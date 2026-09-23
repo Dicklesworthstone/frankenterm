@@ -559,6 +559,70 @@ impl super::TermWindow {
         });
     }
 
+    /// A scrolled remote viewport's row is meaningful only in its current
+    /// layout. Capture the content origin before tab.resize changes that layout;
+    /// the paint path will publish the remapped row after the new layout arrives.
+    fn capture_remote_viewports_before_resize(&mut self, mux: &Mux) {
+        let candidates: Vec<_> = self
+            .pane_state
+            .borrow()
+            .iter()
+            .filter_map(|(&pane_id, state)| {
+                if state.overlay.is_some() || state.remote_viewport.is_some() {
+                    return None;
+                }
+                state.viewport.map(|row| (pane_id, row))
+            })
+            .collect();
+
+        for (pane_id, row) in candidates {
+            let Some((_, window_id, _)) = mux.resolve_pane_id(pane_id) else {
+                continue;
+            };
+            if window_id != self.mux_window_id {
+                continue;
+            }
+            let Some(pane) = mux.get_pane(pane_id) else {
+                continue;
+            };
+            if pane
+                .downcast_ref::<frankenterm_client::pane::ClientPane>()
+                .is_none()
+            {
+                continue;
+            }
+            let dimensions = pane.get_dimensions();
+            let Some(mut anchor) = super::render::pane::ViewportAnchor::new(
+                &*pane,
+                row,
+                dimensions,
+            )
+            .or_else(|| {
+                self.pane_state(pane_id)
+                    .and_then(|state| state.last_viewport_source)
+                    .filter(|(_, _, observed)| {
+                        mux::renderable::same_line_layout_geometry(observed, &dimensions)
+                    })
+                    .map(|source| {
+                        super::render::pane::ViewportAnchor::from_source(source, row)
+                            .bind_pane_identity(&*pane)
+                    })
+            }) else {
+                continue;
+            };
+            // Admit the owned anchor while the old layout still names `row`.
+            let _ = anchor.poll(&*pane);
+            if let Some(mut state) = self.pane_state(pane_id) {
+                if state.viewport == Some(row)
+                    && state.remote_viewport.is_none()
+                    && state.overlay.is_none()
+                {
+                    state.remote_viewport = Some(anchor);
+                }
+            }
+        }
+    }
+
     pub fn apply_dimensions(
         &mut self,
         dimensions: &Dimensions,
@@ -745,6 +809,7 @@ impl super::TermWindow {
             self.record_render_invalidation(RenderInvalidationCause::TerminalGrid);
             if let Some(mux) = Mux::try_get() {
                 if let Some(window) = mux.get_window(self.mux_window_id) {
+                    self.capture_remote_viewports_before_resize(&mux);
                     for index in resize_tab_indices(window.len(), window.get_active_idx()) {
                         if let Some(tab) = window.get_by_idx(index) {
                             tab.resize(size);

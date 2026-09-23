@@ -10258,6 +10258,7 @@ impl TermWindow {
                                 })
                                 .map(|source| {
                                     render::pane::ViewportAnchor::from_source(source, row)
+                                        .bind_pane_identity(&*pane)
                                 })
                         })?;
                     // Admit capture while these coordinates still name the

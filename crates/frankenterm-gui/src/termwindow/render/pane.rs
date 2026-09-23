@@ -37,6 +37,9 @@ pub(crate) type ViewportSource = (
 
 pub(crate) struct ViewportAnchor {
     original: ViewportSource,
+    /// Outer None is reserved for source-only test fixtures; a bound live
+    /// anchor distinguishes an unregistered pane from a replaced registration.
+    registration: Option<Option<mux::PaneRegistrationHandle>>,
     authority: crate::selection::SelectionAuthority,
     row: StableRowIndex,
     state: Option<mux::pane::PaneSelectionAnchor>,
@@ -54,12 +57,13 @@ impl ViewportAnchor {
         let original = crate::selection::SelectionAuthority::capture_source(pane).filter(
             |(_, _, observed)| mux::renderable::same_line_layout_geometry(observed, &dimensions),
         )?;
-        Some(Self::from_source(original, row))
+        Some(Self::from_source(original, row).bind_pane_identity(pane))
     }
 
     pub(crate) fn from_source(original: ViewportSource, row: StableRowIndex) -> Self {
         Self {
             original,
+            registration: None,
             authority: original.0,
             row,
             state: None,
@@ -67,6 +71,11 @@ impl ViewportAnchor {
             unavailable: false,
             deadline: Some(Instant::now() + std::time::Duration::from_secs(30)),
         }
+    }
+
+    pub(crate) fn bind_pane_identity(mut self, pane: &dyn mux::pane::Pane) -> Self {
+        self.registration = Some(pane.mux_registration_slot().load());
+        self
     }
 
     pub(crate) fn poll(
@@ -77,6 +86,28 @@ impl ViewportAnchor {
         use mux::pane::{PaneSelectionAnchorError as Error, PaneSelectionAnchorStatus as Status};
         if self.unavailable {
             return Err(Error::Unsupported);
+        }
+        // The backend token may legitimately outlive a layout change, but it
+        // must never be polled through a replacement pane or registration.
+        // Reconstruct the original stamp using this pane's allocation identity
+        // without comparing it to the *current* layout's sequence or geometry.
+        let same_registration = match (&self.registration, pane.mux_registration_slot().load()) {
+            (Some(Some(expected)), Some(current)) => {
+                expected.same_registration(&current)
+                    && expected.try_with_current(|_| ()).is_some()
+            }
+            (Some(None), None) | (None, _) => true,
+            _ => false,
+        };
+        if !same_registration
+            || !self.original.0.matches_remote_snapshot(
+                pane,
+                self.original.0.layout_floor(),
+                self.original.2,
+            )
+        {
+            self.retire();
+            return Err(Error::SourceChanged);
         }
         self.deadline
             .get_or_insert_with(|| Instant::now() + std::time::Duration::from_secs(30));
@@ -468,8 +499,8 @@ impl crate::TermWindow {
             .downcast_ref::<frankenterm_client::pane::ClientPane>()
             .is_some()
         {
-            if let Some(source) = crate::selection::SelectionAuthority::capture_source(source_pane)
-            {
+            let source = crate::selection::SelectionAuthority::capture_source(source_pane);
+            if let Some(source) = source {
                 if let Some(mut state) = self.pane_state(pane_id) {
                     state.last_viewport_source = Some(source);
                 }
@@ -478,6 +509,22 @@ impl crate::TermWindow {
                 .pane
                 .downcast_ref::<frankenterm_client::pane::ClientPane>()
                 .is_some();
+            // Tab topology changes synchronously, while a remote pane publishes
+            // its resized content later. Keep the old viewport anchor alive until
+            // the content source actually matches the target pane geometry.
+            if bare
+                && !source.is_some_and(|(_, _, dimensions)| {
+                    dimensions.cols == pos.width
+                        && dimensions.viewport_rows == pos.height
+                        && dimensions.pixel_width == pos.pixel_width
+                        && dimensions.pixel_height == pos.pixel_height
+                })
+            {
+                self.update_next_frame_time(Some(
+                    Instant::now() + std::time::Duration::from_millis(16),
+                ));
+                return Err(crate::termwindow::NativeFramePending.into());
+            }
             let anchor = self
                 .pane_state(pane_id)
                 .and_then(|mut state| state.remote_viewport.take());
