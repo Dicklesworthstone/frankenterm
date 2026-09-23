@@ -134706,6 +134706,42 @@ printf x > "$MINISIGN_MARKER"
         assert_eq!(beads[0].status, "in_progress");
     }
 
+    /// ft-vxxzk: toml 1.x parses `toml::Value` as one bare value, so reading a
+    /// real Cargo.toml that way silently returned None for both readers.
+    #[test]
+    fn proof_doctor_manifest_readers_parse_real_cargo_documents() {
+        let dir = unique_temp_dir("proof_doctor_manifest_readers");
+        let package_manifest = dir.join("package.toml");
+        std::fs::write(
+            &package_manifest,
+            "[package]\nname = \"frankenterm-core\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+        )
+        .unwrap();
+        let workspace_manifest = dir.join("workspace.toml");
+        std::fs::write(
+            &workspace_manifest,
+            "[workspace]\nresolver = \"3\"\nmembers = [\"crates/a\", \"crates/b\"]\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            proof_doctor_manifest_package_name(&package_manifest).as_deref(),
+            Some("frankenterm-core")
+        );
+        assert_eq!(
+            proof_doctor_workspace_members_from_manifest(&workspace_manifest),
+            Some(vec!["crates/a".to_string(), "crates/b".to_string()])
+        );
+        assert_eq!(
+            proof_doctor_manifest_package_name(&workspace_manifest),
+            None
+        );
+        assert_eq!(
+            proof_doctor_workspace_members_from_manifest(&package_manifest),
+            None
+        );
+    }
+
     #[test]
     fn proof_doctor_extracts_cargo_package_filters() {
         let command = vec![
