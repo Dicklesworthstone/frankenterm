@@ -15,6 +15,7 @@ use alloc::sync::Weak;
 #[cfg(feature = "appdata")]
 use core::any::Any;
 use core::cmp::Ordering;
+use core::convert::TryFrom;
 use core::hash::Hash;
 use core::ops::Range;
 use finl_unicode::grapheme_clusters::Graphemes;
@@ -3559,7 +3560,7 @@ fn dp_cost_is_additive(
     // The scorer receives slack as i64. A wider target can turn a valid
     // positive slack negative at the cast and charge KP_BADNESS_INF instead
     // of a cost bounded by badness_scale, invalidating frontier pruning.
-    if i64::try_from(width).is_err() {
+    if <i64 as core::convert::TryFrom<usize>>::try_from(width).is_err() {
         return false;
     }
     let max_token_width = (0..token_count)
