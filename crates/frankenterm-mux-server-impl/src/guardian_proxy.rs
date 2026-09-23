@@ -8218,6 +8218,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn legacy_model_restore_refuses_without_retiring_original_child() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         use frankenterm_core::mux_recovery_image::{
             CheckpointAuthority, MuxRecoveryImage, RecoveryImageGenerationMeta, RecoveryObjectRef,
         };
@@ -8390,6 +8392,7 @@ mod tests {
             CheckpointAuthority::ModelOnly { .. }
         ));
         let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let store = SnapshotPublicationStore::open(directory.path(), Default::default()).unwrap();
         store
             .publish_object(&RecoveryObjectPayload {

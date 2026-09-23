@@ -6742,7 +6742,12 @@ mod tests {
         let (_, sequence, dimensions, _) = pane.selection_source_snapshot().unwrap();
         let mut state = None;
         assert!(pane
-            .read_lines_at_layout_capability(sequence, dimensions, &[0..1], &mut state)
+            .read_lines_at_layout_capability(
+                sequence,
+                dimensions,
+                std::slice::from_ref(&(0..1)),
+                &mut state,
+            )
             .unwrap()
             .is_none());
         promise::spawn::block_on(peer.respond_next_lines(vec![(
@@ -6758,7 +6763,12 @@ mod tests {
         let mut payload = None;
         for _ in 0..64 {
             payload = pane
-                .read_lines_at_layout_capability(sequence, dimensions, &[0..1], &mut state)
+                .read_lines_at_layout_capability(
+                    sequence,
+                    dimensions,
+                    std::slice::from_ref(&(0..1)),
+                    &mut state,
+                )
                 .unwrap();
             if payload.is_some() {
                 break;
@@ -6812,7 +6822,12 @@ mod tests {
             let (_, sequence, dimensions, _) = pane.selection_source_snapshot().unwrap();
             let mut state = None;
             assert!(pane
-                .read_lines_at_layout_capability(sequence, dimensions, &[0..1], &mut state)
+                .read_lines_at_layout_capability(
+                    sequence,
+                    dimensions,
+                    std::slice::from_ref(&(0..1)),
+                    &mut state,
+                )
                 .unwrap()
                 .is_none());
             promise::spawn::block_on(peer.respond_next_lines(reply)).unwrap();
@@ -6821,7 +6836,7 @@ mod tests {
                 match pane.read_lines_at_layout_capability(
                     sequence,
                     dimensions,
-                    &[0..1],
+                    std::slice::from_ref(&(0..1)),
                     &mut state,
                 ) {
                     Err(PaneSelectionAnchorError::SourceChanged) => {

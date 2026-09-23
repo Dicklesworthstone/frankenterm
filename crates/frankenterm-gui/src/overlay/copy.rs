@@ -1094,6 +1094,47 @@ mod dirty_tracking_tests {
     #[cfg(unix)]
     fn native_content_navigation_cold_unicode_busy_and_stale_actions() {
         use wezterm_term::config::{ScrollbackSpillSink, ScrollbackTierConfig};
+        // SimpleExecutor installs a process-global scheduler. Isolate its
+        // lifetime from parallel frontend tests that replace that scheduler.
+        const CHILD: &str = "FT_COPY_NAVIGATION_TEST_CHILD";
+        const NAME: &str = "overlay::copy::dirty_tracking_tests::native_content_navigation_cold_unicode_busy_and_stale_actions";
+        if std::env::var(CHILD).as_deref() != Ok(NAME) {
+            let mut logs = tempfile::tempdir().unwrap();
+            logs.disable_cleanup(true);
+            let stdout_path = logs.path().join("stdout.log");
+            let stderr_path = logs.path().join("stderr.log");
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([NAME, "--exact", "--nocapture"])
+                .env(CHILD, NAME)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::fs::File::create(&stdout_path).unwrap())
+                .stderr(std::fs::File::create(&stderr_path).unwrap())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break Ok(status),
+                    Ok(None) if std::time::Instant::now() < deadline => {}
+                    other => break Err(format!("child did not complete: {other:?}")),
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            let cleanup = status.is_err().then(|| (child.kill(), child.wait()));
+            let stdout = std::fs::read_to_string(stdout_path).unwrap();
+            let stderr = std::fs::read_to_string(stderr_path).unwrap();
+            assert!(
+                status.as_ref().is_ok_and(|status| status.success())
+                    && stdout.contains(&format!("test {NAME} ... ok"))
+                    && stdout.contains("1 passed; 0 failed"),
+                "owned navigation child failed: {status:?}; cleanup={cleanup:?}\n{stdout}\n{stderr}"
+            );
+            return;
+        }
+        let executor = promise::spawn::SimpleExecutor::try_with_limits(
+            promise::spawn::MainThreadAdmissionLimits::new(32, 1024 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
         #[derive(Debug)]
         struct ColdConfig(Arc<dyn ScrollbackSpillSink>);
         impl wezterm_term::TerminalConfiguration for ColdConfig {
@@ -1317,11 +1358,18 @@ mod dirty_tracking_tests {
                 "cursor" => cursor.0 = 1,
                 "selection" => start = Some(SelectionCoordinate::x_y(1, 0)),
                 "close" => action.cancelled.store(true, Ordering::Release),
-                "source" => pane
-                    .perform_actions(vec![termwiz::escape::Action::PrintString(
+                "source" => {
+                    let before = pane.get_current_seqno();
+                    pane.perform_actions(vec![termwiz::escape::Action::PrintString(
                         "changed".to_owned(),
                     )])
-                    .unwrap(),
+                    .unwrap();
+                    while pane.get_current_seqno() == before {
+                        assert!(std::time::Instant::now() < action.deadline);
+                        executor.try_tick().unwrap();
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
                 "geometry" => {
                     pane.resize(TerminalSize {
                         rows: 3,
@@ -1335,6 +1383,7 @@ mod dirty_tracking_tests {
                     // geometry publication before testing the stale read;
                     // admission alone still permits the old source.
                     loop {
+                        executor.try_tick().unwrap();
                         assert!(
                             std::time::Instant::now() < action.deadline,
                             "owned resize must complete within the original action deadline"
@@ -1380,6 +1429,7 @@ mod dirty_tracking_tests {
         .unwrap();
         coordinates.deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
+            executor.try_tick().unwrap();
             let current = crate::selection::SelectionAuthority::capture_source(&*pane);
             if current.is_some_and(|(_, _, dims)| dims.cols == 4) {
                 break;
@@ -1399,6 +1449,7 @@ mod dirty_tracking_tests {
             "legacy unsupported capture refuses changed-layout coordinates"
         );
         let mapped = loop {
+            executor.try_tick().unwrap();
             match coordinates.poll(&*pane) {
                 Ok(Some((points, _))) => break points,
                 Ok(None) | Err(mux::pane::PaneSelectionAnchorError::Busy) => {}
@@ -1410,15 +1461,17 @@ mod dirty_tracking_tests {
         let start = mapped[1].unwrap();
         let end = mapped[0].unwrap();
         let viewport = mapped[2].unwrap();
-        assert_eq!(
-            viewport.row, start.row,
-            "top-prefix viewport follows the same logical content"
-        );
+        // The bounded wrap planner may leave an underfull row containing the
+        // leading spaces. Cell zero and cell two need not share a visual row.
+        // Prove their original content offsets through the actual hydrated
+        // rows, rather than imposing a greedy wrapping geometry.
+        assert_eq!(viewport.column, Some(0));
+        assert!(viewport.row <= start.row);
         assert!(
             end.row > start.row,
             "four-column resize must really reflow the selected prefix"
         );
-        let requested = start.row..end.row + 1;
+        let requested = viewport.row..end.row + 1;
         let read = pane
             .capture_line_read(requested.clone(), &mut Default::default())
             .expect("native cold read capability")
@@ -1428,10 +1481,24 @@ mod dirty_tracking_tests {
         let (first, rows) = read
             .try_clone_viewport_for_snapshot(requested, &mut (32 * 1024 * 1024), &mut 65_536)
             .expect("complete bounded remapped cold rows");
-        assert_eq!(first, start.row);
+        assert_eq!(first, viewport.row);
+        let mut prefix = String::new();
+        let mut logical_cells = 0;
         let mut selected = String::new();
         for (offset, line) in rows.iter().enumerate() {
             let row = first + offset as isize;
+            if row < start.row {
+                prefix.push_str(&line.columns_as_str(0..line.len()));
+                logical_cells += line.len();
+                continue;
+            }
+            if row == start.row {
+                prefix.push_str(&line.columns_as_str(0..start.column.unwrap()));
+                assert_eq!(logical_cells + start.column.unwrap(), 2);
+            }
+            if row == end.row {
+                assert_eq!(logical_cells + end.column.unwrap(), 7);
+            }
             let left = if row == start.row {
                 start.column.unwrap()
             } else {
@@ -1443,7 +1510,9 @@ mod dirty_tracking_tests {
                 4
             };
             selected.push_str(&line.columns_as_str(left..right));
+            logical_cells += line.len();
         }
+        assert_eq!(prefix, "  ", "viewport retains the exact unselected prefix");
         assert_eq!(
             selected, "界e\u{301}  Z",
             "actual cold reflow retains exact original selected bytes"
