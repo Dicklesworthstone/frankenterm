@@ -900,14 +900,17 @@ impl super::TermWindow {
         use crate::selection::{NativeSelectionCapture, PendingLocalSelectionCapture};
         use mux::pane::{PaneSelectionAnchorError as Error, PaneSelectionAnchorStatus as Status};
 
+        // Every retry must retain the original pane instance and layout
+        // authority. A replacement can have identical numeric dimensions and
+        // sequence, so the opaque backend state alone cannot fence it.
+        let Some((authority, _, dimensions)) = SelectionAuthority::capture_source(&**pane) else {
+            return NativeSelectionCapture::Busy;
+        };
+        if pending.desired.authority != Some(authority) {
+            pending.local_capture = None;
+            return NativeSelectionCapture::Invalidated;
+        }
         if pending.local_capture.is_none() {
-            let Some((authority, _, dimensions)) = SelectionAuthority::capture_source(&**pane)
-            else {
-                return NativeSelectionCapture::Busy;
-            };
-            if pending.desired.authority != Some(authority) {
-                return NativeSelectionCapture::Invalidated;
-            }
             pending.local_capture = Some(PendingLocalSelectionCapture {
                 dimensions,
                 state: None,
@@ -3138,6 +3141,48 @@ mod tests {
             )
             .is_err()
         );
+
+        // A retry with an owned backend request must still reject a changed
+        // source before presenting old coordinates to the capability API.
+        struct OwnedRequestDrop(Arc<AtomicBool>);
+        impl Drop for OwnedRequestDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let retired = Arc::new(AtomicBool::new(false));
+        let mut pending = crate::selection::PendingNativeSelection::new(desired);
+        pending.local_capture = Some(crate::selection::PendingLocalSelectionCapture {
+            dimensions,
+            state: Some(Box::new(OwnedRequestDrop(Arc::clone(&retired)))),
+        });
+        pane.resize(wezterm_term::TerminalSize {
+            rows: 3,
+            cols: 20,
+            dpi: 96,
+            pixel_width: 160,
+            pixel_height: 48,
+        })
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resize did not commit"
+            );
+            if SelectionAuthority::capture_source(&*pane)
+                .is_some_and(|(current, _, dims)| current != authority && dims.cols == 20)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(matches!(
+            TermWindow::capture_native_selection(&pane, &mut pending),
+            crate::selection::NativeSelectionCapture::Invalidated
+        ));
+        assert!(pending.local_capture.is_none());
+        assert!(retired.load(Ordering::SeqCst));
     }
 
     #[test]
