@@ -3959,6 +3959,12 @@ impl ClientPane {
                     }
                     SelectionAnchorResolveOutcomeV1::SourceChanged
                     | SelectionAnchorResolveOutcomeV1::Unsupported => {
+                        log::debug!(
+                            "selection remap refused by owner pane={} operation={} outcome={:?}",
+                            token.0.remote_pane_id,
+                            token.0.operation_id,
+                            response.outcome
+                        );
                         token.0.invalid.store(true, Ordering::Release);
                         return Err(SelectionReadError::SourceChanged);
                     }
@@ -3978,7 +3984,15 @@ impl ClientPane {
                         Some((layout, sequence, dimensions, Some(points)))
                     }
                     Err(SelectionReadError::Busy) => None,
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        log::debug!(
+                            "selection remap refused by cache pane={} operation={} reason={:?}",
+                            token.0.remote_pane_id,
+                            token.0.operation_id,
+                            error
+                        );
+                        return Err(error);
+                    }
                 }
             }
             _ => None,
