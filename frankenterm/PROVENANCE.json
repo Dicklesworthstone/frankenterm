@@ -156,7 +156,7 @@
         "cleanup": 2,
         "cosmetic": 20,
         "feat": 55,
-        "fix": 111,
+        "fix": 112,
         "other": 17,
         "refactor": 5,
         "rename": 2,
@@ -164,13 +164,13 @@
         "security-fix": 2,
         "test": 38
       },
-      "fork_side_commit_count": 259,
+      "fork_side_commit_count": 260,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-22T03:14:32-04:00",
-        "sha": "b60a014301eb1b2eeb92b98ec456f79f5d8bc298",
-        "subject": "test(client): match native workspace in mixed-DPI attachment fixture"
+        "classification": "fix",
+        "committed_at": "2026-09-23T00:25:12-04:00",
+        "sha": "c73bb58199d9d9b08fbd68e11df69c3815c09c34",
+        "subject": "fix(selection): carry bounded remote anchors through reflow"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -184,7 +184,7 @@
         "cosmetic": 21,
         "docs": 2,
         "feat": 44,
-        "fix": 63,
+        "fix": 64,
         "other": 21,
         "refactor": 2,
         "rename": 2,
@@ -192,13 +192,13 @@
         "security-fix": 1,
         "test": 84
       },
-      "fork_side_commit_count": 247,
+      "fork_side_commit_count": 248,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-20T22:57:56-04:00",
-        "sha": "8cdc77907cd3d562927153c469156d3d15d2cfd0",
-        "subject": "fix: preserve GUI launch ownership and unblock guardian recovery startup"
+        "committed_at": "2026-09-23T00:25:12-04:00",
+        "sha": "c73bb58199d9d9b08fbd68e11df69c3815c09c34",
+        "subject": "fix(selection): carry bounded remote anchors through reflow"
       },
       "name": "codec",
       "path": "frankenterm/codec",
@@ -641,7 +641,7 @@
         "cosmetic": 30,
         "docs": 6,
         "feat": 207,
-        "fix": 289,
+        "fix": 290,
         "other": 54,
         "refactor": 12,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 112
       },
-      "fork_side_commit_count": 735,
+      "fork_side_commit_count": 736,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-22T15:33:24-04:00",
-        "sha": "3176312365f9c3903a5f7c8c320d6005b80062d9",
-        "subject": "fix(gui): prevent overlays from rolling back pending pane resizes"
+        "committed_at": "2026-09-23T00:25:12-04:00",
+        "sha": "c73bb58199d9d9b08fbd68e11df69c3815c09c34",
+        "subject": "fix(selection): carry bounded remote anchors through reflow"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1065,8 +1065,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2925,
-  "generated_at": "2026-09-22T20:23:59.633113Z",
+  "fork_side_commit_total": 2928,
+  "generated_at": "2026-09-23T04:38:45.205349Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
