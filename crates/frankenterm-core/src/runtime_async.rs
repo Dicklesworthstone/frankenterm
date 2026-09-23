@@ -3561,6 +3561,13 @@ pub mod process {
     pub const DEFAULT_COMMAND_STDOUT_LIMIT_BYTES: usize = 16 * 1024 * 1024;
     /// Default maximum stderr bytes retained by one [`Command::output`] call.
     pub const DEFAULT_COMMAND_STDERR_LIMIT_BYTES: usize = 256 * 1024;
+    /// Bounded retries after a transient `ETXTBSY` ("Text file busy") exec
+    /// failure. It happens when another thread's concurrent fork briefly holds
+    /// a writable descriptor to a binary this process just wrote, or while a
+    /// tool replaces its own binary; it always clears once that descriptor
+    /// closes, so every output command retries a few times (ft-e5jb0).
+    pub(crate) const DEFAULT_EXEC_BUSY_RETRY_DELAYS: [Duration; 2] =
+        [Duration::from_millis(10), Duration::from_millis(50)];
     #[cfg(unix)]
     const UNIX_KILL_COMMANDS: &[&str] = &["/bin/kill", "/usr/bin/kill"];
 
@@ -4691,7 +4698,7 @@ pub mod process {
                 stdin_limit: DEFAULT_COMMAND_STDIN_LIMIT_BYTES,
                 stdout_limit: DEFAULT_COMMAND_STDOUT_LIMIT_BYTES,
                 stderr_limit: DEFAULT_COMMAND_STDERR_LIMIT_BYTES,
-                exec_busy_retry_delays: Vec::new(),
+                exec_busy_retry_delays: DEFAULT_EXEC_BUSY_RETRY_DELAYS.to_vec(),
             }
         }
 
@@ -4796,10 +4803,9 @@ pub mod process {
             self
         }
 
-        /// Configure bounded retry delays for transient `ETXTBSY` spawn
-        /// failures. This is crate-internal because only integrations that can
-        /// be replaced in place need the write-then-exec race workaround.
-        #[cfg(any(feature = "subprocess-bridge", test))]
+        /// Override the bounded retry delays for transient `ETXTBSY` spawn
+        /// failures (default [`DEFAULT_EXEC_BUSY_RETRY_DELAYS`]).
+        #[cfg(test)]
         pub(crate) fn exec_busy_retry_delays(&mut self, delays: &[Duration]) -> &mut Self {
             self.exec_busy_retry_delays.clear();
             self.exec_busy_retry_delays.extend_from_slice(delays);
@@ -6608,6 +6614,14 @@ pub mod process {
                 },
             )
             .expect("fully settled process must preserve its initiating result");
+        }
+
+        #[test]
+        fn output_commands_retry_transient_exec_busy_by_default() {
+            let spec = Command::new("not-executed").output_spec();
+            assert_eq!(spec.exec_busy_retry_delays, DEFAULT_EXEC_BUSY_RETRY_DELAYS);
+            let total: Duration = DEFAULT_EXEC_BUSY_RETRY_DELAYS.iter().sum();
+            assert!(total <= Duration::from_millis(100), "retries stay bounded");
         }
 
         #[test]

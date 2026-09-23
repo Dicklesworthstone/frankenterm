@@ -23,8 +23,6 @@ use crate::runtime_async::process::{
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const DP_ROOT: &str = "/dp";
-const EXEC_BUSY_RETRY_DELAYS: [Duration; 2] =
-    [Duration::from_millis(10), Duration::from_millis(50)];
 
 /// Reusable subprocess bridge for typed JSON CLI integrations.
 #[derive(Debug, Clone)]
@@ -138,7 +136,6 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
         cmd.kill_on_drop(true);
         cmd.stdout_limit(self.stdout_limit);
         cmd.stderr_limit(self.stderr_limit);
-        cmd.exec_busy_retry_delays(&EXEC_BUSY_RETRY_DELAYS);
         for (k, v) in env {
             cmd.env(k, v);
         }
