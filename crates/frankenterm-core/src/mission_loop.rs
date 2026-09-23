@@ -932,6 +932,20 @@ impl MissionLoop {
             kept_assignments.push(assignment);
         }
 
+        // A bead the governor held in cooldown (or another gate rejected)
+        // this cycle is still being retried; keep its streak until the bead
+        // leaves the open issue set. Replacing the map wholesale made the
+        // retry-storm gate unreachable under the default 3-cycle cooldown,
+        // because no bead is ever assigned in consecutive cycles (ft-vf97j).
+        for (bead_id, streak) in std::mem::take(&mut self.state.retry_streaks) {
+            let still_open = issues.iter().any(|issue| {
+                issue.id == bead_id && issue.status != crate::beads_types::BeadStatus::Closed
+            });
+            if still_open {
+                next_retry_streaks.entry(bead_id).or_insert(streak);
+            }
+        }
+
         let mut rejected = assignment_set.rejected;
         rejected.extend(envelope_rejections);
         self.state.retry_streaks = next_retry_streaks;
@@ -3600,6 +3614,79 @@ mod tests {
 
         let third = ml.evaluate(3000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
         assert_eq!(third.assignment_set.assignment_count(), 1);
+    }
+
+    /// ft-vf97j: under the DEFAULT governor cooldown a bead is never assigned
+    /// in consecutive cycles; its retry streak must survive the cooldown
+    /// cycles so the envelope's retry-storm gate can still fire.
+    #[test]
+    fn retry_storm_gate_fires_across_default_governor_cooldown() {
+        let mut ml = MissionLoop::new(MissionLoopConfig {
+            safety_envelope: MissionSafetyEnvelopeConfig {
+                max_assignments_per_cycle: 10,
+                max_risky_assignments_per_cycle: 10,
+                max_consecutive_retries_per_bead: 2,
+                ..MissionSafetyEnvelopeConfig::default()
+            },
+            ..MissionLoopConfig::default()
+        });
+        assert!(
+            ml.config.governor_config.reassignment_cooldown_cycles > 1,
+            "this regression is about the default cooldown"
+        );
+        let issues = vec![sample_detail("retry", BeadStatus::Open, 0, &[])];
+        let agents = vec![ready_agent("a1")];
+        let ctx = PlannerExtractionContext::default();
+
+        let mut assigned_cycles = 0;
+        let mut storm_fired = false;
+        for cycle in 1..=20_u64 {
+            let decision = ml.evaluate(
+                cycle * 1000,
+                MissionTrigger::CadenceTick,
+                &issues,
+                &agents,
+                &ctx,
+            );
+            assigned_cycles += decision.assignment_set.assignment_count();
+            storm_fired |= decision.assignment_set.rejected.iter().any(|rejected| {
+                rejected.reasons.iter().any(|reason| {
+                    matches!(
+                        reason,
+                        RejectionReason::SafetyGateDenied { gate_name }
+                        if gate_name == "mission.envelope.retry_storm"
+                    )
+                })
+            });
+            if assigned_cycles > 0 && decision.assignment_set.assignment_count() == 0 {
+                assert!(
+                    ml.state().retry_streaks.contains_key("retry"),
+                    "cycle {cycle}: an unassigned open bead keeps its streak"
+                );
+            }
+        }
+        assert!(assigned_cycles >= 2, "the bead is retried across cooldowns");
+        assert!(
+            storm_fired,
+            "the retry-storm gate must be reachable with the default governor"
+        );
+    }
+
+    #[test]
+    fn retry_streak_is_dropped_once_the_bead_closes() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let agents = vec![ready_agent("a1")];
+        let ctx = PlannerExtractionContext::default();
+        let open = vec![sample_detail("done-later", BeadStatus::Open, 0, &[])];
+        ml.evaluate(1000, MissionTrigger::CadenceTick, &open, &agents, &ctx);
+        assert_eq!(ml.state().retry_streaks.get("done-later"), Some(&1));
+
+        let closed = vec![sample_detail("done-later", BeadStatus::Closed, 0, &[])];
+        ml.evaluate(2000, MissionTrigger::CadenceTick, &closed, &agents, &ctx);
+        assert!(!ml.state().retry_streaks.contains_key("done-later"));
+
+        ml.evaluate(3000, MissionTrigger::CadenceTick, &[], &agents, &ctx);
+        assert!(ml.state().retry_streaks.is_empty());
     }
 
     #[test]
