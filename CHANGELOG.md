@@ -26,11 +26,15 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 ---
 
-## [Unreleased] -- `0.15.19`; development on `main` since the local `0.15.2` build
+## [Unreleased] -- `0.15.20`; development on `main` since the local `0.15.2` build
 
 Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
-Version `0.15.19` carries forward the release-candidate fixes below and addresses viewport, copy-mode, cold-history painting and reconnect defects found during candidate testing. Publication and new native artifact qualification remain pending; diagnostic models do not establish release acceptance or measured performance gains.
+Version `0.15.20` carries forward the release-candidate fixes below and addresses viewport, copy-mode, cold-history painting and reconnect defects found during candidate testing. Publication and new native artifact qualification remain pending; diagnostic models do not establish release acceptance or measured performance gains.
+
+- Remote selection recognizes accepted PDU25 render updates as current connection data, fixing empty selection and refused copy-mode navigation on that delivery path. Reconnects retire prior cached rows before publishing successor coordinates, independently of render-delivery acknowledgements.
+- Reflow preserves words separated by em spaces instead of splitting them as though the separator were part of a word.
+- Renderer buffer-shrink counters advance only when capacity actually decreases, so unsuccessful shrink attempts do not inflate the reported count.
 
 - Remote viewports retain backend anchors across reflow instead of reusing obsolete row numbers. Copy-mode selection dispatch reaches the underlying pane, and viewport capture starts at a valid origin cell. Pending captures remain bounded and reject superseded navigation or source authority.
 - Newly fetched history invalidates visible painting even when the server sequence is unchanged. Failed line reads have bounded retries while unrelated rows remain eligible for fetching.

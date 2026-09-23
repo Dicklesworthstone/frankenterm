@@ -156,7 +156,7 @@
         "cleanup": 2,
         "cosmetic": 20,
         "feat": 55,
-        "fix": 115,
+        "fix": 116,
         "other": 17,
         "refactor": 5,
         "rename": 2,
@@ -164,13 +164,13 @@
         "security-fix": 2,
         "test": 40
       },
-      "fork_side_commit_count": 265,
+      "fork_side_commit_count": 266,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-23T05:53:33-04:00",
-        "sha": "8e15155cafd92eb4937e27bfc2f8d63cdbe7e5c2",
-        "subject": "fix(gui): capture viewport from a valid origin cell"
+        "committed_at": "2026-09-23T07:25:05-04:00",
+        "sha": "8f755f767991d49168b1a05d580592672d5594d8",
+        "subject": "fix(client): authorize selection from accepted connection surfaces"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -850,20 +850,20 @@
         "cleanup": 1,
         "cosmetic": 7,
         "feat": 14,
-        "fix": 47,
+        "fix": 48,
         "other": 31,
         "refactor": 3,
         "rename": 1,
         "security-fix": 2,
         "test": 22
       },
-      "fork_side_commit_count": 131,
+      "fork_side_commit_count": 132,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-21T21:56:39-04:00",
-        "sha": "a385a71431c3a51111c0b09b19efb562d582e390",
-        "subject": "fix(surface): read memoized wrap counts without copying break offsets"
+        "committed_at": "2026-09-23T07:25:32-04:00",
+        "sha": "cde55bc20f940cf628f467cb5cf0dcc7e5f8a8fb",
+        "subject": "fix(surface): preserve words separated by em spaces during reflow"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -1065,8 +1065,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2935,
-  "generated_at": "2026-09-23T09:57:34.600228Z",
+  "fork_side_commit_total": 2937,
+  "generated_at": "2026-09-23T11:30:30.562076Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
