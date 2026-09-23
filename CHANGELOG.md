@@ -26,11 +26,17 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 ---
 
-## [Unreleased] -- `0.15.18`; development on `main` since the local `0.15.2` build
+## [Unreleased] -- `0.15.19`; development on `main` since the local `0.15.2` build
 
 Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
-Version `0.15.18` carries forward the release-candidate fixes below and adds selection, overlay and guardian corrections. Publication and new native artifact qualification remain pending; diagnostic models do not establish release acceptance or measured performance gains.
+Version `0.15.19` carries forward the release-candidate fixes below and addresses viewport, copy-mode, cold-history painting and reconnect defects found during candidate testing. Publication and new native artifact qualification remain pending; diagnostic models do not establish release acceptance or measured performance gains.
+
+- Remote viewports retain backend anchors across reflow instead of reusing obsolete row numbers. Copy-mode selection dispatch reaches the underlying pane, and viewport capture starts at a valid origin cell. Pending captures remain bounded and reject superseded navigation or source authority.
+- Newly fetched history invalidates visible painting even when the server sequence is unchanged. Failed line reads have bounded retries while unrelated rows remain eligible for fetching.
+- Modern remote selection requires the current connection's render snapshot to be applied before cached coordinates can authorize a new capture. Reconnects cannot reuse a predecessor's cached layout merely because sequence and dimensions coincide.
+- Mux response waiters yield after accounting for each nonmatching buffered frame and check cancellation before returning a pending response, allowing unrelated work and cancellation to progress during ready sideband traffic.
+- Opt-in capture diagnostics distinguish collector poll occupancy and wake delay from storage append and reply delays. Total wall latency and acceptance rules remain unchanged; these diagnostics do not establish a performance improvement.
 
 - Selection-anchor failures retain their capture, resolve or release operation identity, affected pane, mutation outcome and retry policy across wire and CLI error handling. Known requests no longer degrade to an unknown-operation error.
 
