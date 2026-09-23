@@ -894,6 +894,9 @@ pub trait Pane: Downcast + Send + Sync {
     /// Capture points in the selected terminal sequence and geometry. Each
     /// backend derives its own layout authority; a proxy's local layout
     /// generation is not a terminal sequence and must not cross this boundary.
+    /// A Pending result may install backend-owned state. The caller must pass
+    /// that same state on retries and drop it when the operation is superseded;
+    /// dropping it releases that request without cancelling independent work.
     fn capture_selection_anchor_capability(
         &self,
         _sequence: SequenceNo,
