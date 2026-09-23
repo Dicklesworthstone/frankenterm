@@ -35,6 +35,8 @@ Version `0.15.20` carries forward the release-candidate fixes below and addresse
 - Remote selection recognizes accepted PDU25 render updates as current connection data, fixing empty selection and refused copy-mode navigation on that delivery path. Reconnects retire prior cached rows before publishing successor coordinates, independently of render-delivery acknowledgements.
 - Reflow preserves words separated by em spaces instead of splitting them as though the separator were part of a word.
 - Renderer buffer-shrink counters advance only when capacity actually decreases, so unsuccessful shrink attempts do not inflate the reported count.
+- Idle rendering can reclaim oversized quad buffers after successful frames establish stable usage. Replacement preserves queued GPU work, cancels on renewed activity, and waits until after a resize gesture ends. Real Vulkan software-adapter tests cover buffer reclamation and queued geometry; native Metal qualification remains pending.
+- Canary rollout fractions count distinct available agents, preserving discovery order. Duplicate agent entries no longer underfill or overfill a rollout cohort.
 
 - Remote viewports retain backend anchors across reflow instead of reusing obsolete row numbers. Copy-mode selection dispatch reaches the underlying pane, and viewport capture starts at a valid origin cell. Pending captures remain bounded and reject superseded navigation or source authority.
 - Newly fetched history invalidates visible painting even when the server sequence is unchanged. Failed line reads have bounded retries while unrelated rows remain eligible for fetching.
