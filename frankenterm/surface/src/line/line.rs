@@ -15,7 +15,6 @@ use alloc::sync::Weak;
 #[cfg(feature = "appdata")]
 use core::any::Any;
 use core::cmp::Ordering;
-use core::convert::TryFrom;
 use core::hash::Hash;
 use core::ops::Range;
 use finl_unicode::grapheme_clusters::Graphemes;
