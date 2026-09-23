@@ -19,7 +19,10 @@ workspace = true
 anyhow = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
-uuid.workspace = true
+# Serialized recovery/durable identities derive serde on `Uuid`; declare the
+# feature here rather than relying on another workspace crate enabling it
+# (a default-features=false dependent such as frankenterm-core-replay did not).
+uuid = { workspace = true, features = ["serde"] }
 tempfile.workspace = true
 emojis.workspace = true
 # ft-i2eni.3 / ft-xxfwy.70: frankenterm-core has no direct `tokio` edge of
@@ -202,6 +205,8 @@ promise.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+# Tests mint fresh durable identities.
+uuid = { workspace = true, features = ["v4", "rng"] }
 syn = { workspace = true, features = ["full", "visit"] }
 proc-macro2 = { workspace = true, features = ["span-locations"] }
 rusqlite = { workspace = true, features = ["trace"] }
