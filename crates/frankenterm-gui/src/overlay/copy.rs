@@ -190,10 +190,16 @@ impl CopyCoordinateAnchor {
             ) {
                 Ok(Some((floor, sequence, dimensions, resolved))) => {
                     let resolved = resolved.ok_or(Error::SourceChanged)?;
-                    points[index] = Some(
-                        resolved[usize::from(original.column.is_none())]
-                            .ok_or(Error::SourceChanged)?,
-                    );
+                    let mut point = resolved[usize::from(original.column.is_none())]
+                        .ok_or(Error::SourceChanged)?;
+                    // The Screen transport intentionally normalizes a
+                    // BeforeZero selection start to cell zero. Copy mode
+                    // needs its boundary form while it remains at column
+                    // zero; a reflowed interior column stays a cell.
+                    if original.column.is_none() && point.column == Some(0) {
+                        point.column = None;
+                    }
+                    points[index] = Some(point);
                     if observed.is_some_and(|previous| previous != (floor, sequence, dimensions)) {
                         ready = false;
                     }
