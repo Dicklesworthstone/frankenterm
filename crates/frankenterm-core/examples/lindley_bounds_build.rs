@@ -290,6 +290,88 @@ mod live_measurement {
         const BURST: usize = 10;
         const BURSTS_PER_PHASE: usize = 100;
 
+        // At most BURST owned writes. Poll in insertion order: the storage
+        // writer reserves its queue FIFO, including under backpressure.
+        type PendingAppend<'a, T> = Option<
+            std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + Send + 'a>>,
+        >;
+
+        fn poll_appends<T>(
+            pending: &mut [PendingAppend<'_, T>],
+            completed: &mut Vec<T>,
+            failure: &mut Option<String>,
+            context: &mut std::task::Context<'_>,
+        ) -> bool {
+            let mut settled = true;
+            for slot in pending {
+                let Some(append) = slot.as_mut() else {
+                    continue;
+                };
+                match append.as_mut().poll(context) {
+                    std::task::Poll::Pending => settled = false,
+                    std::task::Poll::Ready(result) => {
+                        *slot = None;
+                        match result {
+                            Ok(row) => completed.push(row),
+                            Err(error) => {
+                                if let Some(first) = failure.as_mut() {
+                                    first.push_str("; append settlement also failed: ");
+                                    first.push_str(&error);
+                                } else {
+                                    *failure = Some(error);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            settled
+        }
+
+        async fn capture_while_appending<T: Send, U: Send>(
+            capture: impl std::future::Future<Output = Result<U, String>> + Send,
+            pending: &mut [PendingAppend<'_, T>],
+            completed: &mut Vec<T>,
+        ) -> Result<U, String> {
+            let mut capture = std::pin::pin!(capture);
+            let mut failure = None;
+            futures::future::poll_fn(|context| {
+                let settled = poll_appends(pending, completed, &mut failure, context);
+                if failure.is_none() {
+                    match capture.as_mut().poll(context) {
+                        std::task::Poll::Ready(Ok(row)) => {
+                            return std::task::Poll::Ready(Ok(row));
+                        }
+                        std::task::Poll::Ready(Err(error)) => failure = Some(error),
+                        std::task::Poll::Pending => {}
+                    }
+                }
+                // Stop polling capture on either failure, but settle every
+                // owned append. Admitted writes retain storage's independent
+                // cleanup context and finite writer-settlement timeout.
+                if settled && failure.is_some() {
+                    std::task::Poll::Ready(Err(failure.take().unwrap()))
+                } else {
+                    std::task::Poll::Pending
+                }
+            })
+            .await
+        }
+
+        async fn drain_appends<T: Send>(
+            pending: &mut [PendingAppend<'_, T>],
+            completed: &mut Vec<T>,
+        ) -> Result<(), String> {
+            let mut failure = None;
+            futures::future::poll_fn(|context| {
+                if poll_appends(pending, completed, &mut failure, context) {
+                    std::task::Poll::Ready(failure.take().map_or(Ok(()), Err))
+                } else {
+                    std::task::Poll::Pending
+                }
+            })
+            .await
+        }
         #[derive(Clone, Serialize, serde::Deserialize)]
         struct Observation {
             sequence: u32,
@@ -555,8 +637,9 @@ mod live_measurement {
                 "payload_bytes": 4096,
                 "transient_read_rejections": observations.iter().map(|row| u64::from(row.transient_read_rejections)).sum::<u64>(),
                 "initial_read_rejections": initial_read_rejections,
-                "diagnostic_timing": "write_ack_ns, storage_submit_ns and snapshot_extraction_return_ns share the stage epoch; snapshot_extraction_return_ns is measured immediately after capture_snapshot returns and before oracle validation, while the existing extraction stage still ends after validation; all durations are wall-clock, not CPU time; extraction-to-submit is intentional batch waiting, submit-to-completion includes storage queue and commit; poll durations and content-free mux transaction stderr include diagnostic overhead",
+                "diagnostic_timing": "write_ack_ns, storage_submit_ns and snapshot_extraction_return_ns share the stage epoch; snapshot_extraction_return_ns is measured immediately after capture_snapshot returns and before oracle validation, while the existing extraction stage still ends after validation; all durations are wall-clock, not CPU time; extraction-to-submit is collector scheduling wait, submit-to-completion includes storage queue and commit; poll durations and content-free mux transaction stderr include diagnostic overhead",
                 "overlap_bytes": 4096,
+                "collector_scheduling": "bounded-streaming-append-polling-v1",
                 "burst_events": BURST,
                 "calibration_rows": BURST * BURSTS_PER_PHASE,
                 "held_out_rows": BURST * BURSTS_PER_PHASE,
@@ -651,50 +734,52 @@ mod live_measurement {
                         .map_err(|error| error.to_string())?;
                 }
                 previous_burst = Some(Instant::now());
-                let mut pending = Vec::with_capacity(BURST);
+                let mut pending: Vec<PendingAppend<'_, (Observation, String)>> =
+                    Vec::with_capacity(BURST);
+                let mut results = Vec::with_capacity(BURST);
                 for offset in 0..BURST {
-                    let sequence =
-                        u32::try_from(burst * BURST + offset).map_err(|error| error.to_string())?;
-                    let started = elapsed(epoch)?;
-                    client
-                        .send_text_no_paste_with_cx(cx, pane_id, &sequence.to_string())
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    let write_ack_ns = elapsed(epoch)?;
-                    let marker = format!("FT LINDLEY END {sequence:08}");
-                    let capture_deadline = Instant::now() + Duration::from_secs(5);
-                    let (snapshot, transient_read_rejections, poll_diagnostics) =
-                        poll_frame(cx, &marker, capture_deadline, || {
-                            client.get_text_with_cx(cx, pane_id, false)
-                        })
-                        .await?;
-                    let captured = elapsed(epoch)?;
-                    let segment = cursor.capture_snapshot(&snapshot, 4096, None);
-                    let snapshot_extraction_return_ns = elapsed(epoch)?;
-                    let segment = segment.ok_or("new frame produced no delta")?;
-                    if !matches!(segment.kind, CapturedSegmentKind::Delta)
-                        || segment.content.trim_matches('\n')
-                            != super::frame(sequence).trim_matches('\n')
-                    {
-                        return Err(format!("gap or missing frame in delta {sequence}"));
-                    }
-                    let extracted = elapsed(epoch)?;
-                    let hash = hex::encode(Sha256::digest(segment.content.as_bytes()));
-                    pending.push((
-                        sequence,
-                        started,
-                        captured,
-                        extracted,
-                        hash,
-                        segment.content,
-                        transient_read_rejections,
-                        write_ack_ns,
-                        poll_diagnostics,
-                        snapshot_extraction_return_ns,
-                    ));
-                }
-                let results = futures::future::join_all(pending.iter().map(
-                    |(
+                    let capture = async {
+                        let sequence = u32::try_from(burst * BURST + offset)
+                            .map_err(|error| error.to_string())?;
+                        let started = elapsed(epoch)?;
+                        client
+                            .send_text_no_paste_with_cx(cx, pane_id, &sequence.to_string())
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        let write_ack_ns = elapsed(epoch)?;
+                        let marker = format!("FT LINDLEY END {sequence:08}");
+                        let capture_deadline = Instant::now() + Duration::from_secs(5);
+                        let (snapshot, transient_read_rejections, poll_diagnostics) =
+                            poll_frame(cx, &marker, capture_deadline, || {
+                                client.get_text_with_cx(cx, pane_id, false)
+                            })
+                            .await?;
+                        let captured = elapsed(epoch)?;
+                        let segment = cursor.capture_snapshot(&snapshot, 4096, None);
+                        let snapshot_extraction_return_ns = elapsed(epoch)?;
+                        let segment = segment.ok_or("new frame produced no delta")?;
+                        if !matches!(segment.kind, CapturedSegmentKind::Delta)
+                            || segment.content.trim_matches('\n')
+                                != super::frame(sequence).trim_matches('\n')
+                        {
+                            return Err(format!("gap or missing frame in delta {sequence}"));
+                        }
+                        let extracted = elapsed(epoch)?;
+                        let hash = hex::encode(Sha256::digest(segment.content.as_bytes()));
+                        Ok((
+                            sequence,
+                            started,
+                            captured,
+                            extracted,
+                            hash,
+                            segment.content,
+                            transient_read_rejections,
+                            write_ack_ns,
+                            poll_diagnostics,
+                            snapshot_extraction_return_ns,
+                        ))
+                    };
+                    let (
                         sequence,
                         started,
                         captured,
@@ -703,44 +788,50 @@ mod live_measurement {
                         content,
                         rejections,
                         write_ack_ns,
-                        poll,
+                        poll_diagnostics,
                         snapshot_extraction_return_ns,
-                    )| async move {
+                    ) = capture_while_appending(Box::pin(capture), &mut pending, &mut results)
+                        .await?;
+                    pending.push(Some(Box::pin(async move {
                         let storage_submit_ns = elapsed(epoch)?;
                         let stored = storage
-                            .append_segment_with_cx(cx, pane_id, content, None)
+                            .append_segment_with_cx(cx, pane_id, &content, None)
                             .await
                             .map_err(|error| error.to_string())?;
                         let completed = elapsed(epoch)?;
-                        if stored.content != *content || stored.seq != u64::from(*sequence) {
+                        if stored.content != content || stored.seq != u64::from(sequence) {
                             return Err("committed segment content or sequence differs".to_string());
                         }
-                        Ok(Observation {
-                            sequence: *sequence,
-                            transient_read_rejections: *rejections,
-                            write_ack_ns: *write_ack_ns,
-                            storage_submit_ns,
-                            snapshot_extraction_return_ns: *snapshot_extraction_return_ns,
-                            poll: poll.clone(),
-                            stages_ns: [
-                                [*started, *captured],
-                                [*captured, *extracted],
-                                [*extracted, completed],
-                            ],
-                            content_sha256: hash.clone(),
-                        })
-                    },
-                ))
-                .await;
-                for result in results {
-                    observations.push(result?);
+                        Ok((
+                            Observation {
+                                sequence,
+                                transient_read_rejections: rejections,
+                                write_ack_ns,
+                                storage_submit_ns,
+                                snapshot_extraction_return_ns,
+                                poll: poll_diagnostics,
+                                stages_ns: [
+                                    [started, captured],
+                                    [captured, extracted],
+                                    [extracted, completed],
+                                ],
+                                content_sha256: hash,
+                            },
+                            content,
+                        ))
+                    })));
+                }
+                drain_appends(&mut pending, &mut results).await?;
+                results.sort_by_key(|(row, _)| row.sequence);
+                for (row, content) in results {
+                    observations.push(row);
+                    expected_content.push(content);
                 }
                 println!(
                     "__FT_LINDLEY_TRACE_BURST__ {}",
                     serde_json::to_string(&observations[observations.len() - BURST..])
                         .map_err(|error| error.to_string())?
                 );
-                expected_content.extend(pending.into_iter().map(|row| row.5));
                 if burst + 1 == BURSTS_PER_PHASE {
                     calibration_model = Some(calibrate(&observations, arrival_rate)?);
                 }
@@ -874,6 +965,7 @@ mod live_measurement {
             if value["release_version"] != identity.release_version
                 || measurement["declared_source_sha"] != identity.source_revision
                 || measurement["schema"] != "frankenterm.lindley-live-capture.v1"
+                || measurement["collector_scheduling"] != "bounded-streaming-append-polling-v1"
                 || measurement["scope"]
                     != "dedicated_mux_capture_delta_grouped_storage_finite_workload"
                 || measurement["calibration_rows"] != NEXT_BLOCK_ROWS
@@ -1467,6 +1559,191 @@ mod live_measurement {
             }
 
             #[test]
+            fn streaming_append_reaches_sqlite_while_next_capture_is_blocked() {
+                let runtime = RuntimeBuilder::current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let directory = tempfile::tempdir().unwrap();
+                    let cx = frankenterm_core::cx::for_testing();
+                    let storage = StorageHandle::new_with_cx(
+                        &cx,
+                        directory.path().join("stream.db").to_str().unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                    storage
+                        .upsert_pane_with_cx(
+                            &cx,
+                            PaneRecord {
+                                pane_id: 1,
+                                pane_uuid: None,
+                                domain: "owned-test".into(),
+                                window_id: None,
+                                tab_id: None,
+                                title: None,
+                                cwd: None,
+                                tty_name: None,
+                                first_seen_at: 0,
+                                last_seen_at: 0,
+                                observed: true,
+                                ignore_reason: None,
+                                last_decision_at: None,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    let (committed, observed) = frankenterm_core::runtime_async::oneshot::channel();
+                    let (capture_entered, wait_for_capture) =
+                        frankenterm_core::runtime_async::oneshot::channel();
+                    let first = async {
+                        frankenterm_core::runtime_async::oneshot_recv_with_cx(
+                            &cx,
+                            wait_for_capture,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                        let row = storage
+                            .append_segment_with_cx(&cx, 1, "first", None)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        committed
+                            .send(())
+                            .map_err(|_| "capture disappeared".to_string())?;
+                        Ok(row)
+                    };
+                    let mut pending: Vec<PendingAppend<'_, _>> = vec![Some(Box::pin(first))];
+                    let mut completed = Vec::with_capacity(BURST);
+                    let next_capture = async {
+                        capture_entered
+                            .send(())
+                            .map_err(|_| "append disappeared".to_string())?;
+                        frankenterm_core::runtime_async::oneshot_recv_with_cx(&cx, observed)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        Ok("second")
+                    };
+                    let second = frankenterm_core::runtime_async::timeout_with_cx(
+                        &cx,
+                        Duration::from_secs(5),
+                        capture_while_appending(next_capture, &mut pending, &mut completed),
+                    )
+                    .await
+                    .expect("first write must complete before capture two is released")
+                    .unwrap();
+                    for index in 1..BURST {
+                        let content = if index == 1 {
+                            second.to_string()
+                        } else {
+                            format!("row-{index}")
+                        };
+                        let storage = &storage;
+                        let cx = &cx;
+                        pending.push(Some(Box::pin(async move {
+                            storage
+                                .append_segment_with_cx(cx, 1, &content, None)
+                                .await
+                                .map_err(|error| error.to_string())
+                        })));
+                        assert!(pending.len() <= BURST);
+                    }
+                    drain_appends(&mut pending, &mut completed).await.unwrap();
+                    assert!(pending.iter().all(Option::is_none));
+                    assert_eq!(completed.len(), BURST);
+                    let mut rows = storage
+                        .get_segments_with_cx(&cx, 1, BURST + 1)
+                        .await
+                        .unwrap();
+                    rows.sort_by_key(|row| row.seq);
+                    assert_eq!(rows.len(), BURST);
+                    for (index, row) in rows.iter().enumerate() {
+                        assert_eq!(row.seq, index as u64);
+                        let expected = match index {
+                            0 => "first".to_string(),
+                            1 => "second".to_string(),
+                            _ => format!("row-{index}"),
+                        };
+                        assert_eq!(row.content, expected);
+                    }
+                    // A capture failure must not discard a previously owned
+                    // real write. The original error survives settlement.
+                    let mut failed_capture_pending: Vec<PendingAppend<'_, _>> =
+                        vec![Some(Box::pin(async {
+                            storage
+                                .append_segment_with_cx(&cx, 1, "drained-after-error", None)
+                                .await
+                                .map_err(|error| error.to_string())
+                        }))];
+                    let mut drained = Vec::new();
+                    let error = capture_while_appending(
+                        std::future::ready(Err::<(), _>("capture refused".to_string())),
+                        &mut failed_capture_pending,
+                        &mut drained,
+                    )
+                    .await
+                    .unwrap_err();
+                    assert_eq!(error, "capture refused");
+                    assert_eq!(drained.len(), 1);
+                    assert_eq!(drained[0].content, "drained-after-error");
+                    assert_eq!(drained[0].seq, BURST as u64);
+                    let cancelled = frankenterm_core::cx::for_testing();
+                    cancelled.cancel_with(
+                        frankenterm_core::outcome::CancelKind::User,
+                        Some("streaming admission cancellation"),
+                    );
+                    let mut cancelled_pending: Vec<PendingAppend<'_, _>> =
+                        vec![Some(Box::pin(async {
+                            storage
+                                .append_segment_with_cx(&cancelled, 1, "cancelled", None)
+                                .await
+                                .map_err(|error| error.to_string())
+                        }))];
+                    let mut cancelled_results = Vec::new();
+                    assert!(
+                        capture_while_appending(
+                            std::future::pending::<Result<(), String>>(),
+                            &mut cancelled_pending,
+                            &mut cancelled_results,
+                        )
+                        .await
+                        .is_err()
+                    );
+                    assert!(cancelled_results.is_empty());
+                    assert!(cancelled_pending.iter().all(Option::is_none));
+                    let rows = storage
+                        .get_segments_with_cx(&cx, 1, BURST + 2)
+                        .await
+                        .unwrap();
+                    assert_eq!(rows.len(), BURST + 1);
+                    assert!(rows.iter().all(|row| row.content != "cancelled"));
+                    // A real closed writer failure also settles, rather than
+                    // waiting forever for the blocked capture or reporting OK.
+                    storage.shutdown_with_cx(&cx).await.unwrap();
+                    let mut closed: Vec<PendingAppend<'_, _>> = vec![Some(Box::pin(async {
+                        storage
+                            .append_segment_with_cx(&cx, 1, "must-not-commit", None)
+                            .await
+                            .map_err(|error| error.to_string())
+                    }))];
+                    let mut closed_results = Vec::new();
+                    let result = frankenterm_core::runtime_async::timeout_with_cx(
+                        &cx,
+                        Duration::from_secs(5),
+                        capture_while_appending(
+                            std::future::pending::<Result<(), String>>(),
+                            &mut closed,
+                            &mut closed_results,
+                        ),
+                    )
+                    .await
+                    .expect("writer failure must terminate blocked capture");
+                    assert!(result.is_err());
+                    assert!(closed_results.is_empty());
+                    assert!(closed.iter().all(Option::is_none));
+                });
+            }
+            #[test]
             fn held_out_service_check_rejects_delayed_departure() {
                 let model =
                     LindleyStageTelemetry::try_new(LatencyStage::PtyCapture, 1.0, 1.0).unwrap();
@@ -1618,6 +1895,7 @@ mod live_measurement {
                     "arrival": {"burst": 10, "rate": 0.1},
                     "measurement": {
                         "schema": "frankenterm.lindley-live-capture.v1",
+                        "collector_scheduling": "bounded-streaming-append-polling-v1",
                         "declared_source_sha": identity.source_revision,
                         "scope": "dedicated_mux_capture_delta_grouped_storage_finite_workload",
                         "calibration_rows": 1000,
@@ -1646,6 +1924,9 @@ mod live_measurement {
                 assert_eq!(selected[0].sequence, 0);
                 assert_eq!(selected[999].sequence, 999);
                 let mut changed = original.clone();
+                changed["measurement"]["collector_scheduling"] = serde_json::Value::Null;
+                assert!(campaign_block(&changed, &identity).is_err());
+                changed = original.clone();
                 changed["release_version"] = serde_json::json!("0.15.6-rc.98");
                 assert!(campaign_block(&changed, &identity).is_err());
                 changed = original.clone();
