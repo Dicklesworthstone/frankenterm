@@ -5187,11 +5187,11 @@ install_pragmasevka() {
 # macOS GUI app (FrankenTerm.app) install
 #
 # Default-on for darwin/arm64 prebuilt installs (the published .app asset only
-# exists for that target). Downloads the signed bundle, places it in
-# /Applications (or ~/Applications without admin rights), registers it with
-# LaunchServices, and refreshes the Dock so an existing Dock pin / Spotlight /
-# Launchpad resolve to the new version. It does NOT add a new Dock tile — app
-# pinning is a user gesture, not an installer's job.
+# exists for that target). Downloads and verifies the signed bundle, retaining
+# it at a generation-specific candidate path under /Applications (or
+# ~/Applications without admin rights). Production activation remains blocked
+# pending cross-launcher lifetime serialization and PTY handoff. This path does
+# not restart the Dock or add a Dock tile.
 # ───────────────────────────────────────────────────────────────────────────
 should_install_app() {
   # Explicit opt-out always wins.
