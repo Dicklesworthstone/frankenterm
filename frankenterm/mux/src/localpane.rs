@@ -5716,20 +5716,18 @@ impl LocalPane {
                 viewport.cold_anchor = None;
             }
             viewport.row = first;
-            if viewport.anchor.is_none() {
-                if self.reclaim_cancelled_cold_selection() {
-                    viewport.anchor = term.screen_mut().capture_selection_anchor(
-                        frame.source_sequence,
-                        [
-                            Some(frankenterm_term::screen::SelectionAnchorCoordinate {
-                                row: first,
-                                column: Some(0),
-                            }),
-                            None,
-                            None,
-                        ],
-                    );
-                }
+            if viewport.anchor.is_none() && self.reclaim_cancelled_cold_selection() {
+                viewport.anchor = term.screen_mut().capture_selection_anchor(
+                    frame.source_sequence,
+                    [
+                        Some(frankenterm_term::screen::SelectionAnchorCoordinate {
+                            row: first,
+                            column: Some(0),
+                        }),
+                        None,
+                        None,
+                    ],
+                );
             }
             if cold && viewport.cold_anchor.is_none() {
                 let registration = self.mux_registration.load()?;
