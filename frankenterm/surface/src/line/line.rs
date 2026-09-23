@@ -7,7 +7,7 @@ use crate::line::clusterline::ClusteredLine;
 use crate::line::linebits::LineBits;
 use crate::line::storage::{CellStorage, VisibleCellIter};
 use crate::line::vecstorage::{HyperlinkCellMatch, VecStorage};
-use crate::{Change, SequenceNo, SEQ_ZERO};
+use crate::{Change, SEQ_ZERO, SequenceNo};
 use alloc::borrow::Cow;
 use alloc::sync::Arc;
 #[cfg(feature = "appdata")]
@@ -3630,27 +3630,35 @@ fn bounded_monospace_wrap_plan_with_width_prefix(
         }
     }
 
-    if let Some((state, break_offsets)) = best[token_count]
+    let Some((state, break_offsets)) = best[token_count]
         .and_then(|state| dp_break_offsets(&best, token_count).map(|offsets| (state, offsets)))
-    {
-        let candidate = MonospaceBreakCandidate {
-            total_cost: state.total_cost,
-            forced_breaks: state.forced_breaks,
-            max_line_badness: state.max_line_badness,
-            line_count: state.line_count,
-            break_offsets,
+    else {
+        // The lookahead may end before the first legal break. No complete DP
+        // candidate was evaluated, so this is a real greedy fallback.
+        return MonospaceWrapPlan {
+            mode: MonospaceWrapMode::Fallback,
+            break_offsets: greedy.break_offsets,
+            estimated_states,
+            evaluated_states,
         };
-        if compare_monospace_break_candidates(&candidate, &greedy) == Ordering::Less {
-            return MonospaceWrapPlan {
-                mode: MonospaceWrapMode::Dp,
-                break_offsets: candidate.break_offsets,
-                estimated_states,
-                evaluated_states,
-            };
-        }
+    };
+    let candidate = MonospaceBreakCandidate {
+        total_cost: state.total_cost,
+        forced_breaks: state.forced_breaks,
+        max_line_badness: state.max_line_badness,
+        line_count: state.line_count,
+        break_offsets,
+    };
+    if compare_monospace_break_candidates(&candidate, &greedy) == Ordering::Less {
+        return MonospaceWrapPlan {
+            mode: MonospaceWrapMode::Dp,
+            break_offsets: candidate.break_offsets,
+            estimated_states,
+            evaluated_states,
+        };
     }
-    // The DP search may not reach a complete row past its lookahead. The
-    // feasible greedy incumbent still counts as a completed bounded search.
+    // A complete DP candidate was evaluated and the greedy incumbent won.
+    // The mode describes completed search, while the cost shows no gain.
     MonospaceWrapPlan {
         mode: MonospaceWrapMode::Dp,
         break_offsets: greedy.break_offsets,
@@ -4167,9 +4175,10 @@ mod tests {
                         .flat_map(|row| row.visible_cells().map(|cell| cell.str().to_owned()))
                         .collect();
                     assert_eq!(actual, expected);
-                    assert!(rows
-                        .iter()
-                        .all(|row| row.visible_cells().all(|cell| cell.attrs().italic())));
+                    assert!(
+                        rows.iter()
+                            .all(|row| row.visible_cells().all(|cell| cell.attrs().italic()))
+                    );
                     let geometry = LineWrapGeometry::capture(&source, 1 << 20).unwrap();
                     assert_eq!(geometry.row_count(cols, model, &mut scratch), rows.len());
                     assert_eq!(
@@ -4459,9 +4468,11 @@ mod tests {
             None
         );
         assert_eq!(scratch, unchanged);
-        assert!(geometry
-            .row_count_with_budget(3, model, &mut scratch, bound)
-            .is_some());
+        assert!(
+            geometry
+                .row_count_with_budget(3, model, &mut scratch, bound)
+                .is_some()
+        );
         assert_eq!(
             geometry.row_count_with_budget(100, model, &mut scratch, 0),
             None,
@@ -4802,13 +4813,10 @@ mod tests {
 
         let mut bytes = byte_cost - 1;
         let mut work = work_cost;
-        assert!(Line::try_clone_batch_for_snapshot(
-            first_slice,
-            second_slice,
-            &mut bytes,
-            &mut work,
-        )
-        .is_none());
+        assert!(
+            Line::try_clone_batch_for_snapshot(first_slice, second_slice, &mut bytes, &mut work,)
+                .is_none()
+        );
         assert_eq!(
             bytes,
             byte_cost - 1 - first_cost,
@@ -5954,6 +5962,37 @@ mod tests {
     }
 
     #[test]
+    fn long_greedy_optimal_line_reports_completed_dp_without_claiming_a_gain() {
+        let text = "x".repeat(300);
+        let model = MonospaceKpCostModel::terminal_default();
+        let line: Line = text.as_str().into();
+        let report = line.wrap_with_report(4, SEQ_ZERO, model);
+        assert_eq!(report.scorecard.mode, MonospaceWrapMode::Dp);
+        assert!(report.scorecard.estimated_states > model.max_dp_states);
+        assert!(report.scorecard.evaluated_states <= model.max_dp_states);
+        assert_eq!(
+            report.scorecard.selected_total_cost,
+            report.scorecard.greedy_total_cost
+        );
+        assert_eq!(report.scorecard.badness_delta, 0);
+    }
+
+    #[test]
+    fn lookahead_with_no_complete_dp_path_reports_greedy_fallback() {
+        let text = format!("{} {}", "x".repeat(100), "y".repeat(100));
+        let model = MonospaceKpCostModel::terminal_default();
+        let line: Line = text.as_str().into();
+        let report = line.wrap_with_report(120, SEQ_ZERO, model);
+        assert_eq!(report.scorecard.mode, MonospaceWrapMode::Fallback);
+        assert!(report.scorecard.evaluated_states <= model.max_dp_states);
+        assert_eq!(
+            report.scorecard.selected_total_cost,
+            report.scorecard.greedy_total_cost
+        );
+        assert_eq!(report.lines.iter().map(Line::len).sum::<usize>(), 201);
+    }
+
+    #[test]
     fn bounded_wrap_plan_accepts_maximum_lookahead_without_overflow() {
         let tokens = cells_from_text("a界bcdef");
         let full_span = MonospaceKpCostModel {
@@ -6472,9 +6511,11 @@ mod tests {
                     assert_eq!(layout.materialize_rows(start..end, 9), expected[start..end]);
                 }
                 assert_eq!(layout.materialize_rows(0..usize::MAX, 9), expected);
-                assert!(layout
-                    .materialize_rows(usize::MAX..usize::MAX, 9)
-                    .is_empty());
+                assert!(
+                    layout
+                        .materialize_rows(usize::MAX..usize::MAX, 9)
+                        .is_empty()
+                );
                 let start = 2;
                 assert!(layout.materialize_rows(start..1, 9).is_empty());
             }
@@ -7026,11 +7067,13 @@ mod tests {
         let mut changed = rows.clone();
         changed[1].cells_mut()[0] = Cell::new('X', CellAttributes::default());
         assert!(Line::try_join_deferred_logical_rows(changed.iter(), 10).is_none());
-        assert!(Line::try_join_deferred_logical_rows(
-            rows.iter().take(1).chain(rows.iter().skip(2)),
-            10,
-        )
-        .is_none());
+        assert!(
+            Line::try_join_deferred_logical_rows(
+                rows.iter().take(1).chain(rows.iter().skip(2)),
+                10,
+            )
+            .is_none()
+        );
     }
 
     #[cfg(feature = "std")]
