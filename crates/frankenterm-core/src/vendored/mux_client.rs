@@ -4513,6 +4513,8 @@ impl DirectMuxClient {
         cx: &Cx,
         serial: u64,
     ) -> Result<Pdu, DirectMuxError> {
+        let checkpoint = checkpoint_mux_cx(cx, self.connection_id, "response_waiter_entry");
+        self.settle_transport_result(checkpoint, "response waiter cancellation", true)?;
         let correlated = self.validate_response_serial(serial);
         self.settle_transport_result(correlated, "response waiter correlation violation", true)?;
         let pending = self.take_pending_response(serial);
@@ -4542,18 +4544,33 @@ impl DirectMuxClient {
             if decoded.serial == 0 {
                 let stashed = self.stash_unilateral_pdu(decoded.pdu);
                 self.settle_transport_result(stashed, "unilateral PDU retention failure", true)?;
-                continue;
+            } else {
+                tracing::trace!(
+                    connection_id = self.connection_id,
+                    request_serial = serial,
+                    response_serial = decoded.serial,
+                    explicit_cx = true,
+                    phase = "response_out_of_order",
+                    "stashing out-of-order mux response"
+                );
+                let stashed = self.stash_pending_response(decoded.serial, decoded.pdu);
+                self.settle_transport_result(
+                    stashed,
+                    "out-of-order response retention failure",
+                    true,
+                )?;
             }
-            tracing::trace!(
-                connection_id = self.connection_id,
-                request_serial = serial,
-                response_serial = decoded.serial,
-                explicit_cx = true,
-                phase = "response_out_of_order",
-                "stashing out-of-order mux response"
-            );
-            let stashed = self.stash_pending_response(decoded.serial, decoded.pdu);
-            self.settle_transport_result(stashed, "out-of-order response retention failure", true)?;
+            // Buffered reads can be immediately ready forever. Finish each
+            // frame's accounting before yielding; one existing size-capped
+            // frame is the maximum nonmatching work per cooperative turn.
+            let yielded = crate::runtime_async::task::yield_now_with_cx(cx)
+                .await
+                .map_err(|error| cancelled_mux_error("response_dispatch_yield", error));
+            self.settle_transport_result(yielded, "response dispatch cancellation", true)?;
+            // The yield checks before suspension, so cancellation by another
+            // task during that turn must be checked again before decoding.
+            let checkpoint = checkpoint_mux_cx(cx, self.connection_id, "response_dispatch_resume");
+            self.settle_transport_result(checkpoint, "response dispatch cancellation", true)?;
         }
     }
 
@@ -7230,9 +7247,10 @@ mod tests {
             for cancel in [false, true] {
                 let cx = crate::cx::for_testing();
                 let (_dir, path, server) = text_read_server(1, |_, _| None).await;
-                let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
-                    .await
-                    .unwrap();
+                let mut client =
+                    DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                        .await
+                        .unwrap();
                 let serial = client
                     .send_request_only(Pdu::ListPanes(ListPanes {}))
                     .await
@@ -7269,7 +7287,7 @@ mod tests {
                     });
                     assert!(witness.as_mut().poll(&mut context).is_ready());
                     let mut completed = None;
-                    for _ in 0..8 {
+                    for _ in 0..128 {
                         if let Poll::Ready(result) = response.as_mut().poll(&mut context) {
                             completed = Some(result);
                             break;
@@ -7283,6 +7301,7 @@ mod tests {
                     }
                 }
                 assert!(progressed.load(Ordering::Relaxed));
+                assert_eq!(wake.0.load(Ordering::Relaxed), if cancel { 1 } else { 96 });
                 assert!(client.outstanding_requests.is_empty());
                 assert!(client.pending_responses.is_empty());
                 assert_eq!(client.pending_response_bytes, 0);
@@ -7290,10 +7309,60 @@ mod tests {
                 assert_eq!(client.connection_poisoned, cancel);
                 assert_eq!(client.poison_transition_count, usize::from(cancel));
                 if !cancel {
-                    assert!(client.read_buf.is_empty(), "every frame consumed exactly once");
+                    assert!(
+                        client.read_buf.is_empty(),
+                        "every frame consumed exactly once"
+                    );
                 }
                 drop(client);
-                timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
+                timeout(Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn cancelled_response_waiter_rejects_resident_and_pending_responses() {
+        run_async_test(async {
+            for pending in [false, true] {
+                let cx = crate::cx::for_testing();
+                let (_dir, path, server) = text_read_server(1, |_, _| None).await;
+                let mut client =
+                    DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                        .await
+                        .unwrap();
+                let serial = client
+                    .send_request_only(Pdu::ListPanes(ListPanes {}))
+                    .await
+                    .unwrap();
+                let response = Pdu::UnitResponse(UnitResponse {});
+                if pending {
+                    client.stash_pending_response(serial, response).unwrap();
+                    assert!(client.pending_responses.contains_key(&serial));
+                } else {
+                    let mut bytes = Vec::new();
+                    response.encode(&mut bytes, serial).unwrap();
+                    client.read_buf.extend_from_slice(&bytes);
+                }
+                cx.cancel_with(crate::outcome::CancelKind::User, None);
+                let error = client
+                    .await_response_with_cx(&cx, serial)
+                    .await
+                    .unwrap_err();
+                assert_cancelled_mux_error(&error);
+                assert!(client.connection_poisoned);
+                assert_eq!(client.poison_transition_count, 1);
+                assert!(client.outstanding_requests.is_empty());
+                assert!(client.pending_responses.is_empty());
+                assert_eq!(client.pending_response_bytes, 0);
+                assert!(client.read_buf.is_empty());
+                drop(client);
+                timeout(Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
             }
         });
     }
