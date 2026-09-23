@@ -4923,7 +4923,10 @@ impl LocalPane {
             // sequence. Revalidate even an exact-sequence cache hit. Conversely,
             // unrelated output alone must not force another payload hydration.
             return Some(
-                match term.screen().selection_anchor_read_ranges(&anchor, sequence) {
+                match term
+                    .screen()
+                    .selection_anchor_read_ranges(&anchor, sequence)
+                {
                     Ok(Some(_)) => {
                         let value = ready.value.clone();
                         if matches!(value, ColdSelectionValue::Captured(Ok(Some(_)))) {
