@@ -91,8 +91,8 @@ struct CopyCoordinateAnchor {
     source: CopyCoordinateSource,
     original: CopyCoordinateSource,
     points: [Option<wezterm_term::screen::SelectionAnchorCoordinate>; 3],
-    state: Option<mux::pane::PaneSelectionAnchor>,
-    captured: bool,
+    state: [Option<mux::pane::PaneSelectionAnchor>; 3],
+    captured: [bool; 3],
     deadline: std::time::Instant,
 }
 
@@ -120,31 +120,96 @@ impl CopyCoordinateAnchor {
         )>,
         mux::pane::PaneSelectionAnchorError,
     > {
+        let result = self.poll_points(pane);
+        if matches!(&result, Err(error) if *error != mux::pane::PaneSelectionAnchorError::Busy) {
+            // A partially acquired set must not occupy the backend's bounded
+            // token registry after this coordinate transaction has failed.
+            self.state = std::array::from_fn(|_| None);
+            self.captured = [false; 3];
+        }
+        result
+    }
+
+    fn poll_points(
+        &mut self,
+        pane: &dyn Pane,
+    ) -> Result<
+        Option<(
+            [Option<wezterm_term::screen::SelectionAnchorCoordinate>; 3],
+            CopyCoordinateSource,
+        )>,
+        mux::pane::PaneSelectionAnchorError,
+    > {
         use mux::pane::{PaneSelectionAnchorError as Error, PaneSelectionAnchorStatus as Status};
         if std::time::Instant::now() >= self.deadline {
             return Err(Error::SourceChanged);
         }
-        if !self.captured {
+        let mut ready = true;
+        for (index, point) in self.points.iter().copied().enumerate() {
+            let Some(point) = point else { continue };
+            if self.captured[index] {
+                continue;
+            }
+            // Independent coordinates are origins, never inclusive range ends.
+            // BeforeZero cannot be an origin; encode that one start boundary as
+            // a minimal range ending at cell zero and resolve only its start.
+            let capture_points = if point.column.is_some() {
+                [Some(point), None, None]
+            } else {
+                [
+                    None,
+                    Some(point),
+                    Some(wezterm_term::screen::SelectionAnchorCoordinate {
+                        column: Some(0),
+                        row: point.row,
+                    }),
+                ]
+            };
             match pane.capture_selection_anchor_capability(
                 self.original.1,
                 self.original.2,
-                self.points,
-                &mut self.state,
-            )? {
-                Status::Pending => return Ok(None),
-                Status::Captured => self.captured = true,
+                capture_points,
+                &mut self.state[index],
+            ) {
+                Ok(Status::Pending) | Err(Error::Busy) => ready = false,
+                Ok(Status::Captured) => self.captured[index] = true,
+                Err(error) => return Err(error),
             }
         }
-        let Some((_, sequence, dimensions, points)) = pane.selection_anchor_capability_snapshot(
-            self.state.as_ref().ok_or(Error::SourceChanged)?,
-        )?
-        else {
+        if !ready {
             return Ok(None);
-        };
-        let points = points.ok_or(Error::SourceChanged)?;
+        }
+        let before =
+            crate::selection::SelectionAuthority::capture_source(pane).ok_or(Error::Busy)?;
+        let mut points = [None; 3];
+        let mut observed = None;
+        for (index, original) in self.points.iter().copied().enumerate() {
+            let Some(original) = original else { continue };
+            match pane.selection_anchor_capability_snapshot(
+                self.state[index].as_ref().ok_or(Error::SourceChanged)?,
+            ) {
+                Ok(Some((floor, sequence, dimensions, resolved))) => {
+                    let resolved = resolved.ok_or(Error::SourceChanged)?;
+                    points[index] = Some(
+                        resolved[usize::from(original.column.is_none())]
+                            .ok_or(Error::SourceChanged)?,
+                    );
+                    if observed.is_some_and(|previous| previous != (floor, sequence, dimensions)) {
+                        ready = false;
+                    }
+                    observed = Some((floor, sequence, dimensions));
+                }
+                Ok(None) | Err(Error::Busy) => ready = false,
+                Err(error) => return Err(error),
+            }
+        }
+        if !ready {
+            return Ok(None);
+        }
+        let (_, sequence, dimensions) = observed.ok_or(Error::SourceChanged)?;
         let source =
             crate::selection::SelectionAuthority::capture_source(pane).ok_or(Error::Busy)?;
-        if source.1 != sequence || source.2 != dimensions {
+        if source != before || source.1 != sequence || source.2 != dimensions {
             return Ok(None);
         }
         Ok(Some((points, source)))
@@ -1342,8 +1407,8 @@ mod dirty_tracking_tests {
                     row: 0,
                 }),
             ],
-            state: None,
-            captured: false,
+            state: std::array::from_fn(|_| None),
+            captured: [false; 3],
             deadline: std::time::Instant::now() + Duration::from_secs(5),
         };
         // Unsupported peers still permit ordinary navigation in the exact
@@ -1365,7 +1430,65 @@ mod dirty_tracking_tests {
             assert!(std::time::Instant::now() < coordinates.deadline);
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(coordinates.captured);
+        assert!(coordinates.captured.iter().all(|captured| *captured));
+        // Exercise the actual backend endpoint contract for every independent
+        // copy-mode optional-coordinate shape, including ordinary navigation
+        // before a selection start exists. Keep these tokens across real reflow.
+        let mut optional_coordinates = Vec::new();
+        for (case, (has_start, has_viewport)) in [
+            (false, false),
+            (false, true),
+            (true, false),
+            (true, true),
+            (true, false),
+            (false, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut points = coordinates.points;
+            if !has_start {
+                points[1] = None;
+            }
+            if !has_viewport {
+                points[2] = None;
+            }
+            if case == 4 {
+                points[1].as_mut().unwrap().column = None;
+            }
+            if case == 5 {
+                // Reverse cursor/viewport order without changing point roles.
+                points[0].as_mut().unwrap().column = Some(0);
+                points[2].as_mut().unwrap().row = 1;
+            }
+            let mut anchor = CopyCoordinateAnchor {
+                source,
+                original: source,
+                points,
+                state: std::array::from_fn(|_| None),
+                captured: [false; 3],
+                deadline: std::time::Instant::now() + Duration::from_secs(5),
+            };
+            loop {
+                executor.try_tick().unwrap();
+                match anchor.poll(&*pane) {
+                    Ok(Some((actual, _))) => {
+                        assert_eq!(actual, points, "initial optional copy coordinates");
+                        break;
+                    }
+                    Ok(None) | Err(mux::pane::PaneSelectionAnchorError::Busy) => {}
+                    other => panic!("optional copy coordinate capture failed: {other:?}"),
+                }
+                assert!(std::time::Instant::now() < anchor.deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // The original `coordinates` already exercises both-present
+            // transport across reflow. Retire this duplicate before admitting
+            // more cases; the fixture must not consume the entire registry.
+            if case != 3 {
+                optional_coordinates.push((case, anchor));
+            }
+        }
         for stale in ["cursor", "selection", "close", "source", "geometry"] {
             let mut action = ContentNavigation::new((0, 0), None, SelectionMode::Cell, true);
             while action.receiver.is_none() {
@@ -1499,6 +1622,61 @@ mod dirty_tracking_tests {
         let start = mapped[1].unwrap();
         let end = mapped[0].unwrap();
         let viewport = mapped[2].unwrap();
+        for (case, mut anchor) in optional_coordinates {
+            anchor.deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut expected =
+                std::array::from_fn(|index| anchor.points[index].and_then(|_| mapped[index]));
+            if case == 4 {
+                expected[1] = Some(wezterm_term::screen::SelectionAnchorCoordinate {
+                    column: None,
+                    row: viewport.row,
+                });
+            }
+            loop {
+                executor.try_tick().unwrap();
+                match anchor.poll(&*pane) {
+                    Ok(Some((actual, current))) => {
+                        assert_eq!(current.2.cols, 4);
+                        if case == 5 {
+                            assert_eq!(actual[0], Some(viewport));
+                            assert!(actual[1].is_none());
+                            let view = actual[2].unwrap();
+                            assert_eq!(view.column, Some(0));
+                            assert!(view.row > actual[0].unwrap().row);
+                            let read = pane
+                                .capture_line_read(view.row..view.row + 1, &mut Default::default())
+                                .unwrap()
+                                .unwrap()
+                                .hydrate(|| false)
+                                .unwrap();
+                            let (first, lines) = read
+                                .try_clone_viewport_for_snapshot(
+                                    view.row..view.row + 1,
+                                    &mut (32 * 1024 * 1024),
+                                    &mut 65_536,
+                                )
+                                .unwrap();
+                            assert_eq!(first, view.row);
+                            assert_eq!(
+                                lines[0].columns_as_str(0..1),
+                                "f",
+                                "viewport retains original filler start after cursor crosses it"
+                            );
+                        } else {
+                            assert_eq!(
+                                actual, expected,
+                                "remapped optional copy coordinates case {case}"
+                            );
+                        }
+                        break;
+                    }
+                    Ok(None) | Err(mux::pane::PaneSelectionAnchorError::Busy) => {}
+                    other => panic!("optional copy coordinate remap failed: {other:?}"),
+                }
+                assert!(std::time::Instant::now() < anchor.deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         let mut uncaptured_old_viewport =
             crate::termwindow::render::pane::ViewportAnchor::from_source(source, 0);
         assert!(matches!(
@@ -2227,8 +2405,8 @@ impl CopyRenderable {
             source,
             original: source,
             points,
-            state: None,
-            captured: false,
+            state: std::array::from_fn(|_| None),
+            captured: [false; 3],
             deadline: std::time::Instant::now() + Duration::from_secs(5),
         };
         // First poll orders the capture before a subsequent resize request.

@@ -207,28 +207,28 @@ struct ColdSelectionReady {
     value: ColdSelectionValue,
 }
 
-// Exactly one gesture/query per pane. Finished work retains only an opaque
-// token or three coordinates; decoded payloads and worker permits never live
-// in this slot. Viewport hydration has independent cancellation authority.
+const MAX_COLD_SELECTION_WORK: usize = 16;
+const COLD_SELECTION_WORK_LEASE: Duration = Duration::from_secs(5);
+
+// Independent gestures cannot cancel one another's hydration. Finished work
+// retains only an opaque token or three coordinates; the shared LineReadPermit
+// still bounds all decoded payloads and active workers.
 struct ColdSelectionWork {
     request: ColdSelectionRequest,
     cancelled: Arc<AtomicBool>,
     ready: Option<ColdSelectionReady>,
+    renewed: Instant,
 }
 
 struct ColdSelectionCompletion {
-    slot: Arc<Mutex<Option<ColdSelectionWork>>>,
+    slot: Arc<Mutex<Vec<ColdSelectionWork>>>,
     cancelled: Arc<AtomicBool>,
 }
 
 impl Drop for ColdSelectionCompletion {
     fn drop(&mut self) {
         let mut slot = self.slot.lock();
-        if slot.as_ref().is_some_and(|work| {
-            Arc::ptr_eq(&work.cancelled, &self.cancelled) && work.ready.is_none()
-        }) {
-            *slot = None;
-        }
+        slot.retain(|work| !Arc::ptr_eq(&work.cancelled, &self.cancelled) || work.ready.is_some());
     }
 }
 
@@ -1493,7 +1493,7 @@ pub struct LocalPane {
     cold_viewport_pending: Arc<Mutex<Option<ColdViewportPending>>>,
     cold_viewport_retry: Arc<AtomicBool>,
     cold_viewport_failure: Arc<Mutex<Option<ColdViewportFailure>>>,
-    cold_selection: Arc<Mutex<Option<ColdSelectionWork>>>,
+    cold_selection: Arc<Mutex<Vec<ColdSelectionWork>>>,
     cold_selection_retry: Arc<AtomicBool>,
     line_layout_observation: Arc<LineLayoutObservation>,
     // Serializes complete producer batches, including deferred persistence,
@@ -4895,8 +4895,9 @@ impl LocalPane {
         dimensions: RenderableDimensions,
         term: &Terminal,
     ) -> Option<ColdSelectionValue> {
-        let slot = self.cold_selection.try_lock()?;
-        let work = slot.as_ref()?;
+        let mut slot = self.cold_selection.try_lock()?;
+        let work = slot.iter_mut().find(|work| work.request == *request)?;
+        work.renewed = Instant::now();
         let ready = work.ready.as_ref()?;
         if work.request != *request
             || work.cancelled.load(Ordering::Acquire)
@@ -4953,14 +4954,34 @@ impl LocalPane {
             retry_cold_viewport(registration, retry);
             return;
         };
-        if slot
-            .as_ref()
-            .is_some_and(|work| work.request == request && work.ready.is_none())
-        {
-            return;
+        let now = Instant::now();
+        slot.retain(|work| {
+            let retain = now.duration_since(work.renewed) < COLD_SELECTION_WORK_LEASE;
+            if !retain {
+                work.cancelled.store(true, Ordering::Release);
+            }
+            retain
+        });
+        if let Some(work) = slot.iter_mut().find(|work| work.request == request) {
+            work.renewed = now;
+            if work.ready.is_none() {
+                return;
+            }
         }
-        if let Some(previous) = slot.take() {
-            previous.cancelled.store(true, Ordering::Release);
+        // This request's obsolete completion can be replaced, but another
+        // live request must retain its progress even when polled alternately.
+        slot.retain(|work| {
+            if work.request == request {
+                work.cancelled.store(true, Ordering::Release);
+                false
+            } else {
+                true
+            }
+        });
+        if slot.len() >= MAX_COLD_SELECTION_WORK {
+            drop(slot);
+            retry_cold_viewport(registration, retry);
+            return;
         }
         let Some(permit) = crate::pane::LineReadPermit::try_acquire() else {
             drop(slot);
@@ -4968,10 +4989,11 @@ impl LocalPane {
             return;
         };
         let cancelled = Arc::new(AtomicBool::new(false));
-        *slot = Some(ColdSelectionWork {
+        slot.push(ColdSelectionWork {
             request: request.clone(),
             cancelled: Arc::clone(&cancelled),
             ready: None,
+            renewed: now,
         });
         drop(slot);
         let completion = ColdSelectionCompletion {
@@ -5013,7 +5035,7 @@ impl LocalPane {
                         let Some(mut slot) = completion.slot.try_lock() else {
                             return false;
                         };
-                        let Some(work) = slot.as_mut().filter(|work| {
+                        let Some(work) = slot.iter_mut().find(|work| {
                             Arc::ptr_eq(&work.cancelled, &completion.cancelled)
                                 && !work.cancelled.load(Ordering::Acquire)
                         }) else {
@@ -5224,8 +5246,8 @@ impl LocalPane {
                         if let Some(dimensions) = terminal_try_get_dimensions(term) {
                             if let Some(mut slot) = self.cold_selection.try_lock() {
                                 if let Some(work) = slot
-                                    .as_mut()
-                                    .filter(|work| Arc::ptr_eq(&work.cancelled, &cancelled))
+                                    .iter_mut()
+                                    .find(|work| Arc::ptr_eq(&work.cancelled, &cancelled))
                                 {
                                     work.ready = Some(ColdSelectionReady {
                                         floor,
@@ -7039,7 +7061,7 @@ impl LocalPane {
             cold_viewport_pending: Arc::new(Mutex::new(None)),
             cold_viewport_retry: Arc::new(AtomicBool::new(false)),
             cold_viewport_failure: Arc::new(Mutex::new(None)),
-            cold_selection: Arc::new(Mutex::new(None)),
+            cold_selection: Arc::new(Mutex::new(Vec::new())),
             cold_selection_retry: Arc::new(AtomicBool::new(false)),
             line_layout_observation: Arc::new(Mutex::new(None)),
             output_application: Mutex::new(()),
@@ -7329,7 +7351,7 @@ impl LocalPane {
 
 impl Drop for LocalPane {
     fn drop(&mut self) {
-        if let Some(work) = self.cold_selection.lock().take() {
+        for work in self.cold_selection.lock().drain(..) {
             work.cancelled.store(true, Ordering::Release);
         }
         if let Some(pending) = self.cold_viewport_pending.lock().take() {
@@ -11677,7 +11699,7 @@ mod tests {
         let sink = Arc::new(ColdResizeTestSink::default());
         let mut term = Terminal::new(
             term_size(20, 4),
-            Arc::new(ColdResizeTestConfig(sink)),
+            Arc::new(ColdResizeTestConfig(Arc::clone(&sink))),
             "FrankenTerm",
             "cold-viewport-anchor",
             Box::new(Vec::new()),
@@ -11753,38 +11775,89 @@ mod tests {
                 column: Some(5),
             }),
         ];
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        *sink.read_gate.lock() = Some((entered_tx, release_rx));
+        let first_capture = pane.capture_selection_anchor(
+            selection_floor,
+            selection_sequence,
+            selection_dimensions,
+            selection_points,
+        );
+        let entered = entered_rx.recv_timeout(Duration::from_secs(3));
+        let first_cancelled = pane
+            .cold_selection
+            .lock()
+            .first()
+            .map(|work| Arc::clone(&work.cancelled));
+        // A distinct viewport origin is requested while the actual endpoint
+        // storage read is held. It must not cancel the selection's worker.
+        let viewport_points = [selection_points[0], None, None];
+        let competing = pane.capture_selection_anchor(
+            selection_floor,
+            selection_sequence,
+            selection_dimensions,
+            viewport_points,
+        );
+        let preserved = first_cancelled
+            .as_ref()
+            .is_some_and(|cancelled| !cancelled.load(Ordering::Acquire));
+        let _ = release_tx.send(());
+        sink.read_gate.lock().take();
+        entered.expect("selection must enter the actual cold payload read");
         assert!(matches!(
-            pane.capture_selection_anchor(
-                selection_floor,
-                selection_sequence,
-                selection_dimensions,
-                selection_points
-            ),
+            first_capture,
             Err(SelectionAnchorCaptureError::Busy)
         ));
+        assert!(matches!(competing, Err(SelectionAnchorCaptureError::Busy)));
+        assert!(
+            preserved,
+            "viewport capture cancelled an independently owned selection"
+        );
+        let mut viewport_token = None;
         let deadline = Instant::now() + Duration::from_secs(5);
-        let selection_anchor = loop {
+        let mut selection_token = None;
+        loop {
             while executor.try_tick().unwrap() {}
-            match pane.capture_selection_anchor(
-                selection_floor,
-                selection_sequence,
-                selection_dimensions,
-                selection_points,
-            ) {
-                Ok(Some(anchor)) => break anchor,
-                Err(SelectionAnchorCaptureError::Busy) => {}
-                other => panic!("cold selection capture lost exact gesture: {:?}", other),
+            if viewport_token.is_none() {
+                match pane.capture_selection_anchor(
+                    selection_floor,
+                    selection_sequence,
+                    selection_dimensions,
+                    viewport_points,
+                ) {
+                    Ok(Some(anchor)) => viewport_token = Some(anchor),
+                    Err(SelectionAnchorCaptureError::Busy) => {}
+                    other => panic!("cold viewport capture lost exact origin: {:?}", other),
+                }
+            }
+            if selection_token.is_none() {
+                match pane.capture_selection_anchor(
+                    selection_floor,
+                    selection_sequence,
+                    selection_dimensions,
+                    selection_points,
+                ) {
+                    Ok(Some(anchor)) => selection_token = Some(anchor),
+                    Err(SelectionAnchorCaptureError::Busy) => {}
+                    other => panic!("cold selection capture lost exact gesture: {:?}", other),
+                }
+            }
+            if selection_token.is_some() && viewport_token.is_some() {
+                break;
             }
             assert!(
                 Instant::now() < deadline,
                 "cold selection worker did not settle"
             );
             std::thread::sleep(Duration::from_millis(1));
-        };
+        }
+        let selection_anchor = selection_token.unwrap();
+        let viewport_token = viewport_token.unwrap();
         assert!(matches!(
             pane.cold_selection
                 .lock()
-                .as_ref()
+                .first()
                 .unwrap()
                 .ready
                 .as_ref()
@@ -11796,24 +11869,111 @@ mod tests {
         // exercises the production RAII guard used by canceled read workers.
         let old_cancelled = Arc::new(AtomicBool::new(true));
         let successor_cancelled = Arc::new(AtomicBool::new(false));
-        let successor = Arc::new(Mutex::new(Some(ColdSelectionWork {
+        let successor = Arc::new(Mutex::new(vec![ColdSelectionWork {
             request: ColdSelectionRequest::Resolve(selection_anchor.clone()),
             cancelled: Arc::clone(&successor_cancelled),
             ready: None,
-        })));
+            renewed: Instant::now(),
+        }]));
         drop(ColdSelectionCompletion {
             slot: Arc::clone(&successor),
             cancelled: old_cancelled,
         });
         assert!(successor
             .lock()
-            .as_ref()
+            .first()
             .is_some_and(|work| Arc::ptr_eq(&work.cancelled, &successor_cancelled)));
         drop(ColdSelectionCompletion {
             slot: Arc::clone(&successor),
             cancelled: successor_cancelled,
         });
-        assert!(successor.lock().is_none());
+        assert!(successor.lock().is_empty());
+        // Exercise admission on the real pane without sixteen redundant
+        // storage workers. These seeded pending records test registry policy;
+        // the two captures above supply actual worker/progress evidence.
+        let retained = std::mem::take(&mut *pane.cold_selection.lock());
+        let request = |column| ColdSelectionRequest::Capture {
+            floor: selection_floor,
+            sequence: selection_sequence,
+            dimensions: selection_dimensions,
+            points: [
+                Some(frankenterm_term::screen::SelectionAnchorCoordinate {
+                    row,
+                    column: Some(column),
+                }),
+                None,
+                None,
+            ],
+        };
+        let cancelled: Vec<_> = (0..MAX_COLD_SELECTION_WORK)
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect();
+        let admitted_at = Instant::now();
+        *pane.cold_selection.lock() = cancelled
+            .iter()
+            .enumerate()
+            .map(|(index, cancelled)| ColdSelectionWork {
+                request: request(index + 1),
+                cancelled: Arc::clone(cancelled),
+                ready: None,
+                renewed: admitted_at,
+            })
+            .collect();
+        let reads_before = sink.payload_reads.load(Ordering::Acquire);
+        {
+            let mut term = pane.terminal.lock();
+            pane.request_cold_selection(&mut term, request(0), vec![row..row + 1]);
+            assert_eq!(pane.cold_selection.lock().len(), MAX_COLD_SELECTION_WORK);
+            assert!(cancelled.iter().all(|flag| !flag.load(Ordering::Acquire)));
+            assert_eq!(sink.payload_reads.load(Ordering::Acquire), reads_before);
+            pane.cold_selection.lock()[0].renewed = admitted_at - Duration::from_secs(1);
+            pane.request_cold_selection(&mut term, request(1), vec![row..row + 1]);
+            assert!(pane.cold_selection.lock()[0].renewed >= admitted_at);
+            assert_eq!(pane.cold_selection.lock().len(), MAX_COLD_SELECTION_WORK);
+            // A cached SourceChanged result owns no payload/worker, but must
+            // not occupy admission forever after the caller abandons it.
+            let mut work = pane.cold_selection.lock();
+            work[1].ready = Some(ColdSelectionReady {
+                floor: selection_floor,
+                sequence: selection_sequence,
+                dimensions: selection_dimensions,
+                value: ColdSelectionValue::Captured(Err(
+                    SelectionAnchorCaptureError::SourceChanged,
+                )),
+            });
+            work[1].renewed = Instant::now() - COLD_SELECTION_WORK_LEASE - Duration::from_secs(1);
+            drop(work);
+            pane.request_cold_selection(&mut term, request(0), vec![row..row + 1]);
+            assert_eq!(pane.cold_selection.lock().len(), MAX_COLD_SELECTION_WORK);
+            assert!(cancelled[1].load(Ordering::Acquire));
+            assert!(cancelled
+                .iter()
+                .enumerate()
+                .all(|(index, flag)| { index == 1 || !flag.load(Ordering::Acquire) }));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            while executor.try_tick().unwrap() {}
+            let ready = pane.cold_selection.lock().iter().any(|work| {
+                work.request == request(0)
+                    && matches!(
+                        work.ready.as_ref().map(|ready| &ready.value),
+                        Some(ColdSelectionValue::Captured(Ok(Some(_))))
+                    )
+            });
+            if ready {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "reclaimed capacity must run the real cold read"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(sink.payload_reads.load(Ordering::Acquire) > reads_before);
+        for work in std::mem::replace(&mut *pane.cold_selection.lock(), retained) {
+            work.cancelled.store(true, Ordering::Release);
+        }
         for (cols, expected) in [
             (13, "lmnopqrUVWXYZ"),
             (40, "abcde\u{301}fghij界klmnopqrUVWXYZ04"),
@@ -11852,17 +12012,36 @@ mod tests {
             let frame = capture(viewport);
             assert_eq!(frame.lines[0].as_str(), expected);
             let deadline = Instant::now() + Duration::from_secs(5);
-            let resolved = loop {
+            let mut selection_resolved = None;
+            let mut viewport_resolved = None;
+            loop {
                 while executor.try_tick().unwrap() {}
-                if let Some((_, _, _, points)) = pane.selection_anchor_snapshot(&selection_anchor) {
-                    break points.expect("cold selection identity survives reflow");
+                if viewport_resolved.is_none() {
+                    if let Some((_, _, _, points)) = pane.selection_anchor_snapshot(&viewport_token)
+                    {
+                        viewport_resolved =
+                            Some(points.expect("cold viewport origin survives reflow"));
+                    }
+                }
+                if selection_resolved.is_none() {
+                    if let Some((_, _, _, points)) =
+                        pane.selection_anchor_snapshot(&selection_anchor)
+                    {
+                        selection_resolved =
+                            Some(points.expect("cold selection identity survives reflow"));
+                    }
+                }
+                if selection_resolved.is_some() && viewport_resolved.is_some() {
+                    break;
                 }
                 assert!(
                     Instant::now() < deadline,
                     "cold selection projection did not settle"
                 );
                 std::thread::sleep(Duration::from_millis(1));
-            };
+            }
+            let resolved = selection_resolved.unwrap();
+            assert_eq!(viewport_resolved.unwrap(), [resolved[0], None, None]);
             let start_column = match cols {
                 13 => 7,
                 40 => 20,
@@ -12069,8 +12248,8 @@ mod tests {
                     let settled = pane
                         .cold_selection
                         .lock()
-                        .as_ref()
-                        .is_none_or(|work| work.ready.is_some());
+                        .iter()
+                        .all(|work| work.ready.is_some());
                     if settled {
                         break;
                     }
@@ -12151,7 +12330,7 @@ mod tests {
             // Advance the cold frontier without a resize or an index-preparation
             // call. Retire completed caches so the original tokens must drive
             // their own real-worker bootstrap against the new source.
-            if let Some(work) = pane.cold_selection.lock().take() {
+            for work in pane.cold_selection.lock().drain(..) {
                 assert!(work.ready.is_some());
                 work.cancelled.store(true, Ordering::Release);
             }
@@ -12210,7 +12389,7 @@ mod tests {
                         token
                     };
                     apply(80);
-                    if let Some(work) = pane.cold_selection.lock().take() {
+                    for work in pane.cold_selection.lock().drain(..) {
                         assert!(work.ready.is_some());
                         work.cancelled.store(true, Ordering::Release);
                     }
@@ -12280,8 +12459,8 @@ mod tests {
                         if pane
                             .cold_selection
                             .lock()
-                            .as_ref()
-                            .is_none_or(|work| work.ready.is_some())
+                            .iter()
+                            .all(|work| work.ready.is_some())
                         {
                             break;
                         }
@@ -12381,7 +12560,7 @@ mod tests {
                     .next()
                     .unwrap()
                     .clone();
-                if let Some(work) = pane.cold_selection.lock().take() {
+                for work in pane.cold_selection.lock().drain(..) {
                     assert!(work.ready.is_some());
                     work.cancelled.store(true, Ordering::Release);
                 }
@@ -12411,7 +12590,7 @@ mod tests {
                         } else {
                             pane.cold_selection
                                 .lock()
-                                .as_mut()
+                                .first_mut()
                                 .and_then(|work| work.ready.as_mut())
                                 .is_some_and(|ready| {
                                     if let ColdSelectionValue::RetryAt(retry_at) = &mut ready.value
@@ -12443,7 +12622,7 @@ mod tests {
                             } else {
                                 pane.cold_selection
                                     .lock()
-                                    .as_mut()
+                                    .first_mut()
                                     .unwrap()
                                     .ready
                                     .as_mut()
