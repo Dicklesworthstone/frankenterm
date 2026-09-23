@@ -685,9 +685,38 @@ impl crate::TermWindow {
                     .pane
                     .downcast_ref::<crate::overlay::quickselect::QuickSelectOverlay>()
                     .is_some();
+            let remote_pixels_ready = pos
+                .pane
+                .downcast_ref::<frankenterm_client::pane::ClientPane>()
+                .is_none_or(|client| {
+                    let Some(range) = sel.range else {
+                        return true;
+                    };
+                    let Some(frame) = selection_frame_before else {
+                        return false;
+                    };
+                    let Some(visible) = frankenterm_gui::checked_stable_row_range_from_top(
+                        current_viewport.unwrap_or(dims.physical_top),
+                        dims.viewport_rows,
+                    ) else {
+                        return false;
+                    };
+                    let selected = range.rows();
+                    let start = selected.start.max(visible.start);
+                    let end = selected.end.min(visible.end);
+                    start >= end
+                        || client.selection_paint_rows_ready(
+                            frame.authority.layout_floor(),
+                            sel.seqno,
+                            start..end,
+                        )
+                });
             (
-                (delegate_overlay
-                    || sel.is_authorized_by(selection_frame_before.map(|frame| frame.authority)))
+                (remote_pixels_ready
+                    && (delegate_overlay
+                        || sel.is_authorized_by(
+                            selection_frame_before.map(|frame| frame.authority),
+                        )))
                 .then_some(sel.range)
                 .flatten(),
                 sel.rectangular,

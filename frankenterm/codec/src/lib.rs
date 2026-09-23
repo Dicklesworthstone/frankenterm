@@ -3455,6 +3455,24 @@ macro_rules! pdu_capability_use {
 }
 
 macro_rules! pdu_encoded_body_limit {
+    (CaptureSelectionAnchorV1, none) => {
+        SELECTION_ANCHOR_BODY_LIMIT
+    };
+    (CaptureSelectionAnchorResponseV1, none) => {
+        SELECTION_ANCHOR_BODY_LIMIT
+    };
+    (ResolveSelectionAnchorV1, none) => {
+        SELECTION_ANCHOR_BODY_LIMIT
+    };
+    (ResolveSelectionAnchorResponseV1, none) => {
+        SELECTION_ANCHOR_BODY_LIMIT
+    };
+    (ReleaseSelectionAnchorV1, none) => {
+        SELECTION_ANCHOR_BODY_LIMIT
+    };
+    (ReleaseSelectionAnchorResponseV1, none) => {
+        SELECTION_ANCHOR_BODY_LIMIT
+    };
     (GetLinesAtLayout, none) => {
         PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
             max_decompressed_bytes: 512 * 1024,
@@ -4282,7 +4300,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 65;
+pub const CODEC_VERSION: usize = 66;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -4311,7 +4329,7 @@ pub const CODEC_VERSION_MIN_SUPPORTED: usize = 61;
 /// Exact historical mux dialect supported for reconnecting to v0.13 servers.
 ///
 /// This is deliberately not folded into [`CODEC_VERSION_MIN_SUPPORTED`].  The
-/// normal rolling-upgrade window remains 61..=65; codec 46 is an explicitly
+/// normal rolling-upgrade window remains 61..=66; codec 46 is an explicitly
 /// selected, schema-by-schema compatibility dialect whose changed wire IDs are
 /// handled below without heuristic fallback.
 pub const LEGACY46_CODEC_VERSION: usize = 46;
@@ -4846,6 +4864,18 @@ pdu! {
     GetLinesAtLayoutResponse: 103, 65, server_reply, none,
         bulk_data, bulk_data, bulk
         => deserialize_get_lines_at_layout_response;
+    CaptureSelectionAnchorV1: 104, 66, client_request, none,
+        query, query, normal => deserialize_capture_selection_anchor;
+    CaptureSelectionAnchorResponseV1: 105, 66, server_reply, none,
+        query, query, normal => deserialize_capture_selection_anchor_response;
+    ResolveSelectionAnchorV1: 106, 66, client_request, none,
+        query, query, normal => deserialize_resolve_selection_anchor;
+    ResolveSelectionAnchorResponseV1: 107, 66, server_reply, none,
+        query, query, normal => deserialize_resolve_selection_anchor_response;
+    ReleaseSelectionAnchorV1: 108, 66, client_request, none,
+        query, query, normal => deserialize_release_selection_anchor;
+    ReleaseSelectionAnchorResponseV1: 109, 66, server_reply, none,
+        query, query, normal => deserialize_release_selection_anchor_response;
 }
 
 impl Pdu {
@@ -6344,6 +6374,21 @@ impl Pdu {
             Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse { pane_id, .. })
             | Pdu::GetLinesAtLayout(GetLinesAtLayout { pane_id, .. })
             | Pdu::GetLinesAtLayoutResponse(GetLinesAtLayoutResponse { pane_id, .. })
+            | Pdu::CaptureSelectionAnchorV1(CaptureSelectionAnchorV1 { pane_id, .. })
+            | Pdu::CaptureSelectionAnchorResponseV1(CaptureSelectionAnchorResponseV1 {
+                pane_id,
+                ..
+            })
+            | Pdu::ResolveSelectionAnchorV1(ResolveSelectionAnchorV1 { pane_id, .. })
+            | Pdu::ResolveSelectionAnchorResponseV1(ResolveSelectionAnchorResponseV1 {
+                pane_id,
+                ..
+            })
+            | Pdu::ReleaseSelectionAnchorV1(ReleaseSelectionAnchorV1 { pane_id, .. })
+            | Pdu::ReleaseSelectionAnchorResponseV1(ReleaseSelectionAnchorResponseV1 {
+                pane_id,
+                ..
+            })
             | Pdu::GetSemanticZonesResponse(GetSemanticZonesResponse { pane_id, .. })
             | Pdu::RenderApplicationUpdate(RenderApplicationUpdate {
                 identity: RenderApplicationIdentity { pane_id, .. },
@@ -15380,6 +15425,125 @@ pub struct GetLines {
 
 pub const GET_LINES_AT_LAYOUT_MIN_CODEC_VERSION: usize = 65;
 
+pub const SELECTION_ANCHOR_MIN_CODEC_VERSION: usize = 66;
+pub const MAX_SELECTION_ANCHOR_DECOMPRESSED_BYTES: usize = 1024;
+pub const MAX_SELECTION_ANCHOR_ZSTD_ENCODED_BYTES: usize = 2048;
+const SELECTION_ANCHOR_BODY_LIMIT: PduEncodedBodyLimit =
+    PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+        max_decompressed_bytes: MAX_SELECTION_ANCHOR_DECOMPRESSED_BYTES,
+        max_zstd_encoded_bytes: MAX_SELECTION_ANCHOR_ZSTD_ENCODED_BYTES,
+    };
+/// Connection-owned anchors expire unless a valid resolve renews their lease.
+pub const SELECTION_ANCHOR_LIFETIME_SECS: u64 = 300;
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy)]
+pub struct SelectionAnchorPointV1 {
+    pub column: Option<usize>,
+    pub row: StableRowIndex,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct CaptureSelectionAnchorV1 {
+    pub pane_id: PaneId,
+    pub operation_id: u64,
+    pub layout: LineReadLayout,
+    pub points: [Option<SelectionAnchorPointV1>; 3],
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ResolveSelectionAnchorV1 {
+    pub pane_id: PaneId,
+    pub operation_id: u64,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ReleaseSelectionAnchorV1 {
+    pub pane_id: PaneId,
+    pub operation_id: u64,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub enum SelectionAnchorCaptureOutcomeV1 {
+    Captured,
+    Busy,
+    SourceChanged,
+    Unsupported,
+    Capacity,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct CaptureSelectionAnchorResponseV1 {
+    pub pane_id: PaneId,
+    pub operation_id: u64,
+    pub outcome: SelectionAnchorCaptureOutcomeV1,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub enum SelectionAnchorResolveOutcomeV1 {
+    Snapshot {
+        layout_floor: SequenceNo,
+        sequence: SequenceNo,
+        dimensions: RenderableDimensions,
+        points: [Option<SelectionAnchorPointV1>; 3],
+    },
+    Busy,
+    SourceChanged,
+    Unsupported,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ResolveSelectionAnchorResponseV1 {
+    pub pane_id: PaneId,
+    pub operation_id: u64,
+    pub outcome: SelectionAnchorResolveOutcomeV1,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ReleaseSelectionAnchorResponseV1 {
+    pub pane_id: PaneId,
+    pub operation_id: u64,
+    pub released: bool,
+}
+
+macro_rules! selection_anchor_decoder {
+    ($function:ident, $ty:ident) => {
+        fn $function(data: &[u8], compressed: bool) -> Result<$ty, Error> {
+            let value: $ty = deserialize_exact_payload_with_limit(
+                data,
+                compressed,
+                stringify!($ty),
+                MAX_SELECTION_ANCHOR_DECOMPRESSED_BYTES,
+            )?;
+            ensure!(value.operation_id != 0, "zero selection operation identity");
+            Ok(value)
+        }
+    };
+}
+selection_anchor_decoder!(
+    deserialize_capture_selection_anchor,
+    CaptureSelectionAnchorV1
+);
+selection_anchor_decoder!(
+    deserialize_capture_selection_anchor_response,
+    CaptureSelectionAnchorResponseV1
+);
+selection_anchor_decoder!(
+    deserialize_resolve_selection_anchor,
+    ResolveSelectionAnchorV1
+);
+selection_anchor_decoder!(
+    deserialize_resolve_selection_anchor_response,
+    ResolveSelectionAnchorResponseV1
+);
+selection_anchor_decoder!(
+    deserialize_release_selection_anchor,
+    ReleaseSelectionAnchorV1
+);
+selection_anchor_decoder!(
+    deserialize_release_selection_anchor_response,
+    ReleaseSelectionAnchorResponseV1
+);
+
 /// The render state the caller used to interpret stable row coordinates.
 /// Checking it again after asynchronous hydration prevents a reply from an
 /// older layout being promoted to the caller's current line sequence number.
@@ -21958,7 +22122,7 @@ mod test {
 
     #[test]
     fn codec_v65_additive_line_layout_preserves_the_v61_compatibility_floor() {
-        assert_eq!(CODEC_VERSION, 65);
+        assert_eq!(CODEC_VERSION, 66);
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
         assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 54);
         assert!(!codec_version_supports_ordered_window_v1(50));
@@ -23811,7 +23975,172 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 65);
+        assert_eq!(CODEC_VERSION, 66);
+    }
+
+    #[test]
+    fn selection_anchor_headers_reject_oversize_before_body_read() {
+        for ident in 104..=109 {
+            let spec = Pdu::wire_spec_for_ident(ident).unwrap();
+            assert_eq!(spec.encoded_body_limit, SELECTION_ANCHOR_BODY_LIMIT);
+            for compressed in [false, true] {
+                let limit = if compressed { 2048 } else { 1024 };
+                let header = declared_pdu_frame_header(ident, 29, limit + 1, compressed);
+                // No body is supplied: a typed limit error, rather than EOF,
+                // proves admission rejected the header before reading its body.
+                let error = decode_raw(header.as_slice()).unwrap_err();
+                let exceeded = error.downcast_ref::<PduEncodedBodyLimitExceeded>().unwrap();
+                assert_eq!(exceeded.ident(), ident);
+                assert_eq!(exceeded.max_payload_bytes(), limit);
+                assert_eq!(exceeded.declared_payload_bytes(), limit + 1);
+                runtime::block_on(async {
+                    let mut reader = runtime::Cursor::new(header);
+                    let error = decode_raw_header_async(&mut reader, Some(29))
+                        .await
+                        .unwrap_err();
+                    let exceeded = error.downcast_ref::<PduEncodedBodyLimitExceeded>().unwrap();
+                    assert_eq!(exceeded.ident(), ident);
+                    assert_eq!(exceeded.max_payload_bytes(), limit);
+                    assert_eq!(exceeded.declared_payload_bytes(), limit + 1);
+
+                    let mut reader = runtime::Cursor::new(declared_pdu_frame_header(
+                        ident, 29, limit, compressed,
+                    ));
+                    let admitted = decode_raw_header_async(&mut reader, Some(29))
+                        .await
+                        .unwrap();
+                    assert_eq!(admitted.encoded_payload_len(), limit);
+                });
+            }
+            let mut oversized = declared_pdu_frame_header(ident, 29, 1025, false);
+            oversized.extend_from_slice(&[0; 1025]);
+            assert!(Pdu::decode(oversized.as_slice())
+                .unwrap_err()
+                .downcast_ref::<PduEncodedBodyLimitExceeded>()
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn selection_anchor_capture_outbound_plan_admits_real_request() {
+        let capture = CaptureSelectionAnchorV1 {
+            pane_id: 7,
+            operation_id: 11,
+            layout: LineReadLayout {
+                seqno: 9,
+                dimensions: RenderableDimensions {
+                    cols: 80,
+                    ..Default::default()
+                },
+            },
+            points: [Some(SelectionAnchorPointV1 {
+                column: Some(2),
+                row: 0,
+            }); 3],
+        };
+        let request = Pdu::CaptureSelectionAnchorV1(capture.clone());
+        for mode in [
+            CompressionMode::Never,
+            CompressionMode::Always,
+            CompressionMode::Auto,
+        ] {
+            let plan = request
+                .plan_outbound(PduProducer::Client, PduWireRole::Request, None, mode)
+                .expect("a valid selection capture must pass real outbound admission");
+            assert_eq!(plan.metadata.semantic_class, PduSemanticClass::Query);
+            assert!(plan.logical_payload_bytes <= MAX_SELECTION_ANCHOR_DECOMPRESSED_BYTES);
+            let frame = plan.encode_frame(29).unwrap();
+            assert_eq!(Pdu::decode(frame.as_slice()).unwrap().pdu, request);
+        }
+        let prepared = request
+            .prepare_outbound_for_dialect(
+                MuxWireDialect::current(66).unwrap(),
+                PduProducer::Client,
+                PduWireRole::Request,
+                None,
+                CompressionMode::Auto,
+            )
+            .expect("current-dialect capture must pass transport preflight");
+        let frame = prepared.encode_frame(29).unwrap();
+        assert_eq!(
+            Pdu::decode(frame.as_slice()).unwrap().pdu,
+            Pdu::CaptureSelectionAnchorV1(capture)
+        );
+    }
+
+    #[test]
+    fn selection_anchor_wire_round_trips_and_rejects_trailing_or_zero_identity() {
+        let layout = LineReadLayout {
+            seqno: 9,
+            dimensions: RenderableDimensions {
+                cols: 80,
+                ..Default::default()
+            },
+        };
+        let points = [
+            Some(SelectionAnchorPointV1 {
+                column: None,
+                row: -2,
+            }),
+            None,
+            None,
+        ];
+        let request = CaptureSelectionAnchorV1 {
+            pane_id: 7,
+            operation_id: 11,
+            layout,
+            points,
+        };
+        let messages = [
+            Pdu::CaptureSelectionAnchorV1(request.clone()),
+            Pdu::CaptureSelectionAnchorResponseV1(CaptureSelectionAnchorResponseV1 {
+                pane_id: 7,
+                operation_id: 11,
+                outcome: SelectionAnchorCaptureOutcomeV1::Captured,
+            }),
+            Pdu::ResolveSelectionAnchorV1(ResolveSelectionAnchorV1 {
+                pane_id: 7,
+                operation_id: 11,
+            }),
+            Pdu::ResolveSelectionAnchorResponseV1(ResolveSelectionAnchorResponseV1 {
+                pane_id: 7,
+                operation_id: 11,
+                outcome: SelectionAnchorResolveOutcomeV1::Snapshot {
+                    layout_floor: 8,
+                    sequence: 9,
+                    dimensions: layout.dimensions,
+                    points,
+                },
+            }),
+            Pdu::ReleaseSelectionAnchorV1(ReleaseSelectionAnchorV1 {
+                pane_id: 7,
+                operation_id: 11,
+            }),
+            Pdu::ReleaseSelectionAnchorResponseV1(ReleaseSelectionAnchorResponseV1 {
+                pane_id: 7,
+                operation_id: 11,
+                released: true,
+            }),
+        ];
+        for message in messages {
+            assert_eq!(message.minimum_codec_version(), Some(66));
+            assert_eq!(message.pane_id(), Some(7));
+            for mode in [CompressionMode::Never, CompressionMode::Always] {
+                let frame = message.encode_frame_with_mode(1, mode).unwrap();
+                assert_eq!(Pdu::decode(frame.as_slice()).unwrap().pdu, message);
+            }
+        }
+        let mut trailing = serialize_with_mode(&request, CompressionMode::Never)
+            .unwrap()
+            .0;
+        trailing.push(0);
+        assert!(deserialize_capture_selection_anchor(&trailing, false).is_err());
+        let mut zero = request;
+        zero.operation_id = 0;
+        let bytes = serialize_with_mode(&zero, CompressionMode::Never)
+            .unwrap()
+            .0;
+        assert!(deserialize_capture_selection_anchor(&bytes, false).is_err());
     }
 
     #[test]
@@ -24141,7 +24470,7 @@ mod test {
     fn pdu_wire_registry_covers_every_assigned_id_and_only_the_historical_gaps() {
         const GAPS: &[u64] = &[5, 6, 7, 15, 16, 17, 18, 19, 21];
 
-        for ident in 0..=103 {
+        for ident in 0..=109 {
             let spec = Pdu::wire_spec_for_ident(ident);
             assert_eq!(
                 spec.is_none(),
@@ -24155,9 +24484,9 @@ mod test {
             }
         }
 
-        assert!(Pdu::wire_spec_for_ident(104).is_none());
+        assert!(Pdu::wire_spec_for_ident(110).is_none());
         assert!(Pdu::wire_spec_for_ident(u64::MAX).is_none());
-        assert_eq!(Pdu::all_wire_specs().len(), 104 - GAPS.len());
+        assert_eq!(Pdu::all_wire_specs().len(), 110 - GAPS.len());
     }
 
     #[test]
@@ -24198,6 +24527,7 @@ mod test {
                 99 => 63,
                 100..=101 => 64,
                 102..=103 => 65,
+                104..=109 => 66,
                 ident => panic!("unexpected assigned PDU ID {}", ident),
             };
             assert_eq!(
@@ -24232,11 +24562,11 @@ mod test {
         const CLIENT_REQUESTS: &[u64] = &[
             1, 3, 9, 11, 12, 13, 14, 22, 24, 26, 28, 31, 33, 34, 35, 36, 38, 40, 41, 43, 45, 46,
             48, 50, 51, 56, 57, 58, 59, 60, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
-            77, 80, 81, 85, 86, 88, 91, 93, 95, 96, 98, 99, 100, 102,
+            77, 80, 81, 85, 86, 88, 91, 93, 95, 96, 98, 99, 100, 102, 104, 106, 108,
         ];
         const SERVER_REPLIES: &[u64] = &[
             0, 2, 4, 8, 10, 23, 25, 27, 29, 30, 32, 42, 47, 49, 52, 61, 76, 78, 82, 87, 89, 92, 94,
-            97, 101, 103,
+            97, 101, 103, 105, 107, 109,
         ];
         const SERVER_UNILATERALS: &[u64] = &[
             20, 25, 37, 38, 39, 44, 53, 54, 55, 56, 57, 58, 79, 83, 84, 90,
@@ -24335,7 +24665,7 @@ mod test {
                     Class::StateSync
                 }
                 24 | 25 | 79 | 80 | 84 | 85 | 91 | 92 => Class::Render,
-                22 | 31 | 41 | 46 | 51 | 52 | 60 | 61 | 77 | 93 | 102 => Class::Query,
+                22 | 31 | 41 | 46 | 51 | 52 | 60 | 61 | 77 | 93 | 102 | 104..=109 => Class::Query,
                 23 | 32 | 42 | 47 | 78 | 94 | 103 => Class::BulkData,
                 ident => panic!("PDU {} is missing from the semantic-class census", ident),
             };
@@ -24347,9 +24677,22 @@ mod test {
                 }
                 37 | 39 | 44 | 53..=55 | 83 | 90 => Cap::StateSync,
                 24 | 25 | 79 | 80 | 84 | 85 | 91 | 92 => Cap::Render,
-                3 | 22 | 31 | 41 | 46 | 51 | 52 | 60 | 61 | 75 | 77 | 81 | 86 | 93 | 102 => {
-                    Cap::Query
-                }
+                3
+                | 22
+                | 31
+                | 41
+                | 46
+                | 51
+                | 52
+                | 60
+                | 61
+                | 75
+                | 77
+                | 81
+                | 86
+                | 93
+                | 102
+                | 104..=109 => Cap::Query,
                 4 | 13 | 20 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 99 | 103 => {
                     Cap::BulkData
                 }
@@ -24389,7 +24732,8 @@ mod test {
                 | 79..=81
                 | 83..=86
                 | 90..=93
-                | 102 => Qos::Normal,
+                | 102
+                | 104..=109 => Qos::Normal,
                 4 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 103 => Qos::Bulk,
                 ident => panic!("PDU {} is missing from the queue-QoS census", ident),
             };
@@ -25337,7 +25681,7 @@ mod test {
     #[test]
     fn check_compat_current_build_keeps_v61_floor_after_additive_v65() {
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
-        assert_eq!(CODEC_VERSION, 65);
+        assert_eq!(CODEC_VERSION, 66);
         assert!(check_compat(62, 61, 60, 58).is_err());
         assert_eq!(
             check_compat(62, 61, 61, 61),
@@ -26174,7 +26518,7 @@ mod test {
     fn async_selector_truncated_discard_fails_closed() {
         runtime::block_on(async {
             let mut wire = Vec::new();
-            encode_raw(104, 1, &[0x41; 128], false, &mut wire).expect("encode discard candidate");
+            encode_raw(110, 1, &[0x41; 128], false, &mut wire).expect("encode discard candidate");
             wire.pop().expect("encoded frame has a payload byte");
             let mut reader = runtime::Cursor::new(wire);
 
@@ -26222,21 +26566,21 @@ mod test {
 
     #[test]
     fn decode_accepts_valid_non_canonical_leb128_headers() {
-        let wire = [0x84, 0x00, 0x81, 0x00, 0xE8, 0x00];
+        let wire = [0x84, 0x00, 0x81, 0x00, 0xEE, 0x00];
         let decoded = Pdu::decode(wire.as_slice()).expect("valid non-canonical header");
         assert_eq!(decoded.serial, 1);
-        assert_eq!(decoded.pdu, Pdu::Invalid { ident: 104 });
+        assert_eq!(decoded.pdu, Pdu::Invalid { ident: 110 });
     }
 
     #[test]
     fn decode_raw_async_accepts_valid_non_canonical_leb128_headers() {
         runtime::block_on(async {
-            let mut reader = runtime::Cursor::new(vec![0x84, 0x00, 0x81, 0x00, 0xE8, 0x00]);
+            let mut reader = runtime::Cursor::new(vec![0x84, 0x00, 0x81, 0x00, 0xEE, 0x00]);
             let decoded = Pdu::decode_async(&mut reader, None)
                 .await
                 .expect("valid non-canonical header");
             assert_eq!(decoded.serial, 1);
-            assert_eq!(decoded.pdu, Pdu::Invalid { ident: 104 });
+            assert_eq!(decoded.pdu, Pdu::Invalid { ident: 110 });
         });
     }
 

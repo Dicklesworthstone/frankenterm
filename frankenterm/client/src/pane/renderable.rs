@@ -13,7 +13,7 @@ use promise::BrokenPromise;
 use rangeset::*;
 use ratelim::RateLimiter;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::future::Future;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -580,6 +580,12 @@ pub struct RenderableInner {
     // Server content revisions, separate from the paint-damage revision that
     // put_line assigns on fetch completion. Bounded to the same cache capacity.
     selection_row_sequences: LruCache<StableRowIndex, SequenceNo>,
+    // Mutation authority must outlive row-cache eviction, including rows that
+    // were never fetched. Entries are ranges, never expanded into row lists.
+    selection_mutations: VecDeque<(u64, Option<SequenceNo>, Range<StableRowIndex>)>,
+    selection_mutation_floor: SequenceNo,
+    selection_mutation_checkpoint: u64,
+    selection_unknown_floor: u64,
     selection_read_witnesses: Vec<Weak<SelectionReadWitnessState>>,
     pub title: String,
     pub working_dir: Option<Url>,
@@ -683,6 +689,10 @@ impl RenderableInner {
             tiered_scrollback_status: None,
             lines: LruCache::new(line_cache_capacity),
             selection_row_sequences: LruCache::new(line_cache_capacity),
+            selection_mutations: VecDeque::new(),
+            selection_mutation_floor: SEQ_ZERO,
+            selection_mutation_checkpoint: 0,
+            selection_unknown_floor: 0,
             selection_read_witnesses: Vec::new(),
             title: title.to_string(),
             working_dir: None,
@@ -1296,6 +1306,9 @@ impl RenderableInner {
         if reset_layout || cold_layout_invalidated {
             self.retire_selection_layout();
         }
+        for range in &delta.dirty_lines {
+            self.record_selection_mutation(Some(delta.seqno), range.clone());
+        }
         // Observe dirty ranges before eviction. An already copied row may no
         // longer be in either LRU, but still belongs to an unfinished copy.
         self.selection_read_witnesses.retain(|weak| {
@@ -1469,6 +1482,9 @@ impl RenderableInner {
 
     pub(crate) fn retire_selection_layout(&mut self) {
         self.selection_layout_generation = self.selection_layout_generation.saturating_add(1);
+        self.selection_mutations.clear();
+        self.selection_mutation_floor = SEQ_ZERO;
+        self.selection_unknown_floor = 0;
         self.selection_read_witnesses.retain(|weak| {
             let Some(witness) = weak.upgrade() else {
                 return false;
@@ -1476,6 +1492,28 @@ impl RenderableInner {
             witness.invalid.store(true, Ordering::Relaxed);
             true
         });
+    }
+
+    fn record_selection_mutation(
+        &mut self,
+        sequence: Option<SequenceNo>,
+        rows: Range<StableRowIndex>,
+    ) {
+        if rows.start >= rows.end {
+            return;
+        }
+        const MAX_MUTATIONS: usize = 128;
+        self.selection_mutation_checkpoint = self.selection_mutation_checkpoint.saturating_add(1);
+        if self.selection_mutations.len() == MAX_MUTATIONS {
+            let (checkpoint, dropped, _) = self.selection_mutations.pop_front().unwrap();
+            if let Some(dropped) = dropped {
+                self.selection_mutation_floor = self.selection_mutation_floor.max(dropped);
+            } else {
+                self.selection_unknown_floor = self.selection_unknown_floor.max(checkpoint);
+            }
+        }
+        self.selection_mutations
+            .push_back((self.selection_mutation_checkpoint, sequence, rows));
     }
 
     pub fn make_all_stale(&mut self) {
@@ -1818,6 +1856,13 @@ impl RenderableInner {
         let capacity = self.lines.cap();
         self.selection_row_sequences.resize(capacity);
         self.selection_row_sequences.put(stable_row, seqno);
+        if let Some(end) = stable_row.checked_add(1) {
+            // A zero revision supplies no server order proof. Only a server
+            // resolve admitted after this local mutation can supersede it.
+            self.record_selection_mutation((seqno != SEQ_ZERO).then_some(seqno), stable_row..end);
+        } else {
+            self.selection_mutation_floor = SequenceNo::MAX;
+        }
         // Fetched/bonus rows can establish a newer server content revision
         // without a preceding dirty notification. Ignore fetch paint damage:
         // `seqno` was saved before update_last_change_seqno above.
@@ -3767,6 +3812,93 @@ impl RenderableState {
         Ok((inner.seqno, inner.dimensions))
     }
 
+    /// Bridge a server-resolved selection to this cache epoch without requiring
+    /// unrelated output to stop. Lost journal history requests a fresh resolve;
+    /// known selected-row mutation or pruning invalidates the selection.
+    pub(crate) fn validate_remote_selection_remap(
+        &self,
+        layout: SequenceNo,
+        response_sequence: SequenceNo,
+        dimensions: RenderableDimensions,
+        points: [Option<wezterm_term::screen::SelectionAnchorCoordinate>; 3],
+        checkpoint: u64,
+    ) -> Result<(SequenceNo, RenderableDimensions), super::SelectionReadError> {
+        use super::SelectionReadError;
+        let inner = self
+            .inner
+            .try_borrow()
+            .map_err(|_| SelectionReadError::Busy)?;
+        if inner.dead || inner.seqno == SequenceNo::MAX {
+            return Err(SelectionReadError::SourceChanged);
+        }
+        if layout != inner.selection_layout_generation
+            || layout == SequenceNo::MAX
+            || inner.selection_mutation_checkpoint == u64::MAX
+            || checkpoint > inner.selection_mutation_checkpoint
+            || checkpoint < inner.selection_unknown_floor
+            || response_sequence > inner.seqno
+            || response_sequence < inner.selection_mutation_floor
+            || !mux::renderable::same_line_layout_geometry(&dimensions, &inner.dimensions)
+        {
+            return Err(SelectionReadError::Busy);
+        }
+        let mut rows: Option<Range<StableRowIndex>> = None;
+        for point in points.iter().flatten() {
+            if point
+                .column
+                .is_some_and(|column| column > inner.dimensions.cols)
+            {
+                return Err(SelectionReadError::InvalidRange);
+            }
+            let end = point
+                .row
+                .checked_add(1)
+                .ok_or(SelectionReadError::InvalidRange)?;
+            rows = Some(match rows {
+                Some(range) => range.start.min(point.row)..range.end.max(end),
+                None => point.row..end,
+            });
+        }
+        let rows = rows.ok_or(SelectionReadError::InvalidRange)?;
+        let retained_end = StableRowIndex::try_from(inner.dimensions.scrollback_rows)
+            .ok()
+            .and_then(|count| inner.dimensions.scrollback_top.checked_add(count))
+            .ok_or(SelectionReadError::SourceChanged)?;
+        if rows.start < inner.dimensions.scrollback_top || rows.end > retained_end {
+            return Err(SelectionReadError::SourceChanged);
+        }
+        if inner
+            .selection_mutations
+            .iter()
+            .any(|(mutation, sequence, changed)| {
+                sequence.map_or(*mutation > checkpoint, |sequence| {
+                    sequence > response_sequence
+                }) && changed.start < rows.end
+                    && rows.start < changed.end
+            })
+        {
+            return Err(SelectionReadError::SourceChanged);
+        }
+        Ok((inner.seqno, inner.dimensions))
+    }
+
+    /// Capture immediately before first polling the server resolve request.
+    /// This is not source authority by itself; it orders unknown line revisions
+    /// against that request while the server provides the selected-row proof.
+    pub(crate) fn remote_selection_mutation_checkpoint(
+        &self,
+    ) -> Result<u64, super::SelectionReadError> {
+        use super::SelectionReadError;
+        let inner = self
+            .inner
+            .try_borrow()
+            .map_err(|_| SelectionReadError::Busy)?;
+        if inner.dead || inner.selection_mutation_checkpoint == u64::MAX {
+            return Err(SelectionReadError::SourceChanged);
+        }
+        Ok(inner.selection_mutation_checkpoint)
+    }
+
     pub(crate) fn selection_source_snapshot(
         &self,
     ) -> Option<(SequenceNo, SequenceNo, RenderableDimensions, bool)> {
@@ -3833,6 +3965,51 @@ impl RenderableState {
                 cached.copy_appdata_from(rendered);
             }
         }
+    }
+
+    /// Nonallocating paint admission for only the selected visible rows. The
+    /// renderer may draw stale cache projections while fetching; those pixels
+    /// are not authority for selection highlighting.
+    pub(crate) fn selection_paint_rows_ready(
+        &self,
+        layout: SequenceNo,
+        selected_sequence: SequenceNo,
+        rows: Range<StableRowIndex>,
+    ) -> bool {
+        let Ok(inner) = self.inner.try_borrow() else {
+            return false;
+        };
+        let Some(count) = rows
+            .end
+            .checked_sub(rows.start)
+            .and_then(|n| usize::try_from(n).ok())
+        else {
+            return false;
+        };
+        let retained_end = StableRowIndex::try_from(inner.dimensions.scrollback_rows)
+            .ok()
+            .and_then(|count| inner.dimensions.scrollback_top.checked_add(count));
+        if inner.dead
+            || layout == SequenceNo::MAX
+            || layout != inner.selection_layout_generation
+            || selected_sequence == SequenceNo::MAX
+            || inner.seqno == SequenceNo::MAX
+            || selected_sequence > inner.seqno
+            || count > inner.dimensions.viewport_rows
+            || count > MAX_RENDER_APPLICATION_LINES
+            || rows.start < inner.dimensions.scrollback_top
+            || retained_end.is_none_or(|end| rows.end > end)
+        {
+            return false;
+        }
+        rows.into_iter().all(|row| {
+            fresh_cached_line(inner.lines.peek(&row))
+                .is_some_and(|line| !line.changed_since(inner.seqno))
+                && inner
+                    .selection_row_sequences
+                    .peek(&row)
+                    .is_some_and(|revision| *revision != SEQ_ZERO && *revision <= selected_sequence)
+        })
     }
 
     pub(crate) fn selection_lines(
@@ -4854,6 +5031,262 @@ mod tests {
         }
         assert_eq!(received, "界".repeat(256));
         assert!(state.inner.borrow().lines.peek(&0).is_none());
+    }
+
+    #[test]
+    fn remote_selection_paint_requires_fresh_selected_visible_rows() {
+        let renderable = test_renderable_state();
+        let state = renderable.lock();
+        let initial = state.selection_source_snapshot().unwrap();
+        let delta = codec::GetPaneRenderChangesResponse {
+            pane_id: 743,
+            mouse_grabbed: false,
+            alt_screen_active: initial.3,
+            cursor_position: mux::renderable::StableCursorPosition::default(),
+            dimensions: initial.2,
+            tiered_scrollback_status: None,
+            dirty_lines: std::iter::once(0..1).collect(),
+            title: "selection-paint-test".to_string(),
+            working_dir: None,
+            bonus_lines: codec::SerializedLines::from(Vec::new()),
+            input_serial: None,
+            seqno: 7,
+        };
+        assert!(state.inner.borrow_mut().apply_changes_to_surface(
+            delta.clone(),
+            vec![(
+                0,
+                Line::from_text("界 e\u{301}", &CellAttributes::default(), 7, None)
+            )],
+        ));
+        assert!(state.selection_paint_rows_ready(initial.0, 7, 0..1));
+        assert!(!state.selection_paint_rows_ready(initial.0, 6, 0..1));
+        assert!(!state.selection_paint_rows_ready(initial.0 + 1, 7, 0..1));
+        assert!(!state.selection_paint_rows_ready(initial.0, 7, 0..25));
+        for entry in [
+            LineEntry::Stale(Line::from("old geometry")),
+            LineEntry::LineAndFetching(Line::from("old geometry"), FetchToken::new(Instant::now())),
+            LineEntry::Fetching(FetchToken::new(Instant::now())),
+        ] {
+            state.inner.borrow_mut().lines.put(0, entry);
+            assert!(!state.selection_paint_rows_ready(initial.0, 7, 0..1));
+        }
+        assert!(state
+            .inner
+            .borrow_mut()
+            .put_line(0, Line::with_width(80, SEQ_ZERO), None));
+        assert!(!state.selection_paint_rows_ready(initial.0, 7, 0..1));
+        assert!(state.inner.borrow_mut().put_line(
+            0,
+            Line::from_text("refreshed", &CellAttributes::default(), 7, None),
+            None
+        ));
+        assert!(state.selection_paint_rows_ready(initial.0, 7, 0..1));
+        let mut changed = delta;
+        changed.seqno = 8;
+        assert!(state.inner.borrow_mut().apply_changes_to_surface(
+            changed,
+            vec![(
+                0,
+                Line::from_text("mutated", &CellAttributes::default(), 8, None)
+            )],
+        ));
+        assert!(!state.selection_paint_rows_ready(initial.0, 7, 0..1));
+        assert!(state.selection_paint_rows_ready(initial.0, 8, 0..1));
+        let _busy = state.inner.borrow_mut();
+        assert!(!state.selection_paint_rows_ready(initial.0, 8, 0..1));
+    }
+
+    #[test]
+    fn remote_selection_remap_journals_uncached_and_evicted_mutations() {
+        use super::super::SelectionReadError;
+        use wezterm_term::screen::SelectionAnchorCoordinate;
+
+        let renderable = test_renderable_state();
+        let state = renderable.lock();
+        let initial = state.selection_source_snapshot().unwrap();
+        let points = [Some(SelectionAnchorCoordinate {
+            row: 1,
+            column: Some(0),
+        }); 3];
+        let mut delta = codec::GetPaneRenderChangesResponse {
+            pane_id: 743,
+            mouse_grabbed: false,
+            alt_screen_active: initial.3,
+            cursor_position: mux::renderable::StableCursorPosition::default(),
+            dimensions: initial.2,
+            tiered_scrollback_status: None,
+            dirty_lines: std::iter::once(10..11).collect(),
+            title: "selection-remap-test".to_string(),
+            working_dir: None,
+            bonus_lines: codec::SerializedLines::from(Vec::new()),
+            input_serial: None,
+            seqno: 7,
+        };
+        assert!(state
+            .inner
+            .borrow_mut()
+            .apply_changes_to_surface(delta.clone(), Vec::new()));
+        // Neither selected nor unrelated row was ever cached. Later unrelated
+        // output still admits the server's earlier selected-row resolution.
+        assert!(state.inner.borrow().lines.peek(&1).is_none());
+        assert_eq!(
+            state
+                .validate_remote_selection_remap(initial.0, 6, initial.2, points, 0)
+                .unwrap()
+                .0,
+            7
+        );
+        delta.seqno = 8;
+        delta.dirty_lines = std::iter::once(1..2).collect();
+        assert!(state
+            .inner
+            .borrow_mut()
+            .apply_changes_to_surface(delta.clone(), Vec::new()));
+        assert!(matches!(
+            state.validate_remote_selection_remap(initial.0, 7, initial.2, points, 0),
+            Err(SelectionReadError::SourceChanged)
+        ));
+
+        // A fresh resolve after that mutation is valid. A newer fetched row is
+        // mutation evidence even without a dirty delta, and survives eviction.
+        assert!(state
+            .validate_remote_selection_remap(initial.0, 8, initial.2, points, 0)
+            .is_ok());
+        delta.seqno = 9;
+        delta.dirty_lines.clear();
+        assert!(state
+            .inner
+            .borrow_mut()
+            .apply_changes_to_surface(delta.clone(), Vec::new()));
+        {
+            let mut inner = state.inner.borrow_mut();
+            inner.lines.resize(NonZeroUsize::new(1).unwrap());
+            assert!(inner.put_line(
+                1,
+                Line::from_text("changed", &CellAttributes::default(), 9, None),
+                None
+            ));
+            assert!(inner.put_line(
+                2,
+                Line::from_text("other", &CellAttributes::default(), 9, None),
+                None
+            ));
+            assert!(inner.lines.peek(&1).is_none());
+            assert!(inner.selection_row_sequences.peek(&1).is_none());
+        }
+        assert!(matches!(
+            state.validate_remote_selection_remap(initial.0, 8, initial.2, points, 0),
+            Err(SelectionReadError::SourceChanged)
+        ));
+
+        // Bounded lost history cannot turn into an empty-LRU permission.
+        delta.dirty_lines = std::iter::once(10..11).collect();
+        for sequence in 10..140 {
+            delta.seqno = sequence;
+            assert!(state
+                .inner
+                .borrow_mut()
+                .apply_changes_to_surface(delta.clone(), Vec::new()));
+        }
+        assert_eq!(state.inner.borrow().selection_mutations.len(), 128);
+        assert!(matches!(
+            state.validate_remote_selection_remap(initial.0, 8, initial.2, points, 0),
+            Err(SelectionReadError::Busy)
+        ));
+        assert!(state
+            .validate_remote_selection_remap(initial.0, 139, initial.2, points, 0)
+            .is_ok());
+
+        delta.seqno = 140;
+        delta.dimensions.scrollback_top = 2;
+        assert!(state
+            .inner
+            .borrow_mut()
+            .apply_changes_to_surface(delta.clone(), Vec::new()));
+        assert!(matches!(
+            state.validate_remote_selection_remap(initial.0, 139, initial.2, points, 0),
+            Err(SelectionReadError::SourceChanged)
+        ));
+        delta.dimensions.cols += 1;
+        assert!(state
+            .inner
+            .borrow_mut()
+            .apply_changes_to_surface(delta, Vec::new()));
+        assert!(matches!(
+            state.validate_remote_selection_remap(initial.0, 140, initial.2, points, 0),
+            Err(SelectionReadError::Busy)
+        ));
+    }
+
+    #[test]
+    fn remote_selection_remap_orders_unknown_revisions_against_request_admission() {
+        use super::super::SelectionReadError;
+        use wezterm_term::screen::SelectionAnchorCoordinate;
+        let renderable = test_renderable_state();
+        let state = renderable.lock();
+        let initial = state.selection_source_snapshot().unwrap();
+        let points = [Some(SelectionAnchorCoordinate {
+            row: 1,
+            column: Some(0),
+        }); 3];
+        let before = state.remote_selection_mutation_checkpoint().unwrap();
+        assert!(state
+            .inner
+            .borrow_mut()
+            .put_line(1, Line::from("unknown revision"), None));
+        let after = state.remote_selection_mutation_checkpoint().unwrap();
+        assert!(after > before);
+        assert!(matches!(
+            state.validate_remote_selection_remap(initial.0, initial.1, initial.2, points, before),
+            Err(SelectionReadError::SourceChanged)
+        ));
+        assert!(state
+            .validate_remote_selection_remap(initial.0, initial.1, initial.2, points, after)
+            .is_ok());
+        assert!(state.inner.borrow_mut().put_line(
+            2,
+            Line::from("unrelated unknown after admission"),
+            None
+        ));
+        assert!(state
+            .validate_remote_selection_remap(initial.0, initial.1, initial.2, points, after)
+            .is_ok());
+        // Overflow of bounded unknown history asks for a new resolve, but does
+        // not poison future requests in an otherwise unchanged layout.
+        for _ in 0..129 {
+            assert!(state.inner.borrow_mut().put_line(
+                2,
+                Line::from("unrelated unknown revision"),
+                None
+            ));
+        }
+        assert!(matches!(
+            state.validate_remote_selection_remap(initial.0, initial.1, initial.2, points, before),
+            Err(SelectionReadError::Busy)
+        ));
+        let latest = state.remote_selection_mutation_checkpoint().unwrap();
+        assert!(state
+            .validate_remote_selection_remap(initial.0, initial.1, initial.2, points, latest)
+            .is_ok());
+        {
+            let _busy = state.inner.borrow_mut();
+            assert!(matches!(
+                state.remote_selection_mutation_checkpoint(),
+                Err(SelectionReadError::Busy)
+            ));
+            assert!(matches!(
+                state.validate_remote_selection_remap(
+                    initial.0, initial.1, initial.2, points, latest
+                ),
+                Err(SelectionReadError::Busy)
+            ));
+        }
+        state.inner.borrow_mut().selection_mutation_checkpoint = u64::MAX;
+        assert!(state.remote_selection_mutation_checkpoint().is_err());
+        assert!(state
+            .validate_remote_selection_remap(initial.0, initial.1, initial.2, points, latest)
+            .is_err());
     }
 
     #[test]

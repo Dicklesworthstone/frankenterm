@@ -39,6 +39,31 @@ pub struct Selection {
     /// Whether the selection is rectangular
     pub rectangular: bool,
     native_anchor: Option<NativeSelectionAnchor>,
+    remote_anchor:
+        Option<SelectionAnchorOwnership<frankenterm_client::pane::RemoteSelectionAnchor>>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct SelectionAnchorOwnership<T> {
+    token: T,
+    authority: Option<SelectionAuthority>,
+    origin: Option<SelectionCoordinate>,
+    range: Option<SelectionRange>,
+}
+
+impl<T> SelectionAnchorOwnership<T> {
+    fn is_current(&self, selection: &Selection) -> bool {
+        !selection.rectangular
+            && self.authority == selection.authority
+            && self.origin == selection.origin
+            && self.range == selection.range
+    }
+}
+
+impl<T: PartialEq> SelectionAnchorOwnership<T> {
+    fn is_current_token(&self, selection: &Selection, token: &T) -> bool {
+        self.token == *token && self.is_current(selection)
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -58,13 +83,52 @@ pub(crate) struct PendingNativeSelection {
     pub paint_retries_remaining: u8,
     pub committed: bool,
     pub text_copy: Option<crate::termwindow::SelectionCopy>,
+    pub remote_capture: Option<frankenterm_client::pane::RemoteSelectionCapture>,
+    pub remote_motion: Option<PendingRemoteSelectionMotion>,
+    pub replay_scheduled: bool,
+    pub identity: Arc<()>,
+}
+
+/// One coalesced endpoint while a remote anchor RPC owns the original gesture.
+/// Coordinates are usable only under this exact displayed frame.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingRemoteSelectionMotion {
+    pub frame: SelectionFrameStamp,
+    pub position: wezterm_term::input::ClickPosition,
+    pub row: StableRowIndex,
+    pub mode: SelectionMode,
+    pub preview: Option<Selection>,
+    pub deadline: std::time::Instant,
+}
+
+impl PendingRemoteSelectionMotion {
+    pub fn can_replay(
+        &self,
+        displayed: Option<SelectionFrameStamp>,
+        now: std::time::Instant,
+    ) -> bool {
+        now < self.deadline && displayed.is_some_and(|frame| frame.same_coordinates(self.frame))
+    }
 }
 
 pub(crate) enum NativeSelectionCapture {
     Ready(wezterm_term::screen::ScreenSelectionAnchor),
+    ReadyRemote(frankenterm_client::pane::RemoteSelectionAnchor),
     Unremappable,
     Busy,
     Invalidated,
+}
+
+impl From<frankenterm_client::pane::RemoteSelectionCaptureStatus> for NativeSelectionCapture {
+    fn from(status: frankenterm_client::pane::RemoteSelectionCaptureStatus) -> Self {
+        use frankenterm_client::pane::RemoteSelectionCaptureStatus;
+        match status {
+            RemoteSelectionCaptureStatus::Ready(token) => Self::ReadyRemote(token),
+            RemoteSelectionCaptureStatus::Busy => Self::Busy,
+            RemoteSelectionCaptureStatus::Invalidated => Self::Invalidated,
+            RemoteSelectionCaptureStatus::Unremappable => Self::Unremappable,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,7 +181,56 @@ impl PendingNativeSelection {
             paint_retries_remaining: 3,
             committed: false,
             text_copy: None,
+            remote_capture: None,
+            remote_motion: None,
+            replay_scheduled: false,
+            identity: Arc::new(()),
         }
+    }
+
+    pub fn retain_remote_motion(&mut self, mut motion: PendingRemoteSelectionMotion) -> bool {
+        // A released copy owns its final endpoint. Later hover motion cannot
+        // replace it while transport is pending.
+        if self.copy.is_some() {
+            return true;
+        }
+        if self.committed && motion.preview.is_some() {
+            // Publishing this preview would sever the old token's ownership.
+            // There is no pending capture to coalesce: the caller must admit
+            // a new capture for the new endpoint instead.
+            return false;
+        }
+        if let Some(previous) = &self.remote_motion {
+            motion.deadline = previous.deadline;
+        }
+        self.remote_motion = Some(motion);
+        true
+    }
+
+    pub fn publish_remote_preview(
+        &self,
+        visible: &mut Selection,
+        authority: Option<SelectionAuthority>,
+    ) -> bool {
+        if self.desired.is_authorized_by(authority) {
+            *visible = self.desired.clone();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn superseding_remote_preview(
+        &self,
+        authority: Option<SelectionAuthority>,
+    ) -> Option<Self> {
+        let preview = self.remote_motion.as_ref()?.preview.as_ref()?;
+        if !preview.is_authorized_by(authority) {
+            return None;
+        }
+        let mut next = Self::new(preview.clone());
+        next.copy = self.copy;
+        Some(next)
     }
 
     /// None retains the intent; Invalidated retires stale coordinates; Applied commits
@@ -134,9 +247,13 @@ impl PendingNativeSelection {
             NativeSelectionCapture::Invalidated => return Some(NativeSelectionCommit::Invalidated),
             NativeSelectionCapture::Unremappable => {
                 next.native_anchor = None;
+                next.remote_anchor = None;
             }
             NativeSelectionCapture::Ready(token) => {
                 next.remember_native_anchor(token);
+            }
+            NativeSelectionCapture::ReadyRemote(token) => {
+                next.remember_remote_anchor(token);
             }
         }
         let needs_repaint = committed.origin != next.origin
@@ -200,6 +317,18 @@ impl SelectionAuthority {
 
     pub(crate) fn layout_floor(self) -> SequenceNo {
         self.sequence
+    }
+
+    pub(crate) fn matches_remote_snapshot(
+        self,
+        pane: &dyn Pane,
+        floor: SequenceNo,
+        dimensions: mux::renderable::RenderableDimensions,
+    ) -> bool {
+        Self::from_native_snapshot(pane, floor, dimensions).is_some_and(|mut observed| {
+            observed.alternate = self.alternate;
+            observed == self
+        })
     }
 
     pub fn capture_source(
@@ -955,6 +1084,7 @@ impl Selection {
         &mut self,
         token: wezterm_term::screen::ScreenSelectionAnchor,
     ) {
+        self.remote_anchor = None;
         self.native_anchor = Some(NativeSelectionAnchor {
             token,
             authority: self.authority,
@@ -975,6 +1105,55 @@ impl Selection {
             .map(|anchor| &anchor.token)
     }
 
+    pub(crate) fn remember_remote_anchor(
+        &mut self,
+        token: frankenterm_client::pane::RemoteSelectionAnchor,
+    ) {
+        self.native_anchor = None;
+        self.remote_anchor = Some(SelectionAnchorOwnership {
+            token,
+            authority: self.authority,
+            origin: self.origin,
+            range: self.range,
+        });
+    }
+
+    pub(crate) fn remote_anchor(&self) -> Option<&frankenterm_client::pane::RemoteSelectionAnchor> {
+        self.remote_anchor
+            .as_ref()
+            .filter(|anchor| anchor.is_current(self))
+            .map(|anchor| &anchor.token)
+    }
+
+    pub(crate) fn clear_remote_anchor_if_current(
+        &mut self,
+        token: &frankenterm_client::pane::RemoteSelectionAnchor,
+    ) {
+        if self
+            .remote_anchor
+            .as_ref()
+            .is_some_and(|anchor| anchor.is_current_token(self, token))
+        {
+            self.clear();
+        }
+    }
+
+    pub(crate) fn rebase_remote_anchor(
+        &mut self,
+        points: [Option<wezterm_term::screen::SelectionAnchorCoordinate>; 3],
+        authority: SelectionAuthority,
+        source_sequence: SequenceNo,
+    ) -> bool {
+        let Some(token) = self.remote_anchor().cloned() else {
+            return false;
+        };
+        if !self.apply_resolved_points(points, authority, source_sequence) {
+            return false;
+        }
+        self.remember_remote_anchor(token);
+        true
+    }
+
     /// Only the exact selection that captured a native token can consume its
     /// remap. Later mouse motion must not be overwritten by prepared work.
     pub(crate) fn rebase_native_anchor(
@@ -986,6 +1165,19 @@ impl Selection {
         let Some(token) = self.native_anchor().cloned() else {
             return false;
         };
+        if !self.apply_resolved_points(points, authority, source_sequence) {
+            return false;
+        }
+        self.remember_native_anchor(token);
+        true
+    }
+
+    fn apply_resolved_points(
+        &mut self,
+        points: [Option<wezterm_term::screen::SelectionAnchorCoordinate>; 3],
+        authority: SelectionAuthority,
+        source_sequence: SequenceNo,
+    ) -> bool {
         if source_sequence == SequenceNo::MAX
             || self.origin.is_some() != points[0].is_some()
             || self.range.is_some() != points[1].is_some()
@@ -1007,7 +1199,6 @@ impl Selection {
             .map(|(start, end)| SelectionRange { start, end });
         self.authority = Some(authority);
         self.seqno = source_sequence;
-        self.remember_native_anchor(token);
         true
     }
 
@@ -1025,10 +1216,12 @@ impl Selection {
         self.origin = None;
         self.authority = None;
         self.native_anchor = None;
+        self.remote_anchor = None;
     }
 
     pub fn begin(&mut self, origin: SelectionCoordinate) {
         self.native_anchor = None;
+        self.remote_anchor = None;
         self.range = None;
         self.origin = Some(origin);
     }
@@ -1522,10 +1715,12 @@ impl SelectionRange {
     }
 
     /// Yields a range representing the row indices.
-    /// Make sure that you invoke this on a normalized range!
+    /// Normalizes reverse selections. The exclusive end saturates: a row at
+    /// StableRowIndex::MAX cannot belong to a representable half-open range.
+    /// Retained-source admission independently rejects that unaddressable row.
     pub fn rows(&self) -> Range<StableRowIndex> {
         let norm = self.normalize();
-        norm.start.y..norm.end.y + 1
+        norm.start.y..norm.end.y.saturating_add(1)
     }
 
     /// Yields a range representing the selected columns for the specified row.
@@ -1574,6 +1769,34 @@ impl SelectionRange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_rows_saturates_unrepresentable_end_without_wrapping() {
+        let max = StableRowIndex::MAX;
+        for (start, end) in [(max - 2, max), (max, max - 2)] {
+            let range = SelectionRange {
+                start: SelectionCoordinate::x_y(0, start),
+                end: SelectionCoordinate::x_y(0, end),
+            }
+            .rows();
+            assert_eq!(range, max - 2..max);
+            assert!(range.contains(&(max - 1)));
+            assert!(!range.contains(&max));
+        }
+        assert!(
+            SelectionRange::start(SelectionCoordinate::x_y(0, max))
+                .rows()
+                .is_empty()
+        );
+        assert_eq!(
+            SelectionRange {
+                start: SelectionCoordinate::x_y(0, 4),
+                end: SelectionCoordinate::x_y(0, -2),
+            }
+            .rows(),
+            -2..5
+        );
+    }
 
     #[cfg(unix)]
     #[test]
@@ -2178,6 +2401,333 @@ mod tests {
     }
 
     #[test]
+    fn remote_motion_after_committed_anchor_requires_new_endpoint_capture() {
+        let (mut term, original, _) = native_anchor_fixture();
+        let old_token = original.native_anchor().unwrap().clone();
+        let mut pending = PendingNativeSelection::new(original.clone());
+        pending.committed = true;
+        let mut preview = original.clone();
+        preview.range.as_mut().unwrap().end = SelectionCoordinate::x_y(5, 3);
+        let expected = live_native_selection_text(&term, &preview);
+        let motion = PendingRemoteSelectionMotion {
+            frame: SelectionFrameStamp {
+                authority: original.authority.unwrap(),
+                source_sequence: original.seqno,
+                viewport: 0,
+                geometry: [0; 12],
+            },
+            position: wezterm_term::input::ClickPosition {
+                column: 6,
+                row: 3,
+                x_pixel_offset: 0,
+                y_pixel_offset: 0,
+            },
+            row: 3,
+            mode: SelectionMode::Cell,
+            preview: Some(preview.clone()),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+        };
+        assert!(!pending.retain_remote_motion(motion.clone()));
+        assert!(pending.remote_motion.is_none());
+        assert_eq!(pending.desired.native_anchor(), Some(&old_token));
+        // The production caller takes the normal new-capture route on false,
+        // so the preview is never paired with the old committed ownership.
+        let next = PendingNativeSelection::new(preview.clone());
+        let mut visible = original.clone();
+        assert!(next.publish_remote_preview(&mut visible, original.authority));
+        assert_eq!(visible, preview);
+        assert!(visible.native_anchor().is_none());
+        assert!(!next.committed);
+        assert_eq!(
+            next.try_commit(&mut visible, NativeSelectionCapture::Busy),
+            None
+        );
+        assert_eq!(visible, preview);
+        let new_token = term
+            .screen_mut()
+            .capture_selection_anchor(next.desired.seqno, next.desired.native_points())
+            .unwrap();
+        assert_ne!(new_token, old_token);
+        next.try_commit(
+            &mut visible,
+            NativeSelectionCapture::Ready(new_token.clone()),
+        )
+        .unwrap();
+        assert_eq!(visible.native_anchor(), Some(&new_token));
+        assert_eq!(live_native_selection_text(&term, &visible), expected);
+
+        // A remap-only wait has no new preview and still retains the original
+        // token; a released copy cannot be superseded by later motion.
+        let mut remap = motion.clone();
+        remap.preview = None;
+        assert!(pending.retain_remote_motion(remap));
+        pending.copy = Some(config::keyassignment::ClipboardCopyDestination::Clipboard);
+        assert!(pending.retain_remote_motion(motion));
+        assert!(pending.remote_motion.as_ref().unwrap().preview.is_none());
+        assert_eq!(pending.desired.native_anchor(), Some(&old_token));
+    }
+
+    #[test]
+    fn remote_motion_preview_coalesces_without_overwriting_capture_or_release() {
+        let (term, original, _) = native_anchor_fixture();
+        let authority = original.authority;
+        let frame = SelectionFrameStamp {
+            authority: authority.unwrap(),
+            source_sequence: original.seqno,
+            viewport: 0,
+            geometry: [0; 12],
+        };
+        let mut desired = original.clone();
+        desired.range.as_mut().unwrap().end = SelectionCoordinate::x_y(4, 3);
+        let mut pending = PendingNativeSelection::new(desired.clone());
+        let original_identity = Arc::clone(&pending.identity);
+        let mut visible = original.clone();
+        assert!(pending.publish_remote_preview(&mut visible, authority));
+        assert_eq!(visible.range, desired.range);
+        assert_ne!(
+            live_native_selection_text(&term, &visible),
+            live_native_selection_text(&term, &original)
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for column in [6, 8] {
+            let mut preview = desired.clone();
+            preview.range.as_mut().unwrap().end = SelectionCoordinate::x_y(column, 3);
+            pending.retain_remote_motion(PendingRemoteSelectionMotion {
+                frame,
+                position: wezterm_term::input::ClickPosition {
+                    column,
+                    row: 3,
+                    x_pixel_offset: 0,
+                    y_pixel_offset: 0,
+                },
+                row: 3,
+                mode: SelectionMode::Cell,
+                preview: Some(preview),
+                deadline,
+            });
+        }
+        assert!(Arc::ptr_eq(&pending.identity, &original_identity));
+        assert_eq!(
+            pending.desired, desired,
+            "in-flight capture keeps its exact request"
+        );
+        assert_eq!(pending.remote_motion.as_ref().unwrap().position.column, 8);
+        pending.copy = Some(config::keyassignment::ClipboardCopyDestination::Clipboard);
+        let mut hover = pending.remote_motion.clone().unwrap();
+        hover.position.column = 70;
+        pending.retain_remote_motion(hover);
+        assert_eq!(pending.remote_motion.as_ref().unwrap().position.column, 8);
+        let next = pending.superseding_remote_preview(authority).unwrap();
+        assert!(!Arc::ptr_eq(&next.identity, &original_identity));
+        assert_eq!(
+            next.desired.range.unwrap().end,
+            SelectionCoordinate::x_y(8, 3)
+        );
+        assert!(next.copy.is_some());
+        assert!(next.publish_remote_preview(&mut visible, authority));
+        assert_eq!(visible, next.desired);
+        let mut resized = authority.unwrap();
+        resized.geometry.0 = 37;
+        assert!(pending.superseding_remote_preview(Some(resized)).is_none());
+        assert!(!next.publish_remote_preview(&mut visible, Some(resized)));
+        assert_eq!(visible, next.desired);
+    }
+
+    #[test]
+    fn remote_release_captures_latest_preview_before_later_resize() {
+        let (mut term, original, _) = native_anchor_fixture();
+        let mut pending = PendingNativeSelection::new(original.clone());
+        let mut latest = original.clone();
+        latest.range.as_mut().unwrap().end = SelectionCoordinate::x_y(5, 3);
+        let expected = live_native_selection_text(&term, &latest);
+        assert_ne!(expected, live_native_selection_text(&term, &original));
+        let frame = SelectionFrameStamp {
+            authority: original.authority.unwrap(),
+            source_sequence: original.seqno,
+            viewport: 0,
+            geometry: [0; 12],
+        };
+        pending.retain_remote_motion(PendingRemoteSelectionMotion {
+            frame,
+            position: wezterm_term::input::ClickPosition {
+                column: 6,
+                row: 3,
+                x_pixel_offset: 0,
+                y_pixel_offset: 0,
+            },
+            row: 3,
+            mode: SelectionMode::Cell,
+            preview: Some(latest),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+        });
+        // This is the release promotion used before the synchronous first
+        // poll of the final remote capture, not completion of the older RPC.
+        let final_capture = pending
+            .superseding_remote_preview(original.authority)
+            .unwrap();
+        let token = term
+            .screen_mut()
+            .capture_selection_anchor(
+                final_capture.desired.seqno,
+                final_capture.desired.native_points(),
+            )
+            .unwrap();
+        term.resize(wezterm_term::TerminalSize {
+            rows: 24,
+            cols: 37,
+            dpi: 96,
+            pixel_width: 296,
+            pixel_height: 384,
+        });
+        let sequence = term.current_seqno();
+        let mut resized = original.authority.unwrap();
+        resized.sequence = sequence;
+        resized.geometry = (37, 24, 96, 296, 384);
+        assert!(
+            pending.superseding_remote_preview(Some(resized)).is_none(),
+            "a late release cannot retroactively capture old-frame coordinates"
+        );
+        let mut committed = original;
+        final_capture
+            .try_commit(&mut committed, NativeSelectionCapture::Ready(token.clone()))
+            .unwrap();
+        let points = term
+            .screen()
+            .resolve_selection_anchor(&token, sequence)
+            .unwrap();
+        assert!(committed.rebase_native_anchor(points, resized, sequence));
+        assert_eq!(live_native_selection_text(&term, &committed), expected);
+    }
+
+    #[test]
+    fn remote_motion_resize_replay_requires_owned_anchor_and_presented_endpoint_frame() {
+        // Real terminal anchor lifecycle plus the production GUI replay gate;
+        // the remote transport and native window callback are separate proof.
+        let (mut term, original, _) = native_anchor_fixture();
+        let token = original.native_anchor().unwrap().clone();
+        let mut pending = PendingNativeSelection::new(original.clone());
+        let old_frame = SelectionFrameStamp {
+            authority: original.authority.unwrap(),
+            source_sequence: original.seqno,
+            viewport: 0,
+            geometry: [0; 12],
+        };
+        term.resize(wezterm_term::TerminalSize {
+            rows: 24,
+            cols: 37,
+            dpi: 96,
+            pixel_width: 296,
+            pixel_height: 384,
+        });
+        let sequence = term.current_seqno();
+        let mut authority = old_frame.authority;
+        authority.sequence = sequence;
+        authority.geometry = (37, 24, 96, 296, 384);
+        let frame = SelectionFrameStamp {
+            authority,
+            source_sequence: sequence,
+            ..old_frame
+        };
+        let now = std::time::Instant::now();
+        pending.retain_remote_motion(PendingRemoteSelectionMotion {
+            frame,
+            position: wezterm_term::input::ClickPosition {
+                column: 5,
+                row: 4,
+                x_pixel_offset: 0,
+                y_pixel_offset: 0,
+            },
+            row: 4,
+            mode: SelectionMode::Cell,
+            preview: None,
+            deadline: now + std::time::Duration::from_secs(5),
+        });
+        pending.copy = Some(config::keyassignment::ClipboardCopyDestination::Clipboard);
+        let mut visible = original.clone();
+        assert_eq!(
+            pending.try_commit(&mut visible, NativeSelectionCapture::Busy),
+            None
+        );
+        assert_eq!(pending.desired, original);
+        pending
+            .try_commit(&mut visible, NativeSelectionCapture::Ready(token.clone()))
+            .unwrap();
+        assert!(!visible.is_authorized_by(Some(authority)));
+        let points = term
+            .screen()
+            .resolve_selection_anchor(&token, sequence)
+            .unwrap();
+        assert!(visible.rebase_native_anchor(points, authority, sequence));
+        assert_eq!(visible.native_anchor(), Some(&token));
+        let motion = pending.remote_motion.as_ref().unwrap();
+        assert!(!motion.can_replay(None, now));
+        assert!(!motion.can_replay(Some(old_frame), now));
+        let mut frames = SelectionFrameState::default();
+        frames.stage(Some(frame), Some(frame), true);
+        assert!(!motion.can_replay(frames.for_mouse(Some(frame)), now));
+        frames.presented();
+        assert!(motion.can_replay(frames.for_mouse(Some(frame)), now));
+        assert!(!motion.can_replay(Some(frame), motion.deadline));
+        assert!(pending.copy.is_some());
+    }
+
+    #[test]
+    fn delayed_anchor_commit_retains_original_authority_until_remapped() {
+        // Exercise the shared GUI commit state with an actual terminal anchor.
+        // The client RPC test separately covers a delayed remote capture reply;
+        // this is not a network or native-window fixture.
+        let (mut term, mut committed, _) = native_anchor_fixture();
+        let original = committed.clone();
+        let mut desired = original.clone();
+        desired.range.as_mut().unwrap().end = SelectionCoordinate::x_y(5, 3);
+        let pending = PendingNativeSelection::new(desired);
+        let expected = live_native_selection_text(&term, &pending.desired);
+        let token = term
+            .screen_mut()
+            .capture_selection_anchor(pending.desired.seqno, pending.desired.native_points())
+            .unwrap();
+        let original_authority = pending.desired.authority;
+        assert_eq!(
+            pending.try_commit(&mut committed, NativeSelectionCapture::Busy),
+            None
+        );
+        assert_eq!(committed, original);
+        term.resize(wezterm_term::TerminalSize {
+            rows: 24,
+            cols: 37,
+            dpi: 96,
+            pixel_width: 296,
+            pixel_height: 384,
+        });
+        let sequence = term.current_seqno();
+        let mut current_authority = original_authority.unwrap();
+        current_authority.sequence = sequence;
+        current_authority.geometry = (37, 24, 96, 296, 384);
+        assert_eq!(
+            pending.try_commit(&mut committed, NativeSelectionCapture::Busy),
+            None
+        );
+        assert_eq!(pending.desired.authority, original_authority);
+        assert_eq!(committed, original);
+        assert_eq!(
+            pending.try_commit(&mut committed, NativeSelectionCapture::Ready(token.clone())),
+            Some(NativeSelectionCommit::Applied {
+                needs_repaint: true
+            })
+        );
+        assert_eq!(committed.native_anchor(), Some(&token));
+        assert_eq!(committed.authority, original_authority);
+        assert!(!committed.is_authorized_by(Some(current_authority)));
+        let points = term
+            .screen()
+            .resolve_selection_anchor(&token, sequence)
+            .unwrap();
+        assert!(committed.rebase_native_anchor(points, current_authority, sequence));
+        assert!(committed.is_authorized_by(Some(current_authority)));
+        assert_eq!(live_native_selection_text(&term, &committed), expected);
+    }
+
+    #[test]
     fn native_selection_commit_rejects_obsolete_intent_without_replacing_anchor() {
         let (_, mut committed, _) = native_anchor_fixture();
         let previous = committed.clone();
@@ -2373,6 +2923,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn remote_anchor_ownership_model_rejects_superseded_selection() {
+        // Model tokens exercise the production ownership predicate, not the
+        // remote lease/RPC implementation or a live remote pane.
+        let authority = SelectionAuthority {
+            source: 1,
+            sequence: 10,
+            geometry: (80, 24, 96, 800, 480),
+            alternate: false,
+        };
+        let mut selection = Selection::default();
+        selection.begin(SelectionCoordinate::x_y(2, -4));
+        selection.range = Some(SelectionRange {
+            start: SelectionCoordinate::x_y(2, -4),
+            end: SelectionCoordinate::x_y(6, -2),
+        });
+        selection.authority = Some(authority);
+        let owned = SelectionAnchorOwnership {
+            token: 11u64,
+            authority: selection.authority,
+            origin: selection.origin,
+            range: selection.range,
+        };
+        assert!(owned.is_current_token(&selection, &11));
+        assert!(!owned.is_current_token(&selection, &12));
+        let original = selection.clone();
+        selection.range.as_mut().unwrap().end.y += 1;
+        assert!(!owned.is_current_token(&selection, &11));
+        selection = original.clone();
+        selection.authority.as_mut().unwrap().sequence += 1;
+        assert!(!owned.is_current_token(&selection, &11));
+        selection = original.clone();
+        selection.rectangular = true;
+        assert!(!owned.is_current_token(&selection, &11));
+        selection = original;
+        selection.clear();
+        assert!(!owned.is_current_token(&selection, &11));
     }
 
     #[test]

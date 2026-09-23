@@ -7028,11 +7028,182 @@ enum ReliableInputTestFault {
     CancelAfterEnqueue,
 }
 
+const MAX_REMOTE_SELECTION_ANCHORS: usize = 16;
+const SELECTION_OPERATION_WINDOW: u64 = 4096;
+
+struct RemoteSelectionAnchor {
+    request: codec::CaptureSelectionAnchorV1,
+    registration: PaneRegistrationHandle,
+    token: wezterm_term::screen::ScreenSelectionAnchor,
+    renewed: Instant,
+}
+
+#[derive(Default)]
+struct RemoteSelectionAnchors {
+    active: HashMap<u64, RemoteSelectionAnchor>,
+    retired: HashSet<u64>,
+    high_water: u64,
+}
+
+impl RemoteSelectionAnchors {
+    fn reap(&mut self, now: Instant) {
+        let expired: Vec<_> = self
+            .active
+            .iter()
+            .filter_map(|(&id, entry)| {
+                (now.saturating_duration_since(entry.renewed).as_secs()
+                    >= codec::SELECTION_ANCHOR_LIFETIME_SECS)
+                    .then_some(id)
+            })
+            .collect();
+        for id in expired {
+            self.active.remove(&id);
+            self.retire(id);
+        }
+    }
+
+    fn retire(&mut self, id: u64) {
+        self.high_water = self.high_water.max(id);
+        let floor = self.high_water.saturating_sub(SELECTION_OPERATION_WINDOW);
+        self.retired.retain(|&old| old > floor);
+        if id > floor {
+            self.retired.insert(id);
+        }
+    }
+
+    fn capture(
+        &mut self,
+        request: codec::CaptureSelectionAnchorV1,
+        registration: &PaneRegistrationHandle,
+        pane: &CurrentPane<'_>,
+        now: Instant,
+    ) -> codec::SelectionAnchorCaptureOutcomeV1 {
+        use codec::SelectionAnchorCaptureOutcomeV1 as Outcome;
+        self.reap(now);
+        let id = request.operation_id;
+        if let Some(entry) = self.active.get(&id) {
+            return if entry.request == request
+                && entry.registration.wire_identity() == registration.wire_identity()
+            {
+                Outcome::Captured
+            } else {
+                Outcome::SourceChanged
+            };
+        }
+        if id == 0
+            || id <= self.high_water.saturating_sub(SELECTION_OPERATION_WINDOW)
+            || self.retired.contains(&id)
+        {
+            return Outcome::SourceChanged;
+        }
+        if self.active.len() >= MAX_REMOTE_SELECTION_ANCHORS {
+            return Outcome::Capacity;
+        }
+        let (floor, dimensions) = match pane.get_line_layout() {
+            Ok(Some(layout)) => layout,
+            Ok(None) => return Outcome::Unsupported,
+            Err(_) => return Outcome::Busy,
+        };
+        if floor > request.layout.seqno
+            || request.layout.seqno > pane.get_current_seqno()
+            || !mux::renderable::same_line_layout_geometry(&dimensions, &request.layout.dimensions)
+        {
+            return Outcome::SourceChanged;
+        }
+        let points = request.points.map(|point| {
+            point.map(|point| wezterm_term::screen::SelectionAnchorCoordinate {
+                column: point.column,
+                row: point.row,
+            })
+        });
+        match pane.capture_selection_anchor(floor, request.layout.seqno, dimensions, points) {
+            None | Some(Ok(None)) => Outcome::Unsupported,
+            Some(Err(mux::localpane::SelectionAnchorCaptureError::Busy)) => Outcome::Busy,
+            Some(Err(mux::localpane::SelectionAnchorCaptureError::SourceChanged)) => {
+                Outcome::SourceChanged
+            }
+            Some(Ok(Some(token))) => {
+                self.retire(id);
+                self.active.insert(
+                    id,
+                    RemoteSelectionAnchor {
+                        request,
+                        registration: registration.clone(),
+                        token,
+                        renewed: now,
+                    },
+                );
+                Outcome::Captured
+            }
+        }
+    }
+
+    fn resolve(
+        &mut self,
+        request: &codec::ResolveSelectionAnchorV1,
+        registration: &PaneRegistrationHandle,
+        pane: &CurrentPane<'_>,
+        now: Instant,
+    ) -> codec::SelectionAnchorResolveOutcomeV1 {
+        use codec::SelectionAnchorResolveOutcomeV1 as Outcome;
+        self.reap(now);
+        let Some(entry) = self.active.get_mut(&request.operation_id) else {
+            return Outcome::SourceChanged;
+        };
+        if entry.request.pane_id != request.pane_id
+            || entry.registration.wire_identity() != registration.wire_identity()
+        {
+            return Outcome::SourceChanged;
+        }
+        match pane.selection_anchor_snapshot(&entry.token) {
+            None => Outcome::Unsupported,
+            Some(None) => {
+                entry.renewed = now;
+                Outcome::Busy
+            }
+            Some(Some((layout_floor, sequence, dimensions, Some(points)))) => {
+                entry.renewed = now;
+                Outcome::Snapshot {
+                    layout_floor,
+                    sequence,
+                    dimensions,
+                    points: points.map(|point| {
+                        point.map(|point| codec::SelectionAnchorPointV1 {
+                            column: point.column,
+                            row: point.row,
+                        })
+                    }),
+                }
+            }
+            Some(Some((_, _, _, None))) => {
+                self.active.remove(&request.operation_id);
+                Outcome::SourceChanged
+            }
+        }
+    }
+
+    fn release(&mut self, request: &codec::ReleaseSelectionAnchorV1) -> bool {
+        if request.operation_id == 0
+            || self
+                .active
+                .get(&request.operation_id)
+                .is_some_and(|entry| entry.request.pane_id != request.pane_id)
+        {
+            return false;
+        }
+        self.active.remove(&request.operation_id);
+        self.retire(request.operation_id);
+        true
+    }
+}
+
 pub struct SessionHandler {
     to_write_tx: PduSender,
     owner: SessionOwner,
     topology_stream_id: TopologyStreamId,
     per_pane: HashMap<PaneId, TrackedPane>,
+    selection_anchors: Arc<parking_lot::Mutex<RemoteSelectionAnchors>>,
+    selection_anchor_expiry_task: Option<promise::spawn::MainThreadSpawnedTask<()>>,
     push_coordinator: Option<Arc<PanePushCoordinator>>,
     push_task: Option<promise::spawn::MainThreadSpawnedTask<()>>,
     client_id: Option<Arc<ClientId>>,
@@ -7046,6 +7217,8 @@ pub struct SessionHandler {
 impl Drop for SessionHandler {
     fn drop(&mut self) {
         self.owner.retire();
+        drop(self.selection_anchor_expiry_task.take());
+        self.selection_anchors.lock().active.clear();
         if let Some(coordinator) = &self.push_coordinator {
             coordinator.close();
         }
@@ -7102,11 +7275,15 @@ impl SessionHandler {
             let _guard = guard;
             worker.run(wake_rx, sender, authority).await;
         });
+        let selection_anchors =
+            Arc::new(parking_lot::Mutex::new(RemoteSelectionAnchors::default()));
         Ok(Self {
             to_write_tx,
             owner,
             topology_stream_id,
             per_pane: HashMap::new(),
+            selection_anchors,
+            selection_anchor_expiry_task: None,
             push_coordinator: Some(coordinator),
             push_task: Some(task),
             client_id: None,
@@ -7116,6 +7293,30 @@ impl SessionHandler {
             reliable_input_test_fault: ReliableInputTestFault::None,
             proxy_client_id: None,
         })
+    }
+
+    fn ensure_selection_anchor_expiry_task(&mut self) -> bool {
+        if self.selection_anchor_expiry_task.is_some() {
+            return true;
+        }
+        let reservation = match try_reserve_main_thread_with_low_priority(
+            MainThreadServiceClass::Render,
+            MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+        ) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            _ => return false,
+        };
+        let anchors = Arc::downgrade(&self.selection_anchors);
+        self.selection_anchor_expiry_task = Some(reservation.spawn_local(async move {
+            loop {
+                promise::spawn::sleep(std::time::Duration::from_secs(30)).await;
+                let Some(anchors) = anchors.upgrade() else {
+                    return;
+                };
+                anchors.lock().reap(Instant::now());
+            }
+        }));
+        true
     }
 
     #[cfg(test)]
@@ -7128,6 +7329,8 @@ impl SessionHandler {
             owner: SessionOwner::new(mux_owner),
             topology_stream_id: TopologyStreamId::from_bytes(*uuid::Uuid::new_v4().as_bytes()),
             per_pane: HashMap::new(),
+            selection_anchors: Arc::new(parking_lot::Mutex::new(RemoteSelectionAnchors::default())),
+            selection_anchor_expiry_task: None,
             push_coordinator: None,
             push_task: None,
             client_id: None,
@@ -9002,6 +9205,98 @@ impl SessionHandler {
                 );
             }
 
+            Pdu::CaptureSelectionAnchorV1(request) => {
+                if !self.ensure_selection_anchor_expiry_task() {
+                    send_response(Ok(Pdu::CaptureSelectionAnchorResponseV1(
+                        codec::CaptureSelectionAnchorResponseV1 {
+                            pane_id: request.pane_id,
+                            operation_id: request.operation_id,
+                            outcome: codec::SelectionAnchorCaptureOutcomeV1::Busy,
+                        },
+                    )));
+                    return;
+                }
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, request.pane_id, &send_response)
+                else {
+                    return;
+                };
+                let anchors = Arc::clone(&self.selection_anchors);
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Interactive,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                with_current_pane(&authority, &registration, |pane| {
+                                    let pane_id = request.pane_id;
+                                    let operation_id = request.operation_id;
+                                    let outcome = anchors.lock().capture(
+                                        request,
+                                        &registration,
+                                        pane,
+                                        Instant::now(),
+                                    );
+                                    Ok(Pdu::CaptureSelectionAnchorResponseV1(
+                                        codec::CaptureSelectionAnchorResponseV1 {
+                                            pane_id,
+                                            operation_id,
+                                            outcome,
+                                        },
+                                    ))
+                                })
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
+            }
+            Pdu::ResolveSelectionAnchorV1(request) => {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, request.pane_id, &send_response)
+                else {
+                    return;
+                };
+                let anchors = Arc::clone(&self.selection_anchors);
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Interactive,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                with_current_pane(&authority, &registration, |pane| {
+                                    let outcome = anchors.lock().resolve(
+                                        &request,
+                                        &registration,
+                                        pane,
+                                        Instant::now(),
+                                    );
+                                    Ok(Pdu::ResolveSelectionAnchorResponseV1(
+                                        codec::ResolveSelectionAnchorResponseV1 {
+                                            pane_id: request.pane_id,
+                                            operation_id: request.operation_id,
+                                            outcome,
+                                        },
+                                    ))
+                                })
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
+            }
+            Pdu::ReleaseSelectionAnchorV1(request) => {
+                let result = authority.try_run(|| self.selection_anchors.lock().release(&request));
+                send_response(result.map(|released| {
+                    Pdu::ReleaseSelectionAnchorResponseV1(codec::ReleaseSelectionAnchorResponseV1 {
+                        pane_id: request.pane_id,
+                        operation_id: request.operation_id,
+                        released,
+                    })
+                }));
+            }
             request @ (Pdu::GetLines(_) | Pdu::GetLinesAtLayout(_)) => {
                 let (pane_id, lines, layout) = match request {
                     Pdu::GetLines(GetLines { pane_id, lines }) => (pane_id, lines, None),
@@ -9803,6 +10098,9 @@ impl SessionHandler {
             | Pdu::SearchScrollbackResponse { .. }
             | Pdu::GetLinesResponse { .. }
             | Pdu::GetLinesAtLayoutResponse { .. }
+            | Pdu::CaptureSelectionAnchorResponseV1 { .. }
+            | Pdu::ResolveSelectionAnchorResponseV1 { .. }
+            | Pdu::ReleaseSelectionAnchorResponseV1 { .. }
             | Pdu::GetSemanticZonesResponse { .. }
             | Pdu::GetCodecVersionResponse { .. }
             | Pdu::WindowWorkspaceChanged { .. }
@@ -10000,6 +10298,609 @@ async fn move_pane(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    struct SelectionChildGuard(Box<dyn portable_pty::ChildKiller + Send + Sync>);
+
+    #[cfg(unix)]
+    impl Drop for SelectionChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+        }
+    }
+
+    #[cfg(unix)]
+    fn real_selection_pane(pane_id: PaneId) -> (Arc<dyn mux::pane::Pane>, SelectionChildGuard) {
+        #[derive(Debug)]
+        struct Config;
+        impl wezterm_term::TerminalConfiguration for Config {
+            fn color_palette(&self) -> wezterm_term::color::ColorPalette {
+                wezterm_term::color::ColorPalette::default()
+            }
+        }
+        let size = wezterm_term::TerminalSize {
+            rows: 4,
+            cols: 20,
+            pixel_width: 200,
+            pixel_height: 80,
+            dpi: 96,
+        };
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 4,
+                cols: 20,
+                pixel_width: 200,
+                pixel_height: 80,
+            })
+            .unwrap();
+        // Keep a real PTY slave alive until the owning LocalPane is dropped;
+        // an already exited child would race the mux's EOF retirement worker.
+        let command = portable_pty::CommandBuilder::new("/bin/cat");
+        let child = pair.slave.spawn_command(command).unwrap();
+        let child_guard = SelectionChildGuard(child.clone_killer());
+        let writer = pair.master.take_writer().unwrap();
+        let mut terminal = wezterm_term::Terminal::new(
+            size,
+            Arc::new(Config),
+            "selection-anchor",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        terminal.advance_bytes(b"abcdefghijklmnop");
+        let pane = Arc::new(mux::localpane::LocalPane::new(
+            pane_id,
+            terminal,
+            child,
+            pair.master,
+            writer,
+            1,
+            [7; 16],
+            "selection-anchor-test".into(),
+        ));
+        (pane, child_guard)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_selection_anchor_dispatch_round_trip_reflows_and_releases_real_pane() {
+        fn exchange(
+            handler: &mut SessionHandler,
+            executor: &SimpleExecutor,
+            captured: &Arc<Mutex<Vec<DecodedPdu>>>,
+            serial: u64,
+            request: Pdu,
+        ) -> Pdu {
+            let frame = request.encode_frame(serial).unwrap();
+            handler.process_one(Pdu::decode(frame.as_slice()).unwrap());
+            tick_until_response(executor, captured, 1);
+            let response = take_response(captured);
+            assert_eq!(response.serial, serial);
+            let frame = response.pdu.encode_frame(response.serial).unwrap();
+            let decoded = Pdu::decode(frame.as_slice()).unwrap();
+            assert_eq!(decoded.serial, serial);
+            decoded.pdu
+        }
+
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = SimpleExecutor::new();
+        let owner = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&owner);
+        let (pane, _child_guard) = real_selection_pane(986);
+        owner.add_pane(&pane).unwrap();
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, owner).unwrap();
+        assert!(handler.selection_anchor_expiry_task.is_none());
+        let (_, dimensions) = pane.get_line_layout().unwrap().unwrap();
+        let capture = Pdu::CaptureSelectionAnchorV1(codec::CaptureSelectionAnchorV1 {
+            pane_id: 986,
+            operation_id: 1,
+            layout: codec::LineReadLayout {
+                seqno: pane.get_current_seqno(),
+                dimensions,
+            },
+            points: [
+                None,
+                Some(codec::SelectionAnchorPointV1 {
+                    column: Some(2),
+                    row: 0,
+                }),
+                Some(codec::SelectionAnchorPointV1 {
+                    column: Some(13),
+                    row: 0,
+                }),
+            ],
+        });
+        assert_eq!(
+            exchange(&mut handler, &executor, &captured, 1, capture),
+            Pdu::CaptureSelectionAnchorResponseV1(codec::CaptureSelectionAnchorResponseV1 {
+                pane_id: 986,
+                operation_id: 1,
+                outcome: codec::SelectionAnchorCaptureOutcomeV1::Captured,
+            })
+        );
+        assert!(handler.selection_anchor_expiry_task.is_some());
+        pane.resize(TerminalSize {
+            rows: 4,
+            cols: 8,
+            pixel_width: 80,
+            pixel_height: 80,
+            dpi: 96,
+        })
+        .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while pane.get_dimensions().cols != 8 {
+            assert!(
+                Instant::now() < deadline,
+                "real dispatch fixture resize did not settle"
+            );
+            executor.try_tick().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let resolve = codec::ResolveSelectionAnchorV1 {
+            pane_id: 986,
+            operation_id: 1,
+        };
+        let response = exchange(
+            &mut handler,
+            &executor,
+            &captured,
+            2,
+            Pdu::ResolveSelectionAnchorV1(resolve.clone()),
+        );
+        let Pdu::ResolveSelectionAnchorResponseV1(codec::ResolveSelectionAnchorResponseV1 {
+            pane_id: 986,
+            operation_id: 1,
+            outcome:
+                codec::SelectionAnchorResolveOutcomeV1::Snapshot {
+                    layout_floor,
+                    sequence,
+                    dimensions,
+                    points,
+                },
+        }) = response
+        else {
+            panic!("real dispatch lost captured selection: {response:?}");
+        };
+        assert!(layout_floor <= sequence);
+        assert_eq!(dimensions.cols, 8);
+        assert_eq!(
+            points,
+            [
+                None,
+                Some(codec::SelectionAnchorPointV1 {
+                    column: Some(2),
+                    row: 0
+                }),
+                Some(codec::SelectionAnchorPointV1 {
+                    column: Some(5),
+                    row: 1
+                })
+            ]
+        );
+        assert_eq!(
+            exchange(
+                &mut handler,
+                &executor,
+                &captured,
+                3,
+                Pdu::ReleaseSelectionAnchorV1(codec::ReleaseSelectionAnchorV1 {
+                    pane_id: 986,
+                    operation_id: 1
+                })
+            ),
+            Pdu::ReleaseSelectionAnchorResponseV1(codec::ReleaseSelectionAnchorResponseV1 {
+                pane_id: 986,
+                operation_id: 1,
+                released: true
+            })
+        );
+        assert_eq!(
+            exchange(
+                &mut handler,
+                &executor,
+                &captured,
+                4,
+                Pdu::ResolveSelectionAnchorV1(resolve)
+            ),
+            Pdu::ResolveSelectionAnchorResponseV1(codec::ResolveSelectionAnchorResponseV1 {
+                pane_id: 986,
+                operation_id: 1,
+                outcome: codec::SelectionAnchorResolveOutcomeV1::SourceChanged,
+            })
+        );
+        assert!(handler.selection_anchors.lock().active.is_empty());
+        drop(handler);
+        drain_simple_executor(&executor);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_selection_anchor_real_reflow_retry_release_and_source_change() {
+        use codec::{
+            SelectionAnchorCaptureOutcomeV1 as Capture, SelectionAnchorResolveOutcomeV1 as Resolve,
+        };
+        let owner = Arc::new(Mux::new(None));
+        let (pane, _child_guard) = real_selection_pane(981);
+        owner.add_pane(&pane).unwrap();
+        let registration = owner.capture_pane_registration(&pane).unwrap();
+        let (_, dimensions) = pane.get_line_layout().unwrap().unwrap();
+        let request = codec::CaptureSelectionAnchorV1 {
+            pane_id: 981,
+            operation_id: 3,
+            layout: codec::LineReadLayout {
+                seqno: pane.get_current_seqno(),
+                dimensions,
+            },
+            points: [
+                None,
+                Some(codec::SelectionAnchorPointV1 {
+                    column: Some(2),
+                    row: 0,
+                }),
+                Some(codec::SelectionAnchorPointV1 {
+                    column: Some(13),
+                    row: 0,
+                }),
+            ],
+        };
+        let now = Instant::now();
+        let mut anchors = RemoteSelectionAnchors::default();
+        registration
+            .try_with_current(|current| {
+                assert_eq!(
+                    anchors.capture(request.clone(), &registration, &current, now),
+                    Capture::Captured
+                );
+                assert_eq!(
+                    anchors.capture(request.clone(), &registration, &current, now),
+                    Capture::Captured
+                );
+                let mut changed = request.clone();
+                changed.points[1].as_mut().unwrap().column = Some(3);
+                assert_eq!(
+                    anchors.capture(changed, &registration, &current, now),
+                    Capture::SourceChanged
+                );
+            })
+            .unwrap();
+        assert_eq!(anchors.active.len(), 1);
+        pane.resize(wezterm_term::TerminalSize {
+            rows: 4,
+            cols: 8,
+            pixel_width: 80,
+            pixel_height: 80,
+            dpi: 96,
+        })
+        .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while pane.get_dimensions().cols != 8 {
+            assert!(Instant::now() < deadline, "real resize did not settle");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let resolve = codec::ResolveSelectionAnchorV1 {
+            pane_id: 981,
+            operation_id: 3,
+        };
+        let result = registration
+            .try_with_current(|current| anchors.resolve(&resolve, &registration, &current, now))
+            .unwrap();
+        match result {
+            Resolve::Snapshot {
+                points, dimensions, ..
+            } => {
+                assert_eq!(dimensions.cols, 8);
+                assert_eq!(
+                    points[1],
+                    Some(codec::SelectionAnchorPointV1 {
+                        column: Some(2),
+                        row: 0
+                    })
+                );
+                assert_eq!(
+                    points[2],
+                    Some(codec::SelectionAnchorPointV1 {
+                        column: Some(5),
+                        row: 1
+                    })
+                );
+            }
+            other => panic!("real anchor did not survive reflow: {other:?}"),
+        }
+        assert!(anchors.release(&codec::ReleaseSelectionAnchorV1 {
+            pane_id: 981,
+            operation_id: 3
+        }));
+        registration
+            .try_with_current(|current| {
+                assert_eq!(
+                    anchors.capture(request.clone(), &registration, &current, now),
+                    Capture::SourceChanged
+                );
+                assert_eq!(
+                    anchors.resolve(&resolve, &registration, &current, now),
+                    Resolve::SourceChanged
+                );
+            })
+            .unwrap();
+        assert!(anchors.active.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_selection_anchor_capacity_out_of_order_expiry_and_cancellation() {
+        use codec::SelectionAnchorCaptureOutcomeV1 as Outcome;
+        let owner = Arc::new(Mux::new(None));
+        let (pane, _child_guard) = real_selection_pane(982);
+        owner.add_pane(&pane).unwrap();
+        let registration = owner.capture_pane_registration(&pane).unwrap();
+        let (_, dimensions) = pane.get_line_layout().unwrap().unwrap();
+        let base = codec::CaptureSelectionAnchorV1 {
+            pane_id: 982,
+            operation_id: 20,
+            layout: codec::LineReadLayout {
+                seqno: pane.get_current_seqno(),
+                dimensions,
+            },
+            points: [
+                Some(codec::SelectionAnchorPointV1 {
+                    column: Some(1),
+                    row: 0,
+                }),
+                None,
+                None,
+            ],
+        };
+        let now = Instant::now();
+        let mut anchors = RemoteSelectionAnchors::default();
+        registration
+            .try_with_current(|current| {
+                for id in (5..=20).rev() {
+                    let mut request = base.clone();
+                    request.operation_id = id;
+                    assert_eq!(
+                        anchors.capture(request, &registration, &current, now),
+                        Outcome::Captured
+                    );
+                }
+                let mut excess = base.clone();
+                excess.operation_id = 21;
+                assert_eq!(
+                    anchors.capture(excess.clone(), &registration, &current, now),
+                    Outcome::Capacity
+                );
+                let expired =
+                    now + std::time::Duration::from_secs(codec::SELECTION_ANCHOR_LIFETIME_SECS);
+                anchors.reap(expired);
+                assert!(anchors.active.is_empty());
+                assert_eq!(
+                    anchors.capture(base.clone(), &registration, &current, expired),
+                    Outcome::SourceChanged
+                );
+                assert_eq!(
+                    anchors.capture(excess, &registration, &current, expired),
+                    Outcome::Captured
+                );
+                assert!(anchors.release(&codec::ReleaseSelectionAnchorV1 {
+                    pane_id: 982,
+                    operation_id: 22
+                }));
+                let mut cancelled = base.clone();
+                cancelled.operation_id = 22;
+                assert_eq!(
+                    anchors.capture(cancelled, &registration, &current, expired),
+                    Outcome::SourceChanged
+                );
+            })
+            .unwrap();
+        for id in 100..10_000 {
+            anchors.retire(id);
+        }
+        assert!(anchors.retired.len() <= SELECTION_OPERATION_WINDOW as usize);
+        assert_eq!(
+            anchors.active.len(),
+            1,
+            "replay-window advance must not retire live anchors"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_selection_anchor_capture_tolerates_unrelated_scrollback_growth() {
+        let owner = Arc::new(Mux::new(None));
+        let (pane, _child_guard) = real_selection_pane(984);
+        owner.add_pane(&pane).unwrap();
+        let registration = owner.capture_pane_registration(&pane).unwrap();
+        let (_, dimensions) = pane.get_line_layout().unwrap().unwrap();
+        let request = codec::CaptureSelectionAnchorV1 {
+            pane_id: 984,
+            operation_id: 1,
+            layout: codec::LineReadLayout {
+                seqno: pane.get_current_seqno(),
+                dimensions,
+            },
+            points: [
+                Some(codec::SelectionAnchorPointV1 {
+                    column: Some(1),
+                    row: 0,
+                }),
+                None,
+                None,
+            ],
+        };
+        pane.perform_actions(vec![
+            termwiz::escape::Action::Control(
+                termwiz::escape::ControlCode::LineFeed
+            );
+            6
+        ])
+        .unwrap();
+        let (_, after) = pane.get_line_layout().unwrap().unwrap();
+        assert_ne!(dimensions, after, "fixture must actually grow scrollback");
+        assert!(mux::renderable::same_line_layout_geometry(
+            &dimensions,
+            &after
+        ));
+        let mut anchors = RemoteSelectionAnchors::default();
+        registration
+            .try_with_current(|current| {
+                assert_eq!(
+                    anchors.capture(request, &registration, &current, Instant::now()),
+                    codec::SelectionAnchorCaptureOutcomeV1::Captured
+                );
+            })
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_selection_anchor_current_alt_screen_is_unremappable_not_stale() {
+        let owner = Arc::new(Mux::new(None));
+        let (pane, _child_guard) = real_selection_pane(985);
+        owner.add_pane(&pane).unwrap();
+        let registration = owner.capture_pane_registration(&pane).unwrap();
+        let mut actions = Vec::new();
+        termwiz::escape::parser::Parser::new()
+            .parse(b"\x1b[?1049halt-screen", |action| actions.push(action));
+        pane.perform_actions(actions).unwrap();
+        assert!(pane.is_alt_screen_active());
+        let (_, dimensions) = pane.get_line_layout().unwrap().unwrap();
+        let request = codec::CaptureSelectionAnchorV1 {
+            pane_id: 985,
+            operation_id: 1,
+            layout: codec::LineReadLayout {
+                seqno: pane.get_current_seqno(),
+                dimensions,
+            },
+            points: [
+                Some(codec::SelectionAnchorPointV1 {
+                    column: Some(1),
+                    row: 0,
+                }),
+                None,
+                None,
+            ],
+        };
+        let mut anchors = RemoteSelectionAnchors::default();
+        registration
+            .try_with_current(|current| {
+                assert_eq!(
+                    anchors.capture(request, &registration, &current, Instant::now()),
+                    codec::SelectionAnchorCaptureOutcomeV1::Unsupported
+                );
+            })
+            .unwrap();
+        assert!(anchors.active.is_empty());
+        assert!(pane.get_lines(0..1).1[0].as_str().starts_with("alt-screen"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_selection_anchor_mutation_replacement_and_lease_renewal() {
+        use codec::{
+            SelectionAnchorCaptureOutcomeV1 as Capture, SelectionAnchorResolveOutcomeV1 as Resolve,
+        };
+        let owner = Arc::new(Mux::new(None));
+        let (pane, _child_guard) = real_selection_pane(983);
+        owner.add_pane(&pane).unwrap();
+        let registration = owner.capture_pane_registration(&pane).unwrap();
+        let (_, dimensions) = pane.get_line_layout().unwrap().unwrap();
+        let request = codec::CaptureSelectionAnchorV1 {
+            pane_id: 983,
+            operation_id: 1,
+            layout: codec::LineReadLayout {
+                seqno: pane.get_current_seqno(),
+                dimensions,
+            },
+            points: [
+                Some(codec::SelectionAnchorPointV1 {
+                    column: Some(1),
+                    row: 0,
+                }),
+                None,
+                None,
+            ],
+        };
+        let resolve = codec::ResolveSelectionAnchorV1 {
+            pane_id: 983,
+            operation_id: 1,
+        };
+        let now = Instant::now();
+        let mut anchors = RemoteSelectionAnchors::default();
+        registration
+            .try_with_current(|current| {
+                assert_eq!(
+                    anchors.capture(request.clone(), &registration, &current, now),
+                    Capture::Captured
+                );
+                assert!(matches!(
+                    anchors.resolve(
+                        &resolve,
+                        &registration,
+                        &current,
+                        now + std::time::Duration::from_secs(250)
+                    ),
+                    Resolve::Snapshot { .. }
+                ));
+            })
+            .unwrap();
+        anchors.reap(now + std::time::Duration::from_secs(301));
+        assert_eq!(anchors.active.len(), 1, "valid resolve renews the lease");
+        pane.perform_actions(vec![termwiz::escape::Action::Print('X')])
+            .unwrap();
+        registration
+            .try_with_current(|current| {
+                assert_eq!(
+                    anchors.resolve(
+                        &resolve,
+                        &registration,
+                        &current,
+                        now + std::time::Duration::from_secs(302)
+                    ),
+                    Resolve::SourceChanged
+                );
+            })
+            .unwrap();
+        assert!(anchors.active.is_empty());
+        let mut current_request = request.clone();
+        current_request.operation_id = 2;
+        current_request.layout.seqno = pane.get_current_seqno();
+        registration
+            .try_with_current(|current| {
+                assert_eq!(
+                    anchors.capture(current_request.clone(), &registration, &current, now),
+                    Capture::Captured
+                );
+            })
+            .unwrap();
+        owner.remove_pane(983);
+        assert!(registration.try_with_current(|_| ()).is_none());
+        let (replacement, _replacement_child_guard) = real_selection_pane(983);
+        let replacement_owner = Arc::new(Mux::new(None));
+        replacement_owner.add_pane(&replacement).unwrap();
+        let replacement_registration = replacement_owner
+            .capture_pane_registration(&replacement)
+            .unwrap();
+        replacement_registration
+            .try_with_current(|current| {
+                assert_eq!(
+                    anchors.capture(current_request, &replacement_registration, &current, now),
+                    Capture::SourceChanged
+                );
+                assert_eq!(
+                    anchors.resolve(
+                        &codec::ResolveSelectionAnchorV1 {
+                            pane_id: 983,
+                            operation_id: 2
+                        },
+                        &replacement_registration,
+                        &current,
+                        now
+                    ),
+                    Resolve::SourceChanged
+                );
+            })
+            .unwrap();
+    }
+
     #[test]
     fn line_read_timing_is_opt_in_capped_and_content_free_after_lock_release() {
         const CHILD: &str = "FT_LINE_READ_TIMING_TEST_CHILD";

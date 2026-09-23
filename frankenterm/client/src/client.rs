@@ -1310,10 +1310,11 @@ impl RpcProtocolAuthority {
         // Above the legacy surface, only the fenced-topology trio, the
         // explicitly coordinated reliable-input request/reply and sampled
         // paste request, the reliable-pane-write request/reply, and the
-        // renderable coordinator's layout-fenced line request/reply are active.
+        // renderable coordinator's layout-fenced line request/reply and the
+        // selection coordinator's capture/resolve/release pairs are active.
         matches!(
             spec.ident,
-            0..=4 | 8..=14 | 20 | 22..=78 | 81..=83 | 96..=103
+            0..=4 | 8..=14 | 20 | 22..=78 | 81..=83 | 96..=109
         )
     }
 
@@ -4426,6 +4427,21 @@ macro_rules! rpc_surface {
             }
         }
         rpc!(get_lines, GetLines, GetLinesResponse);
+        rpc!(
+            capture_selection_anchor,
+            CaptureSelectionAnchorV1,
+            CaptureSelectionAnchorResponseV1
+        );
+        rpc!(
+            resolve_selection_anchor,
+            ResolveSelectionAnchorV1,
+            ResolveSelectionAnchorResponseV1
+        );
+        rpc!(
+            release_selection_anchor,
+            ReleaseSelectionAnchorV1,
+            ReleaseSelectionAnchorResponseV1
+        );
         rpc!(
             get_lines_at_layout,
             GetLinesAtLayout,
@@ -10556,6 +10572,45 @@ impl TestRpcPeer {
         Ok(())
     }
 
+    /// Controlled peer reply for client scheduling tests. This exercises the
+    /// real outbound lease, not a claim that a server captured an anchor.
+    pub(crate) async fn respond_next_selection_capture(
+        &self,
+        outcome: SelectionAnchorCaptureOutcomeV1,
+    ) -> anyhow::Result<CaptureSelectionAnchorV1> {
+        let message = self.receiver.recv().await?;
+        let ReaderMessage::SendPdu {
+            binding,
+            lease,
+            promise,
+        } = message
+        else {
+            bail!("selection peer received a control message");
+        };
+        anyhow::ensure!(
+            lease.matches(binding),
+            "selection RPC lease binding changed"
+        );
+        let prepared = lease
+            .claim_for_reader()?
+            .context("selection RPC was cancelled")?;
+        let Pdu::CaptureSelectionAnchorV1(request) = prepared.pdu() else {
+            bail!("selection peer received {}", prepared.pdu().pdu_name());
+        };
+        let request = request.clone();
+        promise
+            .send(Ok(PendingRpcReply::pdu(
+                Pdu::CaptureSelectionAnchorResponseV1(CaptureSelectionAnchorResponseV1 {
+                    pane_id: request.pane_id,
+                    operation_id: request.operation_id,
+                    outcome,
+                }),
+            )))
+            .await
+            .map_err(|_| anyhow!("selection consumer retired"))?;
+        Ok(request)
+    }
+
     pub(crate) async fn respond_next_reliable_applied(
         &self,
     ) -> anyhow::Result<TestReliableWireRequest> {
@@ -13419,7 +13474,7 @@ mod tests {
         expected.push(20);
         expected.extend(22..=78);
         expected.extend(81..=83);
-        expected.extend(96..=103);
+        expected.extend(96..=109);
 
         let actual = Pdu::all_wire_specs()
             .iter()
@@ -13430,6 +13485,61 @@ mod tests {
             actual, expected,
             "ordinary-client endpoint activation changed without updating its explicit baseline"
         );
+    }
+
+    #[test]
+    fn selection_anchor_endpoints_require_v66_and_registered_protocol() {
+        let generation = NonZeroU64::new(17).unwrap();
+        let current = RpcProtocolAuthority::established_for_test(generation, CODEC_VERSION);
+        let bootstrap = RpcProtocolAuthority::new(generation);
+        for (request, reply) in [
+            (
+                &<CaptureSelectionAnchorV1 as PduWireIdent>::WIRE_SPEC,
+                &<CaptureSelectionAnchorResponseV1 as PduWireIdent>::WIRE_SPEC,
+            ),
+            (
+                &<ResolveSelectionAnchorV1 as PduWireIdent>::WIRE_SPEC,
+                &<ResolveSelectionAnchorResponseV1 as PduWireIdent>::WIRE_SPEC,
+            ),
+            (
+                &<ReleaseSelectionAnchorV1 as PduWireIdent>::WIRE_SPEC,
+                &<ReleaseSelectionAnchorResponseV1 as PduWireIdent>::WIRE_SPEC,
+            ),
+        ] {
+            for point in [
+                RpcOutboundAdmissionPoint::Preflight,
+                RpcOutboundAdmissionPoint::Enqueue,
+                RpcOutboundAdmissionPoint::Dequeue,
+            ] {
+                current.validate_outbound(request, point).unwrap();
+            }
+            current
+                .validate_inbound(reply, PduWireRole::CorrelatedReply)
+                .unwrap();
+            assert!(matches!(
+                current.validate_inbound(reply, PduWireRole::Unilateral),
+                Err(OrdinaryMuxProtocolError::DirectionViolation { .. })
+            ));
+            assert!(matches!(
+                bootstrap.validate_outbound(request, RpcOutboundAdmissionPoint::Preflight),
+                Err(OrdinaryMuxProtocolError::PhaseViolation { .. })
+            ));
+            assert!(matches!(
+                bootstrap.validate_inbound(reply, PduWireRole::CorrelatedReply),
+                Err(OrdinaryMuxProtocolError::PhaseViolation { .. })
+            ));
+            for version in [LEGACY46_CODEC_VERSION, 61, 62, 63, 64, 65] {
+                let older = RpcProtocolAuthority::established_for_test(generation, version);
+                assert!(matches!(
+                    older.validate_outbound(request, RpcOutboundAdmissionPoint::Preflight),
+                    Err(OrdinaryMuxProtocolError::DialectViolation { required: 66, .. })
+                ));
+                assert!(matches!(
+                    older.validate_inbound(reply, PduWireRole::CorrelatedReply),
+                    Err(OrdinaryMuxProtocolError::DialectViolation { required: 66, .. })
+                ));
+            }
+        }
     }
 
     #[test]

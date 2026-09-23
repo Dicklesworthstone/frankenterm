@@ -4345,6 +4345,17 @@ mod pane_registration_handle {
         }
     }
 
+    pub type LocalSelectionAnchorCapture = Result<
+        Option<frankenterm_term::screen::ScreenSelectionAnchor>,
+        crate::localpane::SelectionAnchorCaptureError,
+    >;
+    pub type LocalSelectionAnchorSnapshot = (
+        termwiz::surface::SequenceNo,
+        termwiz::surface::SequenceNo,
+        crate::renderable::RenderableDimensions,
+        Option<[Option<frankenterm_term::screen::SelectionAnchorCoordinate>; 3]>,
+    );
+
     /// Restricted view of one exact live pane registration.
     ///
     /// The underlying mux and pane references are intentionally private.  In
@@ -4447,6 +4458,29 @@ mod pane_registration_handle {
 
         pub fn get_current_working_dir(&self, policy: CachePolicy) -> Option<url::Url> {
             self.pane.get_current_working_dir(policy)
+        }
+
+        /// Only the terminal owner can mint an anchor. Nested remote panes
+        /// deliberately have no local token authority.
+        pub fn capture_selection_anchor(
+            &self,
+            floor: termwiz::surface::SequenceNo,
+            sequence: termwiz::surface::SequenceNo,
+            dimensions: crate::renderable::RenderableDimensions,
+            points: [Option<frankenterm_term::screen::SelectionAnchorCoordinate>; 3],
+        ) -> Option<LocalSelectionAnchorCapture> {
+            self.pane
+                .downcast_ref::<crate::localpane::LocalPane>()
+                .map(|pane| pane.capture_selection_anchor(floor, sequence, dimensions, points))
+        }
+
+        pub fn selection_anchor_snapshot(
+            &self,
+            anchor: &frankenterm_term::screen::ScreenSelectionAnchor,
+        ) -> Option<Option<LocalSelectionAnchorSnapshot>> {
+            self.pane
+                .downcast_ref::<crate::localpane::LocalPane>()
+                .map(|pane| pane.selection_anchor_snapshot(anchor))
         }
 
         pub fn get_current_seqno(&self) -> termwiz::surface::SequenceNo {

@@ -32,7 +32,7 @@ use std::future::Future;
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
@@ -54,6 +54,271 @@ pub enum SelectionReadError {
     SourceChanged,
     InvalidRange,
     TooLarge,
+}
+
+type SelectionPoints = [Option<wezterm_term::screen::SelectionAnchorCoordinate>; 3];
+type RemoteSelectionSnapshot = (
+    SequenceNo,
+    SequenceNo,
+    RenderableDimensions,
+    Option<SelectionPoints>,
+);
+
+// Process-wide allocation also distinguishes simultaneously attached domains.
+// Exhaustion refuses capture; an ID is never reused in a live connection.
+static NEXT_SELECTION_OPERATION: AtomicU64 = AtomicU64::new(1);
+
+struct SelectionRpcResult<T> {
+    result: Arc<Mutex<Option<anyhow::Result<T>>>>,
+    task: Mutex<Option<promise::spawn::MainThreadSpawnedTask<()>>>,
+}
+
+impl<T> SelectionRpcResult<T> {
+    fn take(&self) -> Option<anyhow::Result<T>> {
+        let result = self.result.try_lock()?.take();
+        if result.is_some() {
+            // Only the bounded retry wake remains after result publication.
+            // Let it run even when consuming this result drops its owner.
+            if let Some(task) = self.task.lock().take() {
+                task.detach();
+            }
+        }
+        result
+    }
+}
+
+async fn selection_rpc_with_timeout<T>(
+    request: impl Future<Output = anyhow::Result<T>>,
+    timeout: Duration,
+) -> anyhow::Result<T> {
+    let request = Box::pin(request);
+    let deadline = Box::pin(promise::spawn::sleep(timeout));
+    match futures::future::select(request, deadline).await {
+        futures::future::Either::Left((result, _)) => result,
+        futures::future::Either::Right(((), _)) => bail!("selection RPC deadline elapsed"),
+    }
+}
+
+fn start_selection_rpc<T: 'static>(
+    request: impl Future<Output = anyhow::Result<T>> + 'static,
+    registration: PaneRegistrationHandle,
+) -> anyhow::Result<SelectionRpcResult<T>> {
+    let reservation = match promise::spawn::try_reserve_main_thread(
+        promise::spawn::MainThreadServiceClass::Input,
+        4 * 1024,
+    ) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+        rejected => bail!("selection RPC admission failed: {rejected:?}"),
+    };
+    let result = Arc::new(Mutex::new(None));
+    let destination = Arc::downgrade(&result);
+    let pending = admit_interactive_rpc_now(async move {
+        let reply = selection_rpc_with_timeout(request, Duration::from_secs(5)).await;
+        if let Some(destination) = destination.upgrade() {
+            *destination.lock() = Some(reply);
+            registration.try_with_current(|pane| pane.notify_lines_ready());
+            // A reply can reach the GUI before its retry backoff elapses.
+            // Retain this admitted task for the due wake; a timestamp alone
+            // would strand a remap when output stops after that reply.
+            drop(destination);
+            promise::spawn::sleep(Duration::from_millis(50)).await;
+            registration.try_with_current(|pane| pane.notify_lines_ready());
+        }
+        Ok::<(), anyhow::Error>(())
+    })?;
+    let task = pending.map(|pending| {
+        reservation.spawn_local(async move {
+            let _ = pending.await;
+        })
+    });
+    // Dropping an abandoned result cancels its RPC and releases its Input
+    // admission. Server leases and release-before-capture retirement cover
+    // requests whose remote effect already happened before cancellation.
+    Ok(SelectionRpcResult {
+        result,
+        task: Mutex::new(task),
+    })
+}
+
+struct RemoteSelectionAnchorInner {
+    rpc: RpcGenerationScope,
+    registration: PaneRegistrationHandle,
+    remote_pane_id: PaneId,
+    operation_id: u64,
+    invalid: AtomicBool,
+    resolve: Mutex<RemoteSelectionResolve>,
+    heartbeat: Mutex<Option<promise::spawn::MainThreadSpawnedTask<()>>>,
+}
+
+#[derive(Default)]
+struct RemoteSelectionResolve {
+    pending: Option<SelectionRpcResult<ResolveSelectionAnchorResponseV1>>,
+    requested_layout: Option<SequenceNo>,
+    requested_checkpoint: Option<u64>,
+    snapshot: Option<(
+        SequenceNo,
+        SequenceNo,
+        RenderableDimensions,
+        SelectionPoints,
+    )>,
+    last_request: Option<Instant>,
+}
+
+impl RemoteSelectionResolve {
+    fn snapshot_for(
+        &self,
+        layout: SequenceNo,
+        sequence: SequenceNo,
+        dimensions: RenderableDimensions,
+    ) -> Option<RemoteSelectionSnapshot> {
+        self.snapshot
+            .filter(|(floor, source, geometry, _)| {
+                self.requested_layout == Some(layout)
+                    && *floor <= *source
+                    && *source <= sequence
+                    && same_line_layout_geometry(geometry, &dimensions)
+            })
+            .map(|(_, sequence, dimensions, points)| (layout, sequence, dimensions, Some(points)))
+    }
+}
+
+impl Drop for RemoteSelectionAnchorInner {
+    fn drop(&mut self) {
+        // A replaced drag must release its sleeping task's admission now,
+        // rather than accumulating one detached timer per mouse movement.
+        drop(self.heartbeat.get_mut().take());
+        // Release stays on the captured connection, including after reconnect.
+        // The server's bounded lease is the fallback if admission is unavailable.
+        let request = self.rpc.release_selection_anchor(ReleaseSelectionAnchorV1 {
+            pane_id: self.remote_pane_id,
+            operation_id: self.operation_id,
+        });
+        if let Err(error) = dispatch_interactive_rpc(
+            selection_rpc_with_timeout(request, Duration::from_secs(5)),
+            "release_selection_anchor",
+        ) {
+            log::debug!("selection anchor release admission failed: {error:#}");
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RemoteSelectionAnchor(Arc<RemoteSelectionAnchorInner>);
+
+impl std::fmt::Debug for RemoteSelectionAnchor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteSelectionAnchor")
+            .field("pane_id", &self.0.remote_pane_id)
+            .field("operation_id", &self.0.operation_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for RemoteSelectionAnchor {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for RemoteSelectionAnchor {}
+
+pub struct RemoteSelectionCapture {
+    token: RemoteSelectionAnchor,
+    layout: SequenceNo,
+    request: CaptureSelectionAnchorV1,
+    pending: Option<SelectionRpcResult<CaptureSelectionAnchorResponseV1>>,
+    captured: bool,
+    started: Instant,
+}
+
+impl std::fmt::Debug for RemoteSelectionCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteSelectionCapture")
+            .field("token", &self.token)
+            .field("layout", &self.layout)
+            .finish_non_exhaustive()
+    }
+}
+
+pub enum RemoteSelectionCaptureStatus {
+    Ready(RemoteSelectionAnchor),
+    Busy,
+    Invalidated,
+    Unremappable,
+}
+
+fn start_selection_heartbeat(token: &RemoteSelectionAnchor) -> anyhow::Result<()> {
+    let weak = Arc::downgrade(&token.0);
+    let reservation = match promise::spawn::try_reserve_main_thread(
+        promise::spawn::MainThreadServiceClass::Render,
+        4 * 1024,
+    ) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+        rejected => anyhow::bail!("selection heartbeat admission failed: {rejected:?}"),
+    };
+    let task = reservation.spawn_local(async move {
+        loop {
+            // The sleeping task holds no token. Clearing the GUI selection
+            // releases it immediately, even when the terminal is idle.
+            promise::spawn::sleep(Duration::from_secs(60)).await;
+            let Some(token) = weak.upgrade() else {
+                return;
+            };
+            if token.invalid.load(Ordering::Acquire)
+                || token.registration.try_with_current(|_| ()).is_none()
+            {
+                return;
+            }
+            let request = token
+                .rpc
+                .resolve_selection_anchor(ResolveSelectionAnchorV1 {
+                    pane_id: token.remote_pane_id,
+                    operation_id: token.operation_id,
+                });
+            // The token owns this task. Retaining it across await would
+            // keep a superseded selection alive until transport timeout.
+            drop(token);
+            let response = selection_rpc_with_timeout(request, Duration::from_secs(5)).await;
+            let Some(token) = weak.upgrade() else {
+                return;
+            };
+            let response = match response {
+                Ok(response) => response,
+                Err(error) if token.rpc.agreed_codec_version().is_some() => {
+                    // Resolve is read-only. A transient queue/transport error
+                    // is not evidence that a still-live anchor became stale.
+                    log::debug!("selection renewal will retry: {error:#}");
+                    continue;
+                }
+                Err(_) => {
+                    token.invalid.store(true, Ordering::Release);
+                    token
+                        .registration
+                        .try_with_current(|pane| pane.notify_lines_ready());
+                    return;
+                }
+            };
+            let valid = response.pane_id == token.remote_pane_id
+                && response.operation_id == token.operation_id
+                && matches!(
+                    response.outcome,
+                    SelectionAnchorResolveOutcomeV1::Snapshot { .. }
+                        | SelectionAnchorResolveOutcomeV1::Busy
+                );
+            if !valid {
+                token.invalid.store(true, Ordering::Release);
+                token
+                    .registration
+                    .try_with_current(|pane| pane.notify_lines_ready());
+                return;
+            }
+            token
+                .registration
+                .try_with_current(|pane| pane.notify_lines_ready());
+        }
+    });
+    *token.0.heartbeat.lock() = Some(task);
+    Ok(())
 }
 
 #[derive(Default)]
@@ -3363,6 +3628,326 @@ fn validate_render_application_resources(
 }
 
 impl ClientPane {
+    fn owns_remote_selection(&self, token: &RemoteSelectionAnchor) -> bool {
+        !token.0.invalid.load(Ordering::Acquire)
+            && token.0.remote_pane_id == self.remote_pane_id
+            && token.0.rpc.agreed_codec_version().is_some()
+            && token.0.rpc.same_generation(&self.client.client.rpc_scope())
+            && self.mux_registration.load().is_some_and(|registration| {
+                registration.wire_identity() == token.0.registration.wire_identity()
+                    && registration.try_with_current(|_| ()).is_some()
+            })
+    }
+
+    /// Register actual server-owned coordinates without blocking an input or
+    /// paint callback. Retrying Busy keeps the same deduplicated operation ID.
+    pub fn capture_remote_selection(
+        &self,
+        layout: SequenceNo,
+        selected_sequence: SequenceNo,
+        dimensions: RenderableDimensions,
+        points: SelectionPoints,
+        pending: &mut Option<RemoteSelectionCapture>,
+    ) -> RemoteSelectionCaptureStatus {
+        let wire_points = points.map(|point| {
+            point.map(|point| SelectionAnchorPointV1 {
+                column: point.column,
+                row: point.row,
+            })
+        });
+        let rpc = self.client.client.rpc_scope();
+        match rpc.agreed_codec_version() {
+            Some(version) if version >= SELECTION_ANCHOR_MIN_CODEC_VERSION => {}
+            Some(_) => return RemoteSelectionCaptureStatus::Unremappable,
+            None => return RemoteSelectionCaptureStatus::Busy,
+        }
+        if let Some(capture) = pending.as_ref() {
+            if capture.layout != layout
+                || capture.request.layout.seqno != selected_sequence
+                || !same_line_layout_geometry(&capture.request.layout.dimensions, &dimensions)
+                || capture.request.points != wire_points
+                || !self.owns_remote_selection(&capture.token)
+            {
+                return RemoteSelectionCaptureStatus::Invalidated;
+            }
+        } else {
+            let Some((current_layout, sequence, current_dimensions, alternate)) =
+                self.selection_source_snapshot()
+            else {
+                return RemoteSelectionCaptureStatus::Busy;
+            };
+            if current_layout != layout
+                || sequence < selected_sequence
+                || current_dimensions != dimensions
+            {
+                return RemoteSelectionCaptureStatus::Invalidated;
+            }
+            if alternate {
+                // Alternate-screen text remains selectable even though its
+                // application-owned coordinates cannot survive normal reflow.
+                return RemoteSelectionCaptureStatus::Unremappable;
+            }
+            let Some(registration) = self.mux_registration.load() else {
+                return RemoteSelectionCaptureStatus::Invalidated;
+            };
+            let Ok(operation_id) = NEXT_SELECTION_OPERATION.try_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| current.checked_add(1),
+            ) else {
+                return RemoteSelectionCaptureStatus::Unremappable;
+            };
+            let token = RemoteSelectionAnchor(Arc::new(RemoteSelectionAnchorInner {
+                rpc,
+                registration,
+                remote_pane_id: self.remote_pane_id,
+                operation_id,
+                invalid: AtomicBool::new(false),
+                resolve: Mutex::new(RemoteSelectionResolve::default()),
+                heartbeat: Mutex::new(None),
+            }));
+            *pending = Some(RemoteSelectionCapture {
+                request: CaptureSelectionAnchorV1 {
+                    pane_id: self.remote_pane_id,
+                    operation_id,
+                    layout: LineReadLayout {
+                        seqno: selected_sequence,
+                        dimensions,
+                    },
+                    points: wire_points,
+                },
+                layout,
+                token,
+                pending: None,
+                captured: false,
+                started: Instant::now(),
+            });
+        }
+        let capture = pending.as_mut().expect("capture initialized above");
+        self.poll_remote_selection_capture(capture)
+    }
+
+    /// An admitted capture keeps its original coordinate authority. A resize
+    /// before reply delivery must resolve the resulting token, not reinterpret
+    /// or discard that request using the replacement viewport coordinates.
+    pub fn poll_remote_selection_capture(
+        &self,
+        capture: &mut RemoteSelectionCapture,
+    ) -> RemoteSelectionCaptureStatus {
+        if !self.owns_remote_selection(&capture.token) {
+            return RemoteSelectionCaptureStatus::Invalidated;
+        }
+        if capture.captured {
+            return RemoteSelectionCaptureStatus::Ready(capture.token.clone());
+        }
+        if let Some(request) = &capture.pending {
+            let Some(result) = request.take() else {
+                return if capture.started.elapsed() >= Duration::from_secs(5) {
+                    RemoteSelectionCaptureStatus::Unremappable
+                } else {
+                    RemoteSelectionCaptureStatus::Busy
+                };
+            };
+            capture.pending = None;
+            let response = match result {
+                Ok(response) => response,
+                Err(error) if self.owns_remote_selection(&capture.token) => {
+                    log::debug!("selection capture will retry: {error:#}");
+                    return if capture.started.elapsed() >= Duration::from_secs(5) {
+                        RemoteSelectionCaptureStatus::Unremappable
+                    } else {
+                        RemoteSelectionCaptureStatus::Busy
+                    };
+                }
+                Err(_) => return RemoteSelectionCaptureStatus::Invalidated,
+            };
+            if response.pane_id != capture.request.pane_id
+                || response.operation_id != capture.request.operation_id
+            {
+                return RemoteSelectionCaptureStatus::Invalidated;
+            }
+            match response.outcome {
+                SelectionAnchorCaptureOutcomeV1::Captured => {
+                    if !self.owns_remote_selection(&capture.token) {
+                        return RemoteSelectionCaptureStatus::Invalidated;
+                    }
+                    if let Err(error) = start_selection_heartbeat(&capture.token) {
+                        log::debug!("selection remains unanchored: {error:#}");
+                        return RemoteSelectionCaptureStatus::Unremappable;
+                    }
+                    capture.captured = true;
+                    return RemoteSelectionCaptureStatus::Ready(capture.token.clone());
+                }
+                SelectionAnchorCaptureOutcomeV1::Busy => {}
+                SelectionAnchorCaptureOutcomeV1::SourceChanged => {
+                    return RemoteSelectionCaptureStatus::Invalidated;
+                }
+                SelectionAnchorCaptureOutcomeV1::Unsupported
+                | SelectionAnchorCaptureOutcomeV1::Capacity => {
+                    return RemoteSelectionCaptureStatus::Unremappable;
+                }
+            }
+        }
+        // Bound admission and Busy retries, not delivery of an already
+        // completed capture. A stalled GUI must still consume the server's
+        // token; resolve will independently validate its current lease.
+        if capture.started.elapsed() >= Duration::from_secs(5) {
+            return RemoteSelectionCaptureStatus::Unremappable;
+        }
+        // This clone survives a cancelled GUI consumer until the capture reply
+        // settles. Its eventual drop releases a token even if that reply is lost
+        // to the consumer; server leases cover connection/admission failure.
+        let token = capture.token.clone();
+        let request = capture.request.clone();
+        match start_selection_rpc(
+            async move {
+                let result = token.0.rpc.capture_selection_anchor(request).await;
+                drop(token);
+                result
+            },
+            capture.token.0.registration.clone(),
+        ) {
+            Ok(request) => capture.pending = Some(request),
+            Err(error) => {
+                log::debug!("selection capture admission failed: {error:#}");
+                capture
+                    .token
+                    .0
+                    .registration
+                    .try_with_current(|pane| pane.notify_lines_ready());
+            }
+        }
+        RemoteSelectionCaptureStatus::Busy
+    }
+
+    /// Resolve under server authority, then bind those points to the exact
+    /// local cache generation. A speculative resize geometry alone is never a
+    /// publication witness. Newer output needs the bounded mutation journal's
+    /// proof that it did not touch the resolved selected range.
+    pub fn remote_selection_anchor_snapshot(
+        &self,
+        token: &RemoteSelectionAnchor,
+    ) -> Result<Option<RemoteSelectionSnapshot>, SelectionReadError> {
+        if !self.owns_remote_selection(token) {
+            return Err(SelectionReadError::SourceChanged);
+        }
+        let (layout, sequence, dimensions, alternate) = self
+            .selection_source_snapshot()
+            .ok_or(SelectionReadError::Busy)?;
+        if alternate {
+            return Err(SelectionReadError::SourceChanged);
+        }
+        let mut resolve = token.0.resolve.try_lock().ok_or(SelectionReadError::Busy)?;
+        if let Some(pending) = &resolve.pending {
+            if let Some(result) = pending.take() {
+                resolve.pending = None;
+                let response = match result {
+                    Ok(response) => response,
+                    Err(error) if self.owns_remote_selection(token) => {
+                        // An unavailable observation is not source mutation.
+                        // Keep the anchor, but authorize no cached coordinates
+                        // until a new server response passes every cache fence.
+                        log::debug!("selection resolve will retry: {error:#}");
+                        return Err(SelectionReadError::Busy);
+                    }
+                    Err(_) => return Err(SelectionReadError::SourceChanged),
+                };
+                if response.pane_id != token.0.remote_pane_id
+                    || response.operation_id != token.0.operation_id
+                {
+                    return Err(SelectionReadError::SourceChanged);
+                }
+                match response.outcome {
+                    SelectionAnchorResolveOutcomeV1::Snapshot {
+                        layout_floor,
+                        sequence,
+                        dimensions,
+                        points,
+                    } => {
+                        resolve.snapshot = Some((
+                            layout_floor,
+                            sequence,
+                            dimensions,
+                            points.map(|point| {
+                                point.map(|point| wezterm_term::screen::SelectionAnchorCoordinate {
+                                    column: point.column,
+                                    row: point.row,
+                                })
+                            }),
+                        ));
+                    }
+                    SelectionAnchorResolveOutcomeV1::Busy => {
+                        resolve.last_request = None;
+                    }
+                    SelectionAnchorResolveOutcomeV1::SourceChanged
+                    | SelectionAnchorResolveOutcomeV1::Unsupported => {
+                        token.0.invalid.store(true, Ordering::Release);
+                        return Err(SelectionReadError::SourceChanged);
+                    }
+                }
+            }
+        }
+        let snapshot = match (
+            resolve.snapshot_for(layout, sequence, dimensions),
+            resolve.requested_checkpoint,
+        ) {
+            (Some((layout, source, dimensions, Some(points))), Some(checkpoint)) => {
+                let cache = self.renderable.try_lock().ok_or(SelectionReadError::Busy)?;
+                match cache
+                    .validate_remote_selection_remap(layout, source, dimensions, points, checkpoint)
+                {
+                    Ok((sequence, dimensions)) => {
+                        Some((layout, sequence, dimensions, Some(points)))
+                    }
+                    Err(SelectionReadError::Busy) => None,
+                    Err(error) => return Err(error),
+                }
+            }
+            _ => None,
+        };
+        let retry_due = resolve
+            .last_request
+            .is_none_or(|started| started.elapsed() >= Duration::from_millis(50));
+        let needs_request = resolve.requested_layout != Some(layout)
+            || (snapshot.is_none() && retry_due)
+            || resolve
+                .last_request
+                .is_none_or(|started| started.elapsed() >= Duration::from_secs(60));
+        if resolve.pending.is_none() && needs_request {
+            let checkpoint = self
+                .renderable
+                .try_lock()
+                .ok_or(SelectionReadError::Busy)?
+                .remote_selection_mutation_checkpoint()?;
+            let request = token
+                .0
+                .rpc
+                .resolve_selection_anchor(ResolveSelectionAnchorV1 {
+                    pane_id: token.0.remote_pane_id,
+                    operation_id: token.0.operation_id,
+                });
+            match start_selection_rpc(request, token.0.registration.clone()) {
+                Ok(pending) => {
+                    resolve.pending = Some(pending);
+                    resolve.requested_layout = Some(layout);
+                    resolve.requested_checkpoint = Some(checkpoint);
+                    resolve.last_request = Some(Instant::now());
+                    // An old response cannot become a new layout's witness just
+                    // because the replacement request has been admitted.
+                    resolve.snapshot = None;
+                }
+                Err(error) => {
+                    log::debug!("selection resolve admission failed: {error:#}");
+                    token
+                        .0
+                        .registration
+                        .try_with_current(|pane| pane.notify_lines_ready());
+                }
+            }
+        }
+        Ok(snapshot)
+    }
+
     /// Observe an ongoing copy without losing mutations of evicted chunks.
     pub fn selection_copy_snapshot(
         &self,
@@ -3397,6 +3982,18 @@ impl ClientPane {
             .try_lock()
             .ok_or(SelectionReadError::Busy)?
             .selection_lines(layout, sequence, selected_sequence, rows)
+    }
+
+    /// Admit highlighting only over fresh selected rows in the visible cache.
+    pub fn selection_paint_rows_ready(
+        &self,
+        layout: SequenceNo,
+        selected_sequence: SequenceNo,
+        rows: Range<StableRowIndex>,
+    ) -> bool {
+        self.renderable.try_lock().is_some_and(|renderable| {
+            renderable.selection_paint_rows_ready(layout, selected_sequence, rows)
+        })
     }
 
     pub fn selection_changed_since(
@@ -4968,6 +5565,60 @@ mod tests {
             MuxSessionIncarnation::from_bytes([0x9c; 16]),
         );
 
+    #[test]
+    fn remote_anchor_snapshot_cannot_authorize_speculative_resize_or_old_generation() {
+        let dimensions = RenderableDimensions {
+            cols: 40,
+            viewport_rows: 24,
+            scrollback_rows: 24,
+            physical_top: 0,
+            scrollback_top: 0,
+            dpi: 96,
+            pixel_width: 400,
+            pixel_height: 480,
+            reverse_video: false,
+        };
+        let points = [
+            Some(wezterm_term::screen::SelectionAnchorCoordinate {
+                column: Some(2),
+                row: 0,
+            }),
+            Some(wezterm_term::screen::SelectionAnchorCoordinate {
+                column: Some(2),
+                row: 0,
+            }),
+            Some(wezterm_term::screen::SelectionAnchorCoordinate {
+                column: Some(5),
+                row: 1,
+            }),
+        ];
+        let mut resolve = RemoteSelectionResolve {
+            requested_layout: Some(7),
+            snapshot: Some((20, 22, dimensions, points)),
+            ..RemoteSelectionResolve::default()
+        };
+        assert_eq!(
+            resolve.snapshot_for(7, 22, dimensions),
+            Some((7, 22, dimensions, Some(points)))
+        );
+        assert!(
+            resolve.snapshot_for(7, 19, dimensions).is_none(),
+            "new pixel geometry with the old server sequence is not a remap"
+        );
+        assert!(
+            resolve.snapshot_for(8, 22, dimensions).is_none(),
+            "a reply from the prior local layout cannot publish after another resize"
+        );
+        let mut different = dimensions;
+        different.cols = 41;
+        assert!(resolve.snapshot_for(7, 22, different).is_none());
+        resolve.snapshot = Some((23, 22, dimensions, points));
+        assert!(
+            resolve.snapshot_for(7, 22, dimensions).is_none(),
+            "a server layout floor cannot be newer than its own source"
+        );
+    }
+
     fn pane_authority_binding(
         session_incarnation: MuxSessionIncarnation,
         pane_registration: ReliablePaneRegistrationIdentityV1,
@@ -5577,6 +6228,51 @@ mod tests {
         assert_eq!(pane.selection_source_snapshot(), Some(before));
     }
 
+    #[test]
+    fn remote_anchor_capture_keeps_alternate_screen_selectable_and_busy_retryable() {
+        let inner = test_client_inner(751);
+        let pane = ClientPane::new(
+            &inner,
+            753,
+            23,
+            757,
+            TerminalSize {
+                cols: 80,
+                rows: 24,
+                pixel_width: 800,
+                pixel_height: 480,
+                dpi: 96,
+            },
+            "alternate",
+            true,
+        )
+        .unwrap();
+        let (layout, sequence, dimensions, alternate) = pane.selection_source_snapshot().unwrap();
+        assert!(alternate);
+        let mut pending = None;
+        {
+            let _locked = pane.renderable.lock();
+            assert!(matches!(
+                pane.capture_remote_selection(
+                    layout,
+                    sequence,
+                    dimensions,
+                    [None; 3],
+                    &mut pending
+                ),
+                RemoteSelectionCaptureStatus::Busy
+            ));
+        }
+        assert!(matches!(
+            pane.capture_remote_selection(layout, sequence, dimensions, [None; 3], &mut pending),
+            RemoteSelectionCaptureStatus::Unremappable
+        ));
+        assert!(
+            pending.is_none(),
+            "unremappable text needs no remote anchor allocation"
+        );
+    }
+
     fn test_client_inner_with_rpc_peer(
         local_domain_id: DomainId,
     ) -> (Arc<ClientInner>, TestRpcPeer) {
@@ -5620,6 +6316,174 @@ mod tests {
         pane.prepare_render_application_bootstrap(&inner.client.rpc_scope())
             .expect("test pane should prepare its committed render connection");
         pane
+    }
+
+    #[test]
+    fn remote_selection_abandoned_capture_releases_client_task_and_token() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(771);
+        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 773, 779);
+        let baseline = executor.admission_snapshot().active_tasks;
+        let (layout, sequence, dimensions, _) = pane.selection_source_snapshot().unwrap();
+        let points = [Some(wezterm_term::screen::SelectionAnchorCoordinate {
+            column: Some(2),
+            row: 0,
+        }); 3];
+        let mut pending = None;
+        assert!(matches!(
+            pane.capture_remote_selection(layout, sequence, dimensions, points, &mut pending),
+            RemoteSelectionCaptureStatus::Busy
+        ));
+        assert!(!peer.is_empty(), "capture must reach the connected peer");
+        let token = Arc::downgrade(&pending.as_ref().unwrap().token.0);
+        assert_eq!(executor.admission_snapshot().active_tasks, baseline + 1);
+        // The peer deliberately does not respond. Cancelling the GUI owner
+        // must reclaim the capture without waiting for disconnect or a lease.
+        drop(pending);
+        pump_mouse_test(&executor);
+        assert!(
+            token.upgrade().is_none(),
+            "abandoned capture retained its token"
+        );
+        // Retire only the fixture's queued capture/release requests. No reply
+        // is needed to cancel capture; this settles the bounded release task.
+        for _ in 0..2 {
+            if peer.is_empty() {
+                break;
+            }
+            promise::spawn::block_on(peer.discard_next_queued_rpc()).unwrap();
+        }
+        pump_mouse_test(&executor);
+        assert!(peer.is_empty());
+        assert_eq!(executor.admission_snapshot().active_tasks, baseline);
+    }
+
+    #[test]
+    fn remote_selection_rpc_deadline_drops_a_nonresponding_request() {
+        let retained = Arc::new(());
+        let weak = Arc::downgrade(&retained);
+        let request = async move {
+            let _retained = retained;
+            futures::future::pending::<anyhow::Result<()>>().await
+        };
+        let error = promise::spawn::block_on(selection_rpc_with_timeout(request, Duration::ZERO))
+            .unwrap_err();
+        assert!(error.to_string().contains("selection RPC deadline elapsed"));
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn remote_selection_capture_reply_survives_resize_before_delivery() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(761);
+        let pane = test_client_pane(&inner, 763, 769);
+        let pane_for_mux: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_for_mux).unwrap();
+        let (layout, sequence, dimensions, _) = pane.selection_source_snapshot().unwrap();
+        let points = [Some(wezterm_term::screen::SelectionAnchorCoordinate {
+            column: Some(2),
+            row: 0,
+        }); 3];
+        let mut pending = None;
+        assert!(matches!(
+            pane.capture_remote_selection(layout, sequence, dimensions, points, &mut pending),
+            RemoteSelectionCaptureStatus::Busy
+        ));
+        assert!(
+            !peer.is_empty(),
+            "capture must enqueue before the peer waits; completion={:?}",
+            pending
+                .as_ref()
+                .and_then(|capture| capture.pending.as_ref())
+                .map(|request| request.result.lock())
+        );
+        // Change the same client cache authority that real resize admission
+        // retires, before the controlled peer delivers its capture response.
+        {
+            let cache = pane.renderable.lock();
+            let mut cache = cache.inner.borrow_mut();
+            cache.retire_selection_layout();
+            cache.dimensions.cols = 40;
+        }
+        let request = promise::spawn::block_on(
+            peer.respond_next_selection_capture(SelectionAnchorCaptureOutcomeV1::Captured),
+        )
+        .unwrap();
+        assert_eq!(request.layout.seqno, sequence);
+        assert_eq!(request.layout.dimensions, dimensions);
+        for _ in 0..64 {
+            if pending
+                .as_ref()
+                .unwrap()
+                .pending
+                .as_ref()
+                .unwrap()
+                .result
+                .lock()
+                .is_some()
+            {
+                break;
+            }
+            assert!(executor.try_tick().unwrap(), "capture reply lost its wake");
+        }
+        assert!(pending
+            .as_ref()
+            .unwrap()
+            .pending
+            .as_ref()
+            .unwrap()
+            .result
+            .lock()
+            .is_some());
+        // Simulate a GUI stall after transport completion without sleeping.
+        pending.as_mut().unwrap().started = Instant::now() - Duration::from_secs(6);
+        let mut token = None;
+        for _ in 0..64 {
+            match pane.poll_remote_selection_capture(pending.as_mut().unwrap()) {
+                RemoteSelectionCaptureStatus::Ready(ready) => {
+                    token = Some(ready);
+                    break;
+                }
+                RemoteSelectionCaptureStatus::Busy => {
+                    assert!(executor.try_tick().unwrap(), "capture reply lost its wake");
+                }
+                _ => panic!("a captured token was discarded only because resize preceded delivery"),
+            }
+        }
+        let token = token.expect("bounded executor drain must deliver capture");
+        assert_ne!(pane.selection_source_snapshot().unwrap().0, layout);
+        // Exercise the completed-RPC error branch independently from source
+        // invalidation. No response coordinates may be promoted on failure.
+        token.0.resolve.lock().pending = Some(SelectionRpcResult {
+            result: Arc::new(Mutex::new(Some(Err(anyhow::anyhow!(
+                "temporary selection observation failure"
+            ))))),
+            task: Mutex::new(None),
+        });
+        assert!(matches!(
+            pane.remote_selection_anchor_snapshot(&token),
+            Err(SelectionReadError::Busy)
+        ));
+        assert!(pane.owns_remote_selection(&token));
+        assert!(token.0.resolve.lock().snapshot.is_none());
+        token.0.invalid.store(true, Ordering::Release);
+        assert!(matches!(
+            pane.remote_selection_anchor_snapshot(&token),
+            Err(SelectionReadError::SourceChanged)
+        ));
+        let weak = Arc::downgrade(&token.0);
+        drop(pending);
+        drop(token);
+        assert!(
+            weak.upgrade().is_none(),
+            "sleeping renewal must not retain a replaced selection"
+        );
     }
 
     #[test]

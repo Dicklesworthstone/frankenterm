@@ -3,6 +3,7 @@ use crate::selection::{
     SmartSelectionPick, WordLineSelectionRead,
 };
 use crate::smart_selection_a11y::emit_smart_selection_pick;
+use frankenterm_client::pane::SelectionReadError;
 use mux::pane::{LogicalLine, Pane, PaneId};
 use std::cell::RefMut;
 use std::sync::Arc;
@@ -665,7 +666,10 @@ impl super::TermWindow {
     }
 
     fn commit_selection_candidate(&self, pane: &Arc<dyn Pane>, desired: Selection) {
-        if pane.downcast_ref::<mux::localpane::LocalPane>().is_none()
+        if (pane.downcast_ref::<mux::localpane::LocalPane>().is_none()
+            && pane
+                .downcast_ref::<frankenterm_client::pane::ClientPane>()
+                .is_none())
             || desired.rectangular
             || (desired.origin.is_none() && desired.range.is_none())
         {
@@ -680,8 +684,15 @@ impl super::TermWindow {
         let Some(mut state) = self.pane_state(pane.pane_id()) else {
             return;
         };
-        state.pending_native_selection =
-            Some(crate::selection::PendingNativeSelection::new(desired));
+        let pending = crate::selection::PendingNativeSelection::new(desired);
+        if pane
+            .downcast_ref::<frankenterm_client::pane::ClientPane>()
+            .is_some()
+        {
+            pending
+                .publish_remote_preview(&mut state.selection, SelectionAuthority::capture(&**pane));
+        }
+        state.pending_native_selection = Some(pending);
         drop(state);
         self.retry_pending_native_selection(pane);
     }
@@ -694,6 +705,20 @@ impl super::TermWindow {
             return;
         };
         if pending
+            .remote_motion
+            .as_ref()
+            .is_some_and(|motion| std::time::Instant::now() >= motion.deadline)
+        {
+            if pending.copy.is_some() {
+                frankenterm_toast_notification::persistent_toast_notification(
+                    "Selection was not copied",
+                    "The pointer frame did not become available in time. Select again.",
+                );
+            }
+            pending.remote_motion = None;
+            pending.copy = None;
+        }
+        if pending
             .text_copy
             .as_ref()
             .is_some_and(|copy| std::time::Instant::now() >= copy.deadline())
@@ -705,7 +730,7 @@ impl super::TermWindow {
             return;
         }
         if pending.committed {
-            self.selection_authority_is_current(pane);
+            let authorized = self.selection_authority_is_current(pane);
             let Some(current) = self
                 .selection(pane.pane_id())
                 .map(|selection| selection.clone())
@@ -714,7 +739,11 @@ impl super::TermWindow {
             };
             let same = match (current.native_anchor(), pending.desired.native_anchor()) {
                 (Some(current), Some(expected)) => current == expected,
-                (None, None) => current == pending.desired,
+                (None, None) => match (current.remote_anchor(), pending.desired.remote_anchor()) {
+                    (Some(current), Some(expected)) => current == expected,
+                    (None, None) => current == pending.desired,
+                    _ => false,
+                },
                 _ => false,
             };
             if !same {
@@ -724,10 +753,55 @@ impl super::TermWindow {
                 return;
             }
             pending.desired = current;
+            if !authorized && pending.desired.remote_anchor().is_some() {
+                // A remap is still pending. Keep the exact copy intent, but
+                // never try to read its old numeric coordinates.
+                if let Some(mut state) = self.pane_state(pane.pane_id()) {
+                    state.pending_native_selection = Some(pending);
+                }
+                return;
+            }
+            if pending.remote_motion.is_some() {
+                self.schedule_remote_selection_motion(pane, &mut pending);
+                if let Some(mut state) = self.pane_state(pane.pane_id()) {
+                    state.pending_native_selection = Some(pending);
+                }
+                return;
+            }
         }
         let local = pane.downcast_ref::<mux::localpane::LocalPane>();
         let capture = if let Some(local) = local {
             Self::capture_native_selection(pane, local, &pending.desired)
+        } else if let Some(client) = pane.downcast_ref::<frankenterm_client::pane::ClientPane>() {
+            use crate::selection::NativeSelectionCapture;
+            if let Some(token) = pending.desired.remote_anchor() {
+                NativeSelectionCapture::ReadyRemote(token.clone())
+            } else if let Some(capture) = pending.remote_capture.as_mut() {
+                // The server may already own an anchor for the original
+                // geometry. Poll that exact request before inspecting today's
+                // cache layout; its delayed reply must survive a resize. The
+                // committed coordinates retain their original authority and
+                // cannot paint or copy until normal anchor remapping succeeds.
+                client.poll_remote_selection_capture(capture).into()
+            } else if let Some((authority, _, dimensions)) =
+                SelectionAuthority::capture_source(&**pane)
+            {
+                if pending.desired.authority != Some(authority) {
+                    NativeSelectionCapture::Invalidated
+                } else {
+                    client
+                        .capture_remote_selection(
+                            authority.layout_floor(),
+                            pending.desired.seqno,
+                            dimensions,
+                            pending.desired.native_points(),
+                            &mut pending.remote_capture,
+                        )
+                        .into()
+                }
+            } else {
+                NativeSelectionCapture::Busy
+            }
         } else {
             match SelectionAuthority::capture(&**pane) {
                 None => crate::selection::NativeSelectionCapture::Busy,
@@ -737,6 +811,24 @@ impl super::TermWindow {
                 Some(_) => crate::selection::NativeSelectionCapture::Invalidated,
             }
         };
+        if matches!(
+            &capture,
+            crate::selection::NativeSelectionCapture::ReadyRemote(_)
+        ) {
+            if let Some(next) =
+                pending.superseding_remote_preview(SelectionAuthority::capture(&**pane))
+            {
+                // A completed older capture must not roll a newer visible
+                // endpoint backward. Admit just the latest coalesced capture.
+                if let Some(mut state) = self.pane_state(pane.pane_id()) {
+                    state.pending_native_selection = Some(next);
+                }
+                if let Some(window) = self.window.as_ref() {
+                    window.invalidate();
+                }
+                return;
+            }
+        }
         let result = {
             let Some(mut state) = self.pane_state(pane.pane_id()) else {
                 return;
@@ -745,7 +837,7 @@ impl super::TermWindow {
             if matches!(
                 result,
                 Some(crate::selection::NativeSelectionCommit::Applied { .. })
-            ) && pending.copy.is_some()
+            ) && (pending.copy.is_some() || pending.remote_motion.is_some())
             {
                 pending.committed = true;
                 pending.desired = state.selection.clone();
@@ -765,6 +857,20 @@ impl super::TermWindow {
                 if let Some(window) = self.window.as_ref() {
                     window.invalidate();
                 }
+            }
+            if pending.remote_motion.is_some() {
+                // First publish the original owned anchor (still under its
+                // original authority), then resolve it before replaying the
+                // coalesced endpoint. Do not copy the intermediate selection.
+                self.selection_authority_is_current(pane);
+                if let Some(mut state) = self.pane_state(pane.pane_id()) {
+                    pending.desired = state.selection.clone();
+                    state.pending_native_selection = Some(pending);
+                }
+                if let Some(window) = self.window.as_ref() {
+                    window.invalidate();
+                }
+                return;
             }
             if let Some(destination) = pending.copy {
                 if local.is_some()
@@ -794,6 +900,96 @@ impl super::TermWindow {
                 }
             }
         }
+    }
+
+    fn schedule_remote_selection_motion(
+        &self,
+        pane: &Arc<dyn Pane>,
+        pending: &mut crate::selection::PendingNativeSelection,
+    ) {
+        if pending.replay_scheduled {
+            return;
+        }
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        pending.replay_scheduled = true;
+        let identity = Arc::clone(&pending.identity);
+        let pane = Arc::downgrade(pane);
+        window.notify(super::TermWindowNotif::Apply(Box::new(move |tw| {
+            let Some(pane) = pane.upgrade() else {
+                return;
+            };
+            let Some(mut state) = tw.pane_state(pane.pane_id()) else {
+                return;
+            };
+            if !state
+                .pending_native_selection
+                .as_ref()
+                .is_some_and(|p| Arc::ptr_eq(&p.identity, &identity))
+            {
+                return;
+            }
+            let mut pending = state.pending_native_selection.take().unwrap();
+            pending.replay_scheduled = false;
+            if !pending
+                .desired
+                .remote_anchor()
+                .is_some_and(|expected| state.selection.remote_anchor() == Some(expected))
+            {
+                // Output invalidation can retire the token without replacing
+                // the queued pending identity. Never restart from the endpoint
+                // alone after the original origin has lost authority.
+                return;
+            }
+            drop(state);
+            let Some(motion) = pending.remote_motion.take() else {
+                return;
+            };
+            let current = tw.selection_frame_stamp(&pane);
+            let displayed = tw
+                .pane_state(pane.pane_id())
+                .and_then(|s| s.selection_frame.for_mouse(current));
+            if !motion.can_replay(displayed, std::time::Instant::now()) {
+                // Never reinterpret a point from an obsolete displayed frame.
+                // The original anchor remains owned and can still remap.
+                if pending.copy.is_some() {
+                    frankenterm_toast_notification::persistent_toast_notification(
+                        "Selection was not copied",
+                        "The pointer frame changed before selection completed. Select again.",
+                    );
+                }
+                return;
+            }
+            let applied = if let Some(preview) = motion
+                .preview
+                .clone()
+                .filter(|p| p.is_authorized_by(current.map(|f| f.authority)))
+            {
+                tw.commit_selection_candidate(&pane, preview);
+                true
+            } else {
+                tw.extend_selection_at_position(
+                    motion.mode,
+                    &pane,
+                    Some((motion.frame.authority, motion.position, motion.row)),
+                )
+            };
+            if applied {
+                if let Some(destination) = pending.copy {
+                    tw.defer_pending_selection_copy(&pane, destination);
+                }
+            } else if let Some(mut state) = tw.pane_state(pane.pane_id()) {
+                // A busy source must not consume an accepted endpoint. A newer
+                // action installed by the normal extension path wins instead.
+                if state.pending_native_selection.is_none()
+                    && state.pending_selection_start.is_none()
+                {
+                    pending.remote_motion = Some(motion);
+                    state.pending_native_selection = Some(pending);
+                }
+            }
+        })));
     }
 
     fn advance_local_selection_read(
@@ -877,6 +1073,16 @@ impl super::TermWindow {
             return Ok(None);
         };
         if pending.desired.authority != Some(authority) {
+            if pending.desired.remote_anchor().is_some()
+                && pane
+                    .downcast_ref::<frankenterm_client::pane::ClientPane>()
+                    .is_some()
+            {
+                // A delayed capture acknowledgement may have just committed
+                // the old geometry. Retain the accepted copy intent while its
+                // exact server anchor resolves, without reading stale rows.
+                return Ok(None);
+            }
             return Err("The pane changed. Select the text again to copy it.");
         }
         if pending.text_copy.is_none() {
@@ -1015,6 +1221,9 @@ impl super::TermWindow {
         pane: &Arc<dyn Pane>,
         destination: config::keyassignment::ClipboardCopyDestination,
     ) -> bool {
+        let remote_authority = pane
+            .downcast_ref::<frankenterm_client::pane::ClientPane>()
+            .and_then(|_| SelectionAuthority::capture(&**pane));
         let Some(mut state) = self.pane_state(pane.pane_id()) else {
             return false;
         };
@@ -1043,9 +1252,20 @@ impl super::TermWindow {
         let Some(pending) = state.pending_native_selection.as_mut() else {
             return false;
         };
+        if remote_authority.is_some() {
+            if let Some(final_capture) = pending.superseding_remote_preview(remote_authority) {
+                // Release owns the latest visible endpoint. First-poll its
+                // final capture now, before a subsequent resize can be sent;
+                // the earlier in-flight request cannot anchor this endpoint.
+                *pending = final_capture;
+            }
+        }
         pending.copy = Some(destination);
         pending.paint_retries_remaining = 3;
         drop(state);
+        if remote_authority.is_some() {
+            self.retry_pending_native_selection(pane);
+        }
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
@@ -1060,10 +1280,47 @@ impl super::TermWindow {
         pane: &Arc<dyn Pane>,
         current: Option<SelectionAuthority>,
     ) -> bool {
-        if !self
+        let invalidated = self
             .selection(pane.pane_id())
-            .is_some_and(|selection| selection.is_invalidated_by(current))
-        {
+            .is_some_and(|selection| selection.is_invalidated_by(current));
+        if let Some(client) = pane.downcast_ref::<frankenterm_client::pane::ClientPane>() {
+            let Some(token) = self
+                .selection(pane.pane_id())
+                .and_then(|selection| selection.remote_anchor().cloned())
+            else {
+                return false;
+            };
+            let (floor, sequence, dimensions, points) =
+                match client.remote_selection_anchor_snapshot(&token) {
+                    Ok(Some(snapshot)) if snapshot.3.is_some() => snapshot,
+                    Ok(None) | Err(SelectionReadError::Busy) => return invalidated,
+                    Ok(Some(_)) | Err(_) => {
+                        if let Some(mut selection) = self.selection(pane.pane_id()) {
+                            selection.clear_remote_anchor_if_current(&token);
+                        }
+                        return false;
+                    }
+                };
+            // Maintain the lease without rewriting an already-current
+            // selection from a separately observed remote snapshot.
+            if !invalidated {
+                return false;
+            }
+            let Some(authority) = current
+                .filter(|authority| authority.matches_remote_snapshot(&**pane, floor, dimensions))
+            else {
+                return true;
+            };
+            if let Some(points) = points {
+                if let Some(mut selection) = self.selection(pane.pane_id()) {
+                    if selection.remote_anchor() == Some(&token) {
+                        selection.rebase_remote_anchor(points, authority, sequence);
+                    }
+                }
+            }
+            return false;
+        }
+        if !invalidated {
             return false;
         }
         let Some(local) = pane.downcast_ref::<mux::localpane::LocalPane>() else {
@@ -1193,6 +1450,84 @@ impl super::TermWindow {
         self.extend_selection_at_position(mode, pane, None);
     }
 
+    fn retain_remote_selection_motion(
+        &self,
+        pane: &Arc<dyn Pane>,
+        mode: SelectionMode,
+        retained: Option<(
+            SelectionAuthority,
+            wezterm_term::input::ClickPosition,
+            StableRowIndex,
+        )>,
+        preview: Option<Selection>,
+    ) -> bool {
+        if mode == SelectionMode::Block
+            || pane
+                .downcast_ref::<frankenterm_client::pane::ClientPane>()
+                .is_none()
+        {
+            return false;
+        }
+        let Some(mut state) = self.pane_state(pane.pane_id()) else {
+            return false;
+        };
+        let owns_remote_request = state
+            .pending_native_selection
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.remote_capture.is_some() || pending.desired.remote_anchor().is_some()
+            })
+            || state.selection.remote_anchor().is_some();
+        if !owns_remote_request {
+            return false;
+        }
+        let Some(frame) = state.mouse_selection_frame else {
+            // No presented pointer coordinates yet. This prevents admitting
+            // motion, not retaining the already-owned selection anchor.
+            return true;
+        };
+        let endpoint = retained.or_else(|| {
+            state
+                .mouse_terminal_coords
+                .map(|(position, row)| (frame.authority, position, row))
+        });
+        let Some((authority, position, row)) = endpoint else {
+            return true;
+        };
+        if authority != frame.authority {
+            return true;
+        }
+        if state.pending_native_selection.is_none() && state.selection.remote_anchor().is_some() {
+            let mut pending =
+                crate::selection::PendingNativeSelection::new(state.selection.clone());
+            pending.committed = true;
+            state.pending_native_selection = Some(pending);
+        }
+        let Some(pending) = state.pending_native_selection.as_mut() else {
+            return false;
+        };
+        if pending.remote_capture.is_none() && pending.desired.remote_anchor().is_none() {
+            return false;
+        }
+        if pending.copy.is_some() {
+            return true;
+        }
+        if !pending.retain_remote_motion(crate::selection::PendingRemoteSelectionMotion {
+            frame,
+            position,
+            row,
+            mode,
+            preview: preview.clone(),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+        }) {
+            return false;
+        }
+        if let Some(preview) = preview {
+            state.selection = preview;
+        }
+        true
+    }
+
     fn extend_selection_at_position(
         &mut self,
         mode: SelectionMode,
@@ -1260,7 +1595,15 @@ impl super::TermWindow {
         let current_source = SelectionAuthority::capture_source(&**pane);
         let current = current_source.map(|(authority, _, _)| authority);
         if desired.is_invalidated_by(current) {
+            if self.retain_remote_selection_motion(pane, mode, retained, None) {
+                return false;
+            }
             self.clear_selection(pane);
+            return false;
+        }
+        if !desired.is_authorized_by(current)
+            && self.retain_remote_selection_motion(pane, mode, retained, None)
+        {
             return false;
         }
 
@@ -1473,7 +1816,9 @@ impl super::TermWindow {
             self.clear_selection(pane);
             return false;
         }
-        self.commit_selection_candidate(pane, desired);
+        if !self.retain_remote_selection_motion(pane, mode, retained, Some(desired.clone())) {
+            self.commit_selection_candidate(pane, desired);
+        }
 
         self.scroll_selection_viewport(pane.pane_id(), position, y, dims);
 
