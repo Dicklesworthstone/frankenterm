@@ -145,6 +145,56 @@ fn workflows_audit_steps_is_not_silently_ignored() {
 }
 
 #[test]
+fn inert_workspace_sync_direction_and_pack_extra_are_not_silently_ignored() {
+    // ft-l3m07: three more parsed keys have no production consumer.
+    assert_rejects("general", "general.workspace", |c| {
+        c.general.workspace = Some("team-a".to_string());
+    });
+    assert_rejects("sync", "sync.targets[backup].default_direction", |c| {
+        c.sync
+            .targets
+            .push(frankenterm_core::config::SyncTargetConfig {
+                name: "backup".to_string(),
+                endpoint: "user@host".to_string(),
+                root: "/srv/ft".to_string(),
+                default_direction: frankenterm_core::config::SyncDirection::Pull,
+                ..Default::default()
+            });
+    });
+    assert_rejects(
+        "patterns",
+        "patterns.pack_overrides.{builtin:core}.extra",
+        |c| {
+            let mut pack = frankenterm_core::config::PackOverride::default();
+            pack.extra
+                .insert("threshold".to_string(), toml::Value::Integer(3));
+            c.patterns
+                .pack_overrides
+                .insert("builtin:core".to_string(), pack);
+        },
+    );
+
+    // The honored parts of the same sections stay accepted.
+    assert_accepts("sync target with default direction", |c| {
+        c.sync
+            .targets
+            .push(frankenterm_core::config::SyncTargetConfig {
+                name: "backup".to_string(),
+                endpoint: "user@host".to_string(),
+                root: "/srv/ft".to_string(),
+                ..Default::default()
+            });
+    });
+    assert_accepts("pack override without extra", |c| {
+        let mut pack = frankenterm_core::config::PackOverride::default();
+        pack.disabled_rules.push("codex.usage.reached".to_string());
+        c.patterns
+            .pack_overrides
+            .insert("builtin:core".to_string(), pack);
+    });
+}
+
+#[test]
 fn search_daemon_unconsumed_fields_are_not_silently_ignored() {
     // ft-v46vj: only search.daemon.enabled is consumed (ipc flips
     // background_job_status). The four sibling fields have no running daemon to

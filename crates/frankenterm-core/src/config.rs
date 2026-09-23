@@ -877,6 +877,30 @@ pub const CONFIG_KEY_WIRING_INVENTORY: &[ConfigKeyWiringRecord] = &[
         validation: "Config::validate rejects non-default values as parsed but no-effect",
     },
     ConfigKeyWiringRecord {
+        key: "general.workspace",
+        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
+        consumer: "none",
+        evidence: "workspace_layout resolves the workspace from --workspace, FT_WORKSPACE, or the current directory; nothing reads this field",
+        tracking_bead: "ft-l3m07",
+        validation: "Config::validate rejects a set value as parsed but no-effect",
+    },
+    ConfigKeyWiringRecord {
+        key: "sync.targets[].default_direction",
+        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
+        consumer: "ft sync status (display only)",
+        evidence: "sync plans take their direction from the push/pull subcommand; the per-target default is only echoed in status",
+        tracking_bead: "ft-l3m07",
+        validation: "Config::validate rejects non-default values as parsed but no-effect",
+    },
+    ConfigKeyWiringRecord {
+        key: "patterns.pack_overrides.<pack>.extra",
+        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
+        consumer: "none",
+        evidence: "merge_pack_overrides carries extra keys but apply_pack_override_to_pack reads only disabled_rules and severity_overrides",
+        tracking_bead: "ft-l3m07",
+        validation: "Config::validate rejects non-empty extra tables as parsed but no-effect",
+    },
+    ConfigKeyWiringRecord {
         key: "safety.redaction",
         status: ConfigKeyWiringStatus::ParsedButUnconsumed,
         consumer: "none",
@@ -6140,6 +6164,54 @@ impl Config {
                     "workflows.audit_steps",
                     "no workflow engine/runner path reads it — step execution recording is \
                      unconditional and there is no step-level audit toggle",
+                ),
+            )
+            .into());
+        }
+
+        // ft-l3m07: three more parsed-but-inert keys fail closed when
+        // customized, so an operator is never misled into thinking they took
+        // effect. Defaults stay accepted.
+        if self.general.workspace.is_some() {
+            return Err(crate::error::ConfigError::ValidationError(
+                parsed_but_unconsumed_config_key_message(
+                    "general.workspace",
+                    "the workspace is resolved from --workspace, FT_WORKSPACE, or the current \
+                     directory",
+                ),
+            )
+            .into());
+        }
+        if let Some(target) = self
+            .sync
+            .targets
+            .iter()
+            .find(|target| target.default_direction != SyncDirection::default())
+        {
+            return Err(crate::error::ConfigError::ValidationError(
+                parsed_but_unconsumed_config_key_message(
+                    &format!("sync.targets[{}].default_direction", target.name),
+                    "sync plans take their direction from the push/pull subcommand",
+                ),
+            )
+            .into());
+        }
+        let mut packs_with_extra: Vec<&str> = self
+            .patterns
+            .pack_overrides
+            .iter()
+            .filter(|(_, pack)| !pack.extra.is_empty())
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if !packs_with_extra.is_empty() {
+            packs_with_extra.sort_unstable();
+            return Err(crate::error::ConfigError::ValidationError(
+                parsed_but_unconsumed_config_key_message(
+                    &format!(
+                        "patterns.pack_overrides.{{{}}}.extra",
+                        packs_with_extra.join(",")
+                    ),
+                    "pack overrides apply only disabled_rules and severity_overrides",
                 ),
             )
             .into());

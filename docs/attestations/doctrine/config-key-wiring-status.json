@@ -79,6 +79,30 @@
       "validation": "Config::validate rejects non-default values as parsed but no-effect"
     },
     {
+      "key": "general.workspace",
+      "status": "parsed_but_unconsumed",
+      "consumer": "none",
+      "evidence": "workspace_layout resolves the workspace from --workspace, FT_WORKSPACE, or the current directory; nothing reads this field",
+      "tracking_bead": "ft-l3m07",
+      "validation": "Config::validate rejects a set value as parsed but no-effect"
+    },
+    {
+      "key": "sync.targets[].default_direction",
+      "status": "parsed_but_unconsumed",
+      "consumer": "ft sync status (display only)",
+      "evidence": "sync plans take their direction from the push/pull subcommand; the per-target default is only echoed in status",
+      "tracking_bead": "ft-l3m07",
+      "validation": "Config::validate rejects non-default values as parsed but no-effect"
+    },
+    {
+      "key": "patterns.pack_overrides.<pack>.extra",
+      "status": "parsed_but_unconsumed",
+      "consumer": "none",
+      "evidence": "merge_pack_overrides carries extra keys but apply_pack_override_to_pack reads only disabled_rules and severity_overrides",
+      "tracking_bead": "ft-l3m07",
+      "validation": "Config::validate rejects non-empty extra tables as parsed but no-effect"
+    },
+    {
       "key": "safety.redaction",
       "status": "parsed_but_unconsumed",
       "consumer": "none",
