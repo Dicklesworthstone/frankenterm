@@ -15,6 +15,23 @@ TARGET=""
 OUTPUT=""
 MANIFEST=""
 CACHE=""
+PREFLIGHT_ONLY=0
+# hashlib.file_digest (used by every embedded hash check) is Python 3.11+.
+MIN_PYTHON_MINOR=11
+
+require_host_tools() {
+    local command
+    for command in curl git ln python3 shasum; do
+        if ! command -v "$command" >/dev/null 2>&1; then
+            echo "Error: required command '$command' is unavailable" >&2
+            exit 2
+        fi
+    done
+    if ! python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, $MIN_PYTHON_MINOR) else 1)"; then
+        echo "Error: python3 at $(command -v python3) is $(python3 -c 'import platform; print(platform.python_version())'); 3.$MIN_PYTHON_MINOR+ is required (hashlib.file_digest)" >&2
+        exit 2
+    fi
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -22,14 +39,22 @@ while [[ $# -gt 0 ]]; do
         --output) OUTPUT="$2"; shift 2 ;;
         --manifest) MANIFEST="$2"; shift 2 ;;
         --cache) CACHE="$2"; shift 2 ;;
+        --preflight) PREFLIGHT_ONLY=1; shift ;;
         -h|--help)
             echo "Usage: $0 --target TRIPLE --output DIR --manifest FILE --cache DIR"
+            echo "       $0 --preflight   (check host tools and Python 3.$MIN_PYTHON_MINOR+ only; run before compiling)"
             echo "Assembles and verifies the pinned browser component without launching it."
             exit 0
             ;;
         *) echo "Unknown option: $1" >&2; exit 2 ;;
     esac
 done
+
+require_host_tools
+if [[ "$PREFLIGHT_ONLY" == 1 ]]; then
+    echo "browser runtime preflight: ok (python3 $(python3 -c 'import platform; print(platform.python_version())'))"
+    exit 0
+fi
 
 if [[ -z "$TARGET" || -z "$OUTPUT" || -z "$MANIFEST" || -z "$CACHE" ]]; then
     echo "Error: --target, --output, --manifest, and --cache are required" >&2
@@ -43,12 +68,6 @@ if [[ -e "$OUTPUT" || -e "$MANIFEST" ]]; then
     echo "Error: output and manifest paths must both be fresh" >&2
     exit 2
 fi
-for command in curl git ln python3 shasum; do
-    if ! command -v "$command" >/dev/null 2>&1; then
-        echo "Error: required command '$command' is unavailable" >&2
-        exit 2
-    fi
-done
 if [[ -n "${DSR_SOURCE_REPOSITORY:-}" && -z "${DSR_RELEASE_GIT_SHA:-}" ]]; then
     echo "Error: DSR_SOURCE_REPOSITORY requires DSR_RELEASE_GIT_SHA" >&2
     exit 2
