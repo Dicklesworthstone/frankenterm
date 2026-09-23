@@ -175,7 +175,7 @@ pub enum SelectionAnchorCaptureError {
 
 type SelectionPoints = [Option<frankenterm_term::screen::SelectionAnchorCoordinate>; 3];
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 enum ColdSelectionRequest {
     Capture {
         floor: SequenceNo,
@@ -184,6 +184,37 @@ enum ColdSelectionRequest {
         points: SelectionPoints,
     },
     Resolve(frankenterm_term::screen::ScreenSelectionAnchorWeak),
+}
+
+impl PartialEq for ColdSelectionRequest {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Capture {
+                    floor: left_floor,
+                    sequence: left_sequence,
+                    dimensions: left_dimensions,
+                    points: left_points,
+                },
+                Self::Capture {
+                    floor: right_floor,
+                    sequence: right_sequence,
+                    dimensions: right_dimensions,
+                    points: right_points,
+                },
+            ) => {
+                left_floor == right_floor
+                    && left_sequence == right_sequence
+                    && crate::renderable::same_line_layout_geometry(
+                        left_dimensions,
+                        right_dimensions,
+                    )
+                    && left_points == right_points
+            }
+            (Self::Resolve(left), Self::Resolve(right)) => left == right,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -222,35 +253,54 @@ struct ColdSelectionWork {
 }
 
 struct ColdSelectionOwnership {
-    owners: AtomicUsize,
-    legacy_requested: AtomicBool,
+    state: AtomicUsize,
 }
 
 impl ColdSelectionOwnership {
-    const CLOSED: usize = usize::MAX;
+    const CLOSED: usize = 1 << (usize::BITS - 1);
+    const LEGACY: usize = 1 << (usize::BITS - 2);
+    const COUNT_MASK: usize = Self::LEGACY - 1;
+
+    fn new(legacy_requested: bool) -> Self {
+        Self {
+            state: AtomicUsize::new(if legacy_requested { Self::LEGACY } else { 0 }),
+        }
+    }
 
     fn claim(&self) -> bool {
-        self.owners
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |owners| {
-                (owners < Self::CLOSED - 1).then_some(owners + 1)
+        self.state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (state & Self::CLOSED == 0 && state & Self::COUNT_MASK < Self::COUNT_MASK)
+                    .then_some(state + 1)
             })
             .is_ok()
     }
 
+    fn mark_legacy(&self) -> bool {
+        self.state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (state & Self::CLOSED == 0).then_some(state | Self::LEGACY)
+            })
+            .is_ok()
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state.load(Ordering::Acquire) & Self::CLOSED != 0
+    }
+
     fn release(&self) -> bool {
-        self.owners
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |owners| {
-                if owners == 0 || owners == Self::CLOSED {
+        self.state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                let owners = state & Self::COUNT_MASK;
+                if owners == 0 || state & Self::CLOSED != 0 {
                     None
-                } else if owners == 1 && !self.legacy_requested.load(Ordering::Acquire) {
+                } else if owners == 1 && state & Self::LEGACY == 0 {
                     Some(Self::CLOSED)
                 } else {
-                    Some(owners - 1)
+                    Some(state - 1)
                 }
             })
-            .is_ok_and(|previous| {
-                previous == 1 && self.owners.load(Ordering::Acquire) == Self::CLOSED
-            })
+            .is_ok_and(|previous| previous & Self::COUNT_MASK == 1 && previous & Self::LEGACY == 0)
     }
 }
 
@@ -1645,6 +1695,7 @@ impl Pane for LocalPane {
             current_dimensions,
             points,
             false,
+            Some(state),
         ) {
             Ok(Some(token)) => {
                 *state = Some(Box::new(token));
@@ -1652,35 +1703,24 @@ impl Pane for LocalPane {
             }
             Ok(None) => Err(Error::Unsupported),
             Err(SelectionAnchorCaptureError::Busy) => {
-                let mut replacement = None;
-                let mut still_owned = false;
-                if let Some(mut slot) = self.cold_selection.try_lock() {
-                    if let Some(work) = slot.iter_mut().find(|work| {
-                        work.request == request && !work.cancelled.load(Ordering::Acquire)
-                    }) {
-                        still_owned = state
-                            .as_ref()
-                            .and_then(|state| state.downcast_ref::<ColdSelectionCaptureOwner>())
-                            .is_some_and(|owner| Arc::ptr_eq(&owner.cancelled, &work.cancelled));
-                        if !still_owned && work.ownership.claim() {
-                            replacement = Some(ColdSelectionCaptureOwner {
-                                request,
-                                slot: Arc::clone(&self.cold_selection),
-                                cancelled: Arc::clone(&work.cancelled),
-                                ownership: Arc::clone(&work.ownership),
-                            });
-                        }
-                    }
-                } else {
-                    return Err(Error::Busy);
-                }
-                if let Some(owner) = replacement {
-                    *state = Some(Box::new(owner));
-                    Ok(Status::Pending)
-                } else if still_owned {
-                    Ok(Status::Pending)
-                } else {
+                let stale = state
+                    .as_ref()
+                    .and_then(|state| state.downcast_ref::<ColdSelectionCaptureOwner>())
+                    .is_some_and(|owner| {
+                        owner.cancelled.load(Ordering::Acquire)
+                            || owner.ownership.is_closed()
+                            || self.cold_selection.try_lock().is_some_and(|slot| {
+                                !slot
+                                    .iter()
+                                    .any(|work| Arc::ptr_eq(&work.cancelled, &owner.cancelled))
+                            })
+                    });
+                if stale {
                     *state = None;
+                }
+                if state.is_some() {
+                    Ok(Status::Pending)
+                } else {
                     Err(Error::Busy)
                 }
             }
@@ -4833,6 +4873,7 @@ impl LocalPane {
             expected_dimensions,
             points,
             true,
+            None,
         )
     }
 
@@ -4843,19 +4884,28 @@ impl LocalPane {
         expected_dimensions: RenderableDimensions,
         points: [Option<frankenterm_term::screen::SelectionAnchorCoordinate>; 3],
         legacy_requested: bool,
+        pending_owner: Option<&mut Option<crate::pane::PaneSelectionAnchor>>,
     ) -> Result<Option<frankenterm_term::screen::ScreenSelectionAnchor>, SelectionAnchorCaptureError>
     {
         let mut term = self
             .terminal
             .try_lock()
             .ok_or(SelectionAnchorCaptureError::Busy)?;
+        // A superseded owner may have dropped while a worker held the slot.
+        // Retire its completed strong token before *any* Screen registration,
+        // including resident and already-hydrated cold captures.
+        if !self.reclaim_cancelled_cold_selection() {
+            return Err(SelectionAnchorCaptureError::Busy);
+        }
         let floor = Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)
             .ok()
             .flatten()
             .ok_or(SelectionAnchorCaptureError::Busy)?;
         let dimensions =
             terminal_try_get_dimensions(&mut term).ok_or(SelectionAnchorCaptureError::Busy)?;
-        if floor != expected_floor || dimensions != expected_dimensions {
+        if floor != expected_floor
+            || !crate::renderable::same_line_layout_geometry(&dimensions, &expected_dimensions)
+        {
             return Err(SelectionAnchorCaptureError::SourceChanged);
         }
         let sequence = term.current_seqno();
@@ -4933,7 +4983,7 @@ impl LocalPane {
                     SelectionAnchorCaptureError::Busy
                 });
         }
-        self.request_cold_selection(&mut term, request, ranges, legacy_requested);
+        self.request_cold_selection(&mut term, request, ranges, legacy_requested, pending_owner);
         Err(SelectionAnchorCaptureError::Busy)
     }
 
@@ -5010,8 +5060,16 @@ impl LocalPane {
                 }
             };
         }
-        self.request_cold_selection(&mut term, request, ranges, true);
+        self.request_cold_selection(&mut term, request, ranges, true, None);
         None
+    }
+
+    fn reclaim_cancelled_cold_selection(&self) -> bool {
+        let Some(mut slot) = self.cold_selection.try_lock() else {
+            return false;
+        };
+        slot.retain(|work| !work.cancelled.load(Ordering::Acquire) && !work.ownership.is_closed());
+        true
     }
 
     fn cold_selection_ready(
@@ -5031,7 +5089,7 @@ impl LocalPane {
             || work.cancelled.load(Ordering::Acquire)
             || ready.floor != floor
             || ready.sequence > sequence
-            || ready.dimensions != dimensions
+            || !crate::renderable::same_line_layout_geometry(&ready.dimensions, &dimensions)
         {
             return None;
         }
@@ -5078,12 +5136,64 @@ impl LocalPane {
         value
     }
 
+    fn claim_cold_selection_work(
+        &self,
+        work: &ColdSelectionWork,
+        state: &mut Option<crate::pane::PaneSelectionAnchor>,
+    ) -> Result<Option<crate::pane::PaneSelectionAnchor>, ()> {
+        if state
+            .as_ref()
+            .and_then(|state| state.downcast_ref::<ColdSelectionCaptureOwner>())
+            .is_some_and(|owner| Arc::ptr_eq(&owner.cancelled, &work.cancelled))
+        {
+            return Ok(None);
+        }
+        if !work.ownership.claim() {
+            return Err(());
+        }
+        Ok(state.replace(Box::new(ColdSelectionCaptureOwner {
+            request: work.request.clone(),
+            slot: Arc::clone(&self.cold_selection),
+            cancelled: Arc::clone(&work.cancelled),
+            ownership: Arc::clone(&work.ownership),
+        })))
+    }
+
+    fn cold_selection_ready_reusable(
+        work: &ColdSelectionWork,
+        floor: SequenceNo,
+        sequence: SequenceNo,
+        dimensions: RenderableDimensions,
+        now: Instant,
+    ) -> bool {
+        let Some(ready) = work.ready.as_ref() else {
+            return true;
+        };
+        if ready.floor != floor
+            || ready.sequence > sequence
+            || !crate::renderable::same_line_layout_geometry(&ready.dimensions, &dimensions)
+        {
+            return false;
+        }
+        match (&ready.value, &work.request) {
+            (ColdSelectionValue::RetryAt(retry_at), _) => now < *retry_at,
+            (ColdSelectionValue::Captured(Ok(Some(_))), ColdSelectionRequest::Capture { .. }) => {
+                true
+            }
+            (ColdSelectionValue::Resolved(Some(_)), ColdSelectionRequest::Resolve(anchor)) => {
+                anchor.upgrade().is_some()
+            }
+            _ => ready.sequence == sequence,
+        }
+    }
+
     fn request_cold_selection(
         &self,
         term: &mut Terminal,
         request: ColdSelectionRequest,
         ranges: Vec<Range<StableRowIndex>>,
         legacy_requested: bool,
+        mut pending_owner: Option<&mut Option<crate::pane::PaneSelectionAnchor>>,
     ) {
         if ranges.is_empty() || ranges.len() > 3 {
             return;
@@ -5092,6 +5202,11 @@ impl LocalPane {
             return;
         };
         let retry = Arc::clone(&self.cold_selection_retry);
+        let current_floor = Self::refresh_line_layout_floor(&self.line_layout_observation, term)
+            .ok()
+            .flatten();
+        let current_dimensions = terminal_try_get_dimensions(term);
+        let current_sequence = term.current_seqno();
         let Some(mut slot) = self.cold_selection.try_lock() else {
             retry_cold_viewport(registration, retry);
             return;
@@ -5099,6 +5214,7 @@ impl LocalPane {
         let now = Instant::now();
         slot.retain(|work| {
             let retain = !work.cancelled.load(Ordering::Acquire)
+                && !work.ownership.is_closed()
                 && now.duration_since(work.renewed) < COLD_SELECTION_WORK_LEASE;
             if !retain {
                 work.cancelled.store(true, Ordering::Release);
@@ -5107,13 +5223,27 @@ impl LocalPane {
         });
         if let Some(work) = slot.iter_mut().find(|work| work.request == request) {
             work.renewed = now;
-            if legacy_requested {
-                work.ownership
-                    .legacy_requested
-                    .store(true, Ordering::Release);
-            }
-            if work.ready.is_none() {
-                return;
+            if !legacy_requested || work.ownership.mark_legacy() {
+                let reusable = match (current_floor, current_dimensions) {
+                    (Some(floor), Some(dimensions)) => Self::cold_selection_ready_reusable(
+                        work,
+                        floor,
+                        current_sequence,
+                        dimensions,
+                        now,
+                    ),
+                    _ => true,
+                };
+                if reusable {
+                    let claim = pending_owner.as_mut().map_or(Ok(None), |owner| {
+                        self.claim_cold_selection_work(work, owner)
+                    });
+                    if let Ok(retired) = claim {
+                        drop(slot);
+                        drop(retired);
+                        return;
+                    }
+                }
             }
         }
         // This request's obsolete completion can be replaced, but another
@@ -5137,17 +5267,26 @@ impl LocalPane {
             return;
         };
         let cancelled = Arc::new(AtomicBool::new(false));
-        slot.push(ColdSelectionWork {
+        let work = ColdSelectionWork {
             request: request.clone(),
             cancelled: Arc::clone(&cancelled),
             ready: None,
             renewed: now,
-            ownership: Arc::new(ColdSelectionOwnership {
-                owners: AtomicUsize::new(0),
-                legacy_requested: AtomicBool::new(legacy_requested),
-            }),
-        });
+            ownership: Arc::new(ColdSelectionOwnership::new(legacy_requested)),
+        };
+        let retired = if let Some(owner) = pending_owner.as_mut() {
+            let Ok(retired) = self.claim_cold_selection_work(&work, owner) else {
+                drop(slot);
+                retry_cold_viewport(registration, retry);
+                return;
+            };
+            retired
+        } else {
+            None
+        };
+        slot.push(work);
         drop(slot);
+        drop(retired);
         let completion = ColdSelectionCompletion {
             slot: Arc::clone(&self.cold_selection),
             cancelled: Arc::clone(&cancelled),
@@ -5187,6 +5326,9 @@ impl LocalPane {
                         let Some(mut slot) = completion.slot.try_lock() else {
                             return false;
                         };
+                        slot.retain(|work| {
+                            !work.cancelled.load(Ordering::Acquire) && !work.ownership.is_closed()
+                        });
                         let Some(work) = slot.iter_mut().find(|work| {
                             Arc::ptr_eq(&work.cancelled, &completion.cancelled)
                                 && !work.cancelled.load(Ordering::Acquire)
@@ -5217,7 +5359,10 @@ impl LocalPane {
                                 points,
                             } => {
                                 floor == *expected_floor
-                                    && dimensions == *expected_dimensions
+                                    && crate::renderable::same_line_layout_geometry(
+                                        &dimensions,
+                                        expected_dimensions,
+                                    )
                                     && sequence >= *expected_sequence
                                     && term
                                         .screen()
@@ -5572,17 +5717,19 @@ impl LocalPane {
             }
             viewport.row = first;
             if viewport.anchor.is_none() {
-                viewport.anchor = term.screen_mut().capture_selection_anchor(
-                    frame.source_sequence,
-                    [
-                        Some(frankenterm_term::screen::SelectionAnchorCoordinate {
-                            row: first,
-                            column: Some(0),
-                        }),
-                        None,
-                        None,
-                    ],
-                );
+                if self.reclaim_cancelled_cold_selection() {
+                    viewport.anchor = term.screen_mut().capture_selection_anchor(
+                        frame.source_sequence,
+                        [
+                            Some(frankenterm_term::screen::SelectionAnchorCoordinate {
+                                row: first,
+                                column: Some(0),
+                            }),
+                            None,
+                            None,
+                        ],
+                    );
+                }
             }
             if cold && viewport.cold_anchor.is_none() {
                 let registration = self.mux_registration.load()?;
@@ -12015,6 +12162,62 @@ mod tests {
                 Some(ColdSelectionValue::Captured(Ok(Some(_))))
             )
         }));
+        // Content appended below this closed group advances physical bounds,
+        // not its logical layout. An already-owned cold capture must survive
+        // that unrelated output and keep its original endpoint authority.
+        let append_points = [
+            Some(frankenterm_term::screen::SelectionAnchorCoordinate {
+                row,
+                column: Some(6),
+            }),
+            None,
+            None,
+        ];
+        let mut append_state = None;
+        assert_eq!(
+            pane.capture_selection_anchor_capability(
+                selection_sequence,
+                selection_dimensions,
+                append_points,
+                &mut append_state,
+            ),
+            Ok(crate::pane::PaneSelectionAnchorStatus::Pending)
+        );
+        assert!(append_state.is_some());
+        {
+            let mut term = pane.terminal.lock();
+            term.advance_bytes(b"unrelated output after the selected group\r\n");
+        }
+        let appended_dimensions = pane.get_dimensions();
+        assert_ne!(
+            appended_dimensions.physical_top,
+            selection_dimensions.physical_top
+        );
+        assert!(crate::renderable::same_line_layout_geometry(
+            &appended_dimensions,
+            &selection_dimensions,
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            while executor.try_tick().unwrap() {}
+            match pane.capture_selection_anchor_capability(
+                selection_sequence,
+                selection_dimensions,
+                append_points,
+                &mut append_state,
+            ) {
+                Ok(crate::pane::PaneSelectionAnchorStatus::Captured) => break,
+                Ok(crate::pane::PaneSelectionAnchorStatus::Pending)
+                | Err(crate::pane::PaneSelectionAnchorError::Busy) => {}
+                result => panic!("append invalidated retained cold capture: {result:?}"),
+            }
+            assert!(Instant::now() < deadline, "append capture did not settle");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(append_state.as_ref().is_some_and(|state| state
+            .downcast_ref::<frankenterm_term::screen::ScreenSelectionAnchor>()
+            .is_some()));
+        drop(append_state);
         // A GUI gesture can be superseded after its real cold worker has
         // completed but before the next paint delivers the token. Twenty
         // distinct abandoned captures must not exhaust Screen's sixteen
@@ -12069,13 +12272,37 @@ mod tests {
                     );
                     std::thread::sleep(Duration::from_millis(1));
                 }
+                // Force the owner's nonblocking retirement to lose the slot
+                // race. The next capture must reclaim this cancelled strong
+                // token before registering a new one.
+                let slot = pane.cold_selection.lock();
                 drop(state);
-                assert!(pane
-                    .cold_selection
-                    .lock()
-                    .iter()
-                    .all(|work| work.request != request));
+                assert!(slot.iter().any(|work| {
+                    work.request == request
+                        && work.cancelled.load(Ordering::Acquire)
+                        && work.ready.is_some()
+                }));
+                drop(slot);
                 abandoned += 1;
+                if abandoned == MAX_COLD_SELECTION_WORK {
+                    let (floor, sequence, dimensions) = pane.selection_source_snapshot().unwrap();
+                    let resident = pane
+                        .capture_selection_anchor(
+                            floor,
+                            sequence,
+                            dimensions,
+                            [
+                                Some(frankenterm_term::screen::SelectionAnchorCoordinate {
+                                    row: dimensions.physical_top,
+                                    column: Some(0),
+                                }),
+                                None,
+                                None,
+                            ],
+                        )
+                        .expect("cancelled cold results must not block resident capture");
+                    assert!(resident.is_some());
+                }
             }
         }
         assert_eq!(abandoned, 20);
@@ -12120,10 +12347,7 @@ mod tests {
             cancelled: Arc::clone(&successor_cancelled),
             ready: None,
             renewed: Instant::now(),
-            ownership: Arc::new(ColdSelectionOwnership {
-                owners: AtomicUsize::new(0),
-                legacy_requested: AtomicBool::new(true),
-            }),
+            ownership: Arc::new(ColdSelectionOwnership::new(true)),
         }]));
         drop(ColdSelectionCompletion {
             slot: Arc::clone(&successor),
@@ -12155,6 +12379,59 @@ mod tests {
                 None,
             ],
         };
+        // Model the exact publication/admission interleaving: a worker has
+        // just completed after caller B's first ready lookup. B must join
+        // A's still-owned result, not cancel it and start another read.
+        let published_request = ColdSelectionRequest::Capture {
+            floor: selection_floor,
+            sequence: selection_sequence,
+            dimensions: selection_dimensions,
+            points: selection_points,
+        };
+        let published_cancelled = Arc::new(AtomicBool::new(false));
+        let published_ownership = Arc::new(ColdSelectionOwnership::new(false));
+        assert!(published_ownership.claim());
+        let mut first_owner: Option<crate::pane::PaneSelectionAnchor> =
+            Some(Box::new(ColdSelectionCaptureOwner {
+                request: published_request.clone(),
+                slot: Arc::clone(&pane.cold_selection),
+                cancelled: Arc::clone(&published_cancelled),
+                ownership: Arc::clone(&published_ownership),
+            }));
+        let (published_floor, published_sequence, published_dimensions) =
+            pane.selection_source_snapshot().unwrap();
+        pane.cold_selection.lock().push(ColdSelectionWork {
+            request: published_request.clone(),
+            cancelled: Arc::clone(&published_cancelled),
+            ready: Some(ColdSelectionReady {
+                floor: published_floor,
+                sequence: published_sequence,
+                dimensions: published_dimensions,
+                value: ColdSelectionValue::Captured(Ok(Some(selection_anchor.clone()))),
+            }),
+            renewed: Instant::now(),
+            ownership: Arc::clone(&published_ownership),
+        });
+        let mut second_owner = None;
+        {
+            let mut term = pane.terminal.lock();
+            pane.request_cold_selection(
+                &mut term,
+                published_request.clone(),
+                vec![row..row + 1],
+                false,
+                Some(&mut second_owner),
+            );
+        }
+        assert!(second_owner.is_some());
+        assert_eq!(pane.cold_selection.lock().len(), 1);
+        assert!(!published_cancelled.load(Ordering::Acquire));
+        drop(first_owner.take());
+        assert!(pane.cold_selection.lock().iter().any(|work| {
+            work.request == published_request && !work.cancelled.load(Ordering::Acquire)
+        }));
+        drop(second_owner);
+        assert!(pane.cold_selection.lock().is_empty());
         let cancelled: Vec<_> = (0..MAX_COLD_SELECTION_WORK)
             .map(|_| Arc::new(AtomicBool::new(false)))
             .collect();
@@ -12167,21 +12444,18 @@ mod tests {
                 cancelled: Arc::clone(cancelled),
                 ready: None,
                 renewed: admitted_at,
-                ownership: Arc::new(ColdSelectionOwnership {
-                    owners: AtomicUsize::new(0),
-                    legacy_requested: AtomicBool::new(true),
-                }),
+                ownership: Arc::new(ColdSelectionOwnership::new(true)),
             })
             .collect();
         let reads_before = sink.payload_reads.load(Ordering::Acquire);
         {
             let mut term = pane.terminal.lock();
-            pane.request_cold_selection(&mut term, request(0), vec![row..row + 1], true);
+            pane.request_cold_selection(&mut term, request(0), vec![row..row + 1], true, None);
             assert_eq!(pane.cold_selection.lock().len(), MAX_COLD_SELECTION_WORK);
             assert!(cancelled.iter().all(|flag| !flag.load(Ordering::Acquire)));
             assert_eq!(sink.payload_reads.load(Ordering::Acquire), reads_before);
             pane.cold_selection.lock()[0].renewed = admitted_at - Duration::from_secs(1);
-            pane.request_cold_selection(&mut term, request(1), vec![row..row + 1], true);
+            pane.request_cold_selection(&mut term, request(1), vec![row..row + 1], true, None);
             assert!(pane.cold_selection.lock()[0].renewed >= admitted_at);
             assert_eq!(pane.cold_selection.lock().len(), MAX_COLD_SELECTION_WORK);
             // A cached SourceChanged result owns no payload/worker, but must
@@ -12197,7 +12471,7 @@ mod tests {
             });
             work[1].renewed = Instant::now() - COLD_SELECTION_WORK_LEASE - Duration::from_secs(1);
             drop(work);
-            pane.request_cold_selection(&mut term, request(0), vec![row..row + 1], true);
+            pane.request_cold_selection(&mut term, request(0), vec![row..row + 1], true, None);
             assert_eq!(pane.cold_selection.lock().len(), MAX_COLD_SELECTION_WORK);
             assert!(cancelled[1].load(Ordering::Acquire));
             assert!(cancelled
