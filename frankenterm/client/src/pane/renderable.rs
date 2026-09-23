@@ -4672,7 +4672,7 @@ mod tests {
     use crate::domain::{ClientDomainConfig, ClientInner};
     use crate::pane::{ClientPane, SelectionReadError};
     use codec::{
-        GetImageCell, InputSerial, RenderConnectionIdentity, TopologyStreamId,
+        GetImageCell, InputSerial, MuxErrorRetry, RenderConnectionIdentity, TopologyStreamId,
         MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES, MAX_IMAGE_HYDRATION_DECODED_BYTES,
     };
     use config::UnixDomain;
