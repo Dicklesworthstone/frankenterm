@@ -267,6 +267,13 @@ impl<T> ElasticBuffer<T> {
     /// threshold not yet elapsed, or there is no excess capacity to
     /// release).
     pub fn try_shrink_if_idle(&mut self, now: Instant) -> Option<ShrinkResult> {
+        // Live allocations belong to RenderState, not this staging Vec.
+        // Only record_live_allocation may report their actual shrink. In
+        // particular, Vec<()> always has usize::MAX capacity and cannot shrink.
+        if self.observed_live_capacity.is_some() {
+            return None;
+        }
+
         if self.gesture_active {
             return None;
         }
@@ -283,6 +290,10 @@ impl<T> ElasticBuffer<T> {
 
         let capacity_before = current;
         self.set_capacity(target);
+        let capacity_after = self.data.capacity();
+        if capacity_after >= capacity_before {
+            return None;
+        }
         // Reset the high-water mark so the next gesture observes a
         // fresh peak.
         self.high_water_mark = self.data.len();
@@ -293,7 +304,7 @@ impl<T> ElasticBuffer<T> {
 
         Some(ShrinkResult {
             capacity_before,
-            capacity_after: self.data.capacity(),
+            capacity_after,
             used_at_shrink: self.data.len(),
         })
     }
@@ -491,6 +502,55 @@ mod tests {
         assert_eq!(bm.telemetry_capacity(), 128);
         assert_eq!(bm.high_water_mark(), 80);
         assert_eq!(bm.grow_count(), 0);
+    }
+
+    #[test]
+    fn zero_sized_staging_buffer_does_not_report_noop_shrink() {
+        let mut bm: ElasticBuffer<()> = small_buffer(0);
+        bm.push(());
+        bm.clear();
+        bm.begin_gesture();
+        let gesture_end = Instant::now();
+        bm.end_gesture(gesture_end);
+        assert!(bm
+            .try_shrink_if_idle(gesture_end + Duration::from_secs(60))
+            .is_none());
+        assert_eq!(bm.shrink_count(), 0);
+        assert_eq!(bm.high_water_mark(), 1);
+        assert_eq!(bm.last_gesture_end, Some(gesture_end));
+    }
+
+    #[test]
+    fn live_zero_sized_observer_idle_does_not_report_staging_shrink() {
+        let mut bm: ElasticBuffer<()> = small_buffer(0);
+        bm.record_live_allocation(200, 256, 0);
+        bm.record_live_allocation(64, 256, 0);
+        assert_eq!(bm.capacity(), usize::MAX);
+
+        bm.begin_gesture();
+        let gesture_end = Instant::now();
+        bm.end_gesture(gesture_end);
+        let after_idle = gesture_end + Duration::from_secs(60);
+        for now in [after_idle, after_idle + Duration::from_secs(60)] {
+            assert!(bm.try_shrink_if_idle(now).is_none());
+            assert_eq!(bm.grow_count(), 0);
+            assert_eq!(bm.shrink_count(), 0);
+            assert_eq!(bm.high_water_mark(), 200);
+            assert_eq!(bm.telemetry_capacity(), 256);
+            assert_eq!(bm.telemetry_len(), 64);
+            assert_eq!(bm.last_gesture_end, Some(gesture_end));
+        }
+
+        // This supplies an allocation report; it does not perform a GPU shrink.
+        bm.record_live_allocation(64, 128, 1);
+        assert_eq!(bm.shrink_count(), 1);
+        assert_eq!(bm.grow_count(), 0);
+        assert_eq!(bm.high_water_mark(), 64);
+        assert_eq!(bm.telemetry_capacity(), 128);
+        assert_eq!(bm.last_gesture_end, None);
+        assert!(bm.try_shrink_if_idle(after_idle).is_none());
+        assert_eq!(bm.shrink_count(), 1);
+        assert_eq!(bm.high_water_mark(), 64);
     }
 
     #[test]
