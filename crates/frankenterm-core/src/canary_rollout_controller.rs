@@ -515,7 +515,8 @@ impl CanaryRolloutController {
     /// Update the set of agents included in the canary cohort.
     ///
     /// When the allowlist in config is non-empty, it takes precedence.
-    /// Otherwise, `available_agents` is sampled at `canary_agent_fraction`.
+    /// Otherwise, distinct `available_agents` are sampled at
+    /// `canary_agent_fraction`, preserving their first-seen order.
     ///
     /// br-ft-ao0i5: the allowlist branch now intersects with
     /// `available_agents` rather than blindly trusting the configured
@@ -543,12 +544,19 @@ impl CanaryRolloutController {
             return;
         }
 
-        let count = ((available_agents.len() as f64 * self.config.canary_agent_fraction).ceil()
-            as usize)
+        // Availability may contain multiple observations of the same agent.
+        // Count identities before sampling so duplicates cannot alter the
+        // rollout fraction or consume another agent's cohort slot.
+        let mut seen = HashSet::new();
+        let distinct: Vec<&String> = available_agents
+            .iter()
+            .filter(|agent| seen.insert(*agent))
+            .collect();
+        let count = ((distinct.len() as f64 * self.config.canary_agent_fraction).ceil() as usize)
             .max(1)
-            .min(available_agents.len());
+            .min(distinct.len());
 
-        for agent in available_agents.iter().take(count) {
+        for agent in distinct.into_iter().take(count) {
             self.canary_agents.insert(agent.clone());
         }
     }
@@ -1653,6 +1661,24 @@ mod tests {
         ctrl.update_canary_agents(&["a1".to_string(), "a2".to_string()]);
 
         assert_eq!(ctrl.canary_agents().len(), 1);
+    }
+
+    #[test]
+    fn canary_agents_fraction_ignores_duplicate_availability() {
+        let mut ctrl = CanaryRolloutController::new(CanaryRolloutConfig {
+            canary_agent_fraction: 0.5,
+            ..Default::default()
+        });
+        let expected = HashSet::from(["a".to_string(), "b".to_string()]);
+        // Repeated early IDs must not consume slots; repeated late IDs must
+        // not inflate the cohort's blast radius.
+        for available in [vec!["a", "a", "b", "c"], vec!["a", "b", "c", "c", "c"]] {
+            let available: Vec<String> = available.into_iter().map(String::from).collect();
+            ctrl.update_canary_agents(&available);
+            assert_eq!(ctrl.canary_agents(), &expected);
+        }
+        ctrl.update_canary_agents(&["w6".to_string(), "w6".to_string()]);
+        assert_eq!(ctrl.canary_agents(), &HashSet::from(["w6".to_string()]));
     }
 
     #[test]

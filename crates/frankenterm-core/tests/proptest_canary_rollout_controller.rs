@@ -513,8 +513,9 @@ proptest! {
     #[test]
     fn canary_conserves_assignments(
         set in arb_assignment_set(),
-        agents in prop::collection::vec(arb_agent_id(), 1..=5),
+        agents in prop::collection::btree_set(arb_agent_id(), 1..=5),
     ) {
+        let agents: Vec<String> = agents.into_iter().collect();
         let config = CanaryRolloutConfig {
             initial_phase: CanaryPhase::Canary,
             canary_agent_allowlist: agents.clone(),
@@ -543,8 +544,9 @@ proptest! {
     #[test]
     fn canary_only_allows_canary_agents(
         set in arb_assignment_set(),
-        agents in prop::collection::vec(arb_agent_id(), 1..=3),
+        agents in prop::collection::btree_set(arb_agent_id(), 1..=3),
     ) {
+        let agents: Vec<String> = agents.into_iter().collect();
         let config = CanaryRolloutConfig {
             initial_phase: CanaryPhase::Canary,
             canary_agent_allowlist: agents.clone(),
@@ -571,7 +573,7 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
-    // 21. Fraction-based selection: count = ceil(len * fraction), clamped to [1, len]
+    // 21. Fraction-based selection counts distinct available identities.
     #[test]
     fn agent_fraction_count(
         fraction in 0.01..=1.0f64,
@@ -585,15 +587,16 @@ proptest! {
         let mut ctrl = CanaryRolloutController::new(config);
         ctrl.update_canary_agents(&agents);
 
-        let expected = ((agents.len() as f64 * fraction).ceil() as usize)
+        let distinct = agents.iter().collect::<std::collections::BTreeSet<_>>();
+        let expected = ((distinct.len() as f64 * fraction).ceil() as usize)
             .max(1)
-            .min(agents.len());
+            .min(distinct.len());
         prop_assert_eq!(
             ctrl.canary_agents().len(),
             expected,
-            "fraction={}, agents={}, expected={}, got={}",
+            "fraction={}, distinct_agents={}, expected={}, got={}",
             fraction,
-            agents.len(),
+            distinct.len(),
             expected,
             ctrl.canary_agents().len(),
         );
@@ -602,9 +605,10 @@ proptest! {
     // 22. Allowlist overrides fraction
     #[test]
     fn allowlist_overrides(
-        agents in prop::collection::vec(arb_agent_id(), 2..=10),
+        agents in prop::collection::btree_set(arb_agent_id(), 2..=10),
         take in 1..=3usize,
     ) {
+        let agents: Vec<String> = agents.into_iter().collect();
         let allowlist: Vec<String> = agents.iter().take(take.min(agents.len())).cloned().collect();
         let config = CanaryRolloutConfig {
             canary_agent_fraction: 0.01,
