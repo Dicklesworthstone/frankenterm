@@ -3820,7 +3820,7 @@ mod tests {
             " \u{301}",
             "\u{2003}\u{301}",
         ] {
-            assert!(!is_wrap_separator(nonseparator), "{nonseparator:?}");
+            assert!(!is_wrap_separator(nonseparator), "{:?}", nonseparator);
         }
     }
 
