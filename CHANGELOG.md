@@ -26,11 +26,14 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 ---
 
-## [Unreleased] -- `0.15.20`; development on `main` since the local `0.15.2` build
+## [Unreleased] -- `0.15.21`; development on `main` since the local `0.15.2` build
 
 Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
-Version `0.15.20` carries forward the release-candidate fixes below and addresses viewport, copy-mode, cold-history painting and reconnect defects found during candidate testing. Publication and new native artifact qualification remain pending; diagnostic models do not establish release acceptance or measured performance gains.
+Version `0.15.21` carries forward the release-candidate fixes below and addresses viewport, copy-mode, cold-history painting and reconnect defects found during candidate testing. Publication and new native artifact qualification remain pending; diagnostic models do not establish release acceptance or measured performance gains.
+
+- Cold viewport hydration cancels superseded work before bounded worker admission fills, while preserving exact source and layout authority. Resize captures the viewport before sending remote dimensions, then rechecks the response before painting; native qualification remains pending.
+- Word-aware wrapping retains bounded alternative break paths when a later line changes the best maximum badness. Focused source tests cover the former pruning failure; remote runtime and native latency qualification remain pending.
 
 - Remote selection recognizes accepted PDU25 render updates as current connection data, fixing empty selection and refused copy-mode navigation on that delivery path. Reconnects retire prior cached rows before publishing successor coordinates, independently of render-delivery acknowledgements.
 - Reflow preserves words separated by em spaces instead of splitting them as though the separator were part of a word.
