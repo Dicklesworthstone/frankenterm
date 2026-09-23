@@ -641,7 +641,7 @@
         "cosmetic": 31,
         "docs": 6,
         "feat": 207,
-        "fix": 296,
+        "fix": 297,
         "other": 54,
         "refactor": 12,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 112
       },
-      "fork_side_commit_count": 743,
+      "fork_side_commit_count": 744,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-23T11:42:03-04:00",
-        "sha": "81319c164ebe2dba4c418fd745beddc27239fb35",
-        "subject": "fix(mux): bind cold selection work to gesture ownership before publication"
+        "committed_at": "2026-09-23T11:57:05-04:00",
+        "sha": "33051b6011c602f7cdb4535a3fdb4273652a3618",
+        "subject": "fix(mux): use current atomic update API for ownership"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -850,20 +850,20 @@
         "cleanup": 1,
         "cosmetic": 7,
         "feat": 14,
-        "fix": 49,
+        "fix": 51,
         "other": 32,
         "refactor": 3,
         "rename": 1,
         "security-fix": 2,
         "test": 23
       },
-      "fork_side_commit_count": 135,
+      "fork_side_commit_count": 137,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-23T11:45:34-04:00",
-        "sha": "cc5fff401cd2b2ed34b218ac8026cc684cb5e640",
-        "subject": "fix(surface): distinguish complete DP search from greedy fallback"
+        "committed_at": "2026-09-23T12:08:10-04:00",
+        "sha": "a35e121d5fd9bad051783dcc6ef036a42fc64c5e",
+        "subject": "fix(surface): preserve optimal DP prefixes with bounded frontiers"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -1065,8 +1065,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2947,
-  "generated_at": "2026-09-23T15:46:08.760849Z",
+  "fork_side_commit_total": 2950,
+  "generated_at": "2026-09-23T16:14:20.477595Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
