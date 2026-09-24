@@ -1,0 +1,78 @@
+{
+  "schema": "ft.surface-verification.v1",
+  "generated_at": "2026-09-24",
+  "source_bead": "ft-xxfwy.28",
+  "method": "static production-path trace (entry point -> worker; test/bench/example code excluded) with file:line evidence; claims spot-checked by hand. No runtime execution; a surface marked wired here is not a runtime pass.",
+  "commit_basis": "b0cc4a380",
+  "surfaces": [
+    {
+      "surface": "incident_bundles",
+      "status": "partial",
+      "evidence": "crash.rs collect_incident_bundle via ft reproduce export (main.rs ReproduceCommands::Export); production passes process sampler None; no GPU/render/BSU-ESU/audit-tail sources; robot/tailer/resource/RCH sources read process globals never published in the CLI process",
+      "readme": "matrix row downgraded to Partial; collector list and commands corrected",
+      "follow_up": "ft-67e8h"
+    },
+    {
+      "surface": "notifications",
+      "status": "partial",
+      "evidence": "run_watcher builds NotificationPipeline on PatternDetected: desktop + webhook senders wired, mute store consulted, payload redacted; webhook single-attempt (webhook.rs module doc); email_notify.rs has no sender; alerts.rs usage-threshold module with no production caller",
+      "readme": "email, alert routing and webhook retry claims corrected",
+      "follow_up": [
+        "ft-iilon",
+        "ft-9b41l"
+      ]
+    },
+    {
+      "surface": "ipc",
+      "status": "wired_with_caveats",
+      "evidence": "run_watcher starts IpcServer (socket 0600) when [ipc].enabled (default true); auth and scope checks only when [ipc].tokens configured (default empty); no generated token; CLI consumers only, no GUI consumer",
+      "readme": "token generation, IpcScope and GUI-consumer claims corrected",
+      "follow_up": null
+    },
+    {
+      "surface": "connector_fabric",
+      "status": "partial",
+      "evidence": "HTTP delivery session only when [safety.connector_transport] configured; fallback outbound returns TransportUnavailable; certification pipeline used by SDK simulator/tests only; no connector_certifications table; robot connector lifecycle mutations change a stored state record only",
+      "readme": "host-process and certification-pipeline claims corrected",
+      "follow_up": "ft-xxfwy.47"
+    },
+    {
+      "surface": "profile_apply",
+      "status": "wired",
+      "evidence": "ft robot profile apply (non-dry-run) spawns via mux executor with send_setup and compensating rollback; no policy consult (policy_for_spawn default Allow); personas and fleet templates are types with no loader or CLI",
+      "readme": "persona/fleet template marked planned",
+      "follow_up": null
+    },
+    {
+      "surface": "mission_run",
+      "status": "not_wired",
+      "evidence": "ft mission run only applies lifecycle transitions and commits mission JSON; MissionDispatcher::dispatch has no production caller",
+      "readme": "execution claim corrected (lifecycle only)",
+      "follow_up": [
+        "ft-majms",
+        "ft-xxfwy.48"
+      ]
+    },
+    {
+      "surface": "backup_restore",
+      "status": "wired",
+      "evidence": "ft backup export (online backup, redaction, checksums, integrity_check verify) / ft backup import (schema check, verify, safety backup); scripts/e2e_backup_restore.sh 7 scenarios; manual export is not compressed (only scheduled backups)",
+      "readme": "zstd claim corrected",
+      "follow_up": null
+    },
+    {
+      "surface": "session_persistence",
+      "status": "partial",
+      "evidence": "session dump/verify-dump/list-durable/export-durable real; mux server installs cold-scrollback spill sink unconditionally; recover/discard/list-orphans operate on flat mmap files that no production path writes",
+      "readme": "already hedged (restore unavailable, recover export-only)",
+      "follow_up": null
+    },
+    {
+      "surface": "search_tantivy_hybrid",
+      "status": "partial",
+      "evidence": "hybrid RRF wired (storage.rs hybrid_search_with_results_backend) over FTS5 + FNV-1a hash embeddings written on append; tantivy only a dev-dependency/test feature; no fastembed or embedder daemon on the production path",
+      "readme": "Tantivy/fastembed claims corrected throughout",
+      "follow_up": null
+    }
+  ]
+}

@@ -265,7 +265,7 @@ $ ft robot search "error: compilation failed" --limit 3
 }
 ```
 
-Add `--mode hybrid` for semantic-ranked results (requires `--features semantic-search` build); hits then carry `semantic_score` and `fusion_rank` fields alongside `score`.
+Add `--mode hybrid` for semantic-ranked results; hits then carry `semantic_score` and `fusion_rank` fields alongside `score`.
 
 ### 6 · Orchestrate transactionally (2 minutes — mission + tx)
 
@@ -320,12 +320,12 @@ Now that you've seen it run, here's the full capability surface:
 | **Multi-Agent Detection** | Aho-Corasick multi-pattern engine + Bloom prefilter + BOCPD change-point detection. Native rule packs for Codex, Claude Code, and Gemini |
 | **Event-Driven Automation** | Workflows trigger on detected patterns with per-workflow trigger-policy allowlists (ft-j0ufc), never on `sleep` loops |
 | **Robot Mode API** | JSON / TOON envelopes optimized for AI-to-AI control[^ft-attest-robot-contracts] |
-| **Lexical + Hybrid Search** | FTS5 + Tantivy + optional ML embeddings via FrankenSearch; lexical, semantic, and hybrid modes across captured output |
+| **Lexical + Hybrid Search** | SQLite FTS5 plus a hash-embedding semantic lane fused with RRF; lexical, semantic, and hybrid modes across captured output |
 | **Operating Envelope Contract** | `ft.operating_envelope.v1` planner module decides whether new pane work is admitted based on system pressure; fails closed when telemetry is missing |
 | **Policy Engine** | 14-subsystem policy framework with per-subsystem health verdicts, capability gates, rate limiting, audit trails, and approval tokens |
 | **Transactional Mission Orchestration** | Prepare/commit/compensate lifecycle, idempotency ledger, deterministic replay, kill switches, capacity-aware objective planner |
 | **Tiered Scrollback** | Three-tier memory management (hot/warm/cold) with a worst-of fleet memory controller; 200-pane capacity and memory figures are benchmark-lane results, not a target-class or live-session guarantee[^ft-attest-perf-headline] |
-| **Incident Bundles** | Crash and swarm-incident bundles wire to live collectors (process tree, GPU state, mux state, render state, beads coordination snapshot) |
+| **Incident Bundles** | Crash and swarm-incident bundles with recent events, stored pane state, DB metadata, config, git state, and a beads coordination snapshot |
 | **Replay & Forensics** | Capture, replay, and diff decision graphs for post-incident analysis and regression testing |
 | **Distributed Mode** | Optional agent-to-aggregator streaming with per-agent dedup, versioned wire protocol, and stale-session pruning[^ft-attest-distributed-threat] |
 | **Reality-check + Attestation** | Maps claims to artifacts or explicit deferred slots in `docs/attestations/manifest.json`. Inspect bundle integrity with `ft attestation verify`; publisher authentication requires a trusted release policy |
@@ -367,14 +367,14 @@ Honest status of every shipped surface, without migration-era hand-waving.
 | Robot mode | **Supported** | All core families: `state`, `get-text`, `send`, `wait-for`, `search`, `events`, `rules`, `workflows`, `agents`, `accounts`, `reservations`, `mission`, `tx`, `health`, `proof status`, `approvals`, `checkpoint`, `context`, `work`, `fleet`, `profile`, `connector`, `kill-switch` (persisted operator switch with scoped fence receipts; [docs/robot-contracts/kill-switch.md](docs/robot-contracts/kill-switch.md)). NTM-gap fallback retired. **Caveats:** the `agents` family is gated behind the (default-on) `agent-detection` feature — a `--no-default-features` build returns `robot.feature_not_available` for it (see the [Compile-Time Feature Matrix](#compile-time-feature-matrix)); the `connector` family's non-dry-run `uninstall`/`rollback` are approval-blocked pending the robot approval-token gate (see [docs/robot-contracts/connector.md](docs/robot-contracts/connector.md)) |
 | Operating envelope | **Supported** | `ft.operating_envelope.v1` planner contract + golden fixtures; fails closed on missing or critical-pressure telemetry |
 | Mission objective planner | **Supported** | Capacity-aware planner for safe swarm orchestration (ft-auy2g) |
-| Incident bundles | **Supported** | Wired to live collectors; publish-side snapshot path; beads coordination snapshot included |
+| Incident bundles | **Partial** | `ft reproduce export` collects recent events, stored pane rows, DB metadata, config, git state and the beads snapshot; process tree, GPU, render, BSU/ESU and audit-tail collectors are not on the production path |
 | Session persistence | **Capture/inspect/export supported; restore execution unavailable** | Snapshot save/list/inspect/pane-membership diff/delete, `ft session doctor`, `ft session dump`, and read-only `ft session list-durable` / `export-durable` ship. The live dump is a private, redacted, checksummed export of live pane text plus bounded topology metadata; the durable export reads the committed cold-scrollback prefix for one stable pane UUID. Neither is a process checkpoint or executable restore image. `ft snapshot restore` and robot checkpoint rollback accept metadata-only `--dry-run` descriptor/status reporting, but every non-dry invocation fails closed before database resolution, process discovery, subprocess launch, or mux mutation. Production does not currently restore panes, processes, hot viewport, mux domains, window/workspace placement, durable tab order, stable active-tab identity, or full appearance. |
 | Reality-check + attestation | **Supported** | `ft attestation verify` / `show` ship as a thin Rust wrapper over `scripts/attestation-verify.sh`. Signed bundles live in `docs/attestations/` |
 | Deferred proof queue | **Supported with fail-closed proof prerequisite** | `ft proof queue/status/replay/attach` and `ft robot proof status` expose source-landed proof intents. Replay executes only through remote-required RCH when admission is explicitly `admitted`; local Cargo is never substituted. Release-slot evidence stays under `docs/attestations/proofs/deferred-proof-replay.json`; current W8.2 remote proof remains blocked on RCH admission. |
 | Web API / SSE | **Supported behind `--features web`** | `/health`, `/panes`, `/events`, `/search`, `/stream/events`, `/stream/deltas` |
 | Distributed mode | **Supported behind `--features distributed`** | Remote panes persist into the same DB and surface through status/search/state; live `get-text` for distributed panes is intentionally unavailable |
 | MCP server | **Supported behind `--features mcp`** | stdio tool surface; per-family Robot parity is scoped in [`docs/robot-contracts/mcp-robot-surface-matrix.md`](docs/robot-contracts/mcp-robot-surface-matrix.md) |
-| Semantic search | **Supported behind `--features semantic-search`** | fastembed-backed embeddings + FrankenSearch hybrid mode |
+| Semantic search | **Supported (hash embeddings)** | Hybrid mode fuses FTS5 with a built-in FNV-1a hash-embedding lane via RRF; fastembed/ML models and a Tantivy index are not on the production path |
 | Browser auth tooling | **Feature-gated** | `ft auth` is real, but only in builds that include the browser feature and a usable browser stack |
 | GUI (FrankenTerm.app) | **Supported on macOS** | Native macOS bundle; live render-state plumbing, BSU/ESU sync-output, classified drag handlers, command-palette domain labels |
 
@@ -454,8 +454,8 @@ Terminology used throughout this document and the codebase. Reading these once s
 | **Tx (transaction)** | The execution engine for missions; prepare → commit → compensate with idempotency receipts. |
 | **Operating envelope** | The fail-closed admission contract that decides whether new pane/workflow work is safe right now. |
 | **Profile** | A reusable pane specification (agent + cwd + env + session settings). |
-| **Persona** | Behavioral defaults a profile inherits (skill mix, prompt preludes, tool palette). |
-| **Fleet template** | A composition of profiles with counts and dependencies. |
+| **Persona** | Behavioral defaults a profile inherits (skill mix, prompt preludes, tool palette). Planned: defined as a type, not yet loadable from `ft`. |
+| **Fleet template** | A composition of profiles with counts and dependencies. Planned: defined as a type, not yet loadable from `ft`. |
 | **Reservation** | An advisory lease on a pane (or file path) preventing concurrent edits. |
 | **Approval token** | A one-shot, scope-pinned 8-char code that lets a specific action through the policy gate. |
 | **Robot Mode** | The JSON / TOON API surface AI agents use to drive `ft`. |
@@ -552,11 +552,11 @@ The `ft attestation` family is a thin Rust wrapper over [`scripts/attestation-ve
 | Cross-session capture + inspection | Built-in snapshots + sessions; automated restore/restart execution is unavailable | Partial / manual | Session-centric, not swarm-centric | Minimal |
 | Agent-safe control plane | 14-subsystem policy diagnostics surface | Not native | Not native | Not native |
 | Transactional multi-pane ops | Prepare/commit/compensate + idempotency ledger | None | None | None |
-| Full-text search over output | FTS5 + Tantivy + hybrid modes | None | None | None |
+| Full-text search over output | FTS5 + hybrid (RRF) modes | None | None | None |
 | Memory management at scale | Three-tier scrollback + fleet controller | Single tier | Single tier | Single tier |
 | Replay and forensics | Decision graph + diff + provenance | None | None | None |
 | Reality-check attestation bundles | Sigstore-signed slot manifest | None | None | None |
-| Incident bundles | Live collectors + publish-side snapshot | None | None | None |
+| Incident bundles | Events, pane rows, DB/config/git state, beads snapshot | None | None | None |
 | Async runtime contract | asupersync, `Cx`-first, project-audited cancellation, `tokio` banned | tokio (no `Cx` model) | smol (no `Cx` model) | none of these project-specific contracts |
 | Unsafe code | Forbidden in CLI/core; audited native/FFI exceptions | unsafe present | unsafe present | unsafe present |
 
@@ -678,11 +678,9 @@ ft robot --format json events --unhandled --limit 50 | \
 
 **With `ft`:**
 ```bash
-ft reproduce --kind crash --output /tmp/incident
-# Bundle includes: process tree, GPU state, mux topology, render state,
-# BSU/ESU drain telemetry, SQLite WAL state, recent events, audit tail,
-# beads coordination snapshot
-ft proof-doctor /tmp/incident
+ft reproduce export --kind crash --out /tmp/incident
+# Bundle includes: recent events, stored pane/mux rows, SQLite metadata,
+# redacted config, git status, latest crash report, beads coordination snapshot
 ```
 
 Live collectors snapshot the world at the moment of failure. The bundle is portable; you can attach it to a bug report and a reviewer can reconstruct the incident without the original host.
@@ -1552,7 +1550,7 @@ Operator-tunable runtime constants live under `[tuning]` sections such as `[tuni
                                    │
                                    ▼
 ┌───────────────────────────────────────────────────────────────────────┐
-│                  Storage Layer (SQLite + FTS5 + Tantivy)              │
+│                  Storage Layer (SQLite + FTS5 + embeddings)           │
 │ output_segments │ events │ workflow_executions │ audit_actions        │
 │ approval_tokens │ session_checkpoints │ mux_pane_state                │
 │ policy_denied_audit (v24+) │ work_claims │ profiles_applied_log       │
@@ -1679,7 +1677,7 @@ frankenterm/                              # <!--count:workspace_members-->83<!--
 | Delta extraction | Bounded 1 MiB overlap matching with gap semantics | Efficient incremental capture without persisting full-buffer re-reads |
 | Pattern detection | Aho-Corasick multi-pattern + anchor filtering + Bloom prefilter | Fast multi-agent pattern matching with probabilistic pre-rejection |
 | Scan pipeline | SIMD newline/ANSI density scan + batch trigger + zstd | Three-stage pipeline for raw pane output |
-| Search | FTS5 lexical + Tantivy + optional ML embeddings (fastembed) | Lexical, semantic, and hybrid modes via FrankenSearch RRF fusion |
+| Search | FTS5 lexical + hash-embedding semantic lane | Lexical, semantic, and hybrid modes via RRF fusion |
 | Change-point detection | BOCPD (Bayesian Online Change-Point Detection) | Catch novel failure modes regex patterns miss |
 | Backpressure | Four-tier model (Green/Yellow/Red/Black) with queue-depth gauges | Prevent OOM and cascading latency under load |
 | Fleet memory | Worst-of tier synthesis with asymmetric hysteresis | Coordinated fleet-wide pressure response; 200-pane qualification remains pending |
@@ -1804,27 +1802,26 @@ ft mission objective-plan --objective "<operator goal as free text>" \
 4. Emits a deterministic plan artifact (golden-fixture-comparable).
 5. Records the plan + decision rationale to the mission audit trail.
 
-The planner is side-effect-free: objective-plan never spawns panes or sends input. Execution is a separate `ft mission run` step (which operates on a mission contract file at `.ft/mission/active.json` by default, see [Sample Mission and Tx Contracts](#deep-dive-sample-mission-and-tx-contracts)) that re-validates against the live envelope before each commit phase.
+The planner is side-effect-free: objective-plan never spawns panes or sends input. Execution is a separate `ft mission run` step (which operates on a mission contract file at `.ft/mission/active.json` by default, see [Sample Mission and Tx Contracts](#deep-dive-sample-mission-and-tx-contracts)); today it advances the mission lifecycle only and does not dispatch into panes (`ft-majms`, `ft-xxfwy.48`).
 
 ---
 
 ## Incident Bundles
 
-When something goes wrong (a crash, a stuck pane, a fleet-wide degradation), `ft` packages the world into an *incident bundle*. Bundles are wired to **live collectors** (no stale snapshots), with a publish-side snapshot path so producers don't have to re-derive bundle inputs.
+When something goes wrong (a crash, a stuck pane, a fleet-wide degradation), `ft` packages what it knows into an *incident bundle*. `ft reproduce export` runs as its own process, so sources that only a running watcher publishes (tailer health, resource pressure, live robot state) are recorded as unavailable rather than invented.
 
-**Live collectors include:**
-- Process tree + per-process resource usage
-- GPU state (when GUI build is enabled)
-- Mux topology + pane state
-- Render-state snapshot (terminal triple-buffer registry, quad allocation snapshot, frame-budget reduce-motion gate)
-- SynchronizedOutput (BSU/ESU) drain telemetry
-- SQLite health + WAL state
-- Recent events + audit trail tail
+**Collected today:**
+- Recent events (last 50)
+- Pane/mux state from stored pane rows (not a live mux query)
+- SQLite metadata (journal mode, size, schema version, row counts)
+- Redacted config, git status, and the latest crash report
 - Beads coordination snapshot from `.beads/issues.jsonl` (ft-tkkqx)
+
+**Not yet on the production path:** process tree sampling, GPU state, render-state snapshots, SynchronizedOutput (BSU/ESU) drain telemetry, WAL checkpoint detail, and the audit-trail tail.
 
 **Producer side:** the swarm wire protocol carries publish-side bundle source notifications (ft-9sy9e family) so distributed incidents include each participating agent's local view.
 
-**Consumer side:** `ft reproduce --kind crash` exports the latest crash bundle in a format `ft proof-doctor` and external forensic tools can read.
+**Consumer side:** `ft reproduce export --kind crash --out DIR` exports the latest crash bundle for external forensic tools; `ft robot incidents autopsy` compiles a redacted post-mortem from a flight-recorder source set.
 
 **Replay side:** `ft robot incidents list/show/explain/replay` reads persisted
 flight-recorder source sets and classifies proof evidence without mutating
@@ -1968,7 +1965,7 @@ The mux connection pool reduces overhead by reusing persistent connections to th
 - **Recovery with retry.** On transient/recoverable errors, the pool discards the failed connection (guard drop releases the semaphore) and retries with a new connection using configurable backoff. The connection is intentionally not returned to the pool after an error since its state may be corrupted.
 - **Circuit breaker integration.** After exhausting retries, failure is reported to a circuit breaker state machine. When the circuit opens (too many recent failures), subsequent operations fail immediately rather than waiting for timeouts. The circuit transitions through Closed → Open → Half-Open → Closed states with configurable cooldown periods.
 
-The retry layer supports exponential backoff with random jitter (uniform ±10% by default) and per-use-case policies (WezTerm CLI: 3 attempts / 100 ms initial; database writes: 5 attempts / 50 ms initial; webhooks: 5 attempts / 1 s initial).
+The retry layer supports exponential backoff with random jitter (uniform ±10% by default) and per-use-case policies (WezTerm CLI: 3 attempts / 100 ms initial; database writes: 5 attempts / 50 ms initial). Webhook delivery does not use it yet: each webhook is a single attempt.
 
 The circuit-breaker `Config` had its `pub` fields tightened (ft-l5z7z) so callers can no longer bypass clamping; see the [Substrate Audit Discipline](#substrate-audit-discipline) section for the broader public-field bypass family closure.
 
@@ -2046,17 +2043,17 @@ A "rule pack" is a versioned, named collection of detection rules. The default p
 
 | Mode | Backend | Best for | Latency target |
 |---|---|---|---|
-| `lexical` (default) | SQLite FTS5 + Tantivy | Known strings, exact errors, identifiers | <10 ms |
+| `lexical` (default) | SQLite FTS5 | Known strings, exact errors, identifiers | <10 ms |
 | `semantic` | fastembed embeddings via FrankenSearch | Conceptual queries ("connection issues"), paraphrased content | depends on embedding model |
 | `hybrid` | RRF fusion of lexical + semantic | Best of both; recommended when in doubt | lexical + semantic + fusion overhead |
 
 ### Lexical (FTS5 + Tantivy)
 
-SQLite FTS5 indexes captured output at write time. Tantivy provides a secondary lexical index with richer scoring (BM25). For typical multi-pane usage, FTS5 alone is sub-10 ms; Tantivy is used when ranked relevance matters more than raw matching.
+SQLite FTS5 indexes captured output at write time. A Tantivy secondary index exists as a separate crate but is not populated on the production path.
 
 ### Semantic (fastembed)
 
-When built with `--features semantic-search`, `ft` runs an embedder daemon that converts captured text into vector embeddings via fastembed. Queries are embedded with the same model and nearest-neighbor matched in the embedding space.
+Every appended segment also gets a 128-dimension FNV-1a hash embedding (`fnv1a-hash-128`) stored alongside it. Queries are embedded the same way and matched by vector similarity. This is a lexical-flavored semantic lane, not an ML model; fastembed and the embedder daemon are not on the production path.
 
 The semantic backend is feature-gated because:
 1. The embedder model is ~100 MB on disk
@@ -2528,7 +2525,7 @@ Retractions are append-only and visible to anyone who verifies the bundle; this 
                                           │
                                           ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│ 6. Persist — append to output_segments + FTS5 + Tantivy index        │
+│ 6. Persist — append to output_segments + FTS5 + hash embedding       │
 │    - Goes through the single-writer queue with batched commits       │
 └──────────────────────────────────────────────────────────────────────┘
                                           │
@@ -2675,7 +2672,7 @@ The connector subsystem lets `ft` talk to external systems (issue trackers, moni
 - **`connector_sdk`** — the contract every connector implements. Versioned capability envelopes, request/response schemas, error taxonomy.
 - **`connector_registry`** — name-keyed registry of installed connectors, with version pinning.
 - **`connector_lifecycle`** — install / start / stop / restart / drain semantics.
-- **`connector_host_runtime`** — isolated host process for connectors (no shared address space with the watcher).
+- **`connector_host_runtime`** — the connector host model plus an HTTP delivery client that runs inside the watcher when `[safety.connector_transport]` is configured (no separate host process).
 - **`connector_inbound_bridge`** — converts external signals (e.g., a webhook from PagerDuty) into typed `ft` events.
 - **`connector_outbound_bridge`** — converts typed `ft` events (e.g., a critical detection) into external calls (e.g., a Slack post).
 - **`connector_mesh`** — multi-host routing across a fleet of `ft` aggregators.
@@ -2693,11 +2690,13 @@ Every connector declares its capabilities: what actions it can invoke, what stat
 
 ### Certification probe pipeline
 
-When a connector is installed, the runtime runs a **certification probe pipeline** that:
-1. Validates the connector binary signature
-2. Runs the capability round-trip evidence harness (the connector reports its capabilities; the host verifies them)
-3. Records the result in the `connector_certifications` table
-4. Refuses to start the connector if certification fails
+A **certification probe pipeline** (`connector_sdk.rs`) models this flow:
+1. Validate the connector binary signature
+2. Run the capability round-trip evidence harness (the connector reports its capabilities; the host verifies them)
+3. Record the result
+4. Refuse to start the connector if certification fails
+
+It is exercised by the SDK simulator and tests only: `ft robot connector install` does not run it yet, and there is no certification table.
 
 ### Mock-finder discipline
 
@@ -2731,7 +2730,7 @@ Non-dry-run apply spawns panes through the mux bridge with rollback on mid-apply
 
 - **Reproducibility.** Two operators running `ft robot profile apply codex_ws --count 3` get the same fleet shape.
 - **Audit.** The applied-log records who applied what when, with the content hash as the idempotency key.
-- **Composability.** Fleet templates compose profiles; missions reference profiles by name; the chain is auditable from mission contract → profile → spawned panes.
+- **Composability (planned).** Personas and fleet templates exist as types (`session_profiles.rs`) but cannot yet be loaded or applied from `ft`; profiles are created with `ft robot profile create` and applied directly.
 
 ---
 
@@ -2925,21 +2924,21 @@ When tracking issue: the WASM execution path is part of the broader extension-sy
 
 ## Deep Dive: Notification Pipeline
 
-When detections fire or workflows complete, `ft` can notify operators through multiple channels.
+When detections fire, `ft watch` can notify operators through desktop notifications and webhooks.
 
 ### Backends
 
 | Channel | File | When to use |
 |---|---|---|
 | Desktop notification | `desktop_notify.rs` | Interactive operator on a workstation |
-| Email | `email_notify.rs` (SMTP) | Non-interactive operator, async escalation |
+| Email | `email_notify.rs` (config only) | Not wired: no SMTP sender exists yet; selecting only email leaves the pipeline disabled |
 | Webhook | `webhook.rs` | Integrate with PagerDuty / Slack / custom routers |
 | Prometheus alert | via the metrics surface | Existing alerting infra |
 | In-app events | event bus | Other `ft` surfaces (web/SSE, MCP, robot events) |
 
 ### Alert manager (`alerts.rs`)
 
-The alert manager routes detections to channels based on configurable rules (severity, rule_id pattern, pane, time-of-day). Each rule has:
+Planned: an alert manager that routes detections to channels by rule (severity, rule_id pattern, pane, time-of-day). `alerts.rs` currently evaluates usage/cost thresholds only and is not connected to the notification pipeline. The intended rule shape:
 - Severity threshold
 - Channel list (one or more backends)
 - Throttling window (suppress duplicates)
@@ -2951,25 +2950,25 @@ All outbound notifications go through the Redactor first; the same one used for 
 
 ### Reliability
 
-Webhook deliveries retry with exponential backoff + jitter (5 attempts / 1 s initial). Failures are recorded; persistent failure opens the per-backend circuit breaker. Email deliveries use the same retry policy via the SMTP transport.
+Webhook delivery is currently a single attempt per notification: failures are logged, but there is no retry, backoff, or circuit breaker on this path yet.
 
 ---
 
 ## Deep Dive: IPC and Local Auth
 
-`ft` exposes a local IPC surface so the GUI, the Robot Mode CLI, the web server, and the watcher can talk to each other without going through the database for every request.
+`ft` exposes a local IPC surface so the Robot Mode CLI and the watcher can talk to each other without going through the database for every request (the GUI does not use it yet).
 
 ### Surface
 
-The IPC server (`ipc.rs`) listens on a Unix domain socket (or named pipe on Windows) configured via `[ipc]`. Authentication is token-based (`IpcAuthToken`); the token is generated at watcher startup and persisted to a known path with restrictive permissions.
+The IPC server (`ipc.rs`) listens on a Unix domain socket (or named pipe on Windows) configured via `[ipc]`. The socket is created with mode `0600`. Token authentication is opt-in: set `[ipc].tokens` (each with a scope) and clients present `FT_IPC_TOKEN`; with no tokens configured (the default), socket file permissions are the only access control and read/write scopes are not enforced.
 
 ### Scope
 
-`IpcScope` enums the visibility of the IPC surface: local-only (default), user (any process running as the same user), or system (any process on the host). Production usage is local-only; broader scopes require explicit configuration and an operator-acknowledged warning.
+`IpcScope` is a per-token permission level: `read`, `write`, or `all`. Each request declares the scope it needs (mutating RPCs need `write`), and the watcher checks it against the presenting token before dispatch, but only when tokens are configured. The socket itself is always local (Unix domain socket or named pipe).
 
 ### Why an IPC layer at all
 
-- **Faster than SQLite-mediated coordination** for high-frequency reads (e.g., the GUI's frame-render path can pull current pressure tier in microseconds instead of milliseconds).
+- **Faster than SQLite-mediated coordination** for high-frequency reads such as pane state and health (a future GUI consumer could read the current pressure tier this way).
 - **Push-based.** Subscribers get notified when state changes, instead of polling.
 - **Bounded blast radius.** A bad client request returns a typed error envelope; it doesn't corrupt the database.
 
@@ -2996,7 +2995,7 @@ Each backup uses the SQLite online backup API for a consistent snapshot. The out
 ### Manual backups
 
 ```bash
-ft backup export --output /tmp/ft-snapshot                # produces a portable backup directory (zstd-compressed)
+ft backup export --output /tmp/ft-snapshot                # produces a portable, checksummed backup directory
 ft backup export --sql-dump                               # also include a SQL text dump for human inspection
 ft backup import /tmp/ft-snapshot                         # restore with a safety backup of current data first
 ft backup import /tmp/ft-snapshot --verify                # verify integrity without importing
@@ -4344,7 +4343,7 @@ By default, output is retained for 30 days (configurable via `storage.retention_
 
 ### Does ft send data anywhere?
 
-Default mode is local-first: no telemetry and no cloud dependency. Network activity only occurs when you explicitly enable integrations like webhooks, SMTP email alerts, or distributed mode.
+Default mode is local-first: no telemetry and no cloud dependency. Network activity only occurs when you explicitly enable integrations like webhooks or distributed mode.
 
 ### Can I use ft without running AI agents?
 
