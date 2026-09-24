@@ -13795,6 +13795,42 @@ struct PaneState {
     ignore_reason: Option<String>,
 }
 
+/// Live pane inventory for incident bundles (ft-67e8h), built from the same
+/// redacted rows `ft robot state` returns.
+fn incident_robot_state_from_panes(
+    states: &[PaneState],
+) -> frankenterm_core::crash::IncidentRobotStateSnapshot {
+    let captured_at_ms = u64::try_from(now_epoch_ms()).unwrap_or(0);
+    let panes = states
+        .iter()
+        .map(|pane| frankenterm_core::crash::IncidentRobotPaneState {
+            pane_id: pane.pane_id,
+            pane_uuid: pane.pane_uuid.clone(),
+            tab_id: pane.tab_id,
+            window_id: pane.window_id,
+            domain: pane.domain.clone(),
+            title: pane.title.clone(),
+            cwd: pane.cwd.clone(),
+            observed: pane.observed,
+            state: if pane.observed {
+                "observed".to_string()
+            } else if pane.ignore_reason.is_some() {
+                "ignored".to_string()
+            } else {
+                "unobserved".to_string()
+            },
+            ignore_reason: pane.ignore_reason.clone(),
+            observed_at_ms: Some(captured_at_ms),
+            last_activity_at_ms: None,
+        })
+        .collect();
+    frankenterm_core::crash::IncidentRobotStateSnapshot::new(
+        captured_at_ms,
+        "ft reproduce live mux pane listing",
+        panes,
+    )
+}
+
 impl PaneState {
     fn from_pane_info(
         info: &frankenterm_core::wezterm::PaneInfo,
@@ -68360,6 +68396,20 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 if let Some(health) = load_runtime_health_snapshot(&layout).await {
                     frankenterm_core::crash::HealthSnapshot::update_global(health);
                 }
+                // Same for the live pane inventory: query the mux the way
+                // `ft robot state` does (text-free, redacted rows) so the
+                // robot_state source reflects live panes, not only stored rows.
+                let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
+                if let Ok(panes) = robot_list_panes_on_runtime_task(wezterm).await {
+                    let mut states: Vec<PaneState> = panes
+                        .iter()
+                        .map(|pane| PaneState::from_pane_info(pane, &config.ingest.panes))
+                        .collect();
+                    redact_pane_state_fields_for_output(&mut states);
+                    frankenterm_core::crash::IncidentRobotStateSnapshot::update_global(
+                        incident_robot_state_from_panes(&states),
+                    );
+                }
                 let collected = if process_sample {
                     collect_incident_bundle_with_process_sampler(
                         &opts,
@@ -102261,6 +102311,43 @@ mod tests {
         assert!(matches!(large.status, DiagnosticStatus::Warning));
         assert_eq!(format_bytes_human(1536), "1.5 KiB");
         assert_eq!(format_bytes_human(12), "12 B");
+    }
+
+    #[test]
+    fn incident_robot_state_uses_live_pane_rows() {
+        let panes = vec![
+            PaneState {
+                pane_id: 3,
+                pane_uuid: None,
+                tab_id: 1,
+                window_id: 0,
+                domain: "local".to_string(),
+                title: Some("zsh".to_string()),
+                cwd: Some("/tmp".to_string()),
+                observed: true,
+                ignore_reason: None,
+            },
+            PaneState {
+                pane_id: 4,
+                pane_uuid: None,
+                tab_id: 1,
+                window_id: 0,
+                domain: "local".to_string(),
+                title: None,
+                cwd: None,
+                observed: false,
+                ignore_reason: Some("title filter".to_string()),
+            },
+        ];
+        let snapshot = incident_robot_state_from_panes(&panes);
+        assert_eq!(snapshot.panes.len(), 2);
+        assert_eq!(snapshot.panes[0].state, "observed");
+        assert_eq!(snapshot.panes[1].state, "ignored");
+        assert!(snapshot.source_surface.contains("live mux"));
+        assert_eq!(
+            snapshot.panes[0].observed_at_ms,
+            Some(snapshot.captured_at_ms)
+        );
     }
 
     fn mission_lifecycle_fixture() -> (
