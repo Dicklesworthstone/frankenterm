@@ -2536,6 +2536,17 @@ mod unsupported_unix_native_socket_tests {
     }
 }
 
+/// A temp directory with the 0700 mode the listener's parent-directory guard
+/// requires; `tempfile::tempdir` alone creates it with the umask default.
+#[cfg(all(test, unix, feature = "native-events-inline-tests"))]
+fn private_socket_test_dir() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("restrict socket test directory to 0700");
+    dir
+}
+
 #[cfg(all(
     test,
     unix,
@@ -2588,7 +2599,7 @@ mod transport_roundtrip_tests {
     #[test]
     fn native_event_platform_transport_roundtrip() {
         run_async_test(async {
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = super::private_socket_test_dir();
             let socket_path = dir.path().join(format!(
                 "native-platform-roundtrip-{}.sock",
                 std::process::id()
@@ -3277,7 +3288,7 @@ mod tests {
     #[test]
     fn bind_with_cx_succeeds_on_fresh_cx() {
         run_async_test(async {
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = super::private_socket_test_dir();
             let socket_path = dir.path().join("bind-cx-fresh.sock");
             let cx = crate::cx::for_testing();
 
@@ -3297,7 +3308,7 @@ mod tests {
     #[test]
     fn bind_with_precancelled_cx_returns_interrupted() {
         run_async_test(async {
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = super::private_socket_test_dir();
             let socket_path = dir.path().join("bind-cx-cancelled.sock");
             let cx = crate::cx::for_testing();
             cx.cancel_with(
@@ -3413,7 +3424,7 @@ mod tests {
     #[test]
     fn bind_existing_regular_file_returns_error() {
         run_async_test(async {
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = super::private_socket_test_dir();
             let socket_path = dir.path().join("exists.sock");
             // Create the file first
             std::fs::write(&socket_path, b"").expect("create file");
@@ -3431,7 +3442,7 @@ mod tests {
     #[test]
     fn bind_active_socket_returns_error() {
         run_async_test(async {
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = super::private_socket_test_dir();
             let socket_path = dir.path().join("active.sock");
             let active_cx = crate::cx::for_testing();
             let _active_listener = event_socket::bind_with_cx(&active_cx, &socket_path)
@@ -3452,7 +3463,7 @@ mod tests {
     #[test]
     fn bind_replaces_stale_socket_path() {
         run_async_test(async {
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = super::private_socket_test_dir();
             let socket_path = dir.path().join("stale.sock");
             // Create a stale socket file via std::os::unix::net (no cleanup on drop)
             let std_listener =
@@ -3479,7 +3490,7 @@ mod tests {
     #[test]
     fn listener_drop_removes_socket_file() {
         run_async_test(async {
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = super::private_socket_test_dir();
             let socket_path = dir.path().join("drop-cleanup.sock");
             let listener = NativeEventListener::bind(socket_path.clone())
                 .await
@@ -3498,7 +3509,7 @@ mod tests {
     #[test]
     fn bind_creates_parent_directories() {
         run_async_test(async {
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = super::private_socket_test_dir();
             let socket_path = dir.path().join("sub").join("dir").join("deep.sock");
             let result = NativeEventListener::bind(socket_path).await;
             assert!(result.is_ok());
@@ -3516,7 +3527,7 @@ mod tests {
     #[test]
     fn run_with_cx_pre_cancelled_exits_immediately() {
         run_async_test(async {
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = super::private_socket_test_dir();
             let socket_path = dir.path().join("precancel.sock");
             let listener = NativeEventListener::bind(socket_path)
                 .await
@@ -3558,7 +3569,7 @@ mod tests {
     #[test]
     fn listener_emits_events() {
         run_async_test(async {
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = super::private_socket_test_dir();
             let socket_path = dir.path().join("native.sock");
             let listener = NativeEventListener::bind(socket_path.clone())
                 .await
@@ -3600,7 +3611,7 @@ mod tests {
     #[test]
     fn listener_handles_multiple_events_on_one_connection() {
         run_async_test(async {
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = super::private_socket_test_dir();
             let socket_path = dir.path().join("multi.sock");
             let listener = NativeEventListener::bind(socket_path.clone())
                 .await
@@ -3641,7 +3652,7 @@ mod tests {
     #[test]
     fn listener_skips_invalid_json_lines() {
         run_async_test(async {
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = super::private_socket_test_dir();
             let socket_path = dir.path().join("invalid.sock");
             let listener = NativeEventListener::bind(socket_path.clone())
                 .await
@@ -3684,7 +3695,7 @@ mod tests {
     #[test]
     fn listener_accepts_reconnect_after_disconnect() {
         run_async_test(async {
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = super::private_socket_test_dir();
             let socket_path = dir.path().join("reconnect.sock");
             let listener = NativeEventListener::bind(socket_path.clone())
                 .await
@@ -3746,7 +3757,7 @@ mod tests {
     #[test]
     fn listener_drops_oversized_line_and_continues() {
         run_async_test(async {
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = super::private_socket_test_dir();
             let socket_path = dir.path().join("oversized.sock");
             let listener = NativeEventListener::bind(socket_path.clone())
                 .await
@@ -3787,7 +3798,7 @@ mod tests {
     #[test]
     fn shutdown_flag_stops_listener() {
         run_async_test(async {
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = super::private_socket_test_dir();
             let socket_path = dir.path().join("shutdown.sock");
             let listener = NativeEventListener::bind(socket_path.clone())
                 .await
@@ -3814,7 +3825,7 @@ mod tests {
     #[test]
     fn shutdown_aborts_and_drains_a_quiet_accepted_connection() {
         run_async_test(async {
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = super::private_socket_test_dir();
             let socket_path = dir.path().join("shutdown-quiet-connection.sock");
             let listener = NativeEventListener::bind(socket_path.clone())
                 .await
@@ -4615,7 +4626,7 @@ mod tests {
     #[test]
     fn listener_handles_rapid_events() {
         run_async_test(async {
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = super::private_socket_test_dir();
             let socket_path = dir.path().join("rapid.sock");
             let listener = NativeEventListener::bind(socket_path.clone())
                 .await
