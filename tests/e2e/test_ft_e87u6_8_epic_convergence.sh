@@ -699,9 +699,7 @@ require_cmd jq
 require_cmd grep
 require_cmd bash
 require_cmd python3
-if ! rch_github_actions_local_cargo_enabled; then
-    require_cmd rch
-fi
+require_cmd rch
 
 run_shell_static
 run_manifest_gap_check
