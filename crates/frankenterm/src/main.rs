@@ -68712,6 +68712,26 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
 
                         println!("ft setup patch - WezTerm User-Var Forwarding\n");
 
+                        if dry_run {
+                            let preview = config_path
+                                .map_or_else(setup::locate_wezterm_config, Ok)
+                                .and_then(|path| setup::preview_wezterm_config_at(&path, remove));
+                            match preview {
+                                Ok(preview) => {
+                                    println!("Dry run: no files were changed.");
+                                    println!("{}", preview.message);
+                                    if let Some(block) = preview.block {
+                                        println!("\nBlock that would be written:\n{block}");
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Error: {e}");
+                                    std::process::exit(1);
+                                }
+                            }
+                            return Ok(());
+                        }
+
                         let result = if remove {
                             if let Some(path) = config_path {
                                 setup::unpatch_wezterm_config_at(&path)
@@ -68777,6 +68797,28 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             "ft setup shell - OSC 133 Prompt Markers ({})\n",
                             shell_type.name()
                         );
+
+                        if dry_run {
+                            let preview = rc_path
+                                .map_or_else(|| setup::locate_shell_rc(shell_type), Ok)
+                                .and_then(|path| {
+                                    setup::preview_shell_rc_at(&path, shell_type, remove)
+                                });
+                            match preview {
+                                Ok(preview) => {
+                                    println!("Dry run: no files were changed.");
+                                    println!("{}", preview.message);
+                                    if let Some(block) = preview.block {
+                                        println!("\nBlock that would be appended:\n{block}");
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Error: {e}");
+                                    std::process::exit(1);
+                                }
+                            }
+                            return Ok(());
+                        }
 
                         let result = if remove {
                             if let Some(path) = rc_path {

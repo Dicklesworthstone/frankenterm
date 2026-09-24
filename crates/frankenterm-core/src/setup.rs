@@ -401,6 +401,140 @@ pub fn patch_shell_rc_at(rc_path: &Path, shell: ShellType) -> Result<PatchResult
     })
 }
 
+/// What `ft setup shell|patch --dry-run` would do to a file, without writing.
+///
+/// Previews apply the same marker validation as the real patch/unpatch
+/// functions: malformed marker pairs are an error here too. `block` carries
+/// the exact ft-managed text that would be written when installing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupFilePreview {
+    /// The rc file that was inspected.
+    pub config_path: PathBuf,
+    /// Whether the real command would modify the file.
+    pub would_modify: bool,
+    /// Human-readable description of the outcome.
+    pub message: String,
+    /// The ft-managed block that would be appended (install only).
+    pub block: Option<String>,
+}
+
+/// Preview installing (`remove == false`) or removing the OSC 133 block.
+pub fn preview_shell_rc_at(
+    rc_path: &Path,
+    shell: ShellType,
+    remove: bool,
+) -> Result<SetupFilePreview> {
+    let content = if rc_path.exists() {
+        fs::read_to_string(rc_path).map_err(|e| {
+            Error::SetupError(format!("Failed to read {}: {}", rc_path.display(), e))
+        })?
+    } else {
+        String::new()
+    };
+    let present = validated_shell_ft_block_bounds(&content)?.is_some();
+    let (would_modify, message, block) = match (remove, present) {
+        (false, true) => (
+            false,
+            format!(
+                "{} already contains FrankenTerm OSC 133 integration. No changes needed.",
+                rc_path.display()
+            ),
+            None,
+        ),
+        (false, false) => (
+            true,
+            format!(
+                "Would add FrankenTerm OSC 133 integration to {}{}",
+                rc_path.display(),
+                if rc_path.exists() {
+                    " (a backup would be saved first)"
+                } else {
+                    " (the file would be created)"
+                }
+            ),
+            Some(create_shell_ft_block(shell)),
+        ),
+        (true, true) => (
+            true,
+            format!(
+                "Would remove the ft-managed block from {} (a backup would be saved first)",
+                rc_path.display()
+            ),
+            None,
+        ),
+        (true, false) => (
+            false,
+            format!(
+                "{} does not contain an ft-managed block. No changes needed.",
+                rc_path.display()
+            ),
+            None,
+        ),
+    };
+    Ok(SetupFilePreview {
+        config_path: rc_path.to_path_buf(),
+        would_modify,
+        message,
+        block,
+    })
+}
+
+/// Preview installing (`remove == false`) or removing the WezTerm
+/// user-var forwarding block, mirroring [`patch_wezterm_config_at`] /
+/// [`unpatch_wezterm_config_at`] without writing.
+pub fn preview_wezterm_config_at(config_path: &Path, remove: bool) -> Result<SetupFilePreview> {
+    let content = fs::read_to_string(config_path).map_err(|e| {
+        Error::SetupError(format!("Failed to read {}: {}", config_path.display(), e))
+    })?;
+    let ft_block = create_ft_block();
+    let existing = validated_wezterm_ft_block_bounds(&content)?.map(|(begin_idx, end_idx)| {
+        content[begin_idx..end_idx]
+            .trim_end_matches('\n')
+            .to_string()
+    });
+    let path = config_path.display();
+    let (would_modify, message, block) = match (remove, existing) {
+        (false, Some(existing)) if existing == ft_block.trim_end_matches('\n') => (
+            false,
+            "WezTerm config already contains FrankenTerm user-var forwarding. No changes needed."
+                .to_string(),
+            None,
+        ),
+        (false, Some(_)) => (
+            true,
+            format!(
+                "Would replace the outdated ft-managed block in {path} (a backup would be saved first)"
+            ),
+            Some(ft_block),
+        ),
+        (false, None) => (
+            true,
+            format!(
+                "Would add FrankenTerm user-var forwarding to {path} (a backup would be saved first)"
+            ),
+            Some(ft_block),
+        ),
+        (true, Some(_)) => (
+            true,
+            format!(
+                "Would remove the ft-managed block from {path} (a backup would be saved first)"
+            ),
+            None,
+        ),
+        (true, None) => (
+            false,
+            format!("{path} does not contain an ft-managed block. No changes needed."),
+            None,
+        ),
+    };
+    Ok(SetupFilePreview {
+        config_path: config_path.to_path_buf(),
+        would_modify,
+        message,
+        block,
+    })
+}
+
 /// Remove the ft-managed block from a shell rc file
 pub fn unpatch_shell_rc_at(rc_path: &Path) -> Result<PatchResult> {
     if !rc_path.exists() {
@@ -1491,6 +1625,90 @@ pub fn default_config_save_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_rc_preview_never_writes_and_matches_patch_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join(".zshrc");
+        std::fs::write(&rc, "export EDITOR=vim\n").unwrap();
+
+        let preview = preview_shell_rc_at(&rc, ShellType::Zsh, false).unwrap();
+        assert!(preview.would_modify);
+        let block = preview.block.expect("install preview shows the block");
+        assert!(block.contains(FT_BEGIN_MARKER_SHELL));
+        assert_eq!(std::fs::read_to_string(&rc).unwrap(), "export EDITOR=vim\n");
+        assert!(
+            !has_backup_sibling(&rc),
+            "a dry run must not create a backup"
+        );
+
+        let missing = dir.path().join("nested").join(".bashrc");
+        let preview = preview_shell_rc_at(&missing, ShellType::Bash, false).unwrap();
+        assert!(preview.would_modify);
+        assert!(!missing.exists() && !missing.parent().unwrap().exists());
+
+        patch_shell_rc_at(&rc, ShellType::Zsh).unwrap();
+        let installed = std::fs::read_to_string(&rc).unwrap();
+        assert!(
+            installed.contains(&block),
+            "preview shows exactly what patch appends"
+        );
+        assert!(
+            !preview_shell_rc_at(&rc, ShellType::Zsh, false)
+                .unwrap()
+                .would_modify
+        );
+        let removal = preview_shell_rc_at(&rc, ShellType::Zsh, true).unwrap();
+        assert!(removal.would_modify);
+        assert_eq!(std::fs::read_to_string(&rc).unwrap(), installed);
+    }
+
+    #[test]
+    fn wezterm_preview_never_writes_and_matches_patch_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("wezterm.lua");
+        let original = "local config = {}\nreturn config\n";
+        std::fs::write(&config, original).unwrap();
+
+        let preview = preview_wezterm_config_at(&config, false).unwrap();
+        assert!(preview.would_modify);
+        assert!(preview.block.is_some());
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+        assert!(
+            !has_backup_sibling(&config),
+            "a dry run must not create a backup"
+        );
+        assert!(
+            !preview_wezterm_config_at(&config, true)
+                .unwrap()
+                .would_modify
+        );
+
+        patch_wezterm_config_at(&config).unwrap();
+        let patched = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            !preview_wezterm_config_at(&config, false)
+                .unwrap()
+                .would_modify
+        );
+        assert!(
+            preview_wezterm_config_at(&config, true)
+                .unwrap()
+                .would_modify
+        );
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), patched);
+    }
+
+    fn has_backup_sibling(path: &Path) -> bool {
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|entry| {
+                let other = entry.file_name().to_string_lossy().to_string();
+                other != name && other.starts_with(&name)
+            })
+    }
     use std::io::Write;
     use tempfile::NamedTempFile;
 
