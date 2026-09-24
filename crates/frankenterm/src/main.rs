@@ -68350,6 +68350,13 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     max_events: 50,
                 };
 
+                // ft-67e8h: this CLI process has no runtime of its own, so publish
+                // the running watcher's health snapshot (via IPC) for the
+                // health / resource-pressure sources instead of recording them
+                // as unavailable. No watcher: they stay unavailable.
+                if let Some(health) = load_runtime_health_snapshot(&layout).await {
+                    frankenterm_core::crash::HealthSnapshot::update_global(health);
+                }
                 let collected = if process_sample {
                     collect_incident_bundle_with_process_sampler(
                         &opts,
