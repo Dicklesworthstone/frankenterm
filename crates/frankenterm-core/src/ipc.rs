@@ -6209,7 +6209,8 @@ mod tests {
         let envelope: IpcEnvelope = serde_json::from_str(json).unwrap();
         assert_eq!(envelope.request.required_scope(), IpcScope::Write);
         let IpcRequest::WatcherControl { control } = envelope.request else {
-            panic!("expected watcher-control request");
+            assert!(false, "expected watcher-control request");
+            return;
         };
         assert_eq!(control.action, WatcherControlAction::Reload);
         assert_eq!(
