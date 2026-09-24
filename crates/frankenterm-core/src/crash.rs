@@ -8158,6 +8158,123 @@ pub fn record_watcher_supervisor_recovery() {
         .record_success();
 }
 
+/// Marker file present while a watcher holds the workspace lock (ft-u6zfw).
+/// Finding it right after acquiring the lock means the previous holder died
+/// without running its cleanup (abort, SIGKILL, power loss).
+pub const WATCHER_RUN_MARKER_FILE: &str = "watcher.running";
+
+/// Bounded, persisted epoch-second timestamps of unclean watcher exits, so a
+/// watcher restarted by launchd/systemd after dying still reports a crash
+/// loop.
+pub const WATCHER_CRASH_HISTORY_FILE: &str = "watcher-crash-history.json";
+
+const MAX_PERSISTED_WATCHER_CRASHES: usize = 64;
+
+/// Removes the run marker when the watcher exits in-process (clean or
+/// error). Deaths that skip destructors leave it behind on purpose.
+#[derive(Debug)]
+pub struct WatcherRunMarker {
+    path: std::path::PathBuf,
+}
+
+impl Drop for WatcherRunMarker {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    %error,
+                    "failed to remove watcher run marker; the next start will report an unclean exit"
+                );
+            }
+        }
+    }
+}
+
+/// Result of [`begin_watcher_run`].
+#[derive(Debug)]
+pub struct WatcherRunStart {
+    /// Keep alive for the watcher's lifetime.
+    pub marker: WatcherRunMarker,
+    /// Whether the previous watcher run in this workspace ended uncleanly.
+    pub previous_run_unclean: bool,
+}
+
+/// Call right after the watcher acquires its single-instance lock. Records an
+/// unclean previous exit into the persisted history, replays the history into
+/// the process-wide watcher crash detector once per process, and writes the
+/// run marker.
+pub fn begin_watcher_run(
+    ft_dir: &std::path::Path,
+    now_secs: u64,
+) -> std::io::Result<WatcherRunStart> {
+    static SEEDED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    let mut first_in_process = false;
+    SEEDED.get_or_init(|| first_in_process = true);
+    begin_watcher_run_with(
+        ft_dir,
+        now_secs,
+        watcher_supervisor_detector(),
+        first_in_process,
+    )
+}
+
+fn begin_watcher_run_with(
+    ft_dir: &std::path::Path,
+    now_secs: u64,
+    detector: &std::sync::Mutex<CrashLoopDetector>,
+    replay_history: bool,
+) -> std::io::Result<WatcherRunStart> {
+    std::fs::create_dir_all(ft_dir)?;
+    let marker_path = ft_dir.join(WATCHER_RUN_MARKER_FILE);
+    let history_path = ft_dir.join(WATCHER_CRASH_HISTORY_FILE);
+    let previous_run_unclean = marker_path.exists();
+
+    let mut history: Vec<u64> = match std::fs::read(&history_path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            tracing::warn!(
+                path = %history_path.display(),
+                %error,
+                "ignoring unreadable watcher crash history"
+            );
+            Vec::new()
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    let mut detector = detector
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if replay_history {
+        for &crashed_at in &history {
+            detector.record_crash(crashed_at);
+        }
+    }
+    if previous_run_unclean {
+        history.push(now_secs);
+        if history.len() > MAX_PERSISTED_WATCHER_CRASHES {
+            history.drain(..history.len() - MAX_PERSISTED_WATCHER_CRASHES);
+        }
+        let tmp = ft_dir.join(format!("{WATCHER_CRASH_HISTORY_FILE}.tmp"));
+        std::fs::write(&tmp, serde_json::to_vec(&history)?)?;
+        std::fs::rename(&tmp, &history_path)?;
+        detector.record_crash(now_secs);
+    }
+    drop(detector);
+
+    std::fs::write(
+        &marker_path,
+        format!(
+            "{{\"pid\":{},\"started_at\":{now_secs}}}\n",
+            std::process::id()
+        ),
+    )?;
+    Ok(WatcherRunStart {
+        marker: WatcherRunMarker { path: marker_path },
+        previous_run_unclean,
+    })
+}
+
 /// Watcher-supervisor crash diagnostics observed at `now_secs`.
 #[must_use]
 pub fn watcher_supervisor_crash_diagnostics(now_secs: u64) -> CrashLoopDiagnostics {
@@ -11537,6 +11654,47 @@ mod tests {
     // -----------------------------------------------------------------------
     // Crash loop detection + backoff tests (bd-24cz TDD)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn watcher_run_marker_detects_unclean_exits_across_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let ft_dir = dir.path().join(".ft");
+        let fresh = || std::sync::Mutex::new(CrashLoopDetector::new(CrashLoopConfig::default()));
+
+        // Clean first start, then a clean in-process exit removes the marker.
+        let detector = fresh();
+        let start = begin_watcher_run_with(&ft_dir, 1_000, &detector, true).unwrap();
+        assert!(!start.previous_run_unclean);
+        assert!(ft_dir.join(WATCHER_RUN_MARKER_FILE).exists());
+        drop(start);
+        assert!(!ft_dir.join(WATCHER_RUN_MARKER_FILE).exists());
+        let start = begin_watcher_run_with(&ft_dir, 1_010, &detector, false).unwrap();
+        assert!(!start.previous_run_unclean, "a clean exit is not a crash");
+
+        // Simulate three process deaths (marker left behind) and restarts in
+        // fresh processes: each new process replays the persisted history.
+        std::mem::forget(start);
+        for (offset, expected_restarts) in [(20, 1), (40, 2), (60, 3)] {
+            let detector = fresh();
+            let start = begin_watcher_run_with(&ft_dir, 1_000 + offset, &detector, true).unwrap();
+            assert!(start.previous_run_unclean);
+            let health = detector.lock().unwrap().diagnostics_at(1_000 + offset);
+            assert_eq!(health.restart_count, expected_restarts);
+            std::mem::forget(start);
+        }
+        let detector = fresh();
+        let start = begin_watcher_run_with(&ft_dir, 1_070, &detector, true).unwrap();
+        let health = detector.lock().unwrap().diagnostics_at(1_070);
+        assert!(
+            health.in_crash_loop,
+            "four deaths inside the window form a loop"
+        );
+        drop(start);
+
+        // Corrupt history is ignored rather than blocking watcher startup.
+        std::fs::write(ft_dir.join(WATCHER_CRASH_HISTORY_FILE), b"not json").unwrap();
+        assert!(begin_watcher_run_with(&ft_dir, 2_000, &fresh(), true).is_ok());
+    }
 
     #[test]
     fn crash_loop_diagnostics_merge_adds_counts_and_keeps_worst_state() {

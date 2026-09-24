@@ -46803,6 +46803,28 @@ async fn run_watcher(
             }
         }
     };
+    // ft-u6zfw: with the lock held, a leftover run marker means the previous
+    // watcher died without cleanup; count it toward crash-loop health.
+    // Declared after the lock guard so the marker is removed first.
+    let _run_marker = if _lock_guard.is_some() {
+        let now_secs = u64::try_from(now_epoch_ms() / 1000).unwrap_or(0);
+        match frankenterm_core::crash::begin_watcher_run(&layout.ft_dir, now_secs) {
+            Ok(start) => {
+                if start.previous_run_unclean {
+                    tracing::warn!(
+                        "Previous watcher exited without cleanup; recorded as a watcher crash"
+                    );
+                }
+                Some(start.marker)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Watcher run marker unavailable; cross-process crash history disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Create storage handle
     let db_path = layout.db_path.to_string_lossy();
