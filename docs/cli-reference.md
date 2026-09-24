@@ -344,7 +344,7 @@ ft robot agents list|running|detect|configure
 ft robot accounts list [--pick]
 ft robot accounts refresh
 ft robot reservations list|reserve|release
-ft robot mission state|decisions
+ft robot mission state|decisions|pause|resume|abort
 ft robot tx plan|run|rollback|show
 ft robot health
 ft robot proof status [--queue-file <path>] [--source-hash <hash>] [--admission-state <state>]

@@ -50,7 +50,7 @@ MCP policy column: `mutation gate` means the tool calls
 | `SessionResume` | `session-resume` | — | robot-only | |
 | `Accounts` | `list`, `refresh` | `wa.accounts`, `wa.accounts_refresh` | mirrored | Refresh: policy gate. |
 | `Reservations` | `reserve`, `release`, `list` | `wa.reserve`, `wa.release`, `wa.reservations` | mirrored | Reserve/release: policy gate. |
-| `Mission` | `objective-plan`, `state`, `decisions` | `wa.mission_objective_plan`, `wa.mission_state`, `wa.mission_explain`, `wa.mission_pause`, `wa.mission_resume`, `wa.mission_abort` | partial | Pause/resume/abort: mutation gate, **MCP-only** — Robot has no lifecycle mutation (human `ft mission pause/resume/abort` does). `wa.mission_explain` returns transitions and failure catalog, not Robot `decisions` payloads. |
+| `Mission` | `objective-plan`, `state`, `decisions`, `pause`, `resume`, `abort` | `wa.mission_objective_plan`, `wa.mission_state`, `wa.mission_explain`, `wa.mission_pause`, `wa.mission_resume`, `wa.mission_abort` | partial | Pause/resume/abort: mutation gate on MCP; Robot verbs pass the Robot policy gate (denials audited) and share the transition + commit path with human `ft mission pause/resume/abort`. `wa.mission_explain` returns transitions and failure catalog, not Robot `decisions` payloads. |
 | `Tx` | `plan`, `run`, `rollback`, `show` | `wa.tx_plan`, `wa.tx_run`, `wa.tx_rollback`, `wa.tx_show` | mirrored | Run/rollback: mutation gate. |
 | `Health` | `health` | — | robot-only | |
 | `Limits` | `limits` | — | robot-only | |
@@ -80,9 +80,10 @@ MCP policy column: `mutation gate` means the tool calls
 | `Proof` | `proof` | — | robot-only | |
 | — | — | `wa.steer_plan` | mcp-only | read; counterpart is the human `ft steer plan`. |
 
-## Known gap
+## Mission lifecycle
 
-Robot Mode has no mission lifecycle mutation (`pause`/`resume`/`abort`) even
-though MCP and the human CLI do. This is a gap, not a design decision, and is
-tracked in `ft-oi92j`; until it closes, Robot callers must use the human
-`ft mission` commands.
+`ft robot mission pause|resume|abort` (`ft-oi92j`) closed the former gap where
+only MCP and the human CLI could mutate mission lifecycle. MCP applies the
+single canonical transition; Robot and the human CLI apply the same
+multi-step transition plan (for example, resume from `retry_pending` goes
+through `dispatching`).

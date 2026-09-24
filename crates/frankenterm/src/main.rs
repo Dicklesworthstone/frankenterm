@@ -5527,6 +5527,42 @@ enum RobotMissionCommands {
         #[arg(long, default_value = "100")]
         limit: usize,
     },
+
+    /// Pause mission execution (policy-gated lifecycle mutation)
+    Pause {
+        /// Expected revision_token JSON from mission state
+        #[arg(long)]
+        expected_token: Option<String>,
+        /// Mission JSON file (default: .ft/mission/active.json)
+        #[arg(long)]
+        mission_file: Option<PathBuf>,
+        /// Operator reason recorded with the pause decision
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
+    /// Resume mission execution from blocked or retry-pending state (policy-gated)
+    Resume {
+        /// Expected revision_token JSON from mission state
+        #[arg(long)]
+        expected_token: Option<String>,
+        /// Mission JSON file (default: .ft/mission/active.json)
+        #[arg(long)]
+        mission_file: Option<PathBuf>,
+    },
+
+    /// Abort mission execution via the cancelled lifecycle transition (policy-gated)
+    Abort {
+        /// Expected revision_token JSON from mission state
+        #[arg(long)]
+        expected_token: Option<String>,
+        /// Mission JSON file (default: .ft/mission/active.json)
+        #[arg(long)]
+        mission_file: Option<PathBuf>,
+        /// Operator reason recorded with the abort decision
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -56597,6 +56633,59 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     let response = RobotResponse::success(data, elapsed_ms(start));
                                     print_robot_response(&response, format, stats)?;
                                 }
+                                RobotMissionCommands::Pause {
+                                    expected_token,
+                                    mission_file,
+                                    reason,
+                                } => {
+                                    run_robot_mission_lifecycle(
+                                        &config,
+                                        &layout,
+                                        MissionLifecycleVerb::Pause,
+                                        mission_file,
+                                        expected_token.as_deref(),
+                                        reason.as_deref(),
+                                        start,
+                                        format,
+                                        stats,
+                                    )
+                                    .await?;
+                                }
+                                RobotMissionCommands::Abort {
+                                    expected_token,
+                                    mission_file,
+                                    reason,
+                                } => {
+                                    run_robot_mission_lifecycle(
+                                        &config,
+                                        &layout,
+                                        MissionLifecycleVerb::Abort,
+                                        mission_file,
+                                        expected_token.as_deref(),
+                                        reason.as_deref(),
+                                        start,
+                                        format,
+                                        stats,
+                                    )
+                                    .await?;
+                                }
+                                RobotMissionCommands::Resume {
+                                    expected_token,
+                                    mission_file,
+                                } => {
+                                    run_robot_mission_lifecycle(
+                                        &config,
+                                        &layout,
+                                        MissionLifecycleVerb::Resume,
+                                        mission_file,
+                                        expected_token.as_deref(),
+                                        None,
+                                        start,
+                                        format,
+                                        stats,
+                                    )
+                                    .await?;
+                                }
                             }
                         }
                         RobotCommands::Tx { command } => {
@@ -77089,6 +77178,82 @@ fn robot_mission_error_code(mission_error_code: &str) -> &'static str {
     }
 }
 
+/// `ft robot mission pause|resume|abort`: workspace containment, the Robot
+/// policy gate (denials are audited like the MCP `wa.mission_*` tools), then
+/// the lifecycle mutation shared with `ft mission pause|resume|abort`.
+#[allow(clippy::too_many_arguments)]
+async fn run_robot_mission_lifecycle(
+    config: &frankenterm_core::config::Config,
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    verb: MissionLifecycleVerb,
+    mission_file: Option<PathBuf>,
+    expected_token: Option<&str>,
+    reason: Option<&str>,
+    start: std::time::Instant,
+    format: RobotOutputFormat,
+    stats: bool,
+) -> anyhow::Result<()> {
+    let mission_error = |err: MissionCommandError| {
+        RobotResponse::<serde_json::Value>::error_with_code(
+            robot_mission_error_code(err.error_code),
+            err.message,
+            err.hint,
+            elapsed_ms(start),
+        )
+    };
+    let mission_path = resolve_mission_file_path(layout, mission_file);
+    if let Err(err) = enforce_robot_mission_path_containment(layout, &mission_path) {
+        return print_robot_response(&mission_error(err), format, stats);
+    }
+
+    let db_path = layout.db_path.to_string_lossy();
+    let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+        Ok(storage) => storage,
+        Err(e) => {
+            let response = RobotResponse::<serde_json::Value>::error_with_code(
+                ROBOT_ERR_STORAGE,
+                format!("Failed to open storage: {e}"),
+                Some("Is the database initialized? Run 'ft watch' first.".to_string()),
+                elapsed_ms(start),
+            );
+            return print_robot_response(&response, format, stats);
+        }
+    };
+    let summary = format!(
+        "ft robot mission {} mission_file={}",
+        verb.as_str(),
+        mission_path.display()
+    );
+    let action = format!("mission.{}", verb.as_str());
+    if let Err((code, message, hint)) =
+        authorize_robot_event_mutation(config, &storage, &action, &summary).await
+    {
+        let response = RobotResponse::<serde_json::Value>::error_with_code(
+            &code,
+            message,
+            hint,
+            elapsed_ms(start),
+        );
+        return print_robot_response(&response, format, stats);
+    }
+
+    match run_mission_lifecycle(
+        layout,
+        &mission_path,
+        verb,
+        expected_token,
+        reason,
+        "robot-operator",
+    ) {
+        Ok((data, _plain_lines)) => print_robot_response(
+            &RobotResponse::success(data, elapsed_ms(start)),
+            format,
+            stats,
+        ),
+        Err(err) => print_robot_response(&mission_error(err), format, stats),
+    }
+}
+
 fn robot_tx_error_code(tx_error_code: &str) -> &'static str {
     match tx_error_code {
         "mission.tx.file_not_found" => "robot.tx_not_found",
@@ -78724,6 +78889,19 @@ fn apply_mission_transition_plan(
     transitioned_at_ms: i64,
     reason: &str,
 ) -> Result<Vec<MissionTransitionRecord>, MissionCommandError> {
+    apply_mission_transition_plan_as(mission, plan, transitioned_at_ms, reason, "cli-operator")
+}
+
+fn apply_mission_transition_plan_as(
+    mission: &mut frankenterm_core::plan::Mission,
+    plan: &[(
+        frankenterm_core::plan::MissionLifecycleState,
+        frankenterm_core::plan::MissionLifecycleTransitionKind,
+    )],
+    transitioned_at_ms: i64,
+    reason: &str,
+    actor: &str,
+) -> Result<Vec<MissionTransitionRecord>, MissionCommandError> {
     use frankenterm_core::plan::{
         MissionLifecycleState as State, MissionLifecycleTransitionKind as Kind,
     };
@@ -78732,13 +78910,13 @@ fn apply_mission_transition_plan(
         let from = mission.lifecycle_state;
         let result = match kind {
             Kind::ExecutionBlocked => mission
-                .pause_mission("cli-operator", reason, transitioned_at_ms, None)
+                .pause_mission(actor, reason, transitioned_at_ms, None)
                 .map(|decision| decision.lifecycle_to),
             Kind::MissionCancelled => mission
-                .abort_mission("cli-operator", reason, None, transitioned_at_ms, None)
+                .abort_mission(actor, reason, None, transitioned_at_ms, None)
                 .map(|decision| decision.lifecycle_to),
             Kind::RetryResumed if from != State::RetryPending || *to != State::Running => mission
-                .resume_mission("cli-operator", reason, transitioned_at_ms, None)
+                .resume_mission(actor, reason, transitioned_at_ms, None)
                 .map(|decision| decision.lifecycle_to),
             _ => mission.transition_lifecycle(*to, *kind, transitioned_at_ms),
         };
@@ -78755,6 +78933,108 @@ fn apply_mission_transition_plan(
         });
     }
     Ok(transitions)
+}
+
+/// A mission lifecycle mutation shared by `ft mission pause|resume|abort` and
+/// `ft robot mission pause|resume|abort` so both surfaces apply the same
+/// transition plan, revision-token check, and durable commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissionLifecycleVerb {
+    Pause,
+    Resume,
+    Abort,
+}
+
+impl MissionLifecycleVerb {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+            Self::Abort => "abort",
+        }
+    }
+}
+
+/// Apply `verb` to the mission at `mission_path` and return the success
+/// payload plus its plain-text rendering. `actor` is recorded as the
+/// requester of the lifecycle decision.
+fn run_mission_lifecycle(
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    mission_path: &Path,
+    verb: MissionLifecycleVerb,
+    expected_token: Option<&str>,
+    reason: Option<&str>,
+    actor: &str,
+) -> Result<(serde_json::Value, Vec<String>), MissionCommandError> {
+    let mutation = acquire_mission_mutation(layout, mission_path, expected_token)?;
+    let mut mission = mutation.mission().clone();
+    let (plan, default_reason) = match verb {
+        MissionLifecycleVerb::Pause => (
+            mission_pause_transition_plan(mission.lifecycle_state)?,
+            "cli_pause",
+        ),
+        MissionLifecycleVerb::Resume => (
+            mission_resume_transition_plan(mission.lifecycle_state)?,
+            "cli_resume",
+        ),
+        MissionLifecycleVerb::Abort => (
+            mission_abort_transition_plan(mission.lifecycle_state)?,
+            "cli_abort",
+        ),
+    };
+    let transitions = apply_mission_transition_plan_as(
+        &mut mission,
+        &plan,
+        mission_now_ms(),
+        reason.unwrap_or(default_reason),
+        actor,
+    )?;
+    let mutation = mutation.commit(&mut mission).map_err(mission_store_error)?;
+    let transitions_json = transitions
+        .iter()
+        .map(|transition| {
+            serde_json::json!({
+                "from": transition.from.to_string(),
+                "to": transition.to.to_string(),
+                "kind": transition.kind.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mission_hash = mission.compute_hash();
+    let mut data = serde_json::json!({
+        "command": verb.as_str(),
+        "mutation": mutation,
+        "mission_file": mission_path.display().to_string(),
+        "mission_id": mission.mission_id.0.clone(),
+        "lifecycle_state": mission.lifecycle_state.to_string(),
+        "no_op": transitions.is_empty(),
+        "transitions": transitions_json,
+        "mission_hash": mission_hash,
+    });
+    let mut plain_lines = vec![
+        format!(
+            "Mission {}: {}",
+            verb.as_str(),
+            mission.mission_id.0.as_str()
+        ),
+        format!(
+            "  Persistence: {}; request only, mission-driver acknowledgement unavailable",
+            mutation.durability
+        ),
+        format!("  File: {}", mission_path.display()),
+        format!("  Lifecycle: {}", mission.lifecycle_state),
+        format!("  Transitions applied: {}", transitions.len()),
+    ];
+    if verb == MissionLifecycleVerb::Resume {
+        plain_lines.push(format!(
+            "  Hash: {}",
+            data["mission_hash"].as_str().unwrap_or("")
+        ));
+    } else {
+        data["reason"] = serde_json::json!(reason);
+        plain_lines.push(format!("  Reason: {}", reason.unwrap_or("none")));
+    }
+    Ok((data, plain_lines))
 }
 
 fn handle_mission_command(
@@ -79331,63 +79611,17 @@ fn handle_mission_command(
         } => {
             let output_format = MissionCommandOutputFormat::from_flag(&format);
             let mission_path = resolve_mission_file_path(layout, mission_file);
-            let mutation =
-                match acquire_mission_mutation(layout, &mission_path, expected_token.as_deref()) {
-                    Ok(guard) => guard,
-                    Err(err) => emit_mission_error(output_format, err),
-                };
-            let mut mission = mutation.mission().clone();
-            let plan = match mission_pause_transition_plan(mission.lifecycle_state) {
-                Ok(plan) => plan,
-                Err(err) => emit_mission_error(output_format, err),
-            };
-            let transitions = match apply_mission_transition_plan(
-                &mut mission,
-                &plan,
-                mission_now_ms(),
-                reason.as_deref().unwrap_or("cli_pause"),
+            let (data, plain_lines) = match run_mission_lifecycle(
+                layout,
+                &mission_path,
+                MissionLifecycleVerb::Pause,
+                expected_token.as_deref(),
+                reason.as_deref(),
+                "cli-operator",
             ) {
-                Ok(transitions) => transitions,
+                Ok(result) => result,
                 Err(err) => emit_mission_error(output_format, err),
             };
-            let mutation = match mutation.commit(&mut mission).map_err(mission_store_error) {
-                Ok(receipt) => receipt,
-                Err(err) => emit_mission_error(output_format, err),
-            };
-            let transitions_json = transitions
-                .iter()
-                .map(|transition| {
-                    serde_json::json!({
-                        "from": transition.from.to_string(),
-                        "to": transition.to.to_string(),
-                        "kind": transition.kind.to_string(),
-                    })
-                })
-                .collect::<Vec<_>>();
-            let reason_label = reason.as_deref().unwrap_or("none").to_string();
-            let mission_hash = mission.compute_hash();
-            let data = serde_json::json!({
-                "command": "pause",
-                "mutation": mutation,
-                "mission_file": mission_path.display().to_string(),
-                "mission_id": mission.mission_id.0.clone(),
-                "lifecycle_state": mission.lifecycle_state.to_string(),
-                "reason": reason,
-                "no_op": transitions.is_empty(),
-                "transitions": transitions_json,
-                "mission_hash": mission_hash,
-            });
-            let plain_lines = vec![
-                format!("Mission pause: {}", mission.mission_id.0.as_str()),
-                format!(
-                    "  Persistence: {}; request only, mission-driver acknowledgement unavailable",
-                    mutation.durability
-                ),
-                format!("  File: {}", mission_path.display()),
-                format!("  Lifecycle: {}", mission.lifecycle_state),
-                format!("  Transitions applied: {}", transitions.len()),
-                format!("  Reason: {}", reason_label),
-            ];
             emit_mission_success(output_format, data, &plain_lines)?;
         }
 
@@ -79398,61 +79632,17 @@ fn handle_mission_command(
         } => {
             let output_format = MissionCommandOutputFormat::from_flag(&format);
             let mission_path = resolve_mission_file_path(layout, mission_file);
-            let mutation =
-                match acquire_mission_mutation(layout, &mission_path, expected_token.as_deref()) {
-                    Ok(guard) => guard,
-                    Err(err) => emit_mission_error(output_format, err),
-                };
-            let mut mission = mutation.mission().clone();
-            let plan = match mission_resume_transition_plan(mission.lifecycle_state) {
-                Ok(plan) => plan,
-                Err(err) => emit_mission_error(output_format, err),
-            };
-            let transitions = match apply_mission_transition_plan(
-                &mut mission,
-                &plan,
-                mission_now_ms(),
-                "cli_resume",
+            let (data, plain_lines) = match run_mission_lifecycle(
+                layout,
+                &mission_path,
+                MissionLifecycleVerb::Resume,
+                expected_token.as_deref(),
+                None,
+                "cli-operator",
             ) {
-                Ok(transitions) => transitions,
+                Ok(result) => result,
                 Err(err) => emit_mission_error(output_format, err),
             };
-            let mutation = match mutation.commit(&mut mission).map_err(mission_store_error) {
-                Ok(receipt) => receipt,
-                Err(err) => emit_mission_error(output_format, err),
-            };
-            let transitions_json = transitions
-                .iter()
-                .map(|transition| {
-                    serde_json::json!({
-                        "from": transition.from.to_string(),
-                        "to": transition.to.to_string(),
-                        "kind": transition.kind.to_string(),
-                    })
-                })
-                .collect::<Vec<_>>();
-            let mission_hash = mission.compute_hash();
-            let data = serde_json::json!({
-                "command": "resume",
-                "mutation": mutation,
-                "mission_file": mission_path.display().to_string(),
-                "mission_id": mission.mission_id.0.clone(),
-                "lifecycle_state": mission.lifecycle_state.to_string(),
-                "no_op": transitions.is_empty(),
-                "transitions": transitions_json,
-                "mission_hash": mission_hash,
-            });
-            let plain_lines = vec![
-                format!("Mission resume: {}", mission.mission_id.0.as_str()),
-                format!(
-                    "  Persistence: {}; request only, mission-driver acknowledgement unavailable",
-                    mutation.durability
-                ),
-                format!("  File: {}", mission_path.display()),
-                format!("  Lifecycle: {}", mission.lifecycle_state),
-                format!("  Transitions applied: {}", transitions.len()),
-                format!("  Hash: {}", mission_hash),
-            ];
             emit_mission_success(output_format, data, &plain_lines)?;
         }
 
@@ -79464,63 +79654,17 @@ fn handle_mission_command(
         } => {
             let output_format = MissionCommandOutputFormat::from_flag(&format);
             let mission_path = resolve_mission_file_path(layout, mission_file);
-            let mutation =
-                match acquire_mission_mutation(layout, &mission_path, expected_token.as_deref()) {
-                    Ok(guard) => guard,
-                    Err(err) => emit_mission_error(output_format, err),
-                };
-            let mut mission = mutation.mission().clone();
-            let plan = match mission_abort_transition_plan(mission.lifecycle_state) {
-                Ok(plan) => plan,
-                Err(err) => emit_mission_error(output_format, err),
-            };
-            let transitions = match apply_mission_transition_plan(
-                &mut mission,
-                &plan,
-                mission_now_ms(),
-                reason.as_deref().unwrap_or("cli_abort"),
+            let (data, plain_lines) = match run_mission_lifecycle(
+                layout,
+                &mission_path,
+                MissionLifecycleVerb::Abort,
+                expected_token.as_deref(),
+                reason.as_deref(),
+                "cli-operator",
             ) {
-                Ok(transitions) => transitions,
+                Ok(result) => result,
                 Err(err) => emit_mission_error(output_format, err),
             };
-            let mutation = match mutation.commit(&mut mission).map_err(mission_store_error) {
-                Ok(receipt) => receipt,
-                Err(err) => emit_mission_error(output_format, err),
-            };
-            let transitions_json = transitions
-                .iter()
-                .map(|transition| {
-                    serde_json::json!({
-                        "from": transition.from.to_string(),
-                        "to": transition.to.to_string(),
-                        "kind": transition.kind.to_string(),
-                    })
-                })
-                .collect::<Vec<_>>();
-            let reason_label = reason.as_deref().unwrap_or("none").to_string();
-            let mission_hash = mission.compute_hash();
-            let data = serde_json::json!({
-                "command": "abort",
-                "mutation": mutation,
-                "mission_file": mission_path.display().to_string(),
-                "mission_id": mission.mission_id.0.clone(),
-                "lifecycle_state": mission.lifecycle_state.to_string(),
-                "reason": reason,
-                "no_op": transitions.is_empty(),
-                "transitions": transitions_json,
-                "mission_hash": mission_hash,
-            });
-            let plain_lines = vec![
-                format!("Mission abort: {}", mission.mission_id.0.as_str()),
-                format!(
-                    "  Persistence: {}; request only, mission-driver acknowledgement unavailable",
-                    mutation.durability
-                ),
-                format!("  File: {}", mission_path.display()),
-                format!("  Lifecycle: {}", mission.lifecycle_state),
-                format!("  Transitions applied: {}", transitions.len()),
-                format!("  Reason: {}", reason_label),
-            ];
             emit_mission_success(output_format, data, &plain_lines)?;
         }
     }
@@ -101571,6 +101715,198 @@ mod tests {
         });
         mission.lifecycle_state = MissionLifecycleState::AwaitingApproval;
         mission
+    }
+
+    fn mission_lifecycle_fixture() -> (
+        tempfile::TempDir,
+        frankenterm_core::config::WorkspaceLayout,
+        PathBuf,
+    ) {
+        let dir = tempfile::tempdir().expect("mission lifecycle tempdir");
+        let ft_dir = dir.path().join(".ft");
+        let layout = frankenterm_core::config::WorkspaceLayout {
+            root: dir.path().to_path_buf(),
+            ft_dir: ft_dir.clone(),
+            db_path: ft_dir.join("ft.db"),
+            lock_path: ft_dir.join("ft.lock"),
+            ipc_socket_path: ft_dir.join("ft.sock"),
+            logs_dir: ft_dir.join("logs"),
+            log_path: ft_dir.join("logs/ft.log"),
+            crash_dir: ft_dir.join("crashes"),
+            diag_dir: ft_dir.join("diag"),
+        };
+        let path = default_mission_file_path(&layout);
+        std::fs::create_dir_all(path.parent().expect("mission dir")).expect("create mission dir");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&sample_robot_mission()).expect("serialize mission"),
+        )
+        .expect("write mission fixture");
+        (dir, layout, path)
+    }
+
+    #[test]
+    fn mission_lifecycle_pause_then_resume_persists_and_records_actor() {
+        use frankenterm_core::plan::MissionLifecycleState;
+        let (_dir, layout, path) = mission_lifecycle_fixture();
+
+        let (data, lines) = run_mission_lifecycle(
+            &layout,
+            &path,
+            MissionLifecycleVerb::Pause,
+            None,
+            Some("ops hold"),
+            "robot-operator",
+        )
+        .expect("pause from running");
+        assert_eq!(data["command"], "pause");
+        assert_eq!(data["lifecycle_state"], "paused");
+        assert_eq!(data["reason"], "ops hold");
+        assert_eq!(data["no_op"], false);
+        assert!(lines.iter().any(|line| line == "  Reason: ops hold"));
+        let persisted = load_mission_from_path(&path).expect("reload paused mission");
+        assert_eq!(persisted.lifecycle_state, MissionLifecycleState::Paused);
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("read mission")
+                .contains("robot-operator"),
+            "the lifecycle decision must record the requesting actor"
+        );
+
+        let (data, _) = run_mission_lifecycle(
+            &layout,
+            &path,
+            MissionLifecycleVerb::Resume,
+            None,
+            None,
+            "robot-operator",
+        )
+        .expect("resume from paused");
+        assert_eq!(data["command"], "resume");
+        assert!(data.get("reason").is_none(), "resume carries no reason");
+        let persisted = load_mission_from_path(&path).expect("reload resumed mission");
+        assert_eq!(persisted.lifecycle_state, MissionLifecycleState::Running);
+    }
+
+    #[test]
+    fn mission_lifecycle_illegal_transition_fails_without_writing() {
+        let (_dir, layout, path) = mission_lifecycle_fixture();
+        run_mission_lifecycle(
+            &layout,
+            &path,
+            MissionLifecycleVerb::Abort,
+            None,
+            None,
+            "robot-operator",
+        )
+        .expect("abort from running");
+        let after_abort = std::fs::read(&path).expect("read aborted mission");
+
+        let err = run_mission_lifecycle(
+            &layout,
+            &path,
+            MissionLifecycleVerb::Pause,
+            None,
+            None,
+            "robot-operator",
+        )
+        .expect_err("a cancelled mission cannot be paused");
+        assert!(
+            err.error_code.starts_with("mission.transition"),
+            "{}",
+            err.error_code
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("reread mission"),
+            after_abort,
+            "a refused transition must not rewrite the mission file"
+        );
+    }
+
+    #[test]
+    fn robot_mission_lifecycle_policy_deny_leaves_mission_unchanged() {
+        run_async_test(async {
+            let (_dir, layout, path) = mission_lifecycle_fixture();
+            let mut config = frankenterm_core::config::Config::default();
+            config.safety.rules.enabled = true;
+            config
+                .safety
+                .rules
+                .rules
+                .push(frankenterm_core::config::PolicyRule {
+                    id: "test.deny.robot.mission".to_string(),
+                    description: Some("deny robot mission mutations".to_string()),
+                    priority: 1,
+                    match_on: frankenterm_core::config::PolicyRuleMatch {
+                        actions: vec!["exec_command".to_string()],
+                        actors: vec!["robot".to_string()],
+                        ..Default::default()
+                    },
+                    decision: frankenterm_core::config::PolicyRuleDecision::Deny,
+                    message: Some("robot mission mutation blocked for test".to_string()),
+                });
+            let before = std::fs::read(&path).expect("read mission before");
+
+            run_robot_mission_lifecycle(
+                &config,
+                &layout,
+                MissionLifecycleVerb::Abort,
+                None,
+                None,
+                Some("denied"),
+                std::time::Instant::now(),
+                RobotOutputFormat::Json,
+                false,
+            )
+            .await
+            .expect("denial is reported as a robot envelope");
+
+            assert_eq!(
+                std::fs::read(&path).expect("read mission after"),
+                before,
+                "a policy-denied robot mutation must leave the mission untouched"
+            );
+        });
+    }
+
+    #[test]
+    fn robot_mission_lifecycle_verbs_parse() {
+        let cases: [(&[&str], MissionLifecycleVerb); 3] = [
+            (
+                &["ft", "robot", "mission", "pause", "--reason", "hold"],
+                MissionLifecycleVerb::Pause,
+            ),
+            (
+                &["ft", "robot", "mission", "resume"],
+                MissionLifecycleVerb::Resume,
+            ),
+            (
+                &["ft", "robot", "mission", "abort", "--expected-token", "{}"],
+                MissionLifecycleVerb::Abort,
+            ),
+        ];
+        for (argv, verb) in cases {
+            let cli = Cli::try_parse_from(argv).expect("robot mission lifecycle verb should parse");
+            let parsed = match cli.command.map(|cmd| *cmd) {
+                Some(Commands::Robot {
+                    command: Some(RobotCommands::Mission { command }),
+                    ..
+                }) => match command {
+                    RobotMissionCommands::Pause { reason, .. } => {
+                        assert_eq!(reason.as_deref(), Some("hold"));
+                        MissionLifecycleVerb::Pause
+                    }
+                    RobotMissionCommands::Resume { .. } => MissionLifecycleVerb::Resume,
+                    RobotMissionCommands::Abort { expected_token, .. } => {
+                        assert_eq!(expected_token.as_deref(), Some("{}"));
+                        MissionLifecycleVerb::Abort
+                    }
+                    _ => panic!("expected a lifecycle verb for {argv:?}"),
+                },
+                _ => panic!("expected robot mission command for {argv:?}"),
+            };
+            assert_eq!(parsed, verb);
+        }
     }
 
     fn sample_robot_mission() -> frankenterm_core::plan::Mission {
