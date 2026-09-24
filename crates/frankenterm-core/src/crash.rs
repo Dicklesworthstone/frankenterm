@@ -6029,6 +6029,64 @@ fn collect_incident_bundle_inner(
                 warning_ids: Vec::new(),
             });
 
+            // Audit trail tail (ft-67e8h): policy decisions and results only;
+            // free-text input/verification summaries are left out of the bundle.
+            let audit_source_started = Instant::now();
+            if opts.max_events > 0 {
+                let audit_surface =
+                    format!("rusqlite read-only audit_actions {}", db_path.display());
+                if let Some(audit_json) = collect_recent_audit_summary(db_path, opts.max_events) {
+                    write_redacted_file(
+                        "audit_tail.json",
+                        &audit_json,
+                        &bundle_dir,
+                        &redactor,
+                        &mut files,
+                        &mut total_size,
+                        &mut redaction_entries,
+                    )?;
+                    sources.push(IncidentSourceEntry {
+                        name: "audit_tail".to_string(),
+                        file: Some("audit_tail.json".to_string()),
+                        status: IncidentSourceStatus::Collected,
+                        evidence_state: IncidentEvidenceState::Measured,
+                        source_surface: audit_surface,
+                        mutates_state: false,
+                        generated_at: Some(exported_at.clone()),
+                        freshness_ms: Some(0),
+                        max_age_ms: Some(300_000),
+                        redaction: redaction_state_for_file(&redaction_entries, "audit_tail.json"),
+                        privacy_tier: "default".to_string(),
+                        size_bytes: bundle_file_size(&bundle_dir, "audit_tail.json"),
+                        elapsed_ms: elapsed_ms(audit_source_started),
+                        warning_ids: Vec::new(),
+                    });
+                } else {
+                    let warning_id = "audit_tail.query_failed";
+                    warnings.push(incident_warning(
+                        warning_id,
+                        "audit_tail",
+                        "failed to query the audit trail from the read-only database".to_string(),
+                    ));
+                    sources.push(IncidentSourceEntry {
+                        name: "audit_tail".to_string(),
+                        file: None,
+                        status: IncidentSourceStatus::Failed,
+                        evidence_state: IncidentEvidenceState::Unavailable,
+                        source_surface: audit_surface,
+                        mutates_state: false,
+                        generated_at: None,
+                        freshness_ms: None,
+                        max_age_ms: Some(300_000),
+                        redaction: IncidentRedactionState::NotApplicable,
+                        privacy_tier: "default".to_string(),
+                        size_bytes: 0,
+                        elapsed_ms: elapsed_ms(audit_source_started),
+                        warning_ids: vec![warning_id.to_string()],
+                    });
+                }
+            }
+
             // Recent events (sanitized summaries)
             let events_source_started = Instant::now();
             if opts.max_events > 0 {
@@ -6436,6 +6494,41 @@ fn collect_db_metadata(db_path: &Path) -> DbMetadata {
 }
 
 /// Collect summaries of recent events from the database (redacted by caller).
+/// Most recent audit_actions rows as structured JSON (no free-text
+/// summaries), newest first.
+fn collect_recent_audit_summary(db_path: &Path, max_rows: usize) -> Option<String> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, ts, actor_kind, pane_id, action_kind, policy_decision, \
+             COALESCE(rule_id, ''), result \
+             FROM audit_actions ORDER BY ts DESC, id DESC LIMIT ?1",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map([max_rows as i64], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, i64>(0)?,
+                "ts": row.get::<_, i64>(1)?,
+                "actor_kind": row.get::<_, String>(2)?,
+                "pane_id": row.get::<_, Option<i64>>(3)?,
+                "action_kind": row.get::<_, String>(4)?,
+                "policy_decision": row.get::<_, String>(5)?,
+                "rule_id": row.get::<_, String>(6)?,
+                "result": row.get::<_, String>(7)?,
+            }))
+        })
+        .ok()?;
+    let actions: Vec<serde_json::Value> = rows.filter_map(Result::ok).collect();
+    serde_json::to_string_pretty(&actions)
+        .inspect_err(|e| tracing::warn!(error = %e, "incident audit tail serialization failed"))
+        .ok()
+}
+
 fn collect_recent_events_summary(db_path: &Path, max_events: usize) -> Option<String> {
     let conn = rusqlite::Connection::open_with_flags(
         db_path,

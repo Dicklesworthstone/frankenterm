@@ -930,6 +930,53 @@ fn collect_incident_bundle_with_db_metadata() {
 }
 
 #[test]
+fn collect_incident_bundle_includes_audit_tail_without_free_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let crash_dir = tmp.path().join("crashes");
+    let out_dir = tmp.path().join("output");
+    let db_path = tmp.path().join("test.db");
+    fs::create_dir_all(&crash_dir).unwrap();
+    fs::create_dir_all(&out_dir).unwrap();
+    create_test_db(&db_path);
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE audit_actions (
+             id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, actor_kind TEXT NOT NULL,
+             pane_id INTEGER, action_kind TEXT NOT NULL, policy_decision TEXT NOT NULL,
+             rule_id TEXT, input_summary TEXT, result TEXT NOT NULL
+         );
+         INSERT INTO audit_actions VALUES
+             (1, 1000, 'robot', 3, 'send_text', 'deny', 'policy.prompt_unknown',
+              'secret-free-text-canary', 'denied'),
+             (2, 2000, 'workflow', 4, 'send_text', 'allow', NULL,
+              'secret-free-text-canary', 'success');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let opts = IncidentBundleOptions {
+        crash_dir: &crash_dir,
+        config_path: None,
+        out_dir: &out_dir,
+        kind: IncidentKind::Manual,
+        db_path: Some(&db_path),
+        max_events: 10,
+    };
+    let result = collect_incident_bundle(&opts).unwrap();
+
+    let raw = fs::read_to_string(result.path.join("audit_tail.json")).unwrap();
+    assert!(
+        !raw.contains("secret-free-text-canary"),
+        "free-text summaries stay out"
+    );
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["id"], 2, "newest first");
+    assert_eq!(rows[1]["policy_decision"], "deny");
+    assert_eq!(rows[1]["rule_id"], "policy.prompt_unknown");
+}
+
+#[test]
 fn collect_incident_bundle_includes_recent_events() {
     let tmp = tempfile::tempdir().unwrap();
     let crash_dir = tmp.path().join("crashes");

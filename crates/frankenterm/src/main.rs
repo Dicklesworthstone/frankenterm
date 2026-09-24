@@ -3181,6 +3181,10 @@ enum ReproduceCommands {
         /// Output format (text or json)
         #[arg(short = 'f', long, default_value = "text")]
         format: String,
+
+        /// Include a bounded, redacted `ps` process-tree snapshot
+        #[arg(long)]
+        process_sample: bool,
     },
 
     /// Replay a bundle for deterministic analysis
@@ -68311,9 +68315,15 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
         }
 
         Some(Commands::Reproduce { command }) => match command {
-            ReproduceCommands::Export { kind, out, format } => {
+            ReproduceCommands::Export {
+                kind,
+                out,
+                format,
+                process_sample,
+            } => {
                 use frankenterm_core::crash::{
-                    IncidentBundleOptions, IncidentKind, collect_incident_bundle,
+                    IncidentBundleOptions, IncidentKind, IncidentProcessSamplerConfig,
+                    collect_incident_bundle, collect_incident_bundle_with_process_sampler,
                 };
 
                 let incident_kind = match kind.to_lowercase().as_str() {
@@ -68339,7 +68349,15 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     max_events: 50,
                 };
 
-                match collect_incident_bundle(&opts) {
+                let collected = if process_sample {
+                    collect_incident_bundle_with_process_sampler(
+                        &opts,
+                        &IncidentProcessSamplerConfig::ps_snapshot(2_000),
+                    )
+                } else {
+                    collect_incident_bundle(&opts)
+                };
+                match collected {
                     Ok(result) => {
                         if format.to_lowercase() == "json" {
                             let json = serde_json::to_string_pretty(&result)

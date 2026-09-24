@@ -367,7 +367,7 @@ Honest status of every shipped surface, without migration-era hand-waving.
 | Robot mode | **Supported** | All core families: `state`, `get-text`, `send`, `wait-for`, `search`, `events`, `rules`, `workflows`, `agents`, `accounts`, `reservations`, `mission`, `tx`, `health`, `proof status`, `approvals`, `checkpoint`, `context`, `work`, `fleet`, `profile`, `connector`, `kill-switch` (persisted operator switch with scoped fence receipts; [docs/robot-contracts/kill-switch.md](docs/robot-contracts/kill-switch.md)). NTM-gap fallback retired. **Caveats:** the `agents` family is gated behind the (default-on) `agent-detection` feature — a `--no-default-features` build returns `robot.feature_not_available` for it (see the [Compile-Time Feature Matrix](#compile-time-feature-matrix)); the `connector` family's non-dry-run `uninstall`/`rollback` are approval-blocked pending the robot approval-token gate (see [docs/robot-contracts/connector.md](docs/robot-contracts/connector.md)) |
 | Operating envelope | **Supported** | `ft.operating_envelope.v1` planner contract + golden fixtures; fails closed on missing or critical-pressure telemetry |
 | Mission objective planner | **Supported** | Capacity-aware planner for safe swarm orchestration (ft-auy2g) |
-| Incident bundles | **Partial** | `ft reproduce export` collects recent events, stored pane rows, DB metadata, config, git state and the beads snapshot; process tree, GPU, render, BSU/ESU and audit-tail collectors are not on the production path |
+| Incident bundles | **Partial** | `ft reproduce export` collects recent events, stored pane rows, DB metadata, config, git state and the beads snapshot; audit tail included, process tree opt-in (`--process-sample`); GPU, render and BSU/ESU collectors are not on the production path |
 | Session persistence | **Capture/inspect/export supported; restore execution unavailable** | Snapshot save/list/inspect/pane-membership diff/delete, `ft session doctor`, `ft session dump`, and read-only `ft session list-durable` / `export-durable` ship. The live dump is a private, redacted, checksummed export of live pane text plus bounded topology metadata; the durable export reads the committed cold-scrollback prefix for one stable pane UUID. Neither is a process checkpoint or executable restore image. `ft snapshot restore` and robot checkpoint rollback accept metadata-only `--dry-run` descriptor/status reporting, but every non-dry invocation fails closed before database resolution, process discovery, subprocess launch, or mux mutation. Production does not currently restore panes, processes, hot viewport, mux domains, window/workspace placement, durable tab order, stable active-tab identity, or full appearance. |
 | Reality-check + attestation | **Supported** | `ft attestation verify` / `show` ship as a thin Rust wrapper over `scripts/attestation-verify.sh`. Signed bundles live in `docs/attestations/` |
 | Deferred proof queue | **Supported with fail-closed proof prerequisite** | `ft proof queue/status/replay/attach` and `ft robot proof status` expose source-landed proof intents. Replay executes only through remote-required RCH when admission is explicitly `admitted`; local Cargo is never substituted. Release-slot evidence stays under `docs/attestations/proofs/deferred-proof-replay.json`; current W8.2 remote proof remains blocked on RCH admission. |
@@ -679,8 +679,9 @@ ft robot --format json events --unhandled --limit 50 | \
 **With `ft`:**
 ```bash
 ft reproduce export --kind crash --out /tmp/incident
-# Bundle includes: recent events, stored pane/mux rows, SQLite metadata,
+# Bundle includes: recent events, audit tail, stored pane/mux rows, SQLite metadata,
 # redacted config, git status, latest crash report, beads coordination snapshot
+# (add --process-sample for a redacted process-tree snapshot)
 ```
 
 Live collectors snapshot the world at the moment of failure. The bundle is portable; you can attach it to a bug report and a reviewer can reconstruct the incident without the original host.
@@ -1815,9 +1816,11 @@ When something goes wrong (a crash, a stuck pane, a fleet-wide degradation), `ft
 - Pane/mux state from stored pane rows (not a live mux query)
 - SQLite metadata (journal mode, size, schema version, row counts)
 - Redacted config, git status, and the latest crash report
+- Audit-trail tail: recent policy decisions and results from `audit_actions` (no free-text summaries)
+- Process tree: a bounded, redacted `ps` snapshot when you pass `--process-sample`
 - Beads coordination snapshot from `.beads/issues.jsonl` (ft-tkkqx)
 
-**Not yet on the production path:** process tree sampling, GPU state, render-state snapshots, SynchronizedOutput (BSU/ESU) drain telemetry, WAL checkpoint detail, and the audit-trail tail.
+**Not yet on the production path:** GPU state, render-state snapshots, SynchronizedOutput (BSU/ESU) drain telemetry, and WAL checkpoint detail.
 
 **Producer side:** the swarm wire protocol carries publish-side bundle source notifications (ft-9sy9e family) so distributed incidents include each participating agent's local view.
 
