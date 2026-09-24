@@ -12207,7 +12207,7 @@ mod tests {
                 Ok(crate::pane::PaneSelectionAnchorStatus::Captured) => break,
                 Ok(crate::pane::PaneSelectionAnchorStatus::Pending)
                 | Err(crate::pane::PaneSelectionAnchorError::Busy) => {}
-                result => panic!("append invalidated retained cold capture: {result:?}"),
+                result => panic!("append invalidated retained cold capture: {:?}", result),
             }
             assert!(Instant::now() < deadline, "append capture did not settle");
             std::thread::sleep(Duration::from_millis(1));
@@ -12325,7 +12325,10 @@ mod tests {
                 Ok(crate::pane::PaneSelectionAnchorStatus::Captured) => break,
                 Ok(crate::pane::PaneSelectionAnchorStatus::Pending)
                 | Err(crate::pane::PaneSelectionAnchorError::Busy) => {}
-                result => panic!("surviving cold capture failed after supersessions: {result:?}"),
+                result => panic!(
+                    "surviving cold capture failed after supersessions: {:?}",
+                    result
+                ),
             }
             assert!(
                 Instant::now() < deadline,
@@ -12416,7 +12419,7 @@ mod tests {
             pane.request_cold_selection(
                 &mut term,
                 published_request.clone(),
-                vec![row..row + 1],
+                std::iter::once(row..row + 1).collect(),
                 false,
                 Some(&mut second_owner),
             );
@@ -12448,12 +12451,24 @@ mod tests {
         let reads_before = sink.payload_reads.load(Ordering::Acquire);
         {
             let mut term = pane.terminal.lock();
-            pane.request_cold_selection(&mut term, request(0), vec![row..row + 1], true, None);
+            pane.request_cold_selection(
+                &mut term,
+                request(0),
+                std::iter::once(row..row + 1).collect(),
+                true,
+                None,
+            );
             assert_eq!(pane.cold_selection.lock().len(), MAX_COLD_SELECTION_WORK);
             assert!(cancelled.iter().all(|flag| !flag.load(Ordering::Acquire)));
             assert_eq!(sink.payload_reads.load(Ordering::Acquire), reads_before);
             pane.cold_selection.lock()[0].renewed = admitted_at - Duration::from_secs(1);
-            pane.request_cold_selection(&mut term, request(1), vec![row..row + 1], true, None);
+            pane.request_cold_selection(
+                &mut term,
+                request(1),
+                std::iter::once(row..row + 1).collect(),
+                true,
+                None,
+            );
             assert!(pane.cold_selection.lock()[0].renewed >= admitted_at);
             assert_eq!(pane.cold_selection.lock().len(), MAX_COLD_SELECTION_WORK);
             // A cached SourceChanged result owns no payload/worker, but must
@@ -12469,7 +12484,13 @@ mod tests {
             });
             work[1].renewed = Instant::now() - COLD_SELECTION_WORK_LEASE - Duration::from_secs(1);
             drop(work);
-            pane.request_cold_selection(&mut term, request(0), vec![row..row + 1], true, None);
+            pane.request_cold_selection(
+                &mut term,
+                request(0),
+                std::iter::once(row..row + 1).collect(),
+                true,
+                None,
+            );
             assert_eq!(pane.cold_selection.lock().len(), MAX_COLD_SELECTION_WORK);
             assert!(cancelled[1].load(Ordering::Acquire));
             assert!(cancelled
