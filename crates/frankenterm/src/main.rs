@@ -67610,7 +67610,16 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 all_checks.push(session_recovery_diagnostic_check(report));
             }
             if layout.db_path.exists() {
-                all_checks.push(prompt_evidence_diagnostic_check(&layout.db_path).await);
+                all_checks.push(
+                    prompt_evidence_diagnostic_check(
+                        &layout.db_path,
+                        layout
+                            .ipc_socket_path
+                            .exists()
+                            .then_some(layout.ipc_socket_path.as_path()),
+                    )
+                    .await,
+                );
             }
             all_checks.push(distributed_readiness_diagnostic_check(&config.distributed));
             all_checks.push(recorder_storage_diagnostic_check(
@@ -96179,11 +96188,15 @@ fn distributed_readiness_diagnostic_check(
 /// Observed panes whose prompt evidence `ft doctor` inspects (ft-xxfwy.12).
 const PROMPT_EVIDENCE_PANE_LIMIT: usize = 50;
 
-/// `ft doctor` row: which observed panes show OSC 133 prompt markers in their
-/// recent captured output. Uses the same storage derivation the send policy
-/// uses, so a pane listed here as missing is one where an untrusted
-/// `ft robot send` gets `policy.prompt_unknown`.
-async fn prompt_evidence_diagnostic_check(db_path: &Path) -> DiagnosticCheck {
+/// `ft doctor` row: which observed panes show OSC 133 prompt evidence, either
+/// markers in recent captured output or the running watcher's live semantic
+/// zones. These are the two sources the send policy reads, so a pane listed
+/// here as missing is one where an untrusted `ft robot send` gets
+/// `policy.prompt_unknown`.
+async fn prompt_evidence_diagnostic_check(
+    db_path: &Path,
+    ipc_socket_path: Option<&Path>,
+) -> DiagnosticCheck {
     let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     let storage =
         match frankenterm_core::storage::StorageHandle::new(&db_path.to_string_lossy()).await {
@@ -96221,8 +96234,29 @@ async fn prompt_evidence_diagnostic_check(db_path: &Path) -> DiagnosticCheck {
         )
         .await
         {
-            Ok(Some(_)) => {}
-            Ok(None) | Err(_) => missing.push(pane.pane_id),
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => {}
+        }
+        let live = match ipc_socket_path {
+            Some(socket) => {
+                frankenterm_core::pane_capability_resolution::fetch_pane_state_from_ipc(
+                    &cx,
+                    socket,
+                    pane.pane_id,
+                )
+                .await
+            }
+            None => Ok(None),
+        };
+        let live_evidence = matches!(
+            live,
+            Ok(Some(ref state)) if state
+                .live_prompt
+                .as_ref()
+                .is_some_and(|live| live.osc_state().is_some())
+        );
+        if !live_evidence {
+            missing.push(pane.pane_id);
         }
     }
     let _ = storage.shutdown().await;
@@ -102254,7 +102288,7 @@ mod tests {
                 .expect("plain segment");
             storage.shutdown().await.expect("shutdown");
 
-            let check = prompt_evidence_diagnostic_check(&db_path).await;
+            let check = prompt_evidence_diagnostic_check(&db_path, None).await;
             assert!(matches!(check.status, DiagnosticStatus::Warning));
             let detail = check.detail.unwrap_or_default();
             assert!(detail.starts_with("1/2"), "{detail}");

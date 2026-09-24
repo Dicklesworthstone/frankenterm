@@ -303,6 +303,23 @@ impl<'a> ApprovalStore<'a> {
         }
     }
 
+    /// Tokens are scoped to a `panes` row (and consumed by pane id), so a
+    /// pane the watcher never recorded cannot hold one. Say so instead of
+    /// surfacing the foreign-key failure.
+    async fn require_registered_pane(&self, cx: &crate::cx::Cx, input: &PolicyInput) -> Result<()> {
+        let Some(pane_id) = input.pane_id else {
+            return Ok(());
+        };
+        if self.storage.get_pane_with_cx(cx, pane_id).await?.is_some() {
+            return Ok(());
+        }
+        Err(Error::Policy(format!(
+            "pane {pane_id} is not recorded in this workspace yet, so no approval code can be \
+             scoped to it; start `ft watch` in this workspace, wait for it to observe the pane, \
+             then retry"
+        )))
+    }
+
     /// Issue a new allow-once approval for the given policy input
     pub async fn issue(
         &self,
@@ -333,6 +350,7 @@ impl<'a> ApprovalStore<'a> {
         cx.checkpoint().map_err(|err| {
             approval_cancelled_error("approval.issue", format!("pre-start: {err}"))
         })?;
+        self.require_registered_pane(cx, input).await?;
 
         let now = now_ms();
         let active = self
@@ -421,6 +439,7 @@ impl<'a> ApprovalStore<'a> {
         cx.checkpoint().map_err(|err| {
             approval_cancelled_error("approval.issue_for_plan", format!("pre-start: {err}"))
         })?;
+        self.require_registered_pane(cx, input).await?;
 
         let now = now_ms();
         let active = self
@@ -1801,6 +1820,34 @@ mod tests {
     ///   4. `attach_to_decision_with_cx` with a decision that
     ///      doesn't require approval is a pure pass-through (no
     ///      storage calls, no checkpoint).
+    #[test]
+    fn issuing_for_an_unrecorded_pane_names_the_fix_not_the_foreign_key() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("ft.db");
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let store = ApprovalStore::new(&storage, ApprovalConfig::default(), "ws");
+            let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane(77);
+
+            for result in [
+                store.issue(&input, None).await,
+                store
+                    .issue_for_plan(&input, "sha256:unrecorded", Some(1), None)
+                    .await,
+            ] {
+                let message = result.expect_err("unrecorded pane").to_string();
+                assert!(message.contains("pane 77 is not recorded"), "{message}");
+                assert!(message.contains("ft watch"), "{message}");
+                assert!(!message.contains("FOREIGN KEY"), "{message}");
+            }
+
+            // Pane-less actions are unaffected.
+            let paneless = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+            store.issue(&paneless, None).await.unwrap();
+            storage.shutdown().await.unwrap();
+        });
+    }
+
     #[test]
     fn approval_rs_cx_first_trail_complete() {
         run_async_test(async {
