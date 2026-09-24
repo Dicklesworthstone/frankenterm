@@ -62470,6 +62470,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             "resize_control_plane_stalled",
                             "resize_control_plane_watchdog",
                             "resize_degradation_ladder",
+                            "pane_output_rates",
                         ] {
                             if let Some(value) = status.get(key) {
                                 payload[key] = value.clone();
@@ -62867,6 +62868,19 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         dashboard, &ctx,
                                     );
                                 print!("{resize_output}");
+                            }
+                        }
+                        if !output_format.is_json() {
+                            let busiest = watcher_status_payload
+                                .as_ref()
+                                .and_then(|status| status.get("pane_output_rates"))
+                                .map(busiest_pane_lines)
+                                .unwrap_or_default();
+                            if !busiest.is_empty() {
+                                println!();
+                                for line in busiest {
+                                    println!("{line}");
+                                }
                             }
                         }
 
@@ -96127,6 +96141,47 @@ fn recorder_storage_diagnostic_check(recorder_dir: &Path) -> DiagnosticCheck {
     }
 }
 
+/// Panes shown in the plain `ft status` busiest-panes block.
+const BUSIEST_PANES_SHOWN: usize = 5;
+
+/// Plain `ft status` lines naming the panes producing the most output
+/// (ft-wl9rx), from the watcher's `pane_output_rates` status field. Empty
+/// until the watcher has a rate window with any output.
+fn busiest_pane_lines(rates: &serde_json::Value) -> Vec<String> {
+    let Ok(snapshot) = serde_json::from_value::<frankenterm_core::runtime::PaneOutputRatesSnapshot>(
+        rates.clone(),
+    ) else {
+        return Vec::new();
+    };
+    let active: Vec<_> = snapshot
+        .panes
+        .iter()
+        .filter(|pane| pane.bytes_per_sec > 0.0)
+        .take(BUSIEST_PANES_SHOWN)
+        .collect();
+    if snapshot.window_ms == 0 || active.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "Busiest panes (captured output, last {}s):",
+        snapshot.window_ms / 1000
+    )];
+    for pane in active {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let rate = format_bytes_human(pane.bytes_per_sec.round() as u64);
+        let dropped = if pane.segments_dropped_total > 0 {
+            format!(", {} segments dropped", pane.segments_dropped_total)
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "  pane {:>4}  {rate}/s  ({:.1} segments/s{dropped})",
+            pane.pane_id, pane.segments_per_sec
+        ));
+    }
+    lines
+}
+
 fn format_bytes_human(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
@@ -102294,6 +102349,32 @@ mod tests {
             assert!(detail.starts_with("1/2"), "{detail}");
             assert!(detail.contains("panes 2"), "{detail}");
         });
+    }
+
+    #[test]
+    fn busiest_pane_lines_rank_flooding_panes_and_skip_idle_ones() {
+        let rates = serde_json::json!({
+            "timestamp_ms": 30_000,
+            "window_ms": 30_000,
+            "panes": [
+                {"pane_id": 7, "bytes_per_sec": 6_300_000.0, "segments_per_sec": 40.0,
+                 "bytes_total": 1, "segments_total": 1, "segments_dropped_total": 12},
+                {"pane_id": 3, "bytes_per_sec": 2_048.0, "segments_per_sec": 0.5,
+                 "bytes_total": 1, "segments_total": 1, "segments_dropped_total": 0},
+                {"pane_id": 1, "bytes_per_sec": 0.0, "segments_per_sec": 0.0,
+                 "bytes_total": 1, "segments_total": 1, "segments_dropped_total": 0}
+            ]
+        });
+        let lines = busiest_pane_lines(&rates);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines[0], "Busiest panes (captured output, last 30s):");
+        assert!(lines[1].contains("pane    7") && lines[1].contains("MiB/s"), "{lines:?}");
+        assert!(lines[1].contains("12 segments dropped"), "{lines:?}");
+        assert!(lines[2].contains("pane    3") && lines[2].contains("2.0 KiB/s"), "{lines:?}");
+
+        let first_tick = serde_json::json!({"timestamp_ms": 1, "window_ms": 0, "panes": []});
+        assert!(busiest_pane_lines(&first_tick).is_empty());
+        assert!(busiest_pane_lines(&serde_json::Value::Null).is_empty());
     }
 
     #[test]

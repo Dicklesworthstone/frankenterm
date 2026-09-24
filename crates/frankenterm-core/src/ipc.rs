@@ -2861,6 +2861,9 @@ async fn handle_request_with_context(
                 .and_then(|snapshot| serde_json::to_value(snapshot).ok())
                 .unwrap_or(serde_json::Value::Null);
             payload["health"] = health;
+            payload["pane_output_rates"] = crate::runtime::PaneOutputRatesSnapshot::get_global()
+                .and_then(|snapshot| serde_json::to_value(snapshot).ok())
+                .unwrap_or(serde_json::Value::Null);
             if let Some(snapshot) =
                 crate::resize_scheduler::ResizeSchedulerDebugSnapshot::get_global()
             {

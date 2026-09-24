@@ -3983,6 +3983,109 @@ const RESIZE_WATCHDOG_CRITICAL_STALLED_LIMIT: usize =
 const RESIZE_WATCHDOG_SAMPLE_LIMIT: usize =
     crate::tuning_config::RuntimeTuning::DEFAULT_RESIZE_WATCHDOG_SAMPLE_LIMIT;
 
+/// Cumulative captured output for one pane (ft-wl9rx).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PaneOutputTotals {
+    pub bytes: u64,
+    pub segments: u64,
+}
+
+/// Captured-output rate of one pane over the last health window.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct PaneOutputRate {
+    pub pane_id: u64,
+    pub bytes_per_sec: f64,
+    pub segments_per_sec: f64,
+    pub bytes_total: u64,
+    pub segments_total: u64,
+    /// Segments dropped under capture backpressure since the watcher started.
+    pub segments_dropped_total: u64,
+}
+
+/// Which panes are producing the most output, busiest first (ft-wl9rx).
+///
+/// Rates are captured (rendered) bytes per second between the last two
+/// health ticks, so a full-screen redraw loop shows up the same way a log
+/// flood does.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct PaneOutputRatesSnapshot {
+    pub timestamp_ms: u64,
+    /// Length of the rate window; zero on the first tick (totals only).
+    pub window_ms: u64,
+    pub panes: Vec<PaneOutputRate>,
+}
+
+/// Panes listed in a published output-rate snapshot.
+const PANE_OUTPUT_RATE_LIMIT: usize = 64;
+
+static GLOBAL_PANE_OUTPUT_RATES: OnceLock<StdRwLock<Option<PaneOutputRatesSnapshot>>> =
+    OnceLock::new();
+
+impl PaneOutputRatesSnapshot {
+    /// Rates between `previous` (taken at `previous_ms`) and `current`.
+    #[must_use]
+    pub fn between(
+        previous: Option<(u64, &HashMap<u64, PaneOutputTotals>)>,
+        current: &HashMap<u64, PaneOutputTotals>,
+        now_ms: u64,
+        dropped_by_pane: &HashMap<u64, u64>,
+    ) -> Self {
+        let window_ms = previous.map_or(0, |(at, _)| now_ms.saturating_sub(at));
+        #[allow(clippy::cast_precision_loss)]
+        let per_sec = |delta: u64| {
+            if window_ms == 0 {
+                0.0
+            } else {
+                delta as f64 * 1000.0 / window_ms as f64
+            }
+        };
+        let mut panes: Vec<PaneOutputRate> = current
+            .iter()
+            .map(|(&pane_id, totals)| {
+                let before = previous
+                    .and_then(|(_, map)| map.get(&pane_id).copied())
+                    .unwrap_or_default();
+                PaneOutputRate {
+                    pane_id,
+                    bytes_per_sec: per_sec(totals.bytes.saturating_sub(before.bytes)),
+                    segments_per_sec: per_sec(totals.segments.saturating_sub(before.segments)),
+                    bytes_total: totals.bytes,
+                    segments_total: totals.segments,
+                    segments_dropped_total: dropped_by_pane.get(&pane_id).copied().unwrap_or(0),
+                }
+            })
+            .collect();
+        panes.sort_by(|a, b| {
+            b.bytes_per_sec
+                .total_cmp(&a.bytes_per_sec)
+                .then(b.bytes_total.cmp(&a.bytes_total))
+                .then(a.pane_id.cmp(&b.pane_id))
+        });
+        panes.truncate(PANE_OUTPUT_RATE_LIMIT);
+        Self {
+            timestamp_ms: now_ms,
+            window_ms,
+            panes,
+        }
+    }
+
+    /// Publish the latest snapshot for the IPC `status` reply.
+    pub fn update_global(snapshot: Self) {
+        let lock = GLOBAL_PANE_OUTPUT_RATES.get_or_init(|| StdRwLock::new(None));
+        *lock.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
+    }
+
+    /// The latest published snapshot, if the watcher has taken one.
+    #[must_use]
+    pub fn get_global() -> Option<Self> {
+        GLOBAL_PANE_OUTPUT_RATES
+            .get()?
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
 /// Machine-readable lock contention and cursor-memory telemetry snapshot.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct RuntimeLockMemoryTelemetrySnapshot {
@@ -4298,6 +4401,9 @@ pub struct RuntimeMetrics {
     /// hold a `BackpressureManager` reference — the manager lives in the
     /// parallel maintenance loop and operates on queue depth sampling.
     backpressure: Arc<BackpressureMetrics>,
+    /// Per-pane captured output totals (ft-wl9rx); pruned to observed panes
+    /// on each health tick.
+    pane_output: StdMutex<HashMap<u64, PaneOutputTotals>>,
 }
 
 /// Aggregate, bounded-cardinality telemetry for persistence-state retirement.
@@ -4365,6 +4471,7 @@ impl Default for RuntimeMetrics {
             native_output_max_batch_events: ShardedMax::new(),
             native_output_max_batch_bytes: ShardedMax::new(),
             backpressure: Arc::new(BackpressureMetrics::default()),
+            pane_output: StdMutex::new(HashMap::new()),
         }
     }
 }
@@ -4490,6 +4597,32 @@ impl RuntimeMetrics {
     /// so drop sites don't have to deref through `backpressure_metrics()`.
     pub fn record_segment_dropped(&self, pane_id: u64) {
         self.backpressure.record_segment_dropped(pane_id);
+    }
+
+    /// Count one captured segment of `bytes` for `pane_id` (ft-wl9rx).
+    pub fn record_pane_output(&self, pane_id: u64, bytes: usize) {
+        let mut panes = self
+            .pane_output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let totals = panes.entry(pane_id).or_default();
+        totals.bytes = totals
+            .bytes
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+        totals.segments = totals.segments.saturating_add(1);
+    }
+
+    /// Per-pane output totals, dropping panes no longer observed.
+    pub fn pane_output_totals_retaining(
+        &self,
+        observed: &HashSet<u64>,
+    ) -> HashMap<u64, PaneOutputTotals> {
+        let mut panes = self
+            .pane_output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        panes.retain(|pane_id, _| observed.contains(pane_id));
+        panes.clone()
     }
 
     /// Get average ingest lag in milliseconds.
@@ -5823,6 +5956,8 @@ impl ObservationRuntime {
                 None::<FleetCoordinatorMaintenanceState>;
             let mut last_fleet_coordinator_observed_state =
                 None::<FleetCoordinatorMaintenanceState>;
+            // ft-wl9rx: totals at the previous health tick, for output rates.
+            let mut previous_pane_output = None::<(u64, HashMap<u64, PaneOutputTotals>)>;
 
             loop {
                 if !first_tick {
@@ -6669,6 +6804,17 @@ impl ObservationRuntime {
                     RuntimeLockMemoryTelemetrySnapshot::update_global(
                         metrics.lock_memory_snapshot(),
                     );
+                    let pane_output = metrics
+                        .pane_output_totals_retaining(&observed_pane_ids.iter().copied().collect());
+                    PaneOutputRatesSnapshot::update_global(PaneOutputRatesSnapshot::between(
+                        previous_pane_output
+                            .as_ref()
+                            .map(|(at, totals)| (*at, totals)),
+                        &pane_output,
+                        snapshot_timestamp,
+                        &metrics.backpressure_metrics().segments_dropped_by_pane(),
+                    ));
+                    previous_pane_output = Some((snapshot_timestamp, pane_output));
                     // Health work includes several locks, storage probes, mux
                     // probes, and coordinator I/O; cadence starts only once
                     // that complete snapshot has actually been published.
@@ -9608,6 +9754,7 @@ impl ObservationRuntime {
                         }
                     }
                     let pane_id = event.segment.pane_id;
+                    metrics.record_pane_output(pane_id, event.segment.content.len());
                     incarnation_state.prepare_event_incarnation(pane_id, pane_incarnation);
                     let bounded_segment =
                         bounded_segment_for_persistence(&event.segment, max_persist_segment_bytes);
@@ -20840,6 +20987,45 @@ mod tests {
             assert!(adapter_probe.is_enabled());
             assert_eq!(adapter_probe.total_captured(), events.len() as u64);
         });
+    }
+
+    #[test]
+    fn pane_output_rates_rank_the_flooding_pane_first() {
+        let metrics = RuntimeMetrics::default();
+        metrics.record_pane_output(1, 100);
+        metrics.record_pane_output(2, 10);
+        metrics.record_pane_output(9, 5); // closes before the next tick
+        let observed: HashSet<u64> = [1, 2, 3].into_iter().collect();
+        let first = metrics.pane_output_totals_retaining(&observed);
+        assert!(!first.contains_key(&9), "unobserved panes are pruned");
+
+        let opening = PaneOutputRatesSnapshot::between(None, &first, 1_000, &HashMap::new());
+        assert_eq!(opening.window_ms, 0);
+        assert!(opening.panes.iter().all(|pane| pane.bytes_per_sec.abs() < f64::EPSILON));
+        assert_eq!(opening.panes[0].pane_id, 1, "totals order the first tick");
+
+        // Over the next 2 s pane 2 floods while pane 1 goes quiet.
+        for _ in 0..4 {
+            metrics.record_pane_output(2, 1_000);
+        }
+        metrics.record_segment_dropped(2);
+        let second = metrics.pane_output_totals_retaining(&observed);
+        let rates = PaneOutputRatesSnapshot::between(
+            Some((1_000, &first)),
+            &second,
+            3_000,
+            &metrics.backpressure_metrics().segments_dropped_by_pane(),
+        );
+        assert_eq!(rates.window_ms, 2_000);
+        let top = &rates.panes[0];
+        assert_eq!(top.pane_id, 2);
+        assert!((top.bytes_per_sec - 2_000.0).abs() < f64::EPSILON);
+        assert!((top.segments_per_sec - 2.0).abs() < f64::EPSILON);
+        assert_eq!((top.bytes_total, top.segments_total), (4_010, 5));
+        assert_eq!(top.segments_dropped_total, 1);
+        let quiet = &rates.panes[1];
+        assert_eq!(quiet.pane_id, 1);
+        assert!(quiet.bytes_per_sec.abs() < f64::EPSILON);
     }
 
     #[test]
