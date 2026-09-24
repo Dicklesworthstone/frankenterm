@@ -3995,6 +3995,16 @@ enum RobotCommands {
         /// Treat wait-for pattern as regex
         #[arg(long)]
         wait_for_regex: bool,
+
+        /// Type the text instead of sending it as one bracketed paste. Use this
+        /// to run commands in a shell pane: shells insert a paste into the line
+        /// editor without executing it. The receipt reports `no_paste`.
+        #[arg(long)]
+        no_paste: bool,
+
+        /// Do not append the trailing newline
+        #[arg(long)]
+        no_newline: bool,
     },
 
     /// Wait for a pattern in pane output (single-condition; the composite
@@ -50669,9 +50679,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             wait_for,
                             timeout_secs,
                             wait_for_regex,
+                            no_paste,
+                            no_newline,
                         } => {
-                            let no_paste = false;
-                            let no_newline = false;
                             let redacted_wait_for = wait_for
                                 .as_ref()
                                 .map(|pattern| redact_wait_pattern_for_output(pattern));
@@ -136813,6 +136823,48 @@ A  docs/new-proof.md\n";
     }
 
     #[test]
+    fn cli_robot_send_accepts_no_paste_and_no_newline() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "send",
+            "3",
+            "echo ok",
+            "--no-paste",
+            "--no-newline",
+        ])
+        .expect("robot send typed-input flags should parse");
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot {
+                command:
+                    Some(RobotCommands::Send {
+                        no_paste,
+                        no_newline,
+                        ..
+                    }),
+                ..
+            }) => {
+                assert!(no_paste);
+                assert!(no_newline);
+            }
+            _ => panic!("expected robot send"),
+        }
+        let default = Cli::try_parse_from(["ft", "robot", "send", "3", "echo ok"])
+            .expect("robot send should parse");
+        assert!(matches!(
+            default.command.map(|b| *b),
+            Some(Commands::Robot {
+                command: Some(RobotCommands::Send {
+                    no_paste: false,
+                    no_newline: false,
+                    ..
+                }),
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn cli_robot_send_alias_inject_parses() {
         let cli = Cli::try_parse_from(["ft", "robot", "inject", "2", "echo hi", "--dry-run"])
             .expect("robot inject alias should parse");
@@ -136829,6 +136881,7 @@ A  docs/new-proof.md\n";
                     wait_for,
                     timeout_secs,
                     wait_for_regex,
+                    ..
                 }) => {
                     assert_eq!(pane_id, 2);
                     assert_eq!(text, "echo hi");
@@ -136874,6 +136927,7 @@ A  docs/new-proof.md\n";
                     wait_for,
                     timeout_secs,
                     wait_for_regex,
+                    ..
                 }) => {
                     assert_eq!(pane_id, 2);
                     assert_eq!(text, "echo hi");

@@ -1288,7 +1288,8 @@ ft robot get-text --all --tail 10         # all active panes
 ### Sending input
 
 ```bash
-ft robot send 1 "/compact"                          # send text (auto-detects paste mode)
+ft robot send 1 "/compact"                          # send as one bracketed paste (agent TUIs)
+ft robot send 2 "make test" --no-paste              # type it instead, so a shell pane executes it
 ft robot send 1 "dangerous command" --dry-run       # preview without executing
 ft robot send 1 "y" --wait-for "confirmed"          # send and wait for confirmation
 ft robot send 1 "/compact" --verify-submit          # return submitted-level SubmitReceipt
