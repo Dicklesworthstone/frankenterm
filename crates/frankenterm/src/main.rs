@@ -67564,6 +67564,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 all_checks.push(prompt_evidence_diagnostic_check(&layout.db_path).await);
             }
             all_checks.push(distributed_readiness_diagnostic_check(&config.distributed));
+            all_checks.push(recorder_storage_diagnostic_check(
+                &layout.ft_dir.join("recorder-log"),
+            ));
 
             let runtime_snapshot = load_runtime_health_snapshot(&layout).await;
             let swarm_capacity_summary = runtime_snapshot
@@ -96007,6 +96010,66 @@ fn session_persistence_is_healthy(
         && !report.cleanup_attempt.blocks_cleanup()
 }
 
+/// Recorder files larger than this get a doctor warning (ft-w1nas).
+const RECORDER_STORAGE_WARN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// `ft doctor` row for recorder disk usage. Every captured segment is also
+/// written to the recorder, which has no rotation or retention yet
+/// (ft-w1nas), so its size only grows; surface it before it fills a disk.
+fn recorder_storage_diagnostic_check(recorder_dir: &Path) -> DiagnosticCheck {
+    const FILES: [&str; 4] = [
+        "events.log",
+        "events.sqlite3",
+        "events.sqlite3-wal",
+        "events.sqlite3-shm",
+    ];
+    let sizes: Vec<(&str, u64)> = FILES
+        .iter()
+        .filter_map(|name| {
+            std::fs::metadata(recorder_dir.join(name))
+                .ok()
+                .map(|meta| (*name, meta.len()))
+        })
+        .collect();
+    if sizes.is_empty() {
+        return DiagnosticCheck::ok_with_detail("recorder storage", "no recorder files yet");
+    }
+    let total: u64 = sizes.iter().map(|(_, len)| len).sum();
+    let listing = sizes
+        .iter()
+        .map(|(name, len)| format!("{name} {}", format_bytes_human(*len)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let detail = format!(
+        "{} total ({listing}); the recorder has no rotation or retention yet (ft-w1nas)",
+        format_bytes_human(total)
+    );
+    if total >= RECORDER_STORAGE_WARN_BYTES {
+        DiagnosticCheck::warning(
+            "recorder storage",
+            detail,
+            "Stop the watcher and archive or remove .ft/recorder-log if disk space matters; retention is not automatic yet",
+        )
+    } else {
+        DiagnosticCheck::ok_with_detail("recorder storage", detail)
+    }
+}
+
+fn format_bytes_human(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 /// `ft doctor` row for the distributed-mode security readiness checklist
 /// (ft-7evp3): the rollout guide says doctor verifies security posture, so
 /// run the same go/no-go evaluator the checklist documents.
@@ -102175,6 +102238,29 @@ mod tests {
                 assert!(detail.contains(&item.id), "{detail} missing {}", item.id);
             }
         }
+    }
+
+    #[test]
+    fn recorder_storage_row_reports_sizes_and_warns_when_large() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let empty = recorder_storage_diagnostic_check(dir.path());
+        assert!(matches!(empty.status, DiagnosticStatus::Ok));
+        assert_eq!(empty.detail.as_deref(), Some("no recorder files yet"));
+
+        std::fs::write(dir.path().join("events.log"), vec![0_u8; 3 * 1024]).unwrap();
+        let small = recorder_storage_diagnostic_check(dir.path());
+        assert!(matches!(small.status, DiagnosticStatus::Ok));
+        let detail = small.detail.unwrap_or_default();
+        assert!(detail.contains("events.log 3.0 KiB"), "{detail}");
+        assert!(detail.contains("ft-w1nas"), "{detail}");
+
+        // A sparse file reports its logical length without using real disk.
+        let big = std::fs::File::create(dir.path().join("events.sqlite3")).unwrap();
+        big.set_len(RECORDER_STORAGE_WARN_BYTES).unwrap();
+        let large = recorder_storage_diagnostic_check(dir.path());
+        assert!(matches!(large.status, DiagnosticStatus::Warning));
+        assert_eq!(format_bytes_human(1536), "1.5 KiB");
+        assert_eq!(format_bytes_human(12), "12 B");
     }
 
     fn mission_lifecycle_fixture() -> (
