@@ -4402,10 +4402,12 @@ impl RuntimeMetrics {
     /// healthy state or silently disabling future lifecycle observations.
     #[must_use]
     pub fn crash_loop_diagnostics(&self, now_secs: u64) -> crate::crash::CrashLoopDiagnostics {
-        self.crash_detector
+        let lifecycle = self
+            .crash_detector
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .diagnostics_at(now_secs)
+            .diagnostics_at(now_secs);
+        lifecycle.merged(crate::crash::watcher_supervisor_crash_diagnostics(now_secs))
     }
 
     /// Record an ingest lag sample.

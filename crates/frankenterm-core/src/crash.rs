@@ -8099,8 +8099,9 @@ impl CrashLoopDetector {
 /// Diagnostic summary from a [`CrashLoopDetector`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrashLoopDiagnostics {
-    /// Number of recorded crash observations in the detection window.
-    /// The observation runtime currently supplies pane lifecycle replacements.
+    /// Number of recorded crash observations in the detection window:
+    /// `ft watch` supervisor restarts of the watcher plus observed pane
+    /// lifecycle replacements (see [`CrashLoopDiagnostics::merged`]).
     pub restart_count: u32,
     /// Timestamp of the most recent crash (epoch seconds).
     pub last_crash_at: Option<u64>,
@@ -8110,6 +8111,60 @@ pub struct CrashLoopDiagnostics {
     pub current_backoff_ms: u64,
     /// Whether the detector considers the system in a crash loop.
     pub in_crash_loop: bool,
+}
+
+impl CrashLoopDiagnostics {
+    /// Combine two independent crash sources into one health observation:
+    /// counts add, the most recent crash wins, and either source in a loop
+    /// puts the whole report in a loop.
+    #[must_use]
+    pub fn merged(self, other: Self) -> Self {
+        Self {
+            restart_count: self.restart_count.saturating_add(other.restart_count),
+            last_crash_at: self.last_crash_at.max(other.last_crash_at),
+            consecutive_crashes: self.consecutive_crashes.max(other.consecutive_crashes),
+            current_backoff_ms: self.current_backoff_ms.max(other.current_backoff_ms),
+            in_crash_loop: self.in_crash_loop || other.in_crash_loop,
+        }
+    }
+}
+
+/// Process-wide history of watcher restarts performed by the `ft watch`
+/// supervisor (ft-u6zfw). Every runtime's `HealthSnapshot` merges it, so a
+/// watcher that keeps failing and being restarted reports its crash loop
+/// through `ft status` / `ft robot health` instead of healthy zeros.
+fn watcher_supervisor_detector() -> &'static std::sync::Mutex<CrashLoopDetector> {
+    static DETECTOR: std::sync::OnceLock<std::sync::Mutex<CrashLoopDetector>> =
+        std::sync::OnceLock::new();
+    DETECTOR
+        .get_or_init(|| std::sync::Mutex::new(CrashLoopDetector::new(CrashLoopConfig::default())))
+}
+
+/// Record that the watcher exited with an error and the supervisor is
+/// restarting it. `now_secs` is wall-clock epoch seconds.
+pub fn record_watcher_supervisor_crash(now_secs: u64) {
+    watcher_supervisor_detector()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .record_crash(now_secs);
+}
+
+/// Record that a restarted watcher ran long enough to count as recovered,
+/// resetting the consecutive-crash counter.
+pub fn record_watcher_supervisor_recovery() {
+    watcher_supervisor_detector()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .record_success();
+}
+
+/// Watcher-supervisor crash diagnostics observed at `now_secs`.
+#[must_use]
+pub fn watcher_supervisor_crash_diagnostics(now_secs: u64) -> CrashLoopDiagnostics {
+    watcher_supervisor_detector()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .diagnostics_at(now_secs)
 }
 
 // ---------------------------------------------------------------------------
@@ -11482,6 +11537,36 @@ mod tests {
     // -----------------------------------------------------------------------
     // Crash loop detection + backoff tests (bd-24cz TDD)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn crash_loop_diagnostics_merge_adds_counts_and_keeps_worst_state() {
+        let supervisor = CrashLoopDiagnostics {
+            restart_count: 3,
+            last_crash_at: Some(90),
+            consecutive_crashes: 3,
+            current_backoff_ms: 4_000,
+            in_crash_loop: true,
+        };
+        let lifecycle = CrashLoopDiagnostics {
+            restart_count: 1,
+            last_crash_at: Some(120),
+            consecutive_crashes: 1,
+            current_backoff_ms: 1_000,
+            in_crash_loop: false,
+        };
+        let merged = lifecycle.merged(supervisor);
+        assert_eq!(merged.restart_count, 4);
+        assert_eq!(merged.last_crash_at, Some(120));
+        assert_eq!(merged.consecutive_crashes, 3);
+        assert_eq!(merged.current_backoff_ms, 4_000);
+        assert!(merged.in_crash_loop);
+
+        let quiet = CrashLoopDetector::new(CrashLoopConfig::default()).diagnostics_at(500);
+        let unchanged = quiet.clone().merged(quiet);
+        assert_eq!(unchanged.restart_count, 0);
+        assert_eq!(unchanged.last_crash_at, None);
+        assert!(!unchanged.in_crash_loop);
+    }
 
     #[test]
     fn crash_loop_config_defaults() {

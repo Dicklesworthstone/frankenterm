@@ -42725,6 +42725,17 @@ const WATCHER_MAX_BACKOFF: Duration = Duration::from_secs(60);
 const WATCHER_CRASH_LOOP_THRESHOLD: usize = 3;
 const RECORDER_BACKEND_MIGRATION_EPOCH: &str = "ft.recorder.backend.v1";
 
+/// Publish a supervisor restart to the process-wide crash history that every
+/// runtime `HealthSnapshot` merges (ft-u6zfw), mirroring
+/// [`WatcherCrashLoop::register_crash`]: a run that lasted past
+/// `WATCHER_STABLE_RESET` counts as a recovery before this crash.
+fn publish_watcher_supervisor_crash(runtime: Duration, now_secs: u64) {
+    if runtime >= WATCHER_STABLE_RESET {
+        frankenterm_core::crash::record_watcher_supervisor_recovery();
+    }
+    frankenterm_core::crash::record_watcher_supervisor_crash(now_secs);
+}
+
 struct WatcherCrashLoop {
     crash_times: VecDeque<Instant>,
 }
@@ -46348,6 +46359,10 @@ async fn run_watcher_with_backoff(
 
                 let runtime = started_at.elapsed();
                 let status = crash_loop.register_crash(runtime);
+                publish_watcher_supervisor_crash(
+                    runtime,
+                    u64::try_from(now_epoch_ms() / 1000).unwrap_or(0),
+                );
                 let error_message = err.to_string();
                 let backoff = status.backoff;
 
@@ -101731,6 +101746,36 @@ mod tests {
         });
         mission.lifecycle_state = MissionLifecycleState::AwaitingApproval;
         mission
+    }
+
+    #[test]
+    fn watcher_supervisor_restarts_reach_runtime_health_snapshot() {
+        // ft-u6zfw: the only writer of this process-global history in the bin
+        // test binary; runtime health reads it for every HealthSnapshot.
+        let now = 1_900_000_000;
+        let baseline =
+            frankenterm_core::runtime::RuntimeMetrics::default().crash_loop_diagnostics(now);
+        for offset in 0..3 {
+            publish_watcher_supervisor_crash(Duration::from_millis(50), now + offset);
+        }
+        let health =
+            frankenterm_core::runtime::RuntimeMetrics::default().crash_loop_diagnostics(now + 3);
+        assert!(health.restart_count >= baseline.restart_count + 3);
+        assert!(
+            health.in_crash_loop,
+            "three quick restarts are a crash loop"
+        );
+        assert_eq!(health.last_crash_at, Some(now + 2));
+        assert!(health.consecutive_crashes >= 3);
+        assert!(health.current_backoff_ms > 0);
+
+        publish_watcher_supervisor_crash(WATCHER_STABLE_RESET, now + 4);
+        let recovered =
+            frankenterm_core::runtime::RuntimeMetrics::default().crash_loop_diagnostics(now + 4);
+        assert_eq!(
+            recovered.consecutive_crashes, 1,
+            "a crash after a stable run restarts the consecutive count"
+        );
     }
 
     fn mission_lifecycle_fixture() -> (
