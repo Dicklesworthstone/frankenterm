@@ -67523,6 +67523,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             if let Some(report) = session_report.as_ref() {
                 all_checks.push(session_recovery_diagnostic_check(report));
             }
+            if layout.db_path.exists() {
+                all_checks.push(prompt_evidence_diagnostic_check(&layout.db_path).await);
+            }
 
             let runtime_snapshot = load_runtime_health_snapshot(&layout).await;
             let swarm_capacity_summary = runtime_snapshot
@@ -95945,6 +95948,90 @@ fn session_persistence_is_healthy(
         && !report.cleanup_attempt.blocks_cleanup()
 }
 
+/// Observed panes whose prompt evidence `ft doctor` inspects (ft-xxfwy.12).
+const PROMPT_EVIDENCE_PANE_LIMIT: usize = 50;
+
+/// `ft doctor` row: which observed panes show OSC 133 prompt markers in their
+/// recent captured output. Uses the same storage derivation the send policy
+/// uses, so a pane listed here as missing is one where an untrusted
+/// `ft robot send` gets `policy.prompt_unknown`.
+async fn prompt_evidence_diagnostic_check(db_path: &Path) -> DiagnosticCheck {
+    let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+    let storage =
+        match frankenterm_core::storage::StorageHandle::new(&db_path.to_string_lossy()).await {
+            Ok(storage) => storage,
+            Err(error) => {
+                return DiagnosticCheck::warning(
+                    "prompt evidence",
+                    format!("storage unavailable: {error}"),
+                    "Run 'ft watch' so pane output is captured",
+                );
+            }
+        };
+    let panes = match storage.get_panes_with_cx(&cx).await {
+        Ok(panes) => panes,
+        Err(error) => {
+            return DiagnosticCheck::warning(
+                "prompt evidence",
+                format!("pane query failed: {error}"),
+                "Run 'ft watch' so pane output is captured",
+            );
+        }
+    };
+    let mut inspected = 0_usize;
+    let mut missing = Vec::new();
+    for pane in panes
+        .iter()
+        .filter(|pane| pane.observed)
+        .take(PROMPT_EVIDENCE_PANE_LIMIT)
+    {
+        inspected += 1;
+        match frankenterm_core::pane_capability_resolution::derive_osc_state_from_storage(
+            &cx,
+            &storage,
+            pane.pane_id,
+        )
+        .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => missing.push(pane.pane_id),
+        }
+    }
+    let _ = storage.shutdown().await;
+    prompt_evidence_check_from(inspected, &missing)
+}
+
+fn prompt_evidence_check_from(inspected: usize, missing: &[u64]) -> DiagnosticCheck {
+    if inspected == 0 {
+        return DiagnosticCheck::ok_with_detail(
+            "prompt evidence",
+            "no observed panes captured yet",
+        );
+    }
+    if missing.is_empty() {
+        return DiagnosticCheck::ok_with_detail(
+            "prompt evidence",
+            format!("all {inspected} observed panes show OSC 133 prompt markers"),
+        );
+    }
+    let shown: Vec<String> = missing.iter().take(10).map(u64::to_string).collect();
+    let more = missing.len().saturating_sub(shown.len());
+    DiagnosticCheck::warning(
+        "prompt evidence",
+        format!(
+            "{}/{inspected} observed panes have no OSC 133 prompt markers (panes {}{}); untrusted sends to them return policy.prompt_unknown",
+            missing.len(),
+            shown.join(", "),
+            if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            }
+        ),
+        "Run 'ft setup shell' in those panes' shells (bash/zsh/fish) and keep 'ft watch' running",
+    )
+}
+
 fn session_recovery_diagnostic_check(
     report: &frankenterm_core::session_restore::SessionDoctorReport,
 ) -> DiagnosticCheck {
@@ -101876,6 +101963,75 @@ mod tests {
             recovered.consecutive_crashes, 1,
             "a crash after a stable run restarts the consecutive count"
         );
+    }
+
+    #[test]
+    fn prompt_evidence_check_names_missing_panes_and_the_fix() {
+        let none = prompt_evidence_check_from(0, &[]);
+        assert!(matches!(none.status, DiagnosticStatus::Ok));
+
+        let all = prompt_evidence_check_from(3, &[]);
+        assert!(matches!(all.status, DiagnosticStatus::Ok));
+        assert!(all.detail.as_deref().unwrap_or("").contains("all 3"));
+
+        let missing: Vec<u64> = (1..=12).collect();
+        let some = prompt_evidence_check_from(20, &missing);
+        assert!(matches!(some.status, DiagnosticStatus::Warning));
+        let detail = some.detail.unwrap_or_default();
+        assert!(detail.starts_with("12/20"), "{detail}");
+        assert!(detail.contains("and 2 more"), "{detail}");
+        assert!(detail.contains("policy.prompt_unknown"), "{detail}");
+        assert!(
+            some.recommendation
+                .unwrap_or_default()
+                .contains("ft setup shell")
+        );
+    }
+
+    #[test]
+    fn prompt_evidence_check_reads_osc133_markers_from_real_storage() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir.path().join("ft.db");
+            let storage = frankenterm_core::storage::StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage");
+            for pane_id in [1_u64, 2] {
+                storage
+                    .upsert_pane(frankenterm_core::storage::PaneRecord {
+                        pane_id,
+                        pane_uuid: None,
+                        domain: "local".to_string(),
+                        window_id: None,
+                        tab_id: None,
+                        title: None,
+                        cwd: None,
+                        tty_name: None,
+                        first_seen_at: 1_700_000_000_000,
+                        last_seen_at: 1_700_000_000_000,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    })
+                    .await
+                    .expect("seed pane");
+            }
+            storage
+                .append_segment(1, "\x1b]133;A\x07$ ", None)
+                .await
+                .expect("prompt segment");
+            storage
+                .append_segment(2, "plain output without prompt markers\n", None)
+                .await
+                .expect("plain segment");
+            storage.shutdown().await.expect("shutdown");
+
+            let check = prompt_evidence_diagnostic_check(&db_path).await;
+            assert!(matches!(check.status, DiagnosticStatus::Warning));
+            let detail = check.detail.unwrap_or_default();
+            assert!(detail.starts_with("1/2"), "{detail}");
+            assert!(detail.contains("panes 2"), "{detail}");
+        });
     }
 
     fn mission_lifecycle_fixture() -> (
