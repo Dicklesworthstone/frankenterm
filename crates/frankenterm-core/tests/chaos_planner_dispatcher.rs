@@ -792,9 +792,10 @@ fn b6_compensation_failure_cascade() {
     )
     .unwrap();
 
-    // Now compensate with a failure at step 2.
+    // Now compensate the committed prefix (s1, s2) with a failure at s2.
+    // Compensation rejects inputs for steps that never committed.
     let comp_contract = build_contract("b6", NUM_STEPS, MissionTxState::Compensating);
-    let comp_inputs = partial_comp_inputs(NUM_STEPS, 2);
+    let comp_inputs = partial_comp_inputs(2, 2);
     let comp_report =
         execute_compensation_phase(&comp_contract, &commit_report, &comp_inputs, 20_000).unwrap();
 
@@ -1125,9 +1126,16 @@ fn c7_dedup_guard_ttl_eviction() {
     let key2 = IdempotencyKey::new("plan-c7", "s2", "action-2");
     let key3 = IdempotencyKey::new("plan-c7", "s3", "action-3");
 
-    guard.record(&key1, "exec-1", StepOutcome::Success { result: None }, 1000);
-    guard.record(&key2, "exec-1", StepOutcome::Success { result: None }, 2000);
-    guard.record(&key3, "exec-1", StepOutcome::Success { result: None }, 5000);
+    // Successes are sticky replay proofs and never TTL-expire; failures do,
+    // so a deliberate retry with the same key is possible.
+    let failed = || StepOutcome::Failed {
+        error_code: "FTX9999".into(),
+        error_message: "exec_error".into(),
+        compensated: false,
+    };
+    guard.record(&key1, "exec-1", failed(), 1000);
+    guard.record(&key2, "exec-1", failed(), 2000);
+    guard.record(&key3, "exec-1", failed(), 5000);
 
     assert_eq!(guard.len(), 3, "[C7] should have 3 entries before eviction");
 
