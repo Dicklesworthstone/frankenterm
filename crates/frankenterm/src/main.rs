@@ -2766,6 +2766,10 @@ enum RobotIncidentCommands {
 
     /// Emit deterministic read-only structural replay frames
     Replay(RobotIncidentReadArgs),
+
+    /// Compile a redacted incident autopsy: manifest, Markdown report,
+    /// source hashes, and evidence-cited root-cause hypotheses
+    Autopsy(RobotIncidentReadArgs),
 }
 
 #[derive(Subcommand)]
@@ -12383,6 +12387,18 @@ fn handle_robot_incident_command(
             store
                 .replay_payload(&args.incident_id)
                 .map(serde_json::to_value)
+        }
+        RobotIncidentCommands::Autopsy(args) => {
+            let store = match build_robot_incident_store(&args.source) {
+                Ok(store) => store,
+                Err(error) => return robot_incident_error_response(error, elapsed_ms),
+            };
+            store.autopsy_input(&args.incident_id).map(|input| {
+                serde_json::to_value(
+                    frankenterm_core::incident_autopsy::IncidentAutopsyCompiler::default()
+                        .compile(input),
+                )
+            })
         }
     };
 
@@ -133581,7 +133597,7 @@ printf x > "$MINISIGN_MARKER"
             _ => panic!("expected Robot command"),
         }
 
-        for surface in ["show", "explain", "replay"] {
+        for surface in ["show", "explain", "replay", "autopsy"] {
             let cli = Cli::try_parse_from([
                 "ft",
                 "robot",
@@ -133611,12 +133627,63 @@ printf x > "$MINISIGN_MARKER"
                         Some(RobotCommands::Incidents {
                             command: RobotIncidentCommands::Replay(args),
                         }),
+                    )
+                    | (
+                        "autopsy",
+                        Some(RobotCommands::Incidents {
+                            command: RobotIncidentCommands::Autopsy(args),
+                        }),
                     ) => assert_eq!(args.incident_id, "ft-ogr3n2-valid"),
                     _ => panic!("expected RobotCommands::Incidents::{surface}"),
                 },
                 _ => panic!("expected Robot command"),
             }
         }
+    }
+
+    #[test]
+    fn robot_incidents_autopsy_compiles_bundle_from_source_set() {
+        let source_set = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("fixtures")
+            .join("flight-recorder")
+            .join("source-adapters")
+            .join("valid-source-set.json");
+        let read = |incident_id: &str| RobotIncidentReadArgs {
+            incident_id: incident_id.to_string(),
+            source: RobotIncidentSourceArgs {
+                source_set: source_set.clone(),
+                source_incident_id: None,
+                generated_at_ms: Some(1_778_000_100_000),
+            },
+        };
+
+        let response = handle_robot_incident_command(
+            &RobotIncidentCommands::Autopsy(read("ft-ogr3n2-valid")),
+            7,
+        );
+        assert!(response.ok, "autopsy should succeed: {:?}", response.error);
+        let data = response.data.expect("autopsy payload");
+        let manifest = &data["manifest"];
+        assert_eq!(manifest["session_id"], "incident:ft-ogr3n2-valid");
+        assert!(manifest["causal_node_count"].as_u64().unwrap_or(0) > 0);
+        assert!(
+            !manifest["hypotheses"]
+                .as_array()
+                .expect("hypotheses array")
+                .is_empty()
+        );
+        assert!(
+            data["report_markdown"]
+                .as_str()
+                .expect("markdown report")
+                .contains("incident:ft-ogr3n2-valid")
+        );
+
+        let missing =
+            handle_robot_incident_command(&RobotIncidentCommands::Autopsy(read("missing")), 7);
+        assert!(!missing.ok, "an unknown incident must fail closed");
     }
 
     #[test]

@@ -569,6 +569,191 @@ impl IncidentSurfaceStore {
         })
     }
 
+    /// Assemble the redacted incident autopsy compiler input for one incident
+    /// (ft-ske0k): the causal DAG, evidence references, proof coverage and
+    /// gaps become source artifacts, replay frames become the timeline, and
+    /// every DAG root-cause candidate becomes an evidence-cited hypothesis.
+    pub fn autopsy_input(
+        &self,
+        incident_id: &str,
+    ) -> Result<frankenterm_core::incident_autopsy::IncidentAutopsyInput, IncidentSurfaceError>
+    {
+        use frankenterm_core::explainability_console::{
+            CausalEvidenceKind, CausalGraphEdge, CausalGraphNode, CausalNodeKind,
+        };
+        use frankenterm_core::incident_autopsy::{
+            IncidentArtifactKind, IncidentAutopsyInput, IncidentEvidenceCitation,
+            IncidentRootCauseHypothesis, IncidentSourceArtifact, IncidentTimelineEntry,
+            IncidentWindow,
+        };
+        use frankenterm_core_replay_types::incident_dag::IncidentDagEdgeKind;
+
+        const DAG_ARTIFACT: &str = "causal-dag";
+        const REPLAY_ARTIFACT: &str = "replay-transcript";
+
+        let show = self.show_payload(incident_id)?;
+        let explain = self.explain_payload(incident_id)?;
+        let replay = self.replay_payload(incident_id)?;
+
+        let mut input = IncidentAutopsyInput::new(
+            format!("incident:{}", show.incident.incident_id),
+            show.generated_at_ms,
+        );
+        if let (Some(start_ms), Some(end_ms)) =
+            (show.incident.first_event_ms, show.incident.last_event_ms)
+        {
+            input.window = Some(IncidentWindow { start_ms, end_ms });
+        }
+
+        input.artifacts.push(IncidentSourceArtifact::included(
+            DAG_ARTIFACT,
+            IncidentArtifactKind::CausalGraph,
+            "incident causal DAG",
+            autopsy_json(&show.dag),
+        ));
+        input.artifacts.push(IncidentSourceArtifact::included(
+            "proof-coverage",
+            IncidentArtifactKind::Other,
+            format!("proof coverage ({})", explain.reason_code),
+            autopsy_json(&show.proof_coverage),
+        ));
+        if show.gaps.is_empty() {
+            input.artifacts.push(IncidentSourceArtifact::excluded(
+                "explanation-gaps",
+                IncidentArtifactKind::Other,
+                "unexplained DAG gaps",
+                "the incident DAG reported no unexplained gaps",
+            ));
+        } else {
+            input.artifacts.push(IncidentSourceArtifact::included(
+                "explanation-gaps",
+                IncidentArtifactKind::Other,
+                "unexplained DAG gaps",
+                autopsy_json(&show.gaps),
+            ));
+        }
+        for (index, evidence) in show.evidence_refs.iter().enumerate() {
+            input.artifacts.push(IncidentSourceArtifact::included(
+                format!("evidence-{index}"),
+                IncidentArtifactKind::Other,
+                format!("{} evidence for {}", evidence.kind, evidence.event_id),
+                autopsy_json(evidence),
+            ));
+        }
+        input.artifacts.push(IncidentSourceArtifact::included(
+            REPLAY_ARTIFACT,
+            IncidentArtifactKind::ReplayInstructions,
+            "structural replay transcript",
+            autopsy_json(&replay.frames),
+        ));
+
+        input.timeline = replay
+            .frames
+            .iter()
+            .map(|frame| IncidentTimelineEntry {
+                timestamp_ms: frame.occurred_at_ms,
+                label: format!(
+                    "{}/{}: {}",
+                    source_label(frame.source),
+                    class_label(frame.event_class),
+                    frame.summary
+                ),
+                citations: vec![IncidentEvidenceCitation::new(
+                    REPLAY_ARTIFACT,
+                    frame.event_id.clone(),
+                    class_label(frame.event_class),
+                )],
+            })
+            .collect();
+
+        input.causal_nodes = show
+            .dag
+            .nodes
+            .iter()
+            .map(|node| {
+                let kind = match node.event_class {
+                    CausalEventClass::PolicyDenial => CausalNodeKind::PolicyDecision,
+                    CausalEventClass::OperatorCancellation => CausalNodeKind::UserAction,
+                    _ => CausalNodeKind::PaneEvent,
+                };
+                let mut graph_node = CausalGraphNode::new(
+                    node.event_id.clone(),
+                    kind,
+                    node.occurred_at_ms,
+                    format!(
+                        "{}/{}",
+                        source_label(node.source),
+                        class_label(node.event_class)
+                    ),
+                )
+                .with_context("source", source_label(node.source))
+                .with_context("event_class", class_label(node.event_class));
+                if let Some(pane_id) = node.correlation.pane_id {
+                    graph_node = graph_node.with_pane_id(pane_id);
+                }
+                graph_node
+            })
+            .collect();
+        input.causal_edges = show
+            .dag
+            .edges
+            .iter()
+            .map(|edge| CausalGraphEdge {
+                from: edge.from_event_id.clone(),
+                to: edge.to_event_id.clone(),
+                evidence: match edge.kind {
+                    IncidentDagEdgeKind::ExplicitParent
+                    | IncidentDagEdgeKind::ExplicitCause
+                    | IncidentDagEdgeKind::ExplicitRoot => CausalEvidenceKind::Observed,
+                    IncidentDagEdgeKind::TemporalProximity => CausalEvidenceKind::Temporal,
+                    _ => CausalEvidenceKind::Inferred,
+                },
+                confidence_bps: edge.confidence_millis.saturating_mul(10).min(10_000),
+                source: "incident_dag".to_string(),
+                description: Some(edge.explanation.clone()),
+            })
+            .collect();
+
+        let candidates = &show.root_cause_candidates;
+        let score_bps = u16::try_from(10_000 / candidates.len().max(1)).unwrap_or(10_000);
+        input.hypotheses = candidates
+            .iter()
+            .map(|candidate| {
+                let mut hypothesis = IncidentRootCauseHypothesis::evidence_cited(
+                    format!("root:{}", candidate.event_id),
+                    format!(
+                        "{} event from {} is a DAG root-cause candidate ({})",
+                        class_label(candidate.event_class),
+                        source_label(candidate.source),
+                        explain.reason_code
+                    ),
+                    score_bps,
+                    vec![IncidentEvidenceCitation::new(
+                        DAG_ARTIFACT,
+                        candidate.event_id.clone(),
+                        class_label(candidate.event_class),
+                    )],
+                );
+                hypothesis.notes.push(
+                    "score is uniform across the DAG's root-cause candidates, not a learned likelihood"
+                        .to_string(),
+                );
+                hypothesis
+            })
+            .collect();
+
+        input
+            .replay_commands
+            .push(match &show.incident.source_artifact {
+                Some(source_set) => format!(
+                    "ft robot incidents replay {} --source-set {source_set}",
+                    show.incident.incident_id
+                ),
+                None => format!("ft robot incidents replay {}", show.incident.incident_id),
+            });
+        Ok(input)
+    }
+
     fn require_incident(
         &self,
         incident_id: &str,
@@ -1129,6 +1314,13 @@ fn distinct_optional_strings<'a>(values: impl Iterator<Item = Option<&'a str>>) 
     out
 }
 
+/// Compact JSON for an autopsy source artifact; the compiler redacts and
+/// hashes it. A serialization failure is carried as content, never dropped.
+fn autopsy_json<T: Serialize + ?Sized>(value: &T) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|error| format!("{{\"serialization_error\":\"{error}\"}}"))
+}
+
 const fn source_label(source: SwarmCausalEventSource) -> &'static str {
     match source {
         SwarmCausalEventSource::Pane => "pane",
@@ -1289,6 +1481,52 @@ mod tests {
                 "{scenario_id} leaked forbidden substring {needle}: {rendered}"
             );
         }
+    }
+
+    #[test]
+    fn autopsy_input_compiles_a_cited_redacted_bundle_from_a_real_source_set() {
+        use frankenterm_core::incident_autopsy::{
+            IncidentAutopsyCompiler, IncidentHypothesisClass,
+        };
+
+        let store = store(VALID_SOURCE_SET);
+        let show = store.show_payload("ft-ogr3n2-valid").unwrap();
+        let replay = store.replay_payload("ft-ogr3n2-valid").unwrap();
+        let input = store.autopsy_input("ft-ogr3n2-valid").unwrap();
+
+        assert_eq!(input.session_id, "incident:ft-ogr3n2-valid");
+        assert_eq!(input.causal_nodes.len(), show.dag.nodes.len());
+        assert_eq!(input.causal_edges.len(), show.dag.edges.len());
+        assert_eq!(input.timeline.len(), replay.frames.len());
+        assert_eq!(input.hypotheses.len(), show.root_cause_candidates.len());
+        assert!(
+            !input.hypotheses.is_empty(),
+            "fixture has root-cause candidates"
+        );
+        assert!(input.window.is_some(), "fixture events carry timestamps");
+
+        let compiler = IncidentAutopsyCompiler::default();
+        let bundle = compiler.compile(input.clone());
+        assert_eq!(bundle.manifest.causal_node_count, show.dag.nodes.len());
+        assert_eq!(bundle.manifest.timeline_entry_count, replay.frames.len());
+        assert!(bundle.manifest.hypotheses.iter().all(|hypothesis| {
+            hypothesis.class == IncidentHypothesisClass::EvidenceCited
+                && !hypothesis.citations.is_empty()
+        }));
+        assert!(bundle.report_markdown.contains("incident:ft-ogr3n2-valid"));
+        assert!(
+            bundle
+                .manifest
+                .replay_commands
+                .iter()
+                .any(|command| command.starts_with("ft robot incidents replay ft-ogr3n2-valid"))
+        );
+        assert_eq!(
+            compiler.compile(input).manifest.reproducible_hash,
+            bundle.manifest.reproducible_hash,
+            "the autopsy must be deterministic for the same source set"
+        );
+        assert!(store.autopsy_input("missing").is_err());
     }
 
     #[test]

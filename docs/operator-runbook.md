@@ -961,6 +961,17 @@ ft robot --format toon incidents replay ft-ogr3n6-agent-mail-outage-beads-fallba
   --source-set fixtures/flight-recorder/incident-corpus/source-sets/agent-mail-outage-beads-fallback.json
 ```
 
+`autopsy` compiles the same incident into a redacted post-mortem bundle:
+`data.manifest` (deterministic `reproducible_hash`, source hashes,
+evidence-cited root-cause hypotheses, replay commands), `data.report_markdown`
+for humans, and a per-artifact inclusion/exclusion log. Hypothesis scores are
+uniform across the DAG's root-cause candidates, not learned likelihoods.
+
+```bash
+ft robot incidents autopsy ft-ogr3n6-remote-cargo-pass \
+  --source-set fixtures/flight-recorder/incident-corpus/source-sets/remote-cargo-pass.json
+```
+
 Useful `list` filters:
 
 ```bash
