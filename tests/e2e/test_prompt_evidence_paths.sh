@@ -13,6 +13,8 @@
 #                           `ft setup shell`, doctor "prompt evidence" warning
 #   either, no watcher   -> robot.approval_error naming `ft watch` (never a raw
 #                           FOREIGN KEY failure)
+#   `ft tx run` with a prompt_active precondition commits on the integrated pane
+#   and is denied at prepare (typed prompt_active.inactive reason) on the bare one.
 #
 # Needs native `ft` and `frankenterm-mux-server` binaries: set FT_BIN_DIR (default
 # target/debug). Envelopes, doctor output and watcher/mux logs are retained under
@@ -121,6 +123,28 @@ scenario() { # name  pane-command...
     sleep 4
     ft robot send "$PANE" "echo ok" --no-paste > "$OUT/$name.watch.json" 2> "$OUT/$name.watch.err"
     ft doctor --json > "$OUT/$name.doctor.json" 2> /dev/null
+    # Contracts must live inside the workspace root.
+    python3 - "$PANE" "$name" > "$D/tx-contract.json" <<'PY'
+import json, sys, time
+pane, name = int(sys.argv[1]), sys.argv[2]
+tx = f"e2e-prompt-{name}"
+print(json.dumps({
+    "tx_version": 1,
+    "intent": {"tx_id": tx, "requested_by": "operator", "summary": "prompt_active gate",
+               "correlation_id": tx, "created_at_ms": int(time.time() * 1000)},
+    "plan": {"plan_id": f"plan-{tx}", "tx_id": tx,
+             "steps": [{"step_id": "s1", "ordinal": 0,
+                        "action": {"type": "send_text", "pane_id": pane, "text": "echo tx"},
+                        "description": "send at the prompt"}],
+             "preconditions": [{"prompt_active": {"pane_id": pane}}],
+             "compensations": []},
+    "lifecycle_state": "planned", "outcome": "pending", "receipts": [],
+}))
+PY
+    ft tx run --contract-file "$D/tx-contract.json" --format json \
+        > "$OUT/$name.tx-run.json" 2> "$OUT/$name.tx-run.err"
+    echo "tx exit=$?" >> "$OUT/$name.tx-run.err"
+    cp "$D/tx-contract.json" "$OUT/$name.tx-contract.json"
 
     if [[ "$name" == integrated ]]; then
         detail=$(json_expr "$OUT/$name.watch.json" \
@@ -128,12 +152,18 @@ scenario() { # name  pane-command...
         check "$name/watcher send allowed on prompt evidence" $? "$detail"
         detail=$(json_expr "$OUT/$name.doctor.json" 'doctor.get("prompt evidence", {}).get("status") == "ok"')
         check "$name/doctor prompt evidence ok" $? "$detail"
+        detail=$(json_expr "$OUT/$name.tx-run.json" \
+            '(d.get("data") or {}).get("final_state") == "committed" and d["data"]["prepare_report"]["gate_inputs"][0]["preconditions_satisfied"] is True')
+        check "$name/tx prompt_active precondition passes and commits" $? "$detail"
     else
         detail=$(json_expr "$OUT/$name.watch.json" \
             'inj.get("status") == "requires_approval" and dec.get("rule_id") == "policy.prompt_unknown" and "ft setup shell" in dec.get("reason","")')
         check "$name/watcher send needs approval naming ft setup shell" $? "$detail"
         detail=$(json_expr "$OUT/$name.doctor.json" 'doctor.get("prompt evidence", {}).get("status") == "warning"')
         check "$name/doctor prompt evidence warns" $? "$detail"
+        detail=$(json_expr "$OUT/$name.tx-run.json" \
+            '(d.get("data") or {}).get("final_state") == "failed" and d["data"]["prepare_report"]["outcome"] == "denied" and d["data"]["prepare_report"]["gate_inputs"][0].get("precondition_reason_code", "").startswith("tx.prepare.precondition.prompt_active.inactive") and "commit_report" not in d["data"]')
+        check "$name/tx prompt_active precondition fails closed at prepare" $? "$detail"
     fi
 
     kill "$WATCH" 2> /dev/null; wait "$WATCH" 2> /dev/null
