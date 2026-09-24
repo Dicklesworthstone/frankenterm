@@ -68,6 +68,9 @@ EXPECTED_FAIL=0
 SKIPPED=0
 RCH_SUBSTRATE_BLOCKED=false
 FINALIZED=0
+# Exit status seen by finalize; an abort (e.g. a FATAL remote stall) must
+# never be summarized as "passed" just because no failed row was recorded.
+FINAL_RC=0
 
 UNRESOLVED_SLOT_COUNT=0
 DEFERRED_SLOT_COUNT=0
@@ -214,6 +217,7 @@ write_summary() {
         --argjson hedge_match_count "${HEDGE_MATCH_COUNT}" \
         --argjson checklist_ref_count "${CHECKLIST_REF_COUNT}" \
         --argjson rch_substrate_blocked "${RCH_SUBSTRATE_BLOCKED}" \
+        --argjson exit_rc "${FINAL_RC}" \
         --argjson selected_workers "${selected_workers}" \
         --argjson remote_cargo_reached "${remote_cargo_reached}" \
         --argjson remote_rustc_reached "${remote_rustc_reached}" \
@@ -224,7 +228,8 @@ write_summary() {
           scenario_id: $scenario_id,
           run_id: $run_id,
           correlation_id: $correlation_id,
-          status: (if $rch_substrate_blocked then "rch_substrate_blocked" elif $fail_count == 0 then "passed" else "failed" end),
+          status: (if $rch_substrate_blocked then "rch_substrate_blocked" elif $exit_rc != 0 and $fail_count == 0 then "aborted" elif $fail_count == 0 then "passed" else "failed" end),
+          exit_rc: $exit_rc,
           artifact_dir: $artifact_dir,
           remote_cargo_target_dir: $remote_target_dir,
           bundle_path: $bundle_path,
@@ -283,6 +288,7 @@ finalize() {
         exit "${rc}"
     fi
     FINALIZED=1
+    FINAL_RC="${rc}"
     if [[ ! -f "${RESOLUTION_FILE}" ]]; then
         jq -n '{status:"not_generated"}' >"${RESOLUTION_FILE}"
     fi
