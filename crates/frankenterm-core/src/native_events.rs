@@ -178,6 +178,76 @@ struct NativeListenerAnomalyCounters {
     rejected_peers: AtomicU64,
 }
 
+/// Pane-output bytes a connection dropped under channel backpressure and has
+/// not yet announced (ft-wtd5g). Before that pane's next frame is dispatched
+/// the loss is sent as an empty-data `PaneOutput` carrying `dropped_bytes`,
+/// which the consumer turns into an explicit capture gap, so replay records
+/// the hole instead of a silently spliced stream.
+#[cfg(any(unix, windows))]
+#[derive(Debug, Default)]
+struct PendingNativeLoss {
+    by_pane: std::collections::HashMap<u64, u64>,
+}
+
+/// Panes with unannounced loss tracked per connection; beyond this the loss
+/// is only counted in the backpressure telemetry.
+#[cfg(any(unix, windows))]
+const MAX_PENDING_LOSS_PANES: usize = 4096;
+
+#[cfg(any(unix, windows))]
+impl PendingNativeLoss {
+    /// Bytes this event would lose if dropped (pane output only).
+    fn bytes_at_risk(event: &NativeEvent) -> Option<(u64, u64)> {
+        match event {
+            NativeEvent::PaneOutput {
+                pane_id,
+                data,
+                dropped_bytes,
+                ..
+            } => Some((*pane_id, (data.len() as u64).saturating_add(*dropped_bytes))),
+            _ => None,
+        }
+    }
+
+    /// Record `bytes` of `pane_id` output lost to backpressure.
+    fn record(&mut self, pane_id: u64, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        if let Some(pending) = self.by_pane.get_mut(&pane_id) {
+            *pending = pending.saturating_add(bytes);
+        } else if self.by_pane.len() < MAX_PENDING_LOSS_PANES {
+            self.by_pane.insert(pane_id, bytes);
+        }
+    }
+
+    /// The gap marker to dispatch ahead of `event`, if its pane has
+    /// unannounced loss.
+    fn marker_before(&self, event: &NativeEvent) -> Option<NativeEvent> {
+        let NativeEvent::PaneOutput {
+            pane_id,
+            timestamp_ms,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        self.by_pane
+            .get(pane_id)
+            .map(|&dropped_bytes| NativeEvent::PaneOutput {
+                pane_id: *pane_id,
+                data: Vec::new(),
+                timestamp_ms: *timestamp_ms,
+                dropped_bytes,
+            })
+    }
+
+    /// The marker for `pane_id` was delivered.
+    fn announced(&mut self, pane_id: u64) {
+        self.by_pane.remove(&pane_id);
+    }
+}
+
 #[cfg(any(unix, windows))]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct NativeConnectionDropCounts {
@@ -1593,6 +1663,7 @@ async fn handle_connection_with_cx(
 ) -> Result<(), std::io::Error> {
     debug!("native event connection accepted (cx path)");
     let mut drops = NativeConnectionDropCounts::default();
+    let mut pending_loss = PendingNativeLoss::default();
     // Keep every fallible read-loop exit inside this result. The single
     // finalizer below must observe accumulated drops before returning the
     // original success or I/O error to the listener task.
@@ -1634,17 +1705,27 @@ async fn handle_connection_with_cx(
             match decode_wire_event(&line) {
                 Ok(Some(event)) => {
                     let (event_kind, pane_id) = event_metadata(&event);
+                    if let Some(marker) = pending_loss.marker_before(&event) {
+                        if matches!(
+                            dispatch_event_with_cx(&cx, &event_tx, marker).await,
+                            EventDispatchOutcome::Sent
+                        ) {
+                            pending_loss.announced(pane_id);
+                        }
+                    }
+                    let at_risk = PendingNativeLoss::bytes_at_risk(&event);
                     match dispatch_event_with_cx(&cx, &event_tx, event).await {
                         EventDispatchOutcome::Sent => {
                             debug!(event_kind, pane_id, "native event dispatched (cx path)");
                         }
                         EventDispatchOutcome::Backpressure => {
-                            // ft-wtd5g: a dropped event here is silent data loss
-                            // (the read loop holds no capture-pipeline handle, so it
-                            // cannot inject a per-pane gap from this layer). Promote
-                            // to warn so the loss is at least operator-visible rather
-                            // than sinking into a filtered debug line; full per-pane
-                            // gap injection for this path is tracked as a follow-up.
+                            // ft-wtd5g: dropped pane output is remembered and
+                            // announced as an explicit gap marker ahead of the
+                            // pane's next frame (see PendingNativeLoss); the
+                            // sampled warning keeps sustained pressure visible.
+                            if let Some((lost_pane, bytes)) = at_risk {
+                                pending_loss.record(lost_pane, bytes);
+                            }
                             let connection_drop_count =
                                 record_native_connection_anomaly(&mut drops.backpressure_drops);
                             let listener_drop_count = record_native_listener_anomaly(
@@ -2094,6 +2175,55 @@ mod native_accept_error_classifier_tests {
         assert_eq!(record_native_listener_anomaly(&counter), u64::MAX);
         assert_eq!(record_native_listener_anomaly(&counter), u64::MAX);
         assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn backpressure_loss_is_announced_as_a_gap_marker_before_the_next_frame() {
+        let output = |pane_id: u64, data: &[u8], dropped_bytes: u64| NativeEvent::PaneOutput {
+            pane_id,
+            data: data.to_vec(),
+            timestamp_ms: 1_000,
+            dropped_bytes,
+        };
+        let mut pending = PendingNativeLoss::default();
+
+        // Nothing pending: no marker, and only pane output is at risk.
+        assert!(pending.marker_before(&output(7, b"hi", 0)).is_none());
+        assert_eq!(
+            PendingNativeLoss::bytes_at_risk(&output(7, b"hello", 3)),
+            Some((7, 8))
+        );
+
+        // Two frames of pane 7 dropped under backpressure accumulate.
+        pending.record(7, 5);
+        pending.record(7, 8);
+        pending.record(9, 0);
+        match pending.marker_before(&output(7, b"next", 0)) {
+            Some(NativeEvent::PaneOutput {
+                pane_id,
+                data,
+                dropped_bytes,
+                ..
+            }) => {
+                assert_eq!((pane_id, dropped_bytes), (7, 13));
+                assert!(data.is_empty(), "the marker carries no pane bytes");
+            }
+            other => panic!("expected a loss marker, got {other:?}"),
+        }
+        assert!(pending.marker_before(&output(9, b"x", 0)).is_none());
+
+        // Until the marker is delivered it stays pending; afterwards it is gone.
+        assert!(pending.marker_before(&output(7, b"again", 0)).is_some());
+        pending.announced(7);
+        assert!(pending.marker_before(&output(7, b"later", 0)).is_none());
+
+        // Tracked panes are bounded.
+        for pane_id in 0..(MAX_PENDING_LOSS_PANES as u64 + 10) {
+            pending.record(pane_id, 1);
+        }
+        assert_eq!(pending.by_pane.len(), MAX_PENDING_LOSS_PANES);
+        pending.record(0, u64::MAX);
+        assert_eq!(pending.by_pane[&0], u64::MAX, "accumulation saturates");
     }
 
     #[test]

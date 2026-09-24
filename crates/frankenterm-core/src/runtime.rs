@@ -9037,6 +9037,30 @@ impl ObservationRuntime {
                                 metrics.record_native_output_input(data.len());
                                 if data.is_empty() {
                                     if dropped_bytes > 0 {
+                                        // ft-wtd5g: a loss marker (e.g. output
+                                        // dropped under listener backpressure).
+                                        // Output buffered before the loss must
+                                        // be recorded ahead of the gap.
+                                        if let Some(item) = coalescer.flush_pane(pane_id) {
+                                            if loop_cx.checkpoint().is_err() {
+                                                break 'native_events;
+                                            }
+                                            metrics.record_native_output_batch(
+                                                item.input_events,
+                                                item.bytes.len(),
+                                            );
+                                            emit_native_output_delta(
+                                                &loop_cx,
+                                                item.pane_id,
+                                                item.bytes,
+                                                item.timestamp_ms,
+                                                &capture_tx,
+                                                &cursors,
+                                                metrics.backpressure_metrics(),
+                                                &item.producer_guard,
+                                            )
+                                            .await;
+                                        }
                                         if loop_cx.checkpoint().is_err() {
                                             break 'native_events;
                                         }
