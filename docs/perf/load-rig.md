@@ -23,6 +23,23 @@ cargo run --example load_rig -p frankenterm-core -- --panes 200 --json
 cargo run --example load_rig -p frankenterm-core -- --mode native-push
 ```
 
+## Measured storage write path (`--storage`)
+
+`--storage` additionally writes every corpus egress frame through the
+production `StorageHandle::append_segment` path into a fresh temporary SQLite
+database (FTS indexing included) and reports **measured** per-append latency
+p50/p95/p99/max (microseconds), throughput (segments/s), and an FTS search for a
+term taken from the corpus. The run exits `1` if nothing was written or the FTS
+check finds no hits. With `--json` the output becomes
+`{"load_rig": <report>, "storage_probe": <probe>}`.
+
+```bash
+cargo run --release --example load_rig -p frankenterm-core -- --panes 200 --storage
+```
+
+Storage numbers depend on the host disk; quote them only with the host, build
+profile, and commit, and never from a debug build.
+
 Valid `--panes` scale points are **10, 50, 200 (default), 1000**; any other value
 exits 2 with an `unsupported scale point` message. Config overrides:
 `--max-capture-lag-ms`, `--memory-limit-mb`, `--poll-interval-ms`,
@@ -62,6 +79,9 @@ The rig reports these in every run:
   traverse the live bridge, mux, PTY, transport, or OS-event path;
 - `poll` and `native_push` share identical replay input, so their lag and queue
   metrics are directly comparable.
+- capture lag is derived from the corpus timeline; the storage write path is
+  measured only by the separate `--storage` probe, not end-to-end through the
+  capture loop.
 
 This rig is regression infrastructure feeding W9.4 (the target-class run); it is
 not itself the signed target-class hardware artifact. See

@@ -450,7 +450,7 @@ impl ChaosScaleHarness {
             limitations: vec![
                 "deterministic replay corpus; no live mux panes are launched".to_string(),
                 "capture metrics are MEASURED over the replay-corpus egress timeline (per-event occurred_at_ms + byte sizes), not synthesized from config; native_push applies the real dedup-window coalescing".to_string(),
-                "the production PatternEngine now scans every egress frame (detection_probe); the SQLite/FTS storage write-path integration is still pending (see ft-7h5da.10.3.2)".to_string(),
+                "the production PatternEngine now scans every egress frame (detection_probe); the SQLite/FTS write path is measured separately by run_replay_corpus_storage_probe (load_rig --storage), but capture lag is still derived from the corpus timeline rather than measured end-to-end through storage (ft-7h5da.10.3.2)".to_string(),
                 "poll and native_push modes share identical replay input so lag and queue metrics are directly comparable".to_string(),
             ],
             detection_probe,
@@ -870,6 +870,124 @@ fn run_detection_probe(corpus: &LargeSwarmReplayCorpus) -> ReplayCorpusDetection
     }
 }
 
+/// Measured production storage write path over the replay corpus
+/// (ft-7h5da.10.3.2): every egress frame is appended through
+/// [`crate::storage::StorageHandle::append_segment`] into a real SQLite + FTS
+/// database, and the wall-clock latency of each append is recorded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplayCorpusStorageProbe {
+    /// Distinct panes registered before writing.
+    pub panes: u64,
+    /// Segments durably appended.
+    pub segments_written: u64,
+    /// Pane-output bytes appended.
+    pub bytes_written: u64,
+    /// Measured append latency percentiles, microseconds.
+    pub append_latency_p50_us: u64,
+    pub append_latency_p95_us: u64,
+    pub append_latency_p99_us: u64,
+    pub append_latency_max_us: u64,
+    /// Wall-clock time for all appends, milliseconds.
+    pub elapsed_ms: u64,
+    /// Sustained append throughput.
+    pub segments_per_sec: f64,
+    /// Term searched through FTS after the run.
+    pub fts_probe_term: String,
+    /// Segments the FTS search returned for `fts_probe_term`.
+    pub fts_probe_hits: u64,
+}
+
+/// Write the replay corpus through the production storage path at
+/// `db_path` (a fresh file) and measure it. Frames are appended in corpus
+/// order, one `append_segment` per frame, as the capture loop does.
+pub async fn run_replay_corpus_storage_probe(
+    corpus: &LargeSwarmReplayCorpus,
+    db_path: &std::path::Path,
+) -> crate::Result<ReplayCorpusStorageProbe> {
+    let storage = crate::storage::StorageHandle::new(&db_path.to_string_lossy()).await?;
+    let mut pane_ids: BTreeSet<u64> = BTreeSet::new();
+    for event in &corpus.events {
+        if matches!(event.payload, RecorderEventPayload::EgressOutput { .. }) {
+            pane_ids.insert(event.pane_id);
+        }
+    }
+    for &pane_id in &pane_ids {
+        storage
+            .upsert_pane(crate::storage::PaneRecord {
+                pane_id,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some(format!("load-rig-{pane_id}")),
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 0,
+                last_seen_at: 0,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await?;
+    }
+
+    let mut latencies_us: Vec<u64> = Vec::new();
+    let mut bytes_written = 0_u64;
+    let mut fts_probe_term = String::new();
+    let started = std::time::Instant::now();
+    for event in &corpus.events {
+        let RecorderEventPayload::EgressOutput { text, .. } = &event.payload else {
+            continue;
+        };
+        if fts_probe_term.is_empty() {
+            fts_probe_term = text
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .find(|word| word.len() >= 4)
+                .unwrap_or_default()
+                .to_string();
+        }
+        let append_started = std::time::Instant::now();
+        storage.append_segment(event.pane_id, text, None).await?;
+        latencies_us.push(u64::try_from(append_started.elapsed().as_micros()).unwrap_or(u64::MAX));
+        bytes_written = bytes_written.saturating_add(text.len() as u64);
+    }
+    let elapsed = started.elapsed();
+    let fts_probe_hits = if fts_probe_term.is_empty() {
+        0
+    } else {
+        storage.search(&fts_probe_term).await?.len() as u64
+    };
+    storage.shutdown().await?;
+
+    latencies_us.sort_unstable();
+    let pct = |p: usize| -> u64 {
+        if latencies_us.is_empty() {
+            0
+        } else {
+            latencies_us[(latencies_us.len() - 1) * p / 100]
+        }
+    };
+    let segments_written = latencies_us.len() as u64;
+    let elapsed_secs = elapsed.as_secs_f64();
+    Ok(ReplayCorpusStorageProbe {
+        panes: pane_ids.len() as u64,
+        segments_written,
+        bytes_written,
+        append_latency_p50_us: pct(50),
+        append_latency_p95_us: pct(95),
+        append_latency_p99_us: pct(99),
+        append_latency_max_us: latencies_us.last().copied().unwrap_or(0),
+        elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        segments_per_sec: if elapsed_secs > 0.0 {
+            segments_written as f64 / elapsed_secs
+        } else {
+            0.0
+        },
+        fts_probe_term,
+        fts_probe_hits,
+    })
+}
+
 /// Fixed per-pane capture-buffer overhead used by the rig's memory model.
 const CAPTURE_BUFFER_OVERHEAD_BYTES: u64 = 4096;
 
@@ -1013,6 +1131,43 @@ fn measure_replay_capture_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_probe_writes_every_egress_frame_through_real_storage() {
+        use crate::runtime_async::CompatRuntime as _;
+
+        let scenario = LargeSwarmScenario::scale_point(10).expect("10-pane scale point");
+        let corpus = generate_large_swarm_corpus(&scenario).expect("corpus");
+        let frames = corpus
+            .events
+            .iter()
+            .filter(|event| matches!(event.payload, RecorderEventPayload::EgressOutput { .. }))
+            .count() as u64;
+        assert!(frames > 0);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let probe = runtime
+            .block_on(run_replay_corpus_storage_probe(
+                &corpus,
+                &dir.path().join("probe.db"),
+            ))
+            .expect("storage probe");
+
+        assert_eq!(probe.segments_written, frames);
+        assert!(probe.panes > 0 && probe.panes <= 10);
+        assert!(probe.bytes_written > 0);
+        assert!(probe.append_latency_p50_us <= probe.append_latency_p95_us);
+        assert!(probe.append_latency_p95_us <= probe.append_latency_p99_us);
+        assert!(probe.append_latency_p99_us <= probe.append_latency_max_us);
+        assert!(!probe.fts_probe_term.is_empty());
+        assert!(
+            probe.fts_probe_hits > 0,
+            "FTS must index the written segments"
+        );
+    }
     use proptest::prelude::*;
 
     // -- ScaleProfile --

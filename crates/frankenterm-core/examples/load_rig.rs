@@ -21,6 +21,7 @@
 //!     [--dedup-window-ms N]      (default 16) \
 //!     [--queue-depth-limit N]    (default 32) \
 //!     [--json]                   (emit the full report as JSON on stdout) \
+//!     [--storage]                (also write the corpus through the real SQLite/FTS path) \
 //!     [--help]
 //!
 //! Exit codes:
@@ -32,8 +33,9 @@ use std::process::ExitCode;
 
 use frankenterm_core::chaos_scale_harness::{
     CaptureMode, ChaosScaleHarness, ReplayCorpusCaptureModeResult, ReplayCorpusLoadRigConfig,
-    ReplayCorpusLoadRigReport,
+    ReplayCorpusLoadRigReport, ReplayCorpusStorageProbe, run_replay_corpus_storage_probe,
 };
+use frankenterm_core::runtime_async::CompatRuntime as _;
 
 const HELP: &str = "\
 ft load-rig — runnable replay-corpus 200-pane load rig (W9.3a)
@@ -47,6 +49,9 @@ OPTIONS:
   --dedup-window-ms N   native-push dedup window (default 16)
   --queue-depth-limit N per-pane queue-depth ceiling (default 32)
   --json                emit the full ReplayCorpusLoadRigReport as JSON
+  --storage             also append every corpus frame through the production
+                        SQLite/FTS storage path (temp DB) and report measured
+                        append latency, throughput, and an FTS hit check
   --help                print this help
 
 Both capture modes are always exercised; --mode only narrows the human display.";
@@ -80,18 +85,21 @@ struct Options {
     config: ReplayCorpusLoadRigConfig,
     display_mode: Option<CaptureMode>,
     as_json: bool,
+    storage: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut config = ReplayCorpusLoadRigConfig::target_200_pane();
     let mut display_mode = None;
     let mut as_json = false;
+    let mut storage = false;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
         match flag {
             "--help" | "-h" => return Ok(None),
             "--json" => as_json = true,
+            "--storage" => storage = true,
             "--panes" => {
                 config.pane_count = next_value(args, &mut index, flag)?
                     .parse()
@@ -134,6 +142,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         config,
         display_mode,
         as_json,
+        storage,
     }))
 }
 
@@ -188,15 +197,34 @@ fn run() -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     };
 
-    let report = ChaosScaleHarness::run_replay_corpus_load_rig(options.config)
+    let report = ChaosScaleHarness::run_replay_corpus_load_rig(options.config.clone())
         .map_err(|error| format!("{error}; valid --panes values are 10, 50, 200, 1000"))?;
+    let storage_probe = if options.storage {
+        Some(run_storage_probe(options.config.pane_count)?)
+    } else {
+        None
+    };
 
     if options.as_json {
-        let json = serde_json::to_string_pretty(&report)
+        let value = match &storage_probe {
+            Some(probe) => serde_json::json!({ "load_rig": report, "storage_probe": probe }),
+            None => serde_json::to_value(&report)
+                .map_err(|error| format!("failed to serialize report: {error}"))?,
+        };
+        let json = serde_json::to_string_pretty(&value)
             .map_err(|error| format!("failed to serialize report: {error}"))?;
         println!("{json}");
     } else {
         render_report(&report, options.display_mode);
+        if let Some(probe) = &storage_probe {
+            render_storage_probe(probe);
+        }
+    }
+    if storage_probe
+        .as_ref()
+        .is_some_and(|probe| probe.fts_probe_hits == 0 || probe.segments_written == 0)
+    {
+        return Ok(ExitCode::from(1));
     }
 
     if report.overall_pass {
@@ -204,6 +232,47 @@ fn run() -> Result<ExitCode, String> {
     } else {
         Ok(ExitCode::from(1))
     }
+}
+
+fn run_storage_probe(pane_count: u64) -> Result<ReplayCorpusStorageProbe, String> {
+    use frankenterm_core::large_swarm_replay::{LargeSwarmScenario, generate_large_swarm_corpus};
+
+    let scenario = LargeSwarmScenario::scale_point(pane_count)
+        .ok_or_else(|| format!("unsupported --panes {pane_count}"))?;
+    let corpus = generate_large_swarm_corpus(&scenario).map_err(|error| error.to_string())?;
+    let dir = tempfile::tempdir().map_err(|error| format!("temp dir: {error}"))?;
+    let db_path = dir.path().join("load-rig.db");
+    let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
+        .build()
+        .map_err(|error| format!("runtime: {error}"))?;
+    runtime
+        .block_on(run_replay_corpus_storage_probe(&corpus, &db_path))
+        .map_err(|error| format!("storage probe failed: {error}"))
+}
+
+fn render_storage_probe(probe: &ReplayCorpusStorageProbe) {
+    println!(
+        "  [{}] storage     append p50/p95/p99/max = {}/{}/{}/{} us | {:.0} segments/s over {} ms",
+        if probe.fts_probe_hits > 0 && probe.segments_written > 0 {
+            "MEASURED"
+        } else {
+            "FAIL"
+        },
+        probe.append_latency_p50_us,
+        probe.append_latency_p95_us,
+        probe.append_latency_p99_us,
+        probe.append_latency_max_us,
+        probe.segments_per_sec,
+        probe.elapsed_ms,
+    );
+    println!(
+        "         panes={} segments={} bytes={} fts {:?} hits={}",
+        probe.panes,
+        probe.segments_written,
+        probe.bytes_written,
+        probe.fts_probe_term,
+        probe.fts_probe_hits,
+    );
 }
 
 fn main() -> ExitCode {
