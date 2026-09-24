@@ -6783,6 +6783,34 @@ fi
 }
 RESOLVED_VERSION="ft $PUBLISHED_PROCESS_FAMILY_VERSION"
 
+# ft-xxfwy.7: a FrankenTerm.app left at a different generation than the CLI
+# family just installed cannot be driven by `ft` (robot.mux_version_skew).
+# Only the bundle's Info.plist is read; the older app is never executed.
+installed_app_pairing_warning() {
+  [ "$OS" = darwin ] || return 0
+  if [ -n "$APP_INSTALLED_PATH" ] && [ "$APP_ACTIVATION_STATE" != pending ]; then
+    return 0
+  fi
+  local app app_version cli_version candidate
+  app=""
+  for candidate in "${APP_DEST:-/Applications}/FrankenTerm.app" "$HOME/Applications/FrankenTerm.app"; do
+    if [ -f "$candidate/Contents/Info.plist" ]; then
+      app="$candidate"
+      break
+    fi
+  done
+  [ -n "$app" ] || return 0
+  app_version=$(plutil -extract CFBundleShortVersionString raw -o - \
+    "$app/Contents/Info.plist" 2>/dev/null) || return 0
+  app_version="${app_version#v}"
+  cli_version="${PUBLISHED_PROCESS_FAMILY_VERSION#v}"
+  [ -n "$app_version" ] && [ -n "$cli_version" ] && [ "$app_version" != "$cli_version" ] || return 0
+  printf '%s\n' \
+    "GUI pairing: $app is $app_version but ft is $cli_version." \
+    "  ft cannot drive a different-generation app (robot.mux_version_skew)." \
+    "  Pair them: rerun this installer with --with-app, or quit the old app."
+}
+
 # ───────────────────────────────────────────────────────────────────────────
 # Final summary
 # ───────────────────────────────────────────────────────────────────────────
@@ -6838,6 +6866,9 @@ if [ "$QUIET" -eq 0 ]; then
       summary_lines+=("GUI app:  $APP_INSTALLED_PATH")
     fi
   fi
+  while IFS= read -r pairing_line; do
+    summary_lines+=("$pairing_line")
+  done < <(installed_app_pairing_warning)
   summary_lines+=("")
   if [ -n "$PENDING_PROCESS_FAMILY_GENERATION" ]; then
     summary_lines+=("Candidate publication is complete; this host was not safe to activate automatically.")

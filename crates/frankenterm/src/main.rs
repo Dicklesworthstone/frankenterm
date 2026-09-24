@@ -121,7 +121,8 @@ built:    {}
 rustc:    {}
 target:   {}
 features: {}
-atomic-component: {}",
+atomic-component: {}
+mux codec: {} (accepts peers >= {})",
             frankenterm_core::VERSION,
             GIT_HASH,
             GIT_DIRTY,
@@ -130,7 +131,27 @@ atomic-component: {}",
             TARGET,
             FEATURES,
             ATOMIC_COMPONENT_MARKER,
+            codec::CODEC_VERSION,
+            codec::CODEC_VERSION_MIN_SUPPORTED,
         )
+    }
+
+    /// Machine-readable build metadata for `ft version --json`. Installers
+    /// compare `codec_version` / `codec_min_supported` against a running
+    /// FrankenTerm.app or mux server to detect generation skew (ft-xxfwy.7).
+    pub fn version_json() -> serde_json::Value {
+        serde_json::json!({
+            "version": frankenterm_core::VERSION,
+            "commit": GIT_HASH,
+            "dirty": !GIT_DIRTY.is_empty(),
+            "built": BUILD_TS,
+            "rustc": RUSTC_VERSION,
+            "target": TARGET,
+            "features": FEATURES,
+            "atomic_component": ATOMIC_COMPONENT_MARKER,
+            "codec_version": codec::CODEC_VERSION,
+            "codec_min_supported": codec::CODEC_VERSION_MIN_SUPPORTED,
+        })
     }
 }
 
@@ -379,8 +400,14 @@ async fn print_version_command(
     cx: &frankenterm_core::cx::Cx,
     full: bool,
     check: bool,
+    json: bool,
 ) -> anyhow::Result<()> {
-    if check {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&build_meta::version_json())?
+        );
+    } else if check {
         println!("{}", fetch_latest_release_check(cx).await?.render());
     } else if full {
         println!("{}", build_meta::verbose_version());
@@ -544,6 +571,10 @@ SEE ALSO:
         /// Check for a newer stable release with the complete signed asset set
         #[arg(long, conflicts_with = "full")]
         check: bool,
+
+        /// Emit build metadata, including the mux codec generation, as JSON
+        #[arg(long, conflicts_with_all = ["full", "check"])]
+        json: bool,
     },
 
     /// Robot mode commands (machine-readable I/O)
@@ -48789,8 +48820,13 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
     // configuration, workspace databases, logging, font installation, and mux
     // state. The public latest-release response and this binary's embedded
     // version are the only authorities needed by `ft version --check`.
-    if let Some(Commands::Version { full, check: true }) = command.as_ref() {
-        print_version_command(cx, *full, true).await?;
+    if let Some(Commands::Version {
+        full,
+        check: true,
+        json,
+    }) = command.as_ref()
+    {
+        print_version_command(cx, *full, true, *json).await?;
         return Ok(());
     }
 
@@ -49104,8 +49140,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
         Some(Commands::Scan { .. }) => {
             unreachable!("scan dispatched before workspace initialization")
         }
-        Some(Commands::Version { full, check }) => {
-            print_version_command(cx, full, check).await?;
+        Some(Commands::Version { full, check, json }) => {
+            print_version_command(cx, full, check, json).await?;
             return Ok(());
         }
 
@@ -140380,9 +140416,31 @@ A  docs/new-proof.md\n";
             Some(Commands::Version {
                 full: false,
                 check: true,
+                json: false,
             })
         ));
         assert!(Cli::try_parse_from(["ft", "version", "--full", "--check"]).is_err());
+        assert!(Cli::try_parse_from(["ft", "version", "--json", "--check"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["ft", "version", "--json"])
+                .expect("version --json should parse")
+                .command
+                .map(|command| *command),
+            Some(Commands::Version { json: true, .. })
+        ));
+    }
+
+    #[test]
+    fn version_json_reports_codec_generation_for_skew_checks() {
+        let value = build_meta::version_json();
+        assert_eq!(value["version"], frankenterm_core::VERSION);
+        assert_eq!(value["codec_version"], codec::CODEC_VERSION);
+        assert_eq!(
+            value["codec_min_supported"],
+            codec::CODEC_VERSION_MIN_SUPPORTED
+        );
+        assert!(value["codec_min_supported"].as_u64() <= value["codec_version"].as_u64());
+        assert!(build_meta::verbose_version().contains("mux codec:"));
     }
 
     #[test]
@@ -140421,6 +140479,7 @@ A  docs/new-proof.md\n";
             &Commands::Version {
                 full: false,
                 check: false,
+                json: false,
             }
         )));
         assert!(!should_auto_install_bundled_font(Some(&Commands::Setup {
