@@ -1144,6 +1144,13 @@ identity-checked unlink plus parent-directory synchronization. It deliberately
 retains the private lock inode so a competing writer cannot create a second
 flock authority while the operation is retiring.
 
+Note: `list-orphans`, `recover`, and `discard` operate on the flat per-pane
+mmap scrollback files under `~/.local/share/ft/scrollback/`. No production
+capture path writes those files today (the per-pane mmap writer is reserved,
+see `config.rs`), so on a normal install these commands find nothing. Durable
+cold scrollback from the mux server is read with `list-durable` /
+`export-durable` instead.
+
 All three flat-mmap orphan commands accept the same explicit recovery envelope:
 `--max-directory-entries`, `--max-file-bytes`, `--max-records`,
 `--max-replay-chunks`, `--max-payload-bytes`, and
