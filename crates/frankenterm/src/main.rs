@@ -46973,9 +46973,20 @@ async fn run_watcher(
             Vec::new();
 
         if !config.notifications.webhooks.is_empty() {
+            // ft-iilon: bounded retry on transient failures, and a per-endpoint
+            // breaker so a dead endpoint is skipped for a cooldown instead of
+            // costing every notification its full retry budget.
             let dispatcher = WebhookDispatcher::new(
                 config.notifications.webhooks.clone(),
                 Box::new(AsupersyncWebhookTransport::new()),
+            )
+            .with_retry_policy(frankenterm_core::webhook::WebhookRetryPolicy::production())
+            .with_circuit_breaker(
+                frankenterm_core::circuit_breaker::CircuitBreakerConfig::new(
+                    5,
+                    1,
+                    std::time::Duration::from_secs(300),
+                ),
             );
             if dispatcher.active_endpoint_count() > 0 {
                 tracing::info!(

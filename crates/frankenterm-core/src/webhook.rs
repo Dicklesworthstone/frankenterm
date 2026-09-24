@@ -1,13 +1,13 @@
 //! Webhook notification delivery.
 //!
 //! Delivers event notifications to external services via HTTP webhooks
-//! with configurable payload templates. Delivery is single-attempt and
-//! best-effort: each matched endpoint is sent exactly once per event, with
-//! no retry, no exponential backoff, and no circuit-breaker isolation. A
-//! failed POST (5xx / connection refused) is recorded once as not-accepted
-//! and is not re-attempted. (ft-37q59: corrected from an earlier doc that
-//! advertised circuit-breaker protection and retry/backoff; the crate's
-//! `retry.rs` / `circuit_breaker.rs` are not wired into this path.)
+//! with configurable payload templates. [`WebhookDispatcher::new`] is
+//! single-attempt; production (`ft watch`) opts into
+//! [`WebhookDispatcher::with_retry_policy`] (bounded exponential backoff on
+//! transport errors, 408, 429 and 5xx; never on other 4xx or caller
+//! cancellation) and [`WebhookDispatcher::with_circuit_breaker`] (per-endpoint
+//! breaker that skips a persistently failing endpoint during its cooldown so
+//! it cannot stall the notification pipeline) (ft-iilon).
 //!
 //! # Architecture
 //!
@@ -16,7 +16,7 @@
 //!                    ↓ (if Send)
 //!            WebhookDispatcher
 //!            ├── render payload (generic/slack/discord)
-//!            └── send via WebhookTransport (single-shot, no retry)
+//!            └── send via WebhookTransport (optional retry + circuit breaker)
 //! ```
 //!
 //! # Transport Abstraction
@@ -498,14 +498,68 @@ pub trait WebhookTransport: Send + Sync {
 // Webhook dispatcher
 // ============================================================================
 
+/// Bounded retry for one webhook delivery (ft-iilon).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebhookRetryPolicy {
+    /// Total attempts per endpoint per event, including the first.
+    pub max_attempts: u32,
+    /// Delay before the second attempt; doubles per attempt.
+    pub initial_delay: std::time::Duration,
+    /// Upper bound on any single delay.
+    pub max_delay: std::time::Duration,
+}
+
+impl WebhookRetryPolicy {
+    /// Production default: 5 attempts, 1 s initial, capped at 4 s
+    /// (at most ~11 s of waiting per endpoint).
+    #[must_use]
+    pub const fn production() -> Self {
+        Self {
+            max_attempts: 5,
+            initial_delay: std::time::Duration::from_secs(1),
+            max_delay: std::time::Duration::from_secs(4),
+        }
+    }
+
+    /// Delay after failed attempt number `attempt` (1-based).
+    #[must_use]
+    pub fn delay_after(&self, attempt: u32) -> std::time::Duration {
+        let factor = 1_u32
+            .checked_shl(attempt.saturating_sub(1))
+            .unwrap_or(u32::MAX);
+        self.initial_delay
+            .saturating_mul(factor)
+            .min(self.max_delay)
+    }
+}
+
+/// Whether a failed delivery is worth another attempt: transport errors and
+/// 408 / 429 / 5xx responses are; other rejections and invalid results are
+/// not. Caller-control failures are never retried.
+#[must_use]
+pub fn webhook_failure_is_retryable(result: &DeliveryResult) -> bool {
+    match result.failure_class() {
+        Some(DeliveryFailureClass::Transport) => true,
+        Some(DeliveryFailureClass::RemoteRejected) => {
+            matches!(result.status_code(), 408 | 429 | 500..=599)
+        }
+        _ => false,
+    }
+}
+
+const WEBHOOK_CIRCUIT_OPEN_ERROR: &str = "webhook_circuit_open";
+
 /// Dispatches webhook notifications to configured endpoints.
 ///
-/// Combines endpoint matching, template rendering, and single-attempt
-/// best-effort delivery (no retry/backoff or circuit breaker — see the
-/// module docs).
+/// Combines endpoint matching, template rendering, and delivery. Delivery is
+/// single-attempt unless a retry policy and/or circuit breaker is attached
+/// (see the module docs).
 pub struct WebhookDispatcher {
     endpoints: Vec<WebhookEndpointConfig>,
     transport: Box<dyn WebhookTransport>,
+    retry: Option<WebhookRetryPolicy>,
+    breaker_config: Option<crate::circuit_breaker::CircuitBreakerConfig>,
+    breakers: std::sync::Mutex<HashMap<String, crate::circuit_breaker::CircuitBreaker>>,
 }
 
 /// Record of a single delivery attempt for observability.
@@ -625,6 +679,107 @@ impl WebhookDispatcher {
         Self {
             endpoints,
             transport,
+            retry: None,
+            breaker_config: None,
+            breakers: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Retry retryable failures per endpoint under `policy`.
+    #[must_use]
+    pub fn with_retry_policy(mut self, policy: WebhookRetryPolicy) -> Self {
+        self.retry = Some(policy);
+        self
+    }
+
+    /// Isolate each endpoint behind a circuit breaker built from `config`.
+    #[must_use]
+    pub fn with_circuit_breaker(
+        mut self,
+        config: crate::circuit_breaker::CircuitBreakerConfig,
+    ) -> Self {
+        self.breaker_config = Some(config);
+        self
+    }
+
+    /// Whether the endpoint's breaker currently admits a delivery.
+    fn breaker_allows(&self, endpoint: &str) -> bool {
+        let Some(config) = &self.breaker_config else {
+            return true;
+        };
+        let mut breakers = self
+            .breakers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        breakers
+            .entry(endpoint.to_string())
+            .or_insert_with(|| {
+                crate::circuit_breaker::CircuitBreaker::with_name(
+                    format!("webhook:{endpoint}"),
+                    config.clone(),
+                )
+            })
+            .allow()
+    }
+
+    fn breaker_record(&self, endpoint: &str, accepted: bool) {
+        if self.breaker_config.is_none() {
+            return;
+        }
+        let mut breakers = self
+            .breakers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(breaker) = breakers.get_mut(endpoint) {
+            if accepted {
+                breaker.record_success();
+            } else {
+                breaker.record_failure();
+            }
+        }
+    }
+
+    /// Send to one endpoint, retrying under the policy. Returns the final
+    /// result and the number of attempts made.
+    async fn send_with_retry(
+        &self,
+        cx: &crate::cx::Cx,
+        endpoint: &WebhookEndpointConfig,
+        body: &serde_json::Value,
+    ) -> (DeliveryResult, u32) {
+        let max_attempts = self.retry.map_or(1, |policy| policy.max_attempts.max(1));
+        let mut attempt = 1;
+        loop {
+            let result = self
+                .transport
+                .send_with_cx(cx, &endpoint.url, &endpoint.headers, body)
+                .await;
+            let give_up = result.accepted()
+                || is_transport_control_failure(&result)
+                || !webhook_failure_is_retryable(&result)
+                || attempt >= max_attempts;
+            if give_up {
+                return (result, attempt);
+            }
+            let delay = self.retry.map_or(std::time::Duration::ZERO, |policy| {
+                policy.delay_after(attempt)
+            });
+            tracing::debug!(
+                endpoint = %endpoint.name,
+                attempt,
+                delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                "webhook delivery failed; retrying"
+            );
+            if cx.checkpoint().is_err()
+                || (!delay.is_zero()
+                    && crate::runtime_async::sleep_with_cx(cx, delay)
+                        .await
+                        .is_err())
+                || cx.checkpoint().is_err()
+            {
+                return (result, attempt);
+            }
+            attempt += 1;
         }
     }
 
@@ -740,17 +895,33 @@ impl WebhookDispatcher {
                 return records;
             }
 
-            let result = self
-                .transport
-                .send_with_cx(cx, &endpoint.url, &endpoint.headers, &body)
-                .await;
+            if !self.breaker_allows(&endpoint.name) {
+                tracing::warn!(
+                    endpoint = %endpoint.name,
+                    "webhook endpoint circuit open; skipping delivery"
+                );
+                records.push(DeliveryRecord {
+                    target: endpoint.name.clone(),
+                    accepted: false,
+                    status_code: 0,
+                    error: Some(WEBHOOK_CIRCUIT_OPEN_ERROR.to_string()),
+                });
+                next_endpoint_index = following_endpoint_index;
+                continue;
+            }
+
+            let (result, attempts) = self.send_with_retry(cx, endpoint, &body).await;
             let accepted = delivery_was_accepted(&result);
+            if !is_transport_control_failure(&result) {
+                self.breaker_record(&endpoint.name, accepted);
+            }
             let safe_error = safe_delivery_error(&result);
 
             if accepted {
                 tracing::info!(
                     endpoint = %endpoint.name,
                     status = result.status_code(),
+                    attempts,
                     "webhook delivered"
                 );
             } else {
@@ -758,6 +929,7 @@ impl WebhookDispatcher {
                     endpoint = %endpoint.name,
                     status = result.status_code(),
                     error_class = ?safe_error,
+                    attempts,
                     "webhook delivery failed"
                 );
             }
@@ -1149,6 +1321,163 @@ mod tests {
         let mut ep = test_endpoint("test", "http://localhost", WebhookTemplate::Generic);
         ep.events = vec!["gemini.*".to_string()];
         assert!(!ep.matches_detection(&test_detection()));
+    }
+
+    // ---- Retry / circuit breaker (ft-iilon) ----
+
+    #[derive(Clone)]
+    struct ScriptedTransport {
+        script: Arc<Mutex<std::collections::VecDeque<DeliveryResult>>>,
+        calls: Arc<Mutex<u32>>,
+    }
+
+    impl ScriptedTransport {
+        fn new(results: Vec<DeliveryResult>) -> Self {
+            Self {
+                script: Arc::new(Mutex::new(results.into())),
+                calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn calls(&self) -> u32 {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    impl WebhookTransport for ScriptedTransport {
+        fn send_with_cx<'a>(
+            &'a self,
+            _cx: &'a crate::cx::Cx,
+            _url: &'a str,
+            _headers: &'a HashMap<String, String>,
+            _body: &'a serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = DeliveryResult> + Send + 'a>> {
+            *self.calls.lock().unwrap() += 1;
+            let mut script = self.script.lock().unwrap();
+            let result = if script.len() > 1 {
+                script.pop_front().unwrap()
+            } else {
+                script.front().cloned().unwrap()
+            };
+            Box::pin(async move { result })
+        }
+    }
+
+    fn fast_retry(max_attempts: u32) -> WebhookRetryPolicy {
+        WebhookRetryPolicy {
+            max_attempts,
+            initial_delay: std::time::Duration::ZERO,
+            max_delay: std::time::Duration::ZERO,
+        }
+    }
+
+    fn retry_dispatcher(transport: &ScriptedTransport, max_attempts: u32) -> WebhookDispatcher {
+        WebhookDispatcher::new(
+            vec![test_endpoint(
+                "hook",
+                "https://example.invalid/hook",
+                WebhookTemplate::Generic,
+            )],
+            Box::new(transport.clone()),
+        )
+        .with_retry_policy(fast_retry(max_attempts))
+    }
+
+    #[test]
+    fn webhook_retries_transient_failures_until_accepted() {
+        run_async_test(async {
+            let transport = ScriptedTransport::new(vec![
+                DeliveryResult::from_http_status(503),
+                DeliveryResult::transport_failure(),
+                DeliveryResult::from_http_status(200),
+            ]);
+            let records = retry_dispatcher(&transport, 5)
+                .dispatch(&test_detection(), 1, &test_rendered(), 0)
+                .await;
+            assert_eq!(transport.calls(), 3);
+            assert_eq!(records.len(), 1);
+            assert!(records[0].accepted);
+        });
+    }
+
+    #[test]
+    fn webhook_does_not_retry_permanent_rejections_and_stops_at_the_limit() {
+        run_async_test(async {
+            let rejected = ScriptedTransport::new(vec![DeliveryResult::from_http_status(404)]);
+            let records = retry_dispatcher(&rejected, 5)
+                .dispatch(&test_detection(), 1, &test_rendered(), 0)
+                .await;
+            assert_eq!(rejected.calls(), 1, "a 404 is not retried");
+            assert!(!records[0].accepted);
+
+            let throttled = ScriptedTransport::new(vec![DeliveryResult::from_http_status(429)]);
+            let records = retry_dispatcher(&throttled, 4)
+                .dispatch(&test_detection(), 1, &test_rendered(), 0)
+                .await;
+            assert_eq!(throttled.calls(), 4, "429 is retried up to max_attempts");
+            assert!(!records[0].accepted);
+
+            let single = ScriptedTransport::new(vec![DeliveryResult::from_http_status(503)]);
+            let records = WebhookDispatcher::new(
+                vec![test_endpoint(
+                    "hook",
+                    "https://example.invalid/hook",
+                    WebhookTemplate::Generic,
+                )],
+                Box::new(single.clone()),
+            )
+            .dispatch(&test_detection(), 1, &test_rendered(), 0)
+            .await;
+            assert_eq!(
+                single.calls(),
+                1,
+                "without a policy delivery stays single-attempt"
+            );
+            assert!(!records[0].accepted);
+        });
+    }
+
+    #[test]
+    fn webhook_circuit_opens_after_repeated_failures_and_skips_the_endpoint() {
+        run_async_test(async {
+            let transport = ScriptedTransport::new(vec![DeliveryResult::from_http_status(500)]);
+            let dispatcher = retry_dispatcher(&transport, 1).with_circuit_breaker(
+                crate::circuit_breaker::CircuitBreakerConfig::new(
+                    2,
+                    1,
+                    std::time::Duration::from_secs(3600),
+                ),
+            );
+            for _ in 0..2 {
+                let records = dispatcher
+                    .dispatch(&test_detection(), 1, &test_rendered(), 0)
+                    .await;
+                assert!(!records[0].accepted);
+            }
+            assert_eq!(transport.calls(), 2);
+
+            let records = dispatcher
+                .dispatch(&test_detection(), 1, &test_rendered(), 0)
+                .await;
+            assert_eq!(transport.calls(), 2, "an open circuit sends nothing");
+            assert_eq!(
+                records[0].error.as_deref(),
+                Some(WEBHOOK_CIRCUIT_OPEN_ERROR)
+            );
+        });
+    }
+
+    #[test]
+    fn webhook_retry_backoff_doubles_and_is_capped() {
+        let policy = WebhookRetryPolicy::production();
+        assert_eq!(policy.delay_after(1), std::time::Duration::from_secs(1));
+        assert_eq!(policy.delay_after(2), std::time::Duration::from_secs(2));
+        assert_eq!(policy.delay_after(3), std::time::Duration::from_secs(4));
+        assert_eq!(policy.delay_after(9), std::time::Duration::from_secs(4));
+        assert_eq!(
+            policy.delay_after(u32::MAX),
+            std::time::Duration::from_secs(4)
+        );
     }
 
     // ---- Dispatcher tests ----

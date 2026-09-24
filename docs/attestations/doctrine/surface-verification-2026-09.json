@@ -15,7 +15,7 @@
     {
       "surface": "notifications",
       "status": "partial",
-      "evidence": "run_watcher builds NotificationPipeline on PatternDetected: desktop + webhook senders wired, mute store consulted, payload redacted; webhook single-attempt (webhook.rs module doc); email_notify.rs has no sender; alerts.rs usage-threshold module with no production caller",
+      "evidence": "run_watcher builds NotificationPipeline on PatternDetected: desktop + webhook senders wired, mute store consulted, payload redacted; webhook single-attempt (webhook.rs module doc); email_notify.rs has no sender; alerts.rs usage-threshold module with no production caller; webhook retry + per-endpoint circuit breaker wired for ft watch in ft-iilon",
       "readme": "email, alert routing and webhook retry claims corrected",
       "follow_up": [
         "ft-iilon",

@@ -1965,7 +1965,7 @@ The mux connection pool reduces overhead by reusing persistent connections to th
 - **Recovery with retry.** On transient/recoverable errors, the pool discards the failed connection (guard drop releases the semaphore) and retries with a new connection using configurable backoff. The connection is intentionally not returned to the pool after an error since its state may be corrupted.
 - **Circuit breaker integration.** After exhausting retries, failure is reported to a circuit breaker state machine. When the circuit opens (too many recent failures), subsequent operations fail immediately rather than waiting for timeouts. The circuit transitions through Closed → Open → Half-Open → Closed states with configurable cooldown periods.
 
-The retry layer supports exponential backoff with random jitter (uniform ±10% by default) and per-use-case policies (WezTerm CLI: 3 attempts / 100 ms initial; database writes: 5 attempts / 50 ms initial). Webhook delivery does not use it yet: each webhook is a single attempt.
+The retry layer supports exponential backoff with random jitter (uniform ±10% by default) and per-use-case policies (WezTerm CLI: 3 attempts / 100 ms initial; database writes: 5 attempts / 50 ms initial). `ft watch` webhook delivery uses its own bounded policy: 5 attempts, 1 s initial delay doubling to a 4 s cap, retrying only transport errors, 408, 429 and 5xx.
 
 The circuit-breaker `Config` had its `pub` fields tightened (ft-l5z7z) so callers can no longer bypass clamping; see the [Substrate Audit Discipline](#substrate-audit-discipline) section for the broader public-field bypass family closure.
 
@@ -2950,7 +2950,7 @@ All outbound notifications go through the Redactor first; the same one used for 
 
 ### Reliability
 
-Webhook delivery is currently a single attempt per notification: failures are logged, but there is no retry, backoff, or circuit breaker on this path yet.
+Under `ft watch`, webhook delivery retries transport errors, 408, 429 and 5xx up to 5 attempts (1 s initial delay, doubling, capped at 4 s); other 4xx responses and cancellation are not retried. Each endpoint has a circuit breaker: after 5 consecutive failed deliveries it is skipped for 5 minutes (recorded as `webhook_circuit_open`) so a dead endpoint cannot stall the pipeline.
 
 ---
 
