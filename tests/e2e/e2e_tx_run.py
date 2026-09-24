@@ -507,6 +507,26 @@ def write_fake_wezterm_cli(workspace: Path) -> tuple[Path, Path]:
 
 def ft_env(workspace: Path, fake_wezterm: Path, fake_state_dir: Path) -> dict[str, str]:
     env = os.environ.copy()
+    # Blind mux socket discovery. Otherwise the vendored backend dials the
+    # operator's running FrankenTerm GUI and these tx sends land in live panes.
+    for key in (
+        "WEZTERM_UNIX_SOCKET",
+        "FRANKENTERM_UNIX_SOCKET",
+        "WEZTERM_PANE",
+        "FRANKENTERM_PANE",
+        "FRANKENTERM_CONFIG_FILE",
+        "WEZTERM_CONFIG_FILE",
+    ):
+        env.pop(key, None)
+    isolated = workspace / ".isolated-home"
+    for sub in ("home", "config", "data", "state", "cache", "runtime"):
+        (isolated / sub).mkdir(parents=True, exist_ok=True, mode=0o700)
+    env["HOME"] = str(isolated / "home")
+    env["XDG_CONFIG_HOME"] = str(isolated / "config")
+    env["XDG_DATA_HOME"] = str(isolated / "data")
+    env["XDG_STATE_HOME"] = str(isolated / "state")
+    env["XDG_CACHE_HOME"] = str(isolated / "cache")
+    env["XDG_RUNTIME_DIR"] = str(isolated / "runtime")
     env["FT_WORKSPACE"] = str(workspace)
     env["FT_DATA_DIR"] = str(workspace / ".ft")
     env["FT_OUTPUT_FORMAT"] = "json"
@@ -704,7 +724,7 @@ def build_happy_contract(pane_a: int, pane_b: int) -> dict[str, Any]:
             "preconditions": [],
             "compensations": [],
         },
-        "lifecycle_state": "draft",
+        "lifecycle_state": "planned",
         "outcome": "pending",
         "receipts": [],
     }
@@ -758,7 +778,7 @@ def build_fail_contract(pane_real: int, pane_missing: int) -> dict[str, Any]:
                 },
             ],
         },
-        "lifecycle_state": "draft",
+        "lifecycle_state": "planned",
         "outcome": "pending",
         "receipts": [],
     }
@@ -793,7 +813,7 @@ def build_deny_contract(pane_denied: int) -> dict[str, Any]:
             "preconditions": [],
             "compensations": [],
         },
-        "lifecycle_state": "draft",
+        "lifecycle_state": "planned",
         "outcome": "pending",
         "receipts": [],
     }
