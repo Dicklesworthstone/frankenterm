@@ -498,7 +498,8 @@ SEE ALSO:
         #[arg(long, value_delimiter = ',')]
         notify_filter: Vec<String>,
 
-        /// Notification channels to use (comma-separated)
+        /// Notification channels to use (comma-separated). `email` has no
+        /// sender yet and is rejected on its own (ft-9b41l).
         #[arg(long, value_delimiter = ',', value_enum)]
         notify_via: Vec<NotifyChannel>,
 
@@ -10176,6 +10177,19 @@ enum NotifyChannel {
     Webhook,
     Desktop,
     Email,
+}
+
+/// `--notify-via email` on its own would leave the watcher with no working
+/// sender (there is no SMTP backend yet, ft-9b41l) while appearing to enable
+/// notifications. Refuse that instead of silently disabling notifications.
+fn email_only_notification_error(notify_via: &[NotifyChannel]) -> Option<String> {
+    let email_requested = notify_via.contains(&NotifyChannel::Email);
+    let working_channel = notify_via
+        .iter()
+        .any(|channel| matches!(channel, NotifyChannel::Webhook | NotifyChannel::Desktop));
+    (email_requested && !working_channel).then(|| {
+        "--notify-via email is not supported yet: FrankenTerm has no email sender (ft-9b41l), so no notifications would be delivered. Use --notify-via desktop and/or webhook.".to_string()
+    })
 }
 
 #[cfg(feature = "sync")]
@@ -46767,6 +46781,9 @@ async fn run_watcher(
         let allow_webhook = notify_via.contains(&NotifyChannel::Webhook);
         let allow_desktop = notify_via.contains(&NotifyChannel::Desktop);
         let allow_email = notify_via.contains(&NotifyChannel::Email);
+        if let Some(message) = email_only_notification_error(&notify_via) {
+            anyhow::bail!("{message}");
+        }
 
         if !allow_webhook {
             config.notifications.webhooks.clear();
@@ -46786,6 +46803,11 @@ async fn run_watcher(
         if let Err(err) = config.notifications.validate() {
             anyhow::bail!("Invalid notification configuration: {err}");
         }
+    }
+    if config.notifications.enabled && config.notifications.email.enabled {
+        tracing::warn!(
+            "Email notifications are enabled but not implemented; no email will be sent (ft-9b41l). Use desktop or webhook notifications."
+        );
     }
 
     // Print resolved paths for diagnostic visibility
@@ -102043,6 +102065,22 @@ mod tests {
             assert!(detail.starts_with("1/2"), "{detail}");
             assert!(detail.contains("panes 2"), "{detail}");
         });
+    }
+
+    #[test]
+    fn notify_via_email_alone_is_refused_but_mixed_channels_are_allowed() {
+        assert!(email_only_notification_error(&[NotifyChannel::Email]).is_some());
+        assert!(
+            email_only_notification_error(&[NotifyChannel::Email])
+                .unwrap_or_default()
+                .contains("ft-9b41l")
+        );
+        assert!(
+            email_only_notification_error(&[NotifyChannel::Email, NotifyChannel::Desktop])
+                .is_none()
+        );
+        assert!(email_only_notification_error(&[NotifyChannel::Webhook]).is_none());
+        assert!(email_only_notification_error(&[]).is_none());
     }
 
     fn mission_lifecycle_fixture() -> (

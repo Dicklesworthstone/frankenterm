@@ -2931,7 +2931,7 @@ When detections fire, `ft watch` can notify operators through desktop notificati
 | Channel | File | When to use |
 |---|---|---|
 | Desktop notification | `desktop_notify.rs` | Interactive operator on a workstation |
-| Email | `email_notify.rs` (config only) | Not wired: no SMTP sender exists yet; selecting only email leaves the pipeline disabled |
+| Email | `email_notify.rs` (config only) | Not wired: no SMTP sender exists yet; `--notify-via email` on its own is rejected and an enabled email config logs a warning (ft-9b41l) |
 | Webhook | `webhook.rs` | Integrate with PagerDuty / Slack / custom routers |
 | Prometheus alert | via the metrics surface | Existing alerting infra |
 | In-app events | event bus | Other `ft` surfaces (web/SSE, MCP, robot events) |
