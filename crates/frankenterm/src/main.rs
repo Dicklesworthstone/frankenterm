@@ -67563,6 +67563,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             if layout.db_path.exists() {
                 all_checks.push(prompt_evidence_diagnostic_check(&layout.db_path).await);
             }
+            all_checks.push(distributed_readiness_diagnostic_check(&config.distributed));
 
             let runtime_snapshot = load_runtime_health_snapshot(&layout).await;
             let swarm_capacity_summary = runtime_snapshot
@@ -95999,6 +96000,49 @@ fn session_persistence_is_healthy(
         && !report.cleanup_attempt.blocks_cleanup()
 }
 
+/// `ft doctor` row for the distributed-mode security readiness checklist
+/// (ft-7evp3): the rollout guide says doctor verifies security posture, so
+/// run the same go/no-go evaluator the checklist documents.
+fn distributed_readiness_diagnostic_check(
+    distributed: &frankenterm_core::config::DistributedConfig,
+) -> DiagnosticCheck {
+    if !distributed.enabled {
+        return DiagnosticCheck::ok_with_detail(
+            "distributed readiness",
+            "distributed mode disabled",
+        );
+    }
+    let report = frankenterm_core::distributed::evaluate_readiness(distributed);
+    if report.ready {
+        return DiagnosticCheck::ok_with_detail(
+            "distributed readiness",
+            format!(
+                "ready: {}/{} required and {}/{} advisory checks pass",
+                report.required_pass,
+                report.required_total,
+                report.advisory_pass,
+                report.advisory_total
+            ),
+        );
+    }
+    let failing: Vec<String> = report
+        .items
+        .iter()
+        .filter(|item| item.required && !item.pass)
+        .map(|item| format!("{} ({})", item.id, item.detail))
+        .collect();
+    DiagnosticCheck::error(
+        "distributed readiness",
+        format!(
+            "not ready: {}/{} required checks pass; failing: {}",
+            report.required_pass,
+            report.required_total,
+            failing.join("; ")
+        ),
+        "Fix the failing required items before exposing distributed mode",
+    )
+}
+
 /// Observed panes whose prompt evidence `ft doctor` inspects (ft-xxfwy.12).
 const PROMPT_EVIDENCE_PANE_LIMIT: usize = 50;
 
@@ -102099,6 +102143,31 @@ mod tests {
         );
         assert!(email_only_notification_error(&[NotifyChannel::Webhook]).is_none());
         assert!(email_only_notification_error(&[]).is_none());
+    }
+
+    #[test]
+    fn distributed_readiness_row_reflects_the_checklist() {
+        let disabled = frankenterm_core::config::DistributedConfig::default();
+        let row = distributed_readiness_diagnostic_check(&disabled);
+        assert!(matches!(row.status, DiagnosticStatus::Ok));
+
+        let mut enabled = frankenterm_core::config::DistributedConfig::default();
+        enabled.enabled = true;
+        let report = frankenterm_core::distributed::evaluate_readiness(&enabled);
+        let row = distributed_readiness_diagnostic_check(&enabled);
+        if report.ready {
+            assert!(matches!(row.status, DiagnosticStatus::Ok));
+        } else {
+            assert!(matches!(row.status, DiagnosticStatus::Error));
+            let detail = row.detail.unwrap_or_default();
+            for item in report
+                .items
+                .iter()
+                .filter(|item| item.required && !item.pass)
+            {
+                assert!(detail.contains(&item.id), "{detail} missing {}", item.id);
+            }
+        }
     }
 
     fn mission_lifecycle_fixture() -> (

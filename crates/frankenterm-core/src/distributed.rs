@@ -1242,11 +1242,9 @@ pub struct ReadinessReport {
 
 /// Evaluate the distributed mode readiness checklist against a config.
 ///
-/// This is a library evaluator: it builds the report but is not yet wired into
-/// any CLI command (notably `ft doctor` does not run it), so it never executes
-/// in a production path on its own. Callers that want a pre-flight go/no-go must
-/// invoke this directly and inspect [`ReadinessReport::ready`]. The live
-/// listener enforces its security primitives at runtime independently of this.
+/// `ft doctor` runs this when distributed mode is enabled and reports the
+/// failing required items (ft-7evp3). The live listener enforces its security
+/// primitives at runtime independently of this checklist.
 ///
 /// Returns a report with pass/fail for each item and an overall go/no-go.
 /// The checklist covers:
