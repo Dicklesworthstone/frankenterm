@@ -1,9 +1,15 @@
 //! Pre-launch quota gate for pane spawning (ft-2dss0).
 //!
 //! Combines signals from the [`CostTracker`], [`RateLimitTracker`], and account
-//! quota system to produce a [`LaunchDecision`] before every pane spawn. This
-//! ensures agents never launch into exhausted providers and surfaces warnings
-//! when budget or rate limits are nearing thresholds.
+//! quota system to produce a [`LaunchDecision`] for a prospective pane spawn.
+//!
+//! # Wiring status (ft-nmlbn)
+//!
+//! No production launch site consults this gate. Launch blocking today is done
+//! by `accounts::build_quota_advisory(..).is_blocking()` in the CLI; this
+//! evaluator only feeds the read-only dashboard snapshot
+//! ([`QuotaGateSnapshot`]) and tests. Treat its verdict as advisory telemetry,
+//! not an enforced admission gate, until a launch site calls it.
 //!
 //! # Integration
 //!
