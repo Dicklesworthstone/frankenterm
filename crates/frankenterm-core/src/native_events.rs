@@ -248,6 +248,25 @@ impl PendingNativeLoss {
     }
 }
 
+/// For an oversized wire line that is a `pane_output` frame, the pane id and
+/// an estimate of the decoded bytes lost (base64 expands 3 bytes to 4). The
+/// line is never parsed as JSON; other event types return `None`.
+#[cfg(any(unix, windows))]
+fn oversized_pane_output_loss(line: &str) -> Option<(u64, u64)> {
+    if !line.contains("\"pane_output\"") {
+        return None;
+    }
+    let key = "\"pane_id\":";
+    let start = line.find(key)? + key.len();
+    let digits: String = line[start..]
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    let pane_id = digits.parse().ok()?;
+    Some((pane_id, (line.len() as u64 / 4).saturating_mul(3)))
+}
+
 #[cfg(any(unix, windows))]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct NativeConnectionDropCounts {
@@ -1687,6 +1706,11 @@ async fn handle_connection_with_cx(
                 None => break 'connection Ok(()),
             };
             if line.len() > MAX_EVENT_LINE_BYTES {
+                // ft-wtd5g: an oversized pane_output frame is lost output;
+                // announce it as a gap before the pane's next frame.
+                if let Some((lost_pane, bytes)) = oversized_pane_output_loss(&line) {
+                    pending_loss.record(lost_pane, bytes);
+                }
                 let connection_drop_count =
                     record_native_connection_anomaly(&mut drops.oversized_line_drops);
                 let listener_drop_count =
@@ -2216,6 +2240,17 @@ mod native_accept_error_classifier_tests {
         assert!(pending.marker_before(&output(7, b"again", 0)).is_some());
         pending.announced(7);
         assert!(pending.marker_before(&output(7, b"later", 0)).is_none());
+
+        // Oversized pane_output lines are attributed to their pane.
+        let big = format!(
+            "{{\"type\":\"pane_output\",\"pane_id\": 42,\"data_b64\":\"{}\",\"ts\":1}}",
+            "A".repeat(4000)
+        );
+        let (pane, bytes) = oversized_pane_output_loss(&big).expect("pane_output line");
+        assert_eq!(pane, 42);
+        assert!(bytes >= 3000, "estimate covers the payload: {bytes}");
+        assert!(oversized_pane_output_loss("{\"type\":\"state_change\",\"pane_id\":1}").is_none());
+        assert!(oversized_pane_output_loss("{\"type\":\"pane_output\"}").is_none());
 
         // Tracked panes are bounded.
         for pane_id in 0..(MAX_PENDING_LOSS_PANES as u64 + 10) {
