@@ -2723,6 +2723,7 @@ mod tests {
             in_gap: None,
             cursor_alt_screen: Some(true),
             reason: None,
+            live_prompt: None,
         };
         assert!(resolve_alt_screen_state(&state).is_none());
     }
@@ -2738,6 +2739,7 @@ mod tests {
             in_gap: None,
             cursor_alt_screen: Some(true),
             reason: None,
+            live_prompt: None,
         };
         assert_eq!(resolve_alt_screen_state(&state), Some(true));
     }
@@ -2753,6 +2755,7 @@ mod tests {
             in_gap: None,
             cursor_alt_screen: None,
             reason: None,
+            live_prompt: None,
         };
         assert_eq!(resolve_alt_screen_state(&state), Some(false));
     }
@@ -2768,6 +2771,7 @@ mod tests {
             in_gap: None,
             cursor_alt_screen: None,
             reason: None,
+            live_prompt: None,
         };
         assert!(resolve_alt_screen_state(&state).is_none());
     }
@@ -3469,6 +3473,7 @@ mod tests {
             in_gap: None,
             cursor_alt_screen: None,
             reason: None,
+            live_prompt: None,
         };
         assert!(resolve_alt_screen_state(&state).is_none());
     }
@@ -3484,6 +3489,7 @@ mod tests {
             in_gap: None,
             cursor_alt_screen: Some(false),
             reason: None,
+            live_prompt: None,
         };
         assert_eq!(resolve_alt_screen_state(&state), Some(false));
     }

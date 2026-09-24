@@ -47611,18 +47611,21 @@ async fn run_watcher(
                     let registry = Arc::clone(&handle.registry);
                     let search_config = config.search.clone();
                     let ipc_task_cx = ipc_cx.clone();
+                    // Vendored capture stores rendered rows, so prompt
+                    // evidence comes from the mux's live semantic zones.
+                    let ipc_ctx =
+                        frankenterm_core::ipc::IpcHandlerContext::with_auth_rpc_control_and_search_config(
+                            event_bus,
+                            Some(registry),
+                            ipc_auth,
+                            rpc_handler,
+                            watcher_control_handler,
+                            Some(search_config),
+                        )
+                        .with_semantic_source(wezterm_handle.clone());
                     let ipc_task = frankenterm_core::runtime_async::task::spawn(async move {
                         server
-                            .run_with_registry_auth_rpc_control_and_search_config_with_cx(
-                                &ipc_task_cx,
-                                event_bus,
-                                registry,
-                                ipc_auth,
-                                rpc_handler,
-                                watcher_control_handler,
-                                Some(search_config),
-                                shutdown_rx,
-                            )
+                            .run_with_handler_context_with_cx(&ipc_task_cx, ipc_ctx, shutdown_rx)
                             .await;
                     });
                     Some((

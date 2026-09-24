@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::ingest::Osc133State;
 use crate::policy::PaneCapabilities;
@@ -40,6 +40,139 @@ pub struct IpcPaneState {
     pub cursor_alt_screen: Option<bool>,
     #[serde(default)]
     pub reason: Option<String>,
+    /// Prompt state the watcher read from the live mux's semantic zones.
+    #[serde(default)]
+    pub live_prompt: Option<LivePromptEvidence>,
+}
+
+/// Shell state reconstructed from the live mux's OSC 133 semantic zones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveShellState {
+    /// The pane has no prompt or input zones: no shell integration.
+    NoIntegration,
+    /// The cursor sits on a prompt zone.
+    Prompt,
+    /// The cursor sits on a command-input zone.
+    Input,
+    /// Output follows the last prompt, or the cursor left the prompt line.
+    CommandRunning,
+    /// The semantic query failed; `detail` says why.
+    Unavailable,
+}
+
+/// Live prompt evidence carried in the watcher's `pane_state` reply.
+///
+/// Vendored capture stores rendered rows, so OSC 133 bytes never reach
+/// storage: the mux consumes them into per-cell semantic types. This is the
+/// evidence that survives, read on demand from the mux.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LivePromptEvidence {
+    pub shell_state: LiveShellState,
+    #[serde(default)]
+    pub last_exit_code: Option<i32>,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+impl LivePromptEvidence {
+    /// Evidence for a failed semantic query.
+    #[must_use]
+    pub fn unavailable(detail: &dyn std::fmt::Display) -> Self {
+        Self {
+            shell_state: LiveShellState::Unavailable,
+            last_exit_code: None,
+            detail: Some(bounded_detail("", detail)),
+        }
+    }
+
+    /// Classify a semantic-zone snapshot. `cursor_row` is the cursor's stable
+    /// row, in the same coordinates as the zones.
+    #[must_use]
+    pub fn from_semantic_zones(
+        snapshot: &crate::wezterm::MuxSemanticSnapshot,
+        cursor_row: Option<i64>,
+    ) -> Self {
+        use crate::wezterm::MuxSemanticZoneKind as Kind;
+        let integrated = snapshot
+            .zones
+            .iter()
+            .any(|zone| matches!(zone.semantic_type, Kind::Prompt | Kind::Input));
+        // Unmarked cells default to Output, so blank Output padding says
+        // nothing about the shell.
+        let last = snapshot
+            .zones
+            .iter()
+            .filter(|zone| zone.semantic_type != Kind::Output || !zone.text.trim().is_empty())
+            .max_by_key(|zone| (zone.end_y, zone.end_x));
+        let shell_state = match last {
+            _ if !integrated => LiveShellState::NoIntegration,
+            None => LiveShellState::NoIntegration,
+            Some(zone) => {
+                // A submitted command with no output yet leaves the last zone
+                // an input zone, but moves the cursor below it.
+                let cursor_left_zone = cursor_row
+                    .and_then(|row| isize::try_from(row).ok())
+                    .is_some_and(|row| row > zone.end_y);
+                match zone.semantic_type {
+                    Kind::Output => LiveShellState::CommandRunning,
+                    _ if cursor_left_zone => LiveShellState::CommandRunning,
+                    Kind::Prompt => LiveShellState::Prompt,
+                    Kind::Input => LiveShellState::Input,
+                }
+            }
+        };
+        Self {
+            shell_state,
+            last_exit_code: snapshot.last_exit_code,
+            detail: None,
+        }
+    }
+
+    /// The equivalent OSC 133 tracker state, or `None` without integration.
+    #[must_use]
+    pub fn osc_state(&self) -> Option<Osc133State> {
+        let state = match self.shell_state {
+            LiveShellState::NoIntegration | LiveShellState::Unavailable => return None,
+            LiveShellState::Prompt => crate::ingest::ShellState::PromptActive,
+            LiveShellState::Input => crate::ingest::ShellState::InputActive,
+            LiveShellState::CommandRunning => crate::ingest::ShellState::CommandRunning,
+        };
+        let mut osc = Osc133State::new();
+        osc.state = state;
+        osc.last_exit_code = self.last_exit_code;
+        osc.markers_seen = 1;
+        Some(osc)
+    }
+}
+
+/// Read live prompt evidence for one pane from the mux, bounded by `budget`.
+pub async fn fetch_live_prompt_evidence(
+    cx: &crate::cx::Cx,
+    mux: &crate::wezterm::WeztermHandle,
+    pane_id: u64,
+    budget: std::time::Duration,
+) -> LivePromptEvidence {
+    let fetch = async {
+        let snapshot = match mux.get_semantic_zones_with_cx(cx, pane_id).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return LivePromptEvidence::unavailable(&error),
+        };
+        // Without a cursor row a submitted-but-silent command reads as input;
+        // the zone kind alone still separates prompt from running output.
+        let cursor_row = mux.list_panes_with_cx(cx).await.ok().and_then(|panes| {
+            panes
+                .iter()
+                .find(|pane| pane.pane_id == pane_id)
+                .and_then(|pane| pane.cursor_y)
+                .map(i64::from)
+        });
+        LivePromptEvidence::from_semantic_zones(&snapshot, cursor_row)
+    };
+    match crate::runtime_async::timeout_with_cx(cx, budget, fetch).await {
+        Ok(evidence) => evidence,
+        Err(error) => LivePromptEvidence::unavailable(&format_args!("semantic query: {error}")),
+    }
 }
 
 /// Resolved capabilities plus the human-readable evidence gaps behind them.
@@ -85,6 +218,7 @@ impl WatcherCapabilitySource {
                     in_gap: cursor.map(|cursor| cursor.in_gap),
                     cursor_alt_screen: cursor.map(|cursor| cursor.in_alt_screen),
                     reason: None,
+                    live_prompt: None,
                 }))
             }
         }
@@ -295,6 +429,15 @@ pub async fn resolve_pane_capabilities_with_source(
                 }
                 if state.pane_id == pane_id && state.known && state.observed != Some(false) {
                     alt_screen = resolve_alt_screen_state(&state);
+                    // Live semantic zones describe the pane now; stored
+                    // segments only carry markers on raw-byte capture paths.
+                    if let Some(live) = &state.live_prompt {
+                        if let Some(live_state) = live.osc_state() {
+                            osc_state = Some(live_state);
+                        } else if let Some(detail) = &live.detail {
+                            warnings.push(bounded_detail("Live prompt state unavailable: ", detail));
+                        }
+                    }
                     if let Some(state_in_gap) = state.in_gap {
                         gap_known = true;
                         in_gap = state_in_gap;
@@ -461,6 +604,7 @@ mod tests {
                 in_gap: Some(false),
                 cursor_alt_screen: Some(false),
                 reason: None,
+                live_prompt: None,
             };
             assert!(
                 test_pane_state_override_slot()
@@ -673,6 +817,159 @@ mod tests {
         });
     }
 
+    fn zone(
+        kind: crate::wezterm::MuxSemanticZoneKind,
+        y: isize,
+        text: &str,
+    ) -> crate::wezterm::MuxSemanticZone {
+        crate::wezterm::MuxSemanticZone {
+            start_y: y,
+            start_x: 0,
+            end_y: y,
+            end_x: text.len().saturating_sub(1),
+            semantic_type: kind,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn live_semantic_zones_classify_the_shell_at_the_cursor() {
+        use crate::wezterm::{MuxSemanticSnapshot, MuxSemanticZoneKind as Kind};
+        let classify = |zones: Vec<crate::wezterm::MuxSemanticZone>, cursor: Option<i64>| {
+            LivePromptEvidence::from_semantic_zones(
+                &MuxSemanticSnapshot {
+                    zones,
+                    last_exit_code: Some(0),
+                },
+                cursor,
+            )
+            .shell_state
+        };
+        // Bare shell: every cell defaults to Output.
+        assert_eq!(
+            classify(vec![zone(Kind::Output, 0, "% ls")], Some(0)),
+            LiveShellState::NoIntegration
+        );
+        assert_eq!(classify(Vec::new(), None), LiveShellState::NoIntegration);
+        // Fresh prompt after a finished command, cursor on the prompt line.
+        let finished = vec![
+            zone(Kind::Prompt, 0, "$ "),
+            zone(Kind::Output, 1, "ok"),
+            zone(Kind::Prompt, 2, "$ "),
+        ];
+        assert_eq!(classify(finished.clone(), Some(2)), LiveShellState::Prompt);
+        assert_eq!(classify(finished, None), LiveShellState::Prompt);
+        // Blank Output padding below the prompt is not command output.
+        assert_eq!(
+            classify(
+                vec![zone(Kind::Prompt, 0, "$ "), zone(Kind::Output, 1, "   ")],
+                Some(0)
+            ),
+            LiveShellState::Prompt
+        );
+        // Typing at the prompt.
+        let typing = vec![zone(Kind::Prompt, 0, "$ "), zone(Kind::Input, 0, "ls")];
+        assert_eq!(classify(typing.clone(), Some(0)), LiveShellState::Input);
+        // Submitted and silent (`sleep 100`): the cursor left the input line.
+        assert_eq!(classify(typing, Some(1)), LiveShellState::CommandRunning);
+        // Output after the last prompt.
+        assert_eq!(
+            classify(
+                vec![zone(Kind::Prompt, 0, "$ "), zone(Kind::Output, 1, "building")],
+                Some(2)
+            ),
+            LiveShellState::CommandRunning
+        );
+    }
+
+    #[test]
+    fn live_prompt_evidence_maps_onto_policy_capabilities() {
+        let caps = |shell_state| {
+            let evidence = LivePromptEvidence {
+                shell_state,
+                last_exit_code: None,
+                detail: None,
+            };
+            PaneCapabilities::from_ingest_state(evidence.osc_state().as_ref(), Some(false), false)
+        };
+        assert!(caps(LiveShellState::Prompt).prompt_active);
+        assert!(caps(LiveShellState::Input).prompt_active);
+        let running = caps(LiveShellState::CommandRunning);
+        assert!(!running.prompt_active && running.command_running);
+        for unknown in [LiveShellState::NoIntegration, LiveShellState::Unavailable] {
+            let caps = caps(unknown);
+            assert!(!caps.prompt_active && !caps.command_running);
+        }
+    }
+
+    #[test]
+    fn watcher_live_prompt_is_prompt_evidence_without_stored_markers() {
+        let state = |pane_id, shell_state| IpcPaneState {
+            pane_id,
+            known: true,
+            observed: Some(true),
+            alt_screen: None,
+            last_status_at: None,
+            in_gap: Some(false),
+            cursor_alt_screen: Some(false),
+            reason: None,
+            live_prompt: Some(LivePromptEvidence {
+                shell_state,
+                last_exit_code: None,
+                detail: (shell_state == LiveShellState::Unavailable)
+                    .then(|| "mux gone".to_string()),
+            }),
+        };
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let resolve = |pane_id| {
+            runtime.block_on(resolve_pane_capabilities(
+                &crate::cx::for_testing(),
+                pane_id,
+                None,
+                Some(Path::new("/nonexistent/ft-capability-test.sock")),
+            ))
+        };
+
+        let _prompt = set_test_pane_state_override(state(4_401, LiveShellState::Prompt));
+        let prompt = resolve(4_401);
+        assert!(prompt.capabilities.prompt_active);
+        assert_eq!(prompt.capabilities.alt_screen, Some(false));
+
+        let _running = set_test_pane_state_override(state(4_402, LiveShellState::CommandRunning));
+        assert!(resolve(4_402).capabilities.command_running);
+
+        let _down = set_test_pane_state_override(state(4_403, LiveShellState::Unavailable));
+        let down = resolve(4_403);
+        assert!(!down.capabilities.prompt_active);
+        assert!(
+            down.warnings
+                .iter()
+                .any(|warning| warning == "Live prompt state unavailable: mux gone"),
+            "{:?}",
+            down.warnings
+        );
+    }
+
+    #[test]
+    fn pane_state_json_without_live_prompt_still_parses() {
+        let state: IpcPaneState = serde_json::from_value(serde_json::json!({
+            "pane_id": 1, "known": true, "live_prompt": null
+        }))
+        .unwrap();
+        assert_eq!(state.live_prompt, None);
+        let state: IpcPaneState = serde_json::from_value(serde_json::json!({
+            "pane_id": 1, "known": true,
+            "live_prompt": {"shell_state": "prompt", "last_exit_code": 0}
+        }))
+        .unwrap();
+        assert_eq!(
+            state.live_prompt.map(|live| live.shell_state),
+            Some(LiveShellState::Prompt)
+        );
+    }
+
     #[test]
     fn missing_evidence_never_widens_capabilities() {
         let state = IpcPaneState {
@@ -684,6 +981,7 @@ mod tests {
             in_gap: None,
             cursor_alt_screen: Some(false),
             reason: Some("not tracked".to_string()),
+            live_prompt: None,
         };
         let _guard = set_test_pane_state_override(state);
         let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
@@ -726,6 +1024,7 @@ mod tests {
             in_gap: Some(false),
             cursor_alt_screen: Some(false),
             reason: None,
+            live_prompt: None,
         };
         for drop_older_first in [true, false] {
             let older = set_test_pane_state_override(state.clone());

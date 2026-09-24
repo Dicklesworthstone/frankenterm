@@ -7206,6 +7206,7 @@ steps:
                         in_gap: Some(false),
                         cursor_alt_screen: Some(false),
                         reason: None,
+                        live_prompt: None,
                     },
                 );
             let temp_dir = tempfile::TempDir::new().unwrap();

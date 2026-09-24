@@ -14576,6 +14576,7 @@ mod tests {
             in_gap: Some(false),
             cursor_alt_screen: Some(false),
             reason: None,
+            live_prompt: None,
         }
     }
 

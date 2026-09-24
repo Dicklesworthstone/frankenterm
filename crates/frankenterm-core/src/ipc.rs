@@ -1245,6 +1245,8 @@ pub struct IpcHandlerContext {
     pub watcher_control_handler: Option<IpcWatcherControlHandler>,
     /// Optional search configuration for IPC status enrichment.
     pub search_config: Option<SearchConfig>,
+    /// Optional mux handle for live prompt evidence in `pane_state`.
+    pub semantic_source: Option<crate::wezterm::WeztermHandle>,
     connection_shutdown: crate::runtime_async::process::CommandCancellation,
     // NOTE: rate_limiter field was removed in v0.2.0 (StatusUpdate removed)
 }
@@ -1260,6 +1262,7 @@ impl IpcHandlerContext {
             rpc_handler: None,
             watcher_control_handler: None,
             search_config: None,
+            semantic_source: None,
             connection_shutdown: crate::runtime_async::process::CommandCancellation::new(),
         }
     }
@@ -1274,6 +1277,7 @@ impl IpcHandlerContext {
             rpc_handler: None,
             watcher_control_handler: None,
             search_config: None,
+            semantic_source: None,
             connection_shutdown: crate::runtime_async::process::CommandCancellation::new(),
         }
     }
@@ -1292,6 +1296,7 @@ impl IpcHandlerContext {
             rpc_handler: None,
             watcher_control_handler: None,
             search_config: None,
+            semantic_source: None,
             connection_shutdown: crate::runtime_async::process::CommandCancellation::new(),
         }
     }
@@ -1344,9 +1349,37 @@ impl IpcHandlerContext {
             rpc_handler,
             watcher_control_handler,
             search_config,
+            semantic_source: None,
             connection_shutdown: crate::runtime_async::process::CommandCancellation::new(),
         }
     }
+
+    /// Answer `pane_state` with live prompt evidence read from this mux.
+    #[must_use]
+    pub fn with_semantic_source(mut self, mux: crate::wezterm::WeztermHandle) -> Self {
+        self.semantic_source = Some(mux);
+        self
+    }
+}
+
+/// Budget for the live semantic-zone read behind one `pane_state` reply.
+const PANE_STATE_SEMANTIC_BUDGET: Duration = Duration::from_millis(750);
+
+/// Live prompt evidence for a `pane_state` reply, or `None` without a mux.
+async fn pane_state_live_prompt(
+    cx: &crate::cx::Cx,
+    pane_id: u64,
+    ctx: &IpcHandlerContext,
+) -> Option<serde_json::Value> {
+    let mux = ctx.semantic_source.as_ref()?;
+    let evidence = crate::pane_capability_resolution::fetch_live_prompt_evidence(
+        cx,
+        mux,
+        pane_id,
+        PANE_STATE_SEMANTIC_BUDGET,
+    )
+    .await;
+    serde_json::to_value(evidence).ok()
 }
 
 /// IPC server that runs in the watcher daemon.
@@ -1921,6 +1954,17 @@ impl IpcServer {
         self.run_with_context_with_cx(cx, ctx, &mut shutdown_rx)
             .await;
     }
+
+    /// Cx-first server loop over a caller-assembled handler context.
+    pub async fn run_with_handler_context_with_cx(
+        self,
+        cx: &crate::cx::Cx,
+        ctx: IpcHandlerContext,
+        mut shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        self.run_with_context_with_cx(cx, Arc::new(ctx), &mut shutdown_rx)
+            .await;
+    }
 }
 
 #[cfg(all(any(unix, windows), test))]
@@ -2182,6 +2226,17 @@ impl IpcServer {
         _rpc_handler: Option<IpcRpcHandler>,
         _watcher_control_handler: Option<IpcWatcherControlHandler>,
         _search_config: Option<SearchConfig>,
+        mut shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        tracing::warn!("IPC server not supported on this platform");
+        Self::recv_shutdown_with_cx(cx, &mut shutdown_rx).await;
+    }
+
+    /// Cx-first unsupported-platform server wait over a handler context.
+    pub async fn run_with_handler_context_with_cx(
+        self,
+        cx: &crate::cx::Cx,
+        _ctx: IpcHandlerContext,
         mut shutdown_rx: mpsc::Receiver<()>,
     ) {
         tracing::warn!("IPC server not supported on this platform");
@@ -3044,6 +3099,8 @@ async fn handle_pane_state(pane_id: u64, ctx: &IpcHandlerContext) -> IpcResponse
         };
         (entry.clone(), registry.get_cursor(pane_id).cloned())
     };
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    let live_prompt = pane_state_live_prompt(&cx, pane_id, ctx).await;
 
     // Note: "alt_screen" and "last_status_at" are deprecated fields (always false/null since v0.2.0).
     // Use "cursor_alt_screen" for authoritative alt-screen state from escape sequence detection.
@@ -3055,6 +3112,7 @@ async fn handle_pane_state(pane_id: u64, ctx: &IpcHandlerContext) -> IpcResponse
         "last_status_at": entry.last_status_at,  // DEPRECATED: always null
         "in_gap": cursor.as_ref().map(|c| c.in_gap),
         "cursor_alt_screen": cursor.as_ref().map(|c| c.in_alt_screen),  // Authoritative alt-screen state
+        "live_prompt": live_prompt,
     }))
 }
 
@@ -3132,6 +3190,7 @@ async fn handle_pane_state_with_cx(
         };
         (entry.clone(), registry.get_cursor(pane_id).cloned())
     };
+    let live_prompt = pane_state_live_prompt(cx, pane_id, ctx).await;
 
     IpcResponse::ok_with_data(serde_json::json!({
         "pane_id": pane_id,
@@ -3141,6 +3200,7 @@ async fn handle_pane_state_with_cx(
         "last_status_at": entry.last_status_at,
         "in_gap": cursor.as_ref().map(|c| c.in_gap),
         "cursor_alt_screen": cursor.as_ref().map(|c| c.in_alt_screen),
+        "live_prompt": live_prompt,
     }))
 }
 
