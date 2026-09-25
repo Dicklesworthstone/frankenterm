@@ -814,7 +814,20 @@ pub struct PaneInfo {
     pub extra: std::collections::HashMap<String, Value>,
 }
 
+/// `PaneInfo::extra` key under which a direct-mux listing reports whether the
+/// pane shows its alternate screen.
+pub const MUX_ALT_SCREEN_ACTIVE_KEY: &str = "alt_screen_active";
+
 impl PaneInfo {
+    /// Alternate-screen state from a direct-mux listing; `None` for sources
+    /// (such as `wezterm cli list`) that do not report it.
+    #[must_use]
+    pub fn mux_alt_screen_active(&self) -> Option<bool> {
+        self.extra
+            .get(MUX_ALT_SCREEN_ACTIVE_KEY)
+            .and_then(Value::as_bool)
+    }
+
     /// Get the effective domain name, falling back to "local" if not specified
     #[must_use]
     pub fn effective_domain(&self) -> &str {
@@ -1068,7 +1081,10 @@ impl From<&mux::tab::PaneEntry> for PaneInfo {
             top_row: Some(mux_usize_to_i64_saturating(entry.top_row)),
             is_active: entry.is_active_pane,
             is_zoomed: entry.is_zoomed_pane,
-            extra: std::collections::HashMap::new(),
+            extra: std::collections::HashMap::from([(
+                MUX_ALT_SCREEN_ACTIVE_KEY.to_string(),
+                Value::Bool(entry.alt_screen_active),
+            )]),
         }
     }
 }
@@ -5752,6 +5768,39 @@ mod tests {
         assert_eq!(pane.cursor_y, Some(u32::MAX));
         assert_eq!(pane.left_col, Some(u32::MAX));
         assert_eq!(pane.top_row, Some(i64::MAX));
+        assert_eq!(pane.mux_alt_screen_active(), Some(false));
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn pane_info_from_mux_entry_reports_alt_screen_and_cli_json_does_not() {
+        let entry = mux::tab::PaneEntry {
+            window_id: 1,
+            tab_id: 2,
+            pane_id: 3,
+            title: "vim".to_string(),
+            size: frankenterm_term::TerminalSize::default(),
+            working_dir: None,
+            alt_screen_active: true,
+            is_active_pane: true,
+            is_zoomed_pane: false,
+            workspace: "default".to_string(),
+            cursor_pos: mux::renderable::StableCursorPosition::default(),
+            physical_top: 0,
+            top_row: 0,
+            left_col: 0,
+            tty_name: None,
+        };
+        let pane = PaneInfo::from(&entry);
+        assert_eq!(pane.mux_alt_screen_active(), Some(true));
+        // It survives the JSON round trip ft list / IPC use.
+        let round_trip: PaneInfo =
+            serde_json::from_value(serde_json::to_value(&pane).unwrap()).unwrap();
+        assert_eq!(round_trip.mux_alt_screen_active(), Some(true));
+
+        let cli: PaneInfo =
+            serde_json::from_str(r#"{"pane_id": 1, "tab_id": 1, "window_id": 1}"#).unwrap();
+        assert_eq!(cli.mux_alt_screen_active(), None);
     }
 
     #[cfg(all(feature = "vendored", unix))]

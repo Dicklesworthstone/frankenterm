@@ -6990,6 +6990,16 @@ impl ObservationRuntime {
                             })
                             .collect::<HashMap<_, _>>();
                         metadata_writes.age_one_tick();
+                        // Direct-mux listings report alternate-screen state.
+                        // Vendored capture stores rendered rows, so this is the
+                        // only alt-screen evidence its panes ever get.
+                        let mux_alt_screen = panes
+                            .iter()
+                            .filter_map(|pane| {
+                                pane.mux_alt_screen_active()
+                                    .map(|active| (pane.pane_id, active))
+                            })
+                            .collect::<Vec<_>>();
                         let (diff, new_entries, metadata_entries, pending_capture_view) = {
                             let mut reg = registry.write().await;
                             let diff = reg.discovery_tick(panes);
@@ -7386,6 +7396,26 @@ impl ObservationRuntime {
                         // map capacity after exact removal. Avoiding discovery-time
                         // write locks on all three runtime maps materially cuts
                         // q200 lock contention.
+                        let stale_alt_screen = {
+                            let cursors_guard = cursors.read().await;
+                            mux_alt_screen
+                                .iter()
+                                .filter(|(pane_id, active)| {
+                                    cursors_guard
+                                        .get(pane_id)
+                                        .is_some_and(|cursor| cursor.in_alt_screen != *active)
+                                })
+                                .copied()
+                                .collect::<Vec<_>>()
+                        };
+                        if !stale_alt_screen.is_empty() {
+                            let mut cursors_guard = cursors.write().await;
+                            for (pane_id, active) in stale_alt_screen {
+                                if let Some(cursor) = cursors_guard.get_mut(&pane_id) {
+                                    cursor.in_alt_screen = active;
+                                }
+                            }
+                        }
                         let live_cursor_state = {
                             let cursors_guard = cursors.read().await;
                             cursors_guard
