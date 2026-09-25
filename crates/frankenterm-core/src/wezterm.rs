@@ -5758,6 +5758,7 @@ mod tests {
         };
 
         let pane = PaneInfo::from(&entry);
+        assert_eq!(pane.mux_alt_screen_active(), Some(false));
         let size = pane.size.expect("mux pane info should include size");
 
         assert_eq!(size.rows, u32::MAX);
@@ -5768,7 +5769,6 @@ mod tests {
         assert_eq!(pane.cursor_y, Some(u32::MAX));
         assert_eq!(pane.left_col, Some(u32::MAX));
         assert_eq!(pane.top_row, Some(i64::MAX));
-        assert_eq!(pane.mux_alt_screen_active(), Some(false));
     }
 
     #[cfg(all(feature = "vendored", unix))]
