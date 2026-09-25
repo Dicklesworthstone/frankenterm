@@ -1,7 +1,11 @@
 //! PAC-Bayesian Adaptive Backpressure for the Aegis Engine (ft-l5em3.3).
 //!
-//! Mathematically guarantees UI responsiveness (60 fps target) under extreme load
-//! using PAC-Bayesian bounds without unnecessarily starving agents.
+//! Chooses throttle decisions that keep UI responsiveness (60 fps target) under
+//! extreme load within PAC-Bayesian bounds without unnecessarily starving agents.
+//!
+//! **Not wired (ft-3agml):** no capture, ingest or render path consults these
+//! verdicts yet; only diagnostics and telemetry read them. Nothing is throttled
+//! and no responsiveness is guaranteed until the GUI frame loop acts on them.
 //!
 //! # Mathematical Formalization
 //!
