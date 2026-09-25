@@ -96863,11 +96863,11 @@ mod operator_guidance_tests {
         let elsewhere = tempfile::tempdir().expect("elsewhere");
         let contract = elsewhere.path().join("tx.json");
         std::fs::write(&contract, "{}").expect("contract");
-        let err = lock_mission_tx_contract(workspace.path(), &contract)
+        let err = super::lock_mission_tx_contract(workspace.path(), &contract)
             .err()
             .expect("outside contract must be refused");
         assert_eq!(err.error_code, "mission.path_escapes_workspace");
-        assert_eq!(err.exit_code, MISSION_EXIT_VALIDATION);
+        assert_eq!(err.exit_code, super::MISSION_EXIT_VALIDATION);
         assert!(err.message.contains("outside workspace root"), "{}", err.message);
         assert!(
             err.hint.unwrap_or_default().contains("under the workspace root"),
