@@ -13,6 +13,8 @@
 #                           `ft setup shell`, doctor "prompt evidence" warning
 #   either, no watcher   -> robot.approval_error naming `ft watch` (never a raw
 #                           FOREIGN KEY failure)
+#   fullscreen + watcher -> denied, policy.alt_screen, capabilities.alt_screen=true
+#                           (alt-screen state comes from the direct-mux listing)
 #   `ft tx run` with a prompt_active precondition commits on the integrated pane
 #   and is denied at prepare (typed prompt_active.inactive reason) on the bare one.
 #
@@ -83,6 +85,19 @@ while True:
         os.write(1, b'\r\n\x1b]133;C\x07ok\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ')
 PY
 
+cat > "$OUT/fullscreen-pane.py" <<'PY'
+import os, select, sys, tty
+tty.setraw(sys.stdin.fileno())
+os.write(1, b'\x1b]133;A\x07$ ')
+os.write(1, b'\x1b[?1049h\x1b[HFULLSCREEN APP')
+while True:
+    r, _, _ = select.select([0], [], [], 120)
+    if not r:
+        break
+    if not os.read(0, 4096):
+        break
+PY
+
 scenario() { # name  pane-command...
     local name="$1"; shift
     local D; D=$(mktemp -d /tmp/ftpe-XXXXXX)
@@ -146,7 +161,11 @@ PY
     echo "tx exit=$?" >> "$OUT/$name.tx-run.err"
     cp "$D/tx-contract.json" "$OUT/$name.tx-contract.json"
 
-    if [[ "$name" == integrated ]]; then
+    if [[ "$name" == fullscreen ]]; then
+        detail=$(json_expr "$OUT/$name.watch.json" \
+            'inj.get("status") == "denied" and dec.get("rule_id") == "policy.alt_screen" and caps.get("alt_screen") is True')
+        check "$name/watcher send into the alternate screen is denied" $? "$detail"
+    elif [[ "$name" == integrated ]]; then
         detail=$(json_expr "$OUT/$name.watch.json" \
             'd.get("ok") is True and inj.get("status") == "allowed" and caps.get("prompt_active") is True')
         check "$name/watcher send allowed on prompt evidence" $? "$detail"
@@ -173,6 +192,7 @@ PY
 
 scenario integrated /usr/bin/python3 "$OUT/osc133-pane.py"
 scenario bare /bin/zsh -f
+scenario fullscreen /usr/bin/python3 "$OUT/fullscreen-pane.py"
 
 echo "prompt evidence e2e: $PASS passed, $FAIL failed (artifacts: $OUT)"
 [[ "$FAIL" == 0 ]]
