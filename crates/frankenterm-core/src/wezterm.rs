@@ -2624,8 +2624,34 @@ impl WeztermClient {
                 let pool_result = if no_paste {
                     pool.write_to_pane_with_cx(cx, pane_id, data.into_bytes())
                         .await
+                        .map(|_| ())
                 } else {
-                    pool.send_paste_with_cx(cx, pane_id, data).await
+                    let (body, submit) = split_paste_submit(&data);
+                    if !submit {
+                        pool.send_paste_with_cx(cx, pane_id, data)
+                            .await
+                            .map(|_| ())
+                    } else {
+                        // An app with bracketed paste enabled (agent composers,
+                        // zsh) inserts a pasted newline instead of submitting,
+                        // so paste the body and type the Enter after it. The
+                        // paste is acknowledged only once committed to the pane,
+                        // which keeps the Enter behind it.
+                        let pasted = if body.is_empty() {
+                            Ok(())
+                        } else {
+                            pool.send_paste_with_cx(cx, pane_id, body.to_string())
+                                .await
+                                .map(|_| ())
+                        };
+                        match pasted {
+                            Ok(()) => pool
+                                .write_to_pane_with_cx(cx, pane_id, b"\r".to_vec())
+                                .await
+                                .map(|_| ()),
+                            Err(e) => Err(e),
+                        }
+                    }
                 };
                 match pool_result {
                     Ok(_) => {
@@ -3964,6 +3990,14 @@ impl WeztermClient {
             }
         }
     }
+}
+
+/// Split pasted text into the body to paste and whether it ends in a line
+/// ending that must be typed as Enter to submit.
+#[cfg_attr(not(all(feature = "vendored", unix)), allow(dead_code))]
+fn split_paste_submit(data: &str) -> (&str, bool) {
+    let body = data.trim_end_matches(['\n', '\r']);
+    (body, body.len() != data.len())
 }
 
 fn is_retryable_error(err: &crate::Error) -> bool {
@@ -5506,6 +5540,16 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::sync::Arc;
+
+    #[test]
+    fn paste_submit_splits_trailing_line_endings_into_one_enter() {
+        assert_eq!(split_paste_submit("hello\n"), ("hello", true));
+        assert_eq!(split_paste_submit("refresh\n\n"), ("refresh", true));
+        assert_eq!(split_paste_submit("a\nb\r\n"), ("a\nb", true));
+        assert_eq!(split_paste_submit("\n"), ("", true));
+        assert_eq!(split_paste_submit("no newline"), ("no newline", false));
+        assert_eq!(split_paste_submit(""), ("", false));
+    }
 
     fn isolated_cli_client() -> WeztermClient {
         WeztermClient::new().with_circuit_breaker_config(CircuitBreakerConfig::default())
