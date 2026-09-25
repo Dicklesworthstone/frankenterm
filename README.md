@@ -596,7 +596,7 @@ ft robot --format json events --unhandled --limit 50 | \
 ft robot wait-for 7 "Usage limit" --timeout-secs 3600
 ```
 
-`ft robot wait-for` takes a single `pane_id` and a substring (or regex with `--regex`). For fleet-wide reactions, inspect `ft robot events --unhandled` or use `--auto-handle`. Context compaction does not reset an account quota. A custom consumer must deduplicate and acknowledge events after an observed outcome, and pause when recovery needs operator approval.
+`ft robot wait-for` takes a single `pane_id` and a substring (or regex with `--regex`). For fleet-wide reactions, inspect `ft robot events --unhandled` or use `--auto-handle`. Context compaction does not reset an account quota. A custom consumer must deduplicate and acknowledge events after an observed outcome, and pause when recovery needs operator approval. Workflow sends pass the same policy gate as `ft robot send`: with the default `require_prompt_active = true`, a pane that publishes no OSC 133 prompt markers (agent TUIs such as Claude Code and Codex publish none) makes the workflow stop at an approval request (`policy.prompt_unknown`) instead of typing (ft-t4sma).
 
 ### Scenario 2 — Coordinate a multi-pane mission with safe rollback
 
