@@ -59,6 +59,103 @@ pub enum LiveShellState {
     CommandRunning,
     /// The semantic query failed; `detail` says why.
     Unavailable,
+    /// A known agent TUI (Codex, Claude Code) shows its empty-handed input
+    /// composer: no work in progress and no pending decision (ft-t4sma).
+    AgentReady,
+}
+
+/// What a known agent TUI's screen shows, read from the live screen tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentScreenState {
+    /// Input composer visible, nothing running, no menu or confirmation.
+    Ready,
+    /// The agent is working (it offers to interrupt).
+    Busy,
+    /// A menu, confirmation or trust prompt is waiting for a human choice.
+    /// Typed text plus Enter would select an option, so never type here.
+    AwaitingDecision,
+}
+
+/// Rows of the screen tail the agent classifier looks at.
+const AGENT_SCREEN_TAIL_ROWS: usize = 40;
+
+/// Classify the bottom of a pane's screen as a known agent TUI state.
+///
+/// Conservative by construction: a decision prompt anywhere in the tail wins,
+/// then any busy marker, and only an exact agent composer layout reads as
+/// ready. Unrecognized screens return `None` and keep their other evidence.
+#[must_use]
+pub fn classify_agent_screen(tail: &str) -> Option<(&'static str, AgentScreenState)> {
+    let lines: Vec<&str> = tail
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let lines = &lines[lines.len().saturating_sub(AGENT_SCREEN_TAIL_ROWS)..];
+    let lower: Vec<String> = lines.iter().map(|line| line.to_lowercase()).collect();
+    let any = |needles: &[&str]| {
+        lower
+            .iter()
+            .any(|line| needles.iter().any(|needle| line.contains(needle)))
+    };
+    // Box-drawing borders are stripped so boxed menus read like plain ones.
+    let content = |line: &str| {
+        line.trim_matches(|c: char| c == '│' || c.is_whitespace())
+            .to_string()
+    };
+    let selected_menu_item = lines.iter().any(|line| {
+        let text = content(*line);
+        ['›', '❯', '●', '>'].iter().any(|marker| {
+            text.strip_prefix(*marker)
+                .map(str::trim_start)
+                .is_some_and(|rest| {
+                    rest.split_once('.')
+                        .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+                })
+        })
+    });
+
+    let codex_composer = lines.iter().any(|line| line.starts_with("› "))
+        && any(&["? for shortcuts"]);
+    let claude_composer = lines.windows(3).any(|window| {
+        window[0].trim_start().starts_with('─')
+            && window[1].starts_with('❯')
+            && window[2].trim_start().starts_with('─')
+    });
+    let agent = if codex_composer || any(&["openai codex", "codex can read", "agent command center"]) {
+        "codex"
+    } else if claude_composer || any(&["claude code"]) {
+        "claude_code"
+    } else if any(&["gemini cli", "gemini code assist"]) {
+        "gemini"
+    } else {
+        return None;
+    };
+
+    if selected_menu_item
+        || any(&[
+            "enter to confirm",
+            "enter to select",
+            "enter continue",
+            "esc to cancel",
+            "trust this folder",
+            "trust the files",
+            "do you want to",
+            "(y/n)",
+            "[y/n]",
+            "allow command",
+            "approve",
+        ])
+    {
+        return Some((agent, AgentScreenState::AwaitingDecision));
+    }
+    if any(&["esc to interrupt", "to interrupt)", "ctrl+c to interrupt"]) {
+        return Some((agent, AgentScreenState::Busy));
+    }
+    if codex_composer || claude_composer {
+        return Some((agent, AgentScreenState::Ready));
+    }
+    None
 }
 
 /// Live prompt evidence carried in the watcher's `pane_state` reply.
@@ -134,7 +231,9 @@ impl LivePromptEvidence {
     pub fn osc_state(&self) -> Option<Osc133State> {
         let state = match self.shell_state {
             LiveShellState::NoIntegration | LiveShellState::Unavailable => return None,
-            LiveShellState::Prompt => crate::ingest::ShellState::PromptActive,
+            LiveShellState::Prompt | LiveShellState::AgentReady => {
+                crate::ingest::ShellState::PromptActive
+            }
             LiveShellState::Input => crate::ingest::ShellState::InputActive,
             LiveShellState::CommandRunning => crate::ingest::ShellState::CommandRunning,
         };
@@ -167,7 +266,38 @@ pub async fn fetch_live_prompt_evidence(
                 .and_then(|pane| pane.cursor_y)
                 .map(i64::from)
         });
-        LivePromptEvidence::from_semantic_zones(&snapshot, cursor_row)
+        let evidence = LivePromptEvidence::from_semantic_zones(&snapshot, cursor_row);
+        // Agent TUIs publish no OSC 133 of their own, and inside an integrated
+        // shell they read as a running command. Their screen says more.
+        if !matches!(
+            evidence.shell_state,
+            LiveShellState::NoIntegration | LiveShellState::CommandRunning
+        ) {
+            return evidence;
+        }
+        let Ok(tail) = mux
+            .get_text_tail_with_cx(cx, pane_id, false, Some(AGENT_SCREEN_TAIL_ROWS * 2))
+            .await
+        else {
+            return evidence;
+        };
+        match classify_agent_screen(&tail.text) {
+            Some((agent, AgentScreenState::Ready)) => LivePromptEvidence {
+                shell_state: LiveShellState::AgentReady,
+                last_exit_code: evidence.last_exit_code,
+                detail: Some(format!("agent_ready:{agent}")),
+            },
+            Some((agent, state)) => LivePromptEvidence {
+                shell_state: LiveShellState::CommandRunning,
+                last_exit_code: evidence.last_exit_code,
+                detail: Some(if state == AgentScreenState::Busy {
+                    format!("agent_busy:{agent}")
+                } else {
+                    format!("agent_awaiting_decision:{agent}")
+                }),
+            },
+            None => evidence,
+        }
     };
     match crate::runtime_async::timeout_with_cx(cx, budget, fetch).await {
         Ok(evidence) => evidence,
@@ -469,6 +599,10 @@ pub async fn resolve_pane_capabilities_with_source(
                     if let Some(live) = &state.live_prompt {
                         if let Some(live_state) = live.osc_state() {
                             osc_state = Some(live_state);
+                            // Name agent-screen evidence so a denial explains itself.
+                            if let Some(detail) = &live.detail {
+                                warnings.push(bounded_detail("Live prompt evidence: ", detail));
+                            }
                         } else if let Some(detail) = &live.detail {
                             warnings.push(bounded_detail("Live prompt state unavailable: ", detail));
                         }
@@ -915,6 +1049,80 @@ mod tests {
             ),
             LiveShellState::CommandRunning
         );
+    }
+
+    fn agent_screen(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/agent_screens")
+            .join(name);
+        std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+    }
+
+    #[test]
+    fn real_agent_idle_composers_read_ready() {
+        // Captured from codex-cli 0.157.0 and Claude Code 2.1.282 idle in a
+        // trusted folder (ft-t4sma); no input was sent.
+        assert_eq!(
+            classify_agent_screen(&agent_screen("codex_0157_idle.txt")),
+            Some(("codex", AgentScreenState::Ready))
+        );
+        assert_eq!(
+            classify_agent_screen(&agent_screen("claude_code_2_1_idle.txt")),
+            Some(("claude_code", AgentScreenState::Ready))
+        );
+    }
+
+    #[test]
+    fn real_agent_trust_menus_await_a_decision_and_are_never_ready() {
+        // Typing text plus Enter into these menus would pick an option.
+        for (fixture, agent) in [
+            ("codex_0157_trust_menu.txt", "codex"),
+            ("claude_code_2_1_trust_menu.txt", "claude_code"),
+            ("gemini_trust_menu.txt", "gemini"),
+        ] {
+            assert_eq!(
+                classify_agent_screen(&agent_screen(fixture)),
+                Some((agent, AgentScreenState::AwaitingDecision)),
+                "{fixture}"
+            );
+        }
+    }
+
+    #[test]
+    fn busy_and_permission_screens_are_not_ready() {
+        // Synthetic, in the agents' documented layouts: working status lines
+        // sit above a still-visible composer.
+        let codex_busy = "• Working (12s • esc to interrupt)\n\n› Ask Codex to do anything\n  ? for shortcuts\n";
+        assert_eq!(
+            classify_agent_screen(codex_busy),
+            Some(("codex", AgentScreenState::Busy))
+        );
+        let claude_busy = "✻ Pondering… (8s · esc to interrupt)\n────────\n❯ \n────────\n  ? for shortcuts\n";
+        assert_eq!(
+            classify_agent_screen(claude_busy),
+            Some(("claude_code", AgentScreenState::Busy))
+        );
+        let claude_permission = "Claude Code\n Do you want to make this edit to main.rs?\n ❯ 1. Yes\n   2. Yes, allow all edits\n   3. No\n";
+        assert_eq!(
+            classify_agent_screen(claude_permission),
+            Some(("claude_code", AgentScreenState::AwaitingDecision))
+        );
+        // Plain shells and unknown programs are not agent screens.
+        assert_eq!(classify_agent_screen("$ ls\nfoo bar\n$ "), None);
+        assert_eq!(classify_agent_screen(""), None);
+    }
+
+    #[test]
+    fn agent_ready_is_prompt_evidence_and_agent_busy_is_a_running_command() {
+        let ready = LivePromptEvidence {
+            shell_state: LiveShellState::AgentReady,
+            last_exit_code: None,
+            detail: Some("agent_ready:codex".to_string()),
+        };
+        let caps = PaneCapabilities::from_ingest_state(ready.osc_state().as_ref(), Some(false), false);
+        assert!(caps.prompt_active && !caps.command_running);
+        let json = serde_json::to_value(&ready).unwrap();
+        assert_eq!(json["shell_state"], "agent_ready");
     }
 
     #[test]
