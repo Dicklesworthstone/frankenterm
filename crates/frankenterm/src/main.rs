@@ -90472,6 +90472,49 @@ fn wezterm_config_path_for_output(path: &Path) -> String {
 ///
 /// Returns `(scrollback_lines, config_path)` after admitting a finite regular
 /// UTF-8 config file, or a content-free failure classification.
+/// Every config file the scrollback check looks for, in precedence order.
+fn scrollback_config_paths() -> Vec<PathBuf> {
+    [
+        dirs::home_dir().map(|root| root.join(".frankenterm.lua")),
+        dirs::home_dir().map(|root| root.join(".config/frankenterm/frankenterm.lua")),
+        dirs::config_dir().map(|root| root.join("frankenterm/frankenterm.lua")),
+        dirs::config_dir().map(|root| root.join("wezterm/wezterm.lua")),
+        dirs::home_dir().map(|root| root.join(".wezterm.lua")),
+        dirs::home_dir().map(|root| root.join(".config/wezterm/wezterm.lua")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// Other existing configs whose `scrollback_lines` differs from the active
+/// one (ft-erfq8): a copy-pasted value in several files drifts invisibly.
+fn disagreeing_scrollback_configs(active: &Path, active_lines: u64) -> Vec<(PathBuf, Option<u64>)> {
+    const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+    let active_canonical = std::fs::canonicalize(active).ok();
+    let mut seen = std::collections::HashSet::new();
+    scrollback_config_paths()
+        .into_iter()
+        .filter(|path| {
+            std::fs::symlink_metadata(path)
+                .is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_CONFIG_BYTES)
+        })
+        // The same file reached through two roots counts once.
+        .filter(|path| match std::fs::canonicalize(path) {
+            Ok(canonical) => {
+                Some(&canonical) != active_canonical.as_ref() && seen.insert(canonical)
+            }
+            Err(_) => false,
+        })
+        .filter_map(|path| {
+            let lines = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|content| parse_wezterm_scrollback_lines(&content));
+            (lines != Some(active_lines)).then_some((path, lines))
+        })
+        .collect()
+}
+
 fn check_wezterm_scrollback() -> Result<(u64, PathBuf), WeztermScrollbackCheckFailure> {
     // Each candidate is resolved beneath an explicitly opened authority root.
     // cap-std then confines intermediate symlinks to that root, while the final
@@ -98748,7 +98791,28 @@ async fn run_diagnostics(
     // Check 3: WezTerm scrollback configuration
     match check_wezterm_scrollback() {
         Ok((lines, path)) => {
-            if lines >= RECOMMENDED_SCROLLBACK_LINES {
+            let disagreeing = disagreeing_scrollback_configs(&path, lines);
+            if !disagreeing.is_empty() {
+                let others = disagreeing
+                    .iter()
+                    .map(|(other, value)| {
+                        format!(
+                            "{} = {}",
+                            wezterm_config_path_for_output(other),
+                            value.map_or_else(|| "unset".to_string(), |v| v.to_string())
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                checks.push(DiagnosticCheck::warning(
+                    "WezTerm scrollback",
+                    format!(
+                        "{lines} lines ({}); other configs disagree: {others}",
+                        wezterm_config_path_for_output(&path)
+                    ),
+                    "Keep scrollback_lines in one config file; the others drift unseen (ft-erfq8)",
+                ));
+            } else if lines >= RECOMMENDED_SCROLLBACK_LINES {
                 checks.push(DiagnosticCheck::ok_with_detail(
                     "WezTerm scrollback",
                     format!(
@@ -102475,6 +102539,25 @@ mod tests {
             assert!(detail.starts_with("1/2"), "{detail}");
             assert!(detail.contains("panes 2"), "{detail}");
         });
+    }
+
+    #[test]
+    fn scrollback_configs_that_disagree_with_the_active_one_are_named() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let active = dir.path().join("frankenterm.lua");
+        std::fs::write(&active, "config.scrollback_lines = 50000\n").unwrap();
+        // Only the active file exists among the real candidate paths here, so
+        // nothing else can disagree in this sandbox.
+        assert!(disagreeing_scrollback_configs(&active, 50_000)
+            .iter()
+            .all(|(path, _)| path != &active));
+        assert_eq!(
+            parse_wezterm_scrollback_lines("config.scrollback_lines = 100000\n"),
+            Some(100_000)
+        );
+        assert!(scrollback_config_paths()
+            .iter()
+            .any(|path| path.ends_with(".frankenterm.lua")));
     }
 
     #[test]
