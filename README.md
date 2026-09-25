@@ -1896,7 +1896,7 @@ Regex patterns catch known failure modes. But what about novel failures that nob
 
 The BOCPD module maintains a posterior distribution over possible "run lengths" (how long the current regime has lasted). When the posterior probability of a regime change exceeds a configurable threshold, a change-point event is emitted. This triggers a context snapshot that captures the execution environment (CWD, env vars, process info, shell state) at microsecond precision.
 
-The system also includes ARS (Autonomous Reflex System) modules in `frankenterm-core-ars` for drift detection, evidence ledgers, blast-radius estimation, and compile-time regime analysis. These are used for post-incident forensics and proactive monitoring.
+The workspace also carries ARS (Autonomous Reflex System) modules in `frankenterm-core-ars` for drift detection, evidence ledgers, blast-radius estimation, secret scanning, and compile-time regime analysis. They are implemented and tested but not wired into any live path yet: no production code consults them, so they scan, intercept, and gate nothing today (ft-7p0qz).
 
 ---
 
