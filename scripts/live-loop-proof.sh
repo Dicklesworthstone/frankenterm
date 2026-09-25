@@ -10,11 +10,11 @@
 #   2. detections from >= 3 rule families: codex.usage.reached, claude_code.compaction,
 #      gemini.usage.reached
 #   3. ft watch --auto-handle runs handle_compaction and its prompt reaches a claude pane
-#   4. a robot send into a full-screen pane is denied (policy.alt_screen)
+#   4. a robot send into a full-screen pane is denied (policy.alt_screen) and audited
 #   5. FTS search finds the usage-limit text in >= 2 panes
-#   6. `ft robot state` latency p95 recorded; asserted < 500 ms only for release builds
+#   6. `ft robot state` latency p95 < 500 ms (asserted on every build profile)
 #
-# usage: scripts/live-loop-proof.sh [BIN_DIR]   (default target/debug)
+# usage: [LIVE_LOOP_RETAIN=1] scripts/live-loop-proof.sh [BIN_DIR]   (default target/debug)
 # Writes tests/e2e/artifacts/live-loop/<run>/receipt.json plus all logs.
 set -uo pipefail
 umask 077
@@ -180,6 +180,10 @@ ft robot send "$FULL" "x" --no-paste > "$OUT/fullscreen-send.json" 2> /dev/null
 python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));inj=(d.get("data") or {}).get("injection") or {};dec=inj.get("decision") or {};sys.exit(0 if inj.get("status")=="denied" and dec.get("rule_id")=="policy.alt_screen" else 1)' \
   "$OUT/fullscreen-send.json"
 check "robot_send_into_fullscreen_pane_is_denied" $? "pane $FULL"
+ft audit --format json --pane "$FULL" --limit 50 > "$OUT/fullscreen-audit.json" 2> /dev/null
+python3 -c 'import json,sys;rows=json.load(open(sys.argv[1]));sys.exit(0 if any(r.get("rule_id")=="policy.alt_screen" and r.get("policy_decision")=="deny" for r in rows) else 1)' \
+  "$OUT/fullscreen-audit.json"
+check "alt_screen_denial_has_audit_row" $? "ft audit --pane $FULL"
 
 ft robot --format json search "usage limit" --limit 50 > "$OUT/search.json" 2> /dev/null
 HIT_PANES=$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));r=d["data"].get("results") or d["data"].get("hits") or [];print(len({h["pane_id"] for h in r}))' "$OUT/search.json" 2> /dev/null || echo 0)
@@ -198,25 +202,27 @@ samples.sort()
 open(out, "w").write(f"{samples[int(len(samples) * 0.95) - 1]:.0f}\n")
 PY
 P95=$(cat "$OUT/state-latency.txt")
-if [[ "$PROFILE" == release ]]; then
-  (( P95 < 500 )); check "robot_state_p95_under_500ms" $? "${P95} ms"
-else
-  echo "INFO robot state p95 ${P95} ms (debug build; the 500 ms gate applies to release)"
-fi
+(( P95 < 500 )); check "robot_state_p95_under_500ms" $? "${P95} ms ($PROFILE build)"
 
-python3 - "$OUT/receipt.json" "$PROFILE" "$PANES" "$P95" "${CHECKS[@]}" <<'PY'
+python3 - "$OUT/receipt.json" "$PROFILE" "$PANES" "$P95" "$("$FT_BIN" --version 2> /dev/null)" "${CHECKS[@]}" <<'PY'
 import json, platform, subprocess, sys, time
-checks = [json.loads(c) for c in sys.argv[5:]]
+checks = [json.loads(c) for c in sys.argv[6:]]
 receipt = {
     "schema": "ft.live-loop-proof.v1", "tier": 2, "adapter": "live-mux",
     "panes": "scripted (no model calls)", "build_profile": sys.argv[2],
     "pane_count": int(sys.argv[3]), "robot_state_p95_ms": int(sys.argv[4]),
     "host": platform.node(), "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     "commit": subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip(),
+    "crates_dirty": bool(subprocess.run(["git", "status", "--short", "--", "crates"], capture_output=True, text=True).stdout.strip()),
+    "ft_version": sys.argv[5].strip(),
     "status": "pass" if checks and all(c["ok"] for c in checks) else "fail",
     "checks": checks,
 }
 json.dump(receipt, open(sys.argv[1], "w"), indent=2)
 print(f"live-loop tier 2: {receipt['status']} ({sum(c['ok'] for c in checks)}/{len(checks)})")
 PY
-python3 -c 'import json,sys;sys.exit(0 if json.load(open(sys.argv[1]))["status"]=="pass" else 1)' "$OUT/receipt.json"
+python3 -c 'import json,sys;sys.exit(0 if json.load(open(sys.argv[1]))["status"]=="pass" else 1)' "$OUT/receipt.json" || exit 1
+# LIVE_LOOP_RETAIN=1 keeps a passing receipt as the tier-2 attestation.
+if [[ "${LIVE_LOOP_RETAIN:-0}" == 1 ]]; then
+  cp "$OUT/receipt.json" "$REPO_ROOT/docs/attestations/proofs/live-loop-tier2.json"
+fi
