@@ -816,6 +816,23 @@ impl WorkflowRunner {
         self
     }
 
+    /// Share the observation runtime's registry and the mux it observes, so
+    /// workflow sends also see live prompt evidence from semantic zones.
+    #[must_use]
+    pub fn with_watcher_registry_and_mux(
+        mut self,
+        registry: Arc<crate::runtime_async::RwLock<crate::ingest::PaneRegistry>>,
+        mux: crate::wezterm::WeztermHandle,
+    ) -> Self {
+        self.injector = self.injector.with_capability_source(
+            Arc::clone(&self.storage),
+            Some(crate::pane_capability_resolution::WatcherCapabilitySource::RegistryWithMux(
+                registry, mux,
+            )),
+        );
+        self
+    }
+
     /// Attach a replay capture adapter for workflow step decision provenance.
     #[must_use]
     pub fn with_replay_capture_adapter(

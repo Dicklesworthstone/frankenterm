@@ -341,7 +341,9 @@ tty.setraw(sys.stdin.fileno())
 (root / 'pane-owner.json').write_text(json.dumps({'pid': os.getpid(), 'parent_pid': os.getppid()}))
 received = (root / 'pane-input.bin').open('ab', buffering=0)
 deadline, previous, total = time.monotonic() + 180, '0', 0
-os.write(1, b'\x1b]2;claude-code-owned-fixture\x07\x1b]133;A\x07fixture ready\r\n')
+# A real prompt leaves the cursor on the prompt line (live prompt evidence
+# reads a cursor below the last prompt as a submitted command).
+os.write(1, b'\x1b]2;claude-code-owned-fixture\x07\x1b]133;A\x07fixture ready> ')
 while time.monotonic() < deadline:
     phase = (root / 'phase').read_text().strip()
     if phase == 'stop':
@@ -349,8 +351,8 @@ while time.monotonic() < deadline:
     if phase in {'1', '2', '3'} and phase != previous:
         previous = phase
         number = int(phase)
-        os.write(1, f'Conversation compacted: {9000 + number} tokens to {4500 + number}\r\n'.encode())
-        os.write(1, b'\x1b]133;A\x07fixture ready\r\n')
+        os.write(1, f'\r\nConversation compacted: {9000 + number} tokens to {4500 + number}\r\n'.encode())
+        os.write(1, b'\x1b]133;A\x07fixture ready> ')
         (root / 'pane-phase.json').write_text(json.dumps({'phase': number, 'pid': os.getpid()}))
     ready, _, _ = select.select([0], [], [], 0.1)
     if ready:
@@ -362,7 +364,7 @@ while time.monotonic() < deadline:
             raise RuntimeError('owned PTY input exceeded fixture cap')
         received.write(chunk)
         os.fsync(received.fileno())
-        os.write(1, b'RC3_FIXTURE_INPUT_RECEIVED\r\n\x1b]133;A\x07')
+        os.write(1, b'\r\nRC3_FIXTURE_INPUT_RECEIVED\r\n\x1b]133;A\x07fixture ready> ')
 else:
     raise RuntimeError('owned pane fixture deadline exceeded')
 PY

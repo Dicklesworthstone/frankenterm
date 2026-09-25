@@ -47374,7 +47374,7 @@ async fn run_watcher(
             injector,
             runner_config,
         )
-        .with_watcher_registry(runtime.pane_registry());
+        .with_watcher_registry_and_mux(runtime.pane_registry(), wezterm_handle.clone());
 
         register_builtin_workflows(&workflow_runner, &config.workflows);
         let enabled_names = enabled_builtin_workflows(&config.workflows)

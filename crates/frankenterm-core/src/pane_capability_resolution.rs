@@ -190,6 +190,12 @@ pub struct CapabilityResolution {
 pub enum WatcherCapabilitySource {
     Ipc(std::path::PathBuf),
     Registry(std::sync::Arc<crate::runtime_async::RwLock<crate::ingest::PaneRegistry>>),
+    /// The live registry plus the mux it observes, for live prompt evidence
+    /// (vendored capture stores rendered rows, so storage has no OSC 133).
+    RegistryWithMux(
+        std::sync::Arc<crate::runtime_async::RwLock<crate::ingest::PaneRegistry>>,
+        crate::wezterm::WeztermHandle,
+    ),
 }
 
 impl WatcherCapabilitySource {
@@ -200,6 +206,35 @@ impl WatcherCapabilitySource {
     ) -> Result<Option<IpcPaneState>, String> {
         match self {
             Self::Ipc(path) => fetch_pane_state_from_ipc(cx, path, pane_id).await,
+            Self::RegistryWithMux(registry, mux) => {
+                let Some(mut state) = Self::Registry(std::sync::Arc::clone(registry))
+                    .registry_pane_state(cx, pane_id)
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                state.live_prompt = Some(
+                    fetch_live_prompt_evidence(
+                        cx,
+                        mux,
+                        pane_id,
+                        std::time::Duration::from_millis(750),
+                    )
+                    .await,
+                );
+                Ok(Some(state))
+            }
+            Self::Registry(_) => self.registry_pane_state(cx, pane_id).await,
+        }
+    }
+
+    async fn registry_pane_state(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+    ) -> Result<Option<IpcPaneState>, String> {
+        match self {
+            Self::Ipc(_) | Self::RegistryWithMux(..) => Ok(None),
             Self::Registry(registry) => {
                 let registry = registry
                     .read_with_cx(cx)
