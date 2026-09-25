@@ -38,7 +38,7 @@ FAKE_TOKEN="sk-ant-api03-FGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGH"
 
 run_mode() {
     local MODE="$1"
-    local D SOCK PORT PANE MUXPID CURL CURL_OTHER TRIGGERED ARRIVED
+    local D SOCK PORT PANE MUXPID CURL CURL_OTHER TRIGGERED ARRIVED WEB_PID=
     local PIDS=()
     D=$(mktemp -d /tmp/ftws-XXXXXX)
     mkdir -p "$D/.ft" "$D/home" "$D/config" "$D/cache" "$D/data" "$D/state" "$D/runtime" "$D/tmp"
@@ -71,7 +71,7 @@ run_mode() {
         ft watch --foreground --poll-interval 500 > "$OUT/$MODE.watch.log" 2>&1 &
         PIDS+=("$!")
         ft web --port "$PORT" > "$OUT/$MODE.web.log" 2>&1 &
-        PIDS+=("$!")
+        WEB_PID=$!; PIDS+=("$WEB_PID")
     fi
     for _ in $(seq 1 100); do
         curl -s -o /dev/null "http://127.0.0.1:$PORT/health" && break
@@ -123,6 +123,35 @@ except Exception:
     done
     ARRIVED=$(now)
     sleep "${DELTA_SETTLE_SECS:-2}"
+
+    if [[ -n "$WEB_PID" ]]; then
+        # Slow client: subscribes to the busiest stream and never reads, while
+        # the pane floods. The server must stay bounded and responsive.
+        local rss_before rss_after web_proc
+        # $! is the subshell running the ft() wrapper; env execs ft in its child.
+        web_proc=$(pgrep -P "$WEB_PID" | head -1)
+        web_proc=${web_proc:-$WEB_PID}
+        rss_before=$(ps -o rss= -p "$web_proc" | tr -d ' ')
+        python3 -c '
+import socket, sys, time
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+s.sendall(f"GET /stream/deltas?pane_id={sys.argv[2]}&max_hz=100 HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+time.sleep(float(sys.argv[3]))
+' "$PORT" "$PANE" 20 &
+        local slow=$!
+        ft send --no-paste "$PANE" 'for i in {1..20000}; do echo flood-$i-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done' \
+            > "$OUT/$MODE.send5.log" 2>&1
+        sleep 15
+        rss_after=$(ps -o rss= -p "$web_proc" | tr -d ' ')
+        curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/health" > "$OUT/$MODE.health-under-slow-client.txt"
+        kill "$slow" 2> /dev/null; wait "$slow" 2> /dev/null
+        echo "$MODE web RSS ${rss_before} KiB -> ${rss_after} KiB under a non-reading client"
+        [[ "$(cat "$OUT/$MODE.health-under-slow-client.txt")" == 200 ]] \
+            && (( rss_after - rss_before < 51200 ))
+        check "$MODE/a non-reading client leaves the server bounded and responsive" $? \
+            "rss ${rss_before}->${rss_after} KiB, health $(cat "$OUT/$MODE.health-under-slow-client.txt")"
+    fi
 
     for pid in "${PIDS[@]}"; do kill "$pid" 2> /dev/null; done
     for pid in "${PIDS[@]}"; do wait "$pid" 2> /dev/null; done
