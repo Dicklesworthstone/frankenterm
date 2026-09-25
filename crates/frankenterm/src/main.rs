@@ -42966,6 +42966,10 @@ async fn bootstrap_recorder_backend_with_probe(
         })
     })
     .await?;
+    // ft-w1nas: roll the append log into sealed segments and keep a 2 GiB budget.
+    let storage = storage.with_append_log_retention(
+        frankenterm_core::recorder_storage::AppendLogRetention::WATCHER_DEFAULT,
+    );
 
     let health = storage.health_with_cx(cx).await;
     if let Some(reason) = recorder_startup_health_failure_reason(&health) {
@@ -96097,7 +96101,8 @@ fn session_persistence_is_healthy(
 }
 
 /// Recorder files larger than this get a doctor warning (ft-w1nas).
-const RECORDER_STORAGE_WARN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Past the append-log budget plus an active segment and a margin.
+const RECORDER_STORAGE_WARN_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 
 /// `ft doctor` row for recorder disk usage. Every captured segment is also
 /// written to the recorder, which has no rotation or retention yet
@@ -96109,7 +96114,7 @@ fn recorder_storage_diagnostic_check(recorder_dir: &Path) -> DiagnosticCheck {
         "events.sqlite3-wal",
         "events.sqlite3-shm",
     ];
-    let sizes: Vec<(&str, u64)> = FILES
+    let mut sizes: Vec<(&str, u64)> = FILES
         .iter()
         .filter_map(|name| {
             std::fs::metadata(recorder_dir.join(name))
@@ -96117,6 +96122,26 @@ fn recorder_storage_diagnostic_check(recorder_dir: &Path) -> DiagnosticCheck {
                 .map(|meta| (*name, meta.len()))
         })
         .collect();
+    // Sealed append-log segments (events.log.<segment>.<first>-<end>).
+    let (sealed_count, sealed_bytes) = std::fs::read_dir(recorder_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with("events.log.") && name.contains('-'))
+                })
+                .filter_map(|entry| entry.metadata().ok())
+                .fold((0_usize, 0_u64), |(count, bytes), meta| {
+                    (count + 1, bytes + meta.len())
+                })
+        })
+        .unwrap_or((0, 0));
+    if sealed_count > 0 {
+        sizes.push(("sealed segments", sealed_bytes));
+    }
     if sizes.is_empty() {
         return DiagnosticCheck::ok_with_detail("recorder storage", "no recorder files yet");
     }
@@ -96127,14 +96152,20 @@ fn recorder_storage_diagnostic_check(recorder_dir: &Path) -> DiagnosticCheck {
         .collect::<Vec<_>>()
         .join(", ");
     let detail = format!(
-        "{} total ({listing}); the recorder has no rotation or retention yet (ft-w1nas)",
-        format_bytes_human(total)
+        "{} total ({listing}); the watcher rolls events.log every {} and keeps {} of sealed segments",
+        format_bytes_human(total),
+        format_bytes_human(
+            frankenterm_core::recorder_storage::AppendLogRetention::WATCHER_DEFAULT.roll_at_bytes
+        ),
+        format_bytes_human(
+            frankenterm_core::recorder_storage::AppendLogRetention::WATCHER_DEFAULT.max_total_bytes
+        ),
     );
     if total >= RECORDER_STORAGE_WARN_BYTES {
         DiagnosticCheck::warning(
             "recorder storage",
             detail,
-            "Stop the watcher and archive or remove .ft/recorder-log if disk space matters; retention is not automatic yet",
+            "Above the append-log budget: an events.sqlite3 recorder or a checkpointed consumer (which pauses rolling) is holding space; archive or remove .ft/recorder-log with the watcher stopped",
         )
     } else {
         DiagnosticCheck::ok_with_detail("recorder storage", detail)
@@ -102430,7 +102461,14 @@ mod tests {
         assert!(matches!(small.status, DiagnosticStatus::Ok));
         let detail = small.detail.unwrap_or_default();
         assert!(detail.contains("events.log 3.0 KiB"), "{detail}");
-        assert!(detail.contains("ft-w1nas"), "{detail}");
+        assert!(detail.contains("rolls events.log every 256.0 MiB"), "{detail}");
+
+        let sealed = "events.log.00000000000000000000.00000000000000000000-00000000000000000009";
+        std::fs::write(dir.path().join(sealed), vec![0_u8; 2 * 1024]).unwrap();
+        let rolled = recorder_storage_diagnostic_check(dir.path());
+        let detail = rolled.detail.unwrap_or_default();
+        assert!(detail.contains("sealed segments 2.0 KiB"), "{detail}");
+        assert!(detail.starts_with("5.0 KiB total"), "{detail}");
 
         // A sparse file reports its logical length without using real disk.
         let big = std::fs::File::create(dir.path().join("events.sqlite3")).unwrap();

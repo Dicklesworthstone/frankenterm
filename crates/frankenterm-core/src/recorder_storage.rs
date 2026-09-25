@@ -792,6 +792,101 @@ impl Default for AppendLogStorageConfig {
     }
 }
 
+/// Size-bounded retention for the append log (ft-w1nas).
+///
+/// Once the active log reaches `roll_at_bytes` it is sealed into a numbered
+/// segment file beside it and a fresh active log starts; ordinals continue.
+/// After each roll the oldest sealed segments are deleted while the recorder's
+/// append-log files exceed `max_total_bytes`. Rolling and deletion only happen
+/// while no consumer checkpoint is registered: path-based readers resume by
+/// byte offset within the active file, so a checkpointed consumer pins the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendLogRetention {
+    pub roll_at_bytes: u64,
+    pub max_total_bytes: u64,
+}
+
+impl AppendLogRetention {
+    /// Watcher default: 256 MiB segments, 2 GiB total.
+    pub const WATCHER_DEFAULT: Self = Self {
+        roll_at_bytes: 256 * 1024 * 1024,
+        max_total_bytes: 2 * 1024 * 1024 * 1024,
+    };
+}
+
+/// A sealed append-log segment: `<log name>.<segment id>.<first>-<end>`, with
+/// `end` the exclusive ordinal bound. The name alone restores ordinals after a
+/// crash anywhere in the roll sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedAppendLogSegment {
+    pub segment_id: u64,
+    pub first_ordinal: u64,
+    pub end_ordinal: u64,
+    pub file_name: String,
+    pub bytes: u64,
+}
+
+fn sealed_segment_file_name(
+    log_name: &str,
+    segment_id: u64,
+    first_ordinal: u64,
+    end_ordinal: u64,
+) -> String {
+    format!("{log_name}.{segment_id:020}.{first_ordinal:020}-{end_ordinal:020}")
+}
+
+fn parse_sealed_segment_file_name(
+    log_name: &str,
+    file_name: &str,
+) -> Option<(u64, u64, u64)> {
+    let rest = file_name.strip_prefix(log_name)?.strip_prefix('.')?;
+    let (segment, range) = rest.split_once('.')?;
+    let (first, end) = range.split_once('-')?;
+    let all_digits = |part: &str| part.len() == 20 && part.bytes().all(|b| b.is_ascii_digit());
+    if !(all_digits(segment) && all_digits(first) && all_digits(end)) {
+        return None;
+    }
+    let parsed = (segment.parse().ok()?, first.parse().ok()?, end.parse().ok()?);
+    (parsed.1 <= parsed.2).then_some(parsed)
+}
+
+/// Sealed segments beside the active log, oldest first.
+fn list_sealed_segments(
+    directory: &CapDir,
+    log_name: &str,
+) -> std::result::Result<Vec<SealedAppendLogSegment>, RecorderStorageError> {
+    let mut sealed = Vec::new();
+    for entry in directory.entries()? {
+        let entry = entry?;
+        let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some((segment_id, first_ordinal, end_ordinal)) =
+            parse_sealed_segment_file_name(log_name, &file_name)
+        else {
+            continue;
+        };
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
+            continue;
+        }
+        sealed.push(SealedAppendLogSegment {
+            segment_id,
+            first_ordinal,
+            end_ordinal,
+            file_name,
+            bytes: metadata.len(),
+        });
+    }
+    sealed.sort_by_key(|segment| segment.segment_id);
+    Ok(sealed)
+}
+
+/// Temporary name of the next active log while a roll installs it.
+fn rolling_file_name(log_name: &str) -> String {
+    format!("{log_name}.rolling")
+}
+
 /// Rusqlite recorder backend configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -883,6 +978,17 @@ impl Default for RecorderStorageConfig {
 pub enum RecorderStorageInstance {
     AppendLog(AppendLogRecorderStorage),
     Rusqlite(RusqliteRecorderStorage),
+}
+
+impl RecorderStorageInstance {
+    /// Enable append-log retention; no effect on other backends (ft-w1nas).
+    #[must_use]
+    pub fn with_append_log_retention(self, retention: AppendLogRetention) -> Self {
+        match self {
+            Self::AppendLog(storage) => Self::AppendLog(storage.with_retention(retention)),
+            other => other,
+        }
+    }
 }
 
 impl RecorderStorage for RecorderStorageInstance {
@@ -1050,6 +1156,8 @@ pub fn bootstrap_recorder_storage(
 #[derive(Debug, Clone)]
 pub struct AppendLogRecorderStorage {
     config: AppendLogStorageConfig,
+    /// Size-bounded rolling and deletion; `None` keeps one unbounded log.
+    retention: Option<AppendLogRetention>,
     in_flight: Arc<AtomicUsize>,
     checkpoint_in_flight: Arc<AtomicUsize>,
     flush_in_flight: Arc<AtomicUsize>,
@@ -1143,6 +1251,15 @@ struct AppendLogInner {
     // Field order keeps state authority alive through the writer's final flush.
     state_file: AppendLogStateFile,
     segment_id: u64,
+    /// Ordinal of the first record in the active log (sealed segments hold
+    /// everything before it).
+    segment_base_ordinal: u64,
+    /// UTF-8 file name of the active log; sealed segments are named after it.
+    /// `None` disables rolling.
+    log_name: Option<String>,
+    /// Last record of the newest sealed segment, reported while the active
+    /// log is still empty after a roll.
+    sealed_latest: Option<RecorderOffset>,
     next_offset: u64,
     next_ordinal: u64,
     latest_record_start: Option<u64>,
@@ -1324,6 +1441,7 @@ impl ScanResult {
 fn recover_checkpoints_from_scan(
     checkpoints: HashMap<String, RecorderCheckpoint>,
     recovered_segment_id: u64,
+    base_ordinal: u64,
     scan: ScanResult,
 ) -> HashMap<String, RecorderCheckpoint> {
     checkpoints
@@ -1331,7 +1449,8 @@ fn recover_checkpoints_from_scan(
         .filter_map(|(consumer, mut checkpoint)| {
             let within_scanned_log = scan.valid_records > 0
                 && scan.valid_len > 0
-                && checkpoint.upto_offset.ordinal < scan.valid_records
+                && checkpoint.upto_offset.ordinal >= base_ordinal
+                && checkpoint.upto_offset.ordinal - base_ordinal < scan.valid_records
                 && checkpoint.upto_offset.byte_offset < scan.valid_len;
             if !within_scanned_log {
                 return None;
@@ -1417,8 +1536,49 @@ impl AppendLogRecorderStorage {
 
         let persisted = state_file.load()?;
         let scan = scan_valid_prefix(&mut file.file)?;
-        let recovered_segment_id = 0;
-        let state_matches_scan = scan.matches_persisted_state(&persisted);
+        // Sealed segment names are the authority for where the active log's
+        // ordinals start (ft-w1nas); without any, this is the legacy single log.
+        let log_name = data_name.to_str().map(str::to_owned);
+        let sealed = match &log_name {
+            Some(name) => {
+                match data_dir.remove_file(rolling_file_name(name)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                list_sealed_segments(&data_dir, name)?
+            }
+            None => Vec::new(),
+        };
+        let (recovered_segment_id, segment_base_ordinal) = sealed
+            .last()
+            .map_or((0, 0), |last| (last.segment_id.saturating_add(1), last.end_ordinal));
+        let sealed_latest = match (sealed.last(), scan.valid_records) {
+            (Some(last), 0) if last.end_ordinal > last.first_ordinal => {
+                let mut read = recorder_open_options();
+                read.read(true);
+                let mut sealed_file = data_dir.open_with(&last.file_name, &read)?.into_std();
+                // Sealed files were synced whole; a read-only scan that would
+                // need to trim a tail just leaves the latest offset unknown.
+                scan_valid_prefix(&mut sealed_file)
+                    .ok()
+                    .and_then(|scan| scan.latest_record_start)
+                    .map(|byte_offset| RecorderOffset {
+                        segment_id: last.segment_id,
+                        byte_offset,
+                        ordinal: last.end_ordinal - 1,
+                    })
+            }
+            _ => None,
+        };
+        let state_matches_scan = if sealed.is_empty() {
+            scan.matches_persisted_state(&persisted)
+        } else {
+            persisted.segment_id == recovered_segment_id
+                && persisted.next_offset == scan.valid_len
+                && persisted.next_ordinal
+                    == segment_base_ordinal.saturating_add(scan.valid_records)
+        };
 
         let next_offset = if state_matches_scan {
             persisted.next_offset
@@ -1429,7 +1589,7 @@ impl AppendLogRecorderStorage {
         let next_ordinal = if state_matches_scan {
             persisted.next_ordinal
         } else {
-            scan.valid_records
+            segment_base_ordinal.saturating_add(scan.valid_records)
         };
 
         let segment_id = if state_matches_scan {
@@ -1441,7 +1601,12 @@ impl AppendLogRecorderStorage {
         let checkpoints = if state_matches_scan {
             persisted.checkpoints
         } else {
-            recover_checkpoints_from_scan(persisted.checkpoints, recovered_segment_id, scan)
+            recover_checkpoints_from_scan(
+                persisted.checkpoints,
+                recovered_segment_id,
+                segment_base_ordinal,
+                scan,
+            )
         };
 
         file.file.seek(SeekFrom::End(0))?;
@@ -1452,6 +1617,9 @@ impl AppendLogRecorderStorage {
             repair_boundary: None,
             state_file,
             segment_id,
+            segment_base_ordinal,
+            log_name,
+            sealed_latest,
             next_offset,
             next_ordinal,
             latest_record_start: scan.latest_record_start,
@@ -1469,11 +1637,116 @@ impl AppendLogRecorderStorage {
 
         Ok(Self {
             config,
+            retention: None,
             in_flight: Arc::new(AtomicUsize::new(0)),
             checkpoint_in_flight: Arc::new(AtomicUsize::new(0)),
             flush_in_flight: Arc::new(AtomicUsize::new(0)),
             inner: Arc::new(Mutex::new(inner)),
         })
+    }
+
+    /// Enable size-bounded rolling and deletion (ft-w1nas).
+    #[must_use]
+    pub fn with_retention(mut self, retention: AppendLogRetention) -> Self {
+        self.retention = Some(retention);
+        self
+    }
+
+    /// Seal the active log once it reaches the roll size, then delete the
+    /// oldest sealed segments beyond the byte budget. Called with the inner
+    /// lock held after a committed append; failures leave appending intact.
+    #[cfg(unix)]
+    fn roll_and_prune(
+        &self,
+        inner: &mut AppendLogInner,
+        retention: AppendLogRetention,
+    ) -> std::result::Result<(), RecorderStorageError> {
+        if inner.writer_failed
+            || inner.repair_boundary.is_some()
+            || !inner.checkpoints.is_empty()
+            || inner.next_offset < retention.roll_at_bytes.max(1)
+        {
+            return Ok(());
+        }
+        let Some(log_name) = inner.log_name.clone() else {
+            return Ok(());
+        };
+        let (directory, _) = recorder_parent(&self.config.data_path)?;
+        Self::flush_writer(inner)?;
+        inner.writer.get_ref().sync_data()?;
+
+        // Stage and lock the next active log before touching the current one.
+        let rolling = rolling_file_name(&log_name);
+        let mut options = recorder_open_options();
+        options.create_new(true).read(true).append(true);
+        let mut next = RecorderLeaseFile::new(directory.open_with(&rolling, &options)?.into_std());
+        if let Err(error) = next.acquire().and_then(|()| next.file.sync_all()) {
+            drop(next);
+            let _ = directory.remove_file(&rolling);
+            return Err(error.into());
+        }
+
+        let sealed_name = sealed_segment_file_name(
+            &log_name,
+            inner.segment_id,
+            inner.segment_base_ordinal,
+            inner.next_ordinal,
+        );
+        if let Err(error) = directory.rename(&log_name, &directory, &sealed_name) {
+            drop(next);
+            let _ = directory.remove_file(&rolling);
+            return Err(error.into());
+        }
+        if let Err(error) = directory.rename(&rolling, &directory, &log_name) {
+            // Put the sealed log back so the writer and the name agree again.
+            if directory
+                .rename(&sealed_name, &directory, &log_name)
+                .is_err()
+            {
+                inner.writer_failed = true;
+            }
+            drop(next);
+            let _ = directory.remove_file(&rolling);
+            return Err(error.into());
+        }
+        sync_directory_file(&open_directory_sync(&directory)?)?;
+
+        // The sealed inode's lease is released when its writer drops here.
+        inner.sealed_latest = Self::latest_offset(inner);
+        inner.writer = std::io::BufWriter::new(next);
+        inner.segment_id = inner.segment_id.saturating_add(1);
+        inner.segment_base_ordinal = inner.next_ordinal;
+        inner.next_offset = 0;
+        inner.latest_record_start = None;
+        Self::persist_state(inner)?;
+
+        let mut sealed = list_sealed_segments(&directory, &log_name)?;
+        let mut total: u64 = sealed.iter().map(|segment| segment.bytes).sum();
+        let mut removed = false;
+        while total > retention.max_total_bytes && !sealed.is_empty() {
+            let oldest = sealed.remove(0);
+            directory.remove_file(&oldest.file_name)?;
+            total = total.saturating_sub(oldest.bytes);
+            removed = true;
+        }
+        if removed {
+            sync_directory_file(&open_directory_sync(&directory)?)?;
+        }
+        Ok(())
+    }
+
+    /// Sealed segments beside the active log, oldest first.
+    ///
+    /// # Errors
+    /// Returns an error when the recorder directory cannot be listed.
+    pub fn sealed_segments(
+        &self,
+    ) -> std::result::Result<Vec<SealedAppendLogSegment>, RecorderStorageError> {
+        let (directory, name) = recorder_parent(&self.config.data_path)?;
+        match name.to_str() {
+            Some(log_name) => list_sealed_segments(&directory, log_name),
+            None => Ok(Vec::new()),
+        }
     }
 
     fn try_acquire_slot(&self) -> std::result::Result<OwnedInFlightGuard, RecorderStorageError> {
@@ -1503,9 +1776,12 @@ impl AppendLogRecorderStorage {
     }
 
     fn latest_offset(inner: &AppendLogInner) -> Option<RecorderOffset> {
+        let Some(byte_offset) = inner.latest_record_start else {
+            return inner.sealed_latest.clone();
+        };
         Some(RecorderOffset {
             segment_id: inner.segment_id,
-            byte_offset: inner.latest_record_start?,
+            byte_offset,
             ordinal: inner.next_ordinal.checked_sub(1)?,
         })
     }
@@ -1837,6 +2113,15 @@ impl AppendLogRecorderStorage {
         match result {
             Ok(response) => {
                 Self::clear_last_error(&mut inner);
+                #[cfg(unix)]
+                if let Some(retention) = self.retention {
+                    // The batch is committed; a failed roll only postpones
+                    // retention and is retried after the next append.
+                    if let Err(err) = self.roll_and_prune(&mut inner, retention) {
+                        tracing::warn!(error = %err, "recorder append-log roll failed");
+                        Self::record_last_error(&mut inner, "append_log_roll", &err);
+                    }
+                }
                 Ok(response)
             }
             Err(err) => {
@@ -5021,6 +5306,154 @@ recorder_backend = "frankensqlite"
             Err(RecorderStorageError::QueueFull { capacity: 1 })
         ));
         drop(sqlite_first);
+    }
+
+    async fn append_one(storage: &AppendLogRecorderStorage, n: u64) -> AppendResponse {
+        storage
+            .append_batch(AppendRequest {
+                batch_id: format!("roll-{n}"),
+                events: vec![sample_event(&format!("roll-{n}"), 3, n, &"x".repeat(200))],
+                required_durability: DurabilityLevel::Appended,
+                producer_ts_ms: n,
+            })
+            .await
+            .unwrap()
+    }
+
+    const TINY_RETENTION: AppendLogRetention = AppendLogRetention {
+        roll_at_bytes: 2_000,
+        max_total_bytes: 6_000,
+    };
+
+    #[test]
+    fn sealed_segment_names_round_trip_and_reject_lookalikes() {
+        let name = sealed_segment_file_name("events.log", 3, 40, 57);
+        assert_eq!(
+            name,
+            "events.log.00000000000000000003.00000000000000000040-00000000000000000057"
+        );
+        assert_eq!(parse_sealed_segment_file_name("events.log", &name), Some((3, 40, 57)));
+        for other in [
+            "events.log",
+            "events.log.rolling",
+            "events.log.3.40-57",
+            "other.log.00000000000000000003.00000000000000000040-00000000000000000057",
+            "events.log.00000000000000000003.00000000000000000057-00000000000000000040",
+        ] {
+            assert_eq!(parse_sealed_segment_file_name("events.log", other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn append_log_rolls_into_sealed_segments_and_stays_under_budget() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let storage = AppendLogRecorderStorage::open(test_config(dir.path()))
+                .unwrap()
+                .with_retention(TINY_RETENTION);
+            let mut last = None;
+            for n in 0..200 {
+                let response = append_one(&storage, n).await;
+                // Ordinals never restart across rolls.
+                assert_eq!(response.first_offset.ordinal, n);
+                last = Some(response);
+            }
+            let sealed = storage.sealed_segments().unwrap();
+            assert!(sealed.len() >= 2, "{sealed:?}");
+            let sealed_bytes: u64 = sealed.iter().map(|segment| segment.bytes).sum();
+            assert!(sealed_bytes <= TINY_RETENTION.max_total_bytes, "{sealed_bytes}");
+            // Retained segments are contiguous and end where the active log starts.
+            for pair in sealed.windows(2) {
+                assert_eq!(pair[0].end_ordinal, pair[1].first_ordinal);
+                assert_eq!(pair[0].segment_id + 1, pair[1].segment_id);
+            }
+            assert!(sealed[0].first_ordinal > 0, "oldest segments were deleted");
+            let active = std::fs::metadata(dir.path().join("events.log")).unwrap().len();
+            assert!(active < TINY_RETENTION.roll_at_bytes + 1_000, "{active}");
+            let last = last.unwrap();
+            assert_eq!(last.last_offset.segment_id, sealed.last().unwrap().segment_id + 1);
+            assert!(!dir.path().join("events.log.rolling").exists());
+        });
+    }
+
+    #[test]
+    fn reopen_after_rolls_continues_ordinals_even_with_stale_state() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let config = test_config(dir.path());
+            {
+                let storage = AppendLogRecorderStorage::open(config.clone())
+                    .unwrap()
+                    .with_retention(TINY_RETENTION);
+                for n in 0..40 {
+                    append_one(&storage, n).await;
+                }
+                storage.flush(FlushMode::Durable).await.unwrap();
+            }
+            let reopened = AppendLogRecorderStorage::open(config.clone())
+                .unwrap()
+                .with_retention(TINY_RETENTION);
+            assert_eq!(append_one(&reopened, 40).await.first_offset.ordinal, 40);
+            drop(reopened);
+
+            // A crash between the renames and the state save leaves state.json
+            // behind the files; sealed names still place the active log.
+            std::fs::remove_file(dir.path().join("state.json")).unwrap();
+            std::fs::write(dir.path().join("events.log.rolling"), b"orphan").unwrap();
+            let recovered = AppendLogRecorderStorage::open(config).unwrap();
+            assert!(!dir.path().join("events.log.rolling").exists());
+            let response = append_one(&recovered, 41).await;
+            assert_eq!(response.first_offset.ordinal, 41);
+            let sealed = recovered.sealed_segments().unwrap();
+            assert_eq!(response.first_offset.segment_id, sealed.last().unwrap().segment_id + 1);
+        });
+    }
+
+    #[test]
+    fn latest_offset_survives_a_roll_that_empties_the_active_log() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let config = test_config(dir.path());
+            let storage = AppendLogRecorderStorage::open(config.clone())
+                .unwrap()
+                .with_retention(AppendLogRetention {
+                    roll_at_bytes: 1,
+                    max_total_bytes: u64::MAX,
+                });
+            let response = append_one(&storage, 0).await;
+            assert_eq!(std::fs::metadata(dir.path().join("events.log")).unwrap().len(), 0);
+            assert_eq!(storage.health().await.latest_offset, Some(response.last_offset.clone()));
+            storage.flush(FlushMode::Durable).await.unwrap();
+            drop(storage);
+            let reopened = AppendLogRecorderStorage::open(config).unwrap();
+            assert_eq!(reopened.health().await.latest_offset, Some(response.last_offset));
+        });
+    }
+
+    #[test]
+    fn a_checkpointed_consumer_pins_the_log_against_rolling() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let storage = AppendLogRecorderStorage::open(test_config(dir.path()))
+                .unwrap()
+                .with_retention(TINY_RETENTION);
+            let first = append_one(&storage, 0).await;
+            storage
+                .commit_checkpoint(RecorderCheckpoint {
+                    consumer: CheckpointConsumerId("indexer".to_string()),
+                    upto_offset: first.last_offset,
+                    schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+                    committed_at_ms: 1,
+                })
+                .await
+                .unwrap();
+            for n in 1..60 {
+                append_one(&storage, n).await;
+            }
+            assert!(storage.sealed_segments().unwrap().is_empty());
+            let active = std::fs::metadata(dir.path().join("events.log")).unwrap().len();
+            assert!(active > TINY_RETENTION.max_total_bytes, "{active}");
+        });
     }
 
     #[test]
