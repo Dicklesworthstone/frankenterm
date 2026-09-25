@@ -12697,6 +12697,51 @@ mod unified_tests {
     }
 
     #[test]
+    fn rank_mux_socket_candidates_exhaustive_presence_picks_highest_present() {
+        use std::path::PathBuf;
+
+        // Every present/absent combination of the single-path sources, with
+        // 0..=3 GUI instances: the winner is the first present source in
+        // MuxSocketSource::ALL order and its reported path is that source's.
+        for mask in 0u8..32 {
+            for instances in 0..=3usize {
+                let bit = |n: u8| (mask >> n) & 1 == 1;
+                let path = |label: &str| Some(PathBuf::from(format!("/{label}")));
+                let candidates = MuxSocketCandidates {
+                    explicit_config: bit(0).then(|| path("c")).flatten(),
+                    environment: bit(1).then(|| path("e")).flatten(),
+                    gui_published: bit(2).then(|| path("p")).flatten(),
+                    gui_instances: (0..instances)
+                        .map(|i| PathBuf::from(format!("/i{i}")))
+                        .collect(),
+                    config_unix_domain: bit(3).then(|| path("u")).flatten(),
+                    default_unix_domain: bit(4).then(|| path("d")).flatten(),
+                };
+                let present = [
+                    (bit(0), "/c", MuxSocketSource::ExplicitConfig),
+                    (bit(1), "/e", MuxSocketSource::Environment),
+                    (bit(2), "/p", MuxSocketSource::GuiPublished),
+                    (instances > 0, "/i0", MuxSocketSource::GuiInstance),
+                    (bit(3), "/u", MuxSocketSource::ConfigUnixDomain),
+                    (bit(4), "/d", MuxSocketSource::DefaultUnixDomain),
+                ];
+                let expected = present
+                    .iter()
+                    .find(|(is_present, _, _)| *is_present)
+                    .map(|(_, path, source)| DiscoveredMuxSocket {
+                        path: PathBuf::from(path),
+                        source: *source,
+                    });
+                assert_eq!(
+                    rank_mux_socket_candidates(&candidates),
+                    expected,
+                    "mask {mask:05b}, {instances} gui instance(s)"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn mux_socket_source_labels_are_stable_and_ordered() {
         let labels: Vec<&str> = MuxSocketSource::ALL
             .iter()
