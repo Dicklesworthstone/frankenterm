@@ -21793,7 +21793,10 @@ impl RobotFleetMuxExecutor {
                 )
             })?;
 
-        if let Err(err) = runtime.block_on(self.mux.send_text(pane_id, &launch)) {
+        // Typed, not pasted: once the shell's line editor enables bracketed
+        // paste, a pasted newline is inserted rather than accepted, so the
+        // launch would sit unexecuted at the prompt.
+        if let Err(err) = runtime.block_on(self.mux.send_text_no_paste(pane_id, &launch)) {
             let _ = runtime.block_on(self.mux.kill_pane(pane_id));
             return Err(
                 frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
@@ -22418,8 +22421,10 @@ impl RobotProfileApplyMuxExecutor {
 
         let runtime = Self::runtime()?;
         let text = format!("{}\n", lines.join("\n"));
+        // Typed, not pasted: a newline inside a bracketed paste does not
+        // execute once the shell's line editor is up.
         runtime
-            .block_on(self.mux.send_text(pane_id, &text))
+            .block_on(self.mux.send_text_no_paste(pane_id, &text))
             .map_err(|err| {
                 frankenterm_core::robot_profile_handler::ProfileApplyExecutionError::new(
                     "robot.profile.bootstrap_failed",
