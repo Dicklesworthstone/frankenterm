@@ -89,6 +89,24 @@ run_mode() {
     curl -sN --max-time 25 "http://127.0.0.1:$PORT/stream/deltas?pane_id=$PANE&max_hz=20" \
         > "$OUT/$MODE.deltas.txt" 2> /dev/null &
     PIDS+=("$!")
+    # Record each frame's ARRIVAL time: ts_ms is stamped when a frame is built,
+    # before the rate limiter waits.
+    python3 -c '
+import sys, time, urllib.request
+out = open(sys.argv[2], "w")
+try:
+    with urllib.request.urlopen(sys.argv[1], timeout=25) as stream:
+        deadline = time.time() + 25
+        for raw in stream:
+            line = raw.decode("utf-8", "replace").rstrip("\n")
+            if line.startswith("event: "):
+                out.write(f"{int(time.time() * 1000)} {line[7:]}\n"); out.flush()
+            if time.time() > deadline:
+                break
+except Exception:
+    pass
+' "http://127.0.0.1:$PORT/stream/deltas?pane_id=$PANE&max_hz=2" "$OUT/$MODE.deltas-2hz.arrivals" &
+    PIDS+=("$!")
     sleep 2
     ft send --no-paste "$PANE" 'printf "\033]2;codex\007"' > "$OUT/$MODE.send1.log" 2>&1
     sleep 1
@@ -96,6 +114,8 @@ run_mode() {
     TRIGGERED=$(now)
     # A leaked credential in pane output must never leave the server in clear.
     ft send --no-paste "$PANE" "echo auth=$FAKE_TOKEN status=ok" > "$OUT/$MODE.send3.log" 2>&1
+    # A burst of output for the max_hz=2 subscriber.
+    ft send --no-paste "$PANE" 'for i in {1..40}; do echo burst-$i; sleep 0.05; done' > "$OUT/$MODE.send4.log" 2>&1
     local deadline=$((SECONDS + 20))
     while (( SECONDS < deadline )); do
         grep -q "codex.usage.reached" "$OUT/$MODE.sse.txt" 2> /dev/null && break
@@ -119,6 +139,14 @@ run_mode() {
     check "$MODE/pane_id filter excludes other panes' detections" $? "$(head -c 400 "$OUT/$MODE.sse-other-pane.txt")"
     grep -q "status=ok" "$OUT/$MODE.deltas.txt" && ! grep -q "$FAKE_TOKEN" "$OUT/$MODE.deltas.txt"
     check "$MODE/output deltas stream redacts a leaked token" $? "$(grep -o 'auth=[^ \"]*' "$OUT/$MODE.deltas.txt" | head -3 | tr '\n' ' ')"
+    python3 - "$OUT/$MODE.deltas-2hz.arrivals" <<'PY'
+import sys
+stamps = [int(line.split()[0]) for line in open(sys.argv[1]) if line.split()[1:] == ["delta"]]
+gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+print(f"max_hz=2 delta frames: {len(stamps)}, min spacing {min(gaps) if gaps else 'n/a'} ms")
+sys.exit(0 if len(stamps) >= 2 and min(gaps) >= 400 else 1)
+PY
+    check "$MODE/max_hz=2 spaces delta frames at least ~500 ms apart" $? "see $OUT/$MODE.deltas-2hz.arrivals"
     local copies
     copies=$(grep -c "codex.usage.reached" "$OUT/$MODE.sse.txt")
     [[ "$copies" == 1 ]]
