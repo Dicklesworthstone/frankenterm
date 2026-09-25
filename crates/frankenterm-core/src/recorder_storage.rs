@@ -5370,8 +5370,19 @@ recorder_backend = "frankensqlite"
             assert!(sealed[0].first_ordinal > 0, "oldest segments were deleted");
             let active = std::fs::metadata(dir.path().join("events.log")).unwrap().len();
             assert!(active < TINY_RETENTION.roll_at_bytes + 1_000, "{active}");
-            let last = last.unwrap();
-            assert_eq!(last.last_offset.segment_id, sealed.last().unwrap().segment_id + 1);
+            // The final record sits in the active log, or in the newest sealed
+            // segment when that very append triggered the roll.
+            let last = last.unwrap().last_offset;
+            let newest = sealed.last().unwrap();
+            if last.segment_id == newest.segment_id {
+                assert!(
+                    (newest.first_ordinal..newest.end_ordinal).contains(&last.ordinal),
+                    "{last:?} vs {newest:?}"
+                );
+            } else {
+                assert_eq!(last.segment_id, newest.segment_id + 1);
+                assert!(last.ordinal >= newest.end_ordinal);
+            }
             assert!(!dir.path().join("events.log.rolling").exists());
         });
     }
