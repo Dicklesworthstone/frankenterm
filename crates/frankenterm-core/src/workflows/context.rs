@@ -294,58 +294,20 @@ impl WorkflowContext {
 
         let verification_report =
             if matches!(&injection, crate::policy::InjectionResult::Allowed { .. }) {
-                // An agent echoes the prompt into its transcript before its
-                // turn indicator appears, so one early capture reads as
-                // stuck_in_composer. Re-capture until the verdict is anything
-                // else or the poll budget runs out.
-                let mut polls: usize = 0;
-                loop {
-                    polls += 1;
-                    let (after_text, after_semantic_snapshot) = if submit_profile.is_some() {
-                        let delay_ms = if polls == 1 { 120 } else { VERIFY_SUBMIT_POLL_MS };
-                        let _ = crate::runtime_async::sleep_with_cx(
-                            cx,
-                            Duration::from_millis(delay_ms),
-                        )
-                        .await;
-                        (
-                            capture_verified_submit_text(cx, injector.client(), pane_id).await,
-                            capture_verified_submit_semantic_snapshot(
-                                cx,
-                                injector.client(),
-                                pane_id,
-                            )
-                            .await,
-                        )
-                    } else {
-                        (None, None)
-                    };
-                    let report = crate::verified_submit::classify_verified_submit(
-                        crate::verified_submit::VerifiedSubmitInput {
-                            pane_id,
-                            command_text: &outbound_text,
-                            agent_type,
-                            profile: submit_profile.as_ref(),
-                            before_text: before_text.as_deref(),
-                            after_text: after_text.as_deref(),
-                            after_semantic_snapshot: after_semantic_snapshot.as_ref(),
-                            attempts: 1,
-                            polls,
-                        },
-                    );
-                    let inconclusive = matches!(
-                        report.state,
-                        crate::robot_types::SubmitReceiptState::StuckInComposer
-                            | crate::robot_types::SubmitReceiptState::VerificationUnavailable
-                    );
-                    if submit_profile.is_none()
-                        || !inconclusive
-                        || polls >= VERIFY_SUBMIT_MAX_POLLS
-                        || cx.checkpoint().is_err()
-                    {
-                        break Some(report);
-                    }
-                }
+                Some(
+                    crate::verified_submit::classify_verified_submit_polled(
+                        cx,
+                        injector.client(),
+                        pane_id,
+                        &outbound_text,
+                        agent_type,
+                        submit_profile.as_ref(),
+                        before_text.as_deref(),
+                        1,
+                        1,
+                    )
+                    .await,
+                )
             } else {
                 None
             };
@@ -507,11 +469,6 @@ impl WorkflowContext {
     }
 }
 
-/// Verified-submit re-capture interval and budget (~5 s) after the first
-/// capture 120 ms behind the send.
-const VERIFY_SUBMIT_POLL_MS: u64 = 400;
-const VERIFY_SUBMIT_MAX_POLLS: usize = 12;
-
 // Captures go through the injector's own client: the default handle is a
 // CLI-only client, which cannot read a pane on a vendored-mux deployment.
 async fn capture_verified_submit_text(
@@ -529,27 +486,6 @@ async fn capture_verified_submit_text(
                 pane_id,
                 %error,
                 "workflow verified-submit text capture unavailable"
-            );
-            None
-        }
-    }
-}
-
-async fn capture_verified_submit_semantic_snapshot(
-    cx: &crate::cx::Cx,
-    client: &crate::wezterm::WeztermHandle,
-    pane_id: u64,
-) -> Option<crate::wezterm::MuxSemanticSnapshot> {
-    match client
-        .get_semantic_zones_with_cx(cx, pane_id)
-        .await
-    {
-        Ok(snapshot) => Some(snapshot),
-        Err(error) => {
-            tracing::debug!(
-                pane_id,
-                %error,
-                "workflow verified-submit semantic capture unavailable"
             );
             None
         }

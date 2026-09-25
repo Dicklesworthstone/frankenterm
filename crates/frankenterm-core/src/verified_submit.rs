@@ -283,6 +283,93 @@ pub fn submit_guarantee_failure_message(receipt: &SubmitReceipt) -> Option<Strin
     })
 }
 
+/// First capture delay after the send, re-capture interval, and poll budget
+/// (~5 s) for [`classify_verified_submit_polled`].
+pub const VERIFY_SUBMIT_FIRST_CAPTURE_MS: u64 = 120;
+pub const VERIFY_SUBMIT_POLL_MS: u64 = 400;
+pub const VERIFY_SUBMIT_MAX_POLLS: usize = 12;
+
+/// Capture the pane after a send and classify it, re-capturing while the
+/// verdict is `stuck_in_composer` or `verification_unavailable`.
+///
+/// An agent echoes the prompt into its transcript before its turn indicator
+/// appears, so a single capture right after the send reads a submitted prompt
+/// as stuck (seen against real Claude Code 2.1). `polls` is the caller's count,
+/// which already includes the first capture; each re-capture adds one.
+#[allow(clippy::too_many_arguments)]
+pub async fn classify_verified_submit_polled(
+    cx: &crate::cx::Cx,
+    client: &crate::wezterm::WeztermHandle,
+    pane_id: u64,
+    command_text: &str,
+    agent_type: AgentType,
+    profile: Option<&SubmitProfile>,
+    before_text: Option<&str>,
+    attempts: u32,
+    polls: usize,
+) -> VerifiedSubmitReport {
+    let mut captures = 0usize;
+    loop {
+        captures += 1;
+        let (after_text, after_semantic_snapshot) = if profile.is_some() {
+            let delay_ms = if captures == 1 {
+                VERIFY_SUBMIT_FIRST_CAPTURE_MS
+            } else {
+                VERIFY_SUBMIT_POLL_MS
+            };
+            let _ = crate::runtime_async::sleep_with_cx(
+                cx,
+                std::time::Duration::from_millis(delay_ms),
+            )
+            .await;
+            let after_text = match client.get_text_with_cx(cx, pane_id, false).await {
+                Ok(text) => Some(text),
+                Err(error) => {
+                    tracing::debug!(pane_id, %error, "verified-submit text capture unavailable");
+                    None
+                }
+            };
+            let after_semantic_snapshot =
+                match client.get_semantic_zones_with_cx(cx, pane_id).await {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(error) => {
+                        tracing::debug!(
+                            pane_id,
+                            %error,
+                            "verified-submit semantic capture unavailable"
+                        );
+                        None
+                    }
+                };
+            (after_text, after_semantic_snapshot)
+        } else {
+            (None, None)
+        };
+        let report = classify_verified_submit(VerifiedSubmitInput {
+            pane_id,
+            command_text,
+            agent_type,
+            profile,
+            before_text,
+            after_text: after_text.as_deref(),
+            after_semantic_snapshot: after_semantic_snapshot.as_ref(),
+            attempts,
+            polls: polls.saturating_add(captures - 1),
+        });
+        let inconclusive = matches!(
+            report.state,
+            SubmitReceiptState::StuckInComposer | SubmitReceiptState::VerificationUnavailable
+        );
+        if profile.is_none()
+            || !inconclusive
+            || captures >= VERIFY_SUBMIT_MAX_POLLS
+            || cx.checkpoint().is_err()
+        {
+            return report;
+        }
+    }
+}
+
 /// Classify the post-send terminal state using a data-driven submit profile.
 #[must_use]
 pub fn classify_verified_submit(input: VerifiedSubmitInput<'_>) -> VerifiedSubmitReport {

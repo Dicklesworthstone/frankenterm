@@ -14175,24 +14175,6 @@ async fn capture_send_submit_text(
     }
 }
 
-async fn capture_send_submit_semantic_snapshot(
-    wezterm: &frankenterm_core::wezterm::WeztermHandle,
-    cx: &frankenterm_core::cx::Cx,
-    pane_id: u64,
-) -> Option<frankenterm_core::wezterm::MuxSemanticSnapshot> {
-    match wezterm.get_semantic_zones_with_cx(cx, pane_id).await {
-        Ok(snapshot) => Some(snapshot),
-        Err(error) => {
-            tracing::debug!(
-                pane_id,
-                %error,
-                "Verified-submit semantic capture unavailable"
-            );
-            None
-        }
-    }
-}
-
 async fn classify_send_submit_after_send(
     wezterm: &frankenterm_core::wezterm::WeztermHandle,
     cx: &frankenterm_core::cx::Cx,
@@ -14204,33 +14186,18 @@ async fn classify_send_submit_after_send(
     attempts: u32,
     polls: usize,
 ) -> frankenterm_core::verified_submit::VerifiedSubmitReport {
-    let (after_text, after_semantic_snapshot) = if submit_profile.is_some() {
-        let _ = frankenterm_core::runtime_async::sleep_with_cx(
-            cx,
-            std::time::Duration::from_millis(120),
-        )
-        .await;
-        let after_text = capture_send_submit_text(wezterm, cx, pane_id).await;
-        let after_semantic_snapshot =
-            capture_send_submit_semantic_snapshot(wezterm, cx, pane_id).await;
-        (after_text, after_semantic_snapshot)
-    } else {
-        (None, None)
-    };
-
-    frankenterm_core::verified_submit::classify_verified_submit(
-        frankenterm_core::verified_submit::VerifiedSubmitInput {
-            pane_id,
-            command_text: text,
-            agent_type,
-            profile: submit_profile,
-            before_text,
-            after_text: after_text.as_deref(),
-            after_semantic_snapshot: after_semantic_snapshot.as_ref(),
-            attempts,
-            polls,
-        },
+    frankenterm_core::verified_submit::classify_verified_submit_polled(
+        cx,
+        wezterm,
+        pane_id,
+        text,
+        agent_type,
+        submit_profile,
+        before_text,
+        attempts,
+        polls,
     )
+    .await
 }
 
 fn attach_send_submit_receipt_to_audit_record(
@@ -50941,13 +50908,21 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                 )
                                                 .await
                                             {
-                                                Ok(()) => wezterm
-                                                    .send_control_with_cx(
+                                                Ok(()) => {
+                                                    frankenterm_core::wezterm::pause_before_paste_submit(
                                                         &cx,
-                                                        pane_id,
-                                                        frankenterm_core::wezterm::control::ENTER,
+                                                        outbound_submit_text,
+                                                        no_paste,
                                                     )
-                                                    .await,
+                                                    .await;
+                                                    wezterm
+                                                        .send_control_with_cx(
+                                                            &cx,
+                                                            pane_id,
+                                                            frankenterm_core::wezterm::control::ENTER,
+                                                        )
+                                                        .await
+                                                }
                                                 Err(error) => Err(error),
                                             }
                                         } else {
@@ -61639,6 +61614,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 .await
                             {
                                 Ok(()) => {
+                                    frankenterm_core::wezterm::pause_before_paste_submit(
+                                        &cx,
+                                        outbound_submit_text,
+                                        no_paste,
+                                    )
+                                    .await;
                                     wezterm
                                         .send_control_with_cx(
                                             &cx,

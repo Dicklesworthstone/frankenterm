@@ -9332,24 +9332,6 @@ async fn mcp_capture_submit_text(
     }
 }
 
-async fn mcp_capture_submit_semantic_snapshot(
-    wezterm: &crate::wezterm::WeztermHandle,
-    cx: &crate::cx::Cx,
-    pane_id: u64,
-) -> Option<crate::wezterm::MuxSemanticSnapshot> {
-    match wezterm.get_semantic_zones_with_cx(cx, pane_id).await {
-        Ok(snapshot) => Some(snapshot),
-        Err(_error) => {
-            tracing::debug!(
-                pane_id,
-                error_class = "wa_send_submit_semantic_capture_unavailable",
-                "wa.send verified-submit semantic capture unavailable"
-            );
-            None
-        }
-    }
-}
-
 async fn mcp_classify_submit_after_send(
     wezterm: &crate::wezterm::WeztermHandle,
     cx: &crate::cx::Cx,
@@ -9361,28 +9343,18 @@ async fn mcp_classify_submit_after_send(
     attempts: u32,
     polls: usize,
 ) -> crate::verified_submit::VerifiedSubmitReport {
-    let (after_text, after_semantic_snapshot) = if submit_profile.is_some() {
-        let _ =
-            crate::runtime_async::sleep_with_cx(cx, std::time::Duration::from_millis(120)).await;
-        let after_text = mcp_capture_submit_text(wezterm, cx, pane_id).await;
-        let after_semantic_snapshot =
-            mcp_capture_submit_semantic_snapshot(wezterm, cx, pane_id).await;
-        (after_text, after_semantic_snapshot)
-    } else {
-        (None, None)
-    };
-
-    crate::verified_submit::classify_verified_submit(crate::verified_submit::VerifiedSubmitInput {
+    crate::verified_submit::classify_verified_submit_polled(
+        cx,
+        wezterm,
         pane_id,
-        command_text: text,
+        text,
         agent_type,
-        profile: submit_profile,
+        submit_profile,
         before_text,
-        after_text: after_text.as_deref(),
-        after_semantic_snapshot: after_semantic_snapshot.as_ref(),
         attempts,
         polls,
-    })
+    )
+    .await
 }
 
 async fn attach_mcp_submit_receipt_to_audit(
