@@ -50839,15 +50839,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     });
                                 let use_verified_submit_path =
                                     submit_profile.is_some() && !no_newline;
-                                let verified_submit_text = (use_verified_submit_path
-                                    && !text.trim().is_empty())
-                                .then(|| {
-                                    frankenterm_core::verified_submit::append_verification_canary(
-                                        pane_id, &text,
-                                    )
-                                });
-                                let outbound_submit_text =
-                                    verified_submit_text.as_deref().unwrap_or(&text);
+                                // No verification canary: agent composers never
+                                // publish the semantic zones that confirm it, and
+                                // its U+2063 marker stops Claude Code submitting
+                                // (ft-y4iz3).
+                                let outbound_submit_text: &str = &text;
 
                                 let engine = PolicyEngine::new(
                                     config.safety.rate_limit_per_pane,
@@ -61545,13 +61541,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         )
                     });
                 let use_verified_submit_path = submit_profile.is_some() && !no_newline;
-                let verified_submit_text = (use_verified_submit_path && !text.trim().is_empty())
-                    .then(|| {
-                        frankenterm_core::verified_submit::append_verification_canary(
-                            pane_id, &text,
-                        )
-                    });
-                let outbound_submit_text = verified_submit_text.as_deref().unwrap_or(&text);
+                // No verification canary: agent composers never publish the
+                // semantic zones that confirm it, and its U+2063 marker stops
+                // Claude Code submitting (ft-y4iz3).
+                let outbound_submit_text: &str = &text;
 
                 let engine = frankenterm_core::policy::PolicyEngine::new(
                     config.safety.rate_limit_per_pane,

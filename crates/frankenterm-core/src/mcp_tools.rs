@@ -9039,7 +9039,6 @@ fn mcp_submit_guarantee_level(params: &SendParams) -> Option<SubmitGuaranteeLeve
 fn mcp_submit_idempotency_binding(
     params: &SendParams,
     guarantee_level: SubmitGuaranteeLevel,
-    append_verification_canary: bool,
 ) -> Option<crate::verified_submit::SubmitIdempotencyBinding> {
     params.idempotency_key.as_deref().map(|caller_key| {
         crate::verified_submit::idempotency_binding(
@@ -9048,7 +9047,7 @@ fn mcp_submit_idempotency_binding(
                 text: &params.text,
                 caller_key,
                 guarantee_level,
-                append_verification_canary,
+                append_verification_canary: false,
                 wait_for: params.wait_for.as_deref(),
                 wait_for_regex: params.wait_for_regex,
                 timeout_secs: params.timeout_secs,
@@ -9620,29 +9619,17 @@ impl ToolHandler for WaSendTool {
             let submit_profile = submit_guarantee_level
                 .filter(|level| level.requires_submit_profile())
                 .and_then(|_| mcp_load_submit_profile(&config, submit_agent_type));
-            // Profile availability changes the exact pane effect because only
-            // a supported semantic classifier may receive a canary. Derive the
-            // durable binding after live resolution so supported/unsupported
-            // drift conflicts on the stable caller claim instead of silently
-            // mutating a retry's bytes.
-            let submit_idempotency_binding = mcp_submit_idempotency_binding(
-                &params,
-                resolved_submit_guarantee_level,
-                submit_profile.is_some(),
-            );
-            let non_idempotent_verified_submit_text = (submit_idempotency_binding.is_none()
-                && submit_profile.is_some()
-                && !params.text.trim().is_empty())
-            .then(|| {
-                crate::verified_submit::append_verification_canary(params.pane_id, &params.text)
-            });
-            let outbound_submit_text = if let Some(binding) = submit_idempotency_binding.as_ref() {
-                binding.outbound_text()
-            } else {
-                non_idempotent_verified_submit_text
-                    .as_deref()
-                    .unwrap_or(&params.text)
-            };
+            // No verification canary on any profile: it is confirmed only
+            // through semantic input zones, which agent composers never
+            // publish, and its U+2063 marker keeps Claude Code 2.1 from
+            // submitting the paste (ft-y4iz3). The pane receives the caller's
+            // exact text whether or not a profile resolves, so profile drift no
+            // longer changes a retry's bytes.
+            let submit_idempotency_binding =
+                mcp_submit_idempotency_binding(&params, resolved_submit_guarantee_level);
+            let outbound_submit_text = submit_idempotency_binding
+                .as_ref()
+                .map_or(params.text.as_str(), |binding| binding.outbound_text());
 
             tracing::debug!(phase = "capabilities_begin", "wa.send request progress");
             let resolution =
