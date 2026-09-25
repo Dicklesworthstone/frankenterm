@@ -558,6 +558,7 @@ pub async fn resolve_pane_capabilities_with_source(
 ) -> CapabilityResolution {
     let mut warnings = Vec::new();
     let mut osc_state = None;
+    let mut agent_composer_ready = false;
 
     if let Some(storage) = storage {
         match derive_osc_state_from_storage(cx, storage, pane_id).await {
@@ -599,6 +600,8 @@ pub async fn resolve_pane_capabilities_with_source(
                     if let Some(live) = &state.live_prompt {
                         if let Some(live_state) = live.osc_state() {
                             osc_state = Some(live_state);
+                            agent_composer_ready =
+                                live.shell_state == LiveShellState::AgentReady;
                             // Name agent-screen evidence so a denial explains itself.
                             if let Some(detail) = &live.detail {
                                 warnings.push(bounded_detail("Live prompt evidence: ", detail));
@@ -641,6 +644,15 @@ pub async fn resolve_pane_capabilities_with_source(
 
     let mut capabilities =
         PaneCapabilities::from_ingest_state(osc_state.as_ref(), alt_screen, in_gap);
+    // Full-screen agent TUIs (codex) keep their composer on the alternate
+    // screen. The alt-screen gate keeps text out of vim and pagers; a screen
+    // positively recognized as an agent composer at rest is expecting text.
+    if agent_composer_ready && capabilities.alt_screen == Some(true) {
+        capabilities.alt_screen = Some(false);
+        warnings.push(
+            "Alternate screen holds an idle agent composer; alt-screen gate not applied.".to_string(),
+        );
+    }
 
     if let Some(storage) = storage {
         match storage.get_active_reservation_with_cx(cx, pane_id).await {
@@ -1110,6 +1122,55 @@ mod tests {
         // Plain shells and unknown programs are not agent screens.
         assert_eq!(classify_agent_screen("$ ls\nfoo bar\n$ "), None);
         assert_eq!(classify_agent_screen(""), None);
+    }
+
+    #[test]
+    fn only_an_idle_agent_composer_lifts_the_alt_screen_gate() {
+        let state = |pane_id, shell_state, detail: &str| IpcPaneState {
+            pane_id,
+            known: true,
+            observed: Some(true),
+            alt_screen: None,
+            last_status_at: None,
+            in_gap: Some(false),
+            cursor_alt_screen: Some(true),
+            reason: None,
+            live_prompt: Some(LivePromptEvidence {
+                shell_state,
+                last_exit_code: None,
+                detail: Some(detail.to_string()),
+            }),
+        };
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let resolve = |pane_id| {
+            runtime.block_on(resolve_pane_capabilities(
+                &crate::cx::for_testing(),
+                pane_id,
+                None,
+                Some(Path::new("/nonexistent/ft-capability-test.sock")),
+            ))
+        };
+
+        let _ready = set_test_pane_state_override(state(
+            4_501,
+            LiveShellState::AgentReady,
+            "agent_ready:codex",
+        ));
+        let ready = resolve(4_501);
+        assert!(ready.capabilities.prompt_active);
+        assert_eq!(ready.capabilities.alt_screen, Some(false));
+
+        // A busy agent (or vim, or a pager) keeps the alt-screen gate.
+        let _busy = set_test_pane_state_override(state(
+            4_502,
+            LiveShellState::CommandRunning,
+            "agent_busy:codex",
+        ));
+        let busy = resolve(4_502);
+        assert_eq!(busy.capabilities.alt_screen, Some(true));
+        assert!(busy.capabilities.command_running);
     }
 
     #[test]
