@@ -66,6 +66,10 @@ sleep 6
 # Subscribe first, then trigger, so the event can only arrive live.
 curl -sN --max-time 25 "http://127.0.0.1:$PORT/stream/events?channel=detections" > "$OUT/sse.txt" 2> "$OUT/sse.err" &
 CURL=$!; PIDS+=("$CURL")
+OTHER_PANE=$((PANE + 1000))
+curl -sN --max-time 25 "http://127.0.0.1:$PORT/stream/events?channel=detections&pane_id=$OTHER_PANE" \
+    > "$OUT/sse-other-pane.txt" 2> /dev/null &
+CURL_OTHER=$!; PIDS+=("$CURL_OTHER")
 sleep 2
 ft send --no-paste "$PANE" 'printf "\033]2;codex\007"' > "$OUT/send1.log" 2>&1
 sleep 1
@@ -78,7 +82,8 @@ while (( SECONDS < deadline )); do
     sleep 0.2
 done
 ARRIVED=$(python3 -c 'import time;print(time.time())')
-kill "$CURL" 2> /dev/null
+sleep 2
+kill "$CURL" "$CURL_OTHER" 2> /dev/null
 
 PASS=0; FAIL=0
 check() { if [[ "$2" == 0 ]]; then PASS=$((PASS+1)); echo "PASS $1"; else FAIL=$((FAIL+1)); echo "FAIL $1: $3"; fi; }
@@ -91,5 +96,9 @@ print(f"trigger-to-SSE latency {latency:.2f}s")
 sys.exit(0 if latency < 10 else 1)
 PY
 check "arrives within 10 s of the pane output" $? "too slow"
+grep -q '"schema":"ft.stream.v1"' "$OUT/sse.txt"
+check "frames carry schema ft.stream.v1" $? "$(head -c 200 "$OUT/sse.txt")"
+grep -q '"kind":"ready"' "$OUT/sse-other-pane.txt" && ! grep -q "codex.usage.reached" "$OUT/sse-other-pane.txt"
+check "pane_id filter excludes other panes' detections" $? "$(head -c 400 "$OUT/sse-other-pane.txt")"
 echo "web stream e2e: $PASS passed, $FAIL failed (artifacts: $OUT)"
 [[ "$FAIL" == 0 ]]
