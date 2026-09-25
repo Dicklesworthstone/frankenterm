@@ -90387,7 +90387,9 @@ impl WeztermScrollbackCheckFailure {
             Self::ChangedDuringRead => "WezTerm config changed while it was being read",
             Self::InvalidEncoding => "WezTerm config is not valid UTF-8 text",
             Self::SettingMissing => "scrollback_lines is not set in the active WezTerm config",
-            Self::ConfigMissing => "No WezTerm config file was found in supported locations",
+            Self::ConfigMissing => {
+                "No frankenterm.lua or wezterm.lua config was found; the built-in scrollback default applies"
+            }
         }
     }
 }
@@ -90460,6 +90462,10 @@ fn check_wezterm_scrollback() -> Result<(u64, PathBuf), WeztermScrollbackCheckFa
     // cap-std then confines intermediate symlinks to that root, while the final
     // config leaf is opened with no-follow semantics.
     let config_candidates: Vec<(PathBuf, PathBuf)> = [
+        // FrankenTerm's own config wins over a WezTerm one, as the GUI loads it.
+        dirs::home_dir().map(|root| (root, PathBuf::from(".frankenterm.lua"))),
+        dirs::home_dir().map(|root| (root, PathBuf::from(".config/frankenterm/frankenterm.lua"))),
+        dirs::config_dir().map(|root| (root, PathBuf::from("frankenterm/frankenterm.lua"))),
         dirs::config_dir().map(|root| (root, PathBuf::from("wezterm/wezterm.lua"))),
         dirs::home_dir().map(|root| (root, PathBuf::from(".wezterm.lua"))),
         dirs::home_dir().map(|root| (root, PathBuf::from(".config/wezterm/wezterm.lua"))),
@@ -96091,11 +96097,18 @@ fn session_restore_lifecycle_needs_reconciliation(
         || report.invalid_resolved_restore_chains > 0
 }
 
+/// Unclean sessions whose owner is not a live process. A running watcher's
+/// own session is unclean until it shuts down; that is not something to
+/// recover, and counting it made every health probe fail while ft watch ran.
+fn stale_unclean_sessions(report: &frankenterm_core::session_restore::SessionDoctorReport) -> usize {
+    report.unclean_sessions.saturating_sub(report.live_sessions)
+}
+
 fn session_persistence_is_healthy(
     report: &frankenterm_core::session_restore::SessionDoctorReport,
 ) -> bool {
     !session_restore_lifecycle_needs_reconciliation(report)
-        && report.unclean_sessions == 0
+        && stale_unclean_sessions(report) == 0
         && report.orphaned_pane_states == 0
         && !report.cleanup_attempt.blocks_cleanup()
 }
@@ -96398,10 +96411,15 @@ fn session_recovery_diagnostic_check(
             "Run 'ft session doctor -f json' and inspect checkpoint roles before retrying restore",
         );
     }
-    if report.unclean_sessions > 0 {
+    if stale_unclean_sessions(report) > 0 {
         return DiagnosticCheck::warning(
             "session persistence",
-            format!("{} unclean session(s)", report.unclean_sessions),
+            format!(
+                "{} unclean session(s) from earlier runs ({} proven dead, {} unknown owner)",
+                stale_unclean_sessions(report),
+                report.recovery_candidate_sessions,
+                report.unknown_owner_sessions
+            ),
             "Run 'ft session doctor -f json' to inspect bounded recovery metadata; restore execution is unavailable",
         );
     }
@@ -96458,7 +96476,7 @@ fn build_session_recovery_guidance(
         };
     }
 
-    if report.unclean_sessions > 0 {
+    if stale_unclean_sessions(report) > 0 {
         push_unique_operator_step(
             &mut next_steps,
             "Inspect persisted sessions",
@@ -96821,6 +96839,50 @@ mod operator_guidance_tests {
                 .next_steps
                 .iter()
                 .any(|step| { step.command == "Fix filesystem permissions before retrying" })
+        );
+    }
+
+    #[test]
+    fn a_running_watchers_own_session_is_healthy_not_unclean() {
+        // The only unclean session belongs to a live owner: ft watch itself.
+        let report = SessionDoctorReport {
+            total_sessions: 1,
+            unclean_sessions: 1,
+            live_sessions: 1,
+            recovery_candidate_sessions: 0,
+            unknown_owner_sessions: 0,
+            total_checkpoints: 1,
+            orphaned_pane_states: 0,
+            orphaned_checkpoints: 0,
+            invalid_resolved_restore_chains: 0,
+            unresolved_restore_attempts: 0,
+            outcome_complete_restore_attempts: 0,
+            reconciliation_required_restore_attempts: 0,
+            orphaned_restore_intents: 0,
+            total_data_bytes: 1024,
+            cleanup_attempt: frankenterm_core::session_retention::SessionCleanupAttemptStatus::None,
+        };
+        assert!(session_persistence_is_healthy(&report));
+        assert!(matches!(
+            session_recovery_diagnostic_check(&report).status,
+            DiagnosticStatus::Ok
+        ));
+        assert_ne!(build_session_recovery_guidance(&report).status, "recovery_required");
+
+        // A dead owner's session beside it still warns.
+        let stale = SessionDoctorReport {
+            total_sessions: 2,
+            unclean_sessions: 2,
+            recovery_candidate_sessions: 1,
+            ..report
+        };
+        assert!(!session_persistence_is_healthy(&stale));
+        let row = session_recovery_diagnostic_check(&stale);
+        assert!(matches!(row.status, DiagnosticStatus::Warning));
+        assert!(
+            row.detail
+                .unwrap_or_default()
+                .starts_with("1 unclean session(s) from earlier runs (1 proven dead")
         );
     }
 
@@ -98669,7 +98731,7 @@ async fn run_diagnostics(
                         "{lines} lines (below {RECOMMENDED_SCROLLBACK_LINES} recommended)"
                     ),
                     format!(
-                        "Add to wezterm.lua: config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}"
+                        "Add to ~/.frankenterm.lua (or wezterm.lua): config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}"
                     ),
                 ));
             }
@@ -98679,7 +98741,7 @@ async fn run_diagnostics(
                 "WezTerm scrollback",
                 failure.diagnostic_detail(),
                 format!(
-                    "Add to wezterm.lua: config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}"
+                    "Add to ~/.frankenterm.lua (or wezterm.lua): config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}"
                 ),
             ));
         }
