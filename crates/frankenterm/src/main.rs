@@ -47350,10 +47350,9 @@ async fn run_watcher(
         // persisted switch is restored once at startup; live refresh/fencing
         // remains a separate contract (ft-xxfwy.42).
         let policy_engine = build_watcher_policy_engine(&config, &storage_for_workflows).await;
-        let wezterm_handle = wezterm_handle.clone();
         let injector = CxPolicyInjector::new(PolicyGatedInjector::with_storage(
             policy_engine,
-            wezterm_handle,
+            wezterm_handle.clone(),
             storage_for_workflows.as_ref().clone(),
         ));
 
