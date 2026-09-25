@@ -4,11 +4,16 @@
 Bead: ft-d0ez0.4
 
 Three scenarios:
-  1. Happy path — 2-step transaction sends markers to 2 panes, verifies committed state.
+  1. happy_path — a 2-step transaction passes prepare, then its commit fails
+     closed: the CLI backend refuses pane input by design, so nothing is typed.
+     (A committed send needs a real mux; tests/e2e/test_prompt_evidence_paths.sh
+     covers that leg against a private frankenterm-mux-server.)
   2. Partial failure — step 2 targets nonexistent pane, compensation fires on pane 1.
   3. Policy denial — safety rule blocks send_text on target pane, prepare phase denies.
 
-Uses a fake wezterm backend (embedded Python script) so no live terminal is needed.
+Uses a fake wezterm backend (embedded Python script) so no live terminal is
+needed. ft_env blinds mux socket discovery so a running FrankenTerm GUI is
+never dialed.
 """
 from __future__ import annotations
 
@@ -192,8 +197,12 @@ def main() -> int:
     if not argv or argv[0] != "cli":
         return 0
 
-    subcommand = argv[1] if len(argv) > 1 else ""
-    args = argv[2:]
+    # ft passes global `cli` flags (e.g. --no-auto-start) before the subcommand.
+    rest = argv[1:]
+    while rest and rest[0].startswith("--"):
+        rest = rest[1:]
+    subcommand = rest[0] if rest else ""
+    args = rest[1:]
 
     with LOCK_PATH.open("a+", encoding="utf-8") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
@@ -909,18 +918,26 @@ def run_scenario_happy(
         committed_count = commit_report.get("committed_count", 0)
         failed_count = commit_report.get("failed_count", 0)
 
+    # The CLI backend refuses pane input by design (no bounded stdin; the
+    # direct mux is the only send path), so against this fake the commit must
+    # fail closed on step 1 without typing anything. A committed two-pane send
+    # needs a real mux: tests/e2e/test_prompt_evidence_paths.sh covers the
+    # commit leg against a private frankenterm-mux-server.
     assertions["ft_tx_run_exit_zero"] = tx_run_result.returncode == 0
     assertions["prepare_outcome_is_all_ready"] = prepare_outcome == "all_ready"
-    assertions["final_state_is_committed"] = final_state == "committed"
-    assertions["commit_outcome_is_fully_committed"] = commit_outcome == "fully_committed"
-    assertions["committed_count_is_2"] = committed_count == 2
-    assertions["failed_count_is_0"] = failed_count == 0
+    assertions["commit_fails_closed_on_cli_backend"] = (
+        commit_outcome != "fully_committed" and committed_count == 0 and failed_count >= 1
+    )
+    assertions["cli_refusal_is_typed_backend_failure"] = (
+        "code=backend_failure operation=send_text effect=not_applied" in tx_run_result.stdout
+    )
+    assertions["final_state_is_not_committed"] = final_state != "committed"
 
-    # Verify pane logs contain sent text
+    # Nothing reached either pane.
     pane_a_log = read_pane_log(fake_state_dir, pane_a)
     pane_b_log = read_pane_log(fake_state_dir, pane_b)
-    assertions["pane_a_contains_step1_marker"] = "step1-marker" in pane_a_log
-    assertions["pane_b_contains_step2_marker"] = "step2-marker" in pane_b_log
+    assertions["pane_a_received_nothing"] = "step1-marker" not in pane_a_log
+    assertions["pane_b_received_nothing"] = "step2-marker" not in pane_b_log
 
     # Run ft tx show to verify contract state inspection
     tx_show_result = run(
