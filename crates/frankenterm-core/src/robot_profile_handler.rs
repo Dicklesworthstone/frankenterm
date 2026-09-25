@@ -364,7 +364,7 @@ fn require_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, ProfileHandl
 
 fn opt_str<'a>(params: &'a Value, key: &str) -> Result<Option<&'a str>, ProfileHandlerError> {
     match params.get(key) {
-        None => Ok(None),
+        None | Some(Value::Null) => Ok(None),
         Some(value) => value
             .as_str()
             .map(Some)
@@ -374,7 +374,7 @@ fn opt_str<'a>(params: &'a Value, key: &str) -> Result<Option<&'a str>, ProfileH
 
 fn opt_u32(params: &Value, key: &str) -> Result<Option<u32>, ProfileHandlerError> {
     match params.get(key) {
-        None => Ok(None),
+        None | Some(Value::Null) => Ok(None),
         Some(value) => {
             let Some(number) = value.as_u64() else {
                 return Err(ProfileHandlerError::BadParams(format!(
@@ -392,7 +392,7 @@ fn opt_u32(params: &Value, key: &str) -> Result<Option<u32>, ProfileHandlerError
 
 fn opt_bool(params: &Value, key: &str) -> Result<Option<bool>, ProfileHandlerError> {
     match params.get(key) {
-        None => Ok(None),
+        None | Some(Value::Null) => Ok(None),
         Some(value) => value
             .as_bool()
             .map(Some)
@@ -1514,6 +1514,35 @@ mod tests {
     }
 
     // ── ft-xxfwy.28: `create` makes `apply` reachable for operators ──
+
+    #[test]
+    fn create_accepts_null_for_every_omitted_optional_flag() {
+        // The CLI serializes omitted flags as JSON null.
+        let backend = fresh_conn();
+        let params = json!({
+            "name": "worker",
+            "role": null,
+            "shell": null,
+            "command": "echo ready",
+            "working_directory": null,
+            "description": null,
+            "tags": null,
+            "env": null,
+            "bootstrap_commands": null,
+        });
+        let created = handle_profile_command("create", &params, &backend).expect("create");
+        assert_eq!(created["created"], json!(true));
+        assert_eq!(created["role"], json!("agent"));
+        assert_eq!(created["spawn_command"], json!("echo ready"));
+        // A present but mistyped value is still refused.
+        let err = handle_profile_command(
+            "create",
+            &json!({ "name": "other", "description": 7 }),
+            &backend,
+        )
+        .expect_err("non-string description");
+        assert!(err.to_string().contains("`description` must be a string"), "{err}");
+    }
 
     #[test]
     fn create_persists_profile_and_returns_show_shape() {

@@ -58992,6 +58992,22 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     return Ok(());
                                 }
                             };
+                            // A fresh workspace has no schema yet: open the managed
+                            // store once so its migrations create the tables (with the
+                            // usual file modes) before the raw backend reads them.
+                            if let Err(e) = ensure_workspace_schema(cx, &layout.db_path).await {
+                                let response = RobotResponse::<serde_json::Value>::error_with_code(
+                                    ROBOT_ERR_STORAGE,
+                                    format!(
+                                        "Failed to initialize workspace DB at {}: {e}",
+                                        layout.db_path.display()
+                                    ),
+                                    None,
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
                             let backend = match frankenterm_core::storage_backend_trait::RusqliteBackend::open_path(
                                 &layout.db_path,
                                 &frankenterm_core::storage_backend_trait::OpenConfig {
@@ -59247,6 +59263,22 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     return Ok(());
                                 }
                             };
+                            // A fresh workspace has no schema yet: open the managed
+                            // store once so its migrations create the tables (with the
+                            // usual file modes) before the raw backend reads them.
+                            if let Err(e) = ensure_workspace_schema(cx, &layout.db_path).await {
+                                let response = RobotResponse::<serde_json::Value>::error_with_code(
+                                    ROBOT_ERR_STORAGE,
+                                    format!(
+                                        "Failed to initialize workspace DB at {}: {e}",
+                                        layout.db_path.display()
+                                    ),
+                                    None,
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
                             let backend = match frankenterm_core::storage_backend_trait::RusqliteBackend::open_path(
                                 &layout.db_path,
                                 &frankenterm_core::storage_backend_trait::OpenConfig {
@@ -59511,6 +59543,22 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     return Ok(());
                                 }
                             };
+                            // A fresh workspace has no schema yet: open the managed
+                            // store once so its migrations create the tables (with the
+                            // usual file modes) before the raw backend reads them.
+                            if let Err(e) = ensure_workspace_schema(cx, &layout.db_path).await {
+                                let response = RobotResponse::<serde_json::Value>::error_with_code(
+                                    ROBOT_ERR_STORAGE,
+                                    format!(
+                                        "Failed to initialize workspace DB at {}: {e}",
+                                        layout.db_path.display()
+                                    ),
+                                    None,
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
                             let backend = match frankenterm_core::storage_backend_trait::RusqliteBackend::open_path(
                                 &layout.db_path,
                                 &frankenterm_core::storage_backend_trait::OpenConfig {
@@ -96241,6 +96289,17 @@ fn recorder_storage_diagnostic_check(recorder_dir: &Path) -> DiagnosticCheck {
     } else {
         DiagnosticCheck::ok_with_detail("recorder storage", detail)
     }
+}
+
+/// Create or migrate the workspace schema through the managed store.
+async fn ensure_workspace_schema(
+    cx: &frankenterm_core::cx::Cx,
+    db_path: &Path,
+) -> frankenterm_core::Result<()> {
+    let storage =
+        frankenterm_core::storage::StorageHandle::new_with_cx(cx, &db_path.to_string_lossy())
+            .await?;
+    storage.shutdown().await
 }
 
 /// Panes shown in the plain `ft status` busiest-panes block.
