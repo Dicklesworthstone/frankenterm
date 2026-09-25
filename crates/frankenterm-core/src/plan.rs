@@ -3878,6 +3878,53 @@ pub trait TxPrepareApprovalChecker {
         scope: &ApprovalScope,
         now_ms: i64,
     ) -> std::result::Result<bool, String>;
+
+    /// Atomically consume one active allow-once approval for `scope`
+    /// (ft-0rlfq.9). `Ok(false)` means no unused token remains, including when
+    /// a concurrent prepare took the last one. Checkers without durable tokens
+    /// keep the presence check.
+    fn claim_approval(
+        &self,
+        scope: &ApprovalScope,
+        now_ms: i64,
+    ) -> std::result::Result<bool, String> {
+        self.has_active_approval(scope, now_ms)
+    }
+}
+
+/// Consume one scoped approval per approval-gated step once every prepare
+/// gate has passed (ft-0rlfq.9). A step whose claim fails is marked
+/// unsatisfied and claiming stops, so the prepare report denies the whole
+/// transaction before any commit; tokens already claimed for earlier steps
+/// stay spent. Returns whether every required approval was claimed.
+pub fn claim_tx_prepare_approvals<A: TxPrepareApprovalChecker>(
+    approvals: &A,
+    gate_inputs: &mut [TxPrepareGateInput],
+    now_ms: i64,
+) -> bool {
+    for gate in gate_inputs.iter_mut() {
+        let Some(requirement) = gate.required_approval.as_ref() else {
+            continue;
+        };
+        if !gate.approval_satisfied {
+            return false;
+        }
+        let scope = ApprovalScope {
+            workspace_id: requirement.workspace_id.clone(),
+            action_kind: requirement.action_kind.clone(),
+            pane_id: requirement.pane_id,
+            action_fingerprint: requirement.action_fingerprint.clone(),
+        };
+        let reason = match approvals.claim_approval(&scope, now_ms) {
+            Ok(true) => continue,
+            Ok(false) => "tx.prepare.approval_already_consumed",
+            Err(_) => "tx.prepare.approval_claim_failed",
+        };
+        gate.approval_satisfied = false;
+        gate.approval_reason_code = Some(reason.to_string());
+        return false;
+    }
+    true
 }
 
 pub struct StorageBackedPrepareApprovalChecker<'a> {
@@ -3892,6 +3939,26 @@ impl<'a> StorageBackedPrepareApprovalChecker<'a> {
 }
 
 impl TxPrepareApprovalChecker for StorageBackedPrepareApprovalChecker<'_> {
+    fn claim_approval(
+        &self,
+        scope: &ApprovalScope,
+        now_ms: i64,
+    ) -> std::result::Result<bool, String> {
+        let Some(storage) = self.storage else {
+            return Ok(false);
+        };
+        storage
+            .claim_active_approval_for_scope_blocking(
+                &scope.workspace_id,
+                &scope.action_kind,
+                scope.pane_id,
+                &scope.action_fingerprint,
+                now_ms,
+            )
+            .map(|claimed| claimed.is_some())
+            .map_err(|err| err.to_string())
+    }
+
     fn has_active_approval(
         &self,
         scope: &ApprovalScope,

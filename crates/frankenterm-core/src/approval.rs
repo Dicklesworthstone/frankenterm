@@ -1821,6 +1821,72 @@ mod tests {
     ///      doesn't require approval is a pure pass-through (no
     ///      storage calls, no checkpoint).
     #[test]
+    fn tx_prepare_claims_a_scoped_approval_exactly_once_under_contention() {
+        use crate::plan::{StorageBackedPrepareApprovalChecker, TxPrepareApprovalChecker};
+        run_async_test(async {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = StorageHandle::new(&dir.path().join("ft.db").to_string_lossy())
+                .await
+                .unwrap();
+            storage
+                .upsert_pane(PaneRecord {
+                    pane_id: 5,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: None,
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: 1_700_000_000_000,
+                    last_seen_at: 1_700_000_000_000,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                })
+                .await
+                .unwrap();
+            let store = ApprovalStore::new(&storage, ApprovalConfig::default(), "ws");
+            let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+                .with_pane(5)
+                .with_text_summary("deploy");
+            let scope = ApprovalScope::from_input("ws", &input);
+            let checker = StorageBackedPrepareApprovalChecker::new(Some(&storage));
+            let now = now_ms();
+
+            // One token: the first claim wins, a replay finds nothing left.
+            store.issue(&input, None).await.unwrap();
+            assert!(checker.has_active_approval(&scope, now).unwrap());
+            assert!(checker.claim_approval(&scope, now).unwrap());
+            assert!(!checker.claim_approval(&scope, now).unwrap());
+            assert!(!checker.has_active_approval(&scope, now).unwrap());
+
+            // A different pane's scope never matches this pane's token.
+            store.issue(&input, None).await.unwrap();
+            let other = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+                .with_pane(6)
+                .with_text_summary("deploy");
+            let other_scope = ApprovalScope::from_input("ws", &other);
+            assert!(!checker.claim_approval(&other_scope, now).unwrap());
+
+            // Concurrent prepares racing for that one token: exactly one wins.
+            let winners = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|threads| {
+                for _ in 0..8 {
+                    threads.spawn(|| {
+                        let checker = StorageBackedPrepareApprovalChecker::new(Some(&storage));
+                        if checker.claim_approval(&scope, now).unwrap() {
+                            winners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    });
+                }
+            });
+            assert_eq!(winners.load(std::sync::atomic::Ordering::SeqCst), 1);
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
     fn issuing_for_an_unrecorded_pane_names_the_fix_not_the_foreign_key() {
         run_async_test(async {
             let dir = tempfile::tempdir().unwrap();

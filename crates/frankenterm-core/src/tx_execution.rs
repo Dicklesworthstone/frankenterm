@@ -2360,6 +2360,11 @@ pub trait StepExecutor {
     /// Evaluate prepare-phase gates for all steps.
     fn evaluate_gates(&self, contract: &MissionTxContract, now_ms: i64) -> Vec<TxPrepareGateInput>;
 
+    /// Consume the scoped allow-once approvals the passing gates relied on,
+    /// just before commit (ft-0rlfq.9). A lost claim marks its gate
+    /// unsatisfied. Executors without durable approvals have nothing to claim.
+    fn claim_prepare_approvals(&self, _gate_inputs: &mut [TxPrepareGateInput], _now_ms: i64) {}
+
     /// Execute commit-phase steps and return inputs.
     fn execute_steps(
         &self,
@@ -2496,6 +2501,14 @@ impl StepExecutor for SyntheticStepExecutor {
     }
 }
 
+fn prepare_gate_passes(gate: &TxPrepareGateInput) -> bool {
+    gate.preconditions_satisfied
+        && gate.policy_passed
+        && gate.reservation_available
+        && gate.approval_satisfied
+        && gate.target_liveness
+}
+
 /// Prepare-phase gate evaluator wired to the real policy engine, approval
 /// store, and target-state providers.
 ///
@@ -2538,6 +2551,11 @@ where
     A: TxPrepareApprovalChecker,
     T: TxPrepareTargetLookup,
 {
+    /// Consume the scoped approvals behind passing gates (ft-0rlfq.9).
+    pub fn claim_approvals(&self, gate_inputs: &mut [TxPrepareGateInput], now_ms: i64) -> bool {
+        crate::plan::claim_tx_prepare_approvals(&self.approvals, gate_inputs, now_ms)
+    }
+
     /// Evaluate the real prepare-phase gates for every step in `contract`.
     pub fn evaluate_gates(
         &self,
@@ -3206,6 +3224,10 @@ where
 {
     fn evaluate_gates(&self, contract: &MissionTxContract, now_ms: i64) -> Vec<TxPrepareGateInput> {
         self.policy_executor.evaluate_gates(contract, now_ms)
+    }
+
+    fn claim_prepare_approvals(&self, gate_inputs: &mut [TxPrepareGateInput], now_ms: i64) {
+        self.policy_executor.claim_approvals(gate_inputs, now_ms);
     }
 
     fn execute_steps(
@@ -5046,6 +5068,17 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 HashSet::new(),
             )
         };
+        let mut gate_inputs = gate_inputs;
+        // ft-0rlfq.9: spend allow-once approvals only when this prepare will
+        // actually dispatch: every gate passes and nothing suspends commit.
+        let dispatch_would_proceed = has_unresolved_effects
+            && kill_switch == MissionKillSwitchLevel::Off
+            && !self.config.paused
+            && contract.plan.steps.len() <= self.config.max_steps_per_batch;
+        if dispatch_would_proceed && gate_inputs.iter().all(prepare_gate_passes) {
+            self.executor
+                .claim_prepare_approvals(&mut gate_inputs, now_ms);
+        }
         self.record_prepare_gate_events(contract, execution_id, events, &gate_inputs, now_ms);
 
         let report = evaluate_prepare_phase(
@@ -11758,6 +11791,117 @@ mod tests {
         assert!(result.commit_report.is_none());
         assert_eq!(result.final_state, MissionTxState::Planned);
         assert_eq!(result.outcome, TxOutcome::Pending);
+    }
+
+    /// Gates pass on an existing approval; claiming spends a shared pool.
+    struct OneShotApprovalExecutor {
+        tokens: std::cell::Cell<u32>,
+        claims: std::cell::Cell<u32>,
+    }
+
+    impl effect_seal::NonEffectful for OneShotApprovalExecutor {}
+
+    impl StepExecutor for OneShotApprovalExecutor {
+        fn evaluate_gates(
+            &self,
+            contract: &MissionTxContract,
+            now_ms: i64,
+        ) -> Vec<TxPrepareGateInput> {
+            ApprovalBlockingExecutor
+                .evaluate_gates(contract, now_ms)
+                .into_iter()
+                .map(|mut gate| {
+                    // Presence check, as the real checker does: any token left.
+                    gate.approval_satisfied = self.tokens.get() > 0;
+                    gate.approval_reason_code = None;
+                    gate
+                })
+                .collect()
+        }
+
+        fn claim_prepare_approvals(&self, gate_inputs: &mut [TxPrepareGateInput], _now_ms: i64) {
+            for gate in gate_inputs {
+                self.claims.set(self.claims.get() + 1);
+                if self.tokens.get() == 0 {
+                    gate.approval_satisfied = false;
+                    gate.approval_reason_code =
+                        Some("tx.prepare.approval_already_consumed".to_string());
+                    return;
+                }
+                self.tokens.set(self.tokens.get() - 1);
+            }
+        }
+
+        fn execute_steps(
+            &self,
+            contract: &MissionTxContract,
+            fail_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<TxCommitStepInput> {
+            crate::plan::mission_tx_commit_step_inputs(contract, fail_step, now_ms)
+        }
+
+        fn execute_compensations(
+            &self,
+            _contract: &MissionTxContract,
+            commit_report: &TxCommitReport,
+            fail_for_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<TxCompensationStepInput> {
+            crate::plan::mission_tx_compensation_inputs(commit_report, fail_for_step, now_ms)
+        }
+    }
+
+    #[test]
+    fn one_allow_once_approval_authorizes_exactly_one_transaction() {
+        // ft-0rlfq.9: one token, two single-step transactions on the same scope.
+        let executor = OneShotApprovalExecutor {
+            tokens: std::cell::Cell::new(1),
+            claims: std::cell::Cell::new(0),
+        };
+        let engine = TxExecutionEngine::new(executor, TxExecutionConfig::default());
+
+        let mut first = make_test_contract(1);
+        let first_result = engine.execute(&mut first, 5_000).unwrap();
+        assert_eq!(first_result.prepare_report.outcome, TxPrepareOutcome::AllReady);
+        assert!(first_result.commit_report.is_some());
+
+        // The token is spent: the presence check now fails at prepare.
+        let mut second = make_test_contract(1);
+        let second_result = engine.execute(&mut second, 6_000).unwrap();
+        assert_ne!(second_result.prepare_report.outcome, TxPrepareOutcome::AllReady);
+        assert!(second_result.commit_report.is_none());
+    }
+
+    #[test]
+    fn a_lost_approval_claim_stops_the_transaction_before_commit() {
+        // Two steps pass the presence check, but only one token can be claimed.
+        let executor = OneShotApprovalExecutor {
+            tokens: std::cell::Cell::new(1),
+            claims: std::cell::Cell::new(0),
+        };
+        let engine = TxExecutionEngine::new(executor, TxExecutionConfig::default());
+        let mut contract = make_test_contract(2);
+        let result = engine.execute(&mut contract, 5_000).unwrap();
+        assert_ne!(result.prepare_report.outcome, TxPrepareOutcome::AllReady);
+        assert!(result.commit_report.is_none());
+    }
+
+    #[test]
+    fn approvals_are_not_claimed_when_the_kill_switch_blocks_dispatch() {
+        let executor = OneShotApprovalExecutor {
+            tokens: std::cell::Cell::new(1),
+            claims: std::cell::Cell::new(0),
+        };
+        let config = TxExecutionConfig {
+            kill_switch: MissionKillSwitchLevel::HardStop,
+            ..TxExecutionConfig::default()
+        };
+        let engine = TxExecutionEngine::new(executor, config);
+        let mut contract = make_test_contract(1);
+        let _ = engine.execute(&mut contract, 5_000);
+        assert_eq!(engine.executor.claims.get(), 0);
+        assert_eq!(engine.executor.tokens.get(), 1);
     }
 
     #[test]

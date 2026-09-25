@@ -10066,6 +10066,29 @@ impl StorageHandle {
         })
     }
 
+    /// Consume one active approval token for the exact scope on a synchronous
+    /// path, returning its id, or `None` when no unused token remains
+    /// (ft-0rlfq.9).
+    pub fn claim_active_approval_for_scope_blocking(
+        &self,
+        workspace_id: &str,
+        action_kind: &str,
+        pane_id: Option<u64>,
+        action_fingerprint: &str,
+        now_ms: i64,
+    ) -> Result<Option<i64>> {
+        pooled_backend(self.db_path.as_str(), |backend| {
+            claim_active_approval_for_scope_backend(
+                backend,
+                workspace_id,
+                action_kind,
+                pane_id,
+                action_fingerprint,
+                now_ms,
+            )
+        })
+    }
+
     // =========================================================================
     // Export Query Operations
     // =========================================================================
@@ -20131,6 +20154,64 @@ fn query_active_approval_for_scope_backend(
     .map_err(|err| storage_backend_error("Query active approval for scope", err))?;
 
     Ok(exists)
+}
+
+/// Consume one unused, unexpired approval token for an exact scope in a
+/// single statement (ft-0rlfq.9). Concurrent claimers serialize on the write,
+/// so each token has exactly one winner; a loser gets `None`.
+fn claim_active_approval_for_scope_backend(
+    backend: &dyn StorageBackend,
+    workspace_id: &str,
+    action_kind: &str,
+    pane_id: Option<u64>,
+    action_fingerprint: &str,
+    now_ms: i64,
+) -> Result<Option<i64>> {
+    let pane_id = pane_id
+        .map(|pane_id| u64_to_i64(pane_id, "approval_tokens.pane_id"))
+        .transpose()?;
+    let pane_clause = if pane_id.is_some() {
+        "pane_id = ?5"
+    } else {
+        "pane_id IS NULL"
+    };
+    let sql = format!(
+        "UPDATE approval_tokens
+         SET used_at = ?4
+         WHERE id = (
+             SELECT id FROM approval_tokens
+             WHERE workspace_id = ?1
+               AND action_kind = ?2
+               AND action_fingerprint = ?3
+               AND {pane_clause}
+               AND used_at IS NULL
+               AND expires_at >= ?4
+             ORDER BY expires_at ASC, id ASC
+             LIMIT 1
+         )
+           AND used_at IS NULL
+         RETURNING id"
+    );
+    let mut params = vec![
+        ToSqlValue::Text(workspace_id),
+        ToSqlValue::Text(action_kind),
+        ToSqlValue::Text(action_fingerprint),
+        ToSqlValue::Integer(now_ms),
+    ];
+    if let Some(pane_id) = pane_id {
+        params.push(ToSqlValue::Integer(pane_id));
+    }
+    let row = backend
+        .query_row_typed(&sql, &params)
+        .map_err(|err| storage_backend_error("Claim active approval for scope", err))?;
+    Ok(row
+        .as_deref()
+        .map(|row| {
+            RowReader::new(row)
+                .i64(0)
+                .map_err(|err| storage_backend_error("Claim active approval row", err))
+        })
+        .transpose()?)
 }
 
 /// Append a segment through the storage backend (called from writer thread).
