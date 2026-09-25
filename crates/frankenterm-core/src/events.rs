@@ -3653,6 +3653,27 @@ mod tests {
         assert_eq!(data.get("cmd").and_then(|v| v.as_str()), Some("ls -la"));
     }
 
+    /// ft-xxfwy.55.22: UserVar is the only event JSON carrier sourced from
+    /// pane input. serde_json's recursion limit bounds its depth before the
+    /// value can reach EventBus clone or SSE serialization.
+    #[test]
+    fn user_var_decode_rejects_json_deeper_than_the_parser_limit() {
+        use base64::Engine;
+
+        let nested = |depth: usize| {
+            let json = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+            base64::engine::general_purpose::STANDARD.encode(json)
+        };
+
+        let shallow = UserVarPayload::decode(&nested(100), false).expect("100 levels decode");
+        assert!(shallow.event_data.is_some());
+
+        let deep = nested(20_000);
+        assert!(UserVarPayload::decode(&deep, false).is_err());
+        let lenient = UserVarPayload::decode(&deep, true).expect("lenient keeps raw value");
+        assert!(lenient.event_data.is_none());
+    }
+
     #[test]
     fn user_var_decode_invalid_base64_strict() {
         // Not valid base64
