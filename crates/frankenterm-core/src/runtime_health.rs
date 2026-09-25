@@ -1554,6 +1554,17 @@ pub fn check_swarm_capacity_operator_summary(
                 .with_evidence(&evidence)
                 .with_remediation(remediation)
         }
+        // No certificate yet (a fresh watcher has no baseline) cannot throttle
+        // anything while the admission controller is not enabled; say so
+        // without failing the whole health report.
+        SwarmCapacityOperatorStatus::Unknown
+            if summary.controller_mode
+                != Some(crate::runtime_telemetry::SwarmCapacityAdmissionControllerMode::Enabled) =>
+        {
+            RuntimeHealthCheck::warn("swarm_capacity", "Swarm capacity", &summary.summary)
+                .with_evidence(&evidence)
+                .with_remediation(remediation)
+        }
         SwarmCapacityOperatorStatus::Violated | SwarmCapacityOperatorStatus::Unknown => {
             RuntimeHealthCheck::fail("swarm_capacity", "Swarm capacity", &summary.summary)
                 .with_evidence(&evidence)
@@ -1812,6 +1823,29 @@ mod tests {
             let rt: CheckStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(rt, status);
         }
+    }
+
+    #[test]
+    fn unknown_capacity_warns_until_the_controller_is_enabled() {
+        use crate::runtime_telemetry::SwarmCapacityAdmissionControllerMode as Mode;
+        let mut summary = SwarmCapacityOperatorSummary::unavailable(1_700_000_000_001, 1, "test");
+        summary.status = SwarmCapacityOperatorStatus::Unknown;
+        for (mode, expected) in [
+            (None, CheckStatus::Warn),
+            (Some(Mode::Disabled), CheckStatus::Warn),
+            (Some(Mode::DryRun), CheckStatus::Warn),
+            (Some(Mode::Enabled), CheckStatus::Fail),
+        ] {
+            summary.controller_mode = mode;
+            assert_eq!(
+                check_swarm_capacity_operator_summary(&summary).status,
+                expected,
+                "{mode:?}"
+            );
+        }
+        summary.status = SwarmCapacityOperatorStatus::Violated;
+        summary.controller_mode = Some(Mode::Disabled);
+        assert_eq!(check_swarm_capacity_operator_summary(&summary).status, CheckStatus::Fail);
     }
 
     #[test]
