@@ -8039,6 +8039,19 @@ impl ObservationRuntime {
                         })
                         .map(|(pane_id, pane)| (*pane_id, pane.info.clone()))
                         .collect::<HashMap<_, _>>();
+                    // Streaming-owned panes are never polled. Admitting them
+                    // here re-added a tailer that the polling sync below
+                    // removed again, on every discovery tick.
+                    #[cfg(all(feature = "vendored", unix))]
+                    let retained_polling_panes = retained_polling_panes
+                        .into_iter()
+                        .filter(|(pane_id, _)| {
+                            !streaming_tasks.contains_key(pane_id)
+                                && capture_bindings
+                                    .get(pane_id)
+                                    .is_some_and(|binding| binding.streaming_source_drained())
+                        })
+                        .collect::<HashMap<_, _>>();
                     let retained_polling_leases = retained_polling_panes
                         .keys()
                         .filter_map(|pane_id| {
