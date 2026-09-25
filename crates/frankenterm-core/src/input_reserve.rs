@@ -1,7 +1,10 @@
 //! Input-preserving backpressure with S3-FIFO admission and reserve floors.
 //!
-//! Card C of the latency-immunity architecture ensures local interaction
-//! (keystrokes, viewport reflow) is never starved by remote mux state work.
+//! Card C of the latency-immunity architecture: keep local interaction
+//! (keystrokes, viewport reflow) from being starved by remote mux state work.
+//!
+//! **Not wired:** no GUI, mux or runtime path schedules work through
+//! [`InputReserveController`] yet, so it protects nothing today.
 //!
 //! # Components
 //!
