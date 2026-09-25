@@ -7983,6 +7983,12 @@ impl<C> PolicyGatedInjector<C>
 where
     C: crate::wezterm::WeztermInterface,
 {
+    /// The terminal client this injector sends through.
+    #[must_use]
+    pub const fn client(&self) -> &C {
+        &self.client
+    }
+
     /// Create a new policy-gated injector without audit trail storage
     #[must_use]
     pub fn new(engine: PolicyEngine, client: C) -> Self {

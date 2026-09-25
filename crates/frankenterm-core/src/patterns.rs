@@ -3515,7 +3515,7 @@ fn builtin_claude_code_submit_profile() -> SubmitProfile {
     SubmitProfile {
         id: "claude_code.default".to_string(),
         agent_type: AgentType::ClaudeCode,
-        version: "2026-06-08".to_string(),
+        version: "2026-09-25".to_string(),
         anchors: SubmitProfileAnchors {
             composer_nonempty: vec![
                 ">".to_string(),
@@ -3532,11 +3532,15 @@ fn builtin_claude_code_submit_profile() -> SubmitProfile {
                 "Using tool".to_string(),
                 "Executing:".to_string(),
                 "Auto-compact".to_string(),
+                // Claude Code 2.1 shows this in the status line while a turn runs.
+                "esc to interrupt".to_string(),
             ],
+            // Not a bare "Permission": the 2.1 footer "bypass permissions on"
+            // matched it and classified every submit as queued.
             queued_behind_operation: vec![
                 "Approve?".to_string(),
                 "Allow?".to_string(),
-                "Permission".to_string(),
+                "Do you want to proceed?".to_string(),
             ],
             crash_to_shell: vec![
                 "Traceback (most recent call last)".to_string(),

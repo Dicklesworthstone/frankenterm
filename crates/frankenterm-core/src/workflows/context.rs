@@ -270,15 +270,15 @@ impl WorkflowContext {
             .submit_profile_for_agent(agent_type)
             .cloned();
         let before_text = if submit_profile.is_some() {
-            capture_verified_submit_text(cx, pane_id).await
+            capture_verified_submit_text(cx, injector.client(), pane_id).await
         } else {
             None
         };
-        let outbound_text = if submit_profile.is_some() && !text.trim().is_empty() {
-            crate::verified_submit::append_verification_canary(pane_id, text)
-        } else {
-            text.to_string()
-        };
+        // No verification canary: it is confirmed only through semantic input
+        // zones, which agent composers never publish, and its U+2063 marker
+        // keeps Claude Code 2.1 from submitting the paste at all. Agent submits
+        // are classified from the captured screen instead.
+        let outbound_text = text.to_string();
 
         let start = Instant::now();
         let injection = injector
@@ -298,8 +298,9 @@ impl WorkflowContext {
                     let _ =
                         crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(120)).await;
                     (
-                        capture_verified_submit_text(cx, pane_id).await,
-                        capture_verified_submit_semantic_snapshot(cx, pane_id).await,
+                        capture_verified_submit_text(cx, injector.client(), pane_id).await,
+                        capture_verified_submit_semantic_snapshot(cx, injector.client(), pane_id)
+                            .await,
                     )
                 } else {
                     (None, None)
@@ -478,8 +479,14 @@ impl WorkflowContext {
     }
 }
 
-async fn capture_verified_submit_text(cx: &crate::cx::Cx, pane_id: u64) -> Option<String> {
-    match default_wezterm_handle()
+// Captures go through the injector's own client: the default handle is a
+// CLI-only client, which cannot read a pane on a vendored-mux deployment.
+async fn capture_verified_submit_text(
+    cx: &crate::cx::Cx,
+    client: &crate::wezterm::WeztermHandle,
+    pane_id: u64,
+) -> Option<String> {
+    match client
         .get_text_with_cx(cx, pane_id, false)
         .await
     {
@@ -497,9 +504,10 @@ async fn capture_verified_submit_text(cx: &crate::cx::Cx, pane_id: u64) -> Optio
 
 async fn capture_verified_submit_semantic_snapshot(
     cx: &crate::cx::Cx,
+    client: &crate::wezterm::WeztermHandle,
     pane_id: u64,
 ) -> Option<crate::wezterm::MuxSemanticSnapshot> {
-    match default_wezterm_handle()
+    match client
         .get_semantic_zones_with_cx(cx, pane_id)
         .await
     {

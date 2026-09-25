@@ -2645,10 +2645,22 @@ impl WeztermClient {
                                 .map(|_| ())
                         };
                         match pasted {
-                            Ok(()) => pool
-                                .write_to_pane_with_cx(cx, pane_id, b"\r".to_vec())
-                                .await
-                                .map(|_| ()),
+                            Ok(()) => {
+                                // Claude Code folds an Enter that arrives right
+                                // behind a multi-line paste into the paste, so
+                                // leave a gap after one. A cancelled sleep falls
+                                // through: the write below observes the same cx.
+                                if body.contains(['\n', '\r']) {
+                                    let _ = crate::runtime_async::sleep_with_cx(
+                                        cx,
+                                        Duration::from_millis(MULTILINE_PASTE_SUBMIT_GAP_MS),
+                                    )
+                                    .await;
+                                }
+                                pool.write_to_pane_with_cx(cx, pane_id, b"\r".to_vec())
+                                    .await
+                                    .map(|_| ())
+                            }
                             Err(e) => Err(e),
                         }
                     }
@@ -3991,6 +4003,13 @@ impl WeztermClient {
         }
     }
 }
+
+/// Gap between a multi-line paste and the Enter typed to submit it. Measured
+/// against Claude Code 2.1.282: an Enter 2 ms after a multi-line paste was
+/// absorbed into the composer, one 760 ms later submitted. Single-line pastes
+/// submitted with no gap, so they get none.
+#[cfg_attr(not(all(feature = "vendored", unix)), allow(dead_code))]
+const MULTILINE_PASTE_SUBMIT_GAP_MS: u64 = 750;
 
 /// Split pasted text into the body to paste and whether it ends in a line
 /// ending that must be typed as Enter to submit.

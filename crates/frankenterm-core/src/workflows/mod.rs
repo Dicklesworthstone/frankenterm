@@ -173,6 +173,9 @@ type PolicyInjector = crate::policy::PolicyGatedInjector<crate::wezterm::Wezterm
 #[derive(Clone)]
 pub struct CxPolicyInjector {
     inner: Arc<crate::runtime_async::Mutex<PolicyInjector>>,
+    /// The injector's own client, for reads that must see the pane the send
+    /// reaches (verified-submit captures) without taking the injector lock.
+    client: crate::wezterm::WeztermHandle,
     capability_source: Option<(
         Arc<crate::storage::StorageHandle>,
         Option<crate::pane_capability_resolution::WatcherCapabilitySource>,
@@ -203,9 +206,16 @@ impl CxPolicyInjector {
     #[must_use]
     pub fn new(injector: PolicyInjector) -> Self {
         Self {
+            client: injector.client().clone(),
             inner: Arc::new(crate::runtime_async::Mutex::new(injector)),
             capability_source: None,
         }
+    }
+
+    /// The terminal client the injector sends through.
+    #[must_use]
+    pub fn client(&self) -> &crate::wezterm::WeztermHandle {
+        &self.client
     }
 
     fn with_capability_source(
