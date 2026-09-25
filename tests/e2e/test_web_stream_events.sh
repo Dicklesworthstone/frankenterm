@@ -33,6 +33,8 @@ check() {
     else FAIL=$((FAIL + 1)); echo "FAIL $1: $3"; fi
 }
 now() { python3 -c 'import time;print(time.time())'; }
+# A fixture shape from redactor_coverage_matrix.rs (not a real credential).
+FAKE_TOKEN="sk-ant-api03-FGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGH"
 
 run_mode() {
     local MODE="$1"
@@ -84,18 +86,23 @@ run_mode() {
     curl -sN --max-time 25 "http://127.0.0.1:$PORT/stream/events?channel=detections&pane_id=$((PANE + 1000))" \
         > "$OUT/$MODE.sse-other-pane.txt" 2> /dev/null &
     CURL_OTHER=$!; PIDS+=("$CURL_OTHER")
+    curl -sN --max-time 25 "http://127.0.0.1:$PORT/stream/deltas?pane_id=$PANE&max_hz=20" \
+        > "$OUT/$MODE.deltas.txt" 2> /dev/null &
+    PIDS+=("$!")
     sleep 2
     ft send --no-paste "$PANE" 'printf "\033]2;codex\007"' > "$OUT/$MODE.send1.log" 2>&1
     sleep 1
     ft send --no-paste "$PANE" "echo \"You've reached your usage limit. try again at 3:00 PM.\"" > "$OUT/$MODE.send2.log" 2>&1
     TRIGGERED=$(now)
+    # A leaked credential in pane output must never leave the server in clear.
+    ft send --no-paste "$PANE" "echo auth=$FAKE_TOKEN status=ok" > "$OUT/$MODE.send3.log" 2>&1
     local deadline=$((SECONDS + 20))
     while (( SECONDS < deadline )); do
         grep -q "codex.usage.reached" "$OUT/$MODE.sse.txt" 2> /dev/null && break
         sleep 0.2
     done
     ARRIVED=$(now)
-    sleep 2
+    sleep "${DELTA_SETTLE_SECS:-2}"
 
     for pid in "${PIDS[@]}"; do kill "$pid" 2> /dev/null; done
     for pid in "${PIDS[@]}"; do wait "$pid" 2> /dev/null; done
@@ -110,6 +117,8 @@ run_mode() {
     grep -q '"kind":"ready"' "$OUT/$MODE.sse-other-pane.txt" \
         && ! grep -q "codex.usage.reached" "$OUT/$MODE.sse-other-pane.txt"
     check "$MODE/pane_id filter excludes other panes' detections" $? "$(head -c 400 "$OUT/$MODE.sse-other-pane.txt")"
+    grep -q "status=ok" "$OUT/$MODE.deltas.txt" && ! grep -q "$FAKE_TOKEN" "$OUT/$MODE.deltas.txt"
+    check "$MODE/output deltas stream redacts a leaked token" $? "$(grep -o 'auth=[^ \"]*' "$OUT/$MODE.deltas.txt" | head -3 | tr '\n' ' ')"
     local copies
     copies=$(grep -c "codex.usage.reached" "$OUT/$MODE.sse.txt")
     [[ "$copies" == 1 ]]

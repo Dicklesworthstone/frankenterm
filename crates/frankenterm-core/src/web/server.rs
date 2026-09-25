@@ -6,7 +6,7 @@ use super::{StorageEventTail, WebServerConfig, WebServerHandle, build_app};
 use crate::events::{Event, EventBus};
 use crate::patterns::{AgentType, Detection, Severity};
 use crate::runtime_async::signal;
-use crate::storage::{EventQuery, EventStreamQuery, StorageHandle, StoredEvent};
+use crate::storage::{EventQuery, EventStreamQuery, SegmentScanQuery, StorageHandle, StoredEvent};
 use crate::web_framework::{FrameworkWebRuntime, web_cx_error};
 use crate::{Error, Result};
 use std::io::Write;
@@ -73,6 +73,17 @@ pub(super) async fn spawn_storage_event_tail(
         .and_then(|events| events.first().map(|event| event.id))
         .unwrap_or(0);
     let batch = batch.max(1);
+    // Segments captured after the tail starts are announced as
+    // SegmentCaptured so /stream/deltas drains within one poll instead of
+    // waiting for its keepalive tick; no capture history is replayed.
+    let segments_since_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX);
+    let mut segment_cursor: Option<i64> = None;
 
     let task = crate::runtime_async::task::spawn_with_cx(cx, move |child_cx| async move {
         info!(target: "wa.web", start_after_event_id = cursor, "storage event tail started");
@@ -80,6 +91,35 @@ pub(super) async fn spawn_storage_event_tail(
             if *stop_rx.borrow() || child_cx.checkpoint().is_err() {
                 break;
             }
+            let segment_query = SegmentScanQuery {
+                after_id: segment_cursor,
+                pane_id: None,
+                since: Some(segments_since_ms),
+                until: None,
+                limit: batch,
+            };
+            let segments_drained = match storage.scan_segments_with_cx(&child_cx, segment_query).await {
+                Ok(segments) => {
+                    let drained = segments.len();
+                    for segment in segments {
+                        segment_cursor = Some(segment_cursor.map_or(segment.id, |c| c.max(segment.id)));
+                        let _ = bus.publish(Event::SegmentCaptured {
+                            pane_id: segment.pane_id,
+                            seq: segment.seq,
+                            content_len: segment.content_len,
+                        });
+                    }
+                    drained
+                }
+                Err(error) => {
+                    warn!(
+                        target: "wa.web",
+                        error = %error,
+                        "storage segment tail query failed; retrying after the poll interval"
+                    );
+                    0
+                }
+            };
             let query = EventStreamQuery {
                 after_id: Some(cursor),
                 limit: Some(batch),
@@ -106,7 +146,7 @@ pub(super) async fn spawn_storage_event_tail(
                     0
                 }
             };
-            if drained >= batch {
+            if drained >= batch || segments_drained >= batch {
                 // More rows may be waiting; yield and poll again immediately.
                 crate::runtime_async::task::yield_now().await;
                 continue;
@@ -407,6 +447,77 @@ mod tests {
 
     /// ft-zeo5o: a detection persisted by another process (here: written
     /// straight to storage) must reach the web server's bus, while history
+    /// Standalone `ft web` has no live capture publisher, so the tail
+    /// announces newly captured segments for /stream/deltas; segments that
+    /// predate the tail are never announced.
+    #[test]
+    fn storage_tail_announces_new_segments_but_not_history() {
+        use crate::events::{Event, EventBus};
+        use crate::runtime_async::CompatRuntime as _;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("segment-tail.db");
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let storage = crate::storage::StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
+            storage
+                .upsert_pane(crate::storage::PaneRecord {
+                    pane_id: 9,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: None,
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: 1_700_000_000_000,
+                    last_seen_at: 1_700_000_000_000,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                })
+                .await
+                .unwrap();
+            let history = storage.append_segment(9, "old output\n", None).await.unwrap();
+            crate::runtime_async::sleep(Duration::from_millis(5)).await;
+
+            let bus = Arc::new(EventBus::new(16));
+            let mut deltas = bus.subscribe_deltas();
+            let cx = crate::cx::for_testing();
+            let tail = super::spawn_storage_event_tail(
+                &cx,
+                storage.clone(),
+                Arc::clone(&bus),
+                Duration::from_millis(20),
+                8,
+            )
+            .await;
+            crate::runtime_async::sleep(Duration::from_millis(5)).await;
+            let live = storage.append_segment(9, "new output\n", None).await.unwrap();
+
+            let event = crate::runtime_async::timeout(Duration::from_secs(10), deltas.recv())
+                .await
+                .expect("the tail must announce a newly captured segment")
+                .expect("bus delivers the event");
+            match event {
+                Event::SegmentCaptured { pane_id, seq, .. } => {
+                    assert_eq!(pane_id, 9);
+                    assert_eq!(seq, live.seq, "history (seq {}) must not be announced", history.seq);
+                }
+                other => panic!("expected SegmentCaptured, got {other:?}"),
+            }
+
+            let _ = tail.into_task().await;
+            storage.shutdown().await.unwrap();
+        });
+    }
+
     /// that predates the tail is never replayed.
     #[test]
     fn storage_event_tail_republishes_new_rows_but_not_history() {
