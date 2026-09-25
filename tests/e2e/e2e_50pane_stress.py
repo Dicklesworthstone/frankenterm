@@ -244,8 +244,12 @@ def main() -> int:
     if not argv or argv[0] != "cli":
         return 0
 
-    subcommand = argv[1] if len(argv) > 1 else ""
-    args = argv[2:]
+    # ft passes global `cli` flags (e.g. --no-auto-start) before the subcommand.
+    rest = argv[1:]
+    while rest and rest[0].startswith("--"):
+        rest = rest[1:]
+    subcommand = rest[0] if rest else ""
+    args = rest[1:]
 
     with LOCK_PATH.open("a+", encoding="utf-8") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
@@ -1952,6 +1956,26 @@ def write_pane_script(
 
 def ft_env(workspace: Path, fake_wezterm: Path, fake_state_dir: Path) -> dict[str, str]:
     env = os.environ.copy()
+    # Blind mux socket discovery. Otherwise the vendored backend dials the
+    # operator's running FrankenTerm GUI and ft acts on live panes.
+    for key in (
+        "WEZTERM_UNIX_SOCKET",
+        "FRANKENTERM_UNIX_SOCKET",
+        "WEZTERM_PANE",
+        "FRANKENTERM_PANE",
+        "FRANKENTERM_CONFIG_FILE",
+        "WEZTERM_CONFIG_FILE",
+    ):
+        env.pop(key, None)
+    isolated = workspace / ".isolated-home"
+    for sub in ("home", "config", "data", "state", "cache", "runtime"):
+        (isolated / sub).mkdir(parents=True, exist_ok=True, mode=0o700)
+    env["HOME"] = str(isolated / "home")
+    env["XDG_CONFIG_HOME"] = str(isolated / "config")
+    env["XDG_DATA_HOME"] = str(isolated / "data")
+    env["XDG_STATE_HOME"] = str(isolated / "state")
+    env["XDG_CACHE_HOME"] = str(isolated / "cache")
+    env["XDG_RUNTIME_DIR"] = str(isolated / "runtime")
     env["FT_WORKSPACE"] = str(workspace)
     env["FT_DATA_DIR"] = str(workspace / ".ft")
     env["FT_OUTPUT_FORMAT"] = "json"
