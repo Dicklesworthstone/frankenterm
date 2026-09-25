@@ -76405,6 +76405,19 @@ fn lock_mission_tx_contract(
     }
 
     frankenterm_core::tx_execution::acquire_tx_contract_lock(workspace_root, path).map_err(|err| {
+        if err.kind() == frankenterm_core::tx_execution::TxContractStoreErrorKind::Validation {
+            // The contract path escapes the workspace; nothing about the lock
+            // file is wrong, so do not send the operator to fix its access.
+            return MissionCommandError {
+                exit_code: MISSION_EXIT_VALIDATION,
+                error_code: "mission.path_escapes_workspace",
+                message: err.to_string(),
+                hint: Some(format!(
+                    "Put the contract under the workspace root {} (or pass --workspace for the directory that holds it), then retry.",
+                    workspace_root.display()
+                )),
+            };
+        }
         let in_progress =
             err.kind() == frankenterm_core::tx_execution::TxContractStoreErrorKind::InProgress;
         MissionCommandError {
@@ -77584,6 +77597,9 @@ fn tx_contract_lock_mission_error_code(
         }
         frankenterm_core::tx_execution::TxContractStoreErrorKind::Conflict => {
             "mission.tx.revision_conflict"
+        }
+        frankenterm_core::tx_execution::TxContractStoreErrorKind::Validation => {
+            "mission.path_escapes_workspace"
         }
         _ => "mission.tx.lock_failed",
     }
@@ -96838,6 +96854,24 @@ mod operator_guidance_tests {
                 .next_steps
                 .iter()
                 .any(|step| { step.command == "Fix filesystem permissions before retrying" })
+        );
+    }
+
+    #[test]
+    fn a_tx_contract_outside_the_workspace_is_a_path_error_not_a_lock_failure() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let contract = elsewhere.path().join("tx.json");
+        std::fs::write(&contract, "{}").expect("contract");
+        let err = lock_mission_tx_contract(workspace.path(), &contract)
+            .err()
+            .expect("outside contract must be refused");
+        assert_eq!(err.error_code, "mission.path_escapes_workspace");
+        assert_eq!(err.exit_code, MISSION_EXIT_VALIDATION);
+        assert!(err.message.contains("outside workspace root"), "{}", err.message);
+        assert!(
+            err.hint.unwrap_or_default().contains("under the workspace root"),
+            "hint must name the fix, not lock-file access"
         );
     }
 

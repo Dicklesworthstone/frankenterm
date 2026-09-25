@@ -862,7 +862,7 @@ fn normalized_workspace_relative_contract_path(
             .or_else(|_| contract_path.strip_prefix(workspace_root))
             .map_err(|_| {
                 TxContractStoreError::new(
-                    TxContractStoreErrorKind::Lock,
+                    TxContractStoreErrorKind::Validation,
                     format!(
                         "transaction contract {} is outside workspace root {}",
                         contract_path.display(),
