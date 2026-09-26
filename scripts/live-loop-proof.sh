@@ -16,10 +16,12 @@
 #
 # LIVE_LOOP_TIER=3 runs tier 3 (ft-xxfwy.10): 50 panes (40 agent fixtures, 2 full-screen,
 # 10 shells that flood 150k lines), a small [fleet_scrollback] per_pane_budget_bytes, agent
-# fires staggered over ~4 minutes, and three more checks:
+# fires staggered over ~4 minutes, and four more checks:
 #   7. the watcher's fleet pressure tier rises above Normal (sampled from `ft robot health`)
 #   8. hot->warm scrollback spill is observed (mux warm_spill_lines_total > 0)
 #   9. detection latency p95 < 5 s (send of "fire" -> event captured_at, first event per pane)
+#  10. no capture gaps except explicit resets (alt-screen transitions); the receipt also
+#      records memory attribution from the mux (doctor "mux scrollback", fleet telemetry)
 #
 # usage: [LIVE_LOOP_TIER=3] [LIVE_LOOP_RETAIN=1] scripts/live-loop-proof.sh [BIN_DIR]
 # Writes tests/e2e/artifacts/live-loop/<run>/receipt.json plus all logs.
@@ -282,6 +284,25 @@ PY
   read -r DET_P95 DET_N DET_FIRED < "$OUT/detection-latency.txt"
   (( DET_P95 >= 0 && DET_P95 < 5000 && DET_N == DET_FIRED ))
   check "detection_latency_p95_under_5s" $? "p95 ${DET_P95} ms over ${DET_N}/${DET_FIRED} fired panes"
+  # Capture gaps: only explicit resets (alt-screen transitions) are acceptable.
+  sqlite3 -readonly "$D/.ft/ft.db" "select reason, count(*) from output_gaps group by reason" \
+    > "$OUT/gaps.txt" 2> "$OUT/gaps.err"
+  GAPS_OK=$?
+  UNEXPLAINED=$(grep -v -E '^alt_screen_(entered|exited|toggled)\|' "$OUT/gaps.txt" | tr '\n' ' ')
+  (( GAPS_OK == 0 )) && [[ -z "$UNEXPLAINED" ]]
+  check "no_capture_gaps_except_explicit_resets" $? "${UNEXPLAINED:-$(tr '\n' ' ' < "$OUT/gaps.txt")}"
+  # Memory attribution, from the mux's own accounting (the resource cockpit's
+  # pane_budget domain reports no telemetry): retained in the receipt.
+  ft doctor --json > "$OUT/doctor-final.json" 2> /dev/null
+  python3 - "$OUT/doctor-final.json" "$OUT/health-samples.jsonl" "$OUT/memory.json" << 'PY'
+import json, sys
+t = open(sys.argv[1]).read()
+checks = json.loads(t[t.index("{"):]).get("checks", [])
+row = next((c for c in checks if c.get("name") == "mux scrollback"), {})
+samples = [json.loads(l) for l in open(sys.argv[2]) if l.strip()]
+json.dump({"mux_scrollback": row.get("detail"), "last_health_sample": samples[-1] if samples else None},
+          open(sys.argv[3], "w"))
+PY
 fi
 
 python3 - "$FT_BIN" "$D/ft.toml" "$OUT/state-latency.txt" "${ENVV[@]}" <<'PY'
@@ -312,6 +333,10 @@ receipt = {
     "status": "pass" if checks and all(c["ok"] for c in checks) else "fail",
     "checks": checks,
 }
+import os
+memory = os.path.join(os.path.dirname(sys.argv[1]), "memory.json")
+if os.path.exists(memory):
+    receipt["memory_attribution"] = json.load(open(memory))
 json.dump(receipt, open(sys.argv[1], "w"), indent=2)
 print(f"live-loop tier {receipt['tier']}: {receipt['status']} ({sum(c['ok'] for c in checks)}/{len(checks)})")
 PY
