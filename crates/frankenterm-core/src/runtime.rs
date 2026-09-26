@@ -6596,12 +6596,19 @@ impl ObservationRuntime {
                         &mut pane_snapshots,
                     );
 
+                    // The coordinator evicts from the compact snapshots
+                    // collected above, never from the mux, which owns pane
+                    // scrollback and has no eviction request. Its "evicted"
+                    // figures are therefore a recommendation, and must never
+                    // be reported or recorded as memory actually reclaimed.
                     if fleet_eval.pages_evicted > 0 || fleet_eval.bytes_reclaimed > 0 {
                         info!(
                             tier = ?fleet_eval.compound_tier,
-                            pages_evicted = fleet_eval.pages_evicted,
-                            bytes_reclaimed = fleet_eval.bytes_reclaimed,
-                            "fleet scrollback coordinator eviction"
+                            recommended_pages = fleet_eval.pages_evicted,
+                            recommended_bytes = fleet_eval.bytes_reclaimed,
+                            "fleet scrollback coordinator: mux warm eviction recommended, not \
+                             applied (the mux has no eviction request; lower \
+                             scrollback_warm_fleet_max_mb to bound warm scrollback)"
                         );
                     } else if !matches!(
                         fleet_eval.compound_tier,
@@ -6664,12 +6671,16 @@ impl ObservationRuntime {
                         let audit_state_changed =
                             last_fleet_coordinator_maintenance_state != Some(current_state);
                         let actions = fleet_eval.actions.len();
+                        // Snapshot-only eviction reclaims nothing, so it is
+                        // not activity: under sustained pressure it repeats
+                        // every tick and would write a maintenance row each
+                        // time. Only state transitions are recorded.
                         if fleet_coordinator_maintenance_is_noteworthy(
                             last_fleet_coordinator_maintenance_state,
                             current_state,
-                            fleet_eval.pages_evicted,
-                            fleet_eval.bytes_reclaimed,
-                            fleet_eval.targets_applied,
+                            0,
+                            0,
+                            0,
                         ) {
                             let audit_reason = if audit_state_changed {
                                 "state_transition"
@@ -6679,9 +6690,10 @@ impl ObservationRuntime {
                             let metadata = serde_json::json!({
                                 "audit_reason": audit_reason,
                                 "compound_tier": format!("{:?}", fleet_eval.compound_tier),
-                                "pages_evicted": fleet_eval.pages_evicted,
-                                "bytes_reclaimed": fleet_eval.bytes_reclaimed,
-                                "targets_applied": fleet_eval.targets_applied,
+                                "eviction_applied": false,
+                                "eviction_recommended_pages": fleet_eval.pages_evicted,
+                                "eviction_recommended_bytes": fleet_eval.bytes_reclaimed,
+                                "eviction_recommended_targets": fleet_eval.targets_applied,
                                 "actions": actions,
                                 "observed_panes": observed_panes,
                                 "pane_status_snapshots": tiered_scrollback_fetch.summaries.len(),
@@ -6697,8 +6709,8 @@ impl ObservationRuntime {
                                 "tiered_scrollback_blind_reason": blind_reason,
                                 "cumulative_ticks": telem.ticks,
                                 "cumulative_elevated_ticks": telem.elevated_ticks,
-                                "cumulative_pages_evicted": telem.pages_evicted,
-                                "cumulative_bytes_reclaimed": telem.bytes_reclaimed,
+                                "cumulative_eviction_recommended_pages": telem.pages_evicted,
+                                "cumulative_eviction_recommended_bytes": telem.bytes_reclaimed,
                             });
                             match storage
                                 .record_maintenance_with_cx(
@@ -6708,12 +6720,12 @@ impl ObservationRuntime {
                                         event_type: "fleet_scrollback_coordinator".to_string(),
                                         message: Some(if telemetry_blind {
                                             format!(
-                                                "Fleet coordinator {audit_reason}: tier={:?}, evicted={} pages; tiered scrollback telemetry blind",
+                                                "Fleet coordinator {audit_reason}: tier={:?}, eviction recommended for {} pages (not applied); tiered scrollback telemetry blind",
                                                 fleet_eval.compound_tier, fleet_eval.pages_evicted,
                                             )
                                         } else {
                                             format!(
-                                                "Fleet coordinator {audit_reason}: tier={:?}, evicted={} pages",
+                                                "Fleet coordinator {audit_reason}: tier={:?}, eviction recommended for {} pages (not applied)",
                                                 fleet_eval.compound_tier, fleet_eval.pages_evicted,
                                             )
                                         }),
