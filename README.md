@@ -2268,9 +2268,9 @@ The fleet memory controller synthesizes pressure from three independent subsyste
 
 ### Inputs
 
-1. **Pipeline backpressure** — queue depths in the ingest pipeline, scan pipeline, event bus, and storage writer. Each has its own gauge.
+1. **Pipeline backpressure** — the capture queue and the storage-writer queue depths against their capacities (the same rows the resource cockpit's `queue_backpressure` domain reports).
 2. **System memory utilization** — process RSS / total RAM, with platform-specific source (`sysctl` on macOS, `/proc/meminfo` on Linux).
-3. **Per-pane memory budgets** — per-pane arena byte accounting with peak watermark tracking.
+3. **Per-pane memory budgets** — each pane's resident scrollback as the mux reports it (warm resident bytes plus in-memory rows), against `[fleet_scrollback] per_pane_budget_bytes`.
 
 ### Synthesis: worst-of
 
