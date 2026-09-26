@@ -432,6 +432,14 @@ ft mcp serve
 ### Backpressure and stability tuning
 
 - If memory pressure rises, lower `scrollback_lines`.
+- Scrollback budgets are per pane. Each pane keeps `scrollback_hot_lines`
+  (default 1000) resident and moves older lines to a warm tier capped at
+  `scrollback_warm_max_mb` (default 50 MiB). A swarm host therefore bounds
+  scrollback memory at roughly panes x (hot + warm): 97 panes at the defaults
+  can hold up to about 4.8 GiB of warm scrollback. On many-pane hosts, lower
+  `scrollback_warm_max_mb` (16 MiB is about 1.5 GiB at 97 panes). There is no
+  fleet-wide cap yet (ft-erfq8). `ft doctor` names any other config file whose
+  `scrollback_lines` disagrees with the active one.
 - If capture load is high, increase `ingest.poll_interval_ms` and/or lower `max_concurrent_captures`.
 - Native state/lifecycle hints use bounded buffering and can be dropped under
   pressure or an indeterminate socket write. Polling remains the authoritative
