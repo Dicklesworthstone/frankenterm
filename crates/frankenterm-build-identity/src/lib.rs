@@ -505,23 +505,24 @@ pub fn emit_cargo_source_revision(variable: &str) -> String {
     let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default();
     let root = std::path::Path::new(&manifest_dir).join("../..");
     let git = root.join(".git");
-    let mut revision = None;
-    if git.exists() {
+    let revision = if git.exists() {
         for name in ["HEAD", "refs", "packed-refs"] {
             let path = git.join(name);
             if path.exists() {
                 println!("cargo:rerun-if-changed={}", path.display());
             }
         }
-        revision = std::process::Command::new("git")
+        std::process::Command::new("git")
             .arg("-C")
             .arg(&root)
             .args(["rev-parse", "--verify", "HEAD"])
             .output()
             .ok()
             .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
-    }
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    } else {
+        None
+    };
     let revision = revision.unwrap_or_else(|| {
         println!("cargo:rerun-if-env-changed=DSR_RELEASE_GIT_SHA");
         std::env::var("DSR_RELEASE_GIT_SHA").unwrap_or_else(|_| "unknown".to_owned())
