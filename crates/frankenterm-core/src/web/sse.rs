@@ -747,7 +747,9 @@ pub(super) fn handle_stream_events(
                     "pane_id": pane_filter
                 }),
             );
-            if let Some(event) = frame_to_sse("ready", seq, ready) {
+            // No SSE id on non-event frames: a sequence number here would
+            // overwrite the client's Last-Event-ID with a non-event id.
+            if let Some(event) = frame_to_sse_with_event_id("ready", None, ready) {
                 if !send_rate_limited_sse(
                     &tx,
                     event,
@@ -837,7 +839,7 @@ pub(super) fn handle_stream_events(
                         seq,
                         json!({ "resume_truncated_after_id": replayed_through }),
                     );
-                    if let Some(event) = frame_to_sse("lag", seq, frame) {
+                    if let Some(event) = frame_to_sse_with_event_id("lag", None, frame) {
                         if !send_rate_limited_sse(
                             &tx,
                             event,
@@ -914,7 +916,7 @@ pub(super) fn handle_stream_events(
                             seq,
                             json!({ "missed_count": missed_count }),
                         );
-                        if let Some(event) = frame_to_sse("lag", seq, frame) {
+                        if let Some(event) = frame_to_sse_with_event_id("lag", None, frame) {
                             if !send_rate_limited_sse(
                                 &tx,
                                 event,

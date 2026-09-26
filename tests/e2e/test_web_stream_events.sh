@@ -206,13 +206,28 @@ PY
     check "$MODE/the detection is delivered exactly once" $? "$copies copies"
     [[ -n "$EVENT_ID" ]] && grep -q "^id: $EVENT_ID\$" "$OUT/$MODE.sse.txt"
     check "$MODE/the detection frame's SSE id is its persisted event id" $? "id '${EVENT_ID}'"
-    [[ "$(grep -c '"replayed":true' "$OUT/$MODE.resume-before.txt")" == 1 ]] \
-        && grep -q "codex.usage.reached" "$OUT/$MODE.resume-before.txt"
+    # Replayed frames' persisted ids, per resume point. Later detections (ids
+    # above the codex one) may legitimately be replayed too.
+    replayed_ids() {
+        python3 - "$1" << 'PY'
+import json, sys
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    if line.startswith("data: ") and '"replayed":true' in line:
+        event = json.loads(line[6:])["data"]["event"]
+        print(event.get("event_id"), event.get("detection", {}).get("rule_id"))
+PY
+    }
+    replayed_ids "$OUT/$MODE.resume-before.txt" > "$OUT/$MODE.resume-before.ids"
+    replayed_ids "$OUT/$MODE.resume-at.txt" > "$OUT/$MODE.resume-at.ids"
+    [[ "$(grep -c "^$EVENT_ID codex.usage.reached\$" "$OUT/$MODE.resume-before.ids")" == 1 ]]
     check "$MODE/Last-Event-ID just before it replays the detection once" $? \
-        "$(head -c 400 "$OUT/$MODE.resume-before.txt")"
-    grep -q '"kind":"ready"' "$OUT/$MODE.resume-at.txt" \
-        && ! grep -q '"replayed":true' "$OUT/$MODE.resume-at.txt"
-    check "$MODE/Last-Event-ID at it replays nothing" $? "$(head -c 400 "$OUT/$MODE.resume-at.txt")"
+        "$(tr '\n' ' ' < "$OUT/$MODE.resume-before.ids")"
+    python3 -c 'import sys;ids=[int(l.split()[0]) for l in open(sys.argv[1]) if l.strip()];sys.exit(0 if all(i > int(sys.argv[2]) for i in ids) else 1)' \
+        "$OUT/$MODE.resume-at.ids" "${EVENT_ID:-0}" && grep -q '"kind":"ready"' "$OUT/$MODE.resume-at.txt"
+    check "$MODE/Last-Event-ID at it replays nothing at or before it" $? \
+        "$(tr '\n' ' ' < "$OUT/$MODE.resume-at.ids")"
+    ! grep -q '^id: ' <(grep -B2 '"kind":"ready"' "$OUT/$MODE.resume-at.txt")
+    check "$MODE/non-event frames carry no SSE id" $? "$(head -c 200 "$OUT/$MODE.resume-at.txt")"
 }
 
 for mode in ${WEB_STREAM_MODES:-standalone inprocess}; do
