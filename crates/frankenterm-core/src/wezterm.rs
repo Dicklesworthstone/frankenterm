@@ -149,6 +149,36 @@ pub struct MuxPaneText {
     pub truncated: bool,
 }
 
+impl MuxPaneText {
+    /// Bound a full pane read to its last `tail` rows of content. Blank
+    /// screen rows below the last output are padding, not content, so they
+    /// are dropped before counting (a fresh tall pane that printed one line
+    /// must not tail to blank rows).
+    fn from_full_text(full_text: String, tail: Option<usize>) -> Self {
+        let original_lines = full_text.lines().count();
+        let original_bytes = Some(full_text.len());
+        let lines: Vec<&str> = full_text.lines().collect();
+        let content = lines
+            .iter()
+            .rposition(|line| !line.trim().is_empty())
+            .map_or(0, |last| last + 1);
+        match tail {
+            Some(n) if n > 0 && n < content => Self {
+                text: lines[content - n..content].join("\n"),
+                original_lines,
+                original_bytes,
+                truncated: true,
+            },
+            _ => Self {
+                text: full_text,
+                original_lines,
+                original_bytes,
+                truncated: false,
+            },
+        }
+    }
+}
+
 /// Abstraction layer over an in-process mux session — the API the
 /// recorder, workflows, and policy layers use to drive panes/tabs/windows
 /// regardless of which concrete client (`WeztermClient`, mocks, sharded
@@ -238,27 +268,7 @@ pub trait MuxInterface: Send + Sync {
     ) -> WeztermFuture<'a, MuxPaneText> {
         Box::pin(async move {
             let full_text = self.get_text_with_cx(cx, pane_id, escapes).await?;
-            let original_lines = full_text.lines().count();
-            let original_bytes = Some(full_text.len());
-            match tail {
-                Some(n) if n > 0 && n < original_lines => {
-                    let lines: Vec<&str> = full_text.lines().collect();
-                    let start_idx = lines.len().saturating_sub(n);
-                    let text = lines[start_idx..].join("\n");
-                    Ok(MuxPaneText {
-                        text,
-                        original_lines,
-                        original_bytes,
-                        truncated: true,
-                    })
-                }
-                _ => Ok(MuxPaneText {
-                    text: full_text,
-                    original_lines,
-                    original_bytes,
-                    truncated: false,
-                }),
-            }
+            Ok(MuxPaneText::from_full_text(full_text, tail))
         })
     }
 
@@ -1793,27 +1803,7 @@ impl WeztermClient {
         let full_text = self
             .run_cli_with_pane_check_retry_with_cx(cx, &args, pane_id)
             .await?;
-        let original_lines = full_text.lines().count();
-        let original_bytes = Some(full_text.len());
-        match tail {
-            Some(n) if n > 0 && n < original_lines => {
-                let lines: Vec<&str> = full_text.lines().collect();
-                let start_idx = lines.len().saturating_sub(n);
-                let text = lines[start_idx..].join("\n");
-                Ok(MuxPaneText {
-                    text,
-                    original_lines,
-                    original_bytes,
-                    truncated: true,
-                })
-            }
-            _ => Ok(MuxPaneText {
-                text: full_text,
-                original_lines,
-                original_bytes,
-                truncated: false,
-            }),
-        }
+        Ok(MuxPaneText::from_full_text(full_text, tail))
     }
 
     /// Stub `get_text_with_cx` for configurations without
@@ -1846,27 +1836,7 @@ impl WeztermClient {
         let full_text = self
             .run_cli_with_pane_check_retry_with_cx(cx, &args, pane_id)
             .await?;
-        let original_lines = full_text.lines().count();
-        let original_bytes = Some(full_text.len());
-        match tail {
-            Some(n) if n > 0 && n < original_lines => {
-                let lines: Vec<&str> = full_text.lines().collect();
-                let start_idx = lines.len().saturating_sub(n);
-                let text = lines[start_idx..].join("\n");
-                Ok(MuxPaneText {
-                    text,
-                    original_lines,
-                    original_bytes,
-                    truncated: true,
-                })
-            }
-            _ => Ok(MuxPaneText {
-                text: full_text,
-                original_lines,
-                original_bytes,
-                truncated: false,
-            }),
-        }
+        Ok(MuxPaneText::from_full_text(full_text, tail))
     }
 
     /// Get OSC 133 semantic zones from the live mux pane state.
@@ -5561,6 +5531,29 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::sync::Arc;
+
+    #[test]
+    fn pane_text_tail_counts_content_rows_not_blank_screen_padding() {
+        // A tall pane that printed two lines tails to its content, whole.
+        let mut screen = String::from("marker\n% \n");
+        screen.push_str(&"\n".repeat(113));
+        let text = MuxPaneText::from_full_text(screen.clone(), Some(50));
+        assert!(!text.truncated);
+        assert_eq!(text.text, screen);
+        assert_eq!(text.original_lines, 115);
+
+        let text = MuxPaneText::from_full_text("a\nb\nc\n\n   \n".to_string(), Some(2));
+        assert!(text.truncated);
+        assert_eq!(text.text, "b\nc");
+        assert_eq!(text.original_lines, 5);
+
+        let full = "a\nb\n".to_string();
+        for tail in [None, Some(0), Some(2), Some(9)] {
+            let text = MuxPaneText::from_full_text(full.clone(), tail);
+            assert!(!text.truncated, "tail {tail:?}");
+            assert_eq!(text.text, full);
+        }
+    }
 
     #[test]
     fn paste_submit_splits_trailing_line_endings_into_one_enter() {
