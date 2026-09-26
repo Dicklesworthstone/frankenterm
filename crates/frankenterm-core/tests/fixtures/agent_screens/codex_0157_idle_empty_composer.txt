@@ -1,0 +1,24 @@
+╭───────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.157.0)                    │
+│                                               │
+│ model:     GPT-6-Sol xhigh   /model to change │
+│ directory: ~/projects/frankenterm             │
+╰───────────────────────────────────────────────╯
+ 
+
+
+
+
+
+
+
+
+
+
+
+                                                                                
+›                                                                               
+                                                                                
+                                                                                
+  GPT-6-Sol xhigh · ~/projects/frankenterm · GPT-6-Sol · xhigh · frankenterm · …
+                                                      ⚠ 2 warnings · f2 to view

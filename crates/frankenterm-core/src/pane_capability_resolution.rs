@@ -115,8 +115,13 @@ pub fn classify_agent_screen(tail: &str) -> Option<(&'static str, AgentScreenSta
         })
     });
 
-    let codex_composer = lines.iter().any(|line| line.starts_with("› "))
-        && any(&["? for shortcuts"]);
+    // The idle composer shows a placeholder ("› Ask Codex to do anything") or,
+    // once it has been used, a bare "›"; the footer may show warnings instead
+    // of the shortcut hint, so the banner also identifies it.
+    let codex_composer = lines
+        .iter()
+        .any(|line| *line == "›" || line.starts_with("› "))
+        && any(&["? for shortcuts", "openai codex"]);
     let claude_composer = lines.windows(3).any(|window| {
         window[0].trim_start().starts_with('─')
             && window[1].starts_with('❯')
@@ -1106,6 +1111,12 @@ mod tests {
         assert_eq!(
             classify_agent_screen(&agent_screen("claude_code_2_1_idle.txt")),
             Some(("claude_code", AgentScreenState::Ready))
+        );
+        // codex-cli 0.157.0 spawned by profile apply: empty composer with no
+        // placeholder and a warnings footer instead of the shortcut hint.
+        assert_eq!(
+            classify_agent_screen(&agent_screen("codex_0157_idle_empty_composer.txt")),
+            Some(("codex", AgentScreenState::Ready))
         );
     }
 
