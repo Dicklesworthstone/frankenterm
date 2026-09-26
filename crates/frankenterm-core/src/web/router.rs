@@ -20,6 +20,7 @@ pub(super) fn build_app(
     storage: Option<StorageHandle>,
     event_bus: Option<Arc<EventBus>>,
     runtime_limits: WebRuntimeLimits,
+    event_source: &'static str,
 ) -> App {
     let streams = WebStreamLifecycle::new();
     let state = AppState {
@@ -39,7 +40,9 @@ pub(super) fn build_app(
         .route(
             "/health",
             Method::Get,
-            |_ctx: &RequestContext, _req: &mut Request| async { health_response() },
+            move |_ctx: &RequestContext, _req: &mut Request| async move {
+                health_response(event_source)
+            },
         )
         .route(
             "/panes",

@@ -203,7 +203,19 @@ pub async fn start_web_server_with_cx(
     } else {
         None
     };
-    let app = build_app(config.storage, config.event_bus, runtime_limits);
+    let event_source = if tail_inputs.is_some() {
+        "storage_tail"
+    } else if config.event_bus.is_some() {
+        "bus"
+    } else {
+        "none"
+    };
+    let app = build_app(
+        config.storage,
+        config.event_bus,
+        runtime_limits,
+        event_source,
+    );
     let (local_addr, runtime) = FrameworkWebRuntime::start_with_cx(cx, bind_addr, app).await?;
 
     let storage_tail = match tail_inputs {

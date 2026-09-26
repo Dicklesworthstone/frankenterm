@@ -25,12 +25,17 @@ use std::sync::Arc;
 pub(super) struct HealthResponse {
     pub(super) ok: bool,
     pub(super) version: &'static str,
+    /// What feeds `/stream/events`: `bus` (the watcher's live EventBus, `ft
+    /// watch --web`), `storage_tail` (a standalone `ft web` following persisted
+    /// events), or `none` (no event stream).
+    pub(super) event_source: &'static str,
 }
 
-pub(super) fn health_response() -> Response {
+pub(super) fn health_response(event_source: &'static str) -> Response {
     let payload = HealthResponse {
         ok: true,
         version: VERSION,
+        event_source,
     };
     Response::json(&payload).unwrap_or_else(|_| Response::internal_error())
 }
@@ -699,11 +704,12 @@ mod tests {
 
     #[test]
     fn health_response_serializes_ok_and_version() {
-        let response = health_response();
+        let response = health_response("storage_tail");
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response);
         assert_eq!(json["ok"], true);
         assert_eq!(json["version"], VERSION);
+        assert_eq!(json["event_source"], "storage_tail");
     }
 
     #[test]

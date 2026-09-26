@@ -77,6 +77,7 @@ run_mode() {
         curl -s -o /dev/null "http://127.0.0.1:$PORT/health" && break
         sleep 0.2
     done
+    curl -s "http://127.0.0.1:$PORT/health" > "$OUT/$MODE.health.json" 2> /dev/null
     sleep 6
 
     # Subscribe first, then trigger, so the event can only arrive live.
@@ -176,6 +177,10 @@ time.sleep(float(sys.argv[3]))
     for pid in "${PIDS[@]}"; do wait "$pid" 2> /dev/null; done
     cp -R "$D/.ft" "$OUT/$MODE.ft-state" 2> /dev/null
 
+    local expected_source=storage_tail
+    [[ "$MODE" == inprocess ]] && expected_source=bus
+    grep -q "\"event_source\":\"$expected_source\"" "$OUT/$MODE.health.json"
+    check "$MODE//health reports event_source=$expected_source" $? "$(cat "$OUT/$MODE.health.json")"
     grep -q "codex.usage.reached" "$OUT/$MODE.sse.txt"
     check "$MODE/detection reaches /stream/events" $? "$(head -c 400 "$OUT/$MODE.sse.txt")"
     python3 -c "import sys; l=float(sys.argv[2])-float(sys.argv[1]); print(f'$MODE trigger-to-SSE latency {l:.2f}s'); sys.exit(0 if l < 10 else 1)" "$TRIGGERED" "$ARRIVED"

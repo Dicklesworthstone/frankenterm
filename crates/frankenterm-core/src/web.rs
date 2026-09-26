@@ -464,8 +464,9 @@ fn build_app(
     storage: Option<StorageHandle>,
     event_bus: Option<Arc<EventBus>>,
     runtime_limits: WebRuntimeLimits,
+    event_source: &'static str,
 ) -> App {
-    router::build_app(storage, event_bus, runtime_limits)
+    router::build_app(storage, event_bus, runtime_limits, event_source)
 }
 
 #[cfg(test)]
@@ -1448,10 +1449,12 @@ mod tests {
         let payload = HealthResponse {
             ok: true,
             version: VERSION,
+            event_source: "bus",
         };
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["ok"], true);
         assert_eq!(json["version"], VERSION);
+        assert_eq!(json["event_source"], "bus");
     }
 
     // =========================================================================

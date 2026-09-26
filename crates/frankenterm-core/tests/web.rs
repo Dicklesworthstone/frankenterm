@@ -318,6 +318,8 @@ mod web_tests {
 
             assert!(response.contains("200"));
             assert!(response.contains("\"ok\":true"));
+            // ft-emlzp: no bus and no storage, so nothing feeds /stream/events.
+            assert!(response.contains("\"event_source\":\"none\""), "{response}");
         });
     }
 
