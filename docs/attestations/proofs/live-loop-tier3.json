@@ -1,0 +1,82 @@
+{
+  "schema": "ft.live-loop-proof.v1",
+  "tier": 3,
+  "adapter": "live-mux",
+  "panes": "scripted (no model calls)",
+  "build_profile": "release-perf",
+  "pane_count": 51,
+  "robot_state_p95_ms": 37,
+  "host": "Mac-mini-max",
+  "generated_at": "2026-09-26T06:02:23Z",
+  "commit": "629d06a1f8a620f4ee991800323e250577ef618b",
+  "crates_dirty": false,
+  "ft_version": "ft 0.15.21 (6f8a06e00c890da26bb54b914da347ecdf40f69f)",
+  "status": "pass",
+  "checks": [
+    {
+      "name": "every_profile_pane_runs_its_command",
+      "ok": true,
+      "detail": "40/40 fixtures started"
+    },
+    {
+      "name": "at_least_50_live_panes_via_profile_apply",
+      "ok": true,
+      "detail": "51 panes"
+    },
+    {
+      "name": "detects_codex.usage.reached",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "detects_claude_code.compaction",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "detects_gemini.usage.reached",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "auto_handle_compaction_prompt_reaches_a_claude_pane",
+      "ok": true,
+      "detail": "14 pane(s)"
+    },
+    {
+      "name": "robot_send_into_fullscreen_pane_is_denied",
+      "ok": true,
+      "detail": "2/2 full-screen panes denied"
+    },
+    {
+      "name": "alt_screen_denial_has_audit_row",
+      "ok": true,
+      "detail": "2/2 audited"
+    },
+    {
+      "name": "fts_search_finds_usage_limit_across_panes",
+      "ok": true,
+      "detail": "24 panes"
+    },
+    {
+      "name": "fleet_pressure_tier_rises_above_normal",
+      "ok": true,
+      "detail": "tiers seen: Critical,Normal"
+    },
+    {
+      "name": "hot_to_warm_scrollback_spill_observed",
+      "ok": true,
+      "detail": "1489792 lines spilled to warm"
+    },
+    {
+      "name": "detection_latency_p95_under_5s",
+      "ok": true,
+      "detail": "p95 173 ms over 38/38 fired panes"
+    },
+    {
+      "name": "robot_state_p95_under_500ms",
+      "ok": true,
+      "detail": "37 ms (release-perf build)"
+    }
+  ]
+}
