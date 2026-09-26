@@ -6883,7 +6883,7 @@ impl ObservationRuntime {
                                 )
                                 .as_ref(),
                                 &[],
-                                None,
+                                storage.storage_io_operator_summary().as_ref(),
                                 None,
                                 last_warm_eviction_receipts.as_ref(),
                             )

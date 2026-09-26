@@ -74,8 +74,8 @@ use crate::runtime_telemetry::{SwarmCapacityStage, SwarmCapacityStageTimer};
 use crate::search::{FusionBackend, HybridSearchService, SearchMode};
 use crate::session_topology::{MAX_SNAPSHOT_BYTES, MAX_TOPOLOGY_PANES};
 use crate::storage::io_scheduler::{
-    StorageIoAdmissionDecision, StorageIoClass, StorageIoScheduler, StorageIoSchedulerConfig,
-    StorageIoWorkItem,
+    StorageIoAdmissionDecision, StorageIoClass, StorageIoOperatorSummary, StorageIoScheduler,
+    StorageIoSchedulerConfig, StorageIoWorkItem,
 };
 use crate::storage_backend_helpers::{count_table_where, execute_typed, row_exists_where};
 use crate::storage_backend_row_helpers::{CellRowReader, RowReader};
@@ -2078,6 +2078,9 @@ struct WriteCommandSender {
     /// the condvar-parked writer after each successful enqueue. `None` keeps the
     /// legacy 1 ms-poll writer untouched (zero added cost on the send path).
     wakeup: Option<Arc<WriterWakeup>>,
+    /// The writer's storage IO scheduler summary, published at each batch
+    /// boundary for the resource cockpit's `storage_io` domain.
+    io_summary: Arc<Mutex<Option<StorageIoOperatorSummary>>>,
 }
 
 struct WriterQueueAdmission<'a> {
@@ -2493,6 +2496,7 @@ impl WriteCommandSender {
             max_capacity,
             terminal_drain_wakeup: Arc::new(WriterWakeup::new()),
             wakeup: None,
+            io_summary: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -3091,6 +3095,17 @@ pub struct StorageHandle {
 }
 
 impl StorageHandle {
+    /// The storage writer's IO scheduler summary as of its latest batch
+    /// boundary; `None` until the writer has processed a batch.
+    #[must_use]
+    pub fn storage_io_operator_summary(&self) -> Option<StorageIoOperatorSummary> {
+        self.write_tx
+            .io_summary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     pub(crate) async fn connector_mutation_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -3835,6 +3850,7 @@ impl StorageHandle {
         let terminal_drain_wakeup_for_writer = Arc::clone(&write_tx.terminal_drain_wakeup);
         let terminal_state_for_writer = Arc::clone(&write_tx.terminal_state);
         let terminal_admission_gate_for_writer = Arc::clone(&write_tx.terminal_admission_gate);
+        let io_summary_for_writer = Arc::clone(&write_tx.io_summary);
         let mmap_runtime_for_writer = mmap_runtime.clone();
         let writer_wakeup_for_writer = writer_wakeup;
         #[cfg(test)]
@@ -3870,6 +3886,7 @@ impl StorageHandle {
                     group_commit_events,
                     writer_wakeup_for_writer.as_deref(),
                     group_commit_adaptive,
+                    Some(&io_summary_for_writer),
                 );
             })
             .map_err(|e| {
@@ -12239,6 +12256,10 @@ struct StorageIoWriterGate {
     scheduler: StorageIoScheduler,
     next_work_id: u64,
     next_ordering_sequence_by_stream: HashMap<String, u64>,
+    /// Where batch boundaries publish the scheduler's operator summary.
+    summary_slot: Option<Arc<Mutex<Option<StorageIoOperatorSummary>>>>,
+    last_summary_ms: Option<u64>,
+    last_summary_queued: u64,
 }
 
 impl Default for StorageIoWriterGate {
@@ -12253,7 +12274,35 @@ impl StorageIoWriterGate {
             scheduler: StorageIoScheduler::new(config),
             next_work_id: 1,
             next_ordering_sequence_by_stream: HashMap::new(),
+            summary_slot: None,
+            last_summary_ms: None,
+            last_summary_queued: 0,
         }
+    }
+
+    /// Publish the scheduler's operator summary: at most once a second while
+    /// work is queued, and always when the queue drains to empty, so an idle
+    /// writer never leaves a busy summary behind.
+    fn publish_summary(&mut self) {
+        const SUMMARY_INTERVAL_MS: u64 = 1_000;
+        let Some(slot) = self.summary_slot.as_ref() else {
+            return;
+        };
+        let now = storage_io_now_ms();
+        let queued = self.scheduler.aggregate_items();
+        let drained = queued == 0 && self.last_summary_queued != 0;
+        let recent = self
+            .last_summary_ms
+            .is_some_and(|last| now.saturating_sub(last) < SUMMARY_INTERVAL_MS);
+        if recent && !drained {
+            return;
+        }
+        self.last_summary_ms = Some(now);
+        self.last_summary_queued = queued;
+        let summary = self.scheduler.snapshot(now).operator_summary();
+        *slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(summary);
     }
 
     fn admit_command(&mut self, cmd: &WriteCommand) -> Option<(u64, StorageIoAdmissionDecision)> {
@@ -12268,6 +12317,7 @@ impl StorageIoWriterGate {
     }
 
     fn finish_batch(&mut self) {
+        self.publish_summary();
         if self.scheduler.aggregate_items() == 0 {
             self.next_ordering_sequence_by_stream.clear();
             // Work IDs only need to be unique while commands are resident in
@@ -13814,9 +13864,11 @@ fn writer_loop(
     group_commit_events: bool,
     writer_wakeup: Option<&WriterWakeup>,
     group_commit_adaptive: bool,
+    io_summary: Option<&Arc<Mutex<Option<StorageIoOperatorSummary>>>>,
 ) {
     let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
     let mut io_gate = StorageIoWriterGate::default();
+    io_gate.summary_slot = io_summary.cloned();
 
     // [round-4 M8] The adaptive M/G/1 controller is constructed only when
     // `group_commit = adaptive`; when `None` the writer takes the byte-identical
@@ -14972,6 +15024,7 @@ mod writer_epoch_transaction_tests {
                 false,
                 None,
                 true,
+                None,
             );
 
             let first = crate::runtime_async::oneshot_recv(first_rx)
@@ -15060,6 +15113,7 @@ mod writer_epoch_transaction_tests {
                 false,
                 None,
                 false,
+                None,
             );
 
             crate::runtime_async::oneshot_recv(shutdown_rx)
@@ -17097,6 +17151,7 @@ mod writer_io_scheduler_tests {
                 false,
                 None,
                 true,
+                None,
             );
 
             let mutation = crate::runtime_async::oneshot_recv(mutation_rx)
