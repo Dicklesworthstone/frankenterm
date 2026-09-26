@@ -2,13 +2,15 @@
 # test_ft_attaches_to_running_gui.sh — native macOS e2e: ft talks to a running
 # FrankenTerm GUI of the same build (ft-xxfwy.8).
 #
-# Launches frankenterm-gui under its own window class (--class ...frankenterm.rc,
-# --skip-config), so the operator's daily FrankenTerm.app, its published socket
-# and its panes are never touched. ft runs with an isolated HOME/XDG/workspace and
-# dials the dev GUI's published socket explicitly (discovery would rank the daily
-# app's default-class symlink first). Steps, each asserted:
+# Launches frankenterm-gui (default window class, --skip-config) with an isolated
+# HOME, so it publishes its socket under that HOME's runtime dir and the
+# operator's daily FrankenTerm.app, its socket and its panes are never touched or
+# visible. ft shares that isolated HOME and has no socket configured: it must find
+# the GUI the way a fresh install does, through the published default-class
+# symlink (source gui_published). Steps, each asserted:
 #   1. versions: ft and frankenterm-gui report the same commit
-#   2. ft doctor: mux socket ok and mux generation "paired"
+#   2. ft doctor: no error rows, mux socket found via gui_published, generation
+#      "paired"
 #   3. ft robot profile apply opens a pane in the GUI printing a random marker
 #   4. ft robot state lists that pane
 #   5. ft robot get-text returns the marker
@@ -27,7 +29,6 @@ FT_BIN="$BIN/ft"; GUI_BIN="$BIN/frankenterm-gui"
 for bin in "$FT_BIN" "$GUI_BIN"; do [[ -x "$bin" ]] || { echo "SKIP: $bin not built" >&2; exit 2; }; done
 OUT="$REPO_ROOT/tests/e2e/artifacts/gui-attach/$(date +%Y%m%dT%H%M%S)"
 mkdir -p "$OUT"
-CLASS=com.dicklesworthstone.frankenterm.rc
 
 D=$(mktemp -d /tmp/ftga-XXXXXX)
 mkdir -p "$D/.ft" "$D/home" "$D/config" "$D/cache" "$D/data" "$D/state" "$D/runtime" "$D/tmp"
@@ -51,21 +52,22 @@ step() { # name exit-status started-at detail
 }
 now() { python3 -c 'import time;print(time.time())'; }
 
-# The dev GUI: separate class, no user config, own process.
-"$GUI_BIN" --skip-config start --class "$CLASS" --always-new-process > "$OUT/gui.log" 2>&1 &
+# The dev GUI: isolated HOME (so its published socket lives there) and config
+# dirs (so no user config: a fresh install). --skip-config/--always-new-process
+# would each stop the GUI publishing its default-class socket.
+env -u FRANKENTERM_CONFIG_FILE -u WEZTERM_CONFIG_FILE -u WEZTERM_UNIX_SOCKET \
+  HOME="$D/home" XDG_CONFIG_HOME="$D/config" "$GUI_BIN" start > "$OUT/gui.log" 2>&1 &
 GUI_PID=$!; PIDS+=("$GUI_PID")
 SOCK=""
 for _ in $(seq 1 150); do
-  for candidate in "$HOME/.local/share/frankenterm/frankenterm-gui-sock-$GUI_PID" \
-    "$HOME/Library/Application Support/frankenterm/frankenterm-gui-sock-$GUI_PID"; do
-    [[ -S "$candidate" ]] && SOCK="$candidate" && break 2
-  done
+  candidate="$D/home/.local/share/frankenterm/frankenterm-gui-sock-$GUI_PID"
+  [[ -S "$candidate" ]] && SOCK="$candidate" && break
   sleep 0.2
 done
 [[ -n "$SOCK" ]] || { echo "FAIL: dev GUI (pid $GUI_PID) published no socket" >&2; exit 1; }
 echo "dev GUI pid $GUI_PID, socket $SOCK"
 
-printf '[storage]\ndb_path = "ft.db"\n[vendored]\nmux_socket_path = "%s"\n' "$SOCK" > "$D/ft.toml"
+printf '[storage]\ndb_path = "ft.db"\n' > "$D/ft.toml"
 ENVV=("PATH=$BIN:/usr/bin:/bin:/usr/sbin:/sbin" "LANG=C" "HOME=$D/home" "SHELL=/bin/zsh"
   "XDG_CONFIG_HOME=$D/config" "XDG_CACHE_HOME=$D/cache" "XDG_DATA_HOME=$D/data"
   "XDG_STATE_HOME=$D/state" "XDG_RUNTIME_DIR=$D/runtime" "TMPDIR=$D/tmp"
@@ -90,8 +92,10 @@ import json, sys
 t = open(sys.argv[1]).read()
 checks = {c.get("name"): c for c in json.loads(t[t.index("{"):]).get("checks", [])}
 sock, gen = checks.get("mux socket", {}), checks.get("mux generation", {})
-ok = sock.get("status") == "ok" and gen.get("status") == "ok" and "paired" in str(gen.get("detail"))
-print(f"socket: {sock.get('detail')} | generation: {gen.get('detail')}")
+errors = [n for n, c in checks.items() if c.get("status") == "error"]
+ok = (not errors and sock.get("status") == "ok" and "source: gui_published" in str(sock.get("detail"))
+      and gen.get("status") == "ok" and "paired" in str(gen.get("detail")))
+print(f"errors: {errors} | socket: {sock.get('detail')} | generation: {gen.get('detail')}")
 sys.exit(0 if ok else 1)
 PY
 step "doctor_pairs_with_gui_mux" $? "$t" "$(python3 -c 'import json,sys;t=open(sys.argv[1]).read();c={x["name"]:x for x in json.loads(t[t.index("{"):])["checks"]};print(c.get("mux generation",{}).get("detail"))' "$OUT/doctor.json" 2> /dev/null)"
@@ -141,7 +145,8 @@ receipt = {
     "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     "commit": subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip(),
     "ft_version": sys.argv[3].strip(), "gui_version": sys.argv[4].strip(),
-    "socket": sys.argv[5], "socket_source": "explicit_config (dev GUI under its own window class)",
+    "socket": sys.argv[5],
+    "socket_source": "gui_published (no socket configured; dev GUI and ft share an isolated HOME)",
     "build_profile": sys.argv[6],
     "status": "pass" if steps and all(s["ok"] for s in steps) else "fail",
     "steps": steps,
