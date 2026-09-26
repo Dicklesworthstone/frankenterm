@@ -14,7 +14,14 @@
 #   5. FTS search finds the usage-limit text in >= 2 panes
 #   6. `ft robot state` latency p95 < 500 ms (asserted on every build profile)
 #
-# usage: [LIVE_LOOP_RETAIN=1] scripts/live-loop-proof.sh [BIN_DIR]   (default target/debug)
+# LIVE_LOOP_TIER=3 runs tier 3 (ft-xxfwy.10): 50 panes (40 agent fixtures, 2 full-screen,
+# 10 shells that flood 150k lines), a small [fleet_scrollback] per_pane_budget_bytes, agent
+# fires staggered over ~4 minutes, and three more checks:
+#   7. the watcher's fleet pressure tier rises above Normal (sampled from `ft robot health`)
+#   8. hot->warm scrollback spill is observed (mux warm_spill_lines_total > 0)
+#   9. detection latency p95 < 5 s (send of "fire" -> event captured_at, first event per pane)
+#
+# usage: [LIVE_LOOP_TIER=3] [LIVE_LOOP_RETAIN=1] scripts/live-loop-proof.sh [BIN_DIR]
 # Writes tests/e2e/artifacts/live-loop/<run>/receipt.json plus all logs.
 set -uo pipefail
 umask 077
@@ -26,6 +33,21 @@ for bin in "$FT_BIN" "$MUX_BIN"; do [[ -x "$bin" ]] || { echo "missing $bin" >&2
 OUT="$REPO_ROOT/tests/e2e/artifacts/live-loop/$(date +%Y%m%dT%H%M%S)"
 mkdir -p "$OUT"
 case "$BIN" in *release*) PROFILE=release ;; *) PROFILE=debug ;; esac
+TIER=${LIVE_LOOP_TIER:-2}
+if [[ "$TIER" == 3 ]]; then
+  SPECS=${LIVE_LOOP_SPECS:-codex:14 claude:14 gemini:10 fullscreen:2}
+  SHELLS=${LIVE_LOOP_SHELLS:-10}
+  MIN_PANES=50
+  # Shells flood past the hot tier so warm spill (and budget pressure) is real.
+  SHELL_CMD="/bin/sh -c 'seq 1 150000; exec /bin/zsh -f'"
+  FIRE_STAGGER=6
+else
+  SPECS=${LIVE_LOOP_SPECS:-codex:6 claude:6 gemini:4 fullscreen:1}
+  SHELLS=${LIVE_LOOP_SHELLS:-3}
+  MIN_PANES=20
+  SHELL_CMD="/bin/zsh -f"
+  FIRE_STAGGER=0
+fi
 
 D=$(mktemp -d /tmp/ftll-XXXXXX)
 mkdir -p "$D/.ft" "$D/home" "$D/config" "$D/cache" "$D/data" "$D/state" "$D/runtime" "$D/tmp" "$D/inputs"
@@ -44,6 +66,10 @@ max_concurrent = 2
 [workflows.compaction_prompts.by_agent]
 claude_code = "TIER2_CONTEXT_REFRESH\n"
 EOF
+if [[ "$TIER" == 3 ]]; then
+  # A real operator budget, sized so flooding panes exceed it.
+  printf '[fleet_scrollback]\nenabled = true\nper_pane_budget_bytes = 262144\n' >> "$D/ft.toml"
+fi
 chmod 600 "$D/ft.toml"
 
 cat > "$D/agent-pane.py" <<'PY'
@@ -111,21 +137,21 @@ env -i "${ENVV[@]}" "$MUX_BIN" --config-file "$D/frankenterm.toml" --daemonize=f
 MUXPID=$!; PIDS+=("$MUXPID")
 for _ in $(seq 1 150); do grep -q "pid=$MUXPID" "$SOCK.lock" 2> /dev/null && [[ -S "$SOCK" ]] && break; sleep 0.2; done
 
-for spec in ${LIVE_LOOP_SPECS:-codex:6 claude:6 gemini:4 fullscreen:1}; do
+for spec in $SPECS; do
   kind=${spec%%:*}; count=${spec##*:}
   ft robot profile create "${kind}_ws" --command "/usr/bin/python3 $D/agent-pane.py $kind $D/inputs" \
     > "$OUT/profile-create-$kind.json" 2>&1
   ft robot profile apply "${kind}_ws" --count "$count" > "$OUT/profile-apply-$kind.json" 2>&1
 done
-ft robot profile create shell_ws --command "/bin/zsh -f" > "$OUT/profile-create-shell.json" 2>&1
-ft robot profile apply shell_ws --count "${LIVE_LOOP_SHELLS:-3}" > "$OUT/profile-apply-shell.json" 2>&1
+ft robot profile create shell_ws --command "$SHELL_CMD" > "$OUT/profile-create-shell.json" 2>&1
+ft robot profile apply shell_ws --count "$SHELLS" > "$OUT/profile-apply-shell.json" 2>&1
 
 env -i "${ENVV[@]}" "$FT_BIN" -c "$D/ft.toml" watch --foreground --auto-handle --poll-interval 500 \
   > "$OUT/watch.log" 2>&1 &
 PIDS+=("$!")
 # Wait until every scripted pane's fixture is running before driving it.
 FIXTURES=0
-for spec in ${LIVE_LOOP_SPECS:-codex:6 claude:6 gemini:4 fullscreen:1}; do FIXTURES=$((FIXTURES + ${spec##*:})); done
+for spec in $SPECS; do FIXTURES=$((FIXTURES + ${spec##*:})); done
 for _ in $(seq 1 60); do
   READY=$(find "$D/inputs" -name '*.ready' | wc -l | tr -d ' ')
   (( READY >= FIXTURES )) && break
@@ -145,21 +171,48 @@ with open(sys.argv[2], "w") as out:
         out.write(f"{pane['pane_id']}\t{(pane.get('title') or '').strip()}\n")
 PY
 PANES=$(wc -l < "$OUT/panes.tsv" | tr -d ' ')
-(( PANES >= 20 ))
-check "twenty_live_panes_via_profile_apply" $? "$PANES panes"
+(( PANES >= MIN_PANES ))
+check "at_least_${MIN_PANES}_live_panes_via_profile_apply" $? "$PANES panes"
+
+# Tier 3: sample the watcher's health (fleet tier, warm spill) until told to stop.
+if [[ "$TIER" == 3 ]]; then
+  (
+    while [[ ! -e "$OUT/health-stop" ]]; do
+      ft robot --format json health 2> /dev/null | python3 -c '
+import json, sys, time
+t = sys.stdin.read()
+try:
+    h = json.loads(t[t.index("{"):])["data"]["health"]
+except Exception:
+    sys.exit(0)
+tel = h.get("fleet_scrollback_telemetry") or {}
+print(json.dumps({"t": time.time(), "fleet_pressure_tier": h.get("fleet_pressure_tier"),
+                  "warm_spill_lines_total": tel.get("warm_spill_lines_total"),
+                  "observed_panes": h.get("observed_panes")}))' >> "$OUT/health-samples.jsonl"
+      sleep 15
+    done
+  ) &
+  PIDS+=("$!")
+fi
 
 # Pane ids come from each profile apply receipt (titles lag in pane metadata).
 spawned() {
   python3 -c 'import json,sys;t=open(sys.argv[1]).read();d=json.loads(t[t.index("{"):]);print(" ".join(str(p) for p in d["data"]["panes_spawned"]))' \
     "$OUT/profile-apply-$1.json" 2> /dev/null
 }
-# Fire every agent pane once.
+# Fire every agent pane once (staggered across the run in tier 3), recording when each
+# send returned so detection latency can be measured against the event's captured_at.
+: > "$OUT/fire-times.tsv"
 for kind in codex claude gemini; do
-  for pane in $(spawned "$kind"); do ft send --no-paste "$pane" "fire" > /dev/null 2>&1; done
+  for pane in $(spawned "$kind"); do
+    ft send --no-paste "$pane" "fire" > /dev/null 2>&1
+    printf '%s\t%s\n' "$pane" "$(python3 -c 'import time;print(int(time.time()*1000))')" >> "$OUT/fire-times.tsv"
+    (( FIRE_STAGGER > 0 )) && sleep "$FIRE_STAGGER"
+  done
 done
 sleep 15
 
-ft robot --format json events --limit 200 > "$OUT/events.json" 2> /dev/null
+ft robot --format json events --limit 1000 > "$OUT/events.json" 2> /dev/null
 for rule in codex.usage.reached claude_code.compaction gemini.usage.reached; do
   python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));ev=d["data"]["events"];sys.exit(0 if any(e["rule_id"]==sys.argv[2] for e in ev) else 1)' \
     "$OUT/events.json" "$rule"
@@ -174,21 +227,60 @@ check "auto_handle_compaction_prompt_reaches_a_claude_pane" $? "$(wc -l < "$OUT/
 for kind in codex claude gemini fullscreen shell; do
   for pane in $(spawned "$kind"); do ft get-text "$pane" --tail 60 > "$OUT/screen-$kind-$pane.txt" 2>&1; done
 done
-FULL=$(spawned fullscreen)
-ft get-text "$FULL" --tail 5 > "$OUT/fullscreen-screen.txt" 2> /dev/null
-ft robot send "$FULL" "x" --no-paste > "$OUT/fullscreen-send.json" 2> /dev/null
-python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));inj=(d.get("data") or {}).get("injection") or {};dec=inj.get("decision") or {};sys.exit(0 if inj.get("status")=="denied" and dec.get("rule_id")=="policy.alt_screen" else 1)' \
-  "$OUT/fullscreen-send.json"
-check "robot_send_into_fullscreen_pane_is_denied" $? "pane $FULL"
-ft audit --format json --pane "$FULL" --limit 50 > "$OUT/fullscreen-audit.json" 2> /dev/null
-python3 -c 'import json,sys;rows=json.load(open(sys.argv[1]));sys.exit(0 if any(r.get("rule_id")=="policy.alt_screen" and r.get("policy_decision")=="deny" for r in rows) else 1)' \
-  "$OUT/fullscreen-audit.json"
-check "alt_screen_denial_has_audit_row" $? "ft audit --pane $FULL"
+DENIED=0; AUDITED=0; FULL_PANES=$(spawned fullscreen)
+for FULL in $FULL_PANES; do
+  ft robot send "$FULL" "x" --no-paste > "$OUT/fullscreen-send-$FULL.json" 2> /dev/null
+  python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));inj=(d.get("data") or {}).get("injection") or {};dec=inj.get("decision") or {};sys.exit(0 if inj.get("status")=="denied" and dec.get("rule_id")=="policy.alt_screen" else 1)' \
+    "$OUT/fullscreen-send-$FULL.json" && DENIED=$((DENIED + 1))
+  ft audit --format json --pane "$FULL" --limit 50 > "$OUT/fullscreen-audit-$FULL.json" 2> /dev/null
+  python3 -c 'import json,sys;rows=json.load(open(sys.argv[1]));sys.exit(0 if any(r.get("rule_id")=="policy.alt_screen" and r.get("policy_decision")=="deny" for r in rows) else 1)' \
+    "$OUT/fullscreen-audit-$FULL.json" && AUDITED=$((AUDITED + 1))
+done
+FULL_COUNT=$(echo $FULL_PANES | wc -w | tr -d ' ')
+(( FULL_COUNT > 0 && DENIED == FULL_COUNT ))
+check "robot_send_into_fullscreen_pane_is_denied" $? "$DENIED/$FULL_COUNT full-screen panes denied"
+(( FULL_COUNT > 0 && AUDITED == FULL_COUNT ))
+check "alt_screen_denial_has_audit_row" $? "$AUDITED/$FULL_COUNT audited"
 
 ft robot --format json search "usage limit" --limit 50 > "$OUT/search.json" 2> /dev/null
 HIT_PANES=$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));r=d["data"].get("results") or d["data"].get("hits") or [];print(len({h["pane_id"] for h in r}))' "$OUT/search.json" 2> /dev/null || echo 0)
 (( HIT_PANES >= 2 ))
 check "fts_search_finds_usage_limit_across_panes" $? "$HIT_PANES panes"
+
+if [[ "$TIER" == 3 ]]; then
+  # The fleet tier needs 3 sustained evaluations on the watcher's 60 s maintenance
+  # loop; keep sampling until it moves or the budget runs out.
+  for _ in $(seq 1 16); do
+    grep -q '"fleet_pressure_tier": "\(Elevated\|Critical\|Emergency\)"' "$OUT/health-samples.jsonl" 2> /dev/null && break
+    sleep 15
+  done
+  touch "$OUT/health-stop"
+  TIERS=$(python3 -c 'import json,sys;print(",".join(sorted({json.loads(l).get("fleet_pressure_tier") or "none" for l in open(sys.argv[1])})))' \
+    "$OUT/health-samples.jsonl" 2> /dev/null)
+  grep -q '"fleet_pressure_tier": "\(Elevated\|Critical\|Emergency\)"' "$OUT/health-samples.jsonl" 2> /dev/null
+  check "fleet_pressure_tier_rises_above_normal" $? "tiers seen: ${TIERS:-none}"
+  SPILL=$(python3 -c 'import json,sys;print(max((json.loads(l).get("warm_spill_lines_total") or 0) for l in open(sys.argv[1])))' \
+    "$OUT/health-samples.jsonl" 2> /dev/null || echo 0)
+  (( SPILL > 0 ))
+  check "hot_to_warm_scrollback_spill_observed" $? "${SPILL} lines spilled to warm"
+  python3 - "$OUT/fire-times.tsv" "$OUT/events.json" "$OUT/detection-latency.txt" << 'PY'
+import json, sys
+fired = {int(p): int(t) for p, t in (line.split("\t") for line in open(sys.argv[1]) if line.strip())}
+events = json.load(open(sys.argv[2]))["data"]["events"]
+agent_rules = ("codex.usage.reached", "claude_code.compaction", "gemini.usage.reached")
+first = {}
+for e in events:
+    pane, at = e.get("pane_id"), e.get("captured_at")
+    if pane in fired and e.get("rule_id") in agent_rules and at is not None and at >= fired[pane] - 1000:
+        first[pane] = min(first.get(pane, at), at)
+lat = sorted(max(0, first[p] - fired[p]) for p in first)
+p95 = lat[max(0, int(len(lat) * 0.95) - 1)] if lat else -1
+open(sys.argv[3], "w").write(f"{p95} {len(lat)} {len(fired)}\n")
+PY
+  read -r DET_P95 DET_N DET_FIRED < "$OUT/detection-latency.txt"
+  (( DET_P95 >= 0 && DET_P95 < 5000 && DET_N == DET_FIRED ))
+  check "detection_latency_p95_under_5s" $? "p95 ${DET_P95} ms over ${DET_N}/${DET_FIRED} fired panes"
+fi
 
 python3 - "$FT_BIN" "$D/ft.toml" "$OUT/state-latency.txt" "${ENVV[@]}" <<'PY'
 import subprocess, sys, time
@@ -204,11 +296,11 @@ PY
 P95=$(cat "$OUT/state-latency.txt")
 (( P95 < 500 )); check "robot_state_p95_under_500ms" $? "${P95} ms ($PROFILE build)"
 
-python3 - "$OUT/receipt.json" "$PROFILE" "$PANES" "$P95" "$("$FT_BIN" --version 2> /dev/null)" "${CHECKS[@]}" <<'PY'
+python3 - "$OUT/receipt.json" "$PROFILE" "$PANES" "$P95" "$("$FT_BIN" --version 2> /dev/null)" "$TIER" "${CHECKS[@]}" <<'PY'
 import json, platform, subprocess, sys, time
-checks = [json.loads(c) for c in sys.argv[6:]]
+checks = [json.loads(c) for c in sys.argv[7:]]
 receipt = {
-    "schema": "ft.live-loop-proof.v1", "tier": 2, "adapter": "live-mux",
+    "schema": "ft.live-loop-proof.v1", "tier": int(sys.argv[6]), "adapter": "live-mux",
     "panes": "scripted (no model calls)", "build_profile": sys.argv[2],
     "pane_count": int(sys.argv[3]), "robot_state_p95_ms": int(sys.argv[4]),
     "host": platform.node(), "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -219,10 +311,10 @@ receipt = {
     "checks": checks,
 }
 json.dump(receipt, open(sys.argv[1], "w"), indent=2)
-print(f"live-loop tier 2: {receipt['status']} ({sum(c['ok'] for c in checks)}/{len(checks)})")
+print(f"live-loop tier {receipt['tier']}: {receipt['status']} ({sum(c['ok'] for c in checks)}/{len(checks)})")
 PY
 python3 -c 'import json,sys;sys.exit(0 if json.load(open(sys.argv[1]))["status"]=="pass" else 1)' "$OUT/receipt.json" || exit 1
-# LIVE_LOOP_RETAIN=1 keeps a passing receipt as the tier-2 attestation.
+# LIVE_LOOP_RETAIN=1 keeps a passing receipt as the tier's attestation.
 if [[ "${LIVE_LOOP_RETAIN:-0}" == 1 ]]; then
-  cp "$OUT/receipt.json" "$REPO_ROOT/docs/attestations/proofs/live-loop-tier2.json"
+  cp "$OUT/receipt.json" "$REPO_ROOT/docs/attestations/proofs/live-loop-tier$TIER.json"
 fi
