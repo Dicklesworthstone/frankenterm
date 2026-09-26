@@ -4072,7 +4072,9 @@ impl PaneOutputRatesSnapshot {
     /// Publish the latest snapshot for the IPC `status` reply.
     pub fn update_global(snapshot: Self) {
         let lock = GLOBAL_PANE_OUTPUT_RATES.get_or_init(|| StdRwLock::new(None));
-        *lock.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
+        *lock
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
     }
 
     /// The latest published snapshot, if the watcher has taken one.
@@ -21056,7 +21058,12 @@ mod tests {
 
         let opening = PaneOutputRatesSnapshot::between(None, &first, 1_000, &HashMap::new());
         assert_eq!(opening.window_ms, 0);
-        assert!(opening.panes.iter().all(|pane| pane.bytes_per_sec.abs() < f64::EPSILON));
+        assert!(
+            opening
+                .panes
+                .iter()
+                .all(|pane| pane.bytes_per_sec.abs() < f64::EPSILON)
+        );
         assert_eq!(opening.panes[0].pane_id, 1, "totals order the first tick");
 
         // Over the next 2 s pane 2 floods while pane 1 goes quiet.
