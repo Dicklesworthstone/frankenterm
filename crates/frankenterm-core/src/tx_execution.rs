@@ -8480,9 +8480,7 @@ mod tests {
                 }
                 new_guard = Some(acquire_tx_contract_lock(&root, &renamed).unwrap());
             });
-            let error = result
-                .err()
-                .expect("stale spelling cannot acquire authority");
+            let error = result.expect_err("stale spelling cannot acquire authority");
             if path.exists() || rename_parent {
                 assert_eq!(error.kind(), TxContractStoreErrorKind::Conflict);
             } else {
