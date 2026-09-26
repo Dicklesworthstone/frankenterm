@@ -50794,7 +50794,17 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     }
                                 };
                                 let domain = pane_info.inferred_domain();
-                                let submit_agent_type = infer_send_submit_agent_type(&pane_info);
+                                let mut submit_agent_type = infer_send_submit_agent_type(&pane_info);
+                                if submit_agent_type == frankenterm_core::patterns::AgentType::Unknown
+                                    && submit_guarantee_level
+                                        .is_some_and(|level| level.requires_submit_profile())
+                                {
+                                    submit_agent_type =
+                                        frankenterm_core::pane_capability_resolution::agent_type_from_screen(
+                                            &cx, &wezterm, pane_id,
+                                        )
+                                        .await;
+                                }
                                 let submit_profile = submit_guarantee_level
                                     .filter(|level| level.requires_submit_profile())
                                     .and_then(|_| {
@@ -61505,7 +61515,16 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     }
                 };
                 let domain = pane_info.inferred_domain();
-                let submit_agent_type = infer_send_submit_agent_type(&pane_info);
+                let mut submit_agent_type = infer_send_submit_agent_type(&pane_info);
+                if submit_agent_type == frankenterm_core::patterns::AgentType::Unknown
+                    && submit_guarantee_level.is_some_and(|level| level.requires_submit_profile())
+                {
+                    submit_agent_type =
+                        frankenterm_core::pane_capability_resolution::agent_type_from_screen(
+                            &cx, &wezterm, pane_id,
+                        )
+                        .await;
+                }
                 let submit_profile = submit_guarantee_level
                     .filter(|level| level.requires_submit_profile())
                     .and_then(|_| {

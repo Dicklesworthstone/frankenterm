@@ -158,6 +158,31 @@ pub fn classify_agent_screen(tail: &str) -> Option<(&'static str, AgentScreenSta
     None
 }
 
+/// Agent type read from a pane's screen, for panes whose metadata does not
+/// name the agent: Codex titles its pane with the working directory, so
+/// title-based inference returns `Unknown` for it. `Unknown` when the screen
+/// is unreadable or not a recognised agent TUI.
+pub async fn agent_type_from_screen(
+    cx: &crate::cx::Cx,
+    mux: &crate::wezterm::WeztermHandle,
+    pane_id: u64,
+) -> crate::patterns::AgentType {
+    use crate::patterns::AgentType;
+
+    let Ok(tail) = mux
+        .get_text_tail_with_cx(cx, pane_id, false, Some(AGENT_SCREEN_TAIL_ROWS * 2))
+        .await
+    else {
+        return AgentType::Unknown;
+    };
+    match classify_agent_screen(&tail.text).map(|(agent, _)| agent) {
+        Some("codex") => AgentType::Codex,
+        Some("claude_code") => AgentType::ClaudeCode,
+        Some("gemini") => AgentType::Gemini,
+        _ => AgentType::Unknown,
+    }
+}
+
 /// Live prompt evidence carried in the watcher's `pane_state` reply.
 ///
 /// Vendored capture stores rendered rows, so OSC 133 bytes never reach

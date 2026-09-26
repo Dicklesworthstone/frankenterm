@@ -9587,7 +9587,17 @@ impl ToolHandler for WaSendTool {
                 .await?;
             tracing::debug!(phase = "pane_lookup_complete", "wa.send request progress");
             let domain = pane_info.inferred_domain();
-            let submit_agent_type = mcp_infer_submit_agent_type(&pane_info);
+            let mut submit_agent_type = mcp_infer_submit_agent_type(&pane_info);
+            if submit_agent_type == AgentType::Unknown
+                && submit_guarantee_level.is_some_and(|level| level.requires_submit_profile())
+            {
+                submit_agent_type = crate::pane_capability_resolution::agent_type_from_screen(
+                    &wezterm_cx,
+                    &wezterm,
+                    params.pane_id,
+                )
+                .await;
+            }
             let submit_profile = submit_guarantee_level
                 .filter(|level| level.requires_submit_profile())
                 .and_then(|_| mcp_load_submit_profile(&config, submit_agent_type));
