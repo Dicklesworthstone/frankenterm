@@ -2658,7 +2658,7 @@ impl WeztermClient {
                     }
                 };
                 match pool_result {
-                    Ok(_) => {
+                    Ok(()) => {
                         self.mux_circuit_record_success();
                         return Ok(());
                     }

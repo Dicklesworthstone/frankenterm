@@ -241,6 +241,13 @@ pub struct Config {
     )]
     pub scrollback_warm_max_mb: usize,
 
+    /// Warm-tier budget (MiB) shared by every live local pane; 0 disables it.
+    /// Each pane's warm cap becomes the smaller of `scrollback_warm_max_mb`
+    /// and this budget divided by the live pane count, so a many-pane host
+    /// bounds total warm scrollback instead of multiplying it by pane count.
+    #[dynamic(default)]
+    pub scrollback_warm_fleet_max_mb: usize,
+
     // -- Agent pane state detection --
     /// Enable agent pane state detection and visual indicators.
     #[dynamic(default = "default_true")]

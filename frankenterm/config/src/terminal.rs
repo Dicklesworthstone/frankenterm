@@ -10,6 +10,45 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use termwiz::cell::UnicodeVersion;
 
+/// Live local panes sharing `scrollback_warm_fleet_max_mb`. Maintained by
+/// [`LiveScrollbackPane`] guards so the tier getter, which runs on every
+/// scrollback spill, reads one atomic and never takes a mux lock.
+static LIVE_SCROLLBACK_PANES: AtomicUsize = AtomicUsize::new(0);
+
+/// Held by each live local pane for its lifetime; counts it toward the fleet
+/// warm-scrollback share.
+#[derive(Debug)]
+pub struct LiveScrollbackPane(());
+
+impl LiveScrollbackPane {
+    #[must_use]
+    pub fn register() -> Self {
+        LIVE_SCROLLBACK_PANES.fetch_add(1, Ordering::Relaxed);
+        Self(())
+    }
+}
+
+impl Drop for LiveScrollbackPane {
+    fn drop(&mut self) {
+        LIVE_SCROLLBACK_PANES.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A pane's warm-tier byte cap: its own `per_pane_mb`, lowered to an equal
+/// share of `fleet_mb` across `live_panes` when the fleet budget is set.
+fn warm_max_bytes_with_fleet_share(
+    per_pane_mb: usize,
+    fleet_mb: usize,
+    live_panes: usize,
+) -> usize {
+    let per_pane = per_pane_mb.saturating_mul(1024 * 1024);
+    if fleet_mb == 0 {
+        return per_pane;
+    }
+    let share = fleet_mb.saturating_mul(1024 * 1024) / live_panes.max(1);
+    per_pane.min(share)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScrollbackSpillSinkContext {
     pub pane_id: usize,
@@ -255,7 +294,11 @@ impl frankenterm_term::TerminalConfiguration for TermConfig {
     fn scrollback_tier_config(&self) -> frankenterm_term::config::ScrollbackTierConfig {
         let config = self.configuration();
         let hot_lines = config.scrollback_hot_lines.min(config.scrollback_lines);
-        let warm_max_bytes = config.scrollback_warm_max_mb.saturating_mul(1024 * 1024);
+        let warm_max_bytes = warm_max_bytes_with_fleet_share(
+            config.scrollback_warm_max_mb,
+            config.scrollback_warm_fleet_max_mb,
+            LIVE_SCROLLBACK_PANES.load(Ordering::Relaxed),
+        );
         frankenterm_term::config::ScrollbackTierConfig {
             enabled: config.scrollback_tiered_enabled,
             hot_lines,
@@ -402,6 +445,19 @@ mod tests {
     use frankenterm_term::TerminalConfiguration;
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    #[test]
+    fn fleet_warm_budget_is_shared_across_live_panes() {
+        const MIB: usize = 1024 * 1024;
+        // Disabled fleet budget: each pane keeps its own cap.
+        assert_eq!(warm_max_bytes_with_fleet_share(50, 0, 97), 50 * MIB);
+        // 1 GiB across 97 panes is ~10.6 MiB each, below the 50 MiB cap.
+        assert_eq!(warm_max_bytes_with_fleet_share(50, 1024, 97), 1024 * MIB / 97);
+        // A few panes: the per-pane cap still bounds each one.
+        assert_eq!(warm_max_bytes_with_fleet_share(50, 1024, 4), 50 * MIB);
+        // No live panes counted yet: share across one.
+        assert_eq!(warm_max_bytes_with_fleet_share(50, 16, 0), 16 * MIB);
+    }
 
     #[derive(Debug)]
     struct TestScrollbackSpillSink;

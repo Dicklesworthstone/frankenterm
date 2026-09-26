@@ -1645,6 +1645,8 @@ pub struct LocalPane {
     /// default build keeps the plain mutex path.
     #[cfg(feature = "disruptor-pane-io")]
     action_ring: Arc<ArrayQueue<AdmittedPaneActions>>,
+    /// Counts this pane toward `scrollback_warm_fleet_max_mb` while it lives.
+    _fleet_scrollback_share: config::LiveScrollbackPane,
 }
 
 fn record_input_for_current_identity(registration: &PaneRegistrationSlot) {
@@ -7386,6 +7388,7 @@ impl LocalPane {
             command_description,
             #[cfg(feature = "disruptor-pane-io")]
             action_ring: Arc::new(ArrayQueue::new(PANE_ACTION_RING_CAPACITY)),
+            _fleet_scrollback_share: config::LiveScrollbackPane::register(),
         }
     }
 

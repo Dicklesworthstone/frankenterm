@@ -436,9 +436,12 @@ ft mcp serve
   (default 1000) resident and moves older lines to a warm tier capped at
   `scrollback_warm_max_mb` (default 50 MiB). A swarm host therefore bounds
   scrollback memory at roughly panes x (hot + warm): 97 panes at the defaults
-  can hold up to about 4.8 GiB of warm scrollback. On many-pane hosts, lower
-  `scrollback_warm_max_mb` (16 MiB is about 1.5 GiB at 97 panes). There is no
-  fleet-wide cap yet (ft-erfq8). `ft doctor` names any other config file whose
+  can hold up to about 4.8 GiB of warm scrollback. On many-pane hosts set
+  `scrollback_warm_fleet_max_mb`: the mux shares that budget equally across its
+  live panes (each pane gets the smaller of its own cap and its share), so
+  `scrollback_warm_fleet_max_mb = 1024` bounds warm scrollback at 1 GiB however
+  many panes are open. `ft doctor` reports the panes' combined warm usage and
+  per-pane cap (`mux scrollback`), and names any other config file whose
   `scrollback_lines` disagrees with the active one.
 - If capture load is high, increase `ingest.poll_interval_ms` and/or lower `max_concurrent_captures`.
 - Native state/lifecycle hints use bounded buffering and can be dropped under

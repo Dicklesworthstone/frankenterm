@@ -104,7 +104,7 @@ pub fn classify_agent_screen(tail: &str) -> Option<(&'static str, AgentScreenSta
             .to_string()
     };
     let selected_menu_item = lines.iter().any(|line| {
-        let text = content(*line);
+        let text = content(line);
         ['›', '❯', '●', '>'].iter().any(|marker| {
             text.strip_prefix(*marker)
                 .map(str::trim_start)

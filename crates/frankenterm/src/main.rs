@@ -47585,7 +47585,7 @@ async fn run_watcher(
                     let ipc_task_cx = ipc_cx.clone();
                     // Vendored capture stores rendered rows, so prompt
                     // evidence comes from the mux's live semantic zones.
-                    let ipc_ctx =
+                    let ipc_handler_context =
                         frankenterm_core::ipc::IpcHandlerContext::with_auth_rpc_control_and_search_config(
                             event_bus,
                             Some(registry),
@@ -47597,7 +47597,11 @@ async fn run_watcher(
                         .with_semantic_source(wezterm_handle.clone());
                     let ipc_task = frankenterm_core::runtime_async::task::spawn(async move {
                         server
-                            .run_with_handler_context_with_cx(&ipc_task_cx, ipc_ctx, shutdown_rx)
+                            .run_with_handler_context_with_cx(
+                                &ipc_task_cx,
+                                ipc_handler_context,
+                                shutdown_rx,
+                            )
                             .await;
                     });
                     Some((
@@ -98584,6 +98588,65 @@ async fn mux_generation_diagnostic(
     Some(check)
 }
 
+/// Aggregate the mux's tiered scrollback across every pane (ft-erfq8): the
+/// per-pane budgets multiply by pane count, so the fleet total is what an
+/// operator has to size. `None` when the mux lists no panes or cannot report.
+async fn mux_scrollback_diagnostic(
+    cx: &frankenterm_core::cx::Cx,
+    mux: &frankenterm_core::wezterm::UnifiedClient,
+) -> Option<DiagnosticCheck> {
+    use frankenterm_core::wezterm::{
+        MuxInterface, PANE_TIERED_SCROLLBACK_BULK_MAX_PANES, PaneTieredScrollbackBatchOutcome,
+    };
+
+    let panes = mux.list_panes_with_cx(cx).await.ok()?;
+    let pane_ids: Vec<u64> = panes.iter().map(|pane| pane.pane_id).collect();
+    if pane_ids.is_empty() {
+        return None;
+    }
+    let mut reported = 0usize;
+    let mut warm_resident_bytes = 0usize;
+    let mut cap_min = usize::MAX;
+    let mut cap_max = 0usize;
+    for chunk in pane_ids.chunks(PANE_TIERED_SCROLLBACK_BULK_MAX_PANES) {
+        let Ok(Some(entries)) = mux.pane_tiered_scrollback_summaries_bulk_with_cx(cx, chunk).await
+        else {
+            continue;
+        };
+        for entry in entries {
+            if let PaneTieredScrollbackBatchOutcome::Available(summary) = entry.outcome {
+                reported += 1;
+                warm_resident_bytes = warm_resident_bytes.saturating_add(summary.warm_resident_bytes);
+                cap_min = cap_min.min(summary.configured_warm_max_bytes);
+                cap_max = cap_max.max(summary.configured_warm_max_bytes);
+            }
+        }
+    }
+    if reported == 0 {
+        return Some(DiagnosticCheck::warning(
+            "mux scrollback",
+            format!("{} panes listed; none reported tiered scrollback", pane_ids.len()),
+            "Check that the mux is a FrankenTerm mux with tiered scrollback enabled",
+        ));
+    }
+    let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+    let caps = if cap_min == cap_max {
+        format!("{:.1} MiB", mib(cap_max))
+    } else {
+        format!("{:.1}-{:.1} MiB", mib(cap_min), mib(cap_max))
+    };
+    Some(DiagnosticCheck::ok_with_detail(
+        "mux scrollback",
+        format!(
+            "{reported} panes: {:.1} MiB warm resident; warm cap per pane {caps}, up to \
+             {:.1} MiB across panes (the mux setting scrollback_warm_fleet_max_mb caps \
+             that total)",
+            mib(warm_resident_bytes),
+            mib(cap_max.saturating_mul(reported)),
+        ),
+    ))
+}
+
 /// Run all diagnostic checks and return results
 async fn run_diagnostics(
     cx: &frankenterm_core::cx::Cx,
@@ -98912,6 +98975,9 @@ async fn run_diagnostics(
     checks.push(mux_socket_diagnostic(mux_client.discovered_socket()));
     #[cfg(all(feature = "vendored", unix))]
     if let Some(check) = mux_generation_diagnostic(cx, mux_client.discovered_socket()).await {
+        checks.push(check);
+    }
+    if let Some(check) = mux_scrollback_diagnostic(cx, &mux_client).await {
         checks.push(check);
     }
 
