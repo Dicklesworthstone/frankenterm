@@ -1015,6 +1015,12 @@ pub trait Pane: Downcast + Send + Sync {
         None
     }
 
+    /// Move resident warm scrollback to the cold tier, returning the rows
+    /// moved, or `None` for panes without tiered scrollback.
+    fn evict_warm_scrollback(&self) -> Option<usize> {
+        None
+    }
+
     fn pane_constraints(&self) -> PaneConstraints {
         PaneConstraints::default()
     }

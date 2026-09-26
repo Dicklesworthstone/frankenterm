@@ -524,6 +524,7 @@ pub enum MuxOperation {
     ClientRegistration,
     ListPanes,
     ReadTieredScrollbackStatus,
+    EvictWarmScrollback,
     Spawn,
     SplitPane,
     MovePaneToNewTab,
@@ -577,6 +578,7 @@ impl MuxOperation {
             Self::ClientRegistration => "client_registration",
             Self::ListPanes => "list_panes",
             Self::ReadTieredScrollbackStatus => "read_tiered_scrollback_status",
+            Self::EvictWarmScrollback => "evict_warm_scrollback",
             Self::Spawn => "spawn",
             Self::SplitPane => "split_pane",
             Self::MovePaneToNewTab => "move_pane_to_new_tab",
@@ -634,6 +636,7 @@ impl MuxOperation {
             "get_semantic_zones" | "get_semantic_zones_with_cx" => Self::ReadSemanticZones,
             "pane_tiered_scrollback_summary_with_cx"
             | "pane_tiered_scrollback_summaries_bulk_with_cx" => Self::ReadTieredScrollbackStatus,
+            "evict_warm_scrollback_bulk_with_cx" => Self::EvictWarmScrollback,
             "spawn" | "spawn_targeted" | "spawn_targeted_with_cx" => Self::Spawn,
             "split_pane" | "split_pane_with_cx" => Self::SplitPane,
             "send_text" | "send_text_with_cx" => Self::SendText,

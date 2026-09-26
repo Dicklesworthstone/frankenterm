@@ -22,7 +22,8 @@ use crate::runtime_async::{io, mpsc, mpsc_try_reserve_send, watch};
 use crate::runtime_async::{task, timeout};
 use codec::{
     AdjustPaneSize, CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, CompatDecision, CompressionMode,
-    CreateFloatingPane, CycleStack, DecodedPdu, GetCodecVersion, GetCodecVersionResponse, GetLines,
+    CreateFloatingPane, CycleStack, DecodedPdu, EvictPaneWarmScrollbackV1,
+    EvictPaneWarmScrollbackV1Response, GetCodecVersion, GetCodecVersionResponse, GetLines,
     GetLinesAtLayout, GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
     GetPaneTieredScrollbackStatusesV1, GetPaneTieredScrollbackStatusesV1Response, GetSemanticZones,
     GetSemanticZonesResponse, InputSerial, LineReadLayout, ListPanes, ListPanesResponse,
@@ -2498,6 +2499,56 @@ impl DirectMuxClient {
         self.settle_transport_result(
             result,
             "tiered-scrollback batch response contract failure",
+            true,
+        )
+    }
+
+    /// Ask the mux to move a pane batch's resident warm scrollback to the
+    /// cold tier; each entry is that pane's status after the eviction. A
+    /// pre-v67 peer refuses before any byte is written
+    /// (`OutboundPduRequiresCodec`).
+    pub async fn evict_pane_warm_scrollback_with_cx(
+        &mut self,
+        cx: &Cx,
+        pane_ids: Vec<usize>,
+    ) -> Result<EvictPaneWarmScrollbackV1Response, DirectMuxError> {
+        let request = EvictPaneWarmScrollbackV1 { pane_ids };
+        request.validate().map_err(|error| {
+            DirectMuxError::proven_pre_write_rejection(DirectMuxError::Codec(error.to_string()))
+        })?;
+        let requested_pane_ids = request.pane_ids.clone();
+        let response = self
+            .send_request_with_cx(cx, Pdu::EvictPaneWarmScrollbackV1(request))
+            .await?;
+        let result = match response {
+            Pdu::EvictPaneWarmScrollbackV1Response(response) => {
+                let response_pane_ids = response
+                    .entries
+                    .iter()
+                    .map(|entry| entry.pane_id)
+                    .collect::<Vec<_>>();
+                if let Err(error) = response.validate() {
+                    Err(DirectMuxError::AlignedUnexpectedResponse {
+                        expected: "bounded unique warm-scrollback eviction response".to_string(),
+                        got: error.to_string(),
+                    })
+                } else if response_pane_ids != requested_pane_ids {
+                    Err(DirectMuxError::AlignedUnexpectedResponse {
+                        expected: format!("evictions for panes {requested_pane_ids:?}"),
+                        got: format!("evictions for panes {response_pane_ids:?}"),
+                    })
+                } else {
+                    Ok(response)
+                }
+            }
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "EvictPaneWarmScrollbackV1Response".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        };
+        self.settle_transport_result(
+            result,
+            "warm-scrollback eviction response contract failure",
             true,
         )
     }

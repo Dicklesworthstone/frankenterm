@@ -2251,6 +2251,10 @@ impl Pane for LocalPane {
         )
     }
 
+    fn evict_warm_scrollback(&self) -> Option<usize> {
+        Some(self.terminal.lock().evict_warm_scrollback())
+    }
+
     fn copy_user_vars(&self) -> HashMap<String, String> {
         self.locked_terminal().user_vars().clone()
     }

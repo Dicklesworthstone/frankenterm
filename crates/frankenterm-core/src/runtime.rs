@@ -5958,6 +5958,8 @@ impl ObservationRuntime {
                 None::<FleetCoordinatorMaintenanceState>;
             let mut last_fleet_coordinator_observed_state =
                 None::<FleetCoordinatorMaintenanceState>;
+            // Set once the mux accepts a warm eviction request (codec >= 67).
+            let mut mux_warm_eviction_supported = false;
             // ft-wl9rx: totals at the previous health tick, for output rates.
             let mut previous_pane_output = None::<(u64, HashMap<u64, PaneOutputTotals>)>;
 
@@ -6620,18 +6622,43 @@ impl ObservationRuntime {
                         &mut pane_snapshots,
                     );
 
-                    // The coordinator evicts from the compact snapshots
-                    // collected above, never from the mux, which owns pane
-                    // scrollback and has no eviction request. Its "evicted"
-                    // figures are therefore a recommendation, and must never
-                    // be reported or recorded as memory actually reclaimed.
-                    if fleet_eval.pages_evicted > 0 || fleet_eval.bytes_reclaimed > 0 {
+                    // The coordinator plans evictions on the compact snapshots
+                    // collected above. The mux owns pane scrollback, so the
+                    // panes it targeted are then evicted there (each one's
+                    // warm tier moved whole to cold), and only the mux's own
+                    // before/after measurement is reported as reclaimed. A mux
+                    // that cannot evict (codec < 67) leaves a recommendation.
+                    let eviction_targets = pane_snapshots.targeted_panes();
+                    let mux_eviction = if eviction_targets.is_empty() {
+                        MuxWarmEviction::default()
+                    } else {
+                        apply_mux_warm_eviction(
+                            &loop_cx,
+                            &wezterm_handle,
+                            &eviction_targets,
+                            &tiered_scrollback_fetch.summaries,
+                        )
+                        .await
+                    };
+                    mux_warm_eviction_supported |= mux_eviction.supported;
+                    if loop_cx.checkpoint().is_err() {
+                        break;
+                    }
+                    if mux_eviction.supported {
+                        info!(
+                            tier = ?fleet_eval.compound_tier,
+                            panes = mux_eviction.panes_evicted,
+                            bytes_released = mux_eviction.bytes_released,
+                            errors = mux_eviction.errors,
+                            "fleet scrollback coordinator: mux warm eviction applied"
+                        );
+                    } else if fleet_eval.pages_evicted > 0 || fleet_eval.bytes_reclaimed > 0 {
                         info!(
                             tier = ?fleet_eval.compound_tier,
                             recommended_pages = fleet_eval.pages_evicted,
                             recommended_bytes = fleet_eval.bytes_reclaimed,
                             "fleet scrollback coordinator: mux warm eviction recommended, not \
-                             applied (the mux has no eviction request; lower \
+                             applied (this mux cannot evict; lower \
                              scrollback_warm_fleet_max_mb to bound warm scrollback)"
                         );
                     } else if !matches!(
@@ -6695,16 +6722,16 @@ impl ObservationRuntime {
                         let audit_state_changed =
                             last_fleet_coordinator_maintenance_state != Some(current_state);
                         let actions = fleet_eval.actions.len();
-                        // Snapshot-only eviction reclaims nothing, so it is
-                        // not activity: under sustained pressure it repeats
-                        // every tick and would write a maintenance row each
-                        // time. Only state transitions are recorded.
+                        // Only a mux-applied eviction is activity; a bare
+                        // recommendation repeats every tick under sustained
+                        // pressure and would write a maintenance row each time,
+                        // so it is recorded only on state transitions.
                         if fleet_coordinator_maintenance_is_noteworthy(
                             last_fleet_coordinator_maintenance_state,
                             current_state,
                             0,
-                            0,
-                            0,
+                            mux_eviction.bytes_released,
+                            mux_eviction.panes_evicted,
                         ) {
                             let audit_reason = if audit_state_changed {
                                 "state_transition"
@@ -6714,7 +6741,10 @@ impl ObservationRuntime {
                             let metadata = serde_json::json!({
                                 "audit_reason": audit_reason,
                                 "compound_tier": format!("{:?}", fleet_eval.compound_tier),
-                                "eviction_applied": false,
+                                "eviction_applied": mux_eviction.supported,
+                                "eviction_mux_panes": mux_eviction.panes_evicted,
+                                "eviction_mux_bytes_released": mux_eviction.bytes_released,
+                                "eviction_mux_errors": mux_eviction.errors,
                                 "eviction_recommended_pages": fleet_eval.pages_evicted,
                                 "eviction_recommended_bytes": fleet_eval.bytes_reclaimed,
                                 "eviction_recommended_targets": fleet_eval.targets_applied,
@@ -6742,7 +6772,14 @@ impl ObservationRuntime {
                                     MaintenanceRecord {
                                         id: 0,
                                         event_type: "fleet_scrollback_coordinator".to_string(),
-                                        message: Some(if telemetry_blind {
+                                        message: Some(if mux_eviction.supported {
+                                            format!(
+                                                "Fleet coordinator {audit_reason}: tier={:?}, mux evicted warm scrollback on {} panes, {} bytes released",
+                                                fleet_eval.compound_tier,
+                                                mux_eviction.panes_evicted,
+                                                mux_eviction.bytes_released,
+                                            )
+                                        } else if telemetry_blind {
                                             format!(
                                                 "Fleet coordinator {audit_reason}: tier={:?}, eviction recommended for {} pages (not applied); tiered scrollback telemetry blind",
                                                 fleet_eval.compound_tier, fleet_eval.pages_evicted,
@@ -6830,8 +6867,11 @@ impl ObservationRuntime {
                                 3,
                             )
                             .with_resource_cockpit_inputs_and_resource_evidence(
-                                warm_tier_budget_snapshot(&tiered_scrollback_fetch.summaries)
-                                    .as_ref(),
+                                warm_tier_budget_snapshot(
+                                    &tiered_scrollback_fetch.summaries,
+                                    mux_warm_eviction_supported,
+                                )
+                                .as_ref(),
                                 &[],
                                 None,
                                 None,
@@ -11758,8 +11798,68 @@ fn approximate_warm_page_count(summary: &PaneTieredScrollbackSummary) -> usize {
 /// per-pane accounting: resident warm bytes against the panes' configured warm
 /// caps. `None` when no pane reports tiered scrollback. Nothing is reclaimable
 /// through the watcher: the mux has no eviction request (ft-fvbp7).
+/// What the mux did with one coordinator tick's warm eviction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MuxWarmEviction {
+    /// The mux accepted the request (false: no vendored mux, or codec < 67).
+    supported: bool,
+    /// Panes whose warm tier the mux moved to cold and re-sampled.
+    panes_evicted: usize,
+    /// Warm resident bytes released, measured by the mux: each pane's warm
+    /// residency this tick minus its residency after the eviction.
+    bytes_released: u64,
+    /// Eviction requests that failed.
+    errors: usize,
+}
+
+/// Ask the mux to move the coordinator's target panes' warm scrollback to
+/// the cold tier, in bounded batches.
+async fn apply_mux_warm_eviction(
+    runtime_cx: &RuntimeLoopCx,
+    wezterm_handle: &WeztermHandle,
+    pane_ids: &[u64],
+    before: &HashMap<u64, PaneTieredScrollbackSummary>,
+) -> MuxWarmEviction {
+    let mut eviction = MuxWarmEviction::default();
+    for chunk in pane_ids.chunks(PANE_TIERED_SCROLLBACK_BULK_MAX_PANES) {
+        match wezterm_handle
+            .evict_warm_scrollback_bulk_with_cx(runtime_cx, chunk)
+            .await
+        {
+            Ok(Some(entries)) => {
+                eviction.supported = true;
+                for entry in entries {
+                    if let PaneTieredScrollbackBatchOutcome::Available(after) = entry.outcome {
+                        let before_bytes = before
+                            .get(&entry.pane_id)
+                            .map_or(0, |summary| summary.warm_resident_bytes);
+                        eviction.panes_evicted += 1;
+                        eviction.bytes_released = eviction.bytes_released.saturating_add(
+                            u64::try_from(before_bytes.saturating_sub(after.warm_resident_bytes))
+                                .unwrap_or(u64::MAX),
+                        );
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                eviction.errors += 1;
+                debug!(
+                    pane_count = chunk.len(),
+                    error = %error,
+                    "mux warm scrollback eviction failed"
+                );
+            }
+        }
+    }
+    eviction
+}
+
+/// `mux_can_evict`: the mux has accepted a warm eviction request, so all of
+/// the warm residency is reclaimable by the coordinator; otherwise none is.
 fn warm_tier_budget_snapshot(
     summaries: &HashMap<u64, PaneTieredScrollbackSummary>,
+    mux_can_evict: bool,
 ) -> Option<crate::fleet_memory_controller::FleetMemoryTierBudgetSnapshot> {
     use crate::fleet_memory_controller::{
         FleetMemoryTier, FleetMemoryTierBudgetRecord, FleetMemoryTierBudgetSnapshot,
@@ -11780,7 +11880,7 @@ fn warm_tier_budget_snapshot(
     });
     let mut record =
         FleetMemoryTierBudgetRecord::new(FleetMemoryTier::WarmCompressed, budget, actual);
-    record.reclaimable_bytes = 0;
+    record.reclaimable_bytes = if mux_can_evict { actual } else { 0 };
     Some(FleetMemoryTierBudgetSnapshot::from_tiers([record]))
 }
 
@@ -23123,6 +23223,42 @@ mod tests {
     }
 
     #[test]
+    fn mux_warm_eviction_measures_released_bytes_from_mux_before_and_after() {
+        run_async_test(async {
+            let summary = |warm_resident_bytes| PaneTieredScrollbackSummary {
+                tiering_enabled: true,
+                warm_resident_bytes,
+                ..PaneTieredScrollbackSummary::default()
+            };
+            let before = HashMap::from([(1, summary(4096)), (2, summary(1000))]);
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            let handle: WeztermHandle = mock.clone();
+            let cx = runtime_loop_cx();
+
+            // A mux that cannot evict: the eviction stays a recommendation.
+            let eviction = apply_mux_warm_eviction(&cx, &handle, &[1, 2], &before).await;
+            assert_eq!(eviction, MuxWarmEviction::default());
+
+            // Pane 1 released everything, pane 2 kept 200 bytes (new output
+            // since the tick's sample), pane 3 vanished.
+            mock.configure_warm_eviction_for_test(Some(HashMap::from([
+                (1, PaneTieredScrollbackBatchOutcome::Available(summary(0))),
+                (2, PaneTieredScrollbackBatchOutcome::Available(summary(200))),
+            ])));
+            let eviction = apply_mux_warm_eviction(&cx, &handle, &[1, 2, 3], &before).await;
+            assert_eq!(
+                eviction,
+                MuxWarmEviction {
+                    supported: true,
+                    panes_evicted: 2,
+                    bytes_released: 4096 + 800,
+                    errors: 0,
+                }
+            );
+        });
+    }
+
+    #[test]
     fn pane_tiered_scrollback_bulk_fetch_collapses_200_panes_to_one_request() {
         run_async_test(async {
             let pane_ids = (0_u64..200).collect::<Vec<_>>();
@@ -25874,27 +26010,32 @@ mod tests {
             ..PaneTieredScrollbackSummary::default()
         };
 
-        assert!(warm_tier_budget_snapshot(&HashMap::new()).is_none());
+        assert!(warm_tier_budget_snapshot(&HashMap::new(), false).is_none());
         // Only panes without tiering (alternate screen): no warm budget at all.
-        assert!(warm_tier_budget_snapshot(&HashMap::from([(1, pane(false, 0))])).is_none());
+        assert!(warm_tier_budget_snapshot(&HashMap::from([(1, pane(false, 0))]), false).is_none());
 
         let summaries = HashMap::from([
             (1, pane(true, 10 * MIB)),
             (2, pane(true, 30 * MIB)),
             (3, pane(false, 0)),
         ]);
-        let snapshot = warm_tier_budget_snapshot(&summaries).expect("two tiered panes");
+        let snapshot = warm_tier_budget_snapshot(&summaries, false).expect("two tiered panes");
         assert_eq!(snapshot.tiers.len(), 1);
         let warm = &snapshot.tiers[0];
         assert_eq!(warm.tier, FleetMemoryTier::WarmCompressed);
         assert_eq!(warm.budget_bytes, 100 * MIB as u64);
         assert_eq!(warm.actual_bytes, 40 * MIB as u64);
-        assert_eq!(warm.reclaimable_bytes, 0, "the mux has no eviction request");
+        assert_eq!(
+            warm.reclaimable_bytes, 0,
+            "a mux that cannot evict frees nothing"
+        );
         assert_eq!(snapshot.pressure_tier(), FleetPressureTier::Normal);
+        let evictable = warm_tier_budget_snapshot(&summaries, true).expect("two tiered panes");
+        assert_eq!(evictable.tiers[0].reclaimable_bytes, 40 * MIB as u64);
 
         let over = HashMap::from([(1, pane(true, 80 * MIB))]);
         assert_ne!(
-            warm_tier_budget_snapshot(&over)
+            warm_tier_budget_snapshot(&over, false)
                 .expect("tiered pane")
                 .pressure_tier(),
             FleetPressureTier::Normal

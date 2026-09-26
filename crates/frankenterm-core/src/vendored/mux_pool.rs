@@ -1053,6 +1053,35 @@ impl MuxPool {
         .await
     }
 
+    /// Move a pane batch's resident warm scrollback to the cold tier; each
+    /// entry is that pane's tiered status after the eviction.
+    pub async fn evict_pane_warm_scrollback_with_cx(
+        &self,
+        cx: &Cx,
+        pane_ids: Vec<usize>,
+    ) -> Result<codec::EvictPaneWarmScrollbackV1Response, MuxPoolError> {
+        codec::EvictPaneWarmScrollbackV1 {
+            pane_ids: pane_ids.clone(),
+        }
+        .validate()
+        .map_err(|error| {
+            MuxPoolError::Mux(DirectMuxError::proven_pre_write_rejection(
+                DirectMuxError::Codec(error.to_string()),
+            ))
+        })?;
+        let op_cx = cx.clone();
+        self.execute_with_recovery_with_cx(cx, "evict_pane_warm_scrollback_v1", move |client| {
+            let op_cx = op_cx.clone();
+            let pane_ids = pane_ids.clone();
+            Box::pin(async move {
+                client
+                    .evict_pane_warm_scrollback_with_cx(&op_cx, pane_ids)
+                    .await
+            })
+        })
+        .await
+    }
+
     /// Fetch OSC 133 semantic zones from a pane via a pooled connection.
     pub async fn get_semantic_zones(
         &self,

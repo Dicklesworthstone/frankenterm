@@ -3545,6 +3545,18 @@ macro_rules! pdu_encoded_body_limit {
             max_zstd_encoded_bytes: MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_ZSTD_ENCODED_BYTES,
         }
     };
+    (EvictPaneWarmScrollbackV1, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_TIERED_SCROLLBACK_STATUS_REQUEST_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_TIERED_SCROLLBACK_STATUS_REQUEST_ZSTD_ENCODED_BYTES,
+        }
+    };
+    (EvictPaneWarmScrollbackV1Response, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_ZSTD_ENCODED_BYTES,
+        }
+    };
     (GetImageCellResponse, none) => {
         PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
             max_decompressed_bytes: MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES,
@@ -4300,7 +4312,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 66;
+pub const CODEC_VERSION: usize = 67;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -4876,6 +4888,12 @@ pdu! {
         query, query, normal => deserialize_release_selection_anchor;
     ReleaseSelectionAnchorResponseV1: 109, 66, server_reply, none,
         query, query, normal => deserialize_release_selection_anchor_response;
+    EvictPaneWarmScrollbackV1: 110, 67, client_request, none,
+        state_sync, state_sync, normal
+        => deserialize_evict_pane_warm_scrollback_v1;
+    EvictPaneWarmScrollbackV1Response: 111, 67, server_reply, none,
+        state_sync, state_sync, normal
+        => deserialize_evict_pane_warm_scrollback_v1_response;
 }
 
 impl Pdu {
@@ -4892,6 +4910,8 @@ impl Pdu {
             Self::GetPaneRenderDeliveryV1Response(value) => value.validate()?,
             Self::GetPaneTieredScrollbackStatusesV1(value) => value.validate()?,
             Self::GetPaneTieredScrollbackStatusesV1Response(value) => value.validate()?,
+            Self::EvictPaneWarmScrollbackV1(value) => value.validate()?,
+            Self::EvictPaneWarmScrollbackV1Response(value) => value.validate()?,
             Self::SendKeyDownTracedV1(value) => value.validate()?,
             Self::SendPasteTracedV1(value) => value.validate()?,
             Self::ReliableKeyEventV1(value) => value.validate()?,
@@ -14515,6 +14535,67 @@ fn deserialize_get_pane_tiered_scrollback_statuses_v1_response(
     Ok(response)
 }
 
+pub const EVICT_PANE_WARM_SCROLLBACK_V1_MIN_CODEC_VERSION: usize = 67;
+
+/// Move the named panes' resident warm scrollback to the cold tier: the fleet
+/// memory-pressure action the watcher's scrollback coordinator decides on.
+/// Same bounded, duplicate-free pane batch as the tiered status request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EvictPaneWarmScrollbackV1 {
+    #[serde(
+        serialize_with = "serialize_tiered_scrollback_batch_pane_ids",
+        deserialize_with = "deserialize_tiered_scrollback_batch_pane_ids"
+    )]
+    pub pane_ids: Vec<PaneId>,
+}
+
+/// One entry per requested pane: its tiered scrollback status sampled after
+/// the eviction, so the caller measures the bytes the mux actually released.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EvictPaneWarmScrollbackV1Response {
+    #[serde(
+        serialize_with = "serialize_tiered_scrollback_batch_entries",
+        deserialize_with = "deserialize_tiered_scrollback_batch_entries"
+    )]
+    pub entries: Vec<PaneTieredScrollbackStatusEntryV1>,
+}
+
+impl EvictPaneWarmScrollbackV1 {
+    pub fn validate(&self) -> Result<(), TieredScrollbackStatusBatchError> {
+        validate_tiered_scrollback_status_batch_ids(
+            self.pane_ids.iter().copied(),
+            self.pane_ids.len(),
+        )
+    }
+}
+
+impl EvictPaneWarmScrollbackV1Response {
+    pub fn validate(&self) -> Result<(), TieredScrollbackStatusBatchError> {
+        validate_tiered_scrollback_status_batch_ids(
+            self.entries.iter().map(|entry| entry.pane_id),
+            self.entries.len(),
+        )
+    }
+}
+
+fn deserialize_evict_pane_warm_scrollback_v1(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<EvictPaneWarmScrollbackV1, Error> {
+    let request: EvictPaneWarmScrollbackV1 = deserialize(data, is_compressed)?;
+    request.validate()?;
+    Ok(request)
+}
+
+fn deserialize_evict_pane_warm_scrollback_v1_response(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<EvictPaneWarmScrollbackV1Response, Error> {
+    let response: EvictPaneWarmScrollbackV1Response = deserialize(data, is_compressed)?;
+    response.validate()?;
+    Ok(response)
+}
+
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetSemanticZones {
     pub pane_id: PaneId,
@@ -22122,7 +22203,7 @@ mod test {
 
     #[test]
     fn codec_v65_additive_line_layout_preserves_the_v61_compatibility_floor() {
-        assert_eq!(CODEC_VERSION, 66);
+        assert_eq!(CODEC_VERSION, 67);
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
         assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 54);
         assert!(!codec_version_supports_ordered_window_v1(50));
@@ -23975,7 +24056,50 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 66);
+        assert_eq!(CODEC_VERSION, 67);
+    }
+
+    #[test]
+    fn evict_warm_scrollback_batch_round_trips_and_rejects_bad_batches() {
+        let request = Pdu::EvictPaneWarmScrollbackV1(EvictPaneWarmScrollbackV1 {
+            pane_ids: vec![3, 9],
+        });
+        for mode in [CompressionMode::Never, CompressionMode::Always] {
+            let frame = request.encode_frame_with_mode(1, mode).unwrap();
+            assert_eq!(Pdu::decode(frame.as_slice()).unwrap().pdu, request);
+        }
+        assert_eq!(request.minimum_codec_version(), Some(67));
+
+        let response = Pdu::EvictPaneWarmScrollbackV1Response(EvictPaneWarmScrollbackV1Response {
+            entries: vec![
+                PaneTieredScrollbackStatusEntryV1 {
+                    pane_id: 3,
+                    outcome: PaneTieredScrollbackStatusOutcomeV1::Available(
+                        maximal_tiered_scrollback_summary_v1(),
+                    ),
+                },
+                PaneTieredScrollbackStatusEntryV1 {
+                    pane_id: 9,
+                    outcome: PaneTieredScrollbackStatusOutcomeV1::Missing,
+                },
+            ],
+        });
+        let frame = response
+            .encode_frame_with_mode(2, CompressionMode::Never)
+            .unwrap();
+        assert_eq!(Pdu::decode(frame.as_slice()).unwrap().pdu, response);
+
+        for pane_ids in [vec![], vec![4, 4]] {
+            let invalid = EvictPaneWarmScrollbackV1 { pane_ids };
+            assert!(invalid.validate().is_err());
+        }
+        let oversized = EvictPaneWarmScrollbackV1 {
+            pane_ids: (0..=MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES as PaneId).collect(),
+        };
+        assert!(matches!(
+            oversized.validate(),
+            Err(TieredScrollbackStatusBatchError::TooMany { .. })
+        ));
     }
 
     #[test]
@@ -24470,7 +24594,7 @@ mod test {
     fn pdu_wire_registry_covers_every_assigned_id_and_only_the_historical_gaps() {
         const GAPS: &[u64] = &[5, 6, 7, 15, 16, 17, 18, 19, 21];
 
-        for ident in 0..=109 {
+        for ident in 0..=111 {
             let spec = Pdu::wire_spec_for_ident(ident);
             assert_eq!(
                 spec.is_none(),
@@ -24484,9 +24608,9 @@ mod test {
             }
         }
 
-        assert!(Pdu::wire_spec_for_ident(110).is_none());
+        assert!(Pdu::wire_spec_for_ident(112).is_none());
         assert!(Pdu::wire_spec_for_ident(u64::MAX).is_none());
-        assert_eq!(Pdu::all_wire_specs().len(), 110 - GAPS.len());
+        assert_eq!(Pdu::all_wire_specs().len(), 112 - GAPS.len());
     }
 
     #[test]
@@ -24528,6 +24652,7 @@ mod test {
                 100..=101 => 64,
                 102..=103 => 65,
                 104..=109 => 66,
+                110..=111 => 67,
                 ident => panic!("unexpected assigned PDU ID {}", ident),
             };
             assert_eq!(
@@ -24562,11 +24687,11 @@ mod test {
         const CLIENT_REQUESTS: &[u64] = &[
             1, 3, 9, 11, 12, 13, 14, 22, 24, 26, 28, 31, 33, 34, 35, 36, 38, 40, 41, 43, 45, 46,
             48, 50, 51, 56, 57, 58, 59, 60, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
-            77, 80, 81, 85, 86, 88, 91, 93, 95, 96, 98, 99, 100, 102, 104, 106, 108,
+            77, 80, 81, 85, 86, 88, 91, 93, 95, 96, 98, 99, 100, 102, 104, 106, 108, 110,
         ];
         const SERVER_REPLIES: &[u64] = &[
             0, 2, 4, 8, 10, 23, 25, 27, 29, 30, 32, 42, 47, 49, 52, 61, 76, 78, 82, 87, 89, 92, 94,
-            97, 101, 103, 105, 107, 109,
+            97, 101, 103, 105, 107, 109, 111,
         ];
         const SERVER_UNILATERALS: &[u64] = &[
             20, 25, 37, 38, 39, 44, 53, 54, 55, 56, 57, 58, 79, 83, 84, 90,
@@ -24661,7 +24786,7 @@ mod test {
                 | 74
                 | 88
                 | 89 => Class::InteractiveState,
-                3 | 4 | 37 | 39 | 44 | 53..=55 | 75 | 76 | 81..=83 | 86 | 87 | 90 => {
+                3 | 4 | 37 | 39 | 44 | 53..=55 | 75 | 76 | 81..=83 | 86 | 87 | 90 | 110 | 111 => {
                     Class::StateSync
                 }
                 24 | 25 | 79 | 80 | 84 | 85 | 91 | 92 => Class::Render,
@@ -24675,7 +24800,7 @@ mod test {
                 8 | 14 | 33..=36 | 38 | 43 | 45 | 48..=50 | 56..=59 | 62..=72 | 74 | 88 | 89 => {
                     Cap::InteractiveState
                 }
-                37 | 39 | 44 | 53..=55 | 83 | 90 => Cap::StateSync,
+                37 | 39 | 44 | 53..=55 | 83 | 90 | 110 | 111 => Cap::StateSync,
                 24 | 25 | 79 | 80 | 84 | 85 | 91 | 92 => Cap::Render,
                 3
                 | 22
@@ -24733,7 +24858,7 @@ mod test {
                 | 83..=86
                 | 90..=93
                 | 102
-                | 104..=109 => Qos::Normal,
+                | 104..=111 => Qos::Normal,
                 4 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 103 => Qos::Bulk,
                 ident => panic!("PDU {} is missing from the queue-QoS census", ident),
             };
@@ -25681,7 +25806,7 @@ mod test {
     #[test]
     fn check_compat_current_build_keeps_v61_floor_after_additive_v65() {
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
-        assert_eq!(CODEC_VERSION, 66);
+        assert_eq!(CODEC_VERSION, 67);
         assert!(check_compat(62, 61, 60, 58).is_err());
         assert_eq!(
             check_compat(62, 61, 61, 61),
@@ -26518,7 +26643,7 @@ mod test {
     fn async_selector_truncated_discard_fails_closed() {
         runtime::block_on(async {
             let mut wire = Vec::new();
-            encode_raw(110, 1, &[0x41; 128], false, &mut wire).expect("encode discard candidate");
+            encode_raw(112, 1, &[0x41; 128], false, &mut wire).expect("encode discard candidate");
             wire.pop().expect("encoded frame has a payload byte");
             let mut reader = runtime::Cursor::new(wire);
 
@@ -26566,21 +26691,21 @@ mod test {
 
     #[test]
     fn decode_accepts_valid_non_canonical_leb128_headers() {
-        let wire = [0x84, 0x00, 0x81, 0x00, 0xEE, 0x00];
+        let wire = [0x84, 0x00, 0x81, 0x00, 0xF0, 0x00];
         let decoded = Pdu::decode(wire.as_slice()).expect("valid non-canonical header");
         assert_eq!(decoded.serial, 1);
-        assert_eq!(decoded.pdu, Pdu::Invalid { ident: 110 });
+        assert_eq!(decoded.pdu, Pdu::Invalid { ident: 112 });
     }
 
     #[test]
     fn decode_raw_async_accepts_valid_non_canonical_leb128_headers() {
         runtime::block_on(async {
-            let mut reader = runtime::Cursor::new(vec![0x84, 0x00, 0x81, 0x00, 0xEE, 0x00]);
+            let mut reader = runtime::Cursor::new(vec![0x84, 0x00, 0x81, 0x00, 0xF0, 0x00]);
             let decoded = Pdu::decode_async(&mut reader, None)
                 .await
                 .expect("valid non-canonical header");
             assert_eq!(decoded.serial, 1);
-            assert_eq!(decoded.pdu, Pdu::Invalid { ident: 110 });
+            assert_eq!(decoded.pdu, Pdu::Invalid { ident: 112 });
         });
     }
 

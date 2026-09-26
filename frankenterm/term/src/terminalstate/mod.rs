@@ -926,6 +926,19 @@ impl TerminalState {
         self.seqno = next_sequence_no(self.seqno);
     }
 
+    /// Move the primary screen's resident warm scrollback to the cold tier
+    /// (the fleet memory-pressure action). Returns the rows moved; the
+    /// sequence number advances only when rows moved, so renderers re-read
+    /// the changed scrollback extent.
+    pub fn evict_warm_scrollback(&mut self) -> usize {
+        let seqno = next_sequence_no(self.seqno);
+        let evicted = self.screen.screen.evict_warm_scrollback(seqno);
+        if evicted > 0 {
+            self.seqno = seqno;
+        }
+        evicted
+    }
+
     pub fn set_config(&mut self, config: Arc<dyn TerminalConfiguration>) {
         self.increment_seqno();
         self.osc52_prompt.replace(None);

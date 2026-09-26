@@ -541,13 +541,24 @@ impl<S: std::hash::BuildHasher> PaneScrollbackAccess
 #[derive(Debug, Clone, Default)]
 pub struct SnapshotPaneScrollbackAccess {
     snapshots: HashMap<u64, ScrollbackTierSnapshot>,
+    targeted: std::collections::BTreeSet<u64>,
 }
 
 impl SnapshotPaneScrollbackAccess {
     /// Create an adapter from pre-collected pane snapshots.
     #[must_use]
     pub fn new(snapshots: HashMap<u64, ScrollbackTierSnapshot>) -> Self {
-        Self { snapshots }
+        Self {
+            snapshots,
+            targeted: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// Panes the coordinator evicted warm pages from, ascending: the set the
+    /// runtime asks the mux to apply the eviction to.
+    #[must_use]
+    pub fn targeted_panes(&self) -> Vec<u64> {
+        self.targeted.iter().copied().collect()
     }
 
     fn evict_from_snapshot(snapshot: &mut ScrollbackTierSnapshot, count: usize) -> usize {
@@ -600,14 +611,21 @@ impl PaneScrollbackAccess for SnapshotPaneScrollbackAccess {
     }
 
     fn evict_warm_pages(&mut self, pane_id: u64, count: usize) -> usize {
-        self.snapshots
+        let evicted = self
+            .snapshots
             .get_mut(&pane_id)
-            .map_or(0, |snapshot| Self::evict_from_snapshot(snapshot, count))
+            .map_or(0, |snapshot| Self::evict_from_snapshot(snapshot, count));
+        if evicted > 0 {
+            self.targeted.insert(pane_id);
+        }
+        evicted
     }
 
     fn evict_all_warm(&mut self, pane_id: u64) {
         if let Some(snapshot) = self.snapshots.get_mut(&pane_id) {
-            Self::evict_from_snapshot(snapshot, snapshot.warm_pages);
+            if Self::evict_from_snapshot(snapshot, snapshot.warm_pages) > 0 {
+                self.targeted.insert(pane_id);
+            }
         }
     }
 }
@@ -1090,6 +1108,7 @@ mod tests {
 
         assert_eq!(pages, 2);
         assert_eq!(bytes, u64::MAX);
+        assert_eq!(access.targeted_panes(), vec![1, 2]);
         assert_eq!(targets, 2);
         assert_eq!(coord.telemetry().targets_applied, u64::MAX);
         assert_eq!(coord.telemetry().pages_evicted, u64::MAX);

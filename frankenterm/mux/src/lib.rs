@@ -4437,6 +4437,11 @@ mod pane_registration_handle {
             self.pane.get_tiered_scrollback_status()
         }
 
+        /// Move this pane's resident warm scrollback to the cold tier.
+        pub fn evict_warm_scrollback(&self) -> Option<usize> {
+            self.pane.evict_warm_scrollback()
+        }
+
         pub fn get_cursor_position(&self) -> crate::renderable::StableCursorPosition {
             self.pane.get_cursor_position()
         }

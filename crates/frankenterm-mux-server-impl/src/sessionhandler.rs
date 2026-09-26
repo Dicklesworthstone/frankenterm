@@ -9,10 +9,11 @@ use codec::GetLinesAtLayout;
 use codec::ReliablePaneWriteV1;
 use codec::{
     ActivatePaneDirection, AdjustPaneSize, CODEC_VERSION, CoherentPaneSnapshot, CreateFloatingPane,
-    CycleStack, DecodedPdu, EraseScrollbackRequest, ErrorResponse, GetClientList,
-    GetClientListResponse, GetCodecVersionResponse, GetImageCell, GetImageCellResponse, GetLines,
-    GetLinesResponse, GetPaneDirection, GetPaneDirectionResponse, GetPaneRenderChanges,
-    GetPaneRenderChangesResponse, GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse,
+    CycleStack, DecodedPdu, EraseScrollbackRequest, ErrorResponse,
+    EvictPaneWarmScrollbackV1Response, GetClientList, GetClientListResponse,
+    GetCodecVersionResponse, GetImageCell, GetImageCellResponse, GetLines, GetLinesResponse,
+    GetPaneDirection, GetPaneDirectionResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
+    GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse,
     GetPaneTieredScrollbackStatusesV1Response, GetSemanticZones, GetSemanticZonesResponse,
     GetTlsCredsResponse, InputSerial, KillPane, ListPanes, ListPanesCoherent,
     ListPanesCoherentOutcome, ListPanesCoherentResponse, ListPanesResponse, ListPanesTabStackEntry,
@@ -6969,6 +6970,39 @@ fn sample_tiered_scrollback_status(
     }
 }
 
+/// Move one exact pane registration's warm scrollback to the cold tier and
+/// sample its status afterwards, under the same panic boundary as the status
+/// batch so one faulty pane cannot fail its siblings' evictions.
+fn evict_warm_scrollback_and_sample(
+    pane_id: PaneId,
+    registration: Option<PaneRegistrationHandle>,
+) -> PaneTieredScrollbackStatusOutcomeV1 {
+    let evicted = catch_recoverable(
+        RecoverablePanicSite::MuxPaneCallback,
+        AssertUnwindSafe(|| {
+            let Some(registration) = registration else {
+                return PaneTieredScrollbackStatusOutcomeV1::Missing;
+            };
+            match registration.try_with_current(|current| {
+                current
+                    .evict_warm_scrollback()
+                    .and_then(|_| current.get_tiered_scrollback_status())
+            }) {
+                Some(Some(status)) => PaneTieredScrollbackStatusOutcomeV1::Available(status.into()),
+                Some(None) => PaneTieredScrollbackStatusOutcomeV1::Unavailable,
+                None => PaneTieredScrollbackStatusOutcomeV1::Closed,
+            }
+        }),
+    );
+    match evicted {
+        Ok(outcome) => outcome,
+        Err(_error) => {
+            log::warn!("warm scrollback eviction callback panicked for pane {pane_id}");
+            PaneTieredScrollbackStatusOutcomeV1::CallbackPanicked
+        }
+    }
+}
+
 fn record_tiered_scrollback_batch_outcomes(entries: &[PaneTieredScrollbackStatusEntryV1]) {
     let mut available = 0_u64;
     let mut unavailable = 0_u64;
@@ -9198,6 +9232,58 @@ impl SessionHandler {
                 );
             }
 
+            Pdu::EvictPaneWarmScrollbackV1(request) => {
+                if let Err(error) = request.validate() {
+                    let _ = error;
+                    send_response(Err(MuxServerRejection::invalid_request().into()));
+                    return;
+                }
+                let estimated_bytes = main_thread_rpc_estimated_bytes(
+                    request
+                        .pane_ids
+                        .len()
+                        .saturating_mul(std::mem::size_of::<PaneId>()),
+                );
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Interactive,
+                    estimated_bytes,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                metrics::counter!("mux.server.warm_scrollback_evict_requests")
+                                    .increment(1);
+                                let session = authority.acquire()?;
+                                // Capture every registration before any eviction, as the
+                                // status batch does, so identities are fixed at admission.
+                                #[allow(clippy::needless_collect)]
+                                let registrations = request
+                                    .pane_ids
+                                    .into_iter()
+                                    .map(|pane_id| (pane_id, session.capture_current_pane(pane_id)))
+                                    .collect::<Vec<_>>();
+                                let entries = registrations
+                                    .into_iter()
+                                    .map(|(pane_id, registration)| {
+                                        PaneTieredScrollbackStatusEntryV1 {
+                                            pane_id,
+                                            outcome: evict_warm_scrollback_and_sample(
+                                                pane_id,
+                                                registration,
+                                            ),
+                                        }
+                                    })
+                                    .collect::<Vec<_>>();
+                                let response = EvictPaneWarmScrollbackV1Response { entries };
+                                response.validate()?;
+                                Ok(Pdu::EvictPaneWarmScrollbackV1Response(response))
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
+            }
+
             Pdu::GetPaneRenderChanges(GetPaneRenderChanges { pane_id, .. }) => {
                 let Some(registration) =
                     capture_pane_or_respond_liveness(&authority, pane_id, &send_response)
@@ -10217,6 +10303,7 @@ impl SessionHandler {
             | Pdu::TabAddedToWindow { .. }
             | Pdu::GetPaneRenderableDimensionsResponse { .. }
             | Pdu::GetPaneTieredScrollbackStatusesV1Response { .. }
+            | Pdu::EvictPaneWarmScrollbackV1Response { .. }
             | Pdu::ReliableKeyEventV1Response { .. }
             | Pdu::ReliablePaneWriteV1Response { .. }
             | Pdu::ErrorResponse { .. }) => {
@@ -14104,6 +14191,15 @@ mod tests {
             self.state.lock().unwrap().tiered_scrollback_status
         }
 
+        fn evict_warm_scrollback(&self) -> Option<usize> {
+            let mut state = self.state.lock().unwrap();
+            let status = state.tiered_scrollback_status.as_mut()?;
+            let evicted = status.warm_resident_lines;
+            status.warm_resident_lines = 0;
+            status.warm_resident_bytes = 0;
+            Some(evicted)
+        }
+
         fn get_title(&self) -> String {
             self.state.lock().unwrap().title.clone()
         }
@@ -16607,6 +16703,65 @@ mod tests {
             render_callback_calls.load(Ordering::Relaxed),
             0,
             "health sampling must not enter the render-delta callback graph"
+        );
+    }
+
+    #[test]
+    fn warm_scrollback_eviction_moves_warm_rows_and_reports_status_after() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let tiered = Arc::new(FakePane::new_with_id(7, None));
+        tiered.set_tiered_scrollback_status(Some(sample_tiered_scrollback_status(41)));
+        let untiered = Arc::new(FakePane::new_with_id(8, None));
+        let tiered_dyn: Arc<dyn Pane> = tiered.clone();
+        let untiered_dyn: Arc<dyn Pane> = untiered;
+        mux.add_pane(&tiered_dyn).expect("register tiered pane");
+        mux.add_pane(&untiered_dyn).expect("register untiered pane");
+        let (sender, captured) = capturing_sender();
+        let mut handler =
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux))).unwrap();
+
+        handler.process_one(DecodedPdu {
+            serial: 402,
+            pdu: Pdu::EvictPaneWarmScrollbackV1(codec::EvictPaneWarmScrollbackV1 {
+                pane_ids: vec![7, 8, 9],
+            }),
+        });
+        tick_until_response(&executor, &captured, 1);
+
+        let Pdu::EvictPaneWarmScrollbackV1Response(response) = take_response(&captured).pdu else {
+            panic!("expected warm scrollback eviction response");
+        };
+        let mut after = sample_tiered_scrollback_status(41);
+        after.warm_resident_lines = 0;
+        after.warm_resident_bytes = 0;
+        assert_eq!(
+            response.entries,
+            vec![
+                PaneTieredScrollbackStatusEntryV1 {
+                    pane_id: 7,
+                    outcome: PaneTieredScrollbackStatusOutcomeV1::Available(after.into()),
+                },
+                PaneTieredScrollbackStatusEntryV1 {
+                    pane_id: 8,
+                    outcome: PaneTieredScrollbackStatusOutcomeV1::Unavailable,
+                },
+                PaneTieredScrollbackStatusEntryV1 {
+                    pane_id: 9,
+                    outcome: PaneTieredScrollbackStatusOutcomeV1::Missing,
+                },
+            ]
+        );
+        assert_eq!(
+            tiered
+                .get_tiered_scrollback_status()
+                .map(|s| s.warm_resident_bytes),
+            Some(0),
+            "the pane itself must have released its warm rows"
         );
     }
 
