@@ -6568,6 +6568,28 @@ impl ObservationRuntime {
                     } else {
                         BudgetLevel::Normal
                     };
+                    // The same per-pane classification, counted for the
+                    // resource cockpit's pane_budget domain.
+                    let pane_budget_evidence = pane_budget_config.enabled.then(|| {
+                        let mut evidence = crate::runtime_telemetry::PaneBudgetCockpitEvidence {
+                            panes: fleet_pane_infos.len(),
+                            throttled: 0,
+                            over_budget: 0,
+                            per_pane_budget_bytes: pane_budget_config.per_pane_budget_bytes,
+                        };
+                        for pane in &fleet_pane_infos {
+                            match classify_pane_budget_level(
+                                u64::try_from(pane.estimated_memory_bytes).unwrap_or(u64::MAX),
+                                pane_budget_config.per_pane_budget_bytes,
+                                pane_budget_config.high_ratio,
+                            ) {
+                                BudgetLevel::Normal => {}
+                                BudgetLevel::Throttled => evidence.throttled += 1,
+                                BudgetLevel::OverBudget => evidence.over_budget += 1,
+                            }
+                        }
+                        evidence
+                    });
                     // Drive the coordinator from the runtime's actual pressure
                     // surfaces instead of cursor-derived placeholders:
                     // - queue depths via BackpressureManager
@@ -6814,7 +6836,8 @@ impl ObservationRuntime {
                                 None,
                                 None,
                                 None,
-                            ),
+                            )
+                            .with_pane_budget_evidence(pane_budget_evidence),
                         ),
                         leak_risk_inventory,
                     };

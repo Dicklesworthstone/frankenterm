@@ -8105,6 +8105,21 @@ pub struct SwarmResourceCockpitLatencyCohort {
     pub p99_over_model_ratio: Option<f64>,
 }
 
+/// The watcher's per-pane scrollback budget classification, for the cockpit's
+/// `pane_budget` domain: how many observed panes sit at or above the
+/// `[fleet_scrollback]` high-water ratio (throttled) or over the budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneBudgetCockpitEvidence {
+    /// Panes classified this tick.
+    pub panes: usize,
+    /// Panes at or above the high-water ratio but under the budget.
+    pub throttled: usize,
+    /// Panes over the per-pane budget.
+    pub over_budget: usize,
+    /// The configured per-pane budget.
+    pub per_pane_budget_bytes: u64,
+}
+
 /// Operator-facing mitigation or drilldown row for the resource cockpit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmResourceCockpitDrilldown {
@@ -8522,6 +8537,68 @@ impl SwarmResourceCockpitSnapshot {
         self
     }
 
+    /// Return this cockpit with its `pane_budget` domain measured from the
+    /// watcher's per-pane scrollback budget classification.
+    #[must_use]
+    pub fn with_pane_budget(mut self, evidence: PaneBudgetCockpitEvidence) -> Self {
+        let tier = if evidence.over_budget > 0 {
+            FleetPressureTier::Critical
+        } else if evidence.throttled > 0 {
+            FleetPressureTier::Elevated
+        } else {
+            FleetPressureTier::Normal
+        };
+        let pressured = evidence.over_budget + evidence.throttled;
+        let mut metrics = BTreeMap::new();
+        for (key, value) in [
+            ("panes", evidence.panes),
+            ("throttled_panes", evidence.throttled),
+            ("over_budget_panes", evidence.over_budget),
+        ] {
+            metrics.insert(
+                key.to_string(),
+                serde_json::Value::from(u64::try_from(value).unwrap_or(u64::MAX)),
+            );
+        }
+        metrics.insert(
+            "per_pane_budget_bytes".to_string(),
+            serde_json::Value::from(evidence.per_pane_budget_bytes),
+        );
+        let (summary, action, reason) = if pressured == 0 {
+            (
+                "pane budgets within limits".to_string(),
+                "none",
+                "resource.proof.healthy",
+            )
+        } else {
+            (
+                format!(
+                    "{} of {} panes over their scrollback budget, {} near it",
+                    evidence.over_budget, evidence.panes, evidence.throttled
+                ),
+                "inspect_pane_budgets",
+                "resource.memory.pane_budget",
+            )
+        };
+        self.domains.pane_budget = swarm_resource_cockpit_measured_domain(
+            "pane_budget",
+            fleet_pressure_tier_name(tier),
+            summary.clone(),
+            action,
+            vec![reason.to_string()],
+            metrics,
+        );
+        if pressured > 0 {
+            self.drilldowns.push(SwarmResourceCockpitDrilldown {
+                subject: "pane_budget".to_string(),
+                reason_code: reason.to_string(),
+                detail: summary,
+            });
+        }
+        self.evidence_state = swarm_resource_cockpit_root_evidence_state(&self.domains);
+        self
+    }
+
     /// Concise stable rows for the human doctor surface.
     #[must_use]
     pub fn compact_table_rows(&self) -> Vec<String> {
@@ -8914,6 +8991,23 @@ impl SwarmCapacityOperatorSummary {
                     action_receipt_report,
                 );
             self.resource_cockpit = Some(cockpit);
+        }
+        self
+    }
+
+    /// Return this summary with the cockpit's `pane_budget` domain measured,
+    /// when the watcher classified per-pane budgets (`None` leaves it
+    /// unavailable, e.g. `[fleet_scrollback] enabled = false`).
+    #[must_use]
+    pub fn with_pane_budget_evidence(
+        mut self,
+        evidence: Option<PaneBudgetCockpitEvidence>,
+    ) -> Self {
+        if let Some(evidence) = evidence {
+            self.resource_cockpit = self
+                .resource_cockpit
+                .take()
+                .map(|cockpit| cockpit.with_pane_budget(evidence));
         }
         self
     }
@@ -17436,6 +17530,59 @@ mod tests {
             resource_admission: cockpit_domain_for_test("resource_admission", evidence_state),
             action_receipts: cockpit_domain_for_test("action_receipts", evidence_state),
         }
+    }
+
+    #[test]
+    fn pane_budget_evidence_measures_the_cockpit_domain() {
+        let base =
+            || SwarmCapacityOperatorSummary::unavailable(1_700_000_000_001, 2, "test.missing");
+        let domain = |summary: &SwarmCapacityOperatorSummary| {
+            summary
+                .resource_cockpit
+                .as_ref()
+                .expect("level 2 includes cockpit")
+                .domains
+                .pane_budget
+                .clone()
+        };
+
+        // No classification (budget disabled): cockpit kept, domain unavailable.
+        let untouched = base().with_pane_budget_evidence(None);
+        assert_eq!(
+            domain(&untouched).evidence_state,
+            SwarmResourceCockpitEvidenceState::Unavailable
+        );
+
+        let healthy = base().with_pane_budget_evidence(Some(PaneBudgetCockpitEvidence {
+            panes: 4,
+            throttled: 0,
+            over_budget: 0,
+            per_pane_budget_bytes: 262_144,
+        }));
+        let row = domain(&healthy);
+        assert_eq!(
+            row.evidence_state,
+            SwarmResourceCockpitEvidenceState::Measured
+        );
+        assert_eq!(row.pressure_tier, "normal");
+        assert_eq!(row.reason_codes, vec!["resource.proof.healthy".to_string()]);
+
+        let pressured = base().with_pane_budget_evidence(Some(PaneBudgetCockpitEvidence {
+            panes: 4,
+            throttled: 1,
+            over_budget: 2,
+            per_pane_budget_bytes: 262_144,
+        }));
+        let row = domain(&pressured);
+        assert_eq!(row.pressure_tier, "critical");
+        assert_eq!(row.metrics["over_budget_panes"], 2);
+        assert_eq!(row.metrics["throttled_panes"], 1);
+        // Contract: a critical row carries a reason code and a drilldown.
+        let cockpit = pressured.resource_cockpit.as_ref().expect("cockpit");
+        assert!(cockpit.drilldowns.iter().any(|drilldown| {
+            drilldown.subject == "pane_budget"
+                && drilldown.reason_code == "resource.memory.pane_budget"
+        }));
     }
 
     #[test]
