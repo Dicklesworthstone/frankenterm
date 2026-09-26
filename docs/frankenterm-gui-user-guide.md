@@ -443,6 +443,13 @@ ft mcp serve
   many panes are open. `ft doctor` reports the panes' combined warm usage and
   per-pane cap (`mux scrollback`), and names any other config file whose
   `scrollback_lines` disagrees with the active one.
+- `ft watch` also relieves scrollback pressure itself. When its fleet
+  coordinator reaches critical pressure (a pane over
+  `[fleet_scrollback] per_pane_budget_bytes`, default 1 GiB, or host memory
+  pressure), it asks the mux to move the targeted panes' warm scrollback to the
+  cold tier and logs the bytes the mux reports releasing (maintenance event
+  `fleet_scrollback_coordinator`). This needs a mux of codec 67 or newer; with
+  an older mux the eviction is only logged as a recommendation.
 - If capture load is high, increase `ingest.poll_interval_ms` and/or lower `max_concurrent_captures`.
 - Native state/lifecycle hints use bounded buffering and can be dropped under
   pressure or an indeterminate socket write. Polling remains the authoritative
