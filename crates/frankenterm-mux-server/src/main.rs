@@ -241,6 +241,12 @@ fn main() {
 fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Result<()> {
     //stats::Stats::init()?;
     config::designate_this_as_the_main_thread();
+    // The codec handshake announces this string to every client; without it
+    // clients (skew errors, `ft doctor`) saw the upstream placeholder text.
+    config::assign_version_info(
+        concat!("frankenterm-mux-server ", env!("CARGO_PKG_VERSION")),
+        std::env::consts::ARCH,
+    );
     let _saver = umask::UmaskSaver::new();
 
     let opts = Opt::parse();

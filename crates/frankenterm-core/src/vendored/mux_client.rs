@@ -1447,9 +1447,23 @@ impl Drop for TextReadDiagnostics {
     }
 }
 
+/// What the mux announced about itself in the codec handshake.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MuxPeerGeneration {
+    /// The server's build identity (`version_string`).
+    pub version: String,
+    /// Highest codec version the server speaks.
+    pub codec: usize,
+    /// Lowest codec version the server accepts.
+    pub codec_min: usize,
+    /// Codec version this connection agreed on.
+    pub agreed: usize,
+}
+
 pub struct DirectMuxClient {
     connection_id: u64,
     protocol_state: DirectMuxProtocolState,
+    peer_generation: Option<MuxPeerGeneration>,
     stream: UnixStream,
     socket_path: PathBuf,
     read_buf: StreamingPduBuffer,
@@ -2307,6 +2321,7 @@ impl DirectMuxClient {
         let mut client = Self {
             connection_id,
             protocol_state: DirectMuxProtocolState::AwaitingCodec { connection_id },
+            peer_generation: None,
             stream,
             compression_mode,
             socket_path,
@@ -2379,6 +2394,12 @@ impl DirectMuxClient {
     #[must_use]
     pub(super) fn is_connection_poisoned(&self) -> bool {
         self.connection_poisoned
+    }
+
+    /// The mux's announced generation, known once the codec handshake passed.
+    #[must_use]
+    pub fn peer_generation(&self) -> Option<&MuxPeerGeneration> {
+        self.peer_generation.as_ref()
     }
 
     /// Process-local, non-reusing identity for this exact transport instance.
@@ -3469,6 +3490,12 @@ impl DirectMuxClient {
                     remote_min,
                     agreed,
                 };
+                self.peer_generation = Some(MuxPeerGeneration {
+                    version: payload.version_string.clone(),
+                    codec: payload.codec_vers,
+                    codec_min: remote_min,
+                    agreed,
+                });
                 self.protocol_state =
                     DirectMuxProtocolState::AwaitingRegistration { codec: negotiated };
                 Ok(payload)
@@ -6449,6 +6476,20 @@ mod tests {
 
             let config = direct_mux_client_config(socket_path);
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
+            // ft-xxfwy.7: the handshake keeps what the mux announced, for
+            // `ft doctor`'s mux generation row.
+            let peer = client
+                .peer_generation()
+                .expect("handshake records the peer generation");
+            assert_eq!(peer.version, "wezterm-test");
+            assert_eq!(
+                (peer.codec, peer.codec_min, peer.agreed),
+                (
+                    CODEC_VERSION,
+                    codec::CODEC_VERSION_MIN_SUPPORTED,
+                    CODEC_VERSION
+                )
+            );
             let panes = client.list_panes().await.expect("list panes");
             assert_eq!(panes.tabs, [] as [mux::tab::PaneNode; 0]);
         });

@@ -98515,6 +98515,75 @@ fn mux_socket_diagnostic(
     }
 }
 
+/// Report the generation of the mux behind the discovered socket and whether
+/// this `ft` pairs with it (ft-xxfwy.7). One read-only handshake connection;
+/// no row when no socket was discovered (the `mux socket` row covers that).
+#[cfg(all(feature = "vendored", unix))]
+async fn mux_generation_diagnostic(
+    cx: &frankenterm_core::cx::Cx,
+    socket: Option<&frankenterm_core::wezterm::DiscoveredMuxSocket>,
+) -> Option<DiagnosticCheck> {
+    use frankenterm_core::vendored::{DirectMuxClient, DirectMuxClientConfig, DirectMuxError};
+
+    let socket = socket?;
+    let local = format!(
+        "ft {} (codec {}, accepts {}..={})",
+        env!("CARGO_PKG_VERSION"),
+        codec::CODEC_VERSION,
+        codec::CODEC_VERSION_MIN_SUPPORTED,
+        codec::CODEC_VERSION
+    );
+    let config = DirectMuxClientConfig::default().with_socket_path(socket.path.clone());
+    let check = match DirectMuxClient::connect_with_cx(cx, config).await {
+        Ok(client) => match client.peer_generation() {
+            Some(peer) => DiagnosticCheck::ok_with_detail(
+                "mux generation",
+                bounded_terminal_diagnostic(
+                    &format!(
+                        "paired: mux {} (codec {}, accepts {}..={}), agreed codec {}; {local}",
+                        peer.version, peer.codec, peer.codec_min, peer.codec, peer.agreed
+                    ),
+                    512,
+                    2_048,
+                ),
+            ),
+            None => DiagnosticCheck::warning(
+                "mux generation",
+                "connected, but the mux announced no generation",
+                "Run `ft robot state` to confirm the pairing",
+            ),
+        },
+        Err(DirectMuxError::IncompatibleCodec {
+            remote,
+            remote_min,
+            remote_version,
+            ..
+        }) => DiagnosticCheck::error(
+            "mux generation",
+            bounded_terminal_diagnostic(
+                &format!(
+                    "version skew: mux {remote_version} (codec {remote}, accepts \
+                     {remote_min}..={remote}) cannot pair with {local}"
+                ),
+                512,
+                2_048,
+            ),
+            "Install matching generations of ft and FrankenTerm.app (install.sh --version \
+             <the app's version>), or restart the mux from this ft's release",
+        ),
+        Err(error) => DiagnosticCheck::warning(
+            "mux generation",
+            bounded_terminal_diagnostic(
+                &format!("unknown: handshake with the mux failed ({error})"),
+                512,
+                2_048,
+            ),
+            "Check that the mux socket above belongs to a running FrankenTerm mux",
+        ),
+    };
+    Some(check)
+}
+
 /// Run all diagnostic checks and return results
 async fn run_diagnostics(
     cx: &frankenterm_core::cx::Cx,
@@ -98841,6 +98910,10 @@ async fn run_diagnostics(
     }
     checks.push(vendored_compatibility_diagnostic(&backend_selection));
     checks.push(mux_socket_diagnostic(mux_client.discovered_socket()));
+    #[cfg(all(feature = "vendored", unix))]
+    if let Some(check) = mux_generation_diagnostic(cx, mux_client.discovered_socket()).await {
+        checks.push(check);
+    }
 
     // Check 3: WezTerm scrollback configuration
     match check_wezterm_scrollback() {
