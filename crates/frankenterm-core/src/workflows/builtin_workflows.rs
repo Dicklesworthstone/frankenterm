@@ -1377,7 +1377,9 @@ impl HandleUsageLimits {
                 StepResult::cont()
             }
             1 => {
-                let wezterm = default_wezterm_handle();
+                // Read the pane through the workflow's own client: on a
+                // vendored mux the default (external-CLI) handle cannot see it.
+                let wezterm = ctx.wezterm_client().unwrap_or_else(default_wezterm_handle);
                 let source = WeztermHandleSource::new(Arc::clone(&wezterm));
                 let options = CodexExitOptions::default();
                 let control_cx = cx.clone();

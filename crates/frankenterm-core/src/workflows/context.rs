@@ -167,6 +167,16 @@ impl WorkflowContext {
         &self.capabilities
     }
 
+    /// The terminal client this workflow's sends go through, for reads that
+    /// must reach the same mux (the default handle only knows the external
+    /// WezTerm CLI). `None` when no injector is configured.
+    #[must_use]
+    pub fn wezterm_client(&self) -> Option<crate::wezterm::WeztermHandle> {
+        self.injector
+            .as_ref()
+            .map(|injector| Arc::clone(injector.client()))
+    }
+
     /// Update the pane capabilities snapshot
     pub fn update_capabilities(&mut self, capabilities: PaneCapabilities) {
         self.capabilities = capabilities;

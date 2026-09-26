@@ -69419,8 +69419,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 }
                 println!("Press Ctrl+C to stop...");
 
-                // Poll pane output via WezTerm CLI
-                let wez = frankenterm_core::wezterm::WeztermClient::new();
+                // Poll pane output through the configured mux client (the
+                // vendored direct mux when available). A bare WeztermClient only
+                // knows the external WezTerm CLI, so on a vendored-only install
+                // every recording failed at its first capture with 0 frames.
+                let wez = frankenterm_core::wezterm::build_unified_client(&config);
                 let mut last_text = String::new();
                 let start = std::time::Instant::now();
 
@@ -69434,7 +69437,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         }
                     }
 
-                    match Box::pin(wez.get_text_with_cx(&record_cx, pane_id, false)).await {
+                    match Box::pin(frankenterm_core::wezterm::MuxInterface::get_text_with_cx(
+                        &wez, &record_cx, pane_id, false,
+                    ))
+                    .await
+                    {
                         Ok(text) => {
                             if text != last_text {
                                 let delta = if last_text.is_empty() {
@@ -71522,8 +71529,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             // the main async runtime. The ProductionQueryClient creates its
             // own dedicated runtime for async operations.
             let layout_clone = layout.clone();
+            let mux_config = config.clone();
             let result = frankenterm_core::runtime_async::spawn_blocking(move || {
-                let query_client = ProductionQueryClient::with_storage(layout_clone, storage);
+                // The configured mux client (vendored direct mux when available);
+                // the default handle only knows the external WezTerm CLI.
+                let wezterm: frankenterm_core::wezterm::WeztermHandle =
+                    Arc::new(frankenterm_core::wezterm::build_unified_client(&mux_config));
+                let query_client =
+                    ProductionQueryClient::with_storage_and_wezterm(layout_clone, storage, wezterm);
                 run_tui(query_client, tui_config)
             })
             .await
@@ -71563,8 +71576,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             };
 
             let layout_clone = layout.clone();
+            let mux_config = config.clone();
             let result = frankenterm_core::runtime_async::spawn_blocking(move || {
-                let query_client = ProductionQueryClient::with_storage(layout_clone, storage);
+                // The configured mux client (vendored direct mux when available);
+                // the default handle only knows the external WezTerm CLI.
+                let wezterm: frankenterm_core::wezterm::WeztermHandle =
+                    Arc::new(frankenterm_core::wezterm::build_unified_client(&mux_config));
+                let query_client =
+                    ProductionQueryClient::with_storage_and_wezterm(layout_clone, storage, wezterm);
                 run_tui(query_client, tui_config)
             })
             .await
@@ -71610,8 +71629,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             };
 
             let layout_clone = layout.clone();
+            let mux_config = config.clone();
             let result = frankenterm_core::runtime_async::spawn_blocking(move || {
-                let query_client = ProductionQueryClient::with_storage(layout_clone, storage);
+                // The configured mux client (vendored direct mux when available);
+                // the default handle only knows the external WezTerm CLI.
+                let wezterm: frankenterm_core::wezterm::WeztermHandle =
+                    Arc::new(frankenterm_core::wezterm::build_unified_client(&mux_config));
+                let query_client =
+                    ProductionQueryClient::with_storage_and_wezterm(layout_clone, storage, wezterm);
                 run_tui(query_client, tui_config)
             })
             .await
