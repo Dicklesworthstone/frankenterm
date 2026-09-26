@@ -1490,6 +1490,7 @@ fn writer_loop_does_not_dispatch_commands_queued_after_shutdown() {
         false,
         None,
         false,
+        None,
     );
     let conn = backend
         .into_connection()
@@ -1503,6 +1504,30 @@ fn writer_loop_does_not_dispatch_commands_queued_after_shutdown() {
         )
         .unwrap();
     assert_eq!(segment_count, 0);
+}
+
+#[test]
+fn storage_handle_publishes_the_writer_io_summary_after_writes_drain() {
+    run_async_test(async {
+        let db_path = temp_db_path();
+        let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+        for i in 0..5 {
+            handle
+                .append_segment(1, &format!("Content {i}"), None)
+                .await
+                .unwrap();
+        }
+
+        // Every append was acknowledged, so the writer drained to empty and
+        // published an idle summary for the cockpit.
+        let summary = handle
+            .storage_io_operator_summary()
+            .expect("the writer publishes after its first batch");
+        assert_eq!(summary.pressure_domain, "storage_io");
+        assert_eq!(summary.aggregate_queue_depth, 0);
+        assert_eq!(summary.write_error_total, 0);
+    });
 }
 
 #[test]
