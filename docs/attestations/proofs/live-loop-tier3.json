@@ -5,10 +5,10 @@
   "panes": "scripted (no model calls)",
   "build_profile": "release-perf",
   "pane_count": 51,
-  "robot_state_p95_ms": 37,
+  "robot_state_p95_ms": 17,
   "host": "Mac-mini-max",
-  "generated_at": "2026-09-26T06:02:23Z",
-  "commit": "629d06a1f8a620f4ee991800323e250577ef618b",
+  "generated_at": "2026-09-26T06:08:15Z",
+  "commit": "8a86f84d3aeaceac915b5a29b07622cf9dc56bd5",
   "crates_dirty": false,
   "ft_version": "ft 0.15.21 (6f8a06e00c890da26bb54b914da347ecdf40f69f)",
   "status": "pass",
@@ -66,17 +66,31 @@
     {
       "name": "hot_to_warm_scrollback_spill_observed",
       "ok": true,
-      "detail": "1489792 lines spilled to warm"
+      "detail": "1489796 lines spilled to warm"
     },
     {
       "name": "detection_latency_p95_under_5s",
       "ok": true,
-      "detail": "p95 173 ms over 38/38 fired panes"
+      "detail": "p95 185 ms over 38/38 fired panes"
+    },
+    {
+      "name": "no_capture_gaps_except_explicit_resets",
+      "ok": true,
+      "detail": ""
     },
     {
       "name": "robot_state_p95_under_500ms",
       "ok": true,
-      "detail": "37 ms (release-perf build)"
+      "detail": "17 ms (release-perf build)"
     }
-  ]
+  ],
+  "memory_attribution": {
+    "mux_scrollback": "51 panes: 179.4 MiB warm resident; warm cap per pane 0.0-50.0 MiB, up to 2550.0 MiB across panes (the mux setting scrollback_warm_fleet_max_mb caps that total)",
+    "last_health_sample": {
+      "t": 1790402891.976017,
+      "fleet_pressure_tier": "Critical",
+      "warm_spill_lines_total": 1489796,
+      "observed_panes": 51
+    }
+  }
 }
