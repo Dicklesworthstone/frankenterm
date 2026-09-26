@@ -7,7 +7,7 @@ use crate::line::clusterline::ClusteredLine;
 use crate::line::linebits::LineBits;
 use crate::line::storage::{CellStorage, VisibleCellIter};
 use crate::line::vecstorage::{HyperlinkCellMatch, VecStorage};
-use crate::{Change, SEQ_ZERO, SequenceNo};
+use crate::{Change, SequenceNo, SEQ_ZERO};
 use alloc::borrow::Cow;
 use alloc::sync::Arc;
 #[cfg(feature = "appdata")]
@@ -4385,10 +4385,9 @@ mod tests {
                         .flat_map(|row| row.visible_cells().map(|cell| cell.str().to_owned()))
                         .collect();
                     assert_eq!(actual, expected);
-                    assert!(
-                        rows.iter()
-                            .all(|row| row.visible_cells().all(|cell| cell.attrs().italic()))
-                    );
+                    assert!(rows
+                        .iter()
+                        .all(|row| row.visible_cells().all(|cell| cell.attrs().italic())));
                     let geometry = LineWrapGeometry::capture(&source, 1 << 20).unwrap();
                     assert_eq!(geometry.row_count(cols, model, &mut scratch), rows.len());
                     assert_eq!(
@@ -4678,11 +4677,9 @@ mod tests {
             None
         );
         assert_eq!(scratch, unchanged);
-        assert!(
-            geometry
-                .row_count_with_budget(3, model, &mut scratch, bound)
-                .is_some()
-        );
+        assert!(geometry
+            .row_count_with_budget(3, model, &mut scratch, bound)
+            .is_some());
         assert_eq!(
             geometry.row_count_with_budget(100, model, &mut scratch, 0),
             None,
@@ -5023,10 +5020,13 @@ mod tests {
 
         let mut bytes = byte_cost - 1;
         let mut work = work_cost;
-        assert!(
-            Line::try_clone_batch_for_snapshot(first_slice, second_slice, &mut bytes, &mut work,)
-                .is_none()
-        );
+        assert!(Line::try_clone_batch_for_snapshot(
+            first_slice,
+            second_slice,
+            &mut bytes,
+            &mut work,
+        )
+        .is_none());
         assert_eq!(
             bytes,
             byte_cost - 1 - first_cost,
@@ -6867,11 +6867,9 @@ mod tests {
                     assert_eq!(layout.materialize_rows(start..end, 9), expected[start..end]);
                 }
                 assert_eq!(layout.materialize_rows(0..usize::MAX, 9), expected);
-                assert!(
-                    layout
-                        .materialize_rows(usize::MAX..usize::MAX, 9)
-                        .is_empty()
-                );
+                assert!(layout
+                    .materialize_rows(usize::MAX..usize::MAX, 9)
+                    .is_empty());
                 let start = 2;
                 assert!(layout.materialize_rows(start..1, 9).is_empty());
             }
@@ -7423,13 +7421,11 @@ mod tests {
         let mut changed = rows.clone();
         changed[1].cells_mut()[0] = Cell::new('X', CellAttributes::default());
         assert!(Line::try_join_deferred_logical_rows(changed.iter(), 10).is_none());
-        assert!(
-            Line::try_join_deferred_logical_rows(
-                rows.iter().take(1).chain(rows.iter().skip(2)),
-                10,
-            )
-            .is_none()
-        );
+        assert!(Line::try_join_deferred_logical_rows(
+            rows.iter().take(1).chain(rows.iter().skip(2)),
+            10,
+        )
+        .is_none());
     }
 
     #[cfg(feature = "std")]

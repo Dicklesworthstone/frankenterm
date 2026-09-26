@@ -31,7 +31,9 @@ fn robot_families(main_rs: &str) -> BTreeSet<String> {
     let mut inside = false;
     for line in main_rs.lines() {
         if !inside {
-            inside = line.trim_start_matches("pub ").starts_with("enum RobotCommands {");
+            inside = line
+                .trim_start_matches("pub ")
+                .starts_with("enum RobotCommands {");
             continue;
         }
         if line.starts_with('}') {
@@ -99,7 +101,11 @@ fn matrix_covers_every_robot_family_and_mcp_tool_exactly_once() {
     let tools = mcp_tools(&read(
         "crates/frankenterm-core/tests/fixtures/mcp_manifest.json",
     ));
-    assert!(families.len() > 40, "parsed only {} families", families.len());
+    assert!(
+        families.len() > 40,
+        "parsed only {} families",
+        families.len()
+    );
     assert!(tools.len() > 30, "parsed only {} tools", tools.len());
 
     let rows = matrix_rows(&read(MATRIX_PATH));
@@ -120,7 +126,10 @@ fn matrix_covers_every_robot_family_and_mcp_tool_exactly_once() {
         .filter(|(_, count)| **count > 1)
         .map(|(name, _)| name.as_str())
         .collect();
-    assert!(duplicated.is_empty(), "listed more than once: {duplicated:?}");
+    assert!(
+        duplicated.is_empty(),
+        "listed more than once: {duplicated:?}"
+    );
 
     let listed_families: BTreeSet<String> = family_rows.into_keys().collect();
     let listed_tools: BTreeSet<String> = tool_rows.into_keys().collect();
