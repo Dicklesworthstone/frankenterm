@@ -1,0 +1,45 @@
+{
+  "schema": "ft.live-loop-proof.v1",
+  "tier": "1-seed",
+  "adapter": "live-mux",
+  "panes": "real Claude Code (haiku, real /compact) + real Codex + zsh with OSC 133",
+  "ft_version": "ft 0.15.21 (6ad62e75af81d998451f19ed7a3a447148a02310+dirty)",
+  "agent_version": "2.1.283 (Claude Code)",
+  "host": "Mac-mini-max",
+  "generated_at": "2026-09-26T01:17:23Z",
+  "commit": "6ad62e75af81d998451f19ed7a3a447148a02310",
+  "crates_dirty": false,
+  "status": "pass",
+  "checks": [
+    {
+      "name": "real_compaction_detected",
+      "ok": true,
+      "detail": "claude_code.compaction"
+    },
+    {
+      "name": "workflow_send_verified_submitted",
+      "ok": true,
+      "detail": "audit send_text verification state"
+    },
+    {
+      "name": "agent_took_a_turn_on_workflow_prompt",
+      "ok": true,
+      "detail": "prompt, finished turn, empty composer"
+    },
+    {
+      "name": "codex_verified_submit_answered",
+      "ok": true,
+      "detail": "pane 1"
+    },
+    {
+      "name": "shell_send_allowed_on_live_prompt_and_ran",
+      "ok": true,
+      "detail": "pane 2"
+    },
+    {
+      "name": "operator_claude_install_not_in_temp",
+      "ok": true,
+      "detail": "/Users/jemanuel/.local/share/claude/versions/2.1.283 -> /Users/jemanuel/.local/share/claude/versions/2.1.283"
+    }
+  ]
+}
