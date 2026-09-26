@@ -86,7 +86,10 @@ step "same_generation" $? "$t" "ft ${FT_COMMIT:0:9}; gui: $GUI_VERSION"
 
 # 2. Doctor sees the GUI's mux and pairs with it.
 t=$(now)
+# Discovery logs every socket candidate at debug; keep that trace with the run.
+ENVV+=("RUST_LOG=frankenterm_core::wezterm=debug")
 ft doctor --json > "$OUT/doctor.json" 2> "$OUT/doctor.err"
+unset 'ENVV[${#ENVV[@]}-1]'
 python3 - "$OUT/doctor.json" << 'PY'
 import json, sys
 t = open(sys.argv[1]).read()
@@ -111,12 +114,13 @@ PANE=$(python3 -c 'import json,sys;t=open(sys.argv[1]).read();print(json.loads(t
 step "profile_apply_opens_a_gui_pane" $? "$t" "pane ${PANE:-none}"
 sleep 3
 
-# 4. robot state lists it.
+# 4. robot state lists it, within 2 s (discovery + dial + list, cold process).
 t=$(now)
 ft robot --format json state > "$OUT/state.json" 2> /dev/null
+STATE_MS=$(python3 -c 'import sys,time;print(int((time.time()-float(sys.argv[1]))*1000))' "$t")
 python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));p=d.get("data",d);p=p.get("panes",p) if isinstance(p,dict) else p;sys.exit(0 if any(str(x.get("pane_id"))==sys.argv[2] for x in p) else 1)' \
-  "$OUT/state.json" "${PANE:--1}"
-step "robot_state_lists_the_pane" $? "$t" "pane ${PANE:-none}"
+  "$OUT/state.json" "${PANE:--1}" && [[ "$STATE_MS" -lt 2000 ]]
+step "robot_state_lists_the_pane" $? "$t" "pane ${PANE:-none}; ${STATE_MS} ms (bound 2000)"
 
 # 5. get-text returns the marker.
 t=$(now)
