@@ -24,7 +24,7 @@ const STORAGE_TAIL_BATCH: usize = 256;
 /// detection. Unknown agent/severity labels fall back to the least-privileged
 /// variants instead of dropping the event, so a malformed row is still
 /// visible to stream consumers.
-fn stored_event_to_bus_event(stored: StoredEvent) -> Event {
+pub(super) fn stored_event_to_bus_event(stored: StoredEvent) -> Event {
     let agent_type = serde_json::from_value(serde_json::Value::String(stored.agent_type.clone()))
         .unwrap_or(AgentType::Unknown);
     let severity = serde_json::from_value(serde_json::Value::String(stored.severity.clone()))

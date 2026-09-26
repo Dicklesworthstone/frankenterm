@@ -443,6 +443,51 @@ pub(super) fn frame_to_sse(
         })
 }
 
+/// Like [`frame_to_sse`], but the SSE `id` is the event's persisted id, and is
+/// omitted for events that have none. A reconnecting client's Last-Event-ID
+/// therefore always names the last persisted event it saw, which
+/// `/stream/events` can resume after; the frame's own `seq` stays per-connection.
+fn frame_to_sse_with_event_id(
+    event_type: &'static str,
+    event_id: Option<i64>,
+    frame: serde_json::Value,
+) -> Option<SseEvent> {
+    serde_json::to_string(&frame)
+        .inspect_err(|e| tracing::warn!(error = %e, event_type, "SSE frame serialization failed"))
+        .ok()
+        .map(|body| {
+            let event = SseEvent::new(body).event_type(event_type);
+            match event_id {
+                Some(id) => event.id(id.to_string()),
+                None => event,
+            }
+        })
+}
+
+/// The persisted event id carried by a bus event, if it has one.
+fn persisted_event_id(event: &Event) -> Option<i64> {
+    match event {
+        Event::PatternDetected { event_id, .. } => *event_id,
+        _ => None,
+    }
+}
+
+/// Most persisted events replayed to one reconnecting `/stream/events` client.
+const EVENT_STREAM_REPLAY_MAX: usize = 1000;
+
+/// Where a `/stream/events` client asked to resume: the `Last-Event-ID` header
+/// a reconnecting EventSource sends, or an explicit `?since_id=`.
+fn event_stream_resume_after(req: &Request, qs: &QueryString) -> Option<i64> {
+    let header = req
+        .headers()
+        .get("last-event-id")
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| value.trim().parse::<i64>().ok());
+    header
+        .or_else(|| parse_u64(qs, "since_id").and_then(|id| i64::try_from(id).ok()))
+        .filter(|id| *id >= 0)
+}
+
 async fn send_rate_limited_sse(
     tx: &mpsc::Sender<SseEvent>,
     event: SseEvent,
@@ -646,6 +691,10 @@ pub(super) fn handle_stream_events(
     };
     let result = require_event_bus(req);
     let lifecycle = req.get_extension::<WebStreamLifecycle>().cloned();
+    let resume_after = event_stream_resume_after(req, &qs);
+    let replay_storage = req
+        .get_extension::<super::middleware::AppState>()
+        .and_then(|state| state.storage.clone());
 
     Box::pin(async move {
         let (event_bus, redactor) = match result {
@@ -712,6 +761,98 @@ pub(super) fn handle_stream_events(
                 }
             }
 
+            // Resume: replay persisted detections after the client's last
+            // seen id before going live. The subscription above was taken
+            // first, so nothing published meanwhile is lost; live events at
+            // or below the last replayed id are skipped as duplicates.
+            let mut replayed_through = resume_after.unwrap_or(i64::MIN);
+            let wants_detections = matches!(
+                channel,
+                EventStreamChannel::All | EventStreamChannel::Detections
+            );
+            if let (Some(after_id), Some(storage), true) =
+                (resume_after, replay_storage.as_ref(), wants_detections)
+            {
+                let query = crate::storage::EventStreamQuery {
+                    after_id: Some(after_id),
+                    limit: Some(EVENT_STREAM_REPLAY_MAX),
+                    pane_id: pane_filter,
+                    ..crate::storage::EventStreamQuery::default()
+                };
+                let stored = match storage.get_events_stream_with_cx(&child_cx, query).await {
+                    Ok(stored) => stored,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "wa.web",
+                            error = %error,
+                            "event stream resume query failed; continuing live only"
+                        );
+                        Vec::new()
+                    }
+                };
+                let truncated = stored.len() >= EVENT_STREAM_REPLAY_MAX;
+                for stored in stored {
+                    let event_id = stored.id;
+                    let event = super::server::stored_event_to_bus_event(stored);
+                    let mut event_json = serde_json::to_value(&event).unwrap_or_else(|_| {
+                        json!({
+                            "error": "event_serialization_failed"
+                        })
+                    });
+                    redact_json_value(&mut event_json, &redactor);
+                    if !advance_stream_sequence(&mut seq) {
+                        return;
+                    }
+                    let frame = make_stream_frame(
+                        "events",
+                        "event",
+                        seq,
+                        json!({ "event": event_json, "replayed": true }),
+                    );
+                    replayed_through = replayed_through.max(event_id);
+                    if let Some(event) = frame_to_sse_with_event_id("event", Some(event_id), frame)
+                    {
+                        if !send_rate_limited_sse(
+                            &tx,
+                            event,
+                            &mut next_emit_at,
+                            min_interval,
+                            &mut consecutive_drops,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                    }
+                }
+                if truncated {
+                    // More history remains than one replay carries: say so,
+                    // the same way a live lag is reported.
+                    if !advance_stream_sequence(&mut seq) {
+                        return;
+                    }
+                    let frame = make_stream_frame(
+                        "events",
+                        "lag",
+                        seq,
+                        json!({ "resume_truncated_after_id": replayed_through }),
+                    );
+                    if let Some(event) = frame_to_sse("lag", seq, frame) {
+                        if !send_rate_limited_sse(
+                            &tx,
+                            event,
+                            &mut next_emit_at,
+                            min_interval,
+                            &mut consecutive_drops,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+
             loop {
                 if child_cx.checkpoint().is_err() {
                     break;
@@ -726,6 +867,10 @@ pub(super) fn handle_stream_events(
                 match recv_result {
                     Ok(Ok(event)) => {
                         if !event_matches_pane(&event, pane_filter) {
+                            continue;
+                        }
+                        let event_id = persisted_event_id(&event);
+                        if event_id.is_some_and(|id| id <= replayed_through) {
                             continue;
                         }
 
@@ -745,7 +890,7 @@ pub(super) fn handle_stream_events(
                             seq,
                             json!({ "event": event_json }),
                         );
-                        if let Some(event) = frame_to_sse("event", seq, frame) {
+                        if let Some(event) = frame_to_sse_with_event_id("event", event_id, frame) {
                             if !send_rate_limited_sse(
                                 &tx,
                                 event,
@@ -1043,11 +1188,12 @@ pub(super) fn handle_stream_deltas(
 #[cfg(test)]
 mod tests {
     use super::{
-        EventStreamChannel, STREAM_MAX_CONSECUTIVE_DROPS, SseEvent, mpsc,
-        parse_event_stream_channel,
+        Event, EventStreamChannel, STREAM_MAX_CONSECUTIVE_DROPS, SseEvent,
+        frame_to_sse_with_event_id, mpsc, parse_event_stream_channel, persisted_event_id,
     };
     use crate::runtime_async::CompatRuntime;
     use crate::web_framework::QueryString;
+    use serde_json::json;
 
     struct ProducerDropProbe(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
@@ -1438,6 +1584,43 @@ mod tests {
         let bytes = event.to_bytes();
         let text = String::from_utf8(bytes).unwrap();
         assert_eq!(text, "data: hello world\n\n");
+    }
+
+    #[test]
+    fn event_frames_carry_the_persisted_event_id_or_none() {
+        // ft-emlzp: a reconnecting client's Last-Event-ID must name the last
+        // persisted event, so only persisted events set the SSE id.
+        let with_id = frame_to_sse_with_event_id("event", Some(1234), json!({"k": 1})).unwrap();
+        let text = String::from_utf8(with_id.to_bytes()).unwrap();
+        assert!(text.contains("id: 1234\n"), "{text}");
+        let without = frame_to_sse_with_event_id("event", None, json!({"k": 1})).unwrap();
+        let text = String::from_utf8(without.to_bytes()).unwrap();
+        assert!(!text.contains("id:"), "{text}");
+
+        let detected = Event::PatternDetected {
+            pane_id: 1,
+            pane_uuid: None,
+            detection: crate::patterns::Detection {
+                rule_id: "codex.usage.reached".to_string(),
+                agent_type: crate::patterns::AgentType::Codex,
+                event_type: "usage.reached".to_string(),
+                severity: crate::patterns::Severity::Warning,
+                confidence: 1.0,
+                extracted: serde_json::Value::Null,
+                matched_text: String::new(),
+                span: (0, 0),
+            },
+            event_id: Some(77),
+        };
+        assert_eq!(persisted_event_id(&detected), Some(77));
+        assert_eq!(
+            persisted_event_id(&Event::SegmentCaptured {
+                pane_id: 1,
+                seq: 2,
+                content_len: 3
+            }),
+            None
+        );
     }
 
     #[test]
