@@ -1321,8 +1321,11 @@ mod tests {
 
     #[test]
     fn missing_evidence_never_widens_capabilities() {
+        // Distinct from every other module's fixture IDs: the override
+        // registry is process-wide and mcp_tools installs safe states for 1..=3.
+        let pane_id = 4_301;
         let state = IpcPaneState {
-            pane_id: 3,
+            pane_id,
             known: false,
             observed: None,
             alt_screen: Some(false),
@@ -1338,7 +1341,7 @@ mod tests {
             .unwrap();
         let resolution = runtime.block_on(resolve_pane_capabilities(
             &crate::cx::for_testing(),
-            3,
+            pane_id,
             None,
             Some(Path::new("/nonexistent/ft-capability-test.sock")),
         ));
