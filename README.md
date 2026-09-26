@@ -936,9 +936,9 @@ ft send <pane_id> "<text>"                  # send input (policy-gated)
 ft send <pane_id> "<text>" --dry-run        # preview without executing
 ft send <pane_id> "<text>" --wait-for "ok"  # verify via wait-for
 ft send <pane_id> "<text>" --no-paste --no-newline
-# Default = bracketed paste (right for agent TUIs). A shell prompt inserts a paste
-# without executing it: use --no-paste to run commands in a shell pane. The receipt
-# reports the mode as "no_paste".
+# Default = the text as one bracketed paste, then a typed Enter that submits it
+# (agent composers and shell prompts alike). --no-paste types the characters
+# instead; --no-newline leaves out the Enter. The receipt reports the mode as "no_paste".
 ```
 
 ### Search
@@ -1288,8 +1288,8 @@ ft robot get-text --all --tail 10         # all active panes
 ### Sending input
 
 ```bash
-ft robot send 1 "/compact"                          # send as one bracketed paste (agent TUIs)
-ft robot send 2 "make test" --no-paste              # type it instead, so a shell pane executes it
+ft robot send 1 "/compact"                          # paste, then a typed Enter submits it
+ft robot send 2 "make test" --no-paste              # type the characters instead of pasting
 ft robot send 1 "dangerous command" --dry-run       # preview without executing
 ft robot send 1 "y" --wait-for "confirmed"          # send and wait for confirmation
 ft robot send 1 "/compact" --verify-submit          # return submitted-level SubmitReceipt
