@@ -11,6 +11,9 @@
 #   3. the agent took a turn on the workflow prompt: the prompt is in the
 #      transcript, a completed-turn marker follows it, the composer is empty
 #   4. the operator's ~/.local/bin/claude link never points into a temp dir
+#   5. a real Codex pane, spawned by `ft robot profile apply`, answers a
+#      `ft robot send --verify-submit` whose receipt says `submitted`
+#      (reported as SKIP, never as a pass, when no codex binary is installed)
 #
 # Spends a few model turns on the operator's account, so it only runs with
 # LIVE_LOOP_REAL_AGENTS=1. The mux, socket and ft state are private; only the
@@ -25,6 +28,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$(cd "${1:-$REPO_ROOT/target/debug}" && pwd)"
 FT_BIN="$BIN/ft"; MUX_BIN="$BIN/frankenterm-mux-server"
 CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
+CODEX_BIN="${CODEX_BIN:-$(command -v codex || true)}"
 for bin in "$FT_BIN" "$MUX_BIN" "$CLAUDE_BIN"; do [[ -x "$bin" ]] || { echo "missing $bin" >&2; exit 2; }; done
 OUT="$REPO_ROOT/tests/e2e/artifacts/live-loop-real/$(date +%Y%m%dT%H%M%S)"
 mkdir -p "$OUT"
@@ -56,6 +60,15 @@ exec env -i HOME="$HOME" PATH="$(dirname "$CLAUDE_BIN"):/opt/homebrew/bin:/usr/l
   TERM=xterm-256color LANG=en_US.UTF-8 USER="$USER" DISABLE_AUTOUPDATER=1 "$CLAUDE_BIN" --model haiku
 EOF
 chmod 700 "$D/agent.sh"
+if [[ -x "$CODEX_BIN" ]]; then
+  cat > "$D/codex.sh" << EOF
+#!/bin/bash
+cd "$REPO_ROOT"
+exec env -i HOME="$HOME" PATH="$(dirname "$CODEX_BIN"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" \\
+  TERM=xterm-256color LANG=en_US.UTF-8 USER="$USER" "$CODEX_BIN"
+EOF
+  chmod 700 "$D/codex.sh"
+fi
 ENVV=("PATH=$BIN:/usr/bin:/bin:/usr/sbin:/sbin" "LANG=C" "HOME=$D/home" "TMPDIR=$D/tmp"
   "XDG_RUNTIME_DIR=$D/runtime" "WEZTERM_UNIX_SOCKET=$SOCK" "FRANKENTERM_UNIX_SOCKET=$SOCK"
   "FRANKENTERM_CONFIG_FILE=$D/frankenterm.toml" "FT_WORKSPACE=$D"
@@ -137,6 +150,29 @@ check "agent_took_a_turn_on_workflow_prompt" $? "prompt, finished turn, empty co
 
 # The operator's own sessions may update Claude Code meanwhile; what must never
 # happen is the link moving into a temp dir.
+if [[ -x "$CODEX_BIN" ]]; then
+  ft robot profile create codex_ws --command "$D/codex.sh" > "$OUT/profile-create-codex.json" 2>&1
+  ft robot profile apply codex_ws --count 1 > "$OUT/profile-apply-codex.json" 2>&1
+  CP=$(python3 -c 'import json,sys;t=open(sys.argv[1]).read();print(json.loads(t[t.index("{"):])["data"]["panes_spawned"][0])' \
+    "$OUT/profile-apply-codex.json" 2> /dev/null)
+  sleep 20
+  ft robot send --verify-submit "$CP" "Reply with the word PONG spelled backwards and nothing else" \
+    > "$OUT/codex-send.json" 2> "$OUT/codex-send.err"
+  sleep 40
+  ft get-text "$CP" --tail 60 > "$OUT/codex-screen.txt" 2> /dev/null
+  python3 - "$OUT/codex-send.json" "$OUT/codex-screen.txt" << 'PY'
+import json, sys
+text = open(sys.argv[1]).read()
+submit = (json.loads(text[text.index("{"):]).get("data") or {}).get("submit") or {}
+screen = open(sys.argv[2], encoding="utf-8", errors="replace").read().splitlines()
+answered = any(line.strip() in ("• GNOP", "GNOP") for line in screen)
+sys.exit(0 if submit.get("state") == "submitted" and answered else 1)
+PY
+  check "codex_verified_submit_answered" $? "pane ${CP:-?}"
+else
+  echo "SKIP codex_verified_submit_answered - no codex binary"
+fi
+
 CLAUDE_LINK_AFTER=$(readlink "$CLAUDE_BIN" 2> /dev/null || echo "$CLAUDE_BIN")
 case "$CLAUDE_LINK_AFTER" in /tmp/* | /private/tmp/* | /var/folders/*) false ;; *) true ;; esac
 check "operator_claude_install_not_in_temp" $? "$CLAUDE_LINK_BEFORE -> $CLAUDE_LINK_AFTER"
