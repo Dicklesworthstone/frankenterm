@@ -123,10 +123,18 @@ fn remove_process_env_for_mux_server_startup(name: &str) {
     unsafe { std::env::remove_var(name) };
 }
 
+/// Semver plus source commit, for `--version` and the mux handshake.
+const MUX_SERVER_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("FRANKENTERM_GIT_HASH"),
+    ")"
+);
+
 #[derive(Debug, Parser)]
 #[command(
     about = "FrankenTerm headless mux server for remote fleets",
-    version = env!("CARGO_PKG_VERSION"),
+    version = MUX_SERVER_VERSION,
     trailing_var_arg = true,
 )]
 struct Opt {
@@ -244,7 +252,13 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
     // The codec handshake announces this string to every client; without it
     // clients (skew errors, `ft doctor`) saw the upstream placeholder text.
     config::assign_version_info(
-        concat!("frankenterm-mux-server ", env!("CARGO_PKG_VERSION")),
+        concat!(
+            "frankenterm-mux-server ",
+            env!("CARGO_PKG_VERSION"),
+            " (",
+            env!("FRANKENTERM_GIT_HASH"),
+            ")"
+        ),
         std::env::consts::ARCH,
     );
     let _saver = umask::UmaskSaver::new();

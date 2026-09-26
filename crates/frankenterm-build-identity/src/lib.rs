@@ -495,6 +495,41 @@ pub fn emit_cargo_atomic_component_marker(
     Ok(marker)
 }
 
+/// Emit `cargo:rustc-env=<variable>=<revision>` from a build script: the
+/// workspace's `git rev-parse HEAD`, re-run whenever HEAD or a ref moves; for
+/// a gitless release archive the DSR release revision; else `unknown`.
+///
+/// Binaries put it in `--version` and the version they announce to mux
+/// clients, so two builds of one semver are distinguishable.
+pub fn emit_cargo_source_revision(variable: &str) -> String {
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default();
+    let root = std::path::Path::new(&manifest_dir).join("../..");
+    let git = root.join(".git");
+    let mut revision = None;
+    if git.exists() {
+        for name in ["HEAD", "refs", "packed-refs"] {
+            let path = git.join(name);
+            if path.exists() {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
+        }
+        revision = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["rev-parse", "--verify", "HEAD"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    }
+    let revision = revision.unwrap_or_else(|| {
+        println!("cargo:rerun-if-env-changed=DSR_RELEASE_GIT_SHA");
+        std::env::var("DSR_RELEASE_GIT_SHA").unwrap_or_else(|_| "unknown".to_owned())
+    });
+    println!("cargo:rustc-env={variable}={revision}");
+    revision
+}
+
 fn read_build_environment(
     variable: &'static str,
     missing_value: &str,
