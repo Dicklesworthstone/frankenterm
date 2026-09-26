@@ -319,7 +319,7 @@ level reasons.
 | --- | --- |
 | `resource.proof.*` | `resource.proof.healthy`, `resource.proof.skipped`, `resource.proof.target_hardware_missing` |
 | `resource.telemetry.*` | `resource.telemetry.unavailable`, `resource.telemetry.stale`, `resource.telemetry.simulated`, `resource.telemetry.mixed` |
-| `resource.memory.*` | `resource.memory.tier_pressure`, `resource.memory.pane_budget`, `resource.memory.rss_growth`, `resource.memory.heap_growth`, `resource.memory.mmap_residency`, `resource.memory.unknown_residency` |
+| `resource.memory.*` | `resource.memory.tier_pressure`, `resource.memory.pane_budget`, `resource.memory.rss_growth`, `resource.memory.heap_growth`, `resource.memory.mmap_residency`, `resource.memory.unknown_residency`, `resource.memory.warm_evicted`, `resource.memory.warm_eviction_failed`, `resource.memory.warm_eviction_unsupported` (action receipts for the watcher's mux warm-scrollback eviction) |
 | `resource.queue.*` | `resource.queue.capture_pressure`, `resource.queue.write_pressure`, `resource.queue.event_bus_lag`, `resource.queue.persistence_lag`, `resource.queue.backpressure_overflow` |
 | `storage_io.*` | `storage_io.defer.queue_full`, `storage_io.degrade.oldest_age_exceeded`, `storage_io.fail_closed.io_error`, `storage_io.defer.search_freshness_lag`, `storage_io.fail_closed.cold_tier_unavailable` |
 | `worker_pool.*` | `worker_pool.no_healthy_workers`, `worker_pool.busy_wait`, `worker_pool.stale_inventory`, `worker_pool.local_fallback_forbidden` |

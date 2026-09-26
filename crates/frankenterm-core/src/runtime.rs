@@ -5960,6 +5960,9 @@ impl ObservationRuntime {
                 None::<FleetCoordinatorMaintenanceState>;
             // Set once the mux accepts a warm eviction request (codec >= 67).
             let mut mux_warm_eviction_supported = false;
+            // The latest coordinator eviction, as the cockpit's action receipt.
+            let mut last_warm_eviction_receipts =
+                None::<crate::memory_pressure::ResourcePressureActionReceiptReport>;
             // ft-wl9rx: totals at the previous health tick, for output rates.
             let mut previous_pane_output = None::<(u64, HashMap<u64, PaneOutputTotals>)>;
 
@@ -6641,6 +6644,13 @@ impl ObservationRuntime {
                         .await
                     };
                     mux_warm_eviction_supported |= mux_eviction.supported;
+                    if !eviction_targets.is_empty() {
+                        last_warm_eviction_receipts = Some(
+                            crate::memory_pressure::evaluate_resource_pressure_action_receipts(&[
+                                mux_warm_eviction_receipt(&mux_eviction, epoch_ms_u64()),
+                            ]),
+                        );
+                    }
                     if loop_cx.checkpoint().is_err() {
                         break;
                     }
@@ -6875,7 +6885,7 @@ impl ObservationRuntime {
                                 &[],
                                 None,
                                 None,
-                                None,
+                                last_warm_eviction_receipts.as_ref(),
                             )
                             .with_pane_budget_evidence(pane_budget_evidence),
                         ),
@@ -11853,6 +11863,56 @@ async fn apply_mux_warm_eviction(
         }
     }
     eviction
+}
+
+/// The cockpit's action receipt for a coordinator tick that targeted panes:
+/// applied (with the mux-measured bytes) when the mux evicted, failed when
+/// the request errored, and planned (a recommendation) when the mux cannot
+/// evict.
+fn mux_warm_eviction_receipt(
+    eviction: &MuxWarmEviction,
+    at_ms: u64,
+) -> crate::memory_pressure::ResourcePressureActionReceiptInput {
+    use crate::memory_pressure::{
+        ResourcePressureAction, ResourcePressureActionReceiptInput, ResourcePressureAttribution,
+        ResourcePressureDomain, ResourcePressureEvidenceState, ResourcePressurePolicyDecision,
+        ResourcePressureReceiptStatus,
+    };
+    let (status, reason) = if eviction.errors > 0 {
+        (
+            ResourcePressureReceiptStatus::Failed,
+            "resource.memory.warm_eviction_failed",
+        )
+    } else if eviction.supported {
+        (
+            ResourcePressureReceiptStatus::Applied,
+            "resource.memory.warm_evicted",
+        )
+    } else {
+        (
+            ResourcePressureReceiptStatus::Planned,
+            "resource.memory.warm_eviction_unsupported",
+        )
+    };
+    ResourcePressureActionReceiptInput {
+        receipt_id: format!("fleet-warm-eviction-{at_ms}"),
+        correlation_id: None,
+        action: ResourcePressureAction::EvictScrollback,
+        target_domain: ResourcePressureDomain::Memory,
+        requested_at_ms: at_ms,
+        completed_at_ms: eviction.supported.then_some(at_ms),
+        status,
+        dry_run: false,
+        // Enabled by `[fleet_scrollback]`; the coordinator acts on its own.
+        policy_decision: ResourcePressurePolicyDecision::Allow,
+        evidence_state: ResourcePressureEvidenceState::Measured,
+        attribution: ResourcePressureAttribution {
+            affected_bytes: Some(eviction.bytes_released),
+            ..ResourcePressureAttribution::default()
+        },
+        reason_codes: vec![reason.to_string()],
+        artifact_paths: Vec::new(),
+    }
 }
 
 /// `mux_can_evict`: the mux has accepted a warm eviction request, so all of
@@ -23256,6 +23316,54 @@ mod tests {
                 }
             );
         });
+    }
+
+    #[test]
+    fn mux_warm_eviction_receipt_is_applied_planned_or_failed() {
+        use crate::memory_pressure::{
+            ResourcePressureAction, ResourcePressureDomain, ResourcePressureReceiptStatus,
+            evaluate_resource_pressure_action_receipts,
+        };
+        let receipt = |eviction: MuxWarmEviction| {
+            evaluate_resource_pressure_action_receipts(&[mux_warm_eviction_receipt(
+                &eviction, 1_000,
+            )])
+        };
+
+        let applied = receipt(MuxWarmEviction {
+            supported: true,
+            panes_evicted: 4,
+            bytes_released: 104_024_608,
+            errors: 0,
+        });
+        let row = &applied.receipts[0];
+        assert_eq!(row.action, ResourcePressureAction::EvictScrollback);
+        assert_eq!(row.target_domain, ResourcePressureDomain::Memory);
+        assert_eq!(row.status, ResourcePressureReceiptStatus::Applied);
+        assert_eq!(row.attribution.affected_bytes, Some(104_024_608));
+        assert_eq!(row.reason_codes[0], "resource.memory.warm_evicted");
+        assert_eq!((applied.failed_receipts, applied.blocked_receipts), (0, 0));
+
+        let planned = receipt(MuxWarmEviction::default());
+        assert_eq!(
+            planned.receipts[0].status,
+            ResourcePressureReceiptStatus::Planned
+        );
+        assert_eq!(
+            planned.receipts[0].reason_codes[0],
+            "resource.memory.warm_eviction_unsupported"
+        );
+
+        let failed = receipt(MuxWarmEviction {
+            supported: true,
+            errors: 1,
+            ..MuxWarmEviction::default()
+        });
+        assert_eq!(
+            failed.receipts[0].status,
+            ResourcePressureReceiptStatus::Failed
+        );
+        assert_eq!(failed.failed_receipts, 1);
     }
 
     #[test]
