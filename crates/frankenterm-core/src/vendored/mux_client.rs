@@ -126,6 +126,23 @@ fn append_mux_text_line(out: &mut String, line: &str, cap: usize) -> Result<(), 
     Ok(())
 }
 
+/// The last `n` rows of `out` (newline-terminated rows) after dropping its
+/// trailing blank rows, and whether every content row was kept.
+fn content_tail_rows(out: &str, n: usize) -> (String, bool) {
+    let rows: Vec<&str> = out.lines().collect();
+    let content = rows
+        .iter()
+        .rposition(|row| !row.trim().is_empty())
+        .map_or(0, |last| last + 1);
+    let start = content.saturating_sub(n);
+    let mut text = String::new();
+    for row in &rows[start..content] {
+        text.push_str(row);
+        text.push('\n');
+    }
+    (text, start == 0)
+}
+
 fn mux_read_retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(if attempt == 0 { 1 } else { 10 })
 }
@@ -2805,16 +2822,21 @@ impl DirectMuxClient {
             })?;
             let total_rows = layout.dimensions.scrollback_rows as usize;
 
-            let (mut start, truncated) = match tail {
+            // A tail means the last `n` rows of content. The blank screen rows
+            // below a short output (a fresh 115-row pane printing one line)
+            // are padding, so read one extra viewport of rows and drop the
+            // trailing blank ones before keeping `n`.
+            let (mut start, content_tail) = match tail {
                 Some(n) if n > 0 && n < total_rows => {
-                    let tail_rows = isize::try_from(n).map_err(|_| {
+                    let read_rows = n.saturating_add(layout.dimensions.viewport_rows);
+                    let read_rows = isize::try_from(read_rows).map_err(|_| {
                         mux_text_contract_error(MuxTextContractReason::ScrollbackRowCountOverflow)
                     })?;
-                    let tail_start = end.saturating_sub(tail_rows).max(scrollback_top);
-                    (tail_start, true)
+                    (end.saturating_sub(read_rows).max(scrollback_top), Some(n))
                 }
-                _ => (scrollback_top, false),
+                _ => (scrollback_top, None),
             };
+            let read_from_top = start == scrollback_top;
             let mut out = String::new();
             while start < end {
                 checkpoint_mux_cx(cx, self.connection_id, "text_read_chunk")?;
@@ -2964,17 +2986,25 @@ impl DirectMuxClient {
             let final_state = final_state?;
             checkpoint_mux_cx(cx, self.connection_id, "text_read_complete")?;
             if final_state.seqno == layout.seqno && final_state.dimensions == layout.dimensions {
-                let result = match tail {
-                    Some(_) => {
-                        let original_bytes = if truncated { None } else { Some(out.len()) };
+                let result = match (tail, content_tail) {
+                    (_, Some(n)) => {
+                        let (text, kept_all) = content_tail_rows(&out, n);
+                        let truncated = !(read_from_top && kept_all);
+                        let original_bytes = if truncated { None } else { Some(text.len()) };
                         MuxTextReadResult::Bounded {
-                            text: out,
+                            text,
                             original_lines: total_rows,
                             original_bytes,
                             truncated,
                         }
                     }
-                    None => MuxTextReadResult::Text(out),
+                    (Some(_), None) => MuxTextReadResult::Bounded {
+                        original_bytes: Some(out.len()),
+                        text: out,
+                        original_lines: total_rows,
+                        truncated: false,
+                    },
+                    (None, None) => MuxTextReadResult::Text(out),
                 };
                 return Ok(Ok(result));
             }
@@ -8407,8 +8437,9 @@ mod tests {
             );
             assert_eq!(
                 *ranges.lock().unwrap(),
-                vec![543..593],
-                "prefix rows -7..543 must never be requested over the wire"
+                vec![519..593],
+                "only the tail plus one viewport (24 rows) may be requested; \
+                 prefix rows -7..519 never cross the wire"
             );
             drop(client);
             timeout(Duration::from_secs(5), server)
@@ -8416,6 +8447,90 @@ mod tests {
                 .unwrap()
                 .unwrap();
         });
+    }
+
+    #[test]
+    fn text_read_tail_skips_blank_screen_rows_below_short_output() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            // A fresh 115-row pane that printed two lines: rows 2..115 are blank.
+            let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                Some(match pdu {
+                    Pdu::GetPaneRenderChanges(_) => {
+                        let mut state = test_render_change(9, 7, "text fixture");
+                        state.dimensions.scrollback_top = 0;
+                        state.dimensions.scrollback_rows = 115;
+                        state.dimensions.viewport_rows = 115;
+                        state.dimensions.physical_top = 0;
+                        Pdu::GetPaneRenderChangesResponse(state)
+                    }
+                    Pdu::GetLinesAtLayout(request) => {
+                        let lines = request
+                            .lines
+                            .iter()
+                            .cloned()
+                            .flatten()
+                            .map(|row| {
+                                let text = match row {
+                                    0 => "RC_MARKER_1",
+                                    1 => "% ",
+                                    _ => "",
+                                };
+                                let line = frankenterm_term::Line::from_text(
+                                    text,
+                                    &termwiz::cell::CellAttributes::default(),
+                                    1,
+                                    None,
+                                );
+                                (row, line)
+                            })
+                            .collect::<Vec<_>>();
+                        Pdu::GetLinesAtLayoutResponse(codec::GetLinesAtLayoutResponse {
+                            pane_id: request.pane_id,
+                            layout: request.layout,
+                            lines: lines.into(),
+                        })
+                    }
+                    other => panic!("unexpected text request {other:?}"),
+                })
+            })
+            .await;
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
+            let result = client
+                .get_text_tail_with_cx(&cx, 9, 100_000, Some(50))
+                .await
+                .unwrap();
+            assert_eq!(
+                result,
+                MuxTextReadResult::Bounded {
+                    text: "RC_MARKER_1\n% \n".to_string(),
+                    original_lines: 115,
+                    original_bytes: Some(15),
+                    truncated: false,
+                },
+                "a tail of 50 must return the pane's content, not 50 blank screen rows"
+            );
+            drop(client);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn content_tail_rows_drops_trailing_blank_rows_before_tailing() {
+        assert_eq!(
+            content_tail_rows("a\nb\nc\n\n  \n", 2),
+            ("b\nc\n".to_string(), false)
+        );
+        assert_eq!(
+            content_tail_rows("a\n\nc\n\n", 5),
+            ("a\n\nc\n".to_string(), true)
+        );
+        assert_eq!(content_tail_rows("\n\n", 3), (String::new(), true));
     }
 
     #[test]
@@ -8513,7 +8628,8 @@ mod tests {
             assert_eq!(
                 result,
                 MuxTextReadResult::Bounded {
-                    text: text_read_expected(553..603, "new"),
+                    // Row 602 is blank (602 % 7 == 0): the content tail ends at 601.
+                    text: text_read_expected(552..602, "new"),
                     original_lines: 600,
                     original_bytes: None,
                     truncated: true,
@@ -8522,7 +8638,7 @@ mod tests {
 
             assert_eq!(
                 *ranges.lock().unwrap(),
-                vec![543..593, 553..603],
+                vec![519..593, 529..603],
                 "retry must recompute the suffix range against the updated layout"
             );
 

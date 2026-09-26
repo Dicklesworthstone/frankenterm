@@ -192,10 +192,7 @@ fn frankenterm_bootstrap() {
     env_logger::init();
     log_gui_macos_backend_policy();
 
-    config::assign_version_info(
-        concat!("FrankenTerm ", env!("CARGO_PKG_VERSION")),
-        env!("FRANKENTERM_TARGET_TRIPLE"),
-    );
+    config::assign_version_info(GUI_VERSION, env!("FRANKENTERM_TARGET_TRIPLE"));
 
     // Set executable location env vars
     if let Ok(exe) = std::env::current_exe() {
@@ -322,10 +319,20 @@ fn parse_macos_version(version: &str) -> Option<MacosVersion> {
 // CLI argument parsing
 // ---------------------------------------------------------------------------
 
+/// `--version` and the version the mux announces to clients: semver plus the
+/// source commit, so two builds of one semver are distinguishable.
+const GUI_VERSION: &str = concat!(
+    "FrankenTerm ",
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("FRANKENTERM_GIT_HASH"),
+    ")"
+);
+
 #[derive(Debug, Parser)]
 #[command(
     about = "FrankenTerm — Swarm-Native Terminal Emulator\nhttps://github.com/Dicklesworthstone/frankenterm",
-    version = concat!("FrankenTerm ", env!("CARGO_PKG_VERSION"))
+    version = GUI_VERSION
 )]
 struct Opt {
     /// Skip loading configuration file
