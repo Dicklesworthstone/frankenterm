@@ -98633,8 +98633,12 @@ async fn mux_scrollback_diagnostic(
                 reported += 1;
                 warm_resident_bytes =
                     warm_resident_bytes.saturating_add(summary.warm_resident_bytes);
-                cap_min = cap_min.min(summary.configured_warm_max_bytes);
-                cap_max = cap_max.max(summary.configured_warm_max_bytes);
+                // A pane without tiering (e.g. on the alternate screen, which
+                // keeps no scrollback) reports a 0 cap; it has no warm budget.
+                if summary.tiering_enabled {
+                    cap_min = cap_min.min(summary.configured_warm_max_bytes);
+                    cap_max = cap_max.max(summary.configured_warm_max_bytes);
+                }
             }
         }
     }
@@ -98649,7 +98653,9 @@ async fn mux_scrollback_diagnostic(
         ));
     }
     let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
-    let caps = if cap_min == cap_max {
+    let caps = if cap_min == usize::MAX {
+        "none (no pane has tiered scrollback)".to_string()
+    } else if cap_min == cap_max {
         format!("{:.1} MiB", mib(cap_max))
     } else {
         format!("{:.1}-{:.1} MiB", mib(cap_min), mib(cap_max))
