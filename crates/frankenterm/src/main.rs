@@ -69464,14 +69464,17 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         }
                     }
 
-                    if frankenterm_core::runtime_async::sleep_with_cx(
-                        &record_cx,
-                        std::time::Duration::from_millis(200),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        // Cx cancelled during record poll.
+                    // Ctrl+C is how the operator is told to stop: end the loop
+                    // so the recorder flushes and saves, instead of dying with
+                    // the buffered frames unwritten.
+                    let keep_polling = frankenterm_core::runtime_async::select! {
+                        _ = frankenterm_core::runtime_async::signal::ctrl_c() => false,
+                        slept = frankenterm_core::runtime_async::sleep_with_cx(
+                            &record_cx,
+                            std::time::Duration::from_millis(200),
+                        ) => slept.is_ok(),
+                    };
+                    if !keep_polling {
                         break;
                     }
                 }

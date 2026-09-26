@@ -16,6 +16,8 @@
 #      (reported as SKIP, never as a pass, when no codex binary is installed)
 #   6. a zsh pane with OSC 133 prompt integration accepts a plain
 #      `ft robot send` on live prompt evidence and runs the command
+#   7. the Claude pane is recorded (`ft record`) and `ft replay` of the .war
+#      recording contains the compaction and the workflow's prompt
 #
 # Spends a few model turns on the operator's account, so it only runs with
 # LIVE_LOOP_REAL_AGENTS=1. The mux, socket and ft state are private; only the
@@ -124,6 +126,13 @@ idle() { # screen shows a reply and no running turn
   return 1
 }
 sleep 15
+# Record the agent pane for the whole loop, so frankenterm-core-replay can
+# replay a real session (ft replay <file>).
+env -i "${ENVV[@]}" "$FT_BIN" -c "$D/ft.toml" record start --pane "$P" \
+  --title "live-loop tier 1 (real Claude Code)" --auto-stop 15m -o "$OUT/claude.war" \
+  > "$OUT/record-start.log" 2>&1 &
+RECPID=$!
+PIDS+=("$RECPID")
 ft send "$P" "Say hi in two words." > /dev/null 2>&1
 idle warmup || echo "warm-up reply not seen"
 ft send "$P" "/compact" > /dev/null 2>&1
@@ -148,6 +157,16 @@ for _ in $(seq 1 48); do
   ft get-text "$P" --tail 200 > "$OUT/screen.txt" 2> /dev/null
   answered && break
 done
+# A standalone recording stops on SIGINT (Ctrl+C) and must flush what it holds.
+kill -INT "$RECPID" 2> /dev/null
+for _ in $(seq 1 50); do kill -0 "$RECPID" 2> /dev/null || break; sleep 0.2; done
+ft replay "$OUT/claude.war" --json > "$OUT/replay.json" 2> "$OUT/replay.err"
+python3 - "$OUT/replay.json" << 'PY'
+import sys
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+sys.exit(0 if "Conversation compacted" in text and "READY-TIER1" in text else 1)
+PY
+check "recorded_session_replays_the_loop" $? "$(wc -c < "$OUT/claude.war" 2> /dev/null | tr -d ' ') bytes .war"
 
 ft robot --format json events --limit 100 > "$OUT/events.json" 2> /dev/null
 python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));sys.exit(0 if any(e["rule_id"]=="claude_code.compaction" for e in d["data"]["events"]) else 1)' \
