@@ -98,11 +98,15 @@ pub(super) async fn spawn_storage_event_tail(
                 until: None,
                 limit: batch,
             };
-            let segments_drained = match storage.scan_segments_with_cx(&child_cx, segment_query).await {
+            let segments_drained = match storage
+                .scan_segments_with_cx(&child_cx, segment_query)
+                .await
+            {
                 Ok(segments) => {
                     let drained = segments.len();
                     for segment in segments {
-                        segment_cursor = Some(segment_cursor.map_or(segment.id, |c| c.max(segment.id)));
+                        segment_cursor =
+                            Some(segment_cursor.map_or(segment.id, |c| c.max(segment.id)));
                         let _ = bus.publish(Event::SegmentCaptured {
                             pane_id: segment.pane_id,
                             seq: segment.seq,
@@ -484,7 +488,10 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let history = storage.append_segment(9, "old output\n", None).await.unwrap();
+            let history = storage
+                .append_segment(9, "old output\n", None)
+                .await
+                .unwrap();
             crate::runtime_async::sleep(Duration::from_millis(5)).await;
 
             let bus = Arc::new(EventBus::new(16));
@@ -499,7 +506,10 @@ mod tests {
             )
             .await;
             crate::runtime_async::sleep(Duration::from_millis(5)).await;
-            let live = storage.append_segment(9, "new output\n", None).await.unwrap();
+            let live = storage
+                .append_segment(9, "new output\n", None)
+                .await
+                .unwrap();
 
             let event = crate::runtime_async::timeout(Duration::from_secs(10), deltas.recv())
                 .await
@@ -508,7 +518,11 @@ mod tests {
             match event {
                 Event::SegmentCaptured { pane_id, seq, .. } => {
                     assert_eq!(pane_id, 9);
-                    assert_eq!(seq, live.seq, "history (seq {}) must not be announced", history.seq);
+                    assert_eq!(
+                        seq, live.seq,
+                        "history (seq {}) must not be announced",
+                        history.seq
+                    );
                 }
                 other => panic!("expected SegmentCaptured, got {other:?}"),
             }

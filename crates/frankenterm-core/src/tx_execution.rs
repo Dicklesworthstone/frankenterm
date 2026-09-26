@@ -11863,13 +11863,19 @@ mod tests {
 
         let mut first = make_test_contract(1);
         let first_result = engine.execute(&mut first, 5_000).unwrap();
-        assert_eq!(first_result.prepare_report.outcome, TxPrepareOutcome::AllReady);
+        assert_eq!(
+            first_result.prepare_report.outcome,
+            TxPrepareOutcome::AllReady
+        );
         assert!(first_result.commit_report.is_some());
 
         // The token is spent: the presence check now fails at prepare.
         let mut second = make_test_contract(1);
         let second_result = engine.execute(&mut second, 6_000).unwrap();
-        assert_ne!(second_result.prepare_report.outcome, TxPrepareOutcome::AllReady);
+        assert_ne!(
+            second_result.prepare_report.outcome,
+            TxPrepareOutcome::AllReady
+        );
         assert!(second_result.commit_report.is_none());
     }
 

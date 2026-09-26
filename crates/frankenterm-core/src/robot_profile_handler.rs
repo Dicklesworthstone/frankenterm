@@ -1541,7 +1541,10 @@ mod tests {
             &backend,
         )
         .expect_err("non-string description");
-        assert!(err.to_string().contains("`description` must be a string"), "{err}");
+        assert!(
+            err.to_string().contains("`description` must be a string"),
+            "{err}"
+        );
     }
 
     #[test]

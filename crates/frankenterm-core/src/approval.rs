@@ -1891,7 +1891,9 @@ mod tests {
         run_async_test(async {
             let dir = tempfile::tempdir().unwrap();
             let db_path = dir.path().join("ft.db");
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
             let store = ApprovalStore::new(&storage, ApprovalConfig::default(), "ws");
             let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane(77);
 

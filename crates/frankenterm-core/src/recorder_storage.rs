@@ -835,10 +835,7 @@ fn sealed_segment_file_name(
     format!("{log_name}.{segment_id:020}.{first_ordinal:020}-{end_ordinal:020}")
 }
 
-fn parse_sealed_segment_file_name(
-    log_name: &str,
-    file_name: &str,
-) -> Option<(u64, u64, u64)> {
+fn parse_sealed_segment_file_name(log_name: &str, file_name: &str) -> Option<(u64, u64, u64)> {
     let rest = file_name.strip_prefix(log_name)?.strip_prefix('.')?;
     let (segment, range) = rest.split_once('.')?;
     let (first, end) = range.split_once('-')?;
@@ -846,7 +843,11 @@ fn parse_sealed_segment_file_name(
     if !(all_digits(segment) && all_digits(first) && all_digits(end)) {
         return None;
     }
-    let parsed = (segment.parse().ok()?, first.parse().ok()?, end.parse().ok()?);
+    let parsed = (
+        segment.parse().ok()?,
+        first.parse().ok()?,
+        end.parse().ok()?,
+    );
     (parsed.1 <= parsed.2).then_some(parsed)
 }
 
@@ -1550,9 +1551,9 @@ impl AppendLogRecorderStorage {
             }
             None => Vec::new(),
         };
-        let (recovered_segment_id, segment_base_ordinal) = sealed
-            .last()
-            .map_or((0, 0), |last| (last.segment_id.saturating_add(1), last.end_ordinal));
+        let (recovered_segment_id, segment_base_ordinal) = sealed.last().map_or((0, 0), |last| {
+            (last.segment_id.saturating_add(1), last.end_ordinal)
+        });
         let sealed_latest = match (sealed.last(), scan.valid_records) {
             (Some(last), 0) if last.end_ordinal > last.first_ordinal => {
                 let mut read = recorder_open_options();
@@ -1576,8 +1577,7 @@ impl AppendLogRecorderStorage {
         } else {
             persisted.segment_id == recovered_segment_id
                 && persisted.next_offset == scan.valid_len
-                && persisted.next_ordinal
-                    == segment_base_ordinal.saturating_add(scan.valid_records)
+                && persisted.next_ordinal == segment_base_ordinal.saturating_add(scan.valid_records)
         };
 
         let next_offset = if state_matches_scan {
@@ -5332,7 +5332,10 @@ recorder_backend = "frankensqlite"
             name,
             "events.log.00000000000000000003.00000000000000000040-00000000000000000057"
         );
-        assert_eq!(parse_sealed_segment_file_name("events.log", &name), Some((3, 40, 57)));
+        assert_eq!(
+            parse_sealed_segment_file_name("events.log", &name),
+            Some((3, 40, 57))
+        );
         for other in [
             "events.log",
             "events.log.rolling",
@@ -5340,7 +5343,11 @@ recorder_backend = "frankensqlite"
             "other.log.00000000000000000003.00000000000000000040-00000000000000000057",
             "events.log.00000000000000000003.00000000000000000057-00000000000000000040",
         ] {
-            assert_eq!(parse_sealed_segment_file_name("events.log", other), None, "{other}");
+            assert_eq!(
+                parse_sealed_segment_file_name("events.log", other),
+                None,
+                "{other}"
+            );
         }
     }
 
@@ -5361,14 +5368,19 @@ recorder_backend = "frankensqlite"
             let sealed = storage.sealed_segments().unwrap();
             assert!(sealed.len() >= 2, "{sealed:?}");
             let sealed_bytes: u64 = sealed.iter().map(|segment| segment.bytes).sum();
-            assert!(sealed_bytes <= TINY_RETENTION.max_total_bytes, "{sealed_bytes}");
+            assert!(
+                sealed_bytes <= TINY_RETENTION.max_total_bytes,
+                "{sealed_bytes}"
+            );
             // Retained segments are contiguous and end where the active log starts.
             for pair in sealed.windows(2) {
                 assert_eq!(pair[0].end_ordinal, pair[1].first_ordinal);
                 assert_eq!(pair[0].segment_id + 1, pair[1].segment_id);
             }
             assert!(sealed[0].first_ordinal > 0, "oldest segments were deleted");
-            let active = std::fs::metadata(dir.path().join("events.log")).unwrap().len();
+            let active = std::fs::metadata(dir.path().join("events.log"))
+                .unwrap()
+                .len();
             assert!(active < TINY_RETENTION.roll_at_bytes + 1_000, "{active}");
             // The final record sits in the active log, or in the newest sealed
             // segment when that very append triggered the roll.
@@ -5416,7 +5428,10 @@ recorder_backend = "frankensqlite"
             let response = append_one(&recovered, 41).await;
             assert_eq!(response.first_offset.ordinal, 41);
             let sealed = recovered.sealed_segments().unwrap();
-            assert_eq!(response.first_offset.segment_id, sealed.last().unwrap().segment_id + 1);
+            assert_eq!(
+                response.first_offset.segment_id,
+                sealed.last().unwrap().segment_id + 1
+            );
         });
     }
 
@@ -5432,12 +5447,23 @@ recorder_backend = "frankensqlite"
                     max_total_bytes: u64::MAX,
                 });
             let response = append_one(&storage, 0).await;
-            assert_eq!(std::fs::metadata(dir.path().join("events.log")).unwrap().len(), 0);
-            assert_eq!(storage.health().await.latest_offset, Some(response.last_offset.clone()));
+            assert_eq!(
+                std::fs::metadata(dir.path().join("events.log"))
+                    .unwrap()
+                    .len(),
+                0
+            );
+            assert_eq!(
+                storage.health().await.latest_offset,
+                Some(response.last_offset.clone())
+            );
             storage.flush(FlushMode::Durable).await.unwrap();
             drop(storage);
             let reopened = AppendLogRecorderStorage::open(config).unwrap();
-            assert_eq!(reopened.health().await.latest_offset, Some(response.last_offset));
+            assert_eq!(
+                reopened.health().await.latest_offset,
+                Some(response.last_offset)
+            );
         });
     }
 
@@ -5462,7 +5488,9 @@ recorder_backend = "frankensqlite"
                 append_one(&storage, n).await;
             }
             assert!(storage.sealed_segments().unwrap().is_empty());
-            let active = std::fs::metadata(dir.path().join("events.log")).unwrap().len();
+            let active = std::fs::metadata(dir.path().join("events.log"))
+                .unwrap()
+                .len();
             assert!(active > TINY_RETENTION.max_total_bytes, "{active}");
         });
     }

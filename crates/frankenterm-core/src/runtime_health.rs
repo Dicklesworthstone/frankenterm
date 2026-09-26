@@ -1559,7 +1559,9 @@ pub fn check_swarm_capacity_operator_summary(
         // without failing the whole health report.
         SwarmCapacityOperatorStatus::Unknown
             if summary.controller_mode
-                != Some(crate::runtime_telemetry::SwarmCapacityAdmissionControllerMode::Enabled) =>
+                != Some(
+                    crate::runtime_telemetry::SwarmCapacityAdmissionControllerMode::Enabled,
+                ) =>
         {
             RuntimeHealthCheck::warn("swarm_capacity", "Swarm capacity", &summary.summary)
                 .with_evidence(&evidence)
@@ -1845,7 +1847,10 @@ mod tests {
         }
         summary.status = SwarmCapacityOperatorStatus::Violated;
         summary.controller_mode = Some(Mode::Disabled);
-        assert_eq!(check_swarm_capacity_operator_summary(&summary).status, CheckStatus::Fail);
+        assert_eq!(
+            check_swarm_capacity_operator_summary(&summary).status,
+            CheckStatus::Fail
+        );
     }
 
     #[test]
