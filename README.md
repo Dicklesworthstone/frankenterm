@@ -2280,10 +2280,15 @@ The controller takes the **worst** tier across the three inputs. If pipeline bac
 
 | Tier | Meaning | Action |
 |---|---|---|
-| **Normal** | All inputs healthy | No throttling |
-| **Elevated** | One input is yellow | Reduce poll cadence; skip optional work (delayed flushes, batch GC) |
-| **Critical** | Any input is red | Aggressive throttling; reject new pane spawns through the operating envelope |
-| **Emergency** | Any input is black | Emergency warm-scrollback eviction; pause all non-essential workflows |
+| **Normal** | All inputs healthy | None |
+| **Elevated** | One input is yellow | Reported (resource cockpit, `ft doctor`, maintenance log); no automatic throttling |
+| **Critical** | Any input is red | `ft watch` asks the mux to move the most pressured panes' warm scrollback to the cold tier (mux codec 67+; older muxes log a recommendation) |
+| **Emergency** | Any input is black | Warm scrollback is evicted on every pane |
+
+The controller also emits `ThrottlePolling` and `PauseIdlePanes` recommendations,
+and the operating envelope plans spawn admission windows, but none of these are
+enforced yet: `ft` does not slow polling, pause panes, or refuse spawns under
+pressure. Warm-scrollback eviction is the only automatic action.
 
 ### Asymmetric hysteresis
 
@@ -2571,9 +2576,10 @@ capacity guarantees.
 
 ### When the loop throttles
 
-- **Elevated tier** — skip optional maintenance (delayed flushes, batch GC).
-- **Critical tier** — reduce poll cadence; deny new pane admission through the envelope.
-- **Emergency tier** — pause non-essential workflows, trigger warm-scrollback eviction.
+- **Elevated tier** — reported only (cockpit, doctor, maintenance log).
+- **Critical tier** — the watcher evicts the targeted panes' warm scrollback on the mux (codec 67+).
+- **Emergency tier** — warm scrollback is evicted on every pane. Poll throttling,
+  pane pausing and spawn refusal are recommendations only today, not enforced.
 
 ### What the loop **never** does
 
