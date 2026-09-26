@@ -13,11 +13,13 @@ use std::time::Duration;
 use tracing::warn;
 
 #[allow(unused_imports)]
+pub(crate) use fastapi::AppConfig;
+#[allow(unused_imports)]
 pub(crate) use fastapi::core::{
     BoxFuture, ControlFlow, Cx, Middleware, OpenApiConfig, StartupOutcome,
 };
 #[allow(unused_imports)]
-pub(crate) use fastapi::http::QueryString;
+pub(crate) use fastapi::http::{ParseLimits, QueryString};
 #[allow(unused_imports)]
 pub(crate) use fastapi::prelude::{App, Method, Request, RequestContext, Response, StatusCode};
 #[allow(unused_imports)]
@@ -53,6 +55,20 @@ const WEB_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(1);
 /// user code and cannot be forcibly time-bounded at this seam.
 const WEB_CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const WEB_CONNECTION_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Parser limits for the application's body cap. The parser buffers a whole
+/// request (line, headers and body, however it is framed) before any
+/// middleware runs, so its bound must be the app's body cap plus the header
+/// allowance: the framework default is 1 MiB whatever the app advertises.
+fn web_parse_limits(max_body_bytes: usize) -> ParseLimits {
+    let defaults = ParseLimits::default();
+    ParseLimits {
+        max_request_size: max_body_bytes
+            .saturating_add(defaults.max_headers_size)
+            .saturating_add(defaults.max_request_line_len),
+        ..defaults
+    }
+}
 
 /// One-way shutdown authority shared by the server and its streaming bodies.
 /// This is deliberately separate from a caller's Cx: cancelling a cloned Cx
@@ -522,6 +538,7 @@ impl FrameworkWebRuntime {
         }
 
         let server_config = ServerConfig::new(resolved_bind_addr.to_string())
+            .with_parse_limits(web_parse_limits(app.config().max_body_size))
             .with_keep_alive_timeout(WEB_KEEP_ALIVE_TIMEOUT)
             .with_drain_timeout(WEB_CONNECTION_DRAIN_TIMEOUT);
         let server = Arc::new(TcpServer::new(server_config));
@@ -743,6 +760,23 @@ mod tests {
         resolve_unauthenticated_bind_addr, validate_unauthenticated_bind_candidates,
         validate_unauthenticated_bound_addr, wait_for_connections_to_drain_with, web_cx_error,
     };
+
+    #[test]
+    fn parser_bound_is_the_body_cap_plus_the_header_allowance() {
+        let defaults = super::ParseLimits::default();
+        let limits = super::web_parse_limits(64 * 1024);
+        assert_eq!(
+            limits.max_request_size,
+            64 * 1024 + defaults.max_headers_size + defaults.max_request_line_len
+        );
+        assert!(limits.max_request_size < defaults.max_request_size);
+        assert_eq!(limits.max_headers_size, defaults.max_headers_size);
+        assert_eq!(limits.max_header_count, defaults.max_header_count);
+        assert_eq!(
+            super::web_parse_limits(usize::MAX).max_request_size,
+            usize::MAX
+        );
+    }
 
     #[test]
     fn stream_shutdown_wakes_parked_waiters_and_is_retained_for_late_subscribers() {

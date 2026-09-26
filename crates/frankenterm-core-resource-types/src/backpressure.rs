@@ -796,6 +796,12 @@ impl BackpressureManager {
         self.config.enabled
     }
 
+    /// The thresholds this manager classifies queue depths against.
+    #[must_use]
+    pub const fn config(&self) -> &BackpressureConfig {
+        &self.config
+    }
+
     /// Snapshot the current telemetry counters.
     pub fn telemetry(&self) -> &BackpressureTelemetry {
         &self.telemetry
