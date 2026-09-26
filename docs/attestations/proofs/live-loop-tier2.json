@@ -3,14 +3,14 @@
   "tier": 2,
   "adapter": "live-mux",
   "panes": "scripted (no model calls)",
-  "build_profile": "debug",
+  "build_profile": "release-interactive",
   "pane_count": 21,
-  "robot_state_p95_ms": 174,
+  "robot_state_p95_ms": 19,
   "host": "Mac-mini-max",
-  "generated_at": "2026-09-25T18:59:33Z",
-  "commit": "2c869b28dca0dc6f0bbb035a51317e1a2d72f217",
+  "generated_at": "2026-09-26T08:11:37Z",
+  "commit": "a312e266db7482746e405b175877be9ec8bf371d",
   "crates_dirty": false,
-  "ft_version": "ft 0.15.21 (2c869b28dca0dc6f0bbb035a51317e1a2d72f217)",
+  "ft_version": "ft 0.15.21 (b6bfaff24aeb6ad2731ab194d750a6adb46d39bb+dirty)",
   "status": "pass",
   "checks": [
     {
@@ -19,7 +19,7 @@
       "detail": "17/17 fixtures started"
     },
     {
-      "name": "twenty_live_panes_via_profile_apply",
+      "name": "at_least_20_live_panes_via_profile_apply",
       "ok": true,
       "detail": "21 panes"
     },
@@ -41,17 +41,17 @@
     {
       "name": "auto_handle_compaction_prompt_reaches_a_claude_pane",
       "ok": true,
-      "detail": "2 pane(s)"
+      "detail": "1 pane(s)"
     },
     {
       "name": "robot_send_into_fullscreen_pane_is_denied",
       "ok": true,
-      "detail": "pane 17"
+      "detail": "1/1 full-screen panes denied"
     },
     {
       "name": "alt_screen_denial_has_audit_row",
       "ok": true,
-      "detail": "ft audit --pane 17"
+      "detail": "1/1 audited"
     },
     {
       "name": "fts_search_finds_usage_limit_across_panes",
@@ -61,7 +61,7 @@
     {
       "name": "robot_state_p95_under_500ms",
       "ok": true,
-      "detail": "174 ms (debug build)"
+      "detail": "19 ms (release-interactive build)"
     }
   ]
 }
