@@ -9,16 +9,19 @@ the policy gate; the robot receipt reports which input mode ran.
 `ft send <pane> <text>` and `ft robot send <pane> <text>` deliver text in one
 of two modes:
 
-| Mode | Flag | Right for | What the pane sees |
-|---|---|---|---|
-| Bracketed paste (default) | none | Agent TUIs (Claude Code, Codex, Gemini) | One paste event; the agent treats the whole text as a single input |
-| Typed | `--no-paste` | Shell prompts | The characters as if typed, so the line editor executes them |
+| Mode | Flag | What the pane sees |
+|---|---|---|
+| Bracketed paste (default) | none | The text as one paste event, then a separately typed Enter that submits it |
+| Typed | `--no-paste` | The characters as if typed, ending in a newline |
 
-A shell prompt inserts a bracketed paste into its line editor **without
-executing it**. To run a command in a shell pane, use `--no-paste`. The default
-is unchanged; choosing the mode is the caller's responsibility.
+The default submits in agent composers (Claude Code, Codex) and shell prompts
+alike: a line editor inserts a pasted newline instead of accepting it, so the
+trailing line ending is split off and typed as its own Enter. After a
+multi-line paste the Enter waits 750 ms, because Claude Code 2.1 folds an
+Enter that arrives right behind one into the paste (measured against the real
+agent).
 
-`--no-newline` suppresses the trailing newline in either mode.
+`--no-newline` sends the text without the Enter in either mode.
 
 ## Receipt fields
 
