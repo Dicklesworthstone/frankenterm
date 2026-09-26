@@ -323,6 +323,53 @@ mod web_tests {
         });
     }
 
+    /// A chunked body carries no Content-Length, so only the parser's own
+    /// bound can refuse it. That bound follows the advertised body cap
+    /// (64 KiB + header allowance), not the framework's 1 MiB default.
+    #[test]
+    fn web_chunked_body_over_the_cap_is_refused_at_the_parser() {
+        fn chunked_request(total: usize) -> Vec<u8> {
+            let mut request = b"GET /health HTTP/1.1\r\nHost: localhost\r\n\
+                Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                .to_vec();
+            let chunk = vec![b'x'; 16 * 1024];
+            let mut sent = 0;
+            while sent < total {
+                let len = chunk.len().min(total - sent);
+                request.extend_from_slice(format!("{len:x}\r\n").as_bytes());
+                request.extend_from_slice(&chunk[..len]);
+                request.extend_from_slice(b"\r\n");
+                sent += len;
+            }
+            request.extend_from_slice(b"0\r\n\r\n");
+            request
+        }
+
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
+            let addr = server.bound_addr();
+            let small = fetch_raw(addr, &chunked_request(1024)).await;
+            let oversized = fetch_raw(addr, &chunked_request(300 * 1024)).await;
+            let shutdown = server.shutdown().await;
+            shutdown.unwrap();
+
+            let small = small.expect("a small chunked body is ordinary framing");
+            assert_eq!(extract_status(&small), 200, "{small}");
+            // The parser refuses it ("request too large") and closes the
+            // connection: no response, an error status, or a reset, but
+            // never a handled 2xx.
+            if let Ok(response) = oversized {
+                let status = extract_status(&response);
+                assert!(
+                    status == 0 || status >= 400,
+                    "300 KiB chunked body must be refused, got {status}: {response}"
+                );
+            }
+        });
+    }
+
     #[test]
     fn web_openapi_discovery_invokes_advertised_health() {
         use anyhow::{Context, ensure};

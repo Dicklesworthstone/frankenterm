@@ -13,7 +13,7 @@ use super::sse::{handle_stream_deltas, handle_stream_events};
 use crate::events::EventBus;
 use crate::policy::Redactor;
 use crate::storage::StorageHandle;
-use crate::web_framework::{App, Method, Request, RequestContext, WebStreamLifecycle};
+use crate::web_framework::{App, AppConfig, Method, Request, RequestContext, WebStreamLifecycle};
 use std::sync::Arc;
 
 pub(super) fn build_app(
@@ -31,6 +31,9 @@ pub(super) fn build_app(
     };
 
     App::builder()
+        // The framework's own body cap (and, through it, the server's parser
+        // bound) is the advertised limit, not the framework's 1 MiB default.
+        .config(AppConfig::new().max_body_size(runtime_limits.max_request_body_bytes))
         .openapi(super::openapi::config())
         .state(streams.clone())
         .middleware(streams)
