@@ -8599,6 +8599,52 @@ impl SwarmResourceCockpitSnapshot {
         self
     }
 
+    /// Return this cockpit with measured `capture` and `write` queue rows
+    /// from the watcher's live depths, classified against the backpressure
+    /// thresholds the watcher itself uses.
+    #[must_use]
+    pub fn with_queue_depths(
+        mut self,
+        depths: &crate::backpressure::QueueDepths,
+        thresholds: &crate::backpressure::BackpressureConfig,
+    ) -> Self {
+        for row in [
+            measured_queue_row(
+                "capture",
+                depths.capture_depth,
+                depths.capture_capacity,
+                (thresholds.yellow_capture, thresholds.red_capture),
+                "resource.queue.capture_pressure",
+            ),
+            measured_queue_row(
+                "write",
+                depths.write_depth,
+                depths.write_capacity,
+                (thresholds.yellow_write, thresholds.red_write),
+                "resource.queue.write_pressure",
+            ),
+        ] {
+            if matches!(row.tier.as_str(), "red" | "black") {
+                self.drilldowns.push(SwarmResourceCockpitDrilldown {
+                    subject: "queue_backpressure".to_string(),
+                    reason_code: row.reason_codes[0].clone(),
+                    detail: format!(
+                        "{} queue {} of {} ({})",
+                        row.queue,
+                        row.depth.unwrap_or(0),
+                        row.capacity.unwrap_or(0),
+                        row.tier
+                    ),
+                });
+            }
+            self.queue_backpressure.push(row);
+        }
+        self.domains.queue_backpressure =
+            swarm_resource_cockpit_queue_domain(&self.queue_backpressure);
+        self.evidence_state = swarm_resource_cockpit_root_evidence_state(&self.domains);
+        self
+    }
+
     /// Concise stable rows for the human doctor surface.
     #[must_use]
     pub fn compact_table_rows(&self) -> Vec<String> {
@@ -9009,6 +9055,21 @@ impl SwarmCapacityOperatorSummary {
                 .take()
                 .map(|cockpit| cockpit.with_pane_budget(evidence));
         }
+        self
+    }
+
+    /// Return this summary with the cockpit's `capture`/`write` queue rows
+    /// measured from the watcher's live queue depths.
+    #[must_use]
+    pub fn with_queue_depths(
+        mut self,
+        depths: &crate::backpressure::QueueDepths,
+        thresholds: &crate::backpressure::BackpressureConfig,
+    ) -> Self {
+        self.resource_cockpit = self
+            .resource_cockpit
+            .take()
+            .map(|cockpit| cockpit.with_queue_depths(depths, thresholds));
         self
     }
 
@@ -9892,6 +9953,55 @@ const fn resource_pressure_policy_decision_name(
         ResourcePressurePolicyDecision::Deny => "deny",
         ResourcePressurePolicyDecision::RequireApproval => "require_approval",
         ResourcePressurePolicyDecision::NotChecked => "not_checked",
+    }
+}
+
+/// One measured cockpit queue row from a live depth and capacity: black when
+/// full, else red/yellow at the (yellow, red) utilization thresholds.
+fn measured_queue_row(
+    queue: &str,
+    depth: usize,
+    capacity: usize,
+    (yellow, red): (f64, f64),
+    pressure_reason: &str,
+) -> SwarmResourceCockpitQueueBackpressureSummary {
+    let as_f64 = |value: usize| f64::from(u32::try_from(value).unwrap_or(u32::MAX));
+    let utilization = if capacity == 0 {
+        0.0
+    } else {
+        as_f64(depth) / as_f64(capacity)
+    };
+    let tier = if capacity > 0 && depth >= capacity {
+        "black"
+    } else if utilization >= red {
+        "red"
+    } else if utilization >= yellow {
+        "yellow"
+    } else {
+        "green"
+    };
+    SwarmResourceCockpitQueueBackpressureSummary {
+        queue: queue.to_string(),
+        evidence_state: SwarmResourceCockpitEvidenceState::Measured,
+        tier: tier.to_string(),
+        depth: Some(u64::try_from(depth).unwrap_or(u64::MAX)),
+        capacity: Some(u64::try_from(capacity).unwrap_or(u64::MAX)),
+        utilization: Some(utilization),
+        oldest_queued_age_ms: None,
+        operator_action: if tier == "green" {
+            "none"
+        } else {
+            "inspect_queue_backpressure"
+        }
+        .to_string(),
+        reason_codes: vec![
+            if tier == "green" {
+                "resource.proof.healthy"
+            } else {
+                pressure_reason
+            }
+            .to_string(),
+        ],
     }
 }
 
@@ -17530,6 +17640,76 @@ mod tests {
             resource_admission: cockpit_domain_for_test("resource_admission", evidence_state),
             action_receipts: cockpit_domain_for_test("action_receipts", evidence_state),
         }
+    }
+
+    #[test]
+    fn queue_depths_measure_the_cockpit_queue_domain() {
+        use crate::backpressure::{BackpressureConfig, QueueDepths};
+        let base =
+            || SwarmCapacityOperatorSummary::unavailable(1_700_000_000_001, 2, "test.missing");
+        let cockpit = |summary: SwarmCapacityOperatorSummary| {
+            summary.resource_cockpit.expect("level 2 includes cockpit")
+        };
+        let thresholds = BackpressureConfig::default();
+
+        let untouched = cockpit(base());
+        assert_eq!(
+            untouched.domains.queue_backpressure.evidence_state,
+            SwarmResourceCockpitEvidenceState::Unavailable
+        );
+
+        let idle = cockpit(base().with_queue_depths(
+            &QueueDepths {
+                capture_depth: 3,
+                capture_capacity: 100,
+                write_depth: 0,
+                write_capacity: 100,
+            },
+            &thresholds,
+        ));
+        assert_eq!(
+            idle.domains.queue_backpressure.evidence_state,
+            SwarmResourceCockpitEvidenceState::Measured
+        );
+        assert_eq!(idle.domains.queue_backpressure.pressure_tier, "green");
+        let queues: Vec<_> = idle
+            .queue_backpressure
+            .iter()
+            .map(|row| (row.queue.as_str(), row.tier.as_str(), row.depth))
+            .collect();
+        assert_eq!(
+            queues,
+            vec![("capture", "green", Some(3)), ("write", "green", Some(0))]
+        );
+        assert!(
+            idle.drilldowns
+                .iter()
+                .all(|d| d.subject != "queue_backpressure")
+        );
+
+        // Capture at 80% is red (>= 0.75), a full write queue is black.
+        let pressured = cockpit(base().with_queue_depths(
+            &QueueDepths {
+                capture_depth: 80,
+                capture_capacity: 100,
+                write_depth: 100,
+                write_capacity: 100,
+            },
+            &thresholds,
+        ));
+        assert_eq!(pressured.domains.queue_backpressure.pressure_tier, "black");
+        let reasons = &pressured.domains.queue_backpressure.reason_codes;
+        assert!(reasons.contains(&"resource.queue.capture_pressure".to_string()));
+        assert!(reasons.contains(&"resource.queue.write_pressure".to_string()));
+        assert_eq!(
+            pressured
+                .drilldowns
+                .iter()
+                .filter(|d| d.subject == "queue_backpressure")
+                .count(),
+            2,
+            "every red/black queue row has a drilldown"
+        );
     }
 
     #[test]

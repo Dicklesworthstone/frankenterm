@@ -6887,7 +6887,16 @@ impl ObservationRuntime {
                                 None,
                                 last_warm_eviction_receipts.as_ref(),
                             )
-                            .with_pane_budget_evidence(pane_budget_evidence),
+                            .with_pane_budget_evidence(pane_budget_evidence)
+                            .with_queue_depths(
+                                &QueueDepths {
+                                    capture_depth,
+                                    capture_capacity: capture_cap,
+                                    write_depth,
+                                    write_capacity: write_cap,
+                                },
+                                backpressure_manager.config(),
+                            ),
                         ),
                         leak_risk_inventory,
                     };
