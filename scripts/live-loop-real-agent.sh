@@ -14,12 +14,15 @@
 #   5. a real Codex pane, spawned by `ft robot profile apply`, answers a
 #      `ft robot send --verify-submit` whose receipt says `submitted`
 #      (reported as SKIP, never as a pass, when no codex binary is installed)
+#   6. a zsh pane with OSC 133 prompt integration accepts a plain
+#      `ft robot send` on live prompt evidence and runs the command
 #
 # Spends a few model turns on the operator's account, so it only runs with
 # LIVE_LOOP_REAL_AGENTS=1. The mux, socket and ft state are private; only the
 # agent sees the real HOME (its auto-updater is disabled).
 #
-# usage: LIVE_LOOP_REAL_AGENTS=1 scripts/live-loop-real-agent.sh [BIN_DIR]
+# usage: LIVE_LOOP_REAL_AGENTS=1 [LIVE_LOOP_RETAIN=1] scripts/live-loop-real-agent.sh [BIN_DIR]
+# LIVE_LOOP_RETAIN=1 keeps a passing receipt as docs/attestations/proofs/live-loop-tier1-seed.json.
 set -uo pipefail
 umask 077
 
@@ -60,6 +63,20 @@ exec env -i HOME="$HOME" PATH="$(dirname "$CLAUDE_BIN"):/opt/homebrew/bin:/usr/l
   TERM=xterm-256color LANG=en_US.UTF-8 USER="$USER" DISABLE_AUTOUPDATER=1 "$CLAUDE_BIN" --model haiku
 EOF
 chmod 700 "$D/agent.sh"
+# Shell integration the way `ft setup shell` wires it: OSC 133 prompt, command
+# and exit-status marks from zsh hooks.
+mkdir -p "$D/zdot"
+cat > "$D/zdot/.zshrc" << 'EOF'
+precmd() { print -n "\e]133;D;$?\a" }
+preexec() { print -n "\e]133;C\a" }
+PS1=$'%{\e]133;A\a%}tier1-shell> %{\e]133;B\a%}'
+EOF
+cat > "$D/shell.sh" << EOF
+#!/bin/bash
+cd "$REPO_ROOT"
+exec env -i HOME="$D/home" ZDOTDIR="$D/zdot" PATH=/usr/bin:/bin TERM=xterm-256color LANG=en_US.UTF-8 /bin/zsh -i
+EOF
+chmod 700 "$D/shell.sh"
 if [[ -x "$CODEX_BIN" ]]; then
   cat > "$D/codex.sh" << EOF
 #!/bin/bash
@@ -173,6 +190,24 @@ else
   echo "SKIP codex_verified_submit_answered - no codex binary"
 fi
 
+ft robot profile create shell_ws --command "$D/shell.sh" > "$OUT/profile-create-shell.json" 2>&1
+ft robot profile apply shell_ws --count 1 > "$OUT/profile-apply-shell.json" 2>&1
+SP=$(python3 -c 'import json,sys;t=open(sys.argv[1]).read();print(json.loads(t[t.index("{"):])["data"]["panes_spawned"][0])' \
+  "$OUT/profile-apply-shell.json" 2> /dev/null)
+sleep 8
+MARK="TIER1_SHELL_$$"
+ft robot send "$SP" "echo $MARK-ran" > "$OUT/shell-send.json" 2> "$OUT/shell-send.err"
+sleep 3
+ft get-text "$SP" --tail 60 > "$OUT/shell-screen.txt" 2> /dev/null
+python3 - "$OUT/shell-send.json" "$OUT/shell-screen.txt" "$MARK-ran" << 'PY'
+import json, sys
+text = open(sys.argv[1]).read()
+injection = (json.loads(text[text.index("{"):]).get("data") or {}).get("injection") or {}
+ran = any(line.strip() == sys.argv[3] for line in open(sys.argv[2], encoding="utf-8", errors="replace"))
+sys.exit(0 if injection.get("status") == "allowed" and ran else 1)
+PY
+check "shell_send_allowed_on_live_prompt_and_ran" $? "pane ${SP:-?}"
+
 CLAUDE_LINK_AFTER=$(readlink "$CLAUDE_BIN" 2> /dev/null || echo "$CLAUDE_BIN")
 case "$CLAUDE_LINK_AFTER" in /tmp/* | /private/tmp/* | /var/folders/*) false ;; *) true ;; esac
 check "operator_claude_install_not_in_temp" $? "$CLAUDE_LINK_BEFORE -> $CLAUDE_LINK_AFTER"
@@ -182,7 +217,7 @@ import json, platform, subprocess, sys, time
 checks = [json.loads(c) for c in sys.argv[4:]]
 receipt = {
     "schema": "ft.live-loop-proof.v1", "tier": "1-seed", "adapter": "live-mux",
-    "panes": "1 real Claude Code pane (haiku), real /compact",
+    "panes": "real Claude Code (haiku, real /compact) + real Codex + zsh with OSC 133",
     "ft_version": sys.argv[2].strip(), "agent_version": sys.argv[3].strip(),
     "host": platform.node(), "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     "commit": subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip(),
@@ -193,4 +228,7 @@ receipt = {
 json.dump(receipt, open(sys.argv[1], "w"), indent=2)
 print(f"live-loop real agent: {receipt['status']} ({sum(c['ok'] for c in checks)}/{len(checks)})")
 PY
-python3 -c 'import json,sys;sys.exit(0 if json.load(open(sys.argv[1]))["status"]=="pass" else 1)' "$OUT/receipt.json"
+python3 -c 'import json,sys;sys.exit(0 if json.load(open(sys.argv[1]))["status"]=="pass" else 1)' "$OUT/receipt.json" || exit 1
+if [[ "${LIVE_LOOP_RETAIN:-0}" == 1 ]]; then
+  cp "$OUT/receipt.json" "$REPO_ROOT/docs/attestations/proofs/live-loop-tier1-seed.json"
+fi
