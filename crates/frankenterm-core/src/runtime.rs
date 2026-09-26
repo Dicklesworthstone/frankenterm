@@ -6806,6 +6806,14 @@ impl ObservationRuntime {
                                 snapshot_timestamp,
                                 observed_panes,
                                 3,
+                            )
+                            .with_resource_cockpit_inputs_and_resource_evidence(
+                                warm_tier_budget_snapshot(&tiered_scrollback_fetch.summaries)
+                                    .as_ref(),
+                                &[],
+                                None,
+                                None,
+                                None,
                             ),
                         ),
                         leak_risk_inventory,
@@ -11721,6 +11729,36 @@ fn approximate_warm_page_count(summary: &PaneTieredScrollbackSummary) -> usize {
     summary
         .warm_resident_lines
         .div_ceil(DEFAULT_WARM_PAGE_LINES)
+}
+
+/// Warm-tier budget evidence for the resource cockpit, from the mux's own
+/// per-pane accounting: resident warm bytes against the panes' configured warm
+/// caps. `None` when no pane reports tiered scrollback. Nothing is reclaimable
+/// through the watcher: the mux has no eviction request (ft-fvbp7).
+fn warm_tier_budget_snapshot(
+    summaries: &HashMap<u64, PaneTieredScrollbackSummary>,
+) -> Option<crate::fleet_memory_controller::FleetMemoryTierBudgetSnapshot> {
+    use crate::fleet_memory_controller::{
+        FleetMemoryTier, FleetMemoryTierBudgetRecord, FleetMemoryTierBudgetSnapshot,
+    };
+
+    let mut tiered = summaries
+        .values()
+        .filter(|summary| summary.tiering_enabled)
+        .peekable();
+    tiered.peek()?;
+    let (budget, actual) = tiered.fold((0u64, 0u64), |(budget, actual), summary| {
+        (
+            budget.saturating_add(
+                u64::try_from(summary.configured_warm_max_bytes).unwrap_or(u64::MAX),
+            ),
+            actual.saturating_add(u64::try_from(summary.warm_resident_bytes).unwrap_or(u64::MAX)),
+        )
+    });
+    let mut record =
+        FleetMemoryTierBudgetRecord::new(FleetMemoryTier::WarmCompressed, budget, actual);
+    record.reclaimable_bytes = 0;
+    Some(FleetMemoryTierBudgetSnapshot::from_tiers([record]))
 }
 
 fn estimated_memory_bytes_from_tiered_scrollback(summary: &PaneTieredScrollbackSummary) -> usize {
@@ -25799,6 +25837,44 @@ mod tests {
         assert_eq!(
             classify_pane_budget_level(default_high, budget, f64::NAN),
             BudgetLevel::Throttled
+        );
+    }
+
+    #[test]
+    fn warm_tier_budget_snapshot_sums_mux_warm_accounting() {
+        use crate::fleet_memory_controller::{FleetMemoryTier, FleetPressureTier};
+        const MIB: usize = 1024 * 1024;
+        let pane = |tiering_enabled, warm_resident_bytes| PaneTieredScrollbackSummary {
+            tiering_enabled,
+            configured_warm_max_bytes: if tiering_enabled { 50 * MIB } else { 0 },
+            warm_resident_bytes,
+            ..PaneTieredScrollbackSummary::default()
+        };
+
+        assert!(warm_tier_budget_snapshot(&HashMap::new()).is_none());
+        // Only panes without tiering (alternate screen): no warm budget at all.
+        assert!(warm_tier_budget_snapshot(&HashMap::from([(1, pane(false, 0))])).is_none());
+
+        let summaries = HashMap::from([
+            (1, pane(true, 10 * MIB)),
+            (2, pane(true, 30 * MIB)),
+            (3, pane(false, 0)),
+        ]);
+        let snapshot = warm_tier_budget_snapshot(&summaries).expect("two tiered panes");
+        assert_eq!(snapshot.tiers.len(), 1);
+        let warm = &snapshot.tiers[0];
+        assert_eq!(warm.tier, FleetMemoryTier::WarmCompressed);
+        assert_eq!(warm.budget_bytes, 100 * MIB as u64);
+        assert_eq!(warm.actual_bytes, 40 * MIB as u64);
+        assert_eq!(warm.reclaimable_bytes, 0, "the mux has no eviction request");
+        assert_eq!(snapshot.pressure_tier(), FleetPressureTier::Normal);
+
+        let over = HashMap::from([(1, pane(true, 80 * MIB))]);
+        assert_ne!(
+            warm_tier_budget_snapshot(&over)
+                .expect("tiered pane")
+                .pressure_tier(),
+            FleetPressureTier::Normal
         );
     }
 
