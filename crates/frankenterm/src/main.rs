@@ -751,12 +751,10 @@ SEE ALSO:
         /// Text to send
         text: String,
 
-        /// Type the text character by character instead of the default
-        /// bracketed paste. The default is right for agent TUIs (Claude Code,
-        /// Codex, Gemini treat a paste as one input); a shell prompt inserts a
-        /// bracketed paste into its line editor WITHOUT executing it, so use
-        /// --no-paste to run commands in a shell pane. The receipt reports the
-        /// mode as `no_paste`.
+        /// Type the text character by character instead of the default, which
+        /// sends it as one bracketed paste and then types the Enter that
+        /// submits it (agent composers and shell prompts alike). The receipt
+        /// reports the mode as `no_paste`.
         #[arg(long)]
         no_paste: bool,
 
@@ -3996,9 +3994,8 @@ enum RobotCommands {
         #[arg(long)]
         wait_for_regex: bool,
 
-        /// Type the text instead of sending it as one bracketed paste. Use this
-        /// to run commands in a shell pane: shells insert a paste into the line
-        /// editor without executing it. The receipt reports `no_paste`.
+        /// Type the text instead of sending it as one bracketed paste followed
+        /// by a typed Enter (the default). The receipt reports `no_paste`.
         #[arg(long)]
         no_paste: bool,
 
@@ -13980,8 +13977,8 @@ struct RobotSendData {
     #[serde(skip_serializing_if = "Option::is_none")]
     submit: Option<frankenterm_core::robot_types::SubmitReceipt>,
     /// Paste mode the send ran in (ft-xxfwy.36): `false` is bracketed paste
-    /// (the default, right for agent TUIs), `true` means the text was typed
-    /// with `--no-paste` (right for shells).
+    /// plus a typed Enter (the default), `true` means the text was typed with
+    /// `--no-paste`.
     no_paste: bool,
     /// `true` when `--no-newline` suppressed the trailing newline.
     no_newline: bool,
