@@ -50795,8 +50795,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     }
                                 };
                                 let domain = pane_info.inferred_domain();
-                                let mut submit_agent_type = infer_send_submit_agent_type(&pane_info);
-                                if submit_agent_type == frankenterm_core::patterns::AgentType::Unknown
+                                let mut submit_agent_type =
+                                    infer_send_submit_agent_type(&pane_info);
+                                if submit_agent_type
+                                    == frankenterm_core::patterns::AgentType::Unknown
                                     && submit_guarantee_level
                                         .is_some_and(|level| level.requires_submit_profile())
                                 {
@@ -96205,7 +96207,9 @@ fn session_restore_lifecycle_needs_reconciliation(
 /// Unclean sessions whose owner is not a live process. A running watcher's
 /// own session is unclean until it shuts down; that is not something to
 /// recover, and counting it made every health probe fail while ft watch ran.
-fn stale_unclean_sessions(report: &frankenterm_core::session_restore::SessionDoctorReport) -> usize {
+fn stale_unclean_sessions(
+    report: &frankenterm_core::session_restore::SessionDoctorReport,
+) -> usize {
     report.unclean_sessions.saturating_sub(report.live_sessions)
 }
 
@@ -96308,9 +96312,9 @@ const BUSIEST_PANES_SHOWN: usize = 5;
 /// (ft-wl9rx), from the watcher's `pane_output_rates` status field. Empty
 /// until the watcher has a rate window with any output.
 fn busiest_pane_lines(rates: &serde_json::Value) -> Vec<String> {
-    let Ok(snapshot) = serde_json::from_value::<frankenterm_core::runtime::PaneOutputRatesSnapshot>(
-        rates.clone(),
-    ) else {
+    let Ok(snapshot) =
+        serde_json::from_value::<frankenterm_core::runtime::PaneOutputRatesSnapshot>(rates.clone())
+    else {
         return Vec::new();
     };
     let active: Vec<_> = snapshot
@@ -96969,9 +96973,15 @@ mod operator_guidance_tests {
             .expect("outside contract must be refused");
         assert_eq!(err.error_code, "mission.path_escapes_workspace");
         assert_eq!(err.exit_code, super::MISSION_EXIT_VALIDATION);
-        assert!(err.message.contains("outside workspace root"), "{}", err.message);
         assert!(
-            err.hint.unwrap_or_default().contains("under the workspace root"),
+            err.message.contains("outside workspace root"),
+            "{}",
+            err.message
+        );
+        assert!(
+            err.hint
+                .unwrap_or_default()
+                .contains("under the workspace root"),
             "hint must name the fix, not lock-file access"
         );
     }
@@ -97001,7 +97011,10 @@ mod operator_guidance_tests {
             session_recovery_diagnostic_check(&report).status,
             DiagnosticStatus::Ok
         ));
-        assert_ne!(build_session_recovery_guidance(&report).status, "recovery_required");
+        assert_ne!(
+            build_session_recovery_guidance(&report).status,
+            "recovery_required"
+        );
 
         // A dead owner's session beside it still warns.
         let stale = SessionDoctorReport {
@@ -98609,14 +98622,17 @@ async fn mux_scrollback_diagnostic(
     let mut cap_min = usize::MAX;
     let mut cap_max = 0usize;
     for chunk in pane_ids.chunks(PANE_TIERED_SCROLLBACK_BULK_MAX_PANES) {
-        let Ok(Some(entries)) = mux.pane_tiered_scrollback_summaries_bulk_with_cx(cx, chunk).await
+        let Ok(Some(entries)) = mux
+            .pane_tiered_scrollback_summaries_bulk_with_cx(cx, chunk)
+            .await
         else {
             continue;
         };
         for entry in entries {
             if let PaneTieredScrollbackBatchOutcome::Available(summary) = entry.outcome {
                 reported += 1;
-                warm_resident_bytes = warm_resident_bytes.saturating_add(summary.warm_resident_bytes);
+                warm_resident_bytes =
+                    warm_resident_bytes.saturating_add(summary.warm_resident_bytes);
                 cap_min = cap_min.min(summary.configured_warm_max_bytes);
                 cap_max = cap_max.max(summary.configured_warm_max_bytes);
             }
@@ -98625,7 +98641,10 @@ async fn mux_scrollback_diagnostic(
     if reported == 0 {
         return Some(DiagnosticCheck::warning(
             "mux scrollback",
-            format!("{} panes listed; none reported tiered scrollback", pane_ids.len()),
+            format!(
+                "{} panes listed; none reported tiered scrollback",
+                pane_ids.len()
+            ),
             "Check that the mux is a FrankenTerm mux with tiered scrollback enabled",
         ));
     }
@@ -102741,16 +102760,20 @@ mod tests {
         std::fs::write(&active, "config.scrollback_lines = 50000\n").unwrap();
         // Only the active file exists among the real candidate paths here, so
         // nothing else can disagree in this sandbox.
-        assert!(disagreeing_scrollback_configs(&active, 50_000)
-            .iter()
-            .all(|(path, _)| path != &active));
+        assert!(
+            disagreeing_scrollback_configs(&active, 50_000)
+                .iter()
+                .all(|(path, _)| path != &active)
+        );
         assert_eq!(
             parse_wezterm_scrollback_lines("config.scrollback_lines = 100000\n"),
             Some(100_000)
         );
-        assert!(scrollback_config_paths()
-            .iter()
-            .any(|path| path.ends_with(".frankenterm.lua")));
+        assert!(
+            scrollback_config_paths()
+                .iter()
+                .any(|path| path.ends_with(".frankenterm.lua"))
+        );
     }
 
     #[test]
@@ -102770,9 +102793,15 @@ mod tests {
         let lines = busiest_pane_lines(&rates);
         assert_eq!(lines.len(), 3, "{lines:?}");
         assert_eq!(lines[0], "Busiest panes (captured output, last 30s):");
-        assert!(lines[1].contains("pane    7") && lines[1].contains("MiB/s"), "{lines:?}");
+        assert!(
+            lines[1].contains("pane    7") && lines[1].contains("MiB/s"),
+            "{lines:?}"
+        );
         assert!(lines[1].contains("12 segments dropped"), "{lines:?}");
-        assert!(lines[2].contains("pane    3") && lines[2].contains("2.0 KiB/s"), "{lines:?}");
+        assert!(
+            lines[2].contains("pane    3") && lines[2].contains("2.0 KiB/s"),
+            "{lines:?}"
+        );
 
         let first_tick = serde_json::json!({"timestamp_ms": 1, "window_ms": 0, "panes": []});
         assert!(busiest_pane_lines(&first_tick).is_empty());
@@ -102832,7 +102861,10 @@ mod tests {
         assert!(matches!(small.status, DiagnosticStatus::Ok));
         let detail = small.detail.unwrap_or_default();
         assert!(detail.contains("events.log 3.0 KiB"), "{detail}");
-        assert!(detail.contains("rolls events.log every 256.0 MiB"), "{detail}");
+        assert!(
+            detail.contains("rolls events.log every 256.0 MiB"),
+            "{detail}"
+        );
 
         let sealed = "events.log.00000000000000000000.00000000000000000000-00000000000000000009";
         std::fs::write(dir.path().join(sealed), vec![0_u8; 2 * 1024]).unwrap();

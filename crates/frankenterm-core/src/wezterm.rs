@@ -2628,9 +2628,7 @@ impl WeztermClient {
                 } else {
                     let (body, submit) = split_paste_submit(&data);
                     if !submit {
-                        pool.send_paste_with_cx(cx, pane_id, data)
-                            .await
-                            .map(|_| ())
+                        pool.send_paste_with_cx(cx, pane_id, data).await.map(|_| ())
                     } else {
                         // An app with bracketed paste enabled (agent composers,
                         // zsh) inserts a pasted newline instead of submitting,
@@ -12748,13 +12746,12 @@ mod unified_tests {
                     (bit(3), "/u", MuxSocketSource::ConfigUnixDomain),
                     (bit(4), "/d", MuxSocketSource::DefaultUnixDomain),
                 ];
-                let expected = present
-                    .iter()
-                    .find(|(is_present, _, _)| *is_present)
-                    .map(|(_, path, source)| DiscoveredMuxSocket {
+                let expected = present.iter().find(|(is_present, _, _)| *is_present).map(
+                    |(_, path, source)| DiscoveredMuxSocket {
                         path: PathBuf::from(path),
                         source: *source,
-                    });
+                    },
+                );
                 assert_eq!(
                     rank_mux_socket_candidates(&candidates),
                     expected,

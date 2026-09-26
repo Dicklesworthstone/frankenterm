@@ -452,7 +452,10 @@ mod tests {
         // Disabled fleet budget: each pane keeps its own cap.
         assert_eq!(warm_max_bytes_with_fleet_share(50, 0, 97), 50 * MIB);
         // 1 GiB across 97 panes is ~10.6 MiB each, below the 50 MiB cap.
-        assert_eq!(warm_max_bytes_with_fleet_share(50, 1024, 97), 1024 * MIB / 97);
+        assert_eq!(
+            warm_max_bytes_with_fleet_share(50, 1024, 97),
+            1024 * MIB / 97
+        );
         // A few panes: the per-pane cap still bounds each one.
         assert_eq!(warm_max_bytes_with_fleet_share(50, 1024, 4), 50 * MIB);
         // No live panes counted yet: share across one.

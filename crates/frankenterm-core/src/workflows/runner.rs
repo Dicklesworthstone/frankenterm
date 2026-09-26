@@ -826,9 +826,11 @@ impl WorkflowRunner {
     ) -> Self {
         self.injector = self.injector.with_capability_source(
             Arc::clone(&self.storage),
-            Some(crate::pane_capability_resolution::WatcherCapabilitySource::RegistryWithMux(
-                registry, mux,
-            )),
+            Some(
+                crate::pane_capability_resolution::WatcherCapabilitySource::RegistryWithMux(
+                    registry, mux,
+                ),
+            ),
         );
         self
     }

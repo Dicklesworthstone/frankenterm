@@ -109,8 +109,9 @@ pub fn classify_agent_screen(tail: &str) -> Option<(&'static str, AgentScreenSta
             text.strip_prefix(*marker)
                 .map(str::trim_start)
                 .is_some_and(|rest| {
-                    rest.split_once('.')
-                        .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+                    rest.split_once('.').is_some_and(|(n, _)| {
+                        !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())
+                    })
                 })
         })
     });
@@ -127,15 +128,16 @@ pub fn classify_agent_screen(tail: &str) -> Option<(&'static str, AgentScreenSta
             && window[1].starts_with('❯')
             && window[2].trim_start().starts_with('─')
     });
-    let agent = if codex_composer || any(&["openai codex", "codex can read", "agent command center"]) {
-        "codex"
-    } else if claude_composer || any(&["claude code"]) {
-        "claude_code"
-    } else if any(&["gemini cli", "gemini code assist"]) {
-        "gemini"
-    } else {
-        return None;
-    };
+    let agent =
+        if codex_composer || any(&["openai codex", "codex can read", "agent command center"]) {
+            "codex"
+        } else if claude_composer || any(&["claude code"]) {
+            "claude_code"
+        } else if any(&["gemini cli", "gemini code assist"]) {
+            "gemini"
+        } else {
+            return None;
+        };
 
     if selected_menu_item
         || any(&[
@@ -630,14 +632,14 @@ pub async fn resolve_pane_capabilities_with_source(
                     if let Some(live) = &state.live_prompt {
                         if let Some(live_state) = live.osc_state() {
                             osc_state = Some(live_state);
-                            agent_composer_ready =
-                                live.shell_state == LiveShellState::AgentReady;
+                            agent_composer_ready = live.shell_state == LiveShellState::AgentReady;
                             // Name agent-screen evidence so a denial explains itself.
                             if let Some(detail) = &live.detail {
                                 warnings.push(bounded_detail("Live prompt evidence: ", detail));
                             }
                         } else if let Some(detail) = &live.detail {
-                            warnings.push(bounded_detail("Live prompt state unavailable: ", detail));
+                            warnings
+                                .push(bounded_detail("Live prompt state unavailable: ", detail));
                         }
                     }
                     if let Some(state_in_gap) = state.in_gap {
@@ -680,7 +682,8 @@ pub async fn resolve_pane_capabilities_with_source(
     if agent_composer_ready && capabilities.alt_screen == Some(true) {
         capabilities.alt_screen = Some(false);
         warnings.push(
-            "Alternate screen holds an idle agent composer; alt-screen gate not applied.".to_string(),
+            "Alternate screen holds an idle agent composer; alt-screen gate not applied."
+                .to_string(),
         );
     }
 
@@ -1086,7 +1089,10 @@ mod tests {
         // Output after the last prompt.
         assert_eq!(
             classify(
-                vec![zone(Kind::Prompt, 0, "$ "), zone(Kind::Output, 1, "building")],
+                vec![
+                    zone(Kind::Prompt, 0, "$ "),
+                    zone(Kind::Output, 1, "building")
+                ],
                 Some(2)
             ),
             LiveShellState::CommandRunning
@@ -1140,12 +1146,14 @@ mod tests {
     fn busy_and_permission_screens_are_not_ready() {
         // Synthetic, in the agents' documented layouts: working status lines
         // sit above a still-visible composer.
-        let codex_busy = "• Working (12s • esc to interrupt)\n\n› Ask Codex to do anything\n  ? for shortcuts\n";
+        let codex_busy =
+            "• Working (12s • esc to interrupt)\n\n› Ask Codex to do anything\n  ? for shortcuts\n";
         assert_eq!(
             classify_agent_screen(codex_busy),
             Some(("codex", AgentScreenState::Busy))
         );
-        let claude_busy = "✻ Pondering… (8s · esc to interrupt)\n────────\n❯ \n────────\n  ? for shortcuts\n";
+        let claude_busy =
+            "✻ Pondering… (8s · esc to interrupt)\n────────\n❯ \n────────\n  ? for shortcuts\n";
         assert_eq!(
             classify_agent_screen(claude_busy),
             Some(("claude_code", AgentScreenState::Busy))
@@ -1216,7 +1224,8 @@ mod tests {
             last_exit_code: None,
             detail: Some("agent_ready:codex".to_string()),
         };
-        let caps = PaneCapabilities::from_ingest_state(ready.osc_state().as_ref(), Some(false), false);
+        let caps =
+            PaneCapabilities::from_ingest_state(ready.osc_state().as_ref(), Some(false), false);
         assert!(caps.prompt_active && !caps.command_running);
         let json = serde_json::to_value(&ready).unwrap();
         assert_eq!(json["shell_state"], "agent_ready");

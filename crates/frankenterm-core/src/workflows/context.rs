@@ -476,10 +476,7 @@ async fn capture_verified_submit_text(
     client: &crate::wezterm::WeztermHandle,
     pane_id: u64,
 ) -> Option<String> {
-    match client
-        .get_text_with_cx(cx, pane_id, false)
-        .await
-    {
+    match client.get_text_with_cx(cx, pane_id, false).await {
         Ok(text) => Some(text),
         Err(error) => {
             tracing::debug!(

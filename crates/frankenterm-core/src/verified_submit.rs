@@ -317,11 +317,9 @@ pub async fn classify_verified_submit_polled(
             } else {
                 VERIFY_SUBMIT_POLL_MS
             };
-            let _ = crate::runtime_async::sleep_with_cx(
-                cx,
-                std::time::Duration::from_millis(delay_ms),
-            )
-            .await;
+            let _ =
+                crate::runtime_async::sleep_with_cx(cx, std::time::Duration::from_millis(delay_ms))
+                    .await;
             let after_text = match client.get_text_with_cx(cx, pane_id, false).await {
                 Ok(text) => Some(text),
                 Err(error) => {
@@ -329,18 +327,18 @@ pub async fn classify_verified_submit_polled(
                     None
                 }
             };
-            let after_semantic_snapshot =
-                match client.get_semantic_zones_with_cx(cx, pane_id).await {
-                    Ok(snapshot) => Some(snapshot),
-                    Err(error) => {
-                        tracing::debug!(
-                            pane_id,
-                            %error,
-                            "verified-submit semantic capture unavailable"
-                        );
-                        None
-                    }
-                };
+            let after_semantic_snapshot = match client.get_semantic_zones_with_cx(cx, pane_id).await
+            {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    tracing::debug!(
+                        pane_id,
+                        %error,
+                        "verified-submit semantic capture unavailable"
+                    );
+                    None
+                }
+            };
             (after_text, after_semantic_snapshot)
         } else {
             (None, None)
