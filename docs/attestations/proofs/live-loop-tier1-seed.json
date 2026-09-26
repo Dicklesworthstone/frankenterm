@@ -3,14 +3,20 @@
   "tier": "1-seed",
   "adapter": "live-mux",
   "panes": "real Claude Code (haiku, real /compact) + real Codex + zsh with OSC 133",
-  "ft_version": "ft 0.15.21 (b6bfaff24aeb6ad2731ab194d750a6adb46d39bb+dirty)",
+  "build_profile": "release-perf",
+  "ft_version": "ft 0.15.21 (d3af2d86165524c50b7832a5681de2f1938aafab+dirty)",
   "agent_version": "2.1.283 (Claude Code)",
   "host": "Mac-mini-max",
-  "generated_at": "2026-09-26T08:18:57Z",
-  "commit": "99137d0a6d0ca06e1fd9162f1f7e578186e75565",
+  "generated_at": "2026-09-26T09:12:44Z",
+  "commit": "d3af2d86165524c50b7832a5681de2f1938aafab",
   "crates_dirty": false,
   "status": "pass",
   "checks": [
+    {
+      "name": "recorded_session_replays_the_loop",
+      "ok": true,
+      "detail": "254723 bytes .war"
+    },
     {
       "name": "real_compaction_detected",
       "ok": true,

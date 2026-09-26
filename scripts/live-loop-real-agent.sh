@@ -16,8 +16,8 @@
 #      (reported as SKIP, never as a pass, when no codex binary is installed)
 #   6. a zsh pane with OSC 133 prompt integration accepts a plain
 #      `ft robot send` on live prompt evidence and runs the command
-#   7. the Claude pane is recorded (`ft record`) and `ft replay` of the .war
-#      recording contains the compaction and the workflow's prompt
+#   7. the Claude pane is recorded (`ft record`, stopped with Ctrl+C): `ft replay`
+#      reports its frames and the exported cast holds the compaction and the prompt
 #
 # Spends a few model turns on the operator's account, so it only runs with
 # LIVE_LOOP_REAL_AGENTS=1. The mux, socket and ft state are private; only the
@@ -160,11 +160,16 @@ done
 # A standalone recording stops on SIGINT (Ctrl+C) and must flush what it holds.
 kill -INT "$RECPID" 2> /dev/null
 for _ in $(seq 1 50); do kill -0 "$RECPID" 2> /dev/null || break; sleep 0.2; done
+# `ft replay --json` reports the recording's metadata; the exported cast holds
+# the recorded screen text.
 ft replay "$OUT/claude.war" --json > "$OUT/replay.json" 2> "$OUT/replay.err"
-python3 - "$OUT/replay.json" << 'PY'
-import sys
-text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
-sys.exit(0 if "Conversation compacted" in text and "READY-TIER1" in text else 1)
+ft record export "$OUT/claude.war" -o "$OUT/claude.cast" > "$OUT/record-export.log" 2>&1
+python3 - "$OUT/replay.json" "$OUT/claude.cast" << 'PY'
+import json, sys
+meta = open(sys.argv[1]).read()
+frames = json.loads(meta[meta.index("{"):]).get("frames", 0)
+cast = open(sys.argv[2], encoding="utf-8", errors="replace").read()
+sys.exit(0 if frames > 0 and "Conversation compacted" in cast and "READY-TIER1" in cast else 1)
 PY
 check "recorded_session_replays_the_loop" $? "$(wc -c < "$OUT/claude.war" 2> /dev/null | tr -d ' ') bytes .war"
 
@@ -231,12 +236,13 @@ CLAUDE_LINK_AFTER=$(readlink "$CLAUDE_BIN" 2> /dev/null || echo "$CLAUDE_BIN")
 case "$CLAUDE_LINK_AFTER" in /tmp/* | /private/tmp/* | /var/folders/*) false ;; *) true ;; esac
 check "operator_claude_install_not_in_temp" $? "$CLAUDE_LINK_BEFORE -> $CLAUDE_LINK_AFTER"
 
-python3 - "$OUT/receipt.json" "$("$FT_BIN" --version 2> /dev/null)" "$("$CLAUDE_BIN" --version 2> /dev/null)" "${CHECKS[@]}" << 'PY'
+python3 - "$OUT/receipt.json" "$("$FT_BIN" --version 2> /dev/null)" "$("$CLAUDE_BIN" --version 2> /dev/null)" "$(basename "$BIN")" "${CHECKS[@]}" << 'PY'
 import json, platform, subprocess, sys, time
-checks = [json.loads(c) for c in sys.argv[4:]]
+checks = [json.loads(c) for c in sys.argv[5:]]
 receipt = {
     "schema": "ft.live-loop-proof.v1", "tier": "1-seed", "adapter": "live-mux",
     "panes": "real Claude Code (haiku, real /compact) + real Codex + zsh with OSC 133",
+    "build_profile": sys.argv[4],
     "ft_version": sys.argv[2].strip(), "agent_version": sys.argv[3].strip(),
     "host": platform.node(), "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     "commit": subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip(),
