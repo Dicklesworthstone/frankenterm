@@ -987,7 +987,7 @@ impl RecorderStorageInstance {
     pub fn with_append_log_retention(self, retention: AppendLogRetention) -> Self {
         match self {
             Self::AppendLog(storage) => Self::AppendLog(storage.with_retention(retention)),
-            other => other,
+            other @ Self::Rusqlite(_) => other,
         }
     }
 }
