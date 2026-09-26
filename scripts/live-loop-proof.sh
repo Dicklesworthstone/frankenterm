@@ -32,7 +32,9 @@ FT_BIN="$BIN/ft"; MUX_BIN="$BIN/frankenterm-mux-server"
 for bin in "$FT_BIN" "$MUX_BIN"; do [[ -x "$bin" ]] || { echo "missing $bin" >&2; exit 2; }; done
 OUT="$REPO_ROOT/tests/e2e/artifacts/live-loop/$(date +%Y%m%dT%H%M%S)"
 mkdir -p "$OUT"
-case "$BIN" in *release*) PROFILE=release ;; *) PROFILE=debug ;; esac
+# Cargo names the output directory after the profile (debug, release-perf,
+# release-interactive, ...); a measurement applies only to the profile it ran on.
+PROFILE=$(basename "$BIN")
 TIER=${LIVE_LOOP_TIER:-2}
 if [[ "$TIER" == 3 ]]; then
   SPECS=${LIVE_LOOP_SPECS:-codex:14 claude:14 gemini:10 fullscreen:2}
