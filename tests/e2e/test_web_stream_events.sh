@@ -7,7 +7,7 @@
 # A zsh pane gets the title `codex` and prints the real Codex usage-limit line; the
 # watcher detects codex.usage.reached, which must reach an SSE subscriber that
 # connected before the trigger. A second subscriber filtered to another pane must
-# receive nothing.
+# receive nothing. A client reconnecting with Last-Event-ID resumes from persisted events.
 #
 # Needs native `ft` (built with the web feature) and `frankenterm-mux-server`:
 # FT_BIN_DIR (default target/debug). WEB_STREAM_MODES narrows the modes.
@@ -124,6 +124,25 @@ except Exception:
     ARRIVED=$(now)
     sleep "${DELTA_SETTLE_SECS:-2}"
 
+    # Resume (ft-emlzp): the detection frame's SSE id is its persisted event id.
+    # A client reconnecting with Last-Event-ID one below it gets it replayed;
+    # one reconnecting at it gets nothing replayed.
+    local EVENT_ID
+    EVENT_ID=$(python3 - "$OUT/$MODE.sse.txt" << 'PY'
+import sys
+lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
+for i, line in enumerate(lines):
+    if line.startswith("data: ") and "codex.usage.reached" in line:
+        ids = [l[4:].strip() for l in lines[max(0, i - 3):i] if l.startswith("id: ")]
+        print(ids[-1] if ids else "")
+        break
+PY
+)
+    curl -sN --max-time 4 -H "Last-Event-ID: $((${EVENT_ID:-1} - 1))" \
+        "http://127.0.0.1:$PORT/stream/events?channel=detections" > "$OUT/$MODE.resume-before.txt" 2> /dev/null
+    curl -sN --max-time 4 -H "Last-Event-ID: ${EVENT_ID:-0}" \
+        "http://127.0.0.1:$PORT/stream/events?channel=detections" > "$OUT/$MODE.resume-at.txt" 2> /dev/null
+
     if [[ -n "$WEB_PID" ]]; then
         # Slow client: subscribes to the busiest stream and never reads, while
         # the pane floods. The server must stay bounded and responsive.
@@ -180,6 +199,15 @@ PY
     copies=$(grep -c "codex.usage.reached" "$OUT/$MODE.sse.txt")
     [[ "$copies" == 1 ]]
     check "$MODE/the detection is delivered exactly once" $? "$copies copies"
+    [[ -n "$EVENT_ID" ]] && grep -q "^id: $EVENT_ID\$" "$OUT/$MODE.sse.txt"
+    check "$MODE/the detection frame's SSE id is its persisted event id" $? "id '${EVENT_ID}'"
+    [[ "$(grep -c '"replayed":true' "$OUT/$MODE.resume-before.txt")" == 1 ]] \
+        && grep -q "codex.usage.reached" "$OUT/$MODE.resume-before.txt"
+    check "$MODE/Last-Event-ID just before it replays the detection once" $? \
+        "$(head -c 400 "$OUT/$MODE.resume-before.txt")"
+    grep -q '"kind":"ready"' "$OUT/$MODE.resume-at.txt" \
+        && ! grep -q '"replayed":true' "$OUT/$MODE.resume-at.txt"
+    check "$MODE/Last-Event-ID at it replays nothing" $? "$(head -c 400 "$OUT/$MODE.resume-at.txt")"
 }
 
 for mode in ${WEB_STREAM_MODES:-standalone inprocess}; do
