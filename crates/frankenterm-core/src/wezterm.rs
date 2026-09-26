@@ -9936,7 +9936,20 @@ pub fn rank_mux_socket_candidates(candidates: &MuxSocketCandidates) -> Option<Di
 /// in `config::gui_socket`, and this is the consumer side of that contract.
 #[must_use]
 pub fn discover_mux_socket_ranked(config_socket_path: Option<&str>) -> Option<DiscoveredMuxSocket> {
-    rank_mux_socket_candidates(&gather_mux_socket_candidates(config_socket_path))
+    let candidates = gather_mux_socket_candidates(config_socket_path);
+    let chosen = rank_mux_socket_candidates(&candidates);
+    tracing::debug!(
+        explicit_config = ?candidates.explicit_config,
+        environment = ?candidates.environment,
+        gui_published = ?candidates.gui_published,
+        gui_instances = ?candidates.gui_instances,
+        config_unix_domain = ?candidates.config_unix_domain,
+        default_unix_domain = ?candidates.default_unix_domain,
+        chosen_source = ?chosen.as_ref().map(|socket| socket.source),
+        chosen_path = ?chosen.as_ref().map(|socket| &socket.path),
+        "mux socket discovery: usable candidates by source"
+    );
+    chosen
 }
 
 /// Discover the mux socket path using all available sources.
