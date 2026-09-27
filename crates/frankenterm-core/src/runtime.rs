@@ -6867,6 +6867,31 @@ impl ObservationRuntime {
                     if loop_cx.checkpoint().is_err() {
                         break;
                     }
+                    // The global admission verdict for a standard new agent
+                    // spawn, from live pressure (ft-t1ktp). Advisory: it is
+                    // published in the resource cockpit; spawn paths do not
+                    // consult it yet.
+                    let warm_tier_budget = warm_tier_budget_snapshot(
+                        &tiered_scrollback_fetch.summaries,
+                        mux_warm_eviction_supported,
+                    );
+                    let admission_decision = crate::swarm_scheduler::SwarmAdmissionController::new(
+                        crate::swarm_scheduler::AdmissionControllerConfig::default(),
+                    )
+                    .evaluate(
+                        &crate::swarm_scheduler::AdmissionRequest::standard(2, 1),
+                        &live_swarm_admission_telemetry(
+                            &QueueDepths {
+                                capture_depth,
+                                capture_capacity: capture_cap,
+                                write_depth,
+                                write_capacity: write_cap,
+                            },
+                            fleet_eval.compound_tier,
+                            warm_tier_budget.clone(),
+                            &crate::runtime_telemetry::swarm_capacity_telemetry_snapshot(),
+                        ),
+                    );
                     let snapshot = HealthSnapshot {
                         timestamp: snapshot_timestamp,
                         observed_panes,
@@ -6917,12 +6942,8 @@ impl ObservationRuntime {
                                 3,
                             )
                             .with_resource_cockpit_inputs_and_resource_evidence(
-                                warm_tier_budget_snapshot(
-                                    &tiered_scrollback_fetch.summaries,
-                                    mux_warm_eviction_supported,
-                                )
-                                .as_ref(),
-                                &[],
+                                warm_tier_budget.as_ref(),
+                                std::slice::from_ref(&admission_decision),
                                 storage.storage_io_operator_summary().as_ref(),
                                 None,
                                 last_action_receipts.as_ref(),
@@ -12033,6 +12054,110 @@ fn fleet_poll_pressure_receipt(
         },
         reason_codes: vec![reason.to_string()],
         artifact_paths: Vec::new(),
+    }
+}
+
+/// Minimum service-time samples before a capacity stage counts as a live
+/// latency input (mirrors the capacity certificate's `min_samples_per_stage`).
+const LIVE_ADMISSION_MIN_STAGE_SAMPLES: u64 = 5;
+
+/// The global admission controller's inputs, from the watcher's own live
+/// pressure surfaces (ft-t1ktp):
+/// - queue: the capture and storage-write pipeline queues (utilization is the
+///   fuller of the two; failure rate is the measured error/timeout share of
+///   ingest-capture and storage-write operations);
+/// - fleet: the fleet coordinator's compound tier;
+/// - memory tier: the mux warm-tier budget, when the mux reports tiering;
+/// - latency: measured p95 service time of each capacity stage with enough
+///   samples, against that stage's default p95 budget.
+///
+/// An input without evidence stays `None`, so the controller reports it as
+/// missing telemetry instead of admitting on a guess.
+fn live_swarm_admission_telemetry(
+    queue: &QueueDepths,
+    fleet_tier: crate::fleet_memory_controller::FleetPressureTier,
+    memory_budget: Option<crate::fleet_memory_controller::FleetMemoryTierBudgetSnapshot>,
+    capacity: &crate::runtime_telemetry::SwarmCapacityTelemetrySnapshot,
+) -> crate::swarm_scheduler::SwarmAdmissionTelemetry {
+    use crate::latency_stages::{LatencyStage, StagePressure, default_budgets};
+    use crate::runtime_telemetry::SwarmCapacityStage;
+
+    #[allow(clippy::cast_precision_loss)]
+    let ratio = |depth: usize, capacity: usize| {
+        if capacity == 0 {
+            0.0
+        } else {
+            depth as f64 / capacity as f64
+        }
+    };
+    let (mut failures, mut outcomes) = (0_u64, 0_u64);
+    for stage in &capacity.stages {
+        if matches!(
+            stage.stage,
+            SwarmCapacityStage::IngestCapture | SwarmCapacityStage::StorageWrite
+        ) {
+            // One failure-class count per failed operation (an
+            // Error(Timeout) bumps both `errors` and `timeouts`).
+            let failed = stage.failure_counts.total();
+            failures = failures.saturating_add(failed);
+            outcomes = outcomes.saturating_add(stage.completions.saturating_add(failed));
+        }
+    }
+    let pending_items = queue.capture_depth.saturating_add(queue.write_depth);
+    #[allow(clippy::cast_precision_loss)]
+    let queue_pressure = crate::swarm_scheduler::QueuePressure {
+        ready_ratio: if pending_items == 0 { 0.0 } else { 1.0 },
+        utilization: ratio(queue.capture_depth, queue.capture_capacity)
+            .max(ratio(queue.write_depth, queue.write_capacity)),
+        starvation_count: 0,
+        failure_rate: if outcomes == 0 {
+            0.0
+        } else {
+            failures as f64 / outcomes as f64
+        },
+        pending_items: u32::try_from(pending_items).unwrap_or(u32::MAX),
+        active_agents: 0,
+        total_capacity: u32::try_from(queue.capture_capacity.saturating_add(queue.write_capacity))
+            .unwrap_or(u32::MAX),
+    };
+
+    let budgets = default_budgets();
+    let budget_p95_us = |stage: LatencyStage| {
+        budgets
+            .iter()
+            .find(|budget| budget.stage == stage)
+            .map(|budget| budget.p95_us)
+    };
+    let latency_stage_pressures: Vec<StagePressure> = capacity
+        .stages
+        .iter()
+        .filter_map(|stage| {
+            let latency_stage = match stage.stage {
+                SwarmCapacityStage::IngestCapture => LatencyStage::PtyCapture,
+                SwarmCapacityStage::StorageWrite => LatencyStage::StorageWrite,
+                SwarmCapacityStage::EventBusFanout => LatencyStage::EventEmission,
+                SwarmCapacityStage::WorkflowRunner => LatencyStage::WorkflowDispatch,
+                _ => return None,
+            };
+            if stage.service_time_ms.count < LIVE_ADMISSION_MIN_STAGE_SAMPLES {
+                return None;
+            }
+            let observed_p95_us = stage.service_time_ms.p95? * 1_000.0;
+            Some(StagePressure::compute(
+                latency_stage,
+                observed_p95_us,
+                budget_p95_us(latency_stage)?,
+            ))
+        })
+        .collect();
+
+    crate::swarm_scheduler::SwarmAdmissionTelemetry {
+        queue_pressure: Some(queue_pressure),
+        fleet_pressure: Some(fleet_tier),
+        memory_tier_budget: memory_budget,
+        latency_stage_pressures: (!latency_stage_pressures.is_empty())
+            .then_some(latency_stage_pressures),
+        herd_wave_pressure: None,
     }
 }
 
@@ -26390,6 +26515,80 @@ mod tests {
         assert_eq!(
             classify_pane_budget_level(default_high, budget, f64::NAN),
             BudgetLevel::Throttled
+        );
+    }
+
+    #[test]
+    fn live_admission_telemetry_maps_pipeline_pressure_and_measured_latency() {
+        use crate::fleet_memory_controller::FleetPressureTier;
+        use crate::latency_stages::LatencyStage;
+        use crate::runtime_telemetry::{
+            FailureClass, SwarmCapacityOutcome, SwarmCapacityStage, SwarmCapacityTelemetry,
+        };
+        use crate::swarm_scheduler::{
+            AdmissionAction, AdmissionControllerConfig, AdmissionReasonCode, AdmissionRequest,
+            SwarmAdmissionController,
+        };
+        let queue = QueueDepths {
+            capture_depth: 10,
+            capture_capacity: 100,
+            write_depth: 90,
+            write_capacity: 100,
+        };
+
+        // No capacity samples: latency stays missing, never guessed.
+        let empty = SwarmCapacityTelemetry::with_defaults().snapshot();
+        let telemetry =
+            live_swarm_admission_telemetry(&queue, FleetPressureTier::Normal, None, &empty);
+        let pressure = telemetry.queue_pressure.as_ref().unwrap();
+        assert!((pressure.utilization - 0.9).abs() < f64::EPSILON);
+        assert_eq!(pressure.pending_items, 100);
+        assert_eq!(pressure.total_capacity, 200);
+        assert_eq!(pressure.failure_rate.to_bits(), 0.0_f64.to_bits());
+        assert_eq!(telemetry.fleet_pressure, Some(FleetPressureTier::Normal));
+        assert!(telemetry.latency_stage_pressures.is_none());
+        let controller = SwarmAdmissionController::new(AdmissionControllerConfig::default());
+        let decision = controller.evaluate(&AdmissionRequest::standard(2, 1), &telemetry);
+        assert_ne!(decision.action, AdmissionAction::Admit);
+        assert!(
+            decision
+                .reason_codes
+                .contains(&AdmissionReasonCode::MissingLatencyTelemetry)
+        );
+
+        // Measured storage writes: 20 ms p95 against the 5 ms budget, and one
+        // timeout recorded as an error counts once.
+        let mut capacity = SwarmCapacityTelemetry::with_defaults();
+        for _ in 0..9 {
+            capacity.record_outcome(
+                SwarmCapacityStage::StorageWrite,
+                SwarmCapacityOutcome::Completed,
+                20.0,
+                0,
+            );
+        }
+        capacity.record_outcome(
+            SwarmCapacityStage::StorageWrite,
+            SwarmCapacityOutcome::Error(FailureClass::Timeout),
+            20.0,
+            0,
+        );
+        let telemetry = live_swarm_admission_telemetry(
+            &queue,
+            FleetPressureTier::Elevated,
+            None,
+            &capacity.snapshot(),
+        );
+        let stages = telemetry.latency_stage_pressures.unwrap();
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].stage, LatencyStage::StorageWrite);
+        assert!((stages[0].observed_p95_us - 20_000.0).abs() < 1.0);
+        assert!((stages[0].budget_p95_us - 5_000.0).abs() < f64::EPSILON);
+        assert!(stages[0].headroom < 0.0, "over budget");
+        let failure_rate = telemetry.queue_pressure.unwrap().failure_rate;
+        assert!(
+            (failure_rate - 0.1).abs() < 1e-9,
+            "1 of 10, got {failure_rate}"
         );
     }
 

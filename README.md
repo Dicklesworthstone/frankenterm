@@ -2288,9 +2288,15 @@ The controller takes the **worst** tier across the three inputs. If pipeline bac
 Pausing an idle pane stretches its poll ceiling rather than stopping capture:
 its next poll captures what it printed meanwhile (a burst larger than the
 capture window becomes an explicit gap segment, as at any poll rate), and a
-pane that starts printing returns to the fast poll floor at once. The
-operating envelope also plans spawn admission windows, but that is not
-enforced: `ft` does not refuse spawns under pressure.
+pane that starts printing returns to the fast poll floor at once.
+
+`ft watch` also evaluates the global admission controller every health tick
+for a standard new agent spawn: capture/write queue fullness and measured
+failure rate, the compound fleet tier, the mux warm-tier budget, and measured
+p95 stage latencies against their budgets. The verdict (admit, defer, degrade,
+or shed, with reason codes; missing evidence is reported, never guessed) is
+published in the resource cockpit's `resource_admission` domain in
+`ft doctor --json`. It is advisory: `ft` does not refuse spawns under pressure.
 
 ### Asymmetric hysteresis
 
