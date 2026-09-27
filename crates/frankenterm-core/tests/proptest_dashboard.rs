@@ -6,8 +6,7 @@ use frankenterm_core::backpressure::{BackpressureSnapshot, BackpressureTier};
 use frankenterm_core::cost_tracker::{
     AlertSeverity, BudgetAlert, CostDashboardSnapshot, PaneCostSummary, ProviderCostSummary,
 };
-use frankenterm_core::dashboard::{DashboardManager, DashboardState, QuotaPanel, SystemHealthTier};
-use frankenterm_core::quota_gate::{LaunchVerdict, QuotaGateSnapshot, QuotaGateTelemetrySnapshot};
+use frankenterm_core::dashboard::{DashboardManager, DashboardState, SystemHealthTier};
 use frankenterm_core::rate_limit_tracker::{ProviderRateLimitStatus, ProviderRateLimitSummary};
 
 // =============================================================================
@@ -200,19 +199,6 @@ fn arb_backpressure_snapshot() -> impl Strategy<Value = BackpressureSnapshot> {
         )
 }
 
-fn arb_quota_snapshot() -> impl Strategy<Value = QuotaGateSnapshot> {
-    (0u64..10_000, 0u64..10_000, 0u64..10_000).prop_map(|(allowed, warned, blocked)| {
-        QuotaGateSnapshot {
-            telemetry: QuotaGateTelemetrySnapshot {
-                evaluations: allowed + warned + blocked,
-                allowed,
-                warned,
-                blocked,
-            },
-        }
-    })
-}
-
 // =============================================================================
 // Property tests
 // =============================================================================
@@ -226,13 +212,11 @@ proptest! {
         cost in arb_cost_dashboard_snapshot(),
         rate_limits in proptest::collection::vec(arb_rate_limit_summary(), 0..5),
         bp in arb_backpressure_snapshot(),
-        quota in arb_quota_snapshot(),
     ) {
         let mut mgr = DashboardManager::new();
         mgr.update_costs(cost);
         mgr.update_rate_limits(rate_limits);
         mgr.update_backpressure(bp);
-        mgr.update_quota(quota);
         let state = mgr.snapshot();
 
         let json = serde_json::to_string(&state).expect("serialize");
@@ -240,7 +224,6 @@ proptest! {
 
         prop_assert_eq!(deser.overall_health, state.overall_health);
         prop_assert_eq!(&deser.rate_limits, &state.rate_limits);
-        prop_assert_eq!(&deser.quota, &state.quota);
         prop_assert_eq!(&deser.telemetry, &state.telemetry);
         // Cost + backpressure panels contain f64 — JSON roundtrip may lose
         // precision at the last decimal digit, so compare via PartialEq (bitwise
@@ -282,35 +265,6 @@ proptest! {
         );
     }
 
-    /// Quota panel block_rate_percent is always <= 100.
-    #[test]
-    fn block_rate_bounded(
-        quota in arb_quota_snapshot(),
-    ) {
-        let mut mgr = DashboardManager::new();
-        mgr.update_quota(quota);
-        let state = mgr.snapshot();
-        prop_assert!(
-            state.quota.block_rate_percent <= 100,
-            "block_rate {}% > 100",
-            state.quota.block_rate_percent,
-        );
-    }
-
-    /// Quota panel evaluations = allowed + warned + blocked.
-    #[test]
-    fn quota_telemetry_conservation(
-        quota in arb_quota_snapshot(),
-    ) {
-        let mut mgr = DashboardManager::new();
-        mgr.update_quota(quota);
-        let state = mgr.snapshot();
-        prop_assert_eq!(
-            state.quota.evaluations,
-            state.quota.allowed + state.quota.warned + state.quota.blocked,
-        );
-    }
-
     /// Telemetry snapshot_count increments exactly once per snapshot() call.
     #[test]
     fn telemetry_monotonicity(n in 1u32..20) {
@@ -320,30 +274,6 @@ proptest! {
         }
         let t = mgr.telemetry().snapshot();
         prop_assert_eq!(t.snapshots_taken, u64::from(n));
-    }
-
-    /// worst_launch_verdict is Block when overall_health >= Red.
-    #[test]
-    fn block_verdict_when_red_or_black(
-        bp_tier in prop_oneof![
-            Just(BackpressureTier::Red),
-            Just(BackpressureTier::Black),
-        ],
-    ) {
-        let mut mgr = DashboardManager::new();
-        mgr.update_backpressure(BackpressureSnapshot {
-            tier: bp_tier,
-            timestamp_epoch_ms: 0,
-            capture_depth: 900,
-            capture_capacity: 1000,
-            write_depth: 900,
-            write_capacity: 1000,
-            duration_in_tier_ms: 0,
-            transitions: 0,
-            paused_panes: vec![],
-        });
-        let state = mgr.snapshot();
-        prop_assert_eq!(state.worst_launch_verdict(), LaunchVerdict::Block);
     }
 
     /// Cost panel provider count matches input provider count.
@@ -397,14 +327,12 @@ proptest! {
         cost_updates in 0u64..10_000,
         rate_limit_updates in 0u64..10_000,
         backpressure_updates in 0u64..10_000,
-        quota_updates in 0u64..10_000,
     ) {
         let snap = frankenterm_core::dashboard::DashboardTelemetrySnapshot {
             snapshots_taken,
             cost_updates,
             rate_limit_updates,
             backpressure_updates,
-            quota_updates,
         };
         let json = serde_json::to_string(&snap).expect("serialize");
         let deser: frankenterm_core::dashboard::DashboardTelemetrySnapshot =
@@ -471,45 +399,6 @@ proptest! {
             BackpressureTier::Red => prop_assert_eq!(health, SystemHealthTier::Red),
             BackpressureTier::Black => prop_assert_eq!(health, SystemHealthTier::Black),
         }
-    }
-
-    /// DB-15: worst_launch_verdict is Allow when everything is Green.
-    #[test]
-    fn db15_allow_when_green(_dummy in 0u8..1) {
-        let mut mgr = DashboardManager::new();
-        // Provide green backpressure
-        mgr.update_backpressure(BackpressureSnapshot {
-            tier: BackpressureTier::Green,
-            timestamp_epoch_ms: 0,
-            capture_depth: 0,
-            capture_capacity: 1000,
-            write_depth: 0,
-            write_capacity: 1000,
-            duration_in_tier_ms: 0,
-            transitions: 0,
-            paused_panes: vec![],
-        });
-        let state = mgr.snapshot();
-        prop_assert_eq!(state.worst_launch_verdict(), LaunchVerdict::Allow);
-    }
-
-    /// DB-16: worst_launch_verdict is Warn when Yellow but not Red.
-    #[test]
-    fn db16_warn_when_yellow(_dummy in 0u8..1) {
-        let mut mgr = DashboardManager::new();
-        mgr.update_backpressure(BackpressureSnapshot {
-            tier: BackpressureTier::Yellow,
-            timestamp_epoch_ms: 0,
-            capture_depth: 500,
-            capture_capacity: 1000,
-            write_depth: 500,
-            write_capacity: 1000,
-            duration_in_tier_ms: 0,
-            transitions: 0,
-            paused_panes: vec![],
-        });
-        let state = mgr.snapshot();
-        prop_assert_eq!(state.worst_launch_verdict(), LaunchVerdict::Warn);
     }
 
     /// DB-17: has_critical_alerts is false when Green, true when Red/Black.
@@ -598,7 +487,6 @@ proptest! {
         n_cost in 0u32..5,
         n_rl in 0u32..5,
         n_bp in 0u32..5,
-        n_quota in 0u32..5,
     ) {
         let mut mgr = DashboardManager::new();
         for _ in 0..n_cost {
@@ -618,18 +506,10 @@ proptest! {
                 transitions: 0, paused_panes: vec![],
             });
         }
-        for _ in 0..n_quota {
-            mgr.update_quota(QuotaGateSnapshot {
-                telemetry: QuotaGateTelemetrySnapshot {
-                    evaluations: 0, allowed: 0, warned: 0, blocked: 0,
-                },
-            });
-        }
         let t = mgr.telemetry().snapshot();
         prop_assert_eq!(t.cost_updates, u64::from(n_cost));
         prop_assert_eq!(t.rate_limit_updates, u64::from(n_rl));
         prop_assert_eq!(t.backpressure_updates, u64::from(n_bp));
-        prop_assert_eq!(t.quota_updates, u64::from(n_quota));
     }
 
     /// DB-23: Default DashboardManager produces all-zero/empty panels.
@@ -640,7 +520,6 @@ proptest! {
         prop_assert_eq!(state.overall_health, SystemHealthTier::Green);
         prop_assert!(state.costs.providers.is_empty());
         prop_assert!(state.costs.alerts.is_empty());
-        prop_assert_eq!(state.quota.evaluations, 0);
         prop_assert_eq!(state.rate_limits.limited_provider_count, 0);
         prop_assert_eq!(state.backpressure.paused_pane_count, 0);
     }
@@ -679,26 +558,5 @@ proptest! {
                 prop_assert!(alert.is_blocking, "critical alert should be blocking");
             }
         }
-    }
-
-    /// DB-25: QuotaPanel serde roundtrip.
-    #[test]
-    fn db25_quota_panel_serde(
-        evaluations in 0u64..10_000,
-        allowed in 0u64..5_000,
-        warned in 0u64..3_000,
-        blocked in 0u64..2_000,
-        block_rate_percent in 0u64..100,
-    ) {
-        let panel = QuotaPanel {
-            evaluations,
-            allowed,
-            warned,
-            blocked,
-            block_rate_percent,
-        };
-        let json = serde_json::to_string(&panel).unwrap();
-        let back: QuotaPanel = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(panel, back);
     }
 }

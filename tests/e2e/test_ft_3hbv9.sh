@@ -7,7 +7,7 @@
 # 2. Dashboard serde roundtrip is stable (JSON serialize/deserialize)
 # 3. Property tests pass (dashboard state invariants)
 # 4. SystemHealthTier ordering and aggregation logic
-# 5. Cost/Rate-limit/Backpressure/Quota panel builders
+# 5. Cost/Rate-limit/Backpressure panel builders
 # 6. Telemetry counter consistency
 #
 # Execution: rch exec -- bash tests/e2e/test_ft_3hbv9.sh
@@ -105,7 +105,7 @@ cd "$PROJECT_ROOT"
 log_event "preflight" "startup" "cargo_target=$CARGO_TARGET_DIR" "ready"
 
 # ── Test matrix ────────────────────────────────────────────────────────────
-TOTAL_STEPS=8
+TOTAL_STEPS=7
 PASSED=0
 FAILED=0
 
@@ -154,21 +154,8 @@ else
     FAILED=$((FAILED + 1))
 fi
 
-# ── Step 4: quota_gate unit tests (dependency) ───────────────────────────
-echo "[4/$TOTAL_STEPS] Testing quota_gate module..."
-TEST_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_quota_gate.log"
-if run_cargo_step "quota_gate_tests" "$TEST_OUTPUT" test -p frankenterm-core --lib -- quota_gate::tests; then
-    log_event "unit_tests" "nominal_path" "quota_gate" "pass"
-    echo "  ✓ quota_gate tests passed"
-    PASSED=$((PASSED + 1))
-else
-    log_event "unit_tests" "failure_injection_path" "quota_gate" "fail" "test_failure" "TEST-E003"
-    echo "  ✗ quota_gate tests FAILED"
-    FAILED=$((FAILED + 1))
-fi
-
-# ── Step 5: backpressure unit tests (dependency) ─────────────────────────
-echo "[5/$TOTAL_STEPS] Testing backpressure module..."
+# ── Step 4: backpressure unit tests (dependency) ─────────────────────────
+echo "[4/$TOTAL_STEPS] Testing backpressure module..."
 TEST_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_backpressure.log"
 if run_cargo_step "backpressure_tests" "$TEST_OUTPUT" test -p frankenterm-core --lib -- backpressure::tests; then
     log_event "unit_tests" "nominal_path" "backpressure" "pass"
@@ -180,8 +167,8 @@ else
     FAILED=$((FAILED + 1))
 fi
 
-# ── Step 6: rate_limit_tracker unit tests (dependency) ───────────────────
-echo "[6/$TOTAL_STEPS] Testing rate_limit_tracker module..."
+# ── Step 5: rate_limit_tracker unit tests (dependency) ───────────────────
+echo "[5/$TOTAL_STEPS] Testing rate_limit_tracker module..."
 TEST_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_rate_limit.log"
 if run_cargo_step "rate_limit_tracker_tests" "$TEST_OUTPUT" test -p frankenterm-core --lib -- rate_limit_tracker::tests; then
     log_event "unit_tests" "nominal_path" "rate_limit_tracker" "pass"
@@ -193,8 +180,8 @@ else
     FAILED=$((FAILED + 1))
 fi
 
-# ── Step 7: dashboard property tests ─────────────────────────────────────
-echo "[7/$TOTAL_STEPS] Running dashboard property tests..."
+# ── Step 6: dashboard property tests ─────────────────────────────────────
+echo "[6/$TOTAL_STEPS] Running dashboard property tests..."
 TEST_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_proptest.log"
 if run_cargo_step "dashboard_proptests" "$TEST_OUTPUT" test -p frankenterm-core --test proptest_dashboard; then
     test_count=$(grep "test result:" "$TEST_OUTPUT" | head -1 | grep -o '[0-9]* passed' || echo "? passed")
@@ -207,8 +194,8 @@ else
     FAILED=$((FAILED + 1))
 fi
 
-# ── Step 8: dashboard adapter property tests (requires tui/ftui feature) ──
-echo "[8/$TOTAL_STEPS] Running dashboard adapter property tests..."
+# ── Step 7: dashboard adapter property tests (requires tui/ftui feature) ──
+echo "[7/$TOTAL_STEPS] Running dashboard adapter property tests..."
 TEST_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_adapter_proptest.log"
 if run_cargo_step "dashboard_adapter_proptests" "$TEST_OUTPUT" test -p frankenterm-core --test proptest_dashboard_adapter; then
     test_count=$(grep "test result:" "$TEST_OUTPUT" | head -1 | grep -o '[0-9]* passed' || echo "? passed")

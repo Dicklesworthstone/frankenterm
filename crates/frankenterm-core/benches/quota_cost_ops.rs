@@ -1,24 +1,18 @@
-//! Criterion benchmarks for CostTracker and QuotaGate hot-path operations.
+//! Criterion benchmarks for CostTracker hot-path operations.
 //!
 //! Bead: wa-2dss0
 //! Required coverage:
 //! - CostTracker.record_usage() throughput (varying pane counts: 1, 50, 200)
 //! - CostTracker.budget_alerts() latency with 0, 3, 16 budget rules
 //! - CostTracker.dashboard_snapshot() for 200 panes x 4 providers
-//! - QuotaGate.evaluate() latency with cold/warm paths and all signal combinations
 //! - Cost additivity: per-provider sums equal grand total
 
 use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankenterm_core::accounts::QuotaAvailability;
-use frankenterm_core::cost_tracker::{
-    AlertSeverity, BudgetAlert, BudgetThreshold, CostTracker, CostTrackerConfig,
-};
+use frankenterm_core::cost_tracker::{BudgetThreshold, CostTracker, CostTrackerConfig};
 use frankenterm_core::patterns::AgentType;
-use frankenterm_core::quota_gate::{QuotaGate, QuotaSignals};
-use frankenterm_core::rate_limit_tracker::{ProviderRateLimitStatus, ProviderRateLimitSummary};
 
 mod bench_common;
 
@@ -34,10 +28,6 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     bench_common::BenchBudget {
         name: "quota_cost_ops/dashboard_snapshot",
         budget: "dashboard_snapshot <1ms for 200 panes x 4 providers",
-    },
-    bench_common::BenchBudget {
-        name: "quota_cost_ops/quota_gate_evaluate",
-        budget: "QuotaGate.evaluate <10µs per call (bead acceptance: <10ms p99)",
     },
 ];
 
@@ -166,126 +156,6 @@ fn bench_dashboard_snapshot(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Benchmarks: QuotaGate.evaluate()
-// ---------------------------------------------------------------------------
-
-fn bench_quota_gate_evaluate(c: &mut Criterion) {
-    let mut group = c.benchmark_group("quota_cost_ops/quota_gate_evaluate");
-    group.measurement_time(Duration::from_secs(5));
-
-    // Cold path: brand new gate each iteration
-    group.bench_function("cold_path", |b| {
-        let signals = QuotaSignals {
-            budget_alerts: vec![],
-            rate_limit_summary: Some(ProviderRateLimitSummary {
-                agent_type: "codex".to_string(),
-                status: ProviderRateLimitStatus::Clear,
-                limited_pane_count: 0,
-                total_pane_count: 5,
-                earliest_clear_secs: 0,
-                total_events: 0,
-            }),
-            quota_availability: Some(QuotaAvailability::Available),
-            selected_quota_percent: Some(85.0),
-        };
-        b.iter(|| {
-            let mut gate = QuotaGate::new();
-            let decision = gate.evaluate(black_box(AgentType::Codex), black_box(&signals));
-            black_box(decision.is_blocked());
-        });
-    });
-
-    // Warm path: reuse gate across iterations
-    group.bench_function("warm_path", |b| {
-        let mut gate = QuotaGate::new();
-        let signals = QuotaSignals {
-            budget_alerts: vec![],
-            rate_limit_summary: Some(ProviderRateLimitSummary {
-                agent_type: "codex".to_string(),
-                status: ProviderRateLimitStatus::Clear,
-                limited_pane_count: 0,
-                total_pane_count: 5,
-                earliest_clear_secs: 0,
-                total_events: 0,
-            }),
-            quota_availability: Some(QuotaAvailability::Available),
-            selected_quota_percent: Some(85.0),
-        };
-        b.iter(|| {
-            let decision = gate.evaluate(black_box(AgentType::Codex), black_box(&signals));
-            black_box(decision.is_blocked());
-        });
-    });
-
-    // Worst case: all three signals active with blocking conditions
-    group.bench_function("worst_case_all_blocking", |b| {
-        let mut gate = QuotaGate::new();
-        let signals = QuotaSignals {
-            budget_alerts: vec![
-                BudgetAlert {
-                    agent_type: "codex".to_string(),
-                    severity: AlertSeverity::Critical,
-                    budget_limit_usd: 10.0,
-                    current_cost_usd: 15.0,
-                    usage_fraction: 1.5,
-                },
-                BudgetAlert {
-                    agent_type: "claude_code".to_string(),
-                    severity: AlertSeverity::Warning,
-                    budget_limit_usd: 20.0,
-                    current_cost_usd: 17.0,
-                    usage_fraction: 0.85,
-                },
-            ],
-            rate_limit_summary: Some(ProviderRateLimitSummary {
-                agent_type: "codex".to_string(),
-                status: ProviderRateLimitStatus::FullyLimited,
-                limited_pane_count: 5,
-                total_pane_count: 5,
-                earliest_clear_secs: 300,
-                total_events: 10,
-            }),
-            quota_availability: Some(QuotaAvailability::Exhausted),
-            selected_quota_percent: None,
-        };
-        b.iter(|| {
-            let decision = gate.evaluate(black_box(AgentType::Codex), black_box(&signals));
-            black_box(decision.block_count());
-        });
-    });
-
-    // Many budget alerts (stress the linear scan)
-    group.bench_function("many_budget_alerts", |b| {
-        let mut gate = QuotaGate::new();
-        let alerts: Vec<BudgetAlert> = (0..50)
-            .map(|i| BudgetAlert {
-                agent_type: format!("provider_{i}"),
-                severity: if i % 3 == 0 {
-                    AlertSeverity::Critical
-                } else {
-                    AlertSeverity::Warning
-                },
-                budget_limit_usd: 100.0,
-                current_cost_usd: 85.0 + i as f64,
-                usage_fraction: (i as f64).mul_add(0.01, 0.85),
-            })
-            .collect();
-        let signals = QuotaSignals {
-            budget_alerts: alerts,
-            rate_limit_summary: None,
-            quota_availability: None,
-            selected_quota_percent: None,
-        };
-        b.iter(|| {
-            let decision = gate.evaluate(black_box(AgentType::Codex), black_box(&signals));
-            black_box(decision.verdict);
-        });
-    });
-
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
 // Benchmarks: Cost additivity verification
 // ---------------------------------------------------------------------------
 
@@ -329,7 +199,6 @@ fn bench_suite(c: &mut Criterion) {
     bench_record_usage(c);
     bench_budget_alerts(c);
     bench_dashboard_snapshot(c);
-    bench_quota_gate_evaluate(c);
     bench_cost_additivity(c);
     bench_common::emit_bench_artifacts("quota_cost_ops", BUDGETS);
 }

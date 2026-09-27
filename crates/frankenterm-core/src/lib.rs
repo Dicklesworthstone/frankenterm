@@ -549,7 +549,6 @@ pub mod proof_quality;
 pub mod protocol_recovery;
 pub mod quantile_sketch;
 pub mod query_contract;
-pub mod quota_gate;
 pub mod r_tree;
 pub mod rate_distortion;
 pub mod rate_limit_tracker;

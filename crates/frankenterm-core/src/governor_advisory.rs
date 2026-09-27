@@ -110,49 +110,6 @@ pub fn connector_governor_advisory(
     )
 }
 
-/// Render a `quota_gate` launch decision as an advisory.
-#[must_use]
-pub fn quota_gate_advisory(decision: &crate::quota_gate::LaunchDecision) -> GovernorAdvisory {
-    use crate::quota_gate::LaunchVerdict;
-    let (verdict, severity) = match decision.verdict {
-        LaunchVerdict::Allow => ("allow", AdvisorySeverity::Allow),
-        LaunchVerdict::Warn => ("warn", AdvisorySeverity::Throttle),
-        LaunchVerdict::Block => ("block", AdvisorySeverity::RejectClass),
-    };
-    // Reason: prefer the first blocking warning, else the first warning, else clear.
-    let reason_code = decision
-        .warnings
-        .iter()
-        .find(|w| w.blocking)
-        .or_else(|| decision.warnings.first())
-        .map_or("clear", |w| warning_source_token(w.source));
-    let recommendation = match decision.verdict {
-        LaunchVerdict::Allow => "launch now".to_string(),
-        LaunchVerdict::Warn => {
-            format!(
-                "launch with caution ({} warning(s) active)",
-                decision.warnings.len()
-            )
-        }
-        LaunchVerdict::Block => {
-            format!(
-                "hold launch ({} blocking reason(s))",
-                decision.block_count()
-            )
-        }
-    };
-    GovernorAdvisory::new("quota_gate", verdict, reason_code, recommendation, severity)
-}
-
-fn warning_source_token(source: crate::quota_gate::WarningSource) -> &'static str {
-    use crate::quota_gate::WarningSource;
-    match source {
-        WarningSource::Budget => "budget",
-        WarningSource::RateLimit => "rate_limit",
-        WarningSource::AccountQuota => "account_quota",
-    }
-}
-
 /// Render a `capacity_governor` decision as an advisory.
 #[must_use]
 pub fn capacity_governor_advisory(
@@ -357,48 +314,6 @@ mod tests {
         assert_eq!(r.verdict, "reject");
         assert_eq!(r.reason_code, "budget_exceeded");
         assert_eq!(r.severity, AdvisorySeverity::RejectClass);
-    }
-
-    #[test]
-    fn quota_gate_block_picks_the_blocking_reason() {
-        use crate::quota_gate::{LaunchDecision, LaunchVerdict, LaunchWarning, WarningSource};
-
-        let decision = LaunchDecision {
-            agent_type: "cc".to_string(),
-            verdict: LaunchVerdict::Block,
-            warnings: vec![
-                LaunchWarning {
-                    source: WarningSource::RateLimit,
-                    blocking: false,
-                    message: "rate limit warning".to_string(),
-                },
-                LaunchWarning {
-                    source: WarningSource::AccountQuota,
-                    blocking: true,
-                    message: "account quota exhausted".to_string(),
-                },
-            ],
-        };
-        let a = quota_gate_advisory(&decision);
-        assert_eq!(a.governor, "quota_gate");
-        assert_eq!(a.verdict, "block");
-        assert_eq!(a.severity, AdvisorySeverity::RejectClass);
-        // The blocking warning wins over the earlier non-blocking one.
-        assert_eq!(a.reason_code, "account_quota");
-    }
-
-    #[test]
-    fn quota_gate_allow_is_clear() {
-        use crate::quota_gate::{LaunchDecision, LaunchVerdict};
-        let decision = LaunchDecision {
-            agent_type: "cc".to_string(),
-            verdict: LaunchVerdict::Allow,
-            warnings: vec![],
-        };
-        let a = quota_gate_advisory(&decision);
-        assert_eq!(a.verdict, "allow");
-        assert_eq!(a.reason_code, "clear");
-        assert_eq!(a.severity, AdvisorySeverity::Allow);
     }
 
     #[test]

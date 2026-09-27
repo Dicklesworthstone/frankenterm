@@ -19,7 +19,6 @@ use frankenterm_core::cost_tracker::{
     AlertSeverity, BudgetAlert, CostDashboardSnapshot, PaneCostSummary, ProviderCostSummary,
 };
 use frankenterm_core::dashboard::DashboardManager;
-use frankenterm_core::quota_gate::{QuotaGateSnapshot, QuotaGateTelemetrySnapshot};
 use frankenterm_core::rate_limit_tracker::{ProviderRateLimitStatus, ProviderRateLimitSummary};
 use frankenterm_core::tui::view_adapters::adapt_dashboard;
 
@@ -152,23 +151,11 @@ fn make_backpressure(tier: BackpressureTier, paused_count: usize) -> Backpressur
     }
 }
 
-fn make_quota(evaluations: u64) -> QuotaGateSnapshot {
-    QuotaGateSnapshot {
-        telemetry: QuotaGateTelemetrySnapshot {
-            evaluations,
-            allowed: evaluations * 80 / 100,
-            warned: evaluations * 15 / 100,
-            blocked: evaluations * 5 / 100,
-        },
-    }
-}
-
 fn populate_manager(provider_count: usize, pane_count: usize) -> DashboardManager {
     let mut mgr = DashboardManager::new();
     mgr.update_costs(make_cost_snapshot(provider_count, pane_count));
     mgr.update_rate_limits(make_rate_limits(provider_count));
     mgr.update_backpressure(make_backpressure(BackpressureTier::Yellow, 3));
-    mgr.update_quota(make_quota(1000));
     mgr
 }
 
@@ -302,15 +289,6 @@ fn bench_dashboard_incremental_update(c: &mut Criterion) {
         let bp = make_backpressure(BackpressureTier::Red, 5);
         b.iter(|| {
             mgr.update_backpressure(black_box(bp.clone()));
-            let state = mgr.snapshot();
-            black_box(&state);
-        });
-    });
-
-    group.bench_function("quota_update_only", |b| {
-        let q = make_quota(2000);
-        b.iter(|| {
-            mgr.update_quota(black_box(q.clone()));
             let state = mgr.snapshot();
             black_box(&state);
         });

@@ -49,14 +49,6 @@
       "defining_path": "crates/frankenterm-core/src/connector_outbound_bridge.rs",
       "status": "wired",
       "note": "runtime dispatch feeds failure outcomes to governor backoff + reliability DLQ"
-    },
-    {
-      "symbol": "evaluate_from_trackers",
-      "defining_path": "crates/frankenterm-core/src/quota_gate.rs",
-      "status": "dormant",
-      "dormant_bead": "ft-nmlbn",
-      "dormant_expires_on": "2026-10-01",
-      "note": "QuotaGate launch-admission verdict never consulted in production (ft-nmlbn)"
     }
   ]
 }

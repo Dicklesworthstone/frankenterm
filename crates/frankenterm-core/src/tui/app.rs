@@ -882,7 +882,7 @@ impl<Q: QueryClient> App<Q> {
             }
         }
 
-        // Refresh unified dashboard state (cost, rate limits, backpressure, quota)
+        // Refresh unified dashboard state (cost, rate limits, backpressure)
         match self.query_client.dashboard_state() {
             Ok(state) => {
                 self.view_state.dashboard = state;

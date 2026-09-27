@@ -12,7 +12,6 @@ mod tui_tests {
         AlertSeverity, BudgetAlert, CostDashboardSnapshot, PaneCostSummary, ProviderCostSummary,
     };
     use frankenterm_core::dashboard::{DashboardManager, SystemHealthTier};
-    use frankenterm_core::quota_gate::{QuotaGateSnapshot, QuotaGateTelemetrySnapshot};
     use frankenterm_core::rate_limit_tracker::{ProviderRateLimitStatus, ProviderRateLimitSummary};
     use frankenterm_core::tui::view_adapters::adapt_dashboard;
 
@@ -208,19 +207,6 @@ mod tui_tests {
             )
     }
 
-    fn arb_quota_snapshot() -> impl Strategy<Value = QuotaGateSnapshot> {
-        (0u64..10_000, 0u64..10_000, 0u64..10_000).prop_map(|(allowed, warned, blocked)| {
-            QuotaGateSnapshot {
-                telemetry: QuotaGateTelemetrySnapshot {
-                    evaluations: allowed + warned + blocked,
-                    allowed,
-                    warned,
-                    blocked,
-                },
-            }
-        })
-    }
-
     // =========================================================================
     // Property tests
     // =========================================================================
@@ -234,13 +220,11 @@ mod tui_tests {
             cost in arb_cost_dashboard_snapshot(),
             rate_limits in proptest::collection::vec(arb_rate_limit_summary(), 0..5),
             bp in arb_backpressure_snapshot(),
-            quota in arb_quota_snapshot(),
         ) {
             let mut mgr = DashboardManager::new();
             mgr.update_costs(cost);
             mgr.update_rate_limits(rate_limits);
             mgr.update_backpressure(bp);
-            mgr.update_quota(quota);
             let state = mgr.snapshot();
             let _model = adapt_dashboard(&state);
         }
@@ -295,36 +279,15 @@ mod tui_tests {
             prop_assert_eq!(model.rate_limit_rows.len(), input_count);
         }
 
-        /// Quota block rate label is always a valid percentage string.
-        #[test]
-        fn quota_block_rate_is_percentage(
-            quota in arb_quota_snapshot(),
-        ) {
-            let mut mgr = DashboardManager::new();
-            mgr.update_quota(quota);
-            let state = mgr.snapshot();
-            let model = adapt_dashboard(&state);
-            prop_assert!(
-                model.quota_block_rate_label.ends_with('%'),
-                "expected % suffix, got: {}",
-                model.quota_block_rate_label,
-            );
-            let pct_str = model.quota_block_rate_label.trim_end_matches('%');
-            let pct: u64 = pct_str.parse().expect("valid integer");
-            prop_assert!(pct <= 100, "block rate {}% > 100", pct);
-        }
-
         /// Summary line always starts with "health=".
         #[test]
         fn summary_line_starts_with_health(
             cost in arb_cost_dashboard_snapshot(),
             bp in arb_backpressure_snapshot(),
-            quota in arb_quota_snapshot(),
         ) {
             let mut mgr = DashboardManager::new();
             mgr.update_costs(cost);
             mgr.update_backpressure(bp);
-            mgr.update_quota(quota);
             let state = mgr.snapshot();
             let model = adapt_dashboard(&state);
             prop_assert!(
@@ -359,13 +322,11 @@ mod tui_tests {
             cost in arb_cost_dashboard_snapshot(),
             rate_limits in proptest::collection::vec(arb_rate_limit_summary(), 0..3),
             bp in arb_backpressure_snapshot(),
-            quota in arb_quota_snapshot(),
         ) {
             let mut mgr = DashboardManager::new();
             mgr.update_costs(cost.clone());
             mgr.update_rate_limits(rate_limits.clone());
             mgr.update_backpressure(bp.clone());
-            mgr.update_quota(quota.clone());
             let state = mgr.snapshot();
             let m1 = adapt_dashboard(&state);
             let m2 = adapt_dashboard(&state);
@@ -377,8 +338,6 @@ mod tui_tests {
             prop_assert_eq!(&m1.bp_tier_label, &m2.bp_tier_label);
             prop_assert_eq!(&m1.bp_capture_label, &m2.bp_capture_label);
             prop_assert_eq!(&m1.bp_write_label, &m2.bp_write_label);
-            prop_assert_eq!(&m1.quota_evaluations_label, &m2.quota_evaluations_label);
-            prop_assert_eq!(&m1.quota_block_rate_label, &m2.quota_block_rate_label);
             prop_assert_eq!(&m1.summary_line, &m2.summary_line);
         }
     }

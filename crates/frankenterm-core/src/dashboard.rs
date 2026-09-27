@@ -9,8 +9,7 @@
 //! | Subsystem          | Snapshot type                  | Key signals                      |
 //! |--------------------|--------------------------------|----------------------------------|
 //! | Cost tracking      | `CostDashboardSnapshot`        | Per-provider spend, budget alerts |
-//! | Quota gate         | `QuotaGateSnapshot`            | Launch verdicts, block counts    |
-//! | Rate limits        | `ProviderRateLimitSummary`     | Cooldown status, limited panes   |
+//! | Rate limits       | `ProviderRateLimitSummary`     | Cooldown status, limited panes   |
 //! | Backpressure       | `BackpressureSnapshot`         | Queue tiers, paused panes        |
 //! | Runtime health     | `RuntimeDoctorReport`          | Health checks, overall tier      |
 //! | Storage pipeline   | `StoragePipelineSnapshot`      | Write lag, health tier           |
@@ -35,7 +34,6 @@ use crate::backpressure::{BackpressureSnapshot, BackpressureTier};
 use crate::cost_tracker::{
     AlertSeverity, BudgetAlert, CostAttributionEstimateSummary, CostDashboardSnapshot,
 };
-use crate::quota_gate::{LaunchVerdict, QuotaGateSnapshot};
 use crate::rate_limit_tracker::{ProviderRateLimitStatus, ProviderRateLimitSummary};
 
 // =============================================================================
@@ -185,21 +183,6 @@ pub struct BackpressurePanel {
     pub transitions: u64,
 }
 
-/// Quota gate panel: launch decision summary.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct QuotaPanel {
-    /// Total evaluations performed.
-    pub evaluations: u64,
-    /// Launches allowed.
-    pub allowed: u64,
-    /// Launches warned.
-    pub warned: u64,
-    /// Launches blocked.
-    pub blocked: u64,
-    /// Block rate as a percentage (0–100).
-    pub block_rate_percent: u64,
-}
-
 // =============================================================================
 // Dashboard state
 // =============================================================================
@@ -220,8 +203,6 @@ pub struct DashboardState {
     pub rate_limits: RateLimitPanel,
     /// Backpressure panel.
     pub backpressure: BackpressurePanel,
-    /// Quota gate panel.
-    pub quota: QuotaPanel,
     /// Telemetry counters for the dashboard manager itself.
     pub telemetry: DashboardTelemetrySnapshot,
 }
@@ -237,7 +218,6 @@ pub struct DashboardTelemetry {
     pub cost_updates: u64,
     pub rate_limit_updates: u64,
     pub backpressure_updates: u64,
-    pub quota_updates: u64,
 }
 
 impl DashboardTelemetry {
@@ -247,7 +227,6 @@ impl DashboardTelemetry {
             cost_updates: self.cost_updates,
             rate_limit_updates: self.rate_limit_updates,
             backpressure_updates: self.backpressure_updates,
-            quota_updates: self.quota_updates,
         }
     }
 }
@@ -259,7 +238,6 @@ pub struct DashboardTelemetrySnapshot {
     pub cost_updates: u64,
     pub rate_limit_updates: u64,
     pub backpressure_updates: u64,
-    pub quota_updates: u64,
 }
 
 // =============================================================================
@@ -276,7 +254,6 @@ pub struct DashboardManager {
     cost_attribution_estimates: Vec<CostAttributionEstimateSummary>,
     rate_limit_summaries: Vec<ProviderRateLimitSummary>,
     backpressure_snapshot: Option<BackpressureSnapshot>,
-    quota_snapshot: Option<QuotaGateSnapshot>,
     telemetry: DashboardTelemetry,
 }
 
@@ -288,7 +265,6 @@ impl DashboardManager {
             cost_attribution_estimates: Vec::new(),
             rate_limit_summaries: Vec::new(),
             backpressure_snapshot: None,
-            quota_snapshot: None,
             telemetry: DashboardTelemetry::default(),
         }
     }
@@ -322,12 +298,6 @@ impl DashboardManager {
         self.telemetry.backpressure_updates += 1;
     }
 
-    /// Update quota gate data.
-    pub fn update_quota(&mut self, snapshot: QuotaGateSnapshot) {
-        self.quota_snapshot = Some(snapshot);
-        self.telemetry.quota_updates += 1;
-    }
-
     /// Produce a point-in-time [`DashboardState`] from the latest subsystem data.
     pub fn snapshot(&mut self) -> DashboardState {
         self.telemetry.snapshots_taken += 1;
@@ -339,7 +309,6 @@ impl DashboardManager {
         let costs = self.build_cost_panel();
         let rate_limits = self.build_rate_limit_panel();
         let backpressure = self.build_backpressure_panel();
-        let quota = self.build_quota_panel();
 
         // Overall health = worst of all subsystem tiers.
         let mut overall = SystemHealthTier::Green;
@@ -365,20 +334,12 @@ impl DashboardManager {
         // Backpressure tier maps directly.
         overall = overall.max(backpressure.health);
 
-        // Quota blocks contribute to health.
-        if quota.blocked > 0 && quota.block_rate_percent > 50 {
-            overall = overall.max(SystemHealthTier::Red);
-        } else if quota.blocked > 0 {
-            overall = overall.max(SystemHealthTier::Yellow);
-        }
-
         DashboardState {
             timestamp_ms: now_ms,
             overall_health: overall,
             costs,
             rate_limits,
             backpressure,
-            quota,
             telemetry: self.telemetry.snapshot(),
         }
     }
@@ -488,29 +449,6 @@ impl DashboardManager {
             transitions: snap.transitions,
         }
     }
-
-    fn build_quota_panel(&self) -> QuotaPanel {
-        let Some(snap) = &self.quota_snapshot else {
-            return QuotaPanel {
-                evaluations: 0,
-                allowed: 0,
-                warned: 0,
-                blocked: 0,
-                block_rate_percent: 0,
-            };
-        };
-
-        let t = &snap.telemetry;
-        let block_rate = (t.blocked * 100).checked_div(t.evaluations).unwrap_or(0);
-
-        QuotaPanel {
-            evaluations: t.evaluations,
-            allowed: t.allowed,
-            warned: t.warned,
-            blocked: t.blocked,
-            block_rate_percent: block_rate,
-        }
-    }
 }
 
 impl Default for DashboardManager {
@@ -557,23 +495,6 @@ fn rate_limit_to_view(summary: &ProviderRateLimitSummary) -> RateLimitProviderVi
 // =============================================================================
 
 impl DashboardState {
-    /// Compute the worst-case launch verdict based on current dashboard state.
-    pub fn worst_launch_verdict(&self) -> LaunchVerdict {
-        if self.quota.blocked > 0 && self.quota.evaluations > 0 {
-            let recent_block_rate = self.quota.block_rate_percent;
-            if recent_block_rate > 50 {
-                return LaunchVerdict::Block;
-            }
-        }
-        if self.overall_health >= SystemHealthTier::Red {
-            return LaunchVerdict::Block;
-        }
-        if self.overall_health >= SystemHealthTier::Yellow {
-            return LaunchVerdict::Warn;
-        }
-        LaunchVerdict::Allow
-    }
-
     /// True if any subsystem is at Red or Black tier.
     pub fn has_critical_alerts(&self) -> bool {
         self.overall_health >= SystemHealthTier::Red
@@ -595,7 +516,6 @@ impl DashboardState {
         let providers = self.costs.providers.len();
         let limited = self.rate_limits.limited_provider_count;
         let paused = self.backpressure.paused_pane_count;
-        let blocked = self.quota.blocked;
 
         let mut parts = vec![format!("health={health}")];
 
@@ -612,10 +532,6 @@ impl DashboardState {
 
         if paused > 0 {
             parts.push(format!("paused={paused}"));
-        }
-
-        if blocked > 0 {
-            parts.push(format!("blocked={blocked}"));
         }
 
         parts.join(" ")
@@ -635,7 +551,6 @@ mod tests {
         CostAttributionEstimateSummary, CostAttributionKind, CostDashboardSnapshot,
         PaneCostSummary, ProviderCostSummary,
     };
-    use crate::quota_gate::{QuotaGateSnapshot, QuotaGateTelemetrySnapshot};
     use crate::rate_limit_tracker::{ProviderRateLimitStatus, ProviderRateLimitSummary};
 
     fn sample_cost_snapshot() -> CostDashboardSnapshot {
@@ -721,17 +636,6 @@ mod tests {
         }
     }
 
-    fn sample_quota() -> QuotaGateSnapshot {
-        QuotaGateSnapshot {
-            telemetry: QuotaGateTelemetrySnapshot {
-                evaluations: 100,
-                allowed: 80,
-                warned: 15,
-                blocked: 5,
-            },
-        }
-    }
-
     // ── Basic snapshot tests ─────────────────────────────────────────
 
     #[test]
@@ -743,7 +647,6 @@ mod tests {
         assert!(state.costs.attribution_estimates.is_empty());
         assert_eq!(state.rate_limits.limited_provider_count, 0);
         assert_eq!(state.backpressure.paused_pane_count, 0);
-        assert_eq!(state.quota.evaluations, 0);
     }
 
     #[test]
@@ -752,7 +655,6 @@ mod tests {
         mgr.update_costs(sample_cost_snapshot());
         mgr.update_rate_limits(sample_rate_limits());
         mgr.update_backpressure(sample_backpressure());
-        mgr.update_quota(sample_quota());
 
         let state = mgr.snapshot();
 
@@ -776,12 +678,6 @@ mod tests {
         assert_eq!(state.backpressure.health, SystemHealthTier::Yellow);
         assert!((state.backpressure.capture_utilization - 0.8).abs() < 1e-6);
         assert_eq!(state.backpressure.paused_pane_count, 1);
-
-        // Quota panel
-        assert_eq!(state.quota.evaluations, 100);
-        assert_eq!(state.quota.allowed, 80);
-        assert_eq!(state.quota.blocked, 5);
-        assert_eq!(state.quota.block_rate_percent, 5);
 
         // Overall health: Yellow from backpressure + rate limits
         assert_eq!(state.overall_health, SystemHealthTier::Yellow);
@@ -873,23 +769,6 @@ mod tests {
         assert_eq!(state.backpressure.paused_pane_count, 5);
     }
 
-    #[test]
-    fn high_block_rate_raises_health_to_red() {
-        let mut mgr = DashboardManager::new();
-        mgr.update_quota(QuotaGateSnapshot {
-            telemetry: QuotaGateTelemetrySnapshot {
-                evaluations: 10,
-                allowed: 2,
-                warned: 2,
-                blocked: 6,
-            },
-        });
-
-        let state = mgr.snapshot();
-        assert_eq!(state.overall_health, SystemHealthTier::Red);
-        assert_eq!(state.quota.block_rate_percent, 60);
-    }
-
     // ── Telemetry tests ──────────────────────────────────────────────
 
     #[test]
@@ -899,7 +778,6 @@ mod tests {
         mgr.update_costs(sample_cost_snapshot());
         mgr.update_rate_limits(sample_rate_limits());
         mgr.update_backpressure(sample_backpressure());
-        mgr.update_quota(sample_quota());
 
         let _ = mgr.snapshot();
         let _ = mgr.snapshot();
@@ -908,7 +786,6 @@ mod tests {
         assert_eq!(t.cost_updates, 2);
         assert_eq!(t.rate_limit_updates, 1);
         assert_eq!(t.backpressure_updates, 1);
-        assert_eq!(t.quota_updates, 1);
         assert_eq!(t.snapshots_taken, 2);
     }
 
@@ -928,7 +805,6 @@ mod tests {
         mgr.update_costs(sample_cost_snapshot());
         mgr.update_rate_limits(sample_rate_limits());
         mgr.update_backpressure(sample_backpressure());
-        mgr.update_quota(sample_quota());
         let state = mgr.snapshot();
 
         let json = serde_json::to_string(&state).expect("serialize");
@@ -939,38 +815,10 @@ mod tests {
         assert_eq!(deser.costs, state.costs);
         assert_eq!(deser.rate_limits, state.rate_limits);
         assert_eq!(deser.backpressure, state.backpressure);
-        assert_eq!(deser.quota, state.quota);
         assert_eq!(deser.telemetry, state.telemetry);
     }
 
     // ── Convenience methods ──────────────────────────────────────────
-
-    #[test]
-    fn worst_launch_verdict_reflects_health() {
-        let mut mgr = DashboardManager::new();
-        let state = mgr.snapshot();
-        assert_eq!(state.worst_launch_verdict(), LaunchVerdict::Allow);
-
-        // Yellow health → Warn
-        mgr.update_backpressure(sample_backpressure()); // Yellow
-        let state = mgr.snapshot();
-        assert_eq!(state.worst_launch_verdict(), LaunchVerdict::Warn);
-
-        // Red health → Block
-        mgr.update_backpressure(BackpressureSnapshot {
-            tier: BackpressureTier::Red,
-            timestamp_epoch_ms: 1_000_000,
-            capture_depth: 900,
-            capture_capacity: 1000,
-            write_depth: 900,
-            write_capacity: 1000,
-            duration_in_tier_ms: 5000,
-            transitions: 4,
-            paused_panes: vec![1, 2, 3],
-        });
-        let state = mgr.snapshot();
-        assert_eq!(state.worst_launch_verdict(), LaunchVerdict::Block);
-    }
 
     #[test]
     fn has_critical_alerts_detects_red_and_above() {
@@ -1033,21 +881,6 @@ mod tests {
         assert!((state.backpressure.write_utilization - 0.0).abs() < 1e-6);
     }
 
-    #[test]
-    fn zero_evaluations_produce_zero_block_rate() {
-        let mut mgr = DashboardManager::new();
-        mgr.update_quota(QuotaGateSnapshot {
-            telemetry: QuotaGateTelemetrySnapshot {
-                evaluations: 0,
-                allowed: 0,
-                warned: 0,
-                blocked: 0,
-            },
-        });
-        let state = mgr.snapshot();
-        assert_eq!(state.quota.block_rate_percent, 0);
-    }
-
     // ── SystemHealthTier ordering ────────────────────────────────────
 
     #[test]
@@ -1097,20 +930,11 @@ mod tests {
             transitions: 0,
             paused_panes: vec![1, 2],
         });
-        mgr.update_quota(QuotaGateSnapshot {
-            telemetry: QuotaGateTelemetrySnapshot {
-                evaluations: 10,
-                allowed: 7,
-                warned: 1,
-                blocked: 2,
-            },
-        });
         let state = mgr.snapshot();
         let line = state.summary_line();
         assert!(line.contains("health=yellow"), "got: {line}");
         assert!(line.contains("cost=$60.00/70000tok"), "got: {line}");
         assert!(line.contains("rate_limited=1"), "got: {line}");
         assert!(line.contains("paused=2"), "got: {line}");
-        assert!(line.contains("blocked=2"), "got: {line}");
     }
 }

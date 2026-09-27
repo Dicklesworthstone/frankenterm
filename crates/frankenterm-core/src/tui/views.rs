@@ -160,7 +160,7 @@ pub struct ViewState {
     pub triage_items: Vec<TriageItemView>,
     /// Current health status
     pub health: Option<HealthStatus>,
-    /// Unified dashboard state (cost, rate limits, backpressure, quota).
+    /// Unified dashboard state (cost, rate limits, backpressure).
     pub dashboard: Option<crate::dashboard::DashboardState>,
     /// Search query input
     pub search_query: String,
@@ -760,7 +760,7 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     footer_widget.render(chunks[footer_idx], buf);
 }
 
-/// Render the unified dashboard panels (cost, rate limits, backpressure, quota).
+/// Render the unified dashboard panels (cost, rate limits, backpressure).
 ///
 /// Arranges panels in a 2x2 grid when space permits, or falls back to a single
 /// column for narrow terminals (< 60 columns).
@@ -794,15 +794,10 @@ fn render_dashboard_panels(model: &DashboardModel, area: Rect, buf: &mut Buffer)
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(rows[0]);
-        let bot_cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(rows[1]);
 
         render_cost_panel(model, top_cols[0], buf);
         render_rate_limit_panel(model, top_cols[1], buf);
-        render_backpressure_panel(model, bot_cols[0], buf);
-        render_quota_panel(model, bot_cols[1], buf);
+        render_backpressure_panel(model, rows[1], buf);
     // Tablet/narrow-desktop mode: weighted split keeps dense panels readable.
     } else if inner.width >= 78 && inner.height >= 10 {
         let rows = Layout::default()
@@ -813,31 +808,24 @@ fn render_dashboard_panels(model: &DashboardModel, area: Rect, buf: &mut Buffer)
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
             .split(rows[0]);
-        let bot_cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-            .split(rows[1]);
 
         render_cost_panel(model, top_cols[0], buf);
         render_rate_limit_panel(model, top_cols[1], buf);
-        render_backpressure_panel(model, bot_cols[0], buf);
-        render_quota_panel(model, bot_cols[1], buf);
+        render_backpressure_panel(model, rows[1], buf);
     // Compact mode: single-column stack avoids cramped two-column text.
     } else {
         let panels = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Percentage(32),
-                Constraint::Percentage(24),
-                Constraint::Percentage(24),
-                Constraint::Percentage(20),
+                Constraint::Percentage(40),
+                Constraint::Percentage(30),
+                Constraint::Percentage(30),
             ])
             .split(inner);
 
         render_cost_panel(model, panels[0], buf);
         render_rate_limit_panel(model, panels[1], buf);
         render_backpressure_panel(model, panels[2], buf);
-        render_quota_panel(model, panels[3], buf);
     }
 }
 
@@ -958,32 +946,6 @@ fn render_backpressure_panel(model: &DashboardModel, area: Rect, buf: &mut Buffe
         Line::from(vec![
             Span::raw("  Paused panes:  "),
             Span::styled(&model.bp_paused_label, Style::default().fg(Color::Magenta)),
-        ]),
-    ];
-
-    let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::NONE));
-    paragraph.render(inner, buf);
-}
-
-/// Render quota gate panel: evaluations and block rate.
-fn render_quota_panel(model: &DashboardModel, area: Rect, buf: &mut Buffer) {
-    let block = Block::default().title("Quota Gate").borders(Borders::ALL);
-    let inner = block.inner(area);
-    block.render(area, buf);
-
-    let block_style: Style = model.quota_block_rate_style.into();
-
-    let lines = vec![
-        Line::from(vec![
-            Span::raw("  Evaluations: "),
-            Span::styled(
-                &model.quota_evaluations_label,
-                Style::default().fg(Color::Cyan),
-            ),
-        ]),
-        Line::from(vec![
-            Span::raw("  Block rate:  "),
-            Span::styled(&model.quota_block_rate_label, block_style),
         ]),
     ];
 
@@ -4033,7 +3995,6 @@ mod tests {
             AlertSeverity, BudgetAlert, CostDashboardSnapshot, PaneCostSummary, ProviderCostSummary,
         };
         use crate::dashboard::DashboardManager;
-        use crate::quota_gate::{QuotaGateSnapshot, QuotaGateTelemetrySnapshot};
         use crate::rate_limit_tracker::{ProviderRateLimitStatus, ProviderRateLimitSummary};
 
         let mut mgr = DashboardManager::new();
@@ -4090,14 +4051,6 @@ mod tests {
             duration_in_tier_ms: 5000,
             transitions: 3,
             paused_panes: vec![1, 2],
-        });
-        mgr.update_quota(QuotaGateSnapshot {
-            telemetry: QuotaGateTelemetrySnapshot {
-                evaluations: 1000,
-                allowed: 800,
-                warned: 150,
-                blocked: 50,
-            },
         });
         mgr.snapshot()
     }

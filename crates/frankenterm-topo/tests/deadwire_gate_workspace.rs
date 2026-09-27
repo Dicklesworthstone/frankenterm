@@ -66,10 +66,6 @@ fn declarations() -> Vec<DecisionApiDeclaration> {
             "record_action_failure",
             "crates/frankenterm-core/src/connector_outbound_bridge.rs",
         ),
-        (
-            "evaluate_from_trackers",
-            "crates/frankenterm-core/src/quota_gate.rs",
-        ),
     ]
     .into_iter()
     .map(|(symbol, path)| DecisionApiDeclaration::new(symbol, path))

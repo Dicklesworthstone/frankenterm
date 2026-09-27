@@ -567,12 +567,6 @@ pub struct DashboardModel {
     pub bp_write_label: String,
     /// Paused pane count label.
     pub bp_paused_label: String,
-    /// Quota evaluations label.
-    pub quota_evaluations_label: String,
-    /// Quota block rate label.
-    pub quota_block_rate_label: String,
-    /// Quota block rate style.
-    pub quota_block_rate_style: StyleSpec,
     /// Compact summary line for status bars.
     pub summary_line: String,
 }
@@ -702,15 +696,6 @@ pub fn adapt_dashboard(state: &DashboardState) -> DashboardModel {
     let bp_write_label = format!("{:.0}%", state.backpressure.write_utilization * 100.0);
     let bp_paused_label = state.backpressure.paused_pane_count.to_string();
 
-    // Quota
-    let quota_block_rate_style = if state.quota.block_rate_percent >= 50 {
-        StyleSpec::new().fg(ColorSpec::Red).bold()
-    } else if state.quota.block_rate_percent >= 20 {
-        StyleSpec::new().fg(ColorSpec::Yellow)
-    } else {
-        StyleSpec::new().fg(ColorSpec::Green)
-    };
-
     DashboardModel {
         health_label,
         health_style,
@@ -725,9 +710,6 @@ pub fn adapt_dashboard(state: &DashboardState) -> DashboardModel {
         bp_capture_label,
         bp_write_label,
         bp_paused_label,
-        quota_evaluations_label: state.quota.evaluations.to_string(),
-        quota_block_rate_label: format!("{}%", state.quota.block_rate_percent),
-        quota_block_rate_style,
         summary_line: state.summary_line(),
     }
 }
@@ -2897,7 +2879,6 @@ mod tests {
             AlertSeverity, BudgetAlert, CostDashboardSnapshot, PaneCostSummary, ProviderCostSummary,
         };
         use crate::dashboard::DashboardManager;
-        use crate::quota_gate::{QuotaGateSnapshot, QuotaGateTelemetrySnapshot};
         use crate::rate_limit_tracker::{ProviderRateLimitStatus, ProviderRateLimitSummary};
 
         let mut mgr = DashboardManager::new();
@@ -2945,14 +2926,6 @@ mod tests {
             duration_in_tier_ms: 5000,
             transitions: 2,
             paused_panes: vec![1],
-        });
-        mgr.update_quota(QuotaGateSnapshot {
-            telemetry: QuotaGateTelemetrySnapshot {
-                evaluations: 100,
-                allowed: 80,
-                warned: 15,
-                blocked: 5,
-            },
         });
         mgr.snapshot()
     }
@@ -3006,15 +2979,6 @@ mod tests {
     }
 
     #[test]
-    fn adapt_dashboard_quota() {
-        let state = sample_dashboard_state();
-        let model = adapt_dashboard(&state);
-        assert_eq!(model.quota_evaluations_label, "100");
-        assert_eq!(model.quota_block_rate_label, "5%");
-        assert_eq!(model.quota_block_rate_style.fg, Some(ColorSpec::Green));
-    }
-
-    #[test]
     fn adapt_dashboard_summary_line() {
         let state = sample_dashboard_state();
         let model = adapt_dashboard(&state);
@@ -3031,7 +2995,6 @@ mod tests {
         assert!(model.alert_rows.is_empty());
         assert!(model.rate_limit_rows.is_empty());
         assert_eq!(model.bp_paused_label, "0");
-        assert_eq!(model.quota_evaluations_label, "0");
     }
 
     #[test]

@@ -6,9 +6,8 @@
 # 1. rate_limit_tracker module compiles and passes all unit tests
 # 2. Pattern rules for rate_limit.detected are present and functional
 # 3. Fixture corpus tests pass (no cross-rule interference)
-# 4. Property tests pass (rate_limit_tracker, cost_tracker, quota_gate)
-# 5. cost_tracker and quota_gate modules compile and pass unit tests
-# 6. Integration tests for the full quota gate pipeline pass
+# 4. Property tests pass (rate_limit_tracker, cost_tracker)
+# 5. cost_tracker module compiles and passes unit tests
 #
 # Execution: rch exec -- bash tests/e2e/test_ft_2dss0.sh
 # ────────────────────────────────────────────────────────────────────────────
@@ -105,7 +104,7 @@ cd "$PROJECT_ROOT"
 log_event "preflight" "startup" "cargo_target=$CARGO_TARGET_DIR" "ready"
 
 # ── Test matrix ────────────────────────────────────────────────────────────
-TOTAL_STEPS=9
+TOTAL_STEPS=7
 PASSED=0
 FAILED=0
 
@@ -195,42 +194,16 @@ else
     FAILED=$((FAILED + 1))
 fi
 
-# ── Step 7: quota_gate unit tests ────────────────────────────────────
-echo "[7/$TOTAL_STEPS] Testing quota_gate module..."
-TEST_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_quota_gate.log"
-if run_cargo_step "quota_gate_tests" "$TEST_OUTPUT" test -p frankenterm-core --lib -- quota_gate::tests; then
-    log_event "unit_tests" "nominal_path" "quota_gate" "pass"
-    echo "  ✓ quota_gate tests passed"
+# ── Step 7: cost_tracker property tests ──────────────────────────────
+echo "[7/$TOTAL_STEPS] Running cost_tracker property tests..."
+TEST_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_proptest_cost.log"
+if run_cargo_step "cost_proptests" "$TEST_OUTPUT" test -p frankenterm-core --test proptest_cost_tracker; then
+    log_event "proptest" "nominal_path" "cost_proptests" "pass"
+    echo "  ✓ cost_tracker property tests passed"
     PASSED=$((PASSED + 1))
 else
-    log_event "unit_tests" "failure_injection_path" "quota_gate" "fail" "test_failure" "TEST-E006"
-    echo "  ✗ quota_gate tests FAILED"
-    FAILED=$((FAILED + 1))
-fi
-
-# ── Step 8: cost_tracker + quota_gate property tests ─────────────────
-echo "[8/$TOTAL_STEPS] Running cost_tracker + quota_gate property tests..."
-TEST_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_proptest_cq.log"
-if run_cargo_step "cost_quota_proptests" "$TEST_OUTPUT" test -p frankenterm-core --test proptest_cost_tracker --test proptest_quota_gate; then
-    log_event "proptest" "nominal_path" "cost_quota_proptests" "pass"
-    echo "  ✓ cost_tracker + quota_gate property tests passed"
-    PASSED=$((PASSED + 1))
-else
-    log_event "proptest" "failure_injection_path" "cost_quota_proptests" "fail" "proptest_failure" "TEST-E007"
-    echo "  ✗ cost_tracker + quota_gate property tests FAILED"
-    FAILED=$((FAILED + 1))
-fi
-
-# ── Step 9: quota_gate integration tests ─────────────────────────────
-echo "[9/$TOTAL_STEPS] Running quota_gate integration tests..."
-TEST_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_integration.log"
-if run_cargo_step "quota_gate_integration" "$TEST_OUTPUT" test -p frankenterm-core --test quota_gate_integration; then
-    log_event "integration" "nominal_path" "quota_gate_integration" "pass"
-    echo "  ✓ quota_gate integration tests passed"
-    PASSED=$((PASSED + 1))
-else
-    log_event "integration" "failure_injection_path" "quota_gate_integration" "fail" "integration_failure" "TEST-E008"
-    echo "  ✗ quota_gate integration tests FAILED"
+    log_event "proptest" "failure_injection_path" "cost_proptests" "fail" "proptest_failure" "TEST-E007"
+    echo "  ✗ cost_tracker property tests FAILED"
     FAILED=$((FAILED + 1))
 fi
 
