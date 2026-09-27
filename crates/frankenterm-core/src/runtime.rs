@@ -17519,11 +17519,19 @@ mod tests {
             use tracing::instrument::WithSubscriber;
             for fail_ack in [false, true] {
                 let capture = ConnectorDiagnosticCapture(Arc::new(StdMutex::new(Vec::new())));
-                let subscriber = tracing_subscriber::fmt()
-                    .json()
-                    .with_env_filter("off,frankenterm::append_transaction=trace")
-                    .with_writer(capture.clone())
-                    .finish();
+                let subscriber = tracing::Dispatch::new(
+                    tracing_subscriber::fmt()
+                        .json()
+                        .with_env_filter("off,frankenterm::append_transaction=trace")
+                        .with_writer(capture.clone())
+                        .finish(),
+                );
+                // A callsite first hit by another test's thread while tracing
+                // runs its single-dispatcher fast path caches that thread's
+                // `never` interest without a lock, and it can land after this
+                // dispatcher's registration rebuild. Rebuild once more now that
+                // this dispatcher is registered so the append-trace gate sees it.
+                tracing::callsite::rebuild_interest_cache();
                 let (_dir, db_path) = temp_db_path();
                 let storage = StorageHandle::new(&db_path)
                     .with_subscriber(subscriber)
