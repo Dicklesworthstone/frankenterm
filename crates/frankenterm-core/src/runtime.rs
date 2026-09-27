@@ -17644,6 +17644,14 @@ mod tests {
             use tracing::instrument::WithSubscriber;
             for fail_ack in [false, true] {
                 let capture = ConnectorDiagnosticCapture(Arc::new(StdMutex::new(Vec::new())));
+                // While exactly one dispatcher is registered, tracing-core
+                // treats it as the global default: callsite interest (and a
+                // rebuild's max level) is computed from the *calling thread's*
+                // default, so a thread without this scoped subscriber caches
+                // `never` for the append-trace callsites. Keeping a second
+                // dispatcher registered for the whole test makes every
+                // interest computation consult all registered dispatchers.
+                let _multi_dispatch_guard = tracing::Dispatch::new(tracing_subscriber::registry());
                 let subscriber = tracing::Dispatch::new(
                     tracing_subscriber::fmt()
                         .json()
@@ -17651,12 +17659,6 @@ mod tests {
                         .with_writer(capture.clone())
                         .finish(),
                 );
-                // A callsite first hit by another test's thread while tracing
-                // runs its single-dispatcher fast path caches that thread's
-                // `never` interest without a lock, and it can land after this
-                // dispatcher's registration rebuild. Rebuild once more now that
-                // this dispatcher is registered so the append-trace gate sees it.
-                tracing::callsite::rebuild_interest_cache();
                 let (_dir, db_path) = temp_db_path();
                 let storage = StorageHandle::new(&db_path)
                     .with_subscriber(subscriber)
