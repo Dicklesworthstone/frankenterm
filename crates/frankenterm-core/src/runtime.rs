@@ -4917,10 +4917,10 @@ pub struct ObservationRuntime {
     pane_activity_tracker: Arc<RwLock<HashMap<u64, PaneActivityState>>>,
     /// Shutdown flag for signaling tasks
     shutdown_flag: Arc<AtomicBool>,
-    /// Set by the maintenance task while the fleet coordinator recommends
-    /// `ThrottlePolling`; the capture task then lets idle panes back off to
-    /// a longer ceiling.
-    fleet_throttle_polling: Arc<AtomicBool>,
+    /// Idle-pane poll pressure (`FLEET_POLL_PRESSURE_*`) set by the
+    /// maintenance task from the fleet coordinator's actions; the capture
+    /// task lets idle panes back off to a longer ceiling accordingly.
+    fleet_poll_pressure_level: Arc<AtomicU8>,
     /// Runtime metrics for health/shutdown
     metrics: Arc<RuntimeMetrics>,
     /// Hot-reloadable config sender (for broadcasting updates to tasks)
@@ -4992,7 +4992,7 @@ impl ObservationRuntime {
             detection_contexts: Arc::new(RwLock::new(HashMap::new())),
             pane_activity_tracker: Arc::new(RwLock::new(HashMap::new())),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
-            fleet_throttle_polling: Arc::new(AtomicBool::new(false)),
+            fleet_poll_pressure_level: Arc::new(AtomicU8::new(FLEET_POLL_PRESSURE_NONE)),
             metrics,
             config_tx: Arc::new(config_tx),
             config_rx,
@@ -5906,7 +5906,7 @@ impl ObservationRuntime {
         let pane_activity_tracker = Arc::clone(&self.pane_activity_tracker);
         let metrics = Arc::clone(&self.metrics);
         let scheduler_snapshot = Arc::clone(&self.scheduler_snapshot);
-        let fleet_throttle_polling = Arc::clone(&self.fleet_throttle_polling);
+        let fleet_poll_pressure_level = Arc::clone(&self.fleet_poll_pressure_level);
 
         let initial_retention_days = self.config.retention_days;
         let initial_retention_policy = Arc::clone(&self.config.retention_policy);
@@ -6631,22 +6631,17 @@ impl ObservationRuntime {
                         &mut pane_snapshots,
                     );
 
-                    // ThrottlePolling (Elevated/Critical) and EmergencyCleanup
-                    // let the capture task back idle panes off further.
-                    let throttle_polling = fleet_eval.actions.iter().any(|action| {
-                        matches!(
-                            action,
-                            crate::fleet_memory_controller::FleetMemoryAction::ThrottlePolling
-                                | crate::fleet_memory_controller::FleetMemoryAction::EmergencyCleanup
-                        )
-                    });
-                    if fleet_throttle_polling.swap(throttle_polling, Ordering::Relaxed)
-                        != throttle_polling
+                    // ThrottlePolling lets the capture task back idle panes
+                    // off 4x; PauseIdlePanes / EmergencyCleanup 16x.
+                    let poll_pressure = fleet_poll_pressure(&fleet_eval.actions);
+                    if fleet_poll_pressure_level.swap(poll_pressure, Ordering::Relaxed)
+                        != poll_pressure
                     {
                         info!(
                             tier = ?fleet_eval.compound_tier,
-                            throttle_polling,
-                            "fleet scrollback coordinator: idle-pane poll throttling changed"
+                            throttle_polling = poll_pressure >= FLEET_POLL_PRESSURE_THROTTLE,
+                            pause_idle_panes = poll_pressure >= FLEET_POLL_PRESSURE_PAUSE,
+                            "fleet scrollback coordinator: idle-pane poll pressure changed"
                         );
                     }
 
@@ -7717,7 +7712,7 @@ impl ObservationRuntime {
         let capture_authority = self.capture_authority.clone();
         let capture_metadata = Arc::clone(&self.capture_metadata);
         let backpressure = Arc::clone(self.metrics.backpressure_metrics());
-        let fleet_throttle_polling = Arc::clone(&self.fleet_throttle_polling);
+        let fleet_poll_pressure_level = Arc::clone(&self.fleet_poll_pressure_level);
         let native_capture_enabled = self.config.native_event_socket.is_some();
         let transition_cache_capacity = self.config.channel_buffer.max(1);
         #[cfg(all(feature = "vendored", unix))]
@@ -7760,7 +7755,7 @@ impl ObservationRuntime {
             // The operator-configured tailer config; fleet poll throttling
             // runs a derived copy and returns to this one when it lifts.
             let mut base_tailer_config = initial_config.clone();
-            let mut polling_throttled = false;
+            let mut poll_pressure = FLEET_POLL_PRESSURE_NONE;
             let mut supervisor = TailerSupervisor::with_budget(
                 initial_config,
                 capture_tx_for_supervisor,
@@ -7962,11 +7957,10 @@ impl ObservationRuntime {
                         #[cfg(all(feature = "vendored", unix))]
                         let tailer_min_interval = new_tailer_config.min_interval;
                         base_tailer_config = new_tailer_config;
-                        supervisor.update_config(if polling_throttled {
-                            fleet_throttled_tailer_config(&base_tailer_config)
-                        } else {
-                            base_tailer_config.clone()
-                        });
+                        supervisor.update_config(fleet_pressured_tailer_config(
+                            &base_tailer_config,
+                            poll_pressure,
+                        ));
                         supervisor.update_budget(new_config.capture_budgets.clone());
                         pane_priorities = new_config.pane_priorities.clone();
                         #[cfg(all(feature = "vendored", unix))]
@@ -7982,15 +7976,15 @@ impl ObservationRuntime {
                     }
 
                     // Fleet pressure: while the coordinator recommends
-                    // ThrottlePolling, idle panes back off to a longer ceiling.
-                    let throttle = fleet_throttle_polling.load(Ordering::Relaxed);
-                    if throttle != polling_throttled {
-                        polling_throttled = throttle;
-                        supervisor.update_config(if throttle {
-                            fleet_throttled_tailer_config(&base_tailer_config)
-                        } else {
-                            base_tailer_config.clone()
-                        });
+                    // ThrottlePolling or PauseIdlePanes, idle panes back off
+                    // to a longer ceiling.
+                    let pressure = fleet_poll_pressure_level.load(Ordering::Relaxed);
+                    if pressure != poll_pressure {
+                        poll_pressure = pressure;
+                        supervisor.update_config(fleet_pressured_tailer_config(
+                            &base_tailer_config,
+                            pressure,
+                        ));
                         metrics::counter!("frankenterm.runtime.fleet_poll_throttle_transitions")
                             .increment(1);
                     }
@@ -13342,6 +13336,52 @@ fn duration_ms_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// How much further idle panes may back off while the fleet coordinator
+/// recommends `ThrottlePolling`.
+const FLEET_THROTTLE_IDLE_POLL_FACTOR: u32 = 4;
+
+/// How much further idle panes back off while the coordinator recommends
+/// `PauseIdlePanes` or `EmergencyCleanup`. This is the enforced form of the
+/// pause: an idle pane is polled so rarely that it costs almost nothing, but
+/// capture never stops — the next poll takes what it printed meanwhile (an
+/// overflowing burst becomes an explicit gap, as at any cadence) and a pane
+/// that starts printing returns to `min_interval` at once.
+const FLEET_PAUSE_IDLE_POLL_FACTOR: u32 = 16;
+
+/// Idle-pane poll pressure published by the maintenance task and applied by
+/// the capture task.
+const FLEET_POLL_PRESSURE_NONE: u8 = 0;
+const FLEET_POLL_PRESSURE_THROTTLE: u8 = 1;
+const FLEET_POLL_PRESSURE_PAUSE: u8 = 2;
+
+/// The poll pressure level the coordinator's recommended actions call for.
+fn fleet_poll_pressure(actions: &[crate::fleet_memory_controller::FleetMemoryAction]) -> u8 {
+    use crate::fleet_memory_controller::FleetMemoryAction;
+    if actions.iter().any(|action| action.involves_pausing()) {
+        FLEET_POLL_PRESSURE_PAUSE
+    } else if actions.contains(&FleetMemoryAction::ThrottlePolling) {
+        FLEET_POLL_PRESSURE_THROTTLE
+    } else {
+        FLEET_POLL_PRESSURE_NONE
+    }
+}
+
+/// The tailer config to run at a fleet poll pressure level: the idle ceiling
+/// (`max_interval`) grows by [`FLEET_THROTTLE_IDLE_POLL_FACTOR`] or
+/// [`FLEET_PAUSE_IDLE_POLL_FACTOR`]; the active floor is unchanged, so a pane
+/// that produces output still polls at `min_interval`.
+fn fleet_pressured_tailer_config(base: &TailerConfig, pressure: u8) -> TailerConfig {
+    let factor = match pressure {
+        FLEET_POLL_PRESSURE_NONE => return base.clone(),
+        FLEET_POLL_PRESSURE_THROTTLE => FLEET_THROTTLE_IDLE_POLL_FACTOR,
+        _ => FLEET_PAUSE_IDLE_POLL_FACTOR,
+    };
+    TailerConfig {
+        max_interval: base.max_interval.saturating_mul(factor),
+        ..base.clone()
+    }
+}
+
 /// How long discovery waits before its next poll after `consecutive_failures`
 /// failed listings in a row.
 ///
@@ -13351,23 +13391,6 @@ fn duration_ms_u64(duration: Duration) -> u64 {
 /// first retry still happens at the configured interval, so a single dropped
 /// listing is invisible; a backend that stays down settles at two polls a
 /// minute. A configured interval slower than the ceiling is never sped up.
-/// How much further idle panes may back off while the fleet coordinator
-/// recommends `ThrottlePolling`.
-const FLEET_THROTTLE_IDLE_POLL_FACTOR: u32 = 4;
-
-/// The tailer config to run under fleet poll throttling: the idle ceiling
-/// (`max_interval`) grows by [`FLEET_THROTTLE_IDLE_POLL_FACTOR`]; the active
-/// floor is unchanged, so a pane that produces output still polls at
-/// `min_interval`.
-fn fleet_throttled_tailer_config(base: &TailerConfig) -> TailerConfig {
-    TailerConfig {
-        max_interval: base
-            .max_interval
-            .saturating_mul(FLEET_THROTTLE_IDLE_POLL_FACTOR),
-        ..base.clone()
-    }
-}
-
 fn discovery_backoff_interval(configured: Duration, consecutive_failures: u32) -> Duration {
     const MAX_DISCOVERY_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -24327,8 +24350,18 @@ mod tests {
             send_timeout: Duration::from_millis(100),
             capture_timeout: Duration::from_secs(2),
         };
-        let throttled = fleet_throttled_tailer_config(&base);
+        assert_eq!(
+            fleet_pressured_tailer_config(&base, FLEET_POLL_PRESSURE_NONE).max_interval,
+            base.max_interval
+        );
+        let throttled = fleet_pressured_tailer_config(&base, FLEET_POLL_PRESSURE_THROTTLE);
         assert_eq!(throttled.max_interval, Duration::from_millis(4_000));
+        let paused = fleet_pressured_tailer_config(&base, FLEET_POLL_PRESSURE_PAUSE);
+        assert_eq!(paused.max_interval, Duration::from_millis(16_000));
+        assert_eq!(
+            paused.min_interval, base.min_interval,
+            "a paused pane that prints returns to the fast floor"
+        );
         assert_eq!(
             throttled.min_interval, base.min_interval,
             "active panes keep polling fast"
@@ -24343,8 +24376,37 @@ mod tests {
             ..base
         };
         assert_eq!(
-            fleet_throttled_tailer_config(&huge).max_interval,
+            fleet_pressured_tailer_config(&huge, FLEET_POLL_PRESSURE_PAUSE).max_interval,
             Duration::MAX
+        );
+    }
+
+    #[test]
+    fn fleet_poll_pressure_follows_the_strongest_recommended_action() {
+        use crate::fleet_memory_controller::FleetMemoryAction;
+        assert_eq!(
+            fleet_poll_pressure(&[FleetMemoryAction::None]),
+            FLEET_POLL_PRESSURE_NONE
+        );
+        assert_eq!(
+            fleet_poll_pressure(&[FleetMemoryAction::EvictWarmScrollback]),
+            FLEET_POLL_PRESSURE_NONE
+        );
+        assert_eq!(
+            fleet_poll_pressure(&[FleetMemoryAction::ThrottlePolling]),
+            FLEET_POLL_PRESSURE_THROTTLE
+        );
+        assert_eq!(
+            fleet_poll_pressure(&[
+                FleetMemoryAction::ThrottlePolling,
+                FleetMemoryAction::EvictWarmScrollback,
+                FleetMemoryAction::PauseIdlePanes,
+            ]),
+            FLEET_POLL_PRESSURE_PAUSE
+        );
+        assert_eq!(
+            fleet_poll_pressure(&[FleetMemoryAction::EmergencyCleanup]),
+            FLEET_POLL_PRESSURE_PAUSE
         );
     }
 

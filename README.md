@@ -2282,12 +2282,15 @@ The controller takes the **worst** tier across the three inputs. If pipeline bac
 |---|---|---|
 | **Normal** | All inputs healthy | None |
 | **Elevated** | One input is yellow | Idle panes may back off to a 4x longer poll ceiling; active panes keep their poll rate |
-| **Critical** | Any input is red | Idle-pane throttling, plus `ft watch` asks the mux to move the most pressured panes' warm scrollback to the cold tier (mux codec 67+; older muxes log a recommendation) |
-| **Emergency** | Any input is black | Idle-pane throttling; warm scrollback is evicted on every pane |
+| **Critical** | Any input is red | Idle panes are paused (a 16x longer poll ceiling), plus `ft watch` asks the mux to move the most pressured panes' warm scrollback to the cold tier (mux codec 67+; older muxes log a recommendation) |
+| **Emergency** | Any input is black | Idle panes are paused (16x ceiling); warm scrollback is evicted on every pane |
 
-The controller also recommends `PauseIdlePanes`, and the operating envelope
-plans spawn admission windows, but neither is enforced: `ft` does not pause
-panes or refuse spawns under pressure.
+Pausing an idle pane stretches its poll ceiling rather than stopping capture:
+its next poll captures what it printed meanwhile (a burst larger than the
+capture window becomes an explicit gap segment, as at any poll rate), and a
+pane that starts printing returns to the fast poll floor at once. The
+operating envelope also plans spawn admission windows, but that is not
+enforced: `ft` does not refuse spawns under pressure.
 
 ### Asymmetric hysteresis
 
@@ -2576,9 +2579,9 @@ capacity guarantees.
 ### When the loop throttles
 
 - **Elevated tier** — idle panes back off to a 4x longer poll ceiling.
-- **Critical tier** — idle-pane throttling, and the watcher evicts the targeted panes' warm scrollback on the mux (codec 67+).
-- **Emergency tier** — idle-pane throttling; warm scrollback is evicted on every pane.
-  Pane pausing and spawn refusal are recommendations only, not enforced.
+- **Critical tier** — idle panes are paused (16x poll ceiling; capture continues at that cadence), and the watcher evicts the targeted panes' warm scrollback on the mux (codec 67+).
+- **Emergency tier** — idle panes are paused; warm scrollback is evicted on every pane.
+  Spawn refusal is a recommendation only, not enforced.
 
 ### What the loop **never** does
 
