@@ -2490,12 +2490,7 @@ mod tests {
             let events = fixture_events();
             let filtered: Vec<_> = events
                 .into_iter()
-                .filter(|e| {
-                    if filters.unhandled_only && e.handled {
-                        return false;
-                    }
-                    true
-                })
+                .filter(|e| !(filters.unhandled_only && e.handled))
                 .collect();
             Ok(filtered)
         }
