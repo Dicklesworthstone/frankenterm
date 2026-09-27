@@ -474,9 +474,10 @@ impl ShadowModeEngineDoctorRow {
         }
     }
 
-    /// Row for a known engine whose observe-only live feed has not landed yet.
+    /// Row for an engine that runs live in the watcher but has no shadow
+    /// (baseline-vs-candidate) sample stream in this process.
     #[must_use]
-    pub fn dormant(
+    pub fn live_without_shadow_samples(
         engine_id: impl Into<String>,
         display_name: impl Into<String>,
         source_module: impl Into<String>,
@@ -489,7 +490,7 @@ impl ShadowModeEngineDoctorRow {
             display_name: display_name.into(),
             source_module: source_module.into(),
             decision_surface: decision_surface.into(),
-            feed_state: ShadowModeFeedState::DormantNotWired,
+            feed_state: ShadowModeFeedState::NoLiveSamples,
             observe_only: true,
             production_behavior_changed: false,
             live_mutation_allowed: false,
@@ -592,8 +593,8 @@ impl ShadowModeDoctorReport {
 /// Build the standalone CLI doctor report.
 ///
 /// The CLI process is read-only and does not own live MissionLoop or watcher
-/// state. The report therefore exposes honest zero-count rows for ready
-/// substrates and explicit `dormant_not_wired` rows for W4 follow-up engines.
+/// state. The report therefore exposes honest zero-count `no_live_samples`
+/// rows, including for the W4 engines that now run live in `ft watch`.
 #[must_use]
 pub fn shadow_mode_doctor_report() -> ShadowModeDoctorReport {
     let mission_evaluator = ShadowModeEvaluator::with_defaults();
@@ -623,28 +624,31 @@ pub fn shadow_mode_doctor_report() -> ShadowModeDoctorReport {
     });
 
     rows.extend([
-        ShadowModeEngineDoctorRow::dormant(
+        ShadowModeEngineDoctorRow::live_without_shadow_samples(
             "bocpd_change_points",
             "BOCPD change-point detector",
             "bocpd",
             "watcher detect-stage pane-output regime changes",
-            "W4.2 must wire BOCPD into the live watcher detect stage before counts become non-zero",
+            "runs live in the ft watch detect stage (bocpd.change_point events); no shadow \
+             baseline runs beside it and this doctor process owns no watcher samples",
             "crates/frankenterm-core/src/bocpd.rs",
         ),
-        ShadowModeEngineDoctorRow::dormant(
+        ShadowModeEngineDoctorRow::live_without_shadow_samples(
             "connector_reliability_governor",
             "Connector reliability and quota governor",
             "connector_governor",
             "outbound connector dispatch decisions",
-            "W4.3 must run connector governor decisions beside dispatch before divergence can be measured",
+            "consulted live on outbound connector dispatch; no shadow baseline runs beside \
+             it and this doctor process owns no dispatch samples",
             "crates/frankenterm-core/src/connector_governor.rs",
         ),
-        ShadowModeEngineDoctorRow::dormant(
+        ShadowModeEngineDoctorRow::live_without_shadow_samples(
             "capacity_governor_admission",
             "Capacity governor admission",
             "swarm_scheduler",
             "resource-pressure admission and quality decisions",
-            "W4.4 must route capacity-governor dry-run decisions into the operating envelope actuator",
+            "evaluated live by ft watch into the resource cockpit; no shadow baseline runs \
+             beside it and this doctor process owns no watcher samples",
             "crates/frankenterm-core/src/swarm_scheduler.rs",
         ),
     ]);
@@ -1147,7 +1151,11 @@ mod tests {
                 .engines
                 .iter()
                 .any(|engine| engine.engine_id == "bocpd_change_points"
-                    && engine.feed_state == ShadowModeFeedState::DormantNotWired)
+                    && engine.feed_state == ShadowModeFeedState::NoLiveSamples)
+        );
+        assert_eq!(
+            report.totals.engines_dormant_not_wired, 0,
+            "the W4 engines are wired; none may be reported dormant"
         );
         assert!(report.engines.iter().all(|engine| engine.observe_only
             && !engine.live_mutation_allowed

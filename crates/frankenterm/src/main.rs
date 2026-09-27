@@ -140699,8 +140699,8 @@ A  docs/new-proof.md\n";
         assert_eq!(shadow_mode["production_behavior_changed"], false);
         assert_eq!(shadow_mode["live_mutation_allowed"], false);
         assert_eq!(shadow_mode["totals"]["engines_total"], 5);
-        assert_eq!(shadow_mode["totals"]["engines_ready_without_samples"], 2);
-        assert_eq!(shadow_mode["totals"]["engines_dormant_not_wired"], 3);
+        assert_eq!(shadow_mode["totals"]["engines_ready_without_samples"], 5);
+        assert_eq!(shadow_mode["totals"]["engines_dormant_not_wired"], 0);
 
         let engines = shadow_mode["engines"]
             .as_array()
@@ -140743,7 +140743,7 @@ A  docs/new-proof.md\n";
         }));
         assert!(engines.iter().any(|engine| {
             engine["engine_id"] == "bocpd_change_points"
-                && engine["feed_state"] == "dormant_not_wired"
+                && engine["feed_state"] == "no_live_samples"
         }));
     }
 
