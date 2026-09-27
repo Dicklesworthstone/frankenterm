@@ -5966,8 +5966,13 @@ impl ObservationRuntime {
                 None::<FleetCoordinatorMaintenanceState>;
             // Set once the mux accepts a warm eviction request (codec >= 67).
             let mut mux_warm_eviction_supported = false;
-            // The latest coordinator eviction, as the cockpit's action receipt.
-            let mut last_warm_eviction_receipts =
+            // The latest coordinator eviction and idle-poll pressure change,
+            // published together as the cockpit's action receipts.
+            let mut last_warm_eviction_receipt =
+                None::<crate::memory_pressure::ResourcePressureActionReceiptInput>;
+            let mut last_poll_pressure_receipt =
+                None::<crate::memory_pressure::ResourcePressureActionReceiptInput>;
+            let mut last_action_receipts =
                 None::<crate::memory_pressure::ResourcePressureActionReceiptReport>;
             // ft-wl9rx: totals at the previous health tick, for output rates.
             let mut previous_pane_output = None::<(u64, HashMap<u64, PaneOutputTotals>)>;
@@ -6634,9 +6639,15 @@ impl ObservationRuntime {
                     // ThrottlePolling lets the capture task back idle panes
                     // off 4x; PauseIdlePanes / EmergencyCleanup 16x.
                     let poll_pressure = fleet_poll_pressure(&fleet_eval.actions);
-                    if fleet_poll_pressure_level.swap(poll_pressure, Ordering::Relaxed)
-                        != poll_pressure
-                    {
+                    let previous_poll_pressure =
+                        fleet_poll_pressure_level.swap(poll_pressure, Ordering::Relaxed);
+                    let poll_pressure_changed = previous_poll_pressure != poll_pressure;
+                    if poll_pressure_changed {
+                        last_poll_pressure_receipt = Some(fleet_poll_pressure_receipt(
+                            previous_poll_pressure,
+                            poll_pressure,
+                            epoch_ms_u64(),
+                        ));
                         info!(
                             tier = ?fleet_eval.compound_tier,
                             throttle_polling = poll_pressure >= FLEET_POLL_PRESSURE_THROTTLE,
@@ -6665,10 +6676,19 @@ impl ObservationRuntime {
                     };
                     mux_warm_eviction_supported |= mux_eviction.supported;
                     if !eviction_targets.is_empty() {
-                        last_warm_eviction_receipts = Some(
-                            crate::memory_pressure::evaluate_resource_pressure_action_receipts(&[
-                                mux_warm_eviction_receipt(&mux_eviction, epoch_ms_u64()),
-                            ]),
+                        last_warm_eviction_receipt =
+                            Some(mux_warm_eviction_receipt(&mux_eviction, epoch_ms_u64()));
+                    }
+                    if poll_pressure_changed || !eviction_targets.is_empty() {
+                        let inputs: Vec<_> = last_poll_pressure_receipt
+                            .iter()
+                            .chain(last_warm_eviction_receipt.iter())
+                            .cloned()
+                            .collect();
+                        last_action_receipts = Some(
+                            crate::memory_pressure::evaluate_resource_pressure_action_receipts(
+                                &inputs,
+                            ),
                         );
                     }
                     if loop_cx.checkpoint().is_err() {
@@ -6905,7 +6925,7 @@ impl ObservationRuntime {
                                 &[],
                                 storage.storage_io_operator_summary().as_ref(),
                                 None,
-                                last_warm_eviction_receipts.as_ref(),
+                                last_action_receipts.as_ref(),
                             )
                             .with_pane_budget_evidence(pane_budget_evidence)
                             .with_queue_depths(
@@ -11960,6 +11980,55 @@ fn mux_warm_eviction_receipt(
         evidence_state: ResourcePressureEvidenceState::Measured,
         attribution: ResourcePressureAttribution {
             affected_bytes: Some(eviction.bytes_released),
+            ..ResourcePressureAttribution::default()
+        },
+        reason_codes: vec![reason.to_string()],
+        artifact_paths: Vec::new(),
+    }
+}
+
+/// The cockpit's action receipt for an idle-poll pressure change: raising the
+/// level degrades idle-pane capture cadence, lowering it back to none rolls
+/// that back. The capture task applies the new tailer config on its next
+/// tick, so the change is `Applied`, not independently confirmed.
+fn fleet_poll_pressure_receipt(
+    previous: u8,
+    current: u8,
+    at_ms: u64,
+) -> crate::memory_pressure::ResourcePressureActionReceiptInput {
+    use crate::memory_pressure::{
+        ResourcePressureAction, ResourcePressureActionReceiptInput, ResourcePressureAttribution,
+        ResourcePressureDomain, ResourcePressureEvidenceState, ResourcePressurePolicyDecision,
+        ResourcePressureReceiptStatus,
+    };
+    let (action, reason) = match current {
+        FLEET_POLL_PRESSURE_NONE => (
+            ResourcePressureAction::Rollback,
+            "resource.memory.idle_poll_restored",
+        ),
+        FLEET_POLL_PRESSURE_THROTTLE => (
+            ResourcePressureAction::DegradeCapture,
+            "resource.memory.idle_poll_throttled",
+        ),
+        _ => (
+            ResourcePressureAction::DegradeCapture,
+            "resource.memory.idle_panes_paused",
+        ),
+    };
+    ResourcePressureActionReceiptInput {
+        receipt_id: format!("fleet-poll-pressure-{previous}-{current}-{at_ms}"),
+        correlation_id: None,
+        action,
+        target_domain: ResourcePressureDomain::Memory,
+        requested_at_ms: at_ms,
+        completed_at_ms: Some(at_ms),
+        status: ResourcePressureReceiptStatus::Applied,
+        dry_run: false,
+        policy_decision: ResourcePressurePolicyDecision::Allow,
+        evidence_state: ResourcePressureEvidenceState::Measured,
+        // The idle-pane capture poll lane is what the level reconfigures.
+        attribution: ResourcePressureAttribution {
+            queue_name: Some("capture".to_string()),
             ..ResourcePressureAttribution::default()
         },
         reason_codes: vec![reason.to_string()],
@@ -23414,6 +23483,46 @@ mod tests {
                 }
             );
         });
+    }
+
+    #[test]
+    fn fleet_poll_pressure_receipts_degrade_then_roll_back() {
+        use crate::memory_pressure::{
+            ResourcePressureAction, ResourcePressureDomain, ResourcePressureReceiptStatus,
+            evaluate_resource_pressure_action_receipts,
+        };
+        let report = evaluate_resource_pressure_action_receipts(&[
+            fleet_poll_pressure_receipt(FLEET_POLL_PRESSURE_NONE, FLEET_POLL_PRESSURE_THROTTLE, 1),
+            fleet_poll_pressure_receipt(FLEET_POLL_PRESSURE_THROTTLE, FLEET_POLL_PRESSURE_PAUSE, 2),
+            fleet_poll_pressure_receipt(FLEET_POLL_PRESSURE_PAUSE, FLEET_POLL_PRESSURE_NONE, 3),
+        ]);
+        let rows: Vec<_> = report
+            .receipts
+            .iter()
+            .map(|row| (row.action, row.reason_codes[0].as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    ResourcePressureAction::DegradeCapture,
+                    "resource.memory.idle_poll_throttled"
+                ),
+                (
+                    ResourcePressureAction::DegradeCapture,
+                    "resource.memory.idle_panes_paused"
+                ),
+                (
+                    ResourcePressureAction::Rollback,
+                    "resource.memory.idle_poll_restored"
+                ),
+            ]
+        );
+        for row in &report.receipts {
+            assert_eq!(row.target_domain, ResourcePressureDomain::Memory);
+            assert_eq!(row.status, ResourcePressureReceiptStatus::Applied);
+        }
+        assert_eq!((report.failed_receipts, report.blocked_receipts), (0, 0));
     }
 
     #[test]
