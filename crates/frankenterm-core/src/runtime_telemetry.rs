@@ -21631,6 +21631,11 @@ mod tests {
         );
     }
 
+    /// Serializes the tests that reset, seed and assert on the process-wide
+    /// live controller state; run in parallel, one test's reset or inject
+    /// landed between another's seed and its assertion.
+    static LIVE_CONTROLLER_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// br-ft-amit3: integration test for the wiring contract — calling
     /// `live_swarm_capacity_operator_summary` after seeding the
     /// persisted state with a known pressure-action history must
@@ -21648,11 +21653,6 @@ mod tests {
     /// telemetry to emit pressure, which requires substantial
     /// fixture setup) and asserts round 2 preserves the recorded
     /// pressure action and propagates the cooldown clock to the plan.
-    /// Serializes the tests that reset, seed and assert on the process-wide
-    /// live controller state; run in parallel, one test's reset or inject
-    /// landed between another's seed and its assertion.
-    static LIVE_CONTROLLER_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn live_summary_preserves_persisted_pressure_history_ft_amit3() {
         let _serial = LIVE_CONTROLLER_STATE_TEST_LOCK
