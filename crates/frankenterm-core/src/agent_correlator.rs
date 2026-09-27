@@ -227,6 +227,8 @@ struct PaneAgentState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DetectionSource {
+    /// Recorded when the fleet launched this pane.
+    FleetSpawn,
     /// Detected from pattern engine output matching.
     PatternEngine,
     /// Detected from pane title keywords.
@@ -1777,6 +1779,7 @@ mod tests {
     #[test]
     fn detection_source_serde_roundtrip() {
         for src in [
+            DetectionSource::FleetSpawn,
             DetectionSource::PatternEngine,
             DetectionSource::PaneTitle,
             DetectionSource::ProcessName,

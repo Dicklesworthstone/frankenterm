@@ -1853,6 +1853,7 @@ impl From<(u64, &crate::agent_correlator::RunningAgentInventoryEntry)> for Runni
             session_id: entry.session_id.clone(),
             source: match entry.source {
                 crate::agent_correlator::DetectionSource::PatternEngine => "pattern_engine",
+                crate::agent_correlator::DetectionSource::FleetSpawn => "fleet_spawn",
                 crate::agent_correlator::DetectionSource::PaneTitle => "pane_title",
                 crate::agent_correlator::DetectionSource::ProcessName => "process_name",
             }
