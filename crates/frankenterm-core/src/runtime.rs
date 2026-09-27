@@ -4917,6 +4917,10 @@ pub struct ObservationRuntime {
     pane_activity_tracker: Arc<RwLock<HashMap<u64, PaneActivityState>>>,
     /// Shutdown flag for signaling tasks
     shutdown_flag: Arc<AtomicBool>,
+    /// Set by the maintenance task while the fleet coordinator recommends
+    /// `ThrottlePolling`; the capture task then lets idle panes back off to
+    /// a longer ceiling.
+    fleet_throttle_polling: Arc<AtomicBool>,
     /// Runtime metrics for health/shutdown
     metrics: Arc<RuntimeMetrics>,
     /// Hot-reloadable config sender (for broadcasting updates to tasks)
@@ -4988,6 +4992,7 @@ impl ObservationRuntime {
             detection_contexts: Arc::new(RwLock::new(HashMap::new())),
             pane_activity_tracker: Arc::new(RwLock::new(HashMap::new())),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
+            fleet_throttle_polling: Arc::new(AtomicBool::new(false)),
             metrics,
             config_tx: Arc::new(config_tx),
             config_rx,
@@ -5901,6 +5906,7 @@ impl ObservationRuntime {
         let pane_activity_tracker = Arc::clone(&self.pane_activity_tracker);
         let metrics = Arc::clone(&self.metrics);
         let scheduler_snapshot = Arc::clone(&self.scheduler_snapshot);
+        let fleet_throttle_polling = Arc::clone(&self.fleet_throttle_polling);
 
         let initial_retention_days = self.config.retention_days;
         let initial_retention_policy = Arc::clone(&self.config.retention_policy);
@@ -6624,6 +6630,25 @@ impl ObservationRuntime {
                         &fleet_pane_infos,
                         &mut pane_snapshots,
                     );
+
+                    // ThrottlePolling (Elevated/Critical) and EmergencyCleanup
+                    // let the capture task back idle panes off further.
+                    let throttle_polling = fleet_eval.actions.iter().any(|action| {
+                        matches!(
+                            action,
+                            crate::fleet_memory_controller::FleetMemoryAction::ThrottlePolling
+                                | crate::fleet_memory_controller::FleetMemoryAction::EmergencyCleanup
+                        )
+                    });
+                    if fleet_throttle_polling.swap(throttle_polling, Ordering::Relaxed)
+                        != throttle_polling
+                    {
+                        info!(
+                            tier = ?fleet_eval.compound_tier,
+                            throttle_polling,
+                            "fleet scrollback coordinator: idle-pane poll throttling changed"
+                        );
+                    }
 
                     // The coordinator plans evictions on the compact snapshots
                     // collected above. The mux owns pane scrollback, so the
@@ -7692,6 +7717,7 @@ impl ObservationRuntime {
         let capture_authority = self.capture_authority.clone();
         let capture_metadata = Arc::clone(&self.capture_metadata);
         let backpressure = Arc::clone(self.metrics.backpressure_metrics());
+        let fleet_throttle_polling = Arc::clone(&self.fleet_throttle_polling);
         let native_capture_enabled = self.config.native_event_socket.is_some();
         let transition_cache_capacity = self.config.channel_buffer.max(1);
         #[cfg(all(feature = "vendored", unix))]
@@ -7731,6 +7757,10 @@ impl ObservationRuntime {
             let capture_tx_for_supervisor = capture_tx.clone();
             // Create tailer supervisor with budget enforcement
             let initial_budget = config_rx.borrow().capture_budgets.clone();
+            // The operator-configured tailer config; fleet poll throttling
+            // runs a derived copy and returns to this one when it lifts.
+            let mut base_tailer_config = initial_config.clone();
+            let mut polling_throttled = false;
             let mut supervisor = TailerSupervisor::with_budget(
                 initial_config,
                 capture_tx_for_supervisor,
@@ -7931,7 +7961,12 @@ impl ObservationRuntime {
                         let tailer_max_interval = new_tailer_config.max_interval;
                         #[cfg(all(feature = "vendored", unix))]
                         let tailer_min_interval = new_tailer_config.min_interval;
-                        supervisor.update_config(new_tailer_config);
+                        base_tailer_config = new_tailer_config;
+                        supervisor.update_config(if polling_throttled {
+                            fleet_throttled_tailer_config(&base_tailer_config)
+                        } else {
+                            base_tailer_config.clone()
+                        });
                         supervisor.update_budget(new_config.capture_budgets.clone());
                         pane_priorities = new_config.pane_priorities.clone();
                         #[cfg(all(feature = "vendored", unix))]
@@ -7944,6 +7979,20 @@ impl ObservationRuntime {
                                 )
                             });
                         }
+                    }
+
+                    // Fleet pressure: while the coordinator recommends
+                    // ThrottlePolling, idle panes back off to a longer ceiling.
+                    let throttle = fleet_throttle_polling.load(Ordering::Relaxed);
+                    if throttle != polling_throttled {
+                        polling_throttled = throttle;
+                        supervisor.update_config(if throttle {
+                            fleet_throttled_tailer_config(&base_tailer_config)
+                        } else {
+                            base_tailer_config.clone()
+                        });
+                        metrics::counter!("frankenterm.runtime.fleet_poll_throttle_transitions")
+                            .increment(1);
                     }
 
                     // Consume one fully-prepared immutable publication.  The
@@ -13302,6 +13351,23 @@ fn duration_ms_u64(duration: Duration) -> u64 {
 /// first retry still happens at the configured interval, so a single dropped
 /// listing is invisible; a backend that stays down settles at two polls a
 /// minute. A configured interval slower than the ceiling is never sped up.
+/// How much further idle panes may back off while the fleet coordinator
+/// recommends `ThrottlePolling`.
+const FLEET_THROTTLE_IDLE_POLL_FACTOR: u32 = 4;
+
+/// The tailer config to run under fleet poll throttling: the idle ceiling
+/// (`max_interval`) grows by [`FLEET_THROTTLE_IDLE_POLL_FACTOR`]; the active
+/// floor is unchanged, so a pane that produces output still polls at
+/// `min_interval`.
+fn fleet_throttled_tailer_config(base: &TailerConfig) -> TailerConfig {
+    TailerConfig {
+        max_interval: base
+            .max_interval
+            .saturating_mul(FLEET_THROTTLE_IDLE_POLL_FACTOR),
+        ..base.clone()
+    }
+}
+
 fn discovery_backoff_interval(configured: Duration, consecutive_failures: u32) -> Duration {
     const MAX_DISCOVERY_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -24249,6 +24315,38 @@ mod tests {
     // =========================================================================
     // discovery_backoff_interval (ft-yykm1)
     // =========================================================================
+
+    #[test]
+    fn fleet_throttle_stretches_only_the_idle_poll_ceiling() {
+        let base = TailerConfig {
+            min_interval: Duration::from_millis(50),
+            max_interval: Duration::from_millis(1_000),
+            backoff_multiplier: 1.5,
+            max_concurrent: 8,
+            overlap_size: 4096,
+            send_timeout: Duration::from_millis(100),
+            capture_timeout: Duration::from_secs(2),
+        };
+        let throttled = fleet_throttled_tailer_config(&base);
+        assert_eq!(throttled.max_interval, Duration::from_millis(4_000));
+        assert_eq!(
+            throttled.min_interval, base.min_interval,
+            "active panes keep polling fast"
+        );
+        assert_eq!(throttled.max_concurrent, base.max_concurrent);
+        assert_eq!(
+            throttled.backoff_multiplier.to_bits(),
+            base.backoff_multiplier.to_bits()
+        );
+        let huge = TailerConfig {
+            max_interval: Duration::MAX,
+            ..base
+        };
+        assert_eq!(
+            fleet_throttled_tailer_config(&huge).max_interval,
+            Duration::MAX
+        );
+    }
 
     #[test]
     fn discovery_backoff_keeps_the_configured_interval_while_healthy() {
