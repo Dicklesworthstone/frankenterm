@@ -36,9 +36,11 @@ for f in "$BRIDGE" "$RUNTIME" "$POLICY"; do
   [[ -f "$f" ]] || { echo "FATAL: missing required input: $f"; exit 2; }
 done
 
-# Slice the process_event body (admission path) so ordering-sensitive checks only
-# look inside it, not the whole file / test module.
-PE_BODY="$(awk '/pub fn process_event/{f=1} f{print} f&&/^    }$/{exit}' "$BRIDGE")"
+# Slice the admission path so ordering-sensitive checks only look inside it, not
+# the whole file / test module. Since 6016c3e22 process_event delegates each
+# rule to process_event_for_rule, which holds the admission checks.
+PE_BODY="$(awk '/fn process_event_for_rule/{f=1} f{print} f&&/^    }$/{exit}' "$BRIDGE")"
+PE_ENTRY="$(awk '/pub fn process_event\(/{f=1} f{print} f&&/^    }$/{exit}' "$BRIDGE")"
 
 PASS=0
 FAIL=0
@@ -48,6 +50,13 @@ has()  { grep -q "$1" <<<"$2"; }
 
 echo "=== Connector reliability/governor consultation contract (ft-kms8i / ft-x3211 / .5.x) ==="
 echo ""
+
+# --- C0: the public entry runs the admission path ---
+if has 'self.process_event_for_rule(' "$PE_ENTRY"; then
+  pass "C0 process_event delegates to process_event_for_rule (the admission path)"
+else
+  fail "C0 process_event no longer reaches process_event_for_rule"
+fi
 
 # --- C1: reliability circuit-breaker is CONSULTED in process_event, with teeth ---
 # allow_operation() gates; a deny under admission_enforced bumps the blocked
