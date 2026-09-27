@@ -156,6 +156,7 @@ proptest! {
         let json = serde_json::to_string(&source).unwrap();
         let expected = match source {
             DetectionSource::PatternEngine => "\"pattern_engine\"",
+            DetectionSource::FleetSpawn => "\"fleet_spawn\"",
             DetectionSource::PaneTitle => "\"pane_title\"",
             DetectionSource::ProcessName => "\"process_name\"",
         };

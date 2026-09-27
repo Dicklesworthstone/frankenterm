@@ -19720,6 +19720,9 @@ fn active_agent_confidence_from_source(
     source: frankenterm_core::agent_correlator::DetectionSource,
 ) -> frankenterm_core::robot_types::AgentHealthConfidence {
     match source {
+        frankenterm_core::agent_correlator::DetectionSource::FleetSpawn => {
+            frankenterm_core::robot_types::AgentHealthConfidence::High
+        }
         frankenterm_core::agent_correlator::DetectionSource::PatternEngine => {
             frankenterm_core::robot_types::AgentHealthConfidence::High
         }
@@ -21772,6 +21775,14 @@ impl RobotFleetMuxExecutor {
             );
         }
 
+        if let Err(err) = robot_fleet_record_spawn(&self.db_path, pane_id, program) {
+            let _ = runtime.block_on(self.mux.kill_pane(pane_id));
+            return Err(frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                "robot.fleet.spawn_record_failed",
+                format!("spawned pane {pane_id} but could not record its provider: {err}"),
+            ));
+        }
+
         let mut output = frankenterm_core::fleet_mutation::FleetMutationStepOutput {
             pane_id: Some(pane_id),
             ..frankenterm_core::fleet_mutation::FleetMutationStepOutput::default()
@@ -21812,6 +21823,9 @@ impl RobotFleetMuxExecutor {
                     format!("failed to stop pane {pane_id} ({reason}): {err}"),
                 )
             })?;
+
+        // A subsequent inventory also prunes this row if cleanup fails.
+        let _ = robot_fleet_forget_spawn(&self.db_path, pane_id);
 
         let mut output = frankenterm_core::fleet_mutation::FleetMutationStepOutput {
             pane_id: Some(pane_id),
@@ -22008,7 +22022,76 @@ fn robot_fleet_work_queue_summary(db_path: &str) -> serde_json::Value {
     })
 }
 
+fn robot_fleet_spawn_db(db_path: &str) -> rusqlite::Result<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    conn.busy_timeout(Duration::from_secs(2))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS fleet_spawned_panes (
+            pane_id INTEGER PRIMARY KEY,
+            program TEXT NOT NULL
+        )",
+    )?;
+    Ok(conn)
+}
+
+fn robot_fleet_record_spawn(db_path: &str, pane_id: u64, program: &str) -> rusqlite::Result<()> {
+    robot_fleet_spawn_db(db_path)?.execute(
+        "INSERT OR REPLACE INTO fleet_spawned_panes (pane_id, program) VALUES (?1, ?2)",
+        rusqlite::params![pane_id, program],
+    )?;
+    Ok(())
+}
+
+fn robot_fleet_forget_spawn(db_path: &str, pane_id: u64) -> rusqlite::Result<()> {
+    robot_fleet_spawn_db(db_path)?.execute(
+        "DELETE FROM fleet_spawned_panes WHERE pane_id = ?1",
+        [pane_id],
+    )?;
+    Ok(())
+}
+
+fn robot_fleet_inventory_from_panes(
+    db_path: &str,
+    panes: &[frankenterm_core::wezterm::PaneInfo],
+) -> rusqlite::Result<BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry>> {
+    use frankenterm_core::agent_correlator::{DetectionSource, RunningAgentInventoryEntry};
+
+    let mut conn = robot_fleet_spawn_db(db_path)?;
+    let tx = conn.transaction()?;
+    let live: std::collections::BTreeSet<u64> = panes.iter().map(|p| p.pane_id).collect();
+    let mut spawned = BTreeMap::new();
+    let mut stale = Vec::new();
+    {
+        let mut stmt = tx.prepare("SELECT pane_id, program FROM fleet_spawned_panes")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (pane_id, program) = row?;
+            if live.contains(&pane_id) {
+                spawned.insert(pane_id, program);
+            } else {
+                stale.push(pane_id);
+            }
+        }
+    }
+    for pane_id in stale {
+        tx.execute("DELETE FROM fleet_spawned_panes WHERE pane_id = ?1", [pane_id])?;
+    }
+    tx.commit()?;
+
+    let mut running = infer_running_agents_from_panes(panes);
+    for (pane_id, program) in spawned {
+        running.insert(pane_id, RunningAgentInventoryEntry {
+            slug: program,
+            state: "active".to_string(),
+            session_id: None,
+            source: DetectionSource::FleetSpawn,
+        });
+    }
+    Ok(running)
+}
+
 async fn robot_fleet_load_running_agents(
+    db_path: &str,
     config: &frankenterm_core::config::Config,
 ) -> (
     BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry>,
@@ -22017,7 +22100,10 @@ async fn robot_fleet_load_running_agents(
     let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(config);
     let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     match wezterm.list_panes_with_cx(&cx).await {
-        Ok(panes) => (infer_running_agents_from_panes(&panes), None),
+        Ok(panes) => match robot_fleet_inventory_from_panes(db_path, &panes) {
+            Ok(agents) => (agents, None),
+            Err(err) => (BTreeMap::new(), Some(err.to_string())),
+        },
         Err(err) => (BTreeMap::new(), Some(err.to_string())),
     }
 }
@@ -22143,7 +22229,7 @@ async fn robot_fleet_command_response(
     match command {
         RobotFleetCommands::Status { detailed } => {
             let (installed_agents, installed_error) = robot_fleet_load_installed_agents();
-            let (running_agents, running_error) = robot_fleet_load_running_agents(config).await;
+            let (running_agents, running_error) = robot_fleet_load_running_agents(db_path, config).await;
             RobotResponse::success(
                 robot_fleet_status_data(
                     db_path,
@@ -22158,7 +22244,7 @@ async fn robot_fleet_command_response(
         }
         RobotFleetCommands::Agents { program, state } => {
             let (installed_agents, installed_error) = robot_fleet_load_installed_agents();
-            let (running_agents, running_error) = robot_fleet_load_running_agents(config).await;
+            let (running_agents, running_error) = robot_fleet_load_running_agents(db_path, config).await;
             RobotResponse::success(
                 robot_fleet_agents_data(
                     installed_agents,
@@ -22182,7 +22268,7 @@ async fn robot_fleet_command_response(
             {
                 return *response;
             }
-            let (running_agents, running_error) = robot_fleet_load_running_agents(config).await;
+            let (running_agents, running_error) = robot_fleet_load_running_agents(db_path, config).await;
             let (claimed_work_by_pane, work_queue_error) =
                 robot_fleet_claimed_work_counts(db_path, &running_agents);
             let mux = frankenterm_core::wezterm::wezterm_handle_from_config(config);
@@ -22258,7 +22344,7 @@ async fn robot_fleet_command_response(
             {
                 return *response;
             }
-            let (running_agents, running_error) = robot_fleet_load_running_agents(config).await;
+            let (running_agents, running_error) = robot_fleet_load_running_agents(db_path, config).await;
             let (work_rows, work_queue_error) = robot_fleet_rebalance_work_rows(db_path);
             let mux = frankenterm_core::wezterm::wezterm_handle_from_config(config);
             let mut executor = RobotFleetMuxExecutor::new(mux, db_path);
@@ -130768,6 +130854,43 @@ printf x > "$MINISIGN_MARKER"
         assert_eq!(data["receipt"]["status"], "dry_run");
         assert_eq!(data["receipt"]["steps"].as_array().unwrap().len(), 2);
         assert_eq!(executor.executed_steps, [] as [String; 0]);
+    }
+
+    #[test]
+    fn test_fleet_spawn_inventory_replans_to_zero_and_prunes_exited_panes() {
+        let tmp = tempfile::tempdir().expect("fleet database directory");
+        let db = tmp.path().join("fleet.sqlite");
+        let db = db.to_str().expect("database path");
+        let pane = |pane_id| {
+            serde_json::from_value::<frankenterm_core::wezterm::PaneInfo>(
+                serde_json::json!({
+                    "pane_id": pane_id, "tab_id": 1, "window_id": 1,
+                    "title": "generic shell"
+                }),
+            )
+            .expect("pane info")
+        };
+
+        robot_fleet_record_spawn(db, 16, "codex").expect("first spawn");
+        robot_fleet_record_spawn(db, 17, "codex").expect("second spawn");
+        let panes = vec![pane(16), pane(17)];
+        let running = robot_fleet_inventory_from_panes(db, &panes).expect("live inventory");
+        assert_eq!(running.len(), 2);
+        assert!(running.values().all(|agent| agent.slug == "codex"));
+        assert!(running.values().all(|agent| agent.source == frankenterm_core::agent_correlator::DetectionSource::FleetSpawn));
+        let (plan, _) = robot_fleet_scale_plan(
+            "codex", 2, true, None, &running, None, &BTreeMap::new(), None,
+        );
+        assert_eq!(plan["current_count"], 2);
+        assert_eq!(plan["delta"], 0);
+
+        let after_exit = robot_fleet_inventory_from_panes(db, &[pane(17)])
+            .expect("inventory after exit");
+        assert_eq!(after_exit.len(), 1);
+        let rows: i64 = robot_fleet_spawn_db(db).expect("db").query_row(
+            "SELECT COUNT(*) FROM fleet_spawned_panes", [], |row| row.get(0),
+        ).expect("row count");
+        assert_eq!(rows, 1);
     }
 
     #[test]
