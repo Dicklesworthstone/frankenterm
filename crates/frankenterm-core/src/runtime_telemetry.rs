@@ -21631,6 +21631,11 @@ mod tests {
         );
     }
 
+    /// Serializes the tests that reset, seed and assert on the process-wide
+    /// live controller state; run in parallel, one test's reset or inject
+    /// landed between another's seed and its assertion.
+    static LIVE_CONTROLLER_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// br-ft-amit3: integration test for the wiring contract — calling
     /// `live_swarm_capacity_operator_summary` after seeding the
     /// persisted state with a known pressure-action history must
@@ -21650,6 +21655,9 @@ mod tests {
     /// pressure action and propagates the cooldown clock to the plan.
     #[test]
     fn live_summary_preserves_persisted_pressure_history_ft_amit3() {
+        let _serial = LIVE_CONTROLLER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         super::reset_live_swarm_capacity_controller_state_for_test();
 
         // Seed: a Defer pressure action recorded at t=10_000.
@@ -21692,6 +21700,9 @@ mod tests {
     /// the cooldown state directly for forensics.
     #[test]
     fn live_controller_state_snapshot_round_trips_ft_amit3() {
+        let _serial = LIVE_CONTROLLER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         super::reset_live_swarm_capacity_controller_state_for_test();
         let initial = super::live_swarm_capacity_controller_state_snapshot();
         assert_eq!(
