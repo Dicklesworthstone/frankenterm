@@ -9047,7 +9047,6 @@ fn mcp_submit_idempotency_binding(
                 text: &params.text,
                 caller_key,
                 guarantee_level,
-                append_verification_canary: false,
                 wait_for: params.wait_for.as_deref(),
                 wait_for_regex: params.wait_for_regex,
                 timeout_secs: params.timeout_secs,
@@ -14560,7 +14559,6 @@ mod tests {
                 text,
                 caller_key,
                 guarantee_level: crate::robot_types::SubmitGuaranteeLevel::Write,
-                append_verification_canary: false,
                 wait_for: None,
                 wait_for_regex: false,
                 timeout_secs: 30,
@@ -21807,7 +21805,7 @@ mod tests {
     }
 
     #[test]
-    fn wa_send_unsupported_profile_never_injects_a_semantic_canary() {
+    fn wa_send_unsupported_profile_sends_exact_text_and_reports_unavailable() {
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
             let (_dir, db) = temp_db_path();
@@ -21854,83 +21852,6 @@ mod tests {
             assert_eq!(
                 content, text,
                 "unsupported profile must receive exact caller text"
-            );
-            assert!(
-                !content.contains("\u{2063}ft-vs:"),
-                "unsupported profile must never receive a semantic canary"
-            );
-        });
-    }
-
-    #[test]
-    fn wa_send_profile_availability_drift_conflicts_before_effect() {
-        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
-        runtime.block_on(async {
-            let (_dir, db) = temp_db_path();
-            let pane_id = 4_215;
-            let text = "echo profile-drift";
-            let caller_key = "profile-drift";
-            let supported_binding = crate::verified_submit::idempotency_binding(
-                crate::verified_submit::SubmitIdempotencyRequest {
-                    pane_id,
-                    text,
-                    caller_key,
-                    guarantee_level: crate::robot_types::SubmitGuaranteeLevel::Submitted,
-                    append_verification_canary: true,
-                    wait_for: None,
-                    wait_for_regex: false,
-                    timeout_secs: 30,
-                },
-            );
-            let ft_dir = db.parent().expect("test database parent");
-            assert!(matches!(
-                crate::submit_idempotency_store::claim(ft_dir, &supported_binding)
-                    .expect("seed prior supported-profile claim"),
-                crate::submit_idempotency_store::ClaimOutcome::Claimed(_)
-            ));
-
-            let mut cfg = Config::default();
-            cfg.safety.require_prompt_active = false;
-            cfg.safety.rate_limit_per_pane = 100;
-            cfg.safety.rate_limit_global = 100;
-            let cfg = Arc::new(cfg);
-            let mock = Arc::new(crate::wezterm::MockWezterm::new());
-            mock.add_default_pane(pane_id).await;
-            let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
-            let tool = WaSendTool::with_wezterm_handle(
-                Arc::clone(&cfg),
-                Arc::clone(&db),
-                Arc::clone(&mock) as crate::wezterm::WeztermHandle,
-            );
-
-            let envelope = parse_json_content(
-                tool.call(
-                    &test_mcp_context(),
-                    serde_json::json!({
-                        "pane_id": pane_id,
-                        "text": text,
-                        "submit_level": "submitted",
-                        "idempotency_key": caller_key
-                    }),
-                )
-                .expect("profile-drift response"),
-            );
-            assert_eq!(envelope["ok"], false, "envelope: {envelope:?}");
-            assert_eq!(envelope["error_code"], MCP_ERR_STORAGE);
-            let content = mock
-                .pane_state(pane_id)
-                .await
-                .expect("mock pane should remain present")
-                .content;
-            assert!(
-                content.is_empty(),
-                "profile drift must fail before pane effect"
-            );
-            assert_eq!(
-                crate::submit_idempotency_store::lookup(ft_dir, &supported_binding)
-                    .expect("lookup original supported binding"),
-                Some(crate::submit_idempotency_store::StoredSubmitState::ActiveOwner),
-                "conflicting current profile resolution must not mutate prior authority"
             );
         });
     }

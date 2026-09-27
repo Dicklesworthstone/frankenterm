@@ -77,7 +77,6 @@ fn binding<'a>(
         text,
         caller_key,
         guarantee_level: SubmitGuaranteeLevel::Submitted,
-        append_verification_canary: true,
         wait_for: None,
         wait_for_regex: false,
         timeout_secs: 30,
