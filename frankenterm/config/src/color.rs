@@ -386,6 +386,15 @@ pub struct TabBarColors {
 
     #[dynamic(default)]
     pub inactive_tab_edge_hover: Option<RgbaColor>,
+
+    /// Styling for an inactive tab in which the bell has rung since
+    /// the tab was last active
+    #[dynamic(default)]
+    pub inactive_tab_bell: Option<TabBarColor>,
+
+    /// Styling for an inactive tab with a pending bell and a mouse hovering
+    #[dynamic(default)]
+    pub inactive_tab_bell_hover: Option<TabBarColor>,
 }
 
 impl TabBarColors {
@@ -429,6 +438,18 @@ impl TabBarColors {
             .unwrap_or_else(default_inactive_tab_edge_hover)
     }
 
+    pub fn inactive_tab_bell(&self) -> TabBarColor {
+        self.inactive_tab_bell
+            .clone()
+            .unwrap_or_else(default_inactive_tab_bell)
+    }
+
+    pub fn inactive_tab_bell_hover(&self) -> TabBarColor {
+        self.inactive_tab_bell_hover
+            .clone()
+            .unwrap_or_else(default_inactive_tab_bell_hover)
+    }
+
     pub fn overlay_with(&self, other: &Self) -> Self {
         macro_rules! overlay {
             ($name:ident) => {
@@ -448,6 +469,8 @@ impl TabBarColors {
             inactive_tab_edge_hover: overlay!(inactive_tab_edge_hover),
             new_tab: overlay!(new_tab),
             new_tab_hover: overlay!(new_tab_hover),
+            inactive_tab_bell: overlay!(inactive_tab_bell),
+            inactive_tab_bell_hover: overlay!(inactive_tab_bell_hover),
         }
     }
 }
@@ -512,6 +535,21 @@ fn default_active_tab() -> TabBarColor {
     TabBarColor {
         bg_color: (0x00, 0x00, 0x00).into(),
         fg_color: (0xc0, 0xc0, 0xc0).into(),
+        ..TabBarColor::default()
+    }
+}
+fn default_inactive_tab_bell() -> TabBarColor {
+    TabBarColor {
+        bg_color: (0x8b, 0x45, 0x13).into(),
+        fg_color: (0xff, 0xff, 0xff).into(),
+        ..TabBarColor::default()
+    }
+}
+fn default_inactive_tab_bell_hover() -> TabBarColor {
+    TabBarColor {
+        bg_color: (0xa0, 0x52, 0x2d).into(),
+        fg_color: (0xff, 0xff, 0xff).into(),
+        italic: true,
         ..TabBarColor::default()
     }
 }

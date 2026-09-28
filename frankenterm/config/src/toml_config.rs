@@ -676,6 +676,54 @@ harfbuzz_features = ["calt=0", "clig=0", "liga=0"]
     }
 
     #[test]
+    fn vertical_tab_bar_and_bell_colors_load_from_toml() {
+        let toml_str = r##"
+use_fancy_tab_bar = false
+tab_bar_position = "Left"
+vertical_tab_width = 25
+vertical_tab_cell_height = 1
+
+[colors.tab_bar.inactive_tab_bell]
+bg_color = "#aa5500"
+fg_color = "#ffffff"
+
+[colors.tab_bar.inactive_tab_bell_hover]
+bg_color = "#bb6600"
+fg_color = "#000000"
+italic = true
+"##;
+        let toml_value: toml::Value = toml::from_str(toml_str).unwrap();
+        let dynamic = toml_to_dynamic(&toml_value);
+        let cfg = Config::from_dynamic(
+            &dynamic,
+            FromDynamicOptions {
+                unknown_fields: UnknownFieldAction::Deny,
+                deprecated_fields: UnknownFieldAction::Warn,
+            },
+        )
+        .unwrap();
+        assert!(!cfg.use_fancy_tab_bar);
+        assert_eq!(cfg.tab_bar_position, crate::TabBarPosition::Left);
+        assert!(cfg.is_vertical_tab_bar());
+        assert_eq!(cfg.vertical_tab_width, 25);
+        assert_eq!(cfg.vertical_tab_cell_height, 1);
+        let tab_bar = cfg
+            .colors
+            .as_ref()
+            .and_then(|c| c.tab_bar.as_ref())
+            .expect("tab_bar colors");
+        let rgba = |s: &str| {
+            <crate::RgbaColor as std::convert::TryFrom<String>>::try_from(s.to_string()).unwrap()
+        };
+        let bell = tab_bar.inactive_tab_bell();
+        assert_eq!(bell.bg_color, rgba("#aa5500"));
+        assert!(!bell.italic);
+        let bell_hover = tab_bar.inactive_tab_bell_hover();
+        assert_eq!(bell_hover.bg_color, rgba("#bb6600"));
+        assert!(bell_hover.italic);
+    }
+
+    #[test]
     fn type_mismatch_produces_error() {
         // scrollback_lines should be integer, not string
         let toml_str = r#"scrollback_lines = "not a number""#;
