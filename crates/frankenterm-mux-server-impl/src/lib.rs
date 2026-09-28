@@ -10179,9 +10179,14 @@ mod tests {
                 pixel_height: 4,
             })
             .unwrap();
+        // macOS ships `true` only in /usr/bin; Linux has both.
+        let true_path = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).exists())
+            .expect("a `true` binary");
         let child = pair
             .slave
-            .spawn_command(portable_pty::CommandBuilder::new("/bin/true"))
+            .spawn_command(portable_pty::CommandBuilder::new(true_path))
             .unwrap();
         let writer = pair.master.take_writer().unwrap();
         let terminal = wezterm_term::Terminal::new(

@@ -12695,6 +12695,8 @@ mod tests {
                             Err(error) => panic!("Hello accept: {error}"),
                         }
                     };
+                    // macOS accepted sockets inherit the listener's O_NONBLOCK.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
@@ -12854,6 +12856,8 @@ mod tests {
                         }
                         Err(error) => panic!("Genesis accept: {error}"),
                     };
+                    // macOS accepted sockets inherit the listener's O_NONBLOCK.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
@@ -13082,6 +13086,10 @@ mod tests {
                         Err(error) => panic!("fixture accept: {error}"),
                     }
                 };
+                // macOS accepted sockets inherit the listener's O_NONBLOCK.
+                stream
+                    .set_nonblocking(false)
+                    .expect("blocking fixture stream");
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .expect("read bound");
