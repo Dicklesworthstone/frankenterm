@@ -4407,6 +4407,7 @@ dependencies = [
  "metrics",
  "mlua",
  "mux",
+ "mux-lua",
  "openssl",
  "portable-pty",
  "promise",
