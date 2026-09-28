@@ -141318,8 +141318,11 @@ A  docs/new-proof.md\n";
                 );
             }
 
-            // No errors in healthy workspace (except compatibility-backend checks which depend on runtime)
-            let wezterm_check_names = ["WezTerm CLI", "WezTerm connection"];
+            // No errors in healthy workspace (except backend checks that depend
+            // on the host runtime: `mux generation` handshakes whatever mux the
+            // host's socket discovery finds, e.g. another build's mux on a
+            // shared worker).
+            let wezterm_check_names = ["WezTerm CLI", "WezTerm connection", "mux generation"];
             let error_names: Vec<&str> = checks
                 .iter()
                 .filter(|c| c.status == DiagnosticStatus::Error)
