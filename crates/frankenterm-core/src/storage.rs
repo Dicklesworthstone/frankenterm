@@ -203,6 +203,42 @@ const QUERY_PANE_LAST_OUTPUT_AT_BULK_SQL: &str = r"WITH requested(pane_id) AS (
      FROM requested
      JOIN panes ON panes.pane_id = requested.pane_id";
 
+/// ft-yj2at: per pane, the last captured output, the last successful
+/// policy-gated input (any send action audited against the pane), and the
+/// most recently detected agent type. Feeds `PaneActivityTimestamps::classify`.
+const QUERY_PANE_AGENT_ACTIVITY_BULK_SQL: &str = r"WITH requested(pane_id) AS (
+         SELECT CAST(requested_json.value AS INTEGER)
+         FROM json_each(?1) AS requested_json
+         WHERE requested_json.type = 'integer'
+     )
+     SELECT panes.pane_id,
+            (
+                SELECT output_segments.captured_at
+                FROM output_segments
+                WHERE output_segments.pane_id = panes.pane_id
+                ORDER BY output_segments.captured_at DESC
+                LIMIT 1
+            ),
+            (
+                SELECT MAX(audit_actions.ts)
+                FROM audit_actions
+                WHERE (audit_actions.pane_id = panes.pane_id
+                       OR audit_actions.target_pane_id = panes.pane_id)
+                  AND audit_actions.action_kind IN
+                      ('send_text', 'send_ctrl_c', 'send_ctrl_d', 'send_ctrl_z', 'send_control')
+                  AND audit_actions.result = 'success'
+            ),
+            (
+                SELECT events.agent_type
+                FROM events
+                WHERE events.pane_id = panes.pane_id
+                  AND events.agent_type NOT IN ('', 'unknown')
+                ORDER BY events.detected_at DESC
+                LIMIT 1
+            )
+     FROM requested
+     JOIN panes ON panes.pane_id = requested.pane_id";
+
 const QUERY_LAST_ACTIVITY_BY_PANE_SQL: &str = r"SELECT panes.pane_id,
               (
                   SELECT output_segments.captured_at
@@ -9243,6 +9279,30 @@ impl StorageHandle {
         Self::spawn_blocking_storage_with_cx(cx, move || {
             pooled_backend(db_path.as_str(), |backend| {
                 query_pane_last_output_at_bulk_canonical_backend(backend, &pane_ids)
+            })
+        })
+        .await
+    }
+
+    /// ft-yj2at: each existing pane's stored activity evidence in one read
+    /// snapshot, for classifying `AgentPaneState` without the watcher's
+    /// in-process state. Missing panes are omitted; input is capped at
+    /// [`STORAGE_BULK_ID_INPUT_MAX`].
+    pub async fn pane_agent_activity_bulk_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_ids: &[u64],
+    ) -> Result<HashMap<u64, PaneAgentActivity>> {
+        Self::checkpoint_storage_operation(cx, "pane_agent_activity_bulk")?;
+        let pane_ids = canonical_pane_ids(pane_ids, "pane agent activity")?;
+        if pane_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let db_path = Arc::clone(&self.db_path);
+
+        Self::spawn_blocking_storage_with_cx(cx, move || {
+            pooled_backend(db_path.as_str(), |backend| {
+                query_pane_agent_activity_bulk_canonical_backend(backend, &pane_ids)
             })
         })
         .await
@@ -33337,6 +33397,87 @@ fn query_pane_last_output_at_bulk_canonical_backend(
     Ok(activity)
 }
 
+/// Stored activity evidence for one pane (ft-yj2at); all timestamps are epoch
+/// ms and `None` when the pane has no such record.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PaneAgentActivity {
+    /// Latest captured output segment.
+    pub last_output_at: Option<i64>,
+    /// Latest successful policy-gated send to the pane.
+    pub last_input_at: Option<i64>,
+    /// Most recently detected agent type (never `unknown`).
+    pub detected_agent_type: Option<String>,
+}
+
+fn query_pane_agent_activity_bulk_canonical_backend(
+    backend: &dyn StorageBackend,
+    pane_ids: &[i64],
+) -> Result<HashMap<u64, PaneAgentActivity>> {
+    if pane_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let pane_ids_json = canonical_i64_id_json(pane_ids, "pane agent activity")?;
+    let rows = backend
+        .query_map_cells(
+            QUERY_PANE_AGENT_ACTIVITY_BULK_SQL,
+            &[ToSqlValue::Text(&pane_ids_json)],
+        )
+        .map_err(|err| storage_backend_error("Bulk pane agent activity query failed", err))?;
+
+    let mut activity = HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let reader = CellRowReader::new(row);
+        if reader.column_count() != 4 {
+            return Err(StorageError::Database(format!(
+                "bulk pane agent activity row has {} columns; expected 4",
+                reader.column_count()
+            ))
+            .into());
+        }
+        let pane_id_i64 = reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("Decode agent activity pane ID", err))?;
+        if pane_ids.binary_search(&pane_id_i64).is_err() {
+            return Err(StorageError::Database(format!(
+                "bulk agent activity query returned unrequested pane ID {pane_id_i64}"
+            ))
+            .into());
+        }
+        let pane_id = u64::try_from(pane_id_i64).map_err(|_| {
+            StorageError::Database(format!(
+                "bulk agent activity pane ID {pane_id_i64} is out of u64 range"
+            ))
+        })?;
+        let timestamp = |idx: usize, what: &str| -> Result<Option<i64>> {
+            let value = reader
+                .optional_i64(idx)
+                .map_err(|err| storage_backend_error("Decode agent activity timestamp", err))?;
+            if value.is_some_and(|value| value < 0) {
+                return Err(StorageError::Database(format!(
+                    "pane {pane_id} has a negative last {what} timestamp"
+                ))
+                .into());
+            }
+            Ok(value)
+        };
+        let row_activity = PaneAgentActivity {
+            last_output_at: timestamp(1, "output")?,
+            last_input_at: timestamp(2, "input")?,
+            detected_agent_type: reader
+                .optional_string(3)
+                .map_err(|err| storage_backend_error("Decode detected agent type", err))?,
+        };
+        if activity.insert(pane_id, row_activity).is_some() {
+            return Err(StorageError::Database(format!(
+                "bulk agent activity query returned duplicate pane ID {pane_id}"
+            ))
+            .into());
+        }
+    }
+
+    Ok(activity)
+}
+
 fn pane_record_from_backend_cells(row: &[SqlCell]) -> Result<PaneRecord> {
     let reader = CellRowReader::new(row);
     let pane_id = reader
@@ -34098,6 +34239,66 @@ fn event_annotations_bulk_supports_bounded_json_each_snapshot() {
     )
     .unwrap();
     assert!(query_event_annotations_bulk_backend(&backend, &[second]).is_err());
+}
+
+#[test]
+fn pane_agent_activity_bulk_reads_output_successful_input_and_known_agent() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1);
+    seed_pane_backend(&backend, 2, 1);
+    seed_segment_backend(&backend, 1, 0, "hello", 150);
+    let audit = |pane: i64, ts: i64, kind: &str, result: &str| {
+        execute_typed(
+            &backend,
+            "INSERT INTO audit_actions (ts, actor_kind, pane_id, action_kind, policy_decision, result)
+             VALUES (?1, 'robot', ?2, ?3, 'allow', ?4)",
+            &[
+                ToSqlValue::Integer(ts),
+                ToSqlValue::Integer(pane),
+                ToSqlValue::Text(kind),
+                ToSqlValue::Text(result),
+            ],
+        )
+        .unwrap();
+    };
+    audit(1, 300, "send_text", "success");
+    audit(1, 400, "send_text", "denied");
+    audit(1, 350, "read_output", "success");
+    audit(1, 320, "send_ctrl_c", "success");
+    let event = |pane: i64, at: i64, agent: &str| {
+        execute_typed(
+            &backend,
+            "INSERT INTO events (pane_id, rule_id, agent_type, event_type, severity, confidence, detected_at)
+             VALUES (?1, 'r', ?2, 't', 'info', 1.0, ?3)",
+            &[
+                ToSqlValue::Integer(pane),
+                ToSqlValue::Text(agent),
+                ToSqlValue::Integer(at),
+            ],
+        )
+        .unwrap();
+    };
+    event(1, 100, "codex");
+    event(1, 200, "unknown");
+    event(2, 100, "");
+
+    let pane_ids = canonical_pane_ids(&[2, 1, 9_999], "pane agent activity").unwrap();
+    let activity = query_pane_agent_activity_bulk_canonical_backend(&backend, &pane_ids).unwrap();
+    assert_eq!(activity.len(), 2, "missing panes are omitted");
+    assert_eq!(
+        activity.get(&1),
+        Some(&PaneAgentActivity {
+            last_output_at: Some(150),
+            last_input_at: Some(320),
+            detected_agent_type: Some("codex".to_string()),
+        }),
+        "only successful send actions count as input; unknown agent types are skipped"
+    );
+    assert_eq!(
+        activity.get(&2),
+        Some(&PaneAgentActivity::default()),
+        "a pane without output, input or a known agent has no evidence"
+    );
 }
 
 #[test]

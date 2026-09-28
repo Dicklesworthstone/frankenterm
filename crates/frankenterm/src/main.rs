@@ -4251,9 +4251,10 @@ enum RobotCommands {
     /// every `--all` must match AND (if any `--any` is given) at least one
     /// `--any` must match.
     /// Supported DB-cursor sources are `rule:<glob>` (an event whose rule-id
-    /// matches appears) and `quiescence:<pane>[:<idle_ms>]` (storage-derived
-    /// output silence). `state:` requires the watcher IPC transport because it
-    /// depends on live input-sent tracking. Generalizes wait-for.
+    /// matches appears), `quiescence:<pane>[:<idle_ms>]` (storage-derived
+    /// output silence) and `state:<pane>:<active|thinking|stuck|idle|human>`
+    /// (agent pane state classified from stored output, audited policy-gated
+    /// input and detected agent type). Generalizes wait-for.
     Await {
         /// Condition where ANY match satisfies (repeatable). E.g. `rule:codex.*`
         #[arg(long = "any")]
@@ -32480,6 +32481,9 @@ fn await_cursor_scope(
             "quiescence:{pane_id}:{}",
             idle_ms.unwrap_or(config.idle_silence_ms)
         ),
+        AwaitCondition::State { pane_id, class } => {
+            format!("state:{pane_id}:{}", class.as_token())
+        }
     };
     let mut any = any.iter().map(canonical).collect::<Vec<_>>();
     let mut all = all.iter().map(canonical).collect::<Vec<_>>();
@@ -34287,6 +34291,13 @@ enum AwaitCondition {
     /// Storage-derived pane quiescence: no captured output for at least the
     /// requested idle threshold.
     Quiescence { pane_id: u64, idle_ms: Option<u64> },
+    /// Storage-derived agent pane state (ft-yj2at): the pane currently
+    /// classifies as `class` from its stored output, policy-gated input and
+    /// detected agent type.
+    State {
+        pane_id: u64,
+        class: frankenterm_core::agent_pane_state::AgentPaneState,
+    },
 }
 
 fn validate_await_condition_limits(any: &[String], all: &[String]) -> Result<(), String> {
@@ -34313,10 +34324,10 @@ fn validate_await_condition_limits(any: &[String], all: &[String]) -> Result<(),
 }
 
 /// Parse one `ft robot await` condition. Supported in DB-cursor mode:
-/// `rule:<glob>` (the rule-id glob from watch-events) and
-/// `quiescence:<pane>[:<idle_ms>]` (latest output timestamp from storage).
-/// The `state:<pane>:<s>` source still requires the watcher's live in-process
-/// state because AgentPaneState depends on input-sent tracking.
+/// `rule:<glob>` (the rule-id glob from watch-events),
+/// `quiescence:<pane>[:<idle_ms>]` (latest output timestamp from storage) and
+/// `state:<pane>:<class>` (AgentPaneState classified from stored output,
+/// audited policy-gated input and detected agent type).
 fn parse_await_condition(spec: &str) -> Result<AwaitCondition, String> {
     let spec = spec.trim();
     if let Some(glob) = spec.strip_prefix("rule:") {
@@ -34328,11 +34339,9 @@ fn parse_await_condition(spec: &str) -> Result<AwaitCondition, String> {
         frankenterm_core::agent_pane_state::AwaitPaneCondition::parse(spec)?
     {
         match condition {
-            frankenterm_core::agent_pane_state::AwaitPaneCondition::State { .. } => Err(format!(
-                "condition `{spec}`: state: sources need the watcher's live \
-                 in-process state over the IPC transport; rule:<glob> and \
-                 quiescence:<pane>[:<idle_ms>] are supported in DB-cursor mode"
-            )),
+            frankenterm_core::agent_pane_state::AwaitPaneCondition::State { pane_id, class } => {
+                Ok(AwaitCondition::State { pane_id, class })
+            }
             frankenterm_core::agent_pane_state::AwaitPaneCondition::Quiescence {
                 pane_id,
                 idle_ms,
@@ -34340,8 +34349,8 @@ fn parse_await_condition(spec: &str) -> Result<AwaitCondition, String> {
         }
     } else {
         Err(format!(
-            "unrecognized condition `{spec}`; expected `rule:<glob>` \
-             or `quiescence:<pane>[:<idle_ms>]`"
+            "unrecognized condition `{spec}`; expected `rule:<glob>`, \
+             `quiescence:<pane>[:<idle_ms>]` or `state:<pane>:<class>`"
         ))
     }
 }
@@ -34353,7 +34362,7 @@ fn await_condition_matches(
 ) -> bool {
     match cond {
         AwaitCondition::Rule(glob) => watch_rule_glob_matches(glob, &event.rule_id),
-        AwaitCondition::Quiescence { .. } => false,
+        AwaitCondition::Quiescence { .. } | AwaitCondition::State { .. } => false,
     }
 }
 
@@ -34386,7 +34395,7 @@ fn await_condition_matches_quiescence(
     config: &frankenterm_core::agent_pane_state::AgentDetectionConfig,
 ) -> Option<bool> {
     match cond {
-        AwaitCondition::Rule(_) => None,
+        AwaitCondition::Rule(_) | AwaitCondition::State { .. } => None,
         AwaitCondition::Quiescence { idle_ms, .. } => {
             let last_output_ms = match last_output_at {
                 Some(timestamp) => match u64::try_from(timestamp) {
@@ -34407,23 +34416,49 @@ fn await_condition_matches_quiescence(
     }
 }
 
+/// Whether a storage-derived pane snapshot classifies as the requested agent
+/// pane state (ft-yj2at). The pane counts as agent-controlled once a detection
+/// with a known agent type was recorded for it; there is no stored stuck flag,
+/// so `stuck` comes only from input followed by output silence.
+fn await_condition_matches_pane_state(
+    cond: &AwaitCondition,
+    activity: &frankenterm_core::storage::PaneAgentActivity,
+    now_ms: u64,
+    config: &frankenterm_core::agent_pane_state::AgentDetectionConfig,
+) -> Option<bool> {
+    let AwaitCondition::State { class, .. } = cond else {
+        return None;
+    };
+    let as_ms = |timestamp: Option<i64>| timestamp.and_then(|ms| u64::try_from(ms).ok());
+    let timestamps = frankenterm_core::agent_pane_state::PaneActivityTimestamps {
+        last_output_ms: as_ms(activity.last_output_at).unwrap_or(0),
+        last_input_ms: as_ms(activity.last_input_at).unwrap_or(0),
+        is_agent: activity.detected_agent_type.is_some(),
+        flagged_stuck: false,
+    };
+    Some(timestamps.classify(now_ms, config) == *class)
+}
+
 fn refresh_await_condition_state(
     condition: &AwaitCondition,
     prior_met: bool,
-    last_output_at: Option<i64>,
+    activity: &frankenterm_core::storage::PaneAgentActivity,
     now_ms: u64,
     config: &frankenterm_core::agent_pane_state::AgentDetectionConfig,
 ) -> bool {
     match condition {
         AwaitCondition::Rule(_) => prior_met,
         AwaitCondition::Quiescence { .. } => {
-            await_condition_matches_quiescence(condition, last_output_at, now_ms, config)
+            await_condition_matches_quiescence(condition, activity.last_output_at, now_ms, config)
                 .unwrap_or(false)
+        }
+        AwaitCondition::State { .. } => {
+            await_condition_matches_pane_state(condition, activity, now_ms, config).unwrap_or(false)
         }
     }
 }
 
-fn await_quiescence_pane_ids(
+fn await_pane_condition_ids(
     any_conditions: &[AwaitCondition],
     all_conditions: &[AwaitCondition],
 ) -> Vec<u64> {
@@ -34432,36 +34467,41 @@ fn await_quiescence_pane_ids(
         .chain(all_conditions)
         .filter_map(|condition| match condition {
             AwaitCondition::Rule(_) => None,
-            AwaitCondition::Quiescence { pane_id, .. } => Some(*pane_id),
+            AwaitCondition::Quiescence { pane_id, .. } | AwaitCondition::State { pane_id, .. } => {
+                Some(*pane_id)
+            }
         })
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect()
 }
 
-fn update_await_quiescence_set_from_snapshot(
+fn update_await_pane_set_from_snapshot(
     config: &frankenterm_core::agent_pane_state::AgentDetectionConfig,
     conditions: &[AwaitCondition],
     met: &mut [bool],
-    pane_activity: &std::collections::HashMap<u64, Option<i64>>,
+    pane_activity: &std::collections::HashMap<u64, frankenterm_core::storage::PaneAgentActivity>,
     now: u64,
 ) -> Result<(), u64> {
     for (condition, is_met) in conditions.iter().zip(met.iter_mut()) {
-        let AwaitCondition::Quiescence { pane_id, .. } = condition else {
+        let (AwaitCondition::Quiescence { pane_id, .. } | AwaitCondition::State { pane_id, .. }) =
+            condition
+        else {
             continue;
         };
-        let Some(last_output_at) = pane_activity.get(pane_id) else {
+        let Some(activity) = pane_activity.get(pane_id) else {
             return Err(*pane_id);
         };
-        // Unlike a rule occurrence, quiescence is a level-triggered state, not
-        // a historical latch. New output must be able to turn a previously
-        // satisfied condition false before the composite is evaluated.
-        *is_met = refresh_await_condition_state(condition, *is_met, *last_output_at, now, config);
+        // Unlike a rule occurrence, pane conditions are level-triggered
+        // states, not historical latches. New output or input must be able to
+        // turn a previously satisfied condition false before the composite is
+        // evaluated.
+        *is_met = refresh_await_condition_state(condition, *is_met, activity, now, config);
     }
     Ok(())
 }
 
-async fn update_await_quiescence_conditions(
+async fn update_await_pane_conditions(
     cx: &frankenterm_core::cx::Cx,
     storage: &frankenterm_core::storage::StorageHandle,
     config: &frankenterm_core::agent_pane_state::AgentDetectionConfig,
@@ -34470,27 +34510,19 @@ async fn update_await_quiescence_conditions(
     all_conditions: &[AwaitCondition],
     all_met: &mut [bool],
 ) -> frankenterm_core::Result<Option<u64>> {
-    let pane_ids = await_quiescence_pane_ids(any_conditions, all_conditions);
+    let pane_ids = await_pane_condition_ids(any_conditions, all_conditions);
     let pane_activity = storage
-        .pane_last_output_at_bulk_with_cx(cx, &pane_ids)
+        .pane_agent_activity_bulk_with_cx(cx, &pane_ids)
         .await?;
     let now = now_ms();
-    if let Err(pane_id) = update_await_quiescence_set_from_snapshot(
-        config,
-        any_conditions,
-        any_met,
-        &pane_activity,
-        now,
-    ) {
+    if let Err(pane_id) =
+        update_await_pane_set_from_snapshot(config, any_conditions, any_met, &pane_activity, now)
+    {
         return Ok(Some(pane_id));
     }
-    if let Err(pane_id) = update_await_quiescence_set_from_snapshot(
-        config,
-        all_conditions,
-        all_met,
-        &pane_activity,
-        now,
-    ) {
+    if let Err(pane_id) =
+        update_await_pane_set_from_snapshot(config, all_conditions, all_met, &pane_activity, now)
+    {
         return Ok(Some(pane_id));
     }
     Ok(None)
@@ -37526,8 +37558,15 @@ mod watch_events_tests {
                 idle_ms: Some(250)
             })
         );
+        assert_eq!(
+            parse_await_condition("state:7:stuck"),
+            Ok(AwaitCondition::State {
+                pane_id: 7,
+                class: frankenterm_core::agent_pane_state::AgentPaneState::Stuck,
+            })
+        );
+        assert!(parse_await_condition("state:7:asleep").is_err());
         assert!(parse_await_condition("rule:").is_err());
-        assert!(parse_await_condition("state:7:stuck").is_err());
         assert!(parse_await_condition("quiescence:bogus").is_err());
         assert!(parse_await_condition("bogus").is_err());
     }
@@ -37613,25 +37652,102 @@ mod watch_events_tests {
                 idle_ms: Some(20),
             },
         ];
-        let all = vec![AwaitCondition::Quiescence {
-            pane_id: 9,
-            idle_ms: Some(30),
-        }];
-        assert_eq!(await_quiescence_pane_ids(&any, &all), [7, 9]);
+        let all = vec![
+            AwaitCondition::Quiescence {
+                pane_id: 9,
+                idle_ms: Some(30),
+            },
+            AwaitCondition::State {
+                pane_id: 11,
+                class: frankenterm_core::agent_pane_state::AgentPaneState::Idle,
+            },
+        ];
+        assert_eq!(await_pane_condition_ids(&any, &all), [7, 9, 11]);
 
         let config = frankenterm_core::agent_pane_state::AgentDetectionConfig::default();
+        let output_at = |at: Option<i64>| frankenterm_core::storage::PaneAgentActivity {
+            last_output_at: at,
+            ..Default::default()
+        };
         let mut met = vec![false; any.len()];
-        let activity = std::collections::HashMap::from([(9, None)]);
+        let activity = std::collections::HashMap::from([(9, output_at(None))]);
         assert_eq!(
-            update_await_quiescence_set_from_snapshot(&config, &any, &mut met, &activity, 1_000,),
+            update_await_pane_set_from_snapshot(&config, &any, &mut met, &activity, 1_000,),
             Err(7),
             "a missing pane is not the same as an existing pane with no output"
         );
 
-        let activity = std::collections::HashMap::from([(7, Some(990)), (9, None)]);
-        update_await_quiescence_set_from_snapshot(&config, &any, &mut met, &activity, 1_000)
+        let activity =
+            std::collections::HashMap::from([(7, output_at(Some(990))), (9, output_at(None))]);
+        update_await_pane_set_from_snapshot(&config, &any, &mut met, &activity, 1_000)
             .expect("all pane IDs exist");
         assert_eq!(met, [true, false]);
+    }
+
+    #[test]
+    fn await_state_classifies_stored_output_input_and_agent_detection() {
+        use frankenterm_core::agent_pane_state::AgentPaneState;
+        let config = frankenterm_core::agent_pane_state::AgentDetectionConfig::default();
+        let state = |class| AwaitCondition::State { pane_id: 7, class };
+        let agent =
+            |output: i64, input: Option<i64>| frankenterm_core::storage::PaneAgentActivity {
+                last_output_at: Some(output),
+                last_input_at: input,
+                detected_agent_type: Some("claude_code".to_string()),
+            };
+        let now = 100_000;
+        let classify = |activity: &frankenterm_core::storage::PaneAgentActivity, class| {
+            await_condition_matches_pane_state(&state(class), activity, now, &config)
+                .expect("state condition")
+        };
+
+        // Output 1 s ago: active.
+        assert!(classify(&agent(99_000, None), AgentPaneState::Active));
+        // Input sent after the last output, 10 s of silence: thinking.
+        assert!(classify(
+            &agent(88_000, Some(90_000)),
+            AgentPaneState::Thinking
+        ));
+        // Input followed by 40 s of silence: stuck.
+        assert!(classify(
+            &agent(58_000, Some(60_000)),
+            AgentPaneState::Stuck
+        ));
+        // No input or output for over a minute: idle.
+        assert!(classify(&agent(10_000, Some(5_000)), AgentPaneState::Idle));
+        // A pane with no detected agent is human, whatever its activity.
+        let human = frankenterm_core::storage::PaneAgentActivity {
+            last_output_at: Some(99_000),
+            ..Default::default()
+        };
+        assert!(classify(&human, AgentPaneState::Human));
+        assert!(!classify(&human, AgentPaneState::Active));
+        assert_eq!(
+            await_condition_matches_pane_state(
+                &AwaitCondition::Rule("x".to_string()),
+                &human,
+                now,
+                &config
+            ),
+            None
+        );
+        // Level-triggered: new output clears a met stuck condition.
+        let stuck = state(AgentPaneState::Stuck);
+        let met = refresh_await_condition_state(
+            &stuck,
+            false,
+            &agent(58_000, Some(60_000)),
+            now,
+            &config,
+        );
+        assert!(met);
+        assert!(!refresh_await_condition_state(
+            &stuck,
+            met,
+            &agent(99_500, Some(60_000)),
+            now,
+            &config
+        ));
     }
 
     #[test]
@@ -37677,10 +37793,25 @@ mod watch_events_tests {
             pane_id: 7,
             idle_ms: Some(500),
         };
-        let quiet = refresh_await_condition_state(&quiescence, false, Some(1_000), 1_500, &config);
+        let output_at = |at: Option<i64>| frankenterm_core::storage::PaneAgentActivity {
+            last_output_at: at,
+            ..Default::default()
+        };
+        let quiet = refresh_await_condition_state(
+            &quiescence,
+            false,
+            &output_at(Some(1_000)),
+            1_500,
+            &config,
+        );
         assert!(quiet);
-        let resumed =
-            refresh_await_condition_state(&quiescence, quiet, Some(1_499), 1_500, &config);
+        let resumed = refresh_await_condition_state(
+            &quiescence,
+            quiet,
+            &output_at(Some(1_499)),
+            1_500,
+            &config,
+        );
         assert!(
             !resumed,
             "new pane output must clear a previously met quiescence condition"
@@ -37688,7 +37819,7 @@ mod watch_events_tests {
 
         let rule = AwaitCondition::Rule("build.done".to_string());
         assert!(
-            refresh_await_condition_state(&rule, true, None, 1_500, &config),
+            refresh_await_condition_state(&rule, true, &output_at(None), 1_500, &config),
             "historical rule occurrences remain latched"
         );
     }
@@ -55119,7 +55250,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
 
                                 let checked_through = event_stream_page_checked_through(&page, 500);
                                 let batch_len = page.events.len();
-                                match update_await_quiescence_conditions(
+                                match update_await_pane_conditions(
                                     &cx,
                                     &storage,
                                     &config.agent_detection,

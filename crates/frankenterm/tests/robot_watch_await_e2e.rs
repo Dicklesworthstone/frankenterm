@@ -849,22 +849,56 @@ fn cursorless_await_checkpoints_then_ignores_seeded_history() {
 #[test]
 fn await_rejects_unsupported_condition_sources() {
     let ws = seed_workspace();
-    // state: requires the watcher IPC transport — a clear typed rejection,
-    // never a silent hang or mis-evaluation. Storage-backed quiescence is
-    // supported independently.
+    // An unknown source is a clear typed rejection, never a silent hang or
+    // mis-evaluation.
     ft(ws.path())
-        .args([
-            "robot",
-            "await",
-            "--all",
-            "state:1:stuck",
-            "--timeout-secs",
-            "1",
-        ])
+        .args(["robot", "await", "--all", "bogus:1", "--timeout-secs", "1"])
         .assert()
         .success()
-        .stdout(
-            predicate::str::contains("IPC transport")
-                .or(predicate::str::contains("state:/quiescence")),
-        );
+        .stdout(predicate::str::contains("unrecognized condition"));
+}
+
+#[test]
+fn await_state_condition_classifies_from_storage() {
+    // ft-yj2at: pane 1 has codex detections (an agent) and no output or input
+    // for far longer than the idle window, so it classifies as idle.
+    let ws = seed_workspace();
+    let out = stdout_of(
+        ft(ws.path())
+            .args([
+                "robot",
+                "await",
+                "--all",
+                "state:1:idle",
+                "--timeout-secs",
+                "5",
+            ])
+            .assert()
+            .success(),
+    );
+    let result = ndjson_records(&out)
+        .into_iter()
+        .find(|record| record["type"] == "await_result")
+        .unwrap_or_else(|| panic!("await_result record: {out}"));
+    assert_eq!(result["satisfied"], true, "state:1:idle output: {out}");
+
+    let out = stdout_of(
+        ft(ws.path())
+            .args([
+                "robot",
+                "await",
+                "--all",
+                "state:1:active",
+                "--timeout-secs",
+                "1",
+            ])
+            .assert()
+            .success(),
+    );
+    let result = ndjson_records(&out)
+        .into_iter()
+        .find(|record| record["type"] == "await_result")
+        .unwrap_or_else(|| panic!("await_result record: {out}"));
+    assert_eq!(result["satisfied"], false, "state:1:active output: {out}");
+    assert_eq!(result["timed_out"], true);
 }

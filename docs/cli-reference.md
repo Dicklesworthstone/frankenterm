@@ -328,7 +328,7 @@ ft robot events label <event_id> --add <label> [--by <actor>]
 ft robot events label <event_id> --remove <label>
 ft robot events label <event_id> --list
 ft robot watch-events [--follow] [--severity <critical|error|warning|info>] [--rule-id <glob>] [--pane <id>] [--unhandled] [--claim] [--cursor <id> --cursor-epoch <32-lowercase-hex> --cursor-scope <64-lowercase-hex>] [--limit <n>] [--heartbeat-interval-ms <ms>] [--poll-interval-ms <ms>] [--max-hz <n>]
-ft robot await [--any 'rule:<glob>'|'quiescence:<pane>[:<idle_ms>]'] [--all 'rule:<glob>'|'quiescence:<pane>[:<idle_ms>]'] [--timeout-secs <n>] [--poll-interval-ms <ms>] [--checkpoint-only] [--cursor <id> --cursor-epoch <32-lowercase-hex> --cursor-scope <64-lowercase-hex>]
+ft robot await [--any 'rule:<glob>'|'quiescence:<pane>[:<idle_ms>]'|'state:<pane>:<active|thinking|stuck|idle|human>'] [--all <same condition forms>] [--timeout-secs <n>] [--poll-interval-ms <ms>] [--checkpoint-only] [--cursor <id> --cursor-epoch <32-lowercase-hex> --cursor-scope <64-lowercase-hex>]
 
 ft robot workflow list
 ft robot workflow run <name> <pane_id> [--force] [--dry-run]
