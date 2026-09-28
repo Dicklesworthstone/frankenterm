@@ -8391,7 +8391,9 @@ mod tests {
             image.panes[0].checkpoint.authority,
             CheckpointAuthority::ModelOnly { .. }
         ));
-        let directory = tempfile::tempdir().unwrap();
+        // The store refuses symlinked path components; macOS /tmp is one.
+        let directory =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let store = SnapshotPublicationStore::open(directory.path(), Default::default()).unwrap();
         store
