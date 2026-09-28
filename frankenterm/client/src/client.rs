@@ -109,18 +109,43 @@ async fn with_mux_rpc_bootstrap_timeout_for<T, F>(
 where
     F: Future<Output = anyhow::Result<T>>,
 {
+    with_rpc_deadline(timeout_duration, "mux RPC bootstrap", operation).await
+}
+
+/// How long one pane liveness poll RPC may take. On an attached transport that
+/// is open but silent (the ssh proxy ESTABLISHED, zero bytes flowing, the peer
+/// never answering) the request never completes. Without a deadline the poll
+/// stays `poll_in_progress` forever, never polls again, and the domain looks
+/// attached while keystrokes go nowhere (ft-81vbe). Generous enough that a slow
+/// but live mux is not torn down.
+pub(crate) const LIVENESS_POLL_RPC_DEADLINE: Duration = Duration::from_secs(45);
+
+/// Bound `operation` by one finite deadline. On expiry the error's root cause is
+/// [`Timeout`] (see [`is_rpc_deadline_timeout`]) and its context names `what`.
+pub(crate) async fn with_rpc_deadline<T, F>(
+    deadline: Duration,
+    what: &'static str,
+    operation: F,
+) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
     let timeout = async move {
-        promise::spawn::sleep(timeout_duration).await;
-        Err(anyhow::Error::new(Timeout)).context(format!(
-            "mux RPC bootstrap exceeded its {:?} deadline",
-            timeout_duration
-        ))
+        promise::spawn::sleep(deadline).await;
+        Err(anyhow::Error::new(Timeout))
+            .context(format!("{what} exceeded its {:?} deadline", deadline))
     };
     pin_mut!(operation);
     pin_mut!(timeout);
     match select(operation, timeout).await {
         Either::Left((result, _)) | Either::Right((result, _)) => result,
     }
+}
+
+/// True when `error` came from a [`with_rpc_deadline`] expiry rather than from
+/// the RPC itself.
+pub(crate) fn is_rpc_deadline_timeout(error: &anyhow::Error) -> bool {
+    error.root_cause().is::<Timeout>()
 }
 
 /// Poll an already-bound interactive RPC exactly once so that its bounded,
@@ -19282,6 +19307,45 @@ mod tests {
 
         assert!(error.root_cause().is::<Timeout>());
         assert!(error.to_string().contains("bootstrap exceeded"));
+    }
+
+    #[test]
+    fn liveness_rpc_deadline_expires_on_a_silent_transport() {
+        // An attached-but-silent transport never answers: the poll must get a
+        // finite, recognisable deadline error instead of waiting forever.
+        let error = asupersync_block_on(with_rpc_deadline(
+            Duration::from_millis(5),
+            "pane liveness poll",
+            futures::future::pending::<anyhow::Result<()>>(),
+        ))
+        .expect_err("a silent liveness RPC must hit its deadline");
+
+        assert!(is_rpc_deadline_timeout(&error));
+        assert!(error
+            .to_string()
+            .contains("pane liveness poll exceeded its"));
+    }
+
+    #[test]
+    fn liveness_rpc_deadline_does_not_misclassify_rpc_errors_or_delay_answers() {
+        // Only the deadline may fence a generation: an ordinary RPC failure keeps
+        // its own error, and a prompt answer passes through untouched.
+        let rpc_error = asupersync_block_on(with_rpc_deadline(
+            Duration::from_secs(30),
+            "pane liveness poll",
+            futures::future::ready(Err::<(), _>(anyhow!("remote refused"))),
+        ))
+        .expect_err("an RPC error must be returned as-is");
+        assert!(!is_rpc_deadline_timeout(&rpc_error));
+        assert_eq!(rpc_error.to_string(), "remote refused");
+
+        let answer = asupersync_block_on(with_rpc_deadline(
+            Duration::from_secs(30),
+            "pane liveness poll",
+            futures::future::ready(Ok::<_, anyhow::Error>(7_u8)),
+        ))
+        .expect("a prompt answer must pass through");
+        assert_eq!(answer, 7);
     }
 
     #[test]

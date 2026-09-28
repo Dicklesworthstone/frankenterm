@@ -1,4 +1,7 @@
-use crate::client::{RpcConsumerKind, RpcGenerationScope};
+use crate::client::{
+    is_rpc_deadline_timeout, with_rpc_deadline, RpcConsumerKind, RpcGenerationScope,
+    LIVENESS_POLL_RPC_DEADLINE,
+};
 use crate::domain::ClientInner;
 use codec::*;
 use config::{configuration, ConfigHandle};
@@ -2566,7 +2569,28 @@ impl RenderableInner {
         });
         reservation
             .spawn_local(async move {
-                let response = request.await;
+                let response = with_rpc_deadline(
+                    LIVENESS_POLL_RPC_DEADLINE,
+                    "pane liveness poll",
+                    request,
+                )
+                .await;
+                if let Err(error) = &response {
+                    if is_rpc_deadline_timeout(error) {
+                        // The transport is attached but silent. Fence this exact
+                        // generation so the reader exits, the proxy is reaped and
+                        // reconnect (or the domain watchdog) takes over, instead of
+                        // leaving the domain "attached" with nothing flowing.
+                        let abort = client.client.abort_rpc_transport_generation(
+                            &rpc,
+                            "pane liveness poll deadline missed",
+                        );
+                        log::warn!(
+                            "liveness poll for remote pane {remote_pane_id} got no answer within {:?}; aborted its RPC generation ({abort:?})",
+                            LIVENESS_POLL_RPC_DEADLINE
+                        );
+                    }
+                }
                 let cleared = registration.try_with_current(|_| {
                     let renderable = renderable.lock();
                     let inner = renderable.inner.borrow();
