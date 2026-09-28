@@ -71777,7 +71777,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             // own dedicated runtime for async operations.
             let layout_clone = layout.clone();
             let mux_config = config.clone();
-            let result = frankenterm_core::runtime_async::spawn_blocking(move || {
+            // Boxed: the closure owns a cloned Config, which makes the future large.
+            let result = Box::pin(frankenterm_core::runtime_async::spawn_blocking(move || {
                 // The configured mux client (vendored direct mux when available);
                 // the default handle only knows the external WezTerm CLI.
                 let wezterm: frankenterm_core::wezterm::WeztermHandle =
@@ -71785,7 +71786,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 let query_client =
                     ProductionQueryClient::with_storage_and_wezterm(layout_clone, storage, wezterm);
                 run_tui(query_client, tui_config)
-            })
+            }))
             .await
             .map_err(|e| anyhow::anyhow!("TUI blocking task failed: {e}"))?;
 
@@ -71824,7 +71825,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
 
             let layout_clone = layout.clone();
             let mux_config = config.clone();
-            let result = frankenterm_core::runtime_async::spawn_blocking(move || {
+            // Boxed: the closure owns a cloned Config, which makes the future large.
+            let result = Box::pin(frankenterm_core::runtime_async::spawn_blocking(move || {
                 // The configured mux client (vendored direct mux when available);
                 // the default handle only knows the external WezTerm CLI.
                 let wezterm: frankenterm_core::wezterm::WeztermHandle =
@@ -71832,7 +71834,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 let query_client =
                     ProductionQueryClient::with_storage_and_wezterm(layout_clone, storage, wezterm);
                 run_tui(query_client, tui_config)
-            })
+            }))
             .await
             .map_err(|e| anyhow::anyhow!("TUI blocking task failed: {e}"))?;
 
