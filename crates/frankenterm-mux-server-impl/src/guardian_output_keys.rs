@@ -793,15 +793,37 @@ fn open_authority_lock_file(
     {
         return Err(GuardianOutputKeyringError::IdentityChanged);
     }
-    // The lock inode is itself part of the authority. Always make both its
-    // empty contents and directory entry durable before relying on it: a
-    // prior creator can make the name visible and crash before its own
-    // directory sync, so observing `before = Some` is not durability proof.
-    file.sync_all()?;
-    sync_directory(directory)?;
+    // The lock inode is itself part of the authority. Make both its empty
+    // contents and directory entry durable before relying on it: a prior
+    // creator can make the name visible and crash before its own directory
+    // sync, so observing `before = Some` is not durability proof. Once this
+    // process has synced an inode, it stays durable; re-syncing it on every
+    // acquisition cost two full flushes per scrollback append (ft-y0gy9).
+    #[cfg(unix)]
+    let identity = (opened.dev(), opened.ino());
+    // A poisoned cache only costs the syncs it would have skipped.
+    #[cfg(unix)]
+    let already_durable = DURABLE_AUTHORITY_LOCKS
+        .lock()
+        .is_ok_and(|durable| durable.contains(&identity));
+    #[cfg(not(unix))]
+    let already_durable = false;
+    if !already_durable {
+        file.sync_all()?;
+        sync_directory(directory)?;
+    }
     validate_opened_file(directory, OsStr::new(AUTHORITY_LOCK_NAME), &file, 0)?;
+    #[cfg(unix)]
+    if !already_durable && let Ok(mut durable) = DURABLE_AUTHORITY_LOCKS.lock() {
+        durable.insert(identity);
+    }
     Ok(file.into_std())
 }
+
+/// Authority lock inodes (dev, ino) this process has already made durable.
+#[cfg(unix)]
+static DURABLE_AUTHORITY_LOCKS: LazyLock<Mutex<HashSet<(u64, u64)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 fn validate_open_authority_lock_file(
     directory: &CapDir,
