@@ -4444,7 +4444,7 @@ impl LiveScrollbackSpillSink {
                     file.set_len(0)?;
                 }
                 file.write_all(&bytes)?;
-                file.sync_all()?;
+                frankenterm_core::storage::mmap_store::ordered_durability_sync(&file)?;
             }
             #[cfg(test)]
             if LIVE_SCROLLBACK_WAL_READBACK_FAULT.with(|fault| fault.get() == 1) {
@@ -4462,13 +4462,17 @@ impl LiveScrollbackSpillSink {
                 Self::verify_append_wal_readback(&stage_path, &bytes)?;
             }
             #[cfg(not(windows))]
-            std::fs::File::open(parent)?.sync_all()?;
+            frankenterm_core::storage::mmap_store::ordered_durability_sync(&std::fs::File::open(
+                parent,
+            )?)?;
 
             publication_attempted = true;
             std::fs::rename(&stage_path, &active_path)
                 .with_context(|| format!("publish append WAL {}", active_path.display()))?;
             #[cfg(not(windows))]
-            std::fs::File::open(parent)?.sync_all()?;
+            frankenterm_core::storage::mmap_store::ordered_durability_sync(&std::fs::File::open(
+                parent,
+            )?)?;
             #[cfg(test)]
             if LIVE_SCROLLBACK_WAL_READBACK_FAULT.with(|fault| fault.get() == 2) {
                 std::fs::OpenOptions::new()
@@ -6252,7 +6256,7 @@ impl LiveScrollbackSpillSink {
         }
         file.set_len(0)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        frankenterm_core::storage::mmap_store::ordered_durability_sync(&file)?;
         Ok(())
     }
 
@@ -6293,7 +6297,7 @@ impl LiveScrollbackSpillSink {
                 "scrollback stage lost private file authority before synchronization"
             );
         }
-        file.sync_all()?;
+        frankenterm_core::storage::mmap_store::ordered_durability_sync(&file)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;
@@ -6505,13 +6509,17 @@ impl LiveScrollbackSpillSink {
             match options.open(&temp_path) {
                 Ok(mut file) => {
                     file.write_all(&bytes)
-                        .and_then(|()| file.sync_all())
+                        .and_then(|()| {
+                            frankenterm_core::storage::mmap_store::ordered_durability_sync(&file)
+                        })
                         .with_context(|| {
                             format!("persist scrollback manifest stage {}", temp_path.display())
                         })?;
                     drop(file);
                     #[cfg(not(windows))]
-                    std::fs::File::open(parent)?.sync_all()?;
+                    frankenterm_core::storage::mmap_store::ordered_durability_sync(
+                        &std::fs::File::open(parent)?,
+                    )?;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     let staged = match Self::read_manifest(&temp_path) {
@@ -6563,7 +6571,9 @@ impl LiveScrollbackSpillSink {
                         LIVE_SCROLLBACK_MANIFEST_MAX_BYTES,
                     )?;
                     #[cfg(not(windows))]
-                    std::fs::File::open(parent)?.sync_all()?;
+                    frankenterm_core::storage::mmap_store::ordered_durability_sync(
+                        &std::fs::File::open(parent)?,
+                    )?;
                 }
                 Err(error) => {
                     return Err(error).with_context(|| {
@@ -6583,12 +6593,13 @@ impl LiveScrollbackSpillSink {
                 let directory = std::fs::File::open(parent).with_context(|| {
                     format!("open scrollback manifest directory {}", parent.display())
                 })?;
-                directory.sync_all().with_context(|| {
-                    format!(
-                        "synchronize scrollback manifest directory {}",
-                        parent.display()
-                    )
-                })?;
+                frankenterm_core::storage::mmap_store::ordered_durability_sync(&directory)
+                    .with_context(|| {
+                        format!(
+                            "synchronize scrollback manifest directory {}",
+                            parent.display()
+                        )
+                    })?;
             }
             let published_manifest = Self::read_manifest(&self.manifest_path)?
                 .ok_or_else(|| anyhow::anyhow!("published scrollback manifest disappeared"))?;

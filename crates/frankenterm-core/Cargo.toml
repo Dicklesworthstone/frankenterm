@@ -195,6 +195,8 @@ rustix = { workspace = true, features = ["process"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 xattr.workspace = true
+# F_BARRIERFSYNC for the ordered-durability sync of the live scrollback store.
+nix = { workspace = true, features = ["fs"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 # Diagnostic examples correlate their phases with same-host perf samples.

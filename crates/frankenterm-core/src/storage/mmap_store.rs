@@ -158,6 +158,36 @@ const PANE_LOG_MAX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
 /// Spill queues use the same cap so accepted batches cannot exceed storage admission.
 pub const PANE_APPEND_MAX_ROWS: usize = 4096;
 const PANE_APPEND_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Durability sync for the live scrollback store (ft-y0gy9).
+///
+/// The store's crash protocol needs its writes to reach stable storage in
+/// order (stage, rename, log, sequence, manifest): recovery reconciles any
+/// prefix of those steps, so a crash or power loss may lose the newest
+/// appends but must never reorder them. On macOS `File::sync_all` is
+/// `F_FULLFSYNC`, a full drive-cache flush (~4.75 ms per call, ~9 per append,
+/// all on the pane's parser thread); `F_BARRIERFSYNC` (~0.7 ms) keeps the
+/// ordering without the flush, the same trade SQLite makes by default on
+/// macOS. A filesystem that rejects the barrier falls back to a full sync.
+/// Elsewhere this is `sync_all`.
+pub fn ordered_durability_sync(file: &File) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_BARRIERFSYNC).is_ok() {
+        return Ok(());
+    }
+    file.sync_all()
+}
+
+/// [`ordered_durability_sync`] for a file's data only. Barrier syncs cover
+/// data and metadata alike, so on macOS this is the same call; elsewhere it
+/// is `sync_data`.
+pub fn ordered_durability_sync_data(file: &File) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_BARRIERFSYNC).is_ok() {
+        return Ok(());
+    }
+    file.sync_data()
+}
 const PANE_BASE_SEQ_JOURNAL_MAX_BYTES: u64 = 1024 * 1024;
 #[cfg(not(test))]
 const PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES: u64 = PANE_BASE_SEQ_JOURNAL_MAX_BYTES / 4 * 3;
@@ -1043,7 +1073,7 @@ impl PaneFile {
                     "pane storage path has no parent directory",
                 ))
             })?;
-            File::open(parent)?.sync_all()?;
+            ordered_durability_sync(&File::open(parent)?)?;
         }
         #[cfg(windows)]
         {
@@ -1303,7 +1333,7 @@ impl PaneFile {
         }
         self.base_seq_file.write_all(record.as_bytes())?;
         self.base_seq_file.flush()?;
-        self.base_seq_file.sync_data()?;
+        ordered_durability_sync_data(&self.base_seq_file)?;
         Ok(())
     }
 
@@ -1366,7 +1396,7 @@ impl PaneFile {
             // Remove exactly that uncommitted suffix before retrying so the
             // next append cannot duplicate rows or join onto a partial record.
             self.file.set_len(self.file_len)?;
-            self.file.sync_all()?;
+            ordered_durability_sync(&self.file)?;
             self.file.seek(SeekFrom::Start(self.file_len))?;
             self.trailing_partial = false;
         }
@@ -1401,7 +1431,7 @@ impl PaneFile {
         // host or mux process dies. Persist the appended data before making it
         // visible through the in-memory index and returning success.
         self.file.flush()?;
-        self.file.sync_data()?;
+        ordered_durability_sync_data(&self.file)?;
         #[cfg(test)]
         {
             PANE_APPEND_DATA_SYNCS.with(|count| count.set(count.get() + 1));
@@ -1625,7 +1655,7 @@ impl PaneFile {
     fn clear(&mut self) -> Result<(), MmapStoreError> {
         self.file.set_len(0)?;
         self.file.flush()?;
-        self.file.sync_data()?;
+        ordered_durability_sync_data(&self.file)?;
         self.file_len = 0;
         self.trailing_partial = false;
         self.data_start = 0;
@@ -1633,7 +1663,7 @@ impl PaneFile {
         self.line_offsets.clear();
         self.base_seq_file.set_len(0)?;
         self.base_seq_file.flush()?;
-        self.base_seq_file.sync_data()?;
+        ordered_durability_sync_data(&self.base_seq_file)?;
         Ok(())
     }
 
@@ -1861,7 +1891,7 @@ impl PaneFile {
             compacted.write_all(&retained)?;
             // Persist the retained bytes before the rename so the swap can never
             // expose a partially written compacted log.
-            compacted.sync_all()?;
+            ordered_durability_sync(&compacted)?;
             compacted
         };
         Self::revalidate_open_file(&tmp_path, &compacted_file)?;
