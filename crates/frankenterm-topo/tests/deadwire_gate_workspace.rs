@@ -70,6 +70,10 @@ fn declarations() -> Vec<DecisionApiDeclaration> {
             "observe_backpressure",
             "crates/frankenterm-core/src/aegis_diagnostics.rs",
         ),
+        (
+            "ensure_active_agent_session_with_cx",
+            "crates/frankenterm-core/src/session_correlation.rs",
+        ),
     ]
     .into_iter()
     .map(|(symbol, path)| DecisionApiDeclaration::new(symbol, path))

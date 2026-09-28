@@ -8691,6 +8691,19 @@ impl ObservationRuntime {
                             pending_resyncs.acknowledge(pane_id);
                             completed_resyncs.remove(&pane_id);
                             retired_state_candidates.remove(&pane_id);
+                            // ft-ngbfu: a closed pane ends its agent session.
+                            if let Err(error) =
+                                crate::session_correlation::end_active_agent_sessions_with_cx(
+                                    &loop_cx,
+                                    &storage,
+                                    pane_id,
+                                    "pane_closed",
+                                    epoch_ms(),
+                                )
+                                .await
+                            {
+                                warn!(pane_id, error = %error, "Failed to end agent sessions");
+                            }
                         }
                     }
 
@@ -9806,6 +9819,9 @@ impl ObservationRuntime {
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
             let max_persist_segment_bytes = tuning.ingest.max_persist_segment_bytes;
             let mut incarnation_state = PersistenceIncarnationState::new();
+            // ft-ngbfu: the agent each pane's open agent_sessions row belongs
+            // to, so storage is only consulted when a pane's agent changes.
+            let mut agent_session_agents: HashMap<u64, AgentType> = HashMap::new();
             let mut capture_open = true;
             let mut retirement_open = true;
             let mut deferred_capture = None;
@@ -10375,6 +10391,39 @@ impl ObservationRuntime {
                                         Ok(outcome) => {
                                             if let Some(event_id) = outcome.inserted_event_id() {
                                                 metrics.events_recorded.increment();
+
+                                                // ft-ngbfu: a detection attributed to
+                                                // an agent opens (or continues) that
+                                                // pane's agent session.
+                                                if matches!(
+                                                    detection.agent_type,
+                                                    AgentType::Codex
+                                                        | AgentType::ClaudeCode
+                                                        | AgentType::Gemini
+                                                ) && agent_session_agents.get(&pane_id)
+                                                    != Some(&detection.agent_type)
+                                                {
+                                                    match crate::session_correlation::ensure_active_agent_session_with_cx(
+                                                        &loop_cx,
+                                                        &storage,
+                                                        pane_id,
+                                                        &detection.agent_type.to_string(),
+                                                        captured_at,
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(_) => {
+                                                            agent_session_agents
+                                                                .insert(pane_id, detection.agent_type);
+                                                        }
+                                                        Err(error) => warn!(
+                                                            pane_id,
+                                                            agent_type = %detection.agent_type,
+                                                            error = %error,
+                                                            "Failed to record agent session"
+                                                        ),
+                                                    }
+                                                }
 
                                                 // Publish to event bus for workflow runners (if configured)
                                                 if let Some(ref bus) = event_bus {

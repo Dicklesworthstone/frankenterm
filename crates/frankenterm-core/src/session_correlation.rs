@@ -595,6 +595,58 @@ async fn select_session_record_with_cx(
     Ok(record)
 }
 
+/// Ensure `pane_id` has an open `agent_sessions` row for `agent_type`
+/// (ft-ngbfu): the watcher calls this when a detection first attributes the
+/// pane to an agent. An open session of the same type is reused; open sessions
+/// of another type end with `agent_changed` (a pane runs one agent at a time);
+/// otherwise a session starts at `started_at_ms`. Returns the session id.
+pub async fn ensure_active_agent_session_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    pane_id: u64,
+    agent_type: &str,
+    started_at_ms: i64,
+) -> Result<i64, crate::Error> {
+    let sessions = storage.get_sessions_for_pane_with_cx(cx, pane_id).await?;
+    let mut active = None;
+    for session in sessions.into_iter().filter(|s| s.ended_at.is_none()) {
+        if session.agent_type == agent_type && active.is_none() {
+            active = Some(session.id);
+        } else {
+            let mut ended = session;
+            ended.ended_at = Some(started_at_ms.max(ended.started_at));
+            ended.end_reason = Some("agent_changed".to_string());
+            storage.upsert_agent_session_with_cx(cx, ended).await?;
+        }
+    }
+    if let Some(id) = active {
+        return Ok(id);
+    }
+    let mut record = AgentSessionRecord::new_start(pane_id, agent_type);
+    record.started_at = started_at_ms;
+    storage.upsert_agent_session_with_cx(cx, record).await
+}
+
+/// End every open `agent_sessions` row for `pane_id` (ft-ngbfu), e.g. when the
+/// pane closes. Returns how many sessions were ended.
+pub async fn end_active_agent_sessions_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    pane_id: u64,
+    end_reason: &str,
+    ended_at_ms: i64,
+) -> Result<usize, crate::Error> {
+    let sessions = storage.get_sessions_for_pane_with_cx(cx, pane_id).await?;
+    let mut ended_count = 0;
+    for mut session in sessions.into_iter().filter(|s| s.ended_at.is_none()) {
+        session.ended_at = Some(ended_at_ms.max(session.started_at));
+        session.end_reason = Some(end_reason.to_string());
+        storage.upsert_agent_session_with_cx(cx, session).await?;
+        ended_count += 1;
+    }
+    Ok(ended_count)
+}
+
 fn resolve_project_path(cwd: &str) -> Option<PathBuf> {
     let parsed = CwdInfo::parse(cwd);
     if parsed.is_remote || parsed.path.is_empty() {
@@ -1285,6 +1337,72 @@ mod tests {
     }
 
     // ── DB-backed tests ──
+
+    #[test]
+    fn agent_session_lifecycle_starts_reuses_switches_and_ends() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("ft.db").to_string_lossy().to_string();
+            let handle = StorageHandle::new(&db_path).await.unwrap();
+            handle
+                .upsert_pane(PaneRecord {
+                    pane_id: 4,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: None,
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: 1,
+                    last_seen_at: 1,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                })
+                .await
+                .unwrap();
+            let cx = crate::cx::for_testing();
+
+            let first = ensure_active_agent_session_with_cx(&cx, &handle, 4, "codex", 1_000)
+                .await
+                .unwrap();
+            let again = ensure_active_agent_session_with_cx(&cx, &handle, 4, "codex", 2_000)
+                .await
+                .unwrap();
+            assert_eq!(first, again, "an open session of the same agent is reused");
+
+            let switched =
+                ensure_active_agent_session_with_cx(&cx, &handle, 4, "claude_code", 3_000)
+                    .await
+                    .unwrap();
+            assert_ne!(first, switched);
+            let codex = handle.get_agent_session(first).await.unwrap().unwrap();
+            assert_eq!(codex.started_at, 1_000);
+            assert_eq!(codex.ended_at, Some(3_000));
+            assert_eq!(codex.end_reason.as_deref(), Some("agent_changed"));
+
+            assert_eq!(
+                end_active_agent_sessions_with_cx(&cx, &handle, 4, "pane_closed", 4_000)
+                    .await
+                    .unwrap(),
+                1
+            );
+            let claude = handle.get_agent_session(switched).await.unwrap().unwrap();
+            assert_eq!(claude.agent_type, "claude_code");
+            assert_eq!(claude.ended_at, Some(4_000));
+            assert_eq!(claude.end_reason.as_deref(), Some("pane_closed"));
+            assert!(handle.get_active_sessions().await.unwrap().is_empty());
+            assert_eq!(
+                end_active_agent_sessions_with_cx(&cx, &handle, 4, "pane_closed", 5_000)
+                    .await
+                    .unwrap(),
+                0
+            );
+
+            handle.shutdown().await.unwrap();
+        });
+    }
 
     #[test]
     fn correlate_and_persist_override_updates_session() {

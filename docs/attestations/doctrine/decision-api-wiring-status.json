@@ -57,6 +57,12 @@
       "dormant_bead": "ft-3agml",
       "dormant_expires_on": "2027-03-31",
       "note": "Aegis PAC-Bayesian throttle verdict: observability only, no capture/ingest/render path consults it (ft-3agml)"
+    },
+    {
+      "symbol": "ensure_active_agent_session_with_cx",
+      "defining_path": "crates/frankenterm-core/src/session_correlation.rs",
+      "status": "wired",
+      "note": "watcher persistence opens/continues a pane's agent_sessions row on agent-attributed detections; capture teardown ends it (ft-ngbfu)"
     }
   ]
 }
