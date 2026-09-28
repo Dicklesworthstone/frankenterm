@@ -219,7 +219,10 @@ end)
 --         '-o', 'ConnectTimeout=10',
 --         '-o', 'BatchMode=yes',
 --         'user@myhost.example.com',        -- placeholder: your own host
---         'nc -U /run/user/1000/frankenterm/sock',
+--         -- -N (netcat-openbsd) ends the remote nc on stdin EOF, so a dropped
+--         -- connection tears down the whole ssh -> nc -> mux chain instead of
+--         -- leaving it running forever.
+--         'nc -N -U /run/user/1000/frankenterm/sock',
 --       },
 --       skip_permissions_check = true,
 --       read_timeout = 120,

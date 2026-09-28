@@ -8299,9 +8299,38 @@ impl std::fmt::Debug for UnixConnectStream {
     }
 }
 
+/// SIGKILL the proxy's whole process group. The proxy is spawned as its own
+/// group leader, so this reaches descendants that a kill of the direct child
+/// cannot: a wrapper such as `sh -c 'ssh a nc … || ssh b nc …'` keeps ssh as a
+/// grandchild, and killing only `sh` left that ssh (and its remote `nc` and mux
+/// connection) orphaned for the life of the GUI. It runs even when the direct
+/// child already exited, because the group can outlive its leader. ESRCH (no
+/// such group) is the expected no-op for a child that is not a group leader; a
+/// group id cannot be reused while any member of that group is alive.
+#[cfg(unix)]
+fn kill_proxy_process_group(pid: u32) {
+    let Ok(pgid) = libc::pid_t::try_from(pid) else {
+        return;
+    };
+    if pgid <= 1 {
+        return;
+    }
+    // SAFETY: `killpg` only sends a signal to the process group `pgid`; it
+    // reads and writes no memory owned by this process.
+    if unsafe { libc::killpg(pgid, libc::SIGKILL) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            log::warn!("failed to kill unix proxy process group {pgid}: {error}");
+        }
+    }
+}
+
 fn terminate_and_reap_proxy_child(
     child: &mut std::process::Child,
 ) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(unix)]
+    kill_proxy_process_group(child.id());
+
     if let Some(status) = child.try_wait()? {
         return Ok(status);
     }
@@ -8433,6 +8462,10 @@ fn unix_connect_with_retry(
                     .ok_or_else(|| anyhow!("unix proxy command is empty"))?;
                 let mut cmd = std::process::Command::new(program);
                 cmd.args(args);
+                // Lead a fresh process group so teardown can kill every
+                // descendant, not just this pid (see kill_proxy_process_group).
+                #[cfg(unix)]
+                cmd.process_group(0);
 
                 let (a, b) = filedescriptor::socketpair()?;
 
@@ -19006,6 +19039,72 @@ mod tests {
             "the transport drop must leave no live or zombie proxy child {}",
             pid
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_proxy_transport_kills_wrapper_grandchildren() {
+        // A proxy wrapper that cannot `exec` (like the `sh -c 'ssh a … || ssh b …'`
+        // fallback form) keeps the real transport as a grandchild. Killing only
+        // the direct child used to orphan it, so this goes through the real
+        // spawn path and checks the grandchild itself.
+        let pid_file = std::env::temp_dir().join(format!(
+            "frankenterm-proxy-grandchild-{}-{}.pid",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        ));
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 30 & echo $! > \"$1\"; wait || true".to_string(),
+            "sh".to_string(),
+            pid_file.display().to_string(),
+        ];
+        let stream = match unix_connect_with_retry(&UnixTarget::Proxy(argv), false, Some(1)) {
+            Ok(stream) => stream,
+            Err(err) => panic!("spawn wrapper proxy: {:#}", err),
+        };
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let grandchild = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "wrapper never recorded its grandchild pid"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let _ = std::fs::remove_file(&pid_file);
+
+        drop(stream);
+
+        // SIGKILL is immediate, but the orphaned grandchild stays a zombie until
+        // init reaps it, and `kill -0` still succeeds on a zombie, so poll briefly.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let alive = std::process::Command::new("sh")
+                .args(["-c", &format!("kill -0 {grandchild} 2>/dev/null")])
+                .status()
+                .expect("probe proxy grandchild pid after transport drop")
+                .success();
+            if !alive {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the transport drop must kill the proxy's grandchild {}, not orphan it",
+                grandchild
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[test]
