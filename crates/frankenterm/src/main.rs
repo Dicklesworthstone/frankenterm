@@ -22036,10 +22036,15 @@ fn robot_fleet_spawn_db(db_path: &str) -> rusqlite::Result<rusqlite::Connection>
     Ok(conn)
 }
 
+/// SQLite stores INTEGER as i64; a pane id beyond `i64::MAX` is refused.
+fn robot_fleet_spawn_pane_sql(pane_id: u64) -> rusqlite::Result<i64> {
+    i64::try_from(pane_id).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+}
+
 fn robot_fleet_record_spawn(db_path: &str, pane_id: u64, program: &str) -> rusqlite::Result<()> {
     robot_fleet_spawn_db(db_path)?.execute(
         "INSERT OR REPLACE INTO fleet_spawned_panes (pane_id, program) VALUES (?1, ?2)",
-        rusqlite::params![pane_id, program],
+        rusqlite::params![robot_fleet_spawn_pane_sql(pane_id)?, program],
     )?;
     Ok(())
 }
@@ -22047,7 +22052,7 @@ fn robot_fleet_record_spawn(db_path: &str, pane_id: u64, program: &str) -> rusql
 fn robot_fleet_forget_spawn(db_path: &str, pane_id: u64) -> rusqlite::Result<()> {
     robot_fleet_spawn_db(db_path)?.execute(
         "DELETE FROM fleet_spawned_panes WHERE pane_id = ?1",
-        [pane_id],
+        [robot_fleet_spawn_pane_sql(pane_id)?],
     )?;
     Ok(())
 }
@@ -22067,7 +22072,14 @@ fn robot_fleet_inventory_from_panes(
     {
         let mut stmt = tx.prepare("SELECT pane_id, program FROM fleet_spawned_panes")?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+            let pane_id = u64::try_from(row.get::<_, i64>(0)?).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })?;
+            Ok((pane_id, row.get::<_, String>(1)?))
         })?;
         for row in rows {
             let (pane_id, program) = row?;
@@ -22081,7 +22093,7 @@ fn robot_fleet_inventory_from_panes(
     for pane_id in stale {
         tx.execute(
             "DELETE FROM fleet_spawned_panes WHERE pane_id = ?1",
-            [pane_id],
+            [robot_fleet_spawn_pane_sql(pane_id)?],
         )?;
     }
     tx.commit()?;
