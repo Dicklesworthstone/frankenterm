@@ -677,11 +677,9 @@ impl super::TermWindow {
 
         let config = &self.config;
 
-        let tab_bar_height = if self.show_tab_bar {
-            self.tab_bar_pixel_height().unwrap_or(0.)
-        } else {
-            0.
-        };
+        let tab_bar_insets = self.tab_bar_insets().unwrap_or_default();
+        let tab_bar_height = tab_bar_insets.height();
+        let tab_bar_width = tab_bar_insets.width();
 
         let border = self.get_os_border();
 
@@ -722,7 +720,8 @@ impl super::TermWindow {
 
             let pixel_width = (cols * self.render_metrics.cell_size.width as usize)
                 + (padding_left + padding_right)
-                + (border.left + border.right).get() as usize;
+                + (border.left + border.right).get() as usize
+                + tab_bar_width as usize;
 
             let dims = Dimensions {
                 pixel_width: pixel_width as usize,
@@ -739,6 +738,7 @@ impl super::TermWindow {
                 padding_bottom,
                 border,
                 tab_bar_height: tab_bar_height as usize,
+                tab_bar_width: tab_bar_width as usize,
             };
 
             (size, dims, ri_calc)
@@ -763,7 +763,8 @@ impl super::TermWindow {
 
             let avail_width = dimensions.pixel_width.saturating_sub(
                 (padding_left + padding_right) as usize
-                    + (border.left + border.right).get() as usize,
+                    + (border.left + border.right).get() as usize
+                    + tab_bar_width as usize,
             );
             let avail_height = dimensions
                 .pixel_height
@@ -799,6 +800,7 @@ impl super::TermWindow {
                 padding_bottom,
                 border,
                 tab_bar_height: tab_bar_height as usize,
+                tab_bar_width: tab_bar_width as usize,
             };
 
             (size, *dimensions, ri_calc)
@@ -1020,11 +1022,11 @@ impl super::TermWindow {
         };
 
         let show_tab_bar = config.enable_tab_bar && !config.hide_tab_bar_if_only_one_tab;
-        let tab_bar_height = if show_tab_bar {
-            self.tab_bar_pixel_height()? as usize
-        } else {
-            0
-        };
+        // Matches the tab bar space that apply_dimensions subtracts.
+        let tab_bar_insets =
+            Self::tab_bar_insets_impl(config, show_tab_bar, &self.fonts, &self.render_metrics)?;
+        let tab_bar_height = tab_bar_insets.height() as usize;
+        let tab_bar_width = tab_bar_insets.width() as usize;
 
         let h_context = DimensionContext {
             dpi: self.dimensions.dpi as f32,
@@ -1043,7 +1045,8 @@ impl super::TermWindow {
         let dimensions = Dimensions {
             pixel_width: ((terminal_size.cols as usize * render_metrics.cell_size.width as usize)
                 + padding_left
-                + effective_right_padding(&config, h_context)),
+                + effective_right_padding(&config, h_context))
+                + tab_bar_width,
             pixel_height: ((terminal_size.rows as usize * render_metrics.cell_size.height as usize)
                 + padding_top
                 + padding_bottom) as usize

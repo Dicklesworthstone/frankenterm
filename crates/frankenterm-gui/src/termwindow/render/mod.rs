@@ -508,6 +508,7 @@ impl crate::TermWindow {
             .bottom
             .evaluate_as_pixels(v_context);
 
+        let tab_bar_insets = self.tab_bar_insets().unwrap_or_default();
         let horizontal_gap = self.dimensions.pixel_width as f32
             - self.terminal_size.pixel_width as f32
             - padding_left
@@ -515,16 +516,13 @@ impl crate::TermWindow {
                 h_context.pixel_cell
             } else {
                 padding_right.evaluate_as_pixels(h_context)
-            };
+            }
+            - tab_bar_insets.width();
         let vertical_gap = self.dimensions.pixel_height as f32
             - self.terminal_size.pixel_height as f32
             - padding_top
             - padding_bottom
-            - if self.show_tab_bar {
-                self.tab_bar_pixel_height().unwrap_or(0.)
-            } else {
-                0.
-            };
+            - tab_bar_insets.height();
         let left_gap = match self.config.window_content_alignment.horizontal {
             HorizontalWindowContentAlignment::Left => 0.,
             HorizontalWindowContentAlignment::Center => (horizontal_gap / 2.).round(),

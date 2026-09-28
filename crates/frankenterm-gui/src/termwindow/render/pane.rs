@@ -380,15 +380,14 @@ impl crate::TermWindow {
         let metrics = crate::utilsprites::RenderMetrics::with_font_metrics(&font.metrics());
         let (left, top) = self.padding_left_top();
         let border = self.get_os_border();
-        let tab_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height()?
-        } else {
-            0.0
-        };
+        let tab_bar_insets = self.tab_bar_insets()?;
+        let tab_height = tab_bar_insets.top;
         let width = pos.width as f32 * self.render_metrics.cell_size.width as f32;
         let height = pos.height as f32 * self.render_metrics.cell_size.height as f32;
         let bounds = euclid::rect(
-            left + border.left.get() as f32
+            tab_bar_insets.left
+                + left
+                + border.left.get() as f32
                 + pos.left as f32 * self.render_metrics.cell_size.width as f32,
             top + border.top.get() as f32
                 + tab_height
@@ -680,17 +679,11 @@ impl crate::TermWindow {
 
         let (padding_left, padding_top) = self.padding_left_top();
 
-        let tab_bar_height = if self.show_tab_bar {
-            self.tab_bar_pixel_height()
-                .context("tab_bar_pixel_height")?
-        } else {
-            0.
-        };
-        let (top_bar_height, bottom_bar_height) = if self.config.tab_bar_at_bottom {
-            (0.0, tab_bar_height)
-        } else {
-            (tab_bar_height, 0.0)
-        };
+        let tab_bar_insets = self.tab_bar_insets().context("tab_bar_insets")?;
+        let top_bar_height = tab_bar_insets.top;
+        let bottom_bar_height = tab_bar_insets.bottom;
+        // A left tab bar shifts the terminal area to the right.
+        let left_bar_width = tab_bar_insets.left;
 
         let border = self.get_os_border();
         let top_pixel_y = top_bar_height + padding_top + border.top.get() as f32;
@@ -748,12 +741,12 @@ impl crate::TermWindow {
             // We want to fill out to the edges of the splits
             let (x, width_delta) = if pos.left == 0 {
                 (
-                    0.,
+                    left_bar_width,
                     padding_left + border.left.get() as f32 + (cell_width / 2.0),
                 )
             } else {
                 (
-                    padding_left + border.left.get() as f32 - (cell_width / 2.0)
+                    left_bar_width + padding_left + border.left.get() as f32 - (cell_width / 2.0)
                         + (pos.left as f32 * cell_width),
                     cell_width,
                 )
@@ -773,9 +766,10 @@ impl crate::TermWindow {
             euclid::rect(
                 x,
                 y,
-                // Go all the way to the right edge if we're right-most
+                // Go all the way to the right edge (or a right tab bar)
+                // if we're right-most
                 if pos.left + pos.width >= self.terminal_size.cols as usize {
-                    self.dimensions.pixel_width as f32 - x
+                    self.dimensions.pixel_width as f32 - tab_bar_insets.right - x
                 } else {
                     (pos.width as f32 * cell_width) + width_delta
                 },
@@ -913,7 +907,8 @@ impl crate::TermWindow {
                 .dimensions
                 .pixel_width
                 .saturating_sub(padding as usize)
-                .saturating_sub(border.right.get());
+                .saturating_sub(border.right.get())
+                .saturating_sub(tab_bar_insets.right as usize);
 
             // Register the scroll bar location
             self.ui_items.push(UIItem {
@@ -1045,7 +1040,8 @@ impl crate::TermWindow {
                 native_password_input: Option<bool>,
             }
 
-            let left_pixel_x = padding_left
+            let left_pixel_x = left_bar_width
+                + padding_left
                 + border.left.get() as f32
                 + (pos.left as f32 * self.render_metrics.cell_size.width as f32);
 

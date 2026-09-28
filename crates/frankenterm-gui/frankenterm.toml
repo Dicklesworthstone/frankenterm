@@ -35,6 +35,12 @@ skip_close_confirmation_for_processes_named = []
 enable_tab_bar = true
 hide_tab_bar_if_only_one_tab = false
 tab_bar_at_bottom = false
+# Place the tab bar at "Top", "Bottom", "Left" or "Right".  Left and Right
+# draw the tabs as a column; its width is vertical_tab_width cells and each
+# tab is vertical_tab_cell_height rows tall.
+# tab_bar_position = "Left"
+# vertical_tab_width = 20
+# vertical_tab_cell_height = 1
 
 # --- Keys ---
 

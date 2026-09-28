@@ -253,7 +253,11 @@ impl crate::TermWindow {
                         },
                     }))
                     .colors({
-                        let inactive_tab = colors.inactive_tab();
+                        let inactive_tab = if item.has_bell {
+                            colors.inactive_tab_bell()
+                        } else {
+                            colors.inactive_tab()
+                        };
                         let bg = bg_color
                             .unwrap_or_else(|| inactive_tab.bg_color.into())
                             .to_linear();
@@ -273,7 +277,11 @@ impl crate::TermWindow {
                         }
                     })
                     .hover_colors({
-                        let inactive_tab_hover = colors.inactive_tab_hover();
+                        let inactive_tab_hover = if item.has_bell {
+                            colors.inactive_tab_bell_hover()
+                        } else {
+                            colors.inactive_tab_hover()
+                        };
                         Some(ElementColors {
                             border: BorderColor::new(
                                 bg_color
@@ -454,7 +462,7 @@ impl crate::TermWindow {
 
         computed.translate(euclid::vec2(
             0.,
-            if self.config.tab_bar_at_bottom {
+            if self.config.is_tab_bar_at_bottom() {
                 self.dimensions.pixel_height as f32
                     - (computed.bounds.height() + border.bottom.get() as f32)
             } else {
