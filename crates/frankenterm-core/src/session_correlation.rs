@@ -656,11 +656,11 @@ fn cass_agent_for_session(agent_type: &str) -> Option<CassAgent> {
 /// `budget` sessions per pass, and each session at most every
 /// [`CASS_ENRICHMENT_RETRY_MS`] (`attempted_at` is the caller's per-process
 /// memory). A missing cass binary only counts as failures.
-pub async fn enrich_active_agent_sessions_with_cx(
+pub async fn enrich_active_agent_sessions_with_cx<S: std::hash::BuildHasher>(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
     cass: &CassClient,
-    attempted_at: &mut std::collections::HashMap<i64, i64>,
+    attempted_at: &mut std::collections::HashMap<i64, i64, S>,
     now_ms: i64,
     budget: usize,
 ) -> Result<CassEnrichmentOutcome, crate::Error> {

@@ -6991,7 +6991,7 @@ impl ObservationRuntime {
                         Ok(_) => {}
                         Err(error) if is_runtime_cancellation(&error) => break,
                         Err(error) => {
-                            debug!(error = %error, "agent session cass enrichment skipped")
+                            debug!(error = %error, "agent session cass enrichment skipped");
                         }
                     }
                     let pane_output = metrics
