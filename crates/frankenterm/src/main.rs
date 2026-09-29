@@ -5960,6 +5960,10 @@ enum RobotProfileCommands {
         /// Preview only
         #[arg(long)]
         dry_run: bool,
+
+        /// Spawn even when the running watcher's admission verdict is `shed`
+        #[arg(long)]
+        force_admission: bool,
     },
     /// Validate a profile definition
     Validate {
@@ -9160,6 +9164,7 @@ const ROBOT_ERR_STORAGE_EFFECT_INDETERMINATE: &str = "robot.storage_effect_indet
 const ROBOT_ERR_CURSOR_DISCONTINUITY: &str = "robot.cursor_discontinuity";
 const ROBOT_ERR_FEATURE_NOT_AVAILABLE: &str = "robot.feature_not_available";
 const ROBOT_ERR_POLICY_DENIED: &str = "robot.policy_denied";
+const ROBOT_ERR_ADMISSION_SHED: &str = "robot.admission_shed";
 const ROBOT_ERR_TIMEOUT: &str = "robot.timeout";
 const ROBOT_ERR_WORKFLOW_ABORTED: &str = "robot.workflow_aborted";
 const ROBOT_ERR_WORKFLOW_ERROR: &str = "robot.workflow_error";
@@ -40551,6 +40556,68 @@ async fn load_runtime_health_snapshot(
     frankenterm_core::crash::HealthSnapshot::get_global()
 }
 
+/// A watcher health snapshot older than three 30 s health ticks no longer
+/// describes current pressure.
+const SPAWN_ADMISSION_MAX_AGE_MS: u64 = 90_000;
+
+/// The running watcher's global admission verdict for a new agent spawn
+/// (ft-xldrk), as reported beside spawn results. `state` is the verdict action
+/// (`admit`, `defer`, `degrade`, `shed`) or `unavailable` when no watcher
+/// answered, it published no verdict, or its snapshot is stale.
+async fn watcher_spawn_admission(
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    now_ms: u64,
+) -> serde_json::Value {
+    spawn_admission_from_snapshot(load_runtime_health_snapshot(layout).await.as_ref(), now_ms)
+}
+
+fn spawn_admission_from_snapshot(
+    snapshot: Option<&frankenterm_core::crash::HealthSnapshot>,
+    now_ms: u64,
+) -> serde_json::Value {
+    let unavailable =
+        |reason: &str| serde_json::json!({ "state": "unavailable", "reason_codes": [reason] });
+    let Some(snapshot) = snapshot else {
+        return unavailable("admission.watcher_unavailable");
+    };
+    let age_ms = now_ms.saturating_sub(snapshot.timestamp);
+    if age_ms > SPAWN_ADMISSION_MAX_AGE_MS {
+        return unavailable("admission.snapshot_stale");
+    }
+    let Some(decision) = snapshot
+        .swarm_capacity
+        .as_ref()
+        .and_then(|summary| summary.resource_cockpit.as_ref())
+        .and_then(|cockpit| cockpit.resource_admission_decisions.first())
+    else {
+        return unavailable("admission.no_verdict");
+    };
+    serde_json::json!({
+        "state": decision.action,
+        "reason_codes": decision.reason_codes,
+        "snapshot_age_ms": age_ms,
+    })
+}
+
+/// A spawn is refused only on an explicit, fresh `shed` verdict, and never
+/// when the operator passed `--force-admission`.
+fn spawn_admission_refuses(admission: &serde_json::Value, force: bool) -> bool {
+    !force && admission["state"] == "shed"
+}
+
+fn admission_reason_list(admission: &serde_json::Value) -> String {
+    admission["reason_codes"]
+        .as_array()
+        .map(|codes| {
+            codes
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
+}
+
 fn attach_resize_dashboard_from_status_payload(
     payload: &mut serde_json::Value,
     status_payload: &serde_json::Value,
@@ -59705,6 +59772,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         name,
                                         count,
                                         dry_run,
+                                        ..
                                     } => (
                                         "apply",
                                         serde_json::json!({
@@ -59822,7 +59890,37 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 &command,
                                 RobotProfileCommands::Apply { dry_run: false, .. }
                             );
-                            let response = if live_apply {
+                            let force_admission = matches!(
+                                &command,
+                                RobotProfileCommands::Apply {
+                                    force_admission: true,
+                                    ..
+                                }
+                            );
+                            // ft-xldrk: consult the running watcher's global
+                            // admission verdict before spawning.
+                            let admission = if live_apply {
+                                watcher_spawn_admission(&layout, now_ms()).await
+                            } else {
+                                serde_json::Value::Null
+                            };
+                            let response = if live_apply
+                                && spawn_admission_refuses(&admission, force_admission)
+                            {
+                                RobotResponse::<serde_json::Value>::error_with_code(
+                                    ROBOT_ERR_ADMISSION_SHED,
+                                    format!(
+                                        "The watcher's admission verdict is shed ({}); no panes were spawned",
+                                        admission_reason_list(&admission)
+                                    ),
+                                    Some(
+                                        "Wait for the resource pressure to clear (ft doctor --json shows the verdict), \
+                                         or rerun with --force-admission."
+                                            .to_string(),
+                                    ),
+                                    elapsed_ms(start),
+                                )
+                            } else if live_apply {
                                 let mux =
                                     frankenterm_core::wezterm::wezterm_handle_from_config(&config);
                                 let mut executor = RobotProfileApplyMuxExecutor::new(mux);
@@ -59832,10 +59930,15 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     &mut executor,
                                     now_epoch_ms(),
                                 ) {
-                                    Ok(data) => RobotResponse::<serde_json::Value>::success(
-                                        data,
-                                        elapsed_ms(start),
-                                    ),
+                                    Ok(mut data) => {
+                                        if let Some(object) = data.as_object_mut() {
+                                            object.insert("admission".to_string(), admission);
+                                        }
+                                        RobotResponse::<serde_json::Value>::success(
+                                            data,
+                                            elapsed_ms(start),
+                                        )
+                                    }
                                     Err(err) => {
                                         let code = err.error_code();
                                         let hint = match &err {
@@ -140890,6 +140993,83 @@ A  docs/new-proof.md\n";
             engine["engine_id"] == "bocpd_change_points"
                 && engine["feed_state"] == "no_live_samples"
         }));
+    }
+
+    #[test]
+    fn spawn_admission_reads_the_fresh_watcher_verdict_and_refuses_only_shed() {
+        use frankenterm_core::swarm_scheduler::{
+            AdmissionControllerConfig, AdmissionRequest, QueuePressure, SwarmAdmissionController,
+            SwarmAdmissionTelemetry,
+        };
+        let decision = |utilization: f64| {
+            SwarmAdmissionController::new(AdmissionControllerConfig::default()).evaluate(
+                &AdmissionRequest::standard(2, 1),
+                &SwarmAdmissionTelemetry {
+                    queue_pressure: Some(QueuePressure {
+                        ready_ratio: 1.0,
+                        utilization,
+                        starvation_count: 0,
+                        failure_rate: 0.0,
+                        pending_items: 1,
+                        active_agents: 0,
+                        total_capacity: 10,
+                    }),
+                    fleet_pressure: Some(
+                        frankenterm_core::fleet_memory_controller::FleetPressureTier::Normal,
+                    ),
+                    memory_tier_budget: None,
+                    latency_stage_pressures: None,
+                    herd_wave_pressure: None,
+                },
+            )
+        };
+        let snapshot_with = |utilization: f64| {
+            test_health_snapshot_with_swarm_capacity(
+                frankenterm_core::runtime_telemetry::SwarmCapacityOperatorSummary::unavailable(
+                    1_700_000_050_000,
+                    3,
+                    "test.admission",
+                )
+                .with_resource_cockpit_inputs_and_resource_evidence(
+                    None,
+                    &[decision(utilization)],
+                    None,
+                    None,
+                    None,
+                ),
+            )
+        };
+        let now = 1_700_000_060_000;
+
+        let none = spawn_admission_from_snapshot(None, now);
+        assert_eq!(none["state"], "unavailable");
+        assert!(
+            !spawn_admission_refuses(&none, false),
+            "no watcher never blocks"
+        );
+
+        let shed_snapshot = snapshot_with(1.0);
+        let stale = spawn_admission_from_snapshot(Some(&shed_snapshot), now + 200_000);
+        assert_eq!(stale["state"], "unavailable");
+        assert_eq!(stale["reason_codes"][0], "admission.snapshot_stale");
+        assert!(
+            !spawn_admission_refuses(&stale, false),
+            "a stale shed never blocks"
+        );
+
+        let shed = spawn_admission_from_snapshot(Some(&shed_snapshot), now);
+        assert_eq!(shed["state"], "shed");
+        assert_eq!(shed["snapshot_age_ms"], 10_000);
+        assert!(spawn_admission_refuses(&shed, false));
+        assert!(
+            !spawn_admission_refuses(&shed, true),
+            "--force-admission overrides"
+        );
+        assert!(admission_reason_list(&shed).contains("queue_over_capacity"));
+
+        let calm = spawn_admission_from_snapshot(Some(&snapshot_with(0.1)), now);
+        assert_ne!(calm["state"], "shed");
+        assert!(!spawn_admission_refuses(&calm, false));
     }
 
     #[test]

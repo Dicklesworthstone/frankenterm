@@ -2296,7 +2296,11 @@ failure rate, the compound fleet tier, the mux warm-tier budget, and measured
 p95 stage latencies against their budgets. The verdict (admit, defer, degrade,
 or shed, with reason codes; missing evidence is reported, never guessed) is
 published in the resource cockpit's `resource_admission` domain in
-`ft doctor --json`. It is advisory: `ft` does not refuse spawns under pressure.
+`ft doctor --json`. `ft robot profile apply` consults it before spawning: a
+fresh `shed` verdict refuses the spawn (`robot.admission_shed`; override with
+`--force-admission`), and every other verdict, including `unavailable` when no
+watcher answers or its snapshot is older than 90 s, proceeds and is reported
+in the response's `admission` field.
 
 ### Asymmetric hysteresis
 
@@ -2587,7 +2591,7 @@ capacity guarantees.
 - **Elevated tier** — idle panes back off to a 4x longer poll ceiling.
 - **Critical tier** — idle panes are paused (16x poll ceiling; capture continues at that cadence), and the watcher evicts the targeted panes' warm scrollback on the mux (codec 67+).
 - **Emergency tier** — idle panes are paused; warm scrollback is evicted on every pane.
-  Spawn refusal is a recommendation only, not enforced.
+  `ft robot profile apply` refuses spawns only on a fresh `shed` admission verdict.
 
 ### What the loop **never** does
 
