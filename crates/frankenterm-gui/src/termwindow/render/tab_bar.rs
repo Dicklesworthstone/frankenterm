@@ -122,7 +122,8 @@ impl crate::TermWindow {
         ));
 
         let cols = self.config.vertical_tab_width.max(1);
-        for (row, line) in self.tab_bar.vertical_lines().iter().enumerate() {
+        let lines = self.tab_bar.vertical_lines();
+        for (row, line) in lines.iter().enumerate() {
             self.render_tab_bar_line(
                 layers,
                 &palette,
@@ -132,6 +133,38 @@ impl crate::TermWindow {
                 tab_bar_width,
                 cols,
             )?;
+        }
+
+        // The bar holds whole rows only, so the window height is rarely an
+        // exact multiple of the cell height. Paint the leftover strip under
+        // the last row in the bar's background, or a transparent window
+        // shows through it.
+        let rows_bottom = top_pixel_y + (lines.len() as f32 * cell_height);
+        let bar_bottom = self.dimensions.pixel_height as f32 - border.bottom.get() as f32;
+        if bar_bottom > rows_bottom {
+            let colors = self
+                .config
+                .resolved_palette
+                .tab_bar
+                .clone()
+                .unwrap_or_default();
+            let background = palette
+                .resolve_bg(ColorAttribute::TrueColorWithDefaultFallback(
+                    *colors.background(),
+                ))
+                .to_linear();
+            self.filled_rectangle(
+                layers,
+                0,
+                euclid::rect(
+                    left_pixel_x,
+                    rows_bottom,
+                    tab_bar_width,
+                    bar_bottom - rows_bottom,
+                ),
+                background,
+            )
+            .context("fill vertical tab bar below the last row")?;
         }
         Ok(())
     }
