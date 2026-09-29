@@ -49,6 +49,7 @@ use unicode_normalization::UnicodeNormalization;
 use wezterm_bidi::Direction;
 use wezterm_gui_subcommands::*;
 
+mod cli;
 mod colorease;
 mod commands;
 mod customglyph;
@@ -395,6 +396,9 @@ enum SubCommand {
 
     #[command(name = "show-keys", about = "Show key assignments")]
     ShowKeys(ShowKeysCommand),
+
+    #[command(name = "cli", about = "Control a running mux server (spawn, list)")]
+    Cli(cli::CliCommand),
 }
 
 async fn async_run_ssh(opts: SshCommand) -> anyhow::Result<()> {
@@ -5722,5 +5726,6 @@ fn run() -> anyhow::Result<()> {
             check_cli_config_health()?;
             run_show_keys(config, &cmd)
         }
+        SubCommand::Cli(cmd) => cli::run_cli(cmd),
     }
 }

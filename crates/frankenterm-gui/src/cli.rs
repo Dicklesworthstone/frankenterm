@@ -1,0 +1,261 @@
+//! `frankenterm-gui cli`: talk to a running mux over its unix socket.
+//!
+//! This is a small subset of upstream `wezterm cli` (spawn and list). It needs
+//! no display, so an agent running inside a pane can open a tab in the window
+//! it lives in.
+
+use anyhow::{Context, anyhow};
+use clap::{Parser, ValueHint};
+use codec::{ListPanesResponse, SpawnV2};
+use config::keyassignment::SpawnTabDomain;
+use frankenterm_client::client::Client;
+use mux::tab::PaneEntry;
+use mux::window::WindowId;
+use portable_pty::cmdbuilder::CommandBuilder;
+use promise::spawn::block_on;
+use std::ffi::OsString;
+use std::path::PathBuf;
+
+#[derive(Debug, Parser, Clone)]
+pub struct CliCommand {
+    #[command(subcommand)]
+    sub: CliSubCommand,
+}
+
+#[derive(Debug, Parser, Clone)]
+enum CliSubCommand {
+    /// Spawn a command into a new tab or window and print the new pane id.
+    #[command(name = "spawn")]
+    Spawn(SpawnArgs),
+
+    /// List windows, tabs and panes.
+    #[command(name = "list")]
+    List(ListArgs),
+}
+
+#[derive(Debug, Parser, Clone)]
+struct SpawnArgs {
+    /// The pane whose window gets the new tab. Defaults to $WEZTERM_PANE,
+    /// then to the focused pane of the most recently active client.
+    #[arg(long)]
+    pane_id: Option<mux::pane::PaneId>,
+
+    /// Put the new tab in this window instead.
+    #[arg(long, conflicts_with = "new_window")]
+    window_id: Option<WindowId>,
+
+    /// Open a new window instead of a tab.
+    #[arg(long)]
+    new_window: bool,
+
+    /// Working directory for the spawned program.
+    #[arg(long, value_parser, value_hint = ValueHint::DirPath)]
+    cwd: Option<OsString>,
+
+    /// Spawn into this domain instead of the default domain.
+    #[arg(long)]
+    domain_name: Option<String>,
+
+    /// Workspace for a new window. Defaults to the source pane's workspace.
+    #[arg(long)]
+    workspace: Option<String>,
+
+    /// The program to run, with its arguments. Defaults to the domain's
+    /// default program.
+    #[arg(value_parser, value_hint = ValueHint::CommandWithArguments, num_args = 1.., last = true)]
+    prog: Vec<OsString>,
+}
+
+#[derive(Debug, Parser, Clone)]
+struct ListArgs {
+    /// Print JSON instead of a table.
+    #[arg(long)]
+    json: bool,
+}
+
+pub fn run_cli(cmd: CliCommand) -> anyhow::Result<()> {
+    let client = connect()?;
+    let executor = promise::spawn::ScopedExecutor::new();
+    block_on(executor.run(async move {
+        let ui = mux::connui::ConnectionUI::new_headless();
+        client
+            .verify_version_compat(&ui)
+            .await
+            .context("negotiate protocol with the mux server")?;
+        let result = match cmd.sub {
+            CliSubCommand::Spawn(args) => run_spawn(&client, args).await,
+            CliSubCommand::List(args) => run_list(&client, args).await,
+        };
+        // Dropping the client makes its reconnect thread log a spurious
+        // "won't try to reconnect" error, so leave before that happens.
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        match result {
+            Ok(()) => std::process::exit(0),
+            Err(err) => {
+                eprintln!("frankenterm-gui cli: {err:#}");
+                std::process::exit(1)
+            }
+        }
+    }))
+}
+
+fn connect() -> anyhow::Result<Client> {
+    let mut ui = mux::connui::ConnectionUI::new_headless();
+    let explicit = std::env::var_os("FRANKENTERM_UNIX_SOCKET")
+        .or_else(|| std::env::var_os("WEZTERM_UNIX_SOCKET"))
+        .filter(|p| !p.is_empty());
+    let client = match explicit {
+        Some(path) => {
+            let dom = config::UnixDomain {
+                socket_path: Some(path.into()),
+                no_serve_automatically: true,
+                ..Default::default()
+            };
+            Client::new_unix_domain(None, &dom, false, &mut ui, true, std::sync::Weak::new())
+        }
+        None => Client::new_default_unix_domain(
+            false,
+            &mut ui,
+            true,
+            true,
+            &crate::termwindow::get_window_class(),
+        ),
+    };
+    client.context("connect to the FrankenTerm mux socket")
+}
+
+fn pane_entries(panes: ListPanesResponse) -> Vec<PaneEntry> {
+    let mut out = vec![];
+    for tabroot in panes.tabs {
+        let mut cursor = tabroot.into_tree().cursor();
+        loop {
+            if let Some(entry) = cursor.leaf_mut() {
+                out.push(entry.clone());
+            }
+            match cursor.preorder_next() {
+                Ok(c) => cursor = c,
+                Err(_) => break,
+            }
+        }
+    }
+    out
+}
+
+async fn run_spawn(client: &Client, args: SpawnArgs) -> anyhow::Result<()> {
+    let config = config::configuration();
+    let entries = pane_entries(client.list_panes().await?);
+
+    // A stale $WEZTERM_PANE (for example from a different terminal) must not
+    // block the spawn, so an unknown pane falls back to the newest window.
+    let source = match client.resolve_pane_id(args.pane_id).await {
+        Ok(pane_id) => entries.iter().find(|e| e.pane_id == pane_id),
+        Err(_) => None,
+    };
+    let newest = entries.iter().max_by_key(|e| e.window_id);
+
+    let window_id = if args.new_window {
+        None
+    } else if let Some(id) = args.window_id {
+        if !entries.iter().any(|e| e.window_id == id) {
+            anyhow::bail!("window {id} does not exist");
+        }
+        Some(id)
+    } else {
+        source.or(newest).map(|e| e.window_id)
+    };
+
+    let workspace = args
+        .workspace
+        .or_else(|| source.or(newest).map(|e| e.workspace.clone()))
+        .or_else(|| config.default_workspace.clone())
+        .unwrap_or_else(|| mux::DEFAULT_WORKSPACE.to_string());
+
+    let command_dir = match args.cwd {
+        Some(cwd) => {
+            let path = PathBuf::from(cwd);
+            let path = if path.is_relative() {
+                std::env::current_dir()
+                    .context("resolve current directory")?
+                    .join(path)
+            } else {
+                path
+            };
+            Some(
+                path.to_str()
+                    .ok_or_else(|| anyhow!("--cwd {} is not valid UTF-8", path.display()))?
+                    .to_string(),
+            )
+        }
+        None => None,
+    };
+
+    let command = if args.prog.is_empty() {
+        None
+    } else {
+        Some(CommandBuilder::from_argv(args.prog))
+    };
+
+    let size = source
+        .or(newest)
+        .filter(|e| Some(e.window_id) == window_id)
+        .map(|e| e.size)
+        .unwrap_or_else(|| config.initial_size(0, None));
+
+    let spawned = client
+        .spawn_v2(SpawnV2 {
+            domain: args
+                .domain_name
+                .map_or(SpawnTabDomain::DefaultDomain, SpawnTabDomain::DomainName),
+            window_id,
+            command,
+            command_dir,
+            size,
+            workspace,
+        })
+        .await?;
+    println!("{}", spawned.pane_id);
+    Ok(())
+}
+
+async fn run_list(client: &Client, args: ListArgs) -> anyhow::Result<()> {
+    let entries = pane_entries(client.list_panes().await?);
+    if args.json {
+        let rows: Vec<_> = entries
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "window_id": e.window_id,
+                    "tab_id": e.tab_id,
+                    "pane_id": e.pane_id,
+                    "workspace": e.workspace,
+                    "size": { "rows": e.size.rows, "cols": e.size.cols },
+                    "title": e.title,
+                    "cwd": e.working_dir.as_ref().map(|u| u.as_str().to_string()),
+                    "is_active": e.is_active_pane,
+                    "tty_name": e.tty_name,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    println!("WINID\tTABID\tPANEID\tWORKSPACE\tSIZE\tTITLE\tCWD");
+    for e in &entries {
+        println!(
+            "{}\t{}\t{}\t{}\t{}x{}\t{}\t{}",
+            e.window_id,
+            e.tab_id,
+            e.pane_id,
+            e.workspace,
+            e.size.cols,
+            e.size.rows,
+            e.title,
+            e.working_dir
+                .as_ref()
+                .map(|u| u.as_str().to_string())
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
