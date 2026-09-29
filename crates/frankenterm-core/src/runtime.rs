@@ -12118,10 +12118,14 @@ const LIVE_ADMISSION_MIN_STAGE_SAMPLES: u64 = 5;
 /// - fleet: the fleet coordinator's compound tier;
 /// - memory tier: the mux warm-tier budget, when the mux reports tiering;
 /// - latency: measured p95 service time of each capacity stage with enough
-///   samples, against that stage's default p95 budget.
+///   samples, against that stage's default p95 budget. A stage that has run
+///   fewer than the minimum operations carries no load, so it counts as zero
+///   latency pressure; otherwise an idle watcher would defer forever
+///   (ft-xldrk, release-build calibration).
 ///
-/// An input without evidence stays `None`, so the controller reports it as
-/// missing telemetry instead of admitting on a guess.
+/// An input without evidence (a disabled capacity collector) stays `None`, so
+/// the controller reports it as missing telemetry instead of admitting on a
+/// guess.
 fn live_swarm_admission_telemetry(
     queue: &QueueDepths,
     fleet_tier: crate::fleet_memory_controller::FleetPressureTier,
@@ -12188,10 +12192,12 @@ fn live_swarm_admission_telemetry(
                 SwarmCapacityStage::WorkflowRunner => LatencyStage::WorkflowDispatch,
                 _ => return None,
             };
-            if stage.service_time_ms.count < LIVE_ADMISSION_MIN_STAGE_SAMPLES {
-                return None;
-            }
-            let observed_p95_us = stage.service_time_ms.p95? * 1_000.0;
+            let observed_p95_us = if stage.service_time_ms.count < LIVE_ADMISSION_MIN_STAGE_SAMPLES
+            {
+                0.0
+            } else {
+                stage.service_time_ms.p95? * 1_000.0
+            };
             Some(StagePressure::compute(
                 latency_stage,
                 observed_p95_us,
@@ -12199,13 +12205,16 @@ fn live_swarm_admission_telemetry(
             ))
         })
         .collect();
+    let latency_stage_pressures = capacity
+        .enabled
+        .then_some(latency_stage_pressures)
+        .filter(|pressures| !pressures.is_empty());
 
     crate::swarm_scheduler::SwarmAdmissionTelemetry {
         queue_pressure: Some(queue_pressure),
         fleet_pressure: Some(fleet_tier),
         memory_tier_budget: memory_budget,
-        latency_stage_pressures: (!latency_stage_pressures.is_empty())
-            .then_some(latency_stage_pressures),
+        latency_stage_pressures,
         herd_wave_pressure: None,
     }
 }
@@ -26587,7 +26596,8 @@ mod tests {
             write_capacity: 100,
         };
 
-        // No capacity samples: latency stays missing, never guessed.
+        // An enabled collector with no traffic: every mapped stage carries
+        // zero latency pressure, so an idle watcher is not deferred forever.
         let empty = SwarmCapacityTelemetry::with_defaults().snapshot();
         let telemetry =
             live_swarm_admission_telemetry(&queue, FleetPressureTier::Normal, None, &empty);
@@ -26597,8 +26607,35 @@ mod tests {
         assert_eq!(pressure.total_capacity, 200);
         assert_eq!(pressure.failure_rate.to_bits(), 0.0_f64.to_bits());
         assert_eq!(telemetry.fleet_pressure, Some(FleetPressureTier::Normal));
-        assert!(telemetry.latency_stage_pressures.is_none());
+        let idle_stages = telemetry.latency_stage_pressures.as_ref().unwrap();
+        assert_eq!(idle_stages.len(), 4);
+        assert!(idle_stages.iter().all(|stage| stage.headroom >= 1.0));
         let controller = SwarmAdmissionController::new(AdmissionControllerConfig::default());
+        let idle_queue = QueueDepths {
+            capture_depth: 0,
+            write_depth: 0,
+            ..queue
+        };
+        let idle =
+            live_swarm_admission_telemetry(&idle_queue, FleetPressureTier::Normal, None, &empty);
+        let decision = controller.evaluate(&AdmissionRequest::standard(2, 1), &idle);
+        assert!(
+            !decision
+                .reason_codes
+                .contains(&AdmissionReasonCode::MissingLatencyTelemetry),
+            "idle latency is known to be zero, not missing"
+        );
+
+        // A disabled collector has no evidence at all: missing, never guessed.
+        let disabled =
+            SwarmCapacityTelemetry::new(crate::runtime_telemetry::SwarmCapacityTelemetryConfig {
+                enabled: false,
+                ..Default::default()
+            })
+            .snapshot();
+        let telemetry =
+            live_swarm_admission_telemetry(&queue, FleetPressureTier::Normal, None, &disabled);
+        assert!(telemetry.latency_stage_pressures.is_none());
         let decision = controller.evaluate(&AdmissionRequest::standard(2, 1), &telemetry);
         assert_ne!(decision.action, AdmissionAction::Admit);
         assert!(
@@ -26631,11 +26668,21 @@ mod tests {
             &capacity.snapshot(),
         );
         let stages = telemetry.latency_stage_pressures.unwrap();
-        assert_eq!(stages.len(), 1);
-        assert_eq!(stages[0].stage, LatencyStage::StorageWrite);
-        assert!((stages[0].observed_p95_us - 20_000.0).abs() < 1.0);
-        assert!((stages[0].budget_p95_us - 5_000.0).abs() < f64::EPSILON);
-        assert!(stages[0].headroom < 0.0, "over budget");
+        assert_eq!(stages.len(), 4);
+        let storage = stages
+            .iter()
+            .find(|stage| stage.stage == LatencyStage::StorageWrite)
+            .unwrap();
+        assert!((storage.observed_p95_us - 20_000.0).abs() < 1.0);
+        assert!((storage.budget_p95_us - 5_000.0).abs() < f64::EPSILON);
+        assert!(storage.headroom < 0.0, "over budget");
+        assert!(
+            stages
+                .iter()
+                .filter(|stage| stage.stage != LatencyStage::StorageWrite)
+                .all(|stage| stage.headroom >= 1.0),
+            "unsampled stages carry no pressure"
+        );
         let failure_rate = telemetry.queue_pressure.unwrap().failure_rate;
         assert!(
             (failure_rate - 0.1).abs() < 1e-9,
