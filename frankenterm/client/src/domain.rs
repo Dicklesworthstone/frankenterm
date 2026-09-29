@@ -290,7 +290,7 @@ impl RemoteLayoutTab {
             ensure!(
                 pane.domain_id() == inner.local_domain_id
                     && client_pane.belongs_to_client(inner)
-                    && client_pane.remote_tab_id == self.remote_tab_id,
+                    && client_pane.remote_tab_id() == self.remote_tab_id,
                 "remote layout tab contains a pane from another attachment"
             );
             ensure!(
@@ -939,11 +939,11 @@ fn ensure_pane_arena_append_order_is_sound(
                  removal is required"
             );
         };
-        if client_pane.remote_tab_id != desired_remote_tab_id {
+        if client_pane.remote_tab_id() != desired_remote_tab_id {
             bail!(
                 "ordered pane arena moves remote pane {remote_pane_id} from tab {} to tab \
                  {desired_remote_tab_id}; atomic pane migration is required",
-                client_pane.remote_tab_id
+                client_pane.remote_tab_id()
             );
         }
     }
@@ -972,7 +972,7 @@ fn ensure_pane_arena_append_order_is_sound(
                      containing a non-client pane"
                 );
             };
-            if !client_pane.belongs_to_client(inner) || client_pane.remote_tab_id != remote_tab_id {
+            if !client_pane.belongs_to_client(inner) || client_pane.remote_tab_id() != remote_tab_id {
                 bail!(
                     "ordered pane arena mapping {remote_tab_id}->{local_tab_id} does not belong \
                      exactly to this client and remote tab"
@@ -1106,7 +1106,7 @@ fn resolve_pane_arena_entry(
                     .is_some_and(|client_pane| {
                         client_pane.belongs_to_client(inner)
                             && client_pane.remote_pane_id() == entry.pane_id
-                            && client_pane.remote_tab_id == entry.tab_id
+                            && client_pane.remote_tab_id() == entry.tab_id
                     }) =>
             {
                 pending
@@ -1364,7 +1364,7 @@ impl ClientInner {
                     let client_pane = pane.downcast_ref::<ClientPane>()?;
                     client_pane
                         .belongs_to_client(self)
-                        .then_some(client_pane.remote_tab_id)
+                        .then_some(client_pane.remote_tab_id())
                 })
             })
             .collect();
@@ -2325,6 +2325,44 @@ fn workspace_for_spawn_window(mux: &Mux, window_id: WindowId) -> String {
     mux.get_window(window_id)
         .map(|window| window.get_workspace().to_string())
         .unwrap_or_else(|| mux.active_workspace())
+}
+
+/// Move one live pane of this client out of the local tab that mirrors its old
+/// remote tab, and record its new remote tab. The pane stays registered, so
+/// the snapshot's tree walk reuses it in the new tab's mirror. An old tab that
+/// is left empty is dropped locally; the server has already retired it.
+fn migrate_client_pane_to_remote_tab(
+    mux: &Mux,
+    inner: &ClientInner,
+    pane: &Arc<dyn Pane>,
+    new_remote_tab_id: TabId,
+) {
+    let Some(client_pane) = pane.downcast_ref::<ClientPane>() else {
+        return;
+    };
+    let old_remote_tab_id = client_pane.remote_tab_id();
+    log::debug!(
+        "domain {}: remote pane {} moved from tab {} to tab {}",
+        inner.local_domain_id,
+        client_pane.remote_pane_id(),
+        old_remote_tab_id,
+        new_remote_tab_id
+    );
+    let old_tab = inner
+        .remote_to_local_tab_id(old_remote_tab_id)
+        .and_then(|local_tab_id| mux.get_tab(local_tab_id))
+        .filter(|tab| {
+            tab.iter_all_panes()
+                .iter()
+                .any(|candidate| Arc::ptr_eq(candidate, pane))
+        });
+    if let Some(old_tab) = old_tab {
+        old_tab.remove_pane(pane.pane_id());
+        if old_tab.iter_all_panes().is_empty() {
+            mux.remove_empty_tab_local_only_if_same(&old_tab);
+        }
+    }
+    client_pane.set_remote_tab_id(new_remote_tab_id);
 }
 
 fn client_inner_is_current(
@@ -4000,7 +4038,7 @@ impl ClientDomain {
                         pane.downcast_ref::<ClientPane>()
                             .is_some_and(|client_pane| {
                                 client_pane.belongs_to_client(&inner)
-                                    && client_pane.remote_tab_id == *remote_tab_id
+                                    && client_pane.remote_tab_id() == *remote_tab_id
                             })
                     }),
                 "remote tab {} mapping targets local tab {} outside this exact client attachment",
@@ -4016,6 +4054,7 @@ impl ClientDomain {
         // mux repeatedly and make a first large-session sync quadratic.
         let live_panes = mux.iter_panes();
         let mut local_pane_ids_by_remote = HashMap::with_capacity(live_panes.len());
+        let mut migrating_panes = Vec::new();
         for pane in live_panes {
             if pane.domain_id() != inner.local_domain_id {
                 continue;
@@ -4027,12 +4066,8 @@ impl ClientDomain {
                 let remote_pane_id = client_pane.remote_pane_id();
                 if let Some(expected_remote_tab_id) = remote_pane_tabs.get(&remote_pane_id).copied()
                 {
-                    if client_pane.remote_tab_id != expected_remote_tab_id {
-                        bail!(
-                            "remote pane {remote_pane_id} moved from tab {} to tab \
-                             {expected_remote_tab_id}; atomic pane migration is required",
-                            client_pane.remote_tab_id
-                        );
+                    if client_pane.remote_tab_id() != expected_remote_tab_id {
+                        migrating_panes.push((Arc::clone(&pane), expected_remote_tab_id));
                     }
                 }
                 let local_pane_id = pane.pane_id();
@@ -4042,6 +4077,13 @@ impl ClientDomain {
                     local_pane_id,
                 )?;
             }
+        }
+        // The server moved these panes into another tab (MovePaneToNewTab).
+        // Keep each pane and its local identity: take it out of the local tab
+        // that mirrors its old remote tab, without killing it, and let the
+        // tree walk below install the same pane in the new tab's mirror.
+        #[allow(unreachable_code)] for (pane, new_remote_tab_id) in migrating_panes {
+            migrate_client_pane_to_remote_tab(mux, &inner, &pane, new_remote_tab_id);
         }
         {
             let mut pane_map = lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane");
@@ -4430,7 +4472,7 @@ impl ClientDomain {
                             .is_some_and(|client_pane| {
                                 client_pane.belongs_to_client(&inner)
                                     && client_pane.remote_pane_id() == entry.pane_id
-                                    && client_pane.remote_tab_id == entry.tab_id
+                                    && client_pane.remote_tab_id() == entry.tab_id
                             }) =>
                     {
                         pending_float_sync.push((Arc::clone(&pane), entry.alt_screen_active));
@@ -7111,6 +7153,124 @@ mod tests {
         assert_eq!(inner.remote_window_for_spawn(&mux, *empty), None);
         inner.record_remote_to_local_window_mapping(41, *empty);
         assert_eq!(inner.remote_window_for_spawn(&mux, *empty), Some(41));
+    }
+
+    fn listing_with_panes(placements: &[(WindowId, TabId, PaneId)]) -> ListPanesResponse {
+        let mut listing = sample_remote_tab_listing();
+        let PaneNode::Leaf(template) = listing.tabs[0].clone() else {
+            panic!("sample remote tab must contain one pane leaf");
+        };
+        listing.tabs.clear();
+        listing.tab_titles.clear();
+        listing.window_titles.clear();
+        for &(window_id, tab_id, pane_id) in placements {
+            let mut entry = template.clone();
+            entry.window_id = window_id;
+            entry.tab_id = tab_id;
+            entry.pane_id = pane_id;
+            listing.tabs.push(PaneNode::Leaf(entry));
+            listing.tab_titles.push(format!("tab {tab_id}"));
+            listing
+                .window_titles
+                .insert(window_id, format!("window {window_id}"));
+        }
+        listing
+    }
+
+    #[test]
+    fn snapshot_migrates_a_pane_the_server_moved_into_another_window() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_033);
+        let _domain = register_test_client_domain(&mux, &inner);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            listing_with_panes(&[(41, 51, 61), (42, 52, 62)]),
+            None,
+        )
+        .expect("two windows should attach");
+        let moved_pane_id = inner
+            .remote_to_local_pane_id(&mux, 61)
+            .expect("pane 61 should map locally");
+        let moved_pane = mux.get_pane(moved_pane_id).expect("pane 61 is registered");
+        let source_window_id = inner.remote_to_local_window(41).expect("window 41 maps");
+        let target_window_id = inner.remote_to_local_window(42).expect("window 42 maps");
+        let source_tab_id = inner.remote_to_local_tab_id(51).expect("tab 51 maps");
+
+        // MovePaneToNewTab put pane 61 into a new tab 53 in window 42, and
+        // tab 51 and window 41 closed on the server.
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            listing_with_panes(&[(42, 52, 62), (42, 53, 61)]),
+            None,
+        )
+        .expect("a server-side pane move must apply, not reject the attachment");
+
+        let after = mux
+            .get_pane(moved_pane_id)
+            .expect("the moved pane keeps its local identity");
+        assert!(Arc::ptr_eq(&after, &moved_pane));
+        assert_eq!(
+            after
+                .downcast_ref::<ClientPane>()
+                .expect("client pane")
+                .remote_tab_id(),
+            53
+        );
+        let new_tab_id = inner.remote_to_local_tab_id(53).expect("tab 53 maps");
+        let new_tab = mux.get_tab(new_tab_id).expect("tab 53 mirror exists");
+        assert!(new_tab
+            .iter_all_panes()
+            .iter()
+            .any(|pane| Arc::ptr_eq(pane, &moved_pane)));
+        assert_eq!(mux.window_containing_tab(new_tab_id), Some(target_window_id));
+        assert!(mux.get_tab(source_tab_id).is_none());
+        assert!(mux.get_window(source_window_id).is_none());
+        assert_eq!(mux.iter_panes().len(), 2);
+    }
+
+    #[test]
+    fn snapshot_migrates_a_pane_the_server_moved_into_a_new_window() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_034);
+        let _domain = register_test_client_domain(&mux, &inner);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            listing_with_panes(&[(41, 51, 61), (41, 52, 62)]),
+            None,
+        )
+        .expect("one window with two tabs should attach");
+        let moved_pane_id = inner.remote_to_local_pane_id(&mux, 61).expect("pane 61");
+        let moved_pane = mux.get_pane(moved_pane_id).expect("pane 61 is registered");
+        let source_window_id = inner.remote_to_local_window(41).expect("window 41 maps");
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            listing_with_panes(&[(41, 52, 62), (43, 53, 61)]),
+            None,
+        )
+        .expect("a move into a new window must apply");
+
+        let after = mux.get_pane(moved_pane_id).expect("same local pane");
+        assert!(Arc::ptr_eq(&after, &moved_pane));
+        let new_tab_id = inner.remote_to_local_tab_id(53).expect("tab 53 maps");
+        let new_window_id = inner.remote_to_local_window(43).expect("window 43 maps");
+        assert_ne!(new_window_id, source_window_id);
+        assert_eq!(mux.window_containing_tab(new_tab_id), Some(new_window_id));
+        let remaining_tab_id = inner.remote_to_local_tab_id(52).expect("tab 52 maps");
+        assert_eq!(
+            mux.window_containing_tab(remaining_tab_id),
+            Some(source_window_id)
+        );
     }
 
     #[test]
