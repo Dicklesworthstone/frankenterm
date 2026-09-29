@@ -64,6 +64,7 @@ const LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE: usize = 16 * 1024 * 1024;
 const EXACT_SCROLLBACK_ZSTD_MAGIC: &[u8; 8] = b"FTSLZ1\0\0";
 const EXACT_SCROLLBACK_ZSTD_HEADER_BYTES: usize = 12;
 const EXACT_SCROLLBACK_ZSTD_WINDOW_LOG: u32 = 17;
+const EXACT_SCROLLBACK_COMPACT_MIN_CELLS: usize = 3;
 const LIVE_SCROLLBACK_MANIFEST_SCHEMA_V1: &str = "frankenterm.live-scrollback-manifest.v1";
 const LIVE_SCROLLBACK_MANIFEST_SCHEMA_V2: &str = "frankenterm.live-scrollback-manifest.v2";
 const LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3: &str = "frankenterm.live-scrollback-manifest.v3";
@@ -7107,7 +7108,12 @@ fn serialize_exact_semantic_scrollback_line(
     // Inspect borrowed cells before materializing compressed scrollback. For
     // printable single-column rows there are no hidden wide-cell spacers, so
     // the existing compact representation already carries every cell exactly.
-    if line.len() >= 32 && line.len() <= LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE {
+    // It is smaller from about three cells up (a 7-cell row seals to 198
+    // instead of 231 bytes, a 31-cell row to 262 instead of 455), and short
+    // rows are most of a flood; the decoder never required a minimum length.
+    if line.len() >= EXACT_SCROLLBACK_COMPACT_MIN_CELLS
+        && line.len() <= LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE
+    {
         let mut count = 0usize;
         let mut runs = 0usize;
         let mut previous = None::<termwiz::surface::line::CellRef<'_>>;
@@ -7126,7 +7132,8 @@ fn serialize_exact_semantic_scrollback_line(
                 runs += 1;
             }
             previous = Some(cell);
-            runs <= line.len() / 8
+            // One attribute run is always compact, however short the row.
+            runs <= (line.len() / 8).max(1)
         }) && count == line.len();
         if compact {
             let mut cell_widths = Vec::new();
@@ -11190,6 +11197,77 @@ mod tests {
     }
 
     #[test]
+    fn short_printable_rows_use_the_smaller_compact_schema_and_reopen_exactly() {
+        use mux::guardian_output_journal::GuardianScrollbackRowIdentity;
+        let (_dir, backing, _deferred) = deferred_test_sink();
+        let state = *backing.lock_state("short size identity").unwrap();
+        let cipher = backing
+            .lock_keyring("short size cipher")
+            .unwrap()
+            .latest_active_cipher()
+            .unwrap();
+        let identity = GuardianScrollbackRowIdentity::new(
+            backing.durable_pane_id,
+            state.content_epoch,
+            1,
+            0,
+            0,
+        )
+        .unwrap();
+        let sealed_bytes = |plaintext: Zeroizing<Vec<u8>>| {
+            let payload = compress_exact_scrollback_plaintext(&plaintext).unwrap_or(plaintext);
+            cipher
+                .seal_scrollback_row(identity, &payload)
+                .unwrap()
+                .encode()
+                .unwrap()
+                .len()
+        };
+        let mut bold = CellAttributes::blank();
+        bold.set_intensity(termwiz::cell::Intensity::Bold);
+        let rows = [
+            (String::new(), CellAttributes::blank(), 1),
+            ("7".to_string(), CellAttributes::blank(), 1),
+            ("42".to_string(), CellAttributes::blank(), 1),
+            ("ok!".to_string(), CellAttributes::blank(), 2),
+            ("1999999".to_string(), CellAttributes::blank(), 2),
+            ("total 48".to_string(), bold, 2),
+            ("x".repeat(31), CellAttributes::blank(), 2),
+        ];
+        for (row, (text, attrs, schema)) in rows.into_iter().enumerate() {
+            let mut line = Line::from_text(&text, &attrs, 42, None);
+            let widths = line
+                .cells_mut()
+                .iter()
+                .map(|cell| cell.width() as u8)
+                .collect();
+            let vector = serialize_semantic_scrollback_payload(&ExactSemanticScrollbackLineV1 {
+                schema: 1,
+                line: line.clone(),
+                cell_widths: widths,
+            })
+            .unwrap();
+            let chosen = serialize_exact_semantic_scrollback_line(&line).unwrap();
+            let semantic: ExactSemanticScrollbackLineV1 =
+                codec::bounded_varbincode_deserialize(&mut chosen.as_slice()).unwrap();
+            assert_eq!(semantic.schema, schema, "schema for {text:?}");
+            if schema == 2 {
+                assert!(
+                    sealed_bytes(chosen) < sealed_bytes(vector),
+                    "compact must seal smaller for {text:?}"
+                );
+            }
+            assert!(backing.store_scrollback_line(row as isize, &line, 16));
+            let restored = backing.load_scrollback_line(row as isize).unwrap();
+            assert_eq!(
+                varbincode::serialize(&restored).unwrap(),
+                varbincode::serialize(&line).unwrap(),
+                "encrypted short-row parity for {text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn compact_scrollback_borrowed_cells_match_materialized_encoding() {
         let mut attrs = CellAttributes::blank();
         attrs.set_italic(true);
@@ -11608,10 +11686,17 @@ mod tests {
             .iter()
             .map(|record| u64::try_from(record.len()).unwrap() + 1)
             .sum();
-        let decoded_budget = serialize_exact_semantic_scrollback_line(&line)
-            .unwrap()
-            .len()
-            * 2;
+        // Charge each row exactly as the decoder does: a compact row also
+        // pays for the cells it expands into.
+        let plaintext = serialize_exact_semantic_scrollback_line(&line).unwrap();
+        let semantic: ExactSemanticScrollbackLineV1 =
+            codec::bounded_varbincode_deserialize(&mut plaintext.as_slice()).unwrap();
+        let row_charge = if semantic.schema == 2 {
+            compact_scrollback_decoded_charge(&semantic, plaintext.len()).unwrap()
+        } else {
+            plaintext.len()
+        };
+        let decoded_budget = row_charge * 2;
         assert_eq!(
             backing
                 .load_scrollback_lines_with_limits(0..4, stored_budget, usize::MAX)
