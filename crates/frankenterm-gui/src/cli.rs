@@ -1,12 +1,13 @@
 //! `frankenterm-gui cli`: talk to a running mux over its unix socket.
 //!
-//! This is a small subset of upstream `wezterm cli` (spawn and list). It needs
+//! This is a small subset of upstream `wezterm cli` (spawn, list and
+//! move-pane-to-new-tab). It needs
 //! no display, so an agent running inside a pane can open a tab in the window
 //! it lives in.
 
 use anyhow::{Context, anyhow};
 use clap::{Parser, ValueHint};
-use codec::{ListPanesResponse, SpawnV2};
+use codec::{ListPanesResponse, MovePaneToNewTab, SpawnV2};
 use config::keyassignment::SpawnTabDomain;
 use frankenterm_client::client::Client;
 use mux::tab::PaneEntry;
@@ -31,6 +32,10 @@ enum CliSubCommand {
     /// List windows, tabs and panes.
     #[command(name = "list")]
     List(ListArgs),
+
+    /// Move a pane into a new tab, in an existing window or a new one.
+    #[command(name = "move-pane-to-new-tab")]
+    MovePaneToNewTab(MovePaneToNewTabArgs),
 }
 
 #[derive(Debug, Parser, Clone)]
@@ -67,6 +72,25 @@ struct SpawnArgs {
 }
 
 #[derive(Debug, Parser, Clone)]
+struct MovePaneToNewTabArgs {
+    /// The pane to move. Defaults to $WEZTERM_PANE.
+    #[arg(long)]
+    pane_id: Option<mux::pane::PaneId>,
+
+    /// Put the new tab in this window. Defaults to the pane's own window.
+    #[arg(long, conflicts_with = "new_window")]
+    window_id: Option<WindowId>,
+
+    /// Put the new tab in a new window.
+    #[arg(long)]
+    new_window: bool,
+
+    /// Workspace for a new window. Defaults to the pane's workspace.
+    #[arg(long)]
+    workspace: Option<String>,
+}
+
+#[derive(Debug, Parser, Clone)]
 struct ListArgs {
     /// Print JSON instead of a table.
     #[arg(long)]
@@ -85,6 +109,7 @@ pub fn run_cli(cmd: CliCommand) -> anyhow::Result<()> {
         let result = match cmd.sub {
             CliSubCommand::Spawn(args) => run_spawn(&client, args).await,
             CliSubCommand::List(args) => run_list(&client, args).await,
+            CliSubCommand::MovePaneToNewTab(args) => run_move_pane_to_new_tab(&client, args).await,
         };
         // Dropping the client makes its reconnect thread log a spurious
         // "won't try to reconnect" error, so leave before that happens.
@@ -215,6 +240,38 @@ async fn run_spawn(client: &Client, args: SpawnArgs) -> anyhow::Result<()> {
         })
         .await?;
     println!("{}", spawned.pane_id);
+    Ok(())
+}
+
+async fn run_move_pane_to_new_tab(
+    client: &Client,
+    args: MovePaneToNewTabArgs,
+) -> anyhow::Result<()> {
+    let entries = pane_entries(client.list_panes().await?);
+    let pane_id = client.resolve_pane_id(args.pane_id).await?;
+    let source = entries
+        .iter()
+        .find(|e| e.pane_id == pane_id)
+        .ok_or_else(|| anyhow!("pane {pane_id} does not exist"))?;
+
+    let window_id = if args.new_window {
+        None
+    } else {
+        let id = args.window_id.unwrap_or(source.window_id);
+        if !entries.iter().any(|e| e.window_id == id) {
+            anyhow::bail!("window {id} does not exist");
+        }
+        Some(id)
+    };
+
+    let moved = client
+        .move_pane_to_new_tab(MovePaneToNewTab {
+            pane_id,
+            window_id,
+            workspace_for_new_window: args.workspace.or_else(|| Some(source.workspace.clone())),
+        })
+        .await?;
+    println!("{}\t{}", moved.window_id, moved.tab_id);
     Ok(())
 }
 
