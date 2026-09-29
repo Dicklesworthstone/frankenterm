@@ -33,3 +33,7 @@ updates:
         update-types: ["version-update:semver-major"]
       - dependency-name: "rusqlite"
         update-types: ["version-update:semver-major"]
+      # 0.21 redesigned the dispatch API that frankenterm/window/src/os/wayland uses;
+      # porting is a manual job (Linux-only build break, not caught on macOS).
+      - dependency-name: "smithay-client-toolkit"
+        versions: [">=0.21"]
