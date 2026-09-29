@@ -2207,6 +2207,30 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Window"],
             icon: Some("md_call_merge"),
         },
+        ShowMoveTabToWindow => CommandDef {
+            brief: "Move tab to window".into(),
+            doc: "Pick another window, or a new one, and move the active tab there".into(),
+            keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "m".into())],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Window"],
+            icon: Some("md_tab"),
+        },
+        MoveTabToWindow(window_id) => CommandDef {
+            brief: format!("Move tab to window {window_id}").into(),
+            doc: format!("Moves the active tab into window {window_id}").into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &[],
+            icon: Some("md_tab"),
+        },
+        MoveTabToNewWindow => CommandDef {
+            brief: "Move tab to a new window".into(),
+            doc: "Moves the active tab into a new window".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Window"],
+            icon: Some("md_open_in_new"),
+        },
         UnifyAllWindows => CommandDef {
             brief: "Unify all".into(),
             doc: "Merge duplicate windows for every remote domain in the current workspace after showing the plan summary"

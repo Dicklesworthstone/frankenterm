@@ -49,6 +49,14 @@ pub struct LauncherWorkspaceEntry {
     pub is_active: bool,
 }
 
+/// Another window that the active tab can be moved into.
+#[derive(Clone, Debug)]
+pub struct LauncherWindowEntry {
+    pub window_id: WindowId,
+    pub title: String,
+    pub tab_count: usize,
+}
+
 #[derive(Debug)]
 pub struct LauncherDomainEntry {
     pub domain_id: DomainId,
@@ -66,6 +74,10 @@ pub struct LauncherArgs {
     title: String,
     active_workspace: String,
     workspaces: Vec<LauncherWorkspaceEntry>,
+    move_targets: Vec<LauncherWindowEntry>,
+    /// Panes in the active tab; a tab with more than one moves only its
+    /// active pane, so the labels say "pane" instead of "tab".
+    active_tab_pane_count: usize,
     help_text: String,
     fuzzy_help_text: String,
     alphabet: String,
@@ -160,6 +172,43 @@ impl LauncherArgs {
             vec![]
         };
 
+        let (move_targets, active_tab_pane_count) =
+            if flags.contains(LauncherFlags::MOVE_TAB_TO_WINDOW) {
+                let targets = mux
+                    .iter_windows_in_workspace(&active_workspace)
+                    .into_iter()
+                    .filter(|window_id| *window_id != mux_window_id)
+                    .filter_map(|window_id| {
+                        let window = mux.get_window(window_id)?;
+                        let title = window
+                            .get_active()
+                            .map(|tab| {
+                                let tab_title = tab.get_title();
+                                if tab_title.is_empty() {
+                                    tab.get_active_pane()
+                                        .map(|pane| pane.get_title())
+                                        .unwrap_or_default()
+                                } else {
+                                    tab_title
+                                }
+                            })
+                            .unwrap_or_default();
+                        Some(LauncherWindowEntry {
+                            window_id,
+                            title,
+                            tab_count: window.len(),
+                        })
+                    })
+                    .collect();
+                let pane_count = mux
+                    .get_active_tab_for_window(mux_window_id)
+                    .and_then(|tab| tab.count_panes())
+                    .unwrap_or(1);
+                (targets, pane_count)
+            } else {
+                (vec![], 1)
+            };
+
         let domains = if flags.contains(LauncherFlags::DOMAINS) {
             let mut domains = mux.iter_domains();
             domains.sort_by(|a, b| {
@@ -206,6 +255,8 @@ impl LauncherArgs {
             title: title.to_string(),
             workspaces,
             active_workspace,
+            move_targets,
+            active_tab_pane_count,
             help_text: help_text.to_string(),
             fuzzy_help_text: fuzzy_help_text.to_string(),
             alphabet: alphabet.to_string(),
@@ -279,6 +330,35 @@ fn domain_entry_label(domain: &LauncherDomainEntry) -> String {
         }
         DomainState::Detached => format!("Domain [{connection}]: attach {}", domain.label),
     }
+}
+
+fn build_move_tab_entries(args: &LauncherArgs) -> Vec<Entry> {
+    if !args.flags.contains(LauncherFlags::MOVE_TAB_TO_WINDOW) {
+        return vec![];
+    }
+    let what = if args.active_tab_pane_count > 1 {
+        "active pane"
+    } else {
+        "tab"
+    };
+    let mut entries: Vec<Entry> = args
+        .move_targets
+        .iter()
+        .map(|target| Entry {
+            label: format!(
+                "Move {what} to window {}: {} ({})",
+                target.window_id,
+                target.title,
+                count_label(target.tab_count, "tab", "tabs")
+            ),
+            action: KeyAssignment::MoveTabToWindow(target.window_id),
+        })
+        .collect();
+    entries.push(Entry {
+        label: format!("Move {what} to a new window"),
+        action: KeyAssignment::MoveTabToNewWindow,
+    });
+    entries
 }
 
 fn build_session_domain_entries(args: &LauncherArgs) -> (Vec<Entry>, Option<usize>) {
@@ -387,9 +467,10 @@ impl LauncherState {
 
     fn build_entries(&mut self, args: LauncherArgs) {
         let config = configuration();
+        self.entries.append(&mut build_move_tab_entries(&args));
         let (mut session_domain_entries, session_active_idx) = build_session_domain_entries(&args);
         if let Some(active_idx) = session_active_idx {
-            self.active_idx = active_idx;
+            self.active_idx = self.entries.len() + active_idx;
         }
         self.entries.append(&mut session_domain_entries);
 
@@ -839,6 +920,19 @@ mod tests {
                     is_active: false,
                 },
             ],
+            move_targets: vec![
+                LauncherWindowEntry {
+                    window_id: 7,
+                    title: "cargo build".to_string(),
+                    tab_count: 2,
+                },
+                LauncherWindowEntry {
+                    window_id: 12,
+                    title: "notes".to_string(),
+                    tab_count: 1,
+                },
+            ],
+            active_tab_pane_count: 1,
             help_text: String::new(),
             fuzzy_help_text: String::new(),
             alphabet: String::new(),
@@ -884,6 +978,34 @@ mod tests {
             "Domain [connected]: open new tab in domain `local`"
         );
         assert_eq!(active_idx, Some(0));
+    }
+
+    #[test]
+    fn move_tab_rows_list_other_windows_then_a_new_window() {
+        let entries = build_move_tab_entries(&sample_args(LauncherFlags::MOVE_TAB_TO_WINDOW));
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].label, "Move tab to window 7: cargo build (2 tabs)");
+        assert_eq!(entries[0].action, KeyAssignment::MoveTabToWindow(7));
+        assert_eq!(entries[1].label, "Move tab to window 12: notes (1 tab)");
+        assert_eq!(entries[1].action, KeyAssignment::MoveTabToWindow(12));
+        assert_eq!(entries[2].label, "Move tab to a new window");
+        assert_eq!(entries[2].action, KeyAssignment::MoveTabToNewWindow);
+    }
+
+    #[test]
+    fn move_tab_rows_say_pane_when_the_tab_is_split() {
+        let mut args = sample_args(LauncherFlags::MOVE_TAB_TO_WINDOW);
+        args.active_tab_pane_count = 3;
+        let entries = build_move_tab_entries(&args);
+
+        assert_eq!(entries[0].label, "Move active pane to window 7: cargo build (2 tabs)");
+        assert_eq!(entries[2].label, "Move active pane to a new window");
+    }
+
+    #[test]
+    fn move_tab_rows_are_absent_without_the_flag() {
+        assert!(build_move_tab_entries(&sample_args(LauncherFlags::DOMAINS)).is_empty());
     }
 
     #[test]
