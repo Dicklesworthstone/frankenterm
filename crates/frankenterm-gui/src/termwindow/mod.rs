@@ -7850,11 +7850,19 @@ impl TermWindow {
                 "window {window_id} does not exist"
             );
         }
-        let pane_id = mux
+        let source_tab = mux
             .get_active_tab_for_window(self.mux_window_id)
-            .and_then(|tab| tab.get_active_pane())
+            .ok_or_else(|| anyhow!("window {} has no active tab", self.mux_window_id))?;
+        let pane_id = source_tab
+            .get_active_pane()
             .ok_or_else(|| anyhow!("window {} has no active pane", self.mux_window_id))?
             .pane_id();
+        // The move builds a fresh tab around the pane. When the pane is the
+        // whole tab, the tab itself is what moves, so its custom title goes
+        // with it. A multi-pane tab keeps its title for the panes left behind.
+        let carried_title = Some(source_tab.get_title())
+            .filter(|title| !title.is_empty() && source_tab.iter_all_panes().len() == 1);
+        drop(source_tab);
 
         match promise::spawn::try_reserve_main_thread(
             promise::spawn::MainThreadServiceClass::Topology,
@@ -7864,7 +7872,10 @@ impl TermWindow {
                 reservation
                     .spawn_local(async move {
                         match mux.move_pane_to_new_tab(pane_id, target, None).await {
-                            Ok((_tab, window_id)) => {
+                            Ok((tab, window_id)) => {
+                                if let Some(title) = &carried_title {
+                                    tab.set_title(title);
+                                }
                                 mux.focus_pane_and_containing_tab(pane_id).ok();
                                 if let Some(win) = try_front_end()
                                     .and_then(|fe| fe.gui_window_for_mux_window(window_id))
