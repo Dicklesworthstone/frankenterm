@@ -98957,6 +98957,67 @@ fn mux_socket_diagnostic(
     }
 }
 
+/// Check that the components installed next to this `ft` (an app bundle or an
+/// install directory) are one atomic build (ft-1itzl): a mixed bundle silently
+/// refuses the vendored backend. Compares the sealed identity marker every
+/// release component embeds. No row for an unsealed development `ft` or when
+/// no sibling component is installed.
+fn component_family_diagnostic() -> Option<DiagnosticCheck> {
+    let ft_path = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let ft = read_local_component_snapshot(&ft_path, AtomicComponentRole::Ft).ok()?;
+    component_family_check(&ft.identity, ft_path.parent()?)
+}
+
+fn component_family_check(ft: &LocalComponentIdentity, dir: &Path) -> Option<DiagnosticCheck> {
+    let mut matched = Vec::new();
+    let mut problems = Vec::new();
+    for (name, role) in [
+        ("frankenterm-gui", AtomicComponentRole::FrankenTermGui),
+        (
+            "frankenterm-mux-server",
+            AtomicComponentRole::FrankenTermMuxServer,
+        ),
+        (
+            "frankenterm-pty-guardian",
+            AtomicComponentRole::FrankenTermPtyGuardian,
+        ),
+    ] {
+        let path = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        if std::fs::symlink_metadata(&path).is_err() {
+            continue;
+        }
+        let snapshot = path
+            .canonicalize()
+            .map_err(anyhow::Error::from)
+            .and_then(|resolved| read_local_component_snapshot(&resolved, role));
+        match snapshot {
+            Ok(snapshot) if snapshot.identity == *ft => matched.push(name),
+            Ok(snapshot) => problems.push(format!(
+                "{name} is {} {} build {}",
+                snapshot.identity.version, snapshot.identity.profile, snapshot.identity.build_id
+            )),
+            Err(error) => problems.push(format!("{name}: {error}")),
+        }
+    }
+    if matched.is_empty() && problems.is_empty() {
+        return None;
+    }
+    let own = format!("ft {} {} build {}", ft.version, ft.profile, ft.build_id);
+    Some(if problems.is_empty() {
+        DiagnosticCheck::ok_with_detail(
+            "component family",
+            bounded_terminal_diagnostic(&format!("{} share {own}", matched.join(", ")), 512, 2_048),
+        )
+    } else {
+        DiagnosticCheck::error(
+            "component family",
+            bounded_terminal_diagnostic(&format!("{own}, but {}", problems.join("; ")), 512, 2_048),
+            "Reinstall every component from one release (install.sh or one DSR artifact set); \
+             a mixed installation disables the vendored backend",
+        )
+    })
+}
+
 /// Report the generation of the mux behind the discovered socket and whether
 /// this `ft` pairs with it (ft-xxfwy.7). One read-only handshake connection;
 /// no row when no socket was discovered (the `mux socket` row covers that).
@@ -99425,6 +99486,9 @@ async fn run_diagnostics(
     checks.push(mux_socket_diagnostic(mux_client.discovered_socket()));
     #[cfg(all(feature = "vendored", unix))]
     if let Some(check) = mux_generation_diagnostic(cx, mux_client.discovered_socket()).await {
+        checks.push(check);
+    }
+    if let Some(check) = component_family_diagnostic() {
         checks.push(check);
     }
     if let Some(check) = mux_scrollback_diagnostic(cx, &mux_client).await {
@@ -117862,6 +117926,55 @@ log_level = "debug"
             ),
         )
         .expect("write atomic component fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_component_family_flags_a_mixed_installation() {
+        let dir = InstallerTestDir::new("create component family fixture");
+        let target = "aarch64-apple-darwin";
+        let ft_path = dir.path().join("ft");
+        write_atomic_component_fixture(&ft_path, &"a".repeat(64), "ft", target);
+        let ft = read_local_component_snapshot(&ft_path, AtomicComponentRole::Ft)
+            .expect("read sealed ft fixture")
+            .identity;
+        assert!(
+            component_family_check(&ft, dir.path()).is_none(),
+            "a standalone ft has no family row"
+        );
+
+        for name in ["frankenterm-gui", "frankenterm-mux-server"] {
+            write_atomic_component_fixture(&dir.path().join(name), &"a".repeat(64), name, target);
+        }
+        let check = component_family_check(&ft, dir.path()).expect("family row");
+        assert_eq!(check.status, DiagnosticStatus::Ok);
+        let detail = check.detail.unwrap();
+        assert!(
+            detail.contains("frankenterm-gui, frankenterm-mux-server share"),
+            "{detail}"
+        );
+
+        write_atomic_component_fixture(
+            &dir.path().join("frankenterm-pty-guardian"),
+            &"b".repeat(64),
+            "frankenterm-pty-guardian",
+            target,
+        );
+        let check = component_family_check(&ft, dir.path()).expect("family row");
+        assert_eq!(check.status, DiagnosticStatus::Error);
+        let detail = check.detail.unwrap();
+        let mismatch = "frankenterm-pty-guardian is 0.15.2";
+        assert!(detail.contains(mismatch), "{detail}");
+        assert!(!detail.contains("frankenterm-gui"), "{detail}");
+
+        std::fs::write(
+            dir.path().join("frankenterm-mux-server"),
+            b"#!/bin/sh\n# no identity marker\nexit 0\n",
+        )
+        .expect("replace mux-server with an unsealed binary");
+        let check = component_family_check(&ft, dir.path()).expect("family row");
+        assert_eq!(check.status, DiagnosticStatus::Error);
+        assert!(check.detail.unwrap().contains("frankenterm-mux-server:"));
     }
 
     #[cfg(unix)]
