@@ -2210,7 +2210,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
         ShowMoveTabToWindow => CommandDef {
             brief: "Move tab to window".into(),
             doc: "Pick another window, or a new one, and move the active tab there".into(),
-            keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "m".into())],
+            keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "j".into())],
             args: &[ArgType::ActiveWindow],
             menubar: &["Window"],
             icon: Some("md_tab"),
