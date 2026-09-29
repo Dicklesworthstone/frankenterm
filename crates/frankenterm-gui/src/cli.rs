@@ -140,10 +140,9 @@ fn connect() -> anyhow::Result<Client> {
                 no_serve_automatically: true,
                 ..Default::default()
             };
-            Client::new_unix_domain(None, &dom, false, &mut ui, true, std::sync::Weak::new())
+            Client::new_unix_domain_request_only(&dom, &mut ui, true)
         }
-        None => Client::new_default_unix_domain(
-            false,
+        None => Client::new_default_unix_domain_request_only(
             &mut ui,
             true,
             true,

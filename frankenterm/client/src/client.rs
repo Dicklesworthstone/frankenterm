@@ -3717,7 +3717,12 @@ struct ClientIncarnation;
 
 #[derive(Clone)]
 enum ClientDispatchTarget {
-    Standalone,
+    /// No local domain. `request_only` marks a client that keeps no
+    /// topology state at all (a one-shot CLI), so no notification can leave
+    /// it out of date and every unilateral PDU is safe to ignore.
+    Standalone {
+        request_only: bool,
+    },
     Attached {
         local_domain_id: DomainId,
         mux_owner: Weak<Mux>,
@@ -3760,7 +3765,9 @@ impl ClientDispatchAuthority {
                 local_domain_id,
                 mux_owner,
             },
-            None => ClientDispatchTarget::Standalone,
+            None => ClientDispatchTarget::Standalone {
+                request_only: false,
+            },
         };
         Self {
             target,
@@ -3772,7 +3779,22 @@ impl ClientDispatchAuthority {
     }
 
     fn is_standalone(&self) -> bool {
-        matches!(&self.target, ClientDispatchTarget::Standalone)
+        matches!(&self.target, ClientDispatchTarget::Standalone { .. })
+    }
+
+    fn is_request_only(&self) -> bool {
+        matches!(
+            &self.target,
+            ClientDispatchTarget::Standalone { request_only: true }
+        )
+    }
+
+    /// Mark a standalone authority as belonging to a request-only client.
+    fn into_request_only(mut self) -> Self {
+        if let ClientDispatchTarget::Standalone { request_only } = &mut self.target {
+            *request_only = true;
+        }
+        self
     }
 
     fn generation_is_current(&self) -> bool {
@@ -4062,7 +4084,7 @@ impl ClientDispatchAuthority {
 
     fn captured_mux(&self) -> Option<Arc<Mux>> {
         match &self.target {
-            ClientDispatchTarget::Standalone => None,
+            ClientDispatchTarget::Standalone { .. } => None,
             ClientDispatchTarget::Attached { mux_owner, .. } => mux_owner.upgrade(),
         }
     }
@@ -4690,7 +4712,17 @@ fn unilateral_without_local_domain_is_ignorable(pdu: &Pdu) -> bool {
     }
 }
 
-fn handle_unilateral_without_local_domain(decoded: &DecodedPdu) -> anyhow::Result<()> {
+fn handle_unilateral_without_local_domain(
+    authority: &ClientDispatchAuthority,
+    decoded: &DecodedPdu,
+) -> anyhow::Result<()> {
+    if authority.is_request_only() {
+        log::trace!(
+            "request-only mux client ignored {} unilateral PDU",
+            decoded.pdu.pdu_name()
+        );
+        return Ok(());
+    }
     if unilateral_without_local_domain_is_ignorable(&decoded.pdu) {
         log::trace!(
             "standalone mux client explicitly ignored {} unilateral PDU",
@@ -4713,7 +4745,7 @@ fn process_unilateral(
         return Ok(());
     }
     if authority.is_standalone() {
-        return handle_unilateral_without_local_domain(&decoded);
+        return handle_unilateral_without_local_domain(authority, &decoded);
     }
     let Some(dispatch) = authority.resolve_current()? else {
         return Ok(());
@@ -4736,7 +4768,7 @@ async fn process_unilateral_with_barrier(
         return Ok(());
     }
     if authority.is_standalone() {
-        handle_unilateral_without_local_domain(&decoded)?;
+        handle_unilateral_without_local_domain(authority, &decoded)?;
         return Ok(());
     }
     let Some(dispatch) = authority.resolve_current()? else {
@@ -9675,8 +9707,17 @@ impl Client {
 
     fn new(
         local_domain_id: Option<DomainId>,
+        reconnectable: Reconnectable,
+        mux_owner: Weak<Mux>,
+    ) -> Self {
+        Self::new_with_dispatch(local_domain_id, reconnectable, mux_owner, false)
+    }
+
+    fn new_with_dispatch(
+        local_domain_id: Option<DomainId>,
         mut reconnectable: Reconnectable,
         mux_owner: Weak<Mux>,
+        request_only: bool,
     ) -> Self {
         let client_domain_config = reconnectable.config.clone();
         let is_reconnectable = reconnectable.reconnectable();
@@ -9694,6 +9735,11 @@ impl Client {
             Arc::clone(&connection_generation),
             Arc::clone(&rpc_transport),
         );
+        let initial_dispatch_authority = if request_only {
+            initial_dispatch_authority.into_request_only()
+        } else {
+            initial_dispatch_authority
+        };
         let mut reconnect_dispatch_authority = initial_dispatch_authority.clone();
         let reconnect_authorization = Arc::clone(&domain_reconnect_authorized);
 
@@ -10297,6 +10343,37 @@ impl Client {
             Reconnectable::new(ClientDomainConfig::Unix(unix_dom.clone()), None);
         reconnectable.connect(initial, ui, no_auto_start)?;
         Ok(Self::new(local_domain_id, reconnectable, mux_owner))
+    }
+
+    /// Connect a request-only client with no local domain, for one-shot
+    /// commands such as `frankenterm-gui cli`. It keeps no topology state, so
+    /// it ignores every unilateral notification instead of failing on the
+    /// ones a standalone client cannot apply. Nothing is retried for it.
+    pub fn new_unix_domain_request_only(
+        unix_dom: &UnixDomain,
+        ui: &mut ConnectionUI,
+        no_auto_start: bool,
+    ) -> anyhow::Result<Self> {
+        let mut reconnectable =
+            Reconnectable::new(ClientDomainConfig::Unix(unix_dom.clone()), None);
+        reconnectable.connect(false, ui, no_auto_start)?;
+        Ok(Self::new_with_dispatch(
+            None,
+            reconnectable,
+            Weak::new(),
+            true,
+        ))
+    }
+
+    /// The default unix domain, connected as [`Client::new_unix_domain_request_only`].
+    pub fn new_default_unix_domain_request_only(
+        ui: &mut ConnectionUI,
+        no_auto_start: bool,
+        prefer_mux: bool,
+        class_name: &str,
+    ) -> anyhow::Result<Self> {
+        let unix_dom = Self::compute_unix_domain(prefer_mux, class_name)?;
+        Self::new_unix_domain_request_only(&unix_dom, ui, no_auto_start)
     }
 
     pub fn new_tls(
@@ -20202,6 +20279,23 @@ mod tests {
             Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
             Arc::new(RpcTransportState::new()),
         )
+    }
+
+    #[test]
+    fn request_only_client_ignores_topology_unilateral_updates() {
+        let authority = standalone_dispatch_authority().into_request_only();
+        for pdu in [
+            Pdu::PaneRemoved(PaneRemoved { pane_id: 9 }),
+            Pdu::WindowWorkspaceChanged(WindowWorkspaceChanged {
+                window_id: 7,
+                workspace: "ops".into(),
+            }),
+        ] {
+            let name = pdu.pdu_name();
+            process_unilateral(&authority, unilateral(pdu)).unwrap_or_else(|err| {
+                panic!("a request-only client must ignore {name}, got {err:#}")
+            });
+        }
     }
 
     #[test]
