@@ -34265,12 +34265,14 @@ fn pane_agent_activity_bulk_reads_output_successful_input_and_known_agent() {
     audit(1, 400, "send_text", "denied");
     audit(1, 350, "read_output", "success");
     audit(1, 320, "send_ctrl_c", "success");
-    let event = |pane: i64, at: i64, agent: &str| {
+    // Event ids must advance the durable high-water mark explicitly.
+    let event = |id: i64, pane: i64, at: i64, agent: &str| {
         execute_typed(
             &backend,
-            "INSERT INTO events (pane_id, rule_id, agent_type, event_type, severity, confidence, detected_at)
-             VALUES (?1, 'r', ?2, 't', 'info', 1.0, ?3)",
+            "INSERT INTO events (id, pane_id, rule_id, agent_type, event_type, severity, confidence, detected_at)
+             VALUES (?1, ?2, 'r', ?3, 't', 'info', 1.0, ?4)",
             &[
+                ToSqlValue::Integer(id),
                 ToSqlValue::Integer(pane),
                 ToSqlValue::Text(agent),
                 ToSqlValue::Integer(at),
@@ -34278,9 +34280,9 @@ fn pane_agent_activity_bulk_reads_output_successful_input_and_known_agent() {
         )
         .unwrap();
     };
-    event(1, 100, "codex");
-    event(1, 200, "unknown");
-    event(2, 100, "");
+    event(1, 1, 100, "codex");
+    event(2, 1, 200, "unknown");
+    event(3, 2, 100, "");
 
     let pane_ids = canonical_pane_ids(&[2, 1, 9_999], "pane agent activity").unwrap();
     let activity = query_pane_agent_activity_bulk_canonical_backend(&backend, &pane_ids).unwrap();
