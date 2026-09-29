@@ -177,6 +177,103 @@ pub struct GuardianOutputKeyring {
     active: Activation,
     active_key: GuardianOutputKey,
     pending_generation: Option<u64>,
+    /// Stat fingerprint of the last fully validated latest authority and when
+    /// that validation finished; see `refresh_latest_authority_unlocked`.
+    validated_authority: Option<(AuthorityFingerprint, std::time::Instant)>,
+}
+
+/// How long an unchanged stat fingerprint may stand in for the full keyring
+/// inventory on the sealing path. Every append refreshes the latest authority
+/// several times; the full inventory re-reads every key and activation file.
+const AUTHORITY_REVALIDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Stat identity of one keyring leaf or of the keyring directory. Adding,
+/// removing or renaming an entry moves the directory's mtime and ctime; an
+/// in-place rewrite or permission change moves the file's ctime, which an
+/// unprivileged writer cannot set back.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StatStamp {
+    device: u64,
+    inode: u64,
+    links: u64,
+    bytes: u64,
+    mode: u32,
+    owner: u32,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+#[cfg(unix)]
+impl StatStamp {
+    fn of(metadata: &CapMetadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            links: metadata.nlink(),
+            bytes: metadata.size(),
+            mode: metadata.mode(),
+            owner: metadata.uid(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AuthorityFingerprint {
+    directory: StatStamp,
+    activation: StatStamp,
+    key: StatStamp,
+}
+
+#[cfg(unix)]
+impl AuthorityFingerprint {
+    /// Timestamps are tick- or second-granular on some filesystems, so a
+    /// change in the same tick as the snapshot can leave every stamp equal.
+    /// Like git's racy-clean rule, trust only stamps comfortably in the past.
+    fn settled(&self, now: std::time::SystemTime) -> bool {
+        const RACY_MARGIN_SECS: i64 = 2;
+        let Ok(now) = now.duration_since(std::time::UNIX_EPOCH) else {
+            return false;
+        };
+        let Ok(now_secs) = i64::try_from(now.as_secs()) else {
+            return false;
+        };
+        [self.directory, self.activation, self.key]
+            .iter()
+            .flat_map(|stamp| [stamp.modified.0, stamp.changed.0])
+            .all(|secs| secs.saturating_add(RACY_MARGIN_SECS) < now_secs)
+    }
+}
+
+/// Never produced off unix: every refresh there takes the full inventory.
+#[cfg(not(unix))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthorityFingerprint {}
+
+#[cfg(not(unix))]
+impl AuthorityFingerprint {
+    fn settled(&self, _now: std::time::SystemTime) -> bool {
+        match *self {}
+    }
+}
+
+/// The fingerprint of `active` as it sits on disk, or `None` when any leaf
+/// cannot be stat'ed (the full inventory then reports the real error).
+#[cfg(unix)]
+fn authority_fingerprint(directory: &CapDir, active: Activation) -> Option<AuthorityFingerprint> {
+    Some(AuthorityFingerprint {
+        directory: StatStamp::of(&directory.dir_metadata().ok()?),
+        activation: StatStamp::of(&directory.symlink_metadata(activation_name(active)).ok()?),
+        key: StatStamp::of(&directory.symlink_metadata(key_name(active.key_id)).ok()?),
+    })
+}
+
+#[cfg(not(unix))]
+fn authority_fingerprint(_directory: &CapDir, _active: Activation) -> Option<AuthorityFingerprint> {
+    None
 }
 
 /// Historical authentication cannot mutate or advance the key authority.
@@ -495,6 +592,7 @@ impl GuardianOutputKeyring {
         self.active = active;
         self.active_key = new_key;
         self.pending_generation = None;
+        self.validated_authority = None;
         Ok(key_id)
     }
 
@@ -513,6 +611,17 @@ impl GuardianOutputKeyring {
 
     fn refresh_latest_authority_unlocked(&mut self) -> Result<(), GuardianOutputKeyringError> {
         validate_directory(&self.directory)?;
+        // Fast path: nothing in the directory, the latest activation or the
+        // active key file changed since a full validation under a second ago.
+        // A rotation adds entries (directory stamp) and so is never skipped.
+        let before = authority_fingerprint(&self.directory, self.active);
+        if let (Some(before), Some((validated, at))) = (before, self.validated_authority)
+            && before == validated
+            && at.elapsed() < AUTHORITY_REVALIDATE_INTERVAL
+        {
+            return Ok(());
+        }
+        self.validated_authority = None;
         let mut current = inventory(&self.directory)?;
         if current.pending.is_some() {
             current = recover_pending_intent(&self.directory, current)?;
@@ -534,6 +643,17 @@ impl GuardianOutputKeyring {
         }
         self.pending_generation = current.pending.map(|intent| intent.generation);
         validate_directory(&self.directory)?;
+        // Trust only a fingerprint that bracketed this whole validation: taken
+        // before the inventory, unchanged after it, for the same activation,
+        // and with stamps old enough that a same-tick rewrite cannot hide.
+        let after = authority_fingerprint(&self.directory, self.active);
+        if let Some(stamp) = after
+            && after == before
+            && self.pending_generation.is_none()
+            && stamp.settled(std::time::SystemTime::now())
+        {
+            self.validated_authority = Some((stamp, std::time::Instant::now()));
+        }
         Ok(())
     }
 }
@@ -576,6 +696,7 @@ fn open_inventory(
         active,
         active_key,
         pending_generation: inventory.pending.map(|intent| intent.generation),
+        validated_authority: None,
     })
 }
 
@@ -1106,6 +1227,7 @@ fn provision_first(
         active_key,
         pending_generation: None,
         scoped_authority: None,
+        validated_authority: None,
     })
 }
 
@@ -2572,6 +2694,70 @@ mod tests {
                 assert!(scope.cipher_for_key_id(key_id).is_err());
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn latest_authority_fast_path_still_follows_rotation_and_key_mutation() {
+        use std::time::{Duration, Instant};
+
+        // Fresh stamps are racy, so the fast path engages only once the
+        // keyring's timestamps are a couple of seconds old.
+        fn settle(keyring: &mut GuardianOutputKeyring) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                keyring
+                    .latest_active_cipher()
+                    .expect("refresh latest authority");
+                if keyring.validated_authority.is_some() {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "settled keyring stamps never enabled the fast path"
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+
+        let root = tempfile::tempdir().expect("create fast-path test root");
+        let scrollback = root.path().join("scrollback-lines");
+        std::fs::create_dir(&scrollback).expect("create scrollback directory");
+        let mut keyring = GuardianOutputKeyring::open_or_provision_scrollback_sibling(&scrollback)
+            .expect("provision authority");
+        settle(&mut keyring);
+        let original = keyring.active_key_id();
+        assert_eq!(
+            keyring.latest_active_cipher().unwrap().key_id(),
+            original,
+            "fast path serves the validated activation"
+        );
+
+        let rotated = GuardianOutputKeyring::open_or_provision_scrollback_sibling(&scrollback)
+            .expect("second opener")
+            .rotate()
+            .expect("second opener rotates");
+        assert_ne!(rotated, original);
+        assert_eq!(
+            keyring.latest_active_cipher().unwrap().key_id(),
+            rotated,
+            "another opener's rotation must bypass the fast path"
+        );
+
+        settle(&mut keyring);
+        let mut options = CapOpenOptions::new();
+        options.write(true).follow(FollowSymlinks::No);
+        let mut file = keyring
+            .directory
+            .open_with(key_name(rotated), &options)
+            .expect("open active key for mutation");
+        file.write_all(&[0x5a; GuardianOutputCipher::KEY_BYTES])
+            .expect("change key material without changing inode");
+        file.sync_all().expect("synchronize changed key");
+        assert!(
+            keyring.latest_active_cipher().is_err(),
+            "an in-place key rewrite must bypass the fast path"
+        );
     }
 
     #[test]

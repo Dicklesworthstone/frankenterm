@@ -48,6 +48,32 @@ const FILE_HEADER_BYTES_U64: u64 = 176;
 const RECORD_HEADER_BYTES_U64: u64 = 96;
 const KEY_ID_BYTES: usize = 8;
 const NONCE_BYTES: usize = 24;
+const NONCE_POOL_NONCES: usize = 64;
+
+std::thread_local! {
+    static NONCE_POOL: std::cell::RefCell<([u8; NONCE_BYTES * NONCE_POOL_NONCES], usize)> =
+        const { std::cell::RefCell::new(([0; NONCE_BYTES * NONCE_POOL_NONCES], NONCE_BYTES * NONCE_POOL_NONCES)) };
+}
+
+/// Draw one random XChaCha20-Poly1305 nonce. Every nonce is still 192 bits of
+/// fresh OS entropy, handed out once and never reused, but a per-thread pool
+/// refills them 64 at a time instead of costing one entropy syscall per
+/// sealed scrollback row (about a tenth of the parse thread under a flood).
+/// Nonces are public, so the pool holds nothing secret. The mux never seals
+/// in a forked child before exec, so no two processes share a pool.
+fn fill_nonce(nonce: &mut [u8; NONCE_BYTES]) -> Result<(), getrandom::Error> {
+    NONCE_POOL.with(|pool| {
+        let (bytes, offset) = &mut *pool.borrow_mut();
+        if *offset + NONCE_BYTES > bytes.len() {
+            getrandom::fill(bytes)?;
+            *offset = 0;
+        }
+        nonce.copy_from_slice(&bytes[*offset..*offset + NONCE_BYTES]);
+        bytes[*offset..*offset + NONCE_BYTES].fill(0);
+        *offset += NONCE_BYTES;
+        Ok(())
+    })
+}
 const AEAD_TAG_BYTES: u32 = 16;
 const AEAD_TAG_BYTES_USIZE: usize = 16;
 const FILE_HEADER_AEAD_DOMAIN: &[u8] = b"frankenterm.guardian-output-file-header.v3\0";
@@ -757,7 +783,7 @@ impl GuardianOutputCipher {
             return Err(GuardianScrollbackRowError::RecordByteLimit);
         }
         let mut nonce = [0; NONCE_BYTES];
-        if getrandom::fill(&mut nonce).is_err() {
+        if fill_nonce(&mut nonce).is_err() {
             nonce.zeroize();
             return Err(GuardianScrollbackRowError::EntropyUnavailable);
         }
@@ -851,7 +877,7 @@ impl GuardianOutputCipher {
             return Err(GuardianScrollbackManifestError::CanonicalByteLimit);
         }
         let mut nonce = [0; NONCE_BYTES];
-        if getrandom::fill(&mut nonce).is_err() {
+        if fill_nonce(&mut nonce).is_err() {
             nonce.zeroize();
             return Err(GuardianScrollbackManifestError::EntropyUnavailable);
         }
@@ -925,7 +951,7 @@ impl GuardianOutputCipher {
             return Err(GuardianScrollbackAppendWalError::CanonicalByteLimit);
         }
         let mut nonce = [0; NONCE_BYTES];
-        if getrandom::fill(&mut nonce).is_err() {
+        if fill_nonce(&mut nonce).is_err() {
             nonce.zeroize();
             return Err(GuardianScrollbackAppendWalError::EntropyUnavailable);
         }
@@ -997,7 +1023,7 @@ impl GuardianOutputCipher {
         aad: &[u8],
     ) -> Result<([u8; NONCE_BYTES], Vec<u8>), GuardianOutputJournalError> {
         let mut nonce_bytes = [0_u8; NONCE_BYTES];
-        if getrandom::fill(&mut nonce_bytes).is_err() {
+        if fill_nonce(&mut nonce_bytes).is_err() {
             nonce_bytes.zeroize();
             return Err(GuardianOutputJournalError::EntropyUnavailable);
         }
@@ -1094,7 +1120,7 @@ impl GuardianOutputCipher {
         plaintext: &[u8],
     ) -> Result<([u8; NONCE_BYTES], Vec<u8>), GuardianOutputJournalError> {
         let mut nonce_bytes = [0_u8; NONCE_BYTES];
-        if getrandom::fill(&mut nonce_bytes).is_err() {
+        if fill_nonce(&mut nonce_bytes).is_err() {
             nonce_bytes.zeroize();
             return Err(GuardianOutputJournalError::EntropyUnavailable);
         }
@@ -3670,7 +3696,7 @@ fn encode_file_header(
     }
     header[112..120].copy_from_slice(&cipher.key_id);
     let mut nonce = [0_u8; NONCE_BYTES];
-    getrandom::fill(&mut nonce).map_err(|_| GuardianOutputJournalError::EntropyUnavailable)?;
+    fill_nonce(&mut nonce).map_err(|_| GuardianOutputJournalError::EntropyUnavailable)?;
     let aad = file_header_aad(&header[0..136]);
     let authentication_tag = cipher
         .cipher
@@ -4275,6 +4301,17 @@ mod tests {
     fn scrollback_identity() -> GuardianScrollbackRowIdentity {
         GuardianScrollbackRowIdentity::new([0x42; 16], [0x24; 16], 7, -3, 11)
             .expect("fixture scrollback identity is valid")
+    }
+
+    #[test]
+    fn pooled_nonces_are_distinct_across_refills() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..NONCE_POOL_NONCES * 3 + 5 {
+            let mut nonce = [0_u8; NONCE_BYTES];
+            fill_nonce(&mut nonce).expect("draw pooled nonce");
+            assert_ne!(nonce, [0_u8; NONCE_BYTES]);
+            assert!(seen.insert(nonce), "a pooled nonce was handed out twice");
+        }
     }
 
     #[test]
