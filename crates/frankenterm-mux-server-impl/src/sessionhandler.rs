@@ -2418,6 +2418,7 @@ impl MuxRequestErrorContext {
                 | Pdu::GetPaneDirection(_)
                 | Pdu::GetPaneRenderableDimensions(_)
                 | Pdu::GetPaneTieredScrollbackStatusesV1(_)
+                | Pdu::GetPaneDomainsV1(_)
                 | Pdu::GetPaneRenderChanges(_)
                 | Pdu::GetPaneRenderDeliveryV1(_)
                 | Pdu::SearchScrollbackRequest(_)
@@ -6970,6 +6971,29 @@ fn sample_tiered_scrollback_status(
     }
 }
 
+/// The owning domain of one exact pane registration, named when the domain is
+/// still registered under a name the reply may carry. A pane that retired
+/// after admission is reported `Missing`, like one that never existed.
+fn pane_domain_outcome(
+    mux: &Mux,
+    registration: Option<PaneRegistrationHandle>,
+) -> codec::PaneDomainOutcomeV1 {
+    let Some(domain_id) = registration
+        .and_then(|registration| registration.try_with_current(|pane| pane.domain_id()))
+    else {
+        return codec::PaneDomainOutcomeV1::Missing;
+    };
+    match mux.get_domain(domain_id) {
+        Some(domain) if domain.domain_name().len() <= codec::MAX_PANE_DOMAIN_NAME_BYTES => {
+            codec::PaneDomainOutcomeV1::Named {
+                domain_id,
+                domain_name: domain.domain_name().to_string(),
+            }
+        }
+        _ => codec::PaneDomainOutcomeV1::Unnamed { domain_id },
+    }
+}
+
 /// Move one exact pane registration's warm scrollback to the cold tier and
 /// sample its status afterwards, under the same panic boundary as the status
 /// batch so one faulty pane cannot fail its siblings' evictions.
@@ -9284,6 +9308,46 @@ impl SessionHandler {
                 );
             }
 
+            Pdu::GetPaneDomainsV1(request) => {
+                if request.validate().is_err() {
+                    send_response(Err(MuxServerRejection::invalid_request().into()));
+                    return;
+                }
+                let estimated_bytes = main_thread_rpc_estimated_bytes(
+                    request
+                        .pane_ids
+                        .len()
+                        .saturating_mul(std::mem::size_of::<PaneId>()),
+                );
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    estimated_bytes,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                let session = authority.acquire()?;
+                                let entries = request
+                                    .pane_ids
+                                    .into_iter()
+                                    .map(|pane_id| codec::PaneDomainEntryV1 {
+                                        pane_id,
+                                        outcome: pane_domain_outcome(
+                                            &session,
+                                            session.capture_current_pane(pane_id),
+                                        ),
+                                    })
+                                    .collect::<Vec<_>>();
+                                let response = codec::GetPaneDomainsV1Response { entries };
+                                response.validate()?;
+                                Ok(Pdu::GetPaneDomainsV1Response(response))
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
+            }
+
             Pdu::GetPaneRenderChanges(GetPaneRenderChanges { pane_id, .. }) => {
                 let Some(registration) =
                     capture_pane_or_respond_liveness(&authority, pane_id, &send_response)
@@ -10304,6 +10368,7 @@ impl SessionHandler {
             | Pdu::GetPaneRenderableDimensionsResponse { .. }
             | Pdu::GetPaneTieredScrollbackStatusesV1Response { .. }
             | Pdu::EvictPaneWarmScrollbackV1Response { .. }
+            | Pdu::GetPaneDomainsV1Response { .. }
             | Pdu::ReliableKeyEventV1Response { .. }
             | Pdu::ReliablePaneWriteV1Response { .. }
             | Pdu::ErrorResponse { .. }) => {
@@ -16703,6 +16768,74 @@ mod tests {
             render_callback_calls.load(Ordering::Relaxed),
             0,
             "health sampling must not enter the render-delta callback graph"
+        );
+    }
+
+    #[test]
+    fn pane_domains_report_the_owning_domain_by_exact_registration() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        let query = |mux: &Arc<Mux>, serial| {
+            let (sender, captured) = capturing_sender();
+            let mut handler =
+                SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(mux)))
+                    .unwrap();
+            handler.process_one(DecodedPdu {
+                serial,
+                pdu: Pdu::GetPaneDomainsV1(codec::GetPaneDomainsV1 {
+                    pane_ids: vec![7, 9],
+                }),
+            });
+            tick_until_response(&executor, &captured, 1);
+            let Pdu::GetPaneDomainsV1Response(response) = take_response(&captured).pdu else {
+                panic!("expected pane domains response");
+            };
+            response.entries
+        };
+
+        // FakePane belongs to domain 0, registered here as "routing-a".
+        let domain: Arc<dyn Domain> = Arc::new(SpawnRoutingTestDomain::new(
+            0,
+            "routing-a",
+            None,
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        let named = Arc::new(Mux::new(Some(domain)));
+        let _named_guard = ScopedMux::install(&named);
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(7, None));
+        named
+            .add_pane(&pane)
+            .expect("register pane in a named domain");
+        assert_eq!(
+            query(&named, 403),
+            vec![
+                codec::PaneDomainEntryV1 {
+                    pane_id: 7,
+                    outcome: codec::PaneDomainOutcomeV1::Named {
+                        domain_id: 0,
+                        domain_name: "routing-a".to_string(),
+                    },
+                },
+                codec::PaneDomainEntryV1 {
+                    pane_id: 9,
+                    outcome: codec::PaneDomainOutcomeV1::Missing,
+                },
+            ]
+        );
+        drop(_named_guard);
+
+        // Without a registered domain the pane still reports its domain id.
+        let unnamed = Arc::new(Mux::new(None));
+        let _unnamed_guard = ScopedMux::install(&unnamed);
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(7, None));
+        unnamed
+            .add_pane(&pane)
+            .expect("register pane without a domain");
+        assert_eq!(
+            query(&unnamed, 404)[0].outcome,
+            codec::PaneDomainOutcomeV1::Unnamed { domain_id: 0 }
         );
     }
 

@@ -3557,6 +3557,18 @@ macro_rules! pdu_encoded_body_limit {
             max_zstd_encoded_bytes: MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_ZSTD_ENCODED_BYTES,
         }
     };
+    (GetPaneDomainsV1, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_TIERED_SCROLLBACK_STATUS_REQUEST_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_TIERED_SCROLLBACK_STATUS_REQUEST_ZSTD_ENCODED_BYTES,
+        }
+    };
+    (GetPaneDomainsV1Response, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_ZSTD_ENCODED_BYTES,
+        }
+    };
     (GetImageCellResponse, none) => {
         PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
             max_decompressed_bytes: MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES,
@@ -4312,7 +4324,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 67;
+pub const CODEC_VERSION: usize = 68;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -4894,6 +4906,12 @@ pdu! {
     EvictPaneWarmScrollbackV1Response: 111, 67, server_reply, none,
         state_sync, state_sync, normal
         => deserialize_evict_pane_warm_scrollback_v1_response;
+    GetPaneDomainsV1: 112, 68, client_request, none,
+        query, query, normal
+        => deserialize_get_pane_domains_v1;
+    GetPaneDomainsV1Response: 113, 68, server_reply, none,
+        bulk_data, bulk_data, bulk
+        => deserialize_get_pane_domains_v1_response;
 }
 
 impl Pdu {
@@ -4912,6 +4930,8 @@ impl Pdu {
             Self::GetPaneTieredScrollbackStatusesV1Response(value) => value.validate()?,
             Self::EvictPaneWarmScrollbackV1(value) => value.validate()?,
             Self::EvictPaneWarmScrollbackV1Response(value) => value.validate()?,
+            Self::GetPaneDomainsV1(value) => value.validate()?,
+            Self::GetPaneDomainsV1Response(value) => value.validate()?,
             Self::SendKeyDownTracedV1(value) => value.validate()?,
             Self::SendPasteTracedV1(value) => value.validate()?,
             Self::ReliableKeyEventV1(value) => value.validate()?,
@@ -14596,6 +14616,150 @@ fn deserialize_evict_pane_warm_scrollback_v1_response(
     Ok(response)
 }
 
+pub const GET_PANE_DOMAINS_V1_MIN_CODEC_VERSION: usize = 68;
+
+/// Longest domain name a pane-domain reply carries. Configured names are
+/// short labels (`local`, `unix`, `ssh:host`); 256 entries at this bound stay
+/// inside the shared batch response ceiling.
+pub const MAX_PANE_DOMAIN_NAME_BYTES: usize = 64;
+
+/// Ask the mux which domain owns each named pane. The pane listing carries no
+/// domain, so without this a client can only guess from the working
+/// directory, which cannot tell a proxied remote pane from a local one.
+/// Same bounded, duplicate-free pane batch as the tiered status request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GetPaneDomainsV1 {
+    #[serde(
+        serialize_with = "serialize_tiered_scrollback_batch_pane_ids",
+        deserialize_with = "deserialize_tiered_scrollback_batch_pane_ids"
+    )]
+    pub pane_ids: Vec<PaneId>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PaneDomainOutcomeV1 {
+    /// The pane's owning domain and its registered name.
+    Named {
+        domain_id: mux::domain::DomainId,
+        domain_name: String,
+    },
+    /// The pane names a domain that is no longer registered, or whose name
+    /// exceeds [`MAX_PANE_DOMAIN_NAME_BYTES`].
+    Unnamed { domain_id: mux::domain::DomainId },
+    /// No pane is registered under the requested id.
+    Missing,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PaneDomainEntryV1 {
+    pub pane_id: PaneId,
+    pub outcome: PaneDomainOutcomeV1,
+}
+
+/// One entry per requested pane, in request order.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GetPaneDomainsV1Response {
+    #[serde(
+        serialize_with = "serialize_pane_domain_entries",
+        deserialize_with = "deserialize_pane_domain_entries"
+    )]
+    pub entries: Vec<PaneDomainEntryV1>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum PaneDomainBatchError {
+    #[error(transparent)]
+    Batch(#[from] TieredScrollbackStatusBatchError),
+    #[error("pane {pane_id} domain name is {bytes} bytes; maximum is {max}")]
+    NameTooLong {
+        pane_id: PaneId,
+        bytes: usize,
+        max: usize,
+    },
+}
+
+impl GetPaneDomainsV1 {
+    pub fn validate(&self) -> Result<(), PaneDomainBatchError> {
+        validate_tiered_scrollback_status_batch_ids(
+            self.pane_ids.iter().copied(),
+            self.pane_ids.len(),
+        )?;
+        Ok(())
+    }
+}
+
+impl GetPaneDomainsV1Response {
+    pub fn validate(&self) -> Result<(), PaneDomainBatchError> {
+        validate_tiered_scrollback_status_batch_ids(
+            self.entries.iter().map(|entry| entry.pane_id),
+            self.entries.len(),
+        )?;
+        for entry in &self.entries {
+            if let PaneDomainOutcomeV1::Named { domain_name, .. } = &entry.outcome {
+                if domain_name.len() > MAX_PANE_DOMAIN_NAME_BYTES {
+                    return Err(PaneDomainBatchError::NameTooLong {
+                        pane_id: entry.pane_id,
+                        bytes: domain_name.len(),
+                        max: MAX_PANE_DOMAIN_NAME_BYTES,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn serialize_pane_domain_entries<S>(
+    entries: &[PaneDomainEntryV1],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if entries.is_empty() || entries.len() > MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES {
+        return Err(serde::ser::Error::custom(format_args!(
+            "pane domain batch entry count {} is outside 1..={}",
+            entries.len(),
+            MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES,
+        )));
+    }
+    serializer.serialize_newtype_struct(
+        bounded_varbincode::TIERED_SCROLLBACK_BATCH_ENTRIES_V1_NEWTYPE,
+        entries,
+    )
+}
+
+fn deserialize_pane_domain_entries<'de, D>(
+    deserializer: D,
+) -> Result<Vec<PaneDomainEntryV1>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_newtype_vec::<D, PaneDomainEntryV1, MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES>(
+        deserializer,
+        "pane domain batch entries",
+        bounded_varbincode::TIERED_SCROLLBACK_BATCH_ENTRIES_V1_NEWTYPE,
+    )
+}
+
+fn deserialize_get_pane_domains_v1(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<GetPaneDomainsV1, Error> {
+    let request: GetPaneDomainsV1 = deserialize(data, is_compressed)?;
+    request.validate()?;
+    Ok(request)
+}
+
+fn deserialize_get_pane_domains_v1_response(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<GetPaneDomainsV1Response, Error> {
+    let response: GetPaneDomainsV1Response = deserialize(data, is_compressed)?;
+    response.validate()?;
+    Ok(response)
+}
+
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetSemanticZones {
     pub pane_id: PaneId,
@@ -22203,7 +22367,7 @@ mod test {
 
     #[test]
     fn codec_v65_additive_line_layout_preserves_the_v61_compatibility_floor() {
-        assert_eq!(CODEC_VERSION, 67);
+        assert_eq!(CODEC_VERSION, 68);
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
         assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 54);
         assert!(!codec_version_supports_ordered_window_v1(50));
@@ -24056,7 +24220,78 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 67);
+        assert_eq!(CODEC_VERSION, 68);
+    }
+
+    #[test]
+    fn pane_domains_batch_round_trips_and_bounds_names() {
+        let request = Pdu::GetPaneDomainsV1(GetPaneDomainsV1 {
+            pane_ids: vec![3, 9, 11],
+        });
+        for mode in [CompressionMode::Never, CompressionMode::Always] {
+            let frame = request.encode_frame_with_mode(1, mode).unwrap();
+            assert_eq!(Pdu::decode(frame.as_slice()).unwrap().pdu, request);
+        }
+        assert_eq!(request.minimum_codec_version(), Some(68));
+
+        let response = Pdu::GetPaneDomainsV1Response(GetPaneDomainsV1Response {
+            entries: vec![
+                PaneDomainEntryV1 {
+                    pane_id: 3,
+                    outcome: PaneDomainOutcomeV1::Named {
+                        domain_id: 7,
+                        domain_name: "ssh:mac-mini-max".to_string(),
+                    },
+                },
+                PaneDomainEntryV1 {
+                    pane_id: 9,
+                    outcome: PaneDomainOutcomeV1::Unnamed { domain_id: 2 },
+                },
+                PaneDomainEntryV1 {
+                    pane_id: 11,
+                    outcome: PaneDomainOutcomeV1::Missing,
+                },
+            ],
+        });
+        for mode in [CompressionMode::Never, CompressionMode::Always] {
+            let frame = response.encode_frame_with_mode(2, mode).unwrap();
+            assert_eq!(Pdu::decode(frame.as_slice()).unwrap().pdu, response);
+        }
+
+        for pane_ids in [vec![], vec![4, 4]] {
+            assert!(GetPaneDomainsV1 { pane_ids }.validate().is_err());
+        }
+        let named = |pane_id, bytes| PaneDomainEntryV1 {
+            pane_id,
+            outcome: PaneDomainOutcomeV1::Named {
+                domain_id: 1,
+                domain_name: "d".repeat(bytes),
+            },
+        };
+        assert!(matches!(
+            GetPaneDomainsV1Response {
+                entries: vec![named(1, MAX_PANE_DOMAIN_NAME_BYTES + 1)],
+            }
+            .validate(),
+            Err(PaneDomainBatchError::NameTooLong { pane_id: 1, .. })
+        ));
+
+        // A full batch of maximal names and ids fits the shared response ceiling.
+        let widest = Pdu::GetPaneDomainsV1Response(GetPaneDomainsV1Response {
+            entries: (0..MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES)
+                .map(|offset| PaneDomainEntryV1 {
+                    pane_id: PaneId::MAX - offset,
+                    outcome: PaneDomainOutcomeV1::Named {
+                        domain_id: usize::MAX,
+                        domain_name: "d".repeat(MAX_PANE_DOMAIN_NAME_BYTES),
+                    },
+                })
+                .collect(),
+        });
+        let frame = widest
+            .encode_frame_with_mode(3, CompressionMode::Never)
+            .unwrap();
+        assert_eq!(Pdu::decode(frame.as_slice()).unwrap().pdu, widest);
     }
 
     #[test]
@@ -24594,7 +24829,7 @@ mod test {
     fn pdu_wire_registry_covers_every_assigned_id_and_only_the_historical_gaps() {
         const GAPS: &[u64] = &[5, 6, 7, 15, 16, 17, 18, 19, 21];
 
-        for ident in 0..=111 {
+        for ident in 0..=113 {
             let spec = Pdu::wire_spec_for_ident(ident);
             assert_eq!(
                 spec.is_none(),
@@ -24608,9 +24843,9 @@ mod test {
             }
         }
 
-        assert!(Pdu::wire_spec_for_ident(112).is_none());
+        assert!(Pdu::wire_spec_for_ident(114).is_none());
         assert!(Pdu::wire_spec_for_ident(u64::MAX).is_none());
-        assert_eq!(Pdu::all_wire_specs().len(), 112 - GAPS.len());
+        assert_eq!(Pdu::all_wire_specs().len(), 114 - GAPS.len());
     }
 
     #[test]
@@ -24653,6 +24888,7 @@ mod test {
                 102..=103 => 65,
                 104..=109 => 66,
                 110..=111 => 67,
+                112..=113 => 68,
                 ident => panic!("unexpected assigned PDU ID {}", ident),
             };
             assert_eq!(
@@ -24687,11 +24923,11 @@ mod test {
         const CLIENT_REQUESTS: &[u64] = &[
             1, 3, 9, 11, 12, 13, 14, 22, 24, 26, 28, 31, 33, 34, 35, 36, 38, 40, 41, 43, 45, 46,
             48, 50, 51, 56, 57, 58, 59, 60, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
-            77, 80, 81, 85, 86, 88, 91, 93, 95, 96, 98, 99, 100, 102, 104, 106, 108, 110,
+            77, 80, 81, 85, 86, 88, 91, 93, 95, 96, 98, 99, 100, 102, 104, 106, 108, 110, 112,
         ];
         const SERVER_REPLIES: &[u64] = &[
             0, 2, 4, 8, 10, 23, 25, 27, 29, 30, 32, 42, 47, 49, 52, 61, 76, 78, 82, 87, 89, 92, 94,
-            97, 101, 103, 105, 107, 109, 111,
+            97, 101, 103, 105, 107, 109, 111, 113,
         ];
         const SERVER_UNILATERALS: &[u64] = &[
             20, 25, 37, 38, 39, 44, 53, 54, 55, 56, 57, 58, 79, 83, 84, 90,
@@ -24790,8 +25026,10 @@ mod test {
                     Class::StateSync
                 }
                 24 | 25 | 79 | 80 | 84 | 85 | 91 | 92 => Class::Render,
-                22 | 31 | 41 | 46 | 51 | 52 | 60 | 61 | 77 | 93 | 102 | 104..=109 => Class::Query,
-                23 | 32 | 42 | 47 | 78 | 94 | 103 => Class::BulkData,
+                22 | 31 | 41 | 46 | 51 | 52 | 60 | 61 | 77 | 93 | 102 | 104..=109 | 112 => {
+                    Class::Query
+                }
+                23 | 32 | 42 | 47 | 78 | 94 | 103 | 113 => Class::BulkData,
                 ident => panic!("PDU {} is missing from the semantic-class census", ident),
             };
             let expected_cap = match spec.ident {
@@ -24817,8 +25055,9 @@ mod test {
                 | 86
                 | 93
                 | 102
-                | 104..=109 => Cap::Query,
-                4 | 13 | 20 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 99 | 103 => {
+                | 104..=109
+                | 112 => Cap::Query,
+                4 | 13 | 20 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 99 | 103 | 113 => {
                     Cap::BulkData
                 }
                 ident => panic!("PDU {} is missing from the admission-cap census", ident),
@@ -24858,8 +25097,8 @@ mod test {
                 | 83..=86
                 | 90..=93
                 | 102
-                | 104..=111 => Qos::Normal,
-                4 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 103 => Qos::Bulk,
+                | 104..=112 => Qos::Normal,
+                4 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 103 | 113 => Qos::Bulk,
                 ident => panic!("PDU {} is missing from the queue-QoS census", ident),
             };
 
@@ -25806,7 +26045,7 @@ mod test {
     #[test]
     fn check_compat_current_build_keeps_v61_floor_after_additive_v65() {
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
-        assert_eq!(CODEC_VERSION, 67);
+        assert_eq!(CODEC_VERSION, 68);
         assert!(check_compat(62, 61, 60, 58).is_err());
         assert_eq!(
             check_compat(62, 61, 61, 61),
@@ -26691,21 +26930,21 @@ mod test {
 
     #[test]
     fn decode_accepts_valid_non_canonical_leb128_headers() {
-        let wire = [0x84, 0x00, 0x81, 0x00, 0xF0, 0x00];
+        let wire = [0x84, 0x00, 0x81, 0x00, 0xF2, 0x00];
         let decoded = Pdu::decode(wire.as_slice()).expect("valid non-canonical header");
         assert_eq!(decoded.serial, 1);
-        assert_eq!(decoded.pdu, Pdu::Invalid { ident: 112 });
+        assert_eq!(decoded.pdu, Pdu::Invalid { ident: 114 });
     }
 
     #[test]
     fn decode_raw_async_accepts_valid_non_canonical_leb128_headers() {
         runtime::block_on(async {
-            let mut reader = runtime::Cursor::new(vec![0x84, 0x00, 0x81, 0x00, 0xF0, 0x00]);
+            let mut reader = runtime::Cursor::new(vec![0x84, 0x00, 0x81, 0x00, 0xF2, 0x00]);
             let decoded = Pdu::decode_async(&mut reader, None)
                 .await
                 .expect("valid non-canonical header");
             assert_eq!(decoded.serial, 1);
-            assert_eq!(decoded.pdu, Pdu::Invalid { ident: 112 });
+            assert_eq!(decoded.pdu, Pdu::Invalid { ident: 114 });
         });
     }
 

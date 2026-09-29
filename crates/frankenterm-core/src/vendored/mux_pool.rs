@@ -1082,6 +1082,30 @@ impl MuxPool {
         .await
     }
 
+    /// Ask the mux which domain owns each pane in a batch (codec 68).
+    pub async fn get_pane_domains_with_cx(
+        &self,
+        cx: &Cx,
+        pane_ids: Vec<usize>,
+    ) -> Result<codec::GetPaneDomainsV1Response, MuxPoolError> {
+        codec::GetPaneDomainsV1 {
+            pane_ids: pane_ids.clone(),
+        }
+        .validate()
+        .map_err(|error| {
+            MuxPoolError::Mux(DirectMuxError::proven_pre_write_rejection(
+                DirectMuxError::Codec(error.to_string()),
+            ))
+        })?;
+        let op_cx = cx.clone();
+        self.execute_with_recovery_with_cx(cx, "get_pane_domains_v1", move |client| {
+            let op_cx = op_cx.clone();
+            let pane_ids = pane_ids.clone();
+            Box::pin(async move { client.get_pane_domains_with_cx(&op_cx, pane_ids).await })
+        })
+        .await
+    }
+
     /// Fetch OSC 133 semantic zones from a pane via a pooled connection.
     pub async fn get_semantic_zones(
         &self,

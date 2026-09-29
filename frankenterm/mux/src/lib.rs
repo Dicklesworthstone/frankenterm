@@ -4442,6 +4442,11 @@ mod pane_registration_handle {
             self.pane.evict_warm_scrollback()
         }
 
+        /// The domain that owns this pane.
+        pub fn domain_id(&self) -> crate::domain::DomainId {
+            self.pane.domain_id()
+        }
+
         pub fn get_cursor_position(&self) -> crate::renderable::StableCursorPosition {
             self.pane.get_cursor_position()
         }

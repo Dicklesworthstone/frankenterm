@@ -2553,6 +2553,50 @@ impl DirectMuxClient {
         )
     }
 
+    /// Ask the mux which domain owns each pane in a batch. A pre-v68 peer
+    /// refuses before any byte is written (`OutboundPduRequiresCodec`).
+    pub async fn get_pane_domains_with_cx(
+        &mut self,
+        cx: &Cx,
+        pane_ids: Vec<usize>,
+    ) -> Result<codec::GetPaneDomainsV1Response, DirectMuxError> {
+        let request = codec::GetPaneDomainsV1 { pane_ids };
+        request.validate().map_err(|error| {
+            DirectMuxError::proven_pre_write_rejection(DirectMuxError::Codec(error.to_string()))
+        })?;
+        let requested_pane_ids = request.pane_ids.clone();
+        let response = self
+            .send_request_with_cx(cx, Pdu::GetPaneDomainsV1(request))
+            .await?;
+        let result = match response {
+            Pdu::GetPaneDomainsV1Response(response) => {
+                let response_pane_ids = response
+                    .entries
+                    .iter()
+                    .map(|entry| entry.pane_id)
+                    .collect::<Vec<_>>();
+                if let Err(error) = response.validate() {
+                    Err(DirectMuxError::AlignedUnexpectedResponse {
+                        expected: "bounded unique pane-domain response".to_string(),
+                        got: error.to_string(),
+                    })
+                } else if response_pane_ids != requested_pane_ids {
+                    Err(DirectMuxError::AlignedUnexpectedResponse {
+                        expected: format!("domains for panes {requested_pane_ids:?}"),
+                        got: format!("domains for panes {response_pane_ids:?}"),
+                    })
+                } else {
+                    Ok(response)
+                }
+            }
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "GetPaneDomainsV1Response".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        };
+        self.settle_transport_result(result, "pane-domain response contract failure", true)
+    }
+
     /// Spawn a new mux pane/tab through the native mux protocol.
     pub async fn spawn_v2(&mut self, spawn: SpawnV2) -> Result<SpawnResponse, DirectMuxError> {
         let cx = Cx::current().unwrap_or_else(cx::for_request);

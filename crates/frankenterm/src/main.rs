@@ -41370,7 +41370,12 @@ async fn robot_list_panes_on_runtime_task(
                 &cx,
                 CapabilityContextSite::RobotOperation,
             )?;
-            wezterm.list_panes_with_cx(&cx).await
+            let mut panes = wezterm.list_panes_with_cx(&cx).await?;
+            // Robot consumers need the owning domain, not a cwd guess (ft-pdawh).
+            wezterm
+                .annotate_pane_domains_with_cx(&cx, &mut panes)
+                .await?;
+            Ok(panes)
         });
     task.await
         .map_err(|error| runtime_task_join_failure("robot.list_panes.await_task", error))?
@@ -61417,7 +61422,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             // ft-xbnl0.2.3 tick 233: cx-first.
             let cx = frankenterm_core::cx::Cx::current()
                 .unwrap_or_else(frankenterm_core::cx::for_request);
-            let panes = match wezterm.list_panes_with_cx(&cx).await {
+            let mut panes = match wezterm.list_panes_with_cx(&cx).await {
                 Ok(panes) => panes,
                 Err(e) => {
                     let error = bounded_display_diagnostic("Failed to list panes: ", &e, 600, 600);
@@ -61425,6 +61430,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     return Err(e.into());
                 }
             };
+            wezterm
+                .annotate_pane_domains_with_cx(&cx, &mut panes)
+                .await?;
 
             let filter = &config.ingest.panes;
             let mut states: Vec<PaneState> = panes

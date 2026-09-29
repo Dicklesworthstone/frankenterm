@@ -213,6 +213,20 @@ pub trait MuxInterface: Send + Sync {
     ) -> WeztermFuture<'a, Vec<PaneInfo>> {
         self.list_panes()
     }
+
+    /// Fill `domain_id`/`domain_name` on listed panes from the mux that owns
+    /// them (codec 68, ft-pdawh). The pane listing carries no domain, and the
+    /// cwd fallback cannot tell a proxied remote pane from a local one.
+    /// Best effort and user-facing only: a backend or peer without the
+    /// request leaves the fields untouched, so callers keep the inferred
+    /// domain. Background loops should not pay this extra round trip.
+    fn annotate_pane_domains_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        _panes: &'a mut [PaneInfo],
+    ) -> WeztermFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
     /// Get a specific pane by ID.
     fn get_pane(&self, pane_id: u64) -> WeztermFuture<'_, PaneInfo>;
 
@@ -1114,6 +1128,31 @@ fn mux_stable_row_to_u32_saturating(value: isize) -> u32 {
     u32::try_from(value).unwrap_or(if value < 0 { 0 } else { u32::MAX })
 }
 
+/// Record the mux-reported owning domain on each pane of one annotated batch.
+/// Entries are positional; one naming a different pane is ignored rather
+/// than attributed to its neighbour.
+#[cfg(all(feature = "vendored", unix))]
+fn apply_pane_domain_entries(panes: &mut [PaneInfo], entries: &[codec::PaneDomainEntryV1]) {
+    for (pane, entry) in panes.iter_mut().zip(entries) {
+        if u64::try_from(entry.pane_id).ok() != Some(pane.pane_id) {
+            continue;
+        }
+        match &entry.outcome {
+            codec::PaneDomainOutcomeV1::Named {
+                domain_id,
+                domain_name,
+            } => {
+                pane.domain_id = u64::try_from(*domain_id).ok();
+                pane.domain_name = Some(domain_name.clone());
+            }
+            codec::PaneDomainOutcomeV1::Unnamed { domain_id } => {
+                pane.domain_id = u64::try_from(*domain_id).ok();
+            }
+            codec::PaneDomainOutcomeV1::Missing => {}
+        }
+    }
+}
+
 #[cfg(all(feature = "vendored", unix))]
 impl From<&mux::tab::PaneEntry> for PaneInfo {
     fn from(entry: &mux::tab::PaneEntry) -> Self {
@@ -1719,6 +1758,50 @@ impl WeztermClient {
             .await?;
         Self::guard_metadata_output_size("cli list", &output)?;
         serde_json::from_str(&output).map_err(|e| WeztermError::ParseError(e.to_string()).into())
+    }
+
+    /// Fill each listed pane's owning domain from the vendored mux (codec 68,
+    /// ft-pdawh), one bounded batch per 256 panes. Best effort and read-only:
+    /// without a mux pool, with the circuit open, or against a pre-v68 mux
+    /// (refused before any byte is written) the panes keep their inferred
+    /// domain, and the circuit breaker is left untouched.
+    #[cfg(all(feature = "vendored", unix))]
+    pub async fn annotate_pane_domains_with_cx(&self, cx: &crate::cx::Cx, panes: &mut [PaneInfo]) {
+        let Some(pool) = self.mux_pool.as_ref() else {
+            return;
+        };
+        if !self.mux_circuit_guard() {
+            return;
+        }
+        for chunk in panes.chunks_mut(codec::MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES) {
+            let Ok(pane_ids) = chunk
+                .iter()
+                .map(|pane| Self::mux_pane_id(pane.pane_id, "pane domain annotation"))
+                .collect::<Result<Vec<_>>>()
+            else {
+                return;
+            };
+            match pool.get_pane_domains_with_cx(cx, pane_ids).await {
+                Ok(response) => apply_pane_domain_entries(chunk, &response.entries),
+                Err(error) => {
+                    tracing::debug!(
+                        failure_class = Self::mux_error_public_code(&error),
+                        "pane domain annotation unavailable; keeping inferred domains"
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Without the vendored mux there is no domain query; panes keep the
+    /// domain the listing backend reported or the inferred one.
+    #[cfg(not(all(feature = "vendored", unix)))]
+    pub async fn annotate_pane_domains_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        _panes: &mut [PaneInfo],
+    ) {
     }
 
     /// Get a specific pane by ID
@@ -3608,7 +3691,7 @@ impl WeztermClient {
         match codec::Pdu::pdu_name_for_ident(request_ident) {
             Some("Ping" | "GetCodecVersion") => MuxOperation::ProtocolHandshake,
             Some("SetClientId") => MuxOperation::ClientRegistration,
-            Some("ListPanes" | "ListPanesCoherent" | "ListPanesOrderedV1") => {
+            Some("ListPanes" | "ListPanesCoherent" | "ListPanesOrderedV1" | "GetPaneDomainsV1") => {
                 MuxOperation::ListPanes
             }
             Some("GetPaneTieredScrollbackStatusesV1") => MuxOperation::ReadTieredScrollbackStatus,
@@ -4209,6 +4292,17 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::list_panes_with_cx(self, cx).await })
     }
 
+    fn annotate_pane_domains_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        panes: &'a mut [PaneInfo],
+    ) -> WeztermFuture<'a, ()> {
+        Box::pin(async move {
+            WeztermClient::annotate_pane_domains_with_cx(self, cx, panes).await;
+            Ok(())
+        })
+    }
+
     fn get_pane(&self, pane_id: u64) -> WeztermFuture<'_, PaneInfo> {
         Box::pin(async move { WeztermClient::get_pane(self, pane_id).await })
     }
@@ -4683,6 +4777,14 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
 
     fn list_panes_with_cx<'a>(&'a self, cx: &'a crate::cx::Cx) -> WeztermFuture<'a, Vec<PaneInfo>> {
         self.as_ref().list_panes_with_cx(cx)
+    }
+
+    fn annotate_pane_domains_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        panes: &'a mut [PaneInfo],
+    ) -> WeztermFuture<'a, ()> {
+        self.as_ref().annotate_pane_domains_with_cx(cx, panes)
     }
 
     fn get_pane_with_cx<'a>(
@@ -5643,6 +5745,55 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::sync::Arc;
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn mux_reported_domains_override_the_cwd_guess() {
+        let pane = |pane_id: u64, cwd: &str| -> PaneInfo {
+            serde_json::from_value(serde_json::json!({
+                "pane_id": pane_id,
+                "tab_id": 1,
+                "window_id": 1,
+                "cwd": cwd,
+            }))
+            .expect("pane fixture")
+        };
+        // A proxied remote pane whose cwd looks local, a local pane whose cwd
+        // names a host, and a pane the mux no longer has.
+        let mut panes = vec![
+            pane(3, "file:///Users/me"),
+            pane(4, "file://build-host/home/me"),
+            pane(5, "file:///tmp"),
+            pane(6, "file:///tmp"),
+        ];
+        let named = |pane_id, domain_id, name: &str| codec::PaneDomainEntryV1 {
+            pane_id,
+            outcome: codec::PaneDomainOutcomeV1::Named {
+                domain_id,
+                domain_name: name.to_string(),
+            },
+        };
+        apply_pane_domain_entries(
+            &mut panes,
+            &[
+                named(3, 7, "trj"),
+                named(4, 0, "local"),
+                codec::PaneDomainEntryV1 {
+                    pane_id: 5,
+                    outcome: codec::PaneDomainOutcomeV1::Unnamed { domain_id: 9 },
+                },
+                // Misaligned entry: never attributed to pane 6.
+                named(99, 1, "elsewhere"),
+            ],
+        );
+        assert_eq!(panes[0].inferred_domain(), "trj");
+        assert_eq!(panes[0].domain_id, Some(7));
+        assert_eq!(panes[1].inferred_domain(), "local");
+        assert_eq!(panes[2].domain_id, Some(9));
+        assert_eq!(panes[2].inferred_domain(), "local");
+        assert_eq!(panes[3].domain_id, None);
+        assert_eq!(panes[3].domain_name, None);
+    }
 
     #[test]
     fn pane_text_tail_counts_content_rows_not_blank_screen_padding() {
@@ -10380,6 +10531,14 @@ impl WeztermInterface for UnifiedClient {
 
     fn list_panes_with_cx<'a>(&'a self, cx: &'a crate::cx::Cx) -> WeztermFuture<'a, Vec<PaneInfo>> {
         self.inner.list_panes_with_cx(cx)
+    }
+
+    fn annotate_pane_domains_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        panes: &'a mut [PaneInfo],
+    ) -> WeztermFuture<'a, ()> {
+        self.inner.annotate_pane_domains_with_cx(cx, panes)
     }
 
     fn get_pane_with_cx<'a>(
