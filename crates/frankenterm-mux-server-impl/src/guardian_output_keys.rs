@@ -289,6 +289,14 @@ pub(crate) trait GuardianHistoricalKeyLookup {
 pub(crate) struct GuardianHistoricalAuthority {
     directory: CapDir,
     lease: AuthorityFileLease,
+    /// The keyring's fast-path snapshot when this lease was taken: the
+    /// validated fingerprint, when it was validated, its activation and cipher.
+    validated_active: Option<(
+        AuthorityFingerprint,
+        std::time::Instant,
+        Activation,
+        GuardianOutputCipher,
+    )>,
 }
 
 impl GuardianHistoricalKeyLookup for GuardianHistoricalAuthority {
@@ -297,6 +305,16 @@ impl GuardianHistoricalKeyLookup for GuardianHistoricalAuthority {
         key_id: [u8; 8],
     ) -> Result<GuardianOutputCipher, GuardianOutputKeyringError> {
         validate_open_authority_lock_file(&self.directory, &self.lease.file)?;
+        // The active key is what the append path authenticates; while the
+        // validated fingerprint still holds, the full inventory would find
+        // exactly the state it validated.
+        if let Some((validated, at, active, cipher)) = &self.validated_active
+            && active.key_id == key_id
+            && at.elapsed() < AUTHORITY_REVALIDATE_INTERVAL
+            && authority_fingerprint(&self.directory, *active).as_ref() == Some(validated)
+        {
+            return Ok(cipher.clone());
+        }
         historical_cipher(&self.directory, key_id)
     }
 }
@@ -373,19 +391,32 @@ impl GuardianOutputKeyring {
     pub(crate) fn historical_authority(
         shared: &Mutex<Self>,
     ) -> Result<GuardianHistoricalAuthority, GuardianOutputKeyringError> {
-        let directory = {
+        let (directory, validated_active) = {
             let keyring = shared
                 .lock()
                 .map_err(|_| GuardianOutputKeyringError::AuthorityChanged)?;
             if !keyring.use_authority_lock || keyring.scoped_authority.is_some() {
                 return Err(GuardianOutputKeyringError::AuthorityChanged);
             }
-            keyring.directory.try_clone()?
+            let validated_active = keyring
+                .validated_authority
+                .map(|(validated, at)| {
+                    keyring
+                        .active_key
+                        .cipher()
+                        .map(|cipher| (validated, at, keyring.active, cipher))
+                })
+                .transpose()?;
+            (keyring.directory.try_clone()?, validated_active)
         };
         // Never wait for a filesystem lease while holding the shared mutex.
         // Rotation may hold that mutex while waiting for earlier readers.
         let lease = AuthorityFileLease::acquire(&directory, false, false)?;
-        Ok(GuardianHistoricalAuthority { directory, lease })
+        Ok(GuardianHistoricalAuthority {
+            directory,
+            lease,
+            validated_active,
+        })
     }
 
     /// Return the process-wide guardian output authority for this securely
@@ -2757,6 +2788,54 @@ mod tests {
         assert!(
             keyring.latest_active_cipher().is_err(),
             "an in-place key rewrite must bypass the fast path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn historical_lookup_fast_path_rechecks_the_active_key_on_disk() {
+        use std::time::{Duration, Instant};
+
+        let root = tempfile::tempdir().expect("create historical fast-path root");
+        let scrollback = root.path().join("scrollback-lines");
+        std::fs::create_dir(&scrollback).expect("create scrollback directory");
+        let shared = GuardianOutputKeyring::shared_scrollback_sibling(&scrollback)
+            .expect("shared authority");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let active = loop {
+            let mut keyring = shared.lock().unwrap();
+            let active = keyring.latest_active_cipher().unwrap().key_id();
+            if keyring.validated_authority.is_some() {
+                break active;
+            }
+            drop(keyring);
+            assert!(Instant::now() < deadline, "fast path never engaged");
+            std::thread::sleep(Duration::from_millis(200));
+        };
+
+        let historical = GuardianOutputKeyring::historical_authority(&shared).unwrap();
+        assert!(historical.validated_active.is_some());
+        assert_eq!(
+            historical.cipher_for_key_id(active).unwrap().key_id(),
+            active
+        );
+        assert!(matches!(
+            historical.cipher_for_key_id([0x11; 8]),
+            Err(GuardianOutputKeyringError::UnactivatedKey)
+        ));
+
+        let mut options = CapOpenOptions::new();
+        options.write(true).follow(FollowSymlinks::No);
+        let mut file = historical
+            .directory
+            .open_with(key_name(active), &options)
+            .expect("open active key for mutation");
+        file.write_all(&[0x5a; GuardianOutputCipher::KEY_BYTES])
+            .expect("change key material without changing inode");
+        file.sync_all().expect("synchronize changed key");
+        assert!(
+            historical.cipher_for_key_id(active).is_err(),
+            "a rewritten active key must fail the historical lookup"
         );
     }
 
