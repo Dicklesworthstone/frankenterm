@@ -667,12 +667,17 @@ pub async fn enrich_active_agent_sessions_with_cx(
     let sessions = storage.get_active_sessions_with_cx(cx).await?;
     attempted_at.retain(|id, _| sessions.iter().any(|session| session.id == *id));
     let mut outcome = CassEnrichmentOutcome::default();
-    let due = sessions.into_iter().filter(|session| {
-        attempted_at
-            .get(&session.id)
-            .is_none_or(|last| now_ms.saturating_sub(*last) >= CASS_ENRICHMENT_RETRY_MS)
-    });
-    for session in due.take(budget) {
+    let due: Vec<AgentSessionRecord> = sessions
+        .into_iter()
+        .filter(|session| {
+            cass_agent_for_session(&session.agent_type).is_some()
+                && attempted_at
+                    .get(&session.id)
+                    .is_none_or(|last| now_ms.saturating_sub(*last) >= CASS_ENRICHMENT_RETRY_MS)
+        })
+        .take(budget)
+        .collect();
+    for session in due {
         let Some(agent) = cass_agent_for_session(&session.agent_type) else {
             continue;
         };
