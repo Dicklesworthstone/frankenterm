@@ -4270,7 +4270,30 @@ impl ClientDomain {
                 // window since the remote-window mapping was recorded.
                 // Reattaching through that old mapping both discards user
                 // intent and fails the mux's exclusive-parent invariant.
-                if mux.window_containing_tab(tab.tab_id()).is_some() {
+                if let Some(containing_window_id) = mux.window_containing_tab(tab.tab_id()) {
+                    // A restored layout places tabs in local windows before
+                    // any snapshot records which remote window each one shows.
+                    // Without a live mapping, a spawn or tab move that targets
+                    // this window reaches the server with no window id and
+                    // opens a new one. Adopt the containing window unless it
+                    // already shows another remote window.
+                    let mapped_window_is_live = inner
+                        .remote_to_local_window(remote_window_id)
+                        .is_some_and(|local_window_id| mux.get_window(local_window_id).is_some());
+                    if !mapped_window_is_live
+                        && inner.local_to_remote_window(containing_window_id).is_none()
+                    {
+                        log::debug!(
+                            "domain {}: remote window {} adopts local window {} from its tabs",
+                            inner.local_domain_id,
+                            remote_window_id,
+                            containing_window_id
+                        );
+                        inner.record_remote_to_local_window_mapping(
+                            remote_window_id,
+                            containing_window_id,
+                        );
+                    }
                     continue;
                 }
 
@@ -7088,6 +7111,54 @@ mod tests {
         assert_eq!(inner.remote_window_for_spawn(&mux, *empty), None);
         inner.record_remote_to_local_window_mapping(41, *empty);
         assert_eq!(inner.remote_window_for_spawn(&mux, *empty), Some(41));
+    }
+
+    #[test]
+    fn snapshot_maps_a_remote_window_to_the_local_window_holding_its_tabs() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_032);
+        let _domain = register_test_client_domain(&mux, &inner);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("initial topology should attach");
+        let first_window_id = inner
+            .remote_to_local_window(41)
+            .expect("remote window should map locally");
+        let tab_id = inner
+            .remote_to_local_tab_id(51)
+            .expect("remote tab should map locally");
+
+        // A restored layout moves the tab into another local window, and the
+        // window it left closes.
+        let restored = mux.new_empty_window(Some("ops".to_string()), None);
+        let restored_window_id = *restored;
+        mux.move_tab_between_windows(tab_id, restored_window_id, None)
+            .expect("move the tab into the restored window");
+        drop(restored);
+        mux.kill_window(first_window_id);
+        assert!(mux.get_window(first_window_id).is_none());
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("resync should apply");
+
+        assert_eq!(
+            inner.local_to_remote_window(restored_window_id),
+            Some(41),
+            "a spawn or tab move targeting the restored window must reach remote window 41"
+        );
+        assert_eq!(mux.window_containing_tab(tab_id), Some(restored_window_id));
     }
 
     #[test]
