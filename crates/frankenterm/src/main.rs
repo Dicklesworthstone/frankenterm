@@ -5903,6 +5903,10 @@ enum RobotFleetCommands {
         /// Caller-supplied idempotency key for durable non-dry-run replay
         #[arg(long)]
         idempotency_key: Option<String>,
+
+        /// Scale up even when the running watcher's admission verdict is `shed`
+        #[arg(long)]
+        force_admission: bool,
     },
     /// Rebalance work across agents
     Rebalance {
@@ -22252,6 +22256,7 @@ fn robot_fleet_error_with_data(
 async fn robot_fleet_command_response(
     db_path: &str,
     config: &frankenterm_core::config::Config,
+    ipc_socket_path: &Path,
     command: &RobotFleetCommands,
     elapsed_ms: u64,
 ) -> RobotResponse<serde_json::Value> {
@@ -22293,6 +22298,7 @@ async fn robot_fleet_command_response(
             target_count,
             dry_run,
             idempotency_key,
+            force_admission,
         } => {
             if let Err(response) =
                 robot_fleet_validate_idempotency_key(idempotency_key.as_deref(), elapsed_ms)
@@ -22315,6 +22321,39 @@ async fn robot_fleet_command_response(
                 &claimed_work_by_pane,
                 work_queue_error,
             );
+            // ft-xldrk: a live scale-up consults the running watcher's
+            // admission verdict before spawning, like `robot profile apply`.
+            if let Some(plan) = plan.as_ref()
+                && !*dry_run
+                && plan.steps.iter().any(|step| {
+                    matches!(
+                        step.action,
+                        frankenterm_core::fleet_mutation::FleetMutationAction::SpawnAgent { .. }
+                    )
+                })
+            {
+                let admission = watcher_spawn_admission(ipc_socket_path, now_ms()).await;
+                let refused = spawn_admission_refuses(&admission, *force_admission);
+                let reasons = admission_reason_list(&admission);
+                if let Some(object) = data.as_object_mut() {
+                    object.insert("admission".to_string(), admission);
+                }
+                if refused {
+                    return robot_fleet_error_with_data(
+                        ROBOT_ERR_ADMISSION_SHED,
+                        format!(
+                            "The watcher's admission verdict is shed ({reasons}); no agents were spawned"
+                        ),
+                        Some(
+                            "Wait for the resource pressure to clear (ft doctor --json shows the verdict), \
+                             or rerun with --force-admission."
+                                .to_string(),
+                        ),
+                        data,
+                        elapsed_ms,
+                    );
+                }
+            }
             if let Some(plan) = plan {
                 match robot_fleet_execute_plan_with_durable_receipt(
                     db_path,
@@ -40527,9 +40566,15 @@ fn attach_runtime_health_payload(
 async fn load_runtime_health_snapshot(
     layout: &frankenterm_core::config::WorkspaceLayout,
 ) -> Option<frankenterm_core::crash::HealthSnapshot> {
+    load_runtime_health_snapshot_at(&layout.ipc_socket_path).await
+}
+
+async fn load_runtime_health_snapshot_at(
+    ipc_socket_path: &Path,
+) -> Option<frankenterm_core::crash::HealthSnapshot> {
     #[cfg(unix)]
     {
-        let client = frankenterm_core::ipc::IpcClient::new(&layout.ipc_socket_path);
+        let client = frankenterm_core::ipc::IpcClient::new(ipc_socket_path);
         // ft-xbnl0.2.3 tick 227: status_with_cx routes through
         // send_request_with_id_with_cx — full cx-first IPC path.
         let cx =
@@ -40551,7 +40596,7 @@ async fn load_runtime_health_snapshot(
     }
 
     #[cfg(not(unix))]
-    let _ = layout;
+    let _ = ipc_socket_path;
 
     frankenterm_core::crash::HealthSnapshot::get_global()
 }
@@ -40564,11 +40609,13 @@ const SPAWN_ADMISSION_MAX_AGE_MS: u64 = 90_000;
 /// (ft-xldrk), as reported beside spawn results. `state` is the verdict action
 /// (`admit`, `defer`, `degrade`, `shed`) or `unavailable` when no watcher
 /// answered, it published no verdict, or its snapshot is stale.
-async fn watcher_spawn_admission(
-    layout: &frankenterm_core::config::WorkspaceLayout,
-    now_ms: u64,
-) -> serde_json::Value {
-    spawn_admission_from_snapshot(load_runtime_health_snapshot(layout).await.as_ref(), now_ms)
+async fn watcher_spawn_admission(ipc_socket_path: &Path, now_ms: u64) -> serde_json::Value {
+    spawn_admission_from_snapshot(
+        load_runtime_health_snapshot_at(ipc_socket_path)
+            .await
+            .as_ref(),
+        now_ms,
+    )
 }
 
 fn spawn_admission_from_snapshot(
@@ -59259,6 +59306,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             let response = robot_fleet_command_response(
                                 &ctx.effective.paths.db_path,
                                 &config,
+                                Path::new(&ctx.effective.paths.ipc_socket_path),
                                 &command,
                                 elapsed_ms(start),
                             )
@@ -59900,7 +59948,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             // ft-xldrk: consult the running watcher's global
                             // admission verdict before spawning.
                             let admission = if live_apply {
-                                watcher_spawn_admission(&layout, now_ms()).await
+                                watcher_spawn_admission(&layout.ipc_socket_path, now_ms()).await
                             } else {
                                 serde_json::Value::Null
                             };
