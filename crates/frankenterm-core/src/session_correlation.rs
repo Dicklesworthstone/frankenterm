@@ -627,6 +627,88 @@ pub async fn ensure_active_agent_session_with_cx(
     storage.upsert_agent_session_with_cx(cx, record).await
 }
 
+/// Minimum spacing between cass attempts for one session.
+pub const CASS_ENRICHMENT_RETRY_MS: i64 = 5 * 60 * 1_000;
+
+/// What one enrichment pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CassEnrichmentOutcome {
+    /// Unlinked sessions sent through cass correlation.
+    pub correlated: usize,
+    /// Linked sessions whose token summary was refreshed.
+    pub refreshed: usize,
+    /// Attempts that failed (cass missing, search error, storage error).
+    pub failed: usize,
+}
+
+fn cass_agent_for_session(agent_type: &str) -> Option<CassAgent> {
+    match agent_type {
+        "codex" => Some(CassAgent::Codex),
+        "claude_code" => Some(CassAgent::ClaudeCode),
+        "gemini" => Some(CassAgent::Gemini),
+        _ => None,
+    }
+}
+
+/// Enrich open `agent_sessions` rows from cass (ft-ngbfu follow-on): an
+/// unlinked session is correlated (external id), a linked one gets its token
+/// summary refreshed (the refresh itself honors its minimum interval). At most
+/// `budget` sessions per pass, and each session at most every
+/// [`CASS_ENRICHMENT_RETRY_MS`] (`attempted_at` is the caller's per-process
+/// memory). A missing cass binary only counts as failures.
+pub async fn enrich_active_agent_sessions_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    cass: &CassClient,
+    attempted_at: &mut std::collections::HashMap<i64, i64>,
+    now_ms: i64,
+    budget: usize,
+) -> Result<CassEnrichmentOutcome, crate::Error> {
+    let sessions = storage.get_active_sessions_with_cx(cx).await?;
+    attempted_at.retain(|id, _| sessions.iter().any(|session| session.id == *id));
+    let mut outcome = CassEnrichmentOutcome::default();
+    let due = sessions.into_iter().filter(|session| {
+        attempted_at
+            .get(&session.id)
+            .is_none_or(|last| now_ms.saturating_sub(*last) >= CASS_ENRICHMENT_RETRY_MS)
+    });
+    for session in due.take(budget) {
+        let Some(agent) = cass_agent_for_session(&session.agent_type) else {
+            continue;
+        };
+        attempted_at.insert(session.id, now_ms);
+        let succeeded = if session.external_id.is_none() {
+            outcome.correlated += 1;
+            correlate_and_persist_for_pane_with_cx(
+                cx,
+                storage,
+                cass,
+                session.pane_id,
+                agent,
+                session.started_at,
+                &CassCorrelationOptions::default(),
+            )
+            .await
+            .is_ok_and(|correlation| correlation.status != CorrelationStatus::Error)
+        } else {
+            outcome.refreshed += 1;
+            refresh_cass_summary_for_session_with_cx(
+                cx,
+                storage,
+                cass,
+                session.id,
+                &CassSummaryRefreshOptions::default(),
+            )
+            .await
+            .is_ok()
+        };
+        if !succeeded {
+            outcome.failed += 1;
+        }
+    }
+    Ok(outcome)
+}
+
 /// End every open `agent_sessions` row for `pane_id` (ft-ngbfu), e.g. when the
 /// pane closes. Returns how many sessions were ended.
 pub async fn end_active_agent_sessions_with_cx(
@@ -1398,6 +1480,103 @@ mod tests {
                     .await
                     .unwrap(),
                 0
+            );
+
+            handle.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn cass_enrichment_is_budgeted_spaced_and_survives_a_missing_cass() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("ft.db").to_string_lossy().to_string();
+            let handle = StorageHandle::new(&db_path).await.unwrap();
+            for pane_id in [1, 2, 3] {
+                handle
+                    .upsert_pane(PaneRecord {
+                        pane_id,
+                        pane_uuid: None,
+                        domain: "local".to_string(),
+                        window_id: None,
+                        tab_id: None,
+                        title: None,
+                        cwd: None,
+                        tty_name: None,
+                        first_seen_at: 1,
+                        last_seen_at: 1,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let cx = crate::cx::for_testing();
+            for (pane_id, agent) in [(1, "codex"), (2, "claude_code"), (3, "unknown")] {
+                ensure_active_agent_session_with_cx(&cx, &handle, pane_id, agent, 1_000)
+                    .await
+                    .unwrap();
+            }
+            let cass = CassClient::new().with_binary("/nonexistent/ft-test-cass");
+            let mut attempted = std::collections::HashMap::new();
+
+            let first = enrich_active_agent_sessions_with_cx(
+                &cx,
+                &handle,
+                &cass,
+                &mut attempted,
+                10_000,
+                1,
+            )
+            .await
+            .unwrap();
+            assert_eq!(first.correlated + first.refreshed, 1, "budget of one");
+            assert_eq!(attempted.len(), 1);
+
+            let second = enrich_active_agent_sessions_with_cx(
+                &cx,
+                &handle,
+                &cass,
+                &mut attempted,
+                10_000,
+                5,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                second.correlated, 1,
+                "the other cass-indexed session; unknown agents are skipped"
+            );
+            let third = enrich_active_agent_sessions_with_cx(
+                &cx,
+                &handle,
+                &cass,
+                &mut attempted,
+                10_000 + CASS_ENRICHMENT_RETRY_MS - 1,
+                5,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                third,
+                CassEnrichmentOutcome::default(),
+                "retry spacing holds"
+            );
+            let later = enrich_active_agent_sessions_with_cx(
+                &cx,
+                &handle,
+                &cass,
+                &mut attempted,
+                10_000 + CASS_ENRICHMENT_RETRY_MS,
+                5,
+            )
+            .await
+            .unwrap();
+            assert_eq!(later.correlated, 2, "both are due again");
+            assert!(
+                handle.get_active_sessions().await.unwrap().len() == 3,
+                "a failed enrichment never ends or drops a session"
             );
 
             handle.shutdown().await.unwrap();

@@ -5976,6 +5976,9 @@ impl ObservationRuntime {
                 None::<crate::memory_pressure::ResourcePressureActionReceiptReport>;
             // ft-wl9rx: totals at the previous health tick, for output rates.
             let mut previous_pane_output = None::<(u64, HashMap<u64, PaneOutputTotals>)>;
+            // Open agent sessions are enriched from cass a few per health tick.
+            let cass_client = crate::cass::CassClient::new();
+            let mut cass_attempted_at: HashMap<i64, i64> = HashMap::new();
 
             loop {
                 if !first_tick {
@@ -6969,6 +6972,28 @@ impl ObservationRuntime {
                     RuntimeLockMemoryTelemetrySnapshot::update_global(
                         metrics.lock_memory_snapshot(),
                     );
+                    match crate::session_correlation::enrich_active_agent_sessions_with_cx(
+                        &loop_cx,
+                        &storage,
+                        &cass_client,
+                        &mut cass_attempted_at,
+                        epoch_ms(),
+                        2,
+                    )
+                    .await
+                    {
+                        Ok(outcome) if outcome.failed > 0 => debug!(
+                            correlated = outcome.correlated,
+                            refreshed = outcome.refreshed,
+                            failed = outcome.failed,
+                            "agent session cass enrichment incomplete"
+                        ),
+                        Ok(_) => {}
+                        Err(error) if is_runtime_cancellation(&error) => break,
+                        Err(error) => {
+                            debug!(error = %error, "agent session cass enrichment skipped")
+                        }
+                    }
                     let pane_output = metrics
                         .pane_output_totals_retaining(&observed_pane_ids.iter().copied().collect());
                     PaneOutputRatesSnapshot::update_global(PaneOutputRatesSnapshot::between(
