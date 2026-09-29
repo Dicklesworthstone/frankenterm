@@ -150,6 +150,8 @@ fn connect() -> anyhow::Result<Client> {
     client.context("connect to the FrankenTerm mux socket")
 }
 
+/// Every pane in a listing: the tiled panes of each tab tree, then the
+/// floating panes, which the listing carries separately.
 fn pane_entries(panes: ListPanesResponse) -> Vec<PaneEntry> {
     let mut out = vec![];
     for tabroot in panes.tabs {
@@ -164,6 +166,7 @@ fn pane_entries(panes: ListPanesResponse) -> Vec<PaneEntry> {
             }
         }
     }
+    out.extend(panes.floating_panes.into_iter().map(|floating| floating.pane));
     out
 }
 
@@ -315,4 +318,64 @@ async fn run_list(client: &Client, args: ListArgs) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mux::renderable::StableCursorPosition;
+    use mux::tab::PaneNode;
+    use std::collections::HashMap;
+    use wezterm_term::TerminalSize;
+
+    fn entry(window_id: WindowId, tab_id: usize, pane_id: usize, workspace: &str) -> PaneEntry {
+        PaneEntry {
+            window_id,
+            tab_id,
+            pane_id,
+            title: format!("pane {pane_id}"),
+            size: TerminalSize {
+                cols: 80,
+                rows: 24,
+                pixel_width: 800,
+                pixel_height: 480,
+                dpi: 96,
+            },
+            working_dir: None,
+            alt_screen_active: false,
+            is_active_pane: true,
+            is_zoomed_pane: false,
+            workspace: workspace.to_string(),
+            cursor_pos: StableCursorPosition::default(),
+            physical_top: 0,
+            top_row: 0,
+            left_col: 0,
+            tty_name: None,
+        }
+    }
+
+    #[test]
+    fn pane_entries_include_floating_panes() {
+        let listing = ListPanesResponse {
+            tabs: vec![PaneNode::Leaf(entry(1, 10, 100, "default"))],
+            tab_titles: vec!["tab".to_string()],
+            window_titles: HashMap::new(),
+            floating_panes: vec![codec::FloatingPaneSnapshotEntry {
+                pane: entry(1, 10, 101, "default"),
+                rect: mux::tab::FloatingPaneRect {
+                    left: 2,
+                    top: 2,
+                    width: 20,
+                    height: 8,
+                },
+                z_order: 0,
+                visible: true,
+                pinned: false,
+                opacity: 1.0,
+                focused: false,
+            }],
+        };
+        let ids: Vec<_> = pane_entries(listing).iter().map(|e| e.pane_id).collect();
+        assert_eq!(ids, vec![100, 101]);
+    }
 }
