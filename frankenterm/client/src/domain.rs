@@ -1338,16 +1338,22 @@ impl ClientInner {
         map.get_remote(&local_window_id).copied()
     }
 
-    /// The remote window a new tab spawned from `local_window_id` belongs in.
+    /// The remote window that a spawn or tab move aimed at `local_window_id`
+    /// belongs in.
     ///
     /// The GUI can move tabs between local windows (a restored layout does
     /// this at startup), and the window mapping does not follow those moves.
     /// So the answer comes from the remote tabs the window actually holds,
     /// active tab first, using the owners from the latest topology snapshot.
-    /// The mapping is then pointed at this window, so later tabs of that
-    /// remote window land where the user is looking. With no tab of this
-    /// client in the window, the recorded mapping is the answer.
-    fn remote_window_for_spawn(&self, mux: &Mux, local_window_id: WindowId) -> Option<WindowId> {
+    /// With no tab of this client in the window, the recorded mapping is the
+    /// answer.
+    ///
+    /// This only reads. One local window can hold tabs of several remote
+    /// windows, which the one-to-one window mapping cannot express, so an
+    /// operation keeps its own requested local window and places its result
+    /// there (see `place_tab_in_requested_window`) instead of repointing the
+    /// shared mapping.
+    fn resolve_remote_window(&self, mux: &Mux, local_window_id: WindowId) -> Option<WindowId> {
         let tabs: Vec<Arc<Tab>> = {
             let window = mux.get_window(local_window_id)?;
             window
@@ -1374,19 +1380,7 @@ impl ClientInner {
                 .iter()
                 .find_map(|remote_tab_id| owners.get(remote_tab_id).copied())
         };
-        let Some(remote_window_id) = derived else {
-            return self.local_to_remote_window(local_window_id);
-        };
-        if self.remote_to_local_window(remote_window_id) != Some(local_window_id) {
-            log::debug!(
-                "domain {}: remote window {} now shows in local window {}",
-                self.local_domain_id,
-                remote_window_id,
-                local_window_id
-            );
-            self.record_remote_to_local_window_mapping(remote_window_id, local_window_id);
-        }
-        Some(remote_window_id)
+        derived.or_else(|| self.local_to_remote_window(local_window_id))
     }
 
     pub fn remote_to_local_pane_id(&self, mux: &Mux, remote_pane_id: PaneId) -> Option<PaneId> {
@@ -2325,6 +2319,42 @@ fn workspace_for_spawn_window(mux: &Mux, window_id: WindowId) -> String {
     mux.get_window(window_id)
         .map(|window| window.get_workspace().to_string())
         .unwrap_or_else(|| mux.active_workspace())
+}
+
+/// Put the tab a spawn or move produced into the local window the operation
+/// was aimed at. The snapshot places a new tab by the window mapping, which
+/// can name another local window when one remote window's tabs are spread
+/// over several local windows. Each operation carries its own requested
+/// window, so overlapping operations cannot redirect each other.
+fn place_tab_in_requested_window(
+    mux: &Mux,
+    tab: &Arc<Tab>,
+    requested_local_window: WindowId,
+) -> anyhow::Result<()> {
+    if mux.get_window(requested_local_window).is_none() {
+        // The requested window closed while the request was in flight.
+        // Keep the tab wherever the snapshot put it.
+        return Ok(());
+    }
+    match mux.window_containing_tab(tab.tab_id()) {
+        Some(current) if current == requested_local_window => Ok(()),
+        Some(_) => mux
+            .move_tab_between_windows(tab.tab_id(), requested_local_window, None)
+            .with_context(|| {
+                format!(
+                    "place tab {} in requested local window {requested_local_window}",
+                    tab.tab_id()
+                )
+            }),
+        None => mux
+            .add_tab_to_window(tab, requested_local_window)
+            .with_context(|| {
+                format!(
+                    "attach tab {} to requested local window {requested_local_window}",
+                    tab.tab_id()
+                )
+            }),
+    }
 }
 
 /// Move one live pane of this client out of the local tab that mirrors its old
@@ -4927,8 +4957,20 @@ impl Domain for ClientDomain {
         );
         let remote_pane_id = Self::exact_remote_pane_id(pane_guard, &inner, "move target")?;
 
-        let remote_window_id =
-            window_id.and_then(|local_window| inner.local_to_remote_window(local_window));
+        // An explicit destination must resolve to a remote window. Sending
+        // None would ask the server for a new window instead.
+        let remote_window_id = match window_id {
+            Some(local_window) => Some(inner.resolve_remote_window(mux, local_window).ok_or_else(
+                || {
+                    anyhow!(
+                        "local window {local_window} shows no remote window of domain {}; \
+                         cannot move a pane there",
+                        inner.local_domain_id
+                    )
+                },
+            )?),
+            None => None,
+        };
 
         let rpc = inner.client.rpc_scope();
         let result = rpc
@@ -4963,6 +5005,13 @@ impl Domain for ClientDomain {
                 .get_tab(local_tab_id)
                 .ok_or_else(|| anyhow!("local tab {local_tab_id} is invalid"))?;
 
+            let local_win_id = match window_id {
+                Some(requested) => {
+                    place_tab_in_requested_window(mux, &tab, requested)?;
+                    mux.window_containing_tab(tab.tab_id()).unwrap_or(local_win_id)
+                }
+                None => local_win_id,
+            };
             pane_guard.capture_move_receipt(tab, local_win_id).map(Some)
         })
         .map_err(anyhow::Error::new)?
@@ -4982,7 +5031,7 @@ impl Domain for ClientDomain {
 
         self.ensure_mux_owner(mux)?;
         let workspace = workspace_for_spawn_window(mux, window);
-        let remote_window_id = inner.remote_window_for_spawn(mux, window);
+        let remote_window_id = inner.resolve_remote_window(mux, window);
 
         let rpc = inner.client.rpc_scope();
         let result = rpc
@@ -5009,6 +5058,7 @@ impl Domain for ClientDomain {
         rpc.commit_sync(RpcConsumerKind::SpawnResolution, || {
             let (tab, _pane, _window_id) =
                 Self::resolve_remote_spawn_entities(mux, &inner, result)?;
+            place_tab_in_requested_window(mux, &tab, window)?;
             Ok(tab)
         })
         .map_err(anyhow::Error::new)?
@@ -7133,12 +7183,102 @@ mod tests {
         assert_eq!(inner.local_to_remote_window(*layout_window), None);
 
         assert_eq!(
-            inner.remote_window_for_spawn(&mux, *layout_window),
+            inner.resolve_remote_window(&mux, *layout_window),
             Some(41),
             "a tab spawned from the layout window must join remote window 41"
         );
-        assert_eq!(inner.remote_to_local_window(41), Some(*layout_window));
-        assert_eq!(inner.local_to_remote_window(*layout_window), Some(41));
+        // Resolution only reads: the mapping of window 41 is not repointed,
+        // so another local window that shows window 41 keeps its mapping.
+        assert_eq!(inner.remote_to_local_window(41), Some(original_window));
+    }
+
+    #[test]
+    fn resolving_one_remote_window_keeps_another_remote_windows_mapping() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_035);
+        let _domain = register_test_client_domain(&mux, &inner);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            listing_with_panes(&[(41, 51, 61), (42, 52, 62)]),
+            None,
+        )
+        .expect("two windows should attach");
+        let window_41 = inner.remote_to_local_window(41).expect("window 41 maps");
+        let tab_52 = inner.remote_to_local_tab_id(52).expect("tab 52 maps");
+
+        // A restored layout puts window 42's tab into window 41's local
+        // window, next to window 41's own tab, and makes it the active tab.
+        mux.move_tab_between_windows(tab_52, window_41, None)
+            .expect("move tab 52 into window 41's local window");
+        let index = mux
+            .get_window(window_41)
+            .expect("window 41 exists")
+            .idx_by_id(tab_52)
+            .expect("tab 52 is in window 41");
+        mux.activate_tab_at_index(window_41, index, true)
+            .expect("activate tab 52");
+
+        assert_eq!(inner.resolve_remote_window(&mux, window_41), Some(42));
+        assert_eq!(
+            inner.remote_to_local_window(41),
+            Some(window_41),
+            "resolving window 42 must not erase window 41's mapping"
+        );
+    }
+
+    #[test]
+    fn a_spawned_tab_lands_in_the_window_its_request_named() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_036);
+        let _domain = register_test_client_domain(&mux, &inner);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("remote topology should attach");
+        let mapped_window = inner.remote_to_local_window(41).expect("window 41 maps");
+        let tab_51 = inner.remote_to_local_tab_id(51).expect("tab 51 maps");
+
+        // Two local windows show remote window 41: the mapped one keeps an
+        // extra tab, and the layout window holds tab 51. Two spawns into
+        // window 41 overlap, one from each local window.
+        let layout_window = mux.new_empty_window(Some("ops".to_string()), None);
+        let layout_window_id = *layout_window;
+        mux.move_tab_between_windows(tab_51, layout_window_id, None)
+            .expect("move tab 51 into the layout window");
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            listing_with_panes(&[(41, 51, 61), (41, 53, 63), (41, 54, 64)]),
+            None,
+        )
+        .expect("the server reports both spawned tabs");
+        let tab_53 = mux
+            .get_tab(inner.remote_to_local_tab_id(53).expect("tab 53 maps"))
+            .expect("tab 53 mirror");
+        let tab_54 = mux
+            .get_tab(inner.remote_to_local_tab_id(54).expect("tab 54 maps"))
+            .expect("tab 54 mirror");
+
+        // Each operation places its own result by its own request.
+        place_tab_in_requested_window(&mux, &tab_53, layout_window_id)
+            .expect("place the layout window's spawn");
+        place_tab_in_requested_window(&mux, &tab_54, mapped_window)
+            .expect("place the mapped window's spawn");
+
+        assert_eq!(mux.window_containing_tab(tab_53.tab_id()), Some(layout_window_id));
+        assert_eq!(mux.window_containing_tab(tab_54.tab_id()), Some(mapped_window));
+        assert_eq!(mux.window_containing_tab(tab_51), Some(layout_window_id));
     }
 
     #[test]
@@ -7150,9 +7290,9 @@ mod tests {
         let _domain = register_test_client_domain(&mux, &inner);
 
         let empty = mux.new_empty_window(Some("ops".to_string()), None);
-        assert_eq!(inner.remote_window_for_spawn(&mux, *empty), None);
+        assert_eq!(inner.resolve_remote_window(&mux, *empty), None);
         inner.record_remote_to_local_window_mapping(41, *empty);
-        assert_eq!(inner.remote_window_for_spawn(&mux, *empty), Some(41));
+        assert_eq!(inner.resolve_remote_window(&mux, *empty), Some(41));
     }
 
     fn listing_with_panes(placements: &[(WindowId, TabId, PaneId)]) -> ListPanesResponse {
