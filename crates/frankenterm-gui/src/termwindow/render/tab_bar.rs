@@ -138,7 +138,8 @@ impl crate::TermWindow {
         // The bar holds whole rows only, so the window height is rarely an
         // exact multiple of the cell height. Paint the leftover strip under
         // the last row in the bar's background, or a transparent window
-        // shows through it.
+        // shows through it. The alpha matches the rows above: they draw the
+        // same non-default background at text_background_opacity.
         let rows_bottom = top_pixel_y + (lines.len() as f32 * cell_height);
         let bar_bottom = self.dimensions.pixel_height as f32 - border.bottom.get() as f32;
         if bar_bottom > rows_bottom {
@@ -152,7 +153,8 @@ impl crate::TermWindow {
                 .resolve_bg(ColorAttribute::TrueColorWithDefaultFallback(
                     *colors.background(),
                 ))
-                .to_linear();
+                .to_linear()
+                .mul_alpha(self.config.text_background_opacity);
             self.filled_rectangle(
                 layers,
                 0,
