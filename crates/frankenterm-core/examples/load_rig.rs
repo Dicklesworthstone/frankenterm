@@ -246,7 +246,10 @@ fn run_storage_probe(pane_count: u64) -> Result<ReplayCorpusStorageProbe, String
         .build()
         .map_err(|error| format!("runtime: {error}"))?;
     runtime
-        .block_on(run_replay_corpus_storage_probe(&corpus, &db_path))
+        .block_on(async {
+            let cx = frankenterm_core::cx::for_request();
+            run_replay_corpus_storage_probe(&cx, &corpus, &db_path).await
+        })
         .map_err(|error| format!("storage probe failed: {error}"))
 }
 

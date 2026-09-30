@@ -901,10 +901,12 @@ pub struct ReplayCorpusStorageProbe {
 /// `db_path` (a fresh file) and measure it. Frames are appended in corpus
 /// order, one `append_segment` per frame, as the capture loop does.
 pub async fn run_replay_corpus_storage_probe(
+    cx: &crate::cx::Cx,
     corpus: &LargeSwarmReplayCorpus,
     db_path: &std::path::Path,
 ) -> crate::Result<ReplayCorpusStorageProbe> {
-    let storage = crate::storage::StorageHandle::new(&db_path.to_string_lossy()).await?;
+    let storage =
+        crate::storage::StorageHandle::new_with_cx(cx, &db_path.to_string_lossy()).await?;
     let mut pane_ids: BTreeSet<u64> = BTreeSet::new();
     for event in &corpus.events {
         if matches!(event.payload, RecorderEventPayload::EgressOutput { .. }) {
@@ -913,21 +915,24 @@ pub async fn run_replay_corpus_storage_probe(
     }
     for &pane_id in &pane_ids {
         storage
-            .upsert_pane(crate::storage::PaneRecord {
-                pane_id,
-                pane_uuid: None,
-                domain: "local".to_string(),
-                window_id: None,
-                tab_id: None,
-                title: Some(format!("load-rig-{pane_id}")),
-                cwd: None,
-                tty_name: None,
-                first_seen_at: 0,
-                last_seen_at: 0,
-                observed: true,
-                ignore_reason: None,
-                last_decision_at: None,
-            })
+            .upsert_pane_with_cx(
+                cx,
+                crate::storage::PaneRecord {
+                    pane_id,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: Some(format!("load-rig-{pane_id}")),
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: 0,
+                    last_seen_at: 0,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                },
+            )
             .await?;
     }
 
@@ -947,7 +952,9 @@ pub async fn run_replay_corpus_storage_probe(
                 .to_string();
         }
         let append_started = std::time::Instant::now();
-        storage.append_segment(event.pane_id, text, None).await?;
+        storage
+            .append_segment_with_cx(cx, event.pane_id, text, None)
+            .await?;
         latencies_us.push(u64::try_from(append_started.elapsed().as_micros()).unwrap_or(u64::MAX));
         bytes_written = bytes_written.saturating_add(text.len() as u64);
     }
@@ -955,9 +962,9 @@ pub async fn run_replay_corpus_storage_probe(
     let fts_probe_hits = if fts_probe_term.is_empty() {
         0
     } else {
-        storage.search(&fts_probe_term).await?.len() as u64
+        storage.search_with_cx(cx, &fts_probe_term).await?.len() as u64
     };
-    storage.shutdown().await?;
+    storage.shutdown_with_cx(cx).await?;
 
     latencies_us.sort_unstable();
     let pct = |p: usize| -> u64 {
@@ -1150,10 +1157,10 @@ mod tests {
             .build()
             .expect("runtime");
         let probe = runtime
-            .block_on(run_replay_corpus_storage_probe(
-                &corpus,
-                &dir.path().join("probe.db"),
-            ))
+            .block_on(async {
+                let cx = crate::cx::for_request();
+                run_replay_corpus_storage_probe(&cx, &corpus, &dir.path().join("probe.db")).await
+            })
             .expect("storage probe");
 
         assert_eq!(probe.segments_written, frames);
