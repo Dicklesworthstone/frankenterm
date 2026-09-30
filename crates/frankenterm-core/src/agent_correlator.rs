@@ -235,6 +235,9 @@ pub enum DetectionSource {
     PaneTitle,
     /// Detected from foreground process name.
     ProcessName,
+    /// Recognized from the agent TUI on the pane's own screen, for panes
+    /// whose title and process name identify nothing (GH #105).
+    ScreenText,
 }
 
 impl AgentCorrelator {
@@ -1783,6 +1786,7 @@ mod tests {
             DetectionSource::PatternEngine,
             DetectionSource::PaneTitle,
             DetectionSource::ProcessName,
+            DetectionSource::ScreenText,
         ] {
             let json = serde_json::to_string(&src).unwrap();
             let back: DetectionSource = serde_json::from_str(&json).unwrap();

@@ -159,6 +159,7 @@ proptest! {
             DetectionSource::FleetSpawn => "\"fleet_spawn\"",
             DetectionSource::PaneTitle => "\"pane_title\"",
             DetectionSource::ProcessName => "\"process_name\"",
+            DetectionSource::ScreenText => "\"screen_text\"",
         };
         prop_assert_eq!(json.as_str(), expected);
     }

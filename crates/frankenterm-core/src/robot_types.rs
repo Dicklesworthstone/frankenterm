@@ -1856,6 +1856,7 @@ impl From<(u64, &crate::agent_correlator::RunningAgentInventoryEntry)> for Runni
                 crate::agent_correlator::DetectionSource::FleetSpawn => "fleet_spawn",
                 crate::agent_correlator::DetectionSource::PaneTitle => "pane_title",
                 crate::agent_correlator::DetectionSource::ProcessName => "process_name",
+                crate::agent_correlator::DetectionSource::ScreenText => "screen_text",
             }
             .to_string(),
             pane_id,

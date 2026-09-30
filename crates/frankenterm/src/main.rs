@@ -19724,6 +19724,75 @@ fn infer_running_agents_from_panes(
     correlator.inventory().running.into_iter().collect()
 }
 
+/// Screen rows read to recognize an agent TUI in an unclassified pane.
+const AGENT_SCREEN_PROBE_TAIL_ROWS: usize = 40;
+/// Most pane screens one inventory reads, so a fleet of plain shells costs a
+/// bounded number of mux round trips.
+const AGENT_SCREEN_PROBE_MAX_PANES: usize = 128;
+
+/// Pane inventory plus the agents that neither the title nor the process
+/// name identified, recognized from the TUI on their own screen: a Codex pane
+/// titled with the user's name is still a Codex pane (GH #105).
+async fn infer_running_agents_with_screens(
+    wezterm: &frankenterm_core::wezterm::WeztermHandle,
+    cx: &frankenterm_core::cx::Cx,
+    panes: &[frankenterm_core::wezterm::PaneInfo],
+) -> BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry> {
+    let mut running = infer_running_agents_from_panes(panes);
+    add_screen_classified_agents(wezterm, cx, panes, &mut running).await;
+    running
+}
+
+/// Read-only: a pane whose screen cannot be read stays unclassified, and
+/// nothing is ever written to a pane.
+async fn add_screen_classified_agents(
+    wezterm: &frankenterm_core::wezterm::WeztermHandle,
+    cx: &frankenterm_core::cx::Cx,
+    panes: &[frankenterm_core::wezterm::PaneInfo],
+    running: &mut BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry>,
+) {
+    let unclassified: Vec<u64> = panes
+        .iter()
+        .map(|pane| pane.pane_id)
+        .filter(|pane_id| !running.contains_key(pane_id))
+        .take(AGENT_SCREEN_PROBE_MAX_PANES)
+        .collect();
+    for pane_id in unclassified {
+        let Ok(screen) = wezterm
+            .get_text_tail_with_cx(cx, pane_id, false, Some(AGENT_SCREEN_PROBE_TAIL_ROWS))
+            .await
+        else {
+            continue;
+        };
+        if let Some(entry) = screen_classified_agent(&screen.text) {
+            running.insert(pane_id, entry);
+        }
+    }
+}
+
+fn screen_classified_agent(
+    tail: &str,
+) -> Option<frankenterm_core::agent_correlator::RunningAgentInventoryEntry> {
+    use frankenterm_core::pane_capability_resolution::{AgentScreenState, classify_agent_screen};
+
+    let (agent, screen) = classify_agent_screen(tail)?;
+    let state = match screen {
+        AgentScreenState::Ready => "idle",
+        AgentScreenState::Busy => "active",
+        AgentScreenState::AwaitingDecision => "waiting_approval",
+    };
+    Some(
+        frankenterm_core::agent_correlator::RunningAgentInventoryEntry {
+            slug: frankenterm_core::agent_provider::AgentProvider::from_slug(agent)
+                .canonical_name()
+                .to_string(),
+            state: state.to_string(),
+            session_id: None,
+            source: frankenterm_core::agent_correlator::DetectionSource::ScreenText,
+        },
+    )
+}
+
 const ROBOT_HEALTH_ACTIVE_AGENT_MAX_AGENTS: usize = 256;
 
 fn active_agent_confidence_from_source(
@@ -19733,7 +19802,8 @@ fn active_agent_confidence_from_source(
         frankenterm_core::agent_correlator::DetectionSource::FleetSpawn => {
             frankenterm_core::robot_types::AgentHealthConfidence::High
         }
-        frankenterm_core::agent_correlator::DetectionSource::PatternEngine => {
+        frankenterm_core::agent_correlator::DetectionSource::PatternEngine
+        | frankenterm_core::agent_correlator::DetectionSource::ScreenText => {
             frankenterm_core::robot_types::AgentHealthConfidence::High
         }
         frankenterm_core::agent_correlator::DetectionSource::PaneTitle => {
@@ -19952,7 +20022,7 @@ async fn load_robot_active_agent_health(
 
     match wezterm.list_panes_with_cx(&cx).await {
         Ok(panes) => {
-            let running_agents = infer_running_agents_from_panes(&panes);
+            let running_agents = infer_running_agents_with_screens(&wezterm, &cx, &panes).await;
             let pane_cwds = panes
                 .iter()
                 .map(|pane| (pane.pane_id, pane.cwd.clone()))
@@ -22134,7 +22204,10 @@ async fn robot_fleet_load_running_agents(
     let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     match wezterm.list_panes_with_cx(&cx).await {
         Ok(panes) => match robot_fleet_inventory_from_panes(db_path, &panes) {
-            Ok(agents) => (agents, None),
+            Ok(mut agents) => {
+                add_screen_classified_agents(&wezterm, &cx, &panes, &mut agents).await;
+                (agents, None)
+            }
             Err(err) => (BTreeMap::new(), Some(err.to_string())),
         },
         Err(err) => (BTreeMap::new(), Some(err.to_string())),
@@ -57924,7 +57997,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         .unwrap_or_else(frankenterm_core::cx::for_request);
                                     let running_agents = match wezterm.list_panes_with_cx(&cx).await
                                     {
-                                        Ok(panes) => infer_running_agents_from_panes(&panes),
+                                        Ok(panes) => {
+                                            infer_running_agents_with_screens(&wezterm, &cx, &panes)
+                                                .await
+                                        }
                                         Err(err) => {
                                             tracing::warn!(
                                                 error = %err,
@@ -57998,7 +58074,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         }
                                     };
 
-                                    let running_agents = infer_running_agents_from_panes(&panes);
+                                    let running_agents =
+                                        infer_running_agents_with_screens(&wezterm, &cx, &panes)
+                                            .await;
                                     let summary = build_robot_agent_inventory_summary(
                                         &installed_agents,
                                         &running_agents,
@@ -58047,7 +58125,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         .unwrap_or_else(frankenterm_core::cx::for_request);
                                     let running_agents = match wezterm.list_panes_with_cx(&cx).await
                                     {
-                                        Ok(panes) => infer_running_agents_from_panes(&panes),
+                                        Ok(panes) => {
+                                            infer_running_agents_with_screens(&wezterm, &cx, &panes)
+                                                .await
+                                        }
                                         Err(err) => {
                                             tracing::warn!(
                                                 error = %err,
@@ -130889,6 +130970,45 @@ printf x > "$MINISIGN_MARKER"
             data.summary.total_agents,
             ROBOT_HEALTH_ACTIVE_AGENT_MAX_AGENTS
         );
+    }
+
+    #[test]
+    fn screen_text_recognizes_agents_that_title_and_process_miss() {
+        use frankenterm_core::agent_correlator::DetectionSource;
+
+        // GH #105: a Codex pane titled with the user's name, and no process
+        // name, is still recognized from its own screen.
+        let codex_idle = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../frankenterm-core/tests/fixtures/agent_screens/codex_0157_idle.txt"),
+        )
+        .expect("codex idle screen fixture");
+        let codex = screen_classified_agent(&codex_idle).expect("codex screen");
+        assert_eq!(codex.slug, "codex");
+        assert_eq!(codex.state, "idle");
+        assert_eq!(codex.source, DetectionSource::ScreenText);
+
+        let claude_busy =
+            "✻ Pondering… (8s · esc to interrupt)\n────────\n❯ \n────────\n  ? for shortcuts\n";
+        let claude = screen_classified_agent(claude_busy).expect("claude screen");
+        assert_eq!(
+            (claude.slug.as_str(), claude.state.as_str()),
+            ("claude", "active")
+        );
+
+        let claude_permission = "Claude Code\n Do you want to make this edit to main.rs?\n ❯ 1. Yes\n   2. Yes, allow all edits\n   3. No\n";
+        let waiting = screen_classified_agent(claude_permission).expect("permission screen");
+        assert_eq!(robot_fleet_state_bucket(&waiting.state), "stalled");
+
+        assert!(screen_classified_agent("$ ls\nfoo bar\n$ ").is_none());
+
+        let running: BTreeMap<u64, _> = [(16, codex.clone()), (17, codex)].into_iter().collect();
+        assert_eq!(
+            robot_fleet_agent_counts(&running),
+            (0, 2, 0),
+            "both screen-recognized Codex panes count toward the fleet"
+        );
+        assert_eq!(robot_fleet_scale_delta(2, running.len()), 0);
     }
 
     #[test]
