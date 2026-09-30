@@ -61,6 +61,7 @@ fn basic_snapshot() -> HealthSnapshot {
         fleet_scrollback_telemetry: None,
         swarm_capacity: None,
         leak_risk_inventory: frankenterm_core::crash::LeakRiskInventorySnapshot::default(),
+        governor_advisories: Vec::new(),
     }
 }
 

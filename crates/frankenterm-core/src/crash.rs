@@ -863,6 +863,11 @@ pub struct HealthSnapshot {
     /// Leak-risk lifecycle inventory for retention debugging.
     #[serde(default)]
     pub leak_risk_inventory: LeakRiskInventorySnapshot,
+
+    /// Each live governor's would-be verdict at this health tick, rendered
+    /// for operators (ft-7h5da.7.9). Display only: no decision path reads it.
+    #[serde(default)]
+    pub governor_advisories: Vec<crate::governor_advisory::GovernorAdvisory>,
 }
 
 /// Aggregate mux tiered-scrollback evidence retained in a health snapshot.
@@ -996,6 +1001,7 @@ struct CrashHealthSnapshot<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     swarm_capacity: Option<&'a crate::runtime_telemetry::SwarmCapacityOperatorSummary>,
     leak_risk_inventory: &'a LeakRiskInventorySnapshot,
+    governor_advisories: &'a [crate::governor_advisory::GovernorAdvisory],
 }
 
 fn redacted_health_snapshot<'a>(
@@ -1063,6 +1069,8 @@ fn redacted_health_snapshot<'a>(
         fleet_scrollback_telemetry: snapshot.fleet_scrollback_telemetry.as_ref(),
         swarm_capacity: snapshot.swarm_capacity.as_ref(),
         leak_risk_inventory: &snapshot.leak_risk_inventory,
+        // Static governor/verdict/reason tokens: no user text to redact.
+        governor_advisories: &snapshot.governor_advisories,
     }
 }
 
@@ -4812,6 +4820,7 @@ fn add_resource_pressure_source(
             },
             "swarm_capacity": snapshot.swarm_capacity,
             "leak_risk_inventory": snapshot.leak_risk_inventory,
+            "governor_advisories": snapshot.governor_advisories,
         });
         sources.push(write_incident_json_source(
             IncidentJsonSourceMeta {
@@ -8580,6 +8589,7 @@ mod tests {
             fleet_scrollback_telemetry: None,
             swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot::default(),
+            governor_advisories: Vec::new(),
         }
     }
 
@@ -8706,6 +8716,7 @@ mod tests {
             fleet_scrollback_telemetry: None,
             swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot::default(),
+            governor_advisories: Vec::new(),
         };
 
         HealthSnapshot::update_global(snapshot);
@@ -12738,6 +12749,7 @@ mod tests {
             fleet_pressure_tier: Some("Normal".to_string()),
             fleet_scrollback_telemetry: None,
             swarm_capacity: None,
+            governor_advisories: Vec::new(),
             leak_risk_inventory: LeakRiskInventorySnapshot {
                 tracked_pane_entries: 10,
                 observed_pane_count: 8,
@@ -12856,6 +12868,7 @@ mod tests {
             }),
             swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot::default(),
+            governor_advisories: Vec::new(),
         };
         let json = serde_json::to_string(&snapshot).unwrap();
         let parsed: HealthSnapshot = serde_json::from_str(&json).unwrap();

@@ -2025,6 +2025,7 @@ fn health_warning_threshold_generates_warnings() {
             fleet_scrollback_telemetry: None,
             swarm_capacity: None,
             leak_risk_inventory: frankenterm_core::crash::LeakRiskInventorySnapshot::default(),
+            governor_advisories: Vec::new(),
         };
 
         assert_ne!(snapshot.warnings, [] as [std::string::String; 0]);

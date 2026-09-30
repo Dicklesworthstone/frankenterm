@@ -7503,6 +7503,7 @@ mod tests {
             fleet_scrollback_telemetry: None,
             swarm_capacity: None,
             leak_risk_inventory: Default::default(),
+            governor_advisories: Vec::new(),
         }
     }
 

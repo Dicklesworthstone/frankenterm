@@ -40634,6 +40634,9 @@ fn attach_runtime_health_payload(
     payload["swarm_capacity"] =
         serde_json::to_value(swarm_capacity_summary_from_health_snapshot(snapshot, 1))
             .unwrap_or(serde_json::Value::Null);
+    // ft-7h5da.7.9: each live governor's would-be verdict, read-only.
+    payload["governor_advisories"] =
+        serde_json::to_value(&snapshot.governor_advisories).unwrap_or(serde_json::Value::Null);
 }
 
 async fn load_runtime_health_snapshot(
@@ -100016,6 +100019,7 @@ mod tests {
             fleet_scrollback_telemetry: None,
             swarm_capacity: Some(summary),
             leak_risk_inventory: frankenterm_core::crash::LeakRiskInventorySnapshot::default(),
+            governor_advisories: Vec::new(),
         }
     }
 

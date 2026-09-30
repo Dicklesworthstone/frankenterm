@@ -6895,6 +6895,13 @@ impl ObservationRuntime {
                             &crate::runtime_telemetry::swarm_capacity_telemetry_snapshot(),
                         ),
                     );
+                    // ft-7h5da.7.9: each governor's would-be verdict this tick,
+                    // for operators only; nothing below reads it back.
+                    let governor_advisories = crate::governor_advisory::runtime_governor_advisories(
+                        backpressure_tier.as_deref(),
+                        &fleet_eval.actions,
+                        &admission_decision,
+                    );
                     let snapshot = HealthSnapshot {
                         timestamp: snapshot_timestamp,
                         observed_panes,
@@ -6963,6 +6970,7 @@ impl ObservationRuntime {
                             ),
                         ),
                         leak_risk_inventory,
+                        governor_advisories,
                     };
 
                     if loop_cx.checkpoint().is_err() {
@@ -13304,6 +13312,13 @@ impl RuntimeHandle {
         }
         let backpressure_tier =
             classify_backpressure_tier(capture_depth, capture_cap, write_depth, write_cap);
+        // This path evaluates no fleet or admission governor; publish only
+        // the advisory it can back with a verdict of its own.
+        let governor_advisories: Vec<_> = backpressure_tier
+            .as_deref()
+            .and_then(crate::governor_advisory::backpressure_tier_advisory)
+            .into_iter()
+            .collect();
 
         let snapshot_timestamp = epoch_ms_u64();
         let crash_diagnostics = self
@@ -13358,6 +13373,7 @@ impl RuntimeHandle {
                 ),
             ),
             leak_risk_inventory,
+            governor_advisories,
         };
 
         // Cancellation at any point in the sample invalidates the whole
@@ -21880,6 +21896,7 @@ mod tests {
             fleet_scrollback_telemetry: None,
             swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot::default(),
+            governor_advisories: Vec::new(),
         };
 
         // Verify metrics are correctly reflected in snapshot
@@ -24165,6 +24182,7 @@ mod tests {
             fleet_scrollback_telemetry: None,
             swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot::default(),
+            governor_advisories: Vec::new(),
         };
 
         assert_eq!(snapshot.capture_queue_depth, 500);
@@ -24215,6 +24233,7 @@ mod tests {
             fleet_scrollback_telemetry: None,
             swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot::default(),
+            governor_advisories: Vec::new(),
         };
 
         let sched = snapshot.scheduler.as_ref().unwrap();
@@ -24265,6 +24284,7 @@ mod tests {
             fleet_scrollback_telemetry: None,
             swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot::default(),
+            governor_advisories: Vec::new(),
         };
 
         let json = serde_json::to_string(&snapshot).unwrap();

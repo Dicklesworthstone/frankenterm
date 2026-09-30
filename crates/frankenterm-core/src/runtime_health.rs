@@ -1784,6 +1784,7 @@ mod tests {
             fleet_scrollback_telemetry: None,
             swarm_capacity: None,
             leak_risk_inventory: crate::crash::LeakRiskInventorySnapshot::default(),
+            governor_advisories: Vec::new(),
         }
     }
 

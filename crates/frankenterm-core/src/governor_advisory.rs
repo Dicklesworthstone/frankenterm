@@ -176,6 +176,88 @@ pub fn fleet_memory_advisory(
     )
 }
 
+/// The advisories of the governors the watcher runtime evaluates every health
+/// tick: capture/write backpressure (its `GREEN`..`BLACK` tier), the fleet
+/// memory controller (its most severe recommended action) and swarm admission.
+/// Published in the health snapshot for read-only operator surfaces; no
+/// decision path reads them (ft-7h5da.7.9).
+#[must_use]
+pub fn runtime_governor_advisories(
+    backpressure_tier: Option<&str>,
+    fleet_memory_actions: &[crate::fleet_memory_controller::FleetMemoryAction],
+    admission: &crate::swarm_scheduler::ResourceAdmissionDecisionSummary,
+) -> Vec<GovernorAdvisory> {
+    let mut advisories = Vec::with_capacity(3);
+    advisories.extend(backpressure_tier.and_then(backpressure_tier_advisory));
+    advisories.push(fleet_memory_advisory(
+        fleet_memory_actions
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(crate::fleet_memory_controller::FleetMemoryAction::None),
+    ));
+    advisories.push(swarm_admission_advisory(admission));
+    advisories
+}
+
+/// Render the runtime's capture/write backpressure tier (`GREEN`, `YELLOW`,
+/// `RED`, `BLACK`) as an advisory; `None` for an unrecognized tier.
+#[must_use]
+pub fn backpressure_tier_advisory(tier: &str) -> Option<GovernorAdvisory> {
+    use crate::policy::PolicyRecommendationResourcePressure as P;
+    let pressure = match tier.to_ascii_uppercase().as_str() {
+        "GREEN" => P::Nominal,
+        "YELLOW" => P::Elevated,
+        "RED" | "BLACK" => P::Critical,
+        _ => return None,
+    };
+    Some(backpressure_advisory(pressure))
+}
+
+/// The stable snake_case serde token of a unit enum variant.
+fn serde_token<T: Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(token)) => token,
+        _ => "unknown".to_string(),
+    }
+}
+
+/// Render the swarm admission controller's decision (the verdict fleet spawns
+/// consult) as an advisory.
+#[must_use]
+pub fn swarm_admission_advisory(
+    decision: &crate::swarm_scheduler::ResourceAdmissionDecisionSummary,
+) -> GovernorAdvisory {
+    use crate::swarm_scheduler::AdmissionAction as A;
+    let (recommendation, severity) = match decision.action {
+        A::Admit => ("admit new agent spawns", AdvisorySeverity::Allow),
+        A::Defer => (
+            "defer new spawns until pressure drops",
+            AdvisorySeverity::Throttle,
+        ),
+        A::Degrade => (
+            "spawn only in a reduced-quality mode",
+            AdvisorySeverity::Throttle,
+        ),
+        A::Shed => (
+            "refuse new spawns; the host is saturated",
+            AdvisorySeverity::RejectClass,
+        ),
+    };
+    let verdict = serde_token(&decision.action);
+    let reason_code = decision
+        .reason_codes
+        .first()
+        .map_or_else(|| verdict.clone(), serde_token);
+    GovernorAdvisory::new(
+        "swarm_admission",
+        verdict,
+        reason_code,
+        recommendation,
+        severity,
+    )
+}
+
 /// Render a `backpressure` resource-pressure signal as an advisory.
 #[must_use]
 pub fn backpressure_advisory(
@@ -263,6 +345,77 @@ pub fn operating_envelope_advisory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fail_closed_admission() -> crate::swarm_scheduler::ResourceAdmissionDecisionSummary {
+        use crate::swarm_scheduler::{
+            AdmissionRequest, SwarmAdmissionController, SwarmAdmissionTelemetry,
+        };
+        SwarmAdmissionController::default().evaluate(
+            &AdmissionRequest::standard(2, 1),
+            &SwarmAdmissionTelemetry {
+                queue_pressure: None,
+                fleet_pressure: None,
+                memory_tier_budget: None,
+                latency_stage_pressures: None,
+                herd_wave_pressure: None,
+            },
+        )
+    }
+
+    #[test]
+    fn swarm_admission_advisory_mirrors_the_native_verdict() {
+        use crate::swarm_scheduler::AdmissionAction;
+        let decision = fail_closed_admission();
+        let advisory = swarm_admission_advisory(&decision);
+        assert_eq!(advisory.governor, "swarm_admission");
+        assert_eq!(advisory.verdict, serde_token(&decision.action));
+        assert_eq!(
+            advisory.reason_code,
+            decision
+                .reason_codes
+                .first()
+                .map_or_else(|| advisory.verdict.clone(), serde_token)
+        );
+        let expected = match decision.action {
+            AdmissionAction::Admit => AdvisorySeverity::Allow,
+            AdmissionAction::Defer | AdmissionAction::Degrade => AdvisorySeverity::Throttle,
+            AdmissionAction::Shed => AdvisorySeverity::RejectClass,
+        };
+        assert_eq!(advisory.severity, expected);
+    }
+
+    #[test]
+    fn runtime_advisories_cover_each_live_governor_and_its_worst_action() {
+        use crate::fleet_memory_controller::FleetMemoryAction;
+        let admission = fail_closed_admission();
+
+        let quiet = runtime_governor_advisories(Some("GREEN"), &[], &admission);
+        let governors: Vec<&str> = quiet.iter().map(|a| a.governor.as_str()).collect();
+        assert_eq!(
+            governors,
+            ["backpressure", "fleet_memory_controller", "swarm_admission"]
+        );
+        assert_eq!(quiet[0].severity, AdvisorySeverity::Allow);
+        assert_eq!(quiet[1].verdict, "none");
+
+        let pressed = runtime_governor_advisories(
+            Some("BLACK"),
+            &[
+                FleetMemoryAction::ThrottlePolling,
+                FleetMemoryAction::PauseIdlePanes,
+                FleetMemoryAction::EvictWarmScrollback,
+            ],
+            &admission,
+        );
+        assert_eq!(pressed[0].severity, AdvisorySeverity::RejectClass);
+        assert_eq!(pressed[1].verdict, "pause_idle_panes");
+        assert_eq!(pressed[1].severity, AdvisorySeverity::RejectClass);
+
+        // No queue capacities, no backpressure tier: that governor is absent.
+        let untiered = runtime_governor_advisories(None, &[], &admission);
+        assert_eq!(untiered.len(), 2);
+        assert_eq!(untiered[0].governor, "fleet_memory_controller");
+    }
 
     #[test]
     fn severity_tokens_are_stable_snake_case() {

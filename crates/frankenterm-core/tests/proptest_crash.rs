@@ -86,6 +86,7 @@ fn arb_health_snapshot() -> impl Strategy<Value = HealthSnapshot> {
                     swarm_capacity: None,
                     leak_risk_inventory:
                         frankenterm_core::crash::LeakRiskInventorySnapshot::default(),
+                    governor_advisories: Vec::new(),
                 }
             },
         )
@@ -1061,6 +1062,7 @@ proptest! {
             fleet_scrollback_telemetry: None,
             swarm_capacity: None,
             leak_risk_inventory: frankenterm_core::crash::LeakRiskInventorySnapshot::default(),
+            governor_advisories: Vec::new(),
         };
         HealthSnapshot::update_global(snap.clone());
         let got = HealthSnapshot::get_global();
@@ -1263,6 +1265,7 @@ proptest! {
             fleet_pressure_tier: fp_tiers[fleet_idx].map(String::from),
             fleet_scrollback_telemetry: None,
             swarm_capacity: None,
+            governor_advisories: Vec::new(),
             leak_risk_inventory: LeakRiskInventorySnapshot {
                 storage_lock_contention_events: contention_events,
                 ..LeakRiskInventorySnapshot::default()
