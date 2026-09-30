@@ -13096,7 +13096,8 @@ fn load_attention_router_input(
     Ok(input)
 }
 
-fn build_cli_attention_router_payload(
+async fn build_cli_attention_router_payload(
+    config: &frankenterm_core::config::Config,
     workspace_root: &Path,
     input_path: Option<&Path>,
     generated_at_ms: Option<u64>,
@@ -13104,7 +13105,22 @@ fn build_cli_attention_router_payload(
     source: &'static str,
     requested_item_id: Option<&str>,
 ) -> anyhow::Result<AttentionRouterSurfacePayload> {
-    let input = load_attention_router_input(workspace_root, input_path, generated_at_ms)?;
+    let mut input = load_attention_router_input(workspace_root, input_path, generated_at_ms)?;
+    // A recorded --input is replayed exactly; a live run adds the watcher's
+    // operating envelope (per-governor advisories) as a real source.
+    if input_path.is_none() {
+        let snapshot = match config.workspace_layout(Some(workspace_root)) {
+            Ok(layout) => load_runtime_health_snapshot_at(&layout.ipc_socket_path).await,
+            Err(_) => None,
+        };
+        input.observations.push(
+            frankenterm_core::attention_router::operating_envelope_observation_from_health(
+                snapshot.as_ref(),
+                input.generated_at_ms,
+                SPAWN_ADMISSION_MAX_AGE_MS,
+            ),
+        );
+    }
     Ok(build_attention_router_surface_payload(
         &input,
         surface,
@@ -50124,33 +50140,39 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     let payload = match command {
                         RobotAttentionCommands::Status { args } => {
                             build_cli_attention_router_payload(
+                                &config,
                                 &workspace_root,
                                 args.input.as_deref(),
                                 args.generated_at_ms,
                                 AttentionRouterSurface::Status,
                                 "robot.attention.status",
                                 None,
-                            )?
+                            )
+                            .await?
                         }
                         RobotAttentionCommands::Next { args } => {
                             build_cli_attention_router_payload(
+                                &config,
                                 &workspace_root,
                                 args.input.as_deref(),
                                 args.generated_at_ms,
                                 AttentionRouterSurface::Next,
                                 "robot.attention.next",
                                 None,
-                            )?
+                            )
+                            .await?
                         }
                         RobotAttentionCommands::Explain { item_id, args } => {
                             build_cli_attention_router_payload(
+                                &config,
                                 &workspace_root,
                                 args.input.as_deref(),
                                 args.generated_at_ms,
                                 AttentionRouterSurface::Explain,
                                 "robot.attention.explain",
                                 item_id.as_deref(),
-                            )?
+                            )
+                            .await?
                         }
                     };
                     let response = RobotResponse::success(payload, elapsed_ms(start));
@@ -71271,35 +71293,41 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
         Some(Commands::Attention { command }) => match command {
             AttentionCommands::Status { args } => {
                 let payload = build_cli_attention_router_payload(
+                    &config,
                     &workspace_root,
                     args.input.as_deref(),
                     args.generated_at_ms,
                     AttentionRouterSurface::Status,
                     "cli.attention.status",
                     None,
-                )?;
+                )
+                .await?;
                 print_attention_router_payload(&payload, args.format)?;
             }
             AttentionCommands::Next { args } => {
                 let payload = build_cli_attention_router_payload(
+                    &config,
                     &workspace_root,
                     args.input.as_deref(),
                     args.generated_at_ms,
                     AttentionRouterSurface::Next,
                     "cli.attention.next",
                     None,
-                )?;
+                )
+                .await?;
                 print_attention_router_payload(&payload, args.format)?;
             }
             AttentionCommands::Explain { item_id, args } => {
                 let payload = build_cli_attention_router_payload(
+                    &config,
                     &workspace_root,
                     args.input.as_deref(),
                     args.generated_at_ms,
                     AttentionRouterSurface::Explain,
                     "cli.attention.explain",
                     item_id.as_deref(),
-                )?;
+                )
+                .await?;
                 print_attention_router_payload(&payload, args.format)?;
             }
         },

@@ -2519,6 +2519,84 @@ fn required_source_kinds() -> [AttentionRouterSourceKind; 6] {
     ]
 }
 
+/// Live operating-envelope source built from the watcher's health snapshot:
+/// one capacity fact per governor advisory (ft-7h5da.7.9). A governor that
+/// would refuse work becomes a blocker (`capacity.black`, or `envelope.shed`
+/// for a shed admission); a snapshot older than `max_age_ms` is degraded
+/// (`telemetry.stale`); no snapshot means the watcher is not reachable.
+#[must_use]
+pub fn operating_envelope_observation_from_health(
+    snapshot: Option<&crate::crash::HealthSnapshot>,
+    now_ms: u64,
+    max_age_ms: u64,
+) -> AttentionRouterSourceObservation {
+    use crate::governor_advisory::AdvisorySeverity;
+
+    let source_kind = AttentionRouterSourceKind::OperatingEnvelope;
+    let Some(snapshot) = snapshot else {
+        return AttentionRouterSourceObservation::new(
+            "operating_envelope.watcher",
+            source_kind,
+            AttentionRouterSourceHealth::Unavailable,
+            "ipc.status.health",
+            "watcher health snapshot is unavailable",
+        )
+        .live(now_ms, 0)
+        .with_fact(
+            AttentionRouterSourceFact::new(
+                AttentionRouterSourceFactKind::SourceUnavailable,
+                "no running watcher answered the health status request",
+            )
+            .with_reason_code("operating_envelope.watcher_unavailable"),
+        );
+    };
+    let age_ms = now_ms.saturating_sub(snapshot.timestamp);
+    let stale = age_ms > max_age_ms;
+    let health = if stale {
+        AttentionRouterSourceHealth::Degraded
+    } else {
+        AttentionRouterSourceHealth::Available
+    };
+    let mut observation = AttentionRouterSourceObservation::new(
+        "operating_envelope.watcher",
+        source_kind,
+        health,
+        "ipc.status.health",
+        format!(
+            "{} governor advisories from the watcher health tick",
+            snapshot.governor_advisories.len()
+        ),
+    )
+    .live(snapshot.timestamp, age_ms);
+    for advisory in &snapshot.governor_advisories {
+        let mut fact = AttentionRouterSourceFact::new(
+            AttentionRouterSourceFactKind::OperatingEnvelopeCapacity,
+            format!(
+                "{} {}: {}",
+                advisory.governor, advisory.verdict, advisory.recommendation
+            ),
+        )
+        .with_reason_code(format!(
+            "governor.{}.{}",
+            advisory.governor, advisory.verdict
+        ));
+        if advisory.severity == AdvisorySeverity::RejectClass {
+            fact = fact.with_reason_code(
+                if advisory.governor == "swarm_admission" && advisory.verdict == "shed" {
+                    "envelope.shed"
+                } else {
+                    "capacity.black"
+                },
+            );
+        }
+        if stale {
+            fact = fact.with_reason_code("telemetry.stale");
+        }
+        observation = observation.with_fact(fact);
+    }
+    observation
+}
+
 fn missing_source_observation(
     source_kind: AttentionRouterSourceKind,
     generated_at_ms: u64,
@@ -2968,6 +3046,102 @@ pub fn build_attention_router_next_view_from_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn health_with_advisories(
+        timestamp: u64,
+        governor_advisories: Vec<crate::governor_advisory::GovernorAdvisory>,
+    ) -> crate::crash::HealthSnapshot {
+        crate::crash::HealthSnapshot {
+            timestamp,
+            observed_panes: 2,
+            capture_queue_depth: 0,
+            write_queue_depth: 0,
+            last_seq_by_pane: vec![],
+            warnings: vec![],
+            ingest_lag_avg_ms: 0.0,
+            ingest_lag_max_ms: 0,
+            db_writable: true,
+            db_last_write_at: None,
+            pane_priority_overrides: vec![],
+            scheduler: None,
+            backpressure_tier: None,
+            last_activity_by_pane: vec![],
+            restart_count: 0,
+            last_crash_at: None,
+            consecutive_crashes: 0,
+            current_backoff_ms: 0,
+            in_crash_loop: false,
+            fleet_pressure_tier: None,
+            fleet_scrollback_telemetry: None,
+            swarm_capacity: None,
+            leak_risk_inventory: crate::crash::LeakRiskInventorySnapshot::default(),
+            governor_advisories,
+        }
+    }
+
+    #[test]
+    fn live_operating_envelope_turns_refusing_governors_into_blockers() {
+        use crate::fleet_memory_controller::FleetMemoryAction;
+        use crate::governor_advisory::{backpressure_tier_advisory, fleet_memory_advisory};
+
+        let now = 1_800_000_000_000;
+        let calm = health_with_advisories(
+            now - 1_000,
+            vec![
+                backpressure_tier_advisory("GREEN").unwrap(),
+                fleet_memory_advisory(FleetMemoryAction::None),
+            ],
+        );
+        let observation = operating_envelope_observation_from_health(Some(&calm), now, 90_000);
+        assert_eq!(observation.health, AttentionRouterSourceHealth::Available);
+        assert_eq!(observation.facts.len(), 2);
+        assert!(
+            observation.facts[0]
+                .reason_codes
+                .contains(&"governor.backpressure.nominal".to_string())
+        );
+        let snapshot = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo").with_observation(observation),
+        );
+        assert!(
+            !snapshot.items.iter().any(|item| item
+                .reason_codes
+                .iter()
+                .any(|code| code == "capacity.black")),
+            "allowing governors raise no blocker"
+        );
+
+        let pressed = health_with_advisories(
+            now - 1_000,
+            vec![
+                backpressure_tier_advisory("BLACK").unwrap(),
+                fleet_memory_advisory(FleetMemoryAction::PauseIdlePanes),
+            ],
+        );
+        let observation = operating_envelope_observation_from_health(Some(&pressed), now, 90_000);
+        let snapshot = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo").with_observation(observation),
+        );
+        assert!(
+            snapshot
+                .items
+                .iter()
+                .any(|item| item.kind == AttentionRouterItemKind::Blocker),
+            "a refusing governor is a blocker"
+        );
+
+        let stale = operating_envelope_observation_from_health(Some(&calm), now + 200_000, 90_000);
+        assert_eq!(stale.health, AttentionRouterSourceHealth::Degraded);
+        assert!(
+            stale
+                .facts
+                .iter()
+                .all(|fact| fact.reason_codes.contains(&"telemetry.stale".to_string()))
+        );
+
+        let absent = operating_envelope_observation_from_health(None, now, 90_000);
+        assert_eq!(absent.health, AttentionRouterSourceHealth::Unavailable);
+    }
 
     fn source(
         bundle: &AttentionRouterSourceBundle,
