@@ -6277,6 +6277,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
 
             let risk = contract_step_risk(contract, step_result.step_id.0.as_str());
             let agent_id = format!("agent-{}", step_result.step_id.0);
+            let idem_key_text = idem_key.as_str().to_string();
             if let Some(store) = context.store.as_deref_mut() {
                 let durable = store.is_durable();
                 let current_outcome = store
@@ -6376,7 +6377,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 TxEventKind::StepFailed
             };
 
-            context.events.push(self.make_event(
+            let event = self.make_event(
                 event_kind,
                 TxObservabilityPhase::Commit,
                 &format!(
@@ -6391,6 +6392,13 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 &contract.plan.plan_id.0,
                 TxPhase::Committing,
                 context.now_ms,
+            );
+            context.events.push(with_step_evidence(
+                event,
+                &step_result.step_id.0,
+                idem_key_text,
+                agent_id,
+                context.ledger,
             ));
         }
 
@@ -6505,6 +6513,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
 
                 let risk = compensation_step_risk(contract, step_id);
                 let agent_id = format!("agent-{step_id}");
+                let idem_key_text = idem_key.as_str().to_string();
                 if let Some(store) = context.store.as_deref_mut() {
                     let durable = store.is_durable();
                     let current_outcome = store
@@ -6594,7 +6603,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                         })?;
                 }
 
-                context.events.push(self.make_event(
+                let event = self.make_event(
                     TxEventKind::StepCompensated,
                     TxObservabilityPhase::Compensate,
                     &format!("tx.compensate.step_{outcome_str}"),
@@ -6602,6 +6611,13 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                     &contract.plan.plan_id.0,
                     TxPhase::Compensating,
                     context.now_ms,
+                );
+                context.events.push(with_step_evidence(
+                    event,
+                    step_id,
+                    idem_key_text,
+                    agent_id,
+                    context.ledger,
                 ));
             }
         }
@@ -6678,7 +6694,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                         ))
                     })?;
                 refresh_local_execution_ledger(context.ledger, store, context.execution_id)?;
-                context.events.push(self.make_event(
+                let event = self.make_event(
                     TxEventKind::StepCompensated,
                     TxObservabilityPhase::Compensate,
                     "tx.compensate.step_deduped",
@@ -6686,6 +6702,13 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                     &contract.plan.plan_id.0,
                     TxPhase::Compensating,
                     context.now_ms,
+                );
+                context.events.push(with_step_evidence(
+                    event,
+                    step_id,
+                    idem_key.as_str().to_string(),
+                    agent_id,
+                    context.ledger,
                 ));
             }
         }
@@ -6885,11 +6908,17 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         execution_id: &str,
         now_ms: i64,
     ) -> Option<TxForensicBundle> {
+        // Every completed execution funnels through here. Its events share the
+        // ledger's compiled plan hash; make_event cannot know it, so bind it
+        // now, whether or not a bundle is produced (ft-6roo4).
+        for event in events.iter_mut() {
+            event.plan_hash = ledger.plan_hash();
+        }
         if !self.config.produce_forensic_bundle {
             return None;
         }
 
-        events.push(self.make_event(
+        let mut exported = self.make_event(
             TxEventKind::BundleExported,
             TxObservabilityPhase::Observability,
             crate::tx_observability::reason_codes::BUNDLE_EXPORTED,
@@ -6897,7 +6926,10 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             &contract.plan.plan_id.0,
             ledger.phase(),
             now_ms,
-        ));
+        );
+        exported.plan_hash = ledger.plan_hash();
+        exported.chain_hash = ledger.last_hash().to_string();
+        events.push(exported);
 
         let compiled_plan = compiled_plan_from_contract(contract);
         Some(crate::tx_observability::build_forensic_bundle(
@@ -6911,6 +6943,24 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             &self.config.observability,
         ))
     }
+}
+
+/// Bind a step event to the exact ledger record it reports: the step, its
+/// idempotency key and agent, and the ledger's hash chain head right after
+/// that record was appended (ft-6roo4).
+fn with_step_evidence(
+    mut event: TxObservabilityEvent,
+    step_id: &str,
+    idem_key: String,
+    agent_id: String,
+    ledger: &TxExecutionLedger,
+) -> TxObservabilityEvent {
+    event.step_id = step_id.to_string();
+    event.idem_key = idem_key;
+    event.agent_id = agent_id;
+    event.chain_hash = ledger.last_hash().to_string();
+    event.plan_hash = ledger.plan_hash();
+    event
 }
 
 fn transition_execution_ledger_pair(
@@ -11927,6 +11977,35 @@ mod tests {
         assert_eq!(gates.len(), 2);
         assert!(gates[0].policy_passed);
         assert!(gates[0].target_liveness);
+    }
+
+    #[test]
+    fn events_carry_plan_hash_and_step_ledger_evidence() {
+        let mut contract = make_test_contract(2);
+        let plan_hash = compiled_plan_from_contract(&contract).plan_hash;
+        let engine = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
+        let result = engine.execute(&mut contract, 5000).unwrap();
+
+        assert!(!result.events.is_empty());
+        for event in &result.events {
+            assert_eq!(event.plan_hash, plan_hash, "{:?}", event.kind);
+        }
+        let steps: Vec<_> = result
+            .events
+            .iter()
+            .filter(|event| event.kind == TxEventKind::StepCommitted)
+            .collect();
+        assert_eq!(steps.len(), 2);
+        for event in &steps {
+            assert!(!event.step_id.is_empty());
+            assert!(event.idem_key.starts_with("txk:"), "{}", event.idem_key);
+            assert_eq!(event.agent_id, format!("agent-{}", event.step_id));
+            assert!(!event.chain_hash.is_empty());
+        }
+        assert_ne!(
+            steps[0].chain_hash, steps[1].chain_hash,
+            "each step event names the chain head after its own record"
+        );
     }
 
     #[test]
