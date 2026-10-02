@@ -441,8 +441,14 @@ async fn run_move_tab(client: &Client, args: MoveTabArgs) -> anyhow::Result<()> 
         .await
         .context("commit the tab order on the mux server")?;
     match outcome {
-        WindowOrderCommitOutcome::Applied { window, rebased, .. } => {
-            let how = if rebased { "applied (rebased)" } else { "applied" };
+        WindowOrderCommitOutcome::Applied {
+            window, rebased, ..
+        } => {
+            let how = if rebased {
+                "applied (rebased)"
+            } else {
+                "applied"
+            };
             println!("{how}: {}", describe_window_order(&window));
             Ok(())
         }
@@ -668,7 +674,14 @@ mod tests {
     #[test]
     fn move_tab_parses_its_arguments() {
         let cmd = CliCommand::try_parse_from([
-            "cli", "move-tab", "--tab-id", "4", "--index", "0", "--expected-revision", "1",
+            "cli",
+            "move-tab",
+            "--tab-id",
+            "4",
+            "--index",
+            "0",
+            "--expected-revision",
+            "1",
         ])
         .unwrap();
         let CliSubCommand::MoveTab(args) = cmd.sub else {
