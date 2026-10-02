@@ -17602,6 +17602,7 @@ impl Mux {
         }
     }
 
+    #[cfg(test)]
     fn remove_pane_if_same_generation(
         &self,
         pane_id: PaneId,
