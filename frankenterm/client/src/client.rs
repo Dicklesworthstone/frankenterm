@@ -1278,18 +1278,55 @@ enum RpcProtocolTransition {
     RegistrationRequest,
 }
 
+/// Which additive wire families one client incarnation may activate.
+///
+/// The profile is fixed when the client is constructed and carried to every
+/// successor generation, so a reconnect can never widen or narrow it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RpcProtocolProfile {
+    /// The GUI's main connection and every other domain-attached client. The
+    /// ordered-window family (PDUs 86-90) stays inactive.
+    Ordinary,
+    /// A request-only client with no local domain. The owner enabled the
+    /// ordered-window protocol for this profile so that a fork client can
+    /// commit a GUI tab move on the mux server: PDUs 86-90 and the
+    /// FENCED|ORDERED|CAS capabilities are active, and every unsolicited
+    /// (serial 0) PDU is dropped before the topology coordinator.
+    RequestOnlyOrdered,
+}
+
+impl RpcProtocolProfile {
+    /// Only a request-only client without a local domain may use the
+    /// ordered-window protocol. An attached domain's main connection keeps the
+    /// ordinary profile.
+    const fn for_client(local_domain_id: Option<DomainId>, request_only: bool) -> Self {
+        if request_only && local_domain_id.is_none() {
+            Self::RequestOnlyOrdered
+        } else {
+            Self::Ordinary
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RpcProtocolAuthority {
     generation: NonZeroU64,
+    profile: RpcProtocolProfile,
     phase: RpcProtocolPhase,
     codec: Option<RpcCodecAuthority>,
     established_capabilities: TopologyCapabilities,
 }
 
 impl RpcProtocolAuthority {
+    #[cfg(test)]
     fn new(generation: NonZeroU64) -> Self {
+        Self::new_with_profile(generation, RpcProtocolProfile::Ordinary)
+    }
+
+    fn new_with_profile(generation: NonZeroU64, profile: RpcProtocolProfile) -> Self {
         Self {
             generation,
+            profile,
             phase: RpcProtocolPhase::AwaitingCodecRequest,
             codec: None,
             established_capabilities: TopologyCapabilities::NONE,
@@ -1306,6 +1343,7 @@ impl RpcProtocolAuthority {
         };
         Self {
             generation,
+            profile: RpcProtocolProfile::Ordinary,
             phase: RpcProtocolPhase::Established,
             codec: Some(RpcCodecAuthority {
                 generation,
@@ -1320,12 +1358,41 @@ impl RpcProtocolAuthority {
         }
     }
 
+    /// Capabilities the [`RpcProtocolProfile::Ordinary`] profile activates.
     const fn locally_activated_capabilities() -> TopologyCapabilities {
         // Every additive capability remains deliberately inactive. Do not
         // replace this exact mask with decoder support or a broad server mask.
         TopologyCapabilities::FENCED_SNAPSHOT_V1
     }
 
+    /// Capabilities the [`RpcProtocolProfile::RequestOnlyOrdered`] profile
+    /// activates: the fenced snapshot, the ordered-window stream and the
+    /// per-window reorder compare-and-set. Exact-render delivery stays off.
+    const fn ordered_lane_activated_capabilities() -> TopologyCapabilities {
+        TopologyCapabilities::from_bits(
+            TopologyCapabilities::FENCED_SNAPSHOT_V1.bits()
+                | TopologyCapabilities::ORDERED_WINDOW_STREAM_V1.bits()
+                | TopologyCapabilities::WINDOW_REORDER_CAS_V1.bits(),
+        )
+    }
+
+    const fn activated_capabilities(&self) -> TopologyCapabilities {
+        match self.profile {
+            RpcProtocolProfile::Ordinary => Self::locally_activated_capabilities(),
+            RpcProtocolProfile::RequestOnlyOrdered => Self::ordered_lane_activated_capabilities(),
+        }
+    }
+
+    fn admits_endpoint(&self, spec: &PduWireSpec) -> bool {
+        match self.profile {
+            RpcProtocolProfile::Ordinary => Self::endpoint_is_activated(spec),
+            RpcProtocolProfile::RequestOnlyOrdered => {
+                Self::endpoint_is_activated(spec) || matches!(spec.ident, 86..=90)
+            }
+        }
+    }
+
+    /// Endpoints the [`RpcProtocolProfile::Ordinary`] profile activates.
     fn endpoint_is_activated(spec: &PduWireSpec) -> bool {
         // Fail closed for every additive endpoint until the ordinary client
         // has an explicit live coordinator. Decoder/handler presence is not
@@ -1374,7 +1441,7 @@ impl RpcProtocolAuthority {
         producer: PduProducer,
         role: PduWireRole,
     ) -> Result<(), OrdinaryMuxProtocolError> {
-        if !Self::endpoint_is_activated(spec) {
+        if !self.admits_endpoint(spec) {
             return Err(OrdinaryMuxProtocolError::EndpointInactive {
                 direction,
                 ident: spec.ident,
@@ -1404,7 +1471,7 @@ impl RpcProtocolAuthority {
         match spec.capability {
             PduCapabilityUse::None => {}
             PduCapabilityUse::Negotiates(required) => {
-                let activated = Self::locally_activated_capabilities();
+                let activated = self.activated_capabilities();
                 if !activated.contains(required) {
                     return Err(OrdinaryMuxProtocolError::CapabilityNotActivated {
                         direction,
@@ -1416,7 +1483,7 @@ impl RpcProtocolAuthority {
                 }
             }
             PduCapabilityUse::Requires(required) => {
-                let activated = Self::locally_activated_capabilities();
+                let activated = self.activated_capabilities();
                 if !activated.contains(required) {
                     return Err(OrdinaryMuxProtocolError::CapabilityNotActivated {
                         direction,
@@ -1491,12 +1558,27 @@ impl RpcProtocolAuthority {
     ) -> Result<(), OrdinaryMuxProtocolError> {
         let spec = assigned_pdu_spec(pdu, RpcProtocolDirection::Outbound)?;
         self.validate_outbound(spec, point)?;
-        if let Pdu::ListPanesCoherent(request) = pdu {
-            let activated = Self::locally_activated_capabilities();
-            if request.supported != activated || request.required != activated {
+        // Each snapshot request advertises exactly the set its family may
+        // establish. PDU81 stays fenced-only for every profile; the server
+        // and `TopologyFenceAuthority` both depend on that exact agreement.
+        let advertised = match pdu {
+            Pdu::ListPanesCoherent(request) => Some((
+                request.supported,
+                request.required,
+                Self::locally_activated_capabilities(),
+            )),
+            Pdu::ListPanesOrderedV1(request) => Some((
+                request.supported,
+                request.required,
+                self.activated_capabilities(),
+            )),
+            _ => None,
+        };
+        if let Some((supported, required, activated)) = advertised {
+            if supported != activated || required != activated {
                 return Err(OrdinaryMuxProtocolError::CapabilityAdvertisementMismatch {
-                    supported: request.supported.bits(),
-                    required: request.required.bits(),
+                    supported: supported.bits(),
+                    required: required.bits(),
                     activated: activated.bits(),
                 });
             }
@@ -1671,20 +1753,33 @@ impl RpcProtocolAuthority {
         &mut self,
         capabilities: TopologyCapabilities,
     ) -> Result<(), OrdinaryMuxProtocolError> {
+        self.establish_capabilities_from(
+            &<ListPanesCoherentResponse as PduWireIdent>::WIRE_SPEC,
+            capabilities,
+        )
+    }
+
+    /// Record the capabilities negotiated by one successful snapshot
+    /// response. `response` names that snapshot in any rejection.
+    fn establish_capabilities_from(
+        &mut self,
+        response: &PduWireSpec,
+        capabilities: TopologyCapabilities,
+    ) -> Result<(), OrdinaryMuxProtocolError> {
         if self.phase != RpcProtocolPhase::Established {
             return Err(OrdinaryMuxProtocolError::PhaseViolation {
                 direction: RpcProtocolDirection::Inbound,
-                ident: <ListPanesCoherentResponse as PduWireIdent>::IDENT,
-                name: "ListPanesCoherentResponse",
+                ident: response.ident,
+                name: response.name,
                 phase: self.phase,
             });
         }
-        let activated = Self::locally_activated_capabilities();
+        let activated = self.activated_capabilities();
         if !activated.contains(capabilities) {
             return Err(OrdinaryMuxProtocolError::CapabilityNotActivated {
                 direction: RpcProtocolDirection::Inbound,
-                ident: <ListPanesCoherentResponse as PduWireIdent>::IDENT,
-                name: "ListPanesCoherentResponse",
+                ident: response.ident,
+                name: response.name,
                 required: capabilities.bits(),
                 activated: activated.bits(),
             });
@@ -2026,6 +2121,9 @@ struct RpcTransportState {
     /// connection, and releasing this gate before the reader acknowledges the
     /// exact snapshot would let concurrent resyncs destroy that invariant.
     topology_sync: futures::lock::Mutex<()>,
+    /// Wire profile of this client incarnation. Every successor generation's
+    /// protocol authority is built with this same profile.
+    protocol_profile: RpcProtocolProfile,
 }
 
 pub(crate) struct RpcGenerationCommitLease {
@@ -2056,14 +2154,22 @@ impl Drop for RpcGenerationCommitLease {
 }
 
 impl RpcTransportState {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::new_with_profile(RpcProtocolProfile::Ordinary)
+    }
+
+    fn new_with_profile(protocol_profile: RpcProtocolProfile) -> Self {
         let generation = NonZeroU64::new(INITIAL_CONNECTION_GENERATION)
             .expect("the initial connection generation is nonzero");
         let (terminal_reader_wake_tx, terminal_reader_wake_rx) = bounded(1);
         Self {
             lifecycle: ParkingMutex::new(RpcTransportLifecycle {
                 phase: RpcTransportPhase::Live(generation),
-                protocol: Some(RpcProtocolAuthority::new(generation)),
+                protocol: Some(RpcProtocolAuthority::new_with_profile(
+                    generation,
+                    protocol_profile,
+                )),
                 active_consumer_commits: 0,
                 terminal_error: None,
                 readiness_authority: Arc::new(RpcReadinessAuthority::new(generation)),
@@ -2079,7 +2185,16 @@ impl RpcTransportState {
             terminal_reader_wake_tx,
             terminal_reader_wake_rx,
             topology_sync: futures::lock::Mutex::new(()),
+            protocol_profile,
         }
+    }
+
+    /// Whether this client drops every unsolicited (serial 0) PDU before the
+    /// topology coordinator. Only the request-only ordered profile does: it
+    /// keeps no topology state, and an ordered connection's stamped PDU90
+    /// stream would otherwise fail the coordinator's legacy phase.
+    fn drops_unsolicited(&self) -> bool {
+        self.protocol_profile == RpcProtocolProfile::RequestOnlyOrdered
     }
 
     #[cfg(test)]
@@ -2432,6 +2547,20 @@ impl RpcTransportState {
             .establish_capabilities(capabilities)
     }
 
+    fn establish_ordered_capabilities(
+        &self,
+        generation: NonZeroU64,
+        capabilities: TopologyCapabilities,
+    ) -> Result<(), OrdinaryMuxProtocolError> {
+        self.lifecycle
+            .lock()
+            .protocol_for_mut(generation)?
+            .establish_capabilities_from(
+                &<ListPanesOrderedV1Response as PduWireIdent>::WIRE_SPEC,
+                capabilities,
+            )
+    }
+
     async fn complete_before_terminal<T>(
         &self,
         operation: impl Future<Output = T>,
@@ -2621,10 +2750,10 @@ impl RpcTransportState {
             .expect("test RPC transport generation should be live");
         let readiness_authority = {
             let mut lifecycle = self.lifecycle.lock();
-            lifecycle.protocol = Some(RpcProtocolAuthority::established_for_test(
-                generation,
-                agreed_codec_version,
-            ));
+            let mut protocol =
+                RpcProtocolAuthority::established_for_test(generation, agreed_codec_version);
+            protocol.profile = self.protocol_profile;
+            lifecycle.protocol = Some(protocol);
             Arc::clone(&lifecycle.readiness_authority)
         };
         let participating = readiness_authority
@@ -4005,7 +4134,10 @@ impl ClientDispatchAuthority {
                         == generation.get() =>
             {
                 lifecycle.phase = RpcTransportPhase::Live(generation);
-                lifecycle.protocol = Some(RpcProtocolAuthority::new(generation));
+                lifecycle.protocol = Some(RpcProtocolAuthority::new_with_profile(
+                    generation,
+                    self.rpc_transport.protocol_profile,
+                ));
                 lifecycle.readiness_authority = readiness_authority;
                 lifecycle.reader_abort = reader_abort;
                 lifecycle.render_connection_identity = None;
@@ -4403,6 +4535,18 @@ macro_rules! rpc_surface {
             list_panes_coherent,
             ListPanesCoherent,
             ListPanesCoherentResponse
+        );
+        // Ordered-window requests pass admission only on a request-only
+        // client; every other profile rejects them before the wire.
+        rpc!(
+            list_panes_ordered_v1,
+            ListPanesOrderedV1,
+            ListPanesOrderedV1Response
+        );
+        rpc!(
+            reorder_window_tabs_v1,
+            ReorderWindowTabsV1,
+            ReorderWindowTabsV1Response
         );
         rpc!(spawn_v2, SpawnV2, SpawnResponse);
         rpc!(split_pane, SplitPane, SpawnResponse);
@@ -8053,6 +8197,13 @@ async fn client_thread_async(
                                 decoded_serial,
                                 payload.pdu_name()
                             );
+                            if decoded_serial == 0 && rpc_transport.drops_unsolicited() {
+                                log::trace!(
+                                    "request-only mux client dropped unsolicited {}",
+                                    payload.pdu_name()
+                                );
+                                continue;
+                            }
                             if decoded_serial == 0 {
                                 let MuxWireDecodedPayload::Pdu(pdu) = payload else {
                                     bail!(
@@ -8171,7 +8322,12 @@ async fn client_thread_async(
                                 decoded.serial,
                                 decoded.pdu.pdu_name()
                             );
-                            if decoded.serial == 0 {
+                            if decoded.serial == 0 && rpc_transport.drops_unsolicited() {
+                                log::trace!(
+                                    "request-only mux client dropped unsolicited {}",
+                                    decoded.pdu.pdu_name()
+                                );
+                            } else if decoded.serial == 0 {
                                 match topology.on_unilateral(decoded)? {
                                     ClientTopologyUnilateralAction::Buffered => {}
                                     ClientTopologyUnilateralAction::Route(routed) => {
@@ -8242,6 +8398,28 @@ async fn client_thread_async(
                                             generation,
                                             TopologyCapabilities::FENCED_SNAPSHOT_V1,
                                         )
+                                        .map_err(NotReconnectableError::ProtocolViolation)?;
+                                }
+                                // A successful ordered snapshot establishes its
+                                // negotiated set before the caller sees it, so
+                                // the caller's next PDU88 passes admission. The
+                                // header gate admits PDU87 only on the
+                                // request-only ordered profile.
+                                if let Pdu::ListPanesOrderedV1Response(ListPanesOrderedV1Response {
+                                    negotiated,
+                                    outcome: ListPanesOrderedV1Outcome::Snapshot(_),
+                                    ..
+                                }) = &decoded.pdu
+                                {
+                                    if binding.request != "ListPanesOrderedV1" {
+                                        bail!(
+                                            "ordered snapshot matched a {} RPC serial {}",
+                                            binding.request,
+                                            serial
+                                        );
+                                    }
+                                    rpc_transport
+                                        .establish_ordered_capabilities(generation, *negotiated)
                                         .map_err(NotReconnectableError::ProtocolViolation)?;
                                 }
                                 let completion = pending
@@ -9724,7 +9902,9 @@ impl Client {
         let client_id = ClientId::new();
         let incarnation = Arc::new(ClientIncarnation);
         let connection_generation = Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION));
-        let rpc_transport = Arc::new(RpcTransportState::new());
+        let rpc_transport = Arc::new(RpcTransportState::new_with_profile(
+            RpcProtocolProfile::for_client(local_domain_id, request_only),
+        ));
         let domain_reconnect_authorized = Arc::new(AtomicBool::new(local_domain_id.is_none()));
         let initial_dispatch_authority = ClientDispatchAuthority::new(
             local_domain_id,
@@ -20277,6 +20457,336 @@ mod tests {
             Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
             Arc::new(RpcTransportState::new()),
         )
+    }
+
+    fn ordered_lane_capabilities() -> TopologyCapabilities {
+        RpcProtocolAuthority::ordered_lane_activated_capabilities()
+    }
+
+    fn ordered_lane_list_request(capabilities: TopologyCapabilities) -> ListPanesOrderedV1 {
+        ListPanesOrderedV1 {
+            protocol_version: ORDERED_WINDOW_PROTOCOL_VERSION,
+            domain_binding_id: DomainBindingId::from_bytes([0x61; 16]),
+            supported: capabilities,
+            required: capabilities,
+        }
+    }
+
+    fn ordered_lane_window() -> OrderedWindowStateV1 {
+        OrderedWindowStateV1 {
+            window_id: RemoteWindowId::new(3),
+            order_revision: WindowOrderRevision::new(5),
+            ordered_tab_ids: vec![RemoteTabId::new(10), RemoteTabId::new(11)],
+            active_tab_id: Some(RemoteTabId::new(10)),
+        }
+    }
+
+    fn ordered_lane_snapshot_response(
+        request: &ListPanesOrderedV1,
+        stream_id: TopologyStreamId,
+        session_incarnation: MuxSessionIncarnation,
+    ) -> ListPanesOrderedV1Response {
+        ListPanesOrderedV1Response {
+            protocol_version: ORDERED_WINDOW_PROTOCOL_VERSION,
+            domain_binding_id: request.domain_binding_id,
+            negotiated: ordered_lane_capabilities(),
+            stream_id,
+            outcome: ListPanesOrderedV1Outcome::Snapshot(OrderedPaneSnapshotV1 {
+                session_incarnation,
+                topology_revision: TopologyRevision::new(40),
+                panes: ordered_pane_arena_from_list_panes(ListPanesResponse {
+                    tabs: Vec::new(),
+                    tab_titles: Vec::new(),
+                    window_titles: HashMap::new(),
+                    floating_panes: Vec::new(),
+                })
+                .expect("an empty ordered pane arena is valid"),
+                floating_panes: Vec::new(),
+                ordered_windows: vec![ordered_lane_window()],
+            }),
+        }
+    }
+
+    fn ordered_lane_reorder_request(
+        stream_id: TopologyStreamId,
+        session_incarnation: MuxSessionIncarnation,
+    ) -> ReorderWindowTabsV1 {
+        let window = ordered_lane_window();
+        ReorderWindowTabsV1 {
+            protocol_version: ORDERED_WINDOW_PROTOCOL_VERSION,
+            domain_binding_id: DomainBindingId::from_bytes([0x61; 16]),
+            stream_id,
+            session_incarnation,
+            window_id: window.window_id,
+            expected_order_revision: window.order_revision,
+            desired_tab_ids: vec![RemoteTabId::new(11), RemoteTabId::new(10)],
+            desired_active_tab_id: window.active_tab_id,
+            mutation_id: WindowOrderMutationId::new([0x62; 16], 1),
+            digest: WindowReorderDigest::ZERO,
+        }
+        .with_computed_digest()
+    }
+
+    #[test]
+    fn ordered_window_family_activates_only_for_the_request_only_profile() {
+        let generation = NonZeroU64::new(INITIAL_CONNECTION_GENERATION).unwrap();
+        let stream_id = TopologyStreamId::from_bytes([0x63; 16]);
+        let session = MuxSessionIncarnation::from_bytes([0x64; 16]);
+        let list = Pdu::ListPanesOrderedV1(ordered_lane_list_request(ordered_lane_capabilities()));
+        let reorder = Pdu::ReorderWindowTabsV1(ordered_lane_reorder_request(stream_id, session));
+
+        let mut ordinary = RpcProtocolAuthority::established_for_test(generation, CODEC_VERSION);
+        for pdu in [&list, &reorder] {
+            assert!(matches!(
+                ordinary.validate_outbound_pdu(pdu, RpcOutboundAdmissionPoint::Enqueue),
+                Err(OrdinaryMuxProtocolError::EndpointInactive { .. })
+            ));
+        }
+        assert!(matches!(
+            ordinary.establish_capabilities_from(
+                &<ListPanesOrderedV1Response as PduWireIdent>::WIRE_SPEC,
+                ordered_lane_capabilities(),
+            ),
+            Err(OrdinaryMuxProtocolError::CapabilityNotActivated { .. })
+        ));
+
+        let mut ordered = RpcProtocolAuthority::established_for_test(generation, CODEC_VERSION);
+        ordered.profile = RpcProtocolProfile::RequestOnlyOrdered;
+        ordered
+            .validate_outbound_pdu(&list, RpcOutboundAdmissionPoint::Enqueue)
+            .expect("the ordered profile may send PDU86");
+        let foundation = TopologyCapabilities::from_bits(
+            TopologyCapabilities::FENCED_SNAPSHOT_V1.bits()
+                | TopologyCapabilities::ORDERED_WINDOW_STREAM_V1.bits(),
+        );
+        assert!(matches!(
+            ordered.validate_outbound_pdu(
+                &Pdu::ListPanesOrderedV1(ordered_lane_list_request(foundation)),
+                RpcOutboundAdmissionPoint::Enqueue,
+            ),
+            Err(OrdinaryMuxProtocolError::CapabilityAdvertisementMismatch { .. })
+        ));
+        let fenced = TopologyCapabilities::FENCED_SNAPSHOT_V1;
+        ordered
+            .validate_outbound_pdu(
+                &Pdu::ListPanesCoherent(ListPanesCoherent {
+                    supported: fenced,
+                    required: fenced,
+                }),
+                RpcOutboundAdmissionPoint::Enqueue,
+            )
+            .expect("PDU81 stays fenced-only on the ordered profile");
+        assert!(matches!(
+            ordered.validate_outbound_pdu(
+                &Pdu::ListPanesCoherent(ListPanesCoherent {
+                    supported: ordered_lane_capabilities(),
+                    required: ordered_lane_capabilities(),
+                }),
+                RpcOutboundAdmissionPoint::Enqueue,
+            ),
+            Err(OrdinaryMuxProtocolError::CapabilityAdvertisementMismatch { .. })
+        ));
+
+        assert!(matches!(
+            ordered.validate_outbound_pdu(&reorder, RpcOutboundAdmissionPoint::Enqueue),
+            Err(OrdinaryMuxProtocolError::CapabilityNotEstablished { .. })
+        ));
+        ordered
+            .establish_capabilities_from(
+                &<ListPanesOrderedV1Response as PduWireIdent>::WIRE_SPEC,
+                ordered_lane_capabilities(),
+            )
+            .expect("PDU87 establishes the ordered lane's capabilities");
+        ordered
+            .validate_outbound_pdu(&reorder, RpcOutboundAdmissionPoint::Enqueue)
+            .expect("PDU88 passes once PDU87 has established CAS");
+        for (spec, role) in [
+            (
+                &<ReorderWindowTabsV1Response as PduWireIdent>::WIRE_SPEC,
+                PduWireRole::CorrelatedReply,
+            ),
+            (
+                &<WindowOrderEventV1 as PduWireIdent>::WIRE_SPEC,
+                PduWireRole::Unilateral,
+            ),
+        ] {
+            ordered
+                .validate_inbound(spec, role)
+                .unwrap_or_else(|err| panic!("{} must be admitted: {}", spec.name, err));
+        }
+        assert!(matches!(
+            ordered.validate_inbound(
+                &<GetPaneRenderDeliveryV1Response as PduWireIdent>::WIRE_SPEC,
+                PduWireRole::CorrelatedReply,
+            ),
+            Err(OrdinaryMuxProtocolError::EndpointInactive { .. })
+        ));
+    }
+
+    #[test]
+    fn only_a_request_only_standalone_client_gets_the_ordered_profile() {
+        assert_eq!(
+            RpcProtocolProfile::for_client(None, true),
+            RpcProtocolProfile::RequestOnlyOrdered
+        );
+        assert_eq!(
+            RpcProtocolProfile::for_client(None, false),
+            RpcProtocolProfile::Ordinary
+        );
+        assert_eq!(
+            RpcProtocolProfile::for_client(Some(7), true),
+            RpcProtocolProfile::Ordinary
+        );
+        assert!(
+            RpcTransportState::new_with_profile(RpcProtocolProfile::RequestOnlyOrdered)
+                .drops_unsolicited()
+        );
+        assert!(!RpcTransportState::new().drops_unsolicited());
+    }
+
+    /// A request-only client runs PDU86 -> PDU87 -> PDU88 -> PDU89 over a real
+    /// socket and reader, and drops every unsolicited PDU the ordered server
+    /// interleaves, including PDU90 order events and a legacy notification.
+    #[cfg(unix)]
+    #[test]
+    fn request_only_ordered_client_round_trips_reorder_and_drops_unsolicited() {
+        let _wd = hang_watchdog(20, "request-only ordered reorder round trip", 97);
+        let (client_stream, mut server_stream) =
+            UnixStream::pair().expect("create ordered-lane socket pair");
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("bound ordered-lane server reads");
+        server_stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .expect("bound ordered-lane server writes");
+        let stream_id = TopologyStreamId::from_bytes([0x65; 16]);
+        let session = MuxSessionIncarnation::from_bytes([0x66; 16]);
+
+        let server = std::thread::Builder::new()
+            .name("ft-ordered-lane-server".to_string())
+            .spawn(move || -> anyhow::Result<()> {
+                let order_event = |windows| {
+                    Pdu::WindowOrderEventV1(WindowOrderEventV1 {
+                        protocol_version: ORDERED_WINDOW_PROTOCOL_VERSION,
+                        stream_id,
+                        session_incarnation: session,
+                        topology_revision: TopologyRevision::new(41),
+                        windows,
+                    })
+                };
+                loop {
+                    let decoded =
+                        Pdu::decode(&mut server_stream).context("server decode client PDU")?;
+                    let (response, done) = match decoded.pdu {
+                        Pdu::GetCodecVersion(_) => (
+                            Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                codec_vers: CODEC_VERSION,
+                                version_string: "ft-ordered-lane-server".to_string(),
+                                executable_path: PathBuf::from("/usr/local/bin/ft"),
+                                config_file_path: None,
+                                min_supported: CODEC_VERSION,
+                            }),
+                            false,
+                        ),
+                        Pdu::SetClientId(_) => {
+                            Pdu::PaneRemoved(PaneRemoved { pane_id: 4 })
+                                .encode(&mut server_stream, 0)
+                                .context("encode unsolicited PaneRemoved")?;
+                            (Pdu::UnitResponse(UnitResponse {}), false)
+                        }
+                        Pdu::ListPanesOrderedV1(request) => (
+                            Pdu::ListPanesOrderedV1Response(ordered_lane_snapshot_response(
+                                &request, stream_id, session,
+                            )),
+                            false,
+                        ),
+                        Pdu::ReorderWindowTabsV1(request) => {
+                            let mut window = ordered_lane_window();
+                            window.order_revision = WindowOrderRevision::new(6);
+                            window.ordered_tab_ids = request.desired_tab_ids.clone();
+                            order_event(vec![window.clone()])
+                                .encode(&mut server_stream, 0)
+                                .context("encode unsolicited PDU90")?;
+                            Pdu::TabTitleChanged(TabTitleChanged {
+                                tab_id: 10,
+                                title: "unsolicited".to_string(),
+                            })
+                            .encode(&mut server_stream, 0)
+                            .context("encode unsolicited TabTitleChanged")?;
+                            (
+                                Pdu::ReorderWindowTabsV1Response(ReorderWindowTabsV1Response {
+                                    protocol_version: ORDERED_WINDOW_PROTOCOL_VERSION,
+                                    stream_id: request.stream_id,
+                                    session_incarnation: request.session_incarnation,
+                                    mutation_id: request.mutation_id,
+                                    request_digest: request.digest,
+                                    outcome: ReorderWindowTabsV1Outcome::Applied(
+                                        WindowOrderCommitV1 {
+                                            topology_revision: TopologyRevision::new(41),
+                                            window,
+                                        },
+                                    ),
+                                }),
+                                false,
+                            )
+                        }
+                        Pdu::Ping(_) => (Pdu::Pong(Pong {}), true),
+                        other => anyhow::bail!("unexpected client PDU: {}", other.pdu_name()),
+                    };
+                    response
+                        .encode(&mut server_stream, decoded.serial)
+                        .context("server encode response PDU")?;
+                    if let Pdu::ListPanesOrderedV1Response(_) = response {
+                        order_event(vec![ordered_lane_window()])
+                            .encode(&mut server_stream, 0)
+                            .context("encode unsolicited PDU90 after the snapshot")?;
+                    }
+                    Write::flush(&mut server_stream).context("server flush response PDU")?;
+                    if done {
+                        return Ok(());
+                    }
+                }
+            })
+            .expect("spawn ordered-lane UDS server");
+
+        let ui = ConnectionUI::new_headless();
+        let reconnectable = Reconnectable::new(
+            ClientDomainConfig::Unix(UnixDomain {
+                name: "ft-ordered-lane".to_string(),
+                no_serve_automatically: true,
+                read_timeout: Duration::from_secs(10),
+                write_timeout: Duration::from_secs(10),
+                ..Default::default()
+            }),
+            Some(Box::new(client_stream)),
+        );
+        let client = Client::new_with_dispatch(None, reconnectable, Weak::new(), true);
+        asupersync_block_on(client.verify_version_compat(&ui)).expect("handshake completes");
+
+        let list_request = ordered_lane_list_request(ordered_lane_capabilities());
+        let snapshot = asupersync_block_on(client.list_panes_ordered_v1(list_request.clone()))
+            .expect("PDU86 receives PDU87");
+        snapshot
+            .validate_for_request(&list_request)
+            .expect("PDU87 answers the exact PDU86");
+        assert_eq!(snapshot.stream_id, stream_id);
+
+        let reorder = ordered_lane_reorder_request(stream_id, session);
+        let response = asupersync_block_on(client.reorder_window_tabs_v1(reorder.clone()))
+            .expect("PDU88 receives PDU89 despite interleaved unsolicited PDUs");
+        assert_eq!(response.mutation_id, reorder.mutation_id);
+        assert_eq!(response.request_digest, reorder.digest);
+        assert!(matches!(
+            response.outcome,
+            ReorderWindowTabsV1Outcome::Applied(ref commit)
+                if commit.window.ordered_tab_ids == reorder.desired_tab_ids
+        ));
+
+        asupersync_block_on(client.ping()).expect("the lane stays live after every drop");
+        server
+            .join()
+            .expect("ordered-lane server joins")
+            .expect("ordered-lane server completes without protocol errors");
     }
 
     #[test]
