@@ -985,7 +985,10 @@ mod tests {
         let entries = build_move_tab_entries(&sample_args(LauncherFlags::MOVE_TAB_TO_WINDOW));
 
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].label, "Move tab to window 7: cargo build (2 tabs)");
+        assert_eq!(
+            entries[0].label,
+            "Move tab to window 7: cargo build (2 tabs)"
+        );
         assert_eq!(entries[0].action, KeyAssignment::MoveTabToWindow(7));
         assert_eq!(entries[1].label, "Move tab to window 12: notes (1 tab)");
         assert_eq!(entries[1].action, KeyAssignment::MoveTabToWindow(12));
@@ -999,7 +1002,10 @@ mod tests {
         args.active_tab_pane_count = 3;
         let entries = build_move_tab_entries(&args);
 
-        assert_eq!(entries[0].label, "Move active pane to window 7: cargo build (2 tabs)");
+        assert_eq!(
+            entries[0].label,
+            "Move active pane to window 7: cargo build (2 tabs)"
+        );
         assert_eq!(entries[2].label, "Move active pane to a new window");
     }
 

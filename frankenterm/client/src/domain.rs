@@ -972,7 +972,8 @@ fn ensure_pane_arena_append_order_is_sound(
                      containing a non-client pane"
                 );
             };
-            if !client_pane.belongs_to_client(inner) || client_pane.remote_tab_id() != remote_tab_id {
+            if !client_pane.belongs_to_client(inner) || client_pane.remote_tab_id() != remote_tab_id
+            {
                 bail!(
                     "ordered pane arena mapping {remote_tab_id}->{local_tab_id} does not belong \
                      exactly to this client and remote tab"
@@ -4112,7 +4113,7 @@ impl ClientDomain {
         // Keep each pane and its local identity: take it out of the local tab
         // that mirrors its old remote tab, without killing it, and let the
         // tree walk below install the same pane in the new tab's mirror.
-        #[allow(unreachable_code)] for (pane, new_remote_tab_id) in migrating_panes {
+        for (pane, new_remote_tab_id) in migrating_panes {
             migrate_client_pane_to_remote_tab(mux, &inner, &pane, new_remote_tab_id);
         }
         {
@@ -5008,7 +5009,8 @@ impl Domain for ClientDomain {
             let local_win_id = match window_id {
                 Some(requested) => {
                     place_tab_in_requested_window(mux, &tab, requested)?;
-                    mux.window_containing_tab(tab.tab_id()).unwrap_or(local_win_id)
+                    mux.window_containing_tab(tab.tab_id())
+                        .unwrap_or(local_win_id)
                 }
                 None => local_win_id,
             };
@@ -7276,8 +7278,14 @@ mod tests {
         place_tab_in_requested_window(&mux, &tab_54, mapped_window)
             .expect("place the mapped window's spawn");
 
-        assert_eq!(mux.window_containing_tab(tab_53.tab_id()), Some(layout_window_id));
-        assert_eq!(mux.window_containing_tab(tab_54.tab_id()), Some(mapped_window));
+        assert_eq!(
+            mux.window_containing_tab(tab_53.tab_id()),
+            Some(layout_window_id)
+        );
+        assert_eq!(
+            mux.window_containing_tab(tab_54.tab_id()),
+            Some(mapped_window)
+        );
         assert_eq!(mux.window_containing_tab(tab_51), Some(layout_window_id));
     }
 
@@ -7367,7 +7375,10 @@ mod tests {
             .iter_all_panes()
             .iter()
             .any(|pane| Arc::ptr_eq(pane, &moved_pane)));
-        assert_eq!(mux.window_containing_tab(new_tab_id), Some(target_window_id));
+        assert_eq!(
+            mux.window_containing_tab(new_tab_id),
+            Some(target_window_id)
+        );
         assert!(mux.get_tab(source_tab_id).is_none());
         assert!(mux.get_window(source_window_id).is_none());
         assert_eq!(mux.iter_panes().len(), 2);
