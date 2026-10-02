@@ -7556,10 +7556,15 @@ impl TopologyCapabilities {
 
     /// Runtime-advertised capabilities.
     ///
-    /// The current codec knows the ordered-window and exact-render bits, but none
-    /// may be advertised until their mux authority, server dispatch, and client
-    /// reconciliation beads complete. Keep this mask intentionally unchanged.
-    pub const SERVER_SUPPORTED: Self = Self::FENCED_SNAPSHOT_V1;
+    /// Ordered-window snapshots and per-window reorder compare-and-set are
+    /// advertised so that a client can commit a GUI tab move on the mux server.
+    /// Exact-render delivery stays unadvertised until its server dispatch and
+    /// client settlement work completes.
+    pub const SERVER_SUPPORTED: Self = Self(
+        Self::FENCED_SNAPSHOT_V1.0
+            | Self::ORDERED_WINDOW_STREAM_V1.0
+            | Self::WINDOW_REORDER_CAS_V1.0,
+    );
 
     pub const fn from_bits(bits: u64) -> Self {
         Self(bits)
@@ -7797,7 +7802,7 @@ pub const MAX_ORDERED_PANE_CENSUS_WORK_PER_TREE: usize = 32_767;
 pub const MAX_ORDERED_PANE_LEAVES_PER_SNAPSHOT: usize = 16_384;
 pub const MAX_ORDERED_PANE_NODES_PER_SNAPSHOT: usize = 32_767;
 /// Whole-attempt pane census and callback work ceiling shared by live PDU82
-/// and dormant PDU87 producers. Deterministic production-path measurements at
+/// and PDU87 producers. Deterministic production-path measurements at
 /// q1/q20/q50/q200 freeze the ordinary one-leaf cost at nineteen units: two
 /// tree visits, nine identity checks, seven pane callbacks, and one assembly
 /// node. Thirty-two units per maximum tiled leaf therefore leave thirteen
@@ -20580,7 +20585,7 @@ mod test {
     }
 
     #[test]
-    fn ordered_window_v1_capabilities_are_known_but_not_advertised() {
+    fn ordered_window_v1_capabilities_are_advertised_without_exact_render() {
         assert_eq!(
             TopologyCapabilities::ORDERED_WINDOW_STREAM_V1.bits(),
             1 << 1
@@ -20588,9 +20593,12 @@ mod test {
         assert_eq!(TopologyCapabilities::WINDOW_REORDER_CAS_V1.bits(), 1 << 2);
         assert_eq!(
             TopologyCapabilities::SERVER_SUPPORTED,
-            TopologyCapabilities::FENCED_SNAPSHOT_V1,
-            "codec knowledge must not activate ordered-window runtime support"
+            ordered_window_all_capabilities(),
+            "the server advertises exactly fenced snapshots, ordered windows and reorder CAS"
         );
+        assert!(TopologyCapabilities::SERVER_SUPPORTED.validate().is_ok());
+        assert!(!TopologyCapabilities::SERVER_SUPPORTED
+            .contains(TopologyCapabilities::EXACT_RENDER_DELIVERY_V1));
         assert!(ordered_window_all_capabilities().validate().is_ok());
         assert_eq!(
             TopologyCapabilities::WINDOW_REORDER_CAS_V1.validate(),
@@ -22432,6 +22440,8 @@ mod test {
         assert_eq!(
             TopologyCapabilities::SERVER_SUPPORTED.bits(),
             TopologyCapabilities::FENCED_SNAPSHOT_V1.bits()
+                | TopologyCapabilities::ORDERED_WINDOW_STREAM_V1.bits()
+                | TopologyCapabilities::WINDOW_REORDER_CAS_V1.bits()
         );
 
         let legacy = Pdu::ListPanesCoherent(ListPanesCoherent {
@@ -25945,7 +25955,7 @@ mod test {
     }
 
     #[test]
-    fn pdu_wire_registry_capability_use_is_exhaustive_and_keeps_ordering_disabled() {
+    fn pdu_wire_registry_capability_use_is_exhaustive_and_keeps_exact_render_disabled() {
         let fenced = TopologyCapabilities::FENCED_SNAPSHOT_V1;
         let ordered = TopologyCapabilities::from_bits(
             fenced.bits() | TopologyCapabilities::ORDERED_WINDOW_STREAM_V1.bits(),
@@ -25983,11 +25993,8 @@ mod test {
             );
         }
 
-        assert_eq!(TopologyCapabilities::SERVER_SUPPORTED, fenced);
-        assert!(!TopologyCapabilities::SERVER_SUPPORTED
-            .contains(TopologyCapabilities::ORDERED_WINDOW_STREAM_V1));
-        assert!(!TopologyCapabilities::SERVER_SUPPORTED
-            .contains(TopologyCapabilities::WINDOW_REORDER_CAS_V1));
+        assert_eq!(TopologyCapabilities::SERVER_SUPPORTED, reorder);
+        assert!(TopologyCapabilities::SERVER_SUPPORTED.contains(ordered));
         assert!(!TopologyCapabilities::SERVER_SUPPORTED
             .contains(TopologyCapabilities::EXACT_RENDER_DELIVERY_V1));
     }
