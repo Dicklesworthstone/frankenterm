@@ -168,7 +168,12 @@ fn pane_entries(panes: ListPanesResponse) -> Vec<PaneEntry> {
             }
         }
     }
-    out.extend(panes.floating_panes.into_iter().map(|floating| floating.pane));
+    out.extend(
+        panes
+            .floating_panes
+            .into_iter()
+            .map(|floating| floating.pane),
+    );
     out
 }
 
@@ -212,7 +217,10 @@ async fn requested_source(
         let value = value
             .into_string()
             .map_err(|v| anyhow!("$WEZTERM_PANE is {v:?}, which is not a pane id"))?;
-        return Ok(Some((parse_env_pane(&value)?, SourceOrigin::WeztermPaneEnv)));
+        return Ok(Some((
+            parse_env_pane(&value)?,
+            SourceOrigin::WeztermPaneEnv,
+        )));
     }
     let mut clients = client
         .list_clients()
@@ -335,8 +343,8 @@ async fn run_move_pane_to_new_tab(
     args: MovePaneToNewTabArgs,
 ) -> anyhow::Result<()> {
     let entries = pane_entries(client.list_panes().await?);
-    let source = find_source(&entries, requested_source(client, args.pane_id).await?)?
-        .ok_or_else(|| {
+    let source =
+        find_source(&entries, requested_source(client, args.pane_id).await?)?.ok_or_else(|| {
             anyhow!("no pane to move: pass --pane-id, or run inside a FrankenTerm pane")
         })?;
     let pane_id = source.pane_id;

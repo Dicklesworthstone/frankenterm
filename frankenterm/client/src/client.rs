@@ -3720,9 +3720,7 @@ enum ClientDispatchTarget {
     /// No local domain. `request_only` marks a client that keeps no
     /// topology state at all (a one-shot CLI), so no notification can leave
     /// it out of date and every unilateral PDU is safe to ignore.
-    Standalone {
-        request_only: bool,
-    },
+    Standalone { request_only: bool },
     Attached {
         local_domain_id: DomainId,
         mux_owner: Weak<Mux>,
