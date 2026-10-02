@@ -7530,8 +7530,12 @@ impl TermWindow {
         let Some(mux) = self.mux_or_log("update window title") else {
             return;
         };
-        let window = match mux.get_window(self.mux_window_id) {
-            Some(window) => window,
+        // Read the tab count and release the `mux.windows` read guard at once.
+        // get_tab_information takes the same guard again, and parking_lot's
+        // RwLock blocks a second read while a writer waits, so holding this
+        // guard across it deadlocks against any `mux.windows.write()`.
+        let num_tabs = match mux.get_window(self.mux_window_id) {
+            Some(window) => window.len(),
             _ => return,
         };
         let tabs = self.get_tab_information();
@@ -7589,11 +7593,9 @@ impl TermWindow {
             }
         }
 
-        let num_tabs = window.len();
         if num_tabs == 0 {
             return;
         }
-        drop(window);
 
         let title = match config::run_immediate_with_lua_config(|lua| {
             if let Some(lua) = lua {
