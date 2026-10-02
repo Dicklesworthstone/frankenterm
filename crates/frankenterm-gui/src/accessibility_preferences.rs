@@ -267,6 +267,13 @@ pub fn palette_with_accessibility_preferences(
 
 #[must_use]
 pub fn config_with_accessibility_palette(config: config::ConfigHandle) -> config::ConfigHandle {
+    // A palette the user chose explicitly (`colors` or `color_scheme`) wins
+    // over the desktop's light/dark preference. Without this, a desktop that
+    // reports "prefer-light" (as KDE does through gsettings even with a dark
+    // theme) paints a light palette over the user's colors.
+    if config.colors.is_some() || config.color_scheme.is_some() {
+        return config;
+    }
     let prefs = AccessibilityPreferenceOverrides::default().resolve(probe_platform_preferences());
     let resolved_palette = palette_with_accessibility_preferences(&config.resolved_palette, prefs);
     config.with_resolved_palette(resolved_palette)
@@ -503,6 +510,25 @@ mod tests {
         );
 
         assert_eq!(result, base);
+    }
+
+    #[test]
+    fn explicit_colors_are_not_overlaid_by_desktop_preference() {
+        let colors = config::Palette {
+            background: Some(config::RgbaColor::try_from("#2e3440".to_string()).unwrap()),
+            ..Default::default()
+        };
+        let mut cfg = config::Config::default();
+        cfg.colors = Some(colors.clone());
+        cfg.resolved_palette = colors;
+        let handle = config::ConfigHandle::detached(cfg);
+
+        // Whatever the desktop reports, the configured palette is kept.
+        let result = config_with_accessibility_palette(handle);
+        assert_eq!(
+            result.resolved_palette.background,
+            Some(config::RgbaColor::try_from("#2e3440".to_string()).unwrap())
+        );
     }
 
     #[test]
