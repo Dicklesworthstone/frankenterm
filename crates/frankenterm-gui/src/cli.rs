@@ -1,15 +1,22 @@
 //! `frankenterm-gui cli`: talk to a running mux over its unix socket.
 //!
-//! This is a small subset of upstream `wezterm cli` (spawn, list and
-//! move-pane-to-new-tab). It needs
+//! This is a small subset of upstream `wezterm cli` (spawn, list,
+//! move-pane-to-new-tab and move-tab). It needs
 //! no display, so an agent running inside a pane can open a tab in the window
 //! it lives in.
 
 use anyhow::{Context, anyhow};
 use clap::{Parser, ValueHint};
-use codec::{ListPanesResponse, MovePaneToNewTab, SpawnV2};
+use codec::{
+    DomainBindingId, ListPanesResponse, MovePaneToNewTab, OrderedWindowStateV1, RemoteTabId,
+    SpawnV2, WindowOrderRevision,
+};
 use config::keyassignment::SpawnTabDomain;
 use frankenterm_client::client::Client;
+use frankenterm_client::ordered_reorder::{
+    self, AcceptedSnapshot, DesiredWindowOrder, MutationNamespace, ReorderDecision,
+    WindowOrderCommitOutcome, WindowOrderIntent,
+};
 use mux::tab::PaneEntry;
 use mux::window::WindowId;
 use portable_pty::cmdbuilder::CommandBuilder;
@@ -36,6 +43,11 @@ enum CliSubCommand {
     /// Move a pane into a new tab, in an existing window or a new one.
     #[command(name = "move-pane-to-new-tab")]
     MovePaneToNewTab(MovePaneToNewTabArgs),
+
+    /// Move a tab to another position in its window, committed on the mux
+    /// server, and print the window's committed tab order.
+    #[command(name = "move-tab")]
+    MoveTab(MoveTabArgs),
 }
 
 #[derive(Debug, Parser, Clone)]
@@ -94,6 +106,23 @@ struct MovePaneToNewTabArgs {
 }
 
 #[derive(Debug, Parser, Clone)]
+struct MoveTabArgs {
+    /// The tab to move, as `cli list` shows it.
+    #[arg(long)]
+    tab_id: u64,
+
+    /// The new zero-based position. A position past the end means last.
+    #[arg(long)]
+    index: usize,
+
+    /// Send one compare-and-set against this window order revision, with no
+    /// rebase or retry, and print the server's decision. A stale revision
+    /// shows the conflict path.
+    #[arg(long)]
+    expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Parser, Clone)]
 struct ListArgs {
     /// Print JSON instead of a table.
     #[arg(long)]
@@ -113,6 +142,7 @@ pub fn run_cli(cmd: CliCommand) -> anyhow::Result<()> {
             CliSubCommand::Spawn(args) => run_spawn(&client, args).await,
             CliSubCommand::List(args) => run_list(&client, args).await,
             CliSubCommand::MovePaneToNewTab(args) => run_move_pane_to_new_tab(&client, args).await,
+            CliSubCommand::MoveTab(args) => run_move_tab(&client, args).await,
         };
         // Dropping the client makes its reconnect thread log a spurious
         // "won't try to reconnect" error, so leave before that happens.
@@ -370,6 +400,110 @@ async fn run_move_pane_to_new_tab(
     Ok(())
 }
 
+/// `window <id> revision <n>: <tab ids in order>`.
+fn describe_window_order(window: &OrderedWindowStateV1) -> String {
+    let tabs: Vec<String> = window
+        .ordered_tab_ids
+        .iter()
+        .map(|tab| tab.get().to_string())
+        .collect();
+    format!(
+        "window {} revision {}: {}",
+        window.window_id.get(),
+        window.order_revision.get(),
+        tabs.join(" ")
+    )
+}
+
+/// A fresh binding for each run. The CLI owns no durable layout, so the
+/// server must not mistake two runs for one attachment.
+fn random_binding() -> DomainBindingId {
+    // A v4 UUID carries fixed version bits, so it is never the reserved zero.
+    DomainBindingId::from_bytes(uuid::Uuid::new_v4().into_bytes())
+}
+
+async fn run_move_tab(client: &Client, args: MoveTabArgs) -> anyhow::Result<()> {
+    let tab_id = RemoteTabId::new(args.tab_id);
+    let binding = random_binding();
+    if let Some(revision) = args.expected_revision {
+        return run_single_reorder_cas(client, binding, tab_id, args.index, revision).await;
+    }
+    let namespace = MutationNamespace::random()?;
+    let intent = WindowOrderIntent {
+        domain_binding_id: binding,
+        expected_session: None,
+        desired: DesiredWindowOrder::MoveTab {
+            tab_id,
+            index: args.index,
+        },
+    };
+    let outcome = ordered_reorder::commit_window_order(client, &namespace, &intent)
+        .await
+        .context("commit the tab order on the mux server")?;
+    match outcome {
+        WindowOrderCommitOutcome::Applied { window, rebased, .. } => {
+            let how = if rebased { "applied (rebased)" } else { "applied" };
+            println!("{how}: {}", describe_window_order(&window));
+            Ok(())
+        }
+        WindowOrderCommitOutcome::Unchanged { window } => {
+            println!("unchanged: {}", describe_window_order(&window));
+            Ok(())
+        }
+        WindowOrderCommitOutcome::ServerWins { window, reason } => {
+            println!("server kept its order: {}", describe_window_order(&window));
+            anyhow::bail!("the move was not applied: {reason:?}")
+        }
+        WindowOrderCommitOutcome::UnknownTab(_) => {
+            anyhow::bail!("tab {} is in no server window", args.tab_id)
+        }
+        other => anyhow::bail!("the move was not applied: {other:?}"),
+    }
+}
+
+/// One PDU88 with a caller-chosen expected revision, for testing the
+/// server's compare-and-set. Nothing is refreshed, rebased or retried.
+async fn run_single_reorder_cas(
+    client: &Client,
+    binding: DomainBindingId,
+    tab_id: RemoteTabId,
+    index: usize,
+    expected_revision: u64,
+) -> anyhow::Result<()> {
+    let list = ordered_reorder::ordered_list_request(binding);
+    let response = client.list_panes_ordered_v1(list.clone()).await?;
+    let (session, snapshot) = match ordered_reorder::accept_ordered_snapshot(&list, response)? {
+        AcceptedSnapshot::Ready { session, snapshot } => (session, snapshot),
+        AcceptedSnapshot::Unavailable(unavailable) => {
+            anyhow::bail!("the server gave no ordered snapshot: {unavailable:?}")
+        }
+    };
+    let mut window = snapshot
+        .ordered_windows
+        .into_iter()
+        .find(|window| window.ordered_tab_ids.contains(&tab_id))
+        .ok_or_else(|| anyhow!("tab {} is in no server window", tab_id.get()))?;
+    let desired = ordered_reorder::move_tab_order(&window.ordered_tab_ids, tab_id, index)
+        .ok_or_else(|| anyhow!("tab {} is in no server window", tab_id.get()))?;
+    window.order_revision = WindowOrderRevision::new(expected_revision);
+    let mutation_id = MutationNamespace::random()?
+        .next_id()
+        .ok_or_else(|| anyhow!("a fresh mutation namespace has no ids"))?;
+    let request = ordered_reorder::build_reorder_request(&session, &window, desired, mutation_id)?;
+    let response = client.reorder_window_tabs_v1(request.clone()).await?;
+    match ordered_reorder::correlate_reorder_response(&request, &response)? {
+        ReorderDecision::Applied { commit, .. } => {
+            println!("applied: {}", describe_window_order(&commit.window));
+            Ok(())
+        }
+        ReorderDecision::Conflict { commit, .. } => {
+            println!("conflict: {}", describe_window_order(&commit.window));
+            anyhow::bail!("revision {expected_revision} is stale")
+        }
+        other => anyhow::bail!("the server rejected the move: {other:?}"),
+    }
+}
+
 async fn run_list(client: &Client, args: ListArgs) -> anyhow::Result<()> {
     let entries = pane_entries(client.list_panes().await?);
     if args.json {
@@ -511,5 +645,37 @@ mod tests {
         assert_eq!(newest_window_in_workspace(&entries, "default"), Some(3));
         assert_eq!(newest_window_in_workspace(&entries, "ops"), Some(9));
         assert_eq!(newest_window_in_workspace(&entries, "empty"), None);
+    }
+
+    #[test]
+    fn a_window_order_prints_its_tabs_in_order() {
+        let window = OrderedWindowStateV1 {
+            window_id: codec::RemoteWindowId::new(2),
+            order_revision: WindowOrderRevision::new(5),
+            ordered_tab_ids: [7, 3, 9].into_iter().map(RemoteTabId::new).collect(),
+            active_tab_id: Some(RemoteTabId::new(3)),
+        };
+        assert_eq!(describe_window_order(&window), "window 2 revision 5: 7 3 9");
+    }
+
+    #[test]
+    fn each_run_gets_a_fresh_nonzero_binding() {
+        let first = random_binding();
+        assert_ne!(first.as_bytes(), [0; 16]);
+        assert_ne!(first, random_binding());
+    }
+
+    #[test]
+    fn move_tab_parses_its_arguments() {
+        let cmd = CliCommand::try_parse_from([
+            "cli", "move-tab", "--tab-id", "4", "--index", "0", "--expected-revision", "1",
+        ])
+        .unwrap();
+        let CliSubCommand::MoveTab(args) = cmd.sub else {
+            panic!("expected move-tab, got {:?}", cmd.sub);
+        };
+        assert_eq!(args.tab_id, 4);
+        assert_eq!(args.index, 0);
+        assert_eq!(args.expected_revision, Some(1));
     }
 }
