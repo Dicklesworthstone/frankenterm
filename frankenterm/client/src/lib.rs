@@ -3,6 +3,7 @@
 pub mod client;
 pub mod discovery;
 pub mod domain;
+pub mod ordered_reorder;
 pub mod pane;
 
 #[cfg(test)]
