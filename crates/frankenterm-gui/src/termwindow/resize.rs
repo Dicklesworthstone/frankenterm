@@ -821,8 +821,14 @@ impl super::TermWindow {
             // above; record the additional cause without invalidating twice.
             self.record_render_invalidation(RenderInvalidationCause::TerminalGrid);
             if let Some(mux) = Mux::try_get() {
-                if let Some(window) = mux.get_window(self.mux_window_id) {
+                // Capture before taking the `mux.windows` read guard: the
+                // capture takes pane_authority, tabs and windows itself, the
+                // reverse of the mux's write order, so holding the guard
+                // across it can deadlock.
+                if mux.get_window(self.mux_window_id).is_some() {
                     self.capture_remote_viewports_before_resize(&mux);
+                }
+                if let Some(window) = mux.get_window(self.mux_window_id) {
                     for index in resize_tab_indices(window.len(), window.get_active_idx()) {
                         if let Some(tab) = window.get_by_idx(index) {
                             tab.resize(size);
