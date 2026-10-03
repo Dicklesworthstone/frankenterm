@@ -1469,7 +1469,6 @@ impl GuiFrontEnd {
         *self.switching_workspaces.borrow()
     }
 
-    #[allow(dead_code)]
     pub fn gui_window_for_mux_window(&self, mux_window_id: MuxWindowId) -> Option<GuiWin> {
         let windows = self.known_windows.borrow();
         for (window, v) in windows.iter() {

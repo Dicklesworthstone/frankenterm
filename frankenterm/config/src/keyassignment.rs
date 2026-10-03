@@ -34,6 +34,7 @@ bitflags::bitflags! {
         const KEY_ASSIGNMENTS = 16;
         const WORKSPACES = 32;
         const COMMANDS = 64;
+        const MOVE_TAB_TO_WINDOW = 128;
     }
 }
 
@@ -89,6 +90,9 @@ impl ToString for LauncherFlags {
         if self.contains(Self::COMMANDS) {
             s.push("COMMANDS");
         }
+        if self.contains(Self::MOVE_TAB_TO_WINDOW) {
+            s.push("MOVE_TAB_TO_WINDOW");
+        }
         s.join("|")
     }
 }
@@ -109,6 +113,7 @@ impl TryFrom<String> for LauncherFlags {
                 "KEY_ASSIGNMENTS" => flags |= Self::KEY_ASSIGNMENTS,
                 "WORKSPACES" => flags |= Self::WORKSPACES,
                 "COMMANDS" => flags |= Self::COMMANDS,
+                "MOVE_TAB_TO_WINDOW" => flags |= Self::MOVE_TAB_TO_WINDOW,
                 _ => {
                     return Err(format!("invalid LauncherFlags `{}` in `{}`", ele, s));
                 }
@@ -704,6 +709,13 @@ pub enum KeyAssignment {
     ActivateWindowRelativeNoWrap(isize),
     UnifyWindowsOnActiveDomain,
     UnifyAllWindows,
+    /// Pick another window and move the active tab there.
+    ShowMoveTabToWindow,
+    /// Move the active tab into the window with this mux window id.
+    /// A tab with several panes moves only its active pane.
+    MoveTabToWindow(usize),
+    /// Move the active tab into a new window.
+    MoveTabToNewWindow,
     PromptInputLine(PromptInputLine),
     InputSelector(InputSelector),
     Confirmation(Confirmation),
@@ -842,6 +854,13 @@ mod tests {
         assert!(flags.contains(LauncherFlags::FUZZY));
         assert!(flags.contains(LauncherFlags::TABS));
         assert!(flags.contains(LauncherFlags::DOMAINS));
+    }
+
+    #[test]
+    fn launcher_flags_move_tab_to_window_roundtrip() {
+        let flags = LauncherFlags::FUZZY | LauncherFlags::MOVE_TAB_TO_WINDOW;
+        assert_eq!(flags.to_string(), "FUZZY|MOVE_TAB_TO_WINDOW");
+        assert_eq!(LauncherFlags::try_from(flags.to_string()).unwrap(), flags);
     }
 
     #[test]
