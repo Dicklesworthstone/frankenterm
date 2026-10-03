@@ -805,11 +805,9 @@ impl super::TermWindow {
     pub fn selection_frame_geometry(&self, pos: &mux::tab::PositionedPane) -> Option<[usize; 12]> {
         let (padding_left, padding_top) = self.padding_left_top();
         let border = self.get_os_border();
-        let top_bar = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height().ok()?
-        } else {
-            0.0
-        };
+        let tab_bar_insets = self.tab_bar_insets().ok()?;
+        let top_bar = tab_bar_insets.top;
+        let left_bar = tab_bar_insets.left;
         Some([
             self.render_metrics.cell_size.width as usize,
             self.render_metrics.cell_size.height as usize,
@@ -819,7 +817,7 @@ impl super::TermWindow {
             pos.height,
             self.dimensions.pixel_width,
             self.dimensions.pixel_height,
-            (padding_left + border.left.get() as f32).to_bits() as usize,
+            (padding_left + left_bar + border.left.get() as f32).to_bits() as usize,
             (padding_top + top_bar + border.top.get() as f32).to_bits() as usize,
             self.shape_generation,
             self.config.generation() as usize,

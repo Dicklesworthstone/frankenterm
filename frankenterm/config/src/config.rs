@@ -785,6 +785,21 @@ pub struct Config {
     #[dynamic(default)]
     pub tab_bar_at_bottom: bool,
 
+    /// Where to place the tab bar: `Top` (default), `Bottom`, `Left` or
+    /// `Right`.  When left at `Top`, the legacy `tab_bar_at_bottom` option
+    /// is still honoured; see `effective_tab_bar_position`.
+    #[dynamic(default)]
+    pub tab_bar_position: TabBarPosition,
+
+    /// Width, in cells, of the tab bar when it is placed on the left or right.
+    #[dynamic(default = "default_vertical_tab_width")]
+    pub vertical_tab_width: usize,
+
+    /// Height, in cell rows, of each tab when the tab bar is placed on the
+    /// left or right.
+    #[dynamic(default = "default_vertical_tab_cell_height")]
+    pub vertical_tab_cell_height: usize,
+
     #[dynamic(default = "default_true")]
     pub mouse_wheel_scrolls_tabs: bool,
 
@@ -1786,6 +1801,31 @@ impl Config {
         map
     }
 
+    /// Returns the effective tab bar position, taking into account both
+    /// `tab_bar_position` and the legacy `tab_bar_at_bottom` option.
+    pub fn effective_tab_bar_position(&self) -> TabBarPosition {
+        if self.tab_bar_position != TabBarPosition::Top {
+            self.tab_bar_position
+        } else if self.tab_bar_at_bottom {
+            TabBarPosition::Bottom
+        } else {
+            TabBarPosition::Top
+        }
+    }
+
+    /// Returns true if the tab bar is placed vertically (left or right).
+    pub fn is_vertical_tab_bar(&self) -> bool {
+        matches!(
+            self.effective_tab_bar_position(),
+            TabBarPosition::Left | TabBarPosition::Right
+        )
+    }
+
+    /// Returns true if a horizontal tab bar is placed at the bottom of the window.
+    pub fn is_tab_bar_at_bottom(&self) -> bool {
+        self.effective_tab_bar_position() == TabBarPosition::Bottom
+    }
+
     /// In some cases we need to compute expanded values based
     /// on those provided by the user.  This is where we do that.
     pub fn compute_extra_defaults(&self, config_path: Option<&Path>) -> Self {
@@ -2759,6 +2799,14 @@ fn default_tab_max_width() -> usize {
     16
 }
 
+fn default_vertical_tab_width() -> usize {
+    20
+}
+
+fn default_vertical_tab_cell_height() -> usize {
+    1
+}
+
 fn default_update_interval() -> u64 {
     86400
 }
@@ -2777,6 +2825,16 @@ fn default_inactive_pane_hsb() -> HsbTransform {
         saturation: 0.9,
         hue: 1.0,
     }
+}
+
+/// Where the tab bar is placed in the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic, Default)]
+pub enum TabBarPosition {
+    #[default]
+    Top,
+    Bottom,
+    Left,
+    Right,
 }
 
 #[derive(FromDynamic, ToDynamic, Clone, Copy, Debug, Default)]
@@ -3181,6 +3239,60 @@ mod tests {
             .check_consistency()
             .expect_err("zero healthy-session fence would erase every finite failure budget");
         assert!(error.to_string().contains("healthy_session_ms"));
+    }
+
+    // ── Tab bar position ───────────────────────────────────────
+
+    #[test]
+    fn effective_tab_bar_position_honours_legacy_bottom_flag() {
+        let mut config = Config::default();
+        assert_eq!(config.effective_tab_bar_position(), TabBarPosition::Top);
+        assert!(!config.is_vertical_tab_bar());
+        assert!(!config.is_tab_bar_at_bottom());
+
+        config.tab_bar_at_bottom = true;
+        assert_eq!(config.effective_tab_bar_position(), TabBarPosition::Bottom);
+        assert!(config.is_tab_bar_at_bottom());
+
+        // An explicit position wins over the legacy flag.
+        config.tab_bar_position = TabBarPosition::Left;
+        assert_eq!(config.effective_tab_bar_position(), TabBarPosition::Left);
+        assert!(config.is_vertical_tab_bar());
+        assert!(!config.is_tab_bar_at_bottom());
+
+        config.tab_bar_position = TabBarPosition::Right;
+        assert!(config.is_vertical_tab_bar());
+
+        config.tab_bar_at_bottom = false;
+        config.tab_bar_position = TabBarPosition::Bottom;
+        assert!(config.is_tab_bar_at_bottom());
+        assert!(!config.is_vertical_tab_bar());
+    }
+
+    #[test]
+    fn vertical_tab_bar_options_parse_from_dynamic() {
+        let mut obj = frankenterm_dynamic::Object::default();
+        obj.insert(
+            Value::String("tab_bar_position".to_string()),
+            Value::String("Left".to_string()),
+        );
+        obj.insert(
+            Value::String("vertical_tab_width".to_string()),
+            Value::U64(25),
+        );
+        obj.insert(
+            Value::String("vertical_tab_cell_height".to_string()),
+            Value::U64(2),
+        );
+        let config =
+            Config::from_dynamic(&Value::Object(obj), FromDynamicOptions::default()).unwrap();
+        assert_eq!(config.tab_bar_position, TabBarPosition::Left);
+        assert_eq!(config.vertical_tab_width, 25);
+        assert_eq!(config.vertical_tab_cell_height, 2);
+
+        let defaults = Config::default();
+        assert_eq!(defaults.vertical_tab_width, 20);
+        assert_eq!(defaults.vertical_tab_cell_height, 1);
     }
 
     // ── DroppedFileQuoting::escape ─────────────────────────────

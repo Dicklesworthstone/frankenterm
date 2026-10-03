@@ -244,13 +244,11 @@ impl CommandPalette {
             .context("failed to resolve command palette font")?;
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
 
-        let top_bar_height = if term_window.show_tab_bar && !term_window.config.tab_bar_at_bottom {
-            term_window
-                .tab_bar_pixel_height()
-                .context("failed to compute tab bar height")?
-        } else {
-            0.
-        };
+        let tab_bar_insets = term_window
+            .tab_bar_insets()
+            .context("failed to compute tab bar size")?;
+        let top_bar_height = tab_bar_insets.top;
+        let left_bar_width = tab_bar_insets.left;
         let (padding_left, padding_top) = term_window.padding_left_top();
         let border = term_window.get_os_border();
         let top_pixel_y = top_bar_height + padding_top + border.top.get() as f32;
@@ -509,7 +507,7 @@ impl CommandPalette {
                     pixel_cell: metrics.cell_size.width as f32,
                 },
                 bounds: euclid::rect(
-                    padding_left + x_adjust,
+                    left_bar_width + padding_left + x_adjust,
                     top_pixel_y,
                     desired_pixel_width,
                     size.rows as f32 * term_window.render_metrics.cell_size.height as f32,

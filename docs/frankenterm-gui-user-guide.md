@@ -151,6 +151,11 @@ Current default key set from `crates/frankenterm-gui/frankenterm.toml`:
 | `enable_tab_bar` | `true` | show/hide tab bar |
 | `hide_tab_bar_if_only_one_tab` | `false` | keeps the macOS integrated titlebar surface visible |
 | `tab_bar_at_bottom` | `false` | set `true` for bottom tab bar |
+| `tab_bar_position` | `"Top"` | `"Top"`, `"Bottom"`, `"Left"` or `"Right"`; any value other than `"Top"` overrides `tab_bar_at_bottom` |
+| `vertical_tab_width` | `20` | width in cells of a `"Left"` or `"Right"` tab bar |
+| `vertical_tab_cell_height` | `1` | rows per tab in a `"Left"` or `"Right"` tab bar |
+| `[colors.tab_bar.inactive_tab_bell]` | bg `#8b4513`, fg `#ffffff` | colors for an inactive tab whose bell rang since it was last active |
+| `[colors.tab_bar.inactive_tab_bell_hover]` | bg `#a0522d`, fg `#ffffff`, italic | same, while the mouse is over the tab |
 | `[leader]` (optional) | unset | tmux-style leader key chord |
 | `unix_domains` | implicit `"unix"` domain | add custom domains only for non-default mux sockets |
 | `resize_wrap_scorecard_enabled` | `true` | emits resize wrap quality telemetry |
@@ -169,6 +174,42 @@ Swap layouts and floating panes are currently keybinding-driven features, not
 TOML-gated features. The default sample config does not list `swap_layout_*` or
 `floating_pane_*` keys because those fields are not parsed as active GUI config
 fields yet.
+
+### Vertical tab bar and bell colors
+
+A tab bar at the top or bottom shows few readable titles once many tabs are
+open. Set `tab_bar_position = "Left"` or `"Right"` to show the tabs as a
+column instead:
+
+```toml
+tab_bar_position = "Left"
+vertical_tab_width = 24       # cells
+vertical_tab_cell_height = 1  # rows per tab
+```
+
+- A vertical tab bar always uses the retro style, even when
+  `use_fancy_tab_bar = true`.
+- Tabs that do not fit in the window height are clipped. The new-tab button
+  follows the last tab.
+- `tab_bar_at_bottom = true` still works. It applies only while
+  `tab_bar_position` is `"Top"` (the default).
+
+When the bell rings in a tab that is not active, that tab is drawn with
+`colors.tab_bar.inactive_tab_bell` until you switch to it. This works in the
+retro, fancy and vertical tab bars. To change the colors:
+
+```toml
+[colors.tab_bar.inactive_tab_bell]
+bg_color = "#aa5500"
+fg_color = "#ffffff"
+
+[colors.tab_bar.inactive_tab_bell_hover]
+bg_color = "#bb6600"
+fg_color = "#ffffff"
+italic = true
+```
+
+Lua `format-tab-title` handlers can read the same flag as `tab.has_bell`.
 
 SSH domain fields (optional per entry):
 
