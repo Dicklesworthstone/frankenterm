@@ -1061,6 +1061,9 @@ fn ensure_pane_arena_append_order_is_sound(
                 );
             }
         }
+        // get_tab below takes `mux.tabs`; holding the `mux.windows` read
+        // guard across it reverses the mux's tabs-then-windows lock order.
+        drop(window);
 
         for remote_tab_id in &desired_remote_tabs {
             let Some(local_tab_id) = remote_to_local_tab.get(remote_tab_id).copied() else {
