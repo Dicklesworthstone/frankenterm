@@ -132,18 +132,18 @@
         "docs": 1,
         "feat": 2,
         "fix": 6,
-        "other": 4,
+        "other": 5,
         "refactor": 2,
         "rename": 1,
         "test": 6
       },
-      "fork_side_commit_count": 22,
+      "fork_side_commit_count": 23,
       "last_modified": {
-        "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-21T15:55:14-04:00",
-        "sha": "f57e64ea25e1a09917fea7061dd695c1583d1d7d",
-        "subject": "fix(build): preserve generated emoji hashes and prove content freshness"
+        "author": "dependabot[bot]",
+        "classification": "other",
+        "committed_at": "2026-09-28T13:41:39Z",
+        "sha": "e73b0d7e4a618381683087d7158d4967d8552aab",
+        "subject": "deps: bump the rust-deps group with 14 updates"
       },
       "name": "frankenterm-char-props",
       "path": "frankenterm/char-props",
@@ -156,7 +156,7 @@
         "cleanup": 2,
         "cosmetic": 20,
         "feat": 55,
-        "fix": 117,
+        "fix": 120,
         "other": 17,
         "refactor": 5,
         "rename": 2,
@@ -164,13 +164,13 @@
         "security-fix": 2,
         "test": 40
       },
-      "fork_side_commit_count": 267,
+      "fork_side_commit_count": 270,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-23T10:17:28-04:00",
-        "sha": "5787a3d2aea4d64f3bc93a360ab8fa656e33b81b",
-        "subject": "fix(selection): distinguish owner and cache remap refusals"
+        "committed_at": "2026-10-02T21:41:17-04:00",
+        "sha": "f049e66bd3c8409f1e7d62cf735cc831dcb5269d",
+        "subject": "fix(release): land the eleven v0.15.21 ship-blockers and review should-fixes (ft-u5tr5)"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -183,8 +183,8 @@
         "cleanup": 1,
         "cosmetic": 21,
         "docs": 2,
-        "feat": 44,
-        "fix": 64,
+        "feat": 46,
+        "fix": 65,
         "other": 21,
         "refactor": 2,
         "rename": 2,
@@ -192,13 +192,13 @@
         "security-fix": 1,
         "test": 84
       },
-      "fork_side_commit_count": 248,
+      "fork_side_commit_count": 251,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-23T00:25:12-04:00",
-        "sha": "c73bb58199d9d9b08fbd68e11df69c3815c09c34",
-        "subject": "fix(selection): carry bounded remote anchors through reflow"
+        "committed_at": "2026-10-02T21:41:17-04:00",
+        "sha": "f049e66bd3c8409f1e7d62cf735cc831dcb5269d",
+        "subject": "fix(release): land the eleven v0.15.21 ship-blockers and review should-fixes (ft-u5tr5)"
       },
       "name": "codec",
       "path": "frankenterm/codec",
@@ -231,8 +231,8 @@
       "classification_summary": {
         "chore": 3,
         "cleanup": 1,
-        "cosmetic": 4,
-        "feat": 44,
+        "cosmetic": 5,
+        "feat": 45,
         "fix": 50,
         "other": 10,
         "refactor": 5,
@@ -241,13 +241,13 @@
         "security-fix": 2,
         "test": 15
       },
-      "fork_side_commit_count": 143,
+      "fork_side_commit_count": 145,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-19T16:44:11-04:00",
-        "sha": "39fc550e04053440dfd8aafd523daaa60c90e917",
-        "subject": "fix(config): use renamed dynamic crate in pane budget test"
+        "classification": "cosmetic",
+        "committed_at": "2026-09-25T23:30:31-04:00",
+        "sha": "0b968dd76568c0d518f6ec2a7f6a231b220cb622",
+        "subject": "style: rustfmt the code touched by this session's live-loop and send work"
       },
       "name": "config",
       "path": "frankenterm/config",
@@ -640,22 +640,22 @@
         "cleanup": 3,
         "cosmetic": 31,
         "docs": 6,
-        "feat": 207,
-        "fix": 297,
-        "other": 54,
+        "feat": 210,
+        "fix": 300,
+        "other": 55,
         "refactor": 12,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
         "test": 112
       },
-      "fork_side_commit_count": 744,
+      "fork_side_commit_count": 751,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-23T11:57:05-04:00",
-        "sha": "33051b6011c602f7cdb4535a3fdb4273652a3618",
-        "subject": "fix(mux): use current atomic update API for ownership"
+        "committed_at": "2026-10-02T21:41:17-04:00",
+        "sha": "f049e66bd3c8409f1e7d62cf735cc831dcb5269d",
+        "subject": "fix(release): land the eleven v0.15.21 ship-blockers and review should-fixes (ft-u5tr5)"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -848,22 +848,22 @@
       "classification_summary": {
         "chore": 3,
         "cleanup": 1,
-        "cosmetic": 7,
+        "cosmetic": 8,
         "feat": 14,
-        "fix": 51,
+        "fix": 53,
         "other": 32,
         "refactor": 3,
         "rename": 1,
         "security-fix": 2,
         "test": 23
       },
-      "fork_side_commit_count": 137,
+      "fork_side_commit_count": 140,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-23T12:08:10-04:00",
-        "sha": "a35e121d5fd9bad051783dcc6ef036a42fc64c5e",
-        "subject": "fix(surface): preserve optimal DP prefixes with bounded frontiers"
+        "classification": "cosmetic",
+        "committed_at": "2026-09-26T04:07:27-04:00",
+        "sha": "68982b572d7f6667d1e429eeb10f4a279ae0345b",
+        "subject": "style: rustfmt surface line.rs and the MCP robot surface matrix test"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -896,7 +896,7 @@
         "cleanup": 3,
         "cosmetic": 15,
         "docs": 2,
-        "feat": 58,
+        "feat": 59,
         "fix": 140,
         "other": 61,
         "refactor": 5,
@@ -904,13 +904,13 @@
         "security-fix": 6,
         "test": 71
       },
-      "fork_side_commit_count": 364,
+      "fork_side_commit_count": 365,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-23T10:57:36-04:00",
-        "sha": "50859369a139795e074fba05e45a8903061fdf6a",
-        "subject": "fix(selection): release completed cold token ownership"
+        "classification": "feat",
+        "committed_at": "2026-09-26T07:25:23-04:00",
+        "sha": "9e4bf6e5a8e8523842f2172f47efc83c5c6aa55f",
+        "subject": "feat(mux): the fleet coordinator evicts warm scrollback on the mux (codec 67)"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1065,8 +1065,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2950,
-  "generated_at": "2026-09-23T16:14:20.477595Z",
+  "fork_side_commit_total": 2970,
+  "generated_at": "2026-10-03T01:41:28.132514Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
