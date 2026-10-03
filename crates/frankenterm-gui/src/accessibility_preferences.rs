@@ -268,6 +268,20 @@ pub fn palette_with_accessibility_preferences(
 #[must_use]
 pub fn config_with_accessibility_palette(config: config::ConfigHandle) -> config::ConfigHandle {
     let prefs = AccessibilityPreferenceOverrides::default().resolve(probe_platform_preferences());
+    config_with_preferences_palette(config, prefs)
+}
+
+fn config_with_preferences_palette(
+    config: config::ConfigHandle,
+    prefs: AccessibilityPreferences,
+) -> config::ConfigHandle {
+    // A palette the user chose explicitly (`colors` or `color_scheme`) wins
+    // over the desktop's light/dark preference. Without this, a desktop that
+    // reports "prefer-light" (as KDE does through gsettings even with a dark
+    // theme) paints a light palette over the user's colors.
+    if config.colors.is_some() || config.color_scheme.is_some() {
+        return config;
+    }
     let resolved_palette = palette_with_accessibility_preferences(&config.resolved_palette, prefs);
     config.with_resolved_palette(resolved_palette)
 }
@@ -503,6 +517,61 @@ mod tests {
         );
 
         assert_eq!(result, base);
+    }
+
+    fn prefer_light() -> AccessibilityPreferences {
+        AccessibilityPreferences::new(
+            MotionPreference::NoPreference,
+            ContrastPreference::NoPreference,
+            ColorSchemePreference::Light,
+        )
+    }
+
+    fn config_with_background(background: &str) -> config::Config {
+        let palette = config::Palette {
+            background: Some(config::RgbaColor::try_from(background.to_string()).unwrap()),
+            ..Default::default()
+        };
+        let mut cfg = config::Config::default();
+        cfg.resolved_palette = palette;
+        cfg
+    }
+
+    #[test]
+    fn explicit_colors_are_not_overlaid_by_desktop_preference() {
+        let mut cfg = config_with_background("#2e3440");
+        cfg.colors = Some(cfg.resolved_palette.clone());
+        let handle = config::ConfigHandle::detached(cfg);
+
+        let result = config_with_preferences_palette(handle, prefer_light());
+        assert_eq!(
+            result.resolved_palette.background,
+            Some(config::RgbaColor::try_from("#2e3440".to_string()).unwrap())
+        );
+    }
+
+    #[test]
+    fn explicit_color_scheme_is_not_overlaid_by_desktop_preference() {
+        let mut cfg = config_with_background("#2e3440");
+        cfg.color_scheme = Some("Nord (Gogh)".to_string());
+        let handle = config::ConfigHandle::detached(cfg);
+
+        let result = config_with_preferences_palette(handle, prefer_light());
+        assert_eq!(
+            result.resolved_palette.background,
+            Some(config::RgbaColor::try_from("#2e3440".to_string()).unwrap())
+        );
+    }
+
+    #[test]
+    fn default_palette_still_follows_desktop_preference() {
+        let handle = config::ConfigHandle::detached(config_with_background("#2e3440"));
+
+        let result = config_with_preferences_palette(handle, prefer_light());
+        assert_eq!(
+            result.resolved_palette.background,
+            Some(config::RgbaColor::try_from(LIGHT_PALETTE.background.to_string()).unwrap())
+        );
     }
 
     #[test]
