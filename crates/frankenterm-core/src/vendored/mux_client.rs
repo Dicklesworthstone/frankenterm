@@ -127,6 +127,37 @@ fn append_mux_text_line(out: &mut String, line: &str, cap: usize) -> Result<(), 
     Ok(())
 }
 
+/// Shape a completed read: a content tail keeps the last `n` non-padding
+/// rows; a plain tail or full read keeps everything that was read.
+fn finish_mux_text_read(
+    out: String,
+    tail: Option<usize>,
+    content_tail: Option<usize>,
+    read_from_top: bool,
+    total_rows: usize,
+) -> MuxTextReadResult {
+    match (tail, content_tail) {
+        (_, Some(n)) => {
+            let (text, kept_all) = content_tail_rows(&out, n);
+            let truncated = !(read_from_top && kept_all);
+            let original_bytes = if truncated { None } else { Some(text.len()) };
+            MuxTextReadResult::Bounded {
+                text,
+                original_lines: total_rows,
+                original_bytes,
+                truncated,
+            }
+        }
+        (Some(_), None) => MuxTextReadResult::Bounded {
+            original_bytes: Some(out.len()),
+            text: out,
+            original_lines: total_rows,
+            truncated: false,
+        },
+        (None, None) => MuxTextReadResult::Text(out),
+    }
+}
+
 /// The last `n` rows of `out` (newline-terminated rows) after dropping its
 /// trailing blank rows, and whether every content row was kept.
 fn content_tail_rows(out: &str, n: usize) -> (String, bool) {
@@ -2680,16 +2711,33 @@ impl DirectMuxClient {
                 if crate::runtime_async::timer_now_with_cx(cx) >= deadline {
                     return Err(DirectMuxError::ReadTimeout);
                 }
-                let serial = self
-                    .send_request_only_with_cx(
-                        cx,
-                        Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
-                            pane_id: pane_id as usize,
-                        }),
-                    )
-                    .await?;
+                // Codec 69 moved the correlated observation to its own PDU so
+                // PDU24 can keep the liveness reply older GUIs require; codec
+                // 65..=68 peers still answer PDU24 with the correlated PDU25.
+                let request = if require_correlated_snapshot
+                    && self.peer_generation.as_ref().is_some_and(|peer| {
+                        peer.agreed >= codec::GET_PANE_RENDER_STATE_V1_MIN_CODEC_VERSION
+                    }) {
+                    Pdu::GetPaneRenderStateV1(codec::GetPaneRenderStateV1 {
+                        pane_id: pane_id as usize,
+                    })
+                } else {
+                    Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
+                        pane_id: pane_id as usize,
+                    })
+                };
+                let serial = self.send_request_only_with_cx(cx, request).await?;
                 let response = self.await_response_with_cx(cx, serial).await;
                 let settled = match response {
+                    Ok(Pdu::LivenessResponse(liveness))
+                        if require_correlated_snapshot && !liveness.is_alive =>
+                    {
+                        self.settle_single_render_response(
+                            pane_id,
+                            Ok(Pdu::LivenessResponse(liveness)),
+                            true,
+                        )
+                    }
                     Ok(response @ Pdu::GetPaneRenderChangesResponse(_))
                         if require_correlated_snapshot =>
                     {
@@ -2879,6 +2927,16 @@ impl DirectMuxClient {
     ) -> Result<Result<MuxTextReadResult, codec::ErrorResponse>, DirectMuxError> {
         const MAX_SNAPSHOT_ATTEMPTS: usize = 3;
         const MAX_RESOURCE_BUSY_RETRIES: usize = 3;
+        if self
+            .peer_generation
+            .as_ref()
+            .is_some_and(|peer| peer.agreed < codec::GET_LINES_AT_LAYOUT_MIN_CODEC_VERSION)
+        {
+            return self
+                .get_text_tail_legacy_with_cx(cx, pane_id, max_output_bytes, tail)
+                .await
+                .map(Ok);
+        }
         #[cfg(test)]
         {
             self.get_lines_retry_delays = [None; 3];
@@ -3081,27 +3139,13 @@ impl DirectMuxClient {
             let final_state = final_state?;
             checkpoint_mux_cx(cx, self.connection_id, "text_read_complete")?;
             if final_state.seqno == layout.seqno && final_state.dimensions == layout.dimensions {
-                let result = match (tail, content_tail) {
-                    (_, Some(n)) => {
-                        let (text, kept_all) = content_tail_rows(&out, n);
-                        let truncated = !(read_from_top && kept_all);
-                        let original_bytes = if truncated { None } else { Some(text.len()) };
-                        MuxTextReadResult::Bounded {
-                            text,
-                            original_lines: total_rows,
-                            original_bytes,
-                            truncated,
-                        }
-                    }
-                    (Some(_), None) => MuxTextReadResult::Bounded {
-                        original_bytes: Some(out.len()),
-                        text: out,
-                        original_lines: total_rows,
-                        truncated: false,
-                    },
-                    (None, None) => MuxTextReadResult::Text(out),
-                };
-                return Ok(Ok(result));
+                return Ok(Ok(finish_mux_text_read(
+                    out,
+                    tail,
+                    content_tail,
+                    read_from_top,
+                    total_rows,
+                )));
             }
             if attempt + 1 < MAX_SNAPSHOT_ATTEMPTS {
                 diagnostics.final_source_retries += 1;
@@ -3121,6 +3165,81 @@ impl DirectMuxClient {
             phase: "final_source",
             attempts: MAX_SNAPSHOT_ATTEMPTS,
         })
+    }
+
+    /// Text read for a pre-codec-65 mux (e.g. a 0.15.1 server), which has
+    /// neither `GetLinesAtLayout` nor a correlated render fence. Rows come
+    /// from plain `GetLines` against the latest render observation, so a pane
+    /// that scrolls mid-read can tear; the modern path proves one layout.
+    async fn get_text_tail_legacy_with_cx(
+        &mut self,
+        cx: &Cx,
+        pane_id: u64,
+        max_output_bytes: usize,
+        tail: Option<usize>,
+    ) -> Result<MuxTextReadResult, DirectMuxError> {
+        const LEGACY_CHUNK_ROWS: isize = 256;
+        let state = self
+            .get_pane_render_state_with_cx(cx, pane_id, false)
+            .await?;
+        let dimensions = state.dimensions;
+        let rows = isize::try_from(dimensions.scrollback_rows).map_err(|_| {
+            mux_text_contract_error(MuxTextContractReason::ScrollbackRowCountOverflow)
+        })?;
+        let scrollback_top = dimensions.scrollback_top;
+        let end = scrollback_top.checked_add(rows).ok_or_else(|| {
+            mux_text_contract_error(MuxTextContractReason::ScrollbackRangeOverflow)
+        })?;
+        let total_rows = dimensions.scrollback_rows;
+        let (mut start, content_tail) = match tail {
+            Some(n) if n > 0 && n < total_rows => {
+                let read_rows = isize::try_from(n.saturating_add(dimensions.viewport_rows))
+                    .map_err(|_| {
+                        mux_text_contract_error(MuxTextContractReason::ScrollbackRowCountOverflow)
+                    })?;
+                (end.saturating_sub(read_rows).max(scrollback_top), Some(n))
+            }
+            _ => (scrollback_top, None),
+        };
+        let read_from_top = start == scrollback_top;
+        let mut out = String::new();
+        while start < end {
+            checkpoint_mux_cx(cx, self.connection_id, "legacy_text_read_chunk")?;
+            let chunk_end = start.saturating_add(LEGACY_CHUNK_ROWS).min(end);
+            let response = self
+                .get_lines_with_cx(cx, pane_id, std::iter::once(start..chunk_end).collect())
+                .await?;
+            if response.pane_id as u64 != pane_id {
+                return Err(mux_text_contract_error(
+                    MuxTextContractReason::ReplyPaneMismatch,
+                ));
+            }
+            let (lines, _images) = response.lines.extract_data();
+            if lines
+                .iter()
+                .enumerate()
+                .any(|(offset, (row, _))| *row != start + offset as isize)
+            {
+                return Err(mux_text_contract_error(
+                    MuxTextContractReason::ReplyRowOrderMismatch,
+                ));
+            }
+            for (_, line) in lines {
+                if let Err(limit) =
+                    append_mux_text_line(&mut out, line.as_str().as_ref(), max_output_bytes)
+                {
+                    return Ok(limit);
+                }
+            }
+            start = chunk_end;
+        }
+        Ok(finish_mux_text_read(
+            out,
+            tail,
+            content_tail,
+            read_from_top,
+            total_rows,
+        ))
     }
 
     /// Fetch OSC 133 semantic zones from a pane through the native mux protocol.
@@ -5720,9 +5839,13 @@ fn subscription_can_retry_same_client(err: &DirectMuxError) -> bool {
 }
 
 fn is_retryable_render_rejection(error: &DirectMuxError) -> bool {
+    // Codec 69 text fences poll with PDU114; its busy refusals retry exactly
+    // like PDU24's.
     matches!(error, DirectMuxError::RemoteRejection(error)
         if error.validate().is_ok()
-            && error.request_ident == <GetPaneRenderChanges as codec::PduWireIdent>::IDENT
+            && (error.request_ident == <GetPaneRenderChanges as codec::PduWireIdent>::IDENT
+                || error.request_ident
+                    == <codec::GetPaneRenderStateV1 as codec::PduWireIdent>::IDENT)
             && matches!(error.code,
                 codec::MuxErrorCode::BACKEND_FAILURE | codec::MuxErrorCode::RESOURCE_BUSY)
             && error.effect == codec::MuxErrorEffect::NOT_APPLIED
@@ -7112,6 +7235,16 @@ mod tests {
 
     async fn render_read_server(
         connections: usize,
+        handle: impl FnMut(usize, Pdu) -> (Vec<Pdu>, Option<Pdu>, Vec<Pdu>) + Send + 'static,
+    ) -> (tempfile::TempDir, PathBuf, task::JoinHandle<()>) {
+        render_read_server_at_codec(CODEC_VERSION, connections, handle).await
+    }
+
+    /// A render/text fixture that advertises `codec_vers`, e.g. 63 to stand
+    /// in for a 0.15.1 mux server.
+    async fn render_read_server_at_codec(
+        codec_vers: usize,
+        connections: usize,
         mut handle: impl FnMut(usize, Pdu) -> (Vec<Pdu>, Option<Pdu>, Vec<Pdu>) + Send + 'static,
     ) -> (tempfile::TempDir, PathBuf, task::JoinHandle<()>) {
         // Unix socket paths have a small platform limit; RCH's nested TMPDIR
@@ -7145,7 +7278,7 @@ mod tests {
                             Pdu::GetCodecVersion(_) => (
                                 Vec::new(),
                                 Some(Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
-                                    codec_vers: CODEC_VERSION,
+                                    codec_vers,
                                     min_supported: CODEC_VERSION_MIN_SUPPORTED,
                                     version_string: "text-test".to_string(),
                                     executable_path: PathBuf::from("/bin/ft"),
@@ -7258,10 +7391,12 @@ mod tests {
                 let cx = crate::cx::for_testing();
                 let mut polls = 0;
                 let (_dir, path, server) = render_read_server(1, move |_, request| {
-                    let Pdu::GetPaneRenderChanges(request) = request else {
-                        panic!("unexpected render poll");
+                    let pane_id = match request {
+                        Pdu::GetPaneRenderChanges(request) => request.pane_id,
+                        Pdu::GetPaneRenderStateV1(request) => request.pane_id,
+                        _ => panic!("unexpected render poll"),
                     };
-                    assert_eq!(request.pane_id, 9);
+                    assert_eq!(pane_id, 9);
                     let index = polls;
                     polls += 1;
                     // Distinct deltas with equal source sequence must retain
@@ -7348,7 +7483,9 @@ mod tests {
             let seen = Arc::clone(&ranges);
             let (_dir, path, server) = text_read_server(1, move |_, pdu| {
                 Some(match pdu {
-                    Pdu::GetPaneRenderChanges(_) => text_read_state(7, -7, 600),
+                    Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
+                        text_read_state(7, -7, 600)
+                    }
                     Pdu::GetLinesAtLayout(request) => {
                         assert_eq!(request.layout.seqno, 7);
                         assert_eq!(request.pane_id, 9);
@@ -7386,6 +7523,92 @@ mod tests {
                     505..593
                 ]
             );
+            drop(client);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    /// A codec-69 text fence polls with PDU114, so the server's busy refusal
+    /// names PDU114. It must retry like PDU24's, or every transient render
+    /// contention fails the whole text read.
+    #[test]
+    fn busy_render_refusals_retry_for_either_render_poll() {
+        let busy =
+            |ident| DirectMuxError::RemoteRejection(codec::ErrorResponse::resource_busy(ident));
+        assert!(is_retryable_render_rejection(&busy(
+            <GetPaneRenderChanges as PduWireIdent>::IDENT
+        )));
+        assert!(is_retryable_render_rejection(&busy(
+            <codec::GetPaneRenderStateV1 as PduWireIdent>::IDENT
+        )));
+        assert!(!is_retryable_render_rejection(&busy(
+            <ListPanes as PduWireIdent>::IDENT
+        )));
+    }
+
+    /// Release-wave B-M6: a 0.15.1 mux (codec 63) has neither
+    /// `GetLinesAtLayout` nor the PDU114 fence. Its PDU24 reply is liveness
+    /// with the render delta on the unilateral stream, and rows come from
+    /// plain `GetLines`.
+    #[test]
+    fn text_read_against_a_pre_layout_mux_uses_plain_line_reads() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let ranges = Arc::new(StdMutex::new(Vec::new()));
+            let seen = Arc::clone(&ranges);
+            let (_dir, path, server) =
+                render_read_server_at_codec(63, 1, move |_, pdu| match pdu {
+                    Pdu::GetPaneRenderChanges(request) => {
+                        assert_eq!(request.pane_id, 9);
+                        (
+                            vec![text_read_state(7, -7, 600)],
+                            Some(Pdu::LivenessResponse(codec::LivenessResponse {
+                                pane_id: 9,
+                                is_alive: true,
+                            })),
+                            Vec::new(),
+                        )
+                    }
+                    Pdu::GetLines(request) => {
+                        assert_eq!(request.pane_id, 9);
+                        assert_eq!(request.lines.len(), 1);
+                        let range = request.lines[0].clone();
+                        seen.lock().unwrap().push(range.clone());
+                        let lines = range
+                            .map(|row| {
+                                let line = frankenterm_term::Line::from_text(
+                                    &text_read_row(row, "legacy"),
+                                    &termwiz::cell::CellAttributes::default(),
+                                    1,
+                                    None,
+                                );
+                                (row, line)
+                            })
+                            .collect::<Vec<_>>();
+                        (
+                            Vec::new(),
+                            Some(Pdu::GetLinesResponse(GetLinesResponse {
+                                pane_id: 9,
+                                lines: lines.into(),
+                            })),
+                            Vec::new(),
+                        )
+                    }
+                    other => panic!("a codec-63 peer cannot answer {}", other.pdu_name()),
+                })
+                .await;
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
+            let result = client.get_text_with_cx(&cx, 9, 100_000).await.unwrap();
+            assert_eq!(
+                result,
+                MuxTextReadResult::Text(text_read_expected(-7..593, "legacy"))
+            );
+            assert_eq!(*ranges.lock().unwrap(), vec![-7..249, 249..505, 505..593]);
             drop(client);
             timeout(Duration::from_secs(5), server)
                 .await
@@ -7593,7 +7816,7 @@ mod tests {
                 let mut render_count = 0;
                 let (_dir, path, server) = text_read_server(1, move |_, pdu| {
                     Some(match pdu {
-                        Pdu::GetPaneRenderChanges(_) => {
+                        Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                             render_count += 1;
                             if !stale_first && render_count == 2 {
                                 generation = 8;
@@ -7690,7 +7913,7 @@ mod tests {
                 let cx = crate::cx::for_testing();
                 let (_dir, path, server) = text_read_server(1, move |_, pdu| {
                     Some(match pdu {
-                        Pdu::GetPaneRenderChanges(_) => {
+                        Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                             let mut reply = text_read_state(7, 0, 3);
                             if let Pdu::GetPaneRenderChangesResponse(ref mut state) = reply {
                                 if defect == "row_count_overflow" {
@@ -7897,7 +8120,7 @@ mod tests {
                 let seen = Arc::clone(&counts);
                 let (_dir, path, server) = text_read_server(1, move |_, pdu| {
                     Some(match pdu {
-                        Pdu::GetPaneRenderChanges(_) => {
+                        Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                             let mut count = seen.lock().unwrap();
                             count.0 += 1;
                             // The source advances again after each observation
@@ -7961,7 +8184,7 @@ mod tests {
                 let seen = Arc::clone(&counts);
                 let (_dir, path, server) = text_read_server(1, move |_, pdu| {
                     Some(match pdu {
-                        Pdu::GetPaneRenderChanges(_) => {
+                        Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                             let mut count = seen.lock().unwrap();
                             count.0 += 1;
                             text_read_state(if quota { 7 } else { count.0 }, 0, 3)
@@ -8038,7 +8261,9 @@ mod tests {
             let seen = Arc::clone(&requests);
             let (_dir, path, server) = text_read_server(1, move |_, pdu| {
                 Some(match pdu {
-                    Pdu::GetPaneRenderChanges(_) => text_read_state(7, 0, 600),
+                    Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
+                        text_read_state(7, 0, 600)
+                    }
                     Pdu::GetLinesAtLayout(request) => {
                         if seen.fetch_add(1, Ordering::SeqCst) == 0 {
                             text_read_reply(request, "partial")
@@ -8076,7 +8301,9 @@ mod tests {
             use crate::vendored::mux_pool::{MuxPool, MuxPoolConfig};
             let cx = crate::cx::for_testing();
             let (_dir, path, server) = text_read_server(2, |connection, pdu| match pdu {
-                Pdu::GetPaneRenderChanges(_) => Some(text_read_state(7, 0, 600)),
+                Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
+                    Some(text_read_state(7, 0, 600))
+                }
                 Pdu::GetLinesAtLayout(request) => {
                     if connection == 0 && request.lines[0].start == 512 {
                         None
@@ -8123,8 +8350,12 @@ mod tests {
                 let seen = Arc::clone(&requests);
                 let (_dir, path, server) = text_read_server(1, move |_, pdu| {
                     Some(match pdu {
-                        Pdu::GetPaneRenderChanges(_) if correlated => text_read_state(8, 0, 600),
-                        Pdu::GetPaneRenderChanges(_) => {
+                        Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_)
+                            if correlated =>
+                        {
+                            text_read_state(8, 0, 600)
+                        }
+                        Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                             Pdu::LivenessResponse(codec::LivenessResponse {
                                 pane_id: 9,
                                 is_alive: true,
@@ -8203,11 +8434,14 @@ mod tests {
                 let connections = 1 + usize::from(reconnect_first);
                 let (_dir, path, server) = text_read_server(connections, move |connection, pdu| {
                     if reconnect_first && connection == 0 {
-                        assert!(matches!(pdu, Pdu::GetPaneRenderChanges(_)));
+                        assert!(matches!(
+                            pdu,
+                            Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_)
+                        ));
                         return None;
                     }
                     Some(match pdu {
-                        Pdu::GetPaneRenderChanges(_) => {
+                        Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                             requests.lock().unwrap().0 += 1;
                             text_read_state(7, 0, 3)
                         }
@@ -8276,7 +8510,7 @@ mod tests {
                 let seen = Arc::clone(&counts);
                 let (_dir, path, server) = text_read_server(1, move |_, pdu| {
                     Some(match pdu {
-                        Pdu::GetPaneRenderChanges(_) => {
+                        Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                             let mut count = seen.lock().unwrap();
                             count.0 += 1;
                             // Three changing attempts, then one stable source
@@ -8367,7 +8601,7 @@ mod tests {
             let mut observers = 0;
             let (_dir, path, server) = text_read_server(1, move |_, pdu| {
                 Some(match pdu {
-                    Pdu::GetPaneRenderChanges(_) => {
+                    Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                         observers += 1;
                         if observers == 1 {
                             text_read_state(7, 0, 0)
@@ -8403,7 +8637,9 @@ mod tests {
                 let cx = crate::cx::for_testing();
                 let (_dir, path, server) = text_read_server(1, |_, pdu| {
                     Some(match pdu {
-                        Pdu::GetPaneRenderChanges(_) => text_read_state(7, 1, 2),
+                        Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
+                            text_read_state(7, 1, 2)
+                        }
                         Pdu::GetLinesAtLayout(request) => text_read_reply(request, "unicode"),
                         other => panic!("unexpected text request {other:?}"),
                     })
@@ -8453,7 +8689,9 @@ mod tests {
                 let seen = Arc::clone(&requests);
                 let (_dir, path, server) = text_read_server(1, move |_, pdu| {
                     Some(match pdu {
-                        Pdu::GetPaneRenderChanges(_) => text_read_state(7, 0, 3),
+                        Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
+                            text_read_state(7, 0, 3)
+                        }
                         Pdu::GetLinesAtLayout(_) => {
                             seen.fetch_add(1, Ordering::SeqCst);
                             Pdu::ErrorResponse(rejection.clone())
@@ -8502,7 +8740,9 @@ mod tests {
             let seen = Arc::clone(&ranges);
             let (_dir, path, server) = text_read_server(1, move |_, pdu| {
                 Some(match pdu {
-                    Pdu::GetPaneRenderChanges(_) => text_read_state(7, -7, 600),
+                    Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
+                        text_read_state(7, -7, 600)
+                    }
                     Pdu::GetLinesAtLayout(request) => {
                         assert_eq!(request.layout.seqno, 7);
                         assert_eq!(request.pane_id, 9);
@@ -8551,7 +8791,7 @@ mod tests {
             // A fresh 115-row pane that printed two lines: rows 2..115 are blank.
             let (_dir, path, server) = text_read_server(1, move |_, pdu| {
                 Some(match pdu {
-                    Pdu::GetPaneRenderChanges(_) => {
+                    Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                         let mut state = test_render_change(9, 7, "text fixture");
                         state.dimensions.scrollback_top = 0;
                         state.dimensions.scrollback_rows = 115;
@@ -8637,7 +8877,9 @@ mod tests {
                 let seen = Arc::clone(&ranges);
                 let (_dir, path, server) = text_read_server(1, move |_, pdu| {
                     Some(match pdu {
-                        Pdu::GetPaneRenderChanges(_) => text_read_state(7, -7, 600),
+                        Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
+                            text_read_state(7, -7, 600)
+                        }
                         Pdu::GetLinesAtLayout(request) => {
                             let range = request.lines[0].clone();
                             seen.lock().unwrap().push(range.clone());
@@ -8688,7 +8930,7 @@ mod tests {
 
             let (_dir, path, server) = text_read_server(1, move |_, pdu| {
                 Some(match pdu {
-                    Pdu::GetPaneRenderChanges(_) => {
+                    Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                         if first_call_server.load(Ordering::SeqCst) {
                             text_read_state(7, -7, 600)
                         } else {
@@ -8753,7 +8995,9 @@ mod tests {
             let seen = Arc::clone(&requests);
             let (_dir, path, server) = text_read_server(1, move |_, pdu| {
                 Some(match pdu {
-                    Pdu::GetPaneRenderChanges(_) => text_read_state(7, 0, 3),
+                    Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
+                        text_read_state(7, 0, 3)
+                    }
                     Pdu::GetLinesAtLayout(request) => {
                         let count = seen.fetch_add(1, Ordering::SeqCst);
                         if count == 0 {
@@ -8803,7 +9047,9 @@ mod tests {
             let seen = Arc::clone(&requests);
             let (_dir, path, server) = text_read_server(1, move |_, pdu| {
                 Some(match pdu {
-                    Pdu::GetPaneRenderChanges(_) => text_read_state(7, 0, 3),
+                    Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
+                        text_read_state(7, 0, 3)
+                    }
                     Pdu::GetLinesAtLayout(_) => {
                         seen.fetch_add(1, Ordering::SeqCst);
                         Pdu::ErrorResponse(codec::ErrorResponse::resource_busy(
@@ -8860,7 +9106,9 @@ mod tests {
                 let seen = Arc::clone(&requests);
                 let (_dir, path, server) = text_read_server(1, move |_, pdu| {
                     Some(match pdu {
-                        Pdu::GetPaneRenderChanges(_) => text_read_state(7, 0, 3),
+                        Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
+                            text_read_state(7, 0, 3)
+                        }
                         Pdu::GetLinesAtLayout(_) => {
                             seen.fetch_add(1, Ordering::SeqCst);
                             Pdu::ErrorResponse(rejection.clone())
@@ -8905,7 +9153,7 @@ mod tests {
             let chunk_seen = Arc::clone(&chunk_calls);
             let (_dir, path, server) = text_read_server(1, move |_, pdu| {
                 Some(match pdu {
-                    Pdu::GetPaneRenderChanges(_) => {
+                    Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                         let count = chunk_seen.load(Ordering::SeqCst);
                         if count < 2 {
                             text_read_state(7, 0, 3)
@@ -9000,7 +9248,7 @@ mod tests {
             let chunk_seen = Arc::clone(&chunk_calls);
             let (_dir, path, server) = text_read_server(1, move |_, pdu| {
                 Some(match pdu {
-                    Pdu::GetPaneRenderChanges(_) => {
+                    Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                         render_seen.fetch_add(1, Ordering::SeqCst);
                         text_read_state(7, 0, 3)
                     }
@@ -10593,7 +10841,9 @@ mod tests {
                                 Pdu::GetCodecVersionResponse(payload)
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                            Pdu::GetPaneRenderChanges(_) | Pdu::GetLines(_) => {
+                            Pdu::GetPaneRenderChanges(_)
+                            | Pdu::GetPaneRenderStateV1(_)
+                            | Pdu::GetLines(_) => {
                                 unexpected_requests += 1;
                                 Pdu::UnitResponse(UnitResponse {})
                             }
@@ -11758,7 +12008,7 @@ mod tests {
                                 .await
                                 .expect("write client response");
                             }
-                            Pdu::GetPaneRenderChanges(_) => {
+                            Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                                 write_response_pdu(
                                     &mut stream,
                                     &Pdu::GetPaneRenderChangesResponse(owned_payload),
@@ -12981,7 +13231,7 @@ mod tests {
                                 .await
                                 .expect("write client response");
                             }
-                            Pdu::GetPaneRenderChanges(_) => {
+                            Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                                 request_observed_tx
                                     .send(())
                                     .expect("signal observed render request");
@@ -13106,7 +13356,7 @@ mod tests {
                                 .await
                                 .expect("write client response");
                             }
-                            Pdu::GetPaneRenderChanges(_) => {
+                            Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                                 render_serials.push(decoded.serial);
                                 if render_serials.len() == 2 {
                                     for serial in render_serials.iter().rev().copied() {
@@ -13423,7 +13673,7 @@ mod tests {
                                 .await
                                 .expect("write client response");
                             }
-                            Pdu::GetPaneRenderChanges(_) => return,
+                            Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => return,
                             _ => {}
                         }
                     }
@@ -14160,7 +14410,7 @@ mod tests {
                                     .expect("encode response");
                                 stream.write_all(&out).await.expect("write response");
                             }
-                            Pdu::GetPaneRenderChanges(_) => {
+                            Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                                 render_request_count += 1;
                                 if render_request_count == 2 {
                                     // Both requests are now unambiguously in
@@ -14274,7 +14524,7 @@ mod tests {
                                     .expect("encode response");
                                 stream.write_all(&out).await.expect("write response");
                             }
-                            Pdu::GetPaneRenderChanges(_) => {
+                            Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                                 render_request_count += 1;
                                 if render_request_count == 2 {
                                     let mut eof_probe = [0u8; 1];
@@ -14385,7 +14635,7 @@ mod tests {
                                     .await
                                     .expect("write client response");
                             }
-                            Pdu::GetPaneRenderChanges(_) => {
+                            Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                                 render_request_count += 1;
                                 if render_request_count == 2 {
                                     stall_tx.send(()).expect("signal stalled batch");
@@ -19023,7 +19273,7 @@ mod tests {
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                            Pdu::GetPaneRenderChanges(_) => {
+                            Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                                 let (dirty_lines, seqno) = if emitted_output {
                                     (Vec::new(), 2)
                                 } else {
@@ -19141,7 +19391,7 @@ mod tests {
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                            Pdu::GetPaneRenderChanges(_) => {
+                            Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                                 let dirty_lines = if emitted_output {
                                     Vec::new()
                                 } else {
@@ -19258,7 +19508,7 @@ mod tests {
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                            Pdu::GetPaneRenderChanges(_) => {
+                            Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                                 let dirty_lines = if emitted_output {
                                     Vec::new()
                                 } else {
@@ -19386,7 +19636,7 @@ mod tests {
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                            Pdu::GetPaneRenderChanges(_) => {
+                            Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                                 server_request_count.fetch_add(1, Ordering::SeqCst);
                                 Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
                                     pane_id: 31,
@@ -19668,7 +19918,7 @@ mod tests {
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                            Pdu::GetPaneRenderChanges(_) => {
+                            Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                                 render_requests += 1;
                                 let (seqno, dirty_lines) = match render_requests {
                                     1 => (1, std::iter::once(0isize..1isize).collect()),
@@ -19786,7 +20036,7 @@ mod tests {
                                 }))
                             }
                             Pdu::SetClientId(_) => Some(Pdu::UnitResponse(UnitResponse {})),
-                            Pdu::GetPaneRenderChanges(_) => {
+                            Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                                 render_requests += 1;
                                 if render_requests == 1 {
                                     Some(Pdu::GetPaneRenderChangesResponse(
@@ -19911,7 +20161,7 @@ mod tests {
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                            Pdu::GetPaneRenderChanges(_) => {
+                            Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                                 let seqno = server_request_count.fetch_add(1, Ordering::SeqCst) + 1;
                                 Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
                                     pane_id: 13,
@@ -20041,7 +20291,7 @@ mod tests {
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                            Pdu::GetPaneRenderChanges(_) => {
+                            Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                                 let seqno = server_request_count.fetch_add(1, Ordering::SeqCst) + 1;
                                 Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
                                     pane_id: 13,
@@ -20170,7 +20420,7 @@ mod tests {
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                            Pdu::GetPaneRenderChanges(_) => {
+                            Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                                 let request_number =
                                     server_request_count.fetch_add(1, Ordering::SeqCst) + 1;
                                 let (seqno, dirty_lines) = if request_number == 1 {
@@ -20312,7 +20562,7 @@ mod tests {
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                            Pdu::GetPaneRenderChanges(_) => {
+                            Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                                 let request_number =
                                     server_request_count.fetch_add(1, Ordering::SeqCst) + 1;
                                 let (seqno, dirty_lines) = if request_number == 1 {
@@ -20447,7 +20697,7 @@ mod tests {
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                            Pdu::GetPaneRenderChanges(_) => {
+                            Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                                 server_request_count.fetch_add(1, Ordering::SeqCst);
                                 Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
                                     pane_id: 13,
@@ -20562,7 +20812,7 @@ mod tests {
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                            Pdu::GetPaneRenderChanges(_) => {
+                            Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                                 // Return empty changes (seqno 0, no dirty lines)
                                 Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
                                     pane_id: 0,

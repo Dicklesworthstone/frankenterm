@@ -6,6 +6,9 @@ Cargo.toml	DEP nix = "0.31.3"
 Cargo.toml	DEP passfd = "0.1.6"
 Cargo.toml	DEP signal-hook = "0.4.4"
 Cargo.toml	DEP termios = "0.3.3"
+# ft-y0gy9: this nix is under [target.'cfg(target_os = "macos")'.dependencies]
+# (F_BARRIERFSYNC); the table check only recognizes cfg(unix) tables.
+crates/frankenterm-core/Cargo.toml	DEP nix = { workspace = true, features = ["fs"] }
 crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::dev(&original_metadata)
 crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::dev(&replacement_metadata),
 crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::dev(&rewritten_metadata),
@@ -73,6 +76,9 @@ crates/frankenterm/src/main.rs	std::os::unix::fs::symlink("../escape", root.join
 crates/frankenterm/src/main.rs	std::os::unix::fs::symlink(&ft, &symlink).expect("plant source symlink");
 crates/frankenterm/src/main.rs	std::os::unix::fs::symlink(&retained_collision_target, root.join(&colliding_selector))
 crates/frankenterm/src/main.rs	std::os::unix::fs::symlink(&target, &link).expect("create escaping symlink");
+# Release-wave B-I3: installer_upgrades_a_pre_generation_ft_and_restores_it_on_failure
+# is #[cfg(unix)]; the symlink is beyond the bounded source lookback.
+crates/frankenterm/src/main.rs	std::os::unix::fs::symlink(app_ft, linked.join("ft")).expect("link 0.15.1 ft");
 crates/frankenterm/src/main.rs	use std::os::unix::ffi::OsStrExt as _;
 crates/frankenterm/src/main.rs	use std::os::unix::fs::MetadataExt as _;
 crates/frankenterm/src/main.rs	use std::os::unix::fs::PermissionsExt as _;

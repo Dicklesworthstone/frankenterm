@@ -4324,7 +4324,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 68;
+pub const CODEC_VERSION: usize = 69;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -4912,6 +4912,8 @@ pdu! {
     GetPaneDomainsV1Response: 113, 68, server_reply, none,
         bulk_data, bulk_data, bulk
         => deserialize_get_pane_domains_v1_response;
+    GetPaneRenderStateV1: 114, 69, client_request, none,
+        render, render, normal;
 }
 
 impl Pdu {
@@ -14334,6 +14336,18 @@ pub struct GetPaneRenderChanges {
     pub pane_id: PaneId,
 }
 
+pub const GET_PANE_RENDER_STATE_V1_MIN_CODEC_VERSION: usize = 69;
+
+/// Ask for one render observation correlated with the pane's current source:
+/// the reply is a `GetPaneRenderChangesResponse` for a live pane, or a
+/// `LivenessResponse` with `is_alive: false`. PDU24 (`GetPaneRenderChanges`)
+/// keeps its original liveness reply, which every supported GUI understands;
+/// clients that need a correlated fence (codec >= 69) send this instead.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct GetPaneRenderStateV1 {
+    pub pane_id: PaneId,
+}
+
 /// Maximum number of panes sampled by one lightweight scrollback-health turn.
 ///
 /// The fleet campaign's largest ordinary class is 200 panes, so 256 keeps one
@@ -22367,7 +22381,7 @@ mod test {
 
     #[test]
     fn codec_v65_additive_line_layout_preserves_the_v61_compatibility_floor() {
-        assert_eq!(CODEC_VERSION, 68);
+        assert_eq!(CODEC_VERSION, 69);
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
         assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 54);
         assert!(!codec_version_supports_ordered_window_v1(50));
@@ -24220,7 +24234,20 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 68);
+        assert_eq!(CODEC_VERSION, 69);
+    }
+
+    #[test]
+    fn pane_render_state_request_round_trips_at_codec_69() {
+        let request = Pdu::GetPaneRenderStateV1(GetPaneRenderStateV1 { pane_id: 42 });
+        for mode in [CompressionMode::Never, CompressionMode::Always] {
+            let frame = request.encode_frame_with_mode(7, mode).unwrap();
+            assert_eq!(Pdu::decode(frame.as_slice()).unwrap().pdu, request);
+        }
+        assert_eq!(
+            request.minimum_codec_version(),
+            Some(GET_PANE_RENDER_STATE_V1_MIN_CODEC_VERSION)
+        );
     }
 
     #[test]
@@ -24829,7 +24856,7 @@ mod test {
     fn pdu_wire_registry_covers_every_assigned_id_and_only_the_historical_gaps() {
         const GAPS: &[u64] = &[5, 6, 7, 15, 16, 17, 18, 19, 21];
 
-        for ident in 0..=113 {
+        for ident in 0..=114 {
             let spec = Pdu::wire_spec_for_ident(ident);
             assert_eq!(
                 spec.is_none(),
@@ -24843,9 +24870,9 @@ mod test {
             }
         }
 
-        assert!(Pdu::wire_spec_for_ident(114).is_none());
+        assert!(Pdu::wire_spec_for_ident(115).is_none());
         assert!(Pdu::wire_spec_for_ident(u64::MAX).is_none());
-        assert_eq!(Pdu::all_wire_specs().len(), 114 - GAPS.len());
+        assert_eq!(Pdu::all_wire_specs().len(), 115 - GAPS.len());
     }
 
     #[test]
@@ -24889,6 +24916,7 @@ mod test {
                 104..=109 => 66,
                 110..=111 => 67,
                 112..=113 => 68,
+                114 => 69,
                 ident => panic!("unexpected assigned PDU ID {}", ident),
             };
             assert_eq!(
@@ -24923,7 +24951,7 @@ mod test {
         const CLIENT_REQUESTS: &[u64] = &[
             1, 3, 9, 11, 12, 13, 14, 22, 24, 26, 28, 31, 33, 34, 35, 36, 38, 40, 41, 43, 45, 46,
             48, 50, 51, 56, 57, 58, 59, 60, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
-            77, 80, 81, 85, 86, 88, 91, 93, 95, 96, 98, 99, 100, 102, 104, 106, 108, 110, 112,
+            77, 80, 81, 85, 86, 88, 91, 93, 95, 96, 98, 99, 100, 102, 104, 106, 108, 110, 112, 114,
         ];
         const SERVER_REPLIES: &[u64] = &[
             0, 2, 4, 8, 10, 23, 25, 27, 29, 30, 32, 42, 47, 49, 52, 61, 76, 78, 82, 87, 89, 92, 94,
@@ -25025,7 +25053,7 @@ mod test {
                 3 | 4 | 37 | 39 | 44 | 53..=55 | 75 | 76 | 81..=83 | 86 | 87 | 90 | 110 | 111 => {
                     Class::StateSync
                 }
-                24 | 25 | 79 | 80 | 84 | 85 | 91 | 92 => Class::Render,
+                24 | 25 | 79 | 80 | 84 | 85 | 91 | 92 | 114 => Class::Render,
                 22 | 31 | 41 | 46 | 51 | 52 | 60 | 61 | 77 | 93 | 102 | 104..=109 | 112 => {
                     Class::Query
                 }
@@ -25039,7 +25067,7 @@ mod test {
                     Cap::InteractiveState
                 }
                 37 | 39 | 44 | 53..=55 | 83 | 90 | 110 | 111 => Cap::StateSync,
-                24 | 25 | 79 | 80 | 84 | 85 | 91 | 92 => Cap::Render,
+                24 | 25 | 79 | 80 | 84 | 85 | 91 | 92 | 114 => Cap::Render,
                 3
                 | 22
                 | 31
@@ -25097,7 +25125,8 @@ mod test {
                 | 83..=86
                 | 90..=93
                 | 102
-                | 104..=112 => Qos::Normal,
+                | 104..=112
+                | 114 => Qos::Normal,
                 4 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 103 | 113 => Qos::Bulk,
                 ident => panic!("PDU {} is missing from the queue-QoS census", ident),
             };
@@ -26045,7 +26074,7 @@ mod test {
     #[test]
     fn check_compat_current_build_keeps_v61_floor_after_additive_v65() {
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
-        assert_eq!(CODEC_VERSION, 68);
+        assert_eq!(CODEC_VERSION, 69);
         assert!(check_compat(62, 61, 60, 58).is_err());
         assert_eq!(
             check_compat(62, 61, 61, 61),
@@ -26930,21 +26959,21 @@ mod test {
 
     #[test]
     fn decode_accepts_valid_non_canonical_leb128_headers() {
-        let wire = [0x84, 0x00, 0x81, 0x00, 0xF2, 0x00];
+        let wire = [0x84, 0x00, 0x81, 0x00, 0xF3, 0x00];
         let decoded = Pdu::decode(wire.as_slice()).expect("valid non-canonical header");
         assert_eq!(decoded.serial, 1);
-        assert_eq!(decoded.pdu, Pdu::Invalid { ident: 114 });
+        assert_eq!(decoded.pdu, Pdu::Invalid { ident: 115 });
     }
 
     #[test]
     fn decode_raw_async_accepts_valid_non_canonical_leb128_headers() {
         runtime::block_on(async {
-            let mut reader = runtime::Cursor::new(vec![0x84, 0x00, 0x81, 0x00, 0xF2, 0x00]);
+            let mut reader = runtime::Cursor::new(vec![0x84, 0x00, 0x81, 0x00, 0xF3, 0x00]);
             let decoded = Pdu::decode_async(&mut reader, None)
                 .await
                 .expect("valid non-canonical header");
             assert_eq!(decoded.serial, 1);
-            assert_eq!(decoded.pdu, Pdu::Invalid { ident: 114 });
+            assert_eq!(decoded.pdu, Pdu::Invalid { ident: 115 });
         });
     }
 

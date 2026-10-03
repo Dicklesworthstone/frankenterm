@@ -20472,6 +20472,21 @@ fn robot_fleet_scale_plan(
             for (pane_id, entry) in matching_agents {
                 let bucket = robot_fleet_state_bucket(&entry.state);
                 let claimed_work_count = claimed_work_by_pane.get(pane_id).copied().unwrap_or(0);
+                // Scale-down only stops panes the fleet itself spawned. An agent
+                // recognized by title, process or screen may be the operator's
+                // own session; counting it is fine, killing it is not.
+                if entry.source != frankenterm_core::agent_correlator::DetectionSource::FleetSpawn {
+                    skipped_agents.push(serde_json::json!({
+                        "pane_id": pane_id,
+                        "agent_id": robot_fleet_agent_id(*pane_id, entry),
+                        "program": entry.slug.clone(),
+                        "state": entry.state.clone(),
+                        "state_bucket": bucket,
+                        "reason_code": "not_fleet_spawned",
+                        "message": "scale-down only stops panes that ft robot fleet spawned",
+                    }));
+                    continue;
+                }
                 if bucket == "idle" && claimed_work_count == 0 && steps.len() < excess {
                     let step_id = format!("stop-{program_slug}-pane-{pane_id}");
                     steps.push(FleetMutationStep {
@@ -22209,6 +22224,30 @@ fn robot_fleet_inventory_from_panes(
     Ok(running)
 }
 
+/// A fleet-spawned pane is recorded as `active`; read its screen so an agent
+/// the fleet started that now sits at its idle composer is `idle`, and so the
+/// only panes scale-down may stop (fleet-spawned ones) can actually qualify.
+/// An unreadable or unrecognized screen keeps the conservative `active`.
+async fn refresh_fleet_spawned_states(
+    wezterm: &frankenterm_core::wezterm::WeztermHandle,
+    cx: &frankenterm_core::cx::Cx,
+    agents: &mut BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry>,
+) {
+    for (pane_id, entry) in agents.iter_mut().filter(|(_, entry)| {
+        entry.source == frankenterm_core::agent_correlator::DetectionSource::FleetSpawn
+    }) {
+        let Ok(screen) = wezterm
+            .get_text_tail_with_cx(cx, *pane_id, false, Some(AGENT_SCREEN_PROBE_TAIL_ROWS))
+            .await
+        else {
+            continue;
+        };
+        if let Some(observed) = screen_classified_agent(&screen.text) {
+            entry.state = observed.state;
+        }
+    }
+}
+
 async fn robot_fleet_load_running_agents(
     db_path: &str,
     config: &frankenterm_core::config::Config,
@@ -22221,6 +22260,7 @@ async fn robot_fleet_load_running_agents(
     match wezterm.list_panes_with_cx(&cx).await {
         Ok(panes) => match robot_fleet_inventory_from_panes(db_path, &panes) {
             Ok(mut agents) => {
+                refresh_fleet_spawned_states(&wezterm, &cx, &mut agents).await;
                 add_screen_classified_agents(&wezterm, &cx, &panes, &mut agents).await;
                 (agents, None)
             }
@@ -57510,7 +57550,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     let (real_runtime, fallback_reason) = resolve_real_tx_runtime(
                                         &config,
                                         &layout,
-                                        tx_run_requires_terminal_backend(&contract),
+                                        tx_run_probes_terminal_backend(
+                                            &contract,
+                                            kill_switch,
+                                            paused,
+                                        ),
                                     )
                                     .await;
                                     let executor_label = if real_runtime.is_some() {
@@ -57604,15 +57648,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         // executor — doing so would bypass policy + approval
                                         // gates and poison the durable idempotency ledger.
                                         // Surfaced via the existing Err handler below.
-                                        Err(TxCommandExecutionError::execution(format!(
-                                            "real tx runtime unavailable{}; refusing to commit a transaction through the synthetic allow-all executor (policy and approval gates would be bypassed). Re-run with --dry-run for a preview, or restore the storage/terminal backend.",
-                                            fallback_reason
-                                                .as_deref()
-                                                .map(|reason| format!(" ({reason})"))
-                                                .unwrap_or_default()
-                                        )))
+                                        Err(TxCommandExecutionError::refused_synthetic_commit(
+                                            fallback_reason.as_ref(),
+                                        ))
                                     } else {
-                                        if let Some(reason) = fallback_reason.as_deref() {
+                                        if let Some(reason) = fallback_reason
+                                            .as_ref()
+                                            .map(TxRuntimeUnavailable::reason)
+                                        {
                                             tracing::warn!(
                                                 %reason,
                                                 "synthetic dry-run preview (real tx runtime unavailable)"
@@ -57859,7 +57902,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         // unavailable, refuse instead: a real commit's effects
                                         // must not silently persist behind a fabricated "rolled
                                         // back" report. (Mirrors ft-pmbe1's run-path guard.)
-                                        if let Some(reason) = fallback_reason.as_deref() {
+                                        if let Some(reason) = fallback_reason
+                                            .as_ref()
+                                            .map(TxRuntimeUnavailable::reason)
+                                        {
                                             tracing::warn!(
                                                 %reason,
                                                 "refusing robot tx rollback: real tx runtime unavailable (synthetic executor would fabricate rollback success)"
@@ -57867,12 +57913,15 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         }
                                         let response =
                                             RobotResponse::<RobotTxRollbackData>::error_with_code(
-                                                "robot.tx_real_runtime_unavailable",
+                                                fallback_reason.as_ref().map_or(
+                                                    "robot.tx_real_runtime_unavailable",
+                                                    TxRuntimeUnavailable::robot_error_code,
+                                                ),
                                                 format!(
                                                     "real tx runtime unavailable{}; refusing to report rollback success through the synthetic executor — no real compensation would run, so the prior commit's effects would persist while the report claims they were undone. Restore the storage and terminal backend, then re-run the rollback.",
                                                     fallback_reason
-                                                        .as_deref()
-                                                        .map(|reason| format!(" ({reason})"))
+                                                        .as_ref()
+                                                        .map(|cause| format!(" ({})", cause.reason()))
                                                         .unwrap_or_default()
                                                 ),
                                                 Some(
@@ -64404,7 +64453,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             std::process::exit(err.exit_code);
                         }
                         let parsed = read_mission_file_capped(path).ok().and_then(|s| {
-                            serde_json::from_str::<frankenterm_core::plan::Mission>(&s).ok()
+                            frankenterm_core::plan::Mission::from_json_slice(s.as_bytes()).ok()
                         });
                         match parsed {
                             Some(m) => Some(m),
@@ -64498,7 +64547,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 let (real_runtime, fallback_reason) = resolve_real_tx_runtime(
                     &config,
                     &layout,
-                    tx_run_requires_terminal_backend(&contract),
+                    tx_run_probes_terminal_backend(&contract, kill_switch, paused),
                 )
                 .await;
                 let executor_label = if real_runtime.is_some() {
@@ -64571,15 +64620,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     // ft-pmbe1 FAIL-CLOSED: real tx runtime unavailable -> refuse to
                     // commit through the synthetic allow-all executor (policy + approval
                     // bypass + durable ledger poisoning). Surfaced via the Err handler.
-                    Err(TxCommandExecutionError::execution(format!(
-                        "real tx runtime unavailable{}; refusing to commit a transaction through the synthetic allow-all executor (policy and approval gates would be bypassed). Re-run with --dry-run for a preview, or restore the storage/terminal backend.",
-                        fallback_reason
-                            .as_deref()
-                            .map(|reason| format!(" ({reason})"))
-                            .unwrap_or_default()
-                    )))
+                    Err(TxCommandExecutionError::refused_synthetic_commit(
+                        fallback_reason.as_ref(),
+                    ))
                 } else {
-                    if let Some(reason) = fallback_reason.as_deref() {
+                    if let Some(reason) = fallback_reason.as_ref().map(TxRuntimeUnavailable::reason)
+                    {
                         tracing::warn!(%reason, "synthetic dry-run preview (real tx runtime unavailable)");
                     }
                     execute_tx_run_with_executor(
@@ -64717,7 +64763,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     println!("  contract: {}", data.contract_file);
                     println!("  mode: {}", if dry_run { "dry_run" } else { "execute" });
                     println!("  executor: {executor_label}");
-                    if let Some(reason) = fallback_reason.as_deref() {
+                    if let Some(reason) = fallback_reason.as_ref().map(TxRuntimeUnavailable::reason)
+                    {
                         println!("  fallback reason: {reason}");
                     }
                     println!(
@@ -69933,6 +69980,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 // knows the external WezTerm CLI, so on a vendored-only install
                 // every recording failed at its first capture with 0 frames.
                 let wez = frankenterm_core::wezterm::build_unified_client(&config);
+                // A recording is a pane-content read path like any other:
+                // secrets are redacted before a frame reaches disk.
+                let redactor = frankenterm_core::redactor::Redactor::new();
                 let mut last_text = String::new();
                 let start = std::time::Instant::now();
 
@@ -69952,6 +70002,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     .await
                     {
                         Ok(text) => {
+                            let text = redactor.redact(&text);
                             if text != last_text {
                                 let delta = if last_text.is_empty() {
                                     text.as_bytes().to_vec()
@@ -76337,6 +76388,12 @@ struct MissionCommandError {
 enum TxCommandExecutionError {
     Execution(String),
     InProgress(String),
+    /// The real runtime could not be resolved, so the command refused to run
+    /// through the synthetic executor (ft-n13o4 keeps the cause typed).
+    RuntimeUnavailable {
+        cause: TxRuntimeUnavailable,
+        message: String,
+    },
     RollbackProof {
         kind: frankenterm_core::tx_execution::RollbackProofKind,
         message: String,
@@ -76358,6 +76415,24 @@ impl TxCommandExecutionError {
 
     fn in_progress(message: impl Into<String>) -> Self {
         Self::InProgress(message.into())
+    }
+
+    /// Refuse to commit through the synthetic allow-all executor because the
+    /// real runtime is unavailable (ft-pmbe1 fail-closed, typed by ft-n13o4).
+    fn refused_synthetic_commit(cause: Option<&TxRuntimeUnavailable>) -> Self {
+        let message = format!(
+            "real tx runtime unavailable{}; refusing to commit a transaction through the synthetic allow-all executor (policy and approval gates would be bypassed). Re-run with --dry-run for a preview, or restore the storage/terminal backend.",
+            cause
+                .map(|cause| format!(" ({})", cause.reason()))
+                .unwrap_or_default()
+        );
+        match cause {
+            Some(cause) => Self::RuntimeUnavailable {
+                cause: cause.clone(),
+                message,
+            },
+            None => Self::Execution(message),
+        }
     }
 
     fn rollback_proof(
@@ -76394,7 +76469,10 @@ impl TxCommandExecutionError {
         &self,
     ) -> Option<&frankenterm_core::tx_execution::TxContractStoreError> {
         match self {
-            Self::Execution(_) | Self::InProgress(_) | Self::RollbackProof { .. } => None,
+            Self::Execution(_)
+            | Self::InProgress(_)
+            | Self::RuntimeUnavailable { .. }
+            | Self::RollbackProof { .. } => None,
             Self::ContractLock { source, .. } | Self::ContractStore { source, .. } => Some(source),
         }
     }
@@ -76405,6 +76483,7 @@ impl std::fmt::Display for TxCommandExecutionError {
         match self {
             Self::Execution(message) => f.write_str(message),
             Self::InProgress(message) => f.write_str(message),
+            Self::RuntimeUnavailable { message, .. } => f.write_str(message),
             Self::RollbackProof { message, .. } => f.write_str(message),
             Self::ContractLock { context, source } | Self::ContractStore { context, source } => {
                 write!(f, "{context}: {source}")
@@ -76853,14 +76932,16 @@ fn load_mission_from_path(
         },
     })?;
 
-    let mission: frankenterm_core::plan::Mission =
-        serde_json::from_str(&raw).map_err(|err| MissionCommandError {
-            exit_code: MISSION_EXIT_INVALID_INPUT,
-            error_code: "mission.invalid_json",
-            message: format!("Invalid mission JSON in {}: {err}", path.display()),
-            hint: Some(
-                "Ensure the mission file is valid JSON and matches mission schema.".to_string(),
-            ),
+    let mission =
+        frankenterm_core::plan::Mission::from_json_slice(raw.as_bytes()).map_err(|err| {
+            MissionCommandError {
+                exit_code: MISSION_EXIT_INVALID_INPUT,
+                error_code: "mission.invalid_json",
+                message: format!("Invalid mission JSON in {}: {err}", path.display()),
+                hint: Some(
+                    "Ensure the mission file is valid JSON and matches mission schema.".to_string(),
+                ),
+            }
         })?;
 
     mission.validate().map_err(|err| MissionCommandError {
@@ -77106,6 +77187,39 @@ fn tx_prepare_target_state(
     }
 }
 
+/// Why the real transaction runtime could not be resolved (ft-n13o4): a
+/// storage failure and an unreachable terminal backend need different fixes,
+/// so they carry different error codes instead of one generic failure.
+#[derive(Debug, Clone)]
+enum TxRuntimeUnavailable {
+    /// The workspace database or transaction data storage would not open.
+    Storage(String),
+    /// The terminal backend did not answer a pane listing.
+    Terminal(String),
+}
+
+impl TxRuntimeUnavailable {
+    fn reason(&self) -> &str {
+        match self {
+            Self::Storage(reason) | Self::Terminal(reason) => reason,
+        }
+    }
+
+    const fn mission_error_code(&self) -> &'static str {
+        match self {
+            Self::Storage(_) => "mission.tx.storage_unavailable",
+            Self::Terminal(_) => "mission.tx.terminal_unavailable",
+        }
+    }
+
+    const fn robot_error_code(&self) -> &'static str {
+        match self {
+            Self::Storage(_) => "robot.tx_storage_unavailable",
+            Self::Terminal(_) => "robot.tx_terminal_unavailable",
+        }
+    }
+}
+
 async fn resolve_real_tx_runtime(
     config: &frankenterm_core::config::Config,
     layout: &frankenterm_core::config::WorkspaceLayout,
@@ -77116,7 +77230,7 @@ async fn resolve_real_tx_runtime(
         frankenterm_core::wezterm::WeztermHandle,
         std::sync::Arc<dyn frankenterm_core::tx_execution::TxStorageAdapter>,
     )>,
-    Option<String>,
+    Option<TxRuntimeUnavailable>,
 ) {
     let db_path = layout.db_path.to_string_lossy();
     let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
@@ -77129,10 +77243,10 @@ async fn resolve_real_tx_runtime(
         Err(err) => {
             return (
                 None,
-                Some(format!(
+                Some(TxRuntimeUnavailable::Storage(format!(
                     "storage unavailable at {}: {err}",
                     layout.db_path.display()
-                )),
+                ))),
             );
         }
     };
@@ -77146,10 +77260,10 @@ async fn resolve_real_tx_runtime(
         Err(err) => {
             return (
                 None,
-                Some(format!(
+                Some(TxRuntimeUnavailable::Storage(format!(
                     "transaction data storage unavailable at {}: {err}",
                     layout.ft_dir.join("tx_data").display()
-                )),
+                ))),
             );
         }
     };
@@ -77163,9 +77277,9 @@ async fn resolve_real_tx_runtime(
         Ok(_) => (Some((storage, wezterm, tx_storage)), None),
         Err(err) => (
             None,
-            Some(format!(
+            Some(TxRuntimeUnavailable::Terminal(format!(
                 "terminal backend unavailable for real tx execution: {err}"
-            )),
+            ))),
         ),
     }
 }
@@ -77200,6 +77314,21 @@ fn tx_action_requires_terminal_backend(action: &frankenterm_core::plan::StepActi
         | frankenterm_core::plan::StepAction::NestedPlan { .. }
         | frankenterm_core::plan::StepAction::Custom { .. } => false,
     }
+}
+
+/// Whether a tx run must prove the terminal backend live before executing.
+/// The engine dispatches no step unless the kill switch is off and the run is
+/// not paused (`dispatch_allowed` in the commit phase), so a paused or
+/// safe-mode/hard-stop run must not fail merely because the terminal is
+/// unreachable: its clean no-effect outcome is still reported (ft-n13o4).
+fn tx_run_probes_terminal_backend(
+    contract: &frankenterm_core::plan::MissionTxContract,
+    kill_switch: frankenterm_core::plan::MissionKillSwitchLevel,
+    paused: bool,
+) -> bool {
+    kill_switch == frankenterm_core::plan::MissionKillSwitchLevel::Off
+        && !paused
+        && tx_run_requires_terminal_backend(contract)
 }
 
 fn tx_run_requires_terminal_backend(contract: &frankenterm_core::plan::MissionTxContract) -> bool {
@@ -78260,6 +78389,20 @@ fn tx_command_error_hint(error: &TxCommandExecutionError) -> Option<String> {
         TxCommandExecutionError::InProgress(_) => {
             Some("Wait for the in-flight transaction mutation to finish, then retry.".to_string())
         }
+        TxCommandExecutionError::RuntimeUnavailable {
+            cause: TxRuntimeUnavailable::Storage(_),
+            ..
+        } => Some(
+            "Nothing was committed. Check that the workspace .ft directory and its database are readable and writable, then retry."
+                .to_string(),
+        ),
+        TxCommandExecutionError::RuntimeUnavailable {
+            cause: TxRuntimeUnavailable::Terminal(_),
+            ..
+        } => Some(
+            "Nothing was committed. Start or reconnect the terminal backend (FrankenTerm GUI or mux), check `ft doctor`, then retry; use --dry-run for a preview meanwhile."
+                .to_string(),
+        ),
         TxCommandExecutionError::Execution(_) => None,
     }
 }
@@ -78268,6 +78411,7 @@ fn robot_tx_command_error_code(error: &TxCommandExecutionError) -> &'static str 
     match error {
         TxCommandExecutionError::Execution(_) => "robot.tx_execution_failed",
         TxCommandExecutionError::InProgress(_) => "robot.tx_in_progress",
+        TxCommandExecutionError::RuntimeUnavailable { cause, .. } => cause.robot_error_code(),
         TxCommandExecutionError::RollbackProof {
             kind: frankenterm_core::tx_execution::RollbackProofKind::Missing,
             ..
@@ -78292,6 +78436,9 @@ fn mission_tx_command_error(error: TxCommandExecutionError) -> MissionCommandErr
         }
         TxCommandExecutionError::InProgress(_) => {
             (MISSION_EXIT_VALIDATION, "mission.tx.in_progress")
+        }
+        TxCommandExecutionError::RuntimeUnavailable { cause, .. } => {
+            (MISSION_EXIT_IO, cause.mission_error_code())
         }
         TxCommandExecutionError::RollbackProof {
             kind: frankenterm_core::tx_execution::RollbackProofKind::Missing,
@@ -79220,7 +79367,7 @@ async fn handle_tx_command(
             let (real_runtime, fallback_reason) = resolve_real_tx_runtime(
                 config,
                 layout,
-                tx_run_requires_terminal_backend(&contract),
+                tx_run_probes_terminal_backend(&contract, kill_switch, paused),
             )
             .await;
             let executor_label = if real_runtime.is_some() {
@@ -79298,15 +79445,11 @@ async fn handle_tx_command(
                 // ft-pmbe1 FAIL-CLOSED: real tx runtime unavailable -> refuse to commit
                 // through the synthetic allow-all executor (policy + approval bypass +
                 // durable ledger poisoning). Surfaced via the .map_err handler below.
-                Err(TxCommandExecutionError::execution(format!(
-                    "real tx runtime unavailable{}; refusing to commit a transaction through the synthetic allow-all executor (policy and approval gates would be bypassed). Re-run with --dry-run for a preview, or restore the storage/terminal backend.",
-                    fallback_reason
-                        .as_deref()
-                        .map(|reason| format!(" ({reason})"))
-                        .unwrap_or_default()
-                )))
+                Err(TxCommandExecutionError::refused_synthetic_commit(
+                    fallback_reason.as_ref(),
+                ))
             } else {
-                if let Some(reason) = fallback_reason.as_deref() {
+                if let Some(reason) = fallback_reason.as_ref().map(TxRuntimeUnavailable::reason) {
                     tracing::warn!(%reason, "synthetic dry-run preview (real tx runtime unavailable)");
                 }
                 execute_tx_run_with_executor(
@@ -79348,7 +79491,7 @@ async fn handle_tx_command(
                     tx_prepare_outcome_label(&data.prepare_report.outcome)
                 ),
             ];
-            if let Some(reason) = fallback_reason.as_deref() {
+            if let Some(reason) = fallback_reason.as_ref().map(TxRuntimeUnavailable::reason) {
                 plain_lines.push(format!("  Fallback reason: {reason}"));
             }
             if let Some(commit_report) = data.commit_report.as_ref() {
@@ -79513,7 +79656,7 @@ async fn handle_tx_command(
                 // backend) is unavailable, refuse instead so a real commit's effects
                 // cannot silently persist behind a fabricated "rolled back" report.
                 // (Mirrors ft-pmbe1's run-path guard.)
-                if let Some(reason) = fallback_reason.as_deref() {
+                if let Some(reason) = fallback_reason.as_ref().map(TxRuntimeUnavailable::reason) {
                     tracing::warn!(
                         %reason,
                         "refusing tx rollback: real tx runtime unavailable (synthetic executor would fabricate rollback success)"
@@ -79522,13 +79665,20 @@ async fn handle_tx_command(
                 emit_mission_error(
                     output_format,
                     MissionCommandError {
-                        exit_code: MISSION_EXIT_VALIDATION,
-                        error_code: "mission.tx.real_runtime_unavailable",
+                        exit_code: if fallback_reason.is_some() {
+                            MISSION_EXIT_IO
+                        } else {
+                            MISSION_EXIT_VALIDATION
+                        },
+                        error_code: fallback_reason.as_ref().map_or(
+                            "mission.tx.real_runtime_unavailable",
+                            TxRuntimeUnavailable::mission_error_code,
+                        ),
                         message: format!(
                             "real tx runtime unavailable{}; refusing to report rollback success through the synthetic executor — no real compensation would run, so the prior commit's effects would persist while the report claims they were undone. Restore the storage and terminal backend, then re-run the rollback.",
                             fallback_reason
-                                .as_deref()
-                                .map(|reason| format!(" ({reason})"))
+                                .as_ref()
+                                .map(|cause| format!(" ({})", cause.reason()))
                                 .unwrap_or_default()
                         ),
                         hint: Some(
@@ -79569,13 +79719,14 @@ async fn handle_tx_command(
                 ),
                 format!("  Final state: {}", data.final_state),
             ];
-            let plain_lines = if let Some(reason) = fallback_reason.as_deref() {
-                let mut lines = plain_lines;
-                lines.push(format!("  Fallback reason: {reason}"));
-                lines
-            } else {
-                plain_lines
-            };
+            let plain_lines =
+                if let Some(reason) = fallback_reason.as_ref().map(TxRuntimeUnavailable::reason) {
+                    let mut lines = plain_lines;
+                    lines.push(format!("  Fallback reason: {reason}"));
+                    lines
+                } else {
+                    plain_lines
+                };
             emit_mission_success(output_format, serde_json::to_value(&data)?, &plain_lines)?;
         }
         TxCommands::Show {
@@ -98894,6 +99045,45 @@ const fn wezterm_cli_probe_required(kind: frankenterm_core::wezterm::BackendKind
     matches!(kind, frankenterm_core::wezterm::BackendKind::Cli)
 }
 
+/// An idle host: this vendored `ft` found no running mux and has no external
+/// WezTerm CLI to fall back to, so the CLI backend was chosen only by default.
+/// Nothing is broken; there is just no session to probe yet. Reporting that as
+/// two errors made `ft doctor` fail on every fresh machine, and the installer's
+/// doctor readiness gate rolled back every fresh install (release-wave B-I1).
+fn doctor_host_is_idle(
+    selection: &frankenterm_core::wezterm::BackendSelection,
+    mux_socket_discovered: bool,
+    external_cli_available: bool,
+) -> bool {
+    cfg!(feature = "vendored")
+        && selection.kind == frankenterm_core::wezterm::BackendKind::Cli
+        && !mux_socket_discovered
+        && !external_cli_available
+}
+
+/// Whether `program` names an executable file, directly or via `PATH`.
+fn executable_on_path(program: &str) -> bool {
+    let is_executable = |path: &Path| {
+        path.metadata().is_ok_and(|metadata| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            }
+            #[cfg(not(unix))]
+            {
+                metadata.is_file()
+            }
+        })
+    };
+    if program.contains('/') {
+        return is_executable(Path::new(program));
+    }
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| is_executable(&dir.join(program)))
+    })
+}
+
 #[cfg(feature = "vendored")]
 fn backend_compatibility_local_version(
     selection: &frankenterm_core::wezterm::BackendSelection,
@@ -99586,12 +99776,23 @@ async fn run_diagnostics(
     let mux_client = frankenterm_core::wezterm::build_unified_client(config);
     let backend_selection = mux_client.selection().clone();
     checks.push(mux_backend_diagnostic(&backend_selection));
+    let host_is_idle = doctor_host_is_idle(
+        &backend_selection,
+        mux_client.discovered_socket().is_some(),
+        executable_on_path(&wezterm_binary()),
+    );
 
     // The external CLI is mandatory only for the CLI backend. A selected
     // vendored client must not fail doctor merely because its optional
     // fallback is absent, and it must not pay for a redundant second version
     // subprocess after backend selection's bounded compatibility probe.
-    if wezterm_cli_probe_required(backend_selection.kind) {
+    if host_is_idle {
+        checks.push(DiagnosticCheck::warning(
+            "WezTerm CLI",
+            "no FrankenTerm mux is running and no external WezTerm CLI is installed; nothing to probe yet",
+            "Start FrankenTerm (or frankenterm-mux-server) to attach panes; the external WezTerm CLI is optional",
+        ));
+    } else if wezterm_cli_probe_required(backend_selection.kind) {
         checks.push(wezterm_cli_version_diagnostic(
             &backend_selection,
             wezterm_timeout,
@@ -99692,7 +99893,13 @@ async fn run_diagnostics(
     // the same MuxInterface used by the runtime under an explicit outer
     // deadline. An explicitly configured socket never falls back; an implicit
     // socket retains the runtime's eligible transport-failure CLI failover.
-    if wezterm_cli_probe_required(backend_selection.kind) {
+    if host_is_idle {
+        checks.push(DiagnosticCheck::warning(
+            "WezTerm connection",
+            "no running mux to connect to (idle host)",
+            "Start FrankenTerm (or frankenterm-mux-server); doctor then probes its panes",
+        ));
+    } else if wezterm_cli_probe_required(backend_selection.kind) {
         match run_cmd_with_timeout(
             &mut wezterm_cli_list_command(),
             wezterm_timeout,
@@ -103932,6 +104139,61 @@ mod tests {
             };
         }
         assert!(!tx_run_requires_terminal_backend(&contract));
+    }
+
+    #[test]
+    fn tx_run_probes_terminal_only_when_a_step_can_dispatch() {
+        use frankenterm_core::plan::MissionKillSwitchLevel as K;
+
+        let contract = sample_robot_tx_contract();
+        assert!(tx_run_requires_terminal_backend(&contract));
+        assert!(tx_run_probes_terminal_backend(&contract, K::Off, false));
+        // The engine dispatches nothing paused or under any kill switch, so
+        // an unreachable terminal must not fail these no-effect runs.
+        assert!(!tx_run_probes_terminal_backend(&contract, K::Off, true));
+        assert!(!tx_run_probes_terminal_backend(
+            &contract,
+            K::SafeMode,
+            false
+        ));
+        assert!(!tx_run_probes_terminal_backend(
+            &contract,
+            K::HardStop,
+            false
+        ));
+    }
+
+    #[test]
+    fn tx_runtime_unavailability_keeps_storage_and_terminal_codes_apart() {
+        let storage = TxRuntimeUnavailable::Storage("storage unavailable at /x".to_string());
+        let terminal = TxRuntimeUnavailable::Terminal("terminal backend down".to_string());
+
+        let error = TxCommandExecutionError::refused_synthetic_commit(Some(&storage));
+        assert_eq!(
+            robot_tx_command_error_code(&error),
+            "robot.tx_storage_unavailable"
+        );
+        let mission = mission_tx_command_error(error);
+        assert_eq!(mission.error_code, "mission.tx.storage_unavailable");
+        assert_eq!(mission.exit_code, MISSION_EXIT_IO);
+        assert!(mission.message.contains("storage unavailable at /x"));
+        assert!(mission.hint.is_some());
+
+        let error = TxCommandExecutionError::refused_synthetic_commit(Some(&terminal));
+        assert_eq!(
+            robot_tx_command_error_code(&error),
+            "robot.tx_terminal_unavailable"
+        );
+        assert_eq!(
+            mission_tx_command_error(error).error_code,
+            "mission.tx.terminal_unavailable"
+        );
+
+        let unknown = TxCommandExecutionError::refused_synthetic_commit(None);
+        assert_eq!(
+            mission_tx_command_error(unknown).error_code,
+            "mission.tx.execution_failed"
+        );
     }
 
     fn persisted_robot_tx_contract(
@@ -120197,12 +120459,17 @@ cat "$FAKE_FONT_ARCHIVE"
         let guardian_probe = active
             .find("\"$stage/frankenterm-pty-guardian\" --version")
             .expect("guardian probe");
-        let seal = active.find("chmod 0555 \"$stage\"").expect("stage seal");
         let publish = active
             .find("$stage_id\" missing publish-noreplace")
             .expect("atomic generation publish");
-        assert!(ft_probe < seal && mux_probe < seal && guardian_probe < seal);
-        assert!(seal < publish);
+        // macOS refuses to rename a read-only directory, so the stage is
+        // published owner-writable and sealed 0555 only afterwards (B-I2).
+        assert!(!active.contains("chmod 0555 \"$stage\""));
+        let seal = active
+            .find("seal_published_installer_generation \"$generation\" || return 1")
+            .expect("post-publication generation seal");
+        assert!(ft_probe < publish && mux_probe < publish && guardian_probe < publish);
+        assert!(publish < seal);
         assert!(active.contains("stage_name=\".generation-${generation_id}.installing\""));
         assert!(!active.contains("stage_name=\".generation-${generation_id}.installing-$$\""));
         assert!(active.contains("validate_installer_stage_inventory \"$stage\" generation"));
@@ -121441,19 +121708,22 @@ with tarfile.open(path, "w") as archive:
             + font[direct_stage..]
                 .find("extract_authenticated_archive")
                 .expect("bounded font extraction");
-        let seal = font
-            .find("seal_font_generation_stage")
-            .expect("exact font receipt seal");
         let publication = font
             .find("atomic_path_transition")
             .expect("atomic font generation publication");
+        // Published owner-writable, sealed after (macOS refuses to rename or
+        // exchange a read-only directory; B-I2).
+        let seal = font
+            .find("seal_font_generation_stage \"$font_dir\"")
+            .expect("exact post-publication font receipt seal");
+        assert_eq!(font.matches("seal_font_generation_stage").count(), 1);
         assert!(receipt < download);
         assert!(download < checksum);
         assert!(checksum < scan_receipt);
         assert!(scan_receipt < direct_stage);
         assert!(direct_stage < extraction);
-        assert!(extraction < seal);
-        assert!(seal < publication);
+        assert!(extraction < publication);
+        assert!(publication < seal);
         assert!(!font.contains("zstd -dc \"$TMP/pragmasevka.zip.zst\" | tar"));
         assert!(font.contains("font - \"$font_identity\""));
         assert!(!font.contains("ensure_exact_staged_tree \"$font_stage\" \"$font_dir\""));
@@ -122615,6 +122885,132 @@ printf x > "$MINISIGN_MARKER"
             "candidate-component-verification-failed"
         );
         assert!(legacy_receipt["next_action"].is_null());
+    }
+
+    /// Release-wave B-I3: installers through 0.15.1 left only `$DEST/ft` (a
+    /// plain file, or a link into FrankenTerm.app). Upgrading from that layout
+    /// was refused as mixed authority. Activation now retains the old `ft`
+    /// (never deletes it) and puts it back if the new generation fails.
+    #[cfg(unix)]
+    #[test]
+    fn installer_upgrades_a_pre_generation_ft_and_restores_it_on_failure() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = InstallerTestDir::new("create pre-generation upgrade fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let candidate_family = create_installer_test_family(
+            &fixture.path().join("candidate-family"),
+            &"2".repeat(64),
+            "x86_64-unknown-linux-gnu",
+            "process-family-ft-mux-server-pty-guardian-default-features-v1",
+        );
+        let retained_entries = |destination: &Path| -> Vec<PathBuf> {
+            match std::fs::read_dir(
+                destination.join(".frankenterm-process-family/retained-entrypoints"),
+            ) {
+                Ok(entries) => entries.map(|entry| entry.unwrap().path()).collect(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(error) => panic!("read retained entrypoints: {error}"),
+            }
+        };
+
+        // A 0.15.1 direct `ft`: a failed activation gives it back untouched.
+        let destination = fixture.path().join("direct-bin");
+        std::fs::create_dir(&destination).expect("create pre-generation destination");
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
+            .expect("make pre-generation destination private");
+        let legacy_ft = b"#!/bin/sh\necho ft 0.15.1\n";
+        std::fs::write(destination.join("ft"), legacy_ft).expect("write 0.15.1 ft");
+        std::fs::set_permissions(
+            destination.join("ft"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("make 0.15.1 ft executable");
+        let published = run_installer_family_function(
+            &installer,
+            &candidate_family,
+            &destination,
+            &fixture.path().join("direct-stage"),
+            None,
+        );
+        assert!(
+            published.status.success(),
+            "publishing over a 0.15.1 ft must succeed: {}",
+            String::from_utf8_lossy(&published.stderr)
+        );
+        assert_eq!(std::fs::read(destination.join("ft")).unwrap(), legacy_ft);
+
+        let failed = run_installer_activation_function(
+            &installer,
+            &candidate_family,
+            &destination,
+            &fixture.path().join("direct-failure"),
+            None,
+            "inactive",
+            true,
+        );
+        assert!(!failed.status.success());
+        assert_eq!(
+            std::fs::read(destination.join("ft")).expect("0.15.1 ft is restored"),
+            legacy_ft
+        );
+        assert!(!destination.join("frankenterm-mux-server").exists());
+        assert!(retained_entries(&destination).is_empty());
+
+        let activated = run_installer_activation_function(
+            &installer,
+            &candidate_family,
+            &destination,
+            &fixture.path().join("direct-activation"),
+            None,
+            "inactive",
+            false,
+        );
+        assert!(
+            activated.status.success(),
+            "activation over a 0.15.1 ft: {}",
+            String::from_utf8_lossy(&activated.stderr)
+        );
+        assert!(family_bytes_match(&destination, &candidate_family));
+        let retained = retained_entries(&destination);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(std::fs::read(&retained[0]).unwrap(), legacy_ft);
+
+        // A 0.15.1 `ft` link into the app bundle is retained as the link.
+        let linked = fixture.path().join("linked-bin");
+        std::fs::create_dir(&linked).expect("create linked destination");
+        std::fs::set_permissions(&linked, std::fs::Permissions::from_mode(0o700))
+            .expect("make linked destination private");
+        let app_ft = Path::new("/Applications/FrankenTerm.app/Contents/MacOS/ft");
+        std::os::unix::fs::symlink(app_ft, linked.join("ft")).expect("link 0.15.1 ft");
+        assert!(
+            run_installer_family_function(
+                &installer,
+                &candidate_family,
+                &linked,
+                &fixture.path().join("linked-stage"),
+                None,
+            )
+            .status
+            .success()
+        );
+        assert!(
+            run_installer_activation_function(
+                &installer,
+                &candidate_family,
+                &linked,
+                &fixture.path().join("linked-activation"),
+                None,
+                "inactive",
+                false,
+            )
+            .status
+            .success()
+        );
+        assert!(family_bytes_match(&linked, &candidate_family));
+        let retained = retained_entries(&linked);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(std::fs::read_link(&retained[0]).unwrap(), app_ft);
     }
 
     #[cfg(unix)]
@@ -131131,7 +131527,8 @@ printf x > "$MINISIGN_MARKER"
                         slug: (*slug).to_string(),
                         state: (*state).to_string(),
                         session_id: None,
-                        source: DetectionSource::PaneTitle,
+                        // Fleet-managed agents: the only ones scale-down may stop.
+                        source: DetectionSource::FleetSpawn,
                     },
                 )
             })
@@ -131520,6 +131917,45 @@ printf x > "$MINISIGN_MARKER"
         assert_eq!(data["receipt"]["status"], "succeeded");
         assert_eq!(data["receipt"]["completed_count"].as_u64(), Some(2));
         assert!(robot_fleet_scale_failure(&data, false).is_none());
+    }
+
+    #[test]
+    fn test_robot_fleet_scale_down_never_stops_panes_it_did_not_spawn() {
+        use frankenterm_core::agent_correlator::DetectionSource;
+
+        // Release-wave B-C1: idle Codex panes recognized by screen or title
+        // (the operator's own sessions) next to one idle fleet-spawned pane.
+        let mut running_agents = robot_fleet_test_running_agents(&[
+            (1, "codex", "idle"),
+            (2, "codex", "idle"),
+            (3, "codex", "idle"),
+        ]);
+        running_agents.get_mut(&1).unwrap().source = DetectionSource::ScreenText;
+        running_agents.get_mut(&2).unwrap().source = DetectionSource::PaneTitle;
+        let mut ledger = frankenterm_core::fleet_mutation::FleetMutationLedger::new();
+        let mut executor = RobotFleetTestExecutor::default();
+
+        let data = robot_fleet_test_scale_data(
+            "codex",
+            0,
+            false,
+            running_agents,
+            BTreeMap::new(),
+            &mut ledger,
+            &mut executor,
+        );
+
+        let targets = data["selected_targets"].as_array().unwrap();
+        assert_eq!(targets.len(), 1, "{data}");
+        assert_eq!(targets[0]["pane_id"].as_u64(), Some(3));
+        let skipped = data["skipped_agents"].as_array().unwrap();
+        assert_eq!(skipped.len(), 2);
+        assert!(
+            skipped
+                .iter()
+                .all(|agent| agent["reason_code"] == "not_fleet_spawned")
+        );
+        assert_eq!(data["status"], "scale_down_partial_plan_created");
     }
 
     #[test]
@@ -140825,6 +141261,32 @@ A  docs/new-proof.md\n";
 
         assert!(wezterm_cli_probe_required(BackendKind::Cli));
         assert!(!wezterm_cli_probe_required(BackendKind::Vendored));
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn doctor_reports_an_idle_vendored_host_as_idle_not_broken() {
+        use frankenterm_core::wezterm::{BackendKind, BackendSelection};
+
+        let fallback = BackendSelection {
+            kind: BackendKind::Cli,
+            reason: "mux socket not discovered; falling back to CLI".to_string(),
+            compatibility: None,
+        };
+        // Fresh machine: no mux, no external CLI -> idle, not two errors.
+        assert!(doctor_host_is_idle(&fallback, false, false));
+        // A running mux, or a real external CLI, keeps the full probes.
+        assert!(!doctor_host_is_idle(&fallback, true, false));
+        assert!(!doctor_host_is_idle(&fallback, false, true));
+        let vendored = BackendSelection {
+            kind: BackendKind::Vendored,
+            ..fallback
+        };
+        assert!(!doctor_host_is_idle(&vendored, false, false));
+
+        assert!(executable_on_path("sh"));
+        assert!(!executable_on_path("ft-definitely-not-a-real-program"));
+        assert!(!executable_on_path("/nonexistent/ft-cli"));
     }
 
     #[cfg(feature = "vendored")]

@@ -222,7 +222,11 @@ err() {
 run_with_spinner() {
   local title="$1"
   shift
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+  # gum spin execs an external program; a shell function (e.g.
+  # download_https_bounded) is not one, so gum would exit 1 and the caller
+  # would wrongly treat the step as failed. Run functions in this shell.
+  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ] && [ "$QUIET" -eq 0 ] \
+    && [ "$(type -t "$1" 2>/dev/null)" = "file" ]; then
     gum spin --spinner dot --title "$title" -- "$@"
   else
     info "$title"
@@ -1089,6 +1093,20 @@ print(f"{stat.S_IMODE(observed.st_mode):04o}")
 PY
 }
 
+# Make a published generation directory immutable (0555) and durable. It is
+# published at 0700 because macOS refuses to rename a read-only directory; a
+# crash between publication and this seal leaves 0700, which a rerun seals.
+seal_published_installer_generation() {
+  local generation="$1" mode
+  mode=$(installer_stage_mode "$generation") || return 1
+  case "$mode" in
+    0555) return 0 ;;
+    0700) chmod 0555 "$generation" || return 1 ;;
+    *) return 1 ;;
+  esac
+  fsync_installer_tree "$generation"
+}
+
 atomic_transition_txid() {
   python3 - "$1" <<'PY'
 import hashlib, sys
@@ -1373,6 +1391,128 @@ finally:
 PY
 }
 
+# Move a pre-generation (<= 0.15.1) `ft` entrypoint, a plain file or a link,
+# into the managed root without deleting it, turning the `legacy-single`
+# authority into `initial`. Runs only inside activation, after the idle census.
+retain_legacy_single_entrypoint() {
+  python3 - "$DEST" <<'PY'
+import hashlib, os, stat, sys, time
+
+destination = os.path.abspath(sys.argv[1])
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+directory = getattr(os, "O_DIRECTORY", 0)
+cloexec = getattr(os, "O_CLOEXEC", 0)
+if not nofollow or not directory:
+    raise SystemExit("descriptor-relative nofollow installation is unavailable")
+
+def open_directory(name, parent_fd=None, create=False):
+    if create:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except FileExistsError:
+            pass
+    fd = os.open(name, os.O_RDONLY | directory | nofollow | cloexec, dir_fd=parent_fd)
+    opened = os.fstat(fd)
+    if (not stat.S_ISDIR(opened.st_mode) or opened.st_uid != os.geteuid() or
+            stat.S_IMODE(opened.st_mode) & 0o022):
+        os.close(fd)
+        raise SystemExit(f"{name} is not one private owner-controlled directory")
+    return fd
+
+destination_fd = open_directory(destination)
+managed_fd = retained_fd = -1
+try:
+    managed_fd = open_directory(".frankenterm-process-family", destination_fd)
+    retained_fd = open_directory("retained-entrypoints", managed_fd, create=True)
+    if os.fstat(retained_fd).st_dev != os.fstat(destination_fd).st_dev:
+        raise SystemExit("retained entrypoints are not on the destination filesystem")
+    observed = os.stat("ft", dir_fd=destination_fd, follow_symlinks=False)
+    if observed.st_uid != os.geteuid():
+        raise SystemExit("pre-generation ft is not owned by the installing user")
+    digest = hashlib.sha256()
+    if stat.S_ISLNK(observed.st_mode):
+        digest.update(b"link:" + os.fsencode(os.readlink("ft", dir_fd=destination_fd)))
+    elif stat.S_ISREG(observed.st_mode):
+        fd = os.open("ft", os.O_RDONLY | nofollow | cloexec, dir_fd=destination_fd)
+        try:
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        finally:
+            os.close(fd)
+    else:
+        raise SystemExit("pre-generation ft is neither a file nor a link")
+    retained = f"ft.{time.time_ns()}.{digest.hexdigest()[:16]}"
+    try:
+        os.stat(retained, dir_fd=retained_fd, follow_symlinks=False)
+        raise SystemExit("retained entrypoint name already exists")
+    except FileNotFoundError:
+        pass
+    after = os.stat("ft", dir_fd=destination_fd, follow_symlinks=False)
+    if (after.st_dev, after.st_ino, after.st_ctime_ns) != (
+            observed.st_dev, observed.st_ino, observed.st_ctime_ns):
+        raise SystemExit("pre-generation ft changed while it was retained")
+    os.rename("ft", retained, src_dir_fd=destination_fd, dst_dir_fd=retained_fd)
+    os.fsync(retained_fd)
+    os.fsync(destination_fd)
+    print(os.path.join(destination, ".frankenterm-process-family",
+                       "retained-entrypoints", retained))
+finally:
+    for fd in (retained_fd, managed_fd, destination_fd):
+        if fd >= 0:
+            os.close(fd)
+PY
+}
+
+# Undo retain_legacy_single_entrypoint after a failed activation rolled back
+# to the absent authority: link the retained entrypoint back to `$DEST/ft`
+# (never replacing an existing one), then drop the retained name.
+restore_legacy_single_entrypoint() {
+  python3 - "$DEST" "$1" <<'PY'
+import os, stat, sys
+
+destination = os.path.abspath(sys.argv[1])
+retained_path = os.path.abspath(sys.argv[2])
+expected_parent = os.path.join(destination, ".frankenterm-process-family",
+                               "retained-entrypoints")
+if os.path.dirname(retained_path) != expected_parent:
+    raise SystemExit("retained entrypoint is outside the managed retention directory")
+flags = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) |
+         getattr(os, "O_CLOEXEC", 0))
+
+def open_private(path):
+    fd = os.open(path, flags)
+    observed = os.fstat(fd)
+    if (not stat.S_ISDIR(observed.st_mode) or observed.st_uid != os.geteuid() or
+            stat.S_IMODE(observed.st_mode) & 0o022):
+        os.close(fd)
+        raise SystemExit(f"{path} is not one private owner-controlled directory")
+    return fd
+
+destination_fd = open_private(destination)
+retained_fd = -1
+try:
+    retained_fd = open_private(expected_parent)
+    name = os.path.basename(retained_path)
+    source = os.stat(name, dir_fd=retained_fd, follow_symlinks=False)
+    os.link(name, "ft", src_dir_fd=retained_fd, dst_dir_fd=destination_fd,
+            follow_symlinks=False)
+    restored = os.stat("ft", dir_fd=destination_fd, follow_symlinks=False)
+    if (restored.st_dev, restored.st_ino) != (source.st_dev, source.st_ino):
+        raise SystemExit("restored ft is not the retained entrypoint")
+    os.fsync(destination_fd)
+    os.unlink(name, dir_fd=retained_fd)
+    os.fsync(retained_fd)
+finally:
+    for fd in (retained_fd, destination_fd):
+        if fd >= 0:
+            os.close(fd)
+PY
+}
+
 inspect_installer_process_family_authority() {
   local allow_activation_recovery="${1:-0}"
   python3 - "$DEST" "$allow_activation_recovery" <<'PY'
@@ -1419,9 +1559,11 @@ def child_snapshot(parent_fd, name, expected_link=None):
     identity = stable(observed)
     if stat.S_ISLNK(observed.st_mode):
         target = os.readlink(name, dir_fd=parent_fd)
-        if ((expected_link is not None and target != expected_link) or
-                observed.st_uid != os.geteuid()):
+        if observed.st_uid != os.geteuid():
             raise SystemExit(f"unsafe or unmanaged symlink at {name}")
+        if expected_link is not None and target != expected_link:
+            # e.g. a 0.15.1 ~/.local/bin/ft -> FrankenTerm.app/Contents/MacOS/ft
+            return ("foreign", target, *identity)
         return ("managed", target, *identity)
     if stat.S_ISREG(observed.st_mode):
         if (expected_link is not None and
@@ -1480,6 +1622,11 @@ try:
         result = "initial"
     elif kinds == ("direct", "direct", "direct"):
         result = "legacy"
+    elif kinds[0] in ("direct", "foreign") and kinds[1:] == ("missing", "missing"):
+        # Installers through 0.15.1 placed only `ft` (a plain file, or a
+        # link into the app bundle). It stays live until activation retains
+        # it under the managed root and proceeds exactly as a first install.
+        result = "legacy-single"
     else:
         raise SystemExit("incomplete or mixed process-family authority")
 
@@ -1731,6 +1878,7 @@ install_process_family() {
   generation="$generations/$generation_id"
   if [ -e "$generation" ] || [ -L "$generation" ]; then
     [ -d "$generation" ] && [ ! -L "$generation" ] && \
+      seal_published_installer_generation "$generation" && \
       verify_canonical_generation "$generation" "$version" "$verifier_source" || return 1
   else
     require_filesystem_capacity "$generations" \
@@ -1762,12 +1910,15 @@ install_process_family() {
     "$stage/ft" --version >/dev/null 2>&1 || return 1
     "$stage/frankenterm-mux-server" --version >/dev/null 2>&1 || return 1
     "$stage/frankenterm-pty-guardian" --version >/dev/null 2>&1 || return 1
-    chmod 0555 "$stage" || return 1
     fsync_installer_tree "$stage" || return 1
     stage_id=$(atomic_path_content_id "$helper" "$generations" "$stage_name") || return 1
     txid=$(atomic_transition_txid "generation:$DEST:$generation_id") || return 1
+    # Publish while the stage is still owner-writable: macOS refuses to
+    # rename a read-only directory even within one parent, so sealing it 0555
+    # first failed every non-root macOS install. Seal after publication.
     atomic_path_transition "$helper" "$generations" "$stage_name" "$generation_id" \
       "$txid" "$stage_id" missing publish-noreplace || return 1
+    seal_published_installer_generation "$generation" || return 1
     verify_canonical_generation "$generation" "$version" "$verifier_source" || return 1
   fi
   installer_failpoint after-generation-publish
@@ -1781,7 +1932,7 @@ install_process_family() {
   }
   PROCESS_FAMILY_COMPONENT_VERIFICATION_STATE="verified"
   case "$authority_state" in
-    initial)
+    initial|legacy-single)
       initial_install=1
       selected_generation="$generation"
       require_no_live_mux_for_initial_selector || true
@@ -1824,13 +1975,14 @@ install_process_family() {
         done
         ensure_exact_staged_file "$legacy_manifest" "$legacy_stage/legacy-family.json" 0444 || return 1
         [ "$(legacy_process_family_manifest "$legacy_stage" -)" = "$legacy_manifest_id" ] || return 1
-        chmod 0555 "$legacy_stage" || return 1
         fsync_installer_tree "$legacy_stage" || return 1
         stage_id=$(atomic_path_content_id "$helper" "$generations" "$legacy_stage_name") || return 1
         txid=$(atomic_transition_txid "legacy-generation:$DEST:$legacy_id") || return 1
+        # Publish writable, then seal (macOS refuses to rename a 0555 dir).
         atomic_path_transition "$helper" "$generations" "$legacy_stage_name" "$legacy_id" \
           "$txid" "$stage_id" missing publish-noreplace || return 1
       fi
+      seal_published_installer_generation "$selected_generation" || return 1
       installer_failpoint after-legacy-recovery-publish
       [ "$(inspect_installer_process_family_authority)" = legacy ] || return 1
       for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
@@ -1882,6 +2034,10 @@ install_process_family() {
     }
     if [ "$initial_install" -eq 1 ]; then
       for name in ft frankenterm-mux-server frankenterm-pty-guardian; do
+        if [ "$authority_state" = legacy-single ] && [ "$name" = ft ]; then
+          # The pre-generation `ft` keeps serving until activation retains it.
+          continue
+        fi
         if [ -L "$DEST/$name" ]; then
           stable_entrypoint_is_managed "$name" && [ ! -e "$DEST/$name" ] || return 1
         else
@@ -2056,6 +2212,7 @@ activate_process_family_generation() {
   local selector_committed_here=0 recovery_claim="" recovery_output=""
   local recovery_version="" recovery_stage_id=""
   local candidate_verification_failed=0 transition_helper="" prior_root=""
+  local retained_entrypoint=""
 
   PROCESS_FAMILY_FAILURE_RECEIPT_SAFE=0
 
@@ -2097,6 +2254,19 @@ activate_process_family_generation() {
   helper="$generation/ft"
   verifier="$generation/verify-components.sh"
   manifest="$generation/process-family.component-manifest.json"
+  if [ "$(inspect_installer_process_family_authority 1 2>/dev/null || true)" = legacy-single ]; then
+    # Only a verified candidate may displace the pre-generation `ft`; after
+    # retention the host is an ordinary first install.
+    verify_canonical_generation "$generation" "" "$verifier" || {
+      err "Candidate generation $generation_id failed canonical verification; the existing ft was left in place"
+      return 1
+    }
+    retained_entrypoint=$(retain_legacy_single_entrypoint) || {
+      err "Could not retain the pre-generation ft entrypoint under $DEST/.frankenterm-process-family"
+      return 1
+    }
+    info "Retained the previous ft entrypoint at $retained_entrypoint"
+  fi
   authority_state=$(inspect_installer_process_family_authority 1) || {
     err "Process-family selector authority is ambiguous or unsafe"
     return 1
@@ -2740,6 +2910,14 @@ PY
           err "First-install rollback did not restore the exact absent authority"
           return 1
         }
+        # An upgrade from a pre-generation install gets its old `ft` back.
+        if [ -n "$retained_entrypoint" ]; then
+          restore_legacy_single_entrypoint "$retained_entrypoint" &&
+            [ "$(inspect_installer_process_family_authority)" = legacy-single ] || {
+            err "Could not restore the previous ft from $retained_entrypoint; restore it to $DEST/ft by hand"
+            return 1
+          }
+        fi
         ;;
       legacy)
         [ "$(inspect_installer_process_family_authority)" = legacy ] || {
@@ -5177,23 +5355,33 @@ install_pragmasevka() {
   fi
   installer_failpoint after-font-extraction
   installer_test_mutate_font_stage "$font_stage" || return 0
-  if ! seal_font_generation_stage "$font_stage" "$tree_receipt" ||
-      ! fsync_installer_tree "$font_stage" ||
-      ! verify_font_tree_receipt "$font_stage" "$tree_receipt" 1; then
-    warn "Pragmasevka generation failed exact receipt sealing; skipping"
+  # The stage is published owner-writable and sealed 0555 only afterwards:
+  # macOS refuses to rename (or exchange) a read-only directory, so sealing
+  # first made every non-root macOS install fail. A stage a prior run sealed
+  # is reopened to 0700 before its content identity is taken.
+  if [ "$(installer_stage_mode "$font_stage" 2>/dev/null)" = 0555 ]; then
+    chmod 0700 "$font_stage" || return 0
+  fi
+  if ! fsync_installer_tree "$font_stage" ||
+      ! verify_font_tree_receipt "$font_stage" "$tree_receipt" 0; then
+    warn "Pragmasevka generation failed its exact pre-publication receipt; skipping"
     return 0
   fi
 
   helper="$PUBLISHED_PROCESS_FAMILY_ROOT/ft"
   stage_id=$(atomic_path_content_id "$helper" "$font_parent" "$font_stage_name") || {
-    warn "Pragmasevka generation lacks one sealed atomic content identity; skipping"
+    warn "Pragmasevka generation lacks one atomic content identity; skipping"
     return 0
   }
   # This second receipt check followed by the atomic helper's stage-content-ID
   # check closes the final same-UID mutation window before the namespace move.
-  verify_font_tree_receipt "$font_stage" "$tree_receipt" 1 || return 0
+  verify_font_tree_receipt "$font_stage" "$tree_receipt" 0 || return 0
   if [ -e "$font_dir" ]; then
     [ -d "$font_dir" ] && [ ! -L "$font_dir" ] || return 0
+    # An exchange renames the prior generation too; reopen a sealed one.
+    if [ "$(installer_stage_mode "$font_dir" 2>/dev/null)" = 0555 ]; then
+      chmod 0700 "$font_dir" || return 0
+    fi
     target_id=$(atomic_path_content_id "$helper" "$font_parent" "$(basename "$font_dir")") || return 0
     operation=exchange
   else
@@ -5209,7 +5397,9 @@ install_pragmasevka() {
     return 0
   fi
   installer_failpoint after-font-publication
-  if ! verify_font_tree_receipt "$font_dir" "$tree_receipt" 1; then
+  if ! seal_font_generation_stage "$font_dir" "$tree_receipt" ||
+      ! fsync_installer_tree "$font_dir" ||
+      ! verify_font_tree_receipt "$font_dir" "$tree_receipt" 1; then
     warn "Published Pragmasevka generation failed its exact post-publication receipt"
     [ "$operation" = exchange ] &&
       warn "The prior font generation remains retained at $font_stage"

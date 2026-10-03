@@ -67,6 +67,7 @@ Column meanings:
 | `ft export` | segment content | ✓ (when `--redact`) | `export.rs:433` `redact_segment(seg, &redactor)` gated on `opts.redact` at `:112`. **Caveat:** `--redact` is an opt-in flag; default behaviour is subject to `opts.redact`'s default. Operators running `ft export` with `--redact=false` get raw bytes by design. |
 | `ft replay` decoded frame output | payload text | ✓ (when `--redact`) | `replay.rs:814-830` gated on `opts.redact`. Same opt-in caveat. |
 | Audit table writes | action summary + decision context | ✓ | `storage::record_audit_action_redacted` at `:6647` (write-time redaction; persisted audit rows are already clean). |
+| `ft record start` frames | captured pane text | ✓ | `main.rs` `RecordCommands::Start` applies `Redactor::redact` to each capture before `record_output` (write-time redaction); `recording.rs` `FrameWriter::new` creates the `.war` file owner-only (0600), also when reusing an existing `--output` path. |
 
 ### Distributed-mode aggregator ingest (closed — FND-004)
 

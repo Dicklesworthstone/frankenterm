@@ -667,6 +667,71 @@ pub struct ChainVerificationSummary {
     pub first_break_at: Option<u64>,
     pub missing_ordinals: Vec<u64>,
     pub total_records: usize,
+    /// Events whose plan hash or step evidence disagrees with the retained
+    /// ledger (see [`verify_event_evidence`]); empty when every event agrees.
+    #[serde(default)]
+    pub event_evidence_mismatches: Vec<String>,
+}
+
+/// Check emitted events against the ledger they claim to describe (ft-6roo4).
+/// Every event must carry the ledger's plan hash. An event that claims a
+/// ledger record (an idempotency key) must match it by key and agent, and its
+/// chain hash must be that record's own hash: the next record's `prev_hash`,
+/// or the ledger head for the final record. Returns one line per mismatch.
+#[must_use]
+pub fn verify_event_evidence(
+    ledger: &TxExecutionLedger,
+    events: &[TxObservabilityEvent],
+) -> Vec<String> {
+    let records = ledger.records();
+    let mut mismatches = Vec::new();
+    // Events of other executions are not this ledger's evidence (bundle
+    // retention drops them too); judge only this execution's events.
+    for event in events.iter().filter(|event| {
+        event.execution_id == ledger.execution_id() && event.plan_id == ledger.plan_id()
+    }) {
+        if event.plan_hash != ledger.plan_hash() {
+            mismatches.push(format!(
+                "event {} ({:?}) plan_hash {:#x} != ledger {:#x}",
+                event.sequence,
+                event.kind,
+                event.plan_hash,
+                ledger.plan_hash()
+            ));
+        }
+        // Only events that claim a ledger record (an idempotency key) are
+        // checked against one; prepare-gate events name a step but no record.
+        if event.idem_key.is_empty() {
+            continue;
+        }
+        let Some(index) = records
+            .iter()
+            .position(|record| record.idem_key.as_str() == event.idem_key)
+        else {
+            mismatches.push(format!(
+                "event {} step {} names idempotency key {} absent from the ledger",
+                event.sequence, event.step_id, event.idem_key
+            ));
+            continue;
+        };
+        let record = &records[index];
+        if record.agent_id != event.agent_id {
+            mismatches.push(format!(
+                "event {} step {} agent {} != ledger record agent {}",
+                event.sequence, event.step_id, event.agent_id, record.agent_id
+            ));
+        }
+        let record_hash = records
+            .get(index + 1)
+            .map_or_else(|| ledger.last_hash(), |next| next.prev_hash.as_str());
+        if event.chain_hash != record_hash {
+            mismatches.push(format!(
+                "event {} step {} chain_hash does not match its ledger record",
+                event.sequence, event.step_id
+            ));
+        }
+    }
+    mismatches
 }
 
 impl From<ChainVerification> for ChainVerificationSummary {
@@ -676,6 +741,7 @@ impl From<ChainVerification> for ChainVerificationSummary {
             first_break_at: cv.first_break_at,
             missing_ordinals: cv.missing_ordinals,
             total_records: cv.total_records,
+            event_evidence_mismatches: Vec::new(),
         }
     }
 }
@@ -804,7 +870,8 @@ pub fn build_forensic_bundle(
 ) -> TxForensicBundle {
     let plan_snapshot = PlanSnapshot::from_plan(plan);
     let ledger_snapshot = LedgerSnapshot::from_ledger(ledger);
-    let chain_verification: ChainVerificationSummary = ledger.verify_chain().into();
+    let mut chain_verification: ChainVerificationSummary = ledger.verify_chain().into();
+    chain_verification.event_evidence_mismatches = verify_event_evidence(ledger, events);
 
     let retained_events = retain_observability_events(ledger, events, config.max_events);
     let (mut timeline, timeline_retention) = retain_timeline_entries(
@@ -1062,6 +1129,66 @@ mod tests {
             agent_id: "system".to_string(),
             details,
         }
+    }
+
+    #[test]
+    fn event_evidence_verifies_against_the_ledger_and_flags_corruption() {
+        let plan = make_test_plan();
+        let ledger = make_test_ledger(&plan);
+        let records = ledger.records();
+        let mut step = make_observability_event(
+            &ledger,
+            2,
+            1000,
+            TxEventKind::StepCommitted,
+            reason_codes::STEP_COMMITTED,
+            "step-1 committed",
+        );
+        step.step_id = "step-1".to_string();
+        step.idem_key = records[0].idem_key.as_str().to_string();
+        step.agent_id = records[0].agent_id.clone();
+        step.chain_hash = records[1].prev_hash.clone();
+        let mut last = step.clone();
+        last.sequence = 3;
+        last.step_id = "step-2".to_string();
+        last.idem_key = records[1].idem_key.as_str().to_string();
+        last.agent_id = records[1].agent_id.clone();
+        last.chain_hash = ledger.last_hash().to_string();
+        let summary = make_observability_event(
+            &ledger,
+            1,
+            500,
+            TxEventKind::PrepareStarted,
+            reason_codes::PREPARE_STARTED,
+            "prepare",
+        );
+        assert!(
+            verify_event_evidence(&ledger, &[summary.clone(), step.clone(), last.clone()])
+                .is_empty()
+        );
+
+        // Replayed/corrupted evidence is named, one line per defect.
+        let mut wrong_chain = step.clone();
+        wrong_chain.chain_hash = ledger.last_hash().to_string();
+        let mut wrong_agent = step.clone();
+        wrong_agent.agent_id = "agent-9".to_string();
+        let mut unknown_key = step.clone();
+        unknown_key.idem_key = "txk:v2:not-in-ledger".to_string();
+        let mut zero_hash = summary.clone();
+        zero_hash.plan_hash = 0;
+        for corrupted in [wrong_chain, wrong_agent, unknown_key, zero_hash] {
+            assert_eq!(
+                verify_event_evidence(&ledger, std::slice::from_ref(&corrupted)).len(),
+                1,
+                "{corrupted:?}"
+            );
+        }
+
+        // Another execution's events are not this ledger's evidence.
+        let mut foreign = summary;
+        foreign.execution_id = "exec-other".to_string();
+        foreign.plan_hash = 0;
+        assert!(verify_event_evidence(&ledger, &[foreign]).is_empty());
     }
 
     // ── TxEventKind ──

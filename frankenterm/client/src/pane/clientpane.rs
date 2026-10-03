@@ -1489,10 +1489,12 @@ impl ReliableInputQueue {
             return Ok(0);
         }
         let rpc = client.client.rpc_scope();
+        // Peers older than reliable pane writes (codec 46, and 61..=63, e.g. a
+        // 0.15.1 mux) take the legacy PDU9 WriteToPane path rather than having
+        // their input refused (release-wave B-M5). Only a dialect older than
+        // every supported one is refused.
         let codec_version = rpc.agreed_codec_version();
-        if codec_version.is_some_and(|version| {
-            version < RELIABLE_PANE_WRITE_V1_MIN_CODEC_VERSION && version != LEGACY46_CODEC_VERSION
-        }) {
+        if codec_version.is_some_and(|version| version < LEGACY46_CODEC_VERSION) {
             notify_pane_write_failure(
                 &registration,
                 &delivery,
@@ -2083,7 +2085,7 @@ impl ReliableInputQueue {
                     "transport_not_ready",
                 );
             }
-            Some(LEGACY46_CODEC_VERSION) => {
+            Some(version) if version < RELIABLE_PANE_WRITE_V1_MIN_CODEC_VERSION => {
                 return Self::attempt_legacy_pane_write(queue, &rpc, entry).await;
             }
             Some(_) => {}
@@ -5730,8 +5732,11 @@ impl Pane for ClientPane {
         // Domain detaching can implicitly call Pane::kill on the panes
         // in the domain, so we need to check here whether the domain is
         // in the detached state; if so then we must skip sending the
-        // kill to the server.
-        if !client.is_detached() {
+        // kill to the server. Likewise a pane already marked dead is being
+        // pruned, not killed by the user: either the server already reported
+        // it gone, or liveness was lost, and a wrong liveness inference must
+        // never terminate a live remote process (release-wave B-M3).
+        if !client.is_detached() && !self.is_dead() {
             let request = client.client.kill_pane(KillPane {
                 pane_id: remote_pane_id,
             });
@@ -9785,47 +9790,32 @@ mod tests {
             ReliableInputAttempt::Retry(delay, "transport_not_ready")
                 if delay == RELIABLE_INPUT_TRANSPORT_RETRY_DELAY
         ));
-        let pre_v64 = promise::spawn::block_on(ReliableInputQueue::attempt(
-            &inner.reliable_input_queue,
-            &inner,
-            &entry,
+        // A pre-v64 peer (e.g. a 0.15.1 mux) has no reliable-write dialect:
+        // the retained bytes go out once as a legacy PDU9 WriteToPane instead
+        // of being held back forever (release-wave B-M5).
+        let (pre_v64, wire) = promise::spawn::block_on(futures::future::join(
+            ReliableInputQueue::attempt(&inner.reliable_input_queue, &inner, &entry),
+            peer.respond_next_unit(),
         ));
         assert!(matches!(
             pre_v64,
-            ReliableInputAttempt::Retry(delay, "unsupported_codec")
-                if delay == RELIABLE_INPUT_TRANSPORT_RETRY_DELAY
+            ReliableInputAttempt::Complete("legacy_applied")
         ));
-        assert!(peer.is_empty());
-        assert_eq!(delivery.pending_chunks(), 1);
-        assert_eq!(delivery.sticky_failure(), None);
-
-        peer.replace_ready_generation(&inner.client, RELIABLE_PANE_WRITE_V1_MIN_CODEC_VERSION)
-            .expect("restore a capable exact generation");
-        let (settled, wire) = promise::spawn::block_on(futures::future::join(
-            ReliableInputQueue::attempt(&inner.reliable_input_queue, &inner, &entry),
-            peer.respond_next_reliable_pane_write(ReliablePaneWriteOutcomeV1::AppliedPrefix {
-                bytes: 8,
-            }),
-        ));
-        assert!(matches!(
-            settled,
-            ReliableInputAttempt::Complete("applied_prefix")
-        ));
-        assert_eq!(
-            wire.expect("restored v64 peer receives retained bytes")
-                .request
-                .data,
-            b"retained"
-        );
+        let Pdu::WriteToPane(write) = wire.expect("the pre-v64 peer receives one legacy write")
+        else {
+            panic!("expected a legacy WriteToPane");
+        };
+        assert_eq!(write.data, b"retained");
+        assert_eq!(write.pane_id, 143);
         assert!(inner
             .reliable_input_queue
-            .complete_front(&entry, "applied_prefix"));
+            .complete_front(&entry, "legacy_applied"));
         assert_eq!(delivery.pending_chunks(), 0);
         assert_eq!(delivery.sticky_failure(), None);
     }
 
     #[test]
-    fn pane_writer_pre_v64_admission_rejection_recovers_after_peer_upgrade() {
+    fn pane_writer_on_a_pre_v64_peer_accepts_input_for_legacy_delivery() {
         let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
@@ -9838,22 +9828,13 @@ mod tests {
             .expect("register old-codec pane");
         inner.reliable_input_queue.state.lock().worker_running = true;
 
-        let error = std::io::Write::write(&mut *pane.writer.lock(), b"no-shim")
-            .expect_err("v63 peer must fail explicitly instead of using WriteToPane");
-        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
-        let repeated = std::io::Write::write(&mut *pane.writer.lock(), b"still-no-shim")
-            .expect_err("v63 remains explicitly unsupported while it is authoritative");
-        assert_eq!(repeated.kind(), std::io::ErrorKind::Unsupported);
-        assert!(inner.reliable_input_queue.state.lock().pending.is_empty());
-        assert!(peer.is_empty());
-
-        peer.replace_ready_generation(&inner.client, RELIABLE_PANE_WRITE_V1_MIN_CODEC_VERSION)
-            .expect("upgrade the exact peer generation to v64");
-        let upgraded = b"after-upgrade";
+        // Release-wave B-M5: a 0.15.21 GUI on a 0.15.1 (v63) mux must still
+        // accept typed input; it is queued for at-most-once legacy delivery.
+        let accepted = b"typed-on-v63";
         assert_eq!(
-            std::io::Write::write(&mut *pane.writer.lock(), upgraded)
-                .expect("zero-byte v63 refusals must not permanently quarantine the writer"),
-            upgraded.len()
+            std::io::Write::write(&mut *pane.writer.lock(), accepted)
+                .expect("a v63 peer accepts writer-path input"),
+            accepted.len()
         );
         assert_eq!(inner.reliable_input_queue.state.lock().pending.len(), 1);
         assert_eq!(pane.writer.lock().delivery.sticky_failure(), None);

@@ -3701,10 +3701,19 @@ const TRAUMA_LOOP_BLOCK_RULE_ID: &str = "policy.trauma_guard.loop_block";
 const TRAUMA_FEEDBACK_PREFIX: &str = "[ft::TraumaGuard]";
 const RCH_HEAVY_COMPUTE_RULE_ID: &str = "policy.rch.heavy_compute";
 
+/// The lines a terminal executes from `text`: `\n`, `\r\n`, and a bare `\r`
+/// each end one, since a typed carriage return is Enter. `str::lines` keeps a
+/// bare `\r` inside its line, so `echo ok\rrm -rf /` would be judged as one
+/// harmless `echo` while the shell runs both commands.
+fn terminal_input_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.split('\n')
+        .flat_map(|line| line.strip_suffix('\r').unwrap_or(line).split('\r'))
+}
+
 /// Determine whether the text looks like a shell command
 #[must_use]
 pub fn is_command_candidate(text: &str) -> bool {
-    for line in text.lines() {
+    for line in terminal_input_lines(text) {
         let mut trimmed = line.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -3823,7 +3832,7 @@ fn is_exact_trauma_bypass_assignment(assignment: &str) -> bool {
 
 #[must_use]
 fn has_trauma_bypass_prefix(text: &str) -> bool {
-    for line in text.lines() {
+    for line in terminal_input_lines(text) {
         let mut trimmed = line.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -3932,7 +3941,7 @@ where
     let mut logical_lines = Vec::new();
     let mut current_logical_line = String::new();
 
-    for line in text.lines() {
+    for line in terminal_input_lines(text) {
         if let Some(stripped) = line.strip_suffix('\\') {
             current_logical_line.push_str(stripped);
             current_logical_line.push(' ');
@@ -8134,10 +8143,16 @@ where
         let mut transient_switch = None;
         let effect_fence = if let Some(storage) = self.storage.as_ref() {
             use crate::policy_kill_switch_state::{
-                KillSwitchStateError, acquire_kill_switch_fence,
+                KILL_SWITCH_FENCE_WAIT, KillSwitchStateError,
+                acquire_kill_switch_fence_within_with_cx,
                 load_kill_switch_state_from_storage_with_cx,
             };
-            let fence = acquire_kill_switch_fence(std::path::Path::new(storage.db_path()));
+            let fence = acquire_kill_switch_fence_within_with_cx(
+                cx,
+                std::path::Path::new(storage.db_path()),
+                KILL_SWITCH_FENCE_WAIT,
+            )
+            .await;
             if matches!(&fence, Err(KillSwitchStateError::FencePending)) {
                 transient_switch = Some(self.engine.kill_switch_state().clone());
             }
@@ -9715,6 +9730,34 @@ mod tests {
         let decision = engine.authorize(&input);
         assert!(decision.is_denied());
         assert_eq!(decision.rule_id(), Some("command.rm_rf_root"));
+    }
+
+    /// A bare carriage return is Enter to a terminal, so a command after it
+    /// runs exactly like one after a newline and must be gated the same way.
+    #[test]
+    fn command_gate_sees_a_command_after_a_bare_carriage_return() {
+        assert_eq!(
+            terminal_input_lines("echo ok\rrm -rf /\r\nls\n").collect::<Vec<_>>(),
+            vec!["echo ok", "rm -rf /", "ls", ""]
+        );
+        assert!(is_command_candidate("# note\rrm -rf /tmp"));
+        assert!(has_trauma_bypass_prefix(
+            "# note\rFT_BYPASS_TRAUMA=1 rm -rf /"
+        ));
+        for text in [
+            "echo ok\rrm -rf /",
+            "echo ok\r\nrm -rf /",
+            "echo ok\nrm -rf /",
+        ] {
+            let mut engine = PolicyEngine::permissive();
+            let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+                .with_pane(1)
+                .with_capabilities(unreserved(PaneCapabilities::prompt()))
+                .with_command_text(text);
+            let decision = engine.authorize(&input);
+            assert!(decision.is_denied(), "{text:?} must be denied");
+            assert_eq!(decision.rule_id(), Some("command.rm_rf_root"));
+        }
     }
 
     #[test]

@@ -246,6 +246,24 @@ fn canonical_socket_lease_record(
     )
 }
 
+/// No server accepts on `sock_path`: three connection attempts 100 ms apart
+/// are all refused. A live server accepts; one refusal alone is not proof
+/// (macOS also refuses when a live listener's backlog is momentarily full).
+/// Any accepted connection, or any other error, keeps the socket protected.
+#[cfg(unix)]
+fn socket_has_no_listener(sock_path: &Path) -> bool {
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        match std::os::unix::net::UnixStream::connect(sock_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 #[cfg(unix)]
 fn process_is_proven_absent(pid: u32) -> bool {
     let Ok(raw_pid) = i32::try_from(pid) else {
@@ -375,15 +393,18 @@ fn quarantine_existing_socket_under_lease(
             sock_path.display()
         );
     }
-    let publisher_pid = socket_lease_record_pid(&initial, lock_file).ok_or_else(|| {
-        anyhow!(
-            "refusing to replace existing socket without an exact versioned lease: {}",
-            sock_path.display()
-        )
-    })?;
-    if !process_is_proven_absent(publisher_pid) {
+    // A versioned lease names its publisher. A socket left by a pre-lease
+    // (0.15.1) server has none, and a recorded pid can be recycled by an
+    // unrelated process; in both cases the socket is stale exactly when no
+    // listener accepts on it (release-wave B-M1: otherwise an upgrade over a
+    // 0.15.1 socket could never start the new server).
+    let publisher_pid = socket_lease_record_pid(&initial, lock_file);
+    let stale = |pid: Option<u32>| {
+        pid.is_some_and(process_is_proven_absent) || socket_has_no_listener(sock_path)
+    };
+    if !stale(publisher_pid) {
         anyhow::bail!(
-            "refusing to replace socket while its recorded publisher is not proven absent: {}",
+            "refusing to replace socket while a server may still own it (live publisher or accepting listener): {}",
             sock_path.display()
         );
     }
@@ -391,8 +412,8 @@ fn quarantine_existing_socket_under_lease(
     let slot = create_stale_socket_quarantine_slot(sock_path, &initial)?;
     let revalidated = sock_path.symlink_metadata()?;
     if !socket_identity_matches(&initial, &revalidated)
-        || socket_lease_record_pid(&initial, lock_file) != Some(publisher_pid)
-        || !process_is_proven_absent(publisher_pid)
+        || socket_lease_record_pid(&initial, lock_file) != publisher_pid
+        || !stale(publisher_pid)
     {
         anyhow::bail!("existing socket authority changed before quarantine");
     }
@@ -841,14 +862,44 @@ mod tests {
             .expect("make live publisher runtime private");
         let live_socket = live_runtime.path().join("gui.sock");
         let mut live_lock = acquire_socket_lock(&live_socket).expect("acquire live publisher lock");
+        // A live publisher still accepts on its socket.
         let live_listener = UnixListener::bind(&live_socket).expect("bind live publisher socket");
         write_socket_lease_record_for_test(&mut live_lock, &live_socket, std::process::id());
-        drop(live_listener);
         drop(live_lock);
         let takeover_lock =
             acquire_socket_lock(&live_socket).expect("reacquire live publisher lock");
         assert!(quarantine_existing_socket_under_lease(&live_socket, &takeover_lock).is_err());
         assert!(live_socket.exists());
+        drop(live_listener);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_lease_socket_is_replaced_only_when_nothing_listens() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Release-wave B-M1: a 0.15.1 server left its socket with no versioned
+        // lease record, so the new server refused to start over it forever.
+        let runtime = tempfile::tempdir().expect("legacy socket runtime");
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make legacy socket runtime private");
+        let socket = runtime.path().join("gui.sock");
+
+        // A legacy server that is still running keeps its socket.
+        let live = UnixListener::bind(&socket).expect("bind live legacy socket");
+        let lock = acquire_socket_lock(&socket).expect("acquire socket lock over legacy socket");
+        assert!(quarantine_existing_socket_under_lease(&socket, &lock).is_err());
+        assert!(socket.exists());
+        drop(lock);
+
+        // Once it is gone, its leftover socket is quarantined, not deleted.
+        drop(live);
+        let lock = acquire_socket_lock(&socket).expect("reacquire socket lock");
+        quarantine_existing_socket_under_lease(&socket, &lock)
+            .expect("quarantine the dead legacy socket");
+        assert!(!socket.exists());
+        let quarantine = runtime.path().join(STALE_SOCKET_QUARANTINE_DIRECTORY);
+        assert_eq!(std::fs::read_dir(&quarantine).unwrap().count(), 1);
     }
 
     #[cfg(unix)]
@@ -868,11 +919,13 @@ mod tests {
         drop(initial_lock);
         let retained_original = runtime.path().join("retained-original-socket");
         std::fs::rename(&socket, &retained_original).expect("retain original socket");
-        drop(UnixListener::bind(&socket).expect("bind replacement socket"));
+        // Another server rebound the path and is serving it.
+        let rebound = UnixListener::bind(&socket).expect("bind replacement socket");
 
         let replacement_lock = acquire_socket_lock(&socket).expect("acquire replacement lock");
         assert!(quarantine_existing_socket_under_lease(&socket, &replacement_lock).is_err());
         assert!(socket.exists());
         assert!(retained_original.exists());
+        drop(rebound);
     }
 }

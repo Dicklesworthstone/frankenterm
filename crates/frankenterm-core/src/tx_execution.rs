@@ -2244,8 +2244,7 @@ impl MissionMutationGuard {
         expected: Option<&MissionRevisionToken>,
     ) -> Result<Self, MissionStoreError> {
         let bytes = guard.read_authoritative_contract_bytes()?;
-        let mission: Mission =
-            serde_json::from_slice(&bytes).map_err(|_| MissionStoreError::Invalid)?;
+        let mission = Mission::from_json_slice(&bytes).map_err(|_| MissionStoreError::Invalid)?;
         mission.validate().map_err(|_| MissionStoreError::Invalid)?;
         let original = MissionRevisionToken::from_mission(&mission)?;
         if expected.is_some_and(|token| token != &original) {
@@ -12005,6 +12004,27 @@ mod tests {
         assert_ne!(
             steps[0].chain_hash, steps[1].chain_hash,
             "each step event names the chain head after its own record"
+        );
+
+        // The forensic bundle cross-checks that evidence and, now that the
+        // events carry the plan hash, retains them in its timeline.
+        let bundle = result
+            .forensic_bundle
+            .expect("default config builds a bundle");
+        assert!(
+            bundle
+                .chain_verification
+                .event_evidence_mismatches
+                .is_empty(),
+            "{:?}",
+            bundle.chain_verification.event_evidence_mismatches
+        );
+        assert!(
+            bundle
+                .timeline
+                .iter()
+                .any(|entry| entry.kind == TxEventKind::CommitStarted),
+            "engine events reach the bundle timeline"
         );
     }
 

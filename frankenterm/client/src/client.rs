@@ -4203,7 +4203,7 @@ pub(crate) struct RemoteRejectionError {
     pub(crate) response: ErrorResponse,
 }
 
-fn remote_rejection_error(
+pub(crate) fn remote_rejection_error(
     method: &'static str,
     expected_request_ident: u64,
     response: &ErrorResponse,
@@ -4421,8 +4421,9 @@ macro_rules! rpc_surface {
         ) -> impl std::future::Future<Output = anyhow::Result<LivenessResponse>> + Send + 'static {
             let mut metric_guard = RpcAttemptMetricGuard::new("get_pane_render_changes");
             let pane_id = pdu.pane_id;
-            // A live pane replies with a freshly correlated render observation;
-            // a missing pane replies with liveness=false. Rendering still uses
+            // A live pane replies with liveness (codec <= 64 and >= 69) or a
+            // correlated render observation (codec 65..=68); a missing pane
+            // replies with liveness=false. Rendering still uses
             // the independent unilateral stream, so this poll must not apply the
             // correlated delta a second time or move its incremental baseline.
             let request = self.send_pdu_expect(Pdu::GetPaneRenderChanges(pdu), None);

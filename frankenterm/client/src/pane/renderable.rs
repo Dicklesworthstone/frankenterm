@@ -2613,9 +2613,14 @@ impl RenderableInner {
                     // Preserve the established liveness policy: a transient
                     // transport failure cannot declare a reconnectable pane dead,
                     // while a non-reconnectable pane has no successor that could
-                    // revive it. The generation commit below still prevents a G1
-                    // result from mutating state after G2 publication.
-                    Err(_) => client.client.is_reconnectable,
+                    // revive it. A typed "busy, retry after backoff" answer is
+                    // proof the pane exists: a busy streaming pane must never be
+                    // declared dead and killed (release-wave B-M3). The
+                    // generation commit below still prevents a G1 result from
+                    // mutating state after G2 publication.
+                    Err(error) => {
+                        client.client.is_reconnectable || liveness_refusal_is_busy(&error)
+                    }
                 };
                 let updated = rpc
                     .commit_sync(RpcConsumerKind::Liveness, || {
@@ -2638,6 +2643,23 @@ impl RenderableInner {
             .detach();
         Ok(())
     }
+}
+
+/// A liveness-poll failure that says "busy, ask again" rather than "gone": the
+/// mux answered PDU24 with a not-applied, retry-after-backoff rejection (its
+/// render metadata was briefly locked by a streaming pane), or this client's
+/// own outbound admission deferred the request.
+fn liveness_refusal_is_busy(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::client::RemoteRejectionError>()
+        .is_some_and(|error| {
+            error.response.request_ident == GetPaneRenderChanges::IDENT
+                && error.response.effect == MuxErrorEffect::NOT_APPLIED
+                && error.response.retry == MuxErrorRetry::SAFE_AFTER_BACKOFF
+        })
+        || error
+            .downcast_ref::<crate::client::ClientOutboundAdmissionError>()
+            .is_some_and(|error| error.ident == GetPaneRenderChanges::IDENT)
 }
 
 const IMAGE_LRU_MAX_ENTRIES: usize = 128;
@@ -4725,6 +4747,32 @@ mod tests {
     use termwiz::surface::{SequenceNo, SEQ_ZERO};
     use wezterm_term::Line;
     use wezterm_term::{KeyCode, KeyModifiers};
+
+    #[test]
+    fn busy_liveness_answers_keep_a_pane_alive() {
+        use codec::{ErrorResponse, GetPaneRenderChanges, PduWireIdent as _};
+
+        // Release-wave B-M3: a streaming pane's busy PDU24 answer used to
+        // mark it dead on a non-reconnectable domain, and pruning then sent
+        // KillPane to the server.
+        let ident = GetPaneRenderChanges::IDENT;
+        let busy = crate::client::remote_rejection_error(
+            "get_pane_render_changes",
+            ident,
+            &ErrorResponse::resource_busy(ident),
+        );
+        assert!(super::liveness_refusal_is_busy(&busy));
+
+        let gone = crate::client::remote_rejection_error(
+            "get_pane_render_changes",
+            ident,
+            &ErrorResponse::pane_not_found(ident, 7),
+        );
+        assert!(!super::liveness_refusal_is_busy(&gone));
+        assert!(!super::liveness_refusal_is_busy(&anyhow::anyhow!(
+            "transport closed"
+        )));
+    }
 
     #[test]
     fn rejected_image_permits_preserve_existing_reservations() {

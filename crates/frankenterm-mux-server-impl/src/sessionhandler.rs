@@ -209,6 +209,12 @@ impl Drop for CancelLineReadOnDrop {
 #[error("line read source changed before publication")]
 struct LineReadPublicationChanged;
 
+/// Every cold-read worker is busy. Nothing about the pane is wrong: the
+/// client is told to retry after backoff rather than shown a failed read.
+#[derive(Debug, thiserror::Error)]
+#[error("cold read worker capacity exhausted")]
+struct LineReadWorkerCapacity;
+
 fn line_read_failure_reason(error: &anyhow::Error) -> &'static str {
     if error
         .downcast_ref::<wezterm_term::screen::ColdReadPayloadLimit>()
@@ -2420,6 +2426,7 @@ impl MuxRequestErrorContext {
                 | Pdu::GetPaneTieredScrollbackStatusesV1(_)
                 | Pdu::GetPaneDomainsV1(_)
                 | Pdu::GetPaneRenderChanges(_)
+                | Pdu::GetPaneRenderStateV1(_)
                 | Pdu::GetPaneRenderDeliveryV1(_)
                 | Pdu::SearchScrollbackRequest(_)
         );
@@ -2475,6 +2482,13 @@ impl MuxRequestErrorContext {
         {
             return ErrorResponse::resource_busy(self.request_ident);
         }
+        if matches!(
+            self.request_ident,
+            GetLines::IDENT | GetLinesAtLayout::IDENT
+        ) && error.downcast_ref::<LineReadWorkerCapacity>().is_some()
+        {
+            return ErrorResponse::resource_busy(self.request_ident);
+        }
         // An unfenced read can recapture the same requested rows after output
         // invalidates its owned plan. A layout-fenced caller must instead
         // observe a fresh layout before deciding whether to restart; preserve
@@ -2496,7 +2510,8 @@ impl MuxRequestErrorContext {
         {
             return ErrorResponse::quota_exceeded(self.request_ident);
         }
-        if self.request_ident == GetPaneRenderChanges::IDENT
+        if (self.request_ident == GetPaneRenderChanges::IDENT
+            || self.request_ident == <codec::GetPaneRenderStateV1 as codec::PduWireIdent>::IDENT)
             && matches!(
                 error.downcast_ref::<PaneRenderPreparationError>(),
                 Some(
@@ -9348,7 +9363,49 @@ impl SessionHandler {
                 );
             }
 
+            // PDU24 keeps its original contract, which every supported GUI
+            // understands: push the render delta on the unilateral stream and
+            // answer liveness. A correlated PDU25 reply here made pre-codec-66
+            // GUIs (0.15.1) disconnect on their first poll (release-wave B-M4);
+            // the correlated observation is PDU114 below.
             Pdu::GetPaneRenderChanges(GetPaneRenderChanges { pane_id, .. }) => {
+                let Some(registration) =
+                    capture_pane_or_respond_liveness(&authority, pane_id, &send_response)
+                else {
+                    return;
+                };
+                let sender = self.to_write_tx.clone();
+                let per_pane = self.per_pane_for_registration(&registration);
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Render,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                let is_alive = authority
+                                    .try_run(|| {
+                                        registration
+                                            .try_with_current(|current| {
+                                                push_pane_changes_with_observation(
+                                                    &current, sender, per_pane, false,
+                                                )
+                                            })
+                                            .transpose()
+                                    })??
+                                    .is_some();
+                                Ok(Pdu::LivenessResponse(LivenessResponse {
+                                    pane_id,
+                                    is_alive,
+                                }))
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
+            }
+
+            Pdu::GetPaneRenderStateV1(codec::GetPaneRenderStateV1 { pane_id }) => {
                 let Some(registration) =
                     capture_pane_or_respond_liveness(&authority, pane_id, &send_response)
                 else {
@@ -9522,7 +9579,7 @@ impl SessionHandler {
                             if let Some(timing) = &mut timing {
                                 timing.outcome = "worker_capacity";
                             }
-                            send_response(Err(anyhow!("cold read worker capacity exhausted")));
+                            send_response(Err(LineReadWorkerCapacity.into()));
                             return;
                         };
                         if let Some(layout) = layout {
@@ -14850,6 +14907,41 @@ mod tests {
                 );
                 assert!(!format!("{response:?}").contains("private"));
             }
+        }
+    }
+
+    /// Four concurrent cold reads fill the worker pool. A fifth is told to
+    /// retry, not that the read failed (release-wave review: `ft get-text`
+    /// failed under ordinary swarm read concurrency).
+    #[test]
+    fn exhausted_cold_read_workers_answer_busy_only_for_line_reads() {
+        for request_ident in [
+            GetLines::IDENT,
+            GetLinesAtLayout::IDENT,
+            GetPaneRenderChanges::IDENT,
+            KillPane::IDENT,
+        ] {
+            let context = MuxRequestErrorContext {
+                request_ident,
+                object: None,
+                may_mutate: request_ident == KillPane::IDENT,
+            };
+            let response = context.response_for_error(&LineReadWorkerCapacity.into());
+            response.validate().unwrap();
+            if matches!(request_ident, GetLines::IDENT | GetLinesAtLayout::IDENT) {
+                assert_eq!(response.code, MuxErrorCode::RESOURCE_BUSY);
+                assert_eq!(response.effect, MuxErrorEffect::NOT_APPLIED);
+                assert_eq!(response.retry, MuxErrorRetry::SAFE_AFTER_BACKOFF);
+            } else {
+                assert_ne!(response.code, MuxErrorCode::RESOURCE_BUSY);
+            }
+            assert_ne!(
+                context
+                    .response_for_error(&anyhow!("cold read worker capacity exhausted"))
+                    .code,
+                MuxErrorCode::RESOURCE_BUSY,
+                "only the typed capacity refusal authorizes a retry"
+            );
         }
     }
 
@@ -21806,7 +21898,7 @@ mod tests {
             let reads_before = pane.line_read_count.load(Ordering::Relaxed);
             handler.process_one(DecodedPdu {
                 serial,
-                pdu: Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
+                pdu: Pdu::GetPaneRenderStateV1(codec::GetPaneRenderStateV1 {
                     pane_id: pane.pane_id(),
                 }),
             });
@@ -21839,6 +21931,31 @@ mod tests {
         assert!(withheld_bulk.lock().unwrap().iter().any(|pdu| {
             matches!(&pdu.pdu, Pdu::GetPaneRenderChangesResponse(response) if response.seqno == 11)
         }), "old deltas remain undelivered while the fresh poll observes source 12");
+
+        // PDU24 keeps the reply every supported GUI understands: liveness on
+        // the request serial, the delta only on the unilateral stream. A
+        // 0.15.1 GUI disconnects on a correlated PDU25 here (B-M4).
+        pane.state.lock().unwrap().seqno = 13;
+        pane.set_changed_line(0);
+        handler.process_one(DecodedPdu {
+            serial: 4,
+            pdu: Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
+                pane_id: pane.pane_id(),
+            }),
+        });
+        drain_simple_executor(&executor);
+        let response = take_response(&controls);
+        assert_eq!(response.serial, 4);
+        assert_eq!(
+            response.pdu,
+            Pdu::LivenessResponse(LivenessResponse {
+                pane_id: pane.pane_id(),
+                is_alive: true,
+            })
+        );
+        assert!(withheld_bulk.lock().unwrap().iter().any(|pdu| {
+            matches!(&pdu.pdu, Pdu::GetPaneRenderChangesResponse(response) if response.seqno == 13)
+        }));
         drop(handler);
         drain_simple_executor(&executor);
     }
@@ -21882,7 +21999,7 @@ mod tests {
         let mut handler = SessionHandler::new_for_mux(sender, mux).unwrap();
         handler.process_one(DecodedPdu {
             serial: 41,
-            pdu: Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
+            pdu: Pdu::GetPaneRenderStateV1(codec::GetPaneRenderStateV1 {
                 pane_id: pane.pane_id(),
             }),
         });
@@ -21897,7 +22014,7 @@ mod tests {
         assert!(captured.lock().unwrap().is_empty());
         handler.process_one(DecodedPdu {
             serial: 42,
-            pdu: Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
+            pdu: Pdu::GetPaneRenderStateV1(codec::GetPaneRenderStateV1 {
                 pane_id: pane.pane_id(),
             }),
         });
@@ -22003,16 +22120,17 @@ mod tests {
             let mut handler = SessionHandler::new_for_mux(sender, mux).unwrap();
             handler.process_one(DecodedPdu {
                 serial: 43,
-                pdu: Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
+                pdu: Pdu::GetPaneRenderStateV1(codec::GetPaneRenderStateV1 {
                     pane_id: pane.pane_id(),
                 }),
             });
             drain_simple_executor(&executor);
             let response = take_response(&captured);
             assert_eq!(response.serial, 43);
+            // The refusal names the request it answers: PDU114.
             expect_error_response(
                 &response.pdu,
-                GetPaneRenderChanges::IDENT,
+                <codec::GetPaneRenderStateV1 as codec::PduWireIdent>::IDENT,
                 if exhausted {
                     MuxErrorCode::BACKEND_FAILURE
                 } else {
@@ -22024,7 +22142,7 @@ mod tests {
             if !exhausted {
                 handler.process_one(DecodedPdu {
                     serial: 44,
-                    pdu: Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
+                    pdu: Pdu::GetPaneRenderStateV1(codec::GetPaneRenderStateV1 {
                         pane_id: pane.pane_id(),
                     }),
                 });
@@ -22066,7 +22184,7 @@ mod tests {
         let mut handler = SessionHandler::new_for_mux(sender, mux).unwrap();
         handler.process_one(DecodedPdu {
             serial: 42,
-            pdu: Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
+            pdu: Pdu::GetPaneRenderStateV1(codec::GetPaneRenderStateV1 {
                 pane_id: pane.pane_id(),
             }),
         });

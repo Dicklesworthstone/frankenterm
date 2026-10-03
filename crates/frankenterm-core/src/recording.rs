@@ -180,7 +180,15 @@ const DEFAULT_FRAME_WRITER_FINALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 impl FrameWriter {
     /// Create a new frame writer.
     pub fn new(path: &Path, flush_threshold: usize) -> Result<Self> {
-        let file = File::create(path)?;
+        // Recordings hold pane output: never readable by other users, also
+        // when an existing file is reused.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options.open(path)?;
+        #[cfg(unix)]
+        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
         Ok(Self {
             buffer: Vec::with_capacity(flush_threshold.max(1)),
             flush_threshold: flush_threshold.max(1),
@@ -1569,6 +1577,25 @@ mod tests {
             u32::from_le_bytes(bytes[10..14].try_into().unwrap()),
             payload.len() as u32
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recording_files_are_owner_only_even_when_reused() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fresh = dir.path().join("fresh.war");
+        drop(FrameWriter::new(&fresh, 4).expect("writer"));
+        let reused = dir.path().join("reused.war");
+        std::fs::write(&reused, b"old").expect("existing world-readable file");
+        std::fs::set_permissions(&reused, std::fs::Permissions::from_mode(0o644))
+            .expect("make it world-readable");
+        drop(FrameWriter::new(&reused, 4).expect("writer over existing file"));
+        for path in [fresh, reused] {
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", path.display());
+        }
     }
 
     #[test]

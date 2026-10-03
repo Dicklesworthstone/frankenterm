@@ -10882,10 +10882,39 @@ fn send_actions_to_mux_with_scheduler_state(
         return;
     };
 
+    if let Err(error) = perform_pane_actions_in_admissible_batches(
+        &mut |batch| pane.perform_actions(batch),
+        actions,
+        dead,
+    ) {
+        metrics::counter!("mux.pane_actions.admission_cancelled").increment(1);
+        log::error!("pane reader stopped after action admission refusal: {error}");
+        generation
+            .live_parser_checkpoint
+            .poison("terminal action admission refused before mutation");
+        dead.store(true, Ordering::Release);
+        return;
+    }
+    histogram!("send_actions_to_mux.perform_actions.latency").record(start.elapsed());
+    output.finish();
+    histogram!("send_actions_to_mux.rate").record(1.);
+}
+
+/// Apply one parser batch, splitting it when admission refuses it as too
+/// large. Parser batch boundaries are arbitrary and a refused admission made
+/// no model mutation, so applying the two halves in order is equivalent.
+/// Without this, binary `cat` output (hundreds of BEL in one read) or heavily
+/// hyperlinked output killed the pane (release-wave B-M2). A single action that
+/// still cannot be admitted is dropped with a metric instead of killing it.
+fn perform_pane_actions_in_admissible_batches(
+    perform: &mut dyn FnMut(Vec<Action>) -> Result<(), crate::pane::PaneActionAdmissionError>,
+    actions: Vec<Action>,
+    dead: &AtomicBool,
+) -> Result<(), crate::pane::PaneActionAdmissionError> {
     let mut pending = actions;
     loop {
-        match pane.perform_actions(pending) {
-            Ok(()) => break,
+        match perform(pending) {
+            Ok(()) => return Ok(()),
             Err(error)
                 if error.reason == crate::pane::PaneActionAdmissionRefusal::Capacity
                     && !dead.load(Ordering::Acquire) =>
@@ -10895,20 +10924,26 @@ fn send_actions_to_mux_with_scheduler_state(
                 // terminal or topology guard. Admission made no model mutation.
                 std::thread::sleep(Duration::from_millis(1));
             }
-            Err(error) => {
-                metrics::counter!("mux.pane_actions.admission_cancelled").increment(1);
-                log::error!("pane reader stopped after action admission refusal: {error}");
-                generation
-                    .live_parser_checkpoint
-                    .poison("terminal action admission refused before mutation");
-                dead.store(true, Ordering::Release);
-                return;
+            Err(error)
+                if error.reason == crate::pane::PaneActionAdmissionRefusal::SizeOverflow
+                    && error.actions.len() > 1 =>
+            {
+                let mut first = error.actions;
+                let second = first.split_off(first.len() / 2);
+                metrics::counter!("mux.pane_actions.oversized_batch_split").increment(1);
+                perform_pane_actions_in_admissible_batches(perform, first, dead)?;
+                pending = second;
             }
+            Err(error) if error.reason == crate::pane::PaneActionAdmissionRefusal::SizeOverflow => {
+                metrics::counter!("mux.pane_actions.oversized_action_dropped").increment(1);
+                log::warn!(
+                    "dropping one terminal action that exceeds the admission bound: {error}"
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
         }
     }
-    histogram!("send_actions_to_mux.perform_actions.latency").record(start.elapsed());
-    output.finish();
-    histogram!("send_actions_to_mux.rate").record(1.);
 }
 
 fn drain_live_parser_checkpoint_wake(
@@ -23384,6 +23419,63 @@ mod tests {
         crate::MUX_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner())
+    }
+
+    #[test]
+    fn oversized_parser_batches_are_split_not_fatal() {
+        use termwiz::escape::ControlCode;
+
+        // Release-wave B-M2: a batch holding too many alert demands (binary
+        // `cat` output is full of BEL) used to kill the pane. Admission here
+        // refuses any batch with more than 4 bells, and refuses one poison
+        // action outright, like an oversized title.
+        let poison = Action::Print('!');
+        let mut input = Vec::new();
+        for index in 0..30_u32 {
+            input.push(Action::Control(ControlCode::Bell));
+            input.push(Action::Print(char::from_digit(index % 10, 10).unwrap()));
+        }
+        input.insert(17, poison.clone());
+        let mut applied = Vec::new();
+        let mut perform = |batch: Vec<Action>| {
+            let bells = batch
+                .iter()
+                .filter(|action| matches!(action, Action::Control(ControlCode::Bell)))
+                .count();
+            if bells > 4 || batch.contains(&poison) {
+                return Err(crate::pane::PaneActionAdmissionError {
+                    actions: batch,
+                    reason: crate::pane::PaneActionAdmissionRefusal::SizeOverflow,
+                });
+            }
+            applied.extend(batch);
+            Ok(())
+        };
+        let dead = AtomicBool::new(false);
+        perform_pane_actions_in_admissible_batches(&mut perform, input.clone(), &dead)
+            .expect("an oversized batch is split, never fatal");
+        let expected: Vec<Action> = input
+            .into_iter()
+            .filter(|action| *action != poison)
+            .collect();
+        assert_eq!(
+            applied, expected,
+            "every admissible action applied, in order"
+        );
+
+        // Any other refusal still reaches the caller.
+        let mut retired = |batch: Vec<Action>| {
+            Err(crate::pane::PaneActionAdmissionError {
+                actions: batch,
+                reason: crate::pane::PaneActionAdmissionRefusal::Retired,
+            })
+        };
+        assert!(perform_pane_actions_in_admissible_batches(
+            &mut retired,
+            vec![Action::Print('x')],
+            &dead
+        )
+        .is_err());
     }
 
     #[test]

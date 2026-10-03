@@ -3252,10 +3252,30 @@ struct ActiveCaptureBinding {
     native_lease: Option<CaptureLease>,
     #[cfg(all(feature = "vendored", unix))]
     streaming_lease: Option<CaptureLease>,
-    /// A failed stream must not evict its polling fallback at the next sync.
-    /// Retry streaming only after this exact capture binding is replaced.
+    /// A failed stream must not evict its polling fallback at the next sync,
+    /// but a transient failure (a mux restart, say) must not pin a long-lived
+    /// pane to the costlier polling path forever either: streaming is retried
+    /// after a capped exponential backoff. A replaced binding starts clean.
     #[cfg(all(feature = "vendored", unix))]
-    streaming_failed: bool,
+    streaming_failure: Option<StreamingFailure>,
+}
+
+/// The latest stream failure of one capture binding and how many it has had.
+#[cfg(all(feature = "vendored", unix))]
+#[derive(Clone, Copy, Debug)]
+struct StreamingFailure {
+    at: Instant,
+    count: u32,
+}
+
+/// Backoff before streaming is retried after `failures` failed streams on one
+/// binding: 5 s, doubling, capped at 5 minutes.
+#[cfg(all(feature = "vendored", unix))]
+fn streaming_retry_delay(failures: u32) -> Duration {
+    const BASE: Duration = Duration::from_secs(5);
+    const MAX: Duration = Duration::from_secs(300);
+    BASE.saturating_mul(1 << failures.saturating_sub(1).min(6))
+        .min(MAX)
 }
 
 struct PendingCaptureResyncBinding {
@@ -3301,7 +3321,12 @@ impl ActiveCaptureBinding {
             .as_ref()
             .is_some_and(|lease| lease.stamp() == stamp)
         {
-            self.streaming_failed = true;
+            self.streaming_failure = Some(StreamingFailure {
+                at: Instant::now(),
+                count: self
+                    .streaming_failure
+                    .map_or(1, |failure| failure.count.saturating_add(1)),
+            });
             true
         } else {
             false
@@ -3315,7 +3340,15 @@ impl ActiveCaptureBinding {
 
     #[cfg(all(feature = "vendored", unix))]
     fn may_start_streaming(&self) -> bool {
-        !self.streaming_failed && self.streaming_source_drained()
+        self.may_start_streaming_at(Instant::now())
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    fn may_start_streaming_at(&self, now: Instant) -> bool {
+        self.streaming_source_drained()
+            && self.streaming_failure.is_none_or(|failure| {
+                now.saturating_duration_since(failure.at) >= streaming_retry_delay(failure.count)
+            })
     }
 
     fn matches_observed(&self, pane: &ObservedCapturePane) -> bool {
@@ -3610,7 +3643,7 @@ async fn activate_capture_binding(
         #[cfg(all(feature = "vendored", unix))]
         streaming_lease: None,
         #[cfg(all(feature = "vendored", unix))]
-        streaming_failed: false,
+        streaming_failure: None,
     })
 }
 
@@ -8883,9 +8916,9 @@ impl ObservationRuntime {
                                     }
                                 }
 
-                                // A failed source remains polling-only for this
-                                // binding. Reach this check only after its retained
-                                // stream lease has successfully drained above.
+                                // A failed source stays polling-only until its
+                                // retry backoff elapses. Reach this check only
+                                // after its retained stream lease has drained above.
                                 if capture_bindings
                                     .get(&pane_id)
                                     .is_none_or(|binding| !binding.may_start_streaming())
@@ -15872,7 +15905,7 @@ mod tests {
                 #[cfg(all(feature = "vendored", unix))]
                 streaming_lease: None,
                 #[cfg(all(feature = "vendored", unix))]
-                streaming_failed: false,
+                streaming_failure: None,
             };
             let second_binding = ActiveCaptureBinding {
                 lifecycle_revision: PaneLifecycleRevision::new(0),
@@ -15886,7 +15919,7 @@ mod tests {
                 #[cfg(all(feature = "vendored", unix))]
                 streaming_lease: None,
                 #[cfg(all(feature = "vendored", unix))]
-                streaming_failed: false,
+                streaming_failure: None,
             };
             let metadata = Arc::new(RwLock::new(HashMap::from([
                 (
@@ -18973,6 +19006,11 @@ mod tests {
                     )
                     .unwrap();
             }
+            // ... but the failure is not permanent: streaming re-arms once
+            // its backoff has elapsed.
+            let failed_at = binding.streaming_failure.expect("latched failure").at;
+            assert!(!binding.may_start_streaming_at(failed_at + Duration::from_millis(4_999)));
+            assert!(binding.may_start_streaming_at(failed_at + Duration::from_secs(5)));
             let mut tasks = TailerPollTaskSet::new();
             supervisor.spawn_ready(&mut tasks);
             let (pane_id, outcome) =
@@ -19019,8 +19057,18 @@ mod tests {
                 .unwrap();
             successor.streaming_lease = Some(successor_stream);
             assert!(!successor.latch_stream_failure(stream.stamp()));
-            assert!(!successor.streaming_failed);
+            assert!(successor.streaming_failure.is_none());
         });
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn streaming_retry_backoff_doubles_from_five_seconds_to_a_five_minute_cap() {
+        let delays: Vec<u64> = [1, 2, 3, 4, 5, 6, 7, 8, u32::MAX]
+            .into_iter()
+            .map(|failures| streaming_retry_delay(failures).as_secs())
+            .collect();
+        assert_eq!(delays, vec![5, 10, 20, 40, 80, 160, 300, 300, 300]);
     }
 
     #[cfg(all(feature = "vendored", unix))]

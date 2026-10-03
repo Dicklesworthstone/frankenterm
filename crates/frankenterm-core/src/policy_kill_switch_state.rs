@@ -258,6 +258,37 @@ pub fn acquire_kill_switch_fence(db_path: &Path) -> Result<KillSwitchFence, Kill
     })
 }
 
+/// How long an async admission waits out a concurrent fence holder. Another
+/// send in the same workspace holds the fence only across its own admission
+/// and dispatch, so concurrent `ft send` calls from a swarm queue briefly
+/// instead of being denied on first contention.
+pub const KILL_SWITCH_FENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// [`acquire_kill_switch_fence`] that waits up to `budget` for a concurrent
+/// holder, sleeping on the runtime (never blocking a worker). Contention that
+/// outlasts the budget, or cancellation of `cx`, is still `FencePending`:
+/// waiting never turns contention into permission to dispatch.
+pub async fn acquire_kill_switch_fence_within_with_cx(
+    cx: &crate::cx::Cx,
+    db_path: &Path,
+    budget: std::time::Duration,
+) -> Result<KillSwitchFence, KillSwitchStateError> {
+    let started = std::time::Instant::now();
+    let mut delay = std::time::Duration::from_millis(2);
+    loop {
+        match acquire_kill_switch_fence(db_path) {
+            Err(KillSwitchStateError::FencePending) if started.elapsed() < budget => {
+                let remaining = budget.saturating_sub(started.elapsed());
+                crate::runtime_async::sleep_with_cx(cx, delay.min(remaining))
+                    .await
+                    .map_err(|_| KillSwitchStateError::FencePending)?;
+                delay = (delay * 2).min(std::time::Duration::from_millis(50));
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Share workspace effect authority with storage-writer mutations. Acquire in
 /// the executing writer, not in a cancellable caller that only enqueues work.
 /// Contention is nonblocking; callers must refuse before mutation and retain
@@ -916,6 +947,54 @@ pub(crate) mod tests {
             acquire_kill_switch_fence(&path),
             Err(KillSwitchStateError::FenceFailed)
         ));
+    }
+
+    /// Concurrent sends in one workspace used to deny whichever lost the
+    /// non-blocking fence race. An async admission now waits out a short hold,
+    /// and contention that outlasts its budget is still pending, never granted.
+    #[test]
+    fn kill_switch_fence_wait_outlasts_a_brief_holder_but_not_its_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("policy.db");
+        let _backend =
+            crate::storage_backend_trait::RusqliteBackend::open_path(&path, &Default::default())
+                .unwrap();
+        use crate::runtime_async::CompatRuntime as _;
+
+        crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("fence wait test runtime")
+            .block_on(async {
+                let cx = crate::cx::for_testing();
+
+                let held = acquire_kill_switch_fence(&path).unwrap();
+                let release = std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    drop(held);
+                });
+                let waited = acquire_kill_switch_fence_within_with_cx(
+                    &cx,
+                    &path,
+                    std::time::Duration::from_secs(10),
+                )
+                .await;
+                release.join().unwrap();
+                assert!(waited.is_ok(), "a brief holder is waited out");
+                drop(waited);
+
+                let _held = acquire_kill_switch_fence(&path).unwrap();
+                let started = std::time::Instant::now();
+                assert!(matches!(
+                    acquire_kill_switch_fence_within_with_cx(
+                        &cx,
+                        &path,
+                        std::time::Duration::from_millis(60),
+                    )
+                    .await,
+                    Err(KillSwitchStateError::FencePending)
+                ));
+                assert!(started.elapsed() >= std::time::Duration::from_millis(60));
+            });
     }
 
     #[test]

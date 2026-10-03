@@ -490,7 +490,7 @@ pub(super) fn mcp_load_mission_from_path(
         Err(err) => return Err(err),
     };
 
-    let mission: crate::plan::Mission = serde_json::from_str(&raw).map_err(|err| {
+    let mission = crate::plan::Mission::from_json_slice(raw.as_bytes()).map_err(|err| {
         McpToolError::new(
             "robot.mission_invalid_json",
             format!("Invalid mission JSON in {}: {err}", path.display()),

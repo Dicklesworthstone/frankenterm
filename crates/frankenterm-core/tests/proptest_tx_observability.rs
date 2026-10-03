@@ -862,6 +862,7 @@ proptest! {
         let cvs = ChainVerificationSummary {
             chain_intact: intact, first_break_at: if intact { None } else { Some(5) },
             missing_ordinals: vec![], total_records: total,
+            event_evidence_mismatches: vec![],
         };
         let json = serde_json::to_string(&cvs).unwrap();
         let back: ChainVerificationSummary = serde_json::from_str(&json).unwrap();

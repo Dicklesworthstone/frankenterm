@@ -2276,6 +2276,35 @@ impl Mission {
         parts.join("|")
     }
 
+    /// Decode a persisted mission. A schema-1 mission (written by 0.15.1 and
+    /// earlier) predates the storage incarnation, so it is upgraded in memory
+    /// with revision 0 and a generation derived from its exact bytes: every
+    /// process loading the same file agrees on the incarnation until the first
+    /// accepted mutation persists it as schema 2. A schema-2 mission missing
+    /// its identity stays invalid.
+    pub fn from_json_slice(bytes: &[u8]) -> Result<Self, serde_json::Error> {
+        let error = match serde_json::from_slice::<Self>(bytes) {
+            Ok(mission) => return Ok(mission),
+            Err(error) => error,
+        };
+        let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
+        let Some(object) = value.as_object_mut().filter(|object| {
+            object
+                .get("mission_version")
+                .and_then(serde_json::Value::as_u64)
+                == Some(1)
+                && !object.contains_key("generation")
+                && !object.contains_key("revision")
+        }) else {
+            return Err(error);
+        };
+        let digest = Sha256::digest(bytes);
+        object.insert("generation".into(), hex::encode(&digest[..16]).into());
+        object.insert("revision".into(), 0_u64.into());
+        object.insert("mission_version".into(), MISSION_SCHEMA_VERSION.into());
+        serde_json::from_value(value)
+    }
+
     /// Validate schema and ownership invariants.
     pub fn validate(&self) -> Result<(), MissionValidationError> {
         if self.mission_version > MISSION_SCHEMA_VERSION {
@@ -8878,7 +8907,43 @@ mod tests {
         assert_eq!(loaded.generation, mission.generation);
         assert_eq!(loaded.compute_hash(), mission.compute_hash());
         json.as_object_mut().unwrap().remove("generation");
-        assert!(serde_json::from_value::<Mission>(json).is_err());
+        assert!(serde_json::from_value::<Mission>(json.clone()).is_err());
+        let bytes = serde_json::to_vec(&json).unwrap();
+        assert!(
+            Mission::from_json_slice(&bytes).is_err(),
+            "a schema-2 mission without its identity stays invalid"
+        );
+    }
+
+    /// A mission file written by 0.15.1 (schema 1) has no storage incarnation.
+    /// It loads as schema 2 with revision 0 and a generation fixed by its exact
+    /// bytes, so independent loads of the same file agree.
+    #[test]
+    fn schema_one_mission_files_upgrade_with_a_byte_derived_incarnation() {
+        let mut json = serde_json::to_value(planning_mission()).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("generation");
+        object.remove("revision");
+        object.insert("mission_version".into(), 1.into());
+        let bytes = serde_json::to_vec_pretty(&json).unwrap();
+
+        let first = Mission::from_json_slice(&bytes).expect("schema-1 mission loads");
+        let second = Mission::from_json_slice(&bytes).unwrap();
+        assert_eq!(first.mission_version, MISSION_SCHEMA_VERSION);
+        assert_eq!(first.revision, 0);
+        assert_eq!(first.generation, second.generation);
+        first.validate().expect("upgraded mission is valid");
+
+        let mut edited = bytes.clone();
+        edited.push(b'\n');
+        assert_ne!(
+            Mission::from_json_slice(&edited).unwrap().generation,
+            first.generation
+        );
+        // Re-encoding persists it as an ordinary schema-2 mission.
+        let persisted = serde_json::to_vec(&first).unwrap();
+        let reloaded: Mission = serde_json::from_slice(&persisted).unwrap();
+        assert_eq!(reloaded.generation, first.generation);
     }
 
     #[test]

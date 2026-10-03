@@ -3699,7 +3699,7 @@ impl WeztermClient {
             Some("SpawnV2") => MuxOperation::Spawn,
             Some("SplitPane") => MuxOperation::SplitPane,
             Some("MovePaneToNewTab") => MuxOperation::MovePaneToNewTab,
-            Some("GetPaneRenderChanges" | "GetPaneRenderDeliveryV1") => {
+            Some("GetPaneRenderChanges" | "GetPaneRenderStateV1" | "GetPaneRenderDeliveryV1") => {
                 MuxOperation::ReadRenderChanges
             }
             Some("RenderApplicationResultV1" | "RenderApplicationResult") => {

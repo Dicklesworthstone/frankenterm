@@ -1406,7 +1406,7 @@ fn b23f_explicit_cx_public_render_batch_cancellation_contract() {
                                 .send(())
                                 .expect("signal that handshake completed");
                         }
-                        Pdu::GetPaneRenderChanges(_) => {
+                        Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                             post_handshake_batch_requests += 1;
                         }
                         other => panic!("unexpected handshake/request PDU: {}", other.pdu_name()),
@@ -1768,7 +1768,7 @@ fn b23i_explicit_cx_public_single_render_cancellation_contract() {
                                 .send(())
                                 .expect("signal that handshake completed");
                         }
-                        Pdu::GetPaneRenderChanges(_) => {
+                        Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                             post_handshake_requests += 1;
                         }
                         other => panic!("unexpected handshake/request PDU: {}", other.pdu_name()),
@@ -2130,7 +2130,7 @@ fn b23l_explicit_cx_public_subscription_cancel_shutdown_contract() {
                             })
                         }
                         Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                        Pdu::GetPaneRenderChanges(_) => {
+                        Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                             server_request_count.fetch_add(1, Ordering::SeqCst);
                             Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
                                 pane_id: 91,
@@ -2302,7 +2302,7 @@ fn b23p_explicit_cx_public_subscription_startup_cancellation_contract() {
                             })
                         }
                         Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                        Pdu::GetPaneRenderChanges(_) => {
+                        Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                             server_request_count.fetch_add(1, Ordering::SeqCst);
                             Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
                                 pane_id: 92,
@@ -2465,7 +2465,7 @@ fn b23m_explicit_cx_public_single_render_read_timeout_contract() {
                             )
                             .await;
                         }
-                        Pdu::GetPaneRenderChanges(_) => {
+                        Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                             runtime_async::sleep(BEHAVIORAL_PEER_STALL).await;
                             return;
                         }
@@ -2920,7 +2920,7 @@ fn b23r_explicit_cx_public_mux_pool_render_batch_cancellation_contract() {
                             )
                             .await;
                         }
-                        Pdu::GetPaneRenderChanges(_) => {
+                        Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                             render_batch_requests += 1;
                         }
                         other => panic!("unexpected handshake/request PDU: {}", other.pdu_name()),
@@ -3189,7 +3189,7 @@ fn b23t_explicit_cx_public_mux_pool_single_render_read_timeout_contract() {
                             )
                             .await;
                         }
-                        Pdu::GetPaneRenderChanges(_) => {
+                        Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                             render_requests += 1;
                             runtime_async::sleep(BEHAVIORAL_PEER_STALL).await;
                             return render_requests;
