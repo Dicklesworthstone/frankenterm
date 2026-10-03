@@ -1489,6 +1489,11 @@ pub struct WeztermClient {
     /// failure hermetic.
     #[cfg(all(feature = "vendored", unix))]
     mux_pool: Option<Arc<crate::vendored::MuxPool>>,
+    /// Latched once the implicit socket's peer proves to be a stock WezTerm:
+    /// its codec never becomes compatible, so later operations go straight
+    /// to the CLI instead of re-dialing a doomed handshake every cooldown.
+    #[cfg(all(feature = "vendored", unix))]
+    stock_wezterm_peer: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for WeztermClient {
@@ -1521,6 +1526,8 @@ impl WeztermClient {
             ),
             #[cfg(all(feature = "vendored", unix))]
             mux_pool: None,
+            #[cfg(all(feature = "vendored", unix))]
+            stock_wezterm_peer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1546,6 +1553,8 @@ impl WeztermClient {
             ),
             #[cfg(all(feature = "vendored", unix))]
             mux_pool: None,
+            #[cfg(all(feature = "vendored", unix))]
+            stock_wezterm_peer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -3834,7 +3843,24 @@ impl WeztermClient {
 
     #[cfg(all(feature = "vendored", unix))]
     fn mux_error_should_fallback_to_cli(err: &crate::vendored::MuxPoolError) -> bool {
-        Self::mux_error_requires_transport_failover(err)
+        Self::mux_error_requires_transport_failover(err) || Self::mux_peer_is_stock_wezterm(err)
+    }
+
+    /// The discovered socket belongs to a stock WezTerm (inherited
+    /// `WEZTERM_UNIX_SOCKET`, or its default socket), whose codec this build
+    /// cannot speak. Its own `wezterm cli` is the compatible client, and the
+    /// handshake failed before any request was sent, so every operation may
+    /// take the CLI path. Without this, `ft watch` observing a WezTerm pane
+    /// failed every listing with a version-skew error. A FrankenTerm peer from
+    /// another release stays a typed `VersionSkew` (ft-xxfwy.7).
+    #[cfg(all(feature = "vendored", unix))]
+    fn mux_peer_is_stock_wezterm(err: &crate::vendored::MuxPoolError) -> bool {
+        matches!(
+            err,
+            crate::vendored::MuxPoolError::Mux(
+                crate::vendored::DirectMuxError::IncompatibleCodec { remote_version, .. }
+            ) if is_stock_wezterm_version(remote_version)
+        )
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -3844,6 +3870,10 @@ impl WeztermClient {
     ) -> bool {
         if self.socket_path.is_some() {
             return false;
+        }
+        if Self::mux_peer_is_stock_wezterm(err) {
+            self.stock_wezterm_peer
+                .store(true, std::sync::atomic::Ordering::Release);
         }
         Self::mux_error_should_fallback_to_cli(err)
     }
@@ -3955,6 +3985,13 @@ impl WeztermClient {
 
     #[cfg(all(feature = "vendored", unix))]
     fn mux_circuit_guard(&self) -> bool {
+        if self.socket_path.is_none()
+            && self
+                .stock_wezterm_peer
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return false;
+        }
         let mut guard = match self.mux_circuit_breaker.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -7722,6 +7759,67 @@ mod tests {
         assert_mux_recovery_axes(&abandoned, MuxCircuitEvidence::BackendFailure, false);
     }
 
+    /// A stock WezTerm socket (its codec is older than any FrankenTerm this
+    /// build supports) is served through `wezterm cli`; a FrankenTerm peer of
+    /// another release keeps the typed skew error and no fallback.
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn stock_wezterm_codec_mismatch_falls_back_to_the_cli() {
+        use crate::vendored::{DirectMuxError, MuxPoolError};
+
+        assert!(is_stock_wezterm_version("20240203-110809-5046fc22"));
+        assert!(is_stock_wezterm_version("20260331-040028-577474d8"));
+        assert!(!is_stock_wezterm_version("FrankenTerm 0.15.21 (c3e3c77d0)"));
+        assert!(!is_stock_wezterm_version(
+            "frankenterm-mux-server 0.15.1 (ced654de8)"
+        ));
+        assert!(!is_stock_wezterm_version("2024020-110809-5046fc22"));
+        assert!(!is_stock_wezterm_version("20240203-110809-"));
+
+        let skew = |remote_version: &str| {
+            MuxPoolError::Mux(DirectMuxError::IncompatibleCodec {
+                local: 69,
+                local_min: 61,
+                remote: 45,
+                remote_min: 45,
+                remote_version: remote_version.to_string(),
+            })
+        };
+        assert!(WeztermClient::mux_error_should_fallback_to_cli(&skew(
+            "20260331-040028-577474d8"
+        )));
+        assert!(!WeztermClient::mux_error_should_fallback_to_cli(&skew(
+            "frankenterm-mux-server 0.13.0 (3ebd60566)"
+        )));
+        // An explicitly configured socket still never falls back.
+        let explicit = WeztermClient::with_socket("/tmp/configured.sock".to_string());
+        assert!(
+            !explicit
+                .mux_error_should_fallback_to_cli_for_client(&skew("20260331-040028-577474d8"))
+        );
+        let implicit = WeztermClient::new();
+        assert!(
+            implicit.mux_error_should_fallback_to_cli_for_client(&skew("20260331-040028-577474d8"))
+        );
+        // Once the peer is known to be stock WezTerm, later operations go
+        // straight to the CLI instead of re-dialing the handshake every
+        // cooldown, and clones (which share the client state) agree.
+        assert!(!implicit.mux_circuit_guard());
+        assert!(!implicit.clone().mux_circuit_guard());
+        // A FrankenTerm skew never latches the CLI route.
+        let frankenterm = WeztermClient::new();
+        assert!(
+            !frankenterm.mux_error_should_fallback_to_cli_for_client(&skew(
+                "FrankenTerm 0.13.0 (3ebd60566)"
+            ))
+        );
+        assert!(
+            !frankenterm
+                .stock_wezterm_peer
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+    }
+
     /// ft-xxfwy.7: a codec-window mismatch (CLI and app from different
     /// releases) must surface as the typed `VersionSkew` error carrying both
     /// generations, not as a generic transport failure, and must never be
@@ -10224,6 +10322,22 @@ fn compatibility_inputs_for_backend_selection(
     // connect-time codec handshake enforces real compatibility.
     let json = serde_json::to_value(report).ok();
     (report.allow_vendored, report.message.clone(), json)
+}
+
+/// A stock WezTerm release identifies itself as `YYYYMMDD-HHMMSS-<commit>`
+/// (e.g. `20240203-110809-5046fc22`); FrankenTerm peers report
+/// `FrankenTerm <version> (...)` or `frankenterm-mux-server <version> (...)`.
+#[must_use]
+pub fn is_stock_wezterm_version(version: &str) -> bool {
+    let mut parts = version.trim().splitn(3, '-');
+    let digits = |part: Option<&str>, len: usize| {
+        part.is_some_and(|part| part.len() == len && part.bytes().all(|b| b.is_ascii_digit()))
+    };
+    digits(parts.next(), 8)
+        && digits(parts.next(), 6)
+        && parts.next().is_some_and(|commit| {
+            (7..=40).contains(&commit.len()) && commit.bytes().all(|b| b.is_ascii_hexdigit())
+        })
 }
 
 /// Build a `UnifiedClient` by probing the runtime environment.

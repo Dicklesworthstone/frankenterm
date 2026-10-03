@@ -275,22 +275,25 @@ impl FrameWriter {
     /// the file handle is unrecoverable, so we mark `finalized` to prevent
     /// further usage and surface the broken-pipe error.
     pub fn finalize_with_timeout(&mut self, timeout: Duration) -> Result<()> {
-        self.finalize_with_timeout_after_worker_delay(timeout, None)
+        self.finalize_with_timeout_after_worker_gate(timeout, None)
     }
 
+    /// The worker waits until `release` fires (or its sender drops) before
+    /// flushing, so a test controls the timeout race instead of racing a
+    /// sleep against the scheduler.
     #[cfg(test)]
     fn finalize_with_timeout_for_test(
         &mut self,
         timeout: Duration,
-        worker_delay: Duration,
+        release: std::sync::mpsc::Receiver<()>,
     ) -> Result<()> {
-        self.finalize_with_timeout_after_worker_delay(timeout, Some(worker_delay))
+        self.finalize_with_timeout_after_worker_gate(timeout, Some(release))
     }
 
-    fn finalize_with_timeout_after_worker_delay(
+    fn finalize_with_timeout_after_worker_gate(
         &mut self,
         timeout: Duration,
-        worker_delay: Option<Duration>,
+        worker_gate: Option<std::sync::mpsc::Receiver<()>>,
     ) -> Result<()> {
         if self.finalized {
             return Ok(());
@@ -323,8 +326,8 @@ impl FrameWriter {
         let spawn_result = std::thread::Builder::new()
             .name("ft-recording-finalize".to_string())
             .spawn(move || {
-                if let Some(delay) = worker_delay {
-                    std::thread::sleep(delay);
+                if let Some(gate) = worker_gate {
+                    let _ = gate.recv();
                 }
                 let parts = worker_parts
                     .lock()
@@ -1995,9 +1998,10 @@ mod tests {
                 writer.write_frame(frame).unwrap();
             }
 
+            let (release, gate) = std::sync::mpsc::channel();
             let first = writer
-                .finalize_with_timeout_for_test(Duration::from_millis(1), Duration::from_millis(25))
-                .expect_err("delayed finalize worker should time out first");
+                .finalize_with_timeout_for_test(Duration::from_millis(1), gate)
+                .expect_err("a gated finalize worker times out first");
             prop_assert!(matches!(first, crate::Error::Io(ref err) if err.kind() == ErrorKind::TimedOut));
             prop_assert!(writer.has_pending_finalize());
             prop_assert!(!writer.is_finalized());
@@ -2013,7 +2017,8 @@ mod tests {
                 true
             );
 
-            writer.finalize_with_timeout(Duration::from_secs(2)).unwrap();
+            release.send(()).unwrap();
+            writer.finalize_with_timeout(Duration::from_secs(10)).unwrap();
             prop_assert!(!writer.has_pending_finalize());
             prop_assert!(writer.is_finalized());
 
@@ -2454,6 +2459,7 @@ mod tests {
                 .await
                 .expect("record segment");
 
+            let (release, gate) = std::sync::mpsc::channel();
             {
                 let mut guard = manager
                     .recorders
@@ -2463,11 +2469,8 @@ mod tests {
                 let recorder = guard.get_mut(&11).expect("active recorder");
                 let first_timeout = recorder
                     .writer
-                    .finalize_with_timeout_for_test(
-                        Duration::from_millis(1),
-                        Duration::from_secs(1),
-                    )
-                    .expect_err("delayed finalize worker should time out");
+                    .finalize_with_timeout_for_test(Duration::from_millis(1), gate)
+                    .expect_err("a gated finalize worker times out");
                 assert!(
                     matches!(first_timeout, crate::Error::Io(ref err) if err.kind() == ErrorKind::TimedOut)
                 );
@@ -2498,8 +2501,9 @@ mod tests {
                 assert!(!recorder.writer.is_finalized());
             }
 
+            release.send(()).unwrap();
             let stats = manager
-                .stop_recording_with_cx_and_timeout(&cx, 11, Duration::from_secs(2))
+                .stop_recording_with_cx_and_timeout(&cx, 11, Duration::from_secs(10))
                 .await
                 .expect("retry should await pending finalize")
                 .expect("recorder should still be present");

@@ -17218,8 +17218,11 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("server should be ready before client connects");
 
+            // The server's EOF ends the read as soon as it closes; the timeout
+            // only bounds a hung test. A 200 ms bound raced the server thread
+            // under parallel load and reported ReadTimeout (ft-qbrn1).
             let config =
-                direct_mux_client_config_with_timeout(socket_path, Duration::from_millis(200));
+                direct_mux_client_config_with_timeout(socket_path, Duration::from_secs(10));
             let mut client = DirectMuxClient::connect_with_cx(&cx, config)
                 .await
                 .expect("connect with cx");
@@ -17228,7 +17231,7 @@ mod tests {
                 .list_panes_with_cx(&cx)
                 .await
                 .expect_err("list_panes_with_cx should fail when server closes without responding");
-            assert!(matches!(err, DirectMuxError::Disconnected));
+            assert!(matches!(err, DirectMuxError::Disconnected), "{err:?}");
             assert!(client.connection_poisoned);
             assert_eq!(client.poison_transition_count, 1);
 

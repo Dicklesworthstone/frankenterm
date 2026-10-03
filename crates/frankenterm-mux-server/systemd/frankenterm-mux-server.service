@@ -5,10 +5,13 @@ After=network.target
 
 [Service]
 Type=simple
-# Explicit --config-file so the daemon binds to its FrankenTerm-namespaced
-# config and never accidentally picks up a sibling ~/.wezterm.lua or
-# ~/.config/wezterm/wezterm.lua. Path lives under XDG_CONFIG_HOME.
-ExecStart=%h/.local/bin/frankenterm-mux-server --daemonize=false --config-file=%h/.config/frankenterm/frankenterm.lua
+# No --config-file: the server loads ~/.config/frankenterm/frankenterm.toml
+# when present and otherwise runs on defaults. Lua (including any sibling
+# ~/.wezterm.lua) is never read unless FRANKENTERM_LUA_CONFIG=1, and an
+# explicit .lua --config-file without that opt-in makes the server refuse to
+# start, which under Restart=on-failure was a crash loop. This matches the
+# unit `ft setup` generates.
+ExecStart=%h/.local/bin/frankenterm-mux-server --daemonize=false
 Restart=on-failure
 RestartSec=5
 # Log only warnings + errors; full output goes to journalctl --user.

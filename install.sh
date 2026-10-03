@@ -128,7 +128,9 @@ MINISIGN_SIGNATURE_URL="${MINISIGN_SIGNATURE_URL:-}"
 APP_MINISIGN_SIGNATURE_URL="${APP_MINISIGN_SIGNATURE_URL:-}"
 MINISIGN_PUBLIC_KEY="RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
-LOCK_FILE="/tmp/ft-install.lock"
+# Per-user: the lock inode must be owned by the installing user, so one
+# shared /tmp path let the first user to install block every other user.
+LOCK_FILE="/tmp/ft-install-${EUID}.lock"
 
 # Download and extraction resource contracts. These are deliberately finite
 # and are enforced both before transfer and again through descriptor-pinned
@@ -141,6 +143,15 @@ MAX_APP_EXPANDED_BYTES=17179869184
 MAX_FONT_ARCHIVE_BYTES=268435456
 MAX_FONT_EXPANDED_BYTES=1073741824
 INSTALLER_FREE_SPACE_HEADROOM_BYTES=67108864
+# Free space demanded before a transfer starts. The MAX_* caps above bound
+# what a transfer may consume and stay enforced during download and
+# extraction; requiring them up front as free space (5 GiB for a ~200 MB ft
+# archive, 20 GiB for the app) refused installs on small hosts. Exact
+# authenticated sizes are still checked again before publication.
+PREFLIGHT_PROCESS_ARCHIVE_BYTES=268435456
+PREFLIGHT_PROCESS_EXPANDED_BYTES=1073741824
+PREFLIGHT_APP_ARCHIVE_BYTES=1073741824
+PREFLIGHT_APP_EXPANDED_BYTES=4294967296
 
 # Cleanup state. The permanent lock inode is never unlinked; a Python holder
 # owns its kernel advisory lock until the shell closes the control FIFO.
@@ -423,6 +434,9 @@ PY
 
 download_https_bounded() {
   local url="$1" output="$2" max_bytes="$3" max_time="$4" retry="${5:-0}"
+  # Free space to demand up front; curl's --max-filesize still caps the
+  # transfer at max_bytes.
+  local preflight_bytes="${6:-$3}"
   local output_parent required_bytes
   case "$url" in
     https://*) ;;
@@ -431,7 +445,8 @@ download_https_bounded() {
       return 1
       ;;
   esac
-  [[ "$max_bytes" =~ ^[0-9]+$ ]] && [[ "$max_time" =~ ^[0-9]+$ ]] || return 1
+  [[ "$max_bytes" =~ ^[0-9]+$ ]] && [[ "$max_time" =~ ^[0-9]+$ ]] &&
+    [[ "$preflight_bytes" =~ ^[0-9]+$ ]] || return 1
   [ ! -e "$output" ] && [ ! -L "$output" ] || {
     err "Refusing to overwrite a retained download path: $output"
     return 1
@@ -441,7 +456,7 @@ download_https_bounded() {
     return 1
   fi
   output_parent=$(dirname "$output") || return 1
-  required_bytes=$((max_bytes + INSTALLER_FREE_SPACE_HEADROOM_BYTES))
+  required_bytes=$(($(smaller_budget "$max_bytes" "$preflight_bytes") + INSTALLER_FREE_SPACE_HEADROOM_BYTES))
   require_filesystem_capacity "$output_parent" "$required_bytes" "temporary download" || return 1
 
   local curl_args=(-fsSL --proto '=https' --proto-redir '=https'
@@ -491,6 +506,10 @@ PY
     return 1
   fi
   verify_bounded_download_file "$output" "$max_bytes"
+}
+
+smaller_budget() {
+  if [ "$1" -le "$2" ]; then printf '%s\n' "$1"; else printf '%s\n' "$2"; fi
 }
 
 require_transfer_capacity() {
@@ -1664,10 +1683,11 @@ installer_mux_ownership_state() {
     esac
     return
   fi
-  python3 - "${SYSTEM_INSTALL:-0}" <<'PY'
+  python3 - "${SYSTEM_INSTALL:-0}" "${DEST:-}" <<'PY'
 import os, pathlib, subprocess, sys
 
 all_users = sys.argv[1] == "1"
+destination = os.path.realpath(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else ""
 force_ps_census = (
     os.environ.get("FT_INSTALL_TEST_LIBRARY_ONLY") == "1" and
     os.environ.get("FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES") == "1" and
@@ -1684,10 +1704,26 @@ names = {
 }
 truncated = {name[:15] for name in names}
 
+def frankenterm_owned(command):
+    # None when the location is unknown (a bare name).
+    if "/" not in command:
+        return None
+    real = os.path.realpath(command)
+    if "frankenterm" in real.lower():
+        return True
+    return bool(destination) and (
+        real == destination or real.startswith(destination.rstrip(os.sep) + os.sep))
+
 def classify(command):
     if command.endswith(" (deleted)"):
         command = command[:-len(" (deleted)")]
     basename = os.path.basename(command)
+    # Stock WezTerm installs side by side with FrankenTerm and owns none of
+    # its session state: a wezterm-named process counts only when it runs
+    # from FrankenTerm's own locations (a pre-rebrand build under DEST, or a
+    # FrankenTerm bundle). Otherwise an open WezTerm window blocked activation.
+    if basename.startswith("wezterm-") and frankenterm_owned(command) is False:
+        return "inactive"
     if basename in names:
         return "active"
     if basename in truncated:
@@ -3560,8 +3596,31 @@ check_network() {
   fi
 }
 
+check_python_runtime() {
+  # The lock holder, staging, and every crash-atomic transition run in
+  # python3. Fail here with a fix instead of midway through an install.
+  local python
+  python=$(command -v python3 2>/dev/null) || {
+    err "python3 (3.7 or newer) is required; install it (e.g. 'brew install python' or your package manager) and rerun"
+    exit 1
+  }
+  # On macOS without the Command Line Tools, /usr/bin/python3 is a stub that
+  # opens an install dialog instead of running; never invoke it unattended.
+  if [ "$(uname -s)" = Darwin ] && [ "$python" = /usr/bin/python3 ] &&
+      ! xcode-select -p >/dev/null 2>&1; then
+    err "/usr/bin/python3 is the Command Line Tools stub; run 'xcode-select --install' (or 'brew install python') and rerun"
+    exit 1
+  fi
+  if ! "$python" -c 'import fcntl, hashlib, json, lzma, sys; sys.exit(0 if sys.version_info >= (3, 7) else 1)' \
+      >/dev/null 2>&1; then
+    err "$python must be Python 3.7 or newer with the lzma module; install a full Python 3 and rerun"
+    exit 1
+  fi
+}
+
 preflight_checks() {
   info "Running preflight checks"
+  check_python_runtime
   check_disk_space
   check_write_permissions
   check_existing_install
@@ -5759,7 +5818,8 @@ PY
     return 0
   fi
   if ! require_transfer_capacity "$TMP" "$dest" \
-      "$MAX_APP_ARCHIVE_BYTES" "$MAX_APP_EXPANDED_BYTES" \
+      "$(smaller_budget "$MAX_APP_ARCHIVE_BYTES" "$PREFLIGHT_APP_ARCHIVE_BYTES")" \
+      "$(smaller_budget "$MAX_APP_EXPANDED_BYTES" "$PREFLIGHT_APP_EXPANDED_BYTES")" \
       "FrankenTerm.app"; then
     warn "Insufficient bounded capacity for FrankenTerm.app; skipping GUI app install"
     mark_app_skipped insufficient_destination_capacity
@@ -5770,7 +5830,7 @@ PY
   tmp_app_tar="$TMP/$APP_ASSET"
   if ! run_with_spinner "Downloading $APP_ASSET" \
       download_https_bounded "$app_url" "$tmp_app_tar" \
-        "$MAX_APP_ARCHIVE_BYTES" 300 1; then
+        "$MAX_APP_ARCHIVE_BYTES" 300 1 "$PREFLIGHT_APP_ARCHIVE_BYTES"; then
     warn "FrankenTerm.app asset not found at $app_url; skipping GUI app install"
     mark_app_skipped app_asset_download_failed
     return 0
@@ -6725,7 +6785,8 @@ TMP=$(mktemp -d)
 # authenticated inventory sizes are checked again before publication.
 if [ "$FROM_SOURCE" -eq 0 ]; then
   require_transfer_capacity "$TMP" "$DEST" \
-    "$MAX_PROCESS_ARCHIVE_BYTES" "$MAX_PROCESS_EXPANDED_BYTES" \
+    "$(smaller_budget "$MAX_PROCESS_ARCHIVE_BYTES" "$PREFLIGHT_PROCESS_ARCHIVE_BYTES")" \
+    "$(smaller_budget "$MAX_PROCESS_EXPANDED_BYTES" "$PREFLIGHT_PROCESS_EXPANDED_BYTES")" \
     "standalone process-family" || exit 1
 fi
 
@@ -6750,7 +6811,7 @@ elif [ "$FROM_SOURCE" -eq 0 ]; then
     # caps the whole transfer.
     if ! run_with_spinner "Downloading $TAR" \
         download_https_bounded "$URL" "$TMP/$TAR" \
-          "$MAX_PROCESS_ARCHIVE_BYTES" 300 1; then
+          "$MAX_PROCESS_ARCHIVE_BYTES" 300 1 "$PREFLIGHT_PROCESS_ARCHIVE_BYTES"; then
       warn "Artifact download failed; falling back to build-from-source"
       FROM_SOURCE=1
     fi

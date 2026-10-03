@@ -79,6 +79,47 @@ pub enum AgentScreenState {
 /// Rows of the screen tail the agent classifier looks at.
 const AGENT_SCREEN_TAIL_ROWS: usize = 40;
 
+/// The bottom status line of a pager or editor: less's `:` / `(END)` / `-M`
+/// prompt, more's `--More--`, man's footer, a vim mode line, its `~` filler
+/// rows, or its ruler (`12,5  Top`, `1,1  All`, `40,1  37%`).
+fn is_pager_or_editor_status_line(line: &str) -> bool {
+    let line = line.trim();
+    if matches!(line, ":" | "(END)" | "~")
+        || line.starts_with("--More--")
+        || line.contains("(press h for help or q to quit)")
+        || ["-- INSERT --", "-- VISUAL", "-- REPLACE --"]
+            .iter()
+            .any(|mode| line.starts_with(mode))
+    {
+        return true;
+    }
+    if let Some(rest) = line.strip_prefix("lines ") {
+        // less -M: "lines 1-24/200 12%"
+        if rest.split_once('-').is_some_and(|(start, _)| {
+            !start.is_empty() && start.bytes().all(|byte| byte.is_ascii_digit())
+        }) {
+            return true;
+        }
+    }
+    let mut words = line.split_whitespace().rev();
+    let (Some(position), Some(cursor)) = (words.next(), words.next()) else {
+        return false;
+    };
+    let position_ok = matches!(position, "All" | "Top" | "Bot")
+        || position
+            .strip_suffix('%')
+            .is_some_and(|pct| !pct.is_empty() && pct.bytes().all(|byte| byte.is_ascii_digit()));
+    let cursor_ok = cursor.split_once(',').is_some_and(|(row, col)| {
+        !row.is_empty()
+            && row.bytes().all(|byte| byte.is_ascii_digit())
+            && !col.is_empty()
+            && col
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'-')
+    });
+    position_ok && cursor_ok
+}
+
 /// Classify the bottom of a pane's screen as a known agent TUI state.
 ///
 /// Conservative by construction: a decision prompt anywhere in the tail wins,
@@ -92,6 +133,16 @@ pub fn classify_agent_screen(tail: &str) -> Option<(&'static str, AgentScreenSta
         .filter(|line| !line.trim().is_empty())
         .collect();
     let lines = &lines[lines.len().saturating_sub(AGENT_SCREEN_TAIL_ROWS)..];
+    // A pager or editor showing captured agent text (less on a transcript,
+    // vim on a doc quoting a composer) paints its own status line last. Such
+    // a screen is never an agent at rest: reading it as one would lift the
+    // alt-screen gate and type into the pager (ft-4d8cm).
+    if lines
+        .last()
+        .is_some_and(|line| is_pager_or_editor_status_line(line))
+    {
+        return None;
+    }
     let lower: Vec<String> = lines.iter().map(|line| line.to_lowercase()).collect();
     let any = |needles: &[&str]| {
         lower
@@ -1124,6 +1175,42 @@ mod tests {
             classify_agent_screen(&agent_screen("codex_0157_idle_empty_composer.txt")),
             Some(("codex", AgentScreenState::Ready))
         );
+    }
+
+    /// ft-4d8cm: a pager or editor displaying a captured agent screen (less
+    /// on a transcript, vim on a doc that quotes one) is not an agent at rest,
+    /// so it must never lift the alt-screen gate.
+    #[test]
+    fn pagers_and_editors_showing_agent_text_are_not_agents() {
+        for screen in ["codex_0157_idle.txt", "claude_code_2_1_idle.txt"] {
+            let captured = agent_screen(screen);
+            for status in [
+                ":",
+                "(END)",
+                "--More--(42%)",
+                "lines 1-24/310 7%",
+                " Manual page codex(1) line 1 (press h for help or q to quit)",
+                "-- INSERT --",
+                "-- VISUAL LINE --",
+                "~",
+                "                                        12,5          Top",
+                "                                        40,1-8        37%",
+            ] {
+                assert_eq!(
+                    classify_agent_screen(&format!("{captured}\n{status}\n")),
+                    None,
+                    "{screen} under {status:?}"
+                );
+            }
+        }
+        // Real agent footers are not status lines.
+        for footer in [
+            "  ← for agents · ? for shortcuts                      ⚠ 2 warnings · f2 to view",
+            "Not logged in · Run /login",
+            "  ⏎ send   ⌃J newline   ⌃T transcript   ⌃C quit   37% context left",
+        ] {
+            assert!(!is_pager_or_editor_status_line(footer), "{footer}");
+        }
     }
 
     #[test]

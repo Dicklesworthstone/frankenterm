@@ -6340,8 +6340,63 @@ fn resolve_ipc_socket_path(ft_dir: &Path, ipc: &IpcConfig) -> PathBuf {
     if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
-        ft_dir.join(candidate)
+        let path = ft_dir.join(candidate);
+        if path.as_os_str().len() <= MAX_UNIX_SOCKET_PATH_BYTES {
+            return path;
+        }
+        short_private_socket_path(&path, &private_runtime_dirs()).unwrap_or(path)
     }
+}
+
+/// Longest unix socket path every supported platform accepts: `sun_path` is
+/// 104 bytes on macOS (108 on Linux), including the terminating NUL.
+const MAX_UNIX_SOCKET_PATH_BYTES: usize = 103;
+
+/// Per-user directories a socket may live in: `$XDG_RUNTIME_DIR`, and on
+/// macOS the per-user `$TMPDIR`. Never a shared `/tmp`, where another user
+/// could squat the name.
+fn private_runtime_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()) {
+        dirs.push(PathBuf::from(runtime));
+    }
+    if cfg!(target_os = "macos") {
+        dirs.push(std::env::temp_dir());
+    }
+    dirs
+}
+
+/// A deep workspace's `.ft/ipc.sock` exceeds `sun_path`, so the watcher could
+/// not bind it and `ft robot` could not reach the watcher. Such a socket moves
+/// to `<private dir>/ft-ipc-<hash of its intended path>.sock`: the watcher and
+/// every client derive the same name. The directory must be owned by this
+/// user and not group/world-writable; otherwise the long path is kept and
+/// binding fails with its usual error.
+fn short_private_socket_path(intended: &Path, dirs: &[PathBuf]) -> Option<PathBuf> {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(intended.as_os_str().as_encoded_bytes());
+    let name = format!("ft-ipc-{}.sock", hex::encode(&digest[..8]));
+    dirs.iter()
+        .filter(|dir| directory_is_private_to_this_user(dir))
+        .map(|dir| dir.join(&name))
+        .find(|path| path.as_os_str().len() <= MAX_UNIX_SOCKET_PATH_BYTES)
+}
+
+#[cfg(unix)]
+fn directory_is_private_to_this_user(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    std::fs::metadata(dir).is_ok_and(|metadata| {
+        metadata.is_dir()
+            && metadata.uid() == rustix::process::getuid().as_raw()
+            && metadata.mode() & 0o022 == 0
+    })
+}
+
+#[cfg(not(unix))]
+fn directory_is_private_to_this_user(_dir: &Path) -> bool {
+    false
 }
 
 /// Warning for paths that are more permissive than expected.
@@ -7148,6 +7203,45 @@ disabled_rules = ["codex.usage_warning"]
         let cwd = std::env::current_dir().expect("cwd");
         let root = resolve_workspace_root_with_env(None, None).expect("resolve");
         assert_eq!(root, cwd);
+    }
+
+    /// A workspace deep enough that `.ft/ipc.sock` exceeds `sun_path` gets a
+    /// stable short socket in a private per-user directory; a shared or
+    /// foreign-owned directory is never used.
+    #[cfg(unix)]
+    #[test]
+    fn deep_workspace_ipc_socket_moves_to_a_private_short_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let private = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(private.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(shared.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let deep = PathBuf::from(format!("/{}/.ft/ipc.sock", "d".repeat(120)));
+        let short = short_private_socket_path(&deep, &[private.path().to_path_buf()])
+            .expect("private dir accepts the socket");
+        assert_eq!(short.parent(), Some(private.path()));
+        assert!(short.as_os_str().len() <= MAX_UNIX_SOCKET_PATH_BYTES);
+        assert_eq!(
+            short,
+            short_private_socket_path(&deep, &[private.path().to_path_buf()]).unwrap(),
+            "watcher and clients derive the same name"
+        );
+        let other = PathBuf::from(format!("/{}/.ft/ipc.sock", "e".repeat(120)));
+        assert_ne!(
+            short_private_socket_path(&other, &[private.path().to_path_buf()]),
+            Some(short)
+        );
+        assert_eq!(
+            short_private_socket_path(&deep, &[shared.path().to_path_buf()]),
+            None,
+            "a group/world-writable directory is never used"
+        );
+
+        let ipc = IpcConfig::default();
+        let shallow = resolve_ipc_socket_path(Path::new("/w/.ft"), &ipc);
+        assert_eq!(shallow, PathBuf::from("/w/.ft/ipc.sock"));
     }
 
     #[test]

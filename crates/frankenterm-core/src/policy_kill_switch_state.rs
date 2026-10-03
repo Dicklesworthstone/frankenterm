@@ -456,9 +456,14 @@ pub(crate) async fn load_kill_switch_state_from_storage_with_cx(
     validate_revision_anchor(state, anchor)
 }
 
+/// Longest a synchronous pre-effect kill-switch read waits on a database lock.
+const KILL_SWITCH_SYNC_READ_BUSY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
 /// The detached workflow adapter must release its injector mutex before any
 /// awaited effect. Its admission phase therefore uses a bounded, read-only
-/// connection with no SQLite busy wait, under the already acquired fence.
+/// connection with a short bounded busy wait
+/// ([`KILL_SWITCH_SYNC_READ_BUSY_TIMEOUT`]), under the already acquired fence.
 pub(crate) fn load_kill_switch_state_from_path_with_cx(
     cx: &crate::cx::Cx,
     path: &str,
@@ -476,8 +481,12 @@ pub(crate) fn load_kill_switch_state_from_path_with_cx(
         },
     )
     .map_err(|_| KillSwitchStateError::LoadFailed("pre-effect database open failed".into()))?;
+    // A read failure arms HardStop, so a zero busy timeout turned any
+    // momentary lock (a WAL checkpoint, the audit row a previous admission
+    // just wrote) into a spurious kill-switch denial. Wait briefly; a lock
+    // held longer still fails closed.
     backend
-        .set_busy_timeout(std::time::Duration::ZERO)
+        .set_busy_timeout(KILL_SWITCH_SYNC_READ_BUSY_TIMEOUT)
         .map_err(|_| {
             KillSwitchStateError::LoadFailed("pre-effect read timeout setup failed".into())
         })?;
@@ -947,6 +956,38 @@ pub(crate) mod tests {
             acquire_kill_switch_fence(&path),
             Err(KillSwitchStateError::FenceFailed)
         ));
+    }
+
+    /// A momentary database lock must not turn the synchronous pre-effect
+    /// read into a failure, because a failed read arms HardStop (ft-qbrn1:
+    /// spurious "kill switch hard_stop" denials under load).
+    #[test]
+    fn sync_kill_switch_read_waits_out_a_momentary_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("policy.db");
+        drop(
+            crate::storage_backend_trait::RusqliteBackend::open_path(&path, &Default::default())
+                .unwrap(),
+        );
+        let holder = rusqlite::Connection::open(&path).unwrap();
+        let mode: String = holder
+            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "delete");
+        holder
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)",
+            )
+            .unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            holder.execute_batch("COMMIT").unwrap();
+        });
+        let cx = crate::cx::for_testing();
+        let loaded = load_kill_switch_state_from_path_with_cx(&cx, path.to_str().unwrap());
+        release.join().unwrap();
+        assert!(loaded.is_ok(), "{loaded:?}");
     }
 
     /// Concurrent sends in one workspace used to deny whichever lost the

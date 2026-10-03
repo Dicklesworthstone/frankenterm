@@ -29026,6 +29026,15 @@ fn robot_checkpoint_save_response(
         },
         "scrollback_panes": scrollback_coverage.panes_with_scrollback,
         "scrollback_reference_coverage_complete": scrollback_coverage.all(),
+        "scrollback_incomplete_pane_count": artifact
+            .map_or(0, |publication| publication.incomplete_pane_count()),
+        "warning": artifact
+            .filter(|publication| !publication.scrollback_complete())
+            .map(|publication| format!(
+                "{} of {} pane scrollback prefixes are incomplete; treat the artifact as forensic salvage only, never as a lossless mux-upgrade source",
+                publication.incomplete_pane_count(),
+                publication.receipt.pane_count
+            )),
         "artifact": artifact_payload,
         "created_at": result.checkpoint_at,
         "trigger": "manual",
@@ -30037,22 +30046,10 @@ async fn robot_checkpoint_save_data(
                 elapsed_ms,
             )
         })?;
-        if !publication.scrollback_complete() {
-            return Err(Box::new(robot_checkpoint_error_response(
-                ROBOT_ERR_STORAGE,
-                format!(
-                    "Checkpoint {} and its verified artifact were retained, but {} of {} pane scrollback prefixes are incomplete.",
-                    result.checkpoint_id,
-                    publication.incomplete_pane_count(),
-                    publication.receipt.pane_count
-                ),
-                Some(
-                    "Treat this artifact as forensic salvage only; do not admit it for a lossless mux upgrade."
-                        .to_string(),
-                ),
-                elapsed_ms,
-            )));
-        }
+        // An incomplete durable prefix (panes older than the durable store)
+        // is reported in the success payload, not as a failure: the
+        // checkpoint is committed, and an ok:false here made agents retry a
+        // save that had already happened.
         Some(publication)
     } else {
         None
@@ -101071,6 +101068,11 @@ mod tests {
             Some(false)
         );
         assert!(response["artifact"].is_null());
+        assert_eq!(
+            response["scrollback_incomplete_pane_count"].as_u64(),
+            Some(0)
+        );
+        assert!(response["warning"].is_null());
         let encoded = serde_json::to_string(&response).expect("serialize save response");
         assert!(!encoded.contains(&secret));
         assert!(!encoded.contains('\u{202e}'));
@@ -123393,6 +123395,69 @@ printf x > "$MINISIGN_MARKER"
         .expect("parse explicit activation failure receipt");
         assert_eq!(persisted, receipt);
         assert_initial_family_is_uniformly_unavailable(&destination);
+    }
+
+    /// Stock WezTerm installs side by side with FrankenTerm and owns none of
+    /// its session state, so an open WezTerm must not block activation. A
+    /// wezterm-named process under DEST (a pre-rebrand build) still counts,
+    /// and one whose location is unknown stays conservative.
+    #[cfg(unix)]
+    #[test]
+    fn installer_process_census_ignores_side_by_side_stock_wezterm() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = InstallerTestDir::new("create stock wezterm census fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let fake_bin = fixture.path().join("fake-bin");
+        std::fs::create_dir(&fake_bin).expect("create fake census tool directory");
+        let destination = fixture.path().join("dest");
+        std::fs::create_dir(&destination).expect("create census destination");
+        let census = |listing: &str| {
+            std::fs::write(
+                fake_bin.join("ps"),
+                format!("#!/usr/bin/env bash\nprintf '{listing}'\n"),
+            )
+            .expect("write fake ps");
+            std::fs::set_permissions(fake_bin.join("ps"), std::fs::Permissions::from_mode(0o555))
+                .expect("make fake ps executable");
+            let script = format!(
+                "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nexport FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES=1\nexport FT_INSTALL_TEST_FORCE_PS_CENSUS=1\nsource {}\nunset FT_INSTALL_TEST_MUX_OWNERSHIP_STATE\nSYSTEM_INSTALL=0\nDEST={}\ninstaller_mux_ownership_state\n",
+                shell_single_quote(&installer.to_string_lossy()),
+                shell_single_quote(&destination.to_string_lossy()),
+            );
+            let inherited_path = std::env::var("PATH").expect("test PATH");
+            let output = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(script)
+                .env("PATH", format!("{}:{inherited_path}", fake_bin.display()))
+                .output()
+                .expect("execute census fixture");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).expect("census output is UTF-8")
+        };
+
+        assert_eq!(
+            census(
+                "7 /Applications/WezTerm.app/Contents/MacOS/wezterm-gui\\n8 /opt/homebrew/bin/wezterm-mux-server\\n"
+            ),
+            "inactive\n"
+        );
+        assert_eq!(
+            census(&format!(
+                "9 {}/wezterm-mux-server\\n",
+                destination.display()
+            )),
+            "active\n"
+        );
+        assert_eq!(
+            census("10 /Applications/FrankenTerm.app/Contents/MacOS/frankenterm-gui\\n"),
+            "active\n"
+        );
+        assert_eq!(census("11 wezterm-gui\\n"), "active\n");
     }
 
     #[cfg(unix)]
