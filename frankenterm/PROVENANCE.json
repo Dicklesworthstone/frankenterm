@@ -233,7 +233,7 @@
         "cleanup": 1,
         "cosmetic": 5,
         "feat": 45,
-        "fix": 50,
+        "fix": 51,
         "other": 10,
         "refactor": 5,
         "rename": 1,
@@ -241,13 +241,13 @@
         "security-fix": 2,
         "test": 15
       },
-      "fork_side_commit_count": 145,
+      "fork_side_commit_count": 146,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-09-25T23:30:31-04:00",
-        "sha": "0b968dd76568c0d518f6ec2a7f6a231b220cb622",
-        "subject": "style: rustfmt the code touched by this session's live-loop and send work"
+        "classification": "fix",
+        "committed_at": "2026-10-03T22:08:31-04:00",
+        "sha": "f16d1dcfe280ecf43be7c8e3d75598fbb51d467b",
+        "subject": "fix(config): detect WSL2 kernels"
       },
       "name": "config",
       "path": "frankenterm/config",
@@ -405,16 +405,16 @@
         "other": 6,
         "refactor": 1,
         "rename": 1,
-        "security-fix": 49,
+        "security-fix": 51,
         "test": 6
       },
-      "fork_side_commit_count": 99,
+      "fork_side_commit_count": 101,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-16T14:45:16-04:00",
-        "sha": "99213c76c1a3323df93636eb149ecf80d76cbccf",
-        "subject": "fix(parser): retain leading empty OSC fields and correct property oracles"
+        "classification": "security-fix",
+        "committed_at": "2026-10-03T22:08:30-04:00",
+        "sha": "e9ac786722ed92d964b29b698586de6df295a429",
+        "subject": "fix(escape-parser): keep semicolons inside OSC 8 hyperlink URIs"
       },
       "name": "frankenterm-escape-parser",
       "path": "frankenterm/escape-parser",
@@ -509,19 +509,19 @@
         "chore": 1,
         "cosmetic": 1,
         "feat": 1,
-        "fix": 5,
+        "fix": 6,
         "other": 1,
         "refactor": 1,
         "rename": 1,
         "test": 5
       },
-      "fork_side_commit_count": 16,
+      "fork_side_commit_count": 17,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "refactor",
-        "committed_at": "2026-06-15T14:11:53-04:00",
-        "sha": "dd97e0bf5102fd4841ed1c07e1c42461742c2de8",
-        "subject": "refactor(vendored): migrate ex-WezTerm crates to upgraded dependency APIs"
+        "classification": "fix",
+        "committed_at": "2026-10-03T22:08:30-04:00",
+        "sha": "94bf79a0b05e6963aa4dcbe1d8bacd8392566b6c",
+        "subject": "fix(input-types): kitty disambiguate mode sends ESC as CSI 27;1u"
       },
       "name": "frankenterm-input-types",
       "path": "frankenterm/input-types",
@@ -641,7 +641,7 @@
         "cosmetic": 31,
         "docs": 6,
         "feat": 210,
-        "fix": 300,
+        "fix": 301,
         "other": 55,
         "refactor": 12,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 112
       },
-      "fork_side_commit_count": 751,
+      "fork_side_commit_count": 752,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-02T21:41:17-04:00",
-        "sha": "f049e66bd3c8409f1e7d62cf735cc831dcb5269d",
-        "subject": "fix(release): land the eleven v0.15.21 ship-blockers and review should-fixes (ft-u5tr5)"
+        "committed_at": "2026-10-03T22:08:31-04:00",
+        "sha": "96f5dc8767838effe90b921553ce558172946720",
+        "subject": "fix(mux): tmux -CC send-keys uses -H and ends with LF"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -897,20 +897,20 @@
         "cosmetic": 15,
         "docs": 2,
         "feat": 59,
-        "fix": 140,
+        "fix": 141,
         "other": 61,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
         "test": 71
       },
-      "fork_side_commit_count": 365,
+      "fork_side_commit_count": 366,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-09-26T07:25:23-04:00",
-        "sha": "9e4bf6e5a8e8523842f2172f47efc83c5c6aa55f",
-        "subject": "feat(mux): the fleet coordinator evicts warm scrollback on the mux (codec 67)"
+        "classification": "fix",
+        "committed_at": "2026-10-03T22:08:30-04:00",
+        "sha": "3b1a20ef669bc99b5202b2c34bb53ec821cbfbf0",
+        "subject": "fix(term): RIS also clears modifyOtherKeys, DECLRMM and bidi overrides"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1039,20 +1039,20 @@
         "cosmetic": 8,
         "docs": 2,
         "feat": 18,
-        "fix": 98,
+        "fix": 99,
         "other": 14,
         "refactor": 6,
         "rename": 1,
         "runtime-swap": 1,
         "test": 3
       },
-      "fork_side_commit_count": 155,
+      "fork_side_commit_count": 156,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-21T02:09:34-04:00",
-        "sha": "49c0fd325664d9c2b6ff6a52ebde379c2f309963",
-        "subject": "fix(macos): use inhabited opaque Blocks runtime storage"
+        "committed_at": "2026-10-03T22:08:41-04:00",
+        "sha": "de1036bc97856e32c9d578472548d32936bdd20c",
+        "subject": "fix(window): compare macOS first-responder pointers with ptr::eq"
       },
       "name": "window",
       "path": "frankenterm/window",
@@ -1065,8 +1065,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2970,
-  "generated_at": "2026-10-03T01:41:28.132514Z",
+  "fork_side_commit_total": 2977,
+  "generated_at": "2026-10-04T02:09:16.837707Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
