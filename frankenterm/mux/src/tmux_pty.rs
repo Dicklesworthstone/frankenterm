@@ -607,7 +607,7 @@ mod tests {
         assert_eq!(queue.len(), 1);
         assert_eq!(
             queue.front().expect("send-keys command").get_command(7),
-            "send-keys -t %99 0x61 0x62 \r"
+            "send-keys -H -t %99 0x61 0x62 \n"
         );
     }
 

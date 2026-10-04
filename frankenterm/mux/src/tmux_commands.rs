@@ -2806,7 +2806,11 @@ impl TmuxCommand for SendKeys {
         for &byte in self.keys.iter() {
             write!(&mut s, "0x{:X} ", byte).expect("unable to write key");
         }
-        format!("send-keys -t %{} {}\r", self.pane, s)
+        // `-H`: each key is one raw byte. Without it tmux reads `0xE7` as the
+        // code point U+00E7, garbling every multi-byte UTF-8 character
+        // (upstream WezTerm e46fe38c5). Control-mode commands end with LF,
+        // like every other command here (upstream 2bd22e73f).
+        format!("send-keys -H -t %{} {}\n", self.pane, s)
     }
 
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
@@ -5224,9 +5228,21 @@ mod tests {
             pane: 7,
         };
         let output = cmd.get_command(0);
-        assert!(output.starts_with("send-keys -t %7 "));
+        assert!(output.starts_with("send-keys -H -t %7 "));
         assert!(output.contains("0x48"));
         assert!(output.contains("0x69"));
+        assert!(output.ends_with('\n'));
+    }
+
+    /// Multi-byte UTF-8 input must reach tmux as raw bytes (`-H`), not as
+    /// code points: `界` is E7 95 8C (upstream WezTerm e46fe38c5).
+    #[test]
+    fn send_keys_sends_utf8_as_raw_hex_bytes() {
+        let cmd = SendKeys {
+            keys: "界".as_bytes().to_vec(),
+            pane: 4,
+        };
+        assert_eq!(cmd.get_command(0), "send-keys -H -t %4 0xE7 0x95 0x8C \n");
     }
 
     #[test]
@@ -5236,7 +5252,7 @@ mod tests {
             pane: 3,
         };
         let output = cmd.get_command(0);
-        assert!(output.contains("send-keys -t %3"));
+        assert!(output.contains("send-keys -H -t %3"));
     }
 
     #[test]
