@@ -3422,6 +3422,42 @@ mod tests {
         )
     }
 
+    /// RIS is the recovery after a TUI exits uncleanly with modifyOtherKeys
+    /// on; it must clear that, DECLRMM and the bidi overrides like DECSTR
+    /// does (upstream WezTerm fe3006aef).
+    #[test]
+    fn full_reset_clears_modify_other_keys_margin_mode_and_bidi() {
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
+            kitty_budget: 1024,
+            unicode_version: UnicodeVersion::new(14),
+            scorecard_enabled: false,
+            checksum_rectangular_area: false,
+        });
+        let mut terminal = crate::Terminal::new(
+            TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            },
+            config,
+            "test",
+            "1",
+            Box::new(std::io::sink()),
+        );
+        // modifyOtherKeys=2, DECLRMM on, bidi enabled with an RTL hint.
+        terminal.advance_bytes(b"\x1b[>4;2m\x1b[?69h\x1b[8h\x1b[?2501h");
+        assert_eq!(terminal.modify_other_keys, Some(2));
+        assert!(terminal.left_and_right_margin_mode);
+
+        terminal.advance_bytes(b"\x1bc");
+        assert_eq!(terminal.modify_other_keys, None);
+        assert!(!terminal.left_and_right_margin_mode);
+        assert_eq!(terminal.bidi_enabled, None);
+        assert!(terminal.bidi_hint.is_none());
+    }
+
     #[test]
     fn resize_saved_pending_wrap_preserves_subsequent_typing() {
         for (alternate, prepared) in [(false, false), (true, false), (false, true), (true, true)] {
