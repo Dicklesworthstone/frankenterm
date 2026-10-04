@@ -3047,7 +3047,7 @@ impl WindowView {
             }
             let first_responder: id = msg_send![window, firstResponder];
             let sheet: id = msg_send![window, attachedSheet];
-            if first_responder != this as *const Object as id || !sheet.is_null() {
+            if !std::ptr::eq(first_responder, this as *const Object as id) || !sheet.is_null() {
                 return false;
             }
         }
