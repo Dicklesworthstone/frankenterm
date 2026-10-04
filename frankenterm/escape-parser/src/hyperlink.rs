@@ -435,12 +435,17 @@ impl Hyperlink {
     }
 
     pub fn parse(osc: &[&[u8]]) -> Result<Option<Hyperlink>> {
-        ensure!(osc.len() == 3, "wrong param count");
-        if osc[1].is_empty() && osc[2].is_empty() {
+        ensure!(osc.len() >= 3, "wrong param count");
+        // `;` is a valid URI character, but the OSC splitter splits on it, so
+        // `data:text/plain;base64,...` arrives as several params. Everything
+        // after the params is the URI (upstream WezTerm cab251610). The joined
+        // bytes may carry credentials, so they live in a zeroizing buffer.
+        let raw_uri = Zeroizing::new(osc[2..].join(&b';'));
+        if osc[1].is_empty() && raw_uri.is_empty() {
             // Clearing current hyperlink
             Ok(None)
         } else {
-            let mut uri = decode_percent_escapes(osc[2])?;
+            let mut uri = decode_percent_escapes(&raw_uri)?;
             let param_count = if osc[1].is_empty() {
                 0
             } else {

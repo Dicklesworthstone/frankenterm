@@ -1812,6 +1812,37 @@ mod test {
         assert_eq!(encode(&actions), "\x1b]532534523;hello\x1b\\");
     }
 
+    /// `;` is valid in a URI: everything after the OSC 8 params is the URI
+    /// (upstream WezTerm cab251610).
+    #[test]
+    fn hyperlink_uri_with_semicolons() {
+        let mut p = Parser::new();
+        for (input, uri) in [
+            (
+                &b"\x1b]8;id=x;https://example.com/a;b?c=d;e\x07"[..],
+                "https://example.com/a;b?c=d;e",
+            ),
+            (
+                &b"\x1b]8;id=x;data:text/plain;base64,aGk=\x07"[..],
+                "data:text/plain;base64,aGk=",
+            ),
+        ] {
+            let actions = p.parse_as_vec(input);
+            let link = crate::hyperlink::Hyperlink::new_with_id(uri, "x");
+            assert_eq!(
+                vec![Action::OperatingSystemCommand(Box::new(
+                    OperatingSystemCommand::SetHyperlink(Some(link)),
+                ))],
+                actions
+            );
+            // Re-emission percent-encodes `;` so the URI stays unambiguous.
+            assert_eq!(
+                encode(&actions),
+                format!("\x1b]8;id=x;{}\x1b\\", uri.replace(';', "%3B"))
+            );
+        }
+    }
+
     #[test]
     fn test_emoji_title_osc() {
         let input = "\x1b]0;\u{1f915}\x07";
