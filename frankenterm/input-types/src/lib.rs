@@ -1801,6 +1801,12 @@ impl KeyEvent {
             match &self.key {
                 Char('\x08') => return '\x7f'.to_string(),
                 Char('\x7f') => return '\x08'.to_string(),
+                // With DISAMBIGUATE_ESCAPE_CODES, ESC must not be sent as a
+                // raw \x1b byte: removing that ambiguity is the flag's whole
+                // purpose. Fall through to the CSI-u path, which produces
+                // \x1b[27;1u as the spec requires (upstream WezTerm aea9b9f2e).
+                // https://sw.kovidgoyal.net/kitty/keyboard-protocol/#disambiguate
+                Char('\x1b') if flags.contains(KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES) => {}
                 Char(c) => return c.to_string(),
                 _ => {}
             }
@@ -3462,6 +3468,39 @@ mod test {
             }
             .encode_kitty(flags),
             "\u{1b}[102;34u".to_string()
+        );
+    }
+
+    /// ESC with DISAMBIGUATE_ESCAPE_CODES must produce \x1b[27;1u, not a raw
+    /// \x1b (upstream WezTerm aea9b9f2e).
+    /// https://sw.kovidgoyal.net/kitty/keyboard-protocol/#disambiguate
+    #[test]
+    fn encode_escape_disambiguate() {
+        let esc = |key_is_down| KeyEvent {
+            key: KeyCode::Char('\x1b'),
+            modifiers: Modifiers::NONE,
+            leds: KeyboardLedStatus::empty(),
+            repeat_count: 1,
+            key_is_down,
+            raw: None,
+            #[cfg(windows)]
+            win32_uni_char: None,
+        };
+        assert_eq!(
+            esc(true).encode_kitty(KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES),
+            "\x1b[27;1u".to_string()
+        );
+        // Without flags the legacy raw byte is unchanged.
+        assert_eq!(
+            esc(true).encode_kitty(KittyKeyboardFlags::NONE),
+            "\x1b".to_string()
+        );
+        assert_eq!(
+            esc(false).encode_kitty(
+                KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KittyKeyboardFlags::REPORT_EVENT_TYPES
+            ),
+            "\x1b[27;1:3u".to_string()
         );
     }
 
