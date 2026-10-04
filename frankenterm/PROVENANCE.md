@@ -44,6 +44,7 @@ compatibility is explicitly not maintained.
 | `b09b56c29` | already-equivalent | tmux PTY writers already return the accepted length. |
 | `4af230bc0` | already-equivalent | serde_with is already 3.x. |
 | `d9dc7f513` | accepted | gui: removal of (or a stale) subscribed mux window id no longer retires the pane-output subscription, so a window that workspace reconcile repurposes keeps repainting. Teardown stays with the GuiMuxSubscription drop; the synchronous WindowTopologyChanged/WindowRemoved retirement was adapted the same way. |
+| `3ff7522b9` | deferred | cell image: hash each transmitted frame once. Perf only (60 fps image streaming); our ImageData carries content revisions and validation authority, so a stored per-variant hash needs its own design. |
 | `76b606ec5` | skipped | shell integration: our script does not reference `ZSH_NAME`. |
 | remainder | skipped | docs, CI, nix/flatpak packaging, upstream dependency cooldown bumps, winapi -> windows-sys refactors, lint-only cleanups, and new features (smart-case search, fancy tab bar, command-palette line height, ClearLine, dictation) that are not fixes. |
 
