@@ -1346,6 +1346,8 @@ pub mod command_rules {
             RotatePanes(RotationDirection::CounterClockwise),
             UnifyWindowsOnActiveDomain,
             UnifyAllWindows,
+            ShowMoveTabToWindow,
+            MoveTabToNewWindow,
             // --- Swap Layouts & Floating Panes ---
             SwapLayoutNext,
             SwapLayoutPrev,

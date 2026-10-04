@@ -3404,7 +3404,9 @@ pub struct ClientPane {
     client: Arc<ClientInner>,
     local_pane_id: PaneId,
     pub remote_pane_id: PaneId,
-    pub remote_tab_id: TabId,
+    /// The remote tab that holds this pane. A server-side move changes it,
+    /// and the topology snapshot that reports the move updates it here.
+    remote_tab_id: std::sync::atomic::AtomicUsize,
     pub renderable: Arc<Mutex<RenderableState>>,
     configured_palette: Mutex<ColorPalette>,
     palette: Mutex<ColorPalette>,
@@ -4196,7 +4198,7 @@ impl ClientPane {
             mouse,
             remote_pane_id,
             local_pane_id,
-            remote_tab_id,
+            remote_tab_id: std::sync::atomic::AtomicUsize::new(remote_tab_id),
             application_palette: Mutex::new(false),
             renderable,
             writer: Mutex::new(writer),
@@ -4932,6 +4934,19 @@ impl ClientPane {
         self.remote_pane_id
     }
 
+    /// The remote tab that currently holds this pane.
+    pub fn remote_tab_id(&self) -> TabId {
+        self.remote_tab_id
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record that the server moved this pane into `remote_tab_id`. Only the
+    /// topology snapshot that reports the move may call this.
+    pub(crate) fn set_remote_tab_id(&self, remote_tab_id: TabId) {
+        self.remote_tab_id
+            .store(remote_tab_id, std::sync::atomic::Ordering::Release);
+    }
+
     /// Send one sampled paste without placing its content in trace metadata.
     /// Peers below the additive traced-paste dialect receive the unchanged
     /// PDU13 request; the context is consumed rather than retained across a
@@ -5102,7 +5117,7 @@ impl ClientPane {
             settled: false,
         };
         let request = rpc.resize(Resize {
-            containing_tab_id: self.remote_tab_id,
+            containing_tab_id: self.remote_tab_id(),
             pane_id: self.remote_pane_id,
             size,
         });
@@ -5150,7 +5165,7 @@ impl ClientPane {
                 };
                 let intent = QueuedResizeIntent {
                     pane_id: self.local_pane_id,
-                    remote_tab_id: self.remote_tab_id,
+                    remote_tab_id: self.remote_tab_id(),
                     remote_pane_id: self.remote_pane_id,
                     registration,
                     delivery_state: Arc::clone(&self.resize_delivery),
@@ -5669,7 +5684,7 @@ impl Pane for ClientPane {
         let mut inner = render.inner.borrow_mut();
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
-        let remote_tab_id = self.remote_tab_id;
+        let remote_tab_id = self.remote_tab_id();
         // Invalidate any cached rows on a resize
         inner.make_all_stale();
         let request = client.client.set_zoomed(SetPaneZoomed {

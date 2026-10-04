@@ -7830,6 +7830,76 @@ impl TermWindow {
         Ok(())
     }
 
+    fn show_move_tab_to_window(&mut self) {
+        let args = LauncherActionArgs {
+            title: Some("Move tab to window".to_string()),
+            flags: LauncherFlags::MOVE_TAB_TO_WINDOW,
+            help_text: Some("Move tab: Enter=move  Esc=cancel  /=filter".to_string()),
+            fuzzy_help_text: None,
+            alphabet: None,
+        };
+        self.show_launcher_impl(args, 0);
+    }
+
+    /// Move the active tab into `target`, or into a new window when `target`
+    /// is `None`, then focus the window it lands in. The mux can only move a
+    /// pane, so a tab with several panes moves just its active pane.
+    fn move_active_tab_to_window(&mut self, target: Option<MuxWindowId>) -> anyhow::Result<()> {
+        if target == Some(self.mux_window_id) {
+            return Ok(());
+        }
+        let mux = self.mux_or_err("move tab to window")?;
+        if let Some(window_id) = target {
+            ensure!(
+                mux.get_window(window_id).is_some(),
+                "window {window_id} does not exist"
+            );
+        }
+        let source_tab = mux
+            .get_active_tab_for_window(self.mux_window_id)
+            .ok_or_else(|| anyhow!("window {} has no active tab", self.mux_window_id))?;
+        let pane_id = source_tab
+            .get_active_pane()
+            .ok_or_else(|| anyhow!("window {} has no active pane", self.mux_window_id))?
+            .pane_id();
+        // The move builds a fresh tab around the pane. When the pane is the
+        // whole tab, the tab itself is what moves, so its custom title goes
+        // with it. A multi-pane tab keeps its title for the panes left behind.
+        let carried_title = Some(source_tab.get_title())
+            .filter(|title| !title.is_empty() && source_tab.iter_all_panes().len() == 1);
+        drop(source_tab);
+
+        match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Topology,
+            8 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                reservation
+                    .spawn_local(async move {
+                        match mux.move_pane_to_new_tab(pane_id, target, None).await {
+                            Ok((tab, window_id)) => {
+                                if let Some(title) = &carried_title {
+                                    tab.set_title(title);
+                                }
+                                mux.focus_pane_and_containing_tab(pane_id).ok();
+                                if let Some(win) = try_front_end()
+                                    .and_then(|fe| fe.gui_window_for_mux_window(window_id))
+                                {
+                                    win.window.focus();
+                                }
+                            }
+                            Err(err) => log::error!("failed to move tab to window: {err:#}"),
+                        }
+                    })
+                    .detach();
+            }
+            rejected => log::error!(
+                "main-thread scheduler rejected move-tab-to-window before mutation: {rejected:?}"
+            ),
+        }
+        Ok(())
+    }
+
     fn activate_tab(&mut self, tab_idx: isize) -> anyhow::Result<()> {
         let mux = self.mux_or_err("activate tab")?;
         let window = mux
@@ -9621,6 +9691,9 @@ impl TermWindow {
             UnifyAllWindows => {
                 self.show_window_unify_confirmation(WindowUnifyScope::AllDomains);
             }
+            ShowMoveTabToWindow => self.show_move_tab_to_window(),
+            MoveTabToWindow(window_id) => self.move_active_tab_to_window(Some(*window_id))?,
+            MoveTabToNewWindow => self.move_active_tab_to_window(None)?,
             SwapLayoutNext => {
                 let Some(mux) = self.mux_or_log("swap to next layout") else {
                     return Ok(PerformAssignmentResult::Handled);
