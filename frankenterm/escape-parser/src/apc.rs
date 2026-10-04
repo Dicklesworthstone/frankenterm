@@ -532,14 +532,26 @@ mod win {
                 ),
             ));
         }
-        let buf_slice = unsafe { std::slice::from_raw_parts(shm.buf.add(offset), size) };
-        let mut data = Vec::new();
+        let mut data: Vec<u8> = Vec::new();
         data.try_reserve_exact(size).map_err(|error| {
             std::io::Error::other(format!(
                 "unable to reserve {size} bounded Kitty shared-memory bytes: {error}"
             ))
         })?;
-        data.extend_from_slice(buf_slice);
+        // Shared memory can be written by another process at any time, so a
+        // `&[u8]` over it would violate Rust's aliasing rules. Copy the bytes
+        // out through raw pointers instead (upstream WezTerm 86d223ec8).
+        if size > 0 {
+            // SAFETY: `offset < RegionSize` and `size <= RegionSize - offset`
+            // were checked above, so `src..src + size` lies inside the mapped
+            // view; `data` has capacity for at least `size` bytes and does not
+            // overlap the mapping.
+            unsafe {
+                let src = shm.buf.add(offset).cast_const();
+                std::ptr::copy_nonoverlapping(src, data.as_mut_ptr(), size);
+                data.set_len(size);
+            }
+        }
 
         Ok(data)
     }
