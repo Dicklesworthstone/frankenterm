@@ -268,8 +268,28 @@ pub fn palette_with_accessibility_preferences(
 #[must_use]
 pub fn config_with_accessibility_palette(config: config::ConfigHandle) -> config::ConfigHandle {
     let prefs = AccessibilityPreferenceOverrides::default().resolve(probe_platform_preferences());
-    let resolved_palette = palette_with_accessibility_preferences(&config.resolved_palette, prefs);
-    config.with_resolved_palette(resolved_palette)
+    let explicit_palette = config.colors.is_some() || config.color_scheme.is_some();
+    match desktop_palette_for_config(&config.resolved_palette, explicit_palette, prefs) {
+        Some(resolved_palette) => config.with_resolved_palette(resolved_palette),
+        None => config,
+    }
+}
+
+/// The palette the desktop preference produces, or `None` to keep the
+/// configured one. A palette the user chose (`colors` or `color_scheme`) wins
+/// over a plain light/dark preference: some desktops (KDE through gsettings)
+/// report prefer-light under a dark theme. A high-contrast request still
+/// applies, since it is an accessibility need rather than a taste.
+fn desktop_palette_for_config(
+    base: &config::Palette,
+    explicit_palette: bool,
+    prefs: AccessibilityPreferences,
+) -> Option<config::Palette> {
+    let class = select_theme_class(prefs);
+    if explicit_palette && matches!(class, ThemeClass::Light | ThemeClass::Dark) {
+        return None;
+    }
+    Some(palette_with_accessibility_preferences(base, prefs))
 }
 
 fn theme_palette_overlay(palette: ThemePalette) -> config::Palette {
@@ -503,6 +523,43 @@ mod tests {
         );
 
         assert_eq!(result, base);
+    }
+
+    fn desktop_prefs(
+        contrast: ContrastPreference,
+        scheme: ColorSchemePreference,
+    ) -> AccessibilityPreferences {
+        AccessibilityPreferences::new(MotionPreference::NoPreference, contrast, scheme)
+    }
+
+    #[test]
+    fn explicit_palette_ignores_desktop_light_dark_but_honors_high_contrast() {
+        let base = config::Palette {
+            background: Some(config::RgbaColor::try_from("#2e3440".to_string()).unwrap()),
+            ..Default::default()
+        };
+        let prefer_light = desktop_prefs(
+            ContrastPreference::NoPreference,
+            ColorSchemePreference::Light,
+        );
+        let high_contrast = desktop_prefs(ContrastPreference::More, ColorSchemePreference::Light);
+
+        // KDE reports prefer-light under a dark theme; the user's dark
+        // `color_scheme` must survive it.
+        assert_eq!(desktop_palette_for_config(&base, true, prefer_light), None);
+        assert_eq!(
+            desktop_palette_for_config(&base, false, prefer_light),
+            Some(palette_with_accessibility_preferences(&base, prefer_light))
+        );
+        assert_ne!(
+            desktop_palette_for_config(&base, false, prefer_light)
+                .and_then(|palette| palette.background),
+            base.background
+        );
+        assert_eq!(
+            desktop_palette_for_config(&base, true, high_contrast),
+            Some(palette_with_accessibility_preferences(&base, high_contrast))
+        );
     }
 
     #[test]
