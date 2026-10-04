@@ -6277,13 +6277,17 @@ impl TermWindow {
                 // here and propagate to the window event handler that
                 // will then do the check with full context.
                 if mux.get_window(mux_window_id).is_none() {
-                    // Something inconsistent: cancel subscription
+                    // During a workspace switch the subscribed window id is
+                    // stale until SwitchToMuxWindow is applied. Skip this
+                    // notification but keep the subscription: cancelling here
+                    // froze the window's rendering for good. The subscription
+                    // ends when its GuiMuxSubscription owner drops
+                    // (upstream WezTerm d9dc7f513).
                     log::debug!(
-                        "PaneOutput: wanted mux_window_id={} from mux, but \
-                         was not found, cancel mux subscription",
+                        "PaneOutput: mux_window_id={} not found (stale during a workspace switch?); skipping",
                         mux_window_id
                     );
-                    return false;
+                    return true;
                 }
                 let _ = pane_id;
             }
@@ -6314,20 +6318,20 @@ impl TermWindow {
             }
             MuxNotification::WindowTopologyChanged(ref change) => {
                 if change.removed_windows().binary_search(&mux_window_id).is_ok() {
-                    dead.store(true, Ordering::Relaxed);
-                    return false;
+                    // The removed id may be the stale one of a workspace
+                    // switch in progress; keep the subscription (see above).
+                    return true;
                 }
                 if !change.affects_window(mux_window_id) {
                     return true;
                 }
             }
             MuxNotification::WindowRemoved(window_id) => {
-                if window_id != mux_window_id {
-                    return true;
-                }
-                // Set the window as dead to unsubscribe from further notifications
-                dead.store(true, Ordering::Relaxed);
-                return false;
+                // Even our own window id: during a workspace switch it is the
+                // stale id about to be replaced. Skip and keep the
+                // subscription; its owner's drop ends it.
+                let _ = window_id;
+                return true;
             }
             MuxNotification::TabResized(tab_id)
             | MuxNotification::TabTitleChanged { tab_id, .. } => {
@@ -6593,12 +6597,13 @@ impl TermWindow {
                     &n,
                     MuxNotification::WindowRemoved(window_id) if *window_id == mux_window_id
                 ) || matches!(&n, MuxNotification::WindowTopologyChanged(change) if change.removed_windows().binary_search(&mux_window_id).is_ok()) {
-                    // This notification is sufficient to retire the subscriber
-                    // synchronously.  Do not enqueue a GUI-thread callback and
-                    // wait for some later notification to observe `dead`.
-                    dead.store(true, Ordering::Release);
-                    callback_unsubscribe_requested.store(true, Ordering::Release);
-                    return false;
+                    // Our mux window was removed. The frontend's workspace
+                    // reconcile then either repurposes this GUI window
+                    // (SwitchToMuxWindow) or closes it, and closing drops the
+                    // GuiMuxSubscription, which unsubscribes. Retiring here
+                    // left a repurposed window that never repainted (upstream
+                    // WezTerm d9dc7f513). Skip it without a GUI-thread callback.
+                    return true;
                 }
                 if !Self::mux_notification_targets_window(&n, mux_window_id) {
                     return true;
