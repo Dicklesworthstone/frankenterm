@@ -13053,6 +13053,25 @@ impl RuntimeHandle {
                     self.wezterm_handle.list_panes_with_cx(&snapshot_cx),
                 )
                 .await;
+                // A runtime that never observed a pane (an idle host with no
+                // reachable mux) has nothing a restore could offer, so an
+                // unreachable backend at shutdown is not evidence of lost
+                // state: commit the terminal checkpoint over the empty set
+                // instead of reporting every stop of an idle watcher as
+                // unclean. A mux that died mid-run leaves its panes in the
+                // registry and stays unclean.
+                let never_observed_a_pane =
+                    matches!(pane_list_result, Ok(Err(_))) && self.registry.read().await.is_empty();
+                let pane_list_result = match pane_list_result {
+                    Ok(Err(error)) if never_observed_a_pane => {
+                        info!(
+                            error = %error,
+                            "terminal snapshot: backend unreachable and no pane was ever observed; committing an empty terminal checkpoint"
+                        );
+                        Ok(Ok(Vec::new()))
+                    }
+                    other => other,
+                };
                 match pane_list_result {
                     Ok(Ok(panes)) => {
                         let checkpoint_timeout = shutdown_timeout.min(Duration::from_secs(5));
@@ -21366,6 +21385,59 @@ mod tests {
                 empty_shutdown_checkpoints, 1,
                 "empty-domain shutdown must persist an explicit zero-pane checkpoint"
             );
+        });
+    }
+
+    /// An idle host: the backend is unreachable for the runtime's whole life,
+    /// so no pane was ever observed. Stopping it is clean (a zero-pane
+    /// terminal checkpoint), not an "unclean shutdown" error on every stop.
+    #[test]
+    fn runtime_that_never_observed_a_pane_shuts_down_clean_without_a_backend() {
+        run_async_test_isolated(|| async {
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            let config = RuntimeConfig {
+                discovery_interval: Duration::from_millis(10),
+                capture_interval: Duration::from_millis(10),
+                min_capture_interval: Duration::from_millis(5),
+                channel_buffer: 64,
+                ..Default::default()
+            };
+            let snapshot_config = SnapshotConfig {
+                enabled: true,
+                interval_seconds: 3600,
+                scheduling: crate::config::SnapshotSchedulingConfig {
+                    mode: SnapshotSchedulingMode::Periodic,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.set_list_panes_error(Some("no mux socket".to_string()));
+            let mut runtime = ObservationRuntime::new(
+                config,
+                storage,
+                Arc::new(RwLock::new(PatternEngine::new())),
+            )
+            .with_wezterm_handle(mock)
+            .with_snapshot_config(snapshot_config);
+
+            let handle = runtime.start().await.expect("runtime should start");
+            let summary = handle.shutdown_with_summary().await;
+            assert!(
+                summary.is_clean(),
+                "an idle runtime with no reachable backend stops cleanly: {:?}",
+                summary.warnings
+            );
+            let connection = rusqlite::Connection::open(&db_path).unwrap();
+            let empty_shutdown_checkpoints: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM session_checkpoints WHERE checkpoint_type = 'shutdown' AND pane_count = 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(empty_shutdown_checkpoints, 1);
         });
     }
 

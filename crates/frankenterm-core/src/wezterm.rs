@@ -10874,6 +10874,9 @@ pub struct MockWezterm {
     tiered_scrollback_legacy_calls: AtomicU64,
     #[cfg(test)]
     tiered_scrollback_cancel_after_bulk_calls: AtomicU64,
+    /// When set, pane listing fails like an unreachable backend.
+    #[cfg(test)]
+    list_panes_error: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Default)]
@@ -11030,7 +11033,37 @@ impl MockWezterm {
             tiered_scrollback_legacy_calls: AtomicU64::new(0),
             #[cfg(test)]
             tiered_scrollback_cancel_after_bulk_calls: AtomicU64::new(0),
+            #[cfg(test)]
+            list_panes_error: Mutex::new(None),
         }
+    }
+
+    /// Make pane listing fail (or succeed again) like an unreachable backend.
+    #[cfg(test)]
+    pub fn set_list_panes_error(&self, error: Option<String>) {
+        *self
+            .list_panes_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = error;
+    }
+
+    #[cfg(test)]
+    fn injected_list_panes_error(&self) -> crate::Result<()> {
+        match self
+            .list_panes_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            Some(error) => Err(WeztermError::CommandFailed(error).into()),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(not(test))]
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+    fn injected_list_panes_error(&self) -> crate::Result<()> {
+        Ok(())
     }
 
     #[cfg(test)]
@@ -11380,6 +11413,7 @@ impl Default for MockWezterm {
 impl WeztermInterface for MockWezterm {
     fn list_panes(&self) -> WeztermFuture<'_, Vec<PaneInfo>> {
         Box::pin(async move {
+            self.injected_list_panes_error()?;
             let panes = self.panes.read().await;
             Ok(panes.values().map(MockPane::to_pane_info).collect())
         })
@@ -11583,6 +11617,7 @@ impl WeztermInterface for MockWezterm {
 
     fn list_panes_with_cx<'a>(&'a self, cx: &'a crate::cx::Cx) -> WeztermFuture<'a, Vec<PaneInfo>> {
         Box::pin(async move {
+            self.injected_list_panes_error()?;
             let panes = self
                 .panes
                 .read_with_cx(cx)
