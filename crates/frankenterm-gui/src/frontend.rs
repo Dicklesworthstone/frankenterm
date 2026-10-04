@@ -1063,7 +1063,25 @@ impl GuiFrontEnd {
                             let Some(fe) = crate::frontend::try_front_end() else {
                                 return;
                             };
-                            if let Some(window) = fe.known_windows.borrow().keys().next() {
+                            // Route the assignment to the window that shows the
+                            // pane that emitted OSC 52; with 2+ windows "any
+                            // window" made an unrelated window own the clipboard.
+                            // A pane no GUI window shows (e.g. another workspace)
+                            // falls back to any window rather than dropping the
+                            // request (upstream WezTerm 016b96272).
+                            let target_window = {
+                                let windows = fe.known_windows.borrow();
+                                Mux::try_get()
+                                    .and_then(|mux| mux.resolve_pane_id(pane_id))
+                                    .and_then(|(_domain, mux_window_id, _tab_id)| {
+                                        windows
+                                            .iter()
+                                            .find(|(_window, id)| **id == mux_window_id)
+                                            .map(|(window, _id)| window.clone())
+                                    })
+                                    .or_else(|| windows.keys().next().cloned())
+                            };
+                            if let Some(window) = target_window.as_ref() {
                                 window.set_clipboard(
                                     match selection {
                                         ClipboardSelection::Clipboard => Clipboard::Clipboard,
