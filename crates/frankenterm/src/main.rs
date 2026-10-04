@@ -77323,8 +77323,14 @@ fn tx_run_probes_terminal_backend(
     kill_switch: frankenterm_core::plan::MissionKillSwitchLevel,
     paused: bool,
 ) -> bool {
+    // A contract already in a terminal state (committed, compensated, rolled
+    // back) replays from its ledger or is refused: a rerun dispatches nothing,
+    // so an unreachable terminal must not fail it either. Skipping the probe
+    // never risks an effect: a step that does dispatch still fails at send
+    // time without a terminal.
     kill_switch == frankenterm_core::plan::MissionKillSwitchLevel::Off
         && !paused
+        && !contract.lifecycle_state.is_terminal()
         && tx_run_requires_terminal_backend(contract)
 }
 
@@ -104163,6 +104169,24 @@ mod tests {
             K::HardStop,
             false
         ));
+        // A rerun of a settled-terminal contract dispatches nothing either;
+        // a Failed one may still compensate, so it keeps the probe.
+        use frankenterm_core::plan::MissionTxState as S;
+        for (state, probes) in [
+            (S::Committed, false),
+            (S::Compensated, false),
+            (S::RolledBack, false),
+            (S::Failed, true),
+            (S::Prepared, true),
+        ] {
+            let mut contract = sample_robot_tx_contract();
+            contract.lifecycle_state = state;
+            assert_eq!(
+                tx_run_probes_terminal_backend(&contract, K::Off, false),
+                probes,
+                "{state:?}"
+            );
+        }
     }
 
     #[test]
