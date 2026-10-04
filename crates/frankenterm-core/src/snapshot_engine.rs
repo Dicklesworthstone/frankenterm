@@ -3003,6 +3003,18 @@ impl SnapshotError {
         }
     }
 
+    /// What an operator should do about this failure, when it is not
+    /// transient. A latched reconciliation persists for the life of the
+    /// process (ft-28hba): snapshots and retention stay paused until the
+    /// watcher restarts and rebuilds authority from durable state.
+    fn operator_remediation(&self) -> &'static str {
+        if self.requires_reconciliation() {
+            "snapshots and retention are paused until reconciliation; restart the watcher (ft stop && ft watch)"
+        } else {
+            ""
+        }
+    }
+
     /// Whether the engine must reconcile durable state before another snapshot
     /// authority mutation can be attempted safely.
     #[must_use]
@@ -3451,6 +3463,8 @@ struct SnapshotAuthorityState {
     reconciliation_required: AtomicBool,
     session_cleanup_reconciliation_required: AtomicBool,
     first_latched_operation: AtomicU8,
+    /// Whether the latched pause of session retention has been reported.
+    cleanup_pause_reported: AtomicBool,
     /// Shared monotonic checkpoint-retention schedule. This prevents multiple
     /// engines for one database from each running the same full scan after a
     /// capture.
@@ -3479,6 +3493,7 @@ impl SnapshotAuthorityState {
             reconciliation_required: AtomicBool::new(false),
             session_cleanup_reconciliation_required: AtomicBool::new(false),
             first_latched_operation: AtomicU8::new(0),
+            cleanup_pause_reported: AtomicBool::new(false),
             checkpoint_cleanup_cadence: StdMutex::new(CheckpointCleanupCadence::new()),
         }
     }
@@ -5552,6 +5567,7 @@ impl SnapshotEngine {
                     tracing::warn!(
                         trigger = ?trigger,
                         error_class = e.diagnostic_class(),
+                        remediation = e.operator_remediation(),
                         "snapshot capture failed"
                     );
                     false
@@ -5695,6 +5711,7 @@ impl SnapshotEngine {
                     tracing::warn!(
                         trigger = ?trigger,
                         error_class = e.diagnostic_class(),
+                        remediation = e.operator_remediation(),
                         "snapshot capture failed"
                     );
                     Err(e)
@@ -6256,6 +6273,7 @@ impl SnapshotEngine {
         schedule: &mut SessionCleanupSchedule,
     ) {
         if self.authority_reconciliation_is_required() {
+            self.report_latched_cleanup_pause();
             return;
         }
         let interval_hours = self.config.session_retention.cleanup_interval_hours;
@@ -6270,6 +6288,8 @@ impl SnapshotEngine {
                     retry_delay_seconds = SESSION_CLEANUP_RETRY_DELAY.as_secs(),
                     "Session retention cleanup admission is busy; retry deferred"
                 );
+            } else {
+                self.report_latched_cleanup_pause();
             }
             return;
         };
@@ -6355,6 +6375,24 @@ impl SnapshotEngine {
             }
         }
         drop(cleanup_attempt);
+    }
+
+    /// A latched reconciliation used to stop session retention silently for
+    /// the rest of the process (ft-28hba). Report it once; the latch is
+    /// permanent for this process, and cadence state stays untouched.
+    fn report_latched_cleanup_pause(&self) {
+        if self
+            .snapshot_authority
+            .cleanup_pause_reported
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        tracing::warn!(
+            first_indeterminate_operation = ?self.snapshot_authority.first_latched_operation(),
+            remediation = "restart the watcher (ft stop && ft watch) to rebuild snapshot authority from durable state",
+            "Session retention cleanup is paused: snapshot authority needs reconciliation"
+        );
     }
 
     /// Acquire exclusive authority for an automatic cleanup attempt. A second
@@ -16758,6 +16796,20 @@ mod tests {
                 restarted_scheduler_schedule,
                 SessionCleanupSchedule::default(),
                 "the sticky latch must stop cleanup before cadence state changes"
+            );
+            // ft-28hba: the paused retention is reported (once), not silent.
+            assert!(
+                engine
+                    .snapshot_authority
+                    .cleanup_pause_reported
+                    .load(Ordering::Acquire)
+            );
+            engine
+                .maybe_run_session_cleanup(&cx, &mut restarted_scheduler_schedule)
+                .await;
+            assert_eq!(
+                restarted_scheduler_schedule,
+                SessionCleanupSchedule::default()
             );
         });
     }
