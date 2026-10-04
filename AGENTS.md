@@ -279,7 +279,11 @@ deliberately.
    Report unrelated workspace or system-package blockers separately from the
    backport result.
 10. Update provenance/backport notes at the end of the batch so the next weekly
-    pass knows which upstream SHAs were accepted, skipped, or deferred.
+    pass knows which upstream SHAs were accepted, skipped, or deferred: add a
+    `### Batch YYYY-MM-DD: upstream <from>..<to>` table to the "Upstream
+    Backport Ledger" in `frankenterm/PROVENANCE.md`. The next batch starts from
+    the previous `<to>`. `scripts/check-upstream-backport-due.sh` reports when
+    the last batch is older than 14 days.
 
 Good backports should feel like FrankenTerm-native fixes with traceable upstream
 provenance, not like a partial re-import of WezTerm.

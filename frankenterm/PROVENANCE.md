@@ -26,6 +26,27 @@ compatibility is explicitly not maintained.
 | ------------ | ---- | ----------- | ----------- | ----- |
 | `577474d89ee61aef4a48145cdec82a638d874751` | 2026-03-31 | accepted | `scripts/cargo-local.sh test -p frankenterm-term checksum_rectangular_area --lib`; `scripts/cargo-local.sh check -p config --lib` | Disabled DECRQCRA checksum replies by default to prevent silent screen scraping; preserved opt-in config behavior. |
 
+### Batch 2026-10-03: upstream `577474d89..cab251610` (148 commits)
+
+| Upstream SHA | Disposition | Notes |
+| ------------ | ----------- | ----- |
+| `86d223ec8` | accepted | escape-parser: copy Kitty shared memory out through raw pointers instead of a `&[u8]` over memory another process may write (aliasing UB). Windows-only path. |
+| `fe3006aef` | accepted | term: RIS also clears modifyOtherKeys, DECLRMM and bidi overrides (recovery after a TUI exits uncleanly). |
+| `aea9b9f2e` | accepted | input-types: kitty DISAMBIGUATE_ESCAPE_CODES sends ESC as `\x1b[27;1u`, not a raw byte. |
+| `cab251610` | accepted | escape-parser: `;` inside an OSC 8 URI is kept (joined into a zeroizing buffer; re-emission still percent-encodes `;`). |
+| `e46fe38c5` | accepted | mux tmux -CC: `send-keys -H` so UTF-8 bytes are not read as code points. |
+| `2bd22e73f` | accepted | mux tmux -CC: send-keys ends with LF like every other control command. |
+| `eeb809729` | accepted | config: WSL detection is case-insensitive and also checks the kernel release (WSL2). |
+| `016b96272` | accepted | gui: OSC 52 clipboard assignment goes to the window that shows the pane. |
+| `d6e185978` | already-equivalent | term image placement already refuses zero cell-pixel and zero draw dimensions. |
+| `b1cc82bb5` | already-equivalent | mux pane search already stops on a fancy-regex error. |
+| `29d01fc8e` | already-equivalent | procinfo build_proc already carries an ancestry set on all three platforms. |
+| `b09b56c29` | already-equivalent | tmux PTY writers already return the accepted length. |
+| `4af230bc0` | already-equivalent | serde_with is already 3.x. |
+| `d9dc7f513` | accepted | gui: removal of (or a stale) subscribed mux window id no longer retires the pane-output subscription, so a window that workspace reconcile repurposes keeps repainting. Teardown stays with the GuiMuxSubscription drop; the synchronous WindowTopologyChanged/WindowRemoved retirement was adapted the same way. |
+| `76b606ec5` | skipped | shell integration: our script does not reference `ZSH_NAME`. |
+| remainder | skipped | docs, CI, nix/flatpak packaging, upstream dependency cooldown bumps, winapi -> windows-sys refactors, lint-only cleanups, and new features (smart-case search, fancy tab bar, command-palette line height, ClearLine, dictation) that are not fixes. |
+
 ## Per-crate classification (ft-zoxxq.5)
 
 Columns:
