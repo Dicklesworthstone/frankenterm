@@ -1061,6 +1061,9 @@ fn ensure_pane_arena_append_order_is_sound(
                 );
             }
         }
+        // `get_tab` takes `mux.tabs`; holding this `mux.windows` read guard
+        // across it would invert the mux's tabs-then-windows lock order.
+        drop(window);
 
         for remote_tab_id in &desired_remote_tabs {
             let Some(local_tab_id) = remote_to_local_tab.get(remote_tab_id).copied() else {
@@ -2274,6 +2277,51 @@ fn workspace_for_spawn_window(mux: &Mux, window_id: WindowId) -> String {
     mux.get_window(window_id)
         .map(|window| window.get_workspace().to_string())
         .unwrap_or_else(|| mux.active_workspace())
+}
+
+/// Drop the local mirror of each tab the server has closed: every pane is a
+/// dead `ClientPane` of this attachment (the server sent `PaneRemoved`) and
+/// the snapshot lists none of their remote tabs. The `PaneRemoved` handler
+/// normally prunes such a tab, but that prune is skipped while any mux
+/// `Activity` is live. Requiring `is_dead` keeps a tab this client spawned
+/// after the snapshot was taken. No `KillPane` is sent: the server already
+/// closed these tabs.
+fn drop_local_tabs_closed_on_server(
+    mux: &Mux,
+    inner: &ClientInner,
+    listed_remote_tabs: &HashMap<TabId, WindowId>,
+) {
+    let mut closed = Vec::new();
+    for window_id in mux.iter_windows() {
+        // Collect under the window read guard and release it before removal,
+        // which takes the windows write lock.
+        let Some(window) = mux.get_window(window_id) else {
+            continue;
+        };
+        for tab in window.iter() {
+            let panes = tab.iter_all_panes();
+            let server_closed = !panes.is_empty()
+                && panes.iter().all(|pane| {
+                    pane.downcast_ref::<ClientPane>()
+                        .is_some_and(|client_pane| {
+                            client_pane.belongs_to_client(inner)
+                                && !listed_remote_tabs.contains_key(&client_pane.remote_tab_id)
+                                && client_pane.is_dead()
+                        })
+                });
+            if server_closed {
+                closed.push(Arc::clone(tab));
+            }
+        }
+    }
+    for tab in closed {
+        log::debug!(
+            "domain {}: dropping local tab {} closed on the server",
+            inner.local_domain_id,
+            tab.tab_id()
+        );
+        mux.remove_tab_local_only_if_same(&tab);
+    }
 }
 
 fn client_inner_is_current(
@@ -4447,6 +4495,10 @@ impl ClientDomain {
                 .try_reserve_exact(authoritative_panes_by_remote.len())
                 .context("reserve authoritative local pane set")?;
             authoritative_panes.extend(authoritative_panes_by_remote.into_values());
+
+            // Reconciliation refuses a tiled pane of this domain that the
+            // snapshot does not name, which would retire the transport.
+            drop_local_tabs_closed_on_server(mux, &inner, &remote_tab_owners);
 
             let reconcile_receipt = mux
                 .reconcile_domain_floating_panes(
@@ -6984,6 +7036,102 @@ mod tests {
         assert!(mux.get_pane(local_float_id).is_none());
         assert_eq!(inner.remote_to_local_pane_id(&mux, 62), None);
         assert_eq!(mux.iter_panes().len(), 1);
+    }
+
+    /// Attach remote tabs 51 (pane 61) and 52 (pane 62) in remote window 41.
+    fn attach_two_remote_tabs(mux: &Arc<Mux>, inner: &Arc<ClientInner>) {
+        let mut two_tabs = sample_remote_tab_listing();
+        let PaneNode::Leaf(mut second) = two_tabs.tabs[0].clone() else {
+            panic!("sample remote tab must contain one pane leaf");
+        };
+        second.tab_id = 52;
+        second.pane_id = 62;
+        two_tabs.tabs.push(PaneNode::Leaf(second));
+        two_tabs.tab_titles.push("second tab".to_string());
+        ClientDomain::process_pane_list(mux, Arc::clone(inner), two_tabs, None)
+            .expect("two-tab topology should attach");
+        assert_eq!(mux.iter_panes().len(), 2);
+    }
+
+    #[test]
+    fn snapshot_drops_a_tab_the_server_closed_and_keeps_the_window() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_031);
+        let _domain = register_test_client_domain(&mux, &inner);
+        attach_two_remote_tabs(&mux, &inner);
+        let window_id = inner
+            .remote_to_local_window(41)
+            .expect("remote window should map locally");
+        let closed_tab_id = inner
+            .remote_to_local_tab_id(52)
+            .expect("second remote tab should map locally");
+
+        // PaneRemoved marked the pane dead, but its prune was skipped because
+        // a mux Activity was live, so the tab is still attached locally.
+        let closed_pane = mux
+            .get_pane(
+                inner
+                    .remote_to_local_pane_id(&mux, 62)
+                    .expect("remote pane 62 should map locally"),
+            )
+            .expect("closed pane is still registered");
+        closed_pane
+            .downcast_ref::<ClientPane>()
+            .expect("client pane")
+            .renderable
+            .lock()
+            .inner
+            .borrow_mut()
+            .dead = true;
+        drop(closed_pane);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("a snapshot without a server-closed tab must apply, not retire the attachment");
+
+        assert!(mux.get_tab(closed_tab_id).is_none());
+        assert_eq!(inner.remote_to_local_tab_id(52), None);
+        assert_eq!(mux.iter_windows(), vec![window_id]);
+        let surviving_tab_id = inner
+            .remote_to_local_tab_id(51)
+            .expect("surviving remote tab should stay mapped");
+        assert_eq!(
+            mux.get_window(window_id)
+                .expect("window should survive")
+                .iter()
+                .map(|tab| tab.tab_id())
+                .collect::<Vec<_>>(),
+            vec![surviving_tab_id]
+        );
+    }
+
+    #[test]
+    fn snapshot_missing_a_live_tab_still_rejects_without_dropping_it() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_032);
+        let _domain = register_test_client_domain(&mux, &inner);
+        attach_two_remote_tabs(&mux, &inner);
+        let live_tab_id = inner
+            .remote_to_local_tab_id(52)
+            .expect("second remote tab should map locally");
+
+        // A snapshot that predates a tab is not evidence the server closed it.
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect_err("an unlisted live tab must not be silently dropped");
+        assert!(mux.get_tab(live_tab_id).is_some());
     }
 
     #[test]

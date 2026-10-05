@@ -4132,6 +4132,9 @@ fn filedescriptor_error_into_io(error: filedescriptor::Error) -> std::io::Error 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PaneRemovalFollowUp {
     None,
+    /// Prune once the retired generation has no operation leases left: a live
+    /// lease keeps the retired pane in its tab, so an earlier prune is a no-op.
+    PruneDeadWindows,
     PruneDeadWindowsIgnoringActivity,
 }
 
@@ -11708,7 +11711,7 @@ fn finish_pane_reader_eof(
     pane_id: PaneId,
     exit_behavior: ExitBehavior,
 ) {
-    let Some(_operation) = generation.try_acquire() else {
+    let Some(operation) = generation.try_acquire() else {
         return;
     };
     let Some(expected) = pane.upgrade() else {
@@ -11718,16 +11721,21 @@ fn finish_pane_reader_eof(
         return;
     };
 
-    match exit_behavior {
-        ExitBehavior::Hold | ExitBehavior::CloseOnCleanExit => {
-            log::trace!("checking for dead windows after EOF on pane {}", pane_id);
-            mux.prune_dead_windows();
-        }
-        ExitBehavior::Close => {
-            mux.remove_pane_if_same_generation(pane_id, &expected, generation);
-            mux.prune_dead_windows();
-        }
+    if exit_behavior == ExitBehavior::Close {
+        // The removal notification prunes again once the last lease on this
+        // generation drops, covering a lease another operation still holds.
+        mux.remove_pane_with_follow_up(
+            pane_id,
+            &expected,
+            generation,
+            PaneRemovalFollowUp::PruneDeadWindows,
+        );
     }
+    // A live lease keeps a retired pane in its tab, so pruning under our own
+    // lease would leave the dead pane's tab open with nothing behind it.
+    drop(operation);
+    log::trace!("checking for dead windows after EOF on pane {}", pane_id);
+    mux.prune_dead_windows();
 }
 
 fn schedule_pane_reader_eof(
@@ -14980,14 +14988,16 @@ impl Mux {
                         reader_start_gate.release_if_registered(self);
                     }
                     if let Some(pane_id) = removed_pane_id {
-                        if removal_follow_up
-                            == PaneRemovalFollowUp::PruneDeadWindowsIgnoringActivity
-                        {
-                            // The exact retired generation remains fenced while
-                            // pruning. No same-ID publication can race the
-                            // topology sweep between Pane::kill and removal of
-                            // its now-dead tab/window.
-                            self.prune_dead_windows_ignoring_activity();
+                        // The exact retired generation remains fenced while
+                        // pruning. No same-ID publication can race the
+                        // topology sweep between Pane::kill and removal of
+                        // its now-dead tab/window.
+                        match removal_follow_up {
+                            PaneRemovalFollowUp::None => {}
+                            PaneRemovalFollowUp::PruneDeadWindows => self.prune_dead_windows(),
+                            PaneRemovalFollowUp::PruneDeadWindowsIgnoringActivity => {
+                                self.prune_dead_windows_ignoring_activity();
+                            }
                         }
                         // The removal queue entry owns the retirement fence. A
                         // caller may complete a ticket reentrantly while an
@@ -17575,19 +17585,27 @@ impl Mux {
         }
     }
 
+    #[cfg(test)]
     fn remove_pane_if_same_generation(
         &self,
         pane_id: PaneId,
         expected: &Arc<dyn Pane>,
         generation: &Arc<PaneRegistrationGeneration>,
     ) {
+        self.remove_pane_with_follow_up(pane_id, expected, generation, PaneRemovalFollowUp::None);
+    }
+
+    fn remove_pane_with_follow_up(
+        &self,
+        pane_id: PaneId,
+        expected: &Arc<dyn Pane>,
+        generation: &Arc<PaneRegistrationGeneration>,
+        follow_up: PaneRemovalFollowUp,
+    ) {
         log::debug!("removing exact pane registration generation {}", pane_id);
-        if let Some(removed) = self.take_pane_for_removal(
-            pane_id,
-            Some(expected),
-            Some(generation),
-            PaneRemovalFollowUp::None,
-        ) {
+        if let Some(removed) =
+            self.take_pane_for_removal(pane_id, Some(expected), Some(generation), follow_up)
+        {
             self.finish_pane_removal(removed, true);
         }
     }
@@ -31011,6 +31029,102 @@ mod tests {
 
         executor.run_until(Duration::from_secs(30), || removed_rx.try_recv().is_ok());
         assert!(mux.get_pane(122).is_none());
+        Mux::shutdown();
+    }
+
+    /// Reader that blocks until the test releases it, then reports EOF.
+    struct GatedEofReader(std::sync::mpsc::Receiver<()>);
+
+    impl std::io::Read for GatedEofReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            let _ = self.0.recv();
+            Ok(0)
+        }
+    }
+
+    fn wait_for_tab_removal(mux: &Mux, tab_id: TabId) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while mux.get_tab(tab_id).is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        mux.get_tab(tab_id).is_none()
+    }
+
+    #[test]
+    fn pane_reader_eof_with_close_removes_its_tab_and_window() {
+        let guard = global_test_lock();
+        Mux::shutdown();
+        let mux = Arc::new(Mux::new(None));
+        let (release_eof, gate) = std::sync::mpsc::channel();
+        let (pane, _) = KillCountingPane::new_with_reader(
+            224,
+            test_size(),
+            Some(Box::new(GatedEofReader(gate))),
+            false,
+        );
+        let (tab, window_id) = register_attached_test_pane(&guard, &mux, &pane);
+        let tab_id = tab.tab_id();
+        drop(tab);
+        assert_eq!(Activity::count_for_mux(&mux), 0);
+
+        // With no activity live, the EOF finalization's own prune is the only
+        // one that runs, so it must not be fenced by the EOF path's lease.
+        release_eof.send(()).expect("reader waits for EOF");
+        assert!(
+            wait_for_tab_removal(&mux, tab_id),
+            "an exited pane's tab must close, not linger with no pane behind it"
+        );
+        assert!(mux.get_pane(224).is_none());
+        assert!(mux.get_window(window_id).is_none());
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn pane_reader_eof_under_another_lease_closes_the_tab_when_the_lease_drops() {
+        let guard = global_test_lock();
+        Mux::shutdown();
+        let mux = Arc::new(Mux::new(None));
+        let (release_eof, gate) = std::sync::mpsc::channel();
+        let (pane, _) = KillCountingPane::new_with_reader(
+            225,
+            test_size(),
+            Some(Box::new(GatedEofReader(gate))),
+            false,
+        );
+        let (tab, window_id) = register_attached_test_pane(&guard, &mux, &pane);
+        let tab_id = tab.tab_id();
+        drop(tab);
+        let generation = Arc::clone(
+            &mux.panes
+                .read()
+                .get(&225)
+                .expect("pane generation is live")
+                .generation,
+        );
+        let other_operation = generation
+            .try_acquire()
+            .expect("live generation admits an operation");
+
+        release_eof.send(()).expect("reader waits for EOF");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while mux.get_pane(225).is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            mux.get_pane(225).is_none(),
+            "EOF with Close retires the pane"
+        );
+        assert!(
+            mux.get_tab(tab_id).is_some(),
+            "a live lease keeps the retired pane in its tab"
+        );
+
+        drop(other_operation);
+        assert!(
+            wait_for_tab_removal(&mux, tab_id),
+            "dropping the last lease must close the exited pane's tab"
+        );
+        assert!(mux.get_window(window_id).is_none());
         Mux::shutdown();
     }
 

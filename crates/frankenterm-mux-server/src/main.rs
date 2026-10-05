@@ -280,6 +280,10 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
         *generation_lifetime = Some(lease);
     }
 
+    // Expose `wezterm.mux` before the config's Lua context is first built so
+    // a `mux-startup` handler can spawn windows and tabs, as in the GUI.
+    config::lua::add_context_setup_func(mux_lua::register);
+
     config::common_init(
         opts.config_file.as_ref(),
         &opts.config_override,
