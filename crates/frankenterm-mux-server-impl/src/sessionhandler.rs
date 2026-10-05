@@ -18653,7 +18653,7 @@ mod tests {
     }
 
     #[test]
-    fn pdu86_remains_dormant_under_runtime_capabilities_and_preserves_serial() {
+    fn pdu86_returns_snapshot_under_runtime_capabilities_and_preserves_serial() {
         let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
@@ -18682,14 +18682,141 @@ mod tests {
         };
         response
             .validate_for_request(&request)
-            .expect("dormant unsupported PDU87 must remain request-correlated");
+            .expect("runtime PDU87 must remain request-correlated");
         assert_eq!(response.stream_id, stream_id);
+        assert_eq!(response.negotiated, TopologyCapabilities::SERVER_SUPPORTED);
         assert!(matches!(
             response.outcome,
-            codec::ListPanesOrderedV1Outcome::Unsupported {
-                supported: TopologyCapabilities::SERVER_SUPPORTED
-            }
+            codec::ListPanesOrderedV1Outcome::Snapshot(_)
         ));
+    }
+
+    #[test]
+    fn runtime_pdu86_then_pdu88_applies_and_list_panes_shows_new_tab_order() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let first_tab = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(7_801, None)));
+        let second_tab = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(7_802, None)));
+        let window_id = attach_snapshot_tab_to_new_window(&mux, &first_tab);
+        mux.add_tab_to_window(&second_tab, window_id)
+            .expect("second test tab attaches to reorder window");
+        let stream_id = TopologyStreamId::from_bytes([0x8a; 16]);
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_session_with_topology_stream(
+            sender,
+            SessionOwner::new(Arc::clone(&mux)),
+            stream_id,
+        )
+        .unwrap();
+
+        let snapshot_request = ordered_snapshot_request(true);
+        handler.process_one(DecodedPdu {
+            serial: 186,
+            pdu: Pdu::ListPanesOrderedV1(snapshot_request.clone()),
+        });
+        tick_until_response(&executor, &captured, 1);
+        let Pdu::ListPanesOrderedV1Response(snapshot_response) = take_response(&captured).pdu
+        else {
+            panic!("expected a typed PDU87 response");
+        };
+        snapshot_response
+            .validate_for_request(&snapshot_request)
+            .expect("runtime PDU87 must remain request-correlated");
+        assert_eq!(
+            snapshot_response.negotiated,
+            TopologyCapabilities::SERVER_SUPPORTED
+        );
+        let codec::ListPanesOrderedV1Outcome::Snapshot(snapshot) = snapshot_response.outcome else {
+            panic!(
+                "expected an ordered snapshot, got {:?}",
+                snapshot_response.outcome
+            );
+        };
+        let [window] = snapshot.ordered_windows.as_slice() else {
+            panic!("expected exactly one ordered window");
+        };
+        let remote_tab = |tab: &Arc<mux::tab::Tab>| {
+            codec::RemoteTabId::new(u64::try_from(tab.tab_id()).expect("test tab id fits u64"))
+        };
+        assert_eq!(
+            window.ordered_tab_ids,
+            vec![remote_tab(&first_tab), remote_tab(&second_tab)]
+        );
+
+        // Build PDU88 only from what the client saw in PDU87.
+        let reorder = codec::ReorderWindowTabsV1 {
+            protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
+            domain_binding_id: snapshot_request.domain_binding_id,
+            stream_id: snapshot_response.stream_id,
+            session_incarnation: snapshot.session_incarnation,
+            window_id: window.window_id,
+            expected_order_revision: window.order_revision,
+            desired_tab_ids: vec![remote_tab(&second_tab), remote_tab(&first_tab)],
+            desired_active_tab_id: window.active_tab_id,
+            mutation_id: codec::WindowOrderMutationId::new([0x8b; 16], 1),
+            digest: codec::WindowReorderDigest::ZERO,
+        }
+        .with_computed_digest();
+        reorder
+            .validate()
+            .expect("client-built PDU88 must be valid");
+        // Dispatch mints this proof from the PDU87 it just published.
+        let authority = established_ordered_window_authority_for_test(
+            snapshot_response.stream_id,
+            snapshot.session_incarnation,
+            snapshot_request.domain_binding_id,
+            snapshot_response.negotiated,
+        );
+        handler.process_one_with_dispatch_authority(
+            DecodedPdu {
+                serial: 188,
+                pdu: Pdu::ReorderWindowTabsV1(reorder.clone()),
+            },
+            Some(authority),
+            None,
+        );
+        tick_until_response(&executor, &captured, 1);
+        let response = take_response(&captured);
+        assert_eq!(response.serial, 188);
+        let Pdu::ReorderWindowTabsV1Response(response) = response.pdu else {
+            panic!("expected a typed PDU89 response, got {:?}", response.pdu);
+        };
+        response.validate().expect("PDU89 must be valid");
+        assert_eq!(response.stream_id, stream_id);
+        assert_eq!(response.session_incarnation, snapshot.session_incarnation);
+        assert_eq!(response.mutation_id, reorder.mutation_id);
+        assert_eq!(response.request_digest, reorder.digest);
+        let codec::ReorderWindowTabsV1Outcome::Applied(commit) = &response.outcome else {
+            panic!("expected applied reorder, got {:?}", response.outcome);
+        };
+        assert_eq!(commit.window.window_id, window.window_id);
+        assert_eq!(
+            commit.window.ordered_tab_ids,
+            vec![remote_tab(&second_tab), remote_tab(&first_tab)]
+        );
+        assert!(commit.window.order_revision > window.order_revision);
+
+        // The legacy listing that `cli list` reads follows the committed order.
+        let listing =
+            block_on(collect_list_panes_snapshot(&mux)).expect("collect legacy pane snapshot");
+        let listed_tab_ids = listing
+            .tabs
+            .iter()
+            .map(|tree| match tree {
+                mux::tab::PaneNode::Leaf(entry) => {
+                    assert_eq!(entry.window_id, window_id);
+                    entry.tab_id
+                }
+                other => panic!("single-pane test tab must list as a leaf, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listed_tab_ids,
+            vec![second_tab.tab_id(), first_tab.tab_id()]
+        );
     }
 
     #[test]
@@ -19518,7 +19645,7 @@ mod tests {
     }
 
     #[test]
-    fn ordered_window_request_returns_typed_unsupported_until_live_capability_activation() {
+    fn ordered_window_request_without_reorder_returns_snapshot_under_runtime_capabilities() {
         let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
@@ -19548,15 +19675,17 @@ mod tests {
             Pdu::ListPanesOrderedV1Response(response) => {
                 response
                     .validate_for_request(&request)
-                    .expect("dormant ordered response must remain request-correlated");
+                    .expect("ordered response must remain request-correlated");
+                assert_eq!(
+                    response.negotiated, required,
+                    "a client that offers no reorder CAS must not be granted it"
+                );
                 assert!(matches!(
                     response.outcome,
-                    codec::ListPanesOrderedV1Outcome::Unsupported {
-                        supported: TopologyCapabilities::SERVER_SUPPORTED
-                    }
+                    codec::ListPanesOrderedV1Outcome::Snapshot(_)
                 ));
             }
-            other => panic!("expected typed PDU87 Unsupported, got {other:?}"),
+            other => panic!("expected typed PDU87 Snapshot, got {other:?}"),
         }
     }
 

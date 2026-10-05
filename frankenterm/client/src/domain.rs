@@ -2,6 +2,10 @@ use crate::client::{
     with_mux_rpc_bootstrap_timeout, Client, RpcConsumerKind, RpcGenerationAbortGuard,
     RpcGenerationScope, RpcTopologySnapshot,
 };
+use crate::ordered_reorder::{
+    commit_window_order, DesiredWindowOrder, MutationNamespace, OrderedReorderLane,
+    WindowOrderCommitOutcome, WindowOrderIntent,
+};
 use crate::pane::{ClientPane, ClientResizeCoordinator, QueuedResizeIntent, ReliableInputQueue};
 use anyhow::{anyhow, bail, ensure, Context};
 use async_trait::async_trait;
@@ -239,6 +243,8 @@ pub struct ClientInner {
     pub(crate) resize_coordinator: Arc<ClientResizeCoordinator>,
     pub(crate) fetch_retry_coordinator: Arc<crate::pane::FetchRetryCoordinator>,
     pending_window_titles: Mutex<HashMap<(WindowId, WindowId), Arc<AtomicBool>>>,
+    pending_window_orders: Mutex<HashMap<WindowId, Arc<AtomicBool>>>,
+    order_lane: Mutex<Option<Arc<OrderLane>>>,
     topology_session: Mutex<ClientTopologySessionState>,
     layout_tab_owners: Mutex<HashMap<TabId, WindowId>>,
     layout_snapshot: Mutex<Option<Arc<RemoteLayoutSnapshot>>>,
@@ -444,6 +450,135 @@ impl Drop for PendingWindowTitle {
             .is_some_and(|dirty| Arc::ptr_eq(dirty, &self.dirty))
         {
             pending.remove(&self.window_mapping);
+        }
+    }
+}
+
+/// Owns one local window's pending tab-order commit. A GUI move during the
+/// commit marks the same entry dirty, and the task makes another pass.
+struct PendingWindowOrder {
+    inner: Arc<ClientInner>,
+    local_window_id: WindowId,
+    dirty: Arc<AtomicBool>,
+}
+
+impl PendingWindowOrder {
+    fn begin_update(&self) {
+        // Clear before reading the local order. A move before this cut is in
+        // that read; one after it requests another pass.
+        self.dirty.store(false, Ordering::Release);
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+
+    fn finish_if_clean(&self) -> bool {
+        let mut pending =
+            lock_or_recover(&self.inner.pending_window_orders, "pending_window_orders");
+        if self.dirty.load(Ordering::Acquire) {
+            return false;
+        }
+        if pending
+            .get(&self.local_window_id)
+            .is_some_and(|dirty| Arc::ptr_eq(dirty, &self.dirty))
+        {
+            pending.remove(&self.local_window_id);
+        }
+        true
+    }
+}
+
+impl Drop for PendingWindowOrder {
+    fn drop(&mut self) {
+        let mut pending =
+            lock_or_recover(&self.inner.pending_window_orders, "pending_window_orders");
+        if pending
+            .get(&self.local_window_id)
+            .is_some_and(|dirty| Arc::ptr_eq(dirty, &self.dirty))
+        {
+            pending.remove(&self.local_window_id);
+        }
+    }
+}
+
+/// A side connection to the same unix mux socket that only commits tab
+/// orders. It is a request-only client, so the ordered-window protocol stays
+/// off the attachment's main connection (a PDU81 resync there would end an
+/// ordered stream). Connected on first use, and replaced after a fault.
+struct OrderLane {
+    unix: UnixDomain,
+    binding: codec::DomainBindingId,
+    namespace: MutationNamespace,
+    client: Mutex<Option<Arc<Client>>>,
+}
+
+impl OrderLane {
+    fn new(unix: UnixDomain, binding: codec::DomainBindingId) -> anyhow::Result<Self> {
+        Ok(Self {
+            unix,
+            binding,
+            namespace: MutationNamespace::random()?,
+            client: Mutex::new(None),
+        })
+    }
+
+    async fn connected(&self) -> anyhow::Result<Arc<Client>> {
+        if let Some(client) = lock_or_recover(&self.client, "order_lane_client").clone() {
+            return Ok(client);
+        }
+        let unix = self.unix.clone();
+        let client = spawn_into_new_thread(move || {
+            let mut ui = ConnectionUI::new_headless();
+            // Never start a server for a reorder: the attachment's own
+            // connection already proved one is running.
+            let no_auto_start = true;
+            Client::new_unix_domain_request_only(&unix, &mut ui, no_auto_start)
+        })
+        .await
+        .context("connect the tab-order lane")?;
+        client
+            .verify_version_compat(&ConnectionUI::new_headless())
+            .await
+            .context("negotiate the tab-order lane protocol")?;
+        let client = Arc::new(client);
+        *lock_or_recover(&self.client, "order_lane_client") = Some(Arc::clone(&client));
+        Ok(client)
+    }
+}
+
+#[async_trait]
+impl OrderedReorderLane for OrderLane {
+    async fn list_panes_ordered(
+        &self,
+        request: codec::ListPanesOrderedV1,
+    ) -> anyhow::Result<codec::ListPanesOrderedV1Response> {
+        self.connected().await?.list_panes_ordered_v1(request).await
+    }
+
+    async fn reorder_window_tabs(
+        &self,
+        request: codec::ReorderWindowTabsV1,
+    ) -> anyhow::Result<codec::ReorderWindowTabsV1Response> {
+        self.connected()
+            .await?
+            .reorder_window_tabs_v1(request)
+            .await
+    }
+
+    async fn reconnect(&self) -> anyhow::Result<()> {
+        lock_or_recover(&self.client, "order_lane_client").take();
+        self.connected().await.map(drop)
+    }
+}
+
+/// A random nonzero binding for a lane whose domain has no durable one.
+fn random_domain_binding() -> anyhow::Result<codec::DomainBindingId> {
+    loop {
+        let mut bytes = [0u8; 16];
+        openssl::rand::rand_bytes(&mut bytes).context("draw a random domain binding")?;
+        if bytes != [0; 16] {
+            return Ok(codec::DomainBindingId::from_bytes(bytes));
         }
     }
 }
@@ -1829,6 +1964,8 @@ impl ClientInner {
             resize_coordinator: ClientResizeCoordinator::new(),
             fetch_retry_coordinator: crate::pane::FetchRetryCoordinator::new(),
             pending_window_titles: Mutex::new(HashMap::new()),
+            pending_window_orders: Mutex::new(HashMap::new()),
+            order_lane: Mutex::new(None),
             topology_session: Mutex::new(ClientTopologySessionState::Unbound),
             layout_tab_owners: Mutex::new(HashMap::new()),
             layout_snapshot: Mutex::new(None),
@@ -1934,6 +2071,137 @@ impl ClientInner {
                 dirty,
             },
         ))
+    }
+
+    /// `None` while a commit for `local_window_id` is already queued or
+    /// running: that one is marked dirty and makes another pass instead.
+    fn queue_window_order(
+        self: &Arc<Self>,
+        local_window_id: WindowId,
+    ) -> Option<PendingWindowOrder> {
+        let mut pending = lock_or_recover(&self.pending_window_orders, "pending_window_orders");
+        if let Some(dirty) = pending.get(&local_window_id) {
+            dirty.store(true, Ordering::Release);
+            metrics::counter!("mux.client.window_order.coalesced").increment(1);
+            return None;
+        }
+        let dirty = Arc::new(AtomicBool::new(true));
+        pending.insert(local_window_id, Arc::clone(&dirty));
+        Some(PendingWindowOrder {
+            inner: Arc::clone(self),
+            local_window_id,
+            dirty,
+        })
+    }
+
+    /// The pinned session of the main connection, when it is a current one.
+    /// Remote ids from a legacy peer carry no session proof.
+    fn current_topology_session(&self) -> Option<MuxSessionIncarnation> {
+        match *lock_or_recover(&self.topology_session, "topology_session") {
+            ClientTopologySessionState::Bound(ClientTopologySession::Current(session)) => {
+                Some(session)
+            }
+            _ => None,
+        }
+    }
+
+    fn order_lane(
+        &self,
+        unix: &UnixDomain,
+        binding: impl FnOnce() -> anyhow::Result<codec::DomainBindingId>,
+    ) -> anyhow::Result<Arc<OrderLane>> {
+        let mut lane = lock_or_recover(&self.order_lane, "order_lane");
+        if let Some(lane) = lane.as_ref() {
+            return Ok(Arc::clone(lane));
+        }
+        let created = Arc::new(OrderLane::new(unix.clone(), binding()?)?);
+        *lane = Some(Arc::clone(&created));
+        Ok(created)
+    }
+
+    /// Drop `lane` so the next commit connects a fresh one. A newer lane is
+    /// left alone.
+    fn drop_order_lane(&self, lane: &Arc<OrderLane>) {
+        let mut current = lock_or_recover(&self.order_lane, "order_lane");
+        if current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, lane))
+        {
+            current.take();
+        }
+    }
+
+    /// The remote tab ids of `local_window_id` in local order, or `None`
+    /// unless every tab holds only this attachment's panes and has a remote
+    /// mapping. A window mixing domains has no single server window to
+    /// commit.
+    fn local_window_remote_order(
+        &self,
+        mux: &Mux,
+        local_window_id: WindowId,
+    ) -> Option<Vec<codec::RemoteTabId>> {
+        let tabs: Vec<Arc<Tab>> = mux.get_window(local_window_id)?.iter().cloned().collect();
+        tabs.iter()
+            .map(|tab| {
+                let panes = tab.iter_all_panes();
+                let ours = !panes.is_empty()
+                    && panes.iter().all(|pane| {
+                        pane.downcast_ref::<ClientPane>()
+                            .is_some_and(|client_pane| client_pane.belongs_to_client(self))
+                    });
+                if !ours {
+                    return None;
+                }
+                let remote_tab_id = self.local_to_remote_tab(tab.tab_id())?;
+                Some(codec::RemoteTabId::new(u64::try_from(remote_tab_id).ok()?))
+            })
+            .collect()
+    }
+
+    /// Make `local_window_id` show the server's order for its tabs. Skips
+    /// a window whose tabs no longer match the server window's tabs.
+    fn apply_server_window_order(
+        &self,
+        mux: &Mux,
+        local_window_id: WindowId,
+        server: &codec::OrderedWindowStateV1,
+    ) -> anyhow::Result<()> {
+        let wanted: Vec<TabId> = server
+            .ordered_tab_ids
+            .iter()
+            .map(|remote| {
+                usize::try_from(remote.get())
+                    .ok()
+                    .and_then(|remote| self.remote_to_local_tab_id(remote))
+            })
+            .collect::<Option<_>>()
+            .context("a server tab has no local tab")?;
+        let local_order = |mux: &Mux| -> Option<Vec<TabId>> {
+            Some(
+                mux.get_window(local_window_id)?
+                    .iter()
+                    .map(|tab| tab.tab_id())
+                    .collect(),
+            )
+        };
+        let current = local_order(mux).context("the local window is gone")?;
+        if current == wanted {
+            return Ok(());
+        }
+        let current_set: HashSet<TabId> = current.iter().copied().collect();
+        let wanted_set: HashSet<TabId> = wanted.iter().copied().collect();
+        ensure!(
+            current_set == wanted_set && current.len() == wanted.len(),
+            "local window {local_window_id} no longer holds exactly the server window's tabs"
+        );
+        let _remote = self.begin_remote_metadata_application()?;
+        for (index, tab_id) in wanted.iter().enumerate() {
+            let current = local_order(mux).context("the local window is gone")?;
+            if current.get(index) != Some(tab_id) {
+                mux.move_tab_between_windows(*tab_id, local_window_id, Some(index))?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn is_detached(&self) -> bool {
@@ -2445,6 +2713,96 @@ fn client_inner_is_current(
             .is_some_and(|client_domain| client_domain.inner_is_current(inner))
 }
 
+/// Whether `inner` is still the live attachment of domain `domain_id`.
+fn client_attachment_is_current(mux: &Mux, domain_id: DomainId, inner: &Arc<ClientInner>) -> bool {
+    !inner.is_detached()
+        && mux.get_domain(domain_id).is_some_and(|domain| {
+            domain
+                .downcast_ref::<ClientDomain>()
+                .is_some_and(|client_domain| client_domain.inner_is_current(inner))
+        })
+}
+
+/// Commit one local window's order until no newer local move is pending.
+async fn run_window_order_commits(
+    mux: Arc<Mux>,
+    domain_id: DomainId,
+    inner: Arc<ClientInner>,
+    lane: Arc<OrderLane>,
+    pending: PendingWindowOrder,
+) {
+    let local_window_id = pending.local_window_id;
+    loop {
+        if !client_attachment_is_current(&mux, domain_id, &inner) {
+            return;
+        }
+        pending.begin_update();
+        let Some(desired) = inner.local_window_remote_order(&mux, local_window_id) else {
+            log::debug!(
+                "window {local_window_id} does not mirror one server window; order not committed"
+            );
+            return;
+        };
+        // The lane must reach the session the main connection's ids belong to.
+        let Some(session) = inner.current_topology_session() else {
+            return;
+        };
+        let intent = WindowOrderIntent {
+            domain_binding_id: lane.binding,
+            expected_session: Some(session),
+            desired: DesiredWindowOrder::Exact(desired),
+        };
+        let outcome = commit_window_order(&*lane, &lane.namespace, &intent).await;
+        if !client_attachment_is_current(&mux, domain_id, &inner) {
+            return;
+        }
+        match outcome {
+            Ok(outcome) => {
+                if outcome.lane_is_stale()
+                    || matches!(outcome, WindowOrderCommitOutcome::MutationIdsExhausted)
+                {
+                    log::warn!(
+                        "tab order for window {local_window_id} was not committed: {outcome:?}"
+                    );
+                    inner.drop_order_lane(&lane);
+                    return;
+                }
+                match &outcome {
+                    WindowOrderCommitOutcome::Applied { .. } => {}
+                    WindowOrderCommitOutcome::Unchanged { .. } => {}
+                    WindowOrderCommitOutcome::ServerWins { reason, .. } => log::info!(
+                        "the mux server kept its tab order for window {local_window_id}: {reason:?}"
+                    ),
+                    WindowOrderCommitOutcome::NotPureWindow(reason) => log::debug!(
+                        "window {local_window_id} is not one server window ({reason}); order not committed"
+                    ),
+                    other => log::warn!(
+                        "tab order for window {local_window_id} was not committed: {other:?}"
+                    ),
+                }
+                // A newer local move is pending: commit it instead of undoing it.
+                if let Some(server) = outcome.server_window().filter(|_| !pending.is_dirty()) {
+                    if let Err(error) =
+                        inner.apply_server_window_order(&mux, local_window_id, server)
+                    {
+                        log::warn!(
+                            "could not apply the server tab order to window {local_window_id}: {error:#}"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                log::warn!("tab order commit for window {local_window_id} failed: {error:#}");
+                inner.drop_order_lane(&lane);
+                return;
+            }
+        }
+        if pending.finish_if_clean() {
+            return;
+        }
+    }
+}
+
 fn mux_notify_client_domain(
     owner: &Weak<Mux>,
     local_domain_id: DomainId,
@@ -2883,6 +3241,59 @@ impl ClientDomain {
         (!self.retired.load(Ordering::Acquire))
             .then_some(binding)
             .flatten()
+    }
+
+    /// Commit the local tab order of `local_window_id` on the mux server.
+    ///
+    /// Call this after a user moves a tab locally. It returns at once: the
+    /// commit runs on the main thread over a request-only side connection,
+    /// and moves made while one is in flight are coalesced into one more
+    /// pass. Only a unix domain whose window mirrors exactly one server window
+    /// is committed; anything else is left alone. If the server keeps its own
+    /// order, the local window is moved to match it.
+    pub fn commit_local_window_order(&self, local_window_id: WindowId) {
+        let ClientDomainConfig::Unix(unix) = &self.config else {
+            return;
+        };
+        let Some(inner) = self.inner() else {
+            return;
+        };
+        if inner.is_detached() || inner.current_topology_session().is_none() {
+            return;
+        }
+        let Some(mux) = self.mux_owner.upgrade() else {
+            return;
+        };
+        let Some(pending) = inner.queue_window_order(local_window_id) else {
+            return;
+        };
+        let binding = || match self.durable_layout_binding() {
+            Some(durable) => Ok(durable.binding_id),
+            None => random_domain_binding(),
+        };
+        let lane = match inner.order_lane(unix, binding) {
+            Ok(lane) => lane,
+            Err(error) => {
+                log::warn!("tab order commit skipped: {error:#}");
+                return;
+            }
+        };
+        let domain_id = self.local_domain_id;
+        match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Topology,
+            4 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                reservation
+                    .spawn_local(run_window_order_commits(
+                        mux, domain_id, inner, lane, pending,
+                    ))
+                    .detach();
+            }
+            rejected => {
+                log::warn!("main-thread scheduler rejected a tab order commit: {rejected:?}");
+            }
+        }
     }
 
     pub fn layout_snapshot(&self) -> Option<Arc<RemoteLayoutSnapshot>> {
@@ -5930,6 +6341,185 @@ mod tests {
         assert!(replacement.queue_window_title(17).is_some());
         assert!(replacement.queue_window_title(18).is_none());
         drop(other_window);
+    }
+
+    #[test]
+    fn window_order_commits_are_single_flight_per_window() {
+        let inner = test_client_inner(91_030);
+        let pending = inner.queue_window_order(17).expect("first order commit");
+        for _ in 0..1_000 {
+            assert!(inner.queue_window_order(17).is_none());
+        }
+        let other = inner
+            .queue_window_order(18)
+            .expect("another window commits independently");
+
+        pending.begin_update();
+        assert!(!pending.is_dirty());
+        assert!(inner.queue_window_order(17).is_none());
+        assert!(
+            pending.is_dirty(),
+            "a move during the commit marks it dirty"
+        );
+        assert!(
+            !pending.finish_if_clean(),
+            "a move during the commit requires another pass"
+        );
+        pending.begin_update();
+        assert!(pending.finish_if_clean());
+
+        let successor = inner
+            .queue_window_order(17)
+            .expect("a move after completion starts a new commit");
+        drop(pending);
+        assert!(
+            inner.queue_window_order(17).is_none(),
+            "the old commit must not erase its successor"
+        );
+        drop(successor);
+        drop(other);
+        assert!(lock_or_recover(&inner.pending_window_orders, "test pending orders").is_empty());
+    }
+
+    /// A local window holding one tab per `(local pane, remote tab, remote
+    /// pane)`, each a ClientPane of `inner` with its tab mapping recorded.
+    fn client_window_fixture(
+        mux: &Arc<Mux>,
+        inner: &Arc<ClientInner>,
+        tabs: &[(PaneId, TabId, PaneId)],
+    ) -> (WindowId, Vec<TabId>) {
+        let window_id = *mux.new_empty_window(Some("order".to_string()), None);
+        let mut local_tabs = Vec::new();
+        for &(local_pane_id, remote_tab_id, remote_pane_id) in tabs {
+            let tab = Arc::new(Tab::new(&TerminalSize::default()));
+            mux.add_tab_no_panes(&tab).expect("fixture tab registers");
+            let pane: Arc<dyn Pane> = Arc::new(
+                ClientPane::new(
+                    inner,
+                    local_pane_id,
+                    remote_tab_id,
+                    remote_pane_id,
+                    TerminalSize::default(),
+                    "order pane",
+                    false,
+                )
+                .unwrap(),
+            );
+            mux.add_pane(&pane).expect("fixture pane registers");
+            tab.assign_pane(&pane);
+            mux.add_tab_to_window(&tab, window_id)
+                .expect("fixture tab joins the window");
+            inner.record_remote_to_local_tab_mapping(remote_tab_id, tab.tab_id());
+            local_tabs.push(tab.tab_id());
+        }
+        (window_id, local_tabs)
+    }
+
+    fn local_tab_order(mux: &Mux, window_id: WindowId) -> Vec<TabId> {
+        mux.get_window(window_id)
+            .expect("fixture window exists")
+            .iter()
+            .map(|tab| tab.tab_id())
+            .collect()
+    }
+
+    fn server_window(order: &[u64]) -> codec::OrderedWindowStateV1 {
+        codec::OrderedWindowStateV1 {
+            window_id: codec::RemoteWindowId::new(1),
+            order_revision: codec::WindowOrderRevision::new(4),
+            ordered_tab_ids: order.iter().copied().map(codec::RemoteTabId::new).collect(),
+            active_tab_id: order.first().copied().map(codec::RemoteTabId::new),
+        }
+    }
+
+    #[test]
+    fn a_window_of_client_tabs_maps_to_remote_ids_in_local_order() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_031);
+        let (window_id, local_tabs) = client_window_fixture(
+            &mux,
+            &inner,
+            &[(93_101, 7, 701), (93_102, 3, 301), (93_103, 9, 901)],
+        );
+        assert_eq!(
+            inner.local_window_remote_order(&mux, window_id),
+            Some(
+                vec![7, 3, 9]
+                    .into_iter()
+                    .map(codec::RemoteTabId::new)
+                    .collect()
+            )
+        );
+
+        inner.remove_old_tab_mapping(3);
+        assert_eq!(
+            inner.local_window_remote_order(&mux, window_id),
+            None,
+            "a tab without a remote mapping has no server window"
+        );
+        inner.record_remote_to_local_tab_mapping(3, local_tabs[1]);
+
+        let other = test_client_inner(91_032);
+        let (foreign_window, _) = client_window_fixture(&mux, &other, &[(93_104, 5, 501)]);
+        let foreign_tab = local_tab_order(&mux, foreign_window)[0];
+        mux.move_tab_between_windows(foreign_tab, window_id, None)
+            .expect("move another attachment's tab into the window");
+        assert_eq!(
+            inner.local_window_remote_order(&mux, window_id),
+            None,
+            "a window mixing attachments is not committed"
+        );
+    }
+
+    #[test]
+    fn server_order_is_applied_locally_without_echo() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_033);
+        let (window_id, local_tabs) = client_window_fixture(
+            &mux,
+            &inner,
+            &[(93_111, 7, 701), (93_112, 3, 301), (93_113, 9, 901)],
+        );
+        let forwarding = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&forwarding);
+        let observer = Arc::clone(&inner);
+        mux.subscribe(move |_| {
+            observed
+                .lock()
+                .expect("forwarding observation lock")
+                .push(observer.should_forward_local_metadata());
+            true
+        })
+        .expect("subscribe to reconcile notifications");
+
+        inner
+            .apply_server_window_order(&mux, window_id, &server_window(&[9, 7, 3]))
+            .expect("apply the server order");
+        assert_eq!(
+            local_tab_order(&mux, window_id),
+            vec![local_tabs[2], local_tabs[0], local_tabs[1]]
+        );
+        assert!(
+            forwarding
+                .lock()
+                .expect("forwarding observations")
+                .iter()
+                .all(|forward| !forward),
+            "applying the server's order must not echo back to it"
+        );
+
+        let before = local_tab_order(&mux, window_id);
+        assert!(
+            inner
+                .apply_server_window_order(&mux, window_id, &server_window(&[9, 7]))
+                .is_err(),
+            "a window whose tabs differ from the server window is left alone"
+        );
+        assert_eq!(local_tab_order(&mux, window_id), before);
     }
 
     #[test]

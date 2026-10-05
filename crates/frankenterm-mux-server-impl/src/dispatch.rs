@@ -110,10 +110,13 @@ impl Default for TopologyRetentionLimits {
 /// the server to guess the client's otherwise-unobservable codec window.
 ///
 /// In contrast, render-application and exact-render delivery have no live
-/// ordinary-server coordinator, and ordered-window support is intentionally
-/// absent from `TopologyCapabilities::SERVER_SUPPORTED`. Keep every
-/// server-produced PDU in those dormant families fail-closed until its own
-/// activation work lands.
+/// ordinary-server coordinator. Keep every server-produced PDU in those
+/// dormant families fail-closed until its own activation work lands.
+///
+/// The ordered-window families (PDU 87, 89 and 90) are advertised in
+/// `TopologyCapabilities::SERVER_SUPPORTED`, but stay in this set: a generic
+/// response or notification path must never emit them. Only the ordered
+/// coordinator can, by attaching the matching [`ServerEmissionAuthority`].
 fn is_dormant_server_wire_spec(spec: &codec::PduWireSpec) -> bool {
     let ident = spec.ident;
     ident == <codec::RenderApplicationUpdateV1 as codec::PduWireIdent>::IDENT
@@ -127,15 +130,17 @@ fn is_dormant_server_wire_spec(spec: &codec::PduWireSpec) -> bool {
 /// Proof carried with a typed outbound PDU from its family-specific dispatch
 /// coordinator to the final encoder chokepoint.
 ///
-/// Ordered-window schemas remain dormant in `SERVER_SUPPORTED`; these permits
-/// are therefore constructible only by the future-enabled ordered fence below.
-/// Keeping the proof on the queued value prevents a generic response path from
-/// bypassing dormancy merely because the codec knows the PDU shape.
+/// The ordered permits are attached only by the ordered-window coordinator:
+/// the PDU87 fence, the PDU90 stream, and the PDU89 reply to an admitted
+/// PDU88 on an established reorder-capable stream. Keeping the proof on the
+/// queued value prevents a generic response path from bypassing dormancy
+/// merely because the codec knows the PDU shape.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ServerEmissionAuthority {
     Ordinary,
     OrderedSnapshotFence,
     OrderedStreamEvent,
+    OrderedReorderResponse,
 }
 
 impl ServerEmissionAuthority {
@@ -152,6 +157,9 @@ impl ServerEmissionAuthority {
             || (self == Self::OrderedStreamEvent
                 && spec.ident == <codec::WindowOrderEventV1 as codec::PduWireIdent>::IDENT
                 && serial == 0)
+            || (self == Self::OrderedReorderResponse
+                && spec.ident == <codec::ReorderWindowTabsV1Response as codec::PduWireIdent>::IDENT
+                && serial != 0)
     }
 }
 
@@ -3084,6 +3092,9 @@ impl TopologyStreamCoordinator {
             Pdu::ListPanesOrderedV1Response(response) => self
                 .validate_and_complete_ordered_fence_response(serial, response)
                 .inspect_err(|_| self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE)),
+            Pdu::ReorderWindowTabsV1Response(response) => self
+                .queue_ordered_reorder_response(serial, response, delivery_class)
+                .inspect_err(|_| self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE)),
             other => {
                 let mut state = self.state.lock();
                 if matches!(
@@ -3142,6 +3153,60 @@ impl TopologyStreamCoordinator {
                 }
             }
         }
+    }
+
+    /// Publish one PDU89 under the ordered authority that admitted its PDU88.
+    ///
+    /// The reply is legal only while this connection still holds an
+    /// established ordered stream that negotiated reorder CAS, either directly
+    /// or as the prior of an identical in-flight PDU86 refresh, and only when
+    /// it names this connection's stream. Anything else trips the connection.
+    /// The coordinator mutex is held across publication so a concurrent
+    /// revocation cannot land between the check and the FIFO admission.
+    fn queue_ordered_reorder_response(
+        &self,
+        serial: u64,
+        response: codec::ReorderWindowTabsV1Response,
+        delivery_class: PduDeliveryClass,
+    ) -> anyhow::Result<()> {
+        // `queue_response_admitted` already rejected every correlated reply
+        // classified as bulk, so `delivery_class` is control here.
+        debug_assert_eq!(delivery_class, PduDeliveryClass::Control);
+        response
+            .validate()
+            .context("validating PDU89 at the dispatch reorder fence")?;
+        let state = self.state.lock();
+        let authority = match &state.phase {
+            TopologyStreamPhase::Established(established) => established
+                .ordered
+                .as_ref()
+                .map(|ordered| ordered.authority),
+            TopologyStreamPhase::Fencing(in_flight) if in_flight.serial != serial => {
+                in_flight.prior.ordered_authority()
+            }
+            TopologyStreamPhase::Legacy
+            | TopologyStreamPhase::Fencing(_)
+            | TopologyStreamPhase::Exhausted => None,
+        }
+        .context("ordered-window reorder response has no established ordered stream")?;
+        if !authority
+            .negotiated
+            .contains(TopologyCapabilities::WINDOW_REORDER_CAS_V1)
+        {
+            anyhow::bail!("ordered-window reorder response without negotiated reorder CAS");
+        }
+        if response.stream_id != authority.stream_id {
+            anyhow::bail!("ordered-window reorder response names a stale or foreign stream");
+        }
+        queue_response_pdu_with_emission_authority(
+            &self.item_tx,
+            &self.terminal,
+            &self.outbound_budget,
+            Pdu::ReorderWindowTabsV1Response(response),
+            serial,
+            delivery_class,
+            ServerEmissionAuthority::OrderedReorderResponse,
+        )
     }
 
     /// Validate the potentially q-sized PDU87 snapshot without holding the
@@ -7754,7 +7819,7 @@ mod tests {
         .with_computed_digest()
     }
 
-    fn dormant_reorder_response(
+    fn sample_reorder_response(
         stream_id: TopologyStreamId,
         session_incarnation: MuxSessionIncarnation,
     ) -> Pdu {
@@ -11078,6 +11143,199 @@ mod tests {
         assert_outbound_live_counters_zero(&coordinator);
     }
 
+    /// Establish a production ordered stream: PDU86 with `request`, then a
+    /// successful PDU87 at `serial`, leaving the coordinator `Established`.
+    fn establish_production_ordered_stream(
+        coordinator: &TopologyStreamCoordinator,
+        item_rx: &Receiver<Item>,
+        request: &codec::ListPanesOrderedV1,
+        serial: u64,
+        session_incarnation: MuxSessionIncarnation,
+        stream_id: TopologyStreamId,
+    ) {
+        coordinator
+            .begin_ordered_fence(serial, request)
+            .expect("begin production ordered topology fence");
+        let response = ordered_snapshot_response(
+            request,
+            stream_id,
+            session_incarnation,
+            TopologyRevision::INITIAL,
+        );
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial,
+                    pdu: Pdu::ListPanesOrderedV1Response(response),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect("production PDU87 must establish the ordered stream");
+        let snapshot = take_written_pdu(item_rx);
+        assert_eq!(snapshot.serial, serial);
+        assert!(matches!(
+            snapshot.pdu,
+            Pdu::ListPanesOrderedV1Response(codec::ListPanesOrderedV1Response {
+                outcome: codec::ListPanesOrderedV1Outcome::Snapshot(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn production_ordered_reorder_round_trip_emits_correlated_pdu89() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let request = ordered_snapshot_request(true);
+        establish_production_ordered_stream(
+            &coordinator,
+            &item_rx,
+            &request,
+            201,
+            session_incarnation,
+            stream_id,
+        );
+
+        let reorder = ordered_reorder_request(&request, stream_id, session_incarnation);
+        let authority = coordinator
+            .admit_ordered_reorder(&reorder)
+            .expect("production PDU87 must authorize PDU88");
+        assert_eq!(authority.stream_id(), stream_id);
+        assert_eq!(
+            authority.negotiated(),
+            TopologyCapabilities::SERVER_SUPPORTED
+        );
+
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 202,
+                    pdu: sample_reorder_response(stream_id, session_incarnation),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect("established reorder authority must permit its PDU89");
+        let reply = take_written_pdu(&item_rx);
+        assert_eq!(reply.serial, 202);
+        assert_eq!(
+            reply.pdu,
+            sample_reorder_response(stream_id, session_incarnation)
+        );
+
+        // An identical PDU86 refresh keeps the same authority, so a PDU89 for
+        // a PDU88 admitted earlier stays legal while the refresh is in flight.
+        coordinator
+            .begin_ordered_fence(203, &request)
+            .expect("an identical PDU86 refresh must be accepted");
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 204,
+                    pdu: sample_reorder_response(stream_id, session_incarnation),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect("an identical refresh must not revoke PDU89 authority");
+        assert_eq!(take_written_pdu(&item_rx).serial, 204);
+
+        assert!(item_rx.is_empty());
+        assert!(terminal_rx.is_empty());
+        assert_outbound_live_counters_zero(&coordinator);
+    }
+
+    #[test]
+    fn ordered_reorder_response_without_matching_authority_is_sticky_terminal() {
+        // Legacy connection: no PDU86/PDU87 has established anything.
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 211,
+                    pdu: sample_reorder_response(stream_id, session_incarnation),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect_err("PDU89 without an ordered stream must be rejected");
+        assert!(item_rx.is_empty());
+        assert_eq!(terminal_rx.try_recv(), Ok(TOPOLOGY_PROTOCOL_FAILURE));
+
+        // Established stream, but the reply names a foreign stream.
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let request = ordered_snapshot_request(true);
+        establish_production_ordered_stream(
+            &coordinator,
+            &item_rx,
+            &request,
+            212,
+            session_incarnation,
+            stream_id,
+        );
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 213,
+                    pdu: sample_reorder_response(
+                        TopologyStreamId::from_bytes([0x5b; 16]),
+                        session_incarnation,
+                    ),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect_err("PDU89 for a foreign stream must be rejected");
+        assert!(item_rx.is_empty());
+        assert_eq!(terminal_rx.try_recv(), Ok(TOPOLOGY_PROTOCOL_FAILURE));
+
+        // Established ordered stream that did not negotiate reorder CAS.
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let request = ordered_snapshot_request(false);
+        establish_production_ordered_stream(
+            &coordinator,
+            &item_rx,
+            &request,
+            214,
+            session_incarnation,
+            stream_id,
+        );
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 215,
+                    pdu: sample_reorder_response(stream_id, session_incarnation),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect_err("PDU89 without negotiated reorder CAS must be rejected");
+        assert!(item_rx.is_empty());
+        assert_eq!(terminal_rx.try_recv(), Ok(TOPOLOGY_PROTOCOL_FAILURE));
+
+        // Correlated PDU89 classified as bulk.
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let request = ordered_snapshot_request(true);
+        establish_production_ordered_stream(
+            &coordinator,
+            &item_rx,
+            &request,
+            216,
+            session_incarnation,
+            stream_id,
+        );
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 217,
+                    pdu: sample_reorder_response(stream_id, session_incarnation),
+                },
+                PduDeliveryClass::Bulk,
+            )
+            .expect_err("a correlated PDU89 must never use bulk delivery");
+        assert!(item_rx.is_empty());
+        assert_eq!(terminal_rx.try_recv(), Ok(TOPOLOGY_PROTOCOL_FAILURE));
+    }
+
     #[test]
     fn ordered_snapshot_encoded_route_rejects_zero_serial_and_raw_bytes() {
         let request = ordered_snapshot_request(true);
@@ -11236,23 +11494,31 @@ mod tests {
     }
 
     #[test]
-    fn production_dormant_ordered_fence_returns_only_correlated_unsupported_and_legacy_resync() {
+    fn production_fence_requiring_exact_render_returns_unsupported_and_legacy_resync() {
         let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
             bound_topology_coordinator();
-        let request = ordered_snapshot_request(true);
+        // Exact-render delivery is the one topology capability production
+        // still does not advertise, so requiring it must leave this PDU86
+        // unsupported.
+        let mut request = ordered_snapshot_request(true);
+        let with_exact_render = TopologyCapabilities::from_bits(
+            request.supported.bits() | TopologyCapabilities::EXACT_RENDER_DELIVERY_V1.bits(),
+        );
+        request.supported = with_exact_render;
+        request.required = with_exact_render;
         coordinator
             .begin_ordered_fence(186, &request)
-            .expect("begin production-dormant ordered topology fence");
+            .expect("begin production ordered topology fence");
 
         let mux = Arc::new(Mux::new(None));
         let _guard = ScopedMux::install(&mux);
         let tab = Arc::new(mux::tab::Tab::new(&TerminalSize::default()));
         mux.add_tab_no_panes(&tab)
-            .expect("register test tab for dormant ordered notification");
+            .expect("register test tab for unsupported ordered notification");
         let window = mux.new_empty_window(None, None);
         let window_id = *window;
         mux.add_tab_to_window(&tab, window_id)
-            .expect("attach test tab to dormant ordered window");
+            .expect("attach test tab to unsupported ordered window");
         drop(window);
         let frozen = mux
             .window_order_snapshot(window_id)
@@ -11275,7 +11541,7 @@ mod tests {
         ));
         assert!(
             item_rx.is_empty(),
-            "the dormant fence must quarantine its compact legacy resync"
+            "the unsupported fence must quarantine its compact legacy resync"
         );
 
         let response = ordered_unsupported_response(
@@ -11285,7 +11551,7 @@ mod tests {
         );
         response
             .validate_for_request(&request)
-            .expect("dormant PDU87 must be exactly request-correlated");
+            .expect("unsupported PDU87 must be exactly request-correlated");
         coordinator
             .queue_response(
                 DecodedPdu {
@@ -11299,18 +11565,15 @@ mod tests {
         let unsupported = take_written_pdu(&item_rx);
         assert_eq!(unsupported.serial, 186);
         let Pdu::ListPanesOrderedV1Response(unsupported) = unsupported.pdu else {
-            panic!("production-dormant PDU86 must receive exactly PDU87");
+            panic!("an unsupported PDU86 must receive exactly PDU87");
         };
         unsupported
             .validate_for_request(&request)
             .expect("queued unsupported PDU87 must preserve the exact PDU86 binding");
-        assert_eq!(
-            unsupported.negotiated,
-            TopologyCapabilities::FENCED_SNAPSHOT_V1
-        );
+        assert_eq!(unsupported.negotiated, ordered_window_capabilities(true));
         let codec::ListPanesOrderedV1Outcome::Unsupported { supported } = unsupported.outcome
         else {
-            panic!("production-dormant PDU87 must report Unsupported");
+            panic!("a PDU86 requiring exact render must report Unsupported");
         };
         assert_eq!(supported, TopologyCapabilities::SERVER_SUPPORTED);
 
@@ -11322,7 +11585,7 @@ mod tests {
         ));
         assert!(
             item_rx.is_empty(),
-            "a dormant ordered fence must never leak PDU90"
+            "an unsupported ordered fence must never leak PDU90"
         );
         assert!(matches!(
             &coordinator.state.lock().phase,
@@ -15702,7 +15965,7 @@ mod tests {
         assert_eq!(
             dormant,
             [79, 84, 87, 89, 90, 92],
-            "only the unactivated render and ordered-window server families may be frozen"
+            "only the unactivated render and the permit-gated ordered-window server families may be frozen"
         );
         for ident in &dormant {
             let spec = Pdu::wire_spec_for_ident(*ident)
@@ -15727,15 +15990,7 @@ mod tests {
 
         assert_eq!(
             TopologyCapabilities::SERVER_SUPPORTED,
-            TopologyCapabilities::FENCED_SNAPSHOT_V1
-        );
-        assert!(
-            !TopologyCapabilities::SERVER_SUPPORTED
-                .contains(TopologyCapabilities::ORDERED_WINDOW_STREAM_V1)
-        );
-        assert!(
-            !TopologyCapabilities::SERVER_SUPPORTED
-                .contains(TopologyCapabilities::WINDOW_REORDER_CAS_V1)
+            ordered_window_capabilities(true)
         );
         assert!(
             !TopologyCapabilities::SERVER_SUPPORTED
@@ -15766,7 +16021,7 @@ mod tests {
             stream_id,
             TopologyCapabilities::SERVER_SUPPORTED,
         ));
-        let pdu89 = dormant_reorder_response(stream_id, session_incarnation);
+        let pdu89 = sample_reorder_response(stream_id, session_incarnation);
         let pdu90 = dormant_window_order_event();
         let cases = [
             (
@@ -15844,6 +16099,34 @@ mod tests {
                 ServerEmissionAuthority::OrderedStreamEvent,
                 &pdu89,
                 89,
+                false,
+            ),
+            (
+                "reorder permit emits correlated PDU89",
+                ServerEmissionAuthority::OrderedReorderResponse,
+                &pdu89,
+                89,
+                true,
+            ),
+            (
+                "reorder permit rejects unilateral PDU89",
+                ServerEmissionAuthority::OrderedReorderResponse,
+                &pdu89,
+                0,
+                false,
+            ),
+            (
+                "reorder permit cannot emit PDU87",
+                ServerEmissionAuthority::OrderedReorderResponse,
+                &pdu87,
+                87,
+                false,
+            ),
+            (
+                "reorder permit cannot emit PDU90",
+                ServerEmissionAuthority::OrderedReorderResponse,
+                &pdu90,
+                0,
                 false,
             ),
         ];

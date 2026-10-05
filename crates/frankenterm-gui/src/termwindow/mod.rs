@@ -666,6 +666,25 @@ fn attached_tab_geometry(size: TerminalSize, tabs: &[Arc<mux::tab::Tab>]) -> Ter
     target
 }
 
+/// After a local tab move, ask the client domain that owns the moved tab to
+/// commit `window_id`'s new order on its mux server. A tab of a local domain
+/// needs nothing. The domain decides whether the window can be committed.
+fn commit_tab_order_to_mux_server(mux: &Mux, window_id: MuxWindowId, moved_tab_id: TabId) {
+    let Some(domain_id) = mux
+        .get_tab(moved_tab_id)
+        .and_then(|tab| tab.get_active_pane())
+        .map(|pane| pane.domain_id())
+    else {
+        return;
+    };
+    let Some(domain) = mux.get_domain(domain_id) else {
+        return;
+    };
+    if let Some(client_domain) = domain.downcast_ref::<frankenterm_client::domain::ClientDomain>() {
+        client_domain.commit_local_window_order(window_id);
+    }
+}
+
 impl RetainedMuxRefresh {
     fn handles(notification: &MuxNotification, window_id: MuxWindowId) -> bool {
         matches!(
@@ -7931,6 +7950,7 @@ impl TermWindow {
         drop(window);
 
         mux.move_tab_between_windows(tab_id, self.mux_window_id, Some(tab_idx))?;
+        commit_tab_order_to_mux_server(&mux, self.mux_window_id, tab_id);
         self.update_title();
         self.update_scrollbar();
 
