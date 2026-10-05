@@ -7333,13 +7333,20 @@ impl TermWindow {
             log::error!("Failed to load font configuration: {:#}", err);
         }
 
-        if let Some(window) = mux.get_window(self.mux_window_id) {
+        // Collect the panes and release the `mux.windows` read guard before
+        // calling into them: pane callbacks must not run under a mux lock.
+        let window_panes = mux.get_window(self.mux_window_id).map(|window| {
+            window
+                .iter()
+                .flat_map(|tab| tab.iter_panes_ignoring_zoom())
+                .map(|positioned| positioned.pane)
+                .collect::<Vec<_>>()
+        });
+        if let Some(window_panes) = window_panes {
             let term_config: Arc<dyn TerminalConfiguration> =
                 Arc::new(TermConfig::with_config(config.clone()));
-            for tab in window.iter() {
-                for pane in tab.iter_panes_ignoring_zoom() {
-                    pane.pane.set_config(Arc::clone(&term_config));
-                }
+            for pane in window_panes {
+                pane.set_config(Arc::clone(&term_config));
             }
             for state in self.pane_state.borrow().values() {
                 if let Some(overlay) = &state.overlay {
