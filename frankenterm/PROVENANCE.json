@@ -156,7 +156,7 @@
         "cleanup": 2,
         "cosmetic": 20,
         "feat": 55,
-        "fix": 120,
+        "fix": 121,
         "other": 17,
         "refactor": 5,
         "rename": 2,
@@ -164,13 +164,13 @@
         "security-fix": 2,
         "test": 40
       },
-      "fork_side_commit_count": 270,
+      "fork_side_commit_count": 271,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-02T21:41:17-04:00",
-        "sha": "f049e66bd3c8409f1e7d62cf735cc831dcb5269d",
-        "subject": "fix(release): land the eleven v0.15.21 ship-blockers and review should-fixes (ft-u5tr5)"
+        "committed_at": "2026-10-04T20:10:32-04:00",
+        "sha": "263afba88b7fd6d06941fbd0b8ce3ed1a6c5e4c0",
+        "subject": "fix(mux,client,mux-server): close an exited pane's tab; apply snapshots without server-closed tabs; mux Lua in the server"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -641,7 +641,7 @@
         "cosmetic": 31,
         "docs": 6,
         "feat": 210,
-        "fix": 301,
+        "fix": 302,
         "other": 55,
         "refactor": 12,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 112
       },
-      "fork_side_commit_count": 752,
+      "fork_side_commit_count": 753,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-03T22:08:31-04:00",
-        "sha": "96f5dc8767838effe90b921553ce558172946720",
-        "subject": "fix(mux): tmux -CC send-keys uses -H and ends with LF"
+        "committed_at": "2026-10-04T20:10:32-04:00",
+        "sha": "263afba88b7fd6d06941fbd0b8ce3ed1a6c5e4c0",
+        "subject": "fix(mux,client,mux-server): close an exited pane's tab; apply snapshots without server-closed tabs; mux Lua in the server"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1065,8 +1065,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2977,
-  "generated_at": "2026-10-04T02:09:16.837707Z",
+  "fork_side_commit_total": 2979,
+  "generated_at": "2026-10-05T00:10:42.682983Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
