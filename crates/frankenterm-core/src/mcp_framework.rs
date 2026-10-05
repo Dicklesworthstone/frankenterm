@@ -916,6 +916,55 @@ impl OutboundFrameworkClient {
         map_legacy_tool_response(response)
     }
 
+    /// Call a remote tool under the caller's context as well as the
+    /// connection's configured response timers.
+    ///
+    /// `caller_cx` bounds only this call: once it is cancelled or its budget
+    /// is exhausted, the request is cancelled through the connection-owned
+    /// executor (the connection stays usable) and the call fails with
+    /// `request_cancelled`. The connection stays the sole ingress driver; each
+    /// turn is one bounded receive slice so the caller's context is observed
+    /// between turns.
+    pub(crate) fn call_tool_content_with_cx(
+        &mut self,
+        caller_cx: &crate::cx::Cx,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> std::result::Result<Vec<McpClientContentItem>, OutboundFrameworkError> {
+        if caller_cx.checkpoint().is_err() {
+            return Err(OutboundFrameworkError::Transport(
+                FrameworkMcpError::request_cancelled(),
+            ));
+        }
+        let mut execution = self
+            .inner
+            .start_yielding_stdio_request(
+                "tools/call",
+                Some(serde_json::json!({"name": name, "arguments": arguments})),
+            )
+            .map_err(OutboundFrameworkError::Transport)?;
+        loop {
+            if let Some((response, _raw_result)) = self
+                .inner
+                .try_take_yielding_stdio_response(&mut execution)
+                .map_err(OutboundFrameworkError::Transport)?
+            {
+                return map_legacy_tool_response(response);
+            }
+            if caller_cx.checkpoint().is_err() {
+                self.inner
+                    .cancel_yielding_stdio_request(&mut execution)
+                    .map_err(OutboundFrameworkError::Transport)?;
+                return Err(OutboundFrameworkError::Transport(
+                    FrameworkMcpError::request_cancelled(),
+                ));
+            }
+            self.inner
+                .drive_yielding_stdio_slice()
+                .map_err(OutboundFrameworkError::Transport)?;
+        }
+    }
+
     /// Close the connection and report whether owned subprocess cleanup succeeded.
     pub(crate) fn shutdown(mut self) -> FrameworkMcpResult<()> {
         self.inner.close()

@@ -952,13 +952,10 @@ impl ToolHandler for RemoteProxyToolHandler {
         //    circuits BEFORE the lock so the next caller's wait
         //    time isn't bounded by an already-doomed request.
         //
-        // Mid-call hangs (the bigger problem when the remote
-        // server itself is hung) require ToolHandler trait
-        // surgery to wrap call_tool in tokio::time::timeout —
-        // tracked separately under ft-bd3vr (blocked on fastmcp
-        // upstream API) and the option-B paragraph in this
-        // bead. This commit ships option-A++ alone, which is
-        // bounded and immediately useful.
+        // Mid-call hangs (the remote server itself is hung) are
+        // bounded below: call_tool_with_cx observes this same Cx
+        // between receive slices and cancels the in-flight request
+        // (ft-bd3vr).
         if let Err(cx_err) = ctx.cx().checkpoint() {
             // br-ft-wzk10 site C: pre-flight Cx checkpoint failed.
             record_mcp_proxy_call_dispatch_failure();
@@ -999,7 +996,10 @@ impl ToolHandler for RemoteProxyToolHandler {
             McpError::internal_error(proxy_route_lock_poisoned_error(&self.exposed_name))
         })?;
 
-        match guard.call_tool(&self.external_name, arguments) {
+        // ft-bd3vr: the request's own Cx also bounds the remote call, so a hung
+        // remote server cannot hold this caller (and, through the per-server
+        // Mutex, every later caller) past the request's deadline.
+        match guard.call_tool_with_cx(ctx.cx(), &self.external_name, arguments) {
             Ok(content) => {
                 let content = content
                     .into_iter()

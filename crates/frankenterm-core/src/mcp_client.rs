@@ -133,16 +133,41 @@ impl FtMcpClient {
         }
     }
 
-    /// Call a remote tool.
+    /// Call a remote tool, bounded by the connection's configured timeout.
     pub fn call_tool(
         &mut self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpClientResult<Vec<McpClientContentItem>> {
+        self.call_tool_bounded(None, name, arguments)
+    }
+
+    /// Call a remote tool, also bounded by `cx`: cancelling it or exhausting
+    /// its budget cancels the in-flight request instead of waiting out the
+    /// connection's configured timeout.
+    pub fn call_tool_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpClientResult<Vec<McpClientContentItem>> {
+        self.call_tool_bounded(Some(cx), name, arguments)
+    }
+
+    fn call_tool_bounded(
+        &mut self,
+        cx: Option<&crate::cx::Cx>,
         name: &str,
         arguments: serde_json::Value,
     ) -> McpClientResult<Vec<McpClientContentItem>> {
         let start = Instant::now();
         let log_server = redact_mcp_client_text(&self.server.name);
         let log_tool = redact_mcp_client_text(name);
-        match self.client.call_tool_content(name, arguments) {
+        let outcome = match cx {
+            Some(cx) => self.client.call_tool_content_with_cx(cx, name, arguments),
+            None => self.client.call_tool_content(name, arguments),
+        };
+        match outcome {
             Ok(content) => {
                 tracing::info!(
                     target: LOG_TARGET,
@@ -1077,6 +1102,74 @@ mod tests {
     }
 
     #[test]
+    fn outbound_call_tool_with_cx_cancels_a_hung_remote_call_and_keeps_the_connection() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+
+        let temp_dir = tempdir().expect("temp dir");
+        let script_path = temp_dir.path().join("mock_mcp_server.py");
+        std::fs::write(&script_path, mock_server_script()).expect("write mock script");
+        let server = ExternalServerConfig {
+            name: "mock".to_string(),
+            command: "python3".to_string(),
+            args: vec!["-u".to_string(), script_path.display().to_string()],
+            env: HashMap::new(),
+            cwd: None,
+            disabled: false,
+        };
+        // A long connection timeout: only the caller's context may end the
+        // hung call within this test's bound.
+        let settings = McpClientConfig {
+            enabled: true,
+            timeout_ms: 60_000,
+            ..McpClientConfig::default()
+        };
+
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("MCP client test runtime");
+        let mut client = runtime.block_on(async {
+            let cx = crate::cx::Cx::current().expect("runtime-owned client context");
+            FtMcpClient::connect_external(&cx, server, &settings)
+                .await
+                .expect("connect to mock server")
+        });
+
+        let caller = crate::cx::for_testing();
+        let canceller = caller.clone();
+        let cancel_thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            canceller.cancel_with(crate::outcome::CancelKind::User, Some("caller gave up"));
+        });
+        let start = std::time::Instant::now();
+        client
+            .call_tool_with_cx(&caller, "hang", serde_json::json!({}))
+            .expect_err("a cancelled caller must not wait for a hung remote tool");
+        cancel_thread.join().expect("cancel thread");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "caller cancellation must end the call well before the 60 s connection timeout"
+        );
+
+        // Cancelling one request leaves the connection usable.
+        let output = client
+            .call_tool("echo", serde_json::json!({"text": "after"}))
+            .expect("connection survives a cancelled call");
+        assert_eq!(
+            output.first().and_then(McpClientContentItem::as_text),
+            Some("after")
+        );
+        client.shutdown().expect("settle MCP subprocess cleanup");
+    }
+
+    #[test]
     fn outbound_mcp_logs_redact_secret_shaped_server_labels() {
         if std::process::Command::new("python3")
             .arg("--version")
@@ -1422,6 +1515,8 @@ for raw in sys.stdin:
                     "isError": False
                 }
             })
+        elif tool_name == "hang":
+            continue
         else:
             send({
                 "jsonrpc": "2.0",
