@@ -13028,11 +13028,28 @@ fn emit_toon_stats(json: &str, toon: &str) {
     );
 }
 
+/// Set once any robot envelope with `ok: false` is printed. Robot commands
+/// exit 0 by default (the envelope is the result); with
+/// `FT_ROBOT_FAIL_ON_ERROR=1` the process exits 1 instead, so shell pipelines
+/// such as `ft robot wait-for 0 Done && next` stop on a timeout or refusal.
+static ROBOT_ERROR_ENVELOPE_PRINTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn robot_fail_on_error_requested(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim),
+        Some("1" | "true" | "TRUE" | "True" | "yes" | "on")
+    )
+}
+
 fn print_robot_response<T: serde::Serialize>(
     response: &RobotResponse<T>,
     format: RobotOutputFormat,
     cli_stats: bool,
 ) -> anyhow::Result<()> {
+    if !response.ok {
+        ROBOT_ERROR_ENVELOPE_PRINTED.store(true, std::sync::atomic::Ordering::Release);
+    }
     let show_stats = should_show_toon_stats(cli_stats);
 
     match format {
@@ -49296,6 +49313,14 @@ fn main() {
         match Box::pin(run(&process_cx, robot_mode)).await {
             Ok(()) => {
                 emit_runtime_bootstrap_lifecycle(runtime_spec, "shutdown", "run_completed", None);
+                if robot_mode
+                    && robot_fail_on_error_requested(
+                        std::env::var("FT_ROBOT_FAIL_ON_ERROR").ok().as_deref(),
+                    )
+                    && ROBOT_ERROR_ENVELOPE_PRINTED.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    std::process::exit(1);
+                }
             }
             Err(err) => {
                 emit_runtime_bootstrap_lifecycle(
@@ -132006,6 +132031,22 @@ printf x > "$MINISIGN_MARKER"
         assert_eq!(data["receipt"]["status"], "succeeded");
         assert_eq!(data["receipt"]["completed_count"].as_u64(), Some(2));
         assert!(robot_fleet_scale_failure(&data, false).is_none());
+    }
+
+    #[test]
+    fn robot_fail_on_error_is_opt_in_and_tracks_error_envelopes() {
+        for value in ["1", "true", " yes ", "on"] {
+            assert!(robot_fail_on_error_requested(Some(value)), "{value}");
+        }
+        for value in [None, Some(""), Some("0"), Some("false"), Some("off")] {
+            assert!(!robot_fail_on_error_requested(value), "{value:?}");
+        }
+        // Printing an error envelope marks it; this process-global only ever
+        // moves to true, so asserting after the print is order-independent.
+        let response =
+            RobotResponse::<()>::error_with_code(ROBOT_ERR_CONFIG, "probe".to_string(), None, 0);
+        print_robot_response(&response, RobotOutputFormat::Json, false).unwrap();
+        assert!(ROBOT_ERROR_ENVELOPE_PRINTED.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]

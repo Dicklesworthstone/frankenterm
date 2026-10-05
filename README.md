@@ -1221,6 +1221,7 @@ The `ft robot` subcommand provides machine-optimized output for AI agents. Alway
 | `FT_OUTPUT_FORMAT` | Default format (`json` or `toon`) |
 | `TOON_DEFAULT_FORMAT` | Fallback default format |
 | `FT_WORKSPACE` | Workspace root directory |
+| `FT_ROBOT_FAIL_ON_ERROR` | `1` makes `ft robot` exit with status 1 when it printed an `ok: false` envelope (default: exit 0, the envelope is the result), so `ft robot wait-for 0 Done && next` stops on a timeout or refusal |
 
 **Precedence:** CLI flag > `FT_OUTPUT_FORMAT` > `TOON_DEFAULT_FORMAT` > `json`
 
