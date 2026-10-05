@@ -156,7 +156,7 @@
         "cleanup": 2,
         "cosmetic": 20,
         "feat": 55,
-        "fix": 121,
+        "fix": 122,
         "other": 17,
         "refactor": 5,
         "rename": 2,
@@ -164,13 +164,13 @@
         "security-fix": 2,
         "test": 40
       },
-      "fork_side_commit_count": 271,
+      "fork_side_commit_count": 272,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-04T20:10:32-04:00",
-        "sha": "263afba88b7fd6d06941fbd0b8ce3ed1a6c5e4c0",
-        "subject": "fix(mux,client,mux-server): close an exited pane's tab; apply snapshots without server-closed tabs; mux Lua in the server"
+        "committed_at": "2026-10-04T22:26:33-04:00",
+        "sha": "bdae72b978830804fe8a0274615f29b2d14bbb81",
+        "subject": "fix(client): apply a snapshot that reports a server-side pane move instead of retiring the transport (ft-j1s72)"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -1065,8 +1065,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2979,
-  "generated_at": "2026-10-05T00:10:42.682983Z",
+  "fork_side_commit_total": 2980,
+  "generated_at": "2026-10-05T02:26:41.396159Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
