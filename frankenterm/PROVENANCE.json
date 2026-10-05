@@ -156,7 +156,7 @@
         "cleanup": 2,
         "cosmetic": 20,
         "feat": 55,
-        "fix": 123,
+        "fix": 124,
         "other": 17,
         "refactor": 5,
         "rename": 2,
@@ -164,13 +164,13 @@
         "security-fix": 2,
         "test": 40
       },
-      "fork_side_commit_count": 273,
+      "fork_side_commit_count": 274,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-05T02:33:29-04:00",
-        "sha": "97436de5b05f4e99bffc0fd69f71b54d6503e5e9",
-        "subject": "fix(client): spawn and move into the window the user asked for after a layout restore (ft-j1s72)"
+        "committed_at": "2026-10-05T13:51:12-04:00",
+        "sha": "10f9adeeab13084f20b047b11edddf382eca0191",
+        "subject": "fix(client): place a spawned or moved tab best-effort instead of failing a committed operation"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -1065,8 +1065,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2981,
-  "generated_at": "2026-10-05T06:33:41.160206Z",
+  "fork_side_commit_total": 2982,
+  "generated_at": "2026-10-05T17:51:19.606926Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
