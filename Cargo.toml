@@ -389,11 +389,11 @@ camino = "1.2.2"
 cap-fs-ext = "4.0.3"
 cap-std = "4.0.3"
 cassowary = "0.3"
-colorgrad = { version = "0.8.0", features = ["named-colors", "preset"] }
+colorgrad = { version = "0.9.0", features = ["named-colors", "preset"] }
 crossbeam = "0.8.4"
 crossbeam-queue = "0.3.12"
 crossbeam-utils = "0.8.21"
-csscolorparser = "0.8.3"
+csscolorparser = "0.9.0"
 deltae = "0.3.2"
 eventheader_dynamic = "0.5.0"
 dirs-next = "2.0"
