@@ -156,7 +156,7 @@
         "cleanup": 2,
         "cosmetic": 20,
         "feat": 55,
-        "fix": 122,
+        "fix": 123,
         "other": 17,
         "refactor": 5,
         "rename": 2,
@@ -164,13 +164,13 @@
         "security-fix": 2,
         "test": 40
       },
-      "fork_side_commit_count": 272,
+      "fork_side_commit_count": 273,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-04T22:26:33-04:00",
-        "sha": "bdae72b978830804fe8a0274615f29b2d14bbb81",
-        "subject": "fix(client): apply a snapshot that reports a server-side pane move instead of retiring the transport (ft-j1s72)"
+        "committed_at": "2026-10-05T02:33:29-04:00",
+        "sha": "97436de5b05f4e99bffc0fd69f71b54d6503e5e9",
+        "subject": "fix(client): spawn and move into the window the user asked for after a layout restore (ft-j1s72)"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -1065,8 +1065,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2980,
-  "generated_at": "2026-10-05T02:26:41.396159Z",
+  "fork_side_commit_total": 2981,
+  "generated_at": "2026-10-05T06:33:41.160206Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
