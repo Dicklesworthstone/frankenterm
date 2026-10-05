@@ -6326,6 +6326,12 @@ enum SteerCommands {
         #[arg(long)]
         ttl_ms: Option<i64>,
 
+        /// Tx contract JSON file the receipt binds (default:
+        /// .ft/mission/tx-active.json when it exists). `ft steer run` only
+        /// executes a receipt bound to the exact contract it runs.
+        #[arg(long)]
+        contract_file: Option<PathBuf>,
+
         /// Output format: plain or json
         #[arg(long, short = 'f', default_value = "plain")]
         format: String,
@@ -64222,10 +64228,11 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 scenario,
                 workspace_id,
                 ttl_ms,
+                contract_file,
                 format,
             } => {
                 use frankenterm_core::steer_plan::{
-                    SteerPlanScenario, plan_status_label, steer_plan,
+                    SteerPlanScenario, plan_status_label, steer_plan_bound,
                 };
                 let as_json = format.eq_ignore_ascii_case("json");
                 let scenario = match SteerPlanScenario::parse(&scenario) {
@@ -64251,14 +64258,55 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 };
                 let workspace_id =
                     workspace_id.unwrap_or_else(|| layout.root.to_string_lossy().to_string());
+                // Bind the receipt to the tx contract `ft steer run` will
+                // execute: the explicit file, else the default one if present.
+                // A contract that exists but cannot be loaded is an error, never
+                // a silently unbound receipt.
+                let explicit_contract = contract_file.is_some();
+                let contract_path = resolve_mission_tx_file_path(&layout, contract_file);
+                let tx_contract_hash = if explicit_contract || contract_path.exists() {
+                    match enforce_robot_mission_path_containment(&layout, &contract_path)
+                        .and_then(|()| load_mission_tx_contract_from_path(&contract_path))
+                    {
+                        Ok(contract) => Some(steering_tx_contract_hash(&contract)),
+                        Err(err) => {
+                            if as_json {
+                                println!(
+                                    "{}",
+                                    serde_json::json!({
+                                        "ok": false,
+                                        "error_code": err.error_code,
+                                        "error": err.message,
+                                        "hint": err.hint,
+                                        "version": frankenterm_core::VERSION,
+                                    })
+                                );
+                            } else {
+                                eprintln!("Error: {}", err.message);
+                                if let Some(hint) = err.hint {
+                                    eprintln!("Hint: {hint}");
+                                }
+                            }
+                            std::process::exit(err.exit_code);
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "Note: no tx contract at {}; this receipt is planning-only and \
+                         `ft steer run` will refuse it. Pass --contract-file to bind one.",
+                        contract_path.display()
+                    );
+                    None
+                };
                 let now = now_ms_i64();
-                let result = steer_plan(
+                let result = steer_plan_bound(
                     scenario,
                     &objective,
                     &workspace_id,
                     now.max(0) as u64,
                     now,
                     ttl_ms,
+                    tx_contract_hash,
                 );
 
                 // Persist the receipt as a content-addressed artifact so
@@ -64537,6 +64585,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 }
 
                 if !valid {
+                    let hint = stored.tx_contract_hash.is_none().then(|| {
+                        format!(
+                            "receipt {} was planned without a tx contract; re-plan with \
+                             `ft steer plan --contract-file {}` to bind this contract",
+                            stored.receipt_id,
+                            execution_contract_path.display()
+                        )
+                    });
                     if as_json {
                         println!(
                             "{}",
@@ -64545,6 +64601,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 "receipt_id": stored.receipt_id,
                                 "valid": false,
                                 "error_code": error_code,
+                                "hint": hint,
                                 "executed": false,
                                 "contract_file": execution_contract_path.display().to_string(),
                                 "live_tx_hash": live_tx_hash,
@@ -64557,6 +64614,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             stored.receipt_id,
                             error_code.unwrap_or("unknown")
                         );
+                        if let Some(hint) = hint {
+                            eprintln!("Hint: {hint}");
+                        }
                     }
                     std::process::exit(1);
                 }

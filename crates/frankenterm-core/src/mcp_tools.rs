@@ -1805,6 +1805,8 @@ struct SteerPlanParams {
     workspace_id: Option<String>,
     #[serde(default)]
     ttl_ms: Option<i64>,
+    #[serde(default)]
+    contract_file: Option<String>,
 }
 
 /// `wa.steer_plan` — MCP mirror of `ft steer plan` (ft-7h5da.6.5). Read-only,
@@ -1848,7 +1850,8 @@ impl ToolHandler for WaSteerPlanTool {
                     },
                     "objective": { "type": "string", "description": "Operator objective description" },
                     "workspace_id": { "type": "string", "description": "Workspace id to bind (default: resolved workspace root, matching the CLI)" },
-                    "ttl_ms": { "type": "integer", "description": "Receipt TTL in milliseconds (default: none)" }
+                    "ttl_ms": { "type": "integer", "description": "Receipt TTL in milliseconds (default: none)" },
+                    "contract_file": { "type": "string", "description": "Tx contract JSON file the receipt binds (default: .ft/mission/tx-active.json when it exists)" }
                 },
                 "required": ["scenario", "objective"],
                 "additionalProperties": false
@@ -1907,14 +1910,46 @@ impl ToolHandler for WaSteerPlanTool {
                 }
             },
         };
+        // Bind the same contract the CLI binds: the explicit file, else the
+        // default one when it exists. A contract that exists but cannot be
+        // loaded is an error, never a silently unbound receipt.
+        let explicit_contract = params.contract_file.is_some();
+        let contract_path = match mcp_resolve_mission_tx_file_path(
+            self.config.as_ref(),
+            params.contract_file.as_deref(),
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+        let tx_contract_hash = if explicit_contract || contract_path.exists() {
+            match mcp_load_mission_tx_contract_from_path(&contract_path) {
+                Ok(contract) => Some(contract.compute_hash()),
+                Err(err) => {
+                    let envelope = McpEnvelope::<()>::error(
+                        err.code,
+                        err.message,
+                        err.hint,
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                }
+            }
+        } else {
+            None
+        };
         let now = now_ms();
-        let result = crate::steer_plan::steer_plan(
+        let result = crate::steer_plan::steer_plan_bound(
             scenario,
             &params.objective,
             &workspace_id,
             now,
             i64::try_from(now).unwrap_or(i64::MAX),
             params.ttl_ms,
+            tx_contract_hash,
         );
         let envelope = McpEnvelope::success(result.receipt, elapsed_ms(start));
         envelope_to_content(envelope)

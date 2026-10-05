@@ -568,9 +568,10 @@ fn plan_receipt_id(w: &Path, extra: &[&str]) -> String {
 
 #[cfg(unix)]
 fn persist_bound_receipt(w: &TempDir, contract: &MissionTxContract) -> SteeringReceipt {
-    // Standard-scenario `steer plan` receipts do not accept a contract input.
-    // Seed the execute-half fixture through the same content-addressed store
-    // with the immutable tx hash that `steer run` must revalidate.
+    // The execute-half fixtures need a receipt with a known TTL and score, so
+    // seed it through the same content-addressed store with the immutable tx
+    // hash that `steer run` must revalidate (`steer plan` binds the same hash;
+    // see steer_plan_binds_the_default_tx_contract_so_steer_run_admits_its_receipt).
     let now_ms = system_now_ms();
     let receipt = SteeringReceipt::new(
         "run the admitted executable transaction",
@@ -804,6 +805,89 @@ fn steer_run_commits_durable_store_data_with_workspace_global_ledger() {
     assert!(
         matches!(&ledger.records()[0].outcome, StepOutcome::Success { .. }),
         "the durable ledger must prove StoreData success"
+    );
+}
+
+#[test]
+fn steer_plan_binds_the_default_tx_contract_so_steer_run_admits_its_receipt() {
+    let w = workspace();
+    let (_path, contract) = write_executable_tx_contract(&w);
+    let out = stdout(
+        ft(w.path())
+            .args([
+                "steer",
+                "plan",
+                "--objective",
+                "run me",
+                "--scenario",
+                "clean-ready",
+                "--format",
+                "json",
+            ])
+            .assert()
+            .success(),
+    );
+    let receipt: serde_json::Value = serde_json::from_str(&out).expect("json receipt");
+    let tx_hash = contract.compute_hash();
+    assert_eq!(
+        receipt["tx_contract_hash"].as_str(),
+        Some(tx_hash.as_str()),
+        "{out}"
+    );
+    let id = receipt["receipt_id"].as_str().expect("receipt_id");
+
+    // The public plan-to-run contract: the receipt `steer plan` printed passes
+    // the receipt gate for the contract `steer run` executes.
+    let run = ft(w.path())
+        .args([
+            "steer",
+            "run",
+            "--receipt",
+            id,
+            "--dry-run",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run ft steer run");
+    let run_out = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        !run_out.contains("robot.steer_"),
+        "a receipt bound by steer plan must pass the steer run gate: {run_out}"
+    );
+}
+
+#[test]
+fn steer_run_refuses_a_planning_only_receipt_with_a_rebind_hint() {
+    let w = workspace();
+    // Planned before any contract exists: the receipt is unbound.
+    let id = plan_receipt_id(w.path(), &[]);
+    let _ = write_executable_tx_contract(&w);
+    let out = stdout(
+        ft(w.path())
+            .args([
+                "steer",
+                "run",
+                "--receipt",
+                &id,
+                "--dry-run",
+                "--format",
+                "json",
+            ])
+            .assert()
+            .failure(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(
+        v["error_code"],
+        serde_json::json!("robot.steer_hash_mismatch"),
+        "{out}"
+    );
+    assert!(
+        v["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("--contract-file")),
+        "{out}"
     );
 }
 

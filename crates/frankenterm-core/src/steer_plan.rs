@@ -475,6 +475,31 @@ pub fn steer_plan(
     created_at_ms: i64,
     ttl_ms: Option<i64>,
 ) -> SteerPlanResult {
+    steer_plan_bound(
+        scenario,
+        objective,
+        workspace_id,
+        generated_at_ms,
+        created_at_ms,
+        ttl_ms,
+        None,
+    )
+}
+
+/// [`steer_plan`] with the receipt bound to a tx contract's canonical hash
+/// (`MissionTxContract::compute_hash`). The binding is part of the
+/// content-addressed receipt id, and `steer_run_gate` only admits a receipt
+/// whose bound hash equals the live contract it executes; an unbound receipt
+/// is planning-only.
+pub fn steer_plan_bound(
+    scenario: SteerPlanScenario,
+    objective: &str,
+    workspace_id: &str,
+    generated_at_ms: u64,
+    created_at_ms: i64,
+    ttl_ms: Option<i64>,
+    tx_contract_hash: Option<String>,
+) -> SteerPlanResult {
     let input = scenario_input(scenario, generated_at_ms, objective);
     let plan = plan_mission_objective(&input);
     let status = plan.plan_status;
@@ -487,7 +512,7 @@ pub fn steer_plan(
         objective,
         workspace_id,
         None,
-        None,
+        tx_contract_hash,
         verdict,
         Some(score),
         approvals,
@@ -516,6 +541,36 @@ mod tests {
             1_704_000_000_000,
             None,
         )
+    }
+
+    #[test]
+    fn bound_receipt_passes_the_run_gate_only_for_its_contract() {
+        use crate::steer_run::{SteerRunGate, steer_run_gate};
+        let now = 1_704_000_000_000;
+        let bound = steer_plan_bound(
+            SteerPlanScenario::CleanReady,
+            "ship the W3 family",
+            "ws-test",
+            now as u64,
+            now,
+            None,
+            Some("tx-hash-a".to_string()),
+        );
+        assert_eq!(bound.receipt.tx_contract_hash.as_deref(), Some("tx-hash-a"));
+        assert_eq!(
+            steer_run_gate(&bound.receipt, None, Some("tx-hash-a"), now),
+            SteerRunGate::Valid
+        );
+        assert_eq!(
+            steer_run_gate(&bound.receipt, None, Some("tx-hash-b"), now),
+            SteerRunGate::HashMismatch { contract: "tx" }
+        );
+
+        // The binding is part of the content-addressed id, and an unbound
+        // planning-only receipt never admits a live contract.
+        let unbound = run(SteerPlanScenario::CleanReady);
+        assert_ne!(unbound.receipt.receipt_id, bound.receipt.receipt_id);
+        assert!(!steer_run_gate(&unbound.receipt, None, Some("tx-hash-a"), now).is_valid());
     }
 
     #[test]

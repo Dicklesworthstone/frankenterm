@@ -1630,6 +1630,10 @@
       "input_schema": {
         "additionalProperties": false,
         "properties": {
+          "contract_file": {
+            "description": "Tx contract JSON file the receipt binds (default: .ft/mission/tx-active.json when it exists)",
+            "type": "string"
+          },
           "format": {
             "description": "Optional output format override for this call",
             "enum": ["json", "toon"],
