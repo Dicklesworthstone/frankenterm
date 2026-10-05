@@ -2367,34 +2367,27 @@ fn drop_local_tabs_closed_on_server(
 /// name another local window once one remote window's tabs are spread over
 /// several local windows. Each operation carries its own requested window, so
 /// overlapping operations cannot redirect each other.
-fn place_tab_in_requested_window(
-    mux: &Mux,
-    tab: &Arc<Tab>,
-    requested_local_window: WindowId,
-) -> anyhow::Result<()> {
+///
+/// Best effort: the server has already committed the spawn or move, so a
+/// local placement failure is logged and the tab stays where the snapshot put
+/// it rather than failing an operation that did happen.
+fn place_tab_in_requested_window(mux: &Mux, tab: &Arc<Tab>, requested_local_window: WindowId) {
     if mux.get_window(requested_local_window).is_none() {
         // The requested window closed while the request was in flight; keep
         // the tab where the snapshot put it.
-        return Ok(());
+        return;
     }
-    match mux.window_containing_tab(tab.tab_id()) {
+    let placed = match mux.window_containing_tab(tab.tab_id()) {
         Some(current) if current == requested_local_window => Ok(()),
-        Some(_) => mux
-            .move_tab_between_windows(tab.tab_id(), requested_local_window, None)
-            .with_context(|| {
-                format!(
-                    "place tab {} in requested local window {requested_local_window}",
-                    tab.tab_id()
-                )
-            }),
-        None => mux
-            .add_tab_to_window(tab, requested_local_window)
-            .with_context(|| {
-                format!(
-                    "attach tab {} to requested local window {requested_local_window}",
-                    tab.tab_id()
-                )
-            }),
+        Some(_) => mux.move_tab_between_windows(tab.tab_id(), requested_local_window, None),
+        None => mux.add_tab_to_window(tab, requested_local_window),
+    };
+    if let Err(error) = placed {
+        log::warn!(
+            "keeping tab {} where the snapshot placed it; requested local window {}: {error:#}",
+            tab.tab_id(),
+            requested_local_window
+        );
     }
 }
 
@@ -5044,7 +5037,7 @@ impl Domain for ClientDomain {
                 .ok_or_else(|| anyhow!("local tab {local_tab_id} is invalid"))?;
             let local_win_id = match window_id {
                 Some(requested) => {
-                    place_tab_in_requested_window(mux, &tab, requested)?;
+                    place_tab_in_requested_window(mux, &tab, requested);
                     mux.window_containing_tab(local_tab_id)
                         .unwrap_or(local_win_id)
                 }
@@ -5096,7 +5089,7 @@ impl Domain for ClientDomain {
         rpc.commit_sync(RpcConsumerKind::SpawnResolution, || {
             let (tab, _pane, _window_id) =
                 Self::resolve_remote_spawn_entities(mux, &inner, result)?;
-            place_tab_in_requested_window(mux, &tab, window)?;
+            place_tab_in_requested_window(mux, &tab, window);
             Ok(tab)
         })
         .map_err(anyhow::Error::new)?
@@ -7431,12 +7424,12 @@ mod tests {
             .expect("tab 51 maps");
         let requested = *mux.new_empty_window(Some("ops".to_string()), None);
 
-        place_tab_in_requested_window(&mux, &tab, requested).expect("place the tab");
+        place_tab_in_requested_window(&mux, &tab, requested);
         assert_eq!(mux.window_containing_tab(tab.tab_id()), Some(requested));
         assert_eq!(inner.remote_to_local_window(41), Some(mapped_window));
 
         // A requested window that closed in flight leaves the tab in place.
-        place_tab_in_requested_window(&mux, &tab, usize::MAX).expect("closed window is a no-op");
+        place_tab_in_requested_window(&mux, &tab, usize::MAX);
         assert_eq!(mux.window_containing_tab(tab.tab_id()), Some(requested));
     }
 
