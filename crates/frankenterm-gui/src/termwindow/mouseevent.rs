@@ -99,13 +99,12 @@ impl super::TermWindow {
 
         let border = self.get_os_border();
 
-        let first_line_offset = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height().unwrap_or(0.) as isize
-        } else {
-            0
-        } + border.top.get() as isize;
+        let tab_bar_insets = self.tab_bar_insets().unwrap_or_default();
+        let first_line_offset = tab_bar_insets.top as isize + border.top.get() as isize;
 
         let (padding_left, padding_top) = self.padding_left_top();
+        // A left tab bar shifts the terminal area to the right.
+        let padding_left = padding_left + tab_bar_insets.left;
 
         let cell_h = self.render_metrics.cell_size.height.max(1);
         let cell_w = (self.render_metrics.cell_size.width as f32).max(1.0);
@@ -364,16 +363,9 @@ impl super::TermWindow {
         let dims = pane.get_dimensions();
         let current_viewport = self.get_viewport(pane.pane_id());
 
-        let tab_bar_height = if self.show_tab_bar {
-            self.tab_bar_pixel_height().unwrap_or(0.)
-        } else {
-            0.
-        };
-        let (top_bar_height, bottom_bar_height) = if self.config.tab_bar_at_bottom {
-            (0.0, tab_bar_height)
-        } else {
-            (tab_bar_height, 0.0)
-        };
+        let tab_bar_insets = self.tab_bar_insets().unwrap_or_default();
+        let top_bar_height = tab_bar_insets.top;
+        let bottom_bar_height = tab_bar_insets.bottom;
 
         let border = self.get_os_border();
         let y_offset = top_bar_height + border.top.get() as f32;

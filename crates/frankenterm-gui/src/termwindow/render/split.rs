@@ -72,11 +72,10 @@ impl crate::TermWindow {
         let cell_height = self.render_metrics.cell_size.height as f32;
 
         let border = self.get_os_border();
-        let first_row_offset = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height()?
-        } else {
-            0.
-        } + border.top.get() as f32;
+        let tab_bar_insets = self.tab_bar_insets()?;
+        let first_row_offset = tab_bar_insets.top + border.top.get() as f32;
+        // The left edge of the terminal area: OS border plus a left tab bar.
+        let left_offset = border.left.get() + tab_bar_insets.left as usize;
 
         let (padding_left, padding_top) = self.padding_left_top();
 
@@ -88,7 +87,7 @@ impl crate::TermWindow {
             first_row_offset,
             padding_left,
             padding_top,
-            border.left.get(),
+            left_offset,
         );
 
         if split.direction == SplitDirection::Horizontal {

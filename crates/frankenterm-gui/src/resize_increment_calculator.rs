@@ -9,7 +9,10 @@ pub struct ResizeIncrementCalculator {
     pub padding_right: usize,
     pub padding_bottom: usize,
     pub border: Border,
+    /// Height of a top/bottom tab bar in pixels.
     pub tab_bar_height: usize,
+    /// Width of a left/right tab bar in pixels.
+    pub tab_bar_width: usize,
 }
 
 fn saturating_resize_base(value: usize, increment: u16) -> u16 {
@@ -22,7 +25,8 @@ impl Into<ResizeIncrement> for ResizeIncrementCalculator {
         let base_width = self
             .padding_left
             .saturating_add(self.padding_right)
-            .saturating_add((self.border.left + self.border.right).get());
+            .saturating_add((self.border.left + self.border.right).get())
+            .saturating_add(self.tab_bar_width);
         let base_height = self
             .padding_top
             .saturating_add(self.padding_bottom)
@@ -69,11 +73,13 @@ mod tests {
             border_bottom in 0usize..40_000,
             border_right in 0usize..40_000,
             tab_bar_height in 0usize..80_000,
+            tab_bar_width in 0usize..80_000,
         ) {
             let expected_base_width = padding_left
                 .saturating_add(padding_right)
                 .saturating_add(border_left)
                 .saturating_add(border_right)
+                .saturating_add(tab_bar_width)
                 .min(usize::from(u16::MAX.saturating_sub(x)));
             let expected_base_height = padding_top
                 .saturating_add(padding_bottom)
@@ -91,6 +97,7 @@ mod tests {
                 padding_bottom,
                 border: test_border(border_top, border_left, border_bottom, border_right),
                 tab_bar_height,
+                tab_bar_width,
             }
             .into();
 
@@ -114,6 +121,7 @@ mod tests {
             padding_bottom: 7,
             border: test_border(8, 3, 2, 1),
             tab_bar_height: 11,
+            tab_bar_width: 0,
         }
         .into();
 
@@ -121,6 +129,25 @@ mod tests {
         assert_eq!(increment.y, 18);
         assert_eq!(increment.base_width, 14);
         assert_eq!(increment.base_height, 33);
+    }
+
+    #[test]
+    fn resize_increment_conversion_includes_vertical_tab_bar_in_base_width() {
+        let increment: ResizeIncrement = ResizeIncrementCalculator {
+            x: 9,
+            y: 18,
+            padding_left: 4,
+            padding_top: 5,
+            padding_right: 6,
+            padding_bottom: 7,
+            border: test_border(8, 3, 2, 1),
+            tab_bar_height: 0,
+            tab_bar_width: 225,
+        }
+        .into();
+
+        assert_eq!(increment.base_width, 14 + 225);
+        assert_eq!(increment.base_height, 22);
     }
 
     #[test]
@@ -134,6 +161,7 @@ mod tests {
             padding_bottom: 39_000,
             border: test_border(2_000, 3_000, 4_000, 5_000),
             tab_bar_height: 12_000,
+            tab_bar_width: 0,
         }
         .into();
 

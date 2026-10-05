@@ -1462,6 +1462,16 @@ impl ConfigHandle {
         }
     }
 
+    /// A handle to `config` that is not installed as the global
+    /// configuration.  Useful in tests that need non-default settings
+    /// without touching process-wide state.
+    pub fn detached(config: Config) -> Self {
+        Self {
+            config: Arc::new(config),
+            generation: 0,
+        }
+    }
+
     pub fn with_resolved_palette(&self, resolved_palette: crate::Palette) -> Self {
         let mut config = (*self.config).clone();
         config.resolved_palette = resolved_palette;
