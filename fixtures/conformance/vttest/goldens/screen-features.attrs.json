@@ -1,0 +1,56 @@
+{"session":"screen-features","screens":[
+{"screen":0,"rows":[
+]},
+{"screen":1,"rows":[
+]},
+{"screen":2,"rows":[
+]},
+{"screen":3,"rows":[
+]},
+{"screen":4,"rows":[
+]},
+{"screen":5,"rows":[
+]},
+{"screen":6,"rows":[
+]},
+{"screen":7,"rows":[
+]},
+{"screen":8,"rows":[
+]},
+{"screen":9,"rows":[
+]},
+{"screen":10,"rows":[
+]},
+{"screen":11,"rows":[
+]},
+{"screen":12,"rows":[
+]},
+{"screen":13,"rows":[
+{"row":4,"runs":[[40,4,"bold"]]},
+{"row":6,"runs":[[6,9,"underline=single"],[45,14,"bold underline=single"]]},
+{"row":8,"runs":[[1,5,"blink=slow"],[40,10,"bold blink=slow"]]},
+{"row":10,"runs":[[6,15,"underline=single blink=slow"],[45,20,"bold underline=single blink=slow"]]},
+{"row":12,"runs":[[1,8,"reverse"],[40,13,"bold reverse"]]},
+{"row":14,"runs":[[6,18,"underline=single reverse"],[45,23,"bold underline=single reverse"]]},
+{"row":16,"runs":[[1,14,"blink=slow reverse"],[40,19,"bold blink=slow reverse"]]},
+{"row":18,"runs":[[6,24,"underline=single blink=slow reverse"],[45,29,"bold underline=single blink=slow reverse"]]}
+]},
+{"screen":14,"rows":[
+{"row":4,"runs":[[40,4,"bold"]]},
+{"row":6,"runs":[[6,9,"underline=single"],[45,14,"bold underline=single"]]},
+{"row":8,"runs":[[1,5,"blink=slow"],[40,10,"bold blink=slow"]]},
+{"row":10,"runs":[[6,15,"underline=single blink=slow"],[45,20,"bold underline=single blink=slow"]]},
+{"row":12,"runs":[[1,8,"reverse"],[40,13,"bold reverse"]]},
+{"row":14,"runs":[[6,18,"underline=single reverse"],[45,23,"bold underline=single reverse"]]},
+{"row":16,"runs":[[1,14,"blink=slow reverse"],[40,19,"bold blink=slow reverse"]]},
+{"row":18,"runs":[[6,24,"underline=single blink=slow reverse"],[45,29,"bold underline=single blink=slow reverse"]]}
+]},
+{"screen":15,"rows":[
+{"row":10,"runs":[[24,10,"bold"],[36,10,"underline=single"],[48,10,"blink=slow"],[60,10,"reverse"]]},
+{"row":12,"runs":[[24,10,"bold"],[36,10,"underline=single"],[48,10,"blink=slow"],[60,10,"reverse"]]},
+{"row":14,"runs":[[24,10,"bold"],[36,10,"underline=single"],[48,10,"blink=slow"],[60,10,"reverse"]]},
+{"row":16,"runs":[[24,10,"bold"],[36,10,"underline=single"],[48,10,"blink=slow"],[60,10,"reverse"]]}
+]},
+{"screen":16,"rows":[
+]}
+]}

@@ -1,0 +1,219 @@
+# vttest/double-sized-characters screen dumps (ft-yccm0.1.9): cursor, DECSCNM, then rows.
+# Golden expectations: change only with a recorded reason (README).
+# Screens corrected by hand where legacy is wrong (see xfail.txt): 05, 06.
+=== 00 key ''
+cursor 21,41 visible
+screen normal
+01 ||
+02 ||
+03 |         VT100 test program, version 2.7 (20251205)|
+04 |         Screen size 24x80 (80 max)|
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Test of cursor movements|
+09 |          2. Test of screen features|
+10 |          3. Test of character sets|
+11 |          4. Test of double-sized characters|
+12 |          5. Test of keyboard|
+13 |          6. Test of terminal reports|
+14 |          7. Test of VT52 mode|
+15 |          8. Test of VT102 features (Insert/Delete Char/Line)|
+16 |          9. Test of known bugs|
+17 |          10. Test of reset and self-test|
+18 |          11. Test non-VT100 (e.g., VT220, XTERM) terminals|
+19 |          12. Modify test-parameters|
+20 ||
+21 |          Enter choice number (0 - 12):|
+22 ||
+23 ||
+24 ||
+=== 01 key '4\r'
+cursor 23,14 visible
+screen normal
+01 | 80 column mode|
+02 ||
+03 ||
+04 ||
+05 |  v------- left margin|
+06 ||
+07 |  This is a normal-sized line|
+08 ||
+09W| This is a Double-width line|
+10 ||
+11T| This is a Double-width-and-height line|
+12B| This is a Double-width-and-height line|
+13 ||
+14T| This is another such line|
+15B| This is another such line|
+16 ||
+17 |  ^------- left margin|
+18 ||
+19 ||
+20 ||
+21 |This is not a double-width line|
+22 ||
+23 |Push <RETURN>|
+24 ||
+=== 02 key '\r'
+cursor 23,14 visible
+screen normal
+01 | 80 column mode|
+02 ||
+03 ||
+04 ||
+05 |  v------- left margin|
+06 ||
+07 |  This is a normal-sized line|
+08 ||
+09W| This is a Double-width line|
+10 ||
+11T| This is a Double-width-and-height line|
+12B| This is a Double-width-and-height line|
+13 ||
+14T| This is another such line|
+15B| This is another such line|
+16 ||
+17 |  ^------- left margin|
+18 ||
+19 ||
+20 ||
+21W|This **is** a double-width line|
+22 ||
+23 |Push <RETURN>|
+24 ||
+=== 03 key '\r'
+cursor 23,14 visible
+screen normal
+01 | 80 column mode|
+02 ||
+03 ||
+04 ||
+05 |                            v------- left margin|
+06 ||
+07 |                            This is a normal-sized line|
+08 ||
+09W|              This is a Double-width line|
+10 ||
+11T|              This is a Double-width-and-height line|
+12B|              This is a Double-width-and-height line|
+13 ||
+14T|              This is another such line|
+15B|              This is another such line|
+16 ||
+17 |                            ^------- left margin|
+18 ||
+19 ||
+20 ||
+21 |This is not a double-width line|
+22 ||
+23 |Push <RETURN>|
+24 ||
+=== 04 key '\r'
+cursor 23,14 visible
+screen normal
+01 | 80 column mode|
+02 ||
+03 ||
+04 ||
+05 |                            v------- left margin|
+06 ||
+07 |                            This is a normal-sized line|
+08 ||
+09W|              This is a Double-width line|
+10 ||
+11T|              This is a Double-width-and-height line|
+12B|              This is a Double-width-and-height line|
+13 ||
+14T|              This is another such line|
+15B|              This is another such line|
+16 ||
+17 |                            ^------- left margin|
+18 ||
+19 ||
+20 ||
+21W|This **is** a double-width line|
+22 ||
+23 |Push <RETURN>|
+24 ||
+=== 05 key '\r'
+cursor 23,54 visible
+screen normal
+01 ||
+02 ||
+03 ||
+04 ||
+05 ||
+06 ||
+07 ||
+08T|┌──────────────────────────────────────┐|
+09B|┌──────────────────────────────────────┐|
+10T|│                                      │|
+11B|│                                      │|
+12T|│ * The mad programmer strikes again * │|
+13B|│ * The mad programmer strikes again * │|
+14T|│                                      │|
+15B|│                                      │|
+16T|└──────────────────────────────────────┘|
+17B|└──────────────────────────────────────┘|
+18 ||
+19 ||
+20 ||
+21 ||
+22 |Another test pattern...  a frame with blinking bold text,|
+23 |all in double-height double-width size. Push <RETURN>|
+24 ||
+=== 06 key '\r'
+cursor 1,53 visible
+screen normal
+01 |Exactly half of the box should remain. Push <RETURN>|
+02 ||
+03 ||
+04 ||
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20T|┌──────────────────────────────────────┐|
+21B|┌──────────────────────────────────────┐|
+22T|│                                      │|
+23B|│                                      │|
+24T|│ * The mad programmer strikes again * │|
+=== 07 key '\r'
+cursor 21,41 visible
+screen normal
+01 ||
+02 ||
+03 |         VT100 test program, version 2.7 (20251205)|
+04 |         Screen size 24x80 (80 max)|
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Test of cursor movements|
+09 |          2. Test of screen features|
+10 |          3. Test of character sets|
+11 |          4. Test of double-sized characters|
+12 |          5. Test of keyboard|
+13 |          6. Test of terminal reports|
+14 |          7. Test of VT52 mode|
+15 |          8. Test of VT102 features (Insert/Delete Char/Line)|
+16 |          9. Test of known bugs|
+17 |          10. Test of reset and self-test|
+18 |          11. Test non-VT100 (e.g., VT220, XTERM) terminals|
+19 |          12. Modify test-parameters|
+20 ||
+21 |          Enter choice number (0 - 12):|
+22 ||
+23 ||
+24 ||

@@ -1,0 +1,235 @@
+# vttest recording for the conformance runner (ft-yccm0.1.9).
+# Captured by capture_vttest.py; do not edit by hand.
+@vttest VT100 test program, version 2.7 (20251205)
+@geometry 24x80.80 24x80 TERM=vt100 LC_ALL=C
+@session vt220-screen-display keys '11\r' '1\r' '2\r' '2\r' '*' '3\r' '*' '4\r' '*' '0\r' '6\r' '*'
+@screen 00 key ''
+\e[0c\eP$q"p\e\\\e[>c\e[?1l\e[?3l\e[?4l\e[?5l\e[?6l\e[?7h\e[?8l\e[?40h\e[?45l\e[r\e[0m\e[2J\e[3;10HVT100 test program, version 2.7 (20251205)
+\e[4;10HScreen size 24x80 (80 max) \e[5;10HChoose test type:\r\r\n
+\e[6;1H\e[0J\r\r\n
+          0. Exit\r\n
+          1. Test of cursor movements\r\n
+          2. Test of screen features\r\n
+          3. Test of character sets\r\n
+          4. Test of double-sized characters\r\n
+          5. Test of keyboard\r\n
+          6. Test of terminal reports\r\n
+          7. Test of VT52 mode\r\n
+          8. Test of VT102 features (Insert/Delete Char/Line)\r\n
+          9. Test of known bugs\r\n
+          10. Test of reset and self-test\r\n
+          11. Test non-VT100 (e.g., VT220, XTERM) terminals\r\n
+          12. Modify test-parameters\r\n
+\r\r\n
+          Enter choice number (0 - 12):\x20
+@screen 01 key '11\r'
+11\r\n
+\e[2J\e[2J\e[3;10HMenu 11: Non-VT100 Tests\e[5;10HChoose test type:\r\r\n
+\e[6;1H\e[0J\r\r\n
+          0. Exit\r\n
+          1. Test of VT220 features\r\n
+          2. Test of VT320 features\r\n
+          3. Test of VT420 features\r\n
+          4. Test of VT520 features\r\n
+          5. Test ISO-6429 cursor-movement\r\n
+          6. Test ISO-6429 colors\r\n
+          7. Test other ISO-6429 features\r\n
+          8. Test XTERM special features\r\n
+\r\r\n
+          Enter choice number (0 - 8):\x20
+@screen 02 key '1\r'
+1\r\n
+\e[2J\e[2J\e[3;10HMenu 11.1: VT220 Tests\e[5;10HChoose test type:\r\r\n
+\e[6;1H\e[0J\r\r\n
+          0. Exit\r\n
+          1. Test reporting functions\r\n
+          2. Test screen-display functions\r\n
+          3. Test 8-bit controls (S7C1T/S8C1T)\r\n
+          4. Test Printer (MC)\r\n
+          5. Test Soft Character Sets (DECDLD)\r\n
+          6. Test Soft Terminal Reset (DECSTR)\r\n
+          7. Test User-Defined Keys (DECUDK)\r\n
+\r\r\n
+          Enter choice number (0 - 7):\x20
+@screen 03 key '2\r'
+2\r\n
+\e[2J\e[2J\e[3;10HMenu 11.1.2: VT220 Screen-Display Tests\e[5;10HChoose test type:\r\r\n
+\e[6;1H\e[0J\r\r\n
+          0. Exit\r\n
+          1. Test Send/Receive mode (SRM)\r\n
+          2. Test Visible/Invisible Cursor (DECTCEM)\r\n
+          3. Test Erase Char (ECH)\r\n
+          4. Test Protected-Areas (DECSCA)\r\n
+\r\r\n
+          Enter choice number (0 - 4):\x20
+@screen 04 key '2\r'
+2\r\n
+\e[2J\e[1;1H\e[?25lThe cursor should be invisible\r\r\n
+Push <RETURN>
+@screen 05 key '\r'
+\r\n
+\e[?25hThe cursor should be visible again\r\r\n
+Push <RETURN>
+@screen 06 key '\r'
+\r\n
+\e[2J\e[3;10HMenu 11.1.2: VT220 Screen-Display Tests\e[5;10HChoose test type:\r\r\n
+\e[6;1H\e[0J\r\r\n
+          0. Exit\r\n
+          1. Test Send/Receive mode (SRM)\r\n
+          2. Test Visible/Invisible Cursor (DECTCEM)\r\n
+          3. Test Erase Char (ECH)\r\n
+          4. Test Protected-Areas (DECSCA)\r\n
+\r\r\n
+          Enter choice number (0 - 4):\x20
+@screen 07 key '3\r'
+3\r\n
+\e[2J\e#8\e[1;77H\e[X\e[1;78H*\e[80X*\e[2;76H\e[X\e[2;77H*\e[80X*\e[3;75H\e[X\e[3;76H*\e[80X*\e[4;74H
+\e[X\e[4;75H*\e[80X*\e[5;73H\e[X\e[5;74H*\e[80X*\e[6;72H\e[X\e[6;73H*\e[80X*\e[7;71H\e[X\e[7;72H*
+\e[80X*\e[8;70H\e[X\e[8;71H*\e[80X*\e[9;69H\e[X\e[9;70H*\e[80X*\e[10;68H\e[X\e[10;69H*\e[80X*\e[11;67H
+\e[X\e[11;68H*\e[80X*\e[12;66H\e[X\e[12;67H*\e[80X*\e[13;65H\e[X\e[13;66H*\e[80X*\e[14;64H\e[X\e[14;65H*
+\e[80X*\e[15;63H\e[X\e[15;64H*\e[80X*\e[16;62H\e[X\e[16;63H*\e[80X*\e[17;61H\e[X\e[17;62H*\e[80X*
+\e[18;60H\e[X\e[18;61H*\e[80X*\e[19;59H\e[X\e[19;60H*\e[80X*\e[20;58H\e[X\e[20;59H*\e[80X*\e[21;57H
+\e[X\e[21;58H*\e[80X*\e[22;56H\e[X\e[22;57H*\e[80X*\e[23;55H\e[X\e[23;56H*\e[80X*\e[24;54H\e[X\e[24;55H*
+\e[80X*\e[20;1H\e[0J\e[20;50Hdiagonal: ^^ (clear)\r\r\n
+ECH test: there should be E's with a gap before diagonal of **'s\r\r\n
+The lower-right diagonal region should be cleared.  Nothing else.\r\r\n
+Push <RETURN>
+@screen 08 key '\r'
+\r\n
+\e[2J\e[3;10HMenu 11.1.2: VT220 Screen-Display Tests\e[5;10HChoose test type:\r\r\n
+\e[6;1H\e[0J\r\r\n
+          0. Exit\r\n
+          1. Test Send/Receive mode (SRM)\r\n
+          2. Test Visible/Invisible Cursor (DECTCEM)\r\n
+          3. Test Erase Char (ECH)\r\n
+          4. Test Protected-Areas (DECSCA)\r\n
+\r\r\n
+          Enter choice number (0 - 4):\x20
+@screen 09 key '4\r'
+4\r\n
+\e[2J\e[1"q\e[5;21H*****************************************\e[6;21H*****************************************
+\e[7;21H*****************************************\e[8;21H*****************************************
+\e[9;21H*****************************************\e[10;21H*****************************************
+\e[11;21H*****************************************\e[12;21H*****************************************
+\e[13;21H*****************************************\e[14;21H*****************************************
+\e[15;21H*****************************************\e[16;21H*****************************************
+\e[17;21H*****************************************\e[0"q\e[1;18H*\e[1;64H*\e[2;19H*\e[2;63H*\e[3;20H*
+\e[3;62H*\e[4;21H*\e[4;61H*\e[18;21H*\e[18;61H*\e[19;20H*\e[19;62H*\e[20;19H*\e[20;63H*\e[21;18H*
+\e[21;64H*\e[22;17H*\e[22;65H*\e[23;16H*\e[23;66H*\e[11;39H\e[?0J\e[1;19H*\e[1;63H*\e[2;20H*\e[2;62H*
+\e[3;21H*\e[3;61H*\e[4;22H*\e[4;60H*\e[18;22H*\e[18;60H*\e[19;21H*\e[19;61H*\e[20;20H*\e[20;62H*
+\e[21;19H*\e[21;63H*\e[22;18H*\e[22;64H*\e[23;17H*\e[23;65H*\e[11;39H\e[?1J\e[1;20H*\e[1;62H*\e[2;21H*
+\e[2;61H*\e[3;22H*\e[3;60H*\e[4;23H*\e[4;59H*\e[18;23H*\e[18;59H*\e[19;22H*\e[19;60H*\e[20;21H*\e[20;61H*
+\e[21;20H*\e[21;62H*\e[22;19H*\e[22;63H*\e[23;18H*\e[23;64H*\e[11;39H\e[?2J\e[7;62H*\e[13;62H*\e[7;63H*
+\e[13;63H*\e[7;64H*\e[13;64H*\e[7;65H*\e[13;65H*\e[7;66H*\e[13;66H*\e[7;67H*\e[13;67H*\e[7;68H*\e[13;68H*
+\e[7;69H*\e[13;69H*\e[7;70H*\e[13;70H*\e[7;71H*\e[13;71H*\e[7;72H*\e[13;72H*\e[7;73H*\e[13;73H*\e[7;74H*
+\e[13;74H*\e[7;75H*\e[13;75H*\e[7;76H*\e[13;76H*\e[7;77H*\e[13;77H*\e[7;78H*\e[13;78H*\e[7;79H*\e[13;79H*
+\e[7;80H*\e[13;80H*\e[7;81H*\e[13;81H*\e[13;41H\e[?0K\e[7;2H*\e[13;2H*\e[7;3H*\e[13;3H*\e[7;4H*\e[13;4H*
+\e[7;5H*\e[13;5H*\e[7;6H*\e[13;6H*\e[7;7H*\e[13;7H*\e[7;8H*\e[13;8H*\e[7;9H*\e[13;9H*\e[7;10H*\e[13;10H*
+\e[7;11H*\e[13;11H*\e[7;12H*\e[13;12H*\e[7;13H*\e[13;13H*\e[7;14H*\e[13;14H*\e[7;15H*\e[13;15H*\e[7;16H*
+\e[13;16H*\e[7;17H*\e[13;17H*\e[7;18H*\e[13;18H*\e[7;19H*\e[13;19H*\e[7;20H*\e[13;20H*\e[13;41H\e[?1K
+\e[7;41H\e[?2K\e[21;1H\e[0JIf your terminal supports DEC protected areas (DECSCA, DECSED, DECSEL),\r\r\n
+there will be an solid box made of *'s in the middle of the screen.\r\r\n
+Push <RETURN>
+@screen 10 key '\r'
+\r\n
+\e[5;21H*****************************************\e[6;21H*****************************************
+\e[7;21H*****************************************\e[8;21H*****************************************
+\e[9;21H*****************************************\e[10;21H*****************************************
+\e[11;21H*****************************************\e[12;21H*****************************************
+\e[13;21H*****************************************\e[14;21H*****************************************
+\e[15;21H*****************************************\e[16;21H*****************************************
+\e[17;21H*****************************************\e[1"q\e[1;1H#################################################################################
+\e[2;1H#################################################################################\e[3;1H#################################################################################
+\e[4;1H#################################################################################\e[5;1H#################################################################################
+\e[6;1H#################################################################################\e[7;1H####################*****************************************####################
+\e[8;1H####################*****************************************####################\e[9;1H####################*****************************************####################
+\e[10;1H####################*****************************************####################\e[11;1H####################*****************************************####################
+\e[12;1H####################*****************************************####################\e[13;1H####################*****************************************####################
+\e[14;1H####################*****************************************####################\e[15;1H####################*****************************************####################
+\e[16;1H####################*****************************************####################\e[17;1H####################*****************************************####################
+\e[18;1H####################*****************************************####################\e[19;1H####################*****************************************####################
+\e[20;1H#################################################################################\e[21;1H#################################################################################
+\e[22;1H#################################################################################\e[23;1H#################################################################################
+\e[24;1H#################################################################################\e[25;1H#################################################################################
+\e[4;80H\e[1J\e[18;1H\e[0J\e[1;20H\e[1K\e[1;62H\e[0K\e[2;20H\e[1K\e[2;62H\e[0K\e[3;20H\e[1K\e[3;62H
+\e[0K\e[4;20H\e[1K\e[4;62H\e[0K\e[5;20H\e[1K\e[5;62H\e[0K\e[6;20H\e[1K\e[6;62H\e[0K\e[7;20H\e[1K
+\e[7;62H\e[0K\e[8;20H\e[1K\e[8;62H\e[0K\e[9;20H\e[1K\e[9;62H\e[0K\e[10;20H\e[1K\e[10;62H\e[0K\e[11;20H
+\e[1K\e[11;62H\e[0K\e[12;20H\e[1K\e[12;62H\e[0K\e[13;20H\e[1K\e[13;62H\e[0K\e[14;20H\e[1K\e[14;62H
+\e[0K\e[15;20H\e[1K\e[15;62H\e[0K\e[16;20H\e[1K\e[16;62H\e[0K\e[17;20H\e[1K\e[17;62H\e[0K\e[18;20H
+\e[1K\e[18;62H\e[0K\e[19;20H\e[1K\e[19;62H\e[0K\e[20;20H\e[1K\e[20;62H\e[0K\e[21;20H\e[1K\e[21;62H
+\e[0K\e[22;20H\e[1K\e[22;62H\e[0K\e[23;20H\e[1K\e[23;62H\e[0K\e[24;20H\e[1K\e[24;62H\e[0K\e[25;20H
+\e[1K\e[25;62H\e[0K\e[0"q\e[21;1H\e[0JIf your terminal supports DEC protected areas (DECSCA, ignoring EL/ED),\r\r\n
+there will be an solid box made of *'s in the middle of the screen.\r\r\n
+Push <RETURN>
+@screen 11 key '\r'
+\r\n
+\e[1"q\e[1;1H#################################################################################\e[2;1H#################################################################################
+\e[3;1H#################################################################################\e[4;1H#################################################################################
+\e[5;1H#################################################################################\e[6;1H#################################################################################
+\e[7;1H####################*****************************************####################\e[8;1H####################*****************************************####################
+\e[9;1H####################*****************************************####################\e[10;1H####################*****************************************####################
+\e[11;1H####################*****************************************####################\e[12;1H####################*****************************************####################
+\e[13;1H####################*****************************************####################\e[14;1H####################*****************************************####################
+\e[15;1H####################*****************************************####################\e[16;1H####################*****************************************####################
+\e[17;1H####################*****************************************####################\e[18;1H####################*****************************************####################
+\e[19;1H####################*****************************************####################\e[20;1H#################################################################################
+\e[21;1H#################################################################################\e[22;1H#################################################################################
+\e[23;1H#################################################################################\e[24;1H#################################################################################
+\e[25;1H#################################################################################\e[1;1H
+\e[80X\e[2;1H\e[80X\e[3;1H\e[80X\e[4;1H\e[80X\e[5;1H\e[20X\e[5;62H\e[19P\e[6;1H\e[20X\e[6;62H\e[19@
+\e[7;1H\e[20X\e[7;62H\e[19P\e[8;1H\e[20X\e[8;62H\e[19@\e[9;1H\e[20X\e[9;62H\e[19P\e[10;1H\e[20X\e[10;62H
+\e[19@\e[11;1H\e[20X\e[11;62H\e[19P\e[12;1H\e[20X\e[12;62H\e[19@\e[13;1H\e[20X\e[13;62H\e[19P\e[14;1H
+\e[20X\e[14;62H\e[19@\e[15;1H\e[20X\e[15;62H\e[19P\e[16;1H\e[20X\e[16;62H\e[19@\e[17;1H\e[20X\e[17;62H
+\e[19P\e[18;1H\e[80P\e[19;1H\e[80P\e[20;1H\e[80P\e[21;1H\e[80P\e[22;1H\e[80P\e[23;1H\e[80P\e[0"q
+\e[21;1H\e[0JIf your terminal supports DEC protected areas (DECSCA, ignoring ECH/ICH/DCH),\r\r\n
+there will be an solid box made of *'s in the middle of the screen.\r\r\n
+Push <RETURN>
+@screen 12 key '\r'
+\r\n
+\e[2J\e[3;10HMenu 11.1.2: VT220 Screen-Display Tests\e[5;10HChoose test type:\r\r\n
+\e[6;1H\e[0J\r\r\n
+          0. Exit\r\n
+          1. Test Send/Receive mode (SRM)\r\n
+          2. Test Visible/Invisible Cursor (DECTCEM)\r\n
+          3. Test Erase Char (ECH)\r\n
+          4. Test Protected-Areas (DECSCA)\r\n
+\r\r\n
+          Enter choice number (0 - 4):\x20
+@screen 13 key '0\r'
+0\r\n
+\e[2J\e[2J\e[3;10HMenu 11.1: VT220 Tests\e[5;10HChoose test type:\r\r\n
+\e[6;1H\e[0J\r\r\n
+          0. Exit\r\n
+          1. Test reporting functions\r\n
+          2. Test screen-display functions\r\n
+          3. Test 8-bit controls (S7C1T/S8C1T)\r\n
+          4. Test Printer (MC)\r\n
+          5. Test Soft Character Sets (DECDLD)\r\n
+          6. Test Soft Terminal Reset (DECSTR)\r\n
+          7. Test User-Defined Keys (DECUDK)\r\n
+\r\r\n
+          Enter choice number (0 - 7):\x20
+@screen 14 key '6\r'
+6\r\n
+\e[2J\e[1;1HTest Soft Terminal Reset (DECSTR)\r\r\n
+(VT220 & up)\r\r\n
+\r\r\n
+The terminal will now soft-reset\r\r\n
+Push <RETURN>
+@screen 15 key '\r'
+\r\n
+\e[!pPush <RETURN>
+@screen 16 key '\r'
+\r\n
+\e[2J\e[3;10HMenu 11.1: VT220 Tests\e[5;10HChoose test type:\r\r\n
+\e[6;1H\e[0J\r\r\n
+          0. Exit\r\n
+          1. Test reporting functions\r\n
+          2. Test screen-display functions\r\n
+          3. Test 8-bit controls (S7C1T/S8C1T)\r\n
+          4. Test Printer (MC)\r\n
+          5. Test Soft Character Sets (DECDLD)\r\n
+          6. Test Soft Terminal Reset (DECSTR)\r\n
+          7. Test User-Defined Keys (DECUDK)\r\n
+\r\r\n
+          Enter choice number (0 - 7):\x20

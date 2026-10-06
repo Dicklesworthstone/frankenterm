@@ -3,20 +3,26 @@
 //! The self-tests plant deliberately divergent engines and require the
 //! harness to catch and minimize them, so the harness cannot pass vacuously.
 //! The remaining tests check every registered candidate against the legacy
-//! engine on the M.1 corpora, the escape-parser fuzz seeds, adversarial cases
-//! and a fixed-seed random campaign. See `tests/differential/mod.rs` for the
-//! long-campaign settings.
+//! engine on the M.1 corpora, the escape-parser fuzz seeds, the recorded
+//! vttest sessions (ft-yccm0.1.9), adversarial cases and a fixed-seed random
+//! campaign. See `tests/differential/mod.rs` for the long-campaign settings.
 
 #[path = "differential/mod.rs"]
 #[allow(dead_code)]
 mod differential;
+
+/// The `.vtrec` reader the conformance runner uses.
+#[path = "conformance/vtrec.rs"]
+#[allow(dead_code)]
+mod vtrec;
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use differential::ddmin::ddmin;
 use differential::engine::{
-    candidates, new_terminal, Engine, EngineFactory, Geometry, Legacy, GEOMETRIES,
+    candidates, drain_replies, new_terminal_with, Engine, EngineFactory, EngineIo, Geometry,
+    Legacy, GEOMETRIES,
 };
 use differential::harness::{self, minimize, run_lockstep, Repro};
 use differential::snapshot::{self, EngineSnapshot};
@@ -50,6 +56,10 @@ impl Engine for IgnoresReverseVideoEngine {
     fn snapshot(&self) -> EngineSnapshot {
         snapshot::capture(&self.terminal)
     }
+
+    fn wait_for_replies(&mut self) {
+        drain_replies(&mut self.terminal);
+    }
 }
 
 impl EngineFactory for IgnoresReverseVideo {
@@ -57,9 +67,9 @@ impl EngineFactory for IgnoresReverseVideo {
         "mock_ignores_reverse_video"
     }
 
-    fn build(&self, geometry: &Geometry) -> Box<dyn Engine> {
+    fn build_with(&self, geometry: &Geometry, io: EngineIo) -> Box<dyn Engine> {
         Box::new(IgnoresReverseVideoEngine {
-            terminal: new_terminal(geometry),
+            terminal: new_terminal_with(geometry, io),
         })
     }
 }
@@ -81,6 +91,10 @@ impl Engine for FreshParserEachChunkEngine {
     fn snapshot(&self) -> EngineSnapshot {
         snapshot::capture(&self.terminal)
     }
+
+    fn wait_for_replies(&mut self) {
+        drain_replies(&mut self.terminal);
+    }
 }
 
 impl EngineFactory for FreshParserEachChunk {
@@ -88,9 +102,9 @@ impl EngineFactory for FreshParserEachChunk {
         "mock_fresh_parser_each_chunk"
     }
 
-    fn build(&self, geometry: &Geometry) -> Box<dyn Engine> {
+    fn build_with(&self, geometry: &Geometry, io: EngineIo) -> Box<dyn Engine> {
         Box::new(FreshParserEachChunkEngine {
-            terminal: new_terminal(geometry),
+            terminal: new_terminal_with(geometry, io),
         })
     }
 }
@@ -332,6 +346,39 @@ fn every_candidate_matches_legacy_on_the_escape_parser_fuzz_seeds() {
             name,
             &geometry,
             &streams::chunk(bytes, ChunkPlan::Bytewise, 0),
+        );
+    }
+}
+
+#[test]
+fn every_candidate_matches_legacy_on_the_vttest_recordings() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/conformance/vttest");
+    let recordings = vtrec::load_dir(&dir).unwrap_or_else(|err| panic!("{}", err));
+    assert!(
+        recordings.len() >= 10,
+        "only {} recordings in {}",
+        recordings.len(),
+        dir.display()
+    );
+    for (index, recording) in recordings.iter().enumerate() {
+        let geometry = Geometry {
+            rows: recording.rows,
+            cols: recording.cols,
+            scrollback: 32,
+        };
+        // vttest's own write boundaries: one chunk per screen.
+        let screens: Vec<Vec<u8>> = recording
+            .screens
+            .iter()
+            .map(|screen| screen.bytes.clone())
+            .collect();
+        let name = format!("vttest-{}", recording.session);
+        check_all(&name, &geometry, &screens);
+        let bytes = screens.concat();
+        check_all(
+            &format!("{}-random", name),
+            &geometry,
+            &streams::chunk(&bytes, ChunkPlan::Random { max: 256 }, index as u64),
         );
     }
 }

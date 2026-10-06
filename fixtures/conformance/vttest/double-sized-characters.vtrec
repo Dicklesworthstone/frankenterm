@@ -1,0 +1,76 @@
+# vttest recording for the conformance runner (ft-yccm0.1.9).
+# Captured by capture_vttest.py; do not edit by hand.
+@vttest VT100 test program, version 2.7 (20251205)
+@geometry 24x80.80 24x80 TERM=vt100 LC_ALL=C
+@session double-sized-characters keys '4\r' '*'
+@screen 00 key ''
+\e[0c\eP$q"p\e\\\e[>c\e[?1l\e[?3l\e[?4l\e[?5l\e[?6l\e[?7h\e[?8l\e[?40h\e[?45l\e[r\e[0m\e[2J\e[3;10HVT100 test program, version 2.7 (20251205)
+\e[4;10HScreen size 24x80 (80 max) \e[5;10HChoose test type:\r\r\n
+\e[6;1H\e[0J\r\r\n
+          0. Exit\r\n
+          1. Test of cursor movements\r\n
+          2. Test of screen features\r\n
+          3. Test of character sets\r\n
+          4. Test of double-sized characters\r\n
+          5. Test of keyboard\r\n
+          6. Test of terminal reports\r\n
+          7. Test of VT52 mode\r\n
+          8. Test of VT102 features (Insert/Delete Char/Line)\r\n
+          9. Test of known bugs\r\n
+          10. Test of reset and self-test\r\n
+          11. Test non-VT100 (e.g., VT220, XTERM) terminals\r\n
+          12. Modify test-parameters\r\n
+\r\r\n
+          Enter choice number (0 - 12):\x20
+@screen 01 key '4\r'
+4\r\n
+\e[2J\e[2J\e[1;1H\e[?3l 80 column mode\e[5;3Hv------- left margin\e[7;3HThis is a normal-sized line
+\e#3\e#4\e#6\e#5\e[9;2HThis is a Double-width line\e#5\e#3\e#4\e#6\e[11;2H\e#6\e#5\e#4\e#3This is a Double-width-and-height line
+\e[12;2H\e#6\e#5\e#3\e#4This is a Double-width-and-height line\e[14;2H\e#6\e#5\e#4\e#3\e[2KThis is another such line
+\e[15;2H\e#6\e#5\e#3\e#4This is another such line\e[17;3H^------- left margin\e[21;1HThis is not a double-width line
+\e[21;6His not\e#5\e[23;1HPush <RETURN>
+@screen 02 key '\r'
+\r\n
+\e[21;6H**is**\e#6\e[23;1HPush <RETURN>
+@screen 03 key '\r'
+\r\n
+\e[2J\e[1;1H\e[?3h 80 column mode\e[5;29Hv------- left margin\e[7;29HThis is a normal-sized line
+\e#3\e#4\e#6\e#5\e[9;15HThis is a Double-width line\e#5\e#3\e#4\e#6\e[11;15H\e#6\e#5\e#4\e#3This is a Double-width-and-height line
+\e[12;15H\e#6\e#5\e#3\e#4This is a Double-width-and-height line\e[14;15H\e#6\e#5\e#4\e#3\e[2KThis is another such line
+\e[15;15H\e#6\e#5\e#3\e#4This is another such line\e[17;29H^------- left margin\e[21;1HThis is not a double-width line
+\e[21;6His not\e#5\e[23;1HPush <RETURN>
+@screen 04 key '\r'
+\r\n
+\e[21;6H**is**\e#6\e[23;1HPush <RETURN>
+@screen 05 key '\r'
+\r\n
+\e[1;1H\e[3g\e[8C\eH\e[8C\eH\e[8C\eH\e[8C\eH\e[8C\eH\e[8C\eH\e[8C\eH\e[8C\eH\e[8C\eH\e[8C\eH\e[?3l
+\e[2J\e(0\e)B\x0f\e[8;1H\e#3lqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqk\e[9;1H\e#4lqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqk
+\e[10;1H\e#3x\t\t\t\t\tx\e[11;1H\e#4x\t\t\t\t\tx\e[12;1H\e#3x\t\t\t\t\tx\e[13;1H\e#4x\t\t\t\t\tx
+\e)0\e(B\x0e\e[14;1H\e#3x                                      x\e[15;1H\e#4x                                      x
+\e[16;1H\e#3mqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqj\e[17;1H\e#4mqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqj
+\e(B\e)B\x0f\e[1;5m\e[12;3H* The mad programmer strikes again * \e[13;3H\t\e[6D* The mad programmer strikes again *
+\e[0m\e[22;1HAnother test pattern...  a frame with blinking bold text,\r\r\n
+all in double-height double-width size. Push <RETURN>
+@screen 06 key '\r'
+\r\n
+\e[8;24r\e[8;1H\eM\eM\eM\eM\eM\eM\eM\eM\eM\eM\eM\eM\e[r\e[1;1HExactly half of the box should remain. Push <RETURN>
+@screen 07 key '\r'
+\r\n
+\e[2J\e[3;10HVT100 test program, version 2.7 (20251205)\e[4;10HScreen size 24x80 (80 max) \e[5;10HChoose test type:\r\r\n
+\e[6;1H\e[0J\r\r\n
+          0. Exit\r\n
+          1. Test of cursor movements\r\n
+          2. Test of screen features\r\n
+          3. Test of character sets\r\n
+          4. Test of double-sized characters\r\n
+          5. Test of keyboard\r\n
+          6. Test of terminal reports\r\n
+          7. Test of VT52 mode\r\n
+          8. Test of VT102 features (Insert/Delete Char/Line)\r\n
+          9. Test of known bugs\r\n
+          10. Test of reset and self-test\r\n
+          11. Test non-VT100 (e.g., VT220, XTERM) terminals\r\n
+          12. Modify test-parameters\r\n
+\r\r\n
+          Enter choice number (0 - 12):\x20
