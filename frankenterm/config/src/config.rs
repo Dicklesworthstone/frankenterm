@@ -2427,9 +2427,10 @@ pub const MIN_MAX_FPS: u64 = 1;
 
 /// Highest supported repaint-rate limit.
 ///
-/// Timer-backed window implementations use millisecond resolution. Limiting
-/// the configured rate to 1,000 keeps their interval strictly positive rather
-/// than turning throttling into a zero-duration reschedule loop.
+/// The repaint throttles sleep on the runtime's timer wheel, whose finest
+/// level ticks once per millisecond. Limiting the configured rate to 1,000
+/// keeps their interval at one tick or more rather than turning throttling
+/// into a zero-duration reschedule loop.
 pub const MAX_MAX_FPS: u64 = 1_000;
 
 fn validate_max_fps(value: &u64) -> Result<(), String> {
@@ -2442,17 +2443,20 @@ fn validate_max_fps(value: &u64) -> Result<(), String> {
     }
 }
 
-/// Convert a configured repaint-rate limit into a nonzero timer interval.
+/// Convert a configured repaint-rate limit into a nonzero repaint interval.
 ///
 /// Dynamic configuration rejects values outside [`MIN_MAX_FPS`] through
 /// [`MAX_MAX_FPS`]. The clamp is intentional defense in depth for internal
-/// callers that construct or mutate [`Config`] directly. Ceiling division is
-/// required here: rounding the millisecond interval down would allow the timer
-/// to exceed the configured frame-rate limit for non-divisors of 1,000.
+/// callers that construct or mutate [`Config`] directly.
+///
+/// The interval is exact to the nanosecond, rounded up so that paints spaced
+/// by it never exceed the configured rate: `max_fps = 60` gives 16,666,667 ns.
+/// Rounding up to whole milliseconds instead (17 ms) capped FrankenTerm at
+/// 58.8 FPS on a 60 Hz display, below its own default limit (ft-1w85m).
 #[must_use]
 pub fn frame_interval_for_max_fps(max_fps: u64) -> Duration {
     let bounded = max_fps.clamp(MIN_MAX_FPS, MAX_MAX_FPS);
-    Duration::from_millis(1_000_u64.div_ceil(bounded))
+    Duration::from_nanos(1_000_000_000_u64.div_ceil(bounded))
 }
 
 fn default_initial_rows() -> u16 {
@@ -3457,17 +3461,19 @@ mod tests {
 
     #[test]
     fn frame_interval_is_nonzero_for_valid_and_defensive_inputs() {
-        assert_eq!(frame_interval_for_max_fps(0), Duration::from_millis(1_000));
+        assert_eq!(frame_interval_for_max_fps(0), Duration::from_secs(1));
         assert_eq!(
             frame_interval_for_max_fps(MIN_MAX_FPS),
-            Duration::from_millis(1_000)
+            Duration::from_secs(1)
         );
         assert_eq!(
-            frame_interval_for_max_fps(default_max_fps()),
-            Duration::from_millis(17)
+            frame_interval_for_max_fps(3),
+            Duration::from_nanos(333_333_334)
         );
-        assert_eq!(frame_interval_for_max_fps(3), Duration::from_millis(334));
-        assert_eq!(frame_interval_for_max_fps(999), Duration::from_millis(2));
+        assert_eq!(
+            frame_interval_for_max_fps(999),
+            Duration::from_nanos(1_001_002)
+        );
         assert_eq!(
             frame_interval_for_max_fps(MAX_MAX_FPS),
             Duration::from_millis(1)
@@ -3478,16 +3484,73 @@ mod tests {
         );
     }
 
+    /// ft-1w85m: the interval is exact to the nanosecond, not whole
+    /// milliseconds. 17 ms for the default of 60 capped repaint at 58.8 FPS.
+    #[test]
+    fn frame_interval_is_nanosecond_exact_for_display_rates() {
+        assert_eq!(default_max_fps(), 60);
+        assert_eq!(
+            frame_interval_for_max_fps(60),
+            Duration::from_nanos(16_666_667)
+        );
+        assert_eq!(
+            frame_interval_for_max_fps(120),
+            Duration::from_nanos(8_333_334)
+        );
+        assert_eq!(
+            frame_interval_for_max_fps(144),
+            Duration::from_nanos(6_944_445)
+        );
+        assert_eq!(
+            frame_interval_for_max_fps(30),
+            Duration::from_nanos(33_333_334)
+        );
+        assert_eq!(frame_interval_for_max_fps(50), Duration::from_millis(20));
+        assert_eq!(
+            frame_interval_for_max_fps(240),
+            Duration::from_nanos(4_166_667)
+        );
+    }
+
+    /// Paints spaced by the interval reach every common refresh rate to
+    /// within a nanosecond per frame, so max_fps equal to the refresh rate
+    /// no longer caps repaint below the display.
+    #[test]
+    fn frame_interval_sustains_the_matching_refresh_rate() {
+        for hz in [
+            24_u64, 30, 48, 50, 59, 60, 75, 90, 100, 120, 144, 165, 240, 360,
+        ] {
+            let interval = frame_interval_for_max_fps(hz).as_nanos();
+            let one_second = 1_000_000_000_u128;
+            let frames = u128::from(hz);
+            assert!(
+                interval * frames >= one_second && interval * frames < one_second + frames,
+                "max_fps={}: {} frames of {} ns",
+                hz,
+                frames,
+                interval
+            );
+        }
+    }
+
     #[test]
     fn frame_interval_never_exceeds_the_valid_configured_rate() {
         for max_fps in MIN_MAX_FPS..=MAX_MAX_FPS {
-            let interval_ms = frame_interval_for_max_fps(max_fps).as_millis();
-            assert!(interval_ms > 0, "max_fps={}", max_fps);
+            let interval_ns = frame_interval_for_max_fps(max_fps).as_nanos();
+            let fps = u128::from(max_fps);
+            assert!(interval_ns > 0, "max_fps={}", max_fps);
             assert!(
-                interval_ms * u128::from(max_fps) >= 1_000,
-                "max_fps={}, interval_ms={}",
+                interval_ns * fps >= 1_000_000_000,
+                "max_fps={}, interval_ns={}",
                 max_fps,
-                interval_ms
+                interval_ns
+            );
+            // The tightest such interval: one nanosecond less would exceed it.
+            assert!(
+                (interval_ns - 1) * fps < 1_000_000_000,
+                "max_fps={}, interval_ns={}",
+                max_fps,
+                interval_ns
             );
         }
     }
