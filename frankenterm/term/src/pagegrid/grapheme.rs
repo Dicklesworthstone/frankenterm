@@ -178,11 +178,16 @@ impl GraphemeArena {
 
     /// Empty and within standard capacity (I14).
     pub fn is_clean(&self) -> bool {
-        let std_map_capacity = FxHashMap::<u32, (u32, u16)>::with_capacity_and_hasher(
-            STD_ARENA_ENTRIES,
-            Default::default(),
-        )
-        .capacity();
+        // Computed once: `Page::reset` checks this in debug builds, and a
+        // recycled page must not allocate.
+        static STD_MAP_CAPACITY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let std_map_capacity = *STD_MAP_CAPACITY.get_or_init(|| {
+            FxHashMap::<u32, (u32, u16)>::with_capacity_and_hasher(
+                STD_ARENA_ENTRIES,
+                Default::default(),
+            )
+            .capacity()
+        });
         self.bytes.is_empty()
             && self.bytes.capacity() <= STD_ARENA_BYTES
             && self.map.is_empty()

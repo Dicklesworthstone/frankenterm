@@ -412,6 +412,76 @@ impl Page {
         header.has(RowHeader::DIRTY)
     }
 
+    /// Exchanges rows `a` and `b` by swapping their headers (D5). Cells,
+    /// seqnos and side entries belong to a slot, so they move with it; both
+    /// rows are marked dirty.
+    pub fn swap_rows(&mut self, a: u32, b: u32) {
+        let first = self.header(a).with_flags(RowHeader::DIRTY, true);
+        let second = self.header(b).with_flags(RowHeader::DIRTY, true);
+        self.set_header(a, second);
+        self.set_header(b, first);
+    }
+
+    /// Copies `src_row` of `src`, a page of the same width, into the empty
+    /// row `dst_row`: cells, length, row flags and the exact seqno. Side
+    /// entries are re-interned here, rich ids included (D5: rows that rotate
+    /// across a page boundary are copied).
+    pub fn copy_row_from(&mut self, dst_row: u32, src: &Page, src_row: u32) {
+        assert_eq!(self.cols, src.cols, "rows copy between pages of one width");
+        let dst = self.header(dst_row);
+        assert!(
+            dst.is_empty(),
+            "row {} must be empty to take a copy",
+            dst_row
+        );
+        let source = src.header(src_row);
+        let (from_slot, to_slot) = (source.slot(), dst.slot());
+        let mut hint = None;
+        let mut has_rich = false;
+        for x in 0..source.len() {
+            let cell = src.cell_at(from_slot, x);
+            let mut copy = cell;
+            if let CellStyle::Rich(id) = cell.style() {
+                let style = src.styles.get(id).expect("I5: a stored rich id is live");
+                let (id, cached) = self.styles.acquire(style, self.serial, hint);
+                hint = Some(cached);
+                has_rich = true;
+                copy = copy.with_style(CellStyle::Rich(id));
+            }
+            let (from, to) = (src.offset(from_slot, x), self.offset(to_slot, x));
+            if cell.has_grapheme() {
+                let text = src.graphemes.get(from).expect("I6: grapheme bit");
+                self.graphemes.insert(to, text);
+            }
+            if cell.has_hyperlink() {
+                let link = src.links.get(from).expect("I7: hyperlink bit");
+                self.links.attach(to, link);
+            }
+            if cell.has_image() {
+                let images = src.images.get(from).expect("I7: image bit");
+                self.images.insert(to, images.to_vec());
+            }
+            self.set_cell_at(to_slot, x, copy);
+        }
+        let flags = source.bits() & (RowHeader::SUMMARY | RowHeader::LINE_FLAGS);
+        let header = RowHeader::with_slot(to_slot)
+            .with_len(source.len())
+            .with_flags(flags | RowHeader::DIRTY, true);
+        debug_assert!(!has_rich || header.has(RowHeader::STYLED), "I9");
+        self.set_header(dst_row, header);
+        let seqno = src.buf[src.seqno_index(from_slot)];
+        let index = self.seqno_index(to_slot);
+        self.buf[index] = seqno;
+        // A lower seqno than the empty row had keeps `max_seqno` an upper
+        // bound; a 0 makes the whole page "always changed".
+        if seqno == 0 {
+            self.max_seqno = 0;
+        } else if self.max_seqno != 0 {
+            self.max_seqno = self.max_seqno.max(seqno);
+        }
+        self.debug_check_row(dst_row);
+    }
+
     fn resolve_style(&mut self, spec: &mut StyleSpec<'_>) -> CellStyle {
         match spec {
             StyleSpec::Inline(inline) => {
@@ -971,11 +1041,9 @@ impl Page {
         self.graphemes.reset();
         self.links.reset();
         self.images.reset();
-        if cfg!(debug_assertions) {
-            if let Err(err) = self.check_invariants() {
-                panic!("pagegrid invariant broken by reset: {}", err);
-            }
-        }
+        // I14. Not `check_invariants`, which allocates: a recycled page must
+        // keep the scroll path allocation-free even in debug builds (B3.3).
+        debug_assert!(self.is_clean(), "pagegrid reset left the page unclean");
     }
 
     /// Whether the page is as [`Self::reset`] leaves it (I14), serial aside.

@@ -149,9 +149,13 @@ impl LinkTable {
 
     /// Empty and within standard capacity (I14).
     pub fn is_clean(&self) -> bool {
-        let std_ptr_capacity =
+        // Computed once: `Page::reset` checks this in debug builds, and a
+        // recycled page must not allocate.
+        static STD_PTR_CAPACITY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let std_ptr_capacity = *STD_PTR_CAPACITY.get_or_init(|| {
             FxHashMap::<usize, u32>::with_capacity_and_hasher(STD_LINKS, Default::default())
-                .capacity();
+                .capacity()
+        });
         self.entries.is_empty()
             && self.entries.capacity() <= STD_LINKS
             && self.free.is_empty()
