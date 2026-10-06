@@ -204,7 +204,9 @@ pub fn base_fonts() -> Vec<SceneFont> {
 }
 
 /// The base configuration every scene starts from: fixed font size and DPI,
-/// no tab bar or scroll bar, no blinking, no animation, WebGpu.
+/// no tab bar or scroll bar, no blinking, no animation, WebGpu, and the
+/// FreeType rasterizer named by [`RASTERIZER_IDENTITY`], so a change of the
+/// platform's default rasterizer cannot silently re-render the goldens.
 pub fn base_config() -> BTreeMap<String, serde_json::Value> {
     use serde_json::json;
     BTreeMap::from([
@@ -225,6 +227,7 @@ pub fn base_config() -> BTreeMap<String, serde_json::Value> {
         ("text_blink_rate_rapid".to_string(), json!(0)),
         ("animation_fps".to_string(), json!(1)),
         ("front_end".to_string(), json!("WebGpu")),
+        ("font_rasterizer".to_string(), json!("FreeType")),
         ("check_for_updates".to_string(), json!(false)),
         ("automatically_reload_config".to_string(), json!(false)),
         ("color_scheme".to_string(), json!("Builtin Dark")),
@@ -543,6 +546,7 @@ mod tests {
             "text_blink_rate = 0",
             "enable_tab_bar = false",
             "front_end = \"WebGpu\"",
+            "font_rasterizer = \"FreeType\"",
             "family = \"JetBrains Mono\"",
             "harfbuzz_features = [\"calt=0\", \"clig=0\", \"liga=0\"]",
             "family = \"Noto Color Emoji\"",
@@ -559,6 +563,10 @@ mod tests {
         assert!(!parsed.enable_tab_bar);
         assert_eq!(parsed.cursor_blink_rate, 0);
         assert_eq!(parsed.front_end, config::FrontEndSelection::WebGpu);
+        assert!(matches!(
+            parsed.font_rasterizer,
+            config::FontRasterizerSelection::FreeType
+        ));
         let families: Vec<&str> = parsed.font.font.iter().map(|f| f.family.as_str()).collect();
         assert_eq!(
             families,
