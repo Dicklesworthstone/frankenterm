@@ -42,6 +42,7 @@ notify.workspace = true
 ordered-float = { workspace=true, features = ["serde"] }
 portable-pty = { workspace=true, features = ["serde_support"]}
 promise.workspace = true
+semver.workspace = true
 serde = {workspace=true, features = ["rc", "derive"]}
 serde_json.workspace = true
 shlex.workspace = true

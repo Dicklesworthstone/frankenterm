@@ -3484,6 +3484,9 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     initialize_window_state_persistence();
 
     let gui = crate::frontend::try_new()?;
+    // ft-yccm0.2.7: name performance-hostile settings, judged against the
+    // real screens, and publish what they were judged by for `ft doctor`.
+    let _gui_tuning = start_gui_tuning_advisories(&config);
     // ft-yccm0.2.5 / ft-yccm0.1.7: publish this process's live GPU, cache,
     // scrollback and allocator counters where `ft doctor --json` and
     // scripts/mac-gui-footprint.sh read them. Diagnostics only: not fatal.
@@ -3540,6 +3543,85 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
 
     maybe_show_configuration_error_window();
     run_gui_event_loop(gui)
+}
+
+/// The fastest screen when the GUI started (ft-yccm0.2.7). Screens are
+/// queried once, on the main thread; config reloads reuse this copy.
+static STARTUP_DISPLAY: std::sync::OnceLock<Option<config::tuning::DisplayRefresh>> =
+    std::sync::OnceLock::new();
+
+fn fastest_display() -> Option<config::tuning::DisplayRefresh> {
+    let screens = Connection::get()?.screens().ok()?;
+    std::iter::once(&screens.main)
+        .chain(std::iter::once(&screens.active))
+        .chain(screens.by_name.values())
+        .filter_map(|screen| {
+            Some(config::tuning::DisplayRefresh {
+                name: screen.name.clone(),
+                hz: u64::try_from(screen.max_fps?).ok()?,
+            })
+        })
+        .max_by_key(|display| display.hz)
+}
+
+fn gui_tuning_inputs(config: &config::Config) -> config::tuning::TuningInputs {
+    config::tuning::TuningInputs {
+        display: STARTUP_DISPLAY.get().cloned().flatten(),
+        ..config::tuning::TuningInputs::from_config(config)
+    }
+}
+
+/// Log one warning per performance-hostile setting (ft-yccm0.2.7) and publish
+/// the settings and display they were judged by, where `ft doctor` reads them.
+/// The GUI cannot judge its own generation (FT-TUNE-0005); `ft doctor` does.
+/// The facts are republished after every config reload, so a fixed setting
+/// clears in doctor; the returned handles keep that going.
+fn start_gui_tuning_advisories(
+    config: &config::Config,
+) -> Option<(
+    Arc<config::tuning::GuiTuningPublication>,
+    config::ConfigSubscription,
+)> {
+    let _ = STARTUP_DISPLAY.set(fastest_display());
+    let inputs = gui_tuning_inputs(config);
+    for advisory in config::tuning::tuning_advisories(&inputs) {
+        log::warn!("{}", advisory.log_line());
+    }
+    let facts = config::tuning::GuiTuningFacts::new(std::process::id(), GUI_VERSION, &inputs);
+    let publication =
+        match config::tuning::GuiTuningPublication::publish(&config::RUNTIME_DIR, &facts) {
+            Ok(publication) => Arc::new(publication),
+            Err(error) => {
+                log::warn!("GUI tuning facts publishing disabled: {error}");
+                return None;
+            }
+        };
+    let subscription = config::subscribe_to_config_reload({
+        let publication = Arc::clone(&publication);
+        move || {
+            // Subscribers run while the configuration mutex is held: read the
+            // reloaded config from a short-lived thread once it is released.
+            let publication = Arc::clone(&publication);
+            let spawned = std::thread::Builder::new()
+                .name("gui-tuning-republish".to_string())
+                .spawn(move || {
+                    let config = config::configuration();
+                    let facts = config::tuning::GuiTuningFacts::new(
+                        std::process::id(),
+                        GUI_VERSION,
+                        &gui_tuning_inputs(&config),
+                    );
+                    if let Err(error) = publication.republish(&facts) {
+                        log::warn!("GUI tuning facts republish failed: {error}");
+                    }
+                });
+            if let Err(error) = spawned {
+                log::warn!("GUI tuning facts republish not started: {error}");
+            }
+            true
+        }
+    });
+    Some((publication, subscription))
 }
 
 /// The resource snapshot this process publishes (ft-yccm0.1.7). Runs on the
