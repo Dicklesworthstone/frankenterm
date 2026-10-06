@@ -1,0 +1,7 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "text over a vertical gradient\n\u001b[?25l",
+    "extra_toml": "[window_background_gradient]\norientation = \"Vertical\"\ncolors = [\"#101020\", \"#304080\"]"
+  }
+}

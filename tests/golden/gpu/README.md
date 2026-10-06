@@ -28,6 +28,54 @@ tests/golden/gpu/<fixture-name>/
   requires `cargo test -p frankenterm-gui --features headless-render
   --test gpu_regression`.
 
+- `gui_snapshot` renders through the real `frankenterm-gui` binary
+  (ft-yccm0.1.10). `input.scene` holds the bytes played into a fresh pane
+  plus configuration changes; `frankenterm_gui::render_corpus` launches the
+  GUI with a pinned configuration (bundled JetBrains Mono, Fira Code, Noto
+  Color Emoji and Symbols Nerd Font from `frankenterm/assets/fonts`, macOS
+  Hiragino Sans GB and Apple SD Gothic Neo for CJK, 13 pt at 144 DPI, no
+  blinking, WebGpu) in a throwaway `HOME`, with a cleared environment,
+  `--always-new-process`, and `FRANKENTERM_NATIVE_E2E_NONACTIVATING=1`, so
+  it never touches a running mux or takes keyboard focus. The scene ends by
+  setting the title `ft-render-snapshot`; the GUI's
+  `FRANKENTERM_RENDER_SNAPSHOT` hook then copies the exact texture it is
+  about to present into a PNG. That is the production font, shaping, glyph
+  atlas and shader output. The `headless_terminal` kind above, by contrast,
+  draws with a synthetic CPU rasterizer. These fixtures live under `real/`,
+  need macOS with a display, and run only when named or when
+  `FT_GPU_HARNESS_REAL_RENDERER=1` is set.
+
+Real-renderer corpus commands (macOS, native; the GUI cannot build on the
+Linux workers):
+
+```bash
+# Compare every real-renderer scene against its golden.
+GPU_HARNESS_FIXTURE_FILTER=real cargo test -p frankenterm-gui --test gpu_regression
+# Re-pin after an intended rendering change (review every heatmap first).
+SET_GOLDEN=1 GPU_HARNESS_FIXTURE_FILTER=real \
+  cargo test -p frankenterm-gui --test gpu_regression -- --update-goldens
+```
+
+`FT_GPU_HARNESS_GUI_BIN` points the harness at a different GUI build, such
+as a release-interactive binary. Every run writes
+`<artifact dir>/parity-receipt.json` with per-scene metrics. A failing
+scene also gets `<name>.actual.png`, `<name>.diff.png`,
+`<name>.heatmap.png` (per-pixel max-channel delta) and `<name>.report.json`.
+Each GUI run's config, scene bytes, log and snapshot are kept under
+`<artifact dir>/gui-snapshot/<name>/`.
+
+A pinned `gui_snapshot` golden's `meta.json` records the snapshot size
+(which depends on the display's backing scale), the DPI, `font_files` (path
+and SHA-256 of every font the scene can resolve), `font_set_sha` over them,
+`rasterizer`, and the GUI's own `Renderer initialized:` line. When such a
+scene fails, its report carries `explained_delta`: which font files changed
+since the golden was pinned, and whether the rasterizer changed (for
+example FreeType to CoreText in Track C). Real-renderer scenes use the
+parity thresholds `min_ssim >= 0.995` (mean of 8x8-window SSIM),
+`min_window_ssim >= 0.95` (the worst window, which catches a regression
+confined to a few glyphs), `l_inf <= 8`, and
+`changed_pixel_fraction <= 0.001`.
+
 `meta.json` records deterministic rendering context and per-fixture
 thresholds. The default comparator contract is:
 

@@ -1,0 +1,9 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "75% window background opacity\n\u001b[?25l",
+    "config": {
+      "window_background_opacity": 0.75
+    }
+  }
+}

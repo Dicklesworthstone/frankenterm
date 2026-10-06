@@ -1,16 +1,20 @@
 //! Render snapshots for the renderer image-parity corpus (ft-yccm0.1.10).
 //!
-//! When `FRANKENTERM_RENDER_SNAPSHOT` names a PNG path, the first frame the
-//! active front end presents after the active pane's title becomes the
-//! sentinel (`FRANKENTERM_RENDER_SNAPSHOT_TITLE`, default
-//! `ft-render-snapshot`) is read back from the GPU and written there. A scene
-//! prints its bytes and then sets that title (`OSC 2`), and terminal output
-//! is applied in order, so the snapshot holds the whole scene as the real
-//! renderer drew it: fonts, shaping, glyph atlas, shaders and chrome.
+//! When `FRANKENTERM_RENDER_SNAPSHOT` names a PNG path, the first paint after
+//! the active pane's title becomes the sentinel
+//! (`FRANKENTERM_RENDER_SNAPSHOT_TITLE`, default `ft-render-snapshot`) draws
+//! the frame into an offscreen texture of the surface's format and size, with
+//! the same geometry and pipeline as a presented frame, and writes it there.
+//! A scene prints its bytes and then sets that title (`OSC 2`), and terminal
+//! output is applied in order, so the snapshot holds the whole scene as the
+//! real renderer draws it: fonts, shaping, glyph atlas, shaders and chrome.
+//! Drawing offscreen means a hidden or occluded window, whose surface yields
+//! no drawable, still captures.
 //!
 //! The variables are read once at window creation; with neither set this
-//! module does nothing. A snapshot is taken once per window and never
-//! affects the presented frame.
+//! module does nothing. A snapshot is taken once per window. The snapshot
+//! paint presents nothing and settles no damage, so the next paint draws the
+//! window as usual.
 
 use anyhow::Context;
 use std::path::{Path, PathBuf};
@@ -51,11 +55,6 @@ impl RenderSnapshotRequest {
         })
     }
 
-    /// Whether the WebGPU surface must be configured readable (`COPY_SRC`).
-    pub(crate) fn requested() -> bool {
-        std::env::var_os(SNAPSHOT_PATH_ENV).is_some_and(|path| !path.is_empty())
-    }
-
     /// Claims the snapshot if the active pane's title is the sentinel. Returns
     /// the output path at most once.
     pub(crate) fn claim(&mut self, active_title: Option<&str>) -> Option<PathBuf> {
@@ -64,6 +63,12 @@ impl RenderSnapshotRequest {
         }
         self.taken = true;
         Some(self.path.clone())
+    }
+
+    /// Returns a claimed snapshot to pending: the frame was not final yet
+    /// (fallback fonts still resolving), so a later paint takes it.
+    pub(crate) fn rearm(&mut self) {
+        self.taken = false;
     }
 }
 
@@ -115,6 +120,52 @@ pub(crate) fn write_png_atomically(
     Ok(())
 }
 
+/// Where one WebGPU frame is drawn.
+pub(crate) enum WebGpuDrawTarget {
+    /// The window surface: drawn, submitted and presented.
+    Surface(crate::termwindow::webgpu::AcquiredWebGpuFrame),
+    /// A snapshot texture: drawn with the same pipeline, read back to a PNG,
+    /// never presented.
+    Snapshot(SnapshotTarget),
+}
+
+/// The offscreen texture one snapshot paint draws into: the surface's format
+/// and size, readable (`COPY_SRC`).
+pub(crate) struct SnapshotTarget {
+    pub(crate) texture: wgpu::Texture,
+    pub(crate) path: PathBuf,
+}
+
+impl SnapshotTarget {
+    pub(crate) fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+        path: PathBuf,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            width > 0 && height > 0,
+            "cannot snapshot a {width}x{height} surface"
+        );
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("frankenterm-gui render snapshot target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        Ok(Self { texture, path })
+    }
+}
+
 /// A texture-to-buffer copy recorded into a frame's encoder, read back after
 /// that frame is submitted.
 pub(crate) struct PendingReadback {
@@ -137,7 +188,7 @@ impl PendingReadback {
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             texture.usage().contains(wgpu::TextureUsages::COPY_SRC),
-            "surface texture was not configured with COPY_SRC; is {SNAPSHOT_PATH_ENV} set before launch?"
+            "snapshot texture lacks COPY_SRC usage"
         );
         let size = texture.size();
         let (width, height) = (size.width, size.height);
@@ -251,6 +302,12 @@ mod tests {
             request.claim(Some("done")),
             None,
             "a snapshot is taken once"
+        );
+        request.rearm();
+        assert_eq!(
+            request.claim(Some("done")),
+            Some(PathBuf::from("/tmp/a.png")),
+            "a re-armed snapshot is claimable again"
         );
     }
 

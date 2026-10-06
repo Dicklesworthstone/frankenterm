@@ -1,0 +1,6 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "osc8: \u001b]8;;https://example.com/a\u001b\\explicit link\u001b]8;;\u001b\\ after\nplain: https://frankenterm.dev/docs and mailto:dev@example.com\u001b[?25l"
+  }
+}

@@ -5290,6 +5290,35 @@ impl TermWindow {
             log::warn!("cannot paint webgpu frame before webgpu state is initialized");
             return Ok(false);
         };
+        // ft-yccm0.1.10: a due image-parity snapshot draws offscreen before
+        // any surface acquisition, so a hidden or occluded window (whose
+        // surface yields no drawable) still captures. That paint presents
+        // nothing and settles no damage; the next paint draws the window.
+        if let Some(path) = self.claim_render_snapshot() {
+            let target = {
+                let config = webgpu.config.borrow();
+                render_snapshot::SnapshotTarget::new(
+                    &webgpu.device,
+                    config.format,
+                    config.width,
+                    config.height,
+                    path,
+                )
+            };
+            match target {
+                Ok(target) => {
+                    if let Err(failure) = self.paint_impl(move |tw| {
+                        tw.call_draw_webgpu(render_snapshot::WebGpuDrawTarget::Snapshot(target))
+                            .map_err(RenderAttemptFailure::draw)
+                    }) {
+                        log::error!("render snapshot paint failed: {failure:#}");
+                    }
+                }
+                Err(err) => log::error!("render snapshot: {err:#}"),
+            }
+            return Ok(true);
+        }
+
         let dimensions = self.dimensions;
         let acquired = match Self::acquire_webgpu_frame_with_repair(&webgpu, dimensions) {
             Ok(acquired) => acquired,
@@ -5301,7 +5330,7 @@ impl TermWindow {
         };
 
         let outcome = match self.paint_impl(move |tw| {
-            tw.call_draw_webgpu(acquired)
+            tw.call_draw_webgpu(render_snapshot::WebGpuDrawTarget::Surface(acquired))
                 .map_err(RenderAttemptFailure::draw)
         }) {
             Ok(outcome) => outcome,
