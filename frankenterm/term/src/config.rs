@@ -1056,6 +1056,17 @@ impl ScrollbackLineAdmission {
     }
 }
 
+/// Outcome of [`ScrollbackSpillSink::await_scrollback_capacity`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollbackCapacityWait {
+    /// Durability made progress since the refusal; retry admission now.
+    Progressed,
+    /// The writer is still working; no progress before the timeout.
+    TimedOut,
+    /// The durability path is failing. Every refused row stays owned.
+    Failed(ScrollbackSpillError),
+}
+
 /// External cold-scrollback sink used by tiered scrollback integrations.
 ///
 /// The terminal model owns full-fidelity [`Line`] values and knows exactly when
@@ -1145,10 +1156,42 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
     }
 
     /// Make all admitted rows durable. Errors retain every unacknowledged row
-    /// in memory. The parser applies backpressure outside the terminal mutex;
-    /// callers must not treat failure as permission to discard queued rows.
+    /// in memory. Callers must not treat failure as permission to discard
+    /// queued rows. This blocks on storage; parsers use
+    /// [`Self::request_scrollback_flush`] instead.
     fn flush_scrollback(&self) -> Result<(), ScrollbackSpillError> {
         Ok(())
+    }
+
+    /// Hand admitted rows to the sink's durability writer without waiting.
+    ///
+    /// Parser maintenance calls this after every applied batch and when its
+    /// pane closes. A sink with its own writer only schedules work here: no
+    /// storage IO, and no wait on a lock held across storage IO. An error
+    /// reports an already-degraded durability path; rows stay owned. The
+    /// default (a synchronous sink) flushes inline, which is its contract.
+    fn request_scrollback_flush(&self) -> Result<(), ScrollbackSpillError> {
+        self.flush_scrollback()
+    }
+
+    /// Wait at most `timeout` for durability progress after this sink
+    /// refused an admission.
+    ///
+    /// Progress (an acknowledged batch or a finished clear/replace) since the
+    /// refusal returns at once, so a writer that is merely behind wakes the
+    /// parser as soon as capacity frees. The timeout bounds how long a parser
+    /// goes without re-checking pane close; it is not a retry interval.
+    /// The default synchronous sink does the flush itself. On failure it has
+    /// no progress signal, so it waits out `timeout` rather than letting the
+    /// caller spin.
+    fn await_scrollback_capacity(&self, timeout: std::time::Duration) -> ScrollbackCapacityWait {
+        match self.flush_scrollback() {
+            Ok(()) => ScrollbackCapacityWait::Progressed,
+            Err(error) => {
+                std::thread::sleep(timeout);
+                ScrollbackCapacityWait::Failed(error)
+            }
+        }
     }
 
     /// Hydrate a previously stored stable row.

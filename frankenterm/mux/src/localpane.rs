@@ -2290,6 +2290,8 @@ impl Pane for LocalPane {
                 | ProcessState::DeadPendingClose { killed } => *killed = true,
                 ProcessState::Dead => {}
             }
+            drop(proc);
+            self.request_scrollback_durability_on_close();
             return;
         }
 
@@ -2311,6 +2313,8 @@ impl Pane for LocalPane {
             }
             _ => {}
         }
+        drop(proc);
+        self.request_scrollback_durability_on_close();
     }
 
     fn is_dead(&self) -> bool {
@@ -6090,84 +6094,120 @@ impl LocalPane {
         empty()
     }
 
+    /// Move this batch's hot-tier overflow into the sink's bounded queue in
+    /// short terminal-lock slices, then hand the queue to the sink's
+    /// durability writer. No storage IO runs on the parser (ft-yccm0.2.1.1).
+    ///
+    /// The parser waits only when the bounded queue refuses a row, and then
+    /// on the writer's progress signal with no terminal lock held. Until the
+    /// overload policy (ft-yccm0.2.1.6) can drop rows into explicit gaps,
+    /// that wait is what keeps refused rows from growing Screen without bound.
     fn drain_scrollback_outside_terminal(
         &self,
         mut sink: Arc<dyn frankenterm_term::config::ScrollbackSpillSink>,
     ) {
-        let mut reported_failure = false;
-        let mut needs_flush = true;
+        use frankenterm_term::config::{ScrollbackCapacityWait, ScrollbackSpillError};
+        use frankenterm_term::DeferredScrollbackTrim;
+        // Bounds how long a parser waiting on durability goes without seeing
+        // an explicit close. Progress wakes the wait immediately.
+        const CAPACITY_WAIT: Duration = Duration::from_millis(100);
+
+        let mut reported_stall = false;
         loop {
-            if matches!(
-                *self.process.lock(),
-                ProcessState::Running { killed: true, .. }
-                    | ProcessState::DeadPendingClose { killed: true }
-                    | ProcessState::Dead
-            ) {
+            if self.process_close_requested() {
+                // Close marker: the writer finishes rows already admitted.
+                let _ = sink.request_scrollback_flush();
                 return;
             }
-            let flushed = if needs_flush {
-                sink.flush_scrollback()
-            } else {
-                Ok(())
+            let mut terminal = self.locked_terminal();
+            let result = terminal.trim_deferred_scrollback();
+            let current = self.scrollback_flush_sink.lock().clone();
+            // Wake a queued reader before another geometry slice can
+            // reacquire the mutex.
+            MutexGuard::unlock_fair(terminal);
+            let Some(current) = current else {
+                return;
             };
-            let stalled = match flushed {
-                Ok(()) => {
-                    let mut terminal = self.locked_terminal();
-                    let result = terminal.trim_deferred_scrollback();
-                    let current = self.scrollback_flush_sink.lock().clone();
-                    // Wake a queued reader before another geometry slice can
-                    // reacquire the mutex. Durability still runs outside it.
-                    MutexGuard::unlock_fair(terminal);
-                    let Some(current) = current else {
-                        return;
-                    };
-                    sink = current;
-                    match result {
-                        frankenterm_term::DeferredScrollbackTrim::Settled { moved: false } => {
-                            if needs_flush {
-                                return;
-                            }
-                            // Resize/configuration may settle the overflow
-                            // between yielded slices. Earlier slices still
-                            // own queued rows that must reach durability.
-                            needs_flush = true;
-                            false
+            sink = current;
+            let failure: Option<ScrollbackSpillError> = match result {
+                DeferredScrollbackTrim::Yielded => {
+                    metrics::counter!("mux.scrollback.geometry_yields").increment(1);
+                    // Opportunistic try-lock readers do not queue on the
+                    // mutex; give their executor a scheduling turn.
+                    std::thread::yield_now();
+                    None
+                }
+                DeferredScrollbackTrim::Settled { .. } => {
+                    // Rows admitted while the batch applied, or by earlier
+                    // yielded slices, reach durability through this handoff.
+                    if let Err(error) = sink.request_scrollback_flush() {
+                        self.report_scrollback_failure(&mut reported_stall, error);
+                    }
+                    return;
+                }
+                DeferredScrollbackTrim::AdmissionBlocked { moved: true } => {
+                    // A full queue after progress is normal capacity, not a
+                    // failure: retry admission before deciding to wait.
+                    sink.request_scrollback_flush().err()
+                }
+                DeferredScrollbackTrim::AdmissionBlocked { moved: false } => {
+                    let requested = sink.request_scrollback_flush();
+                    match sink.await_scrollback_capacity(CAPACITY_WAIT) {
+                        ScrollbackCapacityWait::Progressed => None,
+                        ScrollbackCapacityWait::TimedOut => {
+                            // The writer is behind, not failing; this pane
+                            // is being backpressured.
+                            metrics::counter!("mux.scrollback.persistence_backpressure")
+                                .increment(1);
+                            requested.err()
                         }
-                        frankenterm_term::DeferredScrollbackTrim::Yielded => {
-                            needs_flush = false;
-                            metrics::counter!("mux.scrollback.geometry_yields").increment(1);
-                            // Opportunistic try-lock readers do not queue on
-                            // the mutex; give their executor a scheduling turn.
-                            std::thread::yield_now();
-                            false
-                        }
-                        frankenterm_term::DeferredScrollbackTrim::Settled { moved }
-                        | frankenterm_term::DeferredScrollbackTrim::AdmissionBlocked { moved } => {
-                            // A yielded slice may have filled the pending
-                            // queue. Flush that batch immediately: refusal
-                            // before attempting durability is normal capacity
-                            // backpressure, not a failed persistence attempt.
-                            let stalled = needs_flush && !moved;
-                            needs_flush = true;
-                            stalled
+                        ScrollbackCapacityWait::Failed(error) => {
+                            metrics::counter!("mux.scrollback.persistence_backpressure")
+                                .increment(1);
+                            Some(error)
                         }
                     }
                 }
-                Err(_) => true,
             };
-            if stalled {
-                if !reported_failure {
-                    log::error!(
-                        "pane {} scrollback persistence is stalled; retaining rows and applying parser backpressure outside the terminal lock",
-                        self.pane_id
-                    );
-                    reported_failure = true;
-                }
-                metrics::counter!("mux.scrollback.persistence_backpressure").increment(1);
-                // This is the blocking parser thread, not an async executor or
-                // the GUI. Explicit pane close ends retries; failures never
-                // permit another input batch to grow retained memory forever.
-                std::thread::sleep(Duration::from_millis(100));
+            if let Some(error) = failure {
+                self.report_scrollback_failure(&mut reported_stall, error);
+            }
+        }
+    }
+
+    fn process_close_requested(&self) -> bool {
+        matches!(
+            *self.process.lock(),
+            ProcessState::Running { killed: true, .. }
+                | ProcessState::DeadPendingClose { killed: true }
+                | ProcessState::Dead
+        )
+    }
+
+    fn report_scrollback_failure(
+        &self,
+        reported: &mut bool,
+        error: frankenterm_term::config::ScrollbackSpillError,
+    ) {
+        if !*reported {
+            log::error!(
+                "pane {} scrollback durability is failing ({error}); retaining rows and applying parser backpressure outside the terminal lock",
+                self.pane_id
+            );
+            *reported = true;
+        }
+    }
+
+    /// Pane close enqueues a close marker. The writer commits rows the pane
+    /// already admitted, then drops the sink, which releases its store.
+    fn request_scrollback_durability_on_close(&self) {
+        let sink = self.scrollback_flush_sink.lock().clone();
+        if let Some(sink) = sink {
+            if let Err(error) = sink.request_scrollback_flush() {
+                log::warn!(
+                    "pane {} closed with scrollback durability degraded: {error}",
+                    self.pane_id
+                );
             }
         }
     }
@@ -6242,6 +6282,13 @@ impl LocalPane {
     #[inline]
     fn locked_terminal(&self) -> MutexGuard<'_, Terminal> {
         self.terminal.lock()
+    }
+
+    /// Queues a reply to one of the child's queries on the terminal's writer,
+    /// behind everything the terminal has already written. Never waits for
+    /// the child to read it (ft-yccm0.2.2.5).
+    pub(crate) fn enqueue_terminal_reply(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.locked_terminal().enqueue_reply(bytes)
     }
 
     /// Apply every staged action batch to `term`, in FIFO order, emptying the
@@ -16398,6 +16445,182 @@ mod tests {
             assert_eq!(*stable_row, index as StableRowIndex);
             assert_eq!(line.as_str().trim_end(), format!("row-{index:02}"));
         }
+    }
+
+    /// ft-yccm0.2.1.1: a sink with its own durability writer. The parser
+    /// may only hand rows over and, when the queue refuses one, wait for
+    /// writer progress; any blocking flush on the parser fails the test.
+    #[derive(Debug, Default)]
+    struct HandoffOnlySink {
+        rows: std::sync::Mutex<Vec<(StableRowIndex, String)>>,
+        written: AtomicUsize,
+        handoffs: AtomicUsize,
+        capacity_waits: AtomicUsize,
+    }
+
+    impl HandoffOnlySink {
+        const QUEUE_ROWS: usize = 16;
+    }
+
+    impl frankenterm_term::config::ScrollbackSpillSink for HandoffOnlySink {
+        fn requires_scrollback_flush(&self) -> bool {
+            true
+        }
+
+        fn flush_scrollback(&self) -> Result<(), frankenterm_term::config::ScrollbackSpillError> {
+            panic!("the parser must never run a blocking scrollback flush")
+        }
+
+        fn request_scrollback_flush(
+            &self,
+        ) -> Result<(), frankenterm_term::config::ScrollbackSpillError> {
+            self.handoffs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn await_scrollback_capacity(
+            &self,
+            _timeout: Duration,
+        ) -> frankenterm_term::config::ScrollbackCapacityWait {
+            // The writer drains everything queued, then signals progress.
+            self.capacity_waits.fetch_add(1, Ordering::SeqCst);
+            self.written
+                .store(self.rows.lock().unwrap().len(), Ordering::SeqCst);
+            frankenterm_term::config::ScrollbackCapacityWait::Progressed
+        }
+
+        fn store_scrollback_line(
+            &self,
+            stable_row: StableRowIndex,
+            line: &Line,
+            _max_retained_rows: usize,
+        ) -> bool {
+            let mut rows = self.rows.lock().unwrap();
+            if rows.len() - self.written.load(Ordering::SeqCst) >= Self::QUEUE_ROWS {
+                return false;
+            }
+            rows.push((stable_row, line.as_str().trim_end().to_string()));
+            true
+        }
+
+        fn load_scrollback_line(&self, stable_row: StableRowIndex) -> Option<Line> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(row, _)| *row == stable_row)
+                .map(|(_, text)| {
+                    Line::from_text(
+                        text,
+                        &frankenterm_term::CellAttributes::blank(),
+                        0,
+                        None,
+                    )
+                })
+        }
+
+        fn oldest_scrollback_row(&self) -> Option<StableRowIndex> {
+            self.rows.lock().unwrap().first().map(|(row, _)| *row)
+        }
+
+        fn retained_scrollback_rows(&self) -> usize {
+            self.rows.lock().unwrap().len()
+        }
+
+        fn retained_scrollback_bytes(&self) -> usize {
+            self.rows.lock().unwrap().len() * 80
+        }
+
+        fn snapshot_scrollback(
+            &self,
+            _expected_newest_exclusive: StableRowIndex,
+            _limits: frankenterm_term::config::ScrollbackSnapshotLimits,
+        ) -> Result<
+            frankenterm_term::config::ScrollbackSnapshot,
+            frankenterm_term::config::ScrollbackSpillError,
+        > {
+            Err(frankenterm_term::config::ScrollbackSpillError::StorageUnavailable)
+        }
+
+        fn replace_scrollback_prefix(
+            &self,
+            _expected_generation: Option<frankenterm_term::config::ScrollbackSnapshotGeneration>,
+            _prefix: frankenterm_term::config::ScrollbackPrefix<'_>,
+            _max_retained_rows: usize,
+        ) -> Result<
+            frankenterm_term::config::ScrollbackReplaceCommit,
+            frankenterm_term::config::ScrollbackSpillError,
+        > {
+            Err(frankenterm_term::config::ScrollbackSpillError::StorageUnavailable)
+        }
+
+        fn clear_scrollback(
+            &self,
+        ) -> Result<
+            frankenterm_term::config::ScrollbackClearCommit,
+            frankenterm_term::config::ScrollbackSpillError,
+        > {
+            Err(frankenterm_term::config::ScrollbackSpillError::StorageUnavailable)
+        }
+    }
+
+    #[test]
+    fn perform_actions_hands_scrollback_to_the_writer_without_store_io() {
+        #[derive(Debug)]
+        struct HandoffConfig(Arc<HandoffOnlySink>);
+        impl TerminalConfiguration for HandoffConfig {
+            fn color_palette(&self) -> ColorPalette {
+                ColorPalette::default()
+            }
+            fn scrollback_size(&self) -> usize {
+                2048
+            }
+            fn scrollback_tier_config(&self) -> frankenterm_term::config::ScrollbackTierConfig {
+                frankenterm_term::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 1,
+                    warm_max_bytes: 0,
+                }
+            }
+            fn scrollback_spill_sink(
+                &self,
+            ) -> Option<Arc<dyn frankenterm_term::config::ScrollbackSpillSink>> {
+                Some(self.0.clone())
+            }
+        }
+
+        let sink = Arc::new(HandoffOnlySink::default());
+        let mut terminal = Terminal::new(
+            term_size(80, 4),
+            Arc::new(HandoffConfig(sink.clone())),
+            "FrankenTerm",
+            "durability-handoff-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        // The queue admits 16 rows while this output scrolls; Screen keeps
+        // the refused overflow until the pane's parser maintenance runs.
+        for row in 0..70 {
+            terminal.advance_bytes(format!("row-{row:02}\r\n").as_bytes());
+        }
+        assert_eq!(sink.rows.lock().unwrap().len(), HandoffOnlySink::QUEUE_ROWS);
+        let pane = make_legacy_test_pane(788, terminal);
+        pane.perform_actions(vec![Action::Print('x')])
+            .expect("test action admission");
+
+        let rows = sink.rows.lock().unwrap().clone();
+        assert_eq!(rows.len(), 66, "every overflow row reached the queue");
+        for (index, (stable_row, text)) in rows.iter().enumerate() {
+            assert_eq!(*stable_row, index as StableRowIndex);
+            assert_eq!(text, &format!("row-{index:02}"));
+        }
+        // 50 refused rows in 16-row queues: at least three progress waits.
+        assert!(sink.capacity_waits.load(Ordering::SeqCst) >= 3);
+        let handoffs = sink.handoffs.load(Ordering::SeqCst);
+        assert!(handoffs >= 1, "the settled batch must reach the writer");
+
+        // Pane close is a durability handoff (close marker), never a flush.
+        pane.kill();
+        assert_eq!(sink.handoffs.load(Ordering::SeqCst), handoffs + 1);
     }
 
     fn seed_checkpoint_cold_rows(terminal: &mut Terminal, rows: &[&str]) {
