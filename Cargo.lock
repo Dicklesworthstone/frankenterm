@@ -4645,6 +4645,7 @@ dependencies = [
  "frankenterm-dynamic",
  "frankenterm-escape-parser",
  "frankenterm-surface",
+ "frankenterm-term",
  "hex",
  "humansize",
  "image",

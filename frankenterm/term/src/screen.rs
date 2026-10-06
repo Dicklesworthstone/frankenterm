@@ -1084,10 +1084,17 @@ impl ColdSeamReflow {
             line.set_last_cell_was_wrapped(false, seqno);
             prefix.append_line(line, seqno);
         }
-        // A cold-only consumer must reproduce exactly these prefix rows. A
-        // paragraph-global policy can choose different breaks without the
-        // resident suffix; refuse that transaction rather than publish two
-        // geometries. Empty prefixes deliberately occupy zero visual rows.
+        // Every cold consumer derives the prefix rows from the published cold
+        // text alone (an incomplete-prefix wrap), so that wrap IS the prefix
+        // geometry. The paragraph-global DP planner can break the prefix
+        // differently while it also sees the resident suffix (the prefix's
+        // last row is then a middle row, not the slack-exempt final row), and
+        // since bounded DP covers long paragraphs (2c417db7b) that is common.
+        // Refusing left the seam unsettled and failed the whole cold resize
+        // preparation (ft-4w698). Instead the seam is a forced break: the
+        // cold prefix keeps its own geometry, the resident rows keep the full
+        // plan's tail, which starts at the same text offset, and every
+        // consumer still sees one geometry. Empty prefixes occupy zero rows.
         if !wrapped.is_empty() {
             let independent = Screen::wrap_cold_logical_line(
                 prefix.clone(),
@@ -1098,10 +1105,16 @@ impl ColdSeamReflow {
                 ScreenLineRead::MAX_ROWS,
             )
             .ok_or_else(|| anyhow::anyhow!("cold seam prefix row limit"))?;
-            anyhow::ensure!(
-                independent == wrapped,
-                "cold seam prefix requires full paragraph geometry"
-            );
+            if independent != wrapped {
+                log::debug!(
+                    target: "frankenterm_term::screen::reflow_profile",
+                    "cold_seam_prefix_break frontier={} cols={} paragraph_prefix_rows={} cold_prefix_rows={}",
+                    self.frontier,
+                    self.witness.cols,
+                    wrapped.len(),
+                    independent.len(),
+                );
+            }
         }
         let wrap_elapsed = profile_start.map(|start| start.elapsed());
         let mut replacements = BTreeMap::new();

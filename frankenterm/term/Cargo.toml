@@ -46,6 +46,11 @@ frankenterm-surface = {workspace = true, features=["std", "appdata", "use_image"
 [dev-dependencies]
 criterion.workspace = true
 env_logger.workspace = true
+# Every runtime consumer (config, mux, codec, client) enables use_serde, and
+# the cold-scrollback tests are cfg(feature = "use_serde"). Enable it for this
+# crate's own tests so `cargo test -p frankenterm-term` can never skip them
+# silently (ft-4w698).
+frankenterm-term = { path = ".", features = ["use_serde"] }
 k9.workspace = true
 proptest = "1.8.0"
 sha2.workspace = true
