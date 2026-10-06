@@ -116,7 +116,7 @@ open(sys.argv[2], "w").write(text)
 ' "$CONTRACT" "$out" \
         "ghostty_commit=$COMMIT" \
         "zig_tarball=zig-fake.tar.xz" \
-        "zig_tarball_url=https://example.invalid/zig-fake.tar.xz" \
+        "zig_tarball_url=https://127.0.0.1:9/zig-fake.tar.xz" \
         "zig_tarball_sha256=$ZIG_SHA" \
         "zig_tarball_top_dir=zig-fake-0.16.0" \
         "app_path=$T/Ghostty.app" \
@@ -257,8 +257,12 @@ expect "a work directory inside the checkout is refused before it is created" 2 
 check "nothing was created inside the checkout" test ! -e "$T/ghostty/scratch"
 expect "a missing tarball without --fetch-zig is a usage error" 2 "pass --zig-tarball PATH or --fetch-zig" \
     --contract "$C" --ghostty-src "$T/ghostty" --work "$T/w-fetch" --check-pins
-expect "a failed download stops the run" 4 "the zig download failed" \
+# Never the network: the fake contract's URL is a closed port on loopback
+# (discard, 9), refused at once; the bounds keep even a black hole short.
+fetch_started=$SECONDS
+FT_H2H_FETCH_CONNECT_TIMEOUT=2 FT_H2H_FETCH_MAX_TIME=5 expect "a failed download stops the run" 4 "the zig download failed" \
     --contract "$C" --ghostty-src "$T/ghostty" --work "$T/w-fetch" --fetch-zig --check-pins
+check "the failed download gave up within its bounds" test $((SECONDS - fetch_started)) -le 10
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

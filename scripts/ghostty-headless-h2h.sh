@@ -28,6 +28,9 @@ HELPER="${SCRIPT_DIR}/ghostty_h2h.py"
 PROBE_SRC="${SCRIPT_DIR}/ghostty-h2h-probe"
 # AGENTS.md: every web request carries this user agent.
 USER_AGENT="OpenAI File Downloader, XaiImageApiFetch/1.0"
+# --fetch-zig bounds, in seconds: connecting, and the whole ~50 MB download.
+FETCH_CONNECT_TIMEOUT="${FT_H2H_FETCH_CONNECT_TIMEOUT:-20}"
+FETCH_MAX_TIME="${FT_H2H_FETCH_MAX_TIME:-900}"
 
 CONTRACT="${REPO_ROOT}/docs/perf/incumbents/ghostty.md"
 GHOSTTY_SRC="${GHOSTTY_SRC:-${HOME}/projects/ghostty}"
@@ -294,7 +297,10 @@ fetch_zig() {
     mkdir -p "$WORK/dl"
     mkdir "$dir"
     log "downloading $(pin zig_tarball_url) into the fresh directory $dir"
+    # Bounded: a dead or black-holed host fails within the connect timeout,
+    # and a stalled transfer within the total limit.
     curl --fail --location --proto '=https' --tlsv1.2 --user-agent "$USER_AGENT" \
+        --connect-timeout "$FETCH_CONNECT_TIMEOUT" --max-time "$FETCH_MAX_TIME" \
         --output "$dir/$ZIG_NAME" "$(pin zig_tarball_url)" || die 4 "the zig download failed"
     got="$(sha256 "$dir/$ZIG_NAME")"
     [[ $got == "$ZIG_SHA" ]] || drift "the downloaded zig tarball has SHA-256 $got, pinned $ZIG_SHA (kept at $dir)"
