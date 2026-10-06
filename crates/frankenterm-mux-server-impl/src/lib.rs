@@ -2829,6 +2829,24 @@ mod deferred_scrollback {
             kept,
             "one marker row per gap"
         );
+        // export-durable shows the gap explicitly, in order.
+        let export = super::export_live_scrollback_transcript(
+            dir.path(),
+            &uuid::Uuid::from_bytes([0xd3; 16]).simple().to_string(),
+            256,
+            64 * 1024,
+            4 * 1024 * 1024,
+        )
+        .expect("export durable transcript");
+        let mut expected: Vec<String> = (0..10).map(|row| format!("flood {row}")).collect();
+        expected.push(gap.marker_text());
+        expected.extend((gap.end..100).map(|row| format!("flood {row}")));
+        let exported: Vec<String> = export
+            .transcript
+            .lines()
+            .map(|line| line.trim_end().to_string())
+            .collect();
+        assert_eq!(exported, expected);
 
         // A checkpoint snapshot sees stable rows: the marker expands back into
         // the gap's rows, and a row limit keeps the newest rows.
