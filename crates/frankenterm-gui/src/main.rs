@@ -3806,6 +3806,9 @@ mod tests {
     /// ft-yccm0.2.8: this binary links the GUI's `malloc_conf` export, so the
     /// running jemalloc must report exactly the tuned options. Reading them
     /// back from jemalloc proves the symbol is honoured, not just present.
+    /// jemalloc must also have finished initializing: on macOS a
+    /// `background_thread:true` request (unsupported there) stops it partway,
+    /// with one arena and `opt.narenas` 0.
     #[cfg(all(feature = "jemalloc", not(windows)))]
     #[test]
     fn gui_binary_runs_jemalloc_with_its_tuned_options() {
@@ -3814,14 +3817,24 @@ mod tests {
             "_RJEM_MALLOC_CONF overrides the compiled tuning; unset it to run this test"
         );
         let options = frankenterm_alloc::jemalloc_options().expect("jemalloc options");
-        assert!(options.background_thread, "{options:?}");
+        assert!(options.narenas > 0, "jemalloc initialized fully: {options:?}");
         assert_eq!(options.dirty_decay_ms, 5000, "{options:?}");
         assert_eq!(options.muzzy_decay_ms, 0, "{options:?}");
-        assert!(
-            frankenterm_alloc::GUI_JEMALLOC_CONF
-                .starts_with(b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:0"),
-            "this test pins the values the conf string sets"
-        );
+        if frankenterm_alloc::JEMALLOC_HAS_BACKGROUND_THREADS {
+            assert_eq!(options.background_thread, Some(true), "{options:?}");
+            assert_eq!(
+                frankenterm_alloc::GUI_JEMALLOC_CONF,
+                b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:0\0",
+                "this test pins the values the conf string sets"
+            );
+        } else {
+            assert_eq!(options.background_thread, None, "{options:?}");
+            assert_eq!(
+                frankenterm_alloc::GUI_JEMALLOC_CONF,
+                b"dirty_decay_ms:5000,muzzy_decay_ms:0\0",
+                "this test pins the values the conf string sets"
+            );
+        }
     }
 
     #[test]

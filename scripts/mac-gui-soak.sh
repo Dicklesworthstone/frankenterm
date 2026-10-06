@@ -13,8 +13,11 @@
 #   --no-atlas-growth    leave out the generated atlas-growth corpus
 #   --gpu-budget-mib N   GPU-owned budget for the verdict (default 1024)
 #   --env NAME=VALUE     extra variable for the GUI's isolated environment,
-#                        e.g. _RJEM_MALLOC_CONF=background_thread:true for
-#                        jemalloc tuning runs (repeatable; recorded in the receipt)
+#                        e.g. _RJEM_MALLOC_CONF=dirty_decay_ms:10000 for the
+#                        jemalloc-default arm of a tuning run (repeatable;
+#                        recorded in the receipt). Never background_thread:true:
+#                        macOS jemalloc has no background threads, and asking
+#                        for them stops its initialization partway (one arena)
 #   --out DIR            run directory (default ./soak-runs/<UTC stamp>)
 #   --self-test          2-minute run, a bundle every 15 s, resize every 30 s
 #   --dry-run            print the plan and the isolated environment only

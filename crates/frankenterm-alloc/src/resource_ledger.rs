@@ -1043,13 +1043,17 @@ impl AllocatorSnapshot {
                 mib(stats.mapped),
                 mib(stats.retained),
             ),
-            (None, Some(reason)) => format!("Allocator {}: stats unavailable ({reason})", self.backend),
+            (None, Some(reason)) => {
+                format!("Allocator {}: stats unavailable ({reason})", self.backend)
+            }
             (None, None) => format!("Allocator {}: stats unavailable", self.backend),
         };
         match self.options {
             Some(options) => format!(
                 "{line}; background_thread {}, dirty_decay_ms {}, muzzy_decay_ms {}, narenas {}",
-                options.background_thread,
+                options
+                    .background_thread
+                    .map_or_else(|| "unsupported".to_string(), |enabled| enabled.to_string()),
                 options.dirty_decay_ms,
                 options.muzzy_decay_ms,
                 options.narenas
@@ -1611,7 +1615,7 @@ mod tests {
             }),
             unavailable: None,
             options: Some(crate::JemallocOptions {
-                background_thread: true,
+                background_thread: Some(true),
                 dirty_decay_ms: 5000,
                 muzzy_decay_ms: 0,
                 narenas: 8,
@@ -1619,16 +1623,36 @@ mod tests {
         };
         assert!(allocator.summary_line().contains("allocated 1.0 MiB"));
         assert!(
-            allocator
-                .summary_line()
-                .ends_with("background_thread true, dirty_decay_ms 5000, muzzy_decay_ms 0, narenas 8"),
+            allocator.summary_line().ends_with(
+                "background_thread true, dirty_decay_ms 5000, muzzy_decay_ms 0, narenas 8"
+            ),
             "{}",
             allocator.summary_line()
+        );
+        // macOS jemalloc has no background threads to report.
+        let apple = AllocatorSnapshot {
+            options: Some(crate::JemallocOptions {
+                background_thread: None,
+                dirty_decay_ms: 5000,
+                muzzy_decay_ms: 0,
+                narenas: 56,
+            }),
+            ..allocator.clone()
+        };
+        assert!(
+            apple.summary_line().ends_with(
+                "background_thread unsupported, dirty_decay_ms 5000, muzzy_decay_ms 0, narenas 56"
+            ),
+            "{}",
+            apple.summary_line()
         );
         assert!(
             AllocatorSnapshot::read()
                 .summary_line()
-                .starts_with(&format!("Allocator {}", crate::allocator_backend().as_str()))
+                .starts_with(&format!(
+                    "Allocator {}",
+                    crate::allocator_backend().as_str()
+                ))
         );
     }
 

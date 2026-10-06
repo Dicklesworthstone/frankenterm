@@ -122,35 +122,52 @@ pub enum AllocatorStatsError {
     MissingOption(&'static str),
 }
 
+/// Whether this target's jemalloc can run background purge threads. jemalloc's
+/// configure leaves them out of every Mach-O (Apple) build. There,
+/// `background_thread:true` is not merely ignored: jemalloc prints "option
+/// background_thread currently supports pthread only" and its initialization
+/// stops partway, leaving one arena for every thread and `opt.narenas` at 0.
+pub const JEMALLOC_HAS_BACKGROUND_THREADS: bool = !cfg!(target_vendor = "apple");
+
 /// The jemalloc configuration the GUI binary installs through its
 /// `malloc_conf` export (ft-yccm0.2.8), NUL-terminated as jemalloc reads it.
 ///
-/// - `background_thread:true`: purging runs on jemalloc's own threads. Without
-///   them jemalloc decays dirty pages only while some thread allocates, so a
-///   GUI that goes idle after a flood keeps its freed pages resident until
-///   macOS compresses or swaps them (the 0.15.2 incident: ~4.2 GB of jemalloc
-///   heap in 31,947 mappings, mostly swapped).
+/// - `background_thread:true`, only where jemalloc supports it (see
+///   [`JEMALLOC_HAS_BACKGROUND_THREADS`]; never on macOS): purging runs on
+///   jemalloc's own threads. Without them jemalloc decays an arena's dirty
+///   pages only while some thread allocates in that arena, so a GUI that goes
+///   idle after a flood can keep its freed pages resident until the OS
+///   compresses or swaps them (the 0.15.2 incident on macOS: ~4.2 GB of
+///   jemalloc heap in 31,947 mappings, mostly swapped).
 /// - `dirty_decay_ms:5000`: half the 10 s default, so a freed burst returns to
-///   the OS within seconds of going idle, while a paint loop that frees and
-///   reallocates every frame keeps reusing its dirty pages.
+///   the OS within seconds once its arena sees activity again, while a paint
+///   loop that frees and reallocates every frame keeps reusing its dirty pages.
 /// - `muzzy_decay_ms:0`: jemalloc 5.3's default, stated so the whole policy is
 ///   in one place.
 ///
-/// Provisional until the M.6 bundles and the T1 ABBA run measure it. A run
-/// can override it without a rebuild through `_RJEM_MALLOC_CONF`, which
-/// jemalloc applies after this compiled-in string.
-pub const GUI_JEMALLOC_CONF: &[u8] = b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:0\0";
+/// Provisional until the M.6 bundles and the T1 ABBA run measure it; on macOS
+/// the soak decides whether activity-driven decay alone returns idle memory.
+/// A run can override it without a rebuild through `_RJEM_MALLOC_CONF`, which
+/// jemalloc applies after this compiled-in string (never pass
+/// `background_thread:true` there on macOS).
+#[cfg(not(target_vendor = "apple"))]
+pub const GUI_JEMALLOC_CONF: &[u8] =
+    b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:0\0";
+/// See the non-Apple definition; Apple targets leave out `background_thread`.
+#[cfg(target_vendor = "apple")]
+pub const GUI_JEMALLOC_CONF: &[u8] = b"dirty_decay_ms:5000,muzzy_decay_ms:0\0";
 
 /// jemalloc run-time options in effect, read back from jemalloc itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct JemallocOptions {
-    /// `opt.background_thread`.
-    pub background_thread: bool,
+    /// `opt.background_thread`; `None` where jemalloc has no background-thread
+    /// support (Apple targets), whose stats report omits the option.
+    pub background_thread: Option<bool>,
     /// `opt.dirty_decay_ms` (-1 disables decay).
     pub dirty_decay_ms: i64,
     /// `opt.muzzy_decay_ms` (-1 disables decay).
     pub muzzy_decay_ms: i64,
-    /// `opt.narenas`.
+    /// `opt.narenas`; 0 when jemalloc's initialization stopped partway.
     pub narenas: u64,
 }
 
@@ -184,13 +201,21 @@ pub fn jemalloc_options() -> Result<JemallocOptions, AllocatorStatsError> {
 #[cfg(any(test, all(feature = "jemalloc", not(windows))))]
 fn parse_jemalloc_options(report: &[u8]) -> Result<JemallocOptions, AllocatorStatsError> {
     let value: serde_json::Value = serde_json::from_slice(report).map_err(|error| {
-        AllocatorStatsError::StatsReport(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        AllocatorStatsError::StatsReport(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            error,
+        ))
     })?;
     let opt = &value["jemalloc"]["opt"];
     Ok(JemallocOptions {
-        background_thread: opt["background_thread"]
-            .as_bool()
-            .ok_or(AllocatorStatsError::MissingOption("background_thread"))?,
+        // jemalloc reports the option only where its runtime control exists.
+        background_thread: match opt.get("background_thread") {
+            None => None,
+            Some(flag) => Some(
+                flag.as_bool()
+                    .ok_or(AllocatorStatsError::MissingOption("background_thread"))?,
+            ),
+        },
         dirty_decay_ms: opt["dirty_decay_ms"]
             .as_i64()
             .ok_or(AllocatorStatsError::MissingOption("dirty_decay_ms"))?,
@@ -503,7 +528,9 @@ mod tests {
     }
 
     /// ft-yccm0.2.8 config presence: the GUI's jemalloc string is one
-    /// NUL-terminated ASCII list that sets exactly the tuned options.
+    /// NUL-terminated ASCII list that sets exactly the tuned options, and asks
+    /// for background threads only where jemalloc has them (on macOS the
+    /// request would stop jemalloc's initialization partway).
     #[test]
     fn gui_jemalloc_conf_sets_background_thread_and_decay() {
         let (last, body) = GUI_JEMALLOC_CONF.split_last().unwrap();
@@ -515,8 +542,18 @@ mod tests {
             .split(',')
             .map(|pair| pair.split_once(':').expect("key:value"))
             .collect();
-        assert_eq!(pairs.len(), 3, "{text}");
-        assert_eq!(pairs["background_thread"], "true");
+        if JEMALLOC_HAS_BACKGROUND_THREADS {
+            assert_eq!(pairs.len(), 3, "{text}");
+            assert_eq!(pairs["background_thread"], "true");
+        } else {
+            assert_eq!(pairs.len(), 2, "{text}");
+            assert!(!pairs.contains_key("background_thread"), "{text}");
+        }
+        assert_eq!(
+            JEMALLOC_HAS_BACKGROUND_THREADS,
+            !cfg!(target_os = "macos") && !cfg!(target_os = "ios"),
+            "jemalloc builds background threads everywhere but Mach-O"
+        );
         let dirty: i64 = pairs["dirty_decay_ms"].parse().unwrap();
         assert!(
             (0..10_000).contains(&dirty),
@@ -533,7 +570,7 @@ mod tests {
         assert_eq!(
             parse_jemalloc_options(report).unwrap(),
             JemallocOptions {
-                background_thread: true,
+                background_thread: Some(true),
                 dirty_decay_ms: 5000,
                 muzzy_decay_ms: 0,
                 narenas: 56,
@@ -542,10 +579,23 @@ mod tests {
         let disabled = br#"{"jemalloc": {"opt": {"background_thread": false,
             "dirty_decay_ms": -1, "muzzy_decay_ms": -1, "narenas": 4}}}"#;
         assert_eq!(parse_jemalloc_options(disabled).unwrap().dirty_decay_ms, -1);
+        // A macOS report: no background-thread support, so no such option.
+        let apple = br#"{"jemalloc": {"opt": {"dirty_decay_ms": 5000,
+            "muzzy_decay_ms": 0, "narenas": 56}}}"#;
+        assert_eq!(
+            parse_jemalloc_options(apple).unwrap().background_thread,
+            None
+        );
         let missing = br#"{"jemalloc": {"opt": {"background_thread": true}}}"#;
         assert!(matches!(
             parse_jemalloc_options(missing),
             Err(AllocatorStatsError::MissingOption("dirty_decay_ms"))
+        ));
+        let malformed = br#"{"jemalloc": {"opt": {"background_thread": "yes",
+            "dirty_decay_ms": 5000, "muzzy_decay_ms": 0, "narenas": 56}}}"#;
+        assert!(matches!(
+            parse_jemalloc_options(malformed),
+            Err(AllocatorStatsError::MissingOption("background_thread"))
         ));
         assert!(matches!(
             parse_jemalloc_options(b"not json"),
@@ -559,11 +609,23 @@ mod tests {
         #[cfg(all(feature = "jemalloc", not(windows)))]
         {
             let options = options.expect("jemalloc reports its options");
-            assert!(options.narenas > 0);
+            assert!(
+                options.narenas > 0,
+                "jemalloc finished initializing: {options:?}"
+            );
             assert!(options.dirty_decay_ms >= -1 && options.muzzy_decay_ms >= -1);
+            // The option is reported exactly where jemalloc supports it.
+            assert_eq!(
+                options.background_thread.is_some(),
+                JEMALLOC_HAS_BACKGROUND_THREADS,
+                "{options:?}"
+            );
         }
         #[cfg(not(all(feature = "jemalloc", not(windows))))]
-        assert!(matches!(options, Err(AllocatorStatsError::JemallocNotEnabled)));
+        assert!(matches!(
+            options,
+            Err(AllocatorStatsError::JemallocNotEnabled)
+        ));
     }
 
     #[test]
