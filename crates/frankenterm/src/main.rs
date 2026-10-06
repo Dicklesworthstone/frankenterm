@@ -141944,8 +141944,11 @@ A  docs/new-proof.md\n";
             publish_resource_snapshot,
         };
 
+        // Collection time; snapshots are published relative to it.
+        const NOW_MS: u64 = 10_000_000;
+        const ONE_HOUR_MS: u64 = 3_600_000;
         let dir = tempfile::tempdir().unwrap();
-        let (empty, empty_check) = gui_gpu_resources_doctor_report(dir.path(), 1_000_000);
+        let (empty, empty_check) = gui_gpu_resources_doctor_report(dir.path(), NOW_MS);
         assert_eq!(empty_check.status, DiagnosticStatus::Ok);
         assert!(empty_check.detail.as_deref().unwrap().contains("no live GUI ledger"));
         assert_eq!(empty["snapshots"].as_array().unwrap().len(), 0);
@@ -141958,7 +141961,7 @@ A  docs/new-proof.md\n";
         window.set(CacheGauge::ShapeCacheEntries, 321);
         let live = ResourceSnapshotEnvelope {
             pid: 4242,
-            published_unix_ms: 1_000_000 - 1_000,
+            published_unix_ms: NOW_MS - 1_000,
             ..ResourceSnapshotEnvelope::now(
                 "frankenterm-gui",
                 ResourceSnapshotBody {
@@ -141976,12 +141979,13 @@ A  docs/new-proof.md\n";
         publish_resource_snapshot(dir.path(), &live).unwrap();
         let crashed = ResourceSnapshotEnvelope {
             pid: 17,
-            published_unix_ms: 1_000_000 - 3_600_000,
+            // Published an hour ago: its process exited without cleanup.
+            published_unix_ms: NOW_MS - ONE_HOUR_MS,
             ..live.clone()
         };
         publish_resource_snapshot(dir.path(), &crashed).unwrap();
 
-        let (report, check) = gui_gpu_resources_doctor_report(dir.path(), 1_000_000);
+        let (report, check) = gui_gpu_resources_doctor_report(dir.path(), NOW_MS);
         assert_eq!(check.status, DiagnosticStatus::Ok);
         let detail = check.detail.unwrap();
         assert!(detail.contains("pid 4242: 1 texture(s) 4.0 MiB live"), "{detail}");
@@ -142007,7 +142011,7 @@ A  docs/new-proof.md\n";
         assert_eq!(report["fresh_within_ms"], 90_000);
 
         std::fs::write(dir.path().join("frankenterm-resources-9.json"), b"{").unwrap();
-        let (report, check) = gui_gpu_resources_doctor_report(dir.path(), 1_000_000);
+        let (report, check) = gui_gpu_resources_doctor_report(dir.path(), NOW_MS);
         assert_eq!(check.status, DiagnosticStatus::Warning);
         assert_eq!(report["unreadable"].as_array().unwrap().len(), 1);
     }
