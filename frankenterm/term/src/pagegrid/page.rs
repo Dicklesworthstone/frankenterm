@@ -398,6 +398,111 @@ impl Page {
         max
     }
 
+    /// Sets the row's seqno to exactly `seqno`, lower or higher (B3.4: a
+    /// row imported from a legacy `Line` keeps that line's seqno).
+    /// `max_seqno` stays an upper bound, and 0 makes it 0.
+    pub fn set_row_seqno(&mut self, row: u32, seqno: SequenceNo) {
+        let slot = self.header(row).slot();
+        let index = self.seqno_index(slot);
+        let old = self.buf[index];
+        let new = seqno as u64;
+        self.buf[index] = new;
+        if new == 0 {
+            self.max_seqno = 0;
+        } else if self.max_seqno != 0 {
+            self.max_seqno = self.max_seqno.max(new);
+        } else if old == 0 {
+            // This row may have been the only one at 0.
+            self.max_seqno = self.computed_max_seqno();
+        }
+    }
+
+    /// Stores `cells` as row `row`, replacing what it held (B3.4's import of
+    /// a legacy `Line`). Every cell is kept exactly as given, hidden cells
+    /// included: legacy vector storage can give a hidden cell attributes of
+    /// its own. The row's length becomes `cells.len()` and its seqno exactly
+    /// `seqno`. Line flags are cleared for the caller to set.
+    ///
+    /// Returns false, leaving the row empty, when the cells do not fit: more
+    /// than `cols + 1` of them, or a cell wider than two columns.
+    pub fn store_legacy_row(&mut self, row: u32, cells: &[Cell], seqno: SequenceNo) -> bool {
+        let header = self.header(row);
+        let slot = header.slot();
+        for x in 0..header.len() {
+            self.release_at(slot, x);
+        }
+        self.set_header(
+            row,
+            RowHeader::with_slot(slot).with_flags(RowHeader::DIRTY, true),
+        );
+        if cells.len() > self.stride() || cells.iter().any(|cell| cell.width() > 2) {
+            self.set_row_seqno(row, seqno);
+            self.debug_check_row(row);
+            return false;
+        }
+
+        let mut flags = RowHeader::DIRTY;
+        let mut cache = None;
+        for (x, cell) in cells.iter().enumerate() {
+            let attrs = cell.attrs();
+            let class = classify(attrs);
+            let style = match &class {
+                StyleClass::Inline(inline) => self.resolve_style(&mut StyleSpec::Inline(*inline)),
+                StyleClass::Rich(rich) => {
+                    flags |= RowHeader::STYLED;
+                    self.resolve_style(&mut StyleSpec::Rich {
+                        style: rich,
+                        cache: &mut cache,
+                    })
+                }
+            };
+            let glyph = Glyph::from_text(cell.str());
+            let mut bits = PackedCell::BLANK
+                .with_style(style)
+                .with_semantic(attrs.semantic_type())
+                .with_wrapped(attrs.wrapped())
+                .with_codepoint(glyph.codepoint())
+                .with_wide(cell.width() >= 2);
+            if !matches!(attrs.semantic_type(), SemanticType::Output) {
+                flags |= RowHeader::SEMANTIC;
+            }
+            let off = self.offset(slot, x);
+            if let Glyph::Cluster(text) = glyph {
+                self.graphemes.insert(off, text);
+                bits = bits.with_grapheme(true);
+                flags |= RowHeader::GRAPHEME;
+            }
+            if let Some(link) = attrs.hyperlink() {
+                self.links.attach(off, link);
+                bits = bits.with_hyperlink(true);
+                flags |= RowHeader::HYPERLINK;
+            }
+            // Legacy's stored order, as `write_legacy` keeps it.
+            let images: Vec<Box<ImageCell>> = attrs
+                .images()
+                .map(|images| images.into_iter().map(Box::new).collect())
+                .unwrap_or_default();
+            if !images.is_empty() {
+                self.images.insert(off, images);
+                bits = bits.with_image(true);
+                flags |= RowHeader::IMAGE;
+            }
+            self.set_cell_at(slot, x, bits);
+        }
+        let len = cells.len();
+        self.set_header(
+            row,
+            RowHeader::with_slot(slot)
+                .with_len(len)
+                .with_flags(flags, true),
+        );
+        // Every hidden bit from the row's first cell (I1).
+        self.resync_hidden(slot, 0, len, len);
+        self.set_row_seqno(row, seqno);
+        self.debug_check_row(row);
+        true
+    }
+
     /// Sets or clears legacy line flags ([`RowHeader::LINE_FLAGS`]).
     pub fn set_row_flags(&mut self, row: u32, flags: u64, on: bool) {
         debug_assert_eq!(flags & !RowHeader::LINE_FLAGS, 0);

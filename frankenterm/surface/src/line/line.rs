@@ -298,6 +298,14 @@ impl Line {
         }
     }
 
+    /// Sets the presence bit for explicit hyperlinks, which writes of
+    /// hyperlinked cells set. A view rebuilt from cells with `from_cells`
+    /// sets it here (ft-yccm0.3.3.4).
+    #[doc(hidden)]
+    pub fn set_has_hyperlink(&mut self, on: bool) {
+        self.bits.set(LineBits::HAS_HYPERLINK, on);
+    }
+
     /// Retain only immutable semantic source data for a mutable callback fence.
     /// Cells stay shared even in eager-clone profiling mode; caches are omitted.
     pub fn semantic_snapshot(&self) -> Self {

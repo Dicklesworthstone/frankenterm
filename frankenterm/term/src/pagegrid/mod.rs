@@ -5,8 +5,9 @@
 //! This module holds the page (B3.2): 8-byte packed cells with palette
 //! styles inline, row headers, and the per-page rich-style table, grapheme
 //! arena, hyperlink table and image map. The page list (B3.3) pools,
-//! recycles and seals pages. The engine switch (B3.4) builds on both;
-//! nothing in the terminal uses them yet.
+//! recycles and seals pages. The views (B3.4, ahead of B3.5) turn a row
+//! into a legacy `Line` and back. The engine switch (B3.4) builds on all
+//! three.
 
 pub mod cell;
 pub mod grapheme;
@@ -20,6 +21,7 @@ pub mod row;
 pub mod style;
 #[cfg(test)]
 mod tests;
+pub mod view;
 
 pub use cell::{CellStyle, Glyph, InlineStyle, PackedCell, StyleClass};
 pub use list::{OverCap, PageList, RangeFloor, RowRef, Scrolled, MAX_POOLED_PAGES, SEAL_DISTANCE};
