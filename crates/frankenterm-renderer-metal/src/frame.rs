@@ -23,6 +23,7 @@
 //! never shrunk, so a steady-state frame allocates no GPU object.
 
 use crate::cell_bg::BackgroundUniforms;
+use crate::cell_text::TextUniforms;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -43,16 +44,18 @@ pub const UNIFORMS_BYTES: usize = 256;
 /// Bytes per cell of the background grid: one RGBA8 color (ft-yccm0.4.2.2).
 pub const CELL_BG_BYTES_PER_CELL: usize = 4;
 
-/// Bytes reserved per glyph instance in the CellText buffer (ft-yccm0.4.2.3).
-pub const CELL_TEXT_INSTANCE_BYTES: usize = 32;
+/// Bytes per glyph instance in the CellText buffer: one
+/// [`crate::cell_text::CellText`] (ft-yccm0.4.2.3).
+pub const CELL_TEXT_INSTANCE_BYTES: usize = 24;
 
 /// Glyph instances reserved per cell. A wide glyph is one instance spanning
 /// two cells and decorations are drawn by the fragment shader, so one per
-/// cell covers a full screen; a frame that needs more grows the buffer.
+/// cell covers a full screen; a frame that needs more grows the buffer
+/// ([`SlotSizes::for_frame`]).
 pub const CELL_TEXT_INSTANCES_PER_CELL: usize = 1;
 
-/// Bytes per row of the per-row table: ring offset, first instance, instance
-/// count and flags, one `u32` each.
+/// Bytes per row of the per-row table: the row's first instance and its
+/// instance count (`u32` each), then 8 bytes reserved for per-row flags.
 pub const ROW_TABLE_BYTES_PER_ROW: usize = 16;
 
 /// One of the per-frame buffers every slot owns.
@@ -141,6 +144,18 @@ impl SlotSizes {
         })
     }
 
+    /// The bytes a frame of `grid` that draws `text_instances` glyph
+    /// instances needs: [`Self::for_grid`], with the CellText buffer large
+    /// enough for every instance when there are more than it reserves.
+    #[must_use]
+    pub fn for_frame(grid: GridExtent, text_instances: usize) -> Option<Self> {
+        let mut sizes = Self::for_grid(grid)?;
+        let text = text_instances.checked_mul(CELL_TEXT_INSTANCE_BYTES)?;
+        let at = SlotBuffer::CellText.index();
+        sizes.bytes[at] = sizes.bytes[at].max(text);
+        Some(sizes)
+    }
+
     /// Bytes `buffer` needs.
     #[must_use]
     pub fn bytes(&self, buffer: SlotBuffer) -> usize {
@@ -181,6 +196,8 @@ pub struct FrameUniforms {
     /// The background pass's cell geometry, ring offset, cursor and tints
     /// (ft-yccm0.4.2.2).
     pub background: BackgroundUniforms,
+    /// The text pass's decoration geometry (ft-yccm0.4.2.3).
+    pub text: TextUniforms,
 }
 
 fn put_u32(bytes: &mut [u8], at: usize, value: u32) {
@@ -215,6 +232,9 @@ impl FrameUniforms {
     /// | 112 | `selection_tint: float4` |
     /// | 128 | `search_tint: float4` |
     /// | 144 | `current_tint: float4` |
+    /// | 160 | `underline_position: float` |
+    /// | 164 | `line_thickness: float` |
+    /// | 168 | `strikethrough_position: float` |
     ///
     /// Everything else is zero, up to [`UNIFORMS_BYTES`].
     #[must_use]
@@ -239,6 +259,16 @@ impl FrameUniforms {
         put_f32s(&mut bytes, 112, &background.selection_tint);
         put_f32s(&mut bytes, 128, &background.search_tint);
         put_f32s(&mut bytes, 144, &background.current_match_tint);
+        let text = &self.text;
+        put_f32s(
+            &mut bytes,
+            160,
+            &[
+                text.underline_position,
+                text.line_thickness,
+                text.strikethrough_position,
+            ],
+        );
         bytes
     }
 
@@ -549,14 +579,37 @@ mod tests {
         let sizes = SlotSizes::for_grid(GridExtent::new(80, 120)).unwrap();
         assert_eq!(sizes.bytes(SlotBuffer::Uniforms), UNIFORMS_BYTES);
         assert_eq!(sizes.bytes(SlotBuffer::CellBg), 80 * 120 * 4);
-        assert_eq!(sizes.bytes(SlotBuffer::CellText), 80 * 120 * 32);
+        assert_eq!(sizes.bytes(SlotBuffer::CellText), 80 * 120 * 24);
         assert_eq!(sizes.bytes(SlotBuffer::RowTable), 80 * 16);
         let empty = SlotSizes::for_grid(GridExtent::default()).unwrap();
         assert_eq!(empty.bytes(SlotBuffer::CellBg), 0);
         assert_eq!(empty.bytes(SlotBuffer::Uniforms), UNIFORMS_BYTES);
         // The operator's 6K window.
         let large = SlotSizes::for_grid(GridExtent::new(117, 512)).unwrap();
-        assert_eq!(large.bytes(SlotBuffer::CellText), 117 * 512 * 32);
+        assert_eq!(large.bytes(SlotBuffer::CellText), 117 * 512 * 24);
+    }
+
+    /// ft-yccm0.4.2.3: a frame with more glyph instances than cells (combining
+    /// marks, ligature pieces) sizes CellText for all of them; fewer keep the
+    /// per-cell reservation.
+    #[test]
+    fn frames_with_extra_glyph_instances_grow_only_the_cell_text_buffer() {
+        let grid = GridExtent::new(80, 120);
+        let reserved = SlotSizes::for_grid(grid).unwrap();
+        assert_eq!(SlotSizes::for_frame(grid, 10).unwrap(), reserved);
+        let crowded = SlotSizes::for_frame(grid, 2 * 80 * 120).unwrap();
+        assert_eq!(
+            crowded.bytes(SlotBuffer::CellText),
+            2 * reserved.bytes(SlotBuffer::CellText)
+        );
+        for kind in [
+            SlotBuffer::Uniforms,
+            SlotBuffer::CellBg,
+            SlotBuffer::RowTable,
+        ] {
+            assert_eq!(crowded.bytes(kind), reserved.bytes(kind));
+        }
+        assert!(SlotSizes::for_frame(grid, usize::MAX).is_none());
     }
 
     /// ft-yccm0.4.3.2: the fence the glyph atlases reuse regions behind.
@@ -692,7 +745,7 @@ mod tests {
         assert_eq!((f32_at(96), u32_at(100)), (2.0, 2));
         assert_eq!((f32_at(112), f32_at(128), f32_at(144)), (0.1, 0.2, 0.3));
         assert!(bytes[104..112].iter().all(|&byte| byte == 0));
-        assert!(bytes[160..].iter().all(|&byte| byte == 0));
+        assert!(bytes[160..].iter().all(|&byte| byte == 0), "no text fields");
         // The shader's struct comments carry the same offsets.
         for (field, offset) in [
             ("frame", 0),
@@ -716,6 +769,56 @@ mod tests {
                 .lines()
                 .find(|line| line.contains(&declaration) && line.contains("//"))
                 .unwrap_or_else(|| panic!("the shader declares {field}"));
+            assert!(
+                line.contains(&format!("// {offset}")),
+                "{field} is at {offset}: {line}"
+            );
+        }
+    }
+
+    /// ft-yccm0.4.2.3: the text pass's fields follow the background's, and the
+    /// text shader declares the whole block at the same offsets.
+    #[test]
+    fn text_uniforms_follow_the_shader_struct_layout() {
+        use crate::cell_text::TEXT_SHADER;
+        let uniforms = FrameUniforms {
+            text: TextUniforms {
+                underline_position: 13.0,
+                line_thickness: 1.5,
+                strikethrough_position: 7.0,
+            },
+            ..FrameUniforms::default()
+        };
+        let bytes = uniforms.to_bytes();
+        let f32_at = |at: usize| f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        assert_eq!((f32_at(160), f32_at(164), f32_at(168)), (13.0, 1.5, 7.0));
+        assert!(bytes[..160].iter().all(|&byte| byte == 0));
+        assert!(bytes[172..].iter().all(|&byte| byte == 0));
+        for (field, offset) in [
+            ("frame", 0),
+            ("viewport", 8),
+            ("grid", 16),
+            ("clear", 32),
+            ("cell_size", 48),
+            ("grid_origin", 56),
+            ("row_offset", 64),
+            ("cursor_shape", 68),
+            ("cursor_cell", 72),
+            ("cursor_color", 80),
+            ("cursor_thickness", 96),
+            ("cursor_width", 100),
+            ("selection_tint", 112),
+            ("search_tint", 128),
+            ("current_tint", 144),
+            ("underline_position", 160),
+            ("line_thickness", 164),
+            ("strikethrough_position", 168),
+        ] {
+            let declaration = format!(" {field};");
+            let line = TEXT_SHADER
+                .lines()
+                .find(|line| line.contains(&declaration) && line.contains("//"))
+                .unwrap_or_else(|| panic!("the text shader declares {field}"));
             assert!(
                 line.contains(&format!("// {offset}")),
                 "{field} is at {offset}: {line}"

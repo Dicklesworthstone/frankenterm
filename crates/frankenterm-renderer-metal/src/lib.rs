@@ -146,8 +146,10 @@ use std::time::Duration;
 
 pub mod atlas;
 pub mod cell_bg;
+pub mod cell_text;
 pub mod frame;
 pub use cell_bg::{BackgroundUniforms, CellBg, CellBgGrid, CursorShape, CursorUniform};
+pub use cell_text::{CellText, CellTextGrid, TextUniforms, UnderlineStyle};
 pub use frame::{FRAME_SLOTS, GridExtent};
 
 #[cfg(target_os = "macos")]

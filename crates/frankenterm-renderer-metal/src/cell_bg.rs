@@ -269,8 +269,8 @@ pub struct BackgroundUniforms {
     pub current_match_tint: [f32; 4],
 }
 
-/// Premultiplied source-over.
-fn over(top: [f32; 4], bottom: [f32; 4]) -> [f32; 4] {
+/// Premultiplied source-over; the text pass's reference blends with it too.
+pub(crate) fn over(top: [f32; 4], bottom: [f32; 4]) -> [f32; 4] {
     let keep = 1.0 - top[3];
     [
         top[0] + bottom[0] * keep,
@@ -398,6 +398,7 @@ mod tests {
                 search_tint: [0.5, 0.5, 0.0, 0.5],
                 current_match_tint: [0.5, 0.25, 0.0, 0.5],
             },
+            ..FrameUniforms::default()
         }
     }
 

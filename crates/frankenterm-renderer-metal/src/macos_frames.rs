@@ -333,6 +333,7 @@ impl FrameSlots {
                 row_offset: cells.row_offset(),
                 ..request.background
             },
+            ..FrameUniforms::default()
         };
         self.write(&lease, SlotBuffer::Uniforms, 0, &uniforms.to_bytes())?;
         self.write(&lease, SlotBuffer::CellBg, 0, cells.as_bytes())?;
