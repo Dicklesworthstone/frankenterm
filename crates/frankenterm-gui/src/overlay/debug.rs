@@ -230,6 +230,8 @@ pub fn show_debug_overlay(
         let mut lines = body.summary_lines();
         // ft-yccm0.1.5 / ft-yccm0.2.1.1: terminal-lock and durability lines.
         lines.extend(body.lock_and_durability_lines());
+        // ft-yccm0.1.4: presented frames and the max_fps cap.
+        lines.push(body.frames.summary_line());
         lines.push(AllocatorSnapshot::read().summary_line());
         lines.join("\r\n")
     };

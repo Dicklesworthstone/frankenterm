@@ -3,6 +3,7 @@ use crate::termwindow::{DamageGeneration, RenderAttemptFailure};
 use ::window::WindowOps;
 use ::window::bitmaps::atlas::{AtlasAllocationFailure, OutOfTextureSpace};
 use anyhow::Context;
+use frankenterm_alloc::resource_ledger::FrameLedger;
 use frankenterm_core::frame_budget_a11y_gate::ReduceMotionState;
 use frankenterm_font::ClearShapeCache;
 use std::time::{Duration, Instant};
@@ -186,22 +187,30 @@ impl crate::TermWindow {
             .and_then(|()| {
                 log::debug!("paint_impl before call_draw elapsed={:?}", start.elapsed());
                 let damage_generation = self.damage_generation();
-                present(self).map(|()| {
-                    // Sample immediately after successful backend acceptance,
-                    // before bookkeeping or log delivery can delay observation.
-                    // The optional diagnostic never substitutes for SCK pixels.
-                    let submission_mach_ns = if log::log_enabled!(
-                        target: "frankenterm_gui::native_present_profile",
-                        log::Level::Debug
-                    ) {
-                        self.webgpu
-                            .as_ref()
-                            .and_then(|state| state.native_submission_mach_ns())
-                    } else {
-                        None
-                    };
-                    (damage_generation, submission_mach_ns)
-                })
+                present(self)
+                    .inspect_err(|_| FrameLedger::global().record_present_failure())
+                    .map(|()| {
+                        // Sample immediately after successful backend acceptance,
+                        // before bookkeeping or log delivery can delay observation.
+                        // The optional diagnostic never substitutes for SCK pixels.
+                        let submission_mach_ns = if log::log_enabled!(
+                            target: "frankenterm_gui::native_present_profile",
+                            log::Level::Debug
+                        ) {
+                            self.webgpu
+                                .as_ref()
+                                .and_then(|state| state.native_submission_mach_ns())
+                        } else {
+                            None
+                        };
+                        // ft-yccm0.1.4: the GUI's own presented-frame count and
+                        // cap, which the throughput harness checks its
+                        // screen-capture FPS meter against.
+                        let frames = FrameLedger::global();
+                        frames.set_max_fps(self.config.max_fps);
+                        frames.record_present();
+                        (damage_generation, submission_mach_ns)
+                    })
             });
 
         // Scheduling the next animation frame is cosmetic: reduce-motion

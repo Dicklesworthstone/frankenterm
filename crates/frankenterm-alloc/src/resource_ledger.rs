@@ -37,6 +37,45 @@ pub const RESOURCE_SNAPSHOT_HEARTBEAT: Duration = Duration::from_secs(30);
 /// [`collect_resource_snapshots`]: three missed heartbeats.
 pub const RESOURCE_SNAPSHOT_FRESHNESS: Duration = Duration::from_secs(90);
 
+/// Overrides the publisher's change-check interval, in milliseconds
+/// (ft-yccm0.1.4). The GUI throughput harness sets it so the presented-frame
+/// count is published often enough to bracket a drain window tightly.
+pub const RESOURCE_SNAPSHOT_INTERVAL_ENV: &str = "FT_RESOURCE_SNAPSHOT_INTERVAL_MS";
+
+/// Accepted range for [`RESOURCE_SNAPSHOT_INTERVAL_ENV`], in milliseconds.
+const RESOURCE_SNAPSHOT_INTERVAL_MS_RANGE: std::ops::RangeInclusive<u64> = 50..=60_000;
+
+/// The publisher interval: `default`, unless [`RESOURCE_SNAPSHOT_INTERVAL_ENV`]
+/// holds a millisecond count within 50..=60000.
+#[must_use]
+pub fn resource_snapshot_interval(default: Duration) -> Duration {
+    resource_snapshot_interval_from(
+        std::env::var(RESOURCE_SNAPSHOT_INTERVAL_ENV)
+            .ok()
+            .as_deref(),
+        default,
+    )
+}
+
+fn resource_snapshot_interval_from(value: Option<&str>, default: Duration) -> Duration {
+    let Some(value) = value else {
+        return default;
+    };
+    match value.trim().parse::<u64>() {
+        Ok(ms) if RESOURCE_SNAPSHOT_INTERVAL_MS_RANGE.contains(&ms) => Duration::from_millis(ms),
+        _ => {
+            log::warn!(
+                "ignoring {RESOURCE_SNAPSHOT_INTERVAL_ENV}={value:?}: expected milliseconds in \
+                 {}..={}; publishing every {} ms",
+                RESOURCE_SNAPSHOT_INTERVAL_MS_RANGE.start(),
+                RESOURCE_SNAPSHOT_INTERVAL_MS_RANGE.end(),
+                default.as_millis()
+            );
+            default
+        }
+    }
+}
+
 /// What a GPU texture is used for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum GpuTexturePurpose {
@@ -215,7 +254,11 @@ impl GpuResourceLedger {
     /// object that owns the texture so the accounting ends exactly when the
     /// texture is dropped.
     #[must_use = "dropping the guard immediately releases the accounting"]
-    pub fn track_texture(&'static self, purpose: GpuTexturePurpose, bytes: u64) -> GpuResourceGuard {
+    pub fn track_texture(
+        &'static self,
+        purpose: GpuTexturePurpose,
+        bytes: u64,
+    ) -> GpuResourceGuard {
         self.textures[purpose.index()].acquire(bytes);
         self.texture_total.acquire(bytes);
         GpuResourceGuard {
@@ -634,7 +677,9 @@ impl LatencyHistogram {
                 return 0;
             }
             // The smallest rank r with r / count >= numerator / denominator.
-            let rank = (count.saturating_mul(numerator)).div_ceil(denominator).max(1);
+            let rank = (count.saturating_mul(numerator))
+                .div_ceil(denominator)
+                .max(1);
             let mut seen = 0u64;
             for (index, bucket) in counts.iter().enumerate() {
                 seen += bucket;
@@ -880,6 +925,119 @@ pub struct DurabilitySnapshot {
     pub rows_abandoned_total: u64,
 }
 
+/// Frames the GUI handed to its graphics backend for presentation, and the
+/// intervals between them (ft-yccm0.1.4). This is FrankenTerm's own frame
+/// count: `scripts/mac-gui-throughput.sh` validates its terminal-agnostic
+/// screen-capture FPS meter against it.
+#[derive(Debug)]
+pub struct FrameLedger {
+    presented_total: AtomicU64,
+    present_failures_total: AtomicU64,
+    present_interval: LatencyHistogram,
+    /// Monotonic nanoseconds of the latest present; 0 before the first.
+    last_present_ns: AtomicU64,
+    max_fps: AtomicU64,
+}
+
+static GLOBAL_FRAME_LEDGER: FrameLedger = FrameLedger::new();
+
+impl Default for FrameLedger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FrameLedger {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            presented_total: AtomicU64::new(0),
+            present_failures_total: AtomicU64::new(0),
+            present_interval: LatencyHistogram::new(),
+            last_present_ns: AtomicU64::new(0),
+            max_fps: AtomicU64::new(0),
+        }
+    }
+
+    /// The ledger the GUI's paint path records into.
+    #[must_use]
+    pub fn global() -> &'static Self {
+        &GLOBAL_FRAME_LEDGER
+    }
+
+    /// The repaint-rate cap (`max_fps`) the presenting window runs with.
+    pub fn set_max_fps(&self, max_fps: u64) {
+        self.max_fps.store(max_fps, Ordering::Relaxed);
+    }
+
+    /// One frame accepted by the backend for presentation, now.
+    pub fn record_present(&self) {
+        self.record_present_at(monotonic_ns());
+    }
+
+    /// One frame accepted for presentation at `at_ns` on a monotonic
+    /// nanosecond clock; the interval since the previous one is recorded.
+    pub fn record_present_at(&self, at_ns: u64) {
+        let at_ns = at_ns.max(1);
+        self.presented_total.fetch_add(1, Ordering::Relaxed);
+        let previous = self.last_present_ns.swap(at_ns, Ordering::Relaxed);
+        if previous != 0 {
+            self.present_interval.record(at_ns.saturating_sub(previous));
+        }
+    }
+
+    /// A frame the backend refused to present.
+    pub fn record_present_failure(&self) {
+        self.present_failures_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> FramesSnapshot {
+        FramesSnapshot {
+            presented_total: self.presented_total.load(Ordering::Relaxed),
+            present_failures_total: self.present_failures_total.load(Ordering::Relaxed),
+            present_interval: self.present_interval.snapshot(),
+            max_fps: self.max_fps.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Nanoseconds since this process first asked, on the monotonic clock.
+fn monotonic_ns() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let epoch = *EPOCH.get_or_init(std::time::Instant::now);
+    u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// The `frames` section of a published snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FramesSnapshot {
+    pub presented_total: u64,
+    pub present_failures_total: u64,
+    /// Present-to-present intervals over the process lifetime, idle gaps
+    /// included.
+    pub present_interval: LatencySnapshot,
+    /// The configured repaint-rate cap; 0 until a frame reports it.
+    pub max_fps: u64,
+}
+
+impl FramesSnapshot {
+    /// One human-readable line for the GUI debug overlay.
+    #[must_use]
+    pub fn summary_line(&self) -> String {
+        let ms = |ns: u64| ns as f64 / 1_000_000.0;
+        format!(
+            "Frames: presented {} (failed {}); present interval p50 {:.2} ms, p95 {:.2} ms, max {:.2} ms; max_fps {}",
+            self.presented_total,
+            self.present_failures_total,
+            ms(self.present_interval.p50_ns),
+            ms(self.present_interval.p95_ns),
+            ms(self.present_interval.max_ns),
+            self.max_fps
+        )
+    }
+}
+
 /// The change-detected part of a published snapshot.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceSnapshotBody {
@@ -894,11 +1052,14 @@ pub struct ResourceSnapshotBody {
     /// [`DurabilityLedger::global`] (ft-yccm0.2.1.1).
     #[serde(default)]
     pub durability: DurabilitySnapshot,
+    /// [`FrameLedger::global`] (ft-yccm0.1.4).
+    #[serde(default)]
+    pub frames: FramesSnapshot,
 }
 
 impl ResourceSnapshotBody {
     /// GPU and cache sections from `gpu` and `caches`, the process's terminal
-    /// lock and durability ledgers; no panes.
+    /// lock, durability and frame ledgers; no panes.
     #[must_use]
     pub fn from_ledgers(gpu: &GpuResourceLedger, caches: &CacheGauges) -> Self {
         Self {
@@ -907,6 +1068,7 @@ impl ResourceSnapshotBody {
             panes: Vec::new(),
             terminal_locks: TerminalLockLedger::global().snapshot(),
             durability: DurabilityLedger::global().snapshot(),
+            frames: FrameLedger::global().snapshot(),
         }
     }
 
@@ -953,13 +1115,21 @@ impl ResourceSnapshotBody {
             ),
             format!(
                 "Caches: {}; {}; {}; glyphs {}; images {:.1} MiB",
-                cache(CacheGauge::ShapeCacheEntries, CacheGauge::ShapeCacheBytes, "shapes"),
+                cache(
+                    CacheGauge::ShapeCacheEntries,
+                    CacheGauge::ShapeCacheBytes,
+                    "shapes"
+                ),
                 cache(
                     CacheGauge::LineShapeCacheEntries,
                     CacheGauge::LineShapeCacheBytes,
                     "lines"
                 ),
-                cache(CacheGauge::LineQuadCacheEntries, CacheGauge::LineQuadCacheBytes, "quads"),
+                cache(
+                    CacheGauge::LineQuadCacheEntries,
+                    CacheGauge::LineQuadCacheBytes,
+                    "quads"
+                ),
                 self.caches
                     .get(CacheGauge::GlyphCacheEntries.as_str())
                     .copied()
@@ -1091,6 +1261,9 @@ pub struct ResourceSnapshotEnvelope {
     /// Durable scrollback writer health (ft-yccm0.2.1.1).
     #[serde(default)]
     pub durability: DurabilitySnapshot,
+    /// Presented frames and the frame-rate cap (ft-yccm0.1.4).
+    #[serde(default)]
+    pub frames: FramesSnapshot,
 }
 
 impl ResourceSnapshotEnvelope {
@@ -1108,6 +1281,7 @@ impl ResourceSnapshotEnvelope {
             allocator,
             terminal_locks: body.terminal_locks,
             durability: body.durability,
+            frames: body.frames,
         }
     }
 }
@@ -1117,7 +1291,9 @@ impl ResourceSnapshotEnvelope {
 pub fn unix_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// Path of the snapshot file `pid` publishes into `dir`.
@@ -1243,7 +1419,9 @@ pub fn collect_resource_snapshots(
                 .push(UnreadableResourceSnapshot { path, error }),
         }
     }
-    collection.snapshots.sort_by_key(|snapshot| snapshot.snapshot.pid);
+    collection
+        .snapshots
+        .sort_by_key(|snapshot| snapshot.snapshot.pid);
     collection.unreadable.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(collection)
 }
@@ -1354,13 +1532,19 @@ mod tests {
         assert_eq!(atlas.bytes(), 16_384);
 
         let atlas_counter = ledger.texture_counter(GpuTexturePurpose::Atlas);
-        assert_eq!((atlas_counter.live_count, atlas_counter.live_bytes), (1, 16_384));
+        assert_eq!(
+            (atlas_counter.live_count, atlas_counter.live_bytes),
+            (1, 16_384)
+        );
         let snapshot = ledger.snapshot();
         assert_eq!(snapshot.texture_total.live_bytes, 16_484);
         assert_eq!(snapshot.texture_total.live_count, 2);
         assert_eq!(snapshot.buffers["vertex"].live_bytes, 48);
         assert_eq!(snapshot.buffer_total.live_count, 1);
-        assert_eq!(snapshot.textures["drawable"], ResourceCounterSnapshot::default());
+        assert_eq!(
+            snapshot.textures["drawable"],
+            ResourceCounterSnapshot::default()
+        );
 
         drop(atlas);
         let atlas_counter = ledger.texture_counter(GpuTexturePurpose::Atlas);
@@ -1393,7 +1577,10 @@ mod tests {
         let counter = ledger.texture_counter(GpuTexturePurpose::Atlas);
         assert_eq!(counter.live_bytes, 5);
         assert_eq!(counter.peak_live_bytes, 40);
-        assert_eq!(counter.created_total - counter.released_total, counter.live_count);
+        assert_eq!(
+            counter.created_total - counter.released_total,
+            counter.live_count
+        );
         drop(third);
     }
 
@@ -1444,9 +1631,12 @@ mod tests {
         .unwrap();
 
         let collection =
-            collect_resource_snapshots(dir.path(), 1_000_500, RESOURCE_SNAPSHOT_FRESHNESS)
-                .unwrap();
-        assert!(collection.unreadable.is_empty(), "{:?}", collection.unreadable);
+            collect_resource_snapshots(dir.path(), 1_000_500, RESOURCE_SNAPSHOT_FRESHNESS).unwrap();
+        assert!(
+            collection.unreadable.is_empty(),
+            "{:?}",
+            collection.unreadable
+        );
         let pids: Vec<_> = collection
             .snapshots
             .iter()
@@ -1475,11 +1665,15 @@ mod tests {
             serde_json::to_vec(&foreign).unwrap(),
         )
         .unwrap();
-        let collection = collect_resource_snapshots(dir.path(), 0, RESOURCE_SNAPSHOT_FRESHNESS)
-            .unwrap();
+        let collection =
+            collect_resource_snapshots(dir.path(), 0, RESOURCE_SNAPSHOT_FRESHNESS).unwrap();
         assert!(collection.snapshots.is_empty());
         assert_eq!(collection.unreadable.len(), 2);
-        assert!(collection.unreadable[1].error.contains("unsupported schema"));
+        assert!(
+            collection.unreadable[1]
+                .error
+                .contains("unsupported schema")
+        );
     }
 
     #[test]
@@ -1551,7 +1745,10 @@ mod tests {
         }
 
         drop(publisher);
-        assert!(!path.exists(), "publisher must remove its own snapshot file");
+        assert!(
+            !path.exists(),
+            "publisher must remove its own snapshot file"
+        );
     }
 
     fn private_gauges() -> &'static CacheGauges {
@@ -1598,7 +1795,9 @@ mod tests {
         let lines = ResourceSnapshotBody::from_ledgers(ledger, gauges).summary_lines();
         assert_eq!(lines.len(), 3);
         assert!(
-            lines[0].starts_with("GPU textures 2 / 3.0 MiB (peak 3.0 MiB): atlas 1 / 2.0 MiB, drawable 1 / 1.0 MiB"),
+            lines[0].starts_with(
+                "GPU textures 2 / 3.0 MiB (peak 3.0 MiB): atlas 1 / 2.0 MiB, drawable 1 / 1.0 MiB"
+            ),
             "{}",
             lines[0]
         );
@@ -1682,14 +1881,20 @@ mod tests {
                 assert_eq!(LatencyHistogram::bucket_index(previous + 1), index);
                 // Two mantissa bits: a bucket is at most a quarter of its lower bound wide.
                 let lower = previous + 1;
-                assert!(upper - lower <= lower / 4, "bucket {index}: {lower}..={upper}");
+                assert!(
+                    upper - lower <= lower / 4,
+                    "bucket {index}: {lower}..={upper}"
+                );
             }
             previous_upper = Some(upper);
         }
         assert_eq!(previous_upper, Some(u64::MAX));
         assert_eq!(LatencyHistogram::bucket_index(0), 0);
         assert_eq!(LatencyHistogram::bucket_index(3), 3);
-        assert_eq!(LatencyHistogram::bucket_index(u64::MAX), LATENCY_BUCKETS - 1);
+        assert_eq!(
+            LatencyHistogram::bucket_index(u64::MAX),
+            LATENCY_BUCKETS - 1
+        );
     }
 
     #[test]
@@ -1822,5 +2027,113 @@ mod tests {
         let parsed: ResourceSnapshotEnvelope = serde_json::from_value(legacy).unwrap();
         assert_eq!(parsed.terminal_locks, TerminalLocksSnapshot::default());
         assert_eq!(parsed.durability, DurabilitySnapshot::default());
+    }
+
+    #[test]
+    fn frame_ledger_counts_presents_failures_and_present_intervals() {
+        let ledger: &'static FrameLedger = Box::leak(Box::new(FrameLedger::new()));
+        assert_eq!(ledger.snapshot(), FramesSnapshot::default());
+
+        // Three presents one 60 Hz period apart, then one after a 250 ms gap.
+        ledger.record_present_at(5_000_000);
+        ledger.record_present_at(21_666_667);
+        ledger.record_present_at(38_333_334);
+        ledger.record_present_at(288_333_334);
+        ledger.record_present_failure();
+        ledger.set_max_fps(120);
+        let snapshot = ledger.snapshot();
+        assert_eq!(snapshot.presented_total, 4);
+        assert_eq!(snapshot.present_failures_total, 1);
+        assert_eq!(snapshot.max_fps, 120);
+        // The first present has no predecessor, so three intervals.
+        assert_eq!(snapshot.present_interval.count, 3);
+        assert_eq!(snapshot.present_interval.max_ns, 250_000_000);
+        assert_eq!(
+            snapshot.present_interval.total_ns,
+            288_333_334 - 5_000_000,
+            "intervals tile the span from the first to the last present"
+        );
+        assert!(
+            (16_666_667..=16_666_667 * 5 / 4).contains(&snapshot.present_interval.p50_ns),
+            "{:?}",
+            snapshot.present_interval
+        );
+        assert_eq!(
+            snapshot.summary_line(),
+            format!(
+                "Frames: presented 4 (failed 1); present interval p50 {:.2} ms, p95 250.00 ms, \
+                 max 250.00 ms; max_fps 120",
+                snapshot.present_interval.p50_ns as f64 / 1_000_000.0
+            )
+        );
+
+        // The global ledger records against its own monotonic clock.
+        let global = FrameLedger::global();
+        let before = global.snapshot().presented_total;
+        global.record_present();
+        global.record_present();
+        assert!(global.snapshot().presented_total >= before + 2);
+    }
+
+    #[test]
+    fn frames_section_round_trips_and_defaults_when_absent() {
+        let envelope = ResourceSnapshotEnvelope {
+            frames: FramesSnapshot {
+                presented_total: 7_200,
+                max_fps: 120,
+                ..FramesSnapshot::default()
+            },
+            ..ResourceSnapshotEnvelope::now(
+                "x",
+                ResourceSnapshotBody::default(),
+                AllocatorSnapshot::default(),
+            )
+        };
+        let value = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(value["frames"]["presented_total"], 7_200);
+        assert_eq!(value["frames"]["max_fps"], 120);
+        assert_eq!(value["frames"]["present_interval"]["count"], 0);
+        let parsed: ResourceSnapshotEnvelope = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed, envelope);
+        // Files written before the section existed still parse.
+        let mut legacy = value;
+        legacy.as_object_mut().unwrap().remove("frames");
+        let parsed: ResourceSnapshotEnvelope = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.frames, FramesSnapshot::default());
+        // from_ledgers carries the global frame section into the body (other
+        // tests may record into the global ledger concurrently).
+        FrameLedger::global().record_present();
+        let body = ResourceSnapshotBody::from_ledgers(private_ledger(), private_gauges());
+        assert!(body.frames.presented_total >= 1);
+        assert!(body.frames.presented_total <= FrameLedger::global().snapshot().presented_total);
+    }
+
+    #[test]
+    fn snapshot_interval_override_accepts_only_milliseconds_in_range() {
+        let default = Duration::from_secs(2);
+        assert_eq!(resource_snapshot_interval_from(None, default), default);
+        assert_eq!(
+            resource_snapshot_interval_from(Some("500"), default),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            resource_snapshot_interval_from(Some(" 250\n"), default),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            resource_snapshot_interval_from(Some("50"), default),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            resource_snapshot_interval_from(Some("60000"), default),
+            Duration::from_secs(60)
+        );
+        for rejected in ["49", "0", "60001", "-5", "1.5", "fast", ""] {
+            assert_eq!(
+                resource_snapshot_interval_from(Some(rejected), default),
+                default,
+                "{rejected:?}"
+            );
+        }
     }
 }

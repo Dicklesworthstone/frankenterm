@@ -3491,7 +3491,10 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
         match frankenterm_alloc::resource_ledger::ResourceSnapshotPublisher::spawn(
             config::RUNTIME_DIR.clone(),
             "frankenterm-gui",
-            std::time::Duration::from_secs(2),
+            // FT_RESOURCE_SNAPSHOT_INTERVAL_MS overrides it (ft-yccm0.1.4).
+            frankenterm_alloc::resource_ledger::resource_snapshot_interval(
+                std::time::Duration::from_secs(2),
+            ),
             collect_resource_snapshot,
         ) {
             Ok(publisher) => Some(publisher),
