@@ -32,26 +32,72 @@ struct PostPresentWork {
     animation_due: Option<Instant>,
     should_schedule_animation: bool,
     should_force_frame_budget_paint: bool,
-    /// The frame drew an image whose first frame was still decoding.
-    images_loading: bool,
+    /// When to poll for an image still drawn as a placeholder while its first
+    /// frame decodes (`TermWindow::image_poll_due`).
+    image_poll_due: Option<Instant>,
 }
 
 impl PostPresentWork {
-    /// When to wake for the next animation frame. Animations run only in a
-    /// focused window and within the frame budget. An image whose first frame
-    /// is still decoding is not motion: its decoder is polled until it shows,
-    /// focused or not, because a finished decode wakes nothing and the image
-    /// would otherwise stay a transparent placeholder until an unrelated
-    /// repaint.
+    /// When to wake for the next frame. Animations run only in a focused
+    /// window and within the frame budget. An image whose first frame is
+    /// still decoding is not motion: it is polled until it shows, focused or
+    /// not, because a finished decode wakes nothing and the image would
+    /// otherwise stay a transparent placeholder until an unrelated repaint.
     fn animation_wake(self, focused: bool) -> Option<Instant> {
-        let wanted = self.images_loading || (focused && self.should_schedule_animation);
-        self.animation_due.filter(|_| wanted)
+        let animation = self
+            .animation_due
+            .filter(|_| focused && self.should_schedule_animation);
+        match (animation, self.image_poll_due) {
+            (Some(animation), Some(image)) => Some(animation.min(image)),
+            (animation, image) => animation.or(image),
+        }
     }
 }
 
 const MAX_PAINT_PASSES: usize = 16;
 
+/// The image poll deadline after noting an image still loading, due to be
+/// polled at `due`: the latest pending one. A line cached with a placeholder
+/// expires no later than its image's deadline, so only once the latest has
+/// passed has every such line expired; keeping an earlier one would let a
+/// paint between the two settle on a line still cached with its placeholder.
+/// A known deadline that has already passed was for lines that expire and
+/// render again, noting their images afresh, so it is replaced.
+fn noted_image_poll_due(known: Option<Instant>, due: Instant, now: Instant) -> Instant {
+    match known {
+        Some(known) if known > now => known.max(due),
+        _ => due,
+    }
+}
+
+/// The image poll deadline that survives into a paint pass starting at
+/// `now`. A passed deadline is dropped: every line cached with a placeholder
+/// due by then has expired and renders again in this pass.
+fn surviving_image_poll_due(known: Option<Instant>, now: Instant) -> Option<Instant> {
+    known.filter(|due| *due > now)
+}
+
 impl crate::TermWindow {
+    /// Records an image drawn in this paint pass by its cache load state and
+    /// next due time: `Loading` means the frame holds a transparent
+    /// placeholder while the image's first frame decodes on a worker, to be
+    /// polled at `next_due` (or the next paint when the cache names none).
+    pub(crate) fn note_image_load_state(
+        &self,
+        load_state: crate::glyphcache::LoadState,
+        next_due: Option<Instant>,
+    ) {
+        if load_state == crate::glyphcache::LoadState::Loading {
+            let now = Instant::now();
+            let due = next_due.unwrap_or(now);
+            self.image_poll_due.set(Some(noted_image_poll_due(
+                self.image_poll_due.get(),
+                due,
+                now,
+            )));
+        }
+    }
+
     pub(crate) fn paint_impl<P>(&mut self, present: P) -> Result<PaintOutcome, RenderAttemptFailure>
     where
         P: FnOnce(&mut Self) -> Result<(), RenderAttemptFailure>,
@@ -263,7 +309,7 @@ impl crate::TermWindow {
                 animation_due,
                 should_schedule_animation,
                 should_force_frame_budget_paint,
-                images_loading: self.images_loading.get(),
+                image_poll_due: self.image_poll_due.get(),
             },
         })
     }
@@ -378,7 +424,10 @@ impl crate::TermWindow {
         for state in self.pane_state.borrow_mut().values_mut() {
             state.selection_frame.begin_attempt();
         }
-        self.images_loading.set(false);
+        self.image_poll_due.set(surviving_image_poll_due(
+            self.image_poll_due.get(),
+            Instant::now(),
+        ));
         {
             let gl_state = self
                 .render_state
@@ -537,44 +586,88 @@ impl crate::TermWindow {
 mod tests {
     use super::*;
 
-    fn work(due: Option<Instant>, schedule: bool, images_loading: bool) -> PostPresentWork {
+    fn work(
+        animation_due: Option<Instant>,
+        schedule: bool,
+        image_poll_due: Option<Instant>,
+    ) -> PostPresentWork {
         PostPresentWork {
-            animation_due: due,
+            animation_due,
             should_schedule_animation: schedule,
             should_force_frame_budget_paint: false,
-            images_loading,
+            image_poll_due,
         }
+    }
+
+    #[test]
+    fn the_image_poll_deadline_is_the_latest_pending_one() {
+        let now = Instant::now();
+        let ms = |n| now + Duration::from_millis(n);
+        assert_eq!(noted_image_poll_due(None, ms(16), now), ms(16));
+        // Two placeholders noted in one paint (a sixel row, then an iTerm2
+        // row a few ms later): a wake at the earlier deadline would find the
+        // later row still cached with its placeholder.
+        assert_eq!(noted_image_poll_due(Some(ms(16)), ms(19), now), ms(19));
+        assert_eq!(noted_image_poll_due(Some(ms(19)), ms(16), now), ms(19));
+        // A passed deadline belongs to lines that render again; a line that
+        // just noted its image afresh must not be hidden behind it.
+        assert_eq!(noted_image_poll_due(Some(now), ms(16), now), ms(16));
+        assert_eq!(noted_image_poll_due(Some(ms(5)), ms(16), ms(6)), ms(16));
+    }
+
+    #[test]
+    fn the_image_poll_deadline_survives_cached_paints_until_it_passes() {
+        let now = Instant::now();
+        let due = now + Duration::from_millis(16);
+        // A paint before the deadline may reuse the cached placeholder line
+        // without rendering it, so the deadline must survive that paint.
+        assert_eq!(surviving_image_poll_due(Some(due), now), Some(due));
+        // From the deadline on, that line has expired and renders again.
+        assert_eq!(surviving_image_poll_due(Some(due), due), None);
+        assert_eq!(surviving_image_poll_due(None, now), None);
     }
 
     #[test]
     fn animations_wake_only_a_focused_window_within_budget() {
         let due = Instant::now() + Duration::from_millis(16);
-        assert_eq!(work(Some(due), true, false).animation_wake(true), Some(due));
-        assert_eq!(work(Some(due), true, false).animation_wake(false), None);
+        assert_eq!(work(Some(due), true, None).animation_wake(true), Some(due));
+        assert_eq!(work(Some(due), true, None).animation_wake(false), None);
         assert_eq!(
-            work(Some(due), false, false).animation_wake(true),
+            work(Some(due), false, None).animation_wake(true),
             None,
             "reduce motion or frame pressure skips the animation"
         );
-        assert_eq!(work(None, true, false).animation_wake(true), None);
+        assert_eq!(work(None, true, None).animation_wake(true), None);
     }
 
     #[test]
     fn a_decoding_image_is_polled_focused_or_not() {
-        let due = Instant::now() + Duration::from_millis(16);
+        let now = Instant::now();
+        let image = now + Duration::from_millis(16);
         for focused in [false, true] {
             for schedule in [false, true] {
                 assert_eq!(
-                    work(Some(due), schedule, true).animation_wake(focused),
-                    Some(due),
+                    work(None, schedule, Some(image)).animation_wake(focused),
+                    Some(image),
                     "focused={focused} schedule={schedule}"
                 );
             }
         }
+        // A running animation and a decoding image: the earlier wins, and an
+        // animation the window may not run never delays the image poll.
+        let sooner = now + Duration::from_millis(5);
+        let later = now + Duration::from_millis(40);
         assert_eq!(
-            work(None, false, true).animation_wake(false),
-            None,
-            "a failed decode has no next poll"
+            work(Some(sooner), true, Some(image)).animation_wake(true),
+            Some(sooner)
+        );
+        assert_eq!(
+            work(Some(later), true, Some(image)).animation_wake(true),
+            Some(image)
+        );
+        assert_eq!(
+            work(Some(sooner), true, Some(image)).animation_wake(false),
+            Some(image)
         );
     }
 }

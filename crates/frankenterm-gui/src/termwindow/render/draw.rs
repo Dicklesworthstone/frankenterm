@@ -67,9 +67,10 @@ impl crate::TermWindow {
         // ft-yccm0.1.10: this frame's shaping and quads are built. If it
         // asked for a fallback font, a resolved fallback has not been applied
         // yet, the configured window background is still loading, or an image
-        // is still a placeholder for its decoding first frame, the frame is
-        // not final: re-arm. Font and background completions invalidate the
-        // window; a decoding image is polled at the decoder's next due time.
+        // is still a placeholder for its decoding first frame (drawn now or
+        // in a cached line), the frame is not final: re-arm. Font and
+        // background completions invalidate the window; a decoding image is
+        // polled at its decoder's next due time.
         if matches!(target, WebGpuDrawTarget::Snapshot(_)) {
             let readiness = SnapshotFrameReadiness {
                 fonts_pending: self.fonts.fallback_resolves_in_flight() > 0
@@ -77,18 +78,13 @@ impl crate::TermWindow {
                         .fallback_invalidation_pending
                         .load(std::sync::atomic::Ordering::Acquire),
                 background_loading: !self.background_load.is_settled(),
-                images_loading: self.images_loading.get(),
+                images_loading: self.image_poll_due.get().is_some(),
             };
             if !readiness.is_final() {
                 if let Some(request) = self.render_snapshot.as_mut() {
                     request.rearm();
                 }
-                if readiness.needs_poll() {
-                    let now = std::time::Instant::now();
-                    let due = self
-                        .has_animation
-                        .borrow()
-                        .unwrap_or(now + std::time::Duration::from_millis(16));
+                if let Some(due) = self.image_poll_due.get().filter(|_| readiness.needs_poll()) {
                     self.schedule_animation_wake(due);
                 }
                 log::info!("render snapshot deferred: {readiness:?}");

@@ -1820,7 +1820,7 @@ impl crate::TermWindow {
             self.allow_images,
         )?;
         self.update_next_frame_time(next_due);
-        self.note_image_load_state(load_state);
+        self.note_image_load_state(load_state, next_due);
 
         if load_state != LoadState::Loaded {
             return Ok(false);

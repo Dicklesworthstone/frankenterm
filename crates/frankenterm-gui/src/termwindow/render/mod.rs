@@ -761,7 +761,7 @@ impl crate::TermWindow {
             .cached_image(image.image_data(), Some(padding), self.allow_images)
             .context("cached_image")?;
         self.update_next_frame_time(next_due);
-        self.note_image_load_state(load_state);
+        self.note_image_load_state(load_state, next_due);
         if load_state != crate::glyphcache::LoadState::Loaded {
             return Ok(());
         }
