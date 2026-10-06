@@ -689,6 +689,16 @@ panic = "unwind"
 # needlessly opaque, so preserve them for attribution-quality A/B evidence.
 strip = "none"
 
+[profile.bench]
+# Without this, `cargo bench` inherits the size-optimized `release` profile
+# (opt-level = "z") and measures code nobody ships or tunes. Mirror
+# `release-perf`; a built-in profile cannot name `inherits`, so its settings
+# are repeated here (ft-yccm0.1.2).
+opt-level = 3
+lto = "thin"
+debug = "line-tables-only"
+strip = "none"
+
 [profile.release.package.frankenterm-fuzz]
 debug = 1
 

@@ -4657,6 +4657,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "terminfo",
  "termwiz 0.24.0",
  "unicode-normalization",

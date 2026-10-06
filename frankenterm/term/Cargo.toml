@@ -48,6 +48,7 @@ criterion.workspace = true
 env_logger.workspace = true
 k9.workspace = true
 proptest = "1.8.0"
+sha2.workspace = true
 
 [[bench]]
 name = "byte_to_grid"
@@ -55,6 +56,13 @@ harness = false
 
 [[bench]]
 name = "term_parser_ab"
+harness = false
+
+# Headless ingest throughput bench (ft-yccm0.1.2). examples/ingest_throughput.rs
+# is the same CLI with a stable path for hyperfine; build both with
+# --profile release-perf or through cargo bench, never --release (opt-level = "z").
+[[bench]]
+name = "ingest_throughput"
 harness = false
 
 [dependencies.termwiz]
