@@ -81,6 +81,16 @@ impl<'s, 'f, G: FeedGate + ?Sized> Handler for FeedHandler<'s, 'f, G> {
         }
     }
 
+    #[inline]
+    fn print_ascii_run(&mut self, run: &str) {
+        if self.diverting {
+            self.diverted.push(Action::PrintString(run.to_string()));
+        } else {
+            self.applied = true;
+            Handler::print_ascii_run(&mut self.performer, run);
+        }
+    }
+
     /// Offers each setting to the gate in order, as `action` offers each
     /// action, and applies the run up to the first one it diverts.
     fn sgr(&mut self, sgrs: &[Sgr]) {

@@ -4,7 +4,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
-use frankenterm_escape_parser::parser::Parser;
+use frankenterm_escape_parser::parser::{AsciiScan, Parser};
 use frankenterm_escape_parser::{Action, ControlCode, Esc, EscCode};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{Clipboard, FeedGate, Terminal, TerminalConfiguration, TerminalSize};
@@ -216,9 +216,11 @@ impl EngineFactory for TwoStage {
 /// applied afterwards with `perform_actions`, as the mux applies them after
 /// admission. The gate diverts what the mux diverts (alert sources) and,
 /// with `divert_every`, also every n-th other action, so diversion lands at
-/// arbitrary points.
+/// arbitrary points. `ascii_scan` pins the parser's ground-state ASCII scan
+/// (ft-yccm0.3.2.2); `None` keeps the parser's default.
 pub struct FusedFeed {
     pub divert_every: Option<usize>,
+    pub ascii_scan: Option<AsciiScan>,
 }
 
 struct FusedFeedGate {
@@ -268,16 +270,25 @@ impl Engine for FusedFeedEngine {
 
 impl EngineFactory for FusedFeed {
     fn name(&self) -> &'static str {
-        match self.divert_every {
-            None => "fused_feed",
-            Some(_) => "fused_feed_frequent_diversion",
+        match (self.divert_every, self.ascii_scan) {
+            (None, None) => "fused_feed",
+            (Some(_), None) => "fused_feed_frequent_diversion",
+            (None, Some(AsciiScan::Scalar)) => "fused_feed_scalar_scan",
+            (None, Some(AsciiScan::Simd16)) => "fused_feed_simd16",
+            (None, Some(AsciiScan::Simd32)) => "fused_feed_simd32",
+            (None, Some(AsciiScan::Simd64)) => "fused_feed_simd64",
+            (Some(_), Some(_)) => "fused_feed_frequent_diversion_pinned_scan",
         }
     }
 
     fn build_with(&self, geometry: &Geometry, io: EngineIo) -> Box<dyn Engine> {
+        let mut parser = Parser::new();
+        if let Some(scan) = self.ascii_scan {
+            parser.set_ascii_scan(scan);
+        }
         Box::new(FusedFeedEngine {
             terminal: new_terminal_with(geometry, io),
-            parser: Parser::new(),
+            parser,
             gate: FusedFeedGate {
                 divert_every: self.divert_every,
                 seen: 0,
@@ -303,9 +314,27 @@ pub fn candidates() -> Vec<Box<dyn EngineFactory>> {
             print_batching: false,
             csi_fast_path: false,
         }),
-        Box::new(FusedFeed { divert_every: None }),
+        Box::new(FusedFeed {
+            divert_every: None,
+            ascii_scan: None,
+        }),
         Box::new(FusedFeed {
             divert_every: Some(7),
+            ascii_scan: None,
+        }),
+        // ft-yccm0.3.2.2: the scalar oracle and the wider `std::simd` scans.
+        // Legacy and the other candidates run the default scan.
+        Box::new(FusedFeed {
+            divert_every: None,
+            ascii_scan: Some(AsciiScan::Scalar),
+        }),
+        Box::new(FusedFeed {
+            divert_every: None,
+            ascii_scan: Some(AsciiScan::Simd32),
+        }),
+        Box::new(FusedFeed {
+            divert_every: None,
+            ascii_scan: Some(AsciiScan::Simd64),
         }),
     ]
 }

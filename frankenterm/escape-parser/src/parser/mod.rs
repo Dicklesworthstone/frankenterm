@@ -15,7 +15,9 @@ use vtparse::{CsiParam, VTActor, VTParser};
 
 use crate::allocate::*;
 
+mod ascii;
 mod sixel;
+pub use ascii::AsciiScan;
 use sixel::SixelBuilder;
 
 const MAX_TCAP_NAMES: usize = 512;
@@ -116,6 +118,26 @@ fn default_csi_fast_path() -> bool {
     }
     #[cfg(not(feature = "std"))]
     csi_fast_path_default_for_value(None)
+}
+
+/// Kill switch and width choice for the ground-state ASCII scan
+/// (ft-yccm0.3.2.2): falsey selects the scalar scan for newly constructed
+/// parsers, and `16`, `32` or `64` a `std::simd` width. See
+/// [`AsciiScan::for_env_value`] and [`Parser::set_ascii_scan`].
+#[cfg(feature = "std")]
+const PARSER_SIMD_ENV: &str = "FT_PARSER_SIMD";
+
+/// Resolve the default [`AsciiScan`] for a freshly constructed [`Parser`].
+/// `no_std` builds use [`AsciiScan::DEFAULT`].
+#[inline]
+fn default_ascii_scan() -> AsciiScan {
+    #[cfg(feature = "std")]
+    {
+        let value = std::env::var(PARSER_SIMD_ENV).ok();
+        return AsciiScan::for_env_value(value.as_deref());
+    }
+    #[cfg(not(feature = "std"))]
+    AsciiScan::for_env_value(None)
 }
 
 /// Pure policy core for [`default_csi_fast_path`], testable without touching
@@ -330,6 +352,15 @@ pub trait Handler {
         self.action(Action::PrintString(text.to_string()));
     }
 
+    /// [`Action::PrintString`] for a run that is all printable ASCII
+    /// (`0x20..=0x7e`) and at least two bytes long (ft-yccm0.3.2.2). A
+    /// handler that knows each byte is one narrow cell can write the run
+    /// straight into a row; the default hands it to [`Handler::print_str`].
+    #[inline]
+    fn print_ascii_run(&mut self, run: &str) {
+        self.print_str(run);
+    }
+
     /// [`Action::Control`].
     #[inline]
     fn control(&mut self, code: ControlCode) {
@@ -399,6 +430,9 @@ pub struct Parser {
     print_batching: bool,
     /// The CSI fast path (ft-yccm0.3.2.4); see [`Parser::set_csi_fast_path`].
     csi_fast_path: bool,
+    /// The ground-state ASCII scan (ft-yccm0.3.2.2); see
+    /// [`Parser::set_ascii_scan`].
+    ascii_scan: AsciiScan,
     /// The fast path's parameter array, reused for every sequence: fixed
     /// size, never on the heap, and never cleared (only the prefix a scan
     /// writes is read).
@@ -583,6 +617,7 @@ impl Parser {
             recovery_stream_bytes: Some(0),
             print_batching: default_print_batching(),
             csi_fast_path: default_csi_fast_path(),
+            ascii_scan: default_ascii_scan(),
             csi_params: [CsiParam::Integer(0); CSI_FAST_MAX_PARAMS],
             sgr_run: core::array::from_fn(|_| Sgr::Reset),
             last_sgr: LastSgr::new(),
@@ -729,6 +764,20 @@ impl Parser {
         self.csi_fast_path
     }
 
+    /// Chooses how the ground state finds the end of a printable-ASCII
+    /// stretch (ft-yccm0.3.2.2). The default is [`AsciiScan::DEFAULT`]
+    /// unless `FT_PARSER_SIMD` says otherwise; `FT_PARSER_SIMD=0` selects
+    /// the scalar scan. It applies with print batching. Every choice yields
+    /// the same action stream.
+    pub fn set_ascii_scan(&mut self, scan: AsciiScan) {
+        self.ascii_scan = scan;
+    }
+
+    /// The ground-state ASCII scan in use. See [`Parser::set_ascii_scan`].
+    pub fn ascii_scan(&self) -> AsciiScan {
+        self.ascii_scan
+    }
+
     /// advance with tmux parser, bypass VTParse
     #[cfg(feature = "tmux_cc")]
     fn advance_tmux_bytes(&mut self, bytes: &[u8]) -> crate::Result<Vec<Event>> {
@@ -839,19 +888,25 @@ impl Parser {
         const MIN_BATCH_CHARS: usize = 2;
 
         let csi_fast_path = self.csi_fast_path;
+        let ascii_scan = self.ascii_scan;
         let n = bytes.len();
         let mut i = 0;
         while i < n {
             if self.state_machine.is_ground() {
                 let byte = bytes[i];
                 if can_start_printable_run(byte) {
-                    let (run_end, char_count) = scan_printable_run(bytes, i);
+                    let (run_end, char_count) = scan_printable_run(bytes, i, ascii_scan);
                     if char_count >= MIN_BATCH_CHARS {
                         // `scan_printable_run` only extends across complete, valid
                         // UTF-8, so the slice is guaranteed valid UTF-8.
                         debug_assert!(core::str::from_utf8(&bytes[i..run_end]).is_ok());
                         if let Ok(s) = core::str::from_utf8(&bytes[i..run_end]) {
-                            handler.print_str(s);
+                            // One byte per character: the run is all ASCII.
+                            if run_end - i == char_count {
+                                handler.print_ascii_run(s);
+                            } else {
+                                handler.print_str(s);
+                            }
                             i = run_end;
                             continue;
                         }
@@ -900,7 +955,7 @@ impl Parser {
                         byte == 0x1b || can_start_printable_run(byte)
                     } else {
                         can_start_printable_run(byte)
-                            && scan_printable_run(bytes, i).1 >= MIN_BATCH_CHARS
+                            && scan_printable_run(bytes, i, ascii_scan).1 >= MIN_BATCH_CHARS
                     };
                     if boundary {
                         break;
@@ -1153,15 +1208,26 @@ fn can_start_printable_run(byte: u8) -> bool {
     matches!(byte, 0x20..=0x7e) || byte >= 0xc2
 }
 
-fn scan_printable_run(bytes: &[u8], start: usize) -> (usize, usize) {
+/// The run described above. `ascii_scan` finds each ASCII stretch
+/// (ft-yccm0.3.2.2); the result does not depend on which scan it is.
+fn scan_printable_run(bytes: &[u8], start: usize, ascii_scan: AsciiScan) -> (usize, usize) {
     let n = bytes.len();
     let mut i = start;
     let mut chars = 0usize;
     while i < n {
         let b = bytes[i];
-        if (0x20..=0x7e).contains(&b) {
-            i += 1;
-            chars += 1;
+        if ascii::is_printable_ascii(b) {
+            // ft-yccm0.3.2.2: the ASCII stretch in one scan. A one-byte
+            // stretch (the character between two escapes) is settled by the
+            // next byte, so it never reaches a `std::simd` scan.
+            let stretch = match bytes.get(i + 1) {
+                Some(&next) if ascii::is_printable_ascii(next) => {
+                    ascii_scan.printable_len(&bytes[i..])
+                }
+                _ => 1,
+            };
+            i += stretch;
+            chars += stretch;
             continue;
         }
         let seq_len = match b {
@@ -2053,37 +2119,49 @@ mod test {
 
     #[test]
     fn scan_printable_run_boundaries() {
+        // Every ASCII scan must find the same run.
+        fn scan_with_every_scan(bytes: &[u8], start: usize) -> (usize, usize) {
+            let oracle = scan_printable_run(bytes, start, AsciiScan::Scalar);
+            for scan in AsciiScan::ALL {
+                assert_eq!(scan_printable_run(bytes, start, scan), oracle, "{:?}", scan);
+            }
+            oracle
+        }
         // Pure ASCII printable run, stops at first control.
-        assert_eq!(scan_printable_run(b"abc\n", 0), (3, 3));
+        assert_eq!(scan_with_every_scan(b"abc\n", 0), (3, 3));
         // DEL terminates the run.
-        assert_eq!(scan_printable_run(b"ab\x7fc", 0), (2, 2));
+        assert_eq!(scan_with_every_scan(b"ab\x7fc", 0), (2, 2));
         // ESC terminates the run.
-        assert_eq!(scan_printable_run(b"ab\x1b[m", 0), (2, 2));
+        assert_eq!(scan_with_every_scan(b"ab\x1b[m", 0), (2, 2));
         // 2-byte UTF-8 (é) counts as one char.
-        assert_eq!(scan_printable_run(b"a\xc3\xa9b", 0), (4, 3));
+        assert_eq!(scan_with_every_scan(b"a\xc3\xa9b", 0), (4, 3));
         // Latin-1 NBSP (U+00A0) prints in ground -> batchable.
-        assert_eq!(scan_printable_run(b"a\xc2\xa0b", 0), (4, 3));
+        assert_eq!(scan_with_every_scan(b"a\xc2\xa0b", 0), (4, 3));
         // 3-byte (€) and 4-byte (🚀) sequences.
-        assert_eq!(scan_printable_run("€".as_bytes(), 0), (3, 1));
-        assert_eq!(scan_printable_run("🚀".as_bytes(), 0), (4, 1));
+        assert_eq!(scan_with_every_scan("€".as_bytes(), 0), (3, 1));
+        assert_eq!(scan_with_every_scan("🚀".as_bytes(), 0), (4, 1));
         // C1-via-UTF-8 (0xC2 0x9B == U+009B == CSI) stops the run immediately.
-        assert_eq!(scan_printable_run(b"\xc2\x9bx", 0), (0, 0));
-        assert_eq!(scan_printable_run(b"ab\xc2\x9bx", 0), (2, 2));
+        assert_eq!(scan_with_every_scan(b"\xc2\x9bx", 0), (0, 0));
+        assert_eq!(scan_with_every_scan(b"ab\xc2\x9bx", 0), (2, 2));
         // The 0x9F/0xA0 boundary: 0x9F is C1 (stop), 0xA0 prints.
-        assert_eq!(scan_printable_run(b"\xc2\x9f", 0), (0, 0));
-        assert_eq!(scan_printable_run(b"\xc2\xa0", 0), (2, 1));
+        assert_eq!(scan_with_every_scan(b"\xc2\x9f", 0), (0, 0));
+        assert_eq!(scan_with_every_scan(b"\xc2\xa0", 0), (2, 1));
         // Incomplete trailing multibyte sequence is deferred (not consumed).
-        assert_eq!(scan_printable_run(b"ab\xe2\x82", 0), (2, 2));
-        assert_eq!(scan_printable_run(b"ab\xc3", 0), (2, 2));
+        assert_eq!(scan_with_every_scan(b"ab\xe2\x82", 0), (2, 2));
+        assert_eq!(scan_with_every_scan(b"ab\xc3", 0), (2, 2));
         // Invalid encodings stop the run.
-        assert_eq!(scan_printable_run(b"a\xffb", 0), (1, 1));
-        assert_eq!(scan_printable_run(b"a\xc0\x80b", 0), (1, 1)); // overlong NUL
-        assert_eq!(scan_printable_run(b"a\xc2Zb", 0), (1, 1)); // bad continuation
+        assert_eq!(scan_with_every_scan(b"a\xffb", 0), (1, 1));
+        assert_eq!(scan_with_every_scan(b"a\xc0\x80b", 0), (1, 1)); // overlong NUL
+        assert_eq!(scan_with_every_scan(b"a\xc2Zb", 0), (1, 1)); // bad continuation
         // Raw C1 / stray continuation bytes are not run material.
-        assert_eq!(scan_printable_run(b"\x80\x81", 0), (0, 0));
+        assert_eq!(scan_with_every_scan(b"\x80\x81", 0), (0, 0));
         // Empty / fully-consumed.
-        assert_eq!(scan_printable_run(b"", 0), (0, 0));
-        assert_eq!(scan_printable_run(b"abc", 3), (3, 0));
+        assert_eq!(scan_with_every_scan(b"", 0), (0, 0));
+        assert_eq!(scan_with_every_scan(b"abc", 3), (3, 0));
+        // ASCII stretches longer than a SIMD block, around UTF-8 and stops.
+        let long = "x".repeat(70) + "\u{e9}" + &"y".repeat(40) + "\x1b[m";
+        assert_eq!(scan_with_every_scan(long.as_bytes(), 0), (112, 111));
+        assert_eq!(scan_with_every_scan(long.as_bytes(), 5), (112, 106));
     }
 
     #[test]
@@ -2352,6 +2430,9 @@ mod test {
             }
             fn print_str(&mut self, text: &str) {
                 self.0.push(Action::PrintString(text.to_string()));
+            }
+            fn print_ascii_run(&mut self, run: &str) {
+                self.0.push(Action::PrintString(run.to_string()));
             }
             fn control(&mut self, code: ControlCode) {
                 self.0.push(Action::Control(code));

@@ -260,6 +260,57 @@ pub fn adversarial_cases() -> Vec<(&'static str, Vec<u8>)> {
     sgr_runs.extend_from_slice(b"x\x1b[1;2;3;4;5;7;8;9;21;22;23;24;25;27;28;29;30mY");
     cases.push(("csi_fast_long_sgr_runs", sgr_runs));
 
+    // ft-yccm0.3.2.2: printable-ASCII runs written a row at a time. These
+    // cover each branch of the row writer: wrapping and scrolling, autowrap
+    // off, margins, a cursor past the right margin, a pending wrap, insert
+    // mode and remapping charsets (left to the character path), a title
+    // being accumulated, text already pending, and wide cells overwritten.
+    cases.extend([
+        (
+            "ascii_run_wraps_and_scrolls",
+            b"\x1b[2;3r\x1b[2;1H0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghij\x1b[r"
+                .to_vec(),
+        ),
+        (
+            "ascii_run_no_autowrap",
+            b"\x1b[?7l0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!\x1b[?7hxy".to_vec(),
+        ),
+        (
+            "ascii_run_margins",
+            b"\x1b[?69h\x1b[3;6s\x1b[2;3Habcdefghijklmnopqrstuvwxyz0123\x1b[?69lZ".to_vec(),
+        ),
+        (
+            "ascii_run_past_right_margin",
+            b"\x1b[?69h\x1b[2;4s\x1b[1;7Hlong text past margin\x1b[?7lmore text\x1b[?7h\x1b[?69l".to_vec(),
+        ),
+        (
+            "ascii_run_pending_wrap",
+            b"\x1b[1;200HX0123456789abcdefghij\x1b[3;200H\x1b[?7lYZ\x1b[?7h0123456789abcdefghij".to_vec(),
+        ),
+        (
+            "ascii_run_insert_and_charsets",
+            b"abcdefghijkl\r\x1b[4hinserted text here\x1b[4l\x1b(0lqqqqqqqqqqqk\x1b(B\x1b(Aab#cd##\x1b(B".to_vec(),
+        ),
+        (
+            "ascii_run_title_and_pending",
+            b"\x1bkaccumulated tmux title\x1b\\after title\xffpending then ascii run\x7fdel then run".to_vec(),
+        ),
+        (
+            "ascii_run_over_wide_cells",
+            "\u{4E2D}\u{6587}\u{5B57}\u{4E2D}\u{6587}\u{5B57}\r\x1b[2Coverwrite half of each wide cell"
+                .as_bytes()
+                .to_vec(),
+        ),
+    ]);
+
+    // Long runs: a log-like stream of lines wider than every geometry.
+    let mut long_runs = Vec::new();
+    for line in 0..40 {
+        long_runs.extend_from_slice(repeat("long line text ", 6 + line % 7).as_bytes());
+        long_runs.extend_from_slice(b"\r\n");
+    }
+    cases.push(("ascii_run_long_lines", long_runs));
+
     cases
 }
 

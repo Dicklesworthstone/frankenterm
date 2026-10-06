@@ -302,6 +302,20 @@ impl<'a> Handler for Performer<'a> {
         self.print_string(text);
     }
 
+    /// What `perform` does for `Action::PrintString` of a printable-ASCII
+    /// run (ft-yccm0.3.2.2), written straight into the rows when no text is
+    /// pending. Pending text could combine with the run, so the run then
+    /// joins it as before. Writing now rather than at the next flush is
+    /// the same, since every action that changes how text prints (controls,
+    /// escapes, CSI, OSC, images) flushes pending print first.
+    #[inline]
+    fn print_ascii_run(&mut self, run: &str) {
+        if !self.print.is_empty() || self.accumulating_title.is_some() || !self.write_ascii_run(run)
+        {
+            self.print_string(run);
+        }
+    }
+
     /// What `perform` does for each `Action::CSI(CSI::Sgr(_))`, with no
     /// `Action` built (ft-yccm0.3.2.4). Pending print is committed with the
     /// old pen, then every setting updates the pen. Flushing once covers the
@@ -732,36 +746,7 @@ impl<'a> Performer<'a> {
             }
 
             if self.wrap_next {
-                // Since we're implicitly moving the cursor to the next
-                // line, we need to tag the current position as wrapped
-                // so that we can correctly reflow it if the window is
-                // resized.
-                {
-                    let y = self.cursor.y;
-                    let is_conpty = self.state.enable_conpty_quirks;
-                    let screen = self.screen_mut();
-                    let y = screen.phys_row(y);
-
-                    fn makes_sense_to_wrap(s: &str) -> bool {
-                        let len = s.len();
-                        match (len, s.chars().next()) {
-                            (1, Some(c)) => c.is_alphanumeric() || c.is_ascii_punctuation(),
-                            _ => true,
-                        }
-                    }
-
-                    let should_mark_wrapped = !is_conpty
-                        || screen
-                            .line_mut(y)
-                            .visible_cells()
-                            .last()
-                            .map(|cell| makes_sense_to_wrap(cell.str()))
-                            .unwrap_or(false);
-                    if should_mark_wrapped {
-                        screen.line_mut(y).set_last_cell_was_wrapped(true, seqno);
-                    }
-                }
-                self.new_line(true);
+                self.wrap_before_print(seqno);
             }
 
             let x = self.cursor.x;
@@ -809,6 +794,102 @@ impl<'a> Performer<'a> {
 
         std::mem::swap(&mut self.print, &mut p);
         self.print.clear();
+    }
+
+    /// Takes a pending wrap before the next character prints: the row is
+    /// marked as wrapped and the cursor moves to the start of the next line,
+    /// scrolling at the bottom margin.
+    fn wrap_before_print(&mut self, seqno: usize) {
+        // Since we're implicitly moving the cursor to the next
+        // line, we need to tag the current position as wrapped
+        // so that we can correctly reflow it if the window is
+        // resized.
+        {
+            let y = self.cursor.y;
+            let is_conpty = self.state.enable_conpty_quirks;
+            let screen = self.screen_mut();
+            let y = screen.phys_row(y);
+
+            fn makes_sense_to_wrap(s: &str) -> bool {
+                let len = s.len();
+                match (len, s.chars().next()) {
+                    (1, Some(c)) => c.is_alphanumeric() || c.is_ascii_punctuation(),
+                    _ => true,
+                }
+            }
+
+            let should_mark_wrapped = !is_conpty
+                || screen
+                    .line_mut(y)
+                    .visible_cells()
+                    .last()
+                    .map(|cell| makes_sense_to_wrap(cell.str()))
+                    .unwrap_or(false);
+            if should_mark_wrapped {
+                screen.line_mut(y).set_last_cell_was_wrapped(true, seqno);
+            }
+        }
+        self.new_line(true);
+    }
+
+    /// Writes a printable-ASCII run straight into the rows, one row segment
+    /// per `set_ascii_cell_run` (ft-yccm0.3.2.2). It reproduces what
+    /// `flush_print` does one character at a time. Each character is one
+    /// narrow cell. A pending wrap is taken before the next character. The
+    /// character that lands on the right margin's column (or the first one,
+    /// when the cursor is already past it) ends the row: it leaves a wrap
+    /// pending, or without autowrap every later character overwrites that
+    /// column.
+    ///
+    /// Returns false, having written nothing, wherever a character could
+    /// print differently: in insert mode, with a character set that remaps
+    /// ASCII, or with bulk row writes switched off.
+    fn write_ascii_run(&mut self, run: &str) -> bool {
+        debug_assert!(run.bytes().all(|byte| matches!(byte, 0x20..=0x7e)));
+        if self.insert
+            || self.active_charset() != CharSet::Ascii
+            || !Self::bulk_ascii_row_write_enabled()
+        {
+            return false;
+        }
+        let seqno = self.seqno;
+        let right_margin = self.left_and_right_margins.end;
+        let mut rest = run;
+        while !rest.is_empty() {
+            if self.wrap_next {
+                self.wrap_before_print(seqno);
+            }
+            let x = self.cursor.x;
+            let y = self.cursor.y;
+            let room = right_margin.saturating_sub(x).max(1);
+            let (row, tail) = rest.split_at(room.min(rest.len()));
+            let last_x = x + row.len() - 1;
+            let pen = self.pen.clone();
+            self.screen_mut().set_ascii_cell_run(x, y, row, pen, seqno);
+            self.note_printed(y, last_x, 1, false);
+            rest = tail;
+            if row.len() < room {
+                self.cursor.x = x + row.len();
+                self.wrap_next = false;
+            } else if self.dec_auto_wrap {
+                self.cursor.x = last_x;
+                self.wrap_next = true;
+            } else {
+                // Without autowrap every later character overwrites that
+                // column, so the run's last character is the one that stays.
+                self.cursor.x = last_x;
+                self.wrap_next = false;
+                if !rest.is_empty() {
+                    let last = &rest[rest.len() - 1..];
+                    let pen = self.pen.clone();
+                    self.screen_mut()
+                        .set_ascii_cell_run(last_x, y, last, pen, seqno);
+                    self.note_printed(y, last_x, 1, false);
+                }
+                rest = "";
+            }
+        }
+        true
     }
 
     /// ConPTY, at the time of writing, does something horrible to rewrite
