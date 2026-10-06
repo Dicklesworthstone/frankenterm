@@ -7,10 +7,22 @@
 //!
 //! What it renders today is deliberately minimal: one render pass that clears
 //! the drawable to the window background color and presents it. That proves
-//! the device, queue, layer and present plumbing end to end. Cell backgrounds,
-//! glyphs and the GPU data model arrive with the later Track C beads, so
-//! `front_end = "Metal"` is an in-development opt-in that does not yet draw
-//! terminal content.
+//! the device, queue, layer and present plumbing end to end. Cell backgrounds
+//! and glyphs arrive with the later Track C beads, so `front_end = "Metal"` is
+//! an in-development opt-in that does not yet draw terminal content.
+//!
+//! # Frame slots (ft-yccm0.4.2.1)
+//!
+//! Every frame is written into one of [`FRAME_SLOTS`] frame slots: per-frame
+//! buffers (uniforms, cell backgrounds, glyph instances, per-row tables) in
+//! shared, write-combined memory that the GPU reads in place. The [`frame`]
+//! module paces them, at most three frames in flight, a slot never rewritten
+//! before the GPU has finished with it, and sizes them for the grid,
+//! growing geometrically so a steady-state frame allocates nothing. On
+//! macOS 15+ one residency set holds every slot buffer. On macOS 26 frames are
+//! submitted through Metal 4: a command allocator, command buffer and argument
+//! table per slot, created once and reused. Elsewhere they go through Metal 3
+//! with the same buffer model ([`SubmissionPath`]).
 //!
 //! On every target other than macOS the same API exists as an uninhabited
 //! stub: [`MetalDevice::system_default`] and [`MetalRenderer::attach`] return
@@ -34,8 +46,9 @@
 //! crate-wide, every block opts in with a narrow `#[allow(unsafe_code)]`, and
 //! clippy's `undocumented_unsafe_blocks` and `multiple_unsafe_ops_per_block`
 //! are denied, so each block holds one operation and one `SAFETY:` comment
-//! naming its category below. All blocks live in `src/macos.rs`. The non-macOS
-//! stub contains none.
+//! naming its category below. All blocks live in `src/macos.rs` and
+//! `src/macos_frames.rs`. The non-macOS stub and the portable [`frame`] module
+//! contain none.
 //!
 //! Most Metal and Core Animation calls are safe in `objc2-metal` /
 //! `objc2-quartz-core` 0.3, whose generated bindings already encode the
@@ -73,15 +86,49 @@
 //!    waited on to completion and checked for success, so no GPU write races
 //!    the read; the bytes are copied into an owned `Vec` before the buffer is
 //!    released, so no reference outlives the allocation.
+//! 5. **BUFFER-WRITE: writing a frame slot.** Copying a frame's bytes into a
+//!    slot buffer's `-contents`.
+//!    *Invariant:* the write requires a `SlotLease` from the same slot ring
+//!    (asserted), and a lease exists only while its slot is not in flight:
+//!    the GPU finished the last frame that read the slot before the lease was
+//!    granted. The destination range is checked against `-length`, the
+//!    buffer is CPU-visible shared storage, and the source is Rust memory
+//!    that cannot overlap it.
+//! 6. **FFI-BLOCK: completion handlers.** `addCompletedHandler:` (Metal 3)
+//!    and `addFeedbackHandler:` (Metal 4) take an Objective-C block, and the
+//!    handler dereferences the command buffer or feedback object Metal passes.
+//!    *Invariant:* Metal copies the block, so the local `RcBlock` may drop
+//!    after the call; the closure owns only `Send + Sync + 'static` state (a
+//!    `CompletionToken`, an `Arc<AtomicU64>`) because Metal runs it on a
+//!    thread of its choosing; the handler is added before the commit; the
+//!    object Metal passes is valid for the duration of the handler.
+//! 7. **FFI-COMMIT: Metal 4 commit.** `commit:count:options:` takes a C
+//!    array of command buffers.
+//!    *Invariant:* the pointer addresses a live one-element array for the
+//!    duration of the call and the count is 1; the command buffer has ended
+//!    encoding, and its allocator is not reset until the frame's feedback
+//!    handler has freed the slot.
+//! 8. **FFI-ARGTABLE: Metal 4 argument tables.** `setAddress:atIndex:` binds
+//!    a buffer by GPU address.
+//!    *Invariant:* the address belongs to a live slot buffer that the frame
+//!    slots own and keep in the queue's residency set; the index is below the
+//!    table's `maxBufferBindCount`; a slot's buffers are rebound whenever its
+//!    generation changes (a buffer was replaced), before the slot's next frame.
 //!
 //! Thread affinity: `MetalRenderer` holds Objective-C objects that are not
 //! `Send`, so it stays on the thread that created it (the GUI main thread
 //! today; bead `ft-yccm0.4.1.2` moves rendering to a dedicated thread).
 
 use std::fmt;
+use std::time::Duration;
+
+pub mod frame;
+pub use frame::{FRAME_SLOTS, GridExtent};
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod macos_frames;
 #[cfg(target_os = "macos")]
 pub use macos::{MetalDevice, MetalRenderer};
 
@@ -100,6 +147,105 @@ pub const MAX_KNOWN_APPLE_FAMILY: u8 = 10;
 /// Largest texture width or height accepted for offscreen rendering: the 2D
 /// texture limit of every Apple3-or-newer GPU family.
 pub const MAX_TEXTURE_EXTENT: u32 = 16_384;
+
+/// Longest a frame waits for a frame slot. A slot frees as soon as the GPU
+/// finishes the frame three back, a few milliseconds at most when the GPU is
+/// healthy; a frame that waits this long fails with
+/// [`FrameError::FrameSlotTimeout`] and the GUI retries it.
+pub const FRAME_SLOT_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Environment variable that selects the submission path: `metal3`, `metal4`
+/// or `auto` (the default: Metal 4 where supported).
+pub const SUBMISSION_ENV: &str = "FRANKENTERM_METAL_SUBMISSION";
+
+/// How the renderer submits frames to the GPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmissionPath {
+    /// Metal 4 (macOS 26): `MTL4CommandQueue`, per-slot command allocators,
+    /// command buffers and argument tables, residency sets.
+    Metal4,
+    /// Metal 3: a command buffer per frame and completion handlers, with the
+    /// same frame-slot buffers.
+    Metal3,
+}
+
+/// The submission path [`SubmissionPath::select`] picked, and why it differs
+/// from what was asked for, if it does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmissionChoice {
+    pub path: SubmissionPath,
+    pub note: Option<String>,
+}
+
+impl SubmissionPath {
+    /// Stable lowercase name, as accepted by [`SUBMISSION_ENV`].
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Metal4 => "metal4",
+            Self::Metal3 => "metal3",
+        }
+    }
+
+    /// Picks the path from whether the device and OS support Metal 4 and the
+    /// [`SUBMISSION_ENV`] value, if set.
+    #[must_use]
+    pub fn select(metal4_supported: bool, requested: Option<&str>) -> SubmissionChoice {
+        let auto = if metal4_supported {
+            Self::Metal4
+        } else {
+            Self::Metal3
+        };
+        match requested.map(str::trim) {
+            None | Some("" | "auto") => SubmissionChoice {
+                path: auto,
+                note: None,
+            },
+            Some("metal3") => SubmissionChoice {
+                path: Self::Metal3,
+                note: metal4_supported
+                    .then(|| format!("{SUBMISSION_ENV}=metal3 forces the Metal 3 path")),
+            },
+            Some("metal4") => SubmissionChoice {
+                path: auto,
+                note: (!metal4_supported).then(|| {
+                    format!("{SUBMISSION_ENV}=metal4, but this device or OS has no Metal 4; using Metal 3")
+                }),
+            },
+            Some(other) => SubmissionChoice {
+                path: auto,
+                note: Some(format!(
+                    "{SUBMISSION_ENV}={other:?} is not metal3, metal4 or auto; using {}",
+                    auto.as_str()
+                )),
+            },
+        }
+    }
+}
+
+impl fmt::Display for SubmissionPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Frame pacing and allocation counters of a [`MetalRenderer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameStats {
+    pub path: SubmissionPath,
+    /// Frames the GPU finished.
+    pub frames_completed: u64,
+    /// Frames whose command buffer finished in error.
+    pub frames_failed: u64,
+    /// Frames committed and not yet finished.
+    pub in_flight: usize,
+    /// The most frames ever in flight at once (at most [`FRAME_SLOTS`]).
+    pub peak_in_flight: usize,
+    /// Frame-slot buffers created since attach; constant in steady state.
+    pub buffer_allocations: u64,
+    /// Allocations in the frame slots' residency set, if the OS has them.
+    pub resident_allocations: Option<usize>,
+}
 
 /// A Metal GPU family the capability probe asks about.
 ///
@@ -220,6 +366,8 @@ pub enum MetalUnavailable {
     NoBackingLayer,
     /// The view's backing layer is not a `CAMetalLayer`.
     LayerNotMetal { class: String },
+    /// The frame-slot buffers could not be allocated.
+    ResourceAllocation { detail: String },
 }
 
 impl MetalUnavailable {
@@ -235,6 +383,7 @@ impl MetalUnavailable {
             Self::UnsupportedWindowHandle { .. } => "unsupported_window_handle",
             Self::NoBackingLayer => "no_backing_layer",
             Self::LayerNotMetal { .. } => "layer_not_metal",
+            Self::ResourceAllocation { .. } => "resource_allocation",
         }
     }
 }
@@ -272,6 +421,9 @@ impl fmt::Display for MetalUnavailable {
                     "the window's backing layer is a {class}, not a CAMetalLayer"
                 )
             }
+            Self::ResourceAllocation { detail } => {
+                write!(f, "the Metal frame slots could not be allocated: {detail}")
+            }
         }
     }
 }
@@ -295,6 +447,18 @@ pub enum FrameError {
     InvalidExtent { width: u32, height: u32 },
     /// The command buffer finished in a state other than completed.
     CommandFailed { detail: String },
+    /// No frame slot freed within [`FRAME_SLOT_TIMEOUT`]: the GPU has not
+    /// finished the frame that last used the next slot.
+    FrameSlotTimeout { slot: usize, in_flight: usize },
+    /// The grid's per-frame buffers would not fit in memory sizes.
+    GridTooLarge { rows: u32, cols: u32 },
+    /// A write would run past the end of a frame-slot buffer.
+    SlotWriteOutOfBounds {
+        buffer: &'static str,
+        offset: usize,
+        len: usize,
+        capacity: usize,
+    },
 }
 
 impl fmt::Display for FrameError {
@@ -311,6 +475,26 @@ impl fmt::Display for FrameError {
                 "extent {width}x{height} is outside 1..={MAX_TEXTURE_EXTENT} pixels per side"
             ),
             Self::CommandFailed { detail } => write!(f, "Metal command buffer failed: {detail}"),
+            Self::FrameSlotTimeout { slot, in_flight } => write!(
+                f,
+                "frame slot {slot} was not released within {} ms ({in_flight} frames in flight)",
+                FRAME_SLOT_TIMEOUT.as_millis()
+            ),
+            Self::GridTooLarge { rows, cols } => {
+                write!(
+                    f,
+                    "a {rows}x{cols} grid is too large for frame-slot buffers"
+                )
+            }
+            Self::SlotWriteOutOfBounds {
+                buffer,
+                offset,
+                len,
+                capacity,
+            } => write!(
+                f,
+                "a {len}-byte write at offset {offset} overruns the {capacity}-byte {buffer} buffer"
+            ),
         }
     }
 }
@@ -359,6 +543,20 @@ impl ClearColor {
             blue: unit(blue) * alpha,
             alpha,
         }
+    }
+
+    /// The premultiplied components as `[red, green, blue, alpha]` `f32`s,
+    /// for shader uniforms.
+    #[must_use]
+    // Components are in 0.0..=1.0, so narrowing to f32 loses only precision.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn to_f32(self) -> [f32; 4] {
+        [
+            self.red as f32,
+            self.green as f32,
+            self.blue as f32,
+            self.alpha as f32,
+        ]
     }
 
     /// The `[B, G, R, A]` bytes a `BGRA8Unorm` clear stores, rounding each
@@ -529,6 +727,7 @@ mod tests {
             MetalUnavailable::LayerNotMetal {
                 class: "CALayer".into(),
             },
+            MetalUnavailable::ResourceAllocation { detail: "d".into() },
         ];
         let codes: Vec<&str> = reasons.iter().map(MetalUnavailable::code).collect();
         assert_eq!(
@@ -542,6 +741,7 @@ mod tests {
                 "unsupported_window_handle",
                 "no_backing_layer",
                 "layer_not_metal",
+                "resource_allocation",
             ]
         );
         for reason in &reasons {
@@ -648,6 +848,76 @@ mod tests {
             FrameError::DrawableUnavailable
                 .to_string()
                 .contains("drawable")
+        );
+    }
+
+    #[test]
+    fn submission_defaults_to_metal4_where_supported_and_honors_the_override() {
+        let pick = |supported, requested| SubmissionPath::select(supported, requested);
+        assert_eq!(pick(true, None).path, SubmissionPath::Metal4);
+        assert_eq!(pick(true, None).note, None);
+        assert_eq!(pick(false, None).path, SubmissionPath::Metal3);
+        assert_eq!(pick(true, Some("auto")).path, SubmissionPath::Metal4);
+        assert_eq!(pick(true, Some(" ")).path, SubmissionPath::Metal4);
+        let forced = pick(true, Some("metal3"));
+        assert_eq!(forced.path, SubmissionPath::Metal3);
+        assert!(forced.note.unwrap().contains("forces the Metal 3 path"));
+        assert_eq!(pick(false, Some("metal3")).note, None);
+        let impossible = pick(false, Some("metal4"));
+        assert_eq!(impossible.path, SubmissionPath::Metal3);
+        assert!(impossible.note.unwrap().contains("no Metal 4"));
+        assert_eq!(pick(true, Some("metal4")), pick(true, None));
+        let typo = pick(true, Some("metl4"));
+        assert_eq!(typo.path, SubmissionPath::Metal4);
+        assert!(
+            typo.note
+                .unwrap()
+                .contains("\"metl4\" is not metal3, metal4 or auto")
+        );
+        assert_eq!(SubmissionPath::Metal4.to_string(), "metal4");
+        assert_eq!(SubmissionPath::Metal3.as_str(), "metal3");
+    }
+
+    #[test]
+    fn frame_slot_errors_describe_their_cause() {
+        let timeout = FrameError::FrameSlotTimeout {
+            slot: 2,
+            in_flight: 3,
+        }
+        .to_string();
+        assert!(timeout.contains("frame slot 2"), "{timeout}");
+        assert!(timeout.contains("100 ms"), "{timeout}");
+        assert!(timeout.contains("3 frames in flight"), "{timeout}");
+        assert!(
+            FrameError::GridTooLarge { rows: 9, cols: 7 }
+                .to_string()
+                .contains("9x7 grid")
+        );
+        let overrun = FrameError::SlotWriteOutOfBounds {
+            buffer: "uniforms",
+            offset: 250,
+            len: 8,
+            capacity: 256,
+        }
+        .to_string();
+        assert!(
+            overrun.contains("8-byte write at offset 250 overruns the 256-byte uniforms buffer"),
+            "{overrun}"
+        );
+        assert!(
+            MetalUnavailable::ResourceAllocation {
+                detail: "no memory".into()
+            }
+            .to_string()
+            .contains("frame slots could not be allocated: no memory")
+        );
+    }
+
+    #[test]
+    fn clear_color_f32_components_keep_premultiplication() {
+        assert_eq!(
+            ClearColor::from_srgba(1.0, 0.5, 0.25, 0.5).to_f32(),
+            [0.5, 0.25, 0.125, 0.5]
         );
     }
 

@@ -2,7 +2,10 @@
 //! return [`MetalUnavailable::UnsupportedPlatform`], so every method body is
 //! statically unreachable and callers need no `cfg`.
 
-use crate::{ClearColor, DeviceCapabilities, FrameError, FrameOutcome, MetalUnavailable};
+use crate::{
+    ClearColor, DeviceCapabilities, FrameError, FrameOutcome, FrameStats, GridExtent,
+    MetalUnavailable, SubmissionPath,
+};
 use raw_window_handle::HasWindowHandle;
 
 /// Uninhabited off macOS; see the crate docs.
@@ -43,10 +46,26 @@ impl MetalRenderer {
         match *self {}
     }
 
+    #[must_use]
+    pub fn submission_path(&self) -> SubmissionPath {
+        match *self {}
+    }
+
+    #[must_use]
+    pub fn submission_note(&self) -> Option<&str> {
+        match *self {}
+    }
+
+    #[must_use]
+    pub fn frame_stats(&self) -> FrameStats {
+        match *self {}
+    }
+
     pub fn render_clear(
         &self,
         _width: u32,
         _height: u32,
+        _grid: GridExtent,
         _color: ClearColor,
     ) -> Result<FrameOutcome, FrameError> {
         match *self {}

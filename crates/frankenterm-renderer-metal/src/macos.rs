@@ -1,10 +1,13 @@
 //! The macOS implementation. Every `unsafe` block in the crate is here, and
 //! each names its UNSAFE-CONTRACT category from the crate docs.
 
+use crate::frame::{FrameUniforms, GridExtent, SlotBuffer};
+use crate::macos_frames::{FrameSlots, Submission, supports_metal4};
 use crate::{
-    ClearColor, DeviceCapabilities, FrameError, FrameOutcome, MAX_TEXTURE_EXTENT, MetalUnavailable,
-    appkit_view,
+    ClearColor, DeviceCapabilities, FRAME_SLOT_TIMEOUT, FrameError, FrameOutcome, FrameStats,
+    MAX_TEXTURE_EXTENT, MetalUnavailable, SUBMISSION_ENV, SubmissionPath, appkit_view,
 };
+use frankenterm_alloc::resource_ledger::GpuResourceLedger;
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, ProtocolObject};
 use objc2::{MainThreadMarker, msg_send};
@@ -12,12 +15,13 @@ use objc2_core_foundation::CGSize;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus,
     MTLCommandEncoder, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily,
-    MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLRenderPassDescriptor, MTLResourceOptions, MTLSize,
-    MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
+    MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLRenderPassDescriptor, MTLResidencySet,
+    MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor,
+    MTLTextureUsage,
 };
 use objc2_quartz_core::{CALayer, CAMetalDrawable, CAMetalLayer};
 use raw_window_handle::HasWindowHandle;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 
 /// The pixel format of every target this crate renders to.
@@ -66,6 +70,10 @@ impl MetalDevice {
     #[must_use]
     pub fn capabilities(&self) -> &DeviceCapabilities {
         &self.capabilities
+    }
+
+    pub(crate) fn raw_device(&self) -> Retained<ProtocolObject<dyn MTLDevice>> {
+        self.device.clone()
     }
 
     /// Clears an offscreen `width x height` `BGRA8Unorm` texture with one
@@ -180,6 +188,22 @@ pub struct MetalRenderer {
     device: MetalDevice,
     layer: Retained<CAMetalLayer>,
     drawable_size: Cell<(u32, u32)>,
+    frames: RefCell<FrameSlots>,
+    submission: Submission,
+    submission_note: Option<String>,
+}
+
+/// Longest a dropped renderer waits for its in-flight frames.
+const DROP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl Drop for MetalRenderer {
+    /// Metal 4 command buffers do not retain the resources they use, so the
+    /// frame-slot buffers must outlive every committed frame: wait (bounded)
+    /// for the GPU to finish before the fields drop.
+    fn drop(&mut self) {
+        // No panic here: this may run during an unwind.
+        self.frames.borrow().ring().wait_idle(DROP_IDLE_TIMEOUT);
+    }
 }
 
 impl fmt::Debug for MetalRenderer {
@@ -187,6 +211,7 @@ impl fmt::Debug for MetalRenderer {
         f.debug_struct("MetalRenderer")
             .field("device", &self.device)
             .field("drawable_size", &self.drawable_size.get())
+            .field("submission", &self.submission.path())
             .finish_non_exhaustive()
     }
 }
@@ -195,10 +220,41 @@ impl MetalRenderer {
     /// Opens and admits the system default device, then binds it to the
     /// window's backing `CAMetalLayer`. Must be called on the main thread.
     ///
-    /// The device is probed before the layer is touched, so a refusal leaves
-    /// the layer exactly as the window created it for the fallback backend.
+    /// The device is probed and the frame slots are allocated before the
+    /// layer is touched, so a refusal leaves the layer exactly as the window
+    /// created it for the fallback backend.
+    ///
+    /// Frames go through Metal 4 when the device and OS support it, else
+    /// Metal 3; [`SUBMISSION_ENV`] can force Metal 3.
     pub fn attach(window: &impl HasWindowHandle) -> Result<Self, MetalUnavailable> {
         let device = MetalDevice::system_default()?;
+        let frames = FrameSlots::new(
+            device.raw_device(),
+            GridExtent::default(),
+            GpuResourceLedger::global(),
+        )
+        .map_err(|error| MetalUnavailable::ResourceAllocation {
+            detail: error.to_string(),
+        })?;
+        let choice = SubmissionPath::select(
+            supports_metal4(&device.device) && frames.residency().is_some(),
+            std::env::var(SUBMISSION_ENV).ok().as_deref(),
+        );
+        let (submission, submission_note) = match choice.path {
+            SubmissionPath::Metal4 => match Submission::metal4(&device.device, &frames) {
+                Ok(submission) => (submission, choice.note),
+                Err(reason) => (
+                    Submission::metal3(device.queue.clone(), &frames),
+                    Some(format!(
+                        "Metal 4 submission unavailable ({reason}); using Metal 3"
+                    )),
+                ),
+            },
+            SubmissionPath::Metal3 => (
+                Submission::metal3(device.queue.clone(), &frames),
+                choice.note,
+            ),
+        };
         let handle =
             window
                 .window_handle()
@@ -228,10 +284,14 @@ impl MetalRenderer {
         layer.setDevice(Some(&device.device));
         layer.setPixelFormat(PIXEL_FORMAT);
         layer.setFramebufferOnly(true);
+        submission.add_layer(&layer);
         Ok(Self {
             device,
             layer,
             drawable_size: Cell::new((0, 0)),
+            frames: RefCell::new(frames),
+            submission,
+            submission_note,
         })
     }
 
@@ -241,12 +301,44 @@ impl MetalRenderer {
         &self.device
     }
 
-    /// Clears the next drawable of a `width x height` pixel layer to `color`,
-    /// schedules its presentation and commits. Does not wait for the GPU.
+    /// How frames reach the GPU.
+    #[must_use]
+    pub fn submission_path(&self) -> SubmissionPath {
+        self.submission.path()
+    }
+
+    /// Why the submission path differs from the default choice, if it does.
+    #[must_use]
+    pub fn submission_note(&self) -> Option<&str> {
+        self.submission_note.as_deref()
+    }
+
+    /// Frame pacing and allocation counters.
+    #[must_use]
+    pub fn frame_stats(&self) -> FrameStats {
+        let frames = self.frames.borrow();
+        let ring = frames.ring();
+        FrameStats {
+            path: self.submission.path(),
+            frames_completed: ring.frames_completed(),
+            frames_failed: self.submission.failed_frames(),
+            in_flight: ring.in_flight(),
+            peak_in_flight: ring.peak_in_flight(),
+            buffer_allocations: frames.allocations(),
+            resident_allocations: frames.residency().map(MTLResidencySet::allocationCount),
+        }
+    }
+
+    /// Renders one frame of a `width x height` pixel layer showing `grid`:
+    /// leases the next frame slot (waiting at most [`FRAME_SLOT_TIMEOUT`] for
+    /// the GPU to release it), writes the frame's uniforms into it, clears
+    /// the next drawable to `color`, schedules its presentation and commits.
+    /// Does not wait for the GPU.
     pub fn render_clear(
         &self,
         width: u32,
         height: u32,
+        grid: GridExtent,
         color: ClearColor,
     ) -> Result<FrameOutcome, FrameError> {
         if width == 0 || height == 0 {
@@ -257,22 +349,27 @@ impl MetalRenderer {
                 .setDrawableSize(CGSize::new(f64::from(width), f64::from(height)));
             self.drawable_size.set((width, height));
         }
+        let lease = self.frames.borrow_mut().begin(grid, FRAME_SLOT_TIMEOUT)?;
+        let frames = self.frames.borrow();
+        let uniforms = FrameUniforms {
+            frame: lease.frame(),
+            viewport: [width, height],
+            grid,
+            clear: color.to_f32(),
+        };
+        frames.write(&lease, SlotBuffer::Uniforms, 0, &uniforms.to_bytes())?;
+        // A frame abandoned here drops its lease, which frees the slot.
         let drawable = self
             .layer
             .nextDrawable()
             .ok_or(FrameError::DrawableUnavailable)?;
-        let commands = self
-            .device
-            .queue
-            .commandBuffer()
-            .ok_or(FrameError::CommandBufferUnavailable)?;
-        let pass = clear_pass(&drawable.texture(), color);
-        let encoder = commands
-            .renderCommandEncoderWithDescriptor(&pass)
-            .ok_or(FrameError::EncoderUnavailable)?;
-        encoder.endEncoding();
-        commands.presentDrawable(ProtocolObject::from_ref(&*drawable));
-        commands.commit();
+        self.submission.encode_clear(
+            &frames,
+            lease,
+            &drawable.texture(),
+            Some(ProtocolObject::from_ref(&*drawable)),
+            color,
+        )?;
         Ok(FrameOutcome::Presented)
     }
 }

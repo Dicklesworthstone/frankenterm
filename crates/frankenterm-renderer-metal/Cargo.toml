@@ -35,14 +35,28 @@ doc_markdown = "allow"
 raw-window-handle.workspace = true
 
 # Same objc2 family versions the workspace already resolves (objc2 0.6.4, the
-# 0.3.2 framework crates), with the feature sets wgpu-hal already enables, so
-# the macOS build adds no new compilation units.
+# 0.3.2 framework crates, block2 0.6.2). The Metal 3 features match what
+# wgpu-hal already enables (including block2, MTLEvent and MTLResidencySet);
+# the MTL4* features add the Metal 4 bindings for the frame-slot submission
+# path (ft-yccm0.4.2.1). frankenterm-alloc (no default features: no global
+# allocator) receives the frame-slot buffers in its GPU resource ledger.
 [target.'cfg(target_os = "macos")'.dependencies]
+block2.workspace = true
+frankenterm-alloc.workspace = true
 objc2.workspace = true
 objc2-foundation.workspace = true
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes"] }
 objc2-metal = { version = "0.3.2", default-features = false, features = [
     "std",
+    "block2",
+    "MTL4ArgumentTable",
+    "MTL4CommandAllocator",
+    "MTL4CommandBuffer",
+    "MTL4CommandEncoder",
+    "MTL4CommandQueue",
+    "MTL4CommitFeedback",
+    "MTL4RenderCommandEncoder",
+    "MTL4RenderPass",
     "MTLAllocation",
     "MTLBlitCommandEncoder",
     "MTLBuffer",
@@ -51,9 +65,12 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
     "MTLCommandQueue",
     "MTLDevice",
     "MTLDrawable",
+    "MTLEvent",
+    "MTLGPUAddress",
     "MTLPixelFormat",
     "MTLRenderCommandEncoder",
     "MTLRenderPass",
+    "MTLResidencySet",
     "MTLResource",
     "MTLTexture",
     "MTLTypes",

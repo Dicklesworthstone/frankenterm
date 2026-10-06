@@ -4532,6 +4532,8 @@ dependencies = [
 name = "frankenterm-renderer-metal"
 version = "0.15.21"
 dependencies = [
+ "block2",
+ "frankenterm-alloc",
  "objc2",
  "objc2-core-foundation",
  "objc2-foundation",

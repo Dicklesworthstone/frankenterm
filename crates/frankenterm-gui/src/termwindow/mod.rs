@@ -3882,7 +3882,8 @@ impl TermWindow {
         self.render_state = None;
 
         let render_info = format!(
-            "Metal (in development: background clear only) on {}",
+            "Metal (in development: background clear only, {} submission) on {}",
+            metal.submission_path(),
             metal.device().capabilities()
         );
         self.opengl_info.replace(render_info.clone());
@@ -3891,6 +3892,9 @@ impl TermWindow {
             render_info,
             config::wezterm_version(),
         );
+        if let Some(note) = metal.submission_note() {
+            log::warn!("Metal renderer: {note}");
+        }
         self.metal.replace(metal);
         self.render_recovery_state.record_reinitialized();
     }
@@ -5166,7 +5170,12 @@ impl TermWindow {
         let dimensions = self.dimensions;
         let width = u32::try_from(dimensions.pixel_width).unwrap_or(u32::MAX);
         let height = u32::try_from(dimensions.pixel_height).unwrap_or(u32::MAX);
-        match metal.render_clear(width, height, color) {
+        // ft-yccm0.4.2.1: the frame slots are sized for the grid.
+        let grid = frankenterm_renderer_metal::GridExtent::new(
+            self.terminal_size.rows,
+            self.terminal_size.cols,
+        );
+        match metal.render_clear(width, height, grid, color) {
             Ok(frankenterm_renderer_metal::FrameOutcome::Presented) => {
                 if let Some(path) = snapshot_path {
                     write_metal_render_snapshot(&metal, &path, width, height, color);
@@ -5190,10 +5199,13 @@ impl TermWindow {
             Ok(frankenterm_renderer_metal::FrameOutcome::ZeroSize) => {}
             Err(err) => {
                 // nextDrawable returns nil when its one-second wait expires,
-                // the same acquisition-timeout class as a wgpu surface
-                // timeout, so it shares that bounded retry-then-park policy.
+                // and a frame slot can stay busy past its wait while the GPU
+                // is behind: the same acquisition-timeout class as a wgpu
+                // surface timeout, so both share that bounded
+                // retry-then-park policy.
                 let stage = match err {
-                    frankenterm_renderer_metal::FrameError::DrawableUnavailable => {
+                    frankenterm_renderer_metal::FrameError::DrawableUnavailable
+                    | frankenterm_renderer_metal::FrameError::FrameSlotTimeout { .. } => {
                         RenderFailureStage::SurfaceAcquire(
                             webgpu::WebGpuSurfaceTextureError::Timeout,
                         )
