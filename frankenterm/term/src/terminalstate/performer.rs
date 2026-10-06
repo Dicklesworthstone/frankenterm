@@ -111,12 +111,17 @@ impl<'a> Performer<'a> {
         let cursor_x = self.cursor.x;
         let cursor_y = self.cursor.y;
         let seqno = self.seqno;
-        let unicode_version = self.unicode_version.clone();
         let pending_wrap = self.wrap_next;
         let dec_auto_wrap = self.dec_auto_wrap;
         let right_margin = self.left_and_right_margins.end;
 
-        let (cursor_x, wrap_next) = {
+        // `print` calls this for every multi-byte grapheme, so the common
+        // outcome (a standalone emoji or CJK character that cannot continue
+        // its neighbour) must stay cheap. Only a borrowed view of the
+        // candidate cell is kept while scanning, and every rejection runs
+        // against that borrow; text and attributes are copied only once a
+        // merge is still possible.
+        let (idx, text, width, attrs) = {
             let screen = self.screen_mut();
             let phys = screen.phys_row(cursor_y);
             let line = screen.line_mut(phys);
@@ -125,48 +130,50 @@ impl<'a> Performer<'a> {
             for cell in line.visible_cells() {
                 let cell_index = cell.cell_index();
                 if pending_wrap && cell_index == cursor_x {
-                    candidate = Some((
-                        cell_index,
-                        cell.str().to_string(),
-                        cell.width(),
-                        cell.attrs().clone(),
-                    ));
+                    candidate = Some(cell);
                     break;
                 }
                 if cell_index < cursor_x {
-                    candidate = Some((
-                        cell_index,
-                        cell.str().to_string(),
-                        cell.width(),
-                        cell.attrs().clone(),
-                    ));
+                    candidate = Some(cell);
                 } else {
                     break;
                 }
             }
 
-            let Some((idx, text, width, attrs)) = candidate else {
+            let Some(cell) = candidate else {
                 return false;
             };
+            let idx = cell.cell_index();
+            let width = cell.width();
             let old_end = idx.saturating_add(width);
             let joins_at_cursor = old_end == cursor_x || (pending_wrap && idx == cursor_x);
             if !joins_at_cursor {
                 return false;
             }
+            let text = cell.str();
             if require_prior_trailing_zwj && !text.ends_with('\u{200d}') {
                 return false;
             }
+            (idx, text.to_string(), width, cell.attrs().clone())
+        };
 
-            let combined = format!("{text}{suffix}");
-            if Graphemes::new(combined.as_str()).count() != 1 {
-                return false;
-            }
+        let combined = format!("{text}{suffix}");
+        if Graphemes::new(combined.as_str()).count() != 1 {
+            return false;
+        }
 
-            let combined_width = grapheme_column_width(&combined, Some(&unicode_version));
-            if !(width..=2).contains(&combined_width) {
-                return false;
-            }
+        let combined_width = grapheme_column_width(&combined, Some(&self.unicode_version));
+        if !(width..=2).contains(&combined_width) {
+            return false;
+        }
 
+        if combined.ends_with('\u{200d}') {
+            self.zwj_tail_cell_possible = true;
+        }
+        let (cursor_x, wrap_next) = {
+            let screen = self.screen_mut();
+            let phys = screen.phys_row(cursor_y);
+            let line = screen.line_mut(phys);
             line.set_cell_grapheme(idx, &combined, combined_width, attrs, seqno);
 
             let next_x = idx.saturating_add(combined_width);
@@ -446,7 +453,9 @@ impl<'a> Performer<'a> {
                 }
             }
 
-            if g.len() > 1 && self.recluster_at_cursor(g, true) {
+            // A multi-byte grapheme only continues its left neighbour when that
+            // cell ends in ZWJ, which cannot exist until one has been written.
+            if g.len() > 1 && self.zwj_tail_cell_possible && self.recluster_at_cursor(g, true) {
                 continue;
             }
 
@@ -510,6 +519,9 @@ impl<'a> Performer<'a> {
                 g,
                 self.pen
             );
+            if g.ends_with('\u{200d}') {
+                self.zwj_tail_cell_possible = true;
+            }
             self.screen_mut()
                 .set_cell_grapheme(x, y, g, print_width, pen, seqno);
 

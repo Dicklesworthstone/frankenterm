@@ -4990,6 +4990,9 @@ impl TerminalState {
             seqno,
             unicode_version: restored_unicode_version,
             unicode_version_stack: restored_unicode_stack,
+            // Restored cells were not written by this performer, so any of
+            // them may end in ZWJ; keep the continuation scan enabled.
+            zwj_tail_cell_possible: true,
             enable_conpty_quirks,
             suppress_initial_title_change,
             accumulating_title,

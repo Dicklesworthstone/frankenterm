@@ -496,6 +496,14 @@ pub struct TerminalState {
     unicode_version: UnicodeVersion,
     unicode_version_stack: Vec<UnicodeVersionStackEntry>,
 
+    /// Whether any cell of either screen may hold text ending in U+200D (ZWJ).
+    /// Only the performer writes arbitrary grapheme text, so this becomes true
+    /// the first time it writes such a cell and stays true; restored state
+    /// starts true because its cells were not written by this performer.
+    /// While false, a multi-byte grapheme cannot continue its left neighbour,
+    /// so `print` skips the cluster-continuation scan entirely.
+    zwj_tail_cell_possible: bool,
+
     enable_conpty_quirks: bool,
     /// On Windows, the ConPTY layer emits an OSC sequence to
     /// set the title shortly after it starts up.
@@ -825,6 +833,7 @@ impl TerminalState {
             seqno,
             unicode_version,
             unicode_version_stack: vec![],
+            zwj_tail_cell_possible: false,
             suppress_initial_title_change: false,
             enable_conpty_quirks: false,
             accumulating_title: None,

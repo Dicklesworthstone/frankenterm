@@ -1032,6 +1032,95 @@ fn width_changing_and_zwj_clusters_are_chunk_boundary_invariant() {
     }
 }
 
+/// ft-yccm0.2.11 — `recluster_at_cursor` runs for every multi-byte grapheme,
+/// so its rejection path (a complete emoji or CJK character beside a cell that
+/// does not end in ZWJ) must stay as chunk-invariant as its merge path. The
+/// stream mirrors the color-emoji throughput benchmark: a 256-color foreground
+/// and background SGR before every wide emoji, ASCII, CJK, or precomposed
+/// character, on screens narrow enough that wide glyphs reach the right margin
+/// and wrap. A ZWJ family whose members are separated by SGR changes exercises
+/// the merge path through real cell attributes.
+#[test]
+fn colored_wide_emoji_stream_is_chunk_boundary_invariant() {
+    let glyphs = ["😀", "A", "🌍", "🚀", "z", "🧠", "🫠", "%", "中", "é"];
+    let mut stream = String::new();
+    for i in 0..48usize {
+        let fg = (i * 37) % 256;
+        let bg = (i * 101 + 7) % 256;
+        stream.push_str(&format!(
+            "\x1b[38;5;{fg}m\x1b[48;5;{bg}m{}",
+            glyphs[i % glyphs.len()]
+        ));
+    }
+    stream.push_str("\x1b[38;5;1m👨\u{200D}\x1b[48;5;2m👩\u{200D}\x1b[38;5;3m👧");
+    stream.push_str("\x1b[0m end");
+    let bytes = stream.as_bytes();
+
+    for cols in [7usize, 8, 9] {
+        let mut whole = make_term(6, cols);
+        whole.advance_bytes(bytes);
+        let expected = serialize_screen_cells(&whole);
+        let expected_cursor = whole.cursor_pos();
+
+        for size in 1usize..=7 {
+            let mut chunked = make_term(6, cols);
+            for chunk in bytes.chunks(size) {
+                chunked.advance_bytes(chunk);
+            }
+            assert_eq!(
+                serialize_screen_cells(&chunked),
+                expected,
+                "colored emoji stream diverged at cols={cols} chunk size {size}"
+            );
+            let cursor = chunked.cursor_pos();
+            assert_eq!(
+                (cursor.x, cursor.y),
+                (expected_cursor.x, expected_cursor.y),
+                "colored emoji stream cursor diverged at cols={cols} chunk size {size}"
+            );
+        }
+    }
+}
+
+/// ft-yccm0.2.11 — a cell ending in ZWJ still absorbs the emoji delivered by a
+/// later `advance_bytes` call, while two complete emoji never merge.
+#[test]
+fn zwj_tail_joins_next_emoji_but_complete_emoji_stay_separate() {
+    let mut joined = make_term(2, 10);
+    joined.advance_bytes("👨\u{200D}".as_bytes());
+    joined.advance_bytes("👩".as_bytes());
+    let mut single_shot = make_term(2, 10);
+    single_shot.advance_bytes("👨\u{200D}👩".as_bytes());
+    assert_eq!(
+        serialize_screen_cells(&joined),
+        serialize_screen_cells(&single_shot),
+        "a ZWJ tail must join the emoji that follows in a later call"
+    );
+    assert_eq!(joined.cursor_pos().x, single_shot.cursor_pos().x);
+
+    // The ZWJ itself arrives alone: it is zero-width, so it attaches to the
+    // previous emoji, and only then can the next emoji continue that cell.
+    let mut lone_zwj = make_term(2, 10);
+    lone_zwj.advance_bytes("👨".as_bytes());
+    lone_zwj.advance_bytes("\u{200D}".as_bytes());
+    lone_zwj.advance_bytes("👩".as_bytes());
+    assert_eq!(
+        serialize_screen_cells(&lone_zwj),
+        serialize_screen_cells(&single_shot),
+        "a ZWJ delivered on its own must still join both emoji"
+    );
+    assert_eq!(lone_zwj.cursor_pos().x, single_shot.cursor_pos().x);
+
+    let mut separate = make_term(2, 10);
+    separate.advance_bytes("😀".as_bytes());
+    separate.advance_bytes("🚀".as_bytes());
+    assert_eq!(
+        separate.cursor_pos().x,
+        4,
+        "two complete wide emoji must occupy four columns"
+    );
+}
+
 /// FND-017 (FIXED) — DCS/sixel cell content is chunk-boundary-invariant.
 ///
 /// A 20k-case soak of the complete-escape chunk-determinism test (after FND-008
