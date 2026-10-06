@@ -1237,44 +1237,23 @@ pub struct GlyphCache {
 
 impl GlyphCache {
     pub fn new_in_memory(fonts: &Rc<FontConfiguration>, size: usize) -> anyhow::Result<Self> {
-        let surface: Rc<dyn Texture2d> = Rc::new(ImageTexture::new(size, size));
-        let atlas = Atlas::new(&surface).expect("failed to create new texture atlas");
-
-        Ok(Self {
-            fonts: Rc::clone(fonts),
-            glyph_cache: AHashMap::new(),
-            image_cache: LfuCache::new(
-                "glyph_cache.image_cache.hit.rate",
-                "glyph_cache.image_cache.miss.rate",
-                |config| config.glyph_cache_image_cache_size,
-                &fonts.config(),
-            ),
-            image_cache_retained_bytes: 0,
-            image_cache_entry_bytes: AHashMap::new(),
-            image_revision_owners: AHashMap::new(),
-            image_validation_rejection_order: VecDeque::new(),
-            image_revision_owner_registrations_since_prune: 0,
-            frame_cache: AHashMap::new(),
-            blank_frame_cache: AHashMap::new(),
-            atlas,
-            line_glyphs: AHashMap::new(),
-            block_glyphs: AHashMap::new(),
-            cursor_glyphs: AHashMap::new(),
-            color: AHashMap::new(),
-            min_frame_duration: config::frame_interval_for_max_fps(fonts.config().max_fps),
-            last_synced_version: 0,
-        })
+        Self::with_atlas_surface(fonts, Rc::new(ImageTexture::new(size, size)))
     }
-}
 
-impl GlyphCache {
     pub fn new_gl(
         backend: &RenderContext,
         fonts: &Rc<FontConfiguration>,
         size: usize,
     ) -> anyhow::Result<Self> {
-        let surface = backend.allocate_texture_atlas(size)?;
-        let atlas = Atlas::new(&surface).expect("failed to create new texture atlas");
+        Self::with_atlas_surface(fonts, backend.allocate_texture_atlas(size)?)
+    }
+
+    /// A glyph cache whose atlas lives in `surface`.
+    pub fn with_atlas_surface(
+        fonts: &Rc<FontConfiguration>,
+        surface: Rc<dyn Texture2d>,
+    ) -> anyhow::Result<Self> {
+        let atlas = Atlas::new(&surface).context("create glyph texture atlas")?;
 
         Ok(Self {
             fonts: Rc::clone(fonts),
@@ -1304,6 +1283,16 @@ impl GlyphCache {
 }
 
 impl GlyphCache {
+    /// Rasterized font glyphs currently cached (cache-gauge ledger).
+    pub fn glyph_entries(&self) -> usize {
+        self.glyph_cache.len()
+    }
+
+    /// Decoded-image bytes retained by the image cache (cache-gauge ledger).
+    pub fn image_cache_retained_bytes(&self) -> usize {
+        self.image_cache_retained_bytes
+    }
+
     fn atlas_footprint_bytes(&self) -> u64 {
         let side = self.atlas.size() as u64;
         side.saturating_mul(side).saturating_mul(4)
