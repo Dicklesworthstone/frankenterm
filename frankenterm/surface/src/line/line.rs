@@ -1400,12 +1400,14 @@ impl Line {
                 // implicitly blank
                 return;
             }
-            while cl.len() < idx {
-                // Fill out any implied blanks until we can append
-                // their intended cell content
-                Arc::make_mut(cl).append_grapheme(" ", 1, CellAttributes::blank());
-            }
-            if idx == cl.len() {
+            // A grapheme that would cluster with the previous cell cannot be
+            // appended to clustered storage; it takes the vector path below.
+            if cl.can_append_cell_at(idx, text) {
+                while cl.len() < idx {
+                    // Fill out any implied blanks until we can append
+                    // their intended cell content
+                    Arc::make_mut(cl).append_grapheme(" ", 1, CellAttributes::blank());
+                }
                 Arc::make_mut(cl).append_grapheme(text, width, attr);
                 self.invalidate_implicit_hyperlinks(seqno);
                 self.invalidate_zones();
@@ -1442,7 +1444,7 @@ impl Line {
         let CellStorage::C(cl) = &mut self.cells else {
             return false;
         };
-        if idx != cl.len() {
+        if idx != cl.len() || !cl.can_append_cell_at(idx, text) {
             return false;
         }
 
@@ -1495,12 +1497,14 @@ impl Line {
                 // implicitly blank
                 return;
             }
-            while cl.len() < idx {
-                // Fill out any implied blanks until we can append
-                // their intended cell content
-                Arc::make_mut(cl).append_grapheme(" ", 1, CellAttributes::blank());
-            }
-            if idx == cl.len() {
+            // A grapheme that would cluster with the previous cell cannot be
+            // appended to clustered storage; it takes the vector path below.
+            if cl.can_append_cell_at(idx, cell.str()) {
+                while cl.len() < idx {
+                    // Fill out any implied blanks until we can append
+                    // their intended cell content
+                    Arc::make_mut(cl).append_grapheme(" ", 1, CellAttributes::blank());
+                }
                 Arc::make_mut(cl).append(cell);
                 return;
             }
@@ -1836,6 +1840,12 @@ impl Line {
             CellStorage::V(v) => ClusteredLine::from_cell_vec(v.len(), self.visible_cells()),
             CellStorage::C(_) => return,
         };
+        // Clustered storage re-segments its text, so it may only replace
+        // cells it reproduces exactly: neighbours that cluster with each
+        // other (a split regional-indicator pair) stay in vector storage.
+        if !cv.reproduces(|| self.visible_cells()) {
+            return;
+        }
         self.cells = CellStorage::C(Arc::new(cv));
     }
 
@@ -1844,6 +1854,10 @@ impl Line {
     /// storage whose mutations may have left adjacent identical-attribute runs.
     pub fn canonicalize_scrollback_storage(&mut self) {
         let clustered = ClusteredLine::from_cell_vec(self.len(), self.visible_cells());
+        // See compress_for_scrollback: keep cells clustering cannot reproduce.
+        if !clustered.reproduces(|| self.visible_cells()) {
+            return;
+        }
         self.cells = CellStorage::C(Arc::new(clustered));
     }
 
