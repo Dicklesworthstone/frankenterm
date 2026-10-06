@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Proposed, revision 2: the review in section 11 is resolved. This is the gate for B3.2-B3.9 (ft-yccm0.3.3.2 .. ft-yccm0.3.3.9) and an input to C2/C4b. |
+| Status | Proposed, revision 2, **frozen** 2026-10-06 by the orchestrator. Section 12 lists the open questions and the bead that settles each one. This is the gate for B3.2-B3.9 (ft-yccm0.3.3.2 .. ft-yccm0.3.3.9) and an input to C2/C4b. |
 | Epic | ft-yccm0 (mac-render), Track B, B3 = ft-yccm0.3.3 |
 | Review | A subagent review is recorded in section 11. An independent review by another lane or model is still requested before B3.2 starts; record it on ft-yccm0.3.3.1. |
 | Sources | FrankenTerm at HEAD 79056d6ee plus the 2026-10-06 working tree (`terminalstate/mod.rs` carried another lane's uncommitted hunk). Ghostty at e500d414f (`~/projects/ghostty`). |
@@ -634,3 +634,20 @@ Evidence:
 | 9 | Missing consumers (recovery `from_slices`, `for_each_phys_line_mut`, the `clear_line` write, kitty mutators, cold-seam install, cold-visual branch, seqno 0) | Added to sections 7.2 and 7.3, 3.9 and 3.10 |
 | 10 | The flip criteria had no read-path lane; the fingerprint is not an equivalence gate | `render_capture` lane in section 8.3; DualEngine I16 harness in section 8.2 |
 | 11-16 | The semantic-flag skip; bidi on reused rows; deserialization masking; pool geometry; citation fixes; arithmetic (T2 8.53M lines, 14-15 pages, pool and alternate page added) | Sections 3.8, 9, 3.1, 2.4, 1.1 and 4 updated |
+
+**Revision 2 was re-reviewed by the same subagent.** It found findings 2-5, 7, 10, 12 and 14-16 resolved, and the rest partially resolved, with five new problems (A-E). Its verdict: fit to gate B3.2 once the hidden-bit rule (Q1) is written into section 3.3, which Q1 below does. Q2-Q8 must be settled before B3.3 starts.
+
+On 2026-10-06 the orchestrator froze the ADR at this point. The remaining items are listed as open questions (section 12) rather than resolved through more review rounds. An independent review by another model is still outstanding.
+
+## 12. Open questions (frozen; each names the bead that must settle it)
+
+| # | Question | Proposed answer | Settle in |
+|---|---|---|---|
+| Q1 | How are `hidden` bits maintained when ICH, DCH, `erase_cell_with_margin` or band copies shift whole tails? They have two break points: the edit column, and the right margin, where ICH drops a cell (`line.rs:1589-1591`) and DCH inserts one (`line.rs:1655-1659`). Resize truncation adds another. | Recompute from **each** break point. Stop at the first `y` past a break where the computed bit equals the stored bit **and** cell `y-1` either did not move or moved by the same shift as cell `y`. That is O(1) per print, and O(cols) for ICH and DCH, which already shift O(cols) cells. **This rule is part of the B3.2 contract.** | B3.2 |
+| Q2 | Seqno-only bumps reach sealed pages. Switching between the alternate and primary screens calls `dirty_top_phys_rows`, which bumps the oldest resident rows (`terminalstate/mod.rs:283-305`). Kitty frame compose and transmit call `kitty_mark_image_placements_dirty` (`kitty.rs:1017-1045, 1313, 1598`), which can bump scrollback rows once per animation frame. This makes I15 false as written. | Route seqno-only bumps to a list-level ordered set of `(stable range, seqno)` floors. Drop each one as front trim passes it. Effective seqno = `max(row_seqno, dirty_floor, range floor)`. Keep copy-on-write for cell edits only. | B3.3 |
+| Q3 | Legacy's V-to-C transition (`compress_for_scrollback`, `line.rs:1834-1840`) rebuilds hidden cells on re-materialization as `blank_with_attrs(head attrs)` (`clusterline.rs:230-232`). That drops the hidden cell's own attributes, and I16 compares hidden cells. | Either the page writer rewrites hidden cells and their side entries at the point where legacy would compress, or legacy is fixed first (section 9). | B3.2 provides the operation; B3.4 decides which. |
+| Q4 | I13 is incomplete. After a narrowing rewrap, legacy pops only trailing whitespace rows (`screen.rs:8305-8313`). Resize and config changes can lower `hot_cap` without trimming (`screen.rs:8754-8758`). Either way `retained_rows > hot_cap` with no refusal and no recovery hold. | Add "after a resize, rewrap or cap change, until the next evicting scroll" to I13's exceptions. Make the list record why it is over the cap, in a writer-owned field, so I13 stays checkable. | B3.3 |
+| Q5 | The effective seqno is ambiguous at 0. Legacy `update_last_change_seqno(S)` turns a row at 0 into S (`line.rs:847-849`). | Take the numeric max first, then treat 0 as "always changed". The page `max_seqno` rule stays conservative. | B3.3 |
+| Q6 | Zone ranges for Output-only rows cannot be emitted in O(1). The range end is the last cell whose text **or attributes** differ from a blank (`line.rs:986-992`), so styled-blank fills such as T0 and T1 need a scan. | Track a per-row "last non-blank column" in the writer, or accept a scan for rows whose `semantic` flag is false. | B3.4 |
+| Q7 | Raw attribute bits 17-31, or a `fat: Some(..)` with every field at its default, that legacy keeps after deserializing from the wire or cold storage. PageGrid masks them, so I16 diverges on rehydrated rows. | Mask them in legacy too (add to section 9), or have I16 compare decoded attributes after normalization. | B3.5 and B3.8 |
+| Q8 | Encoded-byte and `Line::eq` stability. Legacy C rows can hold adjacent clusters with identical attributes (`line.rs:1842-1846`), so the encoded bytes differ even where the V/C form matches. `localpane.rs:1961-1964` copies appdata only when `*current == rendered`, and `Line::eq` compares seqno, bits and storage form (`line.rs:209-212`). | Cached views must be `Line::eq`-stable across materializations. Only decoded equality is claimed for the wire and the disk (section 7.4 is corrected by this entry). | B3.5 |
