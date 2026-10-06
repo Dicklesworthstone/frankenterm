@@ -11343,6 +11343,16 @@ fn attempt_live_parser_checkpoint(
     LiveParserAttemptOutcome::Completed
 }
 
+/// Pane gather and parse threads do work the user is waiting on, so they ask
+/// for user-initiated QoS: on Apple silicon that keeps them on performance
+/// cores during an output flood instead of efficiency cores
+/// (ft-yccm0.3.1.3). A no-op off macOS.
+fn set_pane_ingest_thread_qos(role: &str, pane_id: PaneId) {
+    if let Err(err) = procinfo::set_current_thread_qos(procinfo::ThreadQos::UserInitiated) {
+        log::warn!("mux-{role}-pane-{pane_id}: could not set user-initiated QoS: {err}");
+    }
+}
+
 fn parse_buffered_data(
     pane: Weak<dyn Pane>,
     generation: Arc<PaneRegistrationGeneration>,
@@ -16125,6 +16135,7 @@ impl Mux {
                 thread::Builder::new()
                     .name(format!("mux-parse-pane-{pane_id}"))
                     .spawn(move || {
+                        set_pane_ingest_thread_qos("parse", pane_id);
                         let _checkpoint_worker = LiveParserWorkerGuard {
                             control: Arc::clone(&parser_generation.live_parser_checkpoint),
                             dead: Arc::clone(&parser_dead),
@@ -16182,6 +16193,7 @@ impl Mux {
                 thread::Builder::new()
                     .name(format!("mux-read-pane-{pane_id}"))
                     .spawn(move || {
+                        set_pane_ingest_thread_qos("read", pane_id);
                         if fail_reader_ready {
                             let _ = reader_ready
                                 .send(Err("injected pane reader readiness failure".to_string()));
