@@ -8,6 +8,7 @@
 //! buffer per frame, completion handlers) everywhere else. Both paths share
 //! the buffer model and the pacing.
 
+use crate::cell_bg::BACKGROUND_SHADER;
 use crate::frame::{
     FRAME_SLOTS, GridExtent, SlotBuffer, SlotLease, SlotRing, SlotSizes, grown_capacity,
 };
@@ -23,10 +24,11 @@ use objc2_metal::{
     MTL4CommandEncoder, MTL4CommandQueue, MTL4CommitFeedback, MTL4CommitOptions,
     MTL4RenderCommandEncoder, MTL4RenderPassDescriptor, MTLBuffer, MTLClearColor, MTLCommandBuffer,
     MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue, MTLDevice, MTLDrawable,
-    MTLGPUFamily, MTLLoadAction, MTLRenderPassColorAttachmentDescriptor,
-    MTLRenderPassColorAttachmentDescriptorArray, MTLRenderPassDescriptor, MTLRenderStages,
-    MTLResidencySet, MTLResidencySetDescriptor, MTLResource, MTLResourceOptions, MTLStoreAction,
-    MTLTexture,
+    MTLGPUFamily, MTLLibrary, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
+    MTLRenderCommandEncoder, MTLRenderPassColorAttachmentDescriptor,
+    MTLRenderPassColorAttachmentDescriptorArray, MTLRenderPassDescriptor,
+    MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLRenderStages, MTLResidencySet,
+    MTLResidencySetDescriptor, MTLResource, MTLResourceOptions, MTLStoreAction, MTLTexture,
 };
 use objc2_quartz_core::CAMetalLayer;
 use std::cell::Cell;
@@ -448,50 +450,133 @@ impl Submission {
         }
     }
 
-    /// Encodes one frame into the leased slot: a render pass that clears
-    /// `target` to `color`, presenting `drawable` when given, and commits it.
-    /// The slot stays in flight until the GPU finishes the frame.
-    pub(crate) fn encode_clear(
+    /// Encodes one frame into the leased slot and commits it: a render pass
+    /// that clears `target` to `color` and, with a `background` pipeline,
+    /// draws the background pass from the slot's uniforms and CellBg buffer.
+    /// Presents `drawable` when given. The slot stays in flight until the GPU
+    /// finishes the frame.
+    pub(crate) fn encode_frame(
         &self,
         frames: &FrameSlots,
         lease: SlotLease,
         target: &ProtocolObject<dyn MTLTexture>,
         drawable: Option<&ProtocolObject<dyn MTLDrawable>>,
         color: ClearColor,
+        background: Option<&BackgroundPipeline>,
     ) -> Result<(), FrameError> {
         assert!(
             lease.is_from(frames.ring()),
             "a slot lease from another renderer's ring"
         );
+        let frame = EncodedFrame {
+            target,
+            drawable,
+            color,
+            background,
+        };
         match self {
-            Self::Metal3(metal3) => metal3.encode_clear(lease, target, drawable, color),
-            Self::Metal4(metal4) => metal4.encode_clear(frames, lease, target, drawable, color),
+            Self::Metal3(metal3) => metal3.encode_frame(frames, lease, &frame),
+            Self::Metal4(metal4) => metal4.encode_frame(frames, lease, &frame),
         }
     }
 }
 
+/// What one frame draws, shared by both submission paths.
+struct EncodedFrame<'a> {
+    target: &'a ProtocolObject<dyn MTLTexture>,
+    drawable: Option<&'a ProtocolObject<dyn MTLDrawable>>,
+    color: ClearColor,
+    background: Option<&'a BackgroundPipeline>,
+}
+
+/// The background pass's render pipeline (ft-yccm0.4.2.2), compiled from
+/// [`BACKGROUND_SHADER`] once per renderer.
+pub(crate) struct BackgroundPipeline {
+    state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+}
+
+impl BackgroundPipeline {
+    pub(crate) fn new(device: &ProtocolObject<dyn MTLDevice>) -> Result<Self, String> {
+        let library = device
+            .newLibraryWithSource_options_error(&NSString::from_str(BACKGROUND_SHADER), None)
+            .map_err(|error| {
+                format!(
+                    "the background shader did not compile: {}",
+                    error.localizedDescription()
+                )
+            })?;
+        let vertex = library
+            .newFunctionWithName(ns_string!("bg_vertex"))
+            .ok_or_else(|| "the background shader has no bg_vertex".to_string())?;
+        let fragment = library
+            .newFunctionWithName(ns_string!("bg_fragment"))
+            .ok_or_else(|| "the background shader has no bg_fragment".to_string())?;
+        let descriptor = MTLRenderPipelineDescriptor::new();
+        descriptor.setLabel(Some(ns_string!("frankenterm background pass")));
+        descriptor.setVertexFunction(Some(&vertex));
+        descriptor.setFragmentFunction(Some(&fragment));
+        #[allow(unsafe_code)]
+        // SAFETY: FFI-INDEX. Index 0 is below the eight color attachments every
+        // Metal device exposes, and the array creates the descriptor on access.
+        let attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
+        attachment.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+        let state = device
+            .newRenderPipelineStateWithDescriptor_error(&descriptor)
+            .map_err(|error| {
+                format!(
+                    "the background pipeline could not be created: {}",
+                    error.localizedDescription()
+                )
+            })?;
+        Ok(Self { state })
+    }
+}
+
 impl Metal3Submission {
-    fn encode_clear(
+    fn encode_frame(
         &self,
+        frames: &FrameSlots,
         lease: SlotLease,
-        target: &ProtocolObject<dyn MTLTexture>,
-        drawable: Option<&ProtocolObject<dyn MTLDrawable>>,
-        color: ClearColor,
+        frame: &EncodedFrame<'_>,
     ) -> Result<(), FrameError> {
+        let slot = lease.slot();
         let commands = self
             .queue
             .commandBuffer()
             .ok_or(FrameError::CommandBufferUnavailable)?;
-        let pass = &self.passes[lease.slot()];
+        let pass = &self.passes[slot];
         let attachment = color_attachment(&pass.colorAttachments());
-        configure_clear(&attachment, target, color);
+        configure_clear(&attachment, frame.target, frame.color);
         let encoder = commands.renderCommandEncoderWithDescriptor(pass);
         // The descriptor outlives the frame; it must not keep the drawable's
         // texture alive.
         attachment.setTexture(None);
         let encoder = encoder.ok_or(FrameError::EncoderUnavailable)?;
+        if let Some(background) = frame.background {
+            encoder.setRenderPipelineState(&background.state);
+            for kind in [SlotBuffer::Uniforms, SlotBuffer::CellBg] {
+                #[allow(unsafe_code)]
+                // SAFETY: FFI-DRAW. The buffer is a live slot buffer of the
+                // leased slot, bound from offset 0 at its SlotBuffer index,
+                // which is the shader's [[buffer(n)]] and below Metal's 31
+                // buffer slots.
+                unsafe {
+                    encoder.setFragmentBuffer_offset_atIndex(
+                        Some(frames.buffer(slot, kind)),
+                        0,
+                        kind.index(),
+                    );
+                }
+            }
+            #[allow(unsafe_code)]
+            // SAFETY: FFI-DRAW. Three vertices of one triangle; bg_vertex
+            // derives positions from vertex_id and reads no vertex buffer.
+            unsafe {
+                encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+            }
+        }
         encoder.endEncoding();
-        if let Some(drawable) = drawable {
+        if let Some(drawable) = frame.drawable {
             commands.presentDrawable(drawable);
         }
         let token = lease.submit();
@@ -547,14 +632,13 @@ impl Metal4Submission {
         self.bound[slot].set(Some(generation));
     }
 
-    fn encode_clear(
+    fn encode_frame(
         &self,
         frames: &FrameSlots,
         lease: SlotLease,
-        target: &ProtocolObject<dyn MTLTexture>,
-        drawable: Option<&ProtocolObject<dyn MTLDrawable>>,
-        color: ClearColor,
+        frame: &EncodedFrame<'_>,
     ) -> Result<(), FrameError> {
+        let (target, drawable, color) = (frame.target, frame.drawable, frame.color);
         let slot = lease.slot();
         self.bind_slot(frames, slot);
         let commands = &self.command_buffers[slot];
@@ -575,6 +659,17 @@ impl Metal4Submission {
             &self.argument_tables[slot],
             MTLRenderStages::Vertex | MTLRenderStages::Fragment,
         );
+        if let Some(background) = frame.background {
+            // The argument table already holds every slot buffer at its
+            // SlotBuffer index, the shader's [[buffer(n)]].
+            encoder.setRenderPipelineState(&background.state);
+            #[allow(unsafe_code)]
+            // SAFETY: FFI-DRAW. Three vertices of one triangle; bg_vertex
+            // derives positions from vertex_id and reads no vertex buffer.
+            unsafe {
+                encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+            }
+        }
         encoder.endEncoding();
         commands.endCommandBuffer();
         if let Some(drawable) = drawable {
@@ -625,6 +720,7 @@ impl Metal4Submission {
 mod tests {
     use super::*;
     use crate::MetalDevice;
+    use crate::cell_bg::{BackgroundUniforms, CellBgGrid, CursorShape, CursorUniform};
     use crate::frame::{FrameUniforms, SlotState, UNIFORMS_BYTES};
     use objc2::Message;
     use objc2_metal::{
@@ -876,6 +972,7 @@ mod tests {
                 viewport: [64, 64],
                 grid: SMALL,
                 clear: [0.0, 0.0, 0.0, 1.0],
+                ..FrameUniforms::default()
             };
             frames
                 .write(&lease, SlotBuffer::Uniforms, 0, &uniforms.to_bytes())
@@ -957,12 +1054,13 @@ mod tests {
                 viewport: [64, 64],
                 grid,
                 clear: [0.1, 0.2, 0.3, 1.0],
+                ..FrameUniforms::default()
             };
             frames
                 .write(&lease, SlotBuffer::Uniforms, 0, &uniforms.to_bytes())
                 .unwrap();
             submission
-                .encode_clear(frames, lease, &target, None, color)
+                .encode_frame(frames, lease, &target, None, color, None)
                 .unwrap();
         }
         assert!(frames.ring().wait_idle(LONG), "every frame completed");
@@ -1035,5 +1133,245 @@ mod tests {
             "{:?}",
             metal4.err()
         );
+    }
+
+    // ---- Background pass (ft-yccm0.4.2.2) ----
+
+    const BG_WIDTH: usize = 96;
+    const BG_HEIGHT: usize = 103;
+
+    fn sized_target(
+        device: &ProtocolObject<dyn MTLDevice>,
+        width: usize,
+        height: usize,
+    ) -> Retained<ProtocolObject<dyn MTLTexture>> {
+        #[allow(unsafe_code)]
+        // SAFETY: FFI-EXTENT. BGRA8Unorm is color-renderable and the extent
+        // is within the Apple-family 2D texture limit.
+        let descriptor = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::BGRA8Unorm,
+                width,
+                height,
+                false,
+            )
+        };
+        descriptor.setUsage(MTLTextureUsage::RenderTarget);
+        descriptor.setStorageMode(MTLStorageMode::Private);
+        device
+            .newTextureWithDescriptor(&descriptor)
+            .expect("background render target")
+    }
+
+    /// The texture's BGRA8 bytes, copied out through a Metal 3 blit.
+    #[allow(unsafe_code)]
+    fn read_bgra(
+        device: &ProtocolObject<dyn MTLDevice>,
+        texture: &ProtocolObject<dyn MTLTexture>,
+        width: usize,
+        height: usize,
+    ) -> Vec<u8> {
+        let len = width * height * 4;
+        let buffer = device
+            .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let queue = device.newCommandQueue().unwrap();
+        let commands = queue.commandBuffer().unwrap();
+        let blit = commands.blitCommandEncoder().unwrap();
+        // SAFETY: FFI-EXTENT. The source is the texture's whole width x
+        // height x 1 extent in slice 0, level 0; the destination pitch is
+        // width * 4 bytes and `buffer` holds exactly pitch * height bytes.
+        unsafe {
+            blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+                texture,
+                0,
+                0,
+                objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                objc2_metal::MTLSize {
+                    width,
+                    height,
+                    depth: 1,
+                },
+                &buffer,
+                0,
+                width * 4,
+                len,
+            );
+        }
+        blit.endEncoding();
+        commands.commit();
+        commands.waitUntilCompleted();
+        assert_eq!(commands.status(), MTLCommandBufferStatus::Completed);
+        // SAFETY: BUFFER-CONTENTS. The blit that wrote `buffer` completed and
+        // the buffer is `len` bytes long; the bytes are copied while it lives.
+        unsafe { std::slice::from_raw_parts(buffer.contents().cast::<u8>().as_ptr(), len) }.to_vec()
+    }
+
+    /// Every background feature at once: colors and default cells, a ring
+    /// offset, a wide character, a selection, search matches.
+    fn background_scene() -> (CellBgGrid, BackgroundUniforms) {
+        use crate::cell_bg::CellBg;
+        let mut cells = CellBgGrid::new(GridExtent::new(6, 10));
+        for row in 0..6_u8 {
+            for col in 0..10_u8 {
+                if (row + col) % 4 != 0 {
+                    let bg = CellBg::rgb(row * 40, col * 25, 128);
+                    cells.set(u32::from(row), u32::from(col), bg);
+                }
+            }
+        }
+        cells.scroll_up(2);
+        cells.fill_row(4, CellBg::rgb(10, 200, 30));
+        cells.set_wide(5, 2, CellBg::rgb(250, 250, 0));
+        for col in 1..5 {
+            let bg = cells.get(2, col).unwrap();
+            cells.set(2, col, bg.selected());
+        }
+        for col in 2..4 {
+            let bg = cells.get(3, col).unwrap();
+            cells.set(3, col, bg.search_match());
+        }
+        let bg = cells.get(3, 6).unwrap();
+        cells.set(3, 6, bg.search_match().current_match());
+        let background = BackgroundUniforms {
+            cell_size: [8.0, 16.0],
+            grid_origin: [4.0, 2.0],
+            row_offset: 0,
+            cursor: CursorUniform::default(),
+            selection_tint: [0.0, 0.0, 0.3, 0.3],
+            search_tint: [0.4, 0.4, 0.0, 0.4],
+            current_match_tint: [0.5, 0.25, 0.0, 0.5],
+        };
+        (cells, background)
+    }
+
+    /// Renders the scene with `cursor` through `submission` and compares
+    /// every pixel with the CPU reference; returns the pixels compared.
+    fn render_and_compare(
+        submission: &Submission,
+        frames: &mut FrameSlots,
+        pipeline: &BackgroundPipeline,
+        cursor: CursorUniform,
+    ) -> usize {
+        let (cells, background) = background_scene();
+        let device = frames.device.clone();
+        let target = sized_target(&device, BG_WIDTH, BG_HEIGHT);
+        if let Some(set) = frames.residency() {
+            set.addAllocation(ProtocolObject::from_ref(&*target));
+            set.commit();
+        }
+        let clear = ClearColor::from_srgba(0.1, 0.2, 0.3, 1.0);
+        let lease = frames.begin(cells.extent(), LONG).unwrap();
+        let uniforms = FrameUniforms {
+            frame: lease.frame(),
+            viewport: [
+                u32::try_from(BG_WIDTH).unwrap(),
+                u32::try_from(BG_HEIGHT).unwrap(),
+            ],
+            grid: cells.extent(),
+            clear: clear.to_f32(),
+            background: BackgroundUniforms {
+                row_offset: cells.row_offset(),
+                cursor,
+                ..background
+            },
+        };
+        frames
+            .write(&lease, SlotBuffer::Uniforms, 0, &uniforms.to_bytes())
+            .unwrap();
+        frames
+            .write(&lease, SlotBuffer::CellBg, 0, cells.as_bytes())
+            .unwrap();
+        submission
+            .encode_frame(frames, lease, &target, None, clear, Some(pipeline))
+            .unwrap();
+        assert!(frames.ring().wait_idle(LONG), "the frame completed");
+        assert_eq!(submission.failed_frames(), 0);
+        let pixels = read_bgra(&device, &target, BG_WIDTH, BG_HEIGHT);
+        if let Some(set) = frames.residency() {
+            set.removeAllocation(ProtocolObject::from_ref(&*target));
+            set.commit();
+        }
+        let cleared = clear.to_bgra8();
+        let mut compared = 0;
+        for y in 0..BG_HEIGHT {
+            for x in 0..BG_WIDTH {
+                let center = |v: usize| f32::from(u16::try_from(v).unwrap()) + 0.5;
+                let expected =
+                    crate::cell_bg::shade_background(&uniforms, &cells, center(x), center(y))
+                        .map_or(cleared, crate::cell_bg::to_bgra8);
+                let at = (y * BG_WIDTH + x) * 4;
+                let got = &pixels[at..at + 4];
+                let off = got
+                    .iter()
+                    .zip(expected)
+                    .map(|(got, want)| got.abs_diff(want))
+                    .max()
+                    .unwrap();
+                assert!(
+                    off <= 1,
+                    "{:?} cursor, pixel ({x}, {y}): GPU {got:?}, reference {expected:?}",
+                    cursor.shape
+                );
+                compared += 1;
+            }
+        }
+        compared
+    }
+
+    fn cursors() -> Vec<CursorUniform> {
+        let white = [1.0, 1.0, 1.0, 1.0];
+        let at = |shape, col, width_cells| CursorUniform {
+            shape,
+            col,
+            row: 1,
+            width_cells,
+            thickness: 2.0,
+            color: white,
+        };
+        vec![
+            CursorUniform::default(),
+            at(CursorShape::Block, 3, 1),
+            at(CursorShape::HollowBlock, 3, 1),
+            at(CursorShape::Underline, 7, 1),
+            at(CursorShape::Bar, 0, 1),
+            // Over the wide character at row 5, column 2.
+            CursorUniform {
+                row: 5,
+                ..at(CursorShape::Block, 2, 2)
+            },
+        ]
+    }
+
+    #[test]
+    fn metal3_background_pass_matches_the_cpu_reference() {
+        let device = device();
+        let mut frames = FrameSlots::new(device.clone(), SMALL, private_ledger()).unwrap();
+        let submission = Submission::metal3(device.newCommandQueue().unwrap(), &frames);
+        let pipeline = BackgroundPipeline::new(&device).expect("background pipeline");
+        for cursor in cursors() {
+            assert_eq!(
+                render_and_compare(&submission, &mut frames, &pipeline, cursor),
+                BG_WIDTH * BG_HEIGHT
+            );
+        }
+    }
+
+    #[test]
+    fn metal4_background_pass_matches_the_cpu_reference() {
+        let device = device();
+        if !supports_metal4(&device) {
+            eprintln!("skipped: this device or OS has no Metal 4 command queues");
+            return;
+        }
+        let mut frames = FrameSlots::new(device.clone(), SMALL, private_ledger()).unwrap();
+        let submission = Submission::metal4(&device, &frames).expect("Metal 4 submission");
+        let pipeline = BackgroundPipeline::new(&device).expect("background pipeline");
+        for cursor in cursors() {
+            assert_eq!(
+                render_and_compare(&submission, &mut frames, &pipeline, cursor),
+                BG_WIDTH * BG_HEIGHT
+            );
+        }
     }
 }

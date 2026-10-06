@@ -114,6 +114,15 @@
 //!    slots own and keep in the queue's residency set; the index is below the
 //!    table's `maxBufferBindCount`; a slot's buffers are rebound whenever its
 //!    generation changes (a buffer was replaced), before the slot's next frame.
+//! 9. **FFI-DRAW: binding and drawing the background pass.**
+//!    `setFragmentBuffer:offset:atIndex:` (Metal 3) and
+//!    `drawPrimitives:vertexStart:vertexCount:` (both paths).
+//!    *Invariant:* each bound buffer is a live slot buffer of the leased
+//!    slot, bound from offset 0 at its `SlotBuffer` index (the shader's
+//!    `[[buffer(n)]]`, below Metal's 31 slots); the draw is three vertices of
+//!    one triangle, and the vertex shader reads no vertex buffer. The shader
+//!    indexes CellBg only below `rows * cols`, and the frame slots size that
+//!    buffer for the frame's grid before the frame is encoded.
 //!
 //! Thread affinity: `MetalRenderer` holds Objective-C objects that are not
 //! `Send`, so it stays on the thread that created it (the GUI main thread
@@ -122,7 +131,9 @@
 use std::fmt;
 use std::time::Duration;
 
+pub mod cell_bg;
 pub mod frame;
+pub use cell_bg::{BackgroundUniforms, CellBg, CellBgGrid, CursorShape, CursorUniform};
 pub use frame::{FRAME_SLOTS, GridExtent};
 
 #[cfg(target_os = "macos")]
@@ -368,6 +379,8 @@ pub enum MetalUnavailable {
     LayerNotMetal { class: String },
     /// The frame-slot buffers could not be allocated.
     ResourceAllocation { detail: String },
+    /// The background pass's shader or pipeline could not be built.
+    Pipeline { detail: String },
 }
 
 impl MetalUnavailable {
@@ -384,6 +397,7 @@ impl MetalUnavailable {
             Self::NoBackingLayer => "no_backing_layer",
             Self::LayerNotMetal { .. } => "layer_not_metal",
             Self::ResourceAllocation { .. } => "resource_allocation",
+            Self::Pipeline { .. } => "pipeline",
         }
     }
 }
@@ -423,6 +437,9 @@ impl fmt::Display for MetalUnavailable {
             }
             Self::ResourceAllocation { detail } => {
                 write!(f, "the Metal frame slots could not be allocated: {detail}")
+            }
+            Self::Pipeline { detail } => {
+                write!(f, "the Metal background pass is unusable: {detail}")
             }
         }
     }
@@ -728,6 +745,7 @@ mod tests {
                 class: "CALayer".into(),
             },
             MetalUnavailable::ResourceAllocation { detail: "d".into() },
+            MetalUnavailable::Pipeline { detail: "d".into() },
         ];
         let codes: Vec<&str> = reasons.iter().map(MetalUnavailable::code).collect();
         assert_eq!(
@@ -742,6 +760,7 @@ mod tests {
                 "no_backing_layer",
                 "layer_not_metal",
                 "resource_allocation",
+                "pipeline",
             ]
         );
         for reason in &reasons {

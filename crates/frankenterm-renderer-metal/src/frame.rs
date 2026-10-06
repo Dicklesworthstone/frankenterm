@@ -22,6 +22,7 @@
 //! [`grown_capacity`]: geometrically, only when the grid outgrows them, and
 //! never shrunk, so a steady-state frame allocates no GPU object.
 
+use crate::cell_bg::BackgroundUniforms;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -168,34 +169,76 @@ pub fn grown_capacity(current: usize, required: usize) -> usize {
 
 /// The per-frame uniform block, written into [`SlotBuffer::Uniforms`] with
 /// [`Self::to_bytes`].
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct FrameUniforms {
     /// Monotonic frame number (the slot lease's [`SlotLease::frame`]).
     pub frame: u64,
     /// Drawable size in pixels.
     pub viewport: [u32; 2],
     pub grid: GridExtent,
-    /// Premultiplied clear color, RGBA.
+    /// Premultiplied clear (default background) color, RGBA.
     pub clear: [f32; 4],
+    /// The background pass's cell geometry, ring offset, cursor and tints
+    /// (ft-yccm0.4.2.2).
+    pub background: BackgroundUniforms,
+}
+
+fn put_u32(bytes: &mut [u8], at: usize, value: u32) {
+    bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_f32s(bytes: &mut [u8], at: usize, values: &[f32]) {
+    for (index, value) in values.iter().enumerate() {
+        let offset = at + index * 4;
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
 }
 
 impl FrameUniforms {
-    /// The little-endian layout the shaders read (Metal Shading Language
-    /// alignment): `frame: ulong` at 0, `viewport: uint2` at 8,
-    /// `grid: uint2` at 16 (rows, cols), `clear: float4` at 32, zero padding
-    /// to [`UNIFORMS_BYTES`].
+    /// The little-endian layout of the shaders' `FrameUniforms` struct
+    /// (`src/shaders/background.metal`, Metal Shading Language alignment):
+    ///
+    /// | offset | field |
+    /// |---|---|
+    /// | 0 | `frame: ulong` |
+    /// | 8 | `viewport: uint2` |
+    /// | 16 | `grid: uint2` (rows, cols) |
+    /// | 32 | `clear: float4` |
+    /// | 48 | `cell_size: float2` |
+    /// | 56 | `grid_origin: float2` |
+    /// | 64 | `row_offset: uint` |
+    /// | 68 | `cursor_shape: uint` |
+    /// | 72 | `cursor_cell: uint2` (col, row) |
+    /// | 80 | `cursor_color: float4` |
+    /// | 96 | `cursor_thickness: float` |
+    /// | 100 | `cursor_width: uint` (cells) |
+    /// | 112 | `selection_tint: float4` |
+    /// | 128 | `search_tint: float4` |
+    /// | 144 | `current_tint: float4` |
+    ///
+    /// Everything else is zero, up to [`UNIFORMS_BYTES`].
     #[must_use]
     pub fn to_bytes(&self) -> [u8; UNIFORMS_BYTES] {
         let mut bytes = [0u8; UNIFORMS_BYTES];
         bytes[0..8].copy_from_slice(&self.frame.to_le_bytes());
-        bytes[8..12].copy_from_slice(&self.viewport[0].to_le_bytes());
-        bytes[12..16].copy_from_slice(&self.viewport[1].to_le_bytes());
-        bytes[16..20].copy_from_slice(&self.grid.rows.to_le_bytes());
-        bytes[20..24].copy_from_slice(&self.grid.cols.to_le_bytes());
-        for (index, component) in self.clear.iter().enumerate() {
-            let at = 32 + index * 4;
-            bytes[at..at + 4].copy_from_slice(&component.to_le_bytes());
-        }
+        put_u32(&mut bytes, 8, self.viewport[0]);
+        put_u32(&mut bytes, 12, self.viewport[1]);
+        put_u32(&mut bytes, 16, self.grid.rows);
+        put_u32(&mut bytes, 20, self.grid.cols);
+        put_f32s(&mut bytes, 32, &self.clear);
+        let background = &self.background;
+        put_f32s(&mut bytes, 48, &background.cell_size);
+        put_f32s(&mut bytes, 56, &background.grid_origin);
+        put_u32(&mut bytes, 64, background.row_offset);
+        put_u32(&mut bytes, 68, background.cursor.shape.code());
+        put_u32(&mut bytes, 72, background.cursor.col);
+        put_u32(&mut bytes, 76, background.cursor.row);
+        put_f32s(&mut bytes, 80, &background.cursor.color);
+        put_f32s(&mut bytes, 96, &[background.cursor.thickness]);
+        put_u32(&mut bytes, 100, background.cursor.width_cells);
+        put_f32s(&mut bytes, 112, &background.selection_tint);
+        put_f32s(&mut bytes, 128, &background.search_tint);
+        put_f32s(&mut bytes, 144, &background.current_match_tint);
         bytes
     }
 
@@ -554,6 +597,7 @@ mod tests {
             viewport: [1920, 1080],
             grid: GridExtent::new(80, 120),
             clear: [0.5, 0.25, 0.0, 1.0],
+            ..FrameUniforms::default()
         };
         let bytes = uniforms.to_bytes();
         assert_eq!(&bytes[0..8], &0x0102_0304_0506_0708_u64.to_le_bytes());
@@ -565,6 +609,77 @@ mod tests {
         assert!(bytes[48..].iter().all(|&byte| byte == 0));
         assert_eq!(FrameUniforms::frame_of(&bytes), Some(uniforms.frame));
         assert_eq!(FrameUniforms::frame_of(&bytes[..7]), None);
+    }
+
+    #[test]
+    fn background_uniforms_follow_the_shader_struct_layout() {
+        use crate::cell_bg::{BACKGROUND_SHADER, CursorShape, CursorUniform};
+        let uniforms = FrameUniforms {
+            background: BackgroundUniforms {
+                cell_size: [8.0, 16.0],
+                grid_origin: [4.0, 2.0],
+                row_offset: 5,
+                cursor: CursorUniform {
+                    shape: CursorShape::Bar,
+                    col: 3,
+                    row: 1,
+                    width_cells: 2,
+                    thickness: 2.0,
+                    color: [1.0, 0.5, 0.25, 0.75],
+                },
+                selection_tint: [0.1; 4],
+                search_tint: [0.2; 4],
+                current_match_tint: [0.3; 4],
+            },
+            ..FrameUniforms::default()
+        };
+        let bytes = uniforms.to_bytes();
+        let f32_at = |at: usize| f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        assert_eq!(
+            [f32_at(48), f32_at(52), f32_at(56), f32_at(60)],
+            [8.0, 16.0, 4.0, 2.0]
+        );
+        assert_eq!(
+            [u32_at(64), u32_at(68), u32_at(72), u32_at(76)],
+            [5, 4, 3, 1]
+        );
+        assert_eq!(
+            [f32_at(80), f32_at(84), f32_at(88), f32_at(92)],
+            [1.0, 0.5, 0.25, 0.75]
+        );
+        assert_eq!((f32_at(96), u32_at(100)), (2.0, 2));
+        assert_eq!((f32_at(112), f32_at(128), f32_at(144)), (0.1, 0.2, 0.3));
+        assert!(bytes[104..112].iter().all(|&byte| byte == 0));
+        assert!(bytes[160..].iter().all(|&byte| byte == 0));
+        // The shader's struct comments carry the same offsets.
+        for (field, offset) in [
+            ("frame", 0),
+            ("viewport", 8),
+            ("grid", 16),
+            ("clear", 32),
+            ("cell_size", 48),
+            ("grid_origin", 56),
+            ("row_offset", 64),
+            ("cursor_shape", 68),
+            ("cursor_cell", 72),
+            ("cursor_color", 80),
+            ("cursor_thickness", 96),
+            ("cursor_width", 100),
+            ("selection_tint", 112),
+            ("search_tint", 128),
+            ("current_tint", 144),
+        ] {
+            let declaration = format!(" {field};");
+            let line = BACKGROUND_SHADER
+                .lines()
+                .find(|line| line.contains(&declaration) && line.contains("//"))
+                .unwrap_or_else(|| panic!("the shader declares {field}"));
+            assert!(
+                line.contains(&format!("// {offset}")),
+                "{field} is at {offset}: {line}"
+            );
+        }
     }
 
     #[test]

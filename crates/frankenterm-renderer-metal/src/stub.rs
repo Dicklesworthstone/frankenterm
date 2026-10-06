@@ -3,8 +3,8 @@
 //! statically unreachable and callers need no `cfg`.
 
 use crate::{
-    ClearColor, DeviceCapabilities, FrameError, FrameOutcome, FrameStats, GridExtent,
-    MetalUnavailable, SubmissionPath,
+    BackgroundUniforms, CellBgGrid, ClearColor, DeviceCapabilities, FrameError, FrameOutcome,
+    FrameStats, GridExtent, MetalUnavailable, SubmissionPath,
 };
 use raw_window_handle::HasWindowHandle;
 
@@ -67,6 +67,17 @@ impl MetalRenderer {
         _height: u32,
         _grid: GridExtent,
         _color: ClearColor,
+    ) -> Result<FrameOutcome, FrameError> {
+        match *self {}
+    }
+
+    pub fn render_cells(
+        &self,
+        _width: u32,
+        _height: u32,
+        _cells: &CellBgGrid,
+        _clear: ClearColor,
+        _background: BackgroundUniforms,
     ) -> Result<FrameOutcome, FrameError> {
         match *self {}
     }

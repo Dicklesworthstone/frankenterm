@@ -1,8 +1,9 @@
 //! The macOS implementation. Every `unsafe` block in the crate is here, and
 //! each names its UNSAFE-CONTRACT category from the crate docs.
 
+use crate::cell_bg::{BackgroundUniforms, CellBgGrid};
 use crate::frame::{FrameUniforms, GridExtent, SlotBuffer};
-use crate::macos_frames::{FrameSlots, Submission, supports_metal4};
+use crate::macos_frames::{BackgroundPipeline, FrameSlots, Submission, supports_metal4};
 use crate::{
     ClearColor, DeviceCapabilities, FRAME_SLOT_TIMEOUT, FrameError, FrameOutcome, FrameStats,
     MAX_TEXTURE_EXTENT, MetalUnavailable, SUBMISSION_ENV, SubmissionPath, appkit_view,
@@ -191,6 +192,7 @@ pub struct MetalRenderer {
     frames: RefCell<FrameSlots>,
     submission: Submission,
     submission_note: Option<String>,
+    background: BackgroundPipeline,
 }
 
 /// Longest a dropped renderer waits for its in-flight frames.
@@ -236,6 +238,8 @@ impl MetalRenderer {
         .map_err(|error| MetalUnavailable::ResourceAllocation {
             detail: error.to_string(),
         })?;
+        let background = BackgroundPipeline::new(&device.device)
+            .map_err(|detail| MetalUnavailable::Pipeline { detail })?;
         let choice = SubmissionPath::select(
             supports_metal4(&device.device) && frames.residency().is_some(),
             std::env::var(SUBMISSION_ENV).ok().as_deref(),
@@ -292,6 +296,7 @@ impl MetalRenderer {
             frames: RefCell::new(frames),
             submission,
             submission_note,
+            background,
         })
     }
 
@@ -341,6 +346,39 @@ impl MetalRenderer {
         grid: GridExtent,
         color: ClearColor,
     ) -> Result<FrameOutcome, FrameError> {
+        self.render(width, height, grid, color, None)
+    }
+
+    /// Renders one frame with the background pass (ft-yccm0.4.2.2): uploads
+    /// `cells` (ring order) into the slot's CellBg buffer, writes the
+    /// uniforms (`background`, with `row_offset` taken from `cells`), clears
+    /// the drawable to `clear` and draws one full-screen triangle that shades
+    /// every cell, the selection and search tints and the cursor.
+    pub fn render_cells(
+        &self,
+        width: u32,
+        height: u32,
+        cells: &CellBgGrid,
+        clear: ClearColor,
+        background: BackgroundUniforms,
+    ) -> Result<FrameOutcome, FrameError> {
+        self.render(
+            width,
+            height,
+            cells.extent(),
+            clear,
+            Some((cells, background)),
+        )
+    }
+
+    fn render(
+        &self,
+        width: u32,
+        height: u32,
+        grid: GridExtent,
+        color: ClearColor,
+        cells: Option<(&CellBgGrid, BackgroundUniforms)>,
+    ) -> Result<FrameOutcome, FrameError> {
         if width == 0 || height == 0 {
             return Ok(FrameOutcome::ZeroSize);
         }
@@ -351,24 +389,33 @@ impl MetalRenderer {
         }
         let lease = self.frames.borrow_mut().begin(grid, FRAME_SLOT_TIMEOUT)?;
         let frames = self.frames.borrow();
-        let uniforms = FrameUniforms {
+        let mut uniforms = FrameUniforms {
             frame: lease.frame(),
             viewport: [width, height],
             grid,
             clear: color.to_f32(),
+            ..FrameUniforms::default()
         };
+        if let Some((cells, background)) = cells {
+            uniforms.background = BackgroundUniforms {
+                row_offset: cells.row_offset(),
+                ..background
+            };
+            frames.write(&lease, SlotBuffer::CellBg, 0, cells.as_bytes())?;
+        }
         frames.write(&lease, SlotBuffer::Uniforms, 0, &uniforms.to_bytes())?;
         // A frame abandoned here drops its lease, which frees the slot.
         let drawable = self
             .layer
             .nextDrawable()
             .ok_or(FrameError::DrawableUnavailable)?;
-        self.submission.encode_clear(
+        self.submission.encode_frame(
             &frames,
             lease,
             &drawable.texture(),
             Some(ProtocolObject::from_ref(&*drawable)),
             color,
+            cells.map(|_| &self.background),
         )?;
         Ok(FrameOutcome::Presented)
     }
