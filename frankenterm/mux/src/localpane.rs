@@ -32,6 +32,8 @@ use frankenterm_term::{
     RecoveryTerminalCheckpointError, RecoveryTerminalCheckpointV3, SemanticZone, StableRowIndex,
     Terminal, TerminalConfiguration, TerminalSize,
 };
+#[cfg(not(feature = "disruptor-pane-io"))]
+use frankenterm_term::{SliceProgress, SlicedActions, SlicedFeed, FEED_SLICE_BYTES};
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
 use procinfo::LocalProcessInfo;
@@ -42,7 +44,7 @@ use std::convert::{TryFrom, TryInto};
 use std::io::{Result as IoResult, Write};
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1600,14 +1602,38 @@ where
 /// (exported through `ft doctor --json`). A wait on the main (UI) thread also
 /// counts as main-thread blocking. An uncontended acquisition costs a
 /// try-lock plus two clock reads and a few relaxed atomic adds.
+///
+/// It is also fair to readers under a parser flood (ft-yccm0.2.3, Ghostty's
+/// `lockDemand`/`yieldToDemand`): a locker other than the parser that has
+/// to wait registers demand while it waits, and the parser, which applies
+/// output in slices, hands the lock over at its next clean slice boundary
+/// ([`Self::hand_over`]) instead of holding it for the whole chunk.
 struct TerminalMutex {
     inner: Mutex<Terminal>,
+    /// Lockers other than the parser waiting for `inner` right now.
+    demand: AtomicU32,
+    /// Acquisitions by demanding lockers; the parser waits for this to move
+    /// after handing the lock over.
+    served: AtomicU64,
 }
+
+/// Longest the parser waits, after handing the terminal lock over, for a
+/// demanding locker to take it (ft-yccm0.2.3).
+#[cfg(not(feature = "disruptor-pane-io"))]
+const HANDOFF_WAIT: Duration = Duration::from_millis(1);
+
+/// Longest the parser holds a pane's terminal lock in one go while applying
+/// output (ft-yccm0.2.3). It then hands the lock over at its next clean
+/// boundary; while a locker is waiting, it does so at once.
+#[cfg(not(feature = "disruptor-pane-io"))]
+const PARSER_HOLD_BUDGET: Duration = Duration::from_millis(2);
 
 impl TerminalMutex {
     fn new(terminal: Terminal) -> Self {
         Self {
             inner: Mutex::new(terminal),
+            demand: AtomicU32::new(0),
+            served: AtomicU64::new(0),
         }
     }
 
@@ -1619,10 +1645,45 @@ impl TerminalMutex {
         if let Some(guard) = self.inner.try_lock() {
             return TerminalGuard::acquired(guard, holder, 0);
         }
+        let demanding = holder != TerminalLockHolder::Parser;
+        if demanding {
+            self.demand.fetch_add(1, Ordering::AcqRel);
+        }
         let started = Instant::now();
         let guard = self.inner.lock();
         let waited = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if demanding {
+            self.demand.fetch_sub(1, Ordering::AcqRel);
+            self.served.fetch_add(1, Ordering::AcqRel);
+        }
         TerminalGuard::acquired(guard, holder, waited.max(1))
+    }
+
+    /// Whether a locker other than the parser is waiting for the lock.
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    fn demanded(&self) -> bool {
+        self.demand.load(Ordering::Acquire) != 0
+    }
+
+    /// The parser's handoff (ft-yccm0.2.3): releases `guard` fairly, so a
+    /// queued locker gets the lock directly, and while lockers are waiting
+    /// gives them up to [`HANDOFF_WAIT`] to take it (a waiter may still be
+    /// spinning rather than queued) before the parser locks again.
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    fn hand_over(&self, guard: TerminalGuard<'_>) {
+        let served = self.served.load(Ordering::Acquire);
+        let demanded = self.demanded();
+        TerminalGuard::unlock_fair(guard);
+        if !demanded {
+            return;
+        }
+        let deadline = Instant::now() + HANDOFF_WAIT;
+        while self.demanded()
+            && self.served.load(Ordering::Acquire) == served
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
     }
 
     fn try_lock(&self) -> Option<TerminalGuard<'_>> {
@@ -2655,6 +2716,11 @@ impl Pane for LocalPane {
             let pending_title = terminal.pending_tmux_title_bytes();
             match self.admit_alert_actions(&mut actions, pending_title, &mut output) {
                 Ok(batch) => {
+                    #[cfg(not(feature = "disruptor-pane-io"))]
+                    {
+                        terminal = batch.apply_sliced(self, terminal);
+                    }
+                    #[cfg(feature = "disruptor-pane-io")]
                     batch.apply(&mut terminal);
                     self.render_facts.publish(&mut terminal);
                 }
@@ -2667,8 +2733,8 @@ impl Pane for LocalPane {
             };
             #[cfg(not(feature = "disruptor-pane-io"))]
             {
-                let mut terminal = self.terminal.lock_as(TerminalLockHolder::Parser);
-                batch.apply(&mut terminal);
+                let terminal = self.terminal.lock_as(TerminalLockHolder::Parser);
+                let mut terminal = batch.apply_sliced(self, terminal);
                 self.render_facts.publish(&mut terminal);
             }
             #[cfg(feature = "disruptor-pane-io")]
@@ -4784,11 +4850,42 @@ impl AdmittedPaneActions {
         terminal.perform_actions(actions);
         drop(application);
     }
+
+    /// [`Self::apply`] in slices that hand the terminal lock to waiting
+    /// lockers between them (ft-yccm0.2.3). The continuation owns the
+    /// remaining actions, so they apply in order, and a slice ends only
+    /// after a non-print action. Returns the guard, still held.
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    fn apply_sliced<'a>(
+        self,
+        pane: &'a LocalPane,
+        terminal: TerminalGuard<'a>,
+    ) -> TerminalGuard<'a> {
+        let Self {
+            actions,
+            alerts,
+            staging,
+        } = self;
+        if actions.is_empty() {
+            return terminal;
+        }
+        let mut application = PaneAlertApplication::install(alerts, staging);
+        let mut sliced = SlicedActions::new(actions);
+        let terminal =
+            pane.run_parser_slices(terminal, &mut application, &mut |terminal, yield_now| {
+                sliced.run(terminal, yield_now)
+            });
+        drop(application);
+        terminal
+    }
 }
 
 struct PaneAlertApplication {
     alerts: Option<FundedPaneAlerts>,
     staging: Arc<Mutex<PaneAlertStaging>>,
+    /// The staged alerts while the terminal lock is handed over between
+    /// slices (ft-yccm0.2.3).
+    suspended: Option<ActivePaneAlerts>,
 }
 
 impl PaneAlertApplication {
@@ -4809,12 +4906,40 @@ impl PaneAlertApplication {
                 remaining_text_bytes: batch.text_bytes,
             });
         }
-        PaneAlertApplication { alerts, staging }
+        PaneAlertApplication {
+            alerts,
+            staging,
+            suspended: None,
+        }
+    }
+
+    /// Takes the batch's staged alerts out before the parser hands the
+    /// terminal lock over between slices (ft-yccm0.2.3). Terminal work by
+    /// other lock holders meanwhile then raises nothing into this funded
+    /// batch: as between any two batches, it is not charged to output.
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    fn suspend(&mut self) {
+        if self.alerts.is_some() && self.suspended.is_none() {
+            self.suspended = self.staging.lock().active.take();
+        }
+    }
+
+    /// Reinstalls the staged alerts once the parser holds the lock again.
+    fn resume(&mut self) {
+        if let Some(active) = self.suspended.take() {
+            let mut state = self.staging.lock();
+            assert!(
+                state.active.is_none(),
+                "terminal action batches are serialized"
+            );
+            state.active = Some(active);
+        }
     }
 }
 
 impl Drop for PaneAlertApplication {
     fn drop(&mut self) {
+        self.resume();
         let Some(mut batch) = self.alerts.take() else {
             return;
         };
@@ -4908,6 +5033,53 @@ fn split_child(
 }
 
 impl LocalPane {
+    /// Runs one producer batch under the terminal lock as the parser, one
+    /// `step` per lock hold (ft-yccm0.2.3). A step stops at a clean boundary
+    /// once `yield_now` says a locker is waiting or the hold has lasted
+    /// [`PARSER_HOLD_BUDGET`]. The facts it applied are then published, the
+    /// batch's alerts are suspended, the lock is handed over and taken
+    /// again, and the next step continues. Returns the guard, still held.
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    fn run_parser_slices<'a>(
+        &'a self,
+        mut terminal: TerminalGuard<'a>,
+        application: &mut PaneAlertApplication,
+        step: &mut dyn FnMut(&mut Terminal, &mut dyn FnMut() -> bool) -> SliceProgress,
+    ) -> TerminalGuard<'a> {
+        let mut held_since = Instant::now();
+        let mut handoffs = 0_u64;
+        loop {
+            let progress = step(&mut terminal, &mut || {
+                self.terminal.demanded() || held_since.elapsed() >= PARSER_HOLD_BUDGET
+            });
+            if progress == SliceProgress::Done {
+                break;
+            }
+            self.render_facts.publish(&mut terminal);
+            application.suspend();
+            let held = held_since.elapsed();
+            let demanded = self.terminal.demanded();
+            self.terminal.hand_over(terminal);
+            handoffs += 1;
+            log::trace!(
+                "pane {} parser handed the terminal lock over after {held:?} (demanded: {demanded})",
+                self.pane_id
+            );
+            terminal = self.terminal.lock_as(TerminalLockHolder::Parser);
+            application.resume();
+            held_since = Instant::now();
+        }
+        if handoffs > 0 {
+            metrics::counter!("mux.parser.terminal_lock_handoffs").increment(handoffs);
+            log::debug!(
+                "pane {} applied one batch in {} lock holds",
+                self.pane_id,
+                handoffs + 1
+            );
+        }
+        terminal
+    }
+
     fn prepare_alert_output(
         &self,
     ) -> Result<Option<crate::PaneAlertOutput>, PaneActionAdmissionRefusal> {
@@ -4950,10 +5122,16 @@ impl LocalPane {
             &self.terminal,
         )?;
         {
-            let mut terminal = self.terminal.lock_as(TerminalLockHolder::Parser);
-            let application =
+            let terminal = self.terminal.lock_as(TerminalLockHolder::Parser);
+            let mut application =
                 PaneAlertApplication::install(alerts, Arc::clone(&self.alert_staging));
-            terminal.feed(parser, bytes, &mut FusedFeedGate, diverted);
+            // Applied in slices that hand the lock to waiting lockers
+            // (ft-yccm0.2.3); see SlicedFeed for why that is exact.
+            let mut sliced = SlicedFeed::new(bytes, FEED_SLICE_BYTES);
+            let mut terminal =
+                self.run_parser_slices(terminal, &mut application, &mut |terminal, yield_now| {
+                    sliced.run(terminal, parser, &mut FusedFeedGate, diverted, yield_now)
+                });
             drop(application);
             self.render_facts.publish(&mut terminal);
         }
@@ -17465,6 +17643,158 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(1));
             }
         });
+    }
+
+    /// T0's shape (ft-yccm0.2.3): 256-colour foreground and background SGR
+    /// before every character, mostly wide emoji; about 25 bytes a frame.
+    fn t0_flood(frames: u32) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut flood = Vec::new();
+        for frame in 0..frames {
+            write!(
+                flood,
+                "\x1b[38;5;{}m\x1b[48;5;{}m",
+                frame % 256,
+                frame * 7 % 256
+            )
+            .unwrap();
+            let character = if frame % 5 == 0 {
+                'x'
+            } else {
+                char::from_u32(0x1F600 + frame % 80).unwrap()
+            };
+            let mut utf8 = [0; 4];
+            flood.extend_from_slice(character.encode_utf8(&mut utf8).as_bytes());
+        }
+        flood
+    }
+
+    /// The comparable state of a pane's terminal: every cell's text and
+    /// attributes, and the cursor without its seqno.
+    fn terminal_cells_and_cursor(
+        pane: &LocalPane,
+    ) -> (
+        Vec<Vec<(String, frankenterm_term::CellAttributes)>>,
+        frankenterm_term::CursorPosition,
+    ) {
+        let terminal = pane.terminal.lock();
+        let screen = terminal.screen();
+        let lines = screen
+            .lines_in_phys_range(0..screen.scrollback_rows())
+            .iter()
+            .map(|line| {
+                line.visible_cells()
+                    .map(|cell| (cell.str().to_string(), cell.attrs().clone()))
+                    .collect()
+            })
+            .collect();
+        let mut cursor = terminal.cursor_pos();
+        cursor.seqno = 0;
+        (lines, cursor)
+    }
+
+    /// ft-yccm0.2.3 acceptance: while the parse thread applies two megabytes
+    /// of T0-shaped output in one fused batch, a reader that has to wait for
+    /// the terminal lock is served at the parser's next slice boundary,
+    /// within 1 ms. The bound is honest about the build: when one slice of
+    /// this (debug, possibly loaded) build takes longer than half a
+    /// millisecond, two slice times are allowed instead, plus 1 ms of
+    /// scheduler slack. Unsliced, the reader would wait for the whole batch,
+    /// which the test checks is far longer than the bound. The batch, handed
+    /// over many times, still lands exactly as one unsliced feed.
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    #[test]
+    fn a_waiting_reader_is_served_within_a_millisecond_under_a_parser_flood() {
+        let flood = t0_flood(80_000);
+        let pane = render_facts_test_pane(841);
+        let done = AtomicBool::new(false);
+        let (waits, flood_time) = std::thread::scope(|scope| {
+            let pane = &pane;
+            let done = &done;
+            let reader = scope.spawn(move || {
+                let mut waits = Vec::new();
+                while !done.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_micros(300));
+                    let asked = Instant::now();
+                    let terminal = pane.terminal.lock_as(TerminalLockHolder::Paint);
+                    waits.push(asked.elapsed());
+                    drop(terminal);
+                }
+                waits
+            });
+            let mut parser = termwiz::escape::parser::Parser::new();
+            let mut diverted = Vec::new();
+            let started = Instant::now();
+            pane.feed_fused(&mut parser, &flood, &mut diverted)
+                .expect("an unregistered pane admits output");
+            let flood_time = started.elapsed();
+            done.store(true, Ordering::Release);
+            assert!(diverted.is_empty(), "T0 output diverts nothing");
+            (reader.join().unwrap(), flood_time)
+        });
+        assert!(waits.len() >= 10, "{} reader samples", waits.len());
+        let slices = u32::try_from(flood.len() / FEED_SLICE_BYTES).unwrap();
+        let slice_time = flood_time / slices;
+        let bound = Duration::from_millis(1).max(2 * slice_time) + Duration::from_millis(1);
+        let mut sorted = waits.clone();
+        sorted.sort();
+        let p99 = sorted[sorted.len() * 99 / 100];
+        let waited = waits
+            .iter()
+            .filter(|wait| **wait > Duration::from_micros(20))
+            .count();
+        eprintln!(
+            "[BENCH] parser flood {} bytes in {flood_time:?} ({slice_time:?} a slice); \
+             reader samples {}, {waited} waited, p99 {p99:?}, max {:?}, bound {bound:?}",
+            flood.len(),
+            waits.len(),
+            sorted.last().copied().unwrap_or_default()
+        );
+        assert!(
+            flood_time > 5 * bound,
+            "the batch ({:?}) must dwarf the bound ({:?})",
+            flood_time,
+            bound
+        );
+        assert!(p99 <= bound, "p99 wait {:?} exceeds {:?}", p99, bound);
+
+        let reference = render_facts_test_pane(842);
+        reference.terminal.lock().advance_bytes(&flood);
+        assert!(
+            terminal_cells_and_cursor(&pane) == terminal_cells_and_cursor(&reference),
+            "the sliced batch must land as one unsliced feed"
+        );
+    }
+
+    /// ft-yccm0.2.3: the two-stage path hands the lock over the same way,
+    /// between actions, and still applies the batch exactly.
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    #[test]
+    fn two_stage_batches_hand_the_lock_to_a_waiting_reader_and_apply_exactly() {
+        let flood = t0_flood(40_000);
+        let pane = render_facts_test_pane(843);
+        let mut actions = Vec::new();
+        termwiz::escape::parser::Parser::new().parse(&flood, |action| actions.push(action));
+        let served = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let pane = &pane;
+            let served = &served;
+            let applier = scope.spawn(move || pane.perform_actions(actions));
+            // Ask while the batch is applying; the parser yields to us.
+            while !pane.terminal.is_locked() && !applier.is_finished() {
+                std::thread::yield_now();
+            }
+            drop(pane.terminal.lock_as(TerminalLockHolder::Paint));
+            served.store(!applier.is_finished(), Ordering::Release);
+            applier.join().unwrap().expect("test action admission");
+        });
+        assert!(
+            served.load(Ordering::Acquire),
+            "the reader was served before the batch finished"
+        );
+        let reference = render_facts_test_pane(844);
+        reference.terminal.lock().advance_bytes(&flood);
+        assert!(terminal_cells_and_cursor(&pane) == terminal_cells_and_cursor(&reference));
     }
 
     /// A wait for a contended terminal mutex on the main thread is counted as

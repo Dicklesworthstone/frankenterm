@@ -8,7 +8,10 @@ use frankenterm_escape_parser::parser::{AsciiScan, Parser};
 use frankenterm_escape_parser::{Action, ControlCode, Esc, EscCode};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::config::GridEngine;
-use frankenterm_term::{Clipboard, FeedGate, Terminal, TerminalConfiguration, TerminalSize};
+use frankenterm_term::{
+    Clipboard, FeedGate, SliceProgress, SlicedActions, SlicedFeed, Terminal, TerminalConfiguration,
+    TerminalSize,
+};
 
 use super::snapshot::{self, EngineSnapshot};
 
@@ -320,6 +323,96 @@ impl EngineFactory for FusedFeed {
     }
 }
 
+/// The parse thread's sliced application (ft-yccm0.2.3): the fused path
+/// through `SlicedFeed`, or the two-stage path through `SlicedActions`, with
+/// tiny slices and a yield at every `yield_every`-th clean boundary, so
+/// yields land wherever a real terminal-lock handoff may. Each `run` after a
+/// yield starts a new output batch, as a new lock hold does in the mux.
+pub struct Sliced {
+    pub two_stage: bool,
+    pub slice_bytes: usize,
+    pub yield_every: usize,
+    pub divert_every: Option<usize>,
+}
+
+struct SlicedEngine {
+    terminal: Terminal,
+    parser: Parser,
+    gate: FusedFeedGate,
+    two_stage: bool,
+    slice_bytes: usize,
+    yield_every: usize,
+    boundaries: usize,
+}
+
+impl Engine for SlicedEngine {
+    fn feed(&mut self, bytes: &[u8]) {
+        let yield_every = self.yield_every;
+        let boundaries = &mut self.boundaries;
+        let mut yield_now = || {
+            *boundaries += 1;
+            boundaries.is_multiple_of(yield_every)
+        };
+        if self.two_stage {
+            let mut actions = Vec::new();
+            self.parser.parse(bytes, |action| actions.push(action));
+            if actions.is_empty() {
+                return;
+            }
+            let mut sliced = SlicedActions::new(actions);
+            while sliced.run(&mut self.terminal, &mut yield_now) == SliceProgress::Yielded {}
+            return;
+        }
+        let mut diverted = Vec::new();
+        let mut sliced = SlicedFeed::new(bytes, self.slice_bytes);
+        while sliced.run(
+            &mut self.terminal,
+            &mut self.parser,
+            &mut self.gate,
+            &mut diverted,
+            &mut yield_now,
+        ) == SliceProgress::Yielded
+        {}
+        assert_eq!(sliced.offset(), bytes.len(), "the whole chunk was taken");
+        self.terminal.perform_actions(diverted);
+    }
+
+    fn snapshot(&self) -> EngineSnapshot {
+        snapshot::capture(&self.terminal)
+    }
+
+    fn wait_for_replies(&mut self) {
+        drain_replies(&mut self.terminal);
+    }
+}
+
+impl EngineFactory for Sliced {
+    fn name(&self) -> &'static str {
+        match (self.two_stage, self.yield_every, self.divert_every) {
+            (true, 1, _) => "sliced_two_stage_every_boundary",
+            (true, _, _) => "sliced_two_stage",
+            (false, 1, None) => "sliced_feed_every_boundary",
+            (false, _, None) => "sliced_feed",
+            (false, _, Some(_)) => "sliced_feed_frequent_diversion",
+        }
+    }
+
+    fn build_with(&self, geometry: &Geometry, io: EngineIo) -> Box<dyn Engine> {
+        Box::new(SlicedEngine {
+            terminal: new_terminal_with(geometry, io),
+            parser: Parser::new(),
+            gate: FusedFeedGate {
+                divert_every: self.divert_every,
+                seen: 0,
+            },
+            two_stage: self.two_stage,
+            slice_bytes: self.slice_bytes,
+            yield_every: self.yield_every.max(1),
+            boundaries: 0,
+        })
+    }
+}
+
 /// The legacy oracle's path with the screen's rows in PageGrid pages
 /// (ft-yccm0.3.3.4): `advance_bytes` into a page-engine terminal. Hot paths
 /// write pages natively; everything else goes through legacy `Line` views,
@@ -391,5 +484,37 @@ pub fn candidates() -> Vec<Box<dyn EngineFactory>> {
         }),
         // ft-yccm0.3.3.4: the page engine.
         Box::new(PageGrid),
+        // ft-yccm0.2.3: sliced application, yielding at every clean boundary
+        // or every third, with 1- and 3-byte slices; and a diverting gate.
+        Box::new(Sliced {
+            two_stage: false,
+            slice_bytes: 1,
+            yield_every: 1,
+            divert_every: None,
+        }),
+        Box::new(Sliced {
+            two_stage: false,
+            slice_bytes: 3,
+            yield_every: 3,
+            divert_every: None,
+        }),
+        Box::new(Sliced {
+            two_stage: false,
+            slice_bytes: 3,
+            yield_every: 2,
+            divert_every: Some(7),
+        }),
+        Box::new(Sliced {
+            two_stage: true,
+            slice_bytes: 0,
+            yield_every: 1,
+            divert_every: None,
+        }),
+        Box::new(Sliced {
+            two_stage: true,
+            slice_bytes: 0,
+            yield_every: 3,
+            divert_every: None,
+        }),
     ]
 }
