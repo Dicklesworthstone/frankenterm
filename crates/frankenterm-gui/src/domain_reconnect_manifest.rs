@@ -604,6 +604,40 @@ fn sync_directory(directory: &CapDir) -> Result<(), DomainReconnectManifestError
     Ok(())
 }
 
+/// Opens to the lock authority made before giving up on a create race.
+const LOCK_OPEN_ATTEMPTS: usize = 8;
+
+/// Opens (creating if needed) the lock authority in the pinned `directory`.
+///
+/// Darwin answers the loser of two concurrent `open(O_CREAT)` calls for one
+/// name with ENOENT instead of opening the file the winner just created
+/// (measured on macOS 26.2, xnu-12377: 99% of synchronized two-thread races;
+/// an immediate retry opened the file every time). Two GUI instances that
+/// create a namespace's lock together hit exactly that (ft-y5xik). A NotFound
+/// is therefore retried, but only while the pinned directory is still the one
+/// `path` names: a directory that was removed or replaced fails closed.
+fn open_lock_authority(
+    path: &Path,
+    directory: &CapDir,
+    name: &OsStr,
+    options: &CapOpenOptions,
+) -> Result<CapFile, DomainReconnectManifestError> {
+    let mut attempt = 1;
+    loop {
+        match directory.open_with(name, options) {
+            Ok(file) => return Ok(file),
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound && attempt < LOCK_OPEN_ATTEMPTS =>
+            {
+                validate_pinned_directory_identity(path, directory)?;
+                attempt += 1;
+                std::thread::yield_now();
+            }
+            Err(error) => return Err(DomainReconnectManifestError::io("open lock", error)),
+        }
+    }
+}
+
 struct ManifestLease {
     path: PathBuf,
     directory: CapDir,
@@ -638,9 +672,7 @@ impl ManifestLease {
             .follow(FollowSymlinks::No);
         #[cfg(unix)]
         options.mode(0o600);
-        let lock_authority = directory
-            .open_with(name, &options)
-            .map_err(|error| DomainReconnectManifestError::io("open lock", error))?;
+        let lock_authority = open_lock_authority(path, &directory, name, &options)?;
         let opened = validate_opened_name(&directory, name, &lock_authority, "lock open")?;
         if opened.len() != 0
             || before
@@ -2206,33 +2238,111 @@ mod tests {
 
     #[test]
     fn concurrent_namespace_migrators_converge_on_one_authority() {
-        let fixture = tempfile::tempdir().expect("domain concurrent migration fixture");
-        let legacy = fixture.path().join("wezterm");
-        let canonical = fixture.path().join("frankenterm");
-        let intended = set_intent_production_at(
-            &legacy,
-            "concurrent-domain",
-            DomainAttachmentIntent::Attached,
-            None,
-        )
-        .expect("publish concurrent legacy authority");
-        let mut workers = Vec::new();
-        for _ in 0..2 {
-            let legacy = legacy.clone();
-            let canonical = canonical.clone();
-            workers.push(std::thread::spawn(move || {
-                migrate_legacy_data_namespace_at(&legacy, &canonical)
-            }));
+        // A barrier releases both migrators together, so they really race to
+        // create the canonical namespace and its locks in every round
+        // (ft-y5xik: unsynchronized threads collided only on a quiet host).
+        for round in 0..8 {
+            let fixture = tempfile::tempdir().expect("domain concurrent migration fixture");
+            let legacy = fixture.path().join("wezterm");
+            let canonical = fixture.path().join("frankenterm");
+            let intended = set_intent_production_at(
+                &legacy,
+                "concurrent-domain",
+                DomainAttachmentIntent::Attached,
+                None,
+            )
+            .expect("publish concurrent legacy authority");
+            let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let mut workers = Vec::new();
+            for _ in 0..2 {
+                let legacy = legacy.clone();
+                let canonical = canonical.clone();
+                let start = std::sync::Arc::clone(&start);
+                workers.push(std::thread::spawn(move || {
+                    start.wait();
+                    migrate_legacy_data_namespace_at(&legacy, &canonical)
+                }));
+            }
+            let outcomes = workers
+                .into_iter()
+                .map(|worker| worker.join().expect("migration worker did not panic"))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap_or_else(|error| {
+                    panic!("round {round}: concurrent migrations converge: {error:?}")
+                });
+            assert_eq!(
+                outcomes.iter().filter(|migrated| **migrated).count(),
+                1,
+                "round {round}: exactly one migrator publishes, the other observes it"
+            );
+            assert_eq!(
+                load_production_from(&canonical, None).expect("load converged authority"),
+                intended,
+                "round {round}"
+            );
         }
-        let outcomes = workers
-            .into_iter()
-            .map(|worker| worker.join().expect("migration worker did not panic"))
-            .collect::<Result<Vec<_>, _>>()
-            .expect("concurrent migrations converge");
-        assert_eq!(outcomes.iter().filter(|migrated| **migrated).count(), 1);
-        assert_eq!(
-            load_production_from(&canonical, None).expect("load converged authority"),
-            intended
+    }
+
+    #[test]
+    fn concurrent_lease_acquisition_survives_darwin_create_races() {
+        // Darwin answers the loser of two concurrent O_CREAT opens of one name
+        // with ENOENT. Every round creates a fresh namespace that several
+        // threads lock at the same instant; each must get its lease in turn.
+        const THREADS: usize = 4;
+        let fixture = tempfile::tempdir().expect("concurrent lease fixture");
+        for round in 0..20 {
+            let directory = fixture.path().join(format!("namespace-{round}"));
+            let start = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+            let workers: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let directory = directory.clone();
+                    let start = std::sync::Arc::clone(&start);
+                    std::thread::spawn(move || {
+                        start.wait();
+                        ManifestLease::acquire(&directory, true).map(drop)
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker
+                    .join()
+                    .expect("lease worker did not panic")
+                    .unwrap_or_else(|error| panic!("round {round}: lease acquisition: {error:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn lock_open_fails_closed_when_the_pinned_directory_is_gone() {
+        let fixture = tempfile::tempdir().expect("vanished namespace fixture");
+        let path = fixture.path().join("vanished");
+        let directory = open_manifest_directory(&path).expect("create namespace directory");
+        std::fs::remove_dir(&path).expect("remove the pinned namespace directory");
+        let mut options = CapOpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            .follow(FollowSymlinks::No);
+        let result = open_lock_authority(&path, &directory, OsStr::new(LOCK_NAME), &options);
+        assert!(
+            result.is_err(),
+            "a removed directory must not yield a lock authority"
+        );
+        // A replacement at the same name is a different directory: still closed.
+        std::fs::create_dir(&path).expect("plant a replacement directory");
+        let result = open_lock_authority(&path, &directory, OsStr::new(LOCK_NAME), &options);
+        assert!(
+            matches!(
+                result,
+                Err(DomainReconnectManifestError::IdentityChanged { .. })
+                    | Err(DomainReconnectManifestError::Io { .. })
+            ),
+            "a replaced directory must not yield a lock authority"
+        );
+        assert!(
+            !path.join(LOCK_NAME).exists(),
+            "nothing was created in the replacement"
         );
     }
 
