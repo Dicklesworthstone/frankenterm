@@ -24,9 +24,10 @@
 # $TMPDIR/ft-gui-throughput-cache), and Screen Recording plus Accessibility
 # permission for the app this runs in; the harness checks both up front and
 # refuses to run without them rather than report 0 FPS. FrankenTerm runs with
-# max_fps at twice the display refresh rate: its repaint throttle waits
-# ceil(1000 / max_fps) ms, so max_fps equal to the refresh rate (or the
-# operator's 30) would cap it below Ghostty by construction.
+# max_fps at twice the display refresh rate by default (--ft-max-fps N to
+# override): builds before 2aa4db498 (ft-1w85m) throttle to whole
+# milliseconds, so max_fps equal to the refresh rate capped them below the
+# display; the operator's 30 caps any build below Ghostty by construction.
 #
 # Output: <run dir>/run.log and <run dir>/receipt.json (schema
 # frankenterm.gui_throughput_receipt.v1), one directory per run under runs/.

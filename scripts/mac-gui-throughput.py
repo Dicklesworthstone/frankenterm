@@ -517,11 +517,15 @@ def width_parity(per_arm):
 
 
 def throttle_admissible(max_fps, refresh_hz):
-    """FrankenTerm's repaint throttle waits ceil(1000 / max_fps) ms between
-    paints (config::frame_interval_for_max_fps); it must be shorter than one
-    refresh period or it caps FrankenTerm below the display by construction."""
-    interval_ms = math.ceil(1000 / max_fps)
-    return interval_ms, interval_ms < 1000 / refresh_hz
+    """FrankenTerm's repaint throttle spaces paint slots by
+    config::frame_interval_for_max_fps: ceil(1e9 / max_fps) ns on a fixed
+    cadence since 2aa4db498 (ft-1w85m). It must not exceed one refresh period
+    (1 us of rounding allowed), or it caps FrankenTerm below the display by
+    construction. Builds before 2aa4db498 rounded up to whole milliseconds and
+    timed each interval from paint start, capping max_fps 60 near 58 FPS, which
+    is why the default is twice the refresh rate. Returns the interval in ms."""
+    interval_ns = -(-1_000_000_000 // max_fps)
+    return interval_ns / 1e6, interval_ns <= 1e9 / refresh_hz + 1_000
 
 
 def verdict(arms, metric, higher_is_better, cv_max, refusals):
@@ -615,9 +619,10 @@ def analysis_self_test():
     pings = [{"latency_ns": 1_000_000}] * 98 + [{"latency_ns": 2_500_000_000, "ax_error": -25204}] * 2
     balls = beachball_metrics(pings, 2000)
     assert balls["beach_balls"] == 2 and balls["ax_errors"] == 2 and balls["unresponsive_s"] == 5.0, balls
-    assert throttle_admissible(60, 60) == (17, False), "max_fps = refresh still caps below it"
-    assert throttle_admissible(120, 60) == (9, True)
-    assert throttle_admissible(240, 120) == (5, True)
+    assert throttle_admissible(60, 60) == (16.666667, True), "max_fps = refresh reaches it (ft-1w85m)"
+    assert throttle_admissible(59, 60)[1] is False and throttle_admissible(30, 60)[1] is False
+    assert throttle_admissible(120, 60) == (8.333334, True)
+    assert throttle_admissible(119, 120)[1] is False
     parity = width_parity({"ft": {"1F600": 2, "1FA70": 1}, "ghostty": {"1F600": 2, "1FA70": 2}})
     assert parity["disagreements"] == 1 and parity["differences"][0]["codepoint"] == "1FA70", parity
     drain_v = verdict({"ft": [10.0, 10.2], "ghostty": [20.0, 20.4]}, "total_s", False, 5.0, [])
@@ -1337,7 +1342,7 @@ def main(argv):
     harness.ft_max_fps = 2 * harness.refresh_hz if args.ft_max_fps == "auto" else int(args.ft_max_fps)
     throttle_ms, throttle_ok = throttle_admissible(harness.ft_max_fps, harness.refresh_hz)
     log(f"display refresh {harness.refresh_hz} Hz; FrankenTerm max_fps {harness.ft_max_fps} "
-        f"(throttle {throttle_ms} ms, {'below' if throttle_ok else 'NOT below'} one refresh period)")
+        f"(throttle {throttle_ms:.6f} ms, {'within' if throttle_ok else 'LONGER than'} one refresh period)")
 
     arms = [{"name": "ft", "kind": "ft", "gui_bin": args.gui_bin, "lua": list(args.ft_lua),
              "env": dict(item.split("=", 1) for item in args.ft_env)}]
@@ -1414,8 +1419,8 @@ def main(argv):
     if args.no_fps:
         fps_refusals.append("FPS not measured (--no-fps)")
     if not throttle_ok:
-        fps_refusals.append(f"FrankenTerm max_fps {harness.ft_max_fps} throttles at {throttle_ms} ms, not below "
-                            f"one {harness.refresh_hz} Hz refresh period")
+        fps_refusals.append(f"FrankenTerm max_fps {harness.ft_max_fps} throttles at {throttle_ms:.6f} ms, longer "
+                            f"than one {harness.refresh_hz} Hz refresh period")
     meter_checks = []
     for run in runs:
         internal, fps = run.get("internal_present"), run.get("fps")
