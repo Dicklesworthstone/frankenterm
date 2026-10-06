@@ -248,6 +248,13 @@ pub struct Config {
     #[dynamic(default)]
     pub scrollback_warm_fleet_max_mb: usize,
 
+    /// Byte budget (MiB) for scrollback rows queued behind the durability
+    /// writer, shared by every pane in the process. Past it, a pane's oldest
+    /// queued rows are dropped from durability and recorded as an explicit
+    /// gap marker instead of throttling the pane (ft-yccm0.2.1.6).
+    #[dynamic(default = "default_scrollback_durability_queue_max_mb")]
+    pub scrollback_durability_queue_max_mb: usize,
+
     // -- Agent pane state detection --
     /// Enable agent pane state detection and visual indicators.
     #[dynamic(default = "default_true")]
@@ -2315,6 +2322,10 @@ fn default_scrollback_hot_lines() -> usize {
 
 fn default_scrollback_warm_max_mb() -> usize {
     50
+}
+
+fn default_scrollback_durability_queue_max_mb() -> usize {
+    64
 }
 
 fn default_agent_active_threshold_ms() -> u64 {
