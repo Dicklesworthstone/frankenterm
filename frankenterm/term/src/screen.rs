@@ -5022,7 +5022,7 @@ impl Screen {
             // bytes. Source validation has its own retained-interval fence.
             // Re-probing storage here can observe Busy just after validation
             // and turn an unchanged mapping into a spurious sequence advance.
-            self.cold_visual_layout_at_current_coordinates()
+            self.cold_visual_layout_for_comparison()
                 .is_none_or(|current| {
                     if std::ptr::eq(next.as_ref(), current) {
                         return false;
@@ -5305,6 +5305,23 @@ impl Screen {
                     .is_some_and(|rows| rows.start == layout.source.start)
                     && interval.retains(&layout.interval, layout.source.clone())
             })
+    }
+
+    /// The installed layout as a baseline for deciding whether a read changes
+    /// coordinates. Unlike [`Self::cold_visual_layout_at_current_coordinates`]
+    /// it survives the resident frontier advancing: ordinary output spills
+    /// rows below a Canonical layout without remapping its rows, and
+    /// `extends` decides whether that older prefix is still exact. Treating
+    /// the stale baseline as absent reported every append as a layout change,
+    /// which re-fenced cold selections that the append never touched
+    /// (ft-gufyy). A different witness or a frontier that moved backwards
+    /// (clear, replacement, resize) still yields no baseline.
+    #[cfg(feature = "use_serde")]
+    fn cold_visual_layout_for_comparison(&self) -> Option<&ColdVisualLayout> {
+        let layout = self.cold_visual_layout.as_deref()?;
+        (self.matches_coordinate_witness(&layout.witness)
+            && layout.resident_frontier <= self.phys_to_stable_row_index(0))
+        .then_some(layout)
     }
 
     #[cfg(feature = "use_serde")]
