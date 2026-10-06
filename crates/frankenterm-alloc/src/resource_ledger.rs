@@ -858,6 +858,13 @@ pub struct DurabilityLedger {
     writer_failures_total: AtomicU64,
     writer_panics_total: AtomicU64,
     rows_abandoned_total: AtomicU64,
+    /// Rows queued behind the writer, and their budget (ft-yccm0.2.1.6).
+    queue_bytes: AtomicU64,
+    queue_budget_bytes: AtomicU64,
+    /// Overload gaps: rows dropped from durability with an explicit marker.
+    gaps_total: AtomicU64,
+    gap_rows_total: AtomicU64,
+    gap_bytes_total: AtomicU64,
 }
 
 static GLOBAL_DURABILITY_LEDGER: DurabilityLedger = DurabilityLedger::new();
@@ -876,7 +883,26 @@ impl DurabilityLedger {
             writer_failures_total: AtomicU64::new(0),
             writer_panics_total: AtomicU64::new(0),
             rows_abandoned_total: AtomicU64::new(0),
+            queue_bytes: AtomicU64::new(0),
+            queue_budget_bytes: AtomicU64::new(0),
+            gaps_total: AtomicU64::new(0),
+            gap_rows_total: AtomicU64::new(0),
+            gap_bytes_total: AtomicU64::new(0),
         }
+    }
+
+    /// The writer's queued bytes and their budget (ft-yccm0.2.1.6).
+    pub fn set_queue(&self, bytes: u64, budget: u64) {
+        self.queue_bytes.store(bytes, Ordering::Relaxed);
+        self.queue_budget_bytes.store(budget, Ordering::Relaxed);
+    }
+
+    /// Overload dropped `rows` queued rows (`bytes` charged) from durability
+    /// as `gaps` explicit gap records.
+    pub fn record_gaps(&self, gaps: u64, rows: u64, bytes: u64) {
+        self.gaps_total.fetch_add(gaps, Ordering::Relaxed);
+        self.gap_rows_total.fetch_add(rows, Ordering::Relaxed);
+        self.gap_bytes_total.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// The ledger the process's durability writer records into.
@@ -911,6 +937,11 @@ impl DurabilityLedger {
             writer_failures_total: self.writer_failures_total.load(Ordering::Relaxed),
             writer_panics_total: self.writer_panics_total.load(Ordering::Relaxed),
             rows_abandoned_total: self.rows_abandoned_total.load(Ordering::Relaxed),
+            queue_bytes: self.queue_bytes.load(Ordering::Relaxed),
+            queue_budget_bytes: self.queue_budget_bytes.load(Ordering::Relaxed),
+            gaps_total: self.gaps_total.load(Ordering::Relaxed),
+            gap_rows_total: self.gap_rows_total.load(Ordering::Relaxed),
+            gap_bytes_total: self.gap_bytes_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -923,6 +954,18 @@ pub struct DurabilitySnapshot {
     pub writer_failures_total: u64,
     pub writer_panics_total: u64,
     pub rows_abandoned_total: u64,
+    /// Rows queued behind the writer, in charged bytes (ft-yccm0.2.1.6).
+    #[serde(default)]
+    pub queue_bytes: u64,
+    #[serde(default)]
+    pub queue_budget_bytes: u64,
+    /// Overload gap records written in place of dropped rows.
+    #[serde(default)]
+    pub gaps_total: u64,
+    #[serde(default)]
+    pub gap_rows_total: u64,
+    #[serde(default)]
+    pub gap_bytes_total: u64,
 }
 
 /// One pane's terminal writer queue (ft-yccm0.2.2.5): bytes enqueued for the
@@ -1269,12 +1312,17 @@ impl DurabilitySnapshot {
     /// One human-readable line for the GUI debug overlay.
     #[must_use]
     pub fn summary_line(&self) -> String {
+        let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
         format!(
-            "Scrollback durability: {} degraded panes; writer failures {}, panics {}, abandoned rows {}",
+            "Scrollback durability: {} degraded panes; writer failures {}, panics {}, abandoned rows {}; overload gaps {} ({} rows); queue {:.1} of {:.1} MiB",
             self.degraded_panes.len(),
             self.writer_failures_total,
             self.writer_panics_total,
-            self.rows_abandoned_total
+            self.rows_abandoned_total,
+            self.gaps_total,
+            self.gap_rows_total,
+            mib(self.queue_bytes),
+            mib(self.queue_budget_bytes)
         )
     }
 }
@@ -2073,13 +2121,46 @@ mod tests {
         );
         ledger.record_recovered("pane-a");
         ledger.record_abandoned("pane-b", 12);
+        // ft-yccm0.2.1.6: overload gaps and the queue gauge.
+        ledger.record_gaps(1, 300, 90_000);
+        ledger.record_gaps(2, 40, 10_000);
+        ledger.set_queue(3 * 1024 * 1024, 64 * 1024 * 1024);
         let snapshot = ledger.snapshot();
         assert!(snapshot.degraded_panes.is_empty());
         assert_eq!(snapshot.rows_abandoned_total, 12);
         assert_eq!(
-            snapshot.summary_line(),
-            "Scrollback durability: 0 degraded panes; writer failures 3, panics 1, abandoned rows 12"
+            (
+                snapshot.gaps_total,
+                snapshot.gap_rows_total,
+                snapshot.gap_bytes_total
+            ),
+            (3, 340, 100_000)
         );
+        assert_eq!(snapshot.queue_bytes, 3 * 1024 * 1024);
+        assert_eq!(
+            snapshot.summary_line(),
+            "Scrollback durability: 0 degraded panes; writer failures 3, panics 1, abandoned rows 12; overload gaps 3 (340 rows); queue 3.0 of 64.0 MiB"
+        );
+        // The doctor schema: the gap fields are named, and a snapshot from a
+        // build without them still parses.
+        let json = serde_json::to_value(&snapshot).unwrap();
+        for field in [
+            "queue_bytes",
+            "queue_budget_bytes",
+            "gaps_total",
+            "gap_rows_total",
+            "gap_bytes_total",
+        ] {
+            assert!(json.get(field).is_some(), "durability.{field} missing");
+        }
+        let old: DurabilitySnapshot = serde_json::from_value(serde_json::json!({
+            "degraded_panes": {},
+            "writer_failures_total": 1,
+            "writer_panics_total": 0,
+            "rows_abandoned_total": 0,
+        }))
+        .unwrap();
+        assert_eq!((old.gaps_total, old.queue_bytes), (0, 0));
     }
 
     #[test]

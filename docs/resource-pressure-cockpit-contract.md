@@ -254,10 +254,17 @@ What an operator sees:
   - `mux.scrollback.durability_gap_markers` (markers written);
   - `mux.scrollback.durability_commit_latency_us` (histogram).
 
-Not yet wired; tracked on ft-yccm0.2.1.6:
+- **`ft doctor --json`.** Each live GUI's resource snapshot carries a
+  `durability` section with:
+  - `queue_bytes` and `queue_budget_bytes`;
+  - `gaps_total` (markers written);
+  - `gap_rows_total` and `gap_bytes_total`.
 
-- `ft doctor --json` fields for gaps and queue bytes;
-- gap counts in `ft session list-durable`.
+  A headless `frankenterm-mux-server` publishes no resource snapshot, so its
+  durability shows only in its logs and metrics.
+
+Not yet wired, tracked on ft-yccm0.2.1.6: gap counts in
+`ft session list-durable`.
 
 ## Worker Pool Pressure
 

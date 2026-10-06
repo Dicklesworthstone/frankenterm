@@ -454,6 +454,9 @@ mod deferred_scrollback {
         budget: AtomicUsize,
         /// Charged bytes of every row queued behind this writer.
         queued_bytes: AtomicUsize,
+        /// Only the process-wide writer publishes to `DurabilityLedger`
+        /// (`ft doctor --json`); private test writers do not.
+        publishes: AtomicBool,
     }
 
     #[derive(Default)]
@@ -467,7 +470,24 @@ mod deferred_scrollback {
         /// The process-wide writer, started on first use.
         pub(super) fn global() -> Arc<Self> {
             static GLOBAL: OnceLock<Arc<DurabilityWriter>> = OnceLock::new();
-            Arc::clone(GLOBAL.get_or_init(Self::spawn))
+            Arc::clone(GLOBAL.get_or_init(|| {
+                let writer = Self::spawn();
+                writer.shared.publishes.store(true, Ordering::Release);
+                writer.publish_queue(0);
+                writer
+            }))
+        }
+
+        /// Whether this writer reports to `DurabilityLedger::global()`.
+        fn publishes(&self) -> bool {
+            self.shared.publishes.load(Ordering::Acquire)
+        }
+
+        fn publish_queue(&self, total: usize) {
+            metrics::gauge!("mux.scrollback.durability_queue_bytes").set(total as f64);
+            if self.publishes() {
+                DurabilityLedger::global().set_queue(total as u64, self.queue_budget() as u64);
+            }
         }
 
         /// Start a writer thread. Without one (spawn failure), sinks fall
@@ -479,6 +499,7 @@ mod deferred_scrollback {
                 running: AtomicBool::new(false),
                 budget: AtomicUsize::new(DEFAULT_QUEUE_BUDGET_BYTES),
                 queued_bytes: AtomicUsize::new(0),
+                publishes: AtomicBool::new(false),
             });
             let worker = Arc::clone(&shared);
             match std::thread::Builder::new()
@@ -519,6 +540,7 @@ mod deferred_scrollback {
         /// `scrollback_durability_queue_max_mb`).
         pub(super) fn set_queue_budget(&self, bytes: usize) {
             self.shared.budget.store(bytes.max(1), Ordering::Release);
+            self.publish_queue(self.queued_bytes());
         }
 
         pub(super) fn queue_budget(&self) -> usize {
@@ -532,12 +554,12 @@ mod deferred_scrollback {
 
         fn charge(&self, bytes: usize) {
             let total = self.shared.queued_bytes.fetch_add(bytes, Ordering::AcqRel) + bytes;
-            metrics::gauge!("mux.scrollback.durability_queue_bytes").set(total as f64);
+            self.publish_queue(total);
         }
 
         fn release(&self, bytes: usize) {
             let total = self.shared.queued_bytes.fetch_sub(bytes, Ordering::AcqRel) - bytes;
-            metrics::gauge!("mux.scrollback.durability_queue_bytes").set(total as f64);
+            self.publish_queue(total);
         }
     }
 
@@ -1288,6 +1310,9 @@ mod deferred_scrollback {
             self.committed_batches.fetch_add(1, Ordering::AcqRel);
             self.publish_progress();
             metrics::counter!("mux.scrollback.durability_gap_markers").increment(1);
+            if self.writer.publishes() {
+                DurabilityLedger::global().record_gaps(1, 0, 0);
+            }
             log::debug!(
                 target: "mux::scrollback_durability",
                 "pane={} recorded durability gap rows={}..{} as store row {}",
@@ -1430,6 +1455,10 @@ mod deferred_scrollback {
             let bytes: usize = gaps.iter().map(|gap| gap.bytes).sum();
             metrics::counter!("mux.scrollback.durability_gap_rows_total").increment(rows as u64);
             metrics::counter!("mux.scrollback.durability_gap_bytes_total").increment(bytes as u64);
+            if self.writer.publishes() {
+                // Gap records are counted when their markers are written.
+                DurabilityLedger::global().record_gaps(0, rows as u64, bytes as u64);
+            }
             let first = gaps[0].start;
             let end = gaps[gaps.len() - 1].end;
             if entered {
@@ -2676,13 +2705,25 @@ mod deferred_scrollback {
         let charge = DeferredScrollbackSpillSink::row_charge(&GatedStore::line(1999)).unwrap();
         sink.writer.set_queue_budget(charge * 600);
         let budget = sink.writer.queue_budget();
+        let mut shedding_latencies = Vec::with_capacity(1_487);
         for row in 513..2_000 {
+            let started = Instant::now();
             assert!(sink.store_scrollback_line(row, &GatedStore::line(row), retention));
+            sink.request_scrollback_flush().unwrap();
+            shedding_latencies.push(started.elapsed());
             assert!(
                 sink.writer.queued_bytes() <= budget,
                 "row {row} broke the budget"
             );
         }
+        // The parser never waits on the stalled writer, shedding included.
+        assert_eq!(store.inside(), 1, "the writer is still inside the store");
+        shedding_latencies.sort();
+        let median = shedding_latencies[shedding_latencies.len() / 2];
+        assert!(
+            median < Duration::from_millis(1),
+            "median admission + handoff while shedding took {median:?}"
+        );
         let gap = {
             let state = sink.state.lock().unwrap();
             // The row the stalled writer holds is never shed; every later
