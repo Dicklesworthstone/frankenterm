@@ -598,22 +598,19 @@ impl super::TermWindow {
                 }
             }
             let dimensions = pane.get_dimensions();
-            let Some(mut anchor) = super::render::pane::ViewportAnchor::new(
-                &*pane,
-                row,
-                dimensions,
-            )
-            .or_else(|| {
-                self.pane_state(pane_id)
-                    .and_then(|state| state.last_viewport_source)
-                    .filter(|(_, _, observed)| {
-                        mux::renderable::same_line_layout_geometry(observed, &dimensions)
-                    })
-                    .map(|source| {
-                        super::render::pane::ViewportAnchor::from_source(source, row)
-                            .bind_pane_identity(&*pane)
-                    })
-            }) else {
+            let Some(mut anchor) =
+                super::render::pane::ViewportAnchor::new(&*pane, row, dimensions).or_else(|| {
+                    self.pane_state(pane_id)
+                        .and_then(|state| state.last_viewport_source)
+                        .filter(|(_, _, observed)| {
+                            mux::renderable::same_line_layout_geometry(observed, &dimensions)
+                        })
+                        .map(|source| {
+                            super::render::pane::ViewportAnchor::from_source(source, row)
+                                .bind_pane_identity(&*pane)
+                        })
+                })
+            else {
                 continue;
             };
             // Admit the owned anchor while the old layout still names `row`.

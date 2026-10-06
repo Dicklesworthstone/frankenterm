@@ -512,9 +512,10 @@ mod tests {
         bm.begin_gesture();
         let gesture_end = Instant::now();
         bm.end_gesture(gesture_end);
-        assert!(bm
-            .try_shrink_if_idle(gesture_end + Duration::from_secs(60))
-            .is_none());
+        assert!(
+            bm.try_shrink_if_idle(gesture_end + Duration::from_secs(60))
+                .is_none()
+        );
         assert_eq!(bm.shrink_count(), 0);
         assert_eq!(bm.high_water_mark(), 1);
         assert_eq!(bm.last_gesture_end, Some(gesture_end));
