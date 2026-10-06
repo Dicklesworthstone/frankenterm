@@ -606,7 +606,7 @@ impl<'a> Performer<'a> {
         let normalized: String;
         let text = if p.is_ascii() {
             p.as_str()
-        } else if self.config.normalize_output_to_unicode_nfc()
+        } else if self.batch_config.normalize_output_to_unicode_nfc
             && is_nfc_quick(p.chars()) != IsNormalized::Yes
         {
             normalized = p.as_str().nfc().collect();
@@ -910,7 +910,8 @@ impl<'a> Performer<'a> {
     /// Draw a character to the screen
     fn print(&mut self, c: char) {
         // We buffer up the chars to increase the chances of correctly grouping graphemes into cells
-        let max_title_len = self.config.max_accumulating_title_len();
+        // Read once per batch, not per character (ft-yccm0.2.4).
+        let max_title_len = self.batch_config.max_accumulating_title_len;
         if let Some(title) = self.accumulating_title.as_mut() {
             if title
                 .len()
@@ -2058,6 +2059,179 @@ mod tests {
             let scalar = run_gate_stream(&bytes, true);
             assert_eq!(swar, scalar, "SWAR diverged from scalar for {name}");
         }
+    }
+
+    /// ft-yccm0.2.4: a configuration whose hot getters count their calls and
+    /// whose values can change between batches, as the GUI's `TermConfig`
+    /// values do under one shared `Arc`.
+    #[derive(Debug)]
+    struct LiveConfig {
+        scrollback: std::sync::atomic::AtomicUsize,
+        title_cap: std::sync::atomic::AtomicUsize,
+        bidi: std::sync::atomic::AtomicBool,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl LiveConfig {
+        fn new(scrollback: usize) -> Arc<Self> {
+            Arc::new(Self {
+                scrollback: std::sync::atomic::AtomicUsize::new(scrollback),
+                title_cap: std::sync::atomic::AtomicUsize::new(8192),
+                bidi: std::sync::atomic::AtomicBool::new(false),
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn read(&self) {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.swap(0, std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl TerminalConfiguration for LiveConfig {
+        fn scrollback_size(&self) -> usize {
+            self.read();
+            self.scrollback.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn scrollback_tier_config(&self) -> ScrollbackTierConfig {
+            self.read();
+            ScrollbackTierConfig {
+                enabled: false,
+                hot_lines: self
+                    .scrollback
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .max(1),
+                warm_max_bytes: 0,
+            }
+        }
+
+        fn max_accumulating_title_len(&self) -> usize {
+            self.read();
+            self.title_cap.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn normalize_output_to_unicode_nfc(&self) -> bool {
+            self.read();
+            false
+        }
+
+        fn bidi_mode(&self) -> crate::config::BidiMode {
+            self.read();
+            crate::config::BidiMode {
+                enabled: self.bidi.load(std::sync::atomic::Ordering::SeqCst),
+                hint: ParagraphDirectionHint::LeftToRight,
+            }
+        }
+
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+    }
+
+    fn live_terminal(config: &Arc<LiveConfig>) -> Terminal {
+        Terminal::new(
+            TerminalSize {
+                rows: 8,
+                cols: 40,
+                pixel_width: 320,
+                pixel_height: 128,
+                dpi: 96,
+            },
+            Arc::clone(config) as Arc<dyn TerminalConfiguration + Send + Sync>,
+            "WezTerm",
+            "test",
+            Box::new(Vec::new()),
+        )
+    }
+
+    fn numbered_lines(count: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for line in 0..count {
+            bytes.extend_from_slice(format!("line {line:04} xxxxxxxxxxxxxxxxxxxx\r\n").as_bytes());
+        }
+        bytes
+    }
+
+    /// ft-yccm0.2.4: printing and scrolling read the configuration once per
+    /// batch, not per character or per row, so the count is independent of
+    /// the batch's size.
+    #[test]
+    fn hot_config_is_read_per_batch_not_per_character_or_row() {
+        let config = LiveConfig::new(16);
+        let mut term = live_terminal(&config);
+        config.reads();
+
+        // About 6,600 printed characters and 200 scrolls, most evicting.
+        term.advance_bytes(numbered_lines(200));
+        let one_batch = config.reads();
+        assert!(
+            one_batch <= 16,
+            "{} configuration reads for one batch",
+            one_batch
+        );
+
+        term.advance_bytes(numbered_lines(400));
+        let double_batch = config.reads();
+        assert!(
+            double_batch <= 16,
+            "{} configuration reads for a batch twice the size",
+            double_batch
+        );
+
+        // The two-stage path refreshes once per batch as well.
+        let mut parser = frankenterm_escape_parser::parser::Parser::new();
+        term.perform_actions(parser.parse_as_vec(&numbered_lines(200)));
+        let two_stage = config.reads();
+        assert!(two_stage <= 16, "{} reads for perform_actions", two_stage);
+    }
+
+    /// ft-yccm0.2.4: a changed configuration takes effect at the next batch.
+    #[test]
+    fn hot_config_changes_take_effect_at_the_next_batch() {
+        let config = LiveConfig::new(16);
+        let mut term = live_terminal(&config);
+        term.advance_bytes(numbered_lines(40));
+        assert_eq!(term.screen().scrollback_rows(), 8 + 16);
+
+        config
+            .scrollback
+            .store(4, std::sync::atomic::Ordering::SeqCst);
+        term.advance_bytes(b"one more\r\n");
+        assert_eq!(term.screen().scrollback_rows(), 8 + 4);
+
+        term.advance_bytes(b"\x1bkabc");
+        assert_eq!(term.pending_tmux_title_bytes(), 3);
+        config
+            .title_cap
+            .store(4, std::sync::atomic::Ordering::SeqCst);
+        term.advance_bytes(b"de");
+        assert_eq!(
+            term.pending_tmux_title_bytes(),
+            0,
+            "the lowered cap discards the title in the next batch"
+        );
+
+        let cursor_row_bidi = |term: &Terminal| {
+            let screen = term.screen();
+            let row = screen.phys_row(term.cursor_pos().y);
+            let mut enabled = None;
+            screen.with_phys_lines(row..row + 1, |lines| {
+                enabled = Some(lines[0].bidi_info().0);
+            });
+            enabled.expect("the cursor row exists")
+        };
+        config.bidi.store(true, std::sync::atomic::Ordering::SeqCst);
+        term.advance_bytes(b"\x1b[2K");
+        assert!(cursor_row_bidi(&term), "erase applies the new bidi mode");
+        config
+            .bidi
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        term.advance_bytes(b"\x1b[2K");
+        assert!(!cursor_row_bidi(&term));
     }
 
     struct RowWalkOverride;

@@ -2782,6 +2782,9 @@ pub struct Screen {
 
     /// config so we can access Maximum number of lines of scrollback
     config: Arc<dyn TerminalConfiguration>,
+    /// The scrollback size and tier settings of `config`, refreshed per parse
+    /// batch so scrolling reads no configuration per row.
+    scrollback_policy: ScrollbackPolicy,
     scrollback_tiering: ScrollbackTieringState,
     /// Authenticated cold-store identity and original half-open prefix boundary
     /// retained while a checkpoint is restored and raw output is replayed off
@@ -3994,12 +3997,32 @@ impl ScrollbackTieringState {
     }
 }
 
-fn scrollback_hot_size(config: &Arc<dyn TerminalConfiguration>, allow_scrollback: bool) -> usize {
+/// `scrollback_size` and `scrollback_tier_config` of a configuration,
+/// captured when the configuration is installed and at the start of every
+/// parse batch (ft-yccm0.2.4). The GUI's `TermConfig` locks a mutex and
+/// clones an `Arc` per read, and scrolling used to read these several times
+/// per row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScrollbackPolicy {
+    size: usize,
+    tier: crate::config::ScrollbackTierConfig,
+}
+
+impl ScrollbackPolicy {
+    fn capture(config: &dyn TerminalConfiguration) -> Self {
+        Self {
+            size: config.scrollback_size(),
+            tier: config.scrollback_tier_config(),
+        }
+    }
+}
+
+fn scrollback_hot_size(policy: &ScrollbackPolicy, allow_scrollback: bool) -> usize {
     if !allow_scrollback {
         return 0;
     }
-    let total = config.scrollback_size();
-    let tier = config.scrollback_tier_config();
+    let total = policy.size;
+    let tier = policy.tier;
     if !tier.enabled {
         return total;
     }
@@ -6131,12 +6154,13 @@ impl Screen {
     ) -> Result<Screen, ()> {
         let physical_rows = size.rows.max(1);
         let physical_cols = size.cols.max(1);
+        let scrollback_policy = ScrollbackPolicy::capture(config.as_ref());
 
         let capacity = if checkpoint_restore {
             0
         } else {
             physical_rows
-                .checked_add(scrollback_hot_size(config, allow_scrollback))
+                .checked_add(scrollback_hot_size(&scrollback_policy, allow_scrollback))
                 .ok_or(())?
         };
         let mut lines = VecDeque::new();
@@ -6152,6 +6176,7 @@ impl Screen {
         Ok(Screen {
             lines,
             config: Arc::clone(config),
+            scrollback_policy,
             scrollback_tiering: ScrollbackTieringState::default(),
             recovery_scrollback: None,
             allow_scrollback,
@@ -6223,8 +6248,15 @@ impl Screen {
             self.last_resize_wrap_gate_payload = None;
         }
         self.config = Arc::clone(config);
+        self.scrollback_policy = ScrollbackPolicy::capture(config.as_ref());
         self.resize_wrap_policy = resize_wrap_policy;
         self.clear_rewrap_line_cache();
+    }
+
+    /// Re-reads [`ScrollbackPolicy`] from the installed configuration; see
+    /// `TerminalState::refresh_batch_config`.
+    pub(crate) fn refresh_scrollback_policy(&mut self) {
+        self.scrollback_policy = ScrollbackPolicy::capture(self.config.as_ref());
     }
 
     #[cfg(feature = "use_serde")]
@@ -6293,14 +6325,15 @@ impl Screen {
         }
 
         let resident_scrollback = self.lines.len().saturating_sub(self.physical_rows);
-        let configured_scrollback = live_config.scrollback_size();
+        let live_policy = ScrollbackPolicy::capture(live_config.as_ref());
+        let configured_scrollback = live_policy.size;
         if resident_scrollback > configured_scrollback {
             return Err(ScrollbackActivationError::ConfiguredRetentionInsufficient);
         }
 
-        let tier = live_config.scrollback_tier_config();
+        let tier = live_policy.tier;
         let desired_hot_rows = if tier.enabled {
-            scrollback_hot_size(live_config, true)
+            scrollback_hot_size(&live_policy, true)
         } else {
             resident_scrollback
         };
@@ -6404,14 +6437,14 @@ impl Screen {
     }
 
     fn hot_scrollback_size(&self) -> usize {
-        scrollback_hot_size(&self.config, self.allow_scrollback)
+        scrollback_hot_size(&self.scrollback_policy, self.allow_scrollback)
     }
 
     fn tiered_scrollback_warm_max_bytes(&self) -> usize {
         if !self.allow_scrollback {
             return 0;
         }
-        let tier = self.config.scrollback_tier_config();
+        let tier = self.scrollback_policy.tier;
         if !tier.enabled {
             return 0;
         }
@@ -6422,8 +6455,8 @@ impl Screen {
         if !self.allow_scrollback {
             return 0;
         }
-        self.config
-            .scrollback_size()
+        self.scrollback_policy
+            .size
             .saturating_sub(self.hot_scrollback_size())
     }
 
@@ -6533,7 +6566,7 @@ impl Screen {
         if self.hot_scrollback_size() == 0 {
             return true;
         }
-        let tier = self.config.scrollback_tier_config();
+        let tier = self.scrollback_policy.tier;
         if !tier.enabled {
             return true;
         }
@@ -6755,7 +6788,7 @@ impl Screen {
         const MAX_COLUMNS: usize = 2048;
         if !self.allow_scrollback
             || self.recovery_scrollback.is_some()
-            || !self.config.scrollback_tier_config().enabled
+            || !self.scrollback_policy.tier.enabled
             || !self
                 .config
                 .scrollback_spill_sink()
@@ -6798,7 +6831,7 @@ impl Screen {
         if !self.allow_scrollback {
             return 0;
         }
-        let tier = self.config.scrollback_tier_config();
+        let tier = self.scrollback_policy.tier;
         if !tier.enabled {
             return 0;
         }
@@ -8950,10 +8983,10 @@ impl Screen {
         cold_sink_retained_lines: usize,
         cold_sink_retained_bytes: usize,
     ) -> TieredScrollbackStatus {
-        let tier = self.config.scrollback_tier_config();
+        let tier = self.scrollback_policy.tier;
         let tiering_enabled = self.allow_scrollback && tier.enabled;
         let configured_scrollback_rows = if self.allow_scrollback {
-            self.config.scrollback_size()
+            self.scrollback_policy.size
         } else {
             0
         };

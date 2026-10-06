@@ -354,9 +354,31 @@ impl ScreenOrAlt {
     }
 }
 
+/// Configuration that per-character and per-row ingest paths read, captured
+/// at the start of every parse batch (ft-yccm0.2.4). The GUI's `TermConfig`
+/// locks a mutex and clones an `Arc` on every read, which `print` used to pay
+/// per character. A change takes effect at the next batch boundary.
+#[derive(Clone, Debug)]
+struct BatchConfig {
+    max_accumulating_title_len: usize,
+    normalize_output_to_unicode_nfc: bool,
+    bidi_mode: BidiMode,
+}
+
+impl BatchConfig {
+    fn capture(config: &dyn TerminalConfiguration) -> Self {
+        Self {
+            max_accumulating_title_len: config.max_accumulating_title_len(),
+            normalize_output_to_unicode_nfc: config.normalize_output_to_unicode_nfc(),
+            bidi_mode: config.bidi_mode(),
+        }
+    }
+}
+
 /// Manages the state for the terminal
 pub struct TerminalState {
     config: Arc<dyn TerminalConfiguration>,
+    batch_config: BatchConfig,
 
     screen: ScreenOrAlt,
     /// The current set of attributes in effect for the next
@@ -1014,9 +1036,11 @@ impl TerminalState {
         let unicode_version = config.unicode_version();
         let kitty_budget = config.kitty_image_budget_bytes();
         let kitty_max_transmission = config.kitty_image_max_transmission_bytes();
+        let batch_config = BatchConfig::capture(config.as_ref());
 
         TerminalState {
             config,
+            batch_config,
             screen,
             pen: CellAttributes::default(),
             cursor: CursorPosition::default(),
@@ -1192,6 +1216,7 @@ impl TerminalState {
     /// sequence number advances only when rows moved, so renderers re-read
     /// the changed scrollback extent.
     pub fn evict_warm_scrollback(&mut self) -> usize {
+        self.refresh_batch_config();
         let seqno = next_sequence_no(self.seqno);
         let evicted = self.screen.screen.evict_warm_scrollback(seqno);
         if evicted > 0 {
@@ -1215,6 +1240,19 @@ impl TerminalState {
             self.unicode_version = config.unicode_version();
         }
         self.config = config;
+        self.refresh_batch_config();
+    }
+
+    /// Re-reads the configuration the ingest hot paths cache: this state's
+    /// [`BatchConfig`] and both screens' scrollback policy. `Terminal` calls
+    /// it at the start of every parse batch, and the entry points that size
+    /// scrollback outside a batch call it too. The refresh is unconditional:
+    /// `TermConfig` folds the live pane count into the tier config without
+    /// bumping its revision.
+    pub(crate) fn refresh_batch_config(&mut self) {
+        self.batch_config = BatchConfig::capture(self.config.as_ref());
+        self.screen.screen.refresh_scrollback_policy();
+        self.screen.alt_screen.refresh_scrollback_policy();
     }
 
     pub fn get_config(&self) -> Arc<dyn TerminalConfiguration> {
@@ -1413,6 +1451,7 @@ impl TerminalState {
     /// alternate screen is active. The caller releases the terminal between
     /// slices and drains the sink only when blocked or settled after progress.
     pub fn trim_deferred_scrollback(&mut self) -> DeferredScrollbackTrim {
+        self.refresh_batch_config();
         let result = self.screen.screen.trim_deferred_scrollback(self.seqno);
         if result.moved() {
             self.increment_seqno();
@@ -1709,6 +1748,7 @@ impl TerminalState {
         prepared: Option<&mut ScreenReflowPreparation>,
     ) {
         self.increment_seqno();
+        self.refresh_batch_config();
         let (cursor_main, cursor_alt) = self.resize_cursors();
 
         let (adjusted_cursor_main, adjusted_cursor_alt) = self.screen.resize(
@@ -2523,7 +2563,7 @@ impl TerminalState {
                     mode,
                     true,
                     self.bidi_enabled
-                        .unwrap_or_else(|| self.config.bidi_mode().enabled),
+                        .unwrap_or(self.batch_config.bidi_mode.enabled),
                 );
             }
 
@@ -3034,7 +3074,7 @@ impl TerminalState {
     }
 
     fn get_bidi_mode(&self) -> BidiMode {
-        let mut mode = self.config.bidi_mode();
+        let mut mode = self.batch_config.bidi_mode;
         if let Some(enabled) = &self.bidi_enabled {
             mode.enabled = *enabled;
         }
