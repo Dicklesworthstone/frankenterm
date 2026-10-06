@@ -10690,8 +10690,21 @@ fn respond_to_synchronized_output_query(
         return;
     };
 
+    let response = synchronized_output_decrqm_response(hold);
+    // A local pane's reply joins the terminal's writer queue: the parser
+    // thread never blocks on a child that has stopped reading its input, and
+    // the reply stays FIFO with the terminal's other replies and user input
+    // (ft-yccm0.2.2.5).
+    if let Some(local) = pane.downcast_ref::<crate::localpane::LocalPane>() {
+        if let Err(err) = local.enqueue_terminal_reply(response) {
+            log::warn!("failed to queue DEC 2026 mode query response: {err}");
+        }
+        return;
+    }
+
+    // Other panes own their writers (a client pane forwards to its server).
     let mut writer = pane.writer();
-    if let Err(err) = writer.write_all(synchronized_output_decrqm_response(hold)) {
+    if let Err(err) = writer.write_all(response) {
         log::warn!("failed to answer DEC 2026 mode query: {err}");
         return;
     }
@@ -32288,6 +32301,71 @@ mod tests {
                 DecPrivateModeCode::SynchronizedOutput
             ))))
         ));
+    }
+
+    /// The DEC 2026 query reply joins the local pane's terminal writer queue.
+    /// With the child stalled (it never reads, and a 1 MiB paste has filled
+    /// the PTY), queueing the reply must still return at once: the parser
+    /// thread that answers queries never waits on the child (ft-yccm0.2.2.5).
+    #[cfg(unix)]
+    #[test]
+    fn local_pane_query_reply_queues_without_blocking_on_a_stalled_child() -> anyhow::Result<()>
+    {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+        let id = pane::alloc_pane_id()?;
+        let durable = uuid::Uuid::new_v4();
+        let pair = native_pty_system().openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+        })?;
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.args(["-c", "sleep 30"]);
+        let mut terminal = Terminal::new(
+            test_size(),
+            Arc::new(config::TermConfig::new_for_pane(
+                id,
+                0,
+                *durable.as_bytes(),
+                String::new(),
+            )),
+            "stalled-child",
+            "test",
+            pair.master.take_writer()?,
+        );
+        let child = pair.slave.spawn_command(cmd)?;
+        drop(pair.slave);
+        terminal.send_paste(&"x".repeat(1 << 20))?;
+        let local = Arc::new(crate::localpane::LocalPane::new(
+            id,
+            terminal,
+            child,
+            pair.master,
+            Box::new(Vec::<u8>::new()),
+            0,
+            *durable.as_bytes(),
+            String::new(),
+        ));
+
+        let queued = {
+            let local = Arc::clone(&local);
+            std::thread::spawn(move || {
+                local.enqueue_terminal_reply(synchronized_output_decrqm_response(true))
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !queued.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "queueing a query reply blocked on the stalled child"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        queued.join().expect("reply thread")?;
+        local.kill();
+        Ok(())
     }
 
     #[test]

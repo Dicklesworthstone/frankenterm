@@ -992,6 +992,19 @@ fn lock_termwindow_mutex<'a, T>(mutex: &'a Mutex<T>, name: &str) -> std::sync::M
     })
 }
 
+/// Sends a paste to `pane`. A refused paste (for example one over the
+/// terminal's paste size limit) is never truncated, so tell the user instead
+/// of failing silently (ft-yccm0.2.2.5).
+pub(crate) fn send_paste_or_notify(pane: &dyn Pane, text: &str) {
+    if let Err(err) = pane.send_paste(text) {
+        log::warn!("paste into pane {} refused: {err:#}", pane.pane_id());
+        frankenterm_toast_notification::persistent_toast_notification(
+            "Paste was not sent",
+            &format!("{err:#}"),
+        );
+    }
+}
+
 pub fn set_window_position(pos: GuiPosition) {
     lock_termwindow_mutex(&POSITION, "window position").replace(pos);
 }
@@ -5014,7 +5027,7 @@ impl TermWindow {
                     None => return Ok(true),
                 };
                 if self.pane_input_ready(&pane) {
-                    pane.send_paste(text.as_str())?;
+                    send_paste_or_notify(&*pane, text.as_str());
                 }
                 Ok(true)
             }
@@ -5030,7 +5043,7 @@ impl TermWindow {
                     .join(" ")
                     + " ";
                 if self.pane_input_ready(&pane) {
-                    pane.send_paste(urls.as_str())?;
+                    send_paste_or_notify(&*pane, urls.as_str());
                 }
                 Ok(true)
             }
@@ -5050,7 +5063,7 @@ impl TermWindow {
                     .join(" ")
                     + " ";
                 if self.pane_input_ready(&pane) {
-                    pane.send_paste(&paths)?;
+                    send_paste_or_notify(&*pane, &paths);
                 }
                 Ok(true)
             }
