@@ -67,9 +67,9 @@ struct PrintedCell {
 thread_local! {
     /// Disables the `last_printed` shortcut so `recluster_at_cursor` always
     /// walks the row: the oracle the shortcut is checked against.
-    static FORCE_RECLUSTER_ROW_WALK: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    static FORCE_RECLUSTER_ROW_WALK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Row walks `recluster_at_cursor` started on this thread.
-    static RECLUSTER_ROW_WALKS: std::cell::Cell<usize> = std::cell::Cell::new(0);
+    static RECLUSTER_ROW_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -134,14 +134,13 @@ impl<'a> Performer<'a> {
     fn note_printed(&mut self, y: VisibleRowIndex, idx: usize, width: usize, ends_in_zwj: bool) {
         // `Line` drops a write that would end past column u16::MAX. Such a
         // cell was never stored, so it must not be remembered either.
-        self.last_printed = (idx.saturating_add(width) <= usize::from(u16::MAX)).then(|| {
-            PrintedCell {
+        self.last_printed =
+            (idx.saturating_add(width) <= usize::from(u16::MAX)).then_some(PrintedCell {
                 y,
                 idx,
                 width,
                 ends_in_zwj,
-            }
-        });
+            });
     }
 
     /// Whether `last_printed` is the cell left of the cursor and does not end
@@ -160,7 +159,7 @@ impl<'a> Performer<'a> {
         if FORCE_RECLUSTER_ROW_WALK.with(std::cell::Cell::get) {
             return false;
         }
-        self.last_printed.map_or(false, |cell| {
+        self.last_printed.is_some_and(|cell| {
             let beside_cursor = if pending_wrap {
                 cell.idx == cursor_x
             } else {
@@ -2057,7 +2056,10 @@ mod tests {
         let (shortcut, shortcut_walks) = run(false);
         let (walked, walked_walks) = run(true);
         assert_eq!(shortcut, walked, "the shortcut changed the grid");
-        assert_eq!(walked_walks, multibyte_prints, "the oracle walks every time");
+        assert_eq!(
+            walked_walks, multibyte_prints,
+            "the oracle walks every time"
+        );
         // Only the call's first multi-byte print, which has no printed cell
         // to consult yet, walks the row.
         assert_eq!(shortcut_walks, 1, "{shortcut_walks} row walks");
