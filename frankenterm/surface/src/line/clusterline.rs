@@ -514,43 +514,61 @@ impl ClusteredLine {
             return;
         }
         guarded_reserve_text(&mut self.text, text.len());
-
-        const MAX_CLUSTER_CELL_WIDTH: usize = u16::MAX as usize;
-        let mut remaining = text;
-        while !remaining.is_empty() {
-            let appended_to_last = match self.clusters.last_mut() {
-                Some(cluster) if cluster.attrs == attrs => {
-                    let available =
-                        MAX_CLUSTER_CELL_WIDTH.saturating_sub(cluster.cell_width as usize);
-                    if available == 0 {
-                        0
-                    } else {
-                        let take = remaining.len().min(available);
-                        cluster.cell_width += take as u16;
-                        take
-                    }
-                }
-                _ => 0,
-            };
-
-            if appended_to_last > 0 {
-                remaining = &remaining[appended_to_last..];
-                continue;
-            }
-
-            let take = remaining.len().min(MAX_CLUSTER_CELL_WIDTH);
-            self.clusters.push(Cluster {
-                cell_width: take as u16,
-                attrs: attrs.clone(),
-            });
-            remaining = &remaining[take..];
-        }
-
+        self.extend_clusters(text.len(), &attrs);
         self.text.push_str(text);
         self.last_cell_width = NonZeroU8::new(1);
         self.len = self
             .len
             .saturating_add(text.len().min(u32::MAX as usize) as u32);
+    }
+
+    /// Appends `count` blank cells: what `append_grapheme(" ", 1,
+    /// CellAttributes::blank())` does `count` times, in one step
+    /// (ft-70s4z). Writing a cell past the end of a line fills the gap with
+    /// these, and a cell at a far column used to pay a detach, a capacity
+    /// check and an attribute comparison per blank.
+    pub fn append_blank_cells(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        guarded_reserve_text(&mut self.text, count);
+        self.extend_clusters(count, &CellAttributes::blank());
+        self.text.extend(core::iter::repeat_n(' ', count));
+        self.last_cell_width = NonZeroU8::new(1);
+        self.len = self.len.saturating_add(count.min(u32::MAX as usize) as u32);
+    }
+
+    /// Accounts `count` width-1 cells with `attrs` to the attribute runs:
+    /// the last run grows while its attributes match and it has room, then
+    /// new runs of at most `u16::MAX` cells follow. One cell at a time
+    /// through `append_grapheme` builds exactly the same runs.
+    fn extend_clusters(&mut self, count: usize, attrs: &CellAttributes) {
+        const MAX_CLUSTER_CELL_WIDTH: usize = u16::MAX as usize;
+        let mut remaining = count;
+        while remaining > 0 {
+            let appended_to_last = match self.clusters.last_mut() {
+                Some(cluster) if cluster.attrs == *attrs => {
+                    let available =
+                        MAX_CLUSTER_CELL_WIDTH.saturating_sub(cluster.cell_width as usize);
+                    let take = remaining.min(available);
+                    cluster.cell_width += take as u16;
+                    take
+                }
+                _ => 0,
+            };
+
+            if appended_to_last > 0 {
+                remaining -= appended_to_last;
+                continue;
+            }
+
+            let take = remaining.min(MAX_CLUSTER_CELL_WIDTH);
+            self.clusters.push(Cluster {
+                cell_width: take as u16,
+                attrs: attrs.clone(),
+            });
+            remaining -= take;
+        }
     }
 
     pub fn append(&mut self, cell: Cell) {
@@ -985,5 +1003,49 @@ mod test {
             GUARDED_LINE_TEXT_WIPE_INVOCATIONS.load(core::sync::atomic::Ordering::Relaxed) > before,
             "a later-field serde error must drop and wipe the decoded text guard"
         );
+    }
+
+    /// ft-70s4z: `append_blank_cells(n)` builds exactly the line `n` single
+    /// blank `append_grapheme` calls build, after every kind of tail: none,
+    /// a blank run, another attribute, a wide cell, and a run one cell short
+    /// of `u16::MAX` (so the bulk fill crosses into new runs).
+    #[test]
+    fn append_blank_cells_matches_one_blank_at_a_time() {
+        let mut bold = CellAttributes::blank();
+        bold.set_intensity(frankenterm_cell::Intensity::Bold);
+        let mut starts = vec![ClusteredLine::new()];
+        let mut blank_tail = ClusteredLine::new();
+        blank_tail.append_ascii_run("ab ", CellAttributes::blank());
+        starts.push(blank_tail);
+        let mut bold_tail = ClusteredLine::new();
+        bold_tail.append_ascii_run("abc", bold.clone());
+        starts.push(bold_tail);
+        let mut wide_tail = ClusteredLine::new();
+        wide_tail.append_grapheme("\u{4e2d}", 2, bold);
+        starts.push(wide_tail);
+        let mut nearly_full = ClusteredLine::new();
+        for _ in 0..u16::MAX - 1 {
+            nearly_full.append_grapheme(" ", 1, CellAttributes::blank());
+        }
+        starts.push(nearly_full);
+
+        for (which, start) in starts.iter().enumerate() {
+            for count in [0usize, 1, 2, 7, 70_000] {
+                let mut bulk = start.clone();
+                bulk.append_blank_cells(count);
+                let mut single = start.clone();
+                for _ in 0..count {
+                    single.append_grapheme(" ", 1, CellAttributes::blank());
+                }
+                assert!(
+                    bulk == single,
+                    "start {} count {}: bulk {} runs, single {} runs",
+                    which,
+                    count,
+                    bulk.clusters.len(),
+                    single.clusters.len()
+                );
+            }
+        }
     }
 }

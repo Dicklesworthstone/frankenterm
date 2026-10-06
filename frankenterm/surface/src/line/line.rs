@@ -287,6 +287,17 @@ impl Line {
         }
     }
 
+    /// How many owners share this line's clustered storage, or `None` for
+    /// vector storage (ft-70s4z). A row being printed should have one: with
+    /// a second owner, every write copies the whole row.
+    #[doc(hidden)]
+    pub fn clustered_storage_owners(&self) -> Option<usize> {
+        match &self.cells {
+            CellStorage::C(line) => Some(Arc::strong_count(line)),
+            CellStorage::V(_) => None,
+        }
+    }
+
     /// Retain only immutable semantic source data for a mutable callback fence.
     /// Cells stay shared even in eager-clone profiling mode; caches are omitted.
     pub fn semantic_snapshot(&self) -> Self {
@@ -1403,12 +1414,11 @@ impl Line {
             // A grapheme that would cluster with the previous cell cannot be
             // appended to clustered storage; it takes the vector path below.
             if cl.can_append_cell_at(idx, text) {
-                while cl.len() < idx {
-                    // Fill out any implied blanks until we can append
-                    // their intended cell content
-                    Arc::make_mut(cl).append_grapheme(" ", 1, CellAttributes::blank());
-                }
-                Arc::make_mut(cl).append_grapheme(text, width, attr);
+                // Fill out any implied blanks, then append the intended
+                // cell content, all in one detach (ft-70s4z).
+                let cl = Arc::make_mut(cl);
+                cl.append_blank_cells(idx - cl.len());
+                cl.append_grapheme(text, width, attr);
                 self.invalidate_implicit_hyperlinks(seqno);
                 self.invalidate_zones();
                 self.update_last_change_seqno(seqno);
@@ -1422,6 +1432,12 @@ impl Line {
     /// Assign a contiguous printable width-1 ASCII run when it can be
     /// represented as a single append to clustered storage. Returns false for
     /// control bytes or whenever the caller must use normal per-cell assignment.
+    ///
+    /// A run that starts past the end of the line (ft-70s4z) gets the result
+    /// per-cell `set_cell` gives it. Leading cells equal to `Cell::blank()`
+    /// stay implicit, the gap up to the first other cell is filled with
+    /// blanks, and the rest is appended. All of it happens in one detach of
+    /// the clustered storage.
     pub fn append_ascii_cell_run(
         &mut self,
         idx: usize,
@@ -1444,14 +1460,25 @@ impl Line {
         let CellStorage::C(cl) = &mut self.cells else {
             return false;
         };
-        if idx != cl.len() || !cl.can_append_cell_at(idx, text) {
+        if !cl.can_append_cell_at(idx, text) {
             return false;
         }
+        // Past the end, `set_cell` leaves a blank cell implicit.
+        let implicit = if idx > cl.len() && Cell::new(' ', attr.clone()) == Cell::blank() {
+            text.bytes().take_while(|&byte| byte == b' ').count()
+        } else {
+            0
+        };
+        let (idx, text) = (idx + implicit, &text[implicit..]);
 
         if attr.hyperlink().is_some() {
             self.bits |= LineBits::HAS_HYPERLINK;
         }
-        Arc::make_mut(cl).append_ascii_run(text, attr);
+        if !text.is_empty() {
+            let cl = Arc::make_mut(cl);
+            cl.append_blank_cells(idx - cl.len());
+            cl.append_ascii_run(text, attr);
+        }
         self.invalidate_implicit_hyperlinks(seqno);
         self.invalidate_zones();
         self.update_last_change_seqno(seqno);
@@ -1500,12 +1527,11 @@ impl Line {
             // A grapheme that would cluster with the previous cell cannot be
             // appended to clustered storage; it takes the vector path below.
             if cl.can_append_cell_at(idx, cell.str()) {
-                while cl.len() < idx {
-                    // Fill out any implied blanks until we can append
-                    // their intended cell content
-                    Arc::make_mut(cl).append_grapheme(" ", 1, CellAttributes::blank());
-                }
-                Arc::make_mut(cl).append(cell);
+                // Fill out any implied blanks, then append the intended
+                // cell content, all in one detach (ft-70s4z).
+                let cl = Arc::make_mut(cl);
+                cl.append_blank_cells(idx - cl.len());
+                cl.append(cell);
                 return;
             }
             /*

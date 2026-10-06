@@ -595,3 +595,71 @@ fn compression_keeps_clustering_neighbours_in_vector_storage() {
     assert_eq!(before, after);
     assert_eq!(plain.len(), visible_width_sum(&plain));
 }
+
+/// ft-70s4z: a printable-ASCII run written past the end of a clustered line
+/// lands exactly where per-cell `set_cell` puts it, which is what the screen
+/// fell back to before. Leading blank cells stay implicit, the gap fills
+/// with blanks, and the storage stays clustered.
+#[test]
+fn append_ascii_cell_run_past_the_end_matches_per_cell_set_cell() {
+    use frankenterm_cell::Intensity;
+    let blank = CellAttributes::blank();
+    let mut bold = CellAttributes::blank();
+    bold.set_intensity(Intensity::Bold);
+    let mut linked = CellAttributes::blank();
+    linked.set_hyperlink(Some(Arc::new(Hyperlink::new("https://seq.example/"))));
+    let cases = [
+        ("", 0, "abc", &blank),
+        ("", 7, "abc", &blank),
+        ("ab", 2, "  cd", &blank),
+        ("ab", 9, "  cd", &blank),
+        ("ab", 9, "   ", &blank),
+        ("ab", 9, "  cd", &bold),
+        ("ab", 9, " ", &bold),
+        ("", 60, "123", &linked),
+        ("", 119, "4", &blank),
+    ];
+    for (prefix, idx, text, attr) in cases {
+        let start = || {
+            let mut line = Line::new(1);
+            assert!(line.append_ascii_cell_run(0, prefix, CellAttributes::blank(), 1));
+            line
+        };
+        let mut bulk = start();
+        assert!(bulk.append_ascii_cell_run(idx, text, attr.clone(), 2));
+        let mut per_cell = start();
+        for (offset, byte) in text.bytes().enumerate() {
+            per_cell.set_cell(idx + offset, Cell::new(char::from(byte), attr.clone()), 2);
+        }
+        assert!(
+            bulk == per_cell,
+            "prefix {:?} at {} text {:?}: {:?} != {:?}",
+            prefix,
+            idx,
+            text,
+            bulk,
+            per_cell
+        );
+        assert!(matches!(&bulk.cells, CellStorage::C(_)));
+    }
+}
+
+/// ft-70s4z: a cell written far past the end of a clustered line fills the
+/// gap in one step and stays clustered, through both `set_cell` and
+/// `set_cell_grapheme`.
+#[test]
+fn far_cell_writes_fill_the_gap_and_stay_clustered() {
+    let mut line = Line::new(1);
+    line.set_cell(60, Cell::new('x', CellAttributes::blank()), 2);
+    line.set_cell_grapheme(100, "\u{4e2d}", 2, CellAttributes::blank(), 3);
+    assert!(matches!(&line.cells, CellStorage::C(_)));
+    assert_eq!(line.len(), 102);
+    let text: String = line
+        .visible_cells()
+        .map(|cell| cell.str().to_string())
+        .collect();
+    assert_eq!(
+        text,
+        format!("{}x{}\u{4e2d}", " ".repeat(60), " ".repeat(39))
+    );
+}

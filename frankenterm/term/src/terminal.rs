@@ -2484,4 +2484,44 @@ mod tests {
             );
         }
     }
+
+    /// ft-70s4z: printing leaves no second owner on any row's clustered
+    /// storage; with one, every write would copy the whole row. The stream is
+    /// seq's output without carriage returns, as the M.1 seq corpus has it,
+    /// so each number lands further right on a fresh row and the gap before
+    /// it is filled in.
+    #[test]
+    fn printed_rows_keep_their_clustered_storage_unshared() {
+        let mut term = make_scrollback_prop_term(24, 120, 200);
+        let mut bytes = Vec::new();
+        for n in 1..3000 {
+            bytes.extend_from_slice(format!("{}\n", n).as_bytes());
+        }
+        for chunk in bytes.chunks(4096) {
+            term.advance_bytes(chunk);
+        }
+
+        let screen = term.screen_mut();
+        let rows = screen.scrollback_rows();
+        let mut clustered = 0;
+        for row in 0..rows {
+            if let Some(owners) = screen.line_mut(row).clustered_storage_owners() {
+                assert_eq!(owners, 1, "row {} of {} is shared", row, rows);
+                clustered += 1;
+            }
+        }
+        assert!(
+            clustered > rows / 2,
+            "{} of {} rows clustered",
+            clustered,
+            rows
+        );
+
+        // The probe does see sharing.
+        let last = rows - 1;
+        let snapshot = screen.line_mut(last).semantic_snapshot();
+        assert_eq!(screen.line_mut(last).clustered_storage_owners(), Some(2));
+        drop(snapshot);
+        assert_eq!(screen.line_mut(last).clustered_storage_owners(), Some(1));
+    }
 }
