@@ -261,6 +261,17 @@ fn snapshots_capture_pending_wrap_modes_and_cell_attributes() {
     assert_eq!(mode(&plain, "wrap_next"), "false");
     assert!(snapshot::describe_difference(&wrapped, &plain).is_some());
 
+    // The saved cursor is compared by position, pen and wrap state; only
+    // its batch seqno, which engines count differently, is normalized.
+    let mut saved_here = Legacy.build(&geometry);
+    saved_here.feed(b"ab\x1b7");
+    let mut saved_there = Legacy.build(&geometry);
+    saved_there.feed(b"abc\x1b7");
+    let here = mode(&saved_here.snapshot(), "saved_cursor_primary");
+    let there = mode(&saved_there.snapshot(), "saved_cursor_primary");
+    assert_ne!(here, there, "the saved position must be compared");
+    assert!(here.contains("seqno: 0"), "{}", here);
+
     let mut styled = Legacy.build(&geometry);
     styled.feed(b"\x1b[4hab\x1b[1;31mc");
     let styled = styled.snapshot();

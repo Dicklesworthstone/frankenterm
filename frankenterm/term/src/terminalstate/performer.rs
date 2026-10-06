@@ -56,6 +56,20 @@ impl TerminalState {
             format!("{:?}", entries)
         }
 
+        // A saved cursor records the seqno of the batch that saved it, and
+        // engines count batches differently (`advance_bytes` bumps the seqno
+        // for every call, `perform_actions` skips empty batches). Zero it as
+        // the live cursor's is; position, wrap state, pen, origin mode and
+        // charsets are still compared.
+        fn saved_cursor(saved: &Option<super::SavedCursor>) -> String {
+            let normalized = saved.as_ref().map(|saved| {
+                let mut saved = saved.clone();
+                saved.position.seqno = 0;
+                saved
+            });
+            format!("{:?}", normalized)
+        }
+
         vec![
             ("wrap_next", format!("{:?}", self.wrap_next)),
             ("insert", format!("{:?}", self.insert)),
@@ -138,11 +152,11 @@ impl TerminalState {
             ),
             (
                 "saved_cursor_primary",
-                format!("{:?}", self.screen.screen.saved_cursor),
+                saved_cursor(&self.screen.screen.saved_cursor),
             ),
             (
                 "saved_cursor_alt",
-                format!("{:?}", self.screen.alt_screen.saved_cursor),
+                saved_cursor(&self.screen.alt_screen.saved_cursor),
             ),
             (
                 "keyboard_stack_primary",
