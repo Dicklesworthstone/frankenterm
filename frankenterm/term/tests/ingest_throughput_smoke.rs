@@ -585,6 +585,9 @@ fn each_lane_run_becomes_one_json_line_with_the_required_fields() {
         assert_eq!(record["load_avg_1m"], 1.5);
         assert_eq!(record["corpus_sha256"], input.corpus.sha256.as_str());
         assert_eq!(record["cursor_x"].is_null(), lane == Lane::Parse, "{line}");
-        assert_eq!(record["actions"].is_null(), lane == Lane::Term, "{line}");
+        // The fused lanes apply as they parse and count no actions, like term
+        // (ft-yccm0.3.2.1).
+        let counts_actions = !matches!(lane, Lane::Term | Lane::MuxFused | Lane::ProdConfigFused);
+        assert_eq!(record["actions"].is_null(), !counts_actions, "{line}");
     }
 }
