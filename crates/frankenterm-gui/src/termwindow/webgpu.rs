@@ -1202,6 +1202,23 @@ fn should_configure_surface(
     force || configured != requested || previous_requested.0 == 0 || previous_requested.1 == 0
 }
 
+/// ft-yccm0.1.10: an image-parity snapshot run reads the presented texture
+/// back, so its surface must allow `COPY_SRC`. Every other run keeps the
+/// surface render-only (framebuffer-only on Metal).
+fn snapshot_surface_usage(caps: &wgpu::SurfaceCapabilities) -> wgpu::TextureUsages {
+    let readable = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
+    if crate::termwindow::render_snapshot::RenderSnapshotRequest::requested() {
+        if caps.usages.contains(readable) {
+            return readable;
+        }
+        log::error!(
+            "render snapshot requested, but this surface cannot be read back (usages {:?})",
+            caps.usages
+        );
+    }
+    wgpu::TextureUsages::RENDER_ATTACHMENT
+}
+
 fn select_composite_alpha_mode(
     alpha_modes: &[wgpu::CompositeAlphaMode],
 ) -> wgpu::CompositeAlphaMode {
@@ -1464,7 +1481,7 @@ impl WebGpuState {
         );
 
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: snapshot_surface_usage(&caps),
             format,
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: surface_width,

@@ -63,6 +63,8 @@ impl crate::TermWindow {
         use crate::renderstate::LedgeredTexture;
         use crate::termwindow::webgpu::WebGpuTexture;
 
+        // ft-yccm0.1.10: claimed before the renderer borrows below.
+        let snapshot_path = self.claim_render_snapshot();
         let webgpu = self
             .webgpu
             .as_mut()
@@ -212,6 +214,18 @@ impl crate::TermWindow {
         }
         drop(render_pass);
 
+        // ft-yccm0.1.10: copy exactly the texture about to be presented.
+        let snapshot = snapshot_path.and_then(|path| {
+            crate::termwindow::render_snapshot::PendingReadback::record(
+                &webgpu.device,
+                &mut encoder,
+                &output.texture,
+                path,
+            )
+            .map_err(|err| log::error!("render snapshot: {err:#}"))
+            .ok()
+        });
+
         // In this wgpu API both `Queue::submit` and `Queue::present`
         // are synchronously infallible. Device-loss errors reported later by
         // wgpu are outside this synchronous seam; a successful return does not
@@ -219,6 +233,11 @@ impl crate::TermWindow {
         let _submission = webgpu.profile_native_stage("submit", || {
             webgpu.queue.submit(std::iter::once(encoder.finish()))
         });
+        if let Some(snapshot) = snapshot {
+            if let Err(err) = snapshot.finish(&webgpu.device) {
+                log::error!("render snapshot: {err:#}");
+            }
+        }
         webgpu.profile_native_stage("present", || webgpu.queue.present(output));
 
         Ok(())

@@ -126,6 +126,7 @@ pub mod palette;
 pub mod paneselect;
 mod prevcursor;
 pub mod render;
+pub(crate) mod render_snapshot;
 pub mod resize;
 mod selection;
 pub(crate) use selection::SelectionCopy;
@@ -990,6 +991,30 @@ fn lock_termwindow_mutex<'a, T>(mutex: &'a Mutex<T>, name: &str) -> std::sync::M
         mutex.clear_poison();
         poisoned.into_inner()
     })
+}
+
+/// Image-parity hook for the Metal front end (ft-yccm0.1.10). Until the
+/// Track C data model lands (ft-yccm0.4.2) its whole frame is the background
+/// clear, so the same pass is rendered offscreen and read back; C2 replaces
+/// this with a readback of the frame's own texture.
+fn write_metal_render_snapshot(
+    metal: &frankenterm_renderer_metal::MetalRenderer,
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+    color: frankenterm_renderer_metal::ClearColor,
+) {
+    let result = metal
+        .device()
+        .clear_offscreen(width, height, color)
+        .map_err(anyhow::Error::new)
+        .and_then(|bgra| {
+            render_snapshot::texels_to_rgba8(wgpu::TextureFormat::Bgra8Unorm, bgra)
+        })
+        .and_then(|rgba| render_snapshot::write_png_atomically(path, width, height, &rgba));
+    if let Err(err) = result {
+        log::error!("Metal render snapshot failed: {err:#}");
+    }
 }
 
 /// Sends a paste to `pane`. A refused paste (for example one over the
@@ -2416,6 +2441,9 @@ pub struct TermWindow {
     /// The native Metal front end. While it is in development it only clears
     /// the window to the background color; it never has a `RenderState`.
     metal: Option<Rc<frankenterm_renderer_metal::MetalRenderer>>,
+    /// Image-parity corpus snapshot request (ft-yccm0.1.10); `None` unless
+    /// `FRANKENTERM_RENDER_SNAPSHOT` was set at window creation.
+    render_snapshot: Option<render_snapshot::RenderSnapshotRequest>,
     config_subscription: Option<config::ConfigSubscription>,
 
     /// Per-pane agent state classification, updated each render tick.
@@ -4574,6 +4602,7 @@ impl TermWindow {
             gl: None,
             webgpu: None,
             metal: None,
+            render_snapshot: render_snapshot::RenderSnapshotRequest::from_env(),
             window: None,
             window_background,
             background_load: BackgroundLoadCoordinator::default(),
@@ -5134,12 +5163,16 @@ impl TermWindow {
             return false;
         };
         let captured_generation = self.damage_generation;
+        let snapshot_path = self.claim_render_snapshot();
         let color = self.metal_clear_color();
         let dimensions = self.dimensions;
         let width = u32::try_from(dimensions.pixel_width).unwrap_or(u32::MAX);
         let height = u32::try_from(dimensions.pixel_height).unwrap_or(u32::MAX);
         match metal.render_clear(width, height, color) {
             Ok(frankenterm_renderer_metal::FrameOutcome::Presented) => {
+                if let Some(path) = snapshot_path {
+                    write_metal_render_snapshot(&metal, &path, width, height, color);
+                }
                 let settlement = apply_presented_render_attempt(
                     &mut self.dirty_lines,
                     self.damage_generation,
@@ -5178,6 +5211,17 @@ impl TermWindow {
             }
         }
         true
+    }
+
+    /// The image-parity snapshot path, once, when the active pane's title is
+    /// the snapshot sentinel (ft-yccm0.1.10). Cheap when no snapshot was
+    /// requested.
+    pub(crate) fn claim_render_snapshot(&mut self) -> Option<std::path::PathBuf> {
+        self.render_snapshot.as_ref()?;
+        let title = self
+            .get_active_pane_or_overlay()
+            .map(|pane| pane.get_title());
+        self.render_snapshot.as_mut()?.claim(title.as_deref())
     }
 
     /// The window background exactly as the other front ends fill it: the
