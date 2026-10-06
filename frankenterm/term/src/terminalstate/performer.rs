@@ -41,6 +41,148 @@ impl TerminalState {
     pub fn pending_tmux_title_bytes(&self) -> usize {
         self.accumulating_title.as_ref().map_or(0, String::len)
     }
+
+    /// Every mode and register that shapes how later output is applied, as
+    /// `(name, value)` pairs in a fixed order. Most of them are otherwise
+    /// private, including the pending-wrap flag. The differential engine
+    /// harness (ft-yccm0.1.8) compares this between engines after every
+    /// chunk; seqnos and internal fast-path flags are deliberately left out.
+    pub fn mode_snapshot(&self) -> Vec<(&'static str, String)> {
+        fn sorted<K: Ord + std::fmt::Debug, V: std::fmt::Debug>(
+            entries: impl Iterator<Item = (K, V)>,
+        ) -> String {
+            let mut entries: Vec<(K, V)> = entries.collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            format!("{:?}", entries)
+        }
+
+        vec![
+            ("wrap_next", format!("{:?}", self.wrap_next)),
+            ("insert", format!("{:?}", self.insert)),
+            ("dec_auto_wrap", format!("{:?}", self.dec_auto_wrap)),
+            ("dec_origin_mode", format!("{:?}", self.dec_origin_mode)),
+            (
+                "reverse_wraparound_mode",
+                format!("{:?}", self.reverse_wraparound_mode),
+            ),
+            (
+                "reverse_video_mode",
+                format!("{:?}", self.reverse_video_mode),
+            ),
+            (
+                "top_and_bottom_margins",
+                format!("{:?}", self.top_and_bottom_margins),
+            ),
+            (
+                "left_and_right_margins",
+                format!("{:?}", self.left_and_right_margins),
+            ),
+            (
+                "left_and_right_margin_mode",
+                format!("{:?}", self.left_and_right_margin_mode),
+            ),
+            ("newline_mode", format!("{:?}", self.newline_mode)),
+            (
+                "saved_dec_private_modes",
+                sorted(self.saved_dec_private_modes.iter()),
+            ),
+            (
+                "application_cursor_keys",
+                format!("{:?}", self.application_cursor_keys),
+            ),
+            (
+                "application_keypad",
+                format!("{:?}", self.application_keypad),
+            ),
+            ("modify_other_keys", format!("{:?}", self.modify_other_keys)),
+            ("dec_ansi_mode", format!("{:?}", self.dec_ansi_mode)),
+            ("bracketed_paste", format!("{:?}", self.bracketed_paste)),
+            ("focus_tracking", format!("{:?}", self.focus_tracking)),
+            ("mouse_tracking", format!("{:?}", self.mouse_tracking)),
+            (
+                "button_event_mouse",
+                format!("{:?}", self.button_event_mouse),
+            ),
+            ("any_event_mouse", format!("{:?}", self.any_event_mouse)),
+            ("mouse_encoding", format!("{:?}", self.mouse_encoding)),
+            ("cursor_visible", format!("{:?}", self.cursor_visible)),
+            ("keyboard_encoding", format!("{:?}", self.keyboard_encoding)),
+            (
+                "synchronized_output",
+                format!("{:?}", self.synchronized_output),
+            ),
+            (
+                "sixel_display_mode",
+                format!("{:?}", self.sixel_display_mode),
+            ),
+            (
+                "sixel_scrolls_right",
+                format!("{:?}", self.sixel_scrolls_right),
+            ),
+            (
+                "use_private_color_registers_for_each_graphic",
+                format!("{:?}", self.use_private_color_registers_for_each_graphic),
+            ),
+            ("color_map", sorted(self.color_map.iter())),
+            ("g0_charset", format!("{:?}", self.g0_charset)),
+            ("g1_charset", format!("{:?}", self.g1_charset)),
+            ("shift_out", format!("{:?}", self.shift_out)),
+            (
+                "tab_stops",
+                format!("{:?} width {}", self.tabs.tabs, self.tabs.tab_width),
+            ),
+            ("pen", format!("{:?}", self.pen)),
+            (
+                "alt_screen_active",
+                format!("{:?}", self.screen.alt_screen_is_active),
+            ),
+            (
+                "saved_cursor_primary",
+                format!("{:?}", self.screen.screen.saved_cursor),
+            ),
+            (
+                "saved_cursor_alt",
+                format!("{:?}", self.screen.alt_screen.saved_cursor),
+            ),
+            (
+                "keyboard_stack_primary",
+                format!("{:?}", self.screen.screen.keyboard_stack),
+            ),
+            (
+                "keyboard_stack_alt",
+                format!("{:?}", self.screen.alt_screen.keyboard_stack),
+            ),
+            ("title", format!("{:?}", self.title)),
+            ("icon_title", format!("{:?}", self.icon_title)),
+            (
+                "accumulating_title",
+                format!("{:?}", self.accumulating_title),
+            ),
+            (
+                "suppress_initial_title_change",
+                format!("{:?}", self.suppress_initial_title_change),
+            ),
+            ("progress", format!("{:?}", self.progress)),
+            ("current_dir", format!("{:?}", self.current_dir)),
+            ("user_vars", sorted(self.user_vars.iter())),
+            ("palette_override", format!("{:?}", self.palette)),
+            ("unicode_version", format!("{:?}", self.unicode_version)),
+            (
+                "unicode_version_stack",
+                format!("{:?}", self.unicode_version_stack),
+            ),
+            (
+                "clear_semantic_attribute_on_newline",
+                format!("{:?}", self.clear_semantic_attribute_on_newline),
+            ),
+            (
+                "last_semantic_command_status",
+                format!("{:?}", self.last_semantic_command_status),
+            ),
+            ("bidi_enabled", format!("{:?}", self.bidi_enabled)),
+            ("bidi_hint", format!("{:?}", self.bidi_hint)),
+        ]
+    }
 }
 
 /// A helper struct for implementing `vtparse::VTActor` while compartmentalizing
