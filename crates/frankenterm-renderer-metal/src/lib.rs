@@ -46,14 +46,14 @@
 //! crate-wide, every block opts in with a narrow `#[allow(unsafe_code)]`, and
 //! clippy's `undocumented_unsafe_blocks` and `multiple_unsafe_ops_per_block`
 //! are denied, so each block holds one operation and one `SAFETY:` comment
-//! naming its category below. All blocks live in `src/macos.rs` and
-//! `src/macos_frames.rs`. The non-macOS stub and the portable [`frame`] module
-//! contain none.
+//! naming its category below. All blocks live in `src/macos.rs`,
+//! `src/macos_frames.rs` and `src/macos_atlas.rs`. The non-macOS stub and the
+//! portable [`frame`] and [`atlas`] modules contain none.
 //!
 //! Most Metal and Core Animation calls are safe in `objc2-metal` /
 //! `objc2-quartz-core` 0.3, whose generated bindings already encode the
 //! Objective-C signatures and retain/release rules. The remaining unsafe
-//! operations fall into four categories:
+//! operations fall into these categories:
 //!
 //! 1. **FFI-VIEW: borrowing the AppKit view.** `MetalRenderer::attach`
 //!    dereferences the `NSView` pointer from a borrowed
@@ -79,6 +79,10 @@
 //!    the destination row pitch is `width * 4` bytes for the 4-byte BGRA8
 //!    format, and the destination buffer is allocated with exactly
 //!    `row pitch * height` bytes, so the copy stays in bounds on both sides.
+//!    The glyph atlases (ft-yccm0.4.3.2) also copy texture to texture when
+//!    an atlas grows: the source region is the old texture's whole extent and
+//!    the destination is the same width and taller, at the same origin; the
+//!    atlas test readback copies a glyph's own region at its format's pitch.
 //! 4. **BUFFER-CONTENTS: reading shared GPU memory.** Reading back the bytes
 //!    of a `MTLStorageModeShared` buffer through `-contents`.
 //!    *Invariant:* the pointer covers `-length` bytes, which is at least the
@@ -123,6 +127,15 @@
 //!    one triangle, and the vertex shader reads no vertex buffer. The shader
 //!    indexes CellBg only below `rows * cols`, and the frame slots size that
 //!    buffer for the frame's grid before the frame is encoded.
+//! 10. **ATLAS-UPLOAD: writing glyph pixels into an atlas texture.**
+//!     `replaceRegion:mipmapLevel:withBytes:bytesPerRow:` on a glyph atlas
+//!     (ft-yccm0.4.3.2).
+//!     *Invariant:* the region comes from the atlas's own allocator, so it lies
+//!     inside the texture, and the allocator hands out only never-used space
+//!     or a page evicted after its last frame finished, so no unfinished frame
+//!     reads it; the pixel slice was checked to hold exactly width x height x
+//!     bytes-per-pixel bytes at a tight row pitch and is borrowed for the
+//!     call; the texture is in shared storage, which the CPU may write.
 //!
 //! Thread affinity: `MetalRenderer` holds Objective-C objects that are not
 //! `Send`, so it stays on the thread that created it (the GUI main thread
@@ -131,6 +144,7 @@
 use std::fmt;
 use std::time::Duration;
 
+pub mod atlas;
 pub mod cell_bg;
 pub mod frame;
 pub use cell_bg::{BackgroundUniforms, CellBg, CellBgGrid, CursorShape, CursorUniform};
@@ -138,6 +152,10 @@ pub use frame::{FRAME_SLOTS, GridExtent};
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod macos_atlas;
+#[cfg(target_os = "macos")]
+pub use macos_atlas::{AtlasError, GlyphAtlases};
 #[cfg(target_os = "macos")]
 mod macos_frames;
 #[cfg(target_os = "macos")]

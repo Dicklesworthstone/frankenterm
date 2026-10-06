@@ -77,6 +77,12 @@ impl MetalDevice {
         self.device.clone()
     }
 
+    /// The device's command queue; the glyph atlases blit on it when they
+    /// grow (ft-yccm0.4.3.2).
+    pub(crate) fn raw_queue(&self) -> &ProtocolObject<dyn MTLCommandQueue> {
+        &self.queue
+    }
+
     /// Clears an offscreen `width x height` `BGRA8Unorm` texture with one
     /// render pass, waits for the GPU, and returns the texture's bytes:
     /// row-major, tightly packed, `[B, G, R, A]` per pixel.

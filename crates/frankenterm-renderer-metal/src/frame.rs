@@ -383,6 +383,23 @@ impl SlotRing {
         self.lock().frames_completed
     }
 
+    /// Every frame numbered below this has finished: it completed on the GPU
+    /// or was dropped unsubmitted, so nothing it drew is still being read.
+    /// The glyph atlases reuse a region only once its last frame is below it
+    /// (ft-yccm0.4.3.2).
+    #[must_use]
+    pub fn retired_before(&self) -> u64 {
+        let ring = self.lock();
+        ring.slots
+            .iter()
+            .filter_map(|state| match state {
+                SlotState::Free => None,
+                SlotState::Encoding { frame } | SlotState::InFlight { frame } => Some(*frame),
+            })
+            .min()
+            .unwrap_or(ring.next_frame)
+    }
+
     /// Waits up to `timeout` until no slot is leased or in flight. Returns
     /// whether the ring went idle.
     pub fn wait_idle(&self, timeout: Duration) -> bool {
@@ -540,6 +557,30 @@ mod tests {
         // The operator's 6K window.
         let large = SlotSizes::for_grid(GridExtent::new(117, 512)).unwrap();
         assert_eq!(large.bytes(SlotBuffer::CellText), 117 * 512 * 32);
+    }
+
+    /// ft-yccm0.4.3.2: the fence the glyph atlases reuse regions behind.
+    #[test]
+    fn retired_before_is_the_oldest_unfinished_frame() {
+        let ring = SlotRing::new();
+        assert_eq!(ring.retired_before(), 0, "nothing leased yet");
+        let first = ring.acquire(LONG).unwrap();
+        assert_eq!(ring.retired_before(), 0, "frame 0 is being encoded");
+        let token0 = first.submit();
+        let token1 = ring.acquire(LONG).unwrap().submit();
+        let encoding = ring.acquire(LONG).unwrap();
+        assert_eq!(ring.retired_before(), 0);
+        // Frame 1 finishing first does not retire frame 0.
+        token1.complete();
+        assert_eq!(ring.retired_before(), 0);
+        token0.complete();
+        assert_eq!(ring.retired_before(), 2, "frame 2 is still being encoded");
+        drop(encoding);
+        assert_eq!(
+            ring.retired_before(),
+            3,
+            "a dropped lease counts as finished"
+        );
     }
 
     #[test]
