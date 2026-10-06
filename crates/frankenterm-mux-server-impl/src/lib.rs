@@ -1162,6 +1162,27 @@ mod deferred_scrollback {
             self.committed_batches.load(Ordering::Acquire)
         }
 
+        /// Sets this sink's writer budget (tests use private writers).
+        #[cfg(test)]
+        pub(super) fn set_writer_budget(&self, bytes: usize) {
+            self.writer.set_queue_budget(bytes);
+        }
+
+        /// The stable-row spans of queued, not yet written, overload gaps.
+        #[cfg(test)]
+        pub(super) fn queued_gaps(&self) -> Vec<std::ops::Range<StableRowIndex>> {
+            self.state
+                .lock()
+                .unwrap()
+                .pending
+                .iter()
+                .filter_map(|entry| match entry {
+                    Pending::Gap(gap) => Some(gap.start..gap.end),
+                    Pending::Row(_) => None,
+                })
+                .collect()
+        }
+
         fn lock_health(&self) -> std::sync::MutexGuard<'_, WriterHealth> {
             // Only plain field updates run under this lock.
             self.health.lock().unwrap_or_else(PoisonError::into_inner)
@@ -1349,7 +1370,7 @@ mod deferred_scrollback {
         // Charges cell storage and grapheme bytes without allocating a second
         // text serialization under the terminal lock. Shared attribute/image
         // payloads are not a claim about total process memory usage.
-        fn row_charge(line: &Line) -> Option<usize> {
+        pub(super) fn row_charge(line: &Line) -> Option<usize> {
             let cells = line
                 .len()
                 .checked_mul(std::mem::size_of::<wezterm_term::Cell>())?;
@@ -2206,7 +2227,7 @@ mod deferred_scrollback {
                 skip += gaps[next_gap].rows() - 1;
                 next_gap += 1;
             }
-            let mut oldest = store_oldest + skip;
+            let oldest = store_oldest + skip;
             let generation = snapshot.generation();
             let fidelity = snapshot.fidelity();
             let stored_bytes = snapshot.stored_bytes();
@@ -2227,12 +2248,15 @@ mod deferred_scrollback {
             if oldest + rows.len() as StableRowIndex != newest {
                 return Err(ScrollbackSpillError::SnapshotRangeMismatch);
             }
-            // Expansion can exceed the row limit; like the store, keep the
-            // newest rows.
+            // The store's contract is every retained row or a ResourceLimit,
+            // never a truncated snapshot. It checked its own (marker-compact)
+            // row count; the expanded stable rows must pass the same limit.
             if rows.len() > limits.max_rows {
-                let cut = rows.len() - limits.max_rows;
-                rows.drain(..cut);
-                oldest += cut as StableRowIndex;
+                return Err(ScrollbackSpillError::ResourceLimit {
+                    resource: "rows",
+                    observed: u64::try_from(rows.len()).unwrap_or(u64::MAX),
+                    maximum: u64::try_from(limits.max_rows).unwrap_or(u64::MAX),
+                });
             }
             ScrollbackSnapshot::from_contiguous_rows(
                 generation,
@@ -3086,9 +3110,26 @@ mod deferred_scrollback {
             assert_eq!(*actual, expected, "snapshot row {row}");
         }
         assert_eq!(rows.len(), 100);
-        let tight = deferred.snapshot_scrollback(100, limits(5)).unwrap();
-        assert_eq!(tight.oldest_stable_row(), Some(95));
-        assert_eq!(text(&tight.rows()[0]), "flood 95");
+        // A row limit never truncates a snapshot (the store's contract is
+        // every retained row or ResourceLimit). Below the store's own,
+        // marker-compact row count the store refuses; between that and the
+        // expanded stable rows the expansion refuses the same way.
+        assert_eq!(
+            deferred.snapshot_scrollback(100, limits(5)).unwrap_err(),
+            ScrollbackSpillError::ResourceLimit {
+                resource: "rows",
+                observed: kept as u64,
+                maximum: 5,
+            }
+        );
+        assert_eq!(
+            deferred.snapshot_scrollback(100, limits(kept)).unwrap_err(),
+            ScrollbackSpillError::ResourceLimit {
+                resource: "rows",
+                observed: 100,
+                maximum: kept as u64,
+            }
+        );
 
         // Recovery: the reopened store carries the marker in order, between
         // the rows before and after the gap.
@@ -12687,42 +12728,60 @@ mod tests {
         retained.cells_mut();
         assert_eq!(persisted, retained);
 
-        // A failing store with a full queue: memory stays bounded, so the
-        // parser waits (outside the terminal lock) until close cancels it.
+        // A failing store whose queue passes its bound. ft-yccm0.2.1.6
+        // changed this contract on purpose. Before, memory stayed bounded by
+        // holding the parser until close; that wait was 22% of mux-parse
+        // samples in the operator's T1 run. Now memory stays bounded by the
+        // writer's byte budget, set to exactly what the old 4096-row full
+        // queue held, and overflow sheds the oldest queued rows into an
+        // explicit gap. The parser never waits, and no row disappears.
         let (_dir, backing, deferred) = deferred_test_sink();
+        let row_bytes = deferred_scrollback::DeferredScrollbackSpillSink::row_charge(
+            &Line::from_text("retained", &CellAttributes::blank(), 0, None),
+        )
+        .unwrap();
+        let budget = LIVE_SCROLLBACK_APPEND_MAX_ROWS * row_bytes;
+        deferred.set_writer_budget(budget);
         let pane = deferred_test_pane(deferred.clone(), 8192);
         std::fs::write(&backing.manifest_path, b"invalid retained authority").unwrap();
         let rows = LIVE_SCROLLBACK_APPEND_MAX_ROWS + 200;
         let (parser, done_rx) = run_parser(&pane, parse(&b"retained\r\n".repeat(rows)));
-        let parser_blocked = done_rx
-            .recv_timeout(std::time::Duration::from_millis(300))
-            .is_err();
+        let returned = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        parser.join().unwrap();
+        returned.expect("a queue past its budget on a failing store must not hold the parser");
         let (_dimensions, _title) = (pane.get_dimensions(), pane.get_title());
-        // Nothing is durable, so every retained row is a queued row.
+        // Nothing is durable, so every retained row is a queued row or gap.
         assert_eq!(backing.retained_scrollback_rows(), 0);
+        assert!(
+            deferred.retained_scrollback_bytes() <= budget,
+            "queued rows stay within the old full-queue bytes"
+        );
+        let evicted = deferred.retained_scrollback_rows();
+        assert!(
+            evicted > LIVE_SCROLLBACK_APPEND_MAX_ROWS,
+            "every evicted row is admitted ({evicted}), none refused"
+        );
+        let gaps = deferred.queued_gaps();
+        assert!(!gaps.is_empty(), "the overflow is an explicit gap");
+        let newest = wezterm_term::StableRowIndex::try_from(evicted - 1).unwrap();
+        for stable in [0, gaps[0].start, gaps[0].end - 1, newest] {
+            assert!(
+                deferred.load_scrollback_line(stable).is_some(),
+                "row {stable} stays readable (its text, or the gap's marker)"
+            );
+        }
         assert_eq!(
-            deferred.retained_scrollback_rows(),
-            LIVE_SCROLLBACK_APPEND_MAX_ROWS,
-            "the queue is full and bounded"
+            deferred
+                .load_scrollback_line(newest)
+                .map(|line| line.as_str().trim_end().to_string()),
+            Some("retained".to_string())
         );
         pane.kill();
-        let stopped = done_rx.recv_timeout(std::time::Duration::from_secs(5));
-        parser.join().unwrap();
-        assert!(
-            parser_blocked,
-            "a full queue on a failing store must hold the parser"
-        );
-        stopped.expect("pane close must end the parser's durability wait");
-        let newest = deferred.load_scrollback_line(
-            wezterm_term::StableRowIndex::try_from(LIVE_SCROLLBACK_APPEND_MAX_ROWS - 1).unwrap(),
-        );
-        assert!(newest.is_some(), "queued rows stay readable");
         restore_store(&backing);
         deferred.flush_scrollback().unwrap();
-        assert_eq!(
-            backing.retained_scrollback_rows(),
-            LIVE_SCROLLBACK_APPEND_MAX_ROWS
-        );
+        // The store holds every row, with each gap written as one marker.
+        let markers_save: usize = gaps.iter().map(|gap| gap.len() - 1).sum();
+        assert_eq!(backing.retained_scrollback_rows(), evicted - markers_save);
     }
 
     /// The real store, committing at most `chunk` rows per call. When armed,
@@ -13446,33 +13505,75 @@ mod tests {
         );
     }
 
+    /// Formerly `deferred_scrollback_refuses_bounded_overflow_without_hiding_rows`.
+    /// ft-yccm0.2.1.6 changed this contract on purpose: a full queue no
+    /// longer refuses rows, because the refusal made the parser wait (22% of
+    /// mux-parse samples in the operator's T1 run). Both of the old bounds
+    /// still hold. Queue memory is bounded by the writer's byte budget, set
+    /// here to the old 16 MiB, and overflow sheds the oldest queued rows
+    /// into an explicit gap rather than hiding them. 4096 rows still bounds
+    /// every store transaction.
     #[test]
-    fn deferred_scrollback_refuses_bounded_overflow_without_hiding_rows() {
+    fn deferred_scrollback_bounds_overflow_by_bytes_without_hiding_rows() {
         let (_dir, backing, deferred) = deferred_test_sink();
         let line = Line::from_text("bounded", &CellAttributes::blank(), 0, None);
         let cap = isize::try_from(LIVE_SCROLLBACK_APPEND_MAX_ROWS).unwrap();
         let retention = LIVE_SCROLLBACK_APPEND_MAX_ROWS * 2;
-        for row in 0..cap {
+        // Rows past the old row cap are admitted: the queue is bounded by
+        // bytes, and these short rows stay far below the budget.
+        for row in 0..=cap {
             assert!(deferred.store_scrollback_line(row, &line, retention));
         }
-        assert!(!deferred.store_scrollback_line(cap, &line, retention));
         assert_eq!(
             deferred.retained_scrollback_rows(),
-            LIVE_SCROLLBACK_APPEND_MAX_ROWS
+            LIVE_SCROLLBACK_APPEND_MAX_ROWS + 1
         );
-        assert_eq!(deferred.load_scrollback_line(cap - 1), Some(line));
+        assert!(deferred.queued_gaps().is_empty());
+        assert_eq!(deferred.load_scrollback_line(cap), Some(line.clone()));
         assert_eq!(backing.retained_scrollback_rows(), 0);
+        deferred.flush_scrollback().unwrap();
+        assert_eq!(
+            backing.retained_scrollback_rows(),
+            LIVE_SCROLLBACK_APPEND_MAX_ROWS + 1
+        );
+        assert!(
+            deferred.committed_batches() >= 2,
+            "no store transaction exceeds {LIVE_SCROLLBACK_APPEND_MAX_ROWS} rows"
+        );
 
         let (_byte_dir, byte_backing, byte_deferred) = deferred_test_sink();
+        let budget = 16 * 1024 * 1024;
+        byte_deferred.set_writer_budget(budget);
         let long = Line::from_text(&"x".repeat(4096), &CellAttributes::blank(), 0, None);
-        let accepted = (0..cap)
-            .take_while(|row| byte_deferred.store_scrollback_line(*row, &long, retention))
-            .count();
-        assert!(
-            accepted > 0 && accepted < LIVE_SCROLLBACK_APPEND_MAX_ROWS,
-            "byte charge must bound long rows before the row cap"
+        for row in 0..cap {
+            assert!(byte_deferred.store_scrollback_line(row, &long, retention));
+            assert!(
+                byte_deferred.retained_scrollback_bytes() <= budget,
+                "the byte budget bounds the queue at row {row}"
+            );
+        }
+        // Long rows hit the byte bound long before the old row cap, and the
+        // oldest became one explicit gap; every row is still accounted for.
+        let gaps = byte_deferred.queued_gaps();
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        let gap = gaps[0].clone();
+        assert_eq!(gap.start, 0);
+        assert!(gap.end < cap, "{gap:?}");
+        assert_eq!(
+            byte_deferred.retained_scrollback_rows(),
+            LIVE_SCROLLBACK_APPEND_MAX_ROWS
         );
-        assert!(byte_deferred.retained_scrollback_bytes() <= 16 * 1024 * 1024);
+        let marker = byte_deferred.load_scrollback_line(0).unwrap();
+        assert!(
+            marker.as_str().starts_with("[durability gap: "),
+            "{}",
+            marker.as_str()
+        );
+        assert_eq!(
+            byte_deferred.load_scrollback_line(gap.end),
+            Some(long.clone())
+        );
+        assert_eq!(byte_deferred.load_scrollback_line(cap - 1), Some(long));
         assert_eq!(byte_backing.retained_scrollback_rows(), 0);
     }
 
