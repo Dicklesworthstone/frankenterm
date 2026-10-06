@@ -403,11 +403,23 @@ pub enum CacheGauge {
     LineQuadCacheBytes,
     GlyphCacheEntries,
     ImageCacheBytes,
+    /// Lines shaped since the window opened (line-shape cache misses);
+    /// a running total, like the next three (ft-yccm0.4.3.4).
+    ShapedLinesTotal,
+    /// Attribute clusters in those lines: what shaping split on before
+    /// fg-agnostic runs.
+    ShapedClustersTotal,
+    /// Shaper calls for those lines: one per shaping run. Runs per line
+    /// against clusters per line shows what fg-agnostic runs saved.
+    ShapingRunsTotal,
+    /// Merged runs shaped again per cluster because a glyph (a ligature)
+    /// spanned a paint boundary.
+    UnsplitShapingRunsTotal,
 }
 
 impl CacheGauge {
     /// Every gauge, in snapshot order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 12] = [
         Self::ShapeCacheEntries,
         Self::ShapeCacheBytes,
         Self::LineShapeCacheEntries,
@@ -416,6 +428,10 @@ impl CacheGauge {
         Self::LineQuadCacheBytes,
         Self::GlyphCacheEntries,
         Self::ImageCacheBytes,
+        Self::ShapedLinesTotal,
+        Self::ShapedClustersTotal,
+        Self::ShapingRunsTotal,
+        Self::UnsplitShapingRunsTotal,
     ];
 
     /// Stable snapshot key.
@@ -430,6 +446,10 @@ impl CacheGauge {
             Self::LineQuadCacheBytes => "line_quad_cache_bytes",
             Self::GlyphCacheEntries => "glyph_cache_entries",
             Self::ImageCacheBytes => "image_cache_bytes",
+            Self::ShapedLinesTotal => "shaped_lines_total",
+            Self::ShapedClustersTotal => "shaped_clusters_total",
+            Self::ShapingRunsTotal => "shaping_runs_total",
+            Self::UnsplitShapingRunsTotal => "unsplit_shaping_runs_total",
         }
     }
 
@@ -457,16 +477,7 @@ impl CacheGauges {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            values: [
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-            ],
+            values: [const { AtomicU64::new(0) }; CacheGauge::ALL.len()],
         }
     }
 

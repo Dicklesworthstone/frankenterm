@@ -147,9 +147,10 @@ fn real_gui_src_is_clean() {
 }
 
 /// ft-yccm0.2.5: the per-window cache-field rule is live on the real tree.
-/// It must actually see the two fenced TermWindow caches (so the clean
-/// result above is not vacuous), every fence entry must still match, and
-/// the atlas owner's maps must be recognised as such.
+/// It must actually see every fenced TermWindow cache (so the clean result
+/// above is not vacuous), every fence entry must still match, and the atlas
+/// owner's maps must be recognised as such. Since ft-yccm0.4.3.4 only the
+/// line-shape cache is fenced; the shape cache must scan clean.
 #[test]
 fn real_gui_per_window_gpu_caches_are_exactly_the_fenced_allow_list() {
     let gui_src = repo_root().join("crates/frankenterm-gui/src");

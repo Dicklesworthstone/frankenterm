@@ -91,6 +91,10 @@
 //!    the code that releases it on every atlas rebuild and the runtime test
 //!    proving it; an entry that no longer matches a reaching field is
 //!    reported as stale so the list cannot rot.
+//!
+//! Since ft-yccm0.4.3.4 `CachedShape` holds only HarfBuzz output and the
+//! sprite bindings live in `GlyphCache` (the atlas owner), so
+//! `TermWindow::shape_cache` scans clean instead of being fenced.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};

@@ -22,7 +22,7 @@ use frankenterm_gui::glyph_quad_staging::{
     GlyphQuadSoaBuffers, GlyphQuadStagingVertex, visit_expanded_glyph_quad_soa_vertices,
 };
 use futures::FutureExt;
-use std::cell::{Ref, RefCell, RefMut};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::convert::TryInto;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -881,6 +881,33 @@ pub struct RenderState {
     /// withdrawn when the window's render state is dropped.
     pub(crate) cache_gauges: CacheGaugeContribution,
     pub(crate) last_cache_gauge_report: Option<Instant>,
+    /// Running line-shaping totals, reported as cache gauges (ft-yccm0.4.3.4).
+    pub(crate) shaping: Cell<ShapingCounters>,
+}
+
+/// What line shaping did since the window opened (ft-yccm0.4.3.4): runs
+/// against clusters per line shows what fg-agnostic shaping runs saved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ShapingCounters {
+    /// Lines shaped (line-shape cache misses).
+    pub(crate) lines: u64,
+    /// Attribute clusters in those lines.
+    pub(crate) clusters: u64,
+    /// Shaper calls: one per shaping run.
+    pub(crate) runs: u64,
+    /// Merged runs shaped again per cluster (a glyph spanned a paint boundary).
+    pub(crate) unsplit_runs: u64,
+}
+
+impl ShapingCounters {
+    pub(crate) fn add(self, other: Self) -> Self {
+        Self {
+            lines: self.lines + other.lines,
+            clusters: self.clusters + other.clusters,
+            runs: self.runs + other.runs,
+            unsplit_runs: self.unsplit_runs + other.unsplit_runs,
+        }
+    }
 }
 
 const QUAD_SHRINK_IDLE: Duration = Duration::from_secs(1);
@@ -1178,6 +1205,7 @@ impl RenderState {
                         pending_quad_shrink: None,
                         cache_gauges: CacheGauges::global().contribution(),
                         last_cache_gauge_report: None,
+                        shaping: Cell::new(ShapingCounters::default()),
                     });
                 }
                 Err(OutOfTextureSpace {

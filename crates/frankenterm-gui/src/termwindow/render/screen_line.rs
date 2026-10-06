@@ -1,4 +1,6 @@
 use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
+use crate::renderstate::ShapingCounters;
+use crate::shapecache::ShapedInfo;
 use crate::termwindow::LineToElementShapeItem;
 use crate::termwindow::render::{
     ClusterStyleCache, ComputeCellFgBgParams, ComputeCellFgBgResult, LineToElementParams,
@@ -53,6 +55,92 @@ fn any_cluster_needs_paragraph_context(cell_clusters: &[CellCluster]) -> bool {
         && cell_clusters
             .iter()
             .any(should_shape_cluster_with_paragraph_context)
+}
+
+/// Whether `next` joins `prev`'s shaping run (ft-yccm0.4.3.4). Clusters
+/// split only by paint attributes (colors, underline, hyperlinks, ...) shape
+/// together: same resolved font style, presentation and left-to-right
+/// direction, contiguous, and the same paragraph-context treatment. A space
+/// on either side of the boundary keeps `make_cluster`'s whitespace break,
+/// which keeps shape-cache keys short.
+fn joins_shaping_run(
+    prev: (&CellCluster, &TextStyle),
+    next: (&CellCluster, &TextStyle),
+    paragraph_context: bool,
+) -> bool {
+    let ((prev, prev_style), (next, next_style)) = (prev, next);
+    prev.attrs != next.attrs
+        && std::ptr::eq(prev_style, next_style)
+        && prev.presentation == next.presentation
+        && prev.direction == Direction::LeftToRight
+        && next.direction == Direction::LeftToRight
+        && next.first_cell_idx == prev.first_cell_idx + prev.width
+        && !prev.text.ends_with(' ')
+        && !next.text.starts_with(' ')
+        && (!paragraph_context
+            || should_shape_cluster_with_paragraph_context(prev)
+                == should_shape_cluster_with_paragraph_context(next))
+}
+
+/// The line's shaping runs as ranges of cluster indices.
+fn shaping_runs(
+    clusters: &[CellCluster],
+    styles: &[&TextStyle],
+    paragraph_context: bool,
+) -> Vec<Range<usize>> {
+    let mut runs = Vec::new();
+    let mut start = 0;
+    for idx in 1..=clusters.len() {
+        let joins = idx < clusters.len()
+            && joins_shaping_run(
+                (&clusters[idx - 1], styles[idx - 1]),
+                (&clusters[idx], styles[idx]),
+                paragraph_context,
+            );
+        if !joins {
+            runs.push(start..idx);
+            start = idx;
+        }
+    }
+    runs
+}
+
+/// Splits a shaped run's glyphs back among the clusters it joined: the glyph
+/// index range each cluster gets, from every glyph's cell count in order and
+/// each cluster's `(first cell, width)`. Zero-cell glyphs (marks) stay with
+/// the glyph before them. `None` when a glyph spans two clusters (a ligature
+/// across a paint boundary), the cells do not add up, or a cluster would get
+/// no glyph; the caller then shapes those clusters one by one, as before.
+fn split_glyph_cells(cells: &[u8], parts: &[(usize, usize)]) -> Option<Vec<Range<usize>>> {
+    let (&(first_cell, _), _) = parts.split_first()?;
+    let end = |part: usize| parts[part].0 + parts[part].1;
+    let mut ranges = Vec::with_capacity(parts.len());
+    let mut part = 0;
+    let mut part_start = 0;
+    let mut cell = first_cell;
+    for (glyph, &width) in cells.iter().enumerate() {
+        let width = usize::from(width);
+        if width == 0 {
+            continue;
+        }
+        while part < parts.len() && cell >= end(part) {
+            ranges.push(part_start..glyph);
+            part_start = glyph;
+            part += 1;
+        }
+        if part == parts.len() || cell < parts[part].0 || cell + width > end(part) {
+            return None;
+        }
+        cell += width;
+    }
+    if part + 1 != parts.len() || cell != end(part) {
+        return None;
+    }
+    ranges.push(part_start..cells.len());
+    ranges
+        .iter()
+        .all(|range| !range.is_empty())
+        .then_some(ranges)
 }
 
 impl crate::TermWindow {
@@ -822,6 +910,61 @@ impl crate::TermWindow {
             .render_state
             .as_ref()
             .context("render state is not initialized")?;
+
+        // ft-yccm0.4.3.4: clusters that differ only in paint attributes are
+        // shaped once as a run; each cluster then gets its own glyphs back,
+        // so colors still apply per glyph.
+        let mut counters = ShapingCounters {
+            lines: 1,
+            clusters: cell_clusters.len() as u64,
+            ..ShapingCounters::default()
+        };
+        let styles: Vec<&TextStyle> = cell_clusters
+            .iter()
+            .map(|cluster| self.fonts.match_style(params.config, &cluster.attrs))
+            .collect();
+        let mut run_glyphs: Vec<Option<Rc<Vec<ShapedInfo>>>> = vec![None; cell_clusters.len()];
+        for run in shaping_runs(&cell_clusters, &styles, paragraph_context.is_some()) {
+            if run.len() < 2 {
+                continue;
+            }
+            let parts: Vec<&CellCluster> = cell_clusters[run.clone()].iter().collect();
+            let Some(joined) = CellCluster::concat(&parts) else {
+                continue;
+            };
+            let run_context = paragraph_context
+                .as_ref()
+                .filter(|_| should_shape_cluster_with_paragraph_context(parts[0]))
+                .map(|context| {
+                    (
+                        context.text.as_str(),
+                        context.ranges[run.start].start..context.ranges[run.end - 1].end,
+                    )
+                });
+            let shaped_run = self.cached_cluster_shape(
+                styles[run.start],
+                &joined,
+                &gl_state,
+                None,
+                &self.render_metrics,
+                run_context,
+            )?;
+            counters.runs += 1;
+            let cells: Vec<u8> = shaped_run.iter().map(|info| info.pos.num_cells).collect();
+            let extents: Vec<(usize, usize)> = parts
+                .iter()
+                .map(|part| (part.first_cell_idx, part.width))
+                .collect();
+            match split_glyph_cells(&cells, &extents) {
+                Some(ranges) => {
+                    for (offset, range) in ranges.into_iter().enumerate() {
+                        run_glyphs[run.start + offset] = Some(Rc::new(shaped_run[range].to_vec()));
+                    }
+                }
+                None => counters.unsplit_runs += 1,
+            }
+        }
+
         let mut shaped = vec![];
         let mut last_style = None;
         let mut x_pos = 0.;
@@ -945,14 +1088,20 @@ impl crate::TermWindow {
                 }
             });
 
-            let glyph_info = self.cached_cluster_shape(
-                style_params.style,
-                &cluster,
-                &gl_state,
-                None,
-                &self.render_metrics,
-                cluster_paragraph_context,
-            )?;
+            let glyph_info = match run_glyphs[idx].take() {
+                Some(glyphs) => glyphs,
+                None => {
+                    counters.runs += 1;
+                    self.cached_cluster_shape(
+                        style_params.style,
+                        &cluster,
+                        &gl_state,
+                        None,
+                        &self.render_metrics,
+                        cluster_paragraph_context,
+                    )?
+                }
+            };
             let pixel_width = glyph_info
                 .iter()
                 .map(|info| info.glyph.x_advance.get() as f32)
@@ -971,6 +1120,7 @@ impl crate::TermWindow {
 
             x_pos += pixel_width;
         }
+        gl_state.shaping.set(gl_state.shaping.get().add(counters));
 
         let shaped = Rc::new(shaped);
 
@@ -1080,5 +1230,91 @@ mod tests {
                 .iter()
                 .all(should_shape_cluster_with_paragraph_context)
         );
+    }
+
+    fn colored(index: u8) -> CellAttributes {
+        let mut attrs = CellAttributes::default();
+        attrs.set_foreground(ColorAttribute::PaletteIndex(index));
+        attrs
+    }
+
+    fn runs_of(cells: Vec<Cell>, styles: &[&TextStyle]) -> Vec<Range<usize>> {
+        let clusters = Line::from_cells(cells, SEQ_ZERO).cluster(None);
+        assert_eq!(clusters.len(), styles.len(), "{clusters:?}");
+        shaping_runs(
+            &clusters,
+            styles,
+            any_cluster_needs_paragraph_context(&clusters),
+        )
+    }
+
+    /// ft-yccm0.4.3.4: color changes no longer split shaping runs; font
+    /// style, presentation and whitespace still do.
+    #[test]
+    fn shaping_runs_join_paint_only_attribute_changes() {
+        let style = TextStyle::default();
+        let bold = TextStyle::default();
+        let same = [&style, &style, &style];
+
+        // Three colors, one font: one run.
+        let rainbow = vec![
+            Cell::new('a', colored(1)),
+            Cell::new('b', colored(1)),
+            Cell::new('c', colored(2)),
+            Cell::new('d', colored(3)),
+        ];
+        assert_eq!(runs_of(rainbow.clone(), &same), vec![0..3]);
+        // A different resolved style (font_rules, bold) splits the run.
+        assert_eq!(
+            runs_of(rainbow.clone(), &[&style, &bold, &bold]),
+            vec![0..1, 1..3]
+        );
+
+        // make_cluster's whitespace break stays, even across a color change.
+        let spaced = vec![
+            Cell::new('a', colored(1)),
+            Cell::new(' ', colored(1)),
+            Cell::new('b', colored(2)),
+        ];
+        assert_eq!(runs_of(spaced, &[&style, &style]), vec![0..1, 1..2]);
+
+        // Text and emoji presentation never share a run.
+        let emoji = vec![
+            Cell::new('a', colored(1)),
+            Cell::new_grapheme("\u{1F600}", colored(2), None),
+        ];
+        assert_eq!(runs_of(emoji, &[&style, &style]), vec![0..1, 1..2]);
+
+        // An ASCII hyperlink keeps its own shaping (no paragraph context).
+        let mut linked = colored(2);
+        linked.set_hyperlink(Some(Arc::new(Hyperlink::new("https://example.com"))));
+        let hyperlink = vec![Cell::new('a', colored(1)), Cell::new('b', linked)];
+        assert_eq!(runs_of(hyperlink, &[&style, &style]), vec![0..1, 1..2]);
+
+        assert!(shaping_runs(&[], &[], false).is_empty());
+    }
+
+    #[test]
+    fn split_glyph_cells_gives_each_cluster_its_own_glyphs() {
+        let parts = [(0, 2), (2, 2), (4, 1)];
+        assert_eq!(
+            split_glyph_cells(&[1, 1, 1, 1, 1], &parts),
+            Some(vec![0..2, 2..4, 4..5])
+        );
+        // A zero-cell mark stays with the glyph before it.
+        assert_eq!(
+            split_glyph_cells(&[1, 0, 1, 1, 1, 1], &parts),
+            Some(vec![0..3, 3..5, 5..6])
+        );
+        // Wide glyphs.
+        assert_eq!(
+            split_glyph_cells(&[2, 2], &[(10, 2), (12, 2)]),
+            Some(vec![0..1, 1..2])
+        );
+        // A ligature across the paint boundary cannot be split.
+        assert_eq!(split_glyph_cells(&[3, 1], &[(0, 2), (2, 2)]), None);
+        // Cells that do not add up, or nothing to split.
+        assert_eq!(split_glyph_cells(&[1, 1, 1], &[(0, 2), (2, 2)]), None);
+        assert_eq!(split_glyph_cells(&[1, 1], &[]), None);
     }
 }

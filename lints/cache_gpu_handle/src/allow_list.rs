@@ -76,18 +76,12 @@ pub struct CacheFieldAllowEntry {
 /// that proves the old atlas texture is freed. An entry that stops matching
 /// a GPU-reaching field is reported as stale and must be removed.
 pub const ALLOWED_CACHE_FIELDS: &[CacheFieldAllowEntry] = &[
-    // Shaping output is kept across rebuilds on purpose (re-shaping is the
-    // expensive part); the sprites are a generation-tagged `AtlasBinding`
-    // that `RenderCaches::invalidate` releases for `CacheRebuild::AtlasSprites`
-    // before `RenderState` replaces the glyph cache (ft-yccm0.2.5).
-    CacheFieldAllowEntry {
-        path: "termwindow/mod.rs",
-        owner: "TermWindow",
-        field: "shape_cache",
-        released_by: "termwindow/resize.rs: release_shape_atlas_bindings",
-        proven_by: "termwindow::resize::tests::\
-                    thousand_atlas_rebuilds_keep_live_atlas_bytes_within_twice_the_atlas_size",
-    },
+    // `TermWindow.shape_cache` is no longer listed: since ft-yccm0.4.3.4 its
+    // entries hold only HarfBuzz output (`CachedShape` of `GlyphInfo`s), and
+    // the resolved sprites live in `GlyphCache.shape_bindings`, beside the
+    // atlas they point into. This lint now proves the shape cache cannot
+    // reach a GPU handle, instead of fencing it.
+    //
     // Line shapes carry `Rc<Vec<ShapedInfo>>`; the whole cache is cleared for
     // every rebuild at or above `CacheRebuild::ColoredLines`, which includes
     // atlas rebuilds.

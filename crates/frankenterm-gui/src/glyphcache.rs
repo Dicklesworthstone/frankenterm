@@ -1,6 +1,7 @@
 use super::utilsprites::RenderMetrics;
 use crate::customglyph::*;
 use crate::renderstate::RenderContext;
+use crate::shapecache::ShapedInfo;
 use crate::termwindow::render::paint::AllowImage;
 use ahash::AHashMap;
 use anyhow::Context;
@@ -1224,6 +1225,10 @@ pub struct GlyphCache {
     pub block_glyphs: AHashMap<SizedBlockKey, Sprite>,
     pub cursor_glyphs: AHashMap<(Option<CursorShape>, u8), Sprite>,
     pub color: AHashMap<(RgbColor, NotNan<f32>), Sprite>,
+    /// Sprites resolved for shape-cache entries, keyed by `CachedShape::id`
+    /// (ft-yccm0.4.3.4). They point into this cache's atlas, so they live here
+    /// and are dropped with it; the shape cache keeps only HarfBuzz output.
+    shape_bindings: LfuCache<u64, Rc<Vec<ShapedInfo>>>,
     min_frame_duration: Duration,
     /// Per-frame snapshot of `atlas.version()` at the start of the
     /// frame (ft-c9arc). Sprites whose stamped version is `<=
@@ -1276,6 +1281,12 @@ impl GlyphCache {
             block_glyphs: AHashMap::new(),
             cursor_glyphs: AHashMap::new(),
             color: AHashMap::new(),
+            shape_bindings: LfuCache::new(
+                "glyph_cache.shape_bindings.hit.rate",
+                "glyph_cache.shape_bindings.miss.rate",
+                |config| config.shape_cache_size,
+                &fonts.config(),
+            ),
             min_frame_duration: config::frame_interval_for_max_fps(fonts.config().max_fps),
             last_synced_version: 0,
         })
@@ -1286,6 +1297,35 @@ impl GlyphCache {
     /// Rasterized font glyphs currently cached (cache-gauge ledger).
     pub fn glyph_entries(&self) -> usize {
         self.glyph_cache.len()
+    }
+
+    /// The sprites bound to shape `id` in this atlas, if resolved here.
+    pub fn shape_binding(&mut self, id: u64) -> Option<Rc<Vec<ShapedInfo>>> {
+        self.shape_bindings.get(&id).cloned()
+    }
+
+    /// Bind `glyphs`, resolved against this atlas, to shape `id`.
+    pub fn bind_shape(&mut self, id: u64, glyphs: Rc<Vec<ShapedInfo>>) {
+        self.shape_bindings.put(id, glyphs);
+    }
+
+    /// Drop every shape binding. The shape cache was cleared, so no entry can
+    /// ask for them again; this keeps them from crowding out live ones.
+    pub fn clear_shape_bindings(&mut self) {
+        self.shape_bindings.clear();
+    }
+
+    /// Bytes of the shape bindings' keys and sprite vectors (cache-gauge
+    /// ledger). The glyphs are counted with the glyph cache.
+    pub fn shape_binding_bytes(&self) -> u64 {
+        use std::mem::size_of;
+        let mut bytes = 0u64;
+        self.shape_bindings.for_each_resident(|_, glyphs| {
+            bytes += (size_of::<u64>()
+                + size_of::<Vec<ShapedInfo>>()
+                + glyphs.capacity() * size_of::<ShapedInfo>()) as u64;
+        });
+        bytes
     }
 
     /// Decoded-image bytes retained by the image cache (cache-gauge ledger).
@@ -1933,6 +1973,7 @@ impl GlyphCache {
         self.apply_image_cache_evictions(evicted);
         self.enforce_image_cache_byte_budget();
         self.cursor_glyphs.clear();
+        self.shape_bindings.update_config(config);
     }
 
     /// Read the current per-frame "last synced" cursor (ft-c9arc).

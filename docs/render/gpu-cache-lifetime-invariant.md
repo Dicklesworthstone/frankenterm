@@ -112,12 +112,13 @@ after a rebuild pinned that generation's atlas texture (up to 256 MiB at the
 8192^2 cap) until LFU eviction, which only happens once the cache is full. This
 fits the frozen 0.15.2 GUI's ~3 GB of "owned unmapped" GPU memory.
 
-- **Fix.** The sprites are a generation-tagged `AtlasBinding` inside
-  `CachedShape`. The `AtlasResource` invalidation (`RenderCaches::invalidate`)
-  releases every binding before `RenderState` replaces the glyph cache, and
-  `CachedShape::glyphs_at` answers only for the generation it was bound at.
-  `TermWindow::recreate_texture_atlas` also drops the fancy tab bar and modal
-  elements (which hold `Rc<CachedGlyph>`) before the replacement.
+- **Fix (superseded by ft-yccm0.4.3.4, below).** The sprites were a
+  generation-tagged `AtlasBinding` inside `CachedShape`. The `AtlasResource`
+  invalidation (`RenderCaches::invalidate`) released every binding before
+  `RenderState` replaced the glyph cache, and `CachedShape::glyphs_at` answered
+  only for the generation it was bound at. `TermWindow::recreate_texture_atlas`
+  also drops the fancy tab bar and modal elements (which hold
+  `Rc<CachedGlyph>`) before the replacement.
 - **Lint.** Struct fields whose type mentions a cache container (`LfuCache`,
   `HashMap`, …) are now roots too. The atlas owner's own maps (`GlyphCache`) are
   spared. Any other GPU-reaching cache field must be listed in
@@ -133,6 +134,26 @@ fits the frozen 0.15.2 GUI's ~3 GB of "owned unmapped" GPU memory.
   that live atlas bytes stay within 2x the atlas size. Its negative control,
   `ledger_counts_an_atlas_pinned_by_a_retained_sprite_binding`, shows that the
   ledger catches a retained binding.
+
+### The structural fix (ft-yccm0.4.3.4)
+
+The `AtlasBinding` release above was tactical: the shape cache still held atlas
+handles, and correctness depended on every rebuild path releasing them first.
+Now the class cannot occur:
+
+- **Shape cache.** `CachedShape` holds only HarfBuzz output, a `Vec<GlyphInfo>`
+  of glyph ids, clusters, advances, offsets and font indices.
+- **Sprite bindings.** The resolved sprites live in `GlyphCache::shape_bindings`,
+  keyed like the shape cache. `GlyphCache` owns the atlas, and an atlas rebuild
+  replaces the whole `GlyphCache`, so every binding dies with the atlas it points
+  into. After a rebuild, a surviving shape-cache entry re-resolves its sprites
+  from its glyph ids; it is not shaped again.
+- **Lint.** `TermWindow.shape_cache` is no longer in `ALLOWED_CACHE_FIELDS`.
+  `cache_gpu_handle` proves it reaches no GPU handle, and re-adding one fails
+  the lint.
+
+`line_to_ele_shape_cache` (whole-line shapes) still carries `ShapedInfo`s and
+stays fenced: every rebuild clears it.
 
 ## The standing rule for future caches (idea 3: weak-ref / re-resolve)
 

@@ -226,10 +226,10 @@ impl RenderCaches<'_> {
             // Unknown prior keys cannot survive either recycled authority.
             rebuild = CacheRebuild::ShapingInputs;
         }
+        // An atlas rebuild keeps the shape cache: its entries hold no sprite,
+        // and their bindings die with the replaced glyph cache (ft-yccm0.4.3.4).
         if rebuild == CacheRebuild::ShapingInputs {
             self.shapes.borrow_mut().clear();
-        } else if rebuild == CacheRebuild::AtlasSprites {
-            release_shape_atlas_bindings(self.shapes);
         }
         if rebuild >= CacheRebuild::ColoredLines {
             clear_generation_keyed_line_shape_cache(self.lines);
@@ -271,20 +271,6 @@ fn next_cache_generation(generation: usize) -> CacheGenerationAdvance {
             recycled_epoch: true,
         },
     }
-}
-
-/// Release every shape-cache entry's atlas-backed glyph sprites (ft-yccm0.2.5).
-///
-/// The HarfBuzz output stays cached; the sprites re-resolve lazily against the
-/// new atlas. Without this, an entry that is not reused after a rebuild keeps
-/// `Rc<CachedGlyph>` -> sprite -> the previous atlas texture alive until the
-/// LFU evicts it, which only happens once the cache is full.
-fn release_shape_atlas_bindings(cache: &RefCell<LfuCache<ShapeCacheKey, Rc<CachedShape>>>) {
-    let mut released = 0u64;
-    cache.borrow().for_each_resident(|_, shape| {
-        released += u64::from(shape.release_atlas_binding());
-    });
-    metrics::counter!("gui.shape_cache.atlas_bindings_released").increment(released);
 }
 
 /// Drop line-shaping results keyed by a superseded shaping-input generation.
@@ -336,6 +322,14 @@ impl super::TermWindow {
             &mut self.shape_generation,
             &mut self.quad_generation,
         );
+        // The cleared shapes' bindings can never answer again (shape ids are
+        // unique); dropping them only keeps them from crowding out live ones.
+        if rebuild == CacheRebuild::ShapingInputs
+            && let Some(render_state) = self.render_state.as_ref()
+            && let Ok(mut glyph_cache) = render_state.glyph_cache.try_borrow_mut()
+        {
+            glyph_cache.clear_shape_bindings();
+        }
         for cause in causes.causes() {
             self.record_render_invalidation(cause);
         }
@@ -1222,14 +1216,9 @@ mod tests {
         }
 
         fn seed(&self) {
-            self.shapes.borrow_mut().put(
-                shape_key(),
-                Rc::new(CachedShape::new(
-                    Vec::new(),
-                    Rc::new(Vec::new()),
-                    self.shape_generation,
-                )),
-            );
+            self.shapes
+                .borrow_mut()
+                .put(shape_key(), Rc::new(CachedShape::new(Vec::new())));
             self.lines.borrow_mut().put(
                 line_shape_key(self.shape_generation, 0),
                 empty_line_shape_item(),
@@ -1388,11 +1377,11 @@ mod tests {
         }
     }
 
+    /// A shape-cache entry for "AVfi" and the sprites resolved for it.
     fn rasterized_shape(
         fonts: &Rc<FontConfiguration>,
         metrics: &RenderMetrics,
-        generation: usize,
-    ) -> Rc<CachedShape> {
+    ) -> (Rc<CachedShape>, Rc<Vec<ShapedInfo>>) {
         let style = TextStyle::default();
         let font = fonts.resolve_font(&style).unwrap();
         let infos = font
@@ -1428,17 +1417,14 @@ mod tests {
             })
             .collect();
         let glyphs = Rc::new(ShapedInfo::process(&infos, &glyphs));
-        Rc::new(CachedShape::new(infos, glyphs, generation))
+        (Rc::new(CachedShape::new(infos)), glyphs)
     }
 
     fn colored_line(
-        shape: &Rc<CachedShape>,
-        generation: usize,
+        glyphs: &Rc<Vec<ShapedInfo>>,
         palette: &ColorPalette,
     ) -> LineToElementShapeItem {
-        let glyphs = shape
-            .glyphs_at(generation)
-            .expect("fixture shape is bound at the requested generation");
+        let glyphs = Rc::clone(glyphs);
         let attrs = CellAttributes::default();
         let config = ConfigHandle::default_config();
         let style = TextStyle::default();
@@ -1515,14 +1501,14 @@ mod tests {
             config::FontLocatorSelection::ConfigDirsOnly
         );
         let metrics = RenderMetrics::new(&fonts).unwrap();
-        let shape = rasterized_shape(&fonts, &metrics, 41);
-        let reference = rasterized_shape(&fonts, &metrics, 41);
+        let (shape, sprites) = rasterized_shape(&fonts, &metrics);
+        let (_, reference) = rasterized_shape(&fonts, &metrics);
         let old_palette = ColorPalette::default();
         let mut new_palette = old_palette.clone();
         new_palette.foreground = (0x12, 0xe4, 0x76).into();
         new_palette.background = (0x31, 0x14, 0x88).into();
-        let expected = line_witness(&colored_line(&reference, 41, &new_palette));
-        let old = line_witness(&colored_line(&shape, 41, &old_palette));
+        let expected = line_witness(&colored_line(&reference, &new_palette));
+        let old = line_witness(&colored_line(&sprites, &old_palette));
         assert_ne!(
             old.0, expected.0,
             "negative control must actually change colors"
@@ -1538,7 +1524,7 @@ mod tests {
         fixture
             .lines
             .borrow_mut()
-            .put(line_shape_key(41, 0), colored_line(&shape, 41, &old_palette));
+            .put(line_shape_key(41, 0), colored_line(&sprites, &old_palette));
         assert_eq!(
             fixture.invalidate(Cause::Palette),
             CacheRebuild::ColoredLines
@@ -1550,14 +1536,9 @@ mod tests {
         assert_eq!(fixture.survivors(), (true, false, false));
         let cached = Rc::clone(fixture.shapes.borrow_mut().get(&shape_key()).unwrap());
         assert!(Rc::ptr_eq(&cached, &shape), "no HarfBuzz cache rebuild");
-        let retained = cached
-            .glyphs_at(fixture.shape_generation)
-            .expect("a palette change keeps the current sprite binding");
-        assert!(
-            Rc::ptr_eq(&retained, &shape.glyphs_at(41).unwrap()),
-            "no sprite re-resolution"
-        );
-        let rebuilt = colored_line(&cached, fixture.shape_generation, &new_palette);
+        // The sprite binding lives in the glyph cache, which a palette change
+        // never touches, so the same sprites recolor.
+        let rebuilt = colored_line(&sprites, &new_palette);
         assert_eq!(line_witness(&rebuilt), expected);
         fixture
             .lines
@@ -1580,7 +1561,7 @@ mod tests {
         fixture
             .lines
             .borrow_mut()
-            .put(line_shape_key(41, 0), colored_line(&shape, 41, &old_palette));
+            .put(line_shape_key(41, 0), colored_line(&sprites, &old_palette));
         assert_ne!(
             line_witness(
                 fixture
@@ -1598,10 +1579,14 @@ mod tests {
         );
         assert_eq!(fixture.survivors(), (false, false, false));
         assert_eq!(fixture.shape_generation, 42);
-        let reshaped = rasterized_shape(&fonts, &metrics, fixture.shape_generation);
-        assert!(!Rc::ptr_eq(&reshaped, &shape));
+        let (reshaped, reshaped_sprites) = rasterized_shape(&fonts, &metrics);
+        assert_ne!(
+            reshaped.id(),
+            shape.id(),
+            "a re-shape never reuses a binding"
+        );
         assert_eq!(
-            line_witness(&colored_line(&reshaped, 42, &new_palette)),
+            line_witness(&colored_line(&reshaped_sprites, &new_palette)),
             expected
         );
     }
@@ -1652,7 +1637,8 @@ mod tests {
     }
 
     /// Look `text` up in the shape cache the way `cached_cluster_shape` does:
-    /// shape on a miss, then bind sprites for the current generation.
+    /// shape on a miss, then take the sprites the current glyph cache has
+    /// bound to the entry, resolving them from its HarfBuzz output if none.
     fn shape_through_cache(
         fixture: &CacheFixture,
         glyph_cache: &RefCell<GlyphCache>,
@@ -1660,7 +1646,6 @@ mod tests {
         metrics: &RenderMetrics,
         text: &str,
     ) -> (Rc<CachedShape>, Rc<Vec<ShapedInfo>>) {
-        let generation = fixture.shape_generation;
         let key = ShapeCacheKey {
             style: TextStyle::default(),
             text: text.to_string(),
@@ -1670,16 +1655,18 @@ mod tests {
             let infos = font
                 .blocking_shape(text, None, wezterm_bidi::Direction::LeftToRight, None, None)
                 .unwrap();
-            let sprites = resolve_sprites(glyph_cache, font, metrics, &infos);
-            let shape = Rc::new(CachedShape::new(infos, sprites, generation));
+            let shape = Rc::new(CachedShape::new(infos));
             fixture.shapes.borrow_mut().put(key, Rc::clone(&shape));
             shape
         });
-        let sprites = shape
-            .glyphs_for(generation, |infos| {
-                Ok(resolve_sprites(glyph_cache, font, metrics, infos))
-            })
-            .unwrap();
+        let bound = glyph_cache.borrow_mut().shape_binding(shape.id());
+        let sprites = bound.unwrap_or_else(|| {
+            let sprites = resolve_sprites(glyph_cache, font, metrics, shape.infos());
+            glyph_cache
+                .borrow_mut()
+                .bind_shape(shape.id(), Rc::clone(&sprites));
+            sprites
+        });
         assert!(
             sprites.iter().any(|info| info.glyph.texture.is_some()),
             "{text:?} must rasterize into the current atlas"
@@ -1695,10 +1682,12 @@ mod tests {
     /// key that is never looked up again. The cold keys are the 0.15.2 leak: an
     /// entry that is not reused was never refreshed, so its glyph `Rc`s pinned
     /// that generation's atlas texture until LFU eviction, and with 1,000
-    /// rebuilds the default-sized cache never fills up to evict anything. The
-    /// line cache also holds the hot shape's sprites, as `render_screen_line`
-    /// does. The rebuild is the production pair: the `AtlasResource`
-    /// invalidation followed by `replace_glyph_cache_atlas`.
+    /// rebuilds the default-sized cache never fills up to evict anything. Since
+    /// ft-yccm0.4.3.4 the entries hold no sprites; their bindings live in the
+    /// glyph cache that each rebuild replaces. The line cache also holds the hot
+    /// shape's sprites, as `render_screen_line` does. The rebuild is the
+    /// production pair: the `AtlasResource` invalidation followed by
+    /// `replace_glyph_cache_atlas`.
     #[test]
     fn thousand_atlas_rebuilds_keep_live_atlas_bytes_within_twice_the_atlas_size() {
         const REBUILDS: u64 = 1_000;
@@ -1730,7 +1719,7 @@ mod tests {
 
         for rebuild in 0..REBUILDS {
             let generation = fixture.shape_generation;
-            let (hot, _) = shape_through_cache(&fixture, &glyph_cache, &font, &metrics, "AVfi");
+            let (_, hot) = shape_through_cache(&fixture, &glyph_cache, &font, &metrics, "AVfi");
             shape_through_cache(
                 &fixture,
                 &glyph_cache,
@@ -1738,10 +1727,10 @@ mod tests {
                 &metrics,
                 &format!("cold {rebuild}"),
             );
-            fixture.lines.borrow_mut().put(
-                line_shape_key(generation, 0),
-                colored_line(&hot, generation, &palette),
-            );
+            fixture
+                .lines
+                .borrow_mut()
+                .put(line_shape_key(generation, 0), colored_line(&hot, &palette));
             drop(hot);
 
             assert_eq!(fixture.invalidate(Cause::AtlasResource), CacheRebuild::AtlasSprites);
@@ -1780,19 +1769,26 @@ mod tests {
             REBUILDS + 1,
             "the shaping output itself must survive every rebuild"
         );
-        fixture.shapes.borrow().for_each_resident(|key, shape| {
-            assert!(
-                !shape.is_atlas_bound(),
-                "{:?} still holds sprites after the final rebuild",
-                key.text
-            );
-        });
         assert!(fixture.lines.borrow().is_empty());
+        assert_eq!(
+            glyph_cache.borrow().shape_binding_bytes(),
+            0,
+            "no binding outlives the atlas it was resolved in"
+        );
+
+        // The surviving hot entry re-resolves its sprites into the current
+        // atlas without being shaped again.
+        let hot = Rc::clone(fixture.shapes.borrow_mut().get(&shape_key()).unwrap());
+        let (again, sprites) = shape_through_cache(&fixture, &glyph_cache, &font, &metrics, "AVfi");
+        assert!(Rc::ptr_eq(&again, &hot), "no re-shape after a rebuild");
+        let atlas = ledger.texture_counter(GpuTexturePurpose::Atlas);
+        assert_eq!((atlas.live_count, atlas.live_bytes), (1, atlas_bytes));
+        drop(sprites);
     }
 
     /// Negative control for the test above: a retained sprite binding (what
-    /// an unreleased shape-cache entry is) keeps its atlas visible in the
-    /// ledger, and the atlas is freed once the binding goes away.
+    /// a shape-cache entry held before ft-yccm0.4.3.4) keeps its atlas visible
+    /// in the ledger, and the atlas is freed once the binding goes away.
     #[test]
     fn ledger_counts_an_atlas_pinned_by_a_retained_sprite_binding() {
         config::use_test_configuration();
