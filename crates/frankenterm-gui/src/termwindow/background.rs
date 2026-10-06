@@ -3223,7 +3223,10 @@ mod tests {
         let cancelled = Arc::new(AtomicBool::new(false));
         lock_cache(&coordinator.state, "test coordinator").current = Some(Arc::clone(&cancelled));
         coordinator.cancel();
-        assert!(coordinator.is_settled(), "a cancelled load leaves nothing to wait for");
+        assert!(
+            coordinator.is_settled(),
+            "a cancelled load leaves nothing to wait for"
+        );
     }
 
     #[test]

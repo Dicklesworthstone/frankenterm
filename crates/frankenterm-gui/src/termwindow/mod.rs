@@ -1008,9 +1008,7 @@ fn write_metal_render_snapshot(
         .device()
         .clear_offscreen(width, height, color)
         .map_err(anyhow::Error::new)
-        .and_then(|bgra| {
-            render_snapshot::texels_to_rgba8(wgpu::TextureFormat::Bgra8Unorm, bgra)
-        })
+        .and_then(|bgra| render_snapshot::texels_to_rgba8(wgpu::TextureFormat::Bgra8Unorm, bgra))
         .and_then(|rgba| render_snapshot::write_png_atomically(path, width, height, &rgba));
     if let Err(err) = result {
         log::error!("Metal render snapshot failed: {err:#}");
