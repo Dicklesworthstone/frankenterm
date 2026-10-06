@@ -85,7 +85,10 @@ impl ViewportAnchor {
     }
 
     fn awaiting_layout(&self) -> bool {
-        !self.unavailable && self.deadline.is_some_and(|deadline| Instant::now() < deadline)
+        !self.unavailable
+            && self
+                .deadline
+                .is_some_and(|deadline| Instant::now() < deadline)
     }
 
     pub(crate) fn poll(
@@ -103,8 +106,7 @@ impl ViewportAnchor {
         // without comparing it to the *current* layout's sequence or geometry.
         let same_registration = match (&self.registration, pane.mux_registration_slot().load()) {
             (Some(Some(expected)), Some(current)) => {
-                expected.same_registration(&current)
-                    && expected.try_with_current(|_| ()).is_some()
+                expected.same_registration(&current) && expected.try_with_current(|_| ()).is_some()
             }
             (Some(None), None) | (None, _) => true,
             _ => false,
