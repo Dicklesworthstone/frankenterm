@@ -4307,11 +4307,11 @@ dependencies = [
  "frankenterm-gui-subcommands",
  "frankenterm-mux-server-impl",
  "frankenterm-open-url",
+ "frankenterm-renderer-metal",
  "frankenterm-sigpipe",
  "frankenterm-ssh",
  "frankenterm-term",
  "frankenterm-toast-notification",
- "frankenterm-renderer-metal",
  "frecency",
  "fs2",
  "futures",
@@ -4522,10 +4522,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "frankenterm-scripting"
-version = "0.1.0"
-dependencies = [
-[[package]]
 name = "frankenterm-renderer-metal"
 version = "0.15.21"
 dependencies = [
@@ -4537,6 +4533,10 @@ dependencies = [
  "raw-window-handle",
 ]
 
+[[package]]
+name = "frankenterm-scripting"
+version = "0.1.0"
+dependencies = [
  "anyhow",
  "config",
  "criterion",
