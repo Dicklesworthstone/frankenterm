@@ -282,8 +282,9 @@ fn every_lane_keeps_the_grid_invariants_on_every_corpus() {
             "{}: action counts differ: {action_counts:?}",
             corpus.name()
         );
-        // The fused, two-stage and production-config paths leave one grid.
-        assert_eq!(summaries.len(), 3, "{}", corpus.name());
+        // The fused, two-stage and production-config paths leave one grid:
+        // every lane but parse drives a terminal.
+        assert_eq!(summaries.len(), Lane::ALL.len() - 1, "{}", corpus.name());
         let (first_lane, first) = &summaries[0];
         for (lane, summary) in &summaries[1..] {
             assert_eq!(
@@ -323,7 +324,7 @@ fn the_sticky_zwj_prelude_runs_untimed_and_keeps_the_invariants() {
         assert_eq!(verdict, Ok(()), "{} lane", lane.name());
         summaries.extend(summary);
     }
-    assert_eq!(summaries.len(), 3);
+    assert_eq!(summaries.len(), Lane::ALL.len() - 1);
     assert!(
         summaries.windows(2).all(|pair| pair[0] == pair[1]),
         "the terminal lanes diverge after the prelude"

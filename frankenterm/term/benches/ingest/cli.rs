@@ -22,7 +22,8 @@ or run every lane through cargo bench, whose [profile.bench] mirrors release-per
   cargo bench -p frankenterm-term --bench ingest_throughput [-- OPTIONS]
 
 Options:
-  --lane L          parse | term | mux_two_stage | prod_config | all (default all);
+  --lane L          parse | term | mux_two_stage | prod_config | mux_fused |
+                    prod_config_fused | all (default all);
                     comma-separated lists are accepted
   --corpus C        color_emoji_random (default) | color_random | seq_lines |
                     long_lines | unicode_mix | tui_repaint | all; comma-separated

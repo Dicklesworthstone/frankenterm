@@ -1,12 +1,17 @@
-//! The four ingest lanes and the end-state sanity checks.
+//! The six ingest lanes and the end-state sanity checks.
 //!
 //! - `parse`: `Parser::parse` into a reused `Vec<Action>`, cleared per chunk.
 //! - `term`: `Terminal::advance_bytes` per chunk (the fused single-stage path).
 //! - `mux_two_stage`: `Parser::parse` into a fresh `Vec<Action>` per chunk, then
-//!   `Terminal::perform_actions`, the shape of the mux parse thread
-//!   (`parse_buffered_data` in `frankenterm/mux/src/lib.rs`).
+//!   `Terminal::perform_actions`, the mux parse thread's shape before
+//!   ft-yccm0.3.2.1 (`parse_buffered_data` in `frankenterm/mux/src/lib.rs`).
 //! - `prod_config`: `mux_two_stage` with [`ProdConfig`], which pays the GUI's
 //!   per-read configuration cost (mutex lock + `Arc` clone).
+//! - `mux_fused`: the mux parse thread's fused path (ft-yccm0.3.2.1): its own
+//!   parser feeds the terminal through `Terminal::feed`, and actions the gate
+//!   diverts (alert sources and synchronized-output controls, as the mux
+//!   gate does) are applied afterwards with `perform_actions`.
+//! - `prod_config_fused`: `mux_fused` with [`ProdConfig`], the GUI's path.
 //!
 //! Timing covers the ingest loop only: terminal construction, the end-state
 //! summary and dropping the terminal fall outside it.
@@ -21,12 +26,13 @@ use std::time::Instant;
 
 use frankenterm_cell::UnicodeVersion;
 use frankenterm_escape_parser::parser::Parser;
+use frankenterm_escape_parser::{Action, ControlCode, Esc, EscCode, CSI};
 use frankenterm_surface::line::MonospaceKpCostModel;
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::config::{
     BidiMode, NewlineCanon, Osc52WritePolicy, ScrollbackTierConfig, TerminalConfigurationRevision,
 };
-use frankenterm_term::{Terminal, TerminalConfiguration, TerminalSize};
+use frankenterm_term::{FeedGate, Terminal, TerminalConfiguration, TerminalSize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Lane {
@@ -34,10 +40,19 @@ pub enum Lane {
     Term,
     MuxTwoStage,
     ProdConfig,
+    MuxFused,
+    ProdConfigFused,
 }
 
 impl Lane {
-    pub const ALL: [Lane; 4] = [Lane::Parse, Lane::Term, Lane::MuxTwoStage, Lane::ProdConfig];
+    pub const ALL: [Lane; 6] = [
+        Lane::Parse,
+        Lane::Term,
+        Lane::MuxTwoStage,
+        Lane::ProdConfig,
+        Lane::MuxFused,
+        Lane::ProdConfigFused,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -45,7 +60,14 @@ impl Lane {
             Lane::Term => "term",
             Lane::MuxTwoStage => "mux_two_stage",
             Lane::ProdConfig => "prod_config",
+            Lane::MuxFused => "mux_fused",
+            Lane::ProdConfigFused => "prod_config_fused",
         }
+    }
+
+    /// Whether the lane pays the GUI's configuration cost ([`ProdConfig`]).
+    pub fn uses_prod_config(self) -> bool {
+        matches!(self, Lane::ProdConfig | Lane::ProdConfigFused)
     }
 
     /// Accepts the canonical name with `-` or `_` separators.
@@ -272,9 +294,10 @@ impl TerminalConfiguration for ProdConfig {
     }
 }
 
-/// Builds the terminal a lane drives. Only `prod_config` uses [`ProdConfig`].
+/// Builds the terminal a lane drives. Only the `prod_config` lanes use
+/// [`ProdConfig`].
 pub fn new_terminal(lane: Lane, geometry: &Geometry) -> Terminal {
-    let config: Arc<dyn TerminalConfiguration + Send + Sync> = if lane == Lane::ProdConfig {
+    let config: Arc<dyn TerminalConfiguration + Send + Sync> = if lane.uses_prod_config() {
         Arc::new(ProdConfig::new(geometry.scrollback))
     } else {
         Arc::new(BenchConfig::new(geometry.scrollback))
@@ -301,8 +324,8 @@ pub struct LaneRun {
     /// Untimed bytes fed first (`--sticky-zwj`).
     pub prelude_bytes: usize,
     pub secs: f64,
-    /// Parser actions produced. `None` for `term`, whose fused parser hands
-    /// each action straight to the performer.
+    /// Parser actions produced. `None` for the fused lanes, whose parser
+    /// hands each action straight to the performer.
     pub actions: Option<u64>,
     /// The final terminal; `None` for `parse`.
     pub terminal: Option<Terminal>,
@@ -332,6 +355,33 @@ fn count(actions: usize) -> u64 {
 /// whole run. That is the ft-yccm0.2.14 scenario, a pane that once printed a
 /// split ZWJ emoji.
 pub const STICKY_ZWJ_PRELUDE: &[u8] = "\u{1F468}\u{200D}\r\n".as_bytes();
+
+/// What the mux's fused gate diverts (`FusedFeedGate` in
+/// `frankenterm/mux/src/localpane.rs`): every alert source and the
+/// synchronized-output controls.
+struct MuxGate;
+
+impl FeedGate for MuxGate {
+    fn diverts(&mut self, action: &Action) -> bool {
+        use frankenterm_escape_parser::csi::{DecPrivateMode, DecPrivateModeCode, Device, Mode};
+        match action {
+            Action::Control(ControlCode::Bell)
+            | Action::OperatingSystemCommand(_)
+            | Action::KittyImage(_)
+            | Action::Esc(Esc::Code(EscCode::StringTerminator | EscCode::FullReset)) => true,
+            Action::CSI(CSI::Mode(
+                Mode::SetDecPrivateMode(code)
+                | Mode::ResetDecPrivateMode(code)
+                | Mode::QueryDecPrivateMode(code),
+            )) => matches!(
+                code,
+                DecPrivateMode::Code(DecPrivateModeCode::SynchronizedOutput)
+            ),
+            Action::CSI(CSI::Device(device)) => matches!(**device, Device::SoftReset),
+            _ => false,
+        }
+    }
+}
 
 /// Feeds `prelude` untimed, then `data` timed, through `lane` in
 /// `geometry.chunk`-sized pieces.
@@ -368,6 +418,31 @@ pub fn run_lane(lane: Lane, prelude: &[u8], data: &[u8], geometry: &Geometry) ->
             let start = Instant::now();
             for piece in data.chunks(chunk) {
                 terminal.advance_bytes(piece);
+            }
+            let secs = start.elapsed().as_secs_f64();
+            LaneRun {
+                lane,
+                bytes: data.len(),
+                prelude_bytes: prelude.len(),
+                secs,
+                actions: None,
+                terminal: Some(terminal),
+            }
+        }
+        Lane::MuxFused | Lane::ProdConfigFused => {
+            let mut terminal = new_terminal(lane, geometry);
+            let mut parser = Parser::new();
+            let mut diverted = Vec::new();
+            if !prelude.is_empty() {
+                terminal.feed(&mut parser, prelude, &mut MuxGate, &mut diverted);
+                terminal.perform_actions(std::mem::take(&mut diverted));
+            }
+            let start = Instant::now();
+            for piece in data.chunks(chunk) {
+                terminal.feed(&mut parser, piece, &mut MuxGate, &mut diverted);
+                if !diverted.is_empty() {
+                    terminal.perform_actions(std::mem::take(&mut diverted));
+                }
             }
             let secs = start.elapsed().as_secs_f64();
             LaneRun {
