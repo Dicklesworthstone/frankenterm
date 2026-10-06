@@ -15794,10 +15794,22 @@ mod tests {
             let before = AUTHORITY_LEASE_ACQUISITIONS.with(std::cell::Cell::get);
             sink.persist_manifest("complete")
                 .expect("publish and acknowledge the authenticated manifest");
+            // ft-yccm0.2.1.5 split manifest publication the way append-WAL
+            // publication already was: the signing key is resolved under the
+            // keyring mutex with its own brief exclusive lease, released
+            // before one shared lease authenticates the staged and published
+            // manifest. The publication's I/O no longer holds the process-wide
+            // mutex, so it no longer convoys other panes. Acknowledgement
+            // still runs under a single lease.
             assert_eq!(
                 AUTHORITY_LEASE_ACQUISITIONS.with(std::cell::Cell::get),
-                before + 1,
-                "manifest sealing and acknowledgement must share one durable authority lease"
+                before + 2,
+                "one lease resolves the signing key, one authenticates and acknowledges"
+            );
+            assert_eq!(
+                LIVE_SCROLLBACK_KEYRING_FREE_AT_RENAME.with(std::cell::Cell::get),
+                Some(true),
+                "the manifest rename runs without the keyring mutex"
             );
         }
         // Rotation must be able to acquire the released scope, and reopening
