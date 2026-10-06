@@ -33,6 +33,12 @@
 //!
 //! Focus and selection are applied in the paint that first sees the
 //! snapshot title, and the snapshot is taken by the next paint.
+//!
+//! A snapshot paint whose frame is not final yet takes nothing and re-arms
+//! the request (see [`SnapshotFrameReadiness`]): a fallback font still
+//! resolving, the window background still loading, or an image whose first
+//! frame is still decoding on a worker, which the frame shows as a
+//! transparent placeholder.
 
 use anyhow::Context;
 use std::path::{Path, PathBuf};
@@ -230,9 +236,35 @@ impl RenderSnapshotRequest {
     }
 
     /// Returns a claimed snapshot to pending: the frame was not final yet
-    /// (fallback fonts still resolving), so a later paint takes it.
+    /// (see [`SnapshotFrameReadiness`]), so a later paint takes it.
     pub(crate) fn rearm(&mut self) {
         self.taken = false;
+    }
+}
+
+/// What can keep a claimed snapshot paint from being the final frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SnapshotFrameReadiness {
+    /// A fallback font resolve is in flight, or resolved but not applied.
+    pub(crate) fonts_pending: bool,
+    /// The configured window background is still loading.
+    pub(crate) background_loading: bool,
+    /// An image in the frame is a transparent placeholder while its first
+    /// frame decodes on a worker.
+    pub(crate) images_loading: bool,
+}
+
+impl SnapshotFrameReadiness {
+    pub(crate) fn is_final(self) -> bool {
+        !(self.fonts_pending || self.background_loading || self.images_loading)
+    }
+
+    /// Whether the deferred snapshot must schedule its own repaint. Fallback
+    /// font and background completions invalidate the window, but a finished
+    /// image decode wakes nothing: it is only seen when a later paint polls
+    /// the decoder, and an unfocused window schedules no animation frame.
+    pub(crate) fn needs_poll(self) -> bool {
+        self.images_loading
     }
 }
 
@@ -474,6 +506,33 @@ mod tests {
             take("/tmp/a.png"),
             "a re-armed snapshot is claimable again"
         );
+    }
+
+    #[test]
+    fn a_frame_is_final_only_when_nothing_is_pending() {
+        assert!(SnapshotFrameReadiness::default().is_final());
+        let pending = [
+            SnapshotFrameReadiness {
+                fonts_pending: true,
+                ..Default::default()
+            },
+            SnapshotFrameReadiness {
+                background_loading: true,
+                ..Default::default()
+            },
+            SnapshotFrameReadiness {
+                images_loading: true,
+                ..Default::default()
+            },
+        ];
+        for readiness in pending {
+            assert!(!readiness.is_final(), "{readiness:?} is not final");
+        }
+        // Only a decoding image needs the snapshot to poll for its repaint.
+        assert!(pending[2].needs_poll());
+        assert!(!pending[0].needs_poll());
+        assert!(!pending[1].needs_poll());
+        assert!(!SnapshotFrameReadiness::default().needs_poll());
     }
 
     fn lookup<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {

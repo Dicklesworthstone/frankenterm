@@ -1,5 +1,5 @@
 use crate::colorease::ColorEaseUniform;
-use crate::termwindow::render_snapshot::WebGpuDrawTarget;
+use crate::termwindow::render_snapshot::{SnapshotFrameReadiness, WebGpuDrawTarget};
 use crate::termwindow::webgpu::ShaderUniform;
 use crate::uniforms::UniformBuilder;
 use ::window::glium;
@@ -64,24 +64,34 @@ impl crate::TermWindow {
         use crate::renderstate::LedgeredTexture;
         use crate::termwindow::webgpu::WebGpuTexture;
 
-        // ft-yccm0.1.10: this frame's shaping has run. If it asked for a
-        // fallback font, a resolved fallback has not been applied yet, or the
-        // configured window background is still loading, the frame is not
-        // final: re-arm, and the repaint that follows the completion (each
-        // invalidates the window) takes the snapshot.
+        // ft-yccm0.1.10: this frame's shaping and quads are built. If it
+        // asked for a fallback font, a resolved fallback has not been applied
+        // yet, the configured window background is still loading, or an image
+        // is still a placeholder for its decoding first frame, the frame is
+        // not final: re-arm. Font and background completions invalidate the
+        // window; a decoding image is polled at the decoder's next due time.
         if matches!(target, WebGpuDrawTarget::Snapshot(_)) {
-            let fonts_pending = self.fonts.fallback_resolves_in_flight() > 0
-                || self
-                    .fallback_invalidation_pending
-                    .load(std::sync::atomic::Ordering::Acquire);
-            let background_pending = !self.background_load.is_settled();
-            if fonts_pending || background_pending {
+            let readiness = SnapshotFrameReadiness {
+                fonts_pending: self.fonts.fallback_resolves_in_flight() > 0
+                    || self
+                        .fallback_invalidation_pending
+                        .load(std::sync::atomic::Ordering::Acquire),
+                background_loading: !self.background_load.is_settled(),
+                images_loading: self.images_loading.get(),
+            };
+            if !readiness.is_final() {
                 if let Some(request) = self.render_snapshot.as_mut() {
                     request.rearm();
                 }
-                log::info!(
-                    "render snapshot deferred: fallback fonts pending={fonts_pending}, background loading={background_pending}"
-                );
+                if readiness.needs_poll() {
+                    let now = std::time::Instant::now();
+                    let due = self
+                        .has_animation
+                        .borrow()
+                        .unwrap_or(now + std::time::Duration::from_millis(16));
+                    self.schedule_animation_wake(due);
+                }
+                log::info!("render snapshot deferred: {readiness:?}");
                 return Ok(());
             }
         }

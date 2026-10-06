@@ -2450,6 +2450,10 @@ pub struct TermWindow {
     /// Image-parity corpus snapshot request (ft-yccm0.1.10); `None` unless
     /// `FRANKENTERM_RENDER_SNAPSHOT` was set at window creation.
     render_snapshot: Option<render_snapshot::RenderSnapshotRequest>,
+    /// Set when the current paint pass drew an image whose first frame was
+    /// still decoding, so the frame shows a transparent placeholder for it.
+    /// Reset by every paint pass; a render snapshot of such a frame waits.
+    images_loading: Cell<bool>,
     config_subscription: Option<config::ConfigSubscription>,
 
     /// Per-pane agent state classification, updated each render tick.
@@ -4613,6 +4617,7 @@ impl TermWindow {
             webgpu: None,
             metal: None,
             render_snapshot: render_snapshot::RenderSnapshotRequest::from_env(),
+            images_loading: Cell::new(false),
             window: None,
             window_background,
             background_load: BackgroundLoadCoordinator::default(),
@@ -5251,6 +5256,15 @@ impl TermWindow {
                 None
             }
             render_snapshot::SnapshotStep::Take(path) => Some(path),
+        }
+    }
+
+    /// Records an image drawn in this paint pass by its cache load state:
+    /// `Loading` means the frame holds a transparent placeholder while the
+    /// image's first frame decodes on a worker.
+    pub(crate) fn note_image_load_state(&self, load_state: crate::glyphcache::LoadState) {
+        if load_state == crate::glyphcache::LoadState::Loading {
+            self.images_loading.set(true);
         }
     }
 

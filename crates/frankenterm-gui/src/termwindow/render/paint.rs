@@ -32,6 +32,21 @@ struct PostPresentWork {
     animation_due: Option<Instant>,
     should_schedule_animation: bool,
     should_force_frame_budget_paint: bool,
+    /// The frame drew an image whose first frame was still decoding.
+    images_loading: bool,
+}
+
+impl PostPresentWork {
+    /// When to wake for the next animation frame. Animations run only in a
+    /// focused window and within the frame budget. An image whose first frame
+    /// is still decoding is not motion: its decoder is polled until it shows,
+    /// focused or not, because a finished decode wakes nothing and the image
+    /// would otherwise stay a transparent placeholder until an unrelated
+    /// repaint.
+    fn animation_wake(self, focused: bool) -> Option<Instant> {
+        let wanted = self.images_loading || (focused && self.should_schedule_animation);
+        self.animation_due.filter(|_| wanted)
+    }
 }
 
 const MAX_PAINT_PASSES: usize = 16;
@@ -248,6 +263,7 @@ impl crate::TermWindow {
                 animation_due,
                 should_schedule_animation,
                 should_force_frame_budget_paint,
+                images_loading: self.images_loading.get(),
             },
         })
     }
@@ -333,10 +349,8 @@ impl crate::TermWindow {
             }
         }
 
-        if self.focused.is_some() && outcome.post_present.should_schedule_animation {
-            if let Some(next_due) = outcome.post_present.animation_due {
-                self.schedule_animation_wake(next_due);
-            }
+        if let Some(next_due) = outcome.post_present.animation_wake(self.focused.is_some()) {
+            self.schedule_animation_wake(next_due);
         }
     }
 
@@ -364,6 +378,7 @@ impl crate::TermWindow {
         for state in self.pane_state.borrow_mut().values_mut() {
             state.selection_frame.begin_attempt();
         }
+        self.images_loading.set(false);
         {
             let gl_state = self
                 .render_state
@@ -515,5 +530,51 @@ impl crate::TermWindow {
         self.paint_modal().context("paint_modal")?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn work(due: Option<Instant>, schedule: bool, images_loading: bool) -> PostPresentWork {
+        PostPresentWork {
+            animation_due: due,
+            should_schedule_animation: schedule,
+            should_force_frame_budget_paint: false,
+            images_loading,
+        }
+    }
+
+    #[test]
+    fn animations_wake_only_a_focused_window_within_budget() {
+        let due = Instant::now() + Duration::from_millis(16);
+        assert_eq!(work(Some(due), true, false).animation_wake(true), Some(due));
+        assert_eq!(work(Some(due), true, false).animation_wake(false), None);
+        assert_eq!(
+            work(Some(due), false, false).animation_wake(true),
+            None,
+            "reduce motion or frame pressure skips the animation"
+        );
+        assert_eq!(work(None, true, false).animation_wake(true), None);
+    }
+
+    #[test]
+    fn a_decoding_image_is_polled_focused_or_not() {
+        let due = Instant::now() + Duration::from_millis(16);
+        for focused in [false, true] {
+            for schedule in [false, true] {
+                assert_eq!(
+                    work(Some(due), schedule, true).animation_wake(focused),
+                    Some(due),
+                    "focused={focused} schedule={schedule}"
+                );
+            }
+        }
+        assert_eq!(
+            work(None, false, true).animation_wake(false),
+            None,
+            "a failed decode has no next poll"
+        );
     }
 }
