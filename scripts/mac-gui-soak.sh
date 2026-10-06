@@ -12,6 +12,9 @@
 #                        ingest_throughput example with --gen-only)
 #   --no-atlas-growth    leave out the generated atlas-growth corpus
 #   --gpu-budget-mib N   GPU-owned budget for the verdict (default 1024)
+#   --env NAME=VALUE     extra variable for the GUI's isolated environment,
+#                        e.g. _RJEM_MALLOC_CONF=background_thread:true for
+#                        jemalloc tuning runs (repeatable; recorded in the receipt)
 #   --out DIR            run directory (default ./soak-runs/<UTC stamp>)
 #   --self-test          2-minute run, a bundle every 15 s, resize every 30 s
 #   --dry-run            print the plan and the isolated environment only
@@ -51,6 +54,7 @@ RESIZE_INTERVAL="10m"
 CORPUS_DIR=""
 ATLAS_GROWTH=1
 GPU_BUDGET_MIB=1024
+EXTRA_ENV=()
 OUT=""
 SELF_TEST=0
 DRY_RUN=0
@@ -85,6 +89,9 @@ while [[ $# -gt 0 ]]; do
     --corpus-dir) CORPUS_DIR="$2"; shift 2 ;;
     --no-atlas-growth) ATLAS_GROWTH=0; shift ;;
     --gpu-budget-mib) GPU_BUDGET_MIB="$2"; shift 2 ;;
+    --env)
+      [[ "$2" == [A-Za-z_]*=* ]] || die "--env needs NAME=VALUE"
+      EXTRA_ENV+=("$2"); shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
     --self-test) SELF_TEST=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -274,14 +281,14 @@ if [[ -n "$CORPUS_DIR" ]]; then
 fi
 
 if [[ "$DRY_RUN" == 1 ]]; then
-  echo "plan: ${ISO_ENV[*]} $GUI_BIN start --always-new-process -- /bin/bash $RUN/workload.sh $STOP $IDLE_S ${CORPUS_DIRS[*]}"
+  echo "plan: ${ISO_ENV[*]} ${EXTRA_ENV[*]+${EXTRA_ENV[*]}} $GUI_BIN start --always-new-process -- /bin/bash $RUN/workload.sh $STOP $IDLE_S ${CORPUS_DIRS[*]}"
   echo "corpora:"; ls -l "$CORPUS"
   exit 0
 fi
 
 PROBE="$(isolation_probe)"
 LOAD_START="$(sysctl -n vm.loadavg)"
-"${ISO_ENV[@]}" "$GUI_BIN" start --always-new-process -- \
+"${ISO_ENV[@]}" ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} "$GUI_BIN" start --always-new-process -- \
   /bin/bash "$RUN/workload.sh" "$STOP" "$IDLE_S" "${CORPUS_DIRS[@]}" \
   >"$RUN/gui.stdout" 2>"$RUN/gui.stderr" &
 GUI_PID=$!
@@ -351,7 +358,7 @@ SOAK_GUI_BIN="$GUI_BIN" SOAK_RUN="$RUN" SOAK_DURATION_S="$DURATION_S" SOAK_ELAPS
   SOAK_SAMPLE_S="$SAMPLE_S" SOAK_SAMPLES="$SAMPLES" SOAK_RESIZES_OK="$RESIZES_OK" \
   SOAK_RESIZE_UNAVAILABLE="$RESIZE_UNAVAILABLE" SOAK_PROBE="$PROBE" SOAK_GUI_DIED="$GUI_DIED" \
   SOAK_LOAD_START="$LOAD_START" SOAK_LOAD_END="$LOAD_END" SOAK_GPU_BUDGET_MIB="$GPU_BUDGET_MIB" \
-  SOAK_ADVISORY="$ADVISORY" \
+  SOAK_ADVISORY="$ADVISORY" SOAK_EXTRA_ENV="$(printf '%s\n' ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"})" \
   python3 -I - "$RUN/growth.json" "$RUN/receipt.json" <<'PY'
 import json, os, sys
 
@@ -379,6 +386,7 @@ receipt = {
     "gpu_budget_mib": int(env["SOAK_GPU_BUDGET_MIB"]),
     "growth_verdict": verdict,
     "growth_verdict_advisory": advisory,
+    "extra_env": [line for line in env["SOAK_EXTRA_ENV"].splitlines() if line],
 }
 receipt["pass"] = (not receipt["gui_exited_early"]) and receipt["bundles_captured"] >= 4 and (
     advisory or verdict.get("pass", False))

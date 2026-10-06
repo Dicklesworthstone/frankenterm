@@ -225,11 +225,11 @@ pub fn show_debug_overlay(
         use frankenterm_alloc::resource_ledger::{
             AllocatorSnapshot, CacheGauges, GpuResourceLedger, ResourceSnapshotBody,
         };
-        let mut lines = ResourceSnapshotBody::from_ledgers(
-            GpuResourceLedger::global(),
-            CacheGauges::global(),
-        )
-        .summary_lines();
+        let body =
+            ResourceSnapshotBody::from_ledgers(GpuResourceLedger::global(), CacheGauges::global());
+        let mut lines = body.summary_lines();
+        // ft-yccm0.1.5 / ft-yccm0.2.1.1: terminal-lock and durability lines.
+        lines.extend(body.lock_and_durability_lines());
         lines.push(AllocatorSnapshot::read().summary_line());
         lines.join("\r\n")
     };

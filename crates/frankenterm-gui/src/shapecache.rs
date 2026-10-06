@@ -95,6 +95,18 @@ pub struct CachedShape {
     binding: RefCell<Option<AtlasBinding>>,
 }
 
+/// Heap bytes of the per-glyph cluster text that `GlyphInfo` retains only in
+/// builds with debug assertions (for diagnostics); release builds have none.
+#[cfg(debug_assertions)]
+fn glyph_text_bytes(infos: &[GlyphInfo]) -> usize {
+    infos.iter().map(|info| info.text.capacity()).sum()
+}
+
+#[cfg(not(debug_assertions))]
+fn glyph_text_bytes(_infos: &[GlyphInfo]) -> usize {
+    0
+}
+
 #[derive(Debug)]
 struct AtlasBinding {
     /// The `shape_generation` at which `glyphs` was resolved.
@@ -145,12 +157,8 @@ impl CachedShape {
     /// bound sprite vector. The glyphs and atlas are owned by the glyph cache
     /// and are not counted here.
     pub fn accounted_bytes(&self) -> u64 {
-        let infos = self.infos.capacity() * std::mem::size_of::<GlyphInfo>()
-            + self
-                .infos
-                .iter()
-                .map(|info| info.text.capacity())
-                .sum::<usize>();
+        let infos =
+            self.infos.capacity() * std::mem::size_of::<GlyphInfo>() + glyph_text_bytes(&self.infos);
         let binding = self.binding.borrow().as_ref().map_or(0, |binding| {
             std::mem::size_of::<Vec<ShapedInfo>>()
                 + binding.glyphs.capacity() * std::mem::size_of::<ShapedInfo>()
@@ -820,8 +828,8 @@ mod test {
         use std::mem::size_of;
 
         let (infos, _glyphs, run) = fake_shaped_run(5);
-        let infos_bytes = infos.capacity() * size_of::<GlyphInfo>()
-            + infos.iter().map(|info| info.text.capacity()).sum::<usize>();
+        let infos_bytes =
+            infos.capacity() * size_of::<GlyphInfo>() + super::glyph_text_bytes(&infos);
         let run_bytes = size_of::<Vec<ShapedInfo>>() + run.capacity() * size_of::<ShapedInfo>();
         let shape = CachedShape::new(infos, Rc::new(run), 0);
         let bound = shape.accounted_bytes();
