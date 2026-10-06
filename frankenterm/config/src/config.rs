@@ -255,6 +255,31 @@ pub struct Config {
     #[dynamic(default = "default_scrollback_durability_queue_max_mb")]
     pub scrollback_durability_queue_max_mb: usize,
 
+    /// Commit window (ms) of the durability writer (ft-yccm0.2.1.2): a pane's
+    /// queued rows wait up to this long after the first one, then go to the
+    /// store in one transaction. 0 commits every request at once.
+    /// `FT_DURABILITY_COMMIT_WINDOW_MS` overrides it for A/B runs.
+    #[dynamic(
+        default = "default_scrollback_durability_commit_window_ms",
+        validate = "validate_scrollback_durability_commit_window_ms"
+    )]
+    pub scrollback_durability_commit_window_ms: u64,
+
+    /// A commit window closes early once this many MiB are queued.
+    #[dynamic(
+        default = "default_scrollback_durability_commit_window_mb",
+        validate = "validate_scrollback_durability_commit_window_mb"
+    )]
+    pub scrollback_durability_commit_window_mb: usize,
+
+    /// A commit window closes early once its pane has queued no row for
+    /// this many milliseconds (the burst ended).
+    #[dynamic(
+        default = "default_scrollback_durability_commit_idle_ms",
+        validate = "validate_scrollback_durability_commit_window_ms"
+    )]
+    pub scrollback_durability_commit_idle_ms: u64,
+
     // -- Agent pane state detection --
     /// Enable agent pane state detection and visual indicators.
     #[dynamic(default = "default_true")]
@@ -2328,6 +2353,43 @@ fn default_scrollback_durability_queue_max_mb() -> usize {
     64
 }
 
+/// Longest durability commit window or idle threshold, in milliseconds.
+pub const MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MS: u64 = 5_000;
+/// Largest durability commit window, in MiB.
+pub const MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MB: usize = 256;
+
+fn default_scrollback_durability_commit_window_ms() -> u64 {
+    250
+}
+
+fn default_scrollback_durability_commit_window_mb() -> usize {
+    8
+}
+
+fn default_scrollback_durability_commit_idle_ms() -> u64 {
+    25
+}
+
+fn validate_scrollback_durability_commit_window_ms(value: &u64) -> Result<(), String> {
+    if *value <= MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MS {
+        Ok(())
+    } else {
+        Err(format!(
+            "durability commit times must be in 0..={MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MS} ms, got {value}"
+        ))
+    }
+}
+
+fn validate_scrollback_durability_commit_window_mb(value: &usize) -> Result<(), String> {
+    if (1..=MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MB).contains(value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "scrollback_durability_commit_window_mb must be in 1..={MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MB}, got {value}"
+        ))
+    }
+}
+
 fn default_agent_active_threshold_ms() -> u64 {
     5_000
 }
@@ -3462,6 +3524,27 @@ mod tests {
         assert!(validate_max_fps(&MIN_MAX_FPS).is_ok());
         assert!(validate_max_fps(&default_max_fps()).is_ok());
         assert!(validate_max_fps(&MAX_MAX_FPS).is_ok());
+    }
+
+    #[test]
+    fn durability_commit_window_keys_validate_their_ranges() {
+        let config = Config::default_config();
+        assert_eq!(config.scrollback_durability_commit_window_ms, 250);
+        assert_eq!(config.scrollback_durability_commit_window_mb, 8);
+        assert_eq!(config.scrollback_durability_commit_idle_ms, 25);
+        for ms in [0, 250, MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MS] {
+            assert!(validate_scrollback_durability_commit_window_ms(&ms).is_ok());
+        }
+        assert!(validate_scrollback_durability_commit_window_ms(
+            &(MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MS + 1)
+        )
+        .is_err());
+        for mb in [1, 8, MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MB] {
+            assert!(validate_scrollback_durability_commit_window_mb(&mb).is_ok());
+        }
+        for mb in [0, MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MB + 1] {
+            assert!(validate_scrollback_durability_commit_window_mb(&mb).is_err());
+        }
     }
 
     #[test]

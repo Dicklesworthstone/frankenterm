@@ -6516,7 +6516,8 @@ impl LocalPane {
     fn request_scrollback_durability_on_close(&self) {
         let sink = self.scrollback_flush_sink.lock().clone();
         if let Some(sink) = sink {
-            if let Err(error) = sink.request_scrollback_flush() {
+            // Close ends the commit window: no further rows will join it.
+            if let Err(error) = sink.request_scrollback_commit() {
                 log::warn!(
                     "pane {} closed with scrollback durability degraded: {error}",
                     self.pane_id

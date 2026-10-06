@@ -352,6 +352,41 @@ If you are tuning a live deployment and do not know where to start, use this ord
 
 The default configuration is intentionally conservative. For most fleets, the right first move is to leave most keys alone and adjust only the small set of knobs tied to the subsystem that is already showing stress.
 
+## Durable Scrollback Writer (GUI and mux config)
+
+These keys live in the GUI and mux config (`frankenterm.lua`, `wezterm.lua` or
+`frankenterm.toml`), not in `ft.toml`. One `scrollback-durability` thread per
+process stores every pane's evicted scrollback rows. The keys are
+process-wide, and each new pane applies their current values.
+
+| Key | Default | Range | What it controls |
+| --- | --- | --- | --- |
+| `scrollback_durability_queue_max_mb` | `64` | any | Byte budget for rows queued behind the writer, shared by all panes. Past it, a pane's oldest queued rows are dropped from durability and recorded as an explicit gap marker instead of throttling the pane (ft-yccm0.2.1.6; see `docs/resource-pressure-cockpit-contract.md`). |
+| `scrollback_durability_commit_window_ms` | `250` | `0..=5000` | Commit window. A pane's queued rows wait up to this long after the first one, then go to the store in one transaction with one set of syncs (ft-yccm0.2.1.2). `0` commits every handoff at once. |
+| `scrollback_durability_commit_window_mb` | `8` | `1..=256` | Closes a window early once this many MiB are queued. |
+| `scrollback_durability_commit_idle_ms` | `25` | `0..=5000` | Closes a window early once its pane has queued no row for this long, so a burst commits as soon as it ends. |
+
+Other events close a window at once:
+
+- a full batch (the store's 4,096-row transaction limit);
+- an overload gap, or a queue past half its budget;
+- an explicit flush, such as a checkpoint;
+- the pane closing.
+
+For A/B runs, `FT_DURABILITY_COMMIT_WINDOW_MS` overrides the window, up to
+5000 ms.
+
+**Tradeoff.**
+
+- **Longer windows.** Rows from many parse batches share one transaction,
+  which cuts syncs, renames and manifest publications per row.
+- **Exposure.** Rows sit in memory, not on disk, until their window closes. A
+  crash loses the queued rows: about one window of output when the writer
+  keeps up, up to the queue budget when it is behind.
+- **Overload.** Under a flood, the batch limit closes windows long before the
+  window age does, so the window mainly saves IO for interactive output and
+  moderate streams.
+
 ## GUI Performance Advisories (`FT-TUNE` codes)
 
 These advisories cover the GUI config (`frankenterm.lua`, `wezterm.lua` or `frankenterm.toml`), not `ft.toml`. Each one names a setting that costs throughput or responsiveness without any other sign. The codes are stable and are never reused.

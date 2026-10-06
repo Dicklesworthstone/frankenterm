@@ -457,12 +457,41 @@ mod deferred_scrollback {
         /// Only the process-wide writer publishes to `DurabilityLedger`
         /// (`ft doctor --json`); private test writers do not.
         publishes: AtomicBool,
+        /// Commit window policy (ft-yccm0.2.1.2), see [`CommitPolicy`].
+        window_ms: AtomicU64,
+        window_bytes: AtomicUsize,
+        idle_ms: AtomicU64,
+    }
+
+    /// When the writer commits a pane's queued rows (ft-yccm0.2.1.2). A
+    /// commit window opens with the first queued row and closes, and the
+    /// rows go to the store, once it is `window` old, its pane has queued
+    /// nothing for `idle`, it holds `window_bytes` or a full batch, the
+    /// pane closes or flushes, or the queue is under pressure. Rows from
+    /// many parse batches thus share one transaction and its syncs.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct CommitPolicy {
+        pub window: Duration,
+        pub window_bytes: usize,
+        pub idle: Duration,
+    }
+
+    impl Default for CommitPolicy {
+        fn default() -> Self {
+            Self {
+                window: Duration::from_millis(250),
+                window_bytes: 8 * 1024 * 1024,
+                idle: Duration::from_millis(25),
+            }
+        }
     }
 
     #[derive(Default)]
     struct WriterQueue {
         ready: VecDeque<Arc<DeferredScrollbackSpillSink>>,
         backoff: Vec<(Instant, Arc<DeferredScrollbackSpillSink>)>,
+        /// Sinks whose commit window is still open, with its closing time.
+        windows: Vec<(Instant, Arc<DeferredScrollbackSpillSink>)>,
         shutdown: bool,
     }
 
@@ -500,7 +529,20 @@ mod deferred_scrollback {
                 budget: AtomicUsize::new(DEFAULT_QUEUE_BUDGET_BYTES),
                 queued_bytes: AtomicUsize::new(0),
                 publishes: AtomicBool::new(false),
+                window_ms: AtomicU64::new(0),
+                window_bytes: AtomicUsize::new(0),
+                idle_ms: AtomicU64::new(0),
             });
+            let policy = CommitPolicy::default();
+            shared
+                .window_ms
+                .store(duration_ms(policy.window), Ordering::Release);
+            shared
+                .window_bytes
+                .store(policy.window_bytes, Ordering::Release);
+            shared
+                .idle_ms
+                .store(duration_ms(policy.idle), Ordering::Release);
             let worker = Arc::clone(&shared);
             match std::thread::Builder::new()
                 .name(DURABILITY_THREAD_NAME.to_string())
@@ -561,6 +603,52 @@ mod deferred_scrollback {
             let total = self.shared.queued_bytes.fetch_sub(bytes, Ordering::AcqRel) - bytes;
             self.publish_queue(total);
         }
+
+        /// Sets the commit window policy (config
+        /// `scrollback_durability_commit_window_ms`, `_window_mb`,
+        /// `_idle_ms`). A zero window commits every request at once.
+        pub(super) fn set_commit_policy(&self, policy: CommitPolicy) {
+            let shared = &self.shared;
+            shared
+                .window_ms
+                .store(duration_ms(policy.window), Ordering::Release);
+            shared
+                .window_bytes
+                .store(policy.window_bytes.max(1), Ordering::Release);
+            shared
+                .idle_ms
+                .store(duration_ms(policy.idle), Ordering::Release);
+        }
+
+        pub(super) fn commit_policy(&self) -> CommitPolicy {
+            let shared = &self.shared;
+            CommitPolicy {
+                window: Duration::from_millis(shared.window_ms.load(Ordering::Acquire)),
+                window_bytes: shared.window_bytes.load(Ordering::Acquire),
+                idle: Duration::from_millis(shared.idle_ms.load(Ordering::Acquire)),
+            }
+        }
+
+        /// Moves `sink` out of an open commit window to the ready queue: a
+        /// threshold or a commit request closed the window early.
+        fn expedite(&self, sink: &DeferredScrollbackSpillSink) {
+            let mut queue = self.shared.lock_queue();
+            let Some(index) = queue
+                .windows
+                .iter()
+                .position(|(_, waiting)| std::ptr::eq(waiting.as_ref(), sink))
+            else {
+                return;
+            };
+            let (_, waiting) = queue.windows.swap_remove(index);
+            queue.ready.push_back(waiting);
+            drop(queue);
+            self.shared.wake.notify_one();
+        }
+    }
+
+    fn duration_ms(duration: Duration) -> u64 {
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
     }
 
     impl Drop for DurabilityWriter {
@@ -587,13 +675,16 @@ mod deferred_scrollback {
             let mut queue = self.lock_queue();
             loop {
                 let now = Instant::now();
-                let mut index = 0;
-                while index < queue.backoff.len() {
-                    if queue.backoff[index].0 <= now {
-                        let (_, sink) = queue.backoff.swap_remove(index);
-                        queue.ready.push_back(sink);
-                    } else {
-                        index += 1;
+                let queue_ref = &mut *queue;
+                for timed in [&mut queue_ref.backoff, &mut queue_ref.windows] {
+                    let mut index = 0;
+                    while index < timed.len() {
+                        if timed[index].0 <= now {
+                            let (_, sink) = timed.swap_remove(index);
+                            queue_ref.ready.push_back(sink);
+                        } else {
+                            index += 1;
+                        }
                     }
                 }
                 if let Some(sink) = queue.ready.pop_front() {
@@ -602,7 +693,13 @@ mod deferred_scrollback {
                 if queue.shutdown {
                     return None;
                 }
-                queue = match queue.backoff.iter().map(|(at, _)| *at).min() {
+                let next = queue
+                    .backoff
+                    .iter()
+                    .chain(queue.windows.iter())
+                    .map(|(at, _)| *at)
+                    .min();
+                queue = match next {
                     Some(at) => {
                         self.wake
                             .wait_timeout(queue, at.saturating_duration_since(now))
@@ -624,6 +721,20 @@ mod deferred_scrollback {
                     self.lock_queue().backoff.push((retry_at, sink));
                     return;
                 }
+            }
+            // An open commit window keeps gathering rows; `scheduled` stays
+            // set, so further requests do not queue the sink again.
+            let window = sink.commit_window(Instant::now());
+            match window {
+                CommitWindow::Open { closes_at } => {
+                    self.lock_queue().windows.push((closes_at, sink));
+                    return;
+                }
+                CommitWindow::Closed(reason) => log::debug!(
+                    target: "mux::scrollback_durability",
+                    "pane={} commit window closed: {reason}",
+                    sink.pane_label
+                ),
             }
             // Clear before draining: a row admitted during this drain
             // schedules another pass instead of waiting for the next batch.
@@ -710,6 +821,13 @@ mod deferred_scrollback {
         Gap(GapSpan),
     }
 
+    /// Whether a sink's queued rows should go to the store now.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CommitWindow {
+        Open { closes_at: Instant },
+        Closed(&'static str),
+    }
+
     impl Pending {
         fn start(&self) -> StableRowIndex {
             match self {
@@ -753,6 +871,11 @@ mod deferred_scrollback {
         /// Overload shedding is active until the queue drains below half of
         /// the budget (hysteresis).
         shedding: bool,
+        /// When the first row still queued was admitted: the open commit
+        /// window's start (ft-yccm0.2.1.2).
+        window_opened: Option<Instant>,
+        /// When the newest row was admitted, for the idle close.
+        last_admitted: Option<Instant>,
         // An acknowledged suffix, transferred from pending without cloning or
         // serializing cells. First reflow can read its cold/hot boundary here.
         // Uses the same cell/text charge as pending, not a total heap estimate.
@@ -787,6 +910,8 @@ mod deferred_scrollback {
         progress_signal: Condvar,
         health: Mutex<WriterHealth>,
         committed_batches: AtomicU64,
+        /// A close (or explicit commit request) ends the open commit window.
+        commit_now: AtomicBool,
     }
 
     impl State {
@@ -804,6 +929,8 @@ mod deferred_scrollback {
                 written_gaps: VecDeque::new(),
                 pruned_gap_skip: 0,
                 shedding: false,
+                window_opened: None,
+                last_admitted: None,
                 cached: VecDeque::new(),
                 cached_bytes: 0,
                 durable_bytes,
@@ -1010,6 +1137,7 @@ mod deferred_scrollback {
                 progress_signal: Condvar::new(),
                 health: Mutex::new(WriterHealth::default()),
                 committed_batches: AtomicU64::new(0),
+                commit_now: AtomicBool::new(false),
             }))
         }
 
@@ -1121,6 +1249,52 @@ mod deferred_scrollback {
             self.progress_signal.notify_all();
         }
 
+        /// Whether the writer should commit this sink's queued rows now
+        /// (ft-yccm0.2.1.2), or when its open commit window closes.
+        fn commit_window(&self, now: Instant) -> CommitWindow {
+            if self.commit_now.load(Ordering::Acquire) {
+                return CommitWindow::Closed("commit requested");
+            }
+            if self.self_ref.strong_count() <= 1 {
+                return CommitWindow::Closed("pane closed");
+            }
+            let policy = self.writer.commit_policy();
+            if policy.window.is_zero() {
+                return CommitWindow::Closed("windows disabled");
+            }
+            if self.writer.queued_bytes() >= self.writer.queue_budget() / 2 {
+                return CommitWindow::Closed("queue pressure");
+            }
+            let Ok(state) = self.state.lock() else {
+                return CommitWindow::Closed("state unavailable");
+            };
+            if state.pending.is_empty() {
+                return CommitWindow::Closed("nothing queued");
+            }
+            if state.shedding || matches!(state.pending.front(), Some(Pending::Gap(_))) {
+                return CommitWindow::Closed("overload gap");
+            }
+            if state.pending.len() >= MAX_BATCH_ROWS {
+                return CommitWindow::Closed("full batch");
+            }
+            if state.pending_bytes >= policy.window_bytes {
+                return CommitWindow::Closed("window bytes");
+            }
+            let opened = state.window_opened.unwrap_or(now);
+            let last = state.last_admitted.unwrap_or(now);
+            let age_close = opened + policy.window;
+            let idle_close = last + policy.idle;
+            if age_close <= now {
+                CommitWindow::Closed("window age")
+            } else if idle_close <= now {
+                CommitWindow::Closed("idle")
+            } else {
+                CommitWindow::Open {
+                    closes_at: age_close.min(idle_close),
+                }
+            }
+        }
+
         /// One drain by the writer or an explicit flush. The outcome is
         /// recorded under the gate, so a stale failure can never overwrite a
         /// later drain's recovery. Panics are contained here.
@@ -1133,6 +1307,8 @@ mod deferred_scrollback {
                 .drain_gate
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            // This drain empties the queue, which closes the window.
+            self.commit_now.store(false, Ordering::Release);
             let outcome = frankenterm_sigpipe::catch_recoverable(
                 frankenterm_sigpipe::RecoverablePanicSite::StorageWriter,
                 std::panic::AssertUnwindSafe(|| self.drain()),
@@ -1297,6 +1473,9 @@ mod deferred_scrollback {
                 _ => return Err(ScrollbackSpillError::SnapshotRowMissing),
             }
             state.in_flight = 0;
+            if state.pending.is_empty() {
+                state.window_opened = None;
+            }
             state.written_gaps.push_back(gap);
             state.prune_written_gaps(store_oldest);
             // The cached suffix serves contiguous acknowledged rows only.
@@ -1366,6 +1545,9 @@ mod deferred_scrollback {
                 state.cache_acknowledged(row);
             }
             state.in_flight = 0;
+            if state.pending.is_empty() {
+                state.window_opened = None;
+            }
             state.durable_bytes = durable_bytes;
             self.pending_rows
                 .store(state.pending.len(), Ordering::Release);
@@ -1425,6 +1607,7 @@ mod deferred_scrollback {
             };
             let mut dropped = Vec::new();
             let mut gaps = Vec::new();
+            let mut close_window = false;
             let (admission, entered_overload) = {
                 let Ok(mut state) = self.state.lock() else {
                     return ScrollbackLineAdmission::Refused;
@@ -1437,9 +1620,13 @@ mod deferred_scrollback {
                     retention,
                     &mut dropped,
                     &mut gaps,
+                    &mut close_window,
                 );
                 (admission, !was_shedding && state.shedding)
             };
+            if close_window {
+                self.writer.expedite(self);
+            }
             // Last-reference Line destruction happens outside the state lock.
             drop(dropped);
             if !gaps.is_empty() {
@@ -1493,6 +1680,7 @@ mod deferred_scrollback {
             retention: usize,
             dropped: &mut Vec<Pending>,
             gaps: &mut Vec<GapSpan>,
+            close_window: &mut bool,
         ) -> ScrollbackLineAdmission {
             if state.publication_uncertain {
                 return ScrollbackLineAdmission::Refused;
@@ -1555,6 +1743,14 @@ mod deferred_scrollback {
             } else {
                 false
             };
+            let window_bytes = self.writer.commit_policy().window_bytes;
+            let window_full = |state: &State| {
+                state.shedding
+                    || state.pending.len() >= MAX_BATCH_ROWS
+                    || state.pending_bytes >= window_bytes
+            };
+            let was_empty = state.pending.is_empty();
+            let was_full = window_full(state);
             if as_gap {
                 let at_unix_ms = unix_now_ms();
                 let span = GapSpan {
@@ -1585,6 +1781,14 @@ mod deferred_scrollback {
                 state.pending_bytes += charge;
                 self.writer.charge(charge);
             }
+            // The commit window opens with the first queued row; reaching a
+            // size threshold closes it early (ft-yccm0.2.1.2).
+            let now = Instant::now();
+            if was_empty {
+                state.window_opened = Some(now);
+            }
+            state.last_admitted = Some(now);
+            *close_window = !was_full && window_full(state);
             self.pending_rows
                 .store(state.pending.len(), Ordering::Release);
             state.oldest = Some(oldest);
@@ -1718,6 +1922,14 @@ mod deferred_scrollback {
                 self.schedule();
             }
             self.durability_failure().map_or(Ok(()), Err)
+        }
+
+        /// Pane close: commit now rather than at the window's end.
+        fn request_scrollback_commit(&self) -> Result<(), ScrollbackSpillError> {
+            self.commit_now.store(true, Ordering::Release);
+            let result = self.request_scrollback_flush();
+            self.writer.expedite(self);
+            result
         }
 
         fn await_scrollback_capacity(&self, timeout: Duration) -> ScrollbackCapacityWait {
@@ -2897,6 +3109,142 @@ mod deferred_scrollback {
             text(&reopened.load_scrollback_line(11).unwrap()),
             format!("flood {}", gap.end)
         );
+    }
+
+    /// A sink on a private writer with `policy`, over an open GatedStore.
+    #[cfg(test)]
+    fn windowed_sink(
+        policy: CommitPolicy,
+        pane: u8,
+    ) -> (Arc<GatedStore>, Arc<DeferredScrollbackSpillSink>) {
+        let store = Arc::new(GatedStore::default());
+        let writer = DurabilityWriter::spawn();
+        writer.set_commit_policy(policy);
+        let sink =
+            DeferredScrollbackSpillSink::with_writer(store.clone(), [pane; 16], writer).unwrap();
+        (store, sink)
+    }
+
+    #[cfg(test)]
+    fn wait_for_rows(store: &GatedStore, rows: usize) -> Duration {
+        let started = Instant::now();
+        while store.rows().len() < rows {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the writer stored {} of {rows} rows",
+                store.rows().len()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        started.elapsed()
+    }
+
+    #[test]
+    fn commit_windows_gather_parse_batches_into_one_transaction() {
+        let (store, sink) = windowed_sink(
+            CommitPolicy {
+                window: Duration::from_secs(5),
+                window_bytes: 1 << 30,
+                idle: Duration::from_millis(300),
+            },
+            0x61,
+        );
+        // Ten parse batches of eight rows, each followed by the parser's
+        // handoff request, all within one idle interval.
+        for batch in 0..10 {
+            for row in batch * 8..batch * 8 + 8 {
+                assert!(sink.store_scrollback_line(row, &GatedStore::line(row), 1 << 20));
+            }
+            sink.request_scrollback_flush().unwrap();
+        }
+        assert!(store.rows().is_empty(), "the window is still open");
+        // The burst ends: the idle close commits it as one transaction.
+        wait_for_rows(&store, 80);
+        assert_eq!(sink.committed_batches(), 1);
+        let expected: Vec<_> = (0..80).map(|row| (row, GatedStore::text(row))).collect();
+        assert_eq!(store.rows(), expected);
+    }
+
+    #[test]
+    fn window_bytes_and_a_close_commit_without_waiting_for_the_window() {
+        // Exactly the first sixteen rows' charge: row 15 closes the window.
+        let window_bytes = (0..16)
+            .map(|row| DeferredScrollbackSpillSink::row_charge(&GatedStore::line(row)).unwrap())
+            .sum();
+        let (store, sink) = windowed_sink(
+            CommitPolicy {
+                window: Duration::from_secs(5),
+                window_bytes,
+                idle: Duration::from_secs(5),
+            },
+            0x62,
+        );
+        for row in 0..15 {
+            assert!(sink.store_scrollback_line(row, &GatedStore::line(row), 1 << 20));
+        }
+        sink.request_scrollback_flush().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            store.rows().is_empty(),
+            "below the window bytes, it stays open"
+        );
+        // The 16th row reaches the window bytes and closes the window.
+        assert!(sink.store_scrollback_line(15, &GatedStore::line(15), 1 << 20));
+        assert!(wait_for_rows(&store, 16) < Duration::from_secs(4));
+        assert_eq!(sink.committed_batches(), 1);
+
+        // A pane close commits the open window at once.
+        for row in 16..19 {
+            assert!(sink.store_scrollback_line(row, &GatedStore::line(row), 1 << 20));
+        }
+        sink.request_scrollback_flush().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(store.rows().len(), 16, "the new window is open");
+        sink.request_scrollback_commit().unwrap();
+        assert!(wait_for_rows(&store, 19) < Duration::from_secs(4));
+        assert_eq!(sink.committed_batches(), 2);
+    }
+
+    #[test]
+    fn the_window_age_closes_a_busy_window_and_zero_disables_windows() {
+        let (store, sink) = windowed_sink(
+            CommitPolicy {
+                window: Duration::from_millis(400),
+                window_bytes: 1 << 30,
+                idle: Duration::from_secs(5),
+            },
+            0x63,
+        );
+        // A steady trickle never goes idle; the window age closes it.
+        let started = Instant::now();
+        let mut row = 0;
+        while store.rows().is_empty() {
+            assert!(started.elapsed() < Duration::from_secs(10), "no commit");
+            assert!(sink.store_scrollback_line(row, &GatedStore::line(row), 1 << 20));
+            sink.request_scrollback_flush().unwrap();
+            row += 1;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            started.elapsed() >= Duration::from_millis(400),
+            "committed after {:?}, before the window age",
+            started.elapsed()
+        );
+
+        // A zero window commits every handoff request by itself.
+        let (store, sink) = windowed_sink(
+            CommitPolicy {
+                window: Duration::ZERO,
+                ..CommitPolicy::default()
+            },
+            0x64,
+        );
+        for row in 0..3 {
+            assert!(sink.store_scrollback_line(row, &GatedStore::line(row), 1 << 20));
+            sink.request_scrollback_flush().unwrap();
+            wait_for_rows(&store, row as usize + 1);
+        }
+        assert_eq!(sink.committed_batches(), 3);
     }
 
     #[test]
@@ -11448,12 +11796,28 @@ pub fn open_scrollback_spill_sink(
     context: &config::ScrollbackSpillSinkContext,
 ) -> anyhow::Result<Arc<dyn wezterm_term::config::ScrollbackSpillSink>> {
     let backing = Arc::new(LiveScrollbackSpillSink::new(base_dir, context)?);
-    // The budget is process-wide; each new pane applies the current value.
-    deferred_scrollback::DurabilityWriter::global().set_queue_budget(
-        config::configuration()
+    // The budget and commit windows are process-wide; each new pane applies
+    // the current values. FT_DURABILITY_COMMIT_WINDOW_MS overrides the window
+    // for A/B runs (ft-yccm0.2.1.2).
+    let config = config::configuration();
+    let writer = deferred_scrollback::DurabilityWriter::global();
+    writer.set_queue_budget(
+        config
             .scrollback_durability_queue_max_mb
             .saturating_mul(1024 * 1024),
     );
+    let window_ms = std::env::var("FT_DURABILITY_COMMIT_WINDOW_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|ms| *ms <= config::MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MS)
+        .unwrap_or(config.scrollback_durability_commit_window_ms);
+    writer.set_commit_policy(deferred_scrollback::CommitPolicy {
+        window: std::time::Duration::from_millis(window_ms),
+        window_bytes: config
+            .scrollback_durability_commit_window_mb
+            .saturating_mul(1024 * 1024),
+        idle: std::time::Duration::from_millis(config.scrollback_durability_commit_idle_ms),
+    });
     let sink =
         deferred_scrollback::DeferredScrollbackSpillSink::new(backing, context.durable_pane_id)
             .context("initialize deferred scrollback metadata")?;

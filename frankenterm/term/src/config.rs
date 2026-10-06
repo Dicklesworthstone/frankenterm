@@ -1174,6 +1174,13 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
         self.flush_scrollback()
     }
 
+    /// Like [`Self::request_scrollback_flush`], but the writer commits now
+    /// instead of waiting for its commit window to close (pane close,
+    /// ft-yccm0.2.1.2). Still never waits on storage.
+    fn request_scrollback_commit(&self) -> Result<(), ScrollbackSpillError> {
+        self.request_scrollback_flush()
+    }
+
     /// Wait at most `timeout` for durability progress after this sink
     /// refused an admission.
     ///
