@@ -35,7 +35,10 @@ use frankenterm_dynamic::{FromDynamic, ToDynamic};
 
 mod linux;
 mod macos;
+mod thread_qos;
 mod windows;
+
+pub use thread_qos::{current_thread_qos, set_current_thread_qos, ThreadQos};
 
 #[derive(Debug, Copy, Clone)]
 #[cfg_attr(feature = "lua", derive(FromDynamic, ToDynamic))]
