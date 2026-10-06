@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use frankenterm_escape_parser::parser::Parser;
+use frankenterm_escape_parser::{Action, ControlCode, Esc, EscCode};
 use frankenterm_term::color::ColorPalette;
-use frankenterm_term::{Clipboard, Terminal, TerminalConfiguration, TerminalSize};
+use frankenterm_term::{Clipboard, FeedGate, Terminal, TerminalConfiguration, TerminalSize};
 
 use super::snapshot::{self, EngineSnapshot};
 
@@ -206,6 +207,81 @@ impl EngineFactory for TwoStage {
     }
 }
 
+/// The mux's fused path (ft-yccm0.3.2.1): an external parser feeds the
+/// terminal through `Terminal::feed`, and the actions the gate diverts are
+/// applied afterwards with `perform_actions`, as the mux applies them after
+/// admission. The gate diverts what the mux diverts (alert sources) and,
+/// with `divert_every`, also every n-th other action, so diversion lands at
+/// arbitrary points.
+pub struct FusedFeed {
+    pub divert_every: Option<usize>,
+}
+
+struct FusedFeedGate {
+    divert_every: Option<usize>,
+    seen: usize,
+}
+
+impl FeedGate for FusedFeedGate {
+    fn diverts(&mut self, action: &Action) -> bool {
+        self.seen += 1;
+        let alert_source = matches!(
+            action,
+            Action::Control(ControlCode::Bell)
+                | Action::OperatingSystemCommand(_)
+                | Action::KittyImage(_)
+                | Action::Esc(Esc::Code(EscCode::StringTerminator | EscCode::FullReset))
+        );
+        alert_source
+            || self
+                .divert_every
+                .is_some_and(|n| self.seen.is_multiple_of(n))
+    }
+}
+
+struct FusedFeedEngine {
+    terminal: Terminal,
+    parser: Parser,
+    gate: FusedFeedGate,
+}
+
+impl Engine for FusedFeedEngine {
+    fn feed(&mut self, bytes: &[u8]) {
+        let mut diverted = Vec::new();
+        self.terminal
+            .feed(&mut self.parser, bytes, &mut self.gate, &mut diverted);
+        self.terminal.perform_actions(diverted);
+    }
+
+    fn snapshot(&self) -> EngineSnapshot {
+        snapshot::capture(&self.terminal)
+    }
+
+    fn wait_for_replies(&mut self) {
+        drain_replies(&mut self.terminal);
+    }
+}
+
+impl EngineFactory for FusedFeed {
+    fn name(&self) -> &'static str {
+        match self.divert_every {
+            None => "fused_feed",
+            Some(_) => "fused_feed_frequent_diversion",
+        }
+    }
+
+    fn build_with(&self, geometry: &Geometry, io: EngineIo) -> Box<dyn Engine> {
+        Box::new(FusedFeedEngine {
+            terminal: new_terminal_with(geometry, io),
+            parser: Parser::new(),
+            gate: FusedFeedGate {
+                divert_every: self.divert_every,
+                seen: 0,
+            },
+        })
+    }
+}
+
 /// Every candidate checked against [`Legacy`]. The fused parser (B2), the
 /// SIMD scanner (B2.2/B2.3) and the page grid (B3) register here when they
 /// land; nothing else in the harness changes.
@@ -216,6 +292,10 @@ pub fn candidates() -> Vec<Box<dyn EngineFactory>> {
         }),
         Box::new(TwoStage {
             print_batching: false,
+        }),
+        Box::new(FusedFeed { divert_every: None }),
+        Box::new(FusedFeed {
+            divert_every: Some(7),
         }),
     ]
 }

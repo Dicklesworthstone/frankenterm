@@ -1,8 +1,9 @@
 use super::*;
 use crate::terminalstate::performer::Performer;
-use frankenterm_escape_parser::parser::Parser;
 #[cfg(feature = "use_serde")]
 use frankenterm_escape_parser::parser::RecoveryGroundBoundary;
+use frankenterm_escape_parser::parser::{Handler, Parser};
+use frankenterm_escape_parser::Action;
 #[cfg(feature = "use_serde")]
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,6 +21,56 @@ pub const RECOVERY_TERMINAL_REPLAY_SEMANTICS_ID: &str =
 pub enum ClipboardSelection {
     Clipboard,
     PrimarySelection,
+}
+
+/// Decides which actions [`Terminal::feed`] must not apply itself
+/// (ft-yccm0.3.2.1): an embedder diverts the actions it has to handle around
+/// the terminal, such as those that need alert admission first.
+pub trait FeedGate {
+    /// Whether `action` leaves the fused path. Printing never does.
+    fn diverts(&mut self, action: &Action) -> bool;
+}
+
+/// Applies actions through the performer until the gate diverts one, then
+/// collects that action and the rest in order.
+struct FeedHandler<'s, 'f, G: FeedGate + ?Sized> {
+    performer: Performer<'s>,
+    gate: &'f mut G,
+    diverted: &'f mut Vec<Action>,
+    diverting: bool,
+    applied: bool,
+}
+
+impl<'s, 'f, G: FeedGate + ?Sized> Handler for FeedHandler<'s, 'f, G> {
+    fn action(&mut self, action: Action) {
+        if !self.diverting && !self.gate.diverts(&action) {
+            self.applied = true;
+            self.performer.perform(action);
+        } else {
+            self.diverting = true;
+            self.diverted.push(action);
+        }
+    }
+
+    #[inline]
+    fn print(&mut self, c: char) {
+        if self.diverting {
+            self.diverted.push(Action::Print(c));
+        } else {
+            self.applied = true;
+            Handler::print(&mut self.performer, c);
+        }
+    }
+
+    #[inline]
+    fn print_str(&mut self, text: &str) {
+        if self.diverting {
+            self.diverted.push(Action::PrintString(text.to_string()));
+        } else {
+            self.applied = true;
+            Handler::print_str(&mut self.performer, text);
+        }
+    }
 }
 
 pub trait Clipboard: Send + Sync {
@@ -1175,6 +1226,43 @@ impl Terminal {
             );
         }
         self.trigger_unseen_output_notif();
+    }
+
+    /// The fused path for an embedder that owns the parser, such as the mux
+    /// parse thread (ft-yccm0.3.2.1). Parses `bytes` with `parser` and
+    /// applies each action as it is decoded, storing none.
+    ///
+    /// At the first action `gate` diverts, application stops: that action and
+    /// every later one decoded from `bytes` go to `diverted`, in order, for the
+    /// embedder to apply itself (for example with [`Self::perform_actions`]
+    /// after admission). Buffered print is flushed before `feed` returns, so
+    /// diverted actions apply after everything `feed` applied. Returns
+    /// whether any action was applied. Like [`Self::perform_actions`], this
+    /// leaves the parser's string-sequence errors to the caller.
+    pub fn feed<G: FeedGate + ?Sized>(
+        &mut self,
+        parser: &mut Parser,
+        bytes: &[u8],
+        gate: &mut G,
+        diverted: &mut Vec<Action>,
+    ) -> bool {
+        self.state.increment_seqno();
+        self.state.refresh_batch_config();
+        let applied = {
+            let mut handler = FeedHandler {
+                performer: Performer::new(&mut self.state),
+                gate,
+                diverted,
+                diverting: false,
+                applied: false,
+            };
+            parser.parse_with(bytes, &mut handler);
+            handler.applied
+        };
+        if applied {
+            self.trigger_unseen_output_notif();
+        }
+        applied
     }
 
     pub fn perform_actions(&mut self, actions: Vec<frankenterm_escape_parser::Action>) {

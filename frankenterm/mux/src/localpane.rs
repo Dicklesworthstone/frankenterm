@@ -4308,6 +4308,18 @@ impl PaneAlertPreflight {
         })
     }
 
+    /// What [`Self::for_actions`] charges a batch with no alert source: the
+    /// one output alert a nonempty batch can raise. The fused path
+    /// (ft-yccm0.3.2.1) diverts every alert source, so this funds it.
+    #[cfg_attr(feature = "disruptor-pane-io", allow(dead_code))]
+    fn output_only() -> Self {
+        Self {
+            count: 1,
+            text_bytes: 0,
+            historical: Vec::new(),
+        }
+    }
+
     fn retained_bytes(&self) -> Option<usize> {
         self.count
             .checked_mul(std::mem::size_of::<Alert>())?
@@ -4473,6 +4485,24 @@ impl Drop for PaneAlertCompletion {
             #[cfg(test)]
             ALERT_DELIVERY_CANCELLED.fetch_add(1, Ordering::Release);
         }
+    }
+}
+
+/// The actions the fused path hands back to the admitted path
+/// (ft-yccm0.3.2.1): every alert source [`PaneAlertPreflight`] charges for,
+/// and the synchronized-output controls the parse thread tracks itself.
+pub(crate) struct FusedFeedGate;
+
+impl frankenterm_term::FeedGate for FusedFeedGate {
+    fn diverts(&mut self, action: &Action) -> bool {
+        use termwiz::escape::{ControlCode, Esc, EscCode};
+        matches!(
+            action,
+            Action::Control(ControlCode::Bell)
+                | Action::OperatingSystemCommand(_)
+                | Action::KittyImage(_)
+                | Action::Esc(Esc::Code(EscCode::StringTerminator | EscCode::FullReset))
+        ) || crate::is_synchronized_output_action(action)
     }
 }
 
@@ -4659,9 +4689,27 @@ impl AdmittedPaneActions {
     fn apply(self, terminal: &mut Terminal) {
         let Self {
             actions,
-            mut alerts,
+            alerts,
             staging,
         } = self;
+        let application = PaneAlertApplication::install(alerts, staging);
+        terminal.perform_actions(actions);
+        drop(application);
+    }
+}
+
+struct PaneAlertApplication {
+    alerts: Option<FundedPaneAlerts>,
+    staging: Arc<Mutex<PaneAlertStaging>>,
+}
+
+impl PaneAlertApplication {
+    /// Installs the batch's funded alerts for the alert handler; dropping
+    /// the application publishes what the batch raised.
+    fn install(
+        mut alerts: Option<FundedPaneAlerts>,
+        staging: Arc<Mutex<PaneAlertStaging>>,
+    ) -> Self {
         {
             let mut state = staging.lock();
             assert!(
@@ -4673,15 +4721,8 @@ impl AdmittedPaneActions {
                 remaining_text_bytes: batch.text_bytes,
             });
         }
-        let application = PaneAlertApplication { alerts, staging };
-        terminal.perform_actions(actions);
-        drop(application);
+        PaneAlertApplication { alerts, staging }
     }
-}
-
-struct PaneAlertApplication {
-    alerts: Option<FundedPaneAlerts>,
-    staging: Arc<Mutex<PaneAlertStaging>>,
 }
 
 impl Drop for PaneAlertApplication {
@@ -4795,6 +4836,45 @@ impl LocalPane {
             .reserve_alert_output()
             .map(Some)
             .ok_or(PaneActionAdmissionRefusal::Retired)
+    }
+
+    /// The fused live path (ft-yccm0.3.2.1): parses `bytes` with the parse
+    /// thread's `parser` straight into the terminal, under the same locks
+    /// and alert admission as `perform_actions`, storing no actions. Every
+    /// alert source and synchronized-output control is diverted, with
+    /// everything after it, into `diverted`, which the parse thread applies
+    /// through the admitted path; so the batch needs only the funding of its
+    /// one output alert. On refusal nothing was parsed or applied.
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    pub(crate) fn feed_fused(
+        &self,
+        parser: &mut termwiz::escape::parser::Parser,
+        bytes: &[u8],
+        diverted: &mut Vec<Action>,
+    ) -> Result<(), PaneActionAdmissionRefusal> {
+        // Covers admission, apply and the durability handoff (ft-yccm0.1.5).
+        let _parse_batch = procinfo::signpost_interval(procinfo::SignpostName::ParseBatch);
+        let mut output = self.prepare_alert_output()?;
+        let _output_application = self.output_application.lock();
+        let alerts = FundedPaneAlerts::reserve(
+            PaneAlertPreflight::output_only(),
+            &mut output,
+            &self.terminal,
+        )?;
+        {
+            let mut terminal = self.terminal.lock_as(TerminalLockHolder::Parser);
+            let application =
+                PaneAlertApplication::install(alerts, Arc::clone(&self.alert_staging));
+            terminal.feed(parser, bytes, &mut FusedFeedGate, diverted);
+            drop(application);
+            self.render_facts.publish(&mut terminal);
+        }
+        let sink = self.scrollback_flush_sink.lock().clone();
+        if let Some(sink) = sink {
+            drop(self.locked_terminal());
+            self.drain_scrollback_outside_terminal(sink);
+        }
+        Ok(())
     }
 
     fn admit_alert_actions(
@@ -8093,6 +8173,45 @@ mod tests {
     use super::*;
     use frankenterm_term::config::ScrollbackSpillSink;
     use std::sync::atomic::AtomicUsize;
+
+    /// ft-yccm0.3.2.1: the fused path funds only the output alert, so its
+    /// gate must divert every action `PaneAlertPreflight` charges more for,
+    /// and every synchronized-output control the parse thread tracks, and
+    /// nothing else.
+    #[test]
+    fn fused_feed_gate_diverts_exactly_the_charged_and_synchronized_actions() {
+        use frankenterm_term::FeedGate;
+        let bytes: &[u8] = b"text \xc3\xa9\x07\x1b]0;title\x07\x1b]2;win\x1b\\\
+            \x1b]1337;SetUserVar=a=Yg==\x07\x1b]7;file://h/p\x07\x1b]777;notify;t;b\x07\
+            \x1bc\x1b\\\x1b[1mbold\x1b[2J\x1b[5;5H\x1b[?2026h\x1b[?2026l\x1b[?2026$p\
+            \x1b[!p\x1bP$qm\x1b\\\x1b_Ga=q,i=1;AAAA\x1b\\\x1b(0q\x1b7\x1b8\r\n\x08\
+            \x1b[?25l\x1b[4h\x1bM";
+        let actions = termwiz::escape::parser::Parser::new().parse_as_vec(bytes);
+        assert!(actions.len() > 20, "{:?}", actions);
+        let output_only = PaneAlertPreflight::output_only();
+        let mut gate = FusedFeedGate;
+        let (mut charged_seen, mut sync_seen, mut plain_seen) = (0, 0, 0);
+        for action in &actions {
+            let preflight = PaneAlertPreflight::for_actions(std::slice::from_ref(action), 0)
+                .expect("a bounded preflight");
+            let charged = preflight.count != output_only.count
+                || preflight.text_bytes != output_only.text_bytes
+                || !preflight.historical.is_empty();
+            let sync = crate::is_synchronized_output_action(action);
+            assert_eq!(gate.diverts(action), charged || sync, "{:?}", action);
+            if charged {
+                charged_seen += 1;
+            } else if sync {
+                sync_seen += 1;
+            } else {
+                plain_seen += 1;
+            }
+        }
+        // The sample covers every class.
+        assert!(charged_seen >= 7, "{} charged", charged_seen);
+        assert_eq!(sync_seen, 4);
+        assert!(plain_seen >= 10, "{} plain", plain_seen);
+    }
 
     #[test]
     fn alert_executor_initialization_failure_is_not_retryable_capacity() {

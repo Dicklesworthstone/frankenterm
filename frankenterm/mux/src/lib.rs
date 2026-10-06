@@ -10766,6 +10766,21 @@ impl SynchronizedOutputHold {
     }
 }
 
+/// The actions [`handle_synchronized_output_action`] acts on: BSU, ESU and
+/// the mode query of DEC mode 2026, and DECSTR. The fused path
+/// (ft-yccm0.3.2.1) diverts them to that handler.
+pub(crate) fn is_synchronized_output_action(action: &Action) -> bool {
+    match action {
+        Action::CSI(CSI::Mode(
+            Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::SynchronizedOutput))
+            | Mode::ResetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::SynchronizedOutput))
+            | Mode::QueryDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::SynchronizedOutput)),
+        )) => true,
+        Action::CSI(CSI::Device(dev)) => matches!(**dev, Device::SoftReset),
+        _ => false,
+    }
+}
+
 fn handle_synchronized_output_action(
     action: &Action,
     hold: &mut SynchronizedOutputHold,
@@ -10776,6 +10791,11 @@ fn handle_synchronized_output_action(
         handled: false,
         depth_outcome: None,
     };
+    // The fused path relies on this predicate naming every action handled
+    // below.
+    if !is_synchronized_output_action(action) {
+        return effect;
+    }
 
     match action {
         Action::CSI(CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
@@ -10914,6 +10934,95 @@ fn send_actions_to_mux_with_scheduler_state(
     histogram!("send_actions_to_mux.perform_actions.latency").record(start.elapsed());
     output.finish();
     histogram!("send_actions_to_mux.rate").record(1.);
+}
+
+/// Whether the parse thread applies bulk chunks through the fused path
+/// (ft-yccm0.3.2.1): on unless `FT_FUSED_PARSE` is `0`, `false`, `off` or
+/// `no`. Read once per parse thread.
+fn fused_parse_enabled() -> bool {
+    !std::env::var("FT_FUSED_PARSE").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+/// Applies one chunk through the fused path (ft-yccm0.3.2.1): the parser
+/// drives the local pane's terminal directly, with no `Vec<Action>`, under
+/// the same output reservation and admission as [`send_actions_to_mux`].
+/// Actions the pane must admit one by one come back in `diverted`, in order.
+///
+/// Returns false, having parsed nothing, when the pane cannot take the chunk
+/// that way (not a local pane, gone, poisoned, unregistered) or admission
+/// refused it for a reason other than capacity. The caller then parses the
+/// chunk into actions for [`send_actions_to_mux`], which handles each of
+/// those cases as before.
+#[cfg(not(feature = "disruptor-pane-io"))]
+fn feed_chunk_to_mux(
+    pane: &Weak<dyn Pane>,
+    generation: &Arc<PaneRegistrationGeneration>,
+    dead: &AtomicBool,
+    parser: &mut termwiz::escape::parser::Parser,
+    bytes: &[u8],
+    diverted: &mut Vec<Action>,
+) -> bool {
+    if generation
+        .live_parser_checkpoint
+        .state
+        .lock()
+        .poison
+        .is_some()
+    {
+        return false;
+    }
+    let start = Instant::now();
+    let Some(pane) = pane.upgrade() else {
+        return false;
+    };
+    let Some(local) = pane.downcast_ref::<crate::localpane::LocalPane>() else {
+        return false;
+    };
+    let Some(mux) = generation.owner.upgrade() else {
+        return false;
+    };
+    let Some(output) = mux.reserve_pane_output_for_reader(
+        &pane,
+        generation,
+        promise::spawn::is_scheduler_configured(),
+    ) else {
+        return false;
+    };
+    loop {
+        match local.feed_fused(parser, bytes, diverted) {
+            Ok(()) => break,
+            Err(crate::pane::PaneActionAdmissionRefusal::Capacity)
+                if !dead.load(Ordering::Acquire) =>
+            {
+                // Admission made no model mutation and parsed nothing.
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(_) => return false,
+        }
+    }
+    histogram!("send_actions_to_mux.perform_actions.latency").record(start.elapsed());
+    output.finish();
+    histogram!("send_actions_to_mux.rate").record(1.);
+    true
+}
+
+/// With the disruptor ring, batches are applied by whoever next locks the
+/// terminal, so the fused path does not apply.
+#[cfg(feature = "disruptor-pane-io")]
+fn feed_chunk_to_mux(
+    _pane: &Weak<dyn Pane>,
+    _generation: &Arc<PaneRegistrationGeneration>,
+    _dead: &AtomicBool,
+    _parser: &mut termwiz::escape::parser::Parser,
+    _bytes: &[u8],
+    _diverted: &mut Vec<Action>,
+) -> bool {
+    false
 }
 
 /// Apply one parser batch, splitting it when admission refuses it as too
@@ -11368,6 +11477,7 @@ fn parse_buffered_data(
     let mut delay = Duration::from_millis(configuration().mux_output_parser_coalesce_delay_ms);
     let mut deadline: Option<Instant> = None;
     let mut checkpoint_worker = ModelCheckpointWorker::default();
+    let fused_parse = fused_parse_enabled();
 
     loop {
         match attempt_live_parser_checkpoint(
@@ -11510,9 +11620,36 @@ fn parse_buffered_data(
                 break;
             }
             Ok(size) => {
+                // The fused path (ft-yccm0.3.2.1) takes a chunk the code below
+                // would apply at once anyway: no synchronized-output hold, and
+                // enough output that it would not wait to coalesce a frame.
+                // Earlier pending actions go first, as they would in one batch.
+                let mut diverted = Vec::new();
+                let fused = fused_parse
+                    && !hold.is_holding()
+                    && action_size.saturating_add(size) >= buf.len()
+                    && {
+                        if !actions.is_empty() {
+                            send_actions_to_mux(
+                                &pane,
+                                &generation,
+                                dead,
+                                std::mem::take(&mut actions),
+                            );
+                            deadline = None;
+                        }
+                        feed_chunk_to_mux(
+                            &pane,
+                            &generation,
+                            dead,
+                            &mut parser,
+                            &buf[0..size],
+                            &mut diverted,
+                        )
+                    };
                 let mut chunk_touched_hold = hold.is_holding();
                 let mut chunk_admission_emitted = false;
-                parser.parse(&buf[0..size], |action| {
+                let mut on_action = |action: Action| {
                     let was_holding = hold.is_holding();
                     let effect = handle_synchronized_output_action(&action, &mut hold, |hold| {
                         respond_to_synchronized_output_query(&pane, &generation, hold);
@@ -11573,7 +11710,15 @@ fn parse_buffered_data(
                         send_actions_to_mux(&pane, &generation, dead, std::mem::take(&mut actions));
                         action_size = 0;
                     }
-                });
+                };
+                if fused {
+                    // Only what the gate diverted remains, already decoded.
+                    for action in diverted {
+                        on_action(action);
+                    }
+                } else {
+                    parser.parse(&buf[0..size], &mut on_action);
+                }
                 if generation
                     .live_parser_checkpoint
                     .record_parsed_bytes(size)
@@ -11592,7 +11737,12 @@ fn parse_buffered_data(
                         },
                     );
                 }
-                action_size += size;
+                if fused && actions.is_empty() {
+                    // Everything this chunk produced is applied.
+                    action_size = 0;
+                } else {
+                    action_size += size;
+                }
                 match attempt_live_parser_checkpoint(
                     &pane,
                     &generation,
