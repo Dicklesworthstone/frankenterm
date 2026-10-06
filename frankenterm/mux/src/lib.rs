@@ -32381,6 +32381,20 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         queued.join().expect("reply thread")?;
+
+        // The GUI publishes this for `ft doctor` (ft-yccm0.2.2.5): the paste
+        // is stuck behind the stalled child, and the reply waits behind it.
+        let backlog = local
+            .writer_backlog()
+            .expect("a local pane owns a terminal writer");
+        assert!(backlog.pending_input_bytes > 0, "{:?}", backlog);
+        assert_eq!(
+            backlog.pending_reply_bytes,
+            synchronized_output_decrqm_response(true).len(),
+            "{:?}",
+            backlog
+        );
+        assert_eq!(backlog.dropped_replies, 0, "{:?}", backlog);
         local.kill();
         Ok(())
     }

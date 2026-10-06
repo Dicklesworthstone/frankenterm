@@ -1075,6 +1075,12 @@ pub trait Pane: Downcast + Send + Sync {
         None
     }
 
+    /// The terminal writer queue's unwritten bytes and reply-drop counters
+    /// (ft-yccm0.2.2.5), for panes that write to a local child.
+    fn writer_backlog(&self) -> Option<frankenterm_term::WriterBacklog> {
+        None
+    }
+
     /// Move resident warm scrollback to the cold tier, returning the rows
     /// moved, or `None` for panes without tiered scrollback.
     fn evict_warm_scrollback(&self) -> Option<usize> {

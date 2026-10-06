@@ -925,6 +925,82 @@ pub struct DurabilitySnapshot {
     pub rows_abandoned_total: u64,
 }
 
+/// One pane's terminal writer queue (ft-yccm0.2.2.5): bytes enqueued for the
+/// child but not yet written, and query replies dropped because the child
+/// stopped reading its input. User input is never dropped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneWriterSnapshot {
+    pub pane_id: u64,
+    pub pending_input_bytes: u64,
+    pub pending_reply_bytes: u64,
+    pub dropped_replies: u64,
+    pub dropped_reply_bytes: u64,
+}
+
+impl PaneWriterSnapshot {
+    fn is_idle(&self) -> bool {
+        self.pending_input_bytes == 0
+            && self.pending_reply_bytes == 0
+            && self.dropped_replies == 0
+            && self.dropped_reply_bytes == 0
+    }
+}
+
+/// The `writers` section of a published snapshot (ft-yccm0.2.2.5): totals
+/// over every pane sampled, and the panes whose writer has unwritten bytes or
+/// has dropped replies. Idle panes are counted, not listed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WritersSnapshot {
+    pub panes_sampled: u64,
+    pub pending_input_bytes_total: u64,
+    pub pending_reply_bytes_total: u64,
+    pub dropped_replies_total: u64,
+    pub dropped_reply_bytes_total: u64,
+    /// Busy panes, sorted by pane id.
+    pub panes: Vec<PaneWriterSnapshot>,
+}
+
+impl WritersSnapshot {
+    #[must_use]
+    pub fn from_panes(panes: impl IntoIterator<Item = PaneWriterSnapshot>) -> Self {
+        let mut section = Self::default();
+        for pane in panes {
+            section.panes_sampled += 1;
+            section.pending_input_bytes_total = section
+                .pending_input_bytes_total
+                .saturating_add(pane.pending_input_bytes);
+            section.pending_reply_bytes_total = section
+                .pending_reply_bytes_total
+                .saturating_add(pane.pending_reply_bytes);
+            section.dropped_replies_total = section
+                .dropped_replies_total
+                .saturating_add(pane.dropped_replies);
+            section.dropped_reply_bytes_total = section
+                .dropped_reply_bytes_total
+                .saturating_add(pane.dropped_reply_bytes);
+            if !pane.is_idle() {
+                section.panes.push(pane);
+            }
+        }
+        section.panes.sort_by_key(|pane| pane.pane_id);
+        section
+    }
+
+    /// One human-readable line for the GUI debug overlay.
+    #[must_use]
+    pub fn summary_line(&self) -> String {
+        format!(
+            "Terminal writers: {} panes ({} busy); pending input {} B, replies {} B; dropped replies {} ({} B)",
+            self.panes_sampled,
+            self.panes.len(),
+            self.pending_input_bytes_total,
+            self.pending_reply_bytes_total,
+            self.dropped_replies_total,
+            self.dropped_reply_bytes_total
+        )
+    }
+}
+
 /// Frames the GUI handed to its graphics backend for presentation, and the
 /// intervals between them (ft-yccm0.1.4). This is FrankenTerm's own frame
 /// count: `scripts/mac-gui-throughput.sh` validates its terminal-agnostic
@@ -1055,11 +1131,15 @@ pub struct ResourceSnapshotBody {
     /// [`FrameLedger::global`] (ft-yccm0.1.4).
     #[serde(default)]
     pub frames: FramesSnapshot,
+    /// Per-pane terminal writer queues (ft-yccm0.2.2.5), filled by the
+    /// process that owns the panes.
+    #[serde(default)]
+    pub writers: WritersSnapshot,
 }
 
 impl ResourceSnapshotBody {
     /// GPU and cache sections from `gpu` and `caches`, the process's terminal
-    /// lock, durability and frame ledgers; no panes.
+    /// lock, durability and frame ledgers; no panes and no writers.
     #[must_use]
     pub fn from_ledgers(gpu: &GpuResourceLedger, caches: &CacheGauges) -> Self {
         Self {
@@ -1069,6 +1149,7 @@ impl ResourceSnapshotBody {
             terminal_locks: TerminalLockLedger::global().snapshot(),
             durability: DurabilityLedger::global().snapshot(),
             frames: FrameLedger::global().snapshot(),
+            writers: WritersSnapshot::default(),
         }
     }
 
@@ -1264,6 +1345,9 @@ pub struct ResourceSnapshotEnvelope {
     /// Presented frames and the frame-rate cap (ft-yccm0.1.4).
     #[serde(default)]
     pub frames: FramesSnapshot,
+    /// Per-pane terminal writer queues and reply drops (ft-yccm0.2.2.5).
+    #[serde(default)]
+    pub writers: WritersSnapshot,
 }
 
 impl ResourceSnapshotEnvelope {
@@ -1282,6 +1366,7 @@ impl ResourceSnapshotEnvelope {
             terminal_locks: body.terminal_locks,
             durability: body.durability,
             frames: body.frames,
+            writers: body.writers,
         }
     }
 }
@@ -2027,6 +2112,87 @@ mod tests {
         let parsed: ResourceSnapshotEnvelope = serde_json::from_value(legacy).unwrap();
         assert_eq!(parsed.terminal_locks, TerminalLocksSnapshot::default());
         assert_eq!(parsed.durability, DurabilitySnapshot::default());
+    }
+
+    #[test]
+    fn writers_section_totals_every_pane_and_lists_only_busy_ones() {
+        let section = WritersSnapshot::from_panes([
+            PaneWriterSnapshot {
+                pane_id: 7,
+                pending_input_bytes: 1 << 20,
+                pending_reply_bytes: 12,
+                ..PaneWriterSnapshot::default()
+            },
+            PaneWriterSnapshot {
+                pane_id: 2,
+                ..PaneWriterSnapshot::default()
+            },
+            PaneWriterSnapshot {
+                pane_id: 3,
+                dropped_replies: 4,
+                dropped_reply_bytes: 48,
+                ..PaneWriterSnapshot::default()
+            },
+        ]);
+        assert_eq!(section.panes_sampled, 3);
+        assert_eq!(section.pending_input_bytes_total, 1 << 20);
+        assert_eq!(section.pending_reply_bytes_total, 12);
+        assert_eq!(section.dropped_replies_total, 4);
+        assert_eq!(section.dropped_reply_bytes_total, 48);
+        let listed: Vec<u64> = section.panes.iter().map(|pane| pane.pane_id).collect();
+        assert_eq!(listed, [3, 7], "idle pane 2 is counted, not listed");
+        assert_eq!(
+            section.summary_line(),
+            "Terminal writers: 3 panes (2 busy); pending input 1048576 B, replies 12 B; dropped replies 4 (48 B)"
+        );
+        assert_eq!(WritersSnapshot::from_panes([]), WritersSnapshot::default());
+
+        let saturated = WritersSnapshot::from_panes([
+            PaneWriterSnapshot {
+                pane_id: 1,
+                pending_input_bytes: u64::MAX,
+                ..PaneWriterSnapshot::default()
+            },
+            PaneWriterSnapshot {
+                pane_id: 2,
+                pending_input_bytes: 5,
+                ..PaneWriterSnapshot::default()
+            },
+        ]);
+        assert_eq!(saturated.pending_input_bytes_total, u64::MAX);
+    }
+
+    #[test]
+    fn writers_section_rides_in_the_envelope_and_defaults_when_absent() {
+        // The ledgers know nothing about panes; the pane owner fills writers.
+        assert_eq!(
+            ResourceSnapshotBody::from_ledgers(private_ledger(), private_gauges()).writers,
+            WritersSnapshot::default()
+        );
+        let body = ResourceSnapshotBody {
+            writers: WritersSnapshot::from_panes([PaneWriterSnapshot {
+                pane_id: 5,
+                pending_reply_bytes: 9,
+                ..PaneWriterSnapshot::default()
+            }]),
+            ..ResourceSnapshotBody::default()
+        };
+        let envelope = ResourceSnapshotEnvelope::now(
+            "frankenterm-gui",
+            body.clone(),
+            AllocatorSnapshot::default(),
+        );
+        assert_eq!(envelope.writers, body.writers);
+        let value = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(value["writers"]["panes"][0]["pane_id"], 5);
+        assert_eq!(value["writers"]["pending_reply_bytes_total"], 9);
+        let parsed: ResourceSnapshotEnvelope = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed, envelope);
+        // Files written by a GUI that predates the section still parse.
+        let mut legacy = value;
+        legacy.as_object_mut().unwrap().remove("writers");
+        let parsed: ResourceSnapshotEnvelope = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.writers, WritersSnapshot::default());
     }
 
     #[test]

@@ -3625,17 +3625,30 @@ fn start_gui_tuning_advisories(
 }
 
 /// The resource snapshot this process publishes (ft-yccm0.1.7). Runs on the
-/// publisher thread; each pane's tier status takes that pane's terminal lock
-/// briefly, never on the GUI thread.
+/// publisher thread; each pane's tier status and writer backlog take that
+/// pane's terminal lock briefly, never on the GUI thread.
 fn collect_resource_snapshot() -> frankenterm_alloc::resource_ledger::ResourceSnapshotBody {
     use frankenterm_alloc::resource_ledger::{
-        CacheGauges, GpuResourceLedger, PaneResourceSnapshot, ResourceSnapshotBody,
+        CacheGauges, GpuResourceLedger, PaneResourceSnapshot, PaneWriterSnapshot,
+        ResourceSnapshotBody, WritersSnapshot,
     };
     let mut body =
         ResourceSnapshotBody::from_ledgers(GpuResourceLedger::global(), CacheGauges::global());
     if let Some(mux) = Mux::try_get() {
-        body.panes = mux
-            .iter_panes()
+        let panes = mux.iter_panes();
+        // ft-yccm0.2.2.5: the GUI owns the panes, so it reports their writer
+        // queues and reply drops to `ft doctor` without a mux RPC.
+        body.writers = WritersSnapshot::from_panes(panes.iter().filter_map(|pane| {
+            let backlog = pane.writer_backlog()?;
+            Some(PaneWriterSnapshot {
+                pane_id: pane.pane_id() as u64,
+                pending_input_bytes: backlog.pending_input_bytes as u64,
+                pending_reply_bytes: backlog.pending_reply_bytes as u64,
+                dropped_replies: backlog.dropped_replies,
+                dropped_reply_bytes: backlog.dropped_reply_bytes,
+            })
+        }));
+        body.panes = panes
             .into_iter()
             .filter_map(|pane| {
                 let status = pane.get_tiered_scrollback_status()?;

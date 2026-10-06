@@ -2392,6 +2392,10 @@ impl Pane for LocalPane {
         )
     }
 
+    fn writer_backlog(&self) -> Option<frankenterm_term::WriterBacklog> {
+        Some(self.terminal.lock().writer_backlog())
+    }
+
     fn evict_warm_scrollback(&self) -> Option<usize> {
         let mut terminal = self.terminal.lock();
         let evicted = terminal.evict_warm_scrollback();
