@@ -48,6 +48,28 @@ impl TerminalState {
 pub(crate) struct Performer<'a> {
     pub state: &'a mut TerminalState,
     print: String,
+    /// The cell the print path wrote last. While set, only printing and SGR
+    /// have run since, so the cursor still sits just past that cell (on it
+    /// when a wrap is pending) and the cell is the one `recluster_at_cursor`
+    /// would find left of the cursor.
+    last_printed: Option<PrintedCell>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PrintedCell {
+    y: VisibleRowIndex,
+    idx: usize,
+    width: usize,
+    ends_in_zwj: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Disables the `last_printed` shortcut so `recluster_at_cursor` always
+    /// walks the row: the oracle the shortcut is checked against.
+    static FORCE_RECLUSTER_ROW_WALK: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    /// Row walks `recluster_at_cursor` started on this thread.
+    static RECLUSTER_ROW_WALKS: std::cell::Cell<usize> = std::cell::Cell::new(0);
 }
 
 #[cfg(test)]
@@ -104,7 +126,48 @@ impl<'a> Performer<'a> {
         Self {
             state,
             print: String::new(),
+            last_printed: None,
         }
+    }
+
+    /// Records the cell the print path just wrote; see `last_printed`.
+    fn note_printed(&mut self, y: VisibleRowIndex, idx: usize, width: usize, ends_in_zwj: bool) {
+        // `Line` drops a write that would end past column u16::MAX. Such a
+        // cell was never stored, so it must not be remembered either.
+        self.last_printed = (idx.saturating_add(width) <= usize::from(u16::MAX)).then(|| {
+            PrintedCell {
+                y,
+                idx,
+                width,
+                ends_in_zwj,
+            }
+        });
+    }
+
+    /// Whether `last_printed` is the cell left of the cursor and does not end
+    /// in ZWJ, in which case no multi-byte grapheme can continue it. Widths
+    /// never exceed two, so writing a cell invalidates any wide cell it
+    /// overlapped; the remembered cell is therefore visible, and with the
+    /// cursor just past it (or on it with a wrap pending) it is exactly the
+    /// candidate the row walk would pick.
+    fn last_printed_rules_out_zwj_tail(
+        &self,
+        cursor_x: usize,
+        cursor_y: VisibleRowIndex,
+        pending_wrap: bool,
+    ) -> bool {
+        #[cfg(test)]
+        if FORCE_RECLUSTER_ROW_WALK.with(std::cell::Cell::get) {
+            return false;
+        }
+        self.last_printed.map_or(false, |cell| {
+            let beside_cursor = if pending_wrap {
+                cell.idx == cursor_x
+            } else {
+                cell.idx.saturating_add(cell.width) == cursor_x
+            };
+            cell.y == cursor_y && beside_cursor && !cell.ends_in_zwj
+        })
     }
 
     fn recluster_at_cursor(&mut self, suffix: &str, require_prior_trailing_zwj: bool) -> bool {
@@ -114,6 +177,17 @@ impl<'a> Performer<'a> {
         let pending_wrap = self.wrap_next;
         let dec_auto_wrap = self.dec_auto_wrap;
         let right_margin = self.left_and_right_margins.end;
+
+        // ft-yccm0.2.14: once a ZWJ-tail cell has existed, `print` asks about
+        // every multi-byte grapheme. Answer from the cell just printed instead
+        // of walking the row from column 0 whenever that settles it.
+        if require_prior_trailing_zwj
+            && self.last_printed_rules_out_zwj_tail(cursor_x, cursor_y, pending_wrap)
+        {
+            return false;
+        }
+        #[cfg(test)]
+        RECLUSTER_ROW_WALKS.with(|walks| walks.set(walks.get() + 1));
 
         // `print` calls this for every multi-byte grapheme, so the common
         // outcome (a standalone emoji or CJK character that cannot continue
@@ -167,7 +241,8 @@ impl<'a> Performer<'a> {
             return false;
         }
 
-        if combined.ends_with('\u{200d}') {
+        let ends_in_zwj = combined.ends_with('\u{200d}');
+        if ends_in_zwj {
             self.zwj_tail_cell_possible = true;
         }
         let (cursor_x, wrap_next) = {
@@ -186,6 +261,7 @@ impl<'a> Performer<'a> {
 
         self.cursor.x = cursor_x;
         self.wrap_next = wrap_next;
+        self.note_printed(cursor_y, idx, combined_width, ends_in_zwj);
         true
     }
 
@@ -324,6 +400,7 @@ impl<'a> Performer<'a> {
             self.cursor.x = next_x;
             self.wrap_next = false;
         }
+        self.note_printed(y, next_x - 1, 1, false);
         true
     }
 
@@ -519,11 +596,13 @@ impl<'a> Performer<'a> {
                 g,
                 self.pen
             );
-            if g.ends_with('\u{200d}') {
+            let ends_in_zwj = g.ends_with('\u{200d}');
+            if ends_in_zwj {
                 self.zwj_tail_cell_possible = true;
             }
             self.screen_mut()
                 .set_cell_grapheme(x, y, g, print_width, pen, seqno);
+            self.note_printed(y, x, print_width, ends_in_zwj);
 
             if !wrappable {
                 self.cursor.x = next_x;
@@ -566,6 +645,21 @@ impl<'a> Performer<'a> {
                 _ => {}
             }
         }
+        // Printing only buffers text, and SGR only changes the pen. Every other
+        // action may move the cursor, scroll, or rewrite the cell
+        // `last_printed` names, so it is forgotten once that action has run
+        // (actions flush pending print first, which records a new cell).
+        let keeps_last_printed = matches!(
+            action,
+            Action::Print(_) | Action::PrintString(_) | Action::CSI(CSI::Sgr(_))
+        );
+        self.perform_action(action);
+        if !keeps_last_printed {
+            self.last_printed = None;
+        }
+    }
+
+    fn perform_action(&mut self, action: Action) {
         match action {
             Action::Print(c) => self.print(c),
             Action::PrintString(s) => self.print_string(&s),
@@ -1825,13 +1919,30 @@ mod tests {
         }
     }
 
+    struct RowWalkOverride;
+
+    impl RowWalkOverride {
+        fn set(force_walk: bool) -> Self {
+            FORCE_RECLUSTER_ROW_WALK.with(|force| force.set(force_walk));
+            Self
+        }
+    }
+
+    impl Drop for RowWalkOverride {
+        fn drop(&mut self) {
+            FORCE_RECLUSTER_ROW_WALK.with(|force| force.set(false));
+        }
+    }
+
     /// ft-yccm0.2.11: `print` skips the multi-byte continuation scan while no
-    /// cell can end in ZWJ. Forcing `zwj_tail_cell_possible` on restores the
-    /// unconditional scan, so identical terminals prove the gate is exact.
-    /// Streams mix emoji, ZWJ, VS16, combining marks, regional indicators,
-    /// CJK, SGR changes, line breaks, cursor moves and erases, and each one is
-    /// split at a varying byte so continuations also cross `advance_bytes`
-    /// calls.
+    /// cell can end in ZWJ. Forcing `zwj_tail_cell_possible` on and disabling
+    /// the ft-yccm0.2.14 last-printed shortcut restores the unconditional row
+    /// walk, so identical terminals prove both the gate and the shortcut
+    /// exact. Streams mix emoji, ZWJ, VS16, skin-tone modifiers, combining
+    /// marks, regional indicators, CJK, SGR changes, line breaks, cursor
+    /// moves, erases, insertions, deletions and scrolls (which rewrite the
+    /// cursor row without moving the cursor), and each one is split at two
+    /// varying bytes so continuations also cross `advance_bytes` calls.
     #[test]
     fn zwj_tail_gate_matches_unconditional_continuation_scan() {
         use std::convert::TryFrom;
@@ -1860,6 +1971,14 @@ mod tests {
             "\x1b[K",
             "\x1b[1;5H",
             " ",
+            "\u{1F3FD}",
+            "\x1b[1K",
+            "\x1b[S",
+            "\x1b[T",
+            "\x1b[L",
+            "\x1b[M",
+            "\x1b[@",
+            "\x1b[P",
         ];
         let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
         let mut next = || {
@@ -1876,21 +1995,102 @@ mod tests {
             }
             let bytes = stream.as_bytes();
             let split = usize::try_from(next() % (bytes.len() as u64 + 1)).unwrap_or(0);
-            let run = |force_scan: bool| {
+            let second_split = split + (bytes.len() - split) / 2;
+            let run = |force_scan: bool, force_walk: bool| {
+                let _walk = RowWalkOverride::set(force_walk);
                 let mut term = make_terminal();
                 if force_scan {
                     term.zwj_tail_cell_possible = true;
                 }
                 term.advance_bytes(&bytes[..split]);
-                term.advance_bytes(&bytes[split..]);
+                term.advance_bytes(&bytes[split..second_split]);
+                term.advance_bytes(&bytes[second_split..]);
                 snapshot_terminal(&term)
             };
+            let unconditional_walk = run(true, true);
             assert_eq!(
-                run(false),
-                run(true),
+                run(false, false),
+                unconditional_walk,
                 "ZWJ-tail gate diverged from the unconditional scan in case {case}: {stream:?}"
             );
+            assert_eq!(
+                run(true, false),
+                unconditional_walk,
+                "last-printed shortcut diverged from the row walk in case {case}: {stream:?}"
+            );
         }
+    }
+
+    /// ft-yccm0.2.14: after a ZWJ-tail cell has existed (here, a ZWJ sequence
+    /// split across calls), `zwj_tail_cell_possible` stays set, yet multi-byte
+    /// prints separated only by SGR must not walk the row: the cell printed
+    /// last answers the continuation question. The grid must match the
+    /// unconditional row walk's.
+    #[test]
+    fn multibyte_prints_after_a_zwj_tail_cell_skip_the_row_walk() {
+        let glyphs = ["😀", "🚀", "A", "中", "🫠"];
+        let mut stream = String::new();
+        for i in 0..400_usize {
+            stream.push_str(&format!(
+                "\x1b[38;5;{}m\x1b[48;5;{}m{}",
+                (i * 37) % 256,
+                (i * 101 + 7) % 256,
+                glyphs[i % glyphs.len()]
+            ));
+        }
+        let multibyte_prints = (0..400_usize)
+            .filter(|i| glyphs[i % glyphs.len()].len() > 1)
+            .count();
+
+        let run = |force_walk: bool| {
+            let _walk = RowWalkOverride::set(force_walk);
+            let mut term = make_terminal();
+            term.advance_bytes("👨\u{200D}".as_bytes());
+            assert!(term.zwj_tail_cell_possible, "a ZWJ-tail cell sets the flag");
+            term.advance_bytes(b"\r\n");
+            RECLUSTER_ROW_WALKS.with(|walks| walks.set(0));
+            // Long enough to wrap, scroll, and print with a wrap pending.
+            term.advance_bytes(stream.as_bytes());
+            let walks = RECLUSTER_ROW_WALKS.with(std::cell::Cell::get);
+            (snapshot_terminal(&term), walks)
+        };
+        let (shortcut, shortcut_walks) = run(false);
+        let (walked, walked_walks) = run(true);
+        assert_eq!(shortcut, walked, "the shortcut changed the grid");
+        assert_eq!(walked_walks, multibyte_prints, "the oracle walks every time");
+        // Only the call's first multi-byte print, which has no printed cell
+        // to consult yet, walks the row.
+        assert_eq!(shortcut_walks, 1, "{shortcut_walks} row walks");
+
+        // A ZWJ tail printed earlier in the same call still absorbs the next
+        // emoji: the shortcut defers to the walk for it.
+        let joined = |force_walk: bool| {
+            let _walk = RowWalkOverride::set(force_walk);
+            let mut term = make_terminal();
+            term.advance_bytes("👨\u{200D}\x1b[38;5;1m👩!".as_bytes());
+            snapshot_terminal(&term)
+        };
+        let shortcut = joined(false);
+        assert_eq!(shortcut, joined(true));
+        let top = &shortcut.all_lines[shortcut.all_lines.len() - 8];
+        assert_eq!(top.cells[0].0, "👨\u{200D}👩");
+        assert_eq!(top.cells[0].1, 2);
+        assert_eq!(top.cells[1].0, "!");
+
+        // A scroll rewrites the cursor row without moving the cursor, so the
+        // printed cell must be forgotten: here SU brings a ZWJ-tail cell up
+        // beside the cursor, and the next emoji must join it.
+        let scrolled = |force_walk: bool| {
+            let _walk = RowWalkOverride::set(force_walk);
+            let mut term = make_terminal();
+            term.advance_bytes("\x1b[2;1H👨\u{200D}".as_bytes());
+            term.advance_bytes("\x1b[1;1H😀\x1b[S👩".as_bytes());
+            snapshot_terminal(&term)
+        };
+        let shortcut = scrolled(false);
+        assert_eq!(shortcut, scrolled(true));
+        let top = &shortcut.all_lines[shortcut.all_lines.len() - 8];
+        assert_eq!(top.cells[0].0, "👨\u{200D}👩");
     }
 
     /// Round-5 D1 (ft-round5-gauntlet-lw0s7.10): the parser printable-run
