@@ -149,6 +149,10 @@ pub struct PageList {
     next_serial: u64,
     /// The stable index the next appended row takes.
     next_stable: StableRowIndex,
+    /// Pages taken from the pool for new rows, since the list was built.
+    pages_reused: u64,
+    /// Pages allocated for new rows because the pool was empty.
+    pages_allocated: u64,
 }
 
 impl std::fmt::Debug for PageList {
@@ -206,6 +210,8 @@ impl PageList {
             range_floors: Vec::new(),
             next_serial: first_serial,
             next_stable: 0,
+            pages_reused: 0,
+            pages_allocated: 0,
         }
     }
 
@@ -243,8 +249,25 @@ impl PageList {
         self.sealed
     }
 
+    /// Idle pages in the pool right now. A list scrolling at its cap
+    /// recycles its front page into the pool and takes it back out when the
+    /// tail page fills, so this alternates between 0 and 1: what proves
+    /// recycling is [`Self::pages_reused`] growing while
+    /// [`Self::pages_allocated`] does not.
     pub fn pooled_page_count(&self) -> usize {
         self.pool.len()
+    }
+
+    /// Pages taken back out of the pool for new rows, since the list was
+    /// built.
+    pub fn pages_reused(&self) -> u64 {
+        self.pages_reused
+    }
+
+    /// Pages allocated for new rows because the pool was empty, since the
+    /// list was built.
+    pub fn pages_allocated(&self) -> u64 {
+        self.pages_allocated
     }
 
     pub fn dirty_floor(&self) -> SequenceNo {
@@ -684,8 +707,12 @@ impl PageList {
     fn append_row(&mut self, seqno: SequenceNo) {
         if self.pages.back().is_none_or(PageSlot::is_full) {
             let page = match self.pool.pop() {
-                Some(page) => page,
+                Some(page) => {
+                    self.pages_reused += 1;
+                    page
+                }
                 None => {
+                    self.pages_allocated += 1;
                     let serial = self.allocate_serial();
                     Arc::new(Page::new(self.cols, self.page_rows, serial))
                 }

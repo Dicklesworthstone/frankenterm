@@ -105,12 +105,31 @@ fn steady_state(rows: Rows) {
     // steady sizes.
     scroll_rows(&mut list, rows, 4 * HOT_CAP, &mut seqno);
     assert_eq!(list.retained_rows(), HOT_CAP);
+    // The pool alternates between 0 and 1 pages at the cap (the front page
+    // goes in when its last row is trimmed, and comes back out when the tail
+    // page fills), so its size at one instant proves nothing. Reuse does.
     assert!(
-        list.pooled_page_count() > 0,
-        "pages recycle through the pool"
+        list.pages_reused() > 0,
+        "pages recycle through the pool during warm-up"
     );
+    let (reused, allocated) = (list.pages_reused(), list.pages_allocated());
 
     let (in_scroll, in_cycles) = scroll_rows(&mut list, rows, STEADY_SCROLLS, &mut seqno);
+    // Every page the steady phase needs comes back out of the pool: one per
+    // `page_rows` scrolls, and not one new allocation.
+    let page_rows = list.page_rows() as usize;
+    assert!(
+        list.pages_reused() - reused >= (STEADY_SCROLLS / page_rows - 1) as u64,
+        "pages recycle through the pool: {} reused in {} scrolls of {}-row pages",
+        list.pages_reused() - reused,
+        STEADY_SCROLLS,
+        page_rows
+    );
+    assert_eq!(
+        list.pages_allocated(),
+        allocated,
+        "the steady phase allocates no page"
+    );
     assert_eq!(
         in_scroll, 0,
         "{} steady-state scrolls allocated {} bytes",
