@@ -19,7 +19,6 @@ no_std = ["dep:heapless"]
 
 [dependencies]
 heapless = {workspace = true, optional = true }
-utf8parse.workspace = true
 
 [dev-dependencies]
 k9.workspace = true

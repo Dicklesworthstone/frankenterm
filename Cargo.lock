@@ -12128,7 +12128,6 @@ version = "0.7.0"
 dependencies = [
  "heapless 0.9.3",
  "k9",
- "utf8parse",
 ]
 
 [[package]]

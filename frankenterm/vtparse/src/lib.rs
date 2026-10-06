@@ -10,9 +10,15 @@
 //! You may wish to use `termwiz::escape::parser::Parser` in the
 //! [termwiz](https://docs.rs/termwiz/) crate if you don't want to have to research
 //! all those possible escape sequences for yourself.
+//!
+//! In the ground state the input is UTF-8 first: every byte above 0x7f starts
+//! a multi-byte sequence or is ill-formed. Ill-formed input prints one
+//! U+FFFD per maximal subpart (Unicode 15, section 3.9), and the byte that
+//! breaks a sequence is parsed again, so no valid character or control after
+//! it is lost. Raw 8-bit C1 bytes are therefore not controls in the ground
+//! state; C1 controls encoded as UTF-8 (U+0080..U+009F) still are.
 #![allow(clippy::upper_case_acronyms)]
 #![cfg_attr(not(feature = "std"), no_std)]
-use utf8parse::Parser as Utf8Parser;
 mod enums;
 use crate::enums::*;
 mod transitions;
@@ -474,8 +480,39 @@ pub struct VTParser {
     max_string_sequence_bytes: usize,
     pending_string_sequence_error: Option<StringSequenceError>,
 
-    utf8_parser: Utf8Parser,
+    /// The open UTF-8 sequence while in `State::Utf8Sequence`: its lead
+    /// byte, the continuation bytes still missing, and the code point
+    /// decoded so far.
+    utf8_lead: u8,
+    utf8_remaining: u8,
+    utf8_codepoint: u32,
     utf8_return_state: State,
+}
+
+/// The length of the UTF-8 sequence `lead` starts, or 0 when `lead` cannot
+/// start one (Unicode 15, table 3-7).
+#[inline]
+const fn utf8_sequence_len(lead: u8) -> u8 {
+    match lead {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => 0,
+    }
+}
+
+/// The bytes that may follow `lead` (table 3-7). The narrow ranges exclude
+/// overlong forms, surrogates and values above U+10FFFF; every later
+/// continuation byte is 0x80..=0xbf.
+#[inline]
+const fn utf8_second_byte_range(lead: u8) -> (u8, u8) {
+    match lead {
+        0xe0 => (0xa0, 0xbf),
+        0xed => (0x80, 0x9f),
+        0xf0 => (0x90, 0xbf),
+        0xf4 => (0x80, 0x8f),
+        _ => (0x80, 0xbf),
+    }
 }
 
 /// Represents a parameter to a CSI-based escaped sequence.
@@ -578,7 +615,9 @@ impl VTParser {
             params_full: false,
             current_param: None,
 
-            utf8_parser: Utf8Parser::new(),
+            utf8_lead: 0,
+            utf8_remaining: 0,
+            utf8_codepoint: 0,
             #[cfg(any(feature = "std", feature = "alloc"))]
             apc_data: Vec::new(),
             #[cfg(any(feature = "std", feature = "alloc"))]
@@ -825,80 +864,96 @@ impl VTParser {
                 }
             }
 
-            Action::Utf8 => self.next_utf8(actor, param),
+            // `parse_byte` decodes UTF-8 itself and never dispatches this.
+            Action::Utf8 => {}
         }
     }
 
-    // Process a utf-8 multi-byte sequence.
-    // The state tables emit Action::Utf8 to initiate a multi-byte
-    // sequence, and once we're in the utf-8 state we'll defer to
-    // this method for each byte until the Decode struct is signalled
-    // that we're done.
-    // We use the REPLACEMENT_CHARACTER for invalid sequences.
-    // We return to the ground state after each codepoint, successful
-    // or otherwise.
+    /// Begins a UTF-8 sequence at `lead` in the ground or OSC string state.
+    /// A byte that cannot start a sequence is a maximal subpart on its own.
+    fn start_utf8(&mut self, actor: &mut dyn VTActor, lead: u8) {
+        let len = utf8_sequence_len(lead);
+        if len == 0 {
+            let state = self.state;
+            self.deliver_utf8(actor, state, char::REPLACEMENT_CHARACTER);
+            return;
+        }
+        self.utf8_lead = lead;
+        self.utf8_remaining = len - 1;
+        // The lead's payload bits: 5, 4 or 3 for 2-, 3- or 4-byte sequences.
+        self.utf8_codepoint = u32::from(lead & (0x7f >> len));
+        self.utf8_return_state = self.state;
+        self.state = State::Utf8Sequence;
+    }
+
+    /// Feeds one byte to the open UTF-8 sequence. A byte that does not
+    /// continue it ends the sequence with one U+FFFD for the bytes so far
+    /// (a maximal subpart) and is then parsed afresh, so a character, an
+    /// ESC or an OSC terminator after a broken sequence is never lost.
     fn next_utf8(&mut self, actor: &mut dyn VTActor, byte: u8) {
-        struct Decoder {
-            codepoint: Option<char>,
+        let second = self.utf8_remaining + 1 == utf8_sequence_len(self.utf8_lead);
+        let (low, high) = if second {
+            utf8_second_byte_range(self.utf8_lead)
+        } else {
+            (0x80, 0xbf)
+        };
+        let return_state = self.utf8_return_state;
+        if !(low..=high).contains(&byte) {
+            self.deliver_utf8(actor, return_state, char::REPLACEMENT_CHARACTER);
+            self.parse_byte(byte, actor);
+            return;
+        }
+        self.utf8_codepoint = (self.utf8_codepoint << 6) | u32::from(byte & 0x3f);
+        self.utf8_remaining -= 1;
+        if self.utf8_remaining == 0 {
+            // The byte ranges admit only scalar values.
+            let c = char::from_u32(self.utf8_codepoint).unwrap_or(char::REPLACEMENT_CHARACTER);
+            self.deliver_utf8(actor, return_state, c);
+        }
+    }
+
+    /// Hands a decoded character to the state the sequence began in and
+    /// returns there.
+    fn deliver_utf8(&mut self, actor: &mut dyn VTActor, return_state: State, c: char) {
+        // Slightly gross special cases C1 controls that were
+        // encoded as UTF-8 rather than emitted as raw 8-bit.
+        // If the decoded value is in the byte range, and that
+        // value would cause a state transition, then we process
+        // that state transition rather than performing the default
+        // string accumulation.
+        if c as u32 <= 0xff {
+            let byte = ((c as u32) & 0xff) as u8;
+
+            let (action, state) = lookup(return_state, byte);
+            if action == Action::Execute || (state != return_state && state != State::Utf8Sequence)
+            {
+                self.state = return_state;
+                self.action(lookup_exit(return_state), 0, actor);
+                self.action(action, byte, actor);
+                self.action(lookup_entry(state), 0, actor);
+                self.state = state;
+                return;
+            }
         }
 
-        impl utf8parse::Receiver for Decoder {
-            fn codepoint(&mut self, c: char) {
-                self.codepoint.replace(c);
-            }
-
-            fn invalid_sequence(&mut self) {
-                self.codepoint(char::REPLACEMENT_CHARACTER);
-            }
-        }
-
-        let mut decoder = Decoder { codepoint: None };
-
-        self.utf8_parser.advance(&mut decoder, byte);
-        if let Some(c) = decoder.codepoint {
-            // Slightly gross special cases C1 controls that were
-            // encoded as UTF-8 rather than emitted as raw 8-bit.
-            // If the decoded value is in the byte range, and that
-            // value would cause a state transition, then we process
-            // that state transition rather than performing the default
-            // string accumulation.
-            if c as u32 <= 0xff {
-                let byte = ((c as u32) & 0xff) as u8;
-
-                let (action, state) = lookup(self.utf8_return_state, byte);
-                if action == Action::Execute
-                    || (state != self.utf8_return_state && state != State::Utf8Sequence)
-                {
-                    self.action(lookup_exit(self.utf8_return_state), 0, actor);
-                    self.action(action, byte, actor);
-                    self.action(lookup_entry(state), 0, actor);
-                    self.utf8_return_state = self.state;
-                    self.state = state;
-                    return;
+        match return_state {
+            State::Ground => actor.print(c),
+            State::OscString => {
+                if let Some(error) = self.osc.put(c, self.max_string_sequence_bytes) {
+                    self.record_string_sequence_error(error);
                 }
             }
-
-            match self.utf8_return_state {
-                State::Ground => actor.print(c),
-                State::OscString => {
-                    if let Some(error) = self.osc.put(c, self.max_string_sequence_bytes) {
-                        self.record_string_sequence_error(error);
-                    }
-                }
-                state => panic!("unreachable state {:?}", state),
-            };
-            self.state = self.utf8_return_state;
-        }
+            state => panic!("unreachable state {:?}", state),
+        };
+        self.state = return_state;
     }
 
     /// Parse a single byte.  This may result in a call to one of the
     /// methods on the provided `actor`.
     #[inline(always)]
     pub fn parse_byte(&mut self, byte: u8, actor: &mut dyn VTActor) {
-        // While in utf-8 parsing mode, co-opt the vt state
-        // table and instead use the utf-8 state table from the
-        // parser.  It will drop us back into the Ground state
-        // after each recognized (or invalid) codepoint.
+        // While a UTF-8 sequence is open, bytes go to the decoder, which
+        // returns to the state the sequence began in when it ends.
         if self.state == State::Utf8Sequence {
             self.next_utf8(actor, byte);
             return;
@@ -906,13 +961,19 @@ impl VTParser {
 
         let (action, state) = lookup(self.state, byte);
 
+        // The tables start sequences at the leads 0xc2..=0xf4 in the ground
+        // and OSC string states. In the ground state every other byte above
+        // 0x7f is ill-formed UTF-8 as well, including raw 8-bit C1 bytes,
+        // which a UTF-8 stream cannot carry.
+        if action == Action::Utf8 || (self.state == State::Ground && byte > 0x7f) {
+            self.start_utf8(actor, byte);
+            return;
+        }
+
         if state != self.state {
-            if state != State::Utf8Sequence {
-                self.action(lookup_exit(self.state), 0, actor);
-            }
+            self.action(lookup_exit(self.state), 0, actor);
             self.action(action, byte, actor);
             self.action(lookup_entry(state), byte, actor);
-            self.utf8_return_state = self.state;
             self.state = state;
         } else {
             self.action(action, byte, actor);
@@ -2058,5 +2119,154 @@ mod test {
     #[test]
     fn utf8_cjk() {
         assert_eq!(parse_as_vec("中".as_bytes()), vec![VTAction::Print('中')]);
+    }
+
+    // --- Ill-formed UTF-8 (ft-fjxga): one U+FFFD per maximal subpart, and
+    // the byte that breaks a sequence is parsed again. ---
+
+    const FFFD: char = char::REPLACEMENT_CHARACTER;
+
+    fn prints(text: &str) -> Vec<VTAction> {
+        text.chars().map(VTAction::Print).collect()
+    }
+
+    #[test]
+    fn utf8_truncated_sequence_keeps_the_next_character() {
+        // utf8parse used to swallow the `b`.
+        assert_eq!(parse_as_vec(b"a\xc3b"), prints("a\u{fffd}b"));
+        assert_eq!(parse_as_vec(b"a\xf0\x9f\x98b"), prints("a\u{fffd}b"));
+        assert_eq!(parse_as_vec(b"a\xe2\x82"), prints("a"));
+    }
+
+    #[test]
+    fn utf8_truncated_sequence_keeps_an_interrupting_escape() {
+        // utf8parse used to swallow the ESC, so `[1m` printed as text.
+        assert_eq!(
+            parse_as_vec(b"a\xe4\x1b[1mb"),
+            vec![
+                VTAction::Print('a'),
+                VTAction::Print(FFFD),
+                VTAction::CsiDispatch {
+                    params: vec![CsiParam::Integer(1)],
+                    parameters_truncated: false,
+                    byte: b'm',
+                },
+                VTAction::Print('b'),
+            ]
+        );
+        assert_eq!(
+            parse_as_vec(b"\xe4\r\n"),
+            vec![
+                VTAction::Print(FFFD),
+                VTAction::ExecuteC0orC1(b'\r'),
+                VTAction::ExecuteC0orC1(b'\n'),
+            ]
+        );
+    }
+
+    #[test]
+    fn utf8_truncated_sequence_keeps_the_osc_terminator() {
+        // A swallowed BEL used to leave the OSC open, absorbing the output.
+        assert_eq!(
+            parse_as_vec(b"\x1b]0;t\xe4\x07x"),
+            vec![
+                VTAction::OscDispatch(vec![b"0".to_vec(), "t\u{fffd}".as_bytes().to_vec()]),
+                VTAction::Print('x'),
+            ]
+        );
+    }
+
+    #[test]
+    fn utf8_ill_formed_bytes_get_one_replacement_per_maximal_subpart() {
+        let cases: &[(&[u8], &str)] = &[
+            (b"a\x80b", "a\u{fffd}b"),
+            (b"a\xbf\xbfb", "a\u{fffd}\u{fffd}b"),
+            (b"a\xc0\xc1\xf5\xffb", "a\u{fffd}\u{fffd}\u{fffd}\u{fffd}b"),
+            // Surrogate, overlong and above-U+10FFFF forms break at the second byte.
+            (b"a\xed\xa0\x80b", "a\u{fffd}\u{fffd}\u{fffd}b"),
+            (b"a\xe0\x80\xafb", "a\u{fffd}\u{fffd}\u{fffd}b"),
+            (b"a\xf0\x8f\xbf\xbfb", "a\u{fffd}\u{fffd}\u{fffd}\u{fffd}b"),
+            (b"a\xf4\x90\x80\x80b", "a\u{fffd}\u{fffd}\u{fffd}\u{fffd}b"),
+            // A lead right after a lead starts the next sequence.
+            (b"\xc3\xc3\xa9", "\u{fffd}\u{e9}"),
+            // The edges of each well-formed range still decode.
+            (b"\xe0\xa0\x80\xed\x9f\xbf", "\u{800}\u{d7ff}"),
+            (b"\xf0\x90\x80\x80\xf4\x8f\xbf\xbf", "\u{10000}\u{10ffff}"),
+        ];
+        for (bytes, expected) in cases {
+            assert_eq!(parse_as_vec(bytes), prints(expected), "{:?}", bytes);
+        }
+    }
+
+    #[test]
+    fn utf8_raw_c1_bytes_are_ill_formed_in_ground_but_encoded_c1_still_executes() {
+        // A raw 0x9b is a stray continuation byte, not CSI.
+        assert_eq!(parse_as_vec(b"\x9b31m"), prints("\u{fffd}31m"));
+        assert_eq!(
+            parse_as_vec("\u{9b}31m".as_bytes()),
+            vec![VTAction::CsiDispatch {
+                params: vec![CsiParam::Integer(31)],
+                parameters_truncated: false,
+                byte: b'm',
+            }]
+        );
+        // Inside strings, raw C1 keeps its 8-bit meaning: 0x9c ends an OSC.
+        assert_eq!(
+            parse_as_vec(b"\x1b]0;t\x9cx"),
+            vec![
+                VTAction::OscDispatch(vec![b"0".to_vec(), b"t".to_vec()]),
+                VTAction::Print('x'),
+            ]
+        );
+    }
+
+    /// The decoder agrees with `String::from_utf8_lossy`, which substitutes
+    /// maximal subparts, on every string of up to four bytes drawn from the
+    /// boundary bytes of table 3-7, fed whole and one byte per call. 0xc2
+    /// is left out because it encodes the C1 controls, which execute.
+    #[test]
+    fn utf8_decoding_matches_from_utf8_lossy_on_boundary_bytes() {
+        const ALPHABET: [u8; 20] = [
+            b'A', 0x80, 0x8f, 0x90, 0x9f, 0xa0, 0xbf, 0xc0, 0xc3, 0xdf, 0xe0, 0xe1, 0xed, 0xee,
+            0xef, 0xf0, 0xf1, 0xf4, 0xf5, 0xff,
+        ];
+        let mut bytes = Vec::new();
+        for len in 1..=4u32 {
+            for mut index in 0..ALPHABET.len().pow(len) {
+                bytes.clear();
+                for _ in 0..len {
+                    bytes.push(ALPHABET[index % ALPHABET.len()]);
+                    index /= ALPHABET.len();
+                }
+                // A trailing open sequence prints nothing until it ends;
+                // the final 'Z' closes it.
+                bytes.push(b'Z');
+                let expected = prints(&alloc::string::String::from_utf8_lossy(&bytes));
+                assert_eq!(parse_as_vec(&bytes), expected, "{:?}", bytes);
+
+                let mut parser = VTParser::new();
+                let mut actor = CollectingVTActor::default();
+                for &byte in &bytes {
+                    parser.parse_byte(byte, &mut actor);
+                }
+                assert_eq!(actor.into_vec(), expected, "bytewise {:?}", bytes);
+                assert!(parser.is_ground());
+            }
+        }
+    }
+
+    #[test]
+    fn utf8_every_scalar_value_decodes() {
+        let mut parser = VTParser::new();
+        let mut buf = [0u8; 4];
+        for value in 0xa0..=0x10ffffu32 {
+            let c = match char::from_u32(value) {
+                Some(c) => c,
+                None => continue,
+            };
+            let mut actor = CollectingVTActor::default();
+            parser.parse(c.encode_utf8(&mut buf).as_bytes(), &mut actor);
+            assert_eq!(actor.into_vec(), vec![VTAction::Print(c)]);
+        }
     }
 }

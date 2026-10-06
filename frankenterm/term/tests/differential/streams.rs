@@ -129,6 +129,21 @@ pub fn adversarial_cases() -> Vec<(&'static str, Vec<u8>)> {
                 0xF4, 0x90, 0x80, 0x80, b'f',
             ],
         ),
+        // ft-fjxga: the byte that breaks a UTF-8 sequence is parsed again,
+        // so an ESC, an OSC terminator or a control after it survives.
+        (
+            "utf8_truncated_then_csi",
+            b"a\xe4\x1b[1mb\xf0\x9f\x98\x1b[0mc".to_vec(),
+        ),
+        (
+            "utf8_truncated_in_osc_then_bel",
+            b"\x1b]0;t\xe4\x07after".to_vec(),
+        ),
+        (
+            "utf8_truncated_then_controls",
+            b"x\xc3\r\ny\xe2\x82\tz".to_vec(),
+        ),
+        ("latin1_gr_bytes", (0xa0..=0xffu8).collect()),
         (
             "c1_controls_utf8",
             "a\u{84}b\u{85}c\u{9b}31md\u{9d}0;t\u{9c}e".as_bytes().to_vec(),
