@@ -1084,10 +1084,17 @@ impl ColdSeamReflow {
             line.set_last_cell_was_wrapped(false, seqno);
             prefix.append_line(line, seqno);
         }
-        // A cold-only consumer must reproduce exactly these prefix rows. A
-        // paragraph-global policy can choose different breaks without the
-        // resident suffix; refuse that transaction rather than publish two
-        // geometries. Empty prefixes deliberately occupy zero visual rows.
+        // Every cold consumer derives the prefix rows from the published cold
+        // text alone (an incomplete-prefix wrap), so that wrap IS the prefix
+        // geometry. The paragraph-global DP planner can break the prefix
+        // differently while it also sees the resident suffix (the prefix's
+        // last row is then a middle row, not the slack-exempt final row), and
+        // since bounded DP covers long paragraphs (2c417db7b) that is common.
+        // Refusing left the seam unsettled and failed the whole cold resize
+        // preparation (ft-4w698). Instead the seam is a forced break: the
+        // cold prefix keeps its own geometry, the resident rows keep the full
+        // plan's tail, which starts at the same text offset, and every
+        // consumer still sees one geometry. Empty prefixes occupy zero rows.
         if !wrapped.is_empty() {
             let independent = Screen::wrap_cold_logical_line(
                 prefix.clone(),
@@ -1098,10 +1105,16 @@ impl ColdSeamReflow {
                 ScreenLineRead::MAX_ROWS,
             )
             .ok_or_else(|| anyhow::anyhow!("cold seam prefix row limit"))?;
-            anyhow::ensure!(
-                independent == wrapped,
-                "cold seam prefix requires full paragraph geometry"
-            );
+            if independent != wrapped {
+                log::debug!(
+                    target: "frankenterm_term::screen::reflow_profile",
+                    "cold_seam_prefix_break frontier={} cols={} paragraph_prefix_rows={} cold_prefix_rows={}",
+                    self.frontier,
+                    self.witness.cols,
+                    wrapped.len(),
+                    independent.len(),
+                );
+            }
         }
         let wrap_elapsed = profile_start.map(|start| start.elapsed());
         let mut replacements = BTreeMap::new();
@@ -2782,6 +2795,9 @@ pub struct Screen {
 
     /// config so we can access Maximum number of lines of scrollback
     config: Arc<dyn TerminalConfiguration>,
+    /// The scrollback size and tier settings of `config`, refreshed per parse
+    /// batch so scrolling reads no configuration per row.
+    scrollback_policy: ScrollbackPolicy,
     scrollback_tiering: ScrollbackTieringState,
     /// Authenticated cold-store identity and original half-open prefix boundary
     /// retained while a checkpoint is restored and raw output is replayed off
@@ -3994,12 +4010,32 @@ impl ScrollbackTieringState {
     }
 }
 
-fn scrollback_hot_size(config: &Arc<dyn TerminalConfiguration>, allow_scrollback: bool) -> usize {
+/// `scrollback_size` and `scrollback_tier_config` of a configuration,
+/// captured when the configuration is installed and at the start of every
+/// parse batch (ft-yccm0.2.4). The GUI's `TermConfig` locks a mutex and
+/// clones an `Arc` per read, and scrolling used to read these several times
+/// per row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScrollbackPolicy {
+    size: usize,
+    tier: crate::config::ScrollbackTierConfig,
+}
+
+impl ScrollbackPolicy {
+    fn capture(config: &dyn TerminalConfiguration) -> Self {
+        Self {
+            size: config.scrollback_size(),
+            tier: config.scrollback_tier_config(),
+        }
+    }
+}
+
+fn scrollback_hot_size(policy: &ScrollbackPolicy, allow_scrollback: bool) -> usize {
     if !allow_scrollback {
         return 0;
     }
-    let total = config.scrollback_size();
-    let tier = config.scrollback_tier_config();
+    let total = policy.size;
+    let tier = policy.tier;
     if !tier.enabled {
         return total;
     }
@@ -4986,7 +5022,7 @@ impl Screen {
             // bytes. Source validation has its own retained-interval fence.
             // Re-probing storage here can observe Busy just after validation
             // and turn an unchanged mapping into a spurious sequence advance.
-            self.cold_visual_layout_at_current_coordinates()
+            self.cold_visual_layout_for_comparison()
                 .is_none_or(|current| {
                     if std::ptr::eq(next.as_ref(), current) {
                         return false;
@@ -5269,6 +5305,23 @@ impl Screen {
                     .is_some_and(|rows| rows.start == layout.source.start)
                     && interval.retains(&layout.interval, layout.source.clone())
             })
+    }
+
+    /// The installed layout as a baseline for deciding whether a read changes
+    /// coordinates. Unlike [`Self::cold_visual_layout_at_current_coordinates`]
+    /// it survives the resident frontier advancing: ordinary output spills
+    /// rows below a Canonical layout without remapping its rows, and
+    /// `extends` decides whether that older prefix is still exact. Treating
+    /// the stale baseline as absent reported every append as a layout change,
+    /// which re-fenced cold selections that the append never touched
+    /// (ft-gufyy). A different witness or a frontier that moved backwards
+    /// (clear, replacement, resize) still yields no baseline.
+    #[cfg(feature = "use_serde")]
+    fn cold_visual_layout_for_comparison(&self) -> Option<&ColdVisualLayout> {
+        let layout = self.cold_visual_layout.as_deref()?;
+        (self.matches_coordinate_witness(&layout.witness)
+            && layout.resident_frontier <= self.phys_to_stable_row_index(0))
+        .then_some(layout)
     }
 
     #[cfg(feature = "use_serde")]
@@ -6131,12 +6184,13 @@ impl Screen {
     ) -> Result<Screen, ()> {
         let physical_rows = size.rows.max(1);
         let physical_cols = size.cols.max(1);
+        let scrollback_policy = ScrollbackPolicy::capture(config.as_ref());
 
         let capacity = if checkpoint_restore {
             0
         } else {
             physical_rows
-                .checked_add(scrollback_hot_size(config, allow_scrollback))
+                .checked_add(scrollback_hot_size(&scrollback_policy, allow_scrollback))
                 .ok_or(())?
         };
         let mut lines = VecDeque::new();
@@ -6152,6 +6206,7 @@ impl Screen {
         Ok(Screen {
             lines,
             config: Arc::clone(config),
+            scrollback_policy,
             scrollback_tiering: ScrollbackTieringState::default(),
             recovery_scrollback: None,
             allow_scrollback,
@@ -6223,8 +6278,15 @@ impl Screen {
             self.last_resize_wrap_gate_payload = None;
         }
         self.config = Arc::clone(config);
+        self.scrollback_policy = ScrollbackPolicy::capture(config.as_ref());
         self.resize_wrap_policy = resize_wrap_policy;
         self.clear_rewrap_line_cache();
+    }
+
+    /// Re-reads [`ScrollbackPolicy`] from the installed configuration; see
+    /// `TerminalState::refresh_batch_config`.
+    pub(crate) fn refresh_scrollback_policy(&mut self) {
+        self.scrollback_policy = ScrollbackPolicy::capture(self.config.as_ref());
     }
 
     #[cfg(feature = "use_serde")]
@@ -6293,14 +6355,15 @@ impl Screen {
         }
 
         let resident_scrollback = self.lines.len().saturating_sub(self.physical_rows);
-        let configured_scrollback = live_config.scrollback_size();
+        let live_policy = ScrollbackPolicy::capture(live_config.as_ref());
+        let configured_scrollback = live_policy.size;
         if resident_scrollback > configured_scrollback {
             return Err(ScrollbackActivationError::ConfiguredRetentionInsufficient);
         }
 
-        let tier = live_config.scrollback_tier_config();
+        let tier = live_policy.tier;
         let desired_hot_rows = if tier.enabled {
-            scrollback_hot_size(live_config, true)
+            scrollback_hot_size(&live_policy, true)
         } else {
             resident_scrollback
         };
@@ -6404,14 +6467,14 @@ impl Screen {
     }
 
     fn hot_scrollback_size(&self) -> usize {
-        scrollback_hot_size(&self.config, self.allow_scrollback)
+        scrollback_hot_size(&self.scrollback_policy, self.allow_scrollback)
     }
 
     fn tiered_scrollback_warm_max_bytes(&self) -> usize {
         if !self.allow_scrollback {
             return 0;
         }
-        let tier = self.config.scrollback_tier_config();
+        let tier = self.scrollback_policy.tier;
         if !tier.enabled {
             return 0;
         }
@@ -6422,8 +6485,8 @@ impl Screen {
         if !self.allow_scrollback {
             return 0;
         }
-        self.config
-            .scrollback_size()
+        self.scrollback_policy
+            .size
             .saturating_sub(self.hot_scrollback_size())
     }
 
@@ -6533,7 +6596,7 @@ impl Screen {
         if self.hot_scrollback_size() == 0 {
             return true;
         }
-        let tier = self.config.scrollback_tier_config();
+        let tier = self.scrollback_policy.tier;
         if !tier.enabled {
             return true;
         }
@@ -6755,7 +6818,7 @@ impl Screen {
         const MAX_COLUMNS: usize = 2048;
         if !self.allow_scrollback
             || self.recovery_scrollback.is_some()
-            || !self.config.scrollback_tier_config().enabled
+            || !self.scrollback_policy.tier.enabled
             || !self
                 .config
                 .scrollback_spill_sink()
@@ -6798,7 +6861,7 @@ impl Screen {
         if !self.allow_scrollback {
             return 0;
         }
-        let tier = self.config.scrollback_tier_config();
+        let tier = self.scrollback_policy.tier;
         if !tier.enabled {
             return 0;
         }
@@ -8950,10 +9013,10 @@ impl Screen {
         cold_sink_retained_lines: usize,
         cold_sink_retained_bytes: usize,
     ) -> TieredScrollbackStatus {
-        let tier = self.config.scrollback_tier_config();
+        let tier = self.scrollback_policy.tier;
         let tiering_enabled = self.allow_scrollback && tier.enabled;
         let configured_scrollback_rows = if self.allow_scrollback {
-            self.config.scrollback_size()
+            self.scrollback_policy.size
         } else {
             0
         };
@@ -12211,6 +12274,13 @@ pub(crate) mod tests {
             cold_sink: Some(sink.clone()),
             ..TestTermConfig::default()
         });
+        // The direct install keeps the fixture's coordinate identity, but
+        // Screen caches the scrollback size and tier per configuration
+        // (9b987f57d). Re-read them as the next parse batch would, or the
+        // spill below still runs under the fixture's tier-disabled policy and
+        // never reaches the sink or the fragment republication (ft-4w698
+        // follow-up).
+        screen.refresh_scrollback_policy();
         let read = screen
             .capture_line_read(0..1)
             .unwrap()

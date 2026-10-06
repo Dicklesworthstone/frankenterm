@@ -41,6 +41,162 @@ impl TerminalState {
     pub fn pending_tmux_title_bytes(&self) -> usize {
         self.accumulating_title.as_ref().map_or(0, String::len)
     }
+
+    /// Every mode and register that shapes how later output is applied, as
+    /// `(name, value)` pairs in a fixed order. Most of them are otherwise
+    /// private, including the pending-wrap flag. The differential engine
+    /// harness (ft-yccm0.1.8) compares this between engines after every
+    /// chunk; seqnos and internal fast-path flags are deliberately left out.
+    pub fn mode_snapshot(&self) -> Vec<(&'static str, String)> {
+        fn sorted<K: Ord + std::fmt::Debug, V: std::fmt::Debug>(
+            entries: impl Iterator<Item = (K, V)>,
+        ) -> String {
+            let mut entries: Vec<(K, V)> = entries.collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            format!("{:?}", entries)
+        }
+
+        // A saved cursor records the seqno of the batch that saved it, and
+        // engines count batches differently (`advance_bytes` bumps the seqno
+        // for every call, `perform_actions` skips empty batches). Zero it as
+        // the live cursor's is; position, wrap state, pen, origin mode and
+        // charsets are still compared.
+        fn saved_cursor(saved: &Option<super::SavedCursor>) -> String {
+            let normalized = saved.as_ref().map(|saved| {
+                let mut saved = saved.clone();
+                saved.position.seqno = 0;
+                saved
+            });
+            format!("{:?}", normalized)
+        }
+
+        vec![
+            ("wrap_next", format!("{:?}", self.wrap_next)),
+            ("insert", format!("{:?}", self.insert)),
+            ("dec_auto_wrap", format!("{:?}", self.dec_auto_wrap)),
+            ("dec_origin_mode", format!("{:?}", self.dec_origin_mode)),
+            (
+                "reverse_wraparound_mode",
+                format!("{:?}", self.reverse_wraparound_mode),
+            ),
+            (
+                "reverse_video_mode",
+                format!("{:?}", self.reverse_video_mode),
+            ),
+            (
+                "top_and_bottom_margins",
+                format!("{:?}", self.top_and_bottom_margins),
+            ),
+            (
+                "left_and_right_margins",
+                format!("{:?}", self.left_and_right_margins),
+            ),
+            (
+                "left_and_right_margin_mode",
+                format!("{:?}", self.left_and_right_margin_mode),
+            ),
+            ("newline_mode", format!("{:?}", self.newline_mode)),
+            (
+                "saved_dec_private_modes",
+                sorted(self.saved_dec_private_modes.iter()),
+            ),
+            (
+                "application_cursor_keys",
+                format!("{:?}", self.application_cursor_keys),
+            ),
+            (
+                "application_keypad",
+                format!("{:?}", self.application_keypad),
+            ),
+            ("modify_other_keys", format!("{:?}", self.modify_other_keys)),
+            ("dec_ansi_mode", format!("{:?}", self.dec_ansi_mode)),
+            ("bracketed_paste", format!("{:?}", self.bracketed_paste)),
+            ("focus_tracking", format!("{:?}", self.focus_tracking)),
+            ("mouse_tracking", format!("{:?}", self.mouse_tracking)),
+            (
+                "button_event_mouse",
+                format!("{:?}", self.button_event_mouse),
+            ),
+            ("any_event_mouse", format!("{:?}", self.any_event_mouse)),
+            ("mouse_encoding", format!("{:?}", self.mouse_encoding)),
+            ("cursor_visible", format!("{:?}", self.cursor_visible)),
+            ("keyboard_encoding", format!("{:?}", self.keyboard_encoding)),
+            (
+                "synchronized_output",
+                format!("{:?}", self.synchronized_output),
+            ),
+            (
+                "sixel_display_mode",
+                format!("{:?}", self.sixel_display_mode),
+            ),
+            (
+                "sixel_scrolls_right",
+                format!("{:?}", self.sixel_scrolls_right),
+            ),
+            (
+                "use_private_color_registers_for_each_graphic",
+                format!("{:?}", self.use_private_color_registers_for_each_graphic),
+            ),
+            ("color_map", sorted(self.color_map.iter())),
+            ("g0_charset", format!("{:?}", self.g0_charset)),
+            ("g1_charset", format!("{:?}", self.g1_charset)),
+            ("shift_out", format!("{:?}", self.shift_out)),
+            (
+                "tab_stops",
+                format!("{:?} width {}", self.tabs.tabs, self.tabs.tab_width),
+            ),
+            ("pen", format!("{:?}", self.pen)),
+            (
+                "alt_screen_active",
+                format!("{:?}", self.screen.alt_screen_is_active),
+            ),
+            (
+                "saved_cursor_primary",
+                saved_cursor(&self.screen.screen.saved_cursor),
+            ),
+            (
+                "saved_cursor_alt",
+                saved_cursor(&self.screen.alt_screen.saved_cursor),
+            ),
+            (
+                "keyboard_stack_primary",
+                format!("{:?}", self.screen.screen.keyboard_stack),
+            ),
+            (
+                "keyboard_stack_alt",
+                format!("{:?}", self.screen.alt_screen.keyboard_stack),
+            ),
+            ("title", format!("{:?}", self.title)),
+            ("icon_title", format!("{:?}", self.icon_title)),
+            (
+                "accumulating_title",
+                format!("{:?}", self.accumulating_title),
+            ),
+            (
+                "suppress_initial_title_change",
+                format!("{:?}", self.suppress_initial_title_change),
+            ),
+            ("progress", format!("{:?}", self.progress)),
+            ("current_dir", format!("{:?}", self.current_dir)),
+            ("user_vars", sorted(self.user_vars.iter())),
+            ("palette_override", format!("{:?}", self.palette)),
+            ("unicode_version", format!("{:?}", self.unicode_version)),
+            (
+                "unicode_version_stack",
+                format!("{:?}", self.unicode_version_stack),
+            ),
+            (
+                "clear_semantic_attribute_on_newline",
+                format!("{:?}", self.clear_semantic_attribute_on_newline),
+            ),
+            (
+                "last_semantic_command_status",
+                format!("{:?}", self.last_semantic_command_status),
+            ),
+            ("bidi_enabled", format!("{:?}", self.bidi_enabled)),
+            ("bidi_hint", format!("{:?}", self.bidi_hint)),
+        ]
+    }
 }
 
 /// A helper struct for implementing `vtparse::VTActor` while compartmentalizing
@@ -464,7 +620,7 @@ impl<'a> Performer<'a> {
         let normalized: String;
         let text = if p.is_ascii() {
             p.as_str()
-        } else if self.config.normalize_output_to_unicode_nfc()
+        } else if self.batch_config.normalize_output_to_unicode_nfc
             && is_nfc_quick(p.chars()) != IsNormalized::Yes
         {
             normalized = p.as_str().nfc().collect();
@@ -768,7 +924,8 @@ impl<'a> Performer<'a> {
     /// Draw a character to the screen
     fn print(&mut self, c: char) {
         // We buffer up the chars to increase the chances of correctly grouping graphemes into cells
-        let max_title_len = self.config.max_accumulating_title_len();
+        // Read once per batch, not per character (ft-yccm0.2.4).
+        let max_title_len = self.batch_config.max_accumulating_title_len;
         if let Some(title) = self.accumulating_title.as_mut() {
             if title
                 .len()
@@ -1918,6 +2075,179 @@ mod tests {
         }
     }
 
+    /// ft-yccm0.2.4: a configuration whose hot getters count their calls and
+    /// whose values can change between batches, as the GUI's `TermConfig`
+    /// values do under one shared `Arc`.
+    #[derive(Debug)]
+    struct LiveConfig {
+        scrollback: std::sync::atomic::AtomicUsize,
+        title_cap: std::sync::atomic::AtomicUsize,
+        bidi: std::sync::atomic::AtomicBool,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl LiveConfig {
+        fn new(scrollback: usize) -> Arc<Self> {
+            Arc::new(Self {
+                scrollback: std::sync::atomic::AtomicUsize::new(scrollback),
+                title_cap: std::sync::atomic::AtomicUsize::new(8192),
+                bidi: std::sync::atomic::AtomicBool::new(false),
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn read(&self) {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.swap(0, std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl TerminalConfiguration for LiveConfig {
+        fn scrollback_size(&self) -> usize {
+            self.read();
+            self.scrollback.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn scrollback_tier_config(&self) -> ScrollbackTierConfig {
+            self.read();
+            ScrollbackTierConfig {
+                enabled: false,
+                hot_lines: self
+                    .scrollback
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .max(1),
+                warm_max_bytes: 0,
+            }
+        }
+
+        fn max_accumulating_title_len(&self) -> usize {
+            self.read();
+            self.title_cap.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn normalize_output_to_unicode_nfc(&self) -> bool {
+            self.read();
+            false
+        }
+
+        fn bidi_mode(&self) -> crate::config::BidiMode {
+            self.read();
+            crate::config::BidiMode {
+                enabled: self.bidi.load(std::sync::atomic::Ordering::SeqCst),
+                hint: ParagraphDirectionHint::LeftToRight,
+            }
+        }
+
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+    }
+
+    fn live_terminal(config: &Arc<LiveConfig>) -> Terminal {
+        Terminal::new(
+            TerminalSize {
+                rows: 8,
+                cols: 40,
+                pixel_width: 320,
+                pixel_height: 128,
+                dpi: 96,
+            },
+            Arc::clone(config) as Arc<dyn TerminalConfiguration + Send + Sync>,
+            "WezTerm",
+            "test",
+            Box::new(Vec::new()),
+        )
+    }
+
+    fn numbered_lines(count: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for line in 0..count {
+            bytes.extend_from_slice(format!("line {line:04} xxxxxxxxxxxxxxxxxxxx\r\n").as_bytes());
+        }
+        bytes
+    }
+
+    /// ft-yccm0.2.4: printing and scrolling read the configuration once per
+    /// batch, not per character or per row, so the count is independent of
+    /// the batch's size.
+    #[test]
+    fn hot_config_is_read_per_batch_not_per_character_or_row() {
+        let config = LiveConfig::new(16);
+        let mut term = live_terminal(&config);
+        config.reads();
+
+        // About 6,600 printed characters and 200 scrolls, most evicting.
+        term.advance_bytes(numbered_lines(200));
+        let one_batch = config.reads();
+        assert!(
+            one_batch <= 16,
+            "{} configuration reads for one batch",
+            one_batch
+        );
+
+        term.advance_bytes(numbered_lines(400));
+        let double_batch = config.reads();
+        assert!(
+            double_batch <= 16,
+            "{} configuration reads for a batch twice the size",
+            double_batch
+        );
+
+        // The two-stage path refreshes once per batch as well.
+        let mut parser = frankenterm_escape_parser::parser::Parser::new();
+        term.perform_actions(parser.parse_as_vec(&numbered_lines(200)));
+        let two_stage = config.reads();
+        assert!(two_stage <= 16, "{} reads for perform_actions", two_stage);
+    }
+
+    /// ft-yccm0.2.4: a changed configuration takes effect at the next batch.
+    #[test]
+    fn hot_config_changes_take_effect_at_the_next_batch() {
+        let config = LiveConfig::new(16);
+        let mut term = live_terminal(&config);
+        term.advance_bytes(numbered_lines(40));
+        assert_eq!(term.screen().scrollback_rows(), 8 + 16);
+
+        config
+            .scrollback
+            .store(4, std::sync::atomic::Ordering::SeqCst);
+        term.advance_bytes(b"one more\r\n");
+        assert_eq!(term.screen().scrollback_rows(), 8 + 4);
+
+        term.advance_bytes(b"\x1bkabc");
+        assert_eq!(term.pending_tmux_title_bytes(), 3);
+        config
+            .title_cap
+            .store(4, std::sync::atomic::Ordering::SeqCst);
+        term.advance_bytes(b"de");
+        assert_eq!(
+            term.pending_tmux_title_bytes(),
+            0,
+            "the lowered cap discards the title in the next batch"
+        );
+
+        let cursor_row_bidi = |term: &Terminal| {
+            let screen = term.screen();
+            let row = screen.phys_row(term.cursor_pos().y);
+            let mut enabled = None;
+            screen.with_phys_lines(row..row + 1, |lines| {
+                enabled = Some(lines[0].bidi_info().0);
+            });
+            enabled.expect("the cursor row exists")
+        };
+        config.bidi.store(true, std::sync::atomic::Ordering::SeqCst);
+        term.advance_bytes(b"\x1b[2K");
+        assert!(cursor_row_bidi(&term), "erase applies the new bidi mode");
+        config
+            .bidi
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        term.advance_bytes(b"\x1b[2K");
+        assert!(!cursor_row_bidi(&term));
+    }
+
     struct RowWalkOverride;
 
     impl RowWalkOverride {
@@ -2017,6 +2347,48 @@ mod tests {
                 unconditional_walk,
                 "last-printed shortcut diverged from the row walk in case {case}: {stream:?}"
             );
+        }
+    }
+
+    /// ft-yccm0.2.14 batch verify 4: the differential stream above panicked in
+    /// `Line::erase_cell_with_margin` ("removal index should be < len"). A
+    /// grapheme that clusters with the previous cell but arrives in a later
+    /// flush (a split regional-indicator pair, or a skin-tone modifier after
+    /// an emoji, as in the operator's emoji corpus) was appended to clustered
+    /// storage, which re-segmented the two cells into one, so the row's
+    /// `len()` exceeded its materialized cells. Minimized: the second scalar
+    /// in a later call or after an SGR, then CUB and DCH inside the row.
+    #[test]
+    fn zwj_tail_gate_regression_clustering_neighbours_then_dch() {
+        let cases: &[(&str, &str)] = &[("\u{1F1FA}", "\u{1F1F8}"), ("\u{1F600}", "\u{1F3FD}")];
+        for &(first, second) in cases {
+            for &gap in &["", "\x1b[38;5;1m"] {
+                for &force_walk in &[false, true] {
+                    let _walk = RowWalkOverride::set(force_walk);
+                    let mut term = make_terminal();
+                    term.advance_bytes(first.as_bytes());
+                    term.advance_bytes(format!("{gap}{second}").as_bytes());
+                    term.advance_bytes(b"\x1b[D\x1b[P");
+                    let screen = term.screen();
+                    let top = screen.physical_rows.min(screen.scrollback_rows());
+                    let row = screen.scrollback_rows() - top;
+                    screen.with_phys_lines(row..row + 1, |lines| {
+                        let line = lines[0];
+                        let widths: usize = line.visible_cells().map(|cell| cell.width()).sum();
+                        assert_eq!(
+                            line.len(),
+                            widths,
+                            "row length diverged from its cells for {first:?} {gap:?} {second:?}"
+                        );
+                        assert_eq!(
+                            line.visible_cells()
+                                .next()
+                                .map(|cell| cell.str().to_string()),
+                            Some(first.to_string())
+                        );
+                    });
+                }
+            }
         }
     }
 

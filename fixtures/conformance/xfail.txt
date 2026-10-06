@@ -1,0 +1,69 @@
+# Expected failures for the conformance suite (ft-yccm0.1.9).
+#
+# One case per line: the case id, then why the engine is expected to fail
+# it. Every entry names a real case and gives a real reason; a case that
+# starts passing must lose its entry (the runner reports it as XPASS).
+# Never add an entry to make a run green without saying what is wrong.
+
+# dec-5f
+vttest/character-sets/02 DEC Special Graphics maps 0x5F to a blank (VT100 table, xterm dec2ucs); frankenterm-term prints '_' (golden row 13 corrected).
+# iso2022
+vttest/character-sets/04 frankenterm-term implements no 96-character sets (ESC - A, ESC . A, ESC / A), locking shifts LS2/LS3 or single shifts SS2/SS3, so the Latin-1 set prints as ASCII. Golden: GL 2/1-7/14 through a Latin-1 96-set map to the upper half; 2/0 stays SPACE and an ignored DEL keeps a pending single shift.
+vttest/character-sets/06 frankenterm-term implements no 96-character sets (ESC - A, ESC . A, ESC / A), locking shifts LS2/LS3, or single shifts SS2/SS3, and its UTF-8 decoder drops lone continuation bytes instead of one U+FFFD per maximal subpart. Golden: GL 2/1-7/14 through a Latin-1 96-set map to the upper half (2/0 stays SPACE, an ignored DEL keeps a pending single shift); 8-bit GR bytes, invalid UTF-8 here, become 32 U+FFFD per row.
+vttest/character-sets/08 frankenterm-term implements no 96-character sets (ESC - A, ESC . A, ESC / A), locking shifts LS2/LS3 or single shifts SS2/SS3, so the Latin-1 set prints as ASCII. Golden: GL 2/1-7/14 through a Latin-1 96-set map to the upper half; 2/0 stays SPACE and an ignored DEL keeps a pending single shift.
+vttest/character-sets/09 frankenterm-term implements no 96-character sets (ESC - A, ESC . A, ESC / A), locking shifts LS2/LS3 or single shifts SS2/SS3, so the Latin-1 set prints as ASCII. Golden: GL 2/1-7/14 through a Latin-1 96-set map to the upper half; 2/0 stays SPACE and an ignored DEL keeps a pending single shift.
+# dw-tab
+vttest/double-sized-characters/05 On a double-width line HT moves the cursor past column 40, so vttest's right border lands in column 41, outside the visible half; a VT100 stops at column 40 (golden border corrected).
+vttest/double-sized-characters/06 On a double-width line HT moves the cursor past column 40, so vttest's right border lands in column 41, outside the visible half; a VT100 stops at column 40 (golden border corrected).
+# cup-overshoot
+vttest/known-bugs/24 CUP clamps the column to cols, not cols-1 (set_cursor_pos keeps x == cols for rewrap), so bug E's CUP to column 100 writes its X into off-screen cell 81 instead of column 80; same defect as esctest/cup/clamps-to-screen.
+# cup-stray
+vttest/known-bugs/25 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+vttest/known-bugs/26 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+vttest/known-bugs/27 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+vttest/known-bugs/28 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+vttest/known-bugs/29 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+vttest/known-bugs/30 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+vttest/known-bugs/31 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+vttest/known-bugs/32 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+vttest/known-bugs/33 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+vttest/known-bugs/34 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+vttest/known-bugs/35 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+vttest/known-bugs/36 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+vttest/known-bugs/37 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+vttest/known-bugs/38 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+vttest/known-bugs/39 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+vttest/known-bugs/40 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+vttest/vt220-screen-display/10 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+vttest/vt220-screen-display/11 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+vttest/vt220-screen-display/12 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+vttest/vt220-screen-display/13 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+vttest/vt220-screen-display/14 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+vttest/vt220-screen-display/15 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+vttest/vt220-screen-display/16 The off-screen cell 81 written by a CUP past the right edge (known-bugs/24, vt220-screen-display/09 CUP 7;81) survives ED 2 and scrolls with its line, leaving a stray character no erase can reach (golden drops it).
+# rep
+vttest/iso6429-misc/03 REP repeats again after a preceding REP; ECMA-48 leaves REP after a control function undefined and xterm repeats only right after a graphic character, so vttest expects 2 '+' per row, not 12.
+vttest/iso6429-colors/65 REP repeats again after a preceding REP; ECMA-48 leaves REP after a control function undefined and xterm repeats only right after a graphic character, so vttest expects 2 '+' per row, not 12.
+# sl
+vttest/iso6429-misc/07 SL (CSI Ps SP @, scroll left) is not implemented, so vttest's diagonal of '*' never becomes the centered column.
+vttest/iso6429-colors/69 SL (CSI Ps SP @, scroll left) is not implemented, so vttest's diagonal of '*' never becomes the centered column.
+# sr
+vttest/iso6429-misc/09 SR (CSI Ps SP A, scroll right) is not implemented, so vttest's diagonal of '*' never becomes the centered column.
+vttest/iso6429-colors/71 SR (CSI Ps SP A, scroll right) is not implemented, so vttest's diagonal of '*' never becomes the centered column.
+# spa
+vttest/iso6429-misc/14 SPA/EPA (ESC V / ESC W) protected areas are not implemented, so ED, EL and ECH erase vttest's protected box.
+# decsca
+vttest/vt220-screen-display/09 DECSCA protection with selective erase DECSED/DECSEL (CSI ? J, CSI ? K) is not implemented, so the unprotected '*' marks survive; the CUP 7;81 overshoot also leaves off-screen cells.
+
+# esctest-style cases
+esctest/cup/clamps-to-screen CUP clamps the column to cols, not cols-1: set_cursor_pos deliberately keeps x == cols so a rewrap remembers a wrapped cursor; VT510 stops CUP at the last column.
+esctest/cha/clamps-to-last-column CHA shares CUP's absolute-column clamp to cols, not cols-1 (set_cursor_pos), so the cursor lands one past the last column.
+esctest/altscreen/1049-switches-to-a-blank-screen Mode 1049 also homes the cursor and resets the pen when it switches (inherited from WezTerm); xterm saves the cursor, switches and clears, leaving the position alone.
+esctest/decrqss/sgr DECRQSS answers only DECSCL, DECSTBM and DECSLRM; for SGR (m) it replies 0$r (invalid) where xterm reports the current rendition.
+esctest/utf8/lone-continuation-byte A lone continuation byte is dropped without a U+FFFD; vtparse feeds utf8parse, which consumes the byte that breaks a sequence instead of reprocessing it (vtparse/src/lib.rs next_utf8).
+esctest/utf8/truncated-lead-keeps-the-next-byte Data loss: the ASCII byte after a truncated lead byte is swallowed (a\xc3b shows a and U+FFFD, no b); vtparse feeds utf8parse, which consumes the byte that breaks a sequence instead of reprocessing it (vtparse/src/lib.rs next_utf8).
+esctest/utf8/never-valid-bytes Bytes that can never start UTF-8 (C0, C1, F5..FF) are dropped without a U+FFFD; vtparse feeds utf8parse, which consumes the byte that breaks a sequence instead of reprocessing it (vtparse/src/lib.rs next_utf8).
+esctest/utf8/encoded-surrogate An encoded surrogate (ED A0 80) becomes one U+FFFD; maximal-subpart practice gives one per byte, since ED cannot be followed by A0.
+esctest/utf8/overlong-form An overlong form (E0 80 AF) becomes one U+FFFD; maximal-subpart practice gives one per byte, since E0 cannot be followed by 80.
+esctest/utf8/truncated-four-byte-sequence Data loss: the ASCII byte after a truncated four-byte sequence is swallowed (F0 9F 98 then b shows U+FFFD, no b); vtparse feeds utf8parse, which consumes the byte that breaks a sequence instead of reprocessing it (vtparse/src/lib.rs next_utf8).
+esctest/utf8/escape-interrupts-a-sequence Visible garbage: an ESC that interrupts a UTF-8 sequence is swallowed, so CSI 1 m prints as the text [1m; vtparse feeds utf8parse, which consumes the byte that breaks a sequence instead of reprocessing it (vtparse/src/lib.rs next_utf8).

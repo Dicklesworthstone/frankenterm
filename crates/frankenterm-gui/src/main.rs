@@ -18,10 +18,6 @@ use config::{ConfigHandle, SerialDomain, SshDomain, SshMultiplexing};
 #[cfg(feature = "jemalloc")]
 use frankenterm_alloc as _;
 use frankenterm_client::domain::{ClientDomain, ClientDomainConfig};
-use frankenterm_core::macos_backend_select::{
-    BackendOverride, BackendSelectionInputs, BackendSelectionResult, MacosArch, MacosVersion,
-    select_macos_backend,
-};
 use frankenterm_font::FontConfiguration;
 use frankenterm_font::shaper::PresentationWidth;
 use frankenterm_mux_server_impl::{
@@ -37,7 +33,7 @@ use portable_pty::cmdbuilder::CommandBuilder;
 use promise::spawn::block_on;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::env::{self, current_dir};
+use std::env::current_dir;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -103,6 +99,22 @@ use frankenterm_gui::{
     domain_reconnect_manifest, domain_reconnect_manifest::DomainAttachmentIntent,
     window_state_persist,
 };
+
+/// The GUI's jemalloc configuration (ft-yccm0.2.8; values and rationale on
+/// [`frankenterm_alloc::GUI_JEMALLOC_CONF`]). jemalloc reads this symbol when
+/// it initializes, before `main`; tikv-jemalloc-sys prefixes jemalloc's public
+/// symbols with `_rjem_`, and its own `malloc_conf` is a weak definition that
+/// this strong one replaces. `_RJEM_MALLOC_CONF` in the environment still
+/// overrides it for measurement runs.
+// SAFETY: the exported value is an immutable pointer to a 'static,
+// NUL-terminated byte string, which is exactly jemalloc's
+// `const char *malloc_conf`; `Option<&u8>` has the same layout as that
+// nullable pointer. jemalloc only reads it, and nothing else defines the name.
+#[cfg(all(feature = "jemalloc", not(windows)))]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+#[used]
+static GUI_JEMALLOC_MALLOC_CONF: Option<&'static u8> =
+    Some(&frankenterm_alloc::GUI_JEMALLOC_CONF[0]);
 
 static AUTO_CONNECT_ENABLED: AtomicBool = AtomicBool::new(false);
 static AUTO_CONNECT_STARTUP_READY: AtomicBool = AtomicBool::new(false);
@@ -176,21 +188,12 @@ pub use termwindow::{ICON_DATA, TermWindow, set_window_class, set_window_positio
 // Bootstrap (inlined from env-bootstrap, minus Lua registration)
 // ---------------------------------------------------------------------------
 
-const FT_MACOS_BACKEND_ENV: &str = "FT_MACOS_BACKEND";
 const FT_ATOMIC_COMPONENT_MARKER: &str = env!("FT_ATOMIC_COMPONENT_MARKER");
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GuiMacosBackendSelection {
-    override_: BackendOverride,
-    arch: MacosArch,
-    version: MacosVersion,
-    result: BackendSelectionResult,
-}
-
 fn frankenterm_bootstrap() {
-    // Initialize logging from RUST_LOG env var
+    // Initialize logging from RUST_LOG env var. The active renderer backend
+    // is logged by TermWindow once it is constructed (front_end config).
     env_logger::init();
-    log_gui_macos_backend_policy();
 
     config::assign_version_info(GUI_VERSION, env!("FRANKENTERM_TARGET_TRIPLE"));
 
@@ -224,95 +227,6 @@ fn frankenterm_bootstrap() {
         std::env::remove_var("VTE_VERSION");
         std::env::remove_var("SHELL");
     }
-}
-
-fn log_gui_macos_backend_policy() {
-    let selection = probe_gui_macos_backend_selection();
-    // This policy probe does not construct or dispatch a renderer. In
-    // particular, MetalDirect is not a live RenderContext implementation.
-    // TermWindow::created reports the successfully constructed backend.
-    log::debug!(
-        "macOS renderer policy probe (not active backend): preference={:?} reason={:?} override={:?} arch={:?} version={}.{}; actual renderer follows front_end configuration",
-        selection.result.backend,
-        selection.result.reason,
-        selection.override_,
-        selection.arch,
-        selection.version.major,
-        selection.version.minor
-    );
-}
-
-fn probe_gui_macos_backend_selection() -> GuiMacosBackendSelection {
-    let override_value = env::var(FT_MACOS_BACKEND_ENV).ok();
-    select_gui_macos_backend(
-        override_value.as_deref(),
-        detect_gui_macos_arch(),
-        detect_gui_macos_version(),
-    )
-}
-
-fn select_gui_macos_backend(
-    override_value: Option<&str>,
-    arch: MacosArch,
-    version: MacosVersion,
-) -> GuiMacosBackendSelection {
-    let override_ = override_value
-        .map(BackendOverride::from_env_str)
-        .unwrap_or_default();
-    let result = select_macos_backend(BackendSelectionInputs::new(arch, version, override_));
-
-    GuiMacosBackendSelection {
-        override_,
-        arch,
-        version,
-        result,
-    }
-}
-
-fn detect_gui_macos_arch() -> MacosArch {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        MacosArch::AppleSilicon
-    }
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    {
-        MacosArch::IntelX64
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        MacosArch::Unknown
-    }
-}
-
-fn detect_gui_macos_version() -> MacosVersion {
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("/usr/bin/sw_vers")
-            .arg("-productVersion")
-            .output()
-            .ok()
-            .and_then(|output| {
-                if output.status.success() {
-                    String::from_utf8(output.stdout).ok()
-                } else {
-                    None
-                }
-            })
-            .and_then(|version| parse_macos_version(&version))
-            .unwrap_or_default()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        MacosVersion::default()
-    }
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn parse_macos_version(version: &str) -> Option<MacosVersion> {
-    let mut parts = version.trim().split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next().unwrap_or("0").parse().ok()?;
-    Some(MacosVersion::new(major, minor))
 }
 
 // ---------------------------------------------------------------------------
@@ -3570,6 +3484,28 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     initialize_window_state_persistence();
 
     let gui = crate::frontend::try_new()?;
+    // ft-yccm0.2.7: name performance-hostile settings, judged against the
+    // real screens, and publish what they were judged by for `ft doctor`.
+    let _gui_tuning = start_gui_tuning_advisories(&config);
+    // ft-yccm0.2.5 / ft-yccm0.1.7: publish this process's live GPU, cache,
+    // scrollback and allocator counters where `ft doctor --json` and
+    // scripts/mac-gui-footprint.sh read them. Diagnostics only: not fatal.
+    let _resource_snapshot_publisher =
+        match frankenterm_alloc::resource_ledger::ResourceSnapshotPublisher::spawn(
+            config::RUNTIME_DIR.clone(),
+            "frankenterm-gui",
+            // FT_RESOURCE_SNAPSHOT_INTERVAL_MS overrides it (ft-yccm0.1.4).
+            frankenterm_alloc::resource_ledger::resource_snapshot_interval(
+                std::time::Duration::from_secs(2),
+            ),
+            collect_resource_snapshot,
+        ) {
+            Ok(publisher) => Some(publisher),
+            Err(error) => {
+                log::warn!("GPU resource snapshot publishing disabled: {error}");
+                None
+            }
+        };
     // Config reload is subscribed before the asynchronous startup transaction
     // settles. Keep reload callbacks from starting a retry generation against
     // an unpublished or ultimately failed initial topology.
@@ -3607,6 +3543,131 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
 
     maybe_show_configuration_error_window();
     run_gui_event_loop(gui)
+}
+
+/// The fastest screen when the GUI started (ft-yccm0.2.7). Screens are
+/// queried once, on the main thread; config reloads reuse this copy.
+static STARTUP_DISPLAY: std::sync::OnceLock<Option<config::tuning::DisplayRefresh>> =
+    std::sync::OnceLock::new();
+
+fn fastest_display() -> Option<config::tuning::DisplayRefresh> {
+    let screens = Connection::get()?.screens().ok()?;
+    std::iter::once(&screens.main)
+        .chain(std::iter::once(&screens.active))
+        .chain(screens.by_name.values())
+        .filter_map(|screen| {
+            Some(config::tuning::DisplayRefresh {
+                name: screen.name.clone(),
+                hz: u64::try_from(screen.max_fps?).ok()?,
+            })
+        })
+        .max_by_key(|display| display.hz)
+}
+
+fn gui_tuning_inputs(config: &config::Config) -> config::tuning::TuningInputs {
+    config::tuning::TuningInputs {
+        display: STARTUP_DISPLAY.get().cloned().flatten(),
+        ..config::tuning::TuningInputs::from_config(config)
+    }
+}
+
+/// Log one warning per performance-hostile setting (ft-yccm0.2.7) and publish
+/// the settings and display they were judged by, where `ft doctor` reads them.
+/// The GUI cannot judge its own generation (FT-TUNE-0005); `ft doctor` does.
+/// The facts are republished after every config reload, so a fixed setting
+/// clears in doctor; the returned handles keep that going.
+fn start_gui_tuning_advisories(
+    config: &config::Config,
+) -> Option<(
+    Arc<config::tuning::GuiTuningPublication>,
+    config::ConfigSubscription,
+)> {
+    let _ = STARTUP_DISPLAY.set(fastest_display());
+    let inputs = gui_tuning_inputs(config);
+    for advisory in config::tuning::tuning_advisories(&inputs) {
+        log::warn!("{}", advisory.log_line());
+    }
+    let facts = config::tuning::GuiTuningFacts::new(std::process::id(), GUI_VERSION, &inputs);
+    let publication =
+        match config::tuning::GuiTuningPublication::publish(&config::RUNTIME_DIR, &facts) {
+            Ok(publication) => Arc::new(publication),
+            Err(error) => {
+                log::warn!("GUI tuning facts publishing disabled: {error}");
+                return None;
+            }
+        };
+    let subscription = config::subscribe_to_config_reload({
+        let publication = Arc::clone(&publication);
+        move || {
+            // Subscribers run while the configuration mutex is held: read the
+            // reloaded config from a short-lived thread once it is released.
+            let publication = Arc::clone(&publication);
+            let spawned = std::thread::Builder::new()
+                .name("gui-tuning-republish".to_string())
+                .spawn(move || {
+                    let config = config::configuration();
+                    let facts = config::tuning::GuiTuningFacts::new(
+                        std::process::id(),
+                        GUI_VERSION,
+                        &gui_tuning_inputs(&config),
+                    );
+                    if let Err(error) = publication.republish(&facts) {
+                        log::warn!("GUI tuning facts republish failed: {error}");
+                    }
+                });
+            if let Err(error) = spawned {
+                log::warn!("GUI tuning facts republish not started: {error}");
+            }
+            true
+        }
+    });
+    Some((publication, subscription))
+}
+
+/// The resource snapshot this process publishes (ft-yccm0.1.7). Runs on the
+/// publisher thread; each pane's tier status and writer backlog take that
+/// pane's terminal lock briefly, never on the GUI thread.
+fn collect_resource_snapshot() -> frankenterm_alloc::resource_ledger::ResourceSnapshotBody {
+    use frankenterm_alloc::resource_ledger::{
+        CacheGauges, GpuResourceLedger, PaneResourceSnapshot, PaneWriterSnapshot,
+        ResourceSnapshotBody, WritersSnapshot,
+    };
+    let mut body =
+        ResourceSnapshotBody::from_ledgers(GpuResourceLedger::global(), CacheGauges::global());
+    if let Some(mux) = Mux::try_get() {
+        let panes = mux.iter_panes();
+        // ft-yccm0.2.2.5: the GUI owns the panes, so it reports their writer
+        // queues and reply drops to `ft doctor` without a mux RPC.
+        body.writers = WritersSnapshot::from_panes(panes.iter().filter_map(|pane| {
+            let backlog = pane.writer_backlog()?;
+            Some(PaneWriterSnapshot {
+                pane_id: pane.pane_id() as u64,
+                pending_input_bytes: backlog.pending_input_bytes as u64,
+                pending_reply_bytes: backlog.pending_reply_bytes as u64,
+                dropped_replies: backlog.dropped_replies,
+                dropped_reply_bytes: backlog.dropped_reply_bytes,
+            })
+        }));
+        body.panes = panes
+            .into_iter()
+            .filter_map(|pane| {
+                let status = pane.get_tiered_scrollback_status()?;
+                Some(PaneResourceSnapshot {
+                    pane_id: pane.pane_id() as u64,
+                    hot_rows: status
+                        .visible_rows
+                        .saturating_add(status.in_memory_scrollback_rows)
+                        as u64,
+                    warm_resident_lines: status.warm_resident_lines as u64,
+                    warm_resident_bytes: status.warm_resident_bytes as u64,
+                    cold_retained_lines: status.cold_sink_retained_lines as u64,
+                    cold_retained_bytes: status.cold_sink_retained_bytes as u64,
+                })
+            })
+            .collect();
+        body.panes.sort_by_key(|pane| pane.pane_id);
+    }
+    body
 }
 
 fn initialize_window_state_persistence() {
@@ -3839,7 +3900,40 @@ fn maybe_show_configuration_error_window() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frankenterm_core::macos_backend_select::{BackendFallbackReason, MacosBackend};
+
+    /// ft-yccm0.2.8: this binary links the GUI's `malloc_conf` export, so the
+    /// running jemalloc must report exactly the tuned options. Reading them
+    /// back from jemalloc proves the symbol is honoured, not just present.
+    /// jemalloc must also have finished initializing: on macOS a
+    /// `background_thread:true` request (unsupported there) stops it partway,
+    /// with one arena and `opt.narenas` 0.
+    #[cfg(all(feature = "jemalloc", not(windows)))]
+    #[test]
+    fn gui_binary_runs_jemalloc_with_its_tuned_options() {
+        assert!(
+            std::env::var_os("_RJEM_MALLOC_CONF").is_none(),
+            "_RJEM_MALLOC_CONF overrides the compiled tuning; unset it to run this test"
+        );
+        let options = frankenterm_alloc::jemalloc_options().expect("jemalloc options");
+        assert!(options.narenas > 0, "jemalloc initialized fully: {options:?}");
+        assert_eq!(options.dirty_decay_ms, 5000, "{options:?}");
+        assert_eq!(options.muzzy_decay_ms, 0, "{options:?}");
+        if frankenterm_alloc::JEMALLOC_HAS_BACKGROUND_THREADS {
+            assert_eq!(options.background_thread, Some(true), "{options:?}");
+            assert_eq!(
+                frankenterm_alloc::GUI_JEMALLOC_CONF,
+                b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:0\0",
+                "this test pins the values the conf string sets"
+            );
+        } else {
+            assert_eq!(options.background_thread, None, "{options:?}");
+            assert_eq!(
+                frankenterm_alloc::GUI_JEMALLOC_CONF,
+                b"dirty_decay_ms:5000,muzzy_decay_ms:0\0",
+                "this test pins the values the conf string sets"
+            );
+        }
+    }
 
     #[test]
     fn same_path_gui_version_mismatch_preserves_new_gui_publication() {
@@ -5136,55 +5230,15 @@ mod tests {
     }
 
     #[test]
-    fn gui_macos_backend_defaults_to_core_selector_auto_path() {
-        let selection =
-            select_gui_macos_backend(None, MacosArch::AppleSilicon, MacosVersion::new(14, 0));
-
-        assert_eq!(selection.override_, BackendOverride::Auto);
-        assert_eq!(selection.result.backend, MacosBackend::MetalDirect);
-        assert_eq!(
-            selection.result.reason,
-            BackendFallbackReason::MetalDirectGranted
-        );
-    }
-
-    #[test]
-    fn gui_macos_backend_honors_wgpu_rollback_override() {
-        let selection = select_gui_macos_backend(
-            Some("wgpu"),
-            MacosArch::AppleSilicon,
-            MacosVersion::new(14, 0),
-        );
-
-        assert_eq!(selection.override_, BackendOverride::Wgpu);
-        assert_eq!(selection.result.backend, MacosBackend::Wgpu);
-        assert_eq!(
-            selection.result.reason,
-            BackendFallbackReason::OperatorOverrideWgpu
-        );
-    }
-
-    #[test]
-    fn gui_macos_backend_downgrades_forced_metal_on_unsupported_runtime() {
-        let selection =
-            select_gui_macos_backend(Some("metal"), MacosArch::IntelX64, MacosVersion::new(14, 0));
-
-        assert_eq!(selection.override_, BackendOverride::MetalDirect);
-        assert_eq!(selection.result.backend, MacosBackend::Wgpu);
-        assert_eq!(
-            selection.result.reason,
-            BackendFallbackReason::OperatorOverrideDowngraded
-        );
-    }
-
-    #[test]
-    fn parse_macos_version_accepts_major_minor_patch() {
-        assert_eq!(
-            parse_macos_version("14.5.1"),
-            Some(MacosVersion::new(14, 5))
-        );
-        assert_eq!(parse_macos_version("13"), Some(MacosVersion::new(13, 0)));
-        assert_eq!(parse_macos_version("not-a-version"), None);
+    fn startup_logs_no_renderer_policy_probe_before_construction() {
+        // The active backend is reported only by TermWindow after it builds
+        // one (ft-yccm0.4.1.1, closing the 4tenz.8.1.1 truth gap). A startup
+        // policy probe named MetalDirect while OpenGL/WebGpu was rendering.
+        let source = include_str!("main.rs");
+        let probe = ["macos_backend", "_select"].concat();
+        let sw_vers = ["/usr/bin/", "sw_vers"].concat();
+        assert!(!source.contains(&probe), "GUI startup must not consult the policy-only selector");
+        assert!(!source.contains(&sw_vers), "GUI startup must not spawn sw_vers");
     }
 }
 

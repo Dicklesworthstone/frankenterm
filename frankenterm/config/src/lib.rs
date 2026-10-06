@@ -87,6 +87,7 @@ mod ssh;
 mod terminal;
 mod tls;
 pub(crate) mod toml_config;
+pub mod tuning;
 mod units;
 mod unix;
 mod version;

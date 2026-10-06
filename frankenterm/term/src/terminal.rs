@@ -1160,6 +1160,7 @@ impl Terminal {
     /// The output is parsed and applied to the terminal model.
     pub fn advance_bytes<B: AsRef<[u8]>>(&mut self, bytes: B) {
         self.state.increment_seqno();
+        self.state.refresh_batch_config();
         {
             let bytes = bytes.as_ref();
 
@@ -1180,6 +1181,7 @@ impl Terminal {
             return;
         }
         self.state.increment_seqno();
+        self.state.refresh_batch_config();
         {
             let mut performer = Performer::new(&mut self.state);
             for action in actions {

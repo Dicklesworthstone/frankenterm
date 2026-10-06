@@ -2,8 +2,8 @@ use super::glyphcache::GlyphCache;
 use super::quad::*;
 use super::utilsprites::{RenderMetrics, UtilSprites};
 use crate::termwindow::webgpu::{WebGpuState, WebGpuTexture, adapter_info_to_gpu_info};
-use ::window::bitmaps::Texture2d;
 use ::window::bitmaps::atlas::{AtlasAllocationFailure, OutOfTextureSpace};
+use ::window::bitmaps::{BitmapImage, Texture2d, TextureRect};
 use ::window::glium::backend::Context as GliumContext;
 use ::window::glium::buffer::{BufferMutSlice, Mapping};
 use ::window::glium::{
@@ -12,6 +12,10 @@ use ::window::glium::{
 use ::window::*;
 use anyhow::Context;
 use config::ConfigHandle;
+use frankenterm_alloc::resource_ledger::{
+    CacheGaugeContribution, CacheGauges, GpuBufferPurpose, GpuResourceGuard, GpuResourceLedger,
+    GpuTexturePurpose, texture_bytes,
+};
 use frankenterm_core::{atlas_tier_doctor::TierSwapDoctorReport, atlas_tiered_swap::MemoryBudget};
 use frankenterm_font::FontConfiguration;
 use frankenterm_gui::glyph_quad_staging::{
@@ -91,6 +95,94 @@ fn round_quad_capacity(need_quads: usize) -> usize {
     need_quads.div_ceil(QUAD_CAPACITY_GROWTH_GRANULARITY) * QUAD_CAPACITY_GROWTH_GRANULARITY
 }
 
+/// An RGBA8 texture registered with a [`GpuResourceLedger`] (ft-yccm0.2.5).
+///
+/// The registration lives inside the texture object, so it ends exactly when
+/// the last `Rc` to the texture drops. A stale `Rc` that pins an old atlas
+/// therefore keeps that atlas visible as a live texture in the ledger instead
+/// of disappearing from the accounting when its `GlyphCache` goes away.
+pub struct LedgeredTexture<T> {
+    texture: T,
+    _ledger: GpuResourceGuard,
+}
+
+impl<T: Texture2d> LedgeredTexture<T> {
+    pub fn new(texture: T, purpose: GpuTexturePurpose, ledger: &'static GpuResourceLedger) -> Self {
+        let bytes = texture_bytes(
+            texture.width() as u64,
+            texture.height() as u64,
+            TEXTURE_ATLAS_BYTES_PER_PIXEL,
+        );
+        Self {
+            _ledger: ledger.track_texture(purpose, bytes),
+            texture,
+        }
+    }
+}
+
+impl<T> std::ops::Deref for LedgeredTexture<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.texture
+    }
+}
+
+impl<T: Texture2d> Texture2d for LedgeredTexture<T> {
+    fn write(&self, rect: Rect, im: &dyn BitmapImage) {
+        self.texture.write(rect, im);
+    }
+
+    fn supports_readback(&self) -> bool {
+        self.texture.supports_readback()
+    }
+
+    fn read(&self, rect: Rect, im: &mut dyn BitmapImage) -> anyhow::Result<()> {
+        self.texture.read(rect, im)
+    }
+
+    fn width(&self) -> usize {
+        self.texture.width()
+    }
+
+    fn height(&self) -> usize {
+        self.texture.height()
+    }
+
+    fn to_texture_coords(&self, coords: Rect) -> TextureRect {
+        self.texture.to_texture_coords(coords)
+    }
+}
+
+/// Replace `glyph_cache` with a fresh cache over `surface`, carrying the
+/// decoded-image cache authority across, and return the new cache's utility
+/// sprites. On error the current cache is left untouched.
+///
+/// The previous cache, and with it the previous atlas texture, is dropped
+/// here. Every per-window holder of its glyphs must already have let go (see
+/// `TermWindow::recreate_texture_atlas`), or the old texture stays alive and
+/// the ledger keeps counting it.
+pub(crate) fn replace_glyph_cache_atlas(
+    glyph_cache: &RefCell<GlyphCache>,
+    fonts: &Rc<FontConfiguration>,
+    metrics: &RenderMetrics,
+    surface: Rc<dyn Texture2d>,
+    ledger: &GpuResourceLedger,
+) -> anyhow::Result<UtilSprites> {
+    let mut new_glyph_cache = GlyphCache::with_atlas_surface(fonts, surface)?;
+    let util_sprites = UtilSprites::new(&mut new_glyph_cache, metrics)?;
+
+    let mut glyph_cache = glyph_cache.borrow_mut();
+
+    // Steal the complete decoded-image cache authority; without this,
+    // animations reset and mutable-image ownership/accounting is lost
+    // each time we fill the texture.
+    glyph_cache.swap_decoded_image_cache_state(&mut new_glyph_cache);
+
+    *glyph_cache = new_glyph_cache;
+    ledger.record_atlas_generation();
+    Ok(util_sprites)
+}
+
 #[derive(Clone)]
 pub enum RenderContext {
     Glium(Rc<GliumContext>),
@@ -158,18 +250,25 @@ impl RenderContext {
                     );
                 }
                 use crate::glium::texture::SrgbTexture2d;
-                let surface: Rc<dyn Texture2d> = Rc::new(SrgbTexture2d::empty_with_format(
-                    context,
-                    glium::texture::SrgbFormat::U8U8U8U8,
-                    glium::texture::MipmapsOption::NoMipmap,
-                    size as u32,
-                    size as u32,
-                )?);
+                let surface: Rc<dyn Texture2d> = Rc::new(LedgeredTexture::new(
+                    SrgbTexture2d::empty_with_format(
+                        context,
+                        glium::texture::SrgbFormat::U8U8U8U8,
+                        glium::texture::MipmapsOption::NoMipmap,
+                        size as u32,
+                        size as u32,
+                    )?,
+                    GpuTexturePurpose::Atlas,
+                    GpuResourceLedger::global(),
+                ));
                 Ok(surface)
             }
             Self::WebGpu(state) => {
-                let texture: Rc<dyn Texture2d> =
-                    Rc::new(WebGpuTexture::new(size as u32, size as u32, state)?);
+                let texture: Rc<dyn Texture2d> = Rc::new(LedgeredTexture::new(
+                    WebGpuTexture::new(size as u32, size as u32, state)?,
+                    GpuTexturePurpose::Atlas,
+                    GpuResourceLedger::global(),
+                ));
                 Ok(texture)
             }
         }
@@ -326,6 +425,7 @@ pub struct WebGpuVertexBuffer {
     num_vertices: usize,
     staging: Vec<Vertex>,
     queue: wgpu::Queue,
+    _ledger: GpuResourceGuard,
 }
 
 impl std::ops::Deref for WebGpuVertexBuffer {
@@ -338,10 +438,11 @@ impl std::ops::Deref for WebGpuVertexBuffer {
 impl WebGpuVertexBuffer {
     pub fn new(num_vertices: usize, device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
         metrics::counter!("gui.webgpu.vertex_buffer_allocations").increment(1);
+        let size = (num_vertices * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
         Self {
             buf: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Vertex Buffer"),
-                size: (num_vertices * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress,
+                size,
                 usage: wgpu::BufferUsages::VERTEX
                     | wgpu::BufferUsages::COPY_DST
                     | wgpu::BufferUsages::COPY_SRC,
@@ -350,6 +451,7 @@ impl WebGpuVertexBuffer {
             num_vertices,
             staging: Vec::with_capacity(num_vertices),
             queue: queue.clone(),
+            _ledger: GpuResourceLedger::global().track_buffer(GpuBufferPurpose::Vertex, size),
         }
     }
 
@@ -368,6 +470,7 @@ impl WebGpuVertexBuffer {
 
 pub struct WebGpuIndexBuffer {
     buf: wgpu::Buffer,
+    _ledger: GpuResourceGuard,
 }
 
 impl std::ops::Deref for WebGpuIndexBuffer {
@@ -383,12 +486,15 @@ impl WebGpuIndexBuffer {
     }
 
     fn with_device(indices: &[u32], device: &wgpu::Device) -> Self {
+        let contents: &[u8] = bytemuck::cast_slice(indices);
         Self {
             buf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Index Buffer"),
                 usage: wgpu::BufferUsages::INDEX,
-                contents: bytemuck::cast_slice(indices),
+                contents,
             }),
+            _ledger: GpuResourceLedger::global()
+                .track_buffer(GpuBufferPurpose::Index, contents.len() as u64),
         }
     }
 }
@@ -771,6 +877,10 @@ pub struct RenderState {
     pub layers: RefCell<Vec<Rc<RenderLayer>>>,
     quad_last_activity: Instant,
     pending_quad_shrink: Option<PendingQuadShrink>,
+    /// This window's share of the process cache gauges (ft-yccm0.1.7);
+    /// withdrawn when the window's render state is dropped.
+    pub(crate) cache_gauges: CacheGaugeContribution,
+    pub(crate) last_cache_gauge_report: Option<Instant>,
 }
 
 const QUAD_SHRINK_IDLE: Duration = Duration::from_secs(1);
@@ -1066,6 +1176,8 @@ impl RenderState {
                         layers: RefCell::new(vec![main_layer]),
                         quad_last_activity: Instant::now(),
                         pending_quad_shrink: None,
+                        cache_gauges: CacheGauges::global().contribution(),
+                        last_cache_gauge_report: None,
                     });
                 }
                 Err(OutOfTextureSpace {
@@ -1252,17 +1364,14 @@ impl RenderState {
         size: Option<usize>,
     ) -> anyhow::Result<()> {
         let size = size.unwrap_or_else(|| self.glyph_cache.borrow().atlas.size());
-        let mut new_glyph_cache = GlyphCache::new_gl(&self.context, fonts, size)?;
-        self.util_sprites = UtilSprites::new(&mut new_glyph_cache, metrics)?;
-
-        let mut glyph_cache = self.glyph_cache.borrow_mut();
-
-        // Steal the complete decoded-image cache authority; without this,
-        // animations reset and mutable-image ownership/accounting is lost
-        // each time we fill the texture.
-        glyph_cache.swap_decoded_image_cache_state(&mut new_glyph_cache);
-
-        *glyph_cache = new_glyph_cache;
+        let surface = self.context.allocate_texture_atlas(size)?;
+        self.util_sprites = replace_glyph_cache_atlas(
+            &self.glyph_cache,
+            fonts,
+            metrics,
+            surface,
+            GpuResourceLedger::global(),
+        )?;
         Ok(())
     }
 }
@@ -1514,7 +1623,6 @@ mod tests {
         use std::cell::RefCell;
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
-        use wgpu::util::DeviceExt;
 
         let (device, queue) = futures::executor::block_on(async {
             let instance =
@@ -1545,13 +1653,10 @@ mod tests {
             glyph_quad_instances: RefCell::new(std::array::from_fn(|_| {
                 WebGpuGlyphQuadSoaStaging::default()
             })),
-            indices: IndexBuffer::WebGpu(WebGpuIndexBuffer {
-                buf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("vertex qualification indices"),
-                    usage: wgpu::BufferUsages::INDEX,
-                    contents: bytemuck::cast_slice(&build_quad_indices(2)),
-                }),
-            }),
+            indices: IndexBuffer::WebGpu(WebGpuIndexBuffer::with_device(
+                &build_quad_indices(2),
+                &device,
+            )),
             capacity: 2,
             next_quad: RefCell::new(0),
         };

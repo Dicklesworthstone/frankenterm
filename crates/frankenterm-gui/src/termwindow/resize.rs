@@ -228,6 +228,8 @@ impl RenderCaches<'_> {
         }
         if rebuild == CacheRebuild::ShapingInputs {
             self.shapes.borrow_mut().clear();
+        } else if rebuild == CacheRebuild::AtlasSprites {
+            release_shape_atlas_bindings(self.shapes);
         }
         if rebuild >= CacheRebuild::ColoredLines {
             clear_generation_keyed_line_shape_cache(self.lines);
@@ -269,6 +271,20 @@ fn next_cache_generation(generation: usize) -> CacheGenerationAdvance {
             recycled_epoch: true,
         },
     }
+}
+
+/// Release every shape-cache entry's atlas-backed glyph sprites (ft-yccm0.2.5).
+///
+/// The HarfBuzz output stays cached; the sprites re-resolve lazily against the
+/// new atlas. Without this, an entry that is not reused after a rebuild keeps
+/// `Rc<CachedGlyph>` -> sprite -> the previous atlas texture alive until the
+/// LFU evicts it, which only happens once the cache is full.
+fn release_shape_atlas_bindings(cache: &RefCell<LfuCache<ShapeCacheKey, Rc<CachedShape>>>) {
+    let mut released = 0u64;
+    cache.borrow().for_each_resident(|_, shape| {
+        released += u64::from(shape.release_atlas_binding());
+    });
+    metrics::counter!("gui.shape_cache.atlas_bindings_released").increment(released);
 }
 
 /// Drop line-shaping results keyed by a superseded shaping-input generation.
@@ -1111,21 +1127,23 @@ mod tests {
     };
     use crate::glyphcache::GlyphCache;
     use crate::quad::HeapQuadAllocator;
+    use crate::renderstate::{LedgeredTexture, replace_glyph_cache_atlas};
     use crate::shapecache::{CachedShape, ShapeCacheKey, ShapedInfo};
     use crate::termwindow::render::{
         LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey, LineToElementShape,
         LineToElementShapeItem, resolve_fg_color_attr,
     };
-    use crate::utilsprites::RenderMetrics;
+    use crate::utilsprites::{RenderMetrics, UtilSprites};
     use config::{ConfigHandle, TextStyle};
-    use frankenterm_font::FontConfiguration;
+    use frankenterm_alloc::resource_ledger::{GpuResourceLedger, GpuTexturePurpose, texture_bytes};
+    use frankenterm_font::{FontConfiguration, GlyphInfo, LoadedFont};
     use lfucache::LfuCache;
     use ordered_float::NotNan;
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
     use std::rc::Rc;
     use wezterm_term::color::ColorPalette;
     use wezterm_term::{CellAttributes, Line};
-    use window::bitmaps::{BitmapImage, Image, TextureRect};
+    use window::bitmaps::{BitmapImage, Image, ImageTexture, Texture2d, TextureRect};
 
     #[test]
     fn active_tab_resize_precedes_hidden_tabs_without_changing_ui_order() {
@@ -1206,11 +1224,11 @@ mod tests {
         fn seed(&self) {
             self.shapes.borrow_mut().put(
                 shape_key(),
-                Rc::new(CachedShape {
-                    infos: Vec::new(),
-                    glyphs: RefCell::new(Rc::new(Vec::new())),
-                    generation: Cell::new(self.shape_generation),
-                }),
+                Rc::new(CachedShape::new(
+                    Vec::new(),
+                    Rc::new(Vec::new()),
+                    self.shape_generation,
+                )),
             );
             self.lines.borrow_mut().put(
                 line_shape_key(self.shape_generation, 0),
@@ -1409,14 +1427,18 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        Rc::new(CachedShape {
-            glyphs: RefCell::new(Rc::new(ShapedInfo::process(&infos, &glyphs))),
-            infos,
-            generation: Cell::new(generation),
-        })
+        let glyphs = Rc::new(ShapedInfo::process(&infos, &glyphs));
+        Rc::new(CachedShape::new(infos, glyphs, generation))
     }
 
-    fn colored_line(shape: &Rc<CachedShape>, palette: &ColorPalette) -> LineToElementShapeItem {
+    fn colored_line(
+        shape: &Rc<CachedShape>,
+        generation: usize,
+        palette: &ColorPalette,
+    ) -> LineToElementShapeItem {
+        let glyphs = shape
+            .glyphs_at(generation)
+            .expect("fixture shape is bound at the requested generation");
         let attrs = CellAttributes::default();
         let config = ConfigHandle::default_config();
         let style = TextStyle::default();
@@ -1432,13 +1454,11 @@ mod tests {
                 bg_color: palette.resolve_bg(cluster.attrs.background()).to_linear(),
                 underline_color: fg,
                 x_pos: 0.0,
-                pixel_width: shape
-                    .glyphs
-                    .borrow()
+                pixel_width: glyphs
                     .iter()
                     .map(|glyph| glyph.glyph.x_advance.get() as f32)
                     .sum(),
-                glyph_info: Rc::clone(&shape.glyphs.borrow()),
+                glyph_info: glyphs,
                 cluster,
             }]),
             current_highlight: None,
@@ -1501,8 +1521,8 @@ mod tests {
         let mut new_palette = old_palette.clone();
         new_palette.foreground = (0x12, 0xe4, 0x76).into();
         new_palette.background = (0x31, 0x14, 0x88).into();
-        let expected = line_witness(&colored_line(&reference, &new_palette));
-        let old = line_witness(&colored_line(&shape, &old_palette));
+        let expected = line_witness(&colored_line(&reference, 41, &new_palette));
+        let old = line_witness(&colored_line(&shape, 41, &old_palette));
         assert_ne!(
             old.0, expected.0,
             "negative control must actually change colors"
@@ -1518,7 +1538,7 @@ mod tests {
         fixture
             .lines
             .borrow_mut()
-            .put(line_shape_key(41, 0), colored_line(&shape, &old_palette));
+            .put(line_shape_key(41, 0), colored_line(&shape, 41, &old_palette));
         assert_eq!(
             fixture.invalidate(Cause::Palette),
             CacheRebuild::ColoredLines
@@ -1530,12 +1550,14 @@ mod tests {
         assert_eq!(fixture.survivors(), (true, false, false));
         let cached = Rc::clone(fixture.shapes.borrow_mut().get(&shape_key()).unwrap());
         assert!(Rc::ptr_eq(&cached, &shape), "no HarfBuzz cache rebuild");
-        assert_eq!(cached.generation.get(), fixture.shape_generation);
+        let retained = cached
+            .glyphs_at(fixture.shape_generation)
+            .expect("a palette change keeps the current sprite binding");
         assert!(
-            Rc::ptr_eq(&cached.glyphs.borrow(), &shape.glyphs.borrow()),
+            Rc::ptr_eq(&retained, &shape.glyphs_at(41).unwrap()),
             "no sprite re-resolution"
         );
-        let rebuilt = colored_line(&cached, &new_palette);
+        let rebuilt = colored_line(&cached, fixture.shape_generation, &new_palette);
         assert_eq!(line_witness(&rebuilt), expected);
         fixture
             .lines
@@ -1558,7 +1580,7 @@ mod tests {
         fixture
             .lines
             .borrow_mut()
-            .put(line_shape_key(41, 0), colored_line(&shape, &old_palette));
+            .put(line_shape_key(41, 0), colored_line(&shape, 41, &old_palette));
         assert_ne!(
             line_witness(
                 fixture
@@ -1579,9 +1601,244 @@ mod tests {
         let reshaped = rasterized_shape(&fonts, &metrics, fixture.shape_generation);
         assert!(!Rc::ptr_eq(&reshaped, &shape));
         assert_eq!(
-            line_witness(&colored_line(&reshaped, &new_palette)),
+            line_witness(&colored_line(&reshaped, 42, &new_palette)),
             expected
         );
+    }
+
+    const LEDGER_ATLAS_SIDE: usize = 256;
+
+    fn private_ledger() -> &'static GpuResourceLedger {
+        Box::leak(Box::new(GpuResourceLedger::new()))
+    }
+
+    /// An in-memory atlas surface registered through the production
+    /// `LedgeredTexture`, exactly as `allocate_texture_atlas` registers GPU ones.
+    fn ledgered_atlas_surface(ledger: &'static GpuResourceLedger) -> Rc<dyn Texture2d> {
+        Rc::new(LedgeredTexture::new(
+            ImageTexture::new(LEDGER_ATLAS_SIDE, LEDGER_ATLAS_SIDE),
+            GpuTexturePurpose::Atlas,
+            ledger,
+        ))
+    }
+
+    /// Resolve sprites for `infos` against the CURRENT glyph cache, as
+    /// `TermWindow::glyph_infos_to_glyphs` does.
+    fn resolve_sprites(
+        glyph_cache: &RefCell<GlyphCache>,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        infos: &[GlyphInfo],
+    ) -> Rc<Vec<ShapedInfo>> {
+        let style = TextStyle::default();
+        let mut glyph_cache = glyph_cache.borrow_mut();
+        let glyphs: Vec<_> = infos
+            .iter()
+            .enumerate()
+            .map(|(index, info)| {
+                glyph_cache
+                    .cached_glyph(
+                        info,
+                        &style,
+                        infos.get(index + 1).is_some_and(|next| next.is_space),
+                        font,
+                        metrics,
+                        info.num_cells,
+                    )
+                    .unwrap()
+            })
+            .collect();
+        Rc::new(ShapedInfo::process(infos, &glyphs))
+    }
+
+    /// Look `text` up in the shape cache the way `cached_cluster_shape` does:
+    /// shape on a miss, then bind sprites for the current generation.
+    fn shape_through_cache(
+        fixture: &CacheFixture,
+        glyph_cache: &RefCell<GlyphCache>,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        text: &str,
+    ) -> (Rc<CachedShape>, Rc<Vec<ShapedInfo>>) {
+        let generation = fixture.shape_generation;
+        let key = ShapeCacheKey {
+            style: TextStyle::default(),
+            text: text.to_string(),
+        };
+        let cached = fixture.shapes.borrow_mut().get(&key).cloned();
+        let shape = cached.unwrap_or_else(|| {
+            let infos = font
+                .blocking_shape(text, None, wezterm_bidi::Direction::LeftToRight, None, None)
+                .unwrap();
+            let sprites = resolve_sprites(glyph_cache, font, metrics, &infos);
+            let shape = Rc::new(CachedShape::new(infos, sprites, generation));
+            fixture.shapes.borrow_mut().put(key, Rc::clone(&shape));
+            shape
+        });
+        let sprites = shape
+            .glyphs_for(generation, |infos| {
+                Ok(resolve_sprites(glyph_cache, font, metrics, infos))
+            })
+            .unwrap();
+        assert!(
+            sprites.iter().any(|info| info.glyph.texture.is_some()),
+            "{text:?} must rasterize into the current atlas"
+        );
+        (shape, sprites)
+    }
+
+    /// ft-yccm0.2.5 acceptance: 1,000 atlas rebuilds with a populated shape
+    /// cache keep live atlas-texture bytes within 2x the (fixed) atlas size,
+    /// read off live ledger counters rather than inferred from the code.
+    ///
+    /// Every generation shapes a hot key that is reused each time, plus a cold
+    /// key that is never looked up again. The cold keys are the 0.15.2 leak: an
+    /// entry that is not reused was never refreshed, so its glyph `Rc`s pinned
+    /// that generation's atlas texture until LFU eviction, and with 1,000
+    /// rebuilds the default-sized cache never fills up to evict anything. The
+    /// line cache also holds the hot shape's sprites, as `render_screen_line`
+    /// does. The rebuild is the production pair: the `AtlasResource`
+    /// invalidation followed by `replace_glyph_cache_atlas`.
+    #[test]
+    fn thousand_atlas_rebuilds_keep_live_atlas_bytes_within_twice_the_atlas_size() {
+        const REBUILDS: u64 = 1_000;
+        config::use_test_configuration();
+        let fonts = Rc::new(FontConfiguration::new(None, 96).unwrap());
+        let metrics = RenderMetrics::new(&fonts).unwrap();
+        let font = fonts.resolve_font(&TextStyle::default()).unwrap();
+        let palette = ColorPalette::default();
+        let ledger = private_ledger();
+        let atlas_bytes = texture_bytes(
+            LEDGER_ATLAS_SIDE as u64,
+            LEDGER_ATLAS_SIDE as u64,
+            4,
+        );
+        let bound = 2 * atlas_bytes;
+
+        let glyph_cache = RefCell::new(
+            GlyphCache::with_atlas_surface(&fonts, ledgered_atlas_surface(ledger)).unwrap(),
+        );
+        // Held across each rebuild like `RenderState::util_sprites`: the old
+        // utility sprites keep the old atlas alive until they are replaced.
+        let mut util_sprites = UtilSprites::new(&mut glyph_cache.borrow_mut(), &metrics).unwrap();
+        assert_eq!(util_sprites.white_space.texture.width(), LEDGER_ATLAS_SIDE);
+        let mut fixture = CacheFixture::new(0, 0);
+        assert!(
+            ConfigHandle::default_config().shape_cache_size as u64 > REBUILDS + 1,
+            "the shape cache must not evict during the run, or eviction could mask a leak"
+        );
+
+        for rebuild in 0..REBUILDS {
+            let generation = fixture.shape_generation;
+            let (hot, _) = shape_through_cache(&fixture, &glyph_cache, &font, &metrics, "AVfi");
+            shape_through_cache(
+                &fixture,
+                &glyph_cache,
+                &font,
+                &metrics,
+                &format!("cold {rebuild}"),
+            );
+            fixture.lines.borrow_mut().put(
+                line_shape_key(generation, 0),
+                colored_line(&hot, generation, &palette),
+            );
+            drop(hot);
+
+            assert_eq!(fixture.invalidate(Cause::AtlasResource), CacheRebuild::AtlasSprites);
+            util_sprites = replace_glyph_cache_atlas(
+                &glyph_cache,
+                &fonts,
+                &metrics,
+                ledgered_atlas_surface(ledger),
+                ledger,
+            )
+            .unwrap();
+            assert_eq!(util_sprites.white_space.texture.width(), LEDGER_ATLAS_SIDE);
+
+            let atlas = ledger.texture_counter(GpuTexturePurpose::Atlas);
+            assert!(
+                atlas.live_bytes <= bound,
+                "rebuild {rebuild}: {} live atlas bytes exceed 2x the atlas size ({bound}); \
+                 a cache is pinning an old atlas texture",
+                atlas.live_bytes
+            );
+            assert_eq!(
+                (atlas.live_count, atlas.live_bytes),
+                (1, atlas_bytes),
+                "rebuild {rebuild}: only the current atlas may stay alive"
+            );
+        }
+
+        let snapshot = ledger.snapshot();
+        let atlas = snapshot.textures["atlas"];
+        assert_eq!(snapshot.atlas_generations, REBUILDS);
+        assert_eq!(atlas.created_total, REBUILDS + 1, "every rebuild made a new atlas");
+        assert_eq!(atlas.released_total, REBUILDS, "every old atlas was freed");
+        assert!(atlas.peak_live_bytes <= bound);
+        assert_eq!(
+            fixture.shapes.borrow().len() as u64,
+            REBUILDS + 1,
+            "the shaping output itself must survive every rebuild"
+        );
+        fixture.shapes.borrow().for_each_resident(|key, shape| {
+            assert!(
+                !shape.is_atlas_bound(),
+                "{:?} still holds sprites after the final rebuild",
+                key.text
+            );
+        });
+        assert!(fixture.lines.borrow().is_empty());
+    }
+
+    /// Negative control for the test above: a retained sprite binding (what
+    /// an unreleased shape-cache entry is) keeps its atlas visible in the
+    /// ledger, and the atlas is freed once the binding goes away.
+    #[test]
+    fn ledger_counts_an_atlas_pinned_by_a_retained_sprite_binding() {
+        config::use_test_configuration();
+        let fonts = Rc::new(FontConfiguration::new(None, 96).unwrap());
+        let metrics = RenderMetrics::new(&fonts).unwrap();
+        let font = fonts.resolve_font(&TextStyle::default()).unwrap();
+        let ledger = private_ledger();
+        let atlas_bytes = texture_bytes(
+            LEDGER_ATLAS_SIDE as u64,
+            LEDGER_ATLAS_SIDE as u64,
+            4,
+        );
+        let glyph_cache = RefCell::new(
+            GlyphCache::with_atlas_surface(&fonts, ledgered_atlas_surface(ledger)).unwrap(),
+        );
+        let mut _util_sprites =
+            UtilSprites::new(&mut glyph_cache.borrow_mut(), &metrics).unwrap();
+        let mut fixture = CacheFixture::new(0, 0);
+
+        let mut retained = Vec::new();
+        for _ in 0..3 {
+            let (_, sprites) =
+                shape_through_cache(&fixture, &glyph_cache, &font, &metrics, "AVfi");
+            retained.push(sprites);
+            fixture.invalidate(Cause::AtlasResource);
+            _util_sprites = replace_glyph_cache_atlas(
+                &glyph_cache,
+                &fonts,
+                &metrics,
+                ledgered_atlas_surface(ledger),
+                ledger,
+            )
+            .unwrap();
+        }
+        let pinned = ledger.texture_counter(GpuTexturePurpose::Atlas);
+        assert_eq!(
+            (pinned.live_count, pinned.live_bytes),
+            (4, 4 * atlas_bytes),
+            "three retained bindings pin three old atlases next to the current one"
+        );
+        assert!(pinned.live_bytes > 2 * atlas_bytes, "the 2x bound detects pinning");
+
+        drop(retained);
+        let freed = ledger.texture_counter(GpuTexturePurpose::Atlas);
+        assert_eq!((freed.live_count, freed.live_bytes), (1, atlas_bytes));
+        assert_eq!(freed.peak_live_bytes, 4 * atlas_bytes);
     }
 
     fn line_shape_key(shape_generation: usize, index: usize) -> LineToEleShapeCacheKey {

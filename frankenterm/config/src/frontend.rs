@@ -8,6 +8,23 @@ pub enum FrontEndSelection {
     OpenGL,
     WebGpu,
     Software,
+    /// The native Metal renderer (macOS only, in development: it currently
+    /// clears the window to the background color and draws no terminal
+    /// content). Falls back to `WebGpu` when Metal is unavailable.
+    Metal,
+}
+
+impl FrontEndSelection {
+    /// The front end a window actually uses, given whether the native Metal
+    /// renderer attached. `Metal` falls back to `WebGpu`; every other
+    /// selection is used as configured.
+    #[must_use]
+    pub fn effective(self, metal_attached: bool) -> Self {
+        match self {
+            Self::Metal if !metal_attached => Self::WebGpu,
+            selection => selection,
+        }
+    }
 }
 
 /// Corresponds to <https://docs.rs/wgpu/latest/wgpu/struct.AdapterInfo.html>
@@ -65,6 +82,37 @@ mod tests {
     #[test]
     fn frontend_selection_default_is_opengl() {
         assert_eq!(FrontEndSelection::default(), FrontEndSelection::OpenGL);
+    }
+
+    #[test]
+    fn frontend_selection_parses_metal_from_config() {
+        use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, Value};
+        let parsed = FrontEndSelection::from_dynamic(
+            &Value::String("Metal".to_string()),
+            FromDynamicOptions::default(),
+        )
+        .expect("front_end = \"Metal\" parses");
+        assert_eq!(parsed, FrontEndSelection::Metal);
+    }
+
+    #[test]
+    fn metal_falls_back_to_webgpu_only_when_it_did_not_attach() {
+        assert_eq!(
+            FrontEndSelection::Metal.effective(true),
+            FrontEndSelection::Metal
+        );
+        assert_eq!(
+            FrontEndSelection::Metal.effective(false),
+            FrontEndSelection::WebGpu
+        );
+        for other in [
+            FrontEndSelection::OpenGL,
+            FrontEndSelection::WebGpu,
+            FrontEndSelection::Software,
+        ] {
+            assert_eq!(other.effective(false), other);
+            assert_eq!(other.effective(true), other);
+        }
     }
 
     #[test]

@@ -586,6 +586,7 @@ impl Window {
                 window: None,
                 screen_changed: false,
                 paint_throttled: false,
+                repaint_slot: None,
                 invalidated: true,
                 gl_context_pair: None,
                 text_cursor_position: Rect::new(Point::new(0, 0), Size::new(0, 0)),
@@ -1712,6 +1713,8 @@ struct Inner {
     window: Option<WeakPtr>,
     screen_changed: bool,
     paint_throttled: bool,
+    /// The latest paint's throttle slot (`crate::repaint_slot`, ft-1w85m).
+    repaint_slot: Option<Instant>,
     window_id: usize,
     invalidated: bool,
     gl_context_pair: Option<GlContextPair>,
@@ -3333,6 +3336,8 @@ impl WindowView {
 
                 let window_id = inner.window_id;
                 let interval = config::frame_interval_for_max_fps(inner.config.max_fps);
+                let slot = crate::repaint_slot(inner.repaint_slot, paint_started, interval);
+                inner.repaint_slot = Some(slot);
                 let connection = Connection::get().map(|connection| Rc::downgrade(&connection));
                 let original_state = Rc::downgrade(&this.inner);
                 if let Ok(reservation) = crate::reserve_window_main_thread(
@@ -3342,7 +3347,7 @@ impl WindowView {
                 ) {
                     reservation
                         .spawn_local(crate::complete_repaint_after_interval(
-                            paint_started,
+                            slot,
                             interval,
                             move || {
                                 let Some(connection) = connection.and_then(|weak| weak.upgrade())

@@ -72,17 +72,47 @@ pub(crate) static REPAINT_SCHEDULER_TEST_LOCK: std::sync::Mutex<()> = std::sync:
 
 /// Finish in the already admitted Render task. Re-admitting completion as a
 /// window operation can strand the repaint latch when the general pool is full.
-/// Paint time and time queued before the first poll both count toward the cap.
+/// The next paint may start one `interval` after `slot` (see [`repaint_slot`]);
+/// paint time and time queued before the first poll both count toward it.
 pub(crate) async fn complete_repaint_after_interval(
-    paint_started: std::time::Instant,
+    slot: std::time::Instant,
     interval: std::time::Duration,
     complete: impl FnOnce(),
 ) {
-    let remaining = interval.saturating_sub(paint_started.elapsed());
+    let remaining = slot
+        .checked_add(interval)
+        .map_or(std::time::Duration::ZERO, |deadline| {
+            deadline.saturating_duration_since(std::time::Instant::now())
+        });
     if !remaining.is_zero() {
         promise::spawn::sleep(remaining).await;
     }
     complete();
+}
+
+/// The throttle slot of a repaint that starts at `paint_started` (ft-1w85m).
+///
+/// The throttle is a one-frame token bucket on a fixed cadence: each paint is
+/// entitled to start one `interval` after the previous paint's slot. A paint
+/// that starts within one interval of that entitlement keeps the cadence,
+/// early or late, so the timer wheel's millisecond slop and the time a wake-up
+/// spends queued are not added to every frame. A continuously invalidated
+/// window then sustains exactly `max_fps`, where anchoring each interval at
+/// the paint's own start lost that latency on every frame. A paint after a
+/// longer idle gap restarts the cadence at its own start, so idle time never
+/// banks a burst. Consecutive slots are always at least `interval` apart.
+pub(crate) fn repaint_slot(
+    previous_slot: Option<std::time::Instant>,
+    paint_started: std::time::Instant,
+    interval: std::time::Duration,
+) -> std::time::Instant {
+    let Some(entitled) = previous_slot.and_then(|slot| slot.checked_add(interval)) else {
+        return paint_started;
+    };
+    match entitled.checked_add(interval) {
+        Some(stale) if paint_started < stale => entitled,
+        _ => paint_started,
+    }
 }
 
 pub use bitmaps::{BitmapImage, Image};
@@ -615,6 +645,159 @@ mod tests {
         assert!(matches!(timer.as_mut().poll(&mut context), Poll::Pending));
         drop(timer);
         assert!(!completed.get());
+    }
+
+    /// ft-1w85m: the completion deadline is the slot plus one interval, even
+    /// when the slot is still ahead (a paint that started before its
+    /// entitlement), and an overdue deadline completes on the first poll.
+    #[test]
+    fn repaint_completion_deadline_is_one_interval_after_the_slot() {
+        use std::cell::Cell;
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        use std::time::{Duration, Instant};
+
+        let mut context = Context::from_waker(Waker::noop());
+        let completed = Cell::new(false);
+        let future_slot = Instant::now() + Duration::from_secs(3600);
+        let mut timer = Box::pin(complete_repaint_after_interval(
+            future_slot,
+            Duration::from_nanos(1),
+            || completed.set(true),
+        ));
+        assert!(matches!(timer.as_mut().poll(&mut context), Poll::Pending));
+        drop(timer);
+        assert!(!completed.get());
+
+        let past_slot = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        let mut timer = Box::pin(complete_repaint_after_interval(
+            past_slot,
+            config::frame_interval_for_max_fps(60),
+            || completed.set(true),
+        ));
+        assert!(matches!(timer.as_mut().poll(&mut context), Poll::Ready(())));
+        assert!(completed.get());
+    }
+
+    #[test]
+    fn repaint_slot_keeps_the_cadence_through_early_and_late_wakes() {
+        use std::time::{Duration, Instant};
+
+        let interval = config::frame_interval_for_max_fps(60);
+        assert_eq!(interval, Duration::from_nanos(16_666_667));
+        let base = Instant::now();
+        let first = repaint_slot(None, base, interval);
+        assert_eq!(first, base, "the first paint starts the cadence");
+
+        // A wake 0.9 ms late keeps the cadence: the lateness is not carried.
+        let late = base + interval + Duration::from_micros(900);
+        assert_eq!(repaint_slot(Some(first), late, interval), base + interval);
+        // The timer wheel can fire a deadline inside its current millisecond
+        // early; the slot stays at the entitlement, so the next deadline does
+        // not move forward either.
+        let early = base + interval - Duration::from_micros(600);
+        assert_eq!(repaint_slot(Some(first), early, interval), base + interval);
+        // Just under one interval late still keeps the cadence.
+        let latest = base + interval * 2 - Duration::from_nanos(1);
+        assert_eq!(repaint_slot(Some(first), latest, interval), base + interval);
+        // A full interval or more past the entitlement is an idle gap: the
+        // cadence restarts at the paint, so idle time never banks a burst.
+        let idle = base + interval * 2;
+        assert_eq!(repaint_slot(Some(first), idle, interval), idle);
+        let long_idle = base + Duration::from_secs(5);
+        assert_eq!(repaint_slot(Some(first), long_idle, interval), long_idle);
+    }
+
+    /// A deterministic model of the macOS/X11/Windows repaint loop for a
+    /// window invalidated on every frame: each paint takes 4 ms, its throttle
+    /// timer fires between 0.9 ms early and 1.0 ms late (the asupersync
+    /// wheel's millisecond tick), and the wake-up then waits up to 0.5 ms for
+    /// the run loop. Returns the paints started within `seconds` and every
+    /// throttle slot.
+    fn simulate_repaint_loop(
+        interval: std::time::Duration,
+        seconds: u64,
+        anchor_at_paint_start: bool,
+    ) -> (usize, Vec<std::time::Instant>) {
+        use std::time::{Duration, Instant};
+
+        let base = Instant::now();
+        let end = base + Duration::from_secs(seconds);
+        let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut previous = None;
+        let mut slots = Vec::new();
+        let mut start = base;
+        let mut paints = 0;
+        while start < end {
+            paints += 1;
+            let slot = if anchor_at_paint_start {
+                start
+            } else {
+                repaint_slot(previous, start, interval)
+            };
+            slots.push(slot);
+            previous = Some(slot);
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let early_or_late_us = (rng % 1_900) as i64 - 900;
+            let queued = Duration::from_micros((rng >> 32) % 500);
+            let deadline = slot + interval;
+            let fired = if early_or_late_us < 0 {
+                deadline - Duration::from_micros(early_or_late_us.unsigned_abs())
+            } else {
+                deadline + Duration::from_micros(early_or_late_us as u64)
+            };
+            start = (fired + queued).max(start + Duration::from_millis(4));
+        }
+        (paints, slots)
+    }
+
+    /// ft-1w85m acceptance: max_fps equal to the refresh rate sustains it.
+    #[test]
+    fn repaint_throttle_sustains_max_fps_despite_timer_slop() {
+        use std::time::Duration;
+
+        for (max_fps, expected) in [(60_u64, 600_usize), (120, 1_200)] {
+            let interval = config::frame_interval_for_max_fps(max_fps);
+            let (paints, slots) = simulate_repaint_loop(interval, 10, false);
+            assert!(
+                (expected - 1..=expected + 1).contains(&paints),
+                "max_fps={} painted {} times in 10 s",
+                max_fps,
+                paints
+            );
+            // The cap holds: slots never closer than one interval, and no
+            // one-second window holds more than max_fps + 1 slots.
+            for pair in slots.windows(2) {
+                assert!(pair[1] - pair[0] >= interval);
+            }
+            for (index, first) in slots.iter().enumerate() {
+                let within = slots[index..]
+                    .iter()
+                    .take_while(|slot| **slot - *first < Duration::from_secs(1))
+                    .count();
+                assert!(
+                    within as u64 <= max_fps + 1,
+                    "max_fps={} allowed {} paints in one second",
+                    max_fps,
+                    within
+                );
+            }
+        }
+
+        // The defect: whole-millisecond intervals anchored at each paint's
+        // start fell well short of 60 FPS, and nanosecond intervals alone
+        // still lose the wake-up latency on every frame.
+        let (old, _) = simulate_repaint_loop(Duration::from_millis(17), 10, true);
+        assert!(old < 585, "old throttle painted {} times", old);
+        let (exact_only, _) =
+            simulate_repaint_loop(config::frame_interval_for_max_fps(60), 10, true);
+        assert!(
+            exact_only < 595,
+            "start-anchored throttle painted {} times",
+            exact_only
+        );
     }
 
     #[test]

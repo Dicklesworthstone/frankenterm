@@ -1,0 +1,218 @@
+# vttest recording for the conformance runner (ft-yccm0.1.9).
+# Captured by capture_vttest.py; do not edit by hand.
+@vttest VT100 test program, version 2.7 (20251205)
+@geometry 24x80.80 24x80 TERM=vt100 LC_ALL=C
+@session character-sets keys '3\r' '8\r' '*' '9\r' '*' '10\r' '*' '11\r' '*'
+@screen 00 key ''
+\e[0c\eP$q"p\e\\\e[>c\e[?1l\e[?3l\e[?4l\e[?5l\e[?6l\e[?7h\e[?8l\e[?40h\e[?45l\e[r\e[0m\e[2J\e[3;10HVT100 test program, version 2.7 (20251205)
+\e[4;10HScreen size 24x80 (80 max) \e[5;10HChoose test type:\r\r\n
+\e[6;1H\e[0J\r\r\n
+          0. Exit\r\n
+          1. Test of cursor movements\r\n
+          2. Test of screen features\r\n
+          3. Test of character sets\r\n
+          4. Test of double-sized characters\r\n
+          5. Test of keyboard\r\n
+          6. Test of terminal reports\r\n
+          7. Test of VT52 mode\r\n
+          8. Test of VT102 features (Insert/Delete Char/Line)\r\n
+          9. Test of known bugs\r\n
+          10. Test of reset and self-test\r\n
+          11. Test non-VT100 (e.g., VT220, XTERM) terminals\r\n
+          12. Modify test-parameters\r\n
+\r\r\n
+          Enter choice number (0 - 12):\x20
+@screen 01 key '3\r'
+3\r\n
+\e[2J\e[?42l\e(B\e-A\e.A\e/A\e[2J\e[3;10HMenu 3: Character-Set Tests\e[5;10HChoose test type:\r\r\n
+\e[6;1H\e[0J\r\r\n
+          0. Exit\r\n
+          1. Reset (G0 ASCII, G1 Latin-1, no NRC mode)\r\n
+          2. Enable highlighting of non-ISO-8859-1 mapping\r\n
+          3. Enable National Replacement Character (NRC) mode\r\n
+          4. Specify G0 (now US ASCII)\r\n
+          5. Specify G1 (now ISO Latin-1)\r\n
+          6. Specify G2 (now ISO Latin-1)\r\n
+          7. Specify G3 (now ISO Latin-1)\r\n
+          8. Test VT100 Character Sets\r\n
+          9. Test Shift In/Shift Out (SI/SO)\r\n
+          10. Test VT220 Locking Shifts\r\n
+          11. Test VT220 Single Shifts\r\n
+          12* Test Soft Character Sets\r\n
+          13. Test Keyboard Layout with G0 Selection\r\n
+\r\r\n
+          Enter choice number (0 - 13):\x20
+@screen 02 key '8\r'
+8\r\n
+\e[2J\e[1;10HSelected as G0 (with SI)\e[1;48HSelected as G1 (with SO)\e)B\e(B\x0e\e[3;1H\e[1mCharacter set B (US ASCII)
+\e[0m\e(B\e)B\x0f\e[4;10H !"#$%&'()*+,-./0123456789:;<=>?\e[5;10H@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_
+\e[6;10H`abcdefghijklmnopqrstuvwxyz{|}~\x7f\e)B\e(B\x0e\e[4;48H !"#$%&'()*+,-./0123456789:;<=>?\e[5;48H@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_
+\e[6;48H`abcdefghijklmnopqrstuvwxyz{|}~\x7f\e)B\e(B\x0e\e[7;1H\e[1mCharacter set A (British)\e[0m
+\e[?42h\e(A\e)B\x0f\e[8;10H !"#$%&'()*+,-./0123456789:;<=>?\e[9;10H@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_
+\e[10;10H`abcdefghijklmnopqrstuvwxyz{|}~\x7f\e[?42l\e[?42h\e)A\e(B\x0e\e[8;48H !"#$%&'()*+,-./0123456789:;<=>?
+\e[9;48H@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_\e[10;48H`abcdefghijklmnopqrstuvwxyz{|}~\x7f\e[?42l\e)B
+\e(B\x0e\e[11;1H\e[1mCharacter set 0 (DEC Special graphics and line drawing)\e[0m\e(0\e)B\x0f\e[12;10H !"#$%&'()*+,-./0123456789:;<=>?
+\e[13;10H@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_\e[14;10H`abcdefghijklmnopqrstuvwxyz{|}~\x7f\e)0\e(B\x0e
+\e[12;48H !"#$%&'()*+,-./0123456789:;<=>?\e[13;48H@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_\e[14;48H`abcdefghijklmnopqrstuvwxyz{|}~\x7f
+\e)B\e(B\x0e\e[15;1H\e[1mCharacter set 1 (DEC Alternate character ROM standard characters)\e[0m\e(1
+\e)B\x0f\e[16;10H !"#$%&'()*+,-./0123456789:;<=>?\e[17;10H@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_\e[18;10H`abcdefghijklmnopqrstuvwxyz{|}~\x7f
+\e)1\e(B\x0e\e[16;48H !"#$%&'()*+,-./0123456789:;<=>?\e[17;48H@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_\e[18;48H`abcdefghijklmnopqrstuvwxyz{|}~\x7f
+\e)B\e(B\x0e\e[19;1H\e[1mCharacter set 2 (DEC Alternate character ROM special graphics)\e[0m\e(2
+\e)B\x0f\e[20;10H !"#$%&'()*+,-./0123456789:;<=>?\e[21;10H@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_\e[22;10H`abcdefghijklmnopqrstuvwxyz{|}~\x7f
+\e)2\e(B\x0e\e[20;48H !"#$%&'()*+,-./0123456789:;<=>?\e[21;48H@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_\e[22;48H`abcdefghijklmnopqrstuvwxyz{|}~\x7f
+\e(B\e)B\x0f\e[24;1HThese are the installed character sets. Push <RETURN>
+@screen 03 key '\r'
+\r\n
+\e[2J\e[3;10HMenu 3: Character-Set Tests\e[5;10HChoose test type:\r\r\n
+\e[6;1H\e[0J\r\r\n
+          0. Exit\r\n
+          1. Reset (G0 ASCII, G1 Latin-1, no NRC mode)\r\n
+          2. Enable highlighting of non-ISO-8859-1 mapping\r\n
+          3. Enable National Replacement Character (NRC) mode\r\n
+          4. Specify G0 (now US ASCII)\r\n
+          5. Specify G1 (now ISO Latin-1)\r\n
+          6. Specify G2 (now ISO Latin-1)\r\n
+          7. Specify G3 (now ISO Latin-1)\r\n
+          8. Test VT100 Character Sets\r\n
+          9. Test Shift In/Shift Out (SI/SO)\r\n
+          10. Test VT220 Locking Shifts\r\n
+          11. Test VT220 Single Shifts\r\n
+          12* Test Soft Character Sets\r\n
+          13. Test Keyboard Layout with G0 Selection\r\n
+\r\r\n
+          Enter choice number (0 - 13):\x20
+@screen 04 key '9\r'
+9\r\n
+\e[2J\e[1;10HThese are the G0 and G1 character sets.\e(B\e)B\x0f\e[3;1H\e[1mCharacter set B (US ASCII)
+\e[0m\e[3;48HSelected as G0 (with SI)\e(B\e[4;10H !"#$%&'()*+,-./0123456789:;<=>?\e[5;10H@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_
+\e[6;10H`abcdefghijklmnopqrstuvwxyz{|}~\x7f\e(B\e)B\x0f\e)B\e(B\x0e\e[7;1H\e[1mCharacter set A (ISO Latin-1)
+\e[0m\e[7;48HSelected as G1 (with SO)\e-A\e[8;10H !"#$%&'()*+,-./0123456789:;<=>?\e[9;10H@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_
+\e[10;10H`abcdefghijklmnopqrstuvwxyz{|}~\x7f\e)B\e(B\x0e\e[24;1H\e(B\e)B\x0fPush <RETURN>
+@screen 05 key '\r'
+\r\n
+\e[2J\e[3;10HMenu 3: Character-Set Tests\e[5;10HChoose test type:\r\r\n
+\e[6;1H\e[0J\r\r\n
+          0. Exit\r\n
+          1. Reset (G0 ASCII, G1 Latin-1, no NRC mode)\r\n
+          2. Enable highlighting of non-ISO-8859-1 mapping\r\n
+          3. Enable National Replacement Character (NRC) mode\r\n
+          4. Specify G0 (now US ASCII)\r\n
+          5. Specify G1 (now ISO Latin-1)\r\n
+          6. Specify G2 (now ISO Latin-1)\r\n
+          7. Specify G3 (now ISO Latin-1)\r\n
+          8. Test VT100 Character Sets\r\n
+          9. Test Shift In/Shift Out (SI/SO)\r\n
+          10. Test VT220 Locking Shifts\r\n
+          11. Test VT220 Single Shifts\r\n
+          12* Test Soft Character Sets\r\n
+          13. Test Keyboard Layout with G0 Selection\r\n
+\r\r\n
+          Enter choice number (0 - 13):\x20
+@screen 06 key '10\r'
+10\r\n
+\e[2J\e[1;10HLocking shifts, with NRC disabled:\e(B\e)B\x0f\e[3;1H\e[1mCharacter set A (ISO Latin-1) in G1
+\e[0m\e[3;48HMaps G1 into GR (LS1R)\e(B\e)B\x0f\e~\e[4;5H !"#$%&'()*+,-./0123456789:;<=>?\e-A\e~
+\e[4;40H\xa0\xa1\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xab\xac\xad\xae\xaf\xb0\xb1\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xbb\xbc\xbd\xbe\xbf
+\e(B\e)B\x0f\e~\e[5;5H@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_\e-A\e~\e[5;40H\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf\xd0\xd1\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xdb\xdc\xdd\xde\xdf
+\e(B\e)B\x0f\e~\e[6;5H`abcdefghijklmnopqrstuvwxyz{|}~\x7f\e-A\e~\e[6;40H\xe0\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xeb\xec\xed\xee\xef\xf0\xf1\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff
+\e(B\e(B\e)B\x0f\e[7;1H\e[1mCharacter set A (ISO Latin-1) in G2\e[0m\e[7;48HMaps G2 into GL (LS2)
+\e.A\en\e[8;5H !"#$%&'()*+,-./0123456789:;<=>?\e(B\e)B\x0f\e-A\e~\e[8;40H\xa0\xa1\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xab\xac\xad\xae\xaf\xb0\xb1\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xbb\xbc\xbd\xbe\xbf
+\e.A\en\e[9;5H@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_\e(B\e)B\x0f\e-A\e~\e[9;40H\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf\xd0\xd1\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xdb\xdc\xdd\xde\xdf
+\e.A\en\e[10;5H`abcdefghijklmnopqrstuvwxyz{|}~\x7f\e(B\e)B\x0f\e-A\e~\e[10;40H\xe0\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xeb\xec\xed\xee\xef\xf0\xf1\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff
+\e.A\e(B\e)B\x0f\e[11;1H\e[1mCharacter set A (ISO Latin-1) in G2\e[0m\e[11;48HMaps G2 into GR (LS2R)
+\e(B\e)B\x0f\e~\e[12;5H !"#$%&'()*+,-./0123456789:;<=>?\e.A\e}\e[12;40H\xa0\xa1\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xab\xac\xad\xae\xaf\xb0\xb1\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xbb\xbc\xbd\xbe\xbf
+\e(B\e)B\x0f\e~\e[13;5H@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_\e.A\e}\e[13;40H\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf\xd0\xd1\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xdb\xdc\xdd\xde\xdf
+\e(B\e)B\x0f\e~\e[14;5H`abcdefghijklmnopqrstuvwxyz{|}~\x7f\e.A\e}\e[14;40H\xe0\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xeb\xec\xed\xee\xef\xf0\xf1\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff
+\e.A\e(B\e)B\x0f\e[15;1H\e[1mCharacter set A (ISO Latin-1) in G3\e[0m\e[15;48HMaps G3 into GL (LS3)
+\e/A\eo\e[16;5H !"#$%&'()*+,-./0123456789:;<=>?\e(B\e)B\x0f\e-A\e~\e[16;40H\xa0\xa1\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xab\xac\xad\xae\xaf\xb0\xb1\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xbb\xbc\xbd\xbe\xbf
+\e/A\eo\e[17;5H@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_\e(B\e)B\x0f\e-A\e~\e[17;40H\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf\xd0\xd1\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xdb\xdc\xdd\xde\xdf
+\e/A\eo\e[18;5H`abcdefghijklmnopqrstuvwxyz{|}~\x7f\e(B\e)B\x0f\e-A\e~\e[18;40H\xe0\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xeb\xec\xed\xee\xef\xf0\xf1\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff
+\e.A\e(B\e)B\x0f\e[19;1H\e[1mCharacter set A (ISO Latin-1) in G3\e[0m\e[19;48HMaps G3 into GR (LS3R)
+\e(B\e)B\x0f\e~\e[20;5H !"#$%&'()*+,-./0123456789:;<=>?\e/A\e|\e[20;40H\xa0\xa1\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xab\xac\xad\xae\xaf\xb0\xb1\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xbb\xbc\xbd\xbe\xbf
+\e(B\e)B\x0f\e~\e[21;5H@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_\e/A\e|\e[21;40H\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf\xd0\xd1\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xdb\xdc\xdd\xde\xdf
+\e(B\e)B\x0f\e~\e[22;5H`abcdefghijklmnopqrstuvwxyz{|}~\x7f\e/A\e|\e[22;40H\xe0\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xeb\xec\xed\xee\xef\xf0\xf1\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff
+\e.A\e(B\e)B\x0f\e[24;1HPush <RETURN>
+@screen 07 key '\r'
+\r\n
+\e[2J\e[3;10HMenu 3: Character-Set Tests\e[5;10HChoose test type:\r\r\n
+\e[6;1H\e[0J\r\r\n
+          0. Exit\r\n
+          1. Reset (G0 ASCII, G1 Latin-1, no NRC mode)\r\n
+          2. Enable highlighting of non-ISO-8859-1 mapping\r\n
+          3. Enable National Replacement Character (NRC) mode\r\n
+          4. Specify G0 (now US ASCII)\r\n
+          5. Specify G1 (now ISO Latin-1)\r\n
+          6. Specify G2 (now ISO Latin-1)\r\n
+          7. Specify G3 (now ISO Latin-1)\r\n
+          8. Test VT100 Character Sets\r\n
+          9. Test Shift In/Shift Out (SI/SO)\r\n
+          10. Test VT220 Locking Shifts\r\n
+          11. Test VT220 Single Shifts\r\n
+          12* Test Soft Character Sets\r\n
+          13. Test Keyboard Layout with G0 Selection\r\n
+\r\r\n
+          Enter choice number (0 - 13):\x20
+@screen 08 key '11\r'
+11\r\n
+\e[2J\e[2J\e[1;1HTesting single-shift G2 into GL (SS2) with NRC disabled\r\n
+G2 is ISO Latin-1\e.A\e[5;5H 32: (\eN )\e[5;17H 48: (\eN0)\e[5;29H 64: (\eN@)\e[5;41H 80: (\eNP)
+\e[5;53H 96: (\eN`)\e[5;65H112: (\eNp)\e[6;5H 33: (\eN!)\e[6;17H 49: (\eN1)\e[6;29H 65: (\eNA)\e[6;41H 81: (
+\eNQ)\e[6;53H 97: (\eNa)\e[6;65H113: (\eNq)\e[7;5H 34: (\eN")\e[7;17H 50: (\eN2)\e[7;29H 66: (\eNB)
+\e[7;41H 82: (\eNR)\e[7;53H 98: (\eNb)\e[7;65H114: (\eNr)\e[8;5H 35: (\eN#)\e[8;17H 51: (\eN3)\e[8;29H 67: (
+\eNC)\e[8;41H 83: (\eNS)\e[8;53H 99: (\eNc)\e[8;65H115: (\eNs)\e[9;5H 36: (\eN$)\e[9;17H 52: (\eN4)
+\e[9;29H 68: (\eND)\e[9;41H 84: (\eNT)\e[9;53H100: (\eNd)\e[9;65H116: (\eNt)\e[10;5H 37: (\eN%)\e[10;17H 53: (
+\eN5)\e[10;29H 69: (\eNE)\e[10;41H 85: (\eNU)\e[10;53H101: (\eNe)\e[10;65H117: (\eNu)\e[11;5H 38: (
+\eN&)\e[11;17H 54: (\eN6)\e[11;29H 70: (\eNF)\e[11;41H 86: (\eNV)\e[11;53H102: (\eNf)\e[11;65H118: (
+\eNv)\e[12;5H 39: (\eN')\e[12;17H 55: (\eN7)\e[12;29H 71: (\eNG)\e[12;41H 87: (\eNW)\e[12;53H103: (
+\eNg)\e[12;65H119: (\eNw)\e[13;5H 40: (\eN()\e[13;17H 56: (\eN8)\e[13;29H 72: (\eNH)\e[13;41H 88: (
+\eNX)\e[13;53H104: (\eNh)\e[13;65H120: (\eNx)\e[14;5H 41: (\eN))\e[14;17H 57: (\eN9)\e[14;29H 73: (
+\eNI)\e[14;41H 89: (\eNY)\e[14;53H105: (\eNi)\e[14;65H121: (\eNy)\e[15;5H 42: (\eN*)\e[15;17H 58: (
+\eN:)\e[15;29H 74: (\eNJ)\e[15;41H 90: (\eNZ)\e[15;53H106: (\eNj)\e[15;65H122: (\eNz)\e[16;5H 43: (
+\eN+)\e[16;17H 59: (\eN;)\e[16;29H 75: (\eNK)\e[16;41H 91: (\eN[)\e[16;53H107: (\eNk)\e[16;65H123: (
+\eN{)\e[17;5H 44: (\eN,)\e[17;17H 60: (\eN<)\e[17;29H 76: (\eNL)\e[17;41H 92: (\eN\\)\e[17;53H108: (
+\eNl)\e[17;65H124: (\eN|)\e[18;5H 45: (\eN-)\e[18;17H 61: (\eN=)\e[18;29H 77: (\eNM)\e[18;41H 93: (
+\eN])\e[18;53H109: (\eNm)\e[18;65H125: (\eN})\e[19;5H 46: (\eN.)\e[19;17H 62: (\eN>)\e[19;29H 78: (
+\eNN)\e[19;41H 94: (\eN^)\e[19;53H110: (\eNn)\e[19;65H126: (\eN~)\e[20;5H 47: (\eN/)\e[20;17H 63: (
+\eN?)\e[20;29H 79: (\eNO)\e[20;41H 95: (\eN_)\e[20;53H111: (\eNo)\e[20;65H127: (\eN\x7f)\e[24;1HPush <RETURN>
+@screen 09 key '\r'
+\r\n
+\e[2J\e[1;1HTesting single-shift G3 into GL (SS3) with NRC disabled\r\n
+G3 is ISO Latin-1\e/A\e[5;5H 32: (\eO )\e[5;17H 48: (\eO0)\e[5;29H 64: (\eO@)\e[5;41H 80: (\eOP)
+\e[5;53H 96: (\eO`)\e[5;65H112: (\eOp)\e[6;5H 33: (\eO!)\e[6;17H 49: (\eO1)\e[6;29H 65: (\eOA)\e[6;41H 81: (
+\eOQ)\e[6;53H 97: (\eOa)\e[6;65H113: (\eOq)\e[7;5H 34: (\eO")\e[7;17H 50: (\eO2)\e[7;29H 66: (\eOB)
+\e[7;41H 82: (\eOR)\e[7;53H 98: (\eOb)\e[7;65H114: (\eOr)\e[8;5H 35: (\eO#)\e[8;17H 51: (\eO3)\e[8;29H 67: (
+\eOC)\e[8;41H 83: (\eOS)\e[8;53H 99: (\eOc)\e[8;65H115: (\eOs)\e[9;5H 36: (\eO$)\e[9;17H 52: (\eO4)
+\e[9;29H 68: (\eOD)\e[9;41H 84: (\eOT)\e[9;53H100: (\eOd)\e[9;65H116: (\eOt)\e[10;5H 37: (\eO%)\e[10;17H 53: (
+\eO5)\e[10;29H 69: (\eOE)\e[10;41H 85: (\eOU)\e[10;53H101: (\eOe)\e[10;65H117: (\eOu)\e[11;5H 38: (
+\eO&)\e[11;17H 54: (\eO6)\e[11;29H 70: (\eOF)\e[11;41H 86: (\eOV)\e[11;53H102: (\eOf)\e[11;65H118: (
+\eOv)\e[12;5H 39: (\eO')\e[12;17H 55: (\eO7)\e[12;29H 71: (\eOG)\e[12;41H 87: (\eOW)\e[12;53H103: (
+\eOg)\e[12;65H119: (\eOw)\e[13;5H 40: (\eO()\e[13;17H 56: (\eO8)\e[13;29H 72: (\eOH)\e[13;41H 88: (
+\eOX)\e[13;53H104: (\eOh)\e[13;65H120: (\eOx)\e[14;5H 41: (\eO))\e[14;17H 57: (\eO9)\e[14;29H 73: (
+\eOI)\e[14;41H 89: (\eOY)\e[14;53H105: (\eOi)\e[14;65H121: (\eOy)\e[15;5H 42: (\eO*)\e[15;17H 58: (
+\eO:)\e[15;29H 74: (\eOJ)\e[15;41H 90: (\eOZ)\e[15;53H106: (\eOj)\e[15;65H122: (\eOz)\e[16;5H 43: (
+\eO+)\e[16;17H 59: (\eO;)\e[16;29H 75: (\eOK)\e[16;41H 91: (\eO[)\e[16;53H107: (\eOk)\e[16;65H123: (
+\eO{)\e[17;5H 44: (\eO,)\e[17;17H 60: (\eO<)\e[17;29H 76: (\eOL)\e[17;41H 92: (\eO\\)\e[17;53H108: (
+\eOl)\e[17;65H124: (\eO|)\e[18;5H 45: (\eO-)\e[18;17H 61: (\eO=)\e[18;29H 77: (\eOM)\e[18;41H 93: (
+\eO])\e[18;53H109: (\eOm)\e[18;65H125: (\eO})\e[19;5H 46: (\eO.)\e[19;17H 62: (\eO>)\e[19;29H 78: (
+\eON)\e[19;41H 94: (\eO^)\e[19;53H110: (\eOn)\e[19;65H126: (\eO~)\e[20;5H 47: (\eO/)\e[20;17H 63: (
+\eO?)\e[20;29H 79: (\eOO)\e[20;41H 95: (\eO_)\e[20;53H111: (\eOo)\e[20;65H127: (\eO\x7f)\e[24;1HPush <RETURN>
+@screen 10 key '\r'
+\r\n
+\e[2J\e[3;10HMenu 3: Character-Set Tests\e[5;10HChoose test type:\r\r\n
+\e[6;1H\e[0J\r\r\n
+          0. Exit\r\n
+          1. Reset (G0 ASCII, G1 Latin-1, no NRC mode)\r\n
+          2. Enable highlighting of non-ISO-8859-1 mapping\r\n
+          3. Enable National Replacement Character (NRC) mode\r\n
+          4. Specify G0 (now US ASCII)\r\n
+          5. Specify G1 (now ISO Latin-1)\r\n
+          6. Specify G2 (now ISO Latin-1)\r\n
+          7. Specify G3 (now ISO Latin-1)\r\n
+          8. Test VT100 Character Sets\r\n
+          9. Test Shift In/Shift Out (SI/SO)\r\n
+          10. Test VT220 Locking Shifts\r\n
+          11. Test VT220 Single Shifts\r\n
+          12* Test Soft Character Sets\r\n
+          13. Test Keyboard Layout with G0 Selection\r\n
+\r\r\n
+          Enter choice number (0 - 13):\x20

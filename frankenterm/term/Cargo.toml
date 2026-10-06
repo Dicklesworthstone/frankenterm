@@ -46,8 +46,14 @@ frankenterm-surface = {workspace = true, features=["std", "appdata", "use_image"
 [dev-dependencies]
 criterion.workspace = true
 env_logger.workspace = true
+# Every runtime consumer (config, mux, codec, client) enables use_serde, and
+# the cold-scrollback tests are cfg(feature = "use_serde"). Enable it for this
+# crate's own tests so `cargo test -p frankenterm-term` can never skip them
+# silently (ft-4w698).
+frankenterm-term = { path = ".", features = ["use_serde"] }
 k9.workspace = true
 proptest = "1.8.0"
+sha2.workspace = true
 
 [[bench]]
 name = "byte_to_grid"
@@ -55,6 +61,17 @@ harness = false
 
 [[bench]]
 name = "term_parser_ab"
+harness = false
+
+# Headless ingest throughput bench (ft-yccm0.1.2). examples/ingest_throughput.rs
+# is the same CLI with a stable path for hyperfine; build both with
+# --profile release-perf or through cargo bench, never --release (opt-level = "z").
+[[bench]]
+name = "ingest_throughput"
+harness = false
+
+[[bench]]
+name = "pagegrid"
 harness = false
 
 [dependencies.termwiz]

@@ -557,8 +557,16 @@ fn clustering_neighbours_keep_len_and_dch_consistent() {
 fn compression_keeps_clustering_neighbours_in_vector_storage() {
     let attrs = CellAttributes::default();
     let mut line = Line::new(1);
-    line.set_cell(0, Cell::new_grapheme("\u{1F1FA}", attrs.clone(), None), 1);
-    line.set_cell(1, Cell::new_grapheme("\u{1F1F8}", attrs.clone(), None), 1);
+    // Regional indicators are two columns wide under the latest Unicode
+    // version, so the second one starts after the first one's spacer.
+    let first = Cell::new_grapheme("\u{1F1FA}", attrs.clone(), None);
+    let second_column = first.width();
+    line.set_cell(0, first, 1);
+    line.set_cell(
+        second_column,
+        Cell::new_grapheme("\u{1F1F8}", attrs.clone(), None),
+        1,
+    );
     line.compress_for_scrollback();
     line.canonicalize_scrollback_storage();
     let texts: Vec<String> = line

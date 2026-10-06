@@ -6157,19 +6157,36 @@ mod tests {
             "aaaa bbbb cccc dddddddd eeeeeeee 界 e\u{301} 🚀 ".repeat(16)
         );
         let model = MonospaceKpCostModel::terminal_default();
-        let line: Line = text.as_str().into();
-        let report = line.wrap_with_report(14, SEQ_ZERO, model);
-        let reconstructed: String = report
-            .lines
-            .iter()
-            .map(|row| row.as_str().into_owned())
-            .collect();
-        assert_eq!(reconstructed, text);
-        assert_eq!(report.scorecard.mode, MonospaceWrapMode::Dp);
-        assert!(report.scorecard.estimated_states > model.max_dp_states);
-        assert!(report.scorecard.evaluated_states <= model.max_dp_states);
-        assert!(report.scorecard.selected_total_cost < report.scorecard.greedy_total_cost);
-        assert_eq!(report.scorecard.selected_forced_breaks, 0);
+        // ft-eyp5a: at 14 columns no wrap of this input beats greedy. A
+        // separator that fits must stay on its row, so the paragraph opens
+        // with an unavoidable slack-4 row, and every later 41-column period
+        // tiles as 14 + 14 + 13. An exhaustive search of this cost model
+        // gives 278 for both. At 15 columns the optimum (779) is strictly
+        // below greedy (1047). The bounded search must find a strict gain
+        // where one exists and tie greedy, never lose to it, where none does.
+        for (width, strictly_better) in [(15, true), (14, false)] {
+            let line: Line = text.as_str().into();
+            let report = line.wrap_with_report(width, SEQ_ZERO, model);
+            let reconstructed: String = report
+                .lines
+                .iter()
+                .map(|row| row.as_str().into_owned())
+                .collect();
+            assert_eq!(reconstructed, text);
+            assert_eq!(report.scorecard.mode, MonospaceWrapMode::Dp);
+            assert!(report.scorecard.estimated_states > model.max_dp_states);
+            assert!(report.scorecard.evaluated_states <= model.max_dp_states);
+            assert!(report.scorecard.selected_total_cost <= report.scorecard.greedy_total_cost);
+            assert_eq!(
+                report.scorecard.selected_total_cost < report.scorecard.greedy_total_cost,
+                strictly_better,
+                "width {}: selected {} greedy {}",
+                width,
+                report.scorecard.selected_total_cost,
+                report.scorecard.greedy_total_cost
+            );
+            assert_eq!(report.scorecard.selected_forced_breaks, 0);
+        }
     }
 
     #[test]

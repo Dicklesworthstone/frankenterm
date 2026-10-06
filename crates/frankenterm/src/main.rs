@@ -68503,6 +68503,33 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 })
                 .collect();
 
+            // ft-yccm0.2.5: live GPU resource ledgers published by GUI
+            // processes (they are not visible from this process otherwise).
+            let (gpu_resources_report, gpu_resources_check) = gui_gpu_resources_doctor_report(
+                ::config::RUNTIME_DIR.as_path(),
+                frankenterm_alloc::resource_ledger::unix_now_ms(),
+            );
+            all_checks.push(gpu_resources_check);
+
+            // ft-yccm0.2.7: performance-hostile GUI settings (FT-TUNE-*).
+            let gui_config = gui_config_text();
+            let installed_gui = installed_gui_version(&installed_gui_plists());
+            let (config_tuning_report, config_tuning_checks) = config_tuning_doctor_report(
+                live_gui_tuning_facts(
+                    ::config::RUNTIME_DIR.as_path(),
+                    frankenterm_alloc::resource_ledger::unix_now_ms(),
+                )
+                .as_ref(),
+                gui_config
+                    .as_ref()
+                    .map(|(path, text)| (path.as_path(), text.as_str())),
+                installed_gui
+                    .as_ref()
+                    .map(|(path, version)| (path.as_path(), version.as_str())),
+                env!("CARGO_PKG_VERSION"),
+            );
+            all_checks.extend(config_tuning_checks);
+
             let large_swarm_proof_gauntlet_report =
                 frankenterm_core::large_swarm_replay::build_large_swarm_proof_gauntlet_manifest(
                     &layout.root,
@@ -68608,6 +68635,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 // reports the no-atlases sentinel.
                 result["atlas_tier_swap"] = serde_json::to_value(&tier_swap_doctor_report)
                     .unwrap_or(serde_json::Value::Null);
+                result["gpu_resources"] = gpu_resources_report;
+                result["config_tuning"] = config_tuning_report;
                 result["hardware_profile"] = serde_json::to_value(&hardware_profile_report)
                     .unwrap_or(serde_json::Value::Null);
                 result["large_swarm_proof_gauntlet"] = match &large_swarm_proof_gauntlet_report {
@@ -96572,6 +96601,8 @@ struct DiagnosticCheck {
     status: DiagnosticStatus,
     detail: Option<String>,
     recommendation: Option<String>,
+    /// A stable advisory code, e.g. `FT-TUNE-0002` (ft-yccm0.2.7).
+    code: Option<&'static str>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -96588,6 +96619,7 @@ impl DiagnosticCheck {
             status: DiagnosticStatus::Ok,
             detail: None,
             recommendation: None,
+            code: None,
         }
     }
 
@@ -96597,6 +96629,7 @@ impl DiagnosticCheck {
             status: DiagnosticStatus::Ok,
             detail: Some(detail.into()),
             recommendation: None,
+            code: None,
         }
     }
 
@@ -96610,6 +96643,7 @@ impl DiagnosticCheck {
             status: DiagnosticStatus::Warning,
             detail: Some(detail.into()),
             recommendation: Some(recommendation.into()),
+            code: None,
         }
     }
 
@@ -96623,7 +96657,13 @@ impl DiagnosticCheck {
             status: DiagnosticStatus::Error,
             detail: Some(detail.into()),
             recommendation: Some(recommendation.into()),
+            code: None,
         }
+    }
+
+    fn with_code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
     }
 
     fn print(&self) {
@@ -96654,6 +96694,9 @@ impl DiagnosticCheck {
         }
         if let Some(rec) = &self.recommendation {
             obj["recommendation"] = serde_json::json!(rec);
+        }
+        if let Some(code) = self.code {
+            obj["code"] = serde_json::json!(code);
         }
         obj
     }
@@ -97524,6 +97567,250 @@ fn build_session_recovery_guidance(
         summary: "Session persistence is healthy; no recovery action is required.".to_string(),
         next_steps,
     }
+}
+
+/// ft-yccm0.2.5: the GPU resource ledgers that GUI processes publish into
+/// `dir`, as the `gpu_resources` JSON block plus one diagnostic check. A GPU
+/// leak is invisible to the CPU heap, so these live counters are the only
+/// way to tell a leaked atlas from a large cache.
+fn gui_gpu_resources_doctor_report(
+    dir: &std::path::Path,
+    now_unix_ms: u64,
+) -> (serde_json::Value, DiagnosticCheck) {
+    use frankenterm_alloc::resource_ledger::{
+        RESOURCE_SNAPSHOT_FRESHNESS, collect_resource_snapshots,
+    };
+    const NAME: &str = "GUI GPU resources";
+    let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+    let collection = match collect_resource_snapshots(dir, now_unix_ms, RESOURCE_SNAPSHOT_FRESHNESS)
+    {
+        Ok(collection) => collection,
+        Err(error) => {
+            return (
+                serde_json::json!({ "dir": dir, "error": error.to_string() }),
+                DiagnosticCheck::warning(
+                    NAME,
+                    format!("cannot read {}: {error}", dir.display()),
+                    "Check the permissions of the FrankenTerm runtime directory",
+                ),
+            );
+        }
+    };
+    let stale = collection.snapshots.len() - collection.fresh().count();
+    let live: Vec<String> = collection
+        .fresh()
+        .map(|collected| {
+            let gpu = &collected.snapshot.gpu;
+            let atlas = gpu.textures.get("atlas").copied().unwrap_or_default();
+            format!(
+                "pid {}: {} texture(s) {:.1} MiB live (atlas {} / {:.1} MiB, peak {:.1} MiB), {} buffer(s) {:.1} MiB, {} atlas rebuild(s)",
+                collected.snapshot.pid,
+                gpu.texture_total.live_count,
+                mib(gpu.texture_total.live_bytes),
+                atlas.live_count,
+                mib(atlas.live_bytes),
+                mib(atlas.peak_live_bytes),
+                gpu.buffer_total.live_count,
+                mib(gpu.buffer_total.live_bytes),
+                gpu.atlas_generations,
+            )
+        })
+        .collect();
+    let detail = if live.is_empty() {
+        format!(
+            "no live GUI ledger in {} ({stale} stale snapshot(s))",
+            dir.display()
+        )
+    } else {
+        format!("{} ({stale} stale snapshot(s))", live.join("; "))
+    };
+    let check = if collection.unreadable.is_empty() {
+        DiagnosticCheck::ok_with_detail(NAME, detail)
+    } else {
+        DiagnosticCheck::warning(
+            NAME,
+            format!(
+                "{detail}; {} unreadable snapshot file(s)",
+                collection.unreadable.len()
+            ),
+            "Inspect gpu_resources.unreadable in `ft doctor --json`",
+        )
+    };
+    let mut value = serde_json::to_value(&collection).unwrap_or(serde_json::Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "fresh_within_ms".to_string(),
+            serde_json::json!(RESOURCE_SNAPSHOT_FRESHNESS.as_millis() as u64),
+        );
+    }
+    (value, check)
+}
+
+/// ft-yccm0.2.7: performance-hostile GUI settings, one `FT-TUNE-*` warning
+/// each, plus the `config_tuning` JSON block. A running GUI's published facts
+/// win: it evaluated the config and saw its displays. Without one, the config
+/// file the GUI would load is scanned as text. The GUI version comes from the
+/// running GUI, else from an installed app bundle.
+fn config_tuning_doctor_report(
+    live: Option<&::config::tuning::GuiTuningFacts>,
+    config_text: Option<(&Path, &str)>,
+    installed_gui: Option<(&Path, &str)>,
+    cli_version: &str,
+) -> (serde_json::Value, Vec<DiagnosticCheck>) {
+    use ::config::tuning::{
+        GuiGeneration, TuningInputs, front_end_name, scan_config_text, tuning_advisories,
+    };
+    const NAME: &str = "performance config";
+    let (mut inputs, source, origin) = if let Some(facts) = live {
+        (
+            facts.to_inputs(cli_version),
+            serde_json::json!({ "kind": "live_gui", "pid": facts.pid }),
+            format!("running GUI pid {}", facts.pid),
+        )
+    } else {
+        let mut inputs = TuningInputs::from_config(&::config::Config::default_config());
+        inputs.cli_version = Some(cli_version.to_string());
+        if let Some((path, text)) = config_text {
+            let scanned = scan_config_text(text);
+            scanned.apply_to(&mut inputs);
+            let path = diagnostic_path_for_output(path);
+            (
+                inputs,
+                serde_json::json!({
+                    "kind": "config_text",
+                    "path": path,
+                    "settings_found": scanned.found(),
+                }),
+                format!("scanned {path}"),
+            )
+        } else {
+            (
+                inputs,
+                serde_json::json!({ "kind": "defaults" }),
+                "no GUI config file, built-in defaults".to_string(),
+            )
+        }
+    };
+    if inputs.gui.is_none() {
+        inputs.gui = installed_gui.map(|(path, version)| GuiGeneration {
+            source: diagnostic_path_for_output(path),
+            version: version.to_string(),
+        });
+    }
+    let advisories = tuning_advisories(&inputs);
+    let checks = if advisories.is_empty() {
+        vec![DiagnosticCheck::ok_with_detail(
+            NAME,
+            format!("no performance-hostile settings ({origin})"),
+        )]
+    } else {
+        advisories
+            .iter()
+            .map(|advisory| {
+                DiagnosticCheck::warning(
+                    format!("{NAME} ({})", advisory.subject),
+                    format!("{} [{origin}]", advisory.detail),
+                    format!("{} See {}.", advisory.remediation, advisory.docs),
+                )
+                .with_code(advisory.code.as_str())
+            })
+            .collect()
+    };
+    let report = serde_json::json!({
+        "source": source,
+        "inputs": {
+            "mux_output_parser_buffer_size": inputs.mux_output_parser_buffer_size,
+            "max_fps": inputs.max_fps,
+            "display": inputs.display,
+            "scrollback_lines": inputs.scrollback_lines,
+            "scrollback_tiered_enabled": inputs.scrollback_tiered_enabled,
+            "scrollback_hot_lines": inputs.scrollback_hot_lines,
+            "front_end": front_end_name(inputs.front_end),
+            "webgpu_force_fallback_adapter": inputs.webgpu_force_fallback_adapter,
+            "gui_version": inputs.gui.as_ref().map(|gui| gui.version.as_str()),
+            "gui_version_source": inputs.gui.as_ref().map(|gui| gui.source.as_str()),
+            "cli_version": cli_version,
+        },
+        "advisories": advisories,
+    });
+    (report, checks)
+}
+
+/// The tuning facts the newest live GUI published into `dir` (ft-yccm0.2.7).
+/// Only a GUI whose resource snapshot is fresh counts, because a crashed
+/// GUI's facts file outlives it.
+fn live_gui_tuning_facts(dir: &Path, now_unix_ms: u64) -> Option<::config::tuning::GuiTuningFacts> {
+    use frankenterm_alloc::resource_ledger::{
+        RESOURCE_SNAPSHOT_FRESHNESS, collect_resource_snapshots,
+    };
+    let collection =
+        collect_resource_snapshots(dir, now_unix_ms, RESOURCE_SNAPSHOT_FRESHNESS).ok()?;
+    collection
+        .fresh()
+        .filter(|collected| collected.snapshot.process == "frankenterm-gui")
+        .filter_map(|collected| {
+            let facts = ::config::tuning::read_gui_tuning(dir, collected.snapshot.pid)
+                .ok()
+                .flatten()?;
+            Some((collected.snapshot.published_unix_ms, facts))
+        })
+        .max_by_key(|(published_unix_ms, _)| *published_unix_ms)
+        .map(|(_, facts)| facts)
+}
+
+/// The config file the GUI would load and its text, if it exists and is a
+/// regular file of at most 1 MiB.
+fn gui_config_text() -> Option<(PathBuf, String)> {
+    const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+    let path = ::config::tuning::gui_config_candidates()
+        .into_iter()
+        .find(|path| path.exists())?;
+    let metadata = std::fs::metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    Some((path, text))
+}
+
+/// The `Info.plist` of each place a FrankenTerm.app is conventionally
+/// installed; none off macOS.
+fn installed_gui_plists() -> Vec<PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    [
+        Some(PathBuf::from("/Applications")),
+        dirs::home_dir().map(|home| home.join("Applications")),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|dir| dir.join("FrankenTerm.app/Contents/Info.plist"))
+    .collect()
+}
+
+/// The app bundle and `CFBundleShortVersionString` of the first readable
+/// plist in `plists`.
+fn installed_gui_version(plists: &[PathBuf]) -> Option<(PathBuf, String)> {
+    const MAX_PLIST_BYTES: u64 = 1024 * 1024;
+    plists.iter().find_map(|plist| {
+        let metadata = std::fs::metadata(plist).ok()?;
+        if !metadata.is_file() || metadata.len() > MAX_PLIST_BYTES {
+            return None;
+        }
+        let version = plist_short_version(&std::fs::read_to_string(plist).ok()?)?;
+        let bundle = plist.parent()?.parent()?.to_path_buf();
+        Some((bundle, version))
+    })
+}
+
+/// `CFBundleShortVersionString` from an XML property list.
+fn plist_short_version(plist: &str) -> Option<String> {
+    let (_, after_key) = plist.split_once("<key>CFBundleShortVersionString</key>")?;
+    let value = after_key.trim_start().strip_prefix("<string>")?;
+    let (version, _) = value.split_once("</string>")?;
+    let version = version.trim();
+    (!version.is_empty()).then(|| version.to_string())
 }
 
 fn build_doctor_operator_guidance(
@@ -141845,6 +142132,313 @@ A  docs/new-proof.md\n";
         assert_eq!(
             diagnostic.recommendation.as_deref(),
             Some("Review connector throttles: ft robot policy quarantine-list"),
+        );
+    }
+
+    // --- GUI GPU resource ledger (ft-yccm0.2.5) ---
+
+    #[test]
+    fn doctor_gpu_resources_reports_published_gui_ledgers() {
+        use frankenterm_alloc::resource_ledger::{
+            AllocatorSnapshot, CacheGauge, CacheGauges, GpuResourceLedger, GpuTexturePurpose,
+            PaneResourceSnapshot, ResourceSnapshotBody, ResourceSnapshotEnvelope,
+            publish_resource_snapshot,
+        };
+
+        // Collection time; snapshots are published relative to it.
+        const NOW_MS: u64 = 10_000_000;
+        const ONE_HOUR_MS: u64 = 3_600_000;
+        let dir = tempfile::tempdir().unwrap();
+        let (empty, empty_check) = gui_gpu_resources_doctor_report(dir.path(), NOW_MS);
+        assert_eq!(empty_check.status, DiagnosticStatus::Ok);
+        assert!(
+            empty_check
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("no live GUI ledger")
+        );
+        assert_eq!(empty["snapshots"].as_array().unwrap().len(), 0);
+
+        let ledger: &'static GpuResourceLedger = Box::leak(Box::new(GpuResourceLedger::new()));
+        let gauges: &'static CacheGauges = Box::leak(Box::new(CacheGauges::new()));
+        let _atlas = ledger.track_texture(GpuTexturePurpose::Atlas, 4 * 1024 * 1024);
+        ledger.record_atlas_generation();
+        let mut window = gauges.contribution();
+        window.set(CacheGauge::ShapeCacheEntries, 321);
+        let live = ResourceSnapshotEnvelope {
+            pid: 4242,
+            published_unix_ms: NOW_MS - 1_000,
+            ..ResourceSnapshotEnvelope::now(
+                "frankenterm-gui",
+                ResourceSnapshotBody {
+                    panes: vec![PaneResourceSnapshot {
+                        pane_id: 9,
+                        hot_rows: 3_000,
+                        warm_resident_bytes: 65_536,
+                        ..PaneResourceSnapshot::default()
+                    }],
+                    ..ResourceSnapshotBody::from_ledgers(ledger, gauges)
+                },
+                AllocatorSnapshot::read(),
+            )
+        };
+        publish_resource_snapshot(dir.path(), &live).unwrap();
+        let crashed = ResourceSnapshotEnvelope {
+            pid: 17,
+            // Published an hour ago: its process exited without cleanup.
+            published_unix_ms: NOW_MS - ONE_HOUR_MS,
+            ..live.clone()
+        };
+        publish_resource_snapshot(dir.path(), &crashed).unwrap();
+
+        let (report, check) = gui_gpu_resources_doctor_report(dir.path(), NOW_MS);
+        assert_eq!(check.status, DiagnosticStatus::Ok);
+        let detail = check.detail.unwrap();
+        assert!(
+            detail.contains("pid 4242: 1 texture(s) 4.0 MiB live"),
+            "{detail}"
+        );
+        assert!(detail.contains("1 atlas rebuild(s)"), "{detail}");
+        assert!(detail.contains("(1 stale snapshot(s))"), "{detail}");
+        assert!(
+            !detail.contains("pid 17"),
+            "stale ledgers are not reported live"
+        );
+
+        let snapshots = report["snapshots"].as_array().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0]["snapshot"]["pid"], 17);
+        assert_eq!(snapshots[0]["stale"], true);
+        assert_eq!(snapshots[1]["stale"], false);
+        assert_eq!(
+            snapshots[1]["snapshot"]["gpu"]["textures"]["atlas"]["live_bytes"],
+            4 * 1024 * 1024
+        );
+        // ft-yccm0.1.7 sections ride along in the same block.
+        let gui = &snapshots[1]["snapshot"];
+        assert_eq!(gui["caches"]["shape_cache_entries"], 321);
+        assert_eq!(gui["panes"][0]["pane_id"], 9);
+        assert_eq!(gui["panes"][0]["warm_resident_bytes"], 65_536);
+        assert!(gui["allocator"]["backend"].is_string());
+        assert_eq!(report["fresh_within_ms"], 90_000);
+
+        std::fs::write(dir.path().join("frankenterm-resources-9.json"), b"{").unwrap();
+        let (report, check) = gui_gpu_resources_doctor_report(dir.path(), NOW_MS);
+        assert_eq!(check.status, DiagnosticStatus::Warning);
+        assert_eq!(report["unreadable"].as_array().unwrap().len(), 1);
+    }
+
+    // --- Performance-hostile GUI config (ft-yccm0.2.7) ---
+
+    #[test]
+    fn doctor_config_tuning_judges_the_live_gui_by_its_published_facts() {
+        use ::config::tuning::{
+            DisplayRefresh, GuiTuningFacts, GuiTuningPublication, TuningInputs,
+        };
+        use frankenterm_alloc::resource_ledger::{
+            AllocatorSnapshot, ResourceSnapshotBody, ResourceSnapshotEnvelope,
+            publish_resource_snapshot,
+        };
+
+        const NOW_MS: u64 = 10_000_000;
+        const ONE_HOUR_MS: u64 = 3_600_000;
+        let dir = tempfile::tempdir().unwrap();
+        assert!(live_gui_tuning_facts(dir.path(), NOW_MS).is_none());
+
+        let gui_snapshot = |pid: u32, published_unix_ms: u64| ResourceSnapshotEnvelope {
+            pid,
+            published_unix_ms,
+            ..ResourceSnapshotEnvelope::now(
+                "frankenterm-gui",
+                ResourceSnapshotBody::default(),
+                AllocatorSnapshot::default(),
+            )
+        };
+        let facts = |pid: u32, max_fps: u64| {
+            let mut inputs = TuningInputs::from_config(&::config::Config::default_config());
+            inputs.mux_output_parser_buffer_size = 512 * 1024;
+            inputs.max_fps = max_fps;
+            inputs.display = Some(DisplayRefresh {
+                name: "Built-in Retina Display".to_string(),
+                hz: 120,
+            });
+            GuiTuningFacts::new(pid, "FrankenTerm 0.15.2 (319a56d)", &inputs)
+        };
+        // A live GUI, and a crashed one whose facts file outlived it.
+        publish_resource_snapshot(dir.path(), &gui_snapshot(4242, NOW_MS - 1_000)).unwrap();
+        let _live = GuiTuningPublication::publish(dir.path(), &facts(4242, 30)).unwrap();
+        publish_resource_snapshot(dir.path(), &gui_snapshot(17, NOW_MS - ONE_HOUR_MS)).unwrap();
+        let _crashed = GuiTuningPublication::publish(dir.path(), &facts(17, 1)).unwrap();
+
+        let live = live_gui_tuning_facts(dir.path(), NOW_MS).expect("the live GUI's facts");
+        assert_eq!(live.pid, 4242);
+
+        // The config file says otherwise; the live GUI's evaluated facts win.
+        let (report, checks) = config_tuning_doctor_report(
+            Some(&live),
+            Some((
+                Path::new("/home/op/.config/frankenterm/frankenterm.lua"),
+                "config.max_fps = 120\n",
+            )),
+            Some((Path::new("/Applications/FrankenTerm.app"), "0.15.21")),
+            "0.15.21",
+        );
+        let codes: Vec<_> = checks.iter().map(|check| check.code).collect();
+        assert_eq!(
+            codes,
+            [
+                Some("FT-TUNE-0001"),
+                Some("FT-TUNE-0002"),
+                Some("FT-TUNE-0005")
+            ]
+        );
+        assert!(
+            checks
+                .iter()
+                .all(|check| check.status == DiagnosticStatus::Warning)
+        );
+        assert_eq!(checks[1].name, "performance config (max_fps)");
+        let detail = checks[1].detail.as_deref().unwrap();
+        assert!(
+            detail.contains("120 Hz refresh rate of display"),
+            "{detail}"
+        );
+        assert!(detail.ends_with("[running GUI pid 4242]"), "{detail}");
+        let recommendation = checks[1].recommendation.as_deref().unwrap();
+        assert!(
+            recommendation.ends_with("See docs/tuning-reference.md#ft-tune-0002."),
+            "{recommendation}"
+        );
+        let generation = checks[2].detail.as_deref().unwrap();
+        assert!(
+            generation.contains("the running GUI (pid 4242) is 0.15.2, older than this ft"),
+            "{generation}"
+        );
+        let row = checks[0].to_json_value();
+        assert_eq!(row["code"], "FT-TUNE-0001");
+        assert_eq!(row["status"], "warning");
+
+        assert_eq!(report["source"]["kind"], "live_gui");
+        assert_eq!(report["source"]["pid"], 4242);
+        assert_eq!(report["inputs"]["max_fps"], 30);
+        assert_eq!(report["inputs"]["display"]["hz"], 120);
+        assert_eq!(
+            report["inputs"]["gui_version"],
+            "FrankenTerm 0.15.2 (319a56d)"
+        );
+        let advisory_codes: Vec<_> = report["advisories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|advisory| advisory["code"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            advisory_codes,
+            ["FT-TUNE-0001", "FT-TUNE-0002", "FT-TUNE-0005"]
+        );
+        assert_eq!(
+            report["advisories"][1]["docs"],
+            "docs/tuning-reference.md#ft-tune-0002"
+        );
+    }
+
+    #[test]
+    fn doctor_config_tuning_scans_the_config_file_when_no_gui_runs() {
+        // The settings that froze the operator, as their frankenterm.lua has them.
+        let lua = "config.scrollback_lines = 100000\n\
+                   config.mux_output_parser_buffer_size = 512 * 1024\n\
+                   config.front_end = \"WebGpu\"\n\
+                   config.max_fps = 30\n";
+        let (report, checks) = config_tuning_doctor_report(
+            None,
+            Some((
+                Path::new("/home/op/.config/frankenterm/frankenterm.lua"),
+                lua,
+            )),
+            Some((Path::new("/Applications/FrankenTerm.app"), "0.15.6-rc.53")),
+            "0.15.21",
+        );
+        let codes: Vec<_> = checks.iter().map(|check| check.code).collect();
+        assert_eq!(
+            codes,
+            [
+                Some("FT-TUNE-0001"),
+                Some("FT-TUNE-0002"),
+                Some("FT-TUNE-0005")
+            ],
+            "tiering is on by default, so 100000 lines is not FT-TUNE-0003"
+        );
+        let fps = checks[1].detail.as_deref().unwrap();
+        assert!(fps.contains("no running GUI reported its display"), "{fps}");
+        assert!(
+            fps.ends_with("[scanned /home/op/.config/frankenterm/frankenterm.lua]"),
+            "{fps}"
+        );
+        let generation = checks[2].detail.as_deref().unwrap();
+        assert!(
+            generation.contains(
+                "/Applications/FrankenTerm.app is 0.15.6-rc.53, older than this ft (0.15.21)"
+            ),
+            "{generation}"
+        );
+        assert_eq!(report["source"]["kind"], "config_text");
+        assert_eq!(
+            report["source"]["settings_found"],
+            serde_json::json!([
+                "mux_output_parser_buffer_size",
+                "max_fps",
+                "scrollback_lines",
+                "front_end"
+            ])
+        );
+        assert_eq!(
+            report["inputs"]["mux_output_parser_buffer_size"],
+            512 * 1024
+        );
+        assert_eq!(
+            report["inputs"]["gui_version_source"],
+            "/Applications/FrankenTerm.app"
+        );
+
+        // No config file and no installed app: one OK row, without a code.
+        let (report, checks) = config_tuning_doctor_report(None, None, None, "0.15.21");
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, DiagnosticStatus::Ok);
+        assert_eq!(checks[0].code, None);
+        assert!(checks[0].to_json_value().get("code").is_none());
+        assert_eq!(report["source"]["kind"], "defaults");
+        assert_eq!(report["advisories"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn doctor_reads_the_installed_app_version_from_its_plist() {
+        let dir = tempfile::tempdir().unwrap();
+        let contents = dir.path().join("FrankenTerm.app/Contents");
+        std::fs::create_dir_all(&contents).unwrap();
+        let plist = contents.join("Info.plist");
+        std::fs::write(
+            &plist,
+            "<?xml version=\"1.0\"?>\n<plist version=\"1.0\">\n<dict>\n\
+             \t<key>CFBundleName</key>\n\t<string>FrankenTerm</string>\n\
+             \t<key>CFBundleShortVersionString</key>\n\t<string>0.15.6-rc.53</string>\n\
+             </dict>\n</plist>\n",
+        )
+        .unwrap();
+        let missing = dir.path().join("Missing.app/Contents/Info.plist");
+
+        let (bundle, version) =
+            installed_gui_version(&[missing.clone(), plist]).expect("the installed bundle");
+        assert_eq!(bundle, dir.path().join("FrankenTerm.app"));
+        assert_eq!(version, "0.15.6-rc.53");
+        assert_eq!(installed_gui_version(&[missing]), None);
+        assert_eq!(
+            plist_short_version("<key>CFBundleShortVersionString</key><integer>3</integer>"),
+            None
+        );
+        assert_eq!(
+            plist_short_version("<key>CFBundleVersion</key><string>1</string>"),
+            None
         );
     }
 
