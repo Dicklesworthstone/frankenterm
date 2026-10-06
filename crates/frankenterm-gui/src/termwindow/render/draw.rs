@@ -60,6 +60,7 @@ impl std::error::Error for DrawFailure {
 
 impl crate::TermWindow {
     pub(crate) fn call_draw_webgpu(&mut self, acquired: AcquiredWebGpuFrame) -> anyhow::Result<()> {
+        use crate::renderstate::LedgeredTexture;
         use crate::termwindow::webgpu::WebGpuTexture;
 
         let webgpu = self
@@ -86,8 +87,8 @@ impl crate::TermWindow {
                 label: Some("Render Encoder"),
             });
         let tex = render_state.glyph_cache.borrow().atlas.texture();
-        let tex = tex
-            .downcast_ref::<WebGpuTexture>()
+        let tex: &WebGpuTexture = tex
+            .downcast_ref::<LedgeredTexture<WebGpuTexture>>()
             .context("glyph atlas is not a WebGPU texture")?;
         let texture_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -224,6 +225,7 @@ impl crate::TermWindow {
     }
 
     pub(crate) fn call_draw_glium(&mut self, frame: &mut glium::Frame) -> anyhow::Result<()> {
+        use crate::renderstate::LedgeredTexture;
         use window::glium::texture::SrgbTexture2d;
 
         let gl_state = self
@@ -231,8 +233,8 @@ impl crate::TermWindow {
             .as_ref()
             .context("render state is not initialized")?;
         let tex = gl_state.glyph_cache.borrow().atlas.texture();
-        let tex = tex
-            .downcast_ref::<SrgbTexture2d>()
+        let tex: &SrgbTexture2d = tex
+            .downcast_ref::<LedgeredTexture<SrgbTexture2d>>()
             .context("glyph atlas is not a glium SrgbTexture2d")?;
         let prog = gl_state.glyph_prog.as_ref().ok_or_else(|| {
             DrawFailure::new(

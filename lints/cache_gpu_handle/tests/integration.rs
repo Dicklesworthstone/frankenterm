@@ -40,7 +40,10 @@ fn bad_fixture_is_flagged() {
         !findings.is_empty(),
         "bad_global_cache.rs must produce >=1 finding (the pre-fix leak shape), got 0"
     );
-    let f = &findings[0];
+    let f = findings
+        .iter()
+        .find(|f| f.reason == FindingReason::GlobalReachesGpuHandle)
+        .expect("the process-global interner must be flagged");
     assert_eq!(f.global, "BAD_SHAPED_RUN_INTERNER");
     assert_eq!(f.reason, FindingReason::GlobalReachesGpuHandle);
     // Reaches a forbidden GPU-handle leaf (CachedGlyph encountered before
@@ -70,13 +73,38 @@ fn good_fixture_is_clean() {
 
 #[test]
 fn fixtures_dir_produces_exactly_one_finding() {
-    // Across the whole fixtures dir, only the bad fixture is dirty.
+    // Across the whole fixtures dir, only the bad fixture is dirty: its
+    // global, and (ft-yccm0.2.5 cache-field rule) the interner's map field
+    // that holds the glyphs.
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let report = audit_dir(&fixtures).unwrap();
+    let mut flagged: Vec<_> = report
+        .findings
+        .iter()
+        .map(|f| {
+            (
+                f.rel_path.to_string_lossy().into_owned(),
+                f.global.clone(),
+                f.reason.clone(),
+            )
+        })
+        .collect();
+    flagged.sort();
     assert_eq!(
-        report.findings.len(),
-        1,
-        "exactly one finding (bad fixture) expected, got {:#?}",
+        flagged,
+        [
+            (
+                "bad_global_cache.rs".to_string(),
+                "BAD_SHAPED_RUN_INTERNER".to_string(),
+                FindingReason::GlobalReachesGpuHandle,
+            ),
+            (
+                "bad_global_cache.rs".to_string(),
+                "BadInterner.runs".to_string(),
+                FindingReason::CacheFieldReachesGpuHandle,
+            ),
+        ],
+        "only the bad fixture may be flagged, got {:#?}",
         report.findings
     );
     assert!(
@@ -116,6 +144,45 @@ fn real_gui_src_is_clean() {
             .map(|f| f.render())
             .collect::<Vec<_>>()
     );
+}
+
+/// ft-yccm0.2.5: the per-window cache-field rule is live on the real tree.
+/// It must actually see the two fenced TermWindow caches (so the clean
+/// result above is not vacuous), every fence entry must still match, and
+/// the atlas owner's maps must be recognised as such.
+#[test]
+fn real_gui_per_window_gpu_caches_are_exactly_the_fenced_allow_list() {
+    let gui_src = repo_root().join("crates/frankenterm-gui/src");
+    let window_src = repo_root().join("frankenterm/window/src");
+    if !gui_src.is_dir() || !window_src.is_dir() {
+        return;
+    }
+    let report = audit_dirs(&[gui_src, window_src]).unwrap();
+    let cache_field_findings: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.reason == FindingReason::CacheFieldReachesGpuHandle)
+        .map(|f| f.render())
+        .collect();
+    assert!(
+        cache_field_findings.is_empty(),
+        "unfenced per-window caches can pin an old atlas: {cache_field_findings:#?}"
+    );
+    assert!(
+        report.stale_cache_field_allow_entries.is_empty(),
+        "stale ALLOWED_CACHE_FIELDS entries: {:?}",
+        report.stale_cache_field_allow_entries
+    );
+    assert_eq!(
+        report.allow_listed_cache_fields,
+        cache_gpu_handle_lint::allow_list::ALLOWED_CACHE_FIELDS.len(),
+        "every fenced cache field must be found and must reach a GPU leaf"
+    );
+    assert!(
+        report.atlas_owner_cache_fields > 0,
+        "GlyphCache's sprite/glyph maps must be recognised as the atlas owner's"
+    );
+    assert!(report.total_cache_fields > report.allow_listed_cache_fields);
 }
 
 #[test]

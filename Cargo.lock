@@ -3672,6 +3672,10 @@ name = "frankenterm-alloc"
 version = "0.15.21"
 dependencies = [
  "criterion",
+ "log",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",

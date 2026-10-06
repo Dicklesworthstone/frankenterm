@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+pub mod resource_ledger;
+
 /// Recover from `std::sync::Mutex` poisoning by taking the inner guard.
 ///
 /// The pane-arena registry stores a `HashMap<u64, PaneArenaState>` where

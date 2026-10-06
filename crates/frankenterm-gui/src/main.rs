@@ -3468,6 +3468,21 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     initialize_window_state_persistence();
 
     let gui = crate::frontend::try_new()?;
+    // ft-yccm0.2.5: publish this process's live GPU resource ledger where
+    // `ft doctor --json` reads it. Diagnostics only: failure is not fatal.
+    let _resource_snapshot_publisher =
+        match frankenterm_alloc::resource_ledger::ResourceSnapshotPublisher::spawn(
+            config::RUNTIME_DIR.clone(),
+            "frankenterm-gui",
+            frankenterm_alloc::resource_ledger::GpuResourceLedger::global(),
+            std::time::Duration::from_secs(2),
+        ) {
+            Ok(publisher) => Some(publisher),
+            Err(error) => {
+                log::warn!("GPU resource snapshot publishing disabled: {error}");
+                None
+            }
+        };
     // Config reload is subscribed before the asynchronous startup transaction
     // settles. Keep reload callbacks from starting a retry generation against
     // an unpublished or ultimately failed initial topology.

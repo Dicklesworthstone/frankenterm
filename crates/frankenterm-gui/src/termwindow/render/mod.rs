@@ -984,7 +984,7 @@ impl crate::TermWindow {
             style,
             text: &cluster.text,
         };
-        let resolve = || -> anyhow::Result<CachedShape> {
+        let shape = || -> anyhow::Result<(Vec<GlyphInfo>, Rc<Vec<ShapedInfo>>)> {
             let font = match font {
                 Some(f) => Rc::clone(f),
                 None => self.fonts.resolve_font(style)?,
@@ -1019,23 +1019,20 @@ impl crate::TermWindow {
                 metrics,
             )?;
             let shaped = Rc::new(ShapedInfo::process(&info, &glyphs));
-            Ok(CachedShape {
-                infos: info,
-                glyphs: RefCell::new(shaped),
-                generation: std::cell::Cell::new(self.shape_generation),
-            })
+            Ok((info, shaped))
         };
         let glyph_info = if paragraph_range.is_some() {
             // Context-sensitive shapes never share this context-free cache;
             // avoid allocating an Rc<CachedShape> for their uncached result.
-            resolve()?.glyphs.into_inner()
+            shape()?.1
         } else {
-            let cached = resolve_cached_shape(&self.shape_cache, key, resolve)?;
-            if cached.generation.get() == self.shape_generation {
-                Rc::clone(&cached.glyphs.borrow())
-            } else {
-                // Atlas rebuilds preserve HarfBuzz output; refresh only sprites.
-                // Publish the new generation only after every glyph resolves.
+            let cached = resolve_cached_shape(&self.shape_cache, key, || {
+                let (infos, glyphs) = shape()?;
+                Ok(CachedShape::new(infos, glyphs, self.shape_generation))
+            })?;
+            // Atlas rebuilds preserve HarfBuzz output and release the sprites;
+            // re-resolve only the sprites against the current atlas.
+            cached.glyphs_for(self.shape_generation, |infos| {
                 let font = match font {
                     Some(f) => Rc::clone(f),
                     None => self.fonts.resolve_font(style)?,
@@ -1043,15 +1040,12 @@ impl crate::TermWindow {
                 let glyphs = self.glyph_infos_to_glyphs(
                     style,
                     &mut gl_state.glyph_cache.borrow_mut(),
-                    &cached.infos,
+                    infos,
                     &font,
                     metrics,
                 )?;
-                let shaped = Rc::new(ShapedInfo::process(&cached.infos, &glyphs));
-                *cached.glyphs.borrow_mut() = Rc::clone(&shaped);
-                cached.generation.set(self.shape_generation);
-                shaped
-            }
+                Ok(Rc::new(ShapedInfo::process(infos, &glyphs)))
+            })?
         };
         metrics::histogram!("cached_cluster_shape").record(shape_resolve_start.elapsed());
         log::trace!(
@@ -1063,14 +1057,22 @@ impl crate::TermWindow {
     }
 
     pub fn recreate_texture_atlas(&mut self, size: Option<usize>) -> anyhow::Result<()> {
-        self.invalidate_render_caches(super::resize::RenderInvalidationCause::AtlasResource);
         // Do NOT clear `shape_cache` here: the cached HarfBuzz output is
-        // atlas-invariant. The `shape_generation` bump makes each surviving
-        // entry re-resolve its glyph sprites (cheap) on next access instead of
-        // re-shaping (the slow HarfBuzz path), and it invalidates the
-        // generation-keyed line_to_ele / line_quad caches. This removes the
-        // full-screen re-shape that every atlas overflow used to trigger — the
-        // root cause of the progressive GUI slowdown.
+        // atlas-invariant. The atlas invalidation releases every entry's glyph
+        // sprites and bumps `shape_generation`, so each surviving entry
+        // re-resolves its sprites (cheap) on next access instead of re-shaping
+        // (the slow HarfBuzz path); it also clears the generation-keyed
+        // line_to_ele / line_quad caches. This removes the full-screen re-shape
+        // that every atlas overflow used to trigger — the root cause of the
+        // progressive GUI slowdown.
+        //
+        // ft-yccm0.2.5: every per-window holder of an `Rc<CachedGlyph>` (shape
+        // and line caches here, the fancy tab bar and modal elements below)
+        // lets go BEFORE the old glyph cache is replaced, so dropping that
+        // cache frees the old atlas texture instead of leaving it pinned.
+        self.invalidate_render_caches(super::resize::RenderInvalidationCause::AtlasResource);
+        self.invalidate_fancy_tab_bar();
+        self.invalidate_modal();
         if let Some(render_state) = self.render_state.as_mut() {
             render_state.recreate_texture_atlas(&self.fonts, &self.render_metrics, size)?;
         }
@@ -1307,11 +1309,7 @@ mod tests {
                 "successful retry must produce real ink"
             );
             let shaped = ShapedInfo::process(&infos, &[glyph]);
-            Ok(CachedShape {
-                infos,
-                glyphs: RefCell::new(Rc::new(shaped)),
-                generation: Cell::new(7),
-            })
+            Ok(CachedShape::new(infos, Rc::new(shaped), 7))
         };
         let failed = resolve_cached_shape(&cache, key, &mut resolve).unwrap_err();
         assert!(
@@ -1327,7 +1325,7 @@ mod tests {
         let hit =
             resolve_cached_shape(&cache, key, || panic!("cache hit must not resolve")).unwrap();
         assert!(Rc::ptr_eq(&success, &hit));
-        assert_eq!(hit.generation.get(), 7);
+        assert!(hit.glyphs_at(7).is_some());
 
         let other = BorrowedShapeCacheKey {
             style: &style,

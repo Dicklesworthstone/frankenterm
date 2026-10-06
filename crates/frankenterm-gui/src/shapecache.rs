@@ -4,7 +4,7 @@ use ahash::{AHashMap, AHasher};
 use config::TextStyle;
 use frankenterm_font::shaper::GlyphInfo;
 use frankenterm_font::units::*;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
@@ -63,13 +63,22 @@ impl ShapedInfo {
 ///
 /// HarfBuzz shaping (`infos`) is **atlas-invariant**: it depends only on the
 /// font + text, not on which atlas generation the glyph sprites currently live
-/// in. The resolved [`ShapedInfo`] sprites (`glyphs`) ARE atlas-dependent. By
-/// caching the invariant `infos` alongside the sprites plus a `generation` tag,
-/// an atlas rebuild can re-resolve the (cheap) sprites from `infos` instead of
-/// throwing the entry away and re-running (expensive) HarfBuzz shaping. This is
-/// the shape-cache analogue of the [`ShapedRunInterner`] decoupling, and it
+/// in. The resolved [`ShapedInfo`] sprites are atlas-dependent: each holds an
+/// `Rc<CachedGlyph>` whose sprite owns an `Rc` of the whole atlas texture. By
+/// caching the invariant `infos` next to a generation-tagged atlas binding, an
+/// atlas rebuild can re-resolve the (cheap) sprites from `infos` instead of
+/// throwing the entry away and re-running (expensive) HarfBuzz shaping. This
 /// removes the per-rebuild full-screen re-shape that drove the progressive GUI
 /// slowdown (the render loop's HarfBuzz time climbing over a session).
+///
+/// **Leak freedom (ft-yccm0.2.5):** a binding that outlives its atlas would pin
+/// that atlas texture (up to 256 MiB at the 8192^2 cap) for as long as the
+/// entry stays in the LFU cache, and an entry that is never reused after the
+/// rebuild is never refreshed. Every atlas rebuild therefore calls
+/// [`CachedShape::release_atlas_binding`] on every resident entry before the
+/// old glyph cache is dropped, so after a rebuild the shape cache holds only
+/// shaping data. Stale bindings are also unreadable: [`CachedShape::glyphs_at`]
+/// answers only for the exact generation that was bound.
 ///
 /// **Soundness of "re-resolve, don't re-shape":** the font-fallback and config
 /// invalidation paths always `clear()` the shape cache. Therefore any entry
@@ -80,12 +89,69 @@ impl ShapedInfo {
 #[derive(Debug)]
 pub struct CachedShape {
     /// Atlas-invariant HarfBuzz output (glyph indices, clusters, advances).
-    pub infos: Vec<GlyphInfo>,
-    /// Atlas-dependent resolved sprites; re-resolved in place when `generation`
-    /// falls behind the window's `shape_generation`.
-    pub glyphs: RefCell<Rc<Vec<ShapedInfo>>>,
-    /// The `shape_generation` at which `glyphs` was last resolved.
-    pub generation: Cell<usize>,
+    infos: Vec<GlyphInfo>,
+    /// Atlas-dependent resolved sprites, or `None` once an atlas rebuild has
+    /// released them.
+    binding: RefCell<Option<AtlasBinding>>,
+}
+
+#[derive(Debug)]
+struct AtlasBinding {
+    /// The `shape_generation` at which `glyphs` was resolved.
+    generation: usize,
+    glyphs: Rc<Vec<ShapedInfo>>,
+}
+
+impl CachedShape {
+    /// A shape whose sprites were resolved at `generation`.
+    pub fn new(infos: Vec<GlyphInfo>, glyphs: Rc<Vec<ShapedInfo>>, generation: usize) -> Self {
+        Self {
+            infos,
+            binding: RefCell::new(Some(AtlasBinding { generation, glyphs })),
+        }
+    }
+
+    /// The sprites bound at exactly `generation`; `None` when the binding is
+    /// from another generation or was released by an atlas rebuild.
+    pub fn glyphs_at(&self, generation: usize) -> Option<Rc<Vec<ShapedInfo>>> {
+        self.binding
+            .borrow()
+            .as_ref()
+            .filter(|binding| binding.generation == generation)
+            .map(|binding| Rc::clone(&binding.glyphs))
+    }
+
+    /// The sprites for `generation`, re-resolving them from the cached shaping
+    /// output with `resolve` when the binding is stale or released. The new
+    /// binding is published only after `resolve` succeeds for every glyph.
+    pub fn glyphs_for(
+        &self,
+        generation: usize,
+        resolve: impl FnOnce(&[GlyphInfo]) -> anyhow::Result<Rc<Vec<ShapedInfo>>>,
+    ) -> anyhow::Result<Rc<Vec<ShapedInfo>>> {
+        if let Some(glyphs) = self.glyphs_at(generation) {
+            return Ok(glyphs);
+        }
+        let glyphs = resolve(&self.infos)?;
+        *self.binding.borrow_mut() = Some(AtlasBinding {
+            generation,
+            glyphs: Rc::clone(&glyphs),
+        });
+        Ok(glyphs)
+    }
+
+    /// Drop the atlas-backed glyph handles, keeping the shaping output.
+    /// Returns whether a binding was released.
+    pub fn release_atlas_binding(&self) -> bool {
+        self.binding.borrow_mut().take().is_some()
+    }
+
+    /// Whether this entry currently holds atlas-backed glyph handles. Test
+    /// oracle for the release fence; production only ever releases.
+    #[cfg(test)]
+    pub fn is_atlas_bound(&self) -> bool {
+        self.binding.borrow().is_some()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -689,6 +755,80 @@ mod test {
             interner.entries <= SHAPED_RUN_INTERNER_MAX_ENTRIES,
             "interner entry count must stay bounded across churn"
         );
+    }
+
+    /// ft-yccm0.2.5: a cached shape answers only for the generation it was
+    /// bound at, and releasing its binding drops every glyph `Rc` it held, which
+    /// is what lets the previous atlas texture be freed after a rebuild.
+    #[test]
+    fn cached_shape_binding_is_generation_exact_and_release_unpins_glyphs() {
+        use super::CachedShape;
+
+        let (infos, glyphs, run) = fake_shaped_run(3);
+        let shape = CachedShape::new(infos.clone(), Rc::new(run), 7);
+        assert!(shape.is_atlas_bound());
+        assert!(shape.glyphs_at(6).is_none(), "older generation must miss");
+        assert!(shape.glyphs_at(8).is_none(), "newer generation must miss");
+        let bound = shape.glyphs_at(7).expect("bound generation must hit");
+        assert!(Rc::ptr_eq(&bound[0].glyph, &glyphs[0]));
+        drop(bound);
+        for glyph in &glyphs {
+            assert_eq!(Rc::strong_count(glyph), 2, "the binding holds one ref");
+        }
+
+        assert!(shape.release_atlas_binding());
+        assert!(!shape.release_atlas_binding(), "release is idempotent");
+        assert!(!shape.is_atlas_bound());
+        assert!(shape.glyphs_at(7).is_none(), "released binding must not answer");
+        for glyph in &glyphs {
+            assert_eq!(
+                Rc::strong_count(glyph),
+                1,
+                "a released shape must not keep any glyph (and so any atlas) alive"
+            );
+        }
+        let rebound = shape
+            .glyphs_for(8, |cached_infos| {
+                assert_eq!(cached_infos, infos.as_slice(), "shaping output survives");
+                Ok(Rc::new(build_shaped_infos(cached_infos, &glyphs)))
+            })
+            .unwrap();
+        assert!(Rc::ptr_eq(&rebound[0].glyph, &glyphs[0]));
+    }
+
+    #[test]
+    fn cached_shape_rebinds_from_infos_and_keeps_no_binding_on_failure() {
+        use super::CachedShape;
+
+        let (infos, _old_glyphs, run) = fake_shaped_run(4);
+        let shape = CachedShape::new(infos.clone(), Rc::new(run), 1);
+        assert!(shape.release_atlas_binding());
+
+        let failed = shape.glyphs_for(2, |_| anyhow::bail!("atlas full"));
+        assert!(failed.is_err());
+        assert!(
+            !shape.is_atlas_bound(),
+            "a failed re-resolution must not publish a binding"
+        );
+
+        let new_glyphs = vec![fake_cached_glyph(40), fake_cached_glyph(41)];
+        let mut resolved_from = Vec::new();
+        let rebound = shape
+            .glyphs_for(2, |cached_infos| {
+                resolved_from.extend(cached_infos.iter().map(|info| info.glyph_pos));
+                Ok(Rc::new(build_shaped_infos(cached_infos, &new_glyphs)))
+            })
+            .unwrap();
+        assert_eq!(
+            resolved_from,
+            infos.iter().map(|info| info.glyph_pos).collect::<Vec<_>>(),
+            "re-resolution must start from the cached shaping output"
+        );
+        assert!(Rc::ptr_eq(&rebound[1].glyph, &new_glyphs[1]));
+        let hit = shape
+            .glyphs_for(2, |_| panic!("a current binding must not re-resolve"))
+            .unwrap();
+        assert!(Rc::ptr_eq(&hit, &rebound));
     }
 
     #[test]
