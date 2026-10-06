@@ -85,9 +85,7 @@ pub fn parse_size(text: &str) -> Result<usize, String> {
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(text.len());
     let (digits, suffix) = text.split_at(split);
-    let value: usize = digits
-        .parse()
-        .map_err(|_| format!("bad size {text:?}"))?;
+    let value: usize = digits.parse().map_err(|_| format!("bad size {text:?}"))?;
     let multiplier: usize = match suffix.trim().to_ascii_lowercase().as_str() {
         "" | "b" => 1,
         "k" | "kib" => 1 << 10,
@@ -180,7 +178,11 @@ pub fn parse_args(
     let mut options = Options {
         lanes: Lane::ALL.to_vec(),
         source: Source::Generated(vec![Corpus::ColorEmojiRandom]),
-        size: if test_mode { TEST_MODE_SIZE } else { DEFAULT_SIZE },
+        size: if test_mode {
+            TEST_MODE_SIZE
+        } else {
+            DEFAULT_SIZE
+        },
         seed: DEFAULT_SEED,
         geometry,
         corpus_dir: None,
@@ -283,7 +285,7 @@ fn git_sha() -> String {
         return sha;
     }
     Command::new("git")
-        .args(&["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"])
+        .args(["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"])
         .output()
         .ok()
         .filter(|output| output.status.success())
@@ -314,7 +316,7 @@ pub fn load_avg_1m() -> Option<f64> {
     }
     // macOS: `sysctl -n vm.loadavg` prints "{ 1.23 2.34 3.45 }".
     let output = Command::new("sysctl")
-        .args(&["-n", "vm.loadavg"])
+        .args(["-n", "vm.loadavg"])
         .output()
         .ok()?;
     let text = String::from_utf8(output.stdout).ok()?;
@@ -464,9 +466,10 @@ fn run_lanes(options: &Options, input: &Input, context: &RecordContext) -> usize
 }
 
 fn file_label(path: &Path) -> String {
-    let name = path
-        .file_name()
-        .map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned());
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
     format!("file:{name}")
 }
 
@@ -496,8 +499,14 @@ fn run(options: &Options) -> Result<usize, String> {
         .unwrap_or_else(cache::default_cache_dir);
     let mut failures = 0;
     for &corpus in corpora {
-        let loaded = cache::load_or_generate(&dir, corpus, options.size, options.seed)
-            .map_err(|error| format!("cannot cache {} in {}: {error}", corpus.name(), dir.display()))?;
+        let loaded =
+            cache::load_or_generate(&dir, corpus, options.size, options.seed).map_err(|error| {
+                format!(
+                    "cannot cache {} in {}: {error}",
+                    corpus.name(),
+                    dir.display()
+                )
+            })?;
         if options.gen_only {
             println!(
                 "{}",

@@ -24,8 +24,7 @@ use frankenterm_escape_parser::parser::Parser;
 use frankenterm_surface::line::MonospaceKpCostModel;
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::config::{
-    BidiMode, NewlineCanon, Osc52WritePolicy, ScrollbackTierConfig,
-    TerminalConfigurationRevision,
+    BidiMode, NewlineCanon, Osc52WritePolicy, ScrollbackTierConfig, TerminalConfigurationRevision,
 };
 use frankenterm_term::{Terminal, TerminalConfiguration, TerminalSize};
 
@@ -52,7 +51,10 @@ impl Lane {
     /// Accepts the canonical name with `-` or `_` separators.
     pub fn from_name(name: &str) -> Option<Self> {
         let normalized = name.replace('-', "_");
-        Self::ALL.iter().copied().find(|lane| lane.name() == normalized)
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|lane| lane.name() == normalized)
     }
 }
 

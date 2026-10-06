@@ -137,9 +137,16 @@ fn first_char(bytes: &[u8]) -> Option<char> {
 #[test]
 fn color_emoji_random_replicates_the_operator_format() {
     let pool = corpus::emoji_pool();
-    assert_eq!(pool.len(), 1447, "1,376 emoji + the script's 71 ASCII characters");
+    assert_eq!(
+        pool.len(),
+        1447,
+        "1,376 emoji + the script's 71 ASCII characters"
+    );
     assert_eq!(pool.iter().filter(|ch| ch.is_ascii()).count(), 71);
-    assert!(!pool.contains(&'$'), "the script's ASCII pool has no dollar sign");
+    assert!(
+        !pool.contains(&'$'),
+        "the script's ASCII pool has no dollar sign"
+    );
     assert_eq!(pool[0], '\u{1F600}');
     assert_eq!(pool[80], '\u{1F300}');
     assert_eq!(pool[1375], '\u{1FAFF}');
@@ -161,7 +168,13 @@ fn color_emoji_random_replicates_the_operator_format() {
             Some(ch) => ch,
             None => break,
         };
-        assert!(fg < 256 && bg < 256, "frame {}: fg {} bg {}", frames, fg, bg);
+        assert!(
+            fg < 256 && bg < 256,
+            "frame {}: fg {} bg {}",
+            frames,
+            fg,
+            bg
+        );
         assert!(
             pool.contains(&ch),
             "frame {} prints {:?}, outside the pool",
@@ -177,7 +190,11 @@ fn color_emoji_random_replicates_the_operator_format() {
         at = after_bg + ch.len_utf8();
     }
     // Only a torn final frame (at most 2 x 11 + 4 bytes) may remain.
-    assert!(bytes.len() - at < 26, "{} unparsed bytes at {at}", bytes.len() - at);
+    assert!(
+        bytes.len() - at < 26,
+        "{} unparsed bytes at {at}",
+        bytes.len() - at
+    );
     assert!(
         fg_seen.iter().all(|&seen| seen) && bg_seen.iter().all(|&seen| seen),
         "fg and bg must both range over 0..=255"
@@ -247,13 +264,7 @@ fn every_lane_keeps_the_grid_invariants_on_every_corpus() {
             assert_eq!(run.bytes, SMOKE_SIZE);
             log_bench_line(corpus, &run);
             let (summary, verdict) = lanes::evaluate(&run, &geometry, &expectation);
-            assert_eq!(
-                verdict,
-                Ok(()),
-                "{} lane on {}",
-                lane.name(),
-                corpus.name()
-            );
+            assert_eq!(verdict, Ok(()), "{} lane on {}", lane.name(), corpus.name());
             if let Some(actions) = run.actions {
                 assert!(actions > 0, "{} lane on {}", lane.name(), corpus.name());
                 action_counts.push((lane, actions));
@@ -320,7 +331,12 @@ fn the_sticky_zwj_prelude_runs_untimed_and_keeps_the_invariants() {
     // The prelude's ZWJ-tail cell stays on screen, so the grid differs from
     // a run without it.
     let plain = lanes::run_lane(Lane::Term, &[], &data, &geometry);
-    let plain = lanes::summarize(plain.terminal.as_ref().expect("the term lane has a terminal"));
+    let plain = lanes::summarize(
+        plain
+            .terminal
+            .as_ref()
+            .expect("the term lane has a terminal"),
+    );
     assert_ne!(plain.fingerprint, summaries[0].fingerprint);
 }
 
@@ -430,8 +446,8 @@ fn the_cli_parses_knobs_and_rejects_bad_input() {
     assert_eq!(defaults.geometry, Geometry::default());
     assert!(!defaults.allow_debug);
     assert!(!defaults.sticky_zwj);
-    let sticky = cli::parse_args(&args(&["--sticky-zwj"]), &no_env, Entry::Example)
-        .expect("sticky");
+    let sticky =
+        cli::parse_args(&args(&["--sticky-zwj"]), &no_env, Entry::Example).expect("sticky");
     assert!(sticky.sticky_zwj);
 
     let env = |name: &str| match name {

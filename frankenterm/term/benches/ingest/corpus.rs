@@ -46,16 +46,59 @@ pub const COLOR_RANDOM_POOL: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()";
 
 const SOURCE_WORDS: &[&str] = &[
-    "fn", "let", "mut", "self", "impl", "match", "return", "if", "else", "for", "in", "while",
-    "pub", "struct", "enum", "use", "crate", "terminal", "cursor", "line", "cell", "width",
-    "attrs", "parser", "action", "screen", "scrollback", "config", "Arc", "Vec", "Option",
-    "Some", "None", "Ok", "Err", "usize", "u8", "String", "clone", "unwrap_or", "len", "push",
-    "iter", "map", "collect", "seqno", "grapheme", "palette",
+    "fn",
+    "let",
+    "mut",
+    "self",
+    "impl",
+    "match",
+    "return",
+    "if",
+    "else",
+    "for",
+    "in",
+    "while",
+    "pub",
+    "struct",
+    "enum",
+    "use",
+    "crate",
+    "terminal",
+    "cursor",
+    "line",
+    "cell",
+    "width",
+    "attrs",
+    "parser",
+    "action",
+    "screen",
+    "scrollback",
+    "config",
+    "Arc",
+    "Vec",
+    "Option",
+    "Some",
+    "None",
+    "Ok",
+    "Err",
+    "usize",
+    "u8",
+    "String",
+    "clone",
+    "unwrap_or",
+    "len",
+    "push",
+    "iter",
+    "map",
+    "collect",
+    "seqno",
+    "grapheme",
+    "palette",
 ];
 
 const SOURCE_PUNCT: &[&str] = &[
-    "(", ")", "{", "}", "[", "]", ";", ",", ".", "::", "->", "=>", "=", "==", "!=", "<", ">",
-    "+", "-", "*", "/", "&", "&&", "||", "!", "?", "#", "\"", "'", ":",
+    "(", ")", "{", "}", "[", "]", ";", ",", ".", "::", "->", "=>", "=", "==", "!=", "<", ">", "+",
+    "-", "*", "/", "&", "&&", "||", "!", "?", "#", "\"", "'", ":",
 ];
 
 /// Emoji ZWJ sequences for `unicode_mix`.
@@ -76,8 +119,8 @@ const ZWJ_SEQUENCES: &[&str] = &[
 
 /// Braille spinner frames, as agent TUIs draw them.
 const SPINNER: [&str; 10] = [
-    "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}",
-    "\u{2827}", "\u{2807}", "\u{280F}",
+    "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}",
+    "\u{2807}", "\u{280F}",
 ];
 
 const BOX_HORIZONTAL: &str = "\u{2500}";
@@ -134,7 +177,10 @@ impl Corpus {
     /// Accepts the canonical name with `-` or `_` separators.
     pub fn from_name(name: &str) -> Option<Self> {
         let normalized = name.replace('-', "_");
-        Self::ALL.iter().copied().find(|corpus| corpus.name() == normalized)
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|corpus| corpus.name() == normalized)
     }
 
     /// Whether the corpus moves the cursor only by printing, CR and LF. Line
