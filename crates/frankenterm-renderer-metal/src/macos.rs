@@ -328,7 +328,7 @@ mod tests {
             "{caps}"
         );
         assert!(caps.unified_memory, "{caps}");
-        assert!(!caps.name.is_empty());
+        assert_ne!(caps.name, "");
     }
 
     #[test]
@@ -348,8 +348,10 @@ mod tests {
                 .clear_offscreen(width, height, color)
                 .expect("offscreen clear");
             assert_eq!(bytes.len(), width as usize * height as usize * BYTES_PER_PIXEL);
-            for (index, pixel) in bytes.chunks_exact(BYTES_PER_PIXEL).enumerate() {
-                assert_eq!(pixel, expected, "pixel {index} of {width}x{height}");
+            let (pixels, remainder) = bytes.as_chunks::<BYTES_PER_PIXEL>();
+            assert_eq!(remainder, &[] as &[u8]);
+            for (index, pixel) in pixels.iter().enumerate() {
+                assert_eq!(*pixel, expected, "pixel {index} of {width}x{height}");
             }
         }
     }
