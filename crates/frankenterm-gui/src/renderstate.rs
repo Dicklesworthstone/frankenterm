@@ -883,6 +883,74 @@ pub struct RenderState {
     pub(crate) last_cache_gauge_report: Option<Instant>,
     /// Running line-shaping totals, reported as cache gauges (ft-yccm0.4.3.4).
     pub(crate) shaping: Cell<ShapingCounters>,
+    /// Whether a full glyph atlas is cleared or grown (ft-yccm0.2.12).
+    pub(crate) atlas_policy: AtlasRebuildPolicy,
+}
+
+/// How long after clearing the glyph atlas an overflow at the same size
+/// grows it instead of clearing it again (ft-yccm0.2.12). Filling the atlas
+/// again this soon means its working set is larger than the atlas: clearing
+/// again would only re-rasterize the same glyphs at every overflow, which
+/// is the rebuild churn of an emoji flood. An overflow after the window
+/// reclaims glyphs that went out of use instead.
+const ATLAS_REFILL_GROWTH_WINDOW: Duration = Duration::from_secs(30);
+
+/// Decides whether a full glyph atlas is cleared or grown (ft-yccm0.2.12),
+/// and counts both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AtlasRebuildPolicy {
+    /// The side of the last clear, and when it happened.
+    last_clear: Option<(usize, Instant)>,
+    /// Rebuilds that kept the size and dropped every glyph.
+    pub(crate) clears: u64,
+    /// Rebuilds that enlarged the atlas.
+    pub(crate) growths: u64,
+}
+
+impl AtlasRebuildPolicy {
+    /// The side to rebuild an atlas of side `current` at, when paint asked
+    /// for `requested`. A size change stands. A clear (`requested ==
+    /// current`) becomes a doubling when the atlas refilled within
+    /// [`ATLAS_REFILL_GROWTH_WINDOW`] of its last clear at this size and the
+    /// doubled side stays within `max_side`.
+    pub(crate) fn plan(
+        &mut self,
+        current: usize,
+        requested: usize,
+        max_side: usize,
+        now: Instant,
+    ) -> usize {
+        let side = if requested != current {
+            requested
+        } else {
+            let refilled = self.last_clear.is_some_and(|(size, at)| {
+                size == current && now.saturating_duration_since(at) < ATLAS_REFILL_GROWTH_WINDOW
+            });
+            match current.checked_mul(2) {
+                Some(doubled) if refilled && doubled <= max_side => doubled,
+                _ => current,
+            }
+        };
+        if side > current {
+            self.growths += 1;
+            self.last_clear = None;
+            metrics::counter!("gui.atlas.grow").increment(1);
+        } else {
+            self.clears += 1;
+            self.last_clear = Some((side, now));
+            metrics::counter!("gui.atlas.clear").increment(1);
+        }
+        side
+    }
+
+    /// The device refused a growth from [`Self::plan`] and the atlas was
+    /// cleared at `side` instead: count what happened.
+    pub(crate) fn growth_refused(&mut self, side: usize, now: Instant) {
+        self.growths = self.growths.saturating_sub(1);
+        self.clears += 1;
+        self.last_clear = Some((side, now));
+        metrics::counter!("gui.atlas.growth_refused").increment(1);
+    }
 }
 
 /// What line shaping did since the window opened (ft-yccm0.4.3.4): runs
@@ -1206,6 +1274,7 @@ impl RenderState {
                         cache_gauges: CacheGauges::global().contribution(),
                         last_cache_gauge_report: None,
                         shaping: Cell::new(ShapingCounters::default()),
+                        atlas_policy: AtlasRebuildPolicy::default(),
                     });
                 }
                 Err(OutOfTextureSpace {
@@ -1347,6 +1416,35 @@ impl RenderState {
     }
 
     pub fn recreate_texture_atlas(
+        &mut self,
+        fonts: &Rc<FontConfiguration>,
+        metrics: &RenderMetrics,
+        size: Option<usize>,
+    ) -> anyhow::Result<()> {
+        // ft-yccm0.2.12: an atlas that refills soon after being cleared grows
+        // instead of being cleared again; see AtlasRebuildPolicy.
+        let current = self.glyph_cache.borrow().atlas.size();
+        let requested = size.unwrap_or(current);
+        let budget_side = max_texture_atlas_side_for_budget(texture_atlas_vram_budget_bytes());
+        let planned = self
+            .atlas_policy
+            .plan(current, requested, budget_side, Instant::now());
+        if planned != requested {
+            match self.recreate_texture_atlas_with_retries(fonts, metrics, Some(planned)) {
+                Ok(()) => return Ok(()),
+                // The device may refuse the larger texture: clear as asked.
+                Err(err) => {
+                    log::warn!(
+                        "could not grow the glyph atlas to {planned}; clearing at {requested}: {err:#}"
+                    );
+                    self.atlas_policy.growth_refused(requested, Instant::now());
+                }
+            }
+        }
+        self.recreate_texture_atlas_with_retries(fonts, metrics, Some(requested))
+    }
+
+    fn recreate_texture_atlas_with_retries(
         &mut self,
         fonts: &Rc<FontConfiguration>,
         metrics: &RenderMetrics,
@@ -1865,5 +1963,243 @@ mod tests {
         assert_eq!(err.size, None);
         assert_eq!(err.current_size, 8192);
         assert_eq!(err.failure, AtlasAllocationFailure::MemoryBudget);
+    }
+
+    /// ft-yccm0.2.12: a full atlas is cleared once per size; refilling it
+    /// within the window grows it, a late overflow reclaims instead, and the
+    /// budget caps growth.
+    #[test]
+    fn a_refilled_atlas_grows_instead_of_clearing_again() {
+        use super::{ATLAS_REFILL_GROWTH_WINDOW, AtlasRebuildPolicy};
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let second = Duration::from_secs(1);
+        let mut policy = AtlasRebuildPolicy::default();
+        assert_eq!(
+            policy.plan(128, 128, 8192, start),
+            128,
+            "first overflow clears"
+        );
+        assert_eq!(
+            policy.plan(128, 128, 8192, start + second),
+            256,
+            "a quick refill grows"
+        );
+        assert_eq!(policy.plan(256, 256, 8192, start + 2 * second), 256);
+        assert_eq!(
+            policy.plan(256, 1024, 8192, start + 3 * second),
+            1024,
+            "an explicit size stands"
+        );
+        let late = start + 4 * second;
+        assert_eq!(policy.plan(1024, 1024, 8192, late), 1024);
+        assert_eq!(
+            policy.plan(1024, 1024, 8192, late + ATLAS_REFILL_GROWTH_WINDOW),
+            1024,
+            "an overflow after the window reclaims"
+        );
+        assert_eq!(
+            policy.plan(1024, 1024, 8192, late + ATLAS_REFILL_GROWTH_WINDOW),
+            2048
+        );
+        assert_eq!(policy.plan(8192, 8192, 8192, late), 8192);
+        assert_eq!(
+            policy.plan(8192, 8192, 8192, late + second),
+            8192,
+            "the budget caps growth"
+        );
+        assert_eq!((policy.clears, policy.growths), (6, 3));
+
+        // A growth the device refused counts as the clear that happened.
+        let mut refused = AtlasRebuildPolicy::default();
+        refused.plan(512, 512, 8192, start);
+        assert_eq!(refused.plan(512, 512, 8192, start + second), 1024);
+        refused.growth_refused(512, start + second);
+        assert_eq!((refused.clears, refused.growths), (2, 0));
+        assert_eq!(
+            refused.plan(512, 512, 8192, start + 2 * second),
+            1024,
+            "the next quick refill tries to grow again"
+        );
+    }
+
+    /// ft-yccm0.2.12 acceptance: the operator's T0 emoji pool (1,376
+    /// codepoints in five blocks, some unassigned), drawn one screen at a
+    /// time through paint's overflow retry, warms up once. Drawing it again
+    /// makes zero fallback queries, zero wasted fallback face shapes and zero
+    /// atlas rebuilds. Each screen fits a small atlas, so only growth on
+    /// refill makes the whole pool resident; clearing at the current size,
+    /// as before, kept clearing as new emoji arrived.
+    #[test]
+    fn the_t0_emoji_pool_draws_twice_with_no_rebuild_or_fallback_query_the_second_time() {
+        use super::{
+            AtlasRebuildPolicy, LedgeredTexture, replace_glyph_cache_atlas,
+            texture_atlas_vram_budget_bytes,
+        };
+        use crate::glyphcache::GlyphCache;
+        use crate::utilsprites::{RenderMetrics, UtilSprites};
+        use ::window::bitmaps::atlas::OutOfTextureSpace;
+        use ::window::bitmaps::{ImageTexture, Texture2d};
+        use frankenterm_alloc::resource_ledger::{GpuResourceLedger, GpuTexturePurpose};
+        use frankenterm_font::FontConfiguration;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Instant;
+        use wezterm_bidi::Direction;
+        use wezterm_term::{CellAttributes, Line};
+
+        // The window's first atlas side (termwindow ATLAS_SIZE).
+        const FIRST_ATLAS_SIDE: usize = 128;
+        // Distinct emoji on one screen of the corpus.
+        const SCREEN: usize = 96;
+        // Like paint's MAX_PAINT_PASSES: a frame retried after each rebuild.
+        const PASSES: usize = 8;
+
+        config::use_test_configuration();
+        let fonts = Rc::new(FontConfiguration::new(None, 96).unwrap());
+        let metrics = RenderMetrics::new(&fonts).unwrap();
+        let font = fonts.default_font().unwrap();
+        let style = fonts.config().font.clone();
+        let ledger: &'static GpuResourceLedger = Box::leak(Box::new(GpuResourceLedger::new()));
+        let surface = |side: usize| -> Rc<dyn Texture2d> {
+            Rc::new(LedgeredTexture::new(
+                ImageTexture::new(side, side),
+                GpuTexturePurpose::Atlas,
+                ledger,
+            ))
+        };
+        let glyph_cache = RefCell::new(
+            GlyphCache::with_atlas_surface(&fonts, surface(FIRST_ATLAS_SIDE)).unwrap(),
+        );
+        let mut util_sprites = UtilSprites::new(&mut glyph_cache.borrow_mut(), &metrics).unwrap();
+        let mut policy = AtlasRebuildPolicy::default();
+        let budget_side = max_texture_atlas_side_for_budget(texture_atlas_vram_budget_bytes());
+        let attrs = CellAttributes::default();
+        let pool: Vec<String> = [
+            0x1F600..0x1F650,
+            0x1F300..0x1F600,
+            0x1F680..0x1F700,
+            0x1F900..0x1FA00,
+            0x1FA70..0x1FB00,
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(char::from_u32)
+        .map(String::from)
+        .collect();
+        assert_eq!(pool.len(), 1376);
+
+        // Draws every emoji of one screen; returns the shapes made and the
+        // overflow that stopped the frame, if any.
+        let draw_screen = |screen: &[String]| -> (u64, Option<OutOfTextureSpace>) {
+            let mut shapes = 0;
+            for text in screen {
+                let cluster = Line::from_text(text, &attrs, 0, None)
+                    .cluster(None)
+                    .remove(0);
+                let infos = font
+                    .blocking_shape(
+                        &cluster.text,
+                        Some(cluster.presentation),
+                        Direction::LeftToRight,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                shapes += 1;
+                for info in &infos {
+                    let drawn = glyph_cache.borrow_mut().cached_glyph(
+                        info,
+                        &style,
+                        false,
+                        &font,
+                        &metrics,
+                        info.num_cells,
+                    );
+                    if let Err(err) = drawn {
+                        let overflow = err
+                            .root_cause()
+                            .downcast_ref::<OutOfTextureSpace>()
+                            .copied()
+                            .unwrap_or_else(|| panic!("{text:?}: {err:#}"));
+                        return (shapes, Some(overflow));
+                    }
+                }
+            }
+            (shapes, None)
+        };
+        let mut draw_pool = |policy: &mut AtlasRebuildPolicy| -> u64 {
+            let mut shapes = 0;
+            for screen in pool.chunks(SCREEN) {
+                let mut drawn = false;
+                for pass in 0..PASSES {
+                    let (made, overflow) = draw_screen(screen);
+                    shapes += made;
+                    let Some(overflow) = overflow else {
+                        drawn = true;
+                        break;
+                    };
+                    // paint_impl's request, then RenderState's policy.
+                    let requested = match (pass, overflow.size) {
+                        (0, _) | (_, None) => overflow.current_size,
+                        (_, Some(size)) => size,
+                    };
+                    let current = glyph_cache.borrow().atlas.size();
+                    let side = policy.plan(current, requested, budget_side, Instant::now());
+                    util_sprites = replace_glyph_cache_atlas(
+                        &glyph_cache,
+                        &fonts,
+                        &metrics,
+                        surface(side),
+                        ledger,
+                    )
+                    .unwrap();
+                    assert_eq!(util_sprites.white_space.texture.width(), side);
+                }
+                assert!(drawn, "a screen did not fit within {PASSES} passes");
+            }
+            shapes
+        };
+
+        draw_pool(&mut policy);
+        let warm = (
+            ledger.snapshot().atlas_generations,
+            policy,
+            fonts.fallback_stats(),
+            font.fallback_walk_stats(),
+        );
+        assert!(
+            warm.1.growths > 0,
+            "the warm-up grew the atlas: {:?}",
+            warm.1
+        );
+        assert!(warm.2.queried > 0, "the warm-up resolved fallbacks");
+
+        let shapes = draw_pool(&mut policy);
+        let walk = font.fallback_walk_stats();
+        assert_eq!(
+            ledger.snapshot().atlas_generations,
+            warm.0,
+            "no atlas rebuild"
+        );
+        assert_eq!(policy, warm.1, "no clear or growth");
+        assert_eq!(
+            fonts.fallback_stats().queried,
+            warm.2.queried,
+            "no fallback query"
+        );
+        assert_eq!(
+            walk.faces_shaped - warm.3.faces_shaped,
+            shapes,
+            "each emoji costs one face shape: no fallback face is shaped in vain"
+        );
+        assert!(walk.skipped_coverage > warm.3.skipped_coverage);
+        assert_eq!(
+            ledger.texture_counter(GpuTexturePurpose::Atlas).live_count,
+            1,
+            "only the current atlas is alive"
+        );
+        drop(util_sprites);
     }
 }
