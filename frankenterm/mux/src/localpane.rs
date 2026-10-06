@@ -4346,6 +4346,11 @@ struct RenderFactsPublisher {
     /// only when this changes.
     palette_source: Mutex<PaletteSource>,
     tmux_domain: Arc<Mutex<Option<Arc<TmuxDomainState>>>>,
+    /// Bench-only: skip every publication, so
+    /// `mux/benches/render_facts_publication.rs` can measure what publishing
+    /// costs a batch (ft-yccm0.2.2.1). Not compiled into normal builds.
+    #[cfg(feature = "bench-hooks")]
+    skip_publication: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4368,6 +4373,8 @@ impl RenderFactsPublisher {
             palette_epoch: AtomicU64::new(0),
             palette_source: Mutex::new(source),
             tmux_domain,
+            #[cfg(feature = "bench-hooks")]
+            skip_publication: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -4381,6 +4388,10 @@ impl RenderFactsPublisher {
 
     /// Capture and publish. The caller holds the terminal mutex.
     fn publish(&self, terminal: &mut Terminal) {
+        #[cfg(feature = "bench-hooks")]
+        if self.skip_publication.load(Ordering::Relaxed) {
+            return;
+        }
         let previous = self.facts.load_full();
         let source = PaletteSource {
             epoch: self.palette_epoch.load(Ordering::Acquire),
@@ -6760,6 +6771,33 @@ impl LocalPane {
     {
         let _terminal = self.terminal.lock();
         f();
+    }
+
+    /// Bench-only hook (feature `bench-hooks`) for
+    /// `mux/benches/render_facts_publication.rs`: with `skip` set, batches are
+    /// applied without publishing `PaneRenderFacts`, so the bench can measure
+    /// the publication's cost (ft-yccm0.2.2.1).
+    #[cfg(feature = "bench-hooks")]
+    #[doc(hidden)]
+    pub fn bench_skip_render_facts_publication(&self, skip: bool) {
+        self.render_facts
+            .skip_publication
+            .store(skip, Ordering::Relaxed);
+    }
+
+    /// Bench-only entry (feature `bench-hooks`) to the fused live path the
+    /// parse thread takes for bulk output (`feed_fused`, ft-yccm0.3.2.1), so
+    /// the render-facts bench measures that path too.
+    #[cfg(all(feature = "bench-hooks", not(feature = "disruptor-pane-io")))]
+    #[doc(hidden)]
+    pub fn bench_feed_fused(
+        &self,
+        parser: &mut termwiz::escape::parser::Parser,
+        bytes: &[u8],
+        diverted: &mut Vec<Action>,
+    ) -> anyhow::Result<()> {
+        self.feed_fused(parser, bytes, diverted)
+            .map_err(|refusal| anyhow::anyhow!("fused feed refused: {:?}", refusal))
     }
 
     fn enqueue_resize(&self, size: TerminalSize, reconcile_tab: bool) -> Result<(), Error> {

@@ -23,6 +23,9 @@ lua = ["dep:luahelper", "dep:mlua", "config/lua", "procinfo/lua"]
 # under render contention. OFF by default — the mutex path is the fallback;
 # enabling this flag swaps in the ring. Clean revert = drop the flag.
 disruptor-pane-io = []
+# Bench-only hooks on LocalPane (benches/render_facts_publication.rs,
+# ft-yccm0.2.2.1). Never enable it in a product build.
+bench-hooks = []
 no-lua = ["config/no-lua"]
 # Legacy fallback path kept for staged migration/testing.
 async-smol = ["config/async-smol", "frankenterm-ssh/async-smol"]
@@ -112,3 +115,8 @@ tempfile.workspace = true
 [[bench]]
 name = "event_bus"
 harness = false
+
+[[bench]]
+name = "render_facts_publication"
+harness = false
+required-features = ["bench-hooks"]
