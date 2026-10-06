@@ -1,11 +1,14 @@
 #![allow(clippy::range_plus_one)]
 use super::*;
-use crate::config::{BidiMode, ScrollbackSnapshotGeneration, ScrollbackSpillError};
+use crate::config::{BidiMode, GridEngine, ScrollbackSnapshotGeneration, ScrollbackSpillError};
 #[cfg(feature = "use_serde")]
 use crate::config::{
     ScrollbackActivationError, ScrollbackPrefix, ScrollbackSnapshotFidelity,
     ScrollbackSnapshotLimits,
 };
+use crate::pagegrid::native;
+use crate::pagegrid::rows::{PageRows, Rows};
+use crate::pagegrid::Page;
 #[cfg(feature = "use_serde")]
 use frankenterm_surface::line::LineWrapGeometry;
 use frankenterm_surface::line::{
@@ -2785,8 +2788,10 @@ pub struct Screen {
     /// Index 0 is the topmost line of the screen/scrollback (depending
     /// on the current window size) and will be the first line to be
     /// popped off the front of the screen when a new line is added that
-    /// would otherwise have exceeded the line capacity
-    lines: VecDeque<Line>,
+    /// would otherwise have exceeded the line capacity.
+    /// With `FT_GRID_ENGINE=page` the rows live in PageGrid pages
+    /// (ft-yccm0.3.3.4); see [`Rows`].
+    lines: Rows,
 
     /// Whenever we scroll a line off the top of the scrollback, we
     /// increment this.  We use this offset to translate between
@@ -3506,7 +3511,7 @@ impl ScreenReflowPreparation {
         if is_cancelled() || self.snapshot.lines.iter().any(Line::has_image_attachments) {
             return false;
         }
-        self.source_lines = self.snapshot.lines.clone();
+        self.source_lines = self.snapshot.lines.reflow_source().clone();
         // Pruning only removes rows after the cursor. Compute its logical
         // prefix on the immutable worker source before that pruning, then
         // reuse it only under the same exact-source authority as the wraps.
@@ -4309,7 +4314,11 @@ impl Screen {
         let Some(count) = count else {
             return Ok(None);
         };
-        let (first, second) = self.lines.as_slices();
+        // Page-engine rows serve this read once B3.5 views reach it.
+        let (first, second) = self
+            .lines
+            .legacy_slices()
+            .ok_or_else(|| anyhow::anyhow!("cold seam reflow unavailable on page-engine rows"))?;
         let resident = Line::try_clone_batch_for_snapshot(
             &first[..count.min(first.len())],
             &second[..count.saturating_sub(first.len())],
@@ -4601,7 +4610,20 @@ impl Screen {
                 .ok_or_else(|| anyhow::anyhow!("resident read unavailable"))?;
             let stop = start + (end - resident_first) as usize;
             anyhow::ensure!(stop <= self.lines.len(), "resident read unavailable");
-            let (first, second) = self.lines.as_slices();
+            let viewed: Vec<Line>;
+            let (first, second) = match self.lines.legacy_slices() {
+                Some(slices) => slices,
+                None => {
+                    // Page-engine rows: their legacy views, read in order.
+                    viewed = self.lines.range(start..stop).cloned().collect();
+                    (&viewed[..], &[][..])
+                }
+            };
+            let (start, stop) = if self.lines.legacy().is_some() {
+                (start, stop)
+            } else {
+                (0, stop - start)
+            };
             Line::try_clone_batch_for_snapshot(
                 &first[start.min(first.len())..stop.min(first.len())],
                 &second[start.saturating_sub(first.len())..stop.saturating_sub(first.len())],
@@ -6148,7 +6170,7 @@ impl Screen {
         let mut screen =
             Self::try_new(size, config, parts.allow_scrollback, seqno, bidi_mode, true)
                 .map_err(|_| ScreenCheckpointCaptureError::ResourceAllocation("screen"))?;
-        screen.lines = parts.lines.into();
+        screen.lines = Rows::Legacy(parts.lines.into());
         screen.stable_row_index_offset = parts.stable_row_index_offset;
         screen.recovery_scrollback = Some(RecoveryScrollbackBoundary {
             expected_generation: parts.cold_snapshot_generation,
@@ -6193,8 +6215,11 @@ impl Screen {
                 .checked_add(scrollback_hot_size(&scrollback_policy, allow_scrollback))
                 .ok_or(())?
         };
+        let engine = config.grid_engine();
         let mut lines = VecDeque::new();
-        lines.try_reserve_exact(capacity).map_err(|_| ())?;
+        if engine == GridEngine::Legacy || checkpoint_restore {
+            lines.try_reserve_exact(capacity).map_err(|_| ())?;
+        }
         if !checkpoint_restore {
             for _ in 0..physical_rows {
                 let mut line = Line::new(seqno);
@@ -6202,6 +6227,17 @@ impl Screen {
                 lines.push_back(line);
             }
         }
+        let hot_cap =
+            physical_rows.saturating_add(scrollback_hot_size(&scrollback_policy, allow_scrollback));
+        let lines = Self::rows_for_engine(
+            engine,
+            lines,
+            physical_cols,
+            hot_cap,
+            seqno,
+            &bidi_mode,
+            checkpoint_restore,
+        );
 
         Ok(Screen {
             lines,
@@ -6251,6 +6287,63 @@ impl Screen {
             #[cfg(test)]
             forced_rollback_cause: None,
         })
+    }
+
+    /// The rows a new screen starts with (ft-yccm0.3.3.4): `lines` as they
+    /// are, or for [`GridEngine::Page`] the same rows in PageGrid pages:
+    /// empty, clustered, with the screen's bidi mode, as `Line::new` plus
+    /// `apply_to_line` makes them. A screen restored from a checkpoint keeps
+    /// legacy rows, and so does one wider than a page row can be.
+    fn rows_for_engine(
+        engine: GridEngine,
+        lines: VecDeque<Line>,
+        physical_cols: usize,
+        hot_cap: usize,
+        seqno: SequenceNo,
+        bidi_mode: &BidiMode,
+        checkpoint_restore: bool,
+    ) -> Rows {
+        let Ok(cols) = u16::try_from(physical_cols) else {
+            return Rows::Legacy(lines);
+        };
+        if engine != GridEngine::Page || checkpoint_restore || cols == u16::MAX {
+            return Rows::Legacy(lines);
+        }
+        let viewport = lines.len();
+        let mut rows = PageRows::new(cols, viewport, hot_cap);
+        rows.scroll(viewport, seqno, false, 0);
+        for index in 0..viewport {
+            if let Some((page, row)) = rows.page_row(index) {
+                native::new_row(
+                    page,
+                    row,
+                    physical_cols,
+                    &CellAttributes::blank(),
+                    Some(bidi_mode),
+                    seqno,
+                );
+            }
+        }
+        Rows::Page(Box::new(rows))
+    }
+
+    /// The storage the screen's rows are in now (ft-yccm0.3.3.4). A
+    /// page-engine screen reports [`GridEngine::Legacy`] once an operation
+    /// the page engine does not perform yet has returned its rows to legacy
+    /// storage.
+    pub fn grid_engine(&self) -> GridEngine {
+        if self.lines.page().is_some() {
+            GridEngine::Page
+        } else {
+            GridEngine::Legacy
+        }
+    }
+
+    /// Row `index` for a native PageGrid write (ft-yccm0.3.3.4). `None` for
+    /// legacy rows, and for a row whose edited view no longer fits its page;
+    /// the caller then edits the row's `Line`.
+    fn page_row(&mut self, index: PhysRowIndex) -> Option<(&mut Page, u32)> {
+        self.lines.page_mut()?.page_row(index)
     }
 
     pub fn full_reset(&mut self) {
@@ -6403,7 +6496,7 @@ impl Screen {
 
         let next_coordinate_identity = ScreenCoordinateIdentity::default();
         if let Some(sink) = sink {
-            let (first, second) = self.lines.as_slices();
+            let (first, second) = self.lines.legacy_mut().as_slices();
             let first_count = first.len().min(cold_prefix_line_count);
             let second_count = cold_prefix_line_count.saturating_sub(first_count);
             let prefix = ScrollbackPrefix::from_slices(
@@ -6539,8 +6632,12 @@ impl Screen {
     }
 
     fn estimate_line_bytes(line: &Line) -> usize {
-        line.len()
-            .saturating_mul(std::mem::size_of::<Cell>())
+        Self::estimate_row_bytes(line.len())
+    }
+
+    /// [`Self::estimate_line_bytes`] of a row `len` cells long.
+    fn estimate_row_bytes(len: usize) -> usize {
+        len.saturating_mul(std::mem::size_of::<Cell>())
             .max(std::mem::size_of::<Line>())
     }
 
@@ -6631,12 +6728,17 @@ impl Screen {
                 }
             }
         }
-        let line_bytes = Self::estimate_line_bytes(line);
+        self.record_warm_spill(Self::estimate_line_bytes(line), seqno);
+        true
+    }
+
+    /// The warm-tier accounting at the end of [`Self::record_scrollback_spill`],
+    /// for a row of `line_bytes` (see [`Self::estimate_row_bytes`]).
+    fn record_warm_spill(&mut self, line_bytes: usize, seqno: SequenceNo) {
         let spill_outcome = self
             .scrollback_tiering
             .record_spill(line_bytes, self.tiered_scrollback_warm_max_bytes());
         self.apply_cold_spill_outcome(seqno, spill_outcome, "budget_overflow");
-        true
     }
 
     #[cfg(feature = "use_serde")]
@@ -7272,7 +7374,7 @@ impl Screen {
     {
         Self::wrap_logical_line_source_for_resize(
             logical_line,
-            &self.lines,
+            self.lines.reflow_source(),
             physical_cols,
             seqno,
             self.resize_wrap_policy,
@@ -7289,7 +7391,7 @@ impl Screen {
     where
         T: ReflowLogicalLine,
     {
-        let line = logical_line.line(&self.lines);
+        let line = logical_line.line(self.lines.reflow_source());
         if line.len() <= physical_cols {
             return self.wrap_logical_line_for_resize(logical_line, physical_cols, seqno);
         }
@@ -7469,7 +7571,7 @@ impl Screen {
             return ViewportReflowPlan::default();
         }
 
-        let logical_ranges = Self::logical_line_physical_ranges(&self.lines);
+        let logical_ranges = Self::logical_line_physical_ranges(self.lines.reflow_source());
         self.build_viewport_reflow_plan_for_logical_ranges(&logical_ranges, logical_count)
     }
 
@@ -7655,7 +7757,7 @@ impl Screen {
             wrapped.push(
                 slot.as_ref()
                     .expect("missing wrapped line result after planner")
-                    .shared_chunk(&self.lines),
+                    .shared_chunk(self.lines.reflow_source()),
             );
         }
         wrapped
@@ -7702,7 +7804,7 @@ impl Screen {
         let mut cache = self.rewrap_cache.take();
         let published_target_matches = cache
             .as_ref()
-            .is_some_and(|entry| entry.matches_published_target(&self.lines));
+            .is_some_and(|entry| entry.matches_published_target(self.lines.reflow_source()));
         let source_signature = if !published_target_matches
             && cache
                 .as_ref()
@@ -7792,7 +7894,7 @@ impl Screen {
         }
         let cache_logical_lines = logical_lines
             .iter()
-            .map(|line| line.clone_line(&self.lines))
+            .map(|line| line.clone_line(self.lines.reflow_source()))
             .collect();
         let mut new_cache = LogicalLineWrapCache::new(source_signature, cache_logical_lines);
         new_cache.insert_wrapped(
@@ -7978,7 +8080,7 @@ impl Screen {
                         }
                         let end = (start + chunk_size).min(batch.logical_range.end);
                         let logical_slice = &logical_lines[start..end];
-                        let physical_lines = &self.lines;
+                        let physical_lines = self.lines.reflow_source();
                         let line_cache = &self.rewrap_line_cache;
                         let dpi = self.dpi;
                         scope.spawn(move |_| {
@@ -8219,9 +8321,9 @@ impl Screen {
 
         let required_capacity = wrapped_count.max(physical_rows);
         let mut pruned_rows = 0usize;
-        self.lines = match wrapped {
+        self.lines = Rows::Legacy(match wrapped {
             WrappedResizeLines::Cached(wrapped) => {
-                let mut rewrapped = std::mem::take(&mut self.lines);
+                let mut rewrapped = std::mem::take(self.lines.legacy_mut());
                 rewrapped.clear();
                 // reserve is relative to len (now zero), not existing capacity.
                 rewrapped.reserve(required_capacity);
@@ -8237,7 +8339,7 @@ impl Screen {
                 rewrapped
             }
             WrappedResizeLines::Scratch { logical_count } => {
-                let source_lines = std::mem::take(&mut self.lines);
+                let source_lines = std::mem::take(self.lines.legacy_mut());
                 let source_capacity = source_lines.capacity();
                 let mut source_iter = source_lines.into_iter().enumerate();
                 let mut next_source = source_iter.next();
@@ -8279,7 +8381,7 @@ impl Screen {
                 }
                 rewrapped
             }
-        };
+        });
         let materialize_elapsed = profile_start.map(|start| start.elapsed());
 
         if logical_cache_hit && reuse_unlinked_scan_state_for_reflow() {
@@ -8477,7 +8579,12 @@ impl Screen {
         size: TerminalSize,
         cursor: CursorPosition,
     ) -> Option<ScreenReflowPreparation> {
-        if !self.allow_scrollback || !self.needs_rewrap_for_width_change(size.cols.max(1)) {
+        // Page-engine rows reflow synchronously, through legacy storage,
+        // until page-wise reflow (B3.6).
+        if self.lines.legacy().is_none()
+            || !self.allow_scrollback
+            || !self.needs_rewrap_for_width_change(size.cols.max(1))
+        {
             return None;
         }
         let profile_start =
@@ -8539,6 +8646,7 @@ impl Screen {
             log::log_enabled!(target: "frankenterm_term::screen::reflow_profile", log::Level::Debug)
                 .then(Instant::now);
         let matches = prepared.ready
+            && self.lines.legacy().is_some()
             && self.allow_scrollback
             && prepared.target == size
             && prepared.logical_cursor_for(cursor).is_some()
@@ -8672,6 +8780,9 @@ impl Screen {
             self.finish_selection_anchor_resize(selection_anchors, seqno);
             return cursor;
         }
+        // Resize and reflow edit rows structurally: page-engine rows take
+        // them through legacy storage until page-wise reflow (B3.6).
+        self.lines.legacy_mut();
         log::debug!(
             "resize screen to {physical_cols}x{physical_rows} dpi={}",
             size.dpi
@@ -9061,6 +9172,10 @@ impl Screen {
     pub fn dirty_line(&mut self, idx: VisibleRowIndex, seqno: SequenceNo) {
         let line_idx = self.phys_row(idx);
         if line_idx < self.lines.len() {
+            if let Some((page, row)) = self.page_row(line_idx) {
+                page.touch_row(row, seqno);
+                return;
+            }
             self.lines[line_idx].update_last_change_seqno(seqno);
         }
     }
@@ -9126,6 +9241,11 @@ impl Screen {
         self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
         let line_idx = self.phys_row(y);
         //debug!("set_cell x={} y={} phys={} {:?}", x, y, line_idx, cell);
+        if let Some((page, row)) = self.page_row(line_idx) {
+            if native::set_cell(page, row, x, cell, false, seqno) {
+                return;
+            }
+        }
 
         let line = self.line_mut(line_idx);
         line.set_cell(x, cell.clone(), seqno);
@@ -9142,6 +9262,11 @@ impl Screen {
     ) {
         self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
         let line_idx = self.phys_row(y);
+        if let Some((page, row)) = self.page_row(line_idx) {
+            if native::set_cell_grapheme(page, row, x, text, width, &attr, seqno) {
+                return;
+            }
+        }
         let line = self.line_mut(line_idx);
         line.set_cell_grapheme(x, text, width, attr, seqno);
     }
@@ -9161,6 +9286,11 @@ impl Screen {
 
         self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
         let line_idx = self.phys_row(y);
+        if let Some((page, row)) = self.page_row(line_idx) {
+            if native::set_ascii_run(page, row, x, text, &attr, seqno) {
+                return;
+            }
+        }
         let line = self.line_mut(line_idx);
         if ascii_cluster_run_append_enabled()
             && line.append_ascii_cell_run(x, text, attr.clone(), seqno)
@@ -9203,15 +9333,40 @@ impl Screen {
             // Tiered scrollback retains at least one hot history row whenever
             // history is enabled, so this boundary never needs cold sink I/O.
             if let Some(previous) = line_idx.checked_sub(1) {
-                self.line_mut(previous)
-                    .set_last_cell_was_wrapped(false, seqno);
+                self.set_last_cell_was_wrapped(previous, false, seqno);
             }
+        }
+        if let Some((page, row)) = self.page_row(line_idx) {
+            if cols.start == 0 {
+                native::apply_bidi(page, row, &bidi_mode, seqno);
+            }
+            if native::fill_blank(page, row, cols.clone(), attr, seqno) {
+                return;
+            }
+            // Declined: the row's `Line` takes the fill. Applying the bidi
+            // mode again there changes nothing.
         }
         let line = self.line_mut(line_idx);
         if cols.start == 0 {
             bidi_mode.apply_to_line(line, seqno);
         }
         line.fill_range(cols, &Cell::blank_with_attrs(attr.clone()), seqno);
+    }
+
+    /// `Line::set_last_cell_was_wrapped` on row `index`, natively for
+    /// page-engine rows (ft-yccm0.3.3.4).
+    pub fn set_last_cell_was_wrapped(
+        &mut self,
+        index: PhysRowIndex,
+        wrapped: bool,
+        seqno: SequenceNo,
+    ) {
+        if let Some((page, row)) = self.page_row(index) {
+            native::set_last_cell_was_wrapped(page, row, wrapped, seqno);
+            return;
+        }
+        self.line_mut(index)
+            .set_last_cell_was_wrapped(wrapped, seqno);
     }
 
     /// Ensure that row is within the range of the physical portion of
@@ -9436,6 +9591,9 @@ impl Screen {
         blank_attr: CellAttributes,
         bidi_mode: BidiMode,
     ) {
+        if self.page_scroll_up(scroll_region, num_rows, seqno, &blank_attr, bidi_mode) {
+            return;
+        }
         self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
         let phys_scroll = self.phys_range(scroll_region);
         let num_rows = num_rows.min(phys_scroll.end - phys_scroll.start);
@@ -9621,6 +9779,210 @@ impl Screen {
         }
     }
 
+    /// Legacy [`Self::scroll_up`] on page-engine rows (ft-yccm0.3.3.4), with
+    /// the page list doing the moving (ADR D5):
+    /// - the full-screen scroll appends rows;
+    /// - a region with top margin 0 appends them too and then rotates its
+    ///   footer down;
+    /// - any other region, and the alternate screen, rotates its rows.
+    ///
+    /// Everything else is legacy's: rows entering scrollback are compressed,
+    /// rows leaving the hot cap are offered to the cold sink one at a time
+    /// (a refusal keeps the row), the stable offset advances by the rows
+    /// admitted, new rows are built the same way (the reused ones without the
+    /// bidi mode), and the footer is dirtied in the same cases.
+    ///
+    /// Returns false, having changed nothing, for legacy rows and when more
+    /// rows would leave than are retained; the legacy code then runs.
+    fn page_scroll_up(
+        &mut self,
+        scroll_region: &Range<VisibleRowIndex>,
+        num_rows: usize,
+        seqno: SequenceNo,
+        blank_attr: &CellAttributes,
+        bidi_mode: BidiMode,
+    ) -> bool {
+        if self.lines.page().is_none() {
+            return false;
+        }
+        let phys_scroll = self.phys_range(scroll_region);
+        let num_rows = num_rows.min(phys_scroll.end - phys_scroll.start);
+        let scrollback_ok = scroll_region.start == 0 && self.allow_scrollback;
+        let insert_at_end = scroll_region.end as usize == self.physical_rows;
+        let max_allowed = self.physical_rows + self.hot_scrollback_size();
+        let lines_removed = if !scrollback_ok {
+            num_rows
+        } else if self.recovery_scrollback.is_some() {
+            0
+        } else {
+            (self.lines.len() + num_rows).saturating_sub(max_allowed)
+        };
+        if scrollback_ok && lines_removed > self.lines.len() {
+            return false;
+        }
+
+        self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
+        if num_rows != 0 && (!scrollback_ok || !insert_at_end) {
+            self.invalidate_coordinate_witnesses();
+        }
+        if !scrollback_ok {
+            for index in phys_scroll.clone() {
+                if let Some((page, row)) = self.page_row(index) {
+                    page.touch_row(row, seqno);
+                }
+            }
+        }
+        if scroll_region.start == 0 {
+            for index in self.phys_range(&(0..num_rows as VisibleRowIndex)) {
+                self.page_compress_for_scrollback(index);
+            }
+        }
+        let cols = self.physical_cols;
+
+        if !scrollback_ok {
+            // No scrollback: the region's top rows are reused at its bottom,
+            // as legacy's eviction path reuses them, without the bidi mode.
+            let rows = self.lines.page_mut().expect("page rows");
+            rows.rotate_up(phys_scroll.clone(), num_rows, seqno);
+            for index in phys_scroll.end - num_rows..phys_scroll.end {
+                if let Some((page, row)) = rows.page_row(index) {
+                    native::new_row(page, row, cols, blank_attr, None, seqno);
+                }
+            }
+            return true;
+        }
+
+        // Rows leaving the hot cap are offered to the sink, oldest first.
+        let reads_spill = self.allow_scrollback
+            && self.hot_scrollback_size() != 0
+            && self.scrollback_policy.tier.enabled;
+        let mut admitted = 0;
+        let mut refused = false;
+        for removed_from_top in 0..lines_removed {
+            if reads_spill {
+                let stable_row = self.stable_row_index_for_removed_top(removed_from_top);
+                let accepted = if self.cold_sink_retention_rows() > 0 {
+                    let line = self.lines[removed_from_top].clone();
+                    self.record_scrollback_spill(stable_row, &line, seqno)
+                } else {
+                    // Without a cold sink only the row's length is read.
+                    let len = self
+                        .lines
+                        .page()
+                        .map_or(0, |rows| rows.row_len(removed_from_top));
+                    self.record_warm_spill(Self::estimate_row_bytes(len), seqno);
+                    true
+                };
+                if !accepted {
+                    refused = true;
+                    break;
+                }
+            }
+            admitted += 1;
+        }
+        if refused
+            && !self
+                .config
+                .scrollback_spill_sink()
+                .is_some_and(|sink| sink.requires_scrollback_flush())
+        {
+            warn!(
+                "cold scrollback persistence failed at stable row {}; retaining the row in memory",
+                self.stable_row_index_for_removed_top(admitted)
+            );
+        }
+
+        let hold = self.recovery_scrollback.is_some();
+        let footer = self.physical_rows - scroll_region.end as usize;
+        let rows = self.lines.page_mut().expect("page rows");
+        rows.set_hot_cap(max_allowed);
+        let scrolled = if insert_at_end {
+            rows.scroll(num_rows, seqno, hold, admitted)
+        } else {
+            rows.scroll_above_footer(num_rows, footer, seqno, hold, admitted)
+        };
+        debug_assert_eq!(scrolled.trimmed, admitted);
+        self.advance_stable_row_index_offset(admitted);
+
+        // Legacy reuses an evicted row for each of the first rows it adds,
+        // and builds the rest new, with the bidi mode.
+        let to_move = lines_removed.min(num_rows);
+        let lines_moved = admitted.min(to_move);
+        let spill_blocked = refused && admitted < to_move;
+        let to_remove = if spill_blocked {
+            0
+        } else {
+            lines_removed - lines_moved
+        };
+        let to_add = num_rows - lines_moved;
+        let first_new = self.lines.len() - footer - num_rows;
+        for added in 0..num_rows {
+            if let Some((page, row)) = self.page_row(first_new + added) {
+                let bidi = (added >= lines_moved).then_some(&bidi_mode);
+                native::new_row(page, row, cols, blank_attr, bidi, seqno);
+            }
+        }
+
+        if to_remove > 0 || (to_add > 0 && !insert_at_end) {
+            for index in
+                self.phys_range(&(scroll_region.end..self.physical_rows as VisibleRowIndex))
+            {
+                if let Some((page, row)) = self.page_row(index) {
+                    page.touch_row(row, seqno);
+                }
+            }
+        }
+        true
+    }
+
+    /// Legacy [`Self::scroll_down`] on page-engine rows (ft-yccm0.3.3.4): the
+    /// region's bottom rows are cleared and move to its top as new rows, and
+    /// the rows they pass are dirtied. Returns false for legacy rows.
+    fn page_scroll_down(
+        &mut self,
+        scroll_region: &Range<VisibleRowIndex>,
+        num_rows: usize,
+        seqno: SequenceNo,
+        blank_attr: &CellAttributes,
+        bidi_mode: BidiMode,
+    ) -> bool {
+        if self.lines.page().is_none() {
+            return false;
+        }
+        self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
+        let phys_scroll = self.phys_range(scroll_region);
+        let num_rows = num_rows.min(phys_scroll.end.saturating_sub(phys_scroll.start));
+        if num_rows != 0 {
+            self.invalidate_coordinate_witnesses();
+        }
+        let middle = phys_scroll.end.saturating_sub(num_rows);
+        for index in phys_scroll.start..middle {
+            if let Some((page, row)) = self.page_row(index) {
+                page.touch_row(row, seqno);
+            }
+        }
+        let cols = self.physical_cols;
+        let rows = self.lines.page_mut().expect("page rows");
+        rows.rotate_down(phys_scroll.clone(), num_rows, seqno);
+        for index in phys_scroll.start..phys_scroll.start + num_rows {
+            if let Some((page, row)) = rows.page_row(index) {
+                native::new_row(page, row, cols, blank_attr, Some(&bidi_mode), seqno);
+            }
+        }
+        true
+    }
+
+    /// `Line::compress_for_scrollback` on row `index`, natively when the
+    /// page-engine row allows it.
+    fn page_compress_for_scrollback(&mut self, index: PhysRowIndex) {
+        if let Some((page, row)) = self.page_row(index) {
+            if native::compress_for_scrollback(page, row) {
+                return;
+            }
+        }
+        self.lines[index].compress_for_scrollback();
+    }
+
     pub fn erase_scrollback(&mut self) -> Result<(), ScrollbackSpillError> {
         let len = self.lines.len();
         let to_clear = len.saturating_sub(self.physical_rows);
@@ -9691,6 +10053,9 @@ impl Screen {
         blank_attr: CellAttributes,
         bidi_mode: BidiMode,
     ) {
+        if self.page_scroll_down(scroll_region, num_rows, seqno, &blank_attr, bidi_mode) {
+            return;
+        }
         self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
         debug!("scroll_down {:?} {}", scroll_region, num_rows);
         let phys_scroll = self.phys_range(scroll_region);
@@ -10101,21 +10466,8 @@ impl Screen {
     where
         F: FnMut(&[&Line]),
     {
-        let (first, second) = self.lines.as_slices();
-        let first_range = 0..first.len();
-        let second_range = first.len()..first.len() + second.len();
-        let first_range = phys_intersection(&first_range, &phys_range);
-        let second_range = phys_intersection(&second_range, &phys_range);
-
-        let mut lines: Vec<&Line> = Vec::with_capacity(phys_range.end - phys_range.start);
-        for line in &first[first_range] {
-            lines.push(line);
-        }
-        for line in &second[second_range.start.saturating_sub(first.len())
-            ..second_range.end.saturating_sub(first.len())]
-        {
-            lines.push(line);
-        }
+        let range = phys_intersection(&(0..self.lines.len()), &phys_range);
+        let lines: Vec<&Line> = self.lines.range(range).collect();
         func(&lines)
     }
 
@@ -10123,22 +10475,8 @@ impl Screen {
     where
         F: FnMut(&mut [&mut Line]),
     {
-        let (first, second) = self.lines.as_mut_slices();
-        let first_len = first.len();
-        let first_range = 0..first.len();
-        let second_range = first.len()..first.len() + second.len();
-        let first_range = phys_intersection(&first_range, &phys_range);
-        let second_range = phys_intersection(&second_range, &phys_range);
-
-        let mut lines: Vec<&mut Line> = Vec::with_capacity(phys_range.end - phys_range.start);
-        for line in &mut first[first_range] {
-            lines.push(line);
-        }
-        for line in &mut second[second_range.start.saturating_sub(first_len)
-            ..second_range.end.saturating_sub(first_len)]
-        {
-            lines.push(line);
-        }
+        let range = phys_intersection(&(0..self.lines.len()), &phys_range);
+        let mut lines: Vec<&mut Line> = self.lines.range_mut(range).collect();
         func(&mut lines)
     }
 
@@ -11212,13 +11550,15 @@ pub(crate) mod tests {
         screen.stable_row_index_offset = 1;
         let mut head = Line::from_text("efg", &CellAttributes::blank(), 1, None);
         head.set_last_cell_was_wrapped(true, 1);
-        screen.lines = [
-            head,
-            Line::from_text("h", &CellAttributes::blank(), 1, None),
-            Line::new(1),
-            Line::new(1),
-        ]
-        .into();
+        screen.lines = Rows::Legacy(
+            [
+                head,
+                Line::from_text("h", &CellAttributes::blank(), 1, None),
+                Line::new(1),
+                Line::new(1),
+            ]
+            .into(),
+        );
         let before = screen.lines.clone();
         let plan = screen.capture_cold_seam_reflow().unwrap().unwrap();
         assert!(plan.hydrate(|| true).is_err());
@@ -11305,13 +11645,15 @@ pub(crate) mod tests {
             screen.stable_row_index_offset = 1;
             let mut head = Line::from_text(head_text, &CellAttributes::blank(), 1, None);
             head.set_last_cell_was_wrapped(true, 1);
-            screen.lines = [
-                head,
-                Line::from_text(tail_text, &CellAttributes::blank(), 1, None),
-                Line::new(1),
-                Line::new(1),
-            ]
-            .into();
+            screen.lines = Rows::Legacy(
+                [
+                    head,
+                    Line::from_text(tail_text, &CellAttributes::blank(), 1, None),
+                    Line::new(1),
+                    Line::new(1),
+                ]
+                .into(),
+            );
             let mut initial = screen
                 .capture_cold_seam_reflow()
                 .unwrap()
@@ -11442,13 +11784,15 @@ pub(crate) mod tests {
         screen.stable_row_index_offset = 1;
         let mut head = Line::from_text("bcd", &CellAttributes::blank(), 1, None);
         head.set_last_cell_was_wrapped(true, 1);
-        screen.lines = [
-            head,
-            Line::from_text("ef", &CellAttributes::blank(), 1, None),
-            Line::new(1),
-            Line::new(1),
-        ]
-        .into();
+        screen.lines = Rows::Legacy(
+            [
+                head,
+                Line::from_text("ef", &CellAttributes::blank(), 1, None),
+                Line::new(1),
+                Line::new(1),
+            ]
+            .into(),
+        );
         let before = screen.lines.clone();
         let error = screen
             .capture_cold_seam_reflow()
@@ -11501,12 +11845,14 @@ pub(crate) mod tests {
             },
         );
         screen.stable_row_index_offset = 2;
-        screen.lines = [
-            Line::from_text("h", &CellAttributes::blank(), 1, None),
-            Line::new(1),
-            Line::new(1),
-        ]
-        .into();
+        screen.lines = Rows::Legacy(
+            [
+                Line::from_text("h", &CellAttributes::blank(), 1, None),
+                Line::new(1),
+                Line::new(1),
+            ]
+            .into(),
+        );
         let mut plan = screen
             .capture_cold_seam_reflow()
             .unwrap()
@@ -16427,7 +16773,7 @@ pub(crate) mod tests {
                     )
                 })
                 .collect();
-            screen.lines = original.iter().cloned().collect();
+            screen.lines = Rows::Legacy(original.iter().cloned().collect());
             sink.refuse_admission.store(true, Ordering::Relaxed);
             assert_eq!(
                 screen.trim_deferred_scrollback(1),
@@ -16435,7 +16781,7 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 screen.lines,
-                original.iter().cloned().collect::<VecDeque<_>>()
+                Rows::Legacy(original.iter().cloned().collect::<VecDeque<_>>())
             );
             assert_eq!(screen.stable_row_index_offset, 0);
             sink.refuse_admission.store(false, Ordering::Relaxed);
@@ -17091,11 +17437,11 @@ pub(crate) mod tests {
     fn no_match_hyperlink_scans_preserve_cached_resize_layouts() {
         let mut screen = test_screen(3, 4, 96);
         let attrs = CellAttributes::blank();
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text_with_wrapped_last_col("abcd", &attrs, 0),
             Line::from_text("ef", &attrs, 0, None),
             Line::new(0),
-        ]);
+        ]));
         let rules = vec![frankenterm_surface::hyperlink::Rule::new(r"https?://\S+", "$0").unwrap()];
         let mut cursor = test_cursor(1, 1, 1);
         for cols in [3, 4, 3] {
@@ -17241,16 +17587,18 @@ pub(crate) mod tests {
     #[test]
     fn resize_cache_snapshot_shares_immutable_arrays_and_keeps_lru_independent() {
         let mut screen = test_screen(3, 20, 96);
-        screen.lines = (0..16)
-            .map(|index| {
-                Line::from_text(
-                    &format!("{index:02} 界e\u{301} abcdefghijklmnop"),
-                    &CellAttributes::blank(),
-                    1,
-                    None,
-                )
-            })
-            .collect();
+        screen.lines = Rows::Legacy(
+            (0..16)
+                .map(|index| {
+                    Line::from_text(
+                        &format!("{index:02} 界e\u{301} abcdefghijklmnop"),
+                        &CellAttributes::blank(),
+                        1,
+                        None,
+                    )
+                })
+                .collect(),
+        );
         let cursor = screen.resize(test_size(3, 8, 96), test_cursor(0, 2, 1), 2, false);
         let before = Arc::clone(screen.rewrap_cache.as_ref().unwrap());
         let old_key = WrapCacheKey {
@@ -17398,12 +17746,12 @@ pub(crate) mod tests {
         use frankenterm_surface::hyperlink::Rule;
         let mut screen = test_screen(4, 6, 96);
         let attrs = CellAttributes::blank();
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text("abcdef", &attrs, 1, None),
             Line::from_text("xy", &attrs, 1, None),
             Line::new(1),
             Line::new(1),
-        ]);
+        ]));
         let old_rules = vec![Rule::new("never-matches", "$0").unwrap()];
         for line in &mut screen.lines {
             line.scan_and_create_hyperlinks(&old_rules);
@@ -17429,7 +17777,7 @@ pub(crate) mod tests {
         );
         let new_rules = vec![Rule::new("abcdef|xy", "https://new.example/$0").unwrap()];
         for target in [&mut screen, &mut fresh] {
-            for range in Screen::logical_line_physical_ranges(&target.lines) {
+            for range in Screen::logical_line_physical_ranges(target.lines.reflow_source()) {
                 let mut lines: Vec<_> = target
                     .lines
                     .iter_mut()
@@ -17465,11 +17813,11 @@ pub(crate) mod tests {
         let mut screen = test_screen(3, 4, 96);
         let attrs = CellAttributes::blank();
 
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text_with_wrapped_last_col("abcd", &attrs, 0),
             Line::from_text("ef", &attrs, 0, None),
             Line::new(0),
-        ]);
+        ]));
 
         let cursor = test_cursor(1, 1, 1);
         let cursor = screen.resize(test_size(3, 3, 96), cursor, 1, false);
@@ -17509,12 +17857,12 @@ pub(crate) mod tests {
         for (conpty, initial_cursor_y) in [(false, 1), (false, 3), (true, 1), (true, 3)] {
             let mut screen = test_screen(4, 8, 96);
             let attrs = CellAttributes::blank();
-            screen.lines = VecDeque::from(vec![
+            screen.lines = Rows::Legacy(VecDeque::from(vec![
                 Line::from_text_with_wrapped_last_col("ab界cdef", &attrs, 1),
                 Line::from_text("e\u{301}🦀z", &attrs, 1, None),
                 Line::from_text("abcdefghijklmno", &attrs, 1, None),
                 Line::new(1),
-            ]);
+            ]));
             // Cover both the original last-row cursor and a cursor above a
             // trailing blank, exercising worker/live pruning parity.
             let mut cursor = test_cursor(0, initial_cursor_y, 1);
@@ -17563,16 +17911,18 @@ pub(crate) mod tests {
     fn prepared_reflow_skips_source_rehash_but_stale_work_uses_fresh_source() {
         for stale in [false, true] {
             let mut screen = test_screen_with_scorecard(3, 20);
-            screen.lines = (0..12)
-                .map(|index| {
-                    Line::from_text(
-                        &format!("{index:02} 界👩‍💻e\u{301} abcdefghijklmnop"),
-                        &CellAttributes::blank(),
-                        1,
-                        None,
-                    )
-                })
-                .collect();
+            screen.lines = Rows::Legacy(
+                (0..12)
+                    .map(|index| {
+                        Line::from_text(
+                            &format!("{index:02} 界👩‍💻e\u{301} abcdefghijklmnop"),
+                            &CellAttributes::blank(),
+                            1,
+                            None,
+                        )
+                    })
+                    .collect(),
+            );
             let cursor = test_cursor(0, 2, 1);
             let size = test_size(3, 7, 96);
             assert!(screen.rewrap_cache.is_none());
@@ -17684,7 +18034,7 @@ pub(crate) mod tests {
             }
             let cache = screen.rewrap_cache.as_ref().unwrap();
             assert_eq!(cache.source_signature, None);
-            assert!(cache.matches_published_target(&screen.lines));
+            assert!(cache.matches_published_target(screen.lines.reflow_source()));
             assert_eq!(actual_cursor, expected_cursor);
             assert_eq!(screen.lines, expected.lines);
             assert_eq!(screen.physical_cols, expected.physical_cols);
@@ -17708,16 +18058,18 @@ pub(crate) mod tests {
     fn unsigned_prepared_cache_cannot_authorize_direct_reuse() {
         for mutate_source in [false, true] {
             let mut screen = test_screen_with_scorecard(3, 20);
-            screen.lines = (0..12)
-                .map(|index| {
-                    Line::from_text(
-                        &format!("{index:02} 界👩‍💻e\u{301} אב abcdefghijklmnop"),
-                        &CellAttributes::blank(),
-                        1,
-                        None,
-                    )
-                })
-                .collect();
+            screen.lines = Rows::Legacy(
+                (0..12)
+                    .map(|index| {
+                        Line::from_text(
+                            &format!("{index:02} 界👩‍💻e\u{301} אב abcdefghijklmnop"),
+                            &CellAttributes::blank(),
+                            1,
+                            None,
+                        )
+                    })
+                    .collect(),
+            );
             let cursor = test_cursor(0, 2, 1);
             let size = test_size(3, 7, 96);
             let mut prepared = screen.capture_reflow_preparation(size, cursor).unwrap();
@@ -17877,11 +18229,11 @@ pub(crate) mod tests {
         for mutation in 0..8 {
             let mut screen = test_screen(3, 8, 96);
             let attrs = CellAttributes::blank();
-            screen.lines = VecDeque::from(vec![
+            screen.lines = Rows::Legacy(VecDeque::from(vec![
                 Line::from_text("abcdefghijkl", &attrs, 1, None),
                 Line::from_text("界e\u{301}z", &attrs, 1, None),
                 Line::new(1),
-            ]);
+            ]));
             let mut cursor = test_cursor(0, 2, 1);
             let size = test_size(3, 4, 96);
             let mut prepared = screen.capture_reflow_preparation(size, cursor).unwrap();
@@ -17930,16 +18282,18 @@ pub(crate) mod tests {
     fn stale_preparation_reuses_unchanged_line_wraps_without_installing_layout() {
         let mut screen = test_screen(3, 80, 96);
         let attrs = CellAttributes::blank();
-        screen.lines = (0..64)
-            .map(|index| {
-                Line::from_text(
-                    &format!("{index:04} abc界e\u{301}defghijklmnop"),
-                    &attrs,
-                    1,
-                    None,
-                )
-            })
-            .collect();
+        screen.lines = Rows::Legacy(
+            (0..64)
+                .map(|index| {
+                    Line::from_text(
+                        &format!("{index:04} abc界e\u{301}defghijklmnop"),
+                        &attrs,
+                        1,
+                        None,
+                    )
+                })
+                .collect(),
+        );
         let cursor = test_cursor(0, 2, 1);
         let size = test_size(3, 8, 96);
         let mut prepared = screen.capture_reflow_preparation(size, cursor).unwrap();
@@ -17970,11 +18324,13 @@ pub(crate) mod tests {
     fn prepared_reflow_cancels_between_batches_without_touching_live_screen() {
         let mut screen = test_screen(3, 8, 96);
         let attrs = CellAttributes::blank();
-        screen.lines = (0..256)
-            .map(|index| {
-                Line::from_text(&format!("{index:04} abc界defghijklmnop"), &attrs, 1, None)
-            })
-            .collect();
+        screen.lines = Rows::Legacy(
+            (0..256)
+                .map(|index| {
+                    Line::from_text(&format!("{index:04} abc界defghijklmnop"), &attrs, 1, None)
+                })
+                .collect(),
+        );
         let original = screen.lines.clone();
         let cursor = test_cursor(0, 2, 1);
         let size = test_size(3, 4, 96);
@@ -17998,9 +18354,11 @@ pub(crate) mod tests {
     fn prepared_reflow_preserves_live_cold_work_counters() {
         let mut screen = test_screen(3, 8, 96);
         let attrs = CellAttributes::blank();
-        screen.lines = (0..256)
-            .map(|_| Line::from_text("abcdefghijklmnop", &attrs, 1, None))
-            .collect();
+        screen.lines = Rows::Legacy(
+            (0..256)
+                .map(|_| Line::from_text("abcdefghijklmnop", &attrs, 1, None))
+                .collect(),
+        );
         let cursor = test_cursor(0, 2, 1);
         let size = test_size(3, 4, 96);
         let mut prepared = screen.capture_reflow_preparation(size, cursor).unwrap();
@@ -18024,11 +18382,11 @@ pub(crate) mod tests {
         use frankenterm_surface::hyperlink::Rule;
         let mut screen = test_screen(3, 6, 96);
         let attrs = CellAttributes::blank();
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text("abcdef", &attrs, 1, None),
             Line::from_text("xy", &attrs, 1, None),
             Line::new(1),
-        ]);
+        ]));
         let cursor = test_cursor(0, 1, 1);
         let size = test_size(3, 4, 96);
         let mut prepared = screen.capture_reflow_preparation(size, cursor).unwrap();
@@ -18069,9 +18427,11 @@ pub(crate) mod tests {
             "界👩‍💻e\u{301}אב".repeat(5),
         ] {
             let mut screen = test_screen(3, 20, 96);
-            screen.lines = (0..3)
-                .map(|_| Line::from_text(&text, &attrs, 1, None))
-                .collect();
+            screen.lines = Rows::Legacy(
+                (0..3)
+                    .map(|_| Line::from_text(&text, &attrs, 1, None))
+                    .collect(),
+            );
             let mut cursor = test_cursor(0, 0, 1);
             let mut reused = 0;
             for (index, cols) in [7, 19, 11, 23, 7, 19, 11, 23].iter().copied().enumerate() {
@@ -18103,7 +18463,11 @@ pub(crate) mod tests {
                 let rebuilt = screen.rebuild_logical_lines_from_physical(seqno);
                 let logical_text: Vec<_> = rebuilt
                     .iter()
-                    .map(|line| line.line(&screen.lines).as_str().into_owned())
+                    .map(|line| {
+                        line.line(screen.lines.reflow_source())
+                            .as_str()
+                            .into_owned()
+                    })
                     .filter(|line| !line.is_empty())
                     .collect();
                 assert_eq!(
@@ -18113,7 +18477,7 @@ pub(crate) mod tests {
                 );
                 let cache = screen.rewrap_cache.as_ref().unwrap();
                 assert_eq!(cache.source_signature, None);
-                assert!(cache.matches_published_target(&screen.lines));
+                assert!(cache.matches_published_target(screen.lines.reflow_source()));
                 assert!(Arc::ptr_eq(
                     cache.published_target.as_ref().unwrap(),
                     &cache.wrapped_by_key[&key].lines,
@@ -18126,16 +18490,18 @@ pub(crate) mod tests {
     #[test]
     fn published_target_preparation_skips_history_hashes_for_cached_and_unseen_widths() {
         let mut screen = test_screen_with_scorecard(3, 40);
-        screen.lines = (0..16)
-            .map(|index| {
-                Line::from_text(
-                    &format!("{index:02} 界👩‍💻e\u{301} אב abcdefghijklmnopqrstuvwxyz"),
-                    &CellAttributes::blank(),
-                    1,
-                    None,
-                )
-            })
-            .collect();
+        screen.lines = Rows::Legacy(
+            (0..16)
+                .map(|index| {
+                    Line::from_text(
+                        &format!("{index:02} 界👩‍💻e\u{301} אב abcdefghijklmnopqrstuvwxyz"),
+                        &CellAttributes::blank(),
+                        1,
+                        None,
+                    )
+                })
+                .collect(),
+        );
         let mut cursor = test_cursor(2, 2, 1);
         for (index, cols) in [7, 19, 11, 7, 19, 5].iter().copied().enumerate() {
             let size = test_size(3, cols, 96);
@@ -18176,7 +18542,7 @@ pub(crate) mod tests {
                 .rewrap_cache
                 .as_ref()
                 .unwrap()
-                .matches_published_target(&screen.lines));
+                .matches_published_target(screen.lines.reflow_source()));
         }
 
         let cache = Arc::clone(screen.rewrap_cache.as_ref().unwrap());
@@ -18191,29 +18557,31 @@ pub(crate) mod tests {
         }));
         assert!(!cancelled.ready && !cancelled.was_applied());
         assert!(Arc::ptr_eq(&cache, screen.rewrap_cache.as_ref().unwrap()));
-        assert!(cache.matches_published_target(&screen.lines));
+        assert!(cache.matches_published_target(screen.lines.reflow_source()));
         assert_eq!(screen.lines, rows);
     }
 
     #[test]
     fn published_target_rejects_same_seqno_cell_attribute_wrap_order_and_length_changes() {
         let mut seed = test_screen(3, 40, 96);
-        seed.lines = (0..6)
-            .map(|index| {
-                Line::from_text(
-                    &format!("{index:02} abcdefghijklmnopqrstuvwxyz"),
-                    &CellAttributes::blank(),
-                    1,
-                    None,
-                )
-            })
-            .collect();
+        seed.lines = Rows::Legacy(
+            (0..6)
+                .map(|index| {
+                    Line::from_text(
+                        &format!("{index:02} abcdefghijklmnopqrstuvwxyz"),
+                        &CellAttributes::blank(),
+                        1,
+                        None,
+                    )
+                })
+                .collect(),
+        );
         let cursor = seed.resize(test_size(3, 7, 96), test_cursor(0, 2, 1), 2, false);
         assert!(seed
             .rewrap_cache
             .as_ref()
             .unwrap()
-            .matches_published_target(&seed.lines));
+            .matches_published_target(seed.lines.reflow_source()));
         for mutation in 0..6 {
             let mut screen = seed.clone();
             match mutation {
@@ -18226,7 +18594,7 @@ pub(crate) mod tests {
                     screen.lines[0].set_cell(0, Cell::new('0', attrs), 2);
                 }
                 2 => screen.lines[0].set_last_cell_was_wrapped(false, 2),
-                3 => screen.lines.swap(0, 1),
+                3 => screen.lines.legacy_mut().swap(0, 1),
                 4 => {
                     screen.lines.pop_back();
                 }
@@ -18242,7 +18610,7 @@ pub(crate) mod tests {
                 .rewrap_cache
                 .as_ref()
                 .unwrap()
-                .matches_published_target(&screen.lines));
+                .matches_published_target(screen.lines.reflow_source()));
             let mut fresh = screen.clone();
             fresh.rewrap_cache = None;
             fresh.clear_rewrap_line_cache();
@@ -18268,11 +18636,11 @@ pub(crate) mod tests {
                 ..Default::default()
             },
         );
-        screen.lines = VecDeque::from([
+        screen.lines = Rows::Legacy(VecDeque::from([
             Line::from_text("abcdefghijkl", &CellAttributes::blank(), 1, None),
             Line::new(1),
             Line::new(1),
-        ]);
+        ]));
         let cursor = screen.rewrap_lines(
             (3, 1),
             (0, 0),
@@ -18306,9 +18674,11 @@ pub(crate) mod tests {
             Arc::clone(&image),
         )));
         let mut screen = test_screen(3, 10, 96);
-        screen.lines = (0..3)
-            .map(|_| Line::from_text("abcdefghijklmnopqrstuvwx", &attrs, 1, None))
-            .collect();
+        screen.lines = Rows::Legacy(
+            (0..3)
+                .map(|_| Line::from_text("abcdefghijklmnopqrstuvwx", &attrs, 1, None))
+                .collect(),
+        );
         let mut cursor = test_cursor(0, 0, 1);
         let mut prepared = screen
             .capture_reflow_preparation(test_size(3, 8, 96), cursor)
@@ -18363,11 +18733,11 @@ pub(crate) mod tests {
         let mut screen = test_screen(3, 4, 96);
         let attrs = CellAttributes::blank();
 
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text_with_wrapped_last_col("abcd", &attrs, 0),
             Line::from_text("ef", &attrs, 0, None),
             Line::new(0),
-        ]);
+        ]));
 
         let cursor = test_cursor(1, 1, 1);
         let cursor = screen.resize(test_size(3, 3, 96), cursor, 1, false);
@@ -18399,11 +18769,11 @@ pub(crate) mod tests {
     fn rewrap_line_cache_reuses_unchanged_lines_after_partial_mutation() {
         let attrs = CellAttributes::blank();
         let mut screen = test_screen(8, 6, 96);
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text("abcdef", &attrs, 0, None),
             Line::from_text("mnopqr", &attrs, 0, None),
             Line::new(0),
-        ]);
+        ]));
 
         let cursor = test_cursor(0, 1, 1);
         let cursor = screen.resize(test_size(8, 3, 96), cursor, 1, false);
@@ -18458,7 +18828,9 @@ pub(crate) mod tests {
     fn rewrap_shared_lines_materializes_same_as_owned_lines_across_resize() {
         let attrs = CellAttributes::blank();
         let mut seed = test_screen(5, 6, 96);
-        seed.lines = VecDeque::from(vec![Line::from_text("abcdef", &attrs, 0, None)]);
+        seed.lines = Rows::Legacy(VecDeque::from(vec![Line::from_text(
+            "abcdef", &attrs, 0, None,
+        )]));
 
         let mut direct_path = seed.clone();
         let mut shared_path = seed.clone();
@@ -18525,13 +18897,13 @@ pub(crate) mod tests {
         let mut screen = test_screen(4, 6, 96);
         let attrs = CellAttributes::blank();
 
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text_with_wrapped_last_col("abcdefghijkl", &attrs, 0),
             Line::from_text("mnop", &attrs, 0, None),
             Line::from_text_with_wrapped_last_col("qrstuv", &attrs, 0),
             Line::from_text("wxyz", &attrs, 0, None),
             Line::new(0),
-        ]);
+        ]));
 
         let cursor = test_cursor(2, 3, 1);
         let cursor = screen.resize(test_size(4, 4, 96), cursor, 1, false);
@@ -18574,7 +18946,7 @@ pub(crate) mod tests {
         let cursor = test_cursor(2, 3, 1);
 
         let mut cached = test_screen(4, 6, 96);
-        cached.lines = seed_lines;
+        cached.lines = Rows::Legacy(seed_lines);
         let cursor = cached.resize(test_size(4, 4, 96), cursor, 1, false);
         let cursor = cached.resize(test_size(4, 6, 96), cursor, 2, false);
 
@@ -18615,7 +18987,7 @@ pub(crate) mod tests {
     #[test]
     fn prepared_reflow_reserves_all_wrapped_rows_before_cached_materialization() {
         let mut screen = test_screen(4, 8, 96);
-        screen.lines = VecDeque::with_capacity(64);
+        screen.lines = Rows::Legacy(VecDeque::with_capacity(64));
         for _ in 0..48 {
             screen
                 .lines
@@ -18655,7 +19027,7 @@ pub(crate) mod tests {
     #[test]
     fn resize_reserves_configured_capacity_relative_to_live_length() {
         let mut screen = test_screen(4, 8, 96);
-        screen.lines = VecDeque::with_capacity(24);
+        screen.lines = Rows::Legacy(VecDeque::with_capacity(24));
         for _ in 0..4 {
             screen
                 .lines
@@ -18678,14 +19050,14 @@ pub(crate) mod tests {
     fn rebuild_logical_lines_with_signature_and_ranges_matches_standalone_scans() {
         let attrs = CellAttributes::blank();
         let mut screen = test_screen(4, 6, 96);
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text_with_wrapped_last_col("abcdef", &attrs, 0),
             Line::from_text("ghij", &attrs, 0, None),
             Line::from_text("kl", &attrs, 0, None),
-        ]);
+        ]));
 
         let expected_signature = screen.compute_layout_signature();
-        let expected_ranges = Screen::logical_line_physical_ranges(&screen.lines);
+        let expected_ranges = Screen::logical_line_physical_ranges(screen.lines.reflow_source());
         let (logical_lines, fused_signature, fused_ranges) =
             screen.rebuild_logical_lines_from_physical_with_signature_and_ranges(2);
 
@@ -18696,7 +19068,10 @@ pub(crate) mod tests {
             panic!("first-use range must defer its token construction");
         };
         assert!(logical.get().is_none());
-        assert_eq!(logical_lines[0].line(&screen.lines).as_str(), "abcdefghij");
+        assert_eq!(
+            logical_lines[0].line(screen.lines.reflow_source()).as_str(),
+            "abcdefghij"
+        );
         assert!(logical.get().is_some());
         assert!(matches!(
             logical_lines[1],
@@ -18708,12 +19083,12 @@ pub(crate) mod tests {
     fn resize_reflow_moves_unwrapped_physical_lines_without_clone() {
         let attrs = CellAttributes::blank();
         let mut screen = test_screen(4, 6, 96);
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text("aa", &attrs, 0, None),
             Line::from_text("abcdef", &attrs, 0, None),
             Line::from_text("zz", &attrs, 0, None),
             Line::new(0),
-        ]);
+        ]));
 
         let logical_lines = screen.rebuild_logical_lines_from_physical(2);
         assert!(matches!(
@@ -18765,7 +19140,7 @@ pub(crate) mod tests {
         let mut screen = test_screen(4, 4, 96);
         let attrs = CellAttributes::blank();
 
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text("l0", &attrs, 0, None),
             Line::from_text("l1", &attrs, 0, None),
             Line::from_text_with_wrapped_last_col("l2a", &attrs, 0),
@@ -18778,9 +19153,10 @@ pub(crate) mod tests {
             Line::from_text("l7", &attrs, 0, None),
             Line::from_text("l8", &attrs, 0, None),
             Line::from_text("l9", &attrs, 0, None),
-        ]);
+        ]));
 
-        let logical_count = Screen::logical_line_physical_ranges(&screen.lines).len();
+        let logical_count =
+            Screen::logical_line_physical_ranges(screen.lines.reflow_source()).len();
         assert_eq!(logical_count, 10);
 
         let plan = screen.build_viewport_reflow_plan_for_current_snapshot(logical_count);
@@ -18801,12 +19177,13 @@ pub(crate) mod tests {
     fn viewport_first_reflow_records_ready_before_cold_scrollback_completion() {
         let mut screen = test_screen(3, 8, 96);
         let attrs = CellAttributes::blank();
-        screen.lines = VecDeque::from(
+        screen.lines = Rows::Legacy(VecDeque::from(
             (0..12)
                 .map(|idx| Line::from_text(&format!("line{idx:02}xx"), &attrs, 0, None))
                 .collect::<Vec<_>>(),
-        );
-        let logical_count = Screen::logical_line_physical_ranges(&screen.lines).len();
+        ));
+        let logical_count =
+            Screen::logical_line_physical_ranges(screen.lines.reflow_source()).len();
         let plan = screen.build_viewport_reflow_plan_for_current_snapshot(logical_count);
         assert!(
             plan.batches
@@ -18870,11 +19247,11 @@ pub(crate) mod tests {
 
         let mut screen = test_screen(4, 8, 96);
         let attrs = CellAttributes::blank();
-        screen.lines = VecDeque::from(
+        screen.lines = Rows::Legacy(VecDeque::from(
             (0..4)
                 .map(|_| Line::from_text("abcdefgh", &attrs, 0, None))
                 .collect::<Vec<_>>(),
-        );
+        ));
         let _ = screen.logical_wraps_for_resize(4, 2, true, &|| false);
         let (_, _, _, wrap_cache_hit, _) = screen
             .logical_wraps_for_resize(4, 2, true, &|| false)
@@ -18889,11 +19266,11 @@ pub(crate) mod tests {
     fn viewport_first_reflow_records_last_viewport_first_reflow_us() {
         let mut screen = test_screen(3, 8, 96);
         let attrs = CellAttributes::blank();
-        screen.lines = VecDeque::from(
+        screen.lines = Rows::Legacy(VecDeque::from(
             (0..12)
                 .map(|idx| Line::from_text(&format!("line{idx:02}xx"), &attrs, 0, None))
                 .collect::<Vec<_>>(),
-        );
+        ));
 
         // Sentinel the field with a value the real recording — bounded by the
         // resize wall-clock window — can never legitimately produce, so the
@@ -18923,7 +19300,7 @@ pub(crate) mod tests {
     fn viewport_first_reflow_is_isomorphic_to_full_scan() {
         let mut screen = test_screen(3, 8, 96);
         let attrs = CellAttributes::blank();
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text("cold0000", &attrs, 0, None),
             Line::from_text("cold1111", &attrs, 0, None),
             Line::from_text("near2222", &attrs, 0, None),
@@ -18931,7 +19308,7 @@ pub(crate) mod tests {
             Line::from_text("view4444", &attrs, 0, None),
             Line::from_text("view5555", &attrs, 0, None),
             Line::from_text("view6666", &attrs, 0, None),
-        ]);
+        ]));
 
         let logical_lines = screen.rebuild_logical_lines_from_physical(2);
         let logical_count = logical_lines.len();
@@ -18971,7 +19348,7 @@ pub(crate) mod tests {
                 .map(|slot| {
                     slot.as_ref()
                         .expect("missing rewrap scratch slot")
-                        .shared_chunk(&screen.lines)
+                        .shared_chunk(screen.lines.reflow_source())
                         .iter()
                         .map(|line| {
                             (
@@ -18997,16 +19374,17 @@ pub(crate) mod tests {
         let mut screen = test_screen(3, 5, 96);
         let attrs = CellAttributes::blank();
 
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text("aa", &attrs, 0, None),
             Line::from_text_with_wrapped_last_col("bbbb", &attrs, 0),
             Line::from_text("cccc", &attrs, 0, None),
             Line::from_text("dd", &attrs, 0, None),
             Line::from_text("ee", &attrs, 0, None),
             Line::from_text("ff", &attrs, 0, None),
-        ]);
+        ]));
 
-        let logical_count = Screen::logical_line_physical_ranges(&screen.lines).len();
+        let logical_count =
+            Screen::logical_line_physical_ranges(screen.lines.reflow_source()).len();
         let first = screen.build_viewport_reflow_plan_for_current_snapshot(logical_count);
         let second = screen.build_viewport_reflow_plan_for_current_snapshot(logical_count);
 
@@ -19095,11 +19473,11 @@ pub(crate) mod tests {
     fn last_good_frame_tracks_resize_begin_and_commit_lineage() {
         let mut screen = test_screen(3, 4, 96);
         let attrs = CellAttributes::blank();
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text("abcd", &attrs, 0, None),
             Line::from_text("efgh", &attrs, 0, None),
             Line::from_text("ijkl", &attrs, 0, None),
-        ]);
+        ]));
 
         let cursor = test_cursor(1, 2, 7);
         let _ = screen.resize(test_size(3, 3, 96), cursor, 8, false);
@@ -19130,10 +19508,10 @@ pub(crate) mod tests {
     fn last_good_frame_invalidates_on_content_mutation() {
         let mut screen = test_screen(2, 4, 96);
         let attrs = CellAttributes::blank();
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text("abcd", &attrs, 0, None),
             Line::from_text("wxyz", &attrs, 0, None),
-        ]);
+        ]));
 
         let cursor = test_cursor(0, 1, 1);
         let _ = screen.resize(test_size(2, 3, 96), cursor, 2, false);
@@ -19157,12 +19535,12 @@ pub(crate) mod tests {
     fn last_good_frame_drops_snapshot_when_budget_exceeded() {
         let mut screen = test_screen(1, 2, 96);
         let attrs = CellAttributes::blank();
-        screen.lines = VecDeque::from(vec![Line::from_text(
+        screen.lines = Rows::Legacy(VecDeque::from(vec![Line::from_text(
             "this line is intentionally oversized relative to viewport budget",
             &attrs,
             0,
             None,
-        )]);
+        )]));
 
         let estimated = Screen::estimate_frame_bytes(&screen.visible_frame_snapshot());
         let budget = screen.retained_frame_byte_budget();
@@ -19179,11 +19557,11 @@ pub(crate) mod tests {
     fn last_good_frame_rolls_back_after_forced_resize_commit_failure() {
         let mut screen = test_screen(3, 4, 96);
         let attrs = CellAttributes::blank();
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text("abcd", &attrs, 0, None),
             Line::from_text("efgh", &attrs, 0, None),
             Line::from_text("ijkl", &attrs, 0, None),
-        ]);
+        ]));
 
         let cursor = test_cursor(1, 1, 10);
         let before_lines: Vec<String> = screen
@@ -19228,11 +19606,11 @@ pub(crate) mod tests {
         let target = test_size(4, 3, 144);
 
         let mut direct = test_screen(3, 4, 96);
-        direct.lines = seed_lines.clone();
+        direct.lines = Rows::Legacy(seed_lines.clone());
         let direct_cursor = direct.resize(target, cursor, 11, false);
 
         let mut fallback_then_retry = test_screen(3, 4, 96);
-        fallback_then_retry.lines = seed_lines;
+        fallback_then_retry.lines = Rows::Legacy(seed_lines);
         fallback_then_retry
             .force_resize_commit_rollback(LastGoodFrameRollbackCause::ForcedFailureInjection);
         let fallback_cursor = fallback_then_retry.resize(target, cursor, 11, false);
@@ -19300,12 +19678,12 @@ pub(crate) mod tests {
     fn cursor_consistency_telemetry_records_passes_on_rewrap() {
         let mut screen = test_screen(4, 6, 96);
         let attrs = CellAttributes::blank();
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text_with_wrapped_last_col("abcdef", &attrs, 0),
             Line::from_text("ghij", &attrs, 0, None),
             Line::from_text("klmn", &attrs, 0, None),
             Line::new(0),
-        ]);
+        ]));
 
         let cursor = test_cursor(2, 2, 1);
         let _ = screen.resize(test_size(4, 4, 96), cursor, 1, false);
@@ -19370,7 +19748,7 @@ pub(crate) mod tests {
     fn read_only_physical_lines_handles_wrapped_ring_storage() {
         let mut screen = test_screen(2, 4, 96);
         let attrs = CellAttributes::blank();
-        screen.lines = VecDeque::with_capacity(4);
+        screen.lines = Rows::Legacy(VecDeque::with_capacity(4));
         for text in ["a", "b", "c", "d"] {
             screen
                 .lines
@@ -19383,7 +19761,7 @@ pub(crate) mod tests {
                 .lines
                 .push_back(Line::from_text(text, &attrs, 1, None));
         }
-        let (first, second) = screen.lines.as_slices();
+        let (first, second) = screen.lines.legacy_slices().expect("legacy rows");
         assert!(!first.is_empty() && !second.is_empty());
 
         for (range, expected) in [
@@ -19411,10 +19789,10 @@ pub(crate) mod tests {
         let source = Line::from_text("ab界e\u{301}🚀z   ", &CellAttributes::default(), 1, None);
         let compact = Line::try_compact_logical_rows(core::iter::once(&source), 1).unwrap();
         let mut screen = test_screen(1, 64, 96);
-        screen.lines = VecDeque::from([compact.clone()]);
+        screen.lines = Rows::Legacy(VecDeque::from([compact.clone()]));
         // Cover the cursor on text and past the final retained nonblank cell.
         for logical_x in [2, source.len() + 2] {
-            screen.lines = VecDeque::from([compact.clone()]);
+            screen.lines = Rows::Legacy(VecDeque::from([compact.clone()]));
             screen.physical_cols = 64;
             screen.rewrap_cache = Some(Arc::new(LogicalLineWrapCache::with_token_budget(
                 Some(screen.compute_layout_signature()),
@@ -19450,12 +19828,12 @@ pub(crate) mod tests {
     #[test]
     fn reflow_cursor_tracks_actual_wide_grapheme_rows() {
         let mut screen = test_screen(1, 6, 96);
-        screen.lines = VecDeque::from([Line::from_text(
+        screen.lines = Rows::Legacy(VecDeque::from([Line::from_text(
             "界界界",
             &CellAttributes::default(),
             1,
             None,
-        )]);
+        )]));
         // The cursor is on the third grapheme, not its trailing spacer.
         let mut cursor = (4, 0);
         for cols in [3, 5, 2, 4, 6, 3] {
@@ -19487,12 +19865,12 @@ pub(crate) mod tests {
     fn resize_returns_cursor_position() {
         let mut screen = test_screen(4, 6, 96);
         let attrs = CellAttributes::blank();
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text("aaa", &attrs, 0, None),
             Line::from_text("bbb", &attrs, 0, None),
             Line::from_text("ccc", &attrs, 0, None),
             Line::from_text("ddd", &attrs, 0, None),
-        ]);
+        ]));
 
         let cursor = test_cursor(2, 1, 1);
         let new_cursor = screen.resize(test_size(4, 8, 96), cursor, 1, false);
@@ -19509,10 +19887,10 @@ pub(crate) mod tests {
     fn resize_same_dimensions_preserves_content() {
         let mut screen = test_screen(2, 4, 96);
         let attrs = CellAttributes::blank();
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text("abcd", &attrs, 0, None),
             Line::from_text("efgh", &attrs, 0, None),
-        ]);
+        ]));
 
         let before: Vec<String> = screen
             .visible_lines()
@@ -19535,10 +19913,10 @@ pub(crate) mod tests {
     fn resize_grow_adds_visible_lines() {
         let mut screen = test_screen(2, 4, 96);
         let attrs = CellAttributes::blank();
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text("abcd", &attrs, 0, None),
             Line::from_text("efgh", &attrs, 0, None),
-        ]);
+        ]));
 
         let cursor = test_cursor(0, 0, 1);
         let _ = screen.resize(test_size(4, 4, 96), cursor, 1, false);
@@ -20313,11 +20691,11 @@ pub(crate) mod tests {
     fn multiple_resizes_preserve_rewrap_cache_integrity() {
         let mut screen = test_screen(3, 6, 96);
         let attrs = CellAttributes::blank();
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text_with_wrapped_last_col("abcdef", &attrs, 0),
             Line::from_text("ghij", &attrs, 0, None),
             Line::from_text("klmn", &attrs, 0, None),
-        ]);
+        ]));
 
         let cursor = test_cursor(0, 0, 1);
         // Resize through multiple widths
@@ -20337,10 +20715,10 @@ pub(crate) mod tests {
     fn last_good_frame_lifecycle_capture_count_increases_per_resize() {
         let mut screen = test_screen(2, 4, 96);
         let attrs = CellAttributes::blank();
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text("abcd", &attrs, 0, None),
             Line::from_text("efgh", &attrs, 0, None),
-        ]);
+        ]));
 
         let cursor = test_cursor(0, 0, 1);
         let cursor = screen.resize(test_size(2, 3, 96), cursor, 1, false);
@@ -20363,11 +20741,11 @@ pub(crate) mod tests {
     fn config_change_recomputes_cached_wraps_under_current_policy() {
         let mut screen = test_screen(3, 10, 96);
         let attrs = CellAttributes::blank();
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text_with_wrapped_last_col("abcdefghij", &attrs, 1),
             Line::from_text_with_wrapped_last_col("klmnopqrst", &attrs, 1),
             Line::from_text("uvwx", &attrs, 1, None),
-        ]);
+        ]));
         let mut cursor = test_cursor(0, 0, 1);
         for (seqno, cols) in [(2, 8), (3, 5), (4, 8)] {
             cursor = screen.resize(test_size(3, cols, 96), cursor, seqno, false);
@@ -20443,7 +20821,7 @@ pub(crate) mod tests {
     fn cached_width_restores_its_readability_scorecard_and_gate_payload() {
         let mut screen = test_screen_with_scorecard(3, 20);
         let attrs = CellAttributes::blank();
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text(
                 "alpha beta gamma delta epsilon zeta eta theta",
                 &attrs,
@@ -20452,7 +20830,7 @@ pub(crate) mod tests {
             ),
             Line::from_text("one two three four five six seven eight", &attrs, 1, None),
             Line::new(1),
-        ]);
+        ]));
         let mut cursor = screen.resize(test_size(3, 8, 96), test_cursor(0, 0, 1), 2, false);
         let narrow_scorecard = screen.last_resize_wrap_scorecard.clone();
         let narrow_payload = screen.last_resize_wrap_gate_payload.clone();
@@ -20479,11 +20857,11 @@ pub(crate) mod tests {
         let attrs = CellAttributes::blank();
 
         // Insert a line that will wrap (longer than 10 cols)
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text_with_wrapped_last_col("abcdefghijklmnop", &attrs, 0),
             Line::from_text("rest", &attrs, 0, None),
             Line::new(0),
-        ]);
+        ]));
 
         let cursor = test_cursor(0, 0, 1);
         let _ = screen.resize(test_size(3, 8, 96), cursor, 1, false);
@@ -20505,11 +20883,11 @@ pub(crate) mod tests {
         let mut screen = test_screen(3, 10, 96);
         let attrs = CellAttributes::blank();
 
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text_with_wrapped_last_col("abcdefghijklmnop", &attrs, 0),
             Line::from_text("rest", &attrs, 0, None),
             Line::new(0),
-        ]);
+        ]));
 
         let cursor = test_cursor(0, 0, 1);
         let _ = screen.resize(test_size(3, 8, 96), cursor, 1, false);
@@ -20805,13 +21183,13 @@ pub(crate) mod tests {
         let mut screen = test_screen_with_scorecard(5, 40);
         let attrs = CellAttributes::blank();
 
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text("fn main() {", &attrs, 0, None),
             Line::from_text("    println!(\"hello\");", &attrs, 0, None),
             Line::from_text("}", &attrs, 0, None),
             Line::new(0),
             Line::new(0),
-        ]);
+        ]));
 
         let cursor = test_cursor(0, 3, 1);
         let _ = screen.resize(test_size(5, 30, 96), cursor, 1, false);
@@ -20835,11 +21213,11 @@ pub(crate) mod tests {
 
         // Create a wide line that will definitely wrap
         let wide_line = "x".repeat(100);
-        screen.lines = VecDeque::from(vec![
+        screen.lines = Rows::Legacy(VecDeque::from(vec![
             Line::from_text_with_wrapped_last_col(&wide_line, &attrs, 0),
             Line::new(0),
             Line::new(0),
-        ]);
+        ]));
 
         let cursor = test_cursor(0, 0, 1);
         let _ = screen.resize(test_size(3, 20, 96), cursor, 1, false);

@@ -237,6 +237,37 @@ fn log_bench_line(corpus: Corpus, run: &LaneRun) {
     );
 }
 
+/// ft-yccm0.3.3.4: the corpora the page engine's first slice covers natively
+/// end with the screen's rows still in pages, so the `term_page` lane
+/// measures the page engine rather than a fallback to legacy storage. (Every
+/// lane leaving the same grid as `term` is checked below.)
+#[test]
+fn term_page_lane_stays_on_pages_for_the_hot_path_corpora() {
+    use frankenterm_term::config::GridEngine;
+    let geometry = Geometry::default();
+    for corpus in [
+        Corpus::SeqLines,
+        Corpus::ColorRandom,
+        Corpus::ColorEmojiRandom,
+        Corpus::LongLines,
+    ] {
+        let data = corpus.generate(SMOKE_SIZE, DEFAULT_SEED);
+        let run = lanes::run_lane(Lane::TermPage, &[], &data, &geometry);
+        let terminal = run.terminal.as_ref().expect("term_page drives a terminal");
+        assert_eq!(
+            terminal.screen().grid_engine(),
+            GridEngine::Page,
+            "{}",
+            corpus.name()
+        );
+    }
+    let legacy = lanes::run_lane(Lane::Term, &[], b"x", &geometry);
+    assert_eq!(
+        legacy.terminal.expect("a terminal").screen().grid_engine(),
+        GridEngine::Legacy
+    );
+}
+
 #[test]
 fn every_lane_keeps_the_grid_invariants_on_every_corpus() {
     let geometry = Geometry::default();
@@ -587,7 +618,10 @@ fn each_lane_run_becomes_one_json_line_with_the_required_fields() {
         assert_eq!(record["cursor_x"].is_null(), lane == Lane::Parse, "{line}");
         // The fused lanes apply as they parse and count no actions, like term
         // (ft-yccm0.3.2.1).
-        let counts_actions = !matches!(lane, Lane::Term | Lane::MuxFused | Lane::ProdConfigFused);
+        let counts_actions = !matches!(
+            lane,
+            Lane::Term | Lane::TermPage | Lane::MuxFused | Lane::ProdConfigFused
+        );
         assert_eq!(record["actions"].is_null(), !counts_actions, "{line}");
     }
 }

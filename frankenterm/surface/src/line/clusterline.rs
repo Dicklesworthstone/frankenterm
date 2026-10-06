@@ -66,6 +66,15 @@ fn breaks_between(prev: Option<char>, next: char) -> bool {
     prev.is_none_or(|prev| is_cluster_inert(prev) && is_cluster_inert(next))
 }
 
+/// The rule clustered storage appends by: whether a cell starting with
+/// `next` may follow one ending in `prev` (`None` at the start of the line)
+/// without the two clustering into one grapheme. The PageGrid engine
+/// mirrors which rows stay clustered with it (ft-yccm0.3.3.4).
+#[doc(hidden)]
+pub fn clustered_append_breaks(prev: Option<char>, next: char) -> bool {
+    breaks_between(prev, next)
+}
+
 /// Stores line data as a contiguous string and a series of
 /// clusters of attribute data describing attributed ranges
 /// within the line

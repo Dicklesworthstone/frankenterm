@@ -7,6 +7,7 @@ use std::time::Duration;
 use frankenterm_escape_parser::parser::{AsciiScan, Parser};
 use frankenterm_escape_parser::{Action, ControlCode, Esc, EscCode};
 use frankenterm_term::color::ColorPalette;
+use frankenterm_term::config::GridEngine;
 use frankenterm_term::{Clipboard, FeedGate, Terminal, TerminalConfiguration, TerminalSize};
 
 use super::snapshot::{self, EngineSnapshot};
@@ -78,11 +79,18 @@ pub trait EngineFactory {
 #[derive(Debug)]
 struct HarnessConfig {
     scrollback: usize,
+    /// Pinned, so `FT_GRID_ENGINE` in the environment never changes which
+    /// engine an oracle or candidate runs.
+    grid_engine: GridEngine,
 }
 
 impl TerminalConfiguration for HarnessConfig {
     fn scrollback_size(&self) -> usize {
         self.scrollback
+    }
+
+    fn grid_engine(&self) -> GridEngine {
+        self.grid_engine
     }
 
     fn color_palette(&self) -> ColorPalette {
@@ -95,6 +103,11 @@ pub fn new_terminal(geometry: &Geometry) -> Terminal {
 }
 
 pub fn new_terminal_with(geometry: &Geometry, io: EngineIo) -> Terminal {
+    new_terminal_on(geometry, io, GridEngine::Legacy)
+}
+
+/// A terminal whose screen rows use `grid_engine`.
+pub fn new_terminal_on(geometry: &Geometry, io: EngineIo, grid_engine: GridEngine) -> Terminal {
     let mut terminal = Terminal::new(
         TerminalSize {
             rows: geometry.rows,
@@ -105,6 +118,7 @@ pub fn new_terminal_with(geometry: &Geometry, io: EngineIo) -> Terminal {
         },
         Arc::new(HarnessConfig {
             scrollback: geometry.scrollback,
+            grid_engine,
         }),
         "frankenterm-differential",
         "0",
@@ -306,6 +320,24 @@ impl EngineFactory for FusedFeed {
     }
 }
 
+/// The legacy oracle's path with the screen's rows in PageGrid pages
+/// (ft-yccm0.3.3.4): `advance_bytes` into a page-engine terminal. Hot paths
+/// write pages natively; everything else goes through legacy `Line` views,
+/// so every corpus compares the page engine against legacy rows.
+pub struct PageGrid;
+
+impl EngineFactory for PageGrid {
+    fn name(&self) -> &'static str {
+        "page_grid"
+    }
+
+    fn build_with(&self, geometry: &Geometry, io: EngineIo) -> Box<dyn Engine> {
+        Box::new(LegacyEngine {
+            terminal: new_terminal_on(geometry, io, GridEngine::Page),
+        })
+    }
+}
+
 /// Every candidate checked against [`Legacy`]. The fused parser (B2), the
 /// SIMD scanner (B2.2/B2.3) and the page grid (B3) register here when they
 /// land; nothing else in the harness changes.
@@ -357,5 +389,7 @@ pub fn candidates() -> Vec<Box<dyn EngineFactory>> {
             ascii_scan: None,
             scalar_utf8: true,
         }),
+        // ft-yccm0.3.3.4: the page engine.
+        Box::new(PageGrid),
     ]
 }

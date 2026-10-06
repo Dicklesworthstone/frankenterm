@@ -1561,6 +1561,36 @@ pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
     fn log_unknown_escape_sequences(&self) -> bool {
         false
     }
+
+    /// The storage for the screen's rows (ft-yccm0.3.3.4): legacy `Line`s,
+    /// or PageGrid pages. By default `FT_GRID_ENGINE=page` selects pages and
+    /// anything else, or no value, legacy. A screen reads this once, when it
+    /// is built.
+    fn grid_engine(&self) -> GridEngine {
+        GridEngine::from_env()
+    }
+}
+
+/// The storage for a screen's rows; see
+/// [`TerminalConfiguration::grid_engine`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GridEngine {
+    /// A `Line` per row: the oracle, and the default until the flip (B3.9).
+    #[default]
+    Legacy,
+    /// PageGrid pages, with legacy `Line` views for readers.
+    Page,
+}
+
+impl GridEngine {
+    /// `FT_GRID_ENGINE`: `page` (any case) selects pages; anything else,
+    /// or no value, legacy.
+    pub fn from_env() -> Self {
+        match std::env::var("FT_GRID_ENGINE") {
+            Ok(value) if value.trim().eq_ignore_ascii_case("page") => GridEngine::Page,
+            _ => GridEngine::Legacy,
+        }
+    }
 }
 impl_downcast!(TerminalConfiguration);
 

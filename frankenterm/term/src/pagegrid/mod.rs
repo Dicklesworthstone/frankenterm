@@ -16,8 +16,10 @@ pub mod links;
 pub mod list;
 #[cfg(test)]
 mod list_tests;
+pub mod native;
 pub mod page;
 pub mod row;
+pub mod rows;
 pub mod style;
 #[cfg(test)]
 mod tests;

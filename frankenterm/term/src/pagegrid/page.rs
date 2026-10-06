@@ -510,6 +510,44 @@ impl Page {
         self.set_header(row, header.with_flags(flags & RowHeader::LINE_FLAGS, on));
     }
 
+    /// Sets or clears the wrapped bit of the cells `from..len`: legacy's
+    /// `set_last_cell_was_wrapped`, given the last visible cell (which owns
+    /// any hidden cells after it). Bumps the seqno.
+    pub fn set_wrapped_from(&mut self, row: u32, from: usize, wrapped: bool, seqno: SequenceNo) {
+        let header = self.header(row);
+        let slot = header.slot();
+        for x in from..header.len() {
+            let cell = self.cell_at(slot, x);
+            self.set_cell_at(slot, x, cell.with_wrapped(wrapped));
+        }
+        self.set_header(row, header.with_flags(RowHeader::DIRTY, true));
+        self.touch(slot, seqno);
+        self.debug_check_row(row);
+    }
+
+    /// Legacy vector storage's `prune_trailing_blanks`: trailing default
+    /// blank cells are dropped, but a wide cell keeps its placeholder.
+    /// Bumps the seqno only when the row shrinks.
+    pub fn prune_trailing_blanks(&mut self, row: u32, seqno: SequenceNo) {
+        let header = self.header(row);
+        let slot = header.slot();
+        let len = header.len();
+        let new_len = (0..len)
+            .rev()
+            .find(|&x| self.cell_at(slot, x).with_hidden(false) != PackedCell::BLANK)
+            .map_or(0, |x| {
+                let width = if self.cell_at(slot, x).is_wide() {
+                    2
+                } else {
+                    1
+                };
+                (x + width).min(len)
+            });
+        if new_len < len {
+            self.resize_row(row, new_len, seqno);
+        }
+    }
+
     /// Renderer consume-and-clear of the row's dirty flag.
     pub fn take_dirty(&mut self, row: u32) -> bool {
         let header = self.header(row);

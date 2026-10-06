@@ -7,6 +7,8 @@ mod test;
 mod vecstorage;
 
 pub use cellref::CellRef;
+#[doc(hidden)]
+pub use clusterline::clustered_append_breaks;
 pub use line::{
     DoubleClickRange, Line, LineWrapGeometry, LineWrapGeometryJoinError, LineWrapLayout,
     LineWrapReport, LineWrapScorecard, LineWrapWidthPrefixScratch, MonospaceKpCostModel,

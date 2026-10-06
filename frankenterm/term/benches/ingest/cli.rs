@@ -23,7 +23,7 @@ or run every lane through cargo bench, whose [profile.bench] mirrors release-per
 
 Options:
   --lane L          parse | term | mux_two_stage | prod_config | mux_fused |
-                    prod_config_fused | all (default all);
+                    prod_config_fused | term_page | all (default all);
                     comma-separated lists are accepted
   --corpus C        color_emoji_random (default) | color_random | seq_lines |
                     long_lines | unicode_mix | tui_repaint | all; comma-separated

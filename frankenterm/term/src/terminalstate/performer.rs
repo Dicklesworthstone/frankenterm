@@ -826,7 +826,8 @@ impl<'a> Performer<'a> {
                     .map(|cell| makes_sense_to_wrap(cell.str()))
                     .unwrap_or(false);
             if should_mark_wrapped {
-                screen.line_mut(y).set_last_cell_was_wrapped(true, seqno);
+                // Natively on page-engine rows (ft-yccm0.3.3.4).
+                screen.set_last_cell_was_wrapped(y, true, seqno);
             }
         }
         self.new_line(true);

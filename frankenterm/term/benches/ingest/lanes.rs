@@ -30,7 +30,8 @@ use frankenterm_escape_parser::{Action, ControlCode, Esc, EscCode, CSI};
 use frankenterm_surface::line::MonospaceKpCostModel;
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::config::{
-    BidiMode, NewlineCanon, Osc52WritePolicy, ScrollbackTierConfig, TerminalConfigurationRevision,
+    BidiMode, GridEngine, NewlineCanon, Osc52WritePolicy, ScrollbackTierConfig,
+    TerminalConfigurationRevision,
 };
 use frankenterm_term::{FeedGate, Terminal, TerminalConfiguration, TerminalSize};
 
@@ -42,16 +43,20 @@ pub enum Lane {
     ProdConfig,
     MuxFused,
     ProdConfigFused,
+    /// The `term` lane with the screen's rows in PageGrid pages
+    /// (ft-yccm0.3.3.4, `FT_GRID_ENGINE=page`).
+    TermPage,
 }
 
 impl Lane {
-    pub const ALL: [Lane; 6] = [
+    pub const ALL: [Lane; 7] = [
         Lane::Parse,
         Lane::Term,
         Lane::MuxTwoStage,
         Lane::ProdConfig,
         Lane::MuxFused,
         Lane::ProdConfigFused,
+        Lane::TermPage,
     ];
 
     pub fn name(self) -> &'static str {
@@ -62,6 +67,7 @@ impl Lane {
             Lane::ProdConfig => "prod_config",
             Lane::MuxFused => "mux_fused",
             Lane::ProdConfigFused => "prod_config_fused",
+            Lane::TermPage => "term_page",
         }
     }
 
@@ -107,17 +113,30 @@ impl Default for Geometry {
 #[derive(Debug)]
 pub struct BenchConfig {
     scrollback: usize,
+    grid_engine: GridEngine,
 }
 
 impl BenchConfig {
+    /// The grid engine `FT_GRID_ENGINE` selects (legacy by default).
     pub fn new(scrollback: usize) -> Self {
-        Self { scrollback }
+        Self::with_grid_engine(scrollback, GridEngine::from_env())
+    }
+
+    pub fn with_grid_engine(scrollback: usize, grid_engine: GridEngine) -> Self {
+        Self {
+            scrollback,
+            grid_engine,
+        }
     }
 }
 
 impl TerminalConfiguration for BenchConfig {
     fn scrollback_size(&self) -> usize {
         self.scrollback
+    }
+
+    fn grid_engine(&self) -> GridEngine {
+        self.grid_engine
     }
 
     fn color_palette(&self) -> ColorPalette {
@@ -299,6 +318,11 @@ impl TerminalConfiguration for ProdConfig {
 pub fn new_terminal(lane: Lane, geometry: &Geometry) -> Terminal {
     let config: Arc<dyn TerminalConfiguration + Send + Sync> = if lane.uses_prod_config() {
         Arc::new(ProdConfig::new(geometry.scrollback))
+    } else if lane == Lane::TermPage {
+        Arc::new(BenchConfig::with_grid_engine(
+            geometry.scrollback,
+            GridEngine::Page,
+        ))
     } else {
         Arc::new(BenchConfig::new(geometry.scrollback))
     };
@@ -415,7 +439,7 @@ pub fn run_lane(lane: Lane, prelude: &[u8], data: &[u8], geometry: &Geometry) ->
                 terminal: None,
             }
         }
-        Lane::Term => {
+        Lane::Term | Lane::TermPage => {
             let mut terminal = new_terminal(lane, geometry);
             if !prelude.is_empty() {
                 terminal.advance_bytes(prelude);
