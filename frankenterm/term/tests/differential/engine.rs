@@ -123,7 +123,10 @@ pub fn drain_replies(terminal: &mut Terminal) {
         .expect("the terminal writer drains within 10 s");
 }
 
-/// The oracle: `Terminal::advance_bytes`, the fused single-stage path.
+/// The oracle: `Terminal::advance_bytes`, the fused single-stage path. Since
+/// ft-yccm0.3.2.1 its parser drives the performer through `Handler`, with no
+/// `Action` values in between; the two-stage candidates below keep the
+/// `Action` path, so every check compares the two.
 pub struct Legacy;
 
 struct LegacyEngine {

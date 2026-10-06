@@ -15,6 +15,7 @@ use frankenterm_escape_parser::osc::{
     ChangeColorPair, ColorOrQuery, FinalTermSemanticPrompt, ITermProprietary,
     ITermUnicodeVersionOp, Selection,
 };
+use frankenterm_escape_parser::parser::Handler;
 use frankenterm_escape_parser::{
     Action, ControlCode, DeviceControlMode, Esc, EscCode, OperatingSystemCommand, CSI,
 };
@@ -274,6 +275,31 @@ impl<'a> DerefMut for Performer<'a> {
 impl<'a> Drop for Performer<'a> {
     fn drop(&mut self) {
         self.flush_print();
+    }
+}
+
+/// The fused path (ft-yccm0.3.2.1): the parser calls the performer directly,
+/// with no `Action` collected in between. A printable run arrives borrowed
+/// and goes straight into the print buffer, with no `String` per run. Every
+/// other action goes through [`Performer::perform`], exactly as the `Action`
+/// path applies it.
+impl<'a> Handler for Performer<'a> {
+    #[inline]
+    fn action(&mut self, action: Action) {
+        self.perform(action);
+    }
+
+    /// What `perform` does for `Action::Print`: only buffering, so the
+    /// `last_printed` shortcut stays valid.
+    #[inline]
+    fn print(&mut self, c: char) {
+        Performer::print(self, c);
+    }
+
+    /// What `perform` does for `Action::PrintString`.
+    #[inline]
+    fn print_str(&mut self, text: &str) {
+        self.print_string(text);
     }
 }
 

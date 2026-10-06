@@ -694,7 +694,7 @@ impl VTParser {
         }
     }
 
-    fn action(&mut self, action: Action, param: u8, actor: &mut dyn VTActor) {
+    fn action<A: VTActor + ?Sized>(&mut self, action: Action, param: u8, actor: &mut A) {
         match action {
             Action::None | Action::Ignore => {}
             Action::Print => actor.print(param as char),
@@ -871,7 +871,7 @@ impl VTParser {
 
     /// Begins a UTF-8 sequence at `lead` in the ground or OSC string state.
     /// A byte that cannot start a sequence is a maximal subpart on its own.
-    fn start_utf8(&mut self, actor: &mut dyn VTActor, lead: u8) {
+    fn start_utf8<A: VTActor + ?Sized>(&mut self, actor: &mut A, lead: u8) {
         let len = utf8_sequence_len(lead);
         if len == 0 {
             let state = self.state;
@@ -890,7 +890,7 @@ impl VTParser {
     /// continue it ends the sequence with one U+FFFD for the bytes so far
     /// (a maximal subpart) and is then parsed afresh, so a character, an
     /// ESC or an OSC terminator after a broken sequence is never lost.
-    fn next_utf8(&mut self, actor: &mut dyn VTActor, byte: u8) {
+    fn next_utf8<A: VTActor + ?Sized>(&mut self, actor: &mut A, byte: u8) {
         let second = self.utf8_remaining + 1 == utf8_sequence_len(self.utf8_lead);
         let (low, high) = if second {
             utf8_second_byte_range(self.utf8_lead)
@@ -914,7 +914,7 @@ impl VTParser {
 
     /// Hands a decoded character to the state the sequence began in and
     /// returns there.
-    fn deliver_utf8(&mut self, actor: &mut dyn VTActor, return_state: State, c: char) {
+    fn deliver_utf8<A: VTActor + ?Sized>(&mut self, actor: &mut A, return_state: State, c: char) {
         // Slightly gross special cases C1 controls that were
         // encoded as UTF-8 rather than emitted as raw 8-bit.
         // If the decoded value is in the byte range, and that
@@ -949,9 +949,11 @@ impl VTParser {
     }
 
     /// Parse a single byte.  This may result in a call to one of the
-    /// methods on the provided `actor`.
+    /// methods on the provided `actor`. The parser is generic over the
+    /// actor, so a concrete actor is called statically, with no dynamic
+    /// dispatch per byte; `&mut dyn VTActor` still works.
     #[inline(always)]
-    pub fn parse_byte(&mut self, byte: u8, actor: &mut dyn VTActor) {
+    pub fn parse_byte<A: VTActor + ?Sized>(&mut self, byte: u8, actor: &mut A) {
         // While a UTF-8 sequence is open, bytes go to the decoder, which
         // returns to the state the sequence began in when it ends.
         if self.state == State::Utf8Sequence {
@@ -983,7 +985,7 @@ impl VTParser {
     /// Parse a sequence of bytes.  The sequence need not be complete.
     /// This may result in some number of calls to the methods on the
     /// provided `actor`.
-    pub fn parse(&mut self, bytes: &[u8], actor: &mut dyn VTActor) {
+    pub fn parse<A: VTActor + ?Sized>(&mut self, bytes: &[u8], actor: &mut A) {
         for b in bytes {
             self.parse_byte(*b, actor);
         }

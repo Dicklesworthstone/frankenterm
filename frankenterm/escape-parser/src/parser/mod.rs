@@ -2,8 +2,8 @@
 #[cfg(feature = "tmux_cc")]
 use crate::tmux_cc::Event;
 use crate::{
-    Action, CSI, DeviceControlMode, EnterDeviceControlMode, Esc, OperatingSystemCommand,
-    ShortDeviceControl,
+    Action, CSI, ControlCode, DeviceControlMode, EnterDeviceControlMode, Esc,
+    OperatingSystemCommand, ShortDeviceControl,
 };
 #[cfg(feature = "tmux_cc")]
 use core::borrow::BorrowMut;
@@ -277,6 +277,63 @@ struct ParseState {
 
 const MAX_SHORT_DCS_BYTES: usize = 8 * 1024 * 1024;
 
+/// Receives what [`Parser::parse_with`] decodes, one call per action, in
+/// stream order (ft-yccm0.3.2.1). The parser is generic over the handler, so
+/// every call is static dispatch, and nothing is collected: a handler that
+/// applies each action as it arrives needs no `Vec<Action>`.
+///
+/// Only [`Handler::action`] is required. The other methods carry the hot
+/// actions without building an [`Action`]; a printable run arrives as a
+/// borrowed `&str` rather than an owned `String`. Their defaults forward
+/// exactly the `Action` that [`Parser::parse`] produces, so overriding none
+/// of them reproduces the `Action` stream.
+pub trait Handler {
+    /// Every action the other methods do not take themselves.
+    fn action(&mut self, action: Action);
+
+    /// [`Action::Print`].
+    #[inline]
+    fn print(&mut self, c: char) {
+        self.action(Action::Print(c));
+    }
+
+    /// [`Action::PrintString`]: a run of ground-state printable characters.
+    #[inline]
+    fn print_str(&mut self, text: &str) {
+        self.action(Action::PrintString(text.to_string()));
+    }
+
+    /// [`Action::Control`].
+    #[inline]
+    fn control(&mut self, code: ControlCode) {
+        self.action(Action::Control(code));
+    }
+
+    /// [`Action::CSI`].
+    #[inline]
+    fn csi(&mut self, csi: CSI) {
+        self.action(Action::CSI(csi));
+    }
+
+    /// [`Action::Esc`].
+    #[inline]
+    fn esc(&mut self, esc: Esc) {
+        self.action(Action::Esc(esc));
+    }
+}
+
+/// The [`Handler`] for consumers that want [`Action`] values (the mux codec,
+/// the recorder, scripting, tests): every action reaches the closure as the
+/// `Action` that [`Parser::parse`] has always produced.
+pub struct ActionCollector<F: FnMut(Action)>(pub F);
+
+impl<F: FnMut(Action)> Handler for ActionCollector<F> {
+    #[inline]
+    fn action(&mut self, action: Action) {
+        (self.0)(action)
+    }
+}
+
 /// The `Parser` struct holds the state machine that is used to decode
 /// a sequence of bytes.  The byte sequence can be streaming into the
 /// state machine.
@@ -548,7 +605,15 @@ impl Parser {
         result
     }
 
-    pub fn parse<F: FnMut(Action)>(&mut self, bytes: &[u8], mut callback: F) {
+    /// Decodes `bytes` and hands every action to `callback` as an [`Action`].
+    pub fn parse<F: FnMut(Action)>(&mut self, bytes: &[u8], callback: F) {
+        self.parse_with(bytes, &mut ActionCollector(callback));
+    }
+
+    /// Decodes `bytes` into `handler`, one call per action, with no
+    /// intermediate `Action` storage; see [`Handler`]. Stream-position
+    /// tracking is the same as [`Parser::parse`].
+    pub fn parse_with<H: Handler + ?Sized>(&mut self, bytes: &[u8], handler: &mut H) {
         // Taking the prior position before invoking caller code makes unwind
         // fail closed. If a callback panics after the parser consumed any part
         // of this slice, the position remains `None` and this parser can never
@@ -556,7 +621,7 @@ impl Parser {
         let prior_stream_bytes = self.recovery_stream_bytes.take();
         self.pending_sequence_bytes = 0;
         for action in core::mem::take(&mut self.pending_actions) {
-            callback(action);
+            handler.action(action);
         }
         #[cfg(feature = "tmux_cc")]
         let is_tmux_mode: bool = self.state.borrow().tmux_state.is_some();
@@ -564,7 +629,7 @@ impl Parser {
         if is_tmux_mode {
             match self.advance_tmux_bytes(bytes) {
                 Ok(tmux_events) => {
-                    callback(Action::DeviceControl(DeviceControlMode::TmuxEvents(
+                    handler.action(Action::DeviceControl(DeviceControlMode::TmuxEvents(
                         Box::new(tmux_events),
                     )));
                 }
@@ -574,7 +639,7 @@ impl Parser {
                     let mut parser_state = self.state.borrow_mut();
                     parser_state.tmux_state = None;
                     let mut perform = Performer {
-                        callback: &mut callback,
+                        handler: &mut *handler,
                         state: &mut parser_state,
                     };
                     self.state_machine
@@ -586,14 +651,14 @@ impl Parser {
         }
 
         if self.print_batching {
-            self.parse_ground_batched(bytes, &mut callback);
+            self.parse_ground_batched(bytes, handler);
             self.finish_recovery_stream_advance(prior_stream_bytes, bytes.len());
             return;
         }
 
         {
             let mut perform = Performer {
-                callback: &mut callback,
+                handler,
                 state: &mut self.state.borrow_mut(),
             };
             self.state_machine.parse(bytes, &mut perform);
@@ -617,7 +682,7 @@ impl Parser {
     /// is identical to the scalar path modulo print coalescing, including
     /// across chunk boundaries (an incomplete trailing multibyte sequence is
     /// deferred to the scalar path, which correctly parks in `Utf8Sequence`).
-    fn parse_ground_batched<F: FnMut(Action)>(&mut self, bytes: &[u8], callback: &mut F) {
+    fn parse_ground_batched<H: Handler + ?Sized>(&mut self, bytes: &[u8], handler: &mut H) {
         // Runs shorter than this stay on the scalar path: a one-codepoint
         // `PrintString` would allocate a `String` where `Print(char)` does not,
         // which would regress control-sequence-heavy streams.
@@ -633,7 +698,7 @@ impl Parser {
                     // UTF-8, so the slice is guaranteed valid UTF-8.
                     debug_assert!(core::str::from_utf8(&bytes[i..run_end]).is_ok());
                     if let Ok(s) = core::str::from_utf8(&bytes[i..run_end]) {
-                        callback(Action::PrintString(s.to_string()));
+                        handler.print_str(s);
                         i = run_end;
                         continue;
                     }
@@ -644,7 +709,7 @@ impl Parser {
             // exhaust the input or reach a ground-state batchable boundary.
             let mut state = self.state.borrow_mut();
             let mut perform = Performer {
-                callback: &mut *callback,
+                handler: &mut *handler,
                 state: &mut state,
             };
             while i < n {
@@ -679,14 +744,14 @@ impl Parser {
         let mut first_idx = None;
         {
             let mut perform = Performer {
-                callback: &mut |action| {
+                handler: &mut ActionCollector(|action| {
                     // capture the action, but only if it is the first one
                     // we've seen.  Preserve an existing one if any.
                     if first.borrow().is_some() {
                         return;
                     }
                     *first.borrow_mut() = Some(action);
-                },
+                }),
                 state: &mut self.state.borrow_mut(),
             };
             for (idx, b) in bytes.iter().enumerate() {
@@ -747,7 +812,7 @@ impl Parser {
             self.state_machine.parse_byte(
                 *b,
                 &mut Performer {
-                    callback: &mut |action| actions.push_back(action),
+                    handler: &mut ActionCollector(|action| actions.push_back(action)),
                     state: &mut self.state.borrow_mut(),
                 },
             );
@@ -780,8 +845,8 @@ impl Parser {
     }
 }
 
-struct Performer<'a, F: FnMut(Action) + 'a> {
-    callback: &'a mut F,
+struct Performer<'a, H: Handler + ?Sized + 'a> {
+    handler: &'a mut H,
     state: &'a mut ParseState,
 }
 
@@ -869,14 +934,15 @@ fn scan_printable_run(bytes: &[u8], start: usize) -> (usize, usize) {
     (i, chars)
 }
 
-impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
+impl<'a, H: Handler + ?Sized> VTActor for Performer<'a, H> {
+    #[inline]
     fn print(&mut self, c: char) {
-        (self.callback)(Action::Print(c));
+        self.handler.print(c);
     }
 
     fn execute_c0_or_c1(&mut self, byte: u8) {
         match FromPrimitive::from_u8(byte) {
-            Some(code) => (self.callback)(Action::Control(code)),
+            Some(code) => self.handler.control(code),
             None => error!(
                 "impossible C0/C1 control code {:?} 0x{:x} was dropped",
                 byte as char, byte
@@ -886,7 +952,7 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
 
     fn apc_dispatch(&mut self, data: Vec<u8>) {
         if let Some(img) = super::KittyImage::parse_apc(&data) {
-            (self.callback)(Action::KittyImage(Box::new(img)))
+            self.handler.action(Action::KittyImage(Box::new(img)))
         } else {
             log::trace!("Ignoring APC data: {:?}", String::from_utf8_lossy(&data));
         }
@@ -930,14 +996,15 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
                     crate::tmux_cc::Parser::new_with_max_retained_bytes(max_string_sequence_bytes),
                 ));
             }
-            (self.callback)(Action::DeviceControl(DeviceControlMode::Enter(Box::new(
-                EnterDeviceControlMode {
-                    byte,
-                    params: params.to_vec(),
-                    intermediates: intermediates.to_vec(),
-                    ignored_extra_intermediates,
-                },
-            ))));
+            self.handler
+                .action(Action::DeviceControl(DeviceControlMode::Enter(Box::new(
+                    EnterDeviceControlMode {
+                        byte,
+                        params: params.to_vec(),
+                        intermediates: intermediates.to_vec(),
+                        ignored_extra_intermediates,
+                    },
+                ))));
         }
     }
 
@@ -1007,9 +1074,9 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
                 match result {
                     Ok(optional_events) => {
                         if let Some(tmux_event) = optional_events {
-                            (self.callback)(Action::DeviceControl(DeviceControlMode::TmuxEvents(
-                                Box::new(vec![tmux_event]),
-                            )));
+                            self.handler.action(Action::DeviceControl(
+                                DeviceControlMode::TmuxEvents(Box::new(vec![tmux_event])),
+                            ));
                         }
                     }
                     Err(_) => {
@@ -1018,7 +1085,8 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
                 }
                 return;
             }
-            (self.callback)(Action::DeviceControl(DeviceControlMode::Data(data)));
+            self.handler
+                .action(Action::DeviceControl(DeviceControlMode::Data(data)));
         }
     }
 
@@ -1028,7 +1096,7 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
             return;
         }
         if let Some(dcs) = self.state.dcs.take() {
-            (self.callback)(Action::DeviceControl(
+            self.handler.action(Action::DeviceControl(
                 DeviceControlMode::ShortDeviceControl(Box::new(dcs)),
             ));
         } else if let Some(mut sixel) = self.state.sixel.take() {
@@ -1039,7 +1107,7 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
                 }
             }
             if sixel.should_emit() {
-                (self.callback)(Action::Sixel(Box::new(sixel.sixel)));
+                self.handler.action(Action::Sixel(Box::new(sixel.sixel)));
             }
         } else if let Some(tcap) = self.state.get_tcap.take() {
             let (names, error) = tcap.finish();
@@ -1049,10 +1117,11 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
                 }
             }
             if let Some(names) = names {
-                (self.callback)(Action::XtGetTcap(names));
+                self.handler.action(Action::XtGetTcap(names));
             }
         } else {
-            (self.callback)(Action::DeviceControl(DeviceControlMode::Exit));
+            self.handler
+                .action(Action::DeviceControl(DeviceControlMode::Exit));
         }
     }
 
@@ -1063,7 +1132,8 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
         } else {
             OperatingSystemCommand::parse(osc)
         };
-        (self.callback)(Action::OperatingSystemCommand(Box::new(parsed)));
+        self.handler
+            .action(Action::OperatingSystemCommand(Box::new(parsed)));
     }
 
     fn csi_dispatch(&mut self, params: &[CsiParam], parameters_truncated: bool, control: u8) {
@@ -1071,20 +1141,20 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
         // table-driven fast decoder first; it emits a byte-identical action
         // stream for the common shapes (and emits nothing when it declines).
         if self.state.table_dispatch {
-            let cb = &mut *self.callback;
+            let handler = &mut *self.handler;
             if CSI::parse_fast(
                 params,
                 parameters_truncated,
                 control as char,
                 &mut |action| {
-                    cb(Action::CSI(action));
+                    handler.csi(action);
                 },
             ) {
                 return;
             }
         }
         for action in CSI::parse(params, parameters_truncated, control as char) {
-            (self.callback)(Action::CSI(action));
+            self.handler.csi(action);
         }
     }
 
@@ -1103,14 +1173,14 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
         if ignored_extra_intermediates || intermediates.len() > 1 {
             return;
         }
-        (self.callback)(Action::Esc(Esc::parse(
+        self.handler.esc(Esc::parse(
             if intermediates.len() == 1 {
                 Some(intermediates[0])
             } else {
                 None
             },
             control,
-        )));
+        ));
     }
 }
 
@@ -1901,14 +1971,88 @@ mod test {
         }
     }
 
+    /// ft-yccm0.3.2.1: a handler that takes every hot action itself sees
+    /// the stream `parse` produces, in order, whole and byte by byte, under
+    /// every parser mode. `&mut dyn Handler` works too.
+    #[test]
+    fn parse_with_hands_a_handler_the_same_stream_as_parse() {
+        #[derive(Default)]
+        struct Recorder(Vec<Action>);
+
+        impl Handler for Recorder {
+            fn action(&mut self, action: Action) {
+                self.0.push(action);
+            }
+            fn print(&mut self, c: char) {
+                self.0.push(Action::Print(c));
+            }
+            fn print_str(&mut self, text: &str) {
+                self.0.push(Action::PrintString(text.to_string()));
+            }
+            fn control(&mut self, code: ControlCode) {
+                self.0.push(Action::Control(code));
+            }
+            fn csi(&mut self, csi: CSI) {
+                self.0.push(Action::CSI(csi));
+            }
+            fn esc(&mut self, esc: Esc) {
+                self.0.push(Action::Esc(esc));
+            }
+        }
+
+        let inputs: &[&[u8]] = &[
+            b"hello world",
+            "caf\u{e9} \u{20ac}1 \u{1f680} \u{65e5}\x1b[31mred\x1b[0m".as_bytes(),
+            b"\x1b[1;4;38;5;196;48;2;1;2;3mX\x1b[m\r\n\x07tail",
+            b"\x1b]0;title\x07body\x1b]8;;http://x\x1b\\link\x1b]8;;\x1b\\",
+            b"\x1bP$qm\x1b\\\x1bPq#0;2;0;0;0#0~~\x1b\\after",
+            b"\x1b(0lqk\x1b(B\x1b7\x1b8\x1bMab",
+            b"a\xe4\x1b[1mb\x9bz\x1b[?2026h\x1b[?2026l",
+        ];
+        for &batching in &[false, true] {
+            for &table in &[false, true] {
+                let configure = |parser: &mut Parser| {
+                    parser.set_print_batching(batching);
+                    parser.set_table_dispatch(table);
+                };
+                for bytes in inputs {
+                    let mut reference = Parser::new();
+                    configure(&mut reference);
+                    let expected = reference.parse_as_vec(bytes);
+
+                    let mut parser = Parser::new();
+                    configure(&mut parser);
+                    let mut recorder = Recorder::default();
+                    parser.parse_with(bytes, &mut recorder);
+                    assert_eq!(recorder.0, expected);
+
+                    // Byte at a time the runs split differently, so compare
+                    // with `parse` fed the same way.
+                    let mut reference = Parser::new();
+                    configure(&mut reference);
+                    let mut expected = Vec::new();
+                    let mut parser = Parser::new();
+                    configure(&mut parser);
+                    let mut recorder = Recorder::default();
+                    for byte in bytes.iter() {
+                        let byte = core::slice::from_ref(byte);
+                        reference.parse(byte, |action| expected.push(action));
+                        parser.parse_with(byte, &mut recorder as &mut dyn Handler);
+                    }
+                    assert_eq!(recorder.0, expected);
+                }
+            }
+        }
+    }
+
     #[test]
     fn overflowed_esc_dispatch_rejects_even_a_short_retained_prefix() {
         let p = Parser::new();
         let mut actions = Vec::new();
-        let mut callback = |action| actions.push(action);
+        let mut collector = ActionCollector(|action| actions.push(action));
         let mut state = p.state.borrow_mut();
         let mut performer = Performer {
-            callback: &mut callback,
+            handler: &mut collector,
             state: &mut state,
         };
         performer.esc_dispatch(&[], &[], true, b'X');

@@ -1166,7 +1166,8 @@ impl Terminal {
 
             let mut performer = Performer::new(&mut self.state);
 
-            self.parser.parse(bytes, |action| performer.perform(action));
+            // Fused: the parser drives the performer directly (ft-yccm0.3.2.1).
+            self.parser.parse_with(bytes, &mut performer);
         }
         if let Some(error) = self.parser.take_string_sequence_error() {
             log::warn!(
