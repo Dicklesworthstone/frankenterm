@@ -217,10 +217,13 @@ impl EngineFactory for TwoStage {
 /// admission. The gate diverts what the mux diverts (alert sources) and,
 /// with `divert_every`, also every n-th other action, so diversion lands at
 /// arbitrary points. `ascii_scan` pins the parser's ground-state ASCII scan
-/// (ft-yccm0.3.2.2); `None` keeps the parser's default.
+/// (ft-yccm0.3.2.2); `None` keeps the parser's default. `scalar_utf8` turns
+/// off one-pass UTF-8 validation of printable runs (ft-yccm0.3.2.3), so every
+/// character is checked on its own.
 pub struct FusedFeed {
     pub divert_every: Option<usize>,
     pub ascii_scan: Option<AsciiScan>,
+    pub scalar_utf8: bool,
 }
 
 struct FusedFeedGate {
@@ -270,6 +273,9 @@ impl Engine for FusedFeedEngine {
 
 impl EngineFactory for FusedFeed {
     fn name(&self) -> &'static str {
+        if self.scalar_utf8 {
+            return "fused_feed_scalar_utf8";
+        }
         match (self.divert_every, self.ascii_scan) {
             (None, None) => "fused_feed",
             (Some(_), None) => "fused_feed_frequent_diversion",
@@ -285,6 +291,9 @@ impl EngineFactory for FusedFeed {
         let mut parser = Parser::new();
         if let Some(scan) = self.ascii_scan {
             parser.set_ascii_scan(scan);
+        }
+        if self.scalar_utf8 {
+            parser.set_simd_utf8(false);
         }
         Box::new(FusedFeedEngine {
             terminal: new_terminal_with(geometry, io),
@@ -317,24 +326,36 @@ pub fn candidates() -> Vec<Box<dyn EngineFactory>> {
         Box::new(FusedFeed {
             divert_every: None,
             ascii_scan: None,
+            scalar_utf8: false,
         }),
         Box::new(FusedFeed {
             divert_every: Some(7),
             ascii_scan: None,
+            scalar_utf8: false,
         }),
         // ft-yccm0.3.2.2: the scalar oracle and the wider `std::simd` scans.
         // Legacy and the other candidates run the default scan.
         Box::new(FusedFeed {
             divert_every: None,
             ascii_scan: Some(AsciiScan::Scalar),
+            scalar_utf8: false,
         }),
         Box::new(FusedFeed {
             divert_every: None,
             ascii_scan: Some(AsciiScan::Simd32),
+            scalar_utf8: false,
         }),
         Box::new(FusedFeed {
             divert_every: None,
             ascii_scan: Some(AsciiScan::Simd64),
+            scalar_utf8: false,
+        }),
+        // ft-yccm0.3.2.3: every character's UTF-8 checked on its own, the
+        // oracle for the one-pass validation the others run.
+        Box::new(FusedFeed {
+            divert_every: None,
+            ascii_scan: None,
+            scalar_utf8: true,
         }),
     ]
 }

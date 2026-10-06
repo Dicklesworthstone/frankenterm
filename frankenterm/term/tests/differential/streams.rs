@@ -311,6 +311,58 @@ pub fn adversarial_cases() -> Vec<(&'static str, Vec<u8>)> {
     }
     cases.push(("ascii_run_long_lines", long_runs));
 
+    // ft-yccm0.3.2.3: printable runs with UTF-8, validated in one pass, and
+    // malformed UTF-8 in and between them, which the state machine decodes.
+    cases.extend([
+        (
+            "utf8_malformed_forms",
+            vec![
+                b'a', 0xC0, 0x80, b'b', 0xC1, 0xBF, b'c', 0xE0, 0x80, 0x80, b'd', 0xE0, 0x9F, 0xBF,
+                b'e', 0xED, 0xA0, 0x80, b'f', 0xED, 0xBF, 0xBF, b'g', 0xF0, 0x80, 0x80, 0x80, b'h',
+                0xF4, 0x90, 0x80, 0x80, b'i', 0xF5, 0x80, b'j', 0xF8, 0x88, 0x80, 0x80, 0x80, b'k',
+                0xEF, 0xBF, 0xBF, 0xF4, 0x8F, 0xBF, 0xBF, b'l',
+            ],
+        ),
+        (
+            "utf8_invalid_between_valid",
+            b"\xc3\xa9\xff\xc3\xa9\x80\xc3\xa9\xc3\xc3\xa9\xe2\x82\xc3\xa9\xf0\x9f\x98\xc3\xa9!".to_vec(),
+        ),
+        (
+            "utf8_c1_inside_runs",
+            "caf\u{e9} \u{a0}nbsp \u{a9}\u{ae} x\u{85}y \u{9b}31mz \u{9d}0;t\u{9c}w"
+                .as_bytes()
+                .to_vec(),
+        ),
+        (
+            "utf8_box_drawing",
+            "\u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}\r\n\u{2502} \u{4e2d}\u{6587} \u{2502}\r\n\u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}"
+                .as_bytes()
+                .to_vec(),
+        ),
+        (
+            "utf8_emoji_cells",
+            "\x1b[38;5;196m\x1b[48;5;21m\u{1F600}\x1b[38;5;7m\x1b[48;5;0m\u{1F680}\u{1F469}\u{200D}\u{1F4BB}\u{2764}\u{FE0F}\u{1F1FA}\u{1F1F8}e\u{301}"
+                .as_bytes()
+                .to_vec(),
+        ),
+        (
+            "utf8_truncated_at_end",
+            b"\xf0\x9f\x98\x80\xf0\x9f\x98\x80\xf0\x9f\x98".to_vec(),
+        ),
+    ]);
+
+    // Long UTF-8 lines: box drawing, CJK and emoji wider than every geometry.
+    let mut utf8_lines = String::new();
+    for line in 0..30 {
+        match line % 3 {
+            0 => utf8_lines.push_str(&repeat("\u{2500}\u{2502}\u{253c}", 30)),
+            1 => utf8_lines.push_str(&repeat("\u{4e2d}\u{6587}\u{5b57} ", 20)),
+            _ => utf8_lines.push_str(&repeat("\u{1F600}\u{1F680} x", 20)),
+        }
+        utf8_lines.push_str("\r\n");
+    }
+    cases.push(("utf8_long_lines", utf8_lines.into_bytes()));
+
     cases
 }
 

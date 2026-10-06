@@ -140,8 +140,28 @@ fn default_ascii_scan() -> AsciiScan {
     AsciiScan::for_env_value(None)
 }
 
-/// Pure policy core for [`default_csi_fast_path`], testable without touching
-/// the process environment.
+/// Kill switch for validating a printable run's UTF-8 in one pass
+/// (ft-yccm0.3.2.3): a falsey value makes newly constructed parsers check
+/// each character on its own, the oracle. See [`Parser::set_simd_utf8`].
+#[cfg(feature = "std")]
+const PARSER_SIMD_UTF8_ENV: &str = "FT_PARSER_SIMD_UTF8";
+
+/// Resolve the default `simd_utf8` setting for a freshly constructed
+/// [`Parser`]: on unless `FT_PARSER_SIMD_UTF8` is set falsey.
+#[inline]
+fn default_simd_utf8() -> bool {
+    #[cfg(feature = "std")]
+    {
+        let value = std::env::var(PARSER_SIMD_UTF8_ENV).ok();
+        return csi_fast_path_default_for_value(value.as_deref());
+    }
+    #[cfg(not(feature = "std"))]
+    csi_fast_path_default_for_value(None)
+}
+
+/// Pure policy core for [`default_csi_fast_path`] and
+/// [`default_simd_utf8`], testable without touching the process
+/// environment: on unless the value is falsey.
 #[inline]
 fn csi_fast_path_default_for_value(value: Option<&str>) -> bool {
     !value.is_some_and(env_value_is_falsey)
@@ -433,6 +453,9 @@ pub struct Parser {
     /// The ground-state ASCII scan (ft-yccm0.3.2.2); see
     /// [`Parser::set_ascii_scan`].
     ascii_scan: AsciiScan,
+    /// One UTF-8 validation per printable run (ft-yccm0.3.2.3); see
+    /// [`Parser::set_simd_utf8`].
+    simd_utf8: bool,
     /// The fast path's parameter array, reused for every sequence: fixed
     /// size, never on the heap, and never cleared (only the prefix a scan
     /// writes is read).
@@ -618,6 +641,7 @@ impl Parser {
             print_batching: default_print_batching(),
             csi_fast_path: default_csi_fast_path(),
             ascii_scan: default_ascii_scan(),
+            simd_utf8: default_simd_utf8(),
             csi_params: [CsiParam::Integer(0); CSI_FAST_MAX_PARAMS],
             sgr_run: core::array::from_fn(|_| Sgr::Reset),
             last_sgr: LastSgr::new(),
@@ -778,6 +802,31 @@ impl Parser {
         self.ascii_scan
     }
 
+    /// Chooses how the ground state checks the UTF-8 of a printable run
+    /// (ft-yccm0.3.2.3). It is on unless `FT_PARSER_SIMD_UTF8` is falsey,
+    /// and it applies with print batching.
+    ///
+    /// On:
+    /// - the run's extent (up to the first control, DEL or C1 control) is
+    ///   found with the [`AsciiScan`] in use;
+    /// - its UTF-8 is validated once, by the same `core::str::from_utf8`
+    ///   that hands the handler its `&str`;
+    /// - a lone character with no printable byte after it is decoded and
+    ///   checked in place.
+    ///
+    /// Off, every character is checked on its own and the run is then
+    /// validated again: the oracle. The action stream is identical either
+    /// way.
+    pub fn set_simd_utf8(&mut self, on: bool) {
+        self.simd_utf8 = on;
+    }
+
+    /// Whether printable runs are validated in one pass. See
+    /// [`Parser::set_simd_utf8`].
+    pub fn simd_utf8(&self) -> bool {
+        self.simd_utf8
+    }
+
     /// advance with tmux parser, bypass VTParse
     #[cfg(feature = "tmux_cc")]
     fn advance_tmux_bytes(&mut self, bytes: &[u8]) -> crate::Result<Vec<Event>> {
@@ -882,49 +931,35 @@ impl Parser {
     /// complete CSI sequence that [`Parser::ground_csi`] takes dispatches as
     /// the machine would dispatch it, ending in Ground.
     fn parse_ground_batched<H: Handler + ?Sized>(&mut self, bytes: &[u8], handler: &mut H) {
-        // Runs shorter than this stay on the scalar path: a one-codepoint
-        // `PrintString` would allocate a `String` where `Print(char)` does not,
-        // which would regress control-sequence-heavy streams.
-        const MIN_BATCH_CHARS: usize = 2;
-
         let csi_fast_path = self.csi_fast_path;
         let ascii_scan = self.ascii_scan;
+        let simd_utf8 = self.simd_utf8;
+        let mut extents = RunExtents::default();
         let n = bytes.len();
         let mut i = 0;
         while i < n {
             if self.state_machine.is_ground() {
                 let byte = bytes[i];
                 if can_start_printable_run(byte) {
-                    let (run_end, char_count) = scan_printable_run(bytes, i, ascii_scan);
-                    if char_count >= MIN_BATCH_CHARS {
-                        // `scan_printable_run` only extends across complete, valid
-                        // UTF-8, so the slice is guaranteed valid UTF-8.
-                        debug_assert!(core::str::from_utf8(&bytes[i..run_end]).is_ok());
-                        if let Ok(s) = core::str::from_utf8(&bytes[i..run_end]) {
-                            // One byte per character: the run is all ASCII.
-                            if run_end - i == char_count {
-                                handler.print_ascii_run(s);
+                    match ground_run(bytes, i, ascii_scan, simd_utf8, &mut extents) {
+                        GroundRun::Text { text, ascii } => {
+                            if ascii {
+                                handler.print_ascii_run(text);
                             } else {
-                                handler.print_str(s);
+                                handler.print_str(text);
                             }
-                            i = run_end;
+                            i += text.len();
                             continue;
                         }
-                    } else if char_count == 1 && csi_fast_path {
                         // A lone codepoint, such as the character between two
                         // SGR sequences, decoded here rather than byte by byte
                         // in the state machine's UTF-8 decoder.
-                        if let Some(c) = decode_scanned_char(&bytes[i..run_end]) {
-                            debug_assert_eq!(
-                                core::str::from_utf8(&bytes[i..run_end])
-                                    .ok()
-                                    .and_then(|s| s.chars().next()),
-                                Some(c)
-                            );
+                        GroundRun::One(c, len) if csi_fast_path => {
                             handler.print(c);
-                            i = run_end;
+                            i += len;
                             continue;
                         }
+                        _ => {}
                     }
                 } else if byte == 0x1b && csi_fast_path {
                     let consumed = self.ground_csi(bytes, i, &mut *handler);
@@ -955,7 +990,10 @@ impl Parser {
                         byte == 0x1b || can_start_printable_run(byte)
                     } else {
                         can_start_printable_run(byte)
-                            && scan_printable_run(bytes, i, ascii_scan).1 >= MIN_BATCH_CHARS
+                            && matches!(
+                                ground_run(bytes, i, ascii_scan, simd_utf8, &mut extents),
+                                GroundRun::Text { .. }
+                            )
                     };
                     if boundary {
                         break;
@@ -1217,15 +1255,7 @@ fn scan_printable_run(bytes: &[u8], start: usize, ascii_scan: AsciiScan) -> (usi
     while i < n {
         let b = bytes[i];
         if ascii::is_printable_ascii(b) {
-            // ft-yccm0.3.2.2: the ASCII stretch in one scan. A one-byte
-            // stretch (the character between two escapes) is settled by the
-            // next byte, so it never reaches a `std::simd` scan.
-            let stretch = match bytes.get(i + 1) {
-                Some(&next) if ascii::is_printable_ascii(next) => {
-                    ascii_scan.printable_len(&bytes[i..])
-                }
-                _ => 1,
-            };
+            let stretch = ascii_stretch(bytes, i, ascii_scan);
             i += stretch;
             chars += stretch;
             continue;
@@ -1258,6 +1288,256 @@ fn scan_printable_run(bytes: &[u8], start: usize, ascii_scan: AsciiScan) -> (usi
         }
     }
     (i, chars)
+}
+
+/// The printable-ASCII stretch at `bytes[at]`, 0 when that byte is not
+/// printable ASCII (ft-yccm0.3.2.2). A one-byte stretch (the character
+/// between two escapes) is settled by the next byte, so it never reaches a
+/// `std::simd` scan.
+#[inline]
+fn ascii_stretch(bytes: &[u8], at: usize, scan: AsciiScan) -> usize {
+    if !bytes
+        .get(at)
+        .is_some_and(|&byte| ascii::is_printable_ascii(byte))
+    {
+        return 0;
+    }
+    match bytes.get(at + 1) {
+        Some(&next) if ascii::is_printable_ascii(next) => scan.printable_len(&bytes[at..]),
+        _ => 1,
+    }
+}
+
+/// What starts at a ground-state byte that can start a printable run.
+#[derive(Clone, Debug, PartialEq)]
+enum GroundRun<'a> {
+    /// No printable character: the state machine takes the byte.
+    None,
+    /// Exactly one character, and its length in bytes. It is printed as
+    /// `Action::Print`, so no `String` is built for it.
+    One(char, usize),
+    /// Two or more characters, and whether they are all ASCII.
+    Text { text: &'a str, ascii: bool },
+}
+
+/// Where the next control (or DEL) and the next `0xc2 0x00..=0x9f` pair lie
+/// in one parse call's input, as absolute positions (ft-yccm0.3.2.3).
+///
+/// Runs are scanned left to right, so a position found from an earlier byte
+/// still holds for every later byte up to it. Without the cache, each run
+/// cut short by malformed UTF-8 would scan the rest of the input again,
+/// which is quadratic on long input with no controls in it.
+#[derive(Default)]
+struct RunExtents {
+    control: Option<usize>,
+    c1: Option<usize>,
+}
+
+impl RunExtents {
+    /// The first control or DEL at or after `from`, or the input's length.
+    #[inline]
+    fn control_from(&mut self, bytes: &[u8], from: usize, scan: AsciiScan) -> usize {
+        match self.control {
+            Some(at) if at >= from => at,
+            _ => {
+                let at = from + scan.control_free_len(&bytes[from..]);
+                self.control = Some(at);
+                at
+            }
+        }
+    }
+
+    /// The first `0xc2` at or after `from` followed by a byte below 0xa0,
+    /// or the input's length. In valid UTF-8 that pair is a C1 control. In
+    /// malformed UTF-8 the `0xc2` cannot start a character, so a run stops
+    /// there either way.
+    #[inline]
+    fn c1_from(&mut self, bytes: &[u8], from: usize, scan: AsciiScan) -> usize {
+        match self.c1 {
+            Some(at) if at >= from => at,
+            _ => {
+                let at = scan
+                    .c1_position(&bytes[from..])
+                    .map_or(bytes.len(), |at| from + at);
+                self.c1 = Some(at);
+                at
+            }
+        }
+    }
+}
+
+/// The maximal printable run at `bytes[start]`, whose bytes the state
+/// machine would print one character at a time and end in Ground (see
+/// [`scan_printable_run`]). With `simd_utf8` it is found by
+/// [`ground_run_bulk`], otherwise by the oracle; both give the same run.
+#[inline]
+fn ground_run<'a>(
+    bytes: &'a [u8],
+    start: usize,
+    scan: AsciiScan,
+    simd_utf8: bool,
+    extents: &mut RunExtents,
+) -> GroundRun<'a> {
+    if simd_utf8 {
+        ground_run_bulk(bytes, start, scan, extents)
+    } else {
+        ground_run_scalar(bytes, start, scan)
+    }
+}
+
+/// The oracle: [`scan_printable_run`] checks each character on its own,
+/// and the run is validated again to hand it over as `&str`.
+fn ground_run_scalar(bytes: &[u8], start: usize, scan: AsciiScan) -> GroundRun<'_> {
+    let (end, chars) = scan_printable_run(bytes, start, scan);
+    let run = &bytes[start..end];
+    match chars {
+        0 => GroundRun::None,
+        1 => decode_scanned_char(run).map_or(GroundRun::None, |c| GroundRun::One(c, run.len())),
+        // `scan_printable_run` only extends across complete, valid UTF-8.
+        _ => core::str::from_utf8(run).map_or(GroundRun::None, |text| GroundRun::Text {
+            text,
+            ascii: run.len() == chars,
+        }),
+    }
+}
+
+/// The run with one UTF-8 validation (ft-yccm0.3.2.3).
+///
+/// Steps:
+/// 1. The printable-ASCII stretch is scanned first. When a control, DEL or
+///    the end of the input follows it, the run is all ASCII.
+/// 2. Otherwise a lone character with no printable byte after it (T0's
+///    emoji between two escapes) is decoded and checked in place by
+///    [`decode_utf8_char`].
+/// 3. Otherwise the run can reach as far as the first control, DEL or
+///    `0xc2 0x00..=0x9f` pair (a C1 control in UTF-8, which the state
+///    machine executes), found with the `std::simd` scans in
+///    [`RunExtents`]. That stretch is validated once by
+///    `core::str::from_utf8`, which also yields the `&str` handed over. The
+///    run ends where the valid UTF-8 ends, at an invalid or incomplete
+///    sequence, which the state machine then decodes, replacement
+///    characters and all.
+///
+/// Only a run cut short by such a sequence is validated a second time, to
+/// obtain its shorter `&str`.
+///
+/// A separate `std::simd` UTF-8 validator would not save that pass: safe
+/// Rust only makes a `&str` from bytes by `core::str::from_utf8`, so it
+/// would be a second validation, not a replacement.
+fn ground_run_bulk<'a>(
+    bytes: &'a [u8],
+    start: usize,
+    scan: AsciiScan,
+    extents: &mut RunExtents,
+) -> GroundRun<'a> {
+    let ascii_end = start + ascii_stretch(bytes, start, scan);
+    if bytes.get(ascii_end).is_none_or(|&next| next < 0x80) {
+        return ascii_run(&bytes[start..ascii_end]);
+    }
+    if ascii_end == start {
+        let Some((c, len)) = decode_utf8_char(&bytes[start..]) else {
+            return GroundRun::None;
+        };
+        if bytes
+            .get(start + len)
+            .is_none_or(|&next| next < 0x20 || next == 0x7f)
+        {
+            return GroundRun::One(c, len);
+        }
+    }
+
+    let limit = extents
+        .control_from(bytes, ascii_end, scan)
+        .min(extents.c1_from(bytes, ascii_end, scan));
+    let candidate = &bytes[start..limit];
+    let text = match core::str::from_utf8(candidate) {
+        Ok(text) => Some(text),
+        Err(error) => core::str::from_utf8(&candidate[..error.valid_up_to()]).ok(),
+    };
+    let Some(text) = text else {
+        return GroundRun::None;
+    };
+    let mut chars = text.chars();
+    match (chars.next(), chars.next()) {
+        (None, _) => GroundRun::None,
+        (Some(c), None) => GroundRun::One(c, text.len()),
+        _ => GroundRun::Text {
+            text,
+            ascii: text.len() <= ascii_end - start,
+        },
+    }
+}
+
+/// A run of printable ASCII.
+#[inline]
+fn ascii_run(run: &[u8]) -> GroundRun<'_> {
+    match run {
+        [] => GroundRun::None,
+        [byte] => GroundRun::One(char::from(*byte), 1),
+        _ => core::str::from_utf8(run).map_or(GroundRun::None, |text| GroundRun::Text {
+            text,
+            ascii: true,
+        }),
+    }
+}
+
+/// One complete, well-formed UTF-8 sequence of two to four bytes at the
+/// start of `bytes` (Unicode Table 3-7) that is not a C1 control: its
+/// character and length (ft-yccm0.3.2.3). Checked and decoded here, with no
+/// call into `core::str::from_utf8`. `None` for anything else, including
+/// ASCII, an incomplete sequence, overlongs, surrogates, values beyond
+/// U+10FFFF, and `0xc2 0x80..=0x9f`.
+#[inline]
+fn decode_utf8_char(bytes: &[u8]) -> Option<(char, usize)> {
+    let continuation = |at: usize| -> Option<u32> {
+        bytes
+            .get(at)
+            .filter(|b| matches!(b, 0x80..=0xbf))
+            .map(|&b| u32::from(b & 0x3f))
+    };
+    let lead = *bytes.first()?;
+    let (value, len) = match lead {
+        0xc2..=0xdf => {
+            let low = continuation(1)?;
+            // `0xc2 0x80..=0x9f` is a C1 control.
+            if lead == 0xc2 && low < 0x20 {
+                return None;
+            }
+            ((u32::from(lead & 0x1f) << 6) | low, 2)
+        }
+        0xe0..=0xef => {
+            let second = *bytes.get(1)?;
+            let allowed = match lead {
+                0xe0 => 0xa0..=0xbf,
+                0xed => 0x80..=0x9f,
+                _ => 0x80..=0xbf,
+            };
+            if !allowed.contains(&second) {
+                return None;
+            }
+            let value =
+                (u32::from(lead & 0x0f) << 12) | (u32::from(second & 0x3f) << 6) | continuation(2)?;
+            (value, 3)
+        }
+        0xf0..=0xf4 => {
+            let second = *bytes.get(1)?;
+            let allowed = match lead {
+                0xf0 => 0x90..=0xbf,
+                0xf4 => 0x80..=0x8f,
+                _ => 0x80..=0xbf,
+            };
+            if !allowed.contains(&second) {
+                return None;
+            }
+            let value = (u32::from(lead & 0x07) << 18)
+                | (u32::from(second & 0x3f) << 12)
+                | (continuation(2)? << 6)
+                | continuation(3)?;
+            (value, 4)
+        }
+        _ => return None,
+    };
+    Some((char::from_u32(value)?, len))
 }
 
 /// Decodes one codepoint [`scan_printable_run`] accepted: a printable ASCII
@@ -2491,6 +2771,123 @@ mod test {
                         parser.parse_with(byte, &mut recorder as &mut dyn Handler);
                     }
                     assert_eq!(recorder.0, expected);
+                }
+            }
+        }
+    }
+
+    /// ft-yccm0.3.2.3: `decode_utf8_char` takes exactly the first character
+    /// `core::str::from_utf8` accepts, minus ASCII and the C1 controls.
+    /// Checked over every two- and three-byte input, and every four-byte
+    /// input with a representative third and fourth byte. Plain `assert!`
+    /// keeps millions of checks fast; k9 formats every call.
+    #[test]
+    fn decode_utf8_char_matches_std_on_every_short_input() {
+        fn expected(bytes: &[u8]) -> Option<(char, usize)> {
+            let valid = match core::str::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(error) => core::str::from_utf8(&bytes[..error.valid_up_to()]).ok()?,
+            };
+            let c = valid.chars().next()?;
+            (!c.is_ascii() && !('\u{80}'..='\u{9f}').contains(&c)).then_some((c, c.len_utf8()))
+        }
+        const EDGES: [u8; 9] = [0x00, 0x7f, 0x80, 0x8f, 0x90, 0xa0, 0xbf, 0xc0, 0xff];
+        for lead in 0..=0xffu8 {
+            let one = [lead];
+            assert!(decode_utf8_char(&one) == expected(&one), "{one:02x?}");
+            for second in 0..=0xffu8 {
+                let two = [lead, second];
+                assert!(decode_utf8_char(&two) == expected(&two), "{two:02x?}");
+                // An ASCII lead never decodes; its longer inputs add nothing.
+                if lead < 0x80 {
+                    continue;
+                }
+                for third in 0..=0xffu8 {
+                    let three = [lead, second, third];
+                    assert!(decode_utf8_char(&three) == expected(&three), "{three:02x?}");
+                }
+                for third in EDGES {
+                    for fourth in EDGES {
+                        let four = [lead, second, third, fourth];
+                        assert!(decode_utf8_char(&four) == expected(&four), "{four:02x?}");
+                    }
+                }
+            }
+        }
+        // Every valid four-byte sequence's extremes.
+        for text in ["\u{10000}", "\u{1f600}", "\u{10ffff}"] {
+            let bytes = text.as_bytes();
+            assert!(decode_utf8_char(bytes) == expected(bytes), "{text:?}");
+        }
+    }
+
+    /// Text pieces for the run equivalence property: ASCII, valid UTF-8 of
+    /// every length (Latin-1 supplement, C1 controls encoded in UTF-8, CJK,
+    /// emoji), controls and DEL, and malformed UTF-8 (stray continuations,
+    /// overlongs, surrogates, values past U+10FFFF, truncated sequences).
+    fn arb_run_piece() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+        use proptest::prelude::*;
+        const PIECES: &[&[u8]] = &[
+            b"a",
+            b"text with spaces ",
+            b"0123456789abcdef0123456789",
+            "\u{e9}".as_bytes(),
+            "\u{a0}".as_bytes(),
+            "\u{85}".as_bytes(),
+            "\u{9b}".as_bytes(),
+            "\u{20ac}".as_bytes(),
+            "\u{2500}\u{2502}\u{250c}".as_bytes(),
+            "\u{4e2d}\u{6587}".as_bytes(),
+            "\u{1f600}".as_bytes(),
+            "\u{fe0f}\u{200d}".as_bytes(),
+            b"\x1b",
+            b"\r\n",
+            b"\x7f",
+            b"\x80",
+            b"\xbf",
+            b"\xc0\x80",
+            b"\xc1\xbf",
+            b"\xe0\x80\x80",
+            b"\xed\xa0\x80",
+            b"\xf0\x80\x80\x80",
+            b"\xf4\x90\x80\x80",
+            b"\xf8\x88\x80\x80\x80",
+            b"\xe2\x82",
+            b"\xf0\x9f\x98",
+            b"\xc3",
+            b"\xff",
+        ];
+        proptest::collection::vec(proptest::sample::select(PIECES), 0..24)
+            .prop_map(|pieces| pieces.concat())
+    }
+
+    proptest::proptest! {
+        /// ft-yccm0.3.2.3: the one-validation run is the oracle's run, with
+        /// every `AsciiScan`, from every byte that can start a run.
+        #[test]
+        fn ground_run_bulk_matches_the_oracle(bytes in arb_run_piece()) {
+            for scan in AsciiScan::ALL {
+                // One cache across increasing starts, as within a parse call.
+                let mut shared = RunExtents::default();
+                for (start, &byte) in bytes.iter().enumerate() {
+                    if !can_start_printable_run(byte) {
+                        continue;
+                    }
+                    let oracle = ground_run_scalar(&bytes, start, AsciiScan::Scalar);
+                    proptest::prop_assert_eq!(
+                        ground_run_bulk(&bytes, start, scan, &mut RunExtents::default()),
+                        oracle.clone(),
+                        "{:?} from {}",
+                        scan,
+                        start
+                    );
+                    proptest::prop_assert_eq!(
+                        ground_run_bulk(&bytes, start, scan, &mut shared),
+                        oracle,
+                        "{:?} from {} with a shared cache",
+                        scan,
+                        start
+                    );
                 }
             }
         }
