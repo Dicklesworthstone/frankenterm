@@ -32,7 +32,9 @@ thiserror.workspace = true
 # `not(windows)` cfgs in lib.rs). Mac/Linux are unchanged.
 [target.'cfg(not(windows))'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
-tikv-jemalloc-ctl = { workspace = true, optional = true }
+# use_std provides stats_print, the only safe way to read the decay options
+# back from jemalloc (ft-yccm0.2.8).
+tikv-jemalloc-ctl = { workspace = true, optional = true, features = ["use_std"] }
 
 [dev-dependencies]
 criterion.workspace = true

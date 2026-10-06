@@ -511,6 +511,10 @@ pub struct AllocatorSnapshot {
     pub stats: Option<AllocatorStatsSnapshot>,
     /// Why `stats` is `None`.
     pub unavailable: Option<String>,
+    /// jemalloc's run-time options (ft-yccm0.2.8), so a bundle records which
+    /// tuning produced it; `None` when unavailable.
+    #[serde(default)]
+    pub options: Option<crate::JemallocOptions>,
 }
 
 /// Serializable [`crate::AllocatorStats`].
@@ -528,6 +532,7 @@ impl AllocatorSnapshot {
     #[must_use]
     pub fn read() -> Self {
         let backend = crate::allocator_backend().as_str().to_string();
+        let options = crate::jemalloc_options().ok();
         match crate::read_allocator_stats() {
             Ok(stats) => Self {
                 backend,
@@ -539,11 +544,13 @@ impl AllocatorSnapshot {
                     retained: stats.retained as u64,
                 }),
                 unavailable: None,
+                options,
             },
             Err(error) => Self {
                 backend,
                 stats: None,
                 unavailable: Some(error.to_string()),
+                options,
             },
         }
     }
@@ -1026,7 +1033,7 @@ impl AllocatorSnapshot {
     #[must_use]
     pub fn summary_line(&self) -> String {
         let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
-        match (&self.stats, &self.unavailable) {
+        let line = match (&self.stats, &self.unavailable) {
             (Some(stats), _) => format!(
                 "Allocator {}: allocated {:.1} MiB, active {:.1}, resident {:.1}, mapped {:.1}, retained {:.1}",
                 self.backend,
@@ -1038,6 +1045,16 @@ impl AllocatorSnapshot {
             ),
             (None, Some(reason)) => format!("Allocator {}: stats unavailable ({reason})", self.backend),
             (None, None) => format!("Allocator {}: stats unavailable", self.backend),
+        };
+        match self.options {
+            Some(options) => format!(
+                "{line}; background_thread {}, dirty_decay_ms {}, muzzy_decay_ms {}, narenas {}",
+                options.background_thread,
+                options.dirty_decay_ms,
+                options.muzzy_decay_ms,
+                options.narenas
+            ),
+            None => line,
         }
     }
 }
@@ -1593,8 +1610,21 @@ mod tests {
                 ..AllocatorStatsSnapshot::default()
             }),
             unavailable: None,
+            options: Some(crate::JemallocOptions {
+                background_thread: true,
+                dirty_decay_ms: 5000,
+                muzzy_decay_ms: 0,
+                narenas: 8,
+            }),
         };
         assert!(allocator.summary_line().contains("allocated 1.0 MiB"));
+        assert!(
+            allocator
+                .summary_line()
+                .ends_with("background_thread true, dirty_decay_ms 5000, muzzy_decay_ms 0, narenas 8"),
+            "{}",
+            allocator.summary_line()
+        );
         assert!(
             AllocatorSnapshot::read()
                 .summary_line()

@@ -100,6 +100,22 @@ use frankenterm_gui::{
     window_state_persist,
 };
 
+/// The GUI's jemalloc configuration (ft-yccm0.2.8; values and rationale on
+/// [`frankenterm_alloc::GUI_JEMALLOC_CONF`]). jemalloc reads this symbol when
+/// it initializes, before `main`; tikv-jemalloc-sys prefixes jemalloc's public
+/// symbols with `_rjem_`, and its own `malloc_conf` is a weak definition that
+/// this strong one replaces. `_RJEM_MALLOC_CONF` in the environment still
+/// overrides it for measurement runs.
+// SAFETY: the exported value is an immutable pointer to a 'static,
+// NUL-terminated byte string, which is exactly jemalloc's
+// `const char *malloc_conf`; `Option<&u8>` has the same layout as that
+// nullable pointer. jemalloc only reads it, and nothing else defines the name.
+#[cfg(all(feature = "jemalloc", not(windows)))]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+#[used]
+static GUI_JEMALLOC_MALLOC_CONF: Option<&'static u8> =
+    Some(&frankenterm_alloc::GUI_JEMALLOC_CONF[0]);
+
 static AUTO_CONNECT_ENABLED: AtomicBool = AtomicBool::new(false);
 static AUTO_CONNECT_STARTUP_READY: AtomicBool = AtomicBool::new(false);
 static AUTO_CONNECT_SUPERVISOR_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -3786,6 +3802,27 @@ fn maybe_show_configuration_error_window() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ft-yccm0.2.8: this binary links the GUI's `malloc_conf` export, so the
+    /// running jemalloc must report exactly the tuned options. Reading them
+    /// back from jemalloc proves the symbol is honoured, not just present.
+    #[cfg(all(feature = "jemalloc", not(windows)))]
+    #[test]
+    fn gui_binary_runs_jemalloc_with_its_tuned_options() {
+        assert!(
+            std::env::var_os("_RJEM_MALLOC_CONF").is_none(),
+            "_RJEM_MALLOC_CONF overrides the compiled tuning; unset it to run this test"
+        );
+        let options = frankenterm_alloc::jemalloc_options().expect("jemalloc options");
+        assert!(options.background_thread, "{options:?}");
+        assert_eq!(options.dirty_decay_ms, 5000, "{options:?}");
+        assert_eq!(options.muzzy_decay_ms, 0, "{options:?}");
+        assert!(
+            frankenterm_alloc::GUI_JEMALLOC_CONF
+                .starts_with(b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:0"),
+            "this test pins the values the conf string sets"
+        );
+    }
 
     #[test]
     fn same_path_gui_version_mismatch_preserves_new_gui_publication() {

@@ -114,6 +114,93 @@ pub enum AllocatorStatsError {
     /// Stats are unavailable because jemalloc support is not compiled in.
     #[error("jemalloc support is disabled (enable feature `jemalloc`)")]
     JemallocNotEnabled,
+    /// jemalloc's stats report could not be produced.
+    #[error("jemalloc stats report failed: {0}")]
+    StatsReport(std::io::Error),
+    /// jemalloc's stats report lacked an expected run-time option.
+    #[error("jemalloc stats report has no usable opt.{0}")]
+    MissingOption(&'static str),
+}
+
+/// The jemalloc configuration the GUI binary installs through its
+/// `malloc_conf` export (ft-yccm0.2.8), NUL-terminated as jemalloc reads it.
+///
+/// - `background_thread:true`: purging runs on jemalloc's own threads. Without
+///   them jemalloc decays dirty pages only while some thread allocates, so a
+///   GUI that goes idle after a flood keeps its freed pages resident until
+///   macOS compresses or swaps them (the 0.15.2 incident: ~4.2 GB of jemalloc
+///   heap in 31,947 mappings, mostly swapped).
+/// - `dirty_decay_ms:5000`: half the 10 s default, so a freed burst returns to
+///   the OS within seconds of going idle, while a paint loop that frees and
+///   reallocates every frame keeps reusing its dirty pages.
+/// - `muzzy_decay_ms:0`: jemalloc 5.3's default, stated so the whole policy is
+///   in one place.
+///
+/// Provisional until the M.6 bundles and the T1 ABBA run measure it. A run
+/// can override it without a rebuild through `_RJEM_MALLOC_CONF`, which
+/// jemalloc applies after this compiled-in string.
+pub const GUI_JEMALLOC_CONF: &[u8] = b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:0\0";
+
+/// jemalloc run-time options in effect, read back from jemalloc itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JemallocOptions {
+    /// `opt.background_thread`.
+    pub background_thread: bool,
+    /// `opt.dirty_decay_ms` (-1 disables decay).
+    pub dirty_decay_ms: i64,
+    /// `opt.muzzy_decay_ms` (-1 disables decay).
+    pub muzzy_decay_ms: i64,
+    /// `opt.narenas`.
+    pub narenas: u64,
+}
+
+/// The jemalloc options this process is running with, taken from jemalloc's
+/// own JSON stats report (the decay options have no typed accessor).
+pub fn jemalloc_options() -> Result<JemallocOptions, AllocatorStatsError> {
+    #[cfg(all(feature = "jemalloc", not(windows)))]
+    {
+        use tikv_jemalloc_ctl::stats_print::{Options, stats_print};
+
+        let mut options = Options::default();
+        options.json_format = true;
+        // "opt" is part of the constant section, so constants stay in.
+        options.skip_merged_arenas = true;
+        options.skip_per_arena = true;
+        options.skip_bin_size_classes = true;
+        options.skip_large_size_classes = true;
+        options.skip_mutex_statistics = true;
+        let mut report = Vec::new();
+        stats_print(&mut report, options).map_err(AllocatorStatsError::StatsReport)?;
+        parse_jemalloc_options(&report)
+    }
+
+    #[cfg(not(all(feature = "jemalloc", not(windows))))]
+    {
+        Err(AllocatorStatsError::JemallocNotEnabled)
+    }
+}
+
+/// Extract [`JemallocOptions`] from a jemalloc JSON stats report.
+#[cfg(any(test, all(feature = "jemalloc", not(windows))))]
+fn parse_jemalloc_options(report: &[u8]) -> Result<JemallocOptions, AllocatorStatsError> {
+    let value: serde_json::Value = serde_json::from_slice(report).map_err(|error| {
+        AllocatorStatsError::StatsReport(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })?;
+    let opt = &value["jemalloc"]["opt"];
+    Ok(JemallocOptions {
+        background_thread: opt["background_thread"]
+            .as_bool()
+            .ok_or(AllocatorStatsError::MissingOption("background_thread"))?,
+        dirty_decay_ms: opt["dirty_decay_ms"]
+            .as_i64()
+            .ok_or(AllocatorStatsError::MissingOption("dirty_decay_ms"))?,
+        muzzy_decay_ms: opt["muzzy_decay_ms"]
+            .as_i64()
+            .ok_or(AllocatorStatsError::MissingOption("muzzy_decay_ms"))?,
+        narenas: opt["narenas"]
+            .as_u64()
+            .ok_or(AllocatorStatsError::MissingOption("narenas"))?,
+    })
 }
 
 /// Read allocator statistics.
@@ -413,6 +500,70 @@ mod tests {
 
         #[cfg(not(all(feature = "jemalloc", not(windows))))]
         assert_eq!(allocator_backend(), AllocatorBackend::System);
+    }
+
+    /// ft-yccm0.2.8 config presence: the GUI's jemalloc string is one
+    /// NUL-terminated ASCII list that sets exactly the tuned options.
+    #[test]
+    fn gui_jemalloc_conf_sets_background_thread_and_decay() {
+        let (last, body) = GUI_JEMALLOC_CONF.split_last().unwrap();
+        assert_eq!(*last, 0, "jemalloc reads malloc_conf as a C string");
+        assert!(!body.contains(&0), "no interior NUL may truncate the list");
+        let text = std::str::from_utf8(body).unwrap();
+        assert!(text.is_ascii());
+        let pairs: std::collections::BTreeMap<&str, &str> = text
+            .split(',')
+            .map(|pair| pair.split_once(':').expect("key:value"))
+            .collect();
+        assert_eq!(pairs.len(), 3, "{text}");
+        assert_eq!(pairs["background_thread"], "true");
+        let dirty: i64 = pairs["dirty_decay_ms"].parse().unwrap();
+        assert!(
+            (0..10_000).contains(&dirty),
+            "tuned below jemalloc's 10 s default"
+        );
+        assert_eq!(pairs["muzzy_decay_ms"], "0");
+    }
+
+    #[test]
+    fn jemalloc_options_parse_from_the_stats_report_shape() {
+        let report = br#"{"jemalloc": {"version": "5.3.1", "opt": {"abort": false,
+            "background_thread": true, "dirty_decay_ms": 5000, "muzzy_decay_ms": 0,
+            "narenas": 56, "retain": true}}}"#;
+        assert_eq!(
+            parse_jemalloc_options(report).unwrap(),
+            JemallocOptions {
+                background_thread: true,
+                dirty_decay_ms: 5000,
+                muzzy_decay_ms: 0,
+                narenas: 56,
+            }
+        );
+        let disabled = br#"{"jemalloc": {"opt": {"background_thread": false,
+            "dirty_decay_ms": -1, "muzzy_decay_ms": -1, "narenas": 4}}}"#;
+        assert_eq!(parse_jemalloc_options(disabled).unwrap().dirty_decay_ms, -1);
+        let missing = br#"{"jemalloc": {"opt": {"background_thread": true}}}"#;
+        assert!(matches!(
+            parse_jemalloc_options(missing),
+            Err(AllocatorStatsError::MissingOption("dirty_decay_ms"))
+        ));
+        assert!(matches!(
+            parse_jemalloc_options(b"not json"),
+            Err(AllocatorStatsError::StatsReport(_))
+        ));
+    }
+
+    #[test]
+    fn jemalloc_options_read_back_from_the_running_allocator() {
+        let options = jemalloc_options();
+        #[cfg(all(feature = "jemalloc", not(windows)))]
+        {
+            let options = options.expect("jemalloc reports its options");
+            assert!(options.narenas > 0);
+            assert!(options.dirty_decay_ms >= -1 && options.muzzy_decay_ms >= -1);
+        }
+        #[cfg(not(all(feature = "jemalloc", not(windows))))]
+        assert!(matches!(options, Err(AllocatorStatsError::JemallocNotEnabled)));
     }
 
     #[test]
