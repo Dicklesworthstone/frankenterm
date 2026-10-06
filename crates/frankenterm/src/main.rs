@@ -68503,6 +68503,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 })
                 .collect();
 
+            // ft-yccm0.2.5: live GPU resource ledgers published by GUI
+            // processes (they are not visible from this process otherwise).
+            let (gpu_resources_report, gpu_resources_check) = gui_gpu_resources_doctor_report(
+                ::config::RUNTIME_DIR.as_path(),
+                frankenterm_alloc::resource_ledger::unix_now_ms(),
+            );
+            all_checks.push(gpu_resources_check);
+
             let large_swarm_proof_gauntlet_report =
                 frankenterm_core::large_swarm_replay::build_large_swarm_proof_gauntlet_manifest(
                     &layout.root,
@@ -68608,6 +68616,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 // reports the no-atlases sentinel.
                 result["atlas_tier_swap"] = serde_json::to_value(&tier_swap_doctor_report)
                     .unwrap_or(serde_json::Value::Null);
+                result["gpu_resources"] = gpu_resources_report;
                 result["hardware_profile"] = serde_json::to_value(&hardware_profile_report)
                     .unwrap_or(serde_json::Value::Null);
                 result["large_swarm_proof_gauntlet"] = match &large_swarm_proof_gauntlet_report {
@@ -97524,6 +97533,83 @@ fn build_session_recovery_guidance(
         summary: "Session persistence is healthy; no recovery action is required.".to_string(),
         next_steps,
     }
+}
+
+/// ft-yccm0.2.5: the GPU resource ledgers that GUI processes publish into
+/// `dir`, as the `gpu_resources` JSON block plus one diagnostic check. A GPU
+/// leak is invisible to the CPU heap, so these live counters are the only
+/// way to tell a leaked atlas from a large cache.
+fn gui_gpu_resources_doctor_report(
+    dir: &std::path::Path,
+    now_unix_ms: u64,
+) -> (serde_json::Value, DiagnosticCheck) {
+    use frankenterm_alloc::resource_ledger::{
+        RESOURCE_SNAPSHOT_FRESHNESS, collect_resource_snapshots,
+    };
+    const NAME: &str = "GUI GPU resources";
+    let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+    let collection = match collect_resource_snapshots(dir, now_unix_ms, RESOURCE_SNAPSHOT_FRESHNESS)
+    {
+        Ok(collection) => collection,
+        Err(error) => {
+            return (
+                serde_json::json!({ "dir": dir, "error": error.to_string() }),
+                DiagnosticCheck::warning(
+                    NAME,
+                    format!("cannot read {}: {error}", dir.display()),
+                    "Check the permissions of the FrankenTerm runtime directory",
+                ),
+            );
+        }
+    };
+    let stale = collection.snapshots.len() - collection.fresh().count();
+    let live: Vec<String> = collection
+        .fresh()
+        .map(|collected| {
+            let gpu = &collected.snapshot.gpu;
+            let atlas = gpu.textures.get("atlas").copied().unwrap_or_default();
+            format!(
+                "pid {}: {} texture(s) {:.1} MiB live (atlas {} / {:.1} MiB, peak {:.1} MiB), {} buffer(s) {:.1} MiB, {} atlas rebuild(s)",
+                collected.snapshot.pid,
+                gpu.texture_total.live_count,
+                mib(gpu.texture_total.live_bytes),
+                atlas.live_count,
+                mib(atlas.live_bytes),
+                mib(atlas.peak_live_bytes),
+                gpu.buffer_total.live_count,
+                mib(gpu.buffer_total.live_bytes),
+                gpu.atlas_generations,
+            )
+        })
+        .collect();
+    let detail = if live.is_empty() {
+        format!(
+            "no live GUI ledger in {} ({stale} stale snapshot(s))",
+            dir.display()
+        )
+    } else {
+        format!("{} ({stale} stale snapshot(s))", live.join("; "))
+    };
+    let check = if collection.unreadable.is_empty() {
+        DiagnosticCheck::ok_with_detail(NAME, detail)
+    } else {
+        DiagnosticCheck::warning(
+            NAME,
+            format!(
+                "{detail}; {} unreadable snapshot file(s)",
+                collection.unreadable.len()
+            ),
+            "Inspect gpu_resources.unreadable in `ft doctor --json`",
+        )
+    };
+    let mut value = serde_json::to_value(&collection).unwrap_or(serde_json::Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "fresh_within_ms".to_string(),
+            serde_json::json!(RESOURCE_SNAPSHOT_FRESHNESS.as_millis() as u64),
+        );
+    }
+    (value, check)
 }
 
 fn build_doctor_operator_guidance(
@@ -141846,6 +141932,84 @@ A  docs/new-proof.md\n";
             diagnostic.recommendation.as_deref(),
             Some("Review connector throttles: ft robot policy quarantine-list"),
         );
+    }
+
+    // --- GUI GPU resource ledger (ft-yccm0.2.5) ---
+
+    #[test]
+    fn doctor_gpu_resources_reports_published_gui_ledgers() {
+        use frankenterm_alloc::resource_ledger::{
+            AllocatorSnapshot, CacheGauge, CacheGauges, GpuResourceLedger, GpuTexturePurpose,
+            PaneResourceSnapshot, ResourceSnapshotBody, ResourceSnapshotEnvelope,
+            publish_resource_snapshot,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let (empty, empty_check) = gui_gpu_resources_doctor_report(dir.path(), 1_000_000);
+        assert_eq!(empty_check.status, DiagnosticStatus::Ok);
+        assert!(empty_check.detail.as_deref().unwrap().contains("no live GUI ledger"));
+        assert_eq!(empty["snapshots"].as_array().unwrap().len(), 0);
+
+        let ledger: &'static GpuResourceLedger = Box::leak(Box::new(GpuResourceLedger::new()));
+        let gauges: &'static CacheGauges = Box::leak(Box::new(CacheGauges::new()));
+        let _atlas = ledger.track_texture(GpuTexturePurpose::Atlas, 4 * 1024 * 1024);
+        ledger.record_atlas_generation();
+        let mut window = gauges.contribution();
+        window.set(CacheGauge::ShapeCacheEntries, 321);
+        let live = ResourceSnapshotEnvelope {
+            pid: 4242,
+            published_unix_ms: 1_000_000 - 1_000,
+            ..ResourceSnapshotEnvelope::now(
+                "frankenterm-gui",
+                ResourceSnapshotBody {
+                    panes: vec![PaneResourceSnapshot {
+                        pane_id: 9,
+                        hot_rows: 3_000,
+                        warm_resident_bytes: 65_536,
+                        ..PaneResourceSnapshot::default()
+                    }],
+                    ..ResourceSnapshotBody::from_ledgers(ledger, gauges)
+                },
+                AllocatorSnapshot::read(),
+            )
+        };
+        publish_resource_snapshot(dir.path(), &live).unwrap();
+        let crashed = ResourceSnapshotEnvelope {
+            pid: 17,
+            published_unix_ms: 1_000_000 - 3_600_000,
+            ..live.clone()
+        };
+        publish_resource_snapshot(dir.path(), &crashed).unwrap();
+
+        let (report, check) = gui_gpu_resources_doctor_report(dir.path(), 1_000_000);
+        assert_eq!(check.status, DiagnosticStatus::Ok);
+        let detail = check.detail.unwrap();
+        assert!(detail.contains("pid 4242: 1 texture(s) 4.0 MiB live"), "{detail}");
+        assert!(detail.contains("1 atlas rebuild(s)"), "{detail}");
+        assert!(detail.contains("(1 stale snapshot(s))"), "{detail}");
+        assert!(!detail.contains("pid 17"), "stale ledgers are not reported live");
+
+        let snapshots = report["snapshots"].as_array().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0]["snapshot"]["pid"], 17);
+        assert_eq!(snapshots[0]["stale"], true);
+        assert_eq!(snapshots[1]["stale"], false);
+        assert_eq!(
+            snapshots[1]["snapshot"]["gpu"]["textures"]["atlas"]["live_bytes"],
+            4 * 1024 * 1024
+        );
+        // ft-yccm0.1.7 sections ride along in the same block.
+        let gui = &snapshots[1]["snapshot"];
+        assert_eq!(gui["caches"]["shape_cache_entries"], 321);
+        assert_eq!(gui["panes"][0]["pane_id"], 9);
+        assert_eq!(gui["panes"][0]["warm_resident_bytes"], 65_536);
+        assert!(gui["allocator"]["backend"].is_string());
+        assert_eq!(report["fresh_within_ms"], 90_000);
+
+        std::fs::write(dir.path().join("frankenterm-resources-9.json"), b"{").unwrap();
+        let (report, check) = gui_gpu_resources_doctor_report(dir.path(), 1_000_000);
+        assert_eq!(check.status, DiagnosticStatus::Warning);
+        assert_eq!(report["unreadable"].as_array().unwrap().len(), 1);
     }
 
     // --- Overall doctor JSON envelope ---
