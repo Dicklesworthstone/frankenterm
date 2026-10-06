@@ -4666,6 +4666,8 @@ dependencies = [
  "sha2 0.11.0",
  "terminfo",
  "termwiz 0.24.0",
+ "tikv-jemalloc-ctl",
+ "tikv-jemallocator",
  "unicode-normalization",
  "url",
  "zeroize",

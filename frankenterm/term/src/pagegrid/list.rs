@@ -437,6 +437,9 @@ impl PageList {
     pub fn rotate_up(&mut self, range: Range<StableRowIndex>, n: usize, seqno: SequenceNo) {
         let range = self.clamp(range);
         let n = n.min(range.len());
+        if n > 0 {
+            self.materialize_floors(&range);
+        }
         for _ in 0..n {
             self.clear(range.start, seqno);
             for bubble in range.start..range.end - 1 {
@@ -451,6 +454,9 @@ impl PageList {
     pub fn rotate_down(&mut self, range: Range<StableRowIndex>, n: usize, seqno: SequenceNo) {
         let range = self.clamp(range);
         let n = n.min(range.len());
+        if n > 0 {
+            self.materialize_floors(&range);
+        }
         for _ in 0..n {
             self.clear(range.end - 1, seqno);
             for bubble in (range.start + 1..range.end).rev() {
@@ -458,6 +464,30 @@ impl PageList {
             }
         }
         self.debug_check_counts();
+    }
+
+    /// Writes the range floors covering `range` into its rows before they
+    /// move. A floor belongs to a position, but a rotated row must carry its
+    /// bump with it, as a legacy `Line` carries its seqno (I10). Floors only
+    /// cover rows that were sealed when marked; a taller viewport can bring
+    /// those rows into a scroll region. The floors stay, so the positions
+    /// keep reading as changed, which is conservative.
+    fn materialize_floors(&mut self, range: &Range<StableRowIndex>) {
+        if self.range_floors.is_empty() {
+            return;
+        }
+        for stable in range.clone() {
+            let floor = self
+                .range_floors
+                .iter()
+                .filter(|floor| floor.covers(stable))
+                .map(|floor| floor.seqno)
+                .max();
+            if let Some(seqno) = floor {
+                let (page, row) = self.row_mut(stable).expect("a retained row");
+                page.touch_row(row, seqno);
+            }
+        }
     }
 
     fn clamp(&self, range: Range<StableRowIndex>) -> Range<StableRowIndex> {

@@ -55,6 +55,13 @@ k9.workspace = true
 proptest = "1.8.0"
 sha2.workspace = true
 
+# ft-yccm0.3.3.3: tests/pagegrid_alloc.rs counts allocations with jemalloc's
+# per-thread counter. jemalloc's sys crate does not build on windows-msvc
+# (ft-p9hok), so these deps and that test skip Windows.
+[target.'cfg(not(windows))'.dev-dependencies]
+tikv-jemallocator.workspace = true
+tikv-jemalloc-ctl.workspace = true
+
 [[bench]]
 name = "byte_to_grid"
 harness = false
