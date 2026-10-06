@@ -2162,6 +2162,48 @@ mod tests {
         }
     }
 
+    /// ft-yccm0.2.14 batch verify 4: the differential stream above panicked in
+    /// `Line::erase_cell_with_margin` ("removal index should be < len"). A
+    /// grapheme that clusters with the previous cell but arrives in a later
+    /// flush (a split regional-indicator pair, or a skin-tone modifier after
+    /// an emoji, as in the operator's emoji corpus) was appended to clustered
+    /// storage, which re-segmented the two cells into one, so the row's
+    /// `len()` exceeded its materialized cells. Minimized: the second scalar
+    /// in a later call or after an SGR, then CUB and DCH inside the row.
+    #[test]
+    fn zwj_tail_gate_regression_clustering_neighbours_then_dch() {
+        let cases: &[(&str, &str)] = &[("\u{1F1FA}", "\u{1F1F8}"), ("\u{1F600}", "\u{1F3FD}")];
+        for &(first, second) in cases {
+            for &gap in &["", "\x1b[38;5;1m"] {
+                for &force_walk in &[false, true] {
+                    let _walk = RowWalkOverride::set(force_walk);
+                    let mut term = make_terminal();
+                    term.advance_bytes(first.as_bytes());
+                    term.advance_bytes(format!("{gap}{second}").as_bytes());
+                    term.advance_bytes(b"\x1b[D\x1b[P");
+                    let screen = term.screen();
+                    let top = screen.physical_rows.min(screen.scrollback_rows());
+                    let row = screen.scrollback_rows() - top;
+                    screen.with_phys_lines(row..row + 1, |lines| {
+                        let line = lines[0];
+                        let widths: usize = line.visible_cells().map(|cell| cell.width()).sum();
+                        assert_eq!(
+                            line.len(),
+                            widths,
+                            "row length diverged from its cells for {first:?} {gap:?} {second:?}"
+                        );
+                        assert_eq!(
+                            line.visible_cells()
+                                .next()
+                                .map(|cell| cell.str().to_string()),
+                            Some(first.to_string())
+                        );
+                    });
+                }
+            }
+        }
+    }
+
     /// ft-yccm0.2.14: after a ZWJ-tail cell has existed (here, a ZWJ sequence
     /// split across calls), `zwj_tail_cell_possible` stays set, yet multi-byte
     /// prints separated only by SGR must not walk the row: the cell printed
