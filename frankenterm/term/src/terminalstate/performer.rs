@@ -1825,6 +1825,74 @@ mod tests {
         }
     }
 
+    /// ft-yccm0.2.11: `print` skips the multi-byte continuation scan while no
+    /// cell can end in ZWJ. Forcing `zwj_tail_cell_possible` on restores the
+    /// unconditional scan, so identical terminals prove the gate is exact.
+    /// Streams mix emoji, ZWJ, VS16, combining marks, regional indicators,
+    /// CJK, SGR changes, line breaks, cursor moves and erases, and each one is
+    /// split at a varying byte so continuations also cross `advance_bytes`
+    /// calls.
+    #[test]
+    fn zwj_tail_gate_matches_unconditional_continuation_scan() {
+        use std::convert::TryFrom;
+
+        let pieces: &[&str] = &[
+            "😀",
+            "🚀",
+            "A",
+            "中",
+            "é",
+            "e\u{301}",
+            "\u{301}",
+            "❤",
+            "\u{FE0F}",
+            "👨",
+            "\u{200D}",
+            "👩",
+            "🇺",
+            "🇸",
+            "\x1b[38;5;196m",
+            "\x1b[48;5;21m",
+            "\x1b[0m",
+            "\r\n",
+            "\x1b[3D",
+            "\x1b[2C",
+            "\x1b[K",
+            "\x1b[1;5H",
+            " ",
+        ];
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..200 {
+            let mut stream = String::new();
+            for _ in 0..64 {
+                let pick = usize::try_from(next() % pieces.len() as u64).unwrap_or(0);
+                stream.push_str(pieces[pick]);
+            }
+            let bytes = stream.as_bytes();
+            let split = usize::try_from(next() % (bytes.len() as u64 + 1)).unwrap_or(0);
+            let run = |force_scan: bool| {
+                let mut term = make_terminal();
+                if force_scan {
+                    term.zwj_tail_cell_possible = true;
+                }
+                term.advance_bytes(&bytes[..split]);
+                term.advance_bytes(&bytes[split..]);
+                snapshot_terminal(&term)
+            };
+            assert_eq!(
+                run(false),
+                run(true),
+                "ZWJ-tail gate diverged from the unconditional scan in case {case}: {stream:?}"
+            );
+        }
+    }
+
     /// Round-5 D1 (ft-round5-gauntlet-lw0s7.10): the parser printable-run
     /// batching optimization emits `Action::PrintString` for ground-state
     /// printable runs instead of one `Action::Print` per codepoint. The

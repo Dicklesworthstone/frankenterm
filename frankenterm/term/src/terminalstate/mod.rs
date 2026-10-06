@@ -497,9 +497,12 @@ pub struct TerminalState {
     unicode_version_stack: Vec<UnicodeVersionStackEntry>,
 
     /// Whether any cell of either screen may hold text ending in U+200D (ZWJ).
-    /// Only the performer writes arbitrary grapheme text, so this becomes true
-    /// the first time it writes such a cell and stays true; restored state
-    /// starts true because its cells were not written by this performer.
+    /// New grapheme text reaches cells only through the performer, so this
+    /// becomes true the first time it writes such a cell and stays true. Other
+    /// writers copy or re-lay-out existing cells (reflow, rectangle copies, and
+    /// cold-history layouts read back from this pane's own spill store), which
+    /// cannot introduce a ZWJ tail this performer never wrote. Restored
+    /// checkpoints start true because their cells came from elsewhere.
     /// While false, a multi-byte grapheme cannot continue its left neighbour,
     /// so `print` skips the cluster-continuation scan entirely.
     zwj_tail_cell_possible: bool,

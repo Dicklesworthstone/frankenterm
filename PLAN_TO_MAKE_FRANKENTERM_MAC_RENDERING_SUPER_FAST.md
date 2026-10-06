@@ -1,10 +1,12 @@
 # PLAN TO MAKE FRANKENTERM MAC RENDERING SUPER FAST
 
-> **The plan has been converted to beads.** Epic **`ft-yccm0`** has 94 child beads and 148 blocking edges. Its description holds the full plan-label -> bead legend, and each bead is self-contained. Treat the beads as the source of truth from here on; this file is the original narrative.
+> **The plan has been converted to beads.** Epic **`ft-yccm0`** has 95 child beads (94 from the plan plus follow-up `ft-yccm0.2.14`). Its description holds the full plan-label -> bead legend, and each bead is self-contained. Treat the beads as the source of truth from here on; this file is the original narrative, and where its numbers differ from the beads, the beads are newer.
 >
 > **Primary acceptance test (T0).** This is the operator's own test: `time \cat color-emoji-random.bin`. The corpus is 30M frames of `ESC[38;5;{fg}m ESC[48;5;{bg}m {emoji-or-ascii}`, 749,801,000 bytes. Compare **total time and FPS** against Ghostty, which measured `41.827 s total` on a busy machine.
 >
-> Headless on a 64 MiB slice: ghostty-bench 1.6-2.0 s vs FrankenTerm 10.3 s. 52% of FrankenTerm's time is an O(cursor_x) allocating scan in `Performer::recluster_at_cursor`, which runs on every multi-byte grapheme. Bead `ft-yccm0.2.11` fixes it.
+> Headless on a 64 MiB slice, measured in a quieter window: ghostty-bench 0.42-0.50 s vs FrankenTerm 2.6-2.9 s. Under heavy load the same pair measured 1.6-2.0 s vs 10.3 s.
+>
+> 52% of FrankenTerm's time was an O(cursor_x) allocating scan in `Performer::recluster_at_cursor`, which ran on every multi-byte grapheme. That was fixed in 2f7920f79 (`ft-yccm0.2.11`): FrankenTerm now takes 0.862 s on that slice, against Ghostty's 0.42-0.50 s.
 >
 > Evidence: `evidence/mac-render-perf/2026-10-05/`.
 
@@ -54,10 +56,10 @@ All rows are measured on the same host, interleaved with a pinned Ghostty (an AB
 | T3 | PTY drain throughput | long ASCII lines (`cat` of a source corpus) | TBD | ≥ 1.25× |
 | T4 | PTY drain throughput | Unicode/CJK/emoji heavy | TBD | ≥ 1.0× |
 | T5 | PTY drain throughput | TUI full-screen repaint (cursor addressing, as in Claude Code or htop) | TBD | ≥ 1.25× |
-| L1 | Keypress-to-photon p50 / p99 | idle shell, 120 Hz ProMotion | TBD | p50 ≤ Ghostty − 2 ms, p99 ≤ 16 ms |
+| L1 | Keypress-to-photon p50 / p99 | idle shell, at display refresh (60 Hz on the operator's 6K display; 120 Hz on ProMotion) | TBD | p50 ≤ Ghostty − 2 ms, p99 ≤ 16 ms |
 | L2 | Keypress-to-photon while another pane floods | T1 running in a sibling pane | TBD | p99 ≤ 25 ms; the UI thread never blocks more than 4 ms |
 | S1 | Frame pacing during a flood | T1 | — | p99 frame interval ≤ 1.25 × the refresh interval; 0 beach balls |
-| S2 | Scroll smoothness | trackpad scroll through 100k lines of scrollback | — | 120 fps sustained, 0 dropped frames |
+| S2 | Scroll smoothness | trackpad scroll through 100k lines of scrollback | — | display refresh sustained (60 fps on the 6K display, 120 on ProMotion), 0 dropped frames |
 | M1 | Bytes per cell, resident | colored text | Ghostty: 8 B cell + style id | ≤ 8 B |
 | M2 | GUI footprint after T1 | single window | — | ≤ 1 GB RSS, bounded GPU memory, no growth over 24 h |
 | E1 | Idle GPU and CPU power | idle 6K window | — | ≤ Ghostty, measured with `powermetrics` |
@@ -372,7 +374,7 @@ Where the `seq` time goes (from the sample):
 ## 8. Measurement and verification substrate (build first, in parallel with A)
 
 1. **`frankenterm-term` bench lane `ingest_throughput`.** Bring the scratch `ftbench` in-tree as a proper Criterion bench plus CLI, with corpora generated deterministically from seeds: color-random, seq, long-lines, unicode, TUI-repaint. Lanes: parse, term, mux-two-stage, and production-config.
-2. **Pinned incumbent.** `ghostty-bench +terminal-stream --data <same file> --terminal-rows 80 --terminal-cols 120`, built from a pinned Ghostty SHA with a pinned zig (0.16.0 is required at `e500d414f`). Record the incumbent contract per the mega-kernel skill's `INCUMBENT-CONTRACT-TEMPLATE`.
+2. **Pinned incumbent.** `ghostty-bench +terminal-stream --data=<same file> --terminal-rows=80 --terminal-cols=120`, built from a pinned Ghostty SHA with a pinned zig (0.16.0 is required at `e500d414f`). Record the incumbent contract per the mega-kernel skill's `INCUMBENT-CONTRACT-TEMPLATE`.
 3. **GUI end-to-end harness** `scripts/mac-gui-throughput.sh`:
    - Launch a dev GUI with an **isolated HOME/XDG** and no socket env (memory: e2e-harness-live-mux-hazard), using `--always-new-process`.
    - Spawn `cat <corpus>` in a pane and measure drain time from the TTY offset (`lsof -o`), plus frame-interval telemetry.
