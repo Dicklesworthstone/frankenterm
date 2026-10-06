@@ -340,6 +340,13 @@ impl GuardianHistoricalKeyLookup for std::sync::MutexGuard<'_, GuardianOutputKey
 /// One serialized persistence operation may authenticate several records with
 /// the same authority. Keep its durable lock lease alive across those lookups,
 /// while every lookup still validates the pinned inode and key inventory.
+///
+/// Manifest publication no longer uses this exclusive scope: it holds the
+/// process-wide keyring mutex only to resolve its signing key and
+/// authenticates under a shared historical lease, so panes do not convoy
+/// (ft-yccm0.2.1.5). The scope stays, with its lease and tamper tests, for
+/// the owner to retire or reuse.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct GuardianOutputKeyringScope<'a> {
     keyring: &'a mut GuardianOutputKeyring,
 }
@@ -550,6 +557,12 @@ impl GuardianOutputKeyring {
         self.active.generation
     }
 
+    /// Whether a trusted full validation currently arms the stat fast path.
+    #[cfg(test)]
+    pub(crate) fn fast_path_validated(&self) -> bool {
+        self.validated_authority.is_some()
+    }
+
     #[must_use]
     pub const fn active_key_id(&self) -> [u8; 8] {
         self.active.key_id
@@ -563,6 +576,7 @@ impl GuardianOutputKeyring {
         self.pending_generation
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn scoped_authority(
         &mut self,
     ) -> Result<GuardianOutputKeyringScope<'_>, GuardianOutputKeyringError> {
@@ -597,6 +611,17 @@ impl GuardianOutputKeyring {
         key_id: [u8; 8],
     ) -> Result<GuardianOutputCipher, GuardianOutputKeyringError> {
         let _authority_lease = self.acquire_authority_lease(false)?;
+        // The append path authenticates with the active key. While the stat
+        // fingerprint of a full validation under a second ago still holds,
+        // the full inventory would find exactly the state it validated
+        // (ft-yccm0.2.1.5: no keyring rescan per lookup).
+        if key_id == self.active.key_id
+            && let Some((validated, at)) = self.validated_authority
+            && at.elapsed() < AUTHORITY_REVALIDATE_INTERVAL
+            && authority_fingerprint(&self.directory, self.active).as_ref() == Some(&validated)
+        {
+            return self.active_key.cipher().map_err(Into::into);
+        }
         historical_cipher(&self.directory, key_id)
     }
 
@@ -1018,7 +1043,16 @@ struct Inventory {
     pending: Option<PublicationIntent>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Full keyring directory scans on this thread, for tests that prove a
+    /// path stays off the inventory (ft-yccm0.2.1.5).
+    pub(crate) static INVENTORY_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn inventory(directory: &CapDir) -> Result<Inventory, GuardianOutputKeyringError> {
+    #[cfg(test)]
+    INVENTORY_SCANS.with(|scans| scans.set(scans.get() + 1));
     let mut inventory = Inventory::default();
     for entry in directory.entries()? {
         let entry = entry?;
@@ -2837,6 +2871,74 @@ mod tests {
             historical.cipher_for_key_id(active).is_err(),
             "a rewritten active key must fail the historical lookup"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keyring_lookup_of_the_active_key_skips_the_inventory_until_the_keyring_changes() {
+        use std::time::{Duration, Instant};
+
+        let root = tempfile::tempdir().expect("create keyring lookup root");
+        let scrollback = root.path().join("scrollback-lines");
+        std::fs::create_dir(&scrollback).expect("create scrollback directory");
+        let shared = GuardianOutputKeyring::shared_scrollback_sibling(&scrollback)
+            .expect("shared authority");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let keyring = loop {
+            let mut keyring = shared.lock().unwrap();
+            keyring.latest_active_cipher().unwrap();
+            if keyring.validated_authority.is_some() {
+                break keyring;
+            }
+            drop(keyring);
+            assert!(Instant::now() < deadline, "fast path never engaged");
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        let active = keyring.active_key_id();
+        let scans = || INVENTORY_SCANS.with(std::cell::Cell::get);
+
+        // ft-yccm0.2.1.5: the MutexGuard lookup path (manifest and WAL
+        // authentication) no longer rescans the keyring for the active key.
+        let before = scans();
+        for _ in 0..8 {
+            assert_eq!(keyring.cipher_for_key_id(active).unwrap().key_id(), active);
+        }
+        let lookup: &dyn GuardianHistoricalKeyLookup = &keyring;
+        assert_eq!(lookup.cipher_for_key_id(active).unwrap().key_id(), active);
+        assert_eq!(scans(), before, "no inventory while the fingerprint holds");
+        // A key that is not the active one still takes the full inventory,
+        // and an unknown one fails closed.
+        assert!(matches!(
+            keyring.cipher_for_key_id([0x11; 8]),
+            Err(GuardianOutputKeyringError::UnactivatedKey)
+        ));
+        assert!(scans() > before);
+
+        // Another opener rotates: the old key stays readable for old rows,
+        // through the full path now that the directory changed.
+        let rotated = GuardianOutputKeyring::open_or_provision_scrollback_sibling(&scrollback)
+            .expect("second opener")
+            .rotate()
+            .expect("second opener rotates");
+        let before = scans();
+        assert_eq!(keyring.cipher_for_key_id(active).unwrap().key_id(), active);
+        assert_eq!(
+            keyring.cipher_for_key_id(rotated).unwrap().key_id(),
+            rotated
+        );
+        assert!(scans() > before, "a changed keyring is rescanned");
+
+        // Rewriting the old active key in place fails closed.
+        let mut options = CapOpenOptions::new();
+        options.write(true).follow(FollowSymlinks::No);
+        let mut file = keyring
+            .directory
+            .open_with(key_name(active), &options)
+            .expect("open key for mutation");
+        file.write_all(&[0x5a; GuardianOutputCipher::KEY_BYTES])
+            .expect("change key material without changing inode");
+        file.sync_all().expect("synchronize changed key");
+        assert!(keyring.cipher_for_key_id(active).is_err());
     }
 
     #[test]

@@ -121,6 +121,9 @@ std::thread_local! {
     static LIVE_SCROLLBACK_WAL_RECORD_DIGESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_CHAIN_LINK_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_MANIFEST_PUBLICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Whether the process-wide keyring mutex was free at the last manifest
+    /// rename (ft-yccm0.2.1.5: publications must not convoy across panes).
+    static LIVE_SCROLLBACK_KEYRING_FREE_AT_RENAME: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static LIVE_SCROLLBACK_CONTENT_GROUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_BATCH_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
@@ -8492,18 +8495,34 @@ impl LiveScrollbackSpillSink {
             let verified_ledger = state.verified_ledger;
             drop(state);
             let ledger_pane_id = self.active_ledger_pane_id();
-            let mut keyring_guard = if authenticated_manifest {
+            // ft-yccm0.2.1.5: the process-wide keyring mutex is held only to
+            // resolve the signing key. Authentication of the staged and
+            // published manifest runs under a shared authority lease, which
+            // blocks rotation but not other panes, so manifest syncs and the
+            // rename no longer convoy every pane behind one mutex. The
+            // exclusive lease `latest_active_cipher` takes is released before
+            // the shared one is taken: one process never nests them.
+            let signing_cipher = if authenticated_manifest {
+                let mut keyring = self
+                    .lock_keyring("persist_manifest signing key")
+                    .map_err(anyhow::Error::new)?;
                 Some(
-                    self.lock_keyring("persist_manifest authentication")
-                        .map_err(anyhow::Error::new)?,
+                    keyring
+                        .latest_active_cipher()
+                        .context("load guardian manifest-authentication key")?,
                 )
             } else {
                 None
             };
-            let mut keyring = keyring_guard
-                .as_mut()
-                .map(|keyring| keyring.scoped_authority())
-                .transpose()?;
+            let keyring = if authenticated_manifest {
+                Some(
+                    guardian_output_keys::GuardianOutputKeyring::historical_authority(
+                        &self.keyring,
+                    )?,
+                )
+            } else {
+                None
+            };
 
             let (
                 oldest_seq,
@@ -8612,12 +8631,9 @@ impl LiveScrollbackSpillSink {
                 manifest_sha256: String::new(),
             };
 
-            if let Some(keyring) = keyring.as_mut() {
+            if let Some(cipher) = signing_cipher.as_ref() {
                 expected_live_scrollback_v4_chain(&manifest)?;
                 let canonical = Self::manifest_authentication_bytes(&manifest)?;
-                let cipher = keyring
-                    .latest_active_cipher()
-                    .context("load guardian manifest-authentication key")?;
                 manifest.guardian_manifest_authentication = Some(
                     cipher
                         .authenticate_scrollback_manifest(&canonical)
@@ -8728,6 +8744,9 @@ impl LiveScrollbackSpillSink {
                     });
                 }
             }
+            #[cfg(test)]
+            LIVE_SCROLLBACK_KEYRING_FREE_AT_RENAME
+                .with(|free| free.set(Some(self.keyring.try_lock().is_ok())));
             std::fs::rename(&temp_path, &self.manifest_path).with_context(|| {
                 format!(
                     "publish scrollback manifest {}",
@@ -12174,6 +12193,50 @@ mod tests {
         )
         .unwrap();
         (dir, backing, deferred)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn steady_state_commits_rescan_no_keyring_and_publish_without_the_keyring_mutex() {
+        use std::time::{Duration, Instant};
+
+        let (_dir, backing, _deferred) = deferred_test_sink();
+        let line = |row: isize| {
+            Line::from_text(&format!("epoch {row}"), &CellAttributes::blank(), 0, None)
+        };
+        // The first append establishes the authenticated lineage.
+        assert_eq!(backing.store_scrollback_lines(0, &[line(0)], 1_000), 1);
+        // Fresh keyring stamps are racy: wait until a full validation arms
+        // the stat fast path.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let mut keyring = backing.lock_keyring("settle keyring").unwrap();
+            keyring.latest_active_cipher().unwrap();
+            if keyring.fast_path_validated() {
+                break;
+            }
+            drop(keyring);
+            assert!(Instant::now() < deadline, "keyring fast path never engaged");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let scans = || guardian_output_keys::INVENTORY_SCANS.with(std::cell::Cell::get);
+        let before = scans();
+        LIVE_SCROLLBACK_KEYRING_FREE_AT_RENAME.with(|free| free.set(None));
+        let lines: Vec<_> = (1..65).map(line).collect();
+        assert_eq!(backing.store_scrollback_lines(1, &lines, 1_000), 64);
+        // ft-yccm0.2.1.5: one pane's manifest syncs and rename no longer hold
+        // the keyring mutex every pane's commit needs, and a steady-state
+        // commit rescans no keyring directory.
+        assert_eq!(
+            LIVE_SCROLLBACK_KEYRING_FREE_AT_RENAME.with(std::cell::Cell::get),
+            Some(true),
+            "the manifest rename held the process-wide keyring mutex"
+        );
+        assert_eq!(
+            scans() - before,
+            0,
+            "a steady-state commit scanned the keyring directory"
+        );
     }
 
     #[cfg(unix)]
