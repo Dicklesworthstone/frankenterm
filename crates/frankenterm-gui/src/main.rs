@@ -3468,14 +3468,15 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     initialize_window_state_persistence();
 
     let gui = crate::frontend::try_new()?;
-    // ft-yccm0.2.5: publish this process's live GPU resource ledger where
-    // `ft doctor --json` reads it. Diagnostics only: failure is not fatal.
+    // ft-yccm0.2.5 / ft-yccm0.1.7: publish this process's live GPU, cache,
+    // scrollback and allocator counters where `ft doctor --json` and
+    // scripts/mac-gui-footprint.sh read them. Diagnostics only: not fatal.
     let _resource_snapshot_publisher =
         match frankenterm_alloc::resource_ledger::ResourceSnapshotPublisher::spawn(
             config::RUNTIME_DIR.clone(),
             "frankenterm-gui",
-            frankenterm_alloc::resource_ledger::GpuResourceLedger::global(),
             std::time::Duration::from_secs(2),
+            collect_resource_snapshot,
         ) {
             Ok(publisher) => Some(publisher),
             Err(error) => {
@@ -3520,6 +3521,39 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
 
     maybe_show_configuration_error_window();
     run_gui_event_loop(gui)
+}
+
+/// The resource snapshot this process publishes (ft-yccm0.1.7). Runs on the
+/// publisher thread; each pane's tier status takes that pane's terminal lock
+/// briefly, never on the GUI thread.
+fn collect_resource_snapshot() -> frankenterm_alloc::resource_ledger::ResourceSnapshotBody {
+    use frankenterm_alloc::resource_ledger::{
+        CacheGauges, GpuResourceLedger, PaneResourceSnapshot, ResourceSnapshotBody,
+    };
+    let mut body =
+        ResourceSnapshotBody::from_ledgers(GpuResourceLedger::global(), CacheGauges::global());
+    if let Some(mux) = Mux::try_get() {
+        body.panes = mux
+            .iter_panes()
+            .into_iter()
+            .filter_map(|pane| {
+                let status = pane.get_tiered_scrollback_status()?;
+                Some(PaneResourceSnapshot {
+                    pane_id: pane.pane_id() as u64,
+                    hot_rows: status
+                        .visible_rows
+                        .saturating_add(status.in_memory_scrollback_rows)
+                        as u64,
+                    warm_resident_lines: status.warm_resident_lines as u64,
+                    warm_resident_bytes: status.warm_resident_bytes as u64,
+                    cold_retained_lines: status.cold_sink_retained_lines as u64,
+                    cold_retained_bytes: status.cold_sink_retained_bytes as u64,
+                })
+            })
+            .collect();
+        body.panes.sort_by_key(|pane| pane.pane_id);
+    }
+    body
 }
 
 fn initialize_window_state_persistence() {

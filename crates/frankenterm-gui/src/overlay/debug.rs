@@ -220,6 +220,19 @@ pub fn show_debug_overlay(
 
     let version = config::wezterm_version();
     let triple = config::wezterm_target_triple();
+    // ft-yccm0.1.7: live process resource counters as of opening the overlay.
+    let resources = {
+        use frankenterm_alloc::resource_ledger::{
+            AllocatorSnapshot, CacheGauges, GpuResourceLedger, ResourceSnapshotBody,
+        };
+        let mut lines = ResourceSnapshotBody::from_ledgers(
+            GpuResourceLedger::global(),
+            CacheGauges::global(),
+        )
+        .summary_lines();
+        lines.push(AllocatorSnapshot::read().summary_line());
+        lines.join("\r\n")
+    };
 
     term.render(&[Change::Text(format!(
         "Debug Overlay\r\n\
@@ -227,6 +240,7 @@ pub fn show_debug_overlay(
          Window Environment: {connection_info}\r\n\
          Lua Version: {lua_version}\r\n\
          {opengl_info}\r\n\
+         {resources}\r\n\
          Enter lua statements or expressions and hit Enter.\r\n\
          Press ESC or CTRL-D to exit\r\n",
     ))])?;

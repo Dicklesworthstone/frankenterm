@@ -347,6 +347,314 @@ pub struct GpuResourceSnapshot {
     pub atlas_generations: u64,
 }
 
+/// CPU-side cache sizes that GUI windows report (ft-yccm0.1.7). Entries are
+/// exact counts; bytes are the cache's own accounting of the heap its entries
+/// own (see each reporter), not an RSS measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum CacheGauge {
+    ShapeCacheEntries,
+    ShapeCacheBytes,
+    LineShapeCacheEntries,
+    LineShapeCacheBytes,
+    LineQuadCacheEntries,
+    LineQuadCacheBytes,
+    GlyphCacheEntries,
+    ImageCacheBytes,
+}
+
+impl CacheGauge {
+    /// Every gauge, in snapshot order.
+    pub const ALL: [Self; 8] = [
+        Self::ShapeCacheEntries,
+        Self::ShapeCacheBytes,
+        Self::LineShapeCacheEntries,
+        Self::LineShapeCacheBytes,
+        Self::LineQuadCacheEntries,
+        Self::LineQuadCacheBytes,
+        Self::GlyphCacheEntries,
+        Self::ImageCacheBytes,
+    ];
+
+    /// Stable snapshot key.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ShapeCacheEntries => "shape_cache_entries",
+            Self::ShapeCacheBytes => "shape_cache_bytes",
+            Self::LineShapeCacheEntries => "line_shape_cache_entries",
+            Self::LineShapeCacheBytes => "line_shape_cache_bytes",
+            Self::LineQuadCacheEntries => "line_quad_cache_entries",
+            Self::LineQuadCacheBytes => "line_quad_cache_bytes",
+            Self::GlyphCacheEntries => "glyph_cache_entries",
+            Self::ImageCacheBytes => "image_cache_bytes",
+        }
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Process-wide sums of [`CacheGauge`]s over every reporting window.
+#[derive(Debug)]
+pub struct CacheGauges {
+    values: [AtomicU64; CacheGauge::ALL.len()],
+}
+
+static GLOBAL_CACHE_GAUGES: CacheGauges = CacheGauges::new();
+
+impl Default for CacheGauges {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CacheGauges {
+    /// All gauges at zero.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            values: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+        }
+    }
+
+    /// The gauges production windows report into.
+    #[must_use]
+    pub fn global() -> &'static Self {
+        &GLOBAL_CACHE_GAUGES
+    }
+
+    /// One reporter's share of the sums (one per window).
+    #[must_use]
+    pub fn contribution(&'static self) -> CacheGaugeContribution {
+        CacheGaugeContribution {
+            gauges: self,
+            reported: [0; CacheGauge::ALL.len()],
+        }
+    }
+
+    /// Current sum of one gauge.
+    #[must_use]
+    pub fn value(&self, gauge: CacheGauge) -> u64 {
+        self.values[gauge.index()].load(Ordering::Relaxed)
+    }
+
+    /// Every gauge keyed by [`CacheGauge::as_str`].
+    #[must_use]
+    pub fn snapshot(&self) -> BTreeMap<String, u64> {
+        CacheGauge::ALL
+            .iter()
+            .map(|gauge| (gauge.as_str().to_string(), self.value(*gauge)))
+            .collect()
+    }
+}
+
+/// A reporter's current values; the global sums move by the delta on each
+/// [`Self::set`], and dropping the reporter (a closed window) withdraws
+/// everything it reported.
+#[derive(Debug)]
+pub struct CacheGaugeContribution {
+    gauges: &'static CacheGauges,
+    reported: [u64; CacheGauge::ALL.len()],
+}
+
+impl CacheGaugeContribution {
+    /// Report `value` as this reporter's current `gauge`.
+    pub fn set(&mut self, gauge: CacheGauge, value: u64) {
+        let index = gauge.index();
+        let previous = std::mem::replace(&mut self.reported[index], value);
+        let sum = &self.gauges.values[index];
+        if value >= previous {
+            sum.fetch_add(value - previous, Ordering::Relaxed);
+        } else {
+            sum.fetch_sub(previous - value, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for CacheGaugeContribution {
+    fn drop(&mut self) {
+        for gauge in CacheGauge::ALL {
+            self.set(gauge, 0);
+        }
+    }
+}
+
+/// Scrollback residency of one pane (ft-yccm0.1.7). Rows are exact; the warm
+/// and cold byte counts are the term crate's own tier accounting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneResourceSnapshot {
+    pub pane_id: u64,
+    /// Rows in the in-memory (hot) tier: visible rows plus in-memory scrollback.
+    pub hot_rows: u64,
+    pub warm_resident_lines: u64,
+    pub warm_resident_bytes: u64,
+    pub cold_retained_lines: u64,
+    pub cold_retained_bytes: u64,
+}
+
+/// Allocator statistics at publish time.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllocatorSnapshot {
+    /// [`crate::AllocatorBackend::as_str`].
+    pub backend: String,
+    /// jemalloc `stats.*` in bytes; `None` when unavailable.
+    pub stats: Option<AllocatorStatsSnapshot>,
+    /// Why `stats` is `None`.
+    pub unavailable: Option<String>,
+}
+
+/// Serializable [`crate::AllocatorStats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllocatorStatsSnapshot {
+    pub allocated: u64,
+    pub active: u64,
+    pub resident: u64,
+    pub mapped: u64,
+    pub retained: u64,
+}
+
+impl AllocatorSnapshot {
+    /// Read the process allocator now.
+    #[must_use]
+    pub fn read() -> Self {
+        let backend = crate::allocator_backend().as_str().to_string();
+        match crate::read_allocator_stats() {
+            Ok(stats) => Self {
+                backend,
+                stats: Some(AllocatorStatsSnapshot {
+                    allocated: stats.allocated as u64,
+                    active: stats.active as u64,
+                    resident: stats.resident as u64,
+                    mapped: stats.mapped as u64,
+                    retained: stats.retained as u64,
+                }),
+                unavailable: None,
+            },
+            Err(error) => Self {
+                backend,
+                stats: None,
+                unavailable: Some(error.to_string()),
+            },
+        }
+    }
+}
+
+/// The change-detected part of a published snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceSnapshotBody {
+    pub gpu: GpuResourceSnapshot,
+    /// [`CacheGauges::snapshot`].
+    pub caches: BTreeMap<String, u64>,
+    /// Per-pane scrollback residency, sorted by pane id.
+    pub panes: Vec<PaneResourceSnapshot>,
+}
+
+impl ResourceSnapshotBody {
+    /// GPU and cache sections from `gpu` and `caches`; no panes.
+    #[must_use]
+    pub fn from_ledgers(gpu: &GpuResourceLedger, caches: &CacheGauges) -> Self {
+        Self {
+            gpu: gpu.snapshot(),
+            caches: caches.snapshot(),
+            panes: Vec::new(),
+        }
+    }
+
+    /// Human-readable lines for the GUI debug overlay.
+    #[must_use]
+    pub fn summary_lines(&self) -> Vec<String> {
+        let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+        let texture = |purpose: GpuTexturePurpose| {
+            let counter = self
+                .gpu
+                .textures
+                .get(purpose.as_str())
+                .copied()
+                .unwrap_or_default();
+            format!(
+                "{} {} / {:.1} MiB",
+                purpose.as_str(),
+                counter.live_count,
+                mib(counter.live_bytes)
+            )
+        };
+        let cache = |entries: CacheGauge, bytes: CacheGauge, label: &str| {
+            format!(
+                "{label} {} / {:.1} MiB",
+                self.caches.get(entries.as_str()).copied().unwrap_or(0),
+                mib(self.caches.get(bytes.as_str()).copied().unwrap_or(0))
+            )
+        };
+        let textures: Vec<String> = GpuTexturePurpose::ALL.iter().map(|p| texture(*p)).collect();
+        vec![
+            format!(
+                "GPU textures {} / {:.1} MiB (peak {:.1} MiB): {}; atlas generations {}",
+                self.gpu.texture_total.live_count,
+                mib(self.gpu.texture_total.live_bytes),
+                mib(self.gpu.texture_total.peak_live_bytes),
+                textures.join(", "),
+                self.gpu.atlas_generations,
+            ),
+            format!(
+                "GPU buffers {} / {:.1} MiB (peak {:.1} MiB)",
+                self.gpu.buffer_total.live_count,
+                mib(self.gpu.buffer_total.live_bytes),
+                mib(self.gpu.buffer_total.peak_live_bytes),
+            ),
+            format!(
+                "Caches: {}; {}; {}; glyphs {}; images {:.1} MiB",
+                cache(CacheGauge::ShapeCacheEntries, CacheGauge::ShapeCacheBytes, "shapes"),
+                cache(
+                    CacheGauge::LineShapeCacheEntries,
+                    CacheGauge::LineShapeCacheBytes,
+                    "lines"
+                ),
+                cache(CacheGauge::LineQuadCacheEntries, CacheGauge::LineQuadCacheBytes, "quads"),
+                self.caches
+                    .get(CacheGauge::GlyphCacheEntries.as_str())
+                    .copied()
+                    .unwrap_or(0),
+                mib(self
+                    .caches
+                    .get(CacheGauge::ImageCacheBytes.as_str())
+                    .copied()
+                    .unwrap_or(0)),
+            ),
+        ]
+    }
+}
+
+impl AllocatorSnapshot {
+    /// One human-readable line for the GUI debug overlay.
+    #[must_use]
+    pub fn summary_line(&self) -> String {
+        let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+        match (&self.stats, &self.unavailable) {
+            (Some(stats), _) => format!(
+                "Allocator {}: allocated {:.1} MiB, active {:.1}, resident {:.1}, mapped {:.1}, retained {:.1}",
+                self.backend,
+                mib(stats.allocated),
+                mib(stats.active),
+                mib(stats.resident),
+                mib(stats.mapped),
+                mib(stats.retained),
+            ),
+            (None, Some(reason)) => format!("Allocator {}: stats unavailable ({reason})", self.backend),
+            (None, None) => format!("Allocator {}: stats unavailable", self.backend),
+        }
+    }
+}
+
 /// One process's published snapshot file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceSnapshotEnvelope {
@@ -360,6 +668,32 @@ pub struct ResourceSnapshotEnvelope {
     pub published_unix_ms: u64,
     /// The GPU ledger at publish time.
     pub gpu: GpuResourceSnapshot,
+    /// Cache gauges at publish time.
+    #[serde(default)]
+    pub caches: BTreeMap<String, u64>,
+    /// Per-pane scrollback residency at publish time.
+    #[serde(default)]
+    pub panes: Vec<PaneResourceSnapshot>,
+    /// Allocator statistics at publish time.
+    #[serde(default)]
+    pub allocator: AllocatorSnapshot,
+}
+
+impl ResourceSnapshotEnvelope {
+    /// An envelope for this process, published now.
+    #[must_use]
+    pub fn now(process: &str, body: ResourceSnapshotBody, allocator: AllocatorSnapshot) -> Self {
+        Self {
+            schema: RESOURCE_SNAPSHOT_SCHEMA.to_string(),
+            pid: std::process::id(),
+            process: process.to_string(),
+            published_unix_ms: unix_now_ms(),
+            gpu: body.gpu,
+            caches: body.caches,
+            panes: body.panes,
+            allocator,
+        }
+    }
 }
 
 /// Milliseconds since the Unix epoch (0 if the clock is before it).
@@ -511,26 +845,23 @@ pub struct ResourceSnapshotPublisher {
 }
 
 impl ResourceSnapshotPublisher {
-    /// Publish `ledger` for this process into `dir` under `process` label.
+    /// Publish this process's resources into `dir` under the `process` label.
+    /// `collect` runs on the publisher thread every `interval`; the snapshot
+    /// is rewritten when its result changes, with fresh allocator stats.
     pub fn spawn(
         dir: PathBuf,
         process: &str,
-        ledger: &'static GpuResourceLedger,
         interval: Duration,
+        mut collect: impl FnMut() -> ResourceSnapshotBody + Send + 'static,
     ) -> std::io::Result<Self> {
-        let pid = std::process::id();
-        let path = resource_snapshot_path(&dir, pid);
+        let path = resource_snapshot_path(&dir, std::process::id());
         let process = process.to_string();
-        let envelope = move |gpu: GpuResourceSnapshot| ResourceSnapshotEnvelope {
-            schema: RESOURCE_SNAPSHOT_SCHEMA.to_string(),
-            pid,
-            process: process.clone(),
-            published_unix_ms: unix_now_ms(),
-            gpu,
+        let envelope = move |body: ResourceSnapshotBody| {
+            ResourceSnapshotEnvelope::now(&process, body, AllocatorSnapshot::read())
         };
         // Publish once synchronously so a startup failure is reported to the
         // caller instead of vanishing into the thread.
-        let mut last = ledger.snapshot();
+        let mut last = collect();
         publish_resource_snapshot(&dir, &envelope(last.clone()))?;
         let (stop, stopped) = mpsc::channel::<()>();
         let thread = std::thread::Builder::new()
@@ -538,8 +869,8 @@ impl ResourceSnapshotPublisher {
             .spawn(move || {
                 let mut last_published = std::time::Instant::now();
                 // Any message or a dropped sender ends the loop.
-                while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(interval) {
-                    let current = ledger.snapshot();
+                while stopped.recv_timeout(interval) == Err(mpsc::RecvTimeoutError::Timeout) {
+                    let current = collect();
                     if current == last && last_published.elapsed() < RESOURCE_SNAPSHOT_HEARTBEAT {
                         continue;
                     }
@@ -549,7 +880,10 @@ impl ResourceSnapshotPublisher {
                             last_published = std::time::Instant::now();
                         }
                         Err(error) => {
-                            log::warn!("resource snapshot publish to {dir:?} failed: {error}");
+                            log::warn!(
+                                "resource snapshot publish to {} failed: {error}",
+                                dir.display()
+                            );
                         }
                     }
                 }
@@ -576,10 +910,13 @@ impl Drop for ResourceSnapshotPublisher {
         }
         // Only ever this process's own file; a crash leaves it behind and the
         // collector then reports it as stale.
-        if let Err(error) = std::fs::remove_file(&self.path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                log::warn!("resource snapshot cleanup of {:?} failed: {error}", self.path);
-            }
+        if let Err(error) = std::fs::remove_file(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            log::warn!(
+                "resource snapshot cleanup of {} failed: {error}",
+                self.path.display()
+            );
         }
     }
 }
@@ -666,11 +1003,13 @@ mod tests {
         let ledger = private_ledger();
         let _atlas = ledger.track_texture(GpuTexturePurpose::Atlas, 4096);
         let fresh = ResourceSnapshotEnvelope {
-            schema: RESOURCE_SNAPSHOT_SCHEMA.to_string(),
             pid: 41,
-            process: "frankenterm-gui".to_string(),
             published_unix_ms: 1_000_000,
-            gpu: ledger.snapshot(),
+            ..ResourceSnapshotEnvelope::now(
+                "frankenterm-gui",
+                ResourceSnapshotBody::from_ledgers(ledger, private_gauges()),
+                AllocatorSnapshot::default(),
+            )
         };
         let old = ResourceSnapshotEnvelope {
             pid: 7,
@@ -709,9 +1048,11 @@ mod tests {
         let foreign = ResourceSnapshotEnvelope {
             schema: "frankenterm.resource_snapshot.v0".to_string(),
             pid: 2,
-            process: "x".to_string(),
-            published_unix_ms: 0,
-            gpu: GpuResourceSnapshot::default(),
+            ..ResourceSnapshotEnvelope::now(
+                "x",
+                ResourceSnapshotBody::default(),
+                AllocatorSnapshot::default(),
+            )
         };
         std::fs::write(
             dir.path().join("frankenterm-resources-2.json"),
@@ -739,11 +1080,21 @@ mod tests {
     fn publisher_writes_its_pid_file_republishes_changes_and_removes_it_on_drop() {
         let dir = tempfile::tempdir().unwrap();
         let ledger = private_ledger();
+        let gauges = private_gauges();
+        let pane_rows = std::sync::Arc::new(AtomicU64::new(24));
+        let collected_rows = std::sync::Arc::clone(&pane_rows);
         let publisher = ResourceSnapshotPublisher::spawn(
             dir.path().to_path_buf(),
             "test-process",
-            ledger,
             Duration::from_millis(10),
+            move || ResourceSnapshotBody {
+                panes: vec![PaneResourceSnapshot {
+                    pane_id: 3,
+                    hot_rows: collected_rows.load(Ordering::Relaxed),
+                    ..PaneResourceSnapshot::default()
+                }],
+                ..ResourceSnapshotBody::from_ledgers(ledger, gauges)
+            },
         )
         .unwrap();
         let path = publisher.path().to_path_buf();
@@ -754,21 +1105,120 @@ mod tests {
         let first = read();
         assert_eq!(first.process, "test-process");
         assert_eq!(first.gpu.texture_total.live_count, 0);
+        assert_eq!(first.panes[0].hot_rows, 24);
+        assert_eq!(first.caches["shape_cache_entries"], 0);
+        assert_eq!(first.allocator.backend, crate::allocator_backend().as_str());
+        assert_eq!(
+            first.allocator.stats.is_some(),
+            crate::jemalloc_enabled(),
+            "allocator stats are present exactly when jemalloc is compiled in"
+        );
 
         let _atlas = ledger.track_texture(GpuTexturePurpose::Atlas, 256);
+        let mut reporter = gauges.contribution();
+        reporter.set(CacheGauge::ShapeCacheEntries, 12);
+        pane_rows.store(80, Ordering::Relaxed);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            if read().gpu.textures["atlas"].live_bytes == 256 {
+            let current = read();
+            if current.gpu.textures["atlas"].live_bytes == 256
+                && current.caches["shape_cache_entries"] == 12
+                && current.panes[0].hot_rows == 80
+            {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "publisher never republished the changed ledger"
+                "publisher never republished the changed resources"
             );
             std::thread::sleep(Duration::from_millis(5));
         }
 
         drop(publisher);
         assert!(!path.exists(), "publisher must remove its own snapshot file");
+    }
+
+    fn private_gauges() -> &'static CacheGauges {
+        Box::leak(Box::new(CacheGauges::new()))
+    }
+
+    #[test]
+    fn cache_gauge_contributions_sum_across_reporters_and_withdraw_on_drop() {
+        let gauges = private_gauges();
+        let mut first = gauges.contribution();
+        let mut second = gauges.contribution();
+        first.set(CacheGauge::ShapeCacheEntries, 100);
+        second.set(CacheGauge::ShapeCacheEntries, 40);
+        second.set(CacheGauge::ImageCacheBytes, 4096);
+        assert_eq!(gauges.value(CacheGauge::ShapeCacheEntries), 140);
+
+        // A shrinking report moves the sum down by the delta only.
+        first.set(CacheGauge::ShapeCacheEntries, 30);
+        assert_eq!(gauges.value(CacheGauge::ShapeCacheEntries), 70);
+
+        drop(second);
+        assert_eq!(gauges.value(CacheGauge::ShapeCacheEntries), 30);
+        assert_eq!(gauges.value(CacheGauge::ImageCacheBytes), 0);
+        let snapshot = gauges.snapshot();
+        assert_eq!(snapshot.len(), CacheGauge::ALL.len());
+        assert_eq!(snapshot["shape_cache_entries"], 30);
+        drop(first);
+        assert!(gauges.snapshot().values().all(|value| *value == 0));
+    }
+
+    #[test]
+    fn summary_lines_report_live_counters_by_purpose() {
+        let ledger = private_ledger();
+        let gauges = private_gauges();
+        let _atlas = ledger.track_texture(GpuTexturePurpose::Atlas, 2 * 1024 * 1024);
+        let _drawable = ledger.track_texture(GpuTexturePurpose::Drawable, 1024 * 1024);
+        let _vertex = ledger.track_buffer(GpuBufferPurpose::Vertex, 512 * 1024);
+        ledger.record_atlas_generation();
+        let mut reporter = gauges.contribution();
+        reporter.set(CacheGauge::ShapeCacheEntries, 7);
+        reporter.set(CacheGauge::ShapeCacheBytes, 3 * 1024 * 1024);
+        reporter.set(CacheGauge::GlyphCacheEntries, 99);
+
+        let lines = ResourceSnapshotBody::from_ledgers(ledger, gauges).summary_lines();
+        assert_eq!(lines.len(), 3);
+        assert!(
+            lines[0].starts_with("GPU textures 2 / 3.0 MiB (peak 3.0 MiB): atlas 1 / 2.0 MiB, drawable 1 / 1.0 MiB"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].ends_with("atlas generations 1"), "{}", lines[0]);
+        assert_eq!(lines[1], "GPU buffers 1 / 0.5 MiB (peak 0.5 MiB)");
+        assert!(lines[2].contains("shapes 7 / 3.0 MiB"), "{}", lines[2]);
+        assert!(lines[2].contains("glyphs 99"), "{}", lines[2]);
+
+        let allocator = AllocatorSnapshot {
+            backend: "jemalloc".to_string(),
+            stats: Some(AllocatorStatsSnapshot {
+                allocated: 1024 * 1024,
+                ..AllocatorStatsSnapshot::default()
+            }),
+            unavailable: None,
+        };
+        assert!(allocator.summary_line().contains("allocated 1.0 MiB"));
+        assert!(
+            AllocatorSnapshot::read()
+                .summary_line()
+                .starts_with(&format!("Allocator {}", crate::allocator_backend().as_str()))
+        );
+    }
+
+    #[test]
+    fn envelope_from_an_older_publisher_without_new_sections_still_parses() {
+        // A v1 file written before the cache/pane/allocator sections existed.
+        let legacy = serde_json::json!({
+            "schema": RESOURCE_SNAPSHOT_SCHEMA,
+            "pid": 5,
+            "process": "frankenterm-gui",
+            "published_unix_ms": 9,
+            "gpu": GpuResourceSnapshot::default(),
+        });
+        let parsed: ResourceSnapshotEnvelope = serde_json::from_value(legacy).unwrap();
+        assert!(parsed.caches.is_empty() && parsed.panes.is_empty());
+        assert_eq!(parsed.allocator, AllocatorSnapshot::default());
     }
 }

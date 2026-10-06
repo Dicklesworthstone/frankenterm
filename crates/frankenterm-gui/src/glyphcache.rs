@@ -1283,6 +1283,16 @@ impl GlyphCache {
 }
 
 impl GlyphCache {
+    /// Rasterized font glyphs currently cached (cache-gauge ledger).
+    pub fn glyph_entries(&self) -> usize {
+        self.glyph_cache.len()
+    }
+
+    /// Decoded-image bytes retained by the image cache (cache-gauge ledger).
+    pub fn image_cache_retained_bytes(&self) -> usize {
+        self.image_cache_retained_bytes
+    }
+
     fn atlas_footprint_bytes(&self) -> u64 {
         let side = self.atlas.size() as u64;
         side.saturating_mul(side).saturating_mul(4)

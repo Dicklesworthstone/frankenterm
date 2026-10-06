@@ -140,6 +140,24 @@ impl CachedShape {
         Ok(glyphs)
     }
 
+    /// Heap bytes this entry owns, for the cache-gauge ledger (ft-yccm0.1.7):
+    /// the struct, the shaping output (with each glyph's cluster text) and the
+    /// bound sprite vector. The glyphs and atlas are owned by the glyph cache
+    /// and are not counted here.
+    pub fn accounted_bytes(&self) -> u64 {
+        let infos = self.infos.capacity() * std::mem::size_of::<GlyphInfo>()
+            + self
+                .infos
+                .iter()
+                .map(|info| info.text.capacity())
+                .sum::<usize>();
+        let binding = self.binding.borrow().as_ref().map_or(0, |binding| {
+            std::mem::size_of::<Vec<ShapedInfo>>()
+                + binding.glyphs.capacity() * std::mem::size_of::<ShapedInfo>()
+        });
+        (std::mem::size_of::<Self>() + infos + binding) as u64
+    }
+
     /// Drop the atlas-backed glyph handles, keeping the shaping output.
     /// Returns whether a binding was released.
     pub fn release_atlas_binding(&self) -> bool {
@@ -794,6 +812,29 @@ mod test {
             })
             .unwrap();
         assert!(Rc::ptr_eq(&rebound[0].glyph, &glyphs[0]));
+    }
+
+    #[test]
+    fn cached_shape_accounted_bytes_cover_shaping_and_bound_sprites() {
+        use super::CachedShape;
+        use std::mem::size_of;
+
+        let (infos, _glyphs, run) = fake_shaped_run(5);
+        let infos_bytes = infos.capacity() * size_of::<GlyphInfo>()
+            + infos.iter().map(|info| info.text.capacity()).sum::<usize>();
+        let run_bytes = size_of::<Vec<ShapedInfo>>() + run.capacity() * size_of::<ShapedInfo>();
+        let shape = CachedShape::new(infos, Rc::new(run), 0);
+        let bound = shape.accounted_bytes();
+        assert_eq!(
+            bound,
+            (size_of::<CachedShape>() + infos_bytes + run_bytes) as u64
+        );
+        shape.release_atlas_binding();
+        assert_eq!(
+            shape.accounted_bytes(),
+            bound - run_bytes as u64,
+            "a released entry no longer accounts for its sprite vector"
+        );
     }
 
     #[test]

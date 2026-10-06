@@ -231,6 +231,7 @@ impl crate::TermWindow {
         if let Some(state) = self.render_state.as_mut() {
             state.observe_quad_frame(Instant::now(), present_result.is_ok());
         }
+        self.report_cache_gauges(Instant::now());
         present_result.map(|(damage_generation, submission_mach_ns)| PaintOutcome {
             damage_generation,
             submission_mach_ns,

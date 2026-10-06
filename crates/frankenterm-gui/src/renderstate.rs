@@ -13,7 +13,8 @@ use ::window::*;
 use anyhow::Context;
 use config::ConfigHandle;
 use frankenterm_alloc::resource_ledger::{
-    GpuResourceGuard, GpuResourceLedger, GpuTexturePurpose, texture_bytes,
+    CacheGaugeContribution, CacheGauges, GpuBufferPurpose, GpuResourceGuard, GpuResourceLedger,
+    GpuTexturePurpose, texture_bytes,
 };
 use frankenterm_core::{atlas_tier_doctor::TierSwapDoctorReport, atlas_tiered_swap::MemoryBudget};
 use frankenterm_font::FontConfiguration;
@@ -424,6 +425,7 @@ pub struct WebGpuVertexBuffer {
     num_vertices: usize,
     staging: Vec<Vertex>,
     queue: wgpu::Queue,
+    _ledger: GpuResourceGuard,
 }
 
 impl std::ops::Deref for WebGpuVertexBuffer {
@@ -436,10 +438,11 @@ impl std::ops::Deref for WebGpuVertexBuffer {
 impl WebGpuVertexBuffer {
     pub fn new(num_vertices: usize, device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
         metrics::counter!("gui.webgpu.vertex_buffer_allocations").increment(1);
+        let size = (num_vertices * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
         Self {
             buf: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Vertex Buffer"),
-                size: (num_vertices * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress,
+                size,
                 usage: wgpu::BufferUsages::VERTEX
                     | wgpu::BufferUsages::COPY_DST
                     | wgpu::BufferUsages::COPY_SRC,
@@ -448,6 +451,7 @@ impl WebGpuVertexBuffer {
             num_vertices,
             staging: Vec::with_capacity(num_vertices),
             queue: queue.clone(),
+            _ledger: GpuResourceLedger::global().track_buffer(GpuBufferPurpose::Vertex, size),
         }
     }
 
@@ -466,6 +470,7 @@ impl WebGpuVertexBuffer {
 
 pub struct WebGpuIndexBuffer {
     buf: wgpu::Buffer,
+    _ledger: GpuResourceGuard,
 }
 
 impl std::ops::Deref for WebGpuIndexBuffer {
@@ -481,12 +486,15 @@ impl WebGpuIndexBuffer {
     }
 
     fn with_device(indices: &[u32], device: &wgpu::Device) -> Self {
+        let contents: &[u8] = bytemuck::cast_slice(indices);
         Self {
             buf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Index Buffer"),
                 usage: wgpu::BufferUsages::INDEX,
-                contents: bytemuck::cast_slice(indices),
+                contents,
             }),
+            _ledger: GpuResourceLedger::global()
+                .track_buffer(GpuBufferPurpose::Index, contents.len() as u64),
         }
     }
 }
@@ -869,6 +877,10 @@ pub struct RenderState {
     pub layers: RefCell<Vec<Rc<RenderLayer>>>,
     quad_last_activity: Instant,
     pending_quad_shrink: Option<PendingQuadShrink>,
+    /// This window's share of the process cache gauges (ft-yccm0.1.7);
+    /// withdrawn when the window's render state is dropped.
+    pub(crate) cache_gauges: CacheGaugeContribution,
+    pub(crate) last_cache_gauge_report: Option<Instant>,
 }
 
 const QUAD_SHRINK_IDLE: Duration = Duration::from_secs(1);
@@ -1164,6 +1176,8 @@ impl RenderState {
                         layers: RefCell::new(vec![main_layer]),
                         quad_last_activity: Instant::now(),
                         pending_quad_shrink: None,
+                        cache_gauges: CacheGauges::global().contribution(),
+                        last_cache_gauge_report: None,
                     });
                 }
                 Err(OutOfTextureSpace {
@@ -1609,7 +1623,6 @@ mod tests {
         use std::cell::RefCell;
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
-        use wgpu::util::DeviceExt;
 
         let (device, queue) = futures::executor::block_on(async {
             let instance =
@@ -1640,13 +1653,10 @@ mod tests {
             glyph_quad_instances: RefCell::new(std::array::from_fn(|_| {
                 WebGpuGlyphQuadSoaStaging::default()
             })),
-            indices: IndexBuffer::WebGpu(WebGpuIndexBuffer {
-                buf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("vertex qualification indices"),
-                    usage: wgpu::BufferUsages::INDEX,
-                    contents: bytemuck::cast_slice(&build_quad_indices(2)),
-                }),
-            }),
+            indices: IndexBuffer::WebGpu(WebGpuIndexBuffer::with_device(
+                &build_quad_indices(2),
+                &device,
+            )),
             capacity: 2,
             next_quad: RefCell::new(0),
         };

@@ -10,6 +10,7 @@ use crate::termwindow::render::paint::AllowImage;
 use crate::termwindow::{BorrowedShapeCacheKey, RenderState, ShapedInfo};
 use crate::utilsprites::RenderMetrics;
 use ::window::bitmaps::{TextureCoord, TextureRect, TextureSize};
+use frankenterm_alloc::resource_ledger::CacheGauge;
 use ::window::{DeadKeyStatus, PointF, RectF, SizeF};
 use anyhow::{Context, anyhow};
 use config::{
@@ -341,6 +342,60 @@ pub struct ClusterStyleCache<'a> {
     underline_color: LinearRgba,
 }
 
+/// How often a window refreshes its cache gauges (ft-yccm0.1.7).
+const CACHE_GAUGE_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Entries and accounted heap bytes of a window's shape, line-shape and
+/// line-quad caches for the cache-gauge ledger (ft-yccm0.1.7). Bytes count
+/// each entry's key and value structs plus the vectors and strings they own
+/// (cluster and composing text, quad vectors, hyperlink spans). Glyphs and
+/// sprite vectors shared with the shape cache are counted only there.
+fn render_cache_gauge_values(
+    shapes: &LfuCache<ShapeCacheKey, Rc<CachedShape>>,
+    lines: &LfuCache<LineToEleShapeCacheKey, LineToElementShapeItem>,
+    quads: &LfuCache<LineQuadCacheKey, LineQuadCacheValue>,
+) -> [(CacheGauge, u64); 6] {
+    use std::mem::size_of;
+
+    let mut shape_bytes = 0u64;
+    shapes.for_each_resident(|key, shape| {
+        shape_bytes += (size_of::<ShapeCacheKey>() + key.text.capacity()) as u64
+            + shape.accounted_bytes();
+    });
+    let mut line_bytes = 0u64;
+    lines.for_each_resident(|key, item| {
+        let composing = key.composing.as_ref().map_or(0, |(_, text)| text.capacity());
+        let elements: usize = item
+            .shaped
+            .iter()
+            .map(|element| element.cluster.text.capacity())
+            .sum();
+        line_bytes += (size_of::<LineToEleShapeCacheKey>()
+            + composing
+            + size_of::<LineToElementShapeItem>()
+            + item.shaped.capacity() * size_of::<LineToElementShape>()
+            + elements) as u64;
+    });
+    let mut quad_bytes = 0u64;
+    quads.for_each_resident(|key, value| {
+        let composing = key.composing.as_ref().map_or(0, String::capacity);
+        quad_bytes += (size_of::<LineQuadCacheKey>()
+            + composing
+            + size_of::<LineQuadCacheValue>()
+            + value.hyperlinks.capacity() * size_of::<crate::selection::HyperlinkSpan>())
+            as u64
+            + value.layers.accounted_bytes();
+    });
+    [
+        (CacheGauge::ShapeCacheEntries, shapes.len() as u64),
+        (CacheGauge::ShapeCacheBytes, shape_bytes),
+        (CacheGauge::LineShapeCacheEntries, lines.len() as u64),
+        (CacheGauge::LineShapeCacheBytes, line_bytes),
+        (CacheGauge::LineQuadCacheEntries, quads.len() as u64),
+        (CacheGauge::LineQuadCacheBytes, quad_bytes),
+    ]
+}
+
 /// Keep only complete successful resolutions. A failure must reach the bounded
 /// frame retry without becoming an LFU hit that prevents the shaper running again.
 fn resolve_cached_shape(
@@ -362,6 +417,42 @@ fn resolve_cached_shape(
 }
 
 impl crate::TermWindow {
+    /// Publish this window's cache sizes into the process cache gauges, at
+    /// most once per [`CACHE_GAUGE_REPORT_INTERVAL`] (ft-yccm0.1.7).
+    pub(crate) fn report_cache_gauges(&mut self, now: Instant) {
+        let Some(render_state) = self.render_state.as_mut() else {
+            return;
+        };
+        if render_state
+            .last_cache_gauge_report
+            .is_some_and(|last| now.saturating_duration_since(last) < CACHE_GAUGE_REPORT_INTERVAL)
+        {
+            return;
+        }
+        render_state.last_cache_gauge_report = Some(now);
+        let values = render_cache_gauge_values(
+            &self.shape_cache.borrow(),
+            &self.line_to_ele_shape_cache.borrow(),
+            &self.line_quad_cache.borrow(),
+        );
+        let (glyph_entries, image_bytes) = {
+            let glyph_cache = render_state.glyph_cache.borrow();
+            (
+                glyph_cache.glyph_entries() as u64,
+                glyph_cache.image_cache_retained_bytes() as u64,
+            )
+        };
+        for (gauge, value) in values {
+            render_state.cache_gauges.set(gauge, value);
+        }
+        render_state
+            .cache_gauges
+            .set(CacheGauge::GlyphCacheEntries, glyph_entries);
+        render_state
+            .cache_gauges
+            .set(CacheGauge::ImageCacheBytes, image_bytes);
+    }
+
     pub fn update_next_frame_time(&self, next_due: Option<Instant>) {
         if next_due.is_some() {
             update_next_frame_time(&mut *self.has_animation.borrow_mut(), next_due);
@@ -1251,6 +1342,110 @@ mod tests {
     use wezterm_term::color::{ColorAttribute, ColorPalette};
     use wezterm_term::{CellAttributes, Intensity};
     use window::color::LinearRgba;
+
+    /// ft-yccm0.1.7: the cache gauges count real LFU entries, grow with the
+    /// strings an entry owns, and drop a shape's sprite vector once an atlas
+    /// rebuild releases it.
+    #[test]
+    fn render_cache_gauges_count_entries_and_track_owned_bytes() {
+        use super::{
+            LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey, LineToElementShapeItem,
+            render_cache_gauge_values,
+        };
+        use crate::quad::HeapQuadAllocator;
+        use crate::shapecache::{CachedShape, ShapeCacheKey};
+        use config::{ConfigHandle, TextStyle};
+        use frankenterm_alloc::resource_ledger::CacheGauge;
+        use lfucache::LfuCache;
+        use ordered_float::NotNan;
+        use std::rc::Rc;
+
+        let config = ConfigHandle::default_config();
+        let mut shapes: LfuCache<ShapeCacheKey, Rc<CachedShape>> =
+            LfuCache::new("t.s.hit", "t.s.miss", |c| c.shape_cache_size, &config);
+        let mut lines: LfuCache<LineToEleShapeCacheKey, LineToElementShapeItem> =
+            LfuCache::new("t.l.hit", "t.l.miss", |c| c.line_to_ele_shape_cache_size, &config);
+        let mut quads: LfuCache<LineQuadCacheKey, LineQuadCacheValue> =
+            LfuCache::new("t.q.hit", "t.q.miss", |c| c.line_quad_cache_size, &config);
+        let gauge = |values: &[(CacheGauge, u64); 6], wanted: CacheGauge| {
+            values
+                .iter()
+                .find(|(gauge, _)| *gauge == wanted)
+                .map(|(_, value)| *value)
+                .unwrap()
+        };
+
+        let empty = render_cache_gauge_values(&shapes, &lines, &quads);
+        assert!(empty.iter().all(|(_, value)| *value == 0), "{empty:?}");
+
+        let key = |text: &str| ShapeCacheKey {
+            style: TextStyle::default(),
+            text: text.to_string(),
+        };
+        let bound = Rc::new(CachedShape::new(Vec::new(), Rc::new(Vec::with_capacity(8)), 3));
+        shapes.put(key("a"), Rc::clone(&bound));
+        shapes.put(key("bb"), Rc::new(CachedShape::new(Vec::new(), Rc::new(Vec::new()), 3)));
+        lines.put(
+            LineToEleShapeCacheKey {
+                shape_hash: [0; 16],
+                composing: Some((0, "compose".to_string())),
+                shape_generation: 3,
+            },
+            LineToElementShapeItem {
+                expires: None,
+                shaped: Rc::new(Vec::new()),
+                current_highlight: None,
+                invalidate_on_hover_change: false,
+            },
+        );
+        quads.put(
+            LineQuadCacheKey {
+                config_generation: 0,
+                shape_generation: 3,
+                quad_generation: 0,
+                composing: None,
+                selection: 0..0,
+                shape_hash: [0; 16],
+                top_pixel_y: NotNan::new(0.0).unwrap(),
+                left_pixel_x: NotNan::new(0.0).unwrap(),
+                pixel_width: NotNan::new(10.0).unwrap(),
+                phys_line_idx: 0,
+                pane_id: 1,
+                pane_is_active: true,
+                cursor: None,
+                reverse_video: false,
+                password_input: false,
+            },
+            LineQuadCacheValue {
+                expires: None,
+                layers: HeapQuadAllocator::default(),
+                current_highlight: None,
+                invalidate_on_hover_change: false,
+                hyperlinks: Vec::new(),
+            },
+        );
+
+        let populated = render_cache_gauge_values(&shapes, &lines, &quads);
+        assert_eq!(gauge(&populated, CacheGauge::ShapeCacheEntries), 2);
+        assert_eq!(gauge(&populated, CacheGauge::LineShapeCacheEntries), 1);
+        assert_eq!(gauge(&populated, CacheGauge::LineQuadCacheEntries), 1);
+        let shape_bytes = gauge(&populated, CacheGauge::ShapeCacheBytes);
+        assert!(shape_bytes > 2 * std::mem::size_of::<CachedShape>() as u64);
+        assert!(gauge(&populated, CacheGauge::LineShapeCacheBytes) >= "compose".len() as u64);
+        assert!(gauge(&populated, CacheGauge::LineQuadCacheBytes) > 0);
+
+        // Releasing the bound sprite vector (an atlas rebuild) shrinks the
+        // accounted shape bytes by exactly that vector.
+        let sprite_vector = (std::mem::size_of::<Vec<crate::shapecache::ShapedInfo>>()
+            + 8 * std::mem::size_of::<crate::shapecache::ShapedInfo>())
+            as u64;
+        assert!(bound.release_atlas_binding());
+        let released = render_cache_gauge_values(&shapes, &lines, &quads);
+        assert_eq!(
+            gauge(&released, CacheGauge::ShapeCacheBytes),
+            shape_bytes - sprite_vector
+        );
+    }
 
     #[test]
     fn shape_cache_retries_failed_resolution_and_keeps_successful_runs() {
