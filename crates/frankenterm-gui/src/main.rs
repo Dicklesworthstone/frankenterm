@@ -18,10 +18,6 @@ use config::{ConfigHandle, SerialDomain, SshDomain, SshMultiplexing};
 #[cfg(feature = "jemalloc")]
 use frankenterm_alloc as _;
 use frankenterm_client::domain::{ClientDomain, ClientDomainConfig};
-use frankenterm_core::macos_backend_select::{
-    BackendOverride, BackendSelectionInputs, BackendSelectionResult, MacosArch, MacosVersion,
-    select_macos_backend,
-};
 use frankenterm_font::FontConfiguration;
 use frankenterm_font::shaper::PresentationWidth;
 use frankenterm_mux_server_impl::{
@@ -37,7 +33,7 @@ use portable_pty::cmdbuilder::CommandBuilder;
 use promise::spawn::block_on;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::env::{self, current_dir};
+use std::env::current_dir;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -176,21 +172,12 @@ pub use termwindow::{ICON_DATA, TermWindow, set_window_class, set_window_positio
 // Bootstrap (inlined from env-bootstrap, minus Lua registration)
 // ---------------------------------------------------------------------------
 
-const FT_MACOS_BACKEND_ENV: &str = "FT_MACOS_BACKEND";
 const FT_ATOMIC_COMPONENT_MARKER: &str = env!("FT_ATOMIC_COMPONENT_MARKER");
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GuiMacosBackendSelection {
-    override_: BackendOverride,
-    arch: MacosArch,
-    version: MacosVersion,
-    result: BackendSelectionResult,
-}
-
 fn frankenterm_bootstrap() {
-    // Initialize logging from RUST_LOG env var
+    // Initialize logging from RUST_LOG env var. The active renderer backend
+    // is logged by TermWindow once it is constructed (front_end config).
     env_logger::init();
-    log_gui_macos_backend_policy();
 
     config::assign_version_info(GUI_VERSION, env!("FRANKENTERM_TARGET_TRIPLE"));
 
@@ -224,95 +211,6 @@ fn frankenterm_bootstrap() {
         std::env::remove_var("VTE_VERSION");
         std::env::remove_var("SHELL");
     }
-}
-
-fn log_gui_macos_backend_policy() {
-    let selection = probe_gui_macos_backend_selection();
-    // This policy probe does not construct or dispatch a renderer. In
-    // particular, MetalDirect is not a live RenderContext implementation.
-    // TermWindow::created reports the successfully constructed backend.
-    log::debug!(
-        "macOS renderer policy probe (not active backend): preference={:?} reason={:?} override={:?} arch={:?} version={}.{}; actual renderer follows front_end configuration",
-        selection.result.backend,
-        selection.result.reason,
-        selection.override_,
-        selection.arch,
-        selection.version.major,
-        selection.version.minor
-    );
-}
-
-fn probe_gui_macos_backend_selection() -> GuiMacosBackendSelection {
-    let override_value = env::var(FT_MACOS_BACKEND_ENV).ok();
-    select_gui_macos_backend(
-        override_value.as_deref(),
-        detect_gui_macos_arch(),
-        detect_gui_macos_version(),
-    )
-}
-
-fn select_gui_macos_backend(
-    override_value: Option<&str>,
-    arch: MacosArch,
-    version: MacosVersion,
-) -> GuiMacosBackendSelection {
-    let override_ = override_value
-        .map(BackendOverride::from_env_str)
-        .unwrap_or_default();
-    let result = select_macos_backend(BackendSelectionInputs::new(arch, version, override_));
-
-    GuiMacosBackendSelection {
-        override_,
-        arch,
-        version,
-        result,
-    }
-}
-
-fn detect_gui_macos_arch() -> MacosArch {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        MacosArch::AppleSilicon
-    }
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    {
-        MacosArch::IntelX64
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        MacosArch::Unknown
-    }
-}
-
-fn detect_gui_macos_version() -> MacosVersion {
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("/usr/bin/sw_vers")
-            .arg("-productVersion")
-            .output()
-            .ok()
-            .and_then(|output| {
-                if output.status.success() {
-                    String::from_utf8(output.stdout).ok()
-                } else {
-                    None
-                }
-            })
-            .and_then(|version| parse_macos_version(&version))
-            .unwrap_or_default()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        MacosVersion::default()
-    }
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn parse_macos_version(version: &str) -> Option<MacosVersion> {
-    let mut parts = version.trim().split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next().unwrap_or("0").parse().ok()?;
-    Some(MacosVersion::new(major, minor))
 }
 
 // ---------------------------------------------------------------------------
@@ -3839,7 +3737,6 @@ fn maybe_show_configuration_error_window() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frankenterm_core::macos_backend_select::{BackendFallbackReason, MacosBackend};
 
     #[test]
     fn same_path_gui_version_mismatch_preserves_new_gui_publication() {
@@ -5136,55 +5033,15 @@ mod tests {
     }
 
     #[test]
-    fn gui_macos_backend_defaults_to_core_selector_auto_path() {
-        let selection =
-            select_gui_macos_backend(None, MacosArch::AppleSilicon, MacosVersion::new(14, 0));
-
-        assert_eq!(selection.override_, BackendOverride::Auto);
-        assert_eq!(selection.result.backend, MacosBackend::MetalDirect);
-        assert_eq!(
-            selection.result.reason,
-            BackendFallbackReason::MetalDirectGranted
-        );
-    }
-
-    #[test]
-    fn gui_macos_backend_honors_wgpu_rollback_override() {
-        let selection = select_gui_macos_backend(
-            Some("wgpu"),
-            MacosArch::AppleSilicon,
-            MacosVersion::new(14, 0),
-        );
-
-        assert_eq!(selection.override_, BackendOverride::Wgpu);
-        assert_eq!(selection.result.backend, MacosBackend::Wgpu);
-        assert_eq!(
-            selection.result.reason,
-            BackendFallbackReason::OperatorOverrideWgpu
-        );
-    }
-
-    #[test]
-    fn gui_macos_backend_downgrades_forced_metal_on_unsupported_runtime() {
-        let selection =
-            select_gui_macos_backend(Some("metal"), MacosArch::IntelX64, MacosVersion::new(14, 0));
-
-        assert_eq!(selection.override_, BackendOverride::MetalDirect);
-        assert_eq!(selection.result.backend, MacosBackend::Wgpu);
-        assert_eq!(
-            selection.result.reason,
-            BackendFallbackReason::OperatorOverrideDowngraded
-        );
-    }
-
-    #[test]
-    fn parse_macos_version_accepts_major_minor_patch() {
-        assert_eq!(
-            parse_macos_version("14.5.1"),
-            Some(MacosVersion::new(14, 5))
-        );
-        assert_eq!(parse_macos_version("13"), Some(MacosVersion::new(13, 0)));
-        assert_eq!(parse_macos_version("not-a-version"), None);
+    fn startup_logs_no_renderer_policy_probe_before_construction() {
+        // The active backend is reported only by TermWindow after it builds
+        // one (ft-yccm0.4.1.1, closing the 4tenz.8.1.1 truth gap). A startup
+        // policy probe named MetalDirect while OpenGL/WebGpu was rendering.
+        let source = include_str!("main.rs");
+        let probe = ["macos_backend", "_select"].concat();
+        let sw_vers = ["/usr/bin/", "sw_vers"].concat();
+        assert!(!source.contains(&probe), "GUI startup must not consult the policy-only selector");
+        assert!(!source.contains(&sw_vers), "GUI startup must not spawn sw_vers");
     }
 }
 

@@ -2400,6 +2400,9 @@ pub struct TermWindow {
 
     gl: Option<Rc<glium::backend::Context>>,
     webgpu: Option<Rc<WebGpuState>>,
+    /// The native Metal front end. While it is in development it only clears
+    /// the window to the background color; it never has a `RenderState`.
+    metal: Option<Rc<frankenterm_renderer_metal::MetalRenderer>>,
     config_subscription: Option<config::ConfigSubscription>,
 
     /// Per-pane agent state classification, updated each render tick.
@@ -3831,6 +3834,27 @@ impl TermWindow {
 
         Ok(())
     }
+
+    /// Activates the native Metal front end. It has no `RenderState`: until
+    /// the Track C data model lands it only clears the window to the
+    /// background color, so the logged identity says exactly that.
+    fn metal_created(&mut self, metal: Rc<frankenterm_renderer_metal::MetalRenderer>) {
+        self.render_wake_state.cancel();
+        self.render_state = None;
+
+        let render_info = format!(
+            "Metal (in development: background clear only) on {}",
+            metal.device().capabilities()
+        );
+        self.opengl_info.replace(render_info.clone());
+        log::info!(
+            "Renderer initialized: {} FrankenTerm version: {}",
+            render_info,
+            config::wezterm_version(),
+        );
+        self.metal.replace(metal);
+        self.render_recovery_state.record_reinitialized();
+    }
 }
 
 const RENDER_RETRY_DELAYS_MS: [u64; 6] = [8, 16, 32, 64, 128, 250];
@@ -4536,6 +4560,7 @@ impl TermWindow {
             os_parameters: None,
             gl: None,
             webgpu: None,
+            metal: None,
             window: None,
             window_background,
             background_load: BackgroundLoadCoordinator::default(),
@@ -4748,14 +4773,36 @@ impl TermWindow {
             }
         });
 
-        let gl = match config.front_end {
-            FrontEndSelection::WebGpu => None,
-            _ => Some(window.enable_opengl().await?),
+        // front_end = "Metal" keeps the native renderer only if it attaches.
+        // Every refusal (not macOS, no device, GPU older than Apple7, no
+        // CAMetalLayer) is logged with its reason code and falls back to WebGpu.
+        let metal = match config.front_end {
+            FrontEndSelection::Metal => {
+                match frankenterm_renderer_metal::MetalRenderer::attach(&window) {
+                    Ok(renderer) => Some(Rc::new(renderer)),
+                    Err(reason) => {
+                        log::warn!(
+                            "front_end=Metal unavailable (reason={}): {reason}; falling back to WebGpu",
+                            reason.code()
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        let effective_front_end = config.front_end.effective(metal.is_some());
+
+        let gl = match effective_front_end {
+            FrontEndSelection::WebGpu | FrontEndSelection::Metal => None,
+            FrontEndSelection::OpenGL | FrontEndSelection::Software => {
+                Some(window.enable_opengl().await?)
+            }
         };
 
         // Renderer initialization yields to native callbacks. Keep the
         // TermWindow RefCell unborrowed so resize/config events can run.
-        let webgpu = match config.front_end {
+        let webgpu = match effective_front_end {
             FrontEndSelection::WebGpu => Some(Rc::new(
                 WebGpuState::new(&window, dimensions, &config).await?,
             )),
@@ -4793,6 +4840,9 @@ impl TermWindow {
             if let Some(webgpu) = webgpu {
                 myself.webgpu.replace(Rc::clone(&webgpu));
                 myself.created(RenderContext::WebGpu(Rc::clone(&webgpu)))?;
+            }
+            if let Some(metal) = metal {
+                myself.metal_created(metal);
             }
             myself.load_os_parameters();
             myself.schedule_background_reload();
@@ -5011,7 +5061,9 @@ impl TermWindow {
     fn paint_if_admitted(&mut self, window: &Window) -> anyhow::Result<bool> {
         match self.render_recovery_state.admit() {
             PaintAdmission::Admit => {
-                if self.webgpu.is_some() {
+                if self.metal.is_some() {
+                    Ok(self.do_paint_metal())
+                } else if self.webgpu.is_some() {
                     self.do_paint_webgpu()
                 } else {
                     Ok(self.do_paint(window))
@@ -5057,6 +5109,80 @@ impl TermWindow {
         drop(self.render_state.take());
         drop(self.webgpu.take());
         drop(self.gl.take());
+        // The Metal renderer retains the view's CAMetalLayer; release it
+        // before the native window goes away too.
+        drop(self.metal.take());
+    }
+
+    /// Paints with the in-development Metal front end: one render pass that
+    /// clears the window to the configured background color, then presents.
+    fn do_paint_metal(&mut self) -> bool {
+        let Some(metal) = self.metal.as_ref().map(Rc::clone) else {
+            return false;
+        };
+        let captured_generation = self.damage_generation;
+        let color = self.metal_clear_color();
+        let dimensions = self.dimensions;
+        let width = u32::try_from(dimensions.pixel_width).unwrap_or(u32::MAX);
+        let height = u32::try_from(dimensions.pixel_height).unwrap_or(u32::MAX);
+        match metal.render_clear(width, height, color) {
+            Ok(frankenterm_renderer_metal::FrameOutcome::Presented) => {
+                let settlement = apply_presented_render_attempt(
+                    &mut self.dirty_lines,
+                    self.damage_generation,
+                    &mut self.render_recovery_state,
+                    captured_generation,
+                );
+                metrics::counter!("gui.render.damage_settlement", "outcome" => settlement.label())
+                    .increment(1);
+                self.render_wake_state.cancel();
+                if settlement.needs_follow_up_paint() {
+                    if let Some(window) = self.window.as_ref() {
+                        window.invalidate();
+                    }
+                }
+            }
+            // Nothing to draw; keep the damage for the first sized frame.
+            Ok(frankenterm_renderer_metal::FrameOutcome::ZeroSize) => {}
+            Err(err) => {
+                // nextDrawable returns nil when its one-second wait expires,
+                // the same acquisition-timeout class as a wgpu surface
+                // timeout, so it shares that bounded retry-then-park policy.
+                let stage = match err {
+                    frankenterm_renderer_metal::FrameError::DrawableUnavailable => {
+                        RenderFailureStage::SurfaceAcquire(
+                            webgpu::WebGpuSurfaceTextureError::Timeout,
+                        )
+                    }
+                    _ => RenderFailureStage::Draw(DrawFailureStage::BackendDraw),
+                };
+                let failure = RenderAttemptFailure::new(
+                    stage,
+                    anyhow::Error::new(err).context("Metal background clear"),
+                );
+                self.handle_render_failure(&failure);
+                log::warn!("Metal paint failed; retaining damage: {failure:#}");
+            }
+        }
+        true
+    }
+
+    /// The window background exactly as the other front ends fill it: the
+    /// sole pane's palette background (else the window palette's), scaled by
+    /// `window_background_opacity`.
+    fn metal_clear_color(&mut self) -> frankenterm_renderer_metal::ClearColor {
+        let panes = self.get_panes_to_render();
+        let background = if panes.len() == 1 {
+            panes[0].pane.palette().background
+        } else {
+            self.palette().background
+        };
+        frankenterm_renderer_metal::ClearColor::from_srgba(
+            background.0,
+            background.1,
+            background.2,
+            background.3 * self.config.window_background_opacity,
+        )
     }
 
     fn do_paint(&mut self, window: &Window) -> bool {
