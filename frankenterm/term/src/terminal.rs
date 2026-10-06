@@ -1,9 +1,10 @@
 use super::*;
 use crate::terminalstate::performer::Performer;
+use frankenterm_escape_parser::csi::Sgr;
 #[cfg(feature = "use_serde")]
 use frankenterm_escape_parser::parser::RecoveryGroundBoundary;
 use frankenterm_escape_parser::parser::{Handler, Parser};
-use frankenterm_escape_parser::Action;
+use frankenterm_escape_parser::{Action, CSI};
 #[cfg(feature = "use_serde")]
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,6 +30,14 @@ pub enum ClipboardSelection {
 pub trait FeedGate {
     /// Whether `action` leaves the fused path. Printing never does.
     fn diverts(&mut self, action: &Action) -> bool;
+
+    /// [`FeedGate::diverts`] for `Action::CSI(CSI::Sgr(sgr))`, which the
+    /// parser's CSI fast path hands over without building the `Action`
+    /// (ft-yccm0.3.2.4). A gate that never diverts SGR can answer without
+    /// building one.
+    fn diverts_sgr(&mut self, sgr: &Sgr) -> bool {
+        self.diverts(&Action::CSI(CSI::Sgr(sgr.clone())))
+    }
 }
 
 /// Applies actions through the performer until the gate diverts one, then
@@ -69,6 +78,25 @@ impl<'s, 'f, G: FeedGate + ?Sized> Handler for FeedHandler<'s, 'f, G> {
         } else {
             self.applied = true;
             Handler::print_str(&mut self.performer, text);
+        }
+    }
+
+    /// Offers each setting to the gate in order, as `action` offers each
+    /// action, and applies the run up to the first one it diverts.
+    fn sgr(&mut self, sgrs: &[Sgr]) {
+        let mut admitted = 0;
+        if !self.diverting {
+            while admitted < sgrs.len() && !self.gate.diverts_sgr(&sgrs[admitted]) {
+                admitted += 1;
+            }
+            if admitted > 0 {
+                self.applied = true;
+                Handler::sgr(&mut self.performer, &sgrs[..admitted]);
+            }
+            self.diverting = admitted < sgrs.len();
+        }
+        for sgr in &sgrs[admitted..] {
+            self.diverted.push(Action::CSI(CSI::Sgr(sgr.clone())));
         }
     }
 }

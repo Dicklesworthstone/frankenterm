@@ -381,6 +381,11 @@ impl FeedGate for MuxGate {
             _ => false,
         }
     }
+
+    /// As the mux gate: SGR never leaves the fused path.
+    fn diverts_sgr(&mut self, _sgr: &frankenterm_escape_parser::csi::Sgr) -> bool {
+        false
+    }
 }
 
 /// Feeds `prelude` untimed, then `data` timed, through `lane` in

@@ -4585,6 +4585,13 @@ impl frankenterm_term::FeedGate for FusedFeedGate {
                 | Action::Esc(Esc::Code(EscCode::StringTerminator | EscCode::FullReset))
         ) || crate::is_synchronized_output_action(action)
     }
+
+    /// SGR is neither an alert source nor a synchronized-output control, so
+    /// `diverts` never diverts it; the CSI fast path's settings
+    /// (ft-yccm0.3.2.4) apply without an `Action` being built for the gate.
+    fn diverts_sgr(&mut self, _sgr: &Sgr) -> bool {
+        false
+    }
 }
 
 struct FundedPaneAlerts {
@@ -8293,12 +8300,13 @@ mod tests {
             \x1b]1337;SetUserVar=a=Yg==\x07\x1b]7;file://h/p\x07\x1b]777;notify;t;b\x07\
             \x1bc\x1b\\\x1b[1mbold\x1b[2J\x1b[5;5H\x1b[?2026h\x1b[?2026l\x1b[?2026$p\
             \x1b[!p\x1bP$qm\x1b\\\x1b_Ga=q,i=1;AAAA\x1b\\\x1b(0q\x1b7\x1b8\r\n\x08\
-            \x1b[?25l\x1b[4h\x1bM";
+            \x1b[?25l\x1b[4h\x1bM\x1b[38;5;196;48;2;1;2;3;4:3m";
         let actions = termwiz::escape::parser::Parser::new().parse_as_vec(bytes);
         assert!(actions.len() > 20, "{:?}", actions);
         let output_only = PaneAlertPreflight::output_only();
         let mut gate = FusedFeedGate;
         let (mut charged_seen, mut sync_seen, mut plain_seen) = (0, 0, 0);
+        let mut sgr_seen = 0;
         for action in &actions {
             let preflight = PaneAlertPreflight::for_actions(std::slice::from_ref(action), 0)
                 .expect("a bounded preflight");
@@ -8307,6 +8315,11 @@ mod tests {
                 || !preflight.historical.is_empty();
             let sync = crate::is_synchronized_output_action(action);
             assert_eq!(gate.diverts(action), charged || sync, "{:?}", action);
+            // The CSI fast path asks about SGR without an Action.
+            if let Action::CSI(CSI::Sgr(sgr)) = action {
+                assert_eq!(gate.diverts_sgr(sgr), gate.diverts(action), "{:?}", action);
+                sgr_seen += 1;
+            }
             if charged {
                 charged_seen += 1;
             } else if sync {
@@ -8319,6 +8332,7 @@ mod tests {
         assert!(charged_seen >= 7, "{} charged", charged_seen);
         assert_eq!(sync_seen, 4);
         assert!(plain_seen >= 10, "{} plain", plain_seen);
+        assert_eq!(sgr_seen, 4);
     }
 
     #[test]

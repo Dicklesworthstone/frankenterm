@@ -9,7 +9,7 @@ use frankenterm_cell::{
     grapheme_column_width, is_white_space_grapheme, Cell, CellAttributes, SemanticType,
 };
 use frankenterm_escape_parser::csi::{
-    CharacterPath, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode,
+    CharacterPath, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode, Sgr,
 };
 use frankenterm_escape_parser::osc::{
     ChangeColorPair, ColorOrQuery, FinalTermSemanticPrompt, ITermProprietary,
@@ -300,6 +300,20 @@ impl<'a> Handler for Performer<'a> {
     #[inline]
     fn print_str(&mut self, text: &str) {
         self.print_string(text);
+    }
+
+    /// What `perform` does for each `Action::CSI(CSI::Sgr(_))`, with no
+    /// `Action` built (ft-yccm0.3.2.4). Pending print is committed with the
+    /// old pen, then every setting updates the pen. Flushing once covers the
+    /// whole run, since nothing prints between the settings. SGR keeps
+    /// `last_printed`.
+    #[inline]
+    fn sgr(&mut self, sgrs: &[Sgr]) {
+        self.pop_tmux_title_state();
+        self.flush_print();
+        for sgr in sgrs {
+            self.state.perform_csi_sgr(sgr.clone());
+        }
     }
 }
 

@@ -2125,37 +2125,9 @@ impl<'a> CSIParser<'a> {
     }
 
     fn decstbm(&mut self, params: &'a [CsiParam]) -> Result<CSI, ()> {
-        match params {
-            [] => Ok(CSI::Cursor(Cursor::SetTopAndBottomMargins {
-                top: OneBased::new(1),
-                bottom: OneBased::new(u32::MAX),
-            })),
-            [p] => Ok(self.advance_by(
-                1,
-                params,
-                CSI::Cursor(Cursor::SetTopAndBottomMargins {
-                    top: OneBased::from_esc_param(p)?,
-                    bottom: OneBased::new(u32::MAX),
-                }),
-            )),
-            [a, CsiParam::P(b';'), b] => Ok(self.advance_by(
-                3,
-                params,
-                CSI::Cursor(Cursor::SetTopAndBottomMargins {
-                    top: OneBased::from_esc_param(a)?,
-                    bottom: OneBased::from_esc_param_with_big_default(b)?,
-                }),
-            )),
-            [CsiParam::P(b';'), b] => Ok(self.advance_by(
-                2,
-                params,
-                CSI::Cursor(Cursor::SetTopAndBottomMargins {
-                    top: OneBased::new(1),
-                    bottom: OneBased::from_esc_param_with_big_default(b)?,
-                }),
-            )),
-            _ => Err(()),
-        }
+        // Every shape `decstbm_margins` accepts uses the whole slice, so no
+        // parameters remain for a further item.
+        decstbm_margins(params)
     }
 
     fn xterm_key_modifier(&mut self, params: &'a [CsiParam]) -> Result<CSI, ()> {
@@ -2431,14 +2403,10 @@ impl<'a> CSIParser<'a> {
 
     fn dec(&mut self, params: &'a [CsiParam]) -> Result<DecPrivateMode, ()> {
         match params {
-            [CsiParam::Integer(p0), ..] => match FromPrimitive::from_i64(*p0) {
-                None => Ok(self.advance_by(
-                    1,
-                    params,
-                    DecPrivateMode::Unspecified(p0.to_u16().ok_or(())?),
-                )),
-                Some(mode) => Ok(self.advance_by(1, params, DecPrivateMode::Code(mode))),
-            },
+            [CsiParam::Integer(p0), ..] => {
+                let mode = dec_private_mode(*p0).ok_or(())?;
+                Ok(self.advance_by(1, params, mode))
+            }
             _ => Err(()),
         }
     }
@@ -3136,6 +3104,192 @@ fn sgr_fast<E: FnMut(CSI)>(params: &[CsiParam], emit: &mut E) -> bool {
         }
     }
     true
+}
+
+/// DECSTBM (`CSI Pt ; Pb r`). Every shape it accepts uses the whole
+/// parameter list, so it is always a single item. Shared by
+/// `CSIParser::decstbm` and the CSI fast path.
+fn decstbm_margins(params: &[CsiParam]) -> Result<CSI, ()> {
+    let (top, bottom) = match params {
+        [] => (OneBased::new(1), OneBased::new(u32::MAX)),
+        [p] => (OneBased::from_esc_param(p)?, OneBased::new(u32::MAX)),
+        [a, CsiParam::P(b';'), b] => (
+            OneBased::from_esc_param(a)?,
+            OneBased::from_esc_param_with_big_default(b)?,
+        ),
+        [CsiParam::P(b';'), b] => (
+            OneBased::new(1),
+            OneBased::from_esc_param_with_big_default(b)?,
+        ),
+        _ => return Err(()),
+    };
+    Ok(CSI::Cursor(Cursor::SetTopAndBottomMargins { top, bottom }))
+}
+
+/// One DEC private mode number as `CSIParser::dec` maps it: a known code, or
+/// `Unspecified` when it fits `u16`.
+fn dec_private_mode(value: i64) -> Option<DecPrivateMode> {
+    match FromPrimitive::from_i64(value) {
+        Some(code) => Some(DecPrivateMode::Code(code)),
+        None => value.to_u16().map(DecPrivateMode::Unspecified),
+    }
+}
+
+/// The CSI fast path's decoder for the common finals other than SGR
+/// (ft-yccm0.3.2.4): `A`-`D`, `H`, `J`, `K`, `r`, and `h`/`l` with `?`.
+///
+/// It dispatches on the final byte directly, with no `CSIParser` and none of
+/// its matching on special `(final, parameters)` shapes; without a private
+/// marker these finals have none, and with `?` only `h`/`l` are taken. Each
+/// arm applies the rule `CSIParser` itself applies (`ParseParams`,
+/// [`decstbm_margins`], [`dec_private_mode`]). For a shape it accepts,
+/// `emit` receives exactly the items `CSI::parse(params, false, control)`
+/// yields and it returns `true`. Otherwise it emits nothing and returns
+/// `false`, and the caller falls back to [`CSI::parse`], which also builds
+/// the `CSI::Unspecified` for malformed or overflowing parameters.
+pub(crate) fn decode_common_csi<E: FnMut(CSI)>(
+    params: &[CsiParam],
+    control: u8,
+    emit: &mut E,
+) -> bool {
+    if let [CsiParam::P(b'?'), modes @ ..] = params {
+        return match control {
+            b'h' => decode_dec_private_modes(modes, Mode::SetDecPrivateMode, emit),
+            b'l' => decode_dec_private_modes(modes, Mode::ResetDecPrivateMode, emit),
+            _ => false,
+        };
+    }
+    let csi = match control {
+        b'A' => u32::parse_params(params).map(|n| CSI::Cursor(Cursor::Up(n))),
+        b'B' => u32::parse_params(params).map(|n| CSI::Cursor(Cursor::Down(n))),
+        b'C' => u32::parse_params(params).map(|n| CSI::Cursor(Cursor::Right(n))),
+        b'D' => u32::parse_params(params).map(|n| CSI::Cursor(Cursor::Left(n))),
+        b'H' => <(OneBased, OneBased)>::parse_params(params)
+            .map(|(line, col)| CSI::Cursor(Cursor::Position { line, col })),
+        b'J' => EraseInDisplay::parse_params(params).map(|e| CSI::Edit(Edit::EraseInDisplay(e))),
+        b'K' => EraseInLine::parse_params(params).map(|e| CSI::Edit(Edit::EraseInLine(e))),
+        b'r' => decstbm_margins(params),
+        _ => return false,
+    };
+    match csi {
+        Ok(csi) => {
+            emit(csi);
+            true
+        }
+        Err(()) => false,
+    }
+}
+
+/// `CSI ? Pm h` or `CSI ? Pm l` in the strict form `Integer (';' Integer)*`,
+/// `modes` being the parameters after the `?`. `CSIParser` yields one mode
+/// per integer there, each `dec` consuming the integer and the `;` after it.
+/// Every mode is checked before any is emitted.
+fn decode_dec_private_modes<E: FnMut(CSI)>(
+    modes: &[CsiParam],
+    wrap: fn(DecPrivateMode) -> Mode,
+    emit: &mut E,
+) -> bool {
+    let mut expect_int = true;
+    for p in modes {
+        match p {
+            CsiParam::Integer(i) if expect_int => {
+                if dec_private_mode(*i).is_none() {
+                    return false;
+                }
+                expect_int = false;
+            }
+            CsiParam::P(b';') if !expect_int => expect_int = true,
+            _ => return false,
+        }
+    }
+    if expect_int {
+        // No mode at all, or a trailing `;`.
+        return false;
+    }
+    for p in modes {
+        if let CsiParam::Integer(i) = p {
+            if let Some(mode) = dec_private_mode(*i) {
+                emit(CSI::Mode(wrap(mode)));
+            }
+        }
+    }
+    true
+}
+
+/// The CSI fast path's SGR decoder (ft-yccm0.3.2.4), with no iterator and no
+/// allocation. It takes the empty list (`Sgr::Reset`) and the strict form
+/// `Integer (';' Integer)*` in which every code is one [`sgr_simple`] maps,
+/// or a `38`/`48`/`58` color as `;5;N` or `;2;R;G;B`. It writes the settings
+/// into `out` and returns how many.
+///
+/// In that form `CSIParser` yields one `Sgr` per code, each consuming its
+/// parameters and the `;` after them, which this reproduces. It returns
+/// `None` (with `out` left as scratch) for every other shape, and the
+/// caller falls back to [`CSI::parse`]. That covers colon sub-parameters
+/// (`38:2::R:G:B`, `4:3`), empty fields, a trailing `;`, a private marker,
+/// unknown codes and out-of-range values, and more settings than `out`
+/// holds.
+pub(crate) fn decode_sgr(params: &[CsiParam], out: &mut [Sgr]) -> Option<usize> {
+    if params.is_empty() {
+        *out.first_mut()? = Sgr::Reset;
+        return Some(1);
+    }
+    let mut count = 0;
+    let mut k = 0;
+    loop {
+        let CsiParam::Integer(code) = *params.get(k)? else {
+            return None;
+        };
+        let (sgr, next) = match code {
+            38 | 48 | 58 => {
+                let (color, next) = sgr_color_semicolon(params, k)?;
+                let sgr = match code {
+                    38 => Sgr::Foreground(color),
+                    48 => Sgr::Background(color),
+                    _ => Sgr::UnderlineColor(color),
+                };
+                (sgr, next)
+            }
+            _ => (sgr_simple(code)?, k + 1),
+        };
+        *out.get_mut(count)? = sgr;
+        count += 1;
+        match params.get(next) {
+            None => return Some(count),
+            Some(CsiParam::P(b';')) => k = next + 1,
+            Some(_) => return None,
+        }
+    }
+}
+
+/// The `;` forms of `CSIParser::parse_sgr_color` for the selector at
+/// `params[k]`: the color, and the index just past its last parameter.
+fn sgr_color_semicolon(params: &[CsiParam], k: usize) -> Option<(ColorSpec, usize)> {
+    match params.get(k + 1..)? {
+        [
+            CsiParam::P(b';'),
+            CsiParam::Integer(5),
+            CsiParam::P(b';'),
+            index,
+            ..,
+        ] => Some((ColorSpec::PaletteIndex(to_u8(index).ok()?), k + 5)),
+        [
+            CsiParam::P(b';'),
+            CsiParam::Integer(2),
+            CsiParam::P(b';'),
+            red,
+            CsiParam::P(b';'),
+            green,
+            CsiParam::P(b';'),
+            blue,
+            ..,
+        ] => {
+            let color: ColorSpec =
+                RgbColor::new_8bpc(to_u8(red).ok()?, to_u8(green).ok()?, to_u8(blue).ok()?).into();
+            Some((color, k + 9))
+        }
+        _ => None,
+    }
 }
 
 impl<'a> Iterator for CSIParser<'a> {
@@ -4852,5 +5006,216 @@ mod test {
         let s = format!("{mr}");
         assert!(s.starts_with("\x1b[<"));
         assert!(s.ends_with("M"));
+    }
+
+    /// `params` as the state machine delivers them for `CSI {text} final`:
+    /// digits are integers, every other byte is a `P`.
+    fn fast_params(text: &str) -> Vec<CsiParam> {
+        let mut params = vec![];
+        let mut current: Option<i64> = None;
+        for byte in text.bytes() {
+            match byte {
+                b'0'..=b'9' => {
+                    current = Some(current.unwrap_or(0) * 10 + i64::from(byte - b'0'));
+                }
+                _ => {
+                    params.extend(current.take().map(CsiParam::Integer));
+                    params.push(CsiParam::P(byte));
+                }
+            }
+        }
+        params.extend(current.map(CsiParam::Integer));
+        params
+    }
+
+    /// What `decode_sgr` and `decode_common_csi` make of `params`, when they
+    /// take it.
+    fn fast_decode(params: &[CsiParam], control: u8) -> Option<Vec<CSI>> {
+        if control == b'm' {
+            let mut out: [Sgr; 8] = core::array::from_fn(|_| Sgr::Reset);
+            let count = decode_sgr(params, &mut out)?;
+            return Some(out[..count].iter().cloned().map(CSI::Sgr).collect());
+        }
+        let mut items = vec![];
+        let taken = decode_common_csi(params, control, &mut |csi| items.push(csi));
+        taken.then_some(items)
+    }
+
+    /// ft-yccm0.3.2.4: the fast decoders take the shapes the operator's
+    /// workload and ordinary programs send (an always-declining decoder would
+    /// pass the equivalence property trivially), and agree with
+    /// `CSI::parse` on each.
+    #[test]
+    fn fast_decoders_take_the_common_shapes() {
+        let taken: &[(&str, u8)] = &[
+            ("", b'm'),
+            ("0", b'm'),
+            ("38;5;196", b'm'),
+            ("48;5;21", b'm'),
+            ("58;5;9", b'm'),
+            ("38;2;1;2;3", b'm'),
+            ("48;2;255;128;0", b'm'),
+            ("58;2;4;5;6", b'm'),
+            ("1;2;3;4;7;22;23;24;27;39;49", b'm'),
+            ("1;38;5;196;48;2;1;2;3;4", b'm'),
+            ("", b'A'),
+            ("0", b'B'),
+            ("5", b'C'),
+            ("4294967295", b'D'),
+            ("", b'H'),
+            ("5;10", b'H'),
+            (";10", b'H'),
+            ("5;", b'H'),
+            ("", b'J'),
+            ("2", b'J'),
+            ("3", b'J'),
+            ("1", b'K'),
+            ("", b'r'),
+            ("2;20", b'r'),
+            (";20", b'r'),
+            ("4", b'r'),
+            ("?25", b'l'),
+            ("?1049", b'h'),
+            ("?1;2004;9999", b'h'),
+        ];
+        for &(text, control) in taken {
+            let params = fast_params(text);
+            let expected: Vec<CSI> = CSI::parse(&params, false, control as char).collect();
+            assert_eq!(
+                fast_decode(&params, control),
+                Some(expected),
+                "CSI {text} {}",
+                control as char
+            );
+        }
+    }
+
+    /// The shapes that need `CSIParser`'s full rules (colon sub-parameters,
+    /// empty fields, a trailing `;`, markers, out-of-range and unknown
+    /// values) are left to it, along with uncommon finals.
+    #[test]
+    fn fast_decoders_leave_the_rest_to_the_csi_parser() {
+        let declined: &[(&str, u8)] = &[
+            ("38:2::1:2:3", b'm'),
+            ("38:5:9", b'm'),
+            ("4:3", b'm'),
+            (";1", b'm'),
+            ("1;", b'm'),
+            ("1;;2", b'm'),
+            ("38;5", b'm'),
+            ("38;5;256", b'm'),
+            ("38;2;1;2", b'm'),
+            ("38;2;1;2;300", b'm'),
+            ("99999", b'm'),
+            ("?1", b'm'),
+            (">4;1", b'm'),
+            ("4294967296", b'A'),
+            ("1;2", b'A'),
+            ("1;2;3", b'H'),
+            ("9", b'J'),
+            ("1;2", b'K'),
+            ("?6", b'r'),
+            ("1;2;3", b'r'),
+            ("?", b'h'),
+            ("?1;", b'h'),
+            ("?1;;2", b'l'),
+            ("?99999", b'h'),
+            ("4", b'h'),
+            ("", b'@'),
+            ("2", b'S'),
+        ];
+        for &(text, control) in declined {
+            assert_eq!(
+                fast_decode(&fast_params(text), control),
+                None,
+                "CSI {text} {}",
+                control as char
+            );
+        }
+    }
+
+    /// One parameter as the state machine can deliver it, biased toward the
+    /// values and separators the fast decoders branch on.
+    fn arb_param() -> impl proptest::strategy::Strategy<Value = CsiParam> {
+        use proptest::prelude::*;
+        prop_oneof![
+            4 => (0i64..=300).prop_map(CsiParam::Integer),
+            3 => proptest::sample::select(vec![
+                0i64,
+                1,
+                2,
+                3,
+                4,
+                5,
+                7,
+                22,
+                23,
+                24,
+                27,
+                38,
+                39,
+                48,
+                49,
+                58,
+                59,
+                255,
+                256,
+                65535,
+                65536,
+                i64::from(u32::MAX),
+                i64::from(u32::MAX) + 1,
+                i64::MAX,
+            ])
+            .prop_map(CsiParam::Integer),
+            5 => Just(CsiParam::P(b';')),
+            1 => Just(CsiParam::P(b':')),
+            1 => proptest::sample::select(b"?<>= $".to_vec()).prop_map(CsiParam::P),
+        ]
+    }
+
+    /// A strict `Integer (';' Integer)*` list of SGR fields, so the property
+    /// below exercises acceptance and not only refusal.
+    fn arb_canonical_sgr() -> impl proptest::strategy::Strategy<Value = Vec<CsiParam>> {
+        use proptest::prelude::*;
+        let field = prop_oneof![
+            (0i64..=110).prop_map(|code| vec![code]),
+            (prop_oneof![Just(38i64), Just(48), Just(58)], 0i64..=260)
+                .prop_map(|(selector, index)| vec![selector, 5, index]),
+            (
+                prop_oneof![Just(38i64), Just(48), Just(58)],
+                0i64..=260,
+                0i64..=260,
+                0i64..=260
+            )
+                .prop_map(|(selector, r, g, b)| vec![selector, 2, r, g, b]),
+        ];
+        proptest::collection::vec(field, 0..6).prop_map(|fields| {
+            let mut params = vec![];
+            for value in fields.into_iter().flatten() {
+                if !params.is_empty() {
+                    params.push(CsiParam::P(b';'));
+                }
+                params.push(CsiParam::Integer(value));
+            }
+            params
+        })
+    }
+
+    proptest::proptest! {
+        /// ft-yccm0.3.2.4: whatever the fast decoders take, they decode
+        /// exactly as `CSI::parse` does.
+        #[test]
+        fn fast_decoders_agree_with_the_csi_parser(
+            params in proptest::prop_oneof![
+                proptest::collection::vec(arb_param(), 0..12),
+                arb_canonical_sgr(),
+            ],
+            control in proptest::sample::select(b"mABCDHJKrhlsSu@".to_vec()),
+        ) {
+            if let Some(fast) = fast_decode(&params, control) {
+                let expected: Vec<CSI> = CSI::parse(&params, false, control as char).collect();
+                proptest::prop_assert_eq!(fast, expected);
+            }
+        }
     }
 }

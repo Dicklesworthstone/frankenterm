@@ -208,6 +208,58 @@ pub fn adversarial_cases() -> Vec<(&'static str, Vec<u8>)> {
     long_line.extend_from_slice(b"\r\n");
     cases.push(("long_wrapped_line", long_line));
 
+    // ft-yccm0.3.2.4, the CSI fast path. These come last so the cases above
+    // keep their geometries.
+    cases.extend([
+        // The operator's T0 pairs, with repeats the last-SGR cache answers.
+        (
+            "csi_fast_t0_repeats",
+            "\x1b[38;5;196m\x1b[48;5;21m\u{1F600}\x1b[38;5;196m\x1b[48;5;21m\u{1F680}\x1b[38;5;196m\x1b[48;5;22mx"
+                .as_bytes()
+                .to_vec(),
+        ),
+        // SGR shapes the fast decoder leaves to CSIParser: empty fields, a
+        // trailing `;`, short or out-of-range colors, colon sub-parameters,
+        // markers and overflow.
+        (
+            "csi_fast_sgr_fields",
+            b"\x1b[;1mA\x1b[1;mB\x1b[1;;2mC\x1b[38;5mD\x1b[38;5;256mE\x1b[38;2;1;2mF".to_vec(),
+        ),
+        (
+            "csi_fast_sgr_colors",
+            b"\x1b[38;2;1;2;300mG\x1b[48;2;1;2;3;4mH\x1b[58;5;9m\x1b[59mI\x1b[38:5:9mJ\x1b[38:2::1:2:3mK\x1b[4:3mL"
+                .to_vec(),
+        ),
+        (
+            "csi_fast_sgr_markers",
+            b"\x1b[?1mM\x1b[>4;1mN\x1b[:1mO\x1b[1:mP\x1b[99999999999999999999mQ".to_vec(),
+        ),
+        // The common finals, in shapes the direct match takes and leaves.
+        (
+            "csi_fast_cursor_finals",
+            b"\x1b[5;10Hx\x1b[Ay\x1b[0B\x1b[5C\x1b[4294967295D\x1b[4294967296A\x1b[;5Hz\x1b[3;H\x1b[3;4;5H\x1b[?5H"
+                .to_vec(),
+        ),
+        (
+            "csi_fast_erase_margins_modes",
+            b"ab\x1b[1J\x1b[9J\x1b[1;K\x1b[2;4r\x1b[2;0r\x1b[;3r\x1b[r\x1b[?7;25l\x1b[?h\x1b[?1;h\x1b[?99999l\x1b[?25;;1l\x1b[?7;25h"
+                .to_vec(),
+        ),
+        // Sequences the scanner leaves to the state machine: a second or
+        // misplaced marker, intermediates, DEL, a control or an ESC inside,
+        // and non-ASCII bytes.
+        (
+            "csi_fast_left_to_state_machine",
+            b"\x1b[?1?2h\x1b[1?hA\x1b[2 qB\x1b[1\x7f2mC\x1b[3\r1mD\x1b[1\x1b[2mE\x1b[\xc3\xa9mF".to_vec(),
+        ),
+    ]);
+
+    // More consecutive SGR settings than one fast-path run holds, then a
+    // sequence with more parameters than the fast path's array.
+    let mut sgr_runs = repeat("\x1b[1m\x1b[38;5;9m", 24).into_bytes();
+    sgr_runs.extend_from_slice(b"x\x1b[1;2;3;4;5;7;8;9;21;22;23;24;25;27;28;29;30mY");
+    cases.push(("csi_fast_long_sgr_runs", sgr_runs));
+
     cases
 }
 

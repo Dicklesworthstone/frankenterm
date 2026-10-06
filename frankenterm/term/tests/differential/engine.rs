@@ -162,9 +162,12 @@ impl EngineFactory for Legacy {
 
 /// The mux parse thread's shape: `Parser::parse` into a `Vec<Action>`, then
 /// `Terminal::perform_actions`, with or without the parser's ground-state
-/// printable-run batching.
+/// printable-run batching, and with or without its CSI fast path
+/// (ft-yccm0.3.2.4), which runs only with batching. Unbatched, every byte
+/// goes through the state machine and every CSI through `CSI::parse`.
 pub struct TwoStage {
     pub print_batching: bool,
+    pub csi_fast_path: bool,
 }
 
 struct TwoStageEngine {
@@ -190,16 +193,17 @@ impl Engine for TwoStageEngine {
 
 impl EngineFactory for TwoStage {
     fn name(&self) -> &'static str {
-        if self.print_batching {
-            "mux_two_stage"
-        } else {
-            "two_stage_unbatched"
+        match (self.print_batching, self.csi_fast_path) {
+            (true, true) => "mux_two_stage",
+            (true, false) => "two_stage_no_csi_fast_path",
+            (false, _) => "two_stage_unbatched",
         }
     }
 
     fn build_with(&self, geometry: &Geometry, io: EngineIo) -> Box<dyn Engine> {
         let mut parser = Parser::new();
         parser.set_print_batching(self.print_batching);
+        parser.set_csi_fast_path(self.csi_fast_path);
         Box::new(TwoStageEngine {
             terminal: new_terminal_with(geometry, io),
             parser,
@@ -289,9 +293,15 @@ pub fn candidates() -> Vec<Box<dyn EngineFactory>> {
     vec![
         Box::new(TwoStage {
             print_batching: true,
+            csi_fast_path: true,
+        }),
+        Box::new(TwoStage {
+            print_batching: true,
+            csi_fast_path: false,
         }),
         Box::new(TwoStage {
             print_batching: false,
+            csi_fast_path: false,
         }),
         Box::new(FusedFeed { divert_every: None }),
         Box::new(FusedFeed {
