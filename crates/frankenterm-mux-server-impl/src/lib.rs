@@ -396,26 +396,261 @@ pub fn reconcile_client_domain_config(
     }
 }
 
-/// The parser owns draining this bounded warm queue. No worker thread, disk
-/// operation or acknowledgement is hidden in queue admission. In particular,
-/// queued reads can proceed during append synchronization. UI metadata callers
-/// must use try_capture_scrollback_interval: legacy getters can block while a
+/// Per-pane warm queue whose store IO runs on one process-wide
+/// `scrollback-durability` thread (ft-yccm0.2.1.1). Parser admission is a
+/// memory transfer under the terminal lock; the parser then hands the queue to
+/// the writer and never performs or waits on storage IO. Queued rows are
+/// bounded by the writer's byte budget (ft-yccm0.2.1.6): past it, a pane's
+/// oldest queued rows become a durability gap, which the writer records in
+/// order as one marker row, so overload never throttles the pane. Queued
+/// reads proceed during append synchronization. UI metadata callers must use
+/// try_capture_scrollback_interval: legacy getters can block while a
 /// destructive operation holds state across durable publication.
 mod deferred_scrollback {
+    use frankenterm_alloc::resource_ledger::DurabilityLedger;
     use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex, TryLockError};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, TryLockError, Weak};
+    use std::time::{Duration, Instant};
     use wezterm_term::config::{
-        ScrollbackClearCommit, ScrollbackIntervalCapture, ScrollbackIntervalIdentity,
-        ScrollbackPrefix, ScrollbackReplaceCommit, ScrollbackSnapshot,
-        ScrollbackSnapshotGeneration, ScrollbackSnapshotLimits, ScrollbackSpillError,
-        ScrollbackSpillSink, ScrollbackUsage, ScrollbackUsageCapture,
+        ScrollbackCapacityWait, ScrollbackClearCommit, ScrollbackIntervalCapture,
+        ScrollbackIntervalIdentity, ScrollbackLineAdmission, ScrollbackPrefix,
+        ScrollbackReplaceCommit, ScrollbackSnapshot, ScrollbackSnapshotGeneration,
+        ScrollbackSnapshotLimits, ScrollbackSpillError, ScrollbackSpillSink, ScrollbackUsage,
+        ScrollbackUsageCapture,
     };
     use wezterm_term::{Line, StableRowIndex};
 
-    const MAX_PENDING_ROWS: usize = super::LIVE_SCROLLBACK_APPEND_MAX_ROWS;
-    const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
+    /// Rows per backing transaction: the store's append limit.
+    const MAX_BATCH_ROWS: usize = super::LIVE_SCROLLBACK_APPEND_MAX_ROWS;
+    /// Default byte budget for rows queued behind the writer, across every
+    /// pane it serves (ft-yccm0.2.1.6). Over budget, the oldest queued rows
+    /// become a durability gap; admission never refuses for capacity.
+    pub const DEFAULT_QUEUE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
     const MAX_CACHED_ROWS: usize = 32;
     const MAX_CACHED_BYTES: usize = 256 * 1024;
+    /// Writer retry delay after a failed drain, doubling per consecutive
+    /// failure up to the maximum. Rows stay owned (and readable) meanwhile.
+    const RETRY_BACKOFF_MIN: Duration = Duration::from_millis(100);
+    const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(2);
+    pub const DURABILITY_THREAD_NAME: &str = "scrollback-durability";
+
+    /// The single thread that performs durable scrollback IO for every pane.
+    ///
+    /// The queue holds at most one entry per sink (`scheduled` deduplicates
+    /// wakeups), so its length is bounded by the live pane count; rows stay in
+    /// each sink's byte- and row-bounded pending queue, where cold reads can
+    /// see them, rather than being copied into the channel. One drainer per
+    /// sink at a time preserves per-pane FIFO order.
+    pub struct DurabilityWriter {
+        shared: Arc<WriterShared>,
+    }
+
+    struct WriterShared {
+        queue: Mutex<WriterQueue>,
+        wake: Condvar,
+        running: AtomicBool,
+        /// Byte budget for rows queued behind this writer.
+        budget: AtomicUsize,
+        /// Charged bytes of every row queued behind this writer.
+        queued_bytes: AtomicUsize,
+        /// Only the process-wide writer publishes to `DurabilityLedger`
+        /// (`ft doctor --json`); private test writers do not.
+        publishes: AtomicBool,
+    }
+
+    #[derive(Default)]
+    struct WriterQueue {
+        ready: VecDeque<Arc<DeferredScrollbackSpillSink>>,
+        backoff: Vec<(Instant, Arc<DeferredScrollbackSpillSink>)>,
+        shutdown: bool,
+    }
+
+    impl DurabilityWriter {
+        /// The process-wide writer, started on first use.
+        pub(super) fn global() -> Arc<Self> {
+            static GLOBAL: OnceLock<Arc<DurabilityWriter>> = OnceLock::new();
+            Arc::clone(GLOBAL.get_or_init(|| {
+                let writer = Self::spawn();
+                writer.shared.publishes.store(true, Ordering::Release);
+                writer.publish_queue(0);
+                writer
+            }))
+        }
+
+        /// Whether this writer reports to `DurabilityLedger::global()`.
+        fn publishes(&self) -> bool {
+            self.shared.publishes.load(Ordering::Acquire)
+        }
+
+        fn publish_queue(&self, total: usize) {
+            metrics::gauge!("mux.scrollback.durability_queue_bytes").set(total as f64);
+            if self.publishes() {
+                DurabilityLedger::global().set_queue(total as u64, self.queue_budget() as u64);
+            }
+        }
+
+        /// Start a writer thread. Without one (spawn failure), sinks fall
+        /// back to draining inline on the requesting thread.
+        pub(super) fn spawn() -> Arc<Self> {
+            let shared = Arc::new(WriterShared {
+                queue: Mutex::new(WriterQueue::default()),
+                wake: Condvar::new(),
+                running: AtomicBool::new(false),
+                budget: AtomicUsize::new(DEFAULT_QUEUE_BUDGET_BYTES),
+                queued_bytes: AtomicUsize::new(0),
+                publishes: AtomicBool::new(false),
+            });
+            let worker = Arc::clone(&shared);
+            match std::thread::Builder::new()
+                .name(DURABILITY_THREAD_NAME.to_string())
+                .spawn(move || {
+                    // Durability need not finish promptly; keep it off the
+                    // performance cores that parse output (ft-yccm0.3.1.3).
+                    if let Err(error) =
+                        procinfo::set_current_thread_qos(procinfo::ThreadQos::Utility)
+                    {
+                        log::warn!(
+                            "{DURABILITY_THREAD_NAME} thread keeps its default QoS class: {error}"
+                        );
+                    }
+                    worker.run();
+                }) {
+                Ok(_) => shared.running.store(true, Ordering::Release),
+                Err(error) => log::error!(
+                    "failed to start the {DURABILITY_THREAD_NAME} thread; scrollback durability runs inline on parser threads: {error}"
+                ),
+            }
+            Arc::new(Self { shared })
+        }
+
+        /// O(1) handoff: never waits on storage. False when no thread runs.
+        fn enqueue(&self, sink: Arc<DeferredScrollbackSpillSink>) -> bool {
+            if !self.shared.running.load(Ordering::Acquire) {
+                return false;
+            }
+            let mut queue = self.shared.lock_queue();
+            queue.ready.push_back(sink);
+            drop(queue);
+            self.shared.wake.notify_one();
+            true
+        }
+
+        /// Sets the byte budget for queued rows (config
+        /// `scrollback_durability_queue_max_mb`).
+        pub(super) fn set_queue_budget(&self, bytes: usize) {
+            self.shared.budget.store(bytes.max(1), Ordering::Release);
+            self.publish_queue(self.queued_bytes());
+        }
+
+        pub(super) fn queue_budget(&self) -> usize {
+            self.shared.budget.load(Ordering::Acquire)
+        }
+
+        /// Charged bytes of every row queued behind this writer.
+        pub(super) fn queued_bytes(&self) -> usize {
+            self.shared.queued_bytes.load(Ordering::Acquire)
+        }
+
+        fn charge(&self, bytes: usize) {
+            let total = self.shared.queued_bytes.fetch_add(bytes, Ordering::AcqRel) + bytes;
+            self.publish_queue(total);
+        }
+
+        fn release(&self, bytes: usize) {
+            let total = self.shared.queued_bytes.fetch_sub(bytes, Ordering::AcqRel) - bytes;
+            self.publish_queue(total);
+        }
+    }
+
+    impl Drop for DurabilityWriter {
+        fn drop(&mut self) {
+            // Queued sinks hold this writer alive, so the queue is empty here.
+            self.shared.lock_queue().shutdown = true;
+            self.shared.wake.notify_all();
+        }
+    }
+
+    impl WriterShared {
+        fn lock_queue(&self) -> std::sync::MutexGuard<'_, WriterQueue> {
+            // Only VecDeque/Vec operations run under this lock.
+            self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        fn run(&self) {
+            while let Some(sink) = self.next_sink() {
+                self.service(sink);
+            }
+        }
+
+        fn next_sink(&self) -> Option<Arc<DeferredScrollbackSpillSink>> {
+            let mut queue = self.lock_queue();
+            loop {
+                let now = Instant::now();
+                let mut index = 0;
+                while index < queue.backoff.len() {
+                    if queue.backoff[index].0 <= now {
+                        let (_, sink) = queue.backoff.swap_remove(index);
+                        queue.ready.push_back(sink);
+                    } else {
+                        index += 1;
+                    }
+                }
+                if let Some(sink) = queue.ready.pop_front() {
+                    return Some(sink);
+                }
+                if queue.shutdown {
+                    return None;
+                }
+                queue = match queue.backoff.iter().map(|(at, _)| *at).min() {
+                    Some(at) => {
+                        self.wake
+                            .wait_timeout(queue, at.saturating_duration_since(now))
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .0
+                    }
+                    None => self
+                        .wake
+                        .wait(queue)
+                        .unwrap_or_else(PoisonError::into_inner),
+                };
+            }
+        }
+
+        fn service(&self, sink: Arc<DeferredScrollbackSpillSink>) {
+            if let Some(retry_at) = sink.retry_not_before() {
+                if retry_at > Instant::now() {
+                    // Still backing off; `scheduled` stays set.
+                    self.lock_queue().backoff.push((retry_at, sink));
+                    return;
+                }
+            }
+            // Clear before draining: a row admitted during this drain
+            // schedules another pass instead of waiting for the next batch.
+            sink.scheduled.store(false, Ordering::Release);
+            if sink.drain_scheduled().is_ok() {
+                return;
+            }
+            let retry_at = sink.retry_not_before().unwrap_or_else(Instant::now);
+            if Arc::strong_count(&sink) == 1 {
+                // The pane closed and only this writer still owns its rows.
+                // Dropping the sink reports them (never silently) and
+                // releases its store.
+                return;
+            }
+            if !sink.scheduled.swap(true, Ordering::AcqRel) {
+                self.lock_queue().backoff.push((retry_at, sink));
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct WriterHealth {
+        failure: Option<ScrollbackSpillError>,
+        panicked: bool,
+        consecutive_failures: u32,
+        retry_not_before: Option<Instant>,
+    }
 
     struct PendingRow {
         stable_row: StableRowIndex,
@@ -424,11 +659,100 @@ mod deferred_scrollback {
         charged_bytes: usize,
     }
 
+    /// Queued rows dropped from durability under overload (ft-yccm0.2.1.6).
+    /// The writer records the gap as one marker row, in order.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct GapSpan {
+        start: StableRowIndex,
+        /// Exclusive.
+        end: StableRowIndex,
+        retention: usize,
+        /// Charged bytes of the dropped rows.
+        bytes: usize,
+        at_unix_ms: u64,
+    }
+
+    impl GapSpan {
+        fn rows(&self) -> StableRowIndex {
+            self.end - self.start
+        }
+
+        /// The marker the durable transcript carries in place of the rows.
+        fn marker_text(&self) -> String {
+            format!(
+                "[durability gap: {} rows ({}..{}), {} bytes, reason=overload, at_unix_ms={}]",
+                self.rows(),
+                self.start,
+                self.end,
+                self.bytes,
+                self.at_unix_ms
+            )
+        }
+
+        /// What a read of `stable_row` in the gap returns: the marker on the
+        /// first row, empty rows after it.
+        fn line_at(&self, stable_row: StableRowIndex) -> Line {
+            if stable_row == self.start {
+                Line::from_text(
+                    &self.marker_text(),
+                    &wezterm_term::CellAttributes::blank(),
+                    0,
+                    None,
+                )
+            } else {
+                Line::new(0)
+            }
+        }
+    }
+
+    enum Pending {
+        Row(PendingRow),
+        Gap(GapSpan),
+    }
+
+    impl Pending {
+        fn start(&self) -> StableRowIndex {
+            match self {
+                Self::Row(row) => row.stable_row,
+                Self::Gap(gap) => gap.start,
+            }
+        }
+
+        fn end(&self) -> StableRowIndex {
+            match self {
+                Self::Row(row) => row.stable_row + 1,
+                Self::Gap(gap) => gap.end,
+            }
+        }
+    }
+
+    fn unix_now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+            })
+    }
+
     struct State {
         interval_identity: ScrollbackIntervalIdentity,
         publication_uncertain: bool,
-        pending: VecDeque<PendingRow>,
+        /// Contiguous stable rows, oldest first: queued rows and gaps.
+        pending: VecDeque<Pending>,
+        /// Charged bytes of the queued rows.
         pending_bytes: usize,
+        /// Front entries a drain has captured and is writing; overload never
+        /// converts them.
+        in_flight: usize,
+        /// Gaps of this lineage already written as markers, oldest first.
+        /// Each makes the store rows after it `rows() - 1` lower than their
+        /// stable rows.
+        written_gaps: VecDeque<GapSpan>,
+        /// The store-row offset of written gaps pruned by retention.
+        pruned_gap_skip: StableRowIndex,
+        /// Overload shedding is active until the queue drains below half of
+        /// the budget (hysteresis).
+        shedding: bool,
         // An acknowledged suffix, transferred from pending without cloning or
         // serializing cells. First reflow can read its cold/hot boundary here.
         // Uses the same cell/text charge as pending, not a total heap estimate.
@@ -441,11 +765,175 @@ mod deferred_scrollback {
 
     pub struct DeferredScrollbackSpillSink {
         backing: Arc<dyn ScrollbackSpillSink>,
+        /// Destructive operations (clear, replace, snapshot). Admission only
+        /// try-locks it, so it never refuses rows because a drain is running.
         operation: Mutex<()>,
+        /// One drainer at a time: the writer, or an explicit flush. Lock
+        /// order is operation -> drain_gate -> state.
+        drain_gate: Mutex<()>,
         state: Mutex<State>,
+        self_ref: Weak<Self>,
+        writer: Arc<DurabilityWriter>,
+        pane_label: String,
+        /// Set while an entry for this sink sits in the writer queue.
+        scheduled: AtomicBool,
+        /// Mirrors `state.pending.len()` so a handoff needs no state lock.
+        pending_rows: AtomicUsize,
+        /// Bumped after every acknowledged batch, clear and replacement.
+        progress_epoch: AtomicU64,
+        /// The progress epoch observed before the most recent refusal.
+        refused_epoch: AtomicU64,
+        progress: Mutex<()>,
+        progress_signal: Condvar,
+        health: Mutex<WriterHealth>,
+        committed_batches: AtomicU64,
     }
 
     impl State {
+        fn empty(
+            durable_bytes: usize,
+            oldest: Option<StableRowIndex>,
+            newest_exclusive: Option<StableRowIndex>,
+        ) -> Self {
+            Self {
+                interval_identity: ScrollbackIntervalIdentity::default(),
+                publication_uncertain: false,
+                pending: VecDeque::new(),
+                pending_bytes: 0,
+                in_flight: 0,
+                written_gaps: VecDeque::new(),
+                pruned_gap_skip: 0,
+                shedding: false,
+                cached: VecDeque::new(),
+                cached_bytes: 0,
+                durable_bytes,
+                oldest,
+                newest_exclusive,
+            }
+        }
+
+        /// How far below `stable_row` its store row is: one less than each
+        /// written gap's length for every gap that ends at or before it.
+        fn store_skip_before(&self, stable_row: StableRowIndex) -> StableRowIndex {
+            self.pruned_gap_skip
+                + self
+                    .written_gaps
+                    .iter()
+                    .take_while(|gap| gap.end <= stable_row)
+                    .map(|gap| gap.rows() - 1)
+                    .sum::<StableRowIndex>()
+        }
+
+        /// The store-row offset after every written gap, which applies to
+        /// every queued row.
+        fn store_skip(&self) -> StableRowIndex {
+            self.pruned_gap_skip
+                + self
+                    .written_gaps
+                    .iter()
+                    .map(|gap| gap.rows() - 1)
+                    .sum::<StableRowIndex>()
+        }
+
+        /// Forgets written gaps whose marker the store no longer retains,
+        /// keeping their store-row offset. Pruning by the store, not by
+        /// `oldest`, keeps every marker a snapshot can return expandable.
+        fn prune_written_gaps(&mut self, store_oldest: Option<StableRowIndex>) {
+            let Some(store_oldest) = store_oldest else {
+                return;
+            };
+            while let Some(gap) = self.written_gaps.front() {
+                if gap.start - self.pruned_gap_skip >= store_oldest {
+                    break;
+                }
+                self.pruned_gap_skip += gap.rows() - 1;
+                self.written_gaps.pop_front();
+            }
+        }
+
+        /// The queued entry holding `stable_row`.
+        fn pending_entry(&self, stable_row: StableRowIndex) -> Option<&Pending> {
+            let index = self
+                .pending
+                .partition_point(|entry| entry.end() <= stable_row);
+            self.pending
+                .get(index)
+                .filter(|entry| entry.start() <= stable_row)
+        }
+
+        /// Turns queued rows after the in-flight prefix into gaps, oldest
+        /// first, until `need` bytes are freed or none are left. Adjacent
+        /// gaps coalesce into one. Returns the bytes freed, the dropped rows
+        /// (to be released outside the state lock) and the new gap spans.
+        fn shed(&mut self, need: usize, at_unix_ms: u64) -> (usize, Vec<Pending>, Vec<GapSpan>) {
+            let mut freed = 0;
+            let mut dropped = Vec::new();
+            let mut spans = Vec::new();
+            let mut index = self.in_flight;
+            while freed < need && index < self.pending.len() {
+                if matches!(self.pending[index], Pending::Gap(_)) {
+                    index += 1;
+                    continue;
+                }
+                // A run of rows from `index`, cut once `need` is met.
+                let mut end = index;
+                let mut run_bytes = 0;
+                while end < self.pending.len() && freed + run_bytes < need {
+                    match &self.pending[end] {
+                        Pending::Row(row) => run_bytes += row.charged_bytes,
+                        Pending::Gap(_) => break,
+                    }
+                    end += 1;
+                }
+                let first = self.pending[index].start();
+                let last = self.pending[end - 1].end();
+                let retention = match &self.pending[index] {
+                    Pending::Row(row) => row.retention,
+                    Pending::Gap(gap) => gap.retention,
+                };
+                dropped.extend(self.pending.drain(index..end));
+                let mut span = GapSpan {
+                    start: first,
+                    end: last,
+                    retention,
+                    bytes: run_bytes,
+                    at_unix_ms,
+                };
+                // Coalesce with a gap on either side that no drain holds.
+                if index > self.in_flight {
+                    if let Some(Pending::Gap(previous)) = self.pending.get(index - 1) {
+                        if previous.end == span.start {
+                            span.start = previous.start;
+                            span.bytes += previous.bytes;
+                            span.at_unix_ms = previous.at_unix_ms;
+                            span.retention = previous.retention;
+                            self.pending.remove(index - 1);
+                            index -= 1;
+                        }
+                    }
+                }
+                if let Some(Pending::Gap(next)) = self.pending.get(index) {
+                    if next.start == span.end {
+                        span.end = next.end;
+                        span.bytes += next.bytes;
+                        self.pending.remove(index);
+                    }
+                }
+                self.pending.insert(index, Pending::Gap(span));
+                spans.push(GapSpan {
+                    start: first,
+                    end: last,
+                    retention,
+                    bytes: run_bytes,
+                    at_unix_ms,
+                });
+                self.pending_bytes -= run_bytes;
+                freed += run_bytes;
+                index += 1;
+            }
+            (freed, dropped, spans)
+        }
+
         fn prune_cached(&mut self) {
             while self.cached.front().is_some_and(|row| {
                 self.oldest.is_none_or(|oldest| row.stable_row < oldest)
@@ -492,15 +980,173 @@ mod deferred_scrollback {
     }
 
     impl DeferredScrollbackSpillSink {
+        /// A sink drained by the process-wide durability writer.
         pub(super) fn new(
             backing: Arc<dyn ScrollbackSpillSink>,
-        ) -> Result<Self, ScrollbackSpillError> {
+            durable_pane_id: [u8; 16],
+        ) -> Result<Arc<Self>, ScrollbackSpillError> {
+            Self::with_writer(backing, durable_pane_id, DurabilityWriter::global())
+        }
+
+        pub(super) fn with_writer(
+            backing: Arc<dyn ScrollbackSpillSink>,
+            durable_pane_id: [u8; 16],
+            writer: Arc<DurabilityWriter>,
+        ) -> Result<Arc<Self>, ScrollbackSpillError> {
             let state = Self::backing_state(backing.as_ref())?;
-            Ok(Self {
+            Ok(Arc::new_cyclic(|self_ref| Self {
                 backing,
                 operation: Mutex::new(()),
+                drain_gate: Mutex::new(()),
                 state: Mutex::new(state),
-            })
+                self_ref: self_ref.clone(),
+                writer,
+                pane_label: uuid::Uuid::from_bytes(durable_pane_id).to_string(),
+                scheduled: AtomicBool::new(false),
+                pending_rows: AtomicUsize::new(0),
+                progress_epoch: AtomicU64::new(0),
+                refused_epoch: AtomicU64::new(0),
+                progress: Mutex::new(()),
+                progress_signal: Condvar::new(),
+                health: Mutex::new(WriterHealth::default()),
+                committed_batches: AtomicU64::new(0),
+            }))
+        }
+
+        /// The current writer failure, if this pane's durability is degraded.
+        /// Rows stay owned in memory (and readable) while it is degraded.
+        pub(super) fn durability_failure(&self) -> Option<ScrollbackSpillError> {
+            self.lock_health().failure
+        }
+
+        /// Whether a contained writer panic has degraded this pane.
+        #[cfg(test)]
+        pub(super) fn writer_panicked(&self) -> bool {
+            self.lock_health().panicked
+        }
+
+        /// Backing transactions this sink has acknowledged, one per batch.
+        #[cfg(test)]
+        pub(super) fn committed_batches(&self) -> u64 {
+            self.committed_batches.load(Ordering::Acquire)
+        }
+
+        fn lock_health(&self) -> std::sync::MutexGuard<'_, WriterHealth> {
+            // Only plain field updates run under this lock.
+            self.health.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        fn retry_not_before(&self) -> Option<Instant> {
+            self.lock_health().retry_not_before
+        }
+
+        fn record_writer_success(&self) {
+            let mut health = self.lock_health();
+            let recovered = health.failure.take();
+            health.consecutive_failures = 0;
+            health.retry_not_before = None;
+            drop(health);
+            if let Some(error) = recovered {
+                DurabilityLedger::global().record_recovered(&self.pane_label);
+                log::info!(
+                    "scrollback durability for pane {} recovered after: {error}",
+                    self.pane_label
+                );
+            }
+        }
+
+        fn record_writer_failure(&self, error: ScrollbackSpillError, panicked: bool) {
+            let mut health = self.lock_health();
+            let first = health.failure.is_none();
+            health.failure = Some(error);
+            health.panicked |= panicked;
+            health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+            let doublings = health.consecutive_failures.saturating_sub(1).min(5);
+            let delay = RETRY_BACKOFF_MIN
+                .saturating_mul(1 << doublings)
+                .min(RETRY_BACKOFF_MAX);
+            let retry_at = Instant::now() + delay;
+            health.retry_not_before = Some(retry_at);
+            drop(health);
+            // Surfaced by `ft doctor --json` through the resource snapshot.
+            DurabilityLedger::global().record_failure(
+                &self.pane_label,
+                &error.to_string(),
+                panicked,
+            );
+            if panicked {
+                metrics::counter!("mux.scrollback.durability_writer_panics").increment(1);
+            }
+            metrics::counter!("mux.scrollback.durability_writer_failures").increment(1);
+            if first {
+                log::error!(
+                    "scrollback durability for pane {} is degraded{}: {error}; rows stay in memory and the writer retries",
+                    self.pane_label,
+                    if panicked {
+                        " by a contained writer panic"
+                    } else {
+                        ""
+                    }
+                );
+            } else {
+                log::debug!(
+                    target: "mux::scrollback_durability",
+                    "pane={} writer retry failed: {error} retry_in_ms={}",
+                    self.pane_label,
+                    delay.as_millis()
+                );
+            }
+        }
+
+        /// O(1): queue this sink for the writer unless it is already queued.
+        /// Without a writer thread, the caller drains inline instead.
+        fn schedule(&self) {
+            if self.scheduled.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            let enqueued = self
+                .self_ref
+                .upgrade()
+                .is_some_and(|this| self.writer.enqueue(this));
+            if !enqueued {
+                self.scheduled.store(false, Ordering::Release);
+                // Records its own outcome; the caller reads the failure state.
+                let _ = self.flush_scrollback();
+            }
+        }
+
+        fn publish_progress(&self) {
+            let _progress = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
+            self.progress_epoch.fetch_add(1, Ordering::AcqRel);
+            self.progress_signal.notify_all();
+        }
+
+        /// One drain by the writer or an explicit flush. The outcome is
+        /// recorded under the gate, so a stale failure can never overwrite a
+        /// later drain's recovery. Panics are contained here.
+        fn drain_scheduled(&self) -> Result<(), ScrollbackSpillError> {
+            // The gate guards no data: pending-row invariants live in state,
+            // which is never held across backing IO by a drain. A drain that
+            // panicked left every unacknowledged row pending, and the backing
+            // store treats re-sent durable rows as exact retries.
+            let _drain = self
+                .drain_gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let outcome = frankenterm_sigpipe::catch_recoverable(
+                frankenterm_sigpipe::RecoverablePanicSite::StorageWriter,
+                std::panic::AssertUnwindSafe(|| self.drain()),
+            );
+            let (error, panicked) = match outcome {
+                Ok(Ok(())) => {
+                    self.record_writer_success();
+                    return Ok(());
+                }
+                Ok(Err(error)) => (error, false),
+                Err(_) => (ScrollbackSpillError::StorageUnavailable, true),
+            };
+            self.record_writer_failure(error, panicked);
+            Err(error)
         }
 
         fn backing_state(backing: &dyn ScrollbackSpillSink) -> Result<State, ScrollbackSpillError> {
@@ -514,17 +1160,11 @@ mod deferred_scrollback {
                         .ok_or(ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))
                 })
                 .transpose()?;
-            Ok(State {
-                interval_identity: ScrollbackIntervalIdentity::default(),
-                publication_uncertain: false,
-                pending: VecDeque::new(),
-                pending_bytes: 0,
-                cached: VecDeque::new(),
-                cached_bytes: 0,
-                durable_bytes: backing.retained_scrollback_bytes(),
+            Ok(State::empty(
+                backing.retained_scrollback_bytes(),
                 oldest,
                 newest_exclusive,
-            })
+            ))
         }
 
         // Charges cell storage and grapheme bytes without allocating a second
@@ -541,70 +1181,454 @@ mod deferred_scrollback {
 
         /// The caller holds operation. Never hold state across backing IO.
         fn drain(&self) -> Result<(), ScrollbackSpillError> {
+            let result = self.drain_entries();
+            if let Ok(mut state) = self.state.lock() {
+                // Nothing is in flight between drains, whatever the outcome.
+                state.in_flight = 0;
+            }
+            result
+        }
+
+        fn drain_entries(&self) -> Result<(), ScrollbackSpillError> {
+            enum Next {
+                Rows {
+                    stable_row: StableRowIndex,
+                    store_row: StableRowIndex,
+                    lines: Vec<Arc<Line>>,
+                    cached: Vec<Arc<Line>>,
+                    retention: usize,
+                },
+                Gap {
+                    gap: GapSpan,
+                    store_row: StableRowIndex,
+                },
+            }
             loop {
                 let next = {
-                    let state = self
+                    let mut state = self
                         .state
                         .lock()
                         .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
                     if state.publication_uncertain {
                         return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
                     }
-                    state.pending.front().map(|first| {
-                        let lines: Vec<_> = state
-                            .pending
-                            .iter()
-                            .take(MAX_PENDING_ROWS)
-                            .take_while(|row| row.retention == first.retention)
-                            .map(|row| Arc::clone(&row.line))
-                            .collect();
-                        // Keep the previous cache alive through retirement as
-                        // well. Last-reference Line destruction must not block
-                        // metadata readers while state is locked.
-                        let cached: Vec<_> = state
-                            .cached
-                            .iter()
-                            .map(|row| Arc::clone(&row.line))
-                            .collect();
-                        (first.stable_row, lines, cached, first.retention)
-                    })
+                    // Every written gap precedes the queue.
+                    let skip = state.store_skip();
+                    let next = match state.pending.front() {
+                        None => None,
+                        Some(Pending::Gap(gap)) => Some(Next::Gap {
+                            gap: *gap,
+                            store_row: gap.start - skip,
+                        }),
+                        Some(Pending::Row(first)) => {
+                            let lines: Vec<_> = state
+                                .pending
+                                .iter()
+                                .take(MAX_BATCH_ROWS)
+                                .map_while(|entry| match entry {
+                                    Pending::Row(row) if row.retention == first.retention => {
+                                        Some(Arc::clone(&row.line))
+                                    }
+                                    _ => None,
+                                })
+                                .collect();
+                            // Keep the previous cache alive through retirement
+                            // as well. Last-reference Line destruction must not
+                            // block metadata readers while state is locked.
+                            let cached: Vec<_> = state
+                                .cached
+                                .iter()
+                                .map(|row| Arc::clone(&row.line))
+                                .collect();
+                            Some(Next::Rows {
+                                stable_row: first.stable_row,
+                                store_row: first.stable_row - skip,
+                                lines,
+                                cached,
+                                retention: first.retention,
+                            })
+                        }
+                    };
+                    state.in_flight = match &next {
+                        None => 0,
+                        Some(Next::Gap { .. }) => 1,
+                        Some(Next::Rows { lines, .. }) => lines.len(),
+                    };
+                    next
                 };
-                let Some((stable_row, pending_lines, cached_lines, retention)) = next else {
-                    return Ok(());
+                match next {
+                    None => return Ok(()),
+                    Some(Next::Gap { gap, store_row }) => self.write_gap(gap, store_row)?,
+                    Some(Next::Rows {
+                        stable_row,
+                        store_row,
+                        lines,
+                        cached,
+                        retention,
+                    }) => self.write_rows(stable_row, store_row, lines, cached, retention)?,
+                }
+            }
+        }
+
+        /// Records a gap as one marker row at its store row (ft-yccm0.2.1.6).
+        fn write_gap(
+            &self,
+            gap: GapSpan,
+            store_row: StableRowIndex,
+        ) -> Result<(), ScrollbackSpillError> {
+            let marker = gap.line_at(gap.start);
+            let acknowledged = self.backing.store_scrollback_lines(
+                store_row,
+                std::slice::from_ref(&marker),
+                gap.retention,
+            );
+            if acknowledged != 1 {
+                return Err(ScrollbackSpillError::StorageUnavailable);
+            }
+            let durable_bytes = self.backing.retained_scrollback_bytes();
+            let store_oldest = self.backing.oldest_scrollback_row();
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            // in_flight kept admission's overload shedding off this entry.
+            match state.pending.pop_front() {
+                Some(Pending::Gap(front)) if front == gap => {}
+                _ => return Err(ScrollbackSpillError::SnapshotRowMissing),
+            }
+            state.in_flight = 0;
+            state.written_gaps.push_back(gap);
+            state.prune_written_gaps(store_oldest);
+            // The cached suffix serves contiguous acknowledged rows only.
+            let cached = std::mem::take(&mut state.cached);
+            state.cached_bytes = 0;
+            state.durable_bytes = durable_bytes;
+            self.pending_rows
+                .store(state.pending.len(), Ordering::Release);
+            drop(state);
+            drop(cached);
+            self.committed_batches.fetch_add(1, Ordering::AcqRel);
+            self.publish_progress();
+            metrics::counter!("mux.scrollback.durability_gap_markers").increment(1);
+            if self.writer.publishes() {
+                DurabilityLedger::global().record_gaps(1, 0, 0);
+            }
+            log::debug!(
+                target: "mux::scrollback_durability",
+                "pane={} recorded durability gap rows={}..{} as store row {}",
+                self.pane_label,
+                gap.start,
+                gap.end,
+                store_row
+            );
+            Ok(())
+        }
+
+        fn write_rows(
+            &self,
+            stable_row: StableRowIndex,
+            store_row: StableRowIndex,
+            pending_lines: Vec<Arc<Line>>,
+            cached_lines: Vec<Arc<Line>>,
+            retention: usize,
+        ) -> Result<(), ScrollbackSpillError> {
+            let started = Instant::now();
+            // Only bounded Arc handles were captured under state. Materialize
+            // the backing-store batch outside the metadata critical section.
+            let lines: Vec<_> = pending_lines
+                .iter()
+                .map(|line| line.as_ref().clone())
+                .collect();
+            let acknowledged = self
+                .backing
+                .store_scrollback_lines(store_row, &lines, retention);
+            if acknowledged == 0 || acknowledged > lines.len() {
+                return Err(ScrollbackSpillError::StorageUnavailable);
+            }
+            let durable_bytes = self.backing.retained_scrollback_bytes();
+            let store_oldest = self.backing.oldest_scrollback_row();
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            state.prune_written_gaps(store_oldest);
+            // drain_gate excludes other drainers, operation excludes clear and
+            // replacement, and in_flight keeps overload shedding off the
+            // captured rows, so they are still the front. Keep the owned
+            // plaintext until the backing sink acknowledges durability.
+            let mut acknowledged_bytes = 0usize;
+            for _ in 0..acknowledged {
+                let Some(Pending::Row(row)) = state.pending.pop_front() else {
+                    return Err(ScrollbackSpillError::SnapshotRowMissing);
                 };
-                // Only bounded Arc handles were captured under state. Materialize
-                // the backing-store batch outside the metadata critical section.
-                let lines: Vec<_> = pending_lines
-                    .iter()
-                    .map(|line| line.as_ref().clone())
-                    .collect();
-                let acknowledged = self
-                    .backing
-                    .store_scrollback_lines(stable_row, &lines, retention);
-                if acknowledged == 0 || acknowledged > lines.len() {
-                    return Err(ScrollbackSpillError::StorageUnavailable);
+                state.pending_bytes -= row.charged_bytes;
+                acknowledged_bytes += row.charged_bytes;
+                state.cache_acknowledged(row);
+            }
+            state.in_flight = 0;
+            state.durable_bytes = durable_bytes;
+            self.pending_rows
+                .store(state.pending.len(), Ordering::Release);
+            let caught_up = state.shedding
+                && self
+                    .writer
+                    .queued_bytes()
+                    .saturating_sub(acknowledged_bytes)
+                    < self.writer.queue_budget() / 2;
+            if caught_up {
+                state.shedding = false;
+            }
+            drop(state);
+            self.writer.release(acknowledged_bytes);
+            self.committed_batches.fetch_add(1, Ordering::AcqRel);
+            self.publish_progress();
+            drop(cached_lines);
+            drop(pending_lines);
+            metrics::counter!("mux.scrollback.deferred_rows_durable")
+                .increment(acknowledged as u64);
+            metrics::histogram!("mux.scrollback.durability_commit_latency_us")
+                .record(started.elapsed().as_micros() as f64);
+            if caught_up {
+                log::warn!(
+                    "scrollback durability for pane {} caught up below half its queue budget at row {}; overload gaps stop",
+                    self.pane_label,
+                    stable_row.saturating_add(acknowledged as StableRowIndex)
+                );
+            }
+            log::debug!(
+                target: "mux::scrollback_durability",
+                "pane={} committed rows={}..{} count={} bytes={} latency_us={}",
+                self.pane_label,
+                stable_row,
+                stable_row.saturating_add(acknowledged as StableRowIndex),
+                acknowledged,
+                acknowledged_bytes,
+                started.elapsed().as_micros()
+            );
+            Ok(())
+        }
+
+        /// Admission body; the trait wrapper records refusals for progress
+        /// waits.
+        fn admit(
+            &self,
+            stable_row: StableRowIndex,
+            line: &Line,
+            retention: usize,
+        ) -> ScrollbackLineAdmission {
+            // A destructive operation leaves the offered row in Screen; never
+            // wait for filesystem IO while the terminal is held. A running
+            // drain holds only drain_gate and does not refuse rows, and a
+            // full queue sheds into a durability gap instead (ft-yccm0.2.1.6).
+            let Ok(_operation) = self.operation.try_lock() else {
+                return ScrollbackLineAdmission::Refused;
+            };
+            let mut dropped = Vec::new();
+            let mut gaps = Vec::new();
+            let (admission, entered_overload) = {
+                let Ok(mut state) = self.state.lock() else {
+                    return ScrollbackLineAdmission::Refused;
+                };
+                let was_shedding = state.shedding;
+                let admission = self.admit_locked(
+                    &mut state,
+                    stable_row,
+                    line,
+                    retention,
+                    &mut dropped,
+                    &mut gaps,
+                );
+                (admission, !was_shedding && state.shedding)
+            };
+            // Last-reference Line destruction happens outside the state lock.
+            drop(dropped);
+            if !gaps.is_empty() {
+                self.report_gaps(&gaps, entered_overload);
+            }
+            admission
+        }
+
+        /// Logs and counts rows dropped from durability. Entering overload is
+        /// a warning; further gaps while it lasts are debug detail.
+        fn report_gaps(&self, gaps: &[GapSpan], entered: bool) {
+            let rows: StableRowIndex = gaps.iter().map(GapSpan::rows).sum();
+            let bytes: usize = gaps.iter().map(|gap| gap.bytes).sum();
+            metrics::counter!("mux.scrollback.durability_gap_rows_total").increment(rows as u64);
+            metrics::counter!("mux.scrollback.durability_gap_bytes_total").increment(bytes as u64);
+            if self.writer.publishes() {
+                // Gap records are counted when their markers are written.
+                DurabilityLedger::global().record_gaps(0, rows as u64, bytes as u64);
+            }
+            let first = gaps[0].start;
+            let end = gaps[gaps.len() - 1].end;
+            if entered {
+                log::warn!(
+                    "scrollback durability for pane {} is overloaded ({} of {} queued bytes): rows {}..{} ({} rows, {} bytes) are recorded as a durability gap instead of throttling the pane",
+                    self.pane_label,
+                    self.writer.queued_bytes(),
+                    self.writer.queue_budget(),
+                    first,
+                    end,
+                    rows,
+                    bytes
+                );
+            } else {
+                log::debug!(
+                    target: "mux::scrollback_durability",
+                    "pane={} durability gap rows={}..{} count={} bytes={}",
+                    self.pane_label,
+                    first,
+                    end,
+                    rows,
+                    bytes
+                );
+            }
+        }
+
+        fn admit_locked(
+            &self,
+            state: &mut State,
+            stable_row: StableRowIndex,
+            line: &Line,
+            retention: usize,
+            dropped: &mut Vec<Pending>,
+            gaps: &mut Vec<GapSpan>,
+        ) -> ScrollbackLineAdmission {
+            if state.publication_uncertain {
+                return ScrollbackLineAdmission::Refused;
+            }
+            // Admission appends contiguous rows; draining removes only a
+            // prefix. An exact retry of a queued row is admitted again, and a
+            // row already shed into a queued gap is part of that gap.
+            if let Some(existing) = state.pending_entry(stable_row) {
+                if let Pending::Row(existing) = existing {
+                    if existing.line.as_ref() != line || existing.retention != retention {
+                        return ScrollbackLineAdmission::Refused;
+                    }
                 }
-                let durable_bytes = self.backing.retained_scrollback_bytes();
-                let mut state = self
-                    .state
-                    .lock()
-                    .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-                // operation excludes enqueue, clear and replacement. Keep the
-                // owned plaintext until the backing sink acknowledges durability.
-                for _ in 0..acknowledged {
-                    let row = state
-                        .pending
-                        .pop_front()
-                        .ok_or(ScrollbackSpillError::SnapshotRowMissing)?;
-                    state.pending_bytes -= row.charged_bytes;
-                    state.cache_acknowledged(row);
+                let interval = match (state.oldest, state.newest_exclusive) {
+                    (Some(first), Some(end)) if (first..end).contains(&stable_row) => {
+                        match state.interval_identity.capture(Some(first..end)) {
+                            ScrollbackIntervalCapture::Ready(interval) => Some(interval),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                return ScrollbackLineAdmission::Admitted { interval };
+            }
+            let Ok(retention_rows) = StableRowIndex::try_from(retention) else {
+                return ScrollbackLineAdmission::Refused;
+            };
+            let Some(next) = stable_row.checked_add(1) else {
+                return ScrollbackLineAdmission::Refused;
+            };
+            let Some(charge) = Self::row_charge(line) else {
+                return ScrollbackLineAdmission::Refused;
+            };
+            if retention == 0
+                || state
+                    .newest_exclusive
+                    .is_some_and(|expected| expected != stable_row)
+            {
+                return ScrollbackLineAdmission::Refused;
+            }
+            let oldest = state
+                .oldest
+                .unwrap_or(stable_row)
+                .max(next.saturating_sub(retention_rows));
+
+            // Overload never throttles the pane (ft-yccm0.2.1.6). Past the
+            // budget this pane's oldest queued rows become a durability gap,
+            // down to half the budget so gaps are few and large.
+            let budget = self.writer.queue_budget();
+            let queued = self.writer.queued_bytes();
+            let as_gap = if queued.saturating_add(charge) > budget {
+                let need = queued.saturating_add(charge).saturating_sub(budget / 2);
+                let (freed, mut gone, mut spans) = state.shed(need, unix_now_ms());
+                self.writer.release(freed);
+                dropped.append(&mut gone);
+                gaps.append(&mut spans);
+                state.shedding = true;
+                // Other panes hold the budget, or this row alone exceeds it.
+                self.writer.queued_bytes().saturating_add(charge) > budget
+            } else {
+                false
+            };
+            if as_gap {
+                let at_unix_ms = unix_now_ms();
+                let span = GapSpan {
+                    start: stable_row,
+                    end: next,
+                    retention,
+                    bytes: charge,
+                    at_unix_ms,
+                };
+                let tail = state.pending.len().checked_sub(1);
+                match (tail, state.pending.back_mut()) {
+                    (Some(index), Some(Pending::Gap(last)))
+                        if index >= state.in_flight && last.end == stable_row =>
+                    {
+                        last.end = next;
+                        last.bytes += charge;
+                    }
+                    _ => state.pending.push_back(Pending::Gap(span)),
                 }
-                state.durable_bytes = durable_bytes;
-                drop(state);
-                drop(cached_lines);
-                drop(pending_lines);
-                metrics::counter!("mux.scrollback.deferred_rows_durable")
-                    .increment(acknowledged as u64);
+                gaps.push(span);
+            } else {
+                state.pending.push_back(Pending::Row(PendingRow {
+                    stable_row,
+                    line: Arc::new(line.clone()),
+                    retention,
+                    charged_bytes: charge,
+                }));
+                state.pending_bytes += charge;
+                self.writer.charge(charge);
+            }
+            self.pending_rows
+                .store(state.pending.len(), Ordering::Release);
+            state.oldest = Some(oldest);
+            state.newest_exclusive = Some(next);
+            state.prune_cached();
+            metrics::counter!("mux.scrollback.deferred_rows_admitted").increment(1);
+            let interval = match state.interval_identity.capture(Some(oldest..next)) {
+                ScrollbackIntervalCapture::Ready(interval) => Some(interval),
+                _ => None,
+            };
+            ScrollbackLineAdmission::Admitted { interval }
+        }
+    }
+
+    impl Drop for DeferredScrollbackSpillSink {
+        fn drop(&mut self) {
+            // Never silent: rows dropped here were admitted but never became
+            // durable (pane closed while its store was failing, or without a
+            // durability handoff). No IO here; the dropping thread may be a UI
+            // thread.
+            // Rows of a queued gap were never recorded either, not even as a
+            // marker: they count as abandoned too.
+            let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+            let rows: StableRowIndex = state
+                .pending
+                .iter()
+                .map(|entry| entry.end() - entry.start())
+                .sum();
+            let pending = usize::try_from(rows).unwrap_or(usize::MAX);
+            // Return this pane's share of the writer's budget.
+            let queued_bytes = state.pending_bytes;
+            self.writer.release(queued_bytes);
+            let failure = self.lock_health().failure;
+            if pending > 0 {
+                log::error!(
+                    "scrollback durability for pane {} dropped {pending} admitted rows that never became durable (last writer failure: {failure:?})",
+                    self.pane_label
+                );
+                metrics::counter!("mux.scrollback.durability_rows_abandoned")
+                    .increment(pending as u64);
+                DurabilityLedger::global().record_abandoned(&self.pane_label, pending as u64);
+            } else if failure.is_some() {
+                // Nothing undurable was lost; a closed pane is no longer degraded.
+                DurabilityLedger::global().record_recovered(&self.pane_label);
             }
         }
     }
@@ -668,95 +1692,60 @@ mod deferred_scrollback {
             stable_row: StableRowIndex,
             line: &Line,
             retention: usize,
-        ) -> wezterm_term::config::ScrollbackLineAdmission {
-            use wezterm_term::config::ScrollbackLineAdmission;
-            // Queue saturation or another operation leaves the offered row in
-            // Screen; never wait for filesystem IO while the terminal is held.
-            let Ok(_operation) = self.operation.try_lock() else {
-                return ScrollbackLineAdmission::Refused;
-            };
-            let Ok(mut state) = self.state.lock() else {
-                return ScrollbackLineAdmission::Refused;
-            };
-            if state.publication_uncertain {
-                return ScrollbackLineAdmission::Refused;
+        ) -> ScrollbackLineAdmission {
+            // Read before deciding: progress that lands after this load makes
+            // a parser waiting on this refusal retry at once (no lost wakeup).
+            let epoch = self.progress_epoch.load(Ordering::Acquire);
+            let admission = self.admit(stable_row, line, retention);
+            if !admission.accepted() {
+                self.refused_epoch.store(epoch, Ordering::Release);
             }
-            // Admission appends contiguous sequence numbers; draining removes
-            // only a prefix. Retention's oldest can advance beyond pending
-            // rows, so index from the actual queue front instead.
-            let pending_index = state.pending.front().and_then(|first| {
-                stable_row
-                    .checked_sub(first.stable_row)
-                    .and_then(|offset| usize::try_from(offset).ok())
-            });
-            if let Some(existing) = pending_index.and_then(|index| state.pending.get(index)) {
-                if existing.stable_row != stable_row
-                    || existing.line.as_ref() != line
-                    || existing.retention != retention
-                {
-                    return ScrollbackLineAdmission::Refused;
-                }
-                let interval = match (state.oldest, state.newest_exclusive) {
-                    (Some(first), Some(end)) if (first..end).contains(&stable_row) => {
-                        match state.interval_identity.capture(Some(first..end)) {
-                            ScrollbackIntervalCapture::Ready(interval) => Some(interval),
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                };
-                return ScrollbackLineAdmission::Admitted { interval };
-            }
-            let Ok(retention_rows) = StableRowIndex::try_from(retention) else {
-                return ScrollbackLineAdmission::Refused;
-            };
-            let Some(next) = stable_row.checked_add(1) else {
-                return ScrollbackLineAdmission::Refused;
-            };
-            let Some(charge) = Self::row_charge(line) else {
-                return ScrollbackLineAdmission::Refused;
-            };
-            if retention == 0
-                || state
-                    .newest_exclusive
-                    .is_some_and(|expected| expected != stable_row)
-                || state.pending.len() >= MAX_PENDING_ROWS
-                || charge > MAX_PENDING_BYTES.saturating_sub(state.pending_bytes)
-            {
-                return ScrollbackLineAdmission::Refused;
-            }
-            let oldest = state
-                .oldest
-                .unwrap_or(stable_row)
-                .max(next.saturating_sub(retention_rows));
-            state.pending.push_back(PendingRow {
-                stable_row,
-                line: Arc::new(line.clone()),
-                retention,
-                charged_bytes: charge,
-            });
-            state.pending_bytes += charge;
-            state.oldest = Some(oldest);
-            state.newest_exclusive = Some(next);
-            state.prune_cached();
-            metrics::counter!("mux.scrollback.deferred_rows_admitted").increment(1);
-            let interval = match state.interval_identity.capture(Some(oldest..next)) {
-                ScrollbackIntervalCapture::Ready(interval) => Some(interval),
-                _ => None,
-            };
-            ScrollbackLineAdmission::Admitted { interval }
+            admission
         }
 
         fn requires_scrollback_flush(&self) -> bool {
             true
         }
 
+        /// Explicit sync point: drains on the calling thread, serialized with
+        /// the writer, and returns once every admitted row is durable.
         fn flush_scrollback(&self) -> Result<(), ScrollbackSpillError> {
-            let _operation = self
-                .operation
-                .lock()
-                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-            self.drain()
+            self.drain_scheduled()
+        }
+
+        fn request_scrollback_flush(&self) -> Result<(), ScrollbackSpillError> {
+            if self.pending_rows.load(Ordering::Acquire) != 0 {
+                self.schedule();
+            }
+            self.durability_failure().map_or(Ok(()), Err)
+        }
+
+        fn await_scrollback_capacity(&self, timeout: Duration) -> ScrollbackCapacityWait {
+            let requested = self.request_scrollback_flush();
+            let refused = self.refused_epoch.load(Ordering::Acquire);
+            let deadline = Instant::now().checked_add(timeout);
+            let mut progress = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
+            loop {
+                if self.progress_epoch.load(Ordering::Acquire) != refused {
+                    return ScrollbackCapacityWait::Progressed;
+                }
+                let now = Instant::now();
+                let remaining =
+                    deadline.map_or(timeout, |deadline| deadline.saturating_duration_since(now));
+                if remaining.is_zero() {
+                    break;
+                }
+                progress = self
+                    .progress_signal
+                    .wait_timeout(progress, remaining)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+            drop(progress);
+            match self.durability_failure().or_else(|| requested.err()) {
+                Some(error) => ScrollbackCapacityWait::Failed(error),
+                None => ScrollbackCapacityWait::TimedOut,
+            }
         }
 
         fn load_scrollback_line(&self, stable_row: StableRowIndex) -> Option<Line> {
@@ -778,7 +1767,18 @@ mod deferred_scrollback {
             // even when the requested durable prefix is already available.
             // The backing read serializes its own IO; validate the lineage
             // afterwards so clear, replacement and retention cannot mix rows.
-            let (end, pending, interval, cached_range) = {
+            /// Where a durable span of stable rows is read from.
+            enum Durable {
+                /// Store rows from `store_start`, one per stable row.
+                Store { store_start: StableRowIndex },
+                /// A written gap's marker and empty rows (ft-yccm0.2.1.6).
+                Gap(GapSpan),
+            }
+            enum Memory {
+                Line(Arc<Line>),
+                Gap(GapSpan),
+            }
+            let (end, pending, interval, cached_range, plan) = {
                 let Ok(state) = self.state.lock() else {
                     return Vec::new();
                 };
@@ -794,32 +1794,85 @@ mod deferred_scrollback {
                     return Vec::new();
                 };
                 let end = rows.end.min(newest).min(rows.start.saturating_add(32));
-                let pending = state
+                let in_range = |row: StableRowIndex| row >= rows.start && row < end;
+                let mut pending: Vec<(StableRowIndex, Memory)> = state
                     .cached
                     .iter()
-                    .chain(state.pending.iter())
-                    .filter(|row| row.stable_row >= rows.start && row.stable_row < end)
-                    .map(|row| (row.stable_row, Arc::clone(&row.line)))
-                    .collect::<Vec<_>>();
+                    .filter(|row| in_range(row.stable_row))
+                    .map(|row| (row.stable_row, Memory::Line(Arc::clone(&row.line))))
+                    .collect();
+                for entry in &state.pending {
+                    match entry {
+                        Pending::Row(row) if in_range(row.stable_row) => {
+                            pending.push((row.stable_row, Memory::Line(Arc::clone(&row.line))));
+                        }
+                        Pending::Row(_) => {}
+                        Pending::Gap(gap) => {
+                            for row in gap.start.max(rows.start)..gap.end.min(end) {
+                                pending.push((row, Memory::Gap(*gap)));
+                            }
+                        }
+                    }
+                }
                 let cached_range = state
                     .cached
                     .front()
                     .zip(state.cached.back())
                     .map(|(first, last)| first.stable_row..last.stable_row.saturating_add(1));
-                (end, pending, interval, cached_range)
+                // The durable prefix: written gaps are synthesized, and the
+                // spans between them map to store rows, which sit lower than
+                // their stable rows by the gaps before them.
+                let durable_end = pending.first().map_or(end, |(row, _)| *row);
+                let mut plan = Vec::new();
+                let mut at = rows.start;
+                for gap in &state.written_gaps {
+                    if gap.end <= at {
+                        continue;
+                    }
+                    if gap.start >= durable_end {
+                        break;
+                    }
+                    if gap.start > at {
+                        let store_start = at - state.store_skip_before(at);
+                        plan.push((at..gap.start, Durable::Store { store_start }));
+                    }
+                    let gap_end = gap.end.min(durable_end);
+                    plan.push((gap.start.max(at)..gap_end, Durable::Gap(*gap)));
+                    at = gap_end;
+                }
+                if at < durable_end {
+                    let store_start = at - state.store_skip_before(at);
+                    plan.push((at..durable_end, Durable::Store { store_start }));
+                }
+                (end, pending, interval, cached_range, plan)
             };
             let durable_end = pending.first().map_or(end, |(row, _)| *row);
-            let mut result = if durable_end > rows.start {
-                self.backing.load_scrollback_lines(rows.start..durable_end)
-            } else {
-                Vec::new()
-            };
+            let mut result = Vec::new();
+            for (span, source) in plan {
+                match source {
+                    Durable::Store { store_start } => {
+                        let len = span.end - span.start;
+                        let lines = self
+                            .backing
+                            .load_scrollback_lines(store_start..store_start + len);
+                        let complete = lines.len() == len as usize;
+                        result.extend(lines);
+                        if !complete {
+                            break;
+                        }
+                    }
+                    Durable::Gap(gap) => result.extend(span.map(|row| gap.line_at(row))),
+                }
+            }
             if result.len() == (durable_end - rows.start) as usize {
-                for (row, line) in pending {
+                for (row, memory) in pending {
                     if row != rows.start + result.len() as StableRowIndex {
                         break;
                     }
-                    result.push(line.as_ref().clone());
+                    result.push(match memory {
+                        Memory::Line(line) => line.as_ref().clone(),
+                        Memory::Gap(gap) => gap.line_at(row),
+                    });
                 }
             }
             let Ok(state) = self.state.lock() else {
@@ -886,8 +1939,95 @@ mod deferred_scrollback {
                 .operation
                 .lock()
                 .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            let _drain = self
+                .drain_gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             self.drain()?;
-            self.backing.snapshot_scrollback(newest, limits)
+            let (gaps, mut skip) = {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+                (
+                    state.written_gaps.iter().copied().collect::<Vec<_>>(),
+                    state.pruned_gap_skip,
+                )
+            };
+            if gaps.is_empty() && skip == 0 {
+                return self.backing.snapshot_scrollback(newest, limits);
+            }
+            // The store holds each written gap as one marker row
+            // (ft-yccm0.2.1.6): read the store's rows, then expand every marker
+            // back into the gap's stable rows.
+            if gaps
+                .iter()
+                .any(|gap| gap.start < newest && newest < gap.end)
+            {
+                return Err(ScrollbackSpillError::SnapshotRangeMismatch);
+            }
+            let newest_skip = skip
+                + gaps
+                    .iter()
+                    .filter(|gap| gap.end <= newest)
+                    .map(|gap| gap.rows() - 1)
+                    .sum::<StableRowIndex>();
+            let snapshot = self
+                .backing
+                .snapshot_scrollback(newest - newest_skip, limits)?;
+            let Some(store_oldest) = snapshot.oldest_stable_row() else {
+                return ScrollbackSnapshot::from_contiguous_rows(
+                    snapshot.generation(),
+                    snapshot.fidelity(),
+                    None,
+                    newest,
+                    snapshot.stored_bytes(),
+                    snapshot.decoded_bytes(),
+                    Vec::new(),
+                );
+            };
+            let mut next_gap = 0;
+            while next_gap < gaps.len() && gaps[next_gap].start - skip < store_oldest {
+                skip += gaps[next_gap].rows() - 1;
+                next_gap += 1;
+            }
+            let mut oldest = store_oldest + skip;
+            let generation = snapshot.generation();
+            let fidelity = snapshot.fidelity();
+            let stored_bytes = snapshot.stored_bytes();
+            let decoded_bytes = snapshot.decoded_bytes();
+            let store_rows = snapshot.into_rows();
+            let mut rows = Vec::with_capacity(store_rows.len());
+            for (offset, line) in store_rows.into_iter().enumerate() {
+                rows.push(line);
+                let store_row = store_oldest + offset as StableRowIndex;
+                if let Some(gap) = gaps.get(next_gap) {
+                    if gap.start - skip == store_row {
+                        rows.extend((gap.start + 1..gap.end).map(|row| gap.line_at(row)));
+                        skip += gap.rows() - 1;
+                        next_gap += 1;
+                    }
+                }
+            }
+            if oldest + rows.len() as StableRowIndex != newest {
+                return Err(ScrollbackSpillError::SnapshotRangeMismatch);
+            }
+            // Expansion can exceed the row limit; like the store, keep the
+            // newest rows.
+            if rows.len() > limits.max_rows {
+                let cut = rows.len() - limits.max_rows;
+                rows.drain(..cut);
+                oldest += cut as StableRowIndex;
+            }
+            ScrollbackSnapshot::from_contiguous_rows(
+                generation,
+                fidelity,
+                (!rows.is_empty()).then_some(oldest),
+                newest,
+                stored_bytes,
+                decoded_bytes,
+                rows,
+            )
         }
 
         fn replace_scrollback_prefix(
@@ -900,6 +2040,12 @@ mod deferred_scrollback {
                 .operation
                 .lock()
                 .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            // An in-flight writer batch must finish before the generation
+            // changes under it.
+            let _drain = self
+                .drain_gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             let mut state = self
                 .state
                 .lock()
@@ -941,17 +2087,19 @@ mod deferred_scrollback {
                 state.publication_uncertain = true;
                 return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
             }
+            // The replaced prefix is written row for row, so its store rows
+            // equal its stable rows again: no gap offset survives.
             *state = State {
                 interval_identity,
-                publication_uncertain: false,
-                pending: VecDeque::new(),
-                pending_bytes: 0,
-                cached: VecDeque::new(),
-                cached_bytes: 0,
-                durable_bytes: self.backing.retained_scrollback_bytes(),
-                oldest: receipt.oldest_stable_row(),
-                newest_exclusive: Some(receipt.newest_stable_row_exclusive()),
+                ..State::empty(
+                    self.backing.retained_scrollback_bytes(),
+                    receipt.oldest_stable_row(),
+                    Some(receipt.newest_stable_row_exclusive()),
+                )
             };
+            self.pending_rows.store(0, Ordering::Release);
+            drop(state);
+            self.publish_progress();
             Ok(receipt)
         }
 
@@ -960,9 +2108,15 @@ mod deferred_scrollback {
                 .operation
                 .lock()
                 .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-            // A successful explicit clear discards both the durable generation
-            // and its queued suffix. On failure every queued row stays owned,
-            // but indeterminate publication cannot authorize new UI results.
+            // Wait out an in-flight writer batch: an append landing after the
+            // clear would resurrect rows from before it. A successful explicit
+            // clear discards both the durable generation and its queued
+            // suffix. On failure every queued row stays owned, but
+            // indeterminate publication cannot authorize new UI results.
+            let _drain = self
+                .drain_gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             let mut state = self
                 .state
                 .lock()
@@ -979,17 +2133,19 @@ mod deferred_scrollback {
                     return Err(error);
                 }
             };
-            *state = State {
-                interval_identity,
-                publication_uncertain: false,
-                pending: VecDeque::new(),
-                pending_bytes: 0,
-                cached: VecDeque::new(),
-                cached_bytes: 0,
-                durable_bytes: 0,
-                oldest: None,
-                newest_exclusive: None,
-            };
+            let released = state.pending_bytes;
+            // Dropped after the state lock is released (end of scope).
+            let _discarded = std::mem::replace(
+                &mut *state,
+                State {
+                    interval_identity,
+                    ..State::empty(0, None, None)
+                },
+            );
+            self.pending_rows.store(0, Ordering::Release);
+            self.writer.release(released);
+            drop(state);
+            self.publish_progress();
             Ok(receipt)
         }
     }
@@ -1020,6 +2176,17 @@ mod deferred_scrollback {
                 .accepted()
         );
         drop(operation);
+        // A drain in flight is not a destructive operation: the parser keeps
+        // admitting rows while the writer is inside a transaction.
+        let drain = deferred.drain_gate.lock().unwrap();
+        let ScrollbackLineAdmission::Admitted {
+            interval: Some(during_drain),
+        } = deferred.store_scrollback_line_with_receipt(11, &line, 2)
+        else {
+            panic!("admission must not wait for or refuse on an in-flight drain");
+        };
+        assert!(during_drain.retains(&admitted, 10..11));
+        drop(drain);
         assert!(
             !deferred
                 .store_scrollback_line_with_receipt(10, &Line::new(1), 2)
@@ -1114,17 +2281,17 @@ mod deferred_scrollback {
         assert!(deferred.store_scrollback_line(1, &pending, 8));
         assert_eq!(backing.retained_scrollback_rows(), 1);
 
-        // Hold the exact transaction lock that a parser flush owns. The real
-        // backing prefix is readable; a read must not wait for the whole drain.
-        let operation = deferred.operation.lock().unwrap();
-        assert!(deferred.operation.try_lock().is_err());
+        // Hold the exact lock a durability drain owns. The real backing prefix
+        // is readable; a read must not wait for the whole drain.
+        let drain = deferred.drain_gate.lock().unwrap();
+        assert!(deferred.drain_gate.try_lock().is_err());
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let reading = Arc::clone(&deferred);
         let reader = std::thread::spawn(move || {
             tx.send(reading.load_scrollback_lines(0..2)).unwrap();
         });
         let result = rx.recv_timeout(std::time::Duration::from_secs(1));
-        drop(operation);
+        drop(drain);
         reader.join().unwrap();
         assert_eq!(result.unwrap(), vec![durable, pending]);
         assert_eq!(backing.retained_scrollback_rows(), 1);
@@ -1158,7 +2325,10 @@ mod deferred_scrollback {
         for row in 0..64 {
             assert!(deferred.store_scrollback_line(row, &line, 128));
         }
-        let original = Arc::clone(&deferred.state.lock().unwrap().pending.back().unwrap().line);
+        let original = match deferred.state.lock().unwrap().pending.back() {
+            Some(Pending::Row(row)) => Arc::clone(&row.line),
+            _ => panic!("the newest queued entry is a row"),
+        };
         deferred.flush_scrollback().unwrap();
         {
             let state = deferred.state.lock().unwrap();
@@ -1310,6 +2480,634 @@ mod deferred_scrollback {
             deferred.try_capture_scrollback_usage(),
             ScrollbackUsageCapture::Unavailable,
             "an incomplete retained interval must not turn into zero usage"
+        );
+    }
+
+    /// A backing store whose writes can be stalled or made to panic, so the
+    /// durability writer can be driven deterministically (ft-yccm0.2.1.1).
+    /// It accepts only contiguous, in-order batches: a gap or a replay is
+    /// refused, which the tests would observe as a writer failure.
+    #[cfg(test)]
+    #[derive(Debug, Default)]
+    struct GatedStore {
+        rows: Mutex<Vec<(StableRowIndex, String)>>,
+        gate: Mutex<GateState>,
+        gate_signal: Condvar,
+    }
+
+    #[cfg(test)]
+    #[derive(Debug, Default)]
+    struct GateState {
+        closed: bool,
+        inside: usize,
+        panic_on_store: bool,
+        writer_thread: Option<String>,
+        writer_qos: Option<procinfo::ThreadQos>,
+    }
+
+    #[cfg(test)]
+    impl GatedStore {
+        fn text(row: StableRowIndex) -> String {
+            format!("row {row}")
+        }
+
+        fn line(row: StableRowIndex) -> Line {
+            Line::from_text(
+                &Self::text(row),
+                &wezterm_term::CellAttributes::blank(),
+                0,
+                None,
+            )
+        }
+
+        fn set_closed(&self, closed: bool) {
+            self.gate.lock().unwrap().closed = closed;
+            self.gate_signal.notify_all();
+        }
+
+        fn set_panic(&self, panic_on_store: bool) {
+            self.gate.lock().unwrap().panic_on_store = panic_on_store;
+        }
+
+        fn inside(&self) -> usize {
+            self.gate.lock().unwrap().inside
+        }
+
+        fn writer_thread(&self) -> Option<String> {
+            self.gate.lock().unwrap().writer_thread.clone()
+        }
+
+        fn writer_qos(&self) -> Option<procinfo::ThreadQos> {
+            self.gate.lock().unwrap().writer_qos
+        }
+
+        fn wait_until_inside(&self) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut gate = self.gate.lock().unwrap();
+            while gate.inside == 0 {
+                let now = Instant::now();
+                assert!(now < deadline, "the writer never entered the store");
+                gate = self
+                    .gate_signal
+                    .wait_timeout(gate, deadline - now)
+                    .unwrap()
+                    .0;
+            }
+        }
+
+        fn rows(&self) -> Vec<(StableRowIndex, String)> {
+            self.rows.lock().unwrap().clone()
+        }
+    }
+
+    #[cfg(test)]
+    impl ScrollbackSpillSink for GatedStore {
+        fn store_scrollback_line(
+            &self,
+            stable_row: StableRowIndex,
+            line: &Line,
+            retention: usize,
+        ) -> bool {
+            self.store_scrollback_lines(stable_row, std::slice::from_ref(line), retention) == 1
+        }
+
+        fn store_scrollback_lines(
+            &self,
+            first: StableRowIndex,
+            lines: &[Line],
+            _retention: usize,
+        ) -> usize {
+            {
+                let mut gate = self.gate.lock().unwrap();
+                gate.writer_thread = std::thread::current().name().map(str::to_owned);
+                gate.writer_qos = procinfo::current_thread_qos();
+                if gate.panic_on_store {
+                    drop(gate);
+                    panic!("injected scrollback store panic");
+                }
+                gate.inside += 1;
+                self.gate_signal.notify_all();
+                while gate.closed {
+                    gate = self.gate_signal.wait(gate).unwrap();
+                }
+                gate.inside -= 1;
+            }
+            let mut rows = self.rows.lock().unwrap();
+            if rows.last().is_some_and(|(last, _)| last + 1 != first) {
+                return 0;
+            }
+            for (offset, line) in lines.iter().enumerate() {
+                rows.push((
+                    first + offset as StableRowIndex,
+                    line.as_str().trim_end().to_string(),
+                ));
+            }
+            lines.len()
+        }
+
+        fn load_scrollback_line(&self, stable_row: StableRowIndex) -> Option<Line> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(row, _)| *row == stable_row)
+                .map(|(_, text)| {
+                    Line::from_text(text, &wezterm_term::CellAttributes::blank(), 0, None)
+                })
+        }
+
+        fn oldest_scrollback_row(&self) -> Option<StableRowIndex> {
+            self.rows.lock().unwrap().first().map(|(row, _)| *row)
+        }
+
+        fn retained_scrollback_rows(&self) -> usize {
+            self.rows.lock().unwrap().len()
+        }
+
+        fn retained_scrollback_bytes(&self) -> usize {
+            0
+        }
+
+        fn snapshot_scrollback(
+            &self,
+            _newest: StableRowIndex,
+            _limits: ScrollbackSnapshotLimits,
+        ) -> Result<ScrollbackSnapshot, ScrollbackSpillError> {
+            Err(ScrollbackSpillError::StorageUnavailable)
+        }
+
+        fn replace_scrollback_prefix(
+            &self,
+            _expected: Option<ScrollbackSnapshotGeneration>,
+            _prefix: ScrollbackPrefix<'_>,
+            _retention: usize,
+        ) -> Result<ScrollbackReplaceCommit, ScrollbackSpillError> {
+            Err(ScrollbackSpillError::StorageUnavailable)
+        }
+
+        fn clear_scrollback(&self) -> Result<ScrollbackClearCommit, ScrollbackSpillError> {
+            Err(ScrollbackSpillError::StorageUnavailable)
+        }
+    }
+
+    #[test]
+    fn durability_writer_handoff_never_blocks_on_a_stalled_store() {
+        let store = Arc::new(GatedStore::default());
+        store.set_closed(true);
+        let sink = DeferredScrollbackSpillSink::with_writer(
+            store.clone(),
+            [0x51; 16],
+            DurabilityWriter::spawn(),
+        )
+        .unwrap();
+        let retention = 1 << 20;
+        assert!(sink.store_scrollback_line(0, &GatedStore::line(0), retention));
+        sink.request_scrollback_flush().unwrap();
+        store.wait_until_inside();
+        assert_eq!(
+            store.writer_thread().as_deref(),
+            Some(DURABILITY_THREAD_NAME),
+            "store IO runs on the durability writer thread"
+        );
+        assert_eq!(
+            store.writer_qos(),
+            cfg!(target_os = "macos").then_some(procinfo::ThreadQos::Utility),
+            "the writer runs at QoS utility on macOS (no QoS classes elsewhere)"
+        );
+
+        // Every admission and handoff completes while the writer is provably
+        // stuck inside the store.
+        let mut latencies = Vec::with_capacity(512);
+        for row in 1..=512 {
+            let started = Instant::now();
+            assert!(sink.store_scrollback_line(row, &GatedStore::line(row), retention));
+            sink.request_scrollback_flush().unwrap();
+            latencies.push(started.elapsed());
+        }
+        assert_eq!(store.inside(), 1, "the writer is still inside the store");
+        latencies.sort();
+        let median = latencies[latencies.len() / 2];
+        assert!(
+            median < Duration::from_millis(1),
+            "median admission + handoff took {median:?}"
+        );
+        // Queued rows stay readable while their write is stalled.
+        assert_eq!(
+            sink.load_scrollback_line(300)
+                .map(|line| line.as_str().trim_end().to_string()),
+            Some(GatedStore::text(300))
+        );
+
+        // ft-yccm0.2.1.6 replaced "a full queue refuses rows": past the
+        // writer's byte budget the oldest queued rows become one durability
+        // gap, so admission never refuses and the parser never waits. A small
+        // budget makes the stalled queue overflow.
+        let charge = DeferredScrollbackSpillSink::row_charge(&GatedStore::line(1999)).unwrap();
+        sink.writer.set_queue_budget(charge * 600);
+        let budget = sink.writer.queue_budget();
+        let mut shedding_latencies = Vec::with_capacity(1_487);
+        for row in 513..2_000 {
+            let started = Instant::now();
+            assert!(sink.store_scrollback_line(row, &GatedStore::line(row), retention));
+            sink.request_scrollback_flush().unwrap();
+            shedding_latencies.push(started.elapsed());
+            assert!(
+                sink.writer.queued_bytes() <= budget,
+                "row {row} broke the budget"
+            );
+        }
+        // The parser never waits on the stalled writer, shedding included.
+        assert_eq!(store.inside(), 1, "the writer is still inside the store");
+        shedding_latencies.sort();
+        let median = shedding_latencies[shedding_latencies.len() / 2];
+        assert!(
+            median < Duration::from_millis(1),
+            "median admission + handoff while shedding took {median:?}"
+        );
+        let gap = {
+            let state = sink.state.lock().unwrap();
+            // The row the stalled writer holds is never shed; every later
+            // overflow coalesced into one gap from row 1.
+            assert!(matches!(&state.pending[0], Pending::Row(row) if row.stable_row == 0));
+            let Pending::Gap(gap) = state.pending[1] else {
+                panic!("the oldest queued rows after the in-flight one form a gap");
+            };
+            assert_eq!(gap.start, 1);
+            let dropped: usize = (gap.start..gap.end)
+                .map(|row| DeferredScrollbackSpillSink::row_charge(&GatedStore::line(row)).unwrap())
+                .sum();
+            assert_eq!(
+                gap.bytes, dropped,
+                "the gap accounts for every dropped byte"
+            );
+            assert_eq!(state.pending.len(), 2 + (2_000 - gap.end) as usize);
+            assert!(state.shedding);
+            gap
+        };
+        // Rows inside a queued gap read as the marker and empty rows.
+        assert_eq!(
+            sink.load_scrollback_line(1)
+                .map(|line| line.as_str().trim_end().to_string()),
+            Some(gap.marker_text())
+        );
+        assert_eq!(sink.load_scrollback_line(2).map(|line| line.len()), Some(0));
+
+        // A destructive operation still refuses a row (it stays in Screen),
+        // and writer progress wakes a parser waiting on that refusal.
+        let operation = sink.operation.lock().unwrap();
+        assert!(!sink.store_scrollback_line(2_000, &GatedStore::line(2_000), retention));
+        drop(operation);
+        store.set_closed(false);
+        assert_eq!(
+            sink.await_scrollback_capacity(Duration::from_secs(10)),
+            ScrollbackCapacityWait::Progressed
+        );
+        sink.flush_scrollback().unwrap();
+        // The store holds the gap as one marker row, in order.
+        let mut expected = vec![(0, GatedStore::text(0)), (1, gap.marker_text())];
+        expected.extend((gap.end..2_000).map(|row| (row - gap.rows() + 1, GatedStore::text(row))));
+        assert_eq!(store.rows(), expected);
+        // Reads translate stable rows to store rows around the gap.
+        for row in [0, gap.end, gap.end + 1, 1_900] {
+            assert_eq!(
+                sink.load_scrollback_line(row)
+                    .map(|line| line.as_str().trim_end().to_string()),
+                Some(GatedStore::text(row)),
+                "row {row}"
+            );
+        }
+        let span = sink.load_scrollback_lines(0..4);
+        assert_eq!(span.len(), 4);
+        assert_eq!(span[1].as_str().trim_end(), gap.marker_text());
+        assert!(span[2].is_whitespace() && span[3].is_whitespace());
+        assert!(sink.writer.queued_bytes() < budget / 2);
+        assert!(
+            !sink.state.lock().unwrap().shedding,
+            "caught up below half the budget"
+        );
+        assert_eq!(sink.durability_failure(), None);
+    }
+
+    #[test]
+    fn overload_gap_is_one_durable_marker_that_snapshots_and_recovery_see() {
+        use wezterm_term::CellAttributes;
+
+        let (dir, backing, deferred) = super::tests::deferred_test_sink();
+        let line = |row: StableRowIndex| {
+            Line::from_text(&format!("flood {row}"), &CellAttributes::blank(), 0, None)
+        };
+        let text = |line: &Line| line.as_str().trim_end().to_string();
+        for row in 0..10 {
+            assert!(deferred.store_scrollback_line(row, &line(row), 1_000));
+        }
+        deferred.flush_scrollback().unwrap();
+        // Nothing drains until the explicit flush, so admission alone sheds.
+        let charge = DeferredScrollbackSpillSink::row_charge(&line(99)).unwrap();
+        deferred.writer.set_queue_budget(charge * 40);
+        for row in 10..100 {
+            assert!(deferred.store_scrollback_line(row, &line(row), 1_000));
+        }
+        let gaps: Vec<GapSpan> = deferred
+            .state
+            .lock()
+            .unwrap()
+            .pending
+            .iter()
+            .filter_map(|entry| match entry {
+                Pending::Gap(gap) => Some(*gap),
+                Pending::Row(_) => None,
+            })
+            .collect();
+        assert_eq!(gaps.len(), 1, "repeated sheds coalesce into one gap");
+        let gap = gaps[0];
+        assert_eq!(gap.start, 10);
+        assert!(gap.end < 95, "half the budget stays queued as rows");
+        deferred.flush_scrollback().unwrap();
+        let kept = 10 + 1 + (100 - gap.end) as usize;
+        assert_eq!(
+            backing.retained_scrollback_rows(),
+            kept,
+            "one marker row per gap"
+        );
+        // export-durable shows the gap explicitly, in order.
+        let export = super::export_live_scrollback_transcript(
+            dir.path(),
+            &uuid::Uuid::from_bytes([0xd3; 16]).simple().to_string(),
+            256,
+            64 * 1024,
+            4 * 1024 * 1024,
+        )
+        .expect("export durable transcript");
+        let mut expected: Vec<String> = (0..10).map(|row| format!("flood {row}")).collect();
+        expected.push(gap.marker_text());
+        expected.extend((gap.end..100).map(|row| format!("flood {row}")));
+        let exported: Vec<String> = export
+            .transcript
+            .lines()
+            .map(|line| line.trim_end().to_string())
+            .collect();
+        assert_eq!(exported, expected);
+
+        // A checkpoint snapshot sees stable rows: the marker expands back into
+        // the gap's rows, and a row limit keeps the newest rows.
+        let limits = |max_rows| ScrollbackSnapshotLimits {
+            max_rows,
+            max_stored_bytes: 1 << 20,
+            max_decoded_bytes: 1 << 20,
+            max_physical_bytes: 1 << 20,
+        };
+        let snapshot = deferred.snapshot_scrollback(100, limits(1_000)).unwrap();
+        assert_eq!(snapshot.oldest_stable_row(), Some(0));
+        assert_eq!(snapshot.newest_stable_row_exclusive(), 100);
+        let rows: Vec<String> = snapshot.rows().iter().map(text).collect();
+        for (row, actual) in (0..).zip(&rows) {
+            let expected = if row < gap.start || row >= gap.end {
+                format!("flood {row}")
+            } else if row == gap.start {
+                gap.marker_text()
+            } else {
+                String::new()
+            };
+            assert_eq!(*actual, expected, "snapshot row {row}");
+        }
+        assert_eq!(rows.len(), 100);
+        let tight = deferred.snapshot_scrollback(100, limits(5)).unwrap();
+        assert_eq!(tight.oldest_stable_row(), Some(95));
+        assert_eq!(text(&tight.rows()[0]), "flood 95");
+
+        // Recovery: the reopened store carries the marker in order, between
+        // the rows before and after the gap.
+        drop(deferred);
+        drop(backing);
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 913,
+            domain_id: 3,
+            durable_pane_id: [0xd3; 16],
+            command_description: "deferred-scrollback-test".to_string(),
+        };
+        let reopened =
+            super::LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context).unwrap();
+        assert_eq!(reopened.retained_scrollback_rows(), kept);
+        assert_eq!(text(&reopened.load_scrollback_line(9).unwrap()), "flood 9");
+        assert_eq!(
+            text(&reopened.load_scrollback_line(10).unwrap()),
+            gap.marker_text()
+        );
+        assert_eq!(
+            text(&reopened.load_scrollback_line(11).unwrap()),
+            format!("flood {}", gap.end)
+        );
+    }
+
+    #[test]
+    fn durability_writer_preserves_per_pane_order_across_10k_enqueues() {
+        const ROWS: StableRowIndex = 10_000;
+        let writer = DurabilityWriter::spawn();
+        let panes: Vec<_> = (0..2u8)
+            .map(|pane| {
+                let store = Arc::new(GatedStore::default());
+                let sink = DeferredScrollbackSpillSink::with_writer(
+                    store.clone(),
+                    [pane; 16],
+                    Arc::clone(&writer),
+                )
+                .unwrap();
+                (store, sink)
+            })
+            .collect();
+        let parsers: Vec<_> = panes
+            .iter()
+            .map(|(_, sink)| {
+                let sink = Arc::clone(sink);
+                std::thread::spawn(move || {
+                    for row in 0..ROWS {
+                        let line = GatedStore::line(row);
+                        // Like the parser: a refusal waits on writer progress.
+                        while !sink.store_scrollback_line(row, &line, 1 << 20) {
+                            assert_eq!(
+                                sink.await_scrollback_capacity(Duration::from_secs(10)),
+                                ScrollbackCapacityWait::Progressed
+                            );
+                        }
+                        if row % 64 == 63 {
+                            sink.request_scrollback_flush().unwrap();
+                        }
+                    }
+                    sink.request_scrollback_flush().unwrap();
+                })
+            })
+            .collect();
+        for parser in parsers {
+            parser.join().unwrap();
+        }
+        let expected: Vec<_> = (0..ROWS).map(|row| (row, GatedStore::text(row))).collect();
+        for (store, sink) in &panes {
+            sink.flush_scrollback().unwrap();
+            assert_eq!(
+                store.rows(),
+                expected,
+                "per-pane FIFO, each row exactly once"
+            );
+            assert_eq!(sink.durability_failure(), None);
+            assert!(
+                sink.committed_batches() >= 3,
+                "batches are bounded by the batch limit"
+            );
+        }
+    }
+
+    #[test]
+    fn durability_writer_finishes_a_closed_panes_rows_then_releases_its_store() {
+        use wezterm_term::CellAttributes;
+
+        let (dir, backing, deferred) = super::tests::deferred_test_sink();
+        let lines: Vec<_> = (0..64)
+            .map(|row| {
+                Line::from_text(
+                    &format!("closing {row} 界 e\u{301}"),
+                    &CellAttributes::blank(),
+                    0,
+                    None,
+                )
+            })
+            .collect();
+        let lease = super::acquire_live_scrollback_filesystem_mutation_lease(
+            backing.manifest_path.parent().unwrap(),
+            false,
+        )
+        .unwrap();
+        for (row, line) in lines.iter().enumerate() {
+            assert!(deferred.store_scrollback_line(row as StableRowIndex, line, 128));
+        }
+        // The close marker hands the rows to the writer, which then stalls
+        // inside the real store behind the held file lease.
+        deferred.request_scrollback_flush().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while backing.mutation_gate.try_lock().is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "the writer never entered the store"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The pane closes: only the writer still owns the sink and its store.
+        let closed_sink = Arc::downgrade(&deferred);
+        let closed_store = Arc::downgrade(&backing);
+        drop(deferred);
+        drop(backing);
+        drop(lease);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while closed_sink.upgrade().is_some() || closed_store.upgrade().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the writer kept a closed pane's store open"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 913,
+            domain_id: 3,
+            durable_pane_id: [0xd3; 16],
+            command_description: "deferred-scrollback-test".to_string(),
+        };
+        let reopened =
+            super::LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context).unwrap();
+        assert_eq!(reopened.retained_scrollback_rows(), lines.len());
+        for (row, expected) in lines.iter().enumerate() {
+            let mut actual = reopened
+                .load_scrollback_line(row as StableRowIndex)
+                .unwrap();
+            let mut expected = expected.clone();
+            actual.cells_mut();
+            expected.cells_mut();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn durability_writer_contains_a_store_panic_as_a_degraded_pane() {
+        let writer = DurabilityWriter::spawn();
+        let failing_store = Arc::new(GatedStore::default());
+        failing_store.set_panic(true);
+        let healthy_store = Arc::new(GatedStore::default());
+        let failing = DeferredScrollbackSpillSink::with_writer(
+            failing_store.clone(),
+            [0x61; 16],
+            Arc::clone(&writer),
+        )
+        .unwrap();
+        let healthy = DeferredScrollbackSpillSink::with_writer(
+            healthy_store.clone(),
+            [0x62; 16],
+            Arc::clone(&writer),
+        )
+        .unwrap();
+        for row in 0..8 {
+            assert!(failing.store_scrollback_line(row, &GatedStore::line(row), 64));
+        }
+        failing.request_scrollback_flush().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while failing.durability_failure().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the writer panic was not surfaced"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(failing.writer_panicked());
+        // The degraded pane is exported through the resource snapshot that
+        // `ft doctor --json` reads (this pane id is unique to this test).
+        let failing_label = uuid::Uuid::from_bytes([0x61; 16]).to_string();
+        let exported = DurabilityLedger::global().snapshot();
+        assert!(exported.degraded_panes.contains_key(&failing_label));
+        assert!(exported.writer_panics_total >= 1);
+        // The parser sees a degraded pane, never a panic, and keeps its rows.
+        assert_eq!(
+            failing.request_scrollback_flush(),
+            Err(ScrollbackSpillError::StorageUnavailable)
+        );
+        assert_eq!(
+            failing
+                .load_scrollback_line(3)
+                .map(|line| line.as_str().trim_end().to_string()),
+            Some(GatedStore::text(3))
+        );
+        assert_eq!(
+            failing.await_scrollback_capacity(Duration::from_millis(20)),
+            ScrollbackCapacityWait::Failed(ScrollbackSpillError::StorageUnavailable)
+        );
+
+        // The writer thread survived the panic: another pane still commits
+        // through it without any explicit flush.
+        for row in 0..8 {
+            assert!(healthy.store_scrollback_line(row, &GatedStore::line(row), 64));
+        }
+        healthy.request_scrollback_flush().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while healthy_store.rows().len() < 8 {
+            assert!(Instant::now() < deadline, "the writer thread died");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // Once the store stops panicking, the backoff retry commits every
+        // owned row and clears the degraded state.
+        failing_store.set_panic(false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while failing_store.rows().len() < 8 || failing.durability_failure().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the degraded pane never recovered"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let expected: Vec<_> = (0..8).map(|row| (row, GatedStore::text(row))).collect();
+        assert_eq!(failing_store.rows(), expected);
+        assert!(
+            !DurabilityLedger::global()
+                .snapshot()
+                .degraded_panes
+                .contains_key(&failing_label),
+            "a recovered pane leaves the exported degraded set"
         );
     }
 }
@@ -9650,9 +11448,16 @@ pub fn open_scrollback_spill_sink(
     context: &config::ScrollbackSpillSinkContext,
 ) -> anyhow::Result<Arc<dyn wezterm_term::config::ScrollbackSpillSink>> {
     let backing = Arc::new(LiveScrollbackSpillSink::new(base_dir, context)?);
-    let sink = deferred_scrollback::DeferredScrollbackSpillSink::new(backing)
-        .context("initialize deferred scrollback metadata")?;
-    Ok(Arc::new(sink))
+    // The budget is process-wide; each new pane applies the current value.
+    deferred_scrollback::DurabilityWriter::global().set_queue_budget(
+        config::configuration()
+            .scrollback_durability_queue_max_mb
+            .saturating_mul(1024 * 1024),
+    );
+    let sink =
+        deferred_scrollback::DeferredScrollbackSpillSink::new(backing, context.durable_pane_id)
+            .context("initialize deferred scrollback metadata")?;
+    Ok(sink)
 }
 
 pub fn install_scrollback_spill_sink_factory() {
@@ -9996,9 +11801,14 @@ mod tests {
         };
         let backing =
             Arc::new(LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context).unwrap());
-        let deferred = Arc::new(
-            deferred_scrollback::DeferredScrollbackSpillSink::new(backing.clone()).unwrap(),
-        );
+        // A private writer: a test that stalls its store must not delay the
+        // durability of sinks in concurrently running tests.
+        let deferred = deferred_scrollback::DeferredScrollbackSpillSink::with_writer(
+            backing.clone(),
+            context.durable_pane_id,
+            deferred_scrollback::DurabilityWriter::spawn(),
+        )
+        .unwrap();
         (dir, backing, deferred)
     }
 
@@ -10224,15 +12034,19 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn deferred_scrollback_geometry_yields_preserve_durable_batch_sizes() {
-        for (row_count, expected_revision) in [
+        for (row_count, minimum_revision, exact) in [
             // A fixed corpus that formerly required four publications: one
-            // establishing authority, then 1023, 1024, and 33 rows. It now fits
-            // one bounded batch, without changing its Unicode/text oracle.
-            (2086, 2),
-            (2 * LIVE_SCROLLBACK_APPEND_MAX_ROWS + 38, 4),
+            // establishing authority, then 1023, 1024, and 33 rows. It fits
+            // the bounded queue during one applied batch, so the writer sees
+            // it whole: exactly one authority row plus one batch.
+            (2086, 2, true),
+            // Overflow past the queue cap is admitted while the writer drains
+            // concurrently, so the writer (not the parser) picks the batch
+            // boundaries: at least authority + three full queues.
+            (2 * LIVE_SCROLLBACK_APPEND_MAX_ROWS + 38, 4, false),
         ] {
             let (_dir, backing, deferred) = deferred_test_sink();
-            let pane = deferred_test_pane(deferred, row_count + 1);
+            let pane = deferred_test_pane(deferred.clone(), row_count + 1);
             let mut corpus = String::new();
             for row in 0..row_count {
                 use std::fmt::Write as _;
@@ -10243,9 +12057,19 @@ mod tests {
                 .parse(corpus.as_bytes(), |action| actions.push(action));
             pane.perform_actions(actions)
                 .expect("test action admission");
+            // The explicit sync point: durability is the writer's, not the
+            // parser's, so the batch has been handed over but may be in flight.
+            deferred.flush_scrollback().unwrap();
             assert_eq!(backing.retained_scrollback_rows(), row_count - 5);
-            // Cooperative geometry slices must not create extra generations.
-            assert_eq!(backing.state.lock().unwrap().revision, expected_revision);
+            // Cooperative geometry slices never mint generations: every one
+            // is exactly one acknowledged writer/flush batch.
+            let revision = backing.state.lock().unwrap().revision;
+            assert_eq!(revision, deferred.committed_batches());
+            if exact {
+                assert_eq!(revision, minimum_revision);
+            } else {
+                assert!(revision >= minimum_revision, "revision {revision}");
+            }
             let (first, lines) = pane.get_lines(0..isize::try_from(row_count + 1).unwrap());
             assert_eq!(first, 0);
             assert_eq!(lines.len(), row_count + 1);
@@ -10284,7 +12108,12 @@ mod tests {
             termwiz::escape::parser::Parser::new()
                 .parse(corpus.as_bytes(), |action| actions.push(action));
             let writing = Arc::clone(&pane);
-            let writer = std::thread::spawn(move || writing.perform_actions(actions));
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            let writer = std::thread::spawn(move || {
+                let result = writing.perform_actions(actions);
+                done_tx.send(()).unwrap();
+                result
+            });
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let entered = loop {
                 if backing.mutation_gate.try_lock().is_err() {
@@ -10310,16 +12139,29 @@ mod tests {
             });
             let observed = rx.recv_timeout(std::time::Duration::from_millis(500));
             let responsive = observed.is_ok();
+            // With the queue, the parser finishes its batch while the
+            // durability writer is still stuck inside real storage.
+            let parser_finished = done_rx
+                .recv_timeout(if use_queue {
+                    std::time::Duration::from_secs(5)
+                } else {
+                    std::time::Duration::from_millis(200)
+                })
+                .is_ok();
             drop(lease);
             writer.join().unwrap().expect("test action admission");
             reader.join().unwrap();
             assert!(
                 entered,
-                "parser did not enter the real persistence boundary"
+                "persistence did not enter the real storage boundary"
             );
             assert_eq!(
                 responsive, use_queue,
                 "queued={use_queue}: direct persistence is the negative control"
+            );
+            assert_eq!(
+                parser_finished, use_queue,
+                "queued={use_queue}: the parser must not wait on storage IO"
             );
             if use_queue {
                 assert_eq!(
@@ -10327,11 +12169,12 @@ mod tests {
                     0,
                     "admission must not report durable worker completion"
                 );
+                deferred.flush_scrollback().unwrap();
             }
             assert_eq!(
                 backing.retained_scrollback_rows(),
                 265,
-                "overflow beyond the queue cap must drain before returning"
+                "every admitted row is durable after the explicit sync point"
             );
             let (first, lines) = pane.get_lines(0..271);
             assert_eq!(first, 0);
@@ -10358,49 +12201,57 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn deferred_scrollback_parser_backpressure_is_readable_and_close_cancellable() {
+        fn parse(output: &[u8]) -> Vec<termwiz::escape::Action> {
+            let mut actions = Vec::new();
+            termwiz::escape::parser::Parser::new().parse(output, |action| actions.push(action));
+            actions
+        }
+        fn run_parser(
+            pane: &Arc<dyn mux::pane::Pane>,
+            actions: Vec<termwiz::escape::Action>,
+        ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<()>) {
+            let writing = Arc::clone(pane);
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            let parser = std::thread::spawn(move || {
+                writing
+                    .perform_actions(actions)
+                    .expect("test action admission");
+                done_tx.send(()).unwrap();
+            });
+            (parser, done_rx)
+        }
+        let restore_store = |backing: &LiveScrollbackSpillSink| {
+            std::fs::rename(
+                &backing.manifest_path,
+                backing.manifest_path.with_extension("retained-invalid"),
+            )
+            .unwrap();
+        };
+
+        // A failing store with queue room: the parser hands rows over and
+        // returns; the rows stay owned and readable while the writer reports
+        // the pane as durability-degraded and retries.
         let (_dir, backing, deferred) = deferred_test_sink();
         let pane = deferred_test_pane(deferred.clone(), 4096);
         std::fs::write(&backing.manifest_path, b"invalid retained authority").unwrap();
-        let mut actions = Vec::new();
-        termwiz::escape::parser::Parser::new().parse(
-            b"retained\r\n".repeat(20).as_slice(),
-            |action| {
-                actions.push(action);
-            },
-        );
-        let writing = Arc::clone(&pane);
-        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-        let writer = std::thread::spawn(move || {
-            writing
-                .perform_actions(actions)
-                .expect("test action admission");
-            done_tx.send(()).unwrap();
-        });
+        let (parser, done_rx) = run_parser(&pane, parse(&b"retained\r\n".repeat(20)));
+        let returned = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        parser.join().unwrap();
+        returned.expect("a failing store must not hold a parser whose queue has room");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while deferred.retained_scrollback_rows() == 0 && std::time::Instant::now() < deadline {
+        while deferred.durability_failure().is_none() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let retained = deferred.load_scrollback_line(0);
-        let parser_blocked = done_rx
-            .recv_timeout(std::time::Duration::from_millis(200))
-            .is_err();
-        let _dimensions = pane.get_dimensions();
-        pane.kill();
-        let stopped = done_rx.recv_timeout(std::time::Duration::from_secs(5));
-        writer.join().unwrap();
-        assert!(retained.is_some());
-        assert!(
-            parser_blocked,
-            "a failed flush must not admit another parser batch"
+        assert_eq!(
+            deferred.durability_failure(),
+            Some(wezterm_term::config::ScrollbackSpillError::StorageUnavailable),
+            "the writer must surface the failing store as a degraded pane"
         );
-        stopped.unwrap();
-        assert_eq!(deferred.load_scrollback_line(0), retained);
-        std::fs::rename(
-            &backing.manifest_path,
-            backing.manifest_path.with_extension("retained-invalid"),
-        )
-        .unwrap();
+        let retained = deferred.load_scrollback_line(0);
+        assert!(retained.is_some());
+        restore_store(&backing);
         deferred.flush_scrollback().unwrap();
+        assert_eq!(deferred.durability_failure(), None);
         let mut persisted = backing.load_scrollback_line(0).unwrap();
         let mut retained = retained.unwrap();
         // The durable codec materializes clustered cells. Compare the full
@@ -10408,6 +12259,288 @@ mod tests {
         persisted.cells_mut();
         retained.cells_mut();
         assert_eq!(persisted, retained);
+
+        // A failing store with a full queue: memory stays bounded, so the
+        // parser waits (outside the terminal lock) until close cancels it.
+        let (_dir, backing, deferred) = deferred_test_sink();
+        let pane = deferred_test_pane(deferred.clone(), 8192);
+        std::fs::write(&backing.manifest_path, b"invalid retained authority").unwrap();
+        let rows = LIVE_SCROLLBACK_APPEND_MAX_ROWS + 200;
+        let (parser, done_rx) = run_parser(&pane, parse(&b"retained\r\n".repeat(rows)));
+        let parser_blocked = done_rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err();
+        let (_dimensions, _title) = (pane.get_dimensions(), pane.get_title());
+        // Nothing is durable, so every retained row is a queued row.
+        assert_eq!(backing.retained_scrollback_rows(), 0);
+        assert_eq!(
+            deferred.retained_scrollback_rows(),
+            LIVE_SCROLLBACK_APPEND_MAX_ROWS,
+            "the queue is full and bounded"
+        );
+        pane.kill();
+        let stopped = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        parser.join().unwrap();
+        assert!(
+            parser_blocked,
+            "a full queue on a failing store must hold the parser"
+        );
+        stopped.expect("pane close must end the parser's durability wait");
+        let newest = deferred.load_scrollback_line(
+            wezterm_term::StableRowIndex::try_from(LIVE_SCROLLBACK_APPEND_MAX_ROWS - 1).unwrap(),
+        );
+        assert!(newest.is_some(), "queued rows stay readable");
+        restore_store(&backing);
+        deferred.flush_scrollback().unwrap();
+        assert_eq!(
+            backing.retained_scrollback_rows(),
+            LIVE_SCROLLBACK_APPEND_MAX_ROWS
+        );
+    }
+
+    /// The real store, committing at most `chunk` rows per call. When armed,
+    /// it parks the durability writer after a committed chunk, between two
+    /// transactions of one drain (ft-yccm0.2.1.1).
+    #[derive(Debug)]
+    struct ChunkedPausingStore {
+        inner: Arc<LiveScrollbackSpillSink>,
+        chunk: usize,
+        pause: std::sync::Mutex<(bool, bool)>,
+        pause_signal: std::sync::Condvar,
+    }
+
+    impl ChunkedPausingStore {
+        fn arm(&self) {
+            self.pause.lock().unwrap().0 = true;
+        }
+
+        fn wait_until_parked(&self) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut pause = self.pause.lock().unwrap();
+            while !pause.1 {
+                let now = std::time::Instant::now();
+                assert!(now < deadline, "the writer never parked mid-batch");
+                pause = self
+                    .pause_signal
+                    .wait_timeout(pause, deadline - now)
+                    .unwrap()
+                    .0;
+            }
+        }
+
+        fn release(&self) {
+            self.pause.lock().unwrap().1 = false;
+            self.pause_signal.notify_all();
+        }
+    }
+
+    impl ScrollbackSpillSink for ChunkedPausingStore {
+        fn store_scrollback_line(
+            &self,
+            stable_row: wezterm_term::StableRowIndex,
+            line: &Line,
+            retention: usize,
+        ) -> bool {
+            self.inner
+                .store_scrollback_line(stable_row, line, retention)
+        }
+
+        fn store_scrollback_lines(
+            &self,
+            first: wezterm_term::StableRowIndex,
+            lines: &[Line],
+            retention: usize,
+        ) -> usize {
+            let take = lines.len().min(self.chunk);
+            let acknowledged = self
+                .inner
+                .store_scrollback_lines(first, &lines[..take], retention);
+            let mut pause = self.pause.lock().unwrap();
+            if pause.0 && acknowledged > 0 {
+                *pause = (false, true);
+                self.pause_signal.notify_all();
+                while pause.1 {
+                    pause = self.pause_signal.wait(pause).unwrap();
+                }
+            }
+            acknowledged
+        }
+
+        fn load_scrollback_line(&self, stable_row: wezterm_term::StableRowIndex) -> Option<Line> {
+            self.inner.load_scrollback_line(stable_row)
+        }
+
+        fn load_scrollback_lines(
+            &self,
+            rows: std::ops::Range<wezterm_term::StableRowIndex>,
+        ) -> Vec<Line> {
+            self.inner.load_scrollback_lines(rows)
+        }
+
+        fn oldest_scrollback_row(&self) -> Option<wezterm_term::StableRowIndex> {
+            self.inner.oldest_scrollback_row()
+        }
+
+        fn retained_scrollback_rows(&self) -> usize {
+            self.inner.retained_scrollback_rows()
+        }
+
+        fn retained_scrollback_bytes(&self) -> usize {
+            self.inner.retained_scrollback_bytes()
+        }
+
+        fn snapshot_scrollback(
+            &self,
+            newest: wezterm_term::StableRowIndex,
+            limits: wezterm_term::config::ScrollbackSnapshotLimits,
+        ) -> Result<
+            wezterm_term::config::ScrollbackSnapshot,
+            wezterm_term::config::ScrollbackSpillError,
+        > {
+            self.inner.snapshot_scrollback(newest, limits)
+        }
+
+        fn replace_scrollback_prefix(
+            &self,
+            expected: Option<wezterm_term::config::ScrollbackSnapshotGeneration>,
+            prefix: wezterm_term::config::ScrollbackPrefix<'_>,
+            retention: usize,
+        ) -> Result<
+            wezterm_term::config::ScrollbackReplaceCommit,
+            wezterm_term::config::ScrollbackSpillError,
+        > {
+            self.inner
+                .replace_scrollback_prefix(expected, prefix, retention)
+        }
+
+        fn clear_scrollback(
+            &self,
+        ) -> Result<
+            wezterm_term::config::ScrollbackClearCommit,
+            wezterm_term::config::ScrollbackSpillError,
+        > {
+            self.inner.clear_scrollback()
+        }
+    }
+
+    /// ft session list-durable / export-durable read the store through
+    /// list_live_scrollback_panes and export_live_scrollback_transcript. With
+    /// durability on its own thread they must still see an exact committed
+    /// prefix: while the writer is parked between two transactions of a
+    /// drain, while it is blocked inside a real transaction, and after the
+    /// pane closes.
+    #[test]
+    fn durable_list_and_export_see_a_committed_prefix_while_the_writer_runs_and_after_close() {
+        let dir = tempfile::tempdir().expect("private durable-prefix fixture");
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 914,
+            domain_id: 3,
+            durable_pane_id: [0xd4; 16],
+            command_description: "durable-prefix-test".to_string(),
+        };
+        let durable_pane_id = uuid::Uuid::from_bytes(context.durable_pane_id)
+            .simple()
+            .to_string();
+        let backing =
+            Arc::new(LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context).unwrap());
+        let store = Arc::new(ChunkedPausingStore {
+            inner: Arc::clone(&backing),
+            chunk: 16,
+            pause: std::sync::Mutex::new((false, false)),
+            pause_signal: std::sync::Condvar::new(),
+        });
+        let deferred = deferred_scrollback::DeferredScrollbackSpillSink::with_writer(
+            store.clone(),
+            context.durable_pane_id,
+            deferred_scrollback::DurabilityWriter::spawn(),
+        )
+        .unwrap();
+        let text = |row: usize| format!("durable row {row} 界");
+        let attrs = CellAttributes::blank();
+        let admit = |rows: std::ops::Range<usize>| {
+            for row in rows {
+                let line = Line::from_text(&text(row), &attrs, 1, None);
+                assert!(deferred.store_scrollback_line(row as isize, &line, 1024));
+            }
+        };
+        let committed_prefix = |rows: usize| {
+            let panes = list_live_scrollback_panes(dir.path(), 8).expect("list durable panes");
+            assert_eq!(panes.len(), 1);
+            assert_eq!(panes[0].durable_pane_id, durable_pane_id);
+            assert!(panes[0].error.is_none(), "{:?}", panes[0].error);
+            assert_eq!(panes[0].state, "complete");
+            assert_eq!(panes[0].retained_rows, Some(rows as u64));
+            let export = export_live_scrollback_transcript(
+                dir.path(),
+                &durable_pane_id,
+                256,
+                64 * 1024,
+                4 * 1024 * 1024,
+            )
+            .expect("export durable transcript");
+            assert_eq!(export.retained_rows, rows);
+            assert_eq!(export.next_seq, rows as u64);
+            let exported: Vec<_> = export.transcript.lines().map(str::trim_end).collect();
+            let expected: Vec<_> = (0..rows).map(text).collect();
+            assert_eq!(
+                exported, expected,
+                "export must be an exact committed prefix"
+            );
+        };
+
+        admit(0..32);
+        deferred.flush_scrollback().unwrap();
+        committed_prefix(32);
+
+        // The writer commits one 16-row transaction of a 64-row drain, then
+        // parks with the rest still owned by the queue.
+        store.arm();
+        admit(32..96);
+        deferred.request_scrollback_flush().unwrap();
+        store.wait_until_parked();
+        committed_prefix(48);
+        assert_eq!(
+            deferred.load_scrollback_lines(80..96).len(),
+            16,
+            "uncommitted rows stay readable through the pane's sink"
+        );
+
+        // Blocked inside a real transaction (behind the store's file lease),
+        // the writer has published nothing new.
+        let lease = acquire_live_scrollback_filesystem_mutation_lease(
+            backing.manifest_path.parent().unwrap(),
+            false,
+        )
+        .unwrap();
+        store.release();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while backing.mutation_gate.try_lock().is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer never entered its next transaction"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        committed_prefix(48);
+
+        // Pane close: the close marker hands the rest to the writer, which
+        // commits it and then drops the sink and the store.
+        deferred.request_scrollback_flush().unwrap();
+        let closed_sink = Arc::downgrade(&deferred);
+        let closed_store = Arc::downgrade(&backing);
+        drop(deferred);
+        drop(store);
+        drop(backing);
+        drop(lease);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while closed_sink.upgrade().is_some() || closed_store.upgrade().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer kept the closed pane's store"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        committed_prefix(96);
     }
 
     #[test]
@@ -11042,8 +13175,12 @@ mod tests {
         assert_eq!(backing.retained_scrollback_rows(), 64);
         // A fresh adapter has the same durable rows but no warm suffix. This
         // is the causal control for the pre-cache path, using real encrypted IO.
-        let uncached =
-            deferred_scrollback::DeferredScrollbackSpillSink::new(backing.clone()).unwrap();
+        let uncached = deferred_scrollback::DeferredScrollbackSpillSink::with_writer(
+            backing.clone(),
+            [0xd3; 16],
+            deferred_scrollback::DurabilityWriter::spawn(),
+        )
+        .unwrap();
         let pending = Line::from_text("pending tail", &CellAttributes::blank(), 64, None);
         assert!(deferred.store_scrollback_line(64, &pending, 128));
         expected.push(pending);

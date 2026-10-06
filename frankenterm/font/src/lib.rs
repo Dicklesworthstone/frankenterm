@@ -14,6 +14,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -1072,10 +1073,23 @@ struct FallbackResolveInfo {
     built_in: Arc<FontDatabase>,
     locator: Arc<dyn FontLocator + Send + Sync>,
     config: ConfigHandle,
+    /// Counted from scheduling until after `completion` has run.
+    in_flight: Arc<AtomicUsize>,
+}
+
+/// Decrements the in-flight resolve count when a resolve finishes, after its
+/// completion callback (and on unwind).
+struct FallbackInFlight(Arc<AtomicUsize>);
+
+impl Drop for FallbackInFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl FallbackResolveInfo {
     fn process(self) {
+        let _in_flight = FallbackInFlight(Arc::clone(&self.in_flight));
         let fallback_str = self.no_glyphs.iter().collect::<String>();
         let mut extra_handles = vec![];
 
@@ -1274,6 +1288,8 @@ struct FontConfigInner {
     char_select_font: RefCell<Option<Rc<LoadedFont>>>,
     command_palette_font: RefCell<Option<Rc<LoadedFont>>>,
     fallback_channel: RefCell<Option<Sender<FallbackResolveInfo>>>,
+    /// Fallback resolves scheduled whose completion has not yet run.
+    fallback_resolves_in_flight: Arc<AtomicUsize>,
 }
 
 /// Matches and loads fonts for a given input style
@@ -1301,6 +1317,7 @@ impl FontConfigInner {
             font_dirs: RefCell::new(Arc::new(FontDatabase::with_font_dirs(&config)?)),
             built_in: RefCell::new(Arc::new(FontDatabase::with_built_in()?)),
             fallback_channel: RefCell::new(None),
+            fallback_resolves_in_flight: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -1329,6 +1346,9 @@ impl FontConfigInner {
             return;
         }
 
+        // Every path below ends in `process`, whose guard decrements this.
+        self.fallback_resolves_in_flight
+            .fetch_add(1, Ordering::AcqRel);
         let info = FallbackResolveInfo {
             completion: Box::new(completion),
             no_glyphs,
@@ -1337,6 +1357,7 @@ impl FontConfigInner {
             built_in: Arc::clone(&*self.built_in.borrow()),
             locator: Arc::clone(&self.locator),
             config: self.config.borrow().clone(),
+            in_flight: Arc::clone(&self.fallback_resolves_in_flight),
         };
 
         let mut fallback = self.fallback_channel.borrow_mut();
@@ -1926,6 +1947,15 @@ impl FontConfiguration {
 
     pub fn config_changed(&self, config: &ConfigHandle) -> anyhow::Result<()> {
         self.inner.config_changed(config)
+    }
+
+    /// Fallback-font resolves scheduled whose completion callback has not yet
+    /// run. While nonzero, some glyph may still change font, so a frame drawn
+    /// now is not final (ft-yccm0.1.10 snapshots wait for zero).
+    pub fn fallback_resolves_in_flight(&self) -> usize {
+        self.inner
+            .fallback_resolves_in_flight
+            .load(Ordering::Acquire)
     }
 
     pub fn config(&self) -> ConfigHandle {

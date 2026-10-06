@@ -1,5 +1,6 @@
 use crate::colorease::ColorEaseUniform;
-use crate::termwindow::webgpu::{AcquiredWebGpuFrame, ShaderUniform};
+use crate::termwindow::render_snapshot::WebGpuDrawTarget;
+use crate::termwindow::webgpu::ShaderUniform;
 use crate::uniforms::UniformBuilder;
 use ::window::glium;
 use ::window::glium::uniforms::{
@@ -59,8 +60,31 @@ impl std::error::Error for DrawFailure {
 }
 
 impl crate::TermWindow {
-    pub(crate) fn call_draw_webgpu(&mut self, acquired: AcquiredWebGpuFrame) -> anyhow::Result<()> {
+    pub(crate) fn call_draw_webgpu(&mut self, target: WebGpuDrawTarget) -> anyhow::Result<()> {
+        use crate::renderstate::LedgeredTexture;
         use crate::termwindow::webgpu::WebGpuTexture;
+
+        // ft-yccm0.1.10: this frame's shaping has run. If it asked for a
+        // fallback font, a resolved fallback has not been applied yet, or the
+        // configured window background is still loading, the frame is not
+        // final: re-arm, and the repaint that follows the completion (each
+        // invalidates the window) takes the snapshot.
+        if matches!(target, WebGpuDrawTarget::Snapshot(_)) {
+            let fonts_pending = self.fonts.fallback_resolves_in_flight() > 0
+                || self
+                    .fallback_invalidation_pending
+                    .load(std::sync::atomic::Ordering::Acquire);
+            let background_pending = !self.background_load.is_settled();
+            if fonts_pending || background_pending {
+                if let Some(request) = self.render_snapshot.as_mut() {
+                    request.rearm();
+                }
+                log::info!(
+                    "render snapshot deferred: fallback fonts pending={fonts_pending}, background loading={background_pending}"
+                );
+                return Ok(());
+            }
+        }
 
         let webgpu = self
             .webgpu
@@ -71,23 +95,36 @@ impl crate::TermWindow {
             .as_ref()
             .context("render state is not initialized")?;
 
-        if acquired.suboptimal {
-            log::warn!(
-                "webgpu surface texture is suboptimal; presenting it before forced reconfigure"
-            );
-        }
-        let output = acquired.texture;
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        // ft-yccm0.1.10: a snapshot target gets the identical draw, then a
+        // readback instead of a present.
+        let (view, output, snapshot) = match target {
+            WebGpuDrawTarget::Surface(acquired) => {
+                if acquired.suboptimal {
+                    log::warn!(
+                        "webgpu surface texture is suboptimal; presenting it before forced reconfigure"
+                    );
+                }
+                let view = acquired
+                    .texture
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+                (view, Some(acquired.texture), None)
+            }
+            WebGpuDrawTarget::Snapshot(snapshot) => {
+                let view = snapshot
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+                (view, None, Some(snapshot))
+            }
+        };
         let mut encoder = webgpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Render Encoder"),
             });
         let tex = render_state.glyph_cache.borrow().atlas.texture();
-        let tex = tex
-            .downcast_ref::<WebGpuTexture>()
+        let tex: &WebGpuTexture = tex
+            .downcast_ref::<LedgeredTexture<WebGpuTexture>>()
             .context("glyph atlas is not a WebGPU texture")?;
         let texture_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -211,6 +248,17 @@ impl crate::TermWindow {
         }
         drop(render_pass);
 
+        let readback = snapshot.as_ref().and_then(|snapshot| {
+            crate::termwindow::render_snapshot::PendingReadback::record(
+                &webgpu.device,
+                &mut encoder,
+                &snapshot.texture,
+                snapshot.path.clone(),
+            )
+            .map_err(|err| log::error!("render snapshot: {err:#}"))
+            .ok()
+        });
+
         // In this wgpu API both `Queue::submit` and `Queue::present`
         // are synchronously infallible. Device-loss errors reported later by
         // wgpu are outside this synchronous seam; a successful return does not
@@ -218,12 +266,20 @@ impl crate::TermWindow {
         let _submission = webgpu.profile_native_stage("submit", || {
             webgpu.queue.submit(std::iter::once(encoder.finish()))
         });
-        webgpu.profile_native_stage("present", || webgpu.queue.present(output));
+        if let Some(readback) = readback {
+            if let Err(err) = readback.finish(&webgpu.device) {
+                log::error!("render snapshot: {err:#}");
+            }
+        }
+        if let Some(output) = output {
+            webgpu.profile_native_stage("present", || webgpu.queue.present(output));
+        }
 
         Ok(())
     }
 
     pub(crate) fn call_draw_glium(&mut self, frame: &mut glium::Frame) -> anyhow::Result<()> {
+        use crate::renderstate::LedgeredTexture;
         use window::glium::texture::SrgbTexture2d;
 
         let gl_state = self
@@ -231,8 +287,8 @@ impl crate::TermWindow {
             .as_ref()
             .context("render state is not initialized")?;
         let tex = gl_state.glyph_cache.borrow().atlas.texture();
-        let tex = tex
-            .downcast_ref::<SrgbTexture2d>()
+        let tex: &SrgbTexture2d = tex
+            .downcast_ref::<LedgeredTexture<SrgbTexture2d>>()
             .context("glyph atlas is not a glium SrgbTexture2d")?;
         let prog = gl_state.glyph_prog.as_ref().ok_or_else(|| {
             DrawFailure::new(

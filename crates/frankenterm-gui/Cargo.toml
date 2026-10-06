@@ -72,7 +72,7 @@ harness = false
 # A compile_error! in main.rs enforces that both features cannot be on at once
 # (each defines a `#[global_allocator]`). See ft-tkxpi.
 default = ["jemalloc"]
-jemalloc = ["dep:frankenterm-alloc", "frankenterm-alloc/jemalloc"]
+jemalloc = ["frankenterm-alloc/jemalloc"]
 wayland = ["window/wayland"]
 headless-render = []
 dhat-heap = ["dep:dhat"]
@@ -97,10 +97,14 @@ frankenterm-core = { workspace = true, features = ["native-wezterm"] }
 # GH#75: broken-pipe (EPIPE) panic-to-exit(141) handling for piped stdout
 # (e.g. `frankenterm-gui show-keys | head`).
 frankenterm-sigpipe.workspace = true
+# Native Metal front end (front_end = "Metal"); an uninhabited stub off macOS.
+frankenterm-renderer-metal.workspace = true
 
 # Allocator wiring (jemalloc by default for release builds; gated behind the
-# `jemalloc` feature so dhat-heap builds can opt out). ft-tkxpi.
-frankenterm-alloc = { workspace = true, optional = true }
+# `jemalloc` feature so dhat-heap builds can opt out). ft-tkxpi. Always linked
+# for the GPU resource ledger (ft-yccm0.2.5); without the `jemalloc` feature it
+# installs no global allocator, so dhat-heap builds are unaffected.
+frankenterm-alloc.workspace = true
 
 # Vendored FrankenTerm crates (ex-WezTerm)
 ahash.workspace = true

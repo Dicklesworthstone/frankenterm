@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""Fake ghostty-h2h-probe for scripts/test_ghostty_headless_h2h.sh.
+
+Derives a final grid from the data file's size: rows + size // 100 total rows,
+cursor at column size % cols on the last row. fake-ingest-throughput derives
+the same grid, so the two agree unless FAKE_FT_ROW_SKEW is set there.
+"""
+
+import json
+import os
+import sys
+
+
+def main() -> int:
+    opts = {"--terminal-rows": "80", "--terminal-cols": "120"}
+    data = None
+    for arg in sys.argv[1:]:
+        key, _, value = arg.partition("=")
+        if key == "--data":
+            data = value
+        elif key in opts:
+            opts[key] = value
+        else:
+            print(f"fake probe: unknown argument {arg}", file=sys.stderr)
+            return 2
+    if not data or not os.path.isfile(data):
+        print("fake probe: --data must name a file", file=sys.stderr)
+        return 2
+    rows, cols = int(opts["--terminal-rows"]), int(opts["--terminal-cols"])
+    size = os.path.getsize(data)
+    total = rows + size // 100
+    print(json.dumps({
+        "schema": "ft.bench.ghostty-h2h-probe.v1", "bytes": size, "rows": rows, "cols": cols,
+        "read_chunk": 65536, "cursor_x": size % cols, "cursor_y": rows - 1, "pending_wrap": False,
+        "total_rows": total, "wrapped_rows": total - 1, "bench_equivalent_total_rows": min(total, rows + 300),
+    }))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

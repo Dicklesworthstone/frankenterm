@@ -1400,12 +1400,14 @@ impl Line {
                 // implicitly blank
                 return;
             }
-            while cl.len() < idx {
-                // Fill out any implied blanks until we can append
-                // their intended cell content
-                Arc::make_mut(cl).append_grapheme(" ", 1, CellAttributes::blank());
-            }
-            if idx == cl.len() {
+            // A grapheme that would cluster with the previous cell cannot be
+            // appended to clustered storage; it takes the vector path below.
+            if cl.can_append_cell_at(idx, text) {
+                while cl.len() < idx {
+                    // Fill out any implied blanks until we can append
+                    // their intended cell content
+                    Arc::make_mut(cl).append_grapheme(" ", 1, CellAttributes::blank());
+                }
                 Arc::make_mut(cl).append_grapheme(text, width, attr);
                 self.invalidate_implicit_hyperlinks(seqno);
                 self.invalidate_zones();
@@ -1442,7 +1444,7 @@ impl Line {
         let CellStorage::C(cl) = &mut self.cells else {
             return false;
         };
-        if idx != cl.len() {
+        if idx != cl.len() || !cl.can_append_cell_at(idx, text) {
             return false;
         }
 
@@ -1495,12 +1497,14 @@ impl Line {
                 // implicitly blank
                 return;
             }
-            while cl.len() < idx {
-                // Fill out any implied blanks until we can append
-                // their intended cell content
-                Arc::make_mut(cl).append_grapheme(" ", 1, CellAttributes::blank());
-            }
-            if idx == cl.len() {
+            // A grapheme that would cluster with the previous cell cannot be
+            // appended to clustered storage; it takes the vector path below.
+            if cl.can_append_cell_at(idx, cell.str()) {
+                while cl.len() < idx {
+                    // Fill out any implied blanks until we can append
+                    // their intended cell content
+                    Arc::make_mut(cl).append_grapheme(" ", 1, CellAttributes::blank());
+                }
                 Arc::make_mut(cl).append(cell);
                 return;
             }
@@ -1836,6 +1840,12 @@ impl Line {
             CellStorage::V(v) => ClusteredLine::from_cell_vec(v.len(), self.visible_cells()),
             CellStorage::C(_) => return,
         };
+        // Clustered storage re-segments its text, so it may only replace
+        // cells it reproduces exactly: neighbours that cluster with each
+        // other (a split regional-indicator pair) stay in vector storage.
+        if !cv.reproduces(|| self.visible_cells()) {
+            return;
+        }
         self.cells = CellStorage::C(Arc::new(cv));
     }
 
@@ -1844,6 +1854,10 @@ impl Line {
     /// storage whose mutations may have left adjacent identical-attribute runs.
     pub fn canonicalize_scrollback_storage(&mut self) {
         let clustered = ClusteredLine::from_cell_vec(self.len(), self.visible_cells());
+        // See compress_for_scrollback: keep cells clustering cannot reproduce.
+        if !clustered.reproduces(|| self.visible_cells()) {
+            return;
+        }
         self.cells = CellStorage::C(Arc::new(clustered));
     }
 
@@ -6143,19 +6157,36 @@ mod tests {
             "aaaa bbbb cccc dddddddd eeeeeeee 界 e\u{301} 🚀 ".repeat(16)
         );
         let model = MonospaceKpCostModel::terminal_default();
-        let line: Line = text.as_str().into();
-        let report = line.wrap_with_report(14, SEQ_ZERO, model);
-        let reconstructed: String = report
-            .lines
-            .iter()
-            .map(|row| row.as_str().into_owned())
-            .collect();
-        assert_eq!(reconstructed, text);
-        assert_eq!(report.scorecard.mode, MonospaceWrapMode::Dp);
-        assert!(report.scorecard.estimated_states > model.max_dp_states);
-        assert!(report.scorecard.evaluated_states <= model.max_dp_states);
-        assert!(report.scorecard.selected_total_cost < report.scorecard.greedy_total_cost);
-        assert_eq!(report.scorecard.selected_forced_breaks, 0);
+        // ft-eyp5a: at 14 columns no wrap of this input beats greedy. A
+        // separator that fits must stay on its row, so the paragraph opens
+        // with an unavoidable slack-4 row, and every later 41-column period
+        // tiles as 14 + 14 + 13. An exhaustive search of this cost model
+        // gives 278 for both. At 15 columns the optimum (779) is strictly
+        // below greedy (1047). The bounded search must find a strict gain
+        // where one exists and tie greedy, never lose to it, where none does.
+        for (width, strictly_better) in [(15, true), (14, false)] {
+            let line: Line = text.as_str().into();
+            let report = line.wrap_with_report(width, SEQ_ZERO, model);
+            let reconstructed: String = report
+                .lines
+                .iter()
+                .map(|row| row.as_str().into_owned())
+                .collect();
+            assert_eq!(reconstructed, text);
+            assert_eq!(report.scorecard.mode, MonospaceWrapMode::Dp);
+            assert!(report.scorecard.estimated_states > model.max_dp_states);
+            assert!(report.scorecard.evaluated_states <= model.max_dp_states);
+            assert!(report.scorecard.selected_total_cost <= report.scorecard.greedy_total_cost);
+            assert_eq!(
+                report.scorecard.selected_total_cost < report.scorecard.greedy_total_cost,
+                strictly_better,
+                "width {}: selected {} greedy {}",
+                width,
+                report.scorecard.selected_total_cost,
+                report.scorecard.greedy_total_cost
+            );
+            assert_eq!(report.scorecard.selected_forced_breaks, 0);
+        }
     }
 
     #[test]

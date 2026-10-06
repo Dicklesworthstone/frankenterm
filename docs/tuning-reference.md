@@ -351,3 +351,76 @@ If you are tuning a live deployment and do not know where to start, use this ord
 6. `wezterm`, `wire_protocol`, and `ipc`: only when backend or transport diagnostics point there.
 
 The default configuration is intentionally conservative. For most fleets, the right first move is to leave most keys alone and adjust only the small set of knobs tied to the subsystem that is already showing stress.
+
+## GUI Performance Advisories (`FT-TUNE` codes)
+
+These advisories cover the GUI config (`frankenterm.lua`, `wezterm.lua` or `frankenterm.toml`), not `ft.toml`. Each one names a setting that costs throughput or responsiveness without any other sign. The codes are stable and are never reused.
+
+Where they appear:
+
+- **GUI startup log.** The GUI logs one `warn` line per advisory, in the form `FT-TUNE-000N <setting>: <what it costs> Fix: <change> (<this page>)`. It judges `max_fps` against the fastest screen it sees.
+- **`ft doctor`.** Each advisory is a `performance config (<setting>)` warning row. In `--json`, the row carries a `code` field. The `config_tuning` block lists the inputs, where they came from, and every advisory with its `code`, `subject`, `detail`, `remediation` and `docs`.
+
+Where `ft doctor` gets the settings:
+
+- **From a running GUI.** A GUI publishes the settings it actually evaluated, and its fastest display, to `gui-tuning-<pid>.json` in the runtime directory. It republishes on config reload. Doctor trusts that file only while the same GUI's resource snapshot is fresh.
+- **From the config file.** With no running GUI, doctor reads the first config file the GUI would load, as text, and never executes it. It reads `name = value` assignments. Integer values may be products such as `512 * 1024`. An assignment that shares a line with an `if` is not read. A computed value, for example from a function call, is not guessed.
+- **Installed GUI version.** On macOS, the GUI version also comes from an installed `FrankenTerm.app` bundle.
+
+The rules are implemented in `frankenterm/config/src/tuning.rs`.
+
+### FT-TUNE-0001
+
+**`mux_output_parser_buffer_size` above 128 KiB**
+
+- **Trigger:** `mux_output_parser_buffer_size` is larger than its 128 KiB (`131072`) default.
+- **Cost:**
+  - Each pty read takes up to this many bytes, and the parsed batch is applied while the pane's terminal lock is held. A larger buffer means longer lock holds, and paint, mouse and resize all wait behind them.
+  - Output that backed up during any stall arrives in bursts of this size.
+  - A 512 KiB buffer makes every such burst four times the default.
+- **Fix:** remove the setting, or set it to `131072` or less.
+- **Tradeoff:** a larger buffer trims per-read overhead on a flood, but the extra lock time lands on the GUI thread.
+
+### FT-TUNE-0002
+
+**`max_fps` below the display's refresh rate**
+
+- **Trigger:** `max_fps` is below the refresh rate of the fastest screen the GUI reported.
+  - Without a running GUI, doctor cannot see the display and compares against 60 Hz, the `max_fps` default.
+  - The default `60` on a 120 Hz ProMotion display also trips this rule.
+- **Cost:** repaints are capped at `max_fps`, so output and typing echo reach the screen at most that many times a second. A 30 fps cap on a 60 Hz display halves the visible frame rate.
+- **Fix:** set `max_fps` to the refresh rate named in the advisory, for example `max_fps = 120`.
+- **Tradeoff:** a lower cap can save GPU work on battery. Make that choice deliberately, not as a leftover setting.
+
+### FT-TUNE-0003
+
+**Very large scrollback with tiering disabled**
+
+- **Trigger:** `scrollback_tiered_enabled = false` and `scrollback_lines` above 10,000.
+- **Cost:**
+  - Without tiering, every scrollback line of every pane stays in memory as a full line.
+  - A resize rewraps every one of those lines, so memory and resize time grow with `scrollback_lines` times the pane count.
+- **Fix:** set `scrollback_tiered_enabled = true` (the default), or lower `scrollback_lines` to 10,000 or less.
+  - With tiering, the newest `scrollback_hot_lines` lines (default 1,000) stay hot and older lines move to the warm and cold tiers.
+- **Tradeoff:** an untiered buffer avoids tier transitions entirely. The 10,000-line threshold is a heuristic, about three times the 3,500-line default.
+
+### FT-TUNE-0004
+
+**A front end that renders on the CPU**
+
+- **Trigger:** either of these, on every platform:
+  - `front_end = "Software"`, a software (CPU) OpenGL renderer;
+  - `front_end = "WebGpu"` with `webgpu_force_fallback_adapter = true`, which makes wgpu use its fallback adapter, generally a software implementation.
+- **Cost:** every frame is drawn on the CPU, which competes with the parser and the shell for the same cores.
+- **Fix:** remove `front_end` to use the default GPU renderer (OpenGL), or set `front_end = "WebGpu"`. Set `webgpu_force_fallback_adapter = false` (the default).
+- **Tradeoff:** a software renderer is a workaround for broken GPU drivers. Keep it only while that problem exists.
+- **Platform rows:** none yet. When a measurement shows a GPU front end slower on a given platform, add a platform row in `tuning.rs` and here. The Metal default switch is ft-yccm0.4.8.
+
+### FT-TUNE-0005
+
+**The GUI is older than `ft`**
+
+- **Trigger:** the GUI's release is older than the `ft` that runs doctor, compared as semantic versions (`0.15.6-rc.53` is older than `0.15.21`). The GUI version comes from the running GUI if one published it, otherwise from an installed `FrankenTerm.app` bundle.
+- **Cost:** the GUI runs without every change released after its version, including ingest, rendering and durability fixes.
+- **Fix:** install `FrankenTerm.app` from the same release as `ft` (`install.sh --version <ft's version>`), then restart FrankenTerm.
+- **Tradeoff:** none. Two builds of the same version that differ only by commit are not ordered, and are not reported.

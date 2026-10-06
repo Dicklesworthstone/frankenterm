@@ -1588,6 +1588,17 @@ impl BackgroundLoadCoordinator {
         }
     }
 
+    /// True when no requested background load is waiting to be loaded or
+    /// applied: the window's background layers are final. A request sets
+    /// `current` and only the main-thread apply (or a cancel) clears it, so a
+    /// frame drawn while this is false may still lack the configured
+    /// background (ft-yccm0.1.10 snapshots wait for it).
+    pub(crate) fn is_settled(&self) -> bool {
+        lock_cache(&self.state, "background load coordinator")
+            .current
+            .is_none()
+    }
+
     pub(crate) fn cancel(&self) {
         let mut state = lock_cache(&self.state, "background load coordinator");
         if let Some(current) = state.current.take() {
@@ -3186,6 +3197,36 @@ mod tests {
         );
         assert!(cache.entries.is_empty());
         assert_eq!(cache.retained_bytes, 0);
+    }
+
+    #[test]
+    fn background_is_settled_only_once_the_requested_load_is_applied() {
+        let coordinator = BackgroundLoadCoordinator::default();
+        assert!(coordinator.is_settled(), "nothing requested");
+        let current = Arc::new(AtomicBool::new(false));
+        {
+            let mut state = lock_cache(&coordinator.state, "test coordinator");
+            state.current = Some(Arc::clone(&current));
+        }
+        assert!(!coordinator.is_settled(), "requested, not yet loaded");
+        {
+            let mut state = lock_cache(&coordinator.state, "test coordinator");
+            state.ready = Some(BackgroundLoadCompletion {
+                cancellation: Arc::clone(&current),
+                layers: Vec::new(),
+            });
+        }
+        assert!(!coordinator.is_settled(), "loaded, not yet applied");
+        assert!(coordinator.take_ready_if_current(&current).is_some());
+        assert!(coordinator.is_settled(), "applied");
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        lock_cache(&coordinator.state, "test coordinator").current = Some(Arc::clone(&cancelled));
+        coordinator.cancel();
+        assert!(
+            coordinator.is_settled(),
+            "a cancelled load leaves nothing to wait for"
+        );
     }
 
     #[test]

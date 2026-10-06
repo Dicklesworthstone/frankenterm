@@ -310,6 +310,14 @@ bitflags! {
     }
 }
 
+/// Waits until the writer thread has written everything the terminal queued
+/// for its child; the writer never blocks the terminal itself.
+fn drain_writer(term: &mut Terminal) {
+    term.writer_barrier()
+        .wait(std::time::Duration::from_secs(10))
+        .expect("terminal writer drained");
+}
+
 fn print_all_lines(term: &Terminal) {
     let screen = term.screen();
 
@@ -603,6 +611,7 @@ fn primary_device_attributes_do_not_advertise_selective_erase_without_support() 
     );
 
     term.advance_bytes("\x1b[c");
+    drain_writer(&mut term);
 
     let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
     assert_eq!(output, "\x1b[?65;4;18;22;52c");
@@ -786,6 +795,7 @@ mod osc52_policy {
                         .term
                         .advance_bytes(format!("\x1b]52;{selection}{terminator}"));
                     fixture.assert_untouched();
+                    drain_writer(&mut fixture.term);
                     assert!(fixture.output.lock().unwrap().is_empty());
                 }
             }
@@ -882,6 +892,7 @@ mod osc52_policy {
                     }
                 }
                 assert_visible_contents(&fixture.term, file!(), line!(), &["CSQ", ""]);
+                drain_writer(&mut fixture.term);
                 assert_eq!(
                     fixture.output.lock().unwrap().as_slice(),
                     b"\x1b]52;c;\x1b\\"
@@ -912,6 +923,7 @@ mod osc52_policy {
                         .term
                         .advance_bytes(format!("\x1b]52;{selection};?{terminator}"));
                     fixture.assert_untouched();
+                    drain_writer(&mut fixture.term);
                     assert_eq!(
                         fixture.output.lock().unwrap().as_slice(),
                         format!("\x1b]52;{selection};\x1b\\").as_bytes()

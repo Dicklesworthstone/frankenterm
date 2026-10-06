@@ -21,6 +21,9 @@ use frankenterm_core::wayland_direct_scanout::{
     ScanoutSupport as DirectScanoutSupport, WaylandCompositor as DirectScanoutCompositor,
     evaluate_direct_scanout,
 };
+use frankenterm_alloc::resource_ledger::{
+    GpuBufferPurpose, GpuResourceGuard, GpuResourceLedger, GpuTexturePurpose, texture_bytes,
+};
 use frankenterm_gui::glyph_quad_staging::{
     GlyphQuadSoaBuffers, GlyphQuadStagingInstance, GlyphQuadStagingVertex,
     moonshot_instanced_glyph_quads_enabled as lib_moonshot_instanced_glyph_quads_enabled,
@@ -683,6 +686,9 @@ pub struct WebGpuState {
     pub render_pipeline: wgpu::RenderPipeline,
     pub glyph_quad_instance_render_pipeline: Option<wgpu::RenderPipeline>,
     shader_uniform_buffer: wgpu::Buffer,
+    _shader_uniform_ledger: GpuResourceGuard,
+    /// One ledger entry per configured swapchain drawable (ft-yccm0.1.7).
+    drawable_ledger: RefCell<Vec<GpuResourceGuard>>,
     shader_uniform_bind_group: wgpu::BindGroup,
     #[allow(dead_code)]
     shader_uniform_bind_group_layout: wgpu::BindGroupLayout,
@@ -777,6 +783,9 @@ impl Texture2d for WebGpuTexture {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
+        // Accounted for as long as the buffer lives in this call.
+        let _readback_ledger =
+            GpuResourceLedger::global().track_buffer(GpuBufferPurpose::Readback, buffer_size);
 
         let mut encoder = self
             .device
@@ -905,6 +914,26 @@ impl WebGpuTexture {
             queue: Arc::clone(&state.queue),
         })
     }
+}
+
+/// Ledger entries for the swapchain drawables `config` asks for (ft-yccm0.1.7).
+///
+/// wgpu-core clamps `desired_maximum_frame_latency` to the backend's range
+/// (Metal: 1..=3) and wgpu-hal's Metal surface sets the layer's
+/// `maximumDrawableCount` to that latency + 1, each drawable being
+/// `width x height` texels of the surface format. This is the configured
+/// swapchain, not a measurement of what Core Animation has allocated so far.
+fn ledger_configured_drawables(config: &wgpu::SurfaceConfiguration) -> Vec<GpuResourceGuard> {
+    let count = config.desired_maximum_frame_latency.clamp(1, 3) + 1;
+    let bytes_per_texel = u64::from(config.format.block_copy_size(None).unwrap_or(4));
+    let bytes = texture_bytes(
+        u64::from(config.width),
+        u64::from(config.height),
+        bytes_per_texel,
+    );
+    (0..count)
+        .map(|_| GpuResourceLedger::global().track_texture(GpuTexturePurpose::Drawable, bytes))
+        .collect()
 }
 
 /// Compute the aligned row pitch required by wgpu copy-to-buffer readback for
@@ -1620,10 +1649,15 @@ impl WebGpuState {
             surface: RefCell::new(surface),
             device,
             queue,
+            drawable_ledger: RefCell::new(ledger_configured_drawables(&config)),
             config: RefCell::new(config),
             dimensions: RefCell::new(dimensions),
             render_pipeline,
             glyph_quad_instance_render_pipeline,
+            _shader_uniform_ledger: GpuResourceLedger::global().track_buffer(
+                GpuBufferPurpose::Uniform,
+                shader_uniform_buffer.size(),
+            ),
             shader_uniform_buffer,
             shader_uniform_bind_group,
             handle,
@@ -1633,6 +1667,15 @@ impl WebGpuState {
             texture_linear_sampler,
             needs_force_configure: Cell::new(false),
         })
+    }
+
+    /// Re-account the swapchain drawables after a configure applied `config`.
+    fn record_configured_surface(&self, config: wgpu::SurfaceConfiguration) {
+        // Register the new drawables before releasing the old ones so the
+        // ledger's peak reflects the overlap a reconfigure can cause.
+        let drawables = ledger_configured_drawables(&config);
+        *self.config.borrow_mut() = config;
+        *self.drawable_ledger.borrow_mut() = drawables;
     }
 
     pub fn update_uniform(&self, uniform: ShaderUniform) {
@@ -1750,7 +1793,7 @@ impl WebGpuState {
             let surface = self.surface.borrow();
             surface.configure(&self.device, &next);
         }
-        *self.config.borrow_mut() = next;
+        self.record_configured_surface(next);
         self.needs_force_configure.set(false);
         Ok(SurfaceConfigureOutcome::Ready)
     }
@@ -1847,7 +1890,7 @@ impl WebGpuState {
         // configure precondition.
         candidate.configure(&self.device, &next);
         let old = self.surface.replace(candidate);
-        *self.config.borrow_mut() = next;
+        self.record_configured_surface(next);
         *self.dimensions.borrow_mut() = dims;
         self.needs_force_configure.set(false);
         drop(old);
@@ -1915,6 +1958,42 @@ mod tests {
     };
     use std::collections::VecDeque;
     use std::sync::mpsc;
+
+    /// ft-yccm0.1.7: drawables are accounted as wgpu-hal Metal configures
+    /// them: clamp(latency, 1..=3) + 1 images of width x height texels.
+    #[test]
+    fn configured_drawables_follow_the_metal_frame_latency_rule() {
+        use super::ledger_configured_drawables;
+        use frankenterm_alloc::resource_ledger::{GpuResourceLedger, GpuTexturePurpose};
+
+        let config = |latency, format| wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width: 1600,
+            height: 1000,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![],
+            desired_maximum_frame_latency: latency,
+        };
+        let live = || {
+            GpuResourceLedger::global()
+                .texture_counter(GpuTexturePurpose::Drawable)
+                .live_count
+        };
+        let before = live();
+        for (latency, expected) in [(0, 2), (1, 2), (2, 3), (3, 4), (9, 4)] {
+            let drawables =
+                ledger_configured_drawables(&config(latency, wgpu::TextureFormat::Bgra8Unorm));
+            assert_eq!(drawables.len(), expected, "latency {latency}");
+            assert!(drawables.iter().all(|guard| guard.bytes() == 1600 * 1000 * 4));
+        }
+        let wide = ledger_configured_drawables(&config(2, wgpu::TextureFormat::Rgba16Float));
+        assert!(wide.iter().all(|guard| guard.bytes() == 1600 * 1000 * 8));
+        drop(wide);
+        assert_eq!(live(), before, "dropped drawables leave the ledger");
+    }
     use std::time::{Duration, Instant};
     use window::Dimensions;
     use window::bitmaps::{BitmapImage, Image};

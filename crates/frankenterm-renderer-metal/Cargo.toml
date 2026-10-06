@@ -1,0 +1,84 @@
+[package]
+name = "frankenterm-renderer-metal"
+description = "Native Metal renderer for the FrankenTerm GUI on macOS"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["terminal", "frankenterm", "metal", "renderer"]
+categories = ["rendering"]
+
+# Audited native/FFI exception (AGENTS.md "Unsafe code"). The workspace lint
+# table forbids unsafe_code, and a forbid cannot be relaxed per item, so this
+# crate carries its own table: unsafe_code is denied crate-wide and each
+# audited block opts in with a narrow #[allow(unsafe_code)] plus a SAFETY
+# comment that names its UNSAFE-CONTRACT category (see src/lib.rs).
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+
+[dependencies]
+raw-window-handle.workspace = true
+
+# Same objc2 family versions the workspace already resolves (objc2 0.6.4, the
+# 0.3.2 framework crates, block2 0.6.2). The Metal 3 features match what
+# wgpu-hal already enables (including block2, MTLEvent and MTLResidencySet);
+# the MTL4* features add the Metal 4 bindings for the frame-slot submission
+# path (ft-yccm0.4.2.1). frankenterm-alloc (no default features: no global
+# allocator) receives the frame-slot buffers in its GPU resource ledger.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2.workspace = true
+frankenterm-alloc.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "MTL4ArgumentTable",
+    "MTL4CommandAllocator",
+    "MTL4CommandBuffer",
+    "MTL4CommandEncoder",
+    "MTL4CommandQueue",
+    "MTL4CommitFeedback",
+    "MTL4RenderCommandEncoder",
+    "MTL4RenderPass",
+    "MTLAllocation",
+    "MTLBlitCommandEncoder",
+    "MTLBuffer",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLDevice",
+    "MTLDrawable",
+    "MTLEvent",
+    "MTLGPUAddress",
+    "MTLPixelFormat",
+    "MTLRenderCommandEncoder",
+    "MTLRenderPass",
+    "MTLResidencySet",
+    "MTLResource",
+    "MTLTexture",
+    "MTLTypes",
+] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "objc2-metal",
+    "CALayer",
+    "CAMetalLayer",
+] }

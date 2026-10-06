@@ -783,6 +783,14 @@ impl std::fmt::Debug for HeapQuadAllocator {
 }
 
 impl HeapQuadAllocator {
+    /// Heap bytes held by the three quad vectors (capacity x quad size) for
+    /// the cache-gauge ledger (ft-yccm0.1.7). Rare boxed per-quad vertex
+    /// streams are not included.
+    pub fn accounted_bytes(&self) -> u64 {
+        let quads = self.layer0.capacity() + self.layer1.capacity() + self.layer2.capacity();
+        (quads * std::mem::size_of::<BoxedQuad>()) as u64
+    }
+
     pub fn apply_to(&self, other: &mut TripleLayerQuadAllocator) -> anyhow::Result<()> {
         let start = std::time::Instant::now();
         for (layer_num, quads) in [(0, &self.layer0), (1, &self.layer1), (2, &self.layer2)] {

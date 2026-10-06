@@ -41,6 +41,162 @@ impl TerminalState {
     pub fn pending_tmux_title_bytes(&self) -> usize {
         self.accumulating_title.as_ref().map_or(0, String::len)
     }
+
+    /// Every mode and register that shapes how later output is applied, as
+    /// `(name, value)` pairs in a fixed order. Most of them are otherwise
+    /// private, including the pending-wrap flag. The differential engine
+    /// harness (ft-yccm0.1.8) compares this between engines after every
+    /// chunk; seqnos and internal fast-path flags are deliberately left out.
+    pub fn mode_snapshot(&self) -> Vec<(&'static str, String)> {
+        fn sorted<K: Ord + std::fmt::Debug, V: std::fmt::Debug>(
+            entries: impl Iterator<Item = (K, V)>,
+        ) -> String {
+            let mut entries: Vec<(K, V)> = entries.collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            format!("{:?}", entries)
+        }
+
+        // A saved cursor records the seqno of the batch that saved it, and
+        // engines count batches differently (`advance_bytes` bumps the seqno
+        // for every call, `perform_actions` skips empty batches). Zero it as
+        // the live cursor's is; position, wrap state, pen, origin mode and
+        // charsets are still compared.
+        fn saved_cursor(saved: &Option<super::SavedCursor>) -> String {
+            let normalized = saved.as_ref().map(|saved| {
+                let mut saved = saved.clone();
+                saved.position.seqno = 0;
+                saved
+            });
+            format!("{:?}", normalized)
+        }
+
+        vec![
+            ("wrap_next", format!("{:?}", self.wrap_next)),
+            ("insert", format!("{:?}", self.insert)),
+            ("dec_auto_wrap", format!("{:?}", self.dec_auto_wrap)),
+            ("dec_origin_mode", format!("{:?}", self.dec_origin_mode)),
+            (
+                "reverse_wraparound_mode",
+                format!("{:?}", self.reverse_wraparound_mode),
+            ),
+            (
+                "reverse_video_mode",
+                format!("{:?}", self.reverse_video_mode),
+            ),
+            (
+                "top_and_bottom_margins",
+                format!("{:?}", self.top_and_bottom_margins),
+            ),
+            (
+                "left_and_right_margins",
+                format!("{:?}", self.left_and_right_margins),
+            ),
+            (
+                "left_and_right_margin_mode",
+                format!("{:?}", self.left_and_right_margin_mode),
+            ),
+            ("newline_mode", format!("{:?}", self.newline_mode)),
+            (
+                "saved_dec_private_modes",
+                sorted(self.saved_dec_private_modes.iter()),
+            ),
+            (
+                "application_cursor_keys",
+                format!("{:?}", self.application_cursor_keys),
+            ),
+            (
+                "application_keypad",
+                format!("{:?}", self.application_keypad),
+            ),
+            ("modify_other_keys", format!("{:?}", self.modify_other_keys)),
+            ("dec_ansi_mode", format!("{:?}", self.dec_ansi_mode)),
+            ("bracketed_paste", format!("{:?}", self.bracketed_paste)),
+            ("focus_tracking", format!("{:?}", self.focus_tracking)),
+            ("mouse_tracking", format!("{:?}", self.mouse_tracking)),
+            (
+                "button_event_mouse",
+                format!("{:?}", self.button_event_mouse),
+            ),
+            ("any_event_mouse", format!("{:?}", self.any_event_mouse)),
+            ("mouse_encoding", format!("{:?}", self.mouse_encoding)),
+            ("cursor_visible", format!("{:?}", self.cursor_visible)),
+            ("keyboard_encoding", format!("{:?}", self.keyboard_encoding)),
+            (
+                "synchronized_output",
+                format!("{:?}", self.synchronized_output),
+            ),
+            (
+                "sixel_display_mode",
+                format!("{:?}", self.sixel_display_mode),
+            ),
+            (
+                "sixel_scrolls_right",
+                format!("{:?}", self.sixel_scrolls_right),
+            ),
+            (
+                "use_private_color_registers_for_each_graphic",
+                format!("{:?}", self.use_private_color_registers_for_each_graphic),
+            ),
+            ("color_map", sorted(self.color_map.iter())),
+            ("g0_charset", format!("{:?}", self.g0_charset)),
+            ("g1_charset", format!("{:?}", self.g1_charset)),
+            ("shift_out", format!("{:?}", self.shift_out)),
+            (
+                "tab_stops",
+                format!("{:?} width {}", self.tabs.tabs, self.tabs.tab_width),
+            ),
+            ("pen", format!("{:?}", self.pen)),
+            (
+                "alt_screen_active",
+                format!("{:?}", self.screen.alt_screen_is_active),
+            ),
+            (
+                "saved_cursor_primary",
+                saved_cursor(&self.screen.screen.saved_cursor),
+            ),
+            (
+                "saved_cursor_alt",
+                saved_cursor(&self.screen.alt_screen.saved_cursor),
+            ),
+            (
+                "keyboard_stack_primary",
+                format!("{:?}", self.screen.screen.keyboard_stack),
+            ),
+            (
+                "keyboard_stack_alt",
+                format!("{:?}", self.screen.alt_screen.keyboard_stack),
+            ),
+            ("title", format!("{:?}", self.title)),
+            ("icon_title", format!("{:?}", self.icon_title)),
+            (
+                "accumulating_title",
+                format!("{:?}", self.accumulating_title),
+            ),
+            (
+                "suppress_initial_title_change",
+                format!("{:?}", self.suppress_initial_title_change),
+            ),
+            ("progress", format!("{:?}", self.progress)),
+            ("current_dir", format!("{:?}", self.current_dir)),
+            ("user_vars", sorted(self.user_vars.iter())),
+            ("palette_override", format!("{:?}", self.palette)),
+            ("unicode_version", format!("{:?}", self.unicode_version)),
+            (
+                "unicode_version_stack",
+                format!("{:?}", self.unicode_version_stack),
+            ),
+            (
+                "clear_semantic_attribute_on_newline",
+                format!("{:?}", self.clear_semantic_attribute_on_newline),
+            ),
+            (
+                "last_semantic_command_status",
+                format!("{:?}", self.last_semantic_command_status),
+            ),
+            ("bidi_enabled", format!("{:?}", self.bidi_enabled)),
+            ("bidi_hint", format!("{:?}", self.bidi_hint)),
+        ]
+    }
 }
 
 /// A helper struct for implementing `vtparse::VTActor` while compartmentalizing
@@ -48,6 +204,28 @@ impl TerminalState {
 pub(crate) struct Performer<'a> {
     pub state: &'a mut TerminalState,
     print: String,
+    /// The cell the print path wrote last. While set, only printing and SGR
+    /// have run since, so the cursor still sits just past that cell (on it
+    /// when a wrap is pending) and the cell is the one `recluster_at_cursor`
+    /// would find left of the cursor.
+    last_printed: Option<PrintedCell>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PrintedCell {
+    y: VisibleRowIndex,
+    idx: usize,
+    width: usize,
+    ends_in_zwj: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Disables the `last_printed` shortcut so `recluster_at_cursor` always
+    /// walks the row: the oracle the shortcut is checked against.
+    static FORCE_RECLUSTER_ROW_WALK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Row walks `recluster_at_cursor` started on this thread.
+    static RECLUSTER_ROW_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -104,7 +282,47 @@ impl<'a> Performer<'a> {
         Self {
             state,
             print: String::new(),
+            last_printed: None,
         }
+    }
+
+    /// Records the cell the print path just wrote; see `last_printed`.
+    fn note_printed(&mut self, y: VisibleRowIndex, idx: usize, width: usize, ends_in_zwj: bool) {
+        // `Line` drops a write that would end past column u16::MAX. Such a
+        // cell was never stored, so it must not be remembered either.
+        self.last_printed =
+            (idx.saturating_add(width) <= usize::from(u16::MAX)).then_some(PrintedCell {
+                y,
+                idx,
+                width,
+                ends_in_zwj,
+            });
+    }
+
+    /// Whether `last_printed` is the cell left of the cursor and does not end
+    /// in ZWJ, in which case no multi-byte grapheme can continue it. Widths
+    /// never exceed two, so writing a cell invalidates any wide cell it
+    /// overlapped; the remembered cell is therefore visible, and with the
+    /// cursor just past it (or on it with a wrap pending) it is exactly the
+    /// candidate the row walk would pick.
+    fn last_printed_rules_out_zwj_tail(
+        &self,
+        cursor_x: usize,
+        cursor_y: VisibleRowIndex,
+        pending_wrap: bool,
+    ) -> bool {
+        #[cfg(test)]
+        if FORCE_RECLUSTER_ROW_WALK.with(std::cell::Cell::get) {
+            return false;
+        }
+        self.last_printed.is_some_and(|cell| {
+            let beside_cursor = if pending_wrap {
+                cell.idx == cursor_x
+            } else {
+                cell.idx.saturating_add(cell.width) == cursor_x
+            };
+            cell.y == cursor_y && beside_cursor && !cell.ends_in_zwj
+        })
     }
 
     fn recluster_at_cursor(&mut self, suffix: &str, require_prior_trailing_zwj: bool) -> bool {
@@ -114,6 +332,17 @@ impl<'a> Performer<'a> {
         let pending_wrap = self.wrap_next;
         let dec_auto_wrap = self.dec_auto_wrap;
         let right_margin = self.left_and_right_margins.end;
+
+        // ft-yccm0.2.14: once a ZWJ-tail cell has existed, `print` asks about
+        // every multi-byte grapheme. Answer from the cell just printed instead
+        // of walking the row from column 0 whenever that settles it.
+        if require_prior_trailing_zwj
+            && self.last_printed_rules_out_zwj_tail(cursor_x, cursor_y, pending_wrap)
+        {
+            return false;
+        }
+        #[cfg(test)]
+        RECLUSTER_ROW_WALKS.with(|walks| walks.set(walks.get() + 1));
 
         // `print` calls this for every multi-byte grapheme, so the common
         // outcome (a standalone emoji or CJK character that cannot continue
@@ -167,7 +396,8 @@ impl<'a> Performer<'a> {
             return false;
         }
 
-        if combined.ends_with('\u{200d}') {
+        let ends_in_zwj = combined.ends_with('\u{200d}');
+        if ends_in_zwj {
             self.zwj_tail_cell_possible = true;
         }
         let (cursor_x, wrap_next) = {
@@ -186,6 +416,7 @@ impl<'a> Performer<'a> {
 
         self.cursor.x = cursor_x;
         self.wrap_next = wrap_next;
+        self.note_printed(cursor_y, idx, combined_width, ends_in_zwj);
         true
     }
 
@@ -324,6 +555,7 @@ impl<'a> Performer<'a> {
             self.cursor.x = next_x;
             self.wrap_next = false;
         }
+        self.note_printed(y, next_x - 1, 1, false);
         true
     }
 
@@ -388,7 +620,7 @@ impl<'a> Performer<'a> {
         let normalized: String;
         let text = if p.is_ascii() {
             p.as_str()
-        } else if self.config.normalize_output_to_unicode_nfc()
+        } else if self.batch_config.normalize_output_to_unicode_nfc
             && is_nfc_quick(p.chars()) != IsNormalized::Yes
         {
             normalized = p.as_str().nfc().collect();
@@ -519,11 +751,13 @@ impl<'a> Performer<'a> {
                 g,
                 self.pen
             );
-            if g.ends_with('\u{200d}') {
+            let ends_in_zwj = g.ends_with('\u{200d}');
+            if ends_in_zwj {
                 self.zwj_tail_cell_possible = true;
             }
             self.screen_mut()
                 .set_cell_grapheme(x, y, g, print_width, pen, seqno);
+            self.note_printed(y, x, print_width, ends_in_zwj);
 
             if !wrappable {
                 self.cursor.x = next_x;
@@ -566,6 +800,21 @@ impl<'a> Performer<'a> {
                 _ => {}
             }
         }
+        // Printing only buffers text, and SGR only changes the pen. Every other
+        // action may move the cursor, scroll, or rewrite the cell
+        // `last_printed` names, so it is forgotten once that action has run
+        // (actions flush pending print first, which records a new cell).
+        let keeps_last_printed = matches!(
+            action,
+            Action::Print(_) | Action::PrintString(_) | Action::CSI(CSI::Sgr(_))
+        );
+        self.perform_action(action);
+        if !keeps_last_printed {
+            self.last_printed = None;
+        }
+    }
+
+    fn perform_action(&mut self, action: Action) {
         match action {
             Action::Print(c) => self.print(c),
             Action::PrintString(s) => self.print_string(&s),
@@ -675,7 +924,8 @@ impl<'a> Performer<'a> {
     /// Draw a character to the screen
     fn print(&mut self, c: char) {
         // We buffer up the chars to increase the chances of correctly grouping graphemes into cells
-        let max_title_len = self.config.max_accumulating_title_len();
+        // Read once per batch, not per character (ft-yccm0.2.4).
+        let max_title_len = self.batch_config.max_accumulating_title_len;
         if let Some(title) = self.accumulating_title.as_mut() {
             if title
                 .len()
@@ -1825,13 +2075,203 @@ mod tests {
         }
     }
 
+    /// ft-yccm0.2.4: a configuration whose hot getters count their calls and
+    /// whose values can change between batches, as the GUI's `TermConfig`
+    /// values do under one shared `Arc`.
+    #[derive(Debug)]
+    struct LiveConfig {
+        scrollback: std::sync::atomic::AtomicUsize,
+        title_cap: std::sync::atomic::AtomicUsize,
+        bidi: std::sync::atomic::AtomicBool,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl LiveConfig {
+        fn new(scrollback: usize) -> Arc<Self> {
+            Arc::new(Self {
+                scrollback: std::sync::atomic::AtomicUsize::new(scrollback),
+                title_cap: std::sync::atomic::AtomicUsize::new(8192),
+                bidi: std::sync::atomic::AtomicBool::new(false),
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn read(&self) {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.swap(0, std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl TerminalConfiguration for LiveConfig {
+        fn scrollback_size(&self) -> usize {
+            self.read();
+            self.scrollback.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn scrollback_tier_config(&self) -> ScrollbackTierConfig {
+            self.read();
+            ScrollbackTierConfig {
+                enabled: false,
+                hot_lines: self
+                    .scrollback
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .max(1),
+                warm_max_bytes: 0,
+            }
+        }
+
+        fn max_accumulating_title_len(&self) -> usize {
+            self.read();
+            self.title_cap.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn normalize_output_to_unicode_nfc(&self) -> bool {
+            self.read();
+            false
+        }
+
+        fn bidi_mode(&self) -> crate::config::BidiMode {
+            self.read();
+            crate::config::BidiMode {
+                enabled: self.bidi.load(std::sync::atomic::Ordering::SeqCst),
+                hint: ParagraphDirectionHint::LeftToRight,
+            }
+        }
+
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+    }
+
+    fn live_terminal(config: &Arc<LiveConfig>) -> Terminal {
+        Terminal::new(
+            TerminalSize {
+                rows: 8,
+                cols: 40,
+                pixel_width: 320,
+                pixel_height: 128,
+                dpi: 96,
+            },
+            Arc::clone(config) as Arc<dyn TerminalConfiguration + Send + Sync>,
+            "WezTerm",
+            "test",
+            Box::new(Vec::new()),
+        )
+    }
+
+    fn numbered_lines(count: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for line in 0..count {
+            bytes.extend_from_slice(format!("line {line:04} xxxxxxxxxxxxxxxxxxxx\r\n").as_bytes());
+        }
+        bytes
+    }
+
+    /// ft-yccm0.2.4: printing and scrolling read the configuration once per
+    /// batch, not per character or per row, so the count is independent of
+    /// the batch's size.
+    #[test]
+    fn hot_config_is_read_per_batch_not_per_character_or_row() {
+        let config = LiveConfig::new(16);
+        let mut term = live_terminal(&config);
+        config.reads();
+
+        // About 6,600 printed characters and 200 scrolls, most evicting.
+        term.advance_bytes(numbered_lines(200));
+        let one_batch = config.reads();
+        assert!(
+            one_batch <= 16,
+            "{} configuration reads for one batch",
+            one_batch
+        );
+
+        term.advance_bytes(numbered_lines(400));
+        let double_batch = config.reads();
+        assert!(
+            double_batch <= 16,
+            "{} configuration reads for a batch twice the size",
+            double_batch
+        );
+
+        // The two-stage path refreshes once per batch as well.
+        let mut parser = frankenterm_escape_parser::parser::Parser::new();
+        term.perform_actions(parser.parse_as_vec(&numbered_lines(200)));
+        let two_stage = config.reads();
+        assert!(two_stage <= 16, "{} reads for perform_actions", two_stage);
+    }
+
+    /// ft-yccm0.2.4: a changed configuration takes effect at the next batch.
+    #[test]
+    fn hot_config_changes_take_effect_at_the_next_batch() {
+        let config = LiveConfig::new(16);
+        let mut term = live_terminal(&config);
+        term.advance_bytes(numbered_lines(40));
+        assert_eq!(term.screen().scrollback_rows(), 8 + 16);
+
+        config
+            .scrollback
+            .store(4, std::sync::atomic::Ordering::SeqCst);
+        term.advance_bytes(b"one more\r\n");
+        assert_eq!(term.screen().scrollback_rows(), 8 + 4);
+
+        term.advance_bytes(b"\x1bkabc");
+        assert_eq!(term.pending_tmux_title_bytes(), 3);
+        config
+            .title_cap
+            .store(4, std::sync::atomic::Ordering::SeqCst);
+        term.advance_bytes(b"de");
+        assert_eq!(
+            term.pending_tmux_title_bytes(),
+            0,
+            "the lowered cap discards the title in the next batch"
+        );
+
+        let cursor_row_bidi = |term: &Terminal| {
+            let screen = term.screen();
+            let row = screen.phys_row(term.cursor_pos().y);
+            let mut enabled = None;
+            screen.with_phys_lines(row..row + 1, |lines| {
+                enabled = Some(lines[0].bidi_info().0);
+            });
+            enabled.expect("the cursor row exists")
+        };
+        config.bidi.store(true, std::sync::atomic::Ordering::SeqCst);
+        term.advance_bytes(b"\x1b[2K");
+        assert!(cursor_row_bidi(&term), "erase applies the new bidi mode");
+        config
+            .bidi
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        term.advance_bytes(b"\x1b[2K");
+        assert!(!cursor_row_bidi(&term));
+    }
+
+    struct RowWalkOverride;
+
+    impl RowWalkOverride {
+        fn set(force_walk: bool) -> Self {
+            FORCE_RECLUSTER_ROW_WALK.with(|force| force.set(force_walk));
+            Self
+        }
+    }
+
+    impl Drop for RowWalkOverride {
+        fn drop(&mut self) {
+            FORCE_RECLUSTER_ROW_WALK.with(|force| force.set(false));
+        }
+    }
+
     /// ft-yccm0.2.11: `print` skips the multi-byte continuation scan while no
-    /// cell can end in ZWJ. Forcing `zwj_tail_cell_possible` on restores the
-    /// unconditional scan, so identical terminals prove the gate is exact.
-    /// Streams mix emoji, ZWJ, VS16, combining marks, regional indicators,
-    /// CJK, SGR changes, line breaks, cursor moves and erases, and each one is
-    /// split at a varying byte so continuations also cross `advance_bytes`
-    /// calls.
+    /// cell can end in ZWJ. Forcing `zwj_tail_cell_possible` on and disabling
+    /// the ft-yccm0.2.14 last-printed shortcut restores the unconditional row
+    /// walk, so identical terminals prove both the gate and the shortcut
+    /// exact. Streams mix emoji, ZWJ, VS16, skin-tone modifiers, combining
+    /// marks, regional indicators, CJK, SGR changes, line breaks, cursor
+    /// moves, erases, insertions, deletions and scrolls (which rewrite the
+    /// cursor row without moving the cursor), and each one is split at two
+    /// varying bytes so continuations also cross `advance_bytes` calls.
     #[test]
     fn zwj_tail_gate_matches_unconditional_continuation_scan() {
         use std::convert::TryFrom;
@@ -1860,6 +2300,14 @@ mod tests {
             "\x1b[K",
             "\x1b[1;5H",
             " ",
+            "\u{1F3FD}",
+            "\x1b[1K",
+            "\x1b[S",
+            "\x1b[T",
+            "\x1b[L",
+            "\x1b[M",
+            "\x1b[@",
+            "\x1b[P",
         ];
         let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
         let mut next = || {
@@ -1876,21 +2324,147 @@ mod tests {
             }
             let bytes = stream.as_bytes();
             let split = usize::try_from(next() % (bytes.len() as u64 + 1)).unwrap_or(0);
-            let run = |force_scan: bool| {
+            let second_split = split + (bytes.len() - split) / 2;
+            let run = |force_scan: bool, force_walk: bool| {
+                let _walk = RowWalkOverride::set(force_walk);
                 let mut term = make_terminal();
                 if force_scan {
                     term.zwj_tail_cell_possible = true;
                 }
                 term.advance_bytes(&bytes[..split]);
-                term.advance_bytes(&bytes[split..]);
+                term.advance_bytes(&bytes[split..second_split]);
+                term.advance_bytes(&bytes[second_split..]);
                 snapshot_terminal(&term)
             };
+            let unconditional_walk = run(true, true);
             assert_eq!(
-                run(false),
-                run(true),
+                run(false, false),
+                unconditional_walk,
                 "ZWJ-tail gate diverged from the unconditional scan in case {case}: {stream:?}"
             );
+            assert_eq!(
+                run(true, false),
+                unconditional_walk,
+                "last-printed shortcut diverged from the row walk in case {case}: {stream:?}"
+            );
         }
+    }
+
+    /// ft-yccm0.2.14 batch verify 4: the differential stream above panicked in
+    /// `Line::erase_cell_with_margin` ("removal index should be < len"). A
+    /// grapheme that clusters with the previous cell but arrives in a later
+    /// flush (a split regional-indicator pair, or a skin-tone modifier after
+    /// an emoji, as in the operator's emoji corpus) was appended to clustered
+    /// storage, which re-segmented the two cells into one, so the row's
+    /// `len()` exceeded its materialized cells. Minimized: the second scalar
+    /// in a later call or after an SGR, then CUB and DCH inside the row.
+    #[test]
+    fn zwj_tail_gate_regression_clustering_neighbours_then_dch() {
+        let cases: &[(&str, &str)] = &[("\u{1F1FA}", "\u{1F1F8}"), ("\u{1F600}", "\u{1F3FD}")];
+        for &(first, second) in cases {
+            for &gap in &["", "\x1b[38;5;1m"] {
+                for &force_walk in &[false, true] {
+                    let _walk = RowWalkOverride::set(force_walk);
+                    let mut term = make_terminal();
+                    term.advance_bytes(first.as_bytes());
+                    term.advance_bytes(format!("{gap}{second}").as_bytes());
+                    term.advance_bytes(b"\x1b[D\x1b[P");
+                    let screen = term.screen();
+                    let top = screen.physical_rows.min(screen.scrollback_rows());
+                    let row = screen.scrollback_rows() - top;
+                    screen.with_phys_lines(row..row + 1, |lines| {
+                        let line = lines[0];
+                        let widths: usize = line.visible_cells().map(|cell| cell.width()).sum();
+                        assert_eq!(
+                            line.len(),
+                            widths,
+                            "row length diverged from its cells for {first:?} {gap:?} {second:?}"
+                        );
+                        assert_eq!(
+                            line.visible_cells()
+                                .next()
+                                .map(|cell| cell.str().to_string()),
+                            Some(first.to_string())
+                        );
+                    });
+                }
+            }
+        }
+    }
+
+    /// ft-yccm0.2.14: after a ZWJ-tail cell has existed (here, a ZWJ sequence
+    /// split across calls), `zwj_tail_cell_possible` stays set, yet multi-byte
+    /// prints separated only by SGR must not walk the row: the cell printed
+    /// last answers the continuation question. The grid must match the
+    /// unconditional row walk's.
+    #[test]
+    fn multibyte_prints_after_a_zwj_tail_cell_skip_the_row_walk() {
+        let glyphs = ["😀", "🚀", "A", "中", "🫠"];
+        let mut stream = String::new();
+        for i in 0..400_usize {
+            stream.push_str(&format!(
+                "\x1b[38;5;{}m\x1b[48;5;{}m{}",
+                (i * 37) % 256,
+                (i * 101 + 7) % 256,
+                glyphs[i % glyphs.len()]
+            ));
+        }
+        let multibyte_prints = (0..400_usize)
+            .filter(|i| glyphs[i % glyphs.len()].len() > 1)
+            .count();
+
+        let run = |force_walk: bool| {
+            let _walk = RowWalkOverride::set(force_walk);
+            let mut term = make_terminal();
+            term.advance_bytes("👨\u{200D}".as_bytes());
+            assert!(term.zwj_tail_cell_possible, "a ZWJ-tail cell sets the flag");
+            term.advance_bytes(b"\r\n");
+            RECLUSTER_ROW_WALKS.with(|walks| walks.set(0));
+            // Long enough to wrap, scroll, and print with a wrap pending.
+            term.advance_bytes(stream.as_bytes());
+            let walks = RECLUSTER_ROW_WALKS.with(std::cell::Cell::get);
+            (snapshot_terminal(&term), walks)
+        };
+        let (shortcut, shortcut_walks) = run(false);
+        let (walked, walked_walks) = run(true);
+        assert_eq!(shortcut, walked, "the shortcut changed the grid");
+        assert_eq!(
+            walked_walks, multibyte_prints,
+            "the oracle walks every time"
+        );
+        // Only the call's first multi-byte print, which has no printed cell
+        // to consult yet, walks the row.
+        assert_eq!(shortcut_walks, 1, "{shortcut_walks} row walks");
+
+        // A ZWJ tail printed earlier in the same call still absorbs the next
+        // emoji: the shortcut defers to the walk for it.
+        let joined = |force_walk: bool| {
+            let _walk = RowWalkOverride::set(force_walk);
+            let mut term = make_terminal();
+            term.advance_bytes("👨\u{200D}\x1b[38;5;1m👩!".as_bytes());
+            snapshot_terminal(&term)
+        };
+        let shortcut = joined(false);
+        assert_eq!(shortcut, joined(true));
+        let top = &shortcut.all_lines[shortcut.all_lines.len() - 8];
+        assert_eq!(top.cells[0].0, "👨\u{200D}👩");
+        assert_eq!(top.cells[0].1, 2);
+        assert_eq!(top.cells[1].0, "!");
+
+        // A scroll rewrites the cursor row without moving the cursor, so the
+        // printed cell must be forgotten: here SU brings a ZWJ-tail cell up
+        // beside the cursor, and the next emoji must join it.
+        let scrolled = |force_walk: bool| {
+            let _walk = RowWalkOverride::set(force_walk);
+            let mut term = make_terminal();
+            term.advance_bytes("\x1b[2;1H👨\u{200D}".as_bytes());
+            term.advance_bytes("\x1b[1;1H😀\x1b[S👩".as_bytes());
+            snapshot_terminal(&term)
+        };
+        let shortcut = scrolled(false);
+        assert_eq!(shortcut, scrolled(true));
+        let top = &shortcut.all_lines[shortcut.all_lines.len() - 8];
+        assert_eq!(top.cells[0].0, "👨\u{200D}👩");
     }
 
     /// Round-5 D1 (ft-round5-gauntlet-lw0s7.10): the parser printable-run

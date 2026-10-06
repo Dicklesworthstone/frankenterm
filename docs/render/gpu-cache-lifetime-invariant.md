@@ -102,6 +102,38 @@ more bug surface, negative EV.
 
 ---
 
+## Per-window caches: the second instance (ft-yccm0.2.5)
+
+The same class recurred without any process-global. `TermWindow::shape_cache`
+(an `LfuCache` capped at 1,024 entries) kept HarfBuzz output across atlas
+rebuilds on purpose, but each entry also kept its resolved `ShapedInfo` sprites,
+and those were refreshed only when the entry was reused. An entry not touched
+after a rebuild pinned that generation's atlas texture (up to 256 MiB at the
+8192^2 cap) until LFU eviction, which only happens once the cache is full. This
+fits the frozen 0.15.2 GUI's ~3 GB of "owned unmapped" GPU memory.
+
+- **Fix.** The sprites are a generation-tagged `AtlasBinding` inside
+  `CachedShape`. The `AtlasResource` invalidation (`RenderCaches::invalidate`)
+  releases every binding before `RenderState` replaces the glyph cache, and
+  `CachedShape::glyphs_at` answers only for the generation it was bound at.
+  `TermWindow::recreate_texture_atlas` also drops the fancy tab bar and modal
+  elements (which hold `Rc<CachedGlyph>`) before the replacement.
+- **Lint.** Struct fields whose type mentions a cache container (`LfuCache`,
+  `HashMap`, …) are now roots too. The atlas owner's own maps (`GlyphCache`) are
+  spared. Any other GPU-reaching cache field must be listed in
+  `ALLOWED_CACHE_FIELDS` with its release site and proving test, and a stale entry
+  fails the lint.
+- **Live counter.** Atlas textures register with the GPU resource ledger
+  (`frankenterm_alloc::resource_ledger`) through `LedgeredTexture`. The
+  registration ends only when the texture itself drops, so a pinned atlas stays
+  visible. The GUI publishes the ledger into its runtime directory, and
+  `ft doctor --json` reports it under `gpu_resources`.
+- **Proof.** `termwindow::resize::tests::thousand_atlas_rebuilds_keep_live_atlas_bytes_within_twice_the_atlas_size`
+  drives 1,000 production rebuilds with never-reused shape entries and asserts
+  that live atlas bytes stay within 2x the atlas size. Its negative control,
+  `ledger_counts_an_atlas_pinned_by_a_retained_sprite_binding`, shows that the
+  ledger catches a retained binding.
+
 ## The standing rule for future caches (idea 3: weak-ref / re-resolve)
 
 When you add a cache that *needs* to reference a resource it does not own:

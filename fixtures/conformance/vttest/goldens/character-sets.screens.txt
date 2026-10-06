@@ -1,0 +1,300 @@
+# vttest/character-sets screen dumps (ft-yccm0.1.9): cursor, DECSCNM, then rows.
+# Golden expectations: change only with a recorded reason (README).
+# Screens corrected by hand where legacy is wrong (see xfail.txt): 02, 04, 06, 08, 09.
+=== 00 key ''
+cursor 21,41 visible
+screen normal
+01 ||
+02 ||
+03 |         VT100 test program, version 2.7 (20251205)|
+04 |         Screen size 24x80 (80 max)|
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Test of cursor movements|
+09 |          2. Test of screen features|
+10 |          3. Test of character sets|
+11 |          4. Test of double-sized characters|
+12 |          5. Test of keyboard|
+13 |          6. Test of terminal reports|
+14 |          7. Test of VT52 mode|
+15 |          8. Test of VT102 features (Insert/Delete Char/Line)|
+16 |          9. Test of known bugs|
+17 |          10. Test of reset and self-test|
+18 |          11. Test non-VT100 (e.g., VT220, XTERM) terminals|
+19 |          12. Modify test-parameters|
+20 ||
+21 |          Enter choice number (0 - 12):|
+22 ||
+23 ||
+24 ||
+=== 01 key '3\r'
+cursor 22,41 visible
+screen normal
+01 ||
+02 ||
+03 |         Menu 3: Character-Set Tests|
+04 ||
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Reset (G0 ASCII, G1 Latin-1, no NRC mode)|
+09 |          2. Enable highlighting of non-ISO-8859-1 mapping|
+10 |          3. Enable National Replacement Character (NRC) mode|
+11 |          4. Specify G0 (now US ASCII)|
+12 |          5. Specify G1 (now ISO Latin-1)|
+13 |          6. Specify G2 (now ISO Latin-1)|
+14 |          7. Specify G3 (now ISO Latin-1)|
+15 |          8. Test VT100 Character Sets|
+16 |          9. Test Shift In/Shift Out (SI/SO)|
+17 |          10. Test VT220 Locking Shifts|
+18 |          11. Test VT220 Single Shifts|
+19 |          12* Test Soft Character Sets|
+20 |          13. Test Keyboard Layout with G0 Selection|
+21 ||
+22 |          Enter choice number (0 - 13):|
+23 ||
+24 ||
+=== 02 key '8\r'
+cursor 24,54 visible
+screen normal
+01 |         Selected as G0 (with SI)              Selected as G1 (with SO)|
+02 ||
+03 |Character set B (US ASCII)|
+04 |          !"#$%&'()*+,-./0123456789:;<=>?       !"#$%&'()*+,-./0123456789:;<=>?|
+05 |         @ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_      @ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_|
+06 |         `abcdefghijklmnopqrstuvwxyz{|}~       `abcdefghijklmnopqrstuvwxyz{|}~|
+07 |Character set A (British)|
+08 |          !"£$%&'()*+,-./0123456789:;<=>?       !"£$%&'()*+,-./0123456789:;<=>?|
+09 |         @ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_      @ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_|
+10 |         `abcdefghijklmnopqrstuvwxyz{|}~       `abcdefghijklmnopqrstuvwxyz{|}~|
+11 |Character set 0 (DEC Special graphics and line drawing)|
+12 |          !"#$%&'()*+,-./0123456789:;<=>?       !"#$%&'()*+,-./0123456789:;<=>?|
+13 |         @ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^       @ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^|
+14 |         ◆▒␉␌␍␊°±␤␋┘┐┌└┼⎺⎻─⎼⎽├┤┴┬│≤≥π≠£·       ◆▒␉␌␍␊°±␤␋┘┐┌└┼⎺⎻─⎼⎽├┤┴┬│≤≥π≠£·|
+15 |Character set 1 (DEC Alternate character ROM standard characters)|
+16 |          !"#$%&'()*+,-./0123456789:;<=>?       !"#$%&'()*+,-./0123456789:;<=>?|
+17 |         @ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_      @ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_|
+18 |         `abcdefghijklmnopqrstuvwxyz{|}~       `abcdefghijklmnopqrstuvwxyz{|}~|
+19 |Character set 2 (DEC Alternate character ROM special graphics)|
+20 |          !"#$%&'()*+,-./0123456789:;<=>?       !"#$%&'()*+,-./0123456789:;<=>?|
+21 |         @ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_      @ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_|
+22 |         `abcdefghijklmnopqrstuvwxyz{|}~       `abcdefghijklmnopqrstuvwxyz{|}~|
+23 ||
+24 |These are the installed character sets. Push <RETURN>|
+=== 03 key '\r'
+cursor 22,41 visible
+screen normal
+01 ||
+02 ||
+03 |         Menu 3: Character-Set Tests|
+04 ||
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Reset (G0 ASCII, G1 Latin-1, no NRC mode)|
+09 |          2. Enable highlighting of non-ISO-8859-1 mapping|
+10 |          3. Enable National Replacement Character (NRC) mode|
+11 |          4. Specify G0 (now US ASCII)|
+12 |          5. Specify G1 (now ISO Latin-1)|
+13 |          6. Specify G2 (now ISO Latin-1)|
+14 |          7. Specify G3 (now ISO Latin-1)|
+15 |          8. Test VT100 Character Sets|
+16 |          9. Test Shift In/Shift Out (SI/SO)|
+17 |          10. Test VT220 Locking Shifts|
+18 |          11. Test VT220 Single Shifts|
+19 |          12* Test Soft Character Sets|
+20 |          13. Test Keyboard Layout with G0 Selection|
+21 ||
+22 |          Enter choice number (0 - 13):|
+23 ||
+24 ||
+=== 04 key '9\r'
+cursor 24,14 visible
+screen normal
+01 |         These are the G0 and G1 character sets.|
+02 ||
+03 |Character set B (US ASCII)                     Selected as G0 (with SI)|
+04 |          !"#$%&'()*+,-./0123456789:;<=>?|
+05 |         @ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_|
+06 |         `abcdefghijklmnopqrstuvwxyz{|}~|
+07 |Character set A (ISO Latin-1)                  Selected as G1 (with SO)|
+08 |          ¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿|
+09 |         ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞß|
+10 |         àáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþ|
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 |Push <RETURN>|
+=== 05 key '\r'
+cursor 22,41 visible
+screen normal
+01 ||
+02 ||
+03 |         Menu 3: Character-Set Tests|
+04 ||
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Reset (G0 ASCII, G1 Latin-1, no NRC mode)|
+09 |          2. Enable highlighting of non-ISO-8859-1 mapping|
+10 |          3. Enable National Replacement Character (NRC) mode|
+11 |          4. Specify G0 (now US ASCII)|
+12 |          5. Specify G1 (now ISO Latin-1)|
+13 |          6. Specify G2 (now ISO Latin-1)|
+14 |          7. Specify G3 (now ISO Latin-1)|
+15 |          8. Test VT100 Character Sets|
+16 |          9. Test Shift In/Shift Out (SI/SO)|
+17 |          10. Test VT220 Locking Shifts|
+18 |          11. Test VT220 Single Shifts|
+19 |          12* Test Soft Character Sets|
+20 |          13. Test Keyboard Layout with G0 Selection|
+21 ||
+22 |          Enter choice number (0 - 13):|
+23 ||
+24 ||
+=== 06 key '10\r'
+cursor 24,14 visible
+screen normal
+01 |         Locking shifts, with NRC disabled:|
+02 ||
+03 |Character set A (ISO Latin-1) in G1            Maps G1 into GR (LS1R)|
+04 |     !"#$%&'()*+,-./0123456789:;<=>?   ��������������������������������|
+05 |    @ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_   ��������������������������������|
+06 |    `abcdefghijklmnopqrstuvwxyz{|}~    ��������������������������������|
+07 |Character set A (ISO Latin-1) in G2            Maps G2 into GL (LS2)|
+08 |     ¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿   ��������������������������������|
+09 |    ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞß   ��������������������������������|
+10 |    àáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþ    ��������������������������������|
+11 |Character set A (ISO Latin-1) in G2            Maps G2 into GR (LS2R)|
+12 |     !"#$%&'()*+,-./0123456789:;<=>?   ��������������������������������|
+13 |    @ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_   ��������������������������������|
+14 |    `abcdefghijklmnopqrstuvwxyz{|}~    ��������������������������������|
+15 |Character set A (ISO Latin-1) in G3            Maps G3 into GL (LS3)|
+16 |     ¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿   ��������������������������������|
+17 |    ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞß   ��������������������������������|
+18 |    àáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþ    ��������������������������������|
+19 |Character set A (ISO Latin-1) in G3            Maps G3 into GR (LS3R)|
+20 |     !"#$%&'()*+,-./0123456789:;<=>?   ��������������������������������|
+21 |    @ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_   ��������������������������������|
+22 |    `abcdefghijklmnopqrstuvwxyz{|}~    ��������������������������������|
+23 ||
+24 |Push <RETURN>|
+=== 07 key '\r'
+cursor 22,41 visible
+screen normal
+01 ||
+02 ||
+03 |         Menu 3: Character-Set Tests|
+04 ||
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Reset (G0 ASCII, G1 Latin-1, no NRC mode)|
+09 |          2. Enable highlighting of non-ISO-8859-1 mapping|
+10 |          3. Enable National Replacement Character (NRC) mode|
+11 |          4. Specify G0 (now US ASCII)|
+12 |          5. Specify G1 (now ISO Latin-1)|
+13 |          6. Specify G2 (now ISO Latin-1)|
+14 |          7. Specify G3 (now ISO Latin-1)|
+15 |          8. Test VT100 Character Sets|
+16 |          9. Test Shift In/Shift Out (SI/SO)|
+17 |          10. Test VT220 Locking Shifts|
+18 |          11. Test VT220 Single Shifts|
+19 |          12* Test Soft Character Sets|
+20 |          13. Test Keyboard Layout with G0 Selection|
+21 ||
+22 |          Enter choice number (0 - 13):|
+23 ||
+24 ||
+=== 08 key '11\r'
+cursor 24,14 visible
+screen normal
+01 |Testing single-shift G2 into GL (SS2) with NRC disabled|
+02 |G2 is ISO Latin-1|
+03 ||
+04 ||
+05 |     32: ( )     48: (°)     64: (À)     80: (Ð)     96: (à)    112: (ð)|
+06 |     33: (¡)     49: (±)     65: (Á)     81: (Ñ)     97: (á)    113: (ñ)|
+07 |     34: (¢)     50: (²)     66: (Â)     82: (Ò)     98: (â)    114: (ò)|
+08 |     35: (£)     51: (³)     67: (Ã)     83: (Ó)     99: (ã)    115: (ó)|
+09 |     36: (¤)     52: (´)     68: (Ä)     84: (Ô)    100: (ä)    116: (ô)|
+10 |     37: (¥)     53: (µ)     69: (Å)     85: (Õ)    101: (å)    117: (õ)|
+11 |     38: (¦)     54: (¶)     70: (Æ)     86: (Ö)    102: (æ)    118: (ö)|
+12 |     39: (§)     55: (·)     71: (Ç)     87: (×)    103: (ç)    119: (÷)|
+13 |     40: (¨)     56: (¸)     72: (È)     88: (Ø)    104: (è)    120: (ø)|
+14 |     41: (©)     57: (¹)     73: (É)     89: (Ù)    105: (é)    121: (ù)|
+15 |     42: (ª)     58: (º)     74: (Ê)     90: (Ú)    106: (ê)    122: (ú)|
+16 |     43: («)     59: (»)     75: (Ë)     91: (Û)    107: (ë)    123: (û)|
+17 |     44: (¬)     60: (¼)     76: (Ì)     92: (Ü)    108: (ì)    124: (ü)|
+18 |     45: (­)     61: (½)     77: (Í)     93: (Ý)    109: (í)    125: (ý)|
+19 |     46: (®)     62: (¾)     78: (Î)     94: (Þ)    110: (î)    126: (þ)|
+20 |     47: (¯)     63: (¿)     79: (Ï)     95: (ß)    111: (ï)    127: (©|
+21 ||
+22 ||
+23 ||
+24 |Push <RETURN>|
+=== 09 key '\r'
+cursor 24,14 visible
+screen normal
+01 |Testing single-shift G3 into GL (SS3) with NRC disabled|
+02 |G3 is ISO Latin-1|
+03 ||
+04 ||
+05 |     32: ( )     48: (°)     64: (À)     80: (Ð)     96: (à)    112: (ð)|
+06 |     33: (¡)     49: (±)     65: (Á)     81: (Ñ)     97: (á)    113: (ñ)|
+07 |     34: (¢)     50: (²)     66: (Â)     82: (Ò)     98: (â)    114: (ò)|
+08 |     35: (£)     51: (³)     67: (Ã)     83: (Ó)     99: (ã)    115: (ó)|
+09 |     36: (¤)     52: (´)     68: (Ä)     84: (Ô)    100: (ä)    116: (ô)|
+10 |     37: (¥)     53: (µ)     69: (Å)     85: (Õ)    101: (å)    117: (õ)|
+11 |     38: (¦)     54: (¶)     70: (Æ)     86: (Ö)    102: (æ)    118: (ö)|
+12 |     39: (§)     55: (·)     71: (Ç)     87: (×)    103: (ç)    119: (÷)|
+13 |     40: (¨)     56: (¸)     72: (È)     88: (Ø)    104: (è)    120: (ø)|
+14 |     41: (©)     57: (¹)     73: (É)     89: (Ù)    105: (é)    121: (ù)|
+15 |     42: (ª)     58: (º)     74: (Ê)     90: (Ú)    106: (ê)    122: (ú)|
+16 |     43: («)     59: (»)     75: (Ë)     91: (Û)    107: (ë)    123: (û)|
+17 |     44: (¬)     60: (¼)     76: (Ì)     92: (Ü)    108: (ì)    124: (ü)|
+18 |     45: (­)     61: (½)     77: (Í)     93: (Ý)    109: (í)    125: (ý)|
+19 |     46: (®)     62: (¾)     78: (Î)     94: (Þ)    110: (î)    126: (þ)|
+20 |     47: (¯)     63: (¿)     79: (Ï)     95: (ß)    111: (ï)    127: (©|
+21 ||
+22 ||
+23 ||
+24 |Push <RETURN>|
+=== 10 key '\r'
+cursor 22,41 visible
+screen normal
+01 ||
+02 ||
+03 |         Menu 3: Character-Set Tests|
+04 ||
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Reset (G0 ASCII, G1 Latin-1, no NRC mode)|
+09 |          2. Enable highlighting of non-ISO-8859-1 mapping|
+10 |          3. Enable National Replacement Character (NRC) mode|
+11 |          4. Specify G0 (now US ASCII)|
+12 |          5. Specify G1 (now ISO Latin-1)|
+13 |          6. Specify G2 (now ISO Latin-1)|
+14 |          7. Specify G3 (now ISO Latin-1)|
+15 |          8. Test VT100 Character Sets|
+16 |          9. Test Shift In/Shift Out (SI/SO)|
+17 |          10. Test VT220 Locking Shifts|
+18 |          11. Test VT220 Single Shifts|
+19 |          12* Test Soft Character Sets|
+20 |          13. Test Keyboard Layout with G0 Selection|
+21 ||
+22 |          Enter choice number (0 - 13):|
+23 ||
+24 ||

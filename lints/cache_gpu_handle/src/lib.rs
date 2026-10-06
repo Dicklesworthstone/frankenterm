@@ -71,6 +71,26 @@
 //! This is exactly why the post-fix interner is clean: it stores
 //! `ShapedInfoTemplate` (no `Rc<CachedGlyph>`), so the global root no
 //! longer reaches a forbidden leaf.
+//!
+//! # Per-window cache fields (ft-yccm0.2.5)
+//!
+//! The same leak class also occurs WITHOUT a process-global: in the 0.15.2
+//! GUI the per-window `TermWindow::shape_cache` (an `LfuCache`) kept
+//! `CachedShape -> ShapedInfo -> Rc<CachedGlyph>` for entries that were not
+//! reused after an atlas rebuild, pinning every old atlas texture (up to
+//! 256 MiB each) until LFU eviction. So a second root class is checked:
+//!
+//! 5. **Cache-field roots.** Every named struct field whose type mentions a
+//!    cache container ([`CACHE_CONTAINERS`]: `LfuCache`, `HashMap`, …) is a
+//!    root, walked exactly like a global.
+//!
+//! 6. **Spares.** A struct that directly owns an `Atlas` field IS the atlas
+//!    owner: its maps are dropped together with the atlas, so they cannot
+//!    outlive it and are not checked. Any other cache field that reaches a
+//!    GPU leaf must be listed in [`allow_list::ALLOWED_CACHE_FIELDS`] with
+//!    the code that releases it on every atlas rebuild and the runtime test
+//!    proving it; an entry that no longer matches a reaching field is
+//!    reported as stale so the list cannot rot.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -102,15 +122,33 @@ pub const FORBIDDEN_LEAVES: &[&str] = &[
     "TextureView", // wgpu::TextureView
 ];
 
-/// One audit finding: a process-global cache that can transitively pin
-/// a GPU resource.
+/// Container idents that make a struct field a long-lived cache root
+/// (matched on the last path segment, anywhere in the field type).
+pub const CACHE_CONTAINERS: &[&str] = &[
+    "LfuCache",
+    "LfuCacheU64",
+    "LruCache",
+    "HashMap",
+    "AHashMap",
+    "FxHashMap",
+    "BTreeMap",
+    "IndexMap",
+];
+
+/// A struct with a field mentioning this type directly owns the glyph
+/// atlas; its cache fields share the atlas lifetime and are spared.
+pub const ATLAS_OWNER_MARKER: &str = "Atlas";
+
+/// One audit finding: a process-global cache, or a per-window cache field,
+/// that can transitively pin a GPU resource.
 #[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd)]
 pub struct Finding {
     /// Path relative to the scanned src root.
     pub rel_path: PathBuf,
-    /// Source line number (1-based) of the global's declaration.
+    /// Source line number (1-based) of the global's (or field's) declaration.
     pub line: usize,
-    /// The global's identifier (e.g. `SHAPED_RUN_INTERNER`).
+    /// The global's identifier (e.g. `SHAPED_RUN_INTERNER`), or
+    /// `Owner.field` for a cache field (e.g. `TermWindow.shape_cache`).
     pub global: String,
     /// The root type of the global container (e.g. `RefCell<ShapedRunInterner>`).
     pub root_type: String,
@@ -128,13 +166,20 @@ pub enum FindingReason {
     /// A process-global container's root type transitively reaches a
     /// forbidden GPU-handle leaf.
     GlobalReachesGpuHandle,
+    /// A struct's cache field (outside the atlas owner) transitively reaches
+    /// a forbidden GPU-handle leaf without an atlas-rebuild release fence.
+    CacheFieldReachesGpuHandle,
 }
 
 impl Finding {
     pub fn render(&self) -> String {
         let path = self.path.join(" -> ");
+        let kind = match self.reason {
+            FindingReason::GlobalReachesGpuHandle => "process-global",
+            FindingReason::CacheFieldReachesGpuHandle => "unfenced cache field",
+        };
         format!(
-            "{}:{}: process-global `{}` : {} can pin a GPU resource — reaches forbidden leaf `{}` ({} (FORBIDDEN))",
+            "{}:{}: {kind} `{}` : {} can pin a GPU resource — reaches forbidden leaf `{}` ({} (FORBIDDEN))",
             self.rel_path.display(),
             self.line,
             self.global,
@@ -157,6 +202,17 @@ pub struct AuditReport {
     pub clean_globals: usize,
     /// Distinct type defs ingested into the type graph.
     pub type_graph_nodes: usize,
+    /// Struct fields whose type mentions a [`CACHE_CONTAINERS`] ident.
+    pub total_cache_fields: usize,
+    /// Cache fields that reach no GPU-handle leaf.
+    pub clean_cache_fields: usize,
+    /// GPU-reaching cache fields of the atlas owner itself (spared).
+    pub atlas_owner_cache_fields: usize,
+    /// GPU-reaching cache fields fenced by [`allow_list::ALLOWED_CACHE_FIELDS`].
+    pub allow_listed_cache_fields: usize,
+    /// `path::Owner.field` allow-list entries that matched no GPU-reaching
+    /// cache field in the scanned roots.
+    pub stale_cache_field_allow_entries: Vec<String>,
     pub findings: Vec<Finding>,
 }
 
@@ -181,6 +237,20 @@ struct GlobalSite {
     root_type_idents: BTreeSet<String>,
 }
 
+/// A struct field whose type mentions a cache container.
+#[derive(Debug, Clone)]
+struct CacheFieldSite {
+    rel_path: PathBuf,
+    rel_posix: String,
+    line: usize,
+    owner: String,
+    field: String,
+    root_type_rendered: String,
+    root_type_idents: BTreeSet<String>,
+    /// The owning struct directly holds an `Atlas`.
+    owner_holds_atlas: bool,
+}
+
 /// Walk every scanned dir, build a unified type graph and a global
 /// list, then run reachability. `src_roots` may contain several dirs
 /// (e.g. the GUI src and the window src); the type graph is built from
@@ -191,6 +261,7 @@ pub fn audit_dirs(src_roots: &[PathBuf]) -> Result<AuditReport, std::io::Error> 
     // type_name -> set of referenced type idents (the type graph edges)
     let mut type_graph: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut globals: Vec<GlobalSite> = Vec::new();
+    let mut cache_fields: Vec<CacheFieldSite> = Vec::new();
 
     for root in src_roots {
         let mut paths: Vec<PathBuf> = Vec::new();
@@ -208,7 +279,7 @@ pub fn audit_dirs(src_roots: &[PathBuf]) -> Result<AuditReport, std::io::Error> 
 
         for path in &paths {
             let rel = path.strip_prefix(root).unwrap_or(path).to_path_buf();
-            ingest_file(path, &rel, &mut type_graph, &mut globals)?;
+            ingest_file(path, &rel, &mut type_graph, &mut globals, &mut cache_fields)?;
         }
     }
 
@@ -250,8 +321,54 @@ pub fn audit_dirs(src_roots: &[PathBuf]) -> Result<AuditReport, std::io::Error> 
         }
     }
 
+    audit_cache_fields(&cache_fields, &type_graph, &mut report);
+
     report.findings.sort();
     Ok(report)
+}
+
+/// Check every cache-field root (rule 5) and apply the spares (rule 6).
+fn audit_cache_fields(
+    cache_fields: &[CacheFieldSite],
+    type_graph: &BTreeMap<String, BTreeSet<String>>,
+    report: &mut AuditReport,
+) {
+    let mut matched_allow_entries = BTreeSet::new();
+    for site in cache_fields {
+        report.total_cache_fields += 1;
+        let Some((leaf, witness)) =
+            reaches_forbidden_from(&site.root_type_rendered, &site.root_type_idents, type_graph)
+        else {
+            report.clean_cache_fields += 1;
+            continue;
+        };
+        if site.owner_holds_atlas {
+            report.atlas_owner_cache_fields += 1;
+            continue;
+        }
+        if let Some(index) = allow_list::ALLOWED_CACHE_FIELDS.iter().position(|entry| {
+            entry.path == site.rel_posix && entry.owner == site.owner && entry.field == site.field
+        }) {
+            matched_allow_entries.insert(index);
+            report.allow_listed_cache_fields += 1;
+            continue;
+        }
+        report.findings.push(Finding {
+            rel_path: site.rel_path.clone(),
+            line: site.line,
+            global: format!("{}.{}", site.owner, site.field),
+            root_type: site.root_type_rendered.clone(),
+            forbidden_leaf: leaf,
+            path: witness,
+            reason: FindingReason::CacheFieldReachesGpuHandle,
+        });
+    }
+    report.stale_cache_field_allow_entries = allow_list::ALLOWED_CACHE_FIELDS
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !matched_allow_entries.contains(index))
+        .map(|(_, entry)| format!("{}::{}.{}", entry.path, entry.owner, entry.field))
+        .collect();
 }
 
 /// Convenience single-dir wrapper (mirrors `cx_propagation`'s `audit_dir`).
@@ -264,6 +381,7 @@ fn ingest_file(
     rel: &Path,
     type_graph: &mut BTreeMap<String, BTreeSet<String>>,
     globals: &mut Vec<GlobalSite>,
+    cache_fields: &mut Vec<CacheFieldSite>,
 ) -> Result<(), std::io::Error> {
     let src = std::fs::read_to_string(path)?;
     let parsed = match syn::parse_file(&src) {
@@ -277,6 +395,7 @@ fn ingest_file(
         rel_posix,
         type_graph,
         globals,
+        cache_fields,
     };
     visitor.visit_file(&parsed);
     Ok(())
@@ -290,14 +409,24 @@ fn reaches_forbidden(
     g: &GlobalSite,
     type_graph: &BTreeMap<String, BTreeSet<String>>,
 ) -> Option<(String, Vec<String>)> {
+    reaches_forbidden_from(&g.root_type_rendered, &g.root_type_idents, type_graph)
+}
+
+/// [`reaches_forbidden`] for any root: a rendered root type plus the idents
+/// it directly references.
+fn reaches_forbidden_from(
+    root_type_rendered: &str,
+    root_type_idents: &BTreeSet<String>,
+    type_graph: &BTreeMap<String, BTreeSet<String>>,
+) -> Option<(String, Vec<String>)> {
     // Seed: a forbidden leaf may appear DIRECTLY in the root type
     // (e.g. `static X: RefCell<Vec<Sprite>>`), so check the seed idents
     // first. The witness then begins with the rendered root type.
-    for ident in &g.root_type_idents {
+    for ident in root_type_idents {
         if is_forbidden(ident) {
             return Some((
                 ident.clone(),
-                vec![g.root_type_rendered.clone(), ident.clone()],
+                vec![root_type_rendered.to_string(), ident.clone()],
             ));
         }
     }
@@ -307,7 +436,7 @@ fn reaches_forbidden(
     let mut pred: BTreeMap<String, String> = BTreeMap::new();
     let mut queue: VecDeque<String> = VecDeque::new();
 
-    for ident in &g.root_type_idents {
+    for ident in root_type_idents {
         if seen.insert(ident.clone()) {
             queue.push_back(ident.clone());
         }
@@ -326,7 +455,7 @@ fn reaches_forbidden(
                     chain.push(p.clone());
                     walk = p.clone();
                 }
-                chain.push(g.root_type_rendered.clone());
+                chain.push(root_type_rendered.to_string());
                 chain.reverse();
                 return Some((next.clone(), chain));
             }
@@ -349,6 +478,7 @@ struct FileVisitor<'a> {
     rel_posix: String,
     type_graph: &'a mut BTreeMap<String, BTreeSet<String>>,
     globals: &'a mut Vec<GlobalSite>,
+    cache_fields: &'a mut Vec<CacheFieldSite>,
 }
 
 impl<'a, 'ast> Visit<'ast> for FileVisitor<'a> {
@@ -356,6 +486,7 @@ impl<'a, 'ast> Visit<'ast> for FileVisitor<'a> {
         let name = node.ident.to_string();
         let mut idents = BTreeSet::new();
         collect_field_idents(&node.fields, &mut idents);
+        self.record_cache_fields(&name, &node.fields);
         self.type_graph.entry(name).or_default().extend(idents);
         syn::visit::visit_item_struct(self, node);
     }
@@ -420,6 +551,52 @@ impl<'a, 'ast> Visit<'ast> for FileVisitor<'a> {
 }
 
 impl<'a> FileVisitor<'a> {
+    /// Record every named field of `owner` whose type mentions a cache
+    /// container (rule 5), noting whether `owner` is the atlas owner.
+    fn record_cache_fields(&mut self, owner: &str, fields: &Fields) {
+        let Fields::Named(named) = fields else {
+            return;
+        };
+        let field_idents: Vec<BTreeSet<String>> = named
+            .named
+            .iter()
+            .map(|field| {
+                let mut idents = BTreeSet::new();
+                collect_type_idents(&field.ty, &mut idents);
+                idents
+            })
+            .collect();
+        let owner_holds_atlas = field_idents
+            .iter()
+            .any(|idents| idents.contains(ATLAS_OWNER_MARKER));
+        for (field, idents) in named.named.iter().zip(field_idents) {
+            // A borrowed view (`&'a RefCell<LfuCache<..>>`) owns nothing and
+            // cannot extend any lifetime; the owning field is the root.
+            if matches!(field.ty, Type::Reference(_)) {
+                continue;
+            }
+            if !idents
+                .iter()
+                .any(|ident| CACHE_CONTAINERS.contains(&ident.as_str()))
+            {
+                continue;
+            }
+            let Some(field_ident) = field.ident.as_ref() else {
+                continue;
+            };
+            self.cache_fields.push(CacheFieldSite {
+                rel_path: self.rel_path.clone(),
+                rel_posix: self.rel_posix.clone(),
+                line: field_ident.span().start().line,
+                owner: owner.to_string(),
+                field: field_ident.to_string(),
+                root_type_rendered: render_type(&field.ty),
+                root_type_idents: idents,
+                owner_holds_atlas,
+            });
+        }
+    }
+
     /// Record a process-global container. For `LazyLock<T>` / `OnceLock<T>`
     /// the *root* is the inner `T` (the cell is just the global wrapper),
     /// but we keep the rendered outer type for the witness header and seed
@@ -737,18 +914,168 @@ fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
 mod tests {
     use super::*;
 
-    fn build_graph_and_globals(src: &str) -> (BTreeMap<String, BTreeSet<String>>, Vec<GlobalSite>) {
+    fn build_graph_globals_and_fields(
+        src: &str,
+    ) -> (
+        BTreeMap<String, BTreeSet<String>>,
+        Vec<GlobalSite>,
+        Vec<CacheFieldSite>,
+    ) {
         let parsed = syn::parse_file(src).unwrap();
         let mut type_graph = BTreeMap::new();
         let mut globals = Vec::new();
+        let mut cache_fields = Vec::new();
         let mut v = FileVisitor {
             rel_path: PathBuf::from("test.rs"),
             rel_posix: "test.rs".to_string(),
             type_graph: &mut type_graph,
             globals: &mut globals,
+            cache_fields: &mut cache_fields,
         };
         v.visit_file(&parsed);
+        (type_graph, globals, cache_fields)
+    }
+
+    fn build_graph_and_globals(src: &str) -> (BTreeMap<String, BTreeSet<String>>, Vec<GlobalSite>) {
+        let (type_graph, globals, _) = build_graph_globals_and_fields(src);
         (type_graph, globals)
+    }
+
+    fn cache_field_report(src: &str) -> AuditReport {
+        let (type_graph, _, cache_fields) = build_graph_globals_and_fields(src);
+        let mut report = AuditReport::default();
+        audit_cache_fields(&cache_fields, &type_graph, &mut report);
+        report
+    }
+
+    /// The 0.15.2 leak shape: a per-window LFU of shapes whose values hold
+    /// glyph `Rc`s. No process-global is involved, so only rule 5 sees it.
+    #[test]
+    fn per_window_lfu_cache_reaching_cached_glyph_is_flagged() {
+        let src = r#"
+            struct TermWindow { shape_cache: RefCell<LfuCache<ShapeCacheKey, Rc<Shape>>> }
+            struct Shape { glyphs: RefCell<Rc<Vec<ShapedInfo>>> }
+            struct ShapedInfo { glyph: Rc<CachedGlyph> }
+            struct CachedGlyph { texture: Option<Sprite> }
+        "#;
+        let (_graph, globals, _fields) = build_graph_globals_and_fields(src);
+        assert!(globals.is_empty(), "no process-global in this shape");
+        let report = cache_field_report(src);
+        assert_eq!(report.total_cache_fields, 1);
+        assert_eq!(report.findings.len(), 1, "{:#?}", report.findings);
+        let f = &report.findings[0];
+        assert_eq!(f.global, "TermWindow.shape_cache");
+        assert_eq!(f.reason, FindingReason::CacheFieldReachesGpuHandle);
+        assert_eq!(f.forbidden_leaf, "CachedGlyph");
+        assert!(f.path.iter().any(|node| node == "ShapedInfo"));
+        assert!(f.render().contains("unfenced cache field `TermWindow.shape_cache`"));
+    }
+
+    #[test]
+    fn hash_map_field_holding_a_sprite_directly_is_flagged() {
+        let src = r#"
+            struct Overlay { icons: AHashMap<u32, Sprite> }
+        "#;
+        let report = cache_field_report(src);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].forbidden_leaf, "Sprite");
+    }
+
+    #[test]
+    fn atlas_owner_maps_are_spared() {
+        // GlyphCache owns the atlas: its maps die with it, so they are not a
+        // leak even though they hold sprites and glyphs.
+        let src = r#"
+            struct GlyphCache {
+                glyph_cache: AHashMap<GlyphKey, Rc<CachedGlyph>>,
+                block_glyphs: AHashMap<u32, Sprite>,
+                pub atlas: Atlas,
+            }
+            struct CachedGlyph { texture: Option<Sprite> }
+        "#;
+        let report = cache_field_report(src);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+        assert_eq!(report.atlas_owner_cache_fields, 2);
+    }
+
+    #[test]
+    fn cache_field_without_gpu_leaf_is_clean_and_non_cache_field_is_not_a_root() {
+        let src = r#"
+            struct TermWindow {
+                line_state_cache: RefCell<LfuCache<u64, LineState>>,
+                util: UtilSprites,
+            }
+            struct LineState { seqno: u64 }
+            struct UtilSprites { white_space: Sprite }
+        "#;
+        let report = cache_field_report(src);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+        assert_eq!(report.total_cache_fields, 1, "only the LfuCache field is a root");
+        assert_eq!(report.clean_cache_fields, 1);
+    }
+
+    #[test]
+    fn allow_listed_cache_field_is_counted_and_unmatched_entries_are_stale() {
+        let entry = &allow_list::ALLOWED_CACHE_FIELDS[0];
+        let src = format!(
+            "struct {} {{ {}: RefCell<LfuCache<Key, Rc<CachedGlyph>>> }}",
+            entry.owner, entry.field
+        );
+        let (type_graph, _, mut cache_fields) = build_graph_globals_and_fields(&src);
+        for site in &mut cache_fields {
+            site.rel_posix = entry.path.to_string();
+        }
+        let mut report = AuditReport::default();
+        audit_cache_fields(&cache_fields, &type_graph, &mut report);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+        assert_eq!(report.allow_listed_cache_fields, 1);
+        assert_eq!(
+            report.stale_cache_field_allow_entries.len(),
+            allow_list::ALLOWED_CACHE_FIELDS.len() - 1,
+            "every entry that matched nothing must be reported stale"
+        );
+        assert!(!report
+            .stale_cache_field_allow_entries
+            .contains(&format!("{}::{}.{}", entry.path, entry.owner, entry.field)));
+    }
+
+    #[test]
+    fn allow_list_entry_on_the_wrong_path_does_not_fence() {
+        let entry = &allow_list::ALLOWED_CACHE_FIELDS[0];
+        let src = format!(
+            "struct {} {{ {}: RefCell<LfuCache<Key, Rc<CachedGlyph>>> }}",
+            entry.owner, entry.field
+        );
+        // `test.rs` is not the allow-listed file, so the same names elsewhere
+        // are not fenced.
+        let report = cache_field_report(&src);
+        assert_eq!(report.findings.len(), 1);
+    }
+
+    #[test]
+    fn borrowed_cache_view_is_not_a_root_but_its_owner_is() {
+        // `RenderCaches` borrows TermWindow's caches for one invalidation; it
+        // owns nothing. The owning field is still checked.
+        let src = r#"
+            struct RenderCaches<'a> { shapes: &'a RefCell<LfuCache<Key, Rc<CachedGlyph>>> }
+            struct Owner { shapes: RefCell<LfuCache<Key, Rc<CachedGlyph>>> }
+        "#;
+        let report = cache_field_report(src);
+        assert_eq!(report.total_cache_fields, 1);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].global, "Owner.shapes");
+    }
+
+    #[test]
+    fn cfg_test_struct_cache_fields_are_skipped() {
+        let src = r#"
+            #[cfg(test)]
+            mod tests {
+                struct Fixture { shapes: RefCell<LfuCache<u64, Rc<CachedGlyph>>> }
+            }
+        "#;
+        let (_graph, _globals, fields) = build_graph_globals_and_fields(src);
+        assert!(fields.is_empty(), "test fixtures are not production caches");
     }
 
     fn first_finding(src: &str) -> Option<Finding> {

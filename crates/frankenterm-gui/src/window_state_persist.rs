@@ -3869,6 +3869,7 @@ where
     cache.get_or_init(|| StartupRestoreCache::new(loader()))
 }
 
+#[cfg(test)]
 fn load_startup_workspace_from<F>(
     cache: &OnceLock<StartupRestoreCache>,
     workspace: &str,
@@ -5886,6 +5887,7 @@ fn enforce_encoded_byte_admission(
     Ok(())
 }
 
+#[cfg(test)]
 fn preflight_batch(
     state: &PersistedState,
     batch: &PendingBatch,
@@ -5894,6 +5896,7 @@ fn preflight_batch(
     preflight_batch_with_byte_limit_and_epoch(state, batch, force_write, MAX_STATE_FILE_BYTES, None)
 }
 
+#[cfg(test)]
 fn preflight_batch_with_byte_limit(
     state: &PersistedState,
     batch: &PendingBatch,

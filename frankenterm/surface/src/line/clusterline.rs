@@ -22,6 +22,50 @@ struct Cluster {
     attrs: CellAttributes,
 }
 
+/// Whether `c` belongs to a code point range whose Grapheme_Cluster_Break is
+/// Other or Extended_Pictographic. Such a char neither extends the grapheme
+/// before it nor is extended by the one after it (GB6-GB9c, GB11-GB13 all
+/// need a Control, Extend, ZWJ, SpacingMark, Prepend, Regional_Indicator,
+/// Hangul jamo or InCB consonant on one side). Covered: printable ASCII,
+/// Latin-1 (minus U+00AD) through Latin Extended, IPA and spacing modifiers,
+/// Greek, Cyrillic, general punctuation (minus the format controls), arrows
+/// through dingbats, braille, CJK symbols (minus U+302A-U+302F), kana (minus
+/// U+3099-U+309A), CJK ideographs, Hangul syllables, fullwidth forms (minus
+/// U+FF9E-U+FF9F) and the emoji blocks minus the skin-tone modifiers
+/// U+1F3FB-U+1F3FF. Anything else is treated as able to cluster.
+pub(crate) fn is_cluster_inert(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0x20..=0x7E
+            | 0xA0..=0xAC
+            | 0xAE..=0x2FF
+            | 0x370..=0x482
+            | 0x48A..=0x52F
+            | 0x2010..=0x2027
+            | 0x2030..=0x205E
+            | 0x2190..=0x27BF
+            | 0x2800..=0x28FF
+            | 0x3000..=0x3029
+            | 0x3030..=0x303F
+            | 0x3041..=0x3096
+            | 0x309B..=0x30FF
+            | 0x4E00..=0x9FFF
+            | 0xAC00..=0xD7A3
+            | 0xFF01..=0xFF9D
+            | 0x1F300..=0x1F3FA
+            | 0x1F400..=0x1F64F
+            | 0x1F680..=0x1F6FF
+            | 0x1F900..=0x1F9FF
+            | 0x1FA70..=0x1FAFF
+    )
+}
+
+/// Whether a grapheme boundary is guaranteed between a cell whose text ends
+/// in `prev` (`None` for the start of the line) and one starting with `next`.
+fn breaks_between(prev: Option<char>, next: char) -> bool {
+    prev.is_none_or(|prev| is_cluster_inert(prev) && is_cluster_inert(next))
+}
+
 /// Stores line data as a contiguous string and a series of
 /// clusters of attribute data describing attributed ranges
 /// within the line
@@ -331,6 +375,75 @@ impl ClusteredLine {
 
     pub fn len(&self) -> usize {
         self.len as usize
+    }
+
+    /// Whether a cell holding the grapheme `text` may be appended at cell
+    /// `idx` (at or past the end; blanks fill any gap first) so that the
+    /// concatenated text still segments into exactly this line's cells.
+    ///
+    /// Iteration re-runs `Graphemes` over the concatenated text, while `len`
+    /// counts the widths appended. Appending a regional indicator after its
+    /// partner, a skin-tone modifier after an emoji, or anything else that
+    /// clusters with the previous cell would merge the two on iteration, so
+    /// `len` would exceed the cells the line yields. Callers then index past
+    /// the materialized cells (DCH after a split flag emoji panicked in
+    /// `Line::erase_cell_with_margin`). Such writes must use vector storage.
+    pub fn can_append_cell_at(&self, idx: usize, text: &str) -> bool {
+        let len = self.len();
+        if idx < len {
+            return false;
+        }
+        let first = match text.chars().next() {
+            Some(first) => first,
+            None => return false,
+        };
+        let mut prev = self.text.chars().next_back();
+        if idx > len {
+            if !breaks_between(prev, ' ') {
+                return false;
+            }
+            prev = Some(' ');
+        }
+        breaks_between(prev, first)
+    }
+
+    /// Whether iterating this line yields exactly `cells`: the same
+    /// graphemes with the same widths, in order. A clustered line built from
+    /// cells whose neighbours cluster with each other would not.
+    ///
+    /// `cells` yields a fresh iterator per pass: a cheap pass checks that
+    /// every boundary is inert, and only a failure pays for re-segmenting.
+    pub fn reproduces<'a, I>(&self, cells: impl Fn() -> I) -> bool
+    where
+        I: Iterator<Item = CellRef<'a>>,
+    {
+        let mut prev = None;
+        let mut inert = true;
+        for cell in cells() {
+            let text = cell.str();
+            match text.chars().next() {
+                Some(first) if breaks_between(prev, first) => {}
+                _ => {
+                    inert = false;
+                    break;
+                }
+            }
+            prev = text.chars().next_back();
+        }
+        if inert {
+            return true;
+        }
+        let mut own = self.iter();
+        for cell in cells() {
+            match own.next() {
+                Some(mine)
+                    if mine.str() == cell.str()
+                        && mine.width()
+                            == usize::from(Self::normalize_cell_width(cell.width())) => {}
+                _ => return false,
+            }
+        }
+        own.next().is_none()
     }
 
     fn is_double_wide(&self, cell_index: usize) -> bool {

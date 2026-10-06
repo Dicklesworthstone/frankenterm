@@ -53,3 +53,50 @@
 /// as a latent leak waiting to be reintroduced and prefer a structural
 /// fix.
 pub const ALLOWED_GLOBALS: &[(&str, &str)] = &[];
+
+/// A per-window cache field that legitimately holds GPU-backed glyphs
+/// between atlas rebuilds because every rebuild releases them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheFieldAllowEntry {
+    /// File holding the struct, relative to the scanned src root.
+    pub path: &'static str,
+    /// The struct that declares the field.
+    pub owner: &'static str,
+    /// The field name.
+    pub field: &'static str,
+    /// The code that releases the field's GPU-backed handles on every
+    /// atlas rebuild.
+    pub released_by: &'static str,
+    /// The runtime test proving the release frees the old atlas.
+    pub proven_by: &'static str,
+}
+
+/// Per-window cache fields fenced by an atlas-rebuild release (rule 6 of
+/// the crate docs). Each entry names its release site and the runtime test
+/// that proves the old atlas texture is freed. An entry that stops matching
+/// a GPU-reaching field is reported as stale and must be removed.
+pub const ALLOWED_CACHE_FIELDS: &[CacheFieldAllowEntry] = &[
+    // Shaping output is kept across rebuilds on purpose (re-shaping is the
+    // expensive part); the sprites are a generation-tagged `AtlasBinding`
+    // that `RenderCaches::invalidate` releases for `CacheRebuild::AtlasSprites`
+    // before `RenderState` replaces the glyph cache (ft-yccm0.2.5).
+    CacheFieldAllowEntry {
+        path: "termwindow/mod.rs",
+        owner: "TermWindow",
+        field: "shape_cache",
+        released_by: "termwindow/resize.rs: release_shape_atlas_bindings",
+        proven_by: "termwindow::resize::tests::\
+                    thousand_atlas_rebuilds_keep_live_atlas_bytes_within_twice_the_atlas_size",
+    },
+    // Line shapes carry `Rc<Vec<ShapedInfo>>`; the whole cache is cleared for
+    // every rebuild at or above `CacheRebuild::ColoredLines`, which includes
+    // atlas rebuilds.
+    CacheFieldAllowEntry {
+        path: "termwindow/mod.rs",
+        owner: "TermWindow",
+        field: "line_to_ele_shape_cache",
+        released_by: "termwindow/resize.rs: clear_generation_keyed_line_shape_cache",
+        proven_by: "termwindow::resize::tests::\
+                    thousand_atlas_rebuilds_keep_live_atlas_bytes_within_twice_the_atlas_size",
+    },
+];
