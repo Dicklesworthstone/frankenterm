@@ -146,6 +146,35 @@ pub trait FontShaper {
 
     /// Compute the metrics for a given fallback font at the specified size
     fn metrics_for_idx(&self, font_idx: usize, size: f64, dpi: u32) -> anyhow::Result<FontMetrics>;
+
+    /// What this shaper's fallback walks have done so far.
+    fn walk_stats(&self) -> FallbackWalkStats {
+        FallbackWalkStats::default()
+    }
+}
+
+/// What fallback walks did (ft-yccm0.2.12): every face tried for a run is
+/// either shaped or skipped without being loaded or shaped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FallbackWalkStats {
+    /// Faces shaped, one HarfBuzz call each.
+    pub faces_shaped: u64,
+    /// Faces skipped because their presentation does not match the run's.
+    pub skipped_presentation: u64,
+    /// Faces skipped because their coverage maps none of the run's emoji.
+    pub skipped_coverage: u64,
+}
+
+impl std::ops::Add for FallbackWalkStats {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            faces_shaped: self.faces_shaped + other.faces_shaped,
+            skipped_presentation: self.skipped_presentation + other.skipped_presentation,
+            skipped_coverage: self.skipped_coverage + other.skipped_coverage,
+        }
+    }
 }
 
 pub use config::FontShaperSelection;

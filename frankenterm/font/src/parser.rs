@@ -4,7 +4,7 @@ use config::{FontAttributes, FontStyle, FreeTypeLoadFlags, FreeTypeLoadTarget};
 pub use config::{FontStretch, FontWeight};
 use rangeset::RangeSet;
 use std::cmp::Ordering;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 #[derive(Debug)]
 pub enum MaybeShaped {
@@ -28,7 +28,9 @@ pub struct ParsedFont {
     style: FontStyle,
     cap_height: Option<f64>,
     pub handle: FontDataHandle,
-    coverage: Mutex<RangeSet<u32>>,
+    /// Computed on first use and shared by every clone of this font, so it
+    /// is computed once per font load (ft-yccm0.2.12).
+    coverage: Arc<Mutex<Option<Arc<FontCoverage>>>>,
     pub synthesize_italic: bool,
     pub synthesize_bold: bool,
     pub synthesize_dim: bool,
@@ -80,7 +82,7 @@ impl Clone for ParsedFont {
             assume_emoji_presentation: self.assume_emoji_presentation,
             handle: self.handle.clone(),
             cap_height: self.cap_height,
-            coverage: Mutex::new(self.lock_coverage().clone()),
+            coverage: Arc::clone(&self.coverage),
             pixel_sizes: self.pixel_sizes.clone(),
             harfbuzz_features: self.harfbuzz_features.clone(),
             freetype_load_target: self.freetype_load_target,
@@ -267,8 +269,78 @@ impl Names {
     }
 }
 
+/// The emoji window of [`EmojiCoverage`]: U+1F000..U+1FB00, Mahjong Tiles
+/// through Symbols and Pictographs Extended-A. It holds every emoji block of
+/// the operator's T0 corpus, and none of its characters has a canonical
+/// decomposition, so a face's cmap alone decides whether HarfBuzz can draw
+/// one of them.
+pub const EMOJI_WINDOW: std::ops::Range<u32> = 0x1F000..0x1FB00;
+
+const EMOJI_WORDS: usize = (EMOJI_WINDOW.end - EMOJI_WINDOW.start) as usize / 64;
+
+/// Which codepoints of [`EMOJI_WINDOW`] a face maps, one bit each
+/// (ft-yccm0.2.12): a constant-time answer on the emoji hot path.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EmojiCoverage {
+    bits: [u64; EMOJI_WORDS],
+}
+
+impl std::fmt::Debug for EmojiCoverage {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+        fmt.debug_struct("EmojiCoverage")
+            .field("mapped", &self.len())
+            .finish()
+    }
+}
+
+impl EmojiCoverage {
+    pub fn from_ranges(ranges: &RangeSet<u32>) -> Self {
+        let mut bits = [0; EMOJI_WORDS];
+        for c in ranges.intersection_with_range(EMOJI_WINDOW).iter_values() {
+            let offset = (c - EMOJI_WINDOW.start) as usize;
+            bits[offset / 64] |= 1 << (offset % 64);
+        }
+        Self { bits }
+    }
+
+    /// Whether the face maps `c`; `None` outside [`EMOJI_WINDOW`].
+    pub fn contains(&self, c: u32) -> Option<bool> {
+        if !EMOJI_WINDOW.contains(&c) {
+            return None;
+        }
+        let offset = (c - EMOJI_WINDOW.start) as usize;
+        Some(self.bits[offset / 64] & (1 << (offset % 64)) != 0)
+    }
+
+    /// Mapped codepoints in the window.
+    pub fn len(&self) -> usize {
+        self.bits
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// The codepoints a face maps (ft-yccm0.2.12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FontCoverage {
+    pub ranges: RangeSet<u32>,
+    pub emoji: EmojiCoverage,
+}
+
+impl FontCoverage {
+    pub fn new(ranges: RangeSet<u32>) -> Self {
+        let emoji = EmojiCoverage::from_ranges(&ranges);
+        Self { ranges, emoji }
+    }
+}
+
 impl ParsedFont {
-    fn lock_coverage(&self) -> MutexGuard<'_, RangeSet<u32>> {
+    fn lock_coverage(&self) -> MutexGuard<'_, Option<Arc<FontCoverage>>> {
         match self.coverage.lock() {
             Ok(coverage) => coverage,
             Err(poisoned) => {
@@ -527,7 +599,7 @@ impl ParsedFont {
             is_built_in_fallback: false,
             assume_emoji_presentation,
             handle,
-            coverage: Mutex::new(RangeSet::new()),
+            coverage: Arc::new(Mutex::new(None)),
             cap_height,
             pixel_sizes,
             harfbuzz_features: None,
@@ -539,26 +611,32 @@ impl ParsedFont {
         })
     }
 
+    /// The codepoints this font maps, computed on first use and then shared
+    /// by every clone of the font (ft-yccm0.2.12).
+    pub fn coverage(&self) -> anyhow::Result<Arc<FontCoverage>> {
+        let mut cov = self.lock_coverage();
+        if let Some(coverage) = cov.as_ref() {
+            return Ok(Arc::clone(coverage));
+        }
+        let t = std::time::Instant::now();
+        let lib = crate::ftwrap::Library::new()?;
+        let face = lib.face_from_locator(&self.handle)?;
+        let coverage = Arc::new(FontCoverage::new(face.compute_coverage()));
+        let elapsed = t.elapsed();
+        metrics::histogram!("font.compute.codepoint.coverage").record(elapsed);
+        log::debug!(
+            "{} codepoint coverage computed in {:?}",
+            self.names.full_name,
+            elapsed
+        );
+        *cov = Some(Arc::clone(&coverage));
+        Ok(coverage)
+    }
+
     /// Computes the intersection of the wanted set of codepoints with
     /// the set of codepoints covered by this font entry.
-    /// Computes the codepoint coverage for this font entry if we haven't
-    /// already done so.
     pub fn coverage_intersection(&self, wanted: &RangeSet<u32>) -> anyhow::Result<RangeSet<u32>> {
-        let mut cov = self.lock_coverage();
-        if cov.is_empty() {
-            let t = std::time::Instant::now();
-            let lib = crate::ftwrap::Library::new()?;
-            let face = lib.face_from_locator(&self.handle)?;
-            *cov = face.compute_coverage();
-            let elapsed = t.elapsed();
-            metrics::histogram!("font.compute.codepoint.coverage").record(elapsed);
-            log::debug!(
-                "{} codepoint coverage computed in {:?}",
-                self.names.full_name,
-                elapsed
-            );
-        }
-        Ok(wanted.intersection(&cov))
+        Ok(wanted.intersection(&self.coverage()?.ranges))
     }
 
     pub fn names(&self) -> &Names {
@@ -950,7 +1028,6 @@ pub(crate) fn parse_and_collect_font_info(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     fn parsed_font_with_coverage() -> ParsedFont {
         let mut coverage = RangeSet::new();
@@ -979,7 +1056,7 @@ mod tests {
                 origin: FontOrigin::BuiltIn,
                 coverage: None,
             },
-            coverage: Mutex::new(coverage),
+            coverage: Arc::new(Mutex::new(Some(Arc::new(FontCoverage::new(coverage))))),
             synthesize_italic: false,
             synthesize_bold: false,
             synthesize_dim: false,
@@ -1018,5 +1095,62 @@ mod tests {
         assert!(intersection.contains(98));
         assert!(intersection.contains(99));
         assert!(!intersection.contains(100));
+    }
+
+    /// ft-yccm0.2.12: the emoji bitmap answers exactly for the window and
+    /// abstains outside it.
+    #[test]
+    fn emoji_coverage_bitmap_matches_the_ranges_inside_the_window() {
+        let mut ranges = RangeSet::new();
+        ranges.add_range(0x1F000..0x1F002);
+        ranges.add_range(0x1F600..0x1F650);
+        ranges.add_range(0x1FAFF..0x1FB10);
+        ranges.add_range(0x41..0x5B);
+        let emoji = EmojiCoverage::from_ranges(&ranges);
+        assert_eq!(emoji.len(), 2 + 0x50 + 1);
+        for c in EMOJI_WINDOW {
+            assert_eq!(emoji.contains(c), Some(ranges.contains(c)), "U+{c:X}");
+        }
+        assert_eq!(emoji.contains(0x41), None, "outside the window");
+        assert_eq!(emoji.contains(EMOJI_WINDOW.end), None);
+        assert_eq!(emoji.contains(EMOJI_WINDOW.start - 1), None);
+        assert!(EmojiCoverage::from_ranges(&RangeSet::new()).is_empty());
+    }
+
+    /// ft-yccm0.2.12: a font's coverage is computed once and shared by its
+    /// clones, including a real bundled emoji face.
+    #[test]
+    fn coverage_is_computed_once_per_font_load_and_shared_by_clones() {
+        let parsed = parsed_font_with_coverage();
+        let clone = parsed.clone();
+        assert!(Arc::ptr_eq(
+            &parsed.coverage().unwrap(),
+            &clone.coverage().unwrap()
+        ));
+
+        let emoji_face = crate::FontDatabase::with_built_in()
+            .unwrap()
+            .list_available()
+            .into_iter()
+            .find(|face| face.names().family == "Noto Color Emoji")
+            .expect("the bundled emoji face");
+        let early_clone = emoji_face.clone();
+        let coverage = emoji_face.coverage().unwrap();
+        assert!(Arc::ptr_eq(&coverage, &early_clone.coverage().unwrap()));
+        assert!(Arc::ptr_eq(
+            &coverage,
+            &emoji_face.clone().coverage().unwrap()
+        ));
+        // The bitmap agrees with the cmap ranges on the T0 blocks.
+        for c in (0x1F600..0x1F650).chain(0x1F300..0x1F600) {
+            assert_eq!(
+                coverage.emoji.contains(c),
+                Some(coverage.ranges.contains(c))
+            );
+        }
+        assert!(
+            coverage.emoji.contains(0x1F600) == Some(true),
+            "grinning face"
+        );
     }
 }

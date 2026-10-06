@@ -1,14 +1,17 @@
-use crate::parser::ParsedFont;
-use crate::shaper::{FallbackIdx, FontMetrics, FontShaper, GlyphInfo, PresentationWidth};
+use crate::parser::{FontCoverage, ParsedFont};
+use crate::shaper::{
+    FallbackIdx, FallbackWalkStats, FontMetrics, FontShaper, GlyphInfo, PresentationWidth,
+};
 use crate::units::*;
 use crate::{ftwrap, hbwrap as harfbuzz};
 use anyhow::{anyhow, Context};
 use config::ConfigHandle;
 use log::error;
 use ordered_float::NotNan;
-use std::cell::{RefCell, RefMut};
+use std::cell::{Cell, OnceCell, RefCell, RefMut};
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
+use std::sync::Arc;
 use termwiz::cell::{unicode_column_width, Presentation};
 use wezterm_bidi::Direction;
 
@@ -34,6 +37,33 @@ fn retain_unused_fallback_fonts() -> bool {
         std::env::var_os("FT_DISABLE_UNUSED_FALLBACK_FONT_CACHE").as_deref()
             != Some(std::ffi::OsStr::new("1"))
     })
+}
+
+// Same-binary control for the emoji coverage skip (ft-yccm0.2.12).
+fn skip_faces_lacking_every_emoji() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("FT_DISABLE_EMOJI_COVERAGE_SKIP").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// Characters that join an emoji sequence without being drawn on their own:
+/// ZWJ, the text and emoji presentation selectors, and the tag characters of
+/// flag sequences. HarfBuzz hides them rather than leaving notdef.
+fn is_emoji_joiner(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200D}' | '\u{FE0E}' | '\u{FE0F}' | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+fn face_presentation(handle: &ParsedFont) -> Presentation {
+    if handle.assume_emoji_presentation {
+        Presentation::Emoji
+    } else {
+        Presentation::Text
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -80,7 +110,6 @@ struct FontPair {
     face: ftwrap::Face,
     font: RefCell<harfbuzz::Font>,
     shaped_any: bool,
-    presentation: Presentation,
     features: Vec<harfbuzz::hb_feature_t>,
     last_size_and_dpi: RefCell<Option<(f64, u32)>>,
 }
@@ -95,6 +124,11 @@ struct MetricsKey {
 pub struct HarfbuzzShaper {
     handles: Vec<ParsedFont>,
     fonts: Vec<RefCell<Option<FontPair>>>,
+    /// Each face's coverage, fetched on first need; `None` if it could not
+    /// be computed, in which case the face is never skipped by coverage.
+    coverage: Vec<OnceCell<Option<Arc<FontCoverage>>>>,
+    skip_uncovered_emoji: bool,
+    walk_stats: Cell<FallbackWalkStats>,
     unused_fonts: RefCell<VecDeque<FallbackIdx>>,
     lib: ftwrap::Library,
     metrics: RefCell<HashMap<MetricsKey, FontMetrics>>,
@@ -104,12 +138,23 @@ pub struct HarfbuzzShaper {
 
 impl HarfbuzzShaper {
     pub fn new(config: &ConfigHandle, handles: &[ParsedFont]) -> anyhow::Result<Self> {
+        Self::with_coverage_skip(config, handles, skip_faces_lacking_every_emoji())
+    }
+
+    /// `skip_uncovered_emoji` false keeps the original walk, which shapes
+    /// every face of the chain in turn: the parity control.
+    fn with_coverage_skip(
+        config: &ConfigHandle,
+        handles: &[ParsedFont],
+        skip_uncovered_emoji: bool,
+    ) -> anyhow::Result<Self> {
         let lib = ftwrap::Library::new()?;
         let handles = handles.to_vec();
         let mut fonts = vec![];
         for _ in 0..handles.len() {
             fonts.push(RefCell::new(None));
         }
+        let coverage = (0..handles.len()).map(|_| OnceCell::new()).collect();
 
         let lang = harfbuzz::language_from_string("en")?;
 
@@ -121,6 +166,9 @@ impl HarfbuzzShaper {
 
         Ok(Self {
             fonts,
+            coverage,
+            skip_uncovered_emoji,
+            walk_stats: Cell::new(FallbackWalkStats::default()),
             unused_fonts: RefCell::new(VecDeque::new()),
             handles,
             lib,
@@ -128,6 +176,45 @@ impl HarfbuzzShaper {
             features,
             lang,
         })
+    }
+
+    fn count(&self, update: impl FnOnce(&mut FallbackWalkStats)) {
+        let mut stats = self.walk_stats.get();
+        update(&mut stats);
+        self.walk_stats.set(stats);
+    }
+
+    /// Whether face `font_idx` provably draws nothing in `text` (ft-yccm0.2.12):
+    /// every character is an emoji-window codepoint the face does not map,
+    /// or an emoji joiner that is not the first character. Shaping such a
+    /// face leaves every cluster incomplete, so the walk would only fall
+    /// through to the next face; skipping it produces the same glyphs
+    /// without loading or shaping it. Emoji-window characters have no
+    /// canonical decompositions, so HarfBuzz cannot draw them from other
+    /// codepoints of the face.
+    fn lacks_every_emoji(&self, font_idx: FallbackIdx, text: &str) -> bool {
+        if !self.skip_uncovered_emoji {
+            return false;
+        }
+        let mut chars = text.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        if is_emoji_joiner(first) {
+            return false;
+        }
+        let coverage = self.coverage[font_idx].get_or_init(|| {
+            self.handles[font_idx]
+                .coverage()
+                .map_err(|err| log::debug!("no coverage for fallback face {font_idx}: {err:#}"))
+                .ok()
+        });
+        let Some(coverage) = coverage else {
+            return false;
+        };
+        std::iter::once(first)
+            .chain(chars)
+            .all(|c| is_emoji_joiner(c) || coverage.emoji.contains(c as u32) == Some(false))
     }
 
     fn load_fallback(&self, font_idx: FallbackIdx) -> anyhow::Result<Option<RefMut<'_, FontPair>>> {
@@ -161,11 +248,6 @@ impl HarfbuzzShaper {
                         face,
                         font: RefCell::new(font),
                         shaped_any: false,
-                        presentation: if handle.assume_emoji_presentation {
-                            Presentation::Emoji
-                        } else {
-                            Presentation::Text
-                        },
                         features,
                         last_size_and_dpi: RefCell::new(None),
                     });
@@ -248,20 +330,31 @@ impl HarfbuzzShaper {
         // behavior without discarding the original text's clusters or widths.
 
         loop {
+            // Decide from the face's handle, before loading it, whether it
+            // can contribute (ft-yccm0.2.12).
+            if let Some(handle) = self.handles.get(font_idx) {
+                if let Some(p) = presentation {
+                    let face = face_presentation(handle);
+                    if face != p {
+                        log::trace!(
+                            "wanted presentation is {p:?} != font \
+                                 presentation {face:?} so skip \
+                                 font_idx={font_idx}"
+                        );
+                        self.count(|stats| stats.skipped_presentation += 1);
+                        font_idx += 1;
+                        continue;
+                    }
+                }
+                // The notdef pass must still shape the base font.
+                if !no_more_fallbacks && self.lacks_every_emoji(font_idx, shaping_text) {
+                    self.count(|stats| stats.skipped_coverage += 1);
+                    font_idx += 1;
+                    continue;
+                }
+            }
             match self.load_fallback(font_idx).context("load_fallback")? {
                 Some(mut pair) => {
-                    if let Some(p) = presentation {
-                        if pair.presentation != p {
-                            log::trace!(
-                                "wanted presentation is {p:?} != font \
-                                     presentation {:?} so skip \
-                                     font_idx={font_idx}",
-                                pair.presentation
-                            );
-                            font_idx += 1;
-                            continue;
-                        }
-                    }
                     let point_size = font_size * self.handles[font_idx].scale.unwrap_or(1.);
 
                     // Tell harfbuzz to recompute important font metrics!
@@ -307,6 +400,7 @@ impl HarfbuzzShaper {
 
                     let mut font = pair.font.borrow_mut();
                     shaped_any = pair.shaped_any;
+                    self.count(|stats| stats.faces_shaped += 1);
                     font.shape(&mut buf, pair.features.as_slice());
                     log::trace!(
                         "shaped font_idx={} {:?} presentation={presentation:?} as: {}",
@@ -649,6 +743,10 @@ impl FontShaper for HarfbuzzShaper {
         result
     }
 
+    fn walk_stats(&self) -> FallbackWalkStats {
+        self.walk_stats.get()
+    }
+
     fn metrics_for_idx(&self, font_idx: usize, size: f64, dpi: u32) -> anyhow::Result<FontMetrics> {
         let mut pair = self
             .load_fallback(font_idx)?
@@ -689,7 +787,7 @@ impl FontShaper for HarfbuzzShaper {
             cap_height_ratio: selected_size.cap_height_to_height_ratio,
             cap_height: selected_size.cap_height.map(PixelLength::new),
             is_scaled: selected_size.is_scaled,
-            presentation: pair.presentation,
+            presentation: face_presentation(&self.handles[font_idx]),
             force_y_adjust: PixelLength::new(0.),
         };
 
@@ -916,6 +1014,138 @@ mod test {
             .unwrap()
             .clone();
         vec![handle; count]
+    }
+
+    /// The default configuration's bundled chain past the primary font: a
+    /// text face, the color emoji face, then a symbol face.
+    fn emoji_chain_handles() -> Vec<ParsedFont> {
+        let db = FontDatabase::with_built_in().unwrap();
+        [
+            "JetBrains Mono",
+            "Noto Color Emoji",
+            "Symbols Nerd Font Mono",
+        ]
+        .into_iter()
+        .map(|family| {
+            db.resolve(&FontAttributes::new(family), 14)
+                .unwrap_or_else(|| panic!("bundled {family}"))
+                .clone()
+        })
+        .collect()
+    }
+
+    /// An emoji-window codepoint of the T0 blocks that no face of `handles`
+    /// maps, found from the faces' own coverage.
+    fn uncovered_t0_codepoint(handles: &[ParsedFont]) -> char {
+        (0x1FA70..0x1FB00)
+            .chain(0x1F900..0x1FA00)
+            .filter_map(char::from_u32)
+            .find(|&c| {
+                handles.iter().all(|handle| {
+                    handle.coverage().unwrap().emoji.contains(c as u32) == Some(false)
+                })
+            })
+            .expect("an unassigned codepoint in the T0 blocks")
+    }
+
+    /// ft-yccm0.2.12: skipping faces whose coverage maps none of a run's
+    /// emoji leaves every glyph and every missing-codepoint request exactly
+    /// as the full walk produces them.
+    #[test]
+    fn coverage_skip_matches_the_full_fallback_walk_exactly() {
+        let handles = emoji_chain_handles();
+        let config = config::configuration();
+        let missing = uncovered_t0_codepoint(&handles);
+        assert_eq!(
+            handles[1].coverage().unwrap().emoji.contains(0x1F600),
+            Some(true),
+            "the emoji face maps U+1F600"
+        );
+        let texts = [
+            "\u{1F600}\u{1F642}".to_string(),
+            missing.to_string(),
+            format!("\u{1F600}{missing}\u{1F642}"),
+            format!("\u{1F600}\u{FE0F}{missing}\u{FE0F}"),
+            "\u{1F468}\u{200D}\u{1F469}\u{1F680}".to_string(),
+            format!("ab\u{1F600} {missing}c"),
+            format!("\u{FE0F}{missing}"),
+        ];
+        let (mut skipping, mut walking) =
+            (FallbackWalkStats::default(), FallbackWalkStats::default());
+        for text in &texts {
+            for presentation in [None, Some(Presentation::Emoji), Some(Presentation::Text)] {
+                for direction in [Direction::LeftToRight, Direction::RightToLeft] {
+                    let shape = |skip: bool| {
+                        let shaper =
+                            HarfbuzzShaper::with_coverage_skip(&config, &handles, skip).unwrap();
+                        let mut requested = Vec::new();
+                        let glyphs = shaper
+                            .shape(
+                                text,
+                                12.,
+                                96,
+                                &mut requested,
+                                presentation,
+                                direction,
+                                None,
+                                None,
+                            )
+                            .unwrap();
+                        (glyphs, requested, shaper.walk_stats())
+                    };
+                    let (glyphs, requested, with_skip) = shape(true);
+                    let (expected, expected_requested, without_skip) = shape(false);
+                    assert_eq!(glyphs, expected, "{text:?} {presentation:?} {direction:?}");
+                    assert_eq!(requested, expected_requested, "{text:?}");
+                    assert_eq!(without_skip.skipped_coverage, 0);
+                    skipping = skipping + with_skip;
+                    walking = walking + without_skip;
+                }
+            }
+        }
+        assert!(skipping.skipped_coverage > 0);
+        assert!(
+            skipping.faces_shaped < walking.faces_shaped,
+            "{skipping:?} vs {walking:?}"
+        );
+    }
+
+    /// ft-yccm0.2.12: an emoji no face maps costs one shape (the notdef
+    /// placeholder) instead of a walk that shapes every face twice.
+    #[test]
+    fn an_uncovered_emoji_shapes_only_the_notdef_placeholder() {
+        let handles = emoji_chain_handles();
+        let config = config::configuration();
+        let missing = uncovered_t0_codepoint(&handles).to_string();
+        let shape = |skip: bool| {
+            let shaper = HarfbuzzShaper::with_coverage_skip(&config, &handles, skip).unwrap();
+            let glyphs = shaper
+                .shape(
+                    &missing,
+                    12.,
+                    96,
+                    &mut Vec::new(),
+                    Some(Presentation::Emoji),
+                    Direction::LeftToRight,
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert!(glyphs.iter().all(|glyph| glyph.glyph_pos == 0));
+            (
+                shaper.walk_stats(),
+                shaper
+                    .fonts
+                    .iter()
+                    .filter(|slot| slot.borrow().is_some())
+                    .count(),
+            )
+        };
+        let (skipping, loaded) = shape(true);
+        assert_eq!(skipping.faces_shaped, 1, "{skipping:?}");
+        assert_eq!(loaded, 1, "only the base face is loaded");
+        let (walking, _) = shape(false);
+        assert_eq!(walking.faces_shaped, 5, "{walking:?}");
     }
 
     #[test]
