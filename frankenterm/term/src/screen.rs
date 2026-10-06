@@ -12274,6 +12274,13 @@ pub(crate) mod tests {
             cold_sink: Some(sink.clone()),
             ..TestTermConfig::default()
         });
+        // The direct install keeps the fixture's coordinate identity, but
+        // Screen caches the scrollback size and tier per configuration
+        // (9b987f57d). Re-read them as the next parse batch would, or the
+        // spill below still runs under the fixture's tier-disabled policy and
+        // never reaches the sink or the fragment republication (ft-4w698
+        // follow-up).
+        screen.refresh_scrollback_policy();
         let read = screen
             .capture_line_read(0..1)
             .unwrap()
