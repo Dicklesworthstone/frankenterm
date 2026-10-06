@@ -19,7 +19,7 @@
 
 use base64::Engine as _;
 use chacha20poly1305::{
-    aead::{common::getrandom, Aead, KeyInit, Payload},
+    aead::{common::getrandom, Aead, AeadInOut, KeyInit, Payload},
     XChaCha20Poly1305, XNonce,
 };
 use sha2::{Digest as _, Sha256};
@@ -505,15 +505,13 @@ impl GuardianEncryptedScrollbackRow {
         bytes
             .try_reserve_exact(binary_bytes)
             .map_err(|_| GuardianScrollbackRowError::AllocationFailed)?;
-        bytes.extend_from_slice(&SCROLLBACK_ROW_FORMAT_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&self.key_id);
-        bytes.extend_from_slice(&self.identity.durable_pane_id);
-        bytes.extend_from_slice(&self.identity.content_epoch);
-        bytes.extend_from_slice(&self.identity.revision.to_le_bytes());
-        bytes.extend_from_slice(&self.identity.stable_row.to_le_bytes());
-        bytes.extend_from_slice(&self.identity.sequence.to_le_bytes());
-        bytes.extend_from_slice(&self.plaintext_bytes.to_le_bytes());
-        bytes.extend_from_slice(&self.nonce);
+        push_scrollback_row_header(
+            &mut bytes,
+            self.key_id,
+            self.identity,
+            self.plaintext_bytes,
+            &self.nonce,
+        );
         bytes.extend_from_slice(&self.ciphertext);
         let encoded_capacity = binary_bytes
             .checked_add(2)
@@ -805,6 +803,66 @@ impl GuardianOutputCipher {
             nonce,
             ciphertext,
         })
+    }
+
+    /// Seal one row straight into its canonical storage record, appended to
+    /// `record`: byte for byte what `seal_scrollback_row(..)?.encode()`
+    /// writes for the same nonce. `scratch` is reused across rows, so in
+    /// steady state sealing allocates nothing (ft-yccm0.2.1.4). Encryption
+    /// runs in place, so no plaintext copy outlives the call, and `record`
+    /// is unchanged on error.
+    pub fn seal_scrollback_row_into(
+        &self,
+        identity: GuardianScrollbackRowIdentity,
+        plaintext: &[u8],
+        scratch: &mut Vec<u8>,
+        record: &mut String,
+    ) -> Result<(), GuardianScrollbackRowError> {
+        let plaintext_bytes = u32::try_from(plaintext.len())
+            .map_err(|_| GuardianScrollbackRowError::RecordByteLimit)?;
+        if plaintext_bytes == 0 || plaintext_bytes > SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES {
+            return Err(GuardianScrollbackRowError::RecordByteLimit);
+        }
+        let binary_bytes = SCROLLBACK_ROW_HEADER_BYTES
+            .checked_add(plaintext.len())
+            .and_then(|bytes| bytes.checked_add(AEAD_TAG_BYTES_USIZE))
+            .ok_or(GuardianScrollbackRowError::ArithmeticOverflow)?;
+        let encoded_bytes = binary_bytes
+            .checked_add(2)
+            .and_then(|bytes| bytes.checked_div(3))
+            .and_then(|bytes| bytes.checked_mul(4))
+            .and_then(|bytes| bytes.checked_add(SCROLLBACK_ROW_RECORD_PREFIX.len()))
+            .ok_or(GuardianScrollbackRowError::ArithmeticOverflow)?;
+        scratch.clear();
+        scratch
+            .try_reserve(binary_bytes)
+            .map_err(|_| GuardianScrollbackRowError::AllocationFailed)?;
+        record
+            .try_reserve(encoded_bytes)
+            .map_err(|_| GuardianScrollbackRowError::AllocationFailed)?;
+        let mut nonce = [0; NONCE_BYTES];
+        if fill_nonce(&mut nonce).is_err() {
+            nonce.zeroize();
+            return Err(GuardianScrollbackRowError::EntropyUnavailable);
+        }
+        push_scrollback_row_header(scratch, self.key_id, identity, plaintext_bytes, &nonce);
+        scratch.extend_from_slice(plaintext);
+        let aad = scrollback_row_aad(self.key_id, identity, plaintext_bytes);
+        let tag = match self.cipher.encrypt_inout_detached(
+            &XNonce::from(nonce),
+            &aad,
+            (&mut scratch[SCROLLBACK_ROW_HEADER_BYTES..]).into(),
+        ) {
+            Ok(tag) => tag,
+            Err(_) => {
+                scratch.zeroize();
+                return Err(GuardianScrollbackRowError::EncryptionFailed);
+            }
+        };
+        scratch.extend_from_slice(&tag);
+        record.push_str(SCROLLBACK_ROW_RECORD_PREFIX);
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode_string(&scratch[..], record);
+        Ok(())
     }
 
     /// Authenticate and open one exact row at its expected durable location.
@@ -1161,22 +1219,53 @@ impl GuardianOutputCipher {
     }
 }
 
+const SCROLLBACK_ROW_AAD_BYTES: usize = SCROLLBACK_ROW_AEAD_DOMAIN.len() + 72;
+
+/// The row's AEAD associated data, built on the stack: sealing a row
+/// allocates nothing for it (ft-yccm0.2.1.4).
 fn scrollback_row_aad(
     key_id: [u8; KEY_ID_BYTES],
     identity: GuardianScrollbackRowIdentity,
     plaintext_bytes: u32,
-) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(SCROLLBACK_ROW_AEAD_DOMAIN.len() + 72);
-    aad.extend_from_slice(SCROLLBACK_ROW_AEAD_DOMAIN);
-    aad.extend_from_slice(&SCROLLBACK_ROW_FORMAT_VERSION.to_le_bytes());
-    aad.extend_from_slice(&key_id);
-    aad.extend_from_slice(&identity.durable_pane_id);
-    aad.extend_from_slice(&identity.content_epoch);
-    aad.extend_from_slice(&identity.revision.to_le_bytes());
-    aad.extend_from_slice(&identity.stable_row.to_le_bytes());
-    aad.extend_from_slice(&identity.sequence.to_le_bytes());
-    aad.extend_from_slice(&plaintext_bytes.to_le_bytes());
+) -> [u8; SCROLLBACK_ROW_AAD_BYTES] {
+    let mut aad = [0; SCROLLBACK_ROW_AAD_BYTES];
+    let mut at = 0;
+    for part in [
+        SCROLLBACK_ROW_AEAD_DOMAIN,
+        &SCROLLBACK_ROW_FORMAT_VERSION.to_le_bytes(),
+        &key_id,
+        &identity.durable_pane_id,
+        &identity.content_epoch,
+        &identity.revision.to_le_bytes(),
+        &identity.stable_row.to_le_bytes(),
+        &identity.sequence.to_le_bytes(),
+        &plaintext_bytes.to_le_bytes(),
+    ] {
+        aad[at..at + part.len()].copy_from_slice(part);
+        at += part.len();
+    }
+    debug_assert_eq!(at, SCROLLBACK_ROW_AAD_BYTES);
     aad
+}
+
+/// The 96-byte row header shared by `encode` and `seal_scrollback_row_into`,
+/// so both always write the same layout.
+fn push_scrollback_row_header(
+    bytes: &mut Vec<u8>,
+    key_id: [u8; KEY_ID_BYTES],
+    identity: GuardianScrollbackRowIdentity,
+    plaintext_bytes: u32,
+    nonce: &[u8; NONCE_BYTES],
+) {
+    bytes.extend_from_slice(&SCROLLBACK_ROW_FORMAT_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&key_id);
+    bytes.extend_from_slice(&identity.durable_pane_id);
+    bytes.extend_from_slice(&identity.content_epoch);
+    bytes.extend_from_slice(&identity.revision.to_le_bytes());
+    bytes.extend_from_slice(&identity.stable_row.to_le_bytes());
+    bytes.extend_from_slice(&identity.sequence.to_le_bytes());
+    bytes.extend_from_slice(&plaintext_bytes.to_le_bytes());
+    bytes.extend_from_slice(nonce);
 }
 
 fn scrollback_manifest_aad(
@@ -4349,6 +4438,67 @@ mod tests {
                 .expect("authenticate chunk-boundary row");
             assert_eq!(opened.as_slice(), plaintext);
         }
+    }
+
+    /// ft-yccm0.2.1.4: rows sealed in place into one batch string are the
+    /// canonical records `seal_scrollback_row(..)?.encode()` writes: each one
+    /// parses, reencodes to itself and opens at its location; the scratch
+    /// keeps no plaintext; a refused row leaves the batch untouched.
+    #[test]
+    fn in_place_sealed_rows_are_canonical_records_in_one_batch_string() {
+        let cipher = cipher();
+        let secret = b"semantic-row-secret-with-style-width-and-link";
+        let mut scratch = Vec::new();
+        let mut batch = String::from("prior-batch-bytes");
+        let mut spans = Vec::new();
+        for plaintext_bytes in [1, 2, 3, 655, 656, 657, 4096] {
+            let mut plaintext = secret.repeat(plaintext_bytes / secret.len() + 1);
+            plaintext.truncate(plaintext_bytes);
+            let start = batch.len();
+            cipher
+                .seal_scrollback_row_into(
+                    scrollback_identity(),
+                    &plaintext,
+                    &mut scratch,
+                    &mut batch,
+                )
+                .expect("seal row in place");
+            spans.push((start..batch.len(), plaintext));
+            // A 16-byte probe: a shorter one could match header bytes by chance.
+            let probe = &secret[..16];
+            assert!(
+                plaintext_bytes < probe.len() || !scratch.windows(probe.len()).any(|w| w == probe),
+                "the scratch holds ciphertext only"
+            );
+        }
+        assert!(batch.starts_with("prior-batch-bytes"));
+        for (span, plaintext) in &spans {
+            let record = &batch[span.clone()];
+            assert!(!record.contains("semantic-row-secret"));
+            let parsed = GuardianEncryptedScrollbackRow::parse(record).expect("parse in-place row");
+            assert_eq!(parsed.encode().expect("reencode in-place row"), record);
+            assert_eq!(parsed.identity(), scrollback_identity());
+            assert_eq!(parsed.key_id(), cipher.key_id());
+            let opened = cipher
+                .open_scrollback_row(&parsed, [0x42; 16], [0x24; 16], -3, 11, 8192)
+                .expect("authenticate in-place row");
+            assert_eq!(opened.as_slice(), plaintext.as_slice());
+
+            let mut tampered = parsed;
+            let last = tampered.ciphertext.len() - 1;
+            tampered.ciphertext[last] ^= 0x01;
+            assert!(matches!(
+                cipher.open_scrollback_row(&tampered, [0x42; 16], [0x24; 16], -3, 11, 8192),
+                Err(GuardianScrollbackRowError::DecryptionFailed)
+            ));
+        }
+
+        let before = batch.clone();
+        assert!(matches!(
+            cipher.seal_scrollback_row_into(scrollback_identity(), b"", &mut scratch, &mut batch),
+            Err(GuardianScrollbackRowError::RecordByteLimit)
+        ));
+        assert_eq!(batch, before, "a refused row leaves the batch untouched");
     }
 
     #[test]

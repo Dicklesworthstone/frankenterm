@@ -9682,6 +9682,193 @@ fn encode_exact_scrollback_line_record(
         .ok()
 }
 
+/// `encode_exact_scrollback_line_record`, sealed in place and appended to
+/// `records`, a batch string whose capacity is reused with `scratch` from
+/// window to window (ft-yccm0.2.1.4). Same record bytes; returns false and
+/// leaves `records` unchanged when the row cannot be sealed.
+fn encode_exact_scrollback_line_record_into(
+    line: &wezterm_term::Line,
+    cipher: &mux::guardian_output_journal::GuardianOutputCipher,
+    identity: mux::guardian_output_journal::GuardianScrollbackRowIdentity,
+    scratch: &mut Vec<u8>,
+    records: &mut String,
+) -> bool {
+    let Some(plaintext) = serialize_exact_semantic_scrollback_line(line) else {
+        return false;
+    };
+    let compressed = compress_exact_scrollback_plaintext(&plaintext);
+    let payload = compressed.as_deref().unwrap_or(&plaintext);
+    cipher
+        .seal_scrollback_row_into(identity, payload, scratch, records)
+        .is_ok()
+}
+
+/// Benchmark hooks for the durable scrollback record path (ft-yccm0.2.1.4):
+/// the per-row stages the store's writer runs, on rows built here. Not an
+/// API; `benches/scrollback_record_encode.rs` is the only caller.
+#[doc(hidden)]
+pub mod scrollback_record_bench {
+    /// `count` printable rows of `text_bytes` cells, one attribute run each.
+    pub struct Rows(Vec<wezterm_term::Line>);
+
+    impl Rows {
+        #[must_use]
+        pub fn printable(count: usize, text_bytes: usize) -> Self {
+            Self(
+                (0..count)
+                    .map(|row| {
+                        let text: String = (0..text_bytes)
+                            .map(|column| char::from(b'!' + ((row + column) % 94) as u8))
+                            .collect();
+                        wezterm_term::Line::from_text(
+                            &text,
+                            &wezterm_term::CellAttributes::blank(),
+                            1,
+                            None,
+                        )
+                    })
+                    .collect(),
+            )
+        }
+
+        /// T0-like rows of `cells` columns: a wide emoji per cell pair, each
+        /// with a fresh palette foreground and background, as
+        /// `color-emoji-random` prints.
+        #[must_use]
+        pub fn emoji_colors(count: usize, cells: usize) -> Self {
+            const EMOJI: [&str; 4] = ["\u{1f600}", "\u{1f680}", "\u{1f916}", "\u{1f389}"];
+            Self(
+                (0..count)
+                    .map(|row| {
+                        let mut line = wezterm_term::Line::with_width(cells, 1);
+                        for column in (0..cells).step_by(2) {
+                            let mut attrs = wezterm_term::CellAttributes::blank();
+                            attrs.set_foreground(termwiz::color::ColorAttribute::PaletteIndex(
+                                ((row * 7 + column) % 256) as u8,
+                            ));
+                            attrs.set_background(termwiz::color::ColorAttribute::PaletteIndex(
+                                ((row * 13 + column * 3) % 256) as u8,
+                            ));
+                            line.set_cell(
+                                column,
+                                wezterm_term::Cell::new_grapheme(
+                                    EMOJI[(row + column) % EMOJI.len()],
+                                    attrs,
+                                    None,
+                                ),
+                                1,
+                            );
+                        }
+                        line
+                    })
+                    .collect(),
+            )
+        }
+
+        /// UTF-8 bytes of the rows' visible text.
+        #[must_use]
+        pub fn text_bytes(&self) -> u64 {
+            self.0
+                .iter()
+                .flat_map(wezterm_term::Line::visible_cells)
+                .map(|cell| cell.str().len() as u64)
+                .sum()
+        }
+    }
+
+    /// One row sealer with a fresh key, sealing rows as the store does.
+    pub struct Sealer {
+        cipher: mux::guardian_output_journal::GuardianOutputCipher,
+    }
+
+    impl Sealer {
+        #[must_use]
+        pub fn new() -> Self {
+            let key = mux::guardian_output_journal::GuardianOutputKey::generate()
+                .expect("bench key from OS entropy");
+            Self {
+                cipher: key.cipher().expect("bench cipher"),
+            }
+        }
+
+        /// The exact semantic plaintext only; returns its total bytes.
+        #[must_use]
+        pub fn serialize(&self, rows: &Rows) -> usize {
+            rows.0
+                .iter()
+                .map(|line| {
+                    super::serialize_exact_semantic_scrollback_line(line)
+                        .expect("bench row serializes")
+                        .len()
+                })
+                .sum()
+        }
+
+        /// Plaintext then compression (the input sealing gets); returns the
+        /// total bytes sealing would take: (plaintext, compressed-or-plain).
+        #[must_use]
+        pub fn serialize_and_compress(&self, rows: &Rows) -> (usize, usize) {
+            rows.0.iter().fold((0, 0), |(plain, sealed), line| {
+                let plaintext = super::serialize_exact_semantic_scrollback_line(line)
+                    .expect("bench row serializes");
+                let compressed = super::compress_exact_scrollback_plaintext(&plaintext);
+                let payload = compressed
+                    .as_deref()
+                    .map_or(plaintext.len(), |payload| payload.len());
+                (plain + plaintext.len(), sealed + payload)
+            })
+        }
+
+        /// The full per-row record path: serialize, compress, seal, encode.
+        /// Returns the total record bytes the ledger would store.
+        #[must_use]
+        pub fn seal(&self, rows: &Rows) -> usize {
+            rows.0
+                .iter()
+                .enumerate()
+                .map(|(row, line)| {
+                    let identity =
+                        mux::guardian_output_journal::GuardianScrollbackRowIdentity::new(
+                            [0x5a; 16], [0xa5; 16], 1, row as i64, row as u64,
+                        )
+                        .expect("bench row identity");
+                    super::encode_exact_scrollback_line_record(line, &self.cipher, identity)
+                        .expect("bench row seals")
+                        .len()
+                })
+                .sum()
+        }
+    }
+
+    impl Sealer {
+        /// The same records, sealed in place into one reused batch string.
+        /// Returns the batch's record bytes (without row separators).
+        pub fn seal_into(&self, rows: &Rows, scratch: &mut Vec<u8>, records: &mut String) -> usize {
+            records.clear();
+            for (row, line) in rows.0.iter().enumerate() {
+                let identity = mux::guardian_output_journal::GuardianScrollbackRowIdentity::new(
+                    [0x5a; 16], [0xa5; 16], 1, row as i64, row as u64,
+                )
+                .expect("bench row identity");
+                assert!(super::encode_exact_scrollback_line_record_into(
+                    line,
+                    &self.cipher,
+                    identity,
+                    scratch,
+                    records,
+                ));
+            }
+            records.len()
+        }
+    }
+
+    impl Default for Sealer {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+}
+
 /// Compress only the exact semantic bytes, before the existing AEAD boundary.
 /// Each frame is independent; the thread-local context only reuses workspace,
 /// never a dictionary from another row. Failed or unhelpful compression leaves

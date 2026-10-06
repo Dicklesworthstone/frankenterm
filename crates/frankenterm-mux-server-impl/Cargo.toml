@@ -78,5 +78,9 @@ proptest = "1.8.0"
 name = "dispatch_throughput"
 harness = false
 
+[[bench]]
+name = "scrollback_record_encode"
+harness = false
+
 [lints]
 workspace = true
