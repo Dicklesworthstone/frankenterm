@@ -8,11 +8,19 @@
 //       and whether FAMILY is installed. Never prompts.
 //   frame-meter capture --pid PID --out FILE --stop-file PATH
 //                       [--ready-file PATH] [--max-seconds N]
+//                       [--title-contains TOKEN] [--title-wait-seconds N]
 //                       [--window-wait-seconds N] [--max-width PX] [--fps-cap N]
-//       Captures the largest on-screen window of PID with ScreenCaptureKit
-//       until PATH exists, writing one JSON line per delivered frame: display
-//       time, arrival time, SCFrameStatus, dirty-rect area fraction and a
-//       pixel hash. The ready file is written once frames are flowing.
+//       Captures a window of PID with ScreenCaptureKit until PATH exists,
+//       writing one JSON line per delivered frame: display time, arrival
+//       time, SCFrameStatus, dirty-rect area fraction and a pixel hash. The
+//       window is the largest on-screen one whose title contains TOKEN; only
+//       after --title-wait-seconds without one does it fall back to the
+//       largest window of PID (recorded as title_verified false). A process
+//       can briefly own other windows (Ghostty replaced its first one under
+//       load, ft-zkjhg). When frames report the stream suspended or stopped,
+//       the window is matched again and the stream follows it ("reacquire"
+//       records). The ready file is written once frames are flowing. A
+//       capture that cannot start writes an "error" record saying why.
 //   frame-meter probe --pid PID --out FILE --stop-file PATH
 //                     [--interval-ms N] [--timeout-ms N] [--hang-ms N]
 //                     [--sample-dir DIR] [--max-samples N]
@@ -212,15 +220,30 @@ func rectArea(_ value: Any) -> Double {
     return 0
 }
 
-final class FrameRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
+/// SCFrameStatus values that mean the captured window stopped producing
+/// frames: suspended (3) and stopped (5).
+let interruptedStatuses: Set<Int> = [
+    SCFrameStatus.suspended.rawValue, SCFrameStatus.stopped.rawValue,
+]
+
+final class FrameRecorder: NSObject, SCStreamOutput {
     let writer: LineWriter
     let lock = NSLock()
     var statusCounts: [Int: Int] = [:]
     var frames = 0
-    var stopError: String?
+    var lastCompleteNs: UInt64 = 0
+    /// Called on the sample queue when a frame reports the stream suspended
+    /// or stopped, with that frame's arrival time.
+    var onInterruption: ((Int, UInt64) -> Void)?
 
     init(writer: LineWriter) {
         self.writer = writer
+    }
+
+    func lastComplete() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastCompleteNs
     }
 
     func stream(
@@ -257,44 +280,271 @@ final class FrameRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         lock.lock()
         statusCounts[status, default: 0] += 1
         frames += 1
+        if status == SCFrameStatus.complete.rawValue {
+            lastCompleteNs = arrival
+        }
+        let handler = onInterruption
         lock.unlock()
-    }
-
-    func stream(_ stream: SCStream, didStopWithError error: Error) {
-        lock.lock()
-        stopError = String(describing: error)
-        lock.unlock()
+        if interruptedStatuses.contains(status) {
+            handler?(status, arrival)
+        }
     }
 }
 
-var captureStream: SCStream?
-var captureRecorder: FrameRecorder?
+/// Writes an `error` record the harness reads back, then exits.
+func failRecord(
+    _ writer: LineWriter, _ code: Int32, _ reason: String, extra: [String: Any] = [:]
+) -> Never {
+    var record: [String: Any] = [
+        "type": "error", "code": code, "reason": reason, "at_ns": uptimeNs(),
+    ]
+    record.merge(extra) { current, _ in current }
+    writer.write(record)
+    writer.close()
+    fail(code, reason)
+}
 
-func findWindow(pid: pid_t, deadline: Date, completion: @escaping (SCWindow, SCShareableContent) -> Void) {
-    SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
-        if let error = error {
-            let text = String(describing: error)
-            if !CGPreflightScreenCaptureAccess() {
-                fail(4, "Screen Recording permission denied (\(text))")
-            }
-            fail(5, "listing shareable content failed: \(text)")
+func describeWindow(_ window: SCWindow) -> [String: Any] {
+    [
+        "window_id": window.windowID,
+        "title": window.title ?? "",
+        "on_screen": window.isOnScreen,
+        "layer": window.windowLayer,
+        "frame_points": [
+            window.frame.origin.x, window.frame.origin.y, window.frame.width, window.frame.height,
+        ],
+    ]
+}
+
+struct WindowChoice {
+    let window: SCWindow
+    /// The window's title contains the run token.
+    let titleVerified: Bool
+    /// Every on-screen window of the process at the time of the choice.
+    let candidates: [[String: Any]]
+}
+
+/// The window to capture: the largest on-screen window of `pid` whose title
+/// contains `token`, or, only when `allowUnverified`, the largest of all.
+/// A process can briefly own windows that are not the terminal (Ghostty
+/// replaced its first window under load in nv3, ft-zkjhg), so the token is
+/// what proves the match.
+func chooseWindow(
+    _ content: SCShareableContent, pid: pid_t, token: String?, allowUnverified: Bool
+) -> WindowChoice? {
+    let owned = content.windows.filter {
+        $0.owningApplication?.processID == pid && $0.isOnScreen && $0.frame.width >= 100
+            && $0.frame.height >= 100
+    }
+    let candidates = owned.map(describeWindow)
+    let smaller: (SCWindow, SCWindow) -> Bool = {
+        $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height
+    }
+    if let token = token, !token.isEmpty {
+        if let match = owned.filter({ ($0.title ?? "").contains(token) }).max(by: smaller) {
+            return WindowChoice(window: match, titleVerified: true, candidates: candidates)
         }
-        let candidates = (content?.windows ?? []).filter {
-            $0.owningApplication?.processID == pid && $0.isOnScreen && $0.frame.width >= 100
-                && $0.frame.height >= 100
+        if !allowUnverified {
+            return nil
         }
+    }
+    guard let best = owned.max(by: smaller) else { return nil }
+    return WindowChoice(window: best, titleVerified: false, candidates: candidates)
+}
+
+func shareableContent(_ completion: @escaping (SCShareableContent?, Error?) -> Void) {
+    SCShareableContent.getExcludingDesktopWindows(
+        false, onScreenWindowsOnly: true, completionHandler: completion)
+}
+
+/// Polls until a window qualifies: one titled with `token` until
+/// `titleDeadline`, any window of `pid` after it, nothing after `deadline`.
+func findWindow(
+    pid: pid_t, token: String?, titleDeadline: Date, deadline: Date, writer: LineWriter,
+    completion: @escaping (WindowChoice, SCShareableContent) -> Void
+) {
+    shareableContent { content, error in
+        if let error = error, !CGPreflightScreenCaptureAccess() {
+            failRecord(writer, 4, "Screen Recording permission denied (\(error))")
+        }
+        let allowUnverified = Date() > titleDeadline
         if let content = content,
-            let window = candidates.max(by: {
-                $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height
-            })
+            let choice = chooseWindow(
+                content, pid: pid, token: token, allowUnverified: allowUnverified)
         {
-            completion(window, content)
-        } else if Date() > deadline {
-            fail(3, "no on-screen window of pid \(pid) appeared")
-        } else {
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.25) {
-                findWindow(pid: pid, deadline: deadline, completion: completion)
+            completion(choice, content)
+            return
+        }
+        if Date() > deadline {
+            let seen =
+                content.map { listed in
+                    listed.windows.filter { $0.owningApplication?.processID == pid }.map(
+                        describeWindow)
+                } ?? []
+            let titled = token.map { " titled with \"\($0)\"" } ?? ""
+            failRecord(
+                writer, 3, "no on-screen window of pid \(pid)\(titled) appeared",
+                extra: [
+                    "candidates": seen,
+                    "listing_error": error.map { String(describing: $0) } ?? "",
+                ])
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.25) {
+            findWindow(
+                pid: pid, token: token, titleDeadline: titleDeadline, deadline: deadline,
+                writer: writer, completion: completion)
+        }
+    }
+}
+
+/// One capture: the stream, the window it follows, and re-acquisition when
+/// the window stops producing frames (suspended, stopped, or replaced).
+final class CaptureSession: NSObject, SCStreamDelegate {
+    static let maxAttempts = 40
+
+    let pid: pid_t
+    let token: String?
+    let writer: LineWriter
+    let recorder: FrameRecorder
+    let configuration: SCStreamConfiguration
+    let sampleQueue = DispatchQueue(label: "frame-meter.samples")
+    let control = DispatchQueue(label: "frame-meter.control")
+    // Guarded by `control`.
+    var stream: SCStream?
+    var windowID: CGWindowID = 0
+    var titleVerified = false
+    var reacquiring = false
+    var attempts = 0
+    var stopError: String?
+
+    init(
+        pid: pid_t, token: String?, writer: LineWriter, recorder: FrameRecorder,
+        configuration: SCStreamConfiguration
+    ) {
+        self.pid = pid
+        self.token = token
+        self.writer = writer
+        self.recorder = recorder
+        self.configuration = configuration
+        super.init()
+        recorder.onInterruption = { [weak self] status, at in
+            self?.requestReacquire(reason: "frame status \(status)", since: at)
+        }
+    }
+
+    /// Starts a stream on `choice`; `then` receives the start error, if any.
+    func start(_ choice: WindowChoice, then: @escaping (Error?) -> Void) {
+        let filter = SCContentFilter(desktopIndependentWindow: choice.window)
+        let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
+        do {
+            try stream.addStreamOutput(recorder, type: .screen, sampleHandlerQueue: sampleQueue)
+        } catch {
+            then(error)
+            return
+        }
+        control.sync {
+            self.stream = stream
+            self.windowID = choice.window.windowID
+            self.titleVerified = choice.titleVerified
+        }
+        stream.startCapture(completionHandler: then)
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        let text = String(describing: error)
+        control.sync {
+            self.stopError = text
+            self.stream = nil
+        }
+        writer.write(["type": "stream_stopped", "at_ns": uptimeNs(), "error": text])
+        requestReacquire(reason: "stream stopped: \(text)", since: uptimeNs())
+    }
+
+    func requestReacquire(reason: String, since: UInt64, delay: Double = 0.25) {
+        control.async {
+            guard !self.reacquiring, self.attempts < CaptureSession.maxAttempts else { return }
+            self.reacquiring = true
+            self.attempts += 1
+            let attempt = self.attempts
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                self.reacquire(reason: reason, since: since, attempt: attempt)
             }
+        }
+    }
+
+    private func finish(_ record: [String: Any], retry: (reason: String, since: UInt64)?) {
+        writer.write(record)
+        control.sync { self.reacquiring = false }
+        if let retry = retry {
+            requestReacquire(reason: retry.reason, since: retry.since, delay: 1.0)
+        }
+    }
+
+    private func reacquire(reason: String, since: UInt64, attempt: Int) {
+        shareableContent { content, error in
+            let (currentID, verified, stream) = self.control.sync {
+                (self.windowID, self.titleVerified, self.stream)
+            }
+            var record: [String: Any] = [
+                "type": "reacquire", "reason": reason, "attempt": attempt, "at_ns": uptimeNs(),
+                "since_ns": since,
+            ]
+            guard let content = content,
+                let choice = chooseWindow(
+                    content, pid: self.pid, token: self.token, allowUnverified: !verified)
+            else {
+                record["outcome"] = "no matching window"
+                if let error = error {
+                    record["error"] = String(describing: error)
+                }
+                self.finish(record, retry: (reason, since))
+                return
+            }
+            record["window_id"] = choice.window.windowID
+            record["title"] = choice.window.title ?? ""
+            record["title_verified"] = choice.titleVerified
+            if stream != nil, choice.window.windowID == currentID {
+                // The same window: ScreenCaptureKit resumes it on its own once
+                // it is visible again. Look again later unless it has resumed.
+                let resumed = self.recorder.lastComplete() > since
+                record["outcome"] = resumed ? "same window, resumed" : "same window, waiting"
+                self.finish(record, retry: resumed ? nil : (reason, since))
+                return
+            }
+            if let stream = stream {
+                let filter = SCContentFilter(desktopIndependentWindow: choice.window)
+                stream.updateContentFilter(filter) { error in
+                    record["outcome"] = error == nil ? "switched window" : "switch failed"
+                    if let error = error {
+                        record["error"] = String(describing: error)
+                    } else {
+                        self.control.sync {
+                            self.windowID = choice.window.windowID
+                            self.titleVerified = choice.titleVerified
+                        }
+                    }
+                    self.finish(record, retry: error == nil ? nil : (reason, since))
+                }
+            } else {
+                self.start(choice) { error in
+                    record["outcome"] = error == nil ? "restarted stream" : "restart failed"
+                    if let error = error {
+                        record["error"] = String(describing: error)
+                    }
+                    self.finish(record, retry: error == nil ? nil : (reason, since))
+                }
+            }
+        }
+    }
+
+    func summaryFields() -> [String: Any] {
+        control.sync {
+            [
+                "reacquire_attempts": attempts,
+                "final_window_id": windowID,
+                "final_title_verified": titleVerified,
+                "stream_error": stopError ?? "",
+            ]
         }
     }
 }
@@ -307,12 +557,21 @@ func capture(_ args: Arguments) -> Never {
     let maxSeconds = args.int("max-seconds", 3600)
     let maxWidth = max(160, args.int("max-width", 960))
     let fpsCap = max(1, args.int("fps-cap", 240))
-    let deadline = Date().addingTimeInterval(TimeInterval(args.int("window-wait-seconds", 60)))
+    let token = args.string("title-contains")
+    let waitSeconds = args.int("window-wait-seconds", 60)
+    let deadline = Date().addingTimeInterval(TimeInterval(waitSeconds))
+    let titleDeadline = Date().addingTimeInterval(
+        TimeInterval(min(waitSeconds, args.int("title-wait-seconds", waitSeconds))))
     guard CGPreflightScreenCaptureAccess() else {
-        fail(4, "Screen Recording permission is not granted to this process's responsible app")
+        failRecord(
+            writer, 4,
+            "Screen Recording permission is not granted to this process's responsible app")
     }
 
-    findWindow(pid: pid, deadline: deadline) { window, content in
+    findWindow(
+        pid: pid, token: token, titleDeadline: titleDeadline, deadline: deadline, writer: writer
+    ) { choice, content in
+        let window = choice.window
         let center = CGPoint(x: window.frame.midX, y: window.frame.midY)
         let display = content.displays.first { $0.frame.contains(center) } ?? content.displays.first
         let displayInfo = display.flatMap { displayRecord(for: $0.displayID) } ?? [:]
@@ -344,28 +603,24 @@ func capture(_ args: Arguments) -> Never {
             "capture_pixels": [configuration.width, configuration.height],
             "fps_cap": fpsCap,
             "display": displayInfo,
+            "token": token ?? "",
+            "title_verified": choice.titleVerified,
+            "candidates": choice.candidates,
             "started_ns": uptimeNs(),
         ]
         writer.write(header)
 
         let recorder = FrameRecorder(writer: writer)
-        let filter = SCContentFilter(desktopIndependentWindow: window)
-        let stream = SCStream(filter: filter, configuration: configuration, delegate: recorder)
-        do {
-            try stream.addStreamOutput(
-                recorder, type: .screen,
-                sampleHandlerQueue: DispatchQueue(label: "frame-meter.samples"))
-        } catch {
-            fail(5, "addStreamOutput failed: \(error)")
-        }
-        captureStream = stream
-        captureRecorder = recorder
-        stream.startCapture { error in
+        let session = CaptureSession(
+            pid: pid, token: token, writer: writer, recorder: recorder,
+            configuration: configuration)
+        captureSession = session
+        session.start(choice) { error in
             if let error = error {
                 if !CGPreflightScreenCaptureAccess() {
-                    fail(4, "Screen Recording permission denied (\(error))")
+                    failRecord(writer, 4, "Screen Recording permission denied (\(error))")
                 }
-                fail(5, "startCapture failed: \(error)")
+                failRecord(writer, 5, "startCapture failed: \(error)")
             }
             if let readyFile = readyFile {
                 FileManager.default.createFile(atPath: readyFile, contents: jsonLine(header))
@@ -378,28 +633,37 @@ func capture(_ args: Arguments) -> Never {
             let expired = Date().timeIntervalSince(startedAt) > TimeInterval(maxSeconds)
             guard FileManager.default.fileExists(atPath: stopFile) || expired else { return }
             timer.cancel()
-            stream.stopCapture { error in
+            let writeSummary: (Error?) -> Void = { error in
                 recorder.lock.lock()
                 var counts: [String: Int] = [:]
                 for (status, count) in recorder.statusCounts { counts[String(status)] = count }
-                let summary: [String: Any] = [
+                var summary: [String: Any] = [
                     "type": "summary",
                     "stopped_ns": uptimeNs(),
                     "frames": recorder.frames,
                     "status_counts": counts,
                     "stop_reason": expired ? "max-seconds" : "stop-file",
-                    "stream_error": recorder.stopError ?? (error.map { String(describing: $0) } ?? ""),
+                    "stop_error": error.map { String(describing: $0) } ?? "",
                 ]
                 recorder.lock.unlock()
+                summary.merge(session.summaryFields()) { current, _ in current }
                 writer.write(summary)
                 writer.close()
                 exit(0)
+            }
+            if let stream = session.control.sync(execute: { session.stream }) {
+                stream.stopCapture(completionHandler: writeSummary)
+            } else {
+                writeSummary(nil)
             }
         }
         timer.resume()
     }
     dispatchMain()
 }
+
+/// Keeps the capture session alive for the life of the process.
+var captureSession: CaptureSession?
 
 // MARK: - probe
 

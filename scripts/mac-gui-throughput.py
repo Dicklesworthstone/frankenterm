@@ -245,7 +245,7 @@ def touch(path):
 PANE_SCRIPT = r"""#!/bin/zsh -f
 # Pane workload of scripts/mac-gui-throughput.sh (ft-yccm0.1.4). Generated per
 # run directory; never edit it while a run is going.
-#   measure DIR CORPUS WIDTHS(0|1) PYTHON PROBE
+#   measure DIR CORPUS WIDTHS(0|1) PYTHON PROBE TITLE
 #   flood   DIR CORPUS
 zmodload zsh/zselect zsh/system
 role=$1 dir=$2 corpus=$3
@@ -260,9 +260,11 @@ if [[ $role == flood ]]; then
   done
   exit 0
 fi
-widths=$4 python=$5 probe=$6
+widths=$4 python=$5 probe=$6 title=$7
 print -r -- $$ > $dir/shell.pid.tmp && mv $dir/shell.pid.tmp $dir/shell.pid
-print -rn -- $'\e[0m\e[2J\e[H'
+# The run token as the window title: the frame meter matches the window by
+# it (ft-zkjhg). Ghostty forces the same title with --title.
+print -rn -- $'\e]2;'"$title"$'\a\e[0m\e[2J\e[H'
 print -r -- "ft-gui-throughput: waiting for go"
 while [[ ! -e $dir/go ]]; do [[ -e $dir/stop ]] && exit 0; zselect -t 1; done
 # The operator's method, time cat, in a zsh whose stderr is the time file; the
@@ -419,35 +421,43 @@ def drain_metrics(samples, size, start_ns, exit_ns):
 INTERVAL_BUCKETS = (("1", 1.5), ("2", 2.5), ("3", 3.5), ("4-5", 5.5), ("6-10", 10.5), (">10", float("inf")))
 
 
+def frame_stamp(frame):
+    """A frame record's time: its display time, or its arrival time when the
+    meter got no display time (recorded as 0)."""
+    return frame.get("display_ns") or frame.get("arrival_ns")
+
+
 def fps_metrics(frames, start_ns, end_ns, refresh_hz):
-    """frames: meter frame records. Content-changed frames are SCK 'complete'
-    frames (new window content) whose dirty area is not zero."""
+    """frames: meter frame records. A content-changed frame is an SCK
+    'complete' frame with a nonzero dirty area whose pixels differ from the
+    previous one. ScreenCaptureKit also marks re-presented identical content
+    complete: in nv3 run 3 it reported 51.3 complete frames/s while 39.9/s
+    changed pixels, matching FrankenTerm's own 40.0 presents/s (ft-zkjhg).
+    So the pixel-changed count is the FPS, and `complete_fps` is kept beside
+    it."""
     if not frames or end_ns <= start_ns:
         return None
     duration = (end_ns - start_ns) / 1e9
 
-    def stamp(frame):
-        return frame.get("display_ns") or frame.get("arrival_ns")
-
-    changed, distinct = [], []
+    complete, changed = [], []
     previous_hash = None
     for frame in frames:
         if frame.get("status") != SCK_COMPLETE:
             continue
         if frame.get("dirty_fraction") == 0:
             continue
-        moment = stamp(frame)
+        moment = frame_stamp(frame)
         if moment is None or not (start_ns <= moment <= end_ns):
             previous_hash = frame.get("hash", previous_hash)
             continue
-        changed.append(moment)
-        if frame.get("hash") != previous_hash:
-            distinct.append(moment)
+        complete.append(moment)
+        if frame.get("hash") is None or frame.get("hash") != previous_hash:
+            changed.append(moment)
         previous_hash = frame.get("hash")
     changed.sort()
     period_ms = 1000.0 / refresh_hz if refresh_hz else 1000.0 / 60
-    out = {"window_s": duration, "changed_frames": len(changed), "distinct_frames": len(distinct),
-           "mean_fps": len(changed) / duration, "distinct_fps": len(distinct) / duration}
+    out = {"window_s": duration, "changed_frames": len(changed), "complete_frames": len(complete),
+           "mean_fps": len(changed) / duration, "complete_fps": len(complete) / duration}
     whole_seconds = int(duration)
     if whole_seconds >= 1:
         bins = [0] * whole_seconds
@@ -471,6 +481,77 @@ def fps_metrics(frames, start_ns, end_ns, refresh_hz):
     out["interval_ms"] = ({"p50": percentile(intervals, 0.5), "p95": percentile(intervals, 0.95)}
                           if intervals else None)
     return out
+
+
+SCK_STATUS_NAMES = {0: "complete", 1: "idle", 2: "blank", 3: "suspended", 4: "started", 5: "stopped"}
+SCK_INTERRUPTED = (3, 5)
+# A capture interrupted for more than this share of the drain window gives no FPS.
+MAX_LOST_SHARE = 0.1
+
+
+def assess_capture(records, start_ns, end_ns, expected_title=None):
+    """Whether a frame-meter capture can give an FPS for the drain window
+    [start_ns, end_ns], and if not, why. Returns (info, reason): reason None
+    means usable. A capture that matched the wrong window, was suspended
+    across the drain, or never started yields a reason, never an FPS of 0
+    (ft-zkjhg)."""
+    error = next((r for r in records if r.get("type") == "error"), None)
+    header = next((r for r in records if r.get("type") == "window"), None)
+    frames = [r for r in records if r.get("type") == "frame"]
+    reacquires = [r for r in records if r.get("type") == "reacquire"]
+    switches = [r for r in reacquires if r.get("outcome") in ("switched window", "restarted stream")]
+    info = {"reacquire_attempts": len(reacquires), "window_switches": len(switches)}
+    if header is None:
+        reason = error["reason"] if error else "the frame meter matched no window"
+        return info, f"no capture: {reason}"
+    title = header.get("title") or ""
+    info.update({"window_id": header.get("window_id"), "title": title,
+                 "title_verified": header.get("title_verified")})
+    if switches:
+        last = switches[-1]
+        info.update({"final_window_id": last.get("window_id"), "final_title": last.get("title")})
+    final_title = info.get("final_title", title) or ""
+    title_problem = None
+    if expected_title and expected_title not in final_title:
+        title_problem = (f"the matched window {info.get('final_window_id', header.get('window_id'))} is titled "
+                         f"{final_title!r}, not the run's {expected_title!r}")
+
+    def relative(moment):
+        offset = (moment - start_ns) / 1e9
+        return f"{-offset:.2f} s before the drain started" if offset < 0 else f"{offset:.2f} s into the drain"
+
+    interruptions = []
+    for index, frame in enumerate(frames):
+        if frame.get("status") not in SCK_INTERRUPTED:
+            continue
+        moment = frame_stamp(frame)
+        resumed = next((frame_stamp(later) for later in frames[index + 1:]
+                        if later.get("status") == SCK_COMPLETE and frame_stamp(later) > moment), None)
+        interruptions.append((moment, resumed, SCK_STATUS_NAMES[frame["status"]]))
+    info["interruptions"] = [{"at": relative(moment), "status": name,
+                              "resumed_after_s": None if resumed is None else (resumed - moment) / 1e9}
+                             for moment, resumed, name in interruptions]
+    window_s = (end_ns - start_ns) / 1e9
+    lost_ns = sum(max(0, min(end_ns, resumed if resumed is not None else end_ns) - max(start_ns, moment))
+                  for moment, resumed, _ in interruptions)
+    info["lost_s"] = lost_ns / 1e9
+    in_window = [f for f in frames if f.get("status") == SCK_COMPLETE
+                 and start_ns <= (frame_stamp(f) or 0) <= end_ns]
+    if not in_window:
+        unresolved = [(moment, name) for moment, resumed, name in interruptions
+                      if resumed is None and moment <= end_ns]
+        if unresolved:
+            moment, name = unresolved[-1]
+            reason = f"the capture was {name} {relative(moment)} and never resumed"
+        else:
+            reason = "the capture delivered no complete frames during the drain"
+        return info, reason + (f"; {title_problem}" if title_problem else "")
+    if title_problem:
+        return info, title_problem
+    if window_s > 0 and lost_ns / 1e9 > MAX_LOST_SHARE * window_s:
+        name = interruptions[0][2]
+        return info, f"the capture was {name} for {lost_ns / 1e9:.2f} s of the {window_s:.2f} s drain"
+    return info, None
 
 
 def internal_present_fps(points, start_ns, end_ns):
@@ -558,7 +639,14 @@ RECEIPT_REQUIRED = {
 }
 RUN_REQUIRED = {"index": int, "arm": str, "pids": dict, "load_start": list, "drain": dict,
                 "time": (dict, type(None)), "fps": (dict, type(None)), "beachball": (dict, type(None)),
-                "errors": list}
+                "errors": list, "fps_unavailable": (str, type(None))}
+
+
+def fps_unavailable_refusals(runs):
+    """FPS-verdict refusals for runs whose capture gave no FPS, each with
+    the reason recorded in the run (ft-zkjhg)."""
+    return [f"run {run['index']} ({run['arm']}): FPS unavailable: {run['fps_unavailable']}"
+            for run in runs if run.get("fps") is None and run.get("fps_unavailable")]
 
 
 def validate_receipt(receipt):
@@ -572,6 +660,10 @@ def validate_receipt(receipt):
         for key, kind in RUN_REQUIRED.items():
             if not isinstance(run.get(key), kind):
                 problems.append(f"runs[{run.get('index')}].{key} missing or not {kind}")
+        # A run measured without an FPS must say why (ft-zkjhg).
+        if (receipt.get("fps_measured") and run.get("fps") is None and not run.get("fps_unavailable")
+                and not run.get("errors")):
+            problems.append(f"runs[{run.get('index')}] has no FPS and no fps_unavailable reason")
     for name in ("drain_total_s", "fps"):
         if "verdict" not in (receipt.get("verdicts") or {}).get(name, {}):
             problems.append(f"verdicts.{name}.verdict missing")
@@ -612,7 +704,8 @@ def analysis_self_test():
     assert fps["interval_histogram_refresh_periods"][">10"] == 1
     repeated = [{"status": 0, "display_ns": base + i * period, "hash": "same", "dirty_fraction": 0.1}
                 for i in range(60)]
-    assert fps_metrics(repeated, base, base + s, 60)["distinct_frames"] == 1
+    unchanged = fps_metrics(repeated, base, base + s, 60)
+    assert (unchanged["changed_frames"], unchanged["complete_frames"]) == (1, 60), unchanged
     internal = internal_present_fps([(0, 100), (s, 160), (2 * s, 220)], s // 2, 3 * s // 2)
     assert internal == {"presented": 60.0, "fps": 60.0}, internal
     assert internal_present_fps([(s, 1)], 0, s) is None
@@ -637,7 +730,67 @@ def analysis_self_test():
     assert abc_order(3) == ["A", "B", "B", "A", "A", "B"]
     problems = validate_receipt({"schema": SCHEMA})
     assert problems and any("runs" in problem for problem in problems), problems
+    capture_self_test(s)
     print("analysis self-test: ok")
+
+
+def capture_self_test(s):
+    """ft-zkjhg: captures that cannot give an FPS say why, never 0.0."""
+    base, period = 1_000 * s, s // 60
+    token = "ftgt-run-01-ghostty"
+
+    def header(title, verified=None):
+        record = {"type": "window", "window_id": 7, "title": title, "started_ns": base}
+        if verified is not None:
+            record["title_verified"] = verified
+        return record
+
+    def complete(t_ns, tag):
+        return {"type": "frame", "status": 0, "display_ns": t_ns, "hash": str(tag), "dirty_fraction": 0.5}
+
+    # nv3: a window titled '' streams for 2.8 s, is suspended at 2.86 s and
+    # never resumes; the drain runs from 3.2 s to 12 s.
+    nv3 = [header("")] + [complete(base + i * period, i) for i in range(168)]
+    nv3.append({"type": "frame", "status": 3, "display_ns": base + 2_860_000_000})
+    info, reason = assess_capture(nv3, base + 3_200_000_000, base + 12 * s, token)
+    assert reason == ("the capture was suspended 0.34 s before the drain started and never resumed; "
+                      f"the matched window 7 is titled '', not the run's '{token}'"), reason
+    assert info["interruptions"][0]["resumed_after_s"] is None
+    # A suspension that a re-acquired window recovers within 0.2 s is fine.
+    recovered = [header(token, True)] + [complete(base + i * period, i) for i in range(240)]
+    recovered.append({"type": "frame", "status": 3, "display_ns": base + 4 * s + 1})
+    recovered.append({"type": "reacquire", "outcome": "switched window", "window_id": 9, "title": token})
+    recovered += [complete(base + 4_200_000_000 + i * period, 1000 + i) for i in range(300)]
+    recovered.sort(key=lambda record: record.get("display_ns", 0))
+    info, reason = assess_capture(recovered, base + s, base + 10 * s, token)
+    assert reason is None, reason
+    assert info["window_switches"] == 1 and info["final_window_id"] == 9
+    assert abs(info["interruptions"][0]["resumed_after_s"] - 0.2) < 0.02, info
+    # Suspended for 4 s of a 10 s drain: too much was lost to count.
+    gap = [header(token, True)] + [complete(base + i * period, i) for i in range(240)]
+    gap.append({"type": "frame", "status": 3, "display_ns": base + 4 * s})
+    gap += [complete(base + 8 * s + i * period, 2000 + i) for i in range(120)]
+    _, reason = assess_capture(gap, base, base + 10 * s, token)
+    assert reason == "the capture was suspended for 4.00 s of the 10.00 s drain", reason
+    # The meter never found the window: its error record is the reason.
+    failed = [{"type": "error", "code": 3, "reason": f'no on-screen window of pid 5 titled with "{token}" appeared'}]
+    _, reason = assess_capture(failed, base, base + s, token)
+    assert reason == f'no capture: no on-screen window of pid 5 titled with "{token}" appeared', reason
+    # Frames from a window that is not the run's are not the run's FPS.
+    _, reason = assess_capture([header("Downloads")] + [complete(base + i * period, i) for i in range(60)],
+                               base, base + s, token)
+    assert reason == f"the matched window 7 is titled 'Downloads', not the run's '{token}'", reason
+    # SCK 'complete' frames with unchanged pixels are not content changes.
+    repeated = [complete(base + i * period, i // 2) for i in range(60)]
+    fps = fps_metrics(repeated, base, base + s, 60)
+    assert (fps["changed_frames"], fps["complete_frames"]) == (30, 60), fps
+    assert abs(fps["mean_fps"] - 30) < 1e-9 and abs(fps["complete_fps"] - 60) < 1e-9
+    # The receipt carries the reason and the FPS verdict cites it.
+    runs = [{"index": 1, "arm": "ghostty", "fps": None, "fps_unavailable": "the capture was suspended",
+             "errors": []}]
+    assert fps_unavailable_refusals(runs) == ["run 1 (ghostty): FPS unavailable: the capture was suspended"]
+    silent = {"schema": SCHEMA, "fps_measured": True, "runs": [dict(runs[0], fps_unavailable=None)]}
+    assert any("no fps_unavailable reason" in problem for problem in validate_receipt(silent))
 
 
 def pty_self_test():
@@ -662,8 +815,9 @@ def pty_self_test():
     size = os.path.getsize(corpus)
     child, master = pty.fork()
     if child == 0:
-        os.execv("/bin/zsh", ["/bin/zsh", "-f", pane, "measure", work, corpus, "1", sys.executable, probe])
-    drained = {"bytes": 0, "queries": 0}
+        os.execv("/bin/zsh", ["/bin/zsh", "-f", pane, "measure", work, corpus, "1", sys.executable, probe,
+                              "ftgt-pty-selftest"])
+    drained = {"bytes": 0, "queries": 0, "head": b""}
     stop = threading.Event()
 
     def terminal():
@@ -678,6 +832,8 @@ def pty_self_test():
             except OSError:
                 return
             drained["bytes"] += len(data)
+            if len(drained["head"]) < 4096:
+                drained["head"] += data[: 4096 - len(drained["head"])]
             queries = data.count(b"\x1b[6n")
             if queries:
                 drained["queries"] += queries
@@ -715,7 +871,9 @@ def pty_self_test():
         assert wait_for(lambda: os.path.exists(os.path.join(work, "widths.done")), 60, 0.1)
         widths = json.loads(read_text(os.path.join(work, "widths.json")))
         assert not widths["failed"] and widths["histogram"] == {"2": 1376}, widths["histogram"]
-        assert drained["queries"] == 1376, drained
+        assert drained["queries"] == 1376, drained["queries"]
+        # The window title the frame meter matches by (ft-zkjhg).
+        assert drained["head"].startswith(b"\x1b]2;ftgt-pty-selftest\x07"), drained["head"][:64]
     finally:
         touch(os.path.join(work, "stop"))
         stop.set()
@@ -728,6 +886,41 @@ def pty_self_test():
           f"longest stall {drain['stalls']['max_s']:.2f} s, time line {timing['raw']!r})")
     # Only this test's own temporary directory; kept when an assertion fails.
     shutil.rmtree(work, ignore_errors=True)
+
+
+def reanalyze(run_dir):
+    """Re-judges every run's capture in an existing run directory (read-only).
+    Runs recorded before ft-zkjhg carry no drain window or title: the window
+    is then taken from the first and last tty offset samples, and the title
+    from the harness's naming rule."""
+    receipt = json.loads(read_text(os.path.join(run_dir, "receipt.json")) or "{}")
+    by_dir = {run.get("run_dir"): run for run in receipt.get("runs") or []}
+    lines = []
+    for name in sorted(os.listdir(os.path.join(run_dir, "runs"))):
+        path = os.path.join(run_dir, "runs", name)
+        run = by_dir.get(path, {})
+        records = read_jsonl(os.path.join(path, "frames.jsonl"))
+        window = run.get("drain_window_ns")
+        if not window:
+            offsets = [r["t_ns"] for r in read_jsonl(os.path.join(path, "offsets.jsonl")) if "t_ns" in r]
+            window = [offsets[0], offsets[-1]] if len(offsets) >= 2 else None
+        if not window:
+            lines.append(f"{name}: no drain window recorded")
+            continue
+        title = run.get("window_title")
+        if title is None and (run.get("arm") or name).endswith("ghostty"):
+            # Before ft-zkjhg only Ghostty was given the token, with --title.
+            title = f"ftgt-{os.path.basename(os.path.abspath(run_dir))}-{name}"
+        info, reason = assess_capture(records, window[0], window[1], title)
+        if reason:
+            lines.append(f"{name}: FPS unavailable: {reason}")
+            continue
+        header = next((r for r in records if r.get("type") == "window"), {})
+        refresh = (header.get("display") or {}).get("max_fps") or 60
+        fps = fps_metrics([r for r in records if r.get("type") == "frame"], window[0], window[1], refresh)
+        lines.append(f"{name}: FPS {fps['mean_fps']:.1f} pixel-changed ({fps['complete_fps']:.1f} SCK complete), "
+                     f"title {info.get('title')!r}, interruptions {len(info['interruptions'])}")
+    return lines
 
 
 def abc_order(reps):
@@ -959,7 +1152,7 @@ class Harness:
             "--confirm-close-surface=false",
             "--quit-after-last-window-closed=true",
             "--auto-update=off",
-            f"--title={self.token}-{os.path.basename(run_dir)}",
+            f"--title={self.run_title(run_dir)}",
         ]
         if self.args.ghostty_scrollback_bytes:
             flags.append(f"--scrollback-limit={self.args.ghostty_scrollback_bytes}")
@@ -976,15 +1169,21 @@ class Harness:
             return None, flags
         return process.pid, flags
 
+    def run_title(self, run_dir):
+        """The window title of one run: Ghostty's --title, and the OSC 2 title
+        FrankenTerm's pane sets. The frame meter matches the window by it."""
+        return f"{self.token}-{os.path.basename(run_dir)}"
+
     def run_once(self, index, arm, width_probe):
         args = self.args
         run_dir = os.path.join(self.run_dir, "runs", f"{index:02d}-{arm['name']}")
         os.makedirs(run_dir, exist_ok=True)
         record = {"index": index, "arm": arm["name"], "kind": arm["kind"], "run_dir": run_dir, "pids": {},
-                  "errors": [], "drain": {}, "time": None, "fps": None, "beachball": None,
-                  "load_start": loadavg()}
+                  "errors": [], "drain": {}, "time": None, "fps": None, "fps_unavailable": None,
+                  "beachball": None, "load_start": loadavg(), "window_title": self.run_title(run_dir)}
         measure_args = ["/bin/zsh", "-f", self.pane_script, "measure", run_dir, self.corpus["path"],
-                        "1" if width_probe else "0", sys.executable, self.width_probe]
+                        "1" if width_probe else "0", sys.executable, self.width_probe,
+                        self.run_title(run_dir)]
         sibling_args = (["/bin/zsh", "-f", self.pane_script, "flood", run_dir, self.flood_corpus["path"]]
                         if args.sibling_flood else None)
         helpers, poller, terminal_pid, token = [], None, None, run_dir
@@ -1029,15 +1228,25 @@ class Harness:
             if not args.no_fps:
                 capture_out = os.path.join(run_dir, "frames.jsonl")
                 ready = os.path.join(run_dir, "capture.ready")
+                # Match the window by its title token (ft-zkjhg). Ghostty forces
+                # the title, so it must match; FrankenTerm's pane sets it with
+                # OSC 2 and falls back to the process's window after 15 s.
+                title_wait = "60" if arm["kind"] == "ghostty" else "15"
                 helper = subprocess.Popen([self.meter, "capture", "--pid", str(terminal_pid), "--out", capture_out,
                                            "--stop-file", stop_helpers, "--ready-file", ready,
+                                           "--title-contains", self.run_title(run_dir),
+                                           "--title-wait-seconds", title_wait, "--window-wait-seconds", "60",
                                            "--max-seconds", str(args.run_timeout + 120)],
                                           stdout=open(os.path.join(run_dir, "capture.log"), "w"), stderr=subprocess.STDOUT)
                 helpers.append(("capture", helper))
-                if not wait_for(lambda: os.path.exists(ready) or helper.poll() is not None, 60, 0.05) \
-                        or not os.path.exists(ready):
-                    raise RuntimeError(f"frame meter never started capturing (exit {helper.poll()}); "
-                                       f"see {run_dir}/capture.log")
+                wait_for(lambda: os.path.exists(ready) or helper.poll() is not None, 75, 0.05)
+                if not os.path.exists(ready):
+                    # The run goes on without FPS; the receipt says why.
+                    failure = next((r for r in read_jsonl(capture_out) if r.get("type") == "error"), None)
+                    record["fps_unavailable"] = (
+                        f"frame meter never started capturing: {failure['reason']}" if failure
+                        else f"frame meter never started capturing (exit {helper.poll()}); see capture.log")
+                    log(f"run {index} {arm['name']}: {record['fps_unavailable']}")
             if not args.no_beachball_probe:
                 hang_dir = os.path.join(run_dir, "hangs")
                 os.makedirs(hang_dir, exist_ok=True)
@@ -1088,6 +1297,7 @@ class Harness:
                 poller.join(timeout=5)
 
             drain_window = (start_ns, exit_ns) if exit_ns else None
+            record["drain_window_ns"] = list(drain_window) if drain_window else None
             self.analyse(record, run_dir, drain_window, poller, go_ns)
             record["footprint_after"] = self.footprint(terminal_pid, run_dir, arm)
         except Exception as error:  # noqa: BLE001 -- recorded in the receipt
@@ -1157,9 +1367,15 @@ class Harness:
             refresh = display.get("max_fps") or self.refresh_hz
             record["capture"]["refresh_hz"] = refresh
             if window:
-                record["fps"] = fps_metrics(frames, window[0], window[1], refresh)
-                if record["fps"] is None:
-                    record["errors"].append("the frame meter delivered no frames")
+                assessment, unavailable = assess_capture(records, window[0], window[1], record["window_title"])
+                record["capture"]["assessment"] = assessment
+                if unavailable:
+                    # No FPS rather than a misleading 0.0; the drain still counts.
+                    record["fps"] = None
+                    record["fps_unavailable"] = record["fps_unavailable"] or unavailable
+                    log(f"run {record['index']} {record['arm']}: FPS unavailable: {record['fps_unavailable']}")
+                else:
+                    record["fps"] = fps_metrics(frames, window[0], window[1], refresh)
         if not args.no_beachball_probe:
             pings = [r for r in read_jsonl(os.path.join(run_dir, "probe.jsonl")) if r.get("type") == "ping"]
             record["beachball"] = beachball_metrics(pings, args.hang_ms)
@@ -1268,6 +1484,9 @@ def parse_args(argv):
                         help="check the analysis code on synthetic data; launch nothing")
     parser.add_argument("--pty-self-test", action="store_true",
                         help="run the pane script in a private pty this process plays terminal for; no GUI")
+    parser.add_argument("--reanalyze", metavar="RUN_DIR",
+                        help="re-judge each run's capture in an existing run directory, read-only; "
+                        "launch nothing")
     args = parser.parse_args(argv)
     label = args.corpus.upper()
     if label in CORPORA:
@@ -1303,6 +1522,10 @@ def main(argv):
         return 0
     if args.pty_self_test:
         pty_self_test()
+        return 0
+    if args.reanalyze:
+        for line in reanalyze(args.reanalyze):
+            print(line)
         return 0
     if sys.platform != "darwin":
         die("macOS only")
@@ -1421,6 +1644,8 @@ def main(argv):
     if not throttle_ok:
         fps_refusals.append(f"FrankenTerm max_fps {harness.ft_max_fps} throttles at {throttle_ms:.6f} ms, longer "
                             f"than one {harness.refresh_hz} Hz refresh period")
+    if not args.no_fps:
+        fps_refusals += fps_unavailable_refusals(runs)
     meter_checks = []
     for run in runs:
         internal, fps = run.get("internal_present"), run.get("fps")
@@ -1485,6 +1710,7 @@ def main(argv):
         "arms": {arm["name"]: {key: value for key, value in arm.items()} for arm in arms},
         "order": [arm["name"] for arm in order],
         "tcc": tcc,
+        "fps_measured": not args.no_fps,
         "isolation": isolation,
         "runs": runs,
         "aggregate": aggregate,
@@ -1502,8 +1728,12 @@ def main(argv):
     def line(name):
         stats = aggregate[name]
         total = stats["time_total_s"]["median"] if stats["time_total_s"] else float("nan")
-        fps = stats["mean_fps"]["median"] if stats["mean_fps"] else float("nan")
-        return f"{name}: time total {total:.3f} s, FPS {fps:.1f}, beach balls {stats['beach_balls']}"
+        if stats["mean_fps"]:
+            fps = f"FPS {stats['mean_fps']['median']:.1f}"
+        else:
+            reasons = [run["fps_unavailable"] for run in per_arm[name] if run.get("fps_unavailable")]
+            fps = f"FPS unavailable ({reasons[0]})" if reasons else "FPS unavailable"
+        return f"{name}: time total {total:.3f} s, {fps}, beach balls {stats['beach_balls']}"
 
     print(f"{corpus['label']} {corpus['name']} {corpus['bytes']} bytes, load at go "
           f"{[run.get('load_go') for run in runs]}")
