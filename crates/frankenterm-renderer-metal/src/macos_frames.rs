@@ -8,11 +8,14 @@
 //! buffer per frame, completion handlers) everywhere else. Both paths share
 //! the buffer model and the pacing.
 
+use crate::atlas::AtlasKind;
 use crate::cell_bg::{BACKGROUND_SHADER, BackgroundUniforms, CellBgGrid};
+use crate::cell_text::{CellTextGrid, TEXT_SHADER, TextUniforms, atlas_texture_index};
 use crate::frame::{
-    FRAME_SLOTS, FrameUniforms, GridExtent, SlotBuffer, SlotLease, SlotRing, SlotSizes,
-    grown_capacity,
+    FRAME_SLOTS, FrameUniforms, GridExtent, ROW_TABLE_BYTES_PER_ROW, SlotBuffer, SlotLease,
+    SlotRing, SlotSizes, grown_capacity,
 };
+use crate::macos_atlas::GlyphAtlases;
 use crate::{ClearColor, FRAME_SLOT_TIMEOUT, FrameError, MAX_TEXTURE_EXTENT, SubmissionPath};
 use block2::RcBlock;
 use frankenterm_alloc::resource_ledger::{GpuBufferPurpose, GpuResourceGuard, GpuResourceLedger};
@@ -23,14 +26,14 @@ use objc2_foundation::{NSString, ns_string};
 use objc2_metal::{
     MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
     MTL4CommandEncoder, MTL4CommandQueue, MTL4CommitFeedback, MTL4CommitOptions,
-    MTL4RenderCommandEncoder, MTL4RenderPassDescriptor, MTLBlitCommandEncoder, MTLBuffer,
-    MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
-    MTLDevice, MTLDrawable, MTLGPUFamily, MTLLibrary, MTLLoadAction, MTLOrigin, MTLPixelFormat,
-    MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassColorAttachmentDescriptor,
-    MTLRenderPassColorAttachmentDescriptorArray, MTLRenderPassDescriptor,
-    MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLRenderStages, MTLResidencySet,
-    MTLResidencySetDescriptor, MTLResource, MTLResourceOptions, MTLSize, MTLStorageMode,
-    MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
+    MTL4RenderCommandEncoder, MTL4RenderPassDescriptor, MTLBlendFactor, MTLBlitCommandEncoder,
+    MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
+    MTLCommandQueue, MTLDevice, MTLDrawable, MTLGPUFamily, MTLLibrary, MTLLoadAction, MTLOrigin,
+    MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder,
+    MTLRenderPassColorAttachmentDescriptor, MTLRenderPassColorAttachmentDescriptorArray,
+    MTLRenderPassDescriptor, MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLRenderStages,
+    MTLResidencySet, MTLResidencySetDescriptor, MTLResource, MTLResourceOptions, MTLSize,
+    MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
 use objc2_quartz_core::CAMetalLayer;
 use std::cell::Cell;
@@ -156,14 +159,30 @@ impl FrameSlots {
         })
     }
 
-    /// Leases the next slot (waiting up to `timeout` for the GPU to finish
-    /// the frame that last used it) and fits its buffers to `grid`.
+    /// [`Self::begin_frame`] for a frame without glyph instances.
+    #[cfg(test)]
     pub(crate) fn begin(
         &mut self,
         grid: GridExtent,
         timeout: Duration,
     ) -> Result<SlotLease, FrameError> {
-        let sizes = sizes_for(grid)?;
+        self.begin_frame(grid, 0, timeout)
+    }
+
+    /// Leases the next slot (waiting up to `timeout` for the GPU to finish
+    /// the frame that last used it) and fits its buffers to `grid` and
+    /// `text_instances` glyph instances, which may need a larger CellText
+    /// buffer than the grid reserves.
+    pub(crate) fn begin_frame(
+        &mut self,
+        grid: GridExtent,
+        text_instances: usize,
+        timeout: Duration,
+    ) -> Result<SlotLease, FrameError> {
+        let sizes = SlotSizes::for_frame(grid, text_instances).ok_or(FrameError::GridTooLarge {
+            rows: grid.rows,
+            cols: grid.cols,
+        })?;
         let lease = self
             .ring
             .acquire(timeout)
@@ -243,6 +262,33 @@ impl FrameSlots {
         Ok(())
     }
 
+    /// Copies `text` into the leased slot: its ring rows back to back into
+    /// the CellText buffer, then its per-row table into the RowTable buffer.
+    /// The slot must have been fitted for `text.len()` instances
+    /// ([`Self::begin_frame`]) and `text`'s rows.
+    pub(crate) fn write_text(
+        &self,
+        lease: &SlotLease,
+        text: &CellTextGrid,
+    ) -> Result<(), FrameError> {
+        let mut offset = 0;
+        for row in text.ring_row_bytes() {
+            if !row.is_empty() {
+                self.write(lease, SlotBuffer::CellText, offset, row)?;
+                offset += row.len();
+            }
+        }
+        for (index, entry) in text.row_table().enumerate() {
+            self.write(
+                lease,
+                SlotBuffer::RowTable,
+                index * ROW_TABLE_BYTES_PER_ROW,
+                &entry,
+            )?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn buffer(&self, slot: usize, kind: SlotBuffer) -> &ProtocolObject<dyn MTLBuffer> {
         &self.slots[slot].buffers[kind.index()].buffer
     }
@@ -264,10 +310,11 @@ impl FrameSlots {
         self.allocations
     }
 
-    /// Renders `request.cells` with the background pass into an offscreen
-    /// texture through `submission` and reads it back through `readback` (a
-    /// Metal 3 queue): BGRA8, row-major, tightly packed. Waits for the GPU;
-    /// the render snapshot (ft-yccm0.1.10) uses it, nothing is presented.
+    /// Renders `request.cells` with the background pass, and `request.text`
+    /// with the text pass when given, into an offscreen texture through
+    /// `submission` and reads it back through `readback` (a Metal 3 queue):
+    /// BGRA8, row-major, tightly packed. Waits for the GPU; the render
+    /// snapshot (ft-yccm0.1.10) uses it, nothing is presented.
     pub(crate) fn render_cells_offscreen(
         &mut self,
         submission: &Submission,
@@ -323,7 +370,8 @@ impl FrameSlots {
     ) -> Result<Vec<u8>, FrameError> {
         let cells = request.cells;
         let failed_before = submission.failed_frames();
-        let lease = self.begin(cells.extent(), FRAME_SLOT_TIMEOUT)?;
+        let text_instances = request.text.as_ref().map_or(0, |text| text.grid.len());
+        let lease = self.begin_frame(cells.extent(), text_instances, FRAME_SLOT_TIMEOUT)?;
         let uniforms = FrameUniforms {
             frame: lease.frame(),
             viewport: [request.width, request.height],
@@ -333,11 +381,30 @@ impl FrameSlots {
                 row_offset: cells.row_offset(),
                 ..request.background
             },
-            ..FrameUniforms::default()
+            text: request
+                .text
+                .as_ref()
+                .map_or_else(TextUniforms::default, |text| text.uniforms),
         };
         self.write(&lease, SlotBuffer::Uniforms, 0, &uniforms.to_bytes())?;
         self.write(&lease, SlotBuffer::CellBg, 0, cells.as_bytes())?;
-        submission.encode_frame(self, lease, target, None, request.clear, Some(pipeline))?;
+        if let Some(text) = &request.text {
+            self.write_text(&lease, text.grid)?;
+        }
+        let text = request.text.as_ref().map(|text| TextDraw {
+            pipeline: text.pipeline,
+            atlases: text.atlases,
+            instances: text.grid.len(),
+        });
+        submission.encode_frame(
+            self,
+            lease,
+            target,
+            None,
+            request.clear,
+            Some(pipeline),
+            text,
+        )?;
         if !self.ring.wait_idle(OFFSCREEN_TIMEOUT) {
             return Err(FrameError::CommandFailed {
                 detail: "the offscreen frame did not finish".to_string(),
@@ -379,13 +446,26 @@ impl FrameSlots {
 /// Longest an offscreen render waits for the GPU.
 const OFFSCREEN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// One offscreen background-pass render.
+/// One offscreen render: the background pass, then the text pass if `text`
+/// is given.
 pub(crate) struct OffscreenCells<'a> {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) cells: &'a CellBgGrid,
     pub(crate) clear: ClearColor,
     pub(crate) background: BackgroundUniforms,
+    pub(crate) text: Option<OffscreenText<'a>>,
+}
+
+/// The text pass of an offscreen render. `grid` must have the cells'
+/// extent and ring offset (checked by the caller), and the atlases'
+/// residency set must have joined the submission's queue
+/// ([`Submission::add_residency_set`]).
+pub(crate) struct OffscreenText<'a> {
+    pub(crate) grid: &'a CellTextGrid,
+    pub(crate) uniforms: TextUniforms,
+    pub(crate) pipeline: &'a TextPipeline,
+    pub(crate) atlases: &'a GlyphAtlases,
 }
 
 /// Copies a BGRA8 texture into shared memory with a Metal 3 blit and
@@ -569,6 +649,8 @@ impl Submission {
         let mut argument_tables = Vec::with_capacity(FRAME_SLOTS);
         let table_descriptor = MTL4ArgumentTableDescriptor::new();
         table_descriptor.setMaxBufferBindCount(SlotBuffer::ALL.len());
+        // The text pass's grayscale and color atlases (ft-yccm0.4.2.3).
+        table_descriptor.setMaxTextureBindCount(AtlasKind::ALL.len());
         for _ in 0..FRAME_SLOTS {
             allocators.push(
                 device
@@ -617,6 +699,20 @@ impl Submission {
         }
     }
 
+    /// Adds `set` (the glyph atlases') to the queue's resident sets, once per
+    /// set. Metal 4 needs it before a frame samples the atlases; Metal 3
+    /// makes bound textures resident itself and takes it only as a hint.
+    pub(crate) fn add_residency_set(&self, set: &ProtocolObject<dyn MTLResidencySet>) {
+        match self {
+            Self::Metal3(metal3) => {
+                if metal3.queue.respondsToSelector(sel!(addResidencySet:)) {
+                    metal3.queue.addResidencySet(set);
+                }
+            }
+            Self::Metal4(metal4) => metal4.queue.addResidencySet(set),
+        }
+    }
+
     /// Frames whose command buffer finished in error.
     pub(crate) fn failed_frames(&self) -> u64 {
         match self {
@@ -626,10 +722,12 @@ impl Submission {
     }
 
     /// Encodes one frame into the leased slot and commits it: a render pass
-    /// that clears `target` to `color` and, with a `background` pipeline,
-    /// draws the background pass from the slot's uniforms and CellBg buffer.
-    /// Presents `drawable` when given. The slot stays in flight until the GPU
-    /// finishes the frame.
+    /// that clears `target` to `color`; with a `background` pipeline, draws
+    /// the background pass from the slot's uniforms and CellBg buffer; with
+    /// `text`, then draws the slot's CellText instances over it in one
+    /// instanced draw. Presents `drawable` when given. The slot stays in
+    /// flight until the GPU finishes the frame.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode_frame(
         &self,
         frames: &FrameSlots,
@@ -638,6 +736,7 @@ impl Submission {
         drawable: Option<&ProtocolObject<dyn MTLDrawable>>,
         color: ClearColor,
         background: Option<&BackgroundPipeline>,
+        text: Option<TextDraw<'_>>,
     ) -> Result<(), FrameError> {
         assert!(
             lease.is_from(frames.ring()),
@@ -648,6 +747,7 @@ impl Submission {
             drawable,
             color,
             background,
+            text: text.filter(|text| text.instances > 0),
         };
         match self {
             Self::Metal3(metal3) => metal3.encode_frame(frames, lease, &frame),
@@ -662,6 +762,70 @@ struct EncodedFrame<'a> {
     drawable: Option<&'a ProtocolObject<dyn MTLDrawable>>,
     color: ClearColor,
     background: Option<&'a BackgroundPipeline>,
+    /// Present only with at least one instance.
+    text: Option<TextDraw<'a>>,
+}
+
+/// The text pass of one frame (ft-yccm0.4.2.3): the pipeline, the atlases
+/// its glyphs sample, and how many CellText instances the slot holds (all
+/// of them written by [`FrameSlots::write_text`]).
+#[derive(Clone, Copy)]
+pub(crate) struct TextDraw<'a> {
+    pub(crate) pipeline: &'a TextPipeline,
+    pub(crate) atlases: &'a GlyphAtlases,
+    pub(crate) instances: usize,
+}
+
+/// A render pipeline drawing into BGRA8Unorm, compiled from `source`;
+/// `blended` enables premultiplied source-over onto what is already there.
+fn render_pipeline(
+    device: &ProtocolObject<dyn MTLDevice>,
+    pass: &str,
+    source: &str,
+    vertex: &NSString,
+    fragment: &NSString,
+    blended: bool,
+) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>, String> {
+    let library = device
+        .newLibraryWithSource_options_error(&NSString::from_str(source), None)
+        .map_err(|error| {
+            format!(
+                "the {pass} shader did not compile: {}",
+                error.localizedDescription()
+            )
+        })?;
+    let vertex = library
+        .newFunctionWithName(vertex)
+        .ok_or_else(|| format!("the {pass} shader has no {vertex}"))?;
+    let fragment = library
+        .newFunctionWithName(fragment)
+        .ok_or_else(|| format!("the {pass} shader has no {fragment}"))?;
+    let descriptor = MTLRenderPipelineDescriptor::new();
+    descriptor.setLabel(Some(&NSString::from_str(&format!(
+        "frankenterm {pass} pass"
+    ))));
+    descriptor.setVertexFunction(Some(&vertex));
+    descriptor.setFragmentFunction(Some(&fragment));
+    #[allow(unsafe_code)]
+    // SAFETY: FFI-INDEX. Index 0 is below the eight color attachments every
+    // Metal device exposes, and the array creates the descriptor on access.
+    let attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
+    attachment.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+    if blended {
+        attachment.setBlendingEnabled(true);
+        attachment.setSourceRGBBlendFactor(MTLBlendFactor::One);
+        attachment.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+        attachment.setSourceAlphaBlendFactor(MTLBlendFactor::One);
+        attachment.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+    }
+    device
+        .newRenderPipelineStateWithDescriptor_error(&descriptor)
+        .map_err(|error| {
+            format!(
+                "the {pass} pipeline could not be created: {}",
+                error.localizedDescription()
+            )
+        })
 }
 
 /// The background pass's render pipeline (ft-yccm0.4.2.2), compiled from
@@ -672,37 +836,35 @@ pub(crate) struct BackgroundPipeline {
 
 impl BackgroundPipeline {
     pub(crate) fn new(device: &ProtocolObject<dyn MTLDevice>) -> Result<Self, String> {
-        let library = device
-            .newLibraryWithSource_options_error(&NSString::from_str(BACKGROUND_SHADER), None)
-            .map_err(|error| {
-                format!(
-                    "the background shader did not compile: {}",
-                    error.localizedDescription()
-                )
-            })?;
-        let vertex = library
-            .newFunctionWithName(ns_string!("bg_vertex"))
-            .ok_or_else(|| "the background shader has no bg_vertex".to_string())?;
-        let fragment = library
-            .newFunctionWithName(ns_string!("bg_fragment"))
-            .ok_or_else(|| "the background shader has no bg_fragment".to_string())?;
-        let descriptor = MTLRenderPipelineDescriptor::new();
-        descriptor.setLabel(Some(ns_string!("frankenterm background pass")));
-        descriptor.setVertexFunction(Some(&vertex));
-        descriptor.setFragmentFunction(Some(&fragment));
-        #[allow(unsafe_code)]
-        // SAFETY: FFI-INDEX. Index 0 is below the eight color attachments every
-        // Metal device exposes, and the array creates the descriptor on access.
-        let attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
-        attachment.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
-        let state = device
-            .newRenderPipelineStateWithDescriptor_error(&descriptor)
-            .map_err(|error| {
-                format!(
-                    "the background pipeline could not be created: {}",
-                    error.localizedDescription()
-                )
-            })?;
+        let state = render_pipeline(
+            device,
+            "background",
+            BACKGROUND_SHADER,
+            ns_string!("bg_vertex"),
+            ns_string!("bg_fragment"),
+            false,
+        )?;
+        Ok(Self { state })
+    }
+}
+
+/// The text pass's render pipeline (ft-yccm0.4.2.3), compiled from
+/// [`TEXT_SHADER`] once per renderer: one quad per CellText instance,
+/// premultiplied source-over onto the background pass.
+pub(crate) struct TextPipeline {
+    state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+}
+
+impl TextPipeline {
+    pub(crate) fn new(device: &ProtocolObject<dyn MTLDevice>) -> Result<Self, String> {
+        let state = render_pipeline(
+            device,
+            "text",
+            TEXT_SHADER,
+            ns_string!("text_vertex"),
+            ns_string!("text_fragment"),
+            true,
+        )?;
         Ok(Self { state })
     }
 }
@@ -748,6 +910,59 @@ impl Metal3Submission {
             // derives positions from vertex_id and reads no vertex buffer.
             unsafe {
                 encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+            }
+        }
+        if let Some(text) = frame.text {
+            encoder.setRenderPipelineState(&text.pipeline.state);
+            for kind in [SlotBuffer::Uniforms, SlotBuffer::CellText] {
+                #[allow(unsafe_code)]
+                // SAFETY: FFI-DRAW. The buffer is a live slot buffer of the
+                // leased slot, bound from offset 0 at its SlotBuffer index,
+                // which is the shader's [[buffer(n)]] and below Metal's 31
+                // buffer slots.
+                unsafe {
+                    encoder.setVertexBuffer_offset_atIndex(
+                        Some(frames.buffer(slot, kind)),
+                        0,
+                        kind.index(),
+                    );
+                }
+            }
+            #[allow(unsafe_code)]
+            // SAFETY: FFI-DRAW. The uniforms buffer of the leased slot, bound
+            // from offset 0 at the shader's [[buffer(0)]].
+            unsafe {
+                encoder.setFragmentBuffer_offset_atIndex(
+                    Some(frames.buffer(slot, SlotBuffer::Uniforms)),
+                    0,
+                    SlotBuffer::Uniforms.index(),
+                );
+            }
+            for kind in AtlasKind::ALL {
+                #[allow(unsafe_code)]
+                // SAFETY: FFI-DRAW. A live atlas texture that the atlases
+                // keep (and retire only after the frames that may sample it
+                // finish), bound at the shader's [[texture(n)]], below
+                // Metal's 31 texture slots. Metal 3 retains bound textures.
+                unsafe {
+                    encoder.setFragmentTexture_atIndex(
+                        Some(text.atlases.texture(kind)),
+                        atlas_texture_index(kind),
+                    );
+                }
+            }
+            #[allow(unsafe_code)]
+            // SAFETY: FFI-DRAW. Four strip vertices per instance, positions
+            // derived from vertex_id; text_vertex reads CellText only at
+            // instance_id < instances, all of which the frame wrote into a
+            // buffer fitted for them.
+            unsafe {
+                encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
+                    MTLPrimitiveType::TriangleStrip,
+                    0,
+                    4,
+                    text.instances,
+                );
             }
         }
         encoder.endEncoding();
@@ -816,6 +1031,23 @@ impl Metal4Submission {
         let (target, drawable, color) = (frame.target, frame.drawable, frame.color);
         let slot = lease.slot();
         self.bind_slot(frames, slot);
+        if let Some(text) = frame.text {
+            // Every frame: growth replaces an atlas texture.
+            for kind in AtlasKind::ALL {
+                #[allow(unsafe_code)]
+                // SAFETY: FFI-ARGTABLE. The resource ID is a live atlas
+                // texture's; the atlases keep it in their residency set, which
+                // joined this queue, until the frames that may sample it have
+                // finished. The index is below the table's
+                // maxTextureBindCount of AtlasKind::ALL.len().
+                unsafe {
+                    self.argument_tables[slot].setTexture_atIndex(
+                        text.atlases.texture(kind).gpuResourceID(),
+                        atlas_texture_index(kind),
+                    );
+                }
+            }
+        }
         let commands = &self.command_buffers[slot];
         // The lease proves this slot's previous frame completed, so its
         // allocator's memory is free to reuse.
@@ -843,6 +1075,24 @@ impl Metal4Submission {
             // derives positions from vertex_id and reads no vertex buffer.
             unsafe {
                 encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+            }
+        }
+        if let Some(text) = frame.text {
+            // The argument table holds the slot buffers and, bound above,
+            // both atlases.
+            encoder.setRenderPipelineState(&text.pipeline.state);
+            #[allow(unsafe_code)]
+            // SAFETY: FFI-DRAW. Four strip vertices per instance, positions
+            // derived from vertex_id; text_vertex reads CellText only at
+            // instance_id < instances, all of which the frame wrote into a
+            // buffer fitted for them.
+            unsafe {
+                encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
+                    MTLPrimitiveType::TriangleStrip,
+                    0,
+                    4,
+                    text.instances,
+                );
             }
         }
         encoder.endEncoding();
@@ -1235,7 +1485,7 @@ mod tests {
                 .write(&lease, SlotBuffer::Uniforms, 0, &uniforms.to_bytes())
                 .unwrap();
             submission
-                .encode_frame(frames, lease, &target, None, color, None)
+                .encode_frame(frames, lease, &target, None, color, None, None)
                 .unwrap();
         }
         assert!(frames.ring().wait_idle(LONG), "every frame completed");
@@ -1385,6 +1635,7 @@ mod tests {
                     cells: &cells,
                     clear,
                     background,
+                    text: None,
                 },
             )
             .unwrap_or_else(|error| panic!("{:?} cursor: {error}", cursor.shape));
@@ -1443,6 +1694,7 @@ mod tests {
                 cells: &cells,
                 clear: ClearColor::from_srgba(0.0, 0.0, 0.0, 1.0),
                 background,
+                text: None,
             };
             assert_eq!(
                 frames.render_cells_offscreen(&submission, &pipeline, &readback, &request),
@@ -1510,5 +1762,460 @@ mod tests {
                 BG_WIDTH * BG_HEIGHT
             );
         }
+    }
+
+    // ---- Text pass (ft-yccm0.4.2.3) ----
+
+    use crate::atlas::{AtlasConfig, AtlasSlot, FrameFence, texture_bytes};
+    use crate::cell_bg::to_bgra8;
+    use crate::cell_text::{CellText, UnderlineStyle, shade_text};
+
+    /// Everything a text-pass render needs, on one submission path.
+    struct TextFixture {
+        frames: FrameSlots,
+        submission: Submission,
+        background: BackgroundPipeline,
+        text: TextPipeline,
+        atlases: GlyphAtlases,
+        /// Every glyph placed in the atlases, with its pixels.
+        glyphs: Vec<(AtlasSlot, Vec<u8>)>,
+    }
+
+    fn small_atlas(kind: AtlasKind) -> AtlasConfig {
+        AtlasConfig {
+            width: 256,
+            initial_height: 128,
+            page_height: 64,
+            padding: 1,
+            max_bytes: texture_bytes(kind, 256, 128),
+        }
+    }
+
+    impl TextFixture {
+        /// `metal4` selects the Metal 4 path; `None` when this device has
+        /// none.
+        fn new(metal4: bool) -> Option<Self> {
+            let metal = MetalDevice::system_default()
+                .unwrap_or_else(|reason| panic!("this test needs a Metal device: {reason}"));
+            let device = metal.raw_device();
+            if metal4 && !supports_metal4(&device) {
+                eprintln!("skipped: this device or OS has no Metal 4 command queues");
+                return None;
+            }
+            // Sized for the background scene, so a crowded frame outgrows
+            // the reserved CellText buffer.
+            let frames =
+                FrameSlots::new(device.clone(), GridExtent::new(6, 10), private_ledger()).unwrap();
+            let submission = if metal4 {
+                Submission::metal4(&device, &frames).expect("Metal 4 submission")
+            } else {
+                Submission::metal3(device.newCommandQueue().unwrap(), &frames)
+            };
+            let mut atlases = GlyphAtlases::new(
+                &metal,
+                small_atlas(AtlasKind::Grayscale),
+                small_atlas(AtlasKind::Color),
+                false,
+                private_ledger(),
+            )
+            .unwrap();
+            if let Some(set) = atlases.residency() {
+                submission.add_residency_set(set);
+            }
+            let fence = FrameFence {
+                current: frames.ring().next_frame(),
+                retired_before: frames.ring().retired_before(),
+            };
+            let mut glyphs = Vec::new();
+            for (kind, width, height) in [
+                (AtlasKind::Grayscale, 6, 12),
+                (AtlasKind::Grayscale, 8, 16),
+                (AtlasKind::Color, 16, 16),
+            ] {
+                let pixels = glyph_pixels(kind, width, height);
+                let slot = atlases
+                    .insert(&metal, kind, width, height, &pixels, fence)
+                    .unwrap();
+                glyphs.push((slot, pixels));
+            }
+            Some(Self {
+                background: BackgroundPipeline::new(&device).expect("background pipeline"),
+                text: TextPipeline::new(&device).expect("text pipeline"),
+                frames,
+                submission,
+                atlases,
+                glyphs,
+            })
+        }
+
+        fn glyph(&self, index: usize) -> AtlasSlot {
+            self.glyphs[index].0
+        }
+
+        /// The stored bytes of an atlas texel, as `shade_text` takes them.
+        /// Panics outside every glyph: the shader never samples there.
+        fn texel(&self, kind: AtlasKind, x: u32, y: u32) -> [u8; 4] {
+            let (slot, pixels) = self
+                .glyphs
+                .iter()
+                .find(|(slot, _)| {
+                    slot.kind == kind
+                        && (slot.x..slot.x + slot.width).contains(&x)
+                        && (slot.y..slot.y + slot.height).contains(&y)
+                })
+                .unwrap_or_else(|| panic!("{kind:?} texel ({x}, {y}) is in no glyph"));
+            let index = ((y - slot.y) * slot.width + (x - slot.x)) as usize;
+            match kind {
+                AtlasKind::Grayscale => [pixels[index], 0, 0, 0],
+                AtlasKind::Color => pixels[index * 4..index * 4 + 4].try_into().unwrap(),
+            }
+        }
+
+        fn render(&mut self, cells: &CellBgGrid, request: TextRequest<'_>) -> Vec<u8> {
+            let readback = self.frames.device.newCommandQueue().unwrap();
+            let pixels = self
+                .frames
+                .render_cells_offscreen(
+                    &self.submission,
+                    &self.background,
+                    &readback,
+                    &OffscreenCells {
+                        width: request.width,
+                        height: request.height,
+                        cells,
+                        clear: request.clear,
+                        background: request.background,
+                        text: Some(OffscreenText {
+                            grid: request.text,
+                            uniforms: request.uniforms,
+                            pipeline: &self.text,
+                            atlases: &self.atlases,
+                        }),
+                    },
+                )
+                .unwrap();
+            assert!(self.frames.ring().wait_idle(LONG));
+            assert_eq!(self.submission.failed_frames(), 0);
+            pixels
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct TextRequest<'a> {
+        width: u32,
+        height: u32,
+        clear: ClearColor,
+        background: BackgroundUniforms,
+        text: &'a CellTextGrid,
+        uniforms: TextUniforms,
+    }
+
+    /// Distinct pixels for every texel: grayscale coverage that sweeps 0 to
+    /// 255, color texels premultiplied with varying alpha, `[B, G, R, A]`.
+    fn glyph_pixels(kind: AtlasKind, width: u32, height: u32) -> Vec<u8> {
+        let mut pixels = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                let wave = u8::try_from((x * 41 + y * 23 + width) % 256).unwrap();
+                match kind {
+                    AtlasKind::Grayscale => pixels.push(if width == 8 { 255 } else { wave }),
+                    AtlasKind::Color => {
+                        let alpha = u16::from(wave.max(1));
+                        let part =
+                            |n: u32| u8::try_from(alpha * u16::try_from(n).unwrap() / 15).unwrap();
+                        pixels.extend([
+                            part(15 - x.min(15)),
+                            part(y.min(15)),
+                            part(x.min(15)),
+                            wave.max(1),
+                        ]);
+                    }
+                }
+            }
+        }
+        pixels
+    }
+
+    /// Every text feature at once over the background scene: tinted and
+    /// translucent grayscale glyphs, wide color emoji, every underline style
+    /// in its own color, overline, strikethrough, glyphs overhanging their
+    /// cell and the grid, stacked instances, a decoration without a glyph,
+    /// and the ring offset the background scene scrolled to.
+    fn text_scene(fixture: &TextFixture, cells: &CellBgGrid) -> CellTextGrid {
+        let mut text = CellTextGrid::new(cells.extent());
+        text.scroll_up(cells.row_offset());
+        assert_eq!(text.row_offset(), cells.row_offset());
+        let (gray, block, emoji) = (fixture.glyph(0), fixture.glyph(1), fixture.glyph(2));
+        let colors = [
+            [255, 255, 255, 255],
+            [250, 40, 10, 255],
+            [20, 220, 90, 128],
+            [30, 60, 240, 200],
+            [0, 0, 0, 255],
+        ];
+        for (col, fg) in (0_u16..).zip(colors) {
+            text.push(0, CellText::new(col, fg).with_glyph(&gray, [1, 2]));
+        }
+        text.push(
+            1,
+            CellText::new(1, [255; 4]).with_glyph(&emoji, [0, 0]).wide(),
+        );
+        text.push(
+            1,
+            CellText::new(4, [255, 255, 255, 100])
+                .with_glyph(&emoji, [0, 0])
+                .wide(),
+        );
+        let styles = [
+            UnderlineStyle::Single,
+            UnderlineStyle::Double,
+            UnderlineStyle::Curly,
+            UnderlineStyle::Dotted,
+            UnderlineStyle::Dashed,
+        ];
+        for (col, style) in (0_u16..).zip(styles) {
+            let fg = [200, 200, 200, 255];
+            let underline = [u8::try_from(col).unwrap() * 50, 255, 60];
+            text.push(2, CellText::new(col, fg).with_underline(style, underline));
+        }
+        text.push(2, CellText::new(5, [255, 0, 255, 255]).with_strikethrough());
+        text.push(2, CellText::new(6, [0, 255, 255, 255]).with_overline());
+        text.push(
+            2,
+            CellText::new(7, [240, 240, 0, 255])
+                .with_glyph(&block, [0, 0])
+                .with_underline(UnderlineStyle::Single, [0, 0, 255])
+                .with_overline()
+                .with_strikethrough(),
+        );
+        // Overhangs: past the grid's right edge, into the left padding,
+        // into the row above.
+        text.push(3, CellText::new(9, [255; 4]).with_glyph(&gray, [5, -3]));
+        text.push(3, CellText::new(0, [255; 4]).with_glyph(&gray, [-3, 0]));
+        // Two glyphs stacked in one cell, the second translucent.
+        text.push(
+            4,
+            CellText::new(3, [255, 128, 0, 255]).with_glyph(&gray, [0, 0]),
+        );
+        text.push(
+            4,
+            CellText::new(3, [0, 128, 255, 120]).with_glyph(&gray, [2, 4]),
+        );
+        text.push(
+            5,
+            CellText::new(8, [255; 4]).with_glyph(&emoji, [0, 0]).wide(),
+        );
+        text
+    }
+
+    /// The color the GPU blends onto: the background pass's 8-bit output.
+    fn from_bgra8(bytes: [u8; 4]) -> [f32; 4] {
+        let unit = |byte: u8| f32::from(byte) / 255.0;
+        [
+            unit(bytes[2]),
+            unit(bytes[1]),
+            unit(bytes[0]),
+            unit(bytes[3]),
+        ]
+    }
+
+    /// Renders `text` over the background scene and compares every pixel
+    /// with the CPU reference (`shade_background`, then `shade_text`).
+    /// Pixels may differ by more than one step only inside `loose` (the
+    /// curly underline's cell, where `sin` rounding can move a boundary
+    /// pixel), at most four of them. Returns the pixels compared.
+    #[allow(clippy::cast_precision_loss)]
+    fn render_text_and_compare(
+        fixture: &mut TextFixture,
+        text: &CellTextGrid,
+        uniforms: TextUniforms,
+        loose: Option<(u32, u32)>,
+    ) -> usize {
+        let (cells, background) = background_scene();
+        let clear = ClearColor::from_srgba(0.1, 0.2, 0.3, 1.0);
+        let request = TextRequest {
+            width: u32::try_from(BG_WIDTH).unwrap(),
+            height: u32::try_from(BG_HEIGHT).unwrap(),
+            clear,
+            background,
+            text,
+            uniforms,
+        };
+        let pixels = fixture.render(&cells, request);
+        assert_eq!(pixels.len(), BG_WIDTH * BG_HEIGHT * 4);
+        let frame = FrameUniforms {
+            viewport: [request.width, request.height],
+            grid: cells.extent(),
+            clear: clear.to_f32(),
+            background: BackgroundUniforms {
+                row_offset: cells.row_offset(),
+                ..background
+            },
+            text: uniforms,
+            ..FrameUniforms::default()
+        };
+        let (mut compared, mut loose_misses) = (0, 0);
+        for y in 0..BG_HEIGHT {
+            for x in 0..BG_WIDTH {
+                let center = |v: usize| f32::from(u16::try_from(v).unwrap()) + 0.5;
+                let (cx, cy) = (center(x), center(y));
+                let under = crate::cell_bg::shade_background(&frame, &cells, cx, cy)
+                    .map_or(clear.to_bgra8(), to_bgra8);
+                let expected = to_bgra8(shade_text(
+                    &frame,
+                    text,
+                    |kind, ax, ay| fixture.texel(kind, ax, ay),
+                    from_bgra8(under),
+                    cx,
+                    cy,
+                ));
+                let at = (y * BG_WIDTH + x) * 4;
+                let got = &pixels[at..at + 4];
+                let off = got
+                    .iter()
+                    .zip(expected)
+                    .map(|(got, want)| got.abs_diff(want))
+                    .max()
+                    .unwrap();
+                compared += 1;
+                if off <= 1 {
+                    continue;
+                }
+                let in_loose = loose.is_some_and(|(row, col)| {
+                    let left = background.grid_origin[0] + col as f32 * background.cell_size[0];
+                    let top = background.grid_origin[1] + row as f32 * background.cell_size[1];
+                    (left..left + background.cell_size[0]).contains(&cx)
+                        && (top..top + background.cell_size[1]).contains(&cy)
+                });
+                assert!(
+                    in_loose,
+                    "pixel ({x}, {y}): GPU {got:?}, reference {expected:?}"
+                );
+                loose_misses += 1;
+            }
+        }
+        assert!(
+            loose_misses <= 4,
+            "{loose_misses} curly boundary pixels differ"
+        );
+        compared
+    }
+
+    fn check_text_pass(metal4: bool) {
+        let Some(mut fixture) = TextFixture::new(metal4) else {
+            return;
+        };
+        let (cells, _) = background_scene();
+        let text = text_scene(&fixture, &cells);
+        // The curly underline is at logical row 2, column 2.
+        for thickness in [1.0, 2.0] {
+            let uniforms = TextUniforms {
+                underline_position: 13.0,
+                line_thickness: thickness,
+                strikethrough_position: 8.0,
+            };
+            assert_eq!(
+                render_text_and_compare(&mut fixture, &text, uniforms, Some((2, 2))),
+                BG_WIDTH * BG_HEIGHT
+            );
+        }
+    }
+
+    #[test]
+    fn metal3_text_pass_matches_the_cpu_reference() {
+        check_text_pass(false);
+    }
+
+    #[test]
+    fn metal4_text_pass_matches_the_cpu_reference() {
+        check_text_pass(true);
+    }
+
+    /// The frame uploads exactly the grid's instances and row table, and
+    /// steady-state text frames allocate no buffer and touch no atlas.
+    #[test]
+    fn text_frames_upload_the_instances_and_row_table_and_allocate_nothing() {
+        let mut fixture = TextFixture::new(false).unwrap();
+        let (cells, background) = background_scene();
+        let text = text_scene(&fixture, &cells);
+        let uniforms = TextUniforms {
+            underline_position: 13.0,
+            line_thickness: 1.0,
+            strikethrough_position: 8.0,
+        };
+        let request = TextRequest {
+            width: 64,
+            height: 64,
+            clear: ClearColor::from_srgba(0.0, 0.0, 0.0, 1.0),
+            background,
+            text: &text,
+            uniforms,
+        };
+        fixture.render(&cells, request);
+        let allocations = fixture.frames.allocations();
+        let generations = AtlasKind::ALL.map(|kind| fixture.atlases.allocator(kind).generation());
+        for _ in 0..6 {
+            fixture.render(&cells, request);
+        }
+        assert_eq!(fixture.frames.allocations(), allocations, "steady state");
+        assert_eq!(
+            AtlasKind::ALL.map(|kind| fixture.atlases.allocator(kind).generation()),
+            generations
+        );
+        assert_eq!(fixture.atlases.retired(), 0);
+        let last = usize::try_from((fixture.frames.ring().next_frame() - 1) % slots_u64()).unwrap();
+        let instances: Vec<u8> = text.ring_row_bytes().flatten().copied().collect();
+        assert_eq!(
+            fixture
+                .frames
+                .read(last, SlotBuffer::CellText, instances.len()),
+            instances
+        );
+        let table: Vec<u8> = text.row_table().flatten().collect();
+        assert_eq!(
+            fixture.frames.read(last, SlotBuffer::RowTable, table.len()),
+            table
+        );
+    }
+
+    /// A frame with more instances than its slot reserves (stacked
+    /// combining marks) grows only that slot's CellText buffer, and still
+    /// draws every instance.
+    #[test]
+    fn crowded_text_frames_grow_cell_text_and_draw_every_instance() {
+        let mut fixture = TextFixture::new(false).unwrap();
+        let (cells, _) = background_scene();
+        let mut text = CellTextGrid::new(cells.extent());
+        text.scroll_up(cells.row_offset());
+        let gray = fixture.glyph(0);
+        for row in 0..6 {
+            for col in 0..10_u16 {
+                for layer in 0..8_i16 {
+                    let fg = [255, u8::try_from(layer).unwrap() * 30, 0, 40];
+                    text.push(
+                        row,
+                        CellText::new(col, fg).with_glyph(&gray, [layer % 3, layer]),
+                    );
+                }
+            }
+        }
+        let reserved = SlotSizes::for_grid(cells.extent()).unwrap();
+        let capacity = fixture.frames.buffer(0, SlotBuffer::CellText).length();
+        assert!(
+            text.len() * crate::frame::CELL_TEXT_INSTANCE_BYTES
+                > capacity.max(reserved.bytes(SlotBuffer::CellText)),
+            "the scene must overflow the reserved CellText buffer"
+        );
+        let before = fixture.frames.allocations();
+        let uniforms = TextUniforms::default();
+        assert_eq!(
+            render_text_and_compare(&mut fixture, &text, uniforms, None),
+            BG_WIDTH * BG_HEIGHT
+        );
+        assert_eq!(
+            fixture.frames.allocations(),
+            before + 1,
+            "one CellText buffer"
+        );
     }
 }

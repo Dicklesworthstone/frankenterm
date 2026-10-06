@@ -12,8 +12,8 @@
 //! that may have sampled it has finished. Both textures, and every retired
 //! one, are recorded in the GPU resource ledger.
 //!
-//! Nothing samples the atlases yet: the glyph draw (ft-yccm0.4.2.3) binds
-//! [`GlyphAtlases::texture`] and adds [`GlyphAtlases::residency`] to its queue.
+//! The text pass (ft-yccm0.4.2.3) samples [`GlyphAtlases::texture`], and the
+//! renderer adds [`GlyphAtlases::residency`] to its queue.
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -31,38 +31,10 @@ use objc2_metal::{
 };
 
 use crate::atlas::{
-    AtlasChange, AtlasConfig, AtlasConfigError, AtlasFull, AtlasKind, AtlasSlot, FrameFence,
-    GlyphAtlas, RetireQueue, texture_bytes,
+    AtlasChange, AtlasConfig, AtlasError, AtlasKind, AtlasSlot, FrameFence, GlyphAtlas,
+    RetireQueue, texture_bytes,
 };
 use crate::{FrameError, MetalDevice};
-
-/// Why a glyph did not reach an atlas.
-#[derive(Debug)]
-pub enum AtlasError {
-    Config(AtlasConfigError),
-    Full(AtlasFull),
-    /// `pixels` was not exactly `width * height * bytes_per_pixel` bytes.
-    PixelBytes {
-        expected: usize,
-        actual: usize,
-    },
-    Gpu(FrameError),
-}
-
-impl std::fmt::Display for AtlasError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Config(error) => write!(f, "atlas configuration: {error}"),
-            Self::Full(full) => write!(f, "atlas full: {full:?}"),
-            Self::PixelBytes { expected, actual } => {
-                write!(f, "glyph pixels are {actual} bytes, expected {expected}")
-            }
-            Self::Gpu(error) => write!(f, "atlas GPU operation failed: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for AtlasError {}
 
 /// One atlas texture and its ledger entry, which is released with it.
 struct AtlasTexture {
@@ -363,9 +335,7 @@ impl GlyphAtlases {
         released
     }
 
-    /// The texture the glyph draw samples for `kind`; first bound by the
-    /// glyph draw (ft-yccm0.4.2.3).
-    #[allow(dead_code)]
+    /// The texture the text pass (ft-yccm0.4.2.3) samples for `kind`.
     pub(crate) fn texture(&self, kind: AtlasKind) -> &ProtocolObject<dyn MTLTexture> {
         &self.atlas(kind).current.texture
     }
@@ -376,9 +346,8 @@ impl GlyphAtlases {
         &self.atlas(kind).atlas
     }
 
-    /// The atlases' residency set, if the OS has them (macOS 15+); the glyph
-    /// draw (ft-yccm0.4.2.3) adds it to its queue.
-    #[allow(dead_code)]
+    /// The atlases' residency set, if the OS has them (macOS 15+); the
+    /// renderer adds it to its queue for the text pass (ft-yccm0.4.2.3).
     pub(crate) fn residency(&self) -> Option<&ProtocolObject<dyn MTLResidencySet>> {
         self.residency.as_deref()
     }

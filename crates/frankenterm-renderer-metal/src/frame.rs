@@ -413,6 +413,13 @@ impl SlotRing {
         self.lock().frames_completed
     }
 
+    /// The number the next lease's frame gets. Glyphs inserted or touched
+    /// for the frame being prepared are stamped with it (ft-yccm0.4.2.3).
+    #[must_use]
+    pub fn next_frame(&self) -> u64 {
+        self.lock().next_frame
+    }
+
     /// Every frame numbered below this has finished: it completed on the GPU
     /// or was dropped unsubmitted, so nothing it drew is still being read.
     /// The glyph atlases reuse a region only once its last frame is below it
@@ -617,7 +624,9 @@ mod tests {
     fn retired_before_is_the_oldest_unfinished_frame() {
         let ring = SlotRing::new();
         assert_eq!(ring.retired_before(), 0, "nothing leased yet");
+        assert_eq!(ring.next_frame(), 0);
         let first = ring.acquire(LONG).unwrap();
+        assert_eq!(ring.next_frame(), 1, "the lease took frame 0");
         assert_eq!(ring.retired_before(), 0, "frame 0 is being encoded");
         let token0 = first.submit();
         let token1 = ring.acquire(LONG).unwrap().submit();

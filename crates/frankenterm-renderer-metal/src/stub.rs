@@ -3,8 +3,9 @@
 //! statically unreachable and callers need no `cfg`.
 
 use crate::{
-    BackgroundUniforms, CellBgGrid, ClearColor, DeviceCapabilities, FrameError, FrameOutcome,
-    FrameStats, GridExtent, MetalUnavailable, SubmissionPath,
+    AtlasError, AtlasKind, AtlasSlot, BackgroundUniforms, CellBgGrid, ClearColor,
+    DeviceCapabilities, FrameError, FrameOutcome, FrameScene, FrameStats, GridExtent,
+    MetalUnavailable, SubmissionPath,
 };
 use raw_window_handle::HasWindowHandle;
 
@@ -90,6 +91,38 @@ impl MetalRenderer {
         _clear: ClearColor,
         _background: BackgroundUniforms,
     ) -> Result<Vec<u8>, FrameError> {
+        match *self {}
+    }
+
+    pub fn render_frame(
+        &self,
+        _width: u32,
+        _height: u32,
+        _scene: &FrameScene<'_>,
+    ) -> Result<FrameOutcome, FrameError> {
+        match *self {}
+    }
+
+    pub fn snapshot_frame(
+        &self,
+        _width: u32,
+        _height: u32,
+        _scene: &FrameScene<'_>,
+    ) -> Result<Vec<u8>, FrameError> {
+        match *self {}
+    }
+
+    pub fn insert_glyph(
+        &self,
+        _kind: AtlasKind,
+        _width: u32,
+        _height: u32,
+        _pixels: &[u8],
+    ) -> Result<AtlasSlot, AtlasError> {
+        match *self {}
+    }
+
+    pub fn touch_glyph(&self, _slot: &AtlasSlot) -> bool {
         match *self {}
     }
 }

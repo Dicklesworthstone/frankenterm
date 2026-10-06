@@ -166,6 +166,34 @@ impl std::fmt::Display for AtlasConfigError {
 
 impl std::error::Error for AtlasConfigError {}
 
+/// Why a glyph did not reach an atlas.
+#[derive(Debug)]
+pub enum AtlasError {
+    Config(AtlasConfigError),
+    Full(AtlasFull),
+    /// `pixels` was not exactly `width * height * bytes_per_pixel` bytes.
+    PixelBytes {
+        expected: usize,
+        actual: usize,
+    },
+    Gpu(crate::FrameError),
+}
+
+impl std::fmt::Display for AtlasError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Config(error) => write!(f, "atlas configuration: {error}"),
+            Self::Full(full) => write!(f, "atlas full: {full:?}"),
+            Self::PixelBytes { expected, actual } => {
+                write!(f, "glyph pixels are {actual} bytes, expected {expected}")
+            }
+            Self::Gpu(error) => write!(f, "atlas GPU operation failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for AtlasError {}
+
 /// Bytes of a `width x height` texture of `kind`.
 #[must_use]
 pub fn texture_bytes(kind: AtlasKind, width: u32, height: u32) -> u64 {

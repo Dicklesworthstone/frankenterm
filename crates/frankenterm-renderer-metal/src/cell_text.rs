@@ -32,6 +32,16 @@ use crate::frame::{CELL_TEXT_INSTANCE_BYTES, FrameUniforms, GridExtent, ROW_TABL
 /// The Metal Shading Language source of the text pass.
 pub const TEXT_SHADER: &str = include_str!("shaders/text.metal");
 
+/// The fragment texture binding (`[[texture(n)]]`, or Metal 4 argument-table
+/// texture index) of `kind`'s atlas in the text pass.
+#[must_use]
+pub const fn atlas_texture_index(kind: AtlasKind) -> usize {
+    match kind {
+        AtlasKind::Grayscale => 0,
+        AtlasKind::Color => 1,
+    }
+}
+
 /// Flag bits in a [`CellText`] instance's last byte.
 pub mod flags {
     /// Bits 0-1: which atlas the glyph samples, if any.
@@ -279,8 +289,9 @@ pub struct CellTextGrid {
     rows: u32,
     cols: u32,
     row_offset: u32,
-    /// Instances of each ring row; cleared rows keep their capacity.
-    ring: Vec<Vec<CellText>>,
+    /// The instance bytes of each ring row, so a row uploads as one slice;
+    /// cleared rows keep their capacity.
+    ring: Vec<Vec<[u8; CELL_TEXT_INSTANCE_BYTES]>>,
     len: usize,
 }
 
@@ -342,7 +353,7 @@ impl CellTextGrid {
             return false;
         };
         let ring_row = u16::try_from(index).expect("ring rows past u16::MAX are not stored");
-        self.ring[index].push(instance.with_ring_row(ring_row));
+        self.ring[index].push(instance.with_ring_row(ring_row).0);
         self.len += 1;
         true
     }
@@ -356,10 +367,11 @@ impl CellTextGrid {
     }
 
     /// The instances of logical `row`, in draw order.
-    #[must_use]
-    pub fn row(&self, row: u32) -> &[CellText] {
+    pub fn row(&self, row: u32) -> impl ExactSizeIterator<Item = CellText> {
         self.ring_index(row)
-            .map_or(&[], |index| self.ring[index].as_slice())
+            .map_or(&[][..], |index| self.ring[index].as_slice())
+            .iter()
+            .map(|bytes| CellText(*bytes))
     }
 
     /// Scrolls the content up by `lines`, like
@@ -391,14 +403,14 @@ impl CellTextGrid {
 
     /// Every instance in draw order: ring row by ring row, each row's in the
     /// order it was pushed. The frame's CellText buffer holds exactly this.
-    pub fn instances(&self) -> impl Iterator<Item = &CellText> {
-        self.ring.iter().flatten()
+    pub fn instances(&self) -> impl Iterator<Item = CellText> {
+        self.ring.iter().flatten().map(|bytes| CellText(*bytes))
     }
 
-    /// Each ring row's instances, in ring order: the CellText buffer is
+    /// Each ring row's instance bytes, in ring order: the CellText buffer is
     /// these slices back to back.
-    pub fn ring_rows(&self) -> impl Iterator<Item = &[CellText]> {
-        self.ring.iter().map(Vec::as_slice)
+    pub fn ring_row_bytes(&self) -> impl Iterator<Item = &[u8]> {
+        self.ring.iter().map(|row| row.as_flattened())
     }
 
     /// The per-row table, one entry per ring row in ring order, as the
@@ -561,9 +573,16 @@ fn shade_instance(
     (out[3] > 0.0).then_some(out)
 }
 
+/// `color` as the 8-bit render target stores it.
+fn to_target(color: [f32; 4]) -> [f32; 4] {
+    color.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() / 255.0)
+}
+
 /// The CPU reference of the text pass: the premultiplied color at pixel
 /// center `(x, y)` after every instance of `text` is blended, in draw order,
-/// over `under` (what the background pass left there).
+/// over `under` (what the background pass left there, as the 8-bit target
+/// holds it). Every blend lands in the 8-bit target before the next instance
+/// reads it, so the reference rounds after each one, like the GPU.
 ///
 /// `atlas(kind, x, y)` returns the atlas texel's stored bytes: the coverage
 /// in byte 0 for [`AtlasKind::Grayscale`], `[B, G, R, A]` premultiplied for
@@ -579,7 +598,8 @@ pub fn shade_text(
     y: f32,
 ) -> [f32; 4] {
     text.instances().fold(under, |color, cell| {
-        shade_instance(uniforms, cell, &atlas, x, y).map_or(color, |top| over(top, color))
+        shade_instance(uniforms, &cell, &atlas, x, y)
+            .map_or(color, |top| to_target(over(top, color)))
     })
 }
 
@@ -751,6 +771,14 @@ mod tests {
                 "device const CellText *instances [[buffer({})]]",
                 SlotBuffer::CellText.index()
             ),
+            format!(
+                "texture2d<float> gray [[texture({})]]",
+                atlas_texture_index(AtlasKind::Grayscale)
+            ),
+            format!(
+                "texture2d<float> color [[texture({})]]",
+                atlas_texture_index(AtlasKind::Color)
+            ),
         ] {
             assert!(TEXT_SHADER.contains(&binding), "{binding}");
         }
@@ -769,15 +797,15 @@ mod tests {
         }
         assert!(text.push(1, CellText::new(2, WHITE)));
         assert_eq!(text.len(), 5);
-        let before: Vec<CellText> = text.instances().copied().collect();
+        let before: Vec<CellText> = text.instances().collect();
         text.scroll_up(1);
         assert_eq!(text.row_offset(), 1);
         // Logical row 0 now shows what row 1 showed, stored where it was.
         assert_eq!(text.row(0).len(), 2);
-        assert_eq!(text.row(0)[0].ring_row(), 1);
-        assert!(text.row(3).is_empty(), "the exposed row is emptied");
+        assert_eq!(text.row(0).next().map(|cell| cell.ring_row()), Some(1));
+        assert_eq!(text.row(3).len(), 0, "the exposed row is emptied");
         assert_eq!(text.len(), 4);
-        let after: Vec<CellText> = text.instances().copied().collect();
+        let after: Vec<CellText> = text.instances().collect();
         assert_eq!(&after[..], &before[1..], "only ring row 0 was cleared");
         text.scroll_up(10);
         assert!(text.is_empty());
@@ -802,10 +830,16 @@ mod tests {
             })
             .collect();
         assert_eq!(table, [[0, 1], [1, 0], [1, 3]]);
-        let rows: Vec<usize> = text.ring_rows().map(<[CellText]>::len).collect();
+        let rows: Vec<usize> = text
+            .ring_row_bytes()
+            .map(|bytes| bytes.len() / CELL_TEXT_INSTANCE_BYTES)
+            .collect();
         assert_eq!(rows, [1, 0, 3]);
-        let order: Vec<u16> = text.instances().map(CellText::ring_row).collect();
+        let order: Vec<u16> = text.instances().map(|cell| cell.ring_row()).collect();
         assert_eq!(order, [0, 2, 2, 2]);
+        let bytes: Vec<u8> = text.ring_row_bytes().flatten().copied().collect();
+        let expected: Vec<u8> = text.instances().flat_map(|cell| *cell.bytes()).collect();
+        assert_eq!(bytes, expected, "the upload is the instances back to back");
     }
 
     #[test]
@@ -818,7 +852,7 @@ mod tests {
         text.clear_row(1);
         text.clear_row(7);
         assert!(text.is_empty());
-        assert_eq!(text.row(9), &[] as &[CellText]);
+        assert_eq!(text.row(9).len(), 0);
     }
 
     #[test]
@@ -864,8 +898,12 @@ mod tests {
         );
         let color = shade(&faded, at(0, 0, 9.0, 3.0));
         let alpha = 51.0 / 255.0;
+        // Within the 8-bit target's rounding.
         for (got, want) in color[..3].iter().zip(&opaque[..3]) {
-            assert!((got - want * alpha).abs() < 1e-6, "{color:?}");
+            assert!(
+                (got - want * alpha).abs() <= 0.5 / 255.0 + 1e-6,
+                "{color:?}"
+            );
         }
         assert!(
             (color[3] - (alpha + (1.0 - alpha))).abs() < 1e-6,

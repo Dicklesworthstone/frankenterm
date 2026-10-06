@@ -5,11 +5,12 @@
 //! the Metal objects: the [`MetalDevice`] (device, command queue, capability
 //! probe) and the [`MetalRenderer`] bound to a window's `CAMetalLayer`.
 //!
-//! What it renders today is deliberately minimal: one render pass that clears
-//! the drawable to the window background color and presents it. That proves
-//! the device, queue, layer and present plumbing end to end. Cell backgrounds
-//! and glyphs arrive with the later Track C beads, so `front_end = "Metal"` is
-//! an in-development opt-in that does not yet draw terminal content.
+//! A frame is one render pass: it clears the drawable to the window
+//! background color, draws the background pass ([`cell_bg`], ft-yccm0.4.2.2)
+//! and then the text pass ([`cell_text`], ft-yccm0.4.2.3), every glyph in one
+//! instanced draw that samples the renderer's glyph atlases ([`atlas`]). The
+//! GUI does not feed it terminal content yet (the snapshot adapter is
+//! ft-yccm0.4.4), so `front_end = "Metal"` is an in-development opt-in.
 //!
 //! # Frame slots (ft-yccm0.4.2.1)
 //!
@@ -48,7 +49,8 @@
 //! are denied, so each block holds one operation and one `SAFETY:` comment
 //! naming its category below. All blocks live in `src/macos.rs`,
 //! `src/macos_frames.rs` and `src/macos_atlas.rs`. The non-macOS stub and the
-//! portable [`frame`] and [`atlas`] modules contain none.
+//! portable [`frame`], [`atlas`], [`cell_bg`] and [`cell_text`] modules
+//! contain none.
 //!
 //! Most Metal and Core Animation calls are safe in `objc2-metal` /
 //! `objc2-quartz-core` 0.3, whose generated bindings already encode the
@@ -113,20 +115,31 @@
 //!    encoding, and its allocator is not reset until the frame's feedback
 //!    handler has freed the slot.
 //! 8. **FFI-ARGTABLE: Metal 4 argument tables.** `setAddress:atIndex:` binds
-//!    a buffer by GPU address.
+//!    a buffer by GPU address; `setTexture:atIndex:` binds a glyph atlas by
+//!    resource ID (ft-yccm0.4.2.3).
 //!    *Invariant:* the address belongs to a live slot buffer that the frame
 //!    slots own and keep in the queue's residency set; the index is below the
 //!    table's `maxBufferBindCount`; a slot's buffers are rebound whenever its
 //!    generation changes (a buffer was replaced), before the slot's next frame.
-//! 9. **FFI-DRAW: binding and drawing the background pass.**
-//!    `setFragmentBuffer:offset:atIndex:` (Metal 3) and
-//!    `drawPrimitives:vertexStart:vertexCount:` (both paths).
+//!    An atlas texture is live and in the atlases' residency set, which joined
+//!    the queue; it is rebound every text frame (growth replaces it), at an
+//!    index below `maxTextureBindCount`, and a replaced texture is retired
+//!    only after every frame that may sample it has finished.
+//! 9. **FFI-DRAW: binding and drawing the background and text passes.**
+//!    `setVertexBuffer:offset:atIndex:`, `setFragmentBuffer:offset:atIndex:`
+//!    and `setFragmentTexture:atIndex:` (Metal 3), and
+//!    `drawPrimitives:vertexStart:vertexCount:` and its `instanceCount:` form
+//!    (both paths).
 //!    *Invariant:* each bound buffer is a live slot buffer of the leased
 //!    slot, bound from offset 0 at its `SlotBuffer` index (the shader's
-//!    `[[buffer(n)]]`, below Metal's 31 slots); the draw is three vertices of
-//!    one triangle, and the vertex shader reads no vertex buffer. The shader
-//!    indexes CellBg only below `rows * cols`, and the frame slots size that
-//!    buffer for the frame's grid before the frame is encoded.
+//!    `[[buffer(n)]]`, below Metal's 31 slots); each bound texture is a live
+//!    atlas texture at the shader's `[[texture(n)]]`. The background draw is
+//!    three vertices of one triangle, and its vertex shader reads no vertex
+//!    buffer; it indexes CellBg only below `rows * cols`, and the frame slots
+//!    size that buffer for the frame's grid before the frame is encoded. The
+//!    text draw is four strip vertices per instance; its vertex shader reads
+//!    CellText only below the instance count, every one of which the frame
+//!    wrote into a buffer fitted for them first.
 //! 10. **ATLAS-UPLOAD: writing glyph pixels into an atlas texture.**
 //!     `replaceRegion:mipmapLevel:withBytes:bytesPerRow:` on a glyph atlas
 //!     (ft-yccm0.4.3.2).
@@ -148,6 +161,7 @@ pub mod atlas;
 pub mod cell_bg;
 pub mod cell_text;
 pub mod frame;
+pub use atlas::{AtlasError, AtlasKind, AtlasSlot};
 pub use cell_bg::{BackgroundUniforms, CellBg, CellBgGrid, CursorShape, CursorUniform};
 pub use cell_text::{CellText, CellTextGrid, TextUniforms, UnderlineStyle};
 pub use frame::{FRAME_SLOTS, GridExtent};
@@ -157,7 +171,7 @@ mod macos;
 #[cfg(target_os = "macos")]
 mod macos_atlas;
 #[cfg(target_os = "macos")]
-pub use macos_atlas::{AtlasError, GlyphAtlases};
+pub use macos_atlas::GlyphAtlases;
 #[cfg(target_os = "macos")]
 mod macos_frames;
 #[cfg(target_os = "macos")]
@@ -496,6 +510,14 @@ pub enum FrameError {
         len: usize,
         capacity: usize,
     },
+    /// A frame's glyph instances do not belong to its cell grid: another
+    /// extent, or another ring offset (ft-yccm0.4.2.3).
+    TextGridMismatch {
+        cells: GridExtent,
+        text: GridExtent,
+        cells_row_offset: u32,
+        text_row_offset: u32,
+    },
 }
 
 impl fmt::Display for FrameError {
@@ -532,11 +554,51 @@ impl fmt::Display for FrameError {
                 f,
                 "a {len}-byte write at offset {offset} overruns the {capacity}-byte {buffer} buffer"
             ),
+            Self::TextGridMismatch {
+                cells,
+                text,
+                cells_row_offset,
+                text_row_offset,
+            } => write!(
+                f,
+                "the glyph grid ({}x{}, ring offset {text_row_offset}) does not match the cell \
+                 grid ({}x{}, ring offset {cells_row_offset})",
+                text.rows, text.cols, cells.rows, cells.cols
+            ),
         }
     }
 }
 
 impl std::error::Error for FrameError {}
+
+/// Everything one frame draws (ft-yccm0.4.2.3): the background pass over
+/// `cells`, then the text pass over `text`, whose glyphs sample the
+/// renderer's atlases. `text` must have `cells`' extent and ring offset.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameScene<'a> {
+    pub cells: &'a CellBgGrid,
+    pub background: BackgroundUniforms,
+    pub text: &'a CellTextGrid,
+    pub text_uniforms: TextUniforms,
+    pub clear: ClearColor,
+}
+
+impl FrameScene<'_> {
+    /// [`FrameError::TextGridMismatch`] unless the glyph grid belongs to the
+    /// cell grid.
+    pub fn check(&self) -> Result<(), FrameError> {
+        let (cells, text) = (self.cells.extent(), self.text.extent());
+        if cells == text && self.cells.row_offset() == self.text.row_offset() {
+            return Ok(());
+        }
+        Err(FrameError::TextGridMismatch {
+            cells,
+            text,
+            cells_row_offset: self.cells.row_offset(),
+            text_row_offset: self.text.row_offset(),
+        })
+    }
+}
 
 /// The outcome of a successfully encoded frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -967,5 +1029,43 @@ mod tests {
             MetalDevice::system_default().err(),
             Some(MetalUnavailable::UnsupportedPlatform)
         );
+    }
+
+    /// ft-yccm0.4.2.3: a frame's glyph grid must have its cell grid's extent
+    /// and ring offset, or the shader would place glyphs on the wrong rows.
+    #[test]
+    fn frame_scenes_refuse_a_glyph_grid_from_another_cell_grid() {
+        fn scene<'a>(cells: &'a CellBgGrid, text: &'a CellTextGrid) -> FrameScene<'a> {
+            FrameScene {
+                cells,
+                background: BackgroundUniforms::default(),
+                text,
+                text_uniforms: TextUniforms::default(),
+                clear: ClearColor::from_srgba(0.0, 0.0, 0.0, 1.0),
+            }
+        }
+        let extent = GridExtent::new(4, 6);
+        let mut cells = CellBgGrid::new(extent);
+        let mut text = CellTextGrid::new(extent);
+        assert_eq!(scene(&cells, &text).check(), Ok(()));
+        cells.scroll_up(1);
+        let error = scene(&cells, &text).check().unwrap_err();
+        assert_eq!(
+            error,
+            FrameError::TextGridMismatch {
+                cells: extent,
+                text: extent,
+                cells_row_offset: 1,
+                text_row_offset: 0,
+            }
+        );
+        assert!(error.to_string().contains("ring offset 0"), "{error}");
+        text.scroll_up(1);
+        assert_eq!(scene(&cells, &text).check(), Ok(()));
+        let other = CellTextGrid::new(GridExtent::new(4, 7));
+        assert!(matches!(
+            scene(&cells, &other).check(),
+            Err(FrameError::TextGridMismatch { .. })
+        ));
     }
 }

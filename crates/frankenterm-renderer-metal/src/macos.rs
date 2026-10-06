@@ -1,14 +1,18 @@
 //! The macOS implementation. Every `unsafe` block in the crate is here, and
 //! each names its UNSAFE-CONTRACT category from the crate docs.
 
+use crate::atlas::{AtlasConfig, AtlasError, AtlasKind, AtlasSlot, FrameFence};
 use crate::cell_bg::{BackgroundUniforms, CellBgGrid};
+use crate::cell_text::{CellTextGrid, TextUniforms};
 use crate::frame::{FrameUniforms, GridExtent, SlotBuffer};
+use crate::macos_atlas::GlyphAtlases;
 use crate::macos_frames::{
-    BackgroundPipeline, FrameSlots, OffscreenCells, Submission, supports_metal4,
+    BackgroundPipeline, FrameSlots, OffscreenCells, OffscreenText, Submission, TextDraw,
+    TextPipeline, supports_metal4,
 };
 use crate::{
-    ClearColor, DeviceCapabilities, FRAME_SLOT_TIMEOUT, FrameError, FrameOutcome, FrameStats,
-    MAX_TEXTURE_EXTENT, MetalUnavailable, SUBMISSION_ENV, SubmissionPath, appkit_view,
+    ClearColor, DeviceCapabilities, FRAME_SLOT_TIMEOUT, FrameError, FrameOutcome, FrameScene,
+    FrameStats, MAX_TEXTURE_EXTENT, MetalUnavailable, SUBMISSION_ENV, SubmissionPath, appkit_view,
 };
 use frankenterm_alloc::resource_ledger::GpuResourceLedger;
 use objc2::rc::Retained;
@@ -201,6 +205,10 @@ pub struct MetalRenderer {
     submission: Submission,
     submission_note: Option<String>,
     background: BackgroundPipeline,
+    text: TextPipeline,
+    /// The glyph atlases the text pass samples (ft-yccm0.4.2.3). Dropped
+    /// after `Drop::drop` has waited out the frames that sample them.
+    atlases: RefCell<GlyphAtlases>,
 }
 
 /// Longest a dropped renderer waits for its in-flight frames.
@@ -248,6 +256,18 @@ impl MetalRenderer {
         })?;
         let background = BackgroundPipeline::new(&device.device)
             .map_err(|detail| MetalUnavailable::Pipeline { detail })?;
+        let text = TextPipeline::new(&device.device)
+            .map_err(|detail| MetalUnavailable::Pipeline { detail })?;
+        let atlases = GlyphAtlases::new(
+            &device,
+            AtlasConfig::for_kind(AtlasKind::Grayscale),
+            AtlasConfig::for_kind(AtlasKind::Color),
+            false,
+            GpuResourceLedger::global(),
+        )
+        .map_err(|error| MetalUnavailable::ResourceAllocation {
+            detail: error.to_string(),
+        })?;
         let choice = SubmissionPath::select(
             supports_metal4(&device.device) && frames.residency().is_some(),
             std::env::var(SUBMISSION_ENV).ok().as_deref(),
@@ -267,6 +287,9 @@ impl MetalRenderer {
                 choice.note,
             ),
         };
+        if let Some(set) = atlases.residency() {
+            submission.add_residency_set(set);
+        }
         let handle =
             window
                 .window_handle()
@@ -305,6 +328,8 @@ impl MetalRenderer {
             submission,
             submission_note,
             background,
+            text,
+            atlases: RefCell::new(atlases),
         })
     }
 
@@ -354,7 +379,7 @@ impl MetalRenderer {
         grid: GridExtent,
         color: ClearColor,
     ) -> Result<FrameOutcome, FrameError> {
-        self.render(width, height, grid, color, None)
+        self.render(width, height, grid, color, None, None)
     }
 
     /// Renders one frame with the background pass (ft-yccm0.4.2.2): uploads
@@ -376,7 +401,96 @@ impl MetalRenderer {
             cells.extent(),
             clear,
             Some((cells, background)),
+            None,
         )
+    }
+
+    /// Renders one frame of `scene` (ft-yccm0.4.2.3): the background pass
+    /// over its cells, then every glyph instance of its text in one
+    /// instanced draw that samples this renderer's atlases. Its glyphs must
+    /// have been placed with [`Self::insert_glyph`] (or kept live with
+    /// [`Self::touch_glyph`]) since the previous frame. Does not wait for the
+    /// GPU.
+    pub fn render_frame(
+        &self,
+        width: u32,
+        height: u32,
+        scene: &FrameScene<'_>,
+    ) -> Result<FrameOutcome, FrameError> {
+        scene.check()?;
+        self.render(
+            width,
+            height,
+            scene.cells.extent(),
+            scene.clear,
+            Some((scene.cells, scene.background)),
+            Some((scene.text, scene.text_uniforms)),
+        )
+    }
+
+    /// [`Self::render_frame`] into an offscreen `width x height` texture,
+    /// returning its bytes (BGRA8, row-major, tightly packed). Waits for the
+    /// GPU and presents nothing.
+    pub fn snapshot_frame(
+        &self,
+        width: u32,
+        height: u32,
+        scene: &FrameScene<'_>,
+    ) -> Result<Vec<u8>, FrameError> {
+        scene.check()?;
+        let atlases = self.atlases.borrow();
+        self.frames.borrow_mut().render_cells_offscreen(
+            &self.submission,
+            &self.background,
+            &self.device.queue,
+            &OffscreenCells {
+                width,
+                height,
+                cells: scene.cells,
+                clear: scene.clear,
+                background: scene.background,
+                text: Some(OffscreenText {
+                    grid: scene.text,
+                    uniforms: scene.text_uniforms,
+                    pipeline: &self.text,
+                    atlases: &atlases,
+                }),
+            },
+        )
+    }
+
+    /// Places a `width x height` glyph in `kind`'s atlas for the next frame
+    /// and uploads its pixels: one coverage byte per pixel for grayscale,
+    /// `[B, G, R, A]` premultiplied for color, rows tightly packed. The
+    /// returned slot goes into [`crate::CellText::with_glyph`].
+    pub fn insert_glyph(
+        &self,
+        kind: AtlasKind,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> Result<AtlasSlot, AtlasError> {
+        let fence = self.atlas_fence();
+        self.atlases
+            .borrow_mut()
+            .insert(&self.device, kind, width, height, pixels, fence)
+    }
+
+    /// Records that the next frame draws the glyph in `slot`. False when the
+    /// atlas evicted it: insert the glyph again.
+    pub fn touch_glyph(&self, slot: &AtlasSlot) -> bool {
+        let frame = self.atlas_fence().current;
+        self.atlases.borrow_mut().touch(slot, frame)
+    }
+
+    /// The frame being prepared, and the frames the GPU has finished.
+    fn atlas_fence(&self) -> FrameFence {
+        let frames = self.frames.borrow();
+        let ring = frames.ring();
+        FrameFence {
+            current: ring.next_frame(),
+            retired_before: ring.retired_before(),
+        }
     }
 
     /// Renders `cells` with the background pass into an offscreen
@@ -402,6 +516,7 @@ impl MetalRenderer {
                 cells,
                 clear,
                 background,
+                text: None,
             },
         )
     }
@@ -413,6 +528,7 @@ impl MetalRenderer {
         grid: GridExtent,
         color: ClearColor,
         cells: Option<(&CellBgGrid, BackgroundUniforms)>,
+        text: Option<(&CellTextGrid, TextUniforms)>,
     ) -> Result<FrameOutcome, FrameError> {
         if width == 0 || height == 0 {
             return Ok(FrameOutcome::ZeroSize);
@@ -422,7 +538,13 @@ impl MetalRenderer {
                 .setDrawableSize(CGSize::new(f64::from(width), f64::from(height)));
             self.drawable_size.set((width, height));
         }
-        let lease = self.frames.borrow_mut().begin(grid, FRAME_SLOT_TIMEOUT)?;
+        let retired_before = self.frames.borrow().ring().retired_before();
+        self.atlases.borrow_mut().collect_retired(retired_before);
+        let text_instances = text.map_or(0, |(text, _)| text.len());
+        let lease =
+            self.frames
+                .borrow_mut()
+                .begin_frame(grid, text_instances, FRAME_SLOT_TIMEOUT)?;
         let frames = self.frames.borrow();
         let mut uniforms = FrameUniforms {
             frame: lease.frame(),
@@ -438,12 +560,17 @@ impl MetalRenderer {
             };
             frames.write(&lease, SlotBuffer::CellBg, 0, cells.as_bytes())?;
         }
+        if let Some((text, text_uniforms)) = text {
+            uniforms.text = text_uniforms;
+            frames.write_text(&lease, text)?;
+        }
         frames.write(&lease, SlotBuffer::Uniforms, 0, &uniforms.to_bytes())?;
         // A frame abandoned here drops its lease, which frees the slot.
         let drawable = self
             .layer
             .nextDrawable()
             .ok_or(FrameError::DrawableUnavailable)?;
+        let atlases = self.atlases.borrow();
         self.submission.encode_frame(
             &frames,
             lease,
@@ -451,6 +578,11 @@ impl MetalRenderer {
             Some(ProtocolObject::from_ref(&*drawable)),
             color,
             cells.map(|_| &self.background),
+            text.map(|(text, _)| TextDraw {
+                pipeline: &self.text,
+                atlases: &atlases,
+                instances: text.len(),
+            }),
         )?;
         Ok(FrameOutcome::Presented)
     }
