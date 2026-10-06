@@ -109,6 +109,16 @@ struct InputSpec {
     /// fixture must sort before this one so an update pins it first.
     #[serde(default)]
     parity_golden: Option<String>,
+    /// `gui_snapshot` fixtures: also measure the render against this other
+    /// fixture's golden, the one a rasterizer change replaces (a CoreText
+    /// scene against its FreeType twin, ft-yccm0.4.3.1). The fixture still
+    /// pins and is gated on its own golden; this comparison is reported under
+    /// `reference` and fails the fixture only when the mean SSIM falls below
+    /// `reference_min_ssim`, the documented tolerance.
+    #[serde(default)]
+    reference_golden: Option<String>,
+    #[serde(default)]
+    reference_min_ssim: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -841,20 +851,33 @@ fn run_fixtures(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         let golden = load_png_rgba8(&golden_path(&root, &fixture)?)?;
         let compare_start = Instant::now();
         let comparison = compare_images(&actual, &golden, fixture.meta.thresholds)?;
+        let reference = reference_check(&root, &fixture, &actual)?;
         let compare_ms = compare_start.elapsed().as_millis();
-        let status = if comparison.passed { "pass" } else { "fail" };
+        let reference_passed = reference.as_ref().is_none_or(|check| check.result.passed);
+        let status = if comparison.passed && reference_passed {
+            "pass"
+        } else {
+            "fail"
+        };
         let explained_delta = gui_snapshot_explained_delta(&fixture);
+        let reference_report = reference.as_ref().map(ReferenceCheck::report);
 
         let mut heatmap = None;
-        if comparison.passed && fixture.expected.status == ExpectedStatus::Pass {
+        if status == "pass" && fixture.expected.status == ExpectedStatus::Pass {
             passed += 1;
         } else {
             failed += 1;
+            // The artifacts show the failing comparison: the fixture's own
+            // golden first, else its reference.
+            let shown = match &reference {
+                Some(check) if comparison.passed => &check.result,
+                _ => &comparison,
+            };
             heatmap = Some(write_failure_artifacts(
                 &artifact_root,
                 &fixture,
                 &actual,
-                &comparison,
+                shown,
                 explained_delta.as_ref(),
             )?);
         }
@@ -875,6 +898,7 @@ fn run_fixtures(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             "changed_pixel_fraction": comparison.metrics.changed_pixel_fraction,
             "heatmap": heatmap,
             "explained_delta": explained_delta,
+            "reference": reference_report,
             "status": status,
         }));
         receipt_rows.push(json!({
@@ -887,6 +911,7 @@ fn run_fixtures(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             "font_set_sha": fixture.meta.font_set_sha,
             "rasterizer": fixture.meta.rasterizer,
             "explained_delta": explained_delta,
+            "reference": reference_report,
         }));
 
         perf_entries.push(PerfEntry {
@@ -1278,6 +1303,88 @@ const GUI_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Renders a `gui_snapshot` fixture through the real `frankenterm-gui`
 /// binary (`FT_GPU_HARNESS_GUI_BIN` overrides the Cargo-built one).
+/// The rasterizer identity a `gui_snapshot` fixture's golden records: its
+/// scene's (`render_corpus::rasterizer_identity`).
+fn fixture_rasterizer_identity(fixture: &Fixture) -> String {
+    fixture.input.scene.as_ref().map_or_else(
+        || render_corpus::RASTERIZER_IDENTITY.to_string(),
+        render_corpus::rasterizer_identity,
+    )
+}
+
+/// A `reference_golden` fixture's measurement against that golden.
+struct ReferenceCheck {
+    fixture: String,
+    min_ssim: f64,
+    result: CompareResult,
+}
+
+impl ReferenceCheck {
+    fn report(&self) -> serde_json::Value {
+        json!({
+            "fixture": self.fixture,
+            "min_ssim": self.min_ssim,
+            "passed": self.result.passed,
+            "ssim": self.result.metrics.ssim,
+            "min_window_ssim": self.result.metrics.min_window_ssim,
+            "linf": self.result.metrics.l_inf,
+            "changed_pixel_fraction": self.result.metrics.changed_pixel_fraction,
+        })
+    }
+}
+
+/// Measures `actual` against the fixture's `reference_golden`, if it names
+/// one: only the mean SSIM floor `reference_min_ssim` decides.
+fn reference_check(
+    root: &Path,
+    fixture: &Fixture,
+    actual: &RgbaImage,
+) -> Result<Option<ReferenceCheck>, Box<dyn std::error::Error>> {
+    let input = &fixture.input;
+    let Some(name) = &input.reference_golden else {
+        if input.reference_min_ssim.is_some() {
+            return Err(format!(
+                "`{}`: reference_min_ssim needs reference_golden",
+                fixture.name
+            )
+            .into());
+        }
+        return Ok(None);
+    };
+    if name.split('/').any(|part| part.is_empty() || part == "..") || *name == fixture.name {
+        return Err(format!("`{}`: bad reference_golden {name:?}", fixture.name).into());
+    }
+    if input.parity_golden.is_some() {
+        return Err(format!(
+            "`{}`: parity_golden and reference_golden exclude each other",
+            fixture.name
+        )
+        .into());
+    }
+    let min_ssim = input
+        .reference_min_ssim
+        .filter(|floor| (0.0..=1.0).contains(floor))
+        .ok_or_else(|| {
+            format!(
+                "`{}`: reference_golden needs reference_min_ssim in [0, 1]",
+                fixture.name
+            )
+        })?;
+    let reference = load_png_rgba8(&root.join(name).join("golden.png"))?;
+    let thresholds = Thresholds {
+        min_ssim,
+        max_l_inf: u8::MAX,
+        max_changed_pixel_fraction: 1.0,
+        min_window_ssim: 0.0,
+    };
+    let result = compare_images(actual, &reference, thresholds)?;
+    Ok(Some(ReferenceCheck {
+        fixture: name.clone(),
+        min_ssim,
+        result,
+    }))
+}
+
 /// The golden a fixture is compared against: its own, or the
 /// `parity_golden` fixture's.
 fn golden_path(root: &Path, fixture: &Fixture) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -1361,7 +1468,7 @@ fn write_gui_snapshot_meta(
         "font_set_sha": render_corpus::font_set_sha(&fonts),
         "harness_version": HARNESS_VERSION,
         "generated_at_runner": renderer_info.unwrap_or("frankenterm-gui (renderer line not logged)"),
-        "rasterizer": render_corpus::RASTERIZER_IDENTITY,
+        "rasterizer": fixture_rasterizer_identity(fixture),
         "font_files": fonts,
         "thresholds": fixture.meta.thresholds,
     });
@@ -1380,12 +1487,13 @@ fn gui_snapshot_explained_delta(fixture: &Fixture) -> Option<serde_json::Value> 
     }
     let current = render_corpus::font_identity(&workspace_root()).ok()?;
     let font_changes = render_corpus::font_identity_changes(&fixture.meta.font_files, &current);
+    let current_rasterizer = fixture_rasterizer_identity(fixture);
     let rasterizer_changed =
-        fixture.meta.rasterizer.as_deref() != Some(render_corpus::RASTERIZER_IDENTITY);
+        fixture.meta.rasterizer.as_deref() != Some(current_rasterizer.as_str());
     Some(json!({
         "font_changes": font_changes,
         "golden_rasterizer": fixture.meta.rasterizer,
-        "current_rasterizer": render_corpus::RASTERIZER_IDENTITY,
+        "current_rasterizer": current_rasterizer,
         "rasterizer_changed": rasterizer_changed,
         "explained": !font_changes.is_empty() || rasterizer_changed,
     }))

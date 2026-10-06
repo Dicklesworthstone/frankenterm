@@ -52,12 +52,21 @@ winapi.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 cocoa.workspace = true
 core-foundation.workspace = true
+# The CoreText rasterizer's bitmap contexts (ft-yccm0.4.3.1); already in the
+# graph through core-text.
+core-graphics.workspace = true
 core-text.workspace = true
 objc.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 env_logger.workspace = true
 k9.workspace = true
+
+# Rasterization cost per glyph, FreeType against CoreText (ft-yccm0.4.3.1).
+[[bench]]
+name = "rasterize_glyph"
+harness = false
 
 [lints.rust]
 unexpected_cfgs = { level = "allow", check-cfg = ['cfg(cargo_clippy)'] }

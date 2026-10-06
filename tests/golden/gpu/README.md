@@ -72,6 +72,17 @@ WebGpu golden. `metal-focus-selection` pins the Metal hook's own output
 (backgrounds, selection and a focused cursor; no glyphs until the CellText
 pass, ft-yccm0.4.2.3).
 
+Every scene renders with `font_rasterizer = "FreeType"` unless it selects
+another rasterizer, and its golden's `meta.json` records the scene's
+rasterizer. A fixture with `"reference_golden": "real/<other>"` and
+`"reference_min_ssim": <floor>` pins and is gated on its own golden as usual,
+and is also measured against the other fixture's golden. That measurement is
+reported under `reference`, and it fails the fixture only when the mean SSIM
+falls below the floor. The `coretext-<scene>` fixtures (ft-yccm0.4.3.1) play
+`<scene>` with `font_rasterizer = "CoreText"` against its FreeType golden;
+their floors and the expected rasterizer differences are documented in
+`docs/render/coretext-rasterizer.md`.
+
 Real-renderer corpus commands (macOS, native; the GUI cannot build on the
 Linux workers):
 

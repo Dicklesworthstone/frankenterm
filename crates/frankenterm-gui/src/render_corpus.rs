@@ -58,11 +58,26 @@ pub const SYSTEM_FALLBACK_FONT_FILES: &[&str] = &[
     "/System/Library/Fonts/Hiragino Sans GB.ttc",
     "/System/Library/Fonts/AppleSDGothicNeo.ttc",
 ];
-/// The rasterizer every golden is produced by today. Track C replaces it with
-/// CoreText and the Metal renderer; goldens record it so that switch is an
-/// explained delta rather than a mystery.
+/// The rasterizer a golden is produced by unless its scene selects another:
+/// the base configuration pins FreeType. Goldens record their scene's
+/// identity ([`rasterizer_identity`]) so a rasterizer switch, such as Track
+/// C's CoreText, is an explained delta rather than a mystery.
 pub const RASTERIZER_IDENTITY: &str =
     "frankenterm-gui WebGpu front end; FreeType rasterizer; HarfBuzz shaper";
+
+/// The rasterizer identity a scene's golden records: [`RASTERIZER_IDENTITY`]
+/// for the base FreeType rasterizer, otherwise the same line naming the
+/// rasterizer the scene's `font_rasterizer` selects (ft-yccm0.4.3.1).
+pub fn rasterizer_identity(scene: &SceneSpec) -> String {
+    let rasterizer = scene
+        .config
+        .get("font_rasterizer")
+        .cloned()
+        .or_else(|| base_config().remove("font_rasterizer"))
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "FreeType".to_string());
+    format!("frankenterm-gui WebGpu front end; {rasterizer} rasterizer; HarfBuzz shaper")
+}
 
 /// One font in the golden's identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -574,6 +589,25 @@ mod tests {
                 .iter()
                 .map(|f| f.family.as_str())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rasterizer_identity_follows_the_scene_rasterizer() {
+        assert_eq!(
+            rasterizer_identity(&SceneSpec::default()),
+            RASTERIZER_IDENTITY
+        );
+        let coretext = SceneSpec {
+            config: BTreeMap::from([(
+                "font_rasterizer".to_string(),
+                serde_json::json!("CoreText"),
+            )]),
+            ..SceneSpec::default()
+        };
+        assert_eq!(
+            rasterizer_identity(&coretext),
+            "frankenterm-gui WebGpu front end; CoreText rasterizer; HarfBuzz shaper"
         );
     }
 

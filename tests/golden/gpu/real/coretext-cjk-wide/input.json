@@ -1,0 +1,11 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "0123456789012345678901234567890123\n\u7b80\u4f53: \u4f60\u597d\u4e16\u754c \u7ec8\u7aef\u6e32\u67d3\u6d4b\u8bd5\n\u7e41\u9ad4: \u7e41\u9ad4\u4e2d\u6587 \u96fb\u8166\u7d42\u7aef \u6e2c\u8a66\n\u65e5\u672c: \u3072\u3089\u304c\u306a \u30ab\u30bf\u30ab\u30ca \u6f22\u5b57\u30c6\u30b9\u30c8\n\ud55c\uad6d: \ud55c\uad6d\uc5b4 \ud55c\uae00 \ud130\ubbf8\ub110 \ub80c\ub354\ub9c1\nmix:  a\u4f60b\u597dc\u4e16d\u754ce\u001b[?25l",
+    "config": {
+      "font_rasterizer": "CoreText"
+    }
+  },
+  "reference_golden": "real/cjk-wide",
+  "reference_min_ssim": 0.998
+}
