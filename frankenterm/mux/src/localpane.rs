@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use config::keyassignment::ScrollbackEraseMode;
 use config::{configuration, ExitBehavior, ExitBehaviorMessaging};
 use fancy_regex::Regex;
+use frankenterm_alloc::resource_ledger::{TerminalLockHolder, TerminalLockLedger};
 use frankenterm_dynamic::Value;
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::color::ColorPalette;
@@ -1592,11 +1593,138 @@ where
     retry_with_backoff_controlled(policy, |attempt| op(attempt).map_err(RetryStepError::Retry))
 }
 
+/// A pane's terminal mutex, instrumented for ft-yccm0.1.5.
+///
+/// Every acquisition records how long it waited and how long it held the
+/// mutex, tagged with the holder kind, in the process's terminal-lock ledger
+/// (exported through `ft doctor --json`). A wait on the main (UI) thread also
+/// counts as main-thread blocking. An uncontended acquisition costs a
+/// try-lock plus two clock reads and a few relaxed atomic adds.
+struct TerminalMutex {
+    inner: Mutex<Terminal>,
+}
+
+impl TerminalMutex {
+    fn new(terminal: Terminal) -> Self {
+        Self {
+            inner: Mutex::new(terminal),
+        }
+    }
+
+    fn lock(&self) -> TerminalGuard<'_> {
+        self.lock_as(TerminalLockHolder::Other)
+    }
+
+    fn lock_as(&self, holder: TerminalLockHolder) -> TerminalGuard<'_> {
+        if let Some(guard) = self.inner.try_lock() {
+            return TerminalGuard::acquired(guard, holder, 0);
+        }
+        let started = Instant::now();
+        let guard = self.inner.lock();
+        let waited = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        TerminalGuard::acquired(guard, holder, waited.max(1))
+    }
+
+    fn try_lock(&self) -> Option<TerminalGuard<'_>> {
+        self.try_lock_as(TerminalLockHolder::Other)
+    }
+
+    fn try_lock_as(&self, holder: TerminalLockHolder) -> Option<TerminalGuard<'_>> {
+        self.inner
+            .try_lock()
+            .map(|guard| TerminalGuard::acquired(guard, holder, 0))
+    }
+
+    /// A probe for availability; not an acquisition, so nothing is recorded.
+    fn is_locked(&self) -> bool {
+        self.inner.is_locked()
+    }
+}
+
+/// Whether the calling thread is the process's main thread, which std names
+/// "main"; in the GUI that is the AppKit/UI thread.
+fn on_main_thread() -> bool {
+    thread_local! {
+        static ON_MAIN: bool = std::thread::current().name() == Some("main");
+    }
+    ON_MAIN.with(|on_main| *on_main)
+}
+
+/// Guard of a [`TerminalMutex`]; records the hold time when released. With
+/// FT_SIGNPOST=1 the hold is also an os_signpost interval named by holder.
+struct TerminalGuard<'a> {
+    guard: Option<MutexGuard<'a, Terminal>>,
+    holder: TerminalLockHolder,
+    acquired: Instant,
+    // Declared after `guard`, so the interval ends once the mutex is free.
+    _hold_interval: procinfo::SignpostInterval,
+}
+
+fn hold_signpost(holder: TerminalLockHolder) -> procinfo::SignpostName {
+    use procinfo::SignpostName;
+    match holder {
+        TerminalLockHolder::Parser => SignpostName::TerminalLockParser,
+        TerminalLockHolder::Paint => SignpostName::TerminalLockPaint,
+        TerminalLockHolder::Mouse => SignpostName::TerminalLockMouse,
+        TerminalLockHolder::Resize => SignpostName::TerminalLockResize,
+        TerminalLockHolder::Selection => SignpostName::TerminalLockSelection,
+        TerminalLockHolder::Other => SignpostName::TerminalLockOther,
+    }
+}
+
+impl<'a> TerminalGuard<'a> {
+    fn acquired(guard: MutexGuard<'a, Terminal>, holder: TerminalLockHolder, wait_ns: u64) -> Self {
+        TerminalLockLedger::global().record_wait(holder, wait_ns, on_main_thread());
+        Self {
+            guard: Some(guard),
+            holder,
+            acquired: Instant::now(),
+            _hold_interval: procinfo::signpost_interval(hold_signpost(holder)),
+        }
+    }
+
+    /// Release with a fair handoff to a queued waiter, as
+    /// `parking_lot::MutexGuard::unlock_fair` does.
+    fn unlock_fair(mut this: Self) {
+        if let Some(guard) = this.guard.take() {
+            this.record_hold();
+            MutexGuard::unlock_fair(guard);
+        }
+    }
+
+    fn record_hold(&self) {
+        let held = u64::try_from(self.acquired.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        TerminalLockLedger::global().record_hold(self.holder, held);
+    }
+}
+
+impl Drop for TerminalGuard<'_> {
+    fn drop(&mut self) {
+        if self.guard.is_some() {
+            self.record_hold();
+        }
+    }
+}
+
+impl std::ops::Deref for TerminalGuard<'_> {
+    type Target = Terminal;
+
+    fn deref(&self) -> &Terminal {
+        self.guard.as_ref().expect("terminal guard is held until dropped")
+    }
+}
+
+impl std::ops::DerefMut for TerminalGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Terminal {
+        self.guard.as_mut().expect("terminal guard is held until dropped")
+    }
+}
+
 pub struct LocalPane {
     pane_id: PaneId,
     durable_pane_id: [u8; 16],
     ownership: LocalPaneOwnership,
-    terminal: Arc<Mutex<Terminal>>,
+    terminal: Arc<TerminalMutex>,
     // Pane-owned lifetime prevents cached metadata crossing pane-id reuse.
     // Only Arc swaps/clones run under this mutex, never terminal work.
     title_metadata: Mutex<Arc<PaneTitleMetadata>>,
@@ -1785,7 +1913,8 @@ impl Pane for LocalPane {
     }
 
     fn get_cursor_position(&self) -> StableCursorPosition {
-        let mut cursor = terminal_get_cursor_position(&mut self.locked_terminal());
+        let mut cursor =
+            terminal_get_cursor_position(&mut self.locked_terminal_as(TerminalLockHolder::Paint));
         if self.tmux_domain.lock().is_some() {
             cursor.visibility = termwiz::surface::CursorVisibility::Hidden;
         }
@@ -1801,7 +1930,8 @@ impl Pane for LocalPane {
     }
 
     fn get_current_seqno(&self) -> SequenceNo {
-        self.locked_terminal().current_seqno()
+        self.locked_terminal_as(TerminalLockHolder::Paint)
+            .current_seqno()
     }
 
     fn render_facts(&self) -> Arc<crate::pane::PaneRenderFacts> {
@@ -1813,7 +1943,11 @@ impl Pane for LocalPane {
         lines: Range<StableRowIndex>,
         seqno: SequenceNo,
     ) -> RangeSet<StableRowIndex> {
-        terminal_get_dirty_lines(&mut self.locked_terminal(), lines, seqno)
+        terminal_get_dirty_lines(
+            &mut self.locked_terminal_as(TerminalLockHolder::Paint),
+            lines,
+            seqno,
+        )
     }
 
     fn get_changed_since_with_source_fence(
@@ -1821,7 +1955,7 @@ impl Pane for LocalPane {
         lines: Range<StableRowIndex>,
         last_observed_source_end: SequenceNo,
     ) -> (SequenceNo, RangeSet<StableRowIndex>) {
-        let mut terminal = self.locked_terminal();
+        let mut terminal = self.locked_terminal_as(TerminalLockHolder::Paint);
         let source_end = terminal.current_seqno();
         let baseline =
             crate::pane::changed_since_query_baseline(last_observed_source_end, source_end);
@@ -1834,7 +1968,7 @@ impl Pane for LocalPane {
         lines: Range<StableRowIndex>,
         for_line: &mut dyn ForEachPaneLogicalLine,
     ) {
-        let mut term = self.locked_terminal();
+        let mut term = self.locked_terminal_as(TerminalLockHolder::Selection);
         let cold = lines.start < term.screen().phys_to_stable_row_index(0);
         if cold {
             drop(term);
@@ -1845,7 +1979,7 @@ impl Pane for LocalPane {
     }
 
     fn with_lines_mut(&self, lines: Range<StableRowIndex>, with_lines: &mut dyn WithPaneLines) {
-        let mut term = self.locked_terminal();
+        let mut term = self.locked_terminal_as(TerminalLockHolder::Paint);
         let cold = lines.start < term.screen().phys_to_stable_row_index(0);
         if cold {
             drop(term);
@@ -1864,7 +1998,7 @@ impl Pane for LocalPane {
         // Never substitute resident row zero for a requested persisted row.
         // A missing cold snapshot is a loading frame, followed by a targeted
         // repaint after exact-registration publication of the worker result.
-        let Some(mut term) = self.terminal.try_lock() else {
+        let Some(mut term) = self.terminal.try_lock_as(TerminalLockHolder::Paint) else {
             if let Some(registration) = self.mux_registration.load() {
                 retry_cold_viewport(registration, Arc::clone(&self.cold_viewport_retry));
             }
@@ -1947,7 +2081,7 @@ impl Pane for LocalPane {
         };
         // This is optional cache maintenance, not a terminal read. Never wait
         // for the parser or drain staged actions after the frame is rendered.
-        let Some(mut term) = self.terminal.try_lock() else {
+        let Some(mut term) = self.terminal.try_lock_as(TerminalLockHolder::Paint) else {
             return;
         };
         let screen = term.screen_mut();
@@ -1972,7 +2106,7 @@ impl Pane for LocalPane {
         // treat an empty result as complete. Only paint uses the loading cache;
         // RPCs use owned worker plans. Preserve complete synchronous results
         // until these remaining consumers acquire an awaited read contract.
-        terminal_get_lines(&mut self.locked_terminal(), lines)
+        terminal_get_lines(&mut self.locked_terminal_as(TerminalLockHolder::Paint), lines)
     }
 
     fn capture_line_read(
@@ -2122,7 +2256,7 @@ impl Pane for LocalPane {
         baseline: SequenceNo,
     ) -> Option<Result<PaneSurfaceSnapshot, frankenterm_term::screen::ColdReadMetadataBusy>> {
         let _diagnostic = MetadataRefusalDiagnostic::new();
-        let mut term = match self.terminal.try_lock() {
+        let mut term = match self.terminal.try_lock_as(TerminalLockHolder::Paint) {
             Some(term) => term,
             None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceTerminal))),
         };
@@ -2243,7 +2377,7 @@ impl Pane for LocalPane {
     }
 
     fn get_dimensions(&self) -> RenderableDimensions {
-        terminal_get_dimensions(&mut self.locked_terminal())
+        terminal_get_dimensions(&mut self.locked_terminal_as(TerminalLockHolder::Paint))
     }
 
     fn get_tiered_scrollback_status(
@@ -2501,6 +2635,8 @@ impl Pane for LocalPane {
         if actions.is_empty() {
             return Ok(());
         }
+        // Covers admission, apply and the durability handoff (ft-yccm0.1.5).
+        let _parse_batch = procinfo::signpost_interval(procinfo::SignpostName::ParseBatch);
         // Authority is acquired outside terminal/tab locks and declared before
         // their guards, so refusal drops those guards before lifecycle custody.
         let mut output = match self.prepare_alert_output() {
@@ -2511,7 +2647,7 @@ impl Pane for LocalPane {
         if PaneAlertPreflight::needs_terminal_state(&actions) {
             // A terminator may publish a title begun in another batch. Drain
             // prior admitted work, then observe and admit against exact state.
-            let mut terminal = self.locked_terminal();
+            let mut terminal = self.locked_terminal_as(TerminalLockHolder::Parser);
             let pending_title = terminal.pending_tmux_title_bytes();
             match self.admit_alert_actions(&mut actions, pending_title, &mut output) {
                 Ok(batch) => {
@@ -2527,7 +2663,7 @@ impl Pane for LocalPane {
             };
             #[cfg(not(feature = "disruptor-pane-io"))]
             {
-                let mut terminal = self.terminal.lock();
+                let mut terminal = self.terminal.lock_as(TerminalLockHolder::Parser);
                 batch.apply(&mut terminal);
                 self.render_facts.publish(&mut terminal);
             }
@@ -2563,7 +2699,7 @@ impl Pane for LocalPane {
         // materialization and serialization do not block the terminal mutex.
         let staged = {
             let _output_application = self.output_application.lock();
-            let mut terminal = self.locked_terminal();
+            let mut terminal = self.locked_terminal_as(TerminalLockHolder::Parser);
             let pending_title = terminal.pending_tmux_title_bytes();
             self.admit_alert_actions(pending_actions, pending_title, &mut output)
                 .map_err(LiveParserPaneCaptureError::ActionAdmission)?
@@ -2587,7 +2723,8 @@ impl Pane for LocalPane {
 
     fn mouse_event(&self, event: MouseEvent) -> Result<(), Error> {
         record_input_for_current_identity(&self.mux_registration);
-        self.locked_terminal().mouse_event(event)
+        self.locked_terminal_as(TerminalLockHolder::Mouse)
+            .mouse_event(event)
     }
 
     fn key_down(&self, key: KeyCode, mods: KeyModifiers) -> Result<(), Error> {
@@ -2713,7 +2850,7 @@ impl Pane for LocalPane {
     }
 
     fn palette(&self) -> ColorPalette {
-        self.locked_terminal().palette()
+        self.locked_terminal_as(TerminalLockHolder::Paint).palette()
     }
 
     fn domain_id(&self) -> DomainId {
@@ -2745,7 +2882,8 @@ impl Pane for LocalPane {
         if self.tmux_domain.lock().is_some() {
             false
         } else {
-            self.locked_terminal().is_mouse_grabbed()
+            self.locked_terminal_as(TerminalLockHolder::Mouse)
+                .is_mouse_grabbed()
         }
     }
 
@@ -2753,7 +2891,8 @@ impl Pane for LocalPane {
         if self.tmux_domain.lock().is_some() {
             false
         } else {
-            self.locked_terminal().is_alt_screen_active()
+            self.locked_terminal_as(TerminalLockHolder::Mouse)
+                .is_alt_screen_active()
         }
     }
 
@@ -4338,7 +4477,7 @@ struct FundedPaneAlerts {
     output: Option<crate::PaneAlertOutput>,
     alerts: Vec<Alert>,
     text_bytes: usize,
-    terminal: std::sync::Weak<Mutex<Terminal>>,
+    terminal: std::sync::Weak<TerminalMutex>,
     historical: Option<crate::AdmittedHistoricalAlerts>,
 }
 
@@ -4371,7 +4510,7 @@ impl FundedPaneAlerts {
     fn reserve(
         preflight: PaneAlertPreflight,
         output: &mut Option<crate::PaneAlertOutput>,
-        terminal: &Arc<Mutex<Terminal>>,
+        terminal: &Arc<TerminalMutex>,
     ) -> Result<Option<Self>, PaneActionAdmissionRefusal> {
         if output.is_none() {
             return Ok(None);
@@ -4453,12 +4592,12 @@ impl FundedPaneAlerts {
     }
 }
 
-async fn wait_for_alert_terminal_unlock(terminal: &std::sync::Weak<Mutex<Terminal>>) {
+async fn wait_for_alert_terminal_unlock(terminal: &std::sync::Weak<TerminalMutex>) {
     loop {
         let Some(terminal) = terminal.upgrade() else {
             return;
         };
-        if terminal.try_lock().is_some() {
+        if !terminal.is_locked() {
             return;
         }
         drop(terminal);
@@ -4729,7 +4868,7 @@ impl LocalPane {
                 .map_err(LegacyTerminalCaptureError::ActionAdmission)?
         };
         let _output_application = self.output_application.lock();
-        let mut terminal = self.locked_terminal();
+        let mut terminal = self.locked_terminal_as(TerminalLockHolder::Parser);
         if !pending_actions.is_empty() {
             let pending_title = terminal.pending_tmux_title_bytes();
             self.admit_alert_actions(pending_actions, pending_title, &mut output)
@@ -4791,7 +4930,7 @@ impl LocalPane {
         // 1. Under terminal lock: drain/apply actions, capture hot state, pin cold generation
         let staged = {
             let _output_application = self.output_application.lock();
-            let mut terminal = self.locked_terminal();
+            let mut terminal = self.locked_terminal_as(TerminalLockHolder::Parser);
             if policy == PendingActionDrainPolicy::DrainAndApply {
                 let pending_title = terminal.pending_tmux_title_bytes();
                 self.admit_alert_actions(pending_actions, pending_title, &mut output)
@@ -6089,7 +6228,9 @@ impl LocalPane {
                                 if completion.cancelled.load(Ordering::Acquire) { return; }
                                 let _ = registration.try_with_current(|pane| {
                                     let Some(terminal) = terminal_for_failure.upgrade() else { return; };
-                                    let Some(term) = terminal.try_lock() else { return; };
+                                    let Some(term) =
+                                    terminal.try_lock_as(TerminalLockHolder::Resize)
+                                else { return; };
                                     let current = failure_witness.matches(term.screen());
                                     drop(term);
                                     if current {
@@ -6279,7 +6420,7 @@ impl LocalPane {
                 let _ = sink.request_scrollback_flush();
                 return;
             }
-            let mut terminal = self.locked_terminal();
+            let mut terminal = self.locked_terminal_as(TerminalLockHolder::Parser);
             let result = terminal.trim_deferred_scrollback();
             if !matches!(
                 result,
@@ -6292,7 +6433,7 @@ impl LocalPane {
             let current = self.scrollback_flush_sink.lock().clone();
             // Wake a queued reader before another geometry slice can
             // reacquire the mutex.
-            MutexGuard::unlock_fair(terminal);
+            TerminalGuard::unlock_fair(terminal);
             let Some(current) = current else {
                 return;
             };
@@ -6439,8 +6580,8 @@ impl LocalPane {
     /// the terminal reflects all parsed output before the caller observes it.
     #[cfg(feature = "disruptor-pane-io")]
     #[inline]
-    fn locked_terminal(&self) -> MutexGuard<'_, Terminal> {
-        let mut term = self.terminal.lock();
+    fn locked_terminal_as(&self, holder: TerminalLockHolder) -> TerminalGuard<'_> {
+        let mut term = self.terminal.lock_as(holder);
         self.drain_action_ring_locked(&mut term);
         term
     }
@@ -6448,8 +6589,14 @@ impl LocalPane {
     /// Default build: a transparent wrapper around the terminal mutex.
     #[cfg(not(feature = "disruptor-pane-io"))]
     #[inline]
-    fn locked_terminal(&self) -> MutexGuard<'_, Terminal> {
-        self.terminal.lock()
+    fn locked_terminal_as(&self, holder: TerminalLockHolder) -> TerminalGuard<'_> {
+        self.terminal.lock_as(holder)
+    }
+
+    /// The terminal for a holder kind not tagged separately (ft-yccm0.1.5).
+    #[inline]
+    fn locked_terminal(&self) -> TerminalGuard<'_> {
+        self.locked_terminal_as(TerminalLockHolder::Other)
     }
 
     /// Queues a reply to one of the child's queries on the terminal's writer,
@@ -6500,7 +6647,7 @@ impl LocalPane {
         if actions.actions.is_empty() {
             return;
         }
-        if let Some(mut term) = self.terminal.try_lock() {
+        if let Some(mut term) = self.terminal.try_lock_as(TerminalLockHolder::Parser) {
             Self::drain_action_ring_into(self.action_ring.as_ref(), &mut term);
             actions.apply(&mut term);
             self.render_facts.publish(&mut term);
@@ -6508,7 +6655,7 @@ impl LocalPane {
         }
         // A staged batch is published by whichever caller drains the ring.
         if let Err(actions) = self.action_ring.push(actions) {
-            let mut term = self.terminal.lock();
+            let mut term = self.terminal.lock_as(TerminalLockHolder::Parser);
             Self::drain_action_ring_into(self.action_ring.as_ref(), &mut term);
             actions.apply(&mut term);
             self.render_facts.publish(&mut term);
@@ -6615,7 +6762,7 @@ impl LocalPane {
     #[allow(clippy::too_many_arguments)]
     fn spawn_resize_worker(
         pane_id: PaneId,
-        terminal: Arc<Mutex<Terminal>>,
+        terminal: Arc<TerminalMutex>,
         line_layout_observation: Arc<LineLayoutObservation>,
         #[cfg(feature = "disruptor-pane-io")] action_ring: Arc<ArrayQueue<AdmittedPaneActions>>,
         pty: Arc<Mutex<Box<dyn MasterPty>>>,
@@ -6679,7 +6826,7 @@ impl LocalPane {
     #[allow(clippy::too_many_arguments)]
     fn run_resize_worker(
         pane_id: PaneId,
-        terminal: Arc<Mutex<Terminal>>,
+        terminal: Arc<TerminalMutex>,
         line_layout_observation: Arc<LineLayoutObservation>,
         #[cfg(feature = "disruptor-pane-io")] action_ring: Arc<ArrayQueue<AdmittedPaneActions>>,
         pty: Arc<Mutex<Box<dyn MasterPty>>>,
@@ -6715,7 +6862,7 @@ impl LocalPane {
                 .map(|result| recover_resize_apply_error(resize_queue.as_ref(), pending, result));
             // Publish the committed geometry before any completion can wake
             // a reader of the new size.
-            render_facts.publish(&mut terminal.lock());
+            render_facts.publish(&mut terminal.lock_as(TerminalLockHolder::Resize));
             if matches!(&settled_apply_result, Ok(Ok(metrics)) if !metrics.cancelled) {
                 if let Some(registration) = pending_registration {
                     // Reconcile primary committed size before cold preparation waits,
@@ -6730,7 +6877,7 @@ impl LocalPane {
                             token,
                             registration,
                         );
-                        render_facts.publish(&mut terminal.lock());
+                        render_facts.publish(&mut terminal.lock_as(TerminalLockHolder::Resize));
                     }
                 }
             }
@@ -6872,7 +7019,7 @@ impl LocalPane {
     /// unable to cross its old-width cold/resident boundary.
     fn prepare_cold_layout_after_resize(
         pane_id: PaneId,
-        terminal: &Mutex<Terminal>,
+        terminal: &TerminalMutex,
         line_layout_observation: &LineLayoutObservation,
         resize_queue: &Arc<Mutex<ResizeQueueState>>,
         token: ResizeCancellationToken,
@@ -6898,7 +7045,9 @@ impl LocalPane {
                     let Some(seam) = retry_cold_resize_step("seam_capture", &cancelled, || {
                         registration
                             .try_with_current(|_| {
-                                let Some(term) = terminal.try_lock() else {
+                                let Some(term) =
+                                    terminal.try_lock_as(TerminalLockHolder::Resize)
+                                else {
                                     return Ok(None);
                                 };
                                 term.capture_cold_seam_reflow().map(Some)
@@ -6918,7 +7067,9 @@ impl LocalPane {
                     let installed = retry_cold_resize_step("seam_commit", &cancelled, || {
                         registration
                             .try_with_current(|_| {
-                                let Some(mut term) = terminal.try_lock() else {
+                                let Some(mut term) =
+                                    terminal.try_lock_as(TerminalLockHolder::Resize)
+                                else {
                                     return Ok(None);
                                 };
                                 let (decision, _) =
@@ -6964,7 +7115,9 @@ impl LocalPane {
                     let Some(plan) = retry_cold_resize_step("index_capture", &cancelled, || {
                         registration
                             .try_with_current(|_| -> anyhow::Result<_> {
-                                let Some(term) = terminal.try_lock() else {
+                                let Some(term) =
+                                    terminal.try_lock_as(TerminalLockHolder::Resize)
+                                else {
                                     return Ok(None);
                                 };
                                 let screen = term.screen();
@@ -6992,7 +7145,9 @@ impl LocalPane {
                     let installed = retry_cold_resize_step("index_commit", &cancelled, || {
                         registration
                             .try_with_current(|_| {
-                                let Some(mut term) = terminal.try_lock() else {
+                                let Some(mut term) =
+                                    terminal.try_lock_as(TerminalLockHolder::Resize)
+                                else {
                                     return Ok(None);
                                 };
                                 let (decision, _) =
@@ -7134,14 +7289,14 @@ impl LocalPane {
     }
 
     fn prepare_resize_reflow(
-        terminal: &Mutex<Terminal>,
+        terminal: &TerminalMutex,
         #[cfg(feature = "disruptor-pane-io")] action_ring: &ArrayQueue<AdmittedPaneActions>,
         size: TerminalSize,
         is_cancelled: impl Fn() -> bool,
     ) -> (Option<frankenterm_term::ScreenReflowPreparation>, Duration) {
         let capture_start = Instant::now();
         let mut prepared = {
-            let terminal = terminal.lock();
+            let terminal = terminal.lock_as(TerminalLockHolder::Resize);
             #[cfg(feature = "disruptor-pane-io")]
             let mut terminal = terminal;
             #[cfg(feature = "disruptor-pane-io")]
@@ -7159,7 +7314,7 @@ impl LocalPane {
 
     fn apply_resize_sync(
         pane_id: PaneId,
-        terminal: &Mutex<Terminal>,
+        terminal: &TerminalMutex,
         line_layout_observation: &LineLayoutObservation,
         #[cfg(feature = "disruptor-pane-io")] action_ring: &ArrayQueue<AdmittedPaneActions>,
         pty: &Mutex<Box<dyn MasterPty>>,
@@ -7172,12 +7327,12 @@ impl LocalPane {
         let terminal_probe_lock_start = Instant::now();
         #[cfg(feature = "disruptor-pane-io")]
         let current_size = {
-            let mut terminal = terminal.lock();
+            let mut terminal = terminal.lock_as(TerminalLockHolder::Resize);
             Self::drain_action_ring_into(action_ring, &mut terminal);
             terminal.get_size()
         };
         #[cfg(not(feature = "disruptor-pane-io"))]
-        let current_size = terminal.lock().get_size();
+        let current_size = terminal.lock_as(TerminalLockHolder::Resize).get_size();
         let terminal_probe_lock_wait = terminal_probe_lock_start.elapsed();
 
         let (superseded_by_seq, last_proven_pty_size) = {
@@ -7358,7 +7513,7 @@ impl LocalPane {
         );
 
         let terminal_apply_lock_start = Instant::now();
-        let mut terminal = terminal.lock();
+        let mut terminal = terminal.lock_as(TerminalLockHolder::Resize);
         #[cfg(feature = "disruptor-pane-io")]
         Self::drain_action_ring_into(action_ring, &mut terminal);
         let terminal_apply_lock_wait = terminal_apply_lock_start.elapsed();
@@ -7607,7 +7762,7 @@ impl LocalPane {
             durable_pane_id,
             ownership,
             title_metadata: Mutex::new(Arc::new(Self::capture_title_metadata(&terminal))),
-            terminal: Arc::new(Mutex::new(terminal)),
+            terminal: Arc::new(TerminalMutex::new(terminal)),
             cold_viewport_pending: Arc::new(Mutex::new(None)),
             cold_viewport_retry: Arc::new(AtomicBool::new(false)),
             cold_viewport_failure: Arc::new(Mutex::new(None)),
@@ -15678,7 +15833,7 @@ mod tests {
 
     #[test]
     fn resize_preparation_releases_locks_and_observes_supersession() {
-        let terminal = Mutex::new(Terminal::new(
+        let terminal = TerminalMutex::new(Terminal::new(
             term_size(80, 3),
             Arc::new(GuardianLifetimeTestTermConfig),
             "FrankenTerm",
@@ -16983,6 +17138,112 @@ mod tests {
         assert_eq!(last.cursor.x, (BATCHES - 1) % 80);
     }
 
+    fn lock_counts(holder: TerminalLockHolder) -> (u64, u64) {
+        let snapshot = TerminalLockLedger::global().snapshot();
+        snapshot
+            .holders
+            .get(holder.as_str())
+            .map_or((0, 0), |stats| (stats.wait.count, stats.hold.count))
+    }
+
+    /// ft-yccm0.1.5: each path records its acquisitions under its own holder
+    /// kind. The ledger is process-wide and other tests run concurrently, so
+    /// only increases caused here are asserted.
+    #[test]
+    fn terminal_lock_acquisitions_are_tagged_by_holder_kind() {
+        let pane = render_facts_test_pane(793);
+        let expect_recorded = |holder: TerminalLockHolder, action: &dyn Fn()| {
+            let (waits, holds) = lock_counts(holder);
+            action();
+            let (waits_after, holds_after) = lock_counts(holder);
+            assert!(waits_after > waits, "{:?} acquisition was not recorded", holder);
+            assert!(holds_after > holds, "{:?} hold was not recorded", holder);
+        };
+        expect_recorded(TerminalLockHolder::Parser, &|| {
+            pane.perform_actions(vec![Action::Print('x')]).unwrap();
+        });
+        expect_recorded(TerminalLockHolder::Paint, &|| {
+            pane.get_dimensions();
+        });
+        expect_recorded(TerminalLockHolder::Paint, &|| {
+            pane.get_lines(0..1);
+        });
+        expect_recorded(TerminalLockHolder::Mouse, &|| {
+            pane.is_mouse_grabbed();
+        });
+        expect_recorded(TerminalLockHolder::Selection, &|| {
+            pane.apply_hyperlinks(0..1, &[]);
+        });
+        expect_recorded(TerminalLockHolder::Other, &|| {
+            pane.get_title();
+        });
+        expect_recorded(TerminalLockHolder::Resize, &|| {
+            pane.resize(term_size(90, 24)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while pane.render_facts().dimensions.cols != 90 {
+                assert!(Instant::now() < deadline, "resize never applied");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+    }
+
+    /// A wait for a contended terminal mutex on the main thread is counted as
+    /// main-thread blocking, with its duration.
+    #[test]
+    fn main_thread_waits_on_a_held_terminal_lock_count_as_blocking() {
+        let pane = render_facts_test_pane(794);
+        let pane = &pane;
+        let before = TerminalLockLedger::global().snapshot();
+        let held_for = Duration::from_millis(30);
+        std::thread::scope(|scope| {
+            let held = pane.terminal.lock();
+            let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+            // std names the process's main thread "main"; so does this one.
+            let waiter = std::thread::Builder::new()
+                .name("main".to_string())
+                .spawn_scoped(scope, move || {
+                    started_tx.send(()).unwrap();
+                    pane.get_dimensions()
+                })
+                .unwrap();
+            started_rx.recv().unwrap();
+            std::thread::sleep(held_for);
+            drop(held);
+            waiter.join().unwrap();
+        });
+        let after = TerminalLockLedger::global().snapshot();
+        assert!(after.main_thread_blocked_waits > before.main_thread_blocked_waits);
+        let blocked = after.main_thread_blocked_ns - before.main_thread_blocked_ns;
+        // The waiter may reach the mutex a little after it signalled.
+        assert!(
+            blocked >= u64::try_from(held_for.as_nanos() / 2).unwrap(),
+            "blocked {} ns while the lock was held for {:?}",
+            blocked,
+            held_for
+        );
+        let half_hold = u64::try_from(held_for.as_nanos() / 2).unwrap();
+        assert!(after.main_thread_max_wait_ns >= half_hold);
+        assert!(after.holders["paint"].wait.max_ns >= half_hold);
+    }
+
+    /// With signposts on, a parse batch opens a "parse batch" interval and a
+    /// parser terminal-lock interval (macOS); elsewhere signposts are no-ops.
+    /// Whether the OS records them depends on Instruments recording.
+    #[test]
+    fn parse_batches_request_signpost_intervals_when_enabled() {
+        let pane = render_facts_test_pane(795);
+        procinfo::set_signposts_enabled(true);
+        let before = procinfo::signpost_intervals_requested();
+        pane.perform_actions(vec![Action::Print('x')]).unwrap();
+        let after = procinfo::signpost_intervals_requested();
+        procinfo::set_signposts_enabled(false);
+        if cfg!(target_os = "macos") {
+            assert!(after >= before + 2, "{} -> {}", before, after);
+        } else {
+            assert_eq!(after, before);
+        }
+    }
+
     fn seed_checkpoint_cold_rows(terminal: &mut Terminal, rows: &[&str]) {
         for row in rows {
             terminal.advance_bytes(row.as_bytes());
@@ -17343,7 +17604,7 @@ mod tests {
             }
         }
         struct Recorder {
-            terminal: Arc<Mutex<Terminal>>,
+            terminal: Arc<TerminalMutex>,
             emitted: AtomicUsize,
         }
         impl log::Log for Recorder {

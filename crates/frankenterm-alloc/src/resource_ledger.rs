@@ -549,6 +549,330 @@ impl AllocatorSnapshot {
     }
 }
 
+/// Sub-buckets per power of two in [`LatencyHistogram`]: two mantissa bits,
+/// so a reported quantile overstates its true value by at most 25%.
+const LATENCY_SUB_BUCKETS: usize = 4;
+/// Enough buckets for every `u64` nanosecond value.
+const LATENCY_BUCKETS: usize = 63 * LATENCY_SUB_BUCKETS;
+
+/// Lock-free log-linear histogram of nanosecond durations (ft-yccm0.1.5).
+///
+/// Recording is a few relaxed atomic adds, so any thread may record without
+/// a lock. Values below 4 ns are exact; above that each power of two splits
+/// into four buckets.
+#[derive(Debug)]
+pub struct LatencyHistogram {
+    buckets: [AtomicU64; LATENCY_BUCKETS],
+    total_ns: AtomicU64,
+    max_ns: AtomicU64,
+}
+
+impl Default for LatencyHistogram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LatencyHistogram {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            buckets: [const { AtomicU64::new(0) }; LATENCY_BUCKETS],
+            total_ns: AtomicU64::new(0),
+            max_ns: AtomicU64::new(0),
+        }
+    }
+
+    /// The bucket holding `value`.
+    const fn bucket_index(value: u64) -> usize {
+        if value < LATENCY_SUB_BUCKETS as u64 {
+            return value as usize;
+        }
+        let msb = 63 - value.leading_zeros() as usize;
+        let sub = ((value >> (msb - 2)) & (LATENCY_SUB_BUCKETS as u64 - 1)) as usize;
+        (msb - 1) * LATENCY_SUB_BUCKETS + sub
+    }
+
+    /// The largest value that lands in bucket `index`.
+    const fn bucket_upper_bound(index: usize) -> u64 {
+        if index < LATENCY_SUB_BUCKETS {
+            return index as u64;
+        }
+        let msb = index / LATENCY_SUB_BUCKETS + 1;
+        let sub = (index % LATENCY_SUB_BUCKETS) as u64;
+        let width = 1u64 << (msb - 2);
+        let lower = (LATENCY_SUB_BUCKETS as u64 + sub) << (msb - 2);
+        lower + (width - 1)
+    }
+
+    pub fn record(&self, value_ns: u64) {
+        self.buckets[Self::bucket_index(value_ns)].fetch_add(1, Ordering::Relaxed);
+        self.total_ns.fetch_add(value_ns, Ordering::Relaxed);
+        self.max_ns.fetch_max(value_ns, Ordering::Relaxed);
+    }
+
+    /// Quantiles report the upper bound of the bucket the rank falls in,
+    /// capped at the true maximum: conservative, never an understatement.
+    #[must_use]
+    pub fn snapshot(&self) -> LatencySnapshot {
+        let counts: Vec<u64> = self
+            .buckets
+            .iter()
+            .map(|bucket| bucket.load(Ordering::Relaxed))
+            .collect();
+        let count: u64 = counts.iter().sum();
+        let max_ns = self.max_ns.load(Ordering::Relaxed);
+        let quantile = |numerator: u64, denominator: u64| -> u64 {
+            if count == 0 {
+                return 0;
+            }
+            // The smallest rank r with r / count >= numerator / denominator.
+            let rank = (count.saturating_mul(numerator)).div_ceil(denominator).max(1);
+            let mut seen = 0u64;
+            for (index, bucket) in counts.iter().enumerate() {
+                seen += bucket;
+                if seen >= rank {
+                    return Self::bucket_upper_bound(index).min(max_ns);
+                }
+            }
+            max_ns
+        };
+        LatencySnapshot {
+            count,
+            total_ns: self.total_ns.load(Ordering::Relaxed),
+            p50_ns: quantile(50, 100),
+            p95_ns: quantile(95, 100),
+            p99_ns: quantile(99, 100),
+            max_ns,
+        }
+    }
+}
+
+/// Summary of a [`LatencyHistogram`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LatencySnapshot {
+    pub count: u64,
+    pub total_ns: u64,
+    pub p50_ns: u64,
+    pub p95_ns: u64,
+    pub p99_ns: u64,
+    pub max_ns: u64,
+}
+
+/// Which code path holds or waits for a pane's terminal mutex (ft-yccm0.1.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TerminalLockHolder {
+    /// Applying parsed output, deferred-scrollback trims, checkpoint capture.
+    Parser,
+    /// Paint reads: lines, damage, cursor, dimensions, palette, surface.
+    Paint,
+    Mouse,
+    Resize,
+    /// Logical-line reads for selection and search.
+    Selection,
+    Other,
+}
+
+impl TerminalLockHolder {
+    pub const ALL: [Self; 6] = [
+        Self::Parser,
+        Self::Paint,
+        Self::Mouse,
+        Self::Resize,
+        Self::Selection,
+        Self::Other,
+    ];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Parser => "parser",
+            Self::Paint => "paint",
+            Self::Mouse => "mouse",
+            Self::Resize => "resize",
+            Self::Selection => "selection",
+            Self::Other => "other",
+        }
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Process-wide terminal-mutex wait and hold times by holder kind, plus the
+/// time the main (UI) thread spent blocked on a terminal mutex
+/// (ft-yccm0.1.5). Every pane's mutex records here.
+#[derive(Debug)]
+pub struct TerminalLockLedger {
+    wait: [LatencyHistogram; TerminalLockHolder::ALL.len()],
+    hold: [LatencyHistogram; TerminalLockHolder::ALL.len()],
+    main_thread_blocked_ns: AtomicU64,
+    main_thread_blocked_waits: AtomicU64,
+    main_thread_max_wait_ns: AtomicU64,
+}
+
+static GLOBAL_TERMINAL_LOCK_LEDGER: TerminalLockLedger = TerminalLockLedger::new();
+
+impl Default for TerminalLockLedger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TerminalLockLedger {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            wait: [const { LatencyHistogram::new() }; TerminalLockHolder::ALL.len()],
+            hold: [const { LatencyHistogram::new() }; TerminalLockHolder::ALL.len()],
+            main_thread_blocked_ns: AtomicU64::new(0),
+            main_thread_blocked_waits: AtomicU64::new(0),
+            main_thread_max_wait_ns: AtomicU64::new(0),
+        }
+    }
+
+    /// The ledger every pane's terminal mutex records into.
+    #[must_use]
+    pub fn global() -> &'static Self {
+        &GLOBAL_TERMINAL_LOCK_LEDGER
+    }
+
+    /// One acquisition: `wait_ns` is zero when the mutex was free.
+    pub fn record_wait(&self, holder: TerminalLockHolder, wait_ns: u64, on_main_thread: bool) {
+        self.wait[holder.index()].record(wait_ns);
+        if on_main_thread && wait_ns > 0 {
+            self.main_thread_blocked_ns
+                .fetch_add(wait_ns, Ordering::Relaxed);
+            self.main_thread_blocked_waits
+                .fetch_add(1, Ordering::Relaxed);
+            self.main_thread_max_wait_ns
+                .fetch_max(wait_ns, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_hold(&self, holder: TerminalLockHolder, hold_ns: u64) {
+        self.hold[holder.index()].record(hold_ns);
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> TerminalLocksSnapshot {
+        let holders = TerminalLockHolder::ALL
+            .iter()
+            .filter_map(|holder| {
+                let wait = self.wait[holder.index()].snapshot();
+                let hold = self.hold[holder.index()].snapshot();
+                (wait.count > 0 || hold.count > 0).then(|| {
+                    (
+                        holder.as_str().to_string(),
+                        TerminalLockHolderSnapshot { wait, hold },
+                    )
+                })
+            })
+            .collect();
+        TerminalLocksSnapshot {
+            holders,
+            main_thread_blocked_ns: self.main_thread_blocked_ns.load(Ordering::Relaxed),
+            main_thread_blocked_waits: self.main_thread_blocked_waits.load(Ordering::Relaxed),
+            main_thread_max_wait_ns: self.main_thread_max_wait_ns.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Wait and hold summaries for one holder kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalLockHolderSnapshot {
+    pub wait: LatencySnapshot,
+    pub hold: LatencySnapshot,
+}
+
+/// The `terminal_locks` section of a published snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalLocksSnapshot {
+    /// Keyed by [`TerminalLockHolder::as_str`]; kinds never seen are absent.
+    pub holders: BTreeMap<String, TerminalLockHolderSnapshot>,
+    /// Total time the main thread spent waiting for a terminal mutex.
+    pub main_thread_blocked_ns: u64,
+    /// Main-thread acquisitions that had to wait.
+    pub main_thread_blocked_waits: u64,
+    pub main_thread_max_wait_ns: u64,
+}
+
+/// Durable scrollback writer health (ft-yccm0.2.1.1): panes whose durability
+/// is degraded, and the writer's failure counters.
+#[derive(Debug)]
+pub struct DurabilityLedger {
+    degraded: std::sync::Mutex<BTreeMap<String, String>>,
+    writer_failures_total: AtomicU64,
+    writer_panics_total: AtomicU64,
+    rows_abandoned_total: AtomicU64,
+}
+
+static GLOBAL_DURABILITY_LEDGER: DurabilityLedger = DurabilityLedger::new();
+
+impl Default for DurabilityLedger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DurabilityLedger {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            degraded: std::sync::Mutex::new(BTreeMap::new()),
+            writer_failures_total: AtomicU64::new(0),
+            writer_panics_total: AtomicU64::new(0),
+            rows_abandoned_total: AtomicU64::new(0),
+        }
+    }
+
+    /// The ledger the process's durability writer records into.
+    #[must_use]
+    pub fn global() -> &'static Self {
+        &GLOBAL_DURABILITY_LEDGER
+    }
+
+    /// A failed (or panicked) drain degrades `pane` until it next succeeds.
+    pub fn record_failure(&self, pane: &str, error: &str, panicked: bool) {
+        self.writer_failures_total.fetch_add(1, Ordering::Relaxed);
+        if panicked {
+            self.writer_panics_total.fetch_add(1, Ordering::Relaxed);
+        }
+        crate::recover_poisoned(self.degraded.lock()).insert(pane.to_string(), error.to_string());
+    }
+
+    pub fn record_recovered(&self, pane: &str) {
+        crate::recover_poisoned(self.degraded.lock()).remove(pane);
+    }
+
+    /// `pane` was dropped with `rows` admitted rows that never became durable.
+    pub fn record_abandoned(&self, pane: &str, rows: u64) {
+        self.rows_abandoned_total.fetch_add(rows, Ordering::Relaxed);
+        crate::recover_poisoned(self.degraded.lock()).remove(pane);
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> DurabilitySnapshot {
+        DurabilitySnapshot {
+            degraded_panes: crate::recover_poisoned(self.degraded.lock()).clone(),
+            writer_failures_total: self.writer_failures_total.load(Ordering::Relaxed),
+            writer_panics_total: self.writer_panics_total.load(Ordering::Relaxed),
+            rows_abandoned_total: self.rows_abandoned_total.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The `durability` section of a published snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurabilitySnapshot {
+    /// Durable pane id -> the writer failure that degraded it.
+    pub degraded_panes: BTreeMap<String, String>,
+    pub writer_failures_total: u64,
+    pub writer_panics_total: u64,
+    pub rows_abandoned_total: u64,
+}
+
 /// The change-detected part of a published snapshot.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceSnapshotBody {
@@ -557,16 +881,25 @@ pub struct ResourceSnapshotBody {
     pub caches: BTreeMap<String, u64>,
     /// Per-pane scrollback residency, sorted by pane id.
     pub panes: Vec<PaneResourceSnapshot>,
+    /// [`TerminalLockLedger::global`] (ft-yccm0.1.5).
+    #[serde(default)]
+    pub terminal_locks: TerminalLocksSnapshot,
+    /// [`DurabilityLedger::global`] (ft-yccm0.2.1.1).
+    #[serde(default)]
+    pub durability: DurabilitySnapshot,
 }
 
 impl ResourceSnapshotBody {
-    /// GPU and cache sections from `gpu` and `caches`; no panes.
+    /// GPU and cache sections from `gpu` and `caches`, the process's terminal
+    /// lock and durability ledgers; no panes.
     #[must_use]
     pub fn from_ledgers(gpu: &GpuResourceLedger, caches: &CacheGauges) -> Self {
         Self {
             gpu: gpu.snapshot(),
             caches: caches.snapshot(),
             panes: Vec::new(),
+            terminal_locks: TerminalLockLedger::global().snapshot(),
+            durability: DurabilityLedger::global().snapshot(),
         }
     }
 
@@ -632,6 +965,60 @@ impl ResourceSnapshotBody {
             ),
         ]
     }
+
+    /// Debug-overlay lines for the terminal-lock and durability sections
+    /// (ft-yccm0.1.5, ft-yccm0.2.1.1), kept apart from [`Self::summary_lines`].
+    #[must_use]
+    pub fn lock_and_durability_lines(&self) -> Vec<String> {
+        vec![
+            self.terminal_locks.summary_line(),
+            self.durability.summary_line(),
+        ]
+    }
+}
+
+impl TerminalLocksSnapshot {
+    /// One human-readable line for the GUI debug overlay.
+    #[must_use]
+    pub fn summary_line(&self) -> String {
+        let ms = |ns: u64| ns as f64 / 1_000_000.0;
+        let holders: Vec<String> = self
+            .holders
+            .iter()
+            .map(|(holder, stats)| {
+                format!(
+                    "{holder} hold p99 {:.2} ms / wait p99 {:.2} ms",
+                    ms(stats.hold.p99_ns),
+                    ms(stats.wait.p99_ns)
+                )
+            })
+            .collect();
+        format!(
+            "Terminal locks: main thread blocked {:.1} ms over {} waits (max {:.2} ms); {}",
+            ms(self.main_thread_blocked_ns),
+            self.main_thread_blocked_waits,
+            ms(self.main_thread_max_wait_ns),
+            if holders.is_empty() {
+                "no acquisitions".to_string()
+            } else {
+                holders.join(", ")
+            }
+        )
+    }
+}
+
+impl DurabilitySnapshot {
+    /// One human-readable line for the GUI debug overlay.
+    #[must_use]
+    pub fn summary_line(&self) -> String {
+        format!(
+            "Scrollback durability: {} degraded panes; writer failures {}, panics {}, abandoned rows {}",
+            self.degraded_panes.len(),
+            self.writer_failures_total,
+            self.writer_panics_total,
+            self.rows_abandoned_total
+        )
+    }
 }
 
 impl AllocatorSnapshot {
@@ -677,6 +1064,12 @@ pub struct ResourceSnapshotEnvelope {
     /// Allocator statistics at publish time.
     #[serde(default)]
     pub allocator: AllocatorSnapshot,
+    /// Terminal-mutex wait/hold times by holder kind (ft-yccm0.1.5).
+    #[serde(default)]
+    pub terminal_locks: TerminalLocksSnapshot,
+    /// Durable scrollback writer health (ft-yccm0.2.1.1).
+    #[serde(default)]
+    pub durability: DurabilitySnapshot,
 }
 
 impl ResourceSnapshotEnvelope {
@@ -692,6 +1085,8 @@ impl ResourceSnapshotEnvelope {
             caches: body.caches,
             panes: body.panes,
             allocator,
+            terminal_locks: body.terminal_locks,
+            durability: body.durability,
         }
     }
 }
@@ -1220,5 +1615,158 @@ mod tests {
         let parsed: ResourceSnapshotEnvelope = serde_json::from_value(legacy).unwrap();
         assert!(parsed.caches.is_empty() && parsed.panes.is_empty());
         assert_eq!(parsed.allocator, AllocatorSnapshot::default());
+    }
+
+    #[test]
+    fn latency_buckets_tile_the_value_range_with_bounded_error() {
+        let mut previous_upper = None;
+        for index in 0..LATENCY_BUCKETS {
+            let upper = LatencyHistogram::bucket_upper_bound(index);
+            assert_eq!(LatencyHistogram::bucket_index(upper), index);
+            if let Some(previous) = previous_upper {
+                // Contiguous: each bucket starts right after the last one.
+                assert_eq!(LatencyHistogram::bucket_index(previous + 1), index);
+                // Two mantissa bits: a bucket is at most a quarter of its lower bound wide.
+                let lower = previous + 1;
+                assert!(upper - lower <= lower / 4, "bucket {index}: {lower}..={upper}");
+            }
+            previous_upper = Some(upper);
+        }
+        assert_eq!(previous_upper, Some(u64::MAX));
+        assert_eq!(LatencyHistogram::bucket_index(0), 0);
+        assert_eq!(LatencyHistogram::bucket_index(3), 3);
+        assert_eq!(LatencyHistogram::bucket_index(u64::MAX), LATENCY_BUCKETS - 1);
+    }
+
+    #[test]
+    fn latency_quantiles_are_conservative_bucket_bounds_capped_at_the_maximum() {
+        let histogram = LatencyHistogram::new();
+        assert_eq!(histogram.snapshot(), LatencySnapshot::default());
+        for value in 1..=100u64 {
+            histogram.record(value * 1_000);
+        }
+        let snapshot = histogram.snapshot();
+        assert_eq!(snapshot.count, 100);
+        assert_eq!(snapshot.total_ns, 5_050_000);
+        assert_eq!(snapshot.max_ns, 100_000);
+        for (reported, exact) in [
+            (snapshot.p50_ns, 50_000),
+            (snapshot.p95_ns, 95_000),
+            (snapshot.p99_ns, 99_000),
+        ] {
+            assert!(
+                reported >= exact && reported <= exact + exact / 4,
+                "{reported} vs {exact}"
+            );
+        }
+        // A single outlier owns the top quantiles but never exceeds the max.
+        // 4 ns sits in an exact (width one) bucket.
+        let spike = LatencyHistogram::new();
+        for _ in 0..99 {
+            spike.record(4);
+        }
+        spike.record(7_000_000);
+        let snapshot = spike.snapshot();
+        assert_eq!(snapshot.p50_ns, 4);
+        assert_eq!(snapshot.p95_ns, 4);
+        assert_eq!(snapshot.p99_ns, 4);
+        assert_eq!(snapshot.max_ns, 7_000_000);
+        spike.record(7_000_000);
+        assert_eq!(spike.snapshot().p99_ns, 7_000_000);
+    }
+
+    #[test]
+    fn terminal_lock_ledger_tags_holders_and_counts_main_thread_blocking() {
+        let ledger: &'static TerminalLockLedger = Box::leak(Box::new(TerminalLockLedger::new()));
+        assert_eq!(ledger.snapshot(), TerminalLocksSnapshot::default());
+        ledger.record_wait(TerminalLockHolder::Parser, 0, false);
+        ledger.record_hold(TerminalLockHolder::Parser, 2_000_000);
+        ledger.record_wait(TerminalLockHolder::Paint, 1_500_000, true);
+        ledger.record_hold(TerminalLockHolder::Paint, 40_000);
+        ledger.record_wait(TerminalLockHolder::Mouse, 0, true);
+        ledger.record_wait(TerminalLockHolder::Resize, 300, false);
+
+        let snapshot = ledger.snapshot();
+        assert_eq!(
+            snapshot.holders.keys().collect::<Vec<_>>(),
+            ["mouse", "paint", "parser", "resize"],
+            "only holders that acquired the lock are reported"
+        );
+        assert_eq!(snapshot.holders["parser"].hold.max_ns, 2_000_000);
+        assert_eq!(snapshot.holders["parser"].wait.count, 1);
+        assert_eq!(snapshot.holders["paint"].wait.max_ns, 1_500_000);
+        assert_eq!(snapshot.holders["resize"].hold.count, 0);
+        // An uncontended main-thread acquisition is not blocking.
+        assert_eq!(snapshot.main_thread_blocked_waits, 1);
+        assert_eq!(snapshot.main_thread_blocked_ns, 1_500_000);
+        assert_eq!(snapshot.main_thread_max_wait_ns, 1_500_000);
+
+        let body = ResourceSnapshotBody {
+            terminal_locks: snapshot,
+            ..ResourceSnapshotBody::default()
+        };
+        let lines = body.lock_and_durability_lines();
+        assert!(
+            lines[0].starts_with("Terminal locks: main thread blocked 1.5 ms over 1 waits"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].contains("parser hold p99 2.00 ms"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn durability_ledger_tracks_degraded_panes_until_recovery_or_abandonment() {
+        let ledger: &'static DurabilityLedger = Box::leak(Box::new(DurabilityLedger::new()));
+        ledger.record_failure("pane-a", "storage unavailable", false);
+        ledger.record_failure("pane-b", "storage unavailable", true);
+        ledger.record_failure("pane-a", "commit outcome indeterminate", false);
+        let snapshot = ledger.snapshot();
+        assert_eq!(snapshot.writer_failures_total, 3);
+        assert_eq!(snapshot.writer_panics_total, 1);
+        assert_eq!(
+            snapshot.degraded_panes["pane-a"], "commit outcome indeterminate",
+            "the latest failure is reported"
+        );
+        ledger.record_recovered("pane-a");
+        ledger.record_abandoned("pane-b", 12);
+        let snapshot = ledger.snapshot();
+        assert!(snapshot.degraded_panes.is_empty());
+        assert_eq!(snapshot.rows_abandoned_total, 12);
+        assert_eq!(
+            snapshot.summary_line(),
+            "Scrollback durability: 0 degraded panes; writer failures 3, panics 1, abandoned rows 12"
+        );
+    }
+
+    #[test]
+    fn lock_and_durability_sections_round_trip_and_default_when_absent() {
+        let envelope = ResourceSnapshotEnvelope {
+            terminal_locks: TerminalLocksSnapshot {
+                main_thread_blocked_ns: 9,
+                ..TerminalLocksSnapshot::default()
+            },
+            durability: DurabilitySnapshot {
+                writer_failures_total: 2,
+                ..DurabilitySnapshot::default()
+            },
+            ..ResourceSnapshotEnvelope::now(
+                "x",
+                ResourceSnapshotBody::default(),
+                AllocatorSnapshot::default(),
+            )
+        };
+        let value = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(value["terminal_locks"]["main_thread_blocked_ns"], 9);
+        assert_eq!(value["durability"]["writer_failures_total"], 2);
+        let parsed: ResourceSnapshotEnvelope = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed, envelope);
+        // Files written before these sections existed still parse.
+        let mut legacy = value;
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("terminal_locks");
+        object.remove("durability");
+        let parsed: ResourceSnapshotEnvelope = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.terminal_locks, TerminalLocksSnapshot::default());
+        assert_eq!(parsed.durability, DurabilitySnapshot::default());
     }
 }

@@ -404,6 +404,7 @@ pub fn reconcile_client_domain_config(
 /// callers must use try_capture_scrollback_interval: legacy getters can block
 /// while a destructive operation holds state across durable publication.
 mod deferred_scrollback {
+    use frankenterm_alloc::resource_ledger::DurabilityLedger;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, TryLockError, Weak};
@@ -751,6 +752,7 @@ mod deferred_scrollback {
             health.retry_not_before = None;
             drop(health);
             if let Some(error) = recovered {
+                DurabilityLedger::global().record_recovered(&self.pane_label);
                 log::info!(
                     "scrollback durability for pane {} recovered after: {error}",
                     self.pane_label
@@ -771,6 +773,12 @@ mod deferred_scrollback {
             let retry_at = Instant::now() + delay;
             health.retry_not_before = Some(retry_at);
             drop(health);
+            // Surfaced by `ft doctor --json` through the resource snapshot.
+            DurabilityLedger::global().record_failure(
+                &self.pane_label,
+                &error.to_string(),
+                panicked,
+            );
             if panicked {
                 metrics::counter!("mux.scrollback.durability_writer_panics").increment(1);
             }
@@ -1069,14 +1077,18 @@ mod deferred_scrollback {
                 .state
                 .get_mut()
                 .map_or(0, |state| state.pending.len());
+            let failure = self.lock_health().failure;
             if pending > 0 {
-                let failure = self.lock_health().failure;
                 log::error!(
                     "scrollback durability for pane {} dropped {pending} admitted rows that never became durable (last writer failure: {failure:?})",
                     self.pane_label
                 );
                 metrics::counter!("mux.scrollback.durability_rows_abandoned")
                     .increment(pending as u64);
+                DurabilityLedger::global().record_abandoned(&self.pane_label, pending as u64);
+            } else if failure.is_some() {
+                // Nothing undurable was lost; a closed pane is no longer degraded.
+                DurabilityLedger::global().record_recovered(&self.pane_label);
             }
         }
     }
@@ -2161,6 +2173,12 @@ mod deferred_scrollback {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(failing.writer_panicked());
+        // The degraded pane is exported through the resource snapshot that
+        // `ft doctor --json` reads (this pane id is unique to this test).
+        let failing_label = uuid::Uuid::from_bytes([0x61; 16]).to_string();
+        let exported = DurabilityLedger::global().snapshot();
+        assert!(exported.degraded_panes.contains_key(&failing_label));
+        assert!(exported.writer_panics_total >= 1);
         // The parser sees a degraded pane, never a panic, and keeps its rows.
         assert_eq!(
             failing.request_scrollback_flush(),
@@ -2199,6 +2217,13 @@ mod deferred_scrollback {
         }
         let expected: Vec<_> = (0..8).map(|row| (row, GatedStore::text(row))).collect();
         assert_eq!(failing_store.rows(), expected);
+        assert!(
+            !DurabilityLedger::global()
+                .snapshot()
+                .degraded_panes
+                .contains_key(&failing_label),
+            "a recovered pane leaves the exported degraded set"
+        );
     }
 }
 
