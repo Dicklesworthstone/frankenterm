@@ -724,10 +724,9 @@ impl WriterBarrier {
     pub fn wait(self, timeout: std::time::Duration) -> std::io::Result<()> {
         match self.state {
             WriterBarrierState::Complete => Ok(()),
-            WriterBarrierState::Unavailable(kind) => Err(std::io::Error::new(
-                kind,
-                "terminal writer is unavailable",
-            )),
+            WriterBarrierState::Unavailable(kind) => {
+                Err(std::io::Error::new(kind, "terminal writer is unavailable"))
+            }
             WriterBarrierState::Pending(ack) => match ack.recv_timeout(timeout) {
                 Ok(result) => result,
                 Err(RecvTimeoutError::Timeout) => Err(std::io::Error::new(
@@ -1601,9 +1600,9 @@ impl TerminalState {
         result
     }
 
-    /// Queues user input behind everything already written. Never blocks
-    /// and is never dropped under backpressure.
-    pub(crate) fn write_user_input(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+    /// Queues user input (keys, pastes, composed text) behind everything
+    /// already written. Never blocks and is never dropped under backpressure.
+    pub fn write_user_input(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.with_user_input(|term| {
             term.writer.write_all(bytes)?;
             term.writer.flush()
@@ -4165,9 +4164,7 @@ mod tests {
     }
 
     /// Resumes the child: reads the pipe to EOF on another thread.
-    fn resume_reader(
-        mut reader: std::io::PipeReader,
-    ) -> std::thread::JoinHandle<Vec<u8>> {
+    fn resume_reader(mut reader: std::io::PipeReader) -> std::thread::JoinHandle<Vec<u8>> {
         std::thread::spawn(move || {
             let mut all = Vec::new();
             std::io::Read::read_to_end(&mut reader, &mut all).expect("read pipe");
@@ -4229,7 +4226,11 @@ mod tests {
             STALLING_PASTE_BYTES + 100,
             "the stalled paste and every keystroke stay queued: {backlog:?}"
         );
-        assert_eq!(backlog.pending_reply_bytes, 100 * reply.len(), "{backlog:?}");
+        assert_eq!(
+            backlog.pending_reply_bytes,
+            100 * reply.len(),
+            "{backlog:?}"
+        );
         assert_eq!(backlog.dropped_replies, 0, "{backlog:?}");
 
         let read = resume_reader(reader);
@@ -4245,7 +4246,10 @@ mod tests {
         }
         // Mouse reporting and focus tracking are off, so neither writes.
         assert_eq!(output.len(), expected.len());
-        assert!(output == expected, "replies and keystrokes must keep FIFO order");
+        assert!(
+            output == expected,
+            "replies and keystrokes must keep FIFO order"
+        );
     }
 
     #[test]
@@ -4283,8 +4287,15 @@ mod tests {
         }
 
         let backlog = terminal.writer_backlog();
-        assert!(kept_replies < replies, "the backlog limit was never reached");
-        assert_eq!(backlog.pending_reply_bytes, kept_replies * reply_len, "{backlog:?}");
+        assert!(
+            kept_replies < replies,
+            "the backlog limit was never reached"
+        );
+        assert_eq!(
+            backlog.pending_reply_bytes,
+            kept_replies * reply_len,
+            "{backlog:?}"
+        );
         assert!(
             backlog.pending_reply_bytes >= REPLY_BACKLOG_LIMIT,
             "{:?}",

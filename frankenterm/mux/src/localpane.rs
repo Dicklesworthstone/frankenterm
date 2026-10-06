@@ -2602,6 +2602,16 @@ impl Pane for LocalPane {
         })
     }
 
+    /// Queues user input on the terminal's writer, FIFO with pastes and query
+    /// replies; never blocks on a child that has stopped reading
+    /// (ft-yccm0.2.2.5). The raw PTY `writer` would block the caller and
+    /// could interleave with a paste the terminal writer is still sending.
+    fn send_user_input(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        record_input_for_current_identity(&self.mux_registration);
+        self.locked_terminal().write_user_input(bytes)?;
+        Ok(())
+    }
+
     fn guardian_live_output_reader(
         &self,
     ) -> anyhow::Result<Option<Box<dyn GuardianLiveOutputReader>>> {

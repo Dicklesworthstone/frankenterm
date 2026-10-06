@@ -267,7 +267,10 @@ impl fmt::Display for MetalUnavailable {
             }
             Self::NoBackingLayer => write!(f, "the window's view has no backing layer"),
             Self::LayerNotMetal { class } => {
-                write!(f, "the window's backing layer is a {class}, not a CAMetalLayer")
+                write!(
+                    f,
+                    "the window's backing layer is a {class}, not a CAMetalLayer"
+                )
             }
         }
     }
@@ -456,7 +459,11 @@ mod tests {
     #[test]
     fn admit_accepts_the_minimum_family_and_newer() {
         for n in MIN_APPLE_FAMILY..=MAX_KNOWN_APPLE_FAMILY {
-            assert_eq!(probe("gpu", true, &apple_up_to(n)).admit(), Ok(()), "Apple{n}");
+            assert_eq!(
+                probe("gpu", true, &apple_up_to(n)).admit(),
+                Ok(()),
+                "Apple{n}"
+            );
         }
     }
 
@@ -480,7 +487,11 @@ mod tests {
 
     #[test]
     fn admit_rejects_intel_and_discrete_mac_gpus() {
-        let caps = probe("AMD Radeon Pro 5500M", false, &[GpuFamily::Mac2, GpuFamily::Metal3]);
+        let caps = probe(
+            "AMD Radeon Pro 5500M",
+            false,
+            &[GpuFamily::Mac2, GpuFamily::Metal3],
+        );
         assert_eq!(caps.apple_family, None);
         assert!(caps.mac2);
         let err = caps.admit().unwrap_err();
@@ -515,7 +526,9 @@ mod tests {
             MetalUnavailable::NotMainThread,
             MetalUnavailable::UnsupportedWindowHandle { kind: "k".into() },
             MetalUnavailable::NoBackingLayer,
-            MetalUnavailable::LayerNotMetal { class: "CALayer".into() },
+            MetalUnavailable::LayerNotMetal {
+                class: "CALayer".into(),
+            },
         ];
         let codes: Vec<&str> = reasons.iter().map(MetalUnavailable::code).collect();
         assert_eq!(
@@ -538,7 +551,8 @@ mod tests {
 
     #[test]
     fn non_appkit_window_handles_are_refused_with_their_kind() {
-        let web = raw_window_handle::RawWindowHandle::Web(raw_window_handle::WebWindowHandle::new(1));
+        let web =
+            raw_window_handle::RawWindowHandle::Web(raw_window_handle::WebWindowHandle::new(1));
         let err = appkit_view(web).unwrap_err();
         assert_eq!(
             err,
@@ -602,8 +616,14 @@ mod tests {
             1.0,
         );
         assert_eq!(color.to_bgra8(), [0xc8, 0x2a, 0x1e, 0xff]);
-        assert_eq!(ClearColor::from_srgba(1.0, 1.0, 1.0, 1.0).to_bgra8(), [255; 4]);
-        assert_eq!(ClearColor::from_srgba(0.0, 0.0, 0.0, 0.0).to_bgra8(), [0; 4]);
+        assert_eq!(
+            ClearColor::from_srgba(1.0, 1.0, 1.0, 1.0).to_bgra8(),
+            [255; 4]
+        );
+        assert_eq!(
+            ClearColor::from_srgba(0.0, 0.0, 0.0, 0.0).to_bgra8(),
+            [0; 4]
+        );
     }
 
     #[test]
@@ -624,7 +644,11 @@ mod tests {
             .to_string()
             .contains("64-byte readback buffer")
         );
-        assert!(FrameError::DrawableUnavailable.to_string().contains("drawable"));
+        assert!(
+            FrameError::DrawableUnavailable
+                .to_string()
+                .contains("drawable")
+        );
     }
 
     #[cfg(not(target_os = "macos"))]

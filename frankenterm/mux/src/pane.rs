@@ -1075,6 +1075,17 @@ pub trait Pane: Downcast + Send + Sync {
     }
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>>;
     fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write>;
+    /// Sends input the user typed or composed (encoded keys, IME text,
+    /// inserted glyphs) to the child. A local pane queues it on its
+    /// terminal's writer, in order with pastes and query replies, and never
+    /// waits for the child to read it (ft-yccm0.2.2.5); other panes write
+    /// through `writer`.
+    fn send_user_input(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        let mut writer = self.writer();
+        std::io::Write::write_all(&mut *writer, bytes)?;
+        std::io::Write::flush(&mut *writer)?;
+        Ok(())
+    }
     fn resize(&self, size: TerminalSize) -> anyhow::Result<()>;
     /// A remote client owns the split layout and sends individual pane sizes.
     /// Asynchronous panes must reconcile their containing tab after applying

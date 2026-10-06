@@ -2,8 +2,8 @@
 //! each names its UNSAFE-CONTRACT category from the crate docs.
 
 use crate::{
-    ClearColor, DeviceCapabilities, FrameError, FrameOutcome, MAX_TEXTURE_EXTENT,
-    MetalUnavailable, appkit_view,
+    ClearColor, DeviceCapabilities, FrameError, FrameOutcome, MAX_TEXTURE_EXTENT, MetalUnavailable,
+    appkit_view,
 };
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, ProtocolObject};
@@ -12,8 +12,8 @@ use objc2_core_foundation::CGSize;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus,
     MTLCommandEncoder, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily,
-    MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLRenderPassDescriptor, MTLResourceOptions,
-    MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
+    MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLRenderPassDescriptor, MTLResourceOptions, MTLSize,
+    MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
 use objc2_quartz_core::{CALayer, CAMetalDrawable, CAMetalLayer};
 use raw_window_handle::HasWindowHandle;
@@ -98,13 +98,12 @@ impl MetalDevice {
         };
         descriptor.setUsage(MTLTextureUsage::RenderTarget);
         descriptor.setStorageMode(MTLStorageMode::Private);
-        let texture = self
-            .device
-            .newTextureWithDescriptor(&descriptor)
-            .ok_or(FrameError::AllocationFailed {
+        let texture = self.device.newTextureWithDescriptor(&descriptor).ok_or(
+            FrameError::AllocationFailed {
                 what: "render target texture",
                 bytes: len,
-            })?;
+            },
+        )?;
         let buffer = self
             .device
             .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
@@ -200,11 +199,12 @@ impl MetalRenderer {
     /// the layer exactly as the window created it for the fallback backend.
     pub fn attach(window: &impl HasWindowHandle) -> Result<Self, MetalUnavailable> {
         let device = MetalDevice::system_default()?;
-        let handle = window
-            .window_handle()
-            .map_err(|err| MetalUnavailable::UnsupportedWindowHandle {
-                kind: format!("unavailable ({err})"),
-            })?;
+        let handle =
+            window
+                .window_handle()
+                .map_err(|err| MetalUnavailable::UnsupportedWindowHandle {
+                    kind: format!("unavailable ({err})"),
+                })?;
         let view = appkit_view(handle.as_raw())?;
         if MainThreadMarker::new().is_none() {
             return Err(MetalUnavailable::NotMainThread);
@@ -311,9 +311,18 @@ mod tests {
 
     #[test]
     fn gpu_family_raw_values_match_the_objc2_metal_constants() {
-        assert_eq!(MTLGPUFamily(GpuFamily::Apple(1).raw()), MTLGPUFamily::Apple1);
-        assert_eq!(MTLGPUFamily(GpuFamily::Apple(7).raw()), MTLGPUFamily::Apple7);
-        assert_eq!(MTLGPUFamily(GpuFamily::Apple(10).raw()), MTLGPUFamily::Apple10);
+        assert_eq!(
+            MTLGPUFamily(GpuFamily::Apple(1).raw()),
+            MTLGPUFamily::Apple1
+        );
+        assert_eq!(
+            MTLGPUFamily(GpuFamily::Apple(7).raw()),
+            MTLGPUFamily::Apple7
+        );
+        assert_eq!(
+            MTLGPUFamily(GpuFamily::Apple(10).raw()),
+            MTLGPUFamily::Apple10
+        );
         assert_eq!(MTLGPUFamily(GpuFamily::Mac2.raw()), MTLGPUFamily::Mac2);
         assert_eq!(MTLGPUFamily(GpuFamily::Metal3.raw()), MTLGPUFamily::Metal3);
     }
@@ -324,7 +333,8 @@ mod tests {
         let device = device();
         let caps = device.capabilities();
         assert!(
-            caps.apple_family.is_some_and(|family| family >= crate::MIN_APPLE_FAMILY),
+            caps.apple_family
+                .is_some_and(|family| family >= crate::MIN_APPLE_FAMILY),
             "{caps}"
         );
         assert!(caps.unified_memory, "{caps}");
@@ -347,7 +357,10 @@ mod tests {
             let bytes = device
                 .clear_offscreen(width, height, color)
                 .expect("offscreen clear");
-            assert_eq!(bytes.len(), width as usize * height as usize * BYTES_PER_PIXEL);
+            assert_eq!(
+                bytes.len(),
+                width as usize * height as usize * BYTES_PER_PIXEL
+            );
             let (pixels, remainder) = bytes.as_chunks::<BYTES_PER_PIXEL>();
             assert_eq!(remainder, &[] as &[u8]);
             for (index, pixel) in pixels.iter().enumerate() {
@@ -360,7 +373,9 @@ mod tests {
     fn offscreen_clear_premultiplies_translucent_backgrounds() {
         let device = device();
         let color = ClearColor::from_srgba(1.0, 1.0, 1.0, 0.0);
-        let bytes = device.clear_offscreen(4, 4, color).expect("offscreen clear");
+        let bytes = device
+            .clear_offscreen(4, 4, color)
+            .expect("offscreen clear");
         assert!(bytes.iter().all(|&byte| byte == 0), "{bytes:?}");
     }
 

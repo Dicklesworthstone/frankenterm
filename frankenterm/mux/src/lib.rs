@@ -32303,14 +32303,15 @@ mod tests {
         ));
     }
 
-    /// The DEC 2026 query reply joins the local pane's terminal writer queue.
-    /// With the child stalled (it never reads, and a 1 MiB paste has filled
-    /// the PTY), queueing the reply must still return at once: the parser
-    /// thread that answers queries never waits on the child (ft-yccm0.2.2.5).
+    /// The DEC 2026 query reply and GUI-composed user input both join the
+    /// local pane's terminal writer queue. With the child stalled (it never
+    /// reads, and a 1 MiB paste has filled the PTY), queueing them must still
+    /// return at once: neither the parser thread nor the GUI main thread ever
+    /// waits on the child (ft-yccm0.2.2.5).
     #[cfg(unix)]
     #[test]
-    fn local_pane_query_reply_queues_without_blocking_on_a_stalled_child() -> anyhow::Result<()>
-    {
+    fn local_pane_reply_and_user_input_queue_without_blocking_on_a_stalled_child(
+    ) -> anyhow::Result<()> {
         use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
         let id = pane::alloc_pane_id()?;
@@ -32349,17 +32350,21 @@ mod tests {
             String::new(),
         ));
 
+        // Both the parser thread's query reply and GUI-composed user input
+        // (kitty-encoded keys, IME text) must queue without waiting.
         let queued = {
             let local = Arc::clone(&local);
-            std::thread::spawn(move || {
-                local.enqueue_terminal_reply(synchronized_output_decrqm_response(true))
+            std::thread::spawn(move || -> anyhow::Result<()> {
+                local.enqueue_terminal_reply(synchronized_output_decrqm_response(true))?;
+                local.send_user_input("\x1b[97;5u composed é".as_bytes())?;
+                Ok(())
             })
         };
         let deadline = Instant::now() + Duration::from_secs(10);
         while !queued.is_finished() {
             assert!(
                 Instant::now() < deadline,
-                "queueing a query reply blocked on the stalled child"
+                "queueing a query reply or user input blocked on the stalled child"
             );
             std::thread::sleep(Duration::from_millis(10));
         }

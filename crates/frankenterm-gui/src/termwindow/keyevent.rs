@@ -419,8 +419,7 @@ impl super::TermWindow {
                             if self.config.debug_key_events {
                                 log::info!("win32: Encoded input as {:?}", encoded);
                             }
-                            pane.writer()
-                                .write_all(encoded.as_bytes())
+                            pane.send_user_input(encoded.as_bytes())
                                 .context("sending win32-input-mode encoded data")
                                 .ok();
                             did_encode = true;
@@ -428,8 +427,7 @@ impl super::TermWindow {
                             if self.config.debug_key_events {
                                 log::info!("kitty: Encoded input as {:?}", encoded);
                             }
-                            pane.writer()
-                                .write_all(encoded.as_bytes())
+                            pane.send_user_input(encoded.as_bytes())
                                 .context("sending kitty encoded data")
                                 .ok();
                             did_encode = true;
@@ -739,15 +737,13 @@ impl super::TermWindow {
                     if self.config.debug_key_events {
                         log::info!("win32: Encoded input as {:?}", encoded);
                     }
-                    pane.writer()
-                        .write_all(encoded.as_bytes())
+                    pane.send_user_input(encoded.as_bytes())
                         .context("sending win32-input-mode encoded data")
                 } else if let Some(encoded) = self.encode_kitty_input(&pane, &window_key) {
                     if self.config.debug_key_events {
                         log::info!("kitty: Encoded input as {:?}", encoded);
                     }
-                    pane.writer()
-                        .write_all(encoded.as_bytes())
+                    pane.send_user_input(encoded.as_bytes())
                         .context("sending kitty encoded data")
                 } else {
                     if self.config.debug_key_events {
@@ -804,7 +800,7 @@ impl super::TermWindow {
                 if !self.pane_input_ready(&pane) {
                     return;
                 }
-                pane.writer().write_all(s.as_bytes()).ok();
+                pane.send_user_input(s.as_bytes()).ok();
                 self.maybe_scroll_to_bottom_for_input(&pane);
                 context.invalidate();
             }
