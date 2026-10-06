@@ -4337,14 +4337,18 @@ impl PaneAlertPreflight {
 ///
 /// Publishers hold the terminal mutex, so publications are serialized and a
 /// later capture never replaces a newer one. Readers only load an `Arc`.
+///
+/// Publishing runs after every applied batch, so it must stay cheap: a
+/// publication that would change nothing is skipped, and a changed one reuses
+/// the allocation of the facts it replaced when no reader still holds them,
+/// replacing the palette and title `Arc`s only when they differ.
 struct RenderFactsPublisher {
     facts: arc_swap::ArcSwap<crate::pane::PaneRenderFacts>,
     /// Bumped by `Alert::PaletteChanged` (any dynamic color escape) and by
     /// configuration assignment.
     palette_epoch: AtomicU64,
-    /// What the published palette was derived from. The palette is cloned
-    /// only when this changes.
-    palette_source: Mutex<PaletteSource>,
+    /// What the latest publication was built from.
+    published: Mutex<PublishedFacts>,
     tmux_domain: Arc<Mutex<Option<Arc<TmuxDomainState>>>>,
     /// Bench-only: skip every publication, so
     /// `mux/benches/render_facts_publication.rs` can measure what publishing
@@ -4359,19 +4363,99 @@ struct PaletteSource {
     revision: frankenterm_term::config::TerminalConfigurationRevision,
 }
 
+/// The plain-value fields of [`crate::pane::PaneRenderFacts`].
+#[derive(Clone, Copy, PartialEq)]
+struct ScalarFacts {
+    seqno: SequenceNo,
+    cursor: StableCursorPosition,
+    dimensions: RenderableDimensions,
+    mouse_grabbed: bool,
+    alt_screen_active: bool,
+    bracketed_paste: bool,
+    focus_tracking: bool,
+}
+
+/// What the latest publication was built from, compared field by field
+/// against the next capture.
+struct PublishedFacts {
+    /// The palette is re-read only when this changes.
+    palette_source: PaletteSource,
+    palette: Arc<ColorPalette>,
+    palette_generation: u64,
+    title: Arc<str>,
+    scalars: ScalarFacts,
+    /// The facts the latest publication replaced; reused in place by the next
+    /// one when no reader still holds them.
+    spare: Option<Arc<crate::pane::PaneRenderFacts>>,
+}
+
+impl PublishedFacts {
+    /// Facts for this state, filled into the spare allocation when it is no
+    /// longer shared.
+    fn build(&mut self) -> Arc<crate::pane::PaneRenderFacts> {
+        if let Some(mut spare) = self.spare.take() {
+            if let Some(slot) = Arc::get_mut(&mut spare) {
+                self.fill(slot);
+                return spare;
+            }
+        }
+        Arc::new(self.facts())
+    }
+
+    /// Overwrites reused facts, touching the palette and title `Arc`s only
+    /// when they differ.
+    fn fill(&self, slot: &mut crate::pane::PaneRenderFacts) {
+        let scalars = self.scalars;
+        slot.seqno = scalars.seqno;
+        slot.cursor = scalars.cursor;
+        slot.dimensions = scalars.dimensions;
+        slot.mouse_grabbed = scalars.mouse_grabbed;
+        slot.alt_screen_active = scalars.alt_screen_active;
+        slot.bracketed_paste = scalars.bracketed_paste;
+        slot.focus_tracking = scalars.focus_tracking;
+        slot.palette_generation = self.palette_generation;
+        if !Arc::ptr_eq(&slot.palette, &self.palette) {
+            slot.palette = Arc::clone(&self.palette);
+        }
+        if !Arc::ptr_eq(&slot.title, &self.title) {
+            slot.title = Arc::clone(&self.title);
+        }
+    }
+
+    fn facts(&self) -> crate::pane::PaneRenderFacts {
+        let scalars = self.scalars;
+        crate::pane::PaneRenderFacts {
+            seqno: scalars.seqno,
+            cursor: scalars.cursor,
+            dimensions: scalars.dimensions,
+            mouse_grabbed: scalars.mouse_grabbed,
+            alt_screen_active: scalars.alt_screen_active,
+            bracketed_paste: scalars.bracketed_paste,
+            focus_tracking: scalars.focus_tracking,
+            palette: Arc::clone(&self.palette),
+            palette_generation: self.palette_generation,
+            title: Arc::clone(&self.title),
+        }
+    }
+}
+
 impl RenderFactsPublisher {
     fn new(terminal: &mut Terminal, tmux_domain: Arc<Mutex<Option<Arc<TmuxDomainState>>>>) -> Self {
-        let source = PaletteSource {
-            epoch: 0,
-            revision: terminal.get_config().revision(),
+        let published = PublishedFacts {
+            palette_source: PaletteSource {
+                epoch: 0,
+                revision: terminal.get_config().revision(),
+            },
+            palette: Arc::new(terminal.palette()),
+            palette_generation: 0,
+            title: Arc::from(terminal.get_title()),
+            scalars: Self::capture(terminal, &tmux_domain),
+            spare: None,
         };
-        let palette = Arc::new(terminal.palette());
-        let title = Arc::from(terminal.get_title());
-        let facts = Self::capture(terminal, &tmux_domain, palette, 0, title);
         Self {
-            facts: arc_swap::ArcSwap::from_pointee(facts),
+            facts: arc_swap::ArcSwap::from_pointee(published.facts()),
             palette_epoch: AtomicU64::new(0),
-            palette_source: Mutex::new(source),
+            published: Mutex::new(published),
             tmux_domain,
             #[cfg(feature = "bench-hooks")]
             skip_publication: std::sync::atomic::AtomicBool::new(false),
@@ -4392,63 +4476,52 @@ impl RenderFactsPublisher {
         if self.skip_publication.load(Ordering::Relaxed) {
             return;
         }
-        let previous = self.facts.load_full();
         let source = PaletteSource {
             epoch: self.palette_epoch.load(Ordering::Acquire),
             revision: terminal.get_config().revision(),
         };
-        let (palette, palette_generation) = {
-            let mut published = self.palette_source.lock();
-            if *published == source {
-                (Arc::clone(&previous.palette), previous.palette_generation)
-            } else {
-                *published = source;
-                let palette = terminal.palette();
-                if palette == *previous.palette {
-                    (Arc::clone(&previous.palette), previous.palette_generation)
-                } else {
-                    (
-                        Arc::new(palette),
-                        previous.palette_generation.wrapping_add(1),
-                    )
-                }
+        let scalars = Self::capture(terminal, &self.tmux_domain);
+        let mut published = self.published.lock();
+        let mut changed = scalars != published.scalars;
+        if published.palette_source != source {
+            published.palette_source = source;
+            let palette = terminal.palette();
+            if palette != *published.palette {
+                published.palette = Arc::new(palette);
+                published.palette_generation = published.palette_generation.wrapping_add(1);
+                changed = true;
             }
-        };
-        let title = if *previous.title == *terminal.get_title() {
-            Arc::clone(&previous.title)
-        } else {
-            Arc::from(terminal.get_title())
-        };
-        let facts = Self::capture(
-            terminal,
-            &self.tmux_domain,
-            palette,
-            palette_generation,
-            title,
-        );
+        }
+        if *published.title != *terminal.get_title() {
+            published.title = Arc::from(terminal.get_title());
+            changed = true;
+        }
+        if !changed {
+            // Readers already hold exactly these facts.
+            return;
+        }
+        published.scalars = scalars;
+        let facts = published.build();
         log::trace!(
             "render facts seqno={} cursor={:?} palette_generation={}",
             facts.seqno,
             facts.cursor,
             facts.palette_generation
         );
-        self.facts.store(Arc::new(facts));
+        published.spare = Some(self.facts.swap(facts));
     }
 
     fn capture(
         terminal: &mut Terminal,
         tmux_domain: &Mutex<Option<Arc<TmuxDomainState>>>,
-        palette: Arc<ColorPalette>,
-        palette_generation: u64,
-        title: Arc<str>,
-    ) -> crate::pane::PaneRenderFacts {
+    ) -> ScalarFacts {
         // Terminal before tmux binding: the DCS parser's lock order.
         let tmux = tmux_domain.lock().is_some();
         let mut cursor = terminal_get_cursor_position(terminal);
         if tmux {
             cursor.visibility = termwiz::surface::CursorVisibility::Hidden;
         }
-        crate::pane::PaneRenderFacts {
+        ScalarFacts {
             seqno: terminal.current_seqno(),
             cursor,
             dimensions: terminal_get_dimensions(terminal),
@@ -4456,9 +4529,6 @@ impl RenderFactsPublisher {
             alt_screen_active: !tmux && terminal.is_alt_screen_active(),
             bracketed_paste: terminal.bracketed_paste_enabled(),
             focus_tracking: terminal.focus_tracking_enabled(),
-            palette,
-            palette_generation,
-            title,
         }
     }
 }
@@ -17236,6 +17306,40 @@ mod tests {
         let resized = pane.render_facts();
         assert_eq!(resized.dimensions, pane.get_dimensions());
         assert_eq!(resized.dimensions.viewport_rows, 30);
+    }
+
+    /// Publication runs after every batch, so it must stay cheap
+    /// (ft-yccm0.2.2.1, < 1%): nothing new publishes nothing, and a changed
+    /// publication refills the allocation it replaced once no reader holds
+    /// it, never facts a reader still holds.
+    #[test]
+    fn render_facts_skip_unchanged_publications_and_reuse_released_facts() {
+        let pane = render_facts_test_pane(793);
+        let first = apply_output(&pane, b"\x1b[2;2H");
+        pane.render_facts.publish(&mut pane.terminal.lock());
+        assert!(
+            Arc::ptr_eq(&first, &pane.render_facts()),
+            "a publication with nothing new keeps the same facts"
+        );
+        drop(first);
+
+        // Each apply_output drops its facts at the end of its statement, so
+        // the third publication refills the first one's allocation.
+        let a = Arc::as_ptr(&apply_output(&pane, b"\x1b[3;3H"));
+        let b = Arc::as_ptr(&apply_output(&pane, b"\x1b[4;4H"));
+        let c = Arc::as_ptr(&apply_output(&pane, b"\x1b[5;5H"));
+        assert_ne!(a, b);
+        assert_eq!(a, c, "released facts are reused in place");
+
+        // Facts a reader holds are never overwritten.
+        let held = pane.render_facts();
+        let held_cursor = held.cursor;
+        apply_output(&pane, b"\x1b[6;6H");
+        apply_output(&pane, b"\x1b[7;7H");
+        assert_eq!(held.cursor, held_cursor);
+        assert_eq!((held.cursor.x, held.cursor.y), (4, 4));
+        let latest = pane.render_facts();
+        assert_eq!((latest.cursor.x, latest.cursor.y), (6, 6));
     }
 
     #[test]
