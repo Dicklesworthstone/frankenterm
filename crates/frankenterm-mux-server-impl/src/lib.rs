@@ -425,7 +425,7 @@ mod deferred_scrollback {
     /// failure up to the maximum. Rows stay owned (and readable) meanwhile.
     const RETRY_BACKOFF_MIN: Duration = Duration::from_millis(100);
     const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(2);
-    pub(super) const DURABILITY_THREAD_NAME: &str = "scrollback-durability";
+    pub const DURABILITY_THREAD_NAME: &str = "scrollback-durability";
 
     /// The single thread that performs durable scrollback IO for every pane.
     ///
@@ -434,7 +434,7 @@ mod deferred_scrollback {
     /// each sink's byte- and row-bounded pending queue, where cold reads can
     /// see them, rather than being copied into the channel. One drainer per
     /// sink at a time preserves per-pane FIFO order.
-    pub(super) struct DurabilityWriter {
+    pub struct DurabilityWriter {
         shared: Arc<WriterShared>,
     }
 
@@ -1181,7 +1181,7 @@ mod deferred_scrollback {
                     .0;
             }
             drop(progress);
-            match self.durability_failure().or(requested.err()) {
+            match self.durability_failure().or_else(|| requested.err()) {
                 Some(error) => ScrollbackCapacityWait::Failed(error),
                 None => ScrollbackCapacityWait::TimedOut,
             }
@@ -11364,6 +11364,241 @@ mod tests {
             backing.retained_scrollback_rows(),
             LIVE_SCROLLBACK_APPEND_MAX_ROWS
         );
+    }
+
+    /// The real store, committing at most `chunk` rows per call. When armed,
+    /// it parks the durability writer after a committed chunk, between two
+    /// transactions of one drain (ft-yccm0.2.1.1).
+    #[derive(Debug)]
+    struct ChunkedPausingStore {
+        inner: Arc<LiveScrollbackSpillSink>,
+        chunk: usize,
+        pause: std::sync::Mutex<(bool, bool)>,
+        pause_signal: std::sync::Condvar,
+    }
+
+    impl ChunkedPausingStore {
+        fn arm(&self) {
+            self.pause.lock().unwrap().0 = true;
+        }
+
+        fn wait_until_parked(&self) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut pause = self.pause.lock().unwrap();
+            while !pause.1 {
+                let now = std::time::Instant::now();
+                assert!(now < deadline, "the writer never parked mid-batch");
+                pause = self.pause_signal.wait_timeout(pause, deadline - now).unwrap().0;
+            }
+        }
+
+        fn release(&self) {
+            self.pause.lock().unwrap().1 = false;
+            self.pause_signal.notify_all();
+        }
+    }
+
+    impl ScrollbackSpillSink for ChunkedPausingStore {
+        fn store_scrollback_line(
+            &self,
+            stable_row: wezterm_term::StableRowIndex,
+            line: &Line,
+            retention: usize,
+        ) -> bool {
+            self.inner.store_scrollback_line(stable_row, line, retention)
+        }
+
+        fn store_scrollback_lines(
+            &self,
+            first: wezterm_term::StableRowIndex,
+            lines: &[Line],
+            retention: usize,
+        ) -> usize {
+            let take = lines.len().min(self.chunk);
+            let acknowledged = self
+                .inner
+                .store_scrollback_lines(first, &lines[..take], retention);
+            let mut pause = self.pause.lock().unwrap();
+            if pause.0 && acknowledged > 0 {
+                *pause = (false, true);
+                self.pause_signal.notify_all();
+                while pause.1 {
+                    pause = self.pause_signal.wait(pause).unwrap();
+                }
+            }
+            acknowledged
+        }
+
+        fn load_scrollback_line(&self, stable_row: wezterm_term::StableRowIndex) -> Option<Line> {
+            self.inner.load_scrollback_line(stable_row)
+        }
+
+        fn load_scrollback_lines(
+            &self,
+            rows: std::ops::Range<wezterm_term::StableRowIndex>,
+        ) -> Vec<Line> {
+            self.inner.load_scrollback_lines(rows)
+        }
+
+        fn oldest_scrollback_row(&self) -> Option<wezterm_term::StableRowIndex> {
+            self.inner.oldest_scrollback_row()
+        }
+
+        fn retained_scrollback_rows(&self) -> usize {
+            self.inner.retained_scrollback_rows()
+        }
+
+        fn retained_scrollback_bytes(&self) -> usize {
+            self.inner.retained_scrollback_bytes()
+        }
+
+        fn snapshot_scrollback(
+            &self,
+            newest: wezterm_term::StableRowIndex,
+            limits: wezterm_term::config::ScrollbackSnapshotLimits,
+        ) -> Result<wezterm_term::config::ScrollbackSnapshot, wezterm_term::config::ScrollbackSpillError>
+        {
+            self.inner.snapshot_scrollback(newest, limits)
+        }
+
+        fn replace_scrollback_prefix(
+            &self,
+            expected: Option<wezterm_term::config::ScrollbackSnapshotGeneration>,
+            prefix: wezterm_term::config::ScrollbackPrefix<'_>,
+            retention: usize,
+        ) -> Result<
+            wezterm_term::config::ScrollbackReplaceCommit,
+            wezterm_term::config::ScrollbackSpillError,
+        > {
+            self.inner
+                .replace_scrollback_prefix(expected, prefix, retention)
+        }
+
+        fn clear_scrollback(
+            &self,
+        ) -> Result<
+            wezterm_term::config::ScrollbackClearCommit,
+            wezterm_term::config::ScrollbackSpillError,
+        > {
+            self.inner.clear_scrollback()
+        }
+    }
+
+    /// ft session list-durable / export-durable read the store through
+    /// list_live_scrollback_panes and export_live_scrollback_transcript. With
+    /// durability on its own thread they must still see an exact committed
+    /// prefix: while the writer is parked between two transactions of a
+    /// drain, while it is blocked inside a real transaction, and after the
+    /// pane closes.
+    #[test]
+    fn durable_list_and_export_see_a_committed_prefix_while_the_writer_runs_and_after_close() {
+        let dir = tempfile::tempdir().expect("private durable-prefix fixture");
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 914,
+            domain_id: 3,
+            durable_pane_id: [0xd4; 16],
+            command_description: "durable-prefix-test".to_string(),
+        };
+        let durable_pane_id = uuid::Uuid::from_bytes(context.durable_pane_id)
+            .simple()
+            .to_string();
+        let backing =
+            Arc::new(LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context).unwrap());
+        let store = Arc::new(ChunkedPausingStore {
+            inner: Arc::clone(&backing),
+            chunk: 16,
+            pause: std::sync::Mutex::new((false, false)),
+            pause_signal: std::sync::Condvar::new(),
+        });
+        let deferred = deferred_scrollback::DeferredScrollbackSpillSink::with_writer(
+            store.clone(),
+            context.durable_pane_id,
+            deferred_scrollback::DurabilityWriter::spawn(),
+        )
+        .unwrap();
+        let text = |row: usize| format!("durable row {row} 界");
+        let attrs = CellAttributes::blank();
+        let admit = |rows: std::ops::Range<usize>| {
+            for row in rows {
+                let line = Line::from_text(&text(row), &attrs, 1, None);
+                assert!(deferred.store_scrollback_line(row as isize, &line, 1024));
+            }
+        };
+        let committed_prefix = |rows: usize| {
+            let panes = list_live_scrollback_panes(dir.path(), 8).expect("list durable panes");
+            assert_eq!(panes.len(), 1);
+            assert_eq!(panes[0].durable_pane_id, durable_pane_id);
+            assert!(panes[0].error.is_none(), "{:?}", panes[0].error);
+            assert_eq!(panes[0].state, "complete");
+            assert_eq!(panes[0].retained_rows, Some(rows as u64));
+            let export = export_live_scrollback_transcript(
+                dir.path(),
+                &durable_pane_id,
+                256,
+                64 * 1024,
+                4 * 1024 * 1024,
+            )
+            .expect("export durable transcript");
+            assert_eq!(export.retained_rows, rows);
+            assert_eq!(export.next_seq, rows as u64);
+            let exported: Vec<_> = export.transcript.lines().map(str::trim_end).collect();
+            let expected: Vec<_> = (0..rows).map(text).collect();
+            assert_eq!(exported, expected, "export must be an exact committed prefix");
+        };
+
+        admit(0..32);
+        deferred.flush_scrollback().unwrap();
+        committed_prefix(32);
+
+        // The writer commits one 16-row transaction of a 64-row drain, then
+        // parks with the rest still owned by the queue.
+        store.arm();
+        admit(32..96);
+        deferred.request_scrollback_flush().unwrap();
+        store.wait_until_parked();
+        committed_prefix(48);
+        assert_eq!(
+            deferred.load_scrollback_lines(80..96).len(),
+            16,
+            "uncommitted rows stay readable through the pane's sink"
+        );
+
+        // Blocked inside a real transaction (behind the store's file lease),
+        // the writer has published nothing new.
+        let lease = acquire_live_scrollback_filesystem_mutation_lease(
+            backing.manifest_path.parent().unwrap(),
+            false,
+        )
+        .unwrap();
+        store.release();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while backing.mutation_gate.try_lock().is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer never entered its next transaction"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        committed_prefix(48);
+
+        // Pane close: the close marker hands the rest to the writer, which
+        // commits it and then drops the sink and the store.
+        deferred.request_scrollback_flush().unwrap();
+        let closed_sink = Arc::downgrade(&deferred);
+        let closed_store = Arc::downgrade(&backing);
+        drop(deferred);
+        drop(store);
+        drop(backing);
+        drop(lease);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while closed_sink.upgrade().is_some() || closed_store.upgrade().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer kept the closed pane's store"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        committed_prefix(96);
     }
 
     #[test]
