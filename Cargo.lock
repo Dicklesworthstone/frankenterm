@@ -4458,6 +4458,7 @@ dependencies = [
  "mux",
  "parking_lot",
  "portable-pty",
+ "procinfo",
  "promise",
  "proptest",
  "rangeset",

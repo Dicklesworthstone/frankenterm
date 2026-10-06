@@ -467,10 +467,20 @@ mod deferred_scrollback {
                 running: AtomicBool::new(false),
             });
             let worker = Arc::clone(&shared);
-            // A plain thread: QoS utility needs ft-yccm0.3.1.3's audited helper.
             match std::thread::Builder::new()
                 .name(DURABILITY_THREAD_NAME.to_string())
-                .spawn(move || worker.run())
+                .spawn(move || {
+                    // Durability need not finish promptly; keep it off the
+                    // performance cores that parse output (ft-yccm0.3.1.3).
+                    if let Err(error) =
+                        procinfo::set_current_thread_qos(procinfo::ThreadQos::Utility)
+                    {
+                        log::warn!(
+                            "{DURABILITY_THREAD_NAME} thread keeps its default QoS class: {error}"
+                        );
+                    }
+                    worker.run();
+                })
             {
                 Ok(_) => shared.running.store(true, Ordering::Release),
                 Err(error) => log::error!(
@@ -1793,6 +1803,7 @@ mod deferred_scrollback {
         inside: usize,
         panic_on_store: bool,
         writer_thread: Option<String>,
+        writer_qos: Option<procinfo::ThreadQos>,
     }
 
     #[cfg(test)]
@@ -1825,6 +1836,10 @@ mod deferred_scrollback {
 
         fn writer_thread(&self) -> Option<String> {
             self.gate.lock().unwrap().writer_thread.clone()
+        }
+
+        fn writer_qos(&self) -> Option<procinfo::ThreadQos> {
+            self.gate.lock().unwrap().writer_qos
         }
 
         fn wait_until_inside(&self) {
@@ -1862,6 +1877,7 @@ mod deferred_scrollback {
             {
                 let mut gate = self.gate.lock().unwrap();
                 gate.writer_thread = std::thread::current().name().map(str::to_owned);
+                gate.writer_qos = procinfo::current_thread_qos();
                 if gate.panic_on_store {
                     drop(gate);
                     panic!("injected scrollback store panic");
@@ -1947,6 +1963,11 @@ mod deferred_scrollback {
             store.writer_thread().as_deref(),
             Some(DURABILITY_THREAD_NAME),
             "store IO runs on the durability writer thread"
+        );
+        assert_eq!(
+            store.writer_qos(),
+            cfg!(target_os = "macos").then_some(procinfo::ThreadQos::Utility),
+            "the writer runs at QoS utility on macOS (no QoS classes elsewhere)"
         );
 
         // Every admission and handoff completes while the writer is provably

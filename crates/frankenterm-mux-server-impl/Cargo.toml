@@ -42,6 +42,7 @@ metrics.workspace = true
 mux.workspace = true
 portable-pty = { workspace=true, features = ["serde_support"]}
 parking_lot.workspace = true
+procinfo = { path = "../../frankenterm/procinfo", default-features = false }
 promise.workspace = true
 rangeset.workspace = true
 rcgen.workspace = true
