@@ -34,6 +34,9 @@ pub enum SteerRunGate {
     /// revalidation, so it cannot be confirmed. Fail closed — refuse rather than
     /// execute on an unverified contract (`contract` is `"mission"` or `"tx"`).
     UnverifiableBinding { contract: &'static str },
+    /// The receipt was planned for another workspace than the one executing
+    /// it; receipts never cross workspaces.
+    WorkspaceMismatch,
 }
 
 impl SteerRunGate {
@@ -47,6 +50,7 @@ impl SteerRunGate {
             Self::NotAdmitted { .. } => Some("robot.steer_receipt_not_admitted"),
             Self::HashMismatch { .. } => Some("robot.steer_hash_mismatch"),
             Self::UnverifiableBinding { .. } => Some("robot.steer_binding_unverifiable"),
+            Self::WorkspaceMismatch => Some("robot.steer_workspace_mismatch"),
         }
     }
 
@@ -108,6 +112,21 @@ pub fn steer_run_gate(
         }
     }
     SteerRunGate::Valid
+}
+
+/// Refuse a receipt planned for another workspace than `live_workspace_id`,
+/// the workspace that would execute it. Run before [`steer_run_gate`]: a
+/// receipt bound to the right contract hash still must not cross workspaces.
+#[must_use]
+pub fn steer_receipt_workspace_gate(
+    receipt: &SteeringReceipt,
+    live_workspace_id: &str,
+) -> SteerRunGate {
+    if receipt.workspace_id == live_workspace_id {
+        SteerRunGate::Valid
+    } else {
+        SteerRunGate::WorkspaceMismatch
+    }
 }
 
 /// ft-7h5da.6.4: whether a steering receipt admits an action that would
@@ -744,6 +763,15 @@ mod tests {
         let g = steer_run_gate(&r, None, None, 2_000);
         assert_eq!(g, SteerRunGate::Expired);
         assert_eq!(g.error_code(), Some("robot.steer_receipt_expired"));
+    }
+
+    #[test]
+    fn receipt_never_crosses_workspaces() {
+        let r = receipt(None, 0, None);
+        assert!(steer_receipt_workspace_gate(&r, "ws").is_valid());
+        let g = steer_receipt_workspace_gate(&r, "other-ws");
+        assert_eq!(g, SteerRunGate::WorkspaceMismatch);
+        assert_eq!(g.error_code(), Some("robot.steer_workspace_mismatch"));
     }
 
     #[test]

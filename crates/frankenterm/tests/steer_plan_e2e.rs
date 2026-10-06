@@ -892,6 +892,34 @@ fn steer_run_refuses_a_planning_only_receipt_with_a_rebind_hint() {
 }
 
 #[test]
+fn steer_run_refuses_a_receipt_planned_for_another_workspace() {
+    let w = workspace();
+    let _ = write_executable_tx_contract(&w);
+    // Bound to the right contract, but planned for another workspace id.
+    let id = plan_receipt_id(w.path(), &["--workspace-id", "some-other-workspace"]);
+    let out = stdout(
+        ft(w.path())
+            .args([
+                "steer",
+                "run",
+                "--receipt",
+                &id,
+                "--dry-run",
+                "--format",
+                "json",
+            ])
+            .assert()
+            .failure(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(
+        v["error_code"],
+        serde_json::json!("robot.steer_workspace_mismatch"),
+        "{out}"
+    );
+}
+
+#[test]
 fn steer_run_refuses_expired_receipt_typed() {
     let w = workspace();
     let _ = write_executable_tx_contract(&w);

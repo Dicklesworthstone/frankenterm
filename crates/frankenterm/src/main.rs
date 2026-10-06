@@ -64540,7 +64540,29 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 };
                 let now = mission_now_ms();
                 let live_tx_hash = steering_tx_contract_hash(&contract);
-                let verdict = if plan_hash
+                // `ft steer plan` binds the resolved workspace root by default;
+                // a path id that canonicalizes to the same root is the same
+                // workspace (symlinked temp or home directories).
+                let root_id = layout.root.to_string_lossy().to_string();
+                let live_workspace_id = if stored.workspace_id != root_id
+                    && matches!(
+                        (
+                            std::fs::canonicalize(&stored.workspace_id),
+                            std::fs::canonicalize(&layout.root),
+                        ),
+                        (Ok(receipt_root), Ok(live_root)) if receipt_root == live_root
+                    ) {
+                    stored.workspace_id.clone()
+                } else {
+                    root_id
+                };
+                let workspace_verdict = frankenterm_core::steer_run::steer_receipt_workspace_gate(
+                    &stored,
+                    &live_workspace_id,
+                );
+                let verdict = if !workspace_verdict.is_valid() {
+                    workspace_verdict
+                } else if plan_hash
                     .as_deref()
                     .is_some_and(|expected| expected != live_tx_hash.as_str())
                 {
