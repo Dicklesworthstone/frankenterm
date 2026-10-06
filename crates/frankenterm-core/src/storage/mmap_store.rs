@@ -143,6 +143,10 @@ pub enum MmapStoreError {
     VersionedPaneIdentityCollision,
     #[error("staged pane ledger failed exact reopen verification")]
     StagedPaneVerificationFailed,
+    #[error(
+        "cannot cut pane ledger back to sequence {next_seq}: it retains rows only from {oldest}"
+    )]
+    TruncateIntoPrunedPrefix { next_seq: u64, oldest: u64 },
 }
 
 const COLD_ERASURE_DATA_SHARDS: usize = 3;
@@ -1652,6 +1656,37 @@ impl PaneFile {
         Ok(())
     }
 
+    /// Drop every record at or after `next_seq`; returns whether any was cut.
+    /// The index forgets the records first, as an uncommitted suffix, so a
+    /// failed truncate or sync leaves them invisible and the next append cuts
+    /// them again. A crash before the sync may keep them on disk; the caller's
+    /// recovery decides about them again on reopen.
+    fn truncate_after(&mut self, next_seq: u64) -> Result<bool, MmapStoreError> {
+        if next_seq >= self.next_seq()? {
+            return Ok(false);
+        }
+        if next_seq < self.base_seq {
+            return Err(MmapStoreError::TruncateIntoPrunedPrefix {
+                next_seq,
+                oldest: self.base_seq,
+            });
+        }
+        let keep = usize::try_from(next_seq - self.base_seq)
+            .map_err(|_| MmapStoreError::NumericOverflow("truncate_keep"))?;
+        let new_len = self
+            .line_offsets
+            .get(keep)
+            .ok_or(MmapStoreError::NumericOverflow("truncate_offset"))?
+            .0;
+        self.line_offsets.truncate(keep);
+        self.file_len = new_len;
+        self.trailing_partial = true;
+        self.file.set_len(new_len)?;
+        ordered_durability_sync(&self.file)?;
+        self.trailing_partial = false;
+        Ok(true)
+    }
+
     fn clear(&mut self) -> Result<(), MmapStoreError> {
         self.file.set_len(0)?;
         self.file.flush()?;
@@ -2243,6 +2278,34 @@ impl SqliteFallbackStore {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    fn truncate_after(&mut self, pane_id: PaneId, next_seq: u64) -> Result<bool, MmapStoreError> {
+        if next_seq >= self.next_seq(pane_id)? {
+            return Ok(false);
+        }
+        if let Some(oldest) = self.oldest_seq(pane_id)?
+            && next_seq < oldest
+        {
+            return Err(MmapStoreError::TruncateIntoPrunedPrefix { next_seq, oldest });
+        }
+        let pane_id_i64 =
+            i64::try_from(pane_id).map_err(|_| MmapStoreError::NumericOverflow("pane_id"))?;
+        let next_seq_i64 =
+            i64::try_from(next_seq).map_err(|_| MmapStoreError::NumericOverflow("seq"))?;
+        let transaction = self.conn.transaction()?;
+        transaction.execute(
+            "DELETE FROM mmap_scrollback_lines WHERE pane_id = ?1 AND seq >= ?2",
+            params![pane_id_i64, next_seq_i64],
+        )?;
+        transaction.execute(
+            "INSERT INTO mmap_scrollback_fallback_panes (pane_id, next_seq)
+             VALUES (?1, ?2)
+             ON CONFLICT(pane_id) DO UPDATE SET next_seq = excluded.next_seq",
+            params![pane_id_i64, next_seq_i64],
+        )?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     fn line_count(&self, pane_id: PaneId) -> Result<usize, MmapStoreError> {
@@ -3110,6 +3173,40 @@ impl MmapScrollbackStore {
             }
         }
         Ok(())
+    }
+
+    /// Cut a pane's ledger back so `next_seq` is its next sequence, dropping
+    /// every newer record (ft-yccm0.2.1.3). A cut at or past the end does
+    /// nothing; a cut into the pruned prefix is refused. Returns whether rows
+    /// were dropped. The cut is synchronized before return, and Reed-Solomon
+    /// shards are rewritten so they cannot restore the dropped rows.
+    ///
+    /// An authenticated owner cuts only rows that no durable authority names:
+    /// it syncs a batch's rows before publishing the WAL that authorizes
+    /// them, so a crash or a failed publication between the two leaves such
+    /// a tail.
+    pub fn truncate_after(
+        &mut self,
+        pane_id: PaneId,
+        next_seq: u64,
+    ) -> Result<bool, MmapStoreError> {
+        if self.fallback_panes.contains(&pane_id) || self.sqlite_is_authority(pane_id)? {
+            self.activate_sqlite_fallback(pane_id)?;
+            return self
+                .sqlite_fallback
+                .as_mut()
+                .ok_or(MmapStoreError::UnknownPane(pane_id))?
+                .truncate_after(pane_id, next_seq);
+        }
+        let pane = self
+            .panes
+            .get_mut(&pane_id)
+            .ok_or(MmapStoreError::UnknownPane(pane_id))?;
+        let truncated = pane.truncate_after(next_seq)?;
+        if truncated && self.cold_erasure == ColdErasureMode::ReedSolomon {
+            pane.write_erasure_sidecars()?;
+        }
+        Ok(truncated)
     }
 
     pub fn refresh_pane_erasure_shards(&mut self, pane_id: PaneId) -> Result<bool, MmapStoreError> {
@@ -5115,6 +5212,145 @@ mod tests {
         assert_eq!(reopened.line_at(1, 7).unwrap().as_deref(), Some("line-7"));
         reopened.append_line(1, "line-8").unwrap();
         assert_eq!(reopened.line_at(1, 8).unwrap().as_deref(), Some("line-8"));
+    }
+
+    #[test]
+    fn truncate_after_cuts_the_tail_durably_and_appends_continue_at_the_cut() {
+        let dir = temp_dir();
+        let log_path = dir.path().join("1.log");
+        {
+            let mut store = file_only_store(dir.path());
+            for idx in 0..6 {
+                assert_eq!(store.append_line(1, &format!("line-{idx}")).unwrap(), idx);
+            }
+            store.prune_before(1, 2).unwrap();
+
+            assert!(!store.truncate_after(1, 6).unwrap(), "a cut at the end");
+            assert!(!store.truncate_after(1, 9).unwrap(), "a cut past the end");
+            assert_eq!(store.next_seq(1).unwrap(), 6);
+            assert!(matches!(
+                store.truncate_after(1, 1),
+                Err(MmapStoreError::TruncateIntoPrunedPrefix {
+                    next_seq: 1,
+                    oldest: 2
+                })
+            ));
+            assert_eq!(store.line_count(1), 4, "a refused cut changes nothing");
+
+            assert!(store.truncate_after(1, 4).unwrap());
+            assert_eq!(store.next_seq(1).unwrap(), 4);
+            assert_eq!(store.oldest_seq(1), Some(2));
+            assert_eq!(store.line_count(1), 2);
+            assert_eq!(store.line_at(1, 3).unwrap().as_deref(), Some("line-3"));
+            assert_eq!(store.line_at(1, 4).unwrap(), None);
+            assert_eq!(
+                std::fs::metadata(&log_path).unwrap().len(),
+                store.file_bytes(1),
+                "the cut bytes are gone from disk, not just from the index"
+            );
+        }
+
+        let mut reopened = file_only_store(dir.path());
+        reopened.ensure_pane(1).unwrap();
+        assert_eq!(reopened.oldest_seq(1), Some(2));
+        assert_eq!(reopened.next_seq(1).unwrap(), 4);
+        assert_eq!(
+            reopened.tail_lines(1, 10).unwrap(),
+            vec!["line-2", "line-3"]
+        );
+        assert_eq!(reopened.append_line(1, "new-4").unwrap(), 4);
+        drop(reopened);
+
+        let mut reopened = file_only_store(dir.path());
+        reopened.ensure_pane(1).unwrap();
+        assert_eq!(
+            reopened.tail_lines(1, 10).unwrap(),
+            vec!["line-2", "line-3", "new-4"]
+        );
+        assert_eq!(reopened.line_at(1, 5).unwrap(), None);
+    }
+
+    #[test]
+    fn truncate_after_a_compacted_log_can_cut_every_retained_row() {
+        let dir = temp_dir();
+        {
+            let mut store = file_only_store(dir.path());
+            for idx in 0..8 {
+                store.append_line(1, &format!("line-{idx}")).unwrap();
+            }
+            store.prune_before(1, 6).unwrap();
+            assert!(store.compact_pane_if_stale(1, 1).unwrap());
+            assert_eq!(store.append_lines(1, &["line-8", "line-9"]).unwrap(), 8);
+
+            assert!(store.truncate_after(1, 7).unwrap());
+            assert_eq!(store.tail_lines(1, 10).unwrap(), vec!["line-6"]);
+        }
+
+        let mut reopened = file_only_store(dir.path());
+        reopened.ensure_pane(1).unwrap();
+        assert_eq!(reopened.oldest_seq(1), Some(6));
+        assert_eq!(reopened.next_seq(1).unwrap(), 7);
+        assert!(reopened.truncate_after(1, 6).unwrap());
+        assert_eq!(reopened.oldest_seq(1), None);
+        assert_eq!(reopened.line_count(1), 0);
+        assert_eq!(reopened.next_seq(1).unwrap(), 6);
+        drop(reopened);
+
+        let mut reopened = file_only_store(dir.path());
+        reopened.ensure_pane(1).unwrap();
+        assert_eq!(reopened.next_seq(1).unwrap(), 6, "the pruned base survives");
+        assert_eq!(reopened.line_count(1), 0);
+        assert_eq!(reopened.append_line(1, "again-6").unwrap(), 6);
+        assert_eq!(reopened.line_at(1, 6).unwrap().as_deref(), Some("again-6"));
+    }
+
+    #[test]
+    fn truncate_after_rewrites_erasure_shards_so_they_cannot_restore_cut_rows() {
+        let dir = temp_dir();
+        let mut store = rs_store(dir.path());
+        store
+            .append_lines(1, &["keep-0", "keep-1", "cut-2"])
+            .unwrap();
+        assert!(store.refresh_pane_erasure_shards(1).unwrap());
+
+        assert!(store.truncate_after(1, 2).unwrap());
+        let on_disk = std::fs::read(dir.path().join("1.log")).unwrap();
+        assert_eq!(on_disk, b"keep-0\nkeep-1\n");
+        assert_eq!(
+            store.recover_pane_bytes_from_erasure_shards(1).unwrap(),
+            Some(on_disk)
+        );
+    }
+
+    #[test]
+    fn sqlite_fallback_truncate_after_sets_the_next_sequence() {
+        let dir = temp_dir();
+        let db_path = dir.path().join("sqlite-truncate.db");
+        let mut sqlite = SqliteFallbackStore::open(&db_path).unwrap();
+        for idx in 0..5 {
+            assert_eq!(
+                sqlite
+                    .append_line_auto_seq(1, &format!("line-{idx}"))
+                    .unwrap(),
+                idx
+            );
+        }
+        sqlite.prune_before(1, 1).unwrap();
+
+        assert!(!sqlite.truncate_after(1, 5).unwrap());
+        assert!(matches!(
+            sqlite.truncate_after(1, 0),
+            Err(MmapStoreError::TruncateIntoPrunedPrefix {
+                next_seq: 0,
+                oldest: 1
+            })
+        ));
+        assert!(sqlite.truncate_after(1, 3).unwrap());
+        assert_eq!(sqlite.next_seq(1).unwrap(), 3);
+        assert_eq!(sqlite.line_count(1).unwrap(), 2);
+        assert_eq!(sqlite.line_at(1, 3).unwrap(), None);
+        assert_eq!(sqlite.append_line_auto_seq(1, "new-3").unwrap(), 3);
+        assert_eq!(sqlite.line_at(1, 3).unwrap().as_deref(), Some("new-3"));
     }
 
     #[test]

@@ -81,6 +81,14 @@ const LIVE_SCROLLBACK_INCREMENTAL_CHAIN_DOMAIN: &[u8] =
 const LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V1: &str = "frankenterm.live-scrollback-append-wal.v1";
 const LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2: &str = "frankenterm.live-scrollback-append-wal.v2";
 const LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3: &str = "frankenterm.live-scrollback-append-wal.v3";
+/// v4 names its batch by row count, byte count and digest. The rows are
+/// written once, to the ledger, before the WAL; recovery verifies them there
+/// (ft-yccm0.2.1.3). v1-v3 carry a second copy of every row.
+const LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4: &str = "frankenterm.live-scrollback-append-wal.v4";
+const LIVE_SCROLLBACK_APPEND_WAL_BATCH_DIGEST_DOMAIN_V3: &[u8] =
+    b"frankenterm.live-scrollback-append-wal-batch.v3\0";
+const LIVE_SCROLLBACK_APPEND_WAL_BATCH_DIGEST_DOMAIN_V4: &[u8] =
+    b"frankenterm.live-scrollback-append-wal-batch.v4\0";
 // A 128 KiB parser batch of short output rows otherwise pays several durable
 // append transactions. The independent 16 MiB pending/record byte limits still
 // bound admission; geometry work continues to yield in its existing slices.
@@ -3702,6 +3710,10 @@ struct LiveScrollbackAppendWalV1 {
     superseding_ledger_pane_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     superseding_manifest_sha256: Option<String>,
+    /// v4 only: the batch's row count. Its rows are already in the ledger,
+    /// so `encrypted_record` is empty and no additional records follow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    appended_record_count: Option<u64>,
     encrypted_record: String,
     /// v3 binds one ordered batch. v1/v2 must have no additional records.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3725,12 +3737,48 @@ struct PreparedAppendWal<'sink> {
     wal: LiveScrollbackAppendWalV1,
 }
 
+/// How a publication proves the retained WAL may be replaced.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetainedAppendWalCheck {
+    /// Verify it against the ledger now.
+    Live,
+    /// A digest-only transaction appends its rows before its WAL, so it checked
+    /// the retained WAL against the ledger before that append. Publication
+    /// requires the retained WAL to be the one checked (same checksum, or
+    /// still none).
+    VerifiedBeforeAppend(Option<[u8; 32]>),
+}
+
+/// What opening a pane did about ledger rows past its published manifest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LedgerTailSettlement {
+    /// The ledger ends at its manifest, or the active WAL names the rows past it.
+    Unchanged,
+    /// Rows no WAL names were cut back to the manifest.
+    Cut(u64),
+    /// The interrupted transaction's complete WAL stage was published and now
+    /// names the rows; recovery rolls it forward.
+    PromotedStage,
+}
+
+/// The append WAL a transaction writes. This binary writes only the
+/// digest-only (v4) form. Pre-v4 binaries carried every row in the WAL
+/// (v2/v3); tests build those so recovery of them stays proven.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppendWalFormat {
+    DigestOnly,
+    #[cfg(test)]
+    CarriedRows,
+}
+
 /// Fresh construction alone mints this borrow. The chain was computed while
 /// projecting these exact records, and the digest was computed after their
 /// owned copies were installed in this WAL. Holding the borrow prevents record
 /// mutation through the metadata validation boundary; disk reads never mint it.
+/// `records` is the batch the WAL names: a v4 WAL holds no copy of it.
 struct AppendWalConstructionProof<'wal> {
     wal: &'wal LiveScrollbackAppendWalV1,
+    records: &'wal [String],
     record_digest: [u8; 32],
     chain_tail: [u8; 32],
 }
@@ -3802,6 +3850,7 @@ impl std::fmt::Debug for LiveScrollbackAppendWalV1 {
                 &self.superseding_ledger_pane_id,
             )
             .field("superseding_manifest_sha256", &"[REDACTED]")
+            .field("appended_record_count", &self.appended_record_count)
             .field("encrypted_record", &"[REDACTED]")
             .field("additional_encrypted_records", &"[REDACTED]")
             .field("guardian_authentication", &"[REDACTED]")
@@ -3811,31 +3860,54 @@ impl std::fmt::Debug for LiveScrollbackAppendWalV1 {
 }
 
 impl LiveScrollbackAppendWalV1 {
+    /// The rows this WAL carries. A digest-only (v4) WAL carries none.
     fn records(&self) -> impl Iterator<Item = &str> {
+        let carried = if self.is_digest_only() { 0 } else { usize::MAX };
         std::iter::once(self.encrypted_record.as_str())
             .chain(self.additional_encrypted_records.iter().map(String::as_str))
+            .take(carried)
+    }
+
+    fn is_digest_only(&self) -> bool {
+        self.schema == LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4
+    }
+
+    /// Rows in the batch: counted by a v4 WAL, carried by v1-v3.
+    fn batch_row_count(&self) -> anyhow::Result<u64> {
+        if self.is_digest_only() {
+            return self
+                .appended_record_count
+                .ok_or_else(|| anyhow::anyhow!("digest-only append WAL has no row count"));
+        }
+        u64::try_from(self.additional_encrypted_records.len())
+            .ok()
+            .and_then(|additional| additional.checked_add(1))
+            .ok_or_else(|| anyhow::anyhow!("append WAL batch row count overflows"))
     }
 
     fn is_incremental(&self) -> bool {
         matches!(
             self.schema.as_str(),
-            LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2 | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3
+            LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2
+                | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3
+                | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4
         )
     }
 
     fn records_digest(&self) -> anyhow::Result<[u8; 32]> {
         #[cfg(test)]
         LIVE_SCROLLBACK_WAL_RECORD_DIGESTS.with(|count| count.set(count.get() + 1));
-        if self.schema != LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3 {
-            return live_scrollback_append_wal_record_digest(&self.encrypted_record);
+        match self.schema.as_str() {
+            LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3 => live_scrollback_append_wal_batch_digest(
+                LIVE_SCROLLBACK_APPEND_WAL_BATCH_DIGEST_DOMAIN_V3,
+                self.batch_row_count()?,
+                self.records(),
+            ),
+            LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4 => {
+                anyhow::bail!("a digest-only append WAL does not carry the rows it names")
+            }
+            _ => live_scrollback_append_wal_record_digest(&self.encrypted_record),
         }
-        let mut hasher = Sha256::new();
-        hasher.update(b"frankenterm.live-scrollback-append-wal-batch.v3\0");
-        hasher.update(u64::try_from(self.additional_encrypted_records.len() + 1)?.to_le_bytes());
-        for record in self.records() {
-            update_scrollback_digest_bytes(&mut hasher, record.as_bytes())?;
-        }
-        Ok(hasher.finalize().into())
     }
 
     fn checksum_view(&self) -> LiveScrollbackAppendWalCanonicalView<'_> {
@@ -3869,6 +3941,7 @@ impl LiveScrollbackAppendWalV1 {
             superseding_revision: self.superseding_revision,
             superseding_ledger_pane_id: self.superseding_ledger_pane_id,
             superseding_manifest_sha256: self.superseding_manifest_sha256.as_deref(),
+            appended_record_count: self.appended_record_count,
             encrypted_record: &self.encrypted_record,
             additional_encrypted_records: &self.additional_encrypted_records,
             guardian_authentication: self.guardian_authentication.as_deref(),
@@ -3933,6 +4006,8 @@ struct LiveScrollbackAppendWalCanonicalView<'a> {
     superseding_ledger_pane_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     superseding_manifest_sha256: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    appended_record_count: Option<u64>,
     encrypted_record: &'a str,
     #[serde(skip_serializing_if = "is_empty_string_slice")]
     additional_encrypted_records: &'a [String],
@@ -4730,6 +4805,29 @@ fn live_scrollback_append_wal_record_digest(record: &str) -> anyhow::Result<[u8;
     Ok(hasher.finalize().into())
 }
 
+/// One ordered batch: the row count, then each length-framed row.
+fn live_scrollback_append_wal_batch_digest<'a>(
+    domain: &[u8],
+    row_count: u64,
+    records: impl IntoIterator<Item = &'a str>,
+) -> anyhow::Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(row_count.to_le_bytes());
+    let mut rows_digested = 0_u64;
+    for record in records {
+        update_scrollback_digest_bytes(&mut hasher, record.as_bytes())?;
+        rows_digested = rows_digested
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("append WAL batch digest row count overflows"))?;
+    }
+    anyhow::ensure!(
+        rows_digested == row_count,
+        "append WAL batch digest covers the wrong number of rows"
+    );
+    Ok(hasher.finalize().into())
+}
+
 fn decode_live_scrollback_canonical_digest(
     encoded: &str,
     field: &'static str,
@@ -5511,35 +5609,59 @@ impl LiveScrollbackSpillSink {
                 LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V1
                     | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2
                     | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3
+                    | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4
             ),
             "unsupported live scrollback append WAL schema"
         );
-        let record_count = wal
-            .additional_encrypted_records
-            .len()
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("append WAL batch row count overflows"))?;
         anyhow::ensure!(
-            record_count <= LIVE_SCROLLBACK_APPEND_MAX_ROWS
-                && if wal.schema == LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3 {
-                    record_count > 1 && u64::try_from(record_count)? <= wal.max_retained_rows
-                } else {
-                    record_count == 1
+            wal.is_digest_only() == wal.appended_record_count.is_some()
+                && (!wal.is_digest_only()
+                    || (wal.encrypted_record.is_empty()
+                        && wal.additional_encrypted_records.is_empty())),
+            "append WAL batch row bounds or schema are invalid"
+        );
+        let record_count = wal.batch_row_count()?;
+        anyhow::ensure!(
+            record_count <= u64::try_from(LIVE_SCROLLBACK_APPEND_MAX_ROWS)?
+                && match wal.schema.as_str() {
+                    LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3 => {
+                        record_count > 1 && record_count <= wal.max_retained_rows
+                    }
+                    LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4 => {
+                        record_count != 0 && record_count <= wal.max_retained_rows
+                    }
+                    _ => record_count == 1,
                 },
             "append WAL batch row bounds or schema are invalid"
         );
-        let record_bytes = wal.records().try_fold(0u64, |bytes, record| {
-            anyhow::ensure!(!record.is_empty(), "append WAL contains an empty record");
-            bytes
-                .checked_add(u64::try_from(record.len())?)
-                .ok_or_else(|| anyhow::anyhow!("append WAL batch bytes overflow"))
-        })?;
+        // A digest-only WAL holds no rows. Its constructor's rows are checked
+        // here; recovery checks the ledger's rows against its digest.
+        let batch_rows: Option<Vec<&str>> = if wal.is_digest_only() {
+            construction.map(|proof| proof.records.iter().map(String::as_str).collect())
+        } else {
+            Some(wal.records().collect())
+        };
+        if let Some(rows) = batch_rows.as_deref() {
+            let record_bytes = rows.iter().try_fold(0u64, |bytes, record| {
+                anyhow::ensure!(!record.is_empty(), "append WAL contains an empty record");
+                bytes
+                    .checked_add(u64::try_from(record.len())?)
+                    .ok_or_else(|| anyhow::anyhow!("append WAL batch bytes overflow"))
+            })?;
+            anyhow::ensure!(
+                u64::try_from(rows.len())? == record_count
+                    && wal.encrypted_record_bytes == record_bytes,
+                "append WAL encrypted-record length is invalid"
+            );
+        }
         anyhow::ensure!(
-            wal.encrypted_record_bytes == record_bytes
-                && record_bytes != 0
-                && record_bytes <= LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES
-                && (wal.schema != LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3
-                    || record_bytes <= LIVE_SCROLLBACK_APPEND_MAX_RECORD_BYTES as u64),
+            wal.encrypted_record_bytes >= record_count
+                && wal.encrypted_record_bytes <= LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES
+                && (!matches!(
+                    wal.schema.as_str(),
+                    LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3 | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4
+                ) || wal.encrypted_record_bytes
+                    <= u64::try_from(LIVE_SCROLLBACK_APPEND_MAX_RECORD_BYTES)?),
             "append WAL encrypted-record length is invalid"
         );
         let expected_durable_pane_id = uuid::Uuid::from_bytes(durable_pane_id).simple().to_string();
@@ -5588,7 +5710,9 @@ impl LiveScrollbackSpillSink {
                     "v1 append WAL contains incremental authority"
                 );
             }
-            LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2 | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3 => {
+            LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2
+            | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3
+            | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4 => {
                 anyhow::ensure!(
                     wal.target_record_set_sha256.is_none(),
                     "incremental append WAL contains a quadratic target-set digest"
@@ -5622,7 +5746,9 @@ impl LiveScrollbackSpillSink {
                     "incremental WAL target chain tail",
                 )?;
                 let expected_tail = match construction {
-                    Some(proof) => proof.chain_tail,
+                    Some(proof) => Some(proof.chain_tail),
+                    // The ledger's rows are chained by recovery instead.
+                    None if wal.is_digest_only() => None,
                     None => {
                         let mut tail = predecessor_tail;
                         for (offset, record) in wal.records().enumerate() {
@@ -5639,11 +5765,11 @@ impl LiveScrollbackSpillSink {
                                 record,
                             )?;
                         }
-                        tail
+                        Some(tail)
                     }
                 };
                 anyhow::ensure!(
-                    expected_tail == target_tail
+                    expected_tail.is_none_or(|tail| tail == target_tail)
                         && (wal.evicted_record_count != Some(0)
                             || predecessor_anchor == target_anchor),
                     "incremental append WAL chain successor is inconsistent"
@@ -5652,11 +5778,12 @@ impl LiveScrollbackSpillSink {
             _ => unreachable!("schema checked above"),
         }
         let expected_digest = match construction {
-            Some(proof) => proof.record_digest,
-            None => wal.records_digest()?,
+            Some(proof) => Some(proof.record_digest),
+            None if wal.is_digest_only() => None,
+            None => Some(wal.records_digest()?),
         };
         anyhow::ensure!(
-            expected_digest == record_digest,
+            expected_digest.is_none_or(|digest| digest == record_digest),
             "append WAL encrypted-record digest mismatch"
         );
         anyhow::ensure!(
@@ -5671,7 +5798,7 @@ impl LiveScrollbackSpillSink {
         );
         let target_next_sequence = wal
             .appended_sequence
-            .checked_add(u64::try_from(record_count)?)
+            .checked_add(record_count)
             .ok_or_else(|| anyhow::anyhow!("append WAL sequence is exhausted"))?;
         anyhow::ensure!(
             wal.target_next_sequence == target_next_sequence
@@ -5690,7 +5817,7 @@ impl LiveScrollbackSpillSink {
                     && wal.target_oldest_sequence
                         == wal
                             .appended_sequence
-                            .checked_add(u64::try_from(record_count)?)
+                            .checked_add(record_count)
                             .and_then(|next| next.checked_sub(wal.target_record_count))
                             .ok_or_else(|| anyhow::anyhow!(
                                 "incremental append WAL target underflows"
@@ -5715,7 +5842,24 @@ impl LiveScrollbackSpillSink {
                         .ok_or_else(|| anyhow::anyhow!("append WAL endpoint overflows"))?,
             "append WAL stable-row interval is inconsistent"
         );
-        for (offset, record) in wal.records().enumerate() {
+        if let Some(rows) = batch_rows {
+            Self::validate_append_wal_row_locations(wal, rows, durable_pane_id, target_epoch)?;
+        }
+        anyhow::ensure!(
+            wal.guardian_authentication.is_some(),
+            "append WAL guardian authentication is missing"
+        );
+        Ok(())
+    }
+
+    /// Every row of a batch is sealed for the exact place the WAL puts it.
+    fn validate_append_wal_row_locations<'a>(
+        wal: &LiveScrollbackAppendWalV1,
+        rows: impl IntoIterator<Item = &'a str>,
+        durable_pane_id: [u8; 16],
+        target_epoch: [u8; 16],
+    ) -> anyhow::Result<()> {
+        for (offset, record) in rows.into_iter().enumerate() {
             let parsed =
                 mux::guardian_output_journal::GuardianEncryptedScrollbackRow::parse(record)
                     .context("parse append WAL exact row")?;
@@ -5737,11 +5881,83 @@ impl LiveScrollbackSpillSink {
                 "append WAL exact row has the wrong authenticated location"
             );
         }
-        anyhow::ensure!(
-            wal.guardian_authentication.is_some(),
-            "append WAL guardian authentication is missing"
-        );
         Ok(())
+    }
+
+    /// A digest-only WAL names its batch and the ledger holds the only copy.
+    /// Rows read back from the ledger must be exactly that batch: its row
+    /// and byte counts, its digest, the chain successor it seals, and every
+    /// row's sealed location.
+    fn verify_digest_only_append_wal_rows(
+        wal: &LiveScrollbackAppendWalV1,
+        rows: &[String],
+        durable_pane_id: [u8; 16],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            wal.is_digest_only(),
+            "ledger batch verification needs a digest-only append WAL"
+        );
+        let row_count = wal.batch_row_count()?;
+        anyhow::ensure!(
+            u64::try_from(rows.len())? == row_count,
+            "the ledger is missing rows its digest-only append WAL names"
+        );
+        let digest = live_scrollback_append_wal_batch_digest(
+            LIVE_SCROLLBACK_APPEND_WAL_BATCH_DIGEST_DOMAIN_V4,
+            row_count,
+            rows.iter().map(String::as_str),
+        )?;
+        anyhow::ensure!(
+            digest
+                == decode_live_scrollback_canonical_digest(
+                    &wal.encrypted_record_sha256,
+                    "append WAL batch digest",
+                )?,
+            "ledger rows differ from the batch their append WAL names"
+        );
+        let mut tail = decode_live_scrollback_canonical_digest(
+            wal.predecessor_chain_tail_sha256
+                .as_deref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("incremental WAL predecessor chain tail is missing")
+                })?,
+            "incremental WAL predecessor chain tail",
+        )?;
+        let mut bytes = 0_u64;
+        for (offset, record) in rows.iter().enumerate() {
+            let sequence = wal
+                .appended_sequence
+                .checked_add(u64::try_from(offset)?)
+                .ok_or_else(|| anyhow::anyhow!("append WAL batch sequence overflows"))?;
+            tail =
+                live_scrollback_incremental_chain_next(tail, wal.ledger_pane_id, sequence, record)?;
+            bytes = bytes
+                .checked_add(u64::try_from(record.len())?)
+                .ok_or_else(|| anyhow::anyhow!("append WAL batch bytes overflow"))?;
+        }
+        anyhow::ensure!(
+            bytes == wal.encrypted_record_bytes
+                && Some(tail)
+                    == wal
+                        .target_chain_tail_sha256
+                        .as_deref()
+                        .map(|encoded| {
+                            decode_live_scrollback_canonical_digest(
+                                encoded,
+                                "incremental WAL target chain tail",
+                            )
+                        })
+                        .transpose()?,
+            "ledger rows disagree with their append WAL's chain or byte count"
+        );
+        let target_epoch =
+            decode_live_scrollback_epoch(&wal.target_content_epoch, "append WAL target epoch")?;
+        Self::validate_append_wal_row_locations(
+            wal,
+            rows.iter().map(String::as_str),
+            durable_pane_id,
+            target_epoch,
+        )
     }
 
     fn validate_verified_append_wal_identity(
@@ -5984,40 +6200,63 @@ impl LiveScrollbackSpillSink {
                 "append WAL target ledger digest or byte count mismatch"
             );
         } else {
-            let count = wal.records().count();
-            anyhow::ensure!(
-                count <= LIVE_SCROLLBACK_APPEND_MAX_ROWS,
-                "append WAL exact target row count exceeds limit"
-            );
-            let end = wal
-                .appended_sequence
-                .checked_add(u64::try_from(count)?)
-                .ok_or_else(|| anyhow::anyhow!("append WAL exact target sequence overflows"))?;
-            // The caller holds the store lock: cloned ledger descriptors share
-            // their seek position. Read the batch through one bounded reader,
-            // retaining exact equality for every row, including the final row.
-            // Use the WAL's hard size cap rather than trusting its claimed size.
-            let max_stored_bytes = LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES
-                .checked_add(u64::try_from(count)?)
-                .ok_or_else(|| anyhow::anyhow!("append WAL read byte budget overflows"))?;
-            #[cfg(test)]
-            LIVE_SCROLLBACK_AUTHORITY_BATCH_READS.with(|reads| reads.set(reads.get() + 1));
-            let records = store.lines_range(
-                wal.ledger_pane_id,
-                wal.appended_sequence..end,
-                count,
-                max_stored_bytes,
-            )?;
-            anyhow::ensure!(
-                records.len() == count && records.iter().map(String::as_str).eq(wal.records()),
-                "append WAL exact target row mismatch"
-            );
+            let records = Self::read_append_wal_batch_from_store(wal, store)?;
+            let count = usize::try_from(wal.batch_row_count()?)?;
+            let exact = if wal.is_digest_only() {
+                // The WAL keeps only the batch digest; the ledger's rows must
+                // reproduce it, byte for byte.
+                records.len() == count
+                    && records.iter().try_fold(0_u64, |bytes, record| {
+                        bytes.checked_add(u64::try_from(record.len()).ok()?)
+                    }) == Some(wal.encrypted_record_bytes)
+                    && live_scrollback_append_wal_batch_digest(
+                        LIVE_SCROLLBACK_APPEND_WAL_BATCH_DIGEST_DOMAIN_V4,
+                        wal.batch_row_count()?,
+                        records.iter().map(String::as_str),
+                    )? == decode_live_scrollback_canonical_digest(
+                        &wal.encrypted_record_sha256,
+                        "append WAL batch digest",
+                    )?
+            } else {
+                records.len() == count && records.iter().map(String::as_str).eq(wal.records())
+            };
+            anyhow::ensure!(exact, "append WAL exact target row mismatch");
         }
         anyhow::ensure!(
             store.retained_record_bytes(wal.ledger_pane_id) == wal.target_retained_record_bytes,
             "append WAL target retained-byte count mismatch"
         );
         Ok(())
+    }
+
+    /// The batch a WAL names, read from the ledger in one bounded read. The
+    /// caller holds the store lock: cloned ledger descriptors share their
+    /// seek position. The byte budget is the WAL's hard size cap, never the
+    /// size the WAL claims.
+    fn read_append_wal_batch_from_store(
+        wal: &LiveScrollbackAppendWalV1,
+        store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+    ) -> anyhow::Result<Vec<String>> {
+        let count = usize::try_from(wal.batch_row_count()?)?;
+        anyhow::ensure!(
+            count <= LIVE_SCROLLBACK_APPEND_MAX_ROWS,
+            "append WAL exact target row count exceeds limit"
+        );
+        let end = wal
+            .appended_sequence
+            .checked_add(u64::try_from(count)?)
+            .ok_or_else(|| anyhow::anyhow!("append WAL exact target sequence overflows"))?;
+        let max_stored_bytes = LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES
+            .checked_add(u64::try_from(count)?)
+            .ok_or_else(|| anyhow::anyhow!("append WAL read byte budget overflows"))?;
+        #[cfg(test)]
+        LIVE_SCROLLBACK_AUTHORITY_BATCH_READS.with(|reads| reads.set(reads.get() + 1));
+        Ok(store.lines_range(
+            wal.ledger_pane_id,
+            wal.appended_sequence..end,
+            count,
+            max_stored_bytes,
+        )?)
     }
 
     fn incremental_append_wal_target_authority(
@@ -6062,6 +6301,132 @@ impl LiveScrollbackSpillSink {
         Ok(scanned)
     }
 
+    /// A digest-only transaction syncs its rows before it publishes the WAL
+    /// that names them, so a crash in between leaves the ledger running past
+    /// its authenticated v4 manifest. Unless the active WAL is authenticated
+    /// and provably consumed or superseded, it may name the rows, and they are
+    /// left to its recovery or refusal, and so are rows a retained manifest
+    /// stage may name. A complete adjacent digest-only WAL stage is the
+    /// interrupted publication: it is finished, replacing the consumed active
+    /// WAL as that transaction would have. Any other complete WAL stage
+    /// leaves the rows alone. Otherwise nothing names them and they were never
+    /// acknowledged: once the retained prefix is proven to be exactly the
+    /// manifest's, they are cut.
+    fn settle_ledger_tail_past_manifest(
+        manifest: Option<&LiveScrollbackManifestV1>,
+        manifest_path: &std::path::Path,
+        ledger_pane_id: u64,
+        store: &mut frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+        active_wal: Option<&LiveScrollbackAppendWalV1>,
+        keyring: &guardian_output_keys::GuardianOutputKeyring,
+        durable_pane_id: [u8; 16],
+    ) -> anyhow::Result<LedgerTailSettlement> {
+        let Some(manifest) = manifest.filter(|manifest| {
+            live_scrollback_manifest_is_authenticated(manifest)
+                && manifest.publication_state == "complete"
+                && manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4
+        }) else {
+            return Ok(LedgerTailSettlement::Unchanged);
+        };
+        let observed_next = store.next_seq(ledger_pane_id)?;
+        if observed_next <= manifest.next_seq {
+            return Ok(LedgerTailSettlement::Unchanged);
+        }
+        // A retained manifest stage may be the successor that names the
+        // rows; its own recovery decides about them.
+        if std::fs::symlink_metadata(Self::deterministic_manifest_stage_path(manifest_path)?)
+            .is_ok()
+        {
+            return Ok(LedgerTailSettlement::Unchanged);
+        }
+        let active_path = Self::append_wal_path(manifest_path)?;
+        let stage_path = Self::append_wal_stage_path(manifest_path)?;
+        let (active_path, stage_path) = (active_path.as_path(), stage_path.as_path());
+        // Declining to cut is always safe: whatever no WAL proves still fails
+        // the checks after this one. Cutting needs proof that no WAL names
+        // the rows, so an active WAL that fails authentication, or is not
+        // provably consumed, leaves them alone.
+        if let Some(active) = active_wal {
+            let consumed = Self::validate_append_wal_identity(active, durable_pane_id).is_ok()
+                && Self::authenticate_append_wal(active, keyring).is_ok()
+                && Self::append_wal_is_consumed_or_superseded(active, manifest).unwrap_or(false);
+            if !consumed {
+                return Ok(LedgerTailSettlement::Unchanged);
+            }
+        }
+        match Self::read_append_wal(stage_path) {
+            Ok(Some(staged)) => {
+                let interrupted_publication = staged.is_digest_only()
+                    && Self::append_wal_matches_predecessor_manifest(&staged, manifest)
+                        .unwrap_or(false);
+                if !interrupted_publication {
+                    return Ok(LedgerTailSettlement::Unchanged);
+                }
+                Self::validate_append_wal_identity(&staged, durable_pane_id)?;
+                Self::authenticate_append_wal(&staged, keyring)?;
+                Self::sync_private_scrollback_stage(
+                    stage_path,
+                    LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES,
+                )?;
+                if let Err(rename_error) = std::fs::rename(stage_path, active_path) {
+                    anyhow::ensure!(
+                        Self::read_append_wal(active_path)?.as_ref() == Some(&staged),
+                        "publish the interrupted append WAL stage: {rename_error}"
+                    );
+                }
+                #[cfg(not(windows))]
+                std::fs::File::open(
+                    active_path
+                        .parent()
+                        .ok_or_else(|| anyhow::anyhow!("scrollback append WAL has no parent"))?,
+                )?
+                .sync_all()?;
+                anyhow::ensure!(
+                    Self::read_append_wal(active_path)?.as_ref() == Some(&staged),
+                    "the published append WAL stage changed during recovery"
+                );
+                return Ok(LedgerTailSettlement::PromotedStage);
+            }
+            Ok(None) => {}
+            Err(_) if Self::append_wal_stage_is_recoverably_incomplete(stage_path)? => {}
+            Err(_) => return Ok(LedgerTailSettlement::Unchanged),
+        }
+
+        let tail = observed_next - manifest.next_seq;
+        anyhow::ensure!(
+            tail <= u64::try_from(LIVE_SCROLLBACK_APPEND_MAX_ROWS)?,
+            "the ledger runs {tail} rows past its manifest, more than one batch"
+        );
+        let oldest = manifest.oldest_seq.unwrap_or(manifest.next_seq);
+        anyhow::ensure!(
+            store.oldest_seq(ledger_pane_id) == Some(oldest)
+                && oldest.checked_add(manifest.retained_rows) == Some(manifest.next_seq),
+            "a ledger running past its manifest no longer starts where the manifest does"
+        );
+        let (mut chain, expected) = expected_live_scrollback_v4_chain(manifest)?;
+        let mut bytes = 0_u64;
+        for sequence in oldest..manifest.next_seq {
+            let record = live_scrollback_authority_record_at(store, ledger_pane_id, sequence)?;
+            bytes = bytes
+                .checked_add(u64::try_from(record.len())?)
+                .and_then(|bytes| bytes.checked_add(1))
+                .ok_or_else(|| anyhow::anyhow!("manifest prefix bytes overflow"))?;
+            chain =
+                live_scrollback_incremental_chain_next(chain, ledger_pane_id, sequence, &record)?;
+        }
+        anyhow::ensure!(
+            chain == expected && Some(bytes) == manifest.retained_record_bytes,
+            "a ledger running past its manifest changed the rows the manifest seals"
+        );
+        store
+            .truncate_after(ledger_pane_id, manifest.next_seq)
+            .context("cut scrollback rows that no append WAL names")?;
+        log::warn!(
+            "cut {tail} scrollback rows past the published manifest that no append WAL names (an append interrupted before its WAL)"
+        );
+        Ok(LedgerTailSettlement::Cut(tail))
+    }
+
     fn reconcile_authenticated_append_wal(
         wal: &LiveScrollbackAppendWalV1,
         manifest: &LiveScrollbackManifestV1,
@@ -6097,7 +6462,18 @@ impl LiveScrollbackSpillSink {
         );
 
         let observed_next = store.next_seq(wal.ledger_pane_id)?;
-        if wal.schema == LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3 {
+        if wal.is_digest_only() {
+            // The batch was synchronized before this WAL was published, so
+            // recovery only rolls forward: the ledger must hold exactly the
+            // batch the WAL names, and nothing after it.
+            anyhow::ensure!(
+                observed_next == wal.target_next_sequence,
+                "digest-only append WAL recovery found its batch incomplete or followed by rows"
+            );
+            let rows = Self::read_append_wal_batch_from_store(wal, store)?;
+            Self::verify_digest_only_append_wal_rows(wal, &rows, durable_pane_id)
+                .context("verify the ledger rows of a digest-only append WAL")?;
+        } else if wal.schema == LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3 {
             anyhow::ensure!(
                 observed_next >= wal.appended_sequence && observed_next <= wal.target_next_sequence,
                 "batch WAL recovery found a gap or conflicting successor"
@@ -6256,6 +6632,7 @@ impl LiveScrollbackSpillSink {
         max_retained_rows: usize,
         encrypted_records: &[String],
         store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+        format: AppendWalFormat,
     ) -> anyhow::Result<(PreparedAppendWal<'_>, VerifiedLedgerState)> {
         let encrypted_record = encrypted_records
             .first()
@@ -6354,8 +6731,12 @@ impl LiveScrollbackSpillSink {
         let newest_stable_row_exclusive = proposed_state
             .newest_stable_row_exclusive
             .ok_or_else(|| anyhow::anyhow!("append WAL target has no stable-row endpoint"))?;
+        let digest_only = format == AppendWalFormat::DigestOnly;
+        let row_count = u64::try_from(encrypted_records.len())?;
         let mut wal = LiveScrollbackAppendWalV1 {
-            schema: if encrypted_records.len() == 1 {
+            schema: if digest_only {
+                LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4
+            } else if encrypted_records.len() == 1 {
                 LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2
             } else {
                 LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3
@@ -6393,12 +6774,29 @@ impl LiveScrollbackSpillSink {
             superseding_revision: None,
             superseding_ledger_pane_id: None,
             superseding_manifest_sha256: None,
-            encrypted_record: encrypted_record.to_string(),
-            additional_encrypted_records: encrypted_records[1..].to_vec(),
+            appended_record_count: digest_only.then_some(row_count),
+            encrypted_record: if digest_only {
+                String::new()
+            } else {
+                encrypted_record.to_string()
+            },
+            additional_encrypted_records: if digest_only {
+                Vec::new()
+            } else {
+                encrypted_records[1..].to_vec()
+            },
             guardian_authentication: None,
             wal_sha256: String::new(),
         };
-        let record_digest = wal.records_digest()?;
+        let record_digest = if digest_only {
+            live_scrollback_append_wal_batch_digest(
+                LIVE_SCROLLBACK_APPEND_WAL_BATCH_DIGEST_DOMAIN_V4,
+                row_count,
+                encrypted_records.iter().map(String::as_str),
+            )?
+        } else {
+            wal.records_digest()?
+        };
         wal.encrypted_record_sha256 = hex::encode(record_digest);
         // Authentication is intentionally absent until every other canonical
         // field is frozen. Validate the non-auth fields with a private marker,
@@ -6409,6 +6807,7 @@ impl LiveScrollbackSpillSink {
             self.durable_pane_id,
             Some(&AppendWalConstructionProof {
                 wal: &wal,
+                records: encrypted_records,
                 record_digest,
                 chain_tail: target_authority.chain_tail,
             }),
@@ -6456,12 +6855,13 @@ impl LiveScrollbackSpillSink {
             outcome_indeterminate: false,
             source,
         })?;
-        self.publish_validated_append_wal(wal)
+        self.publish_validated_append_wal(wal, RetainedAppendWalCheck::Live)
     }
 
     fn persist_prepared_append_wal(
         &self,
         prepared: &PreparedAppendWal<'_>,
+        retained: RetainedAppendWalCheck,
     ) -> Result<(), LiveScrollbackAppendWalPublishError> {
         if !std::ptr::eq(self, prepared.owner) {
             return Err(LiveScrollbackAppendWalPublishError {
@@ -6469,7 +6869,87 @@ impl LiveScrollbackSpillSink {
                 source: anyhow::anyhow!("prepared append WAL belongs to another sink"),
             });
         }
-        self.publish_validated_append_wal(&prepared.wal)
+        self.publish_validated_append_wal(&prepared.wal, retained)
+    }
+
+    /// The retained WAL may be replaced only when the published manifest
+    /// consumed it, with the ledger still at that target, or authentically
+    /// superseded it. Returns its checksum, or None when none is retained.
+    fn verify_replaceable_active_append_wal(
+        &self,
+        keyring: &dyn guardian_output_keys::GuardianHistoricalKeyLookup,
+    ) -> anyhow::Result<Option<[u8; 32]>> {
+        let active_path = Self::append_wal_path(&self.manifest_path)?;
+        let Some(verified) = Self::read_checksum_verified_append_wal(&active_path)? else {
+            return Ok(None);
+        };
+        self.validate_verified_append_wal_identity(&verified)?;
+        let checksum = verified.checksum;
+        let active = verified.wal;
+        let manifest = Self::read_manifest(&self.manifest_path)?
+            .ok_or_else(|| anyhow::anyhow!("active append WAL has no manifest"))?;
+        let durable_pane_id = uuid::Uuid::from_bytes(self.durable_pane_id)
+            .simple()
+            .to_string();
+        validate_live_scrollback_manifest_identity(
+            &manifest,
+            &durable_pane_id,
+            &self.manifest_path,
+        )?;
+        Self::authenticate_append_wal(&active, keyring)?;
+        anyhow::ensure!(
+            Self::authenticate_manifest(&manifest, keyring)?,
+            "active append WAL supersession manifest is not authenticated"
+        );
+        if Self::append_wal_matches_target_manifest(&active, &manifest)? {
+            let store = self
+                .lock_store("replace consumed append WAL target")
+                .map_err(anyhow::Error::new)?;
+            if Self::append_wal_is_v1_to_v4_target_migration(&active, &manifest) {
+                Self::verify_v1_append_wal_v4_target_migration(&active, &manifest, &store)?;
+            } else {
+                Self::verify_append_wal_target_store(&active, &store)?;
+            }
+            if active.is_incremental() {
+                let authority = Self::incremental_append_wal_target_authority(&active)?;
+                anyhow::ensure!(
+                    authority.matches_store_facts(&store)?
+                        && expected_live_scrollback_v4_chain(&manifest)?
+                            == (authority.chain_anchor, authority.chain_tail),
+                    "consumed incremental append WAL disagrees with its published v4 authority"
+                );
+            } else if !Self::append_wal_is_v1_to_v4_target_migration(&active, &manifest) {
+                Self::verify_logical_ledger_digest_from_store(
+                    &manifest,
+                    active.ledger_pane_id,
+                    &store,
+                )
+                .context("bind consumed append WAL before bounded-slot replacement")?;
+            }
+        } else {
+            anyhow::ensure!(
+                Self::append_wal_supersession_matches_manifest(&active, &manifest)?
+                    || Self::append_wal_is_immediately_superseded_by_manifest(&active, &manifest,)?,
+                "refusing to replace an unconsumed or unlinked append WAL"
+            );
+        }
+        Ok(Some(checksum))
+    }
+
+    /// Whether the deterministic WAL stage may hold exactly this WAL, so a
+    /// failed publication could still be finished by recovery. A stage that
+    /// cannot be read, and is not a recoverably incomplete write, might.
+    fn append_wal_stage_may_name(&self, wal: &LiveScrollbackAppendWalV1) -> bool {
+        let Ok(stage_path) = Self::append_wal_stage_path(&self.manifest_path) else {
+            return true;
+        };
+        match Self::read_append_wal(&stage_path) {
+            Ok(Some(staged)) => staged == *wal,
+            Ok(None) => false,
+            Err(_) => {
+                !Self::append_wal_stage_is_recoverably_incomplete(&stage_path).unwrap_or(false)
+            }
+        }
     }
 
     /// Both entry points prove input identity and checksum before reaching
@@ -6477,6 +6957,7 @@ impl LiveScrollbackSpillSink {
     fn publish_validated_append_wal(
         &self,
         wal: &LiveScrollbackAppendWalV1,
+        retained: RetainedAppendWalCheck,
     ) -> Result<(), LiveScrollbackAppendWalPublishError> {
         let mut publication_attempted = false;
         let result = (|| -> anyhow::Result<()> {
@@ -6494,56 +6975,16 @@ impl LiveScrollbackSpillSink {
             #[cfg(unix)]
             let parent = _parent;
 
-            if let Some(verified) = Self::read_checksum_verified_append_wal(&active_path)? {
-                self.validate_verified_append_wal_identity(&verified)?;
-                let active = verified.wal;
-                let manifest = Self::read_manifest(&self.manifest_path)?
-                    .ok_or_else(|| anyhow::anyhow!("active append WAL has no manifest"))?;
-                let durable_pane_id = uuid::Uuid::from_bytes(self.durable_pane_id)
-                    .simple()
-                    .to_string();
-                validate_live_scrollback_manifest_identity(
-                    &manifest,
-                    &durable_pane_id,
-                    &self.manifest_path,
-                )?;
-                Self::authenticate_append_wal(&active, &keyring)?;
-                anyhow::ensure!(
-                    Self::authenticate_manifest(&manifest, &keyring)?,
-                    "active append WAL supersession manifest is not authenticated"
-                );
-                if Self::append_wal_matches_target_manifest(&active, &manifest)? {
-                    let store = self
-                        .lock_store("replace consumed append WAL target")
-                        .map_err(anyhow::Error::new)?;
-                    if Self::append_wal_is_v1_to_v4_target_migration(&active, &manifest) {
-                        Self::verify_v1_append_wal_v4_target_migration(&active, &manifest, &store)?;
-                    } else {
-                        Self::verify_append_wal_target_store(&active, &store)?;
-                    }
-                    if active.is_incremental() {
-                        let authority = Self::incremental_append_wal_target_authority(&active)?;
-                        anyhow::ensure!(
-                            authority.matches_store_facts(&store)?
-                                && expected_live_scrollback_v4_chain(&manifest)?
-                                    == (authority.chain_anchor, authority.chain_tail),
-                            "consumed incremental append WAL disagrees with its published v4 authority"
-                        );
-                    } else if !Self::append_wal_is_v1_to_v4_target_migration(&active, &manifest) {
-                        Self::verify_logical_ledger_digest_from_store(
-                            &manifest,
-                            active.ledger_pane_id,
-                            &store,
-                        )
-                        .context("bind consumed append WAL before bounded-slot replacement")?;
-                    }
-                } else {
+            match retained {
+                RetainedAppendWalCheck::Live => {
+                    self.verify_replaceable_active_append_wal(&keyring)?;
+                }
+                RetainedAppendWalCheck::VerifiedBeforeAppend(expected) => {
+                    let observed = Self::read_checksum_verified_append_wal(&active_path)?
+                        .map(|verified| verified.checksum);
                     anyhow::ensure!(
-                        Self::append_wal_supersession_matches_manifest(&active, &manifest)?
-                            || Self::append_wal_is_immediately_superseded_by_manifest(
-                                &active, &manifest,
-                            )?,
-                        "refusing to replace an unconsumed or unlinked append WAL"
+                        observed == expected,
+                        "the retained append WAL changed after its pre-append replacement check"
                     );
                 }
             }
@@ -7341,7 +7782,27 @@ impl LiveScrollbackSpillSink {
         }
         let append_wal_path = Self::append_wal_path(&manifest_path)?;
         let append_wal_stage_path = Self::append_wal_stage_path(&manifest_path)?;
-        let active_append_wal = Self::read_append_wal(&append_wal_path)?;
+        let mut active_append_wal = Self::read_append_wal(&append_wal_path)?;
+        let tail_settlement = {
+            let keyring_guard = keyring
+                .lock()
+                .map_err(|_| anyhow::anyhow!("guardian output keyring is poisoned"))?;
+            Self::settle_ledger_tail_past_manifest(
+                persisted_manifest
+                    .as_ref()
+                    .filter(|_| authenticated_manifest),
+                &manifest_path,
+                ledger_pane_id,
+                &mut store,
+                active_append_wal.as_ref(),
+                &keyring_guard,
+                context.durable_pane_id,
+            )
+            .context("settle scrollback rows past the published manifest")?
+        };
+        if tail_settlement == LedgerTailSettlement::PromotedStage {
+            active_append_wal = Self::read_append_wal(&append_wal_path)?;
+        }
         if let Some(wal) = active_append_wal.as_ref() {
             let published_manifest = persisted_manifest.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("scrollback append WAL has no published predecessor manifest")
@@ -10108,7 +10569,9 @@ impl LiveScrollbackSpillSink {
             return false;
         };
         proposed_state.newest_stable_row_exclusive = Some(newest);
-        let (append_wal, target_authority) = if manifest_prepare_required {
+        // Rows reach the ledger before the record that authorizes them: a
+        // first row's prepared manifest, or a later batch's digest-only WAL.
+        let (prepared_wal, target_authority) = if manifest_prepare_required {
             let target = {
                 let Ok(store) = self.lock_store("store_scrollback_line prepare first authority")
                 else {
@@ -10133,43 +10596,48 @@ impl LiveScrollbackSpillSink {
                 Ok(Some(manifest)) => manifest,
                 _ => return false,
             };
-            let (wal, target) = {
-                let Ok(store) = self.lock_store("store_scrollback_line prepare append WAL") else {
-                    return false;
-                };
-                match self.prepare_authenticated_append_wal(
-                    &predecessor_manifest,
-                    previous_state,
-                    proposed_state,
-                    ledger_pane_id,
-                    stable_row,
-                    desired_seq,
-                    max_retained_rows,
-                    &records,
-                    &store,
-                ) {
-                    Ok(prepared) => prepared,
-                    Err(_) => return false,
-                }
-            };
-            if let Err(error) = self.persist_prepared_append_wal(&wal) {
-                if error.outcome_indeterminate() {
-                    if let Ok(mut state) =
-                        self.lock_state("store_scrollback_line append WAL quarantine")
-                    {
-                        state.transaction_quarantined = true;
-                    }
-                }
+            let Ok(store) = self.lock_store("store_scrollback_line prepare append WAL") else {
                 return false;
+            };
+            match self.prepare_authenticated_append_wal(
+                &predecessor_manifest,
+                previous_state,
+                proposed_state,
+                ledger_pane_id,
+                stable_row,
+                desired_seq,
+                max_retained_rows,
+                &records,
+                &store,
+                AppendWalFormat::DigestOnly,
+            ) {
+                Ok((wal, target)) => (Some(wal), target),
+                Err(_) => return false,
             }
-            (Some(wal.wal), target)
         };
-        let Ok(mut state) = self.lock_state("store_scrollback_line publish proposed state") else {
-            return false;
+        // The retained WAL is checked against the ledger before this batch
+        // lands in it; publication then requires that same retained WAL.
+        let retained_wal_checksum = if prepared_wal.is_some() {
+            let checked = (|| -> anyhow::Result<Option<[u8; 32]>> {
+                let keyring = guardian_output_keys::GuardianOutputKeyring::historical_authority(
+                    &self.keyring,
+                )?;
+                self.verify_replaceable_active_append_wal(&keyring)
+            })();
+            let Ok(checksum) = checked else {
+                return false;
+            };
+            checksum
+        } else {
+            None
         };
-        *state = proposed_state;
-        drop(state);
         if manifest_prepare_required {
+            let Ok(mut state) = self.lock_state("store_scrollback_line publish proposed state")
+            else {
+                return false;
+            };
+            *state = proposed_state;
+            drop(state);
             if let Err(error) = self.persist_manifest("prepared") {
                 let Ok(mut state) = self.lock_state("store_scrollback_line prepare failure") else {
                     return false;
@@ -10183,11 +10651,7 @@ impl LiveScrollbackSpillSink {
             }
         }
 
-        #[cfg(test)]
-        if records.len() > 1 && self.fail_batch_at(1) {
-            return false;
-        }
-        let content_result = (|| -> anyhow::Result<()> {
+        let append_result = (|| -> anyhow::Result<()> {
             let mut store = self
                 .lock_store("store_scrollback_line append")
                 .map_err(anyhow::Error::new)?;
@@ -10203,7 +10667,59 @@ impl LiveScrollbackSpillSink {
                 appended_seq == desired_seq,
                 "scrollback append returned the wrong sequence"
             );
-
+            Ok(())
+        })();
+        if append_result.is_err() {
+            if let Ok(mut state) = self.lock_state("store_scrollback_line append quarantine") {
+                // A synchronized prepared manifest may already authorize
+                // recovery, and a failed sync leaves the ledger's tail
+                // uncertain until reopen settles it. Never roll back here.
+                state.transaction_quarantined = true;
+            }
+            return false;
+        }
+        #[cfg(test)]
+        if records.len() > 1 && self.fail_batch_at(1) {
+            return false;
+        }
+        let append_wal = if let Some(wal) = prepared_wal {
+            if let Err(error) = self.persist_prepared_append_wal(
+                &wal,
+                RetainedAppendWalCheck::VerifiedBeforeAppend(retained_wal_checksum),
+            ) {
+                // No WAL names the batch, so its rows were never
+                // acknowledged: cut them and the ledger is back at its
+                // manifest. A WAL that may be on disk keeps them for
+                // recovery to roll forward instead.
+                let cut = !error.outcome_indeterminate()
+                    && !self.append_wal_stage_may_name(&wal.wal)
+                    && self
+                        .lock_store("store_scrollback_line cut unauthorized batch")
+                        .is_ok_and(|mut store| {
+                            store.truncate_after(ledger_pane_id, desired_seq).is_ok()
+                        });
+                if !cut {
+                    if let Ok(mut state) =
+                        self.lock_state("store_scrollback_line append WAL quarantine")
+                    {
+                        state.transaction_quarantined = true;
+                    }
+                }
+                return false;
+            }
+            let Ok(mut state) = self.lock_state("store_scrollback_line publish proposed state")
+            else {
+                return false;
+            };
+            *state = proposed_state;
+            Some(wal.wal)
+        } else {
+            None
+        };
+        let content_result = (|| -> anyhow::Result<()> {
+            let mut store = self
+                .lock_store("store_scrollback_line retention")
+                .map_err(anyhow::Error::new)?;
             let retained = store.line_count(ledger_pane_id);
             if retained > max_retained_rows {
                 let oldest_seq = store.oldest_seq(ledger_pane_id).ok_or_else(|| {
@@ -13079,8 +13595,11 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3);
-        assert_eq!(wal.records().count(), lines.len());
+        // ft-yccm0.2.1.3: the batch WAL is digest-only (v4); it names the
+        // 64 rows by count and digest and the rows live once, in the ledger.
+        assert_eq!(wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4);
+        assert_eq!(wal.appended_record_count, Some(lines.len() as u64));
+        assert_eq!(wal.records().count(), 0);
         let manifest = LiveScrollbackSpillSink::read_manifest(&backing.manifest_path)
             .unwrap()
             .unwrap();
@@ -13098,7 +13617,13 @@ mod tests {
 
     #[test]
     fn deferred_scrollback_batch_failure_keeps_pending_rows_and_reopens_exactly() {
-        for (fault, persisted_prefix) in [(1, 0), (1, 1), (1, 2), (2, 3), (3, 3)] {
+        // ft-yccm0.2.1.3 moved the batch's rows ahead of its WAL. Fault 1
+        // now dies after the rows are synchronized and before the WAL exists;
+        // `persisted_prefix` is how many of the batch's rows that crash left
+        // on disk. No WAL names them, so reopen cuts them and the owner
+        // re-commits them. Faults 2 and 3 die after the digest-only WAL, so
+        // reopen rolls the batch forward from the ledger.
+        for (fault, persisted_prefix) in [(1, 0), (1, 1), (1, 2), (1, 3), (2, 3), (3, 3)] {
             let (dir, backing, deferred) = deferred_test_sink();
             let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
             assert!(deferred.store_scrollback_line(0, &prior, 16));
@@ -13128,18 +13653,20 @@ mod tests {
             let wal = LiveScrollbackSpillSink::read_append_wal(
                 &LiveScrollbackSpillSink::append_wal_path(&backing.manifest_path).unwrap(),
             )
-            .unwrap()
             .unwrap();
-            assert_eq!(wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3);
-            if fault == 1 && persisted_prefix != 0 {
-                // Retain a real synchronized prefix under the actual generated
-                // WAL, independently of the storage unit's partial-write hook.
-                let records: Vec<_> = wal.records().take(persisted_prefix).collect();
-                backing
+            if fault == 1 {
+                assert!(wal.is_none(), "the crash came before the batch's WAL");
+                // Keep the synchronized prefix that crash would have left.
+                let cut = backing
                     .lock_store("test partial batch cut")
                     .unwrap()
-                    .append_lines(backing.active_ledger_pane_id(), &records)
+                    .truncate_after(backing.active_ledger_pane_id(), 1 + persisted_prefix)
                     .unwrap();
+                assert_eq!(cut, persisted_prefix < 3);
+            } else {
+                let wal = wal.unwrap();
+                assert_eq!(wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4);
+                assert_eq!(wal.appended_record_count, Some(3));
             }
             let context = config::ScrollbackSpillSinkContext {
                 pane_id: 913,
@@ -13149,13 +13676,15 @@ mod tests {
             };
             let reopened =
                 LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context).unwrap();
-            assert_eq!(reopened.retained_scrollback_rows(), 4);
-            for (offset, expected) in std::iter::once(&prior).chain(lines.iter()).enumerate() {
-                let mut actual = reopened.load_scrollback_line(offset as isize).unwrap();
-                let mut expected = expected.clone();
-                actual.cells_mut();
-                expected.cells_mut();
-                assert_eq!(actual, expected);
+            if fault == 1 {
+                assert_eq!(
+                    reopened.retained_scrollback_rows(),
+                    1,
+                    "rows no WAL names are cut on reopen"
+                );
+                assert!(reopened.load_scrollback_line(1).is_none());
+            } else {
+                assert_eq!(reopened.retained_scrollback_rows(), 4);
             }
             // A lost receipt is retried only after authoritative reopen. Every
             // acknowledged prefix is exact and does not mint another revision.
@@ -13165,6 +13694,13 @@ mod tests {
                     reopened.store_scrollback_lines(1 + offset as isize, &lines[offset..], 16);
                 assert!(acknowledged > 0 && acknowledged <= lines.len() - offset);
                 offset += acknowledged;
+            }
+            for (offset, expected) in std::iter::once(&prior).chain(lines.iter()).enumerate() {
+                let mut actual = reopened.load_scrollback_line(offset as isize).unwrap();
+                let mut expected = expected.clone();
+                actual.cells_mut();
+                expected.cells_mut();
+                assert_eq!(actual, expected);
             }
             let manifest = LiveScrollbackSpillSink::read_manifest(&reopened.manifest_path)
                 .unwrap()
@@ -13329,7 +13865,9 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(wal.records().count(), 2);
+        // The digest-only WAL (ft-yccm0.2.1.3) names its batch by count;
+        // the bounds below are the same ones a carried batch had to meet.
+        assert_eq!(wal.appended_record_count, Some(2));
         assert_eq!(wal.target_oldest_sequence, 1);
         assert_eq!(wal.target_next_sequence, 3);
         assert_eq!(backing.retained_scrollback_rows(), 2);
@@ -13340,13 +13878,22 @@ mod tests {
                 .is_err()
         );
         let mut too_large = wal.clone();
-        too_large.additional_encrypted_records[0] =
-            "x".repeat(LIVE_SCROLLBACK_APPEND_MAX_RECORD_BYTES);
-        too_large.encrypted_record_bytes =
-            too_large.records().map(|record| record.len() as u64).sum();
+        too_large.encrypted_record_bytes = LIVE_SCROLLBACK_APPEND_MAX_RECORD_BYTES as u64 + 1;
         let error = LiveScrollbackSpillSink::validate_append_wal_identity(&too_large, [0xd3; 16])
             .unwrap_err();
         assert!(error.to_string().contains("encrypted-record length"));
+        let mut over_retention = wal.clone();
+        over_retention.appended_record_count = Some(3);
+        let error =
+            LiveScrollbackSpillSink::validate_append_wal_identity(&over_retention, [0xd3; 16])
+                .unwrap_err();
+        assert!(error.to_string().contains("batch row bounds"));
+        let mut carried = wal.clone();
+        carried.encrypted_record = "x".to_string();
+        assert!(
+            LiveScrollbackSpillSink::validate_append_wal_identity(&carried, [0xd3; 16]).is_err(),
+            "a digest-only WAL never carries a row"
+        );
         let context = config::ScrollbackSpillSinkContext {
             pane_id: 913,
             domain_id: 3,
@@ -13409,7 +13956,11 @@ mod tests {
                 .iter()
                 .map(|text| Line::from_text(text, &CellAttributes::blank(), 2, None))
                 .collect();
-            LIVE_SCROLLBACK_BATCH_FAULT.with(|setting| setting.set(1));
+            // Since ft-yccm0.2.1.3 the batch's rows precede its WAL, so the
+            // fault that leaves a published, unconsumed WAL is 2 (after the
+            // WAL and retention, before the manifest). The WAL is digest-only:
+            // reordering or dropping rows is a digest or count change.
+            LIVE_SCROLLBACK_BATCH_FAULT.with(|setting| setting.set(2));
             let acknowledged = backing.store_scrollback_lines(1, &lines, 16);
             LIVE_SCROLLBACK_BATCH_FAULT.with(|setting| setting.set(0));
             assert_eq!(acknowledged, 0);
@@ -13418,12 +13969,13 @@ mod tests {
             let mut wal = LiveScrollbackSpillSink::read_append_wal(&wal_path)
                 .unwrap()
                 .unwrap();
+            assert_eq!(wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4);
             match mutation {
                 0 => {
-                    wal.additional_encrypted_records.swap(0, 1);
+                    wal.encrypted_record_sha256 = "22".repeat(32);
                 }
                 1 => {
-                    wal.additional_encrypted_records.pop();
+                    wal.appended_record_count = Some(2);
                 }
                 2 => {
                     wal.predecessor_manifest_sha256 = "11".repeat(32);
@@ -13439,11 +13991,7 @@ mod tests {
             std::fs::write(&wal_path, serde_json::to_vec_pretty(&wal).unwrap()).unwrap();
             let content_path = backing.manifest_path.parent().unwrap().join("0.log");
             if mutation == 4 {
-                backing
-                    .lock_store("test exact partial batch before old-prefix tamper")
-                    .unwrap()
-                    .append_line(backing.active_ledger_pane_id(), &wal.encrypted_record)
-                    .unwrap();
+                // The exact batch is on disk; alter a row the manifest seals.
                 let mut content = std::fs::read(&content_path).unwrap();
                 let middle = content.iter().position(|byte| *byte == b'\n').unwrap() / 2;
                 content[middle] = if content[middle] == b'A' { b'B' } else { b'A' };
@@ -13463,6 +14011,309 @@ mod tests {
                 std::fs::read(&backing.manifest_path).unwrap(),
                 before_manifest
             );
+        }
+    }
+
+    fn deferred_test_context() -> config::ScrollbackSpillSinkContext {
+        config::ScrollbackSpillSinkContext {
+            pane_id: 913,
+            domain_id: 3,
+            durable_pane_id: [0xd3; 16],
+            command_description: "deferred-scrollback-test".to_string(),
+        }
+    }
+
+    fn digest_only_test_lines(prefix: &str, rows: usize) -> Vec<Line> {
+        (0..rows)
+            .map(|row| {
+                Line::from_text(
+                    &format!("{prefix}-{row:04} {}", "x".repeat(80)),
+                    &CellAttributes::blank(),
+                    2,
+                    None,
+                )
+            })
+            .collect()
+    }
+
+    /// ft-yccm0.2.1.3 AC1: the WAL names a batch by count and digest; every
+    /// row byte reaches disk once, in the ledger; the WAL's size does not grow
+    /// with the batch.
+    #[test]
+    fn digest_only_wal_names_a_batch_without_copying_it_and_rows_are_written_once() {
+        let (_dir, backing, _deferred) = deferred_test_sink();
+        let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+        assert!(backing.store_scrollback_line(0, &prior, 4096));
+        let log_path = backing.manifest_path.parent().unwrap().join("0.log");
+        let wal_path = LiveScrollbackSpillSink::append_wal_path(&backing.manifest_path).unwrap();
+        let ledger_pane_id = backing.active_ledger_pane_id();
+        let mut wal_sizes = Vec::new();
+        let mut next_row = 1_usize;
+        for batch_rows in [4_usize, 256] {
+            let lines = digest_only_test_lines("batch", batch_rows);
+            let log_before = std::fs::metadata(&log_path).unwrap().len();
+            assert_eq!(
+                backing.store_scrollback_lines(next_row as isize, &lines, 4096),
+                batch_rows
+            );
+            let records = backing
+                .lock_store("test digest-only batch rows")
+                .unwrap()
+                .lines_range(
+                    ledger_pane_id,
+                    next_row as u64..(next_row + batch_rows) as u64,
+                    batch_rows,
+                    64 * 1024 * 1024,
+                )
+                .unwrap();
+            assert_eq!(records.len(), batch_rows);
+            let record_bytes: u64 = records.iter().map(|record| record.len() as u64 + 1).sum();
+            assert_eq!(
+                std::fs::metadata(&log_path).unwrap().len() - log_before,
+                record_bytes,
+                "each row is written to the ledger exactly once"
+            );
+            let wal_text = std::fs::read_to_string(&wal_path).unwrap();
+            let wal = LiveScrollbackSpillSink::read_append_wal(&wal_path)
+                .unwrap()
+                .unwrap();
+            assert_eq!(wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4);
+            assert_eq!(wal.appended_record_count, Some(batch_rows as u64));
+            assert_eq!(wal.encrypted_record_bytes + batch_rows as u64, record_bytes);
+            assert!(
+                records
+                    .iter()
+                    .all(|record| !wal_text.contains(record.as_str())),
+                "the WAL holds no row"
+            );
+            wal_sizes.push(wal_text.len());
+            next_row += batch_rows;
+        }
+        // 64x the rows changes only the WAL's numbers, never its size class.
+        assert!(wal_sizes[1] <= wal_sizes[0] + 32, "{wal_sizes:?}");
+        assert!(wal_sizes[1] < 4096, "{wal_sizes:?}");
+    }
+
+    /// A crash after the batch's WAL stage is complete but before it is
+    /// renamed: the rows are kept, and reopen finishes the publication and
+    /// rolls the batch forward from the ledger.
+    #[test]
+    fn digest_only_wal_publication_cut_short_after_a_complete_stage_rolls_forward_on_reopen() {
+        let (dir, backing, _deferred) = deferred_test_sink();
+        let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+        assert!(backing.store_scrollback_line(0, &prior, 16));
+        let first = digest_only_test_lines("first", 2);
+        assert_eq!(backing.store_scrollback_lines(1, &first, 16), 2);
+        let consumed = LiveScrollbackSpillSink::read_append_wal(
+            &LiveScrollbackSpillSink::append_wal_path(&backing.manifest_path).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let lines = digest_only_test_lines("second", 2);
+        // The stage gains a trailing byte after its sync: still the same
+        // complete WAL, but publication's exact readback refuses it.
+        LIVE_SCROLLBACK_WAL_READBACK_FAULT.with(|fault| fault.set(1));
+        let acknowledged = backing.store_scrollback_lines(3, &lines, 16);
+        LIVE_SCROLLBACK_WAL_READBACK_FAULT.with(|fault| fault.set(0));
+        assert_eq!(acknowledged, 0);
+        assert!(
+            backing
+                .lock_state("test stage-kept quarantine")
+                .unwrap()
+                .transaction_quarantined,
+            "rows a complete stage names are kept for recovery"
+        );
+        let ledger_pane_id = backing.active_ledger_pane_id();
+        assert_eq!(
+            backing
+                .lock_store("test stage-kept rows")
+                .unwrap()
+                .next_seq(ledger_pane_id)
+                .unwrap(),
+            5
+        );
+        let stage_path =
+            LiveScrollbackSpillSink::append_wal_stage_path(&backing.manifest_path).unwrap();
+        let staged = LiveScrollbackSpillSink::read_append_wal(&stage_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(staged.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4);
+        assert_ne!(staged, consumed);
+
+        let reopened =
+            LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                .unwrap();
+        assert!(!stage_path.exists(), "the interrupted stage was published");
+        assert_eq!(
+            LiveScrollbackSpillSink::read_append_wal(
+                &LiveScrollbackSpillSink::append_wal_path(&reopened.manifest_path).unwrap()
+            )
+            .unwrap(),
+            Some(staged.clone())
+        );
+        assert_eq!(reopened.retained_scrollback_rows(), 5);
+        for (offset, expected) in std::iter::once(&prior)
+            .chain(first.iter())
+            .chain(lines.iter())
+            .enumerate()
+        {
+            let mut actual = reopened.load_scrollback_line(offset as isize).unwrap();
+            let mut expected = expected.clone();
+            actual.cells_mut();
+            expected.cells_mut();
+            assert_eq!(actual, expected);
+        }
+        let manifest = LiveScrollbackSpillSink::read_manifest(&reopened.manifest_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.next_seq, 5);
+        assert_eq!(manifest.revision, Some(staged.target_revision));
+    }
+
+    /// Publication refused before this batch's stage was written: no WAL can
+    /// name the batch, so its rows are cut at once and the sink stays usable.
+    #[test]
+    fn digest_only_wal_publication_refused_before_its_stage_cuts_the_unnamed_rows() {
+        let (_dir, backing, _deferred) = deferred_test_sink();
+        let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+        assert!(backing.store_scrollback_line(0, &prior, 16));
+        assert_eq!(
+            backing.store_scrollback_lines(1, &digest_only_test_lines("first", 2), 16),
+            2
+        );
+        let wal_path = LiveScrollbackSpillSink::append_wal_path(&backing.manifest_path).unwrap();
+        let stage_path =
+            LiveScrollbackSpillSink::append_wal_stage_path(&backing.manifest_path).unwrap();
+        // Another transaction's complete stage makes publication refuse.
+        std::fs::copy(&wal_path, stage_path).unwrap();
+        let log_path = backing.manifest_path.parent().unwrap().join("0.log");
+        let log_before = std::fs::read(&log_path).unwrap();
+        let manifest_before = std::fs::read(&backing.manifest_path).unwrap();
+        let wal_before = std::fs::read(&wal_path).unwrap();
+
+        assert_eq!(
+            backing.store_scrollback_lines(3, &digest_only_test_lines("second", 2), 16),
+            0
+        );
+        assert!(
+            !backing
+                .lock_state("test cut without quarantine")
+                .unwrap()
+                .transaction_quarantined
+        );
+        assert_eq!(
+            std::fs::read(&log_path).unwrap(),
+            log_before,
+            "the unnamed rows were cut"
+        );
+        assert_eq!(
+            std::fs::read(&backing.manifest_path).unwrap(),
+            manifest_before
+        );
+        assert_eq!(std::fs::read(&wal_path).unwrap(), wal_before);
+        assert_eq!(backing.retained_scrollback_rows(), 3);
+        assert!(backing.load_scrollback_line(3).is_none());
+    }
+
+    /// A published digest-only WAL whose batch is torn or missing in the
+    /// ledger cannot be rolled forward or back: reopen refuses and writes
+    /// nothing.
+    #[test]
+    fn digest_only_wal_recovery_refuses_a_torn_or_missing_batch_without_writing() {
+        for damage in ["torn", "missing"] {
+            let (dir, backing, _deferred) = deferred_test_sink();
+            let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+            assert!(backing.store_scrollback_line(0, &prior, 16));
+            LIVE_SCROLLBACK_BATCH_FAULT.with(|setting| setting.set(2));
+            let acknowledged =
+                backing.store_scrollback_lines(1, &digest_only_test_lines("batch", 3), 16);
+            LIVE_SCROLLBACK_BATCH_FAULT.with(|setting| setting.set(0));
+            assert_eq!(acknowledged, 0);
+            let log_path = backing.manifest_path.parent().unwrap().join("0.log");
+            let mut content = std::fs::read(&log_path).unwrap();
+            let last_start = content[..content.len() - 1]
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .unwrap()
+                + 1;
+            if damage == "torn" {
+                let middle = last_start + (content.len() - last_start) / 2;
+                content[middle] = if content[middle] == b'A' { b'B' } else { b'A' };
+            } else {
+                content.truncate(last_start);
+            }
+            std::fs::write(&log_path, &content).unwrap();
+            let manifest_before = std::fs::read(&backing.manifest_path).unwrap();
+            let error =
+                LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                    .err()
+                    .unwrap_or_else(|| panic!("{damage}: a damaged batch must refuse"));
+            assert!(
+                format!("{error:#}").contains("digest-only append WAL")
+                    || format!("{error:#}").contains("batch their append WAL names"),
+                "{damage}: {error:#}"
+            );
+            assert_eq!(std::fs::read(&log_path).unwrap(), content, "{damage}");
+            assert_eq!(
+                std::fs::read(&backing.manifest_path).unwrap(),
+                manifest_before,
+                "{damage}"
+            );
+        }
+    }
+
+    /// Rows past the manifest that no WAL names are cut on reopen, after the
+    /// consumed active WAL is authenticated, and only over a retained prefix
+    /// that is exactly the manifest's; a changed prefix refuses and cuts
+    /// nothing.
+    #[test]
+    fn rows_past_the_manifest_that_no_wal_names_are_cut_only_over_an_intact_prefix() {
+        for tamper_prefix in [false, true] {
+            let (dir, backing, _deferred) = deferred_test_sink();
+            let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+            assert!(backing.store_scrollback_line(0, &prior, 16));
+            let first = digest_only_test_lines("first", 2);
+            assert_eq!(backing.store_scrollback_lines(1, &first, 16), 2);
+            let log_path = backing.manifest_path.parent().unwrap().join("0.log");
+            let committed_len = std::fs::metadata(&log_path).unwrap().len();
+            LIVE_SCROLLBACK_BATCH_FAULT.with(|setting| setting.set(1));
+            let acknowledged =
+                backing.store_scrollback_lines(3, &digest_only_test_lines("second", 3), 16);
+            LIVE_SCROLLBACK_BATCH_FAULT.with(|setting| setting.set(0));
+            assert_eq!(acknowledged, 0);
+            assert!(std::fs::metadata(&log_path).unwrap().len() > committed_len);
+            if tamper_prefix {
+                let mut content = std::fs::read(&log_path).unwrap();
+                let middle = content.iter().position(|byte| *byte == b'\n').unwrap() / 2;
+                content[middle] = if content[middle] == b'A' { b'B' } else { b'A' };
+                std::fs::write(&log_path, content).unwrap();
+            }
+            let content_before = std::fs::read(&log_path).unwrap();
+            let reopened =
+                LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context());
+            if tamper_prefix {
+                assert!(reopened.is_err());
+                assert_eq!(
+                    std::fs::read(&log_path).unwrap(),
+                    content_before,
+                    "a changed prefix is never cut over"
+                );
+                continue;
+            }
+            let reopened = reopened.unwrap();
+            assert_eq!(std::fs::metadata(&log_path).unwrap().len(), committed_len);
+            assert_eq!(reopened.retained_scrollback_rows(), 3);
+            assert!(reopened.load_scrollback_line(3).is_none());
+            for (offset, expected) in std::iter::once(&prior).chain(first.iter()).enumerate() {
+                let mut actual = reopened.load_scrollback_line(offset as isize).unwrap();
+                let mut expected = expected.clone();
+                actual.cells_mut();
+                expected.cells_mut();
+                assert_eq!(actual, expected);
+            }
+            let again = digest_only_test_lines("again", 2);
+            assert_eq!(reopened.store_scrollback_lines(3, &again, 16), 2);
+            assert_eq!(reopened.retained_scrollback_rows(), 5);
         }
     }
 
@@ -14629,6 +15480,11 @@ mod tests {
         Mux::shutdown();
     }
 
+    // These fixtures build the pre-v4 append WAL that carries its rows (v2
+    // for one row, v3 for a batch): crash fixtures that publish a WAL without
+    // its rows prove this binary still recovers WALs older binaries left.
+    // The digest-only v4 WAL this binary writes is covered by the
+    // digest_only_* tests.
     fn prepare_later_row_append_wal_for_test(
         sink: &LiveScrollbackSpillSink,
         stable_row: wezterm_term::StableRowIndex,
@@ -14725,6 +15581,7 @@ mod tests {
                 max_retained_rows,
                 &records,
                 &store,
+                AppendWalFormat::CarriedRows,
             )
             .expect("prepare authenticated test append WAL");
         proposed_state.verified_ledger = Some(target_authority);
@@ -14932,9 +15789,11 @@ mod tests {
             &LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path)
                 .expect("derive measured append WAL path"),
         )
-        .expect("read measured v2 append WAL")
-        .expect("measured v2 append WAL exists");
-        assert_eq!(wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2);
+        .expect("read measured append WAL")
+        .expect("measured append WAL exists");
+        // A single later row is a one-row digest-only batch (ft-yccm0.2.1.3).
+        assert_eq!(wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4);
+        assert_eq!(wal.appended_record_count, Some(1));
         (
             reads,
             LIVE_SCROLLBACK_EVICTION_RANGE_READS.with(std::cell::Cell::get),
@@ -15401,8 +16260,10 @@ mod tests {
     #[test]
     fn append_wal_construction_proof_cannot_authorize_copied_or_tampered_wal() {
         let (_dir, _context, sink, wal, _line) = append_wal_fixture(196, 8);
+        let records: Vec<String> = wal.records().map(str::to_string).collect();
         let proof = AppendWalConstructionProof {
             wal: &wal,
+            records: &records,
             record_digest: wal.records_digest().unwrap(),
             chain_tail: decode_live_scrollback_canonical_digest(
                 wal.target_chain_tail_sha256.as_deref().unwrap(),
@@ -15469,7 +16330,8 @@ mod tests {
         let identities = LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get);
         let checksums = LIVE_SCROLLBACK_WAL_CHECKSUMS.with(std::cell::Cell::get);
         let decodes = LIVE_SCROLLBACK_WAL_DECODES.with(std::cell::Cell::get);
-        sink.persist_prepared_append_wal(&prepared).unwrap();
+        sink.persist_prepared_append_wal(&prepared, RetainedAppendWalCheck::Live)
+            .unwrap();
         assert_eq!(
             LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get),
             identities
@@ -15523,7 +16385,7 @@ mod tests {
             let (_dir, _context, sink, _wal, line) = append_wal_fixture(189 + point, 8);
             let (prepared, _) = prepare_later_row_owned_append_wal_for_test(&sink, 11, &line, 8);
             LIVE_SCROLLBACK_WAL_READBACK_FAULT.with(|fault| fault.set(point));
-            let result = sink.persist_prepared_append_wal(&prepared);
+            let result = sink.persist_prepared_append_wal(&prepared, RetainedAppendWalCheck::Live);
             LIVE_SCROLLBACK_WAL_READBACK_FAULT.with(|fault| fault.set(0));
             let error = result.unwrap_err();
             assert_eq!(error.outcome_indeterminate(), point == 2);
@@ -15559,7 +16421,8 @@ mod tests {
         write_private_stage_fixture(&stage, &compact);
         let checksums = LIVE_SCROLLBACK_WAL_CHECKSUMS.with(std::cell::Cell::get);
         let decodes = LIVE_SCROLLBACK_WAL_DECODES.with(std::cell::Cell::get);
-        sink.persist_prepared_append_wal(&prepared).unwrap();
+        sink.persist_prepared_append_wal(&prepared, RetainedAppendWalCheck::Live)
+            .unwrap();
         assert_eq!(
             LIVE_SCROLLBACK_WAL_CHECKSUMS.with(std::cell::Cell::get),
             checksums + 3
@@ -15624,7 +16487,9 @@ mod tests {
         let (prepared, _) = prepare_later_row_owned_append_wal_for_test(&sink, 11, &line, 8);
         let other_dir = tempfile::tempdir().unwrap();
         let other = LiveScrollbackSpillSink::new(other_dir.path().to_path_buf(), &context).unwrap();
-        let error = other.persist_prepared_append_wal(&prepared).unwrap_err();
+        let error = other
+            .persist_prepared_append_wal(&prepared, RetainedAppendWalCheck::Live)
+            .unwrap_err();
         assert!(!error.outcome_indeterminate());
         assert!(format!("{:#}", error.source).contains("another sink"));
         assert!(
@@ -15638,7 +16503,9 @@ mod tests {
         seal_append_wal_fixture(&sink, &mut occupied);
         let stage = LiveScrollbackSpillSink::append_wal_stage_path(&sink.manifest_path).unwrap();
         write_complete_append_wal_fixture(&stage, &occupied);
-        let error = sink.persist_prepared_append_wal(&prepared).unwrap_err();
+        let error = sink
+            .persist_prepared_append_wal(&prepared, RetainedAppendWalCheck::Live)
+            .unwrap_err();
         assert!(!error.outcome_indeterminate());
         assert_eq!(
             LiveScrollbackSpillSink::read_append_wal(&stage).unwrap(),
@@ -15656,7 +16523,9 @@ mod tests {
             let mut other_keys = other.keyring.lock().unwrap();
             std::mem::swap(&mut *keys, &mut *other_keys);
         }
-        let error = sink.persist_prepared_append_wal(&prepared).unwrap_err();
+        let error = sink
+            .persist_prepared_append_wal(&prepared, RetainedAppendWalCheck::Live)
+            .unwrap_err();
         assert!(!error.outcome_indeterminate());
         assert!(format!("{:#}", error.source).contains("append WAL guardian key"));
         let active = LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path).unwrap();
@@ -15675,7 +16544,9 @@ mod tests {
             panic!("test prepared publication cache poison");
         }));
         assert!(poison.is_err());
-        let error = sink.persist_prepared_append_wal(&prepared).unwrap_err();
+        let error = sink
+            .persist_prepared_append_wal(&prepared, RetainedAppendWalCheck::Live)
+            .unwrap_err();
         assert!(error.outcome_indeterminate());
         assert_eq!(
             LiveScrollbackSpillSink::read_append_wal(&active).unwrap(),
@@ -17242,18 +18113,19 @@ mod tests {
                 second_reopen.store_scrollback_line(12, &successor, 1),
                 "a recovered v1 WAL must not strand later append authority"
             );
+            // This binary's successor WAL is digest-only (ft-yccm0.2.1.3).
             let successor_wal = LiveScrollbackSpillSink::read_append_wal(&wal_path)
-                .expect("read successor v2 WAL")
-                .expect("successor v2 WAL exists");
-            assert_eq!(successor_wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2);
+                .expect("read successor v4 WAL")
+                .expect("successor v4 WAL exists");
+            assert_eq!(successor_wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4);
             drop(second_reopen);
 
             let third_reopen = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
-                .expect("reopen after replacing legacy v1 WAL with v2");
+                .expect("reopen after replacing legacy v1 WAL with v4");
             assert_eq!(
                 third_reopen
                     .load_scrollback_line(12)
-                    .expect("v2 successor survives cold reopen")
+                    .expect("v4 successor survives cold reopen")
                     .as_str()
                     .as_ref(),
                 successor.as_str().as_ref()
@@ -18127,6 +18999,19 @@ mod tests {
             "batch-ciphertext-row-3-base64-payload".to_string(),
         ];
         assert_append_wal_borrowed_and_legacy_equivalence(&v3_wal, "Variant 3 (V3 batch)");
+
+        // Variant 3b: digest-only V4 batch: a row count and no rows
+        let mut v4_wal = v2_wal.clone();
+        v4_wal.schema = LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4.to_string();
+        v4_wal.appended_record_count = Some(3);
+        v4_wal.encrypted_record.clear();
+        assert_append_wal_borrowed_and_legacy_equivalence(&v4_wal, "Variant 3b (V4 digest-only)");
+        assert!(
+            serde_json::to_string(&v4_wal.authentication_view())
+                .unwrap()
+                .contains("\"appended_record_count\":3"),
+            "the guardian MAC binds the row count"
+        );
 
         // Variant 4: Metadata variants (None vs Some for optional fields, supersession, eviction)
         let mut modified = v2_wal.clone();
