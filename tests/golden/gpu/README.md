@@ -45,6 +45,33 @@ tests/golden/gpu/<fixture-name>/
   need macOS with a display, and run only when named or when
   `FT_GPU_HARNESS_REAL_RENDERER=1` is set.
 
+Some state cannot come from scene bytes. `input.scene.snapshot` asks the
+GUI's snapshot hook to set it up first:
+
+- `"focus": true` renders the window as focused. Only the window's own
+  focus state changes, so the run still never takes keyboard focus. The
+  `cursor-*-focused` scenes show the focused block, underline and bar; the
+  plain `cursor-*` scenes keep the unfocused hollow block.
+- `"selection": [r0, c0, r1, c1]` selects visible cells from row `r0`,
+  column `c0` through row `r1`, column `c1`, inclusive (`selection`).
+- `"split": {"direction": "right" | "bottom", "text": "..."}` splits the
+  pane once the scene's bytes are shown; the new pane plays `text`
+  (`split-right`, `split-bottom`).
+
+Configuration strings may name committed fixtures as `${FIXTURES}/<file>`,
+which resolves to `tests/golden/gpu/real/fixtures/` (`background-image` uses
+`background-checker.png`).
+
+A fixture with `"parity_golden": "real/<other>"` is compared against that
+other fixture's golden and never pins one of its own, so `--update-goldens`
+cannot bless one backend's output as parity with itself. The other fixture
+must sort first. `parity-backgrounds-metal` renders the backgrounds-only
+`parity-backgrounds` scene with `front_end = "Metal"`: the Metal background
+pass (ft-yccm0.4.2.2), read back by the Metal snapshot hook, against the
+WebGpu golden. `metal-focus-selection` pins the Metal hook's own output
+(backgrounds, selection and a focused cursor; no glyphs until the CellText
+pass, ft-yccm0.4.2.3).
+
 Real-renderer corpus commands (macOS, native; the GUI cannot build on the
 Linux workers):
 

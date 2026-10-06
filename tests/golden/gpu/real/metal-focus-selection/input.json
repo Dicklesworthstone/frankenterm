@@ -1,0 +1,18 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "\u001b[48;5;22m green \u001b[0m default \u001b[48;5;94m brown \u001b[0m\nsecond row\nthird\u001b[2 q\u001b[2;3H",
+    "config": {
+      "front_end": "Metal"
+    },
+    "snapshot": {
+      "focus": true,
+      "selection": [
+        0,
+        2,
+        1,
+        5
+      ]
+    }
+  }
+}

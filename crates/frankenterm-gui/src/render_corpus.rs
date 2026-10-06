@@ -13,7 +13,14 @@
 //! publish itself as, the operator's mux, and `--always-new-process` keeps it
 //! out of any running GUI. It runs non-activating
 //! (`FRANKENTERM_NATIVE_E2E_NONACTIVATING=1`), so it never takes keyboard
-//! focus and its window is always rendered in the unfocused state.
+//! focus; its window renders unfocused unless the scene asks the snapshot
+//! hook to render it focused ([`SceneActions::focus`], which changes only the
+//! window's own focus state).
+//!
+//! [`SceneActions`] also covers the state bytes cannot create: a selection,
+//! and a split whose second pane plays its own bytes. String config values
+//! and `extra_toml` may name committed fixtures as `${FIXTURES}/<file>`
+//! ([`FIXTURES_DIR`]).
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -25,6 +32,14 @@ use std::time::{Duration, Instant};
 
 /// The title a scene sets last; the GUI snapshots the next presented frame.
 pub const SNAPSHOT_TITLE: &str = "ft-render-snapshot";
+/// The title that makes the GUI perform a scene's split (the GUI's
+/// `render_snapshot::SPLIT_TITLE`).
+pub const SPLIT_TITLE: &str = "ft-render-split";
+/// Committed fixture files scenes refer to as `${FIXTURES}`, relative to the
+/// repository root.
+pub const FIXTURES_DIR: &str = "tests/golden/gpu/real/fixtures";
+/// The placeholder for [`FIXTURES_DIR`] in scene configuration.
+pub const FIXTURES_PLACEHOLDER: &str = "${FIXTURES}";
 /// Bundled fonts, relative to the repository root.
 pub const BUNDLED_FONTS_DIR: &str = "frankenterm/assets/fonts";
 /// The pinned font files the base configuration resolves glyphs from.
@@ -80,6 +95,93 @@ pub struct SceneSpec {
     /// such as `[window_background_gradient]`.
     #[serde(default)]
     pub extra_toml: Option<String>,
+    /// Window state the snapshot hook sets up first.
+    #[serde(default, skip_serializing_if = "SceneActions::is_empty")]
+    pub snapshot: SceneActions,
+}
+
+/// Window state a scene's bytes cannot create, set up by the GUI's snapshot
+/// hook (its `FRANKENTERM_RENDER_SNAPSHOT_*` variables).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SceneActions {
+    /// Render the window as focused (focused cursor shapes).
+    #[serde(default)]
+    pub focus: bool,
+    /// `[start_row, start_col, end_row, end_col]` in visible cells, inclusive.
+    #[serde(default)]
+    pub selection: Option<[u32; 4]>,
+    /// Split the pane once the scene's bytes are shown.
+    #[serde(default)]
+    pub split: Option<SceneSplit>,
+}
+
+impl SceneActions {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// A split: the new pane goes `right` or `bottom` and plays `text`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SceneSplit {
+    pub direction: String,
+    pub text: String,
+}
+
+/// The snapshot-hook variables for `actions`. `split_scene` is the file the
+/// split pane plays.
+pub fn snapshot_action_env(
+    actions: &SceneActions,
+    split_scene: &Path,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let mut env = Vec::new();
+    if actions.focus {
+        env.push((
+            "FRANKENTERM_RENDER_SNAPSHOT_FOCUS".to_string(),
+            "1".to_string(),
+        ));
+    }
+    if let Some([start_row, start_col, end_row, end_col]) = actions.selection {
+        anyhow::ensure!(
+            (end_row, end_col) >= (start_row, start_col),
+            "the scene selection ends before it starts"
+        );
+        env.push((
+            "FRANKENTERM_RENDER_SNAPSHOT_SELECTION".to_string(),
+            format!("{start_row},{start_col},{end_row},{end_col}"),
+        ));
+    }
+    if let Some(split) = &actions.split {
+        anyhow::ensure!(
+            matches!(split.direction.as_str(), "right" | "bottom"),
+            "split direction {:?} is not right or bottom",
+            split.direction
+        );
+        let path = split_scene.display().to_string();
+        anyhow::ensure!(
+            !path.contains('\''),
+            "the split scene path {path:?} contains a single quote"
+        );
+        env.push((
+            "FRANKENTERM_RENDER_SNAPSHOT_SPLIT".to_string(),
+            split.direction.clone(),
+        ));
+        env.push((
+            "FRANKENTERM_RENDER_SNAPSHOT_SPLIT_COMMAND".to_string(),
+            format!("cat '{path}'; printf '\\033]2;{SNAPSHOT_TITLE}\\007'; exec sleep 600"),
+        ));
+    }
+    Ok(env)
+}
+
+/// Replaces [`FIXTURES_PLACEHOLDER`] in generated TOML with `fixtures_dir`.
+pub fn substitute_fixtures(toml: &str, fixtures_dir: &Path) -> anyhow::Result<String> {
+    let dir = fixtures_dir.display().to_string();
+    anyhow::ensure!(
+        !dir.contains(['"', '\\']),
+        "the fixtures directory {dir:?} cannot appear in a TOML string"
+    );
+    Ok(toml.replace(FIXTURES_PLACEHOLDER, &dir))
 }
 
 /// The base font stack: JetBrains Mono without ligatures, then emoji, Nerd
@@ -296,17 +398,31 @@ pub fn render_scene_snapshot(
     let config_path = work_dir.join("frankenterm.toml");
     std::fs::write(
         &config_path,
-        scene_config_toml(&repo_root.join(BUNDLED_FONTS_DIR), scene)?,
+        substitute_fixtures(
+            &scene_config_toml(&repo_root.join(BUNDLED_FONTS_DIR), scene)?,
+            &repo_root.join(FIXTURES_DIR),
+        )?,
     )?;
     let scene_path = work_dir.join("scene.bin");
     std::fs::write(&scene_path, scene.text.as_bytes())?;
+    let split_path = work_dir.join("split-scene.bin");
+    if let Some(split) = &scene.snapshot.split {
+        std::fs::write(&split_path, split.text.as_bytes())?;
+    }
+    let action_env = snapshot_action_env(&scene.snapshot, &split_path)?;
     let snapshot_path = work_dir.join("snapshot.png");
     let _ = std::fs::remove_file(&snapshot_path);
     let log_path = work_dir.join("gui.log");
     let log = std::fs::File::create(&log_path)?;
 
-    // The scene, then the sentinel title; then stay alive until killed.
-    let script = format!("cat \"$1\"; printf '\\033]2;{SNAPSHOT_TITLE}\\007'; exec sleep 600");
+    // The scene, then the sentinel title (or, for a split scene, the split
+    // title; the split pane sets the sentinel); then stay alive until killed.
+    let first_title = if scene.snapshot.split.is_some() {
+        SPLIT_TITLE
+    } else {
+        SNAPSHOT_TITLE
+    };
+    let script = format!("cat \"$1\"; printf '\\033]2;{first_title}\\007'; exec sleep 600");
     let mut command = Command::new(gui_bin);
     command
         .arg("--config-file")
@@ -338,6 +454,7 @@ pub fn render_scene_snapshot(
         // cannot take keyboard focus from the operator, and every snapshot
         // sees the same (unfocused) window state.
         .env("FRANKENTERM_NATIVE_E2E_NONACTIVATING", "1")
+        .envs(action_env)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
@@ -504,6 +621,99 @@ mod tests {
             parsed.default_cwd.as_deref(),
             Some(Path::new("a \"quoted\" \\ path"))
         );
+    }
+
+    #[test]
+    fn scene_actions_become_snapshot_hook_variables() {
+        let split_scene = Path::new("/work/split-scene.bin");
+        assert!(
+            snapshot_action_env(&SceneActions::default(), split_scene)
+                .unwrap()
+                .is_empty()
+        );
+        let actions = SceneActions {
+            focus: true,
+            selection: Some([1, 2, 3, 4]),
+            split: Some(SceneSplit {
+                direction: "right".to_string(),
+                text: "second".to_string(),
+            }),
+        };
+        let env: BTreeMap<String, String> = snapshot_action_env(&actions, split_scene)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(env["FRANKENTERM_RENDER_SNAPSHOT_FOCUS"], "1");
+        assert_eq!(env["FRANKENTERM_RENDER_SNAPSHOT_SELECTION"], "1,2,3,4");
+        assert_eq!(env["FRANKENTERM_RENDER_SNAPSHOT_SPLIT"], "right");
+        assert_eq!(
+            env["FRANKENTERM_RENDER_SNAPSHOT_SPLIT_COMMAND"],
+            "cat '/work/split-scene.bin'; printf '\\033]2;ft-render-snapshot\\007'; exec sleep 600"
+        );
+    }
+
+    #[test]
+    fn malformed_scene_actions_are_refused() {
+        let split_scene = Path::new("/work/split-scene.bin");
+        let backwards = SceneActions {
+            selection: Some([3, 0, 1, 0]),
+            ..SceneActions::default()
+        };
+        assert!(snapshot_action_env(&backwards, split_scene).is_err());
+        let sideways = SceneActions {
+            split: Some(SceneSplit {
+                direction: "left".to_string(),
+                text: String::new(),
+            }),
+            ..SceneActions::default()
+        };
+        assert!(snapshot_action_env(&sideways, split_scene).is_err());
+        let split = SceneActions {
+            split: Some(SceneSplit {
+                direction: "bottom".to_string(),
+                text: String::new(),
+            }),
+            ..SceneActions::default()
+        };
+        assert!(snapshot_action_env(&split, Path::new("/it's/here")).is_err());
+    }
+
+    #[test]
+    fn fixture_paths_are_substituted_into_valid_config() {
+        let scene = SceneSpec {
+            config: BTreeMap::from([(
+                "window_background_image".to_string(),
+                serde_json::json!("${FIXTURES}/background-checker.png"),
+            )]),
+            ..SceneSpec::default()
+        };
+        let toml = substitute_fixtures(
+            &scene_config_toml(Path::new("/f"), &scene).unwrap(),
+            Path::new("/repo/tests/golden/gpu/real/fixtures"),
+        )
+        .unwrap();
+        assert!(!toml.contains(FIXTURES_PLACEHOLDER));
+        let config = parse(&toml);
+        assert_eq!(
+            config.window_background_image,
+            Some(PathBuf::from(
+                "/repo/tests/golden/gpu/real/fixtures/background-checker.png"
+            ))
+        );
+        assert!(substitute_fixtures("x", Path::new("/a\"b")).is_err());
+    }
+
+    #[test]
+    fn scene_actions_round_trip_and_stay_out_of_plain_scenes() {
+        let plain = serde_json::to_value(SceneSpec::default()).unwrap();
+        assert!(plain.get("snapshot").is_none(), "{plain}");
+        let scene: SceneSpec = serde_json::from_value(serde_json::json!({
+            "text": "x",
+            "snapshot": {"focus": true, "split": {"direction": "bottom", "text": "y"}}
+        }))
+        .unwrap();
+        assert!(scene.snapshot.focus);
+        assert_eq!(scene.snapshot.split.unwrap().text, "y");
     }
 
     #[test]

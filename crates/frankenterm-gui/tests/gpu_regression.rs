@@ -102,6 +102,13 @@ struct InputSpec {
     /// `gui_snapshot` fixtures: the scene played into the real GUI.
     #[serde(default)]
     scene: Option<SceneSpec>,
+    /// `gui_snapshot` fixtures: compare against this other fixture's golden
+    /// (cross-backend parity, such as Metal against WebGpu on one scene).
+    /// Such a fixture never pins a golden of its own, so `--update-goldens`
+    /// cannot bless one backend's output as parity with itself. The named
+    /// fixture must sort before this one so an update pins it first.
+    #[serde(default)]
+    parity_golden: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -819,7 +826,9 @@ fn run_fixtures(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         let actual = render_outcome.image;
 
         if args.update_goldens {
-            write_png_deterministic(&fixture.dir.join("golden.png"), &actual)?;
+            if fixture.input.parity_golden.is_none() {
+                write_png_deterministic(&fixture.dir.join("golden.png"), &actual)?;
+            }
             if fixture.input.kind == InputKind::GuiSnapshot {
                 write_gui_snapshot_meta(
                     &fixture,
@@ -829,7 +838,7 @@ fn run_fixtures(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let golden = load_png_rgba8(&fixture.dir.join("golden.png"))?;
+        let golden = load_png_rgba8(&golden_path(&root, &fixture)?)?;
         let compare_start = Instant::now();
         let comparison = compare_images(&actual, &golden, fixture.meta.thresholds)?;
         let compare_ms = compare_start.elapsed().as_millis();
@@ -1269,6 +1278,27 @@ const GUI_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Renders a `gui_snapshot` fixture through the real `frankenterm-gui`
 /// binary (`FT_GPU_HARNESS_GUI_BIN` overrides the Cargo-built one).
+/// The golden a fixture is compared against: its own, or the
+/// `parity_golden` fixture's.
+fn golden_path(root: &Path, fixture: &Fixture) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    match &fixture.input.parity_golden {
+        None => Ok(fixture.dir.join("golden.png")),
+        Some(name) => {
+            if name.split('/').any(|part| part.is_empty() || part == "..") {
+                return Err(format!("`{}`: bad parity_golden {name:?}", fixture.name).into());
+            }
+            if name.as_str() >= fixture.name.as_str() {
+                return Err(format!(
+                    "`{}`: parity_golden {name:?} must sort before it",
+                    fixture.name
+                )
+                .into());
+            }
+            Ok(root.join(name).join("golden.png"))
+        }
+    }
+}
+
 fn render_gui_snapshot_fixture(
     fixture: &Fixture,
 ) -> Result<RenderOutcome, Box<dyn std::error::Error>> {

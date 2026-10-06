@@ -3,7 +3,9 @@
 
 use crate::cell_bg::{BackgroundUniforms, CellBgGrid};
 use crate::frame::{FrameUniforms, GridExtent, SlotBuffer};
-use crate::macos_frames::{BackgroundPipeline, FrameSlots, Submission, supports_metal4};
+use crate::macos_frames::{
+    BackgroundPipeline, FrameSlots, OffscreenCells, Submission, supports_metal4,
+};
 use crate::{
     ClearColor, DeviceCapabilities, FRAME_SLOT_TIMEOUT, FrameError, FrameOutcome, FrameStats,
     MAX_TEXTURE_EXTENT, MetalUnavailable, SUBMISSION_ENV, SubmissionPath, appkit_view,
@@ -374,6 +376,33 @@ impl MetalRenderer {
             cells.extent(),
             clear,
             Some((cells, background)),
+        )
+    }
+
+    /// Renders `cells` with the background pass into an offscreen
+    /// `width x height` texture and returns its bytes (BGRA8, row-major,
+    /// tightly packed). Waits for the GPU and presents nothing: the render
+    /// snapshot of the image-parity corpus (ft-yccm0.1.10) reads back real
+    /// cell output this way.
+    pub fn snapshot_cells(
+        &self,
+        width: u32,
+        height: u32,
+        cells: &CellBgGrid,
+        clear: ClearColor,
+        background: BackgroundUniforms,
+    ) -> Result<Vec<u8>, FrameError> {
+        self.frames.borrow_mut().render_cells_offscreen(
+            &self.submission,
+            &self.background,
+            &self.device.queue,
+            &OffscreenCells {
+                width,
+                height,
+                cells,
+                clear,
+                background,
+            },
         )
     }
 

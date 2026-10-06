@@ -15,6 +15,24 @@
 //! module does nothing. A snapshot is taken once per window. The snapshot
 //! paint presents nothing and settles no damage, so the next paint draws the
 //! window as usual.
+//!
+//! Some window state cannot be produced by terminal bytes alone. Optional
+//! actions set it up (ft-yccm0.1.10):
+//!
+//! - `FRANKENTERM_RENDER_SNAPSHOT_FOCUS=1` renders the window as focused.
+//!   The corpus runs windows that never take keyboard focus from the
+//!   operator, so without this every cursor is the unfocused hollow block.
+//!   Only the window's own focus state changes; nothing is activated.
+//! - `FRANKENTERM_RENDER_SNAPSHOT_SELECTION=r0,c0,r1,c1` selects from
+//!   visible row `r0`, column `c0` through row `r1`, column `c1` (inclusive)
+//!   in the active pane.
+//! - `FRANKENTERM_RENDER_SNAPSHOT_SPLIT=right|bottom` together with
+//!   `FRANKENTERM_RENDER_SNAPSHOT_SPLIT_COMMAND` splits the active pane when
+//!   its title becomes `ft-render-split`, running the command (`/bin/sh -c`)
+//!   in the new pane; that pane then sets the snapshot title.
+//!
+//! Focus and selection are applied in the paint that first sees the
+//! snapshot title, and the snapshot is taken by the next paint.
 
 use anyhow::Context;
 use std::path::{Path, PathBuf};
@@ -23,9 +41,128 @@ use std::time::{Duration, Instant};
 
 pub(crate) const SNAPSHOT_PATH_ENV: &str = "FRANKENTERM_RENDER_SNAPSHOT";
 pub(crate) const SNAPSHOT_TITLE_ENV: &str = "FRANKENTERM_RENDER_SNAPSHOT_TITLE";
+pub(crate) const SNAPSHOT_FOCUS_ENV: &str = "FRANKENTERM_RENDER_SNAPSHOT_FOCUS";
+pub(crate) const SNAPSHOT_SELECTION_ENV: &str = "FRANKENTERM_RENDER_SNAPSHOT_SELECTION";
+pub(crate) const SNAPSHOT_SPLIT_ENV: &str = "FRANKENTERM_RENDER_SNAPSHOT_SPLIT";
+pub(crate) const SNAPSHOT_SPLIT_COMMAND_ENV: &str = "FRANKENTERM_RENDER_SNAPSHOT_SPLIT_COMMAND";
 pub(crate) const DEFAULT_SNAPSHOT_TITLE: &str = "ft-render-snapshot";
+/// The title that triggers a requested split.
+pub(crate) const SPLIT_TITLE: &str = "ft-render-split";
 const READBACK_TIMEOUT: Duration = Duration::from_secs(10);
 const READBACK_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// A selection in visible cell coordinates, both ends inclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SnapshotSelection {
+    pub(crate) start_row: usize,
+    pub(crate) start_col: usize,
+    pub(crate) end_row: usize,
+    pub(crate) end_col: usize,
+}
+
+impl SnapshotSelection {
+    fn parse(text: &str) -> Result<Self, String> {
+        let numbers = text
+            .split(',')
+            .map(|part| part.trim().parse::<usize>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| format!("{SNAPSHOT_SELECTION_ENV}={text:?} is not r0,c0,r1,c1"))?;
+        let [start_row, start_col, end_row, end_col] = numbers[..] else {
+            return Err(format!(
+                "{SNAPSHOT_SELECTION_ENV}={text:?} is not r0,c0,r1,c1"
+            ));
+        };
+        if (end_row, end_col) < (start_row, start_col) {
+            return Err(format!(
+                "{SNAPSHOT_SELECTION_ENV}={text:?} ends before it starts"
+            ));
+        }
+        Ok(Self {
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+        })
+    }
+}
+
+/// Where a requested split puts the new pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotSplitDirection {
+    Right,
+    Bottom,
+}
+
+/// A split to perform before the snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SnapshotSplit {
+    pub(crate) direction: SnapshotSplitDirection,
+    /// Run as `/bin/sh -c <command>` in the new pane.
+    pub(crate) command: String,
+}
+
+/// Window state to set up before the snapshot; see the module docs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SnapshotActions {
+    pub(crate) focus: bool,
+    pub(crate) selection: Option<SnapshotSelection>,
+    pub(crate) split: Option<SnapshotSplit>,
+}
+
+impl SnapshotActions {
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let focus = match lookup(SNAPSHOT_FOCUS_ENV).as_deref() {
+            None | Some("" | "0") => false,
+            Some("1") => true,
+            Some(other) => return Err(format!("{SNAPSHOT_FOCUS_ENV}={other:?} is not 0 or 1")),
+        };
+        let selection = lookup(SNAPSHOT_SELECTION_ENV)
+            .filter(|text| !text.is_empty())
+            .map(|text| SnapshotSelection::parse(&text))
+            .transpose()?;
+        let split = match lookup(SNAPSHOT_SPLIT_ENV).as_deref() {
+            None | Some("") => None,
+            Some(direction) => {
+                let direction = match direction {
+                    "right" => SnapshotSplitDirection::Right,
+                    "bottom" => SnapshotSplitDirection::Bottom,
+                    other => {
+                        return Err(format!(
+                            "{SNAPSHOT_SPLIT_ENV}={other:?} is not right or bottom"
+                        ));
+                    }
+                };
+                let command = lookup(SNAPSHOT_SPLIT_COMMAND_ENV)
+                    .filter(|command| !command.is_empty())
+                    .ok_or_else(|| {
+                        format!("{SNAPSHOT_SPLIT_ENV} needs {SNAPSHOT_SPLIT_COMMAND_ENV}")
+                    })?;
+                Some(SnapshotSplit { direction, command })
+            }
+        };
+        Ok(Self {
+            focus,
+            selection,
+            split,
+        })
+    }
+}
+
+/// What the window should do for its snapshot request in this paint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SnapshotStep {
+    /// Nothing yet.
+    Idle,
+    /// Split the active pane (its title became [`SPLIT_TITLE`]).
+    Split(SnapshotSplit),
+    /// The snapshot title is up: set focus and selection, then paint again.
+    Prepare {
+        focus: bool,
+        selection: Option<SnapshotSelection>,
+    },
+    /// Draw this paint into the snapshot at the path.
+    Take(PathBuf),
+}
 
 /// A pending one-shot snapshot request for one window.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,14 +170,25 @@ pub(crate) struct RenderSnapshotRequest {
     path: PathBuf,
     title: String,
     taken: bool,
+    actions: SnapshotActions,
+    prepared: bool,
 }
 
 impl RenderSnapshotRequest {
     pub(crate) fn from_env() -> Option<Self> {
-        Self::from_values(
+        let mut request = Self::from_values(
             std::env::var_os(SNAPSHOT_PATH_ENV),
             std::env::var(SNAPSHOT_TITLE_ENV).ok(),
-        )
+        )?;
+        match SnapshotActions::from_lookup(|name| std::env::var(name).ok()) {
+            Ok(actions) => request.actions = actions,
+            Err(error) => {
+                // A malformed action would snapshot the wrong state; take none.
+                log::error!("render snapshot disabled: {error}");
+                return None;
+            }
+        }
+        Some(request)
     }
 
     fn from_values(path: Option<std::ffi::OsString>, title: Option<String>) -> Option<Self> {
@@ -52,17 +200,33 @@ impl RenderSnapshotRequest {
             path,
             title,
             taken: false,
+            actions: SnapshotActions::default(),
+            prepared: false,
         })
     }
 
-    /// Claims the snapshot if the active pane's title is the sentinel. Returns
-    /// the output path at most once.
-    pub(crate) fn claim(&mut self, active_title: Option<&str>) -> Option<PathBuf> {
-        if self.taken || active_title != Some(self.title.as_str()) {
-            return None;
+    /// Advances the request for a paint whose active pane has `active_title`.
+    pub(crate) fn step(&mut self, active_title: Option<&str>) -> SnapshotStep {
+        if self.taken {
+            return SnapshotStep::Idle;
+        }
+        if active_title == Some(SPLIT_TITLE) {
+            if let Some(split) = self.actions.split.take() {
+                return SnapshotStep::Split(split);
+            }
+        }
+        if active_title != Some(self.title.as_str()) {
+            return SnapshotStep::Idle;
+        }
+        if !self.prepared && (self.actions.focus || self.actions.selection.is_some()) {
+            self.prepared = true;
+            return SnapshotStep::Prepare {
+                focus: self.actions.focus,
+                selection: self.actions.selection,
+            };
         }
         self.taken = true;
-        Some(self.path.clone())
+        SnapshotStep::Take(self.path.clone())
     }
 
     /// Returns a claimed snapshot to pending: the frame was not final yet
@@ -287,27 +451,141 @@ mod tests {
         assert_eq!(request.path, PathBuf::from("/tmp/a.png"));
     }
 
+    fn take(path: &str) -> SnapshotStep {
+        SnapshotStep::Take(PathBuf::from(path))
+    }
+
     #[test]
-    fn claim_fires_once_and_only_on_the_sentinel_title() {
+    fn the_snapshot_is_taken_once_and_only_on_the_sentinel_title() {
         let mut request =
             RenderSnapshotRequest::from_values(Some("/tmp/a.png".into()), Some("done".into()))
                 .unwrap();
-        assert_eq!(request.claim(None), None);
-        assert_eq!(request.claim(Some("zsh")), None);
+        assert_eq!(request.step(None), SnapshotStep::Idle);
+        assert_eq!(request.step(Some("zsh")), SnapshotStep::Idle);
+        assert_eq!(request.step(Some("done")), take("/tmp/a.png"));
         assert_eq!(
-            request.claim(Some("done")),
-            Some(PathBuf::from("/tmp/a.png"))
-        );
-        assert_eq!(
-            request.claim(Some("done")),
-            None,
+            request.step(Some("done")),
+            SnapshotStep::Idle,
             "a snapshot is taken once"
         );
         request.rearm();
         assert_eq!(
-            request.claim(Some("done")),
-            Some(PathBuf::from("/tmp/a.png")),
+            request.step(Some("done")),
+            take("/tmp/a.png"),
             "a re-armed snapshot is claimable again"
+        );
+    }
+
+    fn lookup<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string())
+        }
+    }
+
+    #[test]
+    fn actions_parse_from_the_environment() {
+        assert_eq!(
+            SnapshotActions::from_lookup(lookup(&[])),
+            Ok(SnapshotActions::default())
+        );
+        let actions = SnapshotActions::from_lookup(lookup(&[
+            (SNAPSHOT_FOCUS_ENV, "1"),
+            (SNAPSHOT_SELECTION_ENV, "1, 2,3,40"),
+            (SNAPSHOT_SPLIT_ENV, "bottom"),
+            (SNAPSHOT_SPLIT_COMMAND_ENV, "cat b; exec sleep 600"),
+        ]))
+        .unwrap();
+        assert!(actions.focus);
+        assert_eq!(
+            actions.selection,
+            Some(SnapshotSelection {
+                start_row: 1,
+                start_col: 2,
+                end_row: 3,
+                end_col: 40,
+            })
+        );
+        assert_eq!(
+            actions.split,
+            Some(SnapshotSplit {
+                direction: SnapshotSplitDirection::Bottom,
+                command: "cat b; exec sleep 600".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_actions_are_errors() {
+        for vars in [
+            &[(SNAPSHOT_FOCUS_ENV, "yes")][..],
+            &[(SNAPSHOT_SELECTION_ENV, "1,2,3")][..],
+            &[(SNAPSHOT_SELECTION_ENV, "1,2,x,4")][..],
+            &[(SNAPSHOT_SELECTION_ENV, "3,0,1,0")][..],
+            &[
+                (SNAPSHOT_SPLIT_ENV, "left"),
+                (SNAPSHOT_SPLIT_COMMAND_ENV, "x"),
+            ][..],
+            &[(SNAPSHOT_SPLIT_ENV, "right")][..],
+        ] {
+            assert!(
+                SnapshotActions::from_lookup(lookup(vars)).is_err(),
+                "{vars:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn focus_and_selection_are_prepared_one_paint_before_the_snapshot() {
+        let mut request =
+            RenderSnapshotRequest::from_values(Some("/tmp/a.png".into()), None).unwrap();
+        let selection = SnapshotSelection {
+            start_row: 0,
+            start_col: 0,
+            end_row: 1,
+            end_col: 5,
+        };
+        request.actions = SnapshotActions {
+            focus: true,
+            selection: Some(selection),
+            split: None,
+        };
+        assert_eq!(request.step(Some("zsh")), SnapshotStep::Idle);
+        assert_eq!(
+            request.step(Some(DEFAULT_SNAPSHOT_TITLE)),
+            SnapshotStep::Prepare {
+                focus: true,
+                selection: Some(selection),
+            }
+        );
+        assert_eq!(
+            request.step(Some(DEFAULT_SNAPSHOT_TITLE)),
+            take("/tmp/a.png")
+        );
+        // A re-armed snapshot does not prepare twice.
+        request.rearm();
+        assert_eq!(
+            request.step(Some(DEFAULT_SNAPSHOT_TITLE)),
+            take("/tmp/a.png")
+        );
+    }
+
+    #[test]
+    fn a_split_fires_once_on_its_own_title() {
+        let mut request =
+            RenderSnapshotRequest::from_values(Some("/tmp/a.png".into()), None).unwrap();
+        let split = SnapshotSplit {
+            direction: SnapshotSplitDirection::Right,
+            command: "cat b".to_string(),
+        };
+        request.actions.split = Some(split.clone());
+        assert_eq!(request.step(Some("zsh")), SnapshotStep::Idle);
+        assert_eq!(request.step(Some(SPLIT_TITLE)), SnapshotStep::Split(split));
+        assert_eq!(request.step(Some(SPLIT_TITLE)), SnapshotStep::Idle);
+        assert_eq!(
+            request.step(Some(DEFAULT_SNAPSHOT_TITLE)),
+            take("/tmp/a.png")
         );
     }
 

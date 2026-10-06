@@ -8,11 +8,12 @@
 //! buffer per frame, completion handlers) everywhere else. Both paths share
 //! the buffer model and the pacing.
 
-use crate::cell_bg::BACKGROUND_SHADER;
+use crate::cell_bg::{BACKGROUND_SHADER, BackgroundUniforms, CellBgGrid};
 use crate::frame::{
-    FRAME_SLOTS, GridExtent, SlotBuffer, SlotLease, SlotRing, SlotSizes, grown_capacity,
+    FRAME_SLOTS, FrameUniforms, GridExtent, SlotBuffer, SlotLease, SlotRing, SlotSizes,
+    grown_capacity,
 };
-use crate::{ClearColor, FrameError, SubmissionPath};
+use crate::{ClearColor, FRAME_SLOT_TIMEOUT, FrameError, MAX_TEXTURE_EXTENT, SubmissionPath};
 use block2::RcBlock;
 use frankenterm_alloc::resource_ledger::{GpuBufferPurpose, GpuResourceGuard, GpuResourceLedger};
 use objc2::rc::Retained;
@@ -22,13 +23,14 @@ use objc2_foundation::{NSString, ns_string};
 use objc2_metal::{
     MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
     MTL4CommandEncoder, MTL4CommandQueue, MTL4CommitFeedback, MTL4CommitOptions,
-    MTL4RenderCommandEncoder, MTL4RenderPassDescriptor, MTLBuffer, MTLClearColor, MTLCommandBuffer,
-    MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue, MTLDevice, MTLDrawable,
-    MTLGPUFamily, MTLLibrary, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
-    MTLRenderCommandEncoder, MTLRenderPassColorAttachmentDescriptor,
+    MTL4RenderCommandEncoder, MTL4RenderPassDescriptor, MTLBlitCommandEncoder, MTLBuffer,
+    MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
+    MTLDevice, MTLDrawable, MTLGPUFamily, MTLLibrary, MTLLoadAction, MTLOrigin, MTLPixelFormat,
+    MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassColorAttachmentDescriptor,
     MTLRenderPassColorAttachmentDescriptorArray, MTLRenderPassDescriptor,
     MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLRenderStages, MTLResidencySet,
-    MTLResidencySetDescriptor, MTLResource, MTLResourceOptions, MTLStoreAction, MTLTexture,
+    MTLResidencySetDescriptor, MTLResource, MTLResourceOptions, MTLSize, MTLStorageMode,
+    MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
 use objc2_quartz_core::CAMetalLayer;
 use std::cell::Cell;
@@ -262,6 +264,98 @@ impl FrameSlots {
         self.allocations
     }
 
+    /// Renders `request.cells` with the background pass into an offscreen
+    /// texture through `submission` and reads it back through `readback` (a
+    /// Metal 3 queue): BGRA8, row-major, tightly packed. Waits for the GPU;
+    /// the render snapshot (ft-yccm0.1.10) uses it, nothing is presented.
+    pub(crate) fn render_cells_offscreen(
+        &mut self,
+        submission: &Submission,
+        pipeline: &BackgroundPipeline,
+        readback: &ProtocolObject<dyn MTLCommandQueue>,
+        request: &OffscreenCells<'_>,
+    ) -> Result<Vec<u8>, FrameError> {
+        let (width, height) = (request.width, request.height);
+        if !(1..=MAX_TEXTURE_EXTENT).contains(&width) || !(1..=MAX_TEXTURE_EXTENT).contains(&height)
+        {
+            return Err(FrameError::InvalidExtent { width, height });
+        }
+        let (width_px, height_px) = (width as usize, height as usize);
+        #[allow(unsafe_code)]
+        // SAFETY: FFI-EXTENT. BGRA8Unorm is color-renderable and the extent
+        // was checked to be within 1..=MAX_TEXTURE_EXTENT on both axes above.
+        let descriptor = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::BGRA8Unorm,
+                width_px,
+                height_px,
+                false,
+            )
+        };
+        descriptor.setUsage(MTLTextureUsage::RenderTarget);
+        descriptor.setStorageMode(MTLStorageMode::Private);
+        let target = self.device.newTextureWithDescriptor(&descriptor).ok_or(
+            FrameError::AllocationFailed {
+                what: "offscreen render target",
+                bytes: width_px * height_px * 4,
+            },
+        )?;
+        // Metal 4 makes nothing resident implicitly.
+        if let Some(set) = &self.residency {
+            set.addAllocation(ProtocolObject::from_ref(&*target));
+            set.commit();
+        }
+        let result = self.render_offscreen_into(submission, pipeline, readback, request, &target);
+        if let Some(set) = &self.residency {
+            set.removeAllocation(ProtocolObject::from_ref(&*target));
+            set.commit();
+        }
+        result
+    }
+
+    fn render_offscreen_into(
+        &mut self,
+        submission: &Submission,
+        pipeline: &BackgroundPipeline,
+        readback: &ProtocolObject<dyn MTLCommandQueue>,
+        request: &OffscreenCells<'_>,
+        target: &ProtocolObject<dyn MTLTexture>,
+    ) -> Result<Vec<u8>, FrameError> {
+        let cells = request.cells;
+        let failed_before = submission.failed_frames();
+        let lease = self.begin(cells.extent(), FRAME_SLOT_TIMEOUT)?;
+        let uniforms = FrameUniforms {
+            frame: lease.frame(),
+            viewport: [request.width, request.height],
+            grid: cells.extent(),
+            clear: request.clear.to_f32(),
+            background: BackgroundUniforms {
+                row_offset: cells.row_offset(),
+                ..request.background
+            },
+        };
+        self.write(&lease, SlotBuffer::Uniforms, 0, &uniforms.to_bytes())?;
+        self.write(&lease, SlotBuffer::CellBg, 0, cells.as_bytes())?;
+        submission.encode_frame(self, lease, target, None, request.clear, Some(pipeline))?;
+        if !self.ring.wait_idle(OFFSCREEN_TIMEOUT) {
+            return Err(FrameError::CommandFailed {
+                detail: "the offscreen frame did not finish".to_string(),
+            });
+        }
+        if submission.failed_frames() != failed_before {
+            return Err(FrameError::CommandFailed {
+                detail: "the offscreen frame finished in error".to_string(),
+            });
+        }
+        read_texture_bgra(
+            &self.device,
+            readback,
+            target,
+            request.width,
+            request.height,
+        )
+    }
+
     /// Reads back `len` bytes of a slot buffer the GPU has finished with.
     #[cfg(test)]
     #[allow(unsafe_code)]
@@ -279,6 +373,86 @@ impl FrameSlots {
         // owned Vec while the buffer is alive.
         unsafe { std::slice::from_raw_parts(contents.as_ptr(), len) }.to_vec()
     }
+}
+
+/// Longest an offscreen render waits for the GPU.
+const OFFSCREEN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One offscreen background-pass render.
+pub(crate) struct OffscreenCells<'a> {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) cells: &'a CellBgGrid,
+    pub(crate) clear: ClearColor,
+    pub(crate) background: BackgroundUniforms,
+}
+
+/// Copies a BGRA8 texture into shared memory with a Metal 3 blit and
+/// returns its bytes: row-major, tightly packed.
+#[allow(unsafe_code)]
+pub(crate) fn read_texture_bgra(
+    device: &ProtocolObject<dyn MTLDevice>,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    texture: &ProtocolObject<dyn MTLTexture>,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, FrameError> {
+    let (width_px, height_px) = (width as usize, height as usize);
+    let bytes_per_row = width_px * 4;
+    let len = bytes_per_row * height_px;
+    let buffer = device
+        .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
+        .ok_or(FrameError::AllocationFailed {
+            what: "readback buffer",
+            bytes: len,
+        })?;
+    let commands = queue
+        .commandBuffer()
+        .ok_or(FrameError::CommandBufferUnavailable)?;
+    let blit = commands
+        .blitCommandEncoder()
+        .ok_or(FrameError::EncoderUnavailable)?;
+    // SAFETY: FFI-EXTENT. The source region is the texture's whole width x
+    // height x 1 extent in slice 0, level 0 (the caller's texture has exactly
+    // this extent and the 4-byte BGRA8 format). The destination pitch is
+    // width * 4 bytes and `buffer` holds exactly pitch * height bytes.
+    unsafe {
+        blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+            texture,
+            0,
+            0,
+            MTLOrigin { x: 0, y: 0, z: 0 },
+            MTLSize {
+                width: width_px,
+                height: height_px,
+                depth: 1,
+            },
+            &buffer,
+            0,
+            bytes_per_row,
+            len,
+        );
+    }
+    blit.endEncoding();
+    commands.commit();
+    commands.waitUntilCompleted();
+    if commands.status() != MTLCommandBufferStatus::Completed {
+        return Err(FrameError::CommandFailed {
+            detail: format!("readback status {}", commands.status().0),
+        });
+    }
+    if buffer.length() < len {
+        return Err(FrameError::AllocationFailed {
+            what: "readback buffer",
+            bytes: len,
+        });
+    }
+    let contents = buffer.contents().cast::<u8>();
+    // SAFETY: BUFFER-CONTENTS. The blit that wrote `buffer` completed
+    // successfully, `-length` was checked to be at least `len`, and the bytes
+    // are copied into an owned Vec while `buffer` is alive.
+    let bytes = unsafe { std::slice::from_raw_parts(contents.as_ptr(), len) }.to_vec();
+    Ok(bytes)
 }
 
 /// A residency set, or `None` before macOS 15 (no `MTLResidencySet`).
@@ -1140,73 +1314,6 @@ mod tests {
     const BG_WIDTH: usize = 96;
     const BG_HEIGHT: usize = 103;
 
-    fn sized_target(
-        device: &ProtocolObject<dyn MTLDevice>,
-        width: usize,
-        height: usize,
-    ) -> Retained<ProtocolObject<dyn MTLTexture>> {
-        #[allow(unsafe_code)]
-        // SAFETY: FFI-EXTENT. BGRA8Unorm is color-renderable and the extent
-        // is within the Apple-family 2D texture limit.
-        let descriptor = unsafe {
-            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
-                MTLPixelFormat::BGRA8Unorm,
-                width,
-                height,
-                false,
-            )
-        };
-        descriptor.setUsage(MTLTextureUsage::RenderTarget);
-        descriptor.setStorageMode(MTLStorageMode::Private);
-        device
-            .newTextureWithDescriptor(&descriptor)
-            .expect("background render target")
-    }
-
-    /// The texture's BGRA8 bytes, copied out through a Metal 3 blit.
-    #[allow(unsafe_code)]
-    fn read_bgra(
-        device: &ProtocolObject<dyn MTLDevice>,
-        texture: &ProtocolObject<dyn MTLTexture>,
-        width: usize,
-        height: usize,
-    ) -> Vec<u8> {
-        let len = width * height * 4;
-        let buffer = device
-            .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
-            .unwrap();
-        let queue = device.newCommandQueue().unwrap();
-        let commands = queue.commandBuffer().unwrap();
-        let blit = commands.blitCommandEncoder().unwrap();
-        // SAFETY: FFI-EXTENT. The source is the texture's whole width x
-        // height x 1 extent in slice 0, level 0; the destination pitch is
-        // width * 4 bytes and `buffer` holds exactly pitch * height bytes.
-        unsafe {
-            blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
-                texture,
-                0,
-                0,
-                objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
-                objc2_metal::MTLSize {
-                    width,
-                    height,
-                    depth: 1,
-                },
-                &buffer,
-                0,
-                width * 4,
-                len,
-            );
-        }
-        blit.endEncoding();
-        commands.commit();
-        commands.waitUntilCompleted();
-        assert_eq!(commands.status(), MTLCommandBufferStatus::Completed);
-        // SAFETY: BUFFER-CONTENTS. The blit that wrote `buffer` completed and
-        // the buffer is `len` bytes long; the bytes are copied while it lives.
-        unsafe { std::slice::from_raw_parts(buffer.contents().cast::<u8>().as_ptr(), len) }.to_vec()
-    }
-
     /// Every background feature at once: colors and default cells, a ring
     /// offset, a wide character, a selection, search matches.
     fn background_scene() -> (CellBgGrid, BackgroundUniforms) {
@@ -1245,8 +1352,10 @@ mod tests {
         (cells, background)
     }
 
-    /// Renders the scene with `cursor` through `submission` and compares
-    /// every pixel with the CPU reference; returns the pixels compared.
+    /// Renders the scene with `cursor` through the production offscreen path
+    /// (`render_cells_offscreen`, as the render snapshot uses it) and
+    /// compares every pixel with the CPU reference; returns the pixels
+    /// compared.
     fn render_and_compare(
         submission: &Submission,
         frames: &mut FrameSlots,
@@ -1254,44 +1363,43 @@ mod tests {
         cursor: CursorUniform,
     ) -> usize {
         let (cells, background) = background_scene();
-        let device = frames.device.clone();
-        let target = sized_target(&device, BG_WIDTH, BG_HEIGHT);
-        if let Some(set) = frames.residency() {
-            set.addAllocation(ProtocolObject::from_ref(&*target));
-            set.commit();
-        }
+        let background = BackgroundUniforms {
+            cursor,
+            ..background
+        };
         let clear = ClearColor::from_srgba(0.1, 0.2, 0.3, 1.0);
-        let lease = frames.begin(cells.extent(), LONG).unwrap();
+        let (width, height) = (
+            u32::try_from(BG_WIDTH).unwrap(),
+            u32::try_from(BG_HEIGHT).unwrap(),
+        );
+        let readback = frames.device.newCommandQueue().unwrap();
+        let pixels = frames
+            .render_cells_offscreen(
+                submission,
+                pipeline,
+                &readback,
+                &OffscreenCells {
+                    width,
+                    height,
+                    cells: &cells,
+                    clear,
+                    background,
+                },
+            )
+            .unwrap_or_else(|error| panic!("{:?} cursor: {error}", cursor.shape));
+        assert_eq!(pixels.len(), BG_WIDTH * BG_HEIGHT * 4);
+        assert!(frames.ring().wait_idle(LONG));
+        assert_eq!(submission.failed_frames(), 0);
         let uniforms = FrameUniforms {
-            frame: lease.frame(),
-            viewport: [
-                u32::try_from(BG_WIDTH).unwrap(),
-                u32::try_from(BG_HEIGHT).unwrap(),
-            ],
+            viewport: [width, height],
             grid: cells.extent(),
             clear: clear.to_f32(),
             background: BackgroundUniforms {
                 row_offset: cells.row_offset(),
-                cursor,
                 ..background
             },
+            ..FrameUniforms::default()
         };
-        frames
-            .write(&lease, SlotBuffer::Uniforms, 0, &uniforms.to_bytes())
-            .unwrap();
-        frames
-            .write(&lease, SlotBuffer::CellBg, 0, cells.as_bytes())
-            .unwrap();
-        submission
-            .encode_frame(frames, lease, &target, None, clear, Some(pipeline))
-            .unwrap();
-        assert!(frames.ring().wait_idle(LONG), "the frame completed");
-        assert_eq!(submission.failed_frames(), 0);
-        let pixels = read_bgra(&device, &target, BG_WIDTH, BG_HEIGHT);
-        if let Some(set) = frames.residency() {
-            set.removeAllocation(ProtocolObject::from_ref(&*target));
-            set.commit();
-        }
         let cleared = clear.to_bgra8();
         let mut compared = 0;
         for y in 0..BG_HEIGHT {
@@ -1317,6 +1425,34 @@ mod tests {
             }
         }
         compared
+    }
+
+    #[test]
+    fn offscreen_renders_reject_bad_extents() {
+        let device = device();
+        let mut frames = FrameSlots::new(device.clone(), SMALL, private_ledger()).unwrap();
+        let submission = Submission::metal3(device.newCommandQueue().unwrap(), &frames);
+        let pipeline = BackgroundPipeline::new(&device).expect("background pipeline");
+        let readback = device.newCommandQueue().unwrap();
+        let (cells, background) = background_scene();
+        for (width, height) in [(0, 10), (10, 0), (crate::MAX_TEXTURE_EXTENT + 1, 10)] {
+            let request = OffscreenCells {
+                width,
+                height,
+                cells: &cells,
+                clear: ClearColor::from_srgba(0.0, 0.0, 0.0, 1.0),
+                background,
+            };
+            assert_eq!(
+                frames.render_cells_offscreen(&submission, &pipeline, &readback, &request),
+                Err(FrameError::InvalidExtent { width, height })
+            );
+        }
+        assert_eq!(
+            frames.residency().map(MTLResidencySet::allocationCount),
+            Some(12),
+            "a refused render leaves the residency set as it was"
+        );
     }
 
     fn cursors() -> Vec<CursorUniform> {

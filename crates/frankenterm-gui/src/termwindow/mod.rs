@@ -120,6 +120,7 @@ pub mod clipboard;
 pub mod frame_budget;
 pub mod idle_detector;
 pub mod keyevent;
+mod metal_cells;
 pub mod modal;
 mod mouseevent;
 pub mod palette;
@@ -993,20 +994,27 @@ fn lock_termwindow_mutex<'a, T>(mutex: &'a Mutex<T>, name: &str) -> std::sync::M
     })
 }
 
-/// Image-parity hook for the Metal front end (ft-yccm0.1.10). Until the
-/// Track C data model lands (ft-yccm0.4.2) its whole frame is the background
-/// clear, so the same pass is rendered offscreen and read back; C2 replaces
-/// this with a readback of the frame's own texture.
+/// Image-parity hook for the Metal front end (ft-yccm0.1.10): the active
+/// pane's cell backgrounds, selection and cursor drawn offscreen by the real
+/// Metal background pass (ft-yccm0.4.2.2) and read back. Without a pane only
+/// the background clear is drawn. Glyphs join when the CellText pass lands
+/// (ft-yccm0.4.2.3).
 fn write_metal_render_snapshot(
     metal: &frankenterm_renderer_metal::MetalRenderer,
     path: &std::path::Path,
     width: u32,
     height: u32,
     color: frankenterm_renderer_metal::ClearColor,
+    cells: Option<(
+        frankenterm_renderer_metal::CellBgGrid,
+        frankenterm_renderer_metal::BackgroundUniforms,
+    )>,
 ) {
-    let result = metal
-        .device()
-        .clear_offscreen(width, height, color)
+    let readback = match cells {
+        Some((cells, background)) => metal.snapshot_cells(width, height, &cells, color, background),
+        None => metal.device().clear_offscreen(width, height, color),
+    };
+    let result = readback
         .map_err(anyhow::Error::new)
         .and_then(|bgra| render_snapshot::texels_to_rgba8(wgpu::TextureFormat::Bgra8Unorm, bgra))
         .and_then(|rgba| render_snapshot::write_png_atomically(path, width, height, &rgba));
@@ -5178,7 +5186,8 @@ impl TermWindow {
         match metal.render_clear(width, height, grid, color) {
             Ok(frankenterm_renderer_metal::FrameOutcome::Presented) => {
                 if let Some(path) = snapshot_path {
-                    write_metal_render_snapshot(&metal, &path, width, height, color);
+                    let cells = self.metal_cell_backgrounds();
+                    write_metal_render_snapshot(&metal, &path, width, height, color, cells);
                 }
                 let settlement = apply_presented_render_attempt(
                     &mut self.dirty_lines,
@@ -5231,7 +5240,90 @@ impl TermWindow {
         let title = self
             .get_active_pane_or_overlay()
             .map(|pane| pane.get_title());
-        self.render_snapshot.as_mut()?.claim(title.as_deref())
+        match self.render_snapshot.as_mut()?.step(title.as_deref()) {
+            render_snapshot::SnapshotStep::Idle => None,
+            render_snapshot::SnapshotStep::Split(split) => {
+                self.split_for_render_snapshot(&split);
+                None
+            }
+            render_snapshot::SnapshotStep::Prepare { focus, selection } => {
+                self.prepare_render_snapshot(focus, selection);
+                None
+            }
+            render_snapshot::SnapshotStep::Take(path) => Some(path),
+        }
+    }
+
+    /// Splits the active pane for a render snapshot (ft-yccm0.1.10): the new
+    /// pane runs the scene's second command and becomes active.
+    fn split_for_render_snapshot(&mut self, split: &render_snapshot::SnapshotSplit) {
+        let spawn = SpawnCommand {
+            args: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                split.command.clone(),
+            ]),
+            ..SpawnCommand::default()
+        };
+        let direction = match split.direction {
+            render_snapshot::SnapshotSplitDirection::Right => SplitDirection::Horizontal,
+            render_snapshot::SnapshotSplitDirection::Bottom => SplitDirection::Vertical,
+        };
+        self.spawn_command(
+            &spawn,
+            SpawnWhere::SplitPane(SplitRequest {
+                direction,
+                target_is_second: true,
+                size: MuxSplitSize::Percent(50),
+                top_level: false,
+            }),
+        );
+    }
+
+    /// Sets up window state a render snapshot asked for (ft-yccm0.1.10),
+    /// then schedules the paint that takes the snapshot.
+    fn prepare_render_snapshot(
+        &mut self,
+        focus: bool,
+        selection: Option<render_snapshot::SnapshotSelection>,
+    ) {
+        if focus && self.focused.is_none() {
+            // Only the window's own focus state changes: nothing is
+            // activated, so the operator keeps keyboard focus.
+            self.focused = Some(Instant::now());
+            self.invalidate_render_caches(RenderInvalidationCause::Focus);
+            self.mark_all_panes_dirty_with_source(
+                frankenterm_core::dirty_line_telemetry::DirtyEventSource::FocusChange,
+            );
+        }
+        if let Some(selection) = selection
+            && let Some(pane) = self.get_active_pane_or_overlay()
+        {
+            let top = pane.get_dimensions().physical_top;
+            let row = |visible: usize| {
+                top.saturating_add(StableRowIndex::try_from(visible).unwrap_or(StableRowIndex::MAX))
+            };
+            let start = crate::selection::SelectionCoordinate::x_y(
+                selection.start_col,
+                row(selection.start_row),
+            );
+            let end = crate::selection::SelectionCoordinate::x_y(
+                selection.end_col,
+                row(selection.end_row),
+            );
+            let authority = crate::selection::SelectionAuthority::capture(&*pane);
+            if authority.is_none() {
+                log::error!("render snapshot: the active pane cannot hold a selection");
+            }
+            self.update_selection(&pane, authority, |current| {
+                current.origin = Some(start);
+                current.range = Some(crate::selection::SelectionRange { start, end });
+                current.rectangular = false;
+            });
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
     }
 
     /// The window background exactly as the other front ends fill it: the

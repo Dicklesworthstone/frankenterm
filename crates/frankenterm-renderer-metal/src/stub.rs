@@ -81,4 +81,15 @@ impl MetalRenderer {
     ) -> Result<FrameOutcome, FrameError> {
         match *self {}
     }
+
+    pub fn snapshot_cells(
+        &self,
+        _width: u32,
+        _height: u32,
+        _cells: &CellBgGrid,
+        _clear: ClearColor,
+        _background: BackgroundUniforms,
+    ) -> Result<Vec<u8>, FrameError> {
+        match *self {}
+    }
 }
