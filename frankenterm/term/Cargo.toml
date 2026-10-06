@@ -70,6 +70,10 @@ harness = false
 name = "ingest_throughput"
 harness = false
 
+[[bench]]
+name = "pagegrid"
+harness = false
+
 [dependencies.termwiz]
 workspace = true
 features = ["use_image"]
