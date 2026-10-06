@@ -7,8 +7,8 @@ publish = false
 [workspace]
 
 [dependencies]
-frankenterm-term = { path = "/Users/jemanuel/projects/frankenterm/frankenterm/term" }
-frankenterm-escape-parser = { path = "/Users/jemanuel/projects/frankenterm/frankenterm/escape-parser" }
+frankenterm-term = { path = "../../../../frankenterm/term" }
+frankenterm-escape-parser = { path = "../../../../frankenterm/escape-parser" }
 
 [profile.release]
 opt-level = 3
