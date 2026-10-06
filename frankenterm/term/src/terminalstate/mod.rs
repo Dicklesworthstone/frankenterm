@@ -1486,6 +1486,12 @@ impl TerminalState {
         self.bracketed_paste
     }
 
+    /// Returns true if the application asked for focus in/out reports
+    /// (DECSET 1004).
+    pub fn focus_tracking_enabled(&self) -> bool {
+        self.focus_tracking
+    }
+
     /// Advise the terminal about a change in its focus state
     pub fn focus_changed(&mut self, focused: bool) {
         if focused == self.focused {

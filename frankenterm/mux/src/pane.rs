@@ -750,6 +750,43 @@ pub trait GuardianLiveCheckpointPublisher: Send + Sync {
     ) -> anyhow::Result<crate::guardian_checkpoint::PublishedGuardianCheckpoint>;
 }
 
+/// Render-relevant pane state captured as one coherent snapshot (ft-yccm0.2.2.1).
+///
+/// A pane that owns a terminal publishes these from the thread that mutates
+/// it: after every applied output batch, resize, configuration assignment,
+/// focus change and scrollback erase. [`Pane::render_facts`] then reads them
+/// without the terminal mutex. Every field describes the terminal at `seqno`;
+/// a reader may see at most the publication before the batch being applied,
+/// so paint that also reads rows must accept one batch of skew (or compare
+/// `seqno` with its row snapshot).
+#[derive(Clone, Debug)]
+pub struct PaneRenderFacts {
+    /// Terminal sequence number at capture.
+    pub seqno: SequenceNo,
+    pub cursor: StableCursorPosition,
+    pub dimensions: RenderableDimensions,
+    /// Any mouse reporting mode is enabled (false while tmux owns the pane).
+    pub mouse_grabbed: bool,
+    pub alt_screen_active: bool,
+    pub bracketed_paste: bool,
+    /// Focus in/out reporting (DECSET 1004) is enabled.
+    pub focus_tracking: bool,
+    /// Shared between publications until the palette changes.
+    pub palette: Arc<ColorPalette>,
+    /// Changes whenever `palette` may differ from the previous publication;
+    /// equal generations mean the same palette, so paint can skip re-reading.
+    pub palette_generation: u64,
+    /// The terminal-provided title (OSC 1/2), before pane-level resolution.
+    pub title: Arc<str>,
+}
+
+/// A fresh palette generation for panes that cannot track palette changes:
+/// it never repeats, so consumers always treat their palette as changed.
+pub fn untracked_palette_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 63);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Terminal metadata used to format titles; never a coordinate or paint authority.
 #[derive(Clone, Debug)]
 pub struct PaneTitleMetadata {
@@ -804,6 +841,29 @@ pub trait Pane: Downcast + Send + Sync {
     fn get_cursor_position(&self) -> StableCursorPosition;
 
     fn get_current_seqno(&self) -> SequenceNo;
+
+    /// Render facts for UI-thread readers (ft-yccm0.2.2.1).
+    ///
+    /// Panes that own a terminal override this with a lock-free publication,
+    /// so the call never waits on the terminal mutex. The default composes
+    /// the blocking accessors below; it is exactly as blocking as calling
+    /// them directly, takes its title from `get_title`, and reports
+    /// `bracketed_paste`/`focus_tracking` as false with an untracked palette
+    /// generation.
+    fn render_facts(&self) -> Arc<PaneRenderFacts> {
+        Arc::new(PaneRenderFacts {
+            seqno: self.get_current_seqno(),
+            cursor: self.get_cursor_position(),
+            dimensions: self.get_dimensions(),
+            mouse_grabbed: self.is_mouse_grabbed(),
+            alt_screen_active: self.is_alt_screen_active(),
+            bracketed_paste: false,
+            focus_tracking: false,
+            palette: Arc::new(self.palette()),
+            palette_generation: untracked_palette_generation(),
+            title: Arc::from(self.get_title()),
+        })
+    }
 
     /// Local paint-cache publication, independent of terminal content authority.
     /// Observers retain their own fence; reading this must never consume damage.

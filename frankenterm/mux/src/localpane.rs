@@ -41,7 +41,7 @@ use std::convert::{TryFrom, TryInto};
 use std::io::{Result as IoResult, Write};
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1621,6 +1621,9 @@ pub struct LocalPane {
     writer: Mutex<Box<dyn Write + Send>>,
     domain_id: DomainId,
     tmux_domain: Arc<Mutex<Option<Arc<TmuxDomainState>>>>,
+    /// Republished under the terminal mutex after every change UI readers
+    /// care about; `render_facts()` never takes the terminal mutex.
+    render_facts: Arc<RenderFactsPublisher>,
     mux_registration: Arc<PaneRegistrationSlot>,
     child_exit_prune: Arc<ChildExitPruneState>,
     proc_list: Arc<Mutex<Option<CachedProcInfo>>>,
@@ -1799,6 +1802,10 @@ impl Pane for LocalPane {
 
     fn get_current_seqno(&self) -> SequenceNo {
         self.locked_terminal().current_seqno()
+    }
+
+    fn render_facts(&self) -> Arc<crate::pane::PaneRenderFacts> {
+        self.render_facts.load()
     }
 
     fn get_changed_since(
@@ -2252,7 +2259,10 @@ impl Pane for LocalPane {
     }
 
     fn evict_warm_scrollback(&self) -> Option<usize> {
-        Some(self.terminal.lock().evict_warm_scrollback())
+        let mut terminal = self.terminal.lock();
+        let evicted = terminal.evict_warm_scrollback();
+        self.render_facts.publish(&mut terminal);
+        Some(evicted)
     }
 
     fn copy_user_vars(&self) -> HashMap<String, String> {
@@ -2474,6 +2484,10 @@ impl Pane for LocalPane {
             .filter(|sink| sink.requires_scrollback_flush());
         terminal.set_config(config);
         *self.scrollback_flush_sink.lock() = sink;
+        // A new configuration object may carry a different palette even when
+        // its revision numbers coincide with the old one's.
+        self.render_facts.palette_may_have_changed();
+        self.render_facts.publish(&mut terminal);
     }
 
     fn get_config(&self) -> Option<Arc<dyn TerminalConfiguration>> {
@@ -2500,7 +2514,10 @@ impl Pane for LocalPane {
             let mut terminal = self.locked_terminal();
             let pending_title = terminal.pending_tmux_title_bytes();
             match self.admit_alert_actions(&mut actions, pending_title, &mut output) {
-                Ok(batch) => batch.apply(&mut terminal),
+                Ok(batch) => {
+                    batch.apply(&mut terminal);
+                    self.render_facts.publish(&mut terminal);
+                }
                 Err(reason) => return Err(PaneActionAdmissionError { actions, reason }),
             }
         } else {
@@ -2509,7 +2526,11 @@ impl Pane for LocalPane {
                 Err(reason) => return Err(PaneActionAdmissionError { actions, reason }),
             };
             #[cfg(not(feature = "disruptor-pane-io"))]
-            batch.apply(&mut self.terminal.lock());
+            {
+                let mut terminal = self.terminal.lock();
+                batch.apply(&mut terminal);
+                self.render_facts.publish(&mut terminal);
+            }
             #[cfg(feature = "disruptor-pane-io")]
             self.perform_actions_disruptor(batch);
         }
@@ -2547,6 +2568,7 @@ impl Pane for LocalPane {
             self.admit_alert_actions(pending_actions, pending_title, &mut output)
                 .map_err(LiveParserPaneCaptureError::ActionAdmission)?
                 .apply(&mut terminal);
+            self.render_facts.publish(&mut terminal);
             terminal
                 .capture_staged(limits)
                 .map_err(LiveParserPaneCaptureError::Terminal)?
@@ -2699,18 +2721,20 @@ impl Pane for LocalPane {
     }
 
     fn erase_scrollback(&self, erase_mode: ScrollbackEraseMode) {
+        let mut terminal = self.locked_terminal();
         match erase_mode {
-            ScrollbackEraseMode::ScrollbackOnly => {
-                self.locked_terminal().erase_scrollback();
-            }
+            ScrollbackEraseMode::ScrollbackOnly => terminal.erase_scrollback(),
             ScrollbackEraseMode::ScrollbackAndViewport => {
-                self.locked_terminal().erase_scrollback_and_viewport();
+                terminal.erase_scrollback_and_viewport()
             }
         }
+        self.render_facts.publish(&mut terminal);
     }
 
     fn focus_changed(&self, focused: bool) {
-        self.locked_terminal().focus_changed(focused);
+        let mut terminal = self.locked_terminal();
+        terminal.focus_changed(focused);
+        self.render_facts.publish(&mut terminal);
     }
 
     fn has_unseen_output(&self) -> bool {
@@ -4154,8 +4178,128 @@ impl PaneAlertPreflight {
     }
 }
 
+/// Lock-free publication of [`crate::pane::PaneRenderFacts`] (ft-yccm0.2.2.1).
+///
+/// Publishers hold the terminal mutex, so publications are serialized and a
+/// later capture never replaces a newer one. Readers only load an `Arc`.
+struct RenderFactsPublisher {
+    facts: arc_swap::ArcSwap<crate::pane::PaneRenderFacts>,
+    /// Bumped by `Alert::PaletteChanged` (any dynamic color escape) and by
+    /// configuration assignment.
+    palette_epoch: AtomicU64,
+    /// What the published palette was derived from. The palette is cloned
+    /// only when this changes.
+    palette_source: Mutex<PaletteSource>,
+    tmux_domain: Arc<Mutex<Option<Arc<TmuxDomainState>>>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PaletteSource {
+    epoch: u64,
+    revision: frankenterm_term::config::TerminalConfigurationRevision,
+}
+
+impl RenderFactsPublisher {
+    fn new(terminal: &mut Terminal, tmux_domain: Arc<Mutex<Option<Arc<TmuxDomainState>>>>) -> Self {
+        let source = PaletteSource {
+            epoch: 0,
+            revision: terminal.get_config().revision(),
+        };
+        let palette = Arc::new(terminal.palette());
+        let title = Arc::from(terminal.get_title());
+        let facts = Self::capture(terminal, &tmux_domain, palette, 0, title);
+        Self {
+            facts: arc_swap::ArcSwap::from_pointee(facts),
+            palette_epoch: AtomicU64::new(0),
+            palette_source: Mutex::new(source),
+            tmux_domain,
+        }
+    }
+
+    fn load(&self) -> Arc<crate::pane::PaneRenderFacts> {
+        self.facts.load_full()
+    }
+
+    fn palette_may_have_changed(&self) {
+        self.palette_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Capture and publish. The caller holds the terminal mutex.
+    fn publish(&self, terminal: &mut Terminal) {
+        let previous = self.facts.load_full();
+        let source = PaletteSource {
+            epoch: self.palette_epoch.load(Ordering::Acquire),
+            revision: terminal.get_config().revision(),
+        };
+        let (palette, palette_generation) = {
+            let mut published = self.palette_source.lock();
+            if *published == source {
+                (Arc::clone(&previous.palette), previous.palette_generation)
+            } else {
+                *published = source;
+                let palette = terminal.palette();
+                if palette == *previous.palette {
+                    (Arc::clone(&previous.palette), previous.palette_generation)
+                } else {
+                    (
+                        Arc::new(palette),
+                        previous.palette_generation.wrapping_add(1),
+                    )
+                }
+            }
+        };
+        let title = if *previous.title == *terminal.get_title() {
+            Arc::clone(&previous.title)
+        } else {
+            Arc::from(terminal.get_title())
+        };
+        let facts = Self::capture(
+            terminal,
+            &self.tmux_domain,
+            palette,
+            palette_generation,
+            title,
+        );
+        log::trace!(
+            "render facts seqno={} cursor={:?} palette_generation={}",
+            facts.seqno,
+            facts.cursor,
+            facts.palette_generation
+        );
+        self.facts.store(Arc::new(facts));
+    }
+
+    fn capture(
+        terminal: &mut Terminal,
+        tmux_domain: &Mutex<Option<Arc<TmuxDomainState>>>,
+        palette: Arc<ColorPalette>,
+        palette_generation: u64,
+        title: Arc<str>,
+    ) -> crate::pane::PaneRenderFacts {
+        // Terminal before tmux binding: the DCS parser's lock order.
+        let tmux = tmux_domain.lock().is_some();
+        let mut cursor = terminal_get_cursor_position(terminal);
+        if tmux {
+            cursor.visibility = termwiz::surface::CursorVisibility::Hidden;
+        }
+        crate::pane::PaneRenderFacts {
+            seqno: terminal.current_seqno(),
+            cursor,
+            dimensions: terminal_get_dimensions(terminal),
+            mouse_grabbed: !tmux && terminal.is_mouse_grabbed(),
+            alt_screen_active: !tmux && terminal.is_alt_screen_active(),
+            bracketed_paste: terminal.bracketed_paste_enabled(),
+            focus_tracking: terminal.focus_tracking_enabled(),
+            palette,
+            palette_generation,
+            title,
+        }
+    }
+}
+
 struct LocalPaneNotifHandler {
     staging: Arc<Mutex<PaneAlertStaging>>,
+    render_facts: Arc<RenderFactsPublisher>,
 }
 
 #[derive(Default)]
@@ -4425,6 +4569,10 @@ impl Drop for PaneAlertApplication {
 
 impl AlertHandler for LocalPaneNotifHandler {
     fn alert(&mut self, mut alert: Alert) {
+        if matches!(alert, Alert::PaletteChanged) {
+            // Render facts track the palette for every pane, registered or not.
+            self.render_facts.palette_may_have_changed();
+        }
         let mut state = self.staging.lock();
         let Some(active) = state.active.as_mut() else {
             // Unregistered model-only batches never acquire authority midway
@@ -4587,6 +4735,7 @@ impl LocalPane {
             self.admit_alert_actions(pending_actions, pending_title, &mut output)
                 .map_err(LegacyTerminalCaptureError::ActionAdmission)?
                 .apply(&mut terminal);
+            self.render_facts.publish(&mut terminal);
         }
         let staged = terminal.capture_staged(limits)?;
         Ok(staged.bind_external_parser_ground(ground))
@@ -4648,6 +4797,7 @@ impl LocalPane {
                 self.admit_alert_actions(pending_actions, pending_title, &mut output)
                     .map_err(LegacyTerminalCaptureError::ActionAdmission)?
                     .apply(&mut terminal);
+                self.render_facts.publish(&mut terminal);
             }
             terminal.capture_staged(limits).map_err(|e| match e {
                 RecoveryTerminalCheckpointError::Checkpoint(
@@ -6131,6 +6281,14 @@ impl LocalPane {
             }
             let mut terminal = self.locked_terminal();
             let result = terminal.trim_deferred_scrollback();
+            if !matches!(
+                result,
+                DeferredScrollbackTrim::Settled { moved: false }
+                    | DeferredScrollbackTrim::AdmissionBlocked { moved: false }
+            ) {
+                // Moved rows change the scrollback geometry.
+                self.render_facts.publish(&mut terminal);
+            }
             let current = self.scrollback_flush_sink.lock().clone();
             // Wake a queued reader before another geometry slice can
             // reacquire the mutex.
@@ -6307,18 +6465,27 @@ impl LocalPane {
     #[cfg(feature = "disruptor-pane-io")]
     #[inline]
     fn drain_action_ring_locked(&self, term: &mut Terminal) {
-        Self::drain_action_ring_into(self.action_ring.as_ref(), term);
+        if Self::drain_action_ring_into(self.action_ring.as_ref(), term) {
+            self.render_facts.publish(term);
+        }
     }
 
     /// Drain `action_ring` into `term` while the caller holds the terminal
-    /// mutex. This is shared by normal `LocalPane` terminal access and the
-    /// resize worker, whose static helper cannot call `locked_terminal`.
+    /// mutex, returning whether any batch was applied. This is shared by
+    /// normal `LocalPane` terminal access and the resize worker, whose static
+    /// helper cannot call `locked_terminal`.
     #[cfg(feature = "disruptor-pane-io")]
     #[inline]
-    fn drain_action_ring_into(action_ring: &ArrayQueue<AdmittedPaneActions>, term: &mut Terminal) {
+    fn drain_action_ring_into(
+        action_ring: &ArrayQueue<AdmittedPaneActions>,
+        term: &mut Terminal,
+    ) -> bool {
+        let mut applied = false;
         while let Some(actions) = action_ring.pop() {
             actions.apply(term);
+            applied = true;
         }
+        applied
     }
 
     /// Producer side (parser thread). If the terminal lock is free, drain any
@@ -6334,14 +6501,17 @@ impl LocalPane {
             return;
         }
         if let Some(mut term) = self.terminal.try_lock() {
-            self.drain_action_ring_locked(&mut term);
+            Self::drain_action_ring_into(self.action_ring.as_ref(), &mut term);
             actions.apply(&mut term);
+            self.render_facts.publish(&mut term);
             return;
         }
+        // A staged batch is published by whichever caller drains the ring.
         if let Err(actions) = self.action_ring.push(actions) {
             let mut term = self.terminal.lock();
-            self.drain_action_ring_locked(&mut term);
+            Self::drain_action_ring_into(self.action_ring.as_ref(), &mut term);
             actions.apply(&mut term);
+            self.render_facts.publish(&mut term);
         }
     }
 
@@ -6435,12 +6605,14 @@ impl LocalPane {
                 Arc::clone(&self.pty),
                 Arc::clone(&self.resize_queue),
                 Arc::clone(&self.mux_registration),
+                Arc::clone(&self.render_facts),
             );
         }
 
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_resize_worker(
         pane_id: PaneId,
         terminal: Arc<Mutex<Terminal>>,
@@ -6449,6 +6621,7 @@ impl LocalPane {
         pty: Arc<Mutex<Box<dyn MasterPty>>>,
         resize_queue: Arc<Mutex<ResizeQueueState>>,
         registration: Arc<PaneRegistrationSlot>,
+        render_facts: Arc<RenderFactsPublisher>,
     ) {
         let worker_terminal = Arc::clone(&terminal);
         let worker_line_layout_observation = Arc::clone(&line_layout_observation);
@@ -6457,6 +6630,7 @@ impl LocalPane {
         let worker_pty = Arc::clone(&pty);
         let worker_queue = Arc::clone(&resize_queue);
         let worker_registration = Arc::clone(&registration);
+        let worker_render_facts = Arc::clone(&render_facts);
         let spawn_result = std::thread::Builder::new()
             .name(format!("pane-resize-{}", pane_id))
             .spawn(move || {
@@ -6469,6 +6643,7 @@ impl LocalPane {
                     worker_pty,
                     worker_queue,
                     worker_registration,
+                    worker_render_facts,
                     true,
                 );
             });
@@ -6495,11 +6670,13 @@ impl LocalPane {
                 pty,
                 resize_queue,
                 registration,
+                render_facts,
                 false,
             );
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_resize_worker(
         pane_id: PaneId,
         terminal: Arc<Mutex<Terminal>>,
@@ -6508,6 +6685,7 @@ impl LocalPane {
         pty: Arc<Mutex<Box<dyn MasterPty>>>,
         resize_queue: Arc<Mutex<ResizeQueueState>>,
         registration: Arc<PaneRegistrationSlot>,
+        render_facts: Arc<RenderFactsPublisher>,
         allow_cold_preparation: bool,
     ) {
         while let Some(pending) = {
@@ -6535,6 +6713,9 @@ impl LocalPane {
             });
             let settled_apply_result = apply_result
                 .map(|result| recover_resize_apply_error(resize_queue.as_ref(), pending, result));
+            // Publish the committed geometry before any completion can wake
+            // a reader of the new size.
+            render_facts.publish(&mut terminal.lock());
             if matches!(&settled_apply_result, Ok(Ok(metrics)) if !metrics.cancelled) {
                 if let Some(registration) = pending_registration {
                     // Reconcile primary committed size before cold preparation waits,
@@ -6549,6 +6730,7 @@ impl LocalPane {
                             token,
                             registration,
                         );
+                        render_facts.publish(&mut terminal.lock());
                     }
                 }
             }
@@ -7398,8 +7580,13 @@ impl LocalPane {
             tmux_domain: Arc::clone(&tmux_domain),
             mux_registration: Arc::clone(&mux_registration),
         }));
+        let render_facts = Arc::new(RenderFactsPublisher::new(
+            &mut terminal,
+            Arc::clone(&tmux_domain),
+        ));
         terminal.set_notification_handler(Box::new(LocalPaneNotifHandler {
             staging: Arc::clone(&alert_staging),
+            render_facts: Arc::clone(&render_facts),
         }));
 
         let process = Arc::new(Mutex::new(ProcessState::Running {
@@ -7439,6 +7626,7 @@ impl LocalPane {
             writer: Mutex::new(writer),
             domain_id,
             tmux_domain,
+            render_facts,
             mux_registration,
             child_exit_prune,
             proc_list: Arc::clone(&proc_list),
@@ -9684,6 +9872,7 @@ mod tests {
                         Arc::clone(&pane.pty),
                         Arc::clone(&pane.resize_queue),
                         Arc::clone(&pane.mux_registration),
+                        Arc::clone(&pane.render_facts),
                         false,
                     );
                 });
@@ -9931,6 +10120,7 @@ mod tests {
                 Arc::clone(&target.pty),
                 Arc::clone(&target.resize_queue),
                 Arc::clone(&target.mux_registration),
+                Arc::clone(&target.render_facts),
                 true,
             );
             worker_done_tx.send(()).unwrap();
@@ -16631,6 +16821,166 @@ mod tests {
         // Pane close is a durability handoff (close marker), never a flush.
         pane.kill();
         assert_eq!(sink.handoffs.load(Ordering::SeqCst), handoffs + 1);
+    }
+
+    #[derive(Debug)]
+    struct RenderFactsTestConfig;
+
+    impl TerminalConfiguration for RenderFactsTestConfig {
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+    }
+
+    fn render_facts_test_pane(pane_id: PaneId) -> LocalPane {
+        make_legacy_test_pane(
+            pane_id,
+            Terminal::new(
+                term_size(80, 24),
+                Arc::new(RenderFactsTestConfig),
+                "FrankenTerm",
+                "render-facts-test",
+                Box::new(Vec::<u8>::new()),
+            ),
+        )
+    }
+
+    fn apply_output(pane: &LocalPane, output: &[u8]) -> Arc<crate::pane::PaneRenderFacts> {
+        let mut actions = Vec::new();
+        termwiz::escape::parser::Parser::new().parse(output, |action| actions.push(action));
+        pane.perform_actions(actions).expect("test action admission");
+        let facts = pane.render_facts();
+        // The publication matches the blocking accessors exactly.
+        assert_eq!(facts.seqno, pane.get_current_seqno());
+        assert_eq!(facts.cursor, pane.get_cursor_position());
+        assert_eq!(facts.dimensions, pane.get_dimensions());
+        assert_eq!(facts.mouse_grabbed, pane.is_mouse_grabbed());
+        assert_eq!(facts.alt_screen_active, pane.is_alt_screen_active());
+        assert_eq!(*facts.palette, pane.palette());
+        assert_eq!(&*facts.title, pane.terminal.lock().get_title());
+        facts
+    }
+
+    #[test]
+    fn render_facts_follow_every_render_relevant_change() {
+        let pane = render_facts_test_pane(790);
+        let initial = pane.render_facts();
+        assert_eq!(initial.dimensions, pane.get_dimensions());
+        assert_eq!(initial.cursor, pane.get_cursor_position());
+        assert!(!initial.mouse_grabbed && !initial.alt_screen_active);
+        assert!(!initial.bracketed_paste && !initial.focus_tracking);
+
+        let moved = apply_output(&pane, b"\x1b[5;10H");
+        assert_eq!((moved.cursor.x, moved.cursor.y), (9, 4));
+        assert!(moved.seqno > initial.seqno);
+
+        let mouse = apply_output(&pane, b"\x1b[?1000h");
+        assert!(mouse.mouse_grabbed);
+        let paste = apply_output(&pane, b"\x1b[?2004h");
+        assert!(paste.bracketed_paste);
+        let focus = apply_output(&pane, b"\x1b[?1004h");
+        assert!(focus.focus_tracking);
+
+        // A title change shares the unchanged palette by pointer.
+        let titled = apply_output(&pane, b"\x1b]2;facts-title\x07");
+        assert_eq!(&*titled.title, "facts-title");
+        assert_eq!(titled.palette_generation, focus.palette_generation);
+        assert!(Arc::ptr_eq(&titled.palette, &focus.palette));
+
+        // A dynamic color escape changes the palette generation and value;
+        // the unchanged title is shared by pointer.
+        let recolored = apply_output(&pane, b"\x1b]4;1;rgb:12/34/56\x1b\\");
+        assert_ne!(recolored.palette_generation, titled.palette_generation);
+        assert_ne!(recolored.palette.colors.0[1], titled.palette.colors.0[1]);
+        assert!(Arc::ptr_eq(&recolored.title, &titled.title));
+
+        let alt = apply_output(&pane, b"\x1b[?1049h");
+        assert!(alt.alt_screen_active);
+        let primary = apply_output(&pane, b"\x1b[?1049l");
+        assert!(!primary.alt_screen_active);
+        let scrolled = apply_output(&pane, &b"line\r\n".repeat(40));
+        assert!(scrolled.dimensions.scrollback_rows > primary.dimensions.scrollback_rows);
+
+        // Changes that do not come from output are published as well.
+        pane.focus_changed(true);
+        assert_eq!(pane.render_facts().seqno, pane.get_current_seqno());
+        pane.erase_scrollback(ScrollbackEraseMode::ScrollbackOnly);
+        assert_eq!(pane.render_facts().dimensions, pane.get_dimensions());
+        pane.set_config(Arc::new(RenderFactsTestConfig));
+        let reconfigured = pane.render_facts();
+        assert_eq!(*reconfigured.palette, pane.palette());
+
+        pane.resize(term_size(100, 30)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pane.render_facts().dimensions.cols != 100 {
+            assert!(Instant::now() < deadline, "resize was never published");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let resized = pane.render_facts();
+        assert_eq!(resized.dimensions, pane.get_dimensions());
+        assert_eq!(resized.dimensions.viewport_rows, 30);
+    }
+
+    #[test]
+    fn render_facts_reader_never_waits_for_the_terminal_mutex() {
+        let pane = render_facts_test_pane(791);
+        let published = apply_output(&pane, b"\x1b[3;7Hready");
+        let pane = &pane;
+        std::thread::scope(|scope| {
+            let held = pane.terminal.lock();
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            scope.spawn(move || tx.send(pane.render_facts()).unwrap());
+            let observed = rx.recv_timeout(Duration::from_secs(5));
+            drop(held);
+            let facts = observed.expect("render_facts waited on the terminal mutex");
+            assert!(Arc::ptr_eq(&facts, &published));
+        });
+    }
+
+    #[test]
+    fn render_facts_concurrent_readers_never_see_a_torn_publication() {
+        const BATCHES: usize = 2000;
+        let pane = render_facts_test_pane(792);
+        let pane = &pane;
+        let done = AtomicBool::new(false);
+        let done = &done;
+        std::thread::scope(|scope| {
+            let readers: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(move || {
+                        let mut reads = 0usize;
+                        let mut last_seqno = 0;
+                        while !done.load(Ordering::Acquire) || reads == 0 {
+                            let facts = pane.render_facts();
+                            assert!(facts.seqno >= last_seqno, "publications went backwards");
+                            last_seqno = facts.seqno;
+                            // Each batch sets the title and cursor column
+                            // together; a torn read would split them.
+                            if let Ok(batch) = facts.title.parse::<usize>() {
+                                assert_eq!(facts.cursor.x, batch % 80, "torn read");
+                            }
+                            reads += 1;
+                        }
+                        reads
+                    })
+                })
+                .collect();
+            for batch in 0..BATCHES {
+                let mut actions = Vec::new();
+                termwiz::escape::parser::Parser::new().parse(
+                    format!("\x1b]2;{batch}\x07\x1b[1;{}H", batch % 80 + 1).as_bytes(),
+                    |action| actions.push(action),
+                );
+                pane.perform_actions(actions).unwrap();
+            }
+            done.store(true, Ordering::Release);
+            for reader in readers {
+                assert!(reader.join().unwrap() > 0);
+            }
+        });
+        let last = pane.render_facts();
+        assert_eq!(&*last.title, format!("{}", BATCHES - 1));
+        assert_eq!(last.cursor.x, (BATCHES - 1) % 80);
     }
 
     fn seed_checkpoint_cold_rows(terminal: &mut Terminal, rows: &[&str]) {
