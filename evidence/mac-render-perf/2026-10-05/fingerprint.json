@@ -1,0 +1,45 @@
+{
+  "captured_at": "2026-10-05",
+  "host": {
+    "cpu": "Apple M4 Pro",
+    "cores_total": 14,
+    "performance_cores": 10,
+    "efficiency_cores": 4,
+    "gpu": "Apple M4 Pro, 20 cores, Metal 4",
+    "memory_bytes": 68719476736,
+    "display": "6144x3456",
+    "os": "macOS 26.2 (25C56)"
+  },
+  "load_conditions": {
+    "load_average_range": "36-100 (shared host; Blender, other agents' cargo builds)",
+    "swap_used_mb": 20133,
+    "swap_total_mb": 21504,
+    "note": "Numbers are provisional; quiet-window re-measurement required before claims."
+  },
+  "toolchains": {
+    "rustc": "1.100.0-nightly (908501772 2026-08-30)",
+    "zig_for_ghostty_bench": "0.16.0 (tarball sha256 b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489)"
+  },
+  "frankenterm": {
+    "installed_gui": "0.15.2 (319a56d), /Applications/.frankenterm-versions/0.15.2-319a56d, UUID 194ED72B-7E3B-32E0-9DBD-0865A015C0AE, stripped",
+    "head_measured": "fc3fd2121",
+    "ftbench_profile": "opt-level=3, lto=thin, codegen-units=1, debug=line-tables-only, RUSTFLAGS=-C force-frame-pointers=yes",
+    "operator_config": {
+      "front_end": "WebGpu",
+      "webgpu_power_preference": "HighPerformance",
+      "max_fps": 30,
+      "scrollback_lines": 100000,
+      "mux_output_parser_buffer_size": 524288,
+      "FRANKENTERM_LUA_CONFIG": "1"
+    }
+  },
+  "ghostty": {
+    "bench_source": "~/projects/ghostty @ e500d414f (ghostty 1.3.2-main), ReleaseFast, -Demit-macos-app=false",
+    "installed_app": "/Applications/Ghostty.app (version not pinned in this session)"
+  },
+  "corpora": {
+    "color-random.bin": {"bytes": 1157032581, "slice_used": "first 64 MiB"},
+    "color-emoji-random.bin": {"bytes": 749801000, "slice_used": "first 64 MiB"},
+    "seq-64m.txt": {"bytes": 67108864, "generator": "seq 1 9000000 | head -c 67108864"}
+  }
+}

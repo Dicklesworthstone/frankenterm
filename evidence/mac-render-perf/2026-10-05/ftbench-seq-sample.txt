@@ -1,0 +1,522 @@
+Analysis of sampling ftbench (pid 9296) every 1 millisecond
+Process:         ftbench [9296]
+Path:            /private/tmp/*/ftbench
+Load Address:    0x1027b8000
+Identifier:      ftbench
+Version:         0
+Code Type:       ARM64
+Platform:        macOS
+Parent Process:  zsh [9293]
+Target Type:     live task
+
+Date/Time:       2026-10-05 21:25:31.312 -0400
+Launch Time:     2026-10-05 21:25:29.800 -0400
+OS Version:      macOS 26.2 (25C56)
+Report Version:  7
+Analysis Tool:   /usr/bin/sample
+
+Physical footprint:         66.8M
+Physical footprint (peak):  66.8M
+Idle exit:                  untracked
+----
+
+Call graph:
+    2793 Thread_137771810   DispatchQueue_1: com.apple.main-thread  (serial)
+    + 2769 start  (in dyld) + 7184  [0x19d2add54]
+    + ! 2769 main  (in ftbench) + 52  [0x102a082e0]
+    + !   2769 _RNvNtCsgJzyKH87JnT_3std2rt19lang_start_internal  (in ftbench) + 932  [0x102b0d424]  rt.rs:171
+    + !     2769 _RNCINvNtCsgJzyKH87JnT_3std2rt10lang_startuE0Cs3nzhn0pXtJw_7ftbench  (in ftbench) + 16  [0x102a003c4]  rt.rs:206
+    + !       2769 _RINvNtNtCsgJzyKH87JnT_3std3sys9backtrace28___rust_begin_short_backtraceFEuuECs3nzhn0pXtJw_7ftbench  (in ftbench) + 12  [0x102a003a4]  backtrace.rs:166
+    + !         2631 _RNvCs3nzhn0pXtJw_7ftbench4main  (in ftbench) + 3128  [0x102a01094]  main.rs:111
+    + !         : 2581 _RNvXs6_NtCs5laRbLPCrL3_25frankenterm_escape_parser6parserINtB5_9PerformerNCINvMsa_NtCsf7v46mcL5oO_16frankenterm_term8terminalNtB1i_8Terminal13advance_bytesRShE0ENtCs5ncOCTRQuzF_7vtparse7VTActor16execute_c0_or_c1Cs3nzhn0pXtJw_7ftbench  (in ftbench) + 288  [0x102a0536c]  mod.rs:879
+    + !         : | 2574 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer7perform  (in ftbench) + 1408  [0x1029a9780]  performer.rs:560
+    + !         : | + 1937 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer7control  (in ftbench) + 60  [0x1029a87d8]  performer.rs:701
+    + !         : | + ! 1549 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer11flush_print  (in ftbench) + 7744  [0x1029a03c0]
+    + !         : | + ! : 1463 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen18set_ascii_cell_run  (in ftbench) + 564  [0x1029bdd10]  screen.rs:9110
+    + !         : | + ! : | 782 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line13set_cell_impl  (in ftbench) + 964  [0x1029318f0]
+    + !         : | + ! : | + 182 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 92  [0x1029359f8]  clusterline.rs:361
+    + !         : | + ! : | + ! 61 _RNvXsA_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributesNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench) + 108,1796,...  [0x1029372a0,0x102937938,...]  lib.rs:0
+    + !         : | + ! : | + ! 37 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 92  [0x1029359f8]  clusterline.rs:361
+    + !         : | + ! : | + ! : 37 _RNvXsA_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributesNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench) + 128,124  [0x1029372b4,0x1029372b0]  lib.rs:78
+    + !         : | + ! : | + ! 36 _RNvXsA_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributesNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench) + 56,68  [0x10293726c,0x102937278]  lib.rs:74
+    + !         : | + ! : | + ! 35 _RNvXsA_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributesNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench) + 32  [0x102937254]  lib.rs:72
+    + !         : | + ! : | + ! 13 _RNvXsA_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributesNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench) + 4  [0x102937238]  lib.rs:70
+    + !         : | + ! : | + 172 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 60  [0x1029359d8]  clusterline.rs:358
+    + !         : | + ! : | + ! 67 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 20  [0x102936624]  clusterline.rs:60
+    + !         : | + ! : | + ! 61 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 140,164,...  [0x10293669c,0x1029366b4,...]  clusterline.rs:67
+    + !         : | + ! : | + ! 21 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 36  [0x102936634]  clusterline.rs:63
+    + !         : | + ! : | + ! 9 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 4,12  [0x102936614,0x10293661c]  clusterline.rs:58
+    + !         : | + ! : | + ! 7 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 188  [0x1029366cc]  clusterline.rs:69
+    + !         : | + ! : | + ! 3 _xzm_free  (in libsystem_malloc.dylib) + 20,48,...  [0x19d495758,0x19d495774,...]
+    + !         : | + ! : | + ! 1 DYLD-STUB$$free  (in ftbench) + 0  [0x102b55d84]
+    + !         : | + ! : | + ! 1 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 76  [0x10293665c]  clusterline.rs:70
+    + !         : | + ! : | + ! 1 _free  (in libsystem_malloc.dylib) + 76  [0x19d4a2a78]
+    + !         : | + ! : | + ! 1 _xzm_free  (in libsystem_malloc.dylib) + 348  [0x19d4958a0]
+    + !         : | + ! : | + !   1 _platform_memset  (in libsystem_platform.dylib) + 160  [0x19d67f130]
+    + !         : | + ! : | + 160 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 208,188,...  [0x102935a6c,0x102935a58,...]  clusterline.rs:378
+    + !         : | + ! : | + 108 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 232  [0x102935a84]  clusterline.rs:378
+    + !         : | + ! : | + ! 60 _platform_memmove  (in libsystem_platform.dylib) + 460,12,...  [0x19d67f52c,0x19d67f36c,...]
+    + !         : | + ! : | + ! 48 DYLD-STUB$$memcpy  (in ftbench) + 4  [0x102b55df4]
+    + !         : | + ! : | + 48 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 104  [0x102935a04]  clusterline.rs:372
+    + !         : | + ! : | + 37 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 88  [0x102936668]  clusterline.rs:70
+    + !         : | + ! : | + 23 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 16,0,...  [0x1029359ac,0x10293599c,...]  clusterline.rs:356
+    + !         : | + ! : | + 22 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 156  [0x102935a38]  clusterline.rs:374
+    + !         : | + ! : | + ! 22 _RNvMs4_NtCs1jdKuBkKU2H_5alloc7raw_vecINtB5_6RawVecNtCs1rDNFHUrGL6_16frankenterm_cell4CellE8grow_oneCsa23bS6AsMV0_19frankenterm_surface  (in ftbench) + 60  [0x102b446c0]  mod.rs:188
+    + !         : | + ! : | + !   12 _RNvMs5_NtCs1jdKuBkKU2H_5alloc7raw_vecNtB5_11RawVecInner11finish_growCsa23bS6AsMV0_19frankenterm_surface  (in ftbench) + 8,280,...  [0x102b447cc,0x102b448dc,...]
+    + !         : | + ! : | + !   10 _RNvMs5_NtCs1jdKuBkKU2H_5alloc7raw_vecNtB5_11RawVecInner11finish_growCsa23bS6AsMV0_19frankenterm_surface  (in ftbench) + 280  [0x102b448dc]
+    + !         : | + ! : | + !     5 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 64,0,...  [0x19d4950cc,0x19d49508c,...]
+    + !         : | + ! : | + !     3 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 276,108  [0x19d494d34,0x19d494c8c]
+    + !         : | + ! : | + !     2 _malloc_zone_malloc  (in libsystem_malloc.dylib) + 12,64  [0x19d4a1e10,0x19d4a1e44]
+    + !         : | + ! : | + 13 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 328,316  [0x102935ae4,0x102935ad8]  clusterline.rs:395
+    + !         : | + ! : | + 11 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 572,336  [0x102935bd8,0x102935aec]  clusterline.rs:396
+    + !         : | + ! : | + 5 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 60,148  [0x1029359d8,0x102935a30]  clusterline.rs:359
+    + !         : | + ! : | + 1 _xzm_free  (in libsystem_malloc.dylib) + 1352  [0x19d495c8c]
+    + !         : | + ! : | 304 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line13set_cell_impl  (in ftbench) + 928  [0x1029318cc]
+    + !         : | + ! : | + 215 _RNvMsB_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE8make_mutBM_  (in ftbench) + 176  [0x1029356c8]  sync.rs:2657
+    + !         : | + ! : | + 73 _RNvMsB_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE8make_mutBM_  (in ftbench) + 36,32  [0x10293563c,0x102935638]  sync.rs:2591
+    + !         : | + ! : | + 11 _RNvMsB_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE8make_mutBM_  (in ftbench) + 0  [0x102935618]  sync.rs:2580
+    + !         : | + ! : | + 3 _RNvMsB_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE8make_mutBM_  (in ftbench) + 24  [0x102935630]  sync.rs:2581
+    + !         : | + ! : | + 2 _RNvMsB_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE8make_mutBM_  (in ftbench) + 180  [0x1029356cc]  sync.rs:2658
+    + !         : | + ! : | 166 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line13set_cell_impl  (in ftbench) + 1020  [0x102931928]
+    + !         : | + ! : | + 65 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine6append  (in ftbench) + 488  [0x102935efc]  clusterline.rs:468
+    + !         : | + ! : | + ! 63 _platform_memmove  (in libsystem_platform.dylib) + 460,12,...  [0x19d67f52c,0x19d67f36c,...]
+    + !         : | + ! : | + ! 2 DYLD-STUB$$memcpy  (in ftbench) + 4  [0x102b55df4]
+    + !         : | + ! : | + 25 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine6append  (in ftbench) + 172  [0x102935dc0]  clusterline.rs:445
+    + !         : | + ! : | + ! 8 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 20  [0x102936624]  clusterline.rs:60
+    + !         : | + ! : | + ! 6 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 140,164,...  [0x10293669c,0x1029366b4,...]  clusterline.rs:67
+    + !         : | + ! : | + ! 4 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 188,208  [0x1029366cc,0x1029366e0]  clusterline.rs:69
+    + !         : | + ! : | + ! 3 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 76  [0x10293665c]  clusterline.rs:70
+    + !         : | + ! : | + ! 1 DYLD-STUB$$free  (in ftbench) + 0  [0x102b55d84]
+    + !         : | + ! : | + ! 1 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 0  [0x102936610]  clusterline.rs:58
+    + !         : | + ! : | + ! 1 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 36  [0x102936634]  clusterline.rs:63
+    + !         : | + ! : | + ! 1 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 48  [0x102936640]  clusterline.rs:64
+    + !         : | + ! : | + 24 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine6append  (in ftbench) + 204  [0x102935de0]  clusterline.rs:448
+    + !         : | + ! : | + ! 13 _RNvXsA_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributesNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench) + 1796,1780,...  [0x102937938,0x102937928,...]  lib.rs:0
+    + !         : | + ! : | + ! 6 _RNvXsA_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributesNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench) + 56,68  [0x10293726c,0x102937278]  lib.rs:74
+    + !         : | + ! : | + ! 3 _RNvXsA_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributesNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench) + 4  [0x102937238]  lib.rs:70
+    + !         : | + ! : | + ! 1 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine6append  (in ftbench) + 204  [0x102935de0]  clusterline.rs:448
+    + !         : | + ! : | + ! : 1 _RNvXsA_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributesNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench) + 124  [0x1029372b0]  lib.rs:78
+    + !         : | + ! : | + ! 1 _RNvXsA_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributesNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench) + 32  [0x102937254]  lib.rs:72
+    + !         : | + ! : | + 15 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine6append  (in ftbench) + 0,16  [0x102935d14,0x102935d24]  clusterline.rs:443
+    + !         : | + ! : | + 12 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine6append  (in ftbench) + 232,1032,...  [0x102935dfc,0x10293611c,...]  clusterline.rs:468
+    + !         : | + ! : | + 8 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine6append  (in ftbench) + 860,756  [0x102936070,0x102936008]  clusterline.rs:486
+    + !         : | + ! : | + 6 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine6append  (in ftbench) + 36  [0x102935d38]  clusterline.rs:444
+    + !         : | + ! : | + 5 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 88  [0x102936668]  clusterline.rs:70
+    + !         : | + ! : | + 3 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine6append  (in ftbench) + 100  [0x102935d78]  clusterline.rs:445
+    + !         : | + ! : | + 1 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine6append  (in ftbench) + 216  [0x102935dec]  clusterline.rs:459
+    + !         : | + ! : | + 1 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine6append  (in ftbench) + 228  [0x102935df8]  clusterline.rs:466
+    + !         : | + ! : | + 1 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine6append  (in ftbench) + 992  [0x1029360f4]  unix.rs:0
+    + !         : | + ! : | 88 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line13set_cell_impl  (in ftbench) + 968,920,...  [0x1029318f4,0x1029318c4,...]
+    + !         : | + ! : | 50 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line13set_cell_impl  (in ftbench) + 996  [0x102931910]
+    + !         : | + ! : | + 27 _RNvMsB_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE8make_mutBM_  (in ftbench) + 176  [0x1029356c8]  sync.rs:2657
+    + !         : | + ! : | + 15 _RNvMsB_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE8make_mutBM_  (in ftbench) + 36  [0x10293563c]  sync.rs:2591
+    + !         : | + ! : | + 7 _RNvMsB_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE8make_mutBM_  (in ftbench) + 44  [0x102935644]  sync.rs:2594
+    + !         : | + ! : | + 1 _RNvMsB_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE8make_mutBM_  (in ftbench) + 56  [0x102935650]  sync.rs:2652
+    + !         : | + ! : | 30 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 592  [0x102935bec]  clusterline.rs:396
+    + !         : | + ! : | 21 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line13set_cell_impl  (in ftbench) + 400  [0x1029316bc]
+    + !         : | + ! : | + 17 _RNvXsj_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_11TeenyStringNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench) + 0,136,...  [0x1028e5508,0x1028e5590,...]  lib.rs:1302
+    + !         : | + ! : | + 4 _RNvXsj_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_11TeenyStringNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench) + 120  [0x1028e5580]  lib.rs:1302
+    + !         : | + ! : | +   3 _platform_memcmp  (in libsystem_platform.dylib) + 272  [0x19d67cfe0]
+    + !         : | + ! : | +   1 _RNvXsj_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_11TeenyStringNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench) + 128  [0x1028e5588]  lib.rs:1302
+    + !         : | + ! : | 18 _RNvMsB_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE8make_mutBM_  (in ftbench) + 188  [0x1029356d4]  sync.rs:2658
+    + !         : | + ! : | 4 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine6append  (in ftbench) + 884  [0x102936088]  clusterline.rs:486
+    + !         : | + ! : 38 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen18set_ascii_cell_run  (in ftbench) + 540  [0x1029bdcf8]  screen.rs:9110
+    + !         : | + ! : | 22 _RNvMsn_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_4Cell3new  (in ftbench) + 216  [0x10289935c]  lib.rs:1345
+    + !         : | + ! : | 14 _RNvMsn_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_4Cell3new  (in ftbench) + 8,0,...  [0x10289928c,0x102899284,...]  lib.rs:1343
+    + !         : | + ! : | 2 _RNvMsn_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_4Cell3new  (in ftbench) + 32  [0x1028992a4]  lib.rs:1344
+    + !         : | + ! : 15 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen18set_ascii_cell_run  (in ftbench) + 576,500,...  [0x1029bdd1c,0x1029bdcd0,...]  screen.rs:9109
+    + !         : | + ! : 9 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen18set_ascii_cell_run  (in ftbench) + 288  [0x1029bdbfc]  screen.rs:9103
+    + !         : | + ! : | 4 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line21append_ascii_cell_run  (in ftbench) + 528  [0x102932eec]  line.rs:1457
+    + !         : | + ! : | 3 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line21append_ascii_cell_run  (in ftbench) + 84,68  [0x102932d30,0x102932d20]  line.rs:1436
+    + !         : | + ! : | 2 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line21append_ascii_cell_run  (in ftbench) + 4,8  [0x102932ce0,0x102932ce4]  line.rs:1423
+    + !         : | + ! : 5 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line13set_cell_impl  (in ftbench) + 1348,1344  [0x102931a70,0x102931a6c]
+    + !         : | + ! : 5 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen18set_ascii_cell_run  (in ftbench) + 96  [0x1029bdb3c]  screen.rs:9099
+    + !         : | + ! : | 5 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen26invalidate_last_good_frame  (in ftbench) + 12,0  [0x1029bf418,0x1029bf40c]  screen.rs:6840
+    + !         : | + ! : 4 _RNvMsn_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_4Cell3new  (in ftbench) + 232  [0x10289936c]  lib.rs:1349
+    + !         : | + ! : 3 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen18set_ascii_cell_run  (in ftbench) + 0  [0x1029bdadc]  screen.rs:9086
+    + !         : | + ! : 2 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen18set_ascii_cell_run  (in ftbench) + 208,268  [0x1029bdbac,0x1029bdbe8]  screen.rs:9103
+    + !         : | + ! : 2 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen18set_ascii_cell_run  (in ftbench) + 524  [0x1029bdce8]  screen.rs:9110
+    + !         : | + ! : 1 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line21append_ascii_cell_run  (in ftbench) + 612  [0x102932f40]  line.rs:1457
+    + !         : | + ! : 1 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen18set_ascii_cell_run  (in ftbench) + 96  [0x1029bdb3c]  screen.rs:9100
+    + !         : | + ! : 1 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen26invalidate_last_good_frame  (in ftbench) + 528  [0x1029bf61c]  screen.rs:6870
+    + !         : | + ! 244 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer11flush_print  (in ftbench) + 7544  [0x1029a02f8]
+    + !         : | + ! : 235 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen17set_cell_grapheme  (in ftbench) + 188  [0x1029bda8c]  screen.rs:9083
+    + !         : | + ! : | 156 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line17set_cell_grapheme  (in ftbench) + 348  [0x1029321b0]  line.rs:1406
+    + !         : | + ! : | + 83 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 60  [0x1029359d8]  clusterline.rs:358
+    + !         : | + ! : | + ! 45 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 140,164  [0x10293669c,0x1029366b4]  clusterline.rs:67
+    + !         : | + ! : | + ! 10 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 20  [0x102936624]  clusterline.rs:60
+    + !         : | + ! : | + ! 10 _xzm_free  (in libsystem_malloc.dylib) + 448,348  [0x19d495904,0x19d4958a0]
+    + !         : | + ! : | + ! 7 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 188  [0x1029366cc]  clusterline.rs:69
+    + !         : | + ! : | + ! 4 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 48  [0x102936640]  clusterline.rs:64
+    + !         : | + ! : | + ! 3 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 36  [0x102936634]  clusterline.rs:63
+    + !         : | + ! : | + ! 3 _xzm_free  (in libsystem_malloc.dylib) + 348  [0x19d4958a0]
+    + !         : | + ! : | + ! : 3 __bzero  (in libsystem_platform.dylib) + 24  [0x19d67f048]
+    + !         : | + ! : | + ! 1 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 4  [0x102936614]  clusterline.rs:58
+    + !         : | + ! : | + 37 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 92  [0x1029359f8]  clusterline.rs:361
+    + !         : | + ! : | + ! 20 _RNvXsA_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributesNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench) + 1796,108,...  [0x102937938,0x1029372a0,...]  lib.rs:0
+    + !         : | + ! : | + ! 12 _RNvXsA_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributesNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench) + 56,68  [0x10293726c,0x102937278]  lib.rs:74
+    + !         : | + ! : | + ! 2 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 92  [0x1029359f8]  clusterline.rs:361
+    + !         : | + ! : | + ! : 2 _RNvXsA_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributesNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench) + 128  [0x1029372b4]  lib.rs:78
+    + !         : | + ! : | + ! 2 _RNvXsA_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributesNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench) + 4  [0x102937238]  lib.rs:70
+    + !         : | + ! : | + ! 1 _RNvXsA_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributesNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench) + 32  [0x102937254]  lib.rs:72
+    + !         : | + ! : | + 11 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 88  [0x102936668]  clusterline.rs:70
+    + !         : | + ! : | + 7 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 192,236,...  [0x102935a5c,0x102935a88,...]  clusterline.rs:378
+    + !         : | + ! : | + 6 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 232  [0x102935a84]  clusterline.rs:378
+    + !         : | + ! : | + ! 4 _platform_memmove  (in libsystem_platform.dylib) + 448,436,...  [0x19d67f520,0x19d67f514,...]
+    + !         : | + ! : | + ! 2 DYLD-STUB$$memcpy  (in ftbench) + 4  [0x102b55df4]
+    + !         : | + ! : | + 4 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 92  [0x1029359f8]  clusterline.rs:361
+    + !         : | + ! : | + 4 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 328  [0x102935ae4]  clusterline.rs:395
+    + !         : | + ! : | + 1 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 52  [0x1029359d0]  clusterline.rs:358
+    + !         : | + ! : | + 1 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 104  [0x102935a04]  clusterline.rs:372
+    + !         : | + ! : | + 1 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 156  [0x102935a38]  clusterline.rs:374
+    + !         : | + ! : | + ! 1 _RNvMs5_NtCs1jdKuBkKU2H_5alloc7raw_vecNtB5_11RawVecInner11finish_growCsa23bS6AsMV0_19frankenterm_surface  (in ftbench) + 324  [0x102b44908]
+    + !         : | + ! : | + 1 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 572  [0x102935bd8]  clusterline.rs:396
+    + !         : | + ! : | 45 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line17set_cell_grapheme  (in ftbench) + 312  [0x10293218c]  line.rs:1406
+    + !         : | + ! : | + 30 _RNvMsB_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE8make_mutBM_  (in ftbench) + 176  [0x1029356c8]  sync.rs:2657
+    + !         : | + ! : | + 10 _RNvMsB_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE8make_mutBM_  (in ftbench) + 36,32  [0x10293563c,0x102935638]  sync.rs:2591
+    + !         : | + ! : | + 3 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line17set_cell_grapheme  (in ftbench) + 348  [0x1029321b0]  line.rs:1406
+    + !         : | + ! : | + ! 3 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 0  [0x10293599c]  clusterline.rs:356
+    + !         : | + ! : | + 2 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 92  [0x1029359f8]  clusterline.rs:361
+    + !         : | + ! : | +   2 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line17set_cell_grapheme  (in ftbench) + 348  [0x1029321b0]  line.rs:1406
+    + !         : | + ! : | +     2 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 16  [0x1029359ac]  clusterline.rs:356
+    + !         : | + ! : | 11 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line17set_cell_grapheme  (in ftbench) + 400  [0x1029321e4]  line.rs:1409
+    + !         : | + ! : | + 6 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 136  [0x102935a24]  clusterline.rs:374
+    + !         : | + ! : | + 3 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 188  [0x102935a58]  clusterline.rs:378
+    + !         : | + ! : | + 1 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 156  [0x102935a38]  clusterline.rs:374
+    + !         : | + ! : | + ! 1 _RNvMs4_NtCs1jdKuBkKU2H_5alloc7raw_vecINtB5_6RawVecNtCs1rDNFHUrGL6_16frankenterm_cell4CellE8grow_oneCsa23bS6AsMV0_19frankenterm_surface  (in ftbench) + 60  [0x102b446c0]  mod.rs:188
+    + !         : | + ! : | + !   1 _RNvMs5_NtCs1jdKuBkKU2H_5alloc7raw_vecNtB5_11RawVecInner11finish_growCsa23bS6AsMV0_19frankenterm_surface  (in ftbench) + 280  [0x102b448dc]
+    + !         : | + ! : | + !     1 _malloc_zone_malloc  (in libsystem_malloc.dylib) + 120  [0x19d4a1e7c]
+    + !         : | + ! : | + 1 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 232  [0x102935a84]  clusterline.rs:378
+    + !         : | + ! : | +   1 _platform_memmove  (in libsystem_platform.dylib) + 444  [0x19d67f51c]
+    + !         : | + ! : | 9 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line17set_cell_grapheme  (in ftbench) + 380  [0x1029321d0]  line.rs:1409
+    + !         : | + ! : | + 6 _RNvMsB_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE8make_mutBM_  (in ftbench) + 176  [0x1029356c8]  sync.rs:2657
+    + !         : | + ! : | + 1 _RNvMsB_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE8make_mutBM_  (in ftbench) + 24  [0x102935630]  sync.rs:2581
+    + !         : | + ! : | + 1 _RNvMsB_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE8make_mutBM_  (in ftbench) + 36  [0x10293563c]  sync.rs:2591
+    + !         : | + ! : | + 1 _RNvMsB_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE8make_mutBM_  (in ftbench) + 56  [0x102935650]  sync.rs:2652
+    + !         : | + ! : | 4 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line17set_cell_grapheme  (in ftbench) + 288,348,...  [0x102932174,0x1029321b0,...]  line.rs:1403
+    + !         : | + ! : | 4 _RNvMsB_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE8make_mutBM_  (in ftbench) + 188  [0x1029356d4]  sync.rs:2658
+    + !         : | + ! : | 3 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line17set_cell_grapheme  (in ftbench) + 16  [0x102932064]  line.rs:1380
+    + !         : | + ! : | 3 _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 592  [0x102935bec]  clusterline.rs:396
+    + !         : | + ! : 6 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen17set_cell_grapheme  (in ftbench) + 76  [0x1029bda1c]  screen.rs:9080
+    + !         : | + ! : | 5 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen26invalidate_last_good_frame  (in ftbench) + 28  [0x1029bf428]  screen.rs:6845
+    + !         : | + ! : | 1 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen26invalidate_last_good_frame  (in ftbench) + 516  [0x1029bf610]  screen.rs:6870
+    + !         : | + ! : 2 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen17set_cell_grapheme  (in ftbench) + 48  [0x1029bda00]  screen.rs:9071
+    + !         : | + ! : 1 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line17set_cell_grapheme  (in ftbench) + 552  [0x10293227c]  line.rs:1418
+    + !         : | + ! 48 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer11flush_print  (in ftbench) + 6688,6920,...  [0x10299ffa0,0x1029a0088,...]
+    + !         : | + ! 31 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer11flush_print  (in ftbench) + 6580  [0x10299ff34]
+    + !         : | + ! : 31 _RNvMs4_NtCsf7v46mcL5oO_16frankenterm_term13terminalstateNtB5_13TerminalState9scroll_up  (in ftbench) + 172  [0x1029b476c]  mod.rs:1552
+    + !         : | + ! :   30 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen24scroll_up_within_margins  (in ftbench) + 388  [0x1029be4e8]  screen.rs:9288
+    + !         : | + ! :   | 27 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 1552  [0x1029c1274]  screen.rs:9482
+    + !         : | + ! :   | + 23 _RINvNtCsk2lpRxBXOWX_4core3ptr9drop_glueNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line4line4LineECsf7v46mcL5oO_16frankenterm_term  (in ftbench) + 52  [0x10295e494]  mod.rs:848
+    + !         : | + ! :   | + ! 19 _RNvMsn_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE9drop_slowBM_  (in ftbench) + 60,28,...  [0x1029362f8,0x1029362d8,...]  sync.rs:2200
+    + !         : | + ! :   | + ! 2 _RNvMsn_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE9drop_slowBM_  (in ftbench) + 132  [0x102936340]  sync.rs:2200
+    + !         : | + ! :   | + ! : 1 _xzm_free  (in libsystem_malloc.dylib) + 348  [0x19d4958a0]
+    + !         : | + ! :   | + ! : | 1 _platform_memset  (in libsystem_platform.dylib) + 108  [0x19d67f0fc]
+    + !         : | + ! :   | + ! : 1 _xzm_free  (in libsystem_malloc.dylib) + 460  [0x19d495910]
+    + !         : | + ! :   | + ! 1 DYLD-STUB$$free  (in ftbench) + 0  [0x102b55d84]
+    + !         : | + ! :   | + ! 1 _xzm_free  (in libsystem_malloc.dylib) + 1352  [0x19d495c8c]
+    + !         : | + ! :   | + 3 _RINvNtCsk2lpRxBXOWX_4core3ptr9drop_glueINtNtNtNtCsgJzyKH87JnT_3std4sync6poison5mutex5MutexINtNtB4_6option6OptionINtNtCs1jdKuBkKU2H_5alloc4sync4WeakDNtNtB4_3any3AnyNtNtB4_6marker4SendNtB2D_4SyncEL_EEEECsf7v46mcL5oO_16frankenterm_term  (in ftbench) + 0,40  [0x10295a538,0x10295a560]  mod.rs:848
+    + !         : | + ! :   | + 1 _RINvNtCsk2lpRxBXOWX_4core3ptr9drop_glueNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line4line4LineECsf7v46mcL5oO_16frankenterm_term  (in ftbench) + 44  [0x10295e48c]  mod.rs:848
+    + !         : | + ! :   | 2 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 1320  [0x1029c118c]  screen.rs:9469
+    + !         : | + ! :   | + 2 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line3new  (in ftbench) + 32  [0x102934bcc]  line.rs:406
+    + !         : | + ! :   | +   1 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 208  [0x19d494cf0]
+    + !         : | + ! :   | +   1 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 76  [0x19d4950d8]
+    + !         : | + ! :   | 1 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 20  [0x1029c0c78]  screen.rs:9368
+    + !         : | + ! :   1 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen26invalidate_last_good_frame  (in ftbench) + 528  [0x1029bf61c]  screen.rs:6870
+    + !         : | + ! 22 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer11flush_print  (in ftbench) + 5304  [0x10299fa38]
+    + !         : | + ! : 13 _RNvXs_NtCsjDmDvoU97ux_12finl_unicode17grapheme_clustersNtB4_9GraphemesNtNtNtNtCsk2lpRxBXOWX_4core4iter6traits8iterator8Iterator4next  (in ftbench) + 944,400  [0x1029ec854,0x1029ec634]  grapheme_clusters.rs:66
+    + !         : | + ! : 4 _RNvXs_NtCsjDmDvoU97ux_12finl_unicode17grapheme_clustersNtB4_9GraphemesNtNtNtNtCsk2lpRxBXOWX_4core4iter6traits8iterator8Iterator4next  (in ftbench) + 996,1024,...  [0x1029ec888,0x1029ec8a4,...]  grapheme_clusters.rs:69
+    + !         : | + ! : 2 _RNvXs_NtCsjDmDvoU97ux_12finl_unicode17grapheme_clustersNtB4_9GraphemesNtNtNtNtCsk2lpRxBXOWX_4core4iter6traits8iterator8Iterator4next  (in ftbench) + 204  [0x1029ec570]  grapheme_clusters.rs:62
+    + !         : | + ! : 2 _RNvXs_NtCsjDmDvoU97ux_12finl_unicode17grapheme_clustersNtB4_9GraphemesNtNtNtNtCsk2lpRxBXOWX_4core4iter6traits8iterator8Iterator4next  (in ftbench) + 1236  [0x1029ec978]  grapheme_clusters.rs:65
+    + !         : | + ! : 1 _RNvXs_NtCsjDmDvoU97ux_12finl_unicode17grapheme_clustersNtB4_9GraphemesNtNtNtNtCsk2lpRxBXOWX_4core4iter6traits8iterator8Iterator4next  (in ftbench) + 212  [0x1029ec578]  grapheme_clusters.rs:63
+    + !         : | + ! 19 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer11flush_print  (in ftbench) + 7684  [0x1029a0384]
+    + !         : | + ! : 19 _RINvMs0_NtNtCsgJzyKH87JnT_3std4sync4onceNtB6_4Once15call_once_forceNCNvMNtB8_9lazy_lockINtB18_8LazyLockbE5force0ECsf7v46mcL5oO_16frankenterm_term  (in ftbench) + 16  [0x102941a14]  once.rs:227
+    + !         : | + ! 16 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer11flush_print  (in ftbench) + 5480  [0x10299fae8]
+    + !         : | + ! : 13 _RNvCs1rDNFHUrGL6_16frankenterm_cell21grapheme_column_width  (in ftbench) + 36  [0x102830ec8]  lib.rs:1556
+    + !         : | + ! : 3 _RNvMso_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14UnicodeVersion7wcwidth  (in ftbench) + 520,0  [0x102899864,0x10289965c]
+    + !         : | + ! 6 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer11flush_print  (in ftbench) + 6532  [0x10299ff04]
+    + !         : | + ! : 6 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line25set_last_cell_was_wrapped  (in ftbench) + 860  [0x10293431c]  line.rs:1890
+    + !         : | + ! 1 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen18set_ascii_cell_run  (in ftbench) + 484  [0x1029bdcc0]  screen.rs:9112
+    + !         : | + ! 1 _RNvXs_NtCsjDmDvoU97ux_12finl_unicode17grapheme_clustersNtB4_9GraphemesNtNtNtNtCsk2lpRxBXOWX_4core4iter6traits8iterator8Iterator4next  (in ftbench) + 1560  [0x1029ecabc]  grapheme_clusters.rs:89
+    + !         : | + 580 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer7control  (in ftbench) + 200  [0x1029a8864]  performer.rs:705
+    + !         : | + ! 547 _RNvMs4_NtCsf7v46mcL5oO_16frankenterm_term13terminalstateNtB5_13TerminalState9scroll_up  (in ftbench) + 172  [0x1029b476c]  mod.rs:1552
+    + !         : | + ! : 520 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen24scroll_up_within_margins  (in ftbench) + 388  [0x1029be4e8]  screen.rs:9288
+    + !         : | + ! : | 386 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 1552  [0x1029c1274]  screen.rs:9482
+    + !         : | + ! : | + 370 _RINvNtCsk2lpRxBXOWX_4core3ptr9drop_glueNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line4line4LineECsf7v46mcL5oO_16frankenterm_term  (in ftbench) + 52  [0x10295e494]  mod.rs:848
+    + !         : | + ! : | + ! 267 _RNvMsn_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE9drop_slowBM_  (in ftbench) + 60,28,...  [0x1029362f8,0x1029362d8,...]  sync.rs:2200
+    + !         : | + ! : | + ! 37 _RNvMsn_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE9drop_slowBM_  (in ftbench) + 80  [0x10293630c]  sync.rs:2200
+    + !         : | + ! : | + ! : 29 _xzm_free  (in libsystem_malloc.dylib) + 348,28,...  [0x19d4958a0,0x19d495760,...]
+    + !         : | + ! : | + ! : 4 _free  (in libsystem_malloc.dylib) + 44  [0x19d4a2a58]
+    + !         : | + ! : | + ! : 3 _xzm_free  (in libsystem_malloc.dylib) + 348  [0x19d4958a0]
+    + !         : | + ! : | + ! : | 3 _platform_memset  (in libsystem_platform.dylib) + 140,160  [0x19d67f11c,0x19d67f130]
+    + !         : | + ! : | + ! : 1 DYLD-STUB$$free  (in ftbench) + 4  [0x102b55d88]
+    + !         : | + ! : | + ! 33 _RNvMsn_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE9drop_slowBM_  (in ftbench) + 132  [0x102936340]  sync.rs:2200
+    + !         : | + ! : | + ! : 20 _xzm_free  (in libsystem_malloc.dylib) + 460,240,...  [0x19d495910,0x19d495834,...]
+    + !         : | + ! : | + ! : 7 _RINvNtCsk2lpRxBXOWX_4core3ptr9drop_glueINtNtCs1jdKuBkKU2H_5alloc3vec3VecNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline7ClusterEEB1e_  (in ftbench) + 68,52  [0x10292f798,0x10292f788]
+    + !         : | + ! : | + ! : 4 _free  (in libsystem_malloc.dylib) + 0,44  [0x19d4a2a2c,0x19d4a2a58]
+    + !         : | + ! : | + ! : 1 DYLD-STUB$$free  (in ftbench) + 0  [0x102b55d84]
+    + !         : | + ! : | + ! : 1 _xzm_free  (in libsystem_malloc.dylib) + 348  [0x19d4958a0]
+    + !         : | + ! : | + ! :   1 _platform_memset  (in libsystem_platform.dylib) + 160  [0x19d67f130]
+    + !         : | + ! : | + ! 25 _xzm_free  (in libsystem_malloc.dylib) + 120,516,...  [0x19d4957bc,0x19d495948,...]
+    + !         : | + ! : | + ! 3 _free  (in libsystem_malloc.dylib) + 0,64,...  [0x19d4a2a2c,0x19d4a2a6c,...]
+    + !         : | + ! : | + ! 2 DYLD-STUB$$free  (in ftbench) + 0  [0x102b55d84]
+    + !         : | + ! : | + ! 2 _RNvMsn_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE9drop_slowBM_  (in ftbench) + 152,160  [0x102936354,0x10293635c]  sync.rs:2201
+    + !         : | + ! : | + ! 1 _xzm_free  (in libsystem_malloc.dylib) + 348  [0x19d4958a0]
+    + !         : | + ! : | + !   1 __bzero  (in libsystem_platform.dylib) + 12  [0x19d67f03c]
+    + !         : | + ! : | + 14 _RINvNtCsk2lpRxBXOWX_4core3ptr9drop_glueNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line4line4LineECsf7v46mcL5oO_16frankenterm_term  (in ftbench) + 44  [0x10295e48c]  mod.rs:848
+    + !         : | + ! : | + 2 _RINvNtCsk2lpRxBXOWX_4core3ptr9drop_glueINtNtNtNtCsgJzyKH87JnT_3std4sync6poison5mutex5MutexINtNtB4_6option6OptionINtNtCs1jdKuBkKU2H_5alloc4sync4WeakDNtNtB4_3any3AnyNtNtB4_6marker4SendNtB2D_4SyncEL_EEEECsf7v46mcL5oO_16frankenterm_term  (in ftbench) + 0,16  [0x10295a538,0x10295a548]  mod.rs:848
+    + !         : | + ! : | 33 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 1320  [0x1029c118c]  screen.rs:9469
+    + !         : | + ! : | + 19 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line3new  (in ftbench) + 84  [0x102934c00]  line.rs:406
+    + !         : | + ! : | + ! 7 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 24,132,...  [0x19d4950a4,0x19d495110,...]
+    + !         : | + ! : | + ! 4 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 0,108,...  [0x19d494c20,0x19d494c8c,...]
+    + !         : | + ! : | + ! 3 DYLD-STUB$$malloc  (in ftbench) + 4  [0x102b55ddc]
+    + !         : | + ! : | + ! 3 _malloc_zone_malloc  (in libsystem_malloc.dylib) + 80,120  [0x19d4a1e54,0x19d4a1e7c]
+    + !         : | + ! : | + ! 2 _xzm_xzone_thread_cache_fill_and_malloc  (in libsystem_malloc.dylib) + 84  [0x19d49a770]
+    + !         : | + ! : | + !   2 _xzm_xzone_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 192  [0x19d49ada4]
+    + !         : | + ! : | + 11 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line3new  (in ftbench) + 32  [0x102934bcc]  line.rs:406
+    + !         : | + ! : | + ! 5 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 276,8  [0x19d494d34,0x19d494c28]
+    + !         : | + ! : | + ! 4 _malloc_zone_malloc  (in libsystem_malloc.dylib) + 12,0,...  [0x19d4a1e10,0x19d4a1e04,...]
+    + !         : | + ! : | + ! 1 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 8  [0x19d495094]
+    + !         : | + ! : | + ! 1 xzm_malloc_zone_malloc_type_malloc  (in libsystem_malloc.dylib) + 0  [0x19d49ebe0]
+    + !         : | + ! : | + 2 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line3new  (in ftbench) + 84,108  [0x102934c00,0x102934c18]  line.rs:406
+    + !         : | + ! : | + 1 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line3new  (in ftbench) + 0  [0x102934bac]  line.rs:403
+    + !         : | + ! : | 19 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 1132  [0x1029c10d0]  screen.rs:9451
+    + !         : | + ! : | + 7 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen23record_scrollback_spill  (in ftbench) + 40  [0x1029bdde0]  screen.rs:0
+    + !         : | + ! : | + 3 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen23record_scrollback_spill  (in ftbench) + 116  [0x1029bde2c]  screen.rs:6536
+    + !         : | + ! : | + 3 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen23record_scrollback_spill  (in ftbench) + 1336  [0x1029be2f0]  screen.rs:6577
+    + !         : | + ! : | + 2 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen23record_scrollback_spill  (in ftbench) + 92  [0x1029bde14]  screen.rs:6533
+    + !         : | + ! : | + ! 2 _RNvXCs3nzhn0pXtJw_7ftbenchNtB2_9MinConfigNtNtCsf7v46mcL5oO_16frankenterm_term6config21TerminalConfiguration15scrollback_size  (in ftbench) + 12  [0x102a03f3c]  main.rs:30
+    + !         : | + ! : | + 2 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen23record_scrollback_spill  (in ftbench) + 128  [0x1029bde38]  screen.rs:6536
+    + !         : | + ! : | + ! 2 _RNvYNtCs3nzhn0pXtJw_7ftbench9MinConfigNtNtCsf7v46mcL5oO_16frankenterm_term6config21TerminalConfiguration22scrollback_tier_configB4_  (in ftbench) + 16  [0x102a0817c]  config.rs:1319
+    + !         : | + ! : | + 1 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen23record_scrollback_spill  (in ftbench) + 80  [0x1029bde08]  screen.rs:6533
+    + !         : | + ! : | + 1 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen23record_scrollback_spill  (in ftbench) + 128  [0x1029bde38]  screen.rs:6537
+    + !         : | + ! : | 15 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 1552  [0x1029c1274]  screen.rs:9482
+    + !         : | + ! : | 9 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 836  [0x1029c0fa8]  range.rs:0
+    + !         : | + ! : | 7 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 1532  [0x1029c1260]  screen.rs:9481
+    + !         : | + ! : | 6 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 72  [0x1029c0cac]  screen.rs:9376
+    + !         : | + ! : | + 6 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen26invalidate_last_good_frame  (in ftbench) + 36,40,...  [0x1029bf430,0x1029bf434,...]  screen.rs:6845
+    + !         : | + ! : | 6 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 840,1020  [0x1029c0fac,0x1029c1060]  screen.rs:9445
+    + !         : | + ! : | 6 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 1168  [0x1029c10f4]  screen.rs:9468
+    + !         : | + ! : | + 3 _RNvXsA_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributesNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench) + 0  [0x1029e8578]  lib.rs:70
+    + !         : | + ! : | + 2 _RNvXsA_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributesNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench) + 116,1512  [0x1029e85ec,0x1029e8b60]  lib.rs:0
+    + !         : | + ! : | + 1 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 1168  [0x1029c10f4]  screen.rs:9468
+    + !         : | + ! : | +   1 _RNvXsA_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributesNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench) + 128  [0x1029e85f8]  lib.rs:78
+    + !         : | + ! : | 4 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 20  [0x1029c0c78]  screen.rs:9368
+    + !         : | + ! : | 4 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 568  [0x1029c0e9c]  screen.rs:9416
+    + !         : | + ! : | + 3 _RNvXCs3nzhn0pXtJw_7ftbenchNtB2_9MinConfigNtNtCsf7v46mcL5oO_16frankenterm_term6config21TerminalConfiguration15scrollback_size  (in ftbench) + 0  [0x102a03f30]  main.rs:28
+    + !         : | + ! : | + 1 _RNvXCs3nzhn0pXtJw_7ftbenchNtB2_9MinConfigNtNtCsf7v46mcL5oO_16frankenterm_term6config21TerminalConfiguration15scrollback_size  (in ftbench) + 12  [0x102a03f3c]  main.rs:30
+    + !         : | + ! : | 4 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 1640,1704  [0x1029c12cc,0x1029c130c]  screen.rs:9425
+    + !         : | + ! : | 4 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 996  [0x1029c1048]  screen.rs:9445
+    + !         : | + ! : | + 4 _RNvMs2_NtNtCs1jdKuBkKU2H_5alloc11collections9vec_dequeINtB5_8VecDequeNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line4line4LineE9wrap_copyCsf7v46mcL5oO_16frankenterm_term  (in ftbench) + 36  [0x10299e3bc]  mod.rs:544
+    + !         : | + ! : | 3 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 588  [0x1029c0eb0]  screen.rs:9416
+    + !         : | + ! : | + 2 _RNvYNtCs3nzhn0pXtJw_7ftbench9MinConfigNtNtCsf7v46mcL5oO_16frankenterm_term6config21TerminalConfiguration22scrollback_tier_configB4_  (in ftbench) + 28  [0x102a08188]  config.rs:1324
+    + !         : | + ! : | + 1 _RNvYNtCs3nzhn0pXtJw_7ftbench9MinConfigNtNtCsf7v46mcL5oO_16frankenterm_term6config21TerminalConfiguration22scrollback_tier_configB4_  (in ftbench) + 0  [0x102a0816c]  config.rs:1318
+    + !         : | + ! : | 2 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 184  [0x1029c0d1c]  screen.rs:9380
+    + !         : | + ! : | 2 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 1036,1048  [0x1029c1070,0x1029c107c]  screen.rs:9446
+    + !         : | + ! : | 2 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 1080  [0x1029c109c]  screen.rs:9450
+    + !         : | + ! : | 2 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 1364,1368  [0x1029c11b8,0x1029c11bc]  screen.rs:9477
+    + !         : | + ! : | 1 _RNvMs2_NtNtCs1jdKuBkKU2H_5alloc11collections9vec_dequeINtB5_8VecDequeNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line4line4LineE9wrap_copyCsf7v46mcL5oO_16frankenterm_term  (in ftbench) + 52  [0x10299e3cc]  mod.rs:544
+    + !         : | + ! : | 1 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen23record_scrollback_spill  (in ftbench) + 1356  [0x1029be304]  screen.rs:6577
+    + !         : | + ! : | 1 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 2680  [0x1029c16dc]  screen.rs:0
+    + !         : | + ! : | 1 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 120  [0x1029c0cdc]  screen.rs:9377
+    + !         : | + ! : | 1 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 1704  [0x1029c130c]  screen.rs:9426
+    + !         : | + ! : | + 1 _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line23compress_for_scrollback  (in ftbench) + 12  [0x102933e28]  line.rs:1834
+    + !         : | + ! : | 1 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench) + 744  [0x1029c0f4c]  screen.rs:9444
+    + !         : | + ! : 10 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen24scroll_up_within_margins  (in ftbench) + 356  [0x1029be4c8]  screen.rs:9287
+    + !         : | + ! : 8 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen24scroll_up_within_margins  (in ftbench) + 80  [0x1029be3b4]  screen.rs:9278
+    + !         : | + ! : | 8 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen26invalidate_last_good_frame  (in ftbench) + 0  [0x1029bf40c]  screen.rs:6840
+    + !         : | + ! : 6 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen24scroll_up_within_margins  (in ftbench) + 0,48  [0x1029be364,0x1029be394]  screen.rs:9269
+    + !         : | + ! : 2 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen24scroll_up_within_margins  (in ftbench) + 1184  [0x1029be804]  screen.rs:9352
+    + !         : | + ! : 1 _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen24scroll_up_within_margins  (in ftbench) + 88  [0x1029be3bc]  screen.rs:9279
+    + !         : | + ! 19 _RNvMs4_NtCsf7v46mcL5oO_16frankenterm_term13terminalstateNtB5_13TerminalState9scroll_up  (in ftbench) + 92  [0x1029b471c]  mod.rs:1551
+    + !         : | + ! : 19 _RNvYNtCs3nzhn0pXtJw_7ftbench9MinConfigNtNtCsf7v46mcL5oO_16frankenterm_term6config21TerminalConfiguration9bidi_modeB4_  (in ftbench) + 0  [0x102a08274]  config.rs:1494
+    + !         : | + ! 9 _RNvMs4_NtCsf7v46mcL5oO_16frankenterm_term13terminalstateNtB5_13TerminalState9scroll_up  (in ftbench) + 48  [0x1029b46f0]  mod.rs:1548
+    + !         : | + ! : 6 _RNvMsb_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributes14clone_sgr_only  (in ftbench) + 0  [0x102895740]  lib.rs:914
+    + !         : | + ! : 3 _RNvMsb_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributes14clone_sgr_only  (in ftbench) + 392  [0x1028958c8]  lib.rs:935
+    + !         : | + ! 3 _RNvMsb_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributes14clone_sgr_only  (in ftbench) + 424  [0x1028958e8]  lib.rs:952
+    + !         : | + ! 2 _RNvMs4_NtCsf7v46mcL5oO_16frankenterm_term13terminalstateNtB5_13TerminalState9scroll_up  (in ftbench) + 0,12  [0x1029b46c0,0x1029b46cc]  mod.rs:1546
+    + !         : | + 36 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer7control  (in ftbench) + 200,1888,...  [0x1029a8864,0x1029a8efc,...]  performer.rs:705
+    + !         : | + 12 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer7control  (in ftbench) + 96  [0x1029a87fc]  performer.rs:704
+    + !         : | + 3 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer7control  (in ftbench) + 52  [0x1029a87d0]  performer.rs:700
+    + !         : | + ! 3 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer20pop_tmux_title_state  (in ftbench) + 28  [0x1029a7c48]  performer.rs:537
+    + !         : | + 1 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer11flush_print  (in ftbench) + 8476  [0x1029a069c]
+    + !         : | + 1 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer20pop_tmux_title_state  (in ftbench) + 256  [0x1029a7d2c]  performer.rs:540
+    + !         : | + 1 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer7control  (in ftbench) + 36  [0x1029a87c0]  performer.rs:698
+    + !         : | + 1 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer7control  (in ftbench) + 52  [0x1029a87d0]  performer.rs:701
+    + !         : | + 1 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer7control  (in ftbench) + 60  [0x1029a87d8]  performer.rs:702
+    + !         : | + 1 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer7control  (in ftbench) + 1908  [0x1029a8f10]  performer.rs:720
+    + !         : | 3 _RNvXs6_NtCs5laRbLPCrL3_25frankenterm_escape_parser6parserINtB5_9PerformerNCINvMsa_NtCsf7v46mcL5oO_16frankenterm_term8terminalNtB1i_8Terminal13advance_bytesRShE0ENtCs5ncOCTRQuzF_7vtparse7VTActor16execute_c0_or_c1Cs3nzhn0pXtJw_7ftbench  (in ftbench) + 288  [0x102a0536c]  mod.rs:879
+    + !         : | + 2 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer7perform  (in ftbench) + 1384  [0x1029a9768]  kitty.rs:0
+    + !         : | + 1 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer7perform  (in ftbench) + 72  [0x1029a9248]  performer.rs:543
+    + !         : | 2 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer7perform  (in ftbench) + 4,12  [0x1029a9204,0x1029a920c]  performer.rs:542
+    + !         : | 2 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer7perform  (in ftbench) + 16924,16932  [0x1029ad41c,0x1029ad424]  performer.rs:586
+    + !         : 25 _RNvXs6_NtCs5laRbLPCrL3_25frankenterm_escape_parser6parserINtB5_9PerformerNCINvMsa_NtCsf7v46mcL5oO_16frankenterm_term8terminalNtB1i_8Terminal13advance_bytesRShE0ENtCs5ncOCTRQuzF_7vtparse7VTActor16execute_c0_or_c1Cs3nzhn0pXtJw_7ftbench  (in ftbench) + 288  [0x102a0536c]  mod.rs:885
+    + !         : 15 _RNvXs6_NtCs5laRbLPCrL3_25frankenterm_escape_parser6parserINtB5_9PerformerNCINvMsa_NtCsf7v46mcL5oO_16frankenterm_term8terminalNtB1i_8Terminal13advance_bytesRShE0ENtCs5ncOCTRQuzF_7vtparse7VTActor16execute_c0_or_c1Cs3nzhn0pXtJw_7ftbench  (in ftbench) + 0  [0x102a0524c]  mod.rs:877
+    + !         : 7 _RNvMs7_Cs5ncOCTRQuzF_7vtparseNtB5_8VTParser6action  (in ftbench) + 596  [0x102b2f760]  lib.rs:662
+    + !         : 1 _RNvMs7_Cs5ncOCTRQuzF_7vtparseNtB5_8VTParser6action  (in ftbench) + 28  [0x102b2f528]  lib.rs:658
+    + !         : 1 _RNvMs7_Cs5ncOCTRQuzF_7vtparseNtB5_8VTParser6action  (in ftbench) + 52  [0x102b2f540]  lib.rs:659
+    + !         : 1 _RNvXs6_NtCs5laRbLPCrL3_25frankenterm_escape_parser6parserINtB5_9PerformerNCINvMsa_NtCsf7v46mcL5oO_16frankenterm_term8terminalNtB1i_8Terminal13advance_bytesRShE0ENtCs5ncOCTRQuzF_7vtparse7VTActor16execute_c0_or_c1Cs3nzhn0pXtJw_7ftbench  (in ftbench) + 36  [0x102a05270]  mod.rs:878
+    + !         62 _RNvCs3nzhn0pXtJw_7ftbench4main  (in ftbench) + 2796,2340,...  [0x102a00f48,0x102a00d80,...]  main.rs:111
+    + !         30 _RNvCs3nzhn0pXtJw_7ftbench4main  (in ftbench) + 3348  [0x102a01170]  main.rs:111
+    + !         : 13 malloc  (in libsystem_malloc.dylib) + 0  [0x19d46bce8]
+    + !         : 9 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 108,276,...  [0x19d494c8c,0x19d494d34,...]
+    + !         : 4 DYLD-STUB$$malloc  (in ftbench) + 4,0  [0x102b55ddc,0x102b55dd8]
+    + !         : 3 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 64,132,...  [0x19d4950cc,0x19d495110,...]
+    + !         : 1 _malloc_zone_malloc  (in libsystem_malloc.dylib) + 0  [0x19d4a1e04]
+    + !         28 _RNvCs3nzhn0pXtJw_7ftbench4main  (in ftbench) + 3424  [0x102a011bc]  main.rs:111
+    + !         : 17 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer7perform  (in ftbench) + 6392  [0x1029aaaf8]  performer.rs:559
+    + !         : | 9 _xzm_free  (in libsystem_malloc.dylib) + 180,120,...  [0x19d4957f8,0x19d4957bc,...]
+    + !         : | 4 xzm_malloc_zone_try_free_default  (in libsystem_malloc.dylib) + 0  [0x19d49ebcc]
+    + !         : | 2 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer7perform  (in ftbench) + 6392  [0x1029aaaf8]  performer.rs:559
+    + !         : | 2 _free  (in libsystem_malloc.dylib) + 4,76  [0x19d4a2a30,0x19d4a2a78]
+    + !         : 6 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer7perform  (in ftbench) + 6372  [0x1029aaae4]  performer.rs:559
+    + !         : | 4 _platform_memmove  (in libsystem_platform.dylib) + 444,452,...  [0x19d67f51c,0x19d67f524,...]
+    + !         : | 2 DYLD-STUB$$memcpy  (in ftbench) + 0,4  [0x102b55df0,0x102b55df4]
+    + !         : 4 _RNvCs3nzhn0pXtJw_7ftbench4main  (in ftbench) + 3424  [0x102a011bc]  main.rs:111
+    + !         : | 2 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer7perform  (in ftbench) + 1728  [0x1029a98c0]  lib.rs:0
+    + !         : | 1 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer7perform  (in ftbench) + 72  [0x1029a9248]  performer.rs:543
+    + !         : | 1 _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer7perform  (in ftbench) + 6328  [0x1029aaab8]  performer.rs:559
+    + !         : 1 _xzm_free  (in libsystem_malloc.dylib) + 1352  [0x19d495c8c]
+    + !         16 _RNvCs3nzhn0pXtJw_7ftbench4main  (in ftbench) + 2592  [0x102a00e7c]  main.rs:111
+    + !         : 14 _RNvNtNtCsk2lpRxBXOWX_4core3str8converts9from_utf8  (in ftbench) + 84,44,...  [0x1027c1400,0x1027c13d8,...]  converts.rs:91
+    + !         : 1 _RNvNtNtCsk2lpRxBXOWX_4core3str8converts9from_utf8  (in ftbench) + 528  [0x1027c15bc]  converts.rs:0
+    + !         : 1 _RNvNtNtCsk2lpRxBXOWX_4core3str8converts9from_utf8  (in ftbench) + 524  [0x1027c15b8]  converts.rs:94
+    + !         1 _RNvCs3nzhn0pXtJw_7ftbench4main  (in ftbench) + 3368  [0x102a01184]  main.rs:111
+    + !         : 1 _platform_memmove  (in libsystem_platform.dylib) + 428  [0x19d67f50c]
+    + !         1 _RNvXs6_NtCs5laRbLPCrL3_25frankenterm_escape_parser6parserINtB5_9PerformerNCINvMsa_NtCsf7v46mcL5oO_16frankenterm_term8terminalNtB1i_8Terminal13advance_bytesRShE0ENtCs5ncOCTRQuzF_7vtparse7VTActor16execute_c0_or_c1Cs3nzhn0pXtJw_7ftbench  (in ftbench) + 292  [0x102a05370]  mod.rs:885
+    + 11 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 104  [0x102936678]  clusterline.rs:65
+    + ! 7 _malloc_zone_malloc  (in libsystem_malloc.dylib) + 0,12  [0x19d4a1e04,0x19d4a1e10]
+    + ! 1 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 276  [0x19d494d34]
+    + ! 1 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 168  [0x19d495134]
+    + ! 1 malloc  (in libsystem_malloc.dylib) + 0  [0x19d46bce8]
+    + ! 1 xzm_malloc_zone_malloc_type_malloc  (in libsystem_malloc.dylib) + 0  [0x19d49ebe0]
+    + 10 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 136  [0x102936698]  clusterline.rs:66
+    + ! 10 _platform_memmove  (in libsystem_platform.dylib) + 24,0  [0x19d67f378,0x19d67f360]
+    + 2 ???  (in <unknown binary>)  [0xc9443c010]
+    + ! 2 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 104  [0x102936678]  clusterline.rs:65
+    + !   2 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 0  [0x19d494c20]
+    + 1 ???  (in <unknown binary>)  [0xc9443c000]
+    +   1 _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 104  [0x102936678]  clusterline.rs:65
+    +     1 <deduplicated_symbol>  (in libsystem_malloc.dylib) + 160  [0x19d494cc0]
+    2793 Thread_137771852: terminal-threaded-writer
+      2793 thread_start  (in libsystem_pthread.dylib) + 8  [0x19d670ba8]
+        2793 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x19d675c08]
+          2793 _RNvNvMs0_NtNtNtCsgJzyKH87JnT_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in ftbench) + 384  [0x102b13374]
+            2793 _RNSNvYNCINvNtNtCsgJzyKH87JnT_3std6thread9lifecycle15spawn_uncheckedNCNvMs2_NtCsf7v46mcL5oO_16frankenterm_term13terminalstateNtB1b_14ThreadedWriter7try_news_0uEs_0INtNtNtCsk2lpRxBXOWX_4core3ops8function6FnOnceuE9call_once6vtableB1d_  (in ftbench) + 72  [0x10296d580]  function.rs:250
+              2793 _RINvNtNtCsgJzyKH87JnT_3std3sys9backtrace28___rust_begin_short_backtraceNCNvMs2_NtCsf7v46mcL5oO_16frankenterm_term13terminalstateNtB1f_14ThreadedWriter7try_news_0uEB1h_  (in ftbench) + 504  [0x102961bb8]  backtrace.rs:166
+                2793 _RNCNvMs1_NtNtNtCsgJzyKH87JnT_3std4sync4mpmc4listINtB7_7ChannelINtNtCsk2lpRxBXOWX_4core6result6ResultNtNtCsktiz3GC3eCe_3exr5block17UncompressedBlockNtNtB1E_5error5ErrorEE4recvs_0Csf7v46mcL5oO_16frankenterm_term  (in ftbench) + 416  [0x10296907c]  list.rs:453
+                  2793 _dispatch_semaphore_wait_slow  (in libdispatch.dylib) + 132  [0x19d4baf40]
+                    2793 _dispatch_sema4_wait  (in libdispatch.dylib) + 28  [0x19d4ba990]
+                      2793 semaphore_wait_trap  (in libsystem_kernel.dylib) + 8  [0x19d632bb0]
+
+Total number in stack (recursive counted multiple, when >=5):
+        10       _xzm_free  (in libsystem_malloc.dylib) + 0  [0x19d495744]
+        8       <deduplicated_symbol>  (in libsystem_malloc.dylib) + 0  [0x19d494c20]
+        7       _platform_memmove  (in libsystem_platform.dylib) + 0  [0x19d67f360]
+        6       DYLD-STUB$$free  (in ftbench) + 0  [0x102b55d84]
+        6       _malloc_zone_malloc  (in libsystem_malloc.dylib) + 0  [0x19d4a1e04]
+        6       _xzm_free  (in libsystem_malloc.dylib) + 348  [0x19d4958a0]
+        6       _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 0  [0x19d49508c]
+        5       _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench) + 92  [0x1029359f8]  clusterline.rs:361
+        5       _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench) + 0  [0x102936610]  clusterline.rs:70
+        5       _free  (in libsystem_malloc.dylib) + 0  [0x19d4a2a2c]
+
+Sort by top of stack, same collapsed (when >= 5):
+        semaphore_wait_trap  (in libsystem_kernel.dylib)        2793
+        _RNvMsB_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE8make_mutBM_  (in ftbench)        425
+        _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine15append_grapheme  (in ftbench)        325
+        _RNvNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline20guarded_reserve_text  (in ftbench)        313
+        _RNvMsn_NtCs1jdKuBkKU2H_5alloc4syncINtB5_3ArcNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline13ClusteredLineE9drop_slowBM_  (in ftbench)        288
+        _RNvXsA_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributesNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench)        249
+        _platform_memmove  (in libsystem_platform.dylib)        143
+        _xzm_free  (in libsystem_malloc.dylib)        100
+        _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line13set_cell_impl  (in ftbench)        93
+        _RNvCs3nzhn0pXtJw_7ftbench4main  (in ftbench)        62
+        _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen9scroll_up  (in ftbench)        57
+        DYLD-STUB$$memcpy  (in ftbench)        54
+        _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer7control  (in ftbench)        52
+        _RNvMs_NtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterlineNtB4_13ClusteredLine6append  (in ftbench)        51
+        _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer11flush_print  (in ftbench)        49
+        _RNvMsn_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_4Cell3new  (in ftbench)        42
+        _RNvXs6_NtCs5laRbLPCrL3_25frankenterm_escape_parser6parserINtB5_9PerformerNCINvMsa_NtCsf7v46mcL5oO_16frankenterm_term8terminalNtB1i_8Terminal13advance_bytesRShE0ENtCs5ncOCTRQuzF_7vtparse7VTActor16execute_c0_or_c1Cs3nzhn0pXtJw_7ftbench  (in ftbench)        42
+        _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen26invalidate_last_good_frame  (in ftbench)        27
+        <deduplicated_symbol>  (in libsystem_malloc.dylib)        26
+        _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen18set_ascii_cell_run  (in ftbench)        24
+        _RNvXs_NtCsjDmDvoU97ux_12finl_unicode17grapheme_clustersNtB4_9GraphemesNtNtNtNtCsk2lpRxBXOWX_4core4iter6traits8iterator8Iterator4next  (in ftbench)        23
+        _RINvMs0_NtNtCsgJzyKH87JnT_3std4sync4onceNtB6_4Once15call_once_forceNCNvMNtB8_9lazy_lockINtB18_8LazyLockbE5force0ECsf7v46mcL5oO_16frankenterm_term  (in ftbench)        19
+        _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen24scroll_up_within_margins  (in ftbench)        19
+        _RNvYNtCs3nzhn0pXtJw_7ftbench9MinConfigNtNtCsf7v46mcL5oO_16frankenterm_term6config21TerminalConfiguration9bidi_modeB4_  (in ftbench)        19
+        _RNvXsj_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_11TeenyStringNtNtCsk2lpRxBXOWX_4core3cmp9PartialEq2eq  (in ftbench)        18
+        _malloc_zone_malloc  (in libsystem_malloc.dylib)        18
+        _xzm_xzone_malloc  (in libsystem_malloc.dylib)        18
+        _RNvMsv_NtCsf7v46mcL5oO_16frankenterm_term6screenNtB5_6Screen23record_scrollback_spill  (in ftbench)        16
+        _RNvNtNtCsk2lpRxBXOWX_4core3str8converts9from_utf8  (in ftbench)        16
+        _RINvNtCsk2lpRxBXOWX_4core3ptr9drop_glueNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line4line4LineECsf7v46mcL5oO_16frankenterm_term  (in ftbench)        15
+        _free  (in libsystem_malloc.dylib)        14
+        malloc  (in libsystem_malloc.dylib)        14
+        _RNvCs1rDNFHUrGL6_16frankenterm_cell21grapheme_column_width  (in ftbench)        13
+        _RNvMs2_NtNtCsf7v46mcL5oO_16frankenterm_term13terminalstate9performerNtB5_9Performer7perform  (in ftbench)        13
+        _RNvMs5_NtCs1jdKuBkKU2H_5alloc7raw_vecNtB5_11RawVecInner11finish_growCsa23bS6AsMV0_19frankenterm_surface  (in ftbench)        13
+        _RNvMsb_Cs1rDNFHUrGL6_16frankenterm_cellNtB5_14CellAttributes14clone_sgr_only  (in ftbench)        12
+        _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line21append_ascii_cell_run  (in ftbench)        10
+        _RNvMs7_Cs5ncOCTRQuzF_7vtparseNtB5_8VTParser6action  (in ftbench)        9
+        _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line17set_cell_grapheme  (in ftbench)        8
+        DYLD-STUB$$free  (in ftbench)        7
+        DYLD-STUB$$malloc  (in ftbench)        7
+        _RINvNtCsk2lpRxBXOWX_4core3ptr9drop_glueINtNtCs1jdKuBkKU2H_5alloc3vec3VecNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line11clusterline7ClusterEEB1e_  (in ftbench)        7
+        _RNvMs2_NtNtCsa23bS6AsMV0_19frankenterm_surface4line4lineNtB5_4Line25set_last_cell_was_wrapped  (in ftbench)        6
+        _RNvXCs3nzhn0pXtJw_7ftbenchNtB2_9MinConfigNtNtCsf7v46mcL5oO_16frankenterm_term6config21TerminalConfiguration15scrollback_size  (in ftbench)        6
+        _platform_memset  (in libsystem_platform.dylib)        6
+        _RINvNtCsk2lpRxBXOWX_4core3ptr9drop_glueINtNtNtNtCsgJzyKH87JnT_3std4sync6poison5mutex5MutexINtNtB4_6option6OptionINtNtCs1jdKuBkKU2H_5alloc4sync4WeakDNtNtB4_3any3AnyNtNtB4_6marker4SendNtB2D_4SyncEL_EEEECsf7v46mcL5oO_16frankenterm_term  (in ftbench)        5
+        _RNvMs2_NtNtCs1jdKuBkKU2H_5alloc11collections9vec_dequeINtB5_8VecDequeNtNtNtCsa23bS6AsMV0_19frankenterm_surface4line4line4LineE9wrap_copyCsf7v46mcL5oO_16frankenterm_term  (in ftbench)        5
+        _RNvYNtCs3nzhn0pXtJw_7ftbench9MinConfigNtNtCsf7v46mcL5oO_16frankenterm_term6config21TerminalConfiguration22scrollback_tier_configB4_  (in ftbench)        5
+
+Binary Images:
+       0x1027b8000 -        0x102c9092b +ftbench (0) <3157C6A1-B28E-3705-B9E4-331B508A61D8> /tmp/*/ftbench
+       0x19d220000 -        0x19d27348b  libobjc.A.dylib (951.1) <1E0A4B36-0701-3482-AA51-000F0ECC7506> /usr/lib/libobjc.A.dylib
+       0x19d274000 -        0x19d2a4bcb  libdyld.dylib (1335) <3A7FDAA5-69EC-3846-AA49-DE7BDEE00285> /usr/lib/system/libdyld.dylib
+       0x19d2a5000 -        0x19d343fc3  dyld (1.0.0 - 1335) <0975AFBA-C46B-364C-BD84-A75DAA9E455A> /usr/lib/dyld
+       0x19d344000 -        0x19d3471d0  libsystem_blocks.dylib (96) <B64F976B-5966-3643-9B57-0EB17D149482> /usr/lib/system/libsystem_blocks.dylib
+       0x19d348000 -        0x19d39cf7f  libxpc.dylib (3089.60.7) <4DB07AE5-6544-3D18-B44B-DCACA4D02FB8> /usr/lib/system/libxpc.dylib
+       0x19d39d000 -        0x19d3bd8df  libsystem_trace.dylib (1815.61.1) <16F2ABF3-27FC-3B12-AE3C-F039C083AE7B> /usr/lib/system/libsystem_trace.dylib
+       0x19d3be000 -        0x19d46a96f  libcorecrypto.dylib (1922.60.11) <A925150E-A21F-3273-A38D-EB304C5D2D18> /usr/lib/system/libcorecrypto.dylib
+       0x19d46b000 -        0x19d4b6bff  libsystem_malloc.dylib (792.60.6) <F68E01CC-EC92-3F25-BAC8-956A3DE42627> /usr/lib/system/libsystem_malloc.dylib
+       0x19d4b7000 -        0x19d4fde5f  libdispatch.dylib (1542.0.4) <A4B349E8-DD6F-3B71-84D9-34F3B4ACD849> /usr/lib/system/libdispatch.dylib
+       0x19d4fe000 -        0x19d500feb  libsystem_featureflags.dylib (101) <6AD11065-D06A-3212-97FC-4EEC4AC48F51> /usr/lib/system/libsystem_featureflags.dylib
+       0x19d501000 -        0x19d583047  libsystem_c.dylib (1725.40.4) <FB5569A9-CB26-36C2-AA05-E99243692B60> /usr/lib/system/libsystem_c.dylib
+       0x19d584000 -        0x19d616ea3  libc++.1.dylib (2000.67) <BEBE1F75-49D4-32E9-9978-FF8D0E799801> /usr/lib/libc++.1.dylib
+       0x19d617000 -        0x19d63192f  libc++abi.dylib (2000.67) <51C9FB66-83AA-3C40-A806-99BC96BAFD7F> /usr/lib/libc++abi.dylib
+       0x19d632000 -        0x19d66e49f  libsystem_kernel.dylib (12377.61.12) <548C45C8-9733-3F0D-8EF4-C06DF1DF2AD0> /usr/lib/system/libsystem_kernel.dylib
+       0x19d66f000 -        0x19d67babb  libsystem_pthread.dylib (539) <527C4BA0-91A5-378B-B3E2-D38269CA5A66> /usr/lib/system/libsystem_pthread.dylib
+       0x19d67c000 -        0x19d6843ef  libsystem_platform.dylib (359.60.3) <4DBAF982-1576-3FFC-86BE-03A9D2C96BE5> /usr/lib/system/libsystem_platform.dylib
+       0x19d685000 -        0x19d6b4e23  libsystem_info.dylib (600) <363CFE03-0003-3DA6-BE41-820B917B7955> /usr/lib/system/libsystem_info.dylib
+       0x1a1628000 -        0x1a1632397  libsystem_darwin.dylib (1725.40.4) <C25292BB-AA30-37D2-8001-E7276ADBAF1E> /usr/lib/system/libsystem_darwin.dylib
+       0x1a1a99000 -        0x1a1aaaff3  libsystem_notify.dylib (344.0.1) <DF1ED23D-F338-306D-BD06-A7F9B4534B23> /usr/lib/system/libsystem_notify.dylib
+       0x1a3d78000 -        0x1a3d92fdb  libsystem_networkextension.dylib (2205.60.9.0.1) <C2085EB4-0A94-3D87-94ED-D5555D3FA837> /usr/lib/system/libsystem_networkextension.dylib
+       0x1a3e16000 -        0x1a3e2dff3  libsystem_asl.dylib (406) <867E699E-8CC6-3792-AC6E-35C5769FADBA> /usr/lib/system/libsystem_asl.dylib
+       0x1a59c3000 -        0x1a59cb3b7  libsystem_symptoms.dylib (2158.60.3) <8D869291-11B3-3D2A-BFDF-F1C1688E19F1> /usr/lib/system/libsystem_symptoms.dylib
+       0x1a9945000 -        0x1a997d2b7  libsystem_containermanager.dylib (725.60.4) <FA1FC4AB-E5A0-391C-8951-41EFEE847E0D> /usr/lib/system/libsystem_containermanager.dylib
+       0x1aad93000 -        0x1aad9766f  libsystem_configuration.dylib (1385.60.3) <11F5CF47-6E93-3FF7-8E5E-E98F69742465> /usr/lib/system/libsystem_configuration.dylib
+       0x1aad98000 -        0x1aad9e6a7  libsystem_sandbox.dylib (2680.60.11) <FD4A58D2-D1AB-3936-86EE-CCB6852E0761> /usr/lib/system/libsystem_sandbox.dylib
+       0x1ac312000 -        0x1ac3151fb  libquarantine.dylib (196.40.3) <18BE2FA3-66CE-3EBF-9E13-8478DF73E146> /usr/lib/system/libquarantine.dylib
+       0x1aca95000 -        0x1aca9bf4f  libsystem_coreservices.dylib (191.2.4) <0646DDBF-346D-3273-9C9B-968121293B8A> /usr/lib/system/libsystem_coreservices.dylib
+       0x1acfe8000 -        0x1ad0258b7  libsystem_m.dylib (3309) <42E15F5C-02B8-3B56-9889-5B59CADD45EB> /usr/lib/system/libsystem_m.dylib
+       0x1ad026000 -        0x1ad026c9b  libcharset.1.dylib (113) <0673192D-5966-307F-B6D1-80F6524E8256> /usr/lib/libcharset.1.dylib
+       0x1ad027000 -        0x1ad02a537  libmacho.dylib (1030.6.3) <D1DA6556-F3D8-3A33-96FF-0B8876A1F0B6> /usr/lib/system/libmacho.dylib
+       0x1ad044000 -        0x1ad05161f  libcommonCrypto.dylib (600035) <87FEBA92-8FE5-32C3-8317-F6F86489CCFB> /usr/lib/system/libcommonCrypto.dylib
+       0x1ad052000 -        0x1ad05bb0b  libunwind.dylib (1900.125) <33789B37-0F3B-389C-BF0A-80FB03A2FB31> /usr/lib/system/libunwind.dylib
+       0x1ad064000 -        0x1ad06e6ff  libcopyfile.dylib (230.0.1.0.1) <317DAF5E-A6BB-3DFF-BCA1-8053DE7A8A2C> /usr/lib/system/libcopyfile.dylib
+       0x1ad06f000 -        0x1ad07295f  libcompiler_rt.dylib (103.3) <E54BAD88-9E9A-3A4D-8E4A-6146B120C1EC> /usr/lib/system/libcompiler_rt.dylib
+       0x1ad073000 -        0x1ad077a1b  libsystem_collections.dylib (1725.40.4) <90FA7AF0-2D12-3FC1-A87A-C4EDE396FDC5> /usr/lib/system/libsystem_collections.dylib
+       0x1ad078000 -        0x1ad07b4bf  libsystem_secinit.dylib (168.40.2) <755B9674-5B57-39CE-B247-4183C3ED6613> /usr/lib/system/libsystem_secinit.dylib
+       0x1ad07c000 -        0x1ad07eb57  libremovefile.dylib (84) <2F92CF32-4C5F-3D57-AEBC-9655B810A23C> /usr/lib/system/libremovefile.dylib
+       0x1ad07f000 -        0x1ad07ff27  libkeymgr.dylib (31) <FBDDA038-D728-3E69-815A-333D6B00BBDF> /usr/lib/system/libkeymgr.dylib
+       0x1ad080000 -        0x1ad088f87  libsystem_dnssd.dylib (2881.60.4) <5DF6DD6A-358E-3170-97D7-EB2107F4DB89> /usr/lib/system/libsystem_dnssd.dylib
+       0x1ad089000 -        0x1ad08e0b3  libcache.dylib (95) <C8B9304A-229B-3775-B353-2333D154987B> /usr/lib/system/libcache.dylib
+       0x1ad08f000 -        0x1ad090cf3  libSystem.B.dylib (1356) <EF46521E-50DB-3B5D-A1F5-5294C83D9B25> /usr/lib/libSystem.B.dylib
+       0x1ad0ca000 -        0x1ad0d11bb  libiconv.2.dylib (113) <CFA46448-594D-3CDB-B136-104EFF00478B> /usr/lib/libiconv.2.dylib
+       0x297b3c000 -        0x297b43319  libRosetta.dylib (365.3) <4B2D840F-AD4B-3A47-9749-3CB480DF3717> /usr/lib/libRosetta.dylib
+       0x299249000 -        0x29924cdeb  libsystem_darwindirectory.dylib (122) <B6309151-0733-31ED-8150-92CE2BB7FEA5> /usr/lib/system/libsystem_darwindirectory.dylib
+       0x29924d000 -        0x299256117  libsystem_eligibility.dylib (286.60.23) <65295E08-697D-334C-8A97-B6FE0D9797A0> /usr/lib/system/libsystem_eligibility.dylib
+       0x299257000 -        0x29925e873  libsystem_sanitizers.dylib (25) <D81DCFCF-61F5-3C56-ACA1-42C900E5364D> /usr/lib/system/libsystem_sanitizers.dylib
+       0x29925f000 -        0x29925fbb7  libsystem_trial.dylib (474.2.0.5) <820D601F-6489-32A9-9405-ECD7378C3570> /usr/lib/system/libsystem_trial.dylib

@@ -1,0 +1,19 @@
+[package]
+name = "ftbench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+frankenterm-term = { path = "/Users/jemanuel/projects/frankenterm/frankenterm/term" }
+frankenterm-escape-parser = { path = "/Users/jemanuel/projects/frankenterm/frankenterm/escape-parser" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+strip = "none"
+panic = "unwind"
