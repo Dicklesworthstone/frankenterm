@@ -14449,6 +14449,96 @@ mod tests {
         }
     }
 
+    fn copy_scrollback_tree(from: &std::path::Path, to: &std::path::Path) {
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                std::fs::create_dir(&target).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+
+                    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
+                copy_scrollback_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
+    /// Recovery fuzz (ft-yccm0.2.1.3): a crash between a digest-only WAL and
+    /// its manifest, then one flipped bit at spread offsets of the manifest,
+    /// the WAL or the ledger, each in a fresh copy of the store. Reopen either
+    /// refuses or serves exactly the original rows. It never panics, and never
+    /// serves a changed, reordered or missing row.
+    #[test]
+    fn digest_only_recovery_refuses_or_exactly_restores_after_any_single_bit_flip() {
+        let (dir, backing, _deferred) = deferred_test_sink();
+        let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+        assert!(backing.store_scrollback_line(0, &prior, 16));
+        let lines = digest_only_test_lines("fuzz", 3);
+        LIVE_SCROLLBACK_BATCH_FAULT.with(|setting| setting.set(2));
+        assert_eq!(backing.store_scrollback_lines(1, &lines, 16), 0);
+        LIVE_SCROLLBACK_BATCH_FAULT.with(|setting| setting.set(0));
+        let expected: Vec<Line> = std::iter::once(prior).chain(lines).collect();
+        let pane = uuid::Uuid::from_bytes([0xd3; 16]).simple().to_string();
+
+        let reopen = |flip: Option<(&str, u64, u8)>| {
+            let copy = tempfile::tempdir().unwrap();
+            copy_scrollback_tree(dir.path(), copy.path());
+            if let Some((name, offset, bit)) = flip {
+                let path = copy.path().join(&pane).join(name);
+                let mut bytes = std::fs::read(&path).unwrap();
+                bytes[usize::try_from(offset).unwrap()] ^= 1 << bit;
+                std::fs::write(&path, bytes).unwrap();
+            }
+            let case = format!("{flip:?}");
+            let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                LiveScrollbackSpillSink::new(copy.path().to_path_buf(), &deferred_test_context())
+            }))
+            .unwrap_or_else(|_| panic!("{case}: reopen panicked"));
+            let Ok(reopened) = opened else {
+                return false;
+            };
+            for (row, expected) in expected.iter().enumerate() {
+                let mut actual = reopened
+                    .load_scrollback_line(row as isize)
+                    .unwrap_or_else(|| panic!("{case}: accepted reopen lost row {row}"));
+                let mut expected = expected.clone();
+                actual.cells_mut();
+                expected.cells_mut();
+                assert_eq!(
+                    actual, expected,
+                    "{case}: accepted reopen changed row {row}"
+                );
+            }
+            assert!(
+                reopened
+                    .load_scrollback_line(expected.len() as isize)
+                    .is_none()
+            );
+            true
+        };
+
+        assert!(reopen(None), "the uncorrupted crash state rolls forward");
+        let mut refused = 0;
+        for name in ["manifest.json", ".append-wal.v1.json", "0.log"] {
+            let len = std::fs::metadata(dir.path().join(&pane).join(name))
+                .unwrap()
+                .len();
+            for step in 0..24_u64 {
+                let offset = len * (2 * step + 1) / 48;
+                if !reopen(Some((name, offset, (step % 8) as u8))) {
+                    refused += 1;
+                }
+            }
+        }
+        assert!(refused > 0, "single-bit corruption is detected");
+    }
+
     /// Rows past the manifest that no WAL names are cut on reopen, after the
     /// consumed active WAL is authenticated, and only over a retained prefix
     /// that is exactly the manifest's; a changed prefix refuses and cuts
