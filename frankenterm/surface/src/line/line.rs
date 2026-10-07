@@ -515,7 +515,16 @@ impl Line {
         seqno: SequenceNo,
         blank_attr: CellAttributes,
     ) {
-        {
+        if matches!(self.cells, CellStorage::C(_)) && !Self::clear_materializes() {
+            // Every cell is replaced, so clustered storage (a scrollback row
+            // recycled at the bottom, on every newline once scrollback is
+            // full) is not decoded first only to be overwritten: that was
+            // about 7% of headless T0 (ft-yccm0.3.2.6).
+            let cells = (0..width)
+                .map(|_| Cell::blank_with_attrs(blank_attr.clone()))
+                .collect();
+            self.cells = CellStorage::V(VecStorage::new(cells));
+        } else {
             let cells = self.coerce_vec_storage();
             for c in cells.iter_mut() {
                 *c = Cell::blank_with_attrs(blank_attr.clone());
@@ -526,6 +535,22 @@ impl Line {
         self.update_last_change_seqno(seqno);
         self.invalidate_zones();
         self.bits = LineBits::NONE;
+    }
+
+    /// `FT_LINE_CLEAR_MATERIALIZE=1` makes [`Self::resize_and_clear`] decode
+    /// clustered storage before clearing it, as it did before
+    /// ft-yccm0.3.2.6: the A/B arm and a rollback. Both arms leave the same
+    /// line. Resolved once per process.
+    fn clear_materializes() -> bool {
+        #[cfg(feature = "std")]
+        {
+            static MATERIALIZE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *MATERIALIZE.get_or_init(|| {
+                std::env::var_os("FT_LINE_CLEAR_MATERIALIZE").is_some_and(|v| v == "1")
+            })
+        }
+        #[cfg(not(feature = "std"))]
+        false
     }
 
     pub fn resize(&mut self, width: usize, seqno: SequenceNo) {
@@ -4497,6 +4522,41 @@ mod tests {
         let seqno = line.current_seqno();
         line.set_double_width(seqno);
         assert!(!line.matches_semantic_snapshot(&before));
+    }
+
+    /// ft-yccm0.3.2.6: clearing a clustered line without decoding it first
+    /// leaves exactly the line that clearing its never-compressed twin
+    /// leaves, at every width, with a styled blank.
+    #[test]
+    fn resize_and_clear_of_a_clustered_line_matches_its_vector_twin() {
+        let mut pen = CellAttributes::default();
+        pen.set_foreground(frankenterm_cell::color::ColorAttribute::PaletteIndex(196));
+        let mut blank = CellAttributes::default();
+        blank.set_background(frankenterm_cell::color::ColorAttribute::PaletteIndex(21));
+        for text in [
+            "plain text",
+            "h\u{e9} \u{1f600} w\u{f6}rld",
+            "",
+            "wide \u{1f468}\u{200d}\u{1f469} end",
+        ] {
+            for width in [0, 3, 12, 120] {
+                let mut clustered = Line::from_text(text, &pen, 3, None);
+                clustered.compress_for_scrollback();
+                assert!(
+                    text.is_empty() || matches!(clustered.cells, CellStorage::C(_)),
+                    "{:?} compresses",
+                    text
+                );
+                let mut vector = Line::from_text(text, &pen, 3, None);
+                assert!(matches!(vector.cells, CellStorage::V(_)));
+                clustered.resize_and_clear(width, 9, blank.clone());
+                vector.resize_and_clear(width, 9, blank.clone());
+                assert!(matches!(clustered.cells, CellStorage::V(_)));
+                assert_eq!(clustered.len(), width, "{text:?} at {width}");
+                assert!(clustered == vector, "{:?} at {}", text, width);
+                assert_eq!(clustered.current_seqno(), vector.current_seqno());
+            }
+        }
     }
 
     fn geometry_screen_rows(source: Line, cols: usize, model: MonospaceKpCostModel) -> Vec<Line> {
