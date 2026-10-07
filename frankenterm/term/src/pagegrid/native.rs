@@ -21,6 +21,7 @@ use frankenterm_bidi::ParagraphDirectionHint;
 use frankenterm_cell::image::ImageCell;
 use frankenterm_cell::{Cell, CellAttributes, SemanticType};
 use frankenterm_surface::line::clustered_append_breaks;
+use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_surface::{Line, SequenceNo};
 use std::ops::Range;
 
@@ -146,19 +147,88 @@ pub fn set_cell_grapheme(
     if !fits(page, x, width) {
         return false;
     }
+    // Legacy builds `Cell::new_grapheme_with_width(text, width, attr)` and
+    // writes it; the page writes its parts directly (T0 prints one such cell
+    // per emoji).
+    let stored = stored_text(text);
     if is_clustered(page, row) {
         // Unlike `set_cell`, this returns before the seqno moves.
         if x > page.row_len(row) && text == " " && *attr == CellAttributes::blank() {
             return true;
         }
-        let first = text.chars().next().unwrap_or(' ');
-        if clustered_can_append(page, row, x, first) {
-            let cell = Cell::new_grapheme_with_width(text, width, attr.clone());
-            return page.write_legacy(row, x, &cell, false, seqno);
+        // `ClusteredLine::can_append_cell_at`: text with no first character
+        // never appends. Text that does append starts with an inert
+        // character, so the cell keeps it as it is.
+        if let Some(first) = text.chars().next() {
+            if clustered_can_append(page, row, x, first) {
+                return write_grapheme(page, row, x, stored, width, attr, seqno);
+            }
         }
     }
-    let cell = Cell::new_grapheme_with_width(text, width, attr.clone());
-    set_cell(page, row, x, &cell, false, seqno)
+    // `set_cell` of that cell.
+    page.touch_row(row, seqno);
+    if is_clustered(page, row) {
+        if x > page.row_len(row)
+            && stored == " "
+            && *attr == CellAttributes::blank()
+            && Cell::new_grapheme_with_width(text, width, attr.clone()) == Cell::blank()
+        {
+            return true;
+        }
+        let first = stored.chars().next().unwrap_or(' ');
+        if !clustered_can_append(page, row, x, first) {
+            set_vector(page, row);
+        }
+    }
+    write_grapheme(page, row, x, stored, width, attr, seqno)
+}
+
+/// The text `Cell::new_grapheme_with_width` keeps (`TeenyString::from_str`):
+/// empty text, CR LF and a lone control byte become a space.
+fn stored_text(text: &str) -> &str {
+    match text.as_bytes() {
+        [] | b"\r\n" => " ",
+        [byte] if *byte < 0x20 || *byte == 0x7f => " ",
+        _ => text,
+    }
+}
+
+/// `Page::write_legacy` of `Cell::new_grapheme_with_width(.., width, attr)`
+/// whose kept text is `stored`, without building the cell. `width` is
+/// already in 1..=2, as the cell normalizes it.
+fn write_grapheme(
+    page: &mut Page,
+    row: u32,
+    x: usize,
+    stored: &str,
+    width: usize,
+    attr: &CellAttributes,
+    seqno: SequenceNo,
+) -> bool {
+    let images: Vec<Box<ImageCell>> = attr
+        .images()
+        .map(|images| images.into_iter().map(Box::new).collect())
+        .unwrap_or_default();
+    let class = classify(attr);
+    let mut cache = None;
+    let style = match &class {
+        StyleClass::Inline(inline) => StyleSpec::Inline(*inline),
+        StyleClass::Rich(rich) => StyleSpec::Rich {
+            style: rich,
+            cache: &mut cache,
+        },
+    };
+    let write = CellWrite {
+        glyph: Glyph::from_text(stored),
+        wide: width >= 2,
+        style,
+        semantic: attr.semantic_type(),
+        wrapped: attr.wrapped(),
+        hyperlink: attr.hyperlink(),
+        images: &images,
+        clear_image_placements: false,
+    };
+    page.write(row, x, write, seqno)
 }
 
 /// Legacy `Screen::set_ascii_cell_run`: each byte of the printable-ASCII
@@ -354,11 +424,13 @@ pub fn fill_blank(
     true
 }
 
-/// Legacy `Line::compress_for_scrollback`, which turns a vector row whose
-/// cells cannot cluster with each other into a clustered one (rebuilding
-/// its hidden cells, ADR Q3) without moving the seqno. Returns false for a
-/// vector row with a boundary that might cluster; the `Line` decides that
-/// one.
+/// Legacy `Line::compress_for_scrollback`: a vector row becomes clustered
+/// (its hidden cells rebuilt, ADR Q3, and the seqno unmoved) when clustered
+/// storage reproduces its cells: when every boundary is inert, or else
+/// when segmenting the cells' text gives back exactly the cells
+/// (`ClusteredLine::reproduces`). Otherwise it stays a vector row. Returns
+/// false only for a final wide cell whose placeholder was truncated, which
+/// the `Line` handles.
 pub fn compress_for_scrollback(page: &mut Page, row: u32) -> bool {
     if is_clustered(page, row) {
         return true;
@@ -383,13 +455,52 @@ pub fn compress_for_scrollback(page: &mut Page, row: u32) -> bool {
             ),
         };
         if !clustered_append_breaks(prev, first) {
-            return false;
+            // A boundary that might cluster: legacy re-segments.
+            if !segmentation_reproduces(page, row) {
+                return true;
+            }
+            break;
         }
         prev = Some(last);
     }
     page.rewrite_hidden_cells(row);
     page.set_row_flags(row, RowHeader::LEGACY_FORM_C, true);
     true
+}
+
+/// The text of the cell at `x`, as legacy's cell holds it.
+fn cell_str<'a>(page: &'a Page, row: u32, x: usize, utf8: &'a mut [u8; 4]) -> &'a str {
+    match page.glyph(row, x) {
+        Glyph::Blank => " ",
+        Glyph::Char(ch) => ch.encode_utf8(utf8),
+        Glyph::Cluster(text) => text,
+    }
+}
+
+/// `ClusteredLine::reproduces` past its inert-boundary shortcut: clustered
+/// storage keeps the row's text and re-segments it, so it stands for the
+/// row only when segmenting the visible cells' concatenated text gives back
+/// exactly those cells. (The widths then agree too: both sides advance
+/// column by column through the same wide cells.)
+fn segmentation_reproduces(page: &Page, row: u32) -> bool {
+    let len = page.row_len(row);
+    let mut text = String::with_capacity(len * 4);
+    let mut utf8 = [0_u8; 4];
+    for x in 0..len {
+        if !page.cell(row, x).is_hidden() {
+            text.push_str(cell_str(page, row, x, &mut utf8));
+        }
+    }
+    let mut graphemes = Graphemes::new(&text);
+    for x in 0..len {
+        if page.cell(row, x).is_hidden() {
+            continue;
+        }
+        if graphemes.next() != Some(cell_str(page, row, x, &mut utf8)) {
+            return false;
+        }
+    }
+    graphemes.next().is_none()
 }
 
 /// Legacy `Screen::insert_cell` (ICH, and printing in insert mode): the
@@ -864,7 +975,11 @@ mod tests {
         LineSize::DoubleHeightBottom,
     ];
 
-    const GLYPHS: [(&str, usize); 7] = [
+    /// Cells including the ones that defeat clustered storage's cheap
+    /// boundary test (combining marks, VS16, ZWJ sequences, a lone regional
+    /// indicator that pairs with its neighbour), plus text that `Cell`
+    /// de-fangs (empty, a control byte).
+    const GLYPHS: [(&str, usize); 12] = [
         (" ", 1),
         ("a", 1),
         ("\u{e9}", 1),
@@ -872,6 +987,11 @@ mod tests {
         ("\u{301}", 1),
         ("\u{4e2d}", 2),
         ("\u{1f600}", 2),
+        ("\u{2764}\u{fe0f}", 2),
+        ("\u{1f468}\u{200d}\u{1f469}", 2),
+        ("\u{1f1e6}", 2),
+        ("", 1),
+        ("\u{7}", 1),
     ];
     const TEXTS: [&str; 4] = ["abc", "  x", "   ", "hello"];
 
