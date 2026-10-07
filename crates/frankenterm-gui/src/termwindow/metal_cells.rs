@@ -9,18 +9,29 @@
 //! way the WebGpu renderer resolves them. The palette comes from the pane's
 //! published render facts, so it is read without the lock. The image-parity
 //! snapshot (ft-yccm0.1.10) draws the same scene offscreen.
+//!
+//! What a frame needs from its window is captured on the main thread as
+//! [`MetalFrameInputs`], so the frame itself can be built on the window's
+//! render thread (ft-yccm0.4.1.2) with that thread's own fonts.
 
+use crate::selection::SelectionRange;
 use crate::termwindow::TermWindow;
 use crate::termwindow::metal_glyphs::FontGlyphs;
+use crate::utilsprites::RenderMetrics;
+use config::ConfigHandle;
+use frankenterm_font::FontConfiguration;
 use frankenterm_gui::metal_scene::{MetalScene, SceneStyle};
 use frankenterm_renderer_metal::{
     BackgroundUniforms, CursorShape as MetalCursorShape, CursorUniform, MetalRenderer, TextUniforms,
 };
 use mux::localpane::LocalPane;
-use mux::pane::PaneId;
+use mux::pane::{Pane, PaneId};
 use mux::render_mirror::{CaptureRequest, RenderMirror, capture_pane_rows};
 use std::rc::Rc;
+use std::sync::Arc;
+use termwiz::hyperlink::Hyperlink;
 use termwiz::surface::{CursorShape, CursorVisibility};
+use wezterm_term::StableRowIndex;
 use wezterm_term::color::{ColorPalette, SrgbaTuple};
 
 /// Straight-alpha sRGB to the premultiplied RGBA the shader composites.
@@ -71,31 +82,105 @@ pub(crate) struct MetalFrameUniforms {
     pub(crate) text: TextUniforms,
 }
 
+/// What a Metal frame needs from its window, captured on the main thread
+/// (ft-yccm0.4.1.2). It is all `Send`, so a render thread can build the frame
+/// from it.
+#[derive(Clone)]
+pub(crate) struct MetalFrameInputs {
+    /// The active pane, or its overlay; `None` draws only the clear color.
+    pub(crate) pane: Option<Arc<dyn Pane>>,
+    pub(crate) viewport_top: Option<StableRowIndex>,
+    pub(crate) config: ConfigHandle,
+    pub(crate) focused: bool,
+    /// The pane's selection, normalized, and whether it is rectangular.
+    pub(crate) selection: Option<(SelectionRange, bool)>,
+    /// The hyperlink under the mouse.
+    pub(crate) hover: Option<Arc<Hyperlink>>,
+    /// Where the grid's first cell starts, in pixels: padding, tab bar and
+    /// window border.
+    pub(crate) grid_origin: [f32; 2],
+}
+
 impl TermWindow {
+    /// The window state a Metal frame is built from.
+    // Border widths are small pixel counts.
+    #[allow(clippy::cast_precision_loss)]
+    pub(crate) fn metal_frame_inputs(&self) -> MetalFrameInputs {
+        let pane = self.get_active_pane_or_overlay();
+        let pane_id = pane.as_ref().map(|pane| pane.pane_id());
+        let (padding_left, padding_top) = self.padding_left_top();
+        let tab_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
+            self.tab_bar_pixel_height().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let border = self.get_os_border();
+        MetalFrameInputs {
+            viewport_top: pane_id.and_then(|pane_id| self.get_viewport(pane_id)),
+            selection: pane_id
+                .and_then(|pane_id| self.selection(pane_id))
+                .and_then(|selection| {
+                    selection
+                        .range
+                        .map(|range| (range.normalize(), selection.rectangular))
+                }),
+            pane,
+            config: self.config.clone(),
+            focused: self.focused.is_some(),
+            hover: self.current_highlight.clone(),
+            grid_origin: [
+                padding_left + border.left.get() as f32,
+                tab_bar_height + padding_top + border.top.get() as f32,
+            ],
+        }
+    }
+
     /// Captures the active pane's changed rows and brings its Metal scene up
-    /// to date; `self.metal_frame` then holds the scene. `None` without a
-    /// pane.
+    /// to date on this thread; `self.metal_frame` then holds the scene.
+    /// `None` without a pane.
+    pub(crate) fn update_metal_frame(
+        &mut self,
+        metal: &Rc<MetalRenderer>,
+    ) -> Option<MetalFrameUniforms> {
+        let inputs = self.metal_frame_inputs();
+        MetalFrame::update(
+            &mut self.metal_frame,
+            &inputs,
+            &self.fonts,
+            &self.render_metrics,
+            metal,
+        )
+    }
+}
+
+impl MetalFrame {
+    /// Captures `inputs.pane`'s changed rows into the render mirror of the
+    /// frame in `slot` and brings its scene up to date; `slot` then holds the
+    /// frame. `None` without a pane. Runs on whichever thread draws the
+    /// window: the main thread, or the window's render thread with that
+    /// thread's own `fonts` and `metrics` (ft-yccm0.4.1.2).
     // Pixel sizes and cell coordinates are small and non-negative.
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         clippy::cast_precision_loss
     )]
-    pub(crate) fn update_metal_frame(
-        &mut self,
+    pub(crate) fn update(
+        slot: &mut Option<MetalFrame>,
+        inputs: &MetalFrameInputs,
+        fonts: &Rc<FontConfiguration>,
+        metrics: &RenderMetrics,
         metal: &Rc<MetalRenderer>,
     ) -> Option<MetalFrameUniforms> {
-        let pane = self.get_active_pane_or_overlay()?;
+        let pane = inputs.pane.as_ref()?;
         let pane_id = pane.pane_id();
-        let mut frame = match self.metal_frame.take() {
+        let config = &inputs.config;
+        let mut frame = match slot.take() {
             Some(frame)
                 if frame.pane_id == pane_id
-                    && frame.glyphs.serves(
-                        &self.fonts,
-                        metal,
-                        &self.render_metrics,
-                        self.config.generation(),
-                    ) =>
+                    && frame
+                        .glyphs
+                        .serves(fonts, metal, metrics, config.generation()) =>
             {
                 frame
             }
@@ -104,23 +189,23 @@ impl TermWindow {
                 mirror: RenderMirror::new(),
                 scene: MetalScene::new(),
                 glyphs: FontGlyphs::new(
-                    Rc::clone(&self.fonts),
-                    self.config.clone(),
+                    Rc::clone(fonts),
+                    config.clone(),
                     Rc::clone(metal),
-                    &self.render_metrics,
+                    metrics,
                 ),
             },
         };
 
         let request = CaptureRequest {
-            viewport_top: self.get_viewport(pane_id),
-            rules: &self.config.hyperlink_rules,
-            rules_generation: self.config.generation(),
+            viewport_top: inputs.viewport_top,
+            rules: &config.hyperlink_rules,
+            rules_generation: config.generation(),
         };
         let captured = pane
             .downcast_ref::<LocalPane>()
             .and_then(|local| local.capture_render_rows(&mut frame.mirror, &request))
-            .unwrap_or_else(|| capture_pane_rows(&*pane, &mut frame.mirror, &request));
+            .unwrap_or_else(|| capture_pane_rows(&**pane, &mut frame.mirror, &request));
         metrics::histogram!("gui.metal.capture.rows_copied").record(captured.rows_captured as f64);
 
         if frame.glyphs.begin_frame() {
@@ -128,22 +213,15 @@ impl TermWindow {
         }
         let facts = pane.render_facts();
         let palette: &ColorPalette = &facts.palette;
-        let focused_and_active = self.focused.is_some();
+        let focused_and_active = inputs.focused;
         let cursor = frame.mirror.cursor();
-        let shape = self
-            .config
-            .default_cursor_style
-            .effective_shape(cursor.shape);
+        let shape = config.default_cursor_style.effective_shape(cursor.shape);
         let block_cursor = focused_and_active
             && matches!(
                 shape,
                 CursorShape::Default | CursorShape::BlinkingBlock | CursorShape::SteadyBlock
             );
-        let selection = self.selection(pane_id).and_then(|selection| {
-            selection
-                .range
-                .map(|range| (range.normalize(), selection.rectangular))
-        });
+        let selection = &inputs.selection;
         let selected = |stable| {
             selection.as_ref().map_or(0..0, |(range, rectangular)| {
                 range.cols_for_row(stable, *rectangular)
@@ -151,23 +229,22 @@ impl TermWindow {
         };
         let style = SceneStyle {
             palette,
-            generation: ((self.config.generation() as u64) << 32)
+            generation: ((config.generation() as u64) << 32)
                 | (facts.palette_generation & 0xffff_ffff),
-            bold_brightens: self.config.bold_brightens_ansi_colors != config::BoldBrightening::No,
+            bold_brightens: config.bold_brightens_ansi_colors != config::BoldBrightening::No,
             selection_fg: visible(palette.selection_fg),
             cursor_fg: if block_cursor {
                 visible(palette.cursor_fg)
             } else {
                 None
             },
-            hover: self.current_highlight.as_ref(),
+            hover: inputs.hover.as_ref(),
         };
         let update = frame
             .scene
             .update(&frame.mirror, &style, &selected, &mut frame.glyphs);
         metrics::histogram!("gui.metal.scene.rows_rebuilt").record(update.rows_rebuilt as f64);
 
-        let metrics = &self.render_metrics;
         let rows = frame.mirror.rows();
         let cursor_row = cursor.y - frame.mirror.first();
         let cursor = match usize::try_from(cursor_row) {
@@ -192,23 +269,13 @@ impl TermWindow {
             }
             _ => CursorUniform::default(),
         };
-        let (padding_left, padding_top) = self.padding_left_top();
-        let tab_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height().unwrap_or(0.0)
-        } else {
-            0.0
-        };
-        let border = self.get_os_border();
         let uniforms = MetalFrameUniforms {
             background: BackgroundUniforms {
                 cell_size: [
                     metrics.cell_size.width as f32,
                     metrics.cell_size.height as f32,
                 ],
-                grid_origin: [
-                    padding_left + border.left.get() as f32,
-                    tab_bar_height + padding_top + border.top.get() as f32,
-                ],
+                grid_origin: inputs.grid_origin,
                 row_offset: frame.scene.cells().row_offset(),
                 cursor,
                 selection_tint: premultiplied(palette.selection_bg),
@@ -221,7 +288,7 @@ impl TermWindow {
                 strikethrough_position: metrics.strike_row as f32,
             },
         };
-        self.metal_frame = Some(frame);
+        *slot = Some(frame);
         Some(uniforms)
     }
 }

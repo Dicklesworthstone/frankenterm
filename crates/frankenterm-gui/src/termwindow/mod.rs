@@ -122,6 +122,7 @@ pub mod idle_detector;
 pub mod keyevent;
 mod metal_cells;
 mod metal_glyphs;
+mod metal_render_thread;
 pub mod modal;
 mod mouseevent;
 pub mod palette;
@@ -510,6 +511,9 @@ struct RetainedMuxRefresh {
     title_pending: Arc<AtomicBool>,
     title: Arc<Mutex<Option<PendingMuxTitleRefresh>>>,
     wake: flume::Sender<()>,
+    /// The window's Metal render thread, woken directly for the output of
+    /// the pane it draws (ft-yccm0.4.1.2).
+    metal: Arc<metal_render_thread::MetalOutputWake>,
 }
 
 // Pending and admitted weak sets plus the native callback's validated Arc
@@ -687,6 +691,16 @@ impl RetainedMuxRefresh {
     }
 
     fn record(&self, notification: &MuxNotification, window_id: MuxWindowId) -> bool {
+        if let MuxNotification::PaneOutput(pane_id) = notification {
+            if self.metal.wake_for(*pane_id) {
+                // The render thread draws this pane and is awake now: no
+                // main-thread task for this batch (ft-yccm0.4.1.2, the
+                // ft-4p4uo class). The interest stays recorded, so the next
+                // main-thread wake still accounts for it.
+                self.output.record(*pane_id);
+                return true;
+            }
+        }
         if matches!(
             notification,
             MuxNotification::TabAddedToWindow { .. } | MuxNotification::WindowTopologyChanged(_)
@@ -2468,6 +2482,13 @@ pub struct TermWindow {
     /// The Metal front end's frame state for the active pane: its render
     /// mirror, scene and glyphs (ft-yccm0.4.4).
     metal_frame: Option<metal_cells::MetalFrame>,
+    /// The Metal render thread that owns the renderer and draws every frame
+    /// off the main thread (ft-yccm0.4.1.2). While it runs, `metal` and
+    /// `metal_frame` are `None`.
+    metal_render: Option<metal_render_thread::MetalRenderThread>,
+    /// Wakes the render thread for its pane's output from the mux
+    /// notification callback; shared with the pane-update subscription.
+    metal_output_wake: Arc<metal_render_thread::MetalOutputWake>,
     /// Image-parity corpus snapshot request (ft-yccm0.1.10); `None` unless
     /// `FRANKENTERM_RENDER_SNAPSHOT` was set at window creation.
     render_snapshot: Option<render_snapshot::RenderSnapshotRequest>,
@@ -3940,7 +3961,16 @@ impl TermWindow {
         if let Some(note) = metal.submission_note() {
             log::warn!("Metal renderer: {note}");
         }
-        self.metal.replace(metal);
+        // ft-yccm0.4.1.2: frames are drawn on a render thread unless the
+        // image-parity snapshot (which reads frames back on this thread) or
+        // FRANKENTERM_METAL_RENDER_THREAD=0 asks for the main thread.
+        if self.render_snapshot.is_none() && metal_render_thread::render_thread_enabled() {
+            if let Err(metal) = self.start_metal_render_thread(metal) {
+                self.metal.replace(metal);
+            }
+        } else {
+            self.metal.replace(metal);
+        }
         self.render_recovery_state.record_reinitialized();
     }
 }
@@ -4652,6 +4682,8 @@ impl TermWindow {
             webgpu: None,
             metal: None,
             metal_frame: None,
+            metal_render: None,
+            metal_output_wake: Arc::default(),
             render_snapshot: render_snapshot::RenderSnapshotRequest::from_env(),
             image_poll_due: Cell::new(None),
             window: None,
@@ -5030,6 +5062,7 @@ impl TermWindow {
             }
             WindowEvent::FocusChanged(focused) => {
                 self.focus_changed(focused, window);
+                self.post_metal_surface();
                 Ok(true)
             }
             WindowEvent::MouseEvent(event) => {
@@ -5046,6 +5079,7 @@ impl TermWindow {
                 live_resizing,
             } => {
                 self.resize(dimensions, window_state, window, live_resizing);
+                self.post_metal_surface();
                 Ok(true)
             }
             WindowEvent::SetInnerSizeCompleted => {
@@ -5154,7 +5188,9 @@ impl TermWindow {
     fn paint_if_admitted(&mut self, window: &Window) -> anyhow::Result<bool> {
         match self.render_recovery_state.admit() {
             PaintAdmission::Admit => {
-                if self.metal.is_some() {
+                if self.metal_render.is_some() {
+                    Ok(self.publish_metal_frame())
+                } else if self.metal.is_some() {
                     Ok(self.do_paint_metal())
                 } else if self.webgpu.is_some() {
                     self.do_paint_webgpu()
@@ -5203,7 +5239,10 @@ impl TermWindow {
         drop(self.webgpu.take());
         drop(self.gl.take());
         // The Metal renderer retains the view's CAMetalLayer; release it
-        // before the native window goes away too.
+        // before the native window goes away too. A render thread owns its
+        // renderer: dropping the handle stops and joins the thread, which
+        // drops the renderer there (ft-yccm0.4.1.2).
+        drop(self.metal_render.take());
         drop(self.metal.take());
     }
 
@@ -6812,6 +6851,7 @@ impl TermWindow {
             title_pending: pending_title_refresh,
             title: Arc::clone(&retained_title_refresh),
             wake: output_tx.clone(),
+            metal: Arc::clone(&self.metal_output_wake),
         };
         self.pane_cleanup.bind(&mux, output_tx.clone());
         let cleanup_dead = Arc::new(AtomicBool::new(false));
@@ -7639,6 +7679,9 @@ impl TermWindow {
             .update_capacity(config.gui_retained_pane_state_limit);
         self.refresh_frame_budget_reduce_motion_state();
         self.palette.take();
+        if let Some(render) = &self.metal_render {
+            render.set_min_frame_interval(self.frame_interval());
+        }
 
         let Some(mux) = self.mux_or_log("reload GUI configuration") else {
             return;
@@ -12714,6 +12757,7 @@ mod tests {
             title_pending: Arc::new(AtomicBool::new(false)),
             title: Arc::new(Mutex::new(None)),
             wake,
+            metal: Arc::default(),
         };
         let seen = Arc::new(AtomicUsize::new(0));
         let callback_seen = Arc::clone(&seen);
@@ -13514,6 +13558,7 @@ mod tests {
             title_pending: Arc::new(AtomicBool::new(false)),
             title: Arc::clone(&retained_title),
             wake,
+            metal: Arc::default(),
         };
         let retained_window = mux.resolve_pane_id(first.pane_id()).unwrap().1;
         assert_eq!(
