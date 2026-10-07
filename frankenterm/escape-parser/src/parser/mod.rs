@@ -120,6 +120,25 @@ fn default_csi_fast_path() -> bool {
     csi_fast_path_default_for_value(None)
 }
 
+/// Kill switch for the 256-color SGR shortcut (ft-yccm0.3.2.6): a falsey
+/// value turns it off for newly constructed parsers. See
+/// [`Parser::set_palette_sgr_fast_path`].
+#[cfg(feature = "std")]
+const PALETTE_SGR_FAST_PATH_ENV: &str = "FT_PALETTE_SGR_FAST_PATH";
+
+/// Resolve the default `palette_sgr_fast_path` setting for a freshly
+/// constructed [`Parser`]: on unless `FT_PALETTE_SGR_FAST_PATH` is falsey.
+#[inline]
+fn default_palette_sgr_fast_path() -> bool {
+    #[cfg(feature = "std")]
+    {
+        let value = std::env::var(PALETTE_SGR_FAST_PATH_ENV).ok();
+        return csi_fast_path_default_for_value(value.as_deref());
+    }
+    #[cfg(not(feature = "std"))]
+    csi_fast_path_default_for_value(None)
+}
+
 /// Kill switch and width choice for the ground-state ASCII scan
 /// (ft-yccm0.3.2.2): falsey selects the scalar scan for newly constructed
 /// parsers, and `16`, `32` or `64` a `std::simd` width. See
@@ -450,6 +469,9 @@ pub struct Parser {
     print_batching: bool,
     /// The CSI fast path (ft-yccm0.3.2.4); see [`Parser::set_csi_fast_path`].
     csi_fast_path: bool,
+    /// The 256-color SGR shortcut inside the CSI fast path
+    /// (ft-yccm0.3.2.6); see [`Parser::set_palette_sgr_fast_path`].
+    palette_sgr_fast_path: bool,
     /// The ground-state ASCII scan (ft-yccm0.3.2.2); see
     /// [`Parser::set_ascii_scan`].
     ascii_scan: AsciiScan,
@@ -644,6 +666,7 @@ impl Parser {
             recovery_stream_bytes: Some(0),
             print_batching: default_print_batching(),
             csi_fast_path: default_csi_fast_path(),
+            palette_sgr_fast_path: default_palette_sgr_fast_path(),
             ascii_scan: default_ascii_scan(),
             simd_utf8: default_simd_utf8(),
             csi_params: [CsiParam::Integer(0); CSI_FAST_MAX_PARAMS],
@@ -790,6 +813,18 @@ impl Parser {
     /// Whether the CSI fast path is on. See [`Parser::set_csi_fast_path`].
     pub fn csi_fast_path(&self) -> bool {
         self.csi_fast_path
+    }
+
+    /// Turns the 256-color SGR shortcut (ft-yccm0.3.2.6) on or off. It is
+    /// on unless `FT_PALETTE_SGR_FAST_PATH` is falsey, and it applies only
+    /// within the CSI fast path. `ESC [ 38;5;N m` and `ESC [ 48;5;N m`, with
+    /// N at most 255 in at most three digits, become the settings
+    /// [`decode_sgr`] gives them, read straight from the bytes: no parameter
+    /// array, no decode, no store into the last-SGR cache (a pure memo of
+    /// bytes to settings, which may stay older). T0 sends two per cell, each
+    /// with a new color. The action stream is identical either way.
+    pub fn set_palette_sgr_fast_path(&mut self, on: bool) {
+        self.palette_sgr_fast_path = on;
     }
 
     /// Chooses how the ground state finds the end of a printable-ASCII
@@ -1043,6 +1078,19 @@ impl Parser {
                 run += cached.len();
                 i = body + len;
                 continue;
+            }
+            if self.palette_sgr_fast_path {
+                if let Some((sgr, len)) = palette_sgr(&bytes[body..]) {
+                    // Flushed as the scan's five parameters would be.
+                    if run + 5 / 2 + 1 > SGR_RUN_MAX {
+                        handler.sgr(&self.sgr_run[..run]);
+                        run = 0;
+                    }
+                    self.sgr_run[run] = sgr;
+                    run += 1;
+                    i = body + len;
+                    continue;
+                }
             }
             let Some((fin, count)) = scan_csi(bytes, i, &mut self.csi_params) else {
                 break;
@@ -1629,6 +1677,39 @@ fn scan_csi(bytes: &[u8], esc: usize, params: &mut [CsiParam]) -> Option<(usize,
         }
         i += 1;
     }
+}
+
+/// The 256-color SGR shortcut (ft-yccm0.3.2.6): `body`, the bytes after an
+/// `ESC [`, opening with `38;5;N m` or `48;5;N m`, N one to three digits of
+/// value at most 255. Returns the setting [`decode_sgr`] decodes from those
+/// parameters, and the length up to and including the `m`; `None` for any
+/// other bytes, which take the scan and decode as before.
+#[inline]
+fn palette_sgr(body: &[u8]) -> Option<(Sgr, usize)> {
+    let foreground = match body.get(..5)? {
+        b"38;5;" => true,
+        b"48;5;" => false,
+        _ => return None,
+    };
+    let digits = body.get(5..)?;
+    let count = digits
+        .iter()
+        .take(4)
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if !(1..=3).contains(&count) || digits.get(count) != Some(&b'm') {
+        return None;
+    }
+    let value = digits[..count]
+        .iter()
+        .fold(0_u16, |value, digit| value * 10 + u16::from(digit - b'0'));
+    let color = crate::color::ColorSpec::PaletteIndex(u8::try_from(value).ok()?);
+    let sgr = if foreground {
+        Sgr::Foreground(color)
+    } else {
+        Sgr::Background(color)
+    };
+    Some((sgr, 5 + count + 1))
 }
 
 /// Hands `handler` the items of a dispatched CSI sequence: the D2 table
@@ -2963,6 +3044,9 @@ mod test {
         let mut parser = Parser::new();
         parser.set_print_batching(true);
         parser.set_csi_fast_path(true);
+        // The 256-color shortcut (ft-yccm0.3.2.6) decodes these sequences
+        // without storing them; this test is the cache's.
+        parser.set_palette_sgr_fast_path(false);
         assert_eq!(
             parser.parse_as_vec(b"\x1b[38;5;196m"),
             vec![Action::CSI(CSI::Sgr(Sgr::Foreground(
@@ -3008,6 +3092,49 @@ mod test {
                 "{:?}",
                 bytes
             );
+        }
+    }
+
+    /// ft-yccm0.3.2.6: the 256-color SGR shortcut leaves the action stream
+    /// the scan and decode give, for every index to 300 (past 255 included),
+    /// leading zeros, empty and longer lists, other finals and selectors, a
+    /// cut-off sequence, and every cut of the stream in two.
+    #[test]
+    fn palette_sgr_shortcut_leaves_the_action_stream_unchanged() {
+        let mut stream = Vec::new();
+        for n in 0..=300u32 {
+            stream.extend_from_slice(
+                format!("\x1b[38;5;{}mA\x1b[48;5;{}m\u{1f600}", n, n * 7 % 301).as_bytes(),
+            );
+        }
+        for shape in [
+            "\x1b[38;5;007m",
+            "\x1b[48;5;0255m",
+            "\x1b[38;5;256m",
+            "\x1b[48;5;999m",
+            "\x1b[38;5;m",
+            "\x1b[38;5;12;1m",
+            "\x1b[48;5;12H",
+            "\x1b[38;5;1x",
+            "\x1b[038;5;9m",
+            "\x1b[58;5;9m",
+            "\x1b[38;2;1;2;3m",
+            "\x1b[38;5;3",
+        ] {
+            stream.extend_from_slice(shape.as_bytes());
+            stream.push(b'Z');
+        }
+        let parse = |shortcut: bool, cut: usize| {
+            let mut parser = Parser::new();
+            parser.set_print_batching(true);
+            parser.set_csi_fast_path(true);
+            parser.set_palette_sgr_fast_path(shortcut);
+            let mut actions = parser.parse_as_vec(&stream[..cut]);
+            actions.extend(parser.parse_as_vec(&stream[cut..]));
+            actions
+        };
+        for cut in (0..=stream.len()).step_by(7) {
+            assert_eq!(parse(true, cut), parse(false, cut), "cut at {}", cut);
         }
     }
 
