@@ -22,6 +22,14 @@ uniform sampler2D atlas_linear_sampler;
 uniform bool subpixel_aa;
 uniform uint milliseconds;
 
+// text_gamma / text_contrast; see text_composition.rs.
+// When text_composition is false, glyphs blend exactly as before.
+uniform bool text_composition;
+uniform float text_gamma_adjustment;
+uniform float text_contrast;
+// Linear color of the background the text is assumed to sit on.
+uniform vec3 text_background;
+
 struct ColorEase {
   vec4 in_function;
   vec4 out_function;
@@ -110,6 +118,35 @@ vec4 to_srgb(vec4 linearRGB)
   return vec4(mix(higher, lower, cutoff), linearRGB.a);
 }
 
+const vec3 LUMINANCE = vec3(0.2126, 0.7152, 0.0722);
+
+float srgb_encode(float x) {
+  return x < 0.0031308 ? x * 12.92 : 1.055 * pow(x, 1.0 / 2.4) - 0.055;
+}
+
+// kitty's text_composition_strategy curve.
+float adjust_coverage(float coverage, float fg_luminance, float bg_luminance) {
+  float weight = (1.0 - fg_luminance + bg_luminance) * 0.5;
+  float curved = mix(coverage, pow(coverage, text_gamma_adjustment), weight);
+  return clamp(curved * text_contrast, 0.0, 1.0);
+}
+
+// The framebuffer blends in sRGB space. Return the coverage that makes
+// that blend land where a linear-light blend at `coverage` would.
+float gamma_space_coverage(float coverage, float fg, float bg) {
+  float fg_srgb = srgb_encode(fg);
+  float bg_srgb = srgb_encode(bg);
+  float delta = fg_srgb - bg_srgb;
+  if (abs(delta) < 1.0e-4) {
+    return coverage;
+  }
+  return clamp((srgb_encode(mix(bg, fg, coverage)) - bg_srgb) / delta, 0.0, 1.0);
+}
+
+float compose_coverage(float coverage, float fg, float bg, float fg_luminance, float bg_luminance) {
+  return gamma_space_coverage(adjust_coverage(coverage, fg_luminance, bg_luminance), fg, bg);
+}
+
 void main() {
   vec4 fg_color = mix(o_fg_color, o_fg_color_alt, o_fg_color_mix);
   if (o_has_color == 3.0) {
@@ -154,6 +191,22 @@ void main() {
   }
 
   color = apply_hsv(color, o_hsv);
+
+  if (text_composition && o_has_color == 0.0) {
+    vec3 fg = clamp(color.rgb, 0.0, 1.0);
+    vec3 bg = clamp(text_background, 0.0, 1.0);
+    float fg_luminance = dot(fg, LUMINANCE);
+    float bg_luminance = dot(bg, LUMINANCE);
+    if (subpixel_aa) {
+      // Dual-source blending gives each channel its own coverage, so each
+      // channel can be converted exactly.
+      colorMask.r = compose_coverage(colorMask.r, fg.r, bg.r, fg_luminance, bg_luminance);
+      colorMask.g = compose_coverage(colorMask.g, fg.g, bg.g, fg_luminance, bg_luminance);
+      colorMask.b = compose_coverage(colorMask.b, fg.b, bg.b, fg_luminance, bg_luminance);
+    } else {
+      color.a = compose_coverage(color.a, fg_luminance, bg_luminance, fg_luminance, bg_luminance);
+    }
+  }
 
   // We MUST output SRGB and tell glium that we do that (outputs_srgb),
   // otherwise something in glium over-gamma-corrects depending on the gl setup.

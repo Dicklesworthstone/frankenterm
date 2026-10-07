@@ -276,6 +276,8 @@ struct BenchShaderUniform {
     foreground_text_hsb: [f32; 3],
     milliseconds: u32,
     projection: [[f32; 4]; 4],
+    text_composition: [f32; 4],
+    text_background: [f32; 4],
 }
 
 struct GlyphQuadGpuBench {
@@ -403,6 +405,8 @@ impl GlyphQuadGpuBench {
             foreground_text_hsb: [1.0, 1.0, 1.0],
             milliseconds: 0,
             projection: identity_projection(),
+            text_composition: [0.0; 4],
+            text_background: [0.0; 4],
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("glyph quad frame bench uniform buffer"),

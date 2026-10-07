@@ -606,6 +606,10 @@ pub struct ShaderUniform {
     pub foreground_text_hsb: [f32; 3],
     pub milliseconds: u32,
     pub projection: [[f32; 4]; 4],
+    /// x: enabled (0 or 1), y: 1 / text_gamma, z: 1 + text_contrast / 100.
+    pub text_composition: [f32; 4],
+    /// Linear background color the text is assumed to sit on (rgb).
+    pub text_background: [f32; 4],
     // sampler2D atlas_nearest_sampler;
     // sampler2D atlas_linear_sampler;
 }
