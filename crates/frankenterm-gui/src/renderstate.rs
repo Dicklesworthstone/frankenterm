@@ -392,6 +392,7 @@ impl WebGpuGlyphQuadSoaStaging {
         self.positions.is_empty()
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.positions.len()
     }
@@ -960,7 +961,7 @@ impl AtlasRebuildPolicy {
 /// What line shaping did since the window opened (ft-yccm0.4.3.4): runs
 /// against clusters per line shows what fg-agnostic shaping runs saved.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ShapingCounters {
+pub struct ShapingCounters {
     /// Lines shaped (line-shape cache misses).
     pub(crate) lines: u64,
     /// Attribute clusters in those lines.
@@ -1315,14 +1316,6 @@ impl RenderState {
         Ok(layer)
     }
 
-    /// Returns true if any of the layers needed more quads to be allocated,
-    /// and if we successfully allocated them.
-    /// Returns false if the quads were sufficient.
-    /// Returns Err if we needed to allocate but failed.
-    pub fn allocated_more_quads(&mut self) -> anyhow::Result<bool> {
-        Ok(self.allocate_more_quads()?.allocated)
-    }
-
     /// Allocate any undersized quad buffers and report how many
     /// concrete GPU-buffer reallocations were performed.
     pub fn allocate_more_quads(&mut self) -> anyhow::Result<QuadAllocationChange> {
@@ -1348,13 +1341,6 @@ impl RenderState {
         }
 
         Ok(result)
-    }
-
-    pub fn needs_more_quads(&self) -> bool {
-        self.layers
-            .borrow()
-            .iter()
-            .any(|layer| (0..3).any(|vb_idx| layer.need_more_quads(vb_idx).is_some()))
     }
 
     pub fn quad_allocation_snapshot(&self) -> QuadAllocationSnapshot {

@@ -44,10 +44,9 @@ impl crate::TermWindow {
             });
         }
 
-        let gl_state = self
-            .render_state
-            .as_ref()
-            .context("render state is not initialized")?;
+        // The window's chrome target: the WebGpu render state, or a Metal
+        // window's own (ft-yccm0.4.7.1: the retro tab bar).
+        let gl_state = self.chrome()?;
 
         let num_cols = params.dims.cols;
 
@@ -414,7 +413,7 @@ impl crate::TermWindow {
                     );
                     quad.set_texture(
                         gl_state
-                            .glyph_cache
+                            .glyph_cache()
                             .borrow_mut()
                             .cursor_sprite(
                                 Some(shape),
@@ -509,7 +508,7 @@ impl crate::TermWindow {
                         if let Some(block) = &info.block_key {
                             texture.replace(
                                 gl_state
-                                    .glyph_cache
+                                    .glyph_cache()
                                     .borrow_mut()
                                     .cached_block(*block, &params.render_metrics)
                                     .context("cached_block")?,
@@ -786,10 +785,7 @@ impl crate::TermWindow {
         };
         let paragraph_context = line_paragraph_context(&cell_clusters);
 
-        let gl_state = self
-            .render_state
-            .as_ref()
-            .context("render state is not initialized")?;
+        let gl_state = self.chrome()?;
 
         // ft-yccm0.4.3.4: clusters that differ only in paint attributes are
         // shaped once as a run; each cluster then gets its own glyphs back,
@@ -813,7 +809,7 @@ impl crate::TermWindow {
                 self.cached_cluster_shape(
                     style,
                     cluster,
-                    &gl_state,
+                    gl_state,
                     None,
                     &self.render_metrics,
                     context,
@@ -843,7 +839,7 @@ impl crate::TermWindow {
                 }
                 // underline and strikethrough
                 let underline_tex_rect = gl_state
-                    .glyph_cache
+                    .glyph_cache()
                     .borrow_mut()
                     .cached_line_sprite(
                         is_highlited_hyperlink,
@@ -949,7 +945,7 @@ impl crate::TermWindow {
                     self.cached_cluster_shape(
                         style_params.style,
                         &cluster,
-                        &gl_state,
+                        gl_state,
                         None,
                         &self.render_metrics,
                         cluster_paragraph_context,
@@ -974,7 +970,7 @@ impl crate::TermWindow {
 
             x_pos += pixel_width;
         }
-        gl_state.shaping.set(gl_state.shaping.get().add(counters));
+        gl_state.record_shaping(counters);
 
         let shaped = Rc::new(shaped);
 

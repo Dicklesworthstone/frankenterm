@@ -8,10 +8,9 @@ use crate::quad::{
 use crate::shapecache::*;
 use crate::termwindow::box_model::ChromeTarget;
 use crate::termwindow::render::paint::AllowImage;
-use crate::termwindow::{BorrowedShapeCacheKey, RenderState, ShapedInfo};
+use crate::termwindow::{BorrowedShapeCacheKey, ShapedInfo};
 use crate::utilsprites::RenderMetrics;
 use ::window::bitmaps::{TextureCoord, TextureRect, TextureSize};
-use frankenterm_alloc::resource_ledger::CacheGauge;
 use ::window::{DeadKeyStatus, PointF, RectF, SizeF};
 use anyhow::{Context, anyhow};
 use config::{
@@ -19,6 +18,7 @@ use config::{
     VerticalWindowContentAlignment, VisualBellTarget,
 };
 use euclid::num::Zero;
+use frankenterm_alloc::resource_ledger::CacheGauge;
 use frankenterm_font::shaper::PresentationWidth;
 use frankenterm_font::units::{IntPixelLength, PixelLength};
 use frankenterm_font::{GlyphInfo, LoadedFont};
@@ -362,12 +362,15 @@ fn render_cache_gauge_values(
 
     let mut shape_bytes = 0u64;
     shapes.for_each_resident(|key, shape| {
-        shape_bytes += (size_of::<ShapeCacheKey>() + key.text.capacity()) as u64
-            + shape.accounted_bytes();
+        shape_bytes +=
+            (size_of::<ShapeCacheKey>() + key.text.capacity()) as u64 + shape.accounted_bytes();
     });
     let mut line_bytes = 0u64;
     lines.for_each_resident(|key, item| {
-        let composing = key.composing.as_ref().map_or(0, |(_, text)| text.capacity());
+        let composing = key
+            .composing
+            .as_ref()
+            .map_or(0, |(_, text)| text.capacity());
         let elements: usize = item
             .shaped
             .iter()
@@ -655,7 +658,7 @@ impl crate::TermWindow {
         style: &TextStyle,
         attrs: &CellAttributes,
         font: Option<&Rc<LoadedFont>>,
-        gl_state: &RenderState,
+        gl_state: &dyn ChromeTarget,
         metrics: &RenderMetrics,
     ) -> anyhow::Result<Rc<CachedGlyph>> {
         let fa_lock = "\u{f023}";
@@ -675,7 +678,7 @@ impl crate::TermWindow {
     pub fn populate_block_quad(
         &self,
         block: BlockKey,
-        gl_state: &RenderState,
+        gl_state: &dyn ChromeTarget,
         quads: &mut dyn QuadAllocator,
         pos_x: f32,
         params: &RenderScreenLineParams,
@@ -683,7 +686,7 @@ impl crate::TermWindow {
         glyph_color: LinearRgba,
     ) -> anyhow::Result<()> {
         let sprite = gl_state
-            .glyph_cache
+            .glyph_cache()
             .borrow_mut()
             .cached_block(block, &params.render_metrics)?
             .texture_coords();
@@ -704,7 +707,7 @@ impl crate::TermWindow {
     pub fn populate_image_quad(
         &self,
         image: &termwiz::image::ImageCell,
-        gl_state: &RenderState,
+        gl_state: &dyn ChromeTarget,
         layers: &mut TripleLayerQuadAllocator,
         layer_num: usize,
         cell_idx: usize,
@@ -761,7 +764,7 @@ impl crate::TermWindow {
         };
 
         let (sprite, next_due, load_state) = gl_state
-            .glyph_cache
+            .glyph_cache()
             .borrow_mut()
             .cached_image(image.image_data(), Some(padding), self.allow_images)
             .context("cached_image")?;
@@ -1082,7 +1085,7 @@ impl crate::TermWindow {
         &self,
         style: &TextStyle,
         cluster: &CellCluster,
-        gl_state: &RenderState,
+        gl_state: &dyn ChromeTarget,
         font: Option<&Rc<LoadedFont>>,
         metrics: &RenderMetrics,
         paragraph_context: Option<(&str, Range<usize>)>,
@@ -1125,7 +1128,7 @@ impl crate::TermWindow {
             }
             let glyphs = self.glyph_infos_to_glyphs(
                 style,
-                &mut gl_state.glyph_cache.borrow_mut(),
+                &mut gl_state.glyph_cache().borrow_mut(),
                 &info,
                 &font,
                 metrics,
@@ -1144,7 +1147,7 @@ impl crate::TermWindow {
                 fresh = Some(glyphs);
                 Ok(CachedShape::new(infos))
             })?;
-            let mut glyph_cache = gl_state.glyph_cache.borrow_mut();
+            let mut glyph_cache = gl_state.glyph_cache().borrow_mut();
             if let Some(glyphs) = fresh {
                 glyph_cache.bind_shape(cached.id(), Rc::clone(&glyphs));
                 glyphs
@@ -1390,8 +1393,12 @@ mod tests {
         let config = ConfigHandle::default_config();
         let mut shapes: LfuCache<ShapeCacheKey, Rc<CachedShape>> =
             LfuCache::new("t.s.hit", "t.s.miss", |c| c.shape_cache_size, &config);
-        let mut lines: LfuCache<LineToEleShapeCacheKey, LineToElementShapeItem> =
-            LfuCache::new("t.l.hit", "t.l.miss", |c| c.line_to_ele_shape_cache_size, &config);
+        let mut lines: LfuCache<LineToEleShapeCacheKey, LineToElementShapeItem> = LfuCache::new(
+            "t.l.hit",
+            "t.l.miss",
+            |c| c.line_to_ele_shape_cache_size,
+            &config,
+        );
         let mut quads: LfuCache<LineQuadCacheKey, LineQuadCacheValue> =
             LfuCache::new("t.q.hit", "t.q.miss", |c| c.line_quad_cache_size, &config);
         let gauge = |values: &[(CacheGauge, u64); 6], wanted: CacheGauge| {

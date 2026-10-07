@@ -3,6 +3,7 @@ use crate::color::LinearRgba;
 use crate::customglyph::{BlockKey, Poly};
 use crate::glyphcache::{CachedGlyph, GlyphCache};
 use crate::quad::{QuadImpl, QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
+use crate::renderstate::ShapingCounters;
 use crate::termwindow::{ColorEase, MouseCapture, RenderState, UIItem, UIItemType};
 use crate::utilsprites::{RenderMetrics, UtilSprites};
 use ::window::RectF;
@@ -426,6 +427,10 @@ pub trait ChromeTarget {
         zindex: i8,
         draw: &mut dyn FnMut(&mut TripleLayerQuadAllocator) -> anyhow::Result<()>,
     ) -> anyhow::Result<()>;
+
+    /// Line shaping done for a screen line it draws (the cache gauges of
+    /// ft-yccm0.4.3.4); a target that does not report them ignores it.
+    fn record_shaping(&self, _counters: ShapingCounters) {}
 }
 
 impl ChromeTarget for RenderState {
@@ -445,6 +450,10 @@ impl ChromeTarget for RenderState {
         let layer = self.layer_for_zindex(zindex)?;
         let mut layers = layer.quad_allocator();
         draw(&mut layers)
+    }
+
+    fn record_shaping(&self, counters: ShapingCounters) {
+        self.shaping.set(self.shaping.get().add(counters));
     }
 }
 

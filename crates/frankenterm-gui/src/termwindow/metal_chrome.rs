@@ -207,13 +207,13 @@ fn ui_quad(
 }
 
 impl TermWindow {
-    /// Lays out and paints this Metal window's chrome, the fancy tab bar
-    /// and any modal overlay, appending their hit-test items to `ui_items`
+    /// Lays out and paints this Metal window's chrome, the tab bar and any
+    /// modal overlay, appending their hit-test items to `ui_items`
     /// as `paint_pass` does, and returns its quads. `None` without chrome.
     // Window pixel sizes are far inside f32's exact integers.
     #[allow(clippy::cast_precision_loss)]
     pub(crate) fn metal_chrome_frame(&mut self) -> Option<ChromeFrame> {
-        let tab_bar = self.show_tab_bar && self.config.use_fancy_tab_bar;
+        let tab_bar = self.show_tab_bar;
         // As paint_pass: background layers when images are allowed.
         let backgrounds = !self.window_background.is_empty()
             && matches!(self.allow_images, AllowImage::Yes | AllowImage::Scale(_));
@@ -279,9 +279,9 @@ impl TermWindow {
         })
     }
 
-    /// The window background layers (when `backgrounds`), the fancy tab bar
-    /// (when `tab_bar`), then any modal, as `paint_pass` paints them for the
-    /// other front ends.
+    /// The window background layers (when `backgrounds`), the fancy or
+    /// retro tab bar (when `tab_bar`), then any modal, as `paint_pass`
+    /// paints them for the other front ends.
     fn paint_metal_chrome(&mut self, backgrounds: bool, tab_bar: bool) -> anyhow::Result<()> {
         if backgrounds {
             let bg_color = self.palette().background.to_linear();
@@ -299,13 +299,24 @@ impl TermWindow {
             // while no layer quad was drawn.
             self.render_backgrounds(bg_color, top)?;
         }
-        if tab_bar {
+        if tab_bar && self.config.use_fancy_tab_bar {
             if self.fancy_tab_bar.is_none() {
                 let palette = self.palette().clone();
                 let bar = self.build_fancy_tab_bar(&palette)?;
                 self.fancy_tab_bar.replace(bar);
             }
             let mut items = self.paint_fancy_tab_bar()?;
+            self.ui_items.append(&mut items);
+        } else if tab_bar {
+            // The retro tab bar is a screen line in the WebGpu renderer's
+            // zindex 0 layer, painted after the panes.
+            let palette = self.palette().clone();
+            let mut items = Vec::new();
+            let chrome = self.chrome()?;
+            chrome.draw_in_layer(0, &mut |layers| {
+                items = self.paint_retro_tab_bar(layers, &palette)?;
+                Ok(())
+            })?;
             self.ui_items.append(&mut items);
         }
         self.paint_modal()
