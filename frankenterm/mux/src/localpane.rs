@@ -17718,77 +17718,158 @@ mod tests {
         (lines, cursor)
     }
 
+    /// What a reader saw of the terminal lock while one flood was applied
+    /// (ft-yccm0.2.3).
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    struct FloodReads {
+        /// Each wait of a Paint locker that asks every 300 us.
+        waits: Vec<Duration>,
+        /// Reads that saw the flood partly applied: the reader was served
+        /// between two of the parser's holds, so the parser handed over.
+        mid_batch_reads: usize,
+        apply_time: Duration,
+    }
+
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    impl FloodReads {
+        /// Runs `apply` while a reader locks the pane's terminal every 300 us
+        /// (the reader has been served once before `apply` starts). Each hold
+        /// of the parser is its own output batch, one seqno, so a read
+        /// strictly between the seqnos before and after the flood happened
+        /// inside it.
+        fn record(pane: &LocalPane, apply: impl FnOnce()) -> Self {
+            let before = pane.terminal.lock().current_seqno();
+            let done = AtomicBool::new(false);
+            let (reads, apply_time) = std::thread::scope(|scope| {
+                let done = &done;
+                let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+                let reader = scope.spawn(move || {
+                    let mut reads = Vec::new();
+                    let mut ready = Some(ready_tx);
+                    while !done.load(Ordering::Acquire) {
+                        let asked = Instant::now();
+                        let terminal = pane.terminal.lock_as(TerminalLockHolder::Paint);
+                        reads.push((asked.elapsed(), terminal.current_seqno()));
+                        drop(terminal);
+                        if let Some(ready) = ready.take() {
+                            ready.send(()).unwrap();
+                        }
+                        std::thread::sleep(Duration::from_micros(300));
+                    }
+                    reads
+                });
+                ready_rx.recv().unwrap();
+                let started = Instant::now();
+                apply();
+                let apply_time = started.elapsed();
+                done.store(true, Ordering::Release);
+                (reader.join().unwrap(), apply_time)
+            });
+            let after = pane.terminal.lock().current_seqno();
+            Self {
+                waits: reads.iter().map(|(wait, _)| *wait).collect(),
+                mid_batch_reads: reads
+                    .iter()
+                    .filter(|(_, seqno)| before < *seqno && *seqno < after)
+                    .count(),
+                apply_time,
+            }
+        }
+
+        fn p99(&self) -> Duration {
+            let mut sorted = self.waits.clone();
+            sorted.sort();
+            sorted[sorted.len() * 99 / 100]
+        }
+
+        /// Which parts of the fairness property these reads break. It is
+        /// relative to `unsliced`, the time to apply the same flood in one
+        /// hold, not an absolute bound, which on a shared debug worker would
+        /// measure scheduler noise as much as fairness. The parser handed
+        /// over, and a waiting reader's p99 wait is a tenth of the unsliced
+        /// apply or less. Unsliced, a reader waits for the whole batch. The
+        /// strict 1 ms target is the M.4 histograms' on the M4.
+        fn fairness_failures(&self, unsliced: Duration) -> Vec<&'static str> {
+            let mut failures = Vec::new();
+            if self.mid_batch_reads == 0 {
+                failures.push("no handoff: the reader was never served mid-batch");
+            }
+            if self.waits.len() < 10 {
+                failures.push("fewer than 10 reader samples");
+            }
+            if self.p99() * 10 > unsliced {
+                failures.push("p99 wait is not far below the unsliced apply time");
+            }
+            failures
+        }
+    }
+
     /// ft-yccm0.2.3 acceptance: while the parse thread applies two megabytes
     /// of T0-shaped output in one fused batch, a reader that has to wait for
-    /// the terminal lock is served at the parser's next slice boundary,
-    /// within 1 ms. The bound is honest about the build: when one slice of
-    /// this (debug, possibly loaded) build takes longer than half a
-    /// millisecond, two slice times are allowed instead, plus 1 ms of
-    /// scheduler slack. Unsliced, the reader would wait for the whole batch,
-    /// which the test checks is far longer than the bound. The batch, handed
-    /// over many times, still lands exactly as one unsliced feed.
+    /// the terminal lock is served at the parser's slice boundaries. The
+    /// planted negative applies the same flood through the same slicing with
+    /// yielding suppressed, one hold as before ft-yccm0.2.3: its time is the
+    /// unsliced apply time, and the same fairness check must fail on it.
+    /// Both batches still land exactly as one unsliced feed.
     #[cfg(not(feature = "disruptor-pane-io"))]
     #[test]
-    fn a_waiting_reader_is_served_within_a_millisecond_under_a_parser_flood() {
+    fn a_waiting_reader_is_served_at_slice_boundaries_under_a_parser_flood() {
         let flood = t0_flood(80_000);
-        let pane = render_facts_test_pane(841);
-        let done = AtomicBool::new(false);
-        let (waits, flood_time) = std::thread::scope(|scope| {
-            let pane = &pane;
-            let done = &done;
-            let reader = scope.spawn(move || {
-                let mut waits = Vec::new();
-                while !done.load(Ordering::Acquire) {
-                    std::thread::sleep(Duration::from_micros(300));
-                    let asked = Instant::now();
-                    let terminal = pane.terminal.lock_as(TerminalLockHolder::Paint);
-                    waits.push(asked.elapsed());
-                    drop(terminal);
-                }
-                waits
-            });
-            let mut parser = termwiz::escape::parser::Parser::new();
-            let mut diverted = Vec::new();
-            let started = Instant::now();
-            pane.feed_fused(&mut parser, &flood, &mut diverted)
-                .expect("an unregistered pane admits output");
-            let flood_time = started.elapsed();
-            done.store(true, Ordering::Release);
-            assert!(diverted.is_empty(), "T0 output diverts nothing");
-            (reader.join().unwrap(), flood_time)
+        let unsliced_pane = render_facts_test_pane(845);
+        let unsliced = FloodReads::record(&unsliced_pane, || {
+            let mut terminal = unsliced_pane.terminal.lock_as(TerminalLockHolder::Parser);
+            let mut sliced = SlicedFeed::new(&flood, FEED_SLICE_BYTES);
+            let progress = sliced.run(
+                &mut terminal,
+                &mut termwiz::escape::parser::Parser::new(),
+                &mut FusedFeedGate,
+                &mut Vec::new(),
+                &mut || false,
+            );
+            assert!(progress == SliceProgress::Done);
         });
-        assert!(waits.len() >= 10, "{} reader samples", waits.len());
-        let slices = u32::try_from(flood.len() / FEED_SLICE_BYTES).unwrap();
-        let slice_time = flood_time / slices;
-        let bound = Duration::from_millis(1).max(2 * slice_time) + Duration::from_millis(1);
-        let mut sorted = waits.clone();
-        sorted.sort();
-        let p99 = sorted[sorted.len() * 99 / 100];
-        let waited = waits
-            .iter()
-            .filter(|wait| **wait > Duration::from_micros(20))
-            .count();
-        eprintln!(
-            "[BENCH] parser flood {} bytes in {flood_time:?} ({slice_time:?} a slice); \
-             reader samples {}, {waited} waited, p99 {p99:?}, max {:?}, bound {bound:?}",
-            flood.len(),
-            waits.len(),
-            sorted.last().copied().unwrap_or_default()
-        );
+        let pane = render_facts_test_pane(841);
+        let sliced = FloodReads::record(&pane, || {
+            let mut diverted = Vec::new();
+            pane.feed_fused(
+                &mut termwiz::escape::parser::Parser::new(),
+                &flood,
+                &mut diverted,
+            )
+            .expect("an unregistered pane admits output");
+            assert!(diverted.is_empty(), "T0 output diverts nothing");
+        });
+        for (name, reads) in [("unsliced", &unsliced), ("sliced", &sliced)] {
+            eprintln!(
+                "[BENCH] parser flood {} bytes, {name}: applied in {:?}, {} reader samples, \
+                 {} mid-batch, p99 wait {:?}, max {:?}",
+                flood.len(),
+                reads.apply_time,
+                reads.waits.len(),
+                reads.mid_batch_reads,
+                reads.p99(),
+                reads.waits.iter().max().copied().unwrap_or_default()
+            );
+        }
+
+        let negative = unsliced.fairness_failures(unsliced.apply_time);
         assert!(
-            flood_time > 5 * bound,
-            "the batch ({:?}) must dwarf the bound ({:?})",
-            flood_time,
-            bound
+            negative.contains(&"no handoff: the reader was never served mid-batch")
+                && negative.contains(&"p99 wait is not far below the unsliced apply time"),
+            "with yielding suppressed the fairness check must fail, but it found only {:?}",
+            negative
         );
-        assert!(p99 <= bound, "p99 wait {:?} exceeds {:?}", p99, bound);
+        let failures = sliced.fairness_failures(unsliced.apply_time);
+        assert!(failures.is_empty(), "{:?}", failures);
 
         let reference = render_facts_test_pane(842);
         reference.terminal.lock().advance_bytes(&flood);
+        let expected = terminal_cells_and_cursor(&reference);
         assert!(
-            terminal_cells_and_cursor(&pane) == terminal_cells_and_cursor(&reference),
+            terminal_cells_and_cursor(&pane) == expected,
             "the sliced batch must land as one unsliced feed"
         );
+        assert!(terminal_cells_and_cursor(&unsliced_pane) == expected);
     }
 
     /// ft-yccm0.2.3: the two-stage path hands the lock over the same way,
