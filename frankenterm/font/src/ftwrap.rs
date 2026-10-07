@@ -1580,3 +1580,28 @@ pub fn composite_mode_to_operator(mode: FT_Composite_Mode) -> cairo::Operator {
 fn ft_make_tag(a: u8, b: u8, c: u8, d: u8) -> FT_ULong {
     (a as FT_ULong) << 24 | (b as FT_ULong) << 16 | (c as FT_ULong) << 8 | (d as FT_ULong)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // FreeType returns Unimplemented_Feature for these calls when it is built
+    // without FT_CONFIG_OPTION_SUBPIXEL_RENDERING, which would make
+    // freetype_lcd_filter silently do nothing.
+    #[test]
+    fn every_lcd_filter_and_custom_weights_are_accepted() {
+        config::use_test_configuration();
+        let mut lib = Library::new().unwrap();
+        for filter in [
+            FreeTypeLcdFilter::Default,
+            FreeTypeLcdFilter::Light,
+            FreeTypeLcdFilter::Legacy,
+            FreeTypeLcdFilter::None,
+        ] {
+            lib.set_lcd_filter(lcd_filter_to_ft(filter))
+                .unwrap_or_else(|err| panic!("{filter:?}: {err:#}"));
+        }
+        lib.set_lcd_filter_weights([0x10, 0x40, 0x70, 0x40, 0x10])
+            .unwrap();
+    }
+}
