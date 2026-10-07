@@ -245,6 +245,60 @@ impl MetalRenderer {
     /// Frames go through Metal 4 when the device and OS support it, else
     /// Metal 3; [`SUBMISSION_ENV`] can force Metal 3.
     pub fn attach(window: &impl HasWindowHandle) -> Result<Self, MetalUnavailable> {
+        let parts = RendererParts::prepare()?;
+        let handle =
+            window
+                .window_handle()
+                .map_err(|err| MetalUnavailable::UnsupportedWindowHandle {
+                    kind: format!("unavailable ({err})"),
+                })?;
+        let view = appkit_view(handle.as_raw())?;
+        if MainThreadMarker::new().is_none() {
+            return Err(MetalUnavailable::NotMainThread);
+        }
+        #[allow(unsafe_code)]
+        // SAFETY: FFI-VIEW. The borrowed `handle` keeps the NSView alive for
+        // this call, and we are on the main thread (checked above). NSView is
+        // an NSObject subclass, so viewing it as NSObject is sound.
+        let view: &NSObject = unsafe { view.cast::<NSObject>().as_ref() };
+        #[allow(unsafe_code)]
+        // SAFETY: FFI-VIEW. `-[NSView layer]` takes no arguments and returns
+        // a nullable `CALayer *`, matching the declared return type. The
+        // returned layer is retained, so it outlives the view borrow.
+        let layer: Option<Retained<CALayer>> = unsafe { msg_send![view, layer] };
+        let layer = layer
+            .ok_or(MetalUnavailable::NoBackingLayer)?
+            .downcast::<CAMetalLayer>()
+            .map_err(|layer| MetalUnavailable::LayerNotMetal {
+                class: layer.class().name().to_string_lossy().into_owned(),
+            })?;
+        Ok(parts.bind(layer))
+    }
+
+    /// A renderer bound to no window (ft-yccm0.4.4): its own unattached
+    /// `CAMetalLayer`, so it only draws offscreen through
+    /// [`Self::snapshot_frame`] and [`Self::snapshot_cells`]. Tests and
+    /// image-parity checks read exact frames back this way.
+    pub fn offscreen() -> Result<Self, MetalUnavailable> {
+        Ok(RendererParts::prepare()?.bind(CAMetalLayer::new()))
+    }
+}
+
+/// Everything a [`MetalRenderer`] owns except its layer.
+struct RendererParts {
+    device: MetalDevice,
+    frames: FrameSlots,
+    submission: Submission,
+    submission_note: Option<String>,
+    background: BackgroundPipeline,
+    text: TextPipeline,
+    atlases: GlyphAtlases,
+}
+
+impl RendererParts {
+    /// Opens and admits the system default device, allocates the frame
+    /// slots, pipelines and atlases, and picks the submission path.
+    fn prepare() -> Result<Self, MetalUnavailable> {
         let device = MetalDevice::system_default()?;
         let frames = FrameSlots::new(
             device.raw_device(),
@@ -290,49 +344,38 @@ impl MetalRenderer {
         if let Some(set) = atlases.residency() {
             submission.add_residency_set(set);
         }
-        let handle =
-            window
-                .window_handle()
-                .map_err(|err| MetalUnavailable::UnsupportedWindowHandle {
-                    kind: format!("unavailable ({err})"),
-                })?;
-        let view = appkit_view(handle.as_raw())?;
-        if MainThreadMarker::new().is_none() {
-            return Err(MetalUnavailable::NotMainThread);
-        }
-        #[allow(unsafe_code)]
-        // SAFETY: FFI-VIEW. The borrowed `handle` keeps the NSView alive for
-        // this call, and we are on the main thread (checked above). NSView is
-        // an NSObject subclass, so viewing it as NSObject is sound.
-        let view: &NSObject = unsafe { view.cast::<NSObject>().as_ref() };
-        #[allow(unsafe_code)]
-        // SAFETY: FFI-VIEW. `-[NSView layer]` takes no arguments and returns
-        // a nullable `CALayer *`, matching the declared return type. The
-        // returned layer is retained, so it outlives the view borrow.
-        let layer: Option<Retained<CALayer>> = unsafe { msg_send![view, layer] };
-        let layer = layer
-            .ok_or(MetalUnavailable::NoBackingLayer)?
-            .downcast::<CAMetalLayer>()
-            .map_err(|layer| MetalUnavailable::LayerNotMetal {
-                class: layer.class().name().to_string_lossy().into_owned(),
-            })?;
-        layer.setDevice(Some(&device.device));
-        layer.setPixelFormat(PIXEL_FORMAT);
-        layer.setFramebufferOnly(true);
-        submission.add_layer(&layer);
         Ok(Self {
             device,
-            layer,
-            drawable_size: Cell::new((0, 0)),
-            frames: RefCell::new(frames),
+            frames,
             submission,
             submission_note,
             background,
             text,
-            atlases: RefCell::new(atlases),
+            atlases,
         })
     }
 
+    /// Binds the parts to `layer`, configured for this device.
+    fn bind(self, layer: Retained<CAMetalLayer>) -> MetalRenderer {
+        layer.setDevice(Some(&self.device.device));
+        layer.setPixelFormat(PIXEL_FORMAT);
+        layer.setFramebufferOnly(true);
+        self.submission.add_layer(&layer);
+        MetalRenderer {
+            device: self.device,
+            layer,
+            drawable_size: Cell::new((0, 0)),
+            frames: RefCell::new(self.frames),
+            submission: self.submission,
+            submission_note: self.submission_note,
+            background: self.background,
+            text: self.text,
+            atlases: RefCell::new(self.atlases),
+        }
+    }
+}
+
+impl MetalRenderer {
     /// The admitted device this renderer draws with.
     #[must_use]
     pub fn device(&self) -> &MetalDevice {

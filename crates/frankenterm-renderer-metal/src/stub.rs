@@ -42,6 +42,10 @@ impl MetalRenderer {
         Err(MetalUnavailable::UnsupportedPlatform)
     }
 
+    pub fn offscreen() -> Result<Self, MetalUnavailable> {
+        Err(MetalUnavailable::UnsupportedPlatform)
+    }
+
     #[must_use]
     pub fn device(&self) -> &MetalDevice {
         match *self {}

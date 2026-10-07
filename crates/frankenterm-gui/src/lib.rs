@@ -10,6 +10,7 @@ pub mod floating_panes;
 pub mod gpu_regression;
 pub mod gpu_regression_fuzz;
 pub mod input_loop;
+pub mod metal_scene;
 pub mod osc8_gui;
 pub mod plugins;
 pub mod render_corpus;

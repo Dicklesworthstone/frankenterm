@@ -421,6 +421,31 @@ impl RenderMirror {
         self.last
     }
 
+    /// A mirror built from full copies of the viewport's lines, `lines[0]`
+    /// being the row at `first`: the Line-based reference that incremental
+    /// captures must match, and what a renderer that deep-clones every
+    /// visible line each frame works from. Hyperlink rules are not applied.
+    pub fn from_lines(
+        dimensions: RenderableDimensions,
+        cursor: StableCursorPosition,
+        first: StableRowIndex,
+        lines: &[Line],
+    ) -> Self {
+        let rows = lines
+            .iter()
+            .enumerate()
+            .map(|(offset, line)| MirrorRow::from_line(first + offset as StableRowIndex, line, 1))
+            .collect();
+        Self {
+            rows,
+            first,
+            dimensions: Some(dimensions),
+            cursor,
+            generation: 1,
+            ..Self::default()
+        }
+    }
+
     /// Forgets every row, so the next capture copies all of them.
     pub fn invalidate(&mut self) {
         self.rows.clear();
