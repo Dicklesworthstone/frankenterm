@@ -16,10 +16,13 @@ use crate::frame::{
     SlotBuffer, SlotLease, SlotRing, SlotSizes, UNIFORMS_BYTES, grown_capacity,
 };
 use crate::macos_atlas::GlyphAtlases;
+use crate::ui_quads::{UI_QUAD_BYTES, UI_SHADER, UI_UNIFORMS_BYTES, UiLayer, ui_uniforms_bytes};
 use crate::uploads::{SlotUploads, UploadPlan, row_table_entry, text_region};
 use crate::{ClearColor, FRAME_SLOT_TIMEOUT, FrameError, MAX_TEXTURE_EXTENT, SubmissionPath};
 use block2::RcBlock;
-use frankenterm_alloc::resource_ledger::{GpuBufferPurpose, GpuResourceGuard, GpuResourceLedger};
+use frankenterm_alloc::resource_ledger::{
+    GpuBufferPurpose, GpuResourceGuard, GpuResourceLedger, GpuTexturePurpose,
+};
 use objc2::Message;
 use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
@@ -31,7 +34,7 @@ use objc2_metal::{
     MTL4RenderCommandEncoder, MTL4RenderPassDescriptor, MTLBlendFactor, MTLBlitCommandEncoder,
     MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
     MTLCommandQueue, MTLDevice, MTLDrawable, MTLGPUFamily, MTLLibrary, MTLLoadAction, MTLOrigin,
-    MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder,
+    MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLRenderCommandEncoder,
     MTLRenderPassColorAttachmentDescriptor, MTLRenderPassColorAttachmentDescriptorArray,
     MTLRenderPassDescriptor, MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLRenderStages,
     MTLResidencySet, MTLResidencySetDescriptor, MTLResource, MTLResourceOptions, MTLScissorRect,
@@ -40,6 +43,7 @@ use objc2_metal::{
 use objc2_quartz_core::CAMetalLayer;
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -108,6 +112,11 @@ pub(crate) struct FrameSlots {
     panes: HashMap<u64, PaneBuffers>,
     /// Per slot: the window frame's uniform blocks and fill cell.
     window: Vec<WindowSlot>,
+    /// The chrome atlas, replaced when its version changes.
+    ui_atlas: Option<UiAtlasTexture>,
+    /// Replaced chrome atlases, each with the first frame that no longer
+    /// samples it: freed once every earlier frame has finished.
+    retired_ui_atlases: Vec<(u64, UiAtlasTexture)>,
 }
 
 /// Frames a pane may go undrawn (a tab switched away, say) before its
@@ -153,6 +162,17 @@ struct WindowSlot {
     /// One CellBg cell without a color, so a fill shows its uniforms' clear
     /// color.
     fill: Option<SlotAllocation>,
+    /// The chrome quads (ft-yccm0.4.7.1): their uniforms, then the quads
+    /// from [`UI_UNIFORMS_BYTES`] on.
+    ui: Option<SlotAllocation>,
+}
+
+/// The texture chrome quads sample (ft-yccm0.4.7.1), holding the
+/// [`crate::UiAtlas`] of one version.
+struct UiAtlasTexture {
+    version: u64,
+    texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    _ledger: GpuResourceGuard,
 }
 
 impl FrameSlots {
@@ -176,6 +196,8 @@ impl FrameSlots {
             upload_bytes_total: 0,
             panes: HashMap::new(),
             window: (0..FRAME_SLOTS).map(|_| WindowSlot::default()).collect(),
+            ui_atlas: None,
+            retired_ui_atlases: Vec::new(),
         };
         for index in 0..FRAME_SLOTS {
             let mut buffers = Vec::with_capacity(SlotBuffer::ALL.len());
@@ -673,6 +695,159 @@ impl FrameSlots {
             )?;
         }
         Ok(())
+    }
+
+    /// Writes `layer`'s uniforms and quads into the leased slot's chrome
+    /// buffer, growing it as needed, and makes the chrome atlas hold
+    /// `layer.atlas`, uploading it only when its version changed
+    /// (ft-yccm0.4.7.1). Returns how many quads to draw.
+    pub(crate) fn write_ui(
+        &mut self,
+        lease: &SlotLease,
+        layer: &UiLayer<'_>,
+        viewport: [u32; 2],
+    ) -> Result<usize, FrameError> {
+        assert!(
+            lease.is_from(&self.ring),
+            "a slot lease from another renderer's ring"
+        );
+        self.retire_ui_atlases();
+        if layer.quads.is_empty() {
+            return Ok(0);
+        }
+        if self
+            .ui_atlas
+            .as_ref()
+            .is_none_or(|atlas| atlas.version != layer.atlas.version)
+        {
+            let atlas = self.upload_ui_atlas(layer)?;
+            if let Some(old) = self.ui_atlas.replace(atlas) {
+                self.retired_ui_atlases.push((lease.frame(), old));
+            }
+        }
+        let slot = lease.slot();
+        let needed = UI_UNIFORMS_BYTES + layer.quads.len() * UI_QUAD_BYTES;
+        let current = self.window[slot]
+            .ui
+            .as_ref()
+            .map_or(0, |allocation| allocation.buffer.length());
+        let capacity = grown_capacity(current, needed);
+        if capacity != current {
+            let replacement = self.allocate_resident(SlotBuffer::Uniforms, capacity, slot)?;
+            if let Some(old) = self.window[slot].ui.replace(replacement)
+                && let Some(set) = &self.residency
+            {
+                set.removeAllocation(ProtocolObject::from_ref(&*old.buffer));
+            }
+            self.commit_residency();
+        }
+        let mut bytes = Vec::with_capacity(needed);
+        bytes.extend_from_slice(&ui_uniforms_bytes(viewport, layer.foreground_text_hsb));
+        for quad in layer.quads {
+            bytes.extend_from_slice(&quad.to_bytes());
+        }
+        let Some(ui) = self.window[slot].ui.as_ref() else {
+            unreachable!("the chrome buffer was just allocated");
+        };
+        self.write_into(lease, &ui.buffer, "window chrome", 0, &bytes)?;
+        Ok(layer.quads.len())
+    }
+
+    /// A texture holding `layer.atlas`.
+    fn upload_ui_atlas(&mut self, layer: &UiLayer<'_>) -> Result<UiAtlasTexture, FrameError> {
+        let atlas = layer.atlas;
+        let (width, height) = (atlas.width, atlas.height);
+        let bytes_per_row = usize::try_from(width)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(4);
+        let rows = usize::try_from(height).unwrap_or(usize::MAX);
+        if !(1..=MAX_TEXTURE_EXTENT).contains(&width)
+            || !(1..=MAX_TEXTURE_EXTENT).contains(&height)
+            || atlas.rgba.len() != bytes_per_row.saturating_mul(rows)
+        {
+            return Err(FrameError::InvalidExtent { width, height });
+        }
+        #[allow(unsafe_code)]
+        // SAFETY: FFI-EXTENT. RGBA8Unorm_sRGB is an ordinary 2D format and the
+        // extent was checked to be within 1..=MAX_TEXTURE_EXTENT on both axes
+        // above.
+        let descriptor = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::RGBA8Unorm_sRGB,
+                width as usize,
+                height as usize,
+                false,
+            )
+        };
+        descriptor.setUsage(MTLTextureUsage::ShaderRead);
+        descriptor.setStorageMode(MTLStorageMode::Shared);
+        let texture = self.device.newTextureWithDescriptor(&descriptor).ok_or(
+            FrameError::AllocationFailed {
+                what: "window chrome atlas",
+                bytes: atlas.rgba.len(),
+            },
+        )?;
+        let Some(pixels) = NonNull::new(atlas.rgba.as_ptr().cast_mut().cast::<c_void>()) else {
+            return Err(FrameError::InvalidExtent { width, height });
+        };
+        let region = MTLRegion {
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+            size: MTLSize {
+                width: width as usize,
+                height: height as usize,
+                depth: 1,
+            },
+        };
+        #[allow(unsafe_code)]
+        // SAFETY: ATLAS-UPLOAD. The region is the whole new texture, which no
+        // frame has used yet. `atlas.rgba` was checked to hold exactly
+        // width * height * 4 bytes, rows tightly packed at `bytes_per_row`,
+        // and the borrow keeps it alive for the call. The texture is in shared
+        // storage, which the CPU may write.
+        unsafe {
+            texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                region,
+                0,
+                pixels,
+                bytes_per_row,
+            );
+        }
+        if let Some(set) = &self.residency {
+            set.addAllocation(ProtocolObject::from_ref(&*texture));
+        }
+        self.commit_residency();
+        Ok(UiAtlasTexture {
+            version: atlas.version,
+            texture,
+            _ledger: self
+                .ledger
+                .track_texture(GpuTexturePurpose::Atlas, atlas.rgba.len() as u64),
+        })
+    }
+
+    /// Frees the replaced chrome atlases no unfinished frame samples.
+    fn retire_ui_atlases(&mut self) {
+        let retired_before = self.ring.retired_before();
+        let residency = &self.residency;
+        let before = self.retired_ui_atlases.len();
+        self.retired_ui_atlases.retain(|(first_without, atlas)| {
+            let keep = *first_without > retired_before;
+            if !keep && let Some(set) = residency {
+                set.removeAllocation(ProtocolObject::from_ref(&*atlas.texture));
+            }
+            keep
+        });
+        if self.retired_ui_atlases.len() != before {
+            self.commit_residency();
+        }
+    }
+
+    /// The leased slot's chrome buffer and the chrome atlas, once written.
+    pub(crate) fn ui_buffers(&self, slot: usize) -> Option<UiBuffers<'_>> {
+        Some(UiBuffers {
+            buffer: &self.window[slot].ui.as_ref()?.buffer,
+            atlas: &self.ui_atlas.as_ref()?.texture,
+        })
     }
 
     /// A pane's `kind` buffer in `slot`, once the pane was uploaded there.
@@ -1304,6 +1479,13 @@ pub(crate) struct PaneTextDraw<'a> {
     pub(crate) instances: usize,
 }
 
+/// A window frame's chrome buffer in one slot and the chrome atlas
+/// (ft-yccm0.4.7.1).
+pub(crate) struct UiBuffers<'a> {
+    pub(crate) buffer: &'a ProtocolObject<dyn MTLBuffer>,
+    pub(crate) atlas: &'a ProtocolObject<dyn MTLTexture>,
+}
+
 /// A window frame's uniforms and fill-cell buffers in one slot.
 pub(crate) struct WindowBuffers<'a> {
     pub(crate) uniforms: &'a ProtocolObject<dyn MTLBuffer>,
@@ -1322,6 +1504,61 @@ pub(crate) struct EncodedWindow<'a> {
     pub(crate) background: &'a BackgroundPipeline,
     pub(crate) text: TextDraw<'a>,
     pub(crate) draws: &'a [WindowDraw<'a>],
+    /// Window chrome, drawn last.
+    pub(crate) ui: Option<UiDraw<'a>>,
+}
+
+/// A window frame's chrome quads (ft-yccm0.4.7.1): one instanced draw of
+/// `quads` quads, in order, over everything else.
+pub(crate) struct UiDraw<'a> {
+    pub(crate) pipeline: &'a UiPipeline,
+    pub(crate) buffers: UiBuffers<'a>,
+    pub(crate) quads: usize,
+    /// The whole target.
+    pub(crate) scissor: crate::PixelRect,
+}
+
+/// Draws a window frame's chrome quads (Metal 3).
+fn draw_ui(encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>, ui: &UiDraw<'_>) {
+    encoder.setRenderPipelineState(&ui.pipeline.state);
+    encoder.setScissorRect(scissor(ui.scissor));
+    #[allow(unsafe_code)]
+    // SAFETY: FFI-DRAW. The leased slot's chrome buffer, written for this
+    // frame: its uniforms, from offset 0, at the vertex shader's [[buffer(0)]].
+    unsafe {
+        encoder.setVertexBuffer_offset_atIndex(Some(ui.buffers.buffer), 0, 0);
+    }
+    #[allow(unsafe_code)]
+    // SAFETY: FFI-DRAW. The same buffer's quads, from UI_UNIFORMS_BYTES (inside
+    // the buffer, which holds them all), at the vertex shader's [[buffer(1)]].
+    unsafe {
+        encoder.setVertexBuffer_offset_atIndex(Some(ui.buffers.buffer), UI_UNIFORMS_BYTES, 1);
+    }
+    #[allow(unsafe_code)]
+    // SAFETY: FFI-DRAW. The chrome uniforms at the fragment shader's
+    // [[buffer(0)]].
+    unsafe {
+        encoder.setFragmentBuffer_offset_atIndex(Some(ui.buffers.buffer), 0, 0);
+    }
+    #[allow(unsafe_code)]
+    // SAFETY: FFI-DRAW. The live chrome atlas, which the frame slots keep
+    // until no unfinished frame samples it, at the fragment shader's
+    // [[texture(0)]]. Metal 3 retains bound textures.
+    unsafe {
+        encoder.setFragmentTexture_atIndex(Some(ui.buffers.atlas), 0);
+    }
+    #[allow(unsafe_code)]
+    // SAFETY: FFI-DRAW. Four strip vertices per instance; ui_vertex reads a
+    // quad only at instance_id < quads, all of which write_ui wrote into a
+    // buffer fitted for them.
+    unsafe {
+        encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
+            MTLPrimitiveType::TriangleStrip,
+            0,
+            4,
+            ui.quads,
+        );
+    }
 }
 
 /// The descriptor of every Metal 4 argument table: one binding per
@@ -1358,17 +1595,29 @@ fn scissor(rect: crate::PixelRect) -> MTLScissorRect {
     }
 }
 
+/// How a pipeline's output combines with what is already drawn, in linear
+/// light.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Blend {
+    /// It replaces it.
+    Opaque,
+    /// Premultiplied source-over.
+    Premultiplied,
+    /// Straight-alpha source-over: WebGpu's `BlendState::ALPHA_BLENDING`,
+    /// for window chrome quads (ft-yccm0.4.7.1).
+    Straight,
+}
+
 /// A render pipeline drawing into [`TARGET_PIXEL_FORMAT`], compiled from
 /// `source` behind [`crate::color::shader_prelude`] (the sRGB decoding
-/// table); `blended` enables premultiplied source-over onto what is already
-/// there, in linear light.
+/// table), blending as `blend` says.
 fn render_pipeline(
     device: &ProtocolObject<dyn MTLDevice>,
     pass: &str,
     source: &str,
     vertex: &NSString,
     fragment: &NSString,
-    blended: bool,
+    blend: Blend,
 ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>, String> {
     let source = format!("{}{source}", crate::color::shader_prelude());
     let library = device
@@ -1396,9 +1645,13 @@ fn render_pipeline(
     // Metal device exposes, and the array creates the descriptor on access.
     let attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
     attachment.setPixelFormat(TARGET_PIXEL_FORMAT);
-    if blended {
+    if blend != Blend::Opaque {
         attachment.setBlendingEnabled(true);
-        attachment.setSourceRGBBlendFactor(MTLBlendFactor::One);
+        attachment.setSourceRGBBlendFactor(if blend == Blend::Straight {
+            MTLBlendFactor::SourceAlpha
+        } else {
+            MTLBlendFactor::One
+        });
         attachment.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
         attachment.setSourceAlphaBlendFactor(MTLBlendFactor::One);
         attachment.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
@@ -1436,8 +1689,8 @@ impl BackgroundPipeline {
             )
         };
         Ok(Self {
-            state: pipeline(false)?,
-            over: pipeline(true)?,
+            state: pipeline(Blend::Opaque)?,
+            over: pipeline(Blend::Premultiplied)?,
         })
     }
 
@@ -1463,7 +1716,28 @@ impl TextPipeline {
             TEXT_SHADER,
             ns_string!("text_vertex"),
             ns_string!("text_fragment"),
-            true,
+            Blend::Premultiplied,
+        )?;
+        Ok(Self { state })
+    }
+}
+
+/// The window chrome pass's render pipeline (ft-yccm0.4.7.1), compiled from
+/// [`UI_SHADER`] once per renderer: WebGpu's quad shader, blended as WebGpu
+/// blends it.
+pub(crate) struct UiPipeline {
+    state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+}
+
+impl UiPipeline {
+    pub(crate) fn new(device: &ProtocolObject<dyn MTLDevice>) -> Result<Self, String> {
+        let state = render_pipeline(
+            device,
+            "chrome",
+            UI_SHADER,
+            ns_string!("ui_vertex"),
+            ns_string!("ui_fragment"),
+            Blend::Straight,
         )?;
         Ok(Self { state })
     }
@@ -1687,6 +1961,9 @@ impl Metal3Submission {
         if window.draws.iter().any(|draw| draw.over) {
             backgrounds(true);
         }
+        if let Some(ui) = &window.ui {
+            draw_ui(&encoder, ui);
+        }
         encoder.endEncoding();
         self.commit(&commands, lease, window.drawable);
         Ok(())
@@ -1845,6 +2122,47 @@ impl Metal4Submission {
         }
     }
 
+    /// Points a window frame's chrome table at its chrome buffer (the
+    /// shader's uniforms at [[buffer(0)]], quads at [[buffer(1)]]) and atlas.
+    fn bind_ui(table: &ProtocolObject<dyn MTL4ArgumentTable>, ui: &UiDraw<'_>) {
+        let buffer = ui.buffers.buffer.gpuAddress();
+        // The chrome shader's two buffers take the first two binding indices.
+        Self::bind_address(table, buffer, SlotBuffer::Uniforms);
+        Self::bind_address(table, buffer + UI_UNIFORMS_BYTES as u64, SlotBuffer::CellBg);
+        #[allow(unsafe_code)]
+        // SAFETY: FFI-ARGTABLE. The live chrome atlas's resource ID; the frame
+        // slots keep it in their residency set, which joined this queue, until
+        // no unfinished frame samples it. Index 0 is below
+        // maxTextureBindCount.
+        unsafe {
+            table.setTexture_atIndex(ui.buffers.atlas.gpuResourceID(), 0);
+        }
+    }
+
+    /// Draws a window frame's chrome quads with its chrome table.
+    fn draw_ui(
+        encoder: &ProtocolObject<dyn MTL4RenderCommandEncoder>,
+        table: &ProtocolObject<dyn MTL4ArgumentTable>,
+        ui: &UiDraw<'_>,
+        stages: MTLRenderStages,
+    ) {
+        encoder.setRenderPipelineState(&ui.pipeline.state);
+        encoder.setArgumentTable_atStages(table, stages);
+        encoder.setScissorRect(scissor(ui.scissor));
+        #[allow(unsafe_code)]
+        // SAFETY: FFI-DRAW. Four strip vertices per instance; ui_vertex reads a
+        // quad only at instance_id < quads, all of which write_ui wrote into a
+        // buffer fitted for them.
+        unsafe {
+            encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
+                MTLPrimitiveType::TriangleStrip,
+                0,
+                4,
+                ui.quads,
+            );
+        }
+    }
+
     fn encode_window(
         &self,
         lease: SlotLease,
@@ -1852,10 +2170,10 @@ impl Metal4Submission {
     ) -> Result<(), FrameError> {
         let slot = lease.slot();
         let mut tables = self.window_tables[slot].borrow_mut();
-        // One table per draw: no draw depends on when the encoder reads a
-        // table's bindings. The lease proves this slot's previous frame, the
-        // last to read them, completed.
-        while tables.len() < window.draws.len() {
+        // One table per draw, the chrome's last: no draw depends on when the
+        // encoder reads a table's bindings. The lease proves this slot's
+        // previous frame, the last to read them, completed.
+        while tables.len() < window.draws.len() + usize::from(window.ui.is_some()) {
             let table = self
                 .device
                 .newArgumentTableWithDescriptor_error(&argument_table_descriptor())
@@ -1887,6 +2205,9 @@ impl Metal4Submission {
                     }
                 }
             }
+        }
+        if let Some(ui) = &window.ui {
+            Self::bind_ui(&tables[window.draws.len()], ui);
         }
         let commands = &self.command_buffers[slot];
         // The lease proves this slot's previous frame completed, so its
@@ -1953,6 +2274,9 @@ impl Metal4Submission {
         }
         if window.draws.iter().any(|draw| draw.over) {
             backgrounds(true);
+        }
+        if let Some(ui) = &window.ui {
+            Self::draw_ui(&encoder, &tables[window.draws.len()], ui, stages);
         }
         encoder.endEncoding();
         drop(tables);

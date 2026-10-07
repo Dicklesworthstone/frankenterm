@@ -207,6 +207,8 @@ pub use cell_text::{CellText, CellTextGrid, TextUniforms, UnderlineStyle};
 pub use frame::{FRAME_SLOTS, GridExtent};
 pub mod window_frame;
 pub use window_frame::{PaneScene, PixelRect, SolidRect, WindowFrame};
+pub mod ui_quads;
+pub use ui_quads::{UiAtlas, UiLayer, UiQuad};
 
 #[cfg(target_os = "macos")]
 mod macos;

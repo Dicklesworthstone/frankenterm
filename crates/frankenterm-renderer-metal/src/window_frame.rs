@@ -94,6 +94,9 @@ pub struct WindowFrame<'a> {
     /// Drawn after every pane's text, in order: later fills cover earlier
     /// ones.
     pub fills: &'a [SolidRect],
+    /// Window chrome quads (the tab bar, overlays), drawn last
+    /// (ft-yccm0.4.7.1).
+    pub ui: Option<crate::UiLayer<'a>>,
 }
 
 impl WindowFrame<'_> {
@@ -157,6 +160,7 @@ mod tests {
             clear: ClearColor::from_srgba(0.0, 0.0, 0.0, 1.0),
             panes,
             fills: &[],
+            ui: None,
         };
         assert_eq!(frame(&panes).check(), Ok(()));
         let duplicate = [pane(1, None), pane(1, None)];

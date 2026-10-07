@@ -9,7 +9,7 @@ use crate::macos_atlas::GlyphAtlases;
 use crate::macos_display_link::{LinkUpdate, MetalDisplayLink};
 use crate::macos_frames::{
     BackgroundPipeline, EncodedWindow, FrameSlots, OffscreenCells, OffscreenText, PaneTextDraw,
-    Submission, TextDraw, TextPipeline, WindowDraw, supports_metal4,
+    Submission, TextDraw, TextPipeline, UiDraw, UiPipeline, WindowDraw, supports_metal4,
 };
 use crate::{
     ClearColor, DeviceCapabilities, FRAME_SLOT_TIMEOUT, FrameError, FrameOutcome, FrameScene,
@@ -209,6 +209,8 @@ pub struct MetalRenderer {
     submission_note: Option<String>,
     background: BackgroundPipeline,
     text: TextPipeline,
+    /// Window chrome quads (ft-yccm0.4.7.1).
+    ui: UiPipeline,
     /// The glyph atlases the text pass samples (ft-yccm0.4.2.3). Dropped
     /// after `Drop::drop` has waited out the frames that sample them.
     atlases: RefCell<GlyphAtlases>,
@@ -319,6 +321,7 @@ struct RendererParts {
     submission_note: Option<String>,
     background: BackgroundPipeline,
     text: TextPipeline,
+    ui: UiPipeline,
     atlases: GlyphAtlases,
 }
 
@@ -338,6 +341,8 @@ impl RendererParts {
         let background = BackgroundPipeline::new(&device.device)
             .map_err(|detail| MetalUnavailable::Pipeline { detail })?;
         let text = TextPipeline::new(&device.device)
+            .map_err(|detail| MetalUnavailable::Pipeline { detail })?;
+        let ui = UiPipeline::new(&device.device)
             .map_err(|detail| MetalUnavailable::Pipeline { detail })?;
         // The color atlas is sRGB, so sampling decodes emoji to linear light
         // as the WebGpu atlas does (ft-yccm0.4.7.3).
@@ -380,6 +385,7 @@ impl RendererParts {
             submission_note,
             background,
             text,
+            ui,
             atlases,
         })
     }
@@ -403,6 +409,7 @@ impl RendererParts {
             submission_note: self.submission_note,
             background: self.background,
             text: self.text,
+            ui: self.ui,
             atlases: RefCell::new(self.atlases),
         }
     }
@@ -787,6 +794,32 @@ impl MetalRenderer {
         Ok(FrameOutcome::Presented)
     }
 
+    /// The chrome draw of a window frame that wrote `quads` chrome quads
+    /// into `slot` (ft-yccm0.4.7.1); `None` without any.
+    fn ui_draw<'a>(
+        &'a self,
+        frames: &'a FrameSlots,
+        slot: usize,
+        quads: usize,
+        [width, height]: [u32; 2],
+    ) -> Result<Option<UiDraw<'a>>, FrameError> {
+        if quads == 0 {
+            return Ok(None);
+        }
+        let buffers = frames
+            .ui_buffers(slot)
+            .ok_or(FrameError::AllocationFailed {
+                what: "window chrome buffers",
+                bytes: 0,
+            })?;
+        Ok(Some(UiDraw {
+            pipeline: &self.ui,
+            buffers,
+            quads,
+            scissor: crate::PixelRect::new(0, 0, width, height),
+        }))
+    }
+
     /// Uploads `frame`'s panes into the next frame slot, writes one uniform
     /// block per draw, and encodes and commits the frame into `target`.
     fn encode_window_frame(
@@ -821,6 +854,14 @@ impl MetalRenderer {
         let placed = window_blocks(frame, lease.frame(), width, height);
         let blocks: Vec<[u8; UNIFORMS_BYTES]> = placed.iter().map(|draw| draw.bytes).collect();
         self.frames.borrow_mut().write_window(&lease, &blocks)?;
+        // ft-yccm0.4.7.1: the window chrome, drawn over everything else.
+        let ui_quads = match &frame.ui {
+            Some(ui) => self
+                .frames
+                .borrow_mut()
+                .write_ui(&lease, ui, [width, height])?,
+            None => 0,
+        };
         let frames = self.frames.borrow();
         let slot = lease.slot();
         let missing = || FrameError::AllocationFailed {
@@ -864,6 +905,7 @@ impl MetalRenderer {
             };
             draws.push(draw);
         }
+        let ui = self.ui_draw(&frames, slot, ui_quads, [width, height])?;
         let atlases = self.atlases.borrow();
         self.submission.encode_window(
             &frames,
@@ -880,6 +922,7 @@ impl MetalRenderer {
                     instances: 0,
                 },
                 draws: &draws,
+                ui,
             },
         )
     }

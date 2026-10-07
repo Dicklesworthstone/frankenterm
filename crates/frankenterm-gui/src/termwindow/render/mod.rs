@@ -509,12 +509,13 @@ impl crate::TermWindow {
     }
 
     /// Where window chrome is laid out and drawn: the WebGpu front end's
-    /// render state (ft-yccm0.4.7.1).
+    /// render state, or a Metal window's own chrome target (ft-yccm0.4.7.1).
     pub(crate) fn chrome(&self) -> anyhow::Result<&dyn ChromeTarget> {
-        self.render_state
-            .as_ref()
-            .map(|state| state as &dyn ChromeTarget)
-            .context("render state is not initialized")
+        match (&self.render_state, &self.metal_chrome) {
+            (Some(state), _) => Ok(state),
+            (None, Some(chrome)) => Ok(chrome),
+            (None, None) => Err(anyhow!("render state is not initialized")),
+        }
     }
 
     pub fn filled_rectangle<'a>(

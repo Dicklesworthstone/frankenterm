@@ -10,7 +10,7 @@
 use crate::{
     AtlasKind, AtlasSlot, BackgroundUniforms, CellBg, CellBgGrid, CellText, CellTextGrid,
     ClearColor, FrameScene, GridExtent, MetalRenderer, PaneScene, PixelRect, SolidRect,
-    TextUniforms, WindowFrame, apply_hsb,
+    TextUniforms, UiQuad, WindowFrame, apply_hsb,
 };
 
 const CELL: [u32; 2] = [8, 16];
@@ -222,6 +222,7 @@ fn check_split(columns: u32, rows: u32) {
         clear: clear(),
         panes: &panes,
         fills: &fills,
+        ui: None,
     };
     let drawn = renderer
         .snapshot_window(width, height, &frame)
@@ -280,6 +281,7 @@ fn a_change_in_one_pane_uploads_only_that_panes_changed_row() {
             clear: clear(),
             panes: &panes,
             fills: &fills,
+            ui: None,
         };
         renderer
             .snapshot_window(width, height, &frame)
@@ -329,6 +331,7 @@ fn a_dimmed_pane_is_its_undimmed_pixels_through_apply_hsb() {
                     clear: clear(),
                     panes: &panes,
                     fills: &[],
+                    ui: None,
                 },
             )
             .expect("a window frame")
@@ -371,6 +374,7 @@ fn fills_are_drawn_over_the_panes_text_and_blend_over_it() {
                     clear: clear(),
                     panes: &panes,
                     fills,
+                    ui: None,
                 },
             )
             .expect("a window frame")
@@ -403,6 +407,7 @@ fn fills_are_drawn_over_the_panes_text_and_blend_over_it() {
                 clear: clear(),
                 panes: &untexted,
                 fills: &[],
+                ui: None,
             },
         )
         .expect("a window frame");
@@ -447,4 +452,193 @@ fn fills_are_drawn_over_the_panes_text_and_blend_over_it() {
             );
         }
     }
+}
+
+/// A chrome layer of `quads` over a 4x4 atlas.
+fn chrome_layer<'a>(
+    quads: &'a [UiQuad],
+    version: u64,
+    rgba: &'a [u8],
+) -> crate::ui_quads::UiLayer<'a> {
+    crate::ui_quads::UiLayer {
+        atlas: crate::ui_quads::UiAtlas {
+            width: 4,
+            height: 4,
+            version,
+            rgba,
+        },
+        quads,
+        foreground_text_hsb: [1.0; 3],
+    }
+}
+
+/// ft-yccm0.4.7.1: window chrome quads are drawn as WebGpu's quad shader
+/// shades them (`shade_ui_quad`, its CPU reference), blended with straight
+/// alpha over the frame in quad order, within 2 codes. The atlas is
+/// uploaded only when its version changes.
+#[test]
+// Atlas texel indices and pixel coordinates are small and non-negative.
+// One scenario: each quad kind, quad order, a planted negative and the
+// atlas version rule share the frame they are checked on.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::too_many_lines
+)]
+fn chrome_quads_draw_as_the_webgpu_quad_shader_shades_them() {
+    use crate::color::{byte_to_linear, from_srgb_bgra8, to_srgb_bgra8};
+    use crate::ui_quads::{UiLayer, blend_ui, kind, shade_ui_quad};
+
+    let renderer = renderer();
+    let glyph = glyph(&renderer);
+    let extent = GridExtent::new(4, 10);
+    let rect = rect_for(0, 0, extent);
+    let content = content(extent, 1, &glyph);
+    let panes = [pane(1, rect, &content, None)];
+    // A 4x4 atlas of uniform 2x2 blocks, so nearest and linear sampling
+    // inside a block's middle both read its color exactly: a color texel, a
+    // half coverage, an opaque gray and transparency.
+    let atlas = |color: [u8; 4]| -> Vec<u8> {
+        (0..4u32)
+            .flat_map(|y| (0..4u32).map(move |x| (x / 2, y / 2)))
+            .flat_map(|block| match block {
+                (0, 0) => color,
+                (1, 0) => [255, 255, 255, 128],
+                (0, 1) => [90, 90, 90, 255],
+                _ => [0, 0, 0, 0],
+            })
+            .collect()
+    };
+    let block_uv = |x: f32, y: f32| {
+        [
+            (x * 2.0 + 0.5) / 4.0,
+            (y * 2.0 + 0.5) / 4.0,
+            (x * 2.0 + 1.5) / 4.0,
+            (y * 2.0 + 1.5) / 4.0,
+        ]
+    };
+    let quad = |rect: [f32; 4], uv, kind| UiQuad {
+        rect,
+        uv,
+        fg: [0.7, 0.3, 0.1, 0.8],
+        alt: [0.7, 0.3, 0.1, 0.8],
+        mix: 0.0,
+        hsv: [1.0; 3],
+        kind,
+    };
+    let quads = [
+        quad(
+            [0.0, 0.0, 16.0, 16.0],
+            block_uv(0.0, 0.0),
+            kind::SOLID_COLOR,
+        ),
+        quad([16.0, 0.0, 32.0, 16.0], block_uv(1.0, 0.0), kind::GLYPH),
+        quad(
+            [32.0, 0.0, 48.0, 16.0],
+            block_uv(0.0, 0.0),
+            kind::COLOR_EMOJI,
+        ),
+        quad(
+            [48.0, 0.0, 64.0, 16.0],
+            block_uv(1.0, 0.0),
+            kind::GRAY_SCALE,
+        ),
+        quad([0.0, 16.0, 16.0, 32.0], block_uv(0.0, 1.0), kind::BG_IMAGE),
+        // Over the first: the later quad covers the earlier one.
+        UiQuad {
+            fg: [0.1, 0.2, 0.9, 0.5],
+            ..quad(
+                [8.0, 8.0, 24.0, 24.0],
+                block_uv(1.0, 1.0),
+                kind::SOLID_COLOR,
+            )
+        },
+    ];
+    let render = |ui: Option<UiLayer<'_>>| {
+        renderer
+            .snapshot_window(
+                rect.width,
+                rect.height,
+                &WindowFrame {
+                    clear: clear(),
+                    panes: &panes,
+                    fills: &[],
+                    ui,
+                },
+            )
+            .expect("a window frame")
+    };
+    let layer = chrome_layer;
+    let plain = render(None);
+    let first = atlas([200, 120, 40, 255]);
+    let drawn = render(Some(layer(&quads, 1, &first)));
+
+    // The reference, quad by quad over each pixel's center.
+    let expected = |quads: &[UiQuad], rgba: &[u8]| -> Vec<u8> {
+        let texel = |uv: [f32; 4]| {
+            let x = ((uv[0] * 4.0) as usize).min(3);
+            let y = ((uv[1] * 4.0) as usize).min(3);
+            let at = (y * 4 + x) * 4;
+            [
+                byte_to_linear(rgba[at]),
+                byte_to_linear(rgba[at + 1]),
+                byte_to_linear(rgba[at + 2]),
+                f32::from(rgba[at + 3]) / 255.0,
+            ]
+        };
+        let mut out = plain.clone();
+        for (index, pixel) in out.chunks_mut(4).enumerate() {
+            let index = u32::try_from(index).unwrap();
+            let center = [
+                (index % rect.width) as f32 + 0.5,
+                (index / rect.width) as f32 + 0.5,
+            ];
+            let mut color = from_srgb_bgra8([pixel[0], pixel[1], pixel[2], pixel[3]]);
+            for quad in quads {
+                let [left, top, right, bottom] = quad.rect;
+                if (left..right).contains(&center[0]) && (top..bottom).contains(&center[1]) {
+                    let sample = texel(quad.uv);
+                    color = blend_ui(shade_ui_quad(quad, sample, sample, [1.0; 3]), color);
+                }
+            }
+            pixel.copy_from_slice(&to_srgb_bgra8(color));
+        }
+        out
+    };
+    let within = |got: &[u8], want: &[u8]| {
+        got.iter()
+            .zip(want)
+            .all(|(got, want)| (i16::from(*got) - i16::from(*want)).abs() <= 2)
+    };
+    let reference = expected(&quads, &first);
+    if let Some((index, (got, want))) = drawn
+        .chunks(4)
+        .zip(reference.chunks(4))
+        .enumerate()
+        .find(|(_, (got, want))| !within(got, want))
+    {
+        panic!("pixel {index}: drew {got:?}, the WebGpu quad shader {want:?}");
+    }
+    assert_ne!(drawn, plain, "the chrome drew nothing");
+    // Planted negative: shading the glyph quad as a grayscale poly (alpha
+    // scaled by coverage instead of replaced) is told apart.
+    let mut wrong = quads;
+    wrong[1].kind = kind::GRAY_SCALE;
+    assert!(
+        !within(&drawn, &expected(&wrong, &first)),
+        "a glyph shaded as a gray poly went unnoticed"
+    );
+
+    // Same version, other bytes: not uploaded again.
+    let second = atlas([20, 200, 220, 255]);
+    assert_eq!(
+        render(Some(layer(&quads, 1, &second))),
+        drawn,
+        "an unchanged version re-uploaded the atlas"
+    );
+    // A new version is uploaded and drawn.
+    let redrawn = render(Some(layer(&quads, 2, &second)));
+    assert!(within(&redrawn, &expected(&quads, &second)));
+    assert_ne!(redrawn, drawn);
 }

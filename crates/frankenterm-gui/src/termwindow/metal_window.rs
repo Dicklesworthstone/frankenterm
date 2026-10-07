@@ -30,7 +30,7 @@ use ::window::color::LinearRgba;
 use config::VisualBellTarget;
 use frankenterm_font::FontConfiguration;
 use frankenterm_renderer_metal::{
-    ClearColor, MetalRenderer, PaneScene, PixelRect, SolidRect, WindowFrame,
+    ClearColor, MetalRenderer, PaneScene, PixelRect, SolidRect, UiLayer, WindowFrame,
 };
 use mux::pane::PaneId;
 use std::collections::HashMap;
@@ -392,6 +392,7 @@ impl MetalPanes {
         &mut self,
         panes: &[MetalPaneRequest],
         fills: &[SolidRect],
+        ui: Option<UiLayer<'_>>,
         clear: ClearColor,
         fonts: &Rc<FontConfiguration>,
         metrics: &RenderMetrics,
@@ -431,6 +432,7 @@ impl MetalPanes {
                 clear,
                 panes: &scenes,
                 fills,
+                ui,
             }))
         };
         drop(scenes);

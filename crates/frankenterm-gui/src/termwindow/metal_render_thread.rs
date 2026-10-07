@@ -23,6 +23,7 @@
 //! interval instead.
 
 use super::TermWindow;
+use super::metal_chrome::ChromeFrame;
 use super::metal_window::{MetalPaneRequest, MetalPanes};
 use crate::utilsprites::RenderMetrics;
 use config::ConfigHandle;
@@ -85,6 +86,9 @@ pub(crate) struct MetalFrameRequest {
     pub(crate) panes: Vec<MetalPaneRequest>,
     /// Split borders.
     pub(crate) splits: Vec<SolidRect>,
+    /// The fancy tab bar and modal overlays, laid out and painted on the
+    /// main thread (ft-yccm0.4.7.1).
+    pub(crate) chrome: Option<ChromeFrame>,
     pub(crate) config: ConfigHandle,
     /// What shows where no pane draws.
     pub(crate) clear: ClearColor,
@@ -328,6 +332,7 @@ impl FrameDriver for MetalDriver {
         let outcome = self.panes.draw(
             &request.panes,
             &request.splits,
+            request.chrome.as_ref().map(ChromeFrame::layer),
             request.clear,
             &fonts,
             &metrics,
@@ -582,9 +587,12 @@ impl TermWindow {
     /// What the render thread's next frame needs from this window.
     pub(super) fn metal_frame_request(&mut self) -> MetalFrameRequest {
         let (panes, splits) = self.metal_window_panes();
+        // After the panes: its hit-test items follow theirs, as in paint_pass.
+        let chrome = self.metal_chrome_frame();
         MetalFrameRequest {
             panes,
             splits,
+            chrome,
             config: self.config.clone(),
             clear: self.metal_clear_color(),
             grid: GridExtent::new(self.terminal_size.rows, self.terminal_size.cols),
@@ -734,6 +742,7 @@ mod tests {
         MetalFrameRequest {
             panes,
             splits: Vec::new(),
+            chrome: None,
             config: config::configuration(),
             clear: ClearColor::from_srgba(0.0, 0.0, 0.0, 1.0),
             grid: GridExtent::new(24, 80),

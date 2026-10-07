@@ -123,6 +123,7 @@ pub mod keyevent;
 mod metal_cells;
 mod metal_glyphs;
 mod metal_render_thread;
+mod metal_chrome;
 mod metal_window;
 pub mod modal;
 mod mouseevent;
@@ -2467,6 +2468,9 @@ pub struct TermWindow {
     /// The Metal front end's frame state for each visible pane: its render
     /// mirror, scene and glyphs (ft-yccm0.4.4, ft-yccm0.4.6).
     metal_panes: metal_window::MetalPanes,
+    /// A Metal window's chrome target: the glyph cache and quad layers its
+    /// tab bar and overlays are laid out and painted with (ft-yccm0.4.7.1).
+    metal_chrome: Option<metal_chrome::MetalChrome>,
     /// The Metal render thread that owns the renderer and draws every frame
     /// off the main thread (ft-yccm0.4.1.2). While it runs, `metal` is
     /// `None` and `metal_panes` is empty.
@@ -4669,6 +4673,7 @@ impl TermWindow {
             webgpu: None,
             metal: None,
             metal_panes: metal_window::MetalPanes::default(),
+            metal_chrome: None,
             metal_render: None,
             metal_output_wake: Arc::default(),
             render_snapshot: render_snapshot::RenderSnapshotRequest::from_env(),
@@ -5256,6 +5261,7 @@ impl TermWindow {
         let outcome = panes.draw(
             &request.panes,
             &request.splits,
+            request.chrome.as_ref().map(metal_chrome::ChromeFrame::layer),
             request.clear,
             &self.fonts,
             &self.render_metrics,

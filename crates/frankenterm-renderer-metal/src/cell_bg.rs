@@ -438,7 +438,7 @@ fn step(edge: f32, x: f32) -> f32 {
 }
 
 /// The shaders' `rgb2hsv`.
-fn rgb_to_hsv(rgb: [f32; 3]) -> [f32; 3] {
+pub(crate) fn rgb_to_hsv(rgb: [f32; 3]) -> [f32; 3] {
     let konst = [0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0];
     let low = mix4(
         [rgb[2], rgb[1], konst[3], konst[2]],
@@ -460,7 +460,7 @@ fn rgb_to_hsv(rgb: [f32; 3]) -> [f32; 3] {
 }
 
 /// The shaders' `hsv2rgb`; `fract` is `x - floor(x)`, as in Metal.
-fn hsv_to_rgb(hsv: [f32; 3]) -> [f32; 3] {
+pub(crate) fn hsv_to_rgb(hsv: [f32; 3]) -> [f32; 3] {
     let konst = [1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0];
     let channel = |offset: f32| {
         let hue = hsv[0] + offset;
