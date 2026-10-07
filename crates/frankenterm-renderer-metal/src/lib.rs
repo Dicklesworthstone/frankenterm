@@ -336,6 +336,12 @@ pub struct FrameStats {
     pub buffer_allocations: u64,
     /// Allocations in the frame slots' residency set, if the OS has them.
     pub resident_allocations: Option<usize>,
+    /// Bytes of cell backgrounds, glyph instances and row-table entries the
+    /// last frame copied into its slot: only rows changed since that slot
+    /// last held the grids (ft-yccm0.4.2.4); zero for an unchanged frame.
+    pub upload_bytes_last: u64,
+    /// The same, summed over every frame since attach.
+    pub upload_bytes_total: u64,
 }
 
 /// A Metal GPU family the capability probe asks about.

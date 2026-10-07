@@ -12,10 +12,11 @@ use crate::atlas::AtlasKind;
 use crate::cell_bg::{BACKGROUND_SHADER, BackgroundUniforms, CellBgGrid};
 use crate::cell_text::{CellTextGrid, TEXT_SHADER, TextUniforms, atlas_texture_index};
 use crate::frame::{
-    FRAME_SLOTS, FrameUniforms, GridExtent, ROW_TABLE_BYTES_PER_ROW, SlotBuffer, SlotLease,
-    SlotRing, SlotSizes, grown_capacity,
+    CELL_TEXT_INSTANCE_BYTES, FRAME_SLOTS, FrameUniforms, GridExtent, ROW_TABLE_BYTES_PER_ROW,
+    SlotBuffer, SlotLease, SlotRing, SlotSizes, grown_capacity,
 };
 use crate::macos_atlas::GlyphAtlases;
+use crate::uploads::{SlotUploads, UploadPlan, row_table_entry, text_region};
 use crate::{ClearColor, FRAME_SLOT_TIMEOUT, FrameError, MAX_TEXTURE_EXTENT, SubmissionPath};
 use block2::RcBlock;
 use frankenterm_alloc::resource_ledger::{GpuBufferPurpose, GpuResourceGuard, GpuResourceLedger};
@@ -79,6 +80,9 @@ struct Slot {
     /// Bumped whenever one of the slot's buffers is reallocated, so bindings
     /// made from the old addresses are refreshed.
     generation: u64,
+    /// What the slot's buffers hold, so a frame uploads only the rows that
+    /// changed since (ft-yccm0.4.2.4).
+    uploads: SlotUploads,
 }
 
 /// The renderer's frame slots; see the module docs.
@@ -89,6 +93,9 @@ pub(crate) struct FrameSlots {
     residency: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
     ledger: &'static GpuResourceLedger,
     allocations: u64,
+    /// Bytes the last frame uploaded into its slot, and since creation.
+    upload_bytes_last: u64,
+    upload_bytes_total: u64,
 }
 
 impl FrameSlots {
@@ -108,6 +115,8 @@ impl FrameSlots {
             residency,
             ledger,
             allocations: 0,
+            upload_bytes_last: 0,
+            upload_bytes_total: 0,
         };
         for index in 0..FRAME_SLOTS {
             let mut buffers = Vec::with_capacity(SlotBuffer::ALL.len());
@@ -117,6 +126,7 @@ impl FrameSlots {
             this.slots.push(Slot {
                 buffers,
                 generation: 0,
+                uploads: SlotUploads::default(),
             });
         }
         if let Some(set) = &this.residency {
@@ -262,31 +272,91 @@ impl FrameSlots {
         Ok(())
     }
 
-    /// Copies `text` into the leased slot: its ring rows back to back into
-    /// the CellText buffer, then its per-row table into the RowTable buffer.
-    /// The slot must have been fitted for `text.len()` instances
-    /// ([`Self::begin_frame`]) and `text`'s rows.
-    pub(crate) fn write_text(
+    /// Uploads into the leased slot what `cells` and `text` changed since
+    /// the slot last held them (ft-yccm0.4.2.4): only their dirty ring rows,
+    /// or everything when the slot is laid out afresh. Fits the slot's
+    /// buffers for the glyph regions first. Returns how many instances the
+    /// text draw covers (`rows * capacity`; zero without text).
+    pub(crate) fn upload(
+        &mut self,
+        lease: &SlotLease,
+        grid: GridExtent,
+        cells: Option<&CellBgGrid>,
+        text: Option<&CellTextGrid>,
+    ) -> Result<usize, FrameError> {
+        assert!(
+            lease.is_from(&self.ring),
+            "a slot lease from another renderer's ring"
+        );
+        let slot = lease.slot();
+        let generation = self.slots[slot].generation;
+        let mut plan = self.slots[slot].uploads.plan(cells, text, generation);
+        let sizes =
+            SlotSizes::for_frame(grid, plan.instances(grid)).ok_or(FrameError::GridTooLarge {
+                rows: grid.rows,
+                cols: grid.cols,
+            })?;
+        self.fit_slot(slot, &sizes)?;
+        let fitted = self.slots[slot].generation;
+        if fitted != generation {
+            // The buffers were replaced: they hold nothing yet.
+            self.slots[slot].uploads.invalidate();
+            plan = self.slots[slot].uploads.plan(cells, text, fitted);
+        }
+        if let Err(err) = self.write_plan(lease, &plan, cells, text) {
+            self.slots[slot].uploads.invalidate();
+            return Err(err);
+        }
+        let bytes = plan.bytes(grid);
+        self.upload_bytes_last = bytes;
+        self.upload_bytes_total = self.upload_bytes_total.saturating_add(bytes);
+        Ok(text.map_or(0, |_| plan.instances(grid)))
+    }
+
+    /// Copies `plan`'s rows into the leased slot: cell background rows at
+    /// their ring offsets, glyph regions zero-padded to the plan's capacity,
+    /// and their row-table entries.
+    fn write_plan(
         &self,
         lease: &SlotLease,
-        text: &CellTextGrid,
+        plan: &UploadPlan,
+        cells: Option<&CellBgGrid>,
+        text: Option<&CellTextGrid>,
     ) -> Result<(), FrameError> {
-        let mut offset = 0;
-        for row in text.ring_row_bytes() {
-            if !row.is_empty() {
-                self.write(lease, SlotBuffer::CellText, offset, row)?;
-                offset += row.len();
+        if let Some(cells) = cells {
+            let row = cells.extent().cols as usize * 4;
+            for &ring in &plan.cell_rows {
+                let ring = ring as usize;
+                self.write(
+                    lease,
+                    SlotBuffer::CellBg,
+                    ring * row,
+                    cells.ring_row_bytes(ring),
+                )?;
             }
         }
-        for (index, entry) in text.row_table().enumerate() {
-            self.write(
-                lease,
-                SlotBuffer::RowTable,
-                index * ROW_TABLE_BYTES_PER_ROW,
-                &entry,
-            )?;
+        if let Some(text) = text {
+            let region = plan.capacity as usize * CELL_TEXT_INSTANCE_BYTES;
+            let mut bytes = Vec::with_capacity(region);
+            for &ring in &plan.text_rows {
+                let ring = ring as usize;
+                bytes.clear();
+                text_region(text, ring, plan.capacity, &mut bytes);
+                self.write(lease, SlotBuffer::CellText, ring * region, &bytes)?;
+                self.write(
+                    lease,
+                    SlotBuffer::RowTable,
+                    ring * ROW_TABLE_BYTES_PER_ROW,
+                    &row_table_entry(text, ring, plan.capacity),
+                )?;
+            }
         }
         Ok(())
+    }
+
+    /// Bytes the last frame uploaded, and all frames since creation.
+    pub(crate) fn upload_bytes(&self) -> (u64, u64) {
+        (self.upload_bytes_last, self.upload_bytes_total)
     }
 
     pub(crate) fn buffer(&self, slot: usize, kind: SlotBuffer) -> &ProtocolObject<dyn MTLBuffer> {
@@ -370,8 +440,13 @@ impl FrameSlots {
     ) -> Result<Vec<u8>, FrameError> {
         let cells = request.cells;
         let failed_before = submission.failed_frames();
-        let text_instances = request.text.as_ref().map_or(0, |text| text.grid.len());
-        let lease = self.begin_frame(cells.extent(), text_instances, FRAME_SLOT_TIMEOUT)?;
+        let lease = self.begin_frame(cells.extent(), 0, FRAME_SLOT_TIMEOUT)?;
+        let instances = self.upload(
+            &lease,
+            cells.extent(),
+            Some(cells),
+            request.text.as_ref().map(|text| text.grid),
+        )?;
         let uniforms = FrameUniforms {
             frame: lease.frame(),
             viewport: [request.width, request.height],
@@ -387,14 +462,10 @@ impl FrameSlots {
                 .map_or_else(TextUniforms::default, |text| text.uniforms),
         };
         self.write(&lease, SlotBuffer::Uniforms, 0, &uniforms.to_bytes())?;
-        self.write(&lease, SlotBuffer::CellBg, 0, cells.as_bytes())?;
-        if let Some(text) = &request.text {
-            self.write_text(&lease, text.grid)?;
-        }
         let text = request.text.as_ref().map(|text| TextDraw {
             pipeline: text.pipeline,
             atlases: text.atlases,
-            instances: text.grid.len(),
+            instances,
         });
         submission.encode_frame(
             self,
@@ -767,8 +838,9 @@ struct EncodedFrame<'a> {
 }
 
 /// The text pass of one frame (ft-yccm0.4.2.3): the pipeline, the atlases
-/// its glyphs sample, and how many CellText instances the slot holds (all
-/// of them written by [`FrameSlots::write_text`]).
+/// its glyphs sample, and how many CellText instances the draw covers:
+/// every ring row's region, `rows * capacity`, whose unused instances are
+/// empty quads (ft-yccm0.4.2.4, [`FrameSlots::upload`]).
 #[derive(Clone, Copy)]
 pub(crate) struct TextDraw<'a> {
     pub(crate) pipeline: &'a TextPipeline,
@@ -2024,7 +2096,6 @@ mod tests {
     /// Pixels may differ by more than one step only inside `loose` (the
     /// curly underline's cell, where `sin` rounding can move a boundary
     /// pixel), at most four of them. Returns the pixels compared.
-    #[allow(clippy::cast_precision_loss)]
     fn render_text_and_compare(
         fixture: &mut TextFixture,
         text: &CellTextGrid,
@@ -2032,6 +2103,21 @@ mod tests {
         loose: Option<(u32, u32)>,
     ) -> usize {
         let (cells, background) = background_scene();
+        render_grids_and_compare(fixture, &cells, background, text, uniforms, loose)
+    }
+
+    /// [`render_text_and_compare`] for any cell grid: renders `cells` and
+    /// `text` through the production offscreen path and compares every
+    /// pixel with the CPU reference; returns the pixels compared.
+    #[allow(clippy::cast_precision_loss)]
+    fn render_grids_and_compare(
+        fixture: &mut TextFixture,
+        cells: &CellBgGrid,
+        background: BackgroundUniforms,
+        text: &CellTextGrid,
+        uniforms: TextUniforms,
+        loose: Option<(u32, u32)>,
+    ) -> usize {
         let clear = ClearColor::from_srgba(0.1, 0.2, 0.3, 1.0);
         let request = TextRequest {
             width: u32::try_from(BG_WIDTH).unwrap(),
@@ -2041,7 +2127,7 @@ mod tests {
             text,
             uniforms,
         };
-        let pixels = fixture.render(&cells, request);
+        let pixels = fixture.render(cells, request);
         assert_eq!(pixels.len(), BG_WIDTH * BG_HEIGHT * 4);
         let frame = FrameUniforms {
             viewport: [request.width, request.height],
@@ -2059,7 +2145,7 @@ mod tests {
             for x in 0..BG_WIDTH {
                 let center = |v: usize| f32::from(u16::try_from(v).unwrap()) + 0.5;
                 let (cx, cy) = (center(x), center(y));
-                let under = crate::cell_bg::shade_background(&frame, &cells, cx, cy)
+                let under = crate::cell_bg::shade_background(&frame, cells, cx, cy)
                     .map_or(clear.to_bgra8(), to_bgra8);
                 let expected = to_bgra8(shade_text(
                     &frame,
@@ -2131,8 +2217,9 @@ mod tests {
         check_text_pass(true);
     }
 
-    /// The frame uploads exactly the grid's instances and row table, and
-    /// steady-state text frames allocate no buffer and touch no atlas.
+    /// Every slot ends up holding the grids' region layout (ft-yccm0.4.2.4)
+    /// of instances and row table, and steady-state text frames allocate no
+    /// buffer, touch no atlas and upload nothing.
     #[test]
     fn text_frames_upload_the_instances_and_row_table_and_allocate_nothing() {
         let mut fixture = TextFixture::new(false).unwrap();
@@ -2164,18 +2251,94 @@ mod tests {
         );
         assert_eq!(fixture.atlases.retired(), 0);
         let last = usize::try_from((fixture.frames.ring().next_frame() - 1) % slots_u64()).unwrap();
-        let instances: Vec<u8> = text.ring_row_bytes().flatten().copied().collect();
+        let capacity = crate::uploads::needed_capacity(&text);
+        let (bg, instances, table) = crate::uploads::full_layout(&cells, &text, capacity);
+        assert_eq!(fixture.frames.read(last, SlotBuffer::CellBg, bg.len()), bg);
         assert_eq!(
             fixture
                 .frames
                 .read(last, SlotBuffer::CellText, instances.len()),
             instances
         );
-        let table: Vec<u8> = text.row_table().flatten().collect();
         assert_eq!(
             fixture.frames.read(last, SlotBuffer::RowTable, table.len()),
             table
         );
+        assert_eq!(
+            fixture.frames.upload_bytes().0,
+            0,
+            "steady frames upload nothing"
+        );
+    }
+
+    /// Dirty-row uploads (ft-yccm0.4.2.4) on the GPU: frame after frame of
+    /// cell writes, glyph pushes, wide color glyphs and scrolls, each frame
+    /// uploading only what its slot had not seen, read back exactly as the
+    /// CPU reference draws the current grids. Once the slots converge a
+    /// one-row change costs one row in each of the next three frames, then
+    /// nothing.
+    #[test]
+    fn dirty_row_frames_match_the_reference_and_upload_only_changed_rows() {
+        use crate::cell_bg::CellBg;
+        let mut fixture = TextFixture::new(false).unwrap();
+        let (mut cells, background) = background_scene();
+        let mut text = text_scene(&fixture, &cells);
+        let uniforms = TextUniforms {
+            underline_position: 13.0,
+            line_thickness: 1.0,
+            strikethrough_position: 8.0,
+        };
+        let (gray, color) = (fixture.glyph(0), fixture.glyph(2));
+        let cols = cells.extent().cols;
+        for frame in 0..18_u32 {
+            let row = frame % 6;
+            match frame % 3 {
+                0 => {
+                    text.clear_row(row);
+                    let col = u16::try_from(frame % cols).unwrap();
+                    text.push(
+                        row,
+                        CellText::new(col, [255, 128, 0, 255]).with_glyph(&gray, [1, 2]),
+                    );
+                }
+                1 => {
+                    let blue = u8::try_from(frame * 7 % 256).unwrap();
+                    cells.set(row, frame % cols, CellBg::rgb(10, 200, blue));
+                    text.push(
+                        row,
+                        CellText::new(3, [0, 0, 0, 255])
+                            .with_glyph(&color, [0, 0])
+                            .wide(),
+                    );
+                }
+                _ => {
+                    cells.scroll_up(1);
+                    text.scroll_up(1);
+                }
+            }
+            let compared =
+                render_grids_and_compare(&mut fixture, &cells, background, &text, uniforms, None);
+            assert_eq!(compared, BG_WIDTH * BG_HEIGHT, "frame {frame}");
+        }
+        for _ in 0..3 {
+            render_grids_and_compare(&mut fixture, &cells, background, &text, uniforms, None);
+        }
+        assert_eq!(
+            fixture.frames.upload_bytes().0,
+            0,
+            "converged slots upload nothing"
+        );
+        cells.set(1, 1, CellBg::rgb(1, 2, 3));
+        for slot in 0..3 {
+            render_grids_and_compare(&mut fixture, &cells, background, &text, uniforms, None);
+            assert_eq!(
+                fixture.frames.upload_bytes().0,
+                u64::from(cols) * 4,
+                "slot {slot} uploads the one changed background row"
+            );
+        }
+        render_grids_and_compare(&mut fixture, &cells, background, &text, uniforms, None);
+        assert_eq!(fixture.frames.upload_bytes().0, 0);
     }
 
     /// A frame with more instances than its slot reserves (stacked

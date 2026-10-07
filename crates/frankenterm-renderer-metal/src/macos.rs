@@ -428,6 +428,7 @@ impl MetalRenderer {
     pub fn frame_stats(&self) -> FrameStats {
         let frames = self.frames.borrow();
         let ring = frames.ring();
+        let (upload_bytes_last, upload_bytes_total) = frames.upload_bytes();
         FrameStats {
             path: self.submission.path(),
             frames_completed: ring.frames_completed(),
@@ -436,6 +437,8 @@ impl MetalRenderer {
             peak_in_flight: ring.peak_in_flight(),
             buffer_allocations: frames.allocations(),
             resident_allocations: frames.residency().map(MTLResidencySet::allocationCount),
+            upload_bytes_last,
+            upload_bytes_total,
         }
     }
 
@@ -714,11 +717,18 @@ impl MetalRenderer {
         }
         let retired_before = self.frames.borrow().ring().retired_before();
         self.atlases.borrow_mut().collect_retired(retired_before);
-        let text_instances = text.map_or(0, |(text, _)| text.len());
-        let lease =
-            self.frames
-                .borrow_mut()
-                .begin_frame(grid, text_instances, FRAME_SLOT_TIMEOUT)?;
+        let lease = self
+            .frames
+            .borrow_mut()
+            .begin_frame(grid, 0, FRAME_SLOT_TIMEOUT)?;
+        // ft-yccm0.4.2.4: only the rows that changed since this slot last
+        // held the grids are copied into it.
+        let text_instances = self.frames.borrow_mut().upload(
+            &lease,
+            grid,
+            cells.map(|(cells, _)| cells),
+            text.map(|(text, _)| text),
+        )?;
         let frames = self.frames.borrow();
         let mut uniforms = FrameUniforms {
             frame: lease.frame(),
@@ -732,11 +742,9 @@ impl MetalRenderer {
                 row_offset: cells.row_offset(),
                 ..background
             };
-            frames.write(&lease, SlotBuffer::CellBg, 0, cells.as_bytes())?;
         }
-        if let Some((text, text_uniforms)) = text {
+        if let Some((_, text_uniforms)) = text {
             uniforms.text = text_uniforms;
-            frames.write_text(&lease, text)?;
         }
         frames.write(&lease, SlotBuffer::Uniforms, 0, &uniforms.to_bytes())?;
         // A frame abandoned here drops its lease, which frees the slot.
@@ -755,10 +763,10 @@ impl MetalRenderer {
             Some(ProtocolObject::from_ref(&*drawable)),
             color,
             cells.map(|_| &self.background),
-            text.map(|(text, _)| TextDraw {
+            text.map(|_| TextDraw {
                 pipeline: &self.text,
                 atlases: &atlases,
-                instances: text.len(),
+                instances: text_instances,
             }),
         )?;
         Ok(FrameOutcome::Presented)
