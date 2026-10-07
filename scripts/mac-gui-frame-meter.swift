@@ -9,13 +9,18 @@
 //   frame-meter capture --pid PID --out FILE --stop-file PATH
 //                       [--ready-file PATH] [--max-seconds N]
 //                       [--title-contains TOKEN] [--title-wait-seconds N]
+//                       [--pid-exclusive 1]
 //                       [--window-wait-seconds N] [--max-width PX] [--fps-cap N]
 //       Captures a window of PID with ScreenCaptureKit until PATH exists,
 //       writing one JSON line per delivered frame: display time, arrival
 //       time, SCFrameStatus, dirty-rect area fraction and a pixel hash. The
-//       window is the largest on-screen one whose title contains TOKEN; only
-//       after --title-wait-seconds without one does it fall back to the
-//       largest window of PID (recorded as title_verified false). A process
+//       window is the largest on-screen one whose title contains TOKEN
+//       (match "title"). With --pid-exclusive 1 (PID was started for this run
+//       alone), an untitled window that is PID's only normal-level window
+//       matches too (match "pid"): ScreenCaptureKit reports every Ghostty
+//       window untitled (ft-5azl8). Only after --title-wait-seconds without
+//       either does it fall back to the largest window of PID (match
+//       "largest", title_verified false), which the harness refuses. A process
 //       can briefly own other windows (Ghostty replaced its first one under
 //       load, ft-zkjhg). When frames report the stream suspended or stopped,
 //       the window is matched again and the stream follows it ("reacquire"
@@ -318,19 +323,27 @@ func describeWindow(_ window: SCWindow) -> [String: Any] {
 
 struct WindowChoice {
     let window: SCWindow
-    /// The window's title contains the run token.
-    let titleVerified: Bool
+    /// How the window is known to be the run's: "title" (its title contains
+    /// the run token), "pid" (PID's only normal-level window, PID being
+    /// exclusive to the run) or "largest" (unverified).
+    let match: String
     /// Every on-screen window of the process at the time of the choice.
     let candidates: [[String: Any]]
+
+    /// The window's title contains the run token.
+    var titleVerified: Bool { match == "title" }
 }
 
 /// The window to capture: the largest on-screen window of `pid` whose title
-/// contains `token`, or, only when `allowUnverified`, the largest of all.
-/// A process can briefly own windows that are not the terminal (Ghostty
-/// replaced its first window under load in nv3, ft-zkjhg), so the token is
-/// what proves the match.
+/// contains `token`; with `pidExclusive`, an untitled window that is the
+/// only normal-level (layer 0) window of `pid`; only when `allowUnverified`,
+/// the largest of all. A process can briefly own windows that are not the
+/// terminal (Ghostty replaced its first window under load in nv3, ft-zkjhg,
+/// and keeps a small panel open), so the title or the pid's sole normal
+/// window is what proves the match. Two normal windows prove nothing.
 func chooseWindow(
-    _ content: SCShareableContent, pid: pid_t, token: String?, allowUnverified: Bool
+    _ content: SCShareableContent, pid: pid_t, token: String?, pidExclusive: Bool,
+    allowUnverified: Bool
 ) -> WindowChoice? {
     let owned = content.windows.filter {
         $0.owningApplication?.processID == pid && $0.isOnScreen && $0.frame.width >= 100
@@ -342,14 +355,18 @@ func chooseWindow(
     }
     if let token = token, !token.isEmpty {
         if let match = owned.filter({ ($0.title ?? "").contains(token) }).max(by: smaller) {
-            return WindowChoice(window: match, titleVerified: true, candidates: candidates)
-        }
-        if !allowUnverified {
-            return nil
+            return WindowChoice(window: match, match: "title", candidates: candidates)
         }
     }
+    let normal = owned.filter { $0.windowLayer == 0 }
+    if pidExclusive, normal.count == 1, (normal[0].title ?? "").isEmpty {
+        return WindowChoice(window: normal[0], match: "pid", candidates: candidates)
+    }
+    if let token = token, !token.isEmpty, !allowUnverified {
+        return nil
+    }
     guard let best = owned.max(by: smaller) else { return nil }
-    return WindowChoice(window: best, titleVerified: false, candidates: candidates)
+    return WindowChoice(window: best, match: "largest", candidates: candidates)
 }
 
 func shareableContent(_ completion: @escaping (SCShareableContent?, Error?) -> Void) {
@@ -357,11 +374,12 @@ func shareableContent(_ completion: @escaping (SCShareableContent?, Error?) -> V
         false, onScreenWindowsOnly: true, completionHandler: completion)
 }
 
-/// Polls until a window qualifies: one titled with `token` until
-/// `titleDeadline`, any window of `pid` after it, nothing after `deadline`.
+/// Polls until a window qualifies: one titled with `token` (or, with
+/// `pidExclusive`, `pid`'s only normal-level window) until `titleDeadline`,
+/// any window of `pid` after it, nothing after `deadline`.
 func findWindow(
-    pid: pid_t, token: String?, titleDeadline: Date, deadline: Date, writer: LineWriter,
-    completion: @escaping (WindowChoice, SCShareableContent) -> Void
+    pid: pid_t, token: String?, pidExclusive: Bool, titleDeadline: Date, deadline: Date,
+    writer: LineWriter, completion: @escaping (WindowChoice, SCShareableContent) -> Void
 ) {
     shareableContent { content, error in
         if let error = error, !CGPreflightScreenCaptureAccess() {
@@ -370,7 +388,8 @@ func findWindow(
         let allowUnverified = Date() > titleDeadline
         if let content = content,
             let choice = chooseWindow(
-                content, pid: pid, token: token, allowUnverified: allowUnverified)
+                content, pid: pid, token: token, pidExclusive: pidExclusive,
+                allowUnverified: allowUnverified)
         {
             completion(choice, content)
             return
@@ -381,7 +400,10 @@ func findWindow(
                     listed.windows.filter { $0.owningApplication?.processID == pid }.map(
                         describeWindow)
                 } ?? []
-            let titled = token.map { " titled with \"\($0)\"" } ?? ""
+            var titled = token.map { " titled with \"\($0)\"" } ?? ""
+            if pidExclusive {
+                titled += token == nil ? " (as its only normal window)" : " or as its only normal window"
+            }
             failRecord(
                 writer, 3, "no on-screen window of pid \(pid)\(titled) appeared",
                 extra: [
@@ -391,8 +413,8 @@ func findWindow(
         }
         DispatchQueue.global().asyncAfter(deadline: .now() + 0.25) {
             findWindow(
-                pid: pid, token: token, titleDeadline: titleDeadline, deadline: deadline,
-                writer: writer, completion: completion)
+                pid: pid, token: token, pidExclusive: pidExclusive, titleDeadline: titleDeadline,
+                deadline: deadline, writer: writer, completion: completion)
         }
     }
 }
@@ -404,6 +426,7 @@ final class CaptureSession: NSObject, SCStreamDelegate {
 
     let pid: pid_t
     let token: String?
+    let pidExclusive: Bool
     let writer: LineWriter
     let recorder: FrameRecorder
     let configuration: SCStreamConfiguration
@@ -412,17 +435,18 @@ final class CaptureSession: NSObject, SCStreamDelegate {
     // Guarded by `control`.
     var stream: SCStream?
     var windowID: CGWindowID = 0
-    var titleVerified = false
+    var match = "largest"
     var reacquiring = false
     var attempts = 0
     var stopError: String?
 
     init(
-        pid: pid_t, token: String?, writer: LineWriter, recorder: FrameRecorder,
-        configuration: SCStreamConfiguration
+        pid: pid_t, token: String?, pidExclusive: Bool, writer: LineWriter,
+        recorder: FrameRecorder, configuration: SCStreamConfiguration
     ) {
         self.pid = pid
         self.token = token
+        self.pidExclusive = pidExclusive
         self.writer = writer
         self.recorder = recorder
         self.configuration = configuration
@@ -445,7 +469,7 @@ final class CaptureSession: NSObject, SCStreamDelegate {
         control.sync {
             self.stream = stream
             self.windowID = choice.window.windowID
-            self.titleVerified = choice.titleVerified
+            self.match = choice.match
         }
         stream.startCapture(completionHandler: then)
     }
@@ -483,7 +507,7 @@ final class CaptureSession: NSObject, SCStreamDelegate {
     private func reacquire(reason: String, since: UInt64, attempt: Int) {
         shareableContent { content, error in
             let (currentID, verified, stream) = self.control.sync {
-                (self.windowID, self.titleVerified, self.stream)
+                (self.windowID, self.match != "largest", self.stream)
             }
             var record: [String: Any] = [
                 "type": "reacquire", "reason": reason, "attempt": attempt, "at_ns": uptimeNs(),
@@ -491,7 +515,8 @@ final class CaptureSession: NSObject, SCStreamDelegate {
             ]
             guard let content = content,
                 let choice = chooseWindow(
-                    content, pid: self.pid, token: self.token, allowUnverified: !verified)
+                    content, pid: self.pid, token: self.token, pidExclusive: self.pidExclusive,
+                    allowUnverified: !verified)
             else {
                 record["outcome"] = "no matching window"
                 if let error = error {
@@ -503,6 +528,8 @@ final class CaptureSession: NSObject, SCStreamDelegate {
             record["window_id"] = choice.window.windowID
             record["title"] = choice.window.title ?? ""
             record["title_verified"] = choice.titleVerified
+            record["match"] = choice.match
+            record["candidates"] = choice.candidates
             if stream != nil, choice.window.windowID == currentID {
                 // The same window: ScreenCaptureKit resumes it on its own once
                 // it is visible again. Look again later unless it has resumed.
@@ -520,7 +547,7 @@ final class CaptureSession: NSObject, SCStreamDelegate {
                     } else {
                         self.control.sync {
                             self.windowID = choice.window.windowID
-                            self.titleVerified = choice.titleVerified
+                            self.match = choice.match
                         }
                     }
                     self.finish(record, retry: error == nil ? nil : (reason, since))
@@ -542,7 +569,8 @@ final class CaptureSession: NSObject, SCStreamDelegate {
             [
                 "reacquire_attempts": attempts,
                 "final_window_id": windowID,
-                "final_title_verified": titleVerified,
+                "final_title_verified": match == "title",
+                "final_match": match,
                 "stream_error": stopError ?? "",
             ]
         }
@@ -558,6 +586,7 @@ func capture(_ args: Arguments) -> Never {
     let maxWidth = max(160, args.int("max-width", 960))
     let fpsCap = max(1, args.int("fps-cap", 240))
     let token = args.string("title-contains")
+    let pidExclusive = args.int("pid-exclusive", 0) != 0
     let waitSeconds = args.int("window-wait-seconds", 60)
     let deadline = Date().addingTimeInterval(TimeInterval(waitSeconds))
     let titleDeadline = Date().addingTimeInterval(
@@ -569,7 +598,8 @@ func capture(_ args: Arguments) -> Never {
     }
 
     findWindow(
-        pid: pid, token: token, titleDeadline: titleDeadline, deadline: deadline, writer: writer
+        pid: pid, token: token, pidExclusive: pidExclusive, titleDeadline: titleDeadline,
+        deadline: deadline, writer: writer
     ) { choice, content in
         let window = choice.window
         let center = CGPoint(x: window.frame.midX, y: window.frame.midY)
@@ -605,6 +635,8 @@ func capture(_ args: Arguments) -> Never {
             "display": displayInfo,
             "token": token ?? "",
             "title_verified": choice.titleVerified,
+            "match": choice.match,
+            "pid_exclusive": pidExclusive,
             "candidates": choice.candidates,
             "started_ns": uptimeNs(),
         ]
@@ -612,8 +644,8 @@ func capture(_ args: Arguments) -> Never {
 
         let recorder = FrameRecorder(writer: writer)
         let session = CaptureSession(
-            pid: pid, token: token, writer: writer, recorder: recorder,
-            configuration: configuration)
+            pid: pid, token: token, pidExclusive: pidExclusive, writer: writer,
+            recorder: recorder, configuration: configuration)
         captureSession = session
         session.start(choice) { error in
             if let error = error {

@@ -489,12 +489,42 @@ SCK_INTERRUPTED = (3, 5)
 MAX_LOST_SHARE = 0.1
 
 
-def assess_capture(records, start_ns, end_ns, expected_title=None):
+def window_identity(window, pid, run_pid, expected_title):
+    """How a matched window (a capture header or a window switch) is known to
+    be the run's, judged from what the meter recorded. Returns (identity,
+    problem): identity "title" when its title holds the run's token; "pid"
+    when it is untitled and the only normal-level (layer 0) window among the
+    recorded candidates of `run_pid`, the terminal process the harness proved
+    is the run's own (ScreenCaptureKit reports every Ghostty window untitled,
+    ft-5azl8). Anything else is refused: a window titled for something else,
+    another process's window, a panel, or one of two normal windows."""
+    title = window.get("title") or ""
+    if not expected_title:
+        return None, None
+    if expected_title in title:
+        return "title", None
+    titled = (f"the matched window {window.get('window_id')} is titled {title!r}, "
+              f"not the run's {expected_title!r}")
+    if title or run_pid is None:
+        return None, titled
+    if pid != run_pid:
+        return None, f"{titled}, and it belongs to pid {pid}, not the run's terminal pid {run_pid}"
+    candidates = window.get("candidates")
+    if candidates is None:
+        return None, f"{titled}, and no candidate windows were recorded to show it is pid {run_pid}'s only one"
+    normal = [candidate.get("window_id") for candidate in candidates if candidate.get("layer") == 0]
+    if normal != [window.get("window_id")]:
+        return None, f"{titled}, and pid {run_pid}'s normal windows are {normal}, not just this one"
+    return "pid", None
+
+
+def assess_capture(records, start_ns, end_ns, expected_title=None, run_pid=None):
     """Whether a frame-meter capture can give an FPS for the drain window
     [start_ns, end_ns], and if not, why. Returns (info, reason): reason None
     means usable. A capture that matched the wrong window, was suspended
     across the drain, or never started yields a reason, never an FPS of 0
-    (ft-zkjhg)."""
+    (ft-zkjhg). `run_pid` is the run's proven terminal pid; with it, an
+    untitled window can be identified by pid (window_identity, ft-5azl8)."""
     error = next((r for r in records if r.get("type") == "error"), None)
     header = next((r for r in records if r.get("type") == "window"), None)
     frames = [r for r in records if r.get("type") == "frame"]
@@ -506,15 +536,14 @@ def assess_capture(records, start_ns, end_ns, expected_title=None):
         return info, f"no capture: {reason}"
     title = header.get("title") or ""
     info.update({"window_id": header.get("window_id"), "title": title,
-                 "title_verified": header.get("title_verified")})
+                 "title_verified": header.get("title_verified"), "match": header.get("match")})
     if switches:
         last = switches[-1]
         info.update({"final_window_id": last.get("window_id"), "final_title": last.get("title")})
-    final_title = info.get("final_title", title) or ""
-    title_problem = None
-    if expected_title and expected_title not in final_title:
-        title_problem = (f"the matched window {info.get('final_window_id', header.get('window_id'))} is titled "
-                         f"{final_title!r}, not the run's {expected_title!r}")
+    # The meter only ever captures windows of the header's pid.
+    identity, title_problem = window_identity(switches[-1] if switches else header, header.get("pid"),
+                                              run_pid, expected_title)
+    info["identity"] = identity
 
     def relative(moment):
         offset = (moment - start_ns) / 1e9
@@ -780,6 +809,7 @@ def capture_self_test(s):
     _, reason = assess_capture([header("Downloads")] + [complete(base + i * period, i) for i in range(60)],
                                base, base + s, token)
     assert reason == f"the matched window 7 is titled 'Downloads', not the run's '{token}'", reason
+    pid_identity_self_test(s, header, complete, token)
     # SCK 'complete' frames with unchanged pixels are not content changes.
     repeated = [complete(base + i * period, i // 2) for i in range(60)]
     fps = fps_metrics(repeated, base, base + s, 60)
@@ -791,6 +821,58 @@ def capture_self_test(s):
     assert fps_unavailable_refusals(runs) == ["run 1 (ghostty): FPS unavailable: the capture was suspended"]
     silent = {"schema": SCHEMA, "fps_measured": True, "runs": [dict(runs[0], fps_unavailable=None)]}
     assert any("no fps_unavailable reason" in problem for problem in validate_receipt(silent))
+
+
+def pid_identity_self_test(s, header, complete, token):
+    """ft-5azl8: ScreenCaptureKit reports every Ghostty window untitled, so a
+    Ghostty window is identified as the only normal-level window of the run's
+    proven terminal pid. Every other window is refused, never measured."""
+    base, period, run_pid = 1_000 * s, s // 60, 85284
+    panel = {"window_id": 22459, "title": "", "layer": 8, "on_screen": True, "frame_points": [1406, 378, 260, 208]}
+    terminal = {"window_id": 22460, "title": "", "layer": 0, "on_screen": True, "frame_points": [0, 890, 968, 740]}
+
+    def capture(window_id, candidates, pid=run_pid, title=""):
+        record = dict(header(title, False), window_id=window_id, pid=pid)
+        if candidates is not None:
+            record["candidates"] = candidates
+        return [record] + [complete(base + i * period, i) for i in range(60)]
+
+    # nv8: the terminal window, untitled, beside Ghostty's small panel.
+    info, reason = assess_capture(capture(22460, [panel, terminal]), base, base + s, token, run_pid)
+    assert reason is None and info["identity"] == "pid", (info, reason)
+    titled = f"the matched window 22460 is titled '', not the run's '{token}'"
+    # Without the run's pid (the harness did not prove it) the title rule stands.
+    _, reason = assess_capture(capture(22460, [panel, terminal]), base, base + s, token)
+    assert reason == titled, reason
+    # Planted negatives: each one a wrong or unprovable window, refused.
+    _, reason = assess_capture(capture(22460, [panel, terminal], pid=4242), base, base + s, token, run_pid)
+    assert reason == f"{titled}, and it belongs to pid 4242, not the run's terminal pid {run_pid}", reason
+    _, reason = assess_capture(capture(22459, [panel, terminal]), base, base + s, token, run_pid)
+    assert reason == (f"the matched window 22459 is titled '', not the run's '{token}', "
+                      f"and pid {run_pid}'s normal windows are [22460], not just this one"), reason
+    second = dict(terminal, window_id=22461)
+    _, reason = assess_capture(capture(22460, [panel, terminal, second]), base, base + s, token, run_pid)
+    assert reason == f"{titled}, and pid {run_pid}'s normal windows are [22460, 22461], not just this one", reason
+    _, reason = assess_capture(capture(22460, None), base, base + s, token, run_pid)
+    assert reason == (f"{titled}, and no candidate windows were recorded to show it is "
+                      f"pid {run_pid}'s only one"), reason
+    _, reason = assess_capture(capture(22460, [dict(terminal, title="Downloads")], title="Downloads"),
+                               base, base + s, token, run_pid)
+    assert reason == f"the matched window 22460 is titled 'Downloads', not the run's '{token}'", reason
+    # A window switch is judged by the window it switched to.
+    switched = capture(22460, [panel, terminal])
+    switched.insert(30, {"type": "reacquire", "outcome": "switched window", "window_id": 22462, "title": "",
+                         "candidates": [panel, dict(terminal, window_id=22462)]})
+    info, reason = assess_capture(switched, base, base + s, token, run_pid)
+    assert reason is None and info["final_window_id"] == 22462 and info["identity"] == "pid", (info, reason)
+    switched[30] = dict(switched[30], candidates=[panel, terminal, dict(terminal, window_id=22462)])
+    _, reason = assess_capture(switched, base, base + s, token, run_pid)
+    assert reason == (f"the matched window 22462 is titled '', not the run's '{token}', "
+                      f"and pid {run_pid}'s normal windows are [22460, 22462], not just this one"), reason
+    # A titled match needs no pid.
+    info, reason = assess_capture(capture(22460, [dict(terminal, title=token)], pid=4242, title=token),
+                                  base, base + s, token, run_pid)
+    assert reason is None and info["identity"] == "title", (info, reason)
 
 
 def pty_self_test():
@@ -892,7 +974,8 @@ def reanalyze(run_dir):
     """Re-judges every run's capture in an existing run directory (read-only).
     Runs recorded before ft-zkjhg carry no drain window or title: the window
     is then taken from the first and last tty offset samples, and the title
-    from the harness's naming rule."""
+    from the harness's naming rule. The receipt's proven terminal pid lets an
+    untitled window be identified by pid (ft-5azl8)."""
     receipt = json.loads(read_text(os.path.join(run_dir, "receipt.json")) or "{}")
     by_dir = {run.get("run_dir"): run for run in receipt.get("runs") or []}
     lines = []
@@ -911,7 +994,7 @@ def reanalyze(run_dir):
         if title is None and (run.get("arm") or name).endswith("ghostty"):
             # Before ft-zkjhg only Ghostty was given the token, with --title.
             title = f"ftgt-{os.path.basename(os.path.abspath(run_dir))}-{name}"
-        info, reason = assess_capture(records, window[0], window[1], title)
+        info, reason = assess_capture(records, window[0], window[1], title, (run.get("pids") or {}).get("terminal"))
         if reason:
             lines.append(f"{name}: FPS unavailable: {reason}")
             continue
@@ -919,7 +1002,8 @@ def reanalyze(run_dir):
         refresh = (header.get("display") or {}).get("max_fps") or 60
         fps = fps_metrics([r for r in records if r.get("type") == "frame"], window[0], window[1], refresh)
         lines.append(f"{name}: FPS {fps['mean_fps']:.1f} pixel-changed ({fps['complete_fps']:.1f} SCK complete), "
-                     f"title {info.get('title')!r}, interruptions {len(info['interruptions'])}")
+                     f"title {info.get('title')!r}, identified by {info.get('identity')}, "
+                     f"interruptions {len(info['interruptions'])}")
     return lines
 
 
@@ -1228,13 +1312,18 @@ class Harness:
             if not args.no_fps:
                 capture_out = os.path.join(run_dir, "frames.jsonl")
                 ready = os.path.join(run_dir, "capture.ready")
-                # Match the window by its title token (ft-zkjhg). Ghostty forces
-                # the title, so it must match; FrankenTerm's pane sets it with
-                # OSC 2 and falls back to the process's window after 15 s.
+                # Match the window by its title token (ft-zkjhg); FrankenTerm's
+                # pane sets it with OSC 2. ScreenCaptureKit reports every
+                # Ghostty window untitled despite --title (nv3, nv8, nv8b;
+                # ft-5azl8), so the pid identifies it instead: both terminals
+                # are processes started for this run alone, proven above by the
+                # pane shell's ancestry, and the run's window is the pid's only
+                # normal-level window (--pid-exclusive). assess_capture checks
+                # that again from the recorded candidates.
                 title_wait = "60" if arm["kind"] == "ghostty" else "15"
                 helper = subprocess.Popen([self.meter, "capture", "--pid", str(terminal_pid), "--out", capture_out,
                                            "--stop-file", stop_helpers, "--ready-file", ready,
-                                           "--title-contains", self.run_title(run_dir),
+                                           "--title-contains", self.run_title(run_dir), "--pid-exclusive", "1",
                                            "--title-wait-seconds", title_wait, "--window-wait-seconds", "60",
                                            "--max-seconds", str(args.run_timeout + 120)],
                                           stdout=open(os.path.join(run_dir, "capture.log"), "w"), stderr=subprocess.STDOUT)
@@ -1367,7 +1456,8 @@ class Harness:
             refresh = display.get("max_fps") or self.refresh_hz
             record["capture"]["refresh_hz"] = refresh
             if window:
-                assessment, unavailable = assess_capture(records, window[0], window[1], record["window_title"])
+                assessment, unavailable = assess_capture(records, window[0], window[1], record["window_title"],
+                                                         record["pids"].get("terminal"))
                 record["capture"]["assessment"] = assessment
                 if unavailable:
                     # No FPS rather than a misleading 0.0; the drain still counts.
