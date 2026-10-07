@@ -20,7 +20,8 @@
 //! - reverse (and reverse video) swaps foreground and background;
 //! - a selected cell takes the selection foreground, and the focused block
 //!   cursor's cell takes the cursor foreground;
-//! - invisible text, or text in its own background color, draws no glyph;
+//! - invisible text, or text in the color it sits on (its background, the
+//!   selection's, or a focused block cursor's), draws no glyph;
 //! - an underline takes its own color (SGR 58), or else the foreground;
 //! - the hovered hyperlink is underlined.
 //!
@@ -76,10 +77,15 @@ pub struct SceneStyle<'a> {
     pub bold_brightens: bool,
     /// The selection's text color; `None` keeps each cell's foreground.
     pub selection_fg: Option<SrgbaTuple>,
+    /// The selection's background, which selected text sits on.
+    pub selection_bg: SrgbaTuple,
     /// The text color under a focused block cursor; `None` when the cursor
     /// is not a focused block (the background pass draws other shapes) or
     /// keeps the cell's foreground.
     pub cursor_fg: Option<SrgbaTuple>,
+    /// A focused block cursor's color, which the text under it sits on;
+    /// `None` when the cursor is not a focused block.
+    pub cursor_bg: Option<SrgbaTuple>,
     /// The hyperlink under the mouse, underlined wherever it appears.
     pub hover: Option<&'a Arc<Hyperlink>>,
 }
@@ -90,8 +96,9 @@ struct BuiltRow {
     stable: Option<StableRowIndex>,
     generation: u64,
     selection: Range<usize>,
-    /// The cursor's column on this row, with the block foreground override.
-    cursor: Option<(usize, Option<[u8; 4]>)>,
+    /// The cursor's column on this row, with a focused block's foreground
+    /// override and its color.
+    cursor: Option<(usize, Option<[u8; 4]>, Option<[u8; 4]>)>,
 }
 
 /// What [`MetalScene::update`] did.
@@ -291,7 +298,13 @@ impl MetalScene {
                 stable: Some(mirror_row.stable()),
                 generation: mirror_row.generation(),
                 selection: selection(mirror_row.stable()),
-                cursor: (cursor_row == Some(row)).then(|| (cursor.x, style.cursor_fg.map(rgba8))),
+                cursor: (cursor_row == Some(row)).then(|| {
+                    (
+                        cursor.x,
+                        style.cursor_fg.map(rgba8),
+                        style.cursor_bg.map(rgba8),
+                    )
+                }),
             };
             let hovered = hover_changed
                 && mirror_row
@@ -349,19 +362,30 @@ impl MetalScene {
                 }
             }
 
+            // Text in the color it sits on draws no glyph. As in the WebGpu
+            // renderer (compute_cell_fg_bg), that is the selection's
+            // background for selected text and a focused block cursor's
+            // color under it, not the cell's own background.
             let mut fg = colors.fg;
+            let mut under = colors.bg;
             if built.selection.contains(&col) {
                 if let Some(selection_fg) = style.selection_fg {
                     fg = selection_fg;
                 }
+                under = style.selection_bg;
             }
-            let mut fg = rgba8(fg);
-            if let Some((cursor_col, Some(cursor_fg))) = built.cursor {
+            let (mut fg, mut under) = (rgba8(fg), rgba8(under));
+            if let Some((cursor_col, cursor_fg, cursor_bg)) = built.cursor {
                 if cursor_col == col {
-                    fg = cursor_fg;
+                    if let Some(cursor_fg) = cursor_fg {
+                        fg = cursor_fg;
+                    }
+                    if let Some(cursor_bg) = cursor_bg {
+                        under = cursor_bg;
+                    }
                 }
             }
-            if cell.invisible() || fg == rgba8(colors.bg) {
+            if cell.invisible() || fg == under {
                 continue;
             }
             let mut underline = underline_style(cell.underline());
@@ -696,12 +720,22 @@ mod tests {
                 generation += 1;
             }
             let hover = (rng.below(3) == 0).then_some(&link);
+            // Selection and cursor text sometimes in the default background
+            // or in the color it sits on, and the block cursor coming and
+            // going, so the glyph-hiding rule is compared with full builds.
             let style = SceneStyle {
                 palette: &palette,
                 generation,
                 bold_brightens: true,
-                selection_fg: (rng.below(2) == 0).then_some(SrgbaTuple(1.0, 1.0, 1.0, 1.0)),
+                selection_fg: *rng.pick(&[
+                    None,
+                    Some(SrgbaTuple(1.0, 1.0, 1.0, 1.0)),
+                    Some(palette.background),
+                    Some(palette.selection_bg),
+                ]),
+                selection_bg: palette.selection_bg,
                 cursor_fg: (rng.below(2) == 0).then_some(SrgbaTuple(0.0, 0.0, 0.0, 1.0)),
+                cursor_bg: (rng.below(2) == 0).then_some(palette.cursor_bg),
                 hover,
             };
             let top = mirror.first() + rng.below(rows as u64) as StableRowIndex;
@@ -753,7 +787,9 @@ mod tests {
             generation: 0,
             bold_brightens: true,
             selection_fg: None,
+            selection_bg: palette.selection_bg,
             cursor_fg: None,
+            cursor_bg: None,
             hover: None,
         }
     }
@@ -873,6 +909,70 @@ mod tests {
         assert_eq!((forward.scrolled, forward.rows_rebuilt), (1, 1));
     }
 
+    /// Text is hidden only in the color it actually sits on, as the WebGpu
+    /// renderer decides: the selection's background under selected text, a
+    /// focused block cursor's color under the cursor, else the cell's own
+    /// background. The Metal focus-selection scene (ft-yccm0.4.4) lost its
+    /// default-colored selected text: dark selection text was compared with
+    /// the dark default background it does not sit on.
+    #[test]
+    fn text_is_hidden_only_in_the_color_it_sits_on() {
+        let palette = ColorPalette::default();
+        let (dark, light, gray) = (
+            palette.background,
+            SrgbaTuple(0.7, 0.84, 1.0, 1.0),
+            SrgbaTuple(0.75, 0.75, 0.75, 1.0),
+        );
+        let mut term = terminal(2, 10);
+        // "ab" is selected, the cursor is on "c", "d" is plain and "ef" is
+        // black on black.
+        term.advance_bytes(b"abcd\x1b[30;40mef\x1b[0m\x1b[1;3H");
+        let mut mirror = RenderMirror::new();
+        let request = CaptureRequest {
+            viewport_top: None,
+            rules: &[],
+            rules_generation: 0,
+        };
+        capture_terminal_rows(&mut term, &mut mirror, &request).expect("resident");
+        let first = mirror.first();
+        let selection = move |stable: StableRowIndex| {
+            if stable == first { 0..2 } else { 0..0 }
+        };
+        let drawn_cols = |selection_fg: SrgbaTuple, cursor_fg: SrgbaTuple| {
+            let style = SceneStyle {
+                selection_fg: Some(selection_fg),
+                selection_bg: light,
+                cursor_fg: Some(cursor_fg),
+                cursor_bg: Some(gray),
+                ..plain_style(&palette)
+            };
+            let mut scene = MetalScene::new();
+            scene.update(&mirror, &style, &selection, &mut SyntheticGlyphs::default());
+            let mut cols: Vec<u16> = scene.text().row(0).map(|instance| instance.col()).collect();
+            cols.dedup();
+            cols
+        };
+        // Dark text on the light selection and on the gray block is drawn,
+        // although the cells' own background is dark too.
+        assert_eq!(drawn_cols(dark, dark), [0, 1, 2, 3]);
+        // Text in the selection's or the block's own color is not.
+        assert_eq!(drawn_cols(light, gray), [3]);
+
+        // The block going away (focus lost) brings back the text it hid,
+        // and the incremental update rebuilds that row for it.
+        let block = SceneStyle {
+            cursor_bg: Some(palette.foreground),
+            ..plain_style(&palette)
+        };
+        let mut scene = MetalScene::new();
+        let mut glyphs = SyntheticGlyphs::default();
+        scene.update(&mirror, &block, &no_selection, &mut glyphs);
+        assert!(!scene.text().row(0).any(|instance| instance.col() == 2));
+        let update = scene.update(&mirror, &plain_style(&palette), &no_selection, &mut glyphs);
+        assert_eq!((update.full, update.rows_rebuilt), (false, 1));
+        assert!(scene.text().row(0).any(|instance| instance.col() == 2));
+    }
+
     /// Exact readback (ft-yccm0.4.4): incremental frames and frames built
     /// from full line copies render to identical pixels on the real Metal
     /// pipeline, and a planted missed row renders differently.
@@ -961,7 +1061,9 @@ mod tests {
                 generation: 0,
                 bold_brightens: true,
                 selection_fg: Some(SrgbaTuple(1.0, 1.0, 1.0, 1.0)),
+                selection_bg: palette.selection_bg,
                 cursor_fg: None,
+                cursor_bg: None,
                 hover: None,
             };
             let request = CaptureRequest {

@@ -233,11 +233,13 @@ impl MetalFrame {
                 | (facts.palette_generation & 0xffff_ffff),
             bold_brightens: config.bold_brightens_ansi_colors != config::BoldBrightening::No,
             selection_fg: visible(palette.selection_fg),
+            selection_bg: palette.selection_bg,
             cursor_fg: if block_cursor {
                 visible(palette.cursor_fg)
             } else {
                 None
             },
+            cursor_bg: block_cursor.then_some(palette.cursor_bg),
             hover: inputs.hover.as_ref(),
         };
         let update = frame
