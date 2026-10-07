@@ -503,6 +503,14 @@ mod tests {
         RenderMirror::from_lines(dims, terminal_get_cursor_position(term), first, &lines)
     }
 
+    #[test]
+    fn colors_become_clamped_and_rounded_unorm_bytes() {
+        assert_eq!(unorm8(0.2), 51);
+        assert_eq!(unorm8(1.5), 255);
+        assert_eq!(unorm8(-1.0), 0);
+        assert_eq!(rgba8(SrgbaTuple(0.2, 1.5, -1.0, 0.5)), [51, 255, 0, 128]);
+    }
+
     /// An instance's bytes without its ring row, which depends on how far
     /// the ring has rotated, not on what the row shows.
     fn normalized(instance: CellText) -> [u8; 24] {
