@@ -387,6 +387,25 @@ For A/B runs, `FT_DURABILITY_COMMIT_WINDOW_MS` overrides the window, up to
   window age does, so the window mainly saves IO for interactive output and
   moderate streams.
 
+## Pane Output Ring (GUI and mux config)
+
+Each pane's reader thread hands PTY output to its parser thread through a
+ring of preallocated slots (ft-yccm0.3.1.1). It replaced an AF_UNIX
+socketpair, so moving bytes between the two threads costs no syscall and no
+kernel copy. The parser parses each slot in place. Each new pane applies the
+current values.
+
+| Key | Default | Range | What it controls |
+| --- | --- | --- | --- |
+| `mux_output_ring_slots` | `8` | `2..=1024` | Slots per pane. When every slot holds unparsed output, the reader parks and stops reading the PTY, so the kernel throttles the child. |
+| `mux_output_ring_slot_bytes` | `65536` | `4096..=16777216` | Bytes per slot. One delivery fills as many slots as it needs; a slot is published as soon as its delivery ends, so small output is not held back. |
+
+**Tradeoff.** Slots times slot bytes bounds the output buffered between
+reader and parser, about 512 KiB per pane by default. The slots are
+preallocated per pane; pages the OS has not touched cost no memory until
+output fills them. A larger ring absorbs longer bursts while the parser is
+busy, at the price of that memory per pane.
+
 ## GUI Performance Advisories (`FT-TUNE` codes)
 
 These advisories cover the GUI config (`frankenterm.lua`, `wezterm.lua` or `frankenterm.toml`), not `ft.toml`. Each one names a setting that costs throughput or responsiveness without any other sign. The codes are stable and are never reused.

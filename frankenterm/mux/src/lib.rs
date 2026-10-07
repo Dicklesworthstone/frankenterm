@@ -88,9 +88,7 @@ use anyhow::{anyhow, Context, Error};
 use config::keyassignment::SpawnTabDomain;
 use config::{configuration, ExitBehavior, GuiPosition, TermConfig};
 use domain::{Domain, DomainId, DomainState, SplitSource};
-use filedescriptor::{
-    poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN, POLLOUT,
-};
+use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
 use frankenterm_term::{Alert, Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
@@ -137,6 +135,7 @@ pub mod guardian_protocol;
 pub mod layout;
 pub mod localpane;
 pub mod pane;
+mod pane_byte_ring;
 pub mod render_mirror;
 pub mod renderable;
 pub mod ssh;
@@ -2837,7 +2836,12 @@ impl LiveParserCheckpointState {
 struct LiveParserCheckpointControl {
     state: Mutex<LiveParserCheckpointState>,
     delivery_gate: Condvar,
-    data_writer: Mutex<Option<FileDescriptor>>,
+    /// The reader's end of the pane byte ring (ft-yccm0.3.1.1). Held for a
+    /// whole delivery, including a park while the ring is full.
+    data_writer: Mutex<Option<pane_byte_ring::RingProducer>>,
+    /// Closes the parser's side without `data_writer`, so a dying parser
+    /// never waits behind a reader parked on a full ring.
+    data_closer: Mutex<Option<pane_byte_ring::RingCloser>>,
     wake_writer: Mutex<Option<FileDescriptor>>,
 }
 
@@ -2952,16 +2956,18 @@ impl LiveParserCheckpointControl {
             state: Mutex::new(LiveParserCheckpointState::new(registration_wire_identity)),
             delivery_gate: Condvar::new(),
             data_writer: Mutex::new(None),
+            data_closer: Mutex::new(None),
             wake_writer: Mutex::new(None),
         }
     }
 
     fn attach_reader_channels(
         &self,
-        data_writer: FileDescriptor,
+        data_writer: pane_byte_ring::RingProducer,
         checkpoint_wake_writer: FileDescriptor,
     ) -> Result<(), LiveParserCheckpointError> {
         let mut current_data_writer = self.data_writer.lock();
+        let mut current_data_closer = self.data_closer.lock();
         let mut current_wake_writer = self.wake_writer.lock();
         let mut state = self.state.lock();
         if state.dead {
@@ -2970,19 +2976,46 @@ impl LiveParserCheckpointControl {
         if state.attached || current_data_writer.is_some() || current_wake_writer.is_some() {
             return Err(LiveParserCheckpointError::ReaderUnavailable);
         }
+        *current_data_closer = Some(data_writer.closer());
         *current_data_writer = Some(data_writer);
         *current_wake_writer = Some(checkpoint_wake_writer);
         state.attached = true;
         Ok(())
     }
 
+    /// The reader is done: the parser drains what was published, then sees
+    /// EOF. A sleeping parser is woken for it.
     fn close_data_writer(&self) {
-        self.data_writer.lock().take();
+        let writer = self.data_writer.lock().take();
+        if let Some(mut writer) = writer {
+            writer.close(|| self.wake_parser_if_attached());
+        }
     }
 
     fn close_reader_channels(&self) {
+        // Release a reader parked on a full ring before taking its writer.
+        if let Some(closer) = self.data_closer.lock().take() {
+            closer.close_consumer();
+        }
         self.data_writer.lock().take();
         self.wake_writer.lock().take();
+    }
+
+    /// Wakes a sleeping parser for published bytes or EOF. Unlike
+    /// `wake_parser` it never poisons: a closed or failing wake channel means
+    /// the parser is gone, and its death is handled where it is observed.
+    fn wake_parser_if_attached(&self) {
+        let mut writer = self.wake_writer.lock();
+        let Some(writer) = writer.as_mut() else {
+            return;
+        };
+        loop {
+            match writer.write(&[1_u8]) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                // WouldBlock: an earlier wake is still queued.
+                _ => return,
+            }
+        }
     }
 
     fn wake_parser(&self) {
@@ -3951,7 +3984,7 @@ impl LiveParserCheckpointControl {
 
     fn write_delivered_bytes_with_writer(
         &self,
-        writer: &mut FileDescriptor,
+        writer: &mut pane_byte_ring::RingProducer,
         bytes: &[u8],
     ) -> std::io::Result<()> {
         if bytes.is_empty() {
@@ -4040,7 +4073,9 @@ impl LiveParserCheckpointControl {
                     return Err(error);
                 }
             };
-            match writer.write(&bytes[offset..offset + allowance]) {
+            match writer.write(&bytes[offset..offset + allowance], || {
+                self.wake_parser_if_attached();
+            }) {
                 Ok(0) => {
                     socket_reservation.disarm();
                     let reason = if wrote_any {
@@ -4072,12 +4107,15 @@ impl LiveParserCheckpointControl {
                     socket_reservation.release_interrupted();
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Every ring slot is full: park until the parser releases
+                    // one. The reader stops reading, so the kernel throttles
+                    // the child.
                     socket_reservation.release_interrupted();
-                    if let Err(wait_error) = wait_for_parser_socket_writable(writer) {
+                    if let Err(wait_error) = writer.wait_writable() {
                         delivery_reservation.abort(if wrote_any {
-                            "partial socket delivery lost writable readiness"
+                            "partial ring delivery lost the parser"
                         } else {
-                            "parser socket writable readiness failed"
+                            "parser ring writable readiness failed"
                         });
                         return Err(wait_error);
                     }
@@ -4098,35 +4136,12 @@ impl LiveParserCheckpointControl {
     }
 }
 
-fn wait_for_parser_socket_writable(writer: &FileDescriptor) -> std::io::Result<()> {
-    loop {
-        let mut readiness = [pollfd {
-            fd: writer.as_socket_descriptor(),
-            events: POLLOUT,
-            revents: 0,
-        }];
-        match poll(&mut readiness, None) {
-            Ok(0) => {}
-            Ok(_) => return Ok(()),
-            Err(error) if filedescriptor_error_is_interrupted(&error) => {}
-            Err(error) => return Err(filedescriptor_error_into_io(error)),
-        }
-    }
-}
-
 fn filedescriptor_error_is_interrupted(error: &filedescriptor::Error) -> bool {
     match error {
         filedescriptor::Error::Poll(source) | filedescriptor::Error::Io(source) => {
             source.kind() == std::io::ErrorKind::Interrupted
         }
         _ => false,
-    }
-}
-
-fn filedescriptor_error_into_io(error: filedescriptor::Error) -> std::io::Error {
-    match error {
-        filedescriptor::Error::Poll(source) | filedescriptor::Error::Io(source) => source,
-        other => std::io::Error::other(other),
     }
 }
 
@@ -11467,10 +11482,10 @@ fn parse_buffered_data(
     pane: Weak<dyn Pane>,
     generation: Arc<PaneRegistrationGeneration>,
     dead: &Arc<AtomicBool>,
-    mut rx: FileDescriptor,
+    mut rx: pane_byte_ring::RingConsumer,
     mut checkpoint_wake_rx: FileDescriptor,
 ) {
-    let mut buf = vec![0; configuration().mux_output_parser_buffer_size];
+    let mut read_limit = configuration().mux_output_parser_buffer_size;
     let mut parser = termwiz::escape::parser::Parser::new();
     let mut actions = vec![];
     let mut hold = SynchronizedOutputHold::default();
@@ -11514,66 +11529,68 @@ fn parse_buffered_data(
             let reap_delay = Duration::from_millis(10);
             poll_delay = Some(poll_delay.map_or(reap_delay, |delay| delay.min(reap_delay)));
         }
-        let mut readiness = [
-            pollfd {
-                fd: rx.as_socket_descriptor(),
-                events: POLLIN,
-                revents: 0,
-            },
-            pollfd {
+        // Published bytes and EOF are read straight from the pane byte ring
+        // without a syscall (ft-yccm0.3.1.1). Only an empty ring sleeps, in
+        // poll on the wake socket, after announcing the sleep so that the
+        // reader's next publication, or its close, wakes this thread.
+        if !rx.has_data_or_eof() {
+            if !rx.announce_sleep() {
+                continue;
+            }
+            let mut readiness = [pollfd {
                 fd: checkpoint_wake_rx.as_socket_descriptor(),
                 events: POLLIN,
                 revents: 0,
-            },
-        ];
-        match poll(&mut readiness, poll_delay) {
-            Ok(0) => {
-                if !actions.is_empty() && !hold.is_holding() {
-                    send_actions_to_mux(&pane, &generation, dead, std::mem::take(&mut actions));
-                    action_size = 0;
-                    deadline = None;
+            }];
+            let polled = poll(&mut readiness, poll_delay);
+            rx.end_sleep();
+            match polled {
+                Ok(0) => {
+                    if !actions.is_empty() && !hold.is_holding() {
+                        send_actions_to_mux(&pane, &generation, dead, std::mem::take(&mut actions));
+                        action_size = 0;
+                        deadline = None;
+                    }
+                    continue;
                 }
-                continue;
-            }
-            Err(error) if filedescriptor_error_is_interrupted(&error) => continue,
-            Err(_) => {
-                dead.store(true, Ordering::Release);
-                generation.live_parser_checkpoint.mark_dead();
-                break;
-            }
-            Ok(_) => {}
-        }
-        if readiness[1].revents != 0 {
-            if !drain_live_parser_checkpoint_wake(
-                &generation.live_parser_checkpoint,
-                &mut checkpoint_wake_rx,
-            ) {
-                dead.store(true, Ordering::Release);
-                break;
-            }
-            match attempt_live_parser_checkpoint(
-                &pane,
-                &generation,
-                dead,
-                &parser,
-                &mut actions,
-                &hold,
-                &mut checkpoint_worker,
-            ) {
-                LiveParserAttemptOutcome::Fatal => break,
-                LiveParserAttemptOutcome::Completed if actions.is_empty() => {
-                    action_size = 0;
-                    deadline = None;
+                Err(error) if filedescriptor_error_is_interrupted(&error) => continue,
+                Err(_) => {
+                    dead.store(true, Ordering::Release);
+                    generation.live_parser_checkpoint.mark_dead();
+                    break;
                 }
-                LiveParserAttemptOutcome::Completed | LiveParserAttemptOutcome::NoRequest => {}
+                Ok(_) => {}
             }
-        }
-        if readiness[0].revents == 0 {
+            if readiness[0].revents != 0 {
+                if !drain_live_parser_checkpoint_wake(
+                    &generation.live_parser_checkpoint,
+                    &mut checkpoint_wake_rx,
+                ) {
+                    dead.store(true, Ordering::Release);
+                    break;
+                }
+                match attempt_live_parser_checkpoint(
+                    &pane,
+                    &generation,
+                    dead,
+                    &parser,
+                    &mut actions,
+                    &hold,
+                    &mut checkpoint_worker,
+                ) {
+                    LiveParserAttemptOutcome::Fatal => break,
+                    LiveParserAttemptOutcome::Completed if actions.is_empty() => {
+                        action_size = 0;
+                        deadline = None;
+                    }
+                    LiveParserAttemptOutcome::Completed | LiveParserAttemptOutcome::NoRequest => {}
+                }
+            }
             continue;
         }
         let allowance = match generation
             .live_parser_checkpoint
-            .parser_read_allowance(buf.len())
+            .parser_read_allowance(read_limit)
         {
             Ok(0) => continue,
             Ok(allowance) => allowance,
@@ -11599,8 +11616,8 @@ fn parse_buffered_data(
                 continue;
             }
         };
-        match rx.read(&mut buf[..allowance]) {
-            Ok(size) if size == 0 => {
+        match rx.peek(allowance) {
+            Ok(pane_byte_ring::RingRead::Closed) => {
                 let _ = attempt_live_parser_checkpoint(
                     &pane,
                     &generation,
@@ -11614,13 +11631,17 @@ fn parse_buffered_data(
                 generation.live_parser_checkpoint.mark_dead();
                 break;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(pane_byte_ring::RingRead::Empty) => continue,
             Err(_) => {
+                generation
+                    .live_parser_checkpoint
+                    .poison("pane byte ring delivered a discontinuous slot");
                 dead.store(true, Ordering::Release);
                 generation.live_parser_checkpoint.mark_dead();
                 break;
             }
-            Ok(size) => {
+            Ok(pane_byte_ring::RingRead::Bytes(chunk)) => {
+                let size = chunk.len();
                 // The fused path (ft-yccm0.3.2.1) takes a chunk the code below
                 // would apply at once anyway: no synchronized-output hold, and
                 // enough output that it would not wait to coalesce a frame.
@@ -11628,7 +11649,7 @@ fn parse_buffered_data(
                 let mut diverted = Vec::new();
                 let fused = fused_parse
                     && !hold.is_holding()
-                    && action_size.saturating_add(size) >= buf.len()
+                    && action_size.saturating_add(size) >= read_limit
                     && {
                         if !actions.is_empty() {
                             send_actions_to_mux(
@@ -11644,7 +11665,7 @@ fn parse_buffered_data(
                             &generation,
                             dead,
                             &mut parser,
-                            &buf[0..size],
+                            chunk,
                             &mut diverted,
                         )
                     };
@@ -11718,8 +11739,10 @@ fn parse_buffered_data(
                         on_action(action);
                     }
                 } else {
-                    parser.parse(&buf[0..size], &mut on_action);
+                    parser.parse(chunk, &mut on_action);
                 }
+                // Parsed: the slot goes back to the reader once exhausted.
+                rx.consume(size);
                 if generation
                     .live_parser_checkpoint
                     .record_parsed_bytes(size)
@@ -11789,7 +11812,7 @@ fn parse_buffered_data(
                     // pause for a short while to increase the chances
                     // that we coalesce a full "frame" from an unoptimized
                     // TUI program
-                    if action_size < buf.len() {
+                    if action_size < read_limit {
                         let poll_delay = match deadline {
                             None => {
                                 if let Some(target) = Instant::now().checked_add(delay) {
@@ -11805,21 +11828,19 @@ fn parse_buffered_data(
                             Some(target) => target.checked_duration_since(Instant::now()),
                         };
                         if poll_delay.is_some() {
-                            let mut pfd = [
-                                pollfd {
-                                    fd: rx.as_socket_descriptor(),
-                                    events: POLLIN,
-                                    revents: 0,
-                                },
-                                pollfd {
-                                    fd: checkpoint_wake_rx.as_socket_descriptor(),
-                                    events: POLLIN,
-                                    revents: 0,
-                                },
-                            ];
-                            if poll(&mut pfd, poll_delay).is_ok_and(|ready| ready > 0) {
-                                // Re-enter the joint poll/capture path before
-                                // applying actions when either fd wakes.
+                            // More output or a checkpoint wake re-enters the
+                            // joint poll/capture path before the actions apply.
+                            if rx.has_data_or_eof() || !rx.announce_sleep() {
+                                continue;
+                            }
+                            let mut pfd = [pollfd {
+                                fd: checkpoint_wake_rx.as_socket_descriptor(),
+                                events: POLLIN,
+                                revents: 0,
+                            }];
+                            let woken = poll(&mut pfd, poll_delay).is_ok_and(|ready| ready > 0);
+                            rx.end_sleep();
+                            if woken || rx.has_data_or_eof() {
                                 continue;
                             }
 
@@ -11834,7 +11855,7 @@ fn parse_buffered_data(
                 }
 
                 let config = configuration();
-                buf.resize(config.mux_output_parser_buffer_size, 0);
+                read_limit = config.mux_output_parser_buffer_size;
                 delay = Duration::from_millis(config.mux_output_parser_coalesce_delay_ms);
             }
         }
@@ -16237,11 +16258,15 @@ impl Mux {
                     "injected pane reader socketpair failure for pane {pane_id}"
                 ));
             }
-            let (mut tx, rx) = allocate_socketpair().with_context(|| {
-                format!("failed to allocate pane reader socketpair for pane {pane_id}")
-            })?;
-            tx.set_non_blocking(true)
-                .with_context(|| format!("make pane {pane_id} parser writer nonblocking"))?;
+            // Reader -> parser bytes travel through preallocated ring slots
+            // (ft-yccm0.3.1.1); the socketpair below only wakes the parser.
+            let (tx, rx) = {
+                let config = configuration();
+                pane_byte_ring::pane_byte_ring(
+                    config.mux_output_ring_slots,
+                    config.mux_output_ring_slot_bytes,
+                )
+            };
             let (mut checkpoint_wake_tx, mut checkpoint_wake_rx) = allocate_socketpair()
                 .with_context(|| {
                     format!(
@@ -24531,11 +24556,7 @@ mod tests {
                 .load()
                 .expect("test pane registration handle");
             let generation = registration.live_parser_test_generation();
-            let (mut data_writer, data_reader) =
-                allocate_socketpair().expect("allocate test parser data socket");
-            data_writer
-                .set_non_blocking(true)
-                .expect("make test parser writer nonblocking");
+            let (data_writer, data_reader) = pane_byte_ring::pane_byte_ring(8, 64 * 1024);
             let (mut wake_writer, mut wake_reader) =
                 allocate_socketpair().expect("allocate test parser control socket");
             wake_writer
@@ -25106,41 +25127,42 @@ mod tests {
     fn nonblocking_backpressure_commits_before_parser_accounting_without_deadlock() {
         let wire_identity = *uuid::Uuid::new_v4().as_bytes();
         let control = Arc::new(LiveParserCheckpointControl::new(wire_identity));
-        let (mut writer, mut reader) =
-            allocate_socketpair().expect("allocate backpressure parser socket");
-        writer
-            .set_non_blocking(true)
-            .expect("make backpressure writer nonblocking");
-        #[cfg(unix)]
-        {
-            let _ = set_socket_buffer(&mut writer, SO_SNDBUF, 1024);
-            let _ = set_socket_buffer(&mut reader, SO_RCVBUF, 1024);
-        }
-        let payload = vec![b'x'; 4 * 1024 * 1024];
+        // Two 1 KiB slots: a 4 MiB delivery parks the writer on a full ring
+        // thousands of times (ft-yccm0.3.1.1).
+        let (mut writer, mut reader) = pane_byte_ring::pane_byte_ring(2, 1024);
+        let payload: Vec<u8> = (0..4 * 1024 * 1024_usize).map(|i| i as u8).collect();
         let expected = payload.len();
+        let expected_bytes = payload.clone();
         let parser_control = Arc::clone(&control);
         let parser = std::thread::spawn(move || {
-            let mut observed = 0;
-            let mut chunk = [0_u8; 257];
-            while observed < expected {
-                match reader.read(&mut chunk) {
-                    Ok(0) => panic!("backpressure parser socket closed early"),
-                    Ok(size) => {
+            let mut observed = Vec::with_capacity(expected);
+            while observed.len() < expected {
+                match reader.peek(257) {
+                    Ok(pane_byte_ring::RingRead::Bytes(chunk)) => {
+                        let size = chunk.len();
+                        observed.extend_from_slice(chunk);
+                        reader.consume(size);
                         parser_control
                             .record_parsed_bytes(size)
-                            .expect("commit exact parser accounting after socket write");
-                        observed += size;
+                            .expect("commit exact parser accounting after ring delivery");
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(error) => panic!("backpressure parser read failed: {}", error),
+                    Ok(pane_byte_ring::RingRead::Empty) => std::thread::yield_now(),
+                    Ok(pane_byte_ring::RingRead::Closed) => {
+                        panic!("backpressure ring closed early")
+                    }
+                    Err(error) => panic!("backpressure ring read failed: {}", error),
                 }
             }
-            observed
+            assert!(
+                observed == expected_bytes,
+                "the payload arrives exactly once, in order"
+            );
+            observed.len()
         });
 
         control
             .write_delivered_bytes_with_writer(&mut writer, &payload)
-            .expect("deliver payload through forced socket backpressure");
+            .expect("deliver payload through forced ring backpressure");
         assert_eq!(
             parser.join().expect("backpressure parser does not panic"),
             expected

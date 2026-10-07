@@ -606,6 +606,23 @@ pub struct Config {
     #[dynamic(default = "default_mux_socket_buffer_size")]
     pub mux_socket_buffer_size: usize,
 
+    /// Slots in each pane's reader -> parser byte ring (ft-yccm0.3.1.1).
+    /// The pane reader publishes PTY output into free slots and the parser
+    /// releases each slot once parsed. When every slot is full the reader
+    /// parks and stops reading, so the kernel throttles the child.
+    #[dynamic(
+        default = "default_mux_output_ring_slots",
+        validate = "validate_mux_output_ring_slots"
+    )]
+    pub mux_output_ring_slots: usize,
+
+    /// Bytes per slot of the reader -> parser byte ring (ft-yccm0.3.1.1).
+    #[dynamic(
+        default = "default_mux_output_ring_slot_bytes",
+        validate = "validate_mux_output_ring_slot_bytes"
+    )]
+    pub mux_output_ring_slot_bytes: usize,
+
     /// Maximum bytes of output to hold during synchronized rendering mode
     /// before force-flushing. Prevents unbounded memory growth from buggy
     /// apps that enter synchronized-output mode and never reset it.
@@ -2195,6 +2212,44 @@ fn default_mux_socket_buffer_size() -> usize {
     1024 * 1024
 }
 
+pub const MUX_OUTPUT_RING_SLOTS_RANGE: std::ops::RangeInclusive<usize> = 2..=1024;
+pub const MUX_OUTPUT_RING_SLOT_BYTES_RANGE: std::ops::RangeInclusive<usize> =
+    4 * 1024..=16 * 1024 * 1024;
+
+fn default_mux_output_ring_slots() -> usize {
+    8
+}
+
+fn default_mux_output_ring_slot_bytes() -> usize {
+    64 * 1024
+}
+
+fn validate_mux_output_ring_slots(value: &usize) -> Result<(), String> {
+    if MUX_OUTPUT_RING_SLOTS_RANGE.contains(value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "mux_output_ring_slots must be in {}..={}, got {}",
+            MUX_OUTPUT_RING_SLOTS_RANGE.start(),
+            MUX_OUTPUT_RING_SLOTS_RANGE.end(),
+            value
+        ))
+    }
+}
+
+fn validate_mux_output_ring_slot_bytes(value: &usize) -> Result<(), String> {
+    if MUX_OUTPUT_RING_SLOT_BYTES_RANGE.contains(value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "mux_output_ring_slot_bytes must be in {}..={}, got {}",
+            MUX_OUTPUT_RING_SLOT_BYTES_RANGE.start(),
+            MUX_OUTPUT_RING_SLOT_BYTES_RANGE.end(),
+            value
+        ))
+    }
+}
+
 fn default_osc52_write_policy() -> frankenterm_term::config::Osc52WritePolicy {
     frankenterm_term::config::Osc52WritePolicy::Prompt
 }
@@ -3485,6 +3540,24 @@ mod tests {
     #[test]
     fn validate_mux_output_parser_buffer_size_zero_rejected() {
         assert!(validate_mux_output_parser_buffer_size(&0).is_err());
+    }
+
+    #[test]
+    fn mux_output_ring_keys_default_inside_their_validated_ranges() {
+        assert!(validate_mux_output_ring_slots(&default_mux_output_ring_slots()).is_ok());
+        assert!(validate_mux_output_ring_slot_bytes(&default_mux_output_ring_slot_bytes()).is_ok());
+        for slots in [0, 1, 1025] {
+            assert!(validate_mux_output_ring_slots(&slots).is_err(), "{}", slots);
+        }
+        for bytes in [0, 4095, 16 * 1024 * 1024 + 1] {
+            assert!(
+                validate_mux_output_ring_slot_bytes(&bytes).is_err(),
+                "{}",
+                bytes
+            );
+        }
+        assert!(validate_mux_output_ring_slots(&2).is_ok());
+        assert!(validate_mux_output_ring_slot_bytes(&(16 * 1024 * 1024)).is_ok());
     }
 
     #[test]

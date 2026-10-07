@@ -16684,10 +16684,7 @@ mod tests {
                 .capture_pane_operation(pane.pane_id())
                 .expect("admit current pane operation");
             let control = &generation.live_parser_checkpoint;
-            let (mut writer, mut reader) = crate::allocate_socketpair().expect("parser socket");
-            writer
-                .set_non_blocking(true)
-                .expect("nonblocking parser writer");
+            let (writer, mut reader) = crate::pane_byte_ring::pane_byte_ring(2, 1024);
             let (mut wake_writer, _wake_reader) =
                 crate::allocate_socketpair().expect("wake socket");
             wake_writer
@@ -16703,9 +16700,13 @@ mod tests {
                 .write_delivered_bytes(b"ab")
                 .expect("deliver authenticated bytes");
             let mut delivered = [0; 2];
-            reader
-                .read_exact(&mut delivered)
-                .expect("read delivered parser bytes");
+            match reader.peek(2).expect("read delivered parser bytes") {
+                crate::pane_byte_ring::RingRead::Bytes(bytes) => {
+                    delivered.copy_from_slice(bytes);
+                }
+                _ => panic!("the authenticated bytes were published"),
+            }
+            reader.consume(2);
             assert_eq!(&delivered, b"ab");
             let mut parser = termwiz::escape::parser::Parser::new();
             let mut staged = Vec::new();
