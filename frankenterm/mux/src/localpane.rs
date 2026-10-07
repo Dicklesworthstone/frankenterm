@@ -6231,6 +6231,31 @@ impl LocalPane {
         }
     }
 
+    /// The Metal renderer's capture (ft-yccm0.4.4). One hold of the fair
+    /// terminal lock copies into `mirror` only the viewport rows that changed
+    /// since its last capture; resolution and instance building happen after
+    /// the lock is released. The lock is taken as a paint locker, so its wait
+    /// and hold land in the paint histograms, and a flooding parser hands it
+    /// over within one apply slice (ft-yccm0.2.3). `None` for a viewport in
+    /// cold scrollback, which is never hydrated under the lock: capture that
+    /// with [`crate::render_mirror::capture_pane_rows`].
+    pub fn capture_render_rows(
+        &self,
+        mirror: &mut crate::render_mirror::RenderMirror,
+        request: &crate::render_mirror::CaptureRequest<'_>,
+    ) -> Option<crate::render_mirror::CaptureStats> {
+        let hide_cursor = self.tmux_domain.lock().is_some();
+        let mut term = self.terminal.lock_as(TerminalLockHolder::Paint);
+        #[cfg(feature = "disruptor-pane-io")]
+        self.drain_action_ring_locked(&mut term);
+        let stats = crate::render_mirror::capture_terminal_rows(&mut term, mirror, request)?;
+        drop(term);
+        if hide_cursor {
+            mirror.hide_cursor();
+        }
+        Some(stats)
+    }
+
     pub fn try_capture_render_frame(
         &self,
         mut viewport: Option<NativeViewport>,

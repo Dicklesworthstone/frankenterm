@@ -137,6 +137,7 @@ pub mod guardian_protocol;
 pub mod layout;
 pub mod localpane;
 pub mod pane;
+pub mod render_mirror;
 pub mod renderable;
 pub mod ssh;
 pub mod ssh_agent;
