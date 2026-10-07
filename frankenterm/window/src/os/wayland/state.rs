@@ -30,7 +30,9 @@ use wayland_client::globals::GlobalList;
 use wayland_client::protocol::wl_keyboard::WlKeyboard;
 use wayland_client::protocol::wl_output::WlOutput;
 use wayland_client::{delegate_dispatch, Connection, QueueHandle};
+use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
+use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur_manager::OrgKdeKwinBlurManager;
 
@@ -82,6 +84,10 @@ pub(super) struct WaylandState {
     pub(super) shm: Shm,
     pub(super) mem_pool: RefCell<SlotPool>,
     pub(super) kde_blur_manager: Option<OrgKdeKwinBlurManager>,
+    /// `wp_fractional_scale_manager_v1` and `wp_viewporter`. Fractional
+    /// scaling is used only when the compositor offers both; otherwise
+    /// windows keep the integer `wl_surface.set_buffer_scale` path.
+    pub(super) fractional_scale: Option<(WpFractionalScaleManagerV1, WpViewporter)>,
     pub(super) seat_bindings: SeatBindings<ObjectId>,
 }
 
@@ -95,6 +101,18 @@ impl WaylandState {
             SubcompositorState::bind(compositor.wl_compositor().clone(), globals, qh)?;
 
         let blur_manager: Option<OrgKdeKwinBlurManager> = globals.bind(qh, 1..=1, GlobalData).ok();
+        let fractional_scale = if fractional_scale_enabled() {
+            let manager: Option<WpFractionalScaleManagerV1> =
+                globals.bind(qh, 1..=1, GlobalData).ok();
+            let viewporter: Option<WpViewporter> = globals.bind(qh, 1..=1, GlobalData).ok();
+            manager.zip(viewporter)
+        } else {
+            None
+        };
+        log::debug!(
+            "Wayland fractional scaling: {}",
+            if fractional_scale.is_some() { "enabled" } else { "unavailable or disabled" }
+        );
         let wayland_state = WaylandState {
             registry: RegistryState::new(globals),
             output: OutputState::new(globals, qh),
@@ -129,10 +147,21 @@ impl WaylandState {
             shm,
             mem_pool: RefCell::new(mem_pool),
             kde_blur_manager: blur_manager,
+            fractional_scale,
             seat_bindings: SeatBindings::default(),
         };
         Ok(wayland_state)
     }
+}
+
+/// `FRANKENTERM_WAYLAND_FRACTIONAL_SCALE=0` turns fractional scaling off and
+/// falls back to integer buffer scales, for comparing the two or working
+/// around a compositor bug.
+fn fractional_scale_enabled() -> bool {
+    !matches!(
+        std::env::var("FRANKENTERM_WAYLAND_FRACTIONAL_SCALE").as_deref(),
+        Ok("0") | Ok("false") | Ok("off")
+    )
 }
 
 /// Publish a new modality-specific surface authority and return the retired
