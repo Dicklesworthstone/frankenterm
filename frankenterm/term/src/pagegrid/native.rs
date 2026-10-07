@@ -186,8 +186,14 @@ pub fn set_ascii_run(
     // default blanks when a cell follows, which storing the run gives too;
     // a run of only such blanks there changes nothing but the seqno, which
     // the per-byte path below applies.
+    //
+    // A run that starts inside the row overwrites it. Legacy's `set_cell`
+    // makes a clustered row a vector row there, and then stores each cell
+    // raw, which `Page::put_ascii` does in bulk unless a cell needs
+    // `Page::write`'s handling.
     let len = page.row_len(row);
-    let appends = if is_clustered(page, row) {
+    let clustered = is_clustered(page, row);
+    let appends = if clustered {
         x >= len
             && clustered_can_append(page, row, x, char::from(first))
             && !(x > len
@@ -196,7 +202,7 @@ pub fn set_ascii_run(
     } else {
         x >= len
     };
-    if appends && images.is_empty() {
+    if images.is_empty() && (appends || x < len) {
         let style = match &class {
             StyleClass::Inline(inline) => StyleSpec::Inline(*inline),
             StyleClass::Rich(rich) => StyleSpec::Rich {
@@ -208,7 +214,15 @@ pub fn set_ascii_run(
         write.semantic = attr.semantic_type();
         write.wrapped = attr.wrapped();
         write.hyperlink = attr.hyperlink();
-        if page.append_ascii(row, x, text.as_bytes(), write, seqno) {
+        let stored = if appends {
+            page.append_ascii(row, x, text.as_bytes(), write, seqno)
+        } else {
+            if clustered {
+                set_vector(page, row);
+            }
+            page.put_ascii(row, x, text.as_bytes(), write, seqno)
+        };
+        if stored {
             return true;
         }
     }
@@ -566,6 +580,43 @@ pub fn blank_band(
     }
 }
 
+/// `cols` blanks with `attr` appended to the empty row, in bulk: what
+/// `write_legacy` of each would store. Returns false, writing nothing, when
+/// `attr` carries images or the row is not empty.
+fn append_blanks(
+    page: &mut Page,
+    row: u32,
+    cols: usize,
+    attr: &CellAttributes,
+    seqno: SequenceNo,
+) -> bool {
+    const SPACES: [u8; 64] = [b' '; 64];
+    if attr.images().is_some() || page.row_len(row) != 0 || cols > usize::from(page.cols()) {
+        return false;
+    }
+    let class = classify(attr);
+    let mut cache = None;
+    let mut x = 0;
+    while x < cols {
+        let n = (cols - x).min(SPACES.len());
+        let style = match &class {
+            StyleClass::Inline(inline) => StyleSpec::Inline(*inline),
+            StyleClass::Rich(rich) => StyleSpec::Rich {
+                style: rich,
+                cache: &mut cache,
+            },
+        };
+        let mut write = CellWrite::new(Glyph::Blank, style);
+        write.semantic = attr.semantic_type();
+        write.wrapped = attr.wrapped();
+        write.hyperlink = attr.hyperlink();
+        let appended = page.append_ascii(row, x, &SPACES[..n], write, seqno);
+        debug_assert!(appended, "an empty row takes its blanks");
+        x += n;
+    }
+    true
+}
+
 /// A row new to the screen, as legacy's scroll makes one in the empty row
 /// `row`: clustered and empty for a default `blank_attr`, otherwise `cols`
 /// blanks with `blank_attr` in vector storage. With `bidi`, the screen's
@@ -582,9 +633,12 @@ pub fn new_row(
     if *blank_attr == CellAttributes::blank() {
         page.set_row_flags(row, RowHeader::LEGACY_FORM_C, true);
     } else {
-        let cell = Cell::blank_with_attrs(blank_attr.clone());
-        for x in 0..cols.min(usize::from(page.cols())) {
-            page.write_legacy(row, x, &cell, false, seqno);
+        let cols = cols.min(usize::from(page.cols()));
+        if !append_blanks(page, row, cols, blank_attr, seqno) {
+            let cell = Cell::blank_with_attrs(blank_attr.clone());
+            for x in 0..cols {
+                page.write_legacy(row, x, &cell, false, seqno);
+            }
         }
     }
     if let Some(mode) = bidi {
@@ -595,7 +649,7 @@ pub fn new_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::color::ColorAttribute;
+    use crate::color::{ColorAttribute, SrgbaTuple};
     use crate::pagegrid::view::{line_view, store_line, stored_cells};
     use frankenterm_cell::{Hyperlink, Intensity};
     use proptest::prelude::*;
@@ -635,9 +689,12 @@ mod tests {
         assert_eq!(page.row_seqno(row), line.current_seqno(), "{}: seqno", what);
     }
 
+    /// Six pens: plain, bold, palette background, a hyperlink, palette
+    /// foreground with the wrapped bit, and a true-colour foreground, which
+    /// pages store as a rich style.
     fn attrs(n: u8) -> CellAttributes {
         let mut attrs = CellAttributes::default();
-        match n % 5 {
+        match n % 6 {
             0 => {}
             1 => {
                 attrs.set_intensity(Intensity::Bold);
@@ -648,9 +705,14 @@ mod tests {
             3 => {
                 attrs.set_hyperlink(Some(Arc::new(Hyperlink::new("https://native.example/"))));
             }
-            _ => {
+            4 => {
                 attrs.set_foreground(ColorAttribute::PaletteIndex(196));
                 attrs.set_wrapped(true);
+            }
+            _ => {
+                attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(
+                    SrgbaTuple(0.25, 0.5, 0.75, 1.0),
+                ));
             }
         }
         attrs
@@ -694,30 +756,30 @@ mod tests {
     fn op() -> impl Strategy<Value = Op> {
         let x = 0usize..11;
         prop_oneof![
-            (x.clone(), 0..GLYPHS.len(), 0u8..5).prop_map(|(x, glyph, attrs)| Op::SetCell {
+            (x.clone(), 0..GLYPHS.len(), 0u8..6).prop_map(|(x, glyph, attrs)| Op::SetCell {
                 x,
                 glyph,
                 attrs
             }),
-            (x.clone(), 0..GLYPHS.len(), 0u8..5).prop_map(|(x, glyph, attrs)| Op::Grapheme {
+            (x.clone(), 0..GLYPHS.len(), 0u8..6).prop_map(|(x, glyph, attrs)| Op::Grapheme {
                 x,
                 glyph,
                 attrs
             }),
-            (0usize..8, 0..TEXTS.len(), 0u8..5).prop_map(|(x, text, attrs)| Op::Ascii {
+            (0usize..8, 0..TEXTS.len(), 0u8..6).prop_map(|(x, text, attrs)| Op::Ascii {
                 x,
                 text,
                 attrs
             }),
             any::<bool>().prop_map(|wrapped| Op::Wrapped { wrapped }),
-            (0usize..13, 0usize..14, 0u8..5).prop_map(|(start, end, attrs)| Op::Fill {
+            (0usize..13, 0usize..14, 0u8..6).prop_map(|(start, end, attrs)| Op::Fill {
                 start,
                 end,
                 attrs
             }),
             Just(Op::Compress),
             (0usize..12, 0usize..13).prop_map(|(x, margin)| Op::Insert { x, margin }),
-            (0usize..13, 0usize..13, 0u8..5).prop_map(|(x, margin, attrs)| Op::Delete {
+            (0usize..13, 0usize..13, 0u8..6).prop_map(|(x, margin, attrs)| Op::Delete {
                 x,
                 margin,
                 attrs
@@ -727,9 +789,9 @@ mod tests {
             (0usize..12, 0usize..13).prop_map(|(start, end)| Op::TakeBand { start, end }),
             (
                 0usize..10,
-                prop::collection::vec((0..GLYPHS.len(), 0u8..5), 0..4),
+                prop::collection::vec((0..GLYPHS.len(), 0u8..6), 0..4),
                 0usize..13,
-                0u8..5
+                0u8..6
             )
                 .prop_map(|(start, cells, end, attrs)| Op::PutBand {
                     start,
@@ -737,12 +799,37 @@ mod tests {
                     end,
                     attrs
                 }),
-            (0usize..12, 0usize..13, 0u8..5).prop_map(|(start, end, attrs)| Op::BlankBand {
+            (0usize..12, 0usize..13, 0u8..6).prop_map(|(start, end, attrs)| Op::BlankBand {
                 start,
                 end,
                 attrs
             }),
         ]
+    }
+
+    /// ft-yccm0.3.3.4: a new row is what legacy's scroll builds, `Line::new`
+    /// for the default pen and otherwise `cols` blanks with the pen, whose
+    /// bulk store must match a `write_legacy` of each. The page row also
+    /// stays dirty.
+    #[test]
+    fn new_rows_match_legacy_new_lines() {
+        for pen in 0..6 {
+            let attr = attrs(pen);
+            for cols in [0, 1, 11, usize::from(COLS)] {
+                // Scroll hands over the row empty and carrying the seqno.
+                let mut page = Page::new(COLS, 1, 1);
+                let row = page.grow(7).expect("a row");
+                page.take_dirty(row);
+                new_row(&mut page, row, cols, &attr, None, 7);
+                let line = if attr == CellAttributes::blank() {
+                    Line::new(7)
+                } else {
+                    Line::with_width_and_cell(cols, Cell::blank_with_attrs(attr.clone()), 7)
+                };
+                assert_same_row(&page, row, &line, &format!("pen {} cols {}", pen, cols));
+                assert!(page.take_dirty(row) || cols == 0 || attr == CellAttributes::blank());
+            }
+        }
     }
 
     proptest! {

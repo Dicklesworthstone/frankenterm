@@ -1078,6 +1078,88 @@ impl Page {
         true
     }
 
+    /// A run of printable ASCII from column `x`, within or up to the end of
+    /// the row, each byte stored as [`Self::write`] stores it over a narrow
+    /// cell: the old cell's side entries released, with the style resolved
+    /// once and one header update for the run (B3.4's bulk print). The run
+    /// may extend the row past its end. `cell`'s glyph and width are
+    /// ignored. Returns false, writing nothing, for a run that starts past
+    /// the end, passes the page's stride or carries images, or meets a cell
+    /// whose overwrite `write` handles specially: a wide or hidden cell in
+    /// the run, a visible wide cell just before it, or a cell with images
+    /// (whose placements legacy carries over).
+    pub fn put_ascii(
+        &mut self,
+        row: u32,
+        x: usize,
+        bytes: &[u8],
+        mut cell: CellWrite<'_>,
+        seqno: SequenceNo,
+    ) -> bool {
+        debug_assert!(bytes.iter().all(|byte| (0x20..0x7f).contains(byte)));
+        let header = self.header(row);
+        let slot = header.slot();
+        let old_len = header.len();
+        let end = x.saturating_add(bytes.len());
+        if bytes.is_empty() || x > old_len || end > self.stride() || !cell.images.is_empty() {
+            return false;
+        }
+        if x > 0 {
+            let prev = self.cell_at(slot, x - 1);
+            if !prev.is_hidden() && prev.is_wide() {
+                return false;
+            }
+        }
+        let kept = end.min(old_len);
+        if (x..kept).any(|col| {
+            let old = self.cell_at(slot, col);
+            old.is_wide() || old.is_hidden() || old.has_image()
+        }) {
+            return false;
+        }
+        cell.glyph = Glyph::Blank;
+        cell.wide = false;
+        // Acquire before release (D3).
+        let style = self.resolve_style(&mut cell.style);
+        if let CellStyle::Rich(id) = style {
+            for _ in 1..bytes.len() {
+                self.styles.add_ref(id);
+            }
+        }
+        let template = PackedCell::BLANK
+            .with_style(style)
+            .with_semantic(cell.semantic)
+            .with_wrapped(cell.wrapped)
+            .with_hyperlink(cell.hyperlink.is_some());
+        for (offset, &byte) in bytes.iter().enumerate() {
+            let col = x + offset;
+            let off = self.offset(slot, col);
+            if col < kept {
+                let old = self.cell_at(slot, col);
+                self.release(off, old, false);
+            }
+            if let Some(link) = cell.hyperlink {
+                self.links.attach(off, link);
+            }
+            let glyph = if byte == b' ' {
+                Glyph::Blank
+            } else {
+                Glyph::Char(char::from(byte))
+            };
+            self.set_cell_at(slot, col, template.with_codepoint(glyph.codepoint()));
+        }
+        // Every cell in the run was narrow and visible and stays so, and no
+        // cell after it was hidden by one of them: no hidden bit changes.
+        let flags = RowHeader::DIRTY | cell.summary_flags(style, false);
+        self.set_header(
+            row,
+            header.with_len(old_len.max(end)).with_flags(flags, true),
+        );
+        self.touch(slot, seqno);
+        self.debug_check_cells(row, x.saturating_sub(1)..(end + 1).min(self.stride()));
+        true
+    }
+
     /// Legacy `Screen::insert_cell` (ICH and insert mode): bump the seqno,
     /// `Line::insert_cell(x, Cell::default(), right_margin)`, then truncate
     /// to `limit` (the screen width, at most `cols`) if the row grew past it.
