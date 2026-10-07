@@ -1140,6 +1140,14 @@ pub trait Pane: Downcast + Send + Sync {
         anyhow::bail!("pane does not own a guardian checkpoint publisher")
     }
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>>;
+    /// A blocking PTY reader whose descriptor can be polled, so the pane
+    /// reader can gather output into larger batches with bounded waits
+    /// (ft-yccm0.3.1.2). Panes without a native PTY return `None` and are
+    /// read through `reader`.
+    #[cfg(unix)]
+    fn gather_reader(&self) -> anyhow::Result<Option<Box<dyn portable_pty::PollablePtyReader>>> {
+        Ok(None)
+    }
     fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write>;
     /// Sends input the user typed or composed (encoded keys, IME text,
     /// inserted glyphs) to the child. A local pane queues it on its

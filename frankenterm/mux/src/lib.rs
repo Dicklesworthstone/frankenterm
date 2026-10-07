@@ -136,6 +136,8 @@ pub mod layout;
 pub mod localpane;
 pub mod pane;
 mod pane_byte_ring;
+#[cfg(unix)]
+mod pane_gather;
 pub mod render_mirror;
 pub mod renderable;
 pub mod ssh;
@@ -2232,8 +2234,29 @@ struct PreparedPaneRegistration {
 }
 
 enum PreparedPaneReader {
-    Raw(Box<dyn std::io::Read + Send>),
+    Raw(RawPaneReader),
     Guardian(Box<dyn GuardianLiveOutputReader>),
+}
+
+/// How the pane reader reads raw PTY output.
+enum RawPaneReader {
+    /// One blocking read per delivery.
+    Blocking(Box<dyn std::io::Read + Send>),
+    /// A pollable PTY: reads are gathered into batches (ft-yccm0.3.1.2).
+    #[cfg(unix)]
+    Gathering(Box<dyn portable_pty::PollablePtyReader>),
+}
+
+impl RawPaneReader {
+    fn for_pane(pane: &dyn Pane) -> anyhow::Result<Option<Self>> {
+        // A backend without a native pollable PTY falls back to blocking
+        // reads; a real failure to clone the PTY surfaces from `reader`.
+        #[cfg(unix)]
+        if let Ok(Some(reader)) = pane.gather_reader() {
+            return Ok(Some(Self::Gathering(reader)));
+        }
+        Ok(pane.reader()?.map(Self::Blocking))
+    }
 }
 
 /// Process-local, non-forgeable identity for one live registration of a pane.
@@ -2839,10 +2862,14 @@ struct LiveParserCheckpointControl {
     /// The reader's end of the pane byte ring (ft-yccm0.3.1.1). Held for a
     /// whole delivery, including a park while the ring is full.
     data_writer: Mutex<Option<pane_byte_ring::RingProducer>>,
-    /// Closes the parser's side without `data_writer`, so a dying parser
-    /// never waits behind a reader parked on a full ring.
-    data_closer: Mutex<Option<pane_byte_ring::RingCloser>>,
+    /// Ring signals without `data_writer`: a dying parser closes its side
+    /// through this, so it never waits behind a reader parked on a full
+    /// ring, and the gathering reader reads the parser's idle flag.
+    data_closer: Mutex<Option<pane_byte_ring::RingHandle>>,
     wake_writer: Mutex<Option<FileDescriptor>>,
+    /// Interrupts the reader's gather wait (ft-yccm0.3.1.2). The gathering
+    /// reader installs it; the parser writes to it before going idle.
+    gather_interrupt: Mutex<Option<FileDescriptor>>,
 }
 
 struct LiveParserDeliveryReservation<'a> {
@@ -2958,6 +2985,7 @@ impl LiveParserCheckpointControl {
             data_writer: Mutex::new(None),
             data_closer: Mutex::new(None),
             wake_writer: Mutex::new(None),
+            gather_interrupt: Mutex::new(None),
         }
     }
 
@@ -2976,7 +3004,7 @@ impl LiveParserCheckpointControl {
         if state.attached || current_data_writer.is_some() || current_wake_writer.is_some() {
             return Err(LiveParserCheckpointError::ReaderUnavailable);
         }
-        *current_data_closer = Some(data_writer.closer());
+        *current_data_closer = Some(data_writer.handle());
         *current_data_writer = Some(data_writer);
         *current_wake_writer = Some(checkpoint_wake_writer);
         state.attached = true;
@@ -2999,6 +3027,31 @@ impl LiveParserCheckpointControl {
         }
         self.data_writer.lock().take();
         self.wake_writer.lock().take();
+        self.gather_interrupt.lock().take();
+    }
+
+    /// The ring's signals, for a reader that gathers batches.
+    fn data_ring_handle(&self) -> Option<pane_byte_ring::RingHandle> {
+        self.data_closer.lock().clone()
+    }
+
+    fn install_gather_interrupt(&self, writer: FileDescriptor) {
+        *self.gather_interrupt.lock() = Some(writer);
+    }
+
+    /// Ends the reader's gather wait so the bytes it holds are published now.
+    /// Best effort: a full interrupt socket already holds a pending wake.
+    fn interrupt_reader_gather(&self) {
+        let mut writer = self.gather_interrupt.lock();
+        let Some(writer) = writer.as_mut() else {
+            return;
+        };
+        loop {
+            match writer.write(&[1_u8]) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                _ => return,
+            }
+        }
     }
 
     /// Wakes a sleeping parser for published bytes or EOF. Unlike
@@ -11537,6 +11590,11 @@ fn parse_buffered_data(
             if !rx.announce_sleep() {
                 continue;
             }
+            if rx.reader_gathering() {
+                // Bytes the reader already read are worth more now than a
+                // bigger batch later (ft-yccm0.3.1.2).
+                generation.live_parser_checkpoint.interrupt_reader_gather();
+            }
             let mut readiness = [pollfd {
                 fd: checkpoint_wake_rx.as_socket_descriptor(),
                 events: POLLIN,
@@ -11832,6 +11890,9 @@ fn parse_buffered_data(
                             // joint poll/capture path before the actions apply.
                             if rx.has_data_or_eof() || !rx.announce_sleep() {
                                 continue;
+                            }
+                            if rx.reader_gathering() {
+                                generation.live_parser_checkpoint.interrupt_reader_gather();
                             }
                             let mut pfd = [pollfd {
                                 fd: checkpoint_wake_rx.as_socket_descriptor(),
@@ -12140,38 +12201,15 @@ fn read_from_guardian_live_output(
     dead.store(true, Ordering::Release);
 }
 
-fn read_from_pane_pty(
-    pane: Weak<dyn Pane>,
-    generation: Arc<PaneRegistrationGeneration>,
-    banner: Option<String>,
-    mut reader: Box<dyn std::io::Read>,
-    dead: Arc<AtomicBool>,
-    parser_done: std::sync::mpsc::Receiver<()>,
+/// One delivery per blocking read: panes without a pollable PTY.
+fn deliver_blocking_pty_output(
+    generation: &Arc<PaneRegistrationGeneration>,
+    pane_id: PaneId,
+    mut reader: Box<dyn std::io::Read + Send>,
+    dead: &AtomicBool,
 ) {
-    let data_writer_guard = LiveParserDataWriterGuard::new(&generation.live_parser_checkpoint);
     let mut buf = vec![0; mux_socket_buffer_size()];
-
-    let pane_for_lifecycle = Weak::clone(&pane);
-    let (pane_id, exit_behavior) = match pane.upgrade() {
-        Some(pane) => (pane.pane_id(), pane.exit_behavior()),
-        None => return,
-    };
-
-    let mut delivery_failed = false;
-    if let Some(banner) = banner {
-        if let Err(err) = generation
-            .live_parser_checkpoint
-            .write_delivered_bytes(banner.as_bytes())
-        {
-            error!(
-                "read_pty failed to write banner to parser: pane {} {:?}",
-                pane_id, err
-            );
-            delivery_failed = true;
-        }
-    }
-
-    while !delivery_failed && !dead.load(Ordering::Acquire) {
+    while !dead.load(Ordering::Acquire) {
         match reader.read(&mut buf) {
             Ok(size) if size == 0 => {
                 log::trace!("read_pty EOF: pane_id {}", pane_id);
@@ -12194,6 +12232,132 @@ fn read_from_pane_pty(
                     );
                     break;
                 }
+            }
+        }
+    }
+}
+
+/// One delivery per gathered batch (ft-yccm0.3.1.2): small output goes out
+/// at once, larger bursts are gathered up to a ring slot under the bounded
+/// waits of `pane_gather`, and an idle parser cuts a gather short.
+#[cfg(unix)]
+fn deliver_gathered_pty_output(
+    generation: &Arc<PaneRegistrationGeneration>,
+    pane_id: PaneId,
+    mut reader: Box<dyn portable_pty::PollablePtyReader>,
+    dead: &AtomicBool,
+) {
+    let control = &generation.live_parser_checkpoint;
+    let Some(ring) = control.data_ring_handle() else {
+        error!("read_pty pane {} has no parser ring", pane_id);
+        return;
+    };
+    let (mut interrupt_tx, mut interrupt_rx) = match socketpair() {
+        Ok(pair) => pair,
+        Err(err) => {
+            error!(
+                "read_pty pane {} could not create its gather interrupt: {:?}",
+                pane_id, err
+            );
+            return;
+        }
+    };
+    if let Err(err) = interrupt_tx
+        .set_non_blocking(true)
+        .and_then(|()| interrupt_rx.set_non_blocking(true))
+    {
+        error!(
+            "read_pty pane {} could not make its gather interrupt nonblocking: {:?}",
+            pane_id, err
+        );
+        return;
+    }
+    control.install_gather_interrupt(interrupt_tx);
+    let (policy, slot_bytes) = {
+        let config = configuration();
+        (
+            pane_gather::GatherPolicy::from_config(&config),
+            config.mux_output_ring_slot_bytes,
+        )
+    };
+    let mut buf = vec![0; slot_bytes];
+    while !dead.load(Ordering::Acquire) {
+        let gathered = {
+            let mut source =
+                pane_gather::PtyGatherSource::new(reader.as_mut(), &mut interrupt_rx, &ring);
+            pane_gather::gather(&mut source, &policy, &mut buf)
+        };
+        let stats = match gathered {
+            Ok(stats) => stats,
+            Err(err) => {
+                error!("read_pty failed: pane {} {:?}", pane_id, err);
+                break;
+            }
+        };
+        log::trace!(
+            "read_pty pane {} gathered {} bytes in {} reads, {} waits, {:?} ({:?})",
+            pane_id,
+            stats.bytes,
+            stats.reads,
+            stats.waits,
+            stats.waited,
+            stats.stop
+        );
+        if stats.bytes > 0 {
+            histogram!("read_from_pane_pty.bytes.rate").record(stats.bytes as f64);
+            if let Err(err) = control.write_delivered_bytes(&buf[..stats.bytes]) {
+                error!(
+                    "read_pty failed to write to parser: pane {} {:?}",
+                    pane_id, err
+                );
+                break;
+            }
+        }
+        if stats.stop == pane_gather::GatherStop::Eof {
+            log::trace!("read_pty EOF: pane_id {}", pane_id);
+            break;
+        }
+    }
+}
+
+fn read_from_pane_pty(
+    pane: Weak<dyn Pane>,
+    generation: Arc<PaneRegistrationGeneration>,
+    banner: Option<String>,
+    reader: RawPaneReader,
+    dead: Arc<AtomicBool>,
+    parser_done: std::sync::mpsc::Receiver<()>,
+) {
+    let data_writer_guard = LiveParserDataWriterGuard::new(&generation.live_parser_checkpoint);
+
+    let pane_for_lifecycle = Weak::clone(&pane);
+    let (pane_id, exit_behavior) = match pane.upgrade() {
+        Some(pane) => (pane.pane_id(), pane.exit_behavior()),
+        None => return,
+    };
+
+    let mut delivery_failed = false;
+    if let Some(banner) = banner {
+        if let Err(err) = generation
+            .live_parser_checkpoint
+            .write_delivered_bytes(banner.as_bytes())
+        {
+            error!(
+                "read_pty failed to write banner to parser: pane {} {:?}",
+                pane_id, err
+            );
+            delivery_failed = true;
+        }
+    }
+
+    if !delivery_failed {
+        match reader {
+            RawPaneReader::Blocking(reader) => {
+                deliver_blocking_pty_output(&generation, pane_id, reader, &dead);
+            }
+            #[cfg(unix)]
+            RawPaneReader::Gathering(reader) => {
+                deliver_gathered_pty_output(&generation, pane_id, reader, &dead);
             }
         }
     }
@@ -16155,7 +16319,7 @@ impl Mux {
 
         let reader = match pane.guardian_live_output_reader()? {
             Some(reader) => Some(PreparedPaneReader::Guardian(reader)),
-            None => pane.reader()?.map(PreparedPaneReader::Raw),
+            None => RawPaneReader::for_pane(pane.as_ref())?.map(PreparedPaneReader::Raw),
         };
         Ok(PreparedPaneRegistration {
             pane_id,

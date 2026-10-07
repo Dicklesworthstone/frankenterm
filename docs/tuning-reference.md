@@ -400,6 +400,29 @@ current values.
 | `mux_output_ring_slots` | `8` | `2..=1024` | Slots per pane. When every slot holds unparsed output, the reader parks and stops reading the PTY, so the kernel throttles the child. |
 | `mux_output_ring_slot_bytes` | `65536` | `4096..=16777216` | Bytes per slot. One delivery fills as many slots as it needs; a slot is published as soon as its delivery ends, so small output is not held back. |
 
+On Unix the reader gathers PTY output into batches before it hands them over
+(ft-yccm0.3.1.2). A macOS PTY master returns about 1 KiB per `read` under
+load (Ghostty observes the same in `Exec.zig`), and every batch costs a ring
+publication, a parser wake and terminal-model work. So:
+
+- A first read below `mux_output_gather_min_bytes` is published at once, so
+  keypress echo never waits.
+- From that size on, the reader keeps reading what is already buffered:
+  `mux_output_gather_spin_checks` immediate checks, then polls of at most
+  `mux_output_gather_poll_us` each.
+- It publishes at a full slot, EOF, an idle parser (the parser interrupts the
+  poll before it sleeps), or after `mux_output_gather_max_wait_us` in total.
+
+The PTY descriptor stays blocking, because it shares its open file description
+with the input writer; the reader polls before every read after the first.
+
+| Key | Default | Range | What it controls |
+| --- | --- | --- | --- |
+| `mux_output_gather_min_bytes` | `1024` | `0..=1048576` | Smallest first read that starts a gather. Below it, output is published at once. |
+| `mux_output_gather_spin_checks` | `16` | `0..=1024` | Immediate readiness checks before the reader polls with a timeout. |
+| `mux_output_gather_poll_us` | `1000` | `1..=100000` | Longest single poll while gathering, in microseconds. |
+| `mux_output_gather_max_wait_us` | `3000` | `0..=100000` | Longest time one batch may gather, in microseconds. `0` turns gathering off. |
+
 **Tradeoff.** Slots times slot bytes bounds the output buffered between
 reader and parser, about 512 KiB per pane by default. The slots are
 preallocated per pane; pages the OS has not touched cost no memory until

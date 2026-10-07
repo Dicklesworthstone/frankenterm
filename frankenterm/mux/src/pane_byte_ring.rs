@@ -22,7 +22,11 @@
 //!   parser announced that it was going to sleep, so a busy pipeline makes no
 //!   syscalls at all.
 //!
-//! Both announcements are Dekker-style: each side stores its own flag, issues
+//! - While the reader gathers a batch (ft-yccm0.3.1.2) it announces it; a
+//!   parser that goes to sleep then interrupts the gather, so bytes already
+//!   read are published at once instead of after the gather's wait.
+//!
+//! Every announcement is Dekker-style: each side stores its own flag, issues
 //! a sequentially consistent fence, then re-checks the other side's state.
 //! At least one side then sees the other, so a wakeup is never lost.
 
@@ -44,6 +48,7 @@ struct PaneByteRing {
     consumer_closed: AtomicBool,
     parser_waiting: AtomicBool,
     reader_waiting: AtomicBool,
+    reader_gathering: AtomicBool,
     reader_thread: Mutex<Option<std::thread::Thread>>,
     #[cfg(test)]
     reader_parks: std::sync::atomic::AtomicUsize,
@@ -87,6 +92,7 @@ pub(crate) fn pane_byte_ring(slots: usize, slot_bytes: usize) -> (RingProducer, 
         consumer_closed: AtomicBool::new(false),
         parser_waiting: AtomicBool::new(false),
         reader_waiting: AtomicBool::new(false),
+        reader_gathering: AtomicBool::new(false),
         reader_thread: Mutex::new(None),
         #[cfg(test)]
         reader_parks: std::sync::atomic::AtomicUsize::new(0),
@@ -115,20 +121,38 @@ pub(crate) struct RingProducer {
     closed: bool,
 }
 
-/// Closes the consumer's side from any thread, without the producer.
+/// Ring signals usable from any thread without the producer: closing the
+/// parser's side, and the reader's gather announcement.
 #[derive(Clone)]
-pub(crate) struct RingCloser(Arc<PaneByteRing>);
+pub(crate) struct RingHandle(Arc<PaneByteRing>);
 
-impl RingCloser {
+impl RingHandle {
     /// The parser is gone: a parked or later write fails with BrokenPipe.
     pub(crate) fn close_consumer(&self) {
         self.0.close_consumer();
     }
+
+    /// The reader announces that it is gathering a batch. False: the parser
+    /// is already idle, so publish what was read now. Pair with `end_gather`.
+    pub(crate) fn begin_gather(&self) -> bool {
+        self.0.reader_gathering.store(true, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        !self.0.parser_waiting.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn end_gather(&self) {
+        self.0.reader_gathering.store(false, Ordering::SeqCst);
+    }
+
+    /// True while the parser sleeps for want of output.
+    pub(crate) fn parser_idle(&self) -> bool {
+        self.0.parser_waiting.load(Ordering::SeqCst)
+    }
 }
 
 impl RingProducer {
-    pub(crate) fn closer(&self) -> RingCloser {
-        RingCloser(Arc::clone(&self.ring))
+    pub(crate) fn handle(&self) -> RingHandle {
+        RingHandle(Arc::clone(&self.ring))
     }
 
     /// Publishes a prefix of `bytes` into the free slots without blocking and
@@ -280,6 +304,13 @@ impl RingConsumer {
 
     pub(crate) fn end_sleep(&self) {
         self.ring.parser_waiting.store(false, Ordering::SeqCst);
+    }
+
+    /// After a true `announce_sleep`: is the reader holding read bytes back
+    /// in a gather? If so the parser interrupts it before sleeping. Read after
+    /// the announcement's fence, it pairs with `RingHandle::begin_gather`.
+    pub(crate) fn reader_gathering(&self) -> bool {
+        self.ring.reader_gathering.load(Ordering::SeqCst)
     }
 
     /// Up to `max` unparsed bytes, in publication order. `InvalidData` means
@@ -447,6 +478,48 @@ mod tests {
         assert!(consumer.announce_sleep());
         producer.close(|| wakes.set(wakes.get() + 1));
         assert_eq!(wakes.get(), 2, "close wakes a sleeping parser for EOF");
+    }
+
+    #[test]
+    fn a_sleeping_parser_and_a_gathering_reader_see_each_other() {
+        let (producer, consumer) = pane_byte_ring(2, 4);
+        let handle = producer.handle();
+        // The reader gathers first: the parser that then sleeps sees it.
+        assert!(handle.begin_gather());
+        assert!(consumer.announce_sleep());
+        assert!(consumer.reader_gathering());
+        consumer.end_sleep();
+        handle.end_gather();
+        // The parser sleeps first: the reader that then gathers sees it.
+        assert!(consumer.announce_sleep());
+        assert!(!handle.begin_gather());
+        assert!(handle.parser_idle());
+        handle.end_gather();
+        consumer.end_sleep();
+        assert!(!handle.parser_idle());
+        assert!(!consumer.reader_gathering());
+    }
+
+    #[test]
+    fn racing_gather_and_sleep_announcements_never_miss_each_other() {
+        for _ in 0..20_000 {
+            let (producer, consumer) = pane_byte_ring(1, 1);
+            let handle = producer.handle();
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let reader_start = Arc::clone(&start);
+            let reader = std::thread::spawn(move || {
+                reader_start.wait();
+                !handle.begin_gather()
+            });
+            start.wait();
+            let parser_saw_gather = consumer.announce_sleep() && consumer.reader_gathering();
+            let reader_saw_idle = reader.join().unwrap();
+            assert!(
+                parser_saw_gather || reader_saw_idle,
+                "neither side saw the other: a gathered batch could wait out its gather"
+            );
+            drop(producer);
+        }
     }
 
     #[test]

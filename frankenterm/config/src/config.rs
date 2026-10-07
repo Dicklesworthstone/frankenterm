@@ -623,6 +623,41 @@ pub struct Config {
     )]
     pub mux_output_ring_slot_bytes: usize,
 
+    /// Pane reader gather policy (ft-yccm0.3.1.2). A first read below this
+    /// many bytes is published at once, so interactive echo never waits.
+    /// From it on the reader keeps reading what is already there. macOS
+    /// returns about 1 KiB per PTY read under load, hence the default.
+    #[dynamic(
+        default = "default_mux_output_gather_min_bytes",
+        validate = "validate_mux_output_gather_min_bytes"
+    )]
+    pub mux_output_gather_min_bytes: usize,
+
+    /// Zero-timeout readiness checks before the gathering reader starts to
+    /// poll with a timeout (ft-yccm0.3.1.2).
+    #[dynamic(
+        default = "default_mux_output_gather_spin_checks",
+        validate = "validate_mux_output_gather_spin_checks"
+    )]
+    pub mux_output_gather_spin_checks: u32,
+
+    /// Longest single poll of a gathering reader, in microseconds
+    /// (ft-yccm0.3.1.2).
+    #[dynamic(
+        default = "default_mux_output_gather_poll_us",
+        validate = "validate_mux_output_gather_poll_us"
+    )]
+    pub mux_output_gather_poll_us: u64,
+
+    /// Total time a reader may gather one batch, in microseconds; 0 turns
+    /// gathering off (ft-yccm0.3.1.2). A full ring slot, EOF or an idle
+    /// parser end the batch sooner.
+    #[dynamic(
+        default = "default_mux_output_gather_max_wait_us",
+        validate = "validate_mux_output_gather_max_wait_us"
+    )]
+    pub mux_output_gather_max_wait_us: u64,
+
     /// Maximum bytes of output to hold during synchronized rendering mode
     /// before force-flushing. Prevents unbounded memory growth from buggy
     /// apps that enter synchronized-output mode and never reset it.
@@ -2237,6 +2272,77 @@ fn validate_mux_output_ring_slots(value: &usize) -> Result<(), String> {
     }
 }
 
+pub const MUX_OUTPUT_GATHER_MIN_BYTES_RANGE: std::ops::RangeInclusive<usize> = 0..=1024 * 1024;
+pub const MUX_OUTPUT_GATHER_SPIN_CHECKS_RANGE: std::ops::RangeInclusive<u32> = 0..=1024;
+pub const MUX_OUTPUT_GATHER_POLL_US_RANGE: std::ops::RangeInclusive<u64> = 1..=100_000;
+pub const MUX_OUTPUT_GATHER_MAX_WAIT_US_RANGE: std::ops::RangeInclusive<u64> = 0..=100_000;
+
+fn default_mux_output_gather_min_bytes() -> usize {
+    1024
+}
+
+fn default_mux_output_gather_spin_checks() -> u32 {
+    16
+}
+
+fn default_mux_output_gather_poll_us() -> u64 {
+    1000
+}
+
+fn default_mux_output_gather_max_wait_us() -> u64 {
+    3000
+}
+
+fn validate_in_range<T: PartialOrd + std::fmt::Display>(
+    key: &str,
+    value: &T,
+    range: &std::ops::RangeInclusive<T>,
+) -> Result<(), String> {
+    if range.contains(value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} must be in {}..={}, got {}",
+            key,
+            range.start(),
+            range.end(),
+            value
+        ))
+    }
+}
+
+fn validate_mux_output_gather_min_bytes(value: &usize) -> Result<(), String> {
+    validate_in_range(
+        "mux_output_gather_min_bytes",
+        value,
+        &MUX_OUTPUT_GATHER_MIN_BYTES_RANGE,
+    )
+}
+
+fn validate_mux_output_gather_spin_checks(value: &u32) -> Result<(), String> {
+    validate_in_range(
+        "mux_output_gather_spin_checks",
+        value,
+        &MUX_OUTPUT_GATHER_SPIN_CHECKS_RANGE,
+    )
+}
+
+fn validate_mux_output_gather_poll_us(value: &u64) -> Result<(), String> {
+    validate_in_range(
+        "mux_output_gather_poll_us",
+        value,
+        &MUX_OUTPUT_GATHER_POLL_US_RANGE,
+    )
+}
+
+fn validate_mux_output_gather_max_wait_us(value: &u64) -> Result<(), String> {
+    validate_in_range(
+        "mux_output_gather_max_wait_us",
+        value,
+        &MUX_OUTPUT_GATHER_MAX_WAIT_US_RANGE,
+    )
+}
+
 fn validate_mux_output_ring_slot_bytes(value: &usize) -> Result<(), String> {
     if MUX_OUTPUT_RING_SLOT_BYTES_RANGE.contains(value) {
         Ok(())
@@ -3558,6 +3664,31 @@ mod tests {
         }
         assert!(validate_mux_output_ring_slots(&2).is_ok());
         assert!(validate_mux_output_ring_slot_bytes(&(16 * 1024 * 1024)).is_ok());
+    }
+
+    #[test]
+    fn mux_output_gather_keys_default_inside_their_validated_ranges() {
+        assert!(
+            validate_mux_output_gather_min_bytes(&default_mux_output_gather_min_bytes()).is_ok()
+        );
+        assert!(
+            validate_mux_output_gather_spin_checks(&default_mux_output_gather_spin_checks())
+                .is_ok()
+        );
+        assert!(validate_mux_output_gather_poll_us(&default_mux_output_gather_poll_us()).is_ok());
+        assert!(
+            validate_mux_output_gather_max_wait_us(&default_mux_output_gather_max_wait_us())
+                .is_ok()
+        );
+        assert!(validate_mux_output_gather_min_bytes(&(1024 * 1024 + 1)).is_err());
+        assert!(validate_mux_output_gather_spin_checks(&1025).is_err());
+        assert!(validate_mux_output_gather_poll_us(&0).is_err());
+        assert!(validate_mux_output_gather_poll_us(&100_001).is_err());
+        assert!(
+            validate_mux_output_gather_max_wait_us(&0).is_ok(),
+            "0 turns gathering off"
+        );
+        assert!(validate_mux_output_gather_max_wait_us(&100_001).is_err());
     }
 
     #[test]

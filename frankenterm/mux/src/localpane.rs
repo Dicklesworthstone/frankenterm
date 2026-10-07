@@ -2874,6 +2874,11 @@ impl Pane for LocalPane {
         Ok(Some(self.pty.lock().try_clone_reader()?))
     }
 
+    #[cfg(unix)]
+    fn gather_reader(&self) -> anyhow::Result<Option<Box<dyn portable_pty::PollablePtyReader>>> {
+        Ok(Some(self.pty.lock().try_clone_blocking_pollable_reader()?))
+    }
+
     fn send_paste(&self, text: &str) -> Result<(), Error> {
         record_input_for_current_identity(&self.mux_registration);
         if self.tmux_domain.lock().is_some() {
