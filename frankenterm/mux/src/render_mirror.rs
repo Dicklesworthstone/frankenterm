@@ -410,6 +410,25 @@ impl MirrorRow {
         )
     }
 
+    /// The row as a `Line` again (ft-yccm0.4.7.3): every cell's text, width
+    /// and attributes ([`Self::cell_attributes`]) set where it was. It
+    /// clusters as [`Self::clusters`] does, and takes the edits the WebGpu
+    /// renderer makes to the captured line before clustering it, such as an
+    /// IME composition overlaid at the cursor.
+    pub fn to_line(&self) -> Line {
+        let mut line = Line::new(self.seqno);
+        for cell in &self.cells {
+            line.set_cell_grapheme(
+                cell.col(),
+                self.text(cell),
+                cell.width(),
+                self.cell_attributes(cell),
+                self.seqno,
+            );
+        }
+        line
+    }
+
     /// Whether the row must be copied again although its seqno says clean.
     fn always_recapture(&self) -> bool {
         self.has_images
@@ -1654,30 +1673,44 @@ mod tests {
                 col += width;
             }
             let row = MirrorRow::from_line(0, &line, 1);
-            let ours = row.clusters();
             let theirs = line.cluster(None);
-            assert_eq!(ours.len(), theirs.len(), "{:?}", line);
-            for (ours, theirs) in ours.iter().zip(&theirs) {
-                assert_eq!(ours.text, theirs.text);
-                assert_eq!(
-                    (ours.width, ours.first_cell_idx),
-                    (theirs.width, theirs.first_cell_idx)
-                );
-                assert_eq!(ours.presentation, theirs.presentation);
-                assert_eq!(ours.direction, theirs.direction);
-                assert_eq!(ours.attrs, theirs.attrs, "{:?}", theirs.text);
-                for byte in 0..theirs.text.len() {
-                    assert_eq!(
-                        (ours.byte_to_cell_idx(byte), ours.byte_to_cell_width(byte)),
-                        (
-                            theirs.byte_to_cell_idx(byte),
-                            theirs.byte_to_cell_width(byte)
-                        )
-                    );
-                }
-            }
+            assert_same_clusters(&row.clusters(), &theirs, &line);
+            // The row made a line again clusters the same, and so does it
+            // with an IME composition overlaid, as the WebGpu renderer
+            // overlays one on the captured line.
+            assert_same_clusters(&row.to_line().cluster(None), &theirs, &line);
+            let at = rng.below(44) as usize;
+            let composing = *rng.pick(&["x", "日本", "e\u{301}a", "→ ok"]);
+            let mut composed = line.clone();
+            composed.overlay_text_with_attribute(at, composing, CellAttributes::blank(), 5);
+            let mut ours = row.to_line();
+            ours.overlay_text_with_attribute(at, composing, CellAttributes::blank(), 5);
+            assert_same_clusters(&ours.cluster(None), &composed.cluster(None), &composed);
             clusters_seen += theirs.len();
         }
         assert!(clusters_seen > 1000, "{}", clusters_seen);
+    }
+
+    fn assert_same_clusters(ours: &[CellCluster], theirs: &[CellCluster], line: &Line) {
+        assert_eq!(ours.len(), theirs.len(), "{:?}", line);
+        for (ours, theirs) in ours.iter().zip(theirs) {
+            assert_eq!(ours.text, theirs.text);
+            assert_eq!(
+                (ours.width, ours.first_cell_idx),
+                (theirs.width, theirs.first_cell_idx)
+            );
+            assert_eq!(ours.presentation, theirs.presentation);
+            assert_eq!(ours.direction, theirs.direction);
+            assert_eq!(ours.attrs, theirs.attrs, "{:?}", theirs.text);
+            for byte in 0..theirs.text.len() {
+                assert_eq!(
+                    (ours.byte_to_cell_idx(byte), ours.byte_to_cell_width(byte)),
+                    (
+                        theirs.byte_to_cell_idx(byte),
+                        theirs.byte_to_cell_width(byte)
+                    )
+                );
+            }
+        }
     }
 }

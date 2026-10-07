@@ -317,12 +317,14 @@ impl FontGlyphs {
 
     /// Places the WebGpu renderer's cursor sprite for `shape`
     /// ([`GlyphCache::cursor_sprite_image`], with the configured
-    /// `cursor_thickness`): a hollow block is its unfocused block outline.
+    /// `cursor_thickness`): a hollow block is its unfocused block outline,
+    /// and a solid one its default shape's fill (the compose cursor).
     fn place_cursor(&mut self, shape: CursorSprite, width_cells: u8) -> Option<PlacedGlyph> {
         let shape = match shape {
             CursorSprite::HollowBlock => CursorShape::SteadyBlock,
             CursorSprite::Bar => CursorShape::SteadyBar,
             CursorSprite::Underline => CursorShape::SteadyUnderline,
+            CursorSprite::Solid => CursorShape::Default,
         };
         let image =
             GlyphCache::cursor_sprite_image(&self.fonts, Some(shape), &self.metrics, width_cells);

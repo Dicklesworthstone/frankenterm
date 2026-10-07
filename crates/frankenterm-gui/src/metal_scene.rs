@@ -8,6 +8,7 @@
 //!   one they were built from);
 //! - rows whose selection span or cursor changed;
 //! - rows with hyperlinks when the hovered hyperlink changes;
+//! - rows with blinking text when the blink levels move;
 //! - every row when the style generation (palette, colors, configuration),
 //!   reverse video or the grid size changes.
 //!
@@ -26,7 +27,10 @@
 //!   ([`LineSprite`]), drawn under the row's glyphs in the underline color
 //!   (SGR 58, or else the cell's foreground before selection and cursor
 //!   colors), as the WebGpu renderer draws them;
-//! - the hovered hyperlink is underlined ([`hovered_underline`]).
+//! - the hovered hyperlink is underlined ([`hovered_underline`]);
+//! - blinking text (SGR 5 and 6), and its decorations in its color, fade
+//!   toward its background by the window's blink level ([`BlinkLevels`]),
+//!   mixed in linear light ([`mix_linear`]).
 //!
 //! The background pass draws the selection tint and the cursor itself. The
 //! caller builds its uniforms.
@@ -40,7 +44,7 @@ use frankenterm_renderer_metal::{
 use mux::render_mirror::{MirrorCell, MirrorColor, MirrorRow, RenderMirror};
 use std::ops::Range;
 use std::sync::Arc;
-use termwiz::cell::{Intensity, Underline};
+use termwiz::cell::{Blink, CellAttributes, Intensity, Underline, unicode_column_width};
 use termwiz::cellcluster::CellCluster;
 use termwiz::hyperlink::Hyperlink;
 use wezterm_term::StableRowIndex;
@@ -127,6 +131,31 @@ pub enum CursorSprite {
     Bar,
     /// A focused underline.
     Underline,
+    /// A compose cursor ([`Compose`]): the WebGpu renderer's sprite for its
+    /// default cursor shape, a solid fill across the cursor's cells, under
+    /// the glyphs.
+    Solid,
+}
+
+/// A dead key, an IME composition or the leader key active in the pane,
+/// which the WebGpu renderer draws as a compose cursor
+/// (`compute_cell_fg_bg` with `dead_key_or_leader` on the active pane): a
+/// solid block over the composition, or else over the cursor's cell, shown
+/// even where the terminal hides its cursor, with the text in it in the
+/// cursor foreground.
+#[derive(Debug, Clone, Copy)]
+pub struct Compose<'a> {
+    /// The composition (IME preedit) text, overlaid at the cursor in blank
+    /// attributes as the WebGpu renderer overlays it on the cursor's line;
+    /// `None` while a dead key is held or the leader key is active.
+    pub text: Option<&'a str>,
+    /// The block's color: `compose_cursor`, or else the cursor color.
+    pub color: SrgbaTuple,
+    /// The color of the text in the block (the cursor foreground).
+    pub fg: SrgbaTuple,
+    /// The color that text is not drawn in (the cursor color, which WebGpu
+    /// gives as the text's background there).
+    pub under: SrgbaTuple,
 }
 
 /// What a frame's colors depend on besides the cells.
@@ -156,18 +185,137 @@ pub struct SceneStyle<'a> {
     pub cursor_sprite: Option<(CursorSprite, SrgbaTuple)>,
     /// The hyperlink under the mouse, underlined wherever it appears.
     pub hover: Option<&'a Arc<Hyperlink>>,
+    /// Where blinking text is in its blink. Only the rows with blinking
+    /// text are rebuilt when it moves.
+    pub blink: BlinkLevels,
+    /// A compose cursor in place of the cursor above; `None` for none.
+    pub compose: Option<Compose<'a>>,
+}
+
+/// How visible blinking text is (ft-yccm0.4.7.3): the WebGpu renderer's
+/// `intensity_continuous` of the window's slow (SGR 5) and rapid (SGR 6)
+/// blink states, from 1.0 (shown) to 0.0 (in its background color). `None`
+/// where that blink rate is 0, which draws the text as if it did not blink.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BlinkLevels {
+    pub slow: Option<f32>,
+    pub rapid: Option<f32>,
+}
+
+impl BlinkLevels {
+    fn level(self, blink: Blink) -> Option<f32> {
+        match blink {
+            Blink::None => None,
+            Blink::Slow => self.slow,
+            Blink::Rapid => self.rapid,
+        }
+    }
+}
+
+/// The blinking text of a built row: which blinks it has, and the levels
+/// of those it was drawn at (as bits, so rows compare exactly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowBlink {
+    slow: bool,
+    rapid: bool,
+    levels: [Option<u32>; 2],
+}
+
+impl RowBlink {
+    /// The blinks `row`'s text has, `None` for none.
+    fn of(row: &MirrorRow) -> Option<Self> {
+        let has = |blink| row.cells().iter().any(|cell| cell.blink() == blink);
+        let (slow, rapid) = (has(Blink::Slow), has(Blink::Rapid));
+        (slow || rapid).then_some(Self {
+            slow,
+            rapid,
+            levels: [None, None],
+        })
+    }
+
+    /// This row's blinks at `levels`.
+    fn at(self, levels: BlinkLevels) -> Self {
+        let bits = |has: bool, level: Option<f32>| level.filter(|_| has).map(f32::to_bits);
+        Self {
+            levels: [bits(self.slow, levels.slow), bits(self.rapid, levels.rapid)],
+            ..self
+        }
+    }
+}
+
+/// `from` moved `amount` of the way to `to`, mixed in linear light as the
+/// WebGpu renderer mixes its linear colors, with `from`'s alpha.
+#[must_use]
+pub fn mix_linear(from: SrgbaTuple, to: SrgbaTuple, amount: f32) -> SrgbaTuple {
+    use frankenterm_renderer_metal::color::{linear_to_srgb, srgb_to_linear};
+    let mix = |from: f32, to: f32| {
+        let from = srgb_to_linear(from);
+        linear_to_srgb(from + (srgb_to_linear(to) - from) * amount)
+    };
+    SrgbaTuple(
+        mix(from.0, to.0),
+        mix(from.1, to.1),
+        mix(from.2, to.2),
+        from.3,
+    )
 }
 
 /// How the cursor draws on its row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RowCursor {
     col: usize,
-    /// A focused block's text color override.
+    /// The columns from `col` the cursor covers: one, or a compose cursor's
+    /// width.
+    cols: usize,
+    /// A focused block's (or compose cursor's) text color override.
     fg: Option<[u8; 4]>,
-    /// A focused block's color, which the text under it sits on.
+    /// A focused block's (or compose cursor's) color, which the text under
+    /// it sits on.
     block: Option<[u8; 4]>,
     /// Any other cursor's sprite and color.
     sprite: Option<(CursorSprite, [u8; 4])>,
+    /// A compose cursor's composition text, overlaid at `col`.
+    composing: Option<String>,
+}
+
+impl RowCursor {
+    /// The compose cursor at `col` of `row`, which covers the composition's
+    /// columns or, without one (or with one of no width), the cell at `col`,
+    /// as the WebGpu renderer's cursor range does.
+    fn compose(compose: &Compose<'_>, col: usize, row: &MirrorRow) -> Self {
+        let width = compose
+            .text
+            .map_or(0, |text| unicode_column_width(text, None));
+        let cols = if width > 0 {
+            width
+        } else {
+            row.cells()
+                .iter()
+                .find(|cell| cell.col() == col)
+                .map_or(1, |cell| cell.width().max(1))
+        };
+        Self {
+            col,
+            cols,
+            fg: Some(rgba8(compose.fg)),
+            block: Some(rgba8(compose.under)),
+            sprite: Some((CursorSprite::Solid, rgba8(compose.color))),
+            composing: compose.text.map(str::to_string),
+        }
+    }
+
+    fn covers(&self, col: usize) -> bool {
+        (self.col..self.col + self.cols).contains(&col)
+    }
+
+    /// The columns the composition text took when overlaid.
+    fn composed(&self) -> Range<usize> {
+        let width = self
+            .composing
+            .as_deref()
+            .map_or(0, |text| unicode_column_width(text, None));
+        self.col..self.col + width
+    }
 }
 
 /// What one rebuilt row was built from.
@@ -178,6 +326,9 @@ struct BuiltRow {
     selection: Range<usize>,
     /// The cursor, when it is on this row.
     cursor: Option<RowCursor>,
+    /// The row's blinking text, and the levels it was drawn at; `None` when
+    /// the row has none.
+    blink: Option<RowBlink>,
 }
 
 /// What [`MetalScene::update`] did.
@@ -265,6 +416,27 @@ fn cell_colors(cell: &MirrorCell, style: &SceneStyle<'_>, reverse_video: bool) -
     }
 }
 
+/// A line sprite's color under the selection's tint (`selection`, opaque,
+/// at alpha `tint`). The WebGpu renderer blends the tint over the sprite
+/// and the cell; tinting the sprite's color, over a cell the background
+/// pass tinted, gives the same blend in linear light:
+/// `(bg (1 - c) + u c)(1 - a) + s a` is `bg' (1 - c) + u' c` with
+/// `bg' = bg (1 - a) + s a` and `u' = u (1 - a) + s a`, for coverage `c`.
+fn selection_tinted(color: SrgbaTuple, selection: SrgbaTuple, tint: f32) -> [u8; 4] {
+    rgba8(mix_linear(color, selection, tint))
+}
+
+/// `cell`'s foreground as the WebGpu renderer draws blinking text: moved
+/// from its background toward its foreground by its blink level
+/// ([`mix_linear`]), before selection and cursor colors apply. Its
+/// decorations in the foreground color blink with it.
+fn blinked_fg(cell: &MirrorCell, colors: &CellColors, style: &SceneStyle<'_>) -> SrgbaTuple {
+    match style.blink.level(cell.blink()) {
+        Some(level) => mix_linear(colors.bg, colors.fg, level),
+        None => colors.fg,
+    }
+}
+
 /// The color `cell`'s text is drawn in, or `None` where it draws no glyph:
 /// invisible text, or text in the color it sits on. As in the WebGpu
 /// renderer (compute_cell_fg_bg), that is the selection's background for
@@ -278,7 +450,7 @@ fn text_color(
 ) -> Option<[u8; 4]> {
     let colors = cell_colors(cell, style, reverse_video);
     let col = cell.col();
-    let mut fg = colors.fg;
+    let mut fg = blinked_fg(cell, &colors, style);
     let mut under = colors.bg;
     if built.selection.contains(&col) {
         if let Some(selection_fg) = style.selection_fg {
@@ -287,8 +459,8 @@ fn text_color(
         under = style.selection_bg;
     }
     let (mut fg, mut under) = (rgba8(fg), rgba8(under));
-    if let Some(cursor) = built.cursor {
-        if cursor.col == col {
+    if let Some(cursor) = &built.cursor {
+        if cursor.covers(col) {
             if let Some(cursor_fg) = cursor.fg {
                 fg = cursor_fg;
             }
@@ -417,22 +589,38 @@ impl MetalScene {
         }
         let hover_changed = !same_link(self.hover.as_ref(), style.hover);
         let cursor = mirror.cursor();
-        let cursor_row = (cursor.visibility == termwiz::surface::CursorVisibility::Visible)
-            .then(|| cursor.y - mirror.first())
-            .and_then(|row| usize::try_from(row).ok());
+        // A compose cursor shows even where the terminal hides its cursor.
+        let cursor_row = (cursor.visibility == termwiz::surface::CursorVisibility::Visible
+            || style.compose.is_some())
+        .then(|| cursor.y - mirror.first())
+        .and_then(|row| usize::try_from(row).ok());
         for (row, mirror_row) in rows.iter().enumerate() {
+            let previous = &self.built[row];
+            let same_cells = previous.stable == Some(mirror_row.stable())
+                && previous.generation == mirror_row.generation();
             let wanted = BuiltRow {
                 stable: Some(mirror_row.stable()),
                 generation: mirror_row.generation(),
                 selection: selection(mirror_row.stable()),
-                cursor: (cursor_row == Some(row)).then(|| RowCursor {
-                    col: cursor.x,
-                    fg: style.cursor_fg.map(rgba8),
-                    block: style.cursor_bg.map(rgba8),
-                    sprite: style
-                        .cursor_sprite
-                        .map(|(shape, color)| (shape, rgba8(color))),
+                cursor: (cursor_row == Some(row)).then(|| match &style.compose {
+                    Some(compose) => RowCursor::compose(compose, cursor.x, mirror_row),
+                    None => RowCursor {
+                        col: cursor.x,
+                        cols: 1,
+                        fg: style.cursor_fg.map(rgba8),
+                        block: style.cursor_bg.map(rgba8),
+                        sprite: style
+                            .cursor_sprite
+                            .map(|(shape, color)| (shape, rgba8(color))),
+                        composing: None,
+                    },
                 }),
+                // Unchanged cells with blinking text want the current levels;
+                // changed cells are rebuilt anyway.
+                blink: previous
+                    .blink
+                    .filter(|_| same_cells)
+                    .map(|blink| blink.at(style.blink)),
             };
             let hovered = hover_changed
                 && mirror_row
@@ -452,7 +640,10 @@ impl MetalScene {
                     dimensions.reverse_video,
                     glyphs,
                 );
-                self.built[row] = wanted;
+                self.built[row] = BuiltRow {
+                    blink: RowBlink::of(mirror_row).map(|blink| blink.at(style.blink)),
+                    ..wanted
+                };
                 update.rows_rebuilt += 1;
             }
         }
@@ -481,7 +672,12 @@ impl MetalScene {
         // Decorations first: the WebGpu renderer draws its line sprites, one
         // per cell, in the layer under every glyph, in the underline color
         // whatever the selection or cursor do to the text, and also under
-        // invisible text.
+        // invisible text. It draws the selection's tint over them, where the
+        // background pass draws it under them here, so a selected column's
+        // sprite takes the tint in its color: the same blend in linear light
+        // ([`selection_tinted`]).
+        let SrgbaTuple(red, green, blue, tint) = style.selection_bg;
+        let selection_opaque = SrgbaTuple(red, green, blue, 1.0);
         for cell in mirror_row.cells() {
             let hovered = style
                 .hover
@@ -502,11 +698,19 @@ impl MetalScene {
                 continue;
             };
             let color = match cell.underline_color() {
-                MirrorColor::Default => rgba8(cell_colors(cell, style, reverse_video).fg),
-                color => rgba8(style.palette.resolve_fg(color.to_attribute())),
+                MirrorColor::Default => {
+                    let colors = cell_colors(cell, style, reverse_video);
+                    blinked_fg(cell, &colors, style)
+                }
+                color => style.palette.resolve_fg(color.to_attribute()),
             };
             let end = (cell.col() + cell.width().max(1)).min(cols as usize);
             for col in cell.col()..end {
+                let color = if built.selection.contains(&col) {
+                    selection_tinted(color, selection_opaque, tint)
+                } else {
+                    rgba8(color)
+                };
                 let instance =
                     CellText::new(col as u16, color).with_glyph(&sprite.slot, sprite.offset);
                 self.text.push(grid_row, instance);
@@ -515,13 +719,19 @@ impl MetalScene {
         // A cursor sprite: a hollow block or an underline goes after the
         // decorations (the WebGpu renderer's layer 0), a bar after the glyphs
         // (its layer 2).
-        let cursor_sprite = built.cursor.and_then(|cursor| {
+        let cursor_sprite = built.cursor.as_ref().and_then(|cursor| {
             let (shape, color) = cursor.sprite?;
-            let width = mirror_row
-                .cells()
-                .iter()
-                .find(|cell| (cell.col()..cell.col() + cell.width().max(1)).contains(&cursor.col))
-                .map_or(1, |cell| cell.width().clamp(1, 2));
+            let width = if shape == CursorSprite::Solid {
+                cursor.cols.clamp(1, usize::from(u8::MAX))
+            } else {
+                mirror_row
+                    .cells()
+                    .iter()
+                    .find(|cell| {
+                        (cell.col()..cell.col() + cell.width().max(1)).contains(&cursor.col)
+                    })
+                    .map_or(1, |cell| cell.width().clamp(1, 2))
+            };
             let sprite = glyphs.cursor_sprite(shape, width as u8)?;
             let instance =
                 CellText::new(cursor.col as u16, color).with_glyph(&sprite.slot, sprite.offset);
@@ -545,18 +755,46 @@ impl MetalScene {
         }
         // Glyphs: the row's clusters, made and shaped as the WebGpu renderer
         // makes and shapes them (ft-yccm0.4.7.3). Each glyph takes the
-        // colors of the cell it starts in.
+        // colors of the cell it starts in. A composition is overlaid on the
+        // cursor's line before clustering, as WebGpu overlays it, and its
+        // glyphs take the compose cursor's text color.
         let cells = mirror_row.cells();
-        for shaped in glyphs.shape_row(&mirror_row.clusters()) {
+        let composing = built
+            .cursor
+            .as_ref()
+            .and_then(|cursor| Some((cursor, cursor.composing.as_deref()?)));
+        let clusters = match composing {
+            Some((cursor, text)) => {
+                let mut line = mirror_row.to_line();
+                line.overlay_text_with_attribute(
+                    cursor.col,
+                    text,
+                    CellAttributes::blank(),
+                    mirror_row.seqno(),
+                );
+                line.cluster(None)
+            }
+            None => mirror_row.clusters(),
+        };
+        let composed = composing.map_or(0..0, |(cursor, _)| cursor.composed());
+        for shaped in glyphs.shape_row(&clusters) {
             let col = shaped.cell;
             if col >= cols as usize {
                 break;
             }
-            let index = cells.partition_point(|cell| cell.col() + cell.width().max(1) <= col);
-            let Some(cell) = cells.get(index) else {
-                continue;
+            let fg = match composing {
+                Some((cursor, _)) if composed.contains(&col) => {
+                    cursor.fg.filter(|fg| Some(*fg) != cursor.block)
+                }
+                _ => {
+                    let index =
+                        cells.partition_point(|cell| cell.col() + cell.width().max(1) <= col);
+                    cells
+                        .get(index)
+                        .and_then(|cell| text_color(cell, style, built, reverse_video))
+                }
             };
-            let Some(fg) = text_color(cell, style, built, reverse_video) else {
+            let Some(fg) = fg else {
                 continue;
             };
             let fg = adjust_brightness(fg, shaped.brightness);
@@ -883,6 +1121,9 @@ mod tests {
         "58;5;46",
         "39",
         "49",
+        "5",
+        "6",
+        "25",
     ];
 
     fn random_output(rng: &mut Rng, rows: usize, cols: usize) -> Vec<u8> {
@@ -984,6 +1225,20 @@ mod tests {
                     Some((CursorSprite::Underline, palette.cursor_bg)),
                 ]),
                 hover,
+                // Blink levels moving between frames, so rows of blinking
+                // text are rebuilt exactly when theirs changes.
+                blink: BlinkLevels {
+                    slow: *rng.pick(&[None, Some(1.0), Some(0.5), Some(0.0)]),
+                    rapid: *rng.pick(&[None, Some(1.0), Some(0.25)]),
+                },
+                // Compositions coming, changing and going, wide and narrow,
+                // and the leader key's cursor without one.
+                compose: (rng.below(4) == 0).then(|| Compose {
+                    text: *rng.pick(&[None, Some("x"), Some("日本"), Some("e\u{301}")]),
+                    color: palette.cursor_bg,
+                    fg: *rng.pick(&[palette.cursor_fg, palette.cursor_bg]),
+                    under: palette.cursor_bg,
+                }),
             };
             let top = mirror.first() + rng.below(rows as u64) as StableRowIndex;
             let bottom = top + rng.below(3) as StableRowIndex;
@@ -1039,6 +1294,8 @@ mod tests {
             cursor_bg: None,
             cursor_sprite: None,
             hover: None,
+            blink: BlinkLevels::default(),
+            compose: None,
         }
     }
 
@@ -1445,6 +1702,264 @@ mod tests {
         assert!(scene.text().row(0).any(|instance| instance.col() == 2));
     }
 
+    /// ft-yccm0.4.7.3: the WebGpu renderer draws the selection's tint over
+    /// decorations, so a selected column's line sprite carries the tint in
+    /// its color; an unselected one keeps the underline color.
+    #[test]
+    fn selected_decorations_carry_the_selection_tint() {
+        let palette = ColorPalette::default();
+        let mut term = terminal(2, 10);
+        term.advance_bytes(b"\x1b[4mabcd\x1b[24m\x1b[?25l");
+        let mut mirror = RenderMirror::new();
+        let mut scene = MetalScene::new();
+        let mut glyphs = SyntheticGlyphs::default();
+        let request = CaptureRequest {
+            viewport_top: None,
+            rules: &[],
+            rules_generation: 0,
+        };
+        capture_terminal_rows(&mut term, &mut mirror, &request).expect("resident");
+        let first = mirror.first();
+        let selection = move |stable: StableRowIndex| {
+            if stable == first { 1..3 } else { 0..0 }
+        };
+        let style = plain_style(&palette);
+        scene.update(&mirror, &style, &selection, &mut glyphs);
+        let lines: Vec<(u16, [u8; 4])> = scene
+            .text()
+            .row(0)
+            .filter(|instance| instance.atlas_origin()[1] >= 1536)
+            .map(|instance| (instance.col(), instance.fg()))
+            .collect();
+        let SrgbaTuple(red, green, blue, alpha) = palette.selection_bg;
+        assert!(alpha > 0.0 && alpha < 1.0);
+        let tinted = rgba8(mix_linear(
+            palette.foreground,
+            SrgbaTuple(red, green, blue, 1.0),
+            alpha,
+        ));
+        let fg = rgba8(palette.foreground);
+        assert_ne!(tinted, fg);
+        assert_eq!(lines, [(0, fg), (1, tinted), (2, tinted), (3, fg)]);
+    }
+
+    /// The blink mix is in linear light, as on the WebGpu path: halfway from
+    /// black to white is sRGB 188, not 128. The alpha is the background's.
+    #[test]
+    fn blink_mixes_in_linear_light() {
+        let black = SrgbaTuple(0.0, 0.0, 0.0, 1.0);
+        let white = SrgbaTuple(1.0, 1.0, 1.0, 0.5);
+        assert_eq!(rgba8(mix_linear(black, white, 0.5)), [188, 188, 188, 255]);
+        assert_eq!(rgba8(mix_linear(black, white, 0.0)), [0, 0, 0, 255]);
+        assert_eq!(rgba8(mix_linear(black, white, 1.0)), [255, 255, 255, 255]);
+    }
+
+    /// ft-yccm0.4.7.3: slow (SGR 5) and rapid (SGR 6) blinking text, and its
+    /// underline, are drawn at their blink level's mix of foreground and
+    /// background; at level 0 the glyphs are hidden like any text in the
+    /// color it sits on. A moving level rebuilds only the rows with that
+    /// kind of blinking text.
+    #[test]
+    fn blinking_text_fades_by_its_level_and_rebuilds_only_its_rows() {
+        let palette = ColorPalette::default();
+        let mut term = terminal(3, 10);
+        term.advance_bytes(b"\x1b[5;4mab\x1b[25;24m cd\r\n\x1b[6mxy\x1b[25m\r\nplain");
+        let mut mirror = RenderMirror::new();
+        let mut scene = MetalScene::new();
+        let mut glyphs = SyntheticGlyphs::default();
+        let levels = |slow, rapid| SceneStyle {
+            blink: BlinkLevels { slow, rapid },
+            ..plain_style(&palette)
+        };
+        // Line sprites have the made-up slots from 4096 on, far below the
+        // glyphs' in the synthetic atlas.
+        let split = |scene: &MetalScene, row: u32| {
+            let (lines, glyphs): (Vec<CellText>, Vec<CellText>) = scene
+                .text()
+                .row(row)
+                .partition(|instance| instance.atlas_origin()[1] >= 1536);
+            let colors = |instances: Vec<CellText>| -> Vec<(u16, [u8; 4])> {
+                instances
+                    .iter()
+                    .map(|instance| (instance.col(), instance.fg()))
+                    .collect()
+            };
+            (colors(glyphs), colors(lines))
+        };
+        let fg = rgba8(palette.foreground);
+        let at = |level: f32| rgba8(mix_linear(palette.background, palette.foreground, level));
+
+        // Blinking off: drawn as plain text.
+        step(
+            &mut term,
+            &mut mirror,
+            &mut scene,
+            &mut glyphs,
+            &no_selection,
+            &levels(None, None),
+        );
+        assert_eq!(
+            split(&scene, 0),
+            (
+                vec![(0, fg), (1, fg), (3, fg), (4, fg)],
+                vec![(0, fg), (1, fg)]
+            )
+        );
+
+        // Halfway through a slow blink: only row 0 changes.
+        let update = scene.update(
+            &mirror,
+            &levels(Some(0.5), None),
+            &no_selection,
+            &mut glyphs,
+        );
+        assert_eq!((update.full, update.rows_rebuilt), (false, 1));
+        assert_ne!(at(0.5), fg);
+        assert_eq!(
+            split(&scene, 0),
+            (
+                vec![(0, at(0.5)), (1, at(0.5)), (3, fg), (4, fg)],
+                vec![(0, at(0.5)), (1, at(0.5))]
+            )
+        );
+
+        // Fully faded: the glyphs are hidden; the underline is in the
+        // background color.
+        scene.update(
+            &mirror,
+            &levels(Some(0.0), None),
+            &no_selection,
+            &mut glyphs,
+        );
+        assert_eq!(at(0.0), rgba8(palette.background));
+        assert_eq!(
+            split(&scene, 0),
+            (vec![(3, fg), (4, fg)], vec![(0, at(0.0)), (1, at(0.0))])
+        );
+
+        // The rapid level moves row 1 alone; the same levels rebuild nothing.
+        let update = scene.update(
+            &mirror,
+            &levels(Some(0.0), Some(0.25)),
+            &no_selection,
+            &mut glyphs,
+        );
+        assert_eq!((update.full, update.rows_rebuilt), (false, 1));
+        assert_eq!(split(&scene, 1).0, vec![(0, at(0.25)), (1, at(0.25))]);
+        let update = scene.update(
+            &mirror,
+            &levels(Some(0.0), Some(0.25)),
+            &no_selection,
+            &mut glyphs,
+        );
+        assert_eq!(update.rows_rebuilt, 0);
+        assert_eq!(split(&scene, 2).0.len(), 5);
+    }
+
+    /// ft-yccm0.4.7.3: an IME composition is overlaid at the cursor in blank
+    /// attributes before the row is clustered, as on the WebGpu path, under
+    /// a solid compose cursor as wide as the composition, with its text in
+    /// the cursor foreground. The terminal hiding its cursor does not hide
+    /// a compose cursor. Without a composition (the leader key) the cursor
+    /// covers its cell. Only the cursor's row is rebuilt as it changes.
+    #[test]
+    fn a_composition_is_overlaid_at_the_cursor_under_a_solid_compose_cursor() {
+        let palette = ColorPalette::default();
+        let mut term = terminal(2, 12);
+        // The cursor is on "c", and hidden.
+        term.advance_bytes(b"ab\x1b[4mcdefgh\x1b[24m\r\nxyz\x1b[1;3H\x1b[?25l");
+        let mut mirror = RenderMirror::new();
+        let mut scene = MetalScene::new();
+        let mut glyphs = SyntheticGlyphs::default();
+        let (fg, compose_fg) = (rgba8(palette.foreground), [10, 20, 30, 255]);
+        let compose_color = SrgbaTuple(0.9, 0.3, 0.6, 1.0);
+        let composing = |text| SceneStyle {
+            compose: Some(Compose {
+                text,
+                color: compose_color,
+                fg: SrgbaTuple(10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0, 1.0),
+                under: palette.cursor_bg,
+            }),
+            ..plain_style(&palette)
+        };
+        // Cursor sprites have the made-up slots from 8192 on, and line
+        // sprites those from 4096.
+        let kinds = |scene: &MetalScene| -> Vec<(char, u16, [u8; 4])> {
+            scene
+                .text()
+                .row(0)
+                .map(|instance| {
+                    let kind = match instance.atlas_origin()[1] {
+                        3072.. => 'c',
+                        1536.. => 'l',
+                        _ => 'g',
+                    };
+                    (kind, instance.col(), instance.fg())
+                })
+                .collect()
+        };
+
+        step(
+            &mut term,
+            &mut mirror,
+            &mut scene,
+            &mut glyphs,
+            &no_selection,
+            &composing(Some("日本")),
+        );
+        let underline: Vec<_> = (2..8).map(|col| ('l', col, fg)).collect();
+        let mut expected = underline.clone();
+        expected.push(('c', 2, rgba8(compose_color)));
+        expected.extend([
+            ('g', 0, fg),
+            ('g', 1, fg),
+            ('g', 2, compose_fg),
+            ('g', 4, compose_fg),
+            ('g', 6, fg),
+            ('g', 7, fg),
+        ]);
+        assert_eq!(kinds(&scene), expected);
+        // The compose cursor is the solid sprite four cells wide.
+        assert!(glyphs.cursors.contains_key(&(CursorSprite::Solid, 4)));
+        assert!(glyphs.slots.contains_key(&("日".to_string(), (0, false))));
+
+        // A new composition rebuilds the cursor's row alone.
+        let update = scene.update(&mirror, &composing(Some("x")), &no_selection, &mut glyphs);
+        assert_eq!((update.full, update.rows_rebuilt), (false, 1));
+        let mut expected = underline.clone();
+        expected.push(('c', 2, rgba8(compose_color)));
+        expected.extend([
+            ('g', 0, fg),
+            ('g', 1, fg),
+            ('g', 2, compose_fg),
+            ('g', 3, fg),
+            ('g', 4, fg),
+            ('g', 5, fg),
+            ('g', 6, fg),
+            ('g', 7, fg),
+        ]);
+        assert_eq!(kinds(&scene), expected);
+
+        // The leader key: no composition, the cursor covers "c", which is
+        // drawn in the cursor foreground.
+        scene.update(&mirror, &composing(None), &no_selection, &mut glyphs);
+        let row = kinds(&scene);
+        assert!(row.contains(&('c', 2, rgba8(compose_color))));
+        assert!(row.contains(&('g', 2, compose_fg)));
+        assert!(row.contains(&('g', 3, fg)));
+        assert!(glyphs.cursors.contains_key(&(CursorSprite::Solid, 1)));
+
+        // No compose state: the hidden cursor draws nothing, and the row is
+        // as the terminal has it.
+        let update = scene.update(&mirror, &plain_style(&palette), &no_selection, &mut glyphs);
+        assert_eq!(update.rows_rebuilt, 1);
+        assert!(
+            kinds(&scene)
+                .iter()
+                .all(|(kind, _, color)| *kind != 'c' && *color == fg)
+        );
+    }
+
     /// Exact readback (ft-yccm0.4.4): incremental frames and frames built
     /// from full line copies render to identical pixels on the real Metal
     /// pipeline, and a planted missed row renders differently.
@@ -1610,6 +2125,8 @@ mod tests {
                 // A cursor sprite through the real pipeline (ft-yccm0.4.7.3).
                 cursor_sprite: Some((CursorSprite::HollowBlock, SrgbaTuple(0.9, 0.5, 0.1, 1.0))),
                 hover: None,
+                blink: BlinkLevels::default(),
+                compose: None,
             };
             let request = CaptureRequest {
                 viewport_top: None,

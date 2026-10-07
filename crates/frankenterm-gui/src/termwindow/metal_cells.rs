@@ -20,7 +20,7 @@ use crate::termwindow::metal_glyphs::{FontGlyphs, MAX_SHAPE_PASSES};
 use crate::utilsprites::RenderMetrics;
 use config::ConfigHandle;
 use frankenterm_font::FontConfiguration;
-use frankenterm_gui::metal_scene::{CursorSprite, MetalScene, SceneStyle};
+use frankenterm_gui::metal_scene::{BlinkLevels, CursorSprite, MetalScene, SceneStyle};
 use frankenterm_renderer_metal::{
     BackgroundUniforms, CursorShape as MetalCursorShape, CursorUniform, MetalRenderer, TextUniforms,
 };
@@ -211,6 +211,11 @@ impl MetalFrame {
             cursor_bg: block_cursor.then_some(palette.cursor_bg),
             cursor_sprite: cursor_sprite(metal_shape).map(|sprite| (sprite, cursor_color)),
             hover: inputs.hover.as_ref(),
+            // The window's blink levels and compose state are not passed to
+            // the frame yet, so blinking text draws as plain text and no
+            // compose cursor is drawn (ft-yccm0.4.7.3).
+            blink: BlinkLevels::default(),
+            compose: None,
         };
         let mut update = frame
             .scene
