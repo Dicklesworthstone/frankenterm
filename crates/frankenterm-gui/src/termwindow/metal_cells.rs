@@ -16,7 +16,7 @@
 //! (ft-yccm0.4.1.2) with that thread's own fonts.
 
 use crate::selection::SelectionRange;
-use crate::termwindow::metal_glyphs::FontGlyphs;
+use crate::termwindow::metal_glyphs::{FontGlyphs, MAX_SHAPE_PASSES};
 use crate::utilsprites::RenderMetrics;
 use config::ConfigHandle;
 use frankenterm_font::FontConfiguration;
@@ -212,9 +212,20 @@ impl MetalFrame {
             cursor_sprite: cursor_sprite(metal_shape).map(|sprite| (sprite, cursor_color)),
             hover: inputs.hover.as_ref(),
         };
-        let update = frame
+        let mut update = frame
             .scene
             .update(&frame.mirror, &style, &selected, &mut frame.glyphs);
+        // ft-yccm0.4.7.3: a fallback font installed while shaping leaves the
+        // clusters shaped before it stale. Rebuild the scene against the grown
+        // chain, as the WebGpu renderer re-runs its paint pass.
+        let mut passes = 1;
+        while frame.glyphs.take_chain_changed() && passes < MAX_SHAPE_PASSES {
+            frame.scene.invalidate();
+            update = frame
+                .scene
+                .update(&frame.mirror, &style, &selected, &mut frame.glyphs);
+            passes += 1;
+        }
         metrics::histogram!("gui.metal.scene.rows_rebuilt").record(update.rows_rebuilt as f64);
 
         let rows = frame.mirror.rows();

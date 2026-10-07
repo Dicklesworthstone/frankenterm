@@ -195,6 +195,22 @@ fn monochrome_glyph_feature_atlas_key(font_id: LoadedFontId, glyph_id: u32) -> u
     )
 }
 
+/// A glyph laid out for its cells, before it is placed in an atlas
+/// ([`GlyphCache::lay_out_glyph`], ft-yccm0.4.7.3): the same fields as
+/// [`CachedGlyph`], with the scaled bitmap instead of a sprite. `image` is
+/// `None` for inkless glyphs, including ligature carriers.
+pub(crate) struct GlyphLayout {
+    pub has_color: bool,
+    pub brightness_adjust: f32,
+    pub x_offset: PixelLength,
+    pub y_offset: PixelLength,
+    pub x_advance: PixelLength,
+    pub bearing_x: PixelLength,
+    pub bearing_y: PixelLength,
+    pub image: Option<Image>,
+    pub scale: f64,
+}
+
 /// Caches a rendered glyph.
 /// The image data may be None for inkless glyphs, including ligature carriers.
 pub struct CachedGlyph {
@@ -2007,7 +2023,6 @@ impl GlyphCache {
     }
 
     /// Perform the load and render of a glyph
-    #[allow(clippy::float_cmp)]
     fn load_glyph(
         &mut self,
         info: &GlyphInfo,
@@ -2015,6 +2030,48 @@ impl GlyphCache {
         followed_by_space: bool,
         num_cells: u8,
     ) -> anyhow::Result<Rc<CachedGlyph>> {
+        let layout = Self::lay_out_glyph(
+            &self.fonts.config(),
+            info,
+            font,
+            followed_by_space,
+            num_cells,
+        )?;
+        let texture = match &layout.image {
+            Some(image) => Some(self.atlas.allocate(image)?),
+            None => None,
+        };
+        let glyph = CachedGlyph {
+            brightness_adjust: layout.brightness_adjust,
+            has_color: layout.has_color,
+            texture,
+            x_offset: layout.x_offset,
+            y_offset: layout.y_offset,
+            x_advance: layout.x_advance,
+            bearing_x: layout.bearing_x,
+            bearing_y: layout.bearing_y,
+            scale: layout.scale,
+        };
+        if info.font_idx != 0 && glyph.texture.is_some() {
+            // It's generally interesting to examine eg: emoji or ligatures
+            // that we might have fallen back to
+            log::trace!("{:?} {:?}", info, glyph);
+        }
+        Ok(Rc::new(glyph))
+    }
+
+    /// What [`Self::load_glyph`] computes before the atlas: the rasterized
+    /// glyph scaled to fit its cells, with its offsets, advance and bearings.
+    /// The Metal renderer lays its glyphs out with this same function, so
+    /// both renderers place every glyph identically (ft-yccm0.4.7.3).
+    #[allow(clippy::float_cmp)]
+    pub(crate) fn lay_out_glyph(
+        config: &ConfigHandle,
+        info: &GlyphInfo,
+        font: &Rc<LoadedFont>,
+        followed_by_space: bool,
+        num_cells: u8,
+    ) -> anyhow::Result<GlyphLayout> {
         let base_metrics;
         let idx_metrics;
         let brightness_adjust;
@@ -2036,7 +2093,7 @@ impl GlyphCache {
         let is_square_or_wide = aspect >= 0.7;
 
         let allow_width_overflow = if is_square_or_wide {
-            match self.fonts.config().allow_square_glyphs_to_overflow_width {
+            match config.allow_square_glyphs_to_overflow_width {
                 AllowSquareGlyphOverflow::Never => false,
                 AllowSquareGlyphOverflow::Always => true,
                 AllowSquareGlyphOverflow::WhenFollowedBySpace => followed_by_space,
@@ -2131,10 +2188,10 @@ impl GlyphCache {
         let glyph = if glyph.width == 0 || glyph.height == 0 {
             // An inkless glyph, such as whitespace or a contextual-ligature
             // carrier. Preserve its advance without allocating an empty sprite.
-            CachedGlyph {
+            GlyphLayout {
                 brightness_adjust: 1.0,
                 has_color: glyph.has_color,
-                texture: None,
+                image: None,
                 x_offset: info.x_offset * scale,
                 y_offset: info.y_offset * scale,
                 x_advance: info.x_advance * scale,
@@ -2180,30 +2237,20 @@ impl GlyphCache {
                 (scale, raw_im)
             };
 
-            let tex = self.atlas.allocate(&raw_im)?;
-
-            let g = CachedGlyph {
+            GlyphLayout {
                 brightness_adjust,
                 has_color: glyph.has_color,
-                texture: Some(tex),
+                image: Some(raw_im),
                 x_offset,
                 y_offset,
                 x_advance,
                 bearing_x,
                 bearing_y,
                 scale,
-            };
-
-            if info.font_idx != 0 {
-                // It's generally interesting to examine eg: emoji or ligatures
-                // that we might have fallen back to
-                log::trace!("{:?} {:?}", info, g);
             }
-
-            g
         };
 
-        Ok(Rc::new(glyph))
+        Ok(glyph)
     }
 
     fn cached_image_impl(

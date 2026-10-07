@@ -4900,20 +4900,9 @@ impl BlockKey {
 }
 
 impl GlyphCache {
-    fn draw_polys(
-        &mut self,
-        metrics: &RenderMetrics,
-        polys: &[Poly],
-        buffer: &mut Image,
-        aa: PolyAA,
-        blend_mode: BlendMode,
-    ) {
-        Self::paint_polys(metrics, polys, buffer, aa, blend_mode);
-    }
-
-    /// [`Self::draw_polys`] without the cache: it needs only the metrics,
-    /// so the Metal renderer's glyph source can paint the same sprites
-    /// (ft-yccm0.4.7.3).
+    /// Paints `polys` into `buffer`. It needs only the metrics, not the
+    /// cache, so the Metal renderer's glyph source paints the same cursor
+    /// and block sprites (ft-yccm0.4.7.3).
     fn paint_polys(
         metrics: &RenderMetrics,
         polys: &[Poly],
@@ -5060,6 +5049,23 @@ impl GlyphCache {
         render_metrics: &RenderMetrics,
         key: SizedBlockKey,
     ) -> anyhow::Result<Sprite> {
+        let buffer = Self::block_sprite_image(render_metrics, key.block);
+        let sprite = self.atlas.allocate(&buffer)?;
+        self.block_glyphs.insert(key, sprite.clone());
+        Ok(sprite)
+    }
+
+    /// The bitmap of the custom glyph `block` (box drawing, block elements,
+    /// powerline and the like) for a cell of `render_metrics`: white (the
+    /// alpha is the coverage) over transparent black. The WebGpu renderer
+    /// allocates it in its atlas; the Metal renderer places the same pixels in
+    /// its grayscale atlas, so lines connect across cells identically on both
+    /// (ft-yccm0.4.7.3).
+    pub(crate) fn block_sprite_image(render_metrics: &RenderMetrics, block: BlockKey) -> Image {
+        let key = SizedBlockKey {
+            block,
+            size: render_metrics.into(),
+        };
         let metrics = match &key.block {
             BlockKey::PolyWithCustomMetrics {
                 underline_height,
@@ -5145,7 +5151,7 @@ impl GlyphCache {
             }
             BlockKey::Triangles(triangles, alpha) => {
                 let mut draw = |cmd: &'static [PolyCommand], style: PolyStyle| {
-                    self.draw_polys(
+                    Self::paint_polys(
                         &metrics,
                         &[Poly {
                             path: cmd,
@@ -5228,7 +5234,7 @@ impl GlyphCache {
             }
             BlockKey::CellDiagonals(diagonals) => {
                 let mut draw = |cmd: &'static [PolyCommand]| {
-                    self.draw_polys(
+                    Self::paint_polys(
                         &metrics,
                         &[Poly {
                             path: cmd,
@@ -5377,7 +5383,7 @@ impl GlyphCache {
             }
             BlockKey::Progress(chunks) => {
                 let mut draw = |cmd: &'static [PolyCommand], style: PolyStyle| {
-                    self.draw_polys(
+                    Self::paint_polys(
                         &metrics,
                         &[Poly {
                             path: cmd,
@@ -5509,7 +5515,7 @@ impl GlyphCache {
             BlockKey::Branches(pattern) => {
                 let mut draw =
                     |cmd: &'static [PolyCommand], style: PolyStyle, blend_mode: BlendMode| {
-                        self.draw_polys(
+                        Self::paint_polys(
                             &metrics,
                             &[Poly {
                                 path: cmd,
@@ -5678,7 +5684,7 @@ impl GlyphCache {
             BlockKey::Spinner(segment) => {
                 let mut draw =
                     |cmd: &'static [PolyCommand], style: PolyStyle, blend_mode: BlendMode| {
-                        self.draw_polys(
+                        Self::paint_polys(
                             &metrics,
                             &[Poly {
                                 path: cmd,
@@ -5898,7 +5904,7 @@ impl GlyphCache {
                 }
             }
             BlockKey::Poly(polys) | BlockKey::PolyWithCustomMetrics { polys, .. } => {
-                self.draw_polys(
+                Self::paint_polys(
                     &metrics,
                     polys,
                     &mut buffer,
@@ -5917,9 +5923,7 @@ impl GlyphCache {
         buffer.log_bits();
         */
 
-        let sprite = self.atlas.allocate(&buffer)?;
-        self.block_glyphs.insert(key, sprite.clone());
-        Ok(sprite)
+        buffer
     }
 }
 

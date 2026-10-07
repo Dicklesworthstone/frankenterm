@@ -35,23 +35,16 @@
 //! renderer's atlases, or a synthetic source in tests.
 
 use frankenterm_renderer_metal::{
-    AtlasSlot, CellBg, CellBgGrid, CellText, CellTextGrid, GridExtent,
+    AtlasSlot, CellBg, CellBgGrid, CellText, CellTextGrid, GridExtent, apply_hsb,
 };
 use mux::render_mirror::{MirrorCell, MirrorColor, MirrorRow, RenderMirror};
 use std::ops::Range;
 use std::sync::Arc;
 use termwiz::cell::{Intensity, Underline};
+use termwiz::cellcluster::CellCluster;
 use termwiz::hyperlink::Hyperlink;
 use wezterm_term::StableRowIndex;
 use wezterm_term::color::{ColorAttribute, ColorPalette, SrgbaTuple};
-
-/// The font style a glyph is drawn in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct GlyphStyle {
-    pub bold: bool,
-    pub half: bool,
-    pub italic: bool,
-}
 
 /// A glyph in an atlas, its top-left `offset` pixels from the cell's
 /// top-left.
@@ -59,6 +52,19 @@ pub struct GlyphStyle {
 pub struct PlacedGlyph {
     pub slot: AtlasSlot,
     pub offset: [i16; 2],
+}
+
+/// One glyph of a shaped cluster (ft-yccm0.4.7.3).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShapedGlyph {
+    /// Cells from the cluster's first cell to the cell the glyph starts in:
+    /// the shaper's cell counts of the glyphs before it, as the WebGpu
+    /// renderer advances through a cluster.
+    pub cell: usize,
+    /// Placed from the top-left of that cell.
+    pub glyph: PlacedGlyph,
+    /// The font's brightness adjustment, 1.0 for none.
+    pub brightness: f32,
 }
 
 /// The lines one cell's decorations draw. Like the WebGpu renderer, the
@@ -92,9 +98,12 @@ pub fn hovered_underline(underline: Underline) -> Underline {
 
 /// Where the glyphs of a frame come from.
 pub trait GlyphSource {
-    /// The glyphs that draw `text` (one grapheme) in `style` across `width`
-    /// cells. Empty when the fonts have nothing to draw.
-    fn glyphs(&mut self, text: &str, style: GlyphStyle, width: usize) -> &[PlacedGlyph];
+    /// The glyphs that draw `cluster`, a run of cells clustered and shaped
+    /// as the WebGpu renderer clusters and shapes its lines: one shaper call
+    /// for the whole run, so ligatures, combining marks and emoji sequences
+    /// come out as they do there. Inkless glyphs (spaces, ligature carriers)
+    /// are left out; they only advance the cells of the glyphs after them.
+    fn shape_cluster(&mut self, cluster: &CellCluster) -> &[ShapedGlyph];
 
     /// The grayscale sprite that draws `lines` over one cell, placed from
     /// the cell's top-left; `None` when the source has none.
@@ -253,6 +262,65 @@ fn cell_colors(cell: &MirrorCell, style: &SceneStyle<'_>, reverse_video: bool) -
             bg,
         }
     }
+}
+
+/// The color `cell`'s text is drawn in, or `None` where it draws no glyph:
+/// invisible text, or text in the color it sits on. As in the WebGpu
+/// renderer (compute_cell_fg_bg), that is the selection's background for
+/// selected text and a focused block cursor's color under it, not the
+/// cell's own background.
+fn text_color(
+    cell: &MirrorCell,
+    style: &SceneStyle<'_>,
+    built: &BuiltRow,
+    reverse_video: bool,
+) -> Option<[u8; 4]> {
+    let colors = cell_colors(cell, style, reverse_video);
+    let col = cell.col();
+    let mut fg = colors.fg;
+    let mut under = colors.bg;
+    if built.selection.contains(&col) {
+        if let Some(selection_fg) = style.selection_fg {
+            fg = selection_fg;
+        }
+        under = style.selection_bg;
+    }
+    let (mut fg, mut under) = (rgba8(fg), rgba8(under));
+    if let Some(cursor) = built.cursor {
+        if cursor.col == col {
+            if let Some(cursor_fg) = cursor.fg {
+                fg = cursor_fg;
+            }
+            if let Some(block) = cursor.block {
+                under = block;
+            }
+        }
+    }
+    (!cell.invisible() && fg != under).then_some(fg)
+}
+
+/// `color` with its brightness scaled by `brightness`, as the WebGpu renderer
+/// draws a glyph from a font with a brightness adjustment: the HSB
+/// brightness of the color in linear light.
+fn adjust_brightness(color: [u8; 4], brightness: f32) -> [u8; 4] {
+    if (brightness - 1.0).abs() < f32::EPSILON {
+        return color;
+    }
+    let [red, green, blue, alpha_byte] = color;
+    let alpha = f32::from(alpha_byte) / 255.0;
+    let decode = frankenterm_renderer_metal::color::byte_to_linear;
+    let premultiplied = [
+        decode(red) * alpha,
+        decode(green) * alpha,
+        decode(blue) * alpha,
+        alpha,
+    ];
+    let [red, green, blue, alpha] = apply_hsb(premultiplied, [1.0, 1.0, brightness]);
+    let encode = |component: f32| {
+        let straight = if alpha > 0.0 { component / alpha } else { 0.0 };
+        unorm8(frankenterm_renderer_metal::color::linear_to_srgb(straight))
+    };
+    [encode(red), encode(green), encode(blue), alpha_byte]
 }
 
 impl MetalScene {
@@ -464,56 +532,33 @@ impl MetalScene {
             }
         }
         for cell in mirror_row.cells() {
-            let col = cell.col();
             let colors = cell_colors(cell, style, reverse_video);
             if let Some(SrgbaTuple(red, green, blue, _)) = colors.explicit_bg {
                 let background = CellBg::rgb(unorm8(red), unorm8(green), unorm8(blue));
                 if cell.width() > 1 {
-                    self.cells.set_wide(grid_row, col as u32, background);
+                    self.cells.set_wide(grid_row, cell.col() as u32, background);
                 } else {
-                    self.cells.set(grid_row, col as u32, background);
+                    self.cells.set(grid_row, cell.col() as u32, background);
                 }
             }
-
-            // Text in the color it sits on draws no glyph. As in the WebGpu
-            // renderer (compute_cell_fg_bg), that is the selection's
-            // background for selected text and a focused block cursor's
-            // color under it, not the cell's own background.
-            let mut fg = colors.fg;
-            let mut under = colors.bg;
-            if built.selection.contains(&col) {
-                if let Some(selection_fg) = style.selection_fg {
-                    fg = selection_fg;
-                }
-                under = style.selection_bg;
-            }
-            let (mut fg, mut under) = (rgba8(fg), rgba8(under));
-            if let Some(cursor) = built.cursor {
-                if cursor.col == col {
-                    if let Some(cursor_fg) = cursor.fg {
-                        fg = cursor_fg;
-                    }
-                    if let Some(block) = cursor.block {
-                        under = block;
-                    }
-                }
-            }
-            if cell.invisible() || fg == under {
-                continue;
-            }
-            let text = mirror_row.text(cell);
-            let glyph_style = GlyphStyle {
-                bold: cell.intensity() == Intensity::Bold,
-                half: cell.intensity() == Intensity::Half,
-                italic: cell.italic(),
-            };
-            let placed = if text.trim().is_empty() {
-                &[][..]
-            } else {
-                glyphs.glyphs(text, glyph_style, cell.width())
-            };
-            for glyph in placed {
-                let instance = CellText::new(col as u16, fg).with_glyph(&glyph.slot, glyph.offset);
+        }
+        // Glyphs: the row's clusters, made and shaped as the WebGpu renderer
+        // makes and shapes them (ft-yccm0.4.7.3). Each glyph takes the
+        // colors of the cell it starts in.
+        let cells = mirror_row.cells();
+        for cluster in mirror_row.clusters() {
+            for shaped in glyphs.shape_cluster(&cluster) {
+                let col = cluster.first_cell_idx + shaped.cell;
+                let index = cells.partition_point(|cell| cell.col() + cell.width().max(1) <= col);
+                let Some(cell) = cells.get(index) else {
+                    continue;
+                };
+                let Some(fg) = text_color(cell, style, built, reverse_video) else {
+                    continue;
+                };
+                let fg = adjust_brightness(fg, shaped.brightness);
+                let instance = CellText::new(col as u16, fg)
+                    .with_glyph(&shaped.glyph.slot, shaped.glyph.offset);
                 self.text.push(grid_row, instance);
             }
         }
@@ -570,13 +615,68 @@ mod tests {
         )
     }
 
-    /// Glyphs with made-up atlas slots, one set per (text, style, width), so
-    /// the instance bytes say which glyph each instance draws.
+    /// A glyph's synthetic style key: intensity and italic.
+    type SyntheticStyle = (u8, bool);
+
+    /// Glyphs with made-up atlas slots, one per (text, style), so the
+    /// instance bytes say which glyph each instance draws. Shaping is one
+    /// glyph per non-blank cell, except that "->" is one glyph across its
+    /// two cells, a synthetic ligature.
     #[derive(Default)]
     struct SyntheticGlyphs {
-        placed: HashMap<(String, GlyphStyle, usize), Vec<PlacedGlyph>>,
+        shaped: HashMap<(String, SyntheticStyle), Vec<ShapedGlyph>>,
+        slots: HashMap<(String, SyntheticStyle), PlacedGlyph>,
         lines: HashMap<LineSprite, PlacedGlyph>,
         cursors: HashMap<(CursorSprite, u8), PlacedGlyph>,
+    }
+
+    fn synthetic_style(cluster: &CellCluster) -> SyntheticStyle {
+        (cluster.attrs.intensity() as u8, cluster.attrs.italic())
+    }
+
+    /// The text of each cell of `cluster`, with its cell counted from the
+    /// cluster's first, from the cluster's own byte-to-cell map.
+    fn cluster_cells(cluster: &CellCluster) -> Vec<(usize, &str)> {
+        let text = cluster.text.as_str();
+        let mut cells = Vec::new();
+        let mut start = 0;
+        for byte in 1..=text.len() {
+            if byte == text.len()
+                || (text.is_char_boundary(byte)
+                    && cluster.byte_to_cell_idx(byte) != cluster.byte_to_cell_idx(start))
+            {
+                let cell = cluster.byte_to_cell_idx(start) - cluster.first_cell_idx;
+                cells.push((cell, &text[start..byte]));
+                start = byte;
+            }
+        }
+        cells
+    }
+
+    /// Shapes `cluster` the synthetic way, calling `place` once per glyph
+    /// text the first time it is seen.
+    fn synthetic_shape(
+        cluster: &CellCluster,
+        mut place: impl FnMut(&str) -> PlacedGlyph,
+    ) -> Vec<ShapedGlyph> {
+        let cells = cluster_cells(cluster);
+        let mut shaped = Vec::new();
+        let mut index = 0;
+        while index < cells.len() {
+            let (cell, text) = cells[index];
+            let ligature =
+                text == "-" && cells.get(index + 1).is_some_and(|(_, next)| *next == ">");
+            let (text, step) = if ligature { ("->", 2) } else { (text, 1) };
+            if !text.trim().is_empty() {
+                shaped.push(ShapedGlyph {
+                    cell,
+                    glyph: place(text),
+                    brightness: 1.0,
+                });
+            }
+            index += step;
+        }
+        shaped
     }
 
     fn synthetic_slot(index: u32, text: &str) -> AtlasSlot {
@@ -597,16 +697,23 @@ mod tests {
     }
 
     impl GlyphSource for SyntheticGlyphs {
-        fn glyphs(&mut self, text: &str, style: GlyphStyle, width: usize) -> &[PlacedGlyph] {
-            let index = u32::try_from(self.placed.len()).unwrap_or(u32::MAX);
-            self.placed
-                .entry((text.to_string(), style, width))
-                .or_insert_with(|| {
-                    vec![PlacedGlyph {
-                        slot: synthetic_slot(index, text),
-                        offset: [1, 2 + (index % 3) as i16],
-                    }]
-                })
+        fn shape_cluster(&mut self, cluster: &CellCluster) -> &[ShapedGlyph] {
+            let style = synthetic_style(cluster);
+            let key = (cluster.text.clone(), style);
+            if !self.shaped.contains_key(&key) {
+                let slots = &mut self.slots;
+                let shaped = synthetic_shape(cluster, |text| {
+                    let index = u32::try_from(slots.len()).unwrap_or(u32::MAX);
+                    *slots
+                        .entry((text.to_string(), style))
+                        .or_insert_with(|| PlacedGlyph {
+                            slot: synthetic_slot(index, text),
+                            offset: [1, 2 + (index % 3) as i16],
+                        })
+                });
+                self.shaped.insert(key.clone(), shaped);
+            }
+            &self.shaped[&key]
         }
 
         /// One made-up grayscale slot per line sprite, far from the glyphs'.
@@ -726,6 +833,8 @@ mod tests {
         "👩\u{200d}💻",
         "x",
         "  ",
+        // A synthetic ligature: one glyph across two cells.
+        "a->b",
     ];
     const SGR: &[&str] = &[
         "0",
@@ -1122,6 +1231,61 @@ mod tests {
         );
     }
 
+    /// ft-yccm0.4.7.3: glyphs come from shaping whole clusters, as on the
+    /// WebGpu path. A ligature across two cells is one glyph at its first
+    /// cell, the glyphs after it start where the shaper's cell counts put
+    /// them, and an attribute change starts a new cluster, so no ligature
+    /// forms across it.
+    #[test]
+    fn clusters_are_shaped_whole_and_glyphs_start_at_their_cells() {
+        let palette = ColorPalette::default();
+        let style = plain_style(&palette);
+        let mut glyphs = SyntheticGlyphs::default();
+        let mut term = terminal(2, 12);
+        // "a->b " is one cluster; the "-" and the bold ">" after it are two.
+        term.advance_bytes("a->b -\x1b[1m>\x1b[0m");
+        let mut mirror = RenderMirror::new();
+        let mut scene = MetalScene::new();
+        step(
+            &mut term,
+            &mut mirror,
+            &mut scene,
+            &mut glyphs,
+            &no_selection,
+            &style,
+        );
+        let texts: Vec<String> = mirror.rows()[0]
+            .clusters()
+            .iter()
+            .map(|cluster| cluster.text.clone())
+            .collect();
+        assert_eq!(texts, ["a->b ", "-", ">"]);
+        let row: Vec<(u16, [u16; 2])> = scene
+            .text()
+            .row(0)
+            .map(|instance| (instance.col(), instance.atlas_origin()))
+            .collect();
+        let origin = |text: &str, style: SyntheticStyle| {
+            let slot = glyphs.slots[&(text.to_string(), style)].slot;
+            [
+                u16::try_from(slot.x).unwrap(),
+                u16::try_from(slot.y).unwrap(),
+            ]
+        };
+        let plain = (Intensity::Normal as u8, false);
+        let bold = (Intensity::Bold as u8, false);
+        assert_eq!(
+            row,
+            [
+                (0, origin("a", plain)),
+                (1, origin("->", plain)),
+                (3, origin("b", plain)),
+                (5, origin("-", plain)),
+                (6, origin(">", bold)),
+            ]
+        );
+    }
+
     /// ft-yccm0.4.7.3: every cursor but a focused block is the WebGpu
     /// renderer's cursor sprite in its color, as wide as the cell under it.
     /// A hollow block or an underline sits under the row's glyphs, a bar
@@ -1267,39 +1431,48 @@ mod tests {
         /// Synthetic glyph bitmaps placed in the renderer's real atlases.
         struct AtlasGlyphs<'a> {
             renderer: &'a MetalRenderer,
-            placed: HashMap<(String, GlyphStyle, usize), Vec<PlacedGlyph>>,
+            shaped: HashMap<(String, SyntheticStyle), Vec<ShapedGlyph>>,
+            slots: HashMap<(String, SyntheticStyle), PlacedGlyph>,
             lines: HashMap<LineSprite, PlacedGlyph>,
             cursors: HashMap<(CursorSprite, u8), PlacedGlyph>,
         }
 
         impl GlyphSource for AtlasGlyphs<'_> {
-            fn glyphs(&mut self, text: &str, style: GlyphStyle, width: usize) -> &[PlacedGlyph] {
+            /// Synthetic shaping with synthetic bitmaps in the real atlases.
+            fn shape_cluster(&mut self, cluster: &CellCluster) -> &[ShapedGlyph] {
                 let renderer = self.renderer;
-                let index = u32::try_from(self.placed.len()).unwrap_or(u32::MAX);
-                self.placed
-                    .entry((text.to_string(), style, width))
-                    .or_insert_with(|| {
-                        let wanted = synthetic_slot(index, text);
-                        let (w, h) = (wanted.width, wanted.height);
-                        let pixels: Vec<u8> = match wanted.kind {
-                            AtlasKind::Grayscale => (0..w * h)
-                                .map(|i| ((i * 37 + index * 11) % 251) as u8)
-                                .collect(),
-                            AtlasKind::Color => (0..w * h)
-                                .flat_map(|i| {
-                                    let level = ((i * 13 + index * 7) % 256) as u8;
-                                    [level / 2, level, level / 3, 255]
-                                })
-                                .collect(),
-                        };
-                        let slot = renderer
-                            .insert_glyph(wanted.kind, w, h, &pixels)
-                            .expect("the atlas takes a small glyph");
-                        vec![PlacedGlyph {
-                            slot,
-                            offset: [1, 2 + (index % 3) as i16],
-                        }]
-                    })
+                let style = synthetic_style(cluster);
+                let key = (cluster.text.clone(), style);
+                if !self.shaped.contains_key(&key) {
+                    let slots = &mut self.slots;
+                    let shaped = synthetic_shape(cluster, |text| {
+                        let index = u32::try_from(slots.len()).unwrap_or(u32::MAX);
+                        *slots.entry((text.to_string(), style)).or_insert_with(|| {
+                            let wanted = synthetic_slot(index, text);
+                            let (w, h) = (wanted.width, wanted.height);
+                            let pixels: Vec<u8> = match wanted.kind {
+                                AtlasKind::Grayscale => (0..w * h)
+                                    .map(|i| ((i * 37 + index * 11) % 251) as u8)
+                                    .collect(),
+                                AtlasKind::Color => (0..w * h)
+                                    .flat_map(|i| {
+                                        let level = ((i * 13 + index * 7) % 256) as u8;
+                                        [level / 2, level, level / 3, 255]
+                                    })
+                                    .collect(),
+                            };
+                            let slot = renderer
+                                .insert_glyph(wanted.kind, w, h, &pixels)
+                                .expect("the atlas takes a small glyph");
+                            PlacedGlyph {
+                                slot,
+                                offset: [1, 2 + (index % 3) as i16],
+                            }
+                        })
+                    });
+                    self.shaped.insert(key.clone(), shaped);
+                }
+                &self.shaped[&key]
             }
 
             /// A cell-sized (8x16) coverage pattern per line sprite.
@@ -1382,7 +1555,8 @@ mod tests {
             let renderer = MetalRenderer::offscreen().expect("an offscreen Metal renderer");
             let mut glyphs = AtlasGlyphs {
                 renderer: &renderer,
-                placed: HashMap::new(),
+                shaped: HashMap::new(),
+                slots: HashMap::new(),
                 lines: HashMap::new(),
                 cursors: HashMap::new(),
             };

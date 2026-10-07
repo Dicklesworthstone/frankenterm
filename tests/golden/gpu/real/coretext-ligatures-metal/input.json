@@ -1,0 +1,23 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "-> => != === <= >= :: |> <| /* */ www 0xFF\nfi fl ff ffi\n\u001b[?25l",
+    "fonts": [
+      {
+        "family": "Fira Code",
+        "harfbuzz_features": [
+          "liga=1",
+          "calt=1"
+        ]
+      },
+      {
+        "family": "Noto Color Emoji"
+      }
+    ],
+    "config": {
+      "font_rasterizer": "CoreText",
+      "front_end": "Metal"
+    }
+  },
+  "parity_golden": "real/coretext-ligatures"
+}

@@ -1,53 +1,64 @@
 //! The Metal renderer's glyphs, from the window's fonts (ft-yccm0.4.4).
 //!
-//! [`FontGlyphs`] is the [`GlyphSource`] of the live Metal frame:
-//! - it resolves the font a glyph style selects (the configured `font_rules`
-//!   applied to the style's intensity and italic);
-//! - it shapes the grapheme with HarfBuzz and rasterizes each glyph with the
-//!   configured rasterizer (CoreText by default on macOS);
-//! - it places the result in the renderer's atlases: coverage in the R8
-//!   atlas, premultiplied color in the BGRA atlas.
+//! [`FontGlyphs`] is the [`GlyphSource`] of the live Metal frame. It draws
+//! with the code the WebGpu renderer draws with (ft-yccm0.4.7.3):
+//! - A cluster (the render mirror makes them with `CellCluster::make_cluster`,
+//!   as WebGpu clusters its lines) takes the font style
+//!   `FontConfiguration::match_style` gives its attributes, and the whole
+//!   cluster is shaped with one `LoadedFont::shape` call with the inputs
+//!   WebGpu passes: its presentation, direction and presentation width, and
+//!   the filter that leaves custom block glyphs to the glyph cache. So
+//!   ligatures, combining marks and emoji sequences come out as they do there.
+//! - Each glyph is laid out by [`GlyphCache::lay_out_glyph`], the glyph
+//!   cache's own fitting and positioning, and placed where WebGpu places it:
+//!   at the cell its shaper cell count reaches, shifted by its offset and
+//!   bearing, its top at the cell height plus the descender (and the super-
+//!   or subscript shift) less its offset and bearing.
+//! - With `custom_block_glyphs`, box drawing, block elements and powerline
+//!   glyphs are the glyph cache's own bitmaps
+//!   ([`GlyphCache::block_sprite_image`]) at the cell's top-left.
+//! - Decorations and cursors are its line and cursor sprites
+//!   ([`GlyphCache::line_sprite_image`], [`GlyphCache::cursor_sprite_image`]).
 //!
-//! Glyphs are positioned as the WebGpu renderer positions them: the pen
-//! advances through the cluster's glyphs, each sits at its shaped offset plus
-//! its bearing, and the baseline is the cell's descender above the bottom.
+//! Bitmaps go to the renderer's atlases: coverage in the R8 atlas,
+//! premultiplied color in the BGRA atlas.
 //!
-//! Decorations are the WebGpu renderer's line sprites (ft-yccm0.4.7.3): the
-//! same cell-sized bitmaps ([`GlyphCache::line_sprite_image`]) placed in the
-//! grayscale atlas, so underline patterns match pixel for pixel.
-//!
-//! Placed glyphs are cached by grapheme, style and width. Every frame touches
-//! the cached slots, so the atlases keep them.
+//! Shaped clusters are cached by font style, vertical alignment and text, as
+//! WebGpu caches by style and text. Every frame touches the cached slots, so
+//! the atlases keep them.
 //! - A fallback font resolving asynchronously (a completion from the shaper)
 //!   or a slot the atlas evicted anyway clears the cache and asks for a full
 //!   scene rebuild.
 //! - So does a full atlas, after which the cache refills with what the frame
 //!   still draws.
 //!
-//! Not yet drawn the WebGpu way:
-//! - custom block glyphs (box drawing comes from the font);
-//! - emoji scaled to fit the cell;
-//! - double-width and double-height lines;
-//! - ligatures across cells (every cell is shaped alone).
+//! Not yet drawn the WebGpu way: double-width and double-height lines, bidi
+//! (the render mirror clusters left to right), and
+//! `experimental_pixel_positioning`.
 
+use crate::customglyph::BlockKey;
 use crate::glyphcache::GlyphCache;
 use crate::utilsprites::RenderMetrics;
-use frankenterm_font::FontConfiguration;
-use frankenterm_font::rasterizer::RasterizedGlyph;
+use config::TextStyle;
+use frankenterm_font::shaper::PresentationWidth;
+use frankenterm_font::{ClearShapeCache, FontConfiguration};
 use frankenterm_gui::metal_scene::{
-    CursorSprite, GlyphSource, GlyphStyle, LineSprite, PlacedGlyph,
+    CursorSprite, GlyphSource, LineSprite, PlacedGlyph, ShapedGlyph,
 };
 use frankenterm_renderer_metal::{AtlasKind, MetalRenderer};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use termwiz::cell::{CellAttributes, Intensity};
+use termwiz::cell::VerticalAlign;
+use termwiz::cellcluster::CellCluster;
 use termwiz::surface::CursorShape;
-use wezterm_bidi::Direction;
 use window::bitmaps::{BitmapImage, Image};
 
-type ByText = HashMap<String, Vec<PlacedGlyph>>;
+/// What a shaped cluster depends on besides its cells' widths, which its
+/// text determines: the font style, the vertical alignment (as its `u8`
+/// code) and the text.
+type ShapeKey = (TextStyle, u8, String);
 
 pub(crate) struct FontGlyphs {
     fonts: Rc<FontConfiguration>,
@@ -55,43 +66,37 @@ pub(crate) struct FontGlyphs {
     renderer: Rc<MetalRenderer>,
     cell_height: f64,
     descender: f64,
-    /// The cell geometry line sprites are drawn for.
+    /// The cell geometry block, line and cursor sprites are drawn for.
     metrics: RenderMetrics,
     /// The configuration generation the glyphs were rasterized under.
     config_generation: usize,
-    placed: HashMap<(GlyphStyle, usize), ByText>,
+    shaped: HashMap<ShapeKey, Vec<ShapedGlyph>>,
     /// Line sprites placed in the grayscale atlas (ft-yccm0.4.7.3).
     lines: HashMap<LineSprite, PlacedGlyph>,
     /// Cursor sprites by shape and width in cells (ft-yccm0.4.7.3).
     cursors: HashMap<(CursorSprite, u8), PlacedGlyph>,
     /// Set by the shaper when a fallback font finishes resolving.
     fallback_resolved: Arc<AtomicBool>,
+    /// The font's fallback chain grew while shaping this frame: the clusters
+    /// shaped before then are stale ([`Self::take_chain_changed`]).
+    chain_changed: bool,
     /// An atlas refused a glyph: clear the cache before the next frame.
     reset: bool,
 }
 
-/// The atlas a rasterized glyph goes to, and its pixels in that atlas's
-/// layout: one coverage byte per pixel, or premultiplied `[B, G, R, A]`.
-fn atlas_pixels(raster: &RasterizedGlyph) -> (AtlasKind, Vec<u8>) {
-    if raster.has_color {
-        let pixels = raster
-            .data
-            .chunks_exact(4)
-            .flat_map(|rgba| [rgba[2], rgba[1], rgba[0], rgba[3]])
-            .collect();
-        (AtlasKind::Color, pixels)
-    } else {
-        let pixels = raster.data.chunks_exact(4).map(|rgba| rgba[3]).collect();
-        (AtlasKind::Grayscale, pixels)
-    }
-}
+/// The most times a scene is shaped again in one frame because the fallback
+/// chain grew: the WebGpu renderer's bound on paint passes.
+pub(crate) const MAX_SHAPE_PASSES: usize = 16;
 
-/// A pixel offset as the instance stores it.
-// Offsets are a few cells at most.
+/// The first pixel a quad starting at `position` covers, as the WebGpu
+/// renderer's quads are rasterized (pixel centers at half pixels, a center
+/// on the leading edge included) and sampled (nearest texel): the bitmap's
+/// first column or row lands there.
+// Positions are a few cells from the cell's corner.
 #[allow(clippy::cast_possible_truncation)]
-fn offset_px(value: f64) -> i16 {
-    value
-        .round()
+fn quad_origin(position: f64) -> i16 {
+    (position - 0.5)
+        .ceil()
         .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
 }
 
@@ -111,12 +116,24 @@ impl FontGlyphs {
             descender: metrics.descender.get(),
             metrics: *metrics,
             config_generation,
-            placed: HashMap::new(),
+            shaped: HashMap::new(),
             lines: HashMap::new(),
             cursors: HashMap::new(),
             fallback_resolved: Arc::new(AtomicBool::new(false)),
+            chain_changed: false,
             reset: false,
         }
+    }
+
+    /// Whether the fallback chain grew while shaping since the last call.
+    /// The shaped clusters are then dropped, and the caller rebuilds its
+    /// scene so every cluster is shaped against the grown chain.
+    pub(crate) fn take_chain_changed(&mut self) -> bool {
+        let changed = std::mem::take(&mut self.chain_changed);
+        if changed {
+            self.shaped.clear();
+        }
+        changed
     }
 
     /// Whether this source still serves `fonts`, `renderer`, these cell
@@ -146,43 +163,46 @@ impl FontGlyphs {
         if !rebuild {
             let renderer = &self.renderer;
             let alive = self
-                .placed
+                .shaped
                 .values()
-                .flat_map(HashMap::values)
                 .flatten()
+                .map(|shaped| &shaped.glyph)
                 .chain(self.lines.values())
                 .chain(self.cursors.values())
                 .all(|glyph| renderer.touch_glyph(&glyph.slot));
             rebuild = !alive;
         }
         if rebuild {
-            self.placed.clear();
+            self.shaped.clear();
             self.lines.clear();
             self.cursors.clear();
         }
         rebuild
     }
 
-    /// Places `image`'s alpha in the grayscale atlas at the cell's top-left:
-    /// a line or cursor sprite as the WebGpu renderer draws it.
-    fn place_sprite(&mut self, image: &Image, what: &str) -> Option<PlacedGlyph> {
+    /// Places `image` in an atlas, `offset` pixels from a cell's top-left:
+    /// its premultiplied RGBA in the color atlas, or its alpha (the coverage)
+    /// in the grayscale atlas.
+    fn place_image(
+        &mut self,
+        image: &Image,
+        color: bool,
+        offset: [i16; 2],
+        what: &str,
+    ) -> Option<PlacedGlyph> {
         let (width, height) = image.image_dimensions();
-        let coverage: Vec<u8> = image
-            .pixel_data_slice()
-            .chunks_exact(4)
-            .map(|rgba| rgba[3])
-            .collect();
+        let rgba = image.pixel_data_slice().chunks_exact(4);
+        let (kind, pixels): (AtlasKind, Vec<u8>) = if color {
+            let bgra = rgba.flat_map(|rgba| [rgba[2], rgba[1], rgba[0], rgba[3]]);
+            (AtlasKind::Color, bgra.collect())
+        } else {
+            (AtlasKind::Grayscale, rgba.map(|rgba| rgba[3]).collect())
+        };
         let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
             return None;
         };
-        match self
-            .renderer
-            .insert_glyph(AtlasKind::Grayscale, width, height, &coverage)
-        {
-            Ok(slot) => Some(PlacedGlyph {
-                slot,
-                offset: [0, 0],
-            }),
+        match self.renderer.insert_glyph(kind, width, height, &pixels) {
+            Ok(slot) => Some(PlacedGlyph { slot, offset }),
             Err(err) => {
                 log::debug!("Metal glyphs: atlas refused {what}: {err}");
                 self.reset = true;
@@ -201,7 +221,7 @@ impl FontGlyphs {
             lines.overline,
             &self.metrics,
         );
-        self.place_sprite(&image, "a line sprite")
+        self.place_image(&image, false, [0, 0], "a line sprite")
     }
 
     /// Places the WebGpu renderer's cursor sprite for `shape`
@@ -215,107 +235,128 @@ impl FontGlyphs {
         };
         let image =
             GlyphCache::cursor_sprite_image(&self.fonts, Some(shape), &self.metrics, width_cells);
-        self.place_sprite(&image, "a cursor sprite")
+        self.place_image(&image, false, [0, 0], "a cursor sprite")
     }
 
-    fn place(&mut self, text: &str, style: GlyphStyle) -> Vec<PlacedGlyph> {
-        let mut attrs = CellAttributes::default();
-        attrs.set_intensity(if style.bold {
-            Intensity::Bold
-        } else if style.half {
-            Intensity::Half
-        } else {
-            Intensity::Normal
-        });
-        attrs.set_italic(style.italic);
-        let text_style = self.fonts.match_style(&self.config, &attrs).clone();
-        let font = match self.fonts.resolve_font(&text_style) {
+    /// Shapes and places `cluster` the WebGpu renderer's way; see the module
+    /// docs.
+    fn shape(&mut self, cluster: &CellCluster) -> Vec<ShapedGlyph> {
+        let style = self.fonts.match_style(&self.config, &cluster.attrs).clone();
+        let font = match self.fonts.resolve_font(&style) {
             Ok(font) => font,
             Err(err) => {
-                log::warn!("Metal glyphs: no font for {text:?}: {err:#}");
+                log::warn!("Metal glyphs: no font for {:?}: {err:#}", cluster.text);
                 return Vec::new();
             }
         };
-        let resolved = Arc::clone(&self.fallback_resolved);
-        let presentation = termwiz::cell::Presentation::for_grapheme(text).0;
-        let infos = match font.shape(
-            text,
-            move || resolved.store(true, Ordering::Release),
-            |_| {},
-            Some(presentation),
-            Direction::LeftToRight,
-            None,
-            None,
-        ) {
-            Ok(infos) => infos,
-            Err(err) => {
-                log::warn!("Metal glyphs: shaping {text:?} failed: {err:#}");
-                return Vec::new();
-            }
-        };
-        let mut placed = Vec::with_capacity(infos.len());
-        let mut pen = 0.0;
-        for info in &infos {
-            let raster = match font.rasterize_glyph(info.glyph_pos, info.font_idx) {
-                Ok(raster) => raster,
-                Err(err) => {
-                    log::warn!(
-                        "Metal glyphs: rasterizing glyph {} failed: {err:#}",
-                        info.glyph_pos
-                    );
-                    pen += info.x_advance.get();
-                    continue;
+        let presentation_width = PresentationWidth::with_cluster(cluster);
+        let mut attempts = 0;
+        let infos = loop {
+            let resolved = Arc::clone(&self.fallback_resolved);
+            match font.shape(
+                &cluster.text,
+                move || resolved.store(true, Ordering::Release),
+                BlockKey::filter_out_synthetic,
+                Some(cluster.presentation),
+                cluster.direction,
+                None,
+                Some(&presentation_width),
+            ) {
+                Ok(infos) => break infos,
+                // The font installed fallback faces while shaping: shape
+                // again against the grown chain, and have the caller rebuild
+                // what it shaped before, as the WebGpu renderer re-runs its
+                // paint pass (bounded as it is).
+                Err(err)
+                    if err.root_cause().downcast_ref::<ClearShapeCache>().is_some()
+                        && attempts < MAX_SHAPE_PASSES =>
+                {
+                    attempts += 1;
+                    self.chain_changed = true;
                 }
+                Err(err) => {
+                    log::warn!("Metal glyphs: shaping {:?} failed: {err:#}", cluster.text);
+                    return Vec::new();
+                }
+            }
+        };
+        // The WebGpu renderer's super- and subscript shift.
+        let valign = match cluster.attrs.vertical_align() {
+            VerticalAlign::BaseLine => 0.0,
+            VerticalAlign::SuperScript => self.cell_height * -0.25,
+            VerticalAlign::SubScript => self.cell_height * 0.25,
+        };
+        let custom_blocks = self.config.custom_block_glyphs;
+        let mut shaped = Vec::with_capacity(infos.len());
+        let mut cell = 0usize;
+        for (index, info) in infos.iter().enumerate() {
+            let block = if custom_blocks {
+                info.only_char.and_then(BlockKey::from_char)
+            } else {
+                None
             };
-            if raster.width > 0 && raster.height > 0 {
-                let (kind, pixels) = atlas_pixels(&raster);
-                let size = (u32::try_from(raster.width), u32::try_from(raster.height));
-                let (Ok(width), Ok(height)) = size else {
-                    continue;
-                };
-                match self.renderer.insert_glyph(kind, width, height, &pixels) {
-                    Ok(slot) => placed.push(PlacedGlyph {
-                        slot,
-                        offset: [
-                            offset_px(pen + info.x_offset.get() + raster.bearing_x.get()),
-                            offset_px(
-                                self.cell_height + self.descender
-                                    - (info.y_offset.get() + raster.bearing_y.get()),
-                            ),
-                        ],
-                    }),
+            if let Some(block) = block {
+                let image = GlyphCache::block_sprite_image(&self.metrics, block);
+                if let Some(glyph) = self.place_image(&image, false, [0, 0], "a block glyph") {
+                    shaped.push(ShapedGlyph {
+                        cell,
+                        glyph,
+                        brightness: 1.0,
+                    });
+                }
+            } else {
+                let followed_by_space = infos.get(index + 1).is_some_and(|next| next.is_space);
+                match GlyphCache::lay_out_glyph(
+                    &self.config,
+                    info,
+                    &font,
+                    followed_by_space,
+                    info.num_cells,
+                ) {
+                    Ok(layout) => {
+                        if let Some(image) = &layout.image {
+                            let left = (layout.x_offset + layout.bearing_x).get();
+                            let top = self.cell_height + self.descender + valign
+                                - (layout.y_offset + layout.bearing_y).get();
+                            let offset = [quad_origin(left), quad_origin(top)];
+                            if let Some(glyph) =
+                                self.place_image(image, layout.has_color, offset, "a glyph")
+                            {
+                                shaped.push(ShapedGlyph {
+                                    cell,
+                                    glyph,
+                                    brightness: layout.brightness_adjust,
+                                });
+                            }
+                        }
+                    }
                     Err(err) => {
-                        log::debug!(
-                            "Metal glyphs: atlas refused glyph {}: {err}",
+                        log::warn!(
+                            "Metal glyphs: laying out glyph {} failed: {err:#}",
                             info.glyph_pos
                         );
-                        self.reset = true;
                     }
                 }
             }
-            pen += info.x_advance.get();
+            cell += usize::from(info.num_cells);
         }
-        placed
+        shaped
     }
 }
 
 impl GlyphSource for FontGlyphs {
-    fn glyphs(&mut self, text: &str, style: GlyphStyle, width: usize) -> &[PlacedGlyph] {
-        let known = self
-            .placed
-            .get(&(style, width))
-            .is_some_and(|by_text| by_text.contains_key(text));
-        if !known {
-            let placed = self.place(text, style);
-            self.placed
-                .entry((style, width))
-                .or_default()
-                .insert(text.to_string(), placed);
+    fn shape_cluster(&mut self, cluster: &CellCluster) -> &[ShapedGlyph] {
+        let style = self.fonts.match_style(&self.config, &cluster.attrs).clone();
+        let key = (
+            style,
+            cluster.attrs.vertical_align() as u8,
+            cluster.text.clone(),
+        );
+        if !self.shaped.contains_key(&key) {
+            let shaped = self.shape(cluster);
+            self.shaped.insert(key.clone(), shaped);
         }
-        self.placed
-            .get(&(style, width))
-            .and_then(|by_text| by_text.get(text))
-            .map_or(&[], Vec::as_slice)
+        &self.shaped[&key]
     }
 
     fn line_sprite(&mut self, lines: LineSprite) -> Option<PlacedGlyph> {

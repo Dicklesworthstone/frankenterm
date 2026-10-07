@@ -38,9 +38,11 @@ use frankenterm_term::{Line, StableRowIndex, Terminal};
 use std::convert::TryFrom;
 use std::ops::Range;
 use std::sync::Arc;
-use termwiz::cell::{Blink, CellAttributes, Intensity, Underline, VerticalAlign};
+use termwiz::cell::{Blink, CellAttributes, Intensity, SemanticType, Underline, VerticalAlign};
+use termwiz::cellcluster::CellCluster;
 use termwiz::color::{ColorAttribute, SrgbaTuple};
 use termwiz::hyperlink::{Hyperlink, Rule};
+use termwiz::surface::line::CellRef;
 use termwiz::surface::{SequenceNo, SEQ_ZERO};
 
 /// A cell color as the cell names it, before palette resolution.
@@ -92,16 +94,19 @@ impl MirrorColor {
 }
 
 // MirrorCell::flags layout.
-const INTENSITY_SHIFT: u16 = 0;
-const UNDERLINE_SHIFT: u16 = 2;
-const BLINK_SHIFT: u16 = 5;
-const ITALIC: u16 = 1 << 7;
-const REVERSE: u16 = 1 << 8;
-const STRIKETHROUGH: u16 = 1 << 9;
-const INVISIBLE: u16 = 1 << 10;
-const OVERLINE: u16 = 1 << 11;
-const VALIGN_SHIFT: u16 = 12;
-const IMAGE: u16 = 1 << 14;
+const INTENSITY_SHIFT: u32 = 0;
+const UNDERLINE_SHIFT: u32 = 2;
+const BLINK_SHIFT: u32 = 5;
+const ITALIC: u32 = 1 << 7;
+const REVERSE: u32 = 1 << 8;
+const STRIKETHROUGH: u32 = 1 << 9;
+const INVISIBLE: u32 = 1 << 10;
+const OVERLINE: u32 = 1 << 11;
+const VALIGN_SHIFT: u32 = 12;
+const IMAGE: u32 = 1 << 14;
+/// Two bits (ft-yccm0.4.7.3): a renderer clusters cells for shaping by their
+/// whole attributes, and the semantic type is one of them.
+const SEMANTIC_SHIFT: u32 = 15;
 
 /// One visible cell (a wide character is one cell of width 2; its spacer is
 /// not stored), in compact form.
@@ -112,7 +117,7 @@ pub struct MirrorCell {
     text_len: u8,
     col: u16,
     width: u8,
-    flags: u16,
+    flags: u32,
     /// 0 for none, else one past an index into the row's hyperlinks.
     link: u16,
     fg: MirrorColor,
@@ -203,11 +208,20 @@ impl MirrorCell {
         self.flags & IMAGE != 0
     }
 
-    fn flags_of(attrs: &CellAttributes) -> u16 {
-        let mut flags = ((attrs.intensity() as u16) << INTENSITY_SHIFT)
-            | ((attrs.underline() as u16) << UNDERLINE_SHIFT)
-            | ((attrs.blink() as u16) << BLINK_SHIFT)
-            | ((attrs.vertical_align() as u16) << VALIGN_SHIFT);
+    pub fn semantic_type(&self) -> SemanticType {
+        match (self.flags >> SEMANTIC_SHIFT) & 0b11 {
+            1 => SemanticType::Input,
+            2 => SemanticType::Prompt,
+            _ => SemanticType::Output,
+        }
+    }
+
+    fn flags_of(attrs: &CellAttributes) -> u32 {
+        let mut flags = ((attrs.intensity() as u32) << INTENSITY_SHIFT)
+            | ((attrs.underline() as u32) << UNDERLINE_SHIFT)
+            | ((attrs.blink() as u32) << BLINK_SHIFT)
+            | ((attrs.vertical_align() as u32) << VALIGN_SHIFT)
+            | ((attrs.semantic_type() as u32) << SEMANTIC_SHIFT);
         for (set, bit) in [
             (attrs.italic(), ITALIC),
             (attrs.reverse(), REVERSE),
@@ -327,6 +341,73 @@ impl MirrorRow {
 
     pub fn has_images(&self) -> bool {
         self.has_images
+    }
+
+    /// The cell's attributes rebuilt from the mirror (ft-yccm0.4.7.3), so a
+    /// renderer can cluster cells for shaping with
+    /// `CellCluster::make_cluster` as the WebGpu renderer clusters lines.
+    /// Equal to the captured attributes except for what the mirror does not
+    /// keep and drawing does not use:
+    /// - image payloads: a cell with images can cluster with equal neighbors
+    ///   here while its line keeps it apart (the image pass draws images,
+    ///   over cells that are mostly blank);
+    /// - true colors finer than 8 bits per channel, and which fallback a
+    ///   true color names.
+    ///
+    /// The wrapped flag is clear, as clustering normalizes it.
+    pub fn cell_attributes(&self, cell: &MirrorCell) -> CellAttributes {
+        let mut attrs = CellAttributes::default();
+        attrs
+            .set_intensity(cell.intensity())
+            .set_underline(cell.underline())
+            .set_blink(cell.blink())
+            .set_italic(cell.italic())
+            .set_reverse(cell.reverse())
+            .set_strikethrough(cell.strikethrough())
+            .set_invisible(cell.invisible())
+            .set_overline(cell.overline())
+            .set_semantic_type(cell.semantic_type())
+            .set_vertical_align(cell.vertical_align())
+            .set_foreground(cell.fg().to_attribute())
+            .set_background(cell.bg().to_attribute());
+        if cell.underline_color() != MirrorColor::Default {
+            attrs.set_underline_color(cell.underline_color().to_attribute());
+        }
+        if let Some(link) = self.hyperlink(cell) {
+            attrs.set_hyperlink(Some(Arc::clone(link)));
+        }
+        attrs
+    }
+
+    /// The row's shaping clusters as `Line::cluster` makes them for the line
+    /// it was captured from (ft-yccm0.4.7.3): runs of cells with equal
+    /// attributes ([`Self::cell_attributes`]) and presentation, broken at
+    /// whitespace runs, by the same `CellCluster::make_cluster`. Left to
+    /// right only: the mirror keeps no bidi state, and the WebGpu renderer
+    /// clusters left to right unless bidi is enabled.
+    pub fn clusters(&self) -> Vec<CellCluster> {
+        let attrs: Vec<CellAttributes> = self
+            .cells
+            .iter()
+            .map(|cell| self.cell_attributes(cell))
+            .collect();
+        let len = self
+            .cells
+            .last()
+            .map_or(0, |cell| cell.col() + cell.width());
+        CellCluster::make_cluster(
+            len,
+            self.cells
+                .iter()
+                .zip(&attrs)
+                .map(|(cell, attrs)| CellRef::ClusterRef {
+                    cell_index: cell.col(),
+                    text: self.text(cell),
+                    width: cell.width(),
+                    attrs,
+                }),
+            None,
+        )
     }
 
     /// Whether the row must be copied again although its seqno says clean.
@@ -1440,6 +1521,11 @@ mod tests {
                         VerticalAlign::SuperScript,
                         VerticalAlign::SubScript,
                     ]))
+                    .set_semantic_type(*rng.pick(&[
+                        SemanticType::Output,
+                        SemanticType::Input,
+                        SemanticType::Prompt,
+                    ]))
                     .set_foreground(*rng.pick(&colors))
                     .set_background(*rng.pick(&colors))
                     .set_underline_color(*rng.pick(&colors));
@@ -1466,6 +1552,7 @@ mod tests {
                 assert_eq!(cell.underline(), attrs.underline());
                 assert_eq!(cell.blink(), attrs.blink());
                 assert_eq!(cell.vertical_align(), attrs.vertical_align());
+                assert_eq!(cell.semantic_type(), attrs.semantic_type());
                 assert_eq!(
                     [
                         cell.italic(),
@@ -1498,5 +1585,99 @@ mod tests {
                 assert!(!cell.has_image());
             }
         }
+    }
+
+    /// ft-yccm0.4.7.3: a mirror row clusters for shaping exactly as the line
+    /// it was captured from: the same runs, texts, widths, first cells,
+    /// presentations, attributes and byte-to-cell maps. The lines mix
+    /// attribute changes, semantic types, hyperlinks, whitespace runs (which
+    /// force breaks), wide characters, combining marks and emoji sequences.
+    #[test]
+    fn mirror_rows_cluster_exactly_as_their_lines() {
+        // Colors the mirror keeps exactly: 8-bit true colors name the
+        // default fallback, as SGR 38;2 does.
+        let colors = [
+            ColorAttribute::Default,
+            ColorAttribute::PaletteIndex(3),
+            ColorAttribute::PaletteIndex(200),
+            ColorAttribute::TrueColorWithDefaultFallback(SrgbaTuple(
+                51.0 / 255.0,
+                128.0 / 255.0,
+                1.0,
+                1.0,
+            )),
+        ];
+        let link = Arc::new(Hyperlink::new("https://example.com"));
+        let texts = [
+            "a",
+            "-",
+            ">",
+            "=",
+            "f",
+            "i",
+            " ",
+            " ",
+            "你",
+            "e\u{301}",
+            "👩\u{200d}💻",
+            "❤\u{fe0f}",
+        ];
+        let mut rng = Rng::new(11);
+        let mut clusters_seen = 0;
+        for _ in 0..200 {
+            let mut line = Line::new(5);
+            let mut col = 0;
+            let mut attrs = CellAttributes::default();
+            while col < 40 {
+                // Runs of equal attributes, so clusters span several cells.
+                if rng.below(4) == 0 {
+                    attrs = CellAttributes::default();
+                    attrs
+                        .set_intensity(*rng.pick(&[Intensity::Normal, Intensity::Bold]))
+                        .set_italic(rng.below(3) == 0)
+                        .set_underline(*rng.pick(&[Underline::None, Underline::Curly]))
+                        .set_semantic_type(*rng.pick(&[
+                            SemanticType::Output,
+                            SemanticType::Input,
+                            SemanticType::Prompt,
+                        ]))
+                        .set_foreground(*rng.pick(&colors))
+                        .set_background(*rng.pick(&colors))
+                        .set_underline_color(*rng.pick(&colors));
+                    if rng.below(4) == 0 {
+                        attrs.set_hyperlink(Some(Arc::clone(&link)));
+                    }
+                }
+                let cell = Cell::new_grapheme(rng.pick(&texts), attrs.clone(), None);
+                let width = cell.width().max(1);
+                line.set_cell(col, cell, 5);
+                col += width;
+            }
+            let row = MirrorRow::from_line(0, &line, 1);
+            let ours = row.clusters();
+            let theirs = line.cluster(None);
+            assert_eq!(ours.len(), theirs.len(), "{:?}", line);
+            for (ours, theirs) in ours.iter().zip(&theirs) {
+                assert_eq!(ours.text, theirs.text);
+                assert_eq!(
+                    (ours.width, ours.first_cell_idx),
+                    (theirs.width, theirs.first_cell_idx)
+                );
+                assert_eq!(ours.presentation, theirs.presentation);
+                assert_eq!(ours.direction, theirs.direction);
+                assert_eq!(ours.attrs, theirs.attrs, "{:?}", theirs.text);
+                for byte in 0..theirs.text.len() {
+                    assert_eq!(
+                        (ours.byte_to_cell_idx(byte), ours.byte_to_cell_width(byte)),
+                        (
+                            theirs.byte_to_cell_idx(byte),
+                            theirs.byte_to_cell_width(byte)
+                        )
+                    );
+                }
+            }
+            clusters_seen += theirs.len();
+        }
+        assert!(clusters_seen > 1000, "{}", clusters_seen);
     }
 }
