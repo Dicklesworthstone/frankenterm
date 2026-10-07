@@ -92,6 +92,12 @@ const SCROLLBACK_ROW_FORMAT_VERSION: u32 = 3;
 const SCROLLBACK_ROW_HEADER_BYTES: usize = 96;
 const SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES: u32 = 16 * 1024 * 1024;
 const SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES_USIZE: usize = 16 * 1024 * 1024;
+const SCROLLBACK_COMPACT_ROW_AEAD_DOMAIN: &[u8] = b"frankenterm.scrollback-row-aead.v4\0";
+const SCROLLBACK_COMPACT_ROW_RECORD_PREFIX: &str = "ftsl4e:";
+const SCROLLBACK_COMPACT_ROW_FORMAT_VERSION: u32 = 4;
+/// The random part of a compact row's nonce; the row's sequence fills the
+/// remaining 8 bytes.
+pub const SCROLLBACK_ROW_NONCE_BASE_BYTES: usize = 16;
 const SCROLLBACK_MANIFEST_AEAD_DOMAIN: &[u8] =
     b"frankenterm.scrollback-manifest-authentication.v1\0";
 const SCROLLBACK_MANIFEST_AUTH_PREFIX: &str = "ftsma1e:";
@@ -542,6 +548,261 @@ impl std::fmt::Debug for GuardianEncryptedScrollbackRow {
     }
 }
 
+/// Where a compact (v4) cold-scrollback row is stored. Its AEAD binds all of
+/// it, so a row moved to another pane, generation, row or sequence fails to
+/// open.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct GuardianScrollbackRowLocation {
+    durable_pane_id: [u8; 16],
+    content_epoch: [u8; 16],
+    stable_row: i64,
+    sequence: u64,
+}
+
+impl GuardianScrollbackRowLocation {
+    pub fn new(
+        durable_pane_id: [u8; 16],
+        content_epoch: [u8; 16],
+        stable_row: i64,
+        sequence: u64,
+    ) -> Result<Self, GuardianScrollbackRowError> {
+        if durable_pane_id == [0; 16] {
+            return Err(GuardianScrollbackRowError::InvalidIdentity(
+                "durable pane ID must be nonzero",
+            ));
+        }
+        if content_epoch == [0; 16] {
+            return Err(GuardianScrollbackRowError::InvalidIdentity(
+                "content epoch must be nonzero",
+            ));
+        }
+        Ok(Self {
+            durable_pane_id,
+            content_epoch,
+            stable_row,
+            sequence,
+        })
+    }
+
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+}
+
+impl std::fmt::Debug for GuardianScrollbackRowLocation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianScrollbackRowLocation")
+            .field("durable_pane_id", &"[REDACTED]")
+            .field("content_epoch", &"[REDACTED]")
+            .field("stable_row", &self.stable_row)
+            .field("sequence", &self.sequence)
+            .finish()
+    }
+}
+
+/// The nonce segment of compact (v4) cold-scrollback rows (ft-yccm0.2.1.4).
+///
+/// A v4 row stores only its ciphertext and tag. Its nonce is the segment's
+/// random 16-byte base followed by the row's little-endian sequence, so no
+/// two rows of one segment share a nonce, and rows of two segments share one
+/// only if two independent 128-bit draws collide. The key ID and base are
+/// stored once, in the authenticated manifest or append WAL that names the
+/// segment's rows, instead of in a 96-byte header on every row.
+///
+/// A segment rebuilt from storage can only open rows. Sealing needs a
+/// [`GuardianScrollbackRowNonceStream`], which only a fresh draw creates.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct GuardianScrollbackRowSegment {
+    key_id: [u8; KEY_ID_BYTES],
+    nonce_base: [u8; SCROLLBACK_ROW_NONCE_BASE_BYTES],
+    first_sequence: u64,
+}
+
+impl GuardianScrollbackRowSegment {
+    /// Rebuild a stored segment. An all-zero base is never drawn, so it is
+    /// refused as corrupt.
+    pub fn new(
+        key_id: [u8; KEY_ID_BYTES],
+        nonce_base: [u8; SCROLLBACK_ROW_NONCE_BASE_BYTES],
+        first_sequence: u64,
+    ) -> Result<Self, GuardianScrollbackRowError> {
+        if nonce_base == [0; SCROLLBACK_ROW_NONCE_BASE_BYTES] {
+            return Err(GuardianScrollbackRowError::InvalidIdentity(
+                "scrollback row nonce base must be nonzero",
+            ));
+        }
+        Ok(Self {
+            key_id,
+            nonce_base,
+            first_sequence,
+        })
+    }
+
+    #[must_use]
+    pub const fn key_id(&self) -> [u8; KEY_ID_BYTES] {
+        self.key_id
+    }
+
+    #[must_use]
+    pub const fn nonce_base(&self) -> [u8; SCROLLBACK_ROW_NONCE_BASE_BYTES] {
+        self.nonce_base
+    }
+
+    #[must_use]
+    pub const fn first_sequence(&self) -> u64 {
+        self.first_sequence
+    }
+
+    /// The nonce of the row at `sequence`: base, then the sequence. Rows
+    /// before the segment's first sequence are not its rows.
+    fn nonce(&self, sequence: u64) -> Result<[u8; NONCE_BYTES], GuardianScrollbackRowError> {
+        if sequence < self.first_sequence {
+            return Err(GuardianScrollbackRowError::StorageIdentityMismatch);
+        }
+        let mut nonce = [0; NONCE_BYTES];
+        nonce[..SCROLLBACK_ROW_NONCE_BASE_BYTES].copy_from_slice(&self.nonce_base);
+        nonce[SCROLLBACK_ROW_NONCE_BASE_BYTES..].copy_from_slice(&sequence.to_le_bytes());
+        Ok(nonce)
+    }
+}
+
+impl std::fmt::Debug for GuardianScrollbackRowSegment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianScrollbackRowSegment")
+            .field("key_id", &"[REDACTED]")
+            .field("nonce_base", &"[REDACTED]")
+            .field("first_sequence", &self.first_sequence)
+            .finish()
+    }
+}
+
+/// The only way to seal compact rows: a segment whose base was freshly drawn
+/// from OS entropy, and a counter that only moves forward. Each sealed row
+/// consumes its sequence, so a stream refuses to seal any sequence again, for
+/// example after a failed batch was cut back. Not `Clone`: a copy would carry
+/// its own counter. A process that crashes loses its stream, and the next
+/// one draws a new base, which `begin` also checks against every retained
+/// segment's.
+pub struct GuardianScrollbackRowNonceStream {
+    segment: GuardianScrollbackRowSegment,
+    next_sequence: u64,
+}
+
+impl GuardianScrollbackRowNonceStream {
+    /// Start a segment at `first_sequence` for rows sealed under `cipher`.
+    /// A base equal to one in `retained` is refused as a nonce reuse: with a
+    /// working entropy source that never happens, so it means the source
+    /// repeats itself.
+    pub fn begin<'a>(
+        cipher: &GuardianOutputCipher,
+        first_sequence: u64,
+        retained: impl IntoIterator<Item = &'a GuardianScrollbackRowSegment>,
+    ) -> Result<Self, GuardianScrollbackRowError> {
+        let mut nonce_base = [0; SCROLLBACK_ROW_NONCE_BASE_BYTES];
+        getrandom::fill(&mut nonce_base)
+            .map_err(|_| GuardianScrollbackRowError::EntropyUnavailable)?;
+        Self::begin_with_base(cipher.key_id, first_sequence, nonce_base, retained)
+    }
+
+    fn begin_with_base<'a>(
+        key_id: [u8; KEY_ID_BYTES],
+        first_sequence: u64,
+        nonce_base: [u8; SCROLLBACK_ROW_NONCE_BASE_BYTES],
+        retained: impl IntoIterator<Item = &'a GuardianScrollbackRowSegment>,
+    ) -> Result<Self, GuardianScrollbackRowError> {
+        if nonce_base == [0; SCROLLBACK_ROW_NONCE_BASE_BYTES] {
+            return Err(GuardianScrollbackRowError::EntropyUnavailable);
+        }
+        if retained
+            .into_iter()
+            .any(|segment| segment.nonce_base == nonce_base)
+        {
+            return Err(GuardianScrollbackRowError::NonceReuse);
+        }
+        Ok(Self {
+            segment: GuardianScrollbackRowSegment {
+                key_id,
+                nonce_base,
+                first_sequence,
+            },
+            next_sequence: first_sequence,
+        })
+    }
+
+    #[must_use]
+    pub const fn segment(&self) -> GuardianScrollbackRowSegment {
+        self.segment
+    }
+
+    /// The lowest sequence this stream may still seal.
+    #[must_use]
+    pub const fn next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+}
+
+impl std::fmt::Debug for GuardianScrollbackRowNonceStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianScrollbackRowNonceStream")
+            .field("segment", &self.segment)
+            .field("next_sequence", &self.next_sequence)
+            .finish()
+    }
+}
+
+/// Whether `record` is a compact (v4) cold-scrollback row.
+#[must_use]
+pub fn is_compact_scrollback_row(record: &str) -> bool {
+    record.starts_with(SCROLLBACK_COMPACT_ROW_RECORD_PREFIX)
+}
+
+/// The stored length of a compact row sealing `plaintext_bytes`, so a writer
+/// can check a batch's byte budget before the row consumes its sequence.
+#[must_use]
+pub fn compact_scrollback_row_record_bytes(plaintext_bytes: usize) -> Option<usize> {
+    let binary_bytes = plaintext_bytes.checked_add(AEAD_TAG_BYTES_USIZE)?;
+    let tail = match binary_bytes % 3 {
+        0 => 0,
+        1 => 2,
+        _ => 3,
+    };
+    (binary_bytes / 3)
+        .checked_mul(4)?
+        .checked_add(tail)?
+        .checked_add(SCROLLBACK_COMPACT_ROW_RECORD_PREFIX.len())
+}
+
+/// The plaintext size of a compact row, from its length alone, so a reader
+/// can charge a decode budget before it decrypts anything.
+pub fn compact_scrollback_row_plaintext_bytes(
+    record: &str,
+) -> Result<u32, GuardianScrollbackRowError> {
+    let encoded = record
+        .strip_prefix(SCROLLBACK_COMPACT_ROW_RECORD_PREFIX)
+        .ok_or(GuardianScrollbackRowError::MalformedRecord)?;
+    let full_groups = encoded.len() / 4;
+    let binary_bytes = match encoded.len() % 4 {
+        0 => full_groups.checked_mul(3),
+        2 => full_groups.checked_mul(3).and_then(|b| b.checked_add(1)),
+        3 => full_groups.checked_mul(3).and_then(|b| b.checked_add(2)),
+        _ => return Err(GuardianScrollbackRowError::MalformedRecord),
+    }
+    .ok_or(GuardianScrollbackRowError::ArithmeticOverflow)?;
+    let plaintext_bytes = binary_bytes
+        .checked_sub(AEAD_TAG_BYTES_USIZE)
+        .ok_or(GuardianScrollbackRowError::MalformedRecord)?;
+    let plaintext_bytes =
+        u32::try_from(plaintext_bytes).map_err(|_| GuardianScrollbackRowError::RecordByteLimit)?;
+    if plaintext_bytes == 0 || plaintext_bytes > SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES {
+        return Err(GuardianScrollbackRowError::RecordByteLimit);
+    }
+    Ok(plaintext_bytes)
+}
+
 #[derive(Debug, Error)]
 pub enum GuardianScrollbackRowError {
     #[error("invalid encrypted scrollback row identity: {0}")]
@@ -570,6 +831,8 @@ pub enum GuardianScrollbackRowError {
     EncryptionFailed,
     #[error("scrollback row authentication or decryption failed")]
     DecryptionFailed,
+    #[error("scrollback row nonce would be reused")]
+    NonceReuse,
 }
 
 /// Hard admission limits for one immutable guardian output-log segment.
@@ -923,6 +1186,120 @@ impl GuardianOutputCipher {
         Ok(plaintext)
     }
 
+    /// Seal one row as a compact (v4) record appended to `record`: the prefix
+    /// and the base64 of ciphertext and tag, with no per-row header or nonce
+    /// (ft-yccm0.2.1.4). The nonce comes from `stream` at the row's sequence,
+    /// and the stream consumes that sequence before encrypting, so it never
+    /// seals it again, even after an error. `scratch` is reused across rows,
+    /// and `record` is unchanged on error.
+    pub fn seal_compact_scrollback_row_into(
+        &self,
+        stream: &mut GuardianScrollbackRowNonceStream,
+        location: GuardianScrollbackRowLocation,
+        plaintext: &[u8],
+        scratch: &mut Vec<u8>,
+        record: &mut String,
+    ) -> Result<(), GuardianScrollbackRowError> {
+        if stream.segment.key_id != self.key_id {
+            return Err(GuardianScrollbackRowError::KeyIdentityMismatch);
+        }
+        if location.sequence < stream.next_sequence {
+            return Err(GuardianScrollbackRowError::NonceReuse);
+        }
+        let plaintext_bytes = u32::try_from(plaintext.len())
+            .map_err(|_| GuardianScrollbackRowError::RecordByteLimit)?;
+        if plaintext_bytes == 0 || plaintext_bytes > SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES {
+            return Err(GuardianScrollbackRowError::RecordByteLimit);
+        }
+        let next_sequence = location
+            .sequence
+            .checked_add(1)
+            .ok_or(GuardianScrollbackRowError::ArithmeticOverflow)?;
+        let binary_bytes = plaintext
+            .len()
+            .checked_add(AEAD_TAG_BYTES_USIZE)
+            .ok_or(GuardianScrollbackRowError::ArithmeticOverflow)?;
+        let encoded_bytes = binary_bytes
+            .checked_add(2)
+            .and_then(|bytes| bytes.checked_div(3))
+            .and_then(|bytes| bytes.checked_mul(4))
+            .and_then(|bytes| bytes.checked_add(SCROLLBACK_COMPACT_ROW_RECORD_PREFIX.len()))
+            .ok_or(GuardianScrollbackRowError::ArithmeticOverflow)?;
+        scratch.clear();
+        scratch
+            .try_reserve(binary_bytes)
+            .map_err(|_| GuardianScrollbackRowError::AllocationFailed)?;
+        record
+            .try_reserve(encoded_bytes)
+            .map_err(|_| GuardianScrollbackRowError::AllocationFailed)?;
+        let nonce = stream.segment.nonce(location.sequence)?;
+        stream.next_sequence = next_sequence;
+        scratch.extend_from_slice(plaintext);
+        let aad = compact_scrollback_row_aad(self.key_id, location, plaintext_bytes);
+        let tag = match self.cipher.encrypt_inout_detached(
+            &XNonce::from(nonce),
+            &aad,
+            scratch.as_mut_slice().into(),
+        ) {
+            Ok(tag) => tag,
+            Err(_) => {
+                scratch.zeroize();
+                return Err(GuardianScrollbackRowError::EncryptionFailed);
+            }
+        };
+        scratch.extend_from_slice(&tag);
+        record.push_str(SCROLLBACK_COMPACT_ROW_RECORD_PREFIX);
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode_string(&scratch[..], record);
+        Ok(())
+    }
+
+    /// Authenticate and open one compact (v4) row of `segment` at its
+    /// expected location. The decoder accepts only the canonical base64 of
+    /// ciphertext and tag, so each row has exactly one stored form.
+    pub fn open_compact_scrollback_row(
+        &self,
+        segment: &GuardianScrollbackRowSegment,
+        record: &str,
+        location: GuardianScrollbackRowLocation,
+        max_plaintext_bytes: u32,
+    ) -> Result<Zeroizing<Vec<u8>>, GuardianScrollbackRowError> {
+        if segment.key_id != self.key_id {
+            return Err(GuardianScrollbackRowError::KeyIdentityMismatch);
+        }
+        let plaintext_bytes = compact_scrollback_row_plaintext_bytes(record)?;
+        if plaintext_bytes > max_plaintext_bytes.min(SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES) {
+            return Err(GuardianScrollbackRowError::RecordByteLimit);
+        }
+        let encoded = record
+            .strip_prefix(SCROLLBACK_COMPACT_ROW_RECORD_PREFIX)
+            .ok_or(GuardianScrollbackRowError::MalformedRecord)?;
+        let nonce = segment.nonce(location.sequence)?;
+        let mut sealed = Zeroizing::new(
+            base64::engine::general_purpose::STANDARD_NO_PAD
+                .decode(encoded)
+                .map_err(|_| GuardianScrollbackRowError::NonCanonicalRecord)?,
+        );
+        let plaintext_len = usize::try_from(plaintext_bytes)
+            .map_err(|_| GuardianScrollbackRowError::ArithmeticOverflow)?;
+        if sealed.len() != plaintext_len + AEAD_TAG_BYTES_USIZE {
+            return Err(GuardianScrollbackRowError::CiphertextLengthMismatch);
+        }
+        let aad = compact_scrollback_row_aad(segment.key_id, location, plaintext_bytes);
+        let (ciphertext, tag) = sealed.split_at_mut(plaintext_len);
+        let tag = chacha20poly1305::Tag::try_from(&*tag)
+            .map_err(|_| GuardianScrollbackRowError::CiphertextLengthMismatch)?;
+        if self
+            .cipher
+            .decrypt_inout_detached(&XNonce::from(nonce), &aad, ciphertext.into(), &tag)
+            .is_err()
+        {
+            sealed.zeroize();
+            return Err(GuardianScrollbackRowError::DecryptionFailed);
+        }
+        sealed.truncate(plaintext_len);
+        Ok(sealed)
+    }
+
     /// Authenticate one canonical v3 scrollback manifest without persisting
     /// either generic metadata ciphertext or raw key material.
     pub fn authenticate_scrollback_manifest(
@@ -1245,6 +1622,34 @@ fn scrollback_row_aad(
         at += part.len();
     }
     debug_assert_eq!(at, SCROLLBACK_ROW_AAD_BYTES);
+    aad
+}
+
+const SCROLLBACK_COMPACT_ROW_AAD_BYTES: usize = SCROLLBACK_COMPACT_ROW_AEAD_DOMAIN.len() + 64;
+
+/// A compact row's AEAD associated data: its own domain and version, the
+/// key, and the full location. The nonce binds the segment.
+fn compact_scrollback_row_aad(
+    key_id: [u8; KEY_ID_BYTES],
+    location: GuardianScrollbackRowLocation,
+    plaintext_bytes: u32,
+) -> [u8; SCROLLBACK_COMPACT_ROW_AAD_BYTES] {
+    let mut aad = [0; SCROLLBACK_COMPACT_ROW_AAD_BYTES];
+    let mut at = 0;
+    for part in [
+        SCROLLBACK_COMPACT_ROW_AEAD_DOMAIN,
+        &SCROLLBACK_COMPACT_ROW_FORMAT_VERSION.to_le_bytes(),
+        &key_id,
+        &location.durable_pane_id,
+        &location.content_epoch,
+        &location.stable_row.to_le_bytes(),
+        &location.sequence.to_le_bytes(),
+        &plaintext_bytes.to_le_bytes(),
+    ] {
+        aad[at..at + part.len()].copy_from_slice(part);
+        at += part.len();
+    }
+    debug_assert_eq!(at, SCROLLBACK_COMPACT_ROW_AAD_BYTES);
     aad
 }
 
@@ -4499,6 +4904,354 @@ mod tests {
             Err(GuardianScrollbackRowError::RecordByteLimit)
         ));
         assert_eq!(batch, before, "a refused row leaves the batch untouched");
+    }
+
+    fn compact_location(sequence: u64) -> GuardianScrollbackRowLocation {
+        GuardianScrollbackRowLocation::new([0x42; 16], [0x24; 16], -3, sequence)
+            .expect("fixture compact row location is valid")
+    }
+
+    /// ft-yccm0.2.1.4: a compact row is the prefix and the base64 of
+    /// ciphertext and tag, exactly 128 characters shorter than the v3 record
+    /// of the same plaintext, and it opens only at its location in its
+    /// segment. Its nonce is the segment base followed by its sequence.
+    #[test]
+    fn compact_rows_drop_the_header_and_nonce_and_open_at_their_location() {
+        let cipher = cipher();
+        let secret = b"semantic-row-secret-with-style-width-and-link";
+        let mut stream = GuardianScrollbackRowNonceStream::begin(&cipher, 11, [])
+            .expect("start a compact row segment");
+        let segment = stream.segment();
+        assert_eq!(segment.key_id(), cipher.key_id());
+        assert_eq!(segment.first_sequence(), 11);
+        let debug = format!("{segment:?} {stream:?}");
+        assert!(!debug.contains(&hex_encode(&segment.nonce_base())));
+
+        let mut scratch = Vec::new();
+        let mut batch = String::from("prior-batch-bytes");
+        let mut spans = Vec::new();
+        for (offset, plaintext_bytes) in [1, 2, 3, 655, 656, 657, 4096].iter().copied().enumerate()
+        {
+            let mut plaintext = secret.repeat(plaintext_bytes / secret.len() + 1);
+            plaintext.truncate(plaintext_bytes);
+            let sequence = 11 + offset as u64;
+            let start = batch.len();
+            cipher
+                .seal_compact_scrollback_row_into(
+                    &mut stream,
+                    compact_location(sequence),
+                    &plaintext,
+                    &mut scratch,
+                    &mut batch,
+                )
+                .expect("seal compact row");
+            spans.push((start..batch.len(), sequence, plaintext));
+        }
+        assert!(batch.starts_with("prior-batch-bytes"));
+        assert_eq!(stream.next_sequence(), 18);
+
+        for (span, sequence, plaintext) in &spans {
+            let record = &batch[span.clone()];
+            assert!(is_compact_scrollback_row(record));
+            assert!(!GuardianEncryptedScrollbackRow::has_encrypted_prefix(
+                record
+            ));
+            assert!(!record.contains("semantic-row-secret"));
+            assert_eq!(
+                compact_scrollback_row_plaintext_bytes(record).expect("size compact row"),
+                u32::try_from(plaintext.len()).unwrap()
+            );
+            assert_eq!(
+                compact_scrollback_row_record_bytes(plaintext.len()),
+                Some(record.len())
+            );
+            let v3 = cipher
+                .seal_scrollback_row(scrollback_identity(), plaintext)
+                .expect("seal v3 row")
+                .encode()
+                .expect("encode v3 row");
+            assert_eq!(
+                v3.len() - record.len(),
+                128,
+                "the 96-byte header costs 128 base64 characters"
+            );
+            let opened = cipher
+                .open_compact_scrollback_row(&segment, record, compact_location(*sequence), 8192)
+                .expect("open compact row at its location");
+            assert_eq!(opened.as_slice(), plaintext.as_slice());
+
+            let mut nonce = [0_u8; NONCE_BYTES];
+            nonce[..16].copy_from_slice(&segment.nonce_base());
+            nonce[16..].copy_from_slice(&sequence.to_le_bytes());
+            assert_eq!(segment.nonce(*sequence).expect("row nonce"), nonce);
+        }
+        assert!(matches!(
+            segment.nonce(10),
+            Err(GuardianScrollbackRowError::StorageIdentityMismatch)
+        ));
+    }
+
+    #[test]
+    fn compact_rows_refuse_another_location_segment_key_tamper_or_encoding() {
+        let cipher = cipher();
+        let mut stream =
+            GuardianScrollbackRowNonceStream::begin(&cipher, 11, []).expect("start segment");
+        let segment = stream.segment();
+        let mut record = String::new();
+        cipher
+            .seal_compact_scrollback_row_into(
+                &mut stream,
+                compact_location(11),
+                b"x",
+                &mut Vec::new(),
+                &mut record,
+            )
+            .expect("seal one-byte compact row");
+        let open = |segment: &GuardianScrollbackRowSegment, record: &str, location| {
+            cipher.open_compact_scrollback_row(segment, record, location, 1024)
+        };
+        open(&segment, &record, compact_location(11)).expect("the row opens where it was sealed");
+
+        for location in [
+            GuardianScrollbackRowLocation::new([0x43; 16], [0x24; 16], -3, 11).unwrap(),
+            GuardianScrollbackRowLocation::new([0x42; 16], [0x25; 16], -3, 11).unwrap(),
+            GuardianScrollbackRowLocation::new([0x42; 16], [0x24; 16], -2, 11).unwrap(),
+            compact_location(12),
+        ] {
+            assert!(matches!(
+                open(&segment, &record, location),
+                Err(GuardianScrollbackRowError::DecryptionFailed)
+            ));
+        }
+        assert!(matches!(
+            open(&segment, &record, compact_location(10)),
+            Err(GuardianScrollbackRowError::StorageIdentityMismatch)
+        ));
+        let other = GuardianScrollbackRowNonceStream::begin(&cipher, 11, [&segment])
+            .expect("start another segment")
+            .segment();
+        assert!(matches!(
+            open(&other, &record, compact_location(11)),
+            Err(GuardianScrollbackRowError::DecryptionFailed)
+        ));
+        let wrong_cipher = GuardianOutputCipher::try_from_key_slice(&[0x72; 32])
+            .expect("wrong-key fixture is structurally valid");
+        assert!(matches!(
+            wrong_cipher.open_compact_scrollback_row(&segment, &record, compact_location(11), 1024),
+            Err(GuardianScrollbackRowError::KeyIdentityMismatch)
+        ));
+        assert!(matches!(
+            cipher.open_compact_scrollback_row(&segment, &record, compact_location(11), 0),
+            Err(GuardianScrollbackRowError::RecordByteLimit)
+        ));
+
+        // One byte plus the tag is 17 bytes: 23 characters whose last one
+        // carries two zero padding bits. Setting one is a second spelling of
+        // the same bytes, which the decoder refuses.
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let last = *record.as_bytes().last().unwrap();
+        let index = ALPHABET.iter().position(|&c| c == last).unwrap();
+        assert_eq!(index & 0b11, 0, "canonical padding bits are zero");
+        let mut noncanonical = record[..record.len() - 1].to_string();
+        noncanonical.push(char::from(ALPHABET[index | 1]));
+        assert!(matches!(
+            open(&segment, &noncanonical, compact_location(11)),
+            Err(GuardianScrollbackRowError::NonCanonicalRecord)
+        ));
+
+        let mut tampered = record.clone().into_bytes();
+        let middle = tampered.len() / 2;
+        tampered[middle] = if tampered[middle] == b'A' { b'B' } else { b'A' };
+        let tampered = String::from_utf8(tampered).unwrap();
+        assert!(matches!(
+            open(&segment, &tampered, compact_location(11)),
+            Err(GuardianScrollbackRowError::DecryptionFailed)
+        ));
+
+        let encoded_tag_only = format!(
+            "{SCROLLBACK_COMPACT_ROW_RECORD_PREFIX}{}",
+            base64::engine::general_purpose::STANDARD_NO_PAD.encode([0_u8; 16])
+        );
+        for (malformed, expected) in [
+            (
+                format!("{SCROLLBACK_COMPACT_ROW_RECORD_PREFIX}AAAAA"),
+                "malformed",
+            ),
+            (
+                format!("{SCROLLBACK_COMPACT_ROW_RECORD_PREFIX}AAAA"),
+                "malformed",
+            ),
+            (encoded_tag_only, "empty"),
+            (record.replacen("ftsl4e:", "ftsl3e:", 1), "malformed"),
+        ] {
+            let result = open(&segment, &malformed, compact_location(11));
+            match expected {
+                "malformed" => assert!(
+                    matches!(result, Err(GuardianScrollbackRowError::MalformedRecord)),
+                    "{}: {:?}",
+                    malformed,
+                    result.map(|_| ())
+                ),
+                _ => assert!(
+                    matches!(result, Err(GuardianScrollbackRowError::RecordByteLimit)),
+                    "{}: {:?}",
+                    malformed,
+                    result.map(|_| ())
+                ),
+            }
+        }
+    }
+
+    /// A stream consumes each sequence it seals: sealing the same or an
+    /// earlier sequence again is refused, as is sealing under another key.
+    /// A refusal before encryption consumes nothing.
+    #[test]
+    fn a_nonce_stream_never_seals_a_sequence_twice() {
+        let cipher = cipher();
+        let mut stream =
+            GuardianScrollbackRowNonceStream::begin(&cipher, 5, []).expect("start segment");
+        let mut scratch = Vec::new();
+        let mut batch = String::new();
+        for sequence in 5..8 {
+            cipher
+                .seal_compact_scrollback_row_into(
+                    &mut stream,
+                    compact_location(sequence),
+                    b"row",
+                    &mut scratch,
+                    &mut batch,
+                )
+                .expect("seal a fresh sequence");
+        }
+        let before = batch.clone();
+        for sequence in [4, 5, 6, 7] {
+            assert!(matches!(
+                cipher.seal_compact_scrollback_row_into(
+                    &mut stream,
+                    compact_location(sequence),
+                    b"different row",
+                    &mut scratch,
+                    &mut batch,
+                ),
+                Err(GuardianScrollbackRowError::NonceReuse)
+            ));
+        }
+        assert_eq!(batch, before, "a refused row leaves the batch untouched");
+
+        assert!(matches!(
+            cipher.seal_compact_scrollback_row_into(
+                &mut stream,
+                compact_location(9),
+                b"",
+                &mut scratch,
+                &mut batch,
+            ),
+            Err(GuardianScrollbackRowError::RecordByteLimit)
+        ));
+        assert_eq!(stream.next_sequence(), 8);
+        let wrong_cipher = GuardianOutputCipher::try_from_key_slice(&[0x72; 32])
+            .expect("wrong-key fixture is structurally valid");
+        assert!(matches!(
+            wrong_cipher.seal_compact_scrollback_row_into(
+                &mut stream,
+                compact_location(9),
+                b"row",
+                &mut scratch,
+                &mut batch,
+            ),
+            Err(GuardianScrollbackRowError::KeyIdentityMismatch)
+        ));
+        cipher
+            .seal_compact_scrollback_row_into(
+                &mut stream,
+                compact_location(9),
+                b"row",
+                &mut scratch,
+                &mut batch,
+            )
+            .expect("a gap is allowed: sequences only move forward");
+        assert_eq!(stream.next_sequence(), 10);
+    }
+
+    /// Planted negative: a second segment drawing a base that a retained
+    /// segment already uses is refused. The hazard it refuses is real: two
+    /// rows sealed at one sequence under one base share a keystream, so their
+    /// ciphertexts XOR to their plaintexts' XOR.
+    #[test]
+    fn a_new_segment_refuses_a_retained_nonce_base() {
+        let cipher = cipher();
+        let retained = GuardianScrollbackRowNonceStream::begin(&cipher, 0, [])
+            .expect("start segment")
+            .segment();
+        assert!(matches!(
+            GuardianScrollbackRowNonceStream::begin_with_base(
+                cipher.key_id(),
+                40,
+                retained.nonce_base(),
+                [&retained],
+            ),
+            Err(GuardianScrollbackRowError::NonceReuse)
+        ));
+        assert!(matches!(
+            GuardianScrollbackRowNonceStream::begin_with_base(cipher.key_id(), 40, [0; 16], []),
+            Err(GuardianScrollbackRowError::EntropyUnavailable)
+        ));
+        assert!(matches!(
+            GuardianScrollbackRowSegment::new(cipher.key_id(), [0; 16], 0),
+            Err(GuardianScrollbackRowError::InvalidIdentity(_))
+        ));
+
+        let mut bases = std::collections::HashSet::new();
+        let mut segments = vec![retained];
+        bases.insert(retained.nonce_base());
+        for first_sequence in 1..1000 {
+            let segment =
+                GuardianScrollbackRowNonceStream::begin(&cipher, first_sequence, &segments)
+                    .expect("a fresh draw never collides")
+                    .segment();
+            assert!(bases.insert(segment.nonce_base()));
+            segments.push(segment);
+        }
+
+        // What the refusal prevents, shown with the check bypassed.
+        let mut first = GuardianScrollbackRowNonceStream::begin_with_base(
+            cipher.key_id(),
+            7,
+            retained.nonce_base(),
+            [],
+        )
+        .expect("bypass the retained check");
+        let mut second = GuardianScrollbackRowNonceStream::begin_with_base(
+            cipher.key_id(),
+            7,
+            retained.nonce_base(),
+            [],
+        )
+        .expect("bypass the retained check");
+        let (left, right) = (*b"rm -rf --no-preserve", *b"password=hunter2 ok!");
+        let seal = |stream: &mut GuardianScrollbackRowNonceStream, plaintext: &[u8]| {
+            let mut record = String::new();
+            cipher
+                .seal_compact_scrollback_row_into(
+                    stream,
+                    compact_location(7),
+                    plaintext,
+                    &mut Vec::new(),
+                    &mut record,
+                )
+                .expect("seal under the reused base");
+            base64::engine::general_purpose::STANDARD_NO_PAD
+                .decode(
+                    record
+                        .strip_prefix(SCROLLBACK_COMPACT_ROW_RECORD_PREFIX)
+                        .unwrap(),
+                )
+                .unwrap()
+        };
+        let (a, b) = (seal(&mut first, &left), seal(&mut second, &right));
+        for index in 0..left.len() {
+            assert_eq!(a[index] ^ b[index], left[index] ^ right[index]);
+        }
     }
 
     #[test]
