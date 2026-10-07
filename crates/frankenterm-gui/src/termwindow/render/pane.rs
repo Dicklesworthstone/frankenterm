@@ -527,10 +527,7 @@ impl crate::TermWindow {
                 text: palette.foreground.to_linear().into(),
                 ..Default::default()
             });
-        let gl_state = self
-            .render_state
-            .as_ref()
-            .context("render state is not initialized")?;
+        let chrome = self.chrome()?;
         let computed = self.compute_element(
             &LayoutContext {
                 width: DimensionContext {
@@ -545,14 +542,14 @@ impl crate::TermWindow {
                 },
                 bounds,
                 metrics: &metrics,
-                gl_state,
+                chrome,
                 zindex: 1,
             },
             &element,
         )?;
         // This tile owns no pane-keyed cache or selection state. Other panes
         // finish the same frame; a returned cleanup credit requests its redraw.
-        self.render_element(&computed, gl_state, None)
+        self.render_element(&computed, chrome, None)
     }
 
     pub(crate) fn focused_floating_pane_border_width(&self, pane_id: PaneId) -> Option<f32> {

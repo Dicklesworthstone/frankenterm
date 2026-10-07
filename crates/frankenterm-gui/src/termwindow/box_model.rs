@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 use crate::color::LinearRgba;
 use crate::customglyph::{BlockKey, Poly};
-use crate::glyphcache::CachedGlyph;
+use crate::glyphcache::{CachedGlyph, GlyphCache};
 use crate::quad::{QuadImpl, QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
 use crate::termwindow::{ColorEase, MouseCapture, RenderState, UIItem, UIItemType};
-use crate::utilsprites::RenderMetrics;
+use crate::utilsprites::{RenderMetrics, UtilSprites};
 use ::window::RectF;
 use anyhow::anyhow;
 use config::{Dimension, DimensionContext};
@@ -411,12 +411,49 @@ fn text_from_glyph_cluster(text: &str, cluster: u32) -> anyhow::Result<&str> {
     })
 }
 
+/// What laying out and drawing window chrome (the box model, filled
+/// rectangles and polys) needs from a front end: the glyph cache that shapes
+/// and rasterizes chrome text and polys, its util sprites, and a quad layer
+/// per zindex. The WebGpu front end's `RenderState` is one; the Metal front
+/// end keeps one of its own, so chrome is laid out, hit-tested and drawn by
+/// the same code on both (ft-yccm0.4.7.1).
+pub trait ChromeTarget {
+    fn glyph_cache(&self) -> &RefCell<GlyphCache>;
+    fn util_sprites(&self) -> &UtilSprites;
+    /// Calls `draw` with the quad layers of `zindex`.
+    fn draw_in_layer(
+        &self,
+        zindex: i8,
+        draw: &mut dyn FnMut(&mut TripleLayerQuadAllocator) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()>;
+}
+
+impl ChromeTarget for RenderState {
+    fn glyph_cache(&self) -> &RefCell<GlyphCache> {
+        &self.glyph_cache
+    }
+
+    fn util_sprites(&self) -> &UtilSprites {
+        &self.util_sprites
+    }
+
+    fn draw_in_layer(
+        &self,
+        zindex: i8,
+        draw: &mut dyn FnMut(&mut TripleLayerQuadAllocator) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let layer = self.layer_for_zindex(zindex)?;
+        let mut layers = layer.quad_allocator();
+        draw(&mut layers)
+    }
+}
+
 pub struct LayoutContext<'a> {
     pub width: DimensionContext,
     pub height: DimensionContext,
     pub bounds: RectF,
     pub metrics: &'a RenderMetrics,
-    pub gl_state: &'a RenderState,
+    pub chrome: &'a dyn ChromeTarget,
     pub zindex: i8,
 }
 
@@ -571,7 +608,7 @@ impl super::TermWindow {
                 },
                 width: context.width,
                 bounds: context.bounds,
-                gl_state: context.gl_state,
+                chrome: context.chrome,
                 metrics: &local_metrics,
                 zindex: context.zindex,
             };
@@ -622,7 +659,7 @@ impl super::TermWindow {
                     None,
                 )?;
                 let mut computed_cells = vec![];
-                let mut glyph_cache = context.gl_state.glyph_cache.borrow_mut();
+                let mut glyph_cache = context.chrome.glyph_cache().borrow_mut();
                 let mut pixel_width = 0.0;
                 let mut x_pos = context.bounds.min_x();
                 let mut min_y = 0.0f32;
@@ -731,7 +768,7 @@ impl super::TermWindow {
                     let kid = self.compute_element(
                         &LayoutContext {
                             bounds,
-                            gl_state: context.gl_state,
+                            chrome: context.chrome,
                             height: context.height,
                             metrics: context.metrics,
                             width: DimensionContext {
@@ -841,12 +878,9 @@ impl super::TermWindow {
     pub fn render_element<'a>(
         &self,
         element: &ComputedElement,
-        gl_state: &RenderState,
+        chrome: &dyn ChromeTarget,
         inherited_colors: Option<&ElementColors>,
     ) -> anyhow::Result<()> {
-        let layer = gl_state.layer_for_zindex(element.zindex)?;
-        let mut layers = layer.quad_allocator();
-
         let colors = match &element.hover_colors {
             Some(hc) => {
                 let hovering =
@@ -866,7 +900,29 @@ impl super::TermWindow {
             None => &element.colors,
         };
 
-        self.render_element_background(element, colors, &mut layers, inherited_colors)?;
+        chrome.draw_in_layer(element.zindex, &mut |layers| {
+            self.render_element_quads(element, colors, layers, inherited_colors)
+        })?;
+        // The children draw after this element's layer is released, as
+        // they may draw into the same layer.
+        if let ComputedElementContent::Children(kids) = &element.content {
+            for kid in kids {
+                self.render_element(kid, chrome, Some(colors))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// An element's own quads, its background and its text or poly, in
+    /// `layers`; its children draw separately.
+    fn render_element_quads(
+        &self,
+        element: &ComputedElement,
+        colors: &ElementColors,
+        layers: &mut TripleLayerQuadAllocator,
+        inherited_colors: Option<&ElementColors>,
+    ) -> anyhow::Result<()> {
+        self.render_element_background(element, colors, layers, inherited_colors)?;
         let left = self.dimensions.pixel_width as f32 / -2.0;
         let top = self.dimensions.pixel_height as f32 / -2.0;
         match &element.content {
@@ -930,17 +986,11 @@ impl super::TermWindow {
                     }
                 }
             }
-            ComputedElementContent::Children(kids) => {
-                drop(layers);
-
-                for kid in kids {
-                    self.render_element(kid, gl_state, Some(colors))?;
-                }
-            }
+            ComputedElementContent::Children(_) => {}
             ComputedElementContent::Poly { poly, line_width } => {
                 if element.content_rect.width() >= poly.width {
                     let mut quad = self.poly_quad(
-                        &mut layers,
+                        layers,
                         1,
                         element.content_rect.origin,
                         poly.poly,

@@ -405,11 +405,7 @@ impl crate::TermWindow {
             for computed in modal.computed_element(self)?.iter() {
                 let mut ui_items = computed.ui_items();
 
-                let gl_state = self
-                    .render_state
-                    .as_ref()
-                    .context("render state is not initialized")?;
-                self.render_element(&computed, gl_state, None)?;
+                self.render_element(&computed, self.chrome()?, None)?;
 
                 self.ui_items.append(&mut ui_items);
             }

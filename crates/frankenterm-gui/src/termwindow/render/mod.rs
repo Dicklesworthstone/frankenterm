@@ -6,6 +6,7 @@ use crate::quad::{
     TripleLayerQuadAllocatorTrait,
 };
 use crate::shapecache::*;
+use crate::termwindow::box_model::ChromeTarget;
 use crate::termwindow::render::paint::AllowImage;
 use crate::termwindow::{BorrowedShapeCacheKey, RenderState, ShapedInfo};
 use crate::utilsprites::RenderMetrics;
@@ -507,6 +508,15 @@ impl crate::TermWindow {
         None
     }
 
+    /// Where window chrome is laid out and drawn: the WebGpu front end's
+    /// render state (ft-yccm0.4.7.1).
+    pub(crate) fn chrome(&self) -> anyhow::Result<&dyn ChromeTarget> {
+        self.render_state
+            .as_ref()
+            .map(|state| state as &dyn ChromeTarget)
+            .context("render state is not initialized")
+    }
+
     pub fn filled_rectangle<'a>(
         &self,
         layers: &'a mut TripleLayerQuadAllocator,
@@ -517,17 +527,14 @@ impl crate::TermWindow {
         let mut quad = layers.allocate(layer_num)?;
         let left_offset = self.dimensions.pixel_width as f32 / 2.;
         let top_offset = self.dimensions.pixel_height as f32 / 2.;
-        let gl_state = self
-            .render_state
-            .as_ref()
-            .context("render state is not initialized")?;
+        let chrome = self.chrome()?;
         quad.set_position(
             rect.min_x() as f32 - left_offset,
             rect.min_y() as f32 - top_offset,
             rect.max_x() as f32 - left_offset,
             rect.max_y() as f32 - top_offset,
         );
-        quad.set_texture(gl_state.util_sprites.filled_box.texture_coords());
+        quad.set_texture(chrome.util_sprites().filled_box.texture_coords());
         quad.set_is_background();
         quad.set_fg_color(color);
         quad.set_hsv(None);
@@ -546,12 +553,9 @@ impl crate::TermWindow {
     ) -> anyhow::Result<QuadImpl<'a>> {
         let left_offset = self.dimensions.pixel_width as f32 / 2.;
         let top_offset = self.dimensions.pixel_height as f32 / 2.;
-        let gl_state = self
-            .render_state
-            .as_ref()
-            .context("render state is not initialized")?;
-        let sprite = gl_state
-            .glyph_cache
+        let sprite = self
+            .chrome()?
+            .glyph_cache()
             .borrow_mut()
             .cached_block(
                 BlockKey::PolyWithCustomMetrics {
