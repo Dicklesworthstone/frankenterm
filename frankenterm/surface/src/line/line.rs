@@ -1895,17 +1895,45 @@ impl Line {
     /// re-materialize the storage in a form that is suitable
     /// for mutation.
     pub fn compress_for_scrollback(&mut self) {
-        let cv = match &self.cells {
-            CellStorage::V(v) => ClusteredLine::from_cell_vec(v.len(), self.visible_cells()),
+        self.compress_for_scrollback_arm(Self::compress_legacy());
+    }
+
+    /// `compress_for_scrollback`, through the checked builder (one pass
+    /// over the cells, presized storage) or, with `legacy`, through
+    /// `from_cell_vec` and a separate `reproduces` pass, as before
+    /// ft-yccm0.3.2.6. Both arms leave the same line.
+    fn compress_for_scrollback_arm(&mut self, legacy: bool) {
+        let (cv, inert) = match &self.cells {
+            CellStorage::V(v) if legacy => (
+                ClusteredLine::from_cell_vec(v.len(), self.visible_cells()),
+                false,
+            ),
+            CellStorage::V(v) => ClusteredLine::from_cells_checked(v.len(), self.visible_cells()),
             CellStorage::C(_) => return,
         };
         // Clustered storage re-segments its text, so it may only replace
         // cells it reproduces exactly: neighbours that cluster with each
         // other (a split regional-indicator pair) stay in vector storage.
-        if !cv.reproduces(|| self.visible_cells()) {
+        // Inert boundaries everywhere already prove it does.
+        if !inert && !cv.reproduces(|| self.visible_cells()) {
             return;
         }
         self.cells = CellStorage::C(Arc::new(cv));
+    }
+
+    /// `FT_LINE_COMPRESS_LEGACY=1` compresses rows for scrollback through
+    /// the builder and checks used before ft-yccm0.3.2.6: the A/B arm and a
+    /// rollback. Both arms leave the same line. Resolved once per process.
+    fn compress_legacy() -> bool {
+        #[cfg(feature = "std")]
+        {
+            static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *LEGACY.get_or_init(|| {
+                std::env::var_os("FT_LINE_COMPRESS_LEGACY").is_some_and(|v| v == "1")
+            })
+        }
+        #[cfg(not(feature = "std"))]
+        false
     }
 
     /// Rebuild canonical attribute runs without materializing a cell vector.
@@ -4555,6 +4583,77 @@ mod tests {
                 assert_eq!(clustered.len(), width, "{text:?} at {width}");
                 assert!(clustered == vector, "{:?} at {}", text, width);
                 assert_eq!(clustered.current_seqno(), vector.current_seqno());
+            }
+        }
+    }
+
+    /// ft-yccm0.3.2.6: compressing for scrollback through the checked,
+    /// presized builder leaves the line the legacy builder and its separate
+    /// `reproduces` pass leave, compressed or not: inert rows, a row whose
+    /// boundary is not inert but reproduces, a row whose neighbours cluster,
+    /// and a T0 row with new colours on every cell. Its clusters fit.
+    #[test]
+    fn compress_for_scrollback_arms_leave_the_same_line() {
+        use frankenterm_cell::color::ColorAttribute;
+        let plain = CellAttributes::default();
+        let mut rows = vec![
+            Line::from_text("plain text", &plain, 3, None),
+            Line::from_text("h\u{e9} \u{1f600} we\u{301}rld", &plain, 3, None),
+            Line::from_text("wide \u{1f468}\u{200d}\u{1f469} end", &plain, 3, None),
+            Line::new(3),
+        ];
+        // A terminal row: vector storage of styled blanks, then printed.
+        let mut t0 = Line::with_width_and_cell(140, Cell::blank_with_attrs(plain.clone()), 3);
+        let mut column = 0;
+        for n in 0..70u8 {
+            let mut attrs = CellAttributes::default();
+            attrs.set_foreground(ColorAttribute::PaletteIndex(n));
+            attrs.set_background(ColorAttribute::PaletteIndex(n.wrapping_mul(7)));
+            let text = if n.is_multiple_of(9) {
+                "h"
+            } else {
+                "\u{1f600}"
+            };
+            let cell = Cell::new_grapheme(text, attrs, None);
+            let width = cell.width();
+            t0.set_cell(column, cell, 3);
+            column += width;
+        }
+        rows.push(t0);
+        let mut split = Line::new(3);
+        let first = Cell::new_grapheme("\u{1F1FA}", plain.clone(), None);
+        let second_column = first.width();
+        split.set_cell(0, first, 3);
+        split.set_cell(
+            second_column,
+            Cell::new_grapheme("\u{1F1F8}", plain.clone(), None),
+            3,
+        );
+        rows.push(split);
+        let last = rows.len() - 1;
+        for (index, row) in rows.into_iter().enumerate() {
+            // Line::new (index 3) starts clustered; every other row is a
+            // vector row, so each arm really compresses it.
+            assert_eq!(row.has_clustered_storage(), index == 3, "row {}", index);
+            let mut legacy = row.clone();
+            let mut checked = row.clone();
+            legacy.compress_for_scrollback_arm(true);
+            checked.compress_for_scrollback_arm(false);
+            let text = row.as_str().into_owned();
+            assert_eq!(
+                checked.has_clustered_storage(),
+                legacy.has_clustered_storage(),
+                "{:?}",
+                text
+            );
+            assert_eq!(checked.has_clustered_storage(), index != last, "{:?}", text);
+            assert!(checked == legacy, "{:?}", text);
+            match &checked.cells {
+                // Built here by the checked builder, not appended to before.
+                CellStorage::C(cl) if !row.has_clustered_storage() => {
+                    assert!(cl.clusters_fit(), "{:?}", text);
+                }
+                _ => {}
             }
         }
     }

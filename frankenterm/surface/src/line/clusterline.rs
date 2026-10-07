@@ -317,16 +317,48 @@ impl ClusteredLine {
     }
 
     pub fn from_cell_vec<'a>(hint: usize, iter: impl Iterator<Item = CellRef<'a>>) -> Self {
+        Self::build(hint, iter, false).0
+    }
+
+    /// [`Self::from_cell_vec`], built for `compress_for_scrollback`
+    /// (ft-yccm0.3.2.6), which returns the same line:
+    /// - also returns whether every boundary between neighbouring cells is
+    ///   inert, the cheap pass of [`Self::reproduces`], so that a caller
+    ///   re-segments only when it is not;
+    /// - sizes the clusters for one per cell and trims them to fit at the
+    ///   end, and starts the text with a byte per cell, where both grew by
+    ///   doubling (a T0 row's 60 to 120 clusters reallocated six times).
+    pub fn from_cells_checked<'a>(
+        hint: usize,
+        iter: impl Iterator<Item = CellRef<'a>>,
+    ) -> (Self, bool) {
+        Self::build(hint, iter, true)
+    }
+
+    fn build<'a>(
+        hint: usize,
+        iter: impl Iterator<Item = CellRef<'a>>,
+        presize: bool,
+    ) -> (Self, bool) {
         let mut last_cluster: Option<Cluster> = None;
         let mut is_double_wide = FixedBitSet::with_capacity(hint);
         // Attribute cloning and cluster growth happen after text append in the
         // loop below and may unwind.  Guard the builder from its first
         // allocation until the complete ClusteredLine can take ownership.
         let mut text = Zeroizing::new(String::new());
-        let mut clusters = vec![];
+        let mut clusters = if presize {
+            guarded_reserve_text(&mut text, hint);
+            Vec::with_capacity(hint)
+        } else {
+            vec![]
+        };
         let mut any_double = false;
         let mut len = 0usize;
         let mut last_cell_width = None;
+        // As the first pass of `reproduces`: the last char so far, and
+        // whether every boundary so far is inert.
+        let mut prev_char = None;
+        let mut inert = true;
 
         for cell in iter {
             let cell_width = Self::normalize_cell_width(cell.width());
@@ -336,6 +368,16 @@ impl ClusteredLine {
             if cell_width > 1 {
                 any_double = true;
                 is_double_wide.set(cell.cell_index(), true);
+            }
+
+            if inert {
+                let cell_text = cell.str();
+                match cell_text.chars().next() {
+                    Some(first) if breaks_between(prev_char, first) => {
+                        prev_char = cell_text.chars().next_back();
+                    }
+                    _ => inert = false,
+                }
             }
 
             guarded_push_str(&mut text, cell.str());
@@ -371,6 +413,9 @@ impl ClusteredLine {
         if let Some(cluster) = last_cluster.take() {
             clusters.push(cluster);
         }
+        if presize {
+            clusters.shrink_to_fit();
+        }
 
         // Box allocation is the final potentially panicking construction
         // step; complete it while the accumulated text is still guarded.
@@ -380,17 +425,24 @@ impl ClusteredLine {
             None
         };
 
-        Self {
+        let line = Self {
             text: core::mem::take(&mut *text),
             is_double_wide,
             clusters,
             len: len.min(u32::MAX as usize) as u32,
             last_cell_width,
-        }
+        };
+        (line, inert)
     }
 
     pub fn len(&self) -> usize {
         self.len as usize
+    }
+
+    /// Whether the clusters hold no spare capacity.
+    #[cfg(test)]
+    pub(crate) fn clusters_fit(&self) -> bool {
+        self.clusters.capacity() == self.clusters.len()
     }
 
     /// Whether a cell holding the grapheme `text` may be appended at cell
