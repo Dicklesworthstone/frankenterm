@@ -100,8 +100,12 @@ pub struct SceneUpdate {
     pub rows_rebuilt: usize,
     /// The grids were rebuilt from scratch.
     pub full: bool,
-    /// The rings rotated by this many rows (output scrolling).
+    /// The rings rotated up by this many rows (output scrolling, or the
+    /// viewport moving down).
     pub scrolled: u32,
+    /// The rings rotated down by this many rows (the viewport moving back
+    /// through scrollback).
+    pub scrolled_back: u32,
 }
 
 /// One pane's Metal frame inputs, rebuilt incrementally from its mirror.
@@ -265,6 +269,16 @@ impl MetalScene {
                     *built = BuiltRow::default();
                 }
                 update.scrolled = lines;
+            } else if delta < 0 && (delta.unsigned_abs()) < rows.len() {
+                let back = delta.unsigned_abs();
+                let lines = u32::try_from(back).unwrap_or(u32::MAX);
+                self.cells.scroll_down(lines);
+                self.text.scroll_down(lines);
+                self.built.rotate_right(back);
+                for built in &mut self.built[..back] {
+                    *built = BuiltRow::default();
+                }
+                update.scrolled_back = lines;
             }
         }
         let hover_changed = !same_link(self.hover.as_ref(), style.hover);
@@ -807,6 +821,56 @@ mod tests {
         };
         let update = step(t, m, s, g, &selection, &restyled);
         assert_eq!((update.full, update.rows_rebuilt), (true, 10));
+    }
+
+    /// Scrollback navigation (ft-yccm0.4.2.4): moving the viewport back or
+    /// forward by a few rows rotates the rings and rebuilds only the exposed
+    /// rows (and the row the cursor left), never the whole frame.
+    #[test]
+    fn scrollback_navigation_rotates_the_rings_and_rebuilds_the_exposed_rows() {
+        let palette = ColorPalette::default();
+        let style = plain_style(&palette);
+        let mut glyphs = SyntheticGlyphs::default();
+        let mut term = terminal(6, 20);
+        for row in 0..30 {
+            term.advance_bytes(format!("row {row}\r\n"));
+        }
+        let top = terminal_get_dimensions(&mut term).physical_top;
+        let mut mirror = RenderMirror::new();
+        let mut scene = MetalScene::new();
+        let mut at = |viewport_top: StableRowIndex,
+                      scene: &mut MetalScene,
+                      mirror: &mut RenderMirror,
+                      term: &mut Terminal| {
+            let request = CaptureRequest {
+                viewport_top: Some(viewport_top),
+                rules: &[],
+                rules_generation: 0,
+            };
+            capture_terminal_rows(term, mirror, &request).expect("resident");
+            let update = scene.update(mirror, &style, &no_selection, &mut glyphs);
+            let mut full = MetalScene::new();
+            full.update(
+                &reference_mirror(term, Some(viewport_top)),
+                &style,
+                &no_selection,
+                &mut glyphs,
+            );
+            assert_eq!(difference(scene, &full), None, "at {viewport_top}");
+            update
+        };
+        let (s, m, t) = (&mut scene, &mut mirror, &mut term);
+        assert!(at(top, s, m, t).full);
+        let back = at(top - 2, s, m, t);
+        assert_eq!(
+            (back.full, back.scrolled_back, back.scrolled),
+            (false, 2, 0)
+        );
+        assert!(back.rows_rebuilt <= 3, "{back:?}");
+        let back = at(top - 5, s, m, t);
+        assert_eq!((back.scrolled_back, back.rows_rebuilt), (3, 3));
+        let forward = at(top - 4, s, m, t);
+        assert_eq!((forward.scrolled, forward.rows_rebuilt), (1, 1));
     }
 
     /// Exact readback (ft-yccm0.4.4): incremental frames and frames built
