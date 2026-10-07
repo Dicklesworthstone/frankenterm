@@ -2,9 +2,11 @@
 //!
 //! Each benchmark runs one 4096-row commit window, the largest batch the store
 //! accepts, through the per-row stages the writer thread runs: the exact
-//! semantic plaintext alone, plaintext plus compression, the full record
-//! (serialize, compress, seal, encode) as one String per row, and the same
-//! records sealed in place into one reused batch string. Rows are printable
+//! semantic plaintext alone, plaintext plus compression, the full v3 record
+//! (serialize, compress, seal, encode) as one String per row, the same
+//! records sealed in place into one reused batch string, and the compact v4
+//! record batches now store (same payload, nonce from the segment stream,
+//! no per-row header). Rows are printable
 //! with one attribute run, at the two line lengths the amplification targets
 //! name (9 and 91 bytes), and T0-like rows of wide emoji with per-cell palette
 //! colors. Throughput is the rows' UTF-8 text bytes, so "MiB/s" is MiB of
@@ -28,15 +30,19 @@ fn record_path(c: &mut Criterion) {
     ];
     for (shape, rows) in &shapes {
         let record_bytes = sealer.seal(rows);
+        let compact_bytes = sealer.seal_compact(rows, &mut Vec::new());
         let (plaintext_bytes, payload_bytes) = sealer.serialize_and_compress(rows);
         let per_row = |bytes: usize| bytes as f64 / WINDOW_ROWS as f64;
         eprintln!(
             "scrollback_record {shape}: per row {:.1} plaintext, {:.1} sealed payload, \
-             {:.1} record bytes ({:.1}x the row text)",
+             {:.1} v3 record bytes ({:.1}x the row text), {:.1} compact record bytes \
+             ({:.1}x)",
             per_row(plaintext_bytes),
             per_row(payload_bytes),
             per_row(record_bytes),
             record_bytes as f64 / rows.text_bytes() as f64,
+            per_row(compact_bytes),
+            compact_bytes as f64 / rows.text_bytes() as f64,
         );
         group.throughput(Throughput::Bytes(rows.text_bytes()));
         group.bench_with_input(BenchmarkId::new("serialize", shape), rows, |bench, rows| {
@@ -64,6 +70,13 @@ fn record_path(c: &mut Criterion) {
                 bench.iter(|| {
                     black_box(sealer.seal_into(black_box(rows), &mut scratch, &mut records))
                 });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("seal_compact_records", shape),
+            rows,
+            |bench, rows| {
+                bench.iter(|| black_box(sealer.seal_compact(black_box(rows), &mut scratch)));
             },
         );
     }
