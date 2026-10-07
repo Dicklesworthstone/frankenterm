@@ -800,10 +800,10 @@ impl MetalRenderer {
         &'a self,
         frames: &'a FrameSlots,
         slot: usize,
-        quads: usize,
+        range: std::ops::Range<usize>,
         [width, height]: [u32; 2],
     ) -> Result<Option<UiDraw<'a>>, FrameError> {
-        if quads == 0 {
+        if range.is_empty() {
             return Ok(None);
         }
         let buffers = frames
@@ -815,7 +815,8 @@ impl MetalRenderer {
         Ok(Some(UiDraw {
             pipeline: &self.ui,
             buffers,
-            quads,
+            first: range.start,
+            quads: range.len(),
             scissor: crate::PixelRect::new(0, 0, width, height),
         }))
     }
@@ -905,7 +906,9 @@ impl MetalRenderer {
             };
             draws.push(draw);
         }
-        let ui = self.ui_draw(&frames, slot, ui_quads, [width, height])?;
+        let under = frame.ui.as_ref().map_or(0, |ui| ui.under.min(ui_quads));
+        let ui_under = self.ui_draw(&frames, slot, 0..under, [width, height])?;
+        let ui = self.ui_draw(&frames, slot, under..ui_quads, [width, height])?;
         let atlases = self.atlases.borrow();
         self.submission.encode_window(
             &frames,
@@ -922,6 +925,7 @@ impl MetalRenderer {
                     instances: 0,
                 },
                 draws: &draws,
+                ui_under,
                 ui,
             },
         )

@@ -586,15 +586,27 @@ impl TermWindow {
 
     /// What the render thread's next frame needs from this window.
     pub(super) fn metal_frame_request(&mut self) -> MetalFrameRequest {
-        let (panes, splits) = self.metal_window_panes();
+        let (mut panes, splits) = self.metal_window_panes();
         // After the panes: its hit-test items follow theirs, as in paint_pass.
         let chrome = self.metal_chrome_frame();
+        let mut clear = self.metal_clear_color();
+        if chrome
+            .as_ref()
+            .is_some_and(ChromeFrame::has_background_layers)
+        {
+            // Over background layers the WebGpu renderer fills neither the
+            // window nor the panes' backgrounds; default cells are clear.
+            clear = ClearColor::from_srgba(0.0, 0.0, 0.0, 0.0);
+            for pane in &mut panes {
+                pane.clear = clear;
+            }
+        }
         MetalFrameRequest {
             panes,
             splits,
             chrome,
             config: self.config.clone(),
-            clear: self.metal_clear_color(),
+            clear,
             grid: GridExtent::new(self.terminal_size.rows, self.terminal_size.cols),
             font_scale: self.fonts.get_font_scale(),
             opaque: self.window_background.is_empty()

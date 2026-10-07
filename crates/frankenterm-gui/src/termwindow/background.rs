@@ -1,8 +1,9 @@
 use crate::Dimensions;
 use crate::color::LinearRgba;
 use crate::glyphcache::LoadState;
-use crate::quad::{QuadAllocator, QuadTrait};
-use crate::termwindow::{RenderState, TermWindowNotif};
+use crate::quad::{QuadTrait, TripleLayerQuadAllocatorTrait};
+use crate::termwindow::TermWindowNotif;
+use crate::termwindow::box_model::ChromeTarget;
 use crate::utilsprites::RenderMetrics;
 use ::window::WindowOps;
 use anyhow::Context;
@@ -1770,10 +1771,7 @@ impl crate::TermWindow {
         bg_color: LinearRgba,
         top: StableRowIndex,
     ) -> anyhow::Result<bool> {
-        let gl_state = self
-            .render_state
-            .as_ref()
-            .context("render state is not initialized")?;
+        let chrome = self.chrome()?;
         let mut layer_idx = -127;
         let mut loaded_any = false;
         for layer in self
@@ -1781,7 +1779,7 @@ impl crate::TermWindow {
             .iter()
             .take(MAX_ACTIVE_BACKGROUND_LAYERS)
         {
-            if self.render_background(gl_state, bg_color, layer, layer_idx, top)? {
+            if self.render_background(chrome, bg_color, layer, layer_idx, top)? {
                 loaded_any = true;
                 layer_idx = layer_idx.saturating_add(1);
             }
@@ -1789,18 +1787,16 @@ impl crate::TermWindow {
         Ok(loaded_any)
     }
 
+    /// Draws one background layer at `layer_index`, through `chrome` so the
+    /// Metal front end draws the same quads (ft-yccm0.4.7.1).
     fn render_background(
         &self,
-        gl_state: &RenderState,
+        chrome: &dyn ChromeTarget,
         bg_color: LinearRgba,
         layer: &LoadedBackgroundLayer,
         layer_index: i8,
         top: StableRowIndex,
     ) -> anyhow::Result<bool> {
-        let render_layer = gl_state.layer_for_zindex(layer_index)?;
-        let vbs = render_layer.vb.borrow();
-        let mut layer0 = vbs[0].map();
-
         // Compose per-layer opacity with the global window opacity. Without
         // this multiplication, a config that sets both `window_background_opacity
         // = 0.85` AND `config.background = { { opacity = 0.92, ... } }` would
@@ -1814,7 +1810,7 @@ impl crate::TermWindow {
             .mul_alpha(layer.def.opacity)
             .mul_alpha(self.config.window_background_opacity);
 
-        let (sprite, next_due, load_state) = gl_state.glyph_cache.borrow_mut().cached_image(
+        let (sprite, next_due, load_state) = chrome.glyph_cache().borrow_mut().cached_image(
             &layer.source,
             None,
             self.allow_images,
@@ -2048,46 +2044,49 @@ impl crate::TermWindow {
 
         let mut emitted = false;
 
-        for y_offset in 0..y_count {
-            let offset_y = y_offset as f32 * repeat_y;
-            let origin_y = origin_y + offset_y;
-            if origin_y >= limit_y {
-                break;
-            }
-
-            for x_step in 0..x_count {
-                let offset_x = x_step as f32 * repeat_x;
-                let origin_x = origin_x + offset_x;
-                if origin_x >= right_pixel {
+        chrome.draw_in_layer(layer_index, &mut |layers| {
+            for y_offset in 0..y_count {
+                let offset_y = y_offset as f32 * repeat_y;
+                let origin_y = origin_y + offset_y;
+                if origin_y >= limit_y {
                     break;
                 }
-                let mut quad = layer0.allocate()?;
-                emitted = true;
-                // log::info!("quad {origin_x},{origin_y} {width}x{height}");
-                quad.set_position(origin_x, origin_y, origin_x + width, origin_y + height);
 
-                let coords = sprite.texture_coords();
-                let mut x1 = coords.min_x();
-                let mut x2 = coords.max_x();
-                let mut y1 = coords.min_y();
-                let mut y2 = coords.max_y();
-                if layer.def.repeat_x == BackgroundRepeat::Mirror
-                    && (first_x_mirrored ^ (x_step % 2 == 1))
-                {
-                    std::mem::swap(&mut x1, &mut x2);
-                }
-                if layer.def.repeat_y == BackgroundRepeat::Mirror
-                    && (first_y_mirrored ^ (y_offset % 2 == 1))
-                {
-                    std::mem::swap(&mut y1, &mut y2);
-                }
+                for x_step in 0..x_count {
+                    let offset_x = x_step as f32 * repeat_x;
+                    let origin_x = origin_x + offset_x;
+                    if origin_x >= right_pixel {
+                        break;
+                    }
+                    let mut quad = layers.allocate(0)?;
+                    emitted = true;
+                    // log::info!("quad {origin_x},{origin_y} {width}x{height}");
+                    quad.set_position(origin_x, origin_y, origin_x + width, origin_y + height);
 
-                quad.set_texture_discrete(x1, x2, y1, y2);
-                quad.set_is_background_image();
-                quad.set_hsv(Some(layer.def.hsb));
-                quad.set_fg_color(color);
+                    let coords = sprite.texture_coords();
+                    let mut x1 = coords.min_x();
+                    let mut x2 = coords.max_x();
+                    let mut y1 = coords.min_y();
+                    let mut y2 = coords.max_y();
+                    if layer.def.repeat_x == BackgroundRepeat::Mirror
+                        && (first_x_mirrored ^ (x_step % 2 == 1))
+                    {
+                        std::mem::swap(&mut x1, &mut x2);
+                    }
+                    if layer.def.repeat_y == BackgroundRepeat::Mirror
+                        && (first_y_mirrored ^ (y_offset % 2 == 1))
+                    {
+                        std::mem::swap(&mut y1, &mut y2);
+                    }
+
+                    quad.set_texture_discrete(x1, x2, y1, y2);
+                    quad.set_is_background_image();
+                    quad.set_hsv(Some(layer.def.hsb));
+                    quad.set_fg_color(color);
+                }
             }
-        }
+            Ok(())
+        })?;
 
         Ok(emitted)
     }

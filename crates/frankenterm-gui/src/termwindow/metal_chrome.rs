@@ -11,6 +11,7 @@
 
 use super::TermWindow;
 use super::box_model::ChromeTarget;
+use super::render::paint::AllowImage;
 use crate::glyphcache::GlyphCache;
 use crate::quad::{HeapQuadAllocator, TripleLayerQuadAllocator, V_BOT_RIGHT, V_TOP_LEFT, Vertex};
 use crate::utilsprites::{RenderMetrics, UtilSprites};
@@ -46,6 +47,9 @@ pub(crate) struct ChromeAtlas {
 #[derive(Clone)]
 pub(crate) struct ChromeFrame {
     quads: Arc<[UiQuad]>,
+    /// How many of `quads`, from the first, are window background layers,
+    /// drawn under the panes.
+    under: usize,
     atlas: Arc<ChromeAtlas>,
     foreground_text_hsb: [f32; 3],
 }
@@ -60,8 +64,15 @@ impl ChromeFrame {
                 rgba: &self.atlas.rgba,
             },
             quads: &self.quads,
+            under: self.under,
             foreground_text_hsb: self.foreground_text_hsb,
         }
+    }
+
+    /// Window background layers were drawn: as the WebGpu renderer does
+    /// then, nothing else fills the window or the panes' backgrounds.
+    pub(crate) fn has_background_layers(&self) -> bool {
+        self.under > 0
     }
 }
 
@@ -128,13 +139,20 @@ impl MetalChrome {
 
     /// The quads drawn since the layers were cleared, in the order the
     /// WebGpu front end draws them: by zindex, then by layer.
-    fn quads(&self, half_width: f32, half_height: f32) -> Arc<[UiQuad]> {
-        self.layers
-            .borrow()
+    /// Also how many come from negative zindexes, the window background
+    /// layers the WebGpu renderer draws under the panes (zindex 0).
+    fn quads(&self, half_width: f32, half_height: f32) -> (Arc<[UiQuad]>, usize) {
+        let layers = self.layers.borrow();
+        let under = layers
+            .range(..0)
+            .map(|(_, layer)| layer.vertices().count())
+            .sum();
+        let quads = layers
             .values()
             .flat_map(HeapQuadAllocator::vertices)
             .map(|vertices| ui_quad(&vertices, half_width, half_height))
-            .collect()
+            .collect();
+        (quads, under)
     }
 
     /// A copy of the glyph cache's texture, made again only when it changed.
@@ -196,7 +214,10 @@ impl TermWindow {
     #[allow(clippy::cast_precision_loss)]
     pub(crate) fn metal_chrome_frame(&mut self) -> Option<ChromeFrame> {
         let tab_bar = self.show_tab_bar && self.config.use_fancy_tab_bar;
-        if !tab_bar && self.get_modal().is_none() {
+        // As paint_pass: background layers when images are allowed.
+        let backgrounds = !self.window_background.is_empty()
+            && matches!(self.allow_images, AllowImage::Yes | AllowImage::Scale(_));
+        if !tab_bar && !backgrounds && self.get_modal().is_none() {
             return None;
         }
         let mut side = self
@@ -222,7 +243,7 @@ impl TermWindow {
                 chrome.layers.borrow_mut().clear();
             }
             let items_before = self.ui_items.len();
-            match self.paint_metal_chrome(tab_bar) {
+            match self.paint_metal_chrome(backgrounds, tab_bar) {
                 Ok(()) => break,
                 Err(err)
                     if err
@@ -243,11 +264,13 @@ impl TermWindow {
             }
         }
         let chrome = self.metal_chrome.as_ref()?;
+        let (quads, under) = chrome.quads(
+            self.dimensions.pixel_width as f32 / 2.0,
+            self.dimensions.pixel_height as f32 / 2.0,
+        );
         Some(ChromeFrame {
-            quads: chrome.quads(
-                self.dimensions.pixel_width as f32 / 2.0,
-                self.dimensions.pixel_height as f32 / 2.0,
-            ),
+            quads,
+            under,
             atlas: chrome.atlas(),
             foreground_text_hsb: {
                 let hsb = self.config.foreground_text_hsb;
@@ -256,9 +279,26 @@ impl TermWindow {
         })
     }
 
-    /// The fancy tab bar (when `tab_bar`), then any modal, as `paint_pass`
-    /// paints them for the other front ends.
-    fn paint_metal_chrome(&mut self, tab_bar: bool) -> anyhow::Result<()> {
+    /// The window background layers (when `backgrounds`), the fancy tab bar
+    /// (when `tab_bar`), then any modal, as `paint_pass` paints them for the
+    /// other front ends.
+    fn paint_metal_chrome(&mut self, backgrounds: bool, tab_bar: bool) -> anyhow::Result<()> {
+        if backgrounds {
+            let bg_color = self.palette().background.to_linear();
+            let top = self
+                .get_panes_to_render()
+                .iter()
+                .find(|pos| pos.is_active)
+                .map(|pos| match self.get_viewport(pos.pane.pane_id()) {
+                    Some(top) => top,
+                    None => pos.pane.render_facts().dimensions.physical_top,
+                })
+                .unwrap_or(0);
+            // Layers still loading draw nothing yet, as on WebGpu, which then
+            // fills the terminal background instead: so does the Metal frame
+            // while no layer quad was drawn.
+            self.render_backgrounds(bg_color, top)?;
+        }
         if tab_bar {
             if self.fancy_tab_bar.is_none() {
                 let palette = self.palette().clone();

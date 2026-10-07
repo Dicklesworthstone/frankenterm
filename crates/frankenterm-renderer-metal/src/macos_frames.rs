@@ -1504,6 +1504,9 @@ pub(crate) struct EncodedWindow<'a> {
     pub(crate) background: &'a BackgroundPipeline,
     pub(crate) text: TextDraw<'a>,
     pub(crate) draws: &'a [WindowDraw<'a>],
+    /// Window background layers, drawn first; the panes' backgrounds then
+    /// blend over them.
+    pub(crate) ui_under: Option<UiDraw<'a>>,
     /// Window chrome, drawn last.
     pub(crate) ui: Option<UiDraw<'a>>,
 }
@@ -1513,9 +1516,18 @@ pub(crate) struct EncodedWindow<'a> {
 pub(crate) struct UiDraw<'a> {
     pub(crate) pipeline: &'a UiPipeline,
     pub(crate) buffers: UiBuffers<'a>,
+    /// The first quad drawn, and how many.
+    pub(crate) first: usize,
     pub(crate) quads: usize,
     /// The whole target.
     pub(crate) scissor: crate::PixelRect,
+}
+
+impl UiDraw<'_> {
+    /// Where the draw's first quad starts in the chrome buffer.
+    fn quads_offset(&self) -> usize {
+        UI_UNIFORMS_BYTES + self.first * UI_QUAD_BYTES
+    }
 }
 
 /// Draws a window frame's chrome quads (Metal 3).
@@ -1529,10 +1541,11 @@ fn draw_ui(encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>, ui: &UiDraw<'_
         encoder.setVertexBuffer_offset_atIndex(Some(ui.buffers.buffer), 0, 0);
     }
     #[allow(unsafe_code)]
-    // SAFETY: FFI-DRAW. The same buffer's quads, from UI_UNIFORMS_BYTES (inside
-    // the buffer, which holds them all), at the vertex shader's [[buffer(1)]].
+    // SAFETY: FFI-DRAW. The same buffer's quads, from the draw's first quad
+    // (inside the buffer, which holds them all), at the vertex shader's
+    // [[buffer(1)]].
     unsafe {
-        encoder.setVertexBuffer_offset_atIndex(Some(ui.buffers.buffer), UI_UNIFORMS_BYTES, 1);
+        encoder.setVertexBuffer_offset_atIndex(Some(ui.buffers.buffer), ui.quads_offset(), 1);
     }
     #[allow(unsafe_code)]
     // SAFETY: FFI-DRAW. The chrome uniforms at the fragment shader's
@@ -1862,10 +1875,18 @@ impl Metal3Submission {
         // texture alive.
         attachment.setTexture(None);
         let encoder = encoder.ok_or(FrameError::EncoderUnavailable)?;
-        // The panes' backgrounds (over false), or the fills drawn over the
-        // panes' text (over true).
+        if let Some(under) = &window.ui_under {
+            draw_ui(&encoder, under);
+        }
+        // The panes' backgrounds (over false), blended over any window
+        // background layers, or the fills drawn over the panes' text (over
+        // true).
         let backgrounds = |over: bool| {
-            encoder.setRenderPipelineState(window.background.pipeline(over));
+            encoder.setRenderPipelineState(
+                window
+                    .background
+                    .pipeline(over || window.ui_under.is_some()),
+            );
             for draw in window.draws.iter().filter(|draw| draw.over == over) {
                 encoder.setScissorRect(scissor(draw.scissor));
                 #[allow(unsafe_code)]
@@ -2128,7 +2149,7 @@ impl Metal4Submission {
         let buffer = ui.buffers.buffer.gpuAddress();
         // The chrome shader's two buffers take the first two binding indices.
         Self::bind_address(table, buffer, SlotBuffer::Uniforms);
-        Self::bind_address(table, buffer + UI_UNIFORMS_BYTES as u64, SlotBuffer::CellBg);
+        Self::bind_address(table, buffer + ui.quads_offset() as u64, SlotBuffer::CellBg);
         #[allow(unsafe_code)]
         // SAFETY: FFI-ARGTABLE. The live chrome atlas's resource ID; the frame
         // slots keep it in their residency set, which joined this queue, until
@@ -2170,10 +2191,12 @@ impl Metal4Submission {
     ) -> Result<(), FrameError> {
         let slot = lease.slot();
         let mut tables = self.window_tables[slot].borrow_mut();
-        // One table per draw, the chrome's last: no draw depends on when the
-        // encoder reads a table's bindings. The lease proves this slot's
-        // previous frame, the last to read them, completed.
-        while tables.len() < window.draws.len() + usize::from(window.ui.is_some()) {
+        // One table per draw, then the chrome's and the background layers':
+        // no draw depends on when the encoder reads a table's bindings. The
+        // lease proves this slot's previous frame, the last to read them,
+        // completed.
+        let (chrome_table, under_table) = (window.draws.len(), window.draws.len() + 1);
+        while tables.len() < under_table + 1 {
             let table = self
                 .device
                 .newArgumentTableWithDescriptor_error(&argument_table_descriptor())
@@ -2207,7 +2230,10 @@ impl Metal4Submission {
             }
         }
         if let Some(ui) = &window.ui {
-            Self::bind_ui(&tables[window.draws.len()], ui);
+            Self::bind_ui(&tables[chrome_table], ui);
+        }
+        if let Some(under) = &window.ui_under {
+            Self::bind_ui(&tables[under_table], under);
         }
         let commands = &self.command_buffers[slot];
         // The lease proves this slot's previous frame completed, so its
@@ -2224,10 +2250,18 @@ impl Metal4Submission {
             return Err(FrameError::EncoderUnavailable);
         };
         let stages = MTLRenderStages::Vertex | MTLRenderStages::Fragment;
-        // The panes' backgrounds (over false), or the fills drawn over the
-        // panes' text (over true).
+        if let Some(under) = &window.ui_under {
+            Self::draw_ui(&encoder, &tables[under_table], under, stages);
+        }
+        // The panes' backgrounds (over false), blended over any window
+        // background layers, or the fills drawn over the panes' text (over
+        // true).
         let backgrounds = |over: bool| {
-            encoder.setRenderPipelineState(window.background.pipeline(over));
+            encoder.setRenderPipelineState(
+                window
+                    .background
+                    .pipeline(over || window.ui_under.is_some()),
+            );
             for (table, draw) in tables
                 .iter()
                 .zip(window.draws)
@@ -2276,7 +2310,7 @@ impl Metal4Submission {
             backgrounds(true);
         }
         if let Some(ui) = &window.ui {
-            Self::draw_ui(&encoder, &tables[window.draws.len()], ui, stages);
+            Self::draw_ui(&encoder, &tables[chrome_table], ui, stages);
         }
         encoder.endEncoding();
         drop(tables);

@@ -468,6 +468,7 @@ fn chrome_layer<'a>(
             rgba,
         },
         quads,
+        under: 0,
         foreground_text_hsb: [1.0; 3],
     }
 }
@@ -641,4 +642,84 @@ fn chrome_quads_draw_as_the_webgpu_quad_shader_shades_them() {
     let redrawn = render(Some(layer(&quads, 2, &second)));
     assert!(within(&redrawn, &expected(&quads, &second)));
     assert_ne!(redrawn, drawn);
+}
+
+/// ft-yccm0.4.7.1: window background layers (`UiLayer::under`) are drawn
+/// under the panes, whose backgrounds blend over them, as the WebGpu
+/// renderer draws background images: a pane with a transparent background
+/// over a layer reads back as the same pane with that layer's color as its
+/// background, within 2 codes.
+#[test]
+// Pixel sizes are small.
+#[allow(clippy::cast_precision_loss)]
+fn background_layers_draw_under_the_panes() {
+    use crate::color::srgb_to_linear;
+    use crate::ui_quads::kind;
+
+    let renderer = renderer();
+    let glyph = glyph(&renderer);
+    let extent = GridExtent::new(4, 10);
+    let rect = rect_for(0, 0, extent);
+    let content = content(extent, 3, &glyph);
+    let (red, green, blue) = (0.8, 0.1, 0.1);
+    let backdrop_color = ClearColor::from_srgba(red, green, blue, 1.0);
+    let transparent = ClearColor::from_srgba(0.0, 0.0, 0.0, 0.0);
+    let backdrop = [UiQuad {
+        rect: [0.0, 0.0, rect.width as f32, rect.height as f32],
+        uv: [0.0, 0.0, 1.0, 1.0],
+        fg: [
+            srgb_to_linear(red),
+            srgb_to_linear(green),
+            srgb_to_linear(blue),
+            1.0,
+        ],
+        alt: [0.0; 4],
+        mix: 0.0,
+        hsv: [1.0; 3],
+        kind: kind::SOLID_COLOR,
+    }];
+    let atlas = [0u8; 64];
+    let render = |pane_clear: ClearColor, ui| {
+        let panes = [PaneScene {
+            clear: pane_clear,
+            ..pane(1, rect, &content, None)
+        }];
+        renderer
+            .snapshot_window(
+                rect.width,
+                rect.height,
+                &WindowFrame {
+                    clear: pane_clear,
+                    panes: &panes,
+                    fills: &[],
+                    ui,
+                },
+            )
+            .expect("a window frame")
+    };
+    let reference = render(backdrop_color, None);
+    let drawn = render(
+        transparent,
+        Some(crate::ui_quads::UiLayer {
+            under: 1,
+            ..chrome_layer(&backdrop, 1, &atlas)
+        }),
+    );
+    if let Some((index, (got, want))) =
+        drawn
+            .chunks(4)
+            .zip(reference.chunks(4))
+            .enumerate()
+            .find(|(_, (got, want))| {
+                got.iter()
+                    .zip(*want)
+                    .any(|(got, want)| (i16::from(*got) - i16::from(*want)).abs() > 2)
+            })
+    {
+        panic!("pixel {index}: drew {got:?} over the layer, {want:?} as the pane's background");
+    }
+    // Planted negative: the same layer drawn over the panes covers their
+    // cells and glyphs.
+    let over = render(transparent, Some(chrome_layer(&backdrop, 1, &atlas)));
+    assert_ne!(over, reference, "a layer over the panes went unnoticed");
 }

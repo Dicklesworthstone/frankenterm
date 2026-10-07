@@ -133,6 +133,11 @@ pub struct UiLayer<'a> {
     pub atlas: UiAtlas<'a>,
     /// In paint order: later quads cover earlier ones.
     pub quads: &'a [UiQuad],
+    /// How many of `quads`, from the first, are drawn under the panes:
+    /// window background layers, which the WebGpu renderer draws at
+    /// negative zindex. The panes' backgrounds then blend over them. The
+    /// rest are drawn over everything.
+    pub under: usize,
     /// `foreground_text_hsb`, applied to monochrome glyphs.
     pub foreground_text_hsb: [f32; 3],
 }
