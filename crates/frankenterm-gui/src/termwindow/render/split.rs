@@ -66,8 +66,8 @@ impl crate::TermWindow {
         split: &PositionedSplit,
         pane: &Arc<dyn Pane>,
     ) -> anyhow::Result<()> {
-        let palette = pane.palette();
-        let foreground = palette.split.to_linear();
+        // Published facts: paint never waits for the terminal (ft-yccm0.2.2.3).
+        let foreground = pane.render_facts().palette.split.to_linear();
         let cell_width = self.render_metrics.cell_size.width as f32;
         let cell_height = self.render_metrics.cell_size.height as f32;
 

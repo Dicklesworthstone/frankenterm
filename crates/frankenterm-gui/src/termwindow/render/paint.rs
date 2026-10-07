@@ -479,7 +479,9 @@ impl crate::TermWindow {
                     .find(|p| p.is_active)
                     .map(|p| match self.get_viewport(p.pane.pane_id()) {
                         Some(top) => top,
-                        None => p.pane.get_dimensions().physical_top,
+                        // Published facts: paint never waits for the
+                        // terminal (ft-yccm0.2.2.3).
+                        None => p.pane.render_facts().dimensions.physical_top,
                     })
                     .unwrap_or(0);
 
@@ -509,7 +511,7 @@ impl crate::TermWindow {
             let background = if panes.len() == 1 {
                 // If we're the only pane, use the pane's palette
                 // to draw the padding background
-                panes[0].pane.palette().background
+                panes[0].pane.render_facts().palette.background
             } else {
                 self.palette().background
             }

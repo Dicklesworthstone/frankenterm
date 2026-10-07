@@ -1325,6 +1325,10 @@ pub struct PaneState {
     /// scrollback.
     viewport: Option<StableRowIndex>,
     native_viewport: Option<mux::localpane::NativeViewport>,
+    /// The native frame this pane was last painted from by a fresh capture.
+    /// When the terminal is busy, paint draws it again instead of failing the
+    /// window's frame (ft-yccm0.2.2.3).
+    last_native_frame: Option<render::pane::PaintedNativeFrame>,
     remote_viewport: Option<render::pane::ViewportAnchor>,
     last_viewport_source: Option<render::pane::ViewportSource>,
     /// Terminal sequence fence consumed by render damage discovery. This is
@@ -3282,6 +3286,11 @@ impl TermWindow {
         }
     }
 
+    /// The shortest time between two frames under the configured `max_fps`.
+    pub(crate) fn frame_interval(&self) -> Duration {
+        config::frame_interval_for_max_fps(self.config.max_fps)
+    }
+
     pub(crate) fn schedule_animation_wake(&mut self, due: Instant) {
         if !matches!(self.render_recovery_state.mode, RenderRecoveryMode::Healthy) {
             metrics::counter!("gui.render.animation_wake", "action" => "suppressed_recovery")
@@ -3305,6 +3314,9 @@ impl TermWindow {
         match directive {
             RenderRecoveryDirective::RetryAfter(delay) => {
                 self.schedule_render_retry(stage, delay);
+            }
+            RenderRecoveryDirective::RetryNextFrame => {
+                self.schedule_render_retry(stage, self.frame_interval());
             }
             RenderRecoveryDirective::Park => {
                 self.render_wake_state.cancel();
@@ -4173,6 +4185,8 @@ enum PaintAdmission {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RenderRecoveryDirective {
     RetryAfter(Duration),
+    /// Retry at the next frame the configured `max_fps` allows.
+    RetryNextFrame,
     Park,
     OpenCircuit,
 }
@@ -4229,9 +4243,9 @@ fn render_recovery_directive(
     };
 
     match stage {
-        RenderFailureStage::NativeFramePending => {
-            RenderRecoveryDirective::RetryAfter(Duration::from_millis(16))
-        }
+        // Paced like any other frame, not by a fixed 16 ms loop that would
+        // ignore max_fps (ft-yccm0.2.2.3).
+        RenderFailureStage::NativeFramePending => RenderRecoveryDirective::RetryNextFrame,
         RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Occluded) => {
             RenderRecoveryDirective::Park
         }
@@ -5341,7 +5355,7 @@ impl TermWindow {
     fn metal_clear_color(&mut self) -> frankenterm_renderer_metal::ClearColor {
         let panes = self.get_panes_to_render();
         let background = if panes.len() == 1 {
-            panes[0].pane.palette().background
+            panes[0].pane.render_facts().palette.background
         } else {
             self.palette().background
         };
@@ -8080,8 +8094,11 @@ impl TermWindow {
 
     fn update_text_cursor(&mut self, pos: &PositionedPane) {
         if let Some(win) = self.window.as_ref() {
-            let cursor = pos.pane.get_cursor_position();
-            let top = pos.pane.get_dimensions().physical_top;
+            // Paint calls this every frame for the active pane: read the
+            // published facts, never the terminal (ft-yccm0.2.2.3).
+            let facts = pos.pane.render_facts();
+            let cursor = facts.cursor;
+            let top = facts.dimensions.physical_top;
             let tab_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
                 self.tab_bar_pixel_height().unwrap_or(0.0)
             } else {
@@ -11665,7 +11682,7 @@ mod tests {
         for _ in 0..100 {
             assert_eq!(
                 recovery.record_failure(super::RenderFailureStage::NativeFramePending),
-                super::RenderRecoveryDirective::RetryAfter(std::time::Duration::from_millis(16))
+                super::RenderRecoveryDirective::RetryNextFrame
             );
             assert_eq!(recovery.failed_attempts_since_success, failures);
         }

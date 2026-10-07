@@ -374,6 +374,43 @@ fn tiled_grid_dirty_rect_from_bitmap(
     ))
 }
 
+/// A local pane's last freshly captured native frame, with the selection
+/// stamp its paint staged (ft-yccm0.2.2.3).
+pub(crate) struct PaintedNativeFrame {
+    frame: mux::localpane::NativeRenderFrame,
+    selection_stamp: Option<crate::selection::SelectionFrameStamp>,
+}
+
+/// Where paint takes a local pane's frame from (ft-yccm0.2.2.3).
+pub(crate) enum NativePaintFrame {
+    /// Captured now, under the terminal try-lock.
+    Fresh(mux::localpane::NativeRenderFrame),
+    /// No capture now (the terminal is busy, or cold rows are still loading):
+    /// the frame the pane was last painted from. Paint draws it again exactly
+    /// as it was, instead of failing the whole window's frame, and derives no
+    /// damage, viewport or selection authority from it.
+    Reused(PaintedNativeFrame),
+}
+
+impl NativePaintFrame {
+    /// The fresh capture when there is one for the pane's current geometry,
+    /// else the frame the pane was last painted from while that still fits.
+    /// A frame for other geometry (a reflow the native worker has not
+    /// finished) is never bound to the pane.
+    pub(crate) fn choose(
+        captured: Option<mux::localpane::NativeRenderFrame>,
+        painted: Option<PaintedNativeFrame>,
+        fits: impl Fn(&RenderableDimensions) -> bool,
+    ) -> Option<Self> {
+        match captured.filter(|frame| fits(&frame.dimensions)) {
+            Some(frame) => Some(Self::Fresh(frame)),
+            None => painted
+                .filter(|painted| fits(&painted.frame.dimensions))
+                .map(Self::Reused),
+        }
+    }
+}
+
 impl crate::TermWindow {
     fn paint_pane_waiting_for_gui_state(&mut self, pos: &PositionedPane) -> anyhow::Result<()> {
         use crate::termwindow::box_model::{Element, ElementColors, ElementContent, LayoutContext};
@@ -591,6 +628,9 @@ impl crate::TermWindow {
             }
         }
         let local = pos.pane.downcast_ref::<mux::localpane::LocalPane>();
+        // Some(stamp) while the pane is drawn again from the frame it was
+        // last painted from, with the selection stamp that paint staged.
+        let mut reused_stamp = None;
         let mut native_frame = if let Some(local) = local {
             let damage_baseline = self
                 .pane_state(pane_id)
@@ -601,35 +641,52 @@ impl crate::TermWindow {
                 .selection(pane_id)
                 .ok_or_else(|| anyhow::anyhow!("GUI pane state admission is pending"))?
                 .seqno;
-            Some(
-                local
-                    .try_capture_render_frame(
-                        self.pane_state(pane_id).and_then(|state| {
-                            state
-                                .native_viewport
-                                .clone()
-                                .or_else(|| state.viewport.map(mux::localpane::NativeViewport::new))
-                        }),
-                        damage_baseline,
-                        selection_baseline,
-                        &self.config.hyperlink_rules,
-                        self.config.detect_password_input,
-                    )
-                    // Tab topology publishes its target before the native
-                    // worker finishes reflow. Do not bind old-width text to
-                    // new pane geometry (or authorize selection over it).
-                    .filter(|frame| {
-                        frame.dimensions.cols == pos.width
-                            && frame.dimensions.viewport_rows == pos.height
-                            && frame.dimensions.pixel_width == pos.pixel_width
-                            && frame.dimensions.pixel_height == pos.pixel_height
-                    })
-                    .ok_or(crate::termwindow::NativeFramePending)?,
-            )
+            let captured = local.try_capture_render_frame(
+                self.pane_state(pane_id).and_then(|state| {
+                    state
+                        .native_viewport
+                        .clone()
+                        .or_else(|| state.viewport.map(mux::localpane::NativeViewport::new))
+                }),
+                damage_baseline,
+                selection_baseline,
+                &self.config.hyperlink_rules,
+                self.config.detect_password_input,
+            );
+            let painted = self
+                .pane_state(pane_id)
+                .and_then(|mut state| state.last_native_frame.take());
+            // Tab topology publishes its target before the native
+            // worker finishes reflow. Do not bind old-width text to
+            // new pane geometry (or authorize selection over it).
+            let fits = |dimensions: &RenderableDimensions| {
+                dimensions.cols == pos.width
+                    && dimensions.viewport_rows == pos.height
+                    && dimensions.pixel_width == pos.pixel_width
+                    && dimensions.pixel_height == pos.pixel_height
+            };
+            match NativePaintFrame::choose(captured, painted, fits)
+                .ok_or(crate::termwindow::NativeFramePending)?
+            {
+                NativePaintFrame::Fresh(frame) => Some(frame),
+                NativePaintFrame::Reused(painted) => {
+                    // The terminal is busy (ft-yccm0.2.2.3): draw the pane as
+                    // it was last painted rather than fail the window's whole
+                    // frame, and capture again at the next frame max_fps
+                    // allows. Output notifications usually ask sooner.
+                    metrics::counter!("gui.paint.native_frame_reused").increment(1);
+                    self.schedule_animation_wake(Instant::now() + self.frame_interval());
+                    reused_stamp = Some(painted.selection_stamp);
+                    Some(painted.frame)
+                }
+            }
         } else {
             None
         };
-        if let Some(frame) = &native_frame {
+        let reused = reused_stamp.is_some();
+        // A reused frame's viewport, damage and selection were settled when
+        // it was fresh; it changes no pane state now.
+        if let Some(frame) = native_frame.as_ref().filter(|_| !reused) {
             // Capture may clamp a viewport whose rows were evicted. Publish
             // that effective viewport before damage, selection, and rendering
             // derive any row coordinates from GUI state.
@@ -638,7 +695,9 @@ impl crate::TermWindow {
                 state.native_viewport = frame.viewport.clone();
             }
         }
-        self.check_for_dirty_lines_and_invalidate_selection(&pos.pane, native_frame.as_ref())?;
+        if !reused {
+            self.check_for_dirty_lines_and_invalidate_selection(&pos.pane, native_frame.as_ref())?;
+        }
         let selection_frame_before = if let Some(frame) = &native_frame {
             crate::selection::SelectionAuthority::from_native_frame(&*pos.pane, frame)
                 .zip(self.selection_frame_geometry(pos))
@@ -700,7 +759,14 @@ impl crate::TermWindow {
         let cursor = native_frame
             .as_ref()
             .map_or_else(|| pos.pane.get_cursor_position(), |frame| frame.cursor);
-        let current_viewport = self.get_viewport(pane_id);
+        let current_viewport = match &native_frame {
+            // A reused frame is drawn at the viewport it was captured for,
+            // which a scroll since then may have moved.
+            Some(frame) if reused => {
+                (frame.first < frame.dimensions.physical_top).then_some(frame.first)
+            }
+            _ => self.get_viewport(pane_id),
+        };
         let dims = native_frame
             .as_ref()
             .map_or_else(|| pos.pane.get_dimensions(), |frame| frame.dimensions);
@@ -896,7 +962,7 @@ impl crate::TermWindow {
             let min_height = self.min_scroll_bar_height();
 
             let info = ScrollHit::thumb(
-                &*pos.pane,
+                &dims,
                 current_viewport,
                 self.dimensions.pixel_height.saturating_sub(
                     thumb_y_offset + border.bottom.get() + bottom_bar_height as usize,
@@ -1337,7 +1403,7 @@ impl crate::TermWindow {
 
             if let Some(frame) = &mut native_frame {
                 render.with_lines_mut(frame.first, &mut frame.lines.iter_mut().collect::<Vec<_>>());
-                if let Some(local) = local {
+                if let Some(local) = local.filter(|_| !reused) {
                     local.publish_render_frame_appdata(frame);
                 }
             } else {
@@ -1363,16 +1429,31 @@ impl crate::TermWindow {
         metrics::histogram!("paint_pane.lines").record(start.elapsed());
         log::trace!("lines elapsed {:?}", start.elapsed());
 
-        let selection_frame_after = self.selection_frame_stamp_for_position(&pos.pane, pos);
+        let selection_frame_after = if reused {
+            None
+        } else {
+            self.selection_frame_stamp_for_position(&pos.pane, pos)
+        };
         let mut state = self
             .pane_state(pane_id)
             .ok_or_else(|| anyhow::anyhow!("GUI pane state admission is pending"))?;
-        state.selection_frame.stage(
-            selection_frame_before,
-            selection_frame_after,
-            complete_selection_frame,
-        );
+        let selection_stamp = match reused_stamp {
+            Some(stamp) => {
+                state.selection_frame.restage(stamp);
+                stamp
+            }
+            None => state.selection_frame.stage(
+                selection_frame_before,
+                selection_frame_after,
+                complete_selection_frame,
+            ),
+        };
         state.selection_frame.stage_hyperlinks(frame_hyperlinks);
+        // Kept for the next paint that finds the terminal busy.
+        state.last_native_frame = native_frame.map(|frame| PaintedNativeFrame {
+            frame,
+            selection_stamp,
+        });
 
         Ok(())
     }
@@ -1607,5 +1688,225 @@ mod tests {
             prop_assert_eq!(layer.dirty_rect(), expected_rect);
             prop_assert_eq!(layer.opaque(), expected_opaque);
         }
+    }
+
+    /// A real local pane, `cat` on a pty, killed when dropped.
+    struct NativePaintTestPane(std::sync::Arc<dyn mux::pane::Pane>);
+
+    impl Drop for NativePaintTestPane {
+        fn drop(&mut self) {
+            self.0.kill();
+        }
+    }
+
+    impl NativePaintTestPane {
+        fn new(pane_id: PaneId, cols: usize) -> Self {
+            #[derive(Debug)]
+            struct NativePaintTestConfig;
+            impl wezterm_term::TerminalConfiguration for NativePaintTestConfig {
+                fn color_palette(&self) -> ColorPalette {
+                    ColorPalette::default()
+                }
+            }
+            let mut terminal = wezterm_term::Terminal::new(
+                wezterm_term::TerminalSize {
+                    rows: 4,
+                    cols,
+                    dpi: 96,
+                    pixel_width: cols * 8,
+                    pixel_height: 64,
+                },
+                std::sync::Arc::new(NativePaintTestConfig),
+                "native-paint-test",
+                "test",
+                Box::new(Vec::<u8>::new()),
+            );
+            terminal.advance_bytes(b"painted once");
+            let pair = portable_pty::native_pty_system()
+                .openpty(portable_pty::PtySize::default())
+                .unwrap();
+            let writer = pair.master.take_writer().unwrap();
+            let child = pair
+                .slave
+                .spawn_command(portable_pty::CommandBuilder::new("/bin/cat"))
+                .unwrap();
+            Self(std::sync::Arc::new(mux::localpane::LocalPane::new(
+                pane_id,
+                terminal,
+                child,
+                pair.master,
+                writer,
+                pane_id,
+                [0x23; 16],
+                "native paint".into(),
+            )))
+        }
+
+        fn local(&self) -> &mux::localpane::LocalPane {
+            self.0.downcast_ref().unwrap()
+        }
+
+        /// The capture paint makes, here of an idle terminal.
+        fn capture(&self) -> mux::localpane::NativeRenderFrame {
+            self.local()
+                .try_capture_render_frame(None, 0, 0, &[], false)
+                .expect("an idle terminal captures a frame")
+        }
+    }
+
+    /// ft-yccm0.2.2.3: paint draws a pane whose terminal is busy from the
+    /// frame it last painted, with the selection stamp that paint staged,
+    /// while that frame still fits the pane. A fresh capture always wins, a
+    /// frame for other geometry is never bound to the pane, and the restaged
+    /// stamp is what the next present reports.
+    #[test]
+    fn paint_reuses_the_last_painted_frame_only_while_it_fits() {
+        let pane = NativePaintTestPane::new(9_220_301, 40);
+        let wider = NativePaintTestPane::new(9_220_302, 41);
+        let first = pane.capture();
+        let dims = first.dimensions;
+        let fits = |candidate: &RenderableDimensions| *candidate == dims;
+        let stamp = crate::selection::SelectionAuthority::from_native_frame(&*pane.0, &first).map(
+            |authority| crate::selection::SelectionFrameStamp {
+                authority,
+                source_sequence: first.source_sequence,
+                viewport: first.first,
+                geometry: [7; 12],
+            },
+        );
+        assert!(stamp.is_some());
+        let painted = || PaintedNativeFrame {
+            frame: pane.capture(),
+            selection_stamp: stamp,
+        };
+
+        assert!(matches!(
+            NativePaintFrame::choose(Some(pane.capture()), Some(painted()), fits),
+            Some(NativePaintFrame::Fresh(_))
+        ));
+        match NativePaintFrame::choose(None, Some(painted()), fits) {
+            Some(NativePaintFrame::Reused(reused)) => {
+                assert_eq!(reused.selection_stamp, stamp);
+                assert_eq!(reused.frame.dimensions, dims);
+            }
+            _ => panic!("a busy pane must be drawn from the frame it last painted"),
+        }
+        // A capture for other geometry, as during a reflow the native
+        // worker has not finished, is not bound to the pane.
+        let other = wider.capture();
+        assert_ne!(other.dimensions, dims);
+        assert!(matches!(
+            NativePaintFrame::choose(Some(other), Some(painted()), fits),
+            Some(NativePaintFrame::Reused(_))
+        ));
+        // Nothing fits: the pane's frame stays pending.
+        assert!(NativePaintFrame::choose(Some(wider.capture()), None, fits).is_none());
+        assert!(
+            NativePaintFrame::choose(None, Some(painted()), |_: &RenderableDimensions| false)
+                .is_none()
+        );
+
+        let mut frames = crate::selection::SelectionFrameState::default();
+        frames.begin_attempt();
+        frames.restage(stamp);
+        assert_eq!(frames.presented(), stamp);
+    }
+
+    /// Holds a pane's terminal mutex from inside `with_lines_mut`.
+    struct HoldTerminal {
+        held: std::sync::mpsc::SyncSender<()>,
+        hold: std::time::Duration,
+    }
+
+    impl WithPaneLines for HoldTerminal {
+        fn with_lines_mut(&mut self, _first: StableRowIndex, _lines: &mut [&mut Line]) {
+            let _ = self.held.send(());
+            std::thread::sleep(self.hold);
+        }
+    }
+
+    /// ft-yccm0.2.2.3 acceptance: while another thread holds a local pane's
+    /// terminal mutex for 500 ms, every terminal read paint makes for that
+    /// pane returns at once on the main thread. These are the published
+    /// facts (the IME caret, the padding background, splits, the Metal
+    /// clear color), the frame capture with its fallback to the frame last
+    /// painted, the scroll bar (from the drawn frame) and the selection
+    /// stamp after rendering. The M.4 ledger records no main-thread wait.
+    #[test]
+    fn paint_never_waits_for_a_terminal_another_thread_holds() {
+        use frankenterm_alloc::resource_ledger::TerminalLockLedger;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        const HOLD: Duration = Duration::from_millis(500);
+        let pane = NativePaintTestPane::new(9_220_303, 40);
+        let painted = PaintedNativeFrame {
+            frame: pane.capture(),
+            selection_stamp: None,
+        };
+        let dims = painted.frame.dimensions;
+        let released = AtomicBool::new(false);
+        let (elapsed, frame, stamp, facts, before, after) = std::thread::scope(|scope| {
+            let (held_tx, held_rx) = std::sync::mpsc::sync_channel(1);
+            let (pane, released) = (&pane, &released);
+            scope.spawn(move || {
+                pane.0.with_lines_mut(
+                    0..1,
+                    &mut HoldTerminal {
+                        held: held_tx,
+                        hold: HOLD,
+                    },
+                );
+                released.store(true, Ordering::Release);
+            });
+            held_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the holder took the terminal");
+            let before = TerminalLockLedger::global().snapshot();
+            // std names the process's main thread, the AppKit thread, "main";
+            // the ledger counts main-thread waits by that name.
+            let reads = std::thread::Builder::new()
+                .name("main".to_string())
+                .spawn_scoped(scope, move || {
+                    let started = Instant::now();
+                    let facts = pane.0.render_facts();
+                    let captured = pane
+                        .local()
+                        .try_capture_render_frame(None, 0, 0, &[], false);
+                    let frame = NativePaintFrame::choose(captured, Some(painted), |candidate| {
+                        *candidate == dims
+                    });
+                    let thumb = ScrollHit::thumb(&dims, None, 600, 10);
+                    let stamp = crate::selection::SelectionAuthority::capture_source(&*pane.0);
+                    let elapsed = started.elapsed();
+                    assert!(thumb.height >= 10);
+                    (elapsed, frame, stamp, facts)
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            let after = TerminalLockLedger::global().snapshot();
+            assert!(
+                !released.load(Ordering::Acquire),
+                "the terminal was held throughout the reads"
+            );
+            (reads.0, reads.1, reads.2, reads.3, before, after)
+        });
+        assert!(released.load(Ordering::Acquire));
+        assert!(
+            matches!(frame, Some(NativePaintFrame::Reused(_))),
+            "the busy pane is drawn from the frame it last painted"
+        );
+        assert!(stamp.is_none(), "the busy selection stamp is skipped");
+        assert_eq!(facts.dimensions, dims);
+        assert_eq!(
+            after.main_thread_blocked_waits, before.main_thread_blocked_waits,
+            "a paint read waited for the held terminal on the main thread"
+        );
+        // Honest slack for a loaded debug build; any wait would be ~500 ms.
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "paint's terminal reads took {elapsed:?} while the terminal was held for {HOLD:?}"
+        );
     }
 }

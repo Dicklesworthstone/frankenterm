@@ -1,4 +1,5 @@
 use mux::pane::Pane;
+use mux::renderable::RenderableDimensions;
 use wezterm_term::StableRowIndex;
 
 pub struct ScrollHit {
@@ -10,15 +11,15 @@ pub struct ScrollHit {
 
 impl ScrollHit {
     /// Compute the y-coordinate for the top of the scrollbar thumb
-    /// and the height of the thumb and return them.
+    /// and the height of the thumb and return them. Paint passes the
+    /// dimensions of the frame it draws, so this never reads the terminal
+    /// (ft-yccm0.2.2.3).
     pub fn thumb(
-        pane: &dyn Pane,
+        render_dims: &RenderableDimensions,
         viewport: Option<StableRowIndex>,
         max_thumb_height: usize,
         min_thumb_size: usize,
     ) -> Self {
-        let render_dims = pane.get_dimensions();
-
         let scroll_top = render_dims
             .physical_top
             .saturating_sub(viewport.unwrap_or(render_dims.physical_top))
@@ -56,11 +57,10 @@ impl ScrollHit {
         max_thumb_height: usize,
         min_thumb_size: usize,
     ) -> StableRowIndex {
-        let thumb = Self::thumb(pane, viewport, max_thumb_height, min_thumb_size);
+        let render_dims = pane.get_dimensions();
+        let thumb = Self::thumb(&render_dims, viewport, max_thumb_height, min_thumb_size);
         let available_height = max_thumb_height - thumb.height;
         let scroll_percent = thumb_top.min(available_height) as f32 / available_height as f32;
-
-        let render_dims = pane.get_dimensions();
 
         render_dims.scrollback_top.saturating_add(
             ((render_dims.physical_top - render_dims.scrollback_top) as f32 * scroll_percent)
