@@ -179,12 +179,20 @@ pub fn set_ascii_run(
         return true;
     };
 
-    // The common case appends the run at the row's end: a clustered row
-    // whose last character lets it append (printable ASCII then always
-    // breaks from ASCII), or a vector row written at or past its end.
+    // The common case appends the run at or past the row's end: a vector
+    // row, or a clustered row whose last character lets it append (printable
+    // ASCII then always breaks from ASCII). Past a clustered row's end,
+    // legacy leaves leading default blanks implicit and pads the gap with
+    // default blanks when a cell follows, which storing the run gives too;
+    // a run of only such blanks there changes nothing but the seqno, which
+    // the per-byte path below applies.
     let len = page.row_len(row);
     let appends = if is_clustered(page, row) {
-        x == len && clustered_can_append(page, row, x, char::from(first))
+        x >= len
+            && clustered_can_append(page, row, x, char::from(first))
+            && !(x > len
+                && text.bytes().all(|byte| byte == b' ')
+                && *attr == CellAttributes::blank())
     } else {
         x >= len
     };

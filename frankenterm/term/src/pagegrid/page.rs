@@ -798,12 +798,12 @@ impl Page {
             self.links.attach(off, link);
             bits = bits.with_hyperlink(true);
         }
-        let mut images = cell.images.to_vec();
-        for image in carried {
-            attach_image(&mut images, image);
-        }
-        let has_image = !images.is_empty();
+        let has_image = !(cell.images.is_empty() && carried.is_empty());
         if has_image {
+            let mut images = cell.images.to_vec();
+            for image in carried {
+                attach_image(&mut images, image);
+            }
             self.images.insert(off, images);
             bits = bits.with_image(true);
         }
@@ -1060,9 +1060,17 @@ impl Page {
             }
             self.set_cell_at(slot, x + offset, template.with_codepoint(glyph.codepoint()));
         }
-        // The padding and the run's first cell may change hidden bits after
-        // a wide cell; the run itself is narrow.
-        self.resync_hidden(slot, old_len, x, end);
+        // Cells past the end were zero (I2), so the padding is already
+        // default blanks and nothing stored is hidden. Only the first new
+        // cell can be: after a visible wide cell whose placeholder was
+        // truncated, it is that placeholder.
+        if old_len > 0 {
+            let prev = self.cell_at(slot, old_len - 1);
+            if !prev.is_hidden() && prev.is_wide() {
+                let first = self.cell_at(slot, old_len);
+                self.set_cell_at(slot, old_len, first.with_hidden(true));
+            }
+        }
         let flags = RowHeader::DIRTY | cell.summary_flags(style, false);
         self.set_header(row, header.with_len(end).with_flags(flags, true));
         self.touch(slot, seqno);
