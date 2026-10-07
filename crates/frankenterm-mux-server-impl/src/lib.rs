@@ -7098,9 +7098,13 @@ impl LiveScrollbackSpillSink {
                 parent,
             )?)?;
 
+            #[cfg(test)]
+            scrollback_crash_points::reach("wal_staged");
             publication_attempted = true;
             std::fs::rename(&stage_path, &active_path)
                 .with_context(|| format!("publish append WAL {}", active_path.display()))?;
+            #[cfg(test)]
+            scrollback_crash_points::reach("wal_renamed");
             #[cfg(not(windows))]
             frankenterm_core::storage::mmap_store::ordered_durability_sync(&std::fs::File::open(
                 parent,
@@ -9249,6 +9253,8 @@ impl LiveScrollbackSpillSink {
             #[cfg(test)]
             LIVE_SCROLLBACK_KEYRING_FREE_AT_RENAME
                 .with(|free| free.set(Some(self.keyring.try_lock().is_ok())));
+            #[cfg(test)]
+            scrollback_crash_points::reach("manifest_staged");
             std::fs::rename(&temp_path, &self.manifest_path).with_context(|| {
                 format!(
                     "publish scrollback manifest {}",
@@ -9256,6 +9262,8 @@ impl LiveScrollbackSpillSink {
                 )
             })?;
             published = true;
+            #[cfg(test)]
+            scrollback_crash_points::reach("manifest_renamed");
             #[cfg(not(windows))]
             {
                 let directory = std::fs::File::open(parent).with_context(|| {
@@ -9665,6 +9673,30 @@ fn encode_scrollback_line_record(
         "{prefix}{payload_sha256}:{}",
         base64::engine::general_purpose::STANDARD_NO_PAD.encode(payload)
     ))
+}
+
+/// Named crash points of a durable scrollback transaction (ft-yccm0.2.1.7).
+/// A crash-test child process arms one; reaching it kills the process with
+/// SIGKILL. Nothing unwinds and nothing is flushed, so only what the kernel
+/// already holds survives, exactly as after `kill -9`.
+#[cfg(test)]
+mod scrollback_crash_points {
+    static ARMED: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
+
+    pub fn arm(step: &'static str) {
+        *ARMED.lock().unwrap() = Some(step);
+    }
+
+    pub fn reach(step: &'static str) {
+        if ARMED.lock().is_ok_and(|armed| *armed == Some(step)) {
+            #[cfg(unix)]
+            let _ = rustix::process::kill_process(
+                rustix::process::getpid(),
+                rustix::process::Signal::KILL,
+            );
+            std::process::abort();
+        }
+    }
 }
 
 fn encode_exact_scrollback_line_record(
@@ -10866,6 +10898,8 @@ impl LiveScrollbackSpillSink {
             return false;
         }
         #[cfg(test)]
+        scrollback_crash_points::reach("rows_appended");
+        #[cfg(test)]
         if records.len() > 1 && self.fail_batch_at(1) {
             return false;
         }
@@ -10917,10 +10951,14 @@ impl LiveScrollbackSpillSink {
                     .checked_add(drop_count)
                     .ok_or_else(|| anyhow::anyhow!("scrollback retention cut overflows"))?;
                 store.prune_before(ledger_pane_id, prune_before_seq)?;
+                #[cfg(test)]
+                scrollback_crash_points::reach("retention_pruned");
                 store.compact_pane_if_stale(
                     ledger_pane_id,
                     LIVE_SCROLLBACK_COMPACT_MIN_STALE_BYTES,
                 )?;
+                #[cfg(test)]
+                scrollback_crash_points::reach("compacted");
             }
             if let Some(wal) = append_wal.as_ref() {
                 Self::verify_append_wal_target_store(wal, &store)?;
@@ -10954,6 +10992,8 @@ impl LiveScrollbackSpillSink {
 
         match self.persist_manifest("complete") {
             Ok(()) => {
+                #[cfg(test)]
+                scrollback_crash_points::reach("committed");
                 #[cfg(test)]
                 if records.len() > 1 && self.fail_batch_at(3) {
                     return false;
@@ -14537,6 +14577,127 @@ mod tests {
             }
         }
         assert!(refused > 0, "single-bit corruption is detected");
+    }
+
+    const CRASH_CHILD_STEP: &str = "FT_TEST_SCROLLBACK_CRASH_STEP";
+    const CRASH_CHILD_BASE: &str = "FT_TEST_SCROLLBACK_CRASH_BASE";
+    const CRASH_TEST: &str = "tests::scrollback_transaction_killed_at_every_named_step_recovers_an_exact_committed_prefix";
+    /// Every named crash point of a batch transaction, in order, and whether
+    /// the killed transaction's batch is rolled forward on reopen.
+    const CRASH_STEPS: [(&str, bool); 8] = [
+        ("rows_appended", false),
+        ("wal_staged", true),
+        ("wal_renamed", true),
+        ("retention_pruned", true),
+        ("compacted", true),
+        ("manifest_staged", true),
+        ("manifest_renamed", true),
+        ("committed", true),
+    ];
+
+    /// ft-yccm0.2.1.7: a child process commits one row, then runs a 3-row
+    /// batch (retention 3, so it also prunes and compacts) and is killed with
+    /// SIGKILL at each named step. The parent reopens the store. Recovery
+    /// yields an exact committed prefix: before the batch's WAL is staged,
+    /// the first row alone; from a staged WAL on, the whole batch rolled
+    /// forward. Rows sit at their exact stable rows, nothing is duplicated
+    /// or reordered, and the durability-gap marker row survives as written.
+    /// The owner's retry then ends in the same exact rows from either state.
+    #[cfg(unix)]
+    #[test]
+    fn scrollback_transaction_killed_at_every_named_step_recovers_an_exact_committed_prefix() {
+        let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+        let mut batch = digest_only_test_lines("crash", 2);
+        batch.push(Line::from_text(
+            "[durability gap: 4 rows (10..14), 512 bytes, reason=overload, at_unix_ms=1]",
+            &CellAttributes::blank(),
+            2,
+            None,
+        ));
+        let assert_row =
+            |sink: &LiveScrollbackSpillSink, row: isize, expected: &Line, case: &str| {
+                let mut actual = sink
+                    .load_scrollback_line(row)
+                    .unwrap_or_else(|| panic!("{case}: row {row} is missing"));
+                let mut expected = expected.clone();
+                actual.cells_mut();
+                expected.cells_mut();
+                assert_eq!(actual, expected, "{case}: row {row}");
+            };
+
+        if let Ok(armed) = std::env::var(CRASH_CHILD_STEP) {
+            let step = CRASH_STEPS
+                .iter()
+                .map(|(step, _)| *step)
+                .find(|step| *step == armed)
+                .expect("a named crash step");
+            let base = PathBuf::from(std::env::var(CRASH_CHILD_BASE).unwrap());
+            let sink = LiveScrollbackSpillSink::new(base, &deferred_test_context()).unwrap();
+            assert!(sink.store_scrollback_line(0, &prior, 3));
+            scrollback_crash_points::arm(step);
+            let _ = sink.store_scrollback_lines(1, &batch, 3);
+            panic!("crash step {step} was never reached");
+        }
+
+        for (step, rolled_forward) in CRASH_STEPS {
+            use std::os::unix::process::ExitStatusExt as _;
+
+            let dir = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg(CRASH_TEST)
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(CRASH_CHILD_STEP, step)
+                .env(CRASH_CHILD_BASE, dir.path())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGKILL),
+                "{step}: the child dies at its step ({status:?})"
+            );
+            let reopened =
+                LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                    .unwrap_or_else(|error| panic!("{step}: reopen after kill -9: {error:#}"));
+            if rolled_forward {
+                assert_eq!(reopened.retained_scrollback_rows(), 3, "{step}");
+                assert_eq!(reopened.oldest_scrollback_row(), Some(1), "{step}");
+                for (offset, line) in batch.iter().enumerate() {
+                    assert_row(&reopened, 1 + offset as isize, line, step);
+                }
+            } else {
+                assert_eq!(reopened.retained_scrollback_rows(), 1, "{step}");
+                assert_eq!(reopened.oldest_scrollback_row(), Some(0), "{step}");
+                assert_row(&reopened, 0, &prior, step);
+            }
+            assert!(reopened.load_scrollback_line(4).is_none(), "{step}");
+
+            let mut offset = 0;
+            while offset < batch.len() {
+                let acknowledged =
+                    reopened.store_scrollback_lines(1 + offset as isize, &batch[offset..], 3);
+                assert!(
+                    acknowledged > 0,
+                    "{step}: retry refused at row {}",
+                    1 + offset
+                );
+                offset += acknowledged;
+            }
+            assert_eq!(reopened.retained_scrollback_rows(), 3, "{step}");
+            for (offset, line) in batch.iter().enumerate() {
+                assert_row(&reopened, 1 + offset as isize, line, step);
+            }
+            let manifest = LiveScrollbackSpillSink::read_manifest(&reopened.manifest_path)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (manifest.oldest_seq, manifest.next_seq),
+                (Some(1), 4),
+                "{step}"
+            );
+        }
     }
 
     /// Rows past the manifest that no WAL names are cut on reopen, after the
