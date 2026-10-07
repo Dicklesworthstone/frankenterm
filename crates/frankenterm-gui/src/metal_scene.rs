@@ -54,12 +54,12 @@ pub struct PlacedGlyph {
     pub offset: [i16; 2],
 }
 
-/// One glyph of a shaped cluster (ft-yccm0.4.7.3).
+/// One glyph of a shaped row (ft-yccm0.4.7.3).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ShapedGlyph {
-    /// Cells from the cluster's first cell to the cell the glyph starts in:
-    /// the shaper's cell counts of the glyphs before it, as the WebGpu
-    /// renderer advances through a cluster.
+    /// The column the glyph starts in: the shaper's cell counts of every
+    /// glyph before it in the row, as the WebGpu renderer advances along a
+    /// line.
     pub cell: usize,
     /// Placed from the top-left of that cell.
     pub glyph: PlacedGlyph,
@@ -98,12 +98,13 @@ pub fn hovered_underline(underline: Underline) -> Underline {
 
 /// Where the glyphs of a frame come from.
 pub trait GlyphSource {
-    /// The glyphs that draw `cluster`, a run of cells clustered and shaped
-    /// as the WebGpu renderer clusters and shapes its lines: one shaper call
-    /// for the whole run, so ligatures, combining marks and emoji sequences
-    /// come out as they do there. Inkless glyphs (spaces, ligature carriers)
-    /// are left out; they only advance the cells of the glyphs after them.
-    fn shape_cluster(&mut self, cluster: &CellCluster) -> &[ShapedGlyph];
+    /// The glyphs that draw a row's `clusters` (clustered as the WebGpu
+    /// renderer clusters its lines), shaped as it shapes a line
+    /// ([`crate::line_shaping`]): each cluster or shaping run with one
+    /// shaper call, so ligatures, combining marks and emoji sequences come
+    /// out as they do there. Inkless glyphs (spaces, ligature carriers) are
+    /// left out; they only advance the cells of the glyphs after them.
+    fn shape_row(&mut self, clusters: &[CellCluster]) -> Vec<ShapedGlyph>;
 
     /// The grayscale sprite that draws `lines` over one cell, placed from
     /// the cell's top-left; `None` when the source has none.
@@ -546,21 +547,22 @@ impl MetalScene {
         // makes and shapes them (ft-yccm0.4.7.3). Each glyph takes the
         // colors of the cell it starts in.
         let cells = mirror_row.cells();
-        for cluster in mirror_row.clusters() {
-            for shaped in glyphs.shape_cluster(&cluster) {
-                let col = cluster.first_cell_idx + shaped.cell;
-                let index = cells.partition_point(|cell| cell.col() + cell.width().max(1) <= col);
-                let Some(cell) = cells.get(index) else {
-                    continue;
-                };
-                let Some(fg) = text_color(cell, style, built, reverse_video) else {
-                    continue;
-                };
-                let fg = adjust_brightness(fg, shaped.brightness);
-                let instance = CellText::new(col as u16, fg)
-                    .with_glyph(&shaped.glyph.slot, shaped.glyph.offset);
-                self.text.push(grid_row, instance);
+        for shaped in glyphs.shape_row(&mirror_row.clusters()) {
+            let col = shaped.cell;
+            if col >= cols as usize {
+                break;
             }
+            let index = cells.partition_point(|cell| cell.col() + cell.width().max(1) <= col);
+            let Some(cell) = cells.get(index) else {
+                continue;
+            };
+            let Some(fg) = text_color(cell, style, built, reverse_video) else {
+                continue;
+            };
+            let fg = adjust_brightness(fg, shaped.brightness);
+            let instance =
+                CellText::new(col as u16, fg).with_glyph(&shaped.glyph.slot, shaped.glyph.offset);
+            self.text.push(grid_row, instance);
         }
         if let Some((CursorSprite::Bar, instance)) = cursor_sprite {
             self.text.push(grid_row, instance);
@@ -696,8 +698,27 @@ mod tests {
         }
     }
 
-    impl GlyphSource for SyntheticGlyphs {
-        fn shape_cluster(&mut self, cluster: &CellCluster) -> &[ShapedGlyph] {
+    /// A row shaped one cluster at a time by `shape_cluster` (its glyphs'
+    /// cells counted from the cluster's first), each cluster advancing the
+    /// row by its width, which its synthetic cell counts add up to.
+    fn synthetic_row(
+        clusters: &[CellCluster],
+        mut shape_cluster: impl FnMut(&CellCluster) -> Vec<ShapedGlyph>,
+    ) -> Vec<ShapedGlyph> {
+        let mut row = Vec::new();
+        let mut first_cell = 0;
+        for cluster in clusters {
+            row.extend(shape_cluster(cluster).into_iter().map(|glyph| ShapedGlyph {
+                cell: first_cell + glyph.cell,
+                ..glyph
+            }));
+            first_cell += cluster.width;
+        }
+        row
+    }
+
+    impl SyntheticGlyphs {
+        fn shape_cluster(&mut self, cluster: &CellCluster) -> Vec<ShapedGlyph> {
             let style = synthetic_style(cluster);
             let key = (cluster.text.clone(), style);
             if !self.shaped.contains_key(&key) {
@@ -713,7 +734,13 @@ mod tests {
                 });
                 self.shaped.insert(key.clone(), shaped);
             }
-            &self.shaped[&key]
+            self.shaped[&key].clone()
+        }
+    }
+
+    impl GlyphSource for SyntheticGlyphs {
+        fn shape_row(&mut self, clusters: &[CellCluster]) -> Vec<ShapedGlyph> {
+            synthetic_row(clusters, |cluster| self.shape_cluster(cluster))
         }
 
         /// One made-up grayscale slot per line sprite, far from the glyphs'.
@@ -1437,9 +1464,9 @@ mod tests {
             cursors: HashMap<(CursorSprite, u8), PlacedGlyph>,
         }
 
-        impl GlyphSource for AtlasGlyphs<'_> {
+        impl AtlasGlyphs<'_> {
             /// Synthetic shaping with synthetic bitmaps in the real atlases.
-            fn shape_cluster(&mut self, cluster: &CellCluster) -> &[ShapedGlyph] {
+            fn shape_cluster(&mut self, cluster: &CellCluster) -> Vec<ShapedGlyph> {
                 let renderer = self.renderer;
                 let style = synthetic_style(cluster);
                 let key = (cluster.text.clone(), style);
@@ -1472,7 +1499,13 @@ mod tests {
                     });
                     self.shaped.insert(key.clone(), shaped);
                 }
-                &self.shaped[&key]
+                self.shaped[&key].clone()
+            }
+        }
+
+        impl GlyphSource for AtlasGlyphs<'_> {
+            fn shape_row(&mut self, clusters: &[CellCluster]) -> Vec<ShapedGlyph> {
+                synthetic_row(clusters, |cluster| self.shape_cluster(cluster))
             }
 
             /// A cell-sized (8x16) coverage pattern per line sprite.
