@@ -116,6 +116,8 @@ lfucache.workspace = true
 luahelper.workspace = true
 mux.workspace = true
 portable-pty = { workspace = true, features = ["serde_support"] }
+# Thread QoS classes for the Metal render thread (ft-yccm0.4.1.2).
+procinfo.workspace = true
 promise.workspace = true
 rangeset.workspace = true
 ratelim.workspace = true

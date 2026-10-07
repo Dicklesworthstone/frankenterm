@@ -14,6 +14,7 @@ pub mod metal_scene;
 pub mod osc8_gui;
 pub mod plugins;
 pub mod render_corpus;
+pub mod render_thread;
 pub mod renderer_slo;
 pub mod rollout_env;
 pub mod window_state_persist;

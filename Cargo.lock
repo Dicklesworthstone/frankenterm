@@ -4339,6 +4339,7 @@ dependencies = [
  "ordered-float 5.5.0",
  "parking_lot",
  "portable-pty",
+ "procinfo",
  "promise",
  "proptest",
  "rangeset",
