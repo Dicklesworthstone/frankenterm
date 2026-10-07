@@ -9681,13 +9681,66 @@ fn encode_scrollback_line_record(
 /// already holds survives, exactly as after `kill -9`.
 #[cfg(test)]
 mod scrollback_crash_points {
+    use std::path::{Path, PathBuf};
+
+    /// Every regular file under a store's base directory, by relative path.
+    pub type Image = std::collections::BTreeMap<PathBuf, Vec<u8>>;
+
     static ARMED: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
+
+    std::thread_local! {
+        static RECORDING: std::cell::RefCell<Option<(PathBuf, Vec<(&'static str, Image)>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
 
     pub fn arm(step: &'static str) {
         *ARMED.lock().unwrap() = Some(step);
     }
 
+    /// Take an image of `base` now ("start") and at every crash point this
+    /// thread reaches until `take`.
+    pub fn record(base: &Path) {
+        let start = image(base);
+        RECORDING.with(|recording| {
+            *recording.borrow_mut() = Some((base.to_path_buf(), vec![("start", start)]));
+        });
+    }
+
+    pub fn take() -> Vec<(&'static str, Image)> {
+        RECORDING.with(|recording| {
+            recording
+                .borrow_mut()
+                .take()
+                .map(|(_, images)| images)
+                .unwrap_or_default()
+        })
+    }
+
+    pub fn image(base: &Path) -> Image {
+        fn walk(base: &Path, dir: &Path, image: &mut Image) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    walk(base, &path, image);
+                } else {
+                    let relative = path.strip_prefix(base).unwrap().to_path_buf();
+                    image.insert(relative, std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        let mut image = Image::new();
+        walk(base, base, &mut image);
+        image
+    }
+
     pub fn reach(step: &'static str) {
+        RECORDING.with(|recording| {
+            if let Some((base, images)) = recording.borrow_mut().as_mut() {
+                let snapshot = image(base);
+                images.push((step, snapshot));
+            }
+        });
         if ARMED.lock().is_ok_and(|armed| *armed == Some(step)) {
             #[cfg(unix)]
             let _ = rustix::process::kill_process(
@@ -14698,6 +14751,241 @@ mod tests {
                 "{step}"
             );
         }
+    }
+
+    /// The store's files in the units that persist independently at a crash:
+    /// a rename moves a stage and its target together, and an append-only
+    /// file can also tear part way through its growth.
+    const CRASH_UNITS: [(&[&str], bool); 4] = [
+        (&[".append-wal.v1.json", ".append-wal.v1.installing"], false),
+        (&["manifest.json", "manifest.json.installing-v3"], false),
+        (&["0.log"], true),
+        (&["0.seq"], true),
+    ];
+
+    fn crash_unit(path: &std::path::Path) -> Option<usize> {
+        let name = path.file_name()?.to_str()?;
+        CRASH_UNITS
+            .iter()
+            .position(|(names, _)| names.contains(&name))
+    }
+
+    /// The durable states a crash can leave between two consecutive images:
+    /// each unit that changed is at its earlier or its later image, and a
+    /// grown append-only file or a newly written stage may also stop half way
+    /// or one byte short. Files outside every unit (keys, locks) take their
+    /// later image.
+    fn crash_states_between(
+        earlier: &scrollback_crash_points::Image,
+        later: &scrollback_crash_points::Image,
+    ) -> Vec<scrollback_crash_points::Image> {
+        let paths: std::collections::BTreeSet<_> = earlier.keys().chain(later.keys()).collect();
+        let changed: Vec<usize> = (0..CRASH_UNITS.len())
+            .filter(|&unit| {
+                paths.iter().any(|path| {
+                    crash_unit(path) == Some(unit) && earlier.get(*path) != later.get(*path)
+                })
+            })
+            .collect();
+        let mut states = Vec::new();
+        for mask in 0..(1_u32 << changed.len()) {
+            let takes_later = |unit: Option<usize>| {
+                unit.is_none_or(|unit| {
+                    changed
+                        .iter()
+                        .position(|&changed| changed == unit)
+                        .is_some_and(|bit| mask & (1 << bit) != 0)
+                })
+            };
+            let state: scrollback_crash_points::Image = paths
+                .iter()
+                .filter_map(|path| {
+                    let source = if takes_later(crash_unit(path)) {
+                        later
+                    } else {
+                        earlier
+                    };
+                    source
+                        .get(*path)
+                        .map(|bytes| ((*path).clone(), bytes.clone()))
+                })
+                .collect();
+            for path in &paths {
+                let Some(unit) = crash_unit(path) else {
+                    continue;
+                };
+                let (Some(grown), before) = (later.get(*path), earlier.get(*path)) else {
+                    continue;
+                };
+                // A new stage is written then synced, so it can tear too.
+                let new_stage = before.is_none()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.contains("installing"));
+                let before = before.map_or(&[][..], Vec::as_slice);
+                if !takes_later(Some(unit))
+                    || !(CRASH_UNITS[unit].1 || new_stage)
+                    || grown.len() <= before.len() + 1
+                    || !grown.starts_with(before)
+                {
+                    continue;
+                }
+                for cut in [
+                    before.len() + (grown.len() - before.len()) / 2,
+                    grown.len() - 1,
+                ] {
+                    let mut torn = state.clone();
+                    torn.insert((*path).clone(), grown[..cut].to_vec());
+                    states.push(torn);
+                }
+            }
+            states.push(state);
+        }
+        states
+    }
+
+    /// A fresh store holding exactly `image`, with the live store's
+    /// (unchanging) directory layout and private permissions.
+    fn materialize_store_image(
+        live: &std::path::Path,
+        image: &scrollback_crash_points::Image,
+    ) -> tempfile::TempDir {
+        fn directories(live: &std::path::Path, dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    out.push(entry.path().strip_prefix(live).unwrap().to_path_buf());
+                    directories(live, &entry.path(), out);
+                }
+            }
+        }
+        let restored = tempfile::tempdir().unwrap();
+        let mut dirs = Vec::new();
+        directories(live, live, &mut dirs);
+        for dir in dirs {
+            let target = restored.path().join(dir);
+            std::fs::create_dir_all(&target).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        for (path, bytes) in image {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+
+                options.mode(0o600);
+            }
+            options
+                .open(restored.path().join(path))
+                .unwrap()
+                .write_all(bytes)
+                .unwrap();
+        }
+        restored
+    }
+
+    /// Commit `pre` row by row, image the store at every crash point of one
+    /// `batch` transaction, and reopen every crash state between consecutive
+    /// images. Each must reopen to exactly the rows before the transaction
+    /// or exactly the rows after it. Returns the number of states checked.
+    fn every_crash_state_of_a_batch_recovers_exactly(
+        pre: &[Line],
+        batch: &[Line],
+        retention: usize,
+    ) -> usize {
+        let (dir, backing, _deferred) = deferred_test_sink();
+        for (row, line) in pre.iter().enumerate() {
+            assert!(backing.store_scrollback_line(row as isize, line, retention));
+        }
+        scrollback_crash_points::record(dir.path());
+        assert_eq!(
+            backing.store_scrollback_lines(pre.len() as isize, batch, retention),
+            batch.len()
+        );
+        let mut images = scrollback_crash_points::take();
+        images.push(("end", scrollback_crash_points::image(dir.path())));
+        let retained = |rows: &[Line]| -> Vec<(isize, Line)> {
+            let first = rows.len().saturating_sub(retention);
+            rows.iter()
+                .enumerate()
+                .skip(first)
+                .map(|(row, line)| (row as isize, line.clone()))
+                .collect()
+        };
+        let before = retained(pre);
+        let after = retained(&pre.iter().chain(batch).cloned().collect::<Vec<_>>());
+        let mut states = 0;
+        for pair in images.windows(2) {
+            let case = format!("{} -> {}", pair[0].0, pair[1].0);
+            for state in crash_states_between(&pair[0].1, &pair[1].1) {
+                states += 1;
+                let restored = materialize_store_image(dir.path(), &state);
+                let reopened = LiveScrollbackSpillSink::new(
+                    restored.path().to_path_buf(),
+                    &deferred_test_context(),
+                )
+                .unwrap_or_else(|error| panic!("{case}: crash state refused: {error:#}"));
+                let holds = |expected: &[(isize, Line)]| {
+                    reopened.retained_scrollback_rows() == expected.len()
+                        && expected.iter().all(|(row, line)| {
+                            reopened
+                                .load_scrollback_line(*row)
+                                .is_some_and(|mut actual| {
+                                    let mut line = line.clone();
+                                    actual.cells_mut();
+                                    line.cells_mut();
+                                    actual == line
+                                })
+                        })
+                };
+                assert!(
+                    holds(&before) || holds(&after),
+                    "{case}: recovered neither the rows before nor the rows after"
+                );
+                assert!(
+                    reopened
+                        .load_scrollback_line((pre.len() + batch.len()) as isize)
+                        .is_none(),
+                    "{case}"
+                );
+            }
+        }
+        states
+    }
+
+    /// ft-yccm0.2.1.7 AC2 (crash-state model): every durable state a crash can
+    /// leave inside a transaction recovers an exact committed prefix. Covers a
+    /// pristine first row, batches with and without retention pruning and
+    /// compaction, a batch replacing a consumed WAL, and full eviction.
+    #[test]
+    fn every_crash_state_inside_a_transaction_recovers_an_exact_committed_prefix() {
+        let row = |text: &str| Line::from_text(text, &CellAttributes::blank(), 1, None);
+        let mut states = 0;
+        states += every_crash_state_of_a_batch_recovers_exactly(&[], &[row("first")], 16);
+        states += every_crash_state_of_a_batch_recovers_exactly(
+            &[row("prior")],
+            &digest_only_test_lines("batch", 3),
+            16,
+        );
+        states += every_crash_state_of_a_batch_recovers_exactly(
+            &[row("prior")],
+            &digest_only_test_lines("pruned", 3),
+            3,
+        );
+        states += every_crash_state_of_a_batch_recovers_exactly(
+            &[row("a"), row("b"), row("c")],
+            &digest_only_test_lines("replacing", 2),
+            16,
+        );
+        states += every_crash_state_of_a_batch_recovers_exactly(&[row("old")], &[row("new")], 1);
+        assert!(states >= 40, "only {states} crash states were exercised");
     }
 
     /// Rows past the manifest that no WAL names are cut on reopen, after the
