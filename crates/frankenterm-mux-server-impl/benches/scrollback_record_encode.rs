@@ -19,6 +19,11 @@
 //! run, the cell-vector schemas every row sealed before (a payload vector and
 //! a record string allocated per row: `seal_compact_cell_schemas`) with
 //! schema 3 through the reusable encode arena (`seal_compact_arena`).
+//!
+//! `emoji_colors80` is synthetic: two alternating emoji with arithmetic
+//! colors, whose repetition favors the cell vector after zstd. `t0_corpus`
+//! is the realistic T0 shape (the M.1 generator's random emoji and colors
+//! through a terminal, as Screen hands the rows over); judge T0 by it.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_mux_server_impl::scrollback_record_bench::{Rows, Sealer};
@@ -99,10 +104,18 @@ fn record_path(c: &mut Criterion) {
             "emoji_colors80_clustered",
             Rows::emoji_colors(WINDOW_ROWS, 80).compressed_for_scrollback(),
         ),
+        // The realistic T0 rows: the M.1 generator through a terminal, as
+        // Screen hands them over (some stay in vector storage).
+        ("t0_corpus", Rows::t0_corpus(WINDOW_ROWS, 7)),
     ];
     let mut stream = sealer.compact_stream();
     for (shape, rows) in &clustered {
-        assert!(rows.all_clustered(), "{shape}");
+        let clustered_rows = rows
+            .lines()
+            .iter()
+            .filter(|line| line.has_clustered_storage())
+            .count();
+        eprintln!("scrollback_record {shape}: {clustered_rows} of {WINDOW_ROWS} rows clustered");
         let per_row = |bytes: usize| bytes as f64 / WINDOW_ROWS as f64;
         let (cell_plaintext, cell_payload) = sealer.serialize_and_compress_cell_schemas(rows);
         let cell_records = sealer.seal_compact_cell_schemas(rows, &mut Vec::new());

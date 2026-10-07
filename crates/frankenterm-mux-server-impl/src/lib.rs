@@ -153,6 +153,9 @@ std::thread_local! {
     static LIVE_SCROLLBACK_KEYRING_FREE_AT_RENAME: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static LIVE_SCROLLBACK_CONTENT_GROUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_BATCH_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    /// Seal clustered rows with the cell-vector schemas, as before schema 3
+    /// (ft-yccm0.2.1.4), for a same-run A/B.
+    static FORCE_CELL_SCHEMAS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn configured_ssh_domains(config: &ConfigHandle) -> Vec<config::SshDomain> {
@@ -11309,10 +11312,217 @@ pub mod scrollback_record_bench {
             self
         }
 
+        #[must_use]
+        pub fn lines(&self) -> &[wezterm_term::Line] {
+            &self.0
+        }
+
         /// Whether every row is in clustered storage.
         #[must_use]
         pub fn all_clustered(&self) -> bool {
             self.0.iter().all(wezterm_term::Line::has_clustered_storage)
+        }
+
+        /// `count` T0 rows exactly as Screen hands them to the store: the
+        /// operator's color-emoji-random stream (per glyph a random 256-color
+        /// foreground and background, then one of 1,376 emoji or 71 ASCII
+        /// characters; the M.1 corpus generator) through an 80-column
+        /// terminal whose scrollback goes straight to a capturing sink.
+        #[must_use]
+        pub fn t0_corpus(count: usize, seed: u64) -> Self {
+            Self::t0_corpus_with_input(count, seed).0
+        }
+
+        /// `t0_corpus` and the bytes of T0 output fed to the terminal. They
+        /// include the last screenful, still on screen and not among the
+        /// rows (about 26 rows of input).
+        #[must_use]
+        pub fn t0_corpus_with_input(count: usize, seed: u64) -> (Self, usize) {
+            let sink = std::sync::Arc::new(CaptureSink::default());
+            let mut terminal = wezterm_term::Terminal::new(
+                wezterm_term::TerminalSize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 800,
+                    pixel_height: 480,
+                    dpi: 96,
+                },
+                std::sync::Arc::new(CaptureConfig(std::sync::Arc::clone(&sink))),
+                "FrankenTerm",
+                "scrollback-record-bench",
+                Box::new(Vec::<u8>::new()),
+            );
+            let pool: Vec<String> = T0_EMOJI_RANGES
+                .iter()
+                .flat_map(|&(start, end)| start..=end)
+                .filter_map(char::from_u32)
+                .map(String::from)
+                .chain(T0_ASCII_POOL.chars().map(String::from))
+                .collect();
+            let mut rng = T0Rng::new(seed);
+            let mut out = Vec::new();
+            let mut input_bytes = 0;
+            while sink.rows() < count {
+                out.clear();
+                for _ in 0..16 {
+                    // The generator's draw order: fg, bg, then the glyph.
+                    let fg = rng.below(256);
+                    let bg = rng.below(256);
+                    let glyph = &pool[rng.below(pool.len())];
+                    out.extend_from_slice(format!("\x1b[38;5;{fg}m\x1b[48;5;{bg}m").as_bytes());
+                    out.extend_from_slice(glyph.as_bytes());
+                }
+                input_bytes += out.len();
+                terminal.advance_bytes(&out);
+            }
+            (Self(sink.take(count)), input_bytes)
+        }
+    }
+
+    /// The M.1 corpus generator's emoji code point ranges and ASCII pool
+    /// (frankenterm-term benches/ingest/corpus.rs).
+    const T0_EMOJI_RANGES: [(u32, u32); 5] = [
+        (0x1F600, 0x1F64F),
+        (0x1F300, 0x1F5FF),
+        (0x1F680, 0x1F6FF),
+        (0x1F900, 0x1F9FF),
+        (0x1FA70, 0x1FAFF),
+    ];
+    const T0_ASCII_POOL: &str =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#%^&*()";
+
+    /// The M.1 corpus generator's xorshift, seeded through splitmix64.
+    struct T0Rng(u64);
+
+    impl T0Rng {
+        fn new(seed: u64) -> Self {
+            let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            Self(if z == 0 { 0x9E37_79B9_7F4A_7C15 } else { z })
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            let draw = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            ((u128::from(draw) * n as u128) >> 64) as usize
+        }
+    }
+
+    /// Keeps the rows a Screen moves to scrollback, as the store gets them.
+    #[derive(Debug, Default)]
+    struct CaptureSink(std::sync::Mutex<Vec<(wezterm_term::StableRowIndex, wezterm_term::Line)>>);
+
+    impl CaptureSink {
+        fn rows(&self) -> usize {
+            self.0.lock().map_or(0, |rows| rows.len())
+        }
+
+        fn take(&self, count: usize) -> Vec<wezterm_term::Line> {
+            self.0
+                .lock()
+                .map(|mut rows| rows.drain(..).take(count).map(|(_, line)| line).collect())
+                .unwrap_or_default()
+        }
+    }
+
+    impl wezterm_term::config::ScrollbackSpillSink for CaptureSink {
+        fn store_scrollback_line(
+            &self,
+            stable_row: wezterm_term::StableRowIndex,
+            line: &wezterm_term::Line,
+            _max_retained_rows: usize,
+        ) -> bool {
+            self.0
+                .lock()
+                .map(|mut rows| rows.push((stable_row, line.clone())))
+                .is_ok()
+        }
+
+        fn load_scrollback_line(
+            &self,
+            stable_row: wezterm_term::StableRowIndex,
+        ) -> Option<wezterm_term::Line> {
+            let rows = self.0.lock().ok()?;
+            rows.iter()
+                .find(|(row, _)| *row == stable_row)
+                .map(|(_, line)| line.clone())
+        }
+
+        fn oldest_scrollback_row(&self) -> Option<wezterm_term::StableRowIndex> {
+            self.0.lock().ok()?.first().map(|(row, _)| *row)
+        }
+
+        fn retained_scrollback_rows(&self) -> usize {
+            self.rows()
+        }
+
+        fn retained_scrollback_bytes(&self) -> usize {
+            0
+        }
+
+        fn snapshot_scrollback(
+            &self,
+            _expected_newest_exclusive: wezterm_term::StableRowIndex,
+            _limits: wezterm_term::config::ScrollbackSnapshotLimits,
+        ) -> Result<
+            wezterm_term::config::ScrollbackSnapshot,
+            wezterm_term::config::ScrollbackSpillError,
+        > {
+            Err(wezterm_term::config::ScrollbackSpillError::StorageUnavailable)
+        }
+
+        fn replace_scrollback_prefix(
+            &self,
+            _expected_generation: Option<wezterm_term::config::ScrollbackSnapshotGeneration>,
+            _prefix: wezterm_term::config::ScrollbackPrefix<'_>,
+            _max_retained_rows: usize,
+        ) -> Result<
+            wezterm_term::config::ScrollbackReplaceCommit,
+            wezterm_term::config::ScrollbackSpillError,
+        > {
+            Err(wezterm_term::config::ScrollbackSpillError::StorageUnavailable)
+        }
+
+        fn clear_scrollback(
+            &self,
+        ) -> Result<
+            wezterm_term::config::ScrollbackClearCommit,
+            wezterm_term::config::ScrollbackSpillError,
+        > {
+            Err(wezterm_term::config::ScrollbackSpillError::StorageUnavailable)
+        }
+    }
+
+    #[derive(Debug)]
+    struct CaptureConfig(std::sync::Arc<CaptureSink>);
+
+    impl wezterm_term::TerminalConfiguration for CaptureConfig {
+        fn color_palette(&self) -> wezterm_term::color::ColorPalette {
+            wezterm_term::color::ColorPalette::default()
+        }
+
+        fn scrollback_size(&self) -> usize {
+            1 << 20
+        }
+
+        fn scrollback_tier_config(&self) -> wezterm_term::config::ScrollbackTierConfig {
+            wezterm_term::config::ScrollbackTierConfig {
+                enabled: true,
+                hot_lines: 2,
+                warm_max_bytes: 0,
+            }
+        }
+
+        fn scrollback_spill_sink(
+            &self,
+        ) -> Option<std::sync::Arc<dyn wezterm_term::config::ScrollbackSpillSink>> {
+            Some(self.0.clone())
         }
     }
 
@@ -11545,7 +11755,11 @@ fn serialize_exact_semantic_scrollback_line_into(
     out: &mut Vec<u8>,
 ) -> bool {
     wipe_scrollback_plaintext(out);
-    if line.has_clustered_storage() {
+    #[cfg(test)]
+    let clustered = line.has_clustered_storage() && !FORCE_CELL_SCHEMAS.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let clustered = line.has_clustered_storage();
+    if clustered {
         let semantic = ExactSemanticScrollbackLineRef {
             schema: EXACT_SCROLLBACK_SCHEMA_CLUSTERED,
             line,
@@ -19013,6 +19227,94 @@ mod tests {
             assert!(line.has_clustered_storage(), "{:?}", line.as_str());
         }
         rows
+    }
+
+    /// ft-yccm0.2.1.4: durable bytes written and syncs per MiB of T0 input,
+    /// the cell-vector schemas every row sealed before against schema 3, in
+    /// one run. Realistic T0 rows (the M.1 generator through an 80-column
+    /// terminal, as Screen hands them over) take the live sink's production
+    /// protocol: a first single batch, then commit windows of at most one
+    /// store batch, published on the final flush. Retention keeps every row,
+    /// so nothing is pruned or compacted: the ledger's log and sequence
+    /// bytes are exactly the bytes appended, and the WAL and manifest the
+    /// publications left come on top. Schema 3 must not amplify them.
+    #[test]
+    fn t0_durable_bytes_and_syncs_per_mib_before_and_after_schema_3() {
+        const ROWS: usize = 8192;
+        let (rows, input_bytes) =
+            super::scrollback_record_bench::Rows::t0_corpus_with_input(ROWS, 7);
+        let lines = rows.lines();
+        let clustered = lines
+            .iter()
+            .filter(|line| line.has_clustered_storage())
+            .count();
+        let measure = |force_cell_schemas: bool| {
+            FORCE_CELL_SCHEMAS.with(|force| force.set(force_cell_schemas));
+            let dir = tempfile::tempdir().unwrap();
+            let sink = LiveScrollbackSpillSink::open(
+                dir.path().to_path_buf(),
+                &deferred_test_context(),
+                std::time::Duration::from_secs(3600),
+            )
+            .unwrap();
+            let syncs_before =
+                frankenterm_core::storage::mmap_store::thread_durability_sync_count();
+            let publications_before =
+                LIVE_SCROLLBACK_MANIFEST_PUBLICATIONS.with(|count| count.get());
+            let mut row = 0;
+            while row < ROWS {
+                let window = &lines[row..(row + LIVE_SCROLLBACK_APPEND_MAX_ROWS).min(ROWS)];
+                let stored = sink.store_scrollback_lines(row as isize, window, ROWS);
+                assert!(stored > 0, "window at row {row}");
+                row += stored;
+            }
+            sink.flush_scrollback().unwrap();
+            let syncs = frankenterm_core::storage::mmap_store::thread_durability_sync_count()
+                - syncs_before;
+            let publications = LIVE_SCROLLBACK_MANIFEST_PUBLICATIONS.with(|count| count.get())
+                - publications_before;
+            FORCE_CELL_SCHEMAS.with(|force| force.set(false));
+            let manifest = published_manifest(&sink);
+            assert_eq!(manifest.next_seq, ROWS as u64);
+            assert_eq!(manifest.oldest_seq, Some(0), "nothing was pruned");
+            for probe in [0, ROWS / 2, ROWS - 1] {
+                let mut stored = sink.load_scrollback_line(probe as isize).unwrap();
+                let mut expected = lines[probe].clone();
+                assert_eq!(stored.cells_mut(), expected.cells_mut(), "row {probe}");
+            }
+            let ledger =
+                manifest.committed_log_bytes.unwrap() + manifest.committed_sequence_bytes.unwrap();
+            let file_bytes =
+                |path: &std::path::Path| std::fs::metadata(path).map_or(0, |m| m.len());
+            let metadata = file_bytes(&sink.manifest_path)
+                + file_bytes(
+                    &LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path).unwrap(),
+                );
+            (ledger, metadata, syncs, publications)
+        };
+        let (before_ledger, before_metadata, before_syncs, before_publications) = measure(true);
+        let (after_ledger, after_metadata, after_syncs, after_publications) = measure(false);
+        let mib = input_bytes as f64 / (1024.0 * 1024.0);
+        let per_mib = |bytes: u64| bytes as f64 / mib;
+        eprintln!(
+            "T0 corpus {ROWS} rows ({clustered} clustered), {input_bytes} input bytes: \
+             cell schemas {before_ledger} ledger + {before_metadata} WAL/manifest bytes = \
+             {:.0} bytes/MiB, {before_syncs} syncs = {:.1} syncs/MiB, {before_publications} \
+             publications; schema 3 {after_ledger} + {after_metadata} = {:.0} bytes/MiB, \
+             {after_syncs} syncs = {:.1} syncs/MiB, {after_publications} publications; \
+             bytes ratio {:.3}",
+            per_mib(before_ledger + before_metadata),
+            before_syncs as f64 / mib,
+            per_mib(after_ledger + after_metadata),
+            after_syncs as f64 / mib,
+            (after_ledger + after_metadata) as f64 / (before_ledger + before_metadata) as f64,
+        );
+        assert_eq!(after_syncs, before_syncs, "the same windows sync the same");
+        assert_eq!(after_publications, before_publications);
+        assert!(
+            after_ledger + after_metadata < before_ledger + before_metadata,
+            "schema 3 must not amplify T0's durable bytes"
+        );
     }
 
     /// ft-yccm0.2.1.4 AC1: a clustered row seals as schema 3, its own runs
