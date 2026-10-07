@@ -899,7 +899,11 @@ const ATLAS_REFILL_GROWTH_WINDOW: Duration = Duration::from_secs(30);
 /// and counts both.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AtlasRebuildPolicy {
-    /// The side of the last clear, and when it happened.
+    /// The side of the last rebuild, clear or growth, and when it happened.
+    /// A growth counts too: an atlas grown because its working set did not
+    /// fit, and refilled this soon, needs to grow again. Clearing it first
+    /// dropped the working set and cost the T0 emoji pool one more rebuild
+    /// on its second pass (ft-yccm0.2.12 rework).
     last_clear: Option<(usize, Instant)>,
     /// Rebuilds that kept the size and dropped every glyph.
     pub(crate) clears: u64,
@@ -911,8 +915,9 @@ impl AtlasRebuildPolicy {
     /// The side to rebuild an atlas of side `current` at, when paint asked
     /// for `requested`. A size change stands. A clear (`requested ==
     /// current`) becomes a doubling when the atlas refilled within
-    /// [`ATLAS_REFILL_GROWTH_WINDOW`] of its last clear at this size and the
-    /// doubled side stays within `max_side`.
+    /// [`ATLAS_REFILL_GROWTH_WINDOW`] of its last rebuild at this size (a
+    /// clear or the growth that made it this size) and the doubled side
+    /// stays within `max_side`.
     pub(crate) fn plan(
         &mut self,
         current: usize,
@@ -933,13 +938,12 @@ impl AtlasRebuildPolicy {
         };
         if side > current {
             self.growths += 1;
-            self.last_clear = None;
             metrics::counter!("gui.atlas.grow").increment(1);
         } else {
             self.clears += 1;
-            self.last_clear = Some((side, now));
             metrics::counter!("gui.atlas.clear").increment(1);
         }
+        self.last_clear = Some((side, now));
         side
     }
 
@@ -1965,9 +1969,9 @@ mod tests {
         assert_eq!(err.failure, AtlasAllocationFailure::MemoryBudget);
     }
 
-    /// ft-yccm0.2.12: a full atlas is cleared once per size; refilling it
-    /// within the window grows it, a late overflow reclaims instead, and the
-    /// budget caps growth.
+    /// ft-yccm0.2.12: the first overflow clears; refilling the atlas within
+    /// the window of its last rebuild grows it, also right after a growth;
+    /// a late overflow reclaims instead, and the budget caps growth.
     #[test]
     fn a_refilled_atlas_grows_instead_of_clearing_again() {
         use super::{ATLAS_REFILL_GROWTH_WINDOW, AtlasRebuildPolicy};
@@ -1986,30 +1990,34 @@ mod tests {
             256,
             "a quick refill grows"
         );
-        assert_eq!(policy.plan(256, 256, 8192, start + 2 * second), 256);
+        // The rework's regression: the grown atlas refilled at once, so its
+        // working set exceeds it too. Clearing it here dropped that working
+        // set (the T0 pool's warm-up cleared 512 at screen 10, and its
+        // second pass grew to 1024).
         assert_eq!(
-            policy.plan(256, 1024, 8192, start + 3 * second),
+            policy.plan(256, 256, 8192, start + 2 * second),
+            512,
+            "a quick refill of a grown atlas grows again"
+        );
+        assert_eq!(
+            policy.plan(512, 1024, 8192, start + 3 * second),
             1024,
             "an explicit size stands"
         );
-        let late = start + 4 * second;
-        assert_eq!(policy.plan(1024, 1024, 8192, late), 1024);
+        let late = start + 3 * second + ATLAS_REFILL_GROWTH_WINDOW;
         assert_eq!(
-            policy.plan(1024, 1024, 8192, late + ATLAS_REFILL_GROWTH_WINDOW),
+            policy.plan(1024, 1024, 8192, late),
             1024,
             "an overflow after the window reclaims"
         );
+        assert_eq!(policy.plan(1024, 1024, 8192, late + second), 2048);
+        assert_eq!(policy.plan(8192, 8192, 8192, late + 2 * second), 8192);
         assert_eq!(
-            policy.plan(1024, 1024, 8192, late + ATLAS_REFILL_GROWTH_WINDOW),
-            2048
-        );
-        assert_eq!(policy.plan(8192, 8192, 8192, late), 8192);
-        assert_eq!(
-            policy.plan(8192, 8192, 8192, late + second),
+            policy.plan(8192, 8192, 8192, late + 3 * second),
             8192,
             "the budget caps growth"
         );
-        assert_eq!((policy.clears, policy.growths), (6, 3));
+        assert_eq!((policy.clears, policy.growths), (4, 4));
 
         // A growth the device refused counts as the clear that happened.
         let mut refused = AtlasRebuildPolicy::default();
@@ -2129,9 +2137,9 @@ mod tests {
             }
             (shapes, None)
         };
-        let mut draw_pool = |policy: &mut AtlasRebuildPolicy| -> u64 {
+        let mut draw_pool = |policy: &mut AtlasRebuildPolicy, round: &str| -> u64 {
             let mut shapes = 0;
-            for screen in pool.chunks(SCREEN) {
+            for (index, screen) in pool.chunks(SCREEN).enumerate() {
                 let mut drawn = false;
                 for pass in 0..PASSES {
                     let (made, overflow) = draw_screen(screen);
@@ -2147,6 +2155,9 @@ mod tests {
                     };
                     let current = glyph_cache.borrow().atlas.size();
                     let side = policy.plan(current, requested, budget_side, Instant::now());
+                    eprintln!(
+                        "[atlas] {round} screen {index} pass {pass}: side {current}, requested {requested}, rebuilt at {side}"
+                    );
                     util_sprites = replace_glyph_cache_atlas(
                         &glyph_cache,
                         &fonts,
@@ -2162,7 +2173,7 @@ mod tests {
             shapes
         };
 
-        draw_pool(&mut policy);
+        draw_pool(&mut policy, "warm-up");
         let warm = (
             ledger.snapshot().atlas_generations,
             policy,
@@ -2176,7 +2187,7 @@ mod tests {
         );
         assert!(warm.2.queried > 0, "the warm-up resolved fallbacks");
 
-        let shapes = draw_pool(&mut policy);
+        let shapes = draw_pool(&mut policy, "second");
         let walk = font.fallback_walk_stats();
         assert_eq!(
             ledger.snapshot().atlas_generations,
