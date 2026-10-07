@@ -84,4 +84,6 @@ objc2-quartz-core = { version = "0.3.2", default-features = false, features = [
     "objc2-metal",
     "CALayer",
     "CAMetalLayer",
+    # Drawable resizes on the render thread commit explicitly (ft-yccm0.4.1.2).
+    "CATransaction",
 ] }

@@ -149,10 +149,25 @@
 //!     reads it; the pixel slice was checked to hold exactly width x height x
 //!     bytes-per-pixel bytes at a tight row pitch and is borrowed for the
 //!     call; the texture is in shared storage, which the CPU may write.
+//! 11. **THREAD-HANDOFF: moving a renderer to its render thread.**
+//!     `MetalRendererHandoff` is `Send` (ft-yccm0.4.1.2). A window's renderer
+//!     is attached on the main thread, as AppKit requires, then moved whole to
+//!     the window's render thread, which then does all its drawing.
+//!     *Invariant:* the handoff owns the renderer, and the renderer is not
+//!     `Sync`, so one thread at a time uses it and none shares it. It holds no
+//!     `Rc` and no thread-local state: its Metal device, queue, buffers,
+//!     textures and pipeline states are thread-safe Metal objects
+//!     (`MTLDevice` is `Send + Sync` in `objc2-metal`); the slot ring it
+//!     shares with completion handlers is an `Arc` of atomics. After the
+//!     handoff only the receiving thread touches the `CAMetalLayer`, whose
+//!     `nextDrawable`, `drawableSize` and drawable presentation may be used
+//!     off the main thread; the drawable size is changed inside an explicit
+//!     `CATransaction`, since a render thread has no run loop to commit an
+//!     implicit one.
 //!
 //! Thread affinity: `MetalRenderer` holds Objective-C objects that are not
-//! `Send`, so it stays on the thread that created it (the GUI main thread
-//! today; bead `ft-yccm0.4.1.2` moves rendering to a dedicated thread).
+//! `Send`, so it stays on the thread that created it unless it is moved
+//! through a [`MetalRendererHandoff`] (category 11).
 
 use std::fmt;
 use std::time::Duration;
@@ -175,12 +190,12 @@ pub use macos_atlas::GlyphAtlases;
 #[cfg(target_os = "macos")]
 mod macos_frames;
 #[cfg(target_os = "macos")]
-pub use macos::{MetalDevice, MetalRenderer};
+pub use macos::{MetalDevice, MetalRenderer, MetalRendererHandoff};
 
 #[cfg(not(target_os = "macos"))]
 mod stub;
 #[cfg(not(target_os = "macos"))]
-pub use stub::{MetalDevice, MetalRenderer};
+pub use stub::{MetalDevice, MetalRenderer, MetalRendererHandoff};
 
 /// Lowest `MTLGPUFamilyAppleN` the renderer admits: Apple7, the M1 generation
 /// and the first Apple-silicon Mac family.

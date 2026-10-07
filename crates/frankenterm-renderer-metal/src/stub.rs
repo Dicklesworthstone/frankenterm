@@ -37,6 +37,20 @@ impl MetalDevice {
 #[derive(Debug)]
 pub enum MetalRenderer {}
 
+/// Off macOS a renderer never exists, so neither does its handoff.
+#[derive(Debug)]
+pub struct MetalRendererHandoff(MetalRenderer);
+
+impl MetalRendererHandoff {
+    pub fn new(renderer: MetalRenderer) -> Self {
+        Self(renderer)
+    }
+
+    pub fn into_renderer(self) -> MetalRenderer {
+        self.0
+    }
+}
+
 impl MetalRenderer {
     pub fn attach(_window: &impl HasWindowHandle) -> Result<Self, MetalUnavailable> {
         Err(MetalUnavailable::UnsupportedPlatform)
@@ -63,6 +77,11 @@ impl MetalRenderer {
 
     #[must_use]
     pub fn frame_stats(&self) -> FrameStats {
+        match *self {}
+    }
+
+    #[must_use]
+    pub fn drawable_size(&self) -> (u32, u32) {
         match *self {}
     }
 

@@ -26,7 +26,7 @@ use objc2_metal::{
     MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor,
     MTLTextureUsage,
 };
-use objc2_quartz_core::{CALayer, CAMetalDrawable, CAMetalLayer};
+use objc2_quartz_core::{CALayer, CAMetalDrawable, CAMetalLayer, CATransaction};
 use raw_window_handle::HasWindowHandle;
 use std::cell::{Cell, RefCell};
 use std::fmt;
@@ -234,6 +234,30 @@ impl fmt::Debug for MetalRenderer {
     }
 }
 
+/// A [`MetalRenderer`] on its way to the thread that will draw with it, the
+/// window's render thread (ft-yccm0.4.1.2). The renderer is attached on the
+/// main thread, as AppKit requires, then moved here whole.
+#[derive(Debug)]
+pub struct MetalRendererHandoff(MetalRenderer);
+
+#[allow(unsafe_code)]
+// SAFETY: THREAD-HANDOFF. The handoff owns its renderer and the renderer is
+// not `Sync`, so only the thread holding it uses it. Its Metal objects are
+// thread-safe and it holds no `Rc` or thread-local state; after the move only
+// the receiving thread touches the layer (crate docs, category 11).
+unsafe impl Send for MetalRendererHandoff {}
+
+impl MetalRendererHandoff {
+    pub fn new(renderer: MetalRenderer) -> Self {
+        Self(renderer)
+    }
+
+    /// The renderer, on the thread that will draw with it.
+    pub fn into_renderer(self) -> MetalRenderer {
+        self.0
+    }
+}
+
 impl MetalRenderer {
     /// Opens and admits the system default device, then binds it to the
     /// window's backing `CAMetalLayer`. Must be called on the main thread.
@@ -410,6 +434,13 @@ impl MetalRenderer {
         }
     }
 
+    /// The layer's drawable size, in pixels, as the last rendered frame set
+    /// it; `(0, 0)` before the first.
+    #[must_use]
+    pub fn drawable_size(&self) -> (u32, u32) {
+        self.drawable_size.get()
+    }
+
     /// Renders one frame of a `width x height` pixel layer showing `grid`:
     /// leases the next frame slot (waiting at most [`FRAME_SLOT_TIMEOUT`] for
     /// the GPU to release it), writes the frame's uniforms into it, clears
@@ -577,8 +608,14 @@ impl MetalRenderer {
             return Ok(FrameOutcome::ZeroSize);
         }
         if self.drawable_size.get() != (width, height) {
+            // A render thread has no run loop to commit an implicit
+            // transaction (ft-yccm0.4.1.2): change the size in an explicit
+            // one, without the implicit resize animation.
+            CATransaction::begin();
+            CATransaction::setDisableActions(true);
             self.layer
                 .setDrawableSize(CGSize::new(f64::from(width), f64::from(height)));
+            CATransaction::commit();
             self.drawable_size.set((width, height));
         }
         let retired_before = self.frames.borrow().ring().retired_before();
