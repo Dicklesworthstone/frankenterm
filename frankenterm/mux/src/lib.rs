@@ -11128,63 +11128,318 @@ fn count_parse_path(generation: &PaneRegistrationGeneration, fused: bool, bytes:
 ///
 /// Only output that cannot hold a synchronized-output action is held: BSU,
 /// ESU and the mode-2026 query change when the loop flushes, so they are
-/// still handled as each is parsed. A chunk with `2026` anywhere in it,
-/// counting the three bytes consumed before it, is parsed as before, which
-/// costs nothing but speed when the digits are only text. DECSTR, the other
-/// synchronized-output action, matters only during a hold, and nothing is
-/// held raw during a hold.
+/// still handled as each is parsed. A chunk in which a sequence that can
+/// decode to one ends (see [`SyncControlScan`]) is parsed as before. Nothing
+/// is held raw during a hold.
 #[derive(Default)]
 struct RawCoalescer {
     bytes: Vec<u8>,
-    /// The last bytes consumed, at most three, for a marker split across
-    /// chunks.
-    window: [u8; 3],
-    window_len: usize,
+    scan: SyncControlScan,
 }
 
 impl RawCoalescer {
-    const MARKER: &'static [u8] = b"2026";
-
     fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
 
-    /// Whether `chunk` may be held raw (see the type's documentation).
-    fn admits(&self, chunk: &[u8]) -> bool {
-        if chunk.windows(Self::MARKER.len()).any(|w| w == Self::MARKER) {
-            return false;
-        }
-        // A marker that starts in the consumed window and ends in `chunk`.
-        let head = &chunk[..chunk.len().min(Self::MARKER.len() - 1)];
-        let mut joint = [0_u8; 6];
-        let tail = &self.window[3 - self.window_len..];
-        joint[..tail.len()].copy_from_slice(tail);
-        joint[tail.len()..tail.len() + head.len()].copy_from_slice(head);
-        !joint[..tail.len() + head.len()]
-            .windows(Self::MARKER.len())
-            .any(|w| w == Self::MARKER)
-    }
-
-    /// Records `chunk` as consumed, held or not, for the next `admits`.
-    fn note_consumed(&mut self, chunk: &[u8]) {
-        if chunk.len() >= 3 {
-            self.window.copy_from_slice(&chunk[chunk.len() - 3..]);
-            self.window_len = 3;
-            return;
-        }
-        let keep = (3 - chunk.len()).min(self.window_len);
-        let mut window = [0_u8; 3];
-        window[..keep].copy_from_slice(&self.window[3 - keep..]);
-        window[keep..keep + chunk.len()].copy_from_slice(chunk);
-        let len = keep + chunk.len();
-        self.window = [0; 3];
-        self.window[3 - len..].copy_from_slice(&window[..len]);
-        self.window_len = len;
+    /// Scans `chunk` as consumed, held or not, and returns whether a
+    /// synchronized-output control may end in it, so that it is not held.
+    /// Every consumed chunk goes through here, in order, so a control split
+    /// across chunks is found in the chunk that ends it.
+    fn scan_controls(&mut self, chunk: &[u8]) -> bool {
+        self.scan.scan(chunk)
     }
 
     fn push(&mut self, chunk: &[u8]) {
         self.bytes.extend_from_slice(chunk);
     }
+}
+
+/// Where [`SyncControlScan`] stands in vtparse's state machine. String
+/// states and the escape-intermediate state count as ground: neither starts
+/// a CSI sequence except through ESC or 0x9B, which every state honors.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SyncScanState {
+    #[default]
+    Ground,
+    Escape,
+    CsiEntry,
+    CsiParam,
+    CsiIntermediate,
+    CsiIgnore,
+}
+
+/// Finds, in the parse thread's consumed output, the CSI sequences that can
+/// decode to a synchronized-output action (ft-yccm0.3.2.1): DEC private mode
+/// 2026 set or reset (CSI ? Pm h or l with 2026 among the Pm), its query
+/// (CSI ? 2026 $ p), and DECSTR (CSI ! p). Text, and any other sequence with
+/// the digits 2026 in it, such as an SGR, is not flagged.
+///
+/// It follows vtparse's CSI transitions byte for byte, across chunks: C0
+/// controls, DEL and 0xa0..=0xff inside a sequence are skipped as the
+/// parser skips them (so ESC [ ? 2 0 NUL 2 6 h is BSU), parameters saturate
+/// as the parser's do, CAN, SUB and the other C1 controls abort the
+/// sequence, and ESC or 0x9B (raw, or the second byte of U+009B in UTF-8)
+/// start afresh from any state. It never misses such a sequence. It can
+/// flag one the parser does not decode, at a cost only in speed: a 0x9B
+/// that continues a UTF-8 character, more than 256 parameters, or a
+/// parameter shape the CSI decoder refuses.
+#[derive(Debug, Default)]
+struct SyncControlScan {
+    state: SyncScanState,
+    /// The parameter being read.
+    param: i64,
+    /// The sequence's private marker is `?`.
+    dec_private: bool,
+    /// A parameter of the sequence is 2026.
+    mode_2026: bool,
+    /// An intermediate of the sequence is `!`.
+    bang: bool,
+    /// An intermediate of the sequence is `$`.
+    dollar: bool,
+}
+
+impl SyncControlScan {
+    const SYNCHRONIZED_OUTPUT_MODE: i64 = 2026;
+
+    /// Advances over `chunk` and returns whether a sequence that can decode
+    /// to a synchronized-output action ends in it.
+    fn scan(&mut self, chunk: &[u8]) -> bool {
+        let Some(last) = rfind_any(chunk, [0x1b, 0x9b]) else {
+            // No sequence starts here; one left open may end here.
+            return self.state != SyncScanState::Ground && self.scan_bytes(chunk);
+        };
+        if self.may_end_control(chunk) {
+            return self.scan_bytes(chunk);
+        }
+        // No control ends here, so only where the scan stands at the end
+        // matters, and from the last ESC or 0x9B on that does not depend on
+        // what came before.
+        let found = self.scan_bytes(&chunk[last..]);
+        debug_assert!(!found, "a control ended where none could");
+        false
+    }
+
+    /// Whether a control can end in `chunk`. Its final byte (h, l or p)
+    /// always follows a byte that keeps a CSI sequence open (a parameter,
+    /// an intermediate, or a byte the parser skips there), or opens the
+    /// chunk while a sequence is open. In T0 every printed character
+    /// follows an SGR's `m`, so its chunks skip [`Self::scan_bytes`].
+    fn may_end_control(&self, chunk: &[u8]) -> bool {
+        let open = matches!(
+            self.state,
+            SyncScanState::CsiEntry | SyncScanState::CsiParam | SyncScanState::CsiIntermediate
+        );
+        let mut from = 0;
+        while let Some(at) = find_any(&chunk[from..], *b"hlp") {
+            let at = from + at;
+            let possible = match at.checked_sub(1) {
+                Some(before) => matches!(
+                    chunk[before],
+                    0x00..=0x17 | 0x19 | 0x1c..=0x3f | 0x7f | 0xa0..=0xff
+                ),
+                None => open,
+            };
+            if possible {
+                return true;
+            }
+            from = at + 1;
+        }
+        false
+    }
+
+    /// Steps over `bytes` and returns whether a control ends in them.
+    fn scan_bytes(&mut self, bytes: &[u8]) -> bool {
+        let mut found = false;
+        let mut rest = bytes;
+        loop {
+            if self.state == SyncScanState::Ground {
+                // Only ESC and 0x9B leave the ground state here.
+                match find_any(rest, [0x1b, 0x9b]) {
+                    Some(at) => rest = &rest[at..],
+                    None => return found,
+                }
+                if let Some(len) = Self::plain_csi_len(rest) {
+                    rest = &rest[len..];
+                    continue;
+                }
+            }
+            let Some((&byte, tail)) = rest.split_first() else {
+                return found;
+            };
+            found |= self.step(byte);
+            rest = tail;
+        }
+    }
+
+    /// The length of the CSI sequence `bytes` opens with, ESC [ then
+    /// parameter bytes then a final byte, when that final byte is not h, l
+    /// or p. Whatever its parameters, the parser ends such a sequence in the
+    /// ground state and it is no control, so the scan skips it whole: an SGR
+    /// costs one pass over its parameters.
+    fn plain_csi_len(bytes: &[u8]) -> Option<usize> {
+        let body = bytes.strip_prefix(b"\x1b[")?;
+        let params = body
+            .iter()
+            .take_while(|&&byte| (0x30..=0x3f).contains(&byte))
+            .count();
+        let last = *body.get(params)?;
+        let plain = (0x40..=0x7e).contains(&last) && !matches!(last, b'h' | b'l' | b'p');
+        plain.then_some(2 + params + 1)
+    }
+
+    fn step(&mut self, byte: u8) -> bool {
+        use SyncScanState::*;
+        // vtparse's transitions from any state; 0xa0..=0xff fall through.
+        match byte {
+            0x1b => {
+                self.state = Escape;
+                return false;
+            }
+            0x9b => {
+                self.enter_csi();
+                return false;
+            }
+            0x18 | 0x1a | 0x80..=0x9f => {
+                self.state = Ground;
+                return false;
+            }
+            _ => {}
+        }
+        match self.state {
+            Ground => {}
+            Escape => match byte {
+                b'[' => self.enter_csi(),
+                // An intermediate, a final byte, or a string introducer.
+                0x20..=0x7e => self.state = Ground,
+                // C0 controls, DEL and 0xa0..=0xff leave ESC pending.
+                _ => {}
+            },
+            CsiEntry | CsiParam => match byte {
+                b'0'..=b'9' => {
+                    self.param = self
+                        .param
+                        .saturating_mul(10)
+                        .saturating_add(i64::from(byte - b'0'));
+                    self.state = CsiParam;
+                }
+                b';' => {
+                    self.end_param();
+                    self.state = CsiParam;
+                }
+                b':' if self.state == CsiEntry => self.state = CsiIgnore,
+                b':' => self.end_param(),
+                0x3c..=0x3f if self.state == CsiEntry => {
+                    self.dec_private = byte == b'?';
+                    self.state = CsiParam;
+                }
+                0x3c..=0x3f => self.state = CsiIgnore,
+                0x20..=0x2f => {
+                    self.end_param();
+                    self.intermediate(byte);
+                    self.state = CsiIntermediate;
+                }
+                0x40..=0x7e => {
+                    self.end_param();
+                    return self.dispatch(byte);
+                }
+                _ => {}
+            },
+            CsiIntermediate => match byte {
+                0x20..=0x2f => self.intermediate(byte),
+                0x30..=0x3f => self.state = CsiIgnore,
+                0x40..=0x7e => return self.dispatch(byte),
+                _ => {}
+            },
+            CsiIgnore => {
+                if (0x40..=0x7e).contains(&byte) {
+                    self.state = Ground;
+                }
+            }
+        }
+        false
+    }
+
+    fn enter_csi(&mut self) {
+        *self = Self {
+            state: SyncScanState::CsiEntry,
+            ..Self::default()
+        };
+    }
+
+    fn end_param(&mut self) {
+        self.mode_2026 |= self.param == Self::SYNCHRONIZED_OUTPUT_MODE;
+        self.param = 0;
+    }
+
+    fn intermediate(&mut self, byte: u8) {
+        self.bang |= byte == b'!';
+        self.dollar |= byte == b'$';
+    }
+
+    /// The sequence ends with `final_byte`; whether it can decode to a
+    /// synchronized-output action. The CSI decoder takes `h` and `l` after
+    /// `?` as DEC private mode set and reset, `p` after `?` and before `$`
+    /// as the mode query, and `p` after `!` as DECSTR.
+    fn dispatch(&mut self, final_byte: u8) -> bool {
+        self.state = SyncScanState::Ground;
+        let mode = self.dec_private
+            && self.mode_2026
+            && match final_byte {
+                b'h' | b'l' => true,
+                b'p' => self.dollar,
+                _ => false,
+            };
+        let soft_reset = final_byte == b'p' && self.bang;
+        mode || soft_reset
+    }
+}
+
+/// Whether one of the eight bytes of `word` is among `needles`. The
+/// zero-byte test is exact for the word as a whole: it has no false
+/// negatives, and it can misplace a hit only above a true zero byte.
+#[inline(always)]
+fn word_holds_any<const N: usize>(word: u64, needles: [u8; N]) -> bool {
+    const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
+    const HIGHS: u64 = u64::from_ne_bytes([0x80; 8]);
+    needles.iter().fold(0, |hits, &needle| {
+        let x = word ^ (ONES * u64::from(needle));
+        hits | (x.wrapping_sub(ONES) & !x & HIGHS)
+    }) != 0
+}
+
+/// The offset of the first byte of `bytes` among `needles`, tested eight
+/// bytes at a time (the parse thread's control scan runs over every byte
+/// of output).
+#[inline]
+fn find_any<const N: usize>(bytes: &[u8], needles: [u8; N]) -> Option<usize> {
+    let (words, tail) = bytes.as_chunks::<8>();
+    for (index, word) in words.iter().enumerate() {
+        if word_holds_any(u64::from_ne_bytes(*word), needles) {
+            if let Some(at) = word.iter().position(|byte| needles.contains(byte)) {
+                return Some(index * 8 + at);
+            }
+        }
+    }
+    let offset = words.len() * 8;
+    tail.iter()
+        .position(|byte| needles.contains(byte))
+        .map(|at| offset + at)
+}
+
+/// The offset of the last byte of `bytes` among `needles`, tested eight
+/// bytes at a time.
+#[inline]
+fn rfind_any<const N: usize>(bytes: &[u8], needles: [u8; N]) -> Option<usize> {
+    let (head, words) = bytes.as_rchunks::<8>();
+    for (index, word) in words.iter().enumerate().rev() {
+        if word_holds_any(u64::from_ne_bytes(*word), needles) {
+            if let Some(at) = word.iter().rposition(|byte| needles.contains(byte)) {
+                return Some(head.len() + index * 8 + at);
+            }
+        }
+    }
+    head.iter().rposition(|byte| needles.contains(byte))
 }
 
 /// Applies what the parse thread holds, in stream order: the pending
@@ -11218,14 +11473,14 @@ fn flush_coalesced_output(
         parser.parse(&bytes, |action| diverted.push(action));
     }
     for action in diverted {
-        let effect = handle_synchronized_output_action(&action, hold, |holding| {
-            respond_to_synchronized_output_query(pane, generation, holding);
-        });
         debug_assert!(
-            effect.depth_outcome.is_none() && !effect.handled && !effect.flush,
+            !is_synchronized_output_action(&action),
             "held raw output decoded a synchronized-output action: {:?}",
             action
         );
+        let effect = handle_synchronized_output_action(&action, hold, |holding| {
+            respond_to_synchronized_output_query(pane, generation, holding);
+        });
         if !effect.handled {
             action.append_to(actions);
         }
@@ -11858,11 +12113,11 @@ fn parse_buffered_data(
             }
             Ok(pane_byte_ring::RingRead::Bytes(chunk)) => {
                 let size = chunk.len();
-                // Output with no synchronized-output marker is held raw while
+                // Output with no synchronized-output control is held raw while
                 // the loop coalesces, and fed fused where the two-stage path
                 // applied the actions it parsed (ft-yccm0.3.2.1 option 2).
-                let holdable = coalesce_raw && !hold.is_holding() && raw.admits(chunk);
-                raw.note_consumed(chunk);
+                let control = coalesce_raw && raw.scan_controls(chunk);
+                let holdable = coalesce_raw && !hold.is_holding() && !control;
                 if !holdable && !raw.is_empty() {
                     // This chunk is parsed as before, after what is held.
                     flush_coalesced_output(
@@ -26245,27 +26500,47 @@ mod tests {
         }
     }
 
-    /// ft-yccm0.3.2.1 option 2: no chunk the parse thread holds raw can
-    /// complete a synchronized-output marker, however the stream is cut, so
-    /// BSU, ESU and the mode-2026 query are always parsed as they arrive.
+    /// The offsets of the bytes on which the live parser, fed `stream` one
+    /// byte at a time, decodes a synchronized-output action.
+    fn synchronized_output_control_ends(stream: &[u8]) -> Vec<usize> {
+        let mut parser = termwiz::escape::parser::Parser::new();
+        let mut ends = Vec::new();
+        for (at, byte) in stream.iter().enumerate() {
+            let mut decoded = false;
+            parser.parse(std::slice::from_ref(byte), |action| {
+                decoded |= is_synchronized_output_action(&action);
+            });
+            if decoded {
+                ends.push(at);
+            }
+        }
+        ends
+    }
+
+    /// ft-yccm0.3.2.1: however the stream is cut, exactly the chunks in
+    /// which the parser decodes a synchronized-output action are flagged.
+    /// BSU, ESU, the mode-2026 query and DECSTR, in every form the parser
+    /// takes (several modes, a leading zero, a NUL inside, 8-bit CSI, CSI
+    /// as UTF-8), are parsed as they arrive; the digits 2026 in text, in an
+    /// SGR, an ANSI mode, a mode save, an OSC title or a sequence CAN
+    /// aborted are held and fed fused.
     #[test]
-    fn raw_coalescer_never_holds_a_chunk_that_completes_a_synchronized_output_marker() {
-        let stream: &[u8] = b"ab\x1b[?2026hcd 20\x1b[?1;2026lxy";
-        let marker_ends: Vec<usize> = (3..stream.len())
-            .filter(|&end| &stream[end - 3..=end] == RawCoalescer::MARKER)
-            .collect();
-        assert_eq!(marker_ends.len(), 2);
+    fn sync_control_scan_flags_exactly_the_chunks_that_end_a_control() {
+        let stream: &[u8] = b"ab 2026-10-07 \x1b[38;5;2026m6\x1b[?2026hcd\x1b[?1;2026l 2026\
+            \x1b[?2026$p\x1b[!p\x1b[?20\x0026h\x9b?2026l\xc2\x9b?2026h\x1b[2026h\
+            \x1b[?2026s\x1b]0;2026\x07\x1b[?20\x1826h\x1b[?02026lxy";
+        let ends = synchronized_output_control_ends(stream);
+        assert_eq!(ends.len(), 8, "the stream holds eight controls: {:?}", ends);
         let check = |cuts: &[usize]| {
-            let mut coalescer = RawCoalescer::default();
+            let mut scan = SyncControlScan::default();
             let mut start = 0;
             for &end in cuts.iter().chain(std::iter::once(&stream.len())) {
                 let chunk = &stream[start..end];
-                let admitted = coalescer.admits(chunk);
-                coalescer.note_consumed(chunk);
-                let completes = marker_ends.iter().any(|&k| (start..end).contains(&k));
-                assert!(
-                    !(admitted && completes),
-                    "cuts {:?}: chunk {:?} completes a marker but was admitted",
+                let ends_control = ends.iter().any(|&at| (start..end).contains(&at));
+                assert_eq!(
+                    scan.scan(chunk),
+                    ends_control,
+                    "cuts {:?}: chunk {:?}",
                     cuts,
                     String::from_utf8_lossy(chunk)
                 );
@@ -26279,14 +26554,261 @@ mod tests {
             }
         }
         check(&(1..stream.len()).collect::<Vec<_>>());
+    }
 
-        // Output with no marker nearby is held.
-        let mut coalescer = RawCoalescer::default();
-        coalescer.note_consumed(b"\x1b[?20");
-        assert!(!coalescer.admits(b"26h"));
-        assert!(coalescer.admits(b"25h text"));
-        coalescer.note_consumed(b"25h text");
-        assert!(coalescer.admits(b"\x1b[38;5;196m\xf0\x9f\x98\x80"));
+    /// ft-yccm0.3.2.1: on random streams, cut at random, every chunk in
+    /// which the live parser decodes a synchronized-output action is
+    /// flagged. A stream mixes CSI sequences built around mode 2026 (each
+    /// introducer form, marker, parameter list, intermediate and final,
+    /// with a stray byte spliced in at random: a C0 control, DEL, CAN, SUB,
+    /// ESC, a C1 control, 0xa0..=0xff) with loose pieces of sequences (ESC,
+    /// 8-bit and UTF-8 C1 controls, markers, intermediates, digits,
+    /// separators, finals, string introducers and terminators, UTF-8).
+    #[test]
+    fn sync_control_scan_never_misses_a_control_the_parser_decodes() {
+        const INTRODUCERS: &[&[u8]] = &[
+            b"\x1b[",
+            b"\x9b",
+            b"\xc2\x9b",
+            b"\x1b\x00[",
+            b"\x1b\xa0[",
+            b"\x1b\x7f[",
+        ];
+        const MARKERS: &[&[u8]] = &[b"", b"?", b"?", b"?", b">", b"="];
+        const PARAMS: &[&[u8]] = &[
+            b"2026", b"2026", b"02026", b"1", b"20", b"", b"2026:1", b"1049",
+        ];
+        const INTERMEDIATES: &[&[u8]] = &[b"", b"", b"", b"$", b"!", b" "];
+        const FINALS: &[u8] = b"hhllppsmr";
+        const STRAYS: &[u8] = b"\x00\x07\x0a\x7f\x18\x1a\x1b\x80\x90\x9b\x9c\x9d\xa0\xc2\xff";
+        const PIECES: &[&[u8]] = &[
+            b"\x1b[",
+            b"\x1b",
+            b"[",
+            b"\x9b",
+            b"\xc2",
+            b"\xc2\x9b",
+            b"?",
+            b"!",
+            b"$",
+            b">",
+            b"2026",
+            b"20",
+            b"26",
+            b"0",
+            b"2",
+            b"6",
+            b"1",
+            b";",
+            b":",
+            b"h",
+            b"l",
+            b"p",
+            b"m",
+            b"s",
+            b"\x00",
+            b"\x07",
+            b"\x7f",
+            b"\x18",
+            b"\x1a",
+            b"\xa0",
+            b"\xff",
+            b"\x9c",
+            b"\x90",
+            b"\x9d",
+            b"\x1b\\",
+            b"]",
+            b"P",
+            b" ",
+            b"a",
+            b"\xf0\x9f\x98\x80",
+        ];
+        let mut seed = 0x2026_1007_u64;
+        let mut next = move |bound: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % bound
+        };
+        let mut controls = 0_usize;
+        let mut flagged_without_control = 0_usize;
+        for _ in 0..20_000 {
+            let mut stream = Vec::new();
+            for _ in 0..1 + next(12) {
+                if next(2) == 0 {
+                    stream.extend_from_slice(PIECES[next(PIECES.len())]);
+                    continue;
+                }
+                let mut sequence = INTRODUCERS[next(INTRODUCERS.len())].to_vec();
+                sequence.extend_from_slice(MARKERS[next(MARKERS.len())]);
+                for index in 0..next(4) {
+                    if index > 0 {
+                        sequence.push(if next(4) == 0 { b':' } else { b';' });
+                    }
+                    sequence.extend_from_slice(PARAMS[next(PARAMS.len())]);
+                }
+                sequence.extend_from_slice(INTERMEDIATES[next(INTERMEDIATES.len())]);
+                sequence.push(FINALS[next(FINALS.len())]);
+                if next(3) == 0 {
+                    let at = next(sequence.len() + 1);
+                    sequence.insert(at, STRAYS[next(STRAYS.len())]);
+                }
+                stream.extend_from_slice(&sequence);
+            }
+            let mut parser = termwiz::escape::parser::Parser::new();
+            let mut scan = SyncControlScan::default();
+            let mut start = 0;
+            while start < stream.len() {
+                let end = (start + 1 + next(8)).min(stream.len());
+                let chunk = &stream[start..end];
+                let mut decoded = false;
+                parser.parse(chunk, |action| {
+                    decoded |= is_synchronized_output_action(&action);
+                });
+                let flagged = scan.scan(chunk);
+                assert!(
+                    flagged || !decoded,
+                    "stream {:?}: chunk {:?} decodes a control but was not flagged",
+                    String::from_utf8_lossy(&stream),
+                    String::from_utf8_lossy(chunk)
+                );
+                controls += usize::from(decoded);
+                flagged_without_control += usize::from(flagged && !decoded);
+                start = end;
+            }
+        }
+        eprintln!(
+            "[BENCH] sync control scan: {} chunks decode a control, {} flagged without one",
+            controls, flagged_without_control
+        );
+        assert!(controls > 1000, "the streams decode controls: {}", controls);
+    }
+
+    /// The word-at-a-time searches the control scan uses find what a plain
+    /// search finds, at every length and offset, among bytes next to their
+    /// needles' bit patterns.
+    #[test]
+    fn word_at_a_time_searches_agree_with_a_plain_search() {
+        const NEEDLES: &[u8] = b"hlp\x1b\x9b";
+        const OTHERS: &[u8] =
+            b"\x00\x01\x1a\x1c\x5b\x67\x69\x6b\x6d\x6f\x71\x7f\x80\x9a\x9c\xe8\xec\xf0\xff";
+        let mut seed = 0x2026_u64;
+        let mut next = move |bound: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % bound
+        };
+        let finals = *b"hlp";
+        let introducers = [0x1b, 0x9b];
+        for _ in 0..20_000 {
+            let bytes: Vec<u8> = (0..next(48))
+                .map(|_| {
+                    if next(16) == 0 {
+                        NEEDLES[next(NEEDLES.len())]
+                    } else {
+                        OTHERS[next(OTHERS.len())]
+                    }
+                })
+                .collect();
+            assert_eq!(
+                find_any(&bytes, finals),
+                bytes.iter().position(|byte| finals.contains(byte)),
+                "{:?}",
+                bytes
+            );
+            assert_eq!(
+                find_any(&bytes, introducers),
+                bytes.iter().position(|byte| introducers.contains(byte)),
+                "{:?}",
+                bytes
+            );
+            assert_eq!(
+                rfind_any(&bytes, finals),
+                bytes.iter().rposition(|byte| finals.contains(byte)),
+                "{:?}",
+                bytes
+            );
+            assert_eq!(
+                rfind_any(&bytes, introducers),
+                bytes.iter().rposition(|byte| introducers.contains(byte)),
+                "{:?}",
+                bytes
+            );
+        }
+    }
+
+    /// ft-yccm0.3.2.1: what the control scan costs the parse thread per
+    /// 64 KiB ring slot, against the digit scan it replaced, on 64 MiB each
+    /// of T0 cells (one in twenty an ASCII character from the operator's
+    /// pool, h, l and p included), an LF staircase, and TUI rows (CUP, SGR,
+    /// words, EL). A measurement, not a gate:
+    /// cargo test --profile release-perf -p mux --lib -- --ignored sync_control_scan_throughput --nocapture
+    #[test]
+    #[ignore = "a throughput measurement; run it in release"]
+    fn sync_control_scan_throughput() {
+        const ASCII: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#%^&*()";
+        let mut n = 0_usize;
+        let mut t0 = Vec::new();
+        while t0.len() < 64 << 20 {
+            t0.extend_from_slice(
+                format!("\x1b[38;5;{}m\x1b[48;5;{}m", n % 256, n * 7 % 256).as_bytes(),
+            );
+            if n.is_multiple_of(20) {
+                t0.push(ASCII[n / 20 % ASCII.len()]);
+            } else {
+                t0.extend_from_slice("\u{1f600}".as_bytes());
+            }
+            n += 1;
+        }
+        let mut seq = Vec::new();
+        while seq.len() < 64 << 20 {
+            seq.extend_from_slice(format!("{}\n", n).as_bytes());
+            n += 1;
+        }
+        let mut tui = Vec::new();
+        while tui.len() < 64 << 20 {
+            tui.extend_from_slice(
+                format!(
+                    "\x1b[{};1H\x1b[38;5;{}mhelp pane {} cpu {}% load\x1b[0m\x1b[K",
+                    1 + n % 40,
+                    n % 256,
+                    n,
+                    n % 100
+                )
+                .as_bytes(),
+            );
+            n += 1;
+        }
+        let digit_scan = |chunk: &[u8]| chunk.windows(4).any(|w| w == b"2026");
+        for (name, corpus) in [("t0", &t0), ("seq_lines", &seq), ("tui", &tui)] {
+            let mut best = [f64::INFINITY; 2];
+            for _ in 0..3 {
+                let start = Instant::now();
+                let mut scan = SyncControlScan::default();
+                for chunk in corpus.chunks(64 << 10) {
+                    std::hint::black_box(scan.scan(std::hint::black_box(chunk)));
+                }
+                best[0] = best[0].min(start.elapsed().as_secs_f64());
+                let start = Instant::now();
+                for chunk in corpus.chunks(64 << 10) {
+                    std::hint::black_box(digit_scan(std::hint::black_box(chunk)));
+                }
+                best[1] = best[1].min(start.elapsed().as_secs_f64());
+            }
+            let mib = corpus.len() as f64 / f64::from(1 << 20);
+            eprintln!(
+                "[BENCH] sync control scan {}: control scan {:.1} ms ({:.0} MiB/s), \
+                 digit scan {:.1} ms ({:.0} MiB/s), best of 3 over {:.0} MiB",
+                name,
+                best[0] * 1e3,
+                mib / best[0],
+                best[1] * 1e3,
+                mib / best[1],
+                mib
+            );
+        }
     }
 
     /// Runs the test named `test` alone in a child test process, flagged by
@@ -26339,8 +26861,8 @@ mod tests {
     /// A local pane on a real PTY whose child prints nothing, registered
     /// with a mux so that its real reader and parse threads run. Output is
     /// injected into its byte ring as exact deliveries, chunk by chunk
-    /// (ft-yccm0.3.2.1 option 2). The bells its mux dispatches for it are
-    /// counted.
+    /// (ft-yccm0.3.2.1 option 2). The bells its mux dispatches for it, and
+    /// the synchronized-output holds ESU drains, are counted.
     #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
     struct QuietLocalPane {
         _mux: Arc<Mux>,
@@ -26348,6 +26870,7 @@ mod tests {
         registration: PaneRegistrationHandle,
         generation: Arc<PaneRegistrationGeneration>,
         bells: Arc<AtomicUsize>,
+        esu_drains: Arc<AtomicUsize>,
     }
 
     #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
@@ -26392,20 +26915,32 @@ mod tests {
             ));
             let mux = Arc::new(Mux::new(None));
             let bells = Arc::new(AtomicUsize::new(0));
-            let observed = Arc::clone(&bells);
+            let esu_drains = Arc::new(AtomicUsize::new(0));
+            let observed_bells = Arc::clone(&bells);
+            let observed_drains = Arc::clone(&esu_drains);
             mux.subscribe(move |notification| {
-                if let MuxNotification::Alert {
-                    pane_id,
-                    alert: frankenterm_term::Alert::Bell,
-                } = notification
-                {
-                    if pane_id == id {
-                        observed.fetch_add(1, Ordering::Relaxed);
+                match notification {
+                    MuxNotification::Alert {
+                        pane_id,
+                        alert: frankenterm_term::Alert::Bell,
+                    } if pane_id == id => {
+                        observed_bells.fetch_add(1, Ordering::Relaxed);
                     }
+                    MuxNotification::SynchronizedOutput {
+                        pane_id,
+                        event:
+                            SynchronizedOutputEvent::Drain {
+                                cause: SynchronizedOutputDrainCause::Esu,
+                                ..
+                            },
+                    } if pane_id == id => {
+                        observed_drains.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
                 }
                 true
             })
-            .expect("quiet local pane bell subscription");
+            .expect("quiet local pane notification subscription");
             mux.add_pane(&pane)?;
             let registration = pane
                 .mux_registration_slot()
@@ -26418,11 +26953,18 @@ mod tests {
                 registration,
                 generation,
                 bells,
+                esu_drains,
             })
         }
 
         fn bells(&self) -> usize {
             self.bells.load(Ordering::Relaxed)
+        }
+
+        /// Synchronized-output holds that ESU drained: each one the parse
+        /// thread saw open and close as it parsed.
+        fn esu_drains(&self) -> usize {
+            self.esu_drains.load(Ordering::Relaxed)
         }
 
         fn deliver(&self, bytes: &[u8]) {
@@ -26538,12 +27080,22 @@ mod tests {
         }
     }
 
-    /// The M.7-style corpora: T0 (an SGR pair and an emoji per cell), an LF
-    /// staircase, mixed text (combining marks, a ZWJ sequence, tabs, CUP,
-    /// EL, CRLF), the same with alerts (BEL and a title, both alert sources
-    /// the fused path diverts), and frames in synchronized output.
+    /// A corpus for the parse-path test (ft-yccm0.3.2.1).
     #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
-    fn parse_path_corpora() -> Vec<(&'static str, Vec<u8>, bool)> {
+    struct ParsePathCorpus {
+        name: &'static str,
+        bytes: Vec<u8>,
+        /// The synchronized-output frames in it, each one BSU..ESU hold.
+        frames: usize,
+    }
+
+    /// The M.7-style corpora: T0 (an SGR pair and an emoji per cell), an LF
+    /// staircase, a log of dated lines, mixed text (combining marks, a ZWJ
+    /// sequence, tabs, CUP, EL, CRLF), the same with alerts (BEL and a
+    /// title, both alert sources the fused path diverts), and frames in
+    /// synchronized output. All but T0 hold the digits 2026 as text.
+    #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
+    fn parse_path_corpora() -> Vec<ParsePathCorpus> {
         let mut t0 = Vec::new();
         for n in 0..6000u32 {
             t0.extend_from_slice(
@@ -26555,17 +27107,28 @@ mod tests {
                 .as_bytes(),
             );
         }
-        // Numbers stay below 2026, whose digits the parse thread
-        // conservatively takes for a synchronized-output marker (a false
-        // positive costs only speed).
         let mut seq = Vec::new();
-        for _ in 0..6 {
-            for n in 1..=1999u32 {
+        for _ in 0..4 {
+            for n in 1..=2999u32 {
                 seq.extend_from_slice(format!("{}\n", n).as_bytes());
             }
         }
+        let mut dated = Vec::new();
+        for n in 0..3000u32 {
+            dated.extend_from_slice(
+                format!(
+                    "\x1b[2m2026-10-07T{:02}:{:02}:{:02}Z\x1b[0m request 2026/{} done in {} ms\r\n",
+                    n / 3600,
+                    n / 60 % 60,
+                    n % 60,
+                    n,
+                    n * 7 % 2100
+                )
+                .as_bytes(),
+            );
+        }
         let mut mixed = Vec::new();
-        for n in 0..2000u32 {
+        for n in 0..2500u32 {
             mixed.extend_from_slice(
                 format!(
                     "\x1b[{}mword{} e\u{301}\u{1f468}\u{200d}\u{1f469}\tx\x1b[K\r\n",
@@ -26583,21 +27146,29 @@ mod tests {
             alerts.insert(at, 0x07);
         }
         alerts.extend_from_slice(b"\x1b]2;coalesced alerts\x1b\\after the title\r\n");
+        let frame_count = 300;
         let mut frames = Vec::new();
-        for n in 0..300u32 {
+        for n in 0..frame_count {
             frames.extend_from_slice(b"\x1b[?2026h\x1b[H");
             for row in 0..24u32 {
-                frames.extend_from_slice(format!("frame {} row {}\x1b[K\r\n", n, row).as_bytes());
+                frames.extend_from_slice(
+                    format!("2026-10-07 frame {} row {}\x1b[K\r\n", n, row).as_bytes(),
+                );
             }
             frames.extend_from_slice(b"\x1b[?2026l");
         }
-        // (name, bytes, whether every byte can be fed fused)
+        let corpus = |name, bytes, frames| ParsePathCorpus {
+            name,
+            bytes,
+            frames,
+        };
         vec![
-            ("t0", t0, true),
-            ("seq_lines", seq, true),
-            ("mixed", mixed, true),
-            ("alerts", alerts, true),
-            ("sync_frames", frames, false),
+            corpus("t0", t0, 0),
+            corpus("seq_lines", seq, 0),
+            corpus("dated_log", dated, 0),
+            corpus("mixed", mixed, 0),
+            corpus("alerts", alerts, 0),
+            corpus("sync_frames", frames, frame_count),
         ]
     }
 
@@ -26607,8 +27178,10 @@ mod tests {
     /// two-stage path gives the same bytes, with the same bells dispatched
     /// and the same title: the alert sources the fused parser diverts still
     /// reach admission. And the chunks are now fed fused: every byte of
-    /// output with no synchronized-output marker goes through the fused
-    /// parser, where before only the chunk that crossed `read_limit` did.
+    /// output with no synchronized-output control goes through the fused
+    /// parser, the digits 2026 in text included, where before only the
+    /// chunk that crossed `read_limit` did. Real BSU and ESU are still
+    /// parsed as they arrive: every frame's hold opens and ESU drains it.
     #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
     #[test]
     fn coalesced_chunks_feed_fused_and_end_as_the_two_stage_path_does() -> anyhow::Result<()> {
@@ -26628,7 +27201,12 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             (seed >> 33) as usize
         };
-        for (name, stream, all_fused) in parse_path_corpora() {
+        for corpus in parse_path_corpora() {
+            let ParsePathCorpus {
+                name,
+                bytes: stream,
+                frames,
+            } = corpus;
             let pane = QuietLocalPane::new()?;
             let mut chunks = Vec::new();
             let mut offset = 0;
@@ -26666,6 +27244,7 @@ mod tests {
                 let applied = pane.parsed_bytes() == stream.len() as u64
                     && pane.snapshot() == expected.snapshot
                     && pane.bells() == expected.bells
+                    && pane.esu_drains() == frames
                     && title_matches();
                 if applied {
                     break;
@@ -26674,6 +27253,7 @@ mod tests {
                     assert_eq!(pane.parsed_bytes(), stream.len() as u64, "{}: parsed", name);
                     assert_eq!(pane.snapshot(), expected.snapshot, "{}: final state", name);
                     assert_eq!(pane.bells(), expected.bells, "{}: bells dispatched", name);
+                    assert_eq!(pane.esu_drains(), frames, "{}: holds ESU drained", name);
                     if let Some(title) = &expected.title {
                         assert_eq!(&pane.pane.get_title(), title, "{}: title", name);
                     }
@@ -26683,12 +27263,14 @@ mod tests {
             delivery.join().expect("delivery thread");
             let (fused, two_stage) = pane.parse_paths();
             eprintln!(
-                "[BENCH] mux parse paths {}: {} bytes fused, {} two-stage of {}, {} bells",
+                "[BENCH] mux parse paths {}: {} bytes fused, {} two-stage of {}, {} bells, \
+                 {} holds drained by ESU",
                 name,
                 fused,
                 two_stage,
                 stream.len(),
-                pane.bells()
+                pane.bells(),
+                pane.esu_drains()
             );
             assert_eq!(
                 fused + two_stage,
@@ -26696,10 +27278,10 @@ mod tests {
                 "{}: every byte counted once",
                 name
             );
-            if all_fused {
+            if frames == 0 {
                 assert_eq!(
                     two_stage, 0,
-                    "{}: T0-sized chunks take the fused path",
+                    "{}: chunks with no synchronized-output control take the fused path",
                     name
                 );
             } else {
