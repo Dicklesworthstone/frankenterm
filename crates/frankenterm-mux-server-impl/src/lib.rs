@@ -798,6 +798,10 @@ mod deferred_scrollback {
         charged_bytes: usize,
     }
 
+    /// How every durability-gap marker row begins. Output can print it too,
+    /// so it identifies a row that may be a marker, never one that is.
+    pub const GAP_MARKER_PREFIX: &str = "[durability gap: ";
+
     /// Queued rows dropped from durability under overload (ft-yccm0.2.1.6).
     /// The writer records the gap as one marker row, in order.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -819,7 +823,7 @@ mod deferred_scrollback {
         /// The marker the durable transcript carries in place of the rows.
         fn marker_text(&self) -> String {
             format!(
-                "[durability gap: {} rows ({}..{}), {} bytes, reason=overload, at_unix_ms={}]",
+                "{GAP_MARKER_PREFIX}{} rows ({}..{}), {} bytes, reason=overload, at_unix_ms={}]",
                 self.rows(),
                 self.start,
                 self.end,
@@ -1511,12 +1515,18 @@ mod deferred_scrollback {
             store_row: StableRowIndex,
         ) -> Result<(), ScrollbackSpillError> {
             let marker = gap.line_at(gap.start);
-            let acknowledged = self.backing.store_scrollback_lines(
+            let (Ok(gap_rows), Ok(gap_bytes)) =
+                (u64::try_from(gap.rows()), u64::try_from(gap.bytes))
+            else {
+                return Err(ScrollbackSpillError::StorageUnavailable);
+            };
+            if !self.backing.store_scrollback_gap_marker(
                 store_row,
-                std::slice::from_ref(&marker),
+                &marker,
                 gap.retention,
-            );
-            if acknowledged != 1 {
+                gap_rows,
+                gap_bytes,
+            ) {
                 return Err(ScrollbackSpillError::StorageUnavailable);
             }
             let durable_bytes = self.backing.retained_scrollback_bytes();
@@ -3191,6 +3201,109 @@ mod deferred_scrollback {
         );
     }
 
+    /// ft-yccm0.2.1.6: `ft session list-durable` reports, from the manifest
+    /// alone, exactly the gaps `export-durable` shows as marker rows. A fresh
+    /// lineage lists a count of zero (not unknown), each overload adds its
+    /// marker's rows and bytes, and a reopened sink keeps the totals.
+    #[test]
+    fn list_durable_reports_the_gap_rows_export_durable_shows() {
+        use wezterm_term::CellAttributes;
+
+        let (dir, backing, deferred) = super::tests::deferred_test_sink();
+        let pane = uuid::Uuid::from_bytes([0xd3; 16]).simple().to_string();
+        let line = |row: StableRowIndex| {
+            Line::from_text(&format!("flood {row}"), &CellAttributes::blank(), 0, None)
+        };
+        let listed = || {
+            let panes =
+                super::list_live_scrollback_panes(dir.path(), 16).expect("list durable panes");
+            assert_eq!(panes.len(), 1);
+            assert_eq!(panes[0].durable_pane_id, pane);
+            panes[0].durability_gaps
+        };
+        for row in 0..10 {
+            assert!(deferred.store_scrollback_line(row, &line(row), 1_000));
+        }
+        deferred.flush_scrollback().unwrap();
+        assert_eq!(
+            listed(),
+            Some(super::LiveScrollbackDurabilityGaps::default()),
+            "a fresh lineage lists a count of zero, not unknown"
+        );
+
+        // Nothing drains until each explicit flush, so each flood sheds.
+        let charge = DeferredScrollbackSpillSink::row_charge(&line(999)).unwrap();
+        deferred.writer.set_queue_budget(charge * 40);
+        let mut shed = Vec::new();
+        for flood in [10..100, 100..190] {
+            for row in flood {
+                assert!(deferred.store_scrollback_line(row, &line(row), 1_000));
+            }
+            shed.extend(deferred.state.lock().unwrap().pending.iter().filter_map(
+                |entry| match entry {
+                    Pending::Gap(gap) => Some(*gap),
+                    Pending::Row(_) => None,
+                },
+            ));
+            deferred.flush_scrollback().unwrap();
+        }
+        assert_eq!(shed.len(), 2, "each flood sheds one gap");
+
+        let export =
+            super::export_live_scrollback_transcript(dir.path(), &pane, 1024, 1 << 20, 16 << 20)
+                .expect("export durable transcript");
+        let exported: Vec<(u64, u64)> = export
+            .transcript
+            .lines()
+            .filter_map(|line| line.trim_end().strip_prefix(GAP_MARKER_PREFIX))
+            .map(|marker| {
+                let (rows, rest) = marker.split_once(" rows (").unwrap();
+                let (_range, rest) = rest.split_once("), ").unwrap();
+                let (bytes, _) = rest.split_once(" bytes").unwrap();
+                (rows.parse().unwrap(), bytes.parse().unwrap())
+            })
+            .collect();
+        let expected: Vec<(u64, u64)> = shed
+            .iter()
+            .map(|gap| {
+                (
+                    u64::try_from(gap.rows()).unwrap(),
+                    u64::try_from(gap.bytes).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(exported, expected, "export shows each gap as one marker");
+        let totals = listed().expect("a lineage that recorded its gaps lists them");
+        assert_eq!(
+            totals,
+            super::LiveScrollbackDurabilityGaps {
+                markers: 2,
+                rows: exported.iter().map(|(rows, _)| rows).sum(),
+                bytes: exported.iter().map(|(_, bytes)| bytes).sum(),
+            }
+        );
+
+        drop(deferred);
+        drop(backing);
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 913,
+            domain_id: 3,
+            durable_pane_id: [0xd3; 16],
+            command_description: "deferred-scrollback-test".to_string(),
+        };
+        let reopened =
+            super::LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context).unwrap();
+        assert_eq!(
+            reopened
+                .lock_state("test reopened gap totals")
+                .unwrap()
+                .durability_gaps,
+            Some(totals)
+        );
+        drop(reopened);
+        assert_eq!(listed(), Some(totals));
+    }
+
     /// A sink on a private writer with `policy`, over an open GatedStore.
     #[cfg(test)]
     fn windowed_sink(
@@ -3796,6 +3909,10 @@ struct LiveScrollbackSpillState {
     /// The nonce segments of the retained compact rows (ft-yccm0.2.1.4), as
     /// the published manifest or active WAL names them.
     row_segments: LiveScrollbackRowSegments,
+    /// The lineage's durability-gap totals (ft-yccm0.2.1.6); `None` is
+    /// unknown. Only a gap marker's single-batch transaction changes them,
+    /// so commit windows never run ahead of the published totals.
+    durability_gaps: Option<LiveScrollbackDurabilityGaps>,
     /// What the published manifest says while this state runs ahead of it
     /// by a durable, unpublished tail (ft-yccm0.2.1.2); `None` when the
     /// manifest describes this state.
@@ -3859,12 +3976,14 @@ impl std::fmt::Debug for LiveScrollbackSpillState {
             .field("transaction_quarantined", &self.transaction_quarantined)
             .field("verified_ledger", &self.verified_ledger)
             .field("row_segments", &self.row_segments)
+            .field("durability_gaps", &self.durability_gaps)
             .field("published", &self.published)
             .finish()
     }
 }
 
 impl LiveScrollbackSpillState {
+    /// A fresh lineage: it has recorded no durability gaps.
     fn empty(content_epoch: [u8; 16], authenticated_manifest: bool) -> Self {
         Self {
             initial_stable_row: None,
@@ -3879,6 +3998,7 @@ impl LiveScrollbackSpillState {
             transaction_quarantined: false,
             verified_ledger: None,
             row_segments: LiveScrollbackRowSegments::EMPTY,
+            durability_gaps: Some(LiveScrollbackDurabilityGaps::default()),
             published: None,
         }
     }
@@ -3985,9 +4105,38 @@ struct LiveScrollbackManifestV1 {
     /// compact.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     row_segments: Vec<LiveScrollbackRowSegmentV1>,
+    /// ft-yccm0.2.1.6: the durability gaps this lineage has recorded.
+    /// Absent means unknown (a manifest from before the field, or a
+    /// recovered tail that may hold an unpublished gap marker), never zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    durability_gaps: Option<LiveScrollbackDurabilityGaps>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     guardian_manifest_authentication: Option<String>,
     manifest_sha256: String,
+}
+
+/// Rows overload dropped from durability in one durable pane's lineage
+/// since it began or was last cleared (ft-yccm0.2.1.6): one marker row
+/// stands for each gap. Retention may have pruned older markers; their rows
+/// still count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveScrollbackDurabilityGaps {
+    pub markers: u64,
+    pub rows: u64,
+    pub bytes: u64,
+}
+
+impl LiveScrollbackDurabilityGaps {
+    /// These totals plus one gap of `rows` rows and `bytes` bytes; `None`
+    /// (unknown) if a total overflows.
+    fn with_gap(self, rows: u64, bytes: u64) -> Option<Self> {
+        Some(Self {
+            markers: self.markers.checked_add(1)?,
+            rows: self.rows.checked_add(rows)?,
+            bytes: self.bytes.checked_add(bytes)?,
+        })
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4044,6 +4193,10 @@ struct LiveScrollbackAppendWalV1 {
     /// new one starting at `appended_sequence`. Absent for a v3-row batch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     row_segment: Option<LiveScrollbackRowSegmentV1>,
+    /// ft-yccm0.2.1.6: the target's durability-gap totals, which the
+    /// manifest it rolls forward to publishes. Absent means unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_durability_gaps: Option<LiveScrollbackDurabilityGaps>,
     encrypted_record: String,
     /// v3 binds one ordered batch. v1/v2 must have no additional records.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -4188,6 +4341,7 @@ impl std::fmt::Debug for LiveScrollbackAppendWalV1 {
                     .as_ref()
                     .map(|segment| segment.first_sequence),
             )
+            .field("target_durability_gaps", &self.target_durability_gaps)
             .field("encrypted_record", &"[REDACTED]")
             .field("additional_encrypted_records", &"[REDACTED]")
             .field("guardian_authentication", &"[REDACTED]")
@@ -4288,6 +4442,7 @@ impl LiveScrollbackAppendWalV1 {
             superseding_manifest_sha256: self.superseding_manifest_sha256.as_deref(),
             appended_record_count: self.appended_record_count,
             row_segment: self.row_segment.as_ref(),
+            target_durability_gaps: self.target_durability_gaps,
             encrypted_record: &self.encrypted_record,
             additional_encrypted_records: &self.additional_encrypted_records,
             guardian_authentication: self.guardian_authentication.as_deref(),
@@ -4356,6 +4511,8 @@ struct LiveScrollbackAppendWalCanonicalView<'a> {
     appended_record_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     row_segment: Option<&'a LiveScrollbackRowSegmentV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_durability_gaps: Option<LiveScrollbackDurabilityGaps>,
     encrypted_record: &'a str,
     #[serde(skip_serializing_if = "is_empty_string_slice")]
     additional_encrypted_records: &'a [String],
@@ -5422,6 +5579,10 @@ pub struct LiveScrollbackDurablePane {
     pub command_description: Option<String>,
     pub retained_rows: Option<u64>,
     pub next_seq: Option<u64>,
+    /// The manifest's durability-gap totals (ft-yccm0.2.1.6), read without
+    /// decoding rows. `None` is unknown (a manifest without the field, or a
+    /// corrupt pane), never zero.
+    pub durability_gaps: Option<LiveScrollbackDurabilityGaps>,
     pub path: PathBuf,
     pub error: Option<String>,
 }
@@ -5814,6 +5975,8 @@ impl LiveScrollbackSpillSink {
             transaction_quarantined: false,
             verified_ledger: Some(VerifiedLedgerState::empty(ledger_pane_id)),
             row_segments: LiveScrollbackRowSegments::EMPTY,
+            // A clear starts the gap count over.
+            durability_gaps: Some(LiveScrollbackDurabilityGaps::default()),
             published: None,
         }
     }
@@ -6544,6 +6707,7 @@ impl LiveScrollbackSpillSink {
             && manifest.retained_rows == wal.target_record_count
             && manifest.next_seq == wal.target_next_sequence
             && manifest.retained_record_bytes == Some(wal.target_retained_record_bytes)
+            && manifest.durability_gaps == wal.target_durability_gaps
             && chain_matches)
     }
 
@@ -6868,8 +7032,8 @@ impl LiveScrollbackSpillSink {
         // up to the first that does not; rows from there on (a torn,
         // reordered or foreign suffix) are cut. The adopted tail gets the WAL
         // its publication would have written, and recovery rolls it forward.
-        let adopted = if incomplete_stage {
-            Vec::new()
+        let (adopted, may_hold_gap_marker) = if incomplete_stage {
+            (Vec::new(), false)
         } else {
             Self::adoptable_ledger_tail(
                 manifest,
@@ -6910,6 +7074,7 @@ impl LiveScrollbackSpillSink {
             manifest,
             published_authority,
             &adopted,
+            may_hold_gap_marker,
             store,
             keyring,
             durable_pane_id,
@@ -6921,7 +7086,9 @@ impl LiveScrollbackSpillSink {
     }
 
     /// The ledger rows past `manifest` that open at their exact location
-    /// under its nonce segments, up to the first that does not.
+    /// under its nonce segments, up to the first that does not, and whether
+    /// any of them may be a durability-gap marker (ft-yccm0.2.1.6): a marker
+    /// whose transaction died before its WAL never published its totals.
     fn adoptable_ledger_tail(
         manifest: &LiveScrollbackManifestV1,
         ledger_pane_id: u64,
@@ -6929,7 +7096,7 @@ impl LiveScrollbackSpillSink {
         keyring: &guardian_output_keys::GuardianOutputKeyring,
         durable_pane_id: [u8; 16],
         observed_next: u64,
-    ) -> anyhow::Result<Vec<String>> {
+    ) -> anyhow::Result<(Vec<String>, bool)> {
         let row_segments = Self::manifest_row_segments(manifest)?;
         let (content_epoch, _revision) = live_scrollback_manifest_generation(manifest)?
             .ok_or_else(|| anyhow::anyhow!("a v4 manifest has no generation"))?;
@@ -6938,6 +7105,7 @@ impl LiveScrollbackSpillSink {
             .ok_or_else(|| anyhow::anyhow!("a manifest with a tail has no stable-row origin"))?;
         let mut cipher_cache = GuardianScrollbackCipherCache::new(keyring, &row_segments);
         let mut adopted = Vec::new();
+        let mut may_hold_gap_marker = false;
         for sequence in manifest.next_seq..observed_next {
             let Some(record) = store.line_at(ledger_pane_id, sequence)? else {
                 break;
@@ -6948,7 +7116,7 @@ impl LiveScrollbackSpillSink {
             else {
                 break;
             };
-            let opens = decode_persisted_scrollback_line_with_limit(
+            let opened = decode_persisted_scrollback_line_with_limit(
                 &record,
                 &mut cipher_cache,
                 durable_pane_id,
@@ -6957,24 +7125,31 @@ impl LiveScrollbackSpillSink {
                 sequence,
                 LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
             )
-            .is_ok_and(|(_line, _bytes, fidelity)| {
-                fidelity == DecodedScrollbackRecordFidelity::ExactSemantic
+            .ok()
+            .filter(|(_line, _bytes, fidelity)| {
+                *fidelity == DecodedScrollbackRecordFidelity::ExactSemantic
             });
-            if !opens {
+            let Some((line, _bytes, _fidelity)) = opened else {
                 break;
-            }
+            };
+            may_hold_gap_marker |= line
+                .as_str()
+                .starts_with(deferred_scrollback::GAP_MARKER_PREFIX);
             adopted.push(record);
         }
-        Ok(adopted)
+        Ok((adopted, may_hold_gap_marker))
     }
 
     /// The cumulative WAL for a tail recovery adopts: the live state the
     /// windows had built from `manifest` and `published_authority` (the
     /// verified prefix), with the manifest's retention applied row by row.
+    /// The manifest's gap totals carry over unless the tail may hold a gap
+    /// marker they do not count; then they are unknown.
     fn adopted_tail_append_wal(
         manifest: &LiveScrollbackManifestV1,
         published_authority: VerifiedLedgerState,
         adopted: &[String],
+        may_hold_gap_marker: bool,
         store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
         keyring: &mut guardian_output_keys::GuardianOutputKeyring,
         durable_pane_id: [u8; 16],
@@ -7028,6 +7203,11 @@ impl LiveScrollbackSpillSink {
             transaction_quarantined: false,
             verified_ledger: Some(target),
             row_segments: Self::manifest_row_segments(manifest)?,
+            durability_gaps: if may_hold_gap_marker {
+                None
+            } else {
+                manifest.durability_gaps
+            },
             published: Some(published),
         };
         let cipher = keyring
@@ -7305,6 +7485,7 @@ impl LiveScrollbackSpillSink {
             transaction_quarantined: false,
             verified_ledger,
             row_segments,
+            durability_gaps: wal.target_durability_gaps,
             published: None,
         }))
     }
@@ -7429,6 +7610,7 @@ impl LiveScrollbackSpillSink {
             superseding_manifest_sha256: None,
             appended_record_count: Some(row_count),
             row_segment: None,
+            target_durability_gaps: live.durability_gaps,
             encrypted_record: String::new(),
             additional_encrypted_records: Vec::new(),
             guardian_authentication: None,
@@ -7667,6 +7849,7 @@ impl LiveScrollbackSpillSink {
             superseding_manifest_sha256: None,
             appended_record_count: digest_only.then_some(row_count),
             row_segment: row_segment.map(LiveScrollbackRowSegmentV1::from_segment),
+            target_durability_gaps: proposed_state.durability_gaps,
             encrypted_record: if digest_only {
                 String::new()
             } else {
@@ -9135,6 +9318,7 @@ impl LiveScrollbackSpillSink {
                         let mut state = LiveScrollbackSpillState::empty(state_content_epoch, true);
                         state.revision = state_revision;
                         state.authenticated_manifest = authenticated_manifest;
+                        state.durability_gaps = manifest.durability_gaps;
                         state.predecessor_generation =
                             live_scrollback_manifest_predecessor(&manifest)?;
                         state.clear_manifest_published = true;
@@ -9348,6 +9532,7 @@ impl LiveScrollbackSpillSink {
                                 transaction_quarantined: false,
                                 verified_ledger: None,
                                 row_segments,
+                                durability_gaps: manifest.durability_gaps,
                                 published: None,
                             },
                             repair_complete_manifest.then_some("complete"),
@@ -9931,6 +10116,7 @@ impl LiveScrollbackSpillSink {
             let predecessor_generation = state.predecessor_generation;
             let verified_ledger = state.verified_ledger;
             let mut row_segments = state.row_segments;
+            let durability_gaps = state.durability_gaps;
             drop(state);
             let ledger_pane_id = self.active_ledger_pane_id();
             // ft-yccm0.2.1.5: the process-wide keyring mutex is held only to
@@ -10072,6 +10258,11 @@ impl LiveScrollbackSpillSink {
                 chain_tail_sha256: incremental_authority
                     .map(|authority| hex::encode(authority.chain_tail)),
                 row_segments: row_segments.to_manifest(),
+                durability_gaps: if authenticated_manifest {
+                    durability_gaps
+                } else {
+                    None
+                },
                 guardian_manifest_authentication: None,
                 manifest_sha256: String::new(),
             };
@@ -10353,6 +10544,7 @@ impl LiveScrollbackSpillSink {
             || Self::manifest_row_segments(&manifest)
                 .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
                 != state.row_segments
+            || manifest.durability_gaps != state.durability_gaps
         {
             return Err(ScrollbackSpillError::StorageUnavailable);
         }
@@ -10447,6 +10639,7 @@ impl LiveScrollbackSpillSink {
             || Self::manifest_row_segments(&manifest)
                 .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
                 != state.row_segments
+            || manifest.durability_gaps != state.durability_gaps
         {
             return Err(ScrollbackSpillError::SnapshotGenerationMismatch);
         }
@@ -12003,17 +12196,43 @@ impl LiveScrollbackSpillSink {
         true
     }
 
+    /// Store `lines` and count the durability syncs that took. `gap` is the
+    /// (rows, bytes) a single gap-marker row stands for (ft-yccm0.2.1.6).
+    fn store_scrollback_rows(
+        &self,
+        stable_row: wezterm_term::StableRowIndex,
+        lines: &[wezterm_term::Line],
+        max_retained_rows: usize,
+        gap: Option<(u64, u64)>,
+    ) -> usize {
+        let mut committed_rows = 1;
+        let syncs = frankenterm_core::storage::mmap_store::thread_durability_sync_count();
+        let committed = self.store_scrollback_lines_transaction(
+            stable_row,
+            lines,
+            max_retained_rows,
+            gap,
+            &mut committed_rows,
+        );
+        self.durability_syncs.fetch_add(
+            frankenterm_core::storage::mmap_store::thread_durability_sync_count() - syncs,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if committed { committed_rows } else { 0 }
+    }
+
     fn store_scrollback_lines_transaction(
         &self,
         stable_row: wezterm_term::StableRowIndex,
         lines: &[wezterm_term::Line],
         max_retained_rows: usize,
+        gap: Option<(u64, u64)>,
         committed_rows: &mut usize,
     ) -> bool {
         let Some(line) = lines.first() else {
             return false;
         };
-        if lines.len() > LIVE_SCROLLBACK_WINDOW_MAX_ROWS {
+        if lines.len() > LIVE_SCROLLBACK_WINDOW_MAX_ROWS || (gap.is_some() && lines.len() != 1) {
             return false;
         }
         if max_retained_rows == 0 {
@@ -12186,13 +12405,21 @@ impl LiveScrollbackSpillSink {
         // it can append without a WAL: publication cadence on, the same
         // retention, and rows continuing the published nonce segment. Any
         // other transaction is a single-batch one, which starts from a
-        // published manifest, so the tail is published first.
+        // published manifest, so the tail is published first. A gap marker
+        // is always a single batch, so the WAL and manifest that publish it
+        // also publish its totals (ft-yccm0.2.1.6).
         let window_state = match self.lock_state("store_scrollback_line window state") {
             Ok(state) => *state,
             Err(_) => return false,
         };
         if window_state.published.is_some()
-            && !self.window_continues_tail(&window_state, stable_row, max_retained_rows, &cipher)
+            && (gap.is_some()
+                || !self.window_continues_tail(
+                    &window_state,
+                    stable_row,
+                    max_retained_rows,
+                    &cipher,
+                ))
             && !self.publish_pending_tail("single-batch transaction")
         {
             return false;
@@ -12231,6 +12458,13 @@ impl LiveScrollbackSpillSink {
                     }),
             );
             proposed_state.max_retained_rows = max_retained_rows;
+            if let Some((rows, bytes)) = gap {
+                // Unknown totals stay unknown; an overflowing total becomes
+                // unknown rather than wrapping.
+                proposed_state.durability_gaps = proposed_state
+                    .durability_gaps
+                    .and_then(|totals| totals.with_gap(rows, bytes));
+            }
             (
                 previous_state,
                 proposed_state,
@@ -12253,7 +12487,8 @@ impl LiveScrollbackSpillSink {
             .is_some_and(|manifest| manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4);
         // A commit window appends every row under one sync (ft-yccm0.2.1.2);
         // a single-batch transaction takes at most one store batch.
-        let commit_window = v4_predecessor
+        let commit_window = gap.is_none()
+            && v4_predecessor
             && self.window_continues_tail(&previous_state, stable_row, max_retained_rows, &cipher);
         let batch_rows = if commit_window {
             lines.len()
@@ -12666,19 +12901,25 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         lines: &[wezterm_term::Line],
         max_retained_rows: usize,
     ) -> usize {
-        let mut committed_rows = 1;
-        let syncs = frankenterm_core::storage::mmap_store::thread_durability_sync_count();
-        let committed = self.store_scrollback_lines_transaction(
+        self.store_scrollback_rows(stable_row, lines, max_retained_rows, None)
+    }
+
+    /// The marker's single-batch transaction publishes the lineage's gap
+    /// totals with it (ft-yccm0.2.1.6).
+    fn store_scrollback_gap_marker(
+        &self,
+        stable_row: wezterm_term::StableRowIndex,
+        marker: &wezterm_term::Line,
+        max_retained_rows: usize,
+        gap_rows: u64,
+        gap_bytes: u64,
+    ) -> bool {
+        self.store_scrollback_rows(
             stable_row,
-            lines,
+            std::slice::from_ref(marker),
             max_retained_rows,
-            &mut committed_rows,
-        );
-        self.durability_syncs.fetch_add(
-            frankenterm_core::storage::mmap_store::thread_durability_sync_count() - syncs,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        if committed { committed_rows } else { 0 }
+            Some((gap_rows, gap_bytes)),
+        ) == 1
     }
 
     /// Publish a durable tail now (ft-yccm0.2.1.2). Its rows are already
@@ -13193,6 +13434,9 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             verified_ledger: None,
             // A replacement ledger is sealed as self-describing v3 rows.
             row_segments: LiveScrollbackRowSegments::EMPTY,
+            // Replacement re-lays the same pane's rows: the rows its gaps
+            // dropped stay lost, so their totals carry over.
+            durability_gaps: previous_state.durability_gaps,
             published: None,
         };
         let replacement_ledger_pane_id = self.replacement_ledger_pane_id(
@@ -13974,6 +14218,7 @@ pub fn list_live_scrollback_panes(
                 command_description: Some(manifest.command_description),
                 retained_rows: Some(manifest.retained_rows),
                 next_seq: Some(manifest.next_seq),
+                durability_gaps: manifest.durability_gaps,
                 path: pane_path,
                 error: None,
             }),
@@ -13985,6 +14230,7 @@ pub fn list_live_scrollback_panes(
                 command_description: None,
                 retained_rows: None,
                 next_seq: None,
+                durability_gaps: None,
                 path: pane_path,
                 error: Some(format!("{error:#}")),
             }),
@@ -17594,9 +17840,201 @@ mod tests {
                 .collect();
             assert_rows_read_back_from(&reopened, 0, &rows);
             assert_eq!(published_manifest(&reopened).next_seq, 6);
+            assert_eq!(
+                published_manifest(&reopened).durability_gaps,
+                Some(LiveScrollbackDurabilityGaps::default()),
+                "a tail with no row that may be a gap marker keeps the gap count (ft-yccm0.2.1.6)"
+            );
             let again = digest_only_test_lines("again", 2);
             assert_eq!(reopened.store_scrollback_lines(6, &again, 16), 2);
             assert_eq!(reopened.retained_scrollback_rows(), 8);
+        }
+    }
+
+    /// ft-yccm0.2.1.6 planted negative: a manifest without the gap totals
+    /// (as one written before the field existed) lists them as unknown,
+    /// never as zero. A reopened sink keeps them unknown through later gap
+    /// markers, since it cannot know the missing count; a clear starts the
+    /// count over from a known zero.
+    #[test]
+    fn a_manifest_without_gap_totals_lists_unknown_until_a_clear_counts_from_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = deferred_test_context();
+        let pane = uuid::Uuid::from_bytes(context.durable_pane_id)
+            .simple()
+            .to_string();
+        let listed = || {
+            let panes = list_live_scrollback_panes(dir.path(), 16).unwrap();
+            assert_eq!(panes.len(), 1);
+            assert_eq!(panes[0].durable_pane_id, pane);
+            assert_eq!(panes[0].error, None);
+            panes[0].durability_gaps
+        };
+        let row = |text: &str| Line::from_text(text, &CellAttributes::blank(), 1, None);
+        let marker =
+            row("[durability gap: 7 rows (1..8), 70 bytes, reason=overload, at_unix_ms=1]");
+
+        let sink = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context).unwrap();
+        // The first row publishes through its manifest alone; no WAL exists.
+        assert!(sink.store_scrollback_line(0, &row("prior"), 16));
+        assert!(
+            LiveScrollbackSpillSink::read_append_wal(
+                &LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path).unwrap()
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(listed(), Some(LiveScrollbackDurabilityGaps::default()));
+
+        // Plant the same manifest without the field, authenticated again.
+        let mut planted = published_manifest(&sink);
+        planted.durability_gaps = None;
+        let canonical = LiveScrollbackSpillSink::manifest_authentication_bytes(&planted).unwrap();
+        let cipher = sink
+            .lock_keyring("test plant manifest without gap totals")
+            .unwrap()
+            .latest_active_cipher()
+            .unwrap();
+        planted.guardian_manifest_authentication = Some(
+            cipher
+                .authenticate_scrollback_manifest(&canonical)
+                .unwrap()
+                .encode(),
+        );
+        planted.manifest_sha256 = LiveScrollbackSpillSink::manifest_checksum(&planted).unwrap();
+        overwrite_private_manifest_fixture(&sink.manifest_path, &planted);
+        drop(sink);
+        assert_eq!(listed(), None, "a missing count lists as unknown, not 0");
+
+        let reopened = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context).unwrap();
+        assert_eq!(
+            reopened
+                .lock_state("test planted gap totals")
+                .unwrap()
+                .durability_gaps,
+            None
+        );
+        assert!(reopened.store_scrollback_gap_marker(1, &marker, 16, 7, 70));
+        assert_eq!(
+            listed(),
+            None,
+            "an unknown count plus a gap stays unknown, never 7"
+        );
+
+        reopened.clear_scrollback().unwrap();
+        assert_eq!(
+            listed(),
+            Some(LiveScrollbackDurabilityGaps::default()),
+            "a clear counts from zero"
+        );
+        assert!(reopened.store_scrollback_gap_marker(8, &marker, 16, 7, 70));
+        assert_eq!(
+            listed(),
+            Some(LiveScrollbackDurabilityGaps {
+                markers: 1,
+                rows: 7,
+                bytes: 70,
+            })
+        );
+    }
+
+    const GAP_CRASH_TEST: &str =
+        "tests::a_gap_marker_killed_at_every_step_never_lists_a_wrong_gap_count";
+
+    /// ft-yccm0.2.1.6: a child process writes a gap marker and is killed
+    /// with SIGKILL at every named step of the marker's transaction. Its row
+    /// is synced first, so reopen recovers it at every step. The totals then
+    /// count it exactly (its WAL rolled forward) or are unknown (the row was
+    /// adopted before any WAL named it): never a count that leaves it out.
+    #[cfg(unix)]
+    #[test]
+    fn a_gap_marker_killed_at_every_step_never_lists_a_wrong_gap_count() {
+        const RETENTION: usize = 3;
+        let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+        let first = digest_only_test_lines("first", 2);
+        let marker = Line::from_text(
+            "[durability gap: 9 rows (3..12), 900 bytes, reason=overload, at_unix_ms=1]",
+            &CellAttributes::blank(),
+            1,
+            None,
+        );
+        let counted = LiveScrollbackDurabilityGaps {
+            markers: 1,
+            rows: 9,
+            bytes: 900,
+        };
+
+        if let Ok(armed) = std::env::var(CRASH_CHILD_STEP) {
+            let step = CRASH_STEPS
+                .iter()
+                .map(|(step, _)| *step)
+                .find(|step| *step == armed)
+                .expect("a named crash step");
+            let base = PathBuf::from(std::env::var(CRASH_CHILD_BASE).unwrap());
+            let sink = LiveScrollbackSpillSink::new(base, &deferred_test_context()).unwrap();
+            assert!(sink.store_scrollback_line(0, &prior, RETENTION));
+            // This batch starts the process's nonce segment and publishes
+            // it, so the marker continues a published segment.
+            assert_eq!(sink.store_scrollback_lines(1, &first, RETENTION), 2);
+            scrollback_crash_points::arm(step);
+            let _ = sink.store_scrollback_gap_marker(3, &marker, RETENTION, 9, 900);
+            panic!("gap marker crash step {step} was never reached");
+        }
+
+        for (step, rolled_forward) in CRASH_STEPS {
+            use std::os::unix::process::ExitStatusExt as _;
+
+            let dir = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg(GAP_CRASH_TEST)
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(CRASH_CHILD_STEP, step)
+                .env(CRASH_CHILD_BASE, dir.path())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGKILL),
+                "{step}: the child dies at its step ({status:?})"
+            );
+            let reopened =
+                LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                    .unwrap_or_else(|error| panic!("{step}: reopen after kill -9: {error:#}"));
+            assert_eq!(reopened.retained_scrollback_rows(), RETENTION, "{step}");
+            assert_rows_read_back_from(&reopened, 1, &[&first[0], &first[1], &marker]);
+            // Killed after its rows synced but before its WAL, the marker is
+            // adopted from the ledger; from the WAL on, it rolls forward.
+            let expected = if rolled_forward { Some(counted) } else { None };
+            assert_eq!(
+                published_manifest(&reopened).durability_gaps,
+                expected,
+                "{step}"
+            );
+            assert_eq!(
+                list_live_scrollback_panes(dir.path(), 16).unwrap()[0].durability_gaps,
+                expected,
+                "{step}"
+            );
+            // The next marker adds to a known count and leaves an unknown one
+            // unknown.
+            let next = Line::from_text(
+                "[durability gap: 2 rows (13..15), 20 bytes, reason=overload, at_unix_ms=2]",
+                &CellAttributes::blank(),
+                1,
+                None,
+            );
+            assert!(
+                reopened.store_scrollback_gap_marker(4, &next, RETENTION, 2, 20),
+                "{step}"
+            );
+            assert_eq!(
+                published_manifest(&reopened).durability_gaps,
+                expected.and_then(|totals| totals.with_gap(2, 20)),
+                "{step}"
+            );
         }
     }
 

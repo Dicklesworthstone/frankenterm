@@ -1149,6 +1149,24 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
         }))
     }
 
+    /// Store one marker row in place of `gap_rows` rows (`gap_bytes` charged
+    /// bytes) that overload dropped from durability, and return whether it
+    /// was durably acknowledged. A sink that keeps durability-gap totals
+    /// publishes them together with the marker; the default stores the
+    /// marker as an ordinary row.
+    fn store_scrollback_gap_marker(
+        &self,
+        stable_row: StableRowIndex,
+        marker: &Line,
+        max_retained_rows: usize,
+        gap_rows: u64,
+        gap_bytes: u64,
+    ) -> bool {
+        let _ = (gap_rows, gap_bytes);
+        self.store_scrollback_lines(stable_row, std::slice::from_ref(marker), max_retained_rows)
+            == 1
+    }
+
     /// Whether parser-side maintenance must drain this sink outside the
     /// terminal mutex before admitting another output batch.
     fn requires_scrollback_flush(&self) -> bool {

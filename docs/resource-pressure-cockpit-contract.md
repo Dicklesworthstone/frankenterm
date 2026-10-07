@@ -263,8 +263,19 @@ What an operator sees:
   A headless `frankenterm-mux-server` publishes no resource snapshot, so its
   durability shows only in its logs and metrics.
 
-Not yet wired, tracked on ft-yccm0.2.1.6: gap counts in
-`ft session list-durable`.
+- **`ft session list-durable`.** Each pane's manifest carries the gap totals
+  of its lineage: `durability_gaps` with `markers`, `rows` and `bytes` in the
+  JSON output, and a "Gap rows" column in the table. The listing reads them
+  from the manifest without decoding rows. Each marker's own transaction
+  updates them, so every marker the store has published is counted.
+  - **Lifetime.** The totals count from the pane's first row or its last
+    clear. A clear resets them to zero. A replacement (reflow) keeps them.
+    Retention may prune old markers, but their rows still count.
+  - **Unknown, never zero.** A manifest without the field lists them as
+    unknown (JSON `null`). Older builds wrote such manifests.
+  - **After a crash.** Recovery may adopt rows that no WAL names. If one of
+    those rows reads like a marker, the totals become unknown, and they stay
+    unknown until the next clear.
 
 ## Worker Pool Pressure
 

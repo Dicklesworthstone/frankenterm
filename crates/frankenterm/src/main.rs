@@ -83392,10 +83392,10 @@ async fn handle_session_command(
                 return Ok(());
             }
             println!(
-                "{:<32} {:<10} {:>12} {:>12}  Command",
-                "Durable pane ID", "State", "Rows", "Next seq"
+                "{:<32} {:<10} {:>12} {:>12} {:>10}  Command",
+                "Durable pane ID", "State", "Rows", "Next seq", "Gap rows"
             );
-            println!("{}", "-".repeat(110));
+            println!("{}", "-".repeat(121));
             for pane in panes {
                 let rows = pane
                     .retained_rows
@@ -83405,17 +83405,19 @@ async fn handle_session_command(
                     .next_seq
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_string());
+                let gap_rows = durable_gap_rows_cell(pane.durability_gaps.as_ref());
                 let description = pane
                     .command_description
                     .as_deref()
                     .or(pane.error.as_deref())
                     .unwrap_or("-");
                 println!(
-                    "{:<32} {:<10} {:>12} {:>12}  {}",
+                    "{:<32} {:<10} {:>12} {:>12} {:>10}  {}",
                     pane.durable_pane_id,
                     pane.state,
                     rows,
                     next_seq,
+                    gap_rows,
                     truncate_id(description, 40)
                 );
             }
@@ -90053,6 +90055,29 @@ fn truncate_id_is_bounded_and_preserves_utf8_boundaries() {
     let bounded = truncate_id(&oversized_grapheme, 8);
     assert!(bounded.len() <= 64);
     assert_eq!(bounded, "...");
+}
+
+/// A durable pane's "Gap rows" cell in `ft session list-durable`: the rows
+/// overload dropped from durability, or "unknown" when its manifest does not
+/// record them (ft-yccm0.2.1.6). A missing count never prints as 0.
+fn durable_gap_rows_cell(
+    gaps: Option<&frankenterm_mux_server_impl::LiveScrollbackDurabilityGaps>,
+) -> String {
+    gaps.map_or_else(|| "unknown".to_string(), |gaps| gaps.rows.to_string())
+}
+
+#[cfg(test)]
+#[test]
+fn durable_gap_rows_cell_prints_unknown_never_zero_for_a_missing_count() {
+    assert_eq!(durable_gap_rows_cell(None), "unknown");
+    let none_recorded = frankenterm_mux_server_impl::LiveScrollbackDurabilityGaps::default();
+    assert_eq!(durable_gap_rows_cell(Some(&none_recorded)), "0");
+    let recorded = frankenterm_mux_server_impl::LiveScrollbackDurabilityGaps {
+        markers: 2,
+        rows: 4097,
+        bytes: 65_536,
+    };
+    assert_eq!(durable_gap_rows_cell(Some(&recorded)), "4097");
 }
 
 /// Format epoch ms for display.
