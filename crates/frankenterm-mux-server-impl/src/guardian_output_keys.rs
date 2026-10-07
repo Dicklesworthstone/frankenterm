@@ -3416,8 +3416,16 @@ mod tests {
             .write(true)
             .open(corrupt_directory.path().join(intent_name(intent)))
             .expect("open intent for corruption");
+        // Byte 128 starts the activation digest, effectively random: flip
+        // its top bit, so the corruption always changes it (writing a fixed
+        // 0x80 was a no-op once in 256 runs).
+        let mut byte = [0_u8; 1];
         intent_file.seek(SeekFrom::Start(128)).expect("seek intent");
-        intent_file.write_all(&[0x80]).expect("corrupt intent");
+        intent_file.read_exact(&mut byte).expect("read intent byte");
+        intent_file.seek(SeekFrom::Start(128)).expect("seek intent");
+        intent_file
+            .write_all(&[byte[0] ^ 0x80])
+            .expect("corrupt intent");
         intent_file.sync_all().expect("sync corrupt intent");
         drop(keyring);
         assert!(matches!(
