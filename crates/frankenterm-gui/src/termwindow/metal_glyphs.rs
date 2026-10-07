@@ -34,15 +34,18 @@ use crate::glyphcache::GlyphCache;
 use crate::utilsprites::RenderMetrics;
 use frankenterm_font::FontConfiguration;
 use frankenterm_font::rasterizer::RasterizedGlyph;
-use frankenterm_gui::metal_scene::{GlyphSource, GlyphStyle, LineSprite, PlacedGlyph};
+use frankenterm_gui::metal_scene::{
+    CursorSprite, GlyphSource, GlyphStyle, LineSprite, PlacedGlyph,
+};
 use frankenterm_renderer_metal::{AtlasKind, MetalRenderer};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use termwiz::cell::{CellAttributes, Intensity};
+use termwiz::surface::CursorShape;
 use wezterm_bidi::Direction;
-use window::bitmaps::BitmapImage;
+use window::bitmaps::{BitmapImage, Image};
 
 type ByText = HashMap<String, Vec<PlacedGlyph>>;
 
@@ -59,6 +62,8 @@ pub(crate) struct FontGlyphs {
     placed: HashMap<(GlyphStyle, usize), ByText>,
     /// Line sprites placed in the grayscale atlas (ft-yccm0.4.7.3).
     lines: HashMap<LineSprite, PlacedGlyph>,
+    /// Cursor sprites by shape and width in cells (ft-yccm0.4.7.3).
+    cursors: HashMap<(CursorSprite, u8), PlacedGlyph>,
     /// Set by the shaper when a fallback font finishes resolving.
     fallback_resolved: Arc<AtomicBool>,
     /// An atlas refused a glyph: clear the cache before the next frame.
@@ -108,6 +113,7 @@ impl FontGlyphs {
             config_generation,
             placed: HashMap::new(),
             lines: HashMap::new(),
+            cursors: HashMap::new(),
             fallback_resolved: Arc::new(AtomicBool::new(false)),
             reset: false,
         }
@@ -145,26 +151,21 @@ impl FontGlyphs {
                 .flat_map(HashMap::values)
                 .flatten()
                 .chain(self.lines.values())
+                .chain(self.cursors.values())
                 .all(|glyph| renderer.touch_glyph(&glyph.slot));
             rebuild = !alive;
         }
         if rebuild {
             self.placed.clear();
             self.lines.clear();
+            self.cursors.clear();
         }
         rebuild
     }
 
-    /// Places the WebGpu renderer's line sprite for `lines` in the grayscale
-    /// atlas: the same bitmap ([`GlyphCache::line_sprite_image`]), its alpha
-    /// as coverage, at the cell's top-left.
-    fn place_line(&mut self, lines: LineSprite) -> Option<PlacedGlyph> {
-        let image = GlyphCache::line_sprite_image(
-            lines.strikethrough,
-            lines.underline,
-            lines.overline,
-            &self.metrics,
-        );
+    /// Places `image`'s alpha in the grayscale atlas at the cell's top-left:
+    /// a line or cursor sprite as the WebGpu renderer draws it.
+    fn place_sprite(&mut self, image: &Image, what: &str) -> Option<PlacedGlyph> {
         let (width, height) = image.image_dimensions();
         let coverage: Vec<u8> = image
             .pixel_data_slice()
@@ -183,11 +184,38 @@ impl FontGlyphs {
                 offset: [0, 0],
             }),
             Err(err) => {
-                log::debug!("Metal glyphs: atlas refused line sprite {lines:?}: {err}");
+                log::debug!("Metal glyphs: atlas refused {what}: {err}");
                 self.reset = true;
                 None
             }
         }
+    }
+
+    /// Places the WebGpu renderer's line sprite for `lines` in the grayscale
+    /// atlas: the same bitmap ([`GlyphCache::line_sprite_image`]), its alpha
+    /// as coverage, at the cell's top-left.
+    fn place_line(&mut self, lines: LineSprite) -> Option<PlacedGlyph> {
+        let image = GlyphCache::line_sprite_image(
+            lines.strikethrough,
+            lines.underline,
+            lines.overline,
+            &self.metrics,
+        );
+        self.place_sprite(&image, "a line sprite")
+    }
+
+    /// Places the WebGpu renderer's cursor sprite for `shape`
+    /// ([`GlyphCache::cursor_sprite_image`], with the configured
+    /// `cursor_thickness`): a hollow block is its unfocused block outline.
+    fn place_cursor(&mut self, shape: CursorSprite, width_cells: u8) -> Option<PlacedGlyph> {
+        let shape = match shape {
+            CursorSprite::HollowBlock => CursorShape::SteadyBlock,
+            CursorSprite::Bar => CursorShape::SteadyBar,
+            CursorSprite::Underline => CursorShape::SteadyUnderline,
+        };
+        let image =
+            GlyphCache::cursor_sprite_image(&self.fonts, Some(shape), &self.metrics, width_cells);
+        self.place_sprite(&image, "a cursor sprite")
     }
 
     fn place(&mut self, text: &str, style: GlyphStyle) -> Vec<PlacedGlyph> {
@@ -296,6 +324,15 @@ impl GlyphSource for FontGlyphs {
         }
         let placed = self.place_line(lines)?;
         self.lines.insert(lines, placed);
+        Some(placed)
+    }
+
+    fn cursor_sprite(&mut self, shape: CursorSprite, width_cells: u8) -> Option<PlacedGlyph> {
+        if let Some(placed) = self.cursors.get(&(shape, width_cells)) {
+            return Some(*placed);
+        }
+        let placed = self.place_cursor(shape, width_cells)?;
+        self.cursors.insert((shape, width_cells), placed);
         Some(placed)
     }
 }

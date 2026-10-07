@@ -1,0 +1,13 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "cursor scene\nline two with text\nabc\u001b[4 q\u001b[2;6H",
+    "config": {
+      "front_end": "Metal"
+    },
+    "snapshot": {
+      "focus": true
+    }
+  },
+  "parity_golden": "real/cursor-underline-focused"
+}

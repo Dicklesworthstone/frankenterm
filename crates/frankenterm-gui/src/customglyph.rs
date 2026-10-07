@@ -1,6 +1,7 @@
 use crate::glyphcache::{GlyphCache, SizedBlockKey};
 use crate::utilsprites::RenderMetrics;
 use config::DimensionContext;
+use frankenterm_font::FontConfiguration;
 use frankenterm_font::units::{IntPixelLength, PixelLength};
 use std::ops::Range;
 use termwiz::surface::CursorShape;
@@ -4907,6 +4908,19 @@ impl GlyphCache {
         aa: PolyAA,
         blend_mode: BlendMode,
     ) {
+        Self::paint_polys(metrics, polys, buffer, aa, blend_mode);
+    }
+
+    /// [`Self::draw_polys`] without the cache: it needs only the metrics,
+    /// so the Metal renderer's glyph source can paint the same sprites
+    /// (ft-yccm0.4.7.3).
+    fn paint_polys(
+        metrics: &RenderMetrics,
+        polys: &[Poly],
+        buffer: &mut Image,
+        aa: PolyAA,
+        blend_mode: BlendMode,
+    ) {
         let (width, height) = buffer.image_dimensions();
         let mut pixmap =
             PixmapMut::from_bytes(buffer.pixel_data_slice_mut(), width as u32, height as u32)
@@ -4948,10 +4962,26 @@ impl GlyphCache {
             return Ok(sprite.clone());
         }
 
+        let buffer = Self::cursor_sprite_image(&self.fonts, shape, metrics, width);
+        let sprite = self.atlas.allocate(&buffer)?;
+        self.cursor_glyphs.insert((shape, width), sprite.clone());
+        Ok(sprite)
+    }
+
+    /// The bitmap of a cursor sprite `width` cells wide: white (the alpha is
+    /// the coverage) over transparent black, anti-aliased. The WebGpu
+    /// renderer allocates it in its atlas; the Metal renderer places the same
+    /// pixels in its grayscale atlas (ft-yccm0.4.7.3).
+    pub(crate) fn cursor_sprite_image(
+        fonts: &FontConfiguration,
+        shape: Option<CursorShape>,
+        metrics: &RenderMetrics,
+        width: u8,
+    ) -> Image {
         let mut metrics = metrics.scale_cell_width(width as f64);
-        if let Some(d) = &self.fonts.config().cursor_thickness {
+        if let Some(d) = &fonts.config().cursor_thickness {
             metrics.underline_height = d.evaluate_as_pixels(DimensionContext {
-                dpi: self.fonts.get_dpi() as f32,
+                dpi: fonts.get_dpi() as f32,
                 pixel_max: metrics.underline_height as f32,
                 pixel_cell: metrics.cell_size.height as f32,
             }) as isize;
@@ -4971,7 +5001,7 @@ impl GlyphCache {
                 buffer.clear_rect(cell_rect, SrgbaPixel::rgba(0xff, 0xff, 0xff, 0xff));
             }
             Some(CursorShape::BlinkingBlock | CursorShape::SteadyBlock) => {
-                self.draw_polys(
+                Self::paint_polys(
                     &metrics,
                     &[Poly {
                         path: &[
@@ -4990,7 +5020,7 @@ impl GlyphCache {
                 );
             }
             Some(CursorShape::BlinkingBar | CursorShape::SteadyBar) => {
-                self.draw_polys(
+                Self::paint_polys(
                     &metrics,
                     &[Poly {
                         path: &[
@@ -5006,7 +5036,7 @@ impl GlyphCache {
                 );
             }
             Some(CursorShape::BlinkingUnderline | CursorShape::SteadyUnderline) => {
-                self.draw_polys(
+                Self::paint_polys(
                     &metrics,
                     &[Poly {
                         path: &[
@@ -5022,10 +5052,7 @@ impl GlyphCache {
                 );
             }
         }
-
-        let sprite = self.atlas.allocate(&buffer)?;
-        self.cursor_glyphs.insert((shape, width), sprite.clone());
-        Ok(sprite)
+        buffer
     }
 
     pub fn block_sprite(

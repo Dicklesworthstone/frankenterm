@@ -20,7 +20,7 @@ use crate::termwindow::metal_glyphs::FontGlyphs;
 use crate::utilsprites::RenderMetrics;
 use config::ConfigHandle;
 use frankenterm_font::FontConfiguration;
-use frankenterm_gui::metal_scene::{MetalScene, SceneStyle};
+use frankenterm_gui::metal_scene::{CursorSprite, MetalScene, SceneStyle};
 use frankenterm_renderer_metal::{
     BackgroundUniforms, CursorShape as MetalCursorShape, CursorUniform, MetalRenderer, TextUniforms,
 };
@@ -54,6 +54,18 @@ fn cursor_shape(shape: CursorShape, focused_and_active: bool) -> MetalCursorShap
         CursorShape::Default | CursorShape::BlinkingBlock | CursorShape::SteadyBlock => {
             MetalCursorShape::Block
         }
+    }
+}
+
+/// The sprite the scene draws for a cursor (ft-yccm0.4.7.3): the WebGpu
+/// renderer's own cursor sprites, anti-aliased, for every shape but a
+/// focused block, which the background pass fills.
+fn cursor_sprite(shape: MetalCursorShape) -> Option<CursorSprite> {
+    match shape {
+        MetalCursorShape::HollowBlock => Some(CursorSprite::HollowBlock),
+        MetalCursorShape::Bar => Some(CursorSprite::Bar),
+        MetalCursorShape::Underline => Some(CursorSprite::Underline),
+        MetalCursorShape::Block | MetalCursorShape::Hidden => None,
     }
 }
 
@@ -172,6 +184,12 @@ impl MetalFrame {
                 shape,
                 CursorShape::Default | CursorShape::BlinkingBlock | CursorShape::SteadyBlock
             );
+        let metal_shape = cursor_shape(shape, focused_and_active);
+        let cursor_color = if focused_and_active {
+            palette.cursor_bg
+        } else {
+            palette.cursor_border
+        };
         let selection = &inputs.selection;
         let selected = |stable| {
             selection.as_ref().map_or(0..0, |(range, rectangular)| {
@@ -191,6 +209,7 @@ impl MetalFrame {
                 None
             },
             cursor_bg: block_cursor.then_some(palette.cursor_bg),
+            cursor_sprite: cursor_sprite(metal_shape).map(|sprite| (sprite, cursor_color)),
             hover: inputs.hover.as_ref(),
         };
         let update = frame
@@ -208,16 +227,17 @@ impl MetalFrame {
                     .find(|cell| (cell.col()..cell.col() + cell.width()).contains(&cursor.x))
                     .map_or(1, |cell| cell.width().clamp(1, 2) as u32);
                 CursorUniform {
-                    shape: cursor_shape(shape, focused_and_active),
+                    // A cursor the scene draws as a sprite is not drawn here.
+                    shape: if cursor_sprite(metal_shape).is_some() {
+                        MetalCursorShape::Hidden
+                    } else {
+                        metal_shape
+                    },
                     col: cursor.x as u32,
                     row: row as u32,
                     width_cells,
                     thickness: metrics.underline_height.max(1) as f32,
-                    color: premultiplied(if focused_and_active {
-                        palette.cursor_bg
-                    } else {
-                        palette.cursor_border
-                    }),
+                    color: premultiplied(cursor_color),
                 }
             }
             _ => CursorUniform::default(),
@@ -280,6 +300,29 @@ mod tests {
             cursor_shape(CursorShape::SteadyBar, true),
             MetalCursorShape::Bar
         );
+    }
+
+    /// ft-yccm0.4.7.3: only a focused block is left to the background pass.
+    #[test]
+    fn every_cursor_but_a_focused_block_is_a_sprite() {
+        assert_eq!(cursor_sprite(MetalCursorShape::Block), None);
+        assert_eq!(cursor_sprite(MetalCursorShape::Hidden), None);
+        for (shape, focused, sprite) in [
+            (CursorShape::SteadyBlock, false, CursorSprite::HollowBlock),
+            (CursorShape::SteadyBar, false, CursorSprite::HollowBlock),
+            (CursorShape::SteadyBar, true, CursorSprite::Bar),
+            (
+                CursorShape::BlinkingUnderline,
+                true,
+                CursorSprite::Underline,
+            ),
+        ] {
+            assert_eq!(
+                cursor_sprite(cursor_shape(shape, focused)),
+                Some(sprite),
+                "{shape:?} focused {focused}"
+            );
+        }
     }
 
     #[test]

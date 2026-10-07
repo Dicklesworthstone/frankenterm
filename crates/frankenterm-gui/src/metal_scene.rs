@@ -99,6 +99,24 @@ pub trait GlyphSource {
     /// The grayscale sprite that draws `lines` over one cell, placed from
     /// the cell's top-left; `None` when the source has none.
     fn line_sprite(&mut self, lines: LineSprite) -> Option<PlacedGlyph>;
+
+    /// The grayscale sprite of a `shape` cursor `width_cells` cells wide,
+    /// placed from its first cell's top-left; `None` when the source has
+    /// none.
+    fn cursor_sprite(&mut self, shape: CursorSprite, width_cells: u8) -> Option<PlacedGlyph>;
+}
+
+/// A cursor the scene draws as the WebGpu renderer's cursor sprite
+/// (ft-yccm0.4.7.3): every cursor but a focused block, which the background
+/// pass fills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CursorSprite {
+    /// An unfocused window's or inactive pane's cursor, whatever its shape.
+    HollowBlock,
+    /// A focused bar, drawn over the glyphs as on the WebGpu path.
+    Bar,
+    /// A focused underline.
+    Underline,
 }
 
 /// What a frame's colors depend on besides the cells.
@@ -122,8 +140,24 @@ pub struct SceneStyle<'a> {
     /// A focused block cursor's color, which the text under it sits on;
     /// `None` when the cursor is not a focused block.
     pub cursor_bg: Option<SrgbaTuple>,
+    /// Any other cursor, drawn as a sprite in its color (the cursor color
+    /// when focused, the cursor border otherwise); `None` for a focused block
+    /// or no cursor.
+    pub cursor_sprite: Option<(CursorSprite, SrgbaTuple)>,
     /// The hyperlink under the mouse, underlined wherever it appears.
     pub hover: Option<&'a Arc<Hyperlink>>,
+}
+
+/// How the cursor draws on its row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowCursor {
+    col: usize,
+    /// A focused block's text color override.
+    fg: Option<[u8; 4]>,
+    /// A focused block's color, which the text under it sits on.
+    block: Option<[u8; 4]>,
+    /// Any other cursor's sprite and color.
+    sprite: Option<(CursorSprite, [u8; 4])>,
 }
 
 /// What one rebuilt row was built from.
@@ -132,9 +166,8 @@ struct BuiltRow {
     stable: Option<StableRowIndex>,
     generation: u64,
     selection: Range<usize>,
-    /// The cursor's column on this row, with a focused block's foreground
-    /// override and its color.
-    cursor: Option<(usize, Option<[u8; 4]>, Option<[u8; 4]>)>,
+    /// The cursor, when it is on this row.
+    cursor: Option<RowCursor>,
 }
 
 /// What [`MetalScene::update`] did.
@@ -323,12 +356,13 @@ impl MetalScene {
                 stable: Some(mirror_row.stable()),
                 generation: mirror_row.generation(),
                 selection: selection(mirror_row.stable()),
-                cursor: (cursor_row == Some(row)).then(|| {
-                    (
-                        cursor.x,
-                        style.cursor_fg.map(rgba8),
-                        style.cursor_bg.map(rgba8),
-                    )
+                cursor: (cursor_row == Some(row)).then(|| RowCursor {
+                    col: cursor.x,
+                    fg: style.cursor_fg.map(rgba8),
+                    block: style.cursor_bg.map(rgba8),
+                    sprite: style
+                        .cursor_sprite
+                        .map(|(shape, color)| (shape, rgba8(color))),
                 }),
             };
             let hovered = hover_changed
@@ -409,6 +443,26 @@ impl MetalScene {
                 self.text.push(grid_row, instance);
             }
         }
+        // A cursor sprite: a hollow block or an underline goes after the
+        // decorations (the WebGpu renderer's layer 0), a bar after the glyphs
+        // (its layer 2).
+        let cursor_sprite = built.cursor.and_then(|cursor| {
+            let (shape, color) = cursor.sprite?;
+            let width = mirror_row
+                .cells()
+                .iter()
+                .find(|cell| (cell.col()..cell.col() + cell.width().max(1)).contains(&cursor.col))
+                .map_or(1, |cell| cell.width().clamp(1, 2));
+            let sprite = glyphs.cursor_sprite(shape, width as u8)?;
+            let instance =
+                CellText::new(cursor.col as u16, color).with_glyph(&sprite.slot, sprite.offset);
+            Some((shape, instance))
+        });
+        if let Some((shape, instance)) = cursor_sprite {
+            if shape != CursorSprite::Bar {
+                self.text.push(grid_row, instance);
+            }
+        }
         for cell in mirror_row.cells() {
             let col = cell.col();
             let colors = cell_colors(cell, style, reverse_video);
@@ -434,13 +488,13 @@ impl MetalScene {
                 under = style.selection_bg;
             }
             let (mut fg, mut under) = (rgba8(fg), rgba8(under));
-            if let Some((cursor_col, cursor_fg, cursor_bg)) = built.cursor {
-                if cursor_col == col {
-                    if let Some(cursor_fg) = cursor_fg {
+            if let Some(cursor) = built.cursor {
+                if cursor.col == col {
+                    if let Some(cursor_fg) = cursor.fg {
                         fg = cursor_fg;
                     }
-                    if let Some(cursor_bg) = cursor_bg {
-                        under = cursor_bg;
+                    if let Some(block) = cursor.block {
+                        under = block;
                     }
                 }
             }
@@ -462,6 +516,9 @@ impl MetalScene {
                 let instance = CellText::new(col as u16, fg).with_glyph(&glyph.slot, glyph.offset);
                 self.text.push(grid_row, instance);
             }
+        }
+        if let Some((CursorSprite::Bar, instance)) = cursor_sprite {
+            self.text.push(grid_row, instance);
         }
         // The selection tints its whole span, blank columns included.
         for col in built.selection.start..built.selection.end.min(cols as usize) {
@@ -519,6 +576,7 @@ mod tests {
     struct SyntheticGlyphs {
         placed: HashMap<(String, GlyphStyle, usize), Vec<PlacedGlyph>>,
         lines: HashMap<LineSprite, PlacedGlyph>,
+        cursors: HashMap<(CursorSprite, u8), PlacedGlyph>,
     }
 
     fn synthetic_slot(index: u32, text: &str) -> AtlasSlot {
@@ -558,6 +616,20 @@ mod tests {
                 slot: synthetic_slot(index, "line"),
                 offset: [0, 0],
             }))
+        }
+
+        /// One made-up grayscale slot per cursor shape and width.
+        fn cursor_sprite(&mut self, shape: CursorSprite, width_cells: u8) -> Option<PlacedGlyph> {
+            let index = 8192 + u32::try_from(self.cursors.len()).unwrap_or(u32::MAX - 8192);
+            Some(
+                *self
+                    .cursors
+                    .entry((shape, width_cells))
+                    .or_insert_with(|| PlacedGlyph {
+                        slot: synthetic_slot(index, "cursor"),
+                        offset: [0, 0],
+                    }),
+            )
         }
     }
 
@@ -769,6 +841,12 @@ mod tests {
                 selection_bg: palette.selection_bg,
                 cursor_fg: (rng.below(2) == 0).then_some(SrgbaTuple(0.0, 0.0, 0.0, 1.0)),
                 cursor_bg: (rng.below(2) == 0).then_some(palette.cursor_bg),
+                cursor_sprite: *rng.pick(&[
+                    None,
+                    Some((CursorSprite::HollowBlock, palette.cursor_border)),
+                    Some((CursorSprite::Bar, palette.cursor_bg)),
+                    Some((CursorSprite::Underline, palette.cursor_bg)),
+                ]),
                 hover,
             };
             let top = mirror.first() + rng.below(rows as u64) as StableRowIndex;
@@ -823,6 +901,7 @@ mod tests {
             selection_bg: palette.selection_bg,
             cursor_fg: None,
             cursor_bg: None,
+            cursor_sprite: None,
             hover: None,
         }
     }
@@ -1043,6 +1122,74 @@ mod tests {
         );
     }
 
+    /// ft-yccm0.4.7.3: every cursor but a focused block is the WebGpu
+    /// renderer's cursor sprite in its color, as wide as the cell under it.
+    /// A hollow block or an underline sits under the row's glyphs, a bar
+    /// over them. A new cursor shape rebuilds the cursor's row only.
+    #[test]
+    fn cursor_sprites_draw_in_webgpu_layer_order() {
+        let palette = ColorPalette::default();
+        let mut glyphs = SyntheticGlyphs::default();
+        let mut term = terminal(2, 10);
+        // The cursor goes to the wide character in columns 2 and 3.
+        term.advance_bytes("ab你\x1b[1;3H");
+        let mut mirror = RenderMirror::new();
+        let mut scene = MetalScene::new();
+        let border = rgba8(palette.cursor_border);
+        let mut frame = |sprite: Option<(CursorSprite, SrgbaTuple)>,
+                         glyphs: &mut SyntheticGlyphs| {
+            let style = SceneStyle {
+                cursor_sprite: sprite,
+                ..plain_style(&palette)
+            };
+            let update = step(
+                &mut term,
+                &mut mirror,
+                &mut scene,
+                glyphs,
+                &no_selection,
+                &style,
+            );
+            let row: Vec<(u16, [u16; 2], [u8; 4])> = scene
+                .text()
+                .row(0)
+                .map(|instance| (instance.col(), instance.atlas_origin(), instance.fg()))
+                .collect();
+            (update, row)
+        };
+        let (_, plain) = frame(None, &mut glyphs);
+        assert_eq!(plain.len(), 3, "a, b and the wide character");
+        for (shape, first) in [
+            (CursorSprite::HollowBlock, true),
+            (CursorSprite::Underline, true),
+            (CursorSprite::Bar, false),
+        ] {
+            let (update, row) = frame(Some((shape, palette.cursor_border)), &mut glyphs);
+            assert_eq!(
+                (update.full, update.rows_rebuilt),
+                (false, 1),
+                "{shape:?}: only the cursor's row"
+            );
+            let slot = glyphs.cursors[&(shape, 2)].slot;
+            let sprite = (
+                2,
+                [
+                    u16::try_from(slot.x).unwrap(),
+                    u16::try_from(slot.y).unwrap(),
+                ],
+                border,
+            );
+            assert_eq!(row.len(), 4, "{shape:?}");
+            if first {
+                assert_eq!(row[0], sprite, "{shape:?} under the glyphs");
+                assert_eq!(row[1..], plain[..], "{shape:?}");
+            } else {
+                assert_eq!(row[3], sprite, "{shape:?} over the glyphs");
+                assert_eq!(row[..3], plain[..], "{shape:?}");
+            }
+        }
+    }
+
     /// Text is hidden only in the color it actually sits on, as the WebGpu
     /// renderer decides: the selection's background under selected text, a
     /// focused block cursor's color under the cursor, else the cell's own
@@ -1122,6 +1269,7 @@ mod tests {
             renderer: &'a MetalRenderer,
             placed: HashMap<(String, GlyphStyle, usize), Vec<PlacedGlyph>>,
             lines: HashMap<LineSprite, PlacedGlyph>,
+            cursors: HashMap<(CursorSprite, u8), PlacedGlyph>,
         }
 
         impl GlyphSource for AtlasGlyphs<'_> {
@@ -1171,6 +1319,39 @@ mod tests {
                     }
                 }))
             }
+
+            /// A hollow box `width_cells` cells wide, with a half-covered
+            /// inner ring, so anti-aliased edges go through the readback.
+            fn cursor_sprite(
+                &mut self,
+                shape: CursorSprite,
+                width_cells: u8,
+            ) -> Option<PlacedGlyph> {
+                let renderer = self.renderer;
+                Some(
+                    *self.cursors.entry((shape, width_cells)).or_insert_with(|| {
+                        let width = 8 * u32::from(width_cells);
+                        let pixels: Vec<u8> = (0..width * 16)
+                            .map(|i| {
+                                let (x, y) = (i % width, i / width);
+                                let edge = x.min(width - 1 - x).min(y.min(15 - y));
+                                match edge {
+                                    0 => 255,
+                                    1 => 128,
+                                    _ => 0,
+                                }
+                            })
+                            .collect();
+                        let slot = renderer
+                            .insert_glyph(AtlasKind::Grayscale, width, 16, &pixels)
+                            .expect("the atlas takes a cursor sprite");
+                        PlacedGlyph {
+                            slot,
+                            offset: [0, 0],
+                        }
+                    }),
+                )
+            }
         }
 
         fn read_back(renderer: &MetalRenderer, scene: &MetalScene) -> Vec<u8> {
@@ -1203,6 +1384,7 @@ mod tests {
                 renderer: &renderer,
                 placed: HashMap::new(),
                 lines: HashMap::new(),
+                cursors: HashMap::new(),
             };
             let mut rng = Rng::new(seed);
             let (rows, cols) = (8, 24);
@@ -1218,6 +1400,8 @@ mod tests {
                 selection_bg: palette.selection_bg,
                 cursor_fg: None,
                 cursor_bg: None,
+                // A cursor sprite through the real pipeline (ft-yccm0.4.7.3).
+                cursor_sprite: Some((CursorSprite::HollowBlock, SrgbaTuple(0.9, 0.5, 0.1, 1.0))),
                 hover: None,
             };
             let request = CaptureRequest {
