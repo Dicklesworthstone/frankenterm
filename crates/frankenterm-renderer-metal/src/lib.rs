@@ -176,6 +176,7 @@ pub mod atlas;
 pub mod cell_bg;
 pub mod cell_text;
 pub mod frame;
+pub mod uploads;
 pub use atlas::{AtlasError, AtlasKind, AtlasSlot};
 pub use cell_bg::{BackgroundUniforms, CellBg, CellBgGrid, CursorShape, CursorUniform};
 pub use cell_text::{CellText, CellTextGrid, TextUniforms, UnderlineStyle};

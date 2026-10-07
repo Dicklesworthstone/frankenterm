@@ -28,6 +28,7 @@
 use crate::atlas::{AtlasKind, AtlasSlot};
 use crate::cell_bg::over;
 use crate::frame::{CELL_TEXT_INSTANCE_BYTES, FrameUniforms, GridExtent, ROW_TABLE_BYTES_PER_ROW};
+use crate::uploads::RowChanges;
 
 /// The Metal Shading Language source of the text pass.
 pub const TEXT_SHADER: &str = include_str!("shaders/text.metal");
@@ -283,8 +284,9 @@ pub struct TextUniforms {
 }
 
 /// One pane's glyph instances, stored by ring row exactly as the frame lays
-/// them out.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// them out. [`RowChanges`] tracks which ring rows changed, so a frame slot
+/// uploads only those (ft-yccm0.4.2.4); equality compares content.
+#[derive(Debug, Clone)]
 pub struct CellTextGrid {
     rows: u32,
     cols: u32,
@@ -293,7 +295,17 @@ pub struct CellTextGrid {
     /// cleared rows keep their capacity.
     ring: Vec<Vec<[u8; CELL_TEXT_INSTANCE_BYTES]>>,
     len: usize,
+    changes: RowChanges,
 }
+
+impl PartialEq for CellTextGrid {
+    fn eq(&self, other: &Self) -> bool {
+        (self.rows, self.cols, self.row_offset) == (other.rows, other.cols, other.row_offset)
+            && self.ring == other.ring
+    }
+}
+
+impl Eq for CellTextGrid {}
 
 impl CellTextGrid {
     /// A grid with no instances. Ring rows are stored as `u16`, so rows past
@@ -301,15 +313,41 @@ impl CellTextGrid {
     #[must_use]
     pub fn new(extent: GridExtent) -> Self {
         let rows = usize::try_from(extent.rows).unwrap_or(usize::MAX);
+        let stored = rows.min(usize::from(u16::MAX) + 1);
         Self {
             rows: extent.rows,
             cols: extent.cols,
             row_offset: 0,
-            ring: (0..rows.min(usize::from(u16::MAX) + 1))
-                .map(|_| Vec::new())
-                .collect(),
+            ring: (0..stored).map(|_| Vec::new()).collect(),
             len: 0,
+            changes: RowChanges::new(stored),
         }
+    }
+
+    /// Which ring rows changed, and the grid instance's epoch.
+    #[must_use]
+    pub fn changes(&self) -> &RowChanges {
+        &self.changes
+    }
+
+    /// The ring rows stored: the row count, at most `u16::MAX + 1`.
+    #[must_use]
+    pub fn ring_rows(&self) -> usize {
+        self.ring.len()
+    }
+
+    /// The instances in ring row `ring_row`.
+    #[must_use]
+    pub fn ring_row_len(&self, ring_row: usize) -> usize {
+        self.ring.get(ring_row).map_or(0, Vec::len)
+    }
+
+    /// Ring row `ring_row`'s instance bytes, back to back.
+    #[must_use]
+    pub fn ring_row_instances(&self, ring_row: usize) -> &[u8] {
+        self.ring
+            .get(ring_row)
+            .map_or(&[], |row| row.as_flattened())
     }
 
     #[must_use]
@@ -355,14 +393,18 @@ impl CellTextGrid {
         let ring_row = u16::try_from(index).expect("ring rows past u16::MAX are not stored");
         self.ring[index].push(instance.with_ring_row(ring_row).0);
         self.len += 1;
+        self.changes.touch(index);
         true
     }
 
     /// Removes every instance of logical `row`.
     pub fn clear_row(&mut self, row: u32) {
-        if let Some(index) = self.ring_index(row) {
+        if let Some(index) = self.ring_index(row)
+            && !self.ring[index].is_empty()
+        {
             self.len -= self.ring[index].len();
             self.ring[index].clear();
+            self.changes.touch(index);
         }
     }
 
@@ -386,6 +428,22 @@ impl CellTextGrid {
         let rotated = (u64::from(self.row_offset) + u64::from(lines)) % u64::from(self.rows);
         self.row_offset = u32::try_from(rotated).expect("the offset is below the row count");
         for row in self.rows - lines..self.rows {
+            self.clear_row(row);
+        }
+    }
+
+    /// Scrolls the content down by `lines`, like
+    /// [`crate::cell_bg::CellBgGrid::scroll_down`]: only `row_offset` moves,
+    /// and the `lines` rows exposed at the top are emptied.
+    pub fn scroll_down(&mut self, lines: u32) {
+        if self.rows == 0 {
+            return;
+        }
+        let lines = lines.min(self.rows);
+        let rows = u64::from(self.rows);
+        let rotated = (u64::from(self.row_offset) + rows - u64::from(lines) % rows) % rows;
+        self.row_offset = u32::try_from(rotated).expect("the offset is below the row count");
+        for row in 0..lines {
             self.clear_row(row);
         }
     }

@@ -18,6 +18,7 @@
 //! the GPU's pixels against it.
 
 use crate::frame::{FrameUniforms, GridExtent};
+use crate::uploads::RowChanges;
 
 /// The Metal Shading Language source of the background pass.
 pub const BACKGROUND_SHADER: &str = include_str!("shaders/background.metal");
@@ -95,14 +96,25 @@ impl CellBg {
 }
 
 /// One pane's cell backgrounds, stored as a ring of rows exactly as the
-/// shader reads them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// shader reads them. [`RowChanges`] tracks which ring rows changed, so a
+/// frame slot uploads only those (ft-yccm0.4.2.4); equality compares content.
+#[derive(Debug, Clone)]
 pub struct CellBgGrid {
     rows: u32,
     cols: u32,
     row_offset: u32,
     bytes: Vec<u8>,
+    changes: RowChanges,
 }
+
+impl PartialEq for CellBgGrid {
+    fn eq(&self, other: &Self) -> bool {
+        (self.rows, self.cols, self.row_offset) == (other.rows, other.cols, other.row_offset)
+            && self.bytes == other.bytes
+    }
+}
+
+impl Eq for CellBgGrid {}
 
 impl CellBgGrid {
     /// A grid of default backgrounds.
@@ -114,7 +126,22 @@ impl CellBgGrid {
             cols: extent.cols,
             row_offset: 0,
             bytes: vec![0; cells.saturating_mul(4)],
+            changes: RowChanges::new(usize::try_from(extent.rows).unwrap_or(usize::MAX)),
         }
+    }
+
+    /// Which ring rows changed, and the grid instance's epoch.
+    #[must_use]
+    pub fn changes(&self) -> &RowChanges {
+        &self.changes
+    }
+
+    /// Ring row `ring_row`'s bytes, as the CellBg buffer holds them.
+    #[must_use]
+    pub fn ring_row_bytes(&self, ring_row: usize) -> &[u8] {
+        let row = self.cols as usize * 4;
+        let start = ring_row.saturating_mul(row).min(self.bytes.len());
+        &self.bytes[start..start.saturating_add(row).min(self.bytes.len())]
     }
 
     #[must_use]
@@ -159,7 +186,11 @@ impl CellBgGrid {
     pub fn set(&mut self, row: u32, col: u32, background: CellBg) -> bool {
         match self.index(row, col) {
             Some(at) => {
-                self.bytes[at..at + 4].copy_from_slice(&background.bytes());
+                let bytes = background.bytes();
+                if self.bytes[at..at + 4] != bytes {
+                    self.bytes[at..at + 4].copy_from_slice(&bytes);
+                    self.changes.touch(self.ring_row(row) as usize);
+                }
                 true
             }
             None => false,
@@ -196,6 +227,23 @@ impl CellBgGrid {
         let rotated = (u64::from(self.row_offset) + u64::from(lines)) % u64::from(self.rows);
         self.row_offset = u32::try_from(rotated).expect("the offset is below the row count");
         for row in self.rows - lines..self.rows {
+            self.fill_row(row, CellBg::DEFAULT);
+        }
+    }
+
+    /// Scrolls the content down by `lines` (scrollback navigation): logical
+    /// row `r + lines` now shows what row `r` showed. Only `row_offset`
+    /// moves; the `lines` rows exposed at the top are reset to the default
+    /// background.
+    pub fn scroll_down(&mut self, lines: u32) {
+        if self.rows == 0 {
+            return;
+        }
+        let lines = lines.min(self.rows);
+        let rows = u64::from(self.rows);
+        let rotated = (u64::from(self.row_offset) + rows - u64::from(lines) % rows) % rows;
+        self.row_offset = u32::try_from(rotated).expect("the offset is below the row count");
+        for row in 0..lines {
             self.fill_row(row, CellBg::DEFAULT);
         }
     }
