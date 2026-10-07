@@ -39,7 +39,7 @@
     }
   ],
   "font_set_sha": "sha256:9b73d400a32f66d074dc9f1d66c4ad79a4508b7f18e46a0e96ea5420e0518c49",
-  "generated_at_runner": "Metal (in development: background clear only, metal4 submission) on Apple M4 Pro (Apple9, Metal3, Mac2, unified memory) FrankenTerm version: FrankenTerm 0.15.21 (1cbb9d458751105757c36d2750970a375de60f4b)",
+  "generated_at_runner": "Metal (in development: background clear only, metal4 submission) on Apple M4 Pro (Apple9, Metal3, Mac2, unified memory) FrankenTerm version: FrankenTerm 0.15.21 (37f3329ffe97aa33517a54ebe11adc909b82a36a)",
   "harness_version": 1,
   "rasterizer": "frankenterm-gui WebGpu front end; FreeType rasterizer; HarfBuzz shaper",
   "texture_format": "presented surface (RGBA8 readback)",

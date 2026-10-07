@@ -337,8 +337,9 @@ fn a_dimmed_pane_is_its_undimmed_pixels_through_apply_hsb() {
     let dimmed = render(Some(hsb));
     assert_ne!(plain, dimmed, "dimming changed nothing");
     for (index, (plain, dimmed)) in plain.chunks(4).zip(dimmed.chunks(4)).enumerate() {
-        let [b, g, r, a] = [plain[0], plain[1], plain[2], plain[3]].map(|c| f32::from(c) / 255.0);
-        let expected = crate::cell_bg::to_bgra8(apply_hsb([r, g, b, a], hsb));
+        // Dimming applies to linear light (ft-yccm0.4.7.3).
+        let rgba = crate::color::from_srgb_bgra8([plain[0], plain[1], plain[2], plain[3]]);
+        let expected = crate::cell_bg::to_bgra8(apply_hsb(rgba, hsb));
         for channel in 0..4 {
             let delta = i16::from(dimmed[channel]) - i16::from(expected[channel]);
             assert!(

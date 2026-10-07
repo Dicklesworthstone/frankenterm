@@ -4,6 +4,12 @@
 // the color atlas and draws the underline, overline and strikethrough itself,
 // so decorations need no extra quads. `shade_text` in src/cell_text.rs is the
 // CPU reference of this shader; keep the two identical.
+//
+// Colors (ft-yccm0.4.7.3): the target is BGRA8Unorm_sRGB and blends in linear
+// light, as the WebGpu renderer's sRGB surface does, so glyph edges match it.
+// Instance colors are sRGB bytes, decoded through SRGB_TO_LINEAR (compiled in
+// front of this source by src/color.rs); the color atlas is BGRA8Unorm_sRGB,
+// so sampling decodes it.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -14,7 +20,7 @@ struct FrameUniforms {
     uint2 viewport;                 // 8
     uint2 grid;                     // 16: rows, cols
     uint2 reserved0;                // 24
-    float4 clear;                   // 32: premultiplied default background
+    float4 clear;                   // 32: premultiplied linear default background
     float2 cell_size;               // 48: pixels
     float2 grid_origin;             // 56: pixels (left and top padding)
     uint row_offset;                // 64: ring offset of every row
@@ -108,8 +114,11 @@ vertex TextVertex text_vertex(uint vertex_id [[vertex_id]],
     out.glyph_origin = glyph_origin;
     out.glyph_size = glyph_size;
     out.atlas_origin = float2(cell.atlas);
-    out.fg = float4(cell.fg) / 255.0;
-    out.decoration = float3(cell.decoration.rgb) / 255.0;
+    out.fg = float4(SRGB_TO_LINEAR[cell.fg.r], SRGB_TO_LINEAR[cell.fg.g],
+                    SRGB_TO_LINEAR[cell.fg.b], float(cell.fg.a) / 255.0);
+    out.decoration = float3(SRGB_TO_LINEAR[cell.decoration.r],
+                            SRGB_TO_LINEAR[cell.decoration.g],
+                            SRGB_TO_LINEAR[cell.decoration.b]);
     out.flags = flags;
     return out;
 }
@@ -207,8 +216,13 @@ fragment float4 text_fragment(TextVertex in [[stage_in]],
         float2 at = in.atlas_origin + floor(inner) + 0.5;
         float4 glyph;
         if (atlas == FLAG_ATLAS_COLOR) {
-            // Color glyphs are premultiplied and keep their own colors.
-            glyph = color.sample(texel, at) * alpha;
+            // Color glyphs keep their own colors. Their texels are
+            // premultiplied sRGB, decoded by the sRGB atlas and weighted by
+            // their own alpha, as the WebGpu path blends them (straight
+            // alpha).
+            float4 texel_color = color.sample(texel, at);
+            float weight = texel_color.a * alpha;
+            glyph = float4(texel_color.rgb * weight, weight);
         } else {
             float coverage = gray.sample(texel, at).r * alpha;
             glyph = float4(in.fg.rgb * coverage, coverage);

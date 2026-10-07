@@ -3,6 +3,12 @@
 // and composites its color, the selection and search tints and the cursor.
 // No per-cell geometry. `shade_background` in src/cell_bg.rs is the CPU
 // reference of this shader; keep the two identical.
+//
+// Colors (ft-yccm0.4.7.3): the target is BGRA8Unorm_sRGB, so this shader
+// writes premultiplied linear light, which the GPU encodes on store, as the
+// WebGpu renderer's sRGB surface does. Cell bytes are sRGB and are decoded
+// through SRGB_TO_LINEAR, which src/color.rs compiles in front of this
+// source. The uniform colors arrive in linear light (FrameUniforms::to_bytes).
 
 #include <metal_stdlib>
 using namespace metal;
@@ -13,7 +19,7 @@ struct FrameUniforms {
     uint2 viewport;          // 8
     uint2 grid;              // 16: rows, cols
     uint2 reserved0;         // 24
-    float4 clear;            // 32: premultiplied default background
+    float4 clear;            // 32: premultiplied linear default background
     float2 cell_size;        // 48: pixels
     float2 grid_origin;      // 56: pixels (left and top padding)
     uint row_offset;         // 64: CellBg ring offset
@@ -97,7 +103,7 @@ fragment float4 bg_fragment(BackgroundVertex in [[stage_in]],
     uint ring_row = (row + u.row_offset) % rows;
     uchar4 cell = cells[ring_row * cols + col];
     float4 color = (cell.a & FLAG_COLOR) != 0
-        ? float4(float3(cell.rgb) / 255.0, 1.0)
+        ? float4(SRGB_TO_LINEAR[cell.r], SRGB_TO_LINEAR[cell.g], SRGB_TO_LINEAR[cell.b], 1.0)
         : u.clear;
     if ((cell.a & FLAG_SELECTED) != 0) {
         color = over(u.selection_tint, color);

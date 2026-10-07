@@ -329,9 +329,10 @@ pub(crate) fn over(top: [f32; 4], bottom: [f32; 4]) -> [f32; 4] {
 }
 
 /// The CPU reference of the background fragment shader: the premultiplied
-/// color it writes at framebuffer position `(x, y)` (a pixel center, as
-/// Metal's `[[position]]`), or `None` where it discards (outside the grid:
-/// padding and scrollbar keep the cleared background).
+/// linear-light color it writes at framebuffer position `(x, y)` (a pixel
+/// center, as Metal's `[[position]]`), or `None` where it discards (outside
+/// the grid: padding and scrollbar keep the cleared background).
+/// [`to_bgra8`] gives the bytes the sRGB target stores for it.
 ///
 /// `cells` must be the grid the frame uploaded, with
 /// `uniforms.grid == cells.extent()` and
@@ -361,22 +362,25 @@ pub fn shade_background(
         return None;
     }
     let cell = cells.get(row, col)?;
+    // Everything blends in linear light (ft-yccm0.4.7.3): the cell's sRGB
+    // bytes are decoded, and the uniform colors are what `to_bytes` writes.
+    let linear = crate::color::linear_premultiplied;
     let mut color = match cell.color() {
         Some([red, green, blue]) => [
-            f32::from(red) / 255.0,
-            f32::from(green) / 255.0,
-            f32::from(blue) / 255.0,
+            crate::color::byte_to_linear(red),
+            crate::color::byte_to_linear(green),
+            crate::color::byte_to_linear(blue),
             1.0,
         ],
-        None => uniforms.clear,
+        None => linear(uniforms.clear),
     };
     if cell.flags() & flags::SELECTED != 0 {
-        color = over(background.selection_tint, color);
+        color = over(linear(background.selection_tint), color);
     }
     if cell.flags() & flags::CURRENT_MATCH != 0 {
-        color = over(background.current_match_tint, color);
+        color = over(linear(background.current_match_tint), color);
     } else if cell.flags() & flags::SEARCH_MATCH != 0 {
-        color = over(background.search_tint, color);
+        color = over(linear(background.search_tint), color);
     }
     let cursor = &background.cursor;
     if cursor.shape != CursorShape::Hidden
@@ -402,7 +406,7 @@ pub fn shade_background(
             CursorShape::Bar => cursor_x < thickness,
         };
         if inside {
-            color = over(cursor.color, color);
+            color = over(linear(cursor.color), color);
         }
     }
     Some(color)
@@ -466,18 +470,11 @@ fn hsv_to_rgb(hsv: [f32; 3]) -> [f32; 3] {
     [channel(konst[0]), channel(konst[1]), channel(konst[2])]
 }
 
-/// A premultiplied float color as the `BGRA8Unorm` bytes the GPU stores.
+/// A premultiplied linear-light color, as the shaders write it, in the
+/// `BGRA8Unorm_sRGB` bytes the GPU stores (ft-yccm0.4.7.3).
 #[must_use]
-// Clamped to 0.0..=255.0 before the cast.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn to_bgra8(color: [f32; 4]) -> [u8; 4] {
-    let byte = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
-    [
-        byte(color[2]),
-        byte(color[1]),
-        byte(color[0]),
-        byte(color[3]),
-    ]
+    crate::color::to_srgb_bgra8(color)
 }
 
 #[cfg(test)]
@@ -488,6 +485,11 @@ mod tests {
     const CELL: [f32; 2] = [8.0, 16.0];
     const ORIGIN: [f32; 2] = [4.0, 2.0];
     const CLEAR: [f32; 4] = [0.1, 0.2, 0.3, 1.0];
+
+    /// What the shader writes for the clear color: linear light.
+    fn cleared() -> [f32; 4] {
+        crate::color::linear_premultiplied(CLEAR)
+    }
 
     fn uniforms(cells: &CellBgGrid, cursor: CursorUniform) -> FrameUniforms {
         FrameUniforms {
@@ -616,7 +618,7 @@ mod tests {
             None,
             "bottom padding"
         );
-        assert_eq!(shade_background(&u, &cells, 83.5, 97.5), Some(CLEAR));
+        assert_eq!(shade_background(&u, &cells, 83.5, 97.5), Some(cleared()));
     }
 
     #[test]
@@ -625,12 +627,15 @@ mod tests {
         cells.set(2, 3, CellBg::rgb(255, 0, 51));
         let u = uniforms(&cells, CursorUniform::default());
         let (x, y) = center(2, 3);
+        // Linear light: sRGB 51 (0.2) is about 3% of the light.
+        let blue = crate::color::byte_to_linear(51);
+        assert!((blue - 0.033_104_76).abs() < 1e-6, "{blue}");
         assert_eq!(
             shade_background(&u, &cells, x, y),
-            Some([1.0, 0.0, 0.2, 1.0])
+            Some([1.0, 0.0, blue, 1.0])
         );
         let (x, y) = center(2, 4);
-        assert_eq!(shade_background(&u, &cells, x, y), Some(CLEAR));
+        assert_eq!(shade_background(&u, &cells, x, y), Some(cleared()));
     }
 
     #[test]
@@ -655,18 +660,25 @@ mod tests {
         cells.set(0, 2, CellBg::rgb(0, 0, 0).search_match());
         let u = uniforms(&cells, CursorUniform::default());
         let (x, y) = center(0, 0);
+        let linear = crate::color::linear_premultiplied;
         let selected = shade_background(&u, &cells, x, y).unwrap();
-        assert_eq!(selected, over(u.background.selection_tint, CLEAR));
+        assert_eq!(
+            selected,
+            over(linear(u.background.selection_tint), cleared())
+        );
         let (x, y) = center(0, 1);
         assert_eq!(
             shade_background(&u, &cells, x, y),
-            Some(over(u.background.current_match_tint, [0.0, 0.0, 0.0, 1.0])),
+            Some(over(
+                linear(u.background.current_match_tint),
+                [0.0, 0.0, 0.0, 1.0]
+            )),
             "the current match wins over the plain search tint"
         );
         let (x, y) = center(0, 2);
         assert_eq!(
             shade_background(&u, &cells, x, y),
-            Some(over(u.background.search_tint, [0.0, 0.0, 0.0, 1.0]))
+            Some(over(linear(u.background.search_tint), [0.0, 0.0, 0.0, 1.0]))
         );
     }
 
@@ -687,7 +699,7 @@ mod tests {
         let block = uniforms(&cells, cursor(CursorShape::Block, 1));
         assert_eq!(shade(&block, 28.5, 18.5), white);
         assert_eq!(shade(&block, 35.5, 33.5), white);
-        assert_eq!(shade(&block, 36.5, 25.5), CLEAR, "the next cell");
+        assert_eq!(shade(&block, 36.5, 25.5), cleared(), "the next cell");
         let wide = uniforms(&cells, cursor(CursorShape::Block, 2));
         assert_eq!(
             shade(&wide, 36.5, 25.5),
@@ -697,23 +709,25 @@ mod tests {
         let underline = uniforms(&cells, cursor(CursorShape::Underline, 1));
         assert_eq!(shade(&underline, 30.5, 33.5), white);
         assert_eq!(shade(&underline, 30.5, 32.5), white);
-        assert_eq!(shade(&underline, 30.5, 31.5), CLEAR);
+        assert_eq!(shade(&underline, 30.5, 31.5), cleared());
         let bar = uniforms(&cells, cursor(CursorShape::Bar, 1));
         assert_eq!(shade(&bar, 29.5, 25.5), white);
-        assert_eq!(shade(&bar, 30.5, 25.5), CLEAR);
+        assert_eq!(shade(&bar, 30.5, 25.5), cleared());
         let hollow = uniforms(&cells, cursor(CursorShape::HollowBlock, 1));
         assert_eq!(shade(&hollow, 28.5, 25.5), white, "left edge");
         assert_eq!(shade(&hollow, 35.5, 25.5), white, "right edge");
         assert_eq!(shade(&hollow, 31.5, 18.5), white, "top edge");
         assert_eq!(shade(&hollow, 31.5, 33.5), white, "bottom edge");
-        assert_eq!(shade(&hollow, 31.5, 25.5), CLEAR, "interior");
+        assert_eq!(shade(&hollow, 31.5, 25.5), cleared(), "interior");
         let hidden = uniforms(&cells, cursor(CursorShape::Hidden, 1));
-        assert_eq!(shade(&hidden, 31.5, 25.5), CLEAR);
+        assert_eq!(shade(&hidden, 31.5, 25.5), cleared());
     }
 
     #[test]
-    fn premultiplied_colors_round_to_bgra8_like_the_gpu() {
-        assert_eq!(to_bgra8([1.0, 0.5, 0.2, 1.0]), [51, 128, 255, 255]);
+    fn linear_colors_are_stored_as_srgb_bytes_like_the_gpu() {
+        // Linear 0.5 and 0.2 encode to sRGB 188 and 124; alpha is stored as is.
+        assert_eq!(to_bgra8([1.0, 0.5, 0.2, 1.0]), [124, 188, 255, 255]);
+        assert_eq!(to_bgra8([0.0, 0.0, 0.0, 0.5]), [0, 0, 0, 128]);
         assert_eq!(to_bgra8([2.0, -1.0, 0.0, 0.0]), [0, 0, 255, 0]);
     }
 

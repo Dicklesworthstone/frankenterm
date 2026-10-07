@@ -552,9 +552,17 @@ fn shade_instance(
         span_cells * background.cell_size[0],
         background.cell_size[1],
     ];
-    let fg = cell.fg().map(unit);
+    // Instance colors are sRGB bytes, decoded to linear light; alpha is
+    // linear (ft-yccm0.4.7.3).
+    let [red, green, blue, alpha] = cell.fg();
+    let fg = [
+        crate::color::byte_to_linear(red),
+        crate::color::byte_to_linear(green),
+        crate::color::byte_to_linear(blue),
+        unit(alpha),
+    ];
     let alpha = fg[3];
-    let underline_rgb = cell.underline_color().map(unit);
+    let underline_rgb = cell.underline_color().map(crate::color::byte_to_linear);
     let underline_color = [
         underline_rgb[0] * alpha,
         underline_rgb[1] * alpha,
@@ -598,13 +606,18 @@ fn shade_instance(
             u32::from(origin[1]) + inner[1].floor() as u32,
         );
         let glyph = match kind {
-            // Stored [B, G, R, A], premultiplied; sampled as RGBA.
-            AtlasKind::Color => [
-                unit(texel[2]) * alpha,
-                unit(texel[1]) * alpha,
-                unit(texel[0]) * alpha,
-                unit(texel[3]) * alpha,
-            ],
+            // Stored [B, G, R, A], premultiplied sRGB. As on the WebGpu path,
+            // the sRGB atlas decodes the color and it is weighted by its own
+            // alpha (WebGpu blends the texel as straight alpha).
+            AtlasKind::Color => {
+                let weight = unit(texel[3]) * alpha;
+                [
+                    crate::color::byte_to_linear(texel[2]) * weight,
+                    crate::color::byte_to_linear(texel[1]) * weight,
+                    crate::color::byte_to_linear(texel[0]) * weight,
+                    weight,
+                ]
+            }
             AtlasKind::Grayscale => {
                 let coverage = unit(texel[0]) * alpha;
                 [
@@ -631,16 +644,18 @@ fn shade_instance(
     (out[3] > 0.0).then_some(out)
 }
 
-/// `color` as the 8-bit render target stores it.
+/// `color` (linear light) as the sRGB target stores it and the next blend
+/// reads it back: encoded to 8-bit sRGB and decoded again.
 fn to_target(color: [f32; 4]) -> [f32; 4] {
-    color.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() / 255.0)
+    crate::color::from_srgb_bgra8(crate::color::to_srgb_bgra8(color))
 }
 
-/// The CPU reference of the text pass: the premultiplied color at pixel
-/// center `(x, y)` after every instance of `text` is blended, in draw order,
-/// over `under` (what the background pass left there, as the 8-bit target
-/// holds it). Every blend lands in the 8-bit target before the next instance
-/// reads it, so the reference rounds after each one, like the GPU.
+/// The CPU reference of the text pass: the premultiplied linear-light color
+/// at pixel center `(x, y)` after every instance of `text` is blended, in
+/// draw order, over `under` (what the background pass left there, as the
+/// sRGB target holds it, in linear light). Every blend lands in the 8-bit
+/// target before the next instance reads it, so the reference encodes and
+/// decodes after each one, like the GPU.
 ///
 /// `atlas(kind, x, y)` returns the atlas texel's stored bytes: the coverage
 /// in byte 0 for [`AtlasKind::Grayscale`], `[B, G, R, A]` premultiplied for
@@ -922,7 +937,8 @@ mod tests {
             1,
             CellText::new(2, fg).with_glyph(&slot(AtlasKind::Grayscale, 10, 20, 3, 4), [2, 5]),
         );
-        let tinted = [1.0, 128.0 / 255.0, 0.0, 1.0];
+        // In linear light (ft-yccm0.4.7.3): sRGB 128 decoded.
+        let tinted = [1.0, crate::color::byte_to_linear(128), 0.0, 1.0];
         assert_eq!(shade(&text, at(1, 2, 2.0, 5.0)), tinted);
         assert_eq!(shade(&text, at(1, 2, 4.0, 8.0)), tinted);
         assert_eq!(shade(&text, at(1, 2, 1.0, 5.0)), UNDER, "left of the glyph");
@@ -944,9 +960,11 @@ mod tests {
                 .with_glyph(&glyph, [0, 0])
                 .wide(),
         );
-        // The texel under (row 0, x 9, y 3) is (49, 53): [B, G, R] = [49, 53, 7].
+        // The texel under (row 0, x 9, y 3) is (49, 53): [B, G, R] = [49, 53, 7],
+        // decoded to linear light as the sRGB atlas samples it.
         let opaque = shade(&text, at(0, 0, 9.0, 3.0));
-        assert_eq!(opaque, [7.0 / 255.0, 53.0 / 255.0, 49.0 / 255.0, 1.0]);
+        let decode = crate::color::byte_to_linear;
+        assert_eq!(opaque, [decode(7), decode(53), decode(49), 1.0]);
         let mut faded = CellTextGrid::new(GridExtent::new(2, 4));
         faded.push(
             0,
@@ -956,7 +974,8 @@ mod tests {
         );
         let color = shade(&faded, at(0, 0, 9.0, 3.0));
         let alpha = 51.0 / 255.0;
-        // Within the 8-bit target's rounding.
+        // Within the 8-bit sRGB target's rounding, which at these dark
+        // levels is finer than half a linear step.
         for (got, want) in color[..3].iter().zip(&opaque[..3]) {
             assert!(
                 (got - want * alpha).abs() <= 0.5 / 255.0 + 1e-6,
@@ -1097,11 +1116,15 @@ mod tests {
         let half_white = [255, 255, 255, 128];
         text.push(0, CellText::new(0, [255, 0, 0, 255]).with_overline());
         text.push(0, CellText::new(0, half_white).with_overline());
-        // Half-transparent white over opaque red.
+        // Half-transparent white over opaque red, blended in linear light and
+        // stored sRGB-encoded (ft-yccm0.4.7.3).
         let alpha = 128.0 / 255.0;
         let got = shade(&text, at(0, 0, 0.0, 0.0));
-        for (got, want) in got.iter().zip([1.0, alpha, alpha, 1.0]) {
+        for (got, want) in got.iter().zip(to_target([1.0, alpha, alpha, 1.0])) {
             assert!((got - want).abs() < 1e-6, "{got} vs {want}");
         }
+        // Green and blue land at sRGB 188, where blending the encoded values
+        // (as a BGRA8Unorm target does) would give 128.
+        assert_eq!(crate::color::to_srgb_bgra8(got), [188, 188, 255, 255]);
     }
 }

@@ -45,6 +45,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+/// Every Metal frame's target: the layer's drawables, the offscreen
+/// readback textures and the pipelines' color attachment. sRGB, so the GPU
+/// blends in linear light and stores sRGB-encoded bytes, as the WebGpu
+/// renderer's sRGB surface does (ft-yccm0.4.7.3, [`crate::color`]).
+pub(crate) const TARGET_PIXEL_FORMAT: MTLPixelFormat = MTLPixelFormat::BGRA8Unorm_sRGB;
+
 /// Storage of every per-frame buffer: CPU-visible unified memory that the
 /// CPU only writes, so write-combined (uncached CPU reads are slow, writes
 /// stream straight to memory).
@@ -770,11 +776,12 @@ impl FrameSlots {
         }
         let (width_px, height_px) = (width as usize, height as usize);
         #[allow(unsafe_code)]
-        // SAFETY: FFI-EXTENT. BGRA8Unorm is color-renderable and the extent
-        // was checked to be within 1..=MAX_TEXTURE_EXTENT on both axes above.
+        // SAFETY: FFI-EXTENT. BGRA8Unorm_sRGB is color-renderable and the
+        // extent was checked to be within 1..=MAX_TEXTURE_EXTENT on both axes
+        // above.
         let descriptor = unsafe {
             MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
-                MTLPixelFormat::BGRA8Unorm,
+                TARGET_PIXEL_FORMAT,
                 width_px,
                 height_px,
                 false,
@@ -1042,11 +1049,13 @@ fn configure_clear(
     attachment.setTexture(Some(target));
     attachment.setLoadAction(MTLLoadAction::Clear);
     attachment.setStoreAction(MTLStoreAction::Store);
+    // The sRGB target takes the clear in linear light (ft-yccm0.4.7.3).
+    let [red, green, blue, alpha] = color.to_linear();
     attachment.setClearColor(MTLClearColor {
-        red: color.red,
-        green: color.green,
-        blue: color.blue,
-        alpha: color.alpha,
+        red,
+        green,
+        blue,
+        alpha,
     });
 }
 
@@ -1332,8 +1341,10 @@ fn scissor(rect: crate::PixelRect) -> MTLScissorRect {
     }
 }
 
-/// A render pipeline drawing into BGRA8Unorm, compiled from `source`;
-/// `blended` enables premultiplied source-over onto what is already there.
+/// A render pipeline drawing into [`TARGET_PIXEL_FORMAT`], compiled from
+/// `source` behind [`crate::color::shader_prelude`] (the sRGB decoding
+/// table); `blended` enables premultiplied source-over onto what is already
+/// there, in linear light.
 fn render_pipeline(
     device: &ProtocolObject<dyn MTLDevice>,
     pass: &str,
@@ -1342,8 +1353,9 @@ fn render_pipeline(
     fragment: &NSString,
     blended: bool,
 ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>, String> {
+    let source = format!("{}{source}", crate::color::shader_prelude());
     let library = device
-        .newLibraryWithSource_options_error(&NSString::from_str(source), None)
+        .newLibraryWithSource_options_error(&NSString::from_str(&source), None)
         .map_err(|error| {
             format!(
                 "the {pass} shader did not compile: {}",
@@ -1366,7 +1378,7 @@ fn render_pipeline(
     // SAFETY: FFI-INDEX. Index 0 is below the eight color attachments every
     // Metal device exposes, and the array creates the descriptor on access.
     let attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
-    attachment.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+    attachment.setPixelFormat(TARGET_PIXEL_FORMAT);
     if blended {
         attachment.setBlendingEnabled(true);
         attachment.setSourceRGBBlendFactor(MTLBlendFactor::One);
@@ -1960,7 +1972,7 @@ mod tests {
     use crate::frame::{FrameUniforms, SlotState, UNIFORMS_BYTES};
     use objc2::Message;
     use objc2_metal::{
-        MTLBlitCommandEncoder, MTLCPUCacheMode, MTLPixelFormat, MTLSharedEvent, MTLStorageMode,
+        MTLBlitCommandEncoder, MTLCPUCacheMode, MTLSharedEvent, MTLStorageMode,
         MTLTextureDescriptor, MTLTextureUsage,
     };
 
@@ -2006,11 +2018,11 @@ mod tests {
         device: &ProtocolObject<dyn MTLDevice>,
     ) -> Retained<ProtocolObject<dyn MTLTexture>> {
         #[allow(unsafe_code)]
-        // SAFETY: FFI-EXTENT. BGRA8Unorm is color-renderable and 64x64 is
-        // within the Apple-family 2D texture limit.
+        // SAFETY: FFI-EXTENT. BGRA8Unorm_sRGB is color-renderable and 64x64
+        // is within the Apple-family 2D texture limit.
         let descriptor = unsafe {
             MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
-                MTLPixelFormat::BGRA8Unorm,
+                TARGET_PIXEL_FORMAT,
                 64,
                 64,
                 false,
@@ -2622,11 +2634,12 @@ mod tests {
             } else {
                 Submission::metal3(device.newCommandQueue().unwrap(), &frames)
             };
+            // sRGB color atlas, as the renderer makes it (ft-yccm0.4.7.3).
             let mut atlases = GlyphAtlases::new(
                 &metal,
                 small_atlas(AtlasKind::Grayscale),
                 small_atlas(AtlasKind::Color),
-                false,
+                true,
                 private_ledger(),
             )
             .unwrap();
@@ -2819,22 +2832,19 @@ mod tests {
         text
     }
 
-    /// The color the GPU blends onto: the background pass's 8-bit output.
+    /// The color the GPU blends onto: the background pass's 8-bit sRGB
+    /// output, read back in linear light.
     fn from_bgra8(bytes: [u8; 4]) -> [f32; 4] {
-        let unit = |byte: u8| f32::from(byte) / 255.0;
-        [
-            unit(bytes[2]),
-            unit(bytes[1]),
-            unit(bytes[0]),
-            unit(bytes[3]),
-        ]
+        crate::color::from_srgb_bgra8(bytes)
     }
 
     /// Renders `text` over the background scene and compares every pixel
     /// with the CPU reference (`shade_background`, then `shade_text`).
-    /// Pixels may differ by more than one step only inside `loose` (the
-    /// curly underline's cell, where `sin` rounding can move a boundary
-    /// pixel), at most four of them. Returns the pixels compared.
+    /// Pixels may differ by one step; by two on at most 1% of the pixels
+    /// (sRGB blending precision, see [`render_grids_and_compare`]); and by
+    /// more only inside `loose` (the curly underline's cell, where `sin`
+    /// rounding can move a boundary pixel), at most four of them. Returns
+    /// the pixels compared.
     fn render_text_and_compare(
         fixture: &mut TextFixture,
         text: &CellTextGrid,
@@ -2879,7 +2889,7 @@ mod tests {
             text: uniforms,
             ..FrameUniforms::default()
         };
-        let (mut compared, mut loose_misses) = (0, 0);
+        let (mut compared, mut loose_misses, mut blend_misses) = (0, 0, 0);
         for y in 0..BG_HEIGHT {
             for x in 0..BG_WIDTH {
                 let center = |v: usize| f32::from(u16::try_from(v).unwrap()) + 0.5;
@@ -2906,6 +2916,16 @@ mod tests {
                 if off <= 1 {
                     continue;
                 }
+                // Apple GPUs blend into sRGB targets at a coarser internal
+                // precision than this f32 reference (ft-yccm0.4.7.3), so a
+                // blended dark channel, where sRGB codes are densest, can
+                // land two codes away. On an M4 Pro every such miss was
+                // exactly 2, in either direction. The WebGpu path blends into
+                // the same sRGB targets on the same GPU.
+                if off == 2 {
+                    blend_misses += 1;
+                    continue;
+                }
                 let in_loose = loose.is_some_and(|(row, col)| {
                     let left = background.grid_origin[0] + col as f32 * background.cell_size[0];
                     let top = background.grid_origin[1] + row as f32 * background.cell_size[1];
@@ -2922,6 +2942,10 @@ mod tests {
         assert!(
             loose_misses <= 4,
             "{loose_misses} curly boundary pixels differ"
+        );
+        assert!(
+            blend_misses * 100 <= compared,
+            "{blend_misses} of {compared} pixels are two codes from the reference"
         );
         compared
     }

@@ -2,7 +2,8 @@
 //!
 //! The renderer keeps two atlases: [`AtlasKind::Grayscale`] (an `R8Unorm`
 //! texture, one byte per pixel, for ordinary glyph coverage) and
-//! [`AtlasKind::Color`] (a `BGRA8Unorm` texture for color emoji and images),
+//! [`AtlasKind::Color`] (a `BGRA8Unorm_sRGB` texture for color emoji and
+//! images, decoded to linear light when sampled),
 //! so grayscale glyphs no longer pay four bytes per pixel. Each starts at
 //! [`DEFAULT_ATLAS_EXTENT`] squared, large enough that the T0 emoji set fits
 //! without churn, instead of starting tiny and rebuilding.
@@ -47,7 +48,8 @@ pub const MAX_ATLAS_EXTENT: u32 = crate::MAX_TEXTURE_EXTENT;
 pub enum AtlasKind {
     /// Glyph coverage, one byte per pixel (`R8Unorm`).
     Grayscale,
-    /// Color glyphs and images, `[B, G, R, A]` per pixel (`BGRA8Unorm`).
+    /// Color glyphs and images, premultiplied sRGB `[B, G, R, A]` per pixel
+    /// (`BGRA8Unorm_sRGB` in the renderer).
     Color,
 }
 

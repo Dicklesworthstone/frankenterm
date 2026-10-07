@@ -198,6 +198,7 @@ use std::time::Duration;
 pub mod atlas;
 pub mod cell_bg;
 pub mod cell_text;
+pub mod color;
 pub mod frame;
 pub mod uploads;
 pub use atlas::{AtlasError, AtlasKind, AtlasSlot};
@@ -675,12 +676,14 @@ pub enum FrameOutcome {
     DrawableResized,
 }
 
-/// A render-pass clear color, premultiplied, for a `BGRA8Unorm` target.
+/// A render-pass clear color, premultiplied, sRGB-encoded.
 ///
-/// The components are sRGB-encoded values written to the framebuffer as-is:
-/// `BGRA8Unorm` applies no transfer function, so the stored bytes match the
-/// configured color exactly. Core Animation composites layers with
-/// premultiplied alpha, so straight alpha is premultiplied on construction.
+/// Metal frames render into `BGRA8Unorm_sRGB` targets (ft-yccm0.4.7.3): a
+/// clear passes the color in linear light ([`Self::to_linear`]) and the GPU
+/// stores it sRGB-encoded again ([`Self::to_bgra8`]), so an opaque color's
+/// stored bytes match the configured color exactly. Core Animation
+/// composites layers with premultiplied alpha, so straight alpha is
+/// premultiplied on construction.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClearColor {
     pub red: f64,
@@ -724,19 +727,18 @@ impl ClearColor {
         ]
     }
 
-    /// The `[B, G, R, A]` bytes a `BGRA8Unorm` clear stores, rounding each
-    /// component to the nearest 8-bit value as Metal's unorm conversion does.
+    /// The premultiplied components in linear light, `[red, green, blue,
+    /// alpha]`: what a clear of an sRGB target takes.
     #[must_use]
-    // The clamp bounds the rounded value to 0.0..=255.0, so the cast is exact.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn to_linear(self) -> [f64; 4] {
+        color::linear_premultiplied(self.to_f32()).map(f64::from)
+    }
+
+    /// The `[B, G, R, A]` bytes a `BGRA8Unorm_sRGB` clear stores: the linear
+    /// color encoded and rounded to the nearest 8-bit value.
+    #[must_use]
     pub fn to_bgra8(self) -> [u8; 4] {
-        let byte = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
-        [
-            byte(self.blue),
-            byte(self.green),
-            byte(self.red),
-            byte(self.alpha),
-        ]
+        color::to_srgb_bgra8(color::linear_premultiplied(self.to_f32()))
     }
 }
 
@@ -991,6 +993,24 @@ mod tests {
             ClearColor::from_srgba(0.0, 0.0, 0.0, 0.0).to_bgra8(),
             [0; 4]
         );
+    }
+
+    /// ft-yccm0.4.7.3: an sRGB target is cleared with linear light, and
+    /// stores the configured sRGB bytes again.
+    #[test]
+    fn clear_colors_are_passed_in_linear_light() {
+        let gray = ClearColor::from_srgba(0.5, 0.5, 0.5, 1.0);
+        let [red, _, _, alpha] = gray.to_linear();
+        assert!((red - 0.214_041).abs() < 1e-5, "{red}");
+        assert!((alpha - 1.0).abs() < f64::EPSILON);
+        // Half-transparent white keeps its premultiplied components.
+        let white = ClearColor::from_srgba(1.0, 1.0, 1.0, 0.5).to_linear();
+        assert!(white.iter().all(|c| (c - 0.5).abs() < 1e-6), "{white:?}");
+        for byte in [0_u8, 1, 30, 128, 200, 254, 255] {
+            let unit = f32::from(byte) / 255.0;
+            let color = ClearColor::from_srgba(unit, unit, unit, 1.0);
+            assert_eq!(color.to_bgra8(), [byte, byte, byte, 255], "{byte}");
+        }
     }
 
     #[test]

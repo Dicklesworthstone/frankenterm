@@ -34,7 +34,7 @@ use std::cell::{Cell, RefCell};
 use std::fmt;
 
 /// The pixel format of every target this crate renders to.
-const PIXEL_FORMAT: MTLPixelFormat = MTLPixelFormat::BGRA8Unorm;
+const PIXEL_FORMAT: MTLPixelFormat = crate::macos_frames::TARGET_PIXEL_FORMAT;
 const BYTES_PER_PIXEL: usize = 4;
 
 /// A Metal device admitted for rendering, with its command queue.
@@ -91,7 +91,7 @@ impl MetalDevice {
         &self.queue
     }
 
-    /// Clears an offscreen `width x height` `BGRA8Unorm` texture with one
+    /// Clears an offscreen `width x height` `BGRA8Unorm_sRGB` texture with one
     /// render pass, waits for the GPU, and returns the texture's bytes:
     /// row-major, tightly packed, `[B, G, R, A]` per pixel.
     pub fn clear_offscreen(
@@ -109,8 +109,9 @@ impl MetalDevice {
         let len = bytes_per_row * height_px;
 
         #[allow(unsafe_code)]
-        // SAFETY: FFI-EXTENT. BGRA8Unorm is color-renderable and the extent
-        // was checked to be within 1..=MAX_TEXTURE_EXTENT on both axes above.
+        // SAFETY: FFI-EXTENT. BGRA8Unorm_sRGB is color-renderable and the
+        // extent was checked to be within 1..=MAX_TEXTURE_EXTENT on both axes
+        // above.
         let descriptor = unsafe {
             MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
                 PIXEL_FORMAT,
@@ -338,11 +339,13 @@ impl RendererParts {
             .map_err(|detail| MetalUnavailable::Pipeline { detail })?;
         let text = TextPipeline::new(&device.device)
             .map_err(|detail| MetalUnavailable::Pipeline { detail })?;
+        // The color atlas is sRGB, so sampling decodes emoji to linear light
+        // as the WebGpu atlas does (ft-yccm0.4.7.3).
         let atlases = GlyphAtlases::new(
             &device,
             AtlasConfig::for_kind(AtlasKind::Grayscale),
             AtlasConfig::for_kind(AtlasKind::Color),
-            false,
+            true,
             GpuResourceLedger::global(),
         )
         .map_err(|error| MetalUnavailable::ResourceAllocation {
@@ -1045,11 +1048,13 @@ fn clear_pass(
     attachment.setTexture(Some(texture));
     attachment.setLoadAction(MTLLoadAction::Clear);
     attachment.setStoreAction(MTLStoreAction::Store);
+    // The sRGB target takes the clear in linear light (ft-yccm0.4.7.3).
+    let [red, green, blue, alpha] = color.to_linear();
     attachment.setClearColor(MTLClearColor {
-        red: color.red,
-        green: color.green,
-        blue: color.blue,
-        alpha: color.alpha,
+        red,
+        green,
+        blue,
+        alpha,
     });
     pass
 }
@@ -1094,6 +1099,21 @@ mod tests {
         );
         assert!(caps.unified_memory, "{caps}");
         assert_ne!(caps.name, "");
+    }
+
+    /// ft-yccm0.4.7.3: the target is sRGB and clears take linear light, yet
+    /// every opaque sRGB byte is stored exactly as configured.
+    #[test]
+    fn every_srgb_byte_survives_a_linear_clear_exactly() {
+        let device = device();
+        for byte in 0..=255_u8 {
+            let unit = f32::from(byte) / 255.0;
+            let color = ClearColor::from_srgba(unit, unit, 1.0 - unit, 1.0);
+            let bytes = device
+                .clear_offscreen(1, 1, color)
+                .expect("offscreen clear");
+            assert_eq!(bytes, [255 - byte, byte, byte, 255], "byte {byte}");
+        }
     }
 
     #[test]

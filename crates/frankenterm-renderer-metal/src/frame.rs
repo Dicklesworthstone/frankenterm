@@ -237,7 +237,11 @@ impl FrameUniforms {
     /// | 168 | `strikethrough_position: float` |
     /// | 176 | `hsb: float4`, see [`Self::to_bytes_with_hsb`] |
     ///
-    /// Everything else is zero, up to [`UNIFORMS_BYTES`].
+    /// Everything else is zero, up to [`UNIFORMS_BYTES`]. The colors (clear,
+    /// cursor and tints) are given premultiplied and sRGB-encoded and are
+    /// written in premultiplied linear light
+    /// ([`crate::color::linear_premultiplied`]): the shaders blend in linear
+    /// light (ft-yccm0.4.7.3).
     #[must_use]
     pub fn to_bytes(&self) -> [u8; UNIFORMS_BYTES] {
         self.to_bytes_with_hsb(None)
@@ -260,7 +264,8 @@ impl FrameUniforms {
         put_u32(&mut bytes, 12, self.viewport[1]);
         put_u32(&mut bytes, 16, self.grid.rows);
         put_u32(&mut bytes, 20, self.grid.cols);
-        put_f32s(&mut bytes, 32, &self.clear);
+        let linear = crate::color::linear_premultiplied;
+        put_f32s(&mut bytes, 32, &linear(self.clear));
         let background = &self.background;
         put_f32s(&mut bytes, 48, &background.cell_size);
         put_f32s(&mut bytes, 56, &background.grid_origin);
@@ -268,12 +273,12 @@ impl FrameUniforms {
         put_u32(&mut bytes, 68, background.cursor.shape.code());
         put_u32(&mut bytes, 72, background.cursor.col);
         put_u32(&mut bytes, 76, background.cursor.row);
-        put_f32s(&mut bytes, 80, &background.cursor.color);
+        put_f32s(&mut bytes, 80, &linear(background.cursor.color));
         put_f32s(&mut bytes, 96, &[background.cursor.thickness]);
         put_u32(&mut bytes, 100, background.cursor.width_cells);
-        put_f32s(&mut bytes, 112, &background.selection_tint);
-        put_f32s(&mut bytes, 128, &background.search_tint);
-        put_f32s(&mut bytes, 144, &background.current_match_tint);
+        put_f32s(&mut bytes, 112, &linear(background.selection_tint));
+        put_f32s(&mut bytes, 128, &linear(background.search_tint));
+        put_f32s(&mut bytes, 144, &linear(background.current_match_tint));
         let text = &self.text;
         put_f32s(
             &mut bytes,
@@ -722,7 +727,10 @@ mod tests {
         assert_eq!(&bytes[8..16], &[0x80, 0x07, 0, 0, 0x38, 0x04, 0, 0]);
         assert_eq!(&bytes[16..24], &[80, 0, 0, 0, 120, 0, 0, 0]);
         assert_eq!(&bytes[24..32], &[0; 8]);
-        assert_eq!(&bytes[32..36], &0.5_f32.to_le_bytes());
+        // The clear color is written in linear light (ft-yccm0.4.7.3).
+        let red = crate::color::srgb_to_linear(0.5);
+        assert!(red < 0.25, "sRGB 0.5 is about a fifth of the light: {red}");
+        assert_eq!(&bytes[32..36], &red.to_le_bytes());
         assert_eq!(&bytes[44..48], &1.0_f32.to_le_bytes());
         assert!(bytes[48..].iter().all(|&byte| byte == 0));
         assert_eq!(FrameUniforms::frame_of(&bytes), Some(uniforms.frame));
@@ -743,7 +751,7 @@ mod tests {
                     row: 1,
                     width_cells: 2,
                     thickness: 2.0,
-                    color: [1.0, 0.5, 0.25, 0.75],
+                    color: [0.75, 0.5, 0.25, 0.75],
                 },
                 selection_tint: [0.1; 4],
                 search_tint: [0.2; 4],
@@ -762,9 +770,15 @@ mod tests {
             [u32_at(64), u32_at(68), u32_at(72), u32_at(76)],
             [5, 4, 3, 1]
         );
+        // Colors are written in premultiplied linear light (ft-yccm0.4.7.3);
+        // the tints are premultiplied white, which converts exactly.
         assert_eq!(
             [f32_at(80), f32_at(84), f32_at(88), f32_at(92)],
-            [1.0, 0.5, 0.25, 0.75]
+            crate::color::linear_premultiplied([0.75, 0.5, 0.25, 0.75])
+        );
+        assert!(
+            (f32_at(80) - 0.75).abs() < f32::EPSILON,
+            "full red stays full at 0.75 coverage"
         );
         assert_eq!((f32_at(96), u32_at(100)), (2.0, 2));
         assert_eq!((f32_at(112), f32_at(128), f32_at(144)), (0.1, 0.2, 0.3));
