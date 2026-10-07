@@ -121,10 +121,12 @@ fn record_path(c: &mut Criterion) {
         let cell_records = sealer.seal_compact_cell_schemas(rows, &mut Vec::new());
         let (plaintext, payload) = sealer.serialize_and_compress(rows);
         let records = sealer.seal_compact_arena(rows, &mut stream);
+        let segment_records = sealer.seal_segments_arena(rows, &mut stream);
         eprintln!(
             "scrollback_record {shape}: per row, cell schemas {:.1} plaintext, {:.1} payload, \
              {:.1} compact record bytes; clustered schema 3 {:.1} plaintext, {:.1} payload, \
-             {:.1} compact record bytes ({:.1}x the row text)",
+             {:.1} compact record bytes ({:.1}x the row text); per segment {:.1} record bytes \
+             ({:.1}x)",
             per_row(cell_plaintext),
             per_row(cell_payload),
             per_row(cell_records),
@@ -132,6 +134,8 @@ fn record_path(c: &mut Criterion) {
             per_row(payload),
             per_row(records),
             records as f64 / rows.text_bytes() as f64,
+            per_row(segment_records),
+            segment_records as f64 / rows.text_bytes() as f64,
         );
         group.throughput(Throughput::Bytes(rows.text_bytes()));
         let mut scratch = Vec::new();
@@ -149,6 +153,13 @@ fn record_path(c: &mut Criterion) {
             rows,
             |bench, rows| {
                 bench.iter(|| black_box(sealer.seal_compact_arena(black_box(rows), &mut stream)));
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("seal_segments_arena", shape),
+            rows,
+            |bench, rows| {
+                bench.iter(|| black_box(sealer.seal_segments_arena(black_box(rows), &mut stream)));
             },
         );
     }

@@ -10964,6 +10964,11 @@ struct ScrollbackRowEncodeArena {
     /// Emptied records of earlier batches, for the next batch's rows.
     spare: Vec<String>,
     spare_bytes: usize,
+    /// ft-yccm0.2.1.4 option A: the open segment's payloads, back to back,
+    /// and each row's length; sealed together by `seal_segment`.
+    segment_payloads: Zeroizing<Vec<u8>>,
+    segment_rows: Vec<u32>,
+    segment_aad: Vec<u8>,
 }
 
 std::thread_local! {
@@ -11027,6 +11032,92 @@ impl ScrollbackRowEncodeArena {
         } else {
             self.recycle(record);
         }
+        sealed
+    }
+
+    /// Whether the prepared payload of `payload_bytes` must start a new
+    /// segment: the open one is full by rows, or would pass the multi-row
+    /// byte cap.
+    fn segment_is_full_for(&self, payload_bytes: usize) -> bool {
+        !self.segment_rows.is_empty()
+            && (self.segment_rows.len()
+                >= mux::guardian_output_journal::SCROLLBACK_SEGMENT_MAX_ROWS
+                || self.segment_payloads.len().saturating_add(payload_bytes)
+                    > mux::guardian_output_journal::SCROLLBACK_SEGMENT_MAX_PLAINTEXT_BYTES)
+    }
+
+    /// Move the prepared payload into the open segment.
+    fn push_segment_payload(&mut self) -> bool {
+        let payload: &[u8] = if self.compressed_payload {
+            &self.compressed
+        } else {
+            &self.plaintext
+        };
+        let pushed = u32::try_from(payload.len()).is_ok_and(|bytes| {
+            self.segment_payloads.try_reserve(payload.len()).is_ok()
+                && self.segment_rows.try_reserve(1).is_ok()
+                && {
+                    self.segment_payloads.extend_from_slice(payload);
+                    self.segment_rows.push(bytes);
+                    true
+                }
+        });
+        self.discard_payload();
+        pushed
+    }
+
+    /// Seal the open segment, whose first row is at `first`, with one AEAD
+    /// operation and append its rows to the batch as records, in record
+    /// strings earlier batches emptied. The segment is empty afterwards,
+    /// sealed or not, and its plaintext wiped.
+    fn seal_segment(
+        &mut self,
+        cipher: &mux::guardian_output_journal::GuardianOutputCipher,
+        stream: &mut mux::guardian_output_journal::GuardianScrollbackRowNonceStream,
+        first: mux::guardian_output_journal::GuardianScrollbackRowLocation,
+    ) -> bool {
+        let Self {
+            seal_scratch,
+            batch,
+            spare,
+            spare_bytes,
+            segment_payloads,
+            segment_rows,
+            segment_aad,
+            ..
+        } = self;
+        if segment_rows.is_empty() {
+            return true;
+        }
+        let sealed = cipher
+            .seal_scrollback_segment_in_place(
+                stream,
+                first,
+                segment_rows,
+                segment_payloads,
+                segment_aad,
+            )
+            .is_ok_and(|tag| {
+                let mut offset = 0;
+                segment_rows.iter().enumerate().all(|(index, &bytes)| {
+                    let mut record = spare.pop().unwrap_or_default();
+                    *spare_bytes = spare_bytes.saturating_sub(record.capacity());
+                    let end = offset + bytes as usize;
+                    let tail = (index + 1 == segment_rows.len()).then_some(&tag);
+                    let pushed = mux::guardian_output_journal::push_scrollback_segment_record(
+                        &mut record,
+                        &segment_payloads[offset..end],
+                        tail,
+                        seal_scratch,
+                    )
+                    .is_ok();
+                    offset = end;
+                    batch.push(record);
+                    pushed
+                })
+            });
+        wipe_scrollback_plaintext(segment_payloads);
+        segment_rows.clear();
         sealed
     }
 
@@ -11573,6 +11664,39 @@ pub mod scrollback_record_bench {
                 );
             }
             lease.arena.batch.iter().map(String::len).sum()
+        }
+
+        /// The same rows and payloads as `seal_compact_arena`, sealed per
+        /// segment (ft-yccm0.2.1.4 option A): one XChaCha20-Poly1305 for each
+        /// run of rows up to 256 KiB of payload, each row then storing only
+        /// its ciphertext and the segment's last row the tag. Returns the
+        /// batch's record bytes.
+        pub fn seal_segments_arena(&self, rows: &Rows, stream: &mut CompactStream) -> usize {
+            let mut lease = super::ScrollbackRowEncodeLease::take();
+            let arena = &mut lease.arena;
+            let location = |sequence: u64| {
+                mux::guardian_output_journal::GuardianScrollbackRowLocation::new(
+                    [0x5a; 16],
+                    [0xa5; 16],
+                    sequence as i64,
+                    sequence,
+                )
+                .expect("bench row location")
+            };
+            let mut first = stream.next_sequence;
+            for line in &rows.0 {
+                let payload_bytes = arena.prepare_payload(line).expect("bench row serializes");
+                if arena.segment_is_full_for(payload_bytes) {
+                    let sealed_rows = arena.segment_rows.len() as u64;
+                    assert!(arena.seal_segment(&self.cipher, &mut stream.stream, location(first)));
+                    first += sealed_rows;
+                }
+                assert!(arena.push_segment_payload());
+            }
+            let sealed_rows = arena.segment_rows.len() as u64;
+            assert!(arena.seal_segment(&self.cipher, &mut stream.stream, location(first)));
+            stream.next_sequence = first + sealed_rows;
+            arena.batch.iter().map(String::len).sum()
         }
 
         /// What the cell-vector schemas (2 or 1) take for these rows,
