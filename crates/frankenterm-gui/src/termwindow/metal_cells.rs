@@ -1,7 +1,7 @@
 //! The live Metal frame (ft-yccm0.4.4).
 //!
-//! Each Metal paint captures the active pane's changed rows into its render
-//! mirror under one short hold of the terminal lock
+//! Each Metal paint captures every visible pane's changed rows into its
+//! render mirror under one short hold of its terminal lock
 //! (`LocalPane::capture_render_rows`; the generic pane path for mux clients
 //! and cold scrollback). It then rebuilds the frame's cell backgrounds and
 //! glyph instances outside the lock, only for the rows that need it
@@ -11,11 +11,11 @@
 //! snapshot (ft-yccm0.1.10) draws the same scene offscreen.
 //!
 //! What a frame needs from its window is captured on the main thread as
-//! [`MetalFrameInputs`], so the frame itself can be built on the window's
-//! render thread (ft-yccm0.4.1.2) with that thread's own fonts.
+//! [`MetalFrameInputs`], one per visible pane (`metal_window`, ft-yccm0.4.6),
+//! so the frame itself can be built on the window's render thread
+//! (ft-yccm0.4.1.2) with that thread's own fonts.
 
 use crate::selection::SelectionRange;
-use crate::termwindow::TermWindow;
 use crate::termwindow::metal_glyphs::FontGlyphs;
 use crate::utilsprites::RenderMetrics;
 use config::ConfigHandle;
@@ -89,10 +89,11 @@ pub(crate) struct MetalFrameUniforms {
 /// from it.
 #[derive(Clone)]
 pub(crate) struct MetalFrameInputs {
-    /// The active pane, or its overlay; `None` draws only the clear color.
+    /// The pane, or its overlay; `None` draws only the clear color.
     pub(crate) pane: Option<Arc<dyn Pane>>,
     pub(crate) viewport_top: Option<StableRowIndex>,
     pub(crate) config: ConfigHandle,
+    /// The window is focused and the pane is its active pane.
     pub(crate) focused: bool,
     /// The pane's selection, normalized, and whether it is rectangular.
     pub(crate) selection: Option<(SelectionRange, bool)>,
@@ -101,58 +102,6 @@ pub(crate) struct MetalFrameInputs {
     /// Where the grid's first cell starts, in pixels: padding, tab bar and
     /// window border.
     pub(crate) grid_origin: [f32; 2],
-}
-
-impl TermWindow {
-    /// The window state a Metal frame is built from.
-    // Border widths are small pixel counts.
-    #[allow(clippy::cast_precision_loss)]
-    pub(crate) fn metal_frame_inputs(&self) -> MetalFrameInputs {
-        let pane = self.get_active_pane_or_overlay();
-        let pane_id = pane.as_ref().map(|pane| pane.pane_id());
-        let (padding_left, padding_top) = self.padding_left_top();
-        let tab_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height().unwrap_or(0.0)
-        } else {
-            0.0
-        };
-        let border = self.get_os_border();
-        MetalFrameInputs {
-            viewport_top: pane_id.and_then(|pane_id| self.get_viewport(pane_id)),
-            selection: pane_id
-                .and_then(|pane_id| self.selection(pane_id))
-                .and_then(|selection| {
-                    selection
-                        .range
-                        .map(|range| (range.normalize(), selection.rectangular))
-                }),
-            pane,
-            config: self.config.clone(),
-            focused: self.focused.is_some(),
-            hover: self.current_highlight.clone(),
-            grid_origin: [
-                padding_left + border.left.get() as f32,
-                tab_bar_height + padding_top + border.top.get() as f32,
-            ],
-        }
-    }
-
-    /// Captures the active pane's changed rows and brings its Metal scene up
-    /// to date on this thread; `self.metal_frame` then holds the scene.
-    /// `None` without a pane.
-    pub(crate) fn update_metal_frame(
-        &mut self,
-        metal: &Rc<MetalRenderer>,
-    ) -> Option<MetalFrameUniforms> {
-        let inputs = self.metal_frame_inputs();
-        MetalFrame::update(
-            &mut self.metal_frame,
-            &inputs,
-            &self.fonts,
-            &self.render_metrics,
-            metal,
-        )
-    }
 }
 
 impl MetalFrame {

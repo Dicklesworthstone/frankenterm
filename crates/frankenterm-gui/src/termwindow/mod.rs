@@ -1010,37 +1010,21 @@ fn lock_termwindow_mutex<'a, T>(mutex: &'a Mutex<T>, name: &str) -> std::sync::M
     })
 }
 
-/// The Metal frame of the active pane's scene (ft-yccm0.4.4).
-fn metal_frame_scene<'a>(
-    frame: &'a metal_cells::MetalFrame,
-    uniforms: &metal_cells::MetalFrameUniforms,
-    clear: frankenterm_renderer_metal::ClearColor,
-) -> frankenterm_renderer_metal::FrameScene<'a> {
-    frankenterm_renderer_metal::FrameScene {
-        cells: frame.scene().cells(),
-        background: uniforms.background,
-        text: frame.scene().text(),
-        text_uniforms: uniforms.text,
-        clear,
-    }
-}
-
 /// Image-parity hook for the Metal front end (ft-yccm0.1.10): the frame the
-/// live path draws (ft-yccm0.4.4), backgrounds, selection, cursor and glyphs,
-/// rendered offscreen by the real Metal passes and read back. Without a pane
-/// only the background clear is drawn.
+/// live path draws (ft-yccm0.4.4), every visible pane with its backgrounds,
+/// selection, cursor and glyphs, splits and dimming (ft-yccm0.4.6), rendered
+/// offscreen by the real Metal passes and read back. Without a pane only the
+/// background clear is drawn.
 fn write_metal_render_snapshot(
     metal: &frankenterm_renderer_metal::MetalRenderer,
     path: &std::path::Path,
     width: u32,
     height: u32,
     color: frankenterm_renderer_metal::ClearColor,
-    frame: Option<(&metal_cells::MetalFrame, &metal_cells::MetalFrameUniforms)>,
+    window: Option<&frankenterm_renderer_metal::WindowFrame<'_>>,
 ) {
-    let readback = match frame {
-        Some((frame, uniforms)) => {
-            metal.snapshot_frame(width, height, &metal_frame_scene(frame, uniforms, color))
-        }
+    let readback = match window {
+        Some(window) => metal.snapshot_window(width, height, window),
         None => metal.device().clear_offscreen(width, height, color),
     };
     let result = readback
@@ -2480,12 +2464,12 @@ pub struct TermWindow {
     /// The native Metal front end. While it is in development it only clears
     /// the window to the background color; it never has a `RenderState`.
     metal: Option<Rc<frankenterm_renderer_metal::MetalRenderer>>,
-    /// The Metal front end's frame state for the active pane: its render
-    /// mirror, scene and glyphs (ft-yccm0.4.4).
-    metal_frame: Option<metal_cells::MetalFrame>,
+    /// The Metal front end's frame state for each visible pane: its render
+    /// mirror, scene and glyphs (ft-yccm0.4.4, ft-yccm0.4.6).
+    metal_panes: metal_window::MetalPanes,
     /// The Metal render thread that owns the renderer and draws every frame
-    /// off the main thread (ft-yccm0.4.1.2). While it runs, `metal` and
-    /// `metal_frame` are `None`.
+    /// off the main thread (ft-yccm0.4.1.2). While it runs, `metal` is
+    /// `None` and `metal_panes` is empty.
     metal_render: Option<metal_render_thread::MetalRenderThread>,
     /// Wakes the render thread for its pane's output from the mux
     /// notification callback; shared with the pane-update subscription.
@@ -4682,7 +4666,7 @@ impl TermWindow {
             gl: None,
             webgpu: None,
             metal: None,
-            metal_frame: None,
+            metal_panes: metal_window::MetalPanes::default(),
             metal_render: None,
             metal_output_wake: Arc::default(),
             render_snapshot: render_snapshot::RenderSnapshotRequest::from_env(),
@@ -5242,8 +5226,10 @@ impl TermWindow {
         // The Metal renderer retains the view's CAMetalLayer; release it
         // before the native window goes away too. A render thread owns its
         // renderer: dropping the handle stops and joins the thread, which
-        // drops the renderer there (ft-yccm0.4.1.2).
+        // drops the renderer there (ft-yccm0.4.1.2). The panes' glyph caches
+        // share the main thread's renderer, so they go first.
         drop(self.metal_render.take());
+        drop(std::mem::take(&mut self.metal_panes));
         drop(self.metal.take());
     }
 
@@ -5255,32 +5241,46 @@ impl TermWindow {
         };
         let captured_generation = self.damage_generation;
         let snapshot_path = self.claim_render_snapshot();
-        let color = self.metal_clear_color();
         let dimensions = self.dimensions;
         let width = u32::try_from(dimensions.pixel_width).unwrap_or(u32::MAX);
         let height = u32::try_from(dimensions.pixel_height).unwrap_or(u32::MAX);
-        // ft-yccm0.4.4: the active pane's changed rows, captured under one
-        // short terminal lock, rebuilt into its scene outside the lock.
-        let uniforms = self.update_metal_frame(&metal);
-        let outcome = match (self.metal_frame.as_ref(), uniforms.as_ref()) {
-            (Some(frame), Some(uniforms)) => {
-                metal.render_frame(width, height, &metal_frame_scene(frame, uniforms, color))
-            }
-            _ => {
-                // ft-yccm0.4.2.1: the frame slots are sized for the grid.
-                let grid = frankenterm_renderer_metal::GridExtent::new(
-                    self.terminal_size.rows,
-                    self.terminal_size.cols,
-                );
-                metal.render_clear(width, height, grid, color)
-            }
-        };
+        // ft-yccm0.4.4: each visible pane's changed rows, captured under one
+        // short terminal lock, rebuilt into its scene outside the lock; all
+        // the panes drawn in one render pass (ft-yccm0.4.6), as the render
+        // thread draws them.
+        let request = self.metal_frame_request();
+        let mut panes = std::mem::take(&mut self.metal_panes);
+        let outcome = panes.draw(
+            &request.panes,
+            &request.splits,
+            request.clear,
+            &self.fonts,
+            &self.render_metrics,
+            &metal,
+            |window| {
+                let outcome = match window {
+                    Some(window) => metal.render_window(width, height, window),
+                    // ft-yccm0.4.2.1: the frame slots are sized for the grid.
+                    None => metal.render_clear(width, height, request.grid, request.clear),
+                };
+                if let (Ok(frankenterm_renderer_metal::FrameOutcome::Presented), Some(path)) =
+                    (&outcome, snapshot_path)
+                {
+                    write_metal_render_snapshot(
+                        &metal,
+                        &path,
+                        width,
+                        height,
+                        request.clear,
+                        window,
+                    );
+                }
+                outcome
+            },
+        );
+        self.metal_panes = panes;
         match outcome {
             Ok(frankenterm_renderer_metal::FrameOutcome::Presented) => {
-                if let Some(path) = snapshot_path {
-                    let frame = self.metal_frame.as_ref().zip(uniforms.as_ref());
-                    write_metal_render_snapshot(&metal, &path, width, height, color, frame);
-                }
                 let settlement = apply_presented_render_attempt(
                     &mut self.dirty_lines,
                     self.damage_generation,
