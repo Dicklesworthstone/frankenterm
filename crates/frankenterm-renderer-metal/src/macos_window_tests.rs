@@ -349,3 +349,102 @@ fn a_dimmed_pane_is_its_undimmed_pixels_through_apply_hsb() {
         }
     }
 }
+
+/// ft-yccm0.4.7.1: fills are drawn over the panes' text, as the WebGpu
+/// renderer draws splits and borders over glyphs, and blend over it. An
+/// opaque fill across glyph cells shows only its color; a translucent one is
+/// its color over the pane's own pixels (linear light, within 2 codes).
+#[test]
+fn fills_are_drawn_over_the_panes_text_and_blend_over_it() {
+    let renderer = renderer();
+    let glyph = glyph(&renderer);
+    let extent = GridExtent::new(4, 10);
+    let rect = rect_for(0, 0, extent);
+    let content = content(extent, 0, &glyph);
+    let panes = [pane(1, rect, &content, None)];
+    let render = |fills: &[SolidRect]| {
+        renderer
+            .snapshot_window(
+                rect.width,
+                rect.height,
+                &WindowFrame {
+                    clear: clear(),
+                    panes: &panes,
+                    fills,
+                },
+            )
+            .expect("a window frame")
+    };
+    let plain = render(&[]);
+    // Rows 0 and 1; the content puts a glyph in every fourth cell.
+    let band = PixelRect::new(0, 0, rect.width, 2 * CELL[1]);
+    let pixels = |image: &[u8]| -> Vec<[u8; 4]> {
+        (band.y..band.y + band.height)
+            .flat_map(|y| (band.x..band.x + band.width).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let at = ((y * rect.width + x) * 4) as usize;
+                [image[at], image[at + 1], image[at + 2], image[at + 3]]
+            })
+            .collect()
+    };
+    let opaque = ClearColor::from_srgba(200.0 / 255.0, 60.0 / 255.0, 60.0 / 255.0, 1.0);
+    // Planted negative: the band holds glyph pixels to cover; without its
+    // text the pane draws it differently.
+    let under = pixels(&plain);
+    let untexted = [PaneScene {
+        text: None,
+        ..pane(1, rect, &content, None)
+    }];
+    let backgrounds_only = renderer
+        .snapshot_window(
+            rect.width,
+            rect.height,
+            &WindowFrame {
+                clear: clear(),
+                panes: &untexted,
+                fills: &[],
+            },
+        )
+        .expect("a window frame");
+    assert_ne!(
+        under,
+        pixels(&backgrounds_only),
+        "the band has no glyphs to cover"
+    );
+    let covered = render(&[SolidRect {
+        rect: band,
+        color: opaque,
+    }]);
+    assert!(
+        pixels(&covered)
+            .iter()
+            .all(|pixel| *pixel == opaque.to_bgra8()),
+        "a glyph shows through an opaque fill"
+    );
+    let rows = (band.height * rect.width * 4) as usize;
+    assert_eq!(
+        covered[rows..],
+        plain[rows..],
+        "the fill drew outside its rect"
+    );
+
+    let translucent = ClearColor::from_srgba(40.0 / 255.0, 120.0 / 255.0, 220.0 / 255.0, 0.5);
+    let blended = render(&[SolidRect {
+        rect: band,
+        color: translucent,
+    }]);
+    let top = crate::color::linear_premultiplied(translucent.to_f32());
+    for (index, (under, got)) in under.iter().zip(pixels(&blended)).enumerate() {
+        let expected = crate::color::to_srgb_bgra8(crate::cell_bg::over(
+            top,
+            crate::color::from_srgb_bgra8(*under),
+        ));
+        for channel in 0..4 {
+            let delta = i16::from(got[channel]) - i16::from(expected[channel]);
+            assert!(
+                delta.abs() <= 2,
+                "pixel {index}: drew {got:?}, the fill over {under:?} is {expected:?}"
+            );
+        }
+    }
+}

@@ -10,10 +10,11 @@ pub(crate) struct SplitRenderGeometry {
     /// The split line's pixels; the Metal frame fills the same rectangle
     /// (ft-yccm0.4.6).
     pub(crate) rect: RectF,
-    ui_x: usize,
-    ui_y: usize,
-    ui_width: usize,
-    ui_height: usize,
+    /// Where the split is hit-tested (dragged).
+    pub(crate) ui_x: usize,
+    pub(crate) ui_y: usize,
+    pub(crate) ui_width: usize,
+    pub(crate) ui_height: usize,
 }
 
 pub(crate) fn split_render_geometry(

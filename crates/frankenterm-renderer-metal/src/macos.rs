@@ -851,6 +851,7 @@ impl MetalRenderer {
                         scissor: placement.rect,
                         cells: buffer(SlotBuffer::CellBg)?,
                         text,
+                        over: false,
                     }
                 }
                 None => WindowDraw {
@@ -858,6 +859,7 @@ impl MetalRenderer {
                     scissor: placement.rect,
                     cells: buffers.fill,
                     text: None,
+                    over: true,
                 },
             };
             draws.push(draw);

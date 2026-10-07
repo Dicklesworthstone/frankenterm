@@ -9,17 +9,25 @@
 //! - its default background;
 //! - the configured `inactive_pane_hsb` dimming when it is inactive.
 //!
-//! Split borders are [`SolidRect`]s in the active pane's split color, where
-//! the WebGpu renderer draws them.
+//! The window chrome the WebGpu renderer draws as quads becomes
+//! [`SolidRect`] fills over the panes' text, from the same geometry: the
+//! window border, agent and floating-pane borders, the scrollbar thumb and
+//! the splits. The visual bell's background flash recolors the pane's
+//! background. The hit-test items for splits and the scrollbar are
+//! registered as `paint_pass` registers them (ft-yccm0.4.7.1).
 //!
 //! Wherever the window is drawn, [`MetalPanes`] keeps one `MetalFrame`
 //! (render mirror, scene and glyphs) per visible pane. A pane whose rows did
 //! not change rebuilds no row, and the renderer uploads none of its rows.
 
-use super::TermWindow;
 use super::metal_cells::{MetalFrame, MetalFrameInputs};
+use super::render::pane::pane_border_rects;
 use super::render::split::split_render_geometry;
+use super::{TermWindow, UIItem, UIItemType};
 use crate::utilsprites::RenderMetrics;
+use ::window::RectF;
+use ::window::color::LinearRgba;
+use config::VisualBellTarget;
 use frankenterm_font::FontConfiguration;
 use frankenterm_renderer_metal::{
     ClearColor, MetalRenderer, PaneScene, PixelRect, SolidRect, WindowFrame,
@@ -27,6 +35,7 @@ use frankenterm_renderer_metal::{
 use mux::pane::PaneId;
 use std::collections::HashMap;
 use std::rc::Rc;
+use wezterm_term::color::SrgbaTuple;
 
 /// One visible pane of a Metal window frame, captured on the main thread.
 #[derive(Clone)]
@@ -85,10 +94,17 @@ impl PaneLayout {
         ]
     }
 
+    /// The pixels a pane fills: [`Self::background_rect`].
+    fn pane_rect(&self, left: usize, top: usize, width: usize, height: usize) -> PixelRect {
+        let rect = self.background_rect(left, top, width, height);
+        pixel_rect(rect.min_x(), rect.min_y(), rect.width(), rect.height())
+    }
+
     /// The rectangle a pane fills, as the WebGpu renderer fills its
     /// background (`paint_pane`): its cells and half a cell into each split
     /// gap; a pane on an edge of the tab also fills the window to that edge.
-    fn pane_rect(&self, left: usize, top: usize, width: usize, height: usize) -> PixelRect {
+    /// Pane borders are drawn inside it.
+    fn background_rect(&self, left: usize, top: usize, width: usize, height: usize) -> RectF {
         let (x, width_delta) = if left == 0 {
             (0.0, self.left + self.cell_width / 2.0)
         } else {
@@ -118,27 +134,91 @@ impl PaneLayout {
         } else {
             height as f32 * self.cell_height + height_delta
         };
-        pixel_rect(x, y, width, height)
+        euclid::rect(x, y, width, height)
+    }
+}
+
+/// A WebGpu chrome quad as a Metal fill: the pixels it covers, in its color.
+fn fill(rect: RectF, color: ClearColor) -> SolidRect {
+    SolidRect {
+        rect: pixel_rect(rect.min_x(), rect.min_y(), rect.width(), rect.height()),
+        color,
+    }
+}
+
+/// A color the WebGpu renderer composites in linear light, for Metal, which
+/// takes sRGB-encoded colors.
+fn linear_color(color: LinearRgba) -> ClearColor {
+    let SrgbaTuple(red, green, blue, alpha) = color.to_srgb();
+    ClearColor::from_srgba(red, green, blue, alpha)
+}
+
+fn srgb_color(color: SrgbaTuple) -> ClearColor {
+    let SrgbaTuple(red, green, blue, alpha) = color;
+    ClearColor::from_srgba(red, green, blue, alpha)
+}
+
+/// The pane background the WebGpu renderer draws while the visual bell
+/// flashes it (`paint_pane`): `background` (linear, scaled by the window
+/// opacity) blended toward `flash` by `intensity`, or `flash` at alpha
+/// `intensity` over it in a transparent window.
+fn bell_background(
+    background: LinearRgba,
+    flash: LinearRgba,
+    intensity: f32,
+    window_is_transparent: bool,
+) -> LinearRgba {
+    let LinearRgba(red, green, blue, _) = flash;
+    let (r1, g1, b1, a1) = background.tuple();
+    if window_is_transparent {
+        let alpha = intensity + a1 * (1.0 - intensity);
+        if alpha <= 0.0 {
+            return LinearRgba::with_components(0.0, 0.0, 0.0, 0.0);
+        }
+        let over =
+            |top: f32, bottom: f32| (top * intensity + bottom * a1 * (1.0 - intensity)) / alpha;
+        LinearRgba::with_components(over(red, r1), over(green, g1), over(blue, b1), alpha)
+    } else {
+        LinearRgba::with_components(
+            r1 + (red - r1) * intensity,
+            g1 + (green - g1) * intensity,
+            b1 + (blue - b1) * intensity,
+            a1,
+        )
     }
 }
 
 impl TermWindow {
-    /// The visible panes and split borders of this window's Metal frame.
+    /// The visible panes and chrome fills of this window's Metal frame. It
+    /// also rebuilds the window's hit-test items (`ui_items`) for what the
+    /// frame draws, as `paint_pass` does for the other front ends: without
+    /// them, Metal windows could not drag splits or the scrollbar
+    /// (ft-yccm0.4.7.1).
+    ///
+    /// The fills follow the WebGpu renderer's layers: the window border
+    /// (layer 1), then each pane's agent and floating-pane borders and the
+    /// active pane's scrollbar thumb, then the splits (layer 2). The renderer
+    /// draws them all over the panes' text.
     // Pixel sizes and border widths are small.
     #[allow(clippy::cast_precision_loss)]
     pub(crate) fn metal_window_panes(&mut self) -> (Vec<MetalPaneRequest>, Vec<SolidRect>) {
         let (padding_left, padding_top) = self.padding_left_top();
-        let tab_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
+        let tab_bar_height = if self.show_tab_bar {
             self.tab_bar_pixel_height().unwrap_or(0.0)
         } else {
             0.0
+        };
+        let (top_bar_height, bottom_bar_height) = if self.config.tab_bar_at_bottom {
+            (0.0, tab_bar_height)
+        } else {
+            (tab_bar_height, 0.0)
         };
         let border = self.get_os_border();
         let layout = PaneLayout {
             cell_width: self.render_metrics.cell_size.width as f32,
             cell_height: self.render_metrics.cell_size.height as f32,
             left: padding_left + border.left.get() as f32,
-            top: tab_bar_height + padding_top + border.top.get() as f32,
+            top: top_bar_height + padding_top + border.top.get() as f32,
             padding_top,
             cols: self.terminal_size.cols,
             rows: self.terminal_size.rows,
@@ -147,72 +227,144 @@ impl TermWindow {
         };
         let focused = self.focused.is_some();
         let opacity = self.config.window_background_opacity;
+        let window_is_transparent = !self.window_background.is_empty() || opacity != 1.0;
         let dim = self.config.inactive_pane_hsb;
         let dim = [dim.hue, dim.saturation, dim.brightness];
         let dim = dim
             .iter()
             .any(|factor| (factor - 1.0).abs() > f32::EPSILON)
             .then_some(dim);
-        let panes = self
-            .get_panes_to_render()
+
+        let mut ui_items = Vec::new();
+        let mut fills: Vec<SolidRect> = self
+            .window_border_rects()
             .into_iter()
-            .map(|pos| {
-                let pane_id = pos.pane.pane_id();
-                let background = pos.pane.render_facts().palette.background;
-                MetalPaneRequest {
-                    inputs: MetalFrameInputs {
-                        viewport_top: self.get_viewport(pane_id),
-                        selection: self.selection(pane_id).and_then(|selection| {
-                            selection
-                                .range
-                                .map(|range| (range.normalize(), selection.rectangular))
-                        }),
-                        config: self.config.clone(),
-                        focused: focused && pos.is_active,
-                        hover: self.current_highlight.clone(),
-                        grid_origin: layout.grid_origin(pos.left, pos.top),
-                        pane: Some(pos.pane),
-                    },
-                    rect: layout.pane_rect(pos.left, pos.top, pos.width, pos.height),
-                    clear: ClearColor::from_srgba(
+            .map(|(rect, color)| fill(rect, linear_color(color)))
+            .collect();
+        let mut panes = Vec::new();
+        for pos in self.get_panes_to_render() {
+            let pane_id = pos.pane.pane_id();
+            let facts = pos.pane.render_facts();
+            let palette = &facts.palette;
+            let background_rect = layout.background_rect(pos.left, pos.top, pos.width, pos.height);
+            let flash = self
+                .get_intensity_if_bell_target_ringing(
+                    &pos.pane,
+                    &self.config,
+                    VisualBellTarget::BackgroundColor,
+                )
+                .map(|intensity| {
+                    let target = self
+                        .config
+                        .resolved_palette
+                        .visual_bell
+                        .as_deref()
+                        .unwrap_or(&palette.foreground)
+                        .to_linear();
+                    let background = palette.background.to_linear().mul_alpha(opacity);
+                    linear_color(bell_background(
+                        background,
+                        target,
+                        intensity,
+                        window_is_transparent,
+                    ))
+                });
+            let background = palette.background;
+            if self.config.agent_detection_enabled {
+                let agent = self
+                    .agent_pane_states
+                    .get(&pane_id)
+                    .and_then(|state| state.border_color_rgba());
+                if let Some((red, green, blue, alpha)) = agent {
+                    let color = LinearRgba::with_components(
+                        f32::from(red) / 255.0,
+                        f32::from(green) / 255.0,
+                        f32::from(blue) / 255.0,
+                        f32::from(alpha) / 255.0,
+                    );
+                    let width = self.config.agent_border_width.max(1) as f32;
+                    for edge in pane_border_rects(background_rect, width)
+                        .into_iter()
+                        .flatten()
+                    {
+                        fills.push(fill(edge, linear_color(color)));
+                    }
+                }
+            }
+            if let Some(width) = self.focused_floating_pane_border_width(pane_id) {
+                for edge in pane_border_rects(background_rect, width)
+                    .into_iter()
+                    .flatten()
+                {
+                    fills.push(fill(edge, srgb_color(palette.cursor_border)));
+                }
+            }
+            if pos.is_active && self.show_scroll_bar {
+                let thumb = self.scroll_thumb_geometry(
+                    &facts.dimensions,
+                    self.get_viewport(pane_id),
+                    top_bar_height,
+                    bottom_bar_height,
+                );
+                ui_items.extend(thumb.ui_items());
+                fills.push(fill(thumb.rect(), srgb_color(palette.scrollbar_thumb)));
+            }
+            panes.push(MetalPaneRequest {
+                inputs: MetalFrameInputs {
+                    viewport_top: self.get_viewport(pane_id),
+                    selection: self.selection(pane_id).and_then(|selection| {
+                        selection
+                            .range
+                            .map(|range| (range.normalize(), selection.rectangular))
+                    }),
+                    config: self.config.clone(),
+                    focused: focused && pos.is_active,
+                    hover: self.current_highlight.clone(),
+                    grid_origin: layout.grid_origin(pos.left, pos.top),
+                    pane: Some(pos.pane),
+                },
+                rect: layout.pane_rect(pos.left, pos.top, pos.width, pos.height),
+                clear: flash.unwrap_or_else(|| {
+                    ClearColor::from_srgba(
                         background.0,
                         background.1,
                         background.2,
                         background.3 * opacity,
-                    ),
-                    hsb: if pos.is_active { None } else { dim },
-                }
-            })
-            .collect();
+                    )
+                }),
+                hsb: if pos.is_active { None } else { dim },
+            });
+        }
+
         let splits = self.get_splits();
         let split_color = self
             .get_active_pane_or_overlay()
             .filter(|_| !splits.is_empty())
-            .map(|pane| pane.render_facts().palette.split);
-        let fills = split_color.map_or_else(Vec::new, |color| {
-            let color = ClearColor::from_srgba(color.0, color.1, color.2, color.3);
-            splits
-                .iter()
-                .map(|split| {
-                    // As paint_split draws it, over the split's cells.
-                    let rect = split_render_geometry(
-                        split,
-                        layout.cell_width,
-                        layout.cell_height,
-                        self.render_metrics.underline_height as f32,
-                        tab_bar_height + border.top.get() as f32,
-                        padding_left,
-                        padding_top,
-                        border.left.get(),
-                    )
-                    .rect;
-                    SolidRect {
-                        rect: pixel_rect(rect.min_x(), rect.min_y(), rect.width(), rect.height()),
-                        color,
-                    }
-                })
-                .collect()
-        });
+            .map(|pane| srgb_color(pane.render_facts().palette.split));
+        if let Some(color) = split_color {
+            for split in &splits {
+                // As paint_split draws it, over the split's cells.
+                let geometry = split_render_geometry(
+                    split,
+                    layout.cell_width,
+                    layout.cell_height,
+                    self.render_metrics.underline_height as f32,
+                    top_bar_height + border.top.get() as f32,
+                    padding_left,
+                    padding_top,
+                    border.left.get(),
+                );
+                fills.push(fill(geometry.rect, color));
+                ui_items.push(UIItem {
+                    x: geometry.ui_x,
+                    width: geometry.ui_width,
+                    y: geometry.ui_y,
+                    height: geometry.ui_height,
+                    item_type: UIItemType::Split(split.clone()),
+                });
+            }
+        }
+        self.ui_items = ui_items;
         (panes, fills)
     }
 }

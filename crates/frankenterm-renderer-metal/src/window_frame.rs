@@ -5,7 +5,10 @@
 //! glyph grids, uniforms and scissor rectangle. Its GPU buffers and the
 //! rows they hold follow the pane's key from frame to frame, so a pane
 //! whose rows did not change uploads nothing (ft-yccm0.4.2.4).
-//! [`SolidRect`]s fill split borders.
+//! [`SolidRect`]s fill the window chrome: split and window borders, pane
+//! borders and the scrollbar thumb. They are drawn after every pane's text,
+//! in order, as the WebGpu renderer draws them over glyphs
+//! (ft-yccm0.4.7.1).
 
 use crate::cell_bg::{BackgroundUniforms, CellBgGrid};
 use crate::cell_text::{CellTextGrid, TextUniforms};
@@ -88,6 +91,8 @@ pub struct WindowFrame<'a> {
     /// What shows where no pane or fill draws: padding and gaps.
     pub clear: ClearColor,
     pub panes: &'a [PaneScene<'a>],
+    /// Drawn after every pane's text, in order: later fills cover earlier
+    /// ones.
     pub fills: &'a [SolidRect],
 }
 

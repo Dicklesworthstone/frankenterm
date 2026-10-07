@@ -8,9 +8,10 @@ pub enum FrontEndSelection {
     OpenGL,
     WebGpu,
     Software,
-    /// The native Metal renderer (macOS only, in development: it currently
-    /// clears the window to the background color and draws no terminal
-    /// content). Falls back to `WebGpu` when Metal is unavailable.
+    /// The native Metal renderer (macOS only, in development: it draws the
+    /// panes' content, splits, borders and the scrollbar, but not yet the tab
+    /// bar or modal overlays). Falls back to `WebGpu` when Metal is
+    /// unavailable.
     Metal,
 }
 

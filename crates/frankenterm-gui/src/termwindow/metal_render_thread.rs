@@ -26,6 +26,7 @@ use super::TermWindow;
 use super::metal_window::{MetalPaneRequest, MetalPanes};
 use crate::utilsprites::RenderMetrics;
 use config::ConfigHandle;
+use frankenterm_alloc::resource_ledger::FrameLedger;
 use frankenterm_font::FontConfiguration;
 #[cfg(test)]
 use frankenterm_gui::render_thread::RenderThreadStats;
@@ -366,6 +367,13 @@ impl FrameDriver for MetalDriver {
                     (u64::from(width) << 32) | u64::from(height),
                     Ordering::Relaxed,
                 );
+                // The GUI's own presented-frame count and cap, which the
+                // throughput harness checks its screen-capture FPS meter
+                // against (ft-yccm0.1.4), as the WebGpu paint records them;
+                // nv9 read 0 presents/s from a Metal window without this.
+                let frames = FrameLedger::global();
+                frames.set_max_fps(request.config.max_fps);
+                frames.record_present();
                 FrameReport {
                     presented: true,
                     redraw_at: None,
@@ -382,6 +390,7 @@ impl FrameDriver for MetalDriver {
                 // A drawable or frame slot that stayed busy past its wait:
                 // try again at the next frame the interval allows.
                 metrics::counter!("gui.metal.render_thread.frame_failed").increment(1);
+                FrameLedger::global().record_present_failure();
                 log::warn!("render thread: Metal frame failed: {err:#}");
                 FrameReport {
                     presented: false,
@@ -882,6 +891,29 @@ mod tests {
             stats.reconfigures < u64::from(POSTS),
             "{} reconfigures for {POSTS} posts",
             stats.reconfigures
+        );
+    }
+
+    /// nv9: the throughput harness checks its FPS meter against the GUI's
+    /// own FrameLedger, which read 0 presents/s from a Metal window. Every
+    /// frame the render thread presents now counts there. Other tests may
+    /// present at the same time, so the ledger's growth is a lower bound.
+    #[test]
+    fn every_presented_frame_counts_in_the_frame_ledger() {
+        let pane = TestPane::new(9_412_005);
+        let pane_id = pane.0.pane_id();
+        let output = Arc::new(MetalOutputWake::default());
+        let before = FrameLedger::global().snapshot().presented_total;
+        let render = spawn(&pane, &output);
+        assert!(eventually(|| {
+            output.wake_for(pane_id);
+            render.stats().frames_presented >= 5
+        }));
+        let presented = render.stats().frames_presented;
+        let counted = FrameLedger::global().snapshot().presented_total - before;
+        assert!(
+            counted >= presented,
+            "{presented} frames presented, {counted} counted in the frame ledger"
         );
     }
 

@@ -1290,6 +1290,9 @@ pub(crate) struct WindowDraw<'a> {
     pub(crate) cells: &'a ProtocolObject<dyn MTLBuffer>,
     /// `None` for a fill.
     pub(crate) text: Option<PaneTextDraw<'a>>,
+    /// A fill, drawn after every pane's text: the WebGpu renderer draws
+    /// splits and borders over glyphs (ft-yccm0.4.7.1).
+    pub(crate) over: bool,
 }
 
 /// A pane's text draw in a window frame: its CellText and RowTable
@@ -1329,6 +1332,20 @@ fn argument_table_descriptor() -> Retained<MTL4ArgumentTableDescriptor> {
     // The text pass's grayscale and color atlases (ft-yccm0.4.2.3).
     descriptor.setMaxTextureBindCount(AtlasKind::ALL.len());
     descriptor
+}
+
+/// Binds the glyph atlases for a window frame's text draws (Metal 3).
+fn bind_atlases(encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>, atlases: &GlyphAtlases) {
+    for kind in AtlasKind::ALL {
+        #[allow(unsafe_code)]
+        // SAFETY: FFI-DRAW. A live atlas texture that the atlases keep until
+        // the frames that may sample it finish, bound at the shader's
+        // [[texture(n)]]. Metal 3 retains bound textures.
+        unsafe {
+            encoder
+                .setFragmentTexture_atIndex(Some(atlases.texture(kind)), atlas_texture_index(kind));
+        }
+    }
 }
 
 /// A scissor rectangle for `rect`.
@@ -1400,19 +1417,34 @@ fn render_pipeline(
 /// [`BACKGROUND_SHADER`] once per renderer.
 pub(crate) struct BackgroundPipeline {
     state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    /// The same shader blended over what is drawn: a window frame's fills,
+    /// drawn over the panes' text, blend like the WebGpu renderer's quads
+    /// (ft-yccm0.4.7.1).
+    over: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
 }
 
 impl BackgroundPipeline {
     pub(crate) fn new(device: &ProtocolObject<dyn MTLDevice>) -> Result<Self, String> {
-        let state = render_pipeline(
-            device,
-            "background",
-            BACKGROUND_SHADER,
-            ns_string!("bg_vertex"),
-            ns_string!("bg_fragment"),
-            false,
-        )?;
-        Ok(Self { state })
+        let pipeline = |blended| {
+            render_pipeline(
+                device,
+                "background",
+                BACKGROUND_SHADER,
+                ns_string!("bg_vertex"),
+                ns_string!("bg_fragment"),
+                blended,
+            )
+        };
+        Ok(Self {
+            state: pipeline(false)?,
+            over: pipeline(true)?,
+        })
+    }
+
+    /// The pipeline of the draws `over` the panes' text, or of the panes'
+    /// own backgrounds.
+    fn pipeline(&self, over: bool) -> &ProtocolObject<dyn MTLRenderPipelineState> {
+        if over { &self.over } else { &self.state }
     }
 }
 
@@ -1556,38 +1588,48 @@ impl Metal3Submission {
         // texture alive.
         attachment.setTexture(None);
         let encoder = encoder.ok_or(FrameError::EncoderUnavailable)?;
-        encoder.setRenderPipelineState(&window.background.state);
-        for draw in window.draws {
-            encoder.setScissorRect(scissor(draw.scissor));
-            #[allow(unsafe_code)]
-            // SAFETY: FFI-DRAW. The leased slot's window uniforms, written for
-            // this frame, bound at the draw's block offset (a multiple of
-            // UNIFORMS_BYTES inside the buffer) at the shader's [[buffer(0)]].
-            unsafe {
-                encoder.setFragmentBuffer_offset_atIndex(
-                    Some(window.uniforms),
-                    draw.uniforms_offset,
-                    SlotBuffer::Uniforms.index(),
-                );
+        // The panes' backgrounds (over false), or the fills drawn over the
+        // panes' text (over true).
+        let backgrounds = |over: bool| {
+            encoder.setRenderPipelineState(window.background.pipeline(over));
+            for draw in window.draws.iter().filter(|draw| draw.over == over) {
+                encoder.setScissorRect(scissor(draw.scissor));
+                #[allow(unsafe_code)]
+                // SAFETY: FFI-DRAW. The leased slot's window uniforms, written
+                // for this frame, bound at the draw's block offset (a multiple
+                // of UNIFORMS_BYTES inside the buffer) at the shader's
+                // [[buffer(0)]].
+                unsafe {
+                    encoder.setFragmentBuffer_offset_atIndex(
+                        Some(window.uniforms),
+                        draw.uniforms_offset,
+                        SlotBuffer::Uniforms.index(),
+                    );
+                }
+                #[allow(unsafe_code)]
+                // SAFETY: FFI-DRAW. The draw's CellBg buffer (a pane's in the
+                // leased slot, sized for its grid, or the slot's fill cell),
+                // bound from offset 0 at the shader's [[buffer(1)]].
+                unsafe {
+                    encoder.setFragmentBuffer_offset_atIndex(
+                        Some(draw.cells),
+                        0,
+                        SlotBuffer::CellBg.index(),
+                    );
+                }
+                #[allow(unsafe_code)]
+                // SAFETY: FFI-DRAW. Three vertices of one triangle; bg_vertex
+                // derives positions from vertex_id and reads no vertex buffer.
+                unsafe {
+                    encoder.drawPrimitives_vertexStart_vertexCount(
+                        MTLPrimitiveType::Triangle,
+                        0,
+                        3,
+                    );
+                }
             }
-            #[allow(unsafe_code)]
-            // SAFETY: FFI-DRAW. The draw's CellBg buffer (a pane's in the
-            // leased slot, sized for its grid, or the slot's fill cell), bound
-            // from offset 0 at the shader's [[buffer(1)]].
-            unsafe {
-                encoder.setFragmentBuffer_offset_atIndex(
-                    Some(draw.cells),
-                    0,
-                    SlotBuffer::CellBg.index(),
-                );
-            }
-            #[allow(unsafe_code)]
-            // SAFETY: FFI-DRAW. Three vertices of one triangle; bg_vertex
-            // derives positions from vertex_id and reads no vertex buffer.
-            unsafe {
-                encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
-            }
-        }
+        };
+        backgrounds(false);
         let mut text_bound = false;
         for draw in window.draws {
             let Some(text) = draw.text.filter(|text| text.instances > 0) else {
@@ -1595,19 +1637,7 @@ impl Metal3Submission {
             };
             if !text_bound {
                 encoder.setRenderPipelineState(&window.text.pipeline.state);
-                for kind in AtlasKind::ALL {
-                    #[allow(unsafe_code)]
-                    // SAFETY: FFI-DRAW. A live atlas texture that the atlases
-                    // keep until the frames that may sample it finish, bound
-                    // at the shader's [[texture(n)]]. Metal 3 retains bound
-                    // textures.
-                    unsafe {
-                        encoder.setFragmentTexture_atIndex(
-                            Some(window.text.atlases.texture(kind)),
-                            atlas_texture_index(kind),
-                        );
-                    }
-                }
+                bind_atlases(&encoder, window.text.atlases);
                 text_bound = true;
             }
             encoder.setScissorRect(scissor(draw.scissor));
@@ -1653,6 +1683,9 @@ impl Metal3Submission {
                     text.instances,
                 );
             }
+        }
+        if window.draws.iter().any(|draw| draw.over) {
+            backgrounds(true);
         }
         encoder.endEncoding();
         self.commit(&commands, lease, window.drawable);
@@ -1870,17 +1903,30 @@ impl Metal4Submission {
             return Err(FrameError::EncoderUnavailable);
         };
         let stages = MTLRenderStages::Vertex | MTLRenderStages::Fragment;
-        encoder.setRenderPipelineState(&window.background.state);
-        for (table, draw) in tables.iter().zip(window.draws) {
-            encoder.setArgumentTable_atStages(table, stages);
-            encoder.setScissorRect(scissor(draw.scissor));
-            #[allow(unsafe_code)]
-            // SAFETY: FFI-DRAW. Three vertices of one triangle; bg_vertex
-            // derives positions from vertex_id and reads no vertex buffer.
-            unsafe {
-                encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+        // The panes' backgrounds (over false), or the fills drawn over the
+        // panes' text (over true).
+        let backgrounds = |over: bool| {
+            encoder.setRenderPipelineState(window.background.pipeline(over));
+            for (table, draw) in tables
+                .iter()
+                .zip(window.draws)
+                .filter(|(_, draw)| draw.over == over)
+            {
+                encoder.setArgumentTable_atStages(table, stages);
+                encoder.setScissorRect(scissor(draw.scissor));
+                #[allow(unsafe_code)]
+                // SAFETY: FFI-DRAW. Three vertices of one triangle; bg_vertex
+                // derives positions from vertex_id and reads no vertex buffer.
+                unsafe {
+                    encoder.drawPrimitives_vertexStart_vertexCount(
+                        MTLPrimitiveType::Triangle,
+                        0,
+                        3,
+                    );
+                }
             }
-        }
+        };
+        backgrounds(false);
         let mut text_bound = false;
         for (table, draw) in tables.iter().zip(window.draws) {
             let Some(text) = draw.text.filter(|text| text.instances > 0) else {
@@ -1904,6 +1950,9 @@ impl Metal4Submission {
                     text.instances,
                 );
             }
+        }
+        if window.draws.iter().any(|draw| draw.over) {
+            backgrounds(true);
         }
         encoder.endEncoding();
         drop(tables);

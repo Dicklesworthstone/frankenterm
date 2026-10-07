@@ -8,74 +8,61 @@ impl crate::TermWindow {
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<()> {
+        for (rect, color) in self.window_border_rects() {
+            self.filled_rectangle(layers, 1, rect, color)?;
+        }
+        Ok(())
+    }
+
+    /// The window border's edges with their colors, in the order both front
+    /// ends draw them: top, left, bottom, right (the Metal frame since
+    /// ft-yccm0.4.7.1). Empty without a border.
+    pub(crate) fn window_border_rects(
+        &self,
+    ) -> Vec<(::window::RectF, ::window::color::LinearRgba)> {
         let border_dimensions = self.get_os_border();
+        let height = self.dimensions.pixel_height as f32;
+        let width = self.dimensions.pixel_width as f32;
+        let frame = &self.config.window_frame;
+        let color = |configured: Option<config::RgbaColor>| {
+            configured
+                .map(|c| c.to_linear())
+                .unwrap_or(border_dimensions.color)
+        };
+        let mut edges = Vec::new();
 
-        if border_dimensions.top.get() > 0
-            || border_dimensions.bottom.get() > 0
-            || border_dimensions.left.get() > 0
-            || border_dimensions.right.get() > 0
-        {
-            let height = self.dimensions.pixel_height as f32;
-            let width = self.dimensions.pixel_width as f32;
-
-            let border_top = border_dimensions.top.get() as f32;
-            if border_top > 0.0 {
-                self.filled_rectangle(
-                    layers,
-                    1,
-                    euclid::rect(0.0, 0.0, width, border_top),
-                    self.config
-                        .window_frame
-                        .border_top_color
-                        .map(|c| c.to_linear())
-                        .unwrap_or(border_dimensions.color),
-                )?;
-            }
-
-            let border_left = border_dimensions.left.get() as f32;
-            if border_left > 0.0 {
-                self.filled_rectangle(
-                    layers,
-                    1,
-                    euclid::rect(0.0, 0.0, border_left, height),
-                    self.config
-                        .window_frame
-                        .border_left_color
-                        .map(|c| c.to_linear())
-                        .unwrap_or(border_dimensions.color),
-                )?;
-            }
-
-            let border_bottom = border_dimensions.bottom.get() as f32;
-            if border_bottom > 0.0 {
-                self.filled_rectangle(
-                    layers,
-                    1,
-                    euclid::rect(0.0, height - border_bottom, width, height),
-                    self.config
-                        .window_frame
-                        .border_bottom_color
-                        .map(|c| c.to_linear())
-                        .unwrap_or(border_dimensions.color),
-                )?;
-            }
-
-            let border_right = border_dimensions.right.get() as f32;
-            if border_right > 0.0 {
-                self.filled_rectangle(
-                    layers,
-                    1,
-                    euclid::rect(width - border_right, 0.0, border_right, height),
-                    self.config
-                        .window_frame
-                        .border_right_color
-                        .map(|c| c.to_linear())
-                        .unwrap_or(border_dimensions.color),
-                )?;
-            }
+        let border_top = border_dimensions.top.get() as f32;
+        if border_top > 0.0 {
+            edges.push((
+                euclid::rect(0.0, 0.0, width, border_top),
+                color(frame.border_top_color),
+            ));
         }
 
-        Ok(())
+        let border_left = border_dimensions.left.get() as f32;
+        if border_left > 0.0 {
+            edges.push((
+                euclid::rect(0.0, 0.0, border_left, height),
+                color(frame.border_left_color),
+            ));
+        }
+
+        let border_bottom = border_dimensions.bottom.get() as f32;
+        if border_bottom > 0.0 {
+            edges.push((
+                euclid::rect(0.0, height - border_bottom, width, height),
+                color(frame.border_bottom_color),
+            ));
+        }
+
+        let border_right = border_dimensions.right.get() as f32;
+        if border_right > 0.0 {
+            edges.push((
+                euclid::rect(width - border_right, 0.0, border_right, height),
+                color(frame.border_right_color),
+            ));
+        }
+        edges
     }
 
     pub fn get_os_border_impl(

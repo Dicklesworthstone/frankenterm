@@ -3925,15 +3925,17 @@ impl TermWindow {
         Ok(())
     }
 
-    /// Activates the native Metal front end. It has no `RenderState`: until
-    /// the Track C data model lands it only clears the window to the
-    /// background color, so the logged identity says exactly that.
+    /// Activates the native Metal front end. It has no `RenderState`: it
+    /// draws the panes' cells, glyphs, selection and cursor, inactive-pane
+    /// dimming, splits, borders and the scrollbar, but not yet the tab bar or
+    /// the modal overlays the other front ends draw (ft-yccm0.4.7.1), so the
+    /// logged identity says what is still missing.
     fn metal_created(&mut self, metal: Rc<frankenterm_renderer_metal::MetalRenderer>) {
         self.render_wake_state.cancel();
         self.render_state = None;
 
         let render_info = format!(
-            "Metal (in development: background clear only, {} submission) on {}",
+            "Metal (in development: panes, splits, borders and scrollbar; tab bar and modal overlays not yet drawn, {} submission) on {}",
             metal.submission_path(),
             metal.device().capabilities()
         );
@@ -5233,8 +5235,9 @@ impl TermWindow {
         drop(self.metal.take());
     }
 
-    /// Paints with the in-development Metal front end: one render pass that
-    /// clears the window to the configured background color, then presents.
+    /// Paints with the in-development Metal front end on the main thread
+    /// (no render thread): every visible pane in one render pass, then
+    /// presents.
     fn do_paint_metal(&mut self) -> bool {
         let Some(metal) = self.metal.as_ref().map(Rc::clone) else {
             return false;
@@ -5281,6 +5284,12 @@ impl TermWindow {
         self.metal_panes = panes;
         match outcome {
             Ok(frankenterm_renderer_metal::FrameOutcome::Presented) => {
+                // The GUI's own presented-frame count and cap, which the
+                // throughput harness checks its FPS meter against
+                // (ft-yccm0.1.4), as the WebGpu paint records them.
+                let frames = frankenterm_alloc::resource_ledger::FrameLedger::global();
+                frames.set_max_fps(self.config.max_fps);
+                frames.record_present();
                 let settlement = apply_presented_render_attempt(
                     &mut self.dirty_lines,
                     self.damage_generation,
@@ -5317,9 +5326,10 @@ impl TermWindow {
                     }
                     _ => RenderFailureStage::Draw(DrawFailureStage::BackendDraw),
                 };
+                frankenterm_alloc::resource_ledger::FrameLedger::global().record_present_failure();
                 let failure = RenderAttemptFailure::new(
                     stage,
-                    anyhow::Error::new(err).context("Metal background clear"),
+                    anyhow::Error::new(err).context("Metal frame"),
                 );
                 self.handle_render_failure(&failure);
                 log::warn!("Metal paint failed; retaining damage: {failure:#}");

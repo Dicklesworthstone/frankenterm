@@ -374,6 +374,83 @@ fn tiled_grid_dirty_rect_from_bitmap(
     ))
 }
 
+/// The four edges of a pane border `width` pixels wide inside `rect`: top,
+/// bottom, left and right, in the order both front ends draw them (the Metal
+/// frame since ft-yccm0.4.7.1). `None` when `rect` has no room for one.
+pub(crate) fn pane_border_rects(rect: RectF, width: f32) -> Option<[RectF; 4]> {
+    let max_width = rect.size.width.max(0.0).min(rect.size.height.max(0.0));
+    let border_w = width.max(1.0).min(max_width);
+    if border_w <= 0.0 {
+        return None;
+    }
+    let (x, y, w, h) = (
+        rect.origin.x,
+        rect.origin.y,
+        rect.size.width,
+        rect.size.height,
+    );
+    Some([
+        euclid::rect(x, y, w, border_w),
+        euclid::rect(x, y + h - border_w, w, border_w),
+        euclid::rect(x, y, border_w, h),
+        euclid::rect(x + w - border_w, y, border_w, h),
+    ])
+}
+
+/// Where the active pane's scrollbar thumb is drawn and hit-tested, in
+/// window pixels, for both front ends (the Metal frame since ft-yccm0.4.7.1).
+pub(crate) struct ScrollThumbGeometry {
+    pub(crate) x: usize,
+    /// The right padding the thumb fills.
+    pub(crate) width: f32,
+    /// Where the track starts: below a top tab bar and the window border.
+    pub(crate) track_top: usize,
+    /// The thumb's offset into the track.
+    pub(crate) offset: usize,
+    pub(crate) height: usize,
+    pub(crate) window_height: usize,
+}
+
+impl ScrollThumbGeometry {
+    pub(crate) fn rect(&self) -> RectF {
+        euclid::rect(
+            self.x as f32,
+            (self.track_top + self.offset) as f32,
+            self.width,
+            self.height as f32,
+        )
+    }
+
+    /// The track above the thumb, the thumb, and the track below it.
+    pub(crate) fn ui_items(&self) -> [UIItem; 3] {
+        let width = self.width as usize;
+        let top = self.track_top + self.offset;
+        [
+            UIItem {
+                x: self.x,
+                width,
+                y: self.track_top,
+                height: self.offset,
+                item_type: UIItemType::AboveScrollThumb,
+            },
+            UIItem {
+                x: self.x,
+                width,
+                y: top,
+                height: self.height,
+                item_type: UIItemType::ScrollThumb,
+            },
+            UIItem {
+                x: self.x,
+                width,
+                y: top + self.height,
+                height: self.window_height.saturating_sub(top + self.height),
+                item_type: UIItemType::BelowScrollThumb,
+            },
+        ]
+    }
+}
+
 /// A local pane's last freshly captured native frame, with the selection
 /// stamp its paint staged (ft-yccm0.2.2.3).
 pub(crate) struct PaintedNativeFrame {
@@ -478,7 +555,7 @@ impl crate::TermWindow {
         self.render_element(&computed, gl_state, None)
     }
 
-    fn focused_floating_pane_border_width(&self, pane_id: PaneId) -> Option<f32> {
+    pub(crate) fn focused_floating_pane_border_width(&self, pane_id: PaneId) -> Option<f32> {
         let mux = Mux::try_get()?;
         let tab = mux.get_active_tab_for_window(self.mux_window_id)?;
         let focused = tab
@@ -496,6 +573,43 @@ impl crate::TermWindow {
         ))
     }
 
+    /// The active pane's scrollbar thumb, for a pane of `dims` scrolled to
+    /// `viewport`, between the top and bottom bars.
+    pub(crate) fn scroll_thumb_geometry(
+        &self,
+        dims: &RenderableDimensions,
+        viewport: Option<StableRowIndex>,
+        top_bar_height: f32,
+        bottom_bar_height: f32,
+    ) -> ScrollThumbGeometry {
+        let border = self.get_os_border();
+        let thumb_y_offset = top_bar_height as usize + border.top.get();
+        let min_height = self.min_scroll_bar_height();
+        let info = ScrollHit::thumb(
+            dims,
+            viewport,
+            self.dimensions
+                .pixel_height
+                .saturating_sub(thumb_y_offset + border.bottom.get() + bottom_bar_height as usize),
+            min_height as usize,
+        );
+        // Adjust the scrollbar thumb position
+        let padding = self.effective_right_padding(&self.config) as f32;
+        let thumb_x = self
+            .dimensions
+            .pixel_width
+            .saturating_sub(padding as usize)
+            .saturating_sub(border.right.get());
+        ScrollThumbGeometry {
+            x: thumb_x,
+            width: padding,
+            track_top: thumb_y_offset,
+            offset: info.top,
+            height: info.height,
+            window_height: self.dimensions.pixel_height,
+        }
+    }
+
     fn draw_pane_border(
         &self,
         layers: &mut TripleLayerQuadAllocator,
@@ -503,32 +617,9 @@ impl crate::TermWindow {
         width: f32,
         color: LinearRgba,
     ) -> anyhow::Result<()> {
-        let max_width = rect.size.width.max(0.0).min(rect.size.height.max(0.0));
-        let border_w = width.max(1.0).min(max_width);
-        if border_w <= 0.0 {
-            return Ok(());
+        for edge in pane_border_rects(rect, width).into_iter().flatten() {
+            self.filled_rectangle(layers, 2, edge, color)?;
         }
-
-        let (x, y, w, h) = (
-            rect.origin.x,
-            rect.origin.y,
-            rect.size.width,
-            rect.size.height,
-        );
-        self.filled_rectangle(layers, 2, euclid::rect(x, y, w, border_w), color)?;
-        self.filled_rectangle(
-            layers,
-            2,
-            euclid::rect(x, y + h - border_w, w, border_w),
-            color,
-        )?;
-        self.filled_rectangle(layers, 2, euclid::rect(x, y, border_w, h), color)?;
-        self.filled_rectangle(
-            layers,
-            2,
-            euclid::rect(x + w - border_w, y, border_w, h),
-            color,
-        )?;
         Ok(())
     }
 
@@ -957,70 +1048,17 @@ impl crate::TermWindow {
         // changes to ScrollHit, mouse positioning, PositionedPane
         // and tab size calculation.
         if pos.is_active && self.show_scroll_bar {
-            let thumb_y_offset = top_bar_height as usize + border.top.get();
-
-            let min_height = self.min_scroll_bar_height();
-
-            let info = ScrollHit::thumb(
+            let thumb = self.scroll_thumb_geometry(
                 &dims,
                 current_viewport,
-                self.dimensions.pixel_height.saturating_sub(
-                    thumb_y_offset + border.bottom.get() + bottom_bar_height as usize,
-                ),
-                min_height as usize,
+                top_bar_height,
+                bottom_bar_height,
             );
-            let abs_thumb_top = thumb_y_offset + info.top;
-            let thumb_size = info.height;
             let color = palette.scrollbar_thumb.to_linear();
-
-            // Adjust the scrollbar thumb position
-            let config = &self.config;
-            let padding = self.effective_right_padding(&config) as f32;
-
-            let thumb_x = self
-                .dimensions
-                .pixel_width
-                .saturating_sub(padding as usize)
-                .saturating_sub(border.right.get());
-
             // Register the scroll bar location
-            self.ui_items.push(UIItem {
-                x: thumb_x,
-                width: padding as usize,
-                y: thumb_y_offset,
-                height: info.top,
-                item_type: UIItemType::AboveScrollThumb,
-            });
-            self.ui_items.push(UIItem {
-                x: thumb_x,
-                width: padding as usize,
-                y: abs_thumb_top,
-                height: thumb_size,
-                item_type: UIItemType::ScrollThumb,
-            });
-            self.ui_items.push(UIItem {
-                x: thumb_x,
-                width: padding as usize,
-                y: abs_thumb_top + thumb_size,
-                height: self
-                    .dimensions
-                    .pixel_height
-                    .saturating_sub(abs_thumb_top + thumb_size),
-                item_type: UIItemType::BelowScrollThumb,
-            });
-
-            self.filled_rectangle(
-                layers,
-                2,
-                euclid::rect(
-                    thumb_x as f32,
-                    abs_thumb_top as f32,
-                    padding,
-                    thumb_size as f32,
-                ),
-                color,
-            )
-            .context("filled_rectangle")?;
+            self.ui_items.extend(thumb.ui_items());
+            self.filled_rectangle(layers, 2, thumb.rect(), color)
+                .context("filled_rectangle")?;
         }
 
         let (selrange, rectangular) = {

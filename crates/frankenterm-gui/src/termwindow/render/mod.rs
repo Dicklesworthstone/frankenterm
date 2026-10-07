@@ -474,7 +474,7 @@ impl crate::TermWindow {
         }
     }
 
-    fn get_intensity_if_bell_target_ringing(
+    pub(crate) fn get_intensity_if_bell_target_ringing(
         &self,
         pane: &Arc<dyn Pane>,
         config: &ConfigHandle,
