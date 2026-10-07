@@ -322,6 +322,56 @@ fail-closed until its durable negative intent commits, preventing an older
 
 `click_interval_ms` controls how much time FrankenTerm allows between successive clicks when deciding whether a gesture counts as a double-click or triple-click selection. The default is `500`, which matches common desktop defaults, but operators who need a slower cadence can raise it to `1000`-`2000` in `frankenterm.toml`.
 
+### Text rendering
+
+These keys tune how glyphs are rasterized and blended. All of them work in
+`frankenterm.toml` and in a Lua config, and a config reload applies them.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `freetype_load_target` | `"Normal"` | Hinting mode: `Normal`, `Light`, `Mono`, `HorizontalLcd` or `VerticalLcd`. |
+| `freetype_render_target` | unset (uses `freetype_load_target`) | Render mode. `HorizontalLcd` or `VerticalLcd` turns on subpixel text. |
+| `freetype_lcd_filter` | `"Default"` | FreeType LCD filter for subpixel text: `Default`, `Light`, `Legacy` or `None`. No effect on grayscale text. |
+| `freetype_lcd_filter_weights` | unset | Five FIR weights (0-255) that replace the filter's own, for example `[0x08, 0x4d, 0x56, 0x4d, 0x08]` (the `Default` filter). |
+| `text_gamma` | unset | Coverage gamma, 0.01 or more. Higher values make text thicker, mostly dark text on a light background. |
+| `text_contrast` | unset | Extra coverage contrast, a percentage from 0 to 100. |
+
+The LCD filters, from FreeType: `Default` uses weights
+`0x08 0x4d 0x56 0x4d 0x08` and gives the least color fringing. `Light` uses
+`0x00 0x55 0x56 0x55 0x00`; it is sharper, with a little more fringing.
+`Legacy` is the pre-2.3 filter. `None` turns filtering off and shows strong
+color fringes. `freetype_lcd_filter` and `freetype_lcd_filter_weights` are
+read when fonts load, so a reload applies them but per-window config
+overrides do not.
+
+`text_gamma` and `text_contrast` follow kitty's `text_composition_strategy`.
+When neither is set, glyphs blend in gamma (sRGB) space as they always have.
+That is kitty's `legacy` mode: light text on a dark background looks thinner
+and dark text on a light background looks heavier. Setting either key
+switches text to linear-light blending and then applies kitty's curve to the
+glyph coverage:
+
+```
+coverage = clamp(mix(a, pow(a, 1 / text_gamma), w) * (1 + text_contrast / 100), 0, 1)
+w        = (1 - luminance(text) + luminance(background)) / 2
+```
+
+So `text_gamma` has its full effect on dark text on a light background and
+very little on light text on a dark background. `text_contrast` applies to
+all text. Some starting points:
+
+- `text_gamma = 1.0`: plain linear blending. Light-on-dark text gets
+  noticeably heavier than the default.
+- `text_gamma = 1.7` with `text_contrast = 30`: kitty's macOS default.
+
+The OpenGL front end blends in sRGB space, so the shader converts each
+coverage value to the one that gives a linear-light result. It needs the
+background color for that and uses the active pane's default background.
+Text on a different background (a selection, a colored cell, the tab bar)
+gets a slightly different curve. With subpixel text each color channel is
+converted separately. The WebGPU front end already blends in linear light
+and only applies the curve.
+
 ## Migration Guide: WezTerm -> FrankenTerm
 
 ### A. Config migration (Lua -> TOML)
