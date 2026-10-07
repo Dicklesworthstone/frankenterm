@@ -208,6 +208,11 @@ pub(crate) struct Performer<'a> {
     /// when a wrap is pending) and the cell is the one `recluster_at_cursor`
     /// would find left of the cursor.
     last_printed: Option<PrintedCell>,
+    /// The last cell of the ASCII run `write_ascii_run` wrote straight into
+    /// the rows, until the next `flush_print`. The run would otherwise still
+    /// sit in `print`, where the next printed text would be segmented
+    /// together with it (see `merge_into_junction`).
+    ascii_junction: Option<PrintedCell>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -335,6 +340,7 @@ impl<'a> Performer<'a> {
             state,
             print: String::new(),
             last_printed: None,
+            ascii_junction: None,
         }
     }
 
@@ -648,6 +654,8 @@ impl<'a> Performer<'a> {
     }
 
     fn flush_print(&mut self) {
+        // Whatever flushes also ends a direct ASCII run's junction.
+        let mut junction = self.ascii_junction.take();
         if self.print.is_empty() {
             return;
         }
@@ -673,6 +681,11 @@ impl<'a> Performer<'a> {
         }
 
         for g in Graphemes::new(text) {
+            if let Some(cell) = junction.take() {
+                if self.merge_into_junction(cell, g, seqno) {
+                    continue;
+                }
+            }
             let g = self.remap_grapheme(g);
 
             let mut print_width = grapheme_column_width(g, Some(&self.unicode_version));
@@ -873,6 +886,76 @@ impl<'a> Performer<'a> {
                 rest = "";
             }
         }
+        self.ascii_junction = self.last_printed;
+        true
+    }
+
+    /// The first grapheme flushed after `write_ascii_run` wrote a run
+    /// straight into the rows, with no flush in between: an escape sequence
+    /// the parser ignored dispatches nothing, so nothing flushed. Had the run
+    /// stayed in `print`, `Graphemes` would have segmented it together with
+    /// `g`, so `g` joins the run's last cell when the two form one grapheme,
+    /// exactly as that segmentation prints it. `recluster_at_cursor` cannot
+    /// stand in: without autowrap the cursor stays on the last column, so it
+    /// would pick the cell before (ft-yccm0.3.2.2; found by the M.7 campaign,
+    /// seed 20349669). Returns false, changing nothing, when they do not
+    /// form one grapheme.
+    fn merge_into_junction(&mut self, cell: PrintedCell, g: &str, seqno: usize) -> bool {
+        let right_margin = self.left_and_right_margins.end;
+        let dec_auto_wrap = self.dec_auto_wrap;
+        let junction = {
+            let screen = self.screen_mut();
+            let phys = screen.phys_row(cell.y);
+            // The visible cell left of `idx + 1` is the junction cell itself.
+            screen.with_merge_candidate(phys, cell.idx.saturating_add(1), false, |candidate| {
+                let candidate = candidate?;
+                (candidate.idx == cell.idx).then(|| {
+                    (
+                        candidate.text.to_string(),
+                        candidate.width,
+                        candidate.attrs(),
+                    )
+                })
+            })
+        };
+        let Some((text, width, attrs)) = junction else {
+            return false;
+        };
+        let mut combined = format!("{text}{g}");
+        // Normalizing the whole buffer would have composed across the
+        // junction too; the run's other characters are starters, so this
+        // combining sequence normalizes on its own.
+        if self.batch_config.normalize_output_to_unicode_nfc
+            && is_nfc_quick(combined.chars()) != IsNormalized::Yes
+        {
+            combined = combined.nfc().collect();
+        }
+        if Graphemes::new(combined.as_str()).count() != 1 {
+            return false;
+        }
+        let combined_width = grapheme_column_width(&combined, Some(&self.unicode_version));
+        if !(width..=2).contains(&combined_width) {
+            return false;
+        }
+        let ends_in_zwj = combined.ends_with('\u{200d}');
+        if ends_in_zwj {
+            self.zwj_tail_cell_possible = true;
+        }
+        let (cursor_x, wrap_next) = {
+            let screen = self.screen_mut();
+            let phys = screen.phys_row(cell.y);
+            screen.merge_grapheme(phys, cell.idx, &combined, combined_width, attrs, seqno);
+            // The cursor as printing `combined` at `idx` leaves it.
+            let next_x = cell.idx.saturating_add(combined_width);
+            if next_x >= right_margin {
+                (cell.idx, dec_auto_wrap)
+            } else {
+                (next_x, false)
+            }
+        };
+        self.cursor.x = cursor_x;
+        self.wrap_next = wrap_next;
+        self.note_printed(cell.y, cell.idx, combined_width, ends_in_zwj);
         true
     }
 
@@ -2835,6 +2918,64 @@ mod tests {
                     "big-endian SWAR mask diverged at byte position {pos} for byte {byte:#04x}"
                 );
             }
+        }
+    }
+
+    /// ft-yccm0.3.2.2, found by the M.7 campaign (seed 20349669): an ASCII
+    /// run written straight into the rows, then an escape sequence the parser
+    /// ignores (nothing dispatched, so nothing flushed), then a grapheme that
+    /// continues the run's last character. The buffered paths segment the
+    /// run and that grapheme together, so the fused path must print the same
+    /// cell, with autowrap off at the last column too.
+    #[test]
+    fn a_direct_ascii_run_joins_the_next_grapheme_across_an_ignored_sequence() {
+        let _bulk = BulkAsciiRowWriteOverride::set(true);
+        let cases: &[(&[u8], &str)] = &[
+            (b"\x1b[?7lcY691164;\x1b[,1_\xe2\x80\x8d", ";\u{200d}"),
+            ("ab\x1b[,1_\u{301}z".as_bytes(), "b\u{301}"),
+            ("ka\x1b[,1_\u{903}".as_bytes(), "a\u{903}"),
+            ("x\x1b[,1_\u{200d}\u{1f600}".as_bytes(), "x\u{200d}"),
+            // SGR flushes, so every path reclusters at the cursor instead.
+            ("ab\x1b[m\u{301}".as_bytes(), "b\u{301}"),
+        ];
+        for (bytes, cell) in cases {
+            let config: Arc<dyn TerminalConfiguration + Send + Sync> = Arc::new(GateTermConfig);
+            let size = TerminalSize {
+                rows: 5,
+                cols: 9,
+                pixel_width: 72,
+                pixel_height: 80,
+                dpi: 96,
+            };
+            let mut fused = Terminal::new(
+                size,
+                Arc::clone(&config),
+                "WezTerm",
+                "test",
+                Box::new(Vec::new()),
+            );
+            fused.advance_bytes(bytes);
+            let mut two_stage =
+                Terminal::new(size, config, "WezTerm", "test", Box::new(Vec::new()));
+            two_stage.perform_actions(Parser::new().parse_as_vec(bytes));
+            let what = String::from_utf8_lossy(bytes).to_string();
+            assert_eq!(
+                snapshot_terminal(&fused),
+                snapshot_terminal(&two_stage),
+                "{:?}",
+                what
+            );
+            let cells: Vec<String> = fused.screen().all_lines()[0]
+                .visible_cells()
+                .map(|cell| cell.str().to_string())
+                .collect();
+            assert!(
+                cells.iter().any(|text| text == cell),
+                "{:?}: no cell {:?} in {:?}",
+                what,
+                cell,
+                cells
+            );
         }
     }
 }
