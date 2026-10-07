@@ -191,6 +191,172 @@ pub trait FrameDriver {
     /// Builds, encodes and presents one frame for `surface`, whose geometry
     /// is the one last passed to [`Self::reconfigure`].
     fn frame(&mut self, surface: &Surface) -> FrameReport;
+
+    /// A display refresh tick passed without a frame. A driver that holds
+    /// something from the tick (a display link's drawable) releases it.
+    fn tick_skipped(&mut self) {}
+}
+
+/// Display refresh ticks for a render thread: a display link
+/// (ft-yccm0.4.1.3). It is created on the render thread with the driver and
+/// used only there; its [`Self::interrupter`] is the one thing other threads
+/// call.
+pub trait VsyncSource {
+    /// Waits for the next tick while running, until interrupted, or until
+    /// `timeout` passes (`None` waits for a tick or an interrupt).
+    fn wait(&mut self, timeout: Option<Duration>) -> VsyncWait;
+    /// Starts or pauses the ticks. A paused source draws no power and
+    /// returns from `wait` only when interrupted or timed out.
+    fn set_running(&mut self, running: bool);
+    /// Asks the display for a refresh rate.
+    fn set_rate_range(&mut self, range: FrameRateRange);
+    /// Interrupts a `wait` in progress, or the next one, from any thread.
+    fn interrupter(&self) -> Arc<dyn Fn() + Send + Sync>;
+}
+
+/// Why [`VsyncSource::wait`] returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VsyncWait {
+    Tick(VsyncTick),
+    Interrupted,
+    TimedOut,
+}
+
+/// One display refresh tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VsyncTick {
+    /// The display's current refresh period.
+    pub interval: Duration,
+}
+
+/// A refresh rate range to ask of the display, in frames per second
+/// (`CAFrameRateRange`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameRateRange {
+    pub minimum: f32,
+    pub maximum: f32,
+    pub preferred: f32,
+}
+
+/// The highest rate asked of a display while busy: ProMotion's 120 Hz.
+pub const BUSY_FRAME_RATE: f32 = 120.0;
+/// The rate asked while calm: slow output, a blinking cursor.
+pub const CALM_FRAME_RATE: f32 = 60.0;
+/// Two frames this close together make the window busy.
+pub const BUSY_WINDOW: Duration = Duration::from_millis(250);
+
+/// The rate a render thread asks of its display: 120 Hz (ProMotion) while
+/// busy with output or interaction, 60 Hz otherwise, and never more than
+/// `max_fps` (one frame per `min_frame_interval`). The range is a single
+/// rate, so the display ticks at a whole fraction of its refresh.
+pub fn preferred_frame_rate(min_frame_interval: Duration, busy: bool) -> FrameRateRange {
+    let max_fps = if min_frame_interval.is_zero() {
+        BUSY_FRAME_RATE
+    } else {
+        (1.0 / min_frame_interval.as_secs_f64()) as f32
+    };
+    let ceiling = if busy {
+        BUSY_FRAME_RATE
+    } else {
+        CALM_FRAME_RATE
+    };
+    let rate = max_fps.min(ceiling).max(1.0);
+    FrameRateRange {
+        minimum: rate,
+        maximum: rate,
+        preferred: rate,
+    }
+}
+
+/// How many refresh ticks apart frames must be to stay within `max_fps`
+/// (one frame per `min_frame_interval`): the smallest whole number of
+/// ticks at least that long. Frames then land on vsync at an even cadence:
+/// 30 fps on a 60 Hz display is exactly every second tick, never 2/2/3.
+pub fn ticks_per_frame(tick_interval: Duration, min_frame_interval: Duration) -> u32 {
+    if tick_interval.is_zero() {
+        return 1;
+    }
+    // Slack for timestamp jitter, so 33.3 ms over 16.7 ms ticks is 2, not 3.
+    let needed = min_frame_interval.saturating_sub(tick_interval / 8);
+    let ticks = needed.as_nanos().div_ceil(tick_interval.as_nanos());
+    u32::try_from(ticks).unwrap_or(u32::MAX).max(1)
+}
+
+/// Clean ticks in a row before an idle render thread pauses its display
+/// link.
+pub const IDLE_TICKS_BEFORE_PAUSE: u32 = 4;
+
+/// What to do on a display refresh tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickDecision {
+    /// Build and present a frame.
+    Frame,
+    /// Wait for a later tick.
+    Skip,
+    /// Nothing has needed drawing for a while: pause the display link.
+    Pause,
+}
+
+/// Picks the refresh ticks a render thread builds frames on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VsyncCadence {
+    ticks_since_frame: u32,
+    idle_ticks: u32,
+}
+
+impl Default for VsyncCadence {
+    fn default() -> Self {
+        Self {
+            // The first dirty tick always draws.
+            ticks_since_frame: u32::MAX,
+            idle_ticks: 0,
+        }
+    }
+}
+
+impl VsyncCadence {
+    /// Decides one tick: a frame when something is `dirty` and at least
+    /// `ticks_per_frame` ticks passed since the last frame; a pause after
+    /// [`IDLE_TICKS_BEFORE_PAUSE`] clean ticks in a row.
+    pub fn on_tick(&mut self, dirty: bool, ticks_per_frame: u32) -> TickDecision {
+        self.ticks_since_frame = self.ticks_since_frame.saturating_add(1);
+        if !dirty {
+            self.idle_ticks = self.idle_ticks.saturating_add(1);
+            return if self.idle_ticks >= IDLE_TICKS_BEFORE_PAUSE {
+                self.idle_ticks = 0;
+                TickDecision::Pause
+            } else {
+                TickDecision::Skip
+            };
+        }
+        self.idle_ticks = 0;
+        if self.ticks_since_frame >= ticks_per_frame {
+            self.ticks_since_frame = 0;
+            TickDecision::Frame
+        } else {
+            TickDecision::Skip
+        }
+    }
+}
+
+/// Whether frames are coming in quick succession (output or interaction).
+#[derive(Debug, Clone, Copy, Default)]
+struct Activity {
+    last: Option<Instant>,
+    previous: Option<Instant>,
+}
+
+impl Activity {
+    fn record(&mut self, at: Instant) {
+        self.previous = self.last;
+        self.last = Some(at);
+    }
+
+    /// Two frames within [`BUSY_WINDOW`] of `now`.
+    fn busy(&self, now: Instant) -> bool {
+        self.previous
+            .is_some_and(|previous| now.saturating_duration_since(previous) <= BUSY_WINDOW)
+    }
 }
 
 /// Counters of a render thread, for tests and diagnostics.
@@ -202,6 +368,10 @@ pub struct RenderThreadStats {
     pub wakes: u64,
     /// Times the thread paused because its window was occluded.
     pub pauses: u64,
+    /// Display refresh ticks received from a [`VsyncSource`].
+    pub vsync_ticks: u64,
+    /// Times a [`VsyncSource`] was started after a pause.
+    pub link_starts: u64,
 }
 
 #[derive(Default)]
@@ -211,12 +381,16 @@ struct Shared {
     pending: AtomicBool,
     stop: AtomicBool,
     thread: OnceLock<Thread>,
+    /// Interrupts a [`VsyncSource`] wait, for a thread paced by one.
+    interrupt: OnceLock<Arc<dyn Fn() + Send + Sync>>,
     min_frame_interval_ns: AtomicU64,
     frames_built: AtomicU64,
     frames_presented: AtomicU64,
     reconfigures: AtomicU64,
     wakes: AtomicU64,
     pauses: AtomicU64,
+    vsync_ticks: AtomicU64,
+    link_starts: AtomicU64,
 }
 
 impl Shared {
@@ -227,7 +401,11 @@ impl Shared {
         }
     }
 
+    /// Brings the thread out of its wait: a park, or a vsync source's wait.
     fn unpark(&self) {
+        if let Some(interrupt) = self.interrupt.get() {
+            interrupt();
+        }
         if let Some(thread) = self.thread.get() {
             thread.unpark();
         }
@@ -276,6 +454,24 @@ impl RenderThread {
         D: FrameDriver,
         F: FnOnce() -> D + Send + 'static,
     {
+        Self::spawn_paced(name, surface, min_frame_interval, move || {
+            (make_driver(), None)
+        })
+    }
+
+    /// Like [`Self::spawn`], but `make` may also return a [`VsyncSource`]
+    /// (ft-yccm0.4.1.3): frames are then built only on its refresh ticks.
+    /// Without one the thread paces to the frame interval on its own.
+    pub fn spawn_paced<D, F>(
+        name: String,
+        surface: SurfaceState,
+        min_frame_interval: Duration,
+        make: F,
+    ) -> std::io::Result<Self>
+    where
+        D: FrameDriver,
+        F: FnOnce() -> (D, Option<Box<dyn VsyncSource>>) + Send + 'static,
+    {
         let shared = Arc::new(Shared {
             mailbox: SurfaceMailbox::new(surface),
             pending: AtomicBool::new(true),
@@ -286,8 +482,16 @@ impl RenderThread {
         let join = std::thread::Builder::new()
             .name(name.clone())
             .spawn(move || {
-                log::debug!("render thread {name}: started");
-                run(&thread_shared, make_driver());
+                let (driver, vsync) = make();
+                log::debug!(
+                    "render thread {name}: started, paced by {}",
+                    if vsync.is_some() {
+                        "display refresh"
+                    } else {
+                        "its frame interval"
+                    }
+                );
+                run(&thread_shared, driver, vsync);
                 log::debug!("render thread {name}: stopped");
             })?;
         let _ = shared.thread.set(join.thread().clone());
@@ -334,6 +538,8 @@ impl RenderThread {
             reconfigures: shared.reconfigures.load(Ordering::Relaxed),
             wakes: shared.wakes.load(Ordering::Relaxed),
             pauses: shared.pauses.load(Ordering::Relaxed),
+            vsync_ticks: shared.vsync_ticks.load(Ordering::Relaxed),
+            link_starts: shared.link_starts.load(Ordering::Relaxed),
         }
     }
 
@@ -350,6 +556,7 @@ impl Drop for RenderThread {
         let Some(join) = self.join.take() else {
             return;
         };
+        self.shared.unpark();
         join.thread().unpark();
         if join.join().is_err() {
             log::error!("render thread panicked");
@@ -361,11 +568,159 @@ fn nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// The thread's loop: wait for a request (a wake, a post or a due redraw)
-/// and for the frame interval to pass, read the surface, follow its QoS,
-/// pause while occluded, reconfigure at the frame boundary when the
-/// geometry changed, then build one frame.
-fn run<D: FrameDriver>(shared: &Shared, mut driver: D) {
+/// Sets the thread's QoS for `surface` when it changed.
+fn follow_qos(qos: &mut Option<ThreadQos>, surface: &Surface) {
+    let wanted = surface.state.qos();
+    if *qos != Some(wanted) {
+        if let Err(err) = procinfo::set_current_thread_qos(wanted) {
+            log::debug!("render thread: cannot set QoS {wanted:?}: {err}");
+        }
+        log::debug!("render thread: QoS {wanted:?}");
+        *qos = Some(wanted);
+    }
+}
+
+/// Builds one frame for `surface`, reconfiguring the driver first when the
+/// geometry changed since the last frame (a frame boundary).
+fn build_frame<D: FrameDriver>(
+    shared: &Shared,
+    driver: &mut D,
+    configured: &mut Option<(u32, u32, u32)>,
+    surface: &Surface,
+) -> FrameReport {
+    if *configured != Some(surface.state.geometry()) {
+        let (width, height, dpi) = surface.state.geometry();
+        log::debug!("render thread: surface {width}x{height} at {dpi} dpi");
+        driver.reconfigure(surface);
+        *configured = Some(surface.state.geometry());
+        shared.reconfigures.fetch_add(1, Ordering::Relaxed);
+    }
+    let report = driver.frame(surface);
+    shared.frames_built.fetch_add(1, Ordering::Relaxed);
+    if report.presented {
+        shared.frames_presented.fetch_add(1, Ordering::Relaxed);
+    }
+    report
+}
+
+fn run<D: FrameDriver>(shared: &Shared, driver: D, vsync: Option<Box<dyn VsyncSource>>) {
+    match vsync {
+        Some(source) => run_vsync(shared, driver, source),
+        None => run_parked(shared, driver),
+    }
+}
+
+/// The loop of a thread paced by a [`VsyncSource`] (ft-yccm0.4.1.3).
+///
+/// Frames are built only on display refresh ticks, on the ticks
+/// [`VsyncCadence`] picks: at most one per `max_fps` interval, always a whole
+/// number of refresh periods apart. A wake or post starts the source and
+/// marks the next frame due; a few clean ticks pause it again, so an idle
+/// window draws nothing. The rate asked of the display follows
+/// [`preferred_frame_rate`].
+fn run_vsync<D: FrameDriver>(shared: &Shared, mut driver: D, mut source: Box<dyn VsyncSource>) {
+    let _ = shared.interrupt.set(source.interrupter());
+    let mut configured: Option<(u32, u32, u32)> = None;
+    let mut qos: Option<ThreadQos> = None;
+    let mut redraw_at: Option<Instant> = None;
+    let mut paused = false;
+    let mut running = false;
+    let mut cadence = VsyncCadence::default();
+    let mut activity = Activity::default();
+    let mut rate: Option<FrameRateRange> = None;
+    loop {
+        if shared.stop.load(Ordering::Acquire) {
+            return;
+        }
+        let surface = shared.mailbox.read();
+        follow_qos(&mut qos, &surface);
+        if surface.state.occluded {
+            if !paused {
+                log::debug!("render thread: paused while occluded");
+                shared.pauses.fetch_add(1, Ordering::Relaxed);
+                paused = true;
+            }
+            if running {
+                source.set_running(false);
+                running = false;
+            }
+            // Swallow output wakes; only a post (which always interrupts)
+            // can make the window visible again.
+            shared.pending.store(true, Ordering::Release);
+            redraw_at = None;
+            source.wait(None);
+            continue;
+        }
+        if paused {
+            log::debug!("render thread: resumed");
+            paused = false;
+        }
+        let now = Instant::now();
+        let due = |redraw_at: Option<Instant>, now: Instant| redraw_at.is_some_and(|at| at <= now);
+        let requested = shared.pending.load(Ordering::Acquire) || due(redraw_at, now);
+        if requested && !running {
+            source.set_running(true);
+            running = true;
+            shared.link_starts.fetch_add(1, Ordering::Relaxed);
+        }
+        let timeout = if running {
+            None
+        } else {
+            redraw_at.map(|at| at.saturating_duration_since(now))
+        };
+        let tick = match source.wait(timeout) {
+            VsyncWait::Tick(tick) => tick,
+            VsyncWait::Interrupted | VsyncWait::TimedOut => continue,
+        };
+        shared.vsync_ticks.fetch_add(1, Ordering::Relaxed);
+        let now = Instant::now();
+        let dirty = shared.pending.load(Ordering::Acquire) || due(redraw_at, now);
+        let ticks = ticks_per_frame(tick.interval, shared.min_frame_interval());
+        match cadence.on_tick(dirty, ticks) {
+            TickDecision::Frame => {}
+            TickDecision::Skip => {
+                driver.tick_skipped();
+                continue;
+            }
+            TickDecision::Pause => {
+                driver.tick_skipped();
+                source.set_running(false);
+                running = false;
+                log::trace!("render thread: display link paused while idle");
+                continue;
+            }
+        }
+        // The surface may have changed while waiting for the tick.
+        let surface = shared.mailbox.read();
+        if surface.state.occluded {
+            driver.tick_skipped();
+            continue;
+        }
+        // The frame shows everything before this point; a wake after it
+        // asks for the next frame.
+        shared.pending.store(false, Ordering::Release);
+        if due(redraw_at, now) {
+            redraw_at = None;
+        }
+        let report = build_frame(shared, &mut driver, &mut configured, &surface);
+        if let Some(at) = report.redraw_at {
+            redraw_at = Some(redraw_at.map_or(at, |due| due.min(at)));
+        }
+        activity.record(now);
+        let wanted = preferred_frame_rate(shared.min_frame_interval(), activity.busy(now));
+        if rate != Some(wanted) {
+            log::debug!("render thread: frame rate {wanted:?}");
+            source.set_rate_range(wanted);
+            rate = Some(wanted);
+        }
+    }
+}
+
+/// The loop of a thread without a [`VsyncSource`]: wait for a request (a
+/// wake, a post or a due redraw) and for the frame interval to pass, read
+/// the surface, follow its QoS, pause while occluded, reconfigure at the
+/// frame boundary when the geometry changed, then build one frame.
+fn run_parked<D: FrameDriver>(shared: &Shared, mut driver: D) {
     let mut configured: Option<(u32, u32, u32)> = None;
     let mut qos: Option<ThreadQos> = None;
     let mut last_frame: Option<Instant> = None;
@@ -403,14 +758,7 @@ fn run<D: FrameDriver>(shared: &Shared, mut driver: D) {
         }
 
         let surface = shared.mailbox.read();
-        let wanted = surface.state.qos();
-        if qos != Some(wanted) {
-            if let Err(err) = procinfo::set_current_thread_qos(wanted) {
-                log::debug!("render thread: cannot set QoS {wanted:?}: {err}");
-            }
-            log::debug!("render thread: QoS {wanted:?}");
-            qos = Some(wanted);
-        }
+        follow_qos(&mut qos, &surface);
         if surface.state.occluded {
             if paused.is_none() {
                 log::debug!("render thread: paused while occluded");
@@ -432,19 +780,8 @@ fn run<D: FrameDriver>(shared: &Shared, mut driver: D) {
             redraw_at = None;
         }
 
-        if configured != Some(surface.state.geometry()) {
-            let (width, height, dpi) = surface.state.geometry();
-            log::debug!("render thread: surface {width}x{height} at {dpi} dpi");
-            driver.reconfigure(&surface);
-            configured = Some(surface.state.geometry());
-            shared.reconfigures.fetch_add(1, Ordering::Relaxed);
-        }
-        let report = driver.frame(&surface);
+        let report = build_frame(shared, &mut driver, &mut configured, &surface);
         last_frame = Some(Instant::now());
-        shared.frames_built.fetch_add(1, Ordering::Relaxed);
-        if report.presented {
-            shared.frames_presented.fetch_add(1, Ordering::Relaxed);
-        }
         if let Some(at) = report.redraw_at {
             redraw_at = Some(redraw_at.map_or(at, |due| due.min(at)));
         }
@@ -756,5 +1093,313 @@ mod tests {
             "{frames} frames in {elapsed:?} at a 20 ms interval"
         );
         assert!(frames >= 2, "wakes produced {frames} frames");
+    }
+
+    // ft-yccm0.4.1.3: display-link pacing, with a fake link the test ticks.
+
+    fn hz(rate: f64) -> Duration {
+        Duration::from_secs_f64(1.0 / rate)
+    }
+
+    #[test]
+    fn ticks_per_frame_is_the_whole_number_of_refresh_periods_max_fps_allows() {
+        for (refresh, max_fps, ticks) in [
+            (60.0, 30.0, 2),
+            (60.0, 60.0, 1),
+            (60.0, 120.0, 1),
+            (120.0, 30.0, 4),
+            (120.0, 60.0, 2),
+            (120.0, 120.0, 1),
+            // 50 fps fits no whole number of 60 Hz periods: the bound wins.
+            (60.0, 50.0, 2),
+            (120.0, 50.0, 3),
+        ] {
+            assert_eq!(
+                ticks_per_frame(hz(refresh), hz(max_fps)),
+                ticks,
+                "{max_fps} fps at {refresh} Hz"
+            );
+        }
+        assert_eq!(ticks_per_frame(Duration::ZERO, hz(60.0)), 1);
+    }
+
+    #[test]
+    fn the_cadence_draws_every_nth_dirty_tick_and_pauses_after_clean_ones() {
+        let mut cadence = VsyncCadence::default();
+        let decisions: Vec<_> = (0..6).map(|_| cadence.on_tick(true, 2)).collect();
+        use TickDecision::{Frame, Pause, Skip};
+        assert_eq!(decisions, [Frame, Skip, Frame, Skip, Frame, Skip]);
+        let clean: Vec<_> = (0..IDLE_TICKS_BEFORE_PAUSE)
+            .map(|_| cadence.on_tick(false, 2))
+            .collect();
+        assert_eq!(clean.last(), Some(&Pause));
+        assert!(
+            clean[..clean.len() - 1]
+                .iter()
+                .all(|decision| *decision == Skip)
+        );
+        // Dirty again after the pause: the first tick draws at once.
+        assert_eq!(cadence.on_tick(true, 2), Frame);
+    }
+
+    #[test]
+    fn the_rate_asked_of_the_display_follows_activity_under_max_fps() {
+        let rate = |max_fps: f64, busy: bool| preferred_frame_rate(hz(max_fps), busy).preferred;
+        assert_eq!(rate(120.0, true), 120.0);
+        assert_eq!(rate(120.0, false), 60.0);
+        assert_eq!(rate(60.0, true), 60.0);
+        assert_eq!(rate(30.0, true), 30.0);
+        assert_eq!(rate(30.0, false), 30.0);
+        let range = preferred_frame_rate(hz(30.0), true);
+        assert_eq!((range.minimum, range.maximum), (30.0, 30.0));
+
+        let start = Instant::now();
+        let mut activity = Activity::default();
+        activity.record(start);
+        assert!(!activity.busy(start), "one frame is not busy");
+        activity.record(start + Duration::from_millis(100));
+        assert!(activity.busy(start + Duration::from_millis(100)));
+        assert!(!activity.busy(start + Duration::from_millis(400)));
+    }
+
+    enum LinkMessage {
+        Tick(Duration),
+        Interrupt,
+    }
+
+    #[derive(Default)]
+    struct LinkLog {
+        running: Vec<bool>,
+        ranges: Vec<FrameRateRange>,
+    }
+
+    /// A display link the test ticks by hand. A paused link drops ticks,
+    /// as a real one does not deliver them.
+    struct FakeLink {
+        rx: std::sync::mpsc::Receiver<LinkMessage>,
+        tx: std::sync::mpsc::Sender<LinkMessage>,
+        running: bool,
+        returned: u64,
+        /// The ticks returned before the thread last entered `wait`.
+        settled: Arc<AtomicU64>,
+        log: Arc<Mutex<LinkLog>>,
+    }
+
+    impl VsyncSource for FakeLink {
+        fn wait(&mut self, timeout: Option<Duration>) -> VsyncWait {
+            self.settled.store(self.returned, Ordering::Release);
+            let deadline = timeout.map(|timeout| Instant::now() + timeout);
+            loop {
+                let message = match deadline {
+                    Some(deadline) => match self
+                        .rx
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    {
+                        Ok(message) => message,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            return VsyncWait::TimedOut;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            return VsyncWait::Interrupted;
+                        }
+                    },
+                    None => match self.rx.recv() {
+                        Ok(message) => message,
+                        Err(_) => return VsyncWait::Interrupted,
+                    },
+                };
+                match message {
+                    LinkMessage::Interrupt => return VsyncWait::Interrupted,
+                    LinkMessage::Tick(_) if !self.running => continue,
+                    LinkMessage::Tick(interval) => {
+                        self.returned += 1;
+                        return VsyncWait::Tick(VsyncTick { interval });
+                    }
+                }
+            }
+        }
+
+        fn set_running(&mut self, running: bool) {
+            self.running = running;
+            self.log.lock().unwrap().running.push(running);
+        }
+
+        fn set_rate_range(&mut self, range: FrameRateRange) {
+            self.log.lock().unwrap().ranges.push(range);
+        }
+
+        fn interrupter(&self) -> Arc<dyn Fn() + Send + Sync> {
+            let tx = self.tx.clone();
+            Arc::new(move || {
+                let _ = tx.send(LinkMessage::Interrupt);
+            })
+        }
+    }
+
+    struct LinkHandle {
+        tx: std::sync::mpsc::Sender<LinkMessage>,
+        settled: Arc<AtomicU64>,
+        expected: std::cell::Cell<u64>,
+        log: Arc<Mutex<LinkLog>>,
+    }
+
+    impl LinkHandle {
+        /// A tick of a running link; returns once the thread has drawn or
+        /// skipped it and is waiting again.
+        fn tick(&self, interval: Duration) {
+            self.expected.set(self.expected.get() + 1);
+            self.tx.send(LinkMessage::Tick(interval)).unwrap();
+            let expected = self.expected.get();
+            assert!(
+                eventually(|| self.settled.load(Ordering::Acquire) >= expected),
+                "the render thread never dealt with tick {expected}"
+            );
+        }
+
+        /// A tick sent to a link the thread has paused: it is dropped.
+        fn tick_while_paused(&self, interval: Duration) {
+            self.tx.send(LinkMessage::Tick(interval)).unwrap();
+        }
+
+        fn running(&self) -> Vec<bool> {
+            self.log.lock().unwrap().running.clone()
+        }
+    }
+
+    /// Always dirty: asks to be drawn again at once.
+    struct DirtyDriver(bool);
+
+    impl FrameDriver for DirtyDriver {
+        fn reconfigure(&mut self, _surface: &Surface) {}
+
+        fn frame(&mut self, _surface: &Surface) -> FrameReport {
+            FrameReport {
+                presented: true,
+                redraw_at: self.0.then(Instant::now),
+            }
+        }
+    }
+
+    fn spawn_with_fake_link(max_fps: f64, always_dirty: bool) -> (RenderThread, LinkHandle) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let settled = Arc::new(AtomicU64::new(0));
+        let log = Arc::new(Mutex::new(LinkLog::default()));
+        let link = FakeLink {
+            rx,
+            tx: tx.clone(),
+            running: false,
+            returned: 0,
+            settled: Arc::clone(&settled),
+            log: Arc::clone(&log),
+        };
+        let thread = RenderThread::spawn_paced(
+            "ft-render-link-test".to_string(),
+            correlated(0),
+            hz(max_fps),
+            move || {
+                (
+                    DirtyDriver(always_dirty),
+                    Some(Box::new(link) as Box<dyn VsyncSource>),
+                )
+            },
+        )
+        .unwrap();
+        let handle = LinkHandle {
+            tx,
+            settled,
+            expected: std::cell::Cell::new(0),
+            log,
+        };
+        // The first frame is due at once, so the thread starts its link.
+        assert!(eventually(|| handle.running() == [true]));
+        (thread, handle)
+    }
+
+    /// The ticks, numbered from 1, on which frames were built while the
+    /// window stayed dirty.
+    fn frame_ticks(refresh: f64, max_fps: f64, ticks: u64) -> Vec<u64> {
+        let (thread, link) = spawn_with_fake_link(max_fps, true);
+        let mut drawn = Vec::new();
+        for tick in 1..=ticks {
+            let before = thread.stats().frames_built;
+            link.tick(hz(refresh));
+            if thread.stats().frames_built > before {
+                drawn.push(tick);
+            }
+        }
+        assert_eq!(thread.stats().vsync_ticks, ticks);
+        drawn
+    }
+
+    /// The acceptance test for max_fps: frames land on every Nth refresh
+    /// tick exactly, at 60 and 120 Hz, never with 2/2/3 judder.
+    #[test]
+    fn max_fps_frames_land_on_every_nth_refresh_tick() {
+        for (refresh, max_fps, every) in [
+            (60.0, 30.0, 2),
+            (60.0, 60.0, 1),
+            (60.0, 120.0, 1),
+            (120.0, 30.0, 4),
+            (120.0, 60.0, 2),
+            (120.0, 120.0, 1),
+        ] {
+            let expected: Vec<u64> = (1..=24).step_by(every).collect();
+            assert_eq!(
+                frame_ticks(refresh, max_fps, 24),
+                expected,
+                "{max_fps} fps at {refresh} Hz"
+            );
+        }
+    }
+
+    /// An idle window pauses its link after a few clean ticks and draws
+    /// nothing; a wake starts the link again, and the frame waits for its
+    /// next tick: frames are built only on ticks.
+    #[test]
+    fn an_idle_window_pauses_its_link_and_draws_only_on_ticks() {
+        let (thread, link) = spawn_with_fake_link(60.0, false);
+        link.tick(hz(60.0));
+        assert_eq!(thread.stats().frames_built, 1, "the first tick draws");
+        for _ in 0..IDLE_TICKS_BEFORE_PAUSE {
+            link.tick(hz(60.0));
+        }
+        assert_eq!(link.running(), [true, false], "clean ticks pause the link");
+        for _ in 0..10 {
+            link.tick_while_paused(hz(60.0));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(thread.stats().frames_built, 1);
+
+        thread.waker().wake();
+        assert!(eventually(|| link.running() == [true, false, true]));
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            thread.stats().frames_built,
+            1,
+            "a wake starts the link but draws nothing before its tick"
+        );
+        link.tick(hz(60.0));
+        assert_eq!(thread.stats().frames_built, 2);
+        assert_eq!(thread.stats().link_starts, 2);
+    }
+
+    /// Busy output asks a 120 Hz display for its full rate when max_fps
+    /// allows; the rate stays within max_fps.
+    #[test]
+    fn busy_frames_ask_the_display_for_max_fps() {
+        let (_thread, link) = spawn_with_fake_link(120.0, true);
+        for _ in 0..6 {
+            link.tick(hz(120.0));
+        }
+        let ranges = link.log.lock().unwrap().ranges.clone();
+        assert_eq!(ranges.last().map(|range| range.preferred), Some(120.0));
+        assert!(ranges.iter().all(|range| range.preferred <= 120.0));
+
+        let (_thread, link) = spawn_with_fake_link(30.0, true);
+        for _ in 0..8 {
+            link.tick(hz(60.0));
+        }
+        let ranges = link.log.lock().unwrap().ranges.clone();
+        assert!(ranges.iter().all(|range| range.preferred == 30.0));
     }
 }
