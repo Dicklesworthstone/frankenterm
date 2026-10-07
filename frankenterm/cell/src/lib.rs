@@ -1467,7 +1467,7 @@ impl UnicodeVersion {
                 return (*width).into();
             }
         }
-        self.width(WCWIDTH_TABLE.classify(c))
+        self.width(classify_width(c))
     }
 
     #[inline]
@@ -1482,6 +1482,79 @@ pub const LATEST_UNICODE_VERSION: UnicodeVersion = UnicodeVersion {
     #[cfg(feature = "std")]
     cell_widths: None,
 };
+
+/// The width class of `c`. The static table answers below U+10000, and in
+/// std builds [`plane1_widths`] answers plane 1, where nearly every emoji
+/// lives. Anything else goes to `WcWidth::from_char`, which searches up to
+/// ten range tables in turn: about 9% of headless T0 time before plane 1
+/// was memoized (ft-yccm0).
+#[inline]
+fn classify_width(c: char) -> WcWidth {
+    #[cfg(feature = "std")]
+    if let Some(width) = plane1_widths::classify(c) {
+        return width;
+    }
+    WCWIDTH_TABLE.classify(c)
+}
+
+/// `WcWidth::from_char` over plane 1 (U+10000..=U+1FFFF), memoized in blocks
+/// of 256 code points, each filled the first time one of its code points is
+/// classified (ft-yccm0). It answers exactly as `from_char` does.
+/// `FT_WCWIDTH_PLANE1_CACHE` set falsey (`0`, `false`, `off`, `no` or empty)
+/// turns it off for the process, for A/B runs and as a kill switch.
+#[cfg(feature = "std")]
+mod plane1_widths {
+    use super::WcWidth;
+    use std::sync::OnceLock;
+
+    const FIRST: u32 = 0x1_0000;
+    const LAST: u32 = 0x1_ffff;
+    const BLOCK: u32 = 256;
+    const BLOCKS: usize = ((LAST - FIRST + 1) / BLOCK) as usize;
+    const ENV: &str = "FT_WCWIDTH_PLANE1_CACHE";
+
+    static TABLE: [OnceLock<[WcWidth; BLOCK as usize]>; BLOCKS] =
+        [const { OnceLock::new() }; BLOCKS];
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+
+    /// The width class of `c`, when `c` is in plane 1 and the cache is on.
+    #[inline]
+    pub(super) fn classify(c: char) -> Option<WcWidth> {
+        let code = u32::from(c);
+        if !(FIRST..=LAST).contains(&code) || !enabled() {
+            return None;
+        }
+        Some(block(code)[((code - FIRST) % BLOCK) as usize])
+    }
+
+    /// The block holding `code`, a plane 1 code point, filled on first use.
+    pub(super) fn block(code: u32) -> &'static [WcWidth; BLOCK as usize] {
+        let offset = code - FIRST;
+        TABLE[(offset / BLOCK) as usize].get_or_init(|| {
+            let base = code - offset % BLOCK;
+            core::array::from_fn(|index| {
+                // Plane 1 holds no surrogates, so every value is a char.
+                char::from_u32(base + index as u32).map_or(WcWidth::Unassigned, WcWidth::from_char)
+            })
+        })
+    }
+
+    fn enabled() -> bool {
+        *ENABLED.get_or_init(|| enabled_for_value(std::env::var(ENV).ok().as_deref()))
+    }
+
+    /// On unless `value` is falsey, as the parser's kill switches read.
+    pub(super) fn enabled_for_value(value: Option<&str>) -> bool {
+        !value.is_some_and(|value| {
+            let value = value.trim();
+            value.is_empty()
+                || value == "0"
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("off")
+                || value.eq_ignore_ascii_case("no")
+        })
+    }
+}
 
 /// Returns true if the char `c` has the unicode White_Space property
 pub fn is_white_space_char(c: char) -> bool {
@@ -1603,6 +1676,42 @@ mod test {
     use super::*;
     use crate::color::SrgbaTuple;
     use alloc::{format, vec};
+
+    /// ft-yccm0: the plane 1 width cache answers exactly as
+    /// `WcWidth::from_char` for every code point it covers, filled block
+    /// by block, and classification elsewhere is unchanged.
+    #[cfg(feature = "std")]
+    #[test]
+    fn plane1_width_cache_answers_as_from_char_for_every_code_point() {
+        for code in 0x1_0000..=0x1_ffff_u32 {
+            let c = char::from_u32(code).expect("plane 1 holds no surrogates");
+            let expected = WcWidth::from_char(c);
+            assert_eq!(
+                plane1_widths::block(code)[(code % 256) as usize],
+                expected,
+                "U+{code:05X} from the cache"
+            );
+            assert_eq!(classify_width(c), expected, "U+{code:05X} classified");
+        }
+        for c in ['a', '\u{7f}', '\u{e001}', '\u{4e00}', '\u{ffff}'] {
+            assert_eq!(classify_width(c), WCWIDTH_TABLE.classify(c), "{c:?}");
+        }
+        for c in ['\u{20000}', '\u{3fffd}', '\u{e0001}', '\u{10fffd}'] {
+            assert_eq!(classify_width(c), WcWidth::from_char(c), "{c:?}");
+        }
+        assert_eq!(grapheme_column_width("\u{1f600}", None), 2);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn plane1_width_cache_kill_switch_reads_falsey_values() {
+        assert!(plane1_widths::enabled_for_value(None));
+        assert!(plane1_widths::enabled_for_value(Some("1")));
+        assert!(plane1_widths::enabled_for_value(Some("on")));
+        for value in ["", " ", "0", "false", "OFF", "No"] {
+            assert!(!plane1_widths::enabled_for_value(Some(value)), "{value:?}");
+        }
+    }
 
     #[test]
     fn teeny_string() {
