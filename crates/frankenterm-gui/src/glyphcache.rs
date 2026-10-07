@@ -2961,6 +2961,24 @@ impl GlyphCache {
     }
 
     fn line_sprite(&mut self, key: LineKey, metrics: &RenderMetrics) -> anyhow::Result<Sprite> {
+        let buffer =
+            Self::line_sprite_image(key.strike_through, key.underline, key.overline, metrics);
+        let sprite = self.atlas.allocate(&buffer)?;
+        self.line_glyphs.insert(key, sprite.clone());
+        Ok(sprite)
+    }
+
+    /// The bitmap of a line sprite: one cell of `metrics` with the
+    /// strikethrough, `underline` and overline drawn white (the alpha is the
+    /// coverage) over transparent black. The WebGpu renderer allocates it in
+    /// its atlas; the Metal renderer places the same pixels in its grayscale
+    /// atlas, so both draw decorations identically (ft-yccm0.4.7.3).
+    pub(crate) fn line_sprite_image(
+        strike_through: bool,
+        underline: Underline,
+        overline: bool,
+        metrics: &RenderMetrics,
+    ) -> Image {
         let mut buffer = Image::new(
             metrics.cell_size.width as usize,
             metrics.cell_size.height as usize,
@@ -3134,10 +3152,10 @@ impl GlyphCache {
         };
 
         buffer.clear_rect(cell_rect, black);
-        if key.overline {
+        if overline {
             draw_overline(&mut buffer);
         }
-        match key.underline {
+        match underline {
             Underline::None => {}
             Underline::Single => draw_single(&mut buffer),
             Underline::Curly => draw_curly(&mut buffer),
@@ -3145,12 +3163,10 @@ impl GlyphCache {
             Underline::Dotted => draw_dotted(&mut buffer),
             Underline::Double => draw_double(&mut buffer),
         }
-        if key.strike_through {
+        if strike_through {
             draw_strike(&mut buffer);
         }
-        let sprite = self.atlas.allocate(&buffer)?;
-        self.line_glyphs.insert(key, sprite.clone());
-        Ok(sprite)
+        buffer
     }
 
     /// Figure out what we're going to draw for the underline.
@@ -3164,11 +3180,11 @@ impl GlyphCache {
         overline: bool,
         metrics: &RenderMetrics,
     ) -> anyhow::Result<Sprite> {
-        let effective_underline = match (is_highlited_hyperlink, underline) {
-            (true, Underline::None) => Underline::Single,
-            (true, Underline::Single) => Underline::Double,
-            (true, _) => Underline::Single,
-            (false, u) => u,
+        // One rule for both renderers (ft-yccm0.4.7.3).
+        let effective_underline = if is_highlited_hyperlink {
+            frankenterm_gui::metal_scene::hovered_underline(underline)
+        } else {
+            underline
         };
 
         let key = LineKey {

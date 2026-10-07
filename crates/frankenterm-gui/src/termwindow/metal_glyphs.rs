@@ -12,6 +12,10 @@
 //! advances through the cluster's glyphs, each sits at its shaped offset plus
 //! its bearing, and the baseline is the cell's descender above the bottom.
 //!
+//! Decorations are the WebGpu renderer's line sprites (ft-yccm0.4.7.3): the
+//! same cell-sized bitmaps ([`GlyphCache::line_sprite_image`]) placed in the
+//! grayscale atlas, so underline patterns match pixel for pixel.
+//!
 //! Placed glyphs are cached by grapheme, style and width. Every frame touches
 //! the cached slots, so the atlases keep them.
 //! - A fallback font resolving asynchronously (a completion from the shaper)
@@ -26,10 +30,11 @@
 //! - double-width and double-height lines;
 //! - ligatures across cells (every cell is shaped alone).
 
+use crate::glyphcache::GlyphCache;
 use crate::utilsprites::RenderMetrics;
 use frankenterm_font::FontConfiguration;
 use frankenterm_font::rasterizer::RasterizedGlyph;
-use frankenterm_gui::metal_scene::{GlyphSource, GlyphStyle, PlacedGlyph};
+use frankenterm_gui::metal_scene::{GlyphSource, GlyphStyle, LineSprite, PlacedGlyph};
 use frankenterm_renderer_metal::{AtlasKind, MetalRenderer};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -37,6 +42,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use termwiz::cell::{CellAttributes, Intensity};
 use wezterm_bidi::Direction;
+use window::bitmaps::BitmapImage;
 
 type ByText = HashMap<String, Vec<PlacedGlyph>>;
 
@@ -46,9 +52,13 @@ pub(crate) struct FontGlyphs {
     renderer: Rc<MetalRenderer>,
     cell_height: f64,
     descender: f64,
+    /// The cell geometry line sprites are drawn for.
+    metrics: RenderMetrics,
     /// The configuration generation the glyphs were rasterized under.
     config_generation: usize,
     placed: HashMap<(GlyphStyle, usize), ByText>,
+    /// Line sprites placed in the grayscale atlas (ft-yccm0.4.7.3).
+    lines: HashMap<LineSprite, PlacedGlyph>,
     /// Set by the shaper when a fallback font finishes resolving.
     fallback_resolved: Arc<AtomicBool>,
     /// An atlas refused a glyph: clear the cache before the next frame.
@@ -94,8 +104,10 @@ impl FontGlyphs {
             renderer,
             cell_height: metrics.cell_size.height as f64,
             descender: metrics.descender.get(),
+            metrics: *metrics,
             config_generation,
             placed: HashMap::new(),
+            lines: HashMap::new(),
             fallback_resolved: Arc::new(AtomicBool::new(false)),
             reset: false,
         }
@@ -132,13 +144,50 @@ impl FontGlyphs {
                 .values()
                 .flat_map(HashMap::values)
                 .flatten()
+                .chain(self.lines.values())
                 .all(|glyph| renderer.touch_glyph(&glyph.slot));
             rebuild = !alive;
         }
         if rebuild {
             self.placed.clear();
+            self.lines.clear();
         }
         rebuild
+    }
+
+    /// Places the WebGpu renderer's line sprite for `lines` in the grayscale
+    /// atlas: the same bitmap ([`GlyphCache::line_sprite_image`]), its alpha
+    /// as coverage, at the cell's top-left.
+    fn place_line(&mut self, lines: LineSprite) -> Option<PlacedGlyph> {
+        let image = GlyphCache::line_sprite_image(
+            lines.strikethrough,
+            lines.underline,
+            lines.overline,
+            &self.metrics,
+        );
+        let (width, height) = image.image_dimensions();
+        let coverage: Vec<u8> = image
+            .pixel_data_slice()
+            .chunks_exact(4)
+            .map(|rgba| rgba[3])
+            .collect();
+        let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
+            return None;
+        };
+        match self
+            .renderer
+            .insert_glyph(AtlasKind::Grayscale, width, height, &coverage)
+        {
+            Ok(slot) => Some(PlacedGlyph {
+                slot,
+                offset: [0, 0],
+            }),
+            Err(err) => {
+                log::debug!("Metal glyphs: atlas refused line sprite {lines:?}: {err}");
+                self.reset = true;
+                None
+            }
+        }
     }
 
     fn place(&mut self, text: &str, style: GlyphStyle) -> Vec<PlacedGlyph> {
@@ -239,5 +288,14 @@ impl GlyphSource for FontGlyphs {
             .get(&(style, width))
             .and_then(|by_text| by_text.get(text))
             .map_or(&[], Vec::as_slice)
+    }
+
+    fn line_sprite(&mut self, lines: LineSprite) -> Option<PlacedGlyph> {
+        if let Some(placed) = self.lines.get(&lines) {
+            return Some(*placed);
+        }
+        let placed = self.place_line(lines)?;
+        self.lines.insert(lines, placed);
+        Some(placed)
     }
 }

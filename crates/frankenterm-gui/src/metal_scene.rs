@@ -22,8 +22,11 @@
 //!   cursor's cell takes the cursor foreground;
 //! - invisible text, or text in the color it sits on (its background, the
 //!   selection's, or a focused block cursor's), draws no glyph;
-//! - an underline takes its own color (SGR 58), or else the foreground;
-//! - the hovered hyperlink is underlined.
+//! - underline, strikethrough and overline are one line sprite per cell
+//!   ([`LineSprite`]), drawn under the row's glyphs in the underline color
+//!   (SGR 58, or else the cell's foreground before selection and cursor
+//!   colors), as the WebGpu renderer draws them;
+//! - the hovered hyperlink is underlined ([`hovered_underline`]).
 //!
 //! The background pass draws the selection tint and the cursor itself. The
 //! caller builds its uniforms.
@@ -32,7 +35,7 @@
 //! renderer's atlases, or a synthetic source in tests.
 
 use frankenterm_renderer_metal::{
-    AtlasSlot, CellBg, CellBgGrid, CellText, CellTextGrid, GridExtent, UnderlineStyle,
+    AtlasSlot, CellBg, CellBgGrid, CellText, CellTextGrid, GridExtent,
 };
 use mux::render_mirror::{MirrorCell, MirrorColor, MirrorRow, RenderMirror};
 use std::ops::Range;
@@ -58,11 +61,44 @@ pub struct PlacedGlyph {
     pub offset: [i16; 2],
 }
 
+/// The lines one cell's decorations draw. Like the WebGpu renderer, the
+/// scene draws them as one sprite per cell (ft-yccm0.4.7.3), so curly,
+/// dotted and dashed patterns come from the same pixels on both paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LineSprite {
+    pub underline: Underline,
+    pub strikethrough: bool,
+    pub overline: bool,
+}
+
+impl LineSprite {
+    /// Whether the sprite draws anything.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.underline == Underline::None && !self.strikethrough && !self.overline
+    }
+}
+
+/// The underline of a cell in the hovered hyperlink: a plain cell gets a
+/// single underline, a single underline becomes double, and any other style
+/// becomes single. The WebGpu renderer applies the same rule.
+#[must_use]
+pub fn hovered_underline(underline: Underline) -> Underline {
+    match underline {
+        Underline::Single => Underline::Double,
+        _ => Underline::Single,
+    }
+}
+
 /// Where the glyphs of a frame come from.
 pub trait GlyphSource {
     /// The glyphs that draw `text` (one grapheme) in `style` across `width`
     /// cells. Empty when the fonts have nothing to draw.
     fn glyphs(&mut self, text: &str, style: GlyphStyle, width: usize) -> &[PlacedGlyph];
+
+    /// The grayscale sprite that draws `lines` over one cell, placed from
+    /// the cell's top-left; `None` when the source has none.
+    fn line_sprite(&mut self, lines: LineSprite) -> Option<PlacedGlyph>;
 }
 
 /// What a frame's colors depend on besides the cells.
@@ -142,17 +178,6 @@ fn unorm8(component: f32) -> u8 {
 
 fn rgba8(SrgbaTuple(red, green, blue, alpha): SrgbaTuple) -> [u8; 4] {
     [unorm8(red), unorm8(green), unorm8(blue), unorm8(alpha)]
-}
-
-fn underline_style(underline: Underline) -> UnderlineStyle {
-    match underline {
-        Underline::None => UnderlineStyle::None,
-        Underline::Single => UnderlineStyle::Single,
-        Underline::Double => UnderlineStyle::Double,
-        Underline::Curly => UnderlineStyle::Curly,
-        Underline::Dotted => UnderlineStyle::Dotted,
-        Underline::Dashed => UnderlineStyle::Dashed,
-    }
 }
 
 fn same_link(a: Option<&Arc<Hyperlink>>, b: Option<&Arc<Hyperlink>>) -> bool {
@@ -350,6 +375,40 @@ impl MetalScene {
         let cols = self.cells.extent().cols;
         self.cells.fill_row(grid_row, CellBg::DEFAULT);
         self.text.clear_row(grid_row);
+        // Decorations first: the WebGpu renderer draws its line sprites, one
+        // per cell, in the layer under every glyph, in the underline color
+        // whatever the selection or cursor do to the text, and also under
+        // invisible text.
+        for cell in mirror_row.cells() {
+            let hovered = style
+                .hover
+                .is_some_and(|hover| same_link(Some(hover), mirror_row.hyperlink(cell)));
+            let lines = LineSprite {
+                underline: if hovered {
+                    hovered_underline(cell.underline())
+                } else {
+                    cell.underline()
+                },
+                strikethrough: cell.strikethrough(),
+                overline: cell.overline(),
+            };
+            if lines.is_empty() {
+                continue;
+            }
+            let Some(sprite) = glyphs.line_sprite(lines) else {
+                continue;
+            };
+            let color = match cell.underline_color() {
+                MirrorColor::Default => rgba8(cell_colors(cell, style, reverse_video).fg),
+                color => rgba8(style.palette.resolve_fg(color.to_attribute())),
+            };
+            let end = (cell.col() + cell.width().max(1)).min(cols as usize);
+            for col in cell.col()..end {
+                let instance =
+                    CellText::new(col as u16, color).with_glyph(&sprite.slot, sprite.offset);
+                self.text.push(grid_row, instance);
+            }
+        }
         for cell in mirror_row.cells() {
             let col = cell.col();
             let colors = cell_colors(cell, style, reverse_video);
@@ -388,34 +447,6 @@ impl MetalScene {
             if cell.invisible() || fg == under {
                 continue;
             }
-            let mut underline = underline_style(cell.underline());
-            if underline == UnderlineStyle::None
-                && style
-                    .hover
-                    .is_some_and(|hover| same_link(Some(hover), mirror_row.hyperlink(cell)))
-            {
-                underline = UnderlineStyle::Single;
-            }
-            let underline_color = match cell.underline_color() {
-                MirrorColor::Default => fg,
-                color => rgba8(style.palette.resolve_fg(color.to_attribute())),
-            };
-            let decorate = |mut instance: CellText| {
-                if cell.width() > 1 {
-                    instance = instance.wide();
-                }
-                if underline != UnderlineStyle::None {
-                    let [red, green, blue, _] = underline_color;
-                    instance = instance.with_underline(underline, [red, green, blue]);
-                }
-                if cell.strikethrough() {
-                    instance = instance.with_strikethrough();
-                }
-                if cell.overline() {
-                    instance = instance.with_overline();
-                }
-                instance
-            };
             let text = mirror_row.text(cell);
             let glyph_style = GlyphStyle {
                 bold: cell.intensity() == Intensity::Bold,
@@ -427,17 +458,9 @@ impl MetalScene {
             } else {
                 glyphs.glyphs(text, glyph_style, cell.width())
             };
-            if placed.is_empty() {
-                // A blank cell can still be underlined, struck or overlined.
-                if underline != UnderlineStyle::None || cell.strikethrough() || cell.overline() {
-                    self.text
-                        .push(grid_row, decorate(CellText::new(col as u16, fg)));
-                }
-                continue;
-            }
             for glyph in placed {
                 let instance = CellText::new(col as u16, fg).with_glyph(&glyph.slot, glyph.offset);
-                self.text.push(grid_row, decorate(instance));
+                self.text.push(grid_row, instance);
             }
         }
         // The selection tints its whole span, blank columns included.
@@ -495,6 +518,7 @@ mod tests {
     #[derive(Default)]
     struct SyntheticGlyphs {
         placed: HashMap<(String, GlyphStyle, usize), Vec<PlacedGlyph>>,
+        lines: HashMap<LineSprite, PlacedGlyph>,
     }
 
     fn synthetic_slot(index: u32, text: &str) -> AtlasSlot {
@@ -525,6 +549,15 @@ mod tests {
                         offset: [1, 2 + (index % 3) as i16],
                     }]
                 })
+        }
+
+        /// One made-up grayscale slot per line sprite, far from the glyphs'.
+        fn line_sprite(&mut self, lines: LineSprite) -> Option<PlacedGlyph> {
+            let index = 4096 + u32::try_from(self.lines.len()).unwrap_or(u32::MAX - 4096);
+            Some(*self.lines.entry(lines).or_insert_with(|| PlacedGlyph {
+                slot: synthetic_slot(index, "line"),
+                offset: [0, 0],
+            }))
         }
     }
 
@@ -909,6 +942,107 @@ mod tests {
         assert_eq!((forward.scrolled, forward.rows_rebuilt), (1, 1));
     }
 
+    #[test]
+    fn a_hovered_link_promotes_its_underline_as_webgpu_does() {
+        assert_eq!(hovered_underline(Underline::None), Underline::Single);
+        assert_eq!(hovered_underline(Underline::Single), Underline::Double);
+        for other in [
+            Underline::Double,
+            Underline::Curly,
+            Underline::Dotted,
+            Underline::Dashed,
+        ] {
+            assert_eq!(hovered_underline(other), Underline::Single, "{other:?}");
+        }
+        let plain = LineSprite {
+            underline: Underline::None,
+            strikethrough: false,
+            overline: false,
+        };
+        assert!(plain.is_empty());
+        assert!(
+            !LineSprite {
+                overline: true,
+                ..plain
+            }
+            .is_empty()
+        );
+    }
+
+    /// ft-yccm0.4.7.3: decorations encode as the WebGpu renderer draws them,
+    /// one line sprite per cell (two for a wide cell) pushed before every
+    /// glyph of the row. The sprite is in the underline color: SGR 58, or else
+    /// the cell's foreground after reverse. Invisible text keeps its
+    /// underline.
+    #[test]
+    fn decorations_are_one_line_sprite_per_cell_under_the_glyphs() {
+        let palette = ColorPalette::default();
+        let style = plain_style(&palette);
+        let mut glyphs = SyntheticGlyphs::default();
+        let mut term = terminal(2, 12);
+        // a b: red curly; c: strikethrough and overline; d: reversed and
+        // underlined; a wide underlined character; h: invisible, underlined.
+        term.advance_bytes(
+            "\x1b[4:3;58;5;196mab\x1b[0m \x1b[9;53mc\x1b[0m\x1b[7;4md\x1b[0m\x1b[4m你\x1b[0m\x1b[8;4mh\x1b[0m",
+        );
+        let mut mirror = RenderMirror::new();
+        let mut scene = MetalScene::new();
+        step(
+            &mut term,
+            &mut mirror,
+            &mut scene,
+            &mut glyphs,
+            &no_selection,
+            &style,
+        );
+        let row: Vec<CellText> = scene.text().row(0).collect();
+        let lines = |underline, strikethrough, overline| LineSprite {
+            underline,
+            strikethrough,
+            overline,
+        };
+        let origin = |lines: LineSprite| {
+            let slot = glyphs.lines[&lines].slot;
+            [
+                u16::try_from(slot.x).unwrap(),
+                u16::try_from(slot.y).unwrap(),
+            ]
+        };
+        let red = rgba8(palette.resolve_fg(ColorAttribute::PaletteIndex(196)));
+        let fg = rgba8(palette.foreground);
+        let reversed = rgba8(palette.background);
+        let curly = origin(lines(Underline::Curly, false, false));
+        let struck = origin(lines(Underline::None, true, true));
+        let single = origin(lines(Underline::Single, false, false));
+        let sprites: Vec<(u16, [u16; 2], [u8; 4])> = row[..7]
+            .iter()
+            .map(|instance| (instance.col(), instance.atlas_origin(), instance.fg()))
+            .collect();
+        assert_eq!(
+            sprites,
+            [
+                (0, curly, red),
+                (1, curly, red),
+                (3, struck, fg),
+                (4, single, reversed),
+                (5, single, fg),
+                (6, single, fg),
+                (7, single, fg),
+            ]
+        );
+        assert!(row[..7].iter().all(|instance| instance.offset() == [0, 0]));
+        // Then the glyphs: a, b, c, d and the wide character; none for the
+        // blank or the invisible cell.
+        let glyph_cols: Vec<u16> = row[7..].iter().map(CellText::col).collect();
+        assert_eq!(glyph_cols, [0, 1, 3, 4, 5]);
+        assert!(
+            row.iter().all(|instance| instance.flags()
+                & !frankenterm_renderer_metal::cell_text::flags::ATLAS_MASK
+                == 0),
+            "no procedural decoration flags"
+        );
+    }
+
     /// Text is hidden only in the color it actually sits on, as the WebGpu
     /// renderer decides: the selection's background under selected text, a
     /// focused block cursor's color under the cursor, else the cell's own
@@ -987,6 +1121,7 @@ mod tests {
         struct AtlasGlyphs<'a> {
             renderer: &'a MetalRenderer,
             placed: HashMap<(String, GlyphStyle, usize), Vec<PlacedGlyph>>,
+            lines: HashMap<LineSprite, PlacedGlyph>,
         }
 
         impl GlyphSource for AtlasGlyphs<'_> {
@@ -1017,6 +1152,24 @@ mod tests {
                             offset: [1, 2 + (index % 3) as i16],
                         }]
                     })
+            }
+
+            /// A cell-sized (8x16) coverage pattern per line sprite.
+            fn line_sprite(&mut self, lines: LineSprite) -> Option<PlacedGlyph> {
+                let renderer = self.renderer;
+                let index = u32::try_from(self.lines.len()).unwrap_or(u32::MAX);
+                Some(*self.lines.entry(lines).or_insert_with(|| {
+                    let pixels: Vec<u8> = (0..8 * 16_u32)
+                        .map(|i| if (i / 8 + index) % 5 == 0 { 255 } else { 0 })
+                        .collect();
+                    let slot = renderer
+                        .insert_glyph(AtlasKind::Grayscale, 8, 16, &pixels)
+                        .expect("the atlas takes a line sprite");
+                    PlacedGlyph {
+                        slot,
+                        offset: [0, 0],
+                    }
+                }))
             }
         }
 
@@ -1049,6 +1202,7 @@ mod tests {
             let mut glyphs = AtlasGlyphs {
                 renderer: &renderer,
                 placed: HashMap::new(),
+                lines: HashMap::new(),
             };
             let mut rng = Rng::new(seed);
             let (rows, cols) = (8, 24);
