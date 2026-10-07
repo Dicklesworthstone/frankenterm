@@ -3228,7 +3228,10 @@ fn decode_dec_private_modes<E: FnMut(CSI)>(
 /// caller falls back to [`CSI::parse`]. That covers colon sub-parameters
 /// (`38:2::R:G:B`, `4:3`), empty fields, a trailing `;`, a private marker,
 /// unknown codes and out-of-range values, and more settings than `out`
-/// holds.
+/// holds. The fast path gives it room for [`SGR_RUN_MAX`] settings, more than
+/// any sequence it scans can carry.
+///
+/// [`SGR_RUN_MAX`]: crate::parser::SGR_RUN_MAX
 pub(crate) fn decode_sgr(params: &[CsiParam], out: &mut [Sgr]) -> Option<usize> {
     if params.is_empty() {
         *out.first_mut()? = Sgr::Reset;
@@ -5029,10 +5032,12 @@ mod test {
     }
 
     /// What `decode_sgr` and `decode_common_csi` make of `params`, when they
-    /// take it.
+    /// take it. `decode_sgr` gets the fast path's room, `SGR_RUN_MAX`
+    /// settings.
     fn fast_decode(params: &[CsiParam], control: u8) -> Option<Vec<CSI>> {
         if control == b'm' {
-            let mut out: [Sgr; 8] = core::array::from_fn(|_| Sgr::Reset);
+            let mut out: [Sgr; crate::parser::SGR_RUN_MAX] =
+                core::array::from_fn(|_| Sgr::Reset);
             let count = decode_sgr(params, &mut out)?;
             return Some(out[..count].iter().cloned().map(CSI::Sgr).collect());
         }
@@ -5057,6 +5062,9 @@ mod test {
             ("48;2;255;128;0", b'm'),
             ("58;2;4;5;6", b'm'),
             ("1;2;3;4;7;22;23;24;27;39;49", b'm'),
+            // 16 settings in 31 parameters, the most a sequence the fast path
+            // scans (`CSI_FAST_MAX_PARAMS`) carries.
+            ("1;3;4;7;9;22;23;24;27;29;39;49;1;3;4;7", b'm'),
             ("1;38;5;196;48;2;1;2;3;4", b'm'),
             ("", b'A'),
             ("0", b'B'),
@@ -5132,6 +5140,25 @@ mod test {
                 control as char
             );
         }
+    }
+
+    /// `decode_sgr`'s one bound is the room it is given: a sequence with
+    /// more settings than `SGR_RUN_MAX` is left to `CSIParser`, and one that
+    /// fits is taken. The fast path never meets the bound, since a sequence
+    /// it scans has at most `CSI_FAST_MAX_PARAMS` parameters.
+    #[test]
+    fn fast_sgr_decoder_takes_every_count_up_to_its_room() {
+        let room = crate::parser::SGR_RUN_MAX;
+        assert!(crate::parser::CSI_FAST_MAX_PARAMS / 2 < room);
+        for count in [1, 8, 9, 11, 16, room] {
+            let text = vec!["1"; count].join(";");
+            let params = fast_params(&text);
+            let expected: Vec<CSI> = CSI::parse(&params, false, 'm').collect();
+            assert_eq!(expected.len(), count);
+            assert_eq!(fast_decode(&params, b'm'), Some(expected), "{count} settings");
+        }
+        let over = fast_params(&vec!["1"; room + 1].join(";"));
+        assert_eq!(fast_decode(&over, b'm'), None, "{} settings", room + 1);
     }
 
     /// One parameter as the state machine can deliver it, biased toward the

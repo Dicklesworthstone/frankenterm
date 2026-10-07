@@ -468,12 +468,16 @@ pub struct Parser {
 
 /// Parameters the CSI fast path holds. A sequence with more goes through
 /// the state machine.
-const CSI_FAST_MAX_PARAMS: usize = 32;
+pub(crate) const CSI_FAST_MAX_PARAMS: usize = 32;
 
-/// SGR settings one [`Handler::sgr`] call carries at most. One sequence of
-/// [`CSI_FAST_MAX_PARAMS`] parameters decodes to at most half of that plus
-/// one, so it always fits once the run is handed over.
-const SGR_RUN_MAX: usize = 32;
+/// SGR settings one [`Handler::sgr`] call carries at most, and so the most
+/// `decode_sgr` is given room for. One sequence of [`CSI_FAST_MAX_PARAMS`]
+/// parameters decodes to at most half of that plus one, so it always fits
+/// once the run is handed over: every SGR the fast path scans is decoded,
+/// whatever its number of settings.
+pub(crate) const SGR_RUN_MAX: usize = 32;
+
+const _: () = assert!(CSI_FAST_MAX_PARAMS / 2 < SGR_RUN_MAX);
 
 /// Longest SGR parameter string the last-SGR cache keeps.
 const LAST_SGR_KEY_MAX: usize = 24;
