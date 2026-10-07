@@ -534,24 +534,17 @@ fn capture_rows(
         });
     }
 
-    // Implicit hyperlinks: rescan the logical lines around the copied rows,
-    // and copy every row of each, since a rescan can change a continuation
-    // row whose seqno did not move.
+    // Implicit hyperlinks: rescanning a logical line that holds a link
+    // rewrites every row of it (with the line's highest seqno), so rescan
+    // each logical line touching the viewport that holds a row being copied
+    // or a row never scanned, inside the viewport or beyond it (new output
+    // wrapped below a scrolled-back viewport), and copy all of its visible
+    // rows.
     if !request.rules.is_empty() {
-        let mut row = 0;
-        while row < rows {
-            if !dirty[row] {
-                row += 1;
-                continue;
-            }
-            let run_start = row;
-            while row < rows && dirty[row] {
-                row += 1;
-            }
-            let run = first + run_start as StableRowIndex..first + row as StableRowIndex;
+        for range in logical_lines_to_rescan(term.screen(), first..end, &dirty) {
             let mut widened: Vec<Range<StableRowIndex>> = Vec::new();
             term.screen_mut()
-                .for_each_logical_line_in_stable_range_mut(run, |logical, lines| {
+                .for_each_logical_line_in_stable_range_mut(range, |logical, lines| {
                     Line::apply_hyperlink_rules(request.rules, lines);
                     widened.push(logical);
                     true
@@ -644,6 +637,155 @@ fn capture_rows(
     mirror.generation = generation;
     mirror.last = stats;
     Some(stats)
+}
+
+/// Rows grouped into one logical line at most, in cells: the cap
+/// `Screen::for_each_logical_line_in_stable_range_mut` applies, mirrored so
+/// both find the same logical lines.
+const MAX_LOGICAL_LINE_LEN: usize = 1024;
+
+/// What deciding a rescan needs from one row.
+struct RowFacts {
+    wrapped: bool,
+    len: usize,
+    scanned: bool,
+}
+
+/// Rows of a screen read on demand, in small chunks, without mutable
+/// access, so clean page-engine rows stay native and a capture reads beyond
+/// the viewport only while logical lines continue.
+struct RowReader<'a> {
+    screen: &'a frankenterm_term::screen::Screen,
+    start: usize,
+    rows: std::collections::VecDeque<RowFacts>,
+    /// The screen has no rows past the last one read.
+    at_end: bool,
+}
+
+impl<'a> RowReader<'a> {
+    const CHUNK: usize = 16;
+
+    fn new(screen: &'a frankenterm_term::screen::Screen, phys: Range<usize>) -> Self {
+        let mut reader = Self {
+            screen,
+            start: phys.start,
+            rows: std::collections::VecDeque::new(),
+            at_end: false,
+        };
+        let wanted = phys.len();
+        let rows = reader.read(phys);
+        reader.at_end = rows.len() < wanted;
+        reader.rows.extend(rows);
+        reader
+    }
+
+    fn read(&self, phys: Range<usize>) -> Vec<RowFacts> {
+        let mut rows = Vec::with_capacity(phys.len());
+        self.screen.with_phys_lines(phys, |lines| {
+            rows.extend(lines.iter().map(|line| RowFacts {
+                wrapped: line.last_cell_was_wrapped(),
+                len: line.len(),
+                scanned: line.implicit_hyperlinks_are_scanned(),
+            }));
+        });
+        rows
+    }
+
+    fn get(&mut self, phys: usize) -> Option<&RowFacts> {
+        while phys < self.start {
+            let from = self.start.saturating_sub(Self::CHUNK);
+            let rows = self.read(from..self.start);
+            if rows.is_empty() {
+                return None;
+            }
+            for row in rows.into_iter().rev() {
+                self.rows.push_front(row);
+            }
+            self.start = from;
+        }
+        while phys >= self.start + self.rows.len() {
+            if self.at_end {
+                return None;
+            }
+            let from = self.start + self.rows.len();
+            let rows = self.read(from..from + Self::CHUNK);
+            self.at_end = rows.len() < Self::CHUNK;
+            if rows.is_empty() {
+                return None;
+            }
+            self.rows.extend(rows);
+        }
+        self.rows.get(phys - self.start)
+    }
+}
+
+/// The stable ranges of the logical lines touching `viewport` that need an
+/// implicit-hyperlink rescan: those holding a row marked in `dirty` (indexed
+/// from `viewport.start`) or a row never scanned, found the way
+/// `Screen::for_each_logical_line_in_stable_range_mut` groups rows.
+fn logical_lines_to_rescan(
+    screen: &frankenterm_term::screen::Screen,
+    viewport: Range<StableRowIndex>,
+    dirty: &[bool],
+) -> Vec<Range<StableRowIndex>> {
+    let phys = screen.stable_range(&viewport);
+    if phys.is_empty() {
+        return Vec::new();
+    }
+    let mut reader = RowReader::new(screen, phys.clone());
+
+    // Back to the start of the first logical line, as the screen walks.
+    let mut start = phys.start;
+    let mut back_len = 0usize;
+    while start > 0 {
+        let Some(prior) = reader.get(start - 1) else {
+            break;
+        };
+        if !prior.wrapped || logical_len_exceeds(back_len, prior.len) {
+            break;
+        }
+        back_len = back_len.saturating_add(prior.len);
+        start -= 1;
+    }
+
+    let mut rescan = Vec::new();
+    let mut row = start;
+    while row < phys.end {
+        if reader.get(row).is_none() {
+            break;
+        }
+        let mut total = 0usize;
+        let mut end_inclusive = row;
+        let mut unscanned = false;
+        let mut index = row;
+        while let Some(line) = reader.get(index) {
+            if total > 0 && logical_len_exceeds(total, line.len) {
+                break;
+            }
+            end_inclusive = index;
+            total = total.saturating_add(line.len);
+            unscanned |= !line.scanned;
+            if !line.wrapped {
+                break;
+            }
+            index += 1;
+        }
+        let logical = screen.phys_to_stable_row_index(row)
+            ..screen.phys_to_stable_row_index(end_inclusive + 1);
+        let copied = (logical.start.max(viewport.start)..logical.end.min(viewport.end))
+            .any(|stable| dirty.get((stable - viewport.start) as usize) == Some(&true));
+        if unscanned || copied {
+            rescan.push(logical);
+        }
+        row = end_inclusive + 1;
+    }
+    rescan
+}
+
+fn logical_len_exceeds(current: usize, additional: usize) -> bool {
+    current
+        .checked_add(additional)
+        .is_none_or(|total| total > MAX_LOGICAL_LINE_LEN)
 }
 
 fn placeholder_row() -> MirrorRow {
@@ -1209,6 +1351,49 @@ mod tests {
         let stats = capture_terminal_rows(&mut term, &mut mirror, &request).expect("resident");
         assert_eq!(stats.rows_captured, 2, "the continuation row is copied too");
         assert_eq!(difference(&mirror, &fresh(&mut term, &request)), None);
+    }
+
+    /// bv13 (seed 5, step 210), minimized: a wrapped logical line runs from
+    /// the last row of a scrolled-back viewport into the row below it. Output
+    /// there completes a URL across both rows; the rescan rewrites the
+    /// visible row too, so the capture must copy it although nothing wrote to
+    /// it.
+    #[test]
+    fn a_link_completed_below_a_scrolled_back_viewport_recaptures_the_visible_row() {
+        let rules = [Rule::new(r"https?://\S+", "$0").expect("rule")];
+        let mut term = terminal(4, 10);
+        // Row 3 is "see https:" and wraps into row 4, "zzzz": no link yet.
+        term.advance_bytes(b"a\r\nb\r\nc\r\nsee https:zzzz\r\n\r\n\r\n");
+        let top = terminal_get_dimensions(&mut term).physical_top;
+        assert_eq!(top, 4, "rows 4 to 7 are on screen");
+        let request = CaptureRequest {
+            viewport_top: Some(0),
+            rules: &rules,
+            rules_generation: 0,
+        };
+        let links_on_row_3 = |mirror: &RenderMirror| {
+            let row = &mirror.rows()[3];
+            assert_eq!(row.stable(), 3);
+            row.cells()
+                .iter()
+                .filter(|cell| row.hyperlink(cell).is_some())
+                .count()
+        };
+        let mut mirror = RenderMirror::new();
+        capture_terminal_rows(&mut term, &mut mirror, &request).expect("resident");
+        assert_eq!(links_on_row_3(&mirror), 0);
+
+        // Row 4, the screen's first row and below the viewport, becomes
+        // "//ab.cd": the logical line reads "see https://ab.cd".
+        term.advance_bytes(b"\x1b[1;1H//ab.cd");
+        let stats = capture_terminal_rows(&mut term, &mut mirror, &request).expect("resident");
+        assert!(!stats.full);
+        assert_eq!(
+            stats.rows_captured, 1,
+            "only the visible row of the rescanned line"
+        );
+        assert_eq!(difference(&mirror, &fresh(&mut term, &request)), None);
+        assert_eq!(links_on_row_3(&mirror), "https:".len());
     }
 
     #[test]
