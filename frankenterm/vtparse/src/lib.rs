@@ -11,12 +11,13 @@
 //! [termwiz](https://docs.rs/termwiz/) crate if you don't want to have to research
 //! all those possible escape sequences for yourself.
 //!
-//! In the ground state the input is UTF-8 first: every byte above 0x7f starts
-//! a multi-byte sequence or is ill-formed. Ill-formed input prints one
-//! U+FFFD per maximal subpart (Unicode 15, section 3.9), and the byte that
-//! breaks a sequence is parsed again, so no valid character or control after
-//! it is lost. Raw 8-bit C1 bytes are therefore not controls in the ground
-//! state; C1 controls encoded as UTF-8 (U+0080..U+009F) still are.
+//! In the ground state a raw byte 0x80..=0x9f is an 8-bit C1 control, as the
+//! DEC parser's tables have it, and so is a C1 control encoded as UTF-8
+//! (U+0080..U+009F). Every byte above 0x9f starts a multi-byte UTF-8
+//! sequence or is ill-formed. Ill-formed input prints one U+FFFD per maximal
+//! subpart (Unicode 15, section 3.9), and the byte that breaks a sequence is
+//! parsed again, so no valid character or control after it is lost: a raw
+//! C1 byte that breaks one acts as that control.
 #![allow(clippy::upper_case_acronyms)]
 #![cfg_attr(not(feature = "std"), no_std)]
 mod enums;
@@ -965,9 +966,9 @@ impl VTParser {
 
         // The tables start sequences at the leads 0xc2..=0xf4 in the ground
         // and OSC string states. In the ground state every other byte above
-        // 0x7f is ill-formed UTF-8 as well, including raw 8-bit C1 bytes,
-        // which a UTF-8 stream cannot carry.
-        if action == Action::Utf8 || (self.state == State::Ground && byte > 0x7f) {
+        // 0x9f is ill-formed UTF-8 as well; raw 0x80..=0x9f stay the tables'
+        // C1 controls (ft-fjxga rework: the parser's legacy contract).
+        if action == Action::Utf8 || (self.state == State::Ground && byte > 0x9f) {
             self.start_utf8(actor, byte);
             return;
         }
@@ -2180,15 +2181,15 @@ mod test {
 
     #[test]
     fn utf8_ill_formed_bytes_get_one_replacement_per_maximal_subpart() {
+        // Raw 0x80..=0x9f are C1 controls in the ground state; see
+        // raw_c1_bytes_are_controls_in_ground_and_encoded_c1_is_too.
         let cases: &[(&[u8], &str)] = &[
-            (b"a\x80b", "a\u{fffd}b"),
+            (b"a\xa0b", "a\u{fffd}b"),
             (b"a\xbf\xbfb", "a\u{fffd}\u{fffd}b"),
             (b"a\xc0\xc1\xf5\xffb", "a\u{fffd}\u{fffd}\u{fffd}\u{fffd}b"),
-            // Surrogate, overlong and above-U+10FFFF forms break at the second byte.
-            (b"a\xed\xa0\x80b", "a\u{fffd}\u{fffd}\u{fffd}b"),
-            (b"a\xe0\x80\xafb", "a\u{fffd}\u{fffd}\u{fffd}b"),
-            (b"a\xf0\x8f\xbf\xbfb", "a\u{fffd}\u{fffd}\u{fffd}\u{fffd}b"),
-            (b"a\xf4\x90\x80\x80b", "a\u{fffd}\u{fffd}\u{fffd}\u{fffd}b"),
+            // Surrogate and above-U+10FFFF forms break at the second byte.
+            (b"a\xed\xa0\xbfb", "a\u{fffd}\u{fffd}\u{fffd}b"),
+            (b"a\xf4\xbf\xbf\xbfb", "a\u{fffd}\u{fffd}\u{fffd}\u{fffd}b"),
             // A lead right after a lead starts the next sequence.
             (b"\xc3\xc3\xa9", "\u{fffd}\u{e9}"),
             // The edges of each well-formed range still decode.
@@ -2201,18 +2202,34 @@ mod test {
     }
 
     #[test]
-    fn utf8_raw_c1_bytes_are_ill_formed_in_ground_but_encoded_c1_still_executes() {
-        // A raw 0x9b is a stray continuation byte, not CSI.
-        assert_eq!(parse_as_vec(b"\x9b31m"), prints("\u{fffd}31m"));
+    fn raw_c1_bytes_are_controls_in_ground_and_encoded_c1_is_too() {
+        // ft-fjxga rework: a raw 0x80..=0x9f in the ground state keeps the
+        // DEC tables' 8-bit C1 meaning, the parser's legacy contract.
+        let csi_31m = || VTAction::CsiDispatch {
+            params: vec![CsiParam::Integer(31)],
+            parameters_truncated: false,
+            byte: b'm',
+        };
+        assert_eq!(parse_as_vec(b"\x9b31m"), vec![csi_31m()]);
+        assert_eq!(parse_as_vec("\u{9b}31m".as_bytes()), vec![csi_31m()]);
         assert_eq!(
-            parse_as_vec("\u{9b}31m".as_bytes()),
-            vec![VTAction::CsiDispatch {
-                params: vec![CsiParam::Integer(31)],
-                parameters_truncated: false,
-                byte: b'm',
-            }]
+            parse_as_vec(b"a\x80b"),
+            vec![
+                VTAction::Print('a'),
+                VTAction::ExecuteC0orC1(0x80),
+                VTAction::Print('b'),
+            ]
         );
-        // Inside strings, raw C1 keeps its 8-bit meaning: 0x9c ends an OSC.
+        // A raw OSC, ended by a raw ST.
+        assert_eq!(
+            parse_as_vec(b"\x9d0;t\x9cx"),
+            vec![
+                VTAction::OscDispatch(vec![b"0".to_vec(), b"t".to_vec()]),
+                VTAction::Print('x'),
+            ]
+        );
+        // Inside strings, raw C1 keeps its 8-bit meaning too: 0x9c ends an
+        // OSC.
         assert_eq!(
             parse_as_vec(b"\x1b]0;t\x9cx"),
             vec![
@@ -2220,12 +2237,69 @@ mod test {
                 VTAction::Print('x'),
             ]
         );
+        // A byte in 0x80..=0x9f that continues a sequence is part of its
+        // character, and one that ends a sequence too early is that
+        // sequence's U+FFFD plus the next character's.
+        assert_eq!(
+            parse_as_vec(b"\xc3\x9b\xe2\x82\xac"),
+            prints("\u{db}\u{20ac}")
+        );
+        assert_eq!(parse_as_vec(b"\xe2\x9b31m"), prints("\u{fffd}31m"));
+        // A raw C1 byte that breaks a sequence ends it with one U+FFFD and
+        // then acts as its control: overlong forms break at their second
+        // byte.
+        assert_eq!(
+            parse_as_vec(b"a\xe0\x80\xafb"),
+            vec![
+                VTAction::Print('a'),
+                VTAction::Print(FFFD),
+                VTAction::ExecuteC0orC1(0x80),
+                VTAction::Print(FFFD),
+                VTAction::Print('b'),
+            ]
+        );
+        assert_eq!(
+            parse_as_vec(b"a\xf0\x8f\xbfb"),
+            vec![
+                VTAction::Print('a'),
+                VTAction::Print(FFFD),
+                VTAction::ExecuteC0orC1(0x8f),
+                VTAction::Print(FFFD),
+                VTAction::Print('b'),
+            ]
+        );
+        assert_eq!(parse_as_vec(b"\xe0\x9b31m"), {
+            let mut actions = prints("\u{fffd}");
+            actions.push(csi_31m());
+            actions
+        });
+    }
+
+    /// `String::from_utf8_lossy` as actions, except that a maximal subpart
+    /// that is one raw C1 byte executes it, as the ground state does.
+    /// `None` when such a byte would open a string or sequence instead.
+    fn lossy_with_c1_controls(bytes: &[u8]) -> Option<Vec<VTAction>> {
+        let mut actions = Vec::new();
+        for chunk in bytes.utf8_chunks() {
+            actions.extend(chunk.valid().chars().map(VTAction::Print));
+            match chunk.invalid() {
+                [] => {}
+                [byte @ (0x80..=0x8f | 0x91..=0x97 | 0x99 | 0x9a)] => {
+                    actions.push(VTAction::ExecuteC0orC1(*byte))
+                }
+                [0x80..=0x9f] => return None,
+                _ => actions.push(VTAction::Print(FFFD)),
+            }
+        }
+        Some(actions)
     }
 
     /// The decoder agrees with `String::from_utf8_lossy`, which substitutes
     /// maximal subparts, on every string of up to four bytes drawn from the
     /// boundary bytes of table 3-7, fed whole and one byte per call. 0xc2
-    /// is left out because it encodes the C1 controls, which execute.
+    /// is left out because it encodes the C1 controls, which execute. A raw
+    /// C1 byte that no sequence takes executes too; strings where one opens
+    /// a DCS or APC string are left to the C1 test above.
     #[test]
     fn utf8_decoding_matches_from_utf8_lossy_on_boundary_bytes() {
         const ALPHABET: [u8; 20] = [
@@ -2243,7 +2317,9 @@ mod test {
                 // A trailing open sequence prints nothing until it ends;
                 // the final 'Z' closes it.
                 bytes.push(b'Z');
-                let expected = prints(&alloc::string::String::from_utf8_lossy(&bytes));
+                let Some(expected) = lossy_with_c1_controls(&bytes) else {
+                    continue;
+                };
                 assert_eq!(parse_as_vec(&bytes), expected, "{:?}", bytes);
 
                 let mut parser = VTParser::new();

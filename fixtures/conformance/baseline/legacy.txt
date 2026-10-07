@@ -389,10 +389,10 @@ PASS esctest/decstr/resets-modes-and-rendition
 PASS esctest/ris/clears-and-homes
 PASS esctest/utf8/multibyte-and-wide
 PASS esctest/utf8/split-across-reads
-PASS esctest/utf8/lone-continuation-byte
+XFAIL esctest/utf8/lone-continuation-byte
 PASS esctest/utf8/truncated-lead-keeps-the-next-byte
 PASS esctest/utf8/never-valid-bytes
-PASS esctest/utf8/encoded-surrogate
-PASS esctest/utf8/overlong-form
+XFAIL esctest/utf8/encoded-surrogate
+XFAIL esctest/utf8/overlong-form
 PASS esctest/utf8/truncated-four-byte-sequence
 PASS esctest/utf8/escape-interrupts-a-sequence
