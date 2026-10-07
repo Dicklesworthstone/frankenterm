@@ -611,7 +611,6 @@ fn request_panes(request: &MetalFrameRequest) -> [Option<PaneId>; 2] {
 mod tests {
     use super::*;
     use mux::pane::Pane;
-    use std::io::Write as _;
 
     /// A local pane, `cat` on a pty, killed when dropped.
     struct TestPane(Arc<dyn Pane>);
@@ -735,8 +734,8 @@ mod tests {
         assert!(eventually(|| render.stats().frames_presented > 0));
 
         let before = render.stats();
+        let feeding = std::sync::atomic::AtomicBool::new(true);
         let blocked_for = std::thread::scope(|scope| {
-            let feeding = std::sync::atomic::AtomicBool::new(true);
             let feeding = &feeding;
             let output = &output;
             let pane = &pane;
