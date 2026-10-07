@@ -6,15 +6,17 @@ use mux::tab::{PositionedSplit, SplitDirection};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct SplitRenderGeometry {
-    rect: RectF,
+pub(crate) struct SplitRenderGeometry {
+    /// The split line's pixels; the Metal frame fills the same rectangle
+    /// (ft-yccm0.4.6).
+    pub(crate) rect: RectF,
     ui_x: usize,
     ui_y: usize,
     ui_width: usize,
     ui_height: usize,
 }
 
-fn split_render_geometry(
+pub(crate) fn split_render_geometry(
     split: &PositionedSplit,
     cell_width: f32,
     cell_height: f32,

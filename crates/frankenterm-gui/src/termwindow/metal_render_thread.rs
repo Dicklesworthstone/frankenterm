@@ -3,13 +3,14 @@
 //! With `front_end = "Metal"`, the window's renderer is attached on the main
 //! thread, as AppKit requires, then moved to a render thread of its own
 //! ([`frankenterm_gui::render_thread`]). From then on the render thread
-//! captures the active pane's changed rows, rebuilds its scene and glyphs,
-//! and encodes and presents every frame. The main thread only publishes what
-//! a frame needs from the window ([`MetalFrameRequest`], when it would have
-//! painted) and the window's surface (size, DPI, focus) through the render
-//! thread's lock-free mailbox. Output of the pane being drawn wakes the
-//! render thread straight from the thread that delivers the mux
-//! notification ([`MetalOutputWake`]), with no main-thread task per batch.
+//! captures every visible pane's changed rows, rebuilds their scenes and
+//! glyphs, and encodes and presents every frame: all the panes in one render
+//! pass (ft-yccm0.4.6). The main thread only publishes what a frame needs
+//! from the window ([`MetalFrameRequest`], when it would have painted) and
+//! the window's surface (size, DPI, focus) through the render thread's
+//! lock-free mailbox. Output of any pane being drawn wakes the render thread
+//! straight from the thread that delivers the mux notification
+//! ([`MetalOutputWake`]), with no main-thread task per batch.
 //!
 //! The render thread keeps its own fonts, built for the window's DPI and
 //! font scale, since a `FontConfiguration` cannot leave the main thread.
@@ -22,8 +23,9 @@
 //! interval instead.
 
 use super::TermWindow;
-use super::metal_cells::{MetalFrame, MetalFrameInputs};
+use super::metal_window::{MetalPaneRequest, MetalPanes};
 use crate::utilsprites::RenderMetrics;
+use config::ConfigHandle;
 use frankenterm_font::FontConfiguration;
 #[cfg(test)]
 use frankenterm_gui::render_thread::RenderThreadStats;
@@ -33,13 +35,13 @@ use frankenterm_gui::render_thread::{
 };
 use frankenterm_renderer_metal::{
     ClearColor, FrameOutcome, GridExtent, LinkUpdate, LinkWait, MetalDisplayLink, MetalRenderer,
-    MetalRendererHandoff,
+    MetalRendererHandoff, SolidRect,
 };
 use mux::pane::PaneId;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 /// `FRANKENTERM_METAL_RENDER_THREAD=0` keeps Metal frames on the main thread.
@@ -78,7 +80,12 @@ impl Pacing {
 /// What the main thread publishes for the render thread's next frame.
 #[derive(Clone)]
 pub(crate) struct MetalFrameRequest {
-    pub(crate) inputs: MetalFrameInputs,
+    /// The visible panes (ft-yccm0.4.6).
+    pub(crate) panes: Vec<MetalPaneRequest>,
+    /// Split borders.
+    pub(crate) splits: Vec<SolidRect>,
+    pub(crate) config: ConfigHandle,
+    /// What shows where no pane draws.
     pub(crate) clear: ClearColor,
     /// The grid a frame without a pane clears.
     pub(crate) grid: GridExtent,
@@ -159,25 +166,14 @@ impl VsyncSource for LinkSource {
     }
 }
 
-const NO_PANE: usize = usize::MAX;
-
 /// Wakes a window's render thread for the output of a pane it draws, on the
 /// thread that delivers the mux notification (ft-yccm0.4.1.2).
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct MetalOutputWake {
     waker: Mutex<Option<RenderWaker>>,
-    /// The panes the render thread draws: the active pane and, under an
-    /// overlay, the overlay pane. [`NO_PANE`] when unused.
-    panes: [AtomicUsize; 2],
-}
-
-impl Default for MetalOutputWake {
-    fn default() -> Self {
-        Self {
-            waker: Mutex::new(None),
-            panes: [AtomicUsize::new(NO_PANE), AtomicUsize::new(NO_PANE)],
-        }
-    }
+    /// The panes the render thread draws: every visible pane, active or not
+    /// (ft-yccm0.4.6), and the pane under an overlay.
+    panes: RwLock<Vec<PaneId>>,
 }
 
 impl MetalOutputWake {
@@ -187,8 +183,9 @@ impl MetalOutputWake {
     pub(crate) fn wake_for(&self, pane_id: PaneId) -> bool {
         if !self
             .panes
-            .iter()
-            .any(|pane| pane.load(Ordering::Acquire) == pane_id)
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&pane_id)
         {
             return false;
         }
@@ -206,9 +203,10 @@ impl MetalOutputWake {
         *self.waker.lock().unwrap_or_else(PoisonError::into_inner) = waker;
     }
 
-    fn set_panes(&self, panes: [Option<PaneId>; 2]) {
-        for (slot, pane) in self.panes.iter().zip(panes) {
-            slot.store(pane.unwrap_or(NO_PANE), Ordering::Release);
+    fn set_panes(&self, panes: Vec<PaneId>) {
+        let mut current = self.panes.write().unwrap_or_else(PoisonError::into_inner);
+        if *current != panes {
+            *current = panes;
         }
     }
 }
@@ -224,7 +222,7 @@ struct RenderFonts {
 /// Draws a window's Metal frames on its render thread.
 struct MetalDriver {
     request: Arc<Mutex<Arc<MetalFrameRequest>>>,
-    frame: Option<MetalFrame>,
+    panes: MetalPanes,
     fonts: Option<RenderFonts>,
     /// The drawable size of the last presented frame, width in the high 32
     /// bits: what the window shows now.
@@ -235,6 +233,9 @@ struct MetalDriver {
     paced_by_link: bool,
     /// The layer opacity last applied.
     opaque: Option<bool>,
+    /// Rows rebuilt per pane since the thread started.
+    #[cfg(test)]
+    rows_rebuilt: Arc<Mutex<std::collections::HashMap<PaneId, u64>>>,
     // Last: off macOS the renderer is uninhabited, and fields built after it
     // would never be evaluated.
     renderer: Rc<MetalRenderer>,
@@ -245,14 +246,14 @@ impl MetalDriver {
     /// DPI or font scale changed.
     fn fonts(&mut self, request: &MetalFrameRequest, dpi: u32) -> anyhow::Result<&RenderFonts> {
         let key = (
-            request.inputs.config.generation(),
+            request.config.generation(),
             dpi,
             request.font_scale.to_bits(),
         );
         if self.fonts.as_ref().is_none_or(|fonts| fonts.key != key) {
             let dpi_usize = usize::try_from(dpi)?;
             let fonts = Rc::new(FontConfiguration::new(
-                Some(request.inputs.config.clone()),
+                Some(request.config.clone()),
                 dpi_usize,
             )?);
             if request.font_scale != 1.0 {
@@ -321,31 +322,43 @@ impl FrameDriver for MetalDriver {
                 return FrameReport::default();
             }
         };
-        let uniforms = MetalFrame::update(
-            &mut self.frame,
-            &request.inputs,
+        // Every visible pane in one render pass (ft-yccm0.4.6).
+        let renderer = Rc::clone(&self.renderer);
+        let outcome = self.panes.draw(
+            &request.panes,
+            &request.splits,
+            request.clear,
             &fonts,
             &metrics,
-            &self.renderer,
+            &renderer,
+            |window| match (window, update) {
+                (Some(window), Some(update)) => {
+                    renderer.render_window_into(update, width, height, window)
+                }
+                (Some(window), None) => renderer.render_window(width, height, window),
+                (None, Some(update)) => {
+                    renderer.render_clear_into(update, width, height, request.grid, request.clear)
+                }
+                (None, None) => renderer.render_clear(width, height, request.grid, request.clear),
+            },
         );
-        let scene = self
-            .frame
-            .as_ref()
-            .zip(uniforms.as_ref())
-            .map(|(frame, uniforms)| super::metal_frame_scene(frame, uniforms, request.clear));
-        let outcome = match (scene, update) {
-            (Some(scene), Some(update)) => self
-                .renderer
-                .render_frame_into(update, width, height, &scene),
-            (Some(scene), None) => self.renderer.render_frame(width, height, &scene),
-            (None, Some(update)) => {
-                self.renderer
-                    .render_clear_into(update, width, height, request.grid, request.clear)
+        let changed = self
+            .panes
+            .rows_rebuilt()
+            .iter()
+            .filter(|(_, rows)| *rows > 0)
+            .count();
+        metrics::histogram!("gui.metal.window.panes_rebuilt").record(changed as f64);
+        #[cfg(test)]
+        {
+            let mut counts = self
+                .rows_rebuilt
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for (pane, rows) in self.panes.rows_rebuilt() {
+                *counts.entry(*pane).or_default() += *rows as u64;
             }
-            (None, None) => self
-                .renderer
-                .render_clear(width, height, request.grid, request.clear),
-        };
+        }
         match outcome {
             Ok(FrameOutcome::Presented) => {
                 let (width, height) = self.renderer.drawable_size();
@@ -388,6 +401,8 @@ pub(crate) struct MetalRenderThread {
     surface: std::cell::Cell<SurfaceState>,
     #[cfg(test)]
     presented_size: Arc<AtomicU64>,
+    #[cfg(test)]
+    rows_rebuilt: Arc<Mutex<std::collections::HashMap<PaneId, u64>>>,
 }
 
 impl MetalRenderThread {
@@ -409,18 +424,24 @@ impl MetalRenderThread {
         let driver_request = Arc::clone(&request);
         let presented_size = Arc::new(AtomicU64::new(0));
         let driver_presented_size = Arc::clone(&presented_size);
+        #[cfg(test)]
+        let rows_rebuilt = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        #[cfg(test)]
+        let driver_rows_rebuilt = Arc::clone(&rows_rebuilt);
         let handoff = MetalRendererHandoff::new(renderer);
         let thread = RenderThread::spawn_paced(name, surface, min_frame_interval, move || {
             // The renderer is the last field: off macOS it is uninhabited,
             // and every field after it would never be evaluated.
             let mut driver = MetalDriver {
                 request: driver_request,
-                frame: None,
+                panes: MetalPanes::default(),
                 fonts: None,
                 presented_size: driver_presented_size,
                 link_update: Rc::new(RefCell::new(None)),
                 paced_by_link: pacing == Pacing::DisplayLink,
                 opaque: None,
+                #[cfg(test)]
+                rows_rebuilt: driver_rows_rebuilt,
                 renderer: Rc::new(handoff.into_renderer()),
             };
             // The link is created here, on the render thread whose run loop
@@ -458,7 +479,20 @@ impl MetalRenderThread {
             surface: std::cell::Cell::new(surface),
             #[cfg(test)]
             presented_size,
+            #[cfg(test)]
+            rows_rebuilt,
         })
+    }
+
+    /// Rows of `pane` rebuilt since the thread started.
+    #[cfg(test)]
+    pub(crate) fn rows_rebuilt(&self, pane: PaneId) -> u64 {
+        self.rows_rebuilt
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&pane)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// The drawable size of the last presented frame; `(0, 0)` before one.
@@ -502,7 +536,7 @@ impl Drop for MetalRenderThread {
         // No output wakes for a thread that is going away; dropping
         // `thread` then stops and joins it.
         self.output.set_waker(None);
-        self.output.set_panes([None, None]);
+        self.output.set_panes(Vec::new());
     }
 }
 
@@ -538,8 +572,11 @@ impl TermWindow {
 
     /// What the render thread's next frame needs from this window.
     pub(super) fn metal_frame_request(&mut self) -> MetalFrameRequest {
+        let (panes, splits) = self.metal_window_panes();
         MetalFrameRequest {
-            inputs: self.metal_frame_inputs(),
+            panes,
+            splits,
+            config: self.config.clone(),
             clear: self.metal_clear_color(),
             grid: GridExtent::new(self.terminal_size.rows, self.terminal_size.cols),
             font_scale: self.fonts.get_font_scale(),
@@ -591,17 +628,22 @@ impl TermWindow {
     }
 }
 
-/// The panes a request draws, whose output wakes the render thread.
-fn request_panes(request: &MetalFrameRequest) -> [Option<PaneId>; 2] {
-    let pane = request.inputs.pane.as_ref();
-    [
-        pane.map(|pane| pane.pane_id()),
-        pane.and_then(|pane| {
-            let source = crate::selection::selection_source_pane(&**pane);
-            let id = source.pane_id();
-            (id != pane.pane_id()).then_some(id)
-        }),
-    ]
+/// The panes a request draws, whose output wakes the render thread: every
+/// visible pane, and the pane an overlay reads.
+fn request_panes(request: &MetalFrameRequest) -> Vec<PaneId> {
+    let mut panes = Vec::with_capacity(request.panes.len());
+    for pane in request
+        .panes
+        .iter()
+        .filter_map(|pane| pane.inputs.pane.as_ref())
+    {
+        panes.push(pane.pane_id());
+        let source = crate::selection::selection_source_pane(&**pane).pane_id();
+        if source != pane.pane_id() {
+            panes.push(source);
+        }
+    }
+    panes
 }
 
 /// Native macOS tests: the real Metal renderer, unattached to a window
@@ -610,6 +652,8 @@ fn request_panes(request: &MetalFrameRequest) -> [Option<PaneId>; 2] {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+    use crate::termwindow::metal_cells::MetalFrameInputs;
+    use frankenterm_renderer_metal::PixelRect;
     use mux::pane::Pane;
 
     /// A local pane, `cat` on a pty, killed when dropped.
@@ -657,23 +701,45 @@ mod tests {
         }
     }
 
-    fn request(pane: &TestPane) -> MetalFrameRequest {
-        config::use_test_configuration();
-        MetalFrameRequest {
+    /// `pane` drawn at `rect`: dimmed unless `active`.
+    // Test rectangles are small pixel counts.
+    #[allow(clippy::cast_precision_loss)]
+    fn pane_request(pane: &TestPane, rect: PixelRect, active: bool) -> MetalPaneRequest {
+        MetalPaneRequest {
             inputs: MetalFrameInputs {
                 pane: Some(Arc::clone(&pane.0)),
                 viewport_top: None,
                 config: config::configuration(),
-                focused: true,
+                focused: active,
                 selection: None,
                 hover: None,
-                grid_origin: [0.0, 0.0],
+                grid_origin: [rect.x as f32, rect.y as f32],
             },
+            rect,
+            clear: ClearColor::from_srgba(0.0, 0.0, 0.0, 1.0),
+            hsb: (!active).then_some([1.0, 0.8, 0.7]),
+        }
+    }
+
+    fn window_request(panes: Vec<MetalPaneRequest>) -> MetalFrameRequest {
+        MetalFrameRequest {
+            panes,
+            splits: Vec::new(),
+            config: config::configuration(),
             clear: ClearColor::from_srgba(0.0, 0.0, 0.0, 1.0),
             grid: GridExtent::new(24, 80),
             font_scale: 1.0,
             opaque: true,
         }
+    }
+
+    fn request(pane: &TestPane) -> MetalFrameRequest {
+        config::use_test_configuration();
+        window_request(vec![pane_request(
+            pane,
+            PixelRect::new(0, 0, 1280, 768),
+            true,
+        )])
     }
 
     fn surface(pixel_width: u32, pixel_height: u32) -> SurfaceState {
@@ -874,6 +940,95 @@ mod tests {
         assert_eq!(
             idle.frames_built, paused.frames_built,
             "an idle window drew"
+        );
+    }
+
+    /// ft-yccm0.4.6 acceptance: two panes side by side, one active. Output
+    /// in the inactive pane wakes the render thread from the delivering
+    /// side, and the frames that follow rebuild that pane's changed row and
+    /// none of the active pane's rows.
+    #[test]
+    fn output_in_an_inactive_pane_wakes_the_thread_and_redraws_only_its_rows() {
+        let active = TestPane::new(9_446_001);
+        let inactive = TestPane::new(9_446_002);
+        let (active_id, inactive_id) = (active.0.pane_id(), inactive.0.pane_id());
+        config::use_test_configuration();
+        let output = Arc::new(MetalOutputWake::default());
+        let render = MetalRenderThread::spawn(
+            "ft-render-test".to_string(),
+            MetalRenderer::offscreen().expect("this Mac runs the Metal front end"),
+            window_request(vec![
+                pane_request(&active, PixelRect::new(0, 0, 640, 768), true),
+                pane_request(&inactive, PixelRect::new(640, 0, 640, 768), false),
+            ]),
+            surface(1280, 768),
+            Duration::from_millis(4),
+            Pacing::Interval,
+            Arc::clone(&output),
+        )
+        .unwrap();
+        assert!(output.wake_for(active_id), "the active pane wakes it");
+        assert!(output.wake_for(inactive_id), "the inactive pane wakes it");
+        assert!(
+            !output.wake_for(9_446_003),
+            "a pane it does not draw does not wake it"
+        );
+        // The first frame builds every row of both panes.
+        assert!(eventually(|| {
+            render.rows_rebuilt(active_id) > 0 && render.rows_rebuilt(inactive_id) > 0
+        }));
+        // Settled: woken frames are presented and rebuild no row.
+        let counts = || {
+            (
+                render.rows_rebuilt(active_id),
+                render.rows_rebuilt(inactive_id),
+                render.stats().frames_presented,
+            )
+        };
+        assert!(
+            eventually(|| {
+                let before = counts();
+                output.wake_for(active_id);
+                std::thread::sleep(Duration::from_millis(50));
+                let after = counts();
+                after.2 > before.2 && (after.0, after.1) == (before.0, before.1)
+            }),
+            "the panes never settled: {:?}",
+            counts()
+        );
+
+        let (active_before, inactive_before, frames_before) = counts();
+        inactive
+            .0
+            .perform_actions(vec![termwiz::escape::Action::PrintString(
+                "output in the inactive pane".into(),
+            )])
+            .expect("the pane takes the output");
+        // As the thread delivering the mux notification does.
+        assert!(output.wake_for(inactive_id));
+        assert!(
+            eventually(|| render.rows_rebuilt(inactive_id) > inactive_before),
+            "the inactive pane's changed row was never redrawn"
+        );
+        // A few more frames, each woken by the inactive pane.
+        assert!(eventually(|| {
+            output.wake_for(inactive_id);
+            render.stats().frames_presented >= frames_before + 3
+        }));
+        let (active_after, inactive_after, frames_after) = counts();
+        let rebuilt = inactive_after - inactive_before;
+        eprintln!(
+            "[BENCH] inactive-pane output: {} frames, {rebuilt} rows of the inactive pane and {} of the active pane rebuilt",
+            frames_after - frames_before,
+            active_after - active_before
+        );
+        assert_eq!(
+            active_after, active_before,
+            "the active pane rebuilt rows for output it never had"
+        );
+        assert!(
+            rebuilt <= 2,
+            "{rebuilt} rows rebuilt for one line of output"
         );
     }
 }

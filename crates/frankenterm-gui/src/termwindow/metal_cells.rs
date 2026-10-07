@@ -80,6 +80,8 @@ impl MetalFrame {
 pub(crate) struct MetalFrameUniforms {
     pub(crate) background: BackgroundUniforms,
     pub(crate) text: TextUniforms,
+    /// How many of the scene's rows this update rebuilt (ft-yccm0.4.6).
+    pub(crate) rows_rebuilt: usize,
 }
 
 /// What a Metal frame needs from its window, captured on the main thread
@@ -289,6 +291,7 @@ impl MetalFrame {
                 line_thickness: metrics.underline_height.max(1) as f32,
                 strikethrough_position: metrics.strike_row as f32,
             },
+            rows_rebuilt: update.rows_rebuilt,
         };
         *slot = Some(frame);
         Some(uniforms)

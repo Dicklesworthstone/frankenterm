@@ -123,6 +123,7 @@ pub mod keyevent;
 mod metal_cells;
 mod metal_glyphs;
 mod metal_render_thread;
+mod metal_window;
 pub mod modal;
 mod mouseevent;
 pub mod palette;
