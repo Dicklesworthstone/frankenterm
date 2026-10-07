@@ -9688,9 +9688,11 @@ mod scrollback_crash_points {
 
     static ARMED: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
 
+    /// The store being imaged and its images so far, by crash point.
+    type Recording = Option<(PathBuf, Vec<(&'static str, Image)>)>;
+
     std::thread_local! {
-        static RECORDING: std::cell::RefCell<Option<(PathBuf, Vec<(&'static str, Image)>)>> =
-            const { std::cell::RefCell::new(None) };
+        static RECORDING: std::cell::RefCell<Recording> = const { std::cell::RefCell::new(None) };
     }
 
     pub fn arm(step: &'static str) {
@@ -14782,9 +14784,10 @@ mod tests {
         let paths: std::collections::BTreeSet<_> = earlier.keys().chain(later.keys()).collect();
         let changed: Vec<usize> = (0..CRASH_UNITS.len())
             .filter(|&unit| {
-                paths.iter().any(|path| {
-                    crash_unit(path) == Some(unit) && earlier.get(*path) != later.get(*path)
-                })
+                paths
+                    .iter()
+                    .filter(|path| crash_unit(path) == Some(unit))
+                    .any(|path| earlier.get(*path) != later.get(*path))
             })
             .collect();
         let mut states = Vec::new();
