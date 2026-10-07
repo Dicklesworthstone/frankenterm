@@ -161,7 +161,11 @@ const PANE_LOG_MAX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
 /// Maximum rows in one durable append; independent byte limits still apply.
 /// Spill queues use the same cap so accepted batches cannot exceed storage admission.
 pub const PANE_APPEND_MAX_ROWS: usize = 4096;
-const PANE_APPEND_MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// Chunks one synchronized append may carry (ft-yccm0.2.1.2): 64 batches of
+/// at most 4096 rows, so a commit window's single barrier covers up to
+/// 262,144 rows.
+pub const PANE_APPEND_MAX_CHUNKS: usize = 64;
+pub const PANE_APPEND_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Durability sync for the live scrollback store (ft-y0gy9).
 ///
@@ -175,6 +179,7 @@ const PANE_APPEND_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// macOS. A filesystem that rejects the barrier falls back to a full sync.
 /// Elsewhere this is `sync_all`.
 pub fn ordered_durability_sync(file: &File) -> std::io::Result<()> {
+    THREAD_DURABILITY_SYNCS.with(|count| count.set(count.get().wrapping_add(1)));
     #[cfg(target_os = "macos")]
     if nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_BARRIERFSYNC).is_ok() {
         return Ok(());
@@ -182,10 +187,24 @@ pub fn ordered_durability_sync(file: &File) -> std::io::Result<()> {
     file.sync_all()
 }
 
+std::thread_local! {
+    static THREAD_DURABILITY_SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many ordered-durability syncs the calling thread has issued, the
+/// unit a durability protocol's cost is measured in (syncs per MiB
+/// ingested, ft-yccm0.2.1.2). Per thread, so concurrent work elsewhere in
+/// the process does not leak into a measurement.
+#[must_use]
+pub fn thread_durability_sync_count() -> u64 {
+    THREAD_DURABILITY_SYNCS.with(std::cell::Cell::get)
+}
+
 /// [`ordered_durability_sync`] for a file's data only. Barrier syncs cover
 /// data and metadata alike, so on macOS this is the same call; elsewhere it
 /// is `sync_data`.
 pub fn ordered_durability_sync_data(file: &File) -> std::io::Result<()> {
+    THREAD_DURABILITY_SYNCS.with(|count| count.set(count.get().wrapping_add(1)));
     #[cfg(target_os = "macos")]
     if nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_BARRIERFSYNC).is_ok() {
         return Ok(());
@@ -321,6 +340,26 @@ fn validate_append_batch(lines: &[&str]) -> Result<(), MmapStoreError> {
         }
     }
     Ok(())
+}
+
+/// Validates every chunk as one append batch and bounds the chunk count;
+/// returns the total row count.
+fn validate_append_chunks(chunks: &[&[&str]]) -> Result<usize, MmapStoreError> {
+    if chunks.len() > PANE_APPEND_MAX_CHUNKS {
+        return Err(MmapStoreError::PaneAppendLimitExceeded {
+            limit_name: "chunks",
+            limit: PANE_APPEND_MAX_CHUNKS as u64,
+            observed: u64::try_from(chunks.len()).unwrap_or(u64::MAX),
+        });
+    }
+    let mut rows = 0usize;
+    for chunk in chunks {
+        validate_append_batch(chunk)?;
+        rows = rows
+            .checked_add(chunk.len())
+            .ok_or(MmapStoreError::NumericOverflow("append_rows"))?;
+    }
+    Ok(rows)
 }
 
 fn validate_read_range(
@@ -1346,19 +1385,26 @@ impl PaneFile {
     }
 
     fn append_lines(&mut self, lines: &[&str]) -> Result<u64, MmapStoreError> {
-        validate_append_batch(lines)?;
+        self.append_line_chunks(&[lines])
+    }
+
+    /// Append every chunk, in order, with one vectored write per chunk and
+    /// one data sync for all of them (ft-yccm0.2.1.2): a commit window costs
+    /// one barrier however many store batches it holds. Each chunk keeps the
+    /// per-batch row and byte bounds; the chunk count is bounded too.
+    fn append_line_chunks(&mut self, chunks: &[&[&str]]) -> Result<u64, MmapStoreError> {
+        let rows = validate_append_chunks(chunks)?;
         let seq = self.next_seq()?;
-        if lines.is_empty() {
+        let Some(first) = chunks.iter().find_map(|chunk| chunk.first()) else {
             return Ok(seq);
-        }
-        if self.file_len == 0 && lines[0].as_bytes().starts_with(b"\0FTMMAP") {
+        };
+        if self.file_len == 0 && first.as_bytes().starts_with(b"\0FTMMAP") {
             return Err(MmapStoreError::InvalidPaneLogHeader(
                 "first record collides with the reserved pane header".to_string(),
             ));
         }
         seq.checked_add(
-            u64::try_from(lines.len())
-                .map_err(|_| MmapStoreError::NumericOverflow("line_count"))?,
+            u64::try_from(rows).map_err(|_| MmapStoreError::NumericOverflow("line_count"))?,
         )
         .ok_or(MmapStoreError::NumericOverflow("seq"))?;
         let physical_end = self.file.seek(SeekFrom::End(0))?;
@@ -1369,20 +1415,10 @@ impl PaneFile {
         };
         let mut offsets = Vec::new();
         offsets
-            .try_reserve_exact(lines.len())
+            .try_reserve_exact(rows)
             .map_err(|_| std::io::Error::other("cannot reserve bounded append offsets"))?;
-        let mut slices = Vec::new();
-        let slice_count = lines
-            .len()
-            .checked_mul(2)
-            .ok_or(MmapStoreError::NumericOverflow("append_slice_count"))?;
-        slices
-            .try_reserve_exact(slice_count)
-            .map_err(|_| std::io::Error::other("cannot reserve bounded append slices"))?;
-        for line in lines {
+        for line in chunks.iter().flat_map(|chunk| chunk.iter()) {
             offsets.push(LineOffset(new_file_len));
-            slices.push(IoSlice::new(line.as_bytes()));
-            slices.push(IoSlice::new(b"\n"));
             new_file_len = new_file_len
                 .checked_add(
                     u64::try_from(line.len())
@@ -1391,8 +1427,19 @@ impl PaneFile {
                 .and_then(|len| len.checked_add(1))
                 .ok_or(MmapStoreError::NumericOverflow("file_len"))?;
         }
+        let mut slices = Vec::new();
+        let slice_count = chunks
+            .iter()
+            .map(|chunk| chunk.len())
+            .max()
+            .unwrap_or(0)
+            .checked_mul(2)
+            .ok_or(MmapStoreError::NumericOverflow("append_slice_count"))?;
+        slices
+            .try_reserve_exact(slice_count)
+            .map_err(|_| std::io::Error::other("cannot reserve bounded append slices"))?;
         self.line_offsets
-            .try_reserve(lines.len())
+            .try_reserve(rows)
             .map_err(|_| std::io::Error::other("cannot reserve bounded append row metadata"))?;
         if self.trailing_partial {
             // The suffix after `file_len` was never acknowledged. A failed
@@ -1411,18 +1458,29 @@ impl PaneFile {
         let mut writer = PaneAppendWriter {
             file: &mut self.file,
             #[cfg(test)]
-            fault_after_bytes: PANE_APPEND_FAULT.with(|fault| match fault.get() {
-                Some(0) => Some(lines[0].len() / 2),
-                Some(rows) if rows <= lines.len() => {
-                    Some(lines[..rows].iter().map(|line| line.len() + 1).sum())
+            fault_after_bytes: PANE_APPEND_FAULT.with(|fault| {
+                let lines = chunks.first().copied().unwrap_or_default();
+                match fault.get() {
+                    Some(0) => lines.first().map(|line| line.len() / 2),
+                    Some(rows) if rows <= lines.len() => {
+                        Some(lines[..rows].iter().map(|line| line.len() + 1).sum())
+                    }
+                    _ => None,
                 }
-                _ => None,
             }),
         };
-        // At most 8192 descriptors (128 KiB on 64-bit hosts) cover the
-        // 4096-row/32-MiB bound. File uses writev on Unix; platforms or writes
-        // accepting only a prefix are handled without replaying accepted bytes.
-        write_append_slices(&mut writer, &mut slices)?;
+        // At most 8192 descriptors (128 KiB on 64-bit hosts) cover one chunk's
+        // 4096-row/32-MiB bound; the vector is reused chunk by chunk. File
+        // uses writev on Unix; platforms or writes accepting only a prefix are
+        // handled without replaying accepted bytes.
+        for chunk in chunks {
+            slices.clear();
+            for line in *chunk {
+                slices.push(IoSlice::new(line.as_bytes()));
+                slices.push(IoSlice::new(b"\n"));
+            }
+            write_append_slices(&mut writer, &mut slices)?;
+        }
         #[cfg(test)]
         if writer.fault_after_bytes == Some(0) {
             return Err(
@@ -2381,6 +2439,47 @@ pub fn read_pane_snapshot(
     max_record_bytes: u64,
     max_physical_bytes: u64,
 ) -> Result<MmapPaneReadSnapshot, MmapStoreError> {
+    read_pane_snapshot_bounded(
+        base_dir,
+        pane_id,
+        None,
+        max_records,
+        max_record_bytes,
+        max_physical_bytes,
+    )
+}
+
+/// [`read_pane_snapshot`] of the records before `through_seq` only
+/// (ft-yccm0.2.1.2). A writer may have appended a durable tail past the
+/// prefix its manifest publishes; this reads that published prefix exactly,
+/// as if the tail were an uncommitted suffix: `committed_bytes` ends at the
+/// last returned record and `max_records` bounds the returned records only.
+pub fn read_pane_snapshot_through(
+    base_dir: &Path,
+    pane_id: PaneId,
+    through_seq: u64,
+    max_records: usize,
+    max_record_bytes: u64,
+    max_physical_bytes: u64,
+) -> Result<MmapPaneReadSnapshot, MmapStoreError> {
+    read_pane_snapshot_bounded(
+        base_dir,
+        pane_id,
+        Some(through_seq),
+        max_records,
+        max_record_bytes,
+        max_physical_bytes,
+    )
+}
+
+fn read_pane_snapshot_bounded(
+    base_dir: &Path,
+    pane_id: PaneId,
+    through_seq: Option<u64>,
+    max_records: usize,
+    max_record_bytes: u64,
+    max_physical_bytes: u64,
+) -> Result<MmapPaneReadSnapshot, MmapStoreError> {
     let base_metadata = std::fs::symlink_metadata(base_dir)?;
     if !base_metadata.file_type().is_dir() {
         return Err(MmapStoreError::InvalidPaneLogHeader(
@@ -2434,10 +2533,12 @@ pub fn read_pane_snapshot(
             ));
         }
     }
-    let (mut line_offsets, committed_bytes, log_base_seq, _data_start) =
+    // A bounded read scans past its bound (the physical byte limit still
+    // applies) and enforces `max_records` on the records it returns.
+    let (mut line_offsets, mut committed_bytes, log_base_seq, _data_start) =
         PaneFile::scan_offsets_and_base_bounded(
             &file,
-            Some(max_records),
+            through_seq.is_none().then_some(max_records),
             Some(max_physical_bytes),
         )?;
 
@@ -2515,6 +2616,20 @@ pub fn read_pane_snapshot(
         )));
     }
     line_offsets.drain(0..logically_pruned);
+    if let Some(through_seq) = through_seq {
+        let kept = usize::try_from(through_seq.saturating_sub(base_seq))
+            .map_err(|_| MmapStoreError::NumericOverflow("snapshot_through_rows"))?;
+        if kept > line_offsets.len() {
+            return Err(MmapStoreError::InvalidPaneLogHeader(format!(
+                "pane log ends at sequence {} before the requested bound {through_seq}",
+                base_seq.saturating_add(u64::try_from(line_offsets.len()).unwrap_or(u64::MAX))
+            )));
+        }
+        if let Some(first_excluded) = line_offsets.get(kept) {
+            committed_bytes = first_excluded.0;
+        }
+        line_offsets.truncate(kept);
+    }
     if line_offsets.len() > max_records {
         return Err(MmapStoreError::PaneSnapshotLimitExceeded {
             limit_name: "records",
@@ -3025,6 +3140,38 @@ impl MmapScrollbackStore {
             .get_mut(&pane_id)
             .ok_or(MmapStoreError::UnknownPane(pane_id))?
             .append_lines(lines)
+    }
+
+    /// [`Self::append_lines`] for several batches with one durability sync
+    /// for all of them on a file-backed pane (ft-yccm0.2.1.2). Returns the
+    /// sequence of the first row. A SQLite-authority pane commits chunk by
+    /// chunk, so a failure there may leave a prefix of the chunks appended.
+    pub fn append_line_chunks(
+        &mut self,
+        pane_id: PaneId,
+        chunks: &[&[&str]],
+    ) -> Result<u64, MmapStoreError> {
+        validate_append_chunks(chunks)?;
+        self.ensure_pane(pane_id)?;
+        if self.fallback_panes.contains(&pane_id) {
+            let sqlite = self
+                .sqlite_fallback
+                .as_mut()
+                .ok_or(MmapStoreError::UnknownPane(pane_id))?;
+            let mut first = None;
+            for chunk in chunks.iter().filter(|chunk| !chunk.is_empty()) {
+                let seq = sqlite.append_lines_auto_seq(pane_id, chunk)?;
+                first.get_or_insert(seq);
+            }
+            return match first {
+                Some(seq) => Ok(seq),
+                None => sqlite.next_seq(pane_id),
+            };
+        }
+        self.panes
+            .get_mut(&pane_id)
+            .ok_or(MmapStoreError::UnknownPane(pane_id))?
+            .append_line_chunks(chunks)
     }
 
     pub fn compact_pane_if_stale(
@@ -5702,6 +5849,129 @@ mod tests {
                 observed: 3,
             }
         ));
+    }
+
+    /// ft-yccm0.2.1.2: a bounded snapshot reads the published prefix of a
+    /// log that also holds a durable tail, as if the tail were uncommitted:
+    /// records, next sequence and committed bytes end at the bound, and the
+    /// record limit applies to what is returned.
+    #[test]
+    fn read_pane_snapshot_through_reads_the_prefix_before_a_durable_tail() {
+        let dir = temp_dir();
+        let log_path = dir.path().join("9.log");
+        let sequence_path = dir.path().join("9.seq");
+        std::fs::write(&log_path, b"zero\none\ntwo\nthree\nfour\n").unwrap();
+        std::fs::write(&sequence_path, b"FTSEQ1:1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::set_permissions(&sequence_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+
+        let snapshot = read_pane_snapshot_through(dir.path(), 9, 3, 2, 1024, 1024).unwrap();
+        assert_eq!(snapshot.oldest_seq, Some(1));
+        assert_eq!(snapshot.next_seq, 3);
+        assert_eq!(snapshot.records, vec!["one", "two"]);
+        assert_eq!(snapshot.retained_record_bytes, 8);
+        assert_eq!(snapshot.committed_bytes, 13, "ends after \"two\\n\"");
+        assert_eq!(snapshot.trailing_uncommitted_bytes, 11);
+
+        let whole = read_pane_snapshot_through(dir.path(), 9, 5, 4, 1024, 1024).unwrap();
+        assert_eq!(whole.records, vec!["one", "two", "three", "four"]);
+        assert_eq!(whole.committed_bytes, 24);
+        assert_eq!(
+            whole.records,
+            read_pane_snapshot(dir.path(), 9, 5, 1024, 1024)
+                .unwrap()
+                .records
+        );
+
+        assert!(matches!(
+            read_pane_snapshot_through(dir.path(), 9, 3, 1, 1024, 1024),
+            Err(MmapStoreError::PaneSnapshotLimitExceeded {
+                limit_name: "records",
+                limit: 1,
+                observed: 2,
+            })
+        ));
+        assert!(
+            matches!(
+                read_pane_snapshot_through(dir.path(), 9, 6, 8, 1024, 1024),
+                Err(MmapStoreError::InvalidPaneLogHeader(_))
+            ),
+            "a bound past the log's end is refused"
+        );
+        let empty = read_pane_snapshot_through(dir.path(), 9, 1, 8, 1024, 1024).unwrap();
+        assert!(empty.records.is_empty());
+        assert_eq!(empty.next_seq, 1);
+    }
+
+    /// ft-yccm0.2.1.2: chunks append in order with one data sync for all of
+    /// them on a file pane; a SQLite-authority pane appends them too; empty
+    /// chunks are skipped; each chunk and the chunk count stay bounded.
+    #[test]
+    fn append_line_chunks_write_every_chunk_in_order_under_one_data_sync() {
+        for fallback in [false, true] {
+            let dir = temp_dir();
+            let db = dir.path().join("chunks.sqlite");
+            let mut store = hybrid_store(dir.path(), &db);
+            if fallback {
+                store.activate_sqlite_fallback(7).unwrap();
+            }
+            assert_eq!(store.append_lines(7, &["before"]).unwrap(), 0);
+            PANE_APPEND_DATA_SYNCS.with(|count| count.set(0));
+            let first: Vec<String> = (0..PANE_APPEND_MAX_ROWS).map(|n| n.to_string()).collect();
+            let first: Vec<&str> = first.iter().map(String::as_str).collect();
+            let chunks: [&[&str]; 3] = [&first, &[], &["界e\u{301}", "👩‍💻"]];
+            assert_eq!(store.append_line_chunks(7, &chunks).unwrap(), 1);
+            let rows = 1 + PANE_APPEND_MAX_ROWS as u64 + 2;
+            assert_eq!(store.next_seq(7).unwrap(), rows);
+            assert_eq!(
+                PANE_APPEND_DATA_SYNCS.with(|count| count.get()),
+                usize::from(!fallback),
+                "one data sync for the whole append"
+            );
+            assert_eq!(store.line_at(7, 1).unwrap().as_deref(), Some("0"));
+            assert_eq!(
+                store.tail_lines(7, 3).unwrap(),
+                vec![
+                    (PANE_APPEND_MAX_ROWS - 1).to_string(),
+                    "界e\u{301}".to_string(),
+                    "👩‍💻".to_string()
+                ]
+            );
+            assert_eq!(store.append_line_chunks(7, &[]).unwrap(), rows);
+
+            let too_many = vec![["x"].as_slice(); PANE_APPEND_MAX_CHUNKS + 1];
+            assert!(matches!(
+                store.append_line_chunks(7, &too_many),
+                Err(MmapStoreError::PaneAppendLimitExceeded {
+                    limit_name: "chunks",
+                    ..
+                })
+            ));
+            let oversized: Vec<&str> = vec!["y"; PANE_APPEND_MAX_ROWS + 1];
+            assert!(matches!(
+                store.append_line_chunks(7, &[&["z"], &oversized]),
+                Err(MmapStoreError::PaneAppendLimitExceeded {
+                    limit_name: "rows",
+                    ..
+                })
+            ));
+            assert_eq!(
+                store.next_seq(7).unwrap(),
+                rows,
+                "a refused append writes nothing"
+            );
+            drop(store);
+            let mut reopened = hybrid_store(dir.path(), &db);
+            reopened.ensure_pane(7).unwrap();
+            assert_eq!(reopened.next_seq(7).unwrap(), rows);
+            assert_eq!(reopened.line_at(7, 1).unwrap().as_deref(), Some("0"));
+        }
     }
 
     #[cfg(unix)]
