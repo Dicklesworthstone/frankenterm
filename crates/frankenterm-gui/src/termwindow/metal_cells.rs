@@ -1,26 +1,27 @@
-//! The active pane's cell backgrounds for the Metal background pass
-//! (ft-yccm0.4.2.2), resolved the way the WebGpu renderer resolves them:
-//! explicit and reverse-video colors, wide characters with their spacer
-//! cells, the selection, and the cursor shape, focused or not.
+//! The live Metal frame (ft-yccm0.4.4).
 //!
-//! The Metal render snapshot (ft-yccm0.1.10) draws these through the real
-//! background pass. The full renderer adapter is ft-yccm0.4.4.
+//! Each Metal paint captures the active pane's changed rows into its render
+//! mirror under one short hold of the terminal lock
+//! (`LocalPane::capture_render_rows`; the generic pane path for mux clients
+//! and cold scrollback). It then rebuilds the frame's cell backgrounds and
+//! glyph instances outside the lock, only for the rows that need it
+//! ([`frankenterm_gui::metal_scene`]). Colors and the cursor are resolved the
+//! way the WebGpu renderer resolves them. The palette comes from the pane's
+//! published render facts, so it is read without the lock. The image-parity
+//! snapshot (ft-yccm0.1.10) draws the same scene offscreen.
 
 use crate::termwindow::TermWindow;
+use crate::termwindow::metal_glyphs::FontGlyphs;
+use frankenterm_gui::metal_scene::{MetalScene, SceneStyle};
 use frankenterm_renderer_metal::{
-    BackgroundUniforms, CellBg, CellBgGrid, CursorShape as MetalCursorShape, CursorUniform,
-    GridExtent,
+    BackgroundUniforms, CursorShape as MetalCursorShape, CursorUniform, MetalRenderer, TextUniforms,
 };
+use mux::localpane::LocalPane;
+use mux::pane::PaneId;
+use mux::render_mirror::{CaptureRequest, RenderMirror, capture_pane_rows};
+use std::rc::Rc;
 use termwiz::surface::{CursorShape, CursorVisibility};
-use wezterm_term::StableRowIndex;
-use wezterm_term::color::{ColorAttribute, SrgbaTuple};
-
-/// An sRGB color component as the 8-bit value the GPU stores.
-// Clamped to 0.0..=255.0 before the cast.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn unorm8(component: f32) -> u8 {
-    (component.clamp(0.0, 1.0) * 255.0).round() as u8
-}
+use wezterm_term::color::{ColorPalette, SrgbaTuple};
 
 /// Straight-alpha sRGB to the premultiplied RGBA the shader composites.
 fn premultiplied(color: SrgbaTuple) -> [f32; 4] {
@@ -45,102 +46,152 @@ fn cursor_shape(shape: CursorShape, focused_and_active: bool) -> MetalCursorShap
     }
 }
 
+/// A color the palette leaves fully transparent keeps the cell's own.
+fn visible(color: SrgbaTuple) -> Option<SrgbaTuple> {
+    (color.3 > 0.0).then_some(color)
+}
+
+/// One pane's live Metal frame state.
+pub(crate) struct MetalFrame {
+    pane_id: PaneId,
+    mirror: RenderMirror,
+    scene: MetalScene,
+    glyphs: FontGlyphs,
+}
+
+impl MetalFrame {
+    pub(crate) fn scene(&self) -> &MetalScene {
+        &self.scene
+    }
+}
+
+/// The uniforms of one Metal frame.
+pub(crate) struct MetalFrameUniforms {
+    pub(crate) background: BackgroundUniforms,
+    pub(crate) text: TextUniforms,
+}
+
 impl TermWindow {
-    /// The active pane's visible cell backgrounds and the background-pass
-    /// uniforms (cell size, grid origin, cursor, selection tint).
+    /// Captures the active pane's changed rows and brings its Metal scene up
+    /// to date; `self.metal_frame` then holds the scene. `None` without a
+    /// pane.
     // Pixel sizes and cell coordinates are small and non-negative.
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         clippy::cast_precision_loss
     )]
-    pub(crate) fn metal_cell_backgrounds(&mut self) -> Option<(CellBgGrid, BackgroundUniforms)> {
+    pub(crate) fn update_metal_frame(
+        &mut self,
+        metal: &Rc<MetalRenderer>,
+    ) -> Option<MetalFrameUniforms> {
         let pane = self.get_active_pane_or_overlay()?;
-        let dims = pane.get_dimensions();
-        let rows = dims.viewport_rows;
-        let cols = dims.cols;
-        let top = dims.physical_top;
-        let palette = pane.palette();
-        let mut cells = CellBgGrid::new(GridExtent::new(rows, cols));
-
-        let visible = top..top.saturating_add(StableRowIndex::try_from(rows).ok()?);
-        let (first, lines) = pane.get_lines(visible);
-        for (index, line) in lines.iter().enumerate() {
-            let Ok(row) = u32::try_from((first - top) as usize + index) else {
-                continue;
-            };
-            for cell in line.visible_cells() {
-                let attrs = cell.attrs();
-                let color = if attrs.reverse() {
-                    Some(palette.resolve_fg(attrs.foreground()))
-                } else {
-                    match attrs.background() {
-                        ColorAttribute::Default => None,
-                        explicit => Some(palette.resolve_bg(explicit)),
-                    }
-                };
-                let Some(SrgbaTuple(red, green, blue, _)) = color else {
-                    continue;
-                };
-                let background = CellBg::rgb(unorm8(red), unorm8(green), unorm8(blue));
-                let col = u32::try_from(cell.cell_index()).unwrap_or(u32::MAX);
-                if cell.width() > 1 {
-                    cells.set_wide(row, col, background);
-                } else {
-                    cells.set(row, col, background);
-                }
+        let pane_id = pane.pane_id();
+        let mut frame = match self.metal_frame.take() {
+            Some(frame)
+                if frame.pane_id == pane_id
+                    && frame.glyphs.serves(
+                        &self.fonts,
+                        metal,
+                        &self.render_metrics,
+                        self.config.generation(),
+                    ) =>
+            {
+                frame
             }
-        }
-
-        if let Some(selection) = self.selection(pane.pane_id()) {
-            if let Some(range) = selection.range {
-                let range = range.normalize();
-                for row in 0..rows {
-                    let stable = top.saturating_add(row as StableRowIndex);
-                    let span = range.cols_for_row(stable, selection.rectangular);
-                    for col in span.start..span.end.min(cols) {
-                        let (row, col) = (row as u32, col as u32);
-                        if let Some(background) = cells.get(row, col) {
-                            cells.set(row, col, background.selected());
-                        }
-                    }
-                }
-            }
-        }
-
-        let cursor = pane.get_cursor_position();
-        let cursor_row = cursor.y - top;
-        let focused_and_active = self.focused.is_some();
-        let metrics = &self.render_metrics;
-        let cursor = if cursor.visibility == CursorVisibility::Visible
-            && (0..rows as StableRowIndex).contains(&cursor_row)
-        {
-            let shape = self
-                .config
-                .default_cursor_style
-                .effective_shape(cursor.shape);
-            let row = cursor_row as u32;
-            let col = cursor.x as u32;
-            let width_cells = lines
-                .get((top + cursor_row - first) as usize)
-                .and_then(|line| line.get_cell(cursor.x))
-                .map_or(1, |cell| cell.width().clamp(1, 2) as u32);
-            CursorUniform {
-                shape: cursor_shape(shape, focused_and_active),
-                col,
-                row,
-                width_cells,
-                thickness: metrics.underline_height.max(1) as f32,
-                color: premultiplied(if focused_and_active {
-                    palette.cursor_bg
-                } else {
-                    palette.cursor_border
-                }),
-            }
-        } else {
-            CursorUniform::default()
+            _ => MetalFrame {
+                pane_id,
+                mirror: RenderMirror::new(),
+                scene: MetalScene::new(),
+                glyphs: FontGlyphs::new(
+                    Rc::clone(&self.fonts),
+                    self.config.clone(),
+                    Rc::clone(metal),
+                    &self.render_metrics,
+                ),
+            },
         };
 
+        let request = CaptureRequest {
+            viewport_top: self.get_viewport(pane_id),
+            rules: &self.config.hyperlink_rules,
+            rules_generation: self.config.generation(),
+        };
+        let captured = pane
+            .downcast_ref::<LocalPane>()
+            .and_then(|local| local.capture_render_rows(&mut frame.mirror, &request))
+            .unwrap_or_else(|| capture_pane_rows(&*pane, &mut frame.mirror, &request));
+        metrics::histogram!("gui.metal.capture.rows_copied").record(captured.rows_captured as f64);
+
+        if frame.glyphs.begin_frame() {
+            frame.scene.invalidate();
+        }
+        let facts = pane.render_facts();
+        let palette: &ColorPalette = &facts.palette;
+        let focused_and_active = self.focused.is_some();
+        let cursor = frame.mirror.cursor();
+        let shape = self
+            .config
+            .default_cursor_style
+            .effective_shape(cursor.shape);
+        let block_cursor = focused_and_active
+            && matches!(
+                shape,
+                CursorShape::Default | CursorShape::BlinkingBlock | CursorShape::SteadyBlock
+            );
+        let selection = self.selection(pane_id).and_then(|selection| {
+            selection
+                .range
+                .map(|range| (range.normalize(), selection.rectangular))
+        });
+        let selected = |stable| {
+            selection.as_ref().map_or(0..0, |(range, rectangular)| {
+                range.cols_for_row(stable, *rectangular)
+            })
+        };
+        let style = SceneStyle {
+            palette,
+            generation: ((self.config.generation() as u64) << 32)
+                | (facts.palette_generation & 0xffff_ffff),
+            bold_brightens: self.config.bold_brightens_ansi_colors != config::BoldBrightening::No,
+            selection_fg: visible(palette.selection_fg),
+            cursor_fg: if block_cursor {
+                visible(palette.cursor_fg)
+            } else {
+                None
+            },
+            hover: self.current_highlight.as_ref(),
+        };
+        let update = frame
+            .scene
+            .update(&frame.mirror, &style, &selected, &mut frame.glyphs);
+        metrics::histogram!("gui.metal.scene.rows_rebuilt").record(update.rows_rebuilt as f64);
+
+        let metrics = &self.render_metrics;
+        let rows = frame.mirror.rows();
+        let cursor_row = cursor.y - frame.mirror.first();
+        let cursor = match usize::try_from(cursor_row) {
+            Ok(row) if cursor.visibility == CursorVisibility::Visible && row < rows.len() => {
+                let width_cells = rows[row]
+                    .cells()
+                    .iter()
+                    .find(|cell| (cell.col()..cell.col() + cell.width()).contains(&cursor.x))
+                    .map_or(1, |cell| cell.width().clamp(1, 2) as u32);
+                CursorUniform {
+                    shape: cursor_shape(shape, focused_and_active),
+                    col: cursor.x as u32,
+                    row: row as u32,
+                    width_cells,
+                    thickness: metrics.underline_height.max(1) as f32,
+                    color: premultiplied(if focused_and_active {
+                        palette.cursor_bg
+                    } else {
+                        palette.cursor_border
+                    }),
+                }
+            }
+            _ => CursorUniform::default(),
+        };
         let (padding_left, padding_top) = self.padding_left_top();
         let tab_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
             self.tab_bar_pixel_height().unwrap_or(0.0)
@@ -148,22 +199,30 @@ impl TermWindow {
             0.0
         };
         let border = self.get_os_border();
-        let background = BackgroundUniforms {
-            cell_size: [
-                metrics.cell_size.width as f32,
-                metrics.cell_size.height as f32,
-            ],
-            grid_origin: [
-                padding_left + border.left.get() as f32,
-                tab_bar_height + padding_top + border.top.get() as f32,
-            ],
-            row_offset: cells.row_offset(),
-            cursor,
-            selection_tint: premultiplied(palette.selection_bg),
-            search_tint: [0.0; 4],
-            current_match_tint: [0.0; 4],
+        let uniforms = MetalFrameUniforms {
+            background: BackgroundUniforms {
+                cell_size: [
+                    metrics.cell_size.width as f32,
+                    metrics.cell_size.height as f32,
+                ],
+                grid_origin: [
+                    padding_left + border.left.get() as f32,
+                    tab_bar_height + padding_top + border.top.get() as f32,
+                ],
+                row_offset: frame.scene.cells().row_offset(),
+                cursor,
+                selection_tint: premultiplied(palette.selection_bg),
+                search_tint: [0.0; 4],
+                current_match_tint: [0.0; 4],
+            },
+            text: TextUniforms {
+                underline_position: metrics.descender_row as f32,
+                line_thickness: metrics.underline_height.max(1) as f32,
+                strikethrough_position: metrics.strike_row as f32,
+            },
         };
-        Some((cells, background))
+        self.metal_frame = Some(frame);
+        Some(uniforms)
     }
 }
 
@@ -203,10 +262,12 @@ mod tests {
     }
 
     #[test]
-    fn colors_become_unorm_bytes_and_premultiplied_tints() {
-        assert_eq!(unorm8(0.2), 51);
-        assert_eq!(unorm8(1.5), 255);
-        assert_eq!(unorm8(-1.0), 0);
+    fn transparent_palette_colors_keep_the_cell_color_and_tints_premultiply() {
+        assert_eq!(visible(SrgbaTuple(0.0, 0.0, 0.0, 0.0)), None);
+        assert_eq!(
+            visible(SrgbaTuple(1.0, 0.0, 0.0, 1.0)),
+            Some(SrgbaTuple(1.0, 0.0, 0.0, 1.0))
+        );
         assert_eq!(
             premultiplied(SrgbaTuple(1.0, 0.5, 0.25, 0.5)),
             [0.5, 0.25, 0.125, 0.5]

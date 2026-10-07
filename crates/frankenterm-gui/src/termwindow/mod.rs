@@ -121,6 +121,7 @@ pub mod frame_budget;
 pub mod idle_detector;
 pub mod keyevent;
 mod metal_cells;
+mod metal_glyphs;
 pub mod modal;
 mod mouseevent;
 pub mod palette;
@@ -994,24 +995,37 @@ fn lock_termwindow_mutex<'a, T>(mutex: &'a Mutex<T>, name: &str) -> std::sync::M
     })
 }
 
-/// Image-parity hook for the Metal front end (ft-yccm0.1.10): the active
-/// pane's cell backgrounds, selection and cursor drawn offscreen by the real
-/// Metal background pass (ft-yccm0.4.2.2) and read back. Without a pane only
-/// the background clear is drawn. Glyphs join when the CellText pass lands
-/// (ft-yccm0.4.2.3).
+/// The Metal frame of the active pane's scene (ft-yccm0.4.4).
+fn metal_frame_scene<'a>(
+    frame: &'a metal_cells::MetalFrame,
+    uniforms: &metal_cells::MetalFrameUniforms,
+    clear: frankenterm_renderer_metal::ClearColor,
+) -> frankenterm_renderer_metal::FrameScene<'a> {
+    frankenterm_renderer_metal::FrameScene {
+        cells: frame.scene().cells(),
+        background: uniforms.background,
+        text: frame.scene().text(),
+        text_uniforms: uniforms.text,
+        clear,
+    }
+}
+
+/// Image-parity hook for the Metal front end (ft-yccm0.1.10): the frame the
+/// live path draws (ft-yccm0.4.4), backgrounds, selection, cursor and glyphs,
+/// rendered offscreen by the real Metal passes and read back. Without a pane
+/// only the background clear is drawn.
 fn write_metal_render_snapshot(
     metal: &frankenterm_renderer_metal::MetalRenderer,
     path: &std::path::Path,
     width: u32,
     height: u32,
     color: frankenterm_renderer_metal::ClearColor,
-    cells: Option<(
-        frankenterm_renderer_metal::CellBgGrid,
-        frankenterm_renderer_metal::BackgroundUniforms,
-    )>,
+    frame: Option<(&metal_cells::MetalFrame, &metal_cells::MetalFrameUniforms)>,
 ) {
-    let readback = match cells {
-        Some((cells, background)) => metal.snapshot_cells(width, height, &cells, color, background),
+    let readback = match frame {
+        Some((frame, uniforms)) => {
+            metal.snapshot_frame(width, height, &metal_frame_scene(frame, uniforms, color))
+        }
         None => metal.device().clear_offscreen(width, height, color),
     };
     let result = readback
@@ -2451,6 +2465,9 @@ pub struct TermWindow {
     /// The native Metal front end. While it is in development it only clears
     /// the window to the background color; it never has a `RenderState`.
     metal: Option<Rc<frankenterm_renderer_metal::MetalRenderer>>,
+    /// The Metal front end's frame state for the active pane: its render
+    /// mirror, scene and glyphs (ft-yccm0.4.4).
+    metal_frame: Option<metal_cells::MetalFrame>,
     /// Image-parity corpus snapshot request (ft-yccm0.1.10); `None` unless
     /// `FRANKENTERM_RENDER_SNAPSHOT` was set at window creation.
     render_snapshot: Option<render_snapshot::RenderSnapshotRequest>,
@@ -4634,6 +4651,7 @@ impl TermWindow {
             gl: None,
             webgpu: None,
             metal: None,
+            metal_frame: None,
             render_snapshot: render_snapshot::RenderSnapshotRequest::from_env(),
             image_poll_due: Cell::new(None),
             window: None,
@@ -5201,16 +5219,27 @@ impl TermWindow {
         let dimensions = self.dimensions;
         let width = u32::try_from(dimensions.pixel_width).unwrap_or(u32::MAX);
         let height = u32::try_from(dimensions.pixel_height).unwrap_or(u32::MAX);
-        // ft-yccm0.4.2.1: the frame slots are sized for the grid.
-        let grid = frankenterm_renderer_metal::GridExtent::new(
-            self.terminal_size.rows,
-            self.terminal_size.cols,
-        );
-        match metal.render_clear(width, height, grid, color) {
+        // ft-yccm0.4.4: the active pane's changed rows, captured under one
+        // short terminal lock, rebuilt into its scene outside the lock.
+        let uniforms = self.update_metal_frame(&metal);
+        let outcome = match (self.metal_frame.as_ref(), uniforms.as_ref()) {
+            (Some(frame), Some(uniforms)) => {
+                metal.render_frame(width, height, &metal_frame_scene(frame, uniforms, color))
+            }
+            _ => {
+                // ft-yccm0.4.2.1: the frame slots are sized for the grid.
+                let grid = frankenterm_renderer_metal::GridExtent::new(
+                    self.terminal_size.rows,
+                    self.terminal_size.cols,
+                );
+                metal.render_clear(width, height, grid, color)
+            }
+        };
+        match outcome {
             Ok(frankenterm_renderer_metal::FrameOutcome::Presented) => {
                 if let Some(path) = snapshot_path {
-                    let cells = self.metal_cell_backgrounds();
-                    write_metal_render_snapshot(&metal, &path, width, height, color, cells);
+                    let frame = self.metal_frame.as_ref().zip(uniforms.as_ref());
+                    write_metal_render_snapshot(&metal, &path, width, height, color, frame);
                 }
                 let settlement = apply_presented_render_attempt(
                     &mut self.dirty_lines,
