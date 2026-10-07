@@ -1598,6 +1598,52 @@ fn bind_atlases(encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>, atlases: 
     }
 }
 
+/// Draws a window frame's pane backgrounds (`over` false), blended over any
+/// window background layers, or the fills drawn over the panes' text (`over`
+/// true) (Metal 3).
+fn draw_backgrounds(
+    encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+    window: &EncodedWindow<'_>,
+    over: bool,
+) {
+    encoder.setRenderPipelineState(
+        window
+            .background
+            .pipeline(over || window.ui_under.is_some()),
+    );
+    for draw in window.draws.iter().filter(|draw| draw.over == over) {
+        encoder.setScissorRect(scissor(draw.scissor));
+        #[allow(unsafe_code)]
+        // SAFETY: FFI-DRAW. The leased slot's window uniforms, written for
+        // this frame, bound at the draw's block offset (a multiple of
+        // UNIFORMS_BYTES inside the buffer) at the shader's [[buffer(0)]].
+        unsafe {
+            encoder.setFragmentBuffer_offset_atIndex(
+                Some(window.uniforms),
+                draw.uniforms_offset,
+                SlotBuffer::Uniforms.index(),
+            );
+        }
+        #[allow(unsafe_code)]
+        // SAFETY: FFI-DRAW. The draw's CellBg buffer (a pane's in the leased
+        // slot, sized for its grid, or the slot's fill cell), bound from
+        // offset 0 at the shader's [[buffer(1)]].
+        unsafe {
+            encoder.setFragmentBuffer_offset_atIndex(
+                Some(draw.cells),
+                0,
+                SlotBuffer::CellBg.index(),
+            );
+        }
+        #[allow(unsafe_code)]
+        // SAFETY: FFI-DRAW. Three vertices of one triangle; bg_vertex derives
+        // positions from vertex_id and reads no vertex buffer.
+        unsafe {
+            encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+        }
+    }
+}
+
 /// A scissor rectangle for `rect`.
 fn scissor(rect: crate::PixelRect) -> MTLScissorRect {
     MTLScissorRect {
@@ -1878,53 +1924,7 @@ impl Metal3Submission {
         if let Some(under) = &window.ui_under {
             draw_ui(&encoder, under);
         }
-        // The panes' backgrounds (over false), blended over any window
-        // background layers, or the fills drawn over the panes' text (over
-        // true).
-        let backgrounds = |over: bool| {
-            encoder.setRenderPipelineState(
-                window
-                    .background
-                    .pipeline(over || window.ui_under.is_some()),
-            );
-            for draw in window.draws.iter().filter(|draw| draw.over == over) {
-                encoder.setScissorRect(scissor(draw.scissor));
-                #[allow(unsafe_code)]
-                // SAFETY: FFI-DRAW. The leased slot's window uniforms, written
-                // for this frame, bound at the draw's block offset (a multiple
-                // of UNIFORMS_BYTES inside the buffer) at the shader's
-                // [[buffer(0)]].
-                unsafe {
-                    encoder.setFragmentBuffer_offset_atIndex(
-                        Some(window.uniforms),
-                        draw.uniforms_offset,
-                        SlotBuffer::Uniforms.index(),
-                    );
-                }
-                #[allow(unsafe_code)]
-                // SAFETY: FFI-DRAW. The draw's CellBg buffer (a pane's in the
-                // leased slot, sized for its grid, or the slot's fill cell),
-                // bound from offset 0 at the shader's [[buffer(1)]].
-                unsafe {
-                    encoder.setFragmentBuffer_offset_atIndex(
-                        Some(draw.cells),
-                        0,
-                        SlotBuffer::CellBg.index(),
-                    );
-                }
-                #[allow(unsafe_code)]
-                // SAFETY: FFI-DRAW. Three vertices of one triangle; bg_vertex
-                // derives positions from vertex_id and reads no vertex buffer.
-                unsafe {
-                    encoder.drawPrimitives_vertexStart_vertexCount(
-                        MTLPrimitiveType::Triangle,
-                        0,
-                        3,
-                    );
-                }
-            }
-        };
-        backgrounds(false);
+        draw_backgrounds(&encoder, window, false);
         let mut text_bound = false;
         for draw in window.draws {
             let Some(text) = draw.text.filter(|text| text.instances > 0) else {
@@ -1980,7 +1980,7 @@ impl Metal3Submission {
             }
         }
         if window.draws.iter().any(|draw| draw.over) {
-            backgrounds(true);
+            draw_backgrounds(&encoder, window, true);
         }
         if let Some(ui) = &window.ui {
             draw_ui(&encoder, ui);
@@ -2184,18 +2184,15 @@ impl Metal4Submission {
         }
     }
 
-    fn encode_window(
+    /// Grows a slot's argument tables to `under_table + 1` and binds them:
+    /// each draw's, then the chrome's and the background layers'.
+    fn bind_window_tables(
         &self,
-        lease: SlotLease,
+        tables: &mut Vec<Retained<ProtocolObject<dyn MTL4ArgumentTable>>>,
         window: &EncodedWindow<'_>,
+        chrome_table: usize,
+        under_table: usize,
     ) -> Result<(), FrameError> {
-        let slot = lease.slot();
-        let mut tables = self.window_tables[slot].borrow_mut();
-        // One table per draw, then the chrome's and the background layers':
-        // no draw depends on when the encoder reads a table's bindings. The
-        // lease proves this slot's previous frame, the last to read them,
-        // completed.
-        let (chrome_table, under_table) = (window.draws.len(), window.draws.len() + 1);
         while tables.len() < under_table + 1 {
             let table = self
                 .device
@@ -2235,6 +2232,22 @@ impl Metal4Submission {
         if let Some(under) = &window.ui_under {
             Self::bind_ui(&tables[under_table], under);
         }
+        Ok(())
+    }
+
+    fn encode_window(
+        &self,
+        lease: SlotLease,
+        window: &EncodedWindow<'_>,
+    ) -> Result<(), FrameError> {
+        let slot = lease.slot();
+        let mut tables = self.window_tables[slot].borrow_mut();
+        // One table per draw, then the chrome's and the background layers':
+        // no draw depends on when the encoder reads a table's bindings. The
+        // lease proves this slot's previous frame, the last to read them,
+        // completed.
+        let (chrome_table, under_table) = (window.draws.len(), window.draws.len() + 1);
+        self.bind_window_tables(&mut tables, window, chrome_table, under_table)?;
         let commands = &self.command_buffers[slot];
         // The lease proves this slot's previous frame completed, so its
         // allocator's memory is free to reuse.
