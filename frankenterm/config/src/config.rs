@@ -280,6 +280,18 @@ pub struct Config {
     )]
     pub scrollback_durability_commit_idle_ms: u64,
 
+    /// Shortest interval (ms) between two manifest publications of one pane
+    /// (ft-yccm0.2.1.2). Between them, each commit window appends its rows
+    /// under one sync and recovery adopts that durable tail; a publication
+    /// (also on pane close or flush) names it in a cumulative WAL. 0
+    /// publishes every transaction. `FT_DURABILITY_MANIFEST_PUBLISH_MS`
+    /// overrides it for A/B runs.
+    #[dynamic(
+        default = "default_scrollback_durability_manifest_publish_ms",
+        validate = "validate_scrollback_durability_manifest_publish_ms"
+    )]
+    pub scrollback_durability_manifest_publish_ms: u64,
+
     // -- Agent pane state detection --
     /// Enable agent pane state detection and visual indicators.
     #[dynamic(default = "default_true")]
@@ -2541,6 +2553,23 @@ fn validate_scrollback_durability_commit_window_ms(value: &u64) -> Result<(), St
     }
 }
 
+/// Longest interval between manifest publications, in milliseconds.
+pub const MAX_SCROLLBACK_DURABILITY_MANIFEST_PUBLISH_MS: u64 = 60_000;
+
+fn default_scrollback_durability_manifest_publish_ms() -> u64 {
+    1_000
+}
+
+fn validate_scrollback_durability_manifest_publish_ms(value: &u64) -> Result<(), String> {
+    if *value <= MAX_SCROLLBACK_DURABILITY_MANIFEST_PUBLISH_MS {
+        Ok(())
+    } else {
+        Err(format!(
+            "scrollback_durability_manifest_publish_ms must be in 0..={MAX_SCROLLBACK_DURABILITY_MANIFEST_PUBLISH_MS}, got {value}"
+        ))
+    }
+}
+
 fn validate_scrollback_durability_commit_window_mb(value: &usize) -> Result<(), String> {
     if (1..=MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MB).contains(value) {
         Ok(())
@@ -3749,6 +3778,14 @@ mod tests {
         for mb in [0, MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MB + 1] {
             assert!(validate_scrollback_durability_commit_window_mb(&mb).is_err());
         }
+        assert_eq!(config.scrollback_durability_manifest_publish_ms, 1_000);
+        for ms in [0, 1_000, MAX_SCROLLBACK_DURABILITY_MANIFEST_PUBLISH_MS] {
+            assert!(validate_scrollback_durability_manifest_publish_ms(&ms).is_ok());
+        }
+        assert!(validate_scrollback_durability_manifest_publish_ms(
+            &(MAX_SCROLLBACK_DURABILITY_MANIFEST_PUBLISH_MS + 1)
+        )
+        .is_err());
     }
 
     #[test]
