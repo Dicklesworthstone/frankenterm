@@ -128,6 +128,16 @@ impl PageRows {
         self.views[index].edited
     }
 
+    /// Row `index` for a native read, with no view built or dropped. `None`
+    /// when an edit left the row's content in its view.
+    pub fn page_row_ref(&self, index: usize) -> Option<(&Page, u32)> {
+        if self.views[index].edited {
+            return None;
+        }
+        let row = self.list.row(self.stable(index))?;
+        Some((row.page, row.row))
+    }
+
     /// Row `index` for a native write. A view edited through
     /// [`Self::line_mut`] is stored back into the page first, and the cached
     /// view is dropped, since the write changes the row. Returns `None`,
@@ -823,6 +833,23 @@ mod tests {
                 b"main\r\n\x1b[?1049halt\x1b[2;3r\n\n\n\x1bMx\x1b[r\x1b[?47l\x1b[?47h".to_vec(),
             ),
             (
+                "osc133_zones",
+                b"\x1b]133;A\x07$ \x1b]133;B\x07ls -l\x1b]133;C\x07\r\nout one\r\nout two\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ "
+                    .to_vec(),
+            ),
+            (
+                "repeat",
+                "ab\x1b[3b\r\n\u{4e2d} \x1b[2b\r\n\x1b[5b\x1b[44mz\x1b[20b\x1b[m"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            (
+                "graphemes_at_the_margin",
+                "\x1b[1;9H\u{1f468}\u{200d}\u{1f469}\x1b[2;10He\u{301}\u{301}\x1b[3;1H\u{2764}\u{fe0f}\u{200d}"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            (
                 "graphemes",
                 "e\u{301} \u{4e2d}\u{6587} \u{1f468}\u{200d}\u{1f469} \u{2764}\u{fe0f} ab\u{301}"
                     .as_bytes()
@@ -847,6 +874,15 @@ mod tests {
                     what
                 );
                 assert_eq!(page.screen().grid_engine(), GridEngine::Page, "{}", what);
+                // Every operation in these streams runs natively: no row is
+                // left held by an edited view.
+                assert_eq!(page.screen().rows_held_by_views(), 0, "{}", what);
+                assert_eq!(
+                    page.get_semantic_zones().unwrap(),
+                    legacy.get_semantic_zones().unwrap(),
+                    "{} zones",
+                    what
+                );
 
                 let size = TerminalSize {
                     rows: 4,

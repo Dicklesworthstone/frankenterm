@@ -13,13 +13,13 @@
 //! A function that returns `false` has written nothing. The caller then
 //! applies the legacy method to the row's `Line` view instead.
 
-use super::cell::{classify, Glyph, StyleClass};
+use super::cell::{classify, Glyph, PackedCell, StyleClass};
 use super::page::{CellWrite, Page, StyleSpec};
 use super::row::RowHeader;
 use crate::config::BidiMode;
 use frankenterm_bidi::ParagraphDirectionHint;
 use frankenterm_cell::image::ImageCell;
-use frankenterm_cell::{Cell, CellAttributes};
+use frankenterm_cell::{Cell, CellAttributes, SemanticType};
 use frankenterm_surface::line::clustered_append_breaks;
 use frankenterm_surface::{Line, SequenceNo};
 use std::ops::Range;
@@ -61,6 +61,12 @@ fn is_clustered(page: &Page, row: u32) -> bool {
 
 fn set_vector(page: &mut Page, row: u32) {
     page.set_row_flags(row, RowHeader::LEGACY_FORM_C, false);
+}
+
+/// The storage effect of legacy `Line::cells_mut`: the row becomes a vector
+/// row, and nothing else changes, its seqno included.
+pub fn make_vector(page: &mut Page, row: u32) {
+    set_vector(page, row);
 }
 
 /// The last character of the row's text as clustered storage holds it: the
@@ -580,6 +586,59 @@ pub fn blank_band(
     }
 }
 
+/// Legacy `Line::semantic_zone_ranges` (`compute_zones`) on a page row: the
+/// runs of visible cells by semantic type, as `(type, columns)`, with each
+/// run ending one past its last cell's column. Visible cells after the last
+/// non-blank one are left out, unless the row is all blanks, in which case
+/// legacy keeps every cell.
+pub fn semantic_zone_ranges(page: &Page, row: u32) -> Vec<(SemanticType, Range<u16>)> {
+    let len = page.row_len(row);
+    let is_blank = |x: usize| page.cell(row, x).with_hidden(false).with_wide(false) == PackedCell::BLANK;
+    let mut last_non_blank = len;
+    for x in 0..len {
+        if !page.cell(row, x).is_hidden() && !is_blank(x) {
+            last_non_blank = x;
+        }
+    }
+    let mut zones: Vec<(SemanticType, Range<u16>)> = Vec::new();
+    let mut last = None;
+    for x in 0..len {
+        let cell = page.cell(row, x);
+        if cell.is_hidden() {
+            continue;
+        }
+        if x > last_non_blank {
+            break;
+        }
+        // Legacy's `cell_index() as u16`.
+        let start = x as u16;
+        let end = start.saturating_add(1);
+        let semantic = cell.semantic();
+        if last != Some(semantic) {
+            zones.push((semantic, start..end));
+        } else if let Some(zone) = zones.last_mut() {
+            zone.1.end = end;
+        }
+        last = Some(semantic);
+    }
+    zones
+}
+
+/// The visible cell a grapheme printed at `cursor_x` may continue, as the
+/// performer's merge looks for it (ft-yccm0.2.14): the one at the cursor
+/// when a wrap is pending, otherwise the last one before the cursor.
+pub fn merge_candidate(page: &Page, row: u32, cursor_x: usize, pending_wrap: bool) -> Option<usize> {
+    let len = page.row_len(row);
+    if pending_wrap && cursor_x < len && !page.cell(row, cursor_x).is_hidden() {
+        return Some(cursor_x);
+    }
+    let mut x = cursor_x.min(len).checked_sub(1)?;
+    while page.cell(row, x).is_hidden() {
+        x = x.checked_sub(1)?;
+    }
+    Some(x)
+}
+
 /// `cols` blanks with `attr` appended to the empty row, in bulk: what
 /// `write_legacy` of each would store. Returns false, writing nothing, when
 /// `attr` carries images or the row is not empty.
@@ -689,12 +748,13 @@ mod tests {
         assert_eq!(page.row_seqno(row), line.current_seqno(), "{}: seqno", what);
     }
 
-    /// Six pens: plain, bold, palette background, a hyperlink, palette
-    /// foreground with the wrapped bit, and a true-colour foreground, which
-    /// pages store as a rich style.
+    /// Eight pens: plain, bold, palette background, a hyperlink, palette
+    /// foreground with the wrapped bit, a true-colour foreground (which
+    /// pages store as a rich style), and the Prompt and Input semantic
+    /// types (OSC 133).
     fn attrs(n: u8) -> CellAttributes {
         let mut attrs = CellAttributes::default();
-        match n % 6 {
+        match n % 8 {
             0 => {}
             1 => {
                 attrs.set_intensity(Intensity::Bold);
@@ -709,13 +769,75 @@ mod tests {
                 attrs.set_foreground(ColorAttribute::PaletteIndex(196));
                 attrs.set_wrapped(true);
             }
-            _ => {
+            5 => {
                 attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(
                     SrgbaTuple(0.25, 0.5, 0.75, 1.0),
                 ));
             }
+            6 => {
+                attrs.set_semantic_type(SemanticType::Prompt);
+            }
+            _ => {
+                attrs.set_semantic_type(SemanticType::Input);
+            }
         }
         attrs
+    }
+
+    /// Legacy's zone ranges for `line`, as the native function gives them.
+    fn legacy_zones(line: &Line) -> Vec<(SemanticType, std::ops::Range<u16>)> {
+        line.clone()
+            .semantic_zone_ranges()
+            .iter()
+            .map(|zone| (zone.semantic_type, zone.range.clone()))
+            .collect()
+    }
+
+    /// The performer's legacy row walk for the merge candidate: its index,
+    /// width, text and attributes.
+    fn legacy_candidate(
+        line: &Line,
+        cursor_x: usize,
+        pending_wrap: bool,
+    ) -> Option<(usize, usize, String, CellAttributes)> {
+        let mut candidate = None;
+        for cell in line.visible_cells() {
+            let cell_index = cell.cell_index();
+            if pending_wrap && cell_index == cursor_x {
+                candidate = Some(cell);
+                break;
+            }
+            if cell_index < cursor_x {
+                candidate = Some(cell);
+            } else {
+                break;
+            }
+        }
+        candidate.map(|cell| {
+            (
+                cell.cell_index(),
+                cell.width(),
+                cell.str().to_string(),
+                cell.attrs().clone(),
+            )
+        })
+    }
+
+    /// What the native merge-candidate read gives for the page row.
+    fn native_candidate(
+        page: &Page,
+        row: u32,
+        cursor_x: usize,
+        pending_wrap: bool,
+    ) -> Option<(usize, usize, String, CellAttributes)> {
+        let idx = merge_candidate(page, row, cursor_x, pending_wrap)?;
+        let text = match page.glyph(row, idx) {
+            Glyph::Blank => " ".to_string(),
+            Glyph::Char(ch) => ch.to_string(),
+            Glyph::Cluster(text) => text.to_string(),
+        };
+        let width = if page.cell(row, idx).is_wide() { 2 } else { 1 };
+        Some((idx, width, text, page.cell_attributes(row, idx)))
     }
 
     #[derive(Clone, Debug)]
@@ -756,30 +878,30 @@ mod tests {
     fn op() -> impl Strategy<Value = Op> {
         let x = 0usize..11;
         prop_oneof![
-            (x.clone(), 0..GLYPHS.len(), 0u8..6).prop_map(|(x, glyph, attrs)| Op::SetCell {
+            (x.clone(), 0..GLYPHS.len(), 0u8..8).prop_map(|(x, glyph, attrs)| Op::SetCell {
                 x,
                 glyph,
                 attrs
             }),
-            (x.clone(), 0..GLYPHS.len(), 0u8..6).prop_map(|(x, glyph, attrs)| Op::Grapheme {
+            (x.clone(), 0..GLYPHS.len(), 0u8..8).prop_map(|(x, glyph, attrs)| Op::Grapheme {
                 x,
                 glyph,
                 attrs
             }),
-            (0usize..8, 0..TEXTS.len(), 0u8..6).prop_map(|(x, text, attrs)| Op::Ascii {
+            (0usize..8, 0..TEXTS.len(), 0u8..8).prop_map(|(x, text, attrs)| Op::Ascii {
                 x,
                 text,
                 attrs
             }),
             any::<bool>().prop_map(|wrapped| Op::Wrapped { wrapped }),
-            (0usize..13, 0usize..14, 0u8..6).prop_map(|(start, end, attrs)| Op::Fill {
+            (0usize..13, 0usize..14, 0u8..8).prop_map(|(start, end, attrs)| Op::Fill {
                 start,
                 end,
                 attrs
             }),
             Just(Op::Compress),
             (0usize..12, 0usize..13).prop_map(|(x, margin)| Op::Insert { x, margin }),
-            (0usize..13, 0usize..13, 0u8..6).prop_map(|(x, margin, attrs)| Op::Delete {
+            (0usize..13, 0usize..13, 0u8..8).prop_map(|(x, margin, attrs)| Op::Delete {
                 x,
                 margin,
                 attrs
@@ -789,9 +911,9 @@ mod tests {
             (0usize..12, 0usize..13).prop_map(|(start, end)| Op::TakeBand { start, end }),
             (
                 0usize..10,
-                prop::collection::vec((0..GLYPHS.len(), 0u8..6), 0..4),
+                prop::collection::vec((0..GLYPHS.len(), 0u8..8), 0..4),
                 0usize..13,
-                0u8..6
+                0u8..8
             )
                 .prop_map(|(start, cells, end, attrs)| Op::PutBand {
                     start,
@@ -799,7 +921,7 @@ mod tests {
                     end,
                     attrs
                 }),
-            (0usize..12, 0usize..13, 0u8..6).prop_map(|(start, end, attrs)| Op::BlankBand {
+            (0usize..12, 0usize..13, 0u8..8).prop_map(|(start, end, attrs)| Op::BlankBand {
                 start,
                 end,
                 attrs
@@ -813,7 +935,7 @@ mod tests {
     /// stays dirty.
     #[test]
     fn new_rows_match_legacy_new_lines() {
-        for pen in 0..6 {
+        for pen in 0..8 {
             let attr = attrs(pen);
             for cols in [0, 1, 11, usize::from(COLS)] {
                 // Scroll hands over the row empty and carrying the seqno.
@@ -992,6 +1114,24 @@ mod tests {
                 }
                 let what = format!("step {} {:?}", step, op);
                 assert_same_row(&page, row, &line, &what);
+                assert_eq!(
+                    semantic_zone_ranges(&page, row),
+                    legacy_zones(&line),
+                    "{}: zones",
+                    what
+                );
+                for cursor_x in 0..=usize::from(COLS) + 1 {
+                    for pending_wrap in [false, true] {
+                        assert_eq!(
+                            native_candidate(&page, row, cursor_x, pending_wrap),
+                            legacy_candidate(&line, cursor_x, pending_wrap),
+                            "{}: merge candidate at {} (pending wrap {})",
+                            what,
+                            cursor_x,
+                            pending_wrap
+                        );
+                    }
+                }
                 if line.current_seqno() != legacy_seqno {
                     // Every mutation legacy's seqno sees also dirties the row.
                     assert!(page.take_dirty(row), "{}: not dirty", what);

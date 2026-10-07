@@ -1039,7 +1039,8 @@ impl TerminalState {
         let seqno = self.seqno;
         let screen = self.screen_mut();
         for row in physical_rows {
-            screen.line_mut(row).update_last_change_seqno(seqno);
+            // Natively on page-engine rows (ft-yccm0.3.3.4).
+            screen.touch_phys_row(row, seqno);
         }
     }
 

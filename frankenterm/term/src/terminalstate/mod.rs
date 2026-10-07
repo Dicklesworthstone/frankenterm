@@ -1799,10 +1799,8 @@ impl TerminalState {
     pub fn make_all_lines_dirty(&mut self) {
         self.increment_seqno();
         let seqno = self.seqno;
-        let screen = &mut self.screen;
-        screen.for_each_phys_line_mut(|_, line| {
-            line.update_last_change_seqno(seqno);
-        });
+        // One floor for page-engine rows (ft-yccm0.3.3.4).
+        self.screen.touch_all_rows(seqno);
     }
 
     /// Returns the 0-based cursor position relative to the top left of
@@ -2925,7 +2923,7 @@ impl TerminalState {
 
         for y in top..=bottom {
             let line_idx = screen.phys_row(VisibleRowIndex::from(y_origin.saturating_add(y)));
-            let line = screen.line_mut(line_idx);
+            let line = screen.phys_line(line_idx);
             let left = x_origin.saturating_add(left as usize);
             let right = x_origin.saturating_add(right as usize);
             for cell in line.visible_cells().skip(left) {
@@ -3211,23 +3209,22 @@ impl TerminalState {
                 let top_and_bottom_margins = self.top_and_bottom_margins.clone();
 
                 // Resolve the source cell.  It may be a double-wide character.
+                // Page-engine rows are read and written natively
+                // (ft-yccm0.3.3.4).
                 let cell = {
                     let screen = self.screen_mut();
                     let to_copy = x.saturating_sub(1);
                     let line_idx = screen.phys_row(y);
-                    let line = screen.line_mut(line_idx);
 
-                    match line.cells_mut().get(to_copy).cloned() {
-                        None => Cell::blank(),
-                        Some(candidate) => {
+                    match screen.repeat_source(line_idx, to_copy) {
+                        (None, _) => Cell::blank(),
+                        (Some(candidate), prior) => {
                             if candidate.str() == " " && to_copy > 0 {
                                 // It's a blank.  It may be the second part of
                                 // a double-wide pair; look ahead of it.
-                                let prior = &line.cells_mut()[to_copy - 1];
-                                if prior.width() > 1 {
-                                    prior.clone()
-                                } else {
-                                    candidate
+                                match prior {
+                                    Some(prior) if prior.width() > 1 => prior,
+                                    _ => candidate,
                                 }
                             } else {
                                 candidate
@@ -3240,9 +3237,7 @@ impl TerminalState {
                     {
                         let screen = self.screen_mut();
                         let line_idx = screen.phys_row(y);
-                        let line = screen.line_mut(line_idx);
-
-                        line.set_cell(x, cell.clone(), seqno);
+                        screen.repeat_cell(line_idx, x, &cell, seqno);
                     }
                     x = next_col_saturating(x);
                     if x > last_col_in(&left_and_right_margins) {
@@ -3675,34 +3670,32 @@ impl TerminalState {
         let mut zones = vec![];
 
         let first_stable_row = screen.phys_to_stable_row_index(0);
-        screen.for_each_phys_line_mut(|idx, line| {
+        // Page-engine rows are read natively (ft-yccm0.3.3.4).
+        screen.for_each_semantic_zone_range(|idx, semantic_type, range| {
             let stable_row = first_stable_row + idx as StableRowIndex;
+            let zone_end_x = range.end.saturating_sub(1) as usize;
+            let new_zone = match current_zone.as_ref() {
+                None => true,
+                Some(zone) => zone.semantic_type != semantic_type,
+            };
 
-            for zone_range in line.semantic_zone_ranges() {
-                let zone_end_x = zone_range.range.end.saturating_sub(1) as usize;
-                let new_zone = match current_zone.as_ref() {
-                    None => true,
-                    Some(zone) => zone.semantic_type != zone_range.semantic_type,
-                };
-
-                if new_zone {
-                    if let Some(zone) = current_zone.take() {
-                        zones.push(zone);
-                    }
-
-                    current_zone.replace(SemanticZone {
-                        start_x: zone_range.range.start as usize,
-                        start_y: stable_row,
-                        end_x: zone_end_x,
-                        end_y: stable_row,
-                        semantic_type: zone_range.semantic_type,
-                    });
+            if new_zone {
+                if let Some(zone) = current_zone.take() {
+                    zones.push(zone);
                 }
 
-                if let Some(zone) = current_zone.as_mut() {
-                    zone.end_x = zone_end_x;
-                    zone.end_y = stable_row;
-                }
+                current_zone.replace(SemanticZone {
+                    start_x: range.start as usize,
+                    start_y: stable_row,
+                    end_x: zone_end_x,
+                    end_y: stable_row,
+                    semantic_type,
+                });
+            }
+
+            if let Some(zone) = current_zone.as_mut() {
+                zone.end_x = zone_end_x;
+                zone.end_y = stable_row;
             }
         });
         if let Some(zone) = current_zone.take() {

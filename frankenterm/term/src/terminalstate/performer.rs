@@ -402,40 +402,26 @@ impl<'a> Performer<'a> {
         // candidate cell is kept while scanning, and every rejection runs
         // against that borrow; text and attributes are copied only once a
         // merge is still possible.
-        let (idx, text, width, attrs) = {
+        // On page-engine rows the candidate is read from the page, with no
+        // Line view (ft-yccm0.3.3.4).
+        let merge = {
             let screen = self.screen_mut();
             let phys = screen.phys_row(cursor_y);
-            let line = screen.line_mut(phys);
-            let mut candidate = None;
-
-            for cell in line.visible_cells() {
-                let cell_index = cell.cell_index();
-                if pending_wrap && cell_index == cursor_x {
-                    candidate = Some(cell);
-                    break;
+            screen.with_merge_candidate(phys, cursor_x, pending_wrap, |candidate| {
+                let cell = candidate?;
+                let old_end = cell.idx.saturating_add(cell.width);
+                let joins_at_cursor = old_end == cursor_x || (pending_wrap && cell.idx == cursor_x);
+                if !joins_at_cursor {
+                    return None;
                 }
-                if cell_index < cursor_x {
-                    candidate = Some(cell);
-                } else {
-                    break;
+                if require_prior_trailing_zwj && !cell.text.ends_with('\u{200d}') {
+                    return None;
                 }
-            }
-
-            let Some(cell) = candidate else {
-                return false;
-            };
-            let idx = cell.cell_index();
-            let width = cell.width();
-            let old_end = idx.saturating_add(width);
-            let joins_at_cursor = old_end == cursor_x || (pending_wrap && idx == cursor_x);
-            if !joins_at_cursor {
-                return false;
-            }
-            let text = cell.str();
-            if require_prior_trailing_zwj && !text.ends_with('\u{200d}') {
-                return false;
-            }
-            (idx, text.to_string(), width, cell.attrs().clone())
+                Some((cell.idx, cell.text.to_string(), cell.width, cell.attrs()))
+            })
+        };
+        let Some((idx, text, width, attrs)) = merge else {
+            return false;
         };
 
         let combined = format!("{text}{suffix}");
@@ -455,8 +441,7 @@ impl<'a> Performer<'a> {
         let (cursor_x, wrap_next) = {
             let screen = self.screen_mut();
             let phys = screen.phys_row(cursor_y);
-            let line = screen.line_mut(phys);
-            line.set_cell_grapheme(idx, &combined, combined_width, attrs, seqno);
+            screen.merge_grapheme(phys, idx, &combined, combined_width, attrs, seqno);
 
             let next_x = idx.saturating_add(combined_width);
             if next_x >= right_margin {
@@ -818,7 +803,7 @@ impl<'a> Performer<'a> {
 
             let should_mark_wrapped = !is_conpty
                 || screen
-                    .line_mut(y)
+                    .phys_line(y)
                     .visible_cells()
                     .last()
                     .map(|cell| makes_sense_to_wrap(cell.str()))

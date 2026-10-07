@@ -6,6 +6,7 @@ use crate::config::{
     ScrollbackActivationError, ScrollbackPrefix, ScrollbackSnapshotFidelity,
     ScrollbackSnapshotLimits,
 };
+use crate::pagegrid::cell::Glyph;
 use crate::pagegrid::native;
 pub use crate::pagegrid::native::LineSize;
 use crate::pagegrid::rows::{PageRows, Rows};
@@ -2756,6 +2757,30 @@ impl ScreenLineRead {
             remaining = remaining.checked_sub(line.len())?;
         }
         None
+    }
+}
+
+/// A cell the performer's grapheme merge may extend, as
+/// [`Screen::with_merge_candidate`] lends it (ft-yccm0.3.3.4).
+pub struct MergeCandidate<'a> {
+    pub idx: usize,
+    pub width: usize,
+    pub text: &'a str,
+    attrs: CandidateAttrs<'a>,
+}
+
+enum CandidateAttrs<'a> {
+    Line(&'a CellAttributes),
+    Page(&'a Page, u32),
+}
+
+impl MergeCandidate<'_> {
+    /// The cell's attributes, built only once a merge goes ahead.
+    pub fn attrs(&self) -> CellAttributes {
+        match self.attrs {
+            CandidateAttrs::Line(attrs) => attrs.clone(),
+            CandidateAttrs::Page(page, row) => page.cell_attributes(row, self.idx),
+        }
     }
 }
 
@@ -9264,6 +9289,164 @@ impl Screen {
             return;
         }
         size.apply_to_line(self.line_mut(idx), seqno);
+    }
+
+    /// How many page-engine rows an edit left in their views: rows a legacy
+    /// operation edited through a `Line` and no native write has stored
+    /// back yet (ft-yccm0.3.3.4).
+    #[cfg(test)]
+    pub(crate) fn rows_held_by_views(&self) -> usize {
+        self.lines.page().map_or(0, |rows| {
+            (0..rows.len()).filter(|&index| rows.is_edited(index)).count()
+        })
+    }
+
+    /// The row at `idx` as a legacy `Line`, for reading. A page-engine row's
+    /// view is built on first read and nothing is marked edited
+    /// (ft-yccm0.3.3.4).
+    pub fn phys_line(&self, idx: PhysRowIndex) -> &Line {
+        &self.lines[idx]
+    }
+
+    /// Raises every row's seqno to at least `seqno`, as a selection redraw
+    /// does. On page-engine rows this is one floor for the whole list
+    /// (ft-yccm0.3.3.4).
+    pub fn touch_all_rows(&mut self, seqno: SequenceNo) {
+        if let Some(rows) = self.lines.page_mut() {
+            rows.mark_all_changed(seqno);
+            return;
+        }
+        self.for_each_phys_line_mut(|_, line| line.update_last_change_seqno(seqno));
+    }
+
+    /// Every row's semantic zone ranges (`Line::semantic_zone_ranges`),
+    /// oldest row first, as `(row, type, columns)`. A page-engine row is
+    /// read natively, with no view built or marked edited
+    /// (ft-yccm0.3.3.4).
+    pub fn for_each_semantic_zone_range<F>(&mut self, mut f: F)
+    where
+        F: FnMut(PhysRowIndex, SemanticType, Range<u16>),
+    {
+        for idx in 0..self.lines.len() {
+            if let Some((page, row)) = self.lines.page().and_then(|rows| rows.page_row_ref(idx)) {
+                for (semantic, range) in native::semantic_zone_ranges(page, row) {
+                    f(idx, semantic, range);
+                }
+                continue;
+            }
+            for zone in self.lines[idx].semantic_zone_ranges() {
+                f(idx, zone.semantic_type, zone.range.clone());
+            }
+        }
+    }
+
+    /// What the performer's grapheme merge reads (ft-yccm0.2.14): the
+    /// visible cell of row `phys` that a grapheme at `cursor_x` may
+    /// continue, the one at the cursor when a wrap is pending, otherwise the
+    /// last one before it. `f` borrows it, from the row's `Line` for legacy
+    /// rows and from the page for page-engine rows, which builds no view
+    /// (ft-yccm0.3.3.4).
+    pub fn with_merge_candidate<R>(
+        &mut self,
+        phys: PhysRowIndex,
+        cursor_x: usize,
+        pending_wrap: bool,
+        f: impl FnOnce(Option<MergeCandidate<'_>>) -> R,
+    ) -> R {
+        if let Some((page, row)) = self.page_row(phys) {
+            let page: &Page = page;
+            let Some(idx) = native::merge_candidate(page, row, cursor_x, pending_wrap) else {
+                return f(None);
+            };
+            let mut utf8 = [0_u8; 4];
+            let text: &str = match page.glyph(row, idx) {
+                Glyph::Blank => " ",
+                Glyph::Char(ch) => ch.encode_utf8(&mut utf8),
+                Glyph::Cluster(text) => text,
+            };
+            let width = if page.cell(row, idx).is_wide() { 2 } else { 1 };
+            return f(Some(MergeCandidate {
+                idx,
+                width,
+                text,
+                attrs: CandidateAttrs::Page(page, row),
+            }));
+        }
+        let line = self.line_mut(phys);
+        let mut candidate = None;
+        for cell in line.visible_cells() {
+            let cell_index = cell.cell_index();
+            if pending_wrap && cell_index == cursor_x {
+                candidate = Some(cell);
+                break;
+            }
+            if cell_index < cursor_x {
+                candidate = Some(cell);
+            } else {
+                break;
+            }
+        }
+        match &candidate {
+            None => f(None),
+            Some(cell) => f(Some(MergeCandidate {
+                idx: cell.cell_index(),
+                width: cell.width(),
+                text: cell.str(),
+                attrs: CandidateAttrs::Line(cell.attrs()),
+            })),
+        }
+    }
+
+    /// What the performer's grapheme merge writes: `Line::set_cell_grapheme`
+    /// on row `phys`, natively on a page-engine row (ft-yccm0.3.3.4). Like
+    /// the merge's legacy write, it leaves the last good frame alone.
+    pub fn merge_grapheme(
+        &mut self,
+        phys: PhysRowIndex,
+        idx: usize,
+        text: &str,
+        width: usize,
+        attr: CellAttributes,
+        seqno: SequenceNo,
+    ) {
+        if let Some((page, row)) = self.page_row(phys) {
+            if native::set_cell_grapheme(page, row, idx, text, width, &attr, seqno) {
+                return;
+            }
+        }
+        self.line_mut(phys)
+            .set_cell_grapheme(idx, text, width, attr, seqno);
+    }
+
+    /// REP's source: the stored cell at column `x` of row `phys` and the one
+    /// before it, as legacy reads them through `Line::cells_mut`, which makes
+    /// the row a vector row (on a page-engine row natively, without a view;
+    /// ft-yccm0.3.3.4).
+    pub fn repeat_source(&mut self, phys: PhysRowIndex, x: usize) -> (Option<Cell>, Option<Cell>) {
+        if let Some((page, row)) = self.page_row(phys) {
+            native::make_vector(page, row);
+            let page: &Page = page;
+            let len = page.row_len(row);
+            let at = |col: usize| (col < len).then(|| page.legacy_cell(row, col));
+            return (at(x), x.checked_sub(1).and_then(at));
+        }
+        let cells = self.line_mut(phys).cells_mut();
+        (
+            cells.get(x).cloned(),
+            x.checked_sub(1).and_then(|prior| cells.get(prior).cloned()),
+        )
+    }
+
+    /// REP's write: `Line::set_cell` on row `phys`, natively on a
+    /// page-engine row (ft-yccm0.3.3.4). Like REP's legacy write, it leaves
+    /// the last good frame alone.
+    pub fn repeat_cell(&mut self, phys: PhysRowIndex, x: usize, cell: &Cell, seqno: SequenceNo) {
+        if let Some((page, row)) = self.page_row(phys) {
+            if native::set_cell(page, row, x, cell, false, seqno) {
+                return;
+            }
+        }
+        self.line_mut(phys).set_cell(x, cell.clone(), seqno);
     }
 
     /// DECALN on the row at `idx`: the screen's width of plain `E` cells,
