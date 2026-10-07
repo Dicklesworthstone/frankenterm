@@ -247,6 +247,24 @@ pub enum FreeTypeLoadTarget {
     VerticalLcd,
 }
 
+/// The FreeType LCD filter applied to subpixel (`HorizontalLcd` and
+/// `VerticalLcd`) glyph renders to reduce color fringes.
+/// See <https://freetype.org/freetype2/docs/reference/ft2-lcd_rendering.html>
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, FromDynamic, ToDynamic)]
+pub enum FreeTypeLcdFilter {
+    /// FIR5 filter with weights 0x08 0x4D 0x56 0x4D 0x08. The smoothest
+    /// result with the least color fringing.
+    #[default]
+    Default,
+    /// FIR3 filter with weights 0x00 0x55 0x56 0x55 0x00. Sharper than
+    /// `Default`, with somewhat more color fringing.
+    Light,
+    /// The filter used before FreeType 2.3.0. Not recommended.
+    Legacy,
+    /// No filtering. Strong color fringes.
+    None,
+}
+
 bitflags! {
     // Note that these are strongly coupled with deps/freetype/src/lib.rs,
     // but we can't directly reference that from here without making config
