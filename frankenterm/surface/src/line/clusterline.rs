@@ -234,18 +234,25 @@ impl<'de> Deserialize<'de> for ClusteredLine {
 /// the thesis is that most of the cells on a given line are single width.
 /// That may not be strictly true for users that heavily use asian scripts,
 /// but we'll start with this and see if we need to improve it.
+///
+/// The indices go straight from the bitset into the sequence, the same bytes
+/// a `Vec<usize>` of them serializes to, without collecting that vector: the
+/// durable scrollback writer serializes every wide row (ft-yccm0.2.1.4).
 #[cfg(feature = "use_serde")]
 fn serialize_bitset<S>(value: &Option<Box<FixedBitSet>>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
-    let mut wide_indices: Vec<usize> = vec![];
+    use serde::ser::SerializeSeq as _;
+
+    let ones = value.as_ref().map_or(0, |bits| bits.count_ones(..));
+    let mut wide_indices = serializer.serialize_seq(Some(ones))?;
     if let Some(bits) = value {
         for idx in bits.ones() {
-            wide_indices.push(idx);
+            wide_indices.serialize_element(&idx)?;
         }
     }
-    wide_indices.serialize(serializer)
+    wide_indices.end()
 }
 
 impl ClusteredLine {
@@ -860,6 +867,42 @@ mod test {
             line.last_cell_was_wrapped(),
             restored.last_cell_was_wrapped()
         );
+    }
+
+    /// The wide-cell indices serialize straight from the bitset exactly as
+    /// the vector of them that serialize_bitset used to collect.
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn wide_mask_serializes_the_indices_a_collected_vector_would() {
+        #[derive(Serialize)]
+        struct Collected<'a> {
+            text: &'a str,
+            is_double_wide: Vec<usize>,
+            clusters: &'a [Cluster],
+            len: u32,
+            last_cell_width: Option<NonZeroU8>,
+        }
+
+        for text in ["a界 b界界", "界", "abc", ""] {
+            let source = crate::line::Line::from_text(text, &CellAttributes::blank(), 1, None);
+            let line = ClusteredLine::from_cell_vec(source.len(), source.visible_cells());
+            let collected = Collected {
+                text: &line.text,
+                is_double_wide: line
+                    .is_double_wide
+                    .as_ref()
+                    .map(|bits| bits.ones().collect())
+                    .unwrap_or_default(),
+                clusters: &line.clusters,
+                len: line.len,
+                last_cell_width: line.last_cell_width,
+            };
+            assert_eq!(
+                serde_json::to_string(&line).unwrap(),
+                serde_json::to_string(&collected).unwrap(),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]

@@ -74,6 +74,16 @@ winapi = { workspace=true, features = [ "winuser" ]}
 criterion = { workspace = true }
 proptest = "1.8.0"
 
+# ft-yccm0.2.1.4: tests/scrollback_row_arena_alloc.rs counts allocations with
+# jemalloc's per-thread counter. frankenterm-alloc installs jemalloc as the
+# global allocator, as the ft and mux-server binaries do; a test-local one
+# would collide with it in workspace builds, which unify that feature.
+# jemalloc's sys crate does not build on windows-msvc (ft-p9hok), so these
+# deps and that test skip Windows.
+[target.'cfg(not(windows))'.dev-dependencies]
+frankenterm-alloc = { workspace = true, features = ["jemalloc"] }
+tikv-jemalloc-ctl.workspace = true
+
 [[bench]]
 name = "dispatch_throughput"
 harness = false

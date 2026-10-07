@@ -4475,6 +4475,7 @@ dependencies = [
  "tempfile",
  "termwiz 0.24.0",
  "thiserror 2.0.21",
+ "tikv-jemalloc-ctl",
  "url",
  "uuid",
  "varbincode",

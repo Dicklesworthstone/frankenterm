@@ -13,6 +13,12 @@
 //! visible pane text the writer can make durable per second of one core.
 //! Before timing, each shape prints its per-row plaintext, sealed payload and
 //! record bytes.
+//!
+//! ft-yccm0.2.1.4 AC1: the `_clustered` shapes are the same rows in the
+//! clustered storage Screen hands the store. For them it compares, in one
+//! run, the cell-vector schemas every row sealed before (a payload vector and
+//! a record string allocated per row: `seal_compact_cell_schemas`) with
+//! schema 3 through the reusable encode arena (`seal_compact_arena`).
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_mux_server_impl::scrollback_record_bench::{Rows, Sealer};
@@ -77,6 +83,59 @@ fn record_path(c: &mut Criterion) {
             rows,
             |bench, rows| {
                 bench.iter(|| black_box(sealer.seal_compact(black_box(rows), &mut scratch)));
+            },
+        );
+    }
+    let clustered = [
+        (
+            "ascii9_clustered",
+            Rows::printable(WINDOW_ROWS, 9).compressed_for_scrollback(),
+        ),
+        (
+            "ascii91_clustered",
+            Rows::printable(WINDOW_ROWS, 91).compressed_for_scrollback(),
+        ),
+        (
+            "emoji_colors80_clustered",
+            Rows::emoji_colors(WINDOW_ROWS, 80).compressed_for_scrollback(),
+        ),
+    ];
+    let mut stream = sealer.compact_stream();
+    for (shape, rows) in &clustered {
+        assert!(rows.all_clustered(), "{shape}");
+        let per_row = |bytes: usize| bytes as f64 / WINDOW_ROWS as f64;
+        let (cell_plaintext, cell_payload) = sealer.serialize_and_compress_cell_schemas(rows);
+        let cell_records = sealer.seal_compact_cell_schemas(rows, &mut Vec::new());
+        let (plaintext, payload) = sealer.serialize_and_compress(rows);
+        let records = sealer.seal_compact_arena(rows, &mut stream);
+        eprintln!(
+            "scrollback_record {shape}: per row, cell schemas {:.1} plaintext, {:.1} payload, \
+             {:.1} compact record bytes; clustered schema 3 {:.1} plaintext, {:.1} payload, \
+             {:.1} compact record bytes ({:.1}x the row text)",
+            per_row(cell_plaintext),
+            per_row(cell_payload),
+            per_row(cell_records),
+            per_row(plaintext),
+            per_row(payload),
+            per_row(records),
+            records as f64 / rows.text_bytes() as f64,
+        );
+        group.throughput(Throughput::Bytes(rows.text_bytes()));
+        let mut scratch = Vec::new();
+        group.bench_with_input(
+            BenchmarkId::new("seal_compact_cell_schemas", shape),
+            rows,
+            |bench, rows| {
+                bench.iter(|| {
+                    black_box(sealer.seal_compact_cell_schemas(black_box(rows), &mut scratch))
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("seal_compact_arena", shape),
+            rows,
+            |bench, rows| {
+                bench.iter(|| black_box(sealer.seal_compact_arena(black_box(rows), &mut stream)));
             },
         );
     }

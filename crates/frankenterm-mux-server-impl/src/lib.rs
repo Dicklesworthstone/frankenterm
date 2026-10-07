@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, MutexGuard};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize as _, Zeroizing};
 
 pub mod delivery_ledger;
 pub mod delivery_scheduler;
@@ -65,6 +65,10 @@ const EXACT_SCROLLBACK_ZSTD_MAGIC: &[u8; 8] = b"FTSLZ1\0\0";
 const EXACT_SCROLLBACK_ZSTD_HEADER_BYTES: usize = 12;
 const EXACT_SCROLLBACK_ZSTD_WINDOW_LOG: u32 = 17;
 const EXACT_SCROLLBACK_COMPACT_MIN_CELLS: usize = 3;
+/// ft-yccm0.2.1.4: an exact row's plaintext schema for a row in clustered
+/// storage, serialized as its attribute runs (1 is the cell vector, 2 the
+/// compact printable-ASCII form).
+const EXACT_SCROLLBACK_SCHEMA_CLUSTERED: u32 = 3;
 const LIVE_SCROLLBACK_MANIFEST_SCHEMA_V1: &str = "frankenterm.live-scrollback-manifest.v1";
 const LIVE_SCROLLBACK_MANIFEST_SCHEMA_V2: &str = "frankenterm.live-scrollback-manifest.v2";
 const LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3: &str = "frankenterm.live-scrollback-manifest.v3";
@@ -10929,6 +10933,149 @@ fn exact_scrollback_line_payload(line: &wezterm_term::Line) -> Option<Zeroizing<
     Some(compress_exact_scrollback_plaintext(&plaintext).unwrap_or(plaintext))
 }
 
+/// Wipe the bytes a reused plaintext buffer holds and empty it, keeping its
+/// capacity. Its spare capacity never holds plaintext: every use ends here.
+fn wipe_scrollback_plaintext(buffer: &mut Vec<u8>) {
+    buffer.as_mut_slice().zeroize();
+    buffer.clear();
+}
+
+/// Record capacity an encode arena keeps from batch to batch: about two
+/// typical commit windows, far below the 64 MiB a window may reach.
+const ROW_ENCODE_ARENA_MAX_SPARE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Reusable buffers for encoding a batch's compact rows (ft-yccm0.2.1.4
+/// AC1), one per thread: the durability writer's, in production. A row in
+/// clustered storage, as Screen hands rows over, is serialized, compressed
+/// and sealed through them without allocating once they have grown to fit.
+/// The plaintext buffers are wiped after every row.
+#[derive(Default)]
+struct ScrollbackRowEncodeArena {
+    plaintext: Zeroizing<Vec<u8>>,
+    compressed: Zeroizing<Vec<u8>>,
+    seal_scratch: Zeroizing<Vec<u8>>,
+    /// Whether the payload `prepare_payload` left is in `compressed`.
+    compressed_payload: bool,
+    /// The batch's sealed records, in order.
+    batch: Vec<String>,
+    /// Emptied records of earlier batches, for the next batch's rows.
+    spare: Vec<String>,
+    spare_bytes: usize,
+}
+
+std::thread_local! {
+    static ROW_ENCODE_ARENA: std::cell::RefCell<Option<ScrollbackRowEncodeArena>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl ScrollbackRowEncodeArena {
+    /// Serialize and compress `line`'s payload, the bytes
+    /// `exact_scrollback_line_payload` returns, and return its length. It
+    /// stays held for `seal_compact_row`.
+    fn prepare_payload(&mut self, line: &wezterm_term::Line) -> Option<usize> {
+        if !serialize_exact_semantic_scrollback_line_into(line, &mut self.plaintext) {
+            return None;
+        }
+        self.compressed_payload =
+            compress_exact_scrollback_plaintext_into(&self.plaintext, &mut self.compressed);
+        if self.compressed_payload {
+            wipe_scrollback_plaintext(&mut self.plaintext);
+            Some(self.compressed.len())
+        } else {
+            Some(self.plaintext.len())
+        }
+    }
+
+    /// Wipe a prepared payload the batch will not seal.
+    fn discard_payload(&mut self) {
+        wipe_scrollback_plaintext(&mut self.plaintext);
+        wipe_scrollback_plaintext(&mut self.compressed);
+    }
+
+    /// Seal the prepared payload as the batch's next compact record, in a
+    /// record string an earlier batch emptied, then wipe the plaintext.
+    fn seal_compact_row(
+        &mut self,
+        cipher: &mux::guardian_output_journal::GuardianOutputCipher,
+        stream: &mut mux::guardian_output_journal::GuardianScrollbackRowNonceStream,
+        location: mux::guardian_output_journal::GuardianScrollbackRowLocation,
+    ) -> bool {
+        let mut record = self.spare.pop().unwrap_or_default();
+        self.spare_bytes = self.spare_bytes.saturating_sub(record.capacity());
+        let payload: &[u8] = if self.compressed_payload {
+            &self.compressed
+        } else {
+            &self.plaintext
+        };
+        let sealed = cipher
+            .seal_compact_scrollback_row_into(
+                stream,
+                location,
+                payload,
+                &mut self.seal_scratch,
+                &mut record,
+            )
+            .is_ok();
+        wipe_scrollback_plaintext(&mut self.plaintext);
+        wipe_scrollback_plaintext(&mut self.compressed);
+        wipe_scrollback_plaintext(&mut self.seal_scratch);
+        if sealed {
+            self.batch.push(record);
+        } else {
+            self.recycle(record);
+        }
+        sealed
+    }
+
+    fn recycle(&mut self, mut record: String) {
+        record.clear();
+        if let Some(bytes) = self
+            .spare_bytes
+            .checked_add(record.capacity())
+            .filter(|bytes| *bytes <= ROW_ENCODE_ARENA_MAX_SPARE_BYTES)
+        {
+            self.spare_bytes = bytes;
+            self.spare.push(record);
+        }
+    }
+}
+
+/// This thread's encode arena for one transaction. Dropping it, on any
+/// path, empties the batch into the spare records and returns the arena.
+struct ScrollbackRowEncodeLease {
+    arena: ScrollbackRowEncodeArena,
+}
+
+impl ScrollbackRowEncodeLease {
+    /// The thread's arena, or a fresh one when this thread has none free.
+    fn take() -> Self {
+        let arena = ROW_ENCODE_ARENA
+            .try_with(|slot| slot.try_borrow_mut().ok().and_then(|mut slot| slot.take()))
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        Self { arena }
+    }
+}
+
+impl Drop for ScrollbackRowEncodeLease {
+    fn drop(&mut self) {
+        let mut arena = std::mem::take(&mut self.arena);
+        // Newest first, so the next batch's first row pops the string this
+        // batch's first row grew. The batch vector keeps its capacity too.
+        let mut batch = std::mem::take(&mut arena.batch);
+        while let Some(record) = batch.pop() {
+            arena.recycle(record);
+        }
+        arena.batch = batch;
+        let _ = ROW_ENCODE_ARENA.try_with(|slot| {
+            if let Ok(mut slot) = slot.try_borrow_mut() {
+                *slot = Some(arena);
+            }
+        });
+    }
+}
+
 /// `encode_exact_scrollback_line_record`, sealed in place and appended to
 /// `records`, a batch string whose capacity is reused with `scratch` from
 /// window to window (ft-yccm0.2.1.4). Same record bytes; returns false and
@@ -11150,6 +11297,127 @@ pub mod scrollback_record_bench {
             Self::new()
         }
     }
+
+    impl Rows {
+        /// The rows as Screen hands them to the durable store: moved to
+        /// clustered storage where clustering reproduces them.
+        #[must_use]
+        pub fn compressed_for_scrollback(mut self) -> Self {
+            for line in &mut self.0 {
+                line.compress_for_scrollback();
+            }
+            self
+        }
+
+        /// Whether every row is in clustered storage.
+        #[must_use]
+        pub fn all_clustered(&self) -> bool {
+            self.0.iter().all(wezterm_term::Line::has_clustered_storage)
+        }
+    }
+
+    /// A compact-row nonce stream and its next sequence.
+    pub struct CompactStream {
+        stream: mux::guardian_output_journal::GuardianScrollbackRowNonceStream,
+        next_sequence: u64,
+    }
+
+    impl Sealer {
+        #[must_use]
+        pub fn compact_stream(&self) -> CompactStream {
+            CompactStream {
+                stream: mux::guardian_output_journal::GuardianScrollbackRowNonceStream::begin(
+                    &self.cipher,
+                    0,
+                    [],
+                )
+                .expect("bench nonce stream"),
+                next_sequence: 0,
+            }
+        }
+
+        /// One commit window's compact records, through this thread's encode
+        /// arena exactly as the store's batches seal them (ft-yccm0.2.1.4
+        /// AC1). Returns the batch's record bytes; the records go back to
+        /// the arena.
+        pub fn seal_compact_arena(&self, rows: &Rows, stream: &mut CompactStream) -> usize {
+            let mut lease = super::ScrollbackRowEncodeLease::take();
+            for line in &rows.0 {
+                let sequence = stream.next_sequence;
+                stream.next_sequence += 1;
+                let location = mux::guardian_output_journal::GuardianScrollbackRowLocation::new(
+                    [0x5a; 16],
+                    [0xa5; 16],
+                    sequence as i64,
+                    sequence,
+                )
+                .expect("bench row location");
+                lease
+                    .arena
+                    .prepare_payload(line)
+                    .expect("bench row serializes");
+                assert!(
+                    lease
+                        .arena
+                        .seal_compact_row(&self.cipher, &mut stream.stream, location)
+                );
+            }
+            lease.arena.batch.iter().map(String::len).sum()
+        }
+
+        /// What the cell-vector schemas (2 or 1) take for these rows,
+        /// whatever their storage: (plaintext, sealed payload) bytes. Before
+        /// ft-yccm0.2.1.4 AC1 every row sealed one of them; kept for an A/B
+        /// in one run.
+        #[must_use]
+        pub fn serialize_and_compress_cell_schemas(&self, rows: &Rows) -> (usize, usize) {
+            rows.0.iter().fold((0, 0), |(plain, sealed), line| {
+                let plaintext = super::serialize_cell_semantic_scrollback_line(line)
+                    .expect("bench row serializes");
+                let payload = super::compress_exact_scrollback_plaintext(&plaintext)
+                    .map_or(plaintext.len(), |payload| payload.len());
+                (plain + plaintext.len(), sealed + payload)
+            })
+        }
+
+        /// The compact record path before AC1: the cell-vector schemas, with
+        /// a payload vector and a record string allocated per row. Returns
+        /// the total record bytes.
+        pub fn seal_compact_cell_schemas(&self, rows: &Rows, scratch: &mut Vec<u8>) -> usize {
+            let mut stream = mux::guardian_output_journal::GuardianScrollbackRowNonceStream::begin(
+                &self.cipher,
+                0,
+                [],
+            )
+            .expect("bench nonce stream");
+            rows.0
+                .iter()
+                .enumerate()
+                .map(|(row, line)| {
+                    let location =
+                        mux::guardian_output_journal::GuardianScrollbackRowLocation::new(
+                            [0x5a; 16], [0xa5; 16], row as i64, row as u64,
+                        )
+                        .expect("bench row location");
+                    let plaintext = super::serialize_cell_semantic_scrollback_line(line)
+                        .expect("bench row serializes");
+                    let payload =
+                        super::compress_exact_scrollback_plaintext(&plaintext).unwrap_or(plaintext);
+                    let mut record = String::new();
+                    self.cipher
+                        .seal_compact_scrollback_row_into(
+                            &mut stream,
+                            location,
+                            &payload,
+                            scratch,
+                            &mut record,
+                        )
+                        .expect("bench row seals");
+                    record.len()
+                })
+                .sum()
+        }
+    }
 }
 
 /// Compress only the exact semantic bytes, before the existing AEAD boundary.
@@ -11157,14 +11425,23 @@ pub mod scrollback_record_bench {
 /// never a dictionary from another row. Failed or unhelpful compression leaves
 /// the original representation intact.
 fn compress_exact_scrollback_plaintext(plaintext: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    let mut payload = Zeroizing::new(Vec::new());
+    compress_exact_scrollback_plaintext_into(plaintext, &mut payload).then_some(payload)
+}
+
+/// `compress_exact_scrollback_plaintext` into `payload`, which keeps its
+/// capacity from row to row (ft-yccm0.2.1.4 AC1). On false (compression
+/// failed or does not pay) `payload` is wiped and empty.
+fn compress_exact_scrollback_plaintext_into(plaintext: &[u8], payload: &mut Vec<u8>) -> bool {
+    wipe_scrollback_plaintext(payload);
     if plaintext.len() < 256 || plaintext.len() > LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE {
-        return None;
+        return false;
     }
     std::thread_local! {
         static COMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> =
             const { std::cell::RefCell::new(None) };
     }
-    COMPRESSOR
+    let compressed = COMPRESSOR
         .try_with(|slot| {
             let mut slot = slot.try_borrow_mut().ok()?;
             if slot.is_none() {
@@ -11175,7 +11452,6 @@ fn compress_exact_scrollback_plaintext(plaintext: &[u8]) -> Option<Zeroizing<Vec
                 *slot = Some(compressor);
             }
             let compressor = slot.as_mut()?;
-            let mut payload = Zeroizing::new(Vec::new());
             payload.try_reserve_exact(plaintext.len()).ok()?;
             payload.resize(plaintext.len(), 0);
             let compressed_bytes = compressor
@@ -11191,14 +11467,22 @@ fn compress_exact_scrollback_plaintext(plaintext: &[u8]) -> Option<Zeroizing<Vec
             payload[..8].copy_from_slice(EXACT_SCROLLBACK_ZSTD_MAGIC);
             payload[8..EXACT_SCROLLBACK_ZSTD_HEADER_BYTES]
                 .copy_from_slice(&u32::try_from(plaintext.len()).ok()?.to_le_bytes());
+            // Truncated bytes become spare capacity, which must hold no
+            // plaintext once the buffer is reused.
+            payload[encoded_bytes..].zeroize();
             payload.truncate(encoded_bytes);
             metrics::counter!("mux.scrollback.exact_compressed_rows").increment(1);
             metrics::counter!("mux.scrollback.exact_compression_bytes_saved")
                 .increment((plaintext.len() - encoded_bytes) as u64);
-            Some(payload)
+            Some(())
         })
         .ok()
         .flatten()
+        .is_some();
+    if !compressed {
+        wipe_scrollback_plaintext(payload);
+    }
+    compressed
 }
 
 /// Called only after authenticating the encrypted row at its expected location.
@@ -11229,17 +11513,67 @@ fn expand_exact_scrollback_plaintext(
     let mut decoder = zstd::Decoder::with_buffer(&plaintext[EXACT_SCROLLBACK_ZSTD_HEADER_BYTES..])?
         .single_frame();
     decoder.window_log_max(EXACT_SCROLLBACK_ZSTD_WINDOW_LOG)?;
-    let mut expanded = BoundedScrollbackPlaintext::new(expected);
-    std::io::copy(&mut decoder, &mut expanded)
-        .context("bounded expansion of authenticated semantic scrollback")?;
+    let mut expanded = Zeroizing::new(Vec::new());
+    std::io::copy(
+        &mut decoder,
+        &mut BoundedScrollbackPlaintext::new(&mut expanded, expected),
+    )
+    .context("bounded expansion of authenticated semantic scrollback")?;
     anyhow::ensure!(
-        expanded.bytes.len() == expected && decoder.finish().is_empty(),
+        expanded.len() == expected && decoder.finish().is_empty(),
         "compressed semantic scrollback frame length or trailing bytes mismatch"
     );
-    Ok(expanded.bytes)
+    Ok(expanded)
 }
 
 fn serialize_exact_semantic_scrollback_line(
+    line: &wezterm_term::Line,
+) -> Option<Zeroizing<Vec<u8>>> {
+    let mut plaintext = Zeroizing::new(Vec::new());
+    serialize_exact_semantic_scrollback_line_into(line, &mut plaintext).then_some(plaintext)
+}
+
+/// The plaintext an exact row seals for `line`, written into `out`, which
+/// keeps its capacity from row to row (ft-yccm0.2.1.4 AC1). A row in
+/// clustered storage, as Screen leaves every row it moves to scrollback,
+/// serializes borrowed as schema 3: its attribute runs, wide cells included,
+/// with no cell vector, clone or width sidecar, so it allocates nothing once
+/// `out` is large enough. Other rows use schema 2 or 1. On false, `out` is
+/// wiped and empty.
+fn serialize_exact_semantic_scrollback_line_into(
+    line: &wezterm_term::Line,
+    out: &mut Vec<u8>,
+) -> bool {
+    wipe_scrollback_plaintext(out);
+    if line.has_clustered_storage() {
+        let semantic = ExactSemanticScrollbackLineRef {
+            schema: EXACT_SCROLLBACK_SCHEMA_CLUSTERED,
+            line,
+            cell_widths: &[],
+        };
+        // The decoder must accept what is sealed: a row it would refuse, or
+        // charge past the row limit, takes the cell-vector schemas instead.
+        if serialize_semantic_scrollback_payload_into(&semantic, out)
+            && clustered_scrollback_decoded_charge(line, out.len())
+                .is_some_and(|charge| charge <= LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE)
+        {
+            return true;
+        }
+        wipe_scrollback_plaintext(out);
+    }
+    let Some(plaintext) = serialize_cell_semantic_scrollback_line(line) else {
+        return false;
+    };
+    if out.try_reserve(plaintext.len()).is_err() {
+        return false;
+    }
+    out.extend_from_slice(&plaintext);
+    true
+}
+
+/// Schema 2 (compact printable ASCII) or schema 1 (the cell vector with a
+/// width sidecar) for a row clustered storage does not hold.
+fn serialize_cell_semantic_scrollback_line(
     line: &wezterm_term::Line,
 ) -> Option<Zeroizing<Vec<u8>>> {
     // Inspect borrowed cells before materializing compressed scrollback. For
@@ -11320,16 +11654,60 @@ fn serialize_exact_semantic_scrollback_line(
 fn serialize_semantic_scrollback_payload(
     semantic: &ExactSemanticScrollbackLineV1,
 ) -> Option<Zeroizing<Vec<u8>>> {
+    let mut plaintext = Zeroizing::new(Vec::new());
+    serialize_semantic_scrollback_payload_into(semantic, &mut plaintext).then_some(plaintext)
+}
+
+/// Appends `semantic`'s bounded varbincode to `out`; on false `out` is wiped.
+fn serialize_semantic_scrollback_payload_into<T: Serialize>(
+    semantic: &T,
+    out: &mut Vec<u8>,
+) -> bool {
+    let start = out.len();
     let mut plaintext =
-        BoundedScrollbackPlaintext::new(LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE);
+        BoundedScrollbackPlaintext::new(out, LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE);
     let serialization = {
         let mut serializer = varbincode::Serializer::new(&mut plaintext);
         semantic.serialize(&mut serializer)
     };
-    if plaintext.exceeded || serialization.is_err() || plaintext.bytes.is_empty() {
+    if plaintext.exceeded || serialization.is_err() || plaintext.bytes.len() == start {
+        wipe_scrollback_plaintext(out);
+        return false;
+    }
+    true
+}
+
+/// Validate a clustered (schema 3) row and charge it as if materialized
+/// (ft-yccm0.2.1.4). Every cell is one or two columns wide and starts where
+/// the previous one ended, the columns add up to the row's length, and the
+/// cells consume all of its text: the runs then reproduce exactly the cells
+/// they were stored with. A wide cell materializes with a spacer that clones
+/// its attributes, so it is charged twice. `None` refuses the row.
+fn clustered_scrollback_decoded_charge(
+    line: &wezterm_term::Line,
+    plaintext_bytes: usize,
+) -> Option<usize> {
+    if !line.has_clustered_storage() || line.len() > LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE {
         return None;
     }
-    Some(plaintext.bytes)
+    let mut charge = plaintext_bytes;
+    let mut columns = 0usize;
+    let mut text_bytes = 0usize;
+    for cell in line.visible_cells() {
+        let width = cell.width();
+        if !matches!(width, 1 | 2) || cell.cell_index() != columns {
+            return None;
+        }
+        columns = columns.checked_add(width)?;
+        if columns > line.len() {
+            return None;
+        }
+        text_bytes = text_bytes.checked_add(cell.str().len())?;
+        let materialized = std::mem::size_of::<termwiz::cell::Cell>()
+            .checked_add(cell.attrs().snapshot_clone_heap_bytes()?)?;
+        charge = charge.checked_add(materialized.checked_mul(width)?)?;
+    }
+    (columns == line.len() && line.visible_text_bytes() == Some(text_bytes)).then_some(charge)
 }
 
 /// Validate the complete compact representation and charge expansion before
@@ -11373,23 +11751,33 @@ struct ExactSemanticScrollbackLineV1 {
     cell_widths: Vec<u8>,
 }
 
-struct BoundedScrollbackPlaintext {
-    bytes: Zeroizing<Vec<u8>>,
+/// `ExactSemanticScrollbackLineV1` over a borrowed row and sidecar: the same
+/// bytes, without cloning the row (ft-yccm0.2.1.4).
+#[derive(Serialize)]
+struct ExactSemanticScrollbackLineRef<'a> {
+    schema: u32,
+    line: &'a wezterm_term::Line,
+    cell_widths: &'a [u8],
+}
+
+/// Appends to a caller's buffer, refusing to grow it past `max_bytes`.
+struct BoundedScrollbackPlaintext<'a> {
+    bytes: &'a mut Vec<u8>,
     max_bytes: usize,
     exceeded: bool,
 }
 
-impl BoundedScrollbackPlaintext {
-    fn new(max_bytes: usize) -> Self {
+impl<'a> BoundedScrollbackPlaintext<'a> {
+    fn new(bytes: &'a mut Vec<u8>, max_bytes: usize) -> Self {
         Self {
-            bytes: Zeroizing::new(Vec::new()),
+            bytes,
             max_bytes,
             exceeded: false,
         }
     }
 }
 
-impl Write for BoundedScrollbackPlaintext {
+impl Write for BoundedScrollbackPlaintext<'_> {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         let Some(next_len) = self.bytes.len().checked_add(buffer.len()) else {
             self.exceeded = true;
@@ -11618,9 +12006,30 @@ fn decode_exact_semantic_scrollback_plaintext(
         "semantic scrollback row contains trailing plaintext"
     );
     anyhow::ensure!(
-        matches!(semantic.schema, 1 | 2),
+        matches!(semantic.schema, 1 | 2 | EXACT_SCROLLBACK_SCHEMA_CLUSTERED),
         "unsupported semantic scrollback row schema"
     );
+    if semantic.schema == EXACT_SCROLLBACK_SCHEMA_CLUSTERED {
+        // The stored runs are the row: validated and charged, it is returned
+        // in clustered storage, exactly as it was sealed.
+        anyhow::ensure!(
+            semantic.cell_widths.is_empty(),
+            "clustered semantic scrollback row carries a width sidecar"
+        );
+        decoded_bytes = clustered_scrollback_decoded_charge(&semantic.line, decoded_bytes)
+            .ok_or_else(|| anyhow::anyhow!("invalid clustered semantic scrollback row"))?;
+        if decoded_bytes > max_decoded_bytes.min(LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE) {
+            return Err(ScrollbackDecodedBudgetExceeded {
+                minimum_required: decoded_bytes,
+            }
+            .into());
+        }
+        return Ok((
+            semantic.line,
+            decoded_bytes,
+            DecodedScrollbackRecordFidelity::ExactSemantic,
+        ));
+    }
     if semantic.schema == 2 {
         decoded_bytes = compact_scrollback_decoded_charge(&semantic, decoded_bytes)
             .ok_or_else(|| anyhow::anyhow!("invalid compact semantic scrollback row"))?;
@@ -11791,9 +12200,12 @@ fn exact_scrollback_line_record_is_equivalent(
     if fidelity != DecodedScrollbackRecordFidelity::ExactSemantic {
         return false;
     }
+    // Compare through the cell-vector schemas, which normalize storage: a
+    // clustered row seals as schema 3, but the same row stored earlier as
+    // schema 2 or 1 decodes into vector storage.
     match (
-        serialize_exact_semantic_scrollback_line(&decoded),
-        serialize_exact_semantic_scrollback_line(line),
+        serialize_cell_semantic_scrollback_line(&decoded),
+        serialize_cell_semantic_scrollback_line(line),
     ) {
         (Some(decoded), Some(expected)) => decoded == expected,
         _ => false,
@@ -12505,7 +12917,10 @@ impl LiveScrollbackSpillSink {
         } else {
             LIVE_SCROLLBACK_APPEND_MAX_RECORD_BYTES
         };
-        let (records, row_segment) = {
+        // The batch's records are encoded through this thread's arena and
+        // stay in it until the transaction ends (ft-yccm0.2.1.4 AC1).
+        let mut encode = ScrollbackRowEncodeLease::take();
+        let row_segment = {
             // ft-yccm0.2.1.4: rows after a v4 manifest are compact, sealed
             // under the live nonce stream. A full segment table leaves them
             // self-describing v3 rows.
@@ -12528,8 +12943,7 @@ impl LiveScrollbackSpillSink {
             } else {
                 None
             };
-            let mut scratch = Vec::new();
-            let mut records = Vec::with_capacity(batch_rows);
+            let arena = &mut encode.arena;
             let mut bytes = 0usize;
             for (offset, line) in lines.iter().take(batch_rows).enumerate() {
                 let Some(row) = wezterm_term::StableRowIndex::try_from(offset)
@@ -12547,9 +12961,7 @@ impl LiveScrollbackSpillSink {
                 let Ok(row) = i64::try_from(row) else {
                     return false;
                 };
-                let record = if let Some(stream) =
-                    row_nonce_stream.as_mut().filter(|_| row_segment.is_some())
-                {
+                if let Some(stream) = row_nonce_stream.as_mut().filter(|_| row_segment.is_some()) {
                     let Ok(location) =
                         mux::guardian_output_journal::GuardianScrollbackRowLocation::new(
                             self.durable_pane_id,
@@ -12560,65 +12972,55 @@ impl LiveScrollbackSpillSink {
                     else {
                         return false;
                     };
-                    let Some(payload) = exact_scrollback_line_payload(line) else {
+                    let Some(payload_bytes) = arena.prepare_payload(line) else {
                         return false;
                     };
                     // Check the batch budget before sealing: a row left for
                     // the next batch must not consume its sequence.
                     let Some(next_bytes) =
                         mux::guardian_output_journal::compact_scrollback_row_record_bytes(
-                            payload.len(),
+                            payload_bytes,
                         )
                         .and_then(|record_bytes| bytes.checked_add(record_bytes))
                     else {
+                        arena.discard_payload();
                         return false;
                     };
-                    if !records.is_empty() && next_bytes > max_batch_record_bytes {
+                    if !arena.batch.is_empty() && next_bytes > max_batch_record_bytes {
+                        arena.discard_payload();
                         break;
                     }
-                    let mut record = String::new();
-                    if cipher
-                        .seal_compact_scrollback_row_into(
-                            stream,
-                            location,
-                            &payload,
-                            &mut scratch,
-                            &mut record,
-                        )
-                        .is_err()
-                    {
+                    if !arena.seal_compact_row(&cipher, stream, location) {
                         return false;
                     }
-                    record
-                } else {
-                    let Ok(identity) =
-                        mux::guardian_output_journal::GuardianScrollbackRowIdentity::new(
-                            self.durable_pane_id,
-                            proposed_state.content_epoch,
-                            proposed_state.revision,
-                            row,
-                            sequence,
-                        )
-                    else {
-                        return false;
-                    };
-                    let Some(record) = encode_exact_scrollback_line_record(line, &cipher, identity)
-                    else {
-                        return false;
-                    };
-                    record
+                    bytes = next_bytes;
+                    continue;
+                }
+                let Ok(identity) = mux::guardian_output_journal::GuardianScrollbackRowIdentity::new(
+                    self.durable_pane_id,
+                    proposed_state.content_epoch,
+                    proposed_state.revision,
+                    row,
+                    sequence,
+                ) else {
+                    return false;
+                };
+                let Some(record) = encode_exact_scrollback_line_record(line, &cipher, identity)
+                else {
+                    return false;
                 };
                 let Some(next_bytes) = bytes.checked_add(record.len()) else {
                     return false;
                 };
-                if !records.is_empty() && next_bytes > max_batch_record_bytes {
+                if !arena.batch.is_empty() && next_bytes > max_batch_record_bytes {
                     break;
                 }
                 bytes = next_bytes;
-                records.push(record);
+                arena.batch.push(record);
             }
-            (records, row_segment)
+            row_segment
         };
+        let records = &encode.arena.batch;
         if commit_window {
             // The window continued the published segment (checked above,
             // under the mutation gate that still excludes every other writer).
@@ -12630,7 +13032,7 @@ impl LiveScrollbackSpillSink {
                 &previous_state,
                 stable_row,
                 desired_seq,
-                &records,
+                records,
                 max_retained_rows,
             );
         }
@@ -12688,7 +13090,7 @@ impl LiveScrollbackSpillSink {
                 stable_row,
                 desired_seq,
                 max_retained_rows,
-                &records,
+                records,
                 row_segment,
                 &store,
                 AppendWalFormat::DigestOnly,
@@ -18546,12 +18948,228 @@ mod tests {
                     })
                     .unwrap();
                 assert_eq!(
-                    serialize_exact_semantic_scrollback_line(&line).unwrap(),
+                    serialize_cell_semantic_scrollback_line(&line).unwrap(),
                     expected,
                     "columns={columns} storage_case={storage_case}",
                 );
+                // ft-yccm0.2.1.4 changed what a clustered row seals: its own
+                // runs as schema 3. A vector row still seals as schema 2.
+                let sealed = serialize_exact_semantic_scrollback_line(&line).unwrap();
+                if storage_case == 0 {
+                    assert!(!line.has_clustered_storage());
+                    assert_eq!(*sealed, *expected, "columns={columns} vector row");
+                } else {
+                    assert!(line.has_clustered_storage());
+                    let clustered = varbincode::serialize(&ExactSemanticScrollbackLineRef {
+                        schema: EXACT_SCROLLBACK_SCHEMA_CLUSTERED,
+                        line: &line,
+                        cell_widths: &[],
+                    })
+                    .unwrap();
+                    assert_eq!(
+                        *sealed, clustered,
+                        "columns={columns} storage_case={storage_case}"
+                    );
+                }
                 assert_eq!(varbincode::serialize(&line).unwrap(), before);
             }
+        }
+    }
+
+    /// Rows as Screen hands them to the store, clustered: T0-like (a wide
+    /// emoji per cell pair with fresh colors), CJK with a bold run, a
+    /// wrapped ASCII row and an empty row.
+    fn clustered_test_rows() -> Vec<Line> {
+        const EMOJI: [&str; 4] = ["\u{1f600}", "\u{1f680}", "\u{1f916}", "\u{1f389}"];
+        let mut t0 = Line::with_width(80, 1);
+        for column in (0..80).step_by(2) {
+            let mut attrs = CellAttributes::blank();
+            attrs.set_foreground(termwiz::color::ColorAttribute::PaletteIndex(
+                (column * 7 % 256) as u8,
+            ));
+            attrs.set_background(termwiz::color::ColorAttribute::PaletteIndex(
+                (column * 13 % 256) as u8,
+            ));
+            t0.set_cell(
+                column,
+                termwiz::cell::Cell::new_grapheme(EMOJI[column % EMOJI.len()], attrs, None),
+                1,
+            );
+        }
+        let mut cjk = Line::from_text("ls 界面 漢字 ok", &CellAttributes::blank(), 3, None);
+        let mut bold = CellAttributes::blank();
+        bold.set_intensity(termwiz::cell::Intensity::Bold);
+        cjk.set_cell_grapheme(3, "界", 2, bold, 3);
+        let mut wrapped = Line::from_text(&"seq ".repeat(20), &CellAttributes::blank(), 5, None);
+        wrapped.set_last_cell_was_wrapped(true, 5);
+        let mut rows = vec![
+            t0,
+            cjk,
+            wrapped,
+            Line::from_text("", &CellAttributes::blank(), 1, None),
+        ];
+        for line in &mut rows {
+            line.compress_for_scrollback();
+            assert!(line.has_clustered_storage(), "{:?}", line.as_str());
+        }
+        rows
+    }
+
+    /// ft-yccm0.2.1.4 AC1: a clustered row seals as schema 3, its own runs
+    /// with no width sidecar, and decodes to exactly that row, still
+    /// clustered. Wide and colored rows take it too, and seal smaller than
+    /// their cell vector. The arena and the allocating path seal the same
+    /// payload.
+    #[test]
+    fn clustered_rows_seal_as_their_runs_and_decode_exactly() {
+        let mut arena = ScrollbackRowEncodeArena::default();
+        for line in clustered_test_rows() {
+            let text = line.as_str().into_owned();
+            let raw = serialize_exact_semantic_scrollback_line(&line).unwrap();
+            let semantic: ExactSemanticScrollbackLineV1 =
+                codec::bounded_varbincode_deserialize(&mut raw.as_slice()).unwrap();
+            assert_eq!(
+                semantic.schema, EXACT_SCROLLBACK_SCHEMA_CLUSTERED,
+                "{text:?}"
+            );
+            assert!(semantic.cell_widths.is_empty(), "{text:?}");
+            let vector = serialize_cell_semantic_scrollback_line(&line).unwrap();
+            if !line.is_whitespace() {
+                assert!(
+                    raw.len() < vector.len(),
+                    "{text:?}: runs {} bytes, cell vector {} bytes",
+                    raw.len(),
+                    vector.len()
+                );
+            }
+
+            let payload = exact_scrollback_line_payload(&line).unwrap();
+            let payload_bytes = arena.prepare_payload(&line).unwrap();
+            let prepared: &[u8] = if arena.compressed_payload {
+                &arena.compressed
+            } else {
+                &arena.plaintext
+            };
+            assert_eq!(prepared, payload.as_slice(), "{text:?}: arena payload");
+            assert_eq!(payload_bytes, payload.len());
+            arena.discard_payload();
+
+            let (decoded, charge, fidelity) = decode_exact_semantic_scrollback_plaintext(
+                payload,
+                LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+            )
+            .unwrap();
+            assert_eq!(fidelity, DecodedScrollbackRecordFidelity::ExactSemantic);
+            assert!(decoded.has_clustered_storage(), "{text:?}");
+            // Derived equality also compares the wide-cell bitset's
+            // capacity, which the wire form drops (the surface crate's
+            // wide_mask_wire_omits_unused_trailing_extent); the row's bytes
+            // and its cells are what must match.
+            assert_eq!(
+                varbincode::serialize(&decoded).unwrap(),
+                varbincode::serialize(&line).unwrap(),
+                "{text:?}: the decoded row is the sealed row"
+            );
+            assert_eq!(decoded.len(), line.len(), "{text:?}");
+            assert_eq!(
+                decoded.last_cell_was_wrapped(),
+                line.last_cell_was_wrapped(),
+                "{text:?}"
+            );
+            assert!(charge >= raw.len(), "{text:?}");
+            let (mut decoded, mut line) = (decoded, line);
+            assert_eq!(decoded.cells_mut(), line.cells_mut(), "{text:?}: cells");
+        }
+    }
+
+    /// The schema 3 decoder refuses a width sidecar and vector storage, and
+    /// any mutation of a sealed plaintext either decodes to a row whose
+    /// runs reproduce exactly its cells or is refused: never a panic.
+    #[test]
+    fn clustered_row_decoder_refuses_malformed_rows_without_panicking() {
+        let rows = clustered_test_rows();
+        let t0 = &rows[0];
+        let decode = |plaintext: Vec<u8>| {
+            decode_exact_semantic_scrollback_plaintext(
+                Zeroizing::new(plaintext),
+                LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+            )
+        };
+        let sidecar = varbincode::serialize(&ExactSemanticScrollbackLineRef {
+            schema: EXACT_SCROLLBACK_SCHEMA_CLUSTERED,
+            line: t0,
+            cell_widths: &[2],
+        })
+        .unwrap();
+        assert!(decode(sidecar).is_err(), "a width sidecar is refused");
+        let mut vector = t0.clone();
+        vector.cells_mut();
+        let vector = varbincode::serialize(&ExactSemanticScrollbackLineRef {
+            schema: EXACT_SCROLLBACK_SCHEMA_CLUSTERED,
+            line: &vector,
+            cell_widths: &[],
+        })
+        .unwrap();
+        assert!(decode(vector).is_err(), "vector storage is refused");
+
+        let sealed = serialize_exact_semantic_scrollback_line(t0)
+            .unwrap()
+            .to_vec();
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut accepted = 0;
+        for _ in 0..4096 {
+            let mut mutated = sealed.clone();
+            for _ in 0..=next() % 3 {
+                let at = (next() % mutated.len() as u64) as usize;
+                mutated[at] = next() as u8;
+            }
+            if let Ok((mut line, _, _)) = decode(mutated) {
+                accepted += 1;
+                let columns = line.len();
+                assert_eq!(
+                    line.cells_mut().len(),
+                    columns,
+                    "an accepted row materializes exactly its columns"
+                );
+            }
+        }
+        // Most single-byte changes land in text or attribute values, which
+        // stay well-formed rows; the sweep must exercise both outcomes.
+        assert!(
+            accepted > 0 && accepted < 4096,
+            "accepted {accepted} of 4096"
+        );
+    }
+
+    /// An exact retry is recognized whatever the row's storage: a row stored
+    /// from vector storage (schema 2 or 1) and retried clustered (schema 3),
+    /// and the reverse. A different row at the same place is not a retry.
+    #[test]
+    fn exact_retries_match_across_vector_and_clustered_storage() {
+        let (_dir, backing, _deferred) = deferred_test_sink();
+        for (row, clustered) in clustered_test_rows().into_iter().enumerate() {
+            let row = row as isize * 2;
+            let mut vector = clustered.clone();
+            vector.cells_mut();
+            assert!(backing.store_scrollback_line(row, &vector, 64));
+            assert!(
+                backing.store_scrollback_line(row, &clustered, 64),
+                "row {row}"
+            );
+            assert!(backing.store_scrollback_line(row + 1, &clustered, 64));
+            assert!(
+                backing.store_scrollback_line(row + 1, &vector, 64),
+                "row {}",
+                row + 1
+            );
+            let other = Line::from_text("other", &CellAttributes::blank(), 1, None);
+            assert!(!backing.store_scrollback_line(row, &other, 64), "row {row}");
         }
     }
 

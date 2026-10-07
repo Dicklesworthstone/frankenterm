@@ -1895,6 +1895,13 @@ impl Line {
         self.cells = CellStorage::C(Arc::new(clustered));
     }
 
+    /// Whether the cells are held as clustered attribute runs, the storage
+    /// `compress_for_scrollback` leaves a row in when clustering reproduces
+    /// it. Such a row serializes as its runs, without a cell vector.
+    pub fn has_clustered_storage(&self) -> bool {
+        matches!(self.cells, CellStorage::C(_))
+    }
+
     pub fn cells_mut(&mut self) -> &mut [Cell] {
         self.coerce_vec_storage().as_mut_slice()
     }
