@@ -367,10 +367,13 @@ impl Page {
         Some(row)
     }
 
-    /// Legacy `Line::update_last_change_seqno`, plus the page maximum.
+    /// Legacy `Line::update_last_change_seqno`, plus the page maximum. The
+    /// row becomes dirty too: a seqno that moves is a change legacy's
+    /// consumers see, so the renderer must see it (B3.4).
     pub fn touch_row(&mut self, row: u32, seqno: SequenceNo) {
-        let slot = self.header(row).slot();
-        self.touch(slot, seqno);
+        let header = self.header(row);
+        self.set_header(row, header.with_flags(RowHeader::DIRTY, true));
+        self.touch(header.slot(), seqno);
     }
 
     fn touch(&mut self, slot: u32, seqno: SequenceNo) {
@@ -444,50 +447,7 @@ impl Page {
         let mut flags = RowHeader::DIRTY;
         let mut cache = None;
         for (x, cell) in cells.iter().enumerate() {
-            let attrs = cell.attrs();
-            let class = classify(attrs);
-            let style = match &class {
-                StyleClass::Inline(inline) => self.resolve_style(&mut StyleSpec::Inline(*inline)),
-                StyleClass::Rich(rich) => {
-                    flags |= RowHeader::STYLED;
-                    self.resolve_style(&mut StyleSpec::Rich {
-                        style: rich,
-                        cache: &mut cache,
-                    })
-                }
-            };
-            let glyph = Glyph::from_text(cell.str());
-            let mut bits = PackedCell::BLANK
-                .with_style(style)
-                .with_semantic(attrs.semantic_type())
-                .with_wrapped(attrs.wrapped())
-                .with_codepoint(glyph.codepoint())
-                .with_wide(cell.width() >= 2);
-            if !matches!(attrs.semantic_type(), SemanticType::Output) {
-                flags |= RowHeader::SEMANTIC;
-            }
-            let off = self.offset(slot, x);
-            if let Glyph::Cluster(text) = glyph {
-                self.graphemes.insert(off, text);
-                bits = bits.with_grapheme(true);
-                flags |= RowHeader::GRAPHEME;
-            }
-            if let Some(link) = attrs.hyperlink() {
-                self.links.attach(off, link);
-                bits = bits.with_hyperlink(true);
-                flags |= RowHeader::HYPERLINK;
-            }
-            // Legacy's stored order, as `write_legacy` keeps it.
-            let images: Vec<Box<ImageCell>> = attrs
-                .images()
-                .map(|images| images.into_iter().map(Box::new).collect())
-                .unwrap_or_default();
-            if !images.is_empty() {
-                self.images.insert(off, images);
-                bits = bits.with_image(true);
-                flags |= RowHeader::IMAGE;
-            }
-            self.set_cell_at(slot, x, bits);
+            flags |= self.store_legacy_cell(slot, x, cell, &mut cache);
         }
         let len = cells.len();
         self.set_header(
@@ -501,6 +461,95 @@ impl Page {
         self.set_row_seqno(row, seqno);
         self.debug_check_row(row);
         true
+    }
+
+    /// Replaces the cells `x..x + cells.len()` with `cells`, kept exactly
+    /// as given: legacy's raw `*cell = other.clone()` into vector storage,
+    /// as its scroll within left and right margins stores them (B3.4).
+    /// Unlike [`Self::write`], no wide head is invalidated and no placement
+    /// carries over. The row's other cells, length and line flags stay, and
+    /// the seqno moves. Returns false, changing nothing, when the cells run
+    /// past the row's length or one is wider than two columns.
+    pub fn put_legacy_cells(
+        &mut self,
+        row: u32,
+        x: usize,
+        cells: &[Cell],
+        seqno: SequenceNo,
+    ) -> bool {
+        let header = self.header(row);
+        let end = x.saturating_add(cells.len());
+        if end > header.len() || cells.iter().any(|cell| cell.width() > 2) {
+            return false;
+        }
+        let slot = header.slot();
+        let mut flags = RowHeader::DIRTY;
+        let mut cache = None;
+        for (offset, cell) in cells.iter().enumerate() {
+            self.release_at(slot, x + offset);
+            flags |= self.store_legacy_cell(slot, x + offset, cell, &mut cache);
+        }
+        self.set_header(row, header.with_flags(flags, true));
+        if x < end {
+            self.resync_hidden(slot, x, end, header.len());
+        }
+        self.touch(slot, seqno);
+        self.debug_check_row(row);
+        true
+    }
+
+    /// Stores `cell` as it is into the released column `x` of the row at
+    /// `slot`, hidden bit aside. Returns the row summary flags it needs.
+    fn store_legacy_cell(
+        &mut self,
+        slot: u32,
+        x: usize,
+        cell: &Cell,
+        cache: &mut Option<CachedRichId>,
+    ) -> u64 {
+        let mut flags = 0;
+        let attrs = cell.attrs();
+        let class = classify(attrs);
+        let style = match &class {
+            StyleClass::Inline(inline) => self.resolve_style(&mut StyleSpec::Inline(*inline)),
+            StyleClass::Rich(rich) => {
+                flags |= RowHeader::STYLED;
+                self.resolve_style(&mut StyleSpec::Rich { style: rich, cache })
+            }
+        };
+        let glyph = Glyph::from_text(cell.str());
+        let mut bits = PackedCell::BLANK
+            .with_style(style)
+            .with_semantic(attrs.semantic_type())
+            .with_wrapped(attrs.wrapped())
+            .with_codepoint(glyph.codepoint())
+            .with_wide(cell.width() >= 2);
+        if !matches!(attrs.semantic_type(), SemanticType::Output) {
+            flags |= RowHeader::SEMANTIC;
+        }
+        let off = self.offset(slot, x);
+        if let Glyph::Cluster(text) = glyph {
+            self.graphemes.insert(off, text);
+            bits = bits.with_grapheme(true);
+            flags |= RowHeader::GRAPHEME;
+        }
+        if let Some(link) = attrs.hyperlink() {
+            self.links.attach(off, link);
+            bits = bits.with_hyperlink(true);
+            flags |= RowHeader::HYPERLINK;
+        }
+        // Legacy's stored order, as `write_legacy` keeps it.
+        let images: Vec<Box<ImageCell>> = attrs
+            .images()
+            .map(|images| images.into_iter().map(Box::new).collect())
+            .unwrap_or_default();
+        if !images.is_empty() {
+            self.images.insert(off, images);
+            bits = bits.with_image(true);
+            flags |= RowHeader::IMAGE;
+        }
+        self.set_cell_at(slot, x, bits);
+        flags
     }
 
     /// Sets or clears legacy line flags ([`RowHeader::LINE_FLAGS`]).
@@ -954,6 +1003,71 @@ impl Page {
             clear_image_placements,
         };
         self.write(row, x, write, seqno)
+    }
+
+    /// A run of printable ASCII from column `x`, at or past the row's end,
+    /// each byte stored as [`Self::write`] stores it, with the style resolved
+    /// once and one header update for the run (B3.4's bulk print). Columns
+    /// from the end up to `x` become default blanks, as `write` pads them.
+    /// `cell`'s glyph and width are ignored. Returns false, writing nothing,
+    /// for a run that starts before the row's end, passes the page's
+    /// stride, carries images, or follows a wide cell (whose invalidation
+    /// `write` performs).
+    pub fn append_ascii(
+        &mut self,
+        row: u32,
+        x: usize,
+        bytes: &[u8],
+        mut cell: CellWrite<'_>,
+        seqno: SequenceNo,
+    ) -> bool {
+        debug_assert!(bytes.iter().all(|byte| (0x20..0x7f).contains(byte)));
+        let header = self.header(row);
+        let slot = header.slot();
+        let old_len = header.len();
+        let end = x.saturating_add(bytes.len());
+        if bytes.is_empty()
+            || x < old_len
+            || end > self.stride()
+            || !cell.images.is_empty()
+            || (x > 0 && x == old_len && self.cell_at(slot, x - 1).is_wide())
+        {
+            return false;
+        }
+        cell.glyph = Glyph::Blank;
+        cell.wide = false;
+        let style = self.resolve_style(&mut cell.style);
+        if let CellStyle::Rich(id) = style {
+            // One reference per stored cell; resolving took the first.
+            for _ in 1..bytes.len() {
+                self.styles.add_ref(id);
+            }
+        }
+        let template = PackedCell::BLANK
+            .with_style(style)
+            .with_semantic(cell.semantic)
+            .with_wrapped(cell.wrapped)
+            .with_hyperlink(cell.hyperlink.is_some());
+        for (offset, &byte) in bytes.iter().enumerate() {
+            let glyph = if byte == b' ' {
+                Glyph::Blank
+            } else {
+                Glyph::Char(char::from(byte))
+            };
+            if let Some(link) = cell.hyperlink {
+                let off = self.offset(slot, x + offset);
+                self.links.attach(off, link);
+            }
+            self.set_cell_at(slot, x + offset, template.with_codepoint(glyph.codepoint()));
+        }
+        // The padding and the run's first cell may change hidden bits after
+        // a wide cell; the run itself is narrow.
+        self.resync_hidden(slot, old_len, x, end);
+        let flags = RowHeader::DIRTY | cell.summary_flags(style, false);
+        self.set_header(row, header.with_len(end).with_flags(flags, true));
+        self.touch(slot, seqno);
+        self.debug_check_cells(row, old_len.saturating_sub(1)..(end + 1).min(self.stride()));
+        true
     }
 
     /// Legacy `Screen::insert_cell` (ICH and insert mode): bump the seqno,

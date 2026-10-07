@@ -2,12 +2,10 @@ use crate::terminal::{Alert, Progress};
 use crate::terminalstate::{
     default_color_map, CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry,
 };
-use crate::{ClipboardSelection, Position, TerminalState, VisibleRowIndex, DCS, ST};
+use crate::{ClipboardSelection, LineSize, Position, TerminalState, VisibleRowIndex, DCS, ST};
 use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_bidi::ParagraphDirectionHint;
-use frankenterm_cell::{
-    grapheme_column_width, is_white_space_grapheme, Cell, CellAttributes, SemanticType,
-};
+use frankenterm_cell::{grapheme_column_width, is_white_space_grapheme, SemanticType};
 use frankenterm_escape_parser::csi::{
     CharacterPath, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode, Sgr,
 };
@@ -1367,19 +1365,19 @@ impl<'a> Performer<'a> {
 
             Esc::Code(EscCode::DecDoubleHeightTopHalfLine) => {
                 let idx = self.screen.phys_row(self.cursor.y);
-                self.screen.line_mut(idx).set_double_height_top(seqno);
+                self.screen.set_line_size(idx, LineSize::DoubleHeightTop, seqno);
             }
             Esc::Code(EscCode::DecDoubleHeightBottomHalfLine) => {
                 let idx = self.screen.phys_row(self.cursor.y);
-                self.screen.line_mut(idx).set_double_height_bottom(seqno);
+                self.screen.set_line_size(idx, LineSize::DoubleHeightBottom, seqno);
             }
             Esc::Code(EscCode::DecDoubleWidthLine) => {
                 let idx = self.screen.phys_row(self.cursor.y);
-                self.screen.line_mut(idx).set_double_width(seqno);
+                self.screen.set_line_size(idx, LineSize::DoubleWidth, seqno);
             }
             Esc::Code(EscCode::DecSingleWidthLine) => {
                 let idx = self.screen.phys_row(self.cursor.y);
-                self.screen.line_mut(idx).set_single_width(seqno);
+                self.screen.set_line_size(idx, LineSize::Single, seqno);
             }
 
             Esc::Code(EscCode::DecScreenAlignmentDisplay) => {
@@ -1388,16 +1386,10 @@ impl<'a> Performer<'a> {
                 // https://vt100.net/docs/vt510-rm/DECALN.html
 
                 let screen = self.screen_mut();
-                let col_range = 0..screen.physical_cols;
                 for y in 0..screen.physical_rows as VisibleRowIndex {
                     let line_idx = screen.phys_row(y);
-                    let line = screen.line_mut(line_idx);
-                    line.resize(col_range.end, seqno);
-                    line.fill_range(
-                        col_range.clone(),
-                        &Cell::new('E', CellAttributes::default()),
-                        seqno,
-                    );
+                    // Natively on page-engine rows (ft-yccm0.3.3.4).
+                    screen.fill_alignment_row(line_idx, seqno);
                 }
 
                 self.top_and_bottom_margins = 0..self.screen().physical_rows as VisibleRowIndex;

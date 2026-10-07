@@ -7,6 +7,7 @@ use crate::config::{
     ScrollbackSnapshotLimits,
 };
 use crate::pagegrid::native;
+pub use crate::pagegrid::native::LineSize;
 use crate::pagegrid::rows::{PageRows, Rows};
 use crate::pagegrid::Page;
 #[cfg(feature = "use_serde")]
@@ -9211,6 +9212,11 @@ impl Screen {
         let phys_cols = self.physical_cols;
 
         let line_idx = self.phys_row(y);
+        if let Some((page, row)) = self.page_row(line_idx) {
+            if native::insert_blank(page, row, x, right_margin, phys_cols, seqno) {
+                return;
+            }
+        }
         let line = self.line_mut(line_idx);
         line.update_last_change_seqno(seqno);
         line.insert_cell(x, Cell::default(), right_margin, seqno);
@@ -9231,8 +9237,47 @@ impl Screen {
     ) {
         self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
         let line_idx = self.phys_row(y);
+        if let Some((page, row)) = self.page_row(line_idx) {
+            if native::erase_cell(page, row, x, right_margin, &blank_attr, seqno) {
+                return;
+            }
+        }
         let line = self.line_mut(line_idx);
         line.erase_cell_with_margin(x, right_margin, seqno, blank_attr);
+    }
+
+    /// `Line::update_last_change_seqno` on the row at `idx`, natively on a
+    /// page-engine row (ft-yccm0.3.3.4), which also becomes dirty.
+    pub fn touch_phys_row(&mut self, idx: PhysRowIndex, seqno: SequenceNo) {
+        if let Some((page, row)) = self.page_row(idx) {
+            page.touch_row(row, seqno);
+            return;
+        }
+        self.line_mut(idx).update_last_change_seqno(seqno);
+    }
+
+    /// DECSWL, DECDWL and DECDHL, and erasing in display: the size of the
+    /// row at `idx`, natively on a page-engine row (ft-yccm0.3.3.4).
+    pub fn set_line_size(&mut self, idx: PhysRowIndex, size: LineSize, seqno: SequenceNo) {
+        if let Some((page, row)) = self.page_row(idx) {
+            native::set_line_size(page, row, size, seqno);
+            return;
+        }
+        size.apply_to_line(self.line_mut(idx), seqno);
+    }
+
+    /// DECALN on the row at `idx`: the screen's width of plain `E` cells,
+    /// natively on a page-engine row (ft-yccm0.3.3.4).
+    pub fn fill_alignment_row(&mut self, idx: PhysRowIndex, seqno: SequenceNo) {
+        let cols = self.physical_cols;
+        if let Some((page, row)) = self.page_row(idx) {
+            if native::fill_alignment(page, row, cols, seqno) {
+                return;
+            }
+        }
+        let line = self.line_mut(idx);
+        line.resize(cols, seqno);
+        line.fill_range(0..cols, &Cell::new('E', CellAttributes::default()), seqno);
     }
 
     /// Set a cell.  the x and y coordinates are relative to the visible screeen
@@ -9517,55 +9562,89 @@ impl Screen {
         if rows_to_copy > 0 {
             for dest_row in phys_scroll.start..phys_scroll.start + rows_to_copy {
                 let src_row = dest_row + num_rows;
-
-                // Copy the source cells first
-                let cells = {
-                    self.lines[src_row]
-                        .cells_mut()
-                        .iter()
-                        .skip(left_and_right_margins.start)
-                        .take(left_and_right_margins.end - left_and_right_margins.start)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                };
-
-                // and place them into the dest
-                let dest_row = self.line_mut(dest_row);
-                dest_row.update_last_change_seqno(seqno);
-                let dest_range =
-                    left_and_right_margins.start..left_and_right_margins.start + cells.len();
-                if dest_row.len() < dest_range.end {
-                    dest_row.resize(dest_range.end, seqno);
-                }
-
-                let tail_range = dest_range.end..left_and_right_margins.end;
-
-                for (src_cell, dest_cell) in
-                    cells.into_iter().zip(&mut dest_row.cells_mut()[dest_range])
-                {
-                    *dest_cell = src_cell.clone();
-                }
-
-                dest_row.fill_range(
-                    tail_range,
-                    &Cell::blank_with_attrs(blank_attr.clone()),
-                    seqno,
-                );
+                self.copy_margin_band(src_row, dest_row, left_and_right_margins, &blank_attr, seqno);
             }
         }
 
         // and blank out rows at the bottom
         for n in phys_scroll.start + rows_to_copy..phys_scroll.end {
-            let dest_row = self.line_mut(n);
-            dest_row.update_last_change_seqno(seqno);
-            for cell in dest_row
+            self.blank_margin_band(n, left_and_right_margins, &blank_attr, seqno);
+        }
+    }
+
+    /// One row of the scroll within left and right margins: the band
+    /// `margins` of row `src` copied raw into row `dest`, and the rest of
+    /// the destination's band erased with `blank_attr`. On page-engine rows
+    /// natively (ft-yccm0.3.3.4).
+    fn copy_margin_band(
+        &mut self,
+        src: PhysRowIndex,
+        dest: PhysRowIndex,
+        margins: &Range<usize>,
+        blank_attr: &CellAttributes,
+        seqno: SequenceNo,
+    ) {
+        // Copy the source cells first
+        let cells = match self.page_row(src) {
+            Some((page, row)) => native::take_band(page, row, margins.clone()),
+            None => self.lines[src]
                 .cells_mut()
-                .iter_mut()
-                .skip(left_and_right_margins.start)
-                .take(left_and_right_margins.end - left_and_right_margins.start)
-            {
-                *cell = Cell::blank_with_attrs(blank_attr.clone());
+                .iter()
+                .skip(margins.start)
+                .take(margins.end - margins.start)
+                .cloned()
+                .collect::<Vec<_>>(),
+        };
+
+        // and place them into the dest
+        if let Some((page, row)) = self.page_row(dest) {
+            if native::put_band(page, row, margins.start, &cells, margins.end, blank_attr, seqno) {
+                return;
             }
+        }
+        let dest_row = self.line_mut(dest);
+        dest_row.update_last_change_seqno(seqno);
+        let dest_range = margins.start..margins.start + cells.len();
+        if dest_row.len() < dest_range.end {
+            dest_row.resize(dest_range.end, seqno);
+        }
+
+        let tail_range = dest_range.end..margins.end;
+
+        for (src_cell, dest_cell) in cells.into_iter().zip(&mut dest_row.cells_mut()[dest_range]) {
+            *dest_cell = src_cell.clone();
+        }
+
+        dest_row.fill_range(
+            tail_range,
+            &Cell::blank_with_attrs(blank_attr.clone()),
+            seqno,
+        );
+    }
+
+    /// A row the scroll within left and right margins vacates: its stored
+    /// cells in the band `margins` become blanks with `blank_attr`. On
+    /// page-engine rows natively (ft-yccm0.3.3.4).
+    fn blank_margin_band(
+        &mut self,
+        n: PhysRowIndex,
+        margins: &Range<usize>,
+        blank_attr: &CellAttributes,
+        seqno: SequenceNo,
+    ) {
+        if let Some((page, row)) = self.page_row(n) {
+            native::blank_band(page, row, margins.clone(), blank_attr, seqno);
+            return;
+        }
+        let dest_row = self.line_mut(n);
+        dest_row.update_last_change_seqno(seqno);
+        for cell in dest_row
+            .cells_mut()
+            .iter_mut()
+            .skip(margins.start)
+            .take(margins.end - margins.start)
+        {
+            *cell = Cell::blank_with_attrs(blank_attr.clone());
         }
     }
 
@@ -9827,9 +9906,7 @@ impl Screen {
         }
         if !scrollback_ok {
             for index in phys_scroll.clone() {
-                if let Some((page, row)) = self.page_row(index) {
-                    page.touch_row(row, seqno);
-                }
+                self.touch_phys_row(index, seqno);
             }
         }
         if scroll_region.start == 0 {
@@ -9927,9 +10004,7 @@ impl Screen {
             for index in
                 self.phys_range(&(scroll_region.end..self.physical_rows as VisibleRowIndex))
             {
-                if let Some((page, row)) = self.page_row(index) {
-                    page.touch_row(row, seqno);
-                }
+                self.touch_phys_row(index, seqno);
             }
         }
         true
@@ -9957,9 +10032,7 @@ impl Screen {
         }
         let middle = phys_scroll.end.saturating_sub(num_rows);
         for index in phys_scroll.start..middle {
-            if let Some((page, row)) = self.page_row(index) {
-                page.touch_row(row, seqno);
-            }
+            self.touch_phys_row(index, seqno);
         }
         let cols = self.physical_cols;
         let rows = self.lines.page_mut().expect("page rows");
@@ -10117,54 +10190,13 @@ impl Screen {
         if rows_to_copy > 0 {
             for src_row in (phys_scroll.start..phys_scroll.start + rows_to_copy).rev() {
                 let dest_row = src_row + num_rows;
-
-                // Copy the source cells first
-                let cells = {
-                    self.lines[src_row]
-                        .cells_mut()
-                        .iter()
-                        .skip(left_and_right_margins.start)
-                        .take(left_and_right_margins.end - left_and_right_margins.start)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                };
-
-                // and place them into the dest
-                let dest_row = self.line_mut(dest_row);
-                dest_row.update_last_change_seqno(seqno);
-                let dest_range =
-                    left_and_right_margins.start..left_and_right_margins.start + cells.len();
-                if dest_row.len() < dest_range.end {
-                    dest_row.resize(dest_range.end, seqno);
-                }
-                let tail_range = dest_range.end..left_and_right_margins.end;
-
-                for (src_cell, dest_cell) in
-                    cells.into_iter().zip(&mut dest_row.cells_mut()[dest_range])
-                {
-                    *dest_cell = src_cell.clone();
-                }
-
-                dest_row.fill_range(
-                    tail_range,
-                    &Cell::blank_with_attrs(blank_attr.clone()),
-                    seqno,
-                );
+                self.copy_margin_band(src_row, dest_row, left_and_right_margins, &blank_attr, seqno);
             }
         }
 
         // and blank out rows at the top
         for n in phys_scroll.start..phys_scroll.start + num_rows {
-            let dest_row = self.line_mut(n);
-            dest_row.update_last_change_seqno(seqno);
-            for cell in dest_row
-                .cells_mut()
-                .iter_mut()
-                .skip(left_and_right_margins.start)
-                .take(left_and_right_margins.end - left_and_right_margins.start)
-            {
-                *cell = Cell::blank_with_attrs(blank_attr.clone());
-            }
+            self.blank_margin_band(n, left_and_right_margins, &blank_attr, seqno);
         }
     }
 

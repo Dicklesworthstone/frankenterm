@@ -132,15 +132,19 @@ impl PageRows {
     /// [`Self::line_mut`] is stored back into the page first, and the cached
     /// view is dropped, since the write changes the row. Returns `None`,
     /// leaving the view as the row's content, when an edited view does not
-    /// fit the page (see [`store_line`]).
+    /// fit the page (see [`store_line`]), or holds a hyperlink after an
+    /// implicit-link scan: legacy's next edit strips implicit links
+    /// (`Line::invalidate_implicit_hyperlinks`), which a page row cannot
+    /// record, so the row stays a view until an edit through it has.
     pub fn page_row(&mut self, index: usize) -> Option<(&mut Page, u32)> {
         let stable = self.stable(index);
         let view = &mut self.views[index];
         let line = view.line.take();
         if std::mem::take(&mut view.edited) {
             let line = line.expect("an edited row has its view");
+            let scanned_links = line.implicit_hyperlinks_are_scanned() && line.has_hyperlink();
             let (page, row) = self.list.row_mut(stable).expect("a retained row");
-            if !store_line(page, row, &line) {
+            if scanned_links || !store_line(page, row, &line) {
                 let view = &mut self.views[index];
                 let _ = view.line.set(line);
                 view.edited = true;
@@ -785,13 +789,38 @@ mod tests {
                     .to_vec(),
             ),
             (
-                "edits_through_views",
+                "edits",
                 b"abcdefgh\r\x1b[2@\x1b[3P\x1b[2L\x1b[M\x1b#8\x1b[3;3H\x1b[4hins\x1b[4l\tq"
+                    .to_vec(),
+            ),
+            (
+                "insert_delete_styled",
+                "\x1b[44mab\u{4e2d}cd\x1b[m\r\x1b[C\x1b[@\x1b[41m\x1b[2P\x1b[m\x1b[2;1H\u{4e2d}\u{6587}x\x1b[2;2H\x1b[4hy\u{1f600}\x1b[4l\x1b[3;9Hq\x1b[1;1H\x1b[9@\x1b[99P"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            (
+                "left_right_margins",
+                b"0123456789\r\nabcdefghij\r\nklmnopqrst\r\nuvwxyzABCD\r\nEFGHIJKLMN\x1b[?69h\x1b[3;8s\x1b[2;5r\x1b[3;4H\x1b[S\x1b[44m\x1b[T\x1b[2L\x1b[m\x1b[M\x1b[2P\x1b[@\x1b[5;8Hz\nw\x1b[?69l\x1b[r"
+                    .to_vec(),
+            ),
+            (
+                "alignment_and_sizes",
+                b"x\x1b#8\x1b[2;1H\x1b#3\x1b[3;1H\x1b#4\x1b[4;1H\x1b#6\x1b[4;1H\x1b#5\x1b[1;1H\x1b#6\x1b[2J"
+                    .to_vec(),
+            ),
+            (
+                "tabs_and_origin",
+                b"\x1b[3g\x1b[1;4H\x1bH\x1b[1;8H\x1bH\r\ta\tb\tc\x1b[2;5r\x1b[?6h\x1b[Ho\x1b[2Z\x1b[3Ip\x1b[?6l\x1b[r\x1b[g"
                     .to_vec(),
             ),
             (
                 "alternate_screen",
                 b"main\r\n\x1b[?1049halt one\r\nalt two\n\n\n\n\n\nscrolled\x1b[?1049lback".to_vec(),
+            ),
+            (
+                "alternate_screen_active",
+                b"main\r\n\x1b[?1049halt\x1b[2;3r\n\n\n\x1bMx\x1b[r\x1b[?47l\x1b[?47h".to_vec(),
             ),
             (
                 "graphemes",
@@ -811,9 +840,13 @@ mod tests {
                 let what = format!("{} in {}-byte chunks", name, chunk);
                 assert_eq!(decoded(&page), decoded(&legacy), "{}", what);
                 assert_eq!(page.cursor_pos(), legacy.cursor_pos(), "{}", what);
-                if *name != "alternate_screen" {
-                    assert_eq!(page.screen().grid_engine(), GridEngine::Page, "{}", what);
-                }
+                assert_eq!(
+                    page.is_alt_screen_active(),
+                    legacy.is_alt_screen_active(),
+                    "{}",
+                    what
+                );
+                assert_eq!(page.screen().grid_engine(), GridEngine::Page, "{}", what);
 
                 let size = TerminalSize {
                     rows: 4,

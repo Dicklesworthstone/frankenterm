@@ -299,9 +299,7 @@ impl ScreenOrAlt {
     fn dirty_top_phys_rows(&mut self, seqno: SequenceNo) {
         let num_rows = self.screen.physical_rows;
         for line_idx in 0..num_rows {
-            self.screen
-                .line_mut(line_idx)
-                .update_last_change_seqno(seqno);
+            self.screen.touch_phys_row(line_idx, seqno);
         }
     }
 
@@ -3068,7 +3066,7 @@ impl TerminalState {
             for y in row_range {
                 screen.clear_line(y, col_range.clone(), &pen, seqno, bidi_mode);
                 let line_idx = screen.phys_row(y);
-                screen.line_mut(line_idx).set_single_width(seqno);
+                screen.set_line_size(line_idx, LineSize::Single, seqno);
             }
         }
     }
