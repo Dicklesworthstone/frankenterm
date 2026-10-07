@@ -500,26 +500,41 @@ mod tests {
         assert!(!consumer.reader_gathering());
     }
 
+    /// 20,000 races between a parser announcing sleep and a reader announcing
+    /// a gather, each on a fresh ring, released together by a barrier. One
+    /// long-lived reader thread races them all: spawning a thread per race
+    /// churned 20,000 thread stacks through the test process for seconds and
+    /// starved thread start-up in concurrently running timing tests.
     #[test]
     fn racing_gather_and_sleep_announcements_never_miss_each_other() {
-        for _ in 0..20_000 {
-            let (producer, consumer) = pane_byte_ring(1, 1);
-            let handle = producer.handle();
-            let start = Arc::new(std::sync::Barrier::new(2));
-            let reader_start = Arc::clone(&start);
-            let reader = std::thread::spawn(move || {
+        const RACES: usize = 20_000;
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let (handles, reader_handles) = std::sync::mpsc::channel::<RingHandle>();
+        let (verdicts, reader_verdicts) = std::sync::mpsc::channel::<bool>();
+        let reader_start = Arc::clone(&start);
+        let reader = std::thread::spawn(move || {
+            for handle in reader_handles {
                 reader_start.wait();
-                !handle.begin_gather()
-            });
+                let saw_idle = !handle.begin_gather();
+                if verdicts.send(saw_idle).is_err() {
+                    return;
+                }
+            }
+        });
+        for _ in 0..RACES {
+            let (producer, consumer) = pane_byte_ring(1, 1);
+            handles.send(producer.handle()).unwrap();
             start.wait();
             let parser_saw_gather = consumer.announce_sleep() && consumer.reader_gathering();
-            let reader_saw_idle = reader.join().unwrap();
+            let reader_saw_idle = reader_verdicts.recv().unwrap();
             assert!(
                 parser_saw_gather || reader_saw_idle,
                 "neither side saw the other: a gathered batch could wait out its gather"
             );
             drop(producer);
         }
+        drop(handles);
+        reader.join().unwrap();
     }
 
     #[test]
