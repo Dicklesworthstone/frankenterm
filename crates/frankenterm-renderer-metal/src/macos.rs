@@ -4,16 +4,17 @@
 use crate::atlas::{AtlasConfig, AtlasError, AtlasKind, AtlasSlot, FrameFence};
 use crate::cell_bg::{BackgroundUniforms, CellBgGrid};
 use crate::cell_text::{CellTextGrid, TextUniforms};
-use crate::frame::{FrameUniforms, GridExtent, SlotBuffer};
+use crate::frame::{FrameUniforms, GridExtent, SlotBuffer, UNIFORMS_BYTES};
 use crate::macos_atlas::GlyphAtlases;
 use crate::macos_display_link::{LinkUpdate, MetalDisplayLink};
 use crate::macos_frames::{
-    BackgroundPipeline, FrameSlots, OffscreenCells, OffscreenText, Submission, TextDraw,
-    TextPipeline, supports_metal4,
+    BackgroundPipeline, EncodedWindow, FrameSlots, OffscreenCells, OffscreenText, PaneTextDraw,
+    Submission, TextDraw, TextPipeline, WindowDraw, supports_metal4,
 };
 use crate::{
     ClearColor, DeviceCapabilities, FRAME_SLOT_TIMEOUT, FrameError, FrameOutcome, FrameScene,
-    FrameStats, MAX_TEXTURE_EXTENT, MetalUnavailable, SUBMISSION_ENV, SubmissionPath, appkit_view,
+    FrameStats, MAX_TEXTURE_EXTENT, MetalUnavailable, SUBMISSION_ENV, SubmissionPath, WindowFrame,
+    appkit_view,
 };
 use frankenterm_alloc::resource_ledger::GpuResourceLedger;
 use objc2::rc::Retained;
@@ -22,10 +23,10 @@ use objc2::{MainThreadMarker, msg_send};
 use objc2_core_foundation::CGSize;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus,
-    MTLCommandEncoder, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily,
-    MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLRenderPassDescriptor, MTLResidencySet,
-    MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor,
-    MTLTextureUsage,
+    MTLCommandEncoder, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLDrawable,
+    MTLGPUFamily, MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLRenderPassDescriptor,
+    MTLResidencySet, MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture,
+    MTLTextureDescriptor, MTLTextureUsage,
 };
 use objc2_quartz_core::{CALayer, CAMetalDrawable, CAMetalLayer, CATransaction};
 use raw_window_handle::HasWindowHandle;
@@ -680,6 +681,204 @@ impl MetalRenderer {
         )
     }
 
+    /// Sizes the layer's drawables for a `width x height` frame.
+    fn fit_drawable(&self, width: u32, height: u32) {
+        if self.drawable_size.get() != (width, height) {
+            // A render thread has no run loop to commit an implicit
+            // transaction (ft-yccm0.4.1.2): change the size in an explicit
+            // one, without the implicit resize animation.
+            CATransaction::begin();
+            CATransaction::setDisableActions(true);
+            self.layer
+                .setDrawableSize(CGSize::new(f64::from(width), f64::from(height)));
+            CATransaction::commit();
+            self.drawable_size.set((width, height));
+        }
+    }
+
+    /// Renders one window frame (ft-yccm0.4.6): every pane of `frame` at its
+    /// rectangle and every fill, in one command buffer and render pass. Each
+    /// pane uploads only the rows it changed since the frame slot last held
+    /// it, so an unchanged pane costs no upload. Does not wait for the GPU.
+    pub fn render_window(
+        &self,
+        width: u32,
+        height: u32,
+        frame: &WindowFrame<'_>,
+    ) -> Result<FrameOutcome, FrameError> {
+        self.render_window_with(width, height, frame, None)
+    }
+
+    /// [`Self::render_window`] into the drawable a display link handed
+    /// over (ft-yccm0.4.1.3).
+    pub fn render_window_into(
+        &self,
+        update: LinkUpdate,
+        width: u32,
+        height: u32,
+        frame: &WindowFrame<'_>,
+    ) -> Result<FrameOutcome, FrameError> {
+        self.render_window_with(width, height, frame, Some(update.drawable))
+    }
+
+    /// [`Self::render_window`] into an offscreen `width x height` texture,
+    /// returning its bytes (BGRA8, row-major, tightly packed). Waits for the
+    /// GPU and presents nothing.
+    pub fn snapshot_window(
+        &self,
+        width: u32,
+        height: u32,
+        frame: &WindowFrame<'_>,
+    ) -> Result<Vec<u8>, FrameError> {
+        frame.check()?;
+        let target = self.frames.borrow().offscreen_target(width, height)?;
+        let failed_before = self.submission.failed_frames();
+        let result = self
+            .encode_window_frame(width, height, frame, &target, None)
+            .and_then(|()| {
+                self.frames.borrow().finish_offscreen(
+                    &self.submission,
+                    failed_before,
+                    &self.device.queue,
+                    &target,
+                    width,
+                    height,
+                )
+            });
+        self.frames.borrow().release_offscreen_target(&target);
+        result
+    }
+
+    fn render_window_with(
+        &self,
+        width: u32,
+        height: u32,
+        frame: &WindowFrame<'_>,
+        provided: Option<Retained<ProtocolObject<dyn CAMetalDrawable>>>,
+    ) -> Result<FrameOutcome, FrameError> {
+        frame.check()?;
+        if width == 0 || height == 0 {
+            return Ok(FrameOutcome::ZeroSize);
+        }
+        self.fit_drawable(width, height);
+        if let Some(drawable) = &provided {
+            let texture = drawable.texture();
+            if (texture.width(), texture.height()) != (width as usize, height as usize) {
+                return Ok(FrameOutcome::DrawableResized);
+            }
+        }
+        let drawable = match provided {
+            Some(drawable) => drawable,
+            None => self
+                .layer
+                .nextDrawable()
+                .ok_or(FrameError::DrawableUnavailable)?,
+        };
+        self.encode_window_frame(
+            width,
+            height,
+            frame,
+            &drawable.texture(),
+            Some(ProtocolObject::from_ref(&*drawable)),
+        )?;
+        Ok(FrameOutcome::Presented)
+    }
+
+    /// Uploads `frame`'s panes into the next frame slot, writes one uniform
+    /// block per draw, and encodes and commits the frame into `target`.
+    fn encode_window_frame(
+        &self,
+        width: u32,
+        height: u32,
+        frame: &WindowFrame<'_>,
+        target: &ProtocolObject<dyn MTLTexture>,
+        drawable: Option<&ProtocolObject<dyn MTLDrawable>>,
+    ) -> Result<(), FrameError> {
+        let retired_before = self.frames.borrow().ring().retired_before();
+        self.atlases.borrow_mut().collect_retired(retired_before);
+        // The slot's own grid buffers are not used by a window frame.
+        let lease =
+            self.frames
+                .borrow_mut()
+                .begin_frame(GridExtent::new(1, 1), 0, FRAME_SLOT_TIMEOUT)?;
+        let mut instances = Vec::with_capacity(frame.panes.len());
+        {
+            let mut frames = self.frames.borrow_mut();
+            frames.begin_window_uploads();
+            for pane in frame.panes {
+                instances.push(frames.upload_pane(
+                    &lease,
+                    pane.key,
+                    pane.cells,
+                    pane.text.map(|(text, _)| text),
+                )?);
+            }
+            frames.retire_panes(lease.frame());
+        }
+        let placed = window_blocks(frame, lease.frame(), width, height);
+        let blocks: Vec<[u8; UNIFORMS_BYTES]> = placed.iter().map(|draw| draw.bytes).collect();
+        self.frames.borrow_mut().write_window(&lease, &blocks)?;
+        let frames = self.frames.borrow();
+        let slot = lease.slot();
+        let missing = || FrameError::AllocationFailed {
+            what: "window frame buffers",
+            bytes: 0,
+        };
+        let buffers = frames.window_buffers(slot).ok_or_else(missing)?;
+        let mut draws = Vec::with_capacity(placed.len());
+        for (block, placement) in placed.iter().enumerate() {
+            let draw = match placement.pane {
+                Some(index) => {
+                    let scene = &frame.panes[index];
+                    let buffer = |kind| {
+                        frames
+                            .pane_buffer(slot, scene.key, kind)
+                            .ok_or_else(missing)
+                    };
+                    let text = match scene.text {
+                        Some(_) => Some(PaneTextDraw {
+                            cell_text: buffer(SlotBuffer::CellText)?,
+                            row_table: buffer(SlotBuffer::RowTable)?,
+                            instances: instances[index],
+                        }),
+                        None => None,
+                    };
+                    WindowDraw {
+                        uniforms_offset: block * UNIFORMS_BYTES,
+                        scissor: placement.rect,
+                        cells: buffer(SlotBuffer::CellBg)?,
+                        text,
+                    }
+                }
+                None => WindowDraw {
+                    uniforms_offset: block * UNIFORMS_BYTES,
+                    scissor: placement.rect,
+                    cells: buffers.fill,
+                    text: None,
+                },
+            };
+            draws.push(draw);
+        }
+        let atlases = self.atlases.borrow();
+        self.submission.encode_window(
+            &frames,
+            lease,
+            &EncodedWindow {
+                target,
+                drawable,
+                color: frame.clear,
+                uniforms: buffers.uniforms,
+                background: &self.background,
+                text: TextDraw {
+                    pipeline: &self.text,
+                    atlases: &atlases,
+                    instances: 0,
+                },
+                draws: &draws,
+            },
+        )
+    }
+
     // One parameter per frame input; a struct would only rename them.
     #[allow(clippy::too_many_arguments)]
     fn render(
@@ -695,17 +894,7 @@ impl MetalRenderer {
         if width == 0 || height == 0 {
             return Ok(FrameOutcome::ZeroSize);
         }
-        if self.drawable_size.get() != (width, height) {
-            // A render thread has no run loop to commit an implicit
-            // transaction (ft-yccm0.4.1.2): change the size in an explicit
-            // one, without the implicit resize animation.
-            CATransaction::begin();
-            CATransaction::setDisableActions(true);
-            self.layer
-                .setDrawableSize(CGSize::new(f64::from(width), f64::from(height)));
-            CATransaction::commit();
-            self.drawable_size.set((width, height));
-        }
+        self.fit_drawable(width, height);
         if let Some(drawable) = &provided {
             // A display link's drawable from before a resize would show
             // this frame stretched: skip it, before leasing a frame slot.
@@ -771,6 +960,76 @@ impl MetalRenderer {
         )?;
         Ok(FrameOutcome::Presented)
     }
+}
+
+/// One draw of a window frame, placed: its uniform block, its scissor, and
+/// the index of its pane, or `None` for a fill.
+struct PlacedBlock {
+    bytes: [u8; UNIFORMS_BYTES],
+    rect: crate::PixelRect,
+    pane: Option<usize>,
+}
+
+/// The uniform blocks of `frame`'s panes, then of its fills, in draw order;
+/// whatever lies wholly outside the `width x height` drawable is left out.
+// Fill rectangles are drawable pixel sizes, exact in f32.
+#[allow(clippy::cast_precision_loss)]
+fn window_blocks(
+    frame: &WindowFrame<'_>,
+    frame_index: u64,
+    width: u32,
+    height: u32,
+) -> Vec<PlacedBlock> {
+    let viewport = [width, height];
+    let mut placed = Vec::with_capacity(frame.panes.len() + frame.fills.len());
+    for (index, pane) in frame.panes.iter().enumerate() {
+        let Some(rect) = pane.rect.within(width, height) else {
+            continue;
+        };
+        let uniforms = FrameUniforms {
+            frame: frame_index,
+            viewport,
+            grid: pane.cells.extent(),
+            clear: pane.clear.to_f32(),
+            background: BackgroundUniforms {
+                row_offset: pane.cells.row_offset(),
+                ..pane.background
+            },
+            text: pane
+                .text
+                .map_or_else(TextUniforms::default, |(_, text)| text),
+        };
+        placed.push(PlacedBlock {
+            bytes: uniforms.to_bytes_with_hsb(pane.hsb),
+            rect,
+            pane: Some(index),
+        });
+    }
+    for fill in frame.fills {
+        let Some(rect) = fill.rect.within(width, height) else {
+            continue;
+        };
+        // One cell the size of the rectangle, without a color of its own:
+        // the background pass fills it with the clear color.
+        let uniforms = FrameUniforms {
+            frame: frame_index,
+            viewport,
+            grid: GridExtent::new(1, 1),
+            clear: fill.color.to_f32(),
+            background: BackgroundUniforms {
+                cell_size: [rect.width as f32, rect.height as f32],
+                grid_origin: [rect.x as f32, rect.y as f32],
+                ..BackgroundUniforms::default()
+            },
+            text: TextUniforms::default(),
+        };
+        placed.push(PlacedBlock {
+            bytes: uniforms.to_bytes(),
+            rect,
+            pane: None,
+        });
+    }
+    placed
 }
 
 /// One color attachment that clears `texture` to `color` and stores it.

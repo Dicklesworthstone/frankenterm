@@ -5,7 +5,7 @@
 use crate::{
     AtlasError, AtlasKind, AtlasSlot, BackgroundUniforms, CellBgGrid, ClearColor,
     DeviceCapabilities, FrameError, FrameOutcome, FrameScene, FrameStats, GridExtent,
-    MetalUnavailable, SubmissionPath,
+    MetalUnavailable, SubmissionPath, WindowFrame,
 };
 use raw_window_handle::HasWindowHandle;
 
@@ -161,6 +161,34 @@ impl MetalRenderer {
 
     #[must_use]
     pub fn display_link(&self) -> Option<MetalDisplayLink> {
+        match *self {}
+    }
+
+    pub fn render_window(
+        &self,
+        _width: u32,
+        _height: u32,
+        _frame: &WindowFrame<'_>,
+    ) -> Result<FrameOutcome, FrameError> {
+        match *self {}
+    }
+
+    pub fn render_window_into(
+        &self,
+        _update: LinkUpdate,
+        _width: u32,
+        _height: u32,
+        _frame: &WindowFrame<'_>,
+    ) -> Result<FrameOutcome, FrameError> {
+        match *self {}
+    }
+
+    pub fn snapshot_window(
+        &self,
+        _width: u32,
+        _height: u32,
+        _frame: &WindowFrame<'_>,
+    ) -> Result<Vec<u8>, FrameError> {
         match *self {}
     }
 

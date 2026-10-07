@@ -235,11 +235,26 @@ impl FrameUniforms {
     /// | 160 | `underline_position: float` |
     /// | 164 | `line_thickness: float` |
     /// | 168 | `strikethrough_position: float` |
+    /// | 176 | `hsb: float4`, see [`Self::to_bytes_with_hsb`] |
     ///
     /// Everything else is zero, up to [`UNIFORMS_BYTES`].
     #[must_use]
     pub fn to_bytes(&self) -> [u8; UNIFORMS_BYTES] {
+        self.to_bytes_with_hsb(None)
+    }
+
+    /// [`Self::to_bytes`] for a pane drawn with inactive-pane dimming
+    /// (ft-yccm0.4.6): `hsb` multiplies every color's hue, saturation and
+    /// brightness, as the WebGpu renderer's `inactive_pane_hsb` does
+    /// ([`crate::apply_hsb`] is the CPU reference). It is stored at offset
+    /// 176 with `w = 1`; without it the field stays zero, which the shaders
+    /// read as no transform.
+    #[must_use]
+    pub fn to_bytes_with_hsb(&self, hsb: Option<[f32; 3]>) -> [u8; UNIFORMS_BYTES] {
         let mut bytes = [0u8; UNIFORMS_BYTES];
+        if let Some([hue, saturation, brightness]) = hsb {
+            put_f32s(&mut bytes, 176, &[hue, saturation, brightness, 1.0]);
+        }
         bytes[0..8].copy_from_slice(&self.frame.to_le_bytes());
         put_u32(&mut bytes, 8, self.viewport[0]);
         put_u32(&mut bytes, 12, self.viewport[1]);
@@ -772,6 +787,7 @@ mod tests {
             ("selection_tint", 112),
             ("search_tint", 128),
             ("current_tint", 144),
+            ("hsb", 176),
         ] {
             let declaration = format!(" {field};");
             let line = BACKGROUND_SHADER
@@ -822,6 +838,7 @@ mod tests {
             ("underline_position", 160),
             ("line_thickness", 164),
             ("strikethrough_position", 168),
+            ("hsb", 176),
         ] {
             let declaration = format!(" {field};");
             let line = TEXT_SHADER
@@ -833,6 +850,25 @@ mod tests {
                 "{field} is at {offset}: {line}"
             );
         }
+    }
+
+    /// ft-yccm0.4.6: inactive-pane dimming is stored at 176 with `w = 1`;
+    /// without it the block is byte-for-byte what `to_bytes` writes.
+    #[test]
+    fn hsb_dimming_is_flagged_at_its_offset_and_absent_by_default() {
+        let uniforms = FrameUniforms {
+            viewport: [640, 480],
+            ..FrameUniforms::default()
+        };
+        assert_eq!(uniforms.to_bytes_with_hsb(None), uniforms.to_bytes());
+        let bytes = uniforms.to_bytes_with_hsb(Some([1.0, 0.8, 0.7]));
+        let f32_at = |at: usize| f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        assert_eq!(
+            [f32_at(176), f32_at(180), f32_at(184), f32_at(188)],
+            [1.0, 0.8, 0.7, 1.0]
+        );
+        assert_eq!(bytes[..176], uniforms.to_bytes()[..176]);
+        assert!(bytes[192..].iter().all(|&byte| byte == 0));
     }
 
     #[test]

@@ -13,13 +13,14 @@ use crate::cell_bg::{BACKGROUND_SHADER, BackgroundUniforms, CellBgGrid};
 use crate::cell_text::{CellTextGrid, TEXT_SHADER, TextUniforms, atlas_texture_index};
 use crate::frame::{
     CELL_TEXT_INSTANCE_BYTES, FRAME_SLOTS, FrameUniforms, GridExtent, ROW_TABLE_BYTES_PER_ROW,
-    SlotBuffer, SlotLease, SlotRing, SlotSizes, grown_capacity,
+    SlotBuffer, SlotLease, SlotRing, SlotSizes, UNIFORMS_BYTES, grown_capacity,
 };
 use crate::macos_atlas::GlyphAtlases;
 use crate::uploads::{SlotUploads, UploadPlan, row_table_entry, text_region};
 use crate::{ClearColor, FRAME_SLOT_TIMEOUT, FrameError, MAX_TEXTURE_EXTENT, SubmissionPath};
 use block2::RcBlock;
 use frankenterm_alloc::resource_ledger::{GpuBufferPurpose, GpuResourceGuard, GpuResourceLedger};
+use objc2::Message;
 use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::sel;
@@ -33,11 +34,12 @@ use objc2_metal::{
     MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder,
     MTLRenderPassColorAttachmentDescriptor, MTLRenderPassColorAttachmentDescriptorArray,
     MTLRenderPassDescriptor, MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLRenderStages,
-    MTLResidencySet, MTLResidencySetDescriptor, MTLResource, MTLResourceOptions, MTLSize,
-    MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
+    MTLResidencySet, MTLResidencySetDescriptor, MTLResource, MTLResourceOptions, MTLScissorRect,
+    MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
 use objc2_quartz_core::CAMetalLayer;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -96,6 +98,55 @@ pub(crate) struct FrameSlots {
     /// Bytes the last frame uploaded into its slot, and since creation.
     upload_bytes_last: u64,
     upload_bytes_total: u64,
+    /// Each pane's own buffers in every slot, by pane key (ft-yccm0.4.6).
+    panes: HashMap<u64, PaneBuffers>,
+    /// Per slot: the window frame's uniform blocks and fill cell.
+    window: Vec<WindowSlot>,
+}
+
+/// Frames a pane may go undrawn (a tab switched away, say) before its
+/// buffers are freed: about five seconds at 120 Hz.
+const PANE_RETIRE_FRAMES: u64 = 600;
+
+/// The buffers of a pane in a window frame that live in a pane's own
+/// allocations, in [`PaneSlot::buffers`] order.
+const PANE_BUFFERS: [SlotBuffer; 3] = [
+    SlotBuffer::CellBg,
+    SlotBuffer::CellText,
+    SlotBuffer::RowTable,
+];
+
+/// Position of `kind` in [`PANE_BUFFERS`].
+fn pane_buffer_index(kind: SlotBuffer) -> usize {
+    PANE_BUFFERS
+        .iter()
+        .position(|buffer| *buffer == kind)
+        .unwrap_or_else(|| unreachable!("{} is not a pane buffer", kind.as_str()))
+}
+
+/// One pane's buffers in one slot (ft-yccm0.4.6), and what they hold.
+struct PaneSlot {
+    buffers: Vec<SlotAllocation>,
+    generation: u64,
+    uploads: SlotUploads,
+}
+
+/// One pane's buffers in every slot. Retired once no frame that drew the
+/// pane can still be in flight.
+struct PaneBuffers {
+    slots: Vec<Option<PaneSlot>>,
+    /// The last frame that drew the pane.
+    last_frame: u64,
+}
+
+/// A slot's window-frame buffers (ft-yccm0.4.6), allocated on first use.
+#[derive(Default)]
+struct WindowSlot {
+    /// One [`FrameUniforms`] block per draw, each [`UNIFORMS_BYTES`] apart.
+    uniforms: Option<SlotAllocation>,
+    /// One CellBg cell without a color, so a fill shows its uniforms' clear
+    /// color.
+    fill: Option<SlotAllocation>,
 }
 
 impl FrameSlots {
@@ -117,6 +168,8 @@ impl FrameSlots {
             allocations: 0,
             upload_bytes_last: 0,
             upload_bytes_total: 0,
+            panes: HashMap::new(),
+            window: (0..FRAME_SLOTS).map(|_| WindowSlot::default()).collect(),
         };
         for index in 0..FRAME_SLOTS {
             let mut buffers = Vec::with_capacity(SlotBuffer::ALL.len());
@@ -241,18 +294,36 @@ impl FrameSlots {
         offset: usize,
         bytes: &[u8],
     ) -> Result<(), FrameError> {
+        self.write_into(
+            lease,
+            self.buffer(lease.slot(), kind),
+            kind.as_str(),
+            offset,
+            bytes,
+        )
+    }
+
+    /// Copies `bytes` into `buffer`, one of the leased slot's buffers (its
+    /// own, or a pane's or window frame's in that slot), at `offset`.
+    fn write_into(
+        &self,
+        lease: &SlotLease,
+        buffer: &ProtocolObject<dyn MTLBuffer>,
+        label: &'static str,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), FrameError> {
         assert!(
             lease.is_from(&self.ring),
             "a slot lease from another renderer's ring"
         );
-        let buffer = self.buffer(lease.slot(), kind);
         let capacity = buffer.length();
         if offset
             .checked_add(bytes.len())
             .is_none_or(|end| end > capacity)
         {
             return Err(FrameError::SlotWriteOutOfBounds {
-                buffer: kind.as_str(),
+                buffer: label,
                 offset,
                 len: bytes.len(),
                 capacity,
@@ -262,10 +333,12 @@ impl FrameSlots {
         #[allow(unsafe_code)]
         // SAFETY: BUFFER-WRITE. `lease` comes from this ring (asserted), so
         // its slot is not in flight: the GPU finished the last frame that read
-        // this buffer before the lease was granted. The buffer is shared
-        // (CPU-visible) storage of `capacity` bytes, and offset + len was
-        // checked to be within it. `bytes` is ordinary Rust memory, which
-        // cannot overlap the Metal allocation.
+        // this buffer before the lease was granted. Every caller passes one of
+        // the leased slot's buffers (its own, or a pane's or the window
+        // frame's for that slot), which only frames on that slot read. The
+        // buffer is shared (CPU-visible) storage of `capacity` bytes, and
+        // offset + len was checked to be within it. `bytes` is ordinary Rust
+        // memory, which cannot overlap the Metal allocation.
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), destination, bytes.len());
         }
@@ -359,6 +432,291 @@ impl FrameSlots {
         (self.upload_bytes_last, self.upload_bytes_total)
     }
 
+    /// Starts a window frame's uploads: its panes add up into
+    /// [`Self::upload_bytes`].
+    pub(crate) fn begin_window_uploads(&mut self) {
+        self.upload_bytes_last = 0;
+    }
+
+    /// [`Self::upload`] for one pane of a window frame (ft-yccm0.4.6): fits
+    /// the pane's own buffers in the leased slot, allocating them on its
+    /// first frame there, and copies what `cells` and `text` changed since
+    /// that slot last held the pane. An unchanged pane copies nothing.
+    /// Returns how many instances its text draw covers.
+    pub(crate) fn upload_pane(
+        &mut self,
+        lease: &SlotLease,
+        key: u64,
+        cells: &CellBgGrid,
+        text: Option<&CellTextGrid>,
+    ) -> Result<usize, FrameError> {
+        assert!(
+            lease.is_from(&self.ring),
+            "a slot lease from another renderer's ring"
+        );
+        let mut pane = self.panes.remove(&key).unwrap_or_else(|| PaneBuffers {
+            slots: (0..FRAME_SLOTS).map(|_| None).collect(),
+            last_frame: lease.frame(),
+        });
+        pane.last_frame = lease.frame();
+        let result = self.upload_into_pane(lease, &mut pane, cells, text);
+        self.panes.insert(key, pane);
+        result
+    }
+
+    fn upload_into_pane(
+        &mut self,
+        lease: &SlotLease,
+        pane: &mut PaneBuffers,
+        cells: &CellBgGrid,
+        text: Option<&CellTextGrid>,
+    ) -> Result<usize, FrameError> {
+        let slot = lease.slot();
+        let grid = cells.extent();
+        if pane.slots[slot].is_none() {
+            let sizes = sizes_for(grid)?;
+            let mut buffers = Vec::with_capacity(PANE_BUFFERS.len());
+            for kind in PANE_BUFFERS {
+                buffers.push(self.allocate_resident(
+                    kind,
+                    grown_capacity(0, sizes.bytes(kind)),
+                    slot,
+                )?);
+            }
+            self.commit_residency();
+            pane.slots[slot] = Some(PaneSlot {
+                buffers,
+                generation: 0,
+                uploads: SlotUploads::default(),
+            });
+        }
+        let Some(pane_slot) = pane.slots[slot].as_mut() else {
+            unreachable!("the pane's slot was just filled");
+        };
+        let mut plan = pane_slot
+            .uploads
+            .plan(Some(cells), text, pane_slot.generation);
+        let sizes =
+            SlotSizes::for_frame(grid, plan.instances(grid)).ok_or(FrameError::GridTooLarge {
+                rows: grid.rows,
+                cols: grid.cols,
+            })?;
+        if self.fit_pane_slot(pane_slot, &sizes, slot)? {
+            // The buffers were replaced: they hold nothing yet.
+            pane_slot.uploads.invalidate();
+            plan = pane_slot
+                .uploads
+                .plan(Some(cells), text, pane_slot.generation);
+        }
+        if let Err(err) = self.write_pane_plan(lease, pane_slot, &plan, cells, text) {
+            pane_slot.uploads.invalidate();
+            return Err(err);
+        }
+        let bytes = plan.bytes(grid);
+        self.upload_bytes_last = self.upload_bytes_last.saturating_add(bytes);
+        self.upload_bytes_total = self.upload_bytes_total.saturating_add(bytes);
+        Ok(text.map_or(0, |_| plan.instances(grid)))
+    }
+
+    /// A slot buffer added to the residency set (committed by the caller).
+    fn allocate_resident(
+        &mut self,
+        kind: SlotBuffer,
+        bytes: usize,
+        slot: usize,
+    ) -> Result<SlotAllocation, FrameError> {
+        let allocation = self.allocate(kind, bytes, slot)?;
+        if let Some(set) = &self.residency {
+            set.addAllocation(ProtocolObject::from_ref(&*allocation.buffer));
+        }
+        Ok(allocation)
+    }
+
+    fn commit_residency(&self) {
+        if let Some(set) = &self.residency {
+            set.commit();
+        }
+    }
+
+    /// Grows a pane's buffers in `slot` that are too small for `sizes`, as
+    /// [`Self::fit_slot`] does for the slot's own. True when one was
+    /// replaced.
+    fn fit_pane_slot(
+        &mut self,
+        pane: &mut PaneSlot,
+        sizes: &SlotSizes,
+        slot: usize,
+    ) -> Result<bool, FrameError> {
+        let mut grown = false;
+        for kind in PANE_BUFFERS {
+            let index = pane_buffer_index(kind);
+            let current = pane.buffers[index].buffer.length();
+            let capacity = grown_capacity(current, sizes.bytes(kind));
+            if capacity == current {
+                continue;
+            }
+            let replacement = self.allocate_resident(kind, capacity, slot)?;
+            let old = std::mem::replace(&mut pane.buffers[index], replacement);
+            if let Some(set) = &self.residency {
+                set.removeAllocation(ProtocolObject::from_ref(&*old.buffer));
+            }
+            grown = true;
+        }
+        if grown {
+            pane.generation += 1;
+            self.commit_residency();
+        }
+        Ok(grown)
+    }
+
+    /// [`Self::write_plan`] into a pane's buffers in the leased slot.
+    fn write_pane_plan(
+        &self,
+        lease: &SlotLease,
+        pane: &PaneSlot,
+        plan: &UploadPlan,
+        cells: &CellBgGrid,
+        text: Option<&CellTextGrid>,
+    ) -> Result<(), FrameError> {
+        let buffer = |kind| &*pane.buffers[pane_buffer_index(kind)].buffer;
+        let row = cells.extent().cols as usize * 4;
+        for &ring in &plan.cell_rows {
+            let ring = ring as usize;
+            self.write_into(
+                lease,
+                buffer(SlotBuffer::CellBg),
+                "pane cell_bg",
+                ring * row,
+                cells.ring_row_bytes(ring),
+            )?;
+        }
+        if let Some(text) = text {
+            let region = plan.capacity as usize * CELL_TEXT_INSTANCE_BYTES;
+            let mut bytes = Vec::with_capacity(region);
+            for &ring in &plan.text_rows {
+                let ring = ring as usize;
+                bytes.clear();
+                text_region(text, ring, plan.capacity, &mut bytes);
+                self.write_into(
+                    lease,
+                    buffer(SlotBuffer::CellText),
+                    "pane cell_text",
+                    ring * region,
+                    &bytes,
+                )?;
+                self.write_into(
+                    lease,
+                    buffer(SlotBuffer::RowTable),
+                    "pane row_table",
+                    ring * ROW_TABLE_BYTES_PER_ROW,
+                    &row_table_entry(text, ring, plan.capacity),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes a window frame's uniform blocks, one per draw, into the leased
+    /// slot's window uniforms, growing them as needed, and readies the
+    /// slot's fill cell (ft-yccm0.4.6).
+    pub(crate) fn write_window(
+        &mut self,
+        lease: &SlotLease,
+        blocks: &[[u8; UNIFORMS_BYTES]],
+    ) -> Result<(), FrameError> {
+        assert!(
+            lease.is_from(&self.ring),
+            "a slot lease from another renderer's ring"
+        );
+        let slot = lease.slot();
+        let needed = blocks.len().max(1) * UNIFORMS_BYTES;
+        let current = self.window[slot]
+            .uniforms
+            .as_ref()
+            .map_or(0, |allocation| allocation.buffer.length());
+        let capacity = grown_capacity(current, needed);
+        if capacity != current {
+            let replacement = self.allocate_resident(SlotBuffer::Uniforms, capacity, slot)?;
+            if let Some(old) = self.window[slot].uniforms.replace(replacement)
+                && let Some(set) = &self.residency
+            {
+                set.removeAllocation(ProtocolObject::from_ref(&*old.buffer));
+            }
+            self.commit_residency();
+        }
+        if self.window[slot].fill.is_none() {
+            let fill = self.allocate_resident(SlotBuffer::CellBg, grown_capacity(0, 4), slot)?;
+            self.commit_residency();
+            self.window[slot].fill = Some(fill);
+        }
+        let (Some(uniforms), Some(fill)) = (
+            self.window[slot].uniforms.as_ref(),
+            self.window[slot].fill.as_ref(),
+        ) else {
+            unreachable!("the window buffers were just allocated");
+        };
+        // An uncolored cell: a fill shows its uniforms' clear color.
+        self.write_into(lease, &fill.buffer, "window fill", 0, &[0; 4])?;
+        for (index, block) in blocks.iter().enumerate() {
+            self.write_into(
+                lease,
+                &uniforms.buffer,
+                "window uniforms",
+                index * UNIFORMS_BYTES,
+                block,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// A pane's `kind` buffer in `slot`, once the pane was uploaded there.
+    pub(crate) fn pane_buffer(
+        &self,
+        slot: usize,
+        key: u64,
+        kind: SlotBuffer,
+    ) -> Option<&ProtocolObject<dyn MTLBuffer>> {
+        let pane = self.panes.get(&key)?.slots[slot].as_ref()?;
+        Some(&pane.buffers[pane_buffer_index(kind)].buffer)
+    }
+
+    /// The window frame's uniforms and fill cell in `slot`, once written.
+    pub(crate) fn window_buffers(&self, slot: usize) -> Option<WindowBuffers<'_>> {
+        let window = &self.window[slot];
+        Some(WindowBuffers {
+            uniforms: &window.uniforms.as_ref()?.buffer,
+            fill: &window.fill.as_ref()?.buffer,
+        })
+    }
+
+    /// Frees the buffers of panes no frame drew for [`PANE_RETIRE_FRAMES`]
+    /// frames, once no frame that drew them can still be in flight.
+    pub(crate) fn retire_panes(&mut self, frame: u64) {
+        let retired_before = self.ring.retired_before();
+        let stale: Vec<u64> = self
+            .panes
+            .iter()
+            .filter(|(_, pane)| {
+                pane.last_frame < retired_before
+                    && pane.last_frame.saturating_add(PANE_RETIRE_FRAMES) < frame
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        for key in stale {
+            if let Some(pane) = self.panes.remove(&key)
+                && let Some(set) = &self.residency
+            {
+                for allocation in pane.slots.iter().flatten().flat_map(|slot| &slot.buffers) {
+                    set.removeAllocation(ProtocolObject::from_ref(&*allocation.buffer));
+                }
+            }
+        }
+        self.commit_residency();
+    }
+
     pub(crate) fn buffer(&self, slot: usize, kind: SlotBuffer) -> &ProtocolObject<dyn MTLBuffer> {
         &self.slots[slot].buffers[kind.index()].buffer
     }
@@ -392,7 +750,20 @@ impl FrameSlots {
         readback: &ProtocolObject<dyn MTLCommandQueue>,
         request: &OffscreenCells<'_>,
     ) -> Result<Vec<u8>, FrameError> {
-        let (width, height) = (request.width, request.height);
+        let target = self.offscreen_target(request.width, request.height)?;
+        let result = self.render_offscreen_into(submission, pipeline, readback, request, &target);
+        self.release_offscreen_target(&target);
+        result
+    }
+
+    /// A `width x height` BGRA8 render target in private storage for an
+    /// offscreen frame, resident for Metal 4 until
+    /// [`Self::release_offscreen_target`].
+    pub(crate) fn offscreen_target(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>, FrameError> {
         if !(1..=MAX_TEXTURE_EXTENT).contains(&width) || !(1..=MAX_TEXTURE_EXTENT).contains(&height)
         {
             return Err(FrameError::InvalidExtent { width, height });
@@ -422,12 +793,38 @@ impl FrameSlots {
             set.addAllocation(ProtocolObject::from_ref(&*target));
             set.commit();
         }
-        let result = self.render_offscreen_into(submission, pipeline, readback, request, &target);
+        Ok(target)
+    }
+
+    pub(crate) fn release_offscreen_target(&self, target: &ProtocolObject<dyn MTLTexture>) {
         if let Some(set) = &self.residency {
-            set.removeAllocation(ProtocolObject::from_ref(&*target));
+            set.removeAllocation(ProtocolObject::from_ref(target));
             set.commit();
         }
-        result
+    }
+
+    /// Waits for the offscreen frame just submitted, then reads `target`
+    /// back: BGRA8, row-major, tightly packed.
+    pub(crate) fn finish_offscreen(
+        &self,
+        submission: &Submission,
+        failed_before: u64,
+        readback: &ProtocolObject<dyn MTLCommandQueue>,
+        target: &ProtocolObject<dyn MTLTexture>,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, FrameError> {
+        if !self.ring.wait_idle(OFFSCREEN_TIMEOUT) {
+            return Err(FrameError::CommandFailed {
+                detail: "the offscreen frame did not finish".to_string(),
+            });
+        }
+        if submission.failed_frames() != failed_before {
+            return Err(FrameError::CommandFailed {
+                detail: "the offscreen frame finished in error".to_string(),
+            });
+        }
+        read_texture_bgra(&self.device, readback, target, width, height)
     }
 
     fn render_offscreen_into(
@@ -675,6 +1072,11 @@ pub(crate) struct Metal4Submission {
     bound: Vec<Cell<Option<u64>>>,
     passes: Vec<Retained<MTL4RenderPassDescriptor>>,
     failed: Arc<AtomicU64>,
+    /// Creates a window frame's argument tables.
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
+    /// Per slot, one argument table per draw of a window frame
+    /// (ft-yccm0.4.6), created as frames need them and reused.
+    window_tables: Vec<ArgumentTablePool>,
 }
 
 impl Submission {
@@ -718,10 +1120,7 @@ impl Submission {
         let mut allocators = Vec::with_capacity(FRAME_SLOTS);
         let mut command_buffers = Vec::with_capacity(FRAME_SLOTS);
         let mut argument_tables = Vec::with_capacity(FRAME_SLOTS);
-        let table_descriptor = MTL4ArgumentTableDescriptor::new();
-        table_descriptor.setMaxBufferBindCount(SlotBuffer::ALL.len());
-        // The text pass's grayscale and color atlases (ft-yccm0.4.2.3).
-        table_descriptor.setMaxTextureBindCount(AtlasKind::ALL.len());
+        let table_descriptor = argument_table_descriptor();
         for _ in 0..FRAME_SLOTS {
             allocators.push(
                 device
@@ -751,6 +1150,10 @@ impl Submission {
                 .map(|_| MTL4RenderPassDescriptor::new())
                 .collect(),
             failed: Arc::new(AtomicU64::new(0)),
+            device: device.retain(),
+            window_tables: (0..FRAME_SLOTS)
+                .map(|_| std::cell::RefCell::new(Vec::new()))
+                .collect(),
         }))
     }
 
@@ -825,6 +1228,27 @@ impl Submission {
             Self::Metal4(metal4) => metal4.encode_frame(frames, lease, &frame),
         }
     }
+
+    /// Encodes one window frame into the leased slot and commits it
+    /// (ft-yccm0.4.6): one command buffer and one render pass, cleared to
+    /// `window.color`. Every draw's background pass runs under its scissor
+    /// rectangle with its own uniforms and CellBg buffer, then every pane's
+    /// text pass the same way. Presents the drawable when given.
+    pub(crate) fn encode_window(
+        &self,
+        frames: &FrameSlots,
+        lease: SlotLease,
+        window: &EncodedWindow<'_>,
+    ) -> Result<(), FrameError> {
+        assert!(
+            lease.is_from(frames.ring()),
+            "a slot lease from another renderer's ring"
+        );
+        match self {
+            Self::Metal3(metal3) => metal3.encode_window(lease, window),
+            Self::Metal4(metal4) => metal4.encode_window(lease, window),
+        }
+    }
 }
 
 /// What one frame draws, shared by both submission paths.
@@ -846,6 +1270,66 @@ pub(crate) struct TextDraw<'a> {
     pub(crate) pipeline: &'a TextPipeline,
     pub(crate) atlases: &'a GlyphAtlases,
     pub(crate) instances: usize,
+}
+
+/// One draw of a window frame (ft-yccm0.4.6): a pane, or a fill.
+pub(crate) struct WindowDraw<'a> {
+    /// The draw's [`FrameUniforms`] block in the slot's window uniforms.
+    pub(crate) uniforms_offset: usize,
+    /// Where it draws; inside the target.
+    pub(crate) scissor: crate::PixelRect,
+    pub(crate) cells: &'a ProtocolObject<dyn MTLBuffer>,
+    /// `None` for a fill.
+    pub(crate) text: Option<PaneTextDraw<'a>>,
+}
+
+/// A pane's text draw in a window frame: its CellText and RowTable
+/// buffers, and how many instances the draw covers.
+#[derive(Clone, Copy)]
+pub(crate) struct PaneTextDraw<'a> {
+    pub(crate) cell_text: &'a ProtocolObject<dyn MTLBuffer>,
+    pub(crate) row_table: &'a ProtocolObject<dyn MTLBuffer>,
+    pub(crate) instances: usize,
+}
+
+/// A window frame's uniforms and fill-cell buffers in one slot.
+pub(crate) struct WindowBuffers<'a> {
+    pub(crate) uniforms: &'a ProtocolObject<dyn MTLBuffer>,
+    pub(crate) fill: &'a ProtocolObject<dyn MTLBuffer>,
+}
+
+/// One slot's pool of Metal 4 argument tables for window draws.
+type ArgumentTablePool = std::cell::RefCell<Vec<Retained<ProtocolObject<dyn MTL4ArgumentTable>>>>;
+
+/// Everything one window frame encodes.
+pub(crate) struct EncodedWindow<'a> {
+    pub(crate) target: &'a ProtocolObject<dyn MTLTexture>,
+    pub(crate) drawable: Option<&'a ProtocolObject<dyn MTLDrawable>>,
+    pub(crate) color: ClearColor,
+    pub(crate) uniforms: &'a ProtocolObject<dyn MTLBuffer>,
+    pub(crate) background: &'a BackgroundPipeline,
+    pub(crate) text: TextDraw<'a>,
+    pub(crate) draws: &'a [WindowDraw<'a>],
+}
+
+/// The descriptor of every Metal 4 argument table: one binding per
+/// [`SlotBuffer`] and one per atlas.
+fn argument_table_descriptor() -> Retained<MTL4ArgumentTableDescriptor> {
+    let descriptor = MTL4ArgumentTableDescriptor::new();
+    descriptor.setMaxBufferBindCount(SlotBuffer::ALL.len());
+    // The text pass's grayscale and color atlases (ft-yccm0.4.2.3).
+    descriptor.setMaxTextureBindCount(AtlasKind::ALL.len());
+    descriptor
+}
+
+/// A scissor rectangle for `rect`.
+fn scissor(rect: crate::PixelRect) -> MTLScissorRect {
+    MTLScissorRect {
+        x: rect.x as usize,
+        y: rect.y as usize,
+        width: rect.width as usize,
+        height: rect.height as usize,
+    }
 }
 
 /// A render pipeline drawing into BGRA8Unorm, compiled from `source`;
@@ -1038,7 +1522,140 @@ impl Metal3Submission {
             }
         }
         encoder.endEncoding();
-        if let Some(drawable) = frame.drawable {
+        self.commit(&commands, lease, frame.drawable);
+        Ok(())
+    }
+
+    fn encode_window(
+        &self,
+        lease: SlotLease,
+        window: &EncodedWindow<'_>,
+    ) -> Result<(), FrameError> {
+        let slot = lease.slot();
+        let commands = self
+            .queue
+            .commandBuffer()
+            .ok_or(FrameError::CommandBufferUnavailable)?;
+        let pass = &self.passes[slot];
+        let attachment = color_attachment(&pass.colorAttachments());
+        configure_clear(&attachment, window.target, window.color);
+        let encoder = commands.renderCommandEncoderWithDescriptor(pass);
+        // The descriptor outlives the frame; it must not keep the drawable's
+        // texture alive.
+        attachment.setTexture(None);
+        let encoder = encoder.ok_or(FrameError::EncoderUnavailable)?;
+        encoder.setRenderPipelineState(&window.background.state);
+        for draw in window.draws {
+            encoder.setScissorRect(scissor(draw.scissor));
+            #[allow(unsafe_code)]
+            // SAFETY: FFI-DRAW. The leased slot's window uniforms, written for
+            // this frame, bound at the draw's block offset (a multiple of
+            // UNIFORMS_BYTES inside the buffer) at the shader's [[buffer(0)]].
+            unsafe {
+                encoder.setFragmentBuffer_offset_atIndex(
+                    Some(window.uniforms),
+                    draw.uniforms_offset,
+                    SlotBuffer::Uniforms.index(),
+                );
+            }
+            #[allow(unsafe_code)]
+            // SAFETY: FFI-DRAW. The draw's CellBg buffer (a pane's in the
+            // leased slot, sized for its grid, or the slot's fill cell), bound
+            // from offset 0 at the shader's [[buffer(1)]].
+            unsafe {
+                encoder.setFragmentBuffer_offset_atIndex(
+                    Some(draw.cells),
+                    0,
+                    SlotBuffer::CellBg.index(),
+                );
+            }
+            #[allow(unsafe_code)]
+            // SAFETY: FFI-DRAW. Three vertices of one triangle; bg_vertex
+            // derives positions from vertex_id and reads no vertex buffer.
+            unsafe {
+                encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+            }
+        }
+        let mut text_bound = false;
+        for draw in window.draws {
+            let Some(text) = draw.text.filter(|text| text.instances > 0) else {
+                continue;
+            };
+            if !text_bound {
+                encoder.setRenderPipelineState(&window.text.pipeline.state);
+                for kind in AtlasKind::ALL {
+                    #[allow(unsafe_code)]
+                    // SAFETY: FFI-DRAW. A live atlas texture that the atlases
+                    // keep until the frames that may sample it finish, bound
+                    // at the shader's [[texture(n)]]. Metal 3 retains bound
+                    // textures.
+                    unsafe {
+                        encoder.setFragmentTexture_atIndex(
+                            Some(window.text.atlases.texture(kind)),
+                            atlas_texture_index(kind),
+                        );
+                    }
+                }
+                text_bound = true;
+            }
+            encoder.setScissorRect(scissor(draw.scissor));
+            #[allow(unsafe_code)]
+            // SAFETY: FFI-DRAW. The leased slot's window uniforms at the
+            // draw's block offset, at the shader's [[buffer(0)]].
+            unsafe {
+                encoder.setVertexBuffer_offset_atIndex(
+                    Some(window.uniforms),
+                    draw.uniforms_offset,
+                    SlotBuffer::Uniforms.index(),
+                );
+            }
+            #[allow(unsafe_code)]
+            // SAFETY: FFI-DRAW. The pane's CellText buffer in the leased slot,
+            // fitted for `instances`, from offset 0 at [[buffer(2)]].
+            unsafe {
+                encoder.setVertexBuffer_offset_atIndex(
+                    Some(text.cell_text),
+                    0,
+                    SlotBuffer::CellText.index(),
+                );
+            }
+            #[allow(unsafe_code)]
+            // SAFETY: FFI-DRAW. The window uniforms at the draw's block
+            // offset, at the fragment shader's [[buffer(0)]].
+            unsafe {
+                encoder.setFragmentBuffer_offset_atIndex(
+                    Some(window.uniforms),
+                    draw.uniforms_offset,
+                    SlotBuffer::Uniforms.index(),
+                );
+            }
+            #[allow(unsafe_code)]
+            // SAFETY: FFI-DRAW. Four strip vertices per instance; text_vertex
+            // reads CellText only at instance_id < instances, all of which the
+            // pane's upload wrote into a buffer fitted for them.
+            unsafe {
+                encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
+                    MTLPrimitiveType::TriangleStrip,
+                    0,
+                    4,
+                    text.instances,
+                );
+            }
+        }
+        encoder.endEncoding();
+        self.commit(&commands, lease, window.drawable);
+        Ok(())
+    }
+
+    /// Presents `drawable` when given and commits `commands`, whose
+    /// completion handler frees the leased slot.
+    fn commit(
+        &self,
+        commands: &ProtocolObject<dyn MTLCommandBuffer>,
+        lease: SlotLease,
+        drawable: Option<&ProtocolObject<dyn MTLDrawable>>,
+    ) {
+        if let Some(drawable) = drawable {
             commands.presentDrawable(drawable);
         }
         let token = lease.submit();
@@ -1065,7 +1682,6 @@ impl Metal3Submission {
             commands.addCompletedHandler(RcBlock::as_ptr(&handler));
         }
         commands.commit();
-        Ok(())
     }
 }
 
@@ -1168,6 +1784,130 @@ impl Metal4Submission {
             }
         }
         encoder.endEncoding();
+        self.commit(slot, lease, drawable);
+        Ok(())
+    }
+
+    /// Points `table` at the buffer `address` for `kind`.
+    fn bind_address(table: &ProtocolObject<dyn MTL4ArgumentTable>, address: u64, kind: SlotBuffer) {
+        #[allow(unsafe_code)]
+        // SAFETY: FFI-ARGTABLE. Every caller passes the GPU address (plus an
+        // offset inside it) of a live buffer of the leased slot that the frame
+        // slots keep in the queue's residency set; the binding index is below
+        // the table's maxBufferBindCount of SlotBuffer::ALL.len().
+        unsafe {
+            table.setAddress_atIndex(address, kind.index());
+        }
+    }
+
+    fn encode_window(
+        &self,
+        lease: SlotLease,
+        window: &EncodedWindow<'_>,
+    ) -> Result<(), FrameError> {
+        let slot = lease.slot();
+        let mut tables = self.window_tables[slot].borrow_mut();
+        // One table per draw: no draw depends on when the encoder reads a
+        // table's bindings. The lease proves this slot's previous frame, the
+        // last to read them, completed.
+        while tables.len() < window.draws.len() {
+            let table = self
+                .device
+                .newArgumentTableWithDescriptor_error(&argument_table_descriptor())
+                .map_err(|_| FrameError::AllocationFailed {
+                    what: "argument table",
+                    bytes: 0,
+                })?;
+            tables.push(table);
+        }
+        let uniforms = window.uniforms.gpuAddress();
+        for (table, draw) in tables.iter().zip(window.draws) {
+            let offset = u64::try_from(draw.uniforms_offset).unwrap_or(u64::MAX);
+            Self::bind_address(table, uniforms + offset, SlotBuffer::Uniforms);
+            Self::bind_address(table, draw.cells.gpuAddress(), SlotBuffer::CellBg);
+            if let Some(text) = draw.text {
+                Self::bind_address(table, text.cell_text.gpuAddress(), SlotBuffer::CellText);
+                Self::bind_address(table, text.row_table.gpuAddress(), SlotBuffer::RowTable);
+                for kind in AtlasKind::ALL {
+                    #[allow(unsafe_code)]
+                    // SAFETY: FFI-ARGTABLE. A live atlas texture's resource
+                    // ID; the atlases keep it in their residency set, which
+                    // joined this queue, until the frames that may sample it
+                    // finished. The index is below maxTextureBindCount.
+                    unsafe {
+                        table.setTexture_atIndex(
+                            window.text.atlases.texture(kind).gpuResourceID(),
+                            atlas_texture_index(kind),
+                        );
+                    }
+                }
+            }
+        }
+        let commands = &self.command_buffers[slot];
+        // The lease proves this slot's previous frame completed, so its
+        // allocator's memory is free to reuse.
+        self.allocators[slot].reset();
+        commands.beginCommandBufferWithAllocator(&self.allocators[slot]);
+        let pass = &self.passes[slot];
+        let attachment = color_attachment(&pass.colorAttachments());
+        configure_clear(&attachment, window.target, window.color);
+        let encoder = commands.renderCommandEncoderWithDescriptor(pass);
+        attachment.setTexture(None);
+        let Some(encoder) = encoder else {
+            commands.endCommandBuffer();
+            return Err(FrameError::EncoderUnavailable);
+        };
+        let stages = MTLRenderStages::Vertex | MTLRenderStages::Fragment;
+        encoder.setRenderPipelineState(&window.background.state);
+        for (table, draw) in tables.iter().zip(window.draws) {
+            encoder.setArgumentTable_atStages(table, stages);
+            encoder.setScissorRect(scissor(draw.scissor));
+            #[allow(unsafe_code)]
+            // SAFETY: FFI-DRAW. Three vertices of one triangle; bg_vertex
+            // derives positions from vertex_id and reads no vertex buffer.
+            unsafe {
+                encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+            }
+        }
+        let mut text_bound = false;
+        for (table, draw) in tables.iter().zip(window.draws) {
+            let Some(text) = draw.text.filter(|text| text.instances > 0) else {
+                continue;
+            };
+            if !text_bound {
+                encoder.setRenderPipelineState(&window.text.pipeline.state);
+                text_bound = true;
+            }
+            encoder.setArgumentTable_atStages(table, stages);
+            encoder.setScissorRect(scissor(draw.scissor));
+            #[allow(unsafe_code)]
+            // SAFETY: FFI-DRAW. Four strip vertices per instance; text_vertex
+            // reads CellText only at instance_id < instances, all of which the
+            // pane's upload wrote into a buffer fitted for them.
+            unsafe {
+                encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
+                    MTLPrimitiveType::TriangleStrip,
+                    0,
+                    4,
+                    text.instances,
+                );
+            }
+        }
+        encoder.endEncoding();
+        drop(tables);
+        self.commit(slot, lease, window.drawable);
+        Ok(())
+    }
+
+    /// Ends the slot's command buffer and commits it, presenting `drawable`
+    /// when given; its feedback handler frees the leased slot.
+    fn commit(
+        &self,
+        slot: usize,
+        lease: SlotLease,
+        drawable: Option<&ProtocolObject<dyn MTLDrawable>>,
+    ) {
+        let commands = &self.command_buffers[slot];
         commands.endCommandBuffer();
         if let Some(drawable) = drawable {
             self.queue.waitForDrawable(drawable);
@@ -1209,7 +1949,6 @@ impl Metal4Submission {
             self.queue.signalDrawable(drawable);
             drawable.present();
         }
-        Ok(())
     }
 }
 

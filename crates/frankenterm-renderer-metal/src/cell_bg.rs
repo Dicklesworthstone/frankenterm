@@ -408,6 +408,64 @@ pub fn shade_background(
     Some(color)
 }
 
+/// Inactive-pane dimming (ft-yccm0.4.6): multiplies a premultiplied color's
+/// hue, saturation and brightness by `hsb`. It is the CPU reference of the
+/// shaders' `apply_hsb`, which is the WebGpu renderer's `apply_hsv` on a
+/// premultiplied color; keep the three identical.
+#[must_use]
+pub fn apply_hsb(color: [f32; 4], hsb: [f32; 3]) -> [f32; 4] {
+    let alpha = color[3];
+    if alpha <= 0.0 {
+        return color;
+    }
+    let hsv = rgb_to_hsv([color[0] / alpha, color[1] / alpha, color[2] / alpha]);
+    let rgb = hsv_to_rgb([hsv[0] * hsb[0], hsv[1] * hsb[1], hsv[2] * hsb[2]]);
+    [rgb[0] * alpha, rgb[1] * alpha, rgb[2] * alpha, alpha]
+}
+
+/// `mix(a, b, t)` for a step `t` of 0 or 1, as the shaders compute it.
+fn mix4(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
+}
+
+/// The shaders' `step(edge, x)`.
+fn step(edge: f32, x: f32) -> f32 {
+    if x < edge { 0.0 } else { 1.0 }
+}
+
+/// The shaders' `rgb2hsv`.
+fn rgb_to_hsv(rgb: [f32; 3]) -> [f32; 3] {
+    let konst = [0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0];
+    let low = mix4(
+        [rgb[2], rgb[1], konst[3], konst[2]],
+        [rgb[1], rgb[2], konst[0], konst[1]],
+        step(rgb[2], rgb[1]),
+    );
+    let high = mix4(
+        [low[0], low[1], low[3], rgb[0]],
+        [rgb[0], low[1], low[2], low[0]],
+        step(low[0], rgb[0]),
+    );
+    let chroma = high[0] - high[3].min(high[1]);
+    let epsilon = 1.0e-10;
+    [
+        (high[2] + (high[3] - high[1]) / (6.0 * chroma + epsilon)).abs(),
+        chroma / (high[0] + epsilon),
+        high[0],
+    ]
+}
+
+/// The shaders' `hsv2rgb`; `fract` is `x - floor(x)`, as in Metal.
+fn hsv_to_rgb(hsv: [f32; 3]) -> [f32; 3] {
+    let konst = [1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0];
+    let channel = |offset: f32| {
+        let hue = hsv[0] + offset;
+        let ramp = ((hue - hue.floor()) * 6.0 - konst[3]).abs();
+        hsv[2] * (konst[0] + ((ramp - konst[0]).clamp(0.0, 1.0) - konst[0]) * hsv[1])
+    };
+    [channel(konst[0]), channel(konst[1]), channel(konst[2])]
+}
+
 /// A premultiplied float color as the `BGRA8Unorm` bytes the GPU stores.
 #[must_use]
 // Clamped to 0.0..=255.0 before the cast.
@@ -657,6 +715,35 @@ mod tests {
     fn premultiplied_colors_round_to_bgra8_like_the_gpu() {
         assert_eq!(to_bgra8([1.0, 0.5, 0.2, 1.0]), [51, 128, 255, 255]);
         assert_eq!(to_bgra8([2.0, -1.0, 0.0, 0.0]), [0, 0, 255, 0]);
+    }
+
+    /// ft-yccm0.4.6: `apply_hsb` scales hue, saturation and brightness of
+    /// the un-premultiplied color and keeps alpha.
+    #[test]
+    fn apply_hsb_scales_hsv_of_the_unpremultiplied_color() {
+        let close = |a: [f32; 4], b: [f32; 4]| a.iter().zip(&b).all(|(a, b)| (a - b).abs() < 1e-5);
+        // Orange at half alpha, premultiplied.
+        let color = [0.5, 0.25, 0.0, 0.5];
+        assert!(close(apply_hsb(color, [1.0, 1.0, 1.0]), color), "identity");
+        // Half the brightness halves every channel.
+        assert!(close(
+            apply_hsb(color, [1.0, 1.0, 0.5]),
+            [0.25, 0.125, 0.0, 0.5]
+        ));
+        // No saturation is the gray of the brightest channel.
+        assert!(close(
+            apply_hsb(color, [1.0, 0.0, 1.0]),
+            [0.5, 0.5, 0.5, 0.5]
+        ));
+        // Hue 30 degrees doubled is 60: yellow.
+        assert!(close(
+            apply_hsb(color, [2.0, 1.0, 1.0]),
+            [0.5, 0.5, 0.0, 0.5]
+        ));
+        let transparent = [0.0, 0.0, 0.0, 0.0];
+        assert_eq!(apply_hsb(transparent, [1.0, 0.5, 0.5]), transparent);
+        // Planted negative: dimming changes the color.
+        assert!(!close(apply_hsb(color, [1.0, 0.8, 0.7]), color));
     }
 
     #[test]

@@ -30,6 +30,8 @@ struct FrameUniforms {
     float underline_position;       // 160: pixels from the cell top
     float line_thickness;           // 164: pixels, every decoration
     float strikethrough_position;   // 168: pixels from the cell top
+    float reserved2;                // 172
+    float4 hsb;                     // 176: inactive-pane dimming when w != 0
 };
 
 // Byte layout: CellText in src/cell_text.rs (24 bytes).
@@ -116,6 +118,31 @@ static float4 over(float4 top, float4 bottom) {
     return top + bottom * (1.0 - top.a);
 }
 
+// Inactive-pane dimming (ft-yccm0.4.6), as in background.metal; `apply_hsb`
+// in src/cell_bg.rs is the CPU reference.
+static float3 rgb2hsv(float3 c) {
+    float4 K = float4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+    float4 p = mix(float4(c.bg, K.wz), float4(c.gb, K.xy), step(c.b, c.g));
+    float4 q = mix(float4(p.xyw, c.r), float4(c.r, p.yzx), step(p.x, c.r));
+    float d = q.x - min(q.w, q.y);
+    float e = 1.0e-10;
+    return float3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+}
+
+static float3 hsv2rgb(float3 c) {
+    float4 K = float4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    float3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+static float4 apply_hsb(float4 color, float4 hsb) {
+    if (hsb.w == 0.0 || color.a <= 0.0) {
+        return color;
+    }
+    float3 hsv = rgb2hsv(color.rgb / color.a) * hsb.xyz;
+    return float4(hsv2rgb(hsv) * color.a, color.a);
+}
+
 static bool in_band(float y, float top, float thickness) {
     return y >= top && y < top + thickness;
 }
@@ -196,5 +223,5 @@ fragment float4 text_fragment(TextVertex in [[stage_in]],
     if (out.a <= 0.0) {
         discard_fragment();
     }
-    return out;
+    return apply_hsb(out, u.hsb);
 }

@@ -201,9 +201,11 @@ pub mod cell_text;
 pub mod frame;
 pub mod uploads;
 pub use atlas::{AtlasError, AtlasKind, AtlasSlot};
-pub use cell_bg::{BackgroundUniforms, CellBg, CellBgGrid, CursorShape, CursorUniform};
+pub use cell_bg::{BackgroundUniforms, CellBg, CellBgGrid, CursorShape, CursorUniform, apply_hsb};
 pub use cell_text::{CellText, CellTextGrid, TextUniforms, UnderlineStyle};
 pub use frame::{FRAME_SLOTS, GridExtent};
+pub mod window_frame;
+pub use window_frame::{PaneScene, PixelRect, SolidRect, WindowFrame};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -213,6 +215,8 @@ mod macos_atlas;
 pub use macos_atlas::GlyphAtlases;
 #[cfg(target_os = "macos")]
 mod macos_display_link;
+#[cfg(all(test, target_os = "macos"))]
+mod macos_window_tests;
 #[cfg(target_os = "macos")]
 pub use macos_display_link::{LinkUpdate, LinkWait, MetalDisplayLink, RunLoopInterrupter};
 #[cfg(target_os = "macos")]
@@ -570,6 +574,9 @@ pub enum FrameError {
         cells_row_offset: u32,
         text_row_offset: u32,
     },
+    /// Two panes of one window frame share a key (ft-yccm0.4.6), so their
+    /// GPU buffers would be one.
+    DuplicatePane { key: u64 },
 }
 
 impl fmt::Display for FrameError {
@@ -617,6 +624,9 @@ impl fmt::Display for FrameError {
                  grid ({}x{}, ring offset {cells_row_offset})",
                 text.rows, text.cols, cells.rows, cells.cols
             ),
+            Self::DuplicatePane { key } => {
+                write!(f, "two panes of one window frame share the key {key}")
+            }
         }
     }
 }

@@ -26,6 +26,8 @@ struct FrameUniforms {
     float4 selection_tint;   // 112: premultiplied overlays
     float4 search_tint;      // 128
     float4 current_tint;     // 144
+    float4 reserved2;        // 160: the text pass's decoration geometry
+    float4 hsb;              // 176: inactive-pane dimming when w != 0
 };
 
 // CellBg flag bits (src/cell_bg.rs `flags`).
@@ -48,6 +50,32 @@ vertex BackgroundVertex bg_vertex(uint vertex_id [[vertex_id]]) {
 
 static float4 over(float4 top, float4 bottom) {
     return top + bottom * (1.0 - top.a);
+}
+
+// Inactive-pane dimming (ft-yccm0.4.6): the WebGpu renderer's apply_hsv,
+// on a premultiplied color. `apply_hsb` in src/cell_bg.rs is the CPU
+// reference; keep the three identical.
+static float3 rgb2hsv(float3 c) {
+    float4 K = float4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+    float4 p = mix(float4(c.bg, K.wz), float4(c.gb, K.xy), step(c.b, c.g));
+    float4 q = mix(float4(p.xyw, c.r), float4(c.r, p.yzx), step(p.x, c.r));
+    float d = q.x - min(q.w, q.y);
+    float e = 1.0e-10;
+    return float3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+}
+
+static float3 hsv2rgb(float3 c) {
+    float4 K = float4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    float3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+static float4 apply_hsb(float4 color, float4 hsb) {
+    if (hsb.w == 0.0 || color.a <= 0.0) {
+        return color;
+    }
+    float3 hsv = rgb2hsv(color.rgb / color.a) * hsb.xyz;
+    return float4(hsv2rgb(hsv) * color.a, color.a);
 }
 
 fragment float4 bg_fragment(BackgroundVertex in [[stage_in]],
@@ -96,5 +124,5 @@ fragment float4 bg_fragment(BackgroundVertex in [[stage_in]],
             color = over(u.cursor_color, color);
         }
     }
-    return color;
+    return apply_hsb(color, u.hsb);
 }
