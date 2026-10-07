@@ -4229,6 +4229,10 @@ struct PaneRegistrationGeneration {
     owner: Weak<Mux>,
     cleanup: Mutex<PaneRetirementCleanupState>,
     cleanup_complete: Arc<AtomicBool>,
+    /// Bytes this pane's parse thread fed fused, then parsed two-stage
+    /// (`count_parse_path`).
+    #[cfg(test)]
+    parse_path_bytes: [std::sync::atomic::AtomicU64; 2],
 }
 
 const PANE_REGISTRATION_RETIRED: usize = 1usize << (usize::BITS - 1);
@@ -4256,6 +4260,8 @@ impl PaneRegistrationGeneration {
             owner,
             cleanup: Mutex::new(PaneRetirementCleanupState::Unattached),
             cleanup_complete: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            parse_path_bytes: Default::default(),
         })
     }
 
@@ -11094,6 +11100,144 @@ fn feed_chunk_to_mux(
     false
 }
 
+/// Bytes the parse thread fed through the fused path, and bytes it parsed
+/// into actions (two-stage), per pane (ft-yccm0.3.2.1 option 2). The
+/// metrics `mux.parser.fused_bytes` and `mux.parser.two_stage_bytes` count
+/// the same for every pane.
+fn count_parse_path(generation: &PaneRegistrationGeneration, fused: bool, bytes: usize) {
+    let bytes = bytes as u64;
+    if fused {
+        metrics::counter!("mux.parser.fused_bytes").increment(bytes);
+    } else {
+        metrics::counter!("mux.parser.two_stage_bytes").increment(bytes);
+    }
+    #[cfg(test)]
+    generation.parse_path_bytes[usize::from(!fused)].fetch_add(bytes, Ordering::Relaxed);
+    #[cfg(not(test))]
+    let _ = generation;
+}
+
+/// The raw output the parse thread holds while it coalesces (ft-yccm0.3.2.1
+/// option 2). The two-stage path parsed each chunk into actions at once and
+/// applied the actions later: when `read_limit` bytes were pending, when the
+/// coalesce deadline passed with nothing more to read, before a checkpoint
+/// capture, or at EOF. This keeps the chunk's bytes instead and feeds them
+/// through the fused path at exactly those points, so batching and
+/// admission are what they were and every byte is parsed once, by the fused
+/// parser.
+///
+/// Only output that cannot hold a synchronized-output action is held: BSU,
+/// ESU and the mode-2026 query change when the loop flushes, so they are
+/// still handled as each is parsed. A chunk with `2026` anywhere in it,
+/// counting the three bytes consumed before it, is parsed as before, which
+/// costs nothing but speed when the digits are only text. DECSTR, the other
+/// synchronized-output action, matters only during a hold, and nothing is
+/// held raw during a hold.
+#[derive(Default)]
+struct RawCoalescer {
+    bytes: Vec<u8>,
+    /// The last bytes consumed, at most three, for a marker split across
+    /// chunks.
+    window: [u8; 3],
+    window_len: usize,
+}
+
+impl RawCoalescer {
+    const MARKER: &'static [u8] = b"2026";
+
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Whether `chunk` may be held raw (see the type's documentation).
+    fn admits(&self, chunk: &[u8]) -> bool {
+        if chunk.windows(Self::MARKER.len()).any(|w| w == Self::MARKER) {
+            return false;
+        }
+        // A marker that starts in the consumed window and ends in `chunk`.
+        let head = &chunk[..chunk.len().min(Self::MARKER.len() - 1)];
+        let mut joint = [0_u8; 6];
+        let tail = &self.window[3 - self.window_len..];
+        joint[..tail.len()].copy_from_slice(tail);
+        joint[tail.len()..tail.len() + head.len()].copy_from_slice(head);
+        !joint[..tail.len() + head.len()]
+            .windows(Self::MARKER.len())
+            .any(|w| w == Self::MARKER)
+    }
+
+    /// Records `chunk` as consumed, held or not, for the next `admits`.
+    fn note_consumed(&mut self, chunk: &[u8]) {
+        if chunk.len() >= 3 {
+            self.window.copy_from_slice(&chunk[chunk.len() - 3..]);
+            self.window_len = 3;
+            return;
+        }
+        let keep = (3 - chunk.len()).min(self.window_len);
+        let mut window = [0_u8; 3];
+        window[..keep].copy_from_slice(&self.window[3 - keep..]);
+        window[keep..keep + chunk.len()].copy_from_slice(chunk);
+        let len = keep + chunk.len();
+        self.window = [0; 3];
+        self.window[3 - len..].copy_from_slice(&window[..len]);
+        self.window_len = len;
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        self.bytes.extend_from_slice(chunk);
+    }
+}
+
+/// Applies what the parse thread holds, in stream order: the pending
+/// two-stage actions, then the raw bytes through the fused path, then any
+/// actions the fused gate diverted (ft-yccm0.3.2.1 option 2). Raw bytes
+/// never hold a synchronized-output action (see [`RawCoalescer`]), so the
+/// diverted ones are alerts and the like, appended as the two-stage path
+/// appends them. Where the fused path declines (no local pane, a poisoned
+/// checkpoint), the bytes are parsed into actions as before.
+fn flush_coalesced_output(
+    pane: &Weak<dyn Pane>,
+    generation: &Arc<PaneRegistrationGeneration>,
+    dead: &Arc<AtomicBool>,
+    parser: &mut termwiz::escape::parser::Parser,
+    raw: &mut RawCoalescer,
+    actions: &mut Vec<Action>,
+    hold: &mut SynchronizedOutputHold,
+) {
+    if !actions.is_empty() {
+        send_actions_to_mux(pane, generation, dead, std::mem::take(actions));
+    }
+    if raw.is_empty() {
+        return;
+    }
+    let bytes = std::mem::take(&mut raw.bytes);
+    let mut diverted = Vec::new();
+    if feed_chunk_to_mux(pane, generation, dead, parser, &bytes, &mut diverted) {
+        count_parse_path(generation, true, bytes.len());
+    } else {
+        count_parse_path(generation, false, bytes.len());
+        parser.parse(&bytes, |action| diverted.push(action));
+    }
+    for action in diverted {
+        let effect = handle_synchronized_output_action(&action, hold, |holding| {
+            respond_to_synchronized_output_query(pane, generation, holding);
+        });
+        debug_assert!(
+            effect.depth_outcome.is_none() && !effect.handled && !effect.flush,
+            "held raw output decoded a synchronized-output action: {:?}",
+            action
+        );
+        if !effect.handled {
+            action.append_to(actions);
+        }
+    }
+    if !actions.is_empty() {
+        send_actions_to_mux(pane, generation, dead, std::mem::take(actions));
+    }
+    // Keep the allocation for the next batch.
+    raw.bytes = bytes;
+    raw.bytes.clear();
+}
+
 /// Apply one parser batch, splitting it when admission refuses it as too
 /// large. Parser batch boundaries are arbitrary and a refused admission made
 /// no model mutation, so applying the two halves in order is equivalent.
@@ -11547,26 +11691,30 @@ fn parse_buffered_data(
     let mut deadline: Option<Instant> = None;
     let mut checkpoint_worker = ModelCheckpointWorker::default();
     let fused_parse = fused_parse_enabled();
+    // Raw coalescing needs the fused path (ft-yccm0.3.2.1 option 2).
+    let coalesce_raw = fused_parse && cfg!(not(feature = "disruptor-pane-io"));
+    let mut raw = RawCoalescer::default();
 
     loop {
-        match attempt_live_parser_checkpoint(
+        match attempt_live_parser_checkpoint_after_raw(
             &pane,
             &generation,
             dead,
-            &parser,
+            &mut parser,
+            &mut raw,
             &mut actions,
-            &hold,
+            &mut hold,
             &mut checkpoint_worker,
         ) {
             LiveParserAttemptOutcome::Fatal => break,
-            LiveParserAttemptOutcome::Completed if actions.is_empty() => {
+            LiveParserAttemptOutcome::Completed if actions.is_empty() && raw.is_empty() => {
                 action_size = 0;
                 deadline = None;
             }
             LiveParserAttemptOutcome::Completed | LiveParserAttemptOutcome::NoRequest => {}
         }
 
-        let mut poll_delay = if !actions.is_empty() && !hold.is_holding() {
+        let mut poll_delay = if (!actions.is_empty() || !raw.is_empty()) && !hold.is_holding() {
             deadline.and_then(|target| target.checked_duration_since(Instant::now()))
         } else {
             None
@@ -11604,8 +11752,16 @@ fn parse_buffered_data(
             rx.end_sleep();
             match polled {
                 Ok(0) => {
-                    if !actions.is_empty() && !hold.is_holding() {
-                        send_actions_to_mux(&pane, &generation, dead, std::mem::take(&mut actions));
+                    if (!actions.is_empty() || !raw.is_empty()) && !hold.is_holding() {
+                        flush_coalesced_output(
+                            &pane,
+                            &generation,
+                            dead,
+                            &mut parser,
+                            &mut raw,
+                            &mut actions,
+                            &mut hold,
+                        );
                         action_size = 0;
                         deadline = None;
                     }
@@ -11627,17 +11783,18 @@ fn parse_buffered_data(
                     dead.store(true, Ordering::Release);
                     break;
                 }
-                match attempt_live_parser_checkpoint(
+                match attempt_live_parser_checkpoint_after_raw(
                     &pane,
                     &generation,
                     dead,
-                    &parser,
+                    &mut parser,
+                    &mut raw,
                     &mut actions,
-                    &hold,
+                    &mut hold,
                     &mut checkpoint_worker,
                 ) {
                     LiveParserAttemptOutcome::Fatal => break,
-                    LiveParserAttemptOutcome::Completed if actions.is_empty() => {
+                    LiveParserAttemptOutcome::Completed if actions.is_empty() && raw.is_empty() => {
                         action_size = 0;
                         deadline = None;
                     }
@@ -11676,13 +11833,14 @@ fn parse_buffered_data(
         };
         match rx.peek(allowance) {
             Ok(pane_byte_ring::RingRead::Closed) => {
-                let _ = attempt_live_parser_checkpoint(
+                let _ = attempt_live_parser_checkpoint_after_raw(
                     &pane,
                     &generation,
                     dead,
-                    &parser,
+                    &mut parser,
+                    &mut raw,
                     &mut actions,
-                    &hold,
+                    &mut hold,
                     &mut checkpoint_worker,
                 );
                 dead.store(true, Ordering::Release);
@@ -11700,33 +11858,51 @@ fn parse_buffered_data(
             }
             Ok(pane_byte_ring::RingRead::Bytes(chunk)) => {
                 let size = chunk.len();
+                // Output with no synchronized-output marker is held raw while
+                // the loop coalesces, and fed fused where the two-stage path
+                // applied the actions it parsed (ft-yccm0.3.2.1 option 2).
+                let holdable = coalesce_raw && !hold.is_holding() && raw.admits(chunk);
+                raw.note_consumed(chunk);
+                if !holdable && !raw.is_empty() {
+                    // This chunk is parsed as before, after what is held.
+                    flush_coalesced_output(
+                        &pane,
+                        &generation,
+                        dead,
+                        &mut parser,
+                        &mut raw,
+                        &mut actions,
+                        &mut hold,
+                    );
+                    action_size = 0;
+                    deadline = None;
+                }
+                let crossing = action_size.saturating_add(size) >= read_limit;
+                let held = holdable && !crossing;
+                if held {
+                    raw.push(chunk);
+                }
                 // The fused path (ft-yccm0.3.2.1) takes a chunk the code below
                 // would apply at once anyway: no synchronized-output hold, and
                 // enough output that it would not wait to coalesce a frame.
-                // Earlier pending actions go first, as they would in one batch.
+                // Earlier pending actions go first, as they would in one batch,
+                // and held raw output joins this chunk in one fused feed.
+                let joined = !held && !raw.is_empty();
+                if joined {
+                    raw.push(chunk);
+                }
+                let feed: &[u8] = if joined { &raw.bytes } else { chunk };
                 let mut diverted = Vec::new();
-                let fused = fused_parse
-                    && !hold.is_holding()
-                    && action_size.saturating_add(size) >= read_limit
-                    && {
-                        if !actions.is_empty() {
-                            send_actions_to_mux(
-                                &pane,
-                                &generation,
-                                dead,
-                                std::mem::take(&mut actions),
-                            );
-                            deadline = None;
-                        }
-                        feed_chunk_to_mux(
-                            &pane,
-                            &generation,
-                            dead,
-                            &mut parser,
-                            chunk,
-                            &mut diverted,
-                        )
-                    };
+                let fused = !held && fused_parse && !hold.is_holding() && crossing && {
+                    if !actions.is_empty() {
+                        send_actions_to_mux(&pane, &generation, dead, std::mem::take(&mut actions));
+                        deadline = None;
+                    }
+                    feed_chunk_to_mux(&pane, &generation, dead, &mut parser, feed, &mut diverted)
+                };
+                if !held {
+                    count_parse_path(&generation, fused, feed.len());
+                }
                 let mut chunk_touched_hold = hold.is_holding();
                 let mut chunk_admission_emitted = false;
                 let mut on_action = |action: Action| {
@@ -11796,10 +11972,16 @@ fn parse_buffered_data(
                     for action in diverted {
                         on_action(action);
                     }
-                } else {
-                    parser.parse(chunk, &mut on_action);
+                } else if !held {
+                    parser.parse(feed, &mut on_action);
                 }
-                // Parsed: the slot goes back to the reader once exhausted.
+                if joined {
+                    raw.bytes.clear();
+                }
+                // Parsed, or held raw: the slot goes back to the reader once
+                // exhausted. A held chunk counts toward the checkpoint fence
+                // as the chunk the two-stage path parsed did, since a capture
+                // feeds what is held first.
                 rx.consume(size);
                 if generation
                     .live_parser_checkpoint
@@ -11825,17 +12007,18 @@ fn parse_buffered_data(
                 } else {
                     action_size += size;
                 }
-                match attempt_live_parser_checkpoint(
+                match attempt_live_parser_checkpoint_after_raw(
                     &pane,
                     &generation,
                     dead,
-                    &parser,
+                    &mut parser,
+                    &mut raw,
                     &mut actions,
-                    &hold,
+                    &mut hold,
                     &mut checkpoint_worker,
                 ) {
                     LiveParserAttemptOutcome::Fatal => break,
-                    LiveParserAttemptOutcome::Completed if actions.is_empty() => {
+                    LiveParserAttemptOutcome::Completed if actions.is_empty() && raw.is_empty() => {
                         action_size = 0;
                         deadline = None;
                     }
@@ -11859,13 +12042,19 @@ fn parse_buffered_data(
                             max_depth: hold.max_depth(),
                         },
                     );
-                    if !actions.is_empty() {
-                        send_actions_to_mux(&pane, &generation, dead, std::mem::take(&mut actions));
-                    }
+                    flush_coalesced_output(
+                        &pane,
+                        &generation,
+                        dead,
+                        &mut parser,
+                        &mut raw,
+                        &mut actions,
+                        &mut hold,
+                    );
                     deadline = None;
                     action_size = 0;
                 }
-                if !actions.is_empty() && !hold.is_holding() {
+                if (!actions.is_empty() || !raw.is_empty()) && !hold.is_holding() {
                     // If we haven't accumulated too much data,
                     // pause for a short while to increase the chances
                     // that we coalesce a full "frame" from an unoptimized
@@ -11910,7 +12099,15 @@ fn parse_buffered_data(
                         }
                     }
 
-                    send_actions_to_mux(&pane, &generation, dead, std::mem::take(&mut actions));
+                    flush_coalesced_output(
+                        &pane,
+                        &generation,
+                        dead,
+                        &mut parser,
+                        &mut raw,
+                        &mut actions,
+                        &mut hold,
+                    );
                     deadline = None;
                     action_size = 0;
                 }
@@ -11926,9 +12123,44 @@ fn parse_buffered_data(
     // to be displayed before we return from here; this is important
     // for very short lived commands so that we don't forget to
     // display what they displayed.
-    if !actions.is_empty() {
-        send_actions_to_mux(&pane, &generation, dead, std::mem::take(&mut actions));
+    flush_coalesced_output(
+        &pane,
+        &generation,
+        dead,
+        &mut parser,
+        &mut raw,
+        &mut actions,
+        &mut hold,
+    );
+}
+
+/// [`attempt_live_parser_checkpoint`] after feeding the raw output the loop
+/// holds (ft-yccm0.3.2.1 option 2). Either capture applies everything
+/// pending, and held bytes already count toward the parsed watermark, so
+/// they are parsed and applied first whenever a capture is ready: a model
+/// capture as soon as one is pending, a guardian capture once delivery and
+/// parsing have reached its fence (where the parser's recovery watermark
+/// must equal the fence). The parser then stands where the two-stage path's
+/// stood, with the same bytes behind it and the same fence ahead.
+#[allow(clippy::too_many_arguments)]
+fn attempt_live_parser_checkpoint_after_raw(
+    pane: &Weak<dyn Pane>,
+    generation: &Arc<PaneRegistrationGeneration>,
+    dead: &Arc<AtomicBool>,
+    parser: &mut termwiz::escape::parser::Parser,
+    raw: &mut RawCoalescer,
+    actions: &mut Vec<Action>,
+    hold: &mut SynchronizedOutputHold,
+    worker: &mut ModelCheckpointWorker,
+) -> LiveParserAttemptOutcome {
+    let control = &generation.live_parser_checkpoint;
+    if !raw.is_empty()
+        && (control.has_ready_model_checkpoint()
+            || matches!(control.ready_checkpoint_target(), Ok(Some(_))))
+    {
+        flush_coalesced_output(pane, generation, dead, parser, raw, actions, hold);
     }
+    attempt_live_parser_checkpoint(pane, generation, dead, parser, actions, hold, worker)
 }
 
 fn set_socket_buffer(fd: &mut FileDescriptor, option: i32, size: usize) -> anyhow::Result<()> {
@@ -26011,6 +26243,515 @@ mod tests {
             pixel_height: 600,
             dpi: 96,
         }
+    }
+
+    /// ft-yccm0.3.2.1 option 2: no chunk the parse thread holds raw can
+    /// complete a synchronized-output marker, however the stream is cut, so
+    /// BSU, ESU and the mode-2026 query are always parsed as they arrive.
+    #[test]
+    fn raw_coalescer_never_holds_a_chunk_that_completes_a_synchronized_output_marker() {
+        let stream: &[u8] = b"ab\x1b[?2026hcd 20\x1b[?1;2026lxy";
+        let marker_ends: Vec<usize> = (3..stream.len())
+            .filter(|&end| &stream[end - 3..=end] == RawCoalescer::MARKER)
+            .collect();
+        assert_eq!(marker_ends.len(), 2);
+        let check = |cuts: &[usize]| {
+            let mut coalescer = RawCoalescer::default();
+            let mut start = 0;
+            for &end in cuts.iter().chain(std::iter::once(&stream.len())) {
+                let chunk = &stream[start..end];
+                let admitted = coalescer.admits(chunk);
+                coalescer.note_consumed(chunk);
+                let completes = marker_ends.iter().any(|&k| (start..end).contains(&k));
+                assert!(
+                    !(admitted && completes),
+                    "cuts {:?}: chunk {:?} completes a marker but was admitted",
+                    cuts,
+                    String::from_utf8_lossy(chunk)
+                );
+                start = end;
+            }
+        };
+        for first in 0..=stream.len() {
+            check(&[first]);
+            for second in first..=stream.len() {
+                check(&[first, second]);
+            }
+        }
+        check(&(1..stream.len()).collect::<Vec<_>>());
+
+        // Output with no marker nearby is held.
+        let mut coalescer = RawCoalescer::default();
+        coalescer.note_consumed(b"\x1b[?20");
+        assert!(!coalescer.admits(b"26h"));
+        assert!(coalescer.admits(b"25h text"));
+        coalescer.note_consumed(b"25h text");
+        assert!(coalescer.admits(b"\x1b[38;5;196m\xf0\x9f\x98\x80"));
+    }
+
+    /// Runs the test named `test` alone in a child test process, flagged by
+    /// the environment variable `child`: a registered local pane admits
+    /// output only with a promise scheduler, which is process-global, so the
+    /// child owns its process (as
+    /// `synchronized_output_preserves_order_across_scheduler_saturation`
+    /// does). Returns true in the parent once the child has passed, and
+    /// false in the child, which then runs the test body.
+    #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
+    fn run_isolated_with_scheduler(test: &str, child: &str) -> bool {
+        if std::env::var_os(child).is_some() {
+            return false;
+        }
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(child, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            if process.try_wait().unwrap().is_some() {
+                let output = process.wait_with_output().unwrap();
+                eprint!("{}", String::from_utf8_lossy(&output.stderr));
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    output.status.success() && stdout.contains("1 passed"),
+                    "{}{}",
+                    stdout,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return true;
+            }
+            if Instant::now() >= deadline {
+                process.kill().unwrap();
+                let output = process.wait_with_output().unwrap();
+                panic!(
+                    "{} timed out in its child process: {}{}",
+                    test,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A local pane on a real PTY whose child prints nothing, registered
+    /// with a mux so that its real reader and parse threads run. Output is
+    /// injected into its byte ring as exact deliveries, chunk by chunk
+    /// (ft-yccm0.3.2.1 option 2). The bells its mux dispatches for it are
+    /// counted.
+    #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
+    struct QuietLocalPane {
+        _mux: Arc<Mux>,
+        pane: Arc<dyn Pane>,
+        registration: PaneRegistrationHandle,
+        generation: Arc<PaneRegistrationGeneration>,
+        bells: Arc<AtomicUsize>,
+    }
+
+    #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
+    impl QuietLocalPane {
+        fn new() -> anyhow::Result<Self> {
+            use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+            let id = pane::alloc_pane_id()?;
+            let durable = uuid::Uuid::new_v4();
+            let pair = native_pty_system().openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 800,
+                pixel_height: 600,
+            })?;
+            let mut cmd = CommandBuilder::new("/bin/sh");
+            cmd.args(["-c", "sleep 120"]);
+            let writer = pair.master.take_writer()?;
+            let terminal = Terminal::new(
+                test_size(),
+                Arc::new(config::TermConfig::new_for_pane(
+                    id,
+                    0,
+                    *durable.as_bytes(),
+                    String::new(),
+                )),
+                "quiet-local-pane",
+                "test",
+                Box::new(Vec::<u8>::new()),
+            );
+            let child = pair.slave.spawn_command(cmd)?;
+            drop(pair.slave);
+            let pane: Arc<dyn Pane> = Arc::new(crate::localpane::LocalPane::new(
+                id,
+                terminal,
+                child,
+                pair.master,
+                writer,
+                0,
+                *durable.as_bytes(),
+                String::new(),
+            ));
+            let mux = Arc::new(Mux::new(None));
+            let bells = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&bells);
+            mux.subscribe(move |notification| {
+                if let MuxNotification::Alert {
+                    pane_id,
+                    alert: frankenterm_term::Alert::Bell,
+                } = notification
+                {
+                    if pane_id == id {
+                        observed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                true
+            })
+            .expect("quiet local pane bell subscription");
+            mux.add_pane(&pane)?;
+            let registration = pane
+                .mux_registration_slot()
+                .load()
+                .expect("quiet local pane registration");
+            let generation = registration.live_parser_test_generation();
+            Ok(Self {
+                _mux: mux,
+                pane,
+                registration,
+                generation,
+                bells,
+            })
+        }
+
+        fn bells(&self) -> usize {
+            self.bells.load(Ordering::Relaxed)
+        }
+
+        fn deliver(&self, bytes: &[u8]) {
+            self.generation
+                .live_parser_checkpoint
+                .write_delivered_bytes(bytes)
+                .expect("deliver output to the quiet pane");
+        }
+
+        fn parsed_bytes(&self) -> u64 {
+            self.generation
+                .live_parser_checkpoint
+                .state
+                .lock()
+                .parsed_bytes
+        }
+
+        /// Bytes fed fused, then bytes parsed two-stage.
+        fn parse_paths(&self) -> (u64, u64) {
+            (
+                self.generation.parse_path_bytes[0].load(Ordering::Relaxed),
+                self.generation.parse_path_bytes[1].load(Ordering::Relaxed),
+            )
+        }
+
+        /// The viewport as cells (text, width, attributes) and wrap bits,
+        /// and the cursor.
+        fn snapshot(&self) -> CellGridSnapshot {
+            let dims = self.pane.get_dimensions();
+            let top = dims.physical_top;
+            let (_, lines) = self
+                .pane
+                .get_lines(top..top + dims.viewport_rows as StableRowIndex);
+            let cursor = self.pane.get_cursor_position();
+            (
+                lines.iter().map(cell_grid_row).collect(),
+                (cursor.x, (cursor.y - top) as i64),
+            )
+        }
+    }
+
+    #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
+    impl Drop for QuietLocalPane {
+        fn drop(&mut self) {
+            self.pane.kill();
+        }
+    }
+
+    type CellGridRow = (Vec<(String, usize, frankenterm_term::CellAttributes)>, bool);
+    type CellGridSnapshot = (Vec<CellGridRow>, (usize, i64));
+
+    fn cell_grid_row(line: &Line) -> CellGridRow {
+        (
+            line.visible_cells()
+                .map(|cell| (cell.str().to_string(), cell.width(), cell.attrs().clone()))
+                .collect(),
+            line.last_cell_was_wrapped(),
+        )
+    }
+
+    #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
+    struct BellCounter(Arc<AtomicUsize>);
+
+    #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
+    impl frankenterm_term::AlertHandler for BellCounter {
+        fn alert(&mut self, alert: frankenterm_term::Alert) {
+            if matches!(alert, frankenterm_term::Alert::Bell) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// What the two-stage path makes of `stream`, on a terminal like the
+    /// quiet pane's: every action parsed, then applied.
+    #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
+    struct TwoStageReference {
+        snapshot: CellGridSnapshot,
+        bells: usize,
+        /// The title the stream set, if it set one.
+        title: Option<String>,
+    }
+
+    #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
+    fn two_stage_reference(stream: &[u8]) -> TwoStageReference {
+        let mut terminal = Terminal::new(
+            test_size(),
+            Arc::new(config::TermConfig::new_for_pane(
+                0,
+                0,
+                *uuid::Uuid::new_v4().as_bytes(),
+                String::new(),
+            )),
+            "two-stage-reference",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        let bells = Arc::new(AtomicUsize::new(0));
+        terminal.set_notification_handler(Box::new(BellCounter(Arc::clone(&bells))));
+        let initial_title = terminal.get_title().to_string();
+        terminal.perform_actions(termwiz::escape::parser::Parser::new().parse_as_vec(stream));
+        let title = Some(terminal.get_title().to_string()).filter(|title| *title != initial_title);
+        let screen = terminal.screen();
+        let rows = screen.physical_rows as frankenterm_term::VisibleRowIndex;
+        let lines = screen.lines_in_phys_range(screen.phys_range(&(0..rows)));
+        let cursor = terminal.cursor_pos();
+        TwoStageReference {
+            snapshot: (
+                lines.iter().map(cell_grid_row).collect(),
+                (cursor.x, cursor.y),
+            ),
+            bells: bells.load(Ordering::Relaxed),
+            title,
+        }
+    }
+
+    /// The M.7-style corpora: T0 (an SGR pair and an emoji per cell), an LF
+    /// staircase, mixed text (combining marks, a ZWJ sequence, tabs, CUP,
+    /// EL, CRLF), the same with alerts (BEL and a title, both alert sources
+    /// the fused path diverts), and frames in synchronized output.
+    #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
+    fn parse_path_corpora() -> Vec<(&'static str, Vec<u8>, bool)> {
+        let mut t0 = Vec::new();
+        for n in 0..6000u32 {
+            t0.extend_from_slice(
+                format!(
+                    "\x1b[38;5;{}m\x1b[48;5;{}m\u{1f600}",
+                    n % 256,
+                    (n * 7) % 256
+                )
+                .as_bytes(),
+            );
+        }
+        // Numbers stay below 2026, whose digits the parse thread
+        // conservatively takes for a synchronized-output marker (a false
+        // positive costs only speed).
+        let mut seq = Vec::new();
+        for _ in 0..6 {
+            for n in 1..=1999u32 {
+                seq.extend_from_slice(format!("{}\n", n).as_bytes());
+            }
+        }
+        let mut mixed = Vec::new();
+        for n in 0..2000u32 {
+            mixed.extend_from_slice(
+                format!(
+                    "\x1b[{}mword{} e\u{301}\u{1f468}\u{200d}\u{1f469}\tx\x1b[K\r\n",
+                    31 + n % 7,
+                    n
+                )
+                .as_bytes(),
+            );
+            if n % 97 == 0 {
+                mixed.extend_from_slice(format!("\x1b[{};{}H", 1 + n % 24, 1 + n % 80).as_bytes());
+            }
+        }
+        let mut alerts = mixed.clone();
+        for at in (0..alerts.len()).step_by(4096).rev() {
+            alerts.insert(at, 0x07);
+        }
+        alerts.extend_from_slice(b"\x1b]2;coalesced alerts\x1b\\after the title\r\n");
+        let mut frames = Vec::new();
+        for n in 0..300u32 {
+            frames.extend_from_slice(b"\x1b[?2026h\x1b[H");
+            for row in 0..24u32 {
+                frames.extend_from_slice(format!("frame {} row {}\x1b[K\r\n", n, row).as_bytes());
+            }
+            frames.extend_from_slice(b"\x1b[?2026l");
+        }
+        // (name, bytes, whether every byte can be fed fused)
+        vec![
+            ("t0", t0, true),
+            ("seq_lines", seq, true),
+            ("mixed", mixed, true),
+            ("alerts", alerts, true),
+            ("sync_frames", frames, false),
+        ]
+    }
+
+    /// ft-yccm0.3.2.1 option 2 acceptance: a local pane's real parse loop,
+    /// fed each corpus in random chunks well under `read_limit` (the shape
+    /// gathered ring slots have, 1 to 32 KiB), ends in the state the
+    /// two-stage path gives the same bytes, with the same bells dispatched
+    /// and the same title: the alert sources the fused parser diverts still
+    /// reach admission. And the chunks are now fed fused: every byte of
+    /// output with no synchronized-output marker goes through the fused
+    /// parser, where before only the chunk that crossed `read_limit` did.
+    #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
+    #[test]
+    fn coalesced_chunks_feed_fused_and_end_as_the_two_stage_path_does() -> anyhow::Result<()> {
+        if run_isolated_with_scheduler(
+            "tests::coalesced_chunks_feed_fused_and_end_as_the_two_stage_path_does",
+            "FT_ISOLATED_COALESCED_PARSE_PATHS",
+        ) {
+            return Ok(());
+        }
+        let _guard = global_test_lock();
+        // A registered local pane admits output only with a scheduler.
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mut seed = 0x2026_1007_u64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        for (name, stream, all_fused) in parse_path_corpora() {
+            let pane = QuietLocalPane::new()?;
+            let mut chunks = Vec::new();
+            let mut offset = 0;
+            while offset < stream.len() {
+                let size = (1024 + next() % (32 * 1024)).min(stream.len() - offset);
+                chunks.push(stream[offset..offset + size].to_vec());
+                offset += size;
+            }
+            // Delivery can wait on a full ring while the parse thread waits
+            // on scheduler capacity, which only this thread's ticks free.
+            let control = Arc::clone(&pane.generation.live_parser_checkpoint);
+            let delivery = std::thread::spawn(move || {
+                for chunk in chunks {
+                    control
+                        .write_delivered_bytes(&chunk)
+                        .expect("deliver output to the quiet pane");
+                }
+            });
+            let expected = two_stage_reference(&stream);
+            if name == "alerts" {
+                assert!(
+                    expected.bells > 0 && expected.title.is_some(),
+                    "alerts: the corpus raises bells and sets a title",
+                );
+            }
+            let title_matches = || {
+                expected
+                    .title
+                    .as_ref()
+                    .is_none_or(|title| pane.pane.get_title() == *title)
+            };
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                while executor.try_tick()? {}
+                let applied = pane.parsed_bytes() == stream.len() as u64
+                    && pane.snapshot() == expected.snapshot
+                    && pane.bells() == expected.bells
+                    && title_matches();
+                if applied {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    assert_eq!(pane.parsed_bytes(), stream.len() as u64, "{}: parsed", name);
+                    assert_eq!(pane.snapshot(), expected.snapshot, "{}: final state", name);
+                    assert_eq!(pane.bells(), expected.bells, "{}: bells dispatched", name);
+                    if let Some(title) = &expected.title {
+                        assert_eq!(&pane.pane.get_title(), title, "{}: title", name);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            delivery.join().expect("delivery thread");
+            let (fused, two_stage) = pane.parse_paths();
+            eprintln!(
+                "[BENCH] mux parse paths {}: {} bytes fused, {} two-stage of {}, {} bells",
+                name,
+                fused,
+                two_stage,
+                stream.len(),
+                pane.bells()
+            );
+            assert_eq!(
+                fused + two_stage,
+                stream.len() as u64,
+                "{}: every byte counted once",
+                name
+            );
+            if all_fused {
+                assert_eq!(
+                    two_stage, 0,
+                    "{}: T0-sized chunks take the fused path",
+                    name
+                );
+            } else {
+                assert!(
+                    two_stage > 0,
+                    "{}: synchronized output is parsed as it arrives",
+                    name
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// ft-yccm0.3.2.1 option 2: a model checkpoint taken while the parse
+    /// thread holds raw output binds at the watermark of every byte
+    /// delivered, so held bytes are parsed and applied before the capture.
+    #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
+    #[test]
+    fn a_model_checkpoint_after_held_output_binds_at_every_byte_delivered() -> anyhow::Result<()> {
+        if run_isolated_with_scheduler(
+            "tests::a_model_checkpoint_after_held_output_binds_at_every_byte_delivered",
+            "FT_ISOLATED_HELD_OUTPUT_MODEL_CHECKPOINT",
+        ) {
+            return Ok(());
+        }
+        let _guard = global_test_lock();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let pane = QuietLocalPane::new()?;
+        let held: &[u8] = b"held output that the parse thread coalesces\r\n";
+        pane.deliver(held);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pane.parsed_bytes() != held.len() as u64 {
+            assert!(
+                Instant::now() < deadline,
+                "the parse thread consumes the delivery"
+            );
+            while executor.try_tick()? {}
+            std::thread::yield_now();
+        }
+        let ack = pane
+            .registration
+            .capture_model_parser_checkpoint(
+                TerminalCheckpointLimits::default(),
+                Duration::from_secs(10),
+                || false,
+            )
+            .map_err(|error| anyhow::anyhow!("model capture failed: {error:?}"))?;
+        assert_eq!(ack.parser_stream_bytes, held.len() as u64);
+        let (rows, _) = pane.snapshot();
+        let first: String = rows[0].0.iter().map(|cell| cell.0.as_str()).collect();
+        assert!(first.starts_with("held output"), "{:?}", first);
+        Ok(())
     }
 
     #[cfg(unix)]
