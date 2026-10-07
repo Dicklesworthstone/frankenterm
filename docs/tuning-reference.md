@@ -365,16 +365,30 @@ process-wide, and each new pane applies their current values.
 | `scrollback_durability_commit_window_ms` | `250` | `0..=5000` | Commit window. A pane's queued rows wait up to this long after the first one, then go to the store in one transaction with one set of syncs (ft-yccm0.2.1.2). `0` commits every handoff at once. |
 | `scrollback_durability_commit_window_mb` | `8` | `1..=256` | Closes a window early once this many MiB are queued. |
 | `scrollback_durability_commit_idle_ms` | `25` | `0..=5000` | Closes a window early once its pane has queued no row for this long, so a burst commits as soon as it ends. |
+| `scrollback_durability_manifest_publish_ms` | `1000` | `0..=60000` | Shortest interval between two manifest publications of one pane (ft-yccm0.2.1.2). Between them each window appends its rows under one sync. `0` publishes after every store batch. |
 
 Other events close a window at once:
 
-- a full batch (the store's 4,096-row transaction limit);
+- a full window (65,536 rows, sixteen store batches);
 - an overload gap, or a queue past half its budget;
 - an explicit flush, such as a checkpoint;
 - the pane closing.
 
 For A/B runs, `FT_DURABILITY_COMMIT_WINDOW_MS` overrides the window, up to
-5000 ms.
+5000 ms, and `FT_DURABILITY_MANIFEST_PUBLISH_MS` the publication interval, up
+to 60000 ms.
+
+**Publication.** A window's rows are durable once its single sync returns.
+The manifest that describes them is published at most once per interval,
+and also on pane close, on an explicit flush and before a snapshot. A
+publication writes one cumulative WAL naming every row since the last
+manifest, prunes what retention evicted, and replaces the manifest: about
+eight syncs, once per interval rather than once per batch. After a crash,
+reopen adopts every unpublished row that opens at its exact location and
+cuts a torn or reordered remainder. A process's first window, a key
+rotation, or a retention change runs as one store batch with its own WAL
+and manifest, so the nonce segment its rows need is published before a
+tail depends on it.
 
 **Tradeoff.**
 
