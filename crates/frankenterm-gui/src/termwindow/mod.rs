@@ -5296,7 +5296,11 @@ impl TermWindow {
                 }
             }
             // Nothing to draw; keep the damage for the first sized frame.
-            Ok(frankenterm_renderer_metal::FrameOutcome::ZeroSize) => {}
+            // (No display link hands this path a drawable to outgrow.)
+            Ok(
+                frankenterm_renderer_metal::FrameOutcome::ZeroSize
+                | frankenterm_renderer_metal::FrameOutcome::DrawableResized,
+            ) => {}
             Err(err) => {
                 // nextDrawable returns nil when its one-second wait expires,
                 // and a frame slot can stay busy past its wait while the GPU

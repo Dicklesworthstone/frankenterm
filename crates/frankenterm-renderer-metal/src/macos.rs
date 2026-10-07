@@ -6,6 +6,7 @@ use crate::cell_bg::{BackgroundUniforms, CellBgGrid};
 use crate::cell_text::{CellTextGrid, TextUniforms};
 use crate::frame::{FrameUniforms, GridExtent, SlotBuffer};
 use crate::macos_atlas::GlyphAtlases;
+use crate::macos_display_link::{LinkUpdate, MetalDisplayLink};
 use crate::macos_frames::{
     BackgroundPipeline, FrameSlots, OffscreenCells, OffscreenText, Submission, TextDraw,
     TextPipeline, supports_metal4,
@@ -384,6 +385,10 @@ impl RendererParts {
         layer.setDevice(Some(&self.device.device));
         layer.setPixelFormat(PIXEL_FORMAT);
         layer.setFramebufferOnly(true);
+        // ft-yccm0.4.1.3: triple buffering, presentation synced to the
+        // display's refresh, set explicitly rather than trusting defaults.
+        layer.setMaximumDrawableCount(3);
+        layer.setDisplaySyncEnabled(true);
         self.submission.add_layer(&layer);
         MetalRenderer {
             device: self.device,
@@ -453,7 +458,7 @@ impl MetalRenderer {
         grid: GridExtent,
         color: ClearColor,
     ) -> Result<FrameOutcome, FrameError> {
-        self.render(width, height, grid, color, None, None)
+        self.render(width, height, grid, color, None, None, None)
     }
 
     /// Renders one frame with the background pass (ft-yccm0.4.2.2): uploads
@@ -475,6 +480,7 @@ impl MetalRenderer {
             cells.extent(),
             clear,
             Some((cells, background)),
+            None,
             None,
         )
     }
@@ -499,7 +505,83 @@ impl MetalRenderer {
             scene.clear,
             Some((scene.cells, scene.background)),
             Some((scene.text, scene.text_uniforms)),
+            None,
         )
+    }
+
+    /// [`Self::render_frame`] into the drawable a display link handed over
+    /// (ft-yccm0.4.1.3), instead of waiting for one in `nextDrawable`. A
+    /// drawable from before a resize is not drawn into:
+    /// [`FrameOutcome::DrawableResized`].
+    pub fn render_frame_into(
+        &self,
+        update: LinkUpdate,
+        width: u32,
+        height: u32,
+        scene: &FrameScene<'_>,
+    ) -> Result<FrameOutcome, FrameError> {
+        scene.check()?;
+        self.render(
+            width,
+            height,
+            scene.cells.extent(),
+            scene.clear,
+            Some((scene.cells, scene.background)),
+            Some((scene.text, scene.text_uniforms)),
+            Some(update.drawable),
+        )
+    }
+
+    /// [`Self::render_clear`] into the drawable a display link handed over.
+    pub fn render_clear_into(
+        &self,
+        update: LinkUpdate,
+        width: u32,
+        height: u32,
+        grid: GridExtent,
+        color: ClearColor,
+    ) -> Result<FrameOutcome, FrameError> {
+        self.render(
+            width,
+            height,
+            grid,
+            color,
+            None,
+            None,
+            Some(update.drawable),
+        )
+    }
+
+    /// A display link for this renderer's layer, paused, on the calling
+    /// thread's run loop (ft-yccm0.4.1.3); use it only on that thread.
+    /// `None` before macOS 14.
+    #[must_use]
+    pub fn display_link(&self) -> Option<MetalDisplayLink> {
+        MetalDisplayLink::new(&self.layer)
+    }
+
+    /// Sets the layer's contents scale to the backing scale, drawable
+    /// pixels per layer point for a `width`-pixel drawable, and whether the
+    /// layer is opaque (ft-yccm0.4.1.3). The window's shared backing layer
+    /// starts non-opaque at scale 1.0 and AppKit resets the scale to 1.0 on a
+    /// screen change, so the Metal path sets both itself at every surface
+    /// change, inside an explicit transaction.
+    pub fn configure_surface(&self, width: u32, opaque: bool) {
+        let points = self.layer.bounds().size.width;
+        let scale = if points > 0.0 {
+            (f64::from(width) / points).round().max(1.0)
+        } else {
+            1.0
+        };
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        if (self.layer.contentsScale() - scale).abs() > f64::EPSILON {
+            self.layer.setContentsScale(scale);
+        }
+        if self.layer.isOpaque() != opaque {
+            self.layer.setOpaque(opaque);
+        }
+        CATransaction::commit();
     }
 
     /// [`Self::render_frame`] into an offscreen `width x height` texture,
@@ -595,6 +677,8 @@ impl MetalRenderer {
         )
     }
 
+    // One parameter per frame input; a struct would only rename them.
+    #[allow(clippy::too_many_arguments)]
     fn render(
         &self,
         width: u32,
@@ -603,6 +687,7 @@ impl MetalRenderer {
         color: ClearColor,
         cells: Option<(&CellBgGrid, BackgroundUniforms)>,
         text: Option<(&CellTextGrid, TextUniforms)>,
+        provided: Option<Retained<ProtocolObject<dyn CAMetalDrawable>>>,
     ) -> Result<FrameOutcome, FrameError> {
         if width == 0 || height == 0 {
             return Ok(FrameOutcome::ZeroSize);
@@ -617,6 +702,15 @@ impl MetalRenderer {
                 .setDrawableSize(CGSize::new(f64::from(width), f64::from(height)));
             CATransaction::commit();
             self.drawable_size.set((width, height));
+        }
+        if let Some(drawable) = &provided {
+            // A display link's drawable from before a resize would show
+            // this frame stretched: skip it, before leasing a frame slot.
+            let texture = drawable.texture();
+            let size = (texture.width(), texture.height());
+            if size != (width as usize, height as usize) {
+                return Ok(FrameOutcome::DrawableResized);
+            }
         }
         let retired_before = self.frames.borrow().ring().retired_before();
         self.atlases.borrow_mut().collect_retired(retired_before);
@@ -646,10 +740,13 @@ impl MetalRenderer {
         }
         frames.write(&lease, SlotBuffer::Uniforms, 0, &uniforms.to_bytes())?;
         // A frame abandoned here drops its lease, which frees the slot.
-        let drawable = self
-            .layer
-            .nextDrawable()
-            .ok_or(FrameError::DrawableUnavailable)?;
+        let drawable = match provided {
+            Some(drawable) => drawable,
+            None => self
+                .layer
+                .nextDrawable()
+                .ok_or(FrameError::DrawableUnavailable)?,
+        };
         let atlases = self.atlases.borrow();
         self.submission.encode_frame(
             &frames,

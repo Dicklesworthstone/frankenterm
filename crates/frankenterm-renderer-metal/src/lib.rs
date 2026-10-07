@@ -48,7 +48,8 @@
 //! clippy's `undocumented_unsafe_blocks` and `multiple_unsafe_ops_per_block`
 //! are denied, so each block holds one operation and one `SAFETY:` comment
 //! naming its category below. All blocks live in `src/macos.rs`,
-//! `src/macos_frames.rs` and `src/macos_atlas.rs`. The non-macOS stub and the
+//! `src/macos_frames.rs`, `src/macos_atlas.rs` and
+//! `src/macos_display_link.rs`. The non-macOS stub and the
 //! portable [`frame`], [`atlas`], [`cell_bg`] and [`cell_text`] modules
 //! contain none.
 //!
@@ -164,6 +165,28 @@
 //!     off the main thread; the drawable size is changed inside an explicit
 //!     `CATransaction`, since a render thread has no run loop to commit an
 //!     implicit one.
+//! 12. **DISPLAY-LINK-DELEGATE: the display link's delegate class.**
+//!     `macos_display_link` defines an Objective-C subclass of `NSObject`
+//!     conforming to `CAMetalDisplayLinkDelegate` (`define_class!`), and
+//!     initializes it with `NSObject`'s `init` (ft-yccm0.4.1.3).
+//!     *Invariant:* `NSObject` has no subclassing requirements and the class
+//!     does not implement `Drop`; its one method has the protocol's selector
+//!     `metalDisplayLink:needsUpdate:` and exact argument types; `init` takes
+//!     no arguments and returns the initialized object. The class's instance
+//!     variable (the last update) is only touched by the render thread, where
+//!     the link's callbacks run.
+//! 13. **FFI-RUNLOOP: scheduling the display link.**
+//!     `addToRunLoop:forMode:` puts the link on a run loop.
+//!     *Invariant:* the run loop is the calling thread's own, and that
+//!     thread is the only one that runs it or uses the link; the mode is a
+//!     valid string private to the render thread.
+//! 14. **THREAD-RUNLOOP: interrupting the render thread's run loop.**
+//!     `RunLoopInterrupter` is `Send + Sync` and calls
+//!     `CFRunLoopPerformBlock`.
+//!     *Invariant:* it uses the run loop only for `CFRunLoopPerformBlock`
+//!     and `CFRunLoopWakeUp`, which Core Foundation documents as callable
+//!     from any thread; its mode is an immutable `CFString`, and the block is
+//!     a valid, non-null block that Core Foundation copies.
 //!
 //! Thread affinity: `MetalRenderer` holds Objective-C objects that are not
 //! `Send`, so it stays on the thread that created it unless it is moved
@@ -189,6 +212,10 @@ mod macos_atlas;
 #[cfg(target_os = "macos")]
 pub use macos_atlas::GlyphAtlases;
 #[cfg(target_os = "macos")]
+mod macos_display_link;
+#[cfg(target_os = "macos")]
+pub use macos_display_link::{LinkUpdate, LinkWait, MetalDisplayLink, RunLoopInterrupter};
+#[cfg(target_os = "macos")]
 mod macos_frames;
 #[cfg(target_os = "macos")]
 pub use macos::{MetalDevice, MetalRenderer, MetalRendererHandoff};
@@ -196,7 +223,10 @@ pub use macos::{MetalDevice, MetalRenderer, MetalRendererHandoff};
 #[cfg(not(target_os = "macos"))]
 mod stub;
 #[cfg(not(target_os = "macos"))]
-pub use stub::{MetalDevice, MetalRenderer, MetalRendererHandoff};
+pub use stub::{
+    LinkUpdate, LinkWait, MetalDevice, MetalDisplayLink, MetalRenderer, MetalRendererHandoff,
+    RunLoopInterrupter,
+};
 
 /// Lowest `MTLGPUFamilyAppleN` the renderer admits: Apple7, the M1 generation
 /// and the first Apple-silicon Mac family.
@@ -623,6 +653,10 @@ pub enum FrameOutcome {
     Presented,
     /// The window has a zero-sized extent, so there was nothing to draw.
     ZeroSize,
+    /// The drawable a display link handed over predates a resize
+    /// (ft-yccm0.4.1.3): nothing was drawn into it, the layer is sized for
+    /// the frame, and the link's next drawable has that size.
+    DrawableResized,
 }
 
 /// A render-pass clear color, premultiplied, for a `BGRA8Unorm` target.

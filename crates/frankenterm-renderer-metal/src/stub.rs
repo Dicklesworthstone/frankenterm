@@ -37,6 +37,59 @@ impl MetalDevice {
 #[derive(Debug)]
 pub enum MetalRenderer {}
 
+/// Off macOS there is no display link (ft-yccm0.4.1.3).
+#[derive(Debug)]
+pub enum MetalDisplayLink {}
+
+/// Uninhabited off macOS.
+#[derive(Debug)]
+pub enum LinkUpdate {}
+
+/// Why a display link wait returned.
+#[derive(Debug)]
+pub enum LinkWait {
+    Update(LinkUpdate),
+    Interrupted,
+    TimedOut,
+}
+
+/// Never handed out off macOS, but inhabited, so code that takes one from a
+/// link compiles there as it does on macOS.
+#[derive(Debug)]
+pub struct RunLoopInterrupter {
+    _private: (),
+}
+
+impl LinkUpdate {
+    #[must_use]
+    pub fn target_presentation_timestamp(&self) -> f64 {
+        match *self {}
+    }
+}
+
+impl MetalDisplayLink {
+    pub fn set_paused(&self, _paused: bool) {
+        match *self {}
+    }
+
+    pub fn set_frame_rate(&self, _minimum: f32, _maximum: f32, _preferred: f32) {
+        match *self {}
+    }
+
+    pub fn wait(&self, _timeout: Option<std::time::Duration>) -> LinkWait {
+        match *self {}
+    }
+
+    #[must_use]
+    pub fn interrupter(&self) -> RunLoopInterrupter {
+        match *self {}
+    }
+}
+
+impl RunLoopInterrupter {
+    pub fn interrupt(&self) {}
+}
+
 /// Off macOS a renderer never exists, so neither does its handoff.
 #[derive(Debug)]
 pub struct MetalRendererHandoff(MetalRenderer);
@@ -82,6 +135,36 @@ impl MetalRenderer {
 
     #[must_use]
     pub fn drawable_size(&self) -> (u32, u32) {
+        match *self {}
+    }
+
+    pub fn render_frame_into(
+        &self,
+        _update: LinkUpdate,
+        _width: u32,
+        _height: u32,
+        _scene: &FrameScene<'_>,
+    ) -> Result<FrameOutcome, FrameError> {
+        match *self {}
+    }
+
+    pub fn render_clear_into(
+        &self,
+        _update: LinkUpdate,
+        _width: u32,
+        _height: u32,
+        _grid: GridExtent,
+        _color: ClearColor,
+    ) -> Result<FrameOutcome, FrameError> {
+        match *self {}
+    }
+
+    #[must_use]
+    pub fn display_link(&self) -> Option<MetalDisplayLink> {
+        match *self {}
+    }
+
+    pub fn configure_surface(&self, _width: u32, _opaque: bool) {
         match *self {}
     }
 

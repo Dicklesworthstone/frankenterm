@@ -13,6 +13,13 @@
 //!
 //! The render thread keeps its own fonts, built for the window's DPI and
 //! font scale, since a `FontConfiguration` cannot leave the main thread.
+//!
+//! On macOS 14 and later the render thread is paced by the window's
+//! `CAMetalDisplayLink` (ft-yccm0.4.1.3): frames are encoded only in its
+//! refresh callbacks, into the drawable each callback hands over, on the
+//! ticks `render_thread::VsyncCadence` picks under `max_fps`; the link is
+//! paused while nothing changes. Earlier macOS paces to the `max_fps`
+//! interval instead.
 
 use super::TermWindow;
 use super::metal_cells::{MetalFrame, MetalFrameInputs};
@@ -21,12 +28,15 @@ use frankenterm_font::FontConfiguration;
 #[cfg(test)]
 use frankenterm_gui::render_thread::RenderThreadStats;
 use frankenterm_gui::render_thread::{
-    FrameDriver, FrameReport, RenderThread, RenderWaker, Surface, SurfaceState,
+    FrameDriver, FrameRateRange, FrameReport, RenderThread, RenderWaker, Surface, SurfaceState,
+    VsyncSource, VsyncTick, VsyncWait,
 };
 use frankenterm_renderer_metal::{
-    ClearColor, FrameOutcome, GridExtent, MetalRenderer, MetalRendererHandoff,
+    ClearColor, FrameOutcome, GridExtent, LinkUpdate, LinkWait, MetalDisplayLink, MetalRenderer,
+    MetalRendererHandoff,
 };
 use mux::pane::PaneId;
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -41,6 +51,30 @@ pub(crate) fn render_thread_enabled() -> bool {
     std::env::var_os(RENDER_THREAD_ENV).is_none_or(|value| value != "0")
 }
 
+/// `FRANKENTERM_METAL_DISPLAY_LINK=0` paces the render thread to the
+/// `max_fps` interval instead of the display link.
+pub(crate) const DISPLAY_LINK_ENV: &str = "FRANKENTERM_METAL_DISPLAY_LINK";
+
+/// How a render thread is paced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pacing {
+    /// The window's display link when the OS has one (ft-yccm0.4.1.3).
+    DisplayLink,
+    /// The `max_fps` interval.
+    Interval,
+}
+
+impl Pacing {
+    /// The display link unless [`DISPLAY_LINK_ENV`] is `0`.
+    pub(crate) fn from_env() -> Self {
+        if std::env::var_os(DISPLAY_LINK_ENV).is_some_and(|value| value == "0") {
+            Self::Interval
+        } else {
+            Self::DisplayLink
+        }
+    }
+}
+
 /// What the main thread publishes for the render thread's next frame.
 #[derive(Clone)]
 pub(crate) struct MetalFrameRequest {
@@ -49,6 +83,80 @@ pub(crate) struct MetalFrameRequest {
     /// The grid a frame without a pane clears.
     pub(crate) grid: GridExtent,
     pub(crate) font_scale: f64,
+    /// The window background is opaque, so the layer can be too: only a
+    /// configured transparency or background image makes it non-opaque.
+    pub(crate) opaque: bool,
+}
+
+/// How many recent refresh periods the link's period estimate looks back.
+const PERIOD_SAMPLES: usize = 8;
+
+/// The window's display link as the render thread's [`VsyncSource`]
+/// (ft-yccm0.4.1.3). Each update's drawable goes to the driver through
+/// `update`.
+struct LinkSource {
+    link: MetalDisplayLink,
+    update: Rc<RefCell<Option<LinkUpdate>>>,
+    last_target: Option<f64>,
+    /// Recent periods between consecutive updates, newest last.
+    periods: Vec<Duration>,
+}
+
+impl LinkSource {
+    /// The display's refresh period: the shortest recent one, so a dropped
+    /// tick does not halve the estimate, which still follows a rate change
+    /// within [`PERIOD_SAMPLES`] ticks. 60 Hz until there is a sample.
+    fn period(&self) -> Duration {
+        self.periods
+            .iter()
+            .min()
+            .copied()
+            .unwrap_or(Duration::from_nanos(16_666_667))
+    }
+}
+
+impl VsyncSource for LinkSource {
+    fn wait(&mut self, timeout: Option<Duration>) -> VsyncWait {
+        match self.link.wait(timeout) {
+            LinkWait::Update(update) => {
+                let target = update.target_presentation_timestamp();
+                if let Some(last) = self.last_target {
+                    let period = target - last;
+                    if period > 0.0 && period < 0.25 {
+                        if self.periods.len() == PERIOD_SAMPLES {
+                            self.periods.remove(0);
+                        }
+                        self.periods.push(Duration::from_secs_f64(period));
+                    }
+                }
+                self.last_target = Some(target);
+                *self.update.borrow_mut() = Some(update);
+                VsyncWait::Tick(VsyncTick {
+                    interval: self.period(),
+                })
+            }
+            LinkWait::Interrupted => VsyncWait::Interrupted,
+            LinkWait::TimedOut => VsyncWait::TimedOut,
+        }
+    }
+
+    fn set_running(&mut self, running: bool) {
+        self.link.set_paused(!running);
+        if !running {
+            // The next update comes after a gap, not one period later.
+            self.last_target = None;
+        }
+    }
+
+    fn set_rate_range(&mut self, range: FrameRateRange) {
+        self.link
+            .set_frame_rate(range.minimum, range.maximum, range.preferred);
+    }
+
+    fn interrupter(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let interrupter = self.link.interrupter();
+        Arc::new(move || interrupter.interrupt())
+    }
 }
 
 const NO_PANE: usize = usize::MAX;
@@ -115,13 +223,21 @@ struct RenderFonts {
 
 /// Draws a window's Metal frames on its render thread.
 struct MetalDriver {
-    renderer: Rc<MetalRenderer>,
     request: Arc<Mutex<Arc<MetalFrameRequest>>>,
     frame: Option<MetalFrame>,
     fonts: Option<RenderFonts>,
     /// The drawable size of the last presented frame, width in the high 32
     /// bits: what the window shows now.
     presented_size: Arc<AtomicU64>,
+    /// The display link's latest update, when the link paces this thread:
+    /// its drawable is the only one a frame is drawn into.
+    link_update: Rc<RefCell<Option<LinkUpdate>>>,
+    paced_by_link: bool,
+    /// The layer opacity last applied.
+    opaque: Option<bool>,
+    // Last: off macOS the renderer is uninhabited, and fields built after it
+    // would never be evaluated.
+    renderer: Rc<MetalRenderer>,
 }
 
 impl MetalDriver {
@@ -163,14 +279,41 @@ impl MetalDriver {
 impl FrameDriver for MetalDriver {
     fn reconfigure(&mut self, surface: &Surface) {
         // The next frame sizes the drawable to the surface (inside an
-        // explicit CATransaction); fonts follow the DPI in `frame`.
+        // explicit CATransaction); fonts follow the DPI in `frame`. The
+        // contents scale follows the new drawable size here (ft-yccm0.4.1.3).
         let (width, height, dpi) = surface.state.geometry();
         log::debug!("render thread: drawable {width}x{height} at {dpi} dpi");
+        let opaque = self
+            .request
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .opaque;
+        self.renderer.configure_surface(width, opaque);
+        self.opaque = Some(opaque);
+    }
+
+    fn tick_skipped(&mut self) {
+        // Release the skipped refresh's drawable to the layer's pool.
+        self.link_update.borrow_mut().take();
     }
 
     fn frame(&mut self, surface: &Surface) -> FrameReport {
         let request = Arc::clone(&self.request.lock().unwrap_or_else(PoisonError::into_inner));
         let (width, height, dpi) = surface.state.geometry();
+        if self.opaque != Some(request.opaque) {
+            self.renderer.configure_surface(width, request.opaque);
+            self.opaque = Some(request.opaque);
+        }
+        let update = if self.paced_by_link {
+            // Paced by the link, a frame is drawn only into the drawable of
+            // the refresh that called for it.
+            match self.link_update.borrow_mut().take() {
+                Some(update) => Some(update),
+                None => return FrameReport::default(),
+            }
+        } else {
+            None
+        };
         let (fonts, metrics) = match self.fonts(&request, dpi) {
             Ok(fonts) => (Rc::clone(&fonts.fonts), fonts.metrics.clone()),
             Err(err) => {
@@ -185,13 +328,21 @@ impl FrameDriver for MetalDriver {
             &metrics,
             &self.renderer,
         );
-        let outcome = match (self.frame.as_ref(), uniforms.as_ref()) {
-            (Some(frame), Some(uniforms)) => self.renderer.render_frame(
-                width,
-                height,
-                &super::metal_frame_scene(frame, uniforms, request.clear),
-            ),
-            _ => self
+        let scene = self
+            .frame
+            .as_ref()
+            .zip(uniforms.as_ref())
+            .map(|(frame, uniforms)| super::metal_frame_scene(frame, uniforms, request.clear));
+        let outcome = match (scene, update) {
+            (Some(scene), Some(update)) => self
+                .renderer
+                .render_frame_into(update, width, height, &scene),
+            (Some(scene), None) => self.renderer.render_frame(width, height, &scene),
+            (None, Some(update)) => {
+                self.renderer
+                    .render_clear_into(update, width, height, request.grid, request.clear)
+            }
+            (None, None) => self
                 .renderer
                 .render_clear(width, height, request.grid, request.clear),
         };
@@ -208,6 +359,12 @@ impl FrameDriver for MetalDriver {
                 }
             }
             Ok(FrameOutcome::ZeroSize) => FrameReport::default(),
+            // The link's drawable predates a resize: draw on the next tick,
+            // whose drawable has the new size.
+            Ok(FrameOutcome::DrawableResized) => FrameReport {
+                presented: false,
+                redraw_at: Some(Instant::now()),
+            },
             Err(err) => {
                 // A drawable or frame slot that stayed busy past its wait:
                 // try again at the next frame the interval allows.
@@ -235,14 +392,16 @@ pub(crate) struct MetalRenderThread {
 
 impl MetalRenderThread {
     /// Moves `renderer` to a new render thread that draws `request` on
-    /// `surface`, paced to `min_frame_interval`. Output of the request's
-    /// panes wakes it through `output`.
+    /// `surface`, at most once per `min_frame_interval` and paced as
+    /// `pacing` asks. Output of the request's panes wakes it through
+    /// `output`.
     pub(crate) fn spawn(
         name: String,
         renderer: MetalRenderer,
         request: MetalFrameRequest,
         surface: SurfaceState,
         min_frame_interval: Duration,
+        pacing: Pacing,
         output: Arc<MetalOutputWake>,
     ) -> std::io::Result<Self> {
         let panes = request_panes(&request);
@@ -251,14 +410,44 @@ impl MetalRenderThread {
         let presented_size = Arc::new(AtomicU64::new(0));
         let driver_presented_size = Arc::clone(&presented_size);
         let handoff = MetalRendererHandoff::new(renderer);
-        // The renderer is the last field: off macOS it is uninhabited, and
-        // every field after it would never be evaluated.
-        let thread = RenderThread::spawn(name, surface, min_frame_interval, move || MetalDriver {
-            request: driver_request,
-            frame: None,
-            fonts: None,
-            presented_size: driver_presented_size,
-            renderer: Rc::new(handoff.into_renderer()),
+        let thread = RenderThread::spawn_paced(name, surface, min_frame_interval, move || {
+            // The renderer is the last field: off macOS it is uninhabited,
+            // and every field after it would never be evaluated.
+            let mut driver = MetalDriver {
+                request: driver_request,
+                frame: None,
+                fonts: None,
+                presented_size: driver_presented_size,
+                link_update: Rc::new(RefCell::new(None)),
+                paced_by_link: pacing == Pacing::DisplayLink,
+                opaque: None,
+                renderer: Rc::new(handoff.into_renderer()),
+            };
+            // The link is created here, on the render thread whose run loop
+            // runs it (ft-yccm0.4.1.3); before macOS 14 there is none.
+            let link = if driver.paced_by_link {
+                driver.renderer.display_link()
+            } else {
+                None
+            };
+            driver.paced_by_link = link.is_some();
+            log::debug!(
+                "render thread: paced by {}",
+                if link.is_some() {
+                    "the display link"
+                } else {
+                    "the max_fps interval"
+                }
+            );
+            let source = link.map(|link| {
+                Box::new(LinkSource {
+                    link,
+                    update: Rc::clone(&driver.link_update),
+                    last_target: None,
+                    periods: Vec::with_capacity(PERIOD_SAMPLES),
+                }) as Box<dyn VsyncSource>
+            });
+            (driver, source)
         })?;
         output.set_panes(panes);
         output.set_waker(Some(thread.waker()));
@@ -334,6 +523,7 @@ impl TermWindow {
             request,
             self.metal_surface(),
             self.frame_interval(),
+            Pacing::from_env(),
             Arc::clone(&self.metal_output_wake),
         ) {
             Ok(thread) => {
@@ -353,6 +543,8 @@ impl TermWindow {
             clear: self.metal_clear_color(),
             grid: GridExtent::new(self.terminal_size.rows, self.terminal_size.cols),
             font_scale: self.fonts.get_font_scale(),
+            opaque: self.window_background.is_empty()
+                && self.config.window_background_opacity >= 1.0,
         }
     }
 
@@ -481,6 +673,7 @@ mod tests {
             clear: ClearColor::from_srgba(0.0, 0.0, 0.0, 1.0),
             grid: GridExtent::new(24, 80),
             font_scale: 1.0,
+            opaque: true,
         }
     }
 
@@ -494,13 +687,24 @@ mod tests {
         }
     }
 
+    /// The threading tests pace to the interval: an offscreen layer is on no
+    /// display, so they do not depend on a display link ticking for it.
     fn spawn(pane: &TestPane, output: &Arc<MetalOutputWake>) -> MetalRenderThread {
+        spawn_paced(pane, output, Pacing::Interval)
+    }
+
+    fn spawn_paced(
+        pane: &TestPane,
+        output: &Arc<MetalOutputWake>,
+        pacing: Pacing,
+    ) -> MetalRenderThread {
         MetalRenderThread::spawn(
             "ft-render-test".to_string(),
             MetalRenderer::offscreen().expect("this Mac runs the Metal front end"),
             request(pane),
             surface(1280, 768),
             Duration::from_millis(4),
+            pacing,
             Arc::clone(output),
         )
         .unwrap()
@@ -625,5 +829,52 @@ mod tests {
             started.elapsed()
         );
         assert!(!output.wake_for(pane_id), "a stopped thread is not woken");
+    }
+
+    /// ft-yccm0.4.1.3 acceptance: paced by the real `CAMetalDisplayLink`,
+    /// every frame is built on a link callback, into that callback's
+    /// drawable, and an idle window pauses its link.
+    #[test]
+    fn frames_are_presented_only_from_display_link_callbacks() {
+        use frankenterm_gui::render_thread::IDLE_TICKS_BEFORE_PAUSE;
+
+        let pane = TestPane::new(9_412_004);
+        let pane_id = pane.0.pane_id();
+        let output = Arc::new(MetalOutputWake::default());
+        let render = spawn_paced(&pane, &output, Pacing::DisplayLink);
+        // Keep the pane dirty for a second, as streaming output does.
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(1) {
+            output.wake_for(pane_id);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let busy = render.stats();
+        eprintln!("[BENCH] display link: {busy:?} after 1 s of output");
+        assert!(
+            busy.vsync_ticks > 0,
+            "the display link never ticked (is the test layer on a display?)"
+        );
+        assert!(busy.frames_presented > 0, "no frame was presented");
+        assert!(
+            busy.frames_built <= busy.vsync_ticks,
+            "{} frames from {} link callbacks: a frame was built off a callback",
+            busy.frames_built,
+            busy.vsync_ticks
+        );
+
+        // Quiet: within a few ticks the link pauses and stops ticking.
+        std::thread::sleep(Duration::from_millis(200));
+        let paused = render.stats();
+        std::thread::sleep(Duration::from_millis(300));
+        let idle = render.stats();
+        assert!(
+            idle.vsync_ticks - paused.vsync_ticks <= u64::from(IDLE_TICKS_BEFORE_PAUSE),
+            "an idle window kept its link ticking: {} ticks in 300 ms",
+            idle.vsync_ticks - paused.vsync_ticks
+        );
+        assert_eq!(
+            idle.frames_built, paused.frames_built,
+            "an idle window drew"
+        );
     }
 }
