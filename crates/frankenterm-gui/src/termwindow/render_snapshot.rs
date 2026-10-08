@@ -30,15 +30,19 @@
 //!   `FRANKENTERM_RENDER_SNAPSHOT_SPLIT_COMMAND` splits the active pane when
 //!   its title becomes `ft-render-split`, running the command (`/bin/sh -c`)
 //!   in the new pane; that pane then sets the snapshot title.
+//! - `FRANKENTERM_RENDER_SNAPSHOT_MODAL=char_select|pane_select|command_palette`
+//!   opens that modal overlay with its default arguments, through the key
+//!   assignment a keypress would perform (ft-yccm0.4.7.1).
 //!
-//! Focus and selection are applied in the paint that first sees the
-//! snapshot title, and the snapshot is taken by the next paint.
+//! Focus, selection and the modal are applied in the paint that first sees
+//! the snapshot title, and the snapshot is taken by the next paint.
 //!
 //! A snapshot paint whose frame is not final yet takes nothing and re-arms
 //! the request (see [`SnapshotFrameReadiness`]): a fallback font still
-//! resolving, the window background still loading, or an image whose first
+//! resolving, the window background still loading, an image whose first
 //! frame is still decoding on a worker, which the frame shows as a
-//! transparent placeholder.
+//! transparent placeholder, or a requested modal not open yet (the command
+//! palette opens from a main-thread task).
 
 use anyhow::Context;
 use std::path::{Path, PathBuf};
@@ -51,6 +55,7 @@ pub(crate) const SNAPSHOT_FOCUS_ENV: &str = "FRANKENTERM_RENDER_SNAPSHOT_FOCUS";
 pub(crate) const SNAPSHOT_SELECTION_ENV: &str = "FRANKENTERM_RENDER_SNAPSHOT_SELECTION";
 pub(crate) const SNAPSHOT_SPLIT_ENV: &str = "FRANKENTERM_RENDER_SNAPSHOT_SPLIT";
 pub(crate) const SNAPSHOT_SPLIT_COMMAND_ENV: &str = "FRANKENTERM_RENDER_SNAPSHOT_SPLIT_COMMAND";
+pub(crate) const SNAPSHOT_MODAL_ENV: &str = "FRANKENTERM_RENDER_SNAPSHOT_MODAL";
 pub(crate) const DEFAULT_SNAPSHOT_TITLE: &str = "ft-render-snapshot";
 /// The title that triggers a requested split.
 pub(crate) const SPLIT_TITLE: &str = "ft-render-split";
@@ -107,12 +112,34 @@ pub(crate) struct SnapshotSplit {
     pub(crate) command: String,
 }
 
+/// A modal overlay to open before the snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotModal {
+    CharSelect,
+    PaneSelect,
+    CommandPalette,
+}
+
+impl SnapshotModal {
+    fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "char_select" => Ok(Self::CharSelect),
+            "pane_select" => Ok(Self::PaneSelect),
+            "command_palette" => Ok(Self::CommandPalette),
+            other => Err(format!(
+                "{SNAPSHOT_MODAL_ENV}={other:?} is not char_select, pane_select or command_palette"
+            )),
+        }
+    }
+}
+
 /// Window state to set up before the snapshot; see the module docs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SnapshotActions {
     pub(crate) focus: bool,
     pub(crate) selection: Option<SnapshotSelection>,
     pub(crate) split: Option<SnapshotSplit>,
+    pub(crate) modal: Option<SnapshotModal>,
 }
 
 impl SnapshotActions {
@@ -146,10 +173,15 @@ impl SnapshotActions {
                 Some(SnapshotSplit { direction, command })
             }
         };
+        let modal = lookup(SNAPSHOT_MODAL_ENV)
+            .filter(|text| !text.is_empty())
+            .map(|text| SnapshotModal::parse(&text))
+            .transpose()?;
         Ok(Self {
             focus,
             selection,
             split,
+            modal,
         })
     }
 }
@@ -161,10 +193,12 @@ pub(crate) enum SnapshotStep {
     Idle,
     /// Split the active pane (its title became [`SPLIT_TITLE`]).
     Split(SnapshotSplit),
-    /// The snapshot title is up: set focus and selection, then paint again.
+    /// The snapshot title is up: set focus and selection, open the modal,
+    /// then paint again.
     Prepare {
         focus: bool,
         selection: Option<SnapshotSelection>,
+        modal: Option<SnapshotModal>,
     },
     /// Draw this paint into the snapshot at the path.
     Take(PathBuf),
@@ -224,15 +258,26 @@ impl RenderSnapshotRequest {
         if active_title != Some(self.title.as_str()) {
             return SnapshotStep::Idle;
         }
-        if !self.prepared && (self.actions.focus || self.actions.selection.is_some()) {
+        if !self.prepared
+            && (self.actions.focus
+                || self.actions.selection.is_some()
+                || self.actions.modal.is_some())
+        {
             self.prepared = true;
             return SnapshotStep::Prepare {
                 focus: self.actions.focus,
                 selection: self.actions.selection,
+                modal: self.actions.modal,
             };
         }
         self.taken = true;
         SnapshotStep::Take(self.path.clone())
+    }
+
+    /// Whether the snapshot waits for a modal it opened (see
+    /// [`SnapshotFrameReadiness::modal_pending`]).
+    pub(crate) fn wants_modal(&self) -> bool {
+        self.prepared && self.actions.modal.is_some()
     }
 
     /// Returns a claimed snapshot to pending: the frame was not final yet
@@ -252,11 +297,17 @@ pub(crate) struct SnapshotFrameReadiness {
     /// An image in the frame is a transparent placeholder while its first
     /// frame decodes on a worker.
     pub(crate) images_loading: bool,
+    /// The snapshot opened a modal that is not open yet. Opening it
+    /// invalidates the window, so nothing needs polling.
+    pub(crate) modal_pending: bool,
 }
 
 impl SnapshotFrameReadiness {
     pub(crate) fn is_final(self) -> bool {
-        !(self.fonts_pending || self.background_loading || self.images_loading)
+        !(self.fonts_pending
+            || self.background_loading
+            || self.images_loading
+            || self.modal_pending)
     }
 
     /// Whether the deferred snapshot must schedule its own repaint. Fallback
@@ -524,6 +575,10 @@ mod tests {
                 images_loading: true,
                 ..Default::default()
             },
+            SnapshotFrameReadiness {
+                modal_pending: true,
+                ..Default::default()
+            },
         ];
         for readiness in pending {
             assert!(!readiness.is_final(), "{readiness:?} is not final");
@@ -532,6 +587,7 @@ mod tests {
         assert!(pending[2].needs_poll());
         assert!(!pending[0].needs_poll());
         assert!(!pending[1].needs_poll());
+        assert!(!pending[3].needs_poll());
         assert!(!SnapshotFrameReadiness::default().needs_poll());
     }
 
@@ -554,8 +610,10 @@ mod tests {
             (SNAPSHOT_SELECTION_ENV, "1, 2,3,40"),
             (SNAPSHOT_SPLIT_ENV, "bottom"),
             (SNAPSHOT_SPLIT_COMMAND_ENV, "cat b; exec sleep 600"),
+            (SNAPSHOT_MODAL_ENV, "pane_select"),
         ]))
         .unwrap();
+        assert_eq!(actions.modal, Some(SnapshotModal::PaneSelect));
         assert!(actions.focus);
         assert_eq!(
             actions.selection,
@@ -587,6 +645,7 @@ mod tests {
                 (SNAPSHOT_SPLIT_COMMAND_ENV, "x"),
             ][..],
             &[(SNAPSHOT_SPLIT_ENV, "right")][..],
+            &[(SNAPSHOT_MODAL_ENV, "launcher")][..],
         ] {
             assert!(
                 SnapshotActions::from_lookup(lookup(vars)).is_err(),
@@ -609,6 +668,7 @@ mod tests {
             focus: true,
             selection: Some(selection),
             split: None,
+            modal: None,
         };
         assert_eq!(request.step(Some("zsh")), SnapshotStep::Idle);
         assert_eq!(
@@ -616,6 +676,7 @@ mod tests {
             SnapshotStep::Prepare {
                 focus: true,
                 selection: Some(selection),
+                modal: None,
             }
         );
         assert_eq!(
@@ -628,6 +689,28 @@ mod tests {
             request.step(Some(DEFAULT_SNAPSHOT_TITLE)),
             take("/tmp/a.png")
         );
+    }
+
+    #[test]
+    fn a_modal_alone_is_prepared_and_then_awaited() {
+        let mut request =
+            RenderSnapshotRequest::from_values(Some("/tmp/a.png".into()), None).unwrap();
+        request.actions.modal = Some(SnapshotModal::CommandPalette);
+        assert!(!request.wants_modal(), "nothing was opened yet");
+        assert_eq!(
+            request.step(Some(DEFAULT_SNAPSHOT_TITLE)),
+            SnapshotStep::Prepare {
+                focus: false,
+                selection: None,
+                modal: Some(SnapshotModal::CommandPalette),
+            }
+        );
+        assert!(request.wants_modal());
+        assert_eq!(
+            request.step(Some(DEFAULT_SNAPSHOT_TITLE)),
+            take("/tmp/a.png")
+        );
+        assert!(request.wants_modal(), "a re-armed snapshot still waits");
     }
 
     #[test]

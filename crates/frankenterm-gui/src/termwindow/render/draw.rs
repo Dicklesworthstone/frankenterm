@@ -1,5 +1,5 @@
 use crate::colorease::ColorEaseUniform;
-use crate::termwindow::render_snapshot::{SnapshotFrameReadiness, WebGpuDrawTarget};
+use crate::termwindow::render_snapshot::WebGpuDrawTarget;
 use crate::termwindow::webgpu::ShaderUniform;
 use crate::uniforms::UniformBuilder;
 use ::window::glium;
@@ -64,30 +64,12 @@ impl crate::TermWindow {
         use crate::renderstate::LedgeredTexture;
         use crate::termwindow::webgpu::WebGpuTexture;
 
-        // ft-yccm0.1.10: this frame's shaping and quads are built. If it
-        // asked for a fallback font, a resolved fallback has not been applied
-        // yet, the configured window background is still loading, or an image
-        // is still a placeholder for its decoding first frame (drawn now or
-        // in a cached line), the frame is not final: re-arm. Font and
-        // background completions invalidate the window; a decoding image is
-        // polled at its decoder's next due time.
+        // ft-yccm0.1.10: this frame's shaping and quads are built. A frame
+        // that is not final yet (see render_snapshot_readiness) re-arms.
         if matches!(target, WebGpuDrawTarget::Snapshot(_)) {
-            let readiness = SnapshotFrameReadiness {
-                fonts_pending: self.fonts.fallback_resolves_in_flight() > 0
-                    || self
-                        .fallback_invalidation_pending
-                        .load(std::sync::atomic::Ordering::Acquire),
-                background_loading: !self.background_load.is_settled(),
-                images_loading: self.image_poll_due.get().is_some(),
-            };
+            let readiness = self.render_snapshot_readiness();
             if !readiness.is_final() {
-                if let Some(request) = self.render_snapshot.as_mut() {
-                    request.rearm();
-                }
-                if let Some(due) = self.image_poll_due.get().filter(|_| readiness.needs_poll()) {
-                    self.schedule_animation_wake(due);
-                }
-                log::info!("render snapshot deferred: {readiness:?}");
+                self.defer_render_snapshot(readiness);
                 return Ok(());
             }
         }

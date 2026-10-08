@@ -128,6 +128,10 @@ pub struct SceneActions {
     /// Split the pane once the scene's bytes are shown.
     #[serde(default)]
     pub split: Option<SceneSplit>,
+    /// Open this modal overlay before the snapshot: `char_select`,
+    /// `pane_select` or `command_palette` (ft-yccm0.4.7.1).
+    #[serde(default)]
+    pub modal: Option<String>,
 }
 
 impl SceneActions {
@@ -184,6 +188,19 @@ pub fn snapshot_action_env(
         env.push((
             "FRANKENTERM_RENDER_SNAPSHOT_SPLIT_COMMAND".to_string(),
             format!("cat '{path}'; printf '\\033]2;{SNAPSHOT_TITLE}\\007'; exec sleep 600"),
+        ));
+    }
+    if let Some(modal) = &actions.modal {
+        anyhow::ensure!(
+            matches!(
+                modal.as_str(),
+                "char_select" | "pane_select" | "command_palette"
+            ),
+            "modal {modal:?} is not char_select, pane_select or command_palette"
+        );
+        env.push((
+            "FRANKENTERM_RENDER_SNAPSHOT_MODAL".to_string(),
+            modal.clone(),
         ));
     }
     Ok(env)
@@ -680,11 +697,13 @@ mod tests {
                 direction: "right".to_string(),
                 text: "second".to_string(),
             }),
+            modal: Some("char_select".to_string()),
         };
         let env: BTreeMap<String, String> = snapshot_action_env(&actions, split_scene)
             .unwrap()
             .into_iter()
             .collect();
+        assert_eq!(env["FRANKENTERM_RENDER_SNAPSHOT_MODAL"], "char_select");
         assert_eq!(env["FRANKENTERM_RENDER_SNAPSHOT_FOCUS"], "1");
         assert_eq!(env["FRANKENTERM_RENDER_SNAPSHOT_SELECTION"], "1,2,3,4");
         assert_eq!(env["FRANKENTERM_RENDER_SNAPSHOT_SPLIT"], "right");
@@ -718,6 +737,11 @@ mod tests {
             ..SceneActions::default()
         };
         assert!(snapshot_action_env(&split, Path::new("/it's/here")).is_err());
+        let launcher = SceneActions {
+            modal: Some("launcher".to_string()),
+            ..SceneActions::default()
+        };
+        assert!(snapshot_action_env(&launcher, split_scene).is_err());
     }
 
     #[test]

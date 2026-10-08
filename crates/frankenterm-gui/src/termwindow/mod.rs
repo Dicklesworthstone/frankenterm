@@ -121,9 +121,9 @@ pub mod frame_budget;
 pub mod idle_detector;
 pub mod keyevent;
 mod metal_cells;
+mod metal_chrome;
 mod metal_glyphs;
 mod metal_render_thread;
-mod metal_chrome;
 mod metal_window;
 pub mod modal;
 mod mouseevent;
@@ -5258,10 +5258,14 @@ impl TermWindow {
         // thread draws them.
         let request = self.metal_frame_request();
         let mut panes = std::mem::take(&mut self.metal_panes);
+        let mut deferred = None;
         let outcome = panes.draw(
             &request.panes,
             &request.splits,
-            request.chrome.as_ref().map(metal_chrome::ChromeFrame::layer),
+            request
+                .chrome
+                .as_ref()
+                .map(metal_chrome::ChromeFrame::layer),
             request.clear,
             &self.fonts,
             &self.render_metrics,
@@ -5275,19 +5279,29 @@ impl TermWindow {
                 if let (Ok(frankenterm_renderer_metal::FrameOutcome::Presented), Some(path)) =
                     (&outcome, snapshot_path)
                 {
-                    write_metal_render_snapshot(
-                        &metal,
-                        &path,
-                        width,
-                        height,
-                        request.clear,
-                        window,
-                    );
+                    // The panes are shaped now: a frame not final yet
+                    // re-arms, as the WebGpu snapshot does.
+                    let readiness = self.render_snapshot_readiness();
+                    if readiness.is_final() {
+                        write_metal_render_snapshot(
+                            &metal,
+                            &path,
+                            width,
+                            height,
+                            request.clear,
+                            window,
+                        );
+                    } else {
+                        deferred = Some(readiness);
+                    }
                 }
                 outcome
             },
         );
         self.metal_panes = panes;
+        if let Some(readiness) = deferred {
+            self.defer_render_snapshot(readiness);
+        }
         match outcome {
             Ok(frankenterm_renderer_metal::FrameOutcome::Presented) => {
                 // The GUI's own presented-frame count and cap, which the
@@ -5358,12 +5372,52 @@ impl TermWindow {
                 self.split_for_render_snapshot(&split);
                 None
             }
-            render_snapshot::SnapshotStep::Prepare { focus, selection } => {
-                self.prepare_render_snapshot(focus, selection);
+            render_snapshot::SnapshotStep::Prepare {
+                focus,
+                selection,
+                modal,
+            } => {
+                self.prepare_render_snapshot(focus, selection, modal);
                 None
             }
             render_snapshot::SnapshotStep::Take(path) => Some(path),
         }
+    }
+
+    /// Whether this frame, its shaping and quads built, is final for a
+    /// claimed render snapshot (ft-yccm0.1.10): no fallback font pending, a
+    /// settled window background, no image placeholder for a decoding first
+    /// frame (drawn now or in a cached line), and the requested modal open.
+    pub(crate) fn render_snapshot_readiness(&self) -> render_snapshot::SnapshotFrameReadiness {
+        render_snapshot::SnapshotFrameReadiness {
+            fonts_pending: self.fonts.fallback_resolves_in_flight() > 0
+                || self
+                    .fallback_invalidation_pending
+                    .load(std::sync::atomic::Ordering::Acquire),
+            background_loading: !self.background_load.is_settled(),
+            images_loading: self.image_poll_due.get().is_some(),
+            modal_pending: self
+                .render_snapshot
+                .as_ref()
+                .is_some_and(render_snapshot::RenderSnapshotRequest::wants_modal)
+                && self.get_modal().is_none(),
+        }
+    }
+
+    /// Returns a claimed snapshot whose frame was not final to pending. Font,
+    /// background and modal completions invalidate the window; a decoding
+    /// image is polled at its decoder's next due time.
+    pub(crate) fn defer_render_snapshot(
+        &mut self,
+        readiness: render_snapshot::SnapshotFrameReadiness,
+    ) {
+        if let Some(request) = self.render_snapshot.as_mut() {
+            request.rearm();
+        }
+        if let Some(due) = self.image_poll_due.get().filter(|_| readiness.needs_poll()) {
+            self.schedule_animation_wake(due);
+        }
+        log::info!("render snapshot deferred: {readiness:?}");
     }
 
     /// Splits the active pane for a render snapshot (ft-yccm0.1.10): the new
@@ -5398,6 +5452,7 @@ impl TermWindow {
         &mut self,
         focus: bool,
         selection: Option<render_snapshot::SnapshotSelection>,
+        modal: Option<render_snapshot::SnapshotModal>,
     ) {
         if focus && self.focused.is_none() {
             // Only the window's own focus state changes: nothing is
@@ -5432,6 +5487,29 @@ impl TermWindow {
                 current.range = Some(crate::selection::SelectionRange { start, end });
                 current.rectangular = false;
             });
+        }
+        if let Some(modal) = modal {
+            // The key assignment a keypress performs (ft-yccm0.4.7.1), with
+            // default arguments.
+            let assignment = match modal {
+                render_snapshot::SnapshotModal::CharSelect => {
+                    KeyAssignment::CharSelect(config::keyassignment::CharSelectArguments::default())
+                }
+                render_snapshot::SnapshotModal::PaneSelect => {
+                    KeyAssignment::PaneSelect(config::keyassignment::PaneSelectArguments::default())
+                }
+                render_snapshot::SnapshotModal::CommandPalette => {
+                    KeyAssignment::ActivateCommandPalette
+                }
+            };
+            match self.get_active_pane_or_overlay() {
+                Some(pane) => {
+                    if let Err(err) = self.perform_key_assignment(&pane, &assignment) {
+                        log::error!("render snapshot: opening {modal:?} failed: {err:#}");
+                    }
+                }
+                None => log::error!("render snapshot: no active pane to open {modal:?} over"),
+            }
         }
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
