@@ -35,9 +35,13 @@ lazy_static::lazy_static! {
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(1);
         let workers = if available >= 32 { 2 } else { 1 };
+        // A whole-image decode the window shows once ready: utility, below
+        // the threads the user is waiting on, never at the host's default
+        // (ft-yccm0.6).
         rayon::ThreadPoolBuilder::new()
             .num_threads(workers)
             .thread_name(|index| format!("background-image-{index}"))
+            .start_handler(|_| procinfo::start_thread_at(procinfo::ThreadQos::Utility))
             .build()
             .map_err(|error| error.to_string())
     };
@@ -57,9 +61,12 @@ lazy_static::lazy_static! {
                 (available / 4).clamp(1, 4)
             }
         };
+        // Gradient pixels are regenerated while the user resizes the
+        // window: user-initiated (ft-yccm0.6).
         rayon::ThreadPoolBuilder::new()
             .num_threads(workers)
             .thread_name(|index| format!("background-gradient-{index}"))
+            .start_handler(|_| procinfo::start_thread_at(procinfo::ThreadQos::UserInitiated))
             .build()
             .map_err(|error| {
                 log::warn!("gradient worker pool unavailable; using serial pixels: {error}");
@@ -2097,6 +2104,48 @@ mod tests {
     use super::*;
     use config::Dimension;
     use std::time::Duration;
+
+    /// ft-yccm0.6: each background pool's threads start at an explicit
+    /// class, the priority they actually run at on macOS: image decodes at
+    /// utility, gradient pixels (regenerated while the user resizes) at
+    /// user-initiated. None runs at the host's default.
+    #[test]
+    fn background_pool_threads_run_at_their_qos() {
+        for (pool, prefix, expected) in [
+            (
+                &*BACKGROUND_WORK_POOL,
+                "background-image-",
+                procinfo::ThreadQos::Utility,
+            ),
+            (
+                &*GRADIENT_WORK_POOL,
+                "background-gradient-",
+                procinfo::ThreadQos::UserInitiated,
+            ),
+        ] {
+            let pool = pool.as_ref().expect("background pool");
+            let (name, qos, priority) = pool.install(|| {
+                (
+                    std::thread::current().name().map(str::to_owned),
+                    procinfo::current_thread_qos(),
+                    procinfo::current_thread_base_priority(),
+                )
+            });
+            assert!(
+                name.as_deref().is_some_and(|name| name.starts_with(prefix)),
+                "{name:?}"
+            );
+            if cfg!(target_os = "macos") {
+                assert_eq!(
+                    (qos, priority),
+                    (Some(expected), Some(expected.base_priority())),
+                    "{prefix}"
+                );
+            } else {
+                assert_eq!((qos, priority), (None, None), "{prefix}");
+            }
+        }
+    }
 
     fn cached_image(last_access: u64, retained_bytes: usize) -> CachedImage {
         CachedImage {

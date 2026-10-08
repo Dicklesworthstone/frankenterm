@@ -11,6 +11,9 @@
 //! |---|---|
 //! | PTY gather and parse (`mux-read-pane-N`, `mux-parse-pane-N`) | [`ThreadQos::UserInitiated`] |
 //! | Metal render thread while the window is focused | [`ThreadQos::UserInteractive`] |
+//! | promise's runtimes and background I/O (`promise-block-on-N`, `promise-background-N`, `promise-background-io`): socket readiness, pane-output and render wakes | [`ThreadQos::UserInitiated`] |
+//! | Inline image frame decoding (`ft-frame-decoder-N`), background gradients (`background-gradient-N`) | [`ThreadQos::UserInitiated`] |
+//! | Background image decoding (`background-image-N`) | [`ThreadQos::Utility`] |
 //! | Durable scrollback writer | [`ThreadQos::Utility`] |
 //!
 //! # The task role caps every class (ft-yccm0.6)
@@ -188,6 +191,19 @@ fn ensure_task_role_once() {
             "no application task role ({err}): QoS classes above default run at the default \
              priority"
         ),
+    }
+}
+
+/// [`set_current_thread_qos`] for a thread-start hook (asupersync's
+/// `on_thread_start`, rayon's `start_handler`), so a pool's threads start
+/// with an explicit class instead of the default 31 (ft-yccm0.6). A failure
+/// is logged at debug and the thread runs on at its inherited class.
+pub fn start_thread_at(qos: ThreadQos) {
+    if let Err(err) = set_current_thread_qos(qos) {
+        log::debug!(
+            "thread {:?}: cannot set QoS {qos:?}: {err}",
+            std::thread::current().name()
+        );
     }
 }
 

@@ -493,10 +493,13 @@ thread_local! {
     static FRAME_DECODER_TEST_JOBS: Cell<Option<&'static AtomicUsize>> = const { Cell::new(None) };
 }
 static FRAME_DECODER_QUEUED_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Decodes the frames of images shown in panes, which the user is waiting
+/// on: user-initiated, never the host's default (ft-yccm0.6).
 static FRAME_DECODER_POOL: LazyLock<Result<rayon::ThreadPool, String>> = LazyLock::new(|| {
     rayon::ThreadPoolBuilder::new()
         .num_threads(MAX_FRAME_DECODER_WORKERS)
         .thread_name(|index| format!("ft-frame-decoder-{index}"))
+        .start_handler(|_| procinfo::start_thread_at(procinfo::ThreadQos::UserInitiated))
         .build()
         .map_err(|error| error.to_string())
 });
@@ -3255,6 +3258,34 @@ mod tests {
     use crate::termwindow::render::paint::AllowImage;
     use frankenterm_core::font_features::{AxisValue, VariableAxis};
     use window::bitmaps::TextureRect;
+
+    /// ft-yccm0.6: frame decoder threads start at user-initiated, the
+    /// priority they actually run at on macOS, not the host's default.
+    #[test]
+    fn frame_decoder_threads_run_at_user_initiated_qos() {
+        let pool = FRAME_DECODER_POOL.as_ref().expect("frame decoder pool");
+        let (name, qos, priority) = pool.install(|| {
+            (
+                std::thread::current().name().map(str::to_owned),
+                procinfo::current_thread_qos(),
+                procinfo::current_thread_base_priority(),
+            )
+        });
+        assert!(
+            name.as_deref()
+                .is_some_and(|name| name.starts_with("ft-frame-decoder-")),
+            "{name:?}"
+        );
+        let expected = procinfo::ThreadQos::UserInitiated;
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                (qos, priority),
+                (Some(expected), Some(expected.base_priority()))
+            );
+        } else {
+            assert_eq!((qos, priority), (None, None));
+        }
+    }
 
     #[test]
     fn bounded_atomic_reservation_preserves_limit_overflow_and_release_boundaries() {
