@@ -15,9 +15,12 @@ sequence: row `n` of a lineage is ledger line `n`.
 | `ftsl4e:` | no longer written; still read | One XChaCha20-Poly1305 per row, no header; the nonce is the nonce segment's base followed by the row's sequence |
 | `ftsl5r:` / `ftsl5t:` | every other batch and commit window | One XChaCha20-Poly1305 per sealed segment; each row stores only its ciphertext slice, and the segment's last row (the tail, `ftsl5t:`) also stores the tag |
 
-A sealed segment (v5) holds at most 4096 rows and at most 256 KiB of row
-payload. A single row larger than that is sealed as a segment of its own,
-up to the 16 MiB row limit. A segment never spans two batches or windows.
+The format bounds a sealed segment (v5) at 4096 rows and 256 KiB of row
+payload, and readers accept any segment within them. The store's writer
+cuts segments at 1024 rows and 128 KiB, to bound what a cold read
+decrypts (see Cold-read cost). A single row larger than that is sealed as a
+segment of its own, up to the 16 MiB row limit. A segment never spans two
+batches or windows.
 
 ## Keys
 
@@ -66,6 +69,16 @@ across a boundary, or marked as a tail in the wrong place, fails the tag.
   open the segment once and keep it open for the next row, so sequential
   readers (snapshots, export, recovery validation, ranged reads) decrypt
   each segment once.
+- Across cold reads, the sink keeps the last segment it opened, so a
+  sweep in Screen's ranged loads of at most 32 rows (the cold index,
+  search) also opens each segment once. It reuses that segment only under
+  the ledger, content epoch and first stable row it was read under, and
+  only while the segment's tail record (whose tag covers the whole
+  segment) is still stored unchanged at its sequence. Stored rows are
+  rewritten only after a cut through the ledger's end and sealed again
+  under a fresh nonce, so a rewritten segment never keeps its tail. A
+  segment changed on disk after it was opened is detected when it is next
+  opened; the kept rows were authenticated when it was opened.
 - What a failure means to each reader: a cold read returns no row;
   snapshots and export fail; recovery validation refuses to open the
   ledger; recovery adoption of an unpublished tail stops at the first
@@ -79,7 +92,8 @@ Retention stays exact: the manifest's oldest row, row count, record bytes
 and chain describe exactly the retained rows. When the oldest retained
 row sits inside a segment whose earlier rows retention evicted, the store
 keeps those evicted rows physically, as its pruned tail (at most 4095
-rows), and compaction keeps them, so the segment still authenticates.
+rows; under 1024 with the writer's segments), and compaction keeps them,
+so the segment still authenticates.
 They never read back as rows: every reader refuses rows before the oldest
 retained row. A tampered slack row makes the segment fail to open, which
 fails closed as above.
@@ -91,6 +105,46 @@ fails closed as above.
   plaintext), and on drop.
 - Decoders wipe their buffers on failure. Plaintext buffers are
   `Zeroizing` and wiped on drop.
+- The segment a sink keeps open between cold reads holds at most one
+  bounded segment's plaintext (256 KiB; a single larger row is not kept,
+  and the buffer kept is at most 1 MiB). It is wiped when it is replaced,
+  when a read fails, by a clear or a prefix replacement (so rows they
+  remove leave no plaintext behind), and when the sink is dropped.
+
+## Cold-read cost
+
+Measured with `benches/scrollback_cold_read.rs` (mux-server-impl) on RCH
+worker ts1, a shared Linux host, so a development signal, not an SLO.
+Each shape is a live store holding row 0 and one full 4096-row commit
+window, and the probes read the first and the tail row of its largest
+segment. "Cold" means no segment is open in the process; the OS page
+cache is warm.
+
+With the writer's segments (1024 rows, 128 KiB):
+
+| | t0_corpus | ascii91 | ascii9 |
+| --- | --- | --- | --- |
+| Largest segment | 285 rows, 131,071 B | 658 rows, 130,942 B | 1024 rows, 35,840 B |
+| One cold row read (first / tail row) | 714 / 732 µs | 753 / 759 µs | 617 / 622 µs |
+| The same read with its segment kept open | 310 / 314 µs | 310 / 314 µs | 316 / 313 µs |
+| Cold 24-row viewport (first / tail row) | 865 µs / 1.18 ms | 841 µs / 1.20 ms | 638 / 829 µs |
+| AEAD and decode: the whole segment, vs one v4 row alone | 213 vs 6.5 µs | 215 vs 5.9 µs | 77 vs 2.2 µs |
+| All 4097 rows in 32-row loads: segment kept / every load cold | 72.4 / 127.6 ms | 60.7 / 122.6 ms | 43.8 / 85.3 ms |
+
+- A single cold row read takes 0.62 to 0.76 ms. About 0.31 ms of every
+  read, with a segment kept open or not, is the sink's per-call
+  verification of the published manifest, which predates segment sealing
+  (ft-mfip6). The segment's own share is 0.30 to 0.45 ms.
+- A viewport that starts at a segment's tail row reaches into the next
+  segment and opens both: 1.18 to 1.20 ms.
+- With segments at the format's bounds (4096 rows, 256 KiB), and with a
+  tail row's segment fetched twice, the same run measured single cold row
+  reads of 0.97 to 1.53 ms (t0_corpus 971 µs / 1.18 ms, ascii91 1.03 /
+  1.31 ms, ascii9 1.14 / 1.53 ms). That is why the writer cuts smaller
+  segments, and why the reader now keeps the rows its scan back reads.
+- The store no longer writes v4 rows, so a per-row store read cannot be
+  measured for comparison; at the cipher, one v4 row opens in 2.2 to
+  6.5 µs.
 
 ## Tests
 
@@ -104,6 +158,11 @@ fails closed as above.
 - `segments_keep_exact_retention_and_the_oldest_rows_segment_readable`,
   `a_torn_segment_is_cut_from_its_first_row`,
   `a_reordered_or_torn_tail_is_adopted_only_up_to_its_first_bad_segment`
+  (mux-server-impl).
+- `cold_reads_keep_the_last_segment_open_until_it_changes`: a sweep opens
+  each segment once; a kept segment is refused once its tail changes or
+  is gone, and is never reused across a clear that reuses its sequences.
+  `cold_read_bench_hooks_read_back_exact_rows_from_the_stores_segments`
   (mux-server-impl).
 - `pruned_tail_rows_stay_readable_until_a_compaction_drops_them`,
   `the_pruned_tail_is_bounded` (frankenterm-core).

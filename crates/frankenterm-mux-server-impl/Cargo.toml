@@ -92,5 +92,9 @@ harness = false
 name = "scrollback_record_encode"
 harness = false
 
+[[bench]]
+name = "scrollback_cold_read"
+harness = false
+
 [lints]
 workspace = true

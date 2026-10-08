@@ -156,6 +156,8 @@ std::thread_local! {
     /// Seal clustered rows with the cell-vector schemas, as before schema 3
     /// (ft-yccm0.2.1.4), for a same-run A/B.
     static FORCE_CELL_SCHEMAS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Sealed segments this thread's readers opened (ft-yccm0.2.1.4).
+    static LIVE_SCROLLBACK_SEGMENT_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn configured_ssh_domains(config: &ConfigHandle) -> Vec<config::SshDomain> {
@@ -3685,6 +3687,9 @@ struct LiveScrollbackSpillSink {
     /// Ordered-durability syncs this sink's writes and publications issued
     /// (ft-yccm0.2.1.2 syncs-per-MiB measurement).
     durability_syncs: std::sync::atomic::AtomicU64,
+    /// The sealed segment the last cold read opened, for the next one
+    /// (ft-yccm0.2.1.4). Locked after the store and the keyring.
+    cold_segment: std::sync::Mutex<LiveScrollbackColdSegment>,
     store: std::sync::Mutex<frankenterm_core::storage::mmap_store::MmapScrollbackStore>,
     state: std::sync::Mutex<LiveScrollbackSpillState>,
     keyring: Arc<std::sync::Mutex<guardian_output_keys::GuardianOutputKeyring>>,
@@ -5896,9 +5901,10 @@ impl LiveScrollbackSpillSink {
         let keyring = self.lock_keyring("load_scrollback_lines decrypt")?;
         let mut cipher_cache = GuardianScrollbackCipherCache::new(&keyring, &state.row_segments);
         let (physical_oldest, next) = store_segment_bounds(&store, ledger_pane_id)?;
-        let mut segments = LiveScrollbackSegmentReader::default();
         let mut fetch =
             |range: std::ops::Range<u64>| store_segment_records(&store, ledger_pane_id, range);
+        let origin = (ledger_pane_id, state.content_epoch, initial);
+        let mut segments = self.take_cold_segment(origin, &mut fetch);
         let mut remaining = max_decoded_bytes;
         let mut result = Vec::with_capacity(records.len());
         for (index, record) in records.iter().enumerate() {
@@ -5939,7 +5945,40 @@ impl LiveScrollbackSpillSink {
                 .ok_or_else(|| anyhow::anyhow!("scrollback decoded byte limit exceeded"))?;
             result.push(line);
         }
+        self.keep_cold_segment(origin, segments);
         Ok(result)
+    }
+
+    /// The segment reader for a cold read under `origin`: the segment the
+    /// last cold read kept open when it still applies (ft-yccm0.2.1.4).
+    fn take_cold_segment(
+        &self,
+        origin: LiveScrollbackColdSegmentOrigin,
+        fetch: &mut LiveScrollbackRecordFetch<'_>,
+    ) -> LiveScrollbackSegmentReader {
+        self.cold_segment.lock().map_or_else(
+            |_| LiveScrollbackSegmentReader::default(),
+            |mut kept| kept.take(origin, fetch),
+        )
+    }
+
+    /// Keep a cold read's open segment for the next cold read.
+    fn keep_cold_segment(
+        &self,
+        origin: LiveScrollbackColdSegmentOrigin,
+        reader: LiveScrollbackSegmentReader,
+    ) {
+        if let Ok(mut kept) = self.cold_segment.lock() {
+            kept.keep(origin, reader);
+        }
+    }
+
+    /// Wipe the segment the last cold read kept open, so rows a clear or a
+    /// replacement removes leave no plaintext behind.
+    fn forget_cold_segment(&self) {
+        if let Ok(mut kept) = self.cold_segment.lock() {
+            *kept = LiveScrollbackColdSegment::default();
+        }
     }
 
     fn active_ledger_pane_id(&self) -> u64 {
@@ -9616,6 +9655,7 @@ impl LiveScrollbackSpillSink {
             manifest_publish_interval,
             last_publication: std::sync::Mutex::new(std::time::Instant::now()),
             durability_syncs: std::sync::atomic::AtomicU64::new(0),
+            cold_segment: std::sync::Mutex::default(),
             store: std::sync::Mutex::new(store),
             state: std::sync::Mutex::new(state),
             keyring,
@@ -11064,13 +11104,12 @@ impl ScrollbackRowEncodeArena {
 
     /// Whether the prepared payload of `payload_bytes` must start a new
     /// segment: the open one is full by rows, or would pass the multi-row
-    /// byte cap.
+    /// byte cap, both the writer's targets.
     fn segment_is_full_for(&self, payload_bytes: usize) -> bool {
         !self.segment_rows.is_empty()
-            && (self.segment_rows.len()
-                >= mux::guardian_output_journal::SCROLLBACK_SEGMENT_MAX_ROWS
+            && (self.segment_rows.len() >= LIVE_SCROLLBACK_SEGMENT_TARGET_ROWS
                 || self.segment_payloads.len().saturating_add(payload_bytes)
-                    > mux::guardian_output_journal::SCROLLBACK_SEGMENT_MAX_PLAINTEXT_BYTES)
+                    > LIVE_SCROLLBACK_SEGMENT_TARGET_PLAINTEXT_BYTES)
     }
 
     /// Move the prepared payload into the open segment.
@@ -11650,6 +11689,176 @@ pub mod scrollback_record_bench {
         next_sequence: u64,
     }
 
+    /// A bench row's durable location: its stable row is its sequence.
+    fn bench_location(
+        sequence: u64,
+    ) -> mux::guardian_output_journal::GuardianScrollbackRowLocation {
+        mux::guardian_output_journal::GuardianScrollbackRowLocation::new(
+            [0x5a; 16],
+            [0xa5; 16],
+            sequence as i64,
+            sequence,
+        )
+        .expect("bench row location")
+    }
+
+    /// The first row a `ColdReadStore` seals per segment. A fresh lineage's
+    /// first batch is sealed as self-describing v3 rows, so the store writes
+    /// row 0 alone, as a pane's store is after its first spill, and every
+    /// later row in commit windows.
+    pub const FIRST_SEGMENT_ROW: u64 = 1;
+
+    /// Rows sealed both ways and kept (`Sealer::seal_window`): compact (v4)
+    /// records, one per row, and per-segment (v5) records from
+    /// `FIRST_SEGMENT_ROW` on.
+    pub struct SealedWindow {
+        compact_segment: mux::guardian_output_journal::GuardianScrollbackRowSegment,
+        compact: Vec<String>,
+        segment_nonces: mux::guardian_output_journal::GuardianScrollbackRowSegment,
+        segmented: Vec<String>,
+        segments: Vec<std::ops::Range<u64>>,
+    }
+
+    impl SealedWindow {
+        /// The rows of each sealed segment, in order.
+        #[must_use]
+        pub fn segments(&self) -> &[std::ops::Range<u64>] {
+            &self.segments
+        }
+    }
+
+    /// A live durable scrollback store holding `rows` from stable row 0, as
+    /// a pane's scrollback reaches it: row 0 alone, then commit windows
+    /// from `FIRST_SEGMENT_ROW`, then published. For cold reads through the
+    /// sink exactly as Screen's scrollback loads make them (ft-yccm0.2.1.4
+    /// AC2). Nothing is pruned.
+    pub struct ColdReadStore {
+        sink: super::LiveScrollbackSpillSink,
+        /// Each sealed segment's rows and payload bytes, in order.
+        segments: Vec<(std::ops::Range<u64>, u64)>,
+    }
+
+    impl ColdReadStore {
+        /// The store, in `dir`, which must outlive it.
+        #[must_use]
+        pub fn open(dir: &std::path::Path, rows: &Rows) -> Self {
+            use mux::guardian_output_journal::{
+                is_scrollback_segment_tail, scrollback_segment_record_plaintext_bytes,
+            };
+            use wezterm_term::config::ScrollbackSpillSink as _;
+
+            let sink = super::LiveScrollbackSpillSink::open(
+                dir.to_path_buf(),
+                &config::ScrollbackSpillSinkContext {
+                    pane_id: 1,
+                    domain_id: 1,
+                    durable_pane_id: [0x5a; 16],
+                    command_description: "scrollback-cold-read-bench".to_string(),
+                },
+                std::time::Duration::from_secs(3600),
+            )
+            .expect("bench durable scrollback store");
+            let count = rows.0.len();
+            assert!(
+                sink.store_scrollback_line(0, &rows.0[0], count),
+                "bench first row"
+            );
+            let mut row = FIRST_SEGMENT_ROW as usize;
+            while row < count {
+                let window =
+                    &rows.0[row..(row + super::LIVE_SCROLLBACK_APPEND_MAX_ROWS).min(count)];
+                let stored = sink.store_scrollback_lines(row as isize, window, count);
+                assert!(stored > 0, "bench window at row {row}");
+                row += stored;
+            }
+            sink.flush_scrollback().expect("bench store publishes");
+            let records = sink
+                .lock_store("scrollback cold-read bench")
+                .expect("bench store")
+                .lines_range_reaching_pruned(
+                    sink.active_ledger_pane_id(),
+                    0..count as u64,
+                    count,
+                    u64::MAX,
+                )
+                .expect("bench store records");
+            let mut segments = Vec::new();
+            let (mut start, mut payload_bytes) = (FIRST_SEGMENT_ROW, 0);
+            for (row, record) in (FIRST_SEGMENT_ROW..).zip(&records[FIRST_SEGMENT_ROW as usize..]) {
+                let tail = is_scrollback_segment_tail(record);
+                payload_bytes += u64::from(
+                    scrollback_segment_record_plaintext_bytes(record, tail)
+                        .expect("the bench store seals segments"),
+                );
+                if tail {
+                    segments.push((start..row + 1, payload_bytes));
+                    (start, payload_bytes) = (row + 1, 0);
+                }
+            }
+            assert_eq!(start, count as u64, "the last segment has a tail");
+            Self { sink, segments }
+        }
+
+        /// Each sealed segment's rows and payload bytes, in order.
+        #[must_use]
+        pub fn segments(&self) -> &[(std::ops::Range<u64>, u64)] {
+            &self.segments
+        }
+
+        /// Drop the segment the sink keeps open after a read, so the next
+        /// read is cold.
+        pub fn forget_open_segment(&self) {
+            self.sink.forget_cold_segment();
+        }
+
+        /// One row read: `load_scrollback_line`, which opens the segment
+        /// holding the row unless the sink kept it open.
+        #[must_use]
+        pub fn load(&self, row: u64) -> wezterm_term::Line {
+            use wezterm_term::config::ScrollbackSpillSink as _;
+
+            self.sink
+                .load_scrollback_line(row as isize)
+                .expect("bench cold read")
+        }
+
+        /// A viewport read: `rows` rows from `row` in one ranged load, which
+        /// opens each segment they touch at most once.
+        #[must_use]
+        pub fn load_viewport(&self, row: u64, rows: u64) -> Vec<wezterm_term::Line> {
+            use wezterm_term::config::ScrollbackSpillSink as _;
+
+            let lines = self
+                .sink
+                .load_scrollback_lines(row as isize..(row + rows) as isize);
+            assert_eq!(lines.len() as u64, rows, "bench viewport read");
+            lines
+        }
+
+        /// Every stored row, read as Screen sweeps cold rows (the cold
+        /// index, search): ranged loads of at most 32 rows. Unless
+        /// `keep_open`, each load starts cold, as every load did before the
+        /// sink kept a segment open. Returns the rows read.
+        #[must_use]
+        pub fn sweep(&self, keep_open: bool) -> usize {
+            use wezterm_term::config::ScrollbackSpillSink as _;
+
+            let end = self.segments.last().map_or(0, |(rows, _)| rows.end);
+            let mut row = 0;
+            while row < end {
+                if !keep_open {
+                    self.forget_open_segment();
+                }
+                let batch = self
+                    .sink
+                    .load_scrollback_lines(row as isize..(row + 32).min(end) as isize);
+                assert!(!batch.is_empty(), "bench sweep at row {row}");
+                row += batch.len() as u64;
+            }
+            row as usize
+        }
+    }
+
     impl Sealer {
         #[must_use]
         pub fn compact_stream(&self) -> CompactStream {
@@ -11669,28 +11878,34 @@ pub mod scrollback_record_bench {
         /// AC1). Returns the batch's record bytes; the records go back to
         /// the arena.
         pub fn seal_compact_arena(&self, rows: &Rows, stream: &mut CompactStream) -> usize {
+            self.seal_compact_window(rows, stream, |records| {
+                records.iter().map(String::len).sum()
+            })
+        }
+
+        /// `seal_compact_arena`, handing the window's records to `records`
+        /// before they go back to the arena.
+        fn seal_compact_window<R>(
+            &self,
+            rows: &Rows,
+            stream: &mut CompactStream,
+            records: impl FnOnce(&[String]) -> R,
+        ) -> R {
             let mut lease = super::ScrollbackRowEncodeLease::take();
             for line in &rows.0 {
                 let sequence = stream.next_sequence;
                 stream.next_sequence += 1;
-                let location = mux::guardian_output_journal::GuardianScrollbackRowLocation::new(
-                    [0x5a; 16],
-                    [0xa5; 16],
-                    sequence as i64,
-                    sequence,
-                )
-                .expect("bench row location");
                 lease
                     .arena
                     .prepare_payload(line)
                     .expect("bench row serializes");
-                assert!(
-                    lease
-                        .arena
-                        .seal_compact_row(&self.cipher, &mut stream.stream, location)
-                );
+                assert!(lease.arena.seal_compact_row(
+                    &self.cipher,
+                    &mut stream.stream,
+                    bench_location(sequence)
+                ));
             }
-            lease.arena.batch.iter().map(String::len).sum()
+            records(&lease.arena.batch)
         }
 
         /// The same rows and payloads as `seal_compact_arena`, sealed per
@@ -11699,31 +11914,139 @@ pub mod scrollback_record_bench {
         /// its ciphertext and the segment's last row the tag. Returns the
         /// batch's record bytes.
         pub fn seal_segments_arena(&self, rows: &Rows, stream: &mut CompactStream) -> usize {
+            self.seal_segment_window(&rows.0, stream, |records| {
+                records.iter().map(String::len).sum()
+            })
+        }
+
+        /// `seal_segments_arena` for `lines`, handing the window's records to
+        /// `records` before they go back to the arena.
+        fn seal_segment_window<R>(
+            &self,
+            lines: &[wezterm_term::Line],
+            stream: &mut CompactStream,
+            records: impl FnOnce(&[String]) -> R,
+        ) -> R {
             let mut lease = super::ScrollbackRowEncodeLease::take();
             let arena = &mut lease.arena;
-            let location = |sequence: u64| {
-                mux::guardian_output_journal::GuardianScrollbackRowLocation::new(
-                    [0x5a; 16],
-                    [0xa5; 16],
-                    sequence as i64,
-                    sequence,
-                )
-                .expect("bench row location")
-            };
             let mut first = stream.next_sequence;
-            for line in &rows.0 {
+            for line in lines {
                 let payload_bytes = arena.prepare_payload(line).expect("bench row serializes");
                 if arena.segment_is_full_for(payload_bytes) {
                     let sealed_rows = arena.segment_rows.len() as u64;
-                    assert!(arena.seal_segment(&self.cipher, &mut stream.stream, location(first)));
+                    assert!(arena.seal_segment(
+                        &self.cipher,
+                        &mut stream.stream,
+                        bench_location(first)
+                    ));
                     first += sealed_rows;
                 }
                 assert!(arena.push_segment_payload());
             }
             let sealed_rows = arena.segment_rows.len() as u64;
-            assert!(arena.seal_segment(&self.cipher, &mut stream.stream, location(first)));
+            assert!(arena.seal_segment(&self.cipher, &mut stream.stream, bench_location(first)));
             stream.next_sequence = first + sealed_rows;
-            arena.batch.iter().map(String::len).sum()
+            records(&arena.batch)
+        }
+
+        /// `rows` sealed both ways under fresh nonce streams, with the
+        /// records kept for cold reads (ft-yccm0.2.1.4 AC2): every row as a
+        /// compact (v4) row from sequence 0, and, as a `ColdReadStore`
+        /// holds them, the rows from `FIRST_SEGMENT_ROW` on as one commit
+        /// window sealed per segment.
+        #[must_use]
+        pub fn seal_window(&self, rows: &Rows) -> SealedWindow {
+            use mux::guardian_output_journal::is_scrollback_segment_tail;
+
+            let mut compact_stream = self.compact_stream();
+            let mut segment_stream = self.compact_stream();
+            segment_stream.next_sequence = FIRST_SEGMENT_ROW;
+            let compact_segment = compact_stream.stream.segment();
+            let segment_nonces = segment_stream.stream.segment();
+            let compact = self.seal_compact_window(rows, &mut compact_stream, <[String]>::to_vec);
+            let segmented = self.seal_segment_window(
+                &rows.0[FIRST_SEGMENT_ROW as usize..],
+                &mut segment_stream,
+                <[String]>::to_vec,
+            );
+            let mut segments = Vec::new();
+            let mut start = FIRST_SEGMENT_ROW;
+            for (row, record) in (FIRST_SEGMENT_ROW..).zip(&segmented) {
+                if is_scrollback_segment_tail(record) {
+                    segments.push(start..row + 1);
+                    start = row + 1;
+                }
+            }
+            assert_eq!(start, rows.0.len() as u64, "the last segment has a tail");
+            SealedWindow {
+                compact_segment,
+                compact,
+                segment_nonces,
+                segmented,
+                segments,
+            }
+        }
+
+        /// A cold read at the cipher of the compact (v4) row at `sequence`,
+        /// as rows were stored before option A: open the row alone, then
+        /// decode it.
+        #[must_use]
+        pub fn open_compact_row(&self, window: &SealedWindow, sequence: u64) -> wezterm_term::Line {
+            let plaintext = self
+                .cipher
+                .open_compact_scrollback_row(
+                    &window.compact_segment,
+                    &window.compact[sequence as usize],
+                    bench_location(sequence),
+                    super::LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE as u32,
+                )
+                .expect("bench compact row opens");
+            super::decode_exact_semantic_scrollback_plaintext(
+                plaintext,
+                super::LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+            )
+            .expect("bench row decodes")
+            .0
+        }
+
+        /// A cold read at the cipher of the per-segment (v5) row at
+        /// `sequence`, as a reader with no segment open makes it: open the
+        /// whole segment holding the row into fresh buffers, then decode the
+        /// row.
+        #[must_use]
+        pub fn open_segment_row(&self, window: &SealedWindow, sequence: u64) -> wezterm_term::Line {
+            let rows = window
+                .segments
+                .iter()
+                .find(|rows| rows.contains(&sequence))
+                .expect("a bench segment holds the row");
+            let records: Vec<&str> = window.segmented[(rows.start - FIRST_SEGMENT_ROW) as usize
+                ..(rows.end - FIRST_SEGMENT_ROW) as usize]
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let mut plaintext = zeroize::Zeroizing::new(Vec::new());
+            let (mut row_bytes, mut aad) = (Vec::new(), Vec::new());
+            self.cipher
+                .open_scrollback_segment(
+                    &window.segment_nonces,
+                    bench_location(rows.start),
+                    &records,
+                    super::LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+                    &mut plaintext,
+                    &mut row_bytes,
+                    &mut aad,
+                )
+                .expect("bench segment opens");
+            let index = (sequence - rows.start) as usize;
+            let start: usize = row_bytes[..index].iter().map(|&bytes| bytes as usize).sum();
+            let payload = plaintext[start..start + row_bytes[index] as usize].to_vec();
+            super::decode_exact_semantic_scrollback_plaintext(
+                zeroize::Zeroizing::new(payload),
+                super::LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+            )
+            .expect("bench row decodes")
+            .0
         }
 
         /// What the cell-vector schemas (2 or 1) take for these rows,
@@ -12446,6 +12769,21 @@ const LIVE_SCROLLBACK_SEGMENT_FETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// base64, which a batch's byte budget reserves for every segment it opens.
 const LIVE_SCROLLBACK_SEGMENT_TAG_RECORD_BYTES: usize = 22;
 
+/// The segments the store's writer cuts (ft-yccm0.2.1.4 AC2): at most 1024
+/// rows and 128 KiB of payload, a quarter and a half of the format's
+/// bounds, which readers keep accepting. A cold read opens the whole
+/// segment holding its row, and with segments at the format's bounds cold
+/// reads measured up to 1.5 ms (benches/scrollback_cold_read.rs); one
+/// sealing per 1024 rows still amortizes the AEAD.
+const LIVE_SCROLLBACK_SEGMENT_TARGET_ROWS: usize = 1024;
+const LIVE_SCROLLBACK_SEGMENT_TARGET_PLAINTEXT_BYTES: usize = 128 * 1024;
+const _: () = assert!(
+    LIVE_SCROLLBACK_SEGMENT_TARGET_ROWS
+        <= mux::guardian_output_journal::SCROLLBACK_SEGMENT_MAX_ROWS
+        && LIVE_SCROLLBACK_SEGMENT_TARGET_PLAINTEXT_BYTES
+            <= mux::guardian_output_journal::SCROLLBACK_SEGMENT_MAX_PLAINTEXT_BYTES
+);
+
 /// A segment reader's fetch from the live store: exactly the rows `range`,
 /// which may reach into the pruned tail, where a segment holding the oldest
 /// retained row may start (ft-yccm0.2.1.4).
@@ -12537,6 +12875,8 @@ struct LiveScrollbackSegmentReader {
     /// Each open row's start in `plaintext`.
     offsets: Vec<usize>,
     aad: Vec<u8>,
+    /// The open segment's tail record, as read.
+    tail: String,
 }
 
 impl LiveScrollbackSegmentReader {
@@ -12546,6 +12886,26 @@ impl LiveScrollbackSegmentReader {
         let start = *self.offsets.get(index)?;
         let bytes = *self.row_bytes.get(index)? as usize;
         self.plaintext.get(start..start.checked_add(bytes)?)
+    }
+
+    /// The open segment's rows, if one is open.
+    fn open_rows(&self) -> Option<std::ops::Range<u64>> {
+        let rows = u64::try_from(self.offsets.len())
+            .ok()
+            .filter(|rows| *rows > 0)?;
+        Some(self.first..self.first.checked_add(rows)?)
+    }
+
+    /// Whether the open segment is still stored as it was read: its tail
+    /// record, whose tag covers the whole segment, is unchanged at its
+    /// sequence. Stored rows are rewritten only after a cut through the
+    /// ledger's end, sealed again under a fresh nonce, so a rewritten
+    /// segment never keeps its tail.
+    fn still_stored(&self, fetch: &mut LiveScrollbackRecordFetch<'_>) -> bool {
+        self.open_rows().is_some_and(|rows| {
+            fetch(rows.end - 1..rows.end)
+                .is_ok_and(|records| matches!(records.as_slice(), [tail] if *tail == self.tail))
+        })
     }
 
     /// The payload of the v5 row at `sequence` (its stable row is
@@ -12575,12 +12935,16 @@ impl LiveScrollbackSegmentReader {
                 "scrollback segment row {sequence} is not reachable"
             );
             let max_rows = u64::try_from(SCROLLBACK_SEGMENT_MAX_ROWS)?;
+            // The rows the scan back reads after the previous segment are
+            // this segment's first rows: keep them, so each record is read
+            // once.
+            let mut earlier = Vec::new();
             let mut start = sequence;
             while start > physical_oldest {
                 let from = start
                     .saturating_sub(LIVE_SCROLLBACK_SEGMENT_FETCH_ROWS)
                     .max(physical_oldest);
-                let block = fetch(from..start)?;
+                let mut block = fetch(from..start)?;
                 anyhow::ensure!(
                     u64::try_from(block.len())? == start - from,
                     "scrollback rows before a segment row are missing"
@@ -12590,17 +12954,22 @@ impl LiveScrollbackSegmentReader {
                 }) {
                     Some(at) => {
                         start = from + u64::try_from(at)? + 1;
+                        block.drain(..=at);
+                        earlier.push(block);
                         break;
                     }
-                    None => start = from,
+                    None => {
+                        start = from;
+                        earlier.push(block);
+                    }
                 }
                 anyhow::ensure!(
                     sequence - start < max_rows,
                     "a scrollback segment runs past its row bound"
                 );
             }
-            let mut records = Vec::new();
-            let mut at = start;
+            let mut records: Vec<String> = earlier.into_iter().rev().flatten().collect();
+            let mut at = sequence;
             'segment: loop {
                 anyhow::ensure!(at < next, "a scrollback segment has no tail");
                 let to = at
@@ -12665,9 +13034,68 @@ impl LiveScrollbackSegmentReader {
                 self.offsets.push(offset);
                 offset += *bytes as usize;
             }
+            self.tail = records.pop().unwrap_or_default();
+            #[cfg(test)]
+            LIVE_SCROLLBACK_SEGMENT_OPENS.with(|opens| opens.set(opens.get() + 1));
         }
         self.open_row(sequence)
             .ok_or_else(|| anyhow::anyhow!("an open scrollback segment lost its row"))
+    }
+}
+
+/// Where a sink's kept segment was read: the ledger, the content epoch and
+/// the stable row of the ledger's first sequence.
+type LiveScrollbackColdSegmentOrigin = (u64, [u8; 16], wezterm_term::StableRowIndex);
+
+/// The most buffer a kept segment may hold: a full segment's plaintext,
+/// with room for the base64 decoder's growth.
+const LIVE_SCROLLBACK_COLD_SEGMENT_MAX_CAPACITY: usize =
+    4 * mux::guardian_output_journal::SCROLLBACK_SEGMENT_MAX_PLAINTEXT_BYTES;
+
+/// The sealed segment a sink's last cold read opened, kept open for the
+/// next (ft-yccm0.2.1.4). Screen reads cold rows in batches of at most 32,
+/// so without it a sweep (the cold index, search) decrypts each segment
+/// once per batch; with it, once. A kept segment is used only under the
+/// origin it was read under, and only while it is still stored as it was
+/// read. A segment larger than the bound (a single larger row) is not
+/// kept. The plaintext is wiped when it is replaced and on drop.
+#[derive(Default)]
+struct LiveScrollbackColdSegment {
+    origin: Option<LiveScrollbackColdSegmentOrigin>,
+    reader: LiveScrollbackSegmentReader,
+}
+
+impl LiveScrollbackColdSegment {
+    /// A reader for a cold read under `origin`: the kept segment if it
+    /// still applies, else one with nothing open.
+    fn take(
+        &mut self,
+        origin: LiveScrollbackColdSegmentOrigin,
+        fetch: &mut LiveScrollbackRecordFetch<'_>,
+    ) -> LiveScrollbackSegmentReader {
+        let reader = std::mem::take(&mut self.reader);
+        if self.origin.take() == Some(origin) && reader.still_stored(fetch) {
+            reader
+        } else {
+            LiveScrollbackSegmentReader::default()
+        }
+    }
+
+    /// Keep `reader`'s open segment for the next cold read under `origin`,
+    /// unless it is larger than a bounded segment.
+    fn keep(
+        &mut self,
+        origin: LiveScrollbackColdSegmentOrigin,
+        reader: LiveScrollbackSegmentReader,
+    ) {
+        if reader.open_rows().is_some()
+            && reader.plaintext.len()
+                <= mux::guardian_output_journal::SCROLLBACK_SEGMENT_MAX_PLAINTEXT_BYTES
+            && reader.plaintext.capacity() <= LIVE_SCROLLBACK_COLD_SEGMENT_MAX_CAPACITY
+        {
+            self.origin = Some(origin);
+            self.reader = reader;
+        }
     }
 }
 
@@ -14105,10 +14533,14 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         let (physical_oldest, next) = store_segment_bounds(&store, ledger_pane_id).ok()?;
         let keyring = self.lock_keyring("load_scrollback_line decrypt").ok()?;
         let mut cipher_cache = GuardianScrollbackCipherCache::new(&keyring, &state.row_segments);
-        decode_stored_scrollback_row(
+        let mut fetch =
+            |range: std::ops::Range<u64>| store_segment_records(&store, ledger_pane_id, range);
+        let origin = (ledger_pane_id, content_epoch, initial);
+        let mut segments = self.take_cold_segment(origin, &mut fetch);
+        let (line, _decoded_bytes, _fidelity) = decode_stored_scrollback_row(
             &record,
-            &mut LiveScrollbackSegmentReader::default(),
-            &mut |range| store_segment_records(&store, ledger_pane_id, range),
+            &mut segments,
+            &mut fetch,
             physical_oldest,
             next,
             &mut cipher_cache,
@@ -14118,8 +14550,9 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             seq,
             LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
         )
-        .ok()
-        .map(|(line, _decoded_bytes, _fidelity)| line)
+        .ok()?;
+        self.keep_cold_segment(origin, segments);
+        Some(line)
     }
 
     fn load_scrollback_lines(
@@ -14505,6 +14938,7 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         let _mutation_gate = self.lock_mutation_gate("replace_scrollback_prefix")?;
         let _filesystem_mutation_lease =
             self.lock_filesystem_mutation("replace_scrollback_prefix")?;
+        self.forget_cold_segment();
         let row_count = prefix.row_count();
         if row_count > max_retained_rows {
             return Err(ScrollbackSpillError::ResourceLimit {
@@ -14860,6 +15294,7 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
 
         let _mutation_gate = self.lock_mutation_gate("clear_scrollback")?;
         let _filesystem_mutation_lease = self.lock_filesystem_mutation("clear_scrollback")?;
+        self.forget_cold_segment();
         let ledger_pane_id = self.active_ledger_pane_id();
         let current_state = *self.lock_state("clear_scrollback current state")?;
         if current_state.transaction_quarantined {
@@ -20081,6 +20516,229 @@ mod tests {
         assert!(
             after_ledger + after_metadata < before_ledger + before_metadata,
             "schema 3 must not amplify T0's durable bytes"
+        );
+    }
+
+    /// ft-yccm0.2.1.4 AC2: the cold-read bench measures the store's own
+    /// segments. The live store, row 0 alone then one full window, seals
+    /// the window into exactly the segments the bench's sealer cuts (the
+    /// writer's 128 KiB target ends ascii91's first, its 1024-row target
+    /// ascii9's), and every hook
+    /// reads back exactly the stored rows: both cipher-level opens, the
+    /// store's cold row reads at each segment's first and tail rows, and a
+    /// viewport across a segment boundary.
+    #[test]
+    fn cold_read_bench_hooks_read_back_exact_rows_from_the_stores_segments() {
+        use super::scrollback_record_bench::{ColdReadStore, FIRST_SEGMENT_ROW, Rows, Sealer};
+        use mux::guardian_output_journal::{
+            SCROLLBACK_SEGMENT_MAX_PLAINTEXT_BYTES, SCROLLBACK_SEGMENT_MAX_ROWS,
+        };
+
+        let same = |mut stored: Line, expected: &Line, case: &str| {
+            let mut expected = expected.clone();
+            assert_eq!(stored.cells_mut(), expected.cells_mut(), "{case}");
+        };
+        let sealer = Sealer::new();
+        let rows_stored = FIRST_SEGMENT_ROW as usize + LIVE_SCROLLBACK_APPEND_MAX_ROWS;
+        for (shape, rows) in [
+            ("ascii91", Rows::printable(rows_stored, 91)),
+            ("ascii9", Rows::printable(rows_stored, 9)),
+        ] {
+            let lines = rows.lines();
+            let window = sealer.seal_window(&rows);
+            let dir = tempfile::tempdir().unwrap();
+            let store = ColdReadStore::open(dir.path(), &rows);
+            let store_segments: Vec<_> = store
+                .segments()
+                .iter()
+                .map(|(rows, _)| rows.clone())
+                .collect();
+            assert_eq!(store_segments, window.segments(), "{shape}");
+            assert_eq!(
+                store_segments.first().map(|rows| rows.start),
+                Some(FIRST_SEGMENT_ROW),
+                "{shape}"
+            );
+            for (rows, payload_bytes) in store.segments() {
+                assert!(
+                    (rows.end - rows.start) as usize <= LIVE_SCROLLBACK_SEGMENT_TARGET_ROWS
+                        && *payload_bytes as usize
+                            <= LIVE_SCROLLBACK_SEGMENT_TARGET_PLAINTEXT_BYTES
+                        && LIVE_SCROLLBACK_SEGMENT_TARGET_ROWS <= SCROLLBACK_SEGMENT_MAX_ROWS
+                        && LIVE_SCROLLBACK_SEGMENT_TARGET_PLAINTEXT_BYTES
+                            <= SCROLLBACK_SEGMENT_MAX_PLAINTEXT_BYTES,
+                    "{shape}: segment {rows:?} of {payload_bytes} bytes"
+                );
+            }
+            let (first, first_bytes) = store.segments()[0].clone();
+            match shape {
+                "ascii91" => assert!(
+                    store.segments().len() > 1
+                        && ((first.end - first.start) as usize)
+                            < LIVE_SCROLLBACK_SEGMENT_TARGET_ROWS
+                        && first_bytes as usize
+                            > LIVE_SCROLLBACK_SEGMENT_TARGET_PLAINTEXT_BYTES - 1024,
+                    "ascii91: the byte target ends the first segment {first:?} at {first_bytes}"
+                ),
+                _ => assert_eq!(
+                    first.end - first.start,
+                    LIVE_SCROLLBACK_SEGMENT_TARGET_ROWS as u64,
+                    "ascii9: the row target ends the first segment"
+                ),
+            }
+            for (rows, _) in store.segments() {
+                for row in [rows.start, rows.end - 1] {
+                    let expected = &lines[row as usize];
+                    let case = format!("{shape} row {row}");
+                    same(sealer.open_compact_row(&window, row), expected, &case);
+                    same(sealer.open_segment_row(&window, row), expected, &case);
+                    same(store.load(row), expected, &case);
+                }
+            }
+            let from = first.end.saturating_sub(12);
+            let viewport = store.load_viewport(from, 24.min(lines.len() as u64 - from));
+            for (row, line) in (from..).zip(viewport) {
+                same(
+                    line,
+                    &lines[row as usize],
+                    &format!("{shape} viewport row {row}"),
+                );
+            }
+            // A sweep in 32-row loads opens each segment once with the
+            // sink keeping one open, and once per load touching it without.
+            let opens = || LIVE_SCROLLBACK_SEGMENT_OPENS.with(std::cell::Cell::get);
+            let end = lines.len() as u64;
+            let cold_opens: usize = (0..end)
+                .step_by(32)
+                .map(|start| {
+                    let stop = (start + 32).min(end);
+                    store
+                        .segments()
+                        .iter()
+                        .filter(|(rows, _)| rows.start < stop && start < rows.end)
+                        .count()
+                })
+                .sum();
+            for (keep_open, expected) in [(true, store.segments().len()), (false, cold_opens)] {
+                store.forget_open_segment();
+                let before = opens();
+                assert_eq!(store.sweep(keep_open), lines.len(), "{shape}");
+                assert_eq!(
+                    opens() - before,
+                    expected,
+                    "{shape}: segment opens of a sweep keeping one open: {keep_open}"
+                );
+            }
+        }
+    }
+
+    /// ft-yccm0.2.1.4: the sink keeps the segment its last cold read
+    /// opened. A sweep in Screen's 32-row loads opens each segment once,
+    /// not once per load, and a row read after its neighbor opens nothing.
+    /// A kept segment is used only while its tail is stored as it was read,
+    /// and never across a clear, even where the new rows reuse its
+    /// sequences.
+    #[test]
+    fn cold_reads_keep_the_last_segment_open_until_it_changes() {
+        const RETENTION: usize = 4096;
+        let dir = tempfile::tempdir().unwrap();
+        let sink = windowed_test_sink(dir.path());
+        let mut rows = vec![Line::from_text("prior", &CellAttributes::blank(), 1, None)];
+        assert!(sink.store_scrollback_line(0, &rows[0], RETENTION));
+        for window in 0..3 {
+            let lines = digest_only_test_lines(&format!("w{window}"), 40);
+            assert_eq!(
+                sink.store_scrollback_lines(rows.len() as isize, &lines, RETENTION),
+                40
+            );
+            rows.extend(lines);
+        }
+        sink.flush_scrollback().unwrap();
+        let ledger_pane_id = sink.active_ledger_pane_id();
+        let tails: Vec<u64> = sink
+            .lock_store("test kept segment tails")
+            .unwrap()
+            .lines_range_reaching_pruned(ledger_pane_id, 0..121, 121, 1 << 20)
+            .unwrap()
+            .iter()
+            .zip(0..)
+            .filter(|(record, _)| mux::guardian_output_journal::is_scrollback_segment_tail(record))
+            .map(|(_, row)| row)
+            .collect();
+        assert_eq!(tails, vec![40, 80, 120], "one segment per window");
+        let opens = || LIVE_SCROLLBACK_SEGMENT_OPENS.with(std::cell::Cell::get);
+        let text = |line: &Line| line.as_str().into_owned();
+
+        let before = opens();
+        let mut row = 0;
+        while row < rows.len() {
+            let batch =
+                sink.load_scrollback_lines(row as isize..(row + 32).min(rows.len()) as isize);
+            assert!(!batch.is_empty(), "sweep at row {row}");
+            for (offset, line) in batch.iter().enumerate() {
+                assert_eq!(
+                    text(line),
+                    text(&rows[row + offset]),
+                    "row {}",
+                    row + offset
+                );
+            }
+            row += batch.len();
+        }
+        assert_eq!(opens() - before, 3, "the sweep opens each segment once");
+
+        let before = opens();
+        assert_eq!(
+            text(&sink.load_scrollback_line(50).unwrap()),
+            text(&rows[50])
+        );
+        assert_eq!(
+            text(&sink.load_scrollback_line(51).unwrap()),
+            text(&rows[51])
+        );
+        assert_eq!(
+            opens() - before,
+            1,
+            "row 51 reads from row 50's open segment"
+        );
+
+        {
+            let store = sink.lock_store("test kept segment").unwrap();
+            let kept = sink.cold_segment.lock().unwrap();
+            assert_eq!(kept.reader.open_rows(), Some(41..81));
+            let mut stored =
+                |range: std::ops::Range<u64>| store_segment_records(&store, ledger_pane_id, range);
+            assert!(kept.reader.still_stored(&mut stored));
+            // The same rows sealed again carry another tag.
+            let mut resealed = |range: std::ops::Range<u64>| -> anyhow::Result<Vec<String>> {
+                let mut records = store_segment_records(&store, ledger_pane_id, range)?;
+                let last = records[0].pop().unwrap();
+                records[0].push(if last == 'A' { 'B' } else { 'A' });
+                Ok(records)
+            };
+            assert!(!kept.reader.still_stored(&mut resealed));
+            let mut cut =
+                |_: std::ops::Range<u64>| -> anyhow::Result<Vec<String>> { anyhow::bail!("cut") };
+            assert!(!kept.reader.still_stored(&mut cut));
+        }
+
+        // A clear wipes the kept segment. New rows then reuse its
+        // sequences: row 250 is sequence 50.
+        sink.clear_scrollback().unwrap();
+        assert_eq!(sink.cold_segment.lock().unwrap().reader.open_rows(), None);
+        let prior = Line::from_text("prior after clear", &CellAttributes::blank(), 1, None);
+        assert!(sink.store_scrollback_line(200, &prior, RETENTION));
+        let after = digest_only_test_lines("after", 100);
+        assert_eq!(sink.store_scrollback_lines(201, &after, RETENTION), 100);
+        let before = opens();
+        assert_eq!(
+            text(&sink.load_scrollback_line(250).unwrap()),
+            text(&after[49])
+        );
+        assert_eq!(
+            opens() - before,
+            1,
+            "the kept segment is not reused across a clear"
         );
     }
 
