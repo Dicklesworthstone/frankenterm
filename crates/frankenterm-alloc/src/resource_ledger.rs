@@ -1224,6 +1224,33 @@ impl FramesSnapshot {
     }
 }
 
+/// Font faces shaped in this process, by whether HarfBuzz ran
+/// (ft-yccm0.4.3.3); filled by the process that shapes text. Their sum is
+/// every face shape; per frame, the first is HarfBuzz calls per frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShapingSnapshot {
+    /// Faces shaped by HarfBuzz, one call each.
+    pub harfbuzz_shapes_total: u64,
+    /// Faces laid out from the printable ASCII table without HarfBuzz.
+    pub bypassed_ascii_shapes_total: u64,
+    /// Faces laid out from the single-codepoint cluster cache without
+    /// HarfBuzz.
+    pub bypassed_cluster_shapes_total: u64,
+}
+
+impl ShapingSnapshot {
+    /// One human-readable line for the GUI debug overlay.
+    #[must_use]
+    pub fn summary_line(&self) -> String {
+        format!(
+            "Shaping: {} faces by HarfBuzz; {} from the ASCII table, {} from the cluster cache",
+            self.harfbuzz_shapes_total,
+            self.bypassed_ascii_shapes_total,
+            self.bypassed_cluster_shapes_total
+        )
+    }
+}
+
 /// The change-detected part of a published snapshot.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceSnapshotBody {
@@ -1245,6 +1272,10 @@ pub struct ResourceSnapshotBody {
     /// process that owns the panes.
     #[serde(default)]
     pub writers: WritersSnapshot,
+    /// Face shapes by whether HarfBuzz ran (ft-yccm0.4.3.3), filled by the
+    /// process that shapes text.
+    #[serde(default)]
+    pub shaping: ShapingSnapshot,
 }
 
 impl ResourceSnapshotBody {
@@ -1260,6 +1291,7 @@ impl ResourceSnapshotBody {
             durability: DurabilityLedger::global().snapshot(),
             frames: FrameLedger::global().snapshot(),
             writers: WritersSnapshot::default(),
+            shaping: ShapingSnapshot::default(),
         }
     }
 
@@ -1463,6 +1495,9 @@ pub struct ResourceSnapshotEnvelope {
     /// Per-pane terminal writer queues and reply drops (ft-yccm0.2.2.5).
     #[serde(default)]
     pub writers: WritersSnapshot,
+    /// Face shapes by whether HarfBuzz ran (ft-yccm0.4.3.3).
+    #[serde(default)]
+    pub shaping: ShapingSnapshot,
 }
 
 impl ResourceSnapshotEnvelope {
@@ -1482,6 +1517,7 @@ impl ResourceSnapshotEnvelope {
             durability: body.durability,
             frames: body.frames,
             writers: body.writers,
+            shaping: body.shaping,
         }
     }
 }

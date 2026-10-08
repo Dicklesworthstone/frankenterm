@@ -1,9 +1,11 @@
 use crate::parser::ParsedFont;
 use crate::units::PixelLength;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use termwiz::cell::Presentation;
 use termwiz::cellcluster::CellCluster;
 
+mod bypass;
 pub mod harfbuzz;
 pub use wezterm_bidi::Direction;
 
@@ -154,15 +156,29 @@ pub trait FontShaper {
 }
 
 /// What fallback walks did (ft-yccm0.2.12): every face tried for a run is
-/// either shaped or skipped without being loaded or shaped.
+/// either shaped or skipped without being loaded or shaped. A face is
+/// shaped by HarfBuzz or, since ft-yccm0.4.3.3, laid out from cached
+/// clusters without it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FallbackWalkStats {
-    /// Faces shaped, one HarfBuzz call each.
+    /// Faces shaped by HarfBuzz, one HarfBuzz call each.
     pub faces_shaped: u64,
     /// Faces skipped because their presentation does not match the run's.
     pub skipped_presentation: u64,
     /// Faces skipped because their coverage maps none of the run's emoji.
     pub skipped_coverage: u64,
+    /// Faces laid out from the printable ASCII table, without HarfBuzz.
+    pub bypassed_ascii: u64,
+    /// Faces laid out from the single-codepoint cluster cache, without
+    /// HarfBuzz.
+    pub bypassed_clusters: u64,
+}
+
+impl FallbackWalkStats {
+    /// Faces shaped by HarfBuzz or laid out without it.
+    pub fn faces_laid_out(&self) -> u64 {
+        self.faces_shaped + self.bypassed_ascii + self.bypassed_clusters
+    }
 }
 
 impl std::ops::Add for FallbackWalkStats {
@@ -173,6 +189,50 @@ impl std::ops::Add for FallbackWalkStats {
             faces_shaped: self.faces_shaped + other.faces_shaped,
             skipped_presentation: self.skipped_presentation + other.skipped_presentation,
             skipped_coverage: self.skipped_coverage + other.skipped_coverage,
+            bypassed_ascii: self.bypassed_ascii + other.bypassed_ascii,
+            bypassed_clusters: self.bypassed_clusters + other.bypassed_clusters,
+        }
+    }
+}
+
+/// Face shapes in this process, by whether HarfBuzz ran (ft-yccm0.4.3.3):
+/// the `shaping` section of the published resource snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShapingTotals {
+    pub harfbuzz_shapes: u64,
+    pub bypassed_ascii_shapes: u64,
+    pub bypassed_cluster_shapes: u64,
+}
+
+static HARFBUZZ_SHAPES: AtomicU64 = AtomicU64::new(0);
+static BYPASSED_ASCII_SHAPES: AtomicU64 = AtomicU64::new(0);
+static BYPASSED_CLUSTER_SHAPES: AtomicU64 = AtomicU64::new(0);
+
+pub fn shaping_totals() -> ShapingTotals {
+    ShapingTotals {
+        harfbuzz_shapes: HARFBUZZ_SHAPES.load(Ordering::Relaxed),
+        bypassed_ascii_shapes: BYPASSED_ASCII_SHAPES.load(Ordering::Relaxed),
+        bypassed_cluster_shapes: BYPASSED_CLUSTER_SHAPES.load(Ordering::Relaxed),
+    }
+}
+
+/// Adds what a shaper's stats gained to the process totals.
+fn add_to_totals(before: FallbackWalkStats, after: FallbackWalkStats) {
+    for (total, before, after) in [
+        (&HARFBUZZ_SHAPES, before.faces_shaped, after.faces_shaped),
+        (
+            &BYPASSED_ASCII_SHAPES,
+            before.bypassed_ascii,
+            after.bypassed_ascii,
+        ),
+        (
+            &BYPASSED_CLUSTER_SHAPES,
+            before.bypassed_clusters,
+            after.bypassed_clusters,
+        ),
+    ] {
+        if after > before {
+            total.fetch_add(after - before, Ordering::Relaxed);
         }
     }
 }

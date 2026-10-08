@@ -232,6 +232,8 @@ pub fn show_debug_overlay(
         lines.extend(body.lock_and_durability_lines());
         // ft-yccm0.1.4: presented frames and the max_fps cap.
         lines.push(body.frames.summary_line());
+        // ft-yccm0.4.3.3: faces shaped by HarfBuzz and laid out without it.
+        lines.push(crate::shaping_snapshot().summary_line());
         lines.push(AllocatorSnapshot::read().summary_line());
         lines.join("\r\n")
     };

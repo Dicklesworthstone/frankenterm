@@ -1,4 +1,7 @@
 use crate::parser::{FontCoverage, ParsedFont};
+use crate::shaper::bypass::{
+    self, Cluster, ClusterCache, Features, GlyphSet, LayoutGate, Plan, RawGlyph, Run, TableKey,
+};
 use crate::shaper::{
     FallbackIdx, FallbackWalkStats, FontMetrics, FontShaper, GlyphInfo, PresentationWidth,
 };
@@ -45,6 +48,14 @@ fn skip_faces_lacking_every_emoji() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var_os("FT_DISABLE_EMOJI_COVERAGE_SKIP").as_deref()
             != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+// Same-binary control for the ASCII table and cluster cache (ft-yccm0.4.3.3).
+fn shaping_bypass_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("FT_DISABLE_SHAPING_BYPASS").as_deref() != Some(std::ffi::OsStr::new("1"))
     })
 }
 
@@ -128,6 +139,11 @@ pub struct HarfbuzzShaper {
     /// be computed, in which case the face is never skipped by coverage.
     coverage: Vec<OnceCell<Option<Arc<FontCoverage>>>>,
     skip_uncovered_emoji: bool,
+    /// Whether runs may be laid out from cached clusters (ft-yccm0.4.3.3).
+    shaping_bypass: bool,
+    /// Each face's composable glyphs, computed on first need.
+    gates: Vec<OnceCell<LayoutGate>>,
+    clusters: RefCell<ClusterCache>,
     walk_stats: Cell<FallbackWalkStats>,
     unused_fonts: RefCell<VecDeque<FallbackIdx>>,
     lib: ftwrap::Library,
@@ -148,6 +164,22 @@ impl HarfbuzzShaper {
         handles: &[ParsedFont],
         skip_uncovered_emoji: bool,
     ) -> anyhow::Result<Self> {
+        Self::with_options(
+            config,
+            handles,
+            skip_uncovered_emoji,
+            shaping_bypass_enabled(),
+        )
+    }
+
+    /// `shaping_bypass` false has HarfBuzz shape every face: the parity
+    /// control for the ASCII table and cluster cache.
+    fn with_options(
+        config: &ConfigHandle,
+        handles: &[ParsedFont],
+        skip_uncovered_emoji: bool,
+        shaping_bypass: bool,
+    ) -> anyhow::Result<Self> {
         let lib = ftwrap::Library::new()?;
         let handles = handles.to_vec();
         let mut fonts = vec![];
@@ -155,6 +187,7 @@ impl HarfbuzzShaper {
             fonts.push(RefCell::new(None));
         }
         let coverage = (0..handles.len()).map(|_| OnceCell::new()).collect();
+        let gates = (0..handles.len()).map(|_| OnceCell::new()).collect();
 
         let lang = harfbuzz::language_from_string("en")?;
 
@@ -168,6 +201,9 @@ impl HarfbuzzShaper {
             fonts,
             coverage,
             skip_uncovered_emoji,
+            shaping_bypass,
+            gates,
+            clusters: RefCell::new(ClusterCache::default()),
             walk_stats: Cell::new(FallbackWalkStats::default()),
             unused_fonts: RefCell::new(VecDeque::new()),
             handles,
@@ -179,9 +215,184 @@ impl HarfbuzzShaper {
     }
 
     fn count(&self, update: impl FnOnce(&mut FallbackWalkStats)) {
-        let mut stats = self.walk_stats.get();
+        let before = self.walk_stats.get();
+        let mut stats = before;
         update(&mut stats);
         self.walk_stats.set(stats);
+        super::add_to_totals(before, stats);
+    }
+
+    /// Face `font_idx`'s composable glyphs (ft-yccm0.4.3.3): every glyph
+    /// that a cluster of one codepoint maps to, less those a lookup could
+    /// match with a neighbour under this face's features. Closed when
+    /// something outside GSUB and GPOS acts between neighbouring glyphs:
+    /// AAT tables, a `kern` table or FreeType kerning, or a feature set on
+    /// part of the text.
+    fn layout_gate(&self, font_idx: FallbackIdx, pair: &FontPair) -> &LayoutGate {
+        self.gates[font_idx].get_or_init(|| {
+            let start = std::time::Instant::now();
+            let font = pair.font.borrow();
+            let face = font.get_face();
+            let neighbourly = pair.face.has_kerning()
+                || [b"morx", b"mort", b"kerx", b"kern", b"trak"]
+                    .iter()
+                    .any(|name| {
+                        let tag = harfbuzz::hb_tag(name[0], name[1], name[2], name[3]);
+                        !face.reference_table(tag).as_slice().is_empty()
+                    });
+            let features = Features::applied(&pair.features);
+            let coverage = self.handles[font_idx].coverage();
+            match (neighbourly, features, coverage) {
+                (false, Some(features), Ok(coverage)) => {
+                    let mut initial = GlyphSet::default();
+                    // An unmapped codepoint is drawn as notdef.
+                    initial.insert(0);
+                    for unicode in coverage.ranges.iter_values() {
+                        let base = char::from_u32(unicode).is_some_and(bypass::is_cluster_base);
+                        if base || matches!(unicode, 0xFE0E | 0xFE0F) {
+                            if let Some(glyph) = font.nominal_glyph(unicode) {
+                                initial.insert(glyph);
+                            }
+                        }
+                    }
+                    let table = |name: &[u8; 4]| {
+                        face.reference_table(harfbuzz::hb_tag(name[0], name[1], name[2], name[3]))
+                    };
+                    let (gsub, gpos) = (table(b"GSUB"), table(b"GPOS"));
+                    let gate =
+                        LayoutGate::new(gsub.as_slice(), gpos.as_slice(), &features, initial);
+                    log::debug!(
+                        "shaping bypass: {} composable glyphs in face {font_idx} ({}) in {:?}",
+                        gate.len(),
+                        self.handles[font_idx].names().full_name,
+                        start.elapsed()
+                    );
+                    gate
+                }
+                _ => LayoutGate::closed(),
+            }
+        })
+    }
+
+    /// Whether `cluster` composes in face `font`: the glyphs HarfBuzz's
+    /// normalizer gives it (hb-ot-shape-normalize.cc) pass `gate`.
+    fn cluster_composes(font: &harfbuzz::Font, gate: &LayoutGate, cluster: &Cluster) -> bool {
+        let base = cluster.base as u32;
+        match cluster.selector {
+            Some(selector) => match font.variation_glyph(base, selector as u32) {
+                Some(glyph) => gate.contains(glyph),
+                None => {
+                    gate.contains(font.nominal_glyph(base).unwrap_or(0))
+                        && gate.contains(font.nominal_glyph(selector as u32).unwrap_or(0))
+                }
+            },
+            None => match font.nominal_glyph(base) {
+                Some(glyph) => gate.contains(glyph),
+                // Unmapped, it is notdef, unless HarfBuzz decomposes it or
+                // draws it with the space glyph.
+                None => {
+                    gate.contains(0)
+                        && !harfbuzz::unicode_has_canonical_decomposition(base)
+                        && harfbuzz::unicode_general_category(base)
+                            != harfbuzz::hb_unicode_general_category_t::HB_UNICODE_GENERAL_CATEGORY_SPACE_SEPARATOR
+                }
+            },
+        }
+    }
+
+    /// Lays out `s[range]` in face `font_idx`: from cached clusters when it
+    /// is `run` and every cluster is cached, otherwise with HarfBuzz, whose
+    /// output then fills the clusters `run` lacks.
+    #[allow(clippy::too_many_arguments)]
+    fn shape_face(
+        &self,
+        font_idx: FallbackIdx,
+        pair: &FontPair,
+        s: &str,
+        range: &Range<usize>,
+        direction: Direction,
+        run: Option<&Run>,
+        point_size: f64,
+        dpi: u32,
+    ) -> anyhow::Result<Vec<RawGlyph>> {
+        let mut harvest = None;
+        if let Some(run) = run {
+            let gate = self.layout_gate(font_idx, pair);
+            if !gate.is_closed() {
+                let key = TableKey {
+                    font_idx,
+                    size: point_size.to_bits(),
+                    dpi,
+                    script: run.script,
+                };
+                let font = pair.font.borrow();
+                let plan = self.clusters.borrow_mut().plan(key, run, |cluster| {
+                    Self::cluster_composes(&font, gate, cluster)
+                });
+                match plan {
+                    Plan::Composed(glyphs) => {
+                        self.count(|stats| {
+                            if run.ascii {
+                                stats.bypassed_ascii += 1;
+                            } else {
+                                stats.bypassed_clusters += 1;
+                            }
+                        });
+                        return Ok(glyphs);
+                    }
+                    Plan::Harvest => harvest = Some(key),
+                    Plan::Shape => {}
+                }
+            }
+        }
+
+        let mut buf = harfbuzz::Buffer::new()?;
+        // We deliberately omit setting the script and leave it to harfbuzz
+        // to infer from the buffer contents so that it can correctly
+        // enable appropriate preprocessing for eg: Hangul.
+        // <https://github.com/wezterm/wezterm/issues/1474> and
+        // <https://github.com/wezterm/wezterm/issues/1573>
+        // buf.set_script(harfbuzz::hb_script_t::HB_SCRIPT_LATIN);
+        buf.set_direction(match direction {
+            Direction::LeftToRight => harfbuzz::hb_direction_t::HB_DIRECTION_LTR,
+            Direction::RightToLeft => harfbuzz::hb_direction_t::HB_DIRECTION_RTL,
+        });
+        buf.set_language(self.lang);
+
+        buf.add_str(s, range.clone());
+        buf.guess_segment_properties();
+        buf.set_cluster_level(
+            harfbuzz::hb_buffer_cluster_level_t::HB_BUFFER_CLUSTER_LEVEL_MONOTONE_GRAPHEMES,
+        );
+
+        let mut font = pair.font.borrow_mut();
+        self.count(|stats| stats.faces_shaped += 1);
+        font.shape(&mut buf, pair.features.as_slice());
+        log::trace!(
+            "shaped font_idx={} {:?} as: {}",
+            font_idx,
+            &s[range.start..range.end],
+            buf.serialize(Some(&*font))
+        );
+        let glyphs: Vec<RawGlyph> = buf
+            .glyph_infos()
+            .iter()
+            .zip(buf.glyph_positions())
+            .map(|(info, pos)| RawGlyph {
+                glyph: info.codepoint,
+                cluster: info.cluster,
+                x_advance: pos.x_advance,
+                y_advance: pos.y_advance,
+                x_offset: pos.x_offset,
+                y_offset: pos.y_offset,
+            })
+            .collect();
+        if let (Some(key), Some(run)) = (harvest, run) {
+            if !self.clusters.borrow_mut().harvest(key, run, &glyphs) {
+                log::debug!("shaping bypass: HarfBuzz clustered {run:?} unexpectedly");
+            }
+        }
+        Ok(glyphs)
     }
 
     /// Whether face `font_idx` provably draws nothing in `text` (ft-yccm0.2.12):
@@ -304,26 +515,14 @@ impl HarfbuzzShaper {
             // must not retry that broken face while producing the placeholder.
             no_glyphs.extend(shaping_text.chars());
         }
-        let mut buf = harfbuzz::Buffer::new()?;
-        // We deliberately omit setting the script and leave it to harfbuzz
-        // to infer from the buffer contents so that it can correctly
-        // enable appropriate preprocessing for eg: Hangul.
-        // <https://github.com/wezterm/wezterm/issues/1474> and
-        // <https://github.com/wezterm/wezterm/issues/1573>
-        // buf.set_script(harfbuzz::hb_script_t::HB_SCRIPT_LATIN);
-        buf.set_direction(match direction {
-            Direction::LeftToRight => harfbuzz::hb_direction_t::HB_DIRECTION_LTR,
-            Direction::RightToLeft => harfbuzz::hb_direction_t::HB_DIRECTION_RTL,
-        });
-        buf.set_language(self.lang);
-
-        buf.add_str(s, range.clone());
-        buf.guess_segment_properties();
-        buf.set_cluster_level(
-            harfbuzz::hb_buffer_cluster_level_t::HB_BUFFER_CLUSTER_LEVEL_MONOTONE_GRAPHEMES,
-        );
+        // Single-codepoint clusters may be laid out without HarfBuzz
+        // (ft-yccm0.4.3.3); right-to-left runs always go to HarfBuzz.
+        let run = (self.shaping_bypass && direction == Direction::LeftToRight)
+            .then(|| bypass::segment(shaping_text, range.start))
+            .flatten();
 
         let shaped_any;
+        let glyphs: Vec<RawGlyph>;
 
         // When no_more_fallbacks is true, accept codepoint==0 and use the
         // base font's notdef glyph. The error-recovery path uses the same
@@ -398,16 +597,17 @@ impl HarfbuzzShaper {
                             .replace((point_size, dpi));
                     }
 
-                    let mut font = pair.font.borrow_mut();
                     shaped_any = pair.shaped_any;
-                    self.count(|stats| stats.faces_shaped += 1);
-                    font.shape(&mut buf, pair.features.as_slice());
-                    log::trace!(
-                        "shaped font_idx={} {:?} presentation={presentation:?} as: {}",
+                    glyphs = self.shape_face(
                         font_idx,
-                        &s[range.start..range.end],
-                        buf.serialize(Some(&*font))
-                    );
+                        &pair,
+                        s,
+                        &range,
+                        direction,
+                        run.as_ref(),
+                        point_size,
+                        dpi,
+                    )?;
                     break;
                 }
                 None => {
@@ -454,9 +654,6 @@ impl HarfbuzzShaper {
             }
         }
 
-        let hb_infos = buf.glyph_infos();
-        let positions = buf.glyph_positions();
-
         let mut cluster = Vec::with_capacity(shaping_text.len());
         let mut info_clusters: Vec<Vec<Info>> = Vec::with_capacity(shaping_text.len());
 
@@ -494,16 +691,15 @@ impl HarfbuzzShaper {
             ..Default::default()
         };
 
-        cluster_resolver.build(hb_infos, s, &range, !no_more_fallbacks);
+        cluster_resolver.build(&glyphs, s, &range, !no_more_fallbacks);
         log::debug!("cluster_resolver: {cluster_resolver:#?}");
 
-        let info_iter = hb_infos.iter().zip(positions.iter()).peekable();
-        for (info, pos) in info_iter {
-            let cluster_info = match cluster_resolver.get(info.cluster as usize) {
+        for glyph in &glyphs {
+            let cluster_info = match cluster_resolver.get(glyph.cluster as usize) {
                 Some(i) => i,
                 None => panic!(
                     "expected cluster info.cluster {} to be in cluster_resolver",
-                    info.cluster
+                    glyph.cluster
                 ),
             };
             let len = cluster_info.byte_len;
@@ -515,11 +711,11 @@ impl HarfbuzzShaper {
                 // in this code
                 cluster: cluster_info.start,
                 len,
-                codepoint: info.codepoint,
-                x_advance: pos.x_advance,
-                y_advance: pos.y_advance,
-                x_offset: pos.x_offset,
-                y_offset: pos.y_offset,
+                codepoint: glyph.glyph,
+                x_advance: glyph.x_advance,
+                y_advance: glyph.y_advance,
+                x_offset: glyph.x_offset,
+                y_offset: glyph.y_offset,
             };
             log::debug!("hb info.cluster {} -> {info:?}", info.cluster);
 
@@ -899,7 +1095,7 @@ struct ClusterResolver<'a> {
 impl<'a> ClusterResolver<'a> {
     pub fn build(
         &mut self,
-        hb_infos: &[harfbuzz::hb_glyph_info_t],
+        glyphs: &[RawGlyph],
         s: &str,
         range: &Range<usize>,
         allow_fallback: bool,
@@ -913,8 +1109,8 @@ impl<'a> ClusterResolver<'a> {
 
         let mut map = HashMap::new();
 
-        for info in hb_infos.iter() {
-            let start = info.cluster as usize;
+        for glyph in glyphs {
+            let start = glyph.cluster as usize;
 
             // Collect the cell index, which is the "true cluster"
             // position from our perspective: the start of the grapheme
@@ -937,7 +1133,7 @@ impl<'a> ClusterResolver<'a> {
             });
             // Determine whole-cluster fallback ownership before visiting its
             // glyphs: a mark may precede or follow its missing base glyph.
-            item.incomplete |= allow_fallback && info.codepoint == 0;
+            item.incomplete |= allow_fallback && glyph.glyph == 0;
         }
 
         let mut cluster_starts: Vec<Item> = map.into_values().collect();
@@ -1105,7 +1301,7 @@ mod test {
         }
         assert!(skipping.skipped_coverage > 0);
         assert!(
-            skipping.faces_shaped < walking.faces_shaped,
+            skipping.faces_laid_out() < walking.faces_laid_out(),
             "{skipping:?} vs {walking:?}"
         );
     }
@@ -1141,11 +1337,380 @@ mod test {
                     .count(),
             )
         };
+        // Faces are shaped by HarfBuzz or, once the walk has cached a
+        // face's notdef cluster, laid out from it (ft-yccm0.4.3.3).
         let (skipping, loaded) = shape(true);
-        assert_eq!(skipping.faces_shaped, 1, "{skipping:?}");
+        assert_eq!(skipping.faces_laid_out(), 1, "{skipping:?}");
         assert_eq!(loaded, 1, "only the base face is loaded");
         let (walking, _) = shape(false);
-        assert_eq!(walking.faces_shaped, 5, "{walking:?}");
+        assert_eq!(walking.faces_laid_out(), 5, "{walking:?}");
+    }
+
+    fn bundled(family: &str) -> ParsedFont {
+        FontDatabase::with_built_in()
+            .unwrap()
+            .resolve(&FontAttributes::new(family), 14)
+            .unwrap_or_else(|| panic!("bundled {family}"))
+            .clone()
+    }
+
+    /// The default font, Pragmasevka Nerd Font regular, from the payload
+    /// `ft setup font` installs.
+    fn pragmasevka() -> ParsedFont {
+        use std::io::Read;
+        static TTF: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
+        let data = *TTF.get_or_init(|| {
+            let payload: &[u8] =
+                include_bytes!("../../../../crates/frankenterm/assets/Pragmasevka_NF.zip.zst");
+            let archive = zstd::stream::decode_all(payload).unwrap();
+            let mut archive = tar::Archive::new(archive.as_slice());
+            let mut entry = archive
+                .entries()
+                .unwrap()
+                .map(Result::unwrap)
+                .find(|entry| entry.path().unwrap().to_str() == Some("pragmasevka-nf-regular.ttf"))
+                .expect("the regular face in the payload");
+            let mut ttf = Vec::new();
+            entry.read_to_end(&mut ttf).unwrap();
+            Box::leak(ttf.into_boxed_slice())
+        });
+        let handle = crate::locator::FontDataHandle {
+            source: crate::locator::FontDataSource::BuiltIn {
+                name: "pragmasevka-nf-regular.ttf",
+                data,
+            },
+            index: 0,
+            variation: 0,
+            origin: crate::locator::FontOrigin::BuiltIn,
+            coverage: None,
+        };
+        let lib = ftwrap::Library::new().unwrap();
+        let face = lib.face_from_locator(&handle).unwrap();
+        ParsedFont::from_face(&face, handle).unwrap()
+    }
+
+    /// The default chain (config `font_with_fallback`): Pragmasevka, then
+    /// the bundled fallback faces, the T0 emoji's among them.
+    fn default_chain() -> Vec<ParsedFont> {
+        vec![
+            pragmasevka(),
+            bundled("JetBrains Mono"),
+            bundled("Noto Color Emoji"),
+            bundled("Symbols Nerd Font Mono"),
+        ]
+    }
+
+    /// The 1,376 codepoints of the operator's T0 emoji corpus.
+    fn t0_pool() -> Vec<char> {
+        let pool: Vec<char> = [
+            0x1F600..0x1F650,
+            0x1F300..0x1F600,
+            0x1F680..0x1F700,
+            0x1F900..0x1FA00,
+            0x1FA70..0x1FB00,
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(char::from_u32)
+        .collect();
+        assert_eq!(pool.len(), 1376);
+        pool
+    }
+
+    /// The presentation a terminal cell holding `text` is shaped with.
+    fn presentation_of(text: &str) -> Presentation {
+        let (default, variation) = Presentation::for_grapheme(text);
+        variation.unwrap_or(default)
+    }
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) as usize % n
+        }
+
+        fn run(&mut self, from: &[char], len: usize) -> String {
+            (0..len).map(|_| from[self.below(from.len())]).collect()
+        }
+    }
+
+    /// Texts with the presentation the GUI shapes them with: each printable
+    /// ASCII character and each T0 codepoint alone and with each
+    /// presentation selector, then runs of them, which the cache composes
+    /// from the clusters the single ones left.
+    fn bypass_corpus() -> Vec<(String, Option<Presentation>)> {
+        let ascii: Vec<char> = (' '..='~').collect();
+        let pool = t0_pool();
+        let mut corpus: Vec<(String, Option<Presentation>)> = ascii
+            .iter()
+            .map(|c| (c.to_string(), Some(Presentation::Text)))
+            .collect();
+        for &c in &pool {
+            for text in [
+                c.to_string(),
+                format!("{c}\u{FE0F}"),
+                format!("{c}\u{FE0E}"),
+            ] {
+                let presentation = presentation_of(&text);
+                corpus.push((text, Some(presentation)));
+            }
+        }
+        let (emoji, text): (Vec<char>, Vec<char>) = pool
+            .iter()
+            .partition(|c| presentation_of(&c.to_string()) == Presentation::Emoji);
+        let mixed: Vec<char> = ascii.iter().chain(&pool).copied().collect();
+        let mut rng = Lcg(0x4_3_3);
+        for _ in 0..300 {
+            let len = 2 + rng.below(40);
+            corpus.push((rng.run(&ascii, len), Some(Presentation::Text)));
+            corpus.push((rng.run(&emoji, len), Some(Presentation::Emoji)));
+            corpus.push((rng.run(&text, len), Some(Presentation::Text)));
+            corpus.push((rng.run(&mixed, len), None));
+            let selected: String = rng
+                .run(&emoji, len)
+                .chars()
+                .flat_map(|c| [c, '\u{FE0F}'])
+                .collect();
+            corpus.push((selected, Some(Presentation::Emoji)));
+        }
+        for text in [
+            "fn main() -> i32 { a != b && c <= d || e >= f }",
+            "www.example.com/ffi?x=1&y=2#L10-L20",
+            "0x7f == 127; // !== === <=> |> <| :: ..= ...",
+            "<!-- --> <<= >>= /* */ ;; ## ~~ __ --",
+        ] {
+            corpus.push((text.to_string(), Some(Presentation::Text)));
+        }
+        corpus
+    }
+
+    /// Shapes `corpus` twice with and without the bypasses; every result,
+    /// missing-glyph requests included, is the same. Returns the bypassing
+    /// shaper's stats and the HarfBuzz-only one's, after each pass.
+    fn assert_bypass_parity(
+        handles: &[ParsedFont],
+        corpus: &[(String, Option<Presentation>)],
+    ) -> [(FallbackWalkStats, FallbackWalkStats); 2] {
+        let config = config::configuration();
+        let bypass = HarfbuzzShaper::with_options(&config, handles, true, true).unwrap();
+        let harfbuzz = HarfbuzzShaper::with_options(&config, handles, true, false).unwrap();
+        let run_pass = |pass: usize| {
+            for (text, presentation) in corpus {
+                let shape = |shaper: &HarfbuzzShaper| {
+                    let mut requested = vec![];
+                    let glyphs = shaper
+                        .shape(
+                            text,
+                            12.,
+                            96,
+                            &mut requested,
+                            *presentation,
+                            Direction::LeftToRight,
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                    (glyphs, requested)
+                };
+                assert_eq!(
+                    shape(&bypass),
+                    shape(&harfbuzz),
+                    "pass {pass}: {text:?} {presentation:?}"
+                );
+            }
+            let (bypassed, shaped) = (bypass.walk_stats(), harfbuzz.walk_stats());
+            assert_eq!(
+                bypassed.faces_laid_out(),
+                shaped.faces_shaped,
+                "the same faces, laid out or shaped: {bypassed:?} {shaped:?}"
+            );
+            assert_eq!(shaped.faces_laid_out(), shaped.faces_shaped);
+            (bypassed, shaped)
+        };
+        [run_pass(0), run_pass(1)]
+    }
+
+    fn gate_len(shaper: &HarfbuzzShaper, font_idx: usize) -> usize {
+        shaper.gates[font_idx].get().map_or(0, LayoutGate::len)
+    }
+
+    /// ft-yccm0.4.3.3: every run laid out from the ASCII table or the
+    /// cluster cache is exactly what HarfBuzz makes of it (glyph ids,
+    /// advances, offsets, clusters, cells and missing-glyph requests), for
+    /// all printable ASCII and the 1,376 T0 codepoints, with the default
+    /// font and the fallback faces the T0 emoji come from.
+    #[test]
+    fn bypassed_layout_matches_harfbuzz_for_ascii_and_the_t0_pool() {
+        let [_, (bypassed, shaped)] = assert_bypass_parity(&default_chain(), &bypass_corpus());
+        eprintln!("Pragmasevka chain: bypassing {bypassed:?}, HarfBuzz only {shaped:?}");
+        assert!(bypassed.bypassed_ascii > 0, "{bypassed:?}");
+        assert!(bypassed.bypassed_clusters > 0, "{bypassed:?}");
+        assert!(
+            bypassed.faces_shaped < shaped.faces_shaped,
+            "{bypassed:?} {shaped:?}"
+        );
+    }
+
+    /// ft-yccm0.4.3.3: the same parity for a font with `calt` ligatures and
+    /// a proportional font with pair kerning.
+    #[test]
+    fn bypassed_layout_matches_harfbuzz_in_ligature_and_kerned_fonts() {
+        let corpus: Vec<_> = bypass_corpus()
+            .into_iter()
+            .filter(|(text, _)| text.is_ascii())
+            .collect();
+        for family in ["JetBrains Mono", "Roboto"] {
+            let [_, (bypassed, shaped)] = assert_bypass_parity(&[bundled(family)], &corpus);
+            eprintln!("{family}: bypassing {bypassed:?}, HarfBuzz only {shaped:?}");
+        }
+    }
+
+    /// ft-yccm0.4.3.3: a ligature never comes from the table. JetBrains
+    /// Mono's `calt` joins `<-`: that run goes to HarfBuzz, which draws the
+    /// ligature, even after `<` and `-` were each shaped alone. With the
+    /// ligature features off, the same run comes from the table and matches
+    /// HarfBuzz; a feature set on part of the text turns the bypass off.
+    #[test]
+    fn a_ligature_face_gets_harfbuzz_output_not_the_table() {
+        let config = config::configuration();
+        let shaper = |handle: &ParsedFont, bypass: bool| {
+            HarfbuzzShaper::with_options(&config, std::slice::from_ref(handle), true, bypass)
+                .unwrap()
+        };
+        let shape = |shaper: &HarfbuzzShaper, text: &str| {
+            shaper
+                .shape(
+                    text,
+                    10.,
+                    72,
+                    &mut vec![],
+                    None,
+                    Direction::LeftToRight,
+                    None,
+                    None,
+                )
+                .unwrap()
+        };
+
+        let ligatures = bundled("JetBrains Mono");
+        let (bypass, harfbuzz) = (shaper(&ligatures, true), shaper(&ligatures, false));
+        for text in ["<", "-", ">", "!", "=", "abc", "<-", "->"] {
+            shape(&bypass, text);
+        }
+        for text in ["<-", "<--", "->", "!=", "===", "a<-b", "x->y"] {
+            let before = bypass.walk_stats();
+            let glyphs = shape(&bypass, text);
+            let after = bypass.walk_stats();
+            assert_eq!(glyphs, shape(&harfbuzz, text), "{text:?}");
+            assert_eq!(
+                after.faces_shaped,
+                before.faces_shaped + 1,
+                "{text:?} went to HarfBuzz"
+            );
+            assert_eq!(after.faces_laid_out(), before.faces_laid_out() + 1);
+        }
+        assert_ne!(
+            shape(&bypass, "<-")[0].glyph_pos,
+            shape(&bypass, "<")[0].glyph_pos,
+            "the ligature's '<' is not the standalone '<'"
+        );
+
+        let mut plain = ligatures.clone();
+        plain.harfbuzz_features = Some(vec!["calt=0".into(), "clig=0".into(), "liga=0".into()]);
+        let (bypass_plain, harfbuzz_plain) = (shaper(&plain, true), shaper(&plain, false));
+        shape(&bypass_plain, "<");
+        shape(&bypass_plain, "-");
+        let before = bypass_plain.walk_stats();
+        let glyphs = shape(&bypass_plain, "<-");
+        assert_eq!(glyphs, shape(&harfbuzz_plain, "<-"));
+        assert_eq!(
+            glyphs[0].glyph_pos,
+            shape(&harfbuzz_plain, "<")[0].glyph_pos
+        );
+        assert_eq!(
+            bypass_plain.walk_stats().bypassed_ascii,
+            before.bypassed_ascii + 1,
+            "'<-' without ligatures comes from the table"
+        );
+        assert!(gate_len(&bypass_plain, 0) > gate_len(&bypass, 0));
+
+        let mut ranged = ligatures;
+        ranged.harfbuzz_features = Some(vec!["calt[0:1]=0".into()]);
+        let bypass_ranged = shaper(&ranged, true);
+        for _ in 0..2 {
+            shape(&bypass_ranged, "abc");
+        }
+        let stats = bypass_ranged.walk_stats();
+        assert_eq!(
+            stats.bypassed_ascii + stats.bypassed_clusters,
+            0,
+            "{stats:?}"
+        );
+        assert!(bypass_ranged.gates[0].get().unwrap().is_closed());
+    }
+
+    /// ft-yccm0.4.3.3: T0 rows, runs of random pool emoji, need HarfBuzz
+    /// only while a row holds an emoji the cache has not seen, or a skin
+    /// tone modifier, which HarfBuzz joins to the emoji before it; the
+    /// process totals count both kinds of face shape.
+    #[test]
+    fn t0_rows_skip_harfbuzz_once_their_emoji_are_cached() {
+        let handles = default_chain();
+        let emoji: Vec<char> = t0_pool()
+            .into_iter()
+            .filter(|c| presentation_of(&c.to_string()) == Presentation::Emoji)
+            .collect();
+        let is_modifier = |c: &char| ('\u{1F3FB}'..='\u{1F3FF}').contains(c);
+        let unmodified: Vec<char> = emoji.iter().copied().filter(|c| !is_modifier(c)).collect();
+        let rows = |from: &[char], seed: u64| -> Vec<(String, Option<Presentation>)> {
+            let mut rng = Lcg(seed);
+            (0..400)
+                .map(|_| (rng.run(from, 20), Some(Presentation::Emoji)))
+                .collect()
+        };
+
+        let totals = crate::shaper::shaping_totals();
+        let [first, (bypassed, shaped)] = assert_bypass_parity(&handles, &rows(&unmodified, 0x70));
+        let again = bypassed.faces_shaped - first.0.faces_shaped;
+        eprintln!(
+            "400 T0 rows without modifiers: HarfBuzz calls {} then {again} with the bypass, \
+             {} then {} without",
+            first.0.faces_shaped,
+            first.1.faces_shaped,
+            shaped.faces_shaped - first.1.faces_shaped
+        );
+        assert!(first.0.faces_shaped < first.1.faces_shaped, "{first:?}");
+        // Every cluster of the repeated rows was cached the first time.
+        assert_eq!(again, 0, "{bypassed:?}");
+
+        let with_modifiers = rows(&emoji, 0x71);
+        let modified = with_modifiers
+            .iter()
+            .filter(|(row, _)| row.chars().any(|c| is_modifier(&c)))
+            .count();
+        let [first, (bypassed, shaped)] = assert_bypass_parity(&handles, &with_modifiers);
+        eprintln!(
+            "400 T0 rows, {modified} with a modifier: HarfBuzz calls {} then {} with the bypass, \
+             {} then {} without",
+            first.0.faces_shaped,
+            bypassed.faces_shaped - first.0.faces_shaped,
+            first.1.faces_shaped,
+            shaped.faces_shaped - first.1.faces_shaped
+        );
+        let after = crate::shaper::shaping_totals();
+        assert!(
+            after.harfbuzz_shapes - totals.harfbuzz_shapes
+                >= bypassed.faces_shaped + shaped.faces_shaped
+        );
+        assert!(
+            after.bypassed_cluster_shapes - totals.bypassed_cluster_shapes
+                >= bypassed.bypassed_clusters
+        );
     }
 
     #[test]

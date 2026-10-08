@@ -62,6 +62,9 @@ objc.workspace = true
 criterion.workspace = true
 env_logger.workspace = true
 k9.workspace = true
+# The bundled Pragmasevka payload, for the shaping bypass parity tests.
+tar.workspace = true
+zstd.workspace = true
 
 # Rasterization cost per glyph, FreeType against CoreText (ft-yccm0.4.3.1).
 [[bench]]

@@ -2265,8 +2265,10 @@ mod tests {
             warm.2.queried,
             "no fallback query"
         );
+        // A face is shaped by HarfBuzz or laid out from cached clusters
+        // (ft-yccm0.4.3.3).
         assert_eq!(
-            walk.faces_shaped - warm.3.faces_shaped,
+            walk.faces_laid_out() - warm.3.faces_laid_out(),
             shapes,
             "each emoji costs one face shape: no fallback face is shaped in vain"
         );

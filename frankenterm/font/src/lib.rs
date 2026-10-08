@@ -44,7 +44,9 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         Err(poisoned) => poisoned.into_inner(),
     }
 }
-pub use crate::shaper::{FallbackIdx, FallbackWalkStats, FontMetrics, GlyphInfo};
+pub use crate::shaper::{
+    shaping_totals, FallbackIdx, FallbackWalkStats, FontMetrics, GlyphInfo, ShapingTotals,
+};
 
 #[derive(Debug, Error)]
 #[error("Font fallback recalculated")]

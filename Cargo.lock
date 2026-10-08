@@ -4241,10 +4241,12 @@ dependencies = [
  "objc",
  "ordered-float 5.5.0",
  "rangeset",
+ "tar",
  "termwiz 0.24.0",
  "thiserror 2.0.21",
  "walkdir",
  "winapi",
+ "zstd 0.14.0",
 ]
 
 [[package]]

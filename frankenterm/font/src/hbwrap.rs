@@ -80,7 +80,6 @@ impl Blob {
         Self { blob }
     }
 
-    #[cfg(not(windows))]
     pub fn as_slice(&self) -> &[u8] {
         unsafe {
             let mut len = 0;
@@ -259,6 +258,32 @@ impl Face {
     pub fn get_upem(&self) -> c_uint {
         unsafe { hb_face_get_upem(self.face) }
     }
+
+    /// The face's `tag` table, empty when the face has none.
+    pub fn reference_table(&self, tag: hb_tag_t) -> Blob {
+        // A new reference, or the empty blob, which is never null.
+        Blob {
+            blob: unsafe { hb_face_reference_table(self.face, tag) },
+        }
+    }
+}
+
+/// `unicode`'s general category from HarfBuzz's default Unicode functions,
+/// the ones its buffers use.
+pub fn unicode_general_category(unicode: hb_codepoint_t) -> hb_unicode_general_category_t {
+    unsafe { hb_unicode_general_category(hb_unicode_funcs_get_default(), unicode) }
+}
+
+/// `unicode`'s script from HarfBuzz's default Unicode functions.
+pub fn unicode_script(unicode: hb_codepoint_t) -> hb_script_t {
+    unsafe { hb_unicode_script(hb_unicode_funcs_get_default(), unicode) }
+}
+
+/// Whether `unicode` has a canonical decomposition, which HarfBuzz's
+/// normalizer tries when a font does not map `unicode`.
+pub fn unicode_has_canonical_decomposition(unicode: hb_codepoint_t) -> bool {
+    let (mut a, mut b) = (0, 0);
+    unsafe { hb_unicode_decompose(hb_unicode_funcs_get_default(), unicode, &mut a, &mut b) != 0 }
 }
 
 pub struct Font {
@@ -301,6 +326,25 @@ impl Font {
             hb_face_reference(face);
         }
         Face { face }
+    }
+
+    /// The glyph this font maps `unicode` to, as HarfBuzz's normalizer
+    /// looks it up.
+    pub fn nominal_glyph(&self, unicode: hb_codepoint_t) -> Option<hb_codepoint_t> {
+        let mut glyph = 0;
+        (unsafe { hb_font_get_nominal_glyph(self.font, unicode, &mut glyph) } != 0).then_some(glyph)
+    }
+
+    /// The glyph this font maps `unicode` followed by `selector` to, if it
+    /// has one for that variation sequence.
+    pub fn variation_glyph(
+        &self,
+        unicode: hb_codepoint_t,
+        selector: hb_codepoint_t,
+    ) -> Option<hb_codepoint_t> {
+        let mut glyph = 0;
+        (unsafe { hb_font_get_variation_glyph(self.font, unicode, selector, &mut glyph) } != 0)
+            .then_some(glyph)
     }
 
     pub fn set_ot_funcs(&mut self) {

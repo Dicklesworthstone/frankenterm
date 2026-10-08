@@ -3624,6 +3624,16 @@ fn start_gui_tuning_advisories(
     Some((publication, subscription))
 }
 
+/// This process's face shapes by whether HarfBuzz ran (ft-yccm0.4.3.3).
+pub(crate) fn shaping_snapshot() -> frankenterm_alloc::resource_ledger::ShapingSnapshot {
+    let totals = frankenterm_font::shaping_totals();
+    frankenterm_alloc::resource_ledger::ShapingSnapshot {
+        harfbuzz_shapes_total: totals.harfbuzz_shapes,
+        bypassed_ascii_shapes_total: totals.bypassed_ascii_shapes,
+        bypassed_cluster_shapes_total: totals.bypassed_cluster_shapes,
+    }
+}
+
 /// The resource snapshot this process publishes (ft-yccm0.1.7). Runs on the
 /// publisher thread; each pane's tier status and writer backlog take that
 /// pane's terminal lock briefly, never on the GUI thread.
@@ -3634,6 +3644,7 @@ fn collect_resource_snapshot() -> frankenterm_alloc::resource_ledger::ResourceSn
     };
     let mut body =
         ResourceSnapshotBody::from_ledgers(GpuResourceLedger::global(), CacheGauges::global());
+    body.shaping = shaping_snapshot();
     if let Some(mux) = Mux::try_get() {
         let panes = mux.iter_panes();
         // ft-yccm0.2.2.5: the GUI owns the panes, so it reports their writer
