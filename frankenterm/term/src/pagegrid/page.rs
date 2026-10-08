@@ -1086,8 +1086,8 @@ impl Page {
     /// ignored. Returns false, writing nothing, for a run that starts past
     /// the end, passes the page's stride or carries images, or meets a cell
     /// whose overwrite `write` handles specially: a wide or hidden cell in
-    /// the run, a visible wide cell just before it, or a cell with images
-    /// (whose placements legacy carries over).
+    /// the run, a wide cell just before it (legacy blanks it, visible or
+    /// hidden), or a cell with images (whose placements legacy carries over).
     pub fn put_ascii(
         &mut self,
         row: u32,
@@ -1104,11 +1104,12 @@ impl Page {
         if bytes.is_empty() || x > old_len || end > self.stride() || !cell.images.is_empty() {
             return false;
         }
-        if x > 0 {
-            let prev = self.cell_at(slot, x - 1);
-            if !prev.is_hidden() && prev.is_wide() {
-                return false;
-            }
+        // Legacy `invalidate_grapheme_at_or_before` blanks a wide cell just
+        // before the run even when it is hidden (a wide cell copied into a
+        // placeholder by a margin band); `write` does that, as `append_ascii`
+        // also defers.
+        if x > 0 && self.cell_at(slot, x - 1).is_wide() {
+            return false;
         }
         let kept = end.min(old_len);
         if (x..kept).any(|col| {

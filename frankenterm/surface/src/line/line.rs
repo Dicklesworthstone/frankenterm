@@ -51,6 +51,16 @@ fn normalize_cell_width(width: usize) -> usize {
     width.clamp(1, 2)
 }
 
+/// The text a cell built from `text` keeps: `TeenyString::from_str` turns
+/// empty text, CR LF and a lone control byte into a space.
+fn kept_cell_text(text: &str) -> &str {
+    match text.as_bytes() {
+        [] | b"\r\n" => " ",
+        [byte] if *byte < 0x20 || *byte == 0x7f => " ",
+        _ => text,
+    }
+}
+
 fn checked_materialized_end(idx: usize, width: usize) -> Option<usize> {
     let end = idx.checked_add(width)?;
     (end <= MAX_MATERIALIZED_LINE_LEN).then_some(end)
@@ -1448,10 +1458,14 @@ impl Line {
             // appended to clustered storage; it takes the vector path below.
             if cl.can_append_cell_at(idx, text) {
                 // Fill out any implied blanks, then append the intended
-                // cell content, all in one detach (ft-70s4z).
+                // cell content, all in one detach (ft-70s4z). The text is
+                // what the cell would keep: at the row's start any first
+                // character appends, and a lone control byte stored raw
+                // there read back as itself while clustered but as a blank
+                // once the row became a vector (ft-yccm0.3.3.4).
                 let cl = Arc::make_mut(cl);
                 cl.append_blank_cells(idx - cl.len());
-                cl.append_grapheme(text, width, attr);
+                cl.append_grapheme(kept_cell_text(text), width, attr);
                 self.invalidate_implicit_hyperlinks(seqno);
                 self.invalidate_zones();
                 self.update_last_change_seqno(seqno);
@@ -4584,6 +4598,29 @@ mod tests {
                 assert!(clustered == vector, "{:?} at {}", text, width);
                 assert_eq!(clustered.current_seqno(), vector.current_seqno());
             }
+        }
+    }
+
+    /// ft-yccm0.3.3.4: a lone control byte or CR LF appended at the start of
+    /// a clustered row reads back as the blank a cell built from it keeps,
+    /// before and after the row becomes a vector, like any other text.
+    #[test]
+    fn a_control_byte_appended_to_a_clustered_row_reads_as_its_cell_keeps_it() {
+        for text in ["\u{7}", "\r\n", "\u{7f}", "a"] {
+            let mut line = Line::new(1);
+            line.set_cell_grapheme(0, text, 1, CellAttributes::default(), 2);
+            assert!(line.has_clustered_storage(), "{:?}", text);
+            let read = |line: &Line| -> Vec<String> {
+                line.visible_cells()
+                    .map(|cell| cell.str().to_string())
+                    .collect()
+            };
+            let clustered = read(&line);
+            let _ = line.cells_mut();
+            assert!(!line.has_clustered_storage(), "{:?}", text);
+            assert_eq!(clustered, read(&line), "{:?}", text);
+            let kept = Cell::new_grapheme_with_width(text, 1, CellAttributes::default());
+            assert_eq!(clustered, vec![kept.str().to_string()], "{:?}", text);
         }
     }
 

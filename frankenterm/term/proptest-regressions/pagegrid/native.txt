@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e616cd44dd4220e81d165d1babd06a030c260f7d685d3b91157bbd6e2b4b9717 # shrinks to ops = [PutBand { start: 5, cells: [(5, 0), (5, 0)], end: 0, attrs: 0 }, PutBand { start: 8, cells: [], end: 0, attrs: 0 }, Ascii { x: 7, text: 0, attrs: 0 }]
+cc dc8cad5fa0fcc4021875f79fc2ae564519b2256019a6c17732854248c01f1b7e # shrinks to ops = [Grapheme { x: 0, glyph: 11, attrs: 0 }]
