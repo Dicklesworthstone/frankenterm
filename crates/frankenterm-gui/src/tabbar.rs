@@ -2,7 +2,8 @@ use crate::termwindow::{PaneInformation, TabInformation, UIItem, UIItemType};
 use config::{ConfigHandle, TabBarColors};
 pub use frankenterm_gui::status_text::{parse_status_text, parse_status_text_with_cell_limit};
 use mlua::{FromLua, IntoLua};
-use std::rc::Rc;
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
 use termwiz::cell::{Cell, CellAttributes, unicode_column_width};
 use termwiz::color::{AnsiColor, ColorSpec};
 use termwiz::surface::SEQ_ZERO;
@@ -68,6 +69,44 @@ struct FormatTabTitleArgs {
     config: mlua::Value,
 }
 
+/// The `config` argument of `format-tab-title`, kept for as long as the
+/// config and the Lua state stay the same.
+struct ConfigLuaCache {
+    config: ConfigHandle,
+    lua: Weak<mlua::Lua>,
+    value: mlua::Value,
+}
+
+thread_local! {
+    static CONFIG_LUA_CACHE: RefCell<Option<ConfigLuaCache>> = const { RefCell::new(None) };
+}
+
+/// Converting the whole config to Lua is the largest part of a tab bar
+/// refresh, and the tab bar refreshes whenever a title changes. Convert it
+/// once per config and Lua state instead. A handler that changes the config
+/// table it is given sees that change in later refreshes too.
+fn config_as_lua(lua: &Rc<mlua::Lua>, config: &ConfigHandle) -> mlua::Result<mlua::Value> {
+    CONFIG_LUA_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(cached) = cache.as_ref()
+            && cached.config.same_config(config)
+            && cached
+                .lua
+                .upgrade()
+                .is_some_and(|cached_lua| Rc::ptr_eq(&cached_lua, lua))
+        {
+            return Ok(cached.value.clone());
+        }
+        let value = (**config).clone().into_lua(lua)?;
+        *cache = Some(ConfigLuaCache {
+            config: config.clone(),
+            lua: Rc::downgrade(lua),
+            value: value.clone(),
+        });
+        Ok(value)
+    })
+}
+
 impl FormatTabTitleArgs {
     fn build(
         lua: Rc<mlua::Lua>,
@@ -80,7 +119,7 @@ impl FormatTabTitleArgs {
         };
         let tabs = lua.create_sequence_from(tab_info.iter().cloned())?;
         let panes = lua.create_sequence_from(pane_info.iter().cloned())?;
-        let config = (**config).clone().into_lua(&lua)?;
+        let config = config_as_lua(&lua, config)?;
         Ok(Some(Self {
             lua,
             handler,
@@ -797,6 +836,28 @@ end)
         assert!(
             seen.get::<bool>("same")?,
             "every call must get the same tabs, panes and config tables"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn config_lua_value_is_reused_until_the_config_changes() -> anyhow::Result<()> {
+        let lua = lua_with_script("local wezterm = require 'wezterm'")?;
+        let config = ConfigHandle::detached(config::Config::default_config());
+        let first = config_as_lua(&lua, &config)?;
+        let again = config_as_lua(&lua, &config.clone())?;
+        assert_eq!(first.to_pointer(), again.to_pointer(), "same config must reuse its Lua table");
+
+        let other = ConfigHandle::detached(config::Config::default_config());
+        let converted = config_as_lua(&lua, &other)?;
+        assert_ne!(first.to_pointer(), converted.to_pointer(), "a new config must be converted again");
+
+        let other_lua = lua_with_script("local wezterm = require 'wezterm'")?;
+        let in_other_state = config_as_lua(&other_lua, &other)?;
+        assert_ne!(
+            converted.to_pointer(),
+            in_other_state.to_pointer(),
+            "a new Lua state needs its own table"
         );
         Ok(())
     }

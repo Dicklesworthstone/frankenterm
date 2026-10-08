@@ -1456,6 +1456,12 @@ impl ConfigHandle {
         self.generation
     }
 
+    /// True when both handles share one `Config` allocation, so anything
+    /// derived from one is valid for the other.
+    pub fn same_config(&self, other: &ConfigHandle) -> bool {
+        Arc::ptr_eq(&self.config, &other.config)
+    }
+
     pub fn default_config() -> Self {
         Self {
             config: Arc::new(Config::default_config()),
