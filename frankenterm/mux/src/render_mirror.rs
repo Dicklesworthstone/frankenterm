@@ -9,6 +9,9 @@
 //!   output because a true color always wins over its palette fallback);
 //! - packed attribute flags and a hyperlink id.
 //!
+//! A [`MirrorRow`] also keeps its cells' images ([`MirrorImage`]): shared
+//! handles to their payloads, with each cell's slice and placement.
+//!
 //! Style and color resolution, selection, hyperlink hover and GPU instance
 //! building all happen from the mirror after the lock is released. No
 //! visible [`Line`] is cloned and no row is compared with a previous copy of
@@ -42,6 +45,7 @@ use termwiz::cell::{Blink, CellAttributes, Intensity, SemanticType, Underline, V
 use termwiz::cellcluster::CellCluster;
 use termwiz::color::{ColorAttribute, SrgbaTuple};
 use termwiz::hyperlink::{Hyperlink, Rule};
+use termwiz::image::ImageCell;
 use termwiz::surface::line::CellRef;
 use termwiz::surface::{SequenceNo, SEQ_ZERO};
 
@@ -238,6 +242,16 @@ impl MirrorCell {
     }
 }
 
+/// An image attached to a cell: a kitty, iTerm2 or sixel image's slice for
+/// the cell, which a renderer draws over the cell's columns
+/// (ft-yccm0.4.7.2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MirrorImage {
+    /// The column of the cell it is attached to.
+    pub col: u16,
+    pub image: ImageCell,
+}
+
 /// One captured row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MirrorRow {
@@ -251,6 +265,8 @@ pub struct MirrorRow {
     text: String,
     links: Vec<Arc<Hyperlink>>,
     has_images: bool,
+    /// The cells' images, by column and then in each cell's z-index order.
+    images: Vec<MirrorImage>,
 }
 
 impl MirrorRow {
@@ -264,6 +280,7 @@ impl MirrorRow {
             text: String::with_capacity(line.len()),
             links: Vec::new(),
             has_images: false,
+            images: Vec::new(),
         };
         for cell in line.visible_cells() {
             let text = cell.str();
@@ -292,10 +309,15 @@ impl MirrorRow {
             };
             let flags = MirrorCell::flags_of(attrs);
             row.has_images |= flags & IMAGE != 0;
+            let col = u16::try_from(cell.cell_index()).unwrap_or(u16::MAX);
+            if let Some(images) = attrs.images() {
+                row.images
+                    .extend(images.into_iter().map(|image| MirrorImage { col, image }));
+            }
             row.cells.push(MirrorCell {
                 text_start,
                 text_len: u8::try_from(len).unwrap_or(u8::MAX),
-                col: u16::try_from(cell.cell_index()).unwrap_or(u16::MAX),
+                col,
                 width: u8::try_from(cell.width()).unwrap_or(u8::MAX),
                 flags,
                 link,
@@ -341,6 +363,12 @@ impl MirrorRow {
 
     pub fn has_images(&self) -> bool {
         self.has_images
+    }
+
+    /// The images attached to the row's cells, by column and then in each
+    /// cell's z-index order (the order a cell's attributes keep them).
+    pub fn images(&self) -> &[MirrorImage] {
+        &self.images
     }
 
     /// The cell's attributes rebuilt from the mirror (ft-yccm0.4.7.3), so a
@@ -897,6 +925,7 @@ fn placeholder_row() -> MirrorRow {
         text: String::new(),
         links: Vec::new(),
         has_images: false,
+        images: Vec::new(),
     }
 }
 
@@ -1091,6 +1120,7 @@ mod tests {
         &'a str,
         &'a [Arc<Hyperlink>],
         bool,
+        &'a [MirrorImage],
     );
 
     /// What a row shows, without the capture bookkeeping (its generation).
@@ -1102,7 +1132,66 @@ mod tests {
             &row.text,
             &row.links,
             row.has_images,
+            &row.images,
         )
+    }
+
+    /// ft-yccm0.4.7.2: a row keeps its cells' images by column, and each
+    /// cell's in its z-index order (the order its attributes keep them,
+    /// whatever order they were attached in), as a renderer draws them. A
+    /// row without images keeps none.
+    #[test]
+    fn a_row_keeps_its_cells_images_in_drawing_order() {
+        use termwiz::image::{ImageData, ImageDataType, TextureCoordinate};
+        let data = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            2,
+            1,
+            vec![255, 0, 0, 255, 0, 0, 255, 255],
+        )));
+        let slice = |left: f32, z_index: i32| {
+            ImageCell::with_z_index(
+                TextureCoordinate::new_f32(left, 0.0),
+                TextureCoordinate::new_f32(left + 0.5, 1.0),
+                Arc::clone(&data),
+                z_index,
+                1,
+                2,
+                3,
+                4,
+                Some(7),
+                None,
+            )
+        };
+        let mut line = Line::from_text("abcd", &CellAttributes::blank(), 1, None);
+        let mut over = CellAttributes::blank();
+        over.attach_image(Box::new(slice(0.5, 2)));
+        over.attach_image(Box::new(slice(0.0, -1)));
+        line.set_cell(3, Cell::new('d', over), 1);
+        let mut under = CellAttributes::blank();
+        under.attach_image(Box::new(slice(0.0, -5)));
+        line.set_cell(1, Cell::new('b', under), 1);
+
+        let row = MirrorRow::from_line(0, &line, 1);
+        assert!(row.has_images());
+        let images: Vec<(u16, i32, f32)> = row
+            .images()
+            .iter()
+            .map(|image| {
+                (
+                    image.col,
+                    image.image.z_index(),
+                    image.image.top_left().x.into_inner(),
+                )
+            })
+            .collect();
+        assert_eq!(images, [(1, -5, 0.0), (3, -1, 0.0), (3, 2, 0.5)]);
+        assert_eq!(row.images()[0].image, slice(0.0, -5));
+        assert_eq!(row.images()[0].image.padding(), (1, 2, 3, 4));
+        assert!(row.cells()[1].has_image() && !row.cells()[2].has_image());
+
+        let plain = Line::from_text("x", &CellAttributes::blank(), 1, None);
+        let plain = MirrorRow::from_line(1, &plain, 1);
+        assert!(!plain.has_images() && plain.images().is_empty());
     }
 
     /// The first difference between what two mirrors show, if any.
