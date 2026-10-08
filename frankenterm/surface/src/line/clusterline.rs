@@ -642,7 +642,7 @@ impl ClusteredLine {
         let mut clusters = self.clusters.iter();
         let cluster = clusters.next();
         ClusterLineCellIter {
-            graphemes: Graphemes::new(&self.text),
+            graphemes: ClusterGraphemes::new(&self.text),
             clusters,
             cluster,
             idx: 0,
@@ -964,8 +964,62 @@ impl ClusteredLine {
     }
 }
 
+/// A clustered line's graphemes, in order (ft-y0gy9). When every char of
+/// the text is cluster-inert, `breaks_between` guarantees a grapheme
+/// boundary between every two of them, so the graphemes are exactly the
+/// chars and are read without segmentation. Any other text is segmented by
+/// `Graphemes`, as before.
+enum ClusterGraphemes<'a> {
+    Chars(&'a str),
+    Segmented(Graphemes<'a>),
+}
+
+/// Whether clustered lines read an all-inert text char by char (ft-y0gy9):
+/// on unless FT_CLUSTER_CHAR_GRAPHEMES=0, read once per process. Both paths
+/// read the same graphemes; only segmentation's cost differs. Builds
+/// without `std` always read char by char.
+fn char_graphemes_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var_os("FT_CLUSTER_CHAR_GRAPHEMES").map_or(true, |value| value != "0")
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+impl<'a> ClusterGraphemes<'a> {
+    fn new(text: &'a str) -> Self {
+        if char_graphemes_enabled() && text.chars().all(is_cluster_inert) {
+            Self::Chars(text)
+        } else {
+            Self::Segmented(Graphemes::new(text))
+        }
+    }
+}
+
+impl<'a> Iterator for ClusterGraphemes<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        match self {
+            Self::Chars(rest) => {
+                let first = rest.chars().next()?;
+                let (grapheme, tail) = rest.split_at(first.len_utf8());
+                *rest = tail;
+                Some(grapheme)
+            }
+            Self::Segmented(graphemes) => graphemes.next(),
+        }
+    }
+}
+
 pub(crate) struct ClusterLineCellIter<'a> {
-    graphemes: Graphemes<'a>,
+    graphemes: ClusterGraphemes<'a>,
     clusters: core::slice::Iter<'a, Cluster>,
     cluster: Option<&'a Cluster>,
     idx: usize,
@@ -1267,6 +1321,108 @@ mod test {
                     single.clusters.len()
                 );
             }
+        }
+    }
+
+    /// `ClusterGraphemes` yields exactly what segmentation yields, and reads
+    /// an all-inert text char by char.
+    fn assert_cluster_graphemes_segment(text: &str) {
+        let fast: Vec<&str> = ClusterGraphemes::new(text).collect();
+        let segmented: Vec<&str> = Graphemes::new(text).collect();
+        assert_eq!(fast, segmented, "{:?}", text);
+        if text.chars().all(is_cluster_inert) {
+            assert!(matches!(
+                ClusterGraphemes::new(text),
+                ClusterGraphemes::Chars(_)
+            ));
+            assert_eq!(fast.len(), text.chars().count(), "{:?}", text);
+        }
+    }
+
+    /// ft-y0gy9: on T0's emoji and ASCII, CJK, Hangul syllables and the
+    /// other inert ranges, the graphemes are the chars; with anything that
+    /// joins (ZWJ, VS16, skin tones, regional indicators, combining marks,
+    /// Hangul jamo, Devanagari) the text is segmented, exactly as before.
+    #[test]
+    fn cluster_graphemes_equal_segmentation_on_inert_and_joining_text() {
+        for text in [
+            "",
+            "plain ascii, punctuation ~!",
+            "\u{1f600}\u{1f680}\u{1f916}\u{1f389}A7\u{1f9ff}\u{1fa70}",
+            "\u{4e2d}\u{6587}\u{3042}\u{30ab}\u{ac00}\u{d7a3}\u{ac00}",
+            "\u{e9}\u{3a9}\u{416}\u{2192}\u{2800}",
+            "\u{1f469}\u{200d}\u{1f4bb}",
+            "\u{2764}\u{fe0f}",
+            "\u{1f44d}\u{1f3fd}",
+            "\u{1f1fa}\u{1f1f8}\u{1f1eb}\u{1f1f7}\u{1f1e9}",
+            "e\u{301}",
+            "\u{1100}\u{1161}\u{11a8}",
+            "\u{915}\u{94d}\u{937}",
+            "a\r\nb",
+        ] {
+            assert_cluster_graphemes_segment(text);
+        }
+    }
+
+    fn graphemes_test_char() -> impl proptest::strategy::Strategy<Value = char> {
+        use proptest::prelude::*;
+        prop_oneof![
+            0x20u32..0x7f,
+            0xa0u32..0x300,
+            0x300u32..0x370,
+            0x1f300u32..0x1f400,
+            0x1f400u32..0x1f650,
+            0x1f680u32..0x1f700,
+            0x1f900u32..0x1fa00,
+            0x1fa70u32..0x1fb00,
+            0x1f1e6u32..0x1f200,
+            Just(0x200du32),
+            Just(0xfe0fu32),
+            Just(0x0du32),
+            Just(0x0au32),
+            0xac00u32..0xac20,
+            0x1100u32..0x1120,
+            0x1160u32..0x1170,
+            0x4e00u32..0x4e40,
+            0x900u32..0x980,
+        ]
+        .prop_map(|value| char::from_u32(value).unwrap())
+    }
+
+    fn inert_test_char() -> impl proptest::strategy::Strategy<Value = char> {
+        use proptest::prelude::*;
+        prop_oneof![
+            0x20u32..0x7f,
+            0x1f300u32..0x1f3fb,
+            0x1f400u32..0x1f650,
+            0x1f680u32..0x1f700,
+            0x1f900u32..0x1fa00,
+            0x1fa70u32..0x1fb00,
+            0x4e00u32..0x9fff,
+            0xac00u32..0xd7a4,
+        ]
+        .prop_map(|value| char::from_u32(value).unwrap())
+    }
+
+    proptest::proptest! {
+        /// ft-y0gy9: random texts mixing inert chars with every kind that
+        /// joins segment exactly as `Graphemes` segments them.
+        #[test]
+        fn cluster_graphemes_equal_segmentation_on_random_text(
+            chars in proptest::collection::vec(graphemes_test_char(), 0..32),
+        ) {
+            let text: String = chars.into_iter().collect();
+            assert_cluster_graphemes_segment(&text);
+        }
+
+        /// ft-y0gy9: random all-inert texts, as T0 rows are, take the char
+        /// path and still equal segmentation.
+        #[test]
+        fn cluster_graphemes_read_inert_text_char_by_char(
+            chars in proptest::collection::vec(inert_test_char(), 0..64),
+        ) {
+            let text: String = chars.into_iter().collect();
+            assert_cluster_graphemes_segment(&text);
         }
     }
 }

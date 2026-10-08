@@ -58,8 +58,6 @@ pub struct CellWrite<'a> {
     pub style: StyleSpec<'a>,
     pub semantic: SemanticType,
     pub wrapped: bool,
-    /// Legacy `CellAttributes::protected` (DECSCA, SPA).
-    pub protected: bool,
     pub hyperlink: Option<&'a Arc<Hyperlink>>,
     pub images: &'a [Box<ImageCell>],
     /// Legacy `set_cell_clearing_image_placements`: drop, rather than carry
@@ -76,7 +74,6 @@ impl<'a> CellWrite<'a> {
             style,
             semantic: SemanticType::Output,
             wrapped: false,
-            protected: false,
             hyperlink: None,
             images: &[],
             clear_image_placements: false,
@@ -948,8 +945,7 @@ impl Page {
         let template = PackedCell::BLANK
             .with_style(style)
             .with_semantic(cell.semantic)
-            .with_wrapped(cell.wrapped)
-            .with_protected(cell.protected);
+            .with_wrapped(cell.wrapped);
         let mut has_image = false;
         if cell.wide {
             has_image |= self.store_written(slot, x + 1, template, &cell, false);
@@ -998,18 +994,41 @@ impl Page {
                 cache: &mut cache,
             },
         };
+        let wide = cell.width() >= 2;
         let write = CellWrite {
             glyph: Glyph::from_text(cell.str()),
-            wide: cell.width() >= 2,
+            wide,
             style,
             semantic: attrs.semantic_type(),
             wrapped: attrs.wrapped(),
-            protected: attrs.protected(),
             hyperlink: attrs.hyperlink(),
             images: &images,
             clear_image_placements,
         };
-        self.write(row, x, write, seqno)
+        let written = self.write(row, x, write, seqno);
+        if written && attrs.protected() {
+            self.protect_cells(row, x..x + if wide { 2 } else { 1 });
+        }
+        written
+    }
+
+    /// Marks the stored cells `cols` of a row protected (legacy
+    /// `CellAttributes::protected`, DECSCA and SPA), right after a write
+    /// whose pen protects stored them. Writes themselves leave the bit
+    /// clear, so a print with no protection pays nothing for it. Cells past
+    /// the row's end are left alone.
+    pub fn protect_cells(&mut self, row: u32, cols: Range<usize>) {
+        let header = self.header(row);
+        let slot = header.slot();
+        let end = cols.end.min(header.len());
+        for x in cols.start..end {
+            let cell = self.cell_at(slot, x);
+            self.set_cell_at(slot, x, cell.with_protected(true));
+        }
+        self.debug_check_cells(
+            row,
+            cols.start.saturating_sub(1)..(end + 1).min(self.stride()),
+        );
     }
 
     /// A run of printable ASCII from column `x`, at or past the row's end,
@@ -1054,7 +1073,6 @@ impl Page {
             .with_style(style)
             .with_semantic(cell.semantic)
             .with_wrapped(cell.wrapped)
-            .with_protected(cell.protected)
             .with_hyperlink(cell.hyperlink.is_some());
         for (offset, &byte) in bytes.iter().enumerate() {
             let glyph = if byte == b' ' {
@@ -1139,7 +1157,6 @@ impl Page {
             .with_style(style)
             .with_semantic(cell.semantic)
             .with_wrapped(cell.wrapped)
-            .with_protected(cell.protected)
             .with_hyperlink(cell.hyperlink.is_some());
         for (offset, &byte) in bytes.iter().enumerate() {
             let col = x + offset;
@@ -1268,8 +1285,7 @@ impl Page {
             let bits = PackedCell::BLANK
                 .with_style(style)
                 .with_semantic(blank.semantic)
-                .with_wrapped(blank.wrapped)
-                .with_protected(blank.protected);
+                .with_wrapped(blank.wrapped);
             let has_image = self.store_written(slot, insert_at, bits, &blank, false);
             flags |= blank.summary_flags(style, has_image);
             len += 1;

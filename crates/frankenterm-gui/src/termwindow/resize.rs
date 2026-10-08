@@ -1697,11 +1697,7 @@ mod tests {
         let font = fonts.resolve_font(&TextStyle::default()).unwrap();
         let palette = ColorPalette::default();
         let ledger = private_ledger();
-        let atlas_bytes = texture_bytes(
-            LEDGER_ATLAS_SIDE as u64,
-            LEDGER_ATLAS_SIDE as u64,
-            4,
-        );
+        let atlas_bytes = texture_bytes(LEDGER_ATLAS_SIDE as u64, LEDGER_ATLAS_SIDE as u64, 4);
         let bound = 2 * atlas_bytes;
 
         let glyph_cache = RefCell::new(
@@ -1733,7 +1729,10 @@ mod tests {
                 .put(line_shape_key(generation, 0), colored_line(&hot, &palette));
             drop(hot);
 
-            assert_eq!(fixture.invalidate(Cause::AtlasResource), CacheRebuild::AtlasSprites);
+            assert_eq!(
+                fixture.invalidate(Cause::AtlasResource),
+                CacheRebuild::AtlasSprites
+            );
             util_sprites = replace_glyph_cache_atlas(
                 &glyph_cache,
                 &fonts,
@@ -1761,7 +1760,11 @@ mod tests {
         let snapshot = ledger.snapshot();
         let atlas = snapshot.textures["atlas"];
         assert_eq!(snapshot.atlas_generations, REBUILDS);
-        assert_eq!(atlas.created_total, REBUILDS + 1, "every rebuild made a new atlas");
+        assert_eq!(
+            atlas.created_total,
+            REBUILDS + 1,
+            "every rebuild made a new atlas"
+        );
         assert_eq!(atlas.released_total, REBUILDS, "every old atlas was freed");
         assert!(atlas.peak_live_bytes <= bound);
         assert_eq!(
@@ -1796,22 +1799,16 @@ mod tests {
         let metrics = RenderMetrics::new(&fonts).unwrap();
         let font = fonts.resolve_font(&TextStyle::default()).unwrap();
         let ledger = private_ledger();
-        let atlas_bytes = texture_bytes(
-            LEDGER_ATLAS_SIDE as u64,
-            LEDGER_ATLAS_SIDE as u64,
-            4,
-        );
+        let atlas_bytes = texture_bytes(LEDGER_ATLAS_SIDE as u64, LEDGER_ATLAS_SIDE as u64, 4);
         let glyph_cache = RefCell::new(
             GlyphCache::with_atlas_surface(&fonts, ledgered_atlas_surface(ledger)).unwrap(),
         );
-        let mut _util_sprites =
-            UtilSprites::new(&mut glyph_cache.borrow_mut(), &metrics).unwrap();
+        let mut _util_sprites = UtilSprites::new(&mut glyph_cache.borrow_mut(), &metrics).unwrap();
         let mut fixture = CacheFixture::new(0, 0);
 
         let mut retained = Vec::new();
         for _ in 0..3 {
-            let (_, sprites) =
-                shape_through_cache(&fixture, &glyph_cache, &font, &metrics, "AVfi");
+            let (_, sprites) = shape_through_cache(&fixture, &glyph_cache, &font, &metrics, "AVfi");
             retained.push(sprites);
             fixture.invalidate(Cause::AtlasResource);
             _util_sprites = replace_glyph_cache_atlas(
@@ -1829,7 +1826,10 @@ mod tests {
             (4, 4 * atlas_bytes),
             "three retained bindings pin three old atlases next to the current one"
         );
-        assert!(pinned.live_bytes > 2 * atlas_bytes, "the 2x bound detects pinning");
+        assert!(
+            pinned.live_bytes > 2 * atlas_bytes,
+            "the 2x bound detects pinning"
+        );
 
         drop(retained);
         let freed = ledger.texture_counter(GpuTexturePurpose::Atlas);

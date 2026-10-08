@@ -1,6 +1,9 @@
 use crate::quad::{TripleLayerQuadAllocatorTrait, Vertex};
 use anyhow::anyhow;
 use config::{ConfigHandle, GpuInfo, HsbTransform, WebGpuPowerPreference};
+use frankenterm_alloc::resource_ledger::{
+    GpuBufferPurpose, GpuResourceGuard, GpuResourceLedger, GpuTexturePurpose, texture_bytes,
+};
 use frankenterm_core::color_management::{SurfaceFormatGamut, SurfaceGamutClassification};
 use frankenterm_core::display_pipeline::{
     ForcePresentSignals, PresentAction, ScanoutBlockReason, ScanoutEligibility, VrrMechanism,
@@ -20,9 +23,6 @@ use frankenterm_core::wayland_direct_scanout::{
     ScanoutFallback as DirectScanoutFallback, ScanoutInputs as DirectScanoutInputs,
     ScanoutSupport as DirectScanoutSupport, WaylandCompositor as DirectScanoutCompositor,
     evaluate_direct_scanout,
-};
-use frankenterm_alloc::resource_ledger::{
-    GpuBufferPurpose, GpuResourceGuard, GpuResourceLedger, GpuTexturePurpose, texture_bytes,
 };
 use frankenterm_gui::glyph_quad_staging::{
     GlyphQuadSoaBuffers, GlyphQuadStagingInstance, GlyphQuadStagingVertex,
@@ -1654,10 +1654,8 @@ impl WebGpuState {
             dimensions: RefCell::new(dimensions),
             render_pipeline,
             glyph_quad_instance_render_pipeline,
-            _shader_uniform_ledger: GpuResourceLedger::global().track_buffer(
-                GpuBufferPurpose::Uniform,
-                shader_uniform_buffer.size(),
-            ),
+            _shader_uniform_ledger: GpuResourceLedger::global()
+                .track_buffer(GpuBufferPurpose::Uniform, shader_uniform_buffer.size()),
             shader_uniform_buffer,
             shader_uniform_bind_group,
             handle,
@@ -1987,7 +1985,11 @@ mod tests {
             let drawables =
                 ledger_configured_drawables(&config(latency, wgpu::TextureFormat::Bgra8Unorm));
             assert_eq!(drawables.len(), expected, "latency {latency}");
-            assert!(drawables.iter().all(|guard| guard.bytes() == 1600 * 1000 * 4));
+            assert!(
+                drawables
+                    .iter()
+                    .all(|guard| guard.bytes() == 1600 * 1000 * 4)
+            );
         }
         let wide = ledger_configured_drawables(&config(2, wgpu::TextureFormat::Rgba16Float));
         assert!(wide.iter().all(|guard| guard.bytes() == 1600 * 1000 * 8));

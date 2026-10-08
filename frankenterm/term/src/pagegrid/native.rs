@@ -224,12 +224,15 @@ fn write_grapheme(
         style,
         semantic: attr.semantic_type(),
         wrapped: attr.wrapped(),
-        protected: attr.protected(),
         hyperlink: attr.hyperlink(),
         images: &images,
         clear_image_placements: false,
     };
-    page.write(row, x, write, seqno)
+    let written = page.write(row, x, write, seqno);
+    if written && attr.protected() {
+        page.protect_cells(row, x..x + width);
+    }
+    written
 }
 
 /// Legacy `Screen::set_ascii_cell_run`: each byte of the printable-ASCII
@@ -290,7 +293,6 @@ pub fn set_ascii_run(
         let mut write = CellWrite::new(Glyph::Blank, style);
         write.semantic = attr.semantic_type();
         write.wrapped = attr.wrapped();
-        write.protected = attr.protected();
         write.hyperlink = attr.hyperlink();
         let stored = if appends {
             page.append_ascii(row, x, text.as_bytes(), write, seqno)
@@ -301,6 +303,9 @@ pub fn set_ascii_run(
             page.put_ascii(row, x, text.as_bytes(), write, seqno)
         };
         if stored {
+            if attr.protected() {
+                page.protect_cells(row, x..x + text.len());
+            }
             return true;
         }
     }
@@ -334,12 +339,14 @@ pub fn set_ascii_run(
             style,
             semantic: attr.semantic_type(),
             wrapped: attr.wrapped(),
-            protected: attr.protected(),
             hyperlink: attr.hyperlink(),
             images: &images,
             clear_image_placements: false,
         };
         page.write(row, at, write, seqno);
+    }
+    if attr.protected() {
+        page.protect_cells(row, x..x + text.len());
     }
     true
 }
@@ -568,10 +575,14 @@ pub fn erase_cell(
     let mut blank = CellWrite::new(Glyph::Blank, style);
     blank.semantic = blank_attr.semantic_type();
     blank.wrapped = blank_attr.wrapped();
-    blank.protected = blank_attr.protected();
     blank.hyperlink = blank_attr.hyperlink();
     blank.images = &images;
     page.erase_cell_with_margin(row, x, right_margin, blank, seqno);
+    // The blank went in at `right_margin - 1` exactly when the row now
+    // reaches past it.
+    if blank_attr.protected() && right_margin - 1 < page.row_len(row) {
+        page.protect_cells(row, right_margin - 1..right_margin);
+    }
     true
 }
 
@@ -783,11 +794,13 @@ fn append_blanks(
         let mut write = CellWrite::new(Glyph::Blank, style);
         write.semantic = attr.semantic_type();
         write.wrapped = attr.wrapped();
-        write.protected = attr.protected();
         write.hyperlink = attr.hyperlink();
         let appended = page.append_ascii(row, x, &SPACES[..n], write, seqno);
         debug_assert!(appended, "an empty row takes its blanks");
         x += n;
+    }
+    if attr.protected() {
+        page.protect_cells(row, 0..cols);
     }
     true
 }
@@ -867,7 +880,7 @@ mod tests {
     /// Eight pens: plain, bold, palette background, a hyperlink, palette
     /// foreground with the wrapped bit, a true-colour foreground (which
     /// pages store as a rich style), and the Prompt and Input semantic
-    /// types (OSC 133).
+    /// types (OSC 133); `n` 8-15 are the same pens protected.
     fn attrs(n: u8) -> CellAttributes {
         let mut attrs = CellAttributes::default();
         match n % 8 {
@@ -896,6 +909,11 @@ mod tests {
             _ => {
                 attrs.set_semantic_type(SemanticType::Input);
             }
+        }
+        // Each pen also comes protected (DECSCA, SPA), which a page stores
+        // after the write (`Page::protect_cells`).
+        if n & 8 != 0 {
+            attrs.set_protected(true);
         }
         attrs
     }
@@ -1003,30 +1021,30 @@ mod tests {
     fn op() -> impl Strategy<Value = Op> {
         let x = 0usize..11;
         prop_oneof![
-            (x.clone(), 0..GLYPHS.len(), 0u8..8).prop_map(|(x, glyph, attrs)| Op::SetCell {
+            (x.clone(), 0..GLYPHS.len(), 0u8..16).prop_map(|(x, glyph, attrs)| Op::SetCell {
                 x,
                 glyph,
                 attrs
             }),
-            (x.clone(), 0..GLYPHS.len(), 0u8..8).prop_map(|(x, glyph, attrs)| Op::Grapheme {
+            (x.clone(), 0..GLYPHS.len(), 0u8..16).prop_map(|(x, glyph, attrs)| Op::Grapheme {
                 x,
                 glyph,
                 attrs
             }),
-            (0usize..8, 0..TEXTS.len(), 0u8..8).prop_map(|(x, text, attrs)| Op::Ascii {
+            (0usize..8, 0..TEXTS.len(), 0u8..16).prop_map(|(x, text, attrs)| Op::Ascii {
                 x,
                 text,
                 attrs
             }),
             any::<bool>().prop_map(|wrapped| Op::Wrapped { wrapped }),
-            (0usize..13, 0usize..14, 0u8..8).prop_map(|(start, end, attrs)| Op::Fill {
+            (0usize..13, 0usize..14, 0u8..16).prop_map(|(start, end, attrs)| Op::Fill {
                 start,
                 end,
                 attrs
             }),
             Just(Op::Compress),
             (0usize..12, 0usize..13).prop_map(|(x, margin)| Op::Insert { x, margin }),
-            (0usize..13, 0usize..13, 0u8..8).prop_map(|(x, margin, attrs)| Op::Delete {
+            (0usize..13, 0usize..13, 0u8..16).prop_map(|(x, margin, attrs)| Op::Delete {
                 x,
                 margin,
                 attrs
@@ -1036,9 +1054,9 @@ mod tests {
             (0usize..12, 0usize..13).prop_map(|(start, end)| Op::TakeBand { start, end }),
             (
                 0usize..10,
-                prop::collection::vec((0..GLYPHS.len(), 0u8..8), 0..4),
+                prop::collection::vec((0..GLYPHS.len(), 0u8..16), 0..4),
                 0usize..13,
-                0u8..8
+                0u8..16
             )
                 .prop_map(|(start, cells, end, attrs)| Op::PutBand {
                     start,
@@ -1046,7 +1064,7 @@ mod tests {
                     end,
                     attrs
                 }),
-            (0usize..12, 0usize..13, 0u8..8).prop_map(|(start, end, attrs)| Op::BlankBand {
+            (0usize..12, 0usize..13, 0u8..16).prop_map(|(start, end, attrs)| Op::BlankBand {
                 start,
                 end,
                 attrs

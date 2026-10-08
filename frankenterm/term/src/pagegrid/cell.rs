@@ -254,9 +254,9 @@ impl PackedCell {
     const STYLE_MASK: u64 = 0xFFFF_FFFF << 29;
     const WRAPPED: u64 = 1 << 61;
     /// Legacy `CellAttributes::protected` (DECSCA, SPA). It is a cell bit
-    /// rather than a style bit: the inline style's 32 bits are full, and a
-    /// pen's protection must not cost a print run anything beyond its
-    /// template.
+    /// rather than a style bit, since the inline style's 32 bits are full.
+    /// Writes never set it; `Page::protect_cells` marks cells after a write
+    /// with a protecting pen, so unprotected printing pays nothing for it.
     const PROTECTED: u64 = 1 << 62;
     pub const RESERVED: u64 = 1 << 63;
 
