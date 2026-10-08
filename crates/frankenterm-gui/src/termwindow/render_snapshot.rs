@@ -33,9 +33,19 @@
 //! - `FRANKENTERM_RENDER_SNAPSHOT_MODAL=char_select|pane_select|command_palette`
 //!   opens that modal overlay with its default arguments, through the key
 //!   assignment a keypress would perform (ft-yccm0.4.7.1).
+//! - `FRANKENTERM_RENDER_SNAPSHOT_COMPOSE=<text>` sets an IME composition
+//!   (`DeadKeyStatus::Composing`), as the input method's marked text sets
+//!   it, so the renderers draw the preedit text and the compose cursor at
+//!   the terminal cursor (ft-yccm0.4.7.3).
+//! - `FRANKENTERM_RENDER_SNAPSHOT_BLINK=<level>` pins every blink (slow and
+//!   rapid text, the cursor) at `level`, from 0.0 to 1.0, wherever the
+//!   renderers read a blink state's level, so a blink phase is drawn the
+//!   same every run (ft-yccm0.4.7.3). The scene's configuration must still
+//!   give the blink a non-zero rate, as a live blink needs.
 //!
-//! Focus, selection and the modal are applied in the paint that first sees
-//! the snapshot title, and the snapshot is taken by the next paint.
+//! Focus, selection, the modal, the composition and the blink are applied in
+//! the paint that first sees the snapshot title, and the snapshot is taken
+//! by the next paint.
 //!
 //! A snapshot paint whose frame is not final yet takes nothing and re-arms
 //! the request (see [`SnapshotFrameReadiness`]): a fallback font still
@@ -56,6 +66,8 @@ pub(crate) const SNAPSHOT_SELECTION_ENV: &str = "FRANKENTERM_RENDER_SNAPSHOT_SEL
 pub(crate) const SNAPSHOT_SPLIT_ENV: &str = "FRANKENTERM_RENDER_SNAPSHOT_SPLIT";
 pub(crate) const SNAPSHOT_SPLIT_COMMAND_ENV: &str = "FRANKENTERM_RENDER_SNAPSHOT_SPLIT_COMMAND";
 pub(crate) const SNAPSHOT_MODAL_ENV: &str = "FRANKENTERM_RENDER_SNAPSHOT_MODAL";
+pub(crate) const SNAPSHOT_COMPOSE_ENV: &str = "FRANKENTERM_RENDER_SNAPSHOT_COMPOSE";
+pub(crate) const SNAPSHOT_BLINK_ENV: &str = "FRANKENTERM_RENDER_SNAPSHOT_BLINK";
 pub(crate) const DEFAULT_SNAPSHOT_TITLE: &str = "ft-render-snapshot";
 /// The title that triggers a requested split.
 pub(crate) const SPLIT_TITLE: &str = "ft-render-split";
@@ -134,12 +146,16 @@ impl SnapshotModal {
 }
 
 /// Window state to set up before the snapshot; see the module docs.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct SnapshotActions {
     pub(crate) focus: bool,
     pub(crate) selection: Option<SnapshotSelection>,
     pub(crate) split: Option<SnapshotSplit>,
     pub(crate) modal: Option<SnapshotModal>,
+    /// An IME composition to set.
+    pub(crate) compose: Option<String>,
+    /// The level every blink is pinned at, from 0.0 to 1.0.
+    pub(crate) blink: Option<f32>,
 }
 
 impl SnapshotActions {
@@ -177,11 +193,26 @@ impl SnapshotActions {
             .filter(|text| !text.is_empty())
             .map(|text| SnapshotModal::parse(&text))
             .transpose()?;
+        let compose = lookup(SNAPSHOT_COMPOSE_ENV).filter(|text| !text.is_empty());
+        let blink = lookup(SNAPSHOT_BLINK_ENV)
+            .filter(|text| !text.is_empty())
+            .map(|text| {
+                text.trim()
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|level| (0.0..=1.0).contains(level))
+                    .ok_or_else(|| {
+                        format!("{SNAPSHOT_BLINK_ENV}={text:?} is not a level from 0 to 1")
+                    })
+            })
+            .transpose()?;
         Ok(Self {
             focus,
             selection,
             split,
             modal,
+            compose,
+            blink,
         })
     }
 }
@@ -205,7 +236,7 @@ pub(crate) enum SnapshotStep {
 }
 
 /// A pending one-shot snapshot request for one window.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RenderSnapshotRequest {
     path: PathBuf,
     title: String,
@@ -261,7 +292,9 @@ impl RenderSnapshotRequest {
         if !self.prepared
             && (self.actions.focus
                 || self.actions.selection.is_some()
-                || self.actions.modal.is_some())
+                || self.actions.modal.is_some()
+                || self.actions.compose.is_some()
+                || self.actions.blink.is_some())
         {
             self.prepared = true;
             return SnapshotStep::Prepare {
@@ -278,6 +311,17 @@ impl RenderSnapshotRequest {
     /// [`SnapshotFrameReadiness::modal_pending`]).
     pub(crate) fn wants_modal(&self) -> bool {
         self.prepared && self.actions.modal.is_some()
+    }
+
+    /// The IME composition the prepare paint sets.
+    pub(crate) fn compose(&self) -> Option<&str> {
+        self.actions.compose.as_deref()
+    }
+
+    /// The level every blink is pinned at, once the snapshot is prepared
+    /// (ft-yccm0.4.7.3).
+    pub(crate) fn blink_level(&self) -> Option<f32> {
+        self.actions.blink.filter(|_| self.prepared)
     }
 
     /// Returns a claimed snapshot to pending: the frame was not final yet
@@ -611,9 +655,13 @@ mod tests {
             (SNAPSHOT_SPLIT_ENV, "bottom"),
             (SNAPSHOT_SPLIT_COMMAND_ENV, "cat b; exec sleep 600"),
             (SNAPSHOT_MODAL_ENV, "pane_select"),
+            (SNAPSHOT_COMPOSE_ENV, "日本"),
+            (SNAPSHOT_BLINK_ENV, " 0.25"),
         ]))
         .unwrap();
         assert_eq!(actions.modal, Some(SnapshotModal::PaneSelect));
+        assert_eq!(actions.compose.as_deref(), Some("日本"));
+        assert_eq!(actions.blink, Some(0.25));
         assert!(actions.focus);
         assert_eq!(
             actions.selection,
@@ -646,6 +694,9 @@ mod tests {
             ][..],
             &[(SNAPSHOT_SPLIT_ENV, "right")][..],
             &[(SNAPSHOT_MODAL_ENV, "launcher")][..],
+            &[(SNAPSHOT_BLINK_ENV, "half")][..],
+            &[(SNAPSHOT_BLINK_ENV, "1.5")][..],
+            &[(SNAPSHOT_BLINK_ENV, "-0.1")][..],
         ] {
             assert!(
                 SnapshotActions::from_lookup(lookup(vars)).is_err(),
@@ -667,8 +718,7 @@ mod tests {
         request.actions = SnapshotActions {
             focus: true,
             selection: Some(selection),
-            split: None,
-            modal: None,
+            ..SnapshotActions::default()
         };
         assert_eq!(request.step(Some("zsh")), SnapshotStep::Idle);
         assert_eq!(
@@ -685,6 +735,31 @@ mod tests {
         );
         // A re-armed snapshot does not prepare twice.
         request.rearm();
+        assert_eq!(
+            request.step(Some(DEFAULT_SNAPSHOT_TITLE)),
+            take("/tmp/a.png")
+        );
+    }
+
+    /// ft-yccm0.4.7.3: a composition or a pinned blink alone is prepared one
+    /// paint before the snapshot, and the blink is pinned only from then on.
+    #[test]
+    fn a_composition_and_a_blink_are_prepared_before_the_snapshot() {
+        let mut request =
+            RenderSnapshotRequest::from_values(Some("/tmp/a.png".into()), None).unwrap();
+        request.actions.compose = Some("日本".to_string());
+        request.actions.blink = Some(0.5);
+        assert_eq!(request.compose(), Some("日本"));
+        assert_eq!(request.blink_level(), None, "not prepared yet");
+        assert_eq!(
+            request.step(Some(DEFAULT_SNAPSHOT_TITLE)),
+            SnapshotStep::Prepare {
+                focus: false,
+                selection: None,
+                modal: None,
+            }
+        );
+        assert_eq!(request.blink_level(), Some(0.5));
         assert_eq!(
             request.step(Some(DEFAULT_SNAPSHOT_TITLE)),
             take("/tmp/a.png")

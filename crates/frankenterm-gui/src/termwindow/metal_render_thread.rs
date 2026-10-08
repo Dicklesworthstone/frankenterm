@@ -752,6 +752,7 @@ mod tests {
                 compose: None,
                 bell_cursor: None,
                 fallback_ready: None,
+                blink_pin: None,
             },
             rect,
             clear: ClearColor::from_srgba(0.0, 0.0, 0.0, 1.0),

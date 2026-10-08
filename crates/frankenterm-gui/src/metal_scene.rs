@@ -120,6 +120,20 @@ pub trait GlyphSource {
     /// placed from its first cell's top-left; `None` when the source has
     /// none.
     fn cursor_sprite(&mut self, shape: CursorSprite, width_cells: u8) -> Option<PlacedGlyph>;
+
+    /// Whether any font style sets a text color, so the scene asks
+    /// [`Self::style_foreground`] per cell only then.
+    fn has_style_foregrounds(&self) -> bool {
+        false
+    }
+
+    /// The text color the font style of `cell`'s attributes sets (a font
+    /// rule's `foreground`), which the WebGpu renderer draws text in the
+    /// default foreground with; `None` for none.
+    fn style_foreground(&mut self, row: &MirrorRow, cell: &MirrorCell) -> Option<SrgbaTuple> {
+        let _ = (row, cell);
+        None
+    }
 }
 
 /// A cursor the scene draws as the WebGpu renderer's cursor sprite
@@ -492,19 +506,34 @@ fn resolved_fg(cell: &MirrorCell, palette: &ColorPalette, bold_brightens: bool) 
     }
 }
 
-fn cell_colors(cell: &MirrorCell, style: &SceneStyle<'_>, reverse_video: bool) -> CellColors {
+/// `cell`'s colors. `style_fg` is the text color its font style sets (a
+/// font rule's `foreground`): it replaces a default foreground wherever the
+/// WebGpu renderer resolves text colors with the font style
+/// (`resolve_fg_color_attr`), so in the text and what it sits on, but not
+/// in a reversed cell's background, which WebGpu's background pass paints
+/// from the attribute alone.
+fn cell_colors(
+    cell: &MirrorCell,
+    style: &SceneStyle<'_>,
+    reverse_video: bool,
+    style_fg: Option<SrgbaTuple>,
+) -> CellColors {
     let palette = style.palette;
     let fg = resolved_fg(cell, palette, style.bold_brightens);
+    let text_fg = match style_fg {
+        Some(color) if cell.fg() == MirrorColor::Default => color,
+        _ => fg,
+    };
     let bg = palette.resolve_bg(cell.bg().to_attribute());
     if cell.reverse() != reverse_video {
         CellColors {
             fg: bg,
             explicit_bg: Some(fg),
-            bg: fg,
+            bg: text_fg,
         }
     } else {
         CellColors {
-            fg,
+            fg: text_fg,
             explicit_bg: (cell.bg() != MirrorColor::Default).then_some(bg),
             bg,
         }
@@ -542,8 +571,9 @@ fn text_color(
     style: &SceneStyle<'_>,
     built: &BuiltRow,
     reverse_video: bool,
+    style_fg: Option<SrgbaTuple>,
 ) -> Option<[u8; 4]> {
-    let colors = cell_colors(cell, style, reverse_video);
+    let colors = cell_colors(cell, style, reverse_video, style_fg);
     let col = cell.col();
     let text_fg = blinked_fg(cell, &colors, style);
     let mut fg = text_fg;
@@ -827,7 +857,16 @@ impl MetalScene {
         // ([`selection_tinted`]).
         let SrgbaTuple(red, green, blue, tint) = style.selection_bg;
         let selection_opaque = SrgbaTuple(red, green, blue, 1.0);
-        for cell in mirror_row.cells() {
+        // The text colors font styles set, asked per cell only when the
+        // configuration has one.
+        let style_fgs = glyphs.has_style_foregrounds().then(|| {
+            mirror_row
+                .cells()
+                .iter()
+                .map(|cell| glyphs.style_foreground(mirror_row, cell))
+                .collect::<Vec<_>>()
+        });
+        for (index, cell) in mirror_row.cells().iter().enumerate() {
             let hovered = style
                 .hover
                 .is_some_and(|hover| same_link(Some(hover), mirror_row.hyperlink(cell)));
@@ -848,7 +887,8 @@ impl MetalScene {
             };
             let color = match cell.underline_color() {
                 MirrorColor::Default => {
-                    let colors = cell_colors(cell, style, reverse_video);
+                    let style_fg = style_fgs.as_ref().and_then(|fgs| fgs[index]);
+                    let colors = cell_colors(cell, style, reverse_video, style_fg);
                     blinked_fg(cell, &colors, style)
                 }
                 color => style.palette.resolve_fg(color.to_attribute()),
@@ -892,7 +932,7 @@ impl MetalScene {
             }
         }
         for cell in mirror_row.cells() {
-            let colors = cell_colors(cell, style, reverse_video);
+            let colors = cell_colors(cell, style, reverse_video, None);
             if let Some(SrgbaTuple(red, green, blue, _)) = colors.explicit_bg {
                 let background = CellBg::rgb(unorm8(red), unorm8(green), unorm8(blue));
                 if cell.width() > 1 {
@@ -946,9 +986,10 @@ impl MetalScene {
                 _ => {
                     let index =
                         cells.partition_point(|cell| cell.col() + cell.width().max(1) <= col);
-                    cells
-                        .get(index)
-                        .and_then(|cell| text_color(cell, style, built, reverse_video))
+                    cells.get(index).and_then(|cell| {
+                        let style_fg = style_fgs.as_ref().and_then(|fgs| fgs[index]);
+                        text_color(cell, style, built, reverse_video, style_fg)
+                    })
                 }
             };
             let Some(fg) = fg else {
@@ -1025,6 +1066,9 @@ mod tests {
         slots: HashMap<(String, SyntheticStyle), PlacedGlyph>,
         lines: HashMap<LineSprite, PlacedGlyph>,
         cursors: HashMap<(CursorSprite, u8), PlacedGlyph>,
+        /// A font rule's text color for bold text, as a configured
+        /// `font_rules` entry with a `foreground` sets one.
+        bold_foreground: Option<SrgbaTuple>,
     }
 
     fn synthetic_style(cluster: &CellCluster) -> SyntheticStyle {
@@ -1136,6 +1180,15 @@ mod tests {
     impl GlyphSource for SyntheticGlyphs {
         fn shape_row(&mut self, clusters: &[CellCluster]) -> Vec<ShapedGlyph> {
             synthetic_row(clusters, |cluster| self.shape_cluster(cluster))
+        }
+
+        fn has_style_foregrounds(&self) -> bool {
+            self.bold_foreground.is_some()
+        }
+
+        fn style_foreground(&mut self, _row: &MirrorRow, cell: &MirrorCell) -> Option<SrgbaTuple> {
+            self.bold_foreground
+                .filter(|_| cell.intensity() == Intensity::Bold)
         }
 
         /// One made-up grayscale slot per line sprite, far from the glyphs'.
@@ -1974,6 +2027,68 @@ mod tests {
                 .text()
                 .row(0)
                 .all(|instance| instance.fg() == rgba8(dim))
+        );
+    }
+
+    /// ft-yccm0.4.7.3: a font rule's `foreground` colors text in the default
+    /// foreground and its default-colored underline, as WebGpu's
+    /// `resolve_fg_color_attr` does with the matched style. Text with its own
+    /// color keeps it, and a reversed cell's background stays the
+    /// attribute's color, as WebGpu's background pass paints it.
+    #[test]
+    fn a_font_rule_foreground_colors_default_text() {
+        let palette = ColorPalette::default();
+        let red = SrgbaTuple(0.9, 0.1, 0.1, 1.0);
+        let mut term = terminal(2, 12);
+        term.advance_bytes(b"\x1b[1;4mab\x1b[0m c\x1b[1;32md\x1b[0m \x1b[1;7me\x1b[0m\x1b[?25l");
+        let mut mirror = RenderMirror::new();
+        let mut scene = MetalScene::new();
+        let mut glyphs = SyntheticGlyphs {
+            bold_foreground: Some(red),
+            ..SyntheticGlyphs::default()
+        };
+        step(
+            &mut term,
+            &mut mirror,
+            &mut scene,
+            &mut glyphs,
+            &no_selection,
+            &plain_style(&palette),
+        );
+        let row: Vec<(u16, [u8; 4], bool)> = scene
+            .text()
+            .row(0)
+            .map(|instance| {
+                let line = instance.atlas_origin()[1] >= 1536;
+                (instance.col(), instance.fg(), line)
+            })
+            .collect();
+        let (fg, green) = (
+            rgba8(palette.foreground),
+            rgba8(palette.resolve_fg(ColorAttribute::PaletteIndex(10))),
+        );
+        assert_eq!(
+            row,
+            [
+                // The bold underline, then the glyphs.
+                (0, rgba8(red), true),
+                (1, rgba8(red), true),
+                (0, rgba8(red), false),
+                (1, rgba8(red), false),
+                (3, fg, false),
+                // Bold green is its own (brightened) color.
+                (4, green, false),
+                // Bold reversed: the default background as text, on the rule's color.
+                (6, rgba8(palette.background), false),
+            ]
+        );
+        // The reversed cell's background is the attribute's foreground,
+        // not the rule's color.
+        let background = scene.cells().get(0, 6).expect("a cell background");
+        let expected = rgba8(palette.foreground);
+        assert_eq!(
+            background,
+            CellBg::rgb(expected[0], expected[1], expected[2])
         );
     }
 

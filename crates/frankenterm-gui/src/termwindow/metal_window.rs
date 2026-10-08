@@ -385,6 +385,7 @@ impl TermWindow {
                         VisualBellTarget::CursorColor,
                     ),
                     fallback_ready: Some(self.metal_fallback_ready()),
+                    blink_pin: self.snapshot_blink_level(),
                     pane: Some(pos.pane),
                 },
                 rect: layout.pane_rect(pos.left, pos.top, pos.width, pos.height),
@@ -482,7 +483,7 @@ impl MetalPanes {
         let phase = panes.first().map_or_else(MetalBlinkPhase::default, |pane| {
             self.blink
                 .get_or_insert_with(|| MetalBlinkClocks::new(&pane.inputs.config))
-                .text_phase(&pane.inputs.config)
+                .text_phase(&pane.inputs.config, pane.inputs.blink_pin)
         });
         let mut blinking = (false, false);
         let mut cursor_due = None;

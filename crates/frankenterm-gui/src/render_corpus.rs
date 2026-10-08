@@ -117,7 +117,7 @@ pub struct SceneSpec {
 
 /// Window state a scene's bytes cannot create, set up by the GUI's snapshot
 /// hook (its `FRANKENTERM_RENDER_SNAPSHOT_*` variables).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SceneActions {
     /// Render the window as focused (focused cursor shapes).
     #[serde(default)]
@@ -132,6 +132,15 @@ pub struct SceneActions {
     /// `pane_select` or `command_palette` (ft-yccm0.4.7.1).
     #[serde(default)]
     pub modal: Option<String>,
+    /// An IME composition (preedit text) at the terminal cursor
+    /// (ft-yccm0.4.7.3).
+    #[serde(default)]
+    pub compose: Option<String>,
+    /// Pin every blink at this level, from 0.0 to 1.0, so a blink phase is
+    /// drawn the same every run; the scene's configuration gives the blinks
+    /// their non-zero rates (ft-yccm0.4.7.3).
+    #[serde(default)]
+    pub blink: Option<f32>,
 }
 
 impl SceneActions {
@@ -201,6 +210,23 @@ pub fn snapshot_action_env(
         env.push((
             "FRANKENTERM_RENDER_SNAPSHOT_MODAL".to_string(),
             modal.clone(),
+        ));
+    }
+    if let Some(compose) = &actions.compose {
+        anyhow::ensure!(!compose.is_empty(), "the scene composition is empty");
+        env.push((
+            "FRANKENTERM_RENDER_SNAPSHOT_COMPOSE".to_string(),
+            compose.clone(),
+        ));
+    }
+    if let Some(blink) = actions.blink {
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&blink),
+            "the scene blink level {blink} is not from 0 to 1"
+        );
+        env.push((
+            "FRANKENTERM_RENDER_SNAPSHOT_BLINK".to_string(),
+            blink.to_string(),
         ));
     }
     Ok(env)
@@ -698,12 +724,16 @@ mod tests {
                 text: "second".to_string(),
             }),
             modal: Some("char_select".to_string()),
+            compose: Some("日本".to_string()),
+            blink: Some(0.5),
         };
         let env: BTreeMap<String, String> = snapshot_action_env(&actions, split_scene)
             .unwrap()
             .into_iter()
             .collect();
         assert_eq!(env["FRANKENTERM_RENDER_SNAPSHOT_MODAL"], "char_select");
+        assert_eq!(env["FRANKENTERM_RENDER_SNAPSHOT_COMPOSE"], "日本");
+        assert_eq!(env["FRANKENTERM_RENDER_SNAPSHOT_BLINK"], "0.5");
         assert_eq!(env["FRANKENTERM_RENDER_SNAPSHOT_FOCUS"], "1");
         assert_eq!(env["FRANKENTERM_RENDER_SNAPSHOT_SELECTION"], "1,2,3,4");
         assert_eq!(env["FRANKENTERM_RENDER_SNAPSHOT_SPLIT"], "right");
@@ -742,6 +772,16 @@ mod tests {
             ..SceneActions::default()
         };
         assert!(snapshot_action_env(&launcher, split_scene).is_err());
+        let empty_compose = SceneActions {
+            compose: Some(String::new()),
+            ..SceneActions::default()
+        };
+        assert!(snapshot_action_env(&empty_compose, split_scene).is_err());
+        let overblink = SceneActions {
+            blink: Some(1.5),
+            ..SceneActions::default()
+        };
+        assert!(snapshot_action_env(&overblink, split_scene).is_err());
     }
 
     #[test]

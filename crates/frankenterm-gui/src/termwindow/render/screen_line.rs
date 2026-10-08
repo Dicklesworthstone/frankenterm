@@ -886,7 +886,7 @@ impl crate::TermWindow {
                     };
                     if let Some((blink_rate, mut colorease)) = blink_rate {
                         if blink_rate != 0 {
-                            let (intensity, next) = colorease.intensity_continuous();
+                            let (intensity, next) = self.blink_intensity(&mut colorease);
 
                             let (r1, g1, b1, a) = bg.tuple();
                             let (r, g, b, _a) = fg.tuple();

@@ -5517,9 +5517,51 @@ impl TermWindow {
                 None => log::error!("render snapshot: no active pane to open {modal:?} over"),
             }
         }
+        // ft-yccm0.4.7.3: an IME composition, as the input method's marked
+        // text sets it (AdviseDeadKeyStatus).
+        let compose = self
+            .render_snapshot
+            .as_ref()
+            .and_then(render_snapshot::RenderSnapshotRequest::compose)
+            .map(str::to_string);
+        if let Some(text) = compose {
+            self.dead_key_status = DeadKeyStatus::Composing(text);
+            self.record_render_invalidation(RenderInvalidationCause::Ime);
+        }
+        // A pinned blink changes the colors of lines cached at the live
+        // blink level until their next blink.
+        if self
+            .render_snapshot
+            .as_ref()
+            .and_then(render_snapshot::RenderSnapshotRequest::blink_level)
+            .is_some()
+        {
+            self.invalidate_render_caches(RenderInvalidationCause::Palette);
+        }
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
+    }
+
+    /// A blink state's level and when it next moves
+    /// (`intensity_continuous`), or the level a render snapshot pins, which
+    /// does not move (ft-yccm0.4.7.3).
+    pub(crate) fn blink_intensity(&self, ease: &mut ColorEase) -> (f32, Instant) {
+        match self
+            .render_snapshot
+            .as_ref()
+            .and_then(render_snapshot::RenderSnapshotRequest::blink_level)
+        {
+            Some(level) => (level, Instant::now() + Duration::from_secs(3600)),
+            None => ease.intensity_continuous(),
+        }
+    }
+
+    /// The level a render snapshot pins every blink at, if it pins one.
+    pub(crate) fn snapshot_blink_level(&self) -> Option<f32> {
+        self.render_snapshot
+            .as_ref()
+            .and_then(render_snapshot::RenderSnapshotRequest::blink_level)
     }
 
     /// The window background exactly as the other front ends fill it: the

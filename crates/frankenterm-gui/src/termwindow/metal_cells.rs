@@ -160,13 +160,22 @@ impl MetalBlinkClocks {
 
     /// The text blink levels now (`intensity_continuous`, as WebGpu reads
     /// them while shaping blinking text), from clocks rebuilt first if
-    /// `config` changed. A blink rate of 0 does not blink.
-    pub(crate) fn text_phase(&mut self, config: &ConfigHandle) -> MetalBlinkPhase {
+    /// `config` changed, or `pin`, a render snapshot's pinned level, which
+    /// does not move. A blink rate of 0 does not blink.
+    pub(crate) fn text_phase(
+        &mut self,
+        config: &ConfigHandle,
+        pin: Option<f32>,
+    ) -> MetalBlinkPhase {
         if self.generation != config.generation() {
             *self = Self::new(config);
         }
-        let slow = (config.text_blink_rate != 0).then(|| self.slow.intensity_continuous());
-        let rapid = (config.text_blink_rate_rapid != 0).then(|| self.rapid.intensity_continuous());
+        let level = |ease: &mut ColorEase| match pin {
+            Some(level) => (level, Instant::now() + std::time::Duration::from_secs(3600)),
+            None => ease.intensity_continuous(),
+        };
+        let slow = (config.text_blink_rate != 0).then(|| level(&mut self.slow));
+        let rapid = (config.text_blink_rate_rapid != 0).then(|| level(&mut self.rapid));
         MetalBlinkPhase {
             levels: BlinkLevels {
                 slow: slow.map(|(level, _)| level),
@@ -178,10 +187,13 @@ impl MetalBlinkClocks {
     }
 
     /// The blink level of a cursor that last moved at `moved`, and when it
-    /// next changes, as WebGpu's `compute_cell_fg_bg` reads it.
-    fn cursor_level(&mut self, moved: Instant) -> (f32, Instant) {
+    /// next changes, as WebGpu's `compute_cell_fg_bg` reads it, or `pin`.
+    fn cursor_level(&mut self, moved: Instant, pin: Option<f32>) -> (f32, Instant) {
         self.cursor.update_start(moved);
-        self.cursor.intensity_continuous()
+        match pin {
+            Some(level) => (level, Instant::now() + std::time::Duration::from_secs(3600)),
+            None => self.cursor.intensity_continuous(),
+        }
     }
 }
 
@@ -230,6 +242,8 @@ pub(crate) struct MetalFrameInputs {
     pub(crate) bell_cursor: Option<f32>,
     /// The window's repaint when a fallback font resolves.
     pub(crate) fallback_ready: Option<FallbackReady>,
+    /// The level a render snapshot pins every blink at.
+    pub(crate) blink_pin: Option<f32>,
 }
 
 impl MetalFrame {
@@ -382,7 +396,7 @@ impl MetalFrame {
             && shape.is_blinking()
             && config.cursor_blink_rate != 0
             && cursor.visibility == CursorVisibility::Visible)
-            .then(|| clocks.cursor_level(frame.cursor_moved));
+            .then(|| clocks.cursor_level(frame.cursor_moved, inputs.blink_pin));
         // A focused cursor is in the cursor color, or in its cell's
         // foreground where the reverse-video cursor applies to the cell; a
         // blinking one moves toward its cell's background by its level.
@@ -589,15 +603,28 @@ mod tests {
     fn the_blink_clocks_follow_the_configuration() {
         let config = ConfigHandle::default_config();
         let mut clocks = MetalBlinkClocks::new(&config);
-        let phase = clocks.text_phase(&config);
+        let phase = clocks.text_phase(&config, None);
         let start = Instant::now();
         for level in [phase.levels.slow, phase.levels.rapid] {
             let level = level.expect("the default rates blink");
             assert!((0.0..=1.0).contains(&level), "{level}");
         }
         assert!(phase.due((true, true)).is_some_and(|due| due >= start));
-        let (level, due) = clocks.cursor_level(Instant::now());
+        let (level, due) = clocks.cursor_level(Instant::now(), None);
         assert!((0.0..=1.0).contains(&level), "{level}");
         assert!(due >= start);
+
+        // A render snapshot's pin is every level, and does not move soon.
+        let pinned = clocks.text_phase(&config, Some(0.25));
+        assert_eq!(
+            (pinned.levels.slow, pinned.levels.rapid),
+            (Some(0.25), Some(0.25))
+        );
+        assert!(
+            pinned
+                .due((true, true))
+                .is_some_and(|due| due > start + std::time::Duration::from_secs(60))
+        );
+        assert_eq!(clocks.cursor_level(Instant::now(), Some(0.75)).0, 0.75);
     }
 }

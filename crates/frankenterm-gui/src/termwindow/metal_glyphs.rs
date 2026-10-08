@@ -63,6 +63,7 @@ use frankenterm_gui::metal_scene::{
 };
 use frankenterm_renderer_metal::{AtlasKind, AtlasSlot, MetalRenderer};
 use lfucache::LfuCache;
+use mux::render_mirror::{MirrorCell, MirrorColor, MirrorRow};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::ops::Range;
@@ -72,6 +73,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use termwiz::cell::VerticalAlign;
 use termwiz::cellcluster::CellCluster;
 use termwiz::surface::CursorShape;
+use wezterm_term::color::SrgbaTuple;
 use window::bitmaps::{BitmapImage, Image};
 
 /// Notifies the window that a fallback font resolved, from whichever thread
@@ -124,6 +126,8 @@ pub(crate) struct FontGlyphs {
     metrics: RenderMetrics,
     /// The configuration generation the glyphs were rasterized under.
     config_generation: usize,
+    /// The configured font or a font rule sets a text color (`foreground`).
+    style_foregrounds: bool,
     /// Font style ids by the address `match_style` returned (stable while
     /// `config` lives), and by value: equal styles share an id, as they
     /// share WebGpu's cache entries.
@@ -176,6 +180,11 @@ impl FontGlyphs {
         metrics: &RenderMetrics,
     ) -> Self {
         let config_generation = config.generation();
+        let style_foregrounds = config.font.foreground.is_some()
+            || config
+                .font_rules
+                .iter()
+                .any(|rule| rule.font.foreground.is_some());
         let shapes = LfuCache::new(
             "metal_shape_cache.hit.rate",
             "metal_shape_cache.miss.rate",
@@ -190,6 +199,7 @@ impl FontGlyphs {
             descender: metrics.descender.get() as f32,
             metrics: *metrics,
             config_generation,
+            style_foregrounds,
             style_addresses: HashMap::new(),
             style_ids: HashMap::new(),
             shapes,
@@ -555,6 +565,25 @@ impl FontGlyphs {
 }
 
 impl GlyphSource for FontGlyphs {
+    fn has_style_foregrounds(&self) -> bool {
+        self.style_foregrounds
+    }
+
+    /// The `foreground` of the font style `match_style` gives `cell`'s
+    /// attributes, as WebGpu's `resolve_fg_color_attr` reads it, for text in
+    /// the default foreground.
+    fn style_foreground(&mut self, row: &MirrorRow, cell: &MirrorCell) -> Option<SrgbaTuple> {
+        if !self.style_foregrounds || cell.fg() != MirrorColor::Default {
+            return None;
+        }
+        let attrs = row.cell_attributes(cell);
+        self.fonts
+            .match_style(&self.config, &attrs)
+            .foreground
+            .as_deref()
+            .copied()
+    }
+
     fn shape_row(&mut self, clusters: &[CellCluster]) -> Vec<ShapedGlyph> {
         let fonts = Rc::clone(&self.fonts);
         let config = self.config.clone();
