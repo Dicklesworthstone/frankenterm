@@ -16,6 +16,9 @@
 #       FrankenTerm A/B (e.g. the A1.8 durable-store gate)
 #   scripts/mac-gui-throughput.sh --gui-bin BIN --corpus-gen-bin X --baseline ft --sibling-flood
 #       pane 1 floods T1 while pane 2 is measured (L2/A2 gates)
+#   scripts/mac-gui-throughput.sh --gui-bin BIN --corpus-file ~/color-emoji-random.bin --cpu-hog 0,12
+#       the same ABBA with no hog, then with 12 busy default-QoS processes during
+#       both arms: the FrankenTerm/Ghostty ratio at each (ft-yccm0.6)
 #   scripts/mac-gui-throughput.sh --gui-bin BIN --self-test    1 MiB, one run per arm
 #   scripts/mac-gui-throughput.sh --dry-run ...                the plan only
 #   scripts/mac-gui-throughput.sh --analysis-self-test         offline checks only

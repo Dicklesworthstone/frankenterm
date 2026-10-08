@@ -20,6 +20,17 @@ or a second FrankenTerm build/config for A/B gates):
   the Accessibility API every --probe-ms; a request outstanding for
   --hang-ms (default 2 s, the spinning-cursor threshold) is a beach ball and
   triggers `sample`.
+* Threads (ft-yccm0.6): every --thread-probe-s during the drain, each of the
+  terminal's threads, with its name, QoS class (from its base priority),
+  current priority and CPU (scripts/mac-thread-qos.py, libproc, read-only).
+  The run keeps threads.json and the busiest threads with CPU per class.
+* CPU contention (ft-yccm0.6): --cpu-hog N runs N busy processes at default
+  QoS during every run of both arms, started before the settle and stopped
+  after the drain, so the load is the harness's own rather than the host's.
+  A list (--cpu-hog 0,12) runs the whole ABBA order once per level; the
+  receipt's "contention" section has each level's medians and arm ratio, and
+  how far that ratio moved from the first level. The top-level aggregate and
+  verdicts are the first level's.
 * Footprint after the run (scripts/mac-gui-footprint.sh capture) and, on the
   first run of each arm, the cell width the terminal gives every emoji in the
   T0 pool (DSR cursor reports), since wrapping changes the work done.
@@ -61,6 +72,12 @@ SCHEMA = "frankenterm.gui_throughput_receipt.v1"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 METER_SOURCE = os.path.join(SCRIPT_DIR, "mac-gui-frame-meter.swift")
 FOOTPRINT = os.path.join(SCRIPT_DIR, "mac-gui-footprint.sh")
+THREAD_QOS = os.path.join(SCRIPT_DIR, "mac-thread-qos.py")
+# One CPU hog thread (ft-yccm0.6): a process that pins itself to default QoS,
+# the class of every unclassified busy thread on a loaded host, says ready,
+# then spins. any(iter(int, 1)) loops forever without allocating.
+HOG_SOURCE = ("import ctypes;ctypes.CDLL(None).pthread_set_qos_class_self_np(0x15,0);"
+              "print('ready',flush=True);any(iter(int,1))")
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
 GHOSTTY_CONTRACT = os.path.join(REPO_ROOT, "docs", "perf", "incumbents", "ghostty.md")
 
@@ -755,6 +772,25 @@ def analysis_self_test():
     assert fps_v["verdict"] == "ft_faster", fps_v
     refused = verdict({"ft": [1.0], "ghostty": [1.0]}, "mean_fps", True, 5.0, ["max_fps caps ft"])
     assert refused["verdict"] == "NO_ADMISSIBLE_RATIO (max_fps caps ft)", refused
+    # ft-yccm0.6: the arms' ratio at each --cpu-hog level, and how far it moved.
+    hog_runs = [{"arm": arm, "cpu_hog_threads": level, "time": {"total_s": total}}
+                for arm, level, total in [("ft", 0, 10.0), ("ft", 0, 10.2), ("ghostty", 0, 8.0),
+                                          ("ghostty", 0, 8.16), ("ft", 8, 40.0), ("ft", 8, 40.8),
+                                          ("ghostty", 8, 10.0), ("ghostty", 8, 10.2)]]
+    hogs = contention_summary(hog_runs, [0, 8], ["ft", "ghostty"], 5.0, [])
+    assert abs(hogs["0"]["ft_over_ghostty"] - 1.25) < 1e-9, hogs
+    assert abs(hogs["8"]["ft_over_ghostty"] - 4.0) < 1e-9, hogs
+    assert abs(hogs["8"]["ratio_vs_first_level"] - 3.2) < 1e-9, hogs
+    assert hogs["8"]["verdict"] == "ghostty_faster" and "ratio_vs_first_level" not in hogs["0"], hogs
+    profile = thread_profile({"samples": 3, "interval_s": 1.0, "error": None, "threads": [
+        {"name": "mux-parse-pane-0", "cpu_s": 5.0, "qos": "default", "classes": {"default": 3},
+         "current_priorities": {"31": 3}},
+        {"name": "renderer", "cpu_s": 2.0, "qos": "user-initiated", "classes": {"user-initiated": 3},
+         "current_priorities": {"37": 3}},
+        {"name": "io", "cpu_s": 1.0, "qos": "default", "classes": {"default": 3},
+         "current_priorities": {"31": 3}}]}, top=2)
+    assert profile["cpu_s_by_qos"] == {"default": 6.0, "user-initiated": 2.0}, profile
+    assert [row["name"] for row in profile["busiest"]] == ["mux-parse-pane-0", "renderer"], profile
     assert abc_order(2) == ["A", "B", "B", "A", "A", "B", "B", "A"][:4]
     assert abc_order(3) == ["A", "B", "B", "A", "A", "B"]
     problems = validate_receipt({"schema": SCHEMA})
@@ -1145,6 +1181,83 @@ class SnapshotPoller(threading.Thread):
             self.stop_event.wait(self.interval)
 
 
+def load_thread_probe():
+    """scripts/mac-thread-qos.py, loaded by path (the harness runs under -I)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("mac_thread_qos", THREAD_QOS)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class CpuHog:
+    """`threads` busy processes at default QoS, started for one run and
+    stopped after it (ft-yccm0.6), so CPU contention is the same in every
+    arm rather than whatever else the host runs. Each carries `token` on its
+    command line, which terminate_exact checks before signalling it."""
+
+    def __init__(self, threads, token, probe):
+        self.threads, self.token, self.probe = threads, token, probe
+        self.processes = []
+
+    def start(self):
+        for _ in range(self.threads):
+            process = subprocess.Popen([sys.executable, "-I", "-c", HOG_SOURCE, self.token],
+                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            self.processes.append(process)
+        for process in self.processes:
+            if process.stdout.readline().strip() != "ready":
+                raise RuntimeError(f"cpu hog pid {process.pid} did not start")
+        priorities = sorted({thread["base_priority"] for process in self.processes
+                             for thread in self.probe.threads(process.pid)})
+        return {"threads": self.threads, "pids": [process.pid for process in self.processes],
+                "base_priorities": priorities}
+
+    def stop(self):
+        for process in self.processes:
+            if process.poll() is None:
+                terminate_exact(process.pid, self.token, "cpu hog", grace=2.0)
+            process.wait(timeout=10)
+        self.processes = []
+
+
+def thread_profile(report, top=20):
+    """A run's thread sampling, condensed: the busiest threads, and the CPU
+    seconds each QoS class used (a thread counts in the class it showed
+    most)."""
+    by_class = {}
+    for row in report["threads"]:
+        by_class[row["qos"]] = round(by_class.get(row["qos"], 0.0) + row["cpu_s"], 3)
+    return {"samples": report["samples"], "interval_s": report["interval_s"], "error": report["error"],
+            "cpu_s_by_qos": by_class,
+            "busiest": [{key: row[key] for key in ("name", "cpu_s", "qos", "classes", "current_priorities")}
+                        for row in report["threads"][:top]]}
+
+
+def contention_summary(runs, levels, names, cv_max, refusals):
+    """Per --cpu-hog level: each arm's median `time` total and the drain
+    verdict, and how much the ratio between the arms moves from the first
+    level to each other one (ft-yccm0.6)."""
+    out = {}
+    for level in levels:
+        values = {name: [run["time"]["total_s"] for run in runs
+                         if run.get("cpu_hog_threads") == level and run["arm"] == name and run.get("time")]
+                  for name in names}
+        judged = verdict(values, "total_s", False, cv_max, refusals)
+        medians = {name: (judged["arms"][name] or {}).get("median") for name in names}
+        a, b = (medians[name] for name in names)
+        out[str(level)] = {"verdict": judged["verdict"], "arms": judged["arms"],
+                           "median_total_s": medians,
+                           f"{names[0]}_over_{names[1]}": (a / b) if a and b else None}
+    key = f"{names[0]}_over_{names[1]}"
+    first = out[str(levels[0])][key]
+    for level in levels[1:]:
+        ratio = out[str(level)][key]
+        out[str(level)]["ratio_vs_first_level"] = (ratio / first) if ratio and first else None
+    return out
+
+
 def read_jsonl(path):
     records = []
     for line in (read_text(path) or "").splitlines():
@@ -1258,13 +1371,16 @@ class Harness:
         FrankenTerm's pane sets. The frame meter matches the window by it."""
         return f"{self.token}-{os.path.basename(run_dir)}"
 
-    def run_once(self, index, arm, width_probe):
+    def run_once(self, index, arm, width_probe, hog_threads=0):
         args = self.args
         run_dir = os.path.join(self.run_dir, "runs", f"{index:02d}-{arm['name']}")
         os.makedirs(run_dir, exist_ok=True)
         record = {"index": index, "arm": arm["name"], "kind": arm["kind"], "run_dir": run_dir, "pids": {},
                   "errors": [], "drain": {}, "time": None, "fps": None, "fps_unavailable": None,
-                  "beachball": None, "load_start": loadavg(), "window_title": self.run_title(run_dir)}
+                  "beachball": None, "load_start": loadavg(), "window_title": self.run_title(run_dir),
+                  "cpu_hog_threads": hog_threads}
+        hog = CpuHog(hog_threads, run_dir, self.thread_probe) if hog_threads else None
+        sampler = None
         measure_args = ["/bin/zsh", "-f", self.pane_script, "measure", run_dir, self.corpus["path"],
                         "1" if width_probe else "0", sys.executable, self.width_probe,
                         self.run_title(run_dir)]
@@ -1352,8 +1468,14 @@ class Harness:
                 touch(os.path.join(run_dir, "flood.go"))
                 log(f"sibling flood started; measuring after {args.flood_lead} s")
                 time.sleep(args.flood_lead)
+            if hog:
+                record["cpu_hog"] = hog.start()
+                log(f"run {index} {arm['name']}: cpu hog {record['cpu_hog']}")
             time.sleep(args.settle)
             record["load_go"] = loadavg()
+            if args.thread_probe_s > 0:
+                sampler = self.thread_probe.ThreadSampler(terminal_pid, args.thread_probe_s)
+                sampler.start()
             go_ns = uptime_ns()
             touch(os.path.join(run_dir, "go"))
             log(f"run {index} {arm['name']}: go (load {record['load_go']})")
@@ -1365,6 +1487,13 @@ class Harness:
             start_ns = uptime_ns()
             record["pids"]["cat"] = cat_pid
             record["drain"], exit_ns, samples = self.sample_drain(cat_pid, start_ns, run_dir, record)
+            if sampler:
+                sampler.stop()
+                report = sampler.summary()
+                with open(os.path.join(run_dir, "threads.json"), "w") as handle:
+                    json.dump(report, handle, indent=2)
+                record["threads"] = thread_profile(report)
+                sampler = None
             done = wait_for(lambda: read_text(os.path.join(run_dir, "done")), 60)
             record["cat_exit_status"] = int(done) if done and done.strip().isdigit() else None
             record["time"] = parse_time_line(read_text(os.path.join(run_dir, "time.txt")))
@@ -1374,6 +1503,8 @@ class Harness:
                 wait_for(lambda: os.path.exists(os.path.join(run_dir, "widths.done")), 180, 0.1)
             time.sleep(args.tail)
             record["load_end"] = loadavg()
+            if hog:
+                hog.stop()
             touch(stop_helpers)
             for name, helper in helpers:
                 try:
@@ -1394,6 +1525,10 @@ class Harness:
             log(f"run {index} {arm['name']} failed: {error}")
         finally:
             touch(os.path.join(run_dir, "stop"))
+            if sampler:
+                sampler.stop()
+            if hog:
+                hog.stop()
             for name, helper in helpers:
                 if helper.poll() is None:
                     helper.terminate()
@@ -1550,6 +1685,13 @@ def parse_args(argv):
     parser.add_argument("--cv-max", type=float, default=5.0, help="refuse a verdict above this CV percent")
     parser.add_argument("--max-load", type=float, default=0.0, help="refuse a verdict when a run starts above "
                         "this 1-minute load average (default 0: record only)")
+    parser.add_argument("--cpu-hog", default="0", metavar="N[,N...]",
+                        help="CPU contention levels (ft-yccm0.6): during every run of both arms, N busy processes "
+                        "at default QoS spin. A list runs the whole ABBA order once per level and reports the "
+                        "arms' ratio at each, e.g. 0,12 (default 0: none)")
+    parser.add_argument("--thread-probe-s", type=float, default=1.0,
+                        help="sample the terminal's threads (QoS class, priority, CPU) this often during the drain; "
+                        "0 disables (default 1)")
     parser.add_argument("--sample-ms", type=int, default=250, help="tty offset sampling period")
     parser.add_argument("--probe-ms", type=int, default=100, help="main-thread probe period")
     parser.add_argument("--hang-ms", type=int, default=2000, help="probe latency counted as a beach ball")
@@ -1601,6 +1743,12 @@ def parse_args(argv):
             parser.error(f"--ft-env/--baseline-env needs NAME=VALUE, got {item!r}")
     if args.sibling_flood and args.baseline == "ghostty":
         parser.error("--sibling-flood needs --baseline ft: Ghostty's panes cannot be split from its command line")
+    try:
+        args.cpu_hog_levels = [int(level) for level in args.cpu_hog.split(",")]
+    except ValueError:
+        parser.error(f"--cpu-hog needs comma-separated thread counts, got {args.cpu_hog!r}")
+    if any(level < 0 for level in args.cpu_hog_levels) or len(set(args.cpu_hog_levels)) != len(args.cpu_hog_levels):
+        parser.error(f"--cpu-hog levels must be distinct and non-negative, got {args.cpu_hog!r}")
     return args
 
 
@@ -1628,6 +1776,7 @@ def main(argv):
     os.makedirs(args.out, exist_ok=True)
     LOG_HANDLE = open(os.path.join(args.out, "run.log"), "a")
     harness = Harness(args)
+    harness.thread_probe = load_thread_probe()
     started = datetime.datetime.now(datetime.timezone.utc).isoformat()
     log(f"run directory {args.out}; argv {shlex.join(argv)}")
 
@@ -1674,7 +1823,9 @@ def main(argv):
         baseline_bin = os.path.abspath(args.baseline_gui_bin or args.gui_bin or "")
         arms.append({"name": "ft_baseline", "kind": "ft", "gui_bin": baseline_bin, "lua": list(args.baseline_ft_lua),
                      "env": dict(item.split("=", 1) for item in args.baseline_env)})
-    order = [arms[0] if slot == "A" else arms[1] for slot in abc_order(args.reps)]
+    # The whole ABBA order once per --cpu-hog level (ft-yccm0.6).
+    order = [(arms[0] if slot == "A" else arms[1], level) for level in args.cpu_hog_levels
+             for slot in abc_order(args.reps)]
 
     harness.prepare_dirs()
     corpus = corpus_spec(args, args.out)
@@ -1687,10 +1838,11 @@ def main(argv):
         harness.flood_corpus = corpus_spec(flood_args, args.out)
     log(f"corpus {corpus['label']} {corpus['name']}: {corpus['path']} ({corpus['bytes']} bytes, sha256 {corpus['sha256']})")
 
-    plan = {"order": [arm["name"] for arm in order], "corpus": corpus, "tcc": tcc, "geometry": {
-        "cols": args.cols, "rows": args.rows, "font_family": args.font_family, "font_size": args.font_size},
-        "ft_max_fps": harness.ft_max_fps, "refresh_hz": harness.refresh_hz, "isolated_env": harness.iso_env,
-        "arms": arms, "incumbent": incumbent}
+    plan = {"order": [f"{arm['name']}@hog{level}" for arm, level in order], "corpus": corpus, "tcc": tcc,
+            "geometry": {"cols": args.cols, "rows": args.rows, "font_family": args.font_family,
+                         "font_size": args.font_size},
+            "ft_max_fps": harness.ft_max_fps, "refresh_hz": harness.refresh_hz, "isolated_env": harness.iso_env,
+            "arms": arms, "incumbent": incumbent, "cpu_hog_levels": args.cpu_hog_levels}
     if args.dry_run:
         print(json.dumps(plan, indent=2, sort_keys=True, default=str))
         print("ft lua config (arm A):\n" + ft_lua_config(arms[0], args, harness.ft_max_fps,
@@ -1700,14 +1852,17 @@ def main(argv):
     isolation = {"probe": harness.isolation_probe(), "env": harness.iso_env}
     runs = []
     widths_done = set()
-    for index, arm in enumerate(order):
+    for index, (arm, level) in enumerate(order):
         probe_widths = not args.no_width_probe and arm["name"] not in widths_done
-        runs.append(harness.run_once(index, arm, probe_widths))
+        runs.append(harness.run_once(index, arm, probe_widths, level))
         widths_done.add(arm["name"])
 
-    # Aggregate and verdicts.
+    # Aggregate and verdicts, over the first --cpu-hog level's runs (with the
+    # default single level 0, every run); every level is in "contention".
     names = [arms[0]["name"], arms[1]["name"]]
-    per_arm = {name: [run for run in runs if run["arm"] == name] for name in names}
+    first_level = args.cpu_hog_levels[0]
+    per_arm = {name: [run for run in runs if run["arm"] == name and run["cpu_hog_threads"] == first_level]
+               for name in names}
 
     def values(name, getter):
         out = []
@@ -1724,7 +1879,9 @@ def main(argv):
     failed_runs = [run["index"] for run in runs if run["errors"]]
     if failed_runs:
         refusals.append(f"runs {failed_runs} recorded errors")
-    if args.max_load and any(run["load_start"][0] > args.max_load for run in runs):
+    # A hog raises the load on purpose, so --max-load judges the first level.
+    first_level_runs = [run for run in runs if run["cpu_hog_threads"] == first_level]
+    if args.max_load and any(run["load_start"][0] > args.max_load for run in first_level_runs):
         refusals.append(f"a run started above load {args.max_load}")
     if incumbent and not incumbent["pin"] and not args.allow_unpinned_ghostty:
         refusals.append("Ghostty is not pinned (M.2 contract or --ghostty-pin)")
@@ -1735,9 +1892,9 @@ def main(argv):
         fps_refusals.append(f"FrankenTerm max_fps {harness.ft_max_fps} throttles at {throttle_ms:.6f} ms, longer "
                             f"than one {harness.refresh_hz} Hz refresh period")
     if not args.no_fps:
-        fps_refusals += fps_unavailable_refusals(runs)
+        fps_refusals += fps_unavailable_refusals(first_level_runs)
     meter_checks = []
-    for run in runs:
+    for run in first_level_runs:
         internal, fps = run.get("internal_present"), run.get("fps")
         if run["kind"] == "ft" and internal and fps:
             ceiling = min(internal["fps"], run.get("capture", {}).get("refresh_hz") or harness.refresh_hz)
@@ -1747,7 +1904,7 @@ def main(argv):
             if not ok:
                 fps_refusals.append(f"run {run['index']}: meter {fps['mean_fps']:.1f} FPS vs FrankenTerm's own "
                                     f"{internal['fps']:.1f} presents/s")
-    for run in runs:
+    for run in first_level_runs:
         snapshot_fps = ((run.get("ft_snapshot") or {}).get("frames") or {}).get("max_fps")
         if run["kind"] == "ft" and snapshot_fps not in (None, 0, harness.ft_max_fps):
             fps_refusals.append(f"run {run['index']}: the GUI reports max_fps {snapshot_fps}, "
@@ -1780,6 +1937,9 @@ def main(argv):
         verdicts[key]["verdict"] += pin_note
     parity = width_parity({name: next((run["widths"]["widths"] for run in per_arm[name] if run.get("widths")), None)
                            for name in names})
+    contention = (contention_summary(runs, args.cpu_hog_levels, names, args.cv_max,
+                                     [f"runs {failed_runs} recorded errors"] if failed_runs else [])
+                  if len(args.cpu_hog_levels) > 1 else None)
 
     receipt = {
         "schema": SCHEMA,
@@ -1798,7 +1958,7 @@ def main(argv):
         "display": {"refresh_hz": harness.refresh_hz, "scale": [display.get("scale") for display in displays]},
         "incumbent": incumbent,
         "arms": {arm["name"]: {key: value for key, value in arm.items()} for arm in arms},
-        "order": [arm["name"] for arm in order],
+        "order": [arm["name"] for arm, _ in order],
         "tcc": tcc,
         "fps_measured": not args.no_fps,
         "isolation": isolation,
@@ -1806,6 +1966,9 @@ def main(argv):
         "aggregate": aggregate,
         "verdicts": verdicts,
         "width_parity": parity,
+        "cpu_hog": {"levels": args.cpu_hog_levels, "aggregate_level": first_level, "source": HOG_SOURCE,
+                    "order": [level for _, level in order]},
+        "contention": contention,
     }
     if args.baseline == "ft":
         receipt["ft"]["baseline_gui_bin_sha256"] = sha256_file(arms[1]["gui_bin"])
@@ -1832,6 +1995,17 @@ def main(argv):
     print(f"  drain verdict: {verdicts['drain_total_s']['verdict']}")
     print(f"  FPS verdict:   {verdicts['fps']['verdict']}")
     print(f"  width parity:  {parity.get('disagreements')} disagreement(s) over {parity.get('codepoints')} codepoints")
+    if len(args.cpu_hog_levels) > 1:
+        print(f"  (the lines above are at --cpu-hog {first_level})")
+    for level, entry in (contention or {}).items():
+        medians = entry["median_total_s"]
+        ratio = entry[f"{names[0]}_over_{names[1]}"]
+        moved = entry.get("ratio_vs_first_level")
+        print(f"  cpu hog {level}: " + ", ".join(
+            f"{name} {medians[name]:.3f} s" if medians[name] else f"{name} n/a" for name in names)
+              + (f"; {names[0]}/{names[1]} {ratio:.3f}" if ratio else "")
+              + (f" ({moved:.2f}x the hog-{first_level} ratio)" if moved else "")
+              + f"; {entry['verdict']}")
     print(f"receipt: {path}")
     if problems:
         log(f"receipt schema problems: {problems}")
