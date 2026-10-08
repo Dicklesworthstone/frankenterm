@@ -850,6 +850,16 @@ mod tests {
                     .to_vec(),
             ),
             (
+                // ft-b35o7: wide graphemes on the last column wrap whole,
+                // over a cleared spacer; without autowrap they are dropped
+                // (or print narrow without their VS16); at the bottom row
+                // the wrap scrolls.
+                "wide_at_the_right_margin",
+                "\x1b]1337;UnicodeVersion=14\x07\x1b[1;10H\u{1f600}\x1b[3;1HZZZZZZZZZZ\rAAAAAAAAA\u{1f600}B\x1b[?7l\x1b[5;10H\u{1f600}\x1b[5;9Hx\u{2764}\u{fe0f}\x1b[?7h\x1b[6;10H\u{2764}\u{fe0f}"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            (
                 "graphemes",
                 "e\u{301} \u{4e2d}\u{6587} \u{1f468}\u{200d}\u{1f469} \u{2764}\u{fe0f} ab\u{301}"
                     .as_bytes()

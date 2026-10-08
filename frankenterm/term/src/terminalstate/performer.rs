@@ -2,7 +2,9 @@ use crate::terminal::{Alert, Progress};
 use crate::terminalstate::{
     default_color_map, CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry,
 };
-use crate::{ClipboardSelection, LineSize, Position, TerminalState, VisibleRowIndex, DCS, ST};
+use crate::{
+    CellAttributes, ClipboardSelection, LineSize, Position, TerminalState, VisibleRowIndex, DCS, ST,
+};
 use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_bidi::ParagraphDirectionHint;
 use frankenterm_cell::{grapheme_column_width, is_white_space_grapheme, SemanticType};
@@ -497,6 +499,10 @@ impl<'a> Performer<'a> {
         if ends_in_zwj {
             self.zwj_tail_cell_possible = true;
         }
+        // ft-b35o7: widened on the right margin's column, it no longer fits.
+        if self.widened_grapheme_overflows(idx, width, combined_width) {
+            return self.wrap_widened_grapheme(&combined, combined_width, attrs, seqno);
+        }
         let (cursor_x, wrap_next) = {
             let screen = self.screen_mut();
             let phys = screen.phys_row(cursor_y);
@@ -798,6 +804,36 @@ impl<'a> Performer<'a> {
                 self.wrap_before_print(seqno);
             }
 
+            // ft-b35o7: a wide grapheme on the right margin's column is never
+            // clipped there. With autowrap it wraps whole to the next row; as
+            // Ghostty (Terminal.zig print, "If we don't have wraparound enabled
+            // then we don't print this character at all and don't move the
+            // cursor. This is how xterm behaves.") and xterm (charproc.c
+            // dotext, which writes nothing unless WRAPAROUND forces a wrap)
+            // do, without it nothing is printed and the cursor stays. Except
+            // that a grapheme wide only by its emoji variation selector prints
+            // narrow without it: Ghostty prints its base, then drops the
+            // selector that cannot widen it, as `recluster_at_cursor` does
+            // when the selector arrives in a later read.
+            let narrowed: String;
+            let (g, print_width) = if self.wide_grapheme_overflows(self.cursor.x, print_width) {
+                if self.dec_auto_wrap {
+                    self.wrap_for_wide_grapheme(seqno);
+                    (g, print_width)
+                } else {
+                    narrowed = g.replace('\u{fe0f}', "");
+                    if narrowed.len() < g.len()
+                        && grapheme_column_width(&narrowed, Some(&self.unicode_version)) == 1
+                    {
+                        (narrowed.as_str(), 1)
+                    } else {
+                        continue;
+                    }
+                }
+            } else {
+                (g, print_width)
+            };
+
             let x = self.cursor.x;
             let y = self.cursor.y;
             let width = self.left_and_right_margins.end;
@@ -843,6 +879,78 @@ impl<'a> Performer<'a> {
 
         std::mem::swap(&mut self.print, &mut p);
         self.print.clear();
+    }
+
+    /// Whether a grapheme `width` cells wide does not fit at column `x`
+    /// (ft-b35o7): a wide grapheme on the right margin's column, in a region
+    /// wider than one column. A wider region always fits it at its left
+    /// margin.
+    fn wide_grapheme_overflows(&self, x: usize, width: usize) -> bool {
+        let margins = &self.left_and_right_margins;
+        width > 1
+            && x < margins.end
+            && x.saturating_add(width) > margins.end
+            && margins.end.saturating_sub(margins.start) > 1
+    }
+
+    /// Wraps for a wide grapheme that does not fit at the cursor, on the
+    /// right margin's column (ft-b35o7), as Ghostty and xterm do with
+    /// autowrap on, rather than clipping it there. The cells from the cursor
+    /// to the margin are cleared to default blanks, which a row does not
+    /// keep at its end. That is Ghostty's spacer head: blank, and not text,
+    /// so copying the wrapped row joins the next row's text without a space,
+    /// and reflow joins and rewraps it exactly as the underfull rows reflow
+    /// itself leaves before a wide grapheme. Then the wrap is taken as a
+    /// pending one is: the row is marked wrapped and the cursor moves to the
+    /// left margin of the next row, scrolling at the bottom margin.
+    fn wrap_for_wide_grapheme(&mut self, seqno: usize) {
+        let (x, y) = (self.cursor.x, self.cursor.y);
+        let end = self.left_and_right_margins.end;
+        let bidi_mode = self.get_bidi_mode();
+        self.screen_mut()
+            .clear_line(y, x..end, &CellAttributes::blank(), seqno, bidi_mode);
+        self.wrap_before_print(seqno);
+    }
+
+    /// Whether the grapheme at column `idx`, `width` cells wide, no longer
+    /// fits once it becomes `combined_width` wide (ft-b35o7): it widens on
+    /// the right margin's column, with the cursor on it.
+    fn widened_grapheme_overflows(&self, idx: usize, width: usize, combined_width: usize) -> bool {
+        combined_width > width
+            && self.cursor.x == idx
+            && self.wide_grapheme_overflows(idx, combined_width)
+    }
+
+    /// The grapheme at the cursor, on the right margin's column, became
+    /// `combined` (a variation selector made it `width` cells wide), which
+    /// does not fit there ([`Self::widened_grapheme_overflows`], ft-b35o7).
+    /// As Ghostty does: with autowrap on it wraps whole to the next row, as a
+    /// wide grapheme printed there does, keeping its attributes; with
+    /// autowrap off nothing changes and the caller drops what would have
+    /// widened it. Returns whether it wrapped.
+    fn wrap_widened_grapheme(
+        &mut self,
+        combined: &str,
+        width: usize,
+        attrs: CellAttributes,
+        seqno: usize,
+    ) -> bool {
+        if !self.dec_auto_wrap {
+            return false;
+        }
+        self.wrap_for_wide_grapheme(seqno);
+        let (x, y) = (self.cursor.x, self.cursor.y);
+        self.screen_mut()
+            .set_cell_grapheme(x, y, combined, width, attrs, seqno);
+        let next_x = x.saturating_add(width);
+        if next_x >= self.left_and_right_margins.end {
+            self.wrap_next = self.dec_auto_wrap;
+        } else {
+            self.cursor.x = next_x;
+            self.wrap_next = false;
+        }
+        self.note_printed(y, x, width, combined.ends_with('\u{200d}'));
+        true
     }
 
     /// Takes a pending wrap before the next character prints: the row is
@@ -993,6 +1101,12 @@ impl<'a> Performer<'a> {
         let ends_in_zwj = combined.ends_with('\u{200d}');
         if ends_in_zwj {
             self.zwj_tail_cell_possible = true;
+        }
+        // ft-b35o7: widened on the right margin's column, it no longer fits.
+        // Without autowrap `g` then goes on alone, and is dropped as a
+        // zero-width grapheme that widens nothing.
+        if self.widened_grapheme_overflows(cell.idx, width, combined_width) {
+            return self.wrap_widened_grapheme(&combined, combined_width, attrs, seqno);
         }
         let (cursor_x, wrap_next) = {
             let screen = self.screen_mut();

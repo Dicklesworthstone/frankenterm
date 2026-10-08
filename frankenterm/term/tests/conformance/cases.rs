@@ -592,6 +592,34 @@ fn margins_and_modes() -> Vec<EscCase> {
             t.rows(4, &["0123456789", "X"])
         }),
         small(
+            "decawm/wide-char-on-the-last-column-wraps-whole",
+            "xterm charproc.c dotext: a wide character with one column left forces the wrap",
+            |t| {
+                t.feed("012345678\u{4e2d}");
+                t.rows(1, &["012345678", "\u{4e2d}"])?;
+                t.wrapped(1, true)?;
+                t.cursor(2, 3)
+            },
+        ),
+        small(
+            "decawm/off-drops-a-wide-char-on-the-last-column",
+            "xterm charproc.c dotext: without WRAPAROUND it is not written",
+            |t| {
+                t.feed("\x1b[?7l012345678\u{4e2d}");
+                t.rows(1, &["012345678", ""])?;
+                t.cursor(1, 10)
+            },
+        ),
+        small(
+            "declrmm/wide-char-on-the-right-margin-wraps-to-the-left-margin",
+            "xterm charproc.c dotext: the wrap goes to the left margin",
+            |t| {
+                t.feed("\x1b[?69h\x1b[3;6s\x1b[1;3Habc\u{4e2d}");
+                t.rows(1, &["  abc", "  \u{4e2d}"])?;
+                t.cursor(2, 5)
+            },
+        ),
+        small(
             "declrmm/text-wraps-at-the-right-margin",
             "VT510 DECSLRM",
             |t| {

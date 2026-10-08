@@ -6,6 +6,7 @@ mod c0;
 use bitflags::bitflags;
 mod c1;
 mod csi;
+mod wide_margin;
 // mod selection; FIXME: port to render layer
 use crate::color::ColorPalette;
 use crate::screen::{ResizeReadabilityGatePolicy, ResizeWrapPolicy};
