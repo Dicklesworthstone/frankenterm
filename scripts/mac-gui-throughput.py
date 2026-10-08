@@ -509,14 +509,23 @@ SCK_INTERRUPTED = (3, 5)
 MAX_LOST_SHARE = 0.1
 
 
-def window_identity(window, pid, run_pid, expected_title):
+# The title FrankenTerm creates its window with, before a pane title replaces
+# it. A FrankenTerm window still titled so never got the run's token: before
+# ft-ro1ht, an OSC 2 applied before the new window subscribed to mux updates
+# raised its alert while no window listened, and was never shown (nv18, nv19).
+FT_CREATION_TITLE = "FrankenTerm"
+
+
+def window_identity(window, pid, run_pid, expected_title, default_title=None):
     """How a matched window (a capture header or a window switch) is known to
     be the run's, judged from what the meter recorded. Returns (identity,
     problem): identity "title" when its title holds the run's token; "pid"
-    when it is untitled and the only normal-level (layer 0) window among the
-    recorded candidates of `run_pid`, the terminal process the harness proved
-    is the run's own (ScreenCaptureKit reports every Ghostty window untitled,
-    ft-5azl8). Anything else is refused: a window titled for something else,
+    when it is the only normal-level (layer 0) window among the recorded
+    candidates of `run_pid`, the terminal process the harness proved is the
+    run's own, and it is untitled (ScreenCaptureKit reports every Ghostty
+    window untitled, ft-5azl8) or still has `default_title`, the title its
+    terminal creates every window with (FT_CREATION_TITLE for FrankenTerm
+    arms). Anything else is refused: a window titled for something else,
     another process's window, a panel, or one of two normal windows."""
     title = window.get("title") or ""
     if not expected_title:
@@ -525,7 +534,7 @@ def window_identity(window, pid, run_pid, expected_title):
         return "title", None
     titled = (f"the matched window {window.get('window_id')} is titled {title!r}, "
               f"not the run's {expected_title!r}")
-    if title or run_pid is None:
+    if run_pid is None or (title and title != default_title):
         return None, titled
     if pid != run_pid:
         return None, f"{titled}, and it belongs to pid {pid}, not the run's terminal pid {run_pid}"
@@ -538,13 +547,14 @@ def window_identity(window, pid, run_pid, expected_title):
     return "pid", None
 
 
-def assess_capture(records, start_ns, end_ns, expected_title=None, run_pid=None):
+def assess_capture(records, start_ns, end_ns, expected_title=None, run_pid=None, default_title=None):
     """Whether a frame-meter capture can give an FPS for the drain window
     [start_ns, end_ns], and if not, why. Returns (info, reason): reason None
     means usable. A capture that matched the wrong window, was suspended
     across the drain, or never started yields a reason, never an FPS of 0
     (ft-zkjhg). `run_pid` is the run's proven terminal pid; with it, an
-    untitled window can be identified by pid (window_identity, ft-5azl8)."""
+    untitled window, or one still titled `default_title`, can be identified
+    by pid (window_identity, ft-5azl8)."""
     error = next((r for r in records if r.get("type") == "error"), None)
     header = next((r for r in records if r.get("type") == "window"), None)
     frames = [r for r in records if r.get("type") == "frame"]
@@ -562,7 +572,7 @@ def assess_capture(records, start_ns, end_ns, expected_title=None, run_pid=None)
         info.update({"final_window_id": last.get("window_id"), "final_title": last.get("title")})
     # The meter only ever captures windows of the header's pid.
     identity, title_problem = window_identity(switches[-1] if switches else header, header.get("pid"),
-                                              run_pid, expected_title)
+                                              run_pid, expected_title, default_title)
     info["identity"] = identity
 
     def relative(moment):
@@ -913,6 +923,34 @@ def pid_identity_self_test(s, header, complete, token):
                                   base, base + s, token, run_pid)
     assert reason is None and info["identity"] == "title", (info, reason)
 
+    # ft-ro1ht (nv19 t0-metal run 0): a FrankenTerm window that never got the
+    # token keeps its creation title. For an FT arm it is identified by pid
+    # like Ghostty's untitled window, and only under the same rule.
+    ft_window = dict(terminal, title=FT_CREATION_TITLE)
+    ft_titled = f"the matched window 22460 is titled {FT_CREATION_TITLE!r}, not the run's '{token}'"
+
+    def ft_capture(candidates, pid=run_pid):
+        return capture(22460, candidates, pid=pid, title=FT_CREATION_TITLE)
+
+    info, reason = assess_capture(ft_capture([ft_window]), base, base + s, token, run_pid, FT_CREATION_TITLE)
+    assert reason is None and info["identity"] == "pid", (info, reason)
+    # Planted negatives: not for a Ghostty arm, not without the proven pid, not
+    # another pid's window, not beside a second normal window.
+    _, reason = assess_capture(ft_capture([ft_window]), base, base + s, token, run_pid)
+    assert reason == ft_titled, reason
+    _, reason = assess_capture(ft_capture([ft_window]), base, base + s, token, None, FT_CREATION_TITLE)
+    assert reason == ft_titled, reason
+    _, reason = assess_capture(ft_capture([ft_window], pid=4242), base, base + s, token, run_pid,
+                               FT_CREATION_TITLE)
+    assert reason == f"{ft_titled}, and it belongs to pid 4242, not the run's terminal pid {run_pid}", reason
+    _, reason = assess_capture(ft_capture([ft_window, dict(ft_window, window_id=22461)]), base, base + s, token,
+                               run_pid, FT_CREATION_TITLE)
+    assert reason == f"{ft_titled}, and pid {run_pid}'s normal windows are [22460, 22461], not just this one", reason
+    # Any other title stays refused for a FrankenTerm arm.
+    _, reason = assess_capture(capture(22460, [dict(terminal, title="Downloads")], title="Downloads"),
+                               base, base + s, token, run_pid, FT_CREATION_TITLE)
+    assert reason == f"the matched window 22460 is titled 'Downloads', not the run's '{token}'", reason
+
 
 def pty_self_test():
     """Runs the real pane script in a private pseudo-terminal that this process
@@ -1033,7 +1071,8 @@ def reanalyze(run_dir):
         if title is None and (run.get("arm") or name).endswith("ghostty"):
             # Before ft-zkjhg only Ghostty was given the token, with --title.
             title = f"ftgt-{os.path.basename(os.path.abspath(run_dir))}-{name}"
-        info, reason = assess_capture(records, window[0], window[1], title, (run.get("pids") or {}).get("terminal"))
+        info, reason = assess_capture(records, window[0], window[1], title, (run.get("pids") or {}).get("terminal"),
+                                      FT_CREATION_TITLE if run.get("kind") == "ft" else None)
         if reason:
             lines.append(f"{name}: FPS unavailable: {reason}")
             continue
@@ -1624,7 +1663,8 @@ class Harness:
             record["capture"]["refresh_hz"] = refresh
             if window:
                 assessment, unavailable = assess_capture(records, window[0], window[1], record["window_title"],
-                                                         record["pids"].get("terminal"))
+                                                         record["pids"].get("terminal"),
+                                                         FT_CREATION_TITLE if record["kind"] == "ft" else None)
                 record["capture"]["assessment"] = assessment
                 if unavailable:
                     # No FPS rather than a misleading 0.0; the drain still counts.

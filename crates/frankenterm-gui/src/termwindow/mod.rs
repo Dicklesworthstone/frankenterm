@@ -4968,6 +4968,11 @@ impl TermWindow {
             myself
                 .subscribe_to_pane_updates()
                 .context("subscribing new GUI window to mux pane updates")?;
+            // A pane title set before the subscription (a shell's OSC 2 at
+            // startup) raised its alert while no window listened, so read the
+            // titles once now: otherwise the window keeps its creation title
+            // until the next title change, which may never come.
+            myself.update_title();
             window.show();
             myself.emit_window_event("window-config-reloaded", None);
             myself.emit_status_event();
