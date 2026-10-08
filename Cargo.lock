@@ -3736,7 +3736,7 @@ version = "0.1.3"
 dependencies = [
  "criterion",
  "k9",
- "phf 0.14.0",
+ "phf 0.13.1",
  "serde",
  "termwiz 0.24.0",
  "ucd-trie",
@@ -8629,6 +8629,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1562dc717473dbaa4c1f85a36410e03c047b2e7df7f45ee938fbef64ae7fadf"
 dependencies = [
  "phf_shared 0.13.1",
+ "serde",
 ]
 
 [[package]]
