@@ -116,8 +116,9 @@ fn test_cup() {
     term.assert_cursor_pos(2, 2, None, None);
     term.cup(-1, -1);
     term.assert_cursor_pos(0, 0, None, None);
+    // VT510 and xterm stop at the last column and row (ft-3e1yj).
     term.cup(500, 500);
-    term.assert_cursor_pos(4, 2, None, None);
+    term.assert_cursor_pos(3, 2, None, None);
 }
 
 #[test]
@@ -131,8 +132,9 @@ fn test_hvp() {
     term.assert_cursor_pos(2, 2, None, None);
     term.hvp(-1, -1);
     term.assert_cursor_pos(0, 0, None, None);
+    // VT510 and xterm stop at the last column and row (ft-3e1yj).
     term.hvp(500, 500);
-    term.assert_cursor_pos(4, 2, None, None);
+    term.assert_cursor_pos(3, 2, None, None);
 }
 
 #[test]
@@ -172,8 +174,27 @@ fn test_cha() {
     term.print("\x1b[-1G");
     term.assert_cursor_pos(0, 1, None, Some(seqno));
 
+    // VT510 and xterm stop at the last column (ft-3e1yj).
     term.print("\x1b[100G");
-    term.assert_cursor_pos(4, 1, None, None);
+    term.assert_cursor_pos(3, 1, None, None);
+}
+
+/// ft-3e1yj: a character printed after CUP past the edge lands in the last
+/// column, on screen, where ED 2 erases it; widening the window shows no
+/// ghost of it in a column past the old edge.
+#[test]
+fn cup_past_the_edge_prints_in_the_last_column_and_ed_erases_it() {
+    let mut term = TestTerm::new(3, 4, 0);
+    term.print("\x1b[999;999HZ");
+    assert_visible_contents(&term, file!(), line!(), &["", "", "   Z"]);
+    term.print("\x1b[2J");
+    assert_visible_contents(&term, file!(), line!(), &["", "", ""]);
+    term.resize(TerminalSize {
+        rows: 3,
+        cols: 8,
+        ..Default::default()
+    });
+    assert_visible_contents(&term, file!(), line!(), &["", "", ""]);
 }
 
 #[test]

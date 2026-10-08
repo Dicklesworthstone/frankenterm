@@ -1372,8 +1372,10 @@ impl TerminalState {
 
     /// Prefer completed rows before both cursors. An active paragraph may
     /// include the cursor only with an explicit logical-offset mapping and
-    /// exact cursor validation at commit. Saved cursors and pending autowrap
-    /// currently retain the completed-row-only path.
+    /// exact cursor validation at commit. A pending autowrap maps from its
+    /// insertion point just past the row's last cell, as resize maps it
+    /// (ft-3e1yj). Saved cursors currently retain the completed-row-only
+    /// path.
     #[cfg(feature = "use_serde")]
     pub fn capture_cold_seam_reflow(
         &self,
@@ -1381,7 +1383,7 @@ impl TerminalState {
         let completed = self
             .screen
             .capture_cold_seam_reflow_before(self.cold_seam_resident_end())?;
-        if completed.is_some() || self.wrap_next || self.screen.saved_cursor.is_some() {
+        if completed.is_some() || self.screen.saved_cursor.is_some() {
             return Ok(completed);
         }
         let physical_row = self.screen.phys_row(self.cursor.y);
@@ -1391,6 +1393,12 @@ impl TerminalState {
         if let Some(seam) = &mut active {
             seam.cursor = Some(crate::screen::ColdSeamCursor {
                 before: self.cursor,
+                pending_wrap: self.wrap_next,
+                insertion_x: if self.wrap_next {
+                    self.left_and_right_margins.end
+                } else {
+                    self.cursor.x
+                },
                 physical_row,
                 after: None,
             });
@@ -1408,7 +1416,7 @@ impl TerminalState {
     ) -> anyhow::Result<bool> {
         let mut resident_end = self.cold_seam_resident_end();
         let mapped_cursor = if let Some(cursor) = &prepared.cursor {
-            if self.wrap_next
+            if self.wrap_next != cursor.pending_wrap
                 || self.screen.saved_cursor.is_some()
                 || self.cursor.x != cursor.before.x
                 || self.cursor.y != cursor.before.y
@@ -1774,6 +1782,30 @@ impl TerminalState {
                 &Position::Absolute(adjusted_cursor_main.x as i64),
                 &Position::Absolute(adjusted_cursor_main.y),
             );
+            // Rewrap can leave the cursor just past the last cell of a row the
+            // reflowed line fills: the insertion point after it, whether a
+            // wrap was pending before or the line now fits the row exactly.
+            // It becomes a wrap pending on the row's last grapheme (ft-3e1yj),
+            // never an off-screen column, so the next character continues the
+            // logical line on the row below. Like printing that grapheme, it
+            // leaves the cursor on its first column (a wide one's too), as the
+            // cold seam's mapping places the same insertion point. Past a row
+            // with room left (a cursor parked beyond shorter text), it is only
+            // clamped.
+            if adjusted_cursor_main.x >= size.cols && self.dec_auto_wrap {
+                let last = {
+                    let screen = self.screen();
+                    let line = screen.phys_line(screen.phys_row(self.cursor.y));
+                    (line.len() >= size.cols)
+                        .then(|| line.visible_cells().last().map(|cell| cell.cell_index()))
+                };
+                if let Some(last) = last {
+                    if let Some(column) = last {
+                        self.cursor.x = column;
+                    }
+                    self.wrap_next = true;
+                }
+            }
         }
     }
 
@@ -1801,6 +1833,13 @@ impl TerminalState {
         let seqno = self.seqno;
         // One floor for page-engine rows (ft-yccm0.3.3.4).
         self.screen.touch_all_rows(seqno);
+    }
+
+    /// Whether a wrap is pending at the cursor: the next character goes to
+    /// the start of the next row.
+    #[cfg(test)]
+    pub(crate) fn wrap_pending(&self) -> bool {
+        self.wrap_next
     }
 
     /// Returns the 0-based cursor position relative to the top left of
@@ -1867,15 +1906,19 @@ impl TerminalState {
                 } else {
                     0
                 })
-                .min(if self.dec_origin_mode {
-                    usize_to_i64_saturating(self.left_and_right_margins.end).saturating_sub(1)
-                } else {
-                    // We allow 1 extra for the cursor x position
-                    // to account for some resize/rewrap scenarios
-                    // where we don't want to forget that the
-                    // cursor belongs to a wrapped line.
-                    usize_to_i64_saturating(self.screen().physical_cols)
-                })
+                .min(
+                    if self.dec_origin_mode {
+                        usize_to_i64_saturating(self.left_and_right_margins.end)
+                    } else {
+                        // The last column, as VT510 and xterm clamp CUP and
+                        // CHA (ft-3e1yj). A cursor that resize/rewrap leaves
+                        // just past a wrapped line's end keeps that line as a
+                        // pending wrap instead (`resize_with_prepared_reflow`),
+                        // never as an off-screen column.
+                        usize_to_i64_saturating(self.screen().physical_cols)
+                    }
+                    .saturating_sub(1),
+                )
                 .max(0),
         };
 

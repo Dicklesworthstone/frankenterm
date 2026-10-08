@@ -1222,6 +1222,48 @@ fn test_resize_2162_by_2_then_up_1() {
 
 /// The cursor stays attached to the final word across a narrow/wide cycle,
 /// including the short physical row introduced by word-aware wrapping.
+/// ft-3e1yj: the case WezTerm's extra cursor column (issue 2162, upstream
+/// 4bf89e0c1) was for. A cursor with a wrap pending after a full row is the
+/// insertion point just past that row's last cell. A resize keeps it there
+/// as a wrap pending on the row's last column, never as an off-screen
+/// column: the next character continues the logical line on the row below,
+/// and the line reflows back whole.
+#[test]
+fn test_resize_keeps_a_pending_wrap_on_its_line() {
+    let size = |rows, cols| TerminalSize {
+        rows,
+        cols,
+        ..Default::default()
+    };
+    let cursor = |term: &TestTerm| {
+        let cursor = term.cursor_pos();
+        (cursor.x, cursor.y)
+    };
+
+    // Narrower: the pending wrap lands just past the new last row's end.
+    let mut term = TestTerm::new(4, 10, 0);
+    term.print("0123456789");
+    assert_eq!(cursor(&term), (9, 0));
+    term.resize(size(4, 5));
+    assert_visible_contents(&term, file!(), line!(), &["01234", "56789", "", ""]);
+    assert_eq!(cursor(&term), (4, 1), "on the last column, not past it");
+    term.print("X");
+    assert_visible_contents(&term, file!(), line!(), &["01234", "56789", "X", ""]);
+    assert_eq!(cursor(&term), (1, 2));
+    term.resize(size(4, 10));
+    assert_visible_contents(&term, file!(), line!(), &["0123456789", "X", "", ""]);
+    assert_eq!(cursor(&term), (1, 1));
+
+    // Same width (only the rows change): the wrap stays pending.
+    let mut term = TestTerm::new(4, 10, 0);
+    term.print("0123456789");
+    term.resize(size(5, 10));
+    assert_eq!(cursor(&term), (9, 0));
+    term.print("X");
+    assert_visible_contents(&term, file!(), line!(), &["0123456789", "X", "", "", ""]);
+    assert_eq!(cursor(&term), (1, 1));
+}
+
 #[test]
 fn test_resize_2162_by_2() {
     let num_lines = 4;
@@ -1299,7 +1341,11 @@ fn test_resize_2162() {
         &["some long long text", "", "", ""],
     );
     eprintln!("check cursor pos 2");
-    term.assert_cursor_pos(19, 0, None, Some(6));
+    // The text now fills the row exactly: the insertion point after "t" is a
+    // wrap pending on the last column, not an off-screen column 19
+    // (ft-3e1yj), so the cursor still belongs to this line.
+    term.assert_cursor_pos(18, 0, None, Some(6));
+    assert!(term.wrap_pending(), "a wrap is pending after the full row");
     term.resize(TerminalSize {
         rows: num_lines,
         cols: num_cols,

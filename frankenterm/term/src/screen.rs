@@ -804,6 +804,11 @@ pub struct ColdSeamReflow {
 #[derive(Debug)]
 pub(crate) struct ColdSeamCursor {
     pub before: CursorPosition,
+    /// A wrap was pending at the cursor (ft-3e1yj).
+    pub pending_wrap: bool,
+    /// The insertion point's column in `physical_row`: the cursor's, or with
+    /// a wrap pending, just past the row's last cell.
+    pub insertion_x: usize,
     pub physical_row: usize,
     pub after: Option<(usize, usize, bool)>,
 }
@@ -992,7 +997,7 @@ impl ColdSeamReflow {
                 .ok_or_else(|| anyhow::anyhow!("cold seam cursor offset overflow"))?;
             Some(
                 prefix
-                    .checked_add(cursor.before.x)
+                    .checked_add(cursor.insertion_x)
                     .ok_or_else(|| anyhow::anyhow!("cold seam cursor offset overflow"))?,
             )
         } else {
@@ -15675,6 +15680,9 @@ pub(crate) mod tests {
             terminal.cursor_pos(),
             terminal.screen().lines.back().map(Line::as_str)
         );
+        // A resize that fills the final row leaves the cursor as the wrap
+        // pending after its last grapheme (ft-3e1yj).
+        let pending = terminal.wrap_pending();
         let mut stale = terminal
             .capture_cold_seam_reflow()
             .unwrap()
@@ -15683,8 +15691,8 @@ pub(crate) mod tests {
             .unwrap();
         let before = terminal.cursor_pos();
         assert!(before.y > 0);
-        // Vertical movement preserves the virtual column just beyond the
-        // right edge; horizontal movement intentionally clamps that column.
+        // Vertical movement keeps the cursor's column; it cancels a pending
+        // wrap.
         terminal.advance_bytes(b"\x1b[A");
         let sequence = terminal.current_seqno() + 1;
         assert!(!terminal
@@ -15745,11 +15753,24 @@ pub(crate) mod tests {
             .hydrate(|| false)
             .unwrap();
         let actual: String = all.lines().map(|line| line.as_str()).collect();
-        assert_eq!(
-            actual,
-            format!("{original}!"),
-            "typing must continue at the original text offset"
-        );
+        if pending {
+            // CUU and CUD above cancelled that pending wrap, as VT510, xterm
+            // and Ghostty cancel it on any cursor movement, so "!" lands on the
+            // last grapheme's cell. Before ft-3e1yj the cursor sat in an
+            // off-screen column instead, and "!" went into an off-screen cell.
+            let last = original.char_indices().last().map_or(0, |(at, _)| at);
+            assert_eq!(
+                actual.trim_end_matches(' '),
+                format!("{}!", &original[..last]),
+                "typing must replace the last grapheme at the original text offset"
+            );
+        } else {
+            assert_eq!(
+                actual,
+                format!("{original}!"),
+                "typing must continue at the original text offset"
+            );
+        }
     }
 
     #[cfg(feature = "use_serde")]
