@@ -30,7 +30,10 @@
 //! - the hovered hyperlink is underlined ([`hovered_underline`]);
 //! - blinking text (SGR 5 and 6), and its decorations in its color, fade
 //!   toward its background by the window's blink level ([`BlinkLevels`]),
-//!   mixed in linear light ([`mix_linear`]).
+//!   mixed in linear light ([`mix_linear`]);
+//! - image cells (kitty, iTerm2, sixel) draw their slices from
+//!   [`GlyphSource::image_cell`], under the glyphs at a negative z-index and
+//!   over them otherwise (ft-yccm0.4.7.2).
 //!
 //! The background pass draws the selection tint and the cursor itself. The
 //! caller builds its uniforms.
@@ -47,6 +50,7 @@ use std::sync::Arc;
 use termwiz::cell::{Blink, CellAttributes, Intensity, Underline, unicode_column_width};
 use termwiz::cellcluster::CellCluster;
 use termwiz::hyperlink::Hyperlink;
+use termwiz::image::ImageCell;
 use wezterm_term::StableRowIndex;
 use wezterm_term::color::{ColorAttribute, ColorPalette, SrgbaTuple};
 
@@ -132,6 +136,16 @@ pub trait GlyphSource {
     /// default foreground with; `None` for none.
     fn style_foreground(&mut self, row: &MirrorRow, cell: &MirrorCell) -> Option<SrgbaTuple> {
         let _ = (row, cell);
+        None
+    }
+
+    /// The color bitmap that draws `image` (an image cell's slice) over one
+    /// column of its cell (ft-yccm0.4.7.2): WebGpu's image quad for the
+    /// cell, the slice of the image scaled to the cell less the image's
+    /// padding as that quad samples it, placed from the cell's top-left.
+    /// `None` while it draws nothing: decoding, not drawable, or images off.
+    fn image_cell(&mut self, image: &ImageCell) -> Option<PlacedGlyph> {
+        let _ = image;
         None
     }
 }
@@ -566,6 +580,56 @@ fn cell_colors(
     }
 }
 
+/// The instances that draw a row's images (ft-yccm0.4.7.2), as WebGpu draws
+/// a line's image cells: every image of a cell over each of the cell's
+/// columns, column by column; those at a negative z-index first, the rest
+/// second. Columns a composition overlays are left out, as the overlay
+/// replaces their cells, images and all.
+// Columns are bounded by the grid extent, which fits u16.
+#[allow(clippy::cast_possible_truncation)]
+fn image_instances(
+    row: &MirrorRow,
+    cols: usize,
+    composed: &Range<usize>,
+    glyphs: &mut dyn GlyphSource,
+) -> (Vec<CellText>, Vec<CellText>) {
+    let (mut under, mut over) = (Vec::new(), Vec::new());
+    let images = row.images();
+    let mut start = 0;
+    while let Some(first) = images.get(start) {
+        let col = usize::from(first.col);
+        let end = start
+            + images[start..]
+                .iter()
+                .take_while(|image| image.col == first.col)
+                .count();
+        let width = row
+            .cells()
+            .binary_search_by_key(&col, MirrorCell::col)
+            .map_or(1, |index| row.cells()[index].width().max(1));
+        for column in col..(col + width).min(cols) {
+            if composed.contains(&column) {
+                continue;
+            }
+            for image in &images[start..end] {
+                let Some(placed) = glyphs.image_cell(&image.image) else {
+                    continue;
+                };
+                // Image texels keep their own colors at full strength.
+                let instance =
+                    CellText::new(column as u16, [255; 4]).with_glyph(&placed.slot, placed.offset);
+                if image.image.z_index() < 0 {
+                    under.push(instance);
+                } else {
+                    over.push(instance);
+                }
+            }
+        }
+        start = end;
+    }
+    (under, over)
+}
+
 /// A line sprite's color under the selection's tint (`selection`, opaque,
 /// at alpha `tint`). The WebGpu renderer blends the tint over the sprite
 /// and the cell; tinting the sprite's color, over a cell the background
@@ -993,6 +1057,14 @@ impl MetalScene {
             None => mirror_row.clusters(),
         };
         let composed = composing.map_or(0..0, |(cursor, _)| cursor.composed());
+        // Images (ft-yccm0.4.7.2): those at a negative z-index over the
+        // decorations and an under-glyph cursor, under the glyphs, as WebGpu
+        // draws them in a line's first layer; the rest after the glyphs.
+        let (under_images, over_images) =
+            image_instances(mirror_row, cols as usize, &composed, glyphs);
+        for instance in under_images {
+            self.text.push(grid_row, instance);
+        }
         for shaped in glyphs.shape_row(&clusters) {
             let col = shaped.cell;
             if col >= cols as usize {
@@ -1032,6 +1104,10 @@ impl MetalScene {
                 self.text.push(grid_row, instance);
             }
         }
+        // WebGpu's last layer: a bar cursor, then the images over the text.
+        for instance in over_images {
+            self.text.push(grid_row, instance);
+        }
         // The selection tints its whole span, blank columns included.
         for col in built.selection.start..built.selection.end.min(cols as usize) {
             let col = col as u32;
@@ -1059,6 +1135,11 @@ mod tests {
     impl TerminalConfiguration for TestConfig {
         fn color_palette(&self) -> ColorPalette {
             ColorPalette::default()
+        }
+
+        /// Image tests place kitty images, at chosen z-indexes.
+        fn enable_kitty_graphics(&self) -> bool {
+            true
         }
     }
 
@@ -1098,6 +1179,8 @@ mod tests {
         /// A font rule's text color for bold text, as a configured
         /// `font_rules` entry with a `foreground` sets one.
         bold_foreground: Option<SrgbaTuple>,
+        /// Image cell bitmaps by z-index and slice (its left edge, as bits).
+        images: HashMap<(i32, u32), PlacedGlyph>,
     }
 
     fn synthetic_style(cluster: &CellCluster) -> SyntheticStyle {
@@ -1241,6 +1324,20 @@ mod tests {
                         offset: [0, 0],
                     }),
             )
+        }
+
+        /// One made-up color slot per image slice, offset by its padding.
+        fn image_cell(&mut self, image: &ImageCell) -> Option<PlacedGlyph> {
+            let index = 12288 + u32::try_from(self.images.len()).unwrap_or(u32::MAX - 12288);
+            let key = (image.z_index(), image.top_left().x.into_inner().to_bits());
+            let (left, top, _, _) = image.padding();
+            Some(*self.images.entry(key).or_insert_with(|| PlacedGlyph {
+                slot: AtlasSlot {
+                    kind: AtlasKind::Color,
+                    ..synthetic_slot(index, "image")
+                },
+                offset: [i16::try_from(left).unwrap(), i16::try_from(top).unwrap()],
+            }))
         }
     }
 
@@ -1895,6 +1992,126 @@ mod tests {
                 assert_eq!(row[..3], plain[..], "{shape:?}");
             }
         }
+    }
+
+    /// ft-yccm0.4.7.2: a row's images are drawn as WebGpu draws a line's
+    /// image cells: each over its cell's column, from its slice's bitmap
+    /// placed at the image's padding, at full strength. Those at a negative
+    /// z-index go over the decorations and under the glyphs, the rest after
+    /// the glyphs and a bar cursor. A composition drops the images of the
+    /// columns it overlays, as its overlay replaces their cells.
+    #[test]
+    fn images_draw_under_or_over_the_glyphs_by_z_index() {
+        let palette = ColorPalette::default();
+        let mut term = terminal(2, 10);
+        // Underlined "ab"; a 2x1-pixel image over two cells at z-index -1;
+        // "c"; the image over one cell at z-index 1; "d", then the cursor.
+        term.advance_bytes(
+            "\x1b[4mab\x1b[24m\x1b_Ga=T,f=32,s=2,v=1,c=2,r=1,z=-1;/wAA/wAA//8=\x1b\\c\
+             \x1b_Ga=T,f=32,s=2,v=1,c=1,r=1,z=1;/wAA/wAA//8=\x1b\\d",
+        );
+        let mut mirror = RenderMirror::new();
+        let mut scene = MetalScene::new();
+        let mut glyphs = SyntheticGlyphs::default();
+        let bar = SceneStyle {
+            cursor_sprite: Some((CursorSprite::Bar, palette.cursor_bg)),
+            ..plain_style(&palette)
+        };
+        step(
+            &mut term,
+            &mut mirror,
+            &mut scene,
+            &mut glyphs,
+            &no_selection,
+            &bar,
+        );
+        let placed: Vec<(u16, i32)> = mirror.rows()[0]
+            .images()
+            .iter()
+            .map(|image| (image.col, image.image.z_index()))
+            .collect();
+        assert_eq!(placed, [(2, -1), (3, -1), (5, 1)], "the kitty placements");
+
+        // Line sprites have the made-up slots from 4096 on, cursor sprites
+        // from 8192, and images from 12288.
+        let kinds = |scene: &MetalScene| -> Vec<(char, u16)> {
+            scene
+                .text()
+                .row(0)
+                .map(|instance| {
+                    let kind = match instance.atlas_origin()[1] {
+                        4608.. => 'i',
+                        3072.. => 'c',
+                        1536.. => 'l',
+                        _ => 'g',
+                    };
+                    (kind, instance.col())
+                })
+                .collect()
+        };
+        assert_eq!(
+            kinds(&scene),
+            [
+                ('l', 0),
+                ('l', 1),
+                ('i', 2),
+                ('i', 3),
+                ('g', 0),
+                ('g', 1),
+                ('g', 4),
+                ('g', 6),
+                ('c', 7),
+                ('i', 5),
+            ]
+        );
+        // Each image column draws its own slice, unpadded, at full strength.
+        let origin = |key: (i32, f32)| {
+            let slot = glyphs.images[&(key.0, key.1.to_bits())].slot;
+            [
+                u16::try_from(slot.x).unwrap(),
+                u16::try_from(slot.y).unwrap(),
+            ]
+        };
+        let images: Vec<(u16, [u16; 2], [u8; 4])> = scene
+            .text()
+            .row(0)
+            .filter(|instance| instance.atlas_origin()[1] >= 4608)
+            .map(|instance| (instance.col(), instance.atlas_origin(), instance.fg()))
+            .collect();
+        assert_eq!(
+            images,
+            [
+                (2, origin((-1, 0.0)), [255; 4]),
+                (3, origin((-1, 0.5)), [255; 4]),
+                (5, origin((1, 0.0)), [255; 4]),
+            ]
+        );
+
+        // A composition at the image's first column takes its image away.
+        term.advance_bytes("\x1b[1;3H");
+        let composing = SceneStyle {
+            compose: Some(Compose {
+                text: Some("x"),
+                color: palette.cursor_bg,
+                fg: palette.cursor_fg,
+                under: palette.cursor_bg,
+                lock: false,
+            }),
+            ..plain_style(&palette)
+        };
+        step(
+            &mut term,
+            &mut mirror,
+            &mut scene,
+            &mut glyphs,
+            &no_selection,
+            &composing,
+        );
+        let image_cols: Vec<u16> = kinds(&scene)
+            .into_iter()
+            .filter_map(|(kind, col)| (kind == 'i').then_some(col))
+            .collect();
+        assert_eq!(image_cols, [3, 5]);
     }
 
     /// Text is hidden only in the color it actually sits on, as the WebGpu
