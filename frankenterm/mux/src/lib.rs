@@ -12776,12 +12776,28 @@ fn attempt_live_parser_checkpoint_after_raw(
 ) -> LiveParserAttemptOutcome {
     let control = &generation.live_parser_checkpoint;
     debug_assert!(!raw.is_framed() || hold.is_holding());
-    if !raw.is_empty()
-        && !raw.is_framed()
-        && (control.has_ready_model_checkpoint()
-            || matches!(control.ready_checkpoint_target(), Ok(Some(_))))
-    {
-        flush_coalesced_output(pane, generation, dead, parser, raw, actions, hold);
+    if !raw.is_empty() && !raw.is_framed() {
+        // Held raw bytes already count as parsed, but the parser has not
+        // consumed them, so a capture must feed them first. This one read of
+        // the request decides that (ft-3woiu). The attempt reads the target
+        // again: a request registered, or a delivery call finished, on
+        // another thread between the two reads would show it a ready target
+        // with the parser short of it by the held bytes, and it would poison
+        // the pane ("external parser recovery watermark disagreed with
+        // delivery fence"). So when nothing is ready here, nothing is
+        // attempted. The request's wake, or the next loop iteration (each
+        // starts with an attempt), makes the attempt after a read that sees
+        // it, and flushes first.
+        let ready = control.has_ready_model_checkpoint()
+            || match control.ready_checkpoint_target() {
+                Ok(Some(_)) => true,
+                Ok(None) => return LiveParserAttemptOutcome::NoRequest,
+                // An overshoot: the attempt reads it again and poisons.
+                Err(_) => false,
+            };
+        if ready {
+            flush_coalesced_output(pane, generation, dead, parser, raw, actions, hold);
+        }
     }
     attempt_live_parser_checkpoint(pane, generation, dead, parser, actions, hold, worker)
 }
