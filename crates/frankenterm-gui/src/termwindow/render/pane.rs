@@ -763,6 +763,9 @@ impl crate::TermWindow {
                     // frame, and capture again at the next frame max_fps
                     // allows. Output notifications usually ask sooner.
                     metrics::counter!("gui.paint.native_frame_reused").increment(1);
+                    // The present counts as stale in the frame ledger, which
+                    // the throughput harness compares with its FPS meter.
+                    frankenterm_alloc::resource_ledger::FrameLedger::global().note_reused_content();
                     self.schedule_animation_wake(Instant::now() + self.frame_interval());
                     reused_stamp = Some(painted.selection_stamp);
                     Some(painted.frame)

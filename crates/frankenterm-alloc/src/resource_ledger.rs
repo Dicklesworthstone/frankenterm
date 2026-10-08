@@ -17,7 +17,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1062,6 +1062,11 @@ impl WritersSnapshot {
 #[derive(Debug)]
 pub struct FrameLedger {
     presented_total: AtomicU64,
+    /// Presents that drew some pane from the frame it was last painted from
+    /// (its terminal was busy), so they may show nothing new.
+    stale_presented_total: AtomicU64,
+    /// A pane was drawn from a reused frame since the last present.
+    reused_content_pending: AtomicBool,
     present_failures_total: AtomicU64,
     present_interval: LatencyHistogram,
     /// Monotonic nanoseconds of the latest present; 0 before the first.
@@ -1082,6 +1087,8 @@ impl FrameLedger {
     pub const fn new() -> Self {
         Self {
             presented_total: AtomicU64::new(0),
+            stale_presented_total: AtomicU64::new(0),
+            reused_content_pending: AtomicBool::new(false),
             present_failures_total: AtomicU64::new(0),
             present_interval: LatencyHistogram::new(),
             last_present_ns: AtomicU64::new(0),
@@ -1110,6 +1117,9 @@ impl FrameLedger {
     pub fn record_present_at(&self, at_ns: u64) {
         let at_ns = at_ns.max(1);
         self.presented_total.fetch_add(1, Ordering::Relaxed);
+        if self.reused_content_pending.swap(false, Ordering::Relaxed) {
+            self.stale_presented_total.fetch_add(1, Ordering::Relaxed);
+        }
         let previous = self.last_present_ns.swap(at_ns, Ordering::Relaxed);
         if previous != 0 {
             self.present_interval.record(at_ns.saturating_sub(previous));
@@ -1121,10 +1131,17 @@ impl FrameLedger {
         self.present_failures_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// The frame being built draws a pane from the frame it was last painted
+    /// from, because its terminal was busy: the next present counts as stale.
+    pub fn note_reused_content(&self) {
+        self.reused_content_pending.store(true, Ordering::Relaxed);
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> FramesSnapshot {
         FramesSnapshot {
             presented_total: self.presented_total.load(Ordering::Relaxed),
+            stale_presented_total: self.stale_presented_total.load(Ordering::Relaxed),
             present_failures_total: self.present_failures_total.load(Ordering::Relaxed),
             present_interval: self.present_interval.snapshot(),
             max_fps: self.max_fps.load(Ordering::Relaxed),
@@ -1143,6 +1160,10 @@ fn monotonic_ns() -> u64 {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FramesSnapshot {
     pub presented_total: u64,
+    /// Presents that drew some pane from a reused frame (its terminal was
+    /// busy); `presented_total - stale_presented_total` showed fresh content.
+    #[serde(default)]
+    pub stale_presented_total: u64,
     pub present_failures_total: u64,
     /// Present-to-present intervals over the process lifetime, idle gaps
     /// included.
@@ -1157,8 +1178,9 @@ impl FramesSnapshot {
     pub fn summary_line(&self) -> String {
         let ms = |ns: u64| ns as f64 / 1_000_000.0;
         format!(
-            "Frames: presented {} (failed {}); present interval p50 {:.2} ms, p95 {:.2} ms, max {:.2} ms; max_fps {}",
+            "Frames: presented {} (stale {}, failed {}); present interval p50 {:.2} ms, p95 {:.2} ms, max {:.2} ms; max_fps {}",
             self.presented_total,
+            self.stale_presented_total,
             self.present_failures_total,
             ms(self.present_interval.p50_ns),
             ms(self.present_interval.p95_ns),
@@ -2319,11 +2341,21 @@ mod tests {
         assert_eq!(
             snapshot.summary_line(),
             format!(
-                "Frames: presented 4 (failed 1); present interval p50 {:.2} ms, p95 250.00 ms, \
-                 max 250.00 ms; max_fps 120",
+                "Frames: presented 4 (stale 0, failed 1); present interval p50 {:.2} ms, \
+                 p95 250.00 ms, max 250.00 ms; max_fps 120",
                 snapshot.present_interval.p50_ns as f64 / 1_000_000.0
             )
         );
+
+        // A pane drawn from a reused frame makes the next present, and only
+        // that one, stale, however many panes were reused in it.
+        ledger.note_reused_content();
+        ledger.note_reused_content();
+        ledger.record_present_at(305_000_000);
+        ledger.record_present_at(321_666_667);
+        let snapshot = ledger.snapshot();
+        assert_eq!(snapshot.presented_total, 6);
+        assert_eq!(snapshot.stale_presented_total, 1);
 
         // The global ledger records against its own monotonic clock.
         let global = FrameLedger::global();
@@ -2353,6 +2385,15 @@ mod tests {
         assert_eq!(value["frames"]["present_interval"]["count"], 0);
         let parsed: ResourceSnapshotEnvelope = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(parsed, envelope);
+        // A frames section from before the stale count still parses.
+        let mut older = value.clone();
+        older["frames"]
+            .as_object_mut()
+            .unwrap()
+            .remove("stale_presented_total");
+        let parsed: ResourceSnapshotEnvelope = serde_json::from_value(older).unwrap();
+        assert_eq!(parsed.frames.presented_total, 7_200);
+        assert_eq!(parsed.frames.stale_presented_total, 0);
         // Files written before the section existed still parse.
         let mut legacy = value;
         legacy.as_object_mut().unwrap().remove("frames");

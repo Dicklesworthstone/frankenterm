@@ -1628,6 +1628,27 @@ const HANDOFF_WAIT: Duration = Duration::from_millis(1);
 #[cfg(not(feature = "disruptor-pane-io"))]
 const PARSER_HOLD_BUDGET: Duration = Duration::from_millis(2);
 
+/// Longest a paint waits for a pane's terminal lock before drawing the pane
+/// from the frame it last painted (ft-yccm0.2.2.3). While it waits, a
+/// flooding parser hands the lock over at its next slice boundary (within
+/// `PARSER_HOLD_BUDGET`), so a fresh frame usually costs well under this.
+/// Without the wait, a paint during a flood almost always found the lock
+/// held and presented the old frame again: the default front end showed ~3
+/// new frames per second at ~26 presents (nv13 T0).
+const RENDER_CAPTURE_WAIT: Duration = Duration::from_millis(4);
+
+/// [`RENDER_CAPTURE_WAIT`], or `FRANKENTERM_RENDER_CAPTURE_WAIT_MS` when set
+/// (0: try the lock only, as before), read once.
+fn render_capture_wait() -> Duration {
+    static WAIT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *WAIT.get_or_init(|| {
+        std::env::var("FRANKENTERM_RENDER_CAPTURE_WAIT_MS")
+            .ok()
+            .and_then(|ms| ms.trim().parse::<u64>().ok())
+            .map_or(RENDER_CAPTURE_WAIT, Duration::from_millis)
+    })
+}
+
 impl TerminalMutex {
     fn new(terminal: Terminal) -> Self {
         Self {
@@ -1694,6 +1715,37 @@ impl TerminalMutex {
         self.inner
             .try_lock()
             .map(|guard| TerminalGuard::acquired(guard, holder, 0))
+    }
+
+    /// [`Self::lock_as`] that gives up after `wait`. A locker other than the
+    /// parser registers demand while it waits, so a flooding parser hands the
+    /// lock over at its next slice boundary (ft-yccm0.2.3); a bare try_lock
+    /// registers none and almost never finds the lock free during a flood.
+    fn try_lock_for_as(
+        &self,
+        holder: TerminalLockHolder,
+        wait: Duration,
+    ) -> Option<TerminalGuard<'_>> {
+        if let Some(guard) = self.inner.try_lock() {
+            return Some(TerminalGuard::acquired(guard, holder, 0));
+        }
+        if wait.is_zero() {
+            return None;
+        }
+        let demanding = holder != TerminalLockHolder::Parser;
+        if demanding {
+            self.demand.fetch_add(1, Ordering::AcqRel);
+        }
+        let started = Instant::now();
+        let guard = self.inner.try_lock_for(wait);
+        let waited = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if demanding {
+            self.demand.fetch_sub(1, Ordering::AcqRel);
+            if guard.is_some() {
+                self.served.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        guard.map(|guard| TerminalGuard::acquired(guard, holder, waited.max(1)))
     }
 
     /// A probe for availability; not an acquisition, so nothing is recorded.
@@ -6269,7 +6321,9 @@ impl LocalPane {
         rules: &[termwiz::hyperlink::Rule],
         detect_password_input: bool,
     ) -> Option<NativeRenderFrame> {
-        let mut term = self.terminal.try_lock()?;
+        let mut term = self
+            .terminal
+            .try_lock_for_as(TerminalLockHolder::Paint, render_capture_wait())?;
         #[cfg(feature = "disruptor-pane-io")]
         self.drain_action_ring_locked(&mut term);
         let hide_cursor = self.tmux_domain.try_lock()?.is_some();
@@ -16342,6 +16396,68 @@ mod tests {
             });
         assert!(matches!(decision, ResizeCommitDecision::Superseded { .. }));
         assert_eq!(terminal.get_size(), term_size(80, 3));
+    }
+
+    /// ft-yccm0.2.2.3: a paint's bounded terminal lock registers demand while
+    /// it waits, so a flooding parser's slice handoff (ft-yccm0.2.3) gives it
+    /// the lock; a bare try_lock registered none and almost always found the
+    /// lock held. A hold that outlasts the wait makes the paint give up and
+    /// withdraw its demand, and a zero wait only tries.
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    #[test]
+    fn a_paint_lock_registers_demand_while_it_waits_and_withdraws_it_on_timeout() {
+        let terminal = Arc::new(TerminalMutex::new(Terminal::new(
+            term_size(80, 3),
+            Arc::new(GuardianLifetimeTestTermConfig),
+            "FrankenTerm",
+            "paint-lock-test",
+            Box::new(std::io::sink()),
+        )));
+        let held = terminal.lock_as(TerminalLockHolder::Parser);
+        assert!(terminal
+            .try_lock_for_as(TerminalLockHolder::Paint, Duration::ZERO)
+            .is_none());
+        assert!(!terminal.demanded(), "a zero wait only tries");
+
+        let served = terminal.served.load(Ordering::Acquire);
+        let paint = {
+            let terminal = Arc::clone(&terminal);
+            std::thread::spawn(move || {
+                terminal
+                    .try_lock_for_as(TerminalLockHolder::Paint, Duration::from_secs(30))
+                    .is_some()
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !terminal.demanded() {
+            assert!(
+                Instant::now() < deadline,
+                "the waiting paint never registered demand"
+            );
+            std::thread::yield_now();
+        }
+        // The parser answers demand at its next slice boundary.
+        terminal.hand_over(held);
+        assert!(
+            paint.join().unwrap(),
+            "the handed-over lock reached the paint"
+        );
+        assert_eq!(terminal.served.load(Ordering::Acquire), served + 1);
+        assert!(!terminal.demanded());
+
+        let held = terminal.lock_as(TerminalLockHolder::Parser);
+        let started = Instant::now();
+        assert!(terminal
+            .try_lock_for_as(TerminalLockHolder::Paint, Duration::from_millis(20))
+            .is_none());
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert!(!terminal.demanded(), "a given-up wait withdraws its demand");
+        assert_eq!(
+            terminal.served.load(Ordering::Acquire),
+            served + 1,
+            "a given-up wait was not served"
+        );
+        drop(held);
     }
 
     #[test]
