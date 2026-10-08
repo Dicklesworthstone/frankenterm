@@ -141,6 +141,11 @@ pub struct SceneActions {
     /// their non-zero rates (ft-yccm0.4.7.3).
     #[serde(default)]
     pub blink: Option<f32>,
+    /// Turn the pane's terminal echo off (`stty -echo`) before the scene
+    /// plays, so the pane reports password input and the cursor is drawn as
+    /// the password lock (ft-yccm0.4.7.3).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub password_input: bool,
 }
 
 impl SceneActions {
@@ -439,6 +444,15 @@ pub struct SceneSnapshot {
     pub elapsed: Duration,
 }
 
+/// The scene pane's shell script: play the scene file (`$1`), set `title`,
+/// then stay alive until killed. With `password_input`, terminal echo goes
+/// off first, with canonical input left on: what the GUI reads as password
+/// input.
+fn scene_script(title: &str, password_input: bool) -> String {
+    let echo_off = if password_input { "stty -echo; " } else { "" };
+    format!("{echo_off}cat \"$1\"; printf '\\033]2;{title}\\007'; exec sleep 600")
+}
+
 /// Renders one scene through the real GUI. `work_dir` receives the config,
 /// the scene bytes, the throwaway `HOME`, the GUI log and the snapshot.
 pub fn render_scene_snapshot(
@@ -483,7 +497,7 @@ pub fn render_scene_snapshot(
     } else {
         SNAPSHOT_TITLE
     };
-    let script = format!("cat \"$1\"; printf '\\033]2;{first_title}\\007'; exec sleep 600");
+    let script = scene_script(first_title, scene.snapshot.password_input);
     let mut command = Command::new(gui_bin);
     command
         .arg("--config-file")
@@ -726,6 +740,8 @@ mod tests {
             modal: Some("char_select".to_string()),
             compose: Some("日本".to_string()),
             blink: Some(0.5),
+            // The scene's own script turns echo off; no hook variable.
+            password_input: true,
         };
         let env: BTreeMap<String, String> = snapshot_action_env(&actions, split_scene)
             .unwrap()
@@ -819,7 +835,36 @@ mod tests {
         }))
         .unwrap();
         assert!(scene.snapshot.focus);
+        assert!(!scene.snapshot.password_input);
         assert_eq!(scene.snapshot.split.unwrap().text, "y");
+        // Password input appears in a scene that sets it, and only there.
+        let focused = serde_json::to_value(SceneActions {
+            focus: true,
+            ..SceneActions::default()
+        })
+        .unwrap();
+        assert!(focused.get("password_input").is_none(), "{focused}");
+        let scene: SceneSpec = serde_json::from_value(serde_json::json!({
+            "text": "x",
+            "snapshot": {"password_input": true}
+        }))
+        .unwrap();
+        assert!(scene.snapshot.password_input);
+        assert!(!scene.snapshot.is_empty());
+    }
+
+    /// ft-yccm0.4.7.3: a password-input scene turns echo off before it
+    /// plays; any other scene's script is as it always was.
+    #[test]
+    fn a_password_input_scene_turns_echo_off_first() {
+        assert_eq!(
+            scene_script(SNAPSHOT_TITLE, false),
+            "cat \"$1\"; printf '\\033]2;ft-render-snapshot\\007'; exec sleep 600"
+        );
+        assert_eq!(
+            scene_script(SPLIT_TITLE, true),
+            format!("stty -echo; cat \"$1\"; printf '\\033]2;{SPLIT_TITLE}\\007'; exec sleep 600")
+        );
     }
 
     #[test]

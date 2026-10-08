@@ -138,7 +138,7 @@ pub trait GlyphSource {
 
 /// A cursor the scene draws as the WebGpu renderer's cursor sprite
 /// (ft-yccm0.4.7.3): every cursor but a focused block, which the background
-/// pass fills.
+/// pass fills, and the lock that replaces any cursor at a password prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CursorSprite {
     /// An unfocused window's or inactive pane's cursor, whatever its shape.
@@ -151,6 +151,21 @@ pub enum CursorSprite {
     /// default cursor shape, a solid fill across the cursor's cells, under
     /// the glyphs.
     Solid,
+    /// The password lock: WebGpu's lock glyph (U+F023 in the default font
+    /// style, `resolve_lock_glyph`), drawn in place of any of the above
+    /// while the pane reports password input. It is drawn where the sprite
+    /// it replaces would be: `over` the glyphs for a focused bar, else under
+    /// them.
+    Lock { over: bool },
+}
+
+impl CursorSprite {
+    /// Drawn over the row's glyphs (the WebGpu renderer's layer 2), as a
+    /// focused bar and the lock in its place are; every other sprite goes
+    /// under them (its layer 0).
+    fn over_glyphs(self) -> bool {
+        matches!(self, Self::Bar | Self::Lock { over: true })
+    }
 }
 
 /// A dead key, an IME composition or the leader key active in the pane,
@@ -174,6 +189,9 @@ pub struct Compose<'a> {
     /// The color that text is not drawn in (the cursor color, which WebGpu
     /// gives as the text's background there).
     pub under: SrgbaTuple,
+    /// The pane reports password input: the block is the lock glyph
+    /// ([`CursorSprite::Lock`]) in its color, as WebGpu draws it there.
+    pub lock: bool,
 }
 
 /// What a frame's colors depend on besides the cells.
@@ -199,7 +217,8 @@ pub struct SceneStyle<'a> {
     pub cursor_bg: Option<SrgbaTuple>,
     /// Any other cursor, drawn as a sprite in its color (the cursor color
     /// when focused, the cursor border otherwise); `None` for a focused block
-    /// or no cursor.
+    /// or no cursor. At a password prompt, any cursor is the lock glyph
+    /// ([`CursorSprite::Lock`]), a focused block's too.
     pub cursor_sprite: Option<(CursorSprite, SrgbaTuple)>,
     /// The hyperlink under the mouse, underlined wherever it appears.
     pub hover: Option<&'a Arc<Hyperlink>>,
@@ -373,7 +392,14 @@ impl RowCursor {
             cols,
             fg: Some(compose.fg),
             block: Some(compose.under),
-            sprite: Some((CursorSprite::Solid, rgba8(compose.color))),
+            sprite: Some((
+                if compose.lock {
+                    CursorSprite::Lock { over: false }
+                } else {
+                    CursorSprite::Solid
+                },
+                rgba8(compose.color),
+            )),
             composing: compose.text.map(str::to_string),
             reverse: reverse.map(f32::to_bits),
             blink: None,
@@ -910,16 +936,17 @@ impl MetalScene {
         // (its layer 2).
         let cursor_sprite = built.cursor.as_ref().and_then(|cursor| {
             let (shape, color) = cursor.sprite?;
-            let width = if shape == CursorSprite::Solid {
-                cursor.cols.clamp(1, usize::from(u8::MAX))
-            } else {
-                mirror_row
+            let width = match shape {
+                CursorSprite::Solid => cursor.cols.clamp(1, usize::from(u8::MAX)),
+                // One glyph, whatever the cells.
+                CursorSprite::Lock { .. } => 1,
+                _ => mirror_row
                     .cells()
                     .iter()
                     .find(|cell| {
                         (cell.col()..cell.col() + cell.width().max(1)).contains(&cursor.col)
                     })
-                    .map_or(1, |cell| cell.width().clamp(1, 2))
+                    .map_or(1, |cell| cell.width().clamp(1, 2)),
             };
             let sprite = glyphs.cursor_sprite(shape, width as u8)?;
             let instance =
@@ -927,7 +954,7 @@ impl MetalScene {
             Some((shape, instance))
         });
         if let Some((shape, instance)) = cursor_sprite {
-            if shape != CursorSprite::Bar {
+            if !shape.over_glyphs() {
                 self.text.push(grid_row, instance);
             }
         }
@@ -1000,8 +1027,10 @@ impl MetalScene {
                 CellText::new(col as u16, fg).with_glyph(&shaped.glyph.slot, shaped.glyph.offset);
             self.text.push(grid_row, instance);
         }
-        if let Some((CursorSprite::Bar, instance)) = cursor_sprite {
-            self.text.push(grid_row, instance);
+        if let Some((shape, instance)) = cursor_sprite {
+            if shape.over_glyphs() {
+                self.text.push(grid_row, instance);
+            }
         }
         // The selection tints its whole span, blank columns included.
         for col in built.selection.start..built.selection.end.min(cols as usize) {
@@ -1436,6 +1465,8 @@ mod tests {
                     Some((CursorSprite::HollowBlock, palette.cursor_border)),
                     Some((CursorSprite::Bar, palette.cursor_bg)),
                     Some((CursorSprite::Underline, palette.cursor_bg)),
+                    Some((CursorSprite::Lock { over: false }, palette.cursor_bg)),
+                    Some((CursorSprite::Lock { over: true }, palette.cursor_bg)),
                 ]),
                 hover,
                 // Blink levels moving between frames, so rows of blinking
@@ -1451,6 +1482,7 @@ mod tests {
                     color: palette.cursor_bg,
                     fg: *rng.pick(&[palette.cursor_fg, palette.cursor_bg]),
                     under: palette.cursor_bg,
+                    lock: rng.below(3) == 0,
                 }),
                 // A configuration change (a new generation) may set a minimum
                 // contrast.
@@ -1796,7 +1828,9 @@ mod tests {
     /// ft-yccm0.4.7.3: every cursor but a focused block is the WebGpu
     /// renderer's cursor sprite in its color, as wide as the cell under it.
     /// A hollow block or an underline sits under the row's glyphs, a bar
-    /// over them. A new cursor shape rebuilds the cursor's row only.
+    /// over them. The password lock is one glyph whatever the cell's width,
+    /// under the glyphs, or over them in a bar's place. A new cursor shape
+    /// rebuilds the cursor's row only.
     #[test]
     fn cursor_sprites_draw_in_webgpu_layer_order() {
         let palette = ColorPalette::default();
@@ -1830,10 +1864,12 @@ mod tests {
         };
         let (_, plain) = frame(None, &mut glyphs);
         assert_eq!(plain.len(), 3, "a, b and the wide character");
-        for (shape, first) in [
-            (CursorSprite::HollowBlock, true),
-            (CursorSprite::Underline, true),
-            (CursorSprite::Bar, false),
+        for (shape, first, width) in [
+            (CursorSprite::HollowBlock, true, 2),
+            (CursorSprite::Underline, true, 2),
+            (CursorSprite::Bar, false, 2),
+            (CursorSprite::Lock { over: false }, true, 1),
+            (CursorSprite::Lock { over: true }, false, 1),
         ] {
             let (update, row) = frame(Some((shape, palette.cursor_border)), &mut glyphs);
             assert_eq!(
@@ -1841,7 +1877,7 @@ mod tests {
                 (false, 1),
                 "{shape:?}: only the cursor's row"
             );
-            let slot = glyphs.cursors[&(shape, 2)].slot;
+            let slot = glyphs.cursors[&(shape, width)].slot;
             let sprite = (
                 2,
                 [
@@ -2373,7 +2409,8 @@ mod tests {
     /// a solid compose cursor as wide as the composition, with its text in
     /// the cursor foreground. The terminal hiding its cursor does not hide
     /// a compose cursor. Without a composition (the leader key) the cursor
-    /// covers its cell. Only the cursor's row is rebuilt as it changes.
+    /// covers its cell. At a password prompt the lock glyph replaces the
+    /// solid block. Only the cursor's row is rebuilt as it changes.
     #[test]
     fn a_composition_is_overlaid_at_the_cursor_under_a_solid_compose_cursor() {
         let palette = ColorPalette::default();
@@ -2385,15 +2422,17 @@ mod tests {
         let mut glyphs = SyntheticGlyphs::default();
         let (fg, compose_fg) = (rgba8(palette.foreground), [10, 20, 30, 255]);
         let compose_color = SrgbaTuple(0.9, 0.3, 0.6, 1.0);
-        let composing = |text| SceneStyle {
+        let compose = |text, lock| SceneStyle {
             compose: Some(Compose {
                 text,
                 color: compose_color,
                 fg: SrgbaTuple(10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0, 1.0),
                 under: palette.cursor_bg,
+                lock,
             }),
             ..plain_style(&palette)
         };
+        let composing = |text| compose(text, false);
         // Cursor sprites have the made-up slots from 8192 on, and line
         // sprites those from 4096.
         let kinds = |scene: &MetalScene| -> Vec<(char, u16, [u8; 4])> {
@@ -2460,6 +2499,41 @@ mod tests {
         assert!(row.contains(&('g', 2, compose_fg)));
         assert!(row.contains(&('g', 3, fg)));
         assert!(glyphs.cursors.contains_key(&(CursorSprite::Solid, 1)));
+
+        // While the pane reports password input, the lock glyph takes the
+        // solid block's place, in its color and layer, one glyph wide; the
+        // composition and its colors are as before.
+        let update = scene.update(
+            &mirror,
+            &compose(Some("日本"), true),
+            &no_selection,
+            &mut glyphs,
+        );
+        assert_eq!((update.full, update.rows_rebuilt), (false, 1));
+        let lock = glyphs.cursors[&(CursorSprite::Lock { over: false }, 1)].slot;
+        let row: Vec<(u16, [u16; 2], [u8; 4])> = scene
+            .text()
+            .row(0)
+            .map(|instance| (instance.col(), instance.atlas_origin(), instance.fg()))
+            .collect();
+        let lock_origin = [
+            u16::try_from(lock.x).unwrap(),
+            u16::try_from(lock.y).unwrap(),
+        ];
+        assert_eq!(row[6], (2, lock_origin, rgba8(compose_color)));
+        assert_eq!(
+            kinds(&scene)[7..],
+            [
+                ('g', 0, fg),
+                ('g', 1, fg),
+                ('g', 2, compose_fg),
+                ('g', 4, compose_fg),
+                ('g', 6, fg),
+                ('g', 7, fg),
+            ]
+        );
+        let wide_lock = (CursorSprite::Lock { over: false }, 4);
+        assert!(!glyphs.cursors.contains_key(&wide_lock));
 
         // No compose state: the hidden cursor draws nothing, and the row is
         // as the terminal has it.

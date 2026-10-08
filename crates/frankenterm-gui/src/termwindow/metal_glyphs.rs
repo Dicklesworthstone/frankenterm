@@ -74,6 +74,7 @@ use termwiz::cell::VerticalAlign;
 use termwiz::cellcluster::CellCluster;
 use termwiz::surface::CursorShape;
 use wezterm_term::color::SrgbaTuple;
+use wezterm_term::{CellAttributes, Line};
 use window::bitmaps::{BitmapImage, Image};
 
 /// Notifies the window that a fallback font resolved, from whichever thread
@@ -133,6 +134,9 @@ pub(crate) struct FontGlyphs {
     /// share WebGpu's cache entries.
     style_addresses: HashMap<usize, u32>,
     style_ids: HashMap<TextStyle, u32>,
+    /// The default font style, which the password lock is shaped in, kept
+    /// where its address stays put while the address map holds it.
+    lock_style: Rc<TextStyle>,
     /// Shaper output for clusters shaped without paragraph context.
     shapes: LfuCache<(u32, String), Rc<Vec<GlyphInfo>>>,
     /// Laid-out font glyphs, `None` for inkless ones.
@@ -202,6 +206,7 @@ impl FontGlyphs {
             style_foregrounds,
             style_addresses: HashMap::new(),
             style_ids: HashMap::new(),
+            lock_style: Rc::new(TextStyle::default()),
             shapes,
             glyphs: HashMap::new(),
             blocks: HashMap::new(),
@@ -342,17 +347,31 @@ impl FontGlyphs {
     /// Places the WebGpu renderer's cursor sprite for `shape`
     /// ([`GlyphCache::cursor_sprite_image`], with the configured
     /// `cursor_thickness`): a hollow block is its unfocused block outline,
-    /// and a solid one its default shape's fill (the compose cursor).
+    /// and a solid one its default shape's fill (the compose cursor). The
+    /// lock is its lock glyph ([`Self::place_lock`]).
     fn place_cursor(&mut self, shape: CursorSprite, width_cells: u8) -> Option<PlacedGlyph> {
         let shape = match shape {
             CursorSprite::HollowBlock => CursorShape::SteadyBlock,
             CursorSprite::Bar => CursorShape::SteadyBar,
             CursorSprite::Underline => CursorShape::SteadyUnderline,
             CursorSprite::Solid => CursorShape::Default,
+            CursorSprite::Lock { .. } => return self.place_lock(),
         };
         let image =
             GlyphCache::cursor_sprite_image(&self.fonts, Some(shape), &self.metrics, width_cells);
         self.place_sprite(&image, "a cursor sprite")
+    }
+
+    /// The WebGpu renderer's password lock (`resolve_lock_glyph`): the first
+    /// glyph U+F023 shapes to in the default font style, placed as a
+    /// baseline glyph of the cursor's cell. Its quad takes the glyph's own
+    /// size, as an inked glyph's layout is always at scale 1.
+    fn place_lock(&mut self) -> Option<PlacedGlyph> {
+        let line = Line::from_text("\u{f023}", &CellAttributes::blank(), 0, None);
+        let cluster = line.cluster(None).into_iter().next()?;
+        let style = Rc::clone(&self.lock_style);
+        let laid = self.shape(&style, &cluster, None).first()?.laid?;
+        Some(self.place(laid, VerticalAlign::BaseLine).0)
     }
 
     /// The glyph cache's bitmap for custom block glyph `block`, placed at
@@ -656,5 +675,38 @@ impl GlyphSource for FontGlyphs {
         let placed = self.place_cursor(shape, width_cells)?;
         self.cursors.insert((shape, width_cells), placed);
         Some(placed)
+    }
+}
+
+/// Native macOS tests: real fonts, shaped and placed in the real Metal
+/// renderer's atlases (`MetalRenderer::offscreen`).
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    /// ft-yccm0.4.7.3: the password lock is the glyph U+F023 shapes to in
+    /// the default font style, placed as text in that style places it in a
+    /// cell: with the default font configured, the very glyph and offset a
+    /// cell holding U+F023 draws, in either layer.
+    #[test]
+    fn the_password_lock_is_the_glyph_its_text_draws_in_the_default_style() {
+        config::use_test_configuration();
+        let config = config::configuration();
+        assert_eq!(config.font, TextStyle::default(), "the default font");
+        let fonts = Rc::new(FontConfiguration::new(Some(config.clone()), 144).unwrap());
+        let metrics = RenderMetrics::new(&fonts).unwrap();
+        let renderer = Rc::new(MetalRenderer::offscreen().expect("this Mac runs Metal"));
+        let mut glyphs = FontGlyphs::new(fonts, config, renderer, &metrics);
+
+        let lock = glyphs
+            .cursor_sprite(CursorSprite::Lock { over: false }, 1)
+            .expect("the lock glyph is inked");
+        let over = glyphs.cursor_sprite(CursorSprite::Lock { over: true }, 1);
+        assert_eq!(over, Some(lock));
+
+        let line = Line::from_text("\u{f023}", &CellAttributes::blank(), 0, None);
+        let shaped = glyphs.shape_row(&line.cluster(None));
+        assert_eq!(shaped.len(), 1, "one glyph");
+        assert_eq!((shaped[0].cell, shaped[0].glyph), (0, lock));
     }
 }

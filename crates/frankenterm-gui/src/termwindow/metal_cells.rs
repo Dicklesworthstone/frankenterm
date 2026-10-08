@@ -244,6 +244,9 @@ pub(crate) struct MetalFrameInputs {
     pub(crate) fallback_ready: Option<FallbackReady>,
     /// The level a render snapshot pins every blink at.
     pub(crate) blink_pin: Option<f32>,
+    /// The pane reports password input (`detect_password_input`): its
+    /// cursor is drawn as the lock glyph.
+    pub(crate) password_input: bool,
 }
 
 impl MetalFrame {
@@ -389,6 +392,7 @@ impl MetalFrame {
             color,
             fg: palette.cursor_fg,
             under: palette.cursor_bg,
+            lock: inputs.password_input,
         });
         // Any other focused cursor blinks as WebGpu's `blinking` does.
         let cursor_blink = (solid.is_none()
@@ -410,6 +414,16 @@ impl MetalFrame {
         if let Some((level, _)) = cursor_blink {
             cursor_color = mix_linear(cursor_color, attr_bg, level);
         }
+        // At a password prompt WebGpu draws its lock glyph in place of the
+        // cursor's sprite, in its color and layer, a focused block's fill
+        // included; the text under a block keeps the block's colors.
+        let sprite = if inputs.password_input {
+            Some(CursorSprite::Lock {
+                over: cursor_sprite(metal_shape) == Some(CursorSprite::Bar),
+            })
+        } else {
+            cursor_sprite(metal_shape)
+        };
         let selection = &inputs.selection;
         let selected = |stable| {
             selection.as_ref().map_or(0..0, |(range, rectangular)| {
@@ -429,7 +443,7 @@ impl MetalFrame {
                 None
             },
             cursor_bg: block_cursor.then_some(palette.cursor_bg),
-            cursor_sprite: cursor_sprite(metal_shape).map(|sprite| (sprite, cursor_color)),
+            cursor_sprite: sprite.map(|sprite| (sprite, cursor_color)),
             hover: inputs.hover.as_ref(),
             blink: phase.levels,
             compose: solid,
@@ -464,7 +478,7 @@ impl MetalFrame {
                     .map_or(1, |cell| cell.width().clamp(1, 2) as u32);
                 CursorUniform {
                     // A cursor the scene draws as a sprite is not drawn here.
-                    shape: if solid.is_some() || cursor_sprite(metal_shape).is_some() {
+                    shape: if solid.is_some() || sprite.is_some() {
                         MetalCursorShape::Hidden
                     } else {
                         metal_shape

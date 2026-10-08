@@ -36,7 +36,7 @@ use frankenterm_font::FontConfiguration;
 use frankenterm_renderer_metal::{
     ClearColor, MetalRenderer, PaneScene, PixelRect, SolidRect, UiLayer, WindowFrame,
 };
-use mux::pane::PaneId;
+use mux::pane::{Pane, PaneId};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -191,6 +191,18 @@ fn bell_background(
             b1 + (blue - b1) * intensity,
             a1,
         )
+    }
+}
+
+/// Whether `pane` reports password input (its tty's echo off in canonical
+/// mode), as the WebGpu renderer reads its metadata for
+/// `detect_password_input`.
+fn reports_password_input(pane: &dyn Pane) -> bool {
+    use wezterm_dynamic::Value;
+    let key = Value::String("password_input".to_string());
+    match pane.get_metadata() {
+        Value::Object(metadata) => matches!(metadata.get(&key), Some(Value::Bool(true))),
+        _ => false,
     }
 }
 
@@ -386,6 +398,8 @@ impl TermWindow {
                     ),
                     fallback_ready: Some(self.metal_fallback_ready()),
                     blink_pin: self.snapshot_blink_level(),
+                    password_input: self.config.detect_password_input
+                        && reports_password_input(&*pos.pane),
                     pane: Some(pos.pane),
                 },
                 rect: layout.pane_rect(pos.left, pos.top, pos.width, pos.height),
