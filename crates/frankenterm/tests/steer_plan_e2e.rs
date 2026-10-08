@@ -679,6 +679,7 @@ fn steer_run_cli_only_backend_fails_closed_and_uses_workspace_global_ledger() {
         attachment["receipt_id"].as_str(),
         Some(receipt.receipt_id.as_str())
     );
+    assert_eq!(attachment["attempt"], 1, "first run of this receipt");
     assert_eq!(
         attachment["tx_contract_hash"].as_str(),
         Some(tx_hash.as_str())
