@@ -324,6 +324,7 @@ PASS esctest/decawm/cr-cancels-the-deferred-wrap
 PASS esctest/decawm/wrap-at-the-bottom-scrolls
 PASS esctest/decawm/wide-char-on-the-last-column-wraps-whole
 PASS esctest/decawm/off-drops-a-wide-char-on-the-last-column
+PASS esctest/decawm/off-a-later-mark-joins-the-last-columns-char
 PASS esctest/declrmm/wide-char-on-the-right-margin-wraps-to-the-left-margin
 PASS esctest/declrmm/text-wraps-at-the-right-margin
 PASS esctest/dectcem/hides-and-shows-the-cursor

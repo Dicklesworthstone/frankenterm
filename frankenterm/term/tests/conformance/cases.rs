@@ -611,6 +611,16 @@ fn margins_and_modes() -> Vec<EscCase> {
             },
         ),
         small(
+            "decawm/off-a-later-mark-joins-the-last-columns-char",
+            "Ghostty Terminal.zig print: without wraparound, the last column's text takes a continuation",
+            |t| {
+                t.feed("\x1b[?7l012345678e");
+                t.feed("\u{301}");
+                t.rows(1, &["012345678e\u{301}", ""])?;
+                t.cursor(1, 10)
+            },
+        ),
+        small(
             "declrmm/wide-char-on-the-right-margin-wraps-to-the-left-margin",
             "xterm charproc.c dotext: the wrap goes to the left margin",
             |t| {

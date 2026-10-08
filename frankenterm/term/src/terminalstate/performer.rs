@@ -416,20 +416,20 @@ impl<'a> Performer<'a> {
     /// in ZWJ, in which case no multi-byte grapheme can continue it. Widths
     /// never exceed two, so writing a cell invalidates any wide cell it
     /// overlapped; the remembered cell is therefore visible, and with the
-    /// cursor just past it (or on it with a wrap pending) it is exactly the
-    /// candidate the row walk would pick.
+    /// cursor just past it (or on it, when a continuation joins the cursor's
+    /// cell) it is exactly the candidate the row walk would pick.
     fn last_printed_rules_out_zwj_tail(
         &self,
         cursor_x: usize,
         cursor_y: VisibleRowIndex,
-        pending_wrap: bool,
+        on_cursor_cell: bool,
     ) -> bool {
         #[cfg(test)]
         if FORCE_RECLUSTER_ROW_WALK.with(std::cell::Cell::get) {
             return false;
         }
         self.last_printed.is_some_and(|cell| {
-            let beside_cursor = if pending_wrap {
+            let beside_cursor = if on_cursor_cell {
                 cell.idx == cursor_x
             } else {
                 cell.idx.saturating_add(cell.width) == cursor_x
@@ -438,19 +438,61 @@ impl<'a> Performer<'a> {
         })
     }
 
+    /// Whether, with autowrap off, the cursor sits on a grapheme that ends at
+    /// the right limit (ft-0b8ux): the one printed on the last column, which a
+    /// continuation arriving later (a combining mark or VS16 in the next read)
+    /// belongs to although no wrap is pending. Ghostty decides it so
+    /// (Terminal.zig `print`, the grapheme's previous cell, "If we do not have
+    /// wraparound"): on the last column, the cursor's own cell when it holds
+    /// text, else the cell left of it. FrankenTerm leaves the cursor on a wide
+    /// grapheme's first column where Ghostty moves it to the spacer tail, so a
+    /// wide grapheme ending at the limit counts too. A row keeps no trailing
+    /// default blanks, so a cell there holds text (or a colored blank).
+    fn cursor_cell_ends_at_the_limit(
+        &mut self,
+        cursor_x: usize,
+        cursor_y: VisibleRowIndex,
+    ) -> bool {
+        if self.dec_auto_wrap {
+            return false;
+        }
+        // Ghostty's right limit: the right margin, or the screen's edge for a
+        // cursor right of the margin.
+        let margin = self.left_and_right_margins.end;
+        let limit = if cursor_x >= margin {
+            self.screen().physical_cols
+        } else {
+            margin
+        };
+        if cursor_x.saturating_add(2) < limit {
+            return false;
+        }
+        let screen = self.screen_mut();
+        let phys = screen.phys_row(cursor_y);
+        screen.with_merge_candidate(phys, cursor_x, true, |candidate| {
+            candidate.is_some_and(|cell| {
+                cell.idx == cursor_x && cell.idx.saturating_add(cell.width) == limit
+            })
+        })
+    }
+
     fn recluster_at_cursor(&mut self, suffix: &str, require_prior_trailing_zwj: bool) -> bool {
         let cursor_x = self.cursor.x;
         let cursor_y = self.cursor.y;
         let seqno = self.seqno;
-        let pending_wrap = self.wrap_next;
         let dec_auto_wrap = self.dec_auto_wrap;
         let right_margin = self.left_and_right_margins.end;
+        // A continuation joins the cursor's own cell when a wrap is pending,
+        // or without autowrap when that cell is the grapheme printed on the
+        // last column (ft-0b8ux); otherwise the cell left of the cursor.
+        let on_cursor_cell =
+            self.wrap_next || self.cursor_cell_ends_at_the_limit(cursor_x, cursor_y);
 
         // ft-yccm0.2.14: once a ZWJ-tail cell has existed, `print` asks about
         // every multi-byte grapheme. Answer from the cell just printed instead
         // of walking the row from column 0 whenever that settles it.
         if require_prior_trailing_zwj
-            && self.last_printed_rules_out_zwj_tail(cursor_x, cursor_y, pending_wrap)
+            && self.last_printed_rules_out_zwj_tail(cursor_x, cursor_y, on_cursor_cell)
         {
             return false;
         }
@@ -468,10 +510,11 @@ impl<'a> Performer<'a> {
         let merge = {
             let screen = self.screen_mut();
             let phys = screen.phys_row(cursor_y);
-            screen.with_merge_candidate(phys, cursor_x, pending_wrap, |candidate| {
+            screen.with_merge_candidate(phys, cursor_x, on_cursor_cell, |candidate| {
                 let cell = candidate?;
                 let old_end = cell.idx.saturating_add(cell.width);
-                let joins_at_cursor = old_end == cursor_x || (pending_wrap && cell.idx == cursor_x);
+                let joins_at_cursor =
+                    old_end == cursor_x || (on_cursor_cell && cell.idx == cursor_x);
                 if !joins_at_cursor {
                     return None;
                 }
@@ -1056,11 +1099,12 @@ impl<'a> Performer<'a> {
     /// the parser ignored dispatches nothing, so nothing flushed. Had the run
     /// stayed in `print`, `Graphemes` would have segmented it together with
     /// `g`, so `g` joins the run's last cell when the two form one grapheme,
-    /// exactly as that segmentation prints it. `recluster_at_cursor` cannot
-    /// stand in: without autowrap the cursor stays on the last column, so it
-    /// would pick the cell before (ft-yccm0.3.2.2; found by the M.7 campaign,
-    /// seed 20349669). Returns false, changing nothing, when they do not
-    /// form one grapheme.
+    /// exactly as that segmentation prints it, NFC normalization included,
+    /// which `recluster_at_cursor` does not apply. (It also picked the cell
+    /// before the run's last one when autowrap was off and the cursor stayed
+    /// on the last column: ft-yccm0.3.2.2, found by the M.7 campaign, seed
+    /// 20349669; ft-0b8ux has since fixed that.) Returns false, changing
+    /// nothing, when they do not form one grapheme.
     fn merge_into_junction(&mut self, cell: PrintedCell, g: &str, seqno: usize) -> bool {
         let right_margin = self.left_and_right_margins.end;
         let dec_auto_wrap = self.dec_auto_wrap;

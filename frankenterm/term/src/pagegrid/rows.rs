@@ -860,6 +860,16 @@ mod tests {
                     .to_vec(),
             ),
             (
+                // ft-0b8ux: without autowrap, continuations of the last
+                // column's grapheme (split across reads by the 7-byte
+                // chunks) join it; a CUP onto the last column's text, and
+                // onto the column before it, picks the cell as Ghostty does.
+                "continuations_at_the_right_margin_without_autowrap",
+                "\x1b[?7l\x1b[1;10He\u{301}\x1b[2;9H\u{1f468}\u{200d}\u{1f469}\x1b[3;10HZ\x1b[3;10H\u{301}\x1b[4;8Hxy\x1b[4;9H\u{301}"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            (
                 "graphemes",
                 "e\u{301} \u{4e2d}\u{6587} \u{1f468}\u{200d}\u{1f469} \u{2764}\u{fe0f} ab\u{301}"
                     .as_bytes()

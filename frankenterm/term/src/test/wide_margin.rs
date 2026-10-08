@@ -20,6 +20,13 @@
 //! not part of the row's text. So copying joins the next row's text without
 //! a space, and reflow rewraps it like the underfull rows reflow leaves
 //! before a wide grapheme itself.
+//!
+//! Without autowrap, a continuation arriving in a later read (a combining
+//! mark, VS16, a ZWJ sequence's next part) joins the grapheme printed on the
+//! last column, though no wrap is pending (ft-0b8ux). Ghostty decides the
+//! cell so (`print`, the grapheme's previous cell, "If we do not have
+//! wraparound"): on the last column, the cursor's own cell when it holds
+//! text, else the one left of it.
 
 use super::*;
 use k9::assert_equal as assert_eq;
@@ -125,10 +132,9 @@ fn without_autowrap_the_wide_char_is_not_printed() {
 /// A variation selector that widens the last column's narrow cell wraps it
 /// whole too, as Ghostty's VS16 path does. That holds whether U+2764 and VS16
 /// arrive in one read (one wide grapheme) or in two, as a PTY can split them.
-/// Without autowrap the selector is dropped and the cell stays narrow, as
-/// Ghostty prints the base and then drops the selector. That is checked for
-/// one read only: split, the selector meets ft-0b8ux (it joins the cell
-/// before the cursor), a separate defect.
+/// Without autowrap the selector is dropped and the cell stays narrow, both
+/// ways, as Ghostty prints the base and then drops the selector. Split, the
+/// selector meets the heart as the cursor's own cell (ft-0b8ux).
 #[test]
 fn a_cell_widened_on_the_last_column_wraps_whole() {
     let heart = "\u{2764}";
@@ -151,9 +157,6 @@ fn a_cell_widened_on_the_last_column_wraps_whole() {
         assert!(wrapped(&term, 0));
         assert_eq!(cells(&term, 1)[0], (0, wide_heart.to_string(), 2));
 
-        if split {
-            continue;
-        }
         let mut term = TestTerm::new(4, COLS, 0);
         term.print(UNICODE_14);
         term.print("\x1b[?7l");
@@ -244,4 +247,73 @@ fn reflow_over_the_spacer_keeps_every_cell_once() {
     assert_visible_contents(&term, file!(), line!(), &[&a_row(), &second, "", ""]);
     assert!(wrapped(&term, 0));
     cursor_at(&term, 3, 1, "after B, wrapped again");
+}
+
+/// ft-0b8ux: without autowrap, a combining mark in the read after the last
+/// column's "e" joins that "e", the cursor's own cell, not the "A" left of
+/// it. An SGR between them changes nothing.
+#[test]
+fn without_autowrap_a_later_mark_joins_the_last_columns_char() {
+    for between in ["", "\x1b[31m"] {
+        let mut term = TestTerm::new(4, COLS, 0);
+        term.print("\x1b[?7l");
+        term.print(format!("{}e", a_row()));
+        term.print(between);
+        term.print("\u{301}");
+        cursor_at(&term, COLS - 1, 0, "on the last column");
+        let first = format!("{}e\u{301}", a_row());
+        assert_visible_contents(&term, file!(), line!(), &[&first, "", "", ""]);
+        let row = cells(&term, 0);
+        assert_eq!(row[COLS - 2], (COLS - 2, "A".to_string(), 1));
+        assert_eq!(row[COLS - 1], (COLS - 1, "e\u{301}".to_string(), 1));
+    }
+}
+
+/// ft-0b8ux: without autowrap, a wide grapheme ending on the last column
+/// keeps the cursor on its first column; the next part of its ZWJ sequence,
+/// in the next read, joins it there instead of overwriting it.
+#[test]
+fn without_autowrap_a_later_zwj_part_joins_the_wide_last_grapheme() {
+    let man = "\u{1f468}\u{200d}";
+    let family = "\u{1f468}\u{200d}\u{1f469}";
+    let mut term = TestTerm::new(4, COLS, 0);
+    term.print("\x1b[?7l");
+    term.print(format!("{}{man}", "A".repeat(COLS - 2)));
+    cursor_at(&term, COLS - 2, 0, "on the wide grapheme");
+    term.print("\u{1f469}");
+    cursor_at(&term, COLS - 2, 0, "still on it");
+    let row = cells(&term, 0);
+    assert_eq!(row[COLS - 3], (COLS - 3, "A".to_string(), 1));
+    assert_eq!(row[COLS - 2], (COLS - 2, family.to_string(), 2));
+}
+
+/// ft-0b8ux: the cell decides, as in Ghostty, not how the cursor got there.
+/// Put on the last column's text by CUP, the cursor's cell takes the mark;
+/// on an empty last column the mark goes to the cell left of it, as it does
+/// one column further left, where a cursor's own cell never takes it.
+#[test]
+fn without_autowrap_the_last_columns_text_takes_a_mark() {
+    let mut term = TestTerm::new(4, COLS, 0);
+    term.print("\x1b[?7l");
+    term.print(format!("{}Z", a_row()));
+    term.print(format!("\x1b[1;{COLS}H"));
+    term.print("\u{301}");
+    let row = cells(&term, 0);
+    assert_eq!(row[COLS - 1], (COLS - 1, "Z\u{301}".to_string(), 1));
+
+    let mut term = TestTerm::new(4, COLS, 0);
+    term.print("\x1b[?7l");
+    term.print(format!("{}\x1b[1;{COLS}H", a_row()));
+    term.print("\u{301}");
+    let row = cells(&term, 0);
+    assert_eq!(row.len(), COLS - 1, "nothing on the last column");
+    assert_eq!(row[COLS - 2], (COLS - 2, "A\u{301}".to_string(), 1));
+
+    let mut term = TestTerm::new(4, COLS, 0);
+    term.print("\x1b[?7l");
+    term.print(format!("{}Z\x1b[1;{}H", "A".repeat(COLS - 2), COLS - 1));
+    term.print("\u{301}");
+    let row = cells(&term, 0);
+    assert_eq!(row[COLS - 3], (COLS - 3, "A\u{301}".to_string(), 1));
+    assert_eq!(row[COLS - 2], (COLS - 2, "Z".to_string(), 1));
 }
