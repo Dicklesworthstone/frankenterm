@@ -1452,10 +1452,25 @@ impl Line {
         attr: CellAttributes,
         seqno: SequenceNo,
     ) {
+        self.set_cell_grapheme_arm(idx, text, width, attr, seqno, Self::grapheme_write_direct());
+    }
+
+    /// `set_cell_grapheme`, writing a vector row's cell directly when
+    /// `direct` (ft-yccm0.3.2.6), or through `set_cell` as before. Both
+    /// leave the same line.
+    fn set_cell_grapheme_arm(
+        &mut self,
+        idx: usize,
+        text: &str,
+        width: usize,
+        attr: CellAttributes,
+        seqno: SequenceNo,
+        direct: bool,
+    ) {
         let width = normalize_cell_width(width);
-        if checked_materialized_end(idx, width).is_none() {
+        let Some(end_idx) = checked_materialized_end(idx, width) else {
             return;
-        }
+        };
 
         if attr.hyperlink().is_some() {
             self.bits |= LineBits::HAS_HYPERLINK;
@@ -1486,7 +1501,38 @@ impl Line {
             }
         }
 
-        self.set_cell(idx, Cell::new_grapheme_with_width(text, width, attr), seqno);
+        let cell = Cell::new_grapheme_with_width(text, width, attr);
+        if direct && matches!(self.cells, CellStorage::V(_)) {
+            // `set_cell_impl` without the steps taken above (the width, the
+            // bounds and the hyperlink bit) or that a vector row skips (the
+            // clustered append). The cell's width is `width`: it was built
+            // with it.
+            self.invalidate_implicit_hyperlinks(seqno);
+            self.invalidate_zones();
+            self.update_last_change_seqno(seqno);
+            if let CellStorage::V(cells) = &mut self.cells {
+                cells.write_grapheme(idx, cell, width, end_idx);
+            }
+            return;
+        }
+        self.set_cell(idx, cell, seqno);
+    }
+
+    /// `FT_LINE_GRAPHEME_DIRECT=0` sends `set_cell_grapheme`'s vector-row
+    /// writes through `set_cell`, as before ft-yccm0.3.2.6: the A/B arm and
+    /// a rollback. `FT_LINE_WRITE_SPLIT=1` does too. Both arms leave the
+    /// same line. Resolved once per process.
+    fn grapheme_write_direct() -> bool {
+        #[cfg(feature = "std")]
+        {
+            static DIRECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *DIRECT.get_or_init(|| {
+                !Self::write_split()
+                    && std::env::var_os("FT_LINE_GRAPHEME_DIRECT").is_none_or(|v| v != "0")
+            })
+        }
+        #[cfg(not(feature = "std"))]
+        true
     }
 
     /// Assign a contiguous printable width-1 ASCII run when it can be
@@ -4808,6 +4854,125 @@ mod tests {
         }
     }
 
+    /// ft-yccm0.3.2.6: `set_cell_grapheme` writing a vector row's cell
+    /// directly leaves the line, its sequence number, bits and zones that
+    /// writing it through `set_cell` leaves. Rows start as styled blanks,
+    /// text with wide and combining cells, clustered rows, deferred wrap
+    /// rows, rows with implicit links and rows with image placements.
+    /// Random graphemes (control bytes, CR LF and empty text among them)
+    /// with random widths, colours and links land on random columns: past
+    /// the end, on wide heads and their placeholders, and over each other.
+    #[test]
+    fn direct_grapheme_writes_match_writes_through_set_cell() {
+        use crate::hyperlink::Hyperlink;
+        use frankenterm_cell::color::ColorAttribute;
+        let texts = [
+            "a",
+            " ",
+            "\u{4e2d}",
+            "\u{1f600}",
+            "e\u{301}",
+            "\u{7}",
+            "\r\n",
+            "",
+            "\u{1f468}\u{200d}\u{1f469}",
+        ];
+        let rules = [Rule::new(r"https://[a-z.]+", "$0").unwrap()];
+        let link = Arc::new(Hyperlink::new("https://explicit.example"));
+        let mut seed = 0x2026_1008_u64;
+        let mut next = move |bound: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % bound
+        };
+        for case in 0..3000 {
+            let mut pen = CellAttributes::default();
+            pen.set_background(ColorAttribute::PaletteIndex(next(16) as u8));
+            let start = match case % 6 {
+                0 => Line::with_width_and_cell(10, Cell::blank_with_attrs(pen.clone()), 1),
+                1 => Line::from_text("ab\u{4e2d}e\u{301}\u{1f680} xyz", &pen, 1, None),
+                2 => {
+                    let mut line = Line::from_text("plain \u{4e2d} row", &pen, 1, None);
+                    line.compress_for_scrollback();
+                    line
+                }
+                3 => Line::from_text("ab\u{4e2d}e\u{301}\u{1f680} xyz wrapped", &pen, 1, None)
+                    .plan_wrap_with_width_prefix_scratch(
+                        7,
+                        MonospaceKpCostModel::terminal_default(),
+                        &mut LineWrapWidthPrefixScratch::default(),
+                    )
+                    .deferred_rows(0..1, 1)
+                    .pop()
+                    .unwrap(),
+                4 => {
+                    let mut line = Line::from_text("go https://a.b now", &pen, 1, None);
+                    Line::apply_hyperlink_rules(&rules, &mut [&mut line]);
+                    line
+                }
+                _ => {
+                    #[cfg_attr(not(feature = "use_image"), allow(unused_mut))]
+                    let mut line = Line::with_width_and_cell(10, Cell::blank_with_attrs(pen), 1);
+                    #[cfg(feature = "use_image")]
+                    {
+                        use frankenterm_cell::image::{
+                            ImageCell, ImageData, ImageDataType, TextureCoordinate,
+                        };
+                        let image = Arc::new(ImageData::with_data(
+                            ImageDataType::new_single_frame(1, 1, vec![1, 2, 3, 4]),
+                        ));
+                        for column in 0..10 {
+                            let placement = (column % 3 != 0).then_some(column as u32);
+                            let mut attrs = CellAttributes::default();
+                            attrs.set_image(Box::new(ImageCell::with_z_index(
+                                TextureCoordinate::new_f32(0.0, 0.0),
+                                TextureCoordinate::new_f32(1.0, 1.0),
+                                Arc::clone(&image),
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                Some(7),
+                                placement,
+                            )));
+                            line.set_cell(column, Cell::new('i', attrs), 1);
+                        }
+                    }
+                    line
+                }
+            };
+            let mut direct = start.clone();
+            let mut through_set_cell = start;
+            for step in 0..10 {
+                let text = texts[next(texts.len())];
+                let width = next(4);
+                let mut attrs = CellAttributes::default();
+                attrs.set_foreground(ColorAttribute::PaletteIndex(next(256) as u8));
+                if next(5) == 0 {
+                    attrs.set_hyperlink(Some(Arc::clone(&link)));
+                }
+                let idx = next(16);
+                let seqno = 2 + step;
+                direct.set_cell_grapheme_arm(idx, text, width, attrs.clone(), seqno, true);
+                through_set_cell.set_cell_grapheme_arm(idx, text, width, attrs, seqno, false);
+                assert!(
+                    direct == through_set_cell
+                        && direct.zones == through_set_cell.zones
+                        && direct.has_clustered_storage()
+                            == through_set_cell.has_clustered_storage(),
+                    "case {} step {}: {:?} width {} at {}",
+                    case,
+                    step,
+                    text,
+                    width,
+                    idx
+                );
+            }
+        }
+    }
+
     /// ft-yccm0.3.3.4: a lone control byte or CR LF appended at the start of
     /// a clustered row reads back as the blank a cell built from it keeps,
     /// before and after the row becomes a vector, like any other text.
@@ -4941,6 +5106,77 @@ mod tests {
             column += width;
         }
         row
+    }
+
+    /// ft-yccm0.3.2.6: what writing a T0 cell costs, as the performer writes
+    /// it: `Line::set_cell_grapheme` of a wide pool emoji with its own
+    /// palette colours, left to right across fresh 120-column vector rows.
+    /// Rows start as blanks with a palette background, as a recycled row
+    /// cleared under a coloured pen does. Text and attributes are drawn
+    /// before timing. Both arms of `set_cell_grapheme_arm` (direct, and
+    /// through `set_cell`) alternate; best of 5 rounds (`FT_T0_WRITE_ROUNDS`)
+    /// over 2,000 rows each. `FT_T0_WRITE_ARM=direct` or `set_cell` times
+    /// one arm only, for a profiler. A measurement, not a gate:
+    /// cargo test --profile release-perf -p frankenterm-surface --features std --lib -- --ignored t0_cell_write_cost --nocapture
+    #[test]
+    #[ignore = "a throughput measurement; run it in release"]
+    fn t0_cell_write_cost() {
+        use frankenterm_cell::color::ColorAttribute;
+        let mut seed = 0x0007_0e11_u64;
+        let mut next = move |bound: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % bound
+        };
+        let cells: Vec<(String, CellAttributes)> = (0..2000 * 60)
+            .map(|_| {
+                let mut attrs = CellAttributes::default();
+                attrs.set_foreground(ColorAttribute::PaletteIndex(next(256) as u8));
+                attrs.set_background(ColorAttribute::PaletteIndex(next(256) as u8));
+                let ch = char::from_u32(0x1F600 + next(80) as u32).unwrap();
+                (ch.to_string(), attrs)
+            })
+            .collect();
+        let mut blank = CellAttributes::default();
+        blank.set_background(ColorAttribute::PaletteIndex(4));
+        let rounds = std::env::var("FT_T0_WRITE_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(5);
+        let only = std::env::var("FT_T0_WRITE_ARM").ok();
+        let arms: Vec<(&str, bool)> = [("direct", true), ("set_cell", false)]
+            .iter()
+            .copied()
+            .filter(|(name, _)| only.as_deref().is_none_or(|only| only == *name))
+            .collect();
+        let mut best = vec![f64::INFINITY; arms.len()];
+        for _ in 0..rounds {
+            for (arm, &(_, direct)) in arms.iter().enumerate() {
+                let mut rows: Vec<Line> = (0..2000)
+                    .map(|_| {
+                        Line::with_width_and_cell(120, Cell::blank_with_attrs(blank.clone()), 1)
+                    })
+                    .collect();
+                let mut source = cells.iter();
+                let start = std::time::Instant::now();
+                for row in &mut rows {
+                    for column in (0..120).step_by(2) {
+                        let (text, attrs) = source.next().unwrap();
+                        row.set_cell_grapheme_arm(column, text, 2, attrs.clone(), 2, direct);
+                    }
+                }
+                best[arm] = best[arm].min(start.elapsed().as_secs_f64());
+                std::hint::black_box(&rows);
+            }
+        }
+        for ((name, _), best) in arms.iter().zip(&best) {
+            eprintln!(
+                "[BENCH] T0 cell write ({}), 120,000 wide cells into vector rows: {:.1} ns/write",
+                name,
+                best * 1e9 / (2000.0 * 60.0)
+            );
+        }
     }
 
     /// ft-951ev: a row compressed for scrollback reads back as the cells it

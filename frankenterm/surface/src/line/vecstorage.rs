@@ -443,6 +443,32 @@ impl VecStorage {
         end: usize,
         clear_image_placement: bool,
     ) {
+        self.write_cell_with(idx, cell, width, end, clear_image_placement, false);
+    }
+
+    /// [`Self::write_cell`] for `Line::set_cell_grapheme`'s direct write
+    /// (ft-yccm0.3.2.6): the same steps, carrying image placements over,
+    /// but each replaced cell is first asked, inline, whether it holds any
+    /// images; most hold none, and their carry-over is then skipped.
+    pub(crate) fn write_grapheme(&mut self, idx: usize, cell: Cell, width: usize, end: usize) {
+        self.write_cell_with(idx, cell, width, end, false, true);
+    }
+
+    #[inline]
+    fn write_cell_with(
+        &mut self,
+        idx: usize,
+        cell: Cell,
+        width: usize,
+        end: usize,
+        clear_image_placement: bool,
+        ask_first: bool,
+    ) {
+        // Skipping the carry-over from a cell that holds no images stores
+        // the same cell.
+        let skip = |old: &Cell| {
+            clear_image_placement || (ask_first && !old.attrs().has_image_attachments())
+        };
         let cells = self.cells_mut();
         if end > cells.len() {
             cells.resize_with(end, Cell::blank);
@@ -459,9 +485,11 @@ impl VecStorage {
         }
         for offset in 1..width {
             let blank = Cell::blank_with_attrs(cell.attrs().clone());
-            store_cell(cells, idx + offset, blank, clear_image_placement);
+            let clear = skip(&cells[idx + offset]);
+            store_cell(cells, idx + offset, blank, clear);
         }
-        store_cell(cells, idx, cell, clear_image_placement);
+        let clear = skip(&cells[idx]);
+        store_cell(cells, idx, cell, clear);
     }
 
     #[cfg_attr(not(feature = "use_image"), allow(unused_mut, unused_variables))]

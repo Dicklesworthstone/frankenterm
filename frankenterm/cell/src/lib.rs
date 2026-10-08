@@ -971,6 +971,7 @@ impl CellAttributes {
     /// This intentionally does not clone the image descriptors.  Persistence
     /// preflights use it to reject unsupported graphics before allocating a
     /// terminal checkpoint projection.
+    #[inline]
     pub fn has_image_attachments(&self) -> bool {
         #[cfg(feature = "use_image")]
         {
@@ -1164,6 +1165,39 @@ impl TeenyString {
         }
     }
 
+    /// The inline word holding `bytes` (fewer than 8): each byte at the
+    /// offset in the word's memory that copying `bytes` into it gives,
+    /// assembled in a register (ft-yccm0.3.2.6). The copy took a memmove
+    /// call, and reading the word back after it stalled, on every non-ASCII
+    /// cell written.
+    fn inline_word(bytes: &[u8]) -> u64 {
+        let mut word = 0u64;
+        for (offset, &byte) in bytes.iter().enumerate() {
+            let shift = if cfg!(target_endian = "little") {
+                8 * offset
+            } else {
+                56 - 8 * offset
+            };
+            word |= u64::from(byte) << shift;
+        }
+        word
+    }
+
+    /// `FT_CELL_TEXT_WORD_COPY=1` makes `from_str` copy short text into its
+    /// inline word through memory, as before ft-yccm0.3.2.6: the A/B arm and
+    /// a rollback. Both build the same word. Resolved once per process.
+    fn word_copies() -> bool {
+        #[cfg(feature = "std")]
+        {
+            static COPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *COPY.get_or_init(|| {
+                std::env::var_os("FT_CELL_TEXT_WORD_COPY").is_some_and(|v| v == "1")
+            })
+        }
+        #[cfg(not(feature = "std"))]
+        false
+    }
+
     pub fn from_str(
         s: &str,
         width: Option<usize>,
@@ -1194,14 +1228,19 @@ impl TeenyString {
         let width = explicit_width.unwrap_or_else(|| grapheme_column_width(s, unicode_version));
 
         if len < core::mem::size_of::<u64>() && width < 3 {
-            let mut word = 0u64;
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    &mut word as *mut u64 as *mut u8,
-                    len,
-                );
-            }
+            let word = if Self::word_copies() {
+                let mut word = 0u64;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        &mut word as *mut u64 as *mut u8,
+                        len,
+                    );
+                }
+                word
+            } else {
+                Self::inline_word(bytes)
+            };
             let word = Self::set_marker_bit(word as u64, width);
             Self(word)
         } else {
@@ -2554,6 +2593,64 @@ mod test {
     }
 
     // ── TeenyString extras ──────────────────────────────────
+
+    /// ft-yccm0.3.2.6: the inline word assembled in a register is the word
+    /// copying the text into memory gives, for every length an inline word
+    /// holds, every byte value at every offset, and random byte strings.
+    #[test]
+    fn inline_word_matches_copying_the_text_into_the_word() {
+        let copied = |bytes: &[u8]| {
+            let mut word = [0u8; 8];
+            word[..bytes.len()].copy_from_slice(bytes);
+            u64::from_ne_bytes(word)
+        };
+        for len in 1..8 {
+            for offset in 0..len {
+                for byte in 0..=255u8 {
+                    let mut bytes = [b'a'; 7];
+                    bytes[offset] = byte;
+                    let bytes = &bytes[..len];
+                    assert_eq!(TeenyString::inline_word(bytes), copied(bytes), "{bytes:?}");
+                }
+            }
+        }
+        let mut seed = 0x2026_1008_u64;
+        for _ in 0..200_000 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let len = 1 + (seed >> 61) as usize % 7;
+            let bytes = (seed >> 3).to_ne_bytes();
+            let bytes = &bytes[..len];
+            assert_eq!(TeenyString::inline_word(bytes), copied(bytes), "{bytes:?}");
+        }
+    }
+
+    /// ft-yccm0.3.2.6: every scalar value, and every T0 emoji with a
+    /// selector, a skin tone or a ZWJ join, keeps its text and explicit
+    /// width in a cell, through whichever word builder the process uses.
+    #[test]
+    fn short_cell_text_reads_back_as_written() {
+        use alloc::string::String;
+        let mut texts: Vec<String> = (0..=0x10_FFFFu32)
+            .filter_map(char::from_u32)
+            .filter(|c| !c.is_ascii_control())
+            .map(String::from)
+            .collect();
+        for emoji in 0x1F600..0x1F650u32 {
+            let emoji = char::from_u32(emoji).unwrap();
+            texts.push(format!("{emoji}\u{FE0F}"));
+            texts.push(format!("{emoji}\u{1F3FB}"));
+            texts.push(format!("{emoji}\u{200D}"));
+        }
+        for text in &texts {
+            for width in [1, 2] {
+                let cell = Cell::new_grapheme_with_width(text, width, CellAttributes::blank());
+                assert_eq!(cell.str(), text.as_str());
+                assert_eq!(cell.width(), width, "{:?}", text);
+            }
+        }
+    }
 
     #[test]
     fn teeny_string_clone_inline() {
