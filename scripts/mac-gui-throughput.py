@@ -24,6 +24,9 @@ or a second FrankenTerm build/config for A/B gates):
   terminal's threads, with its name, QoS class (from its base priority),
   current priority and CPU (scripts/mac-thread-qos.py, libproc, read-only).
   The run keeps threads.json and the busiest threads with CPU per class.
+  With --stack-sample-at-s S, /usr/bin/sample also records every thread's
+  stacks S seconds after go (stack-sample.txt), which shows what a thread
+  that is not running waits on.
 * CPU contention (ft-yccm0.6): --cpu-hog N runs N busy processes at default
   QoS during every run of both arms, started before the settle and stopped
   after the drain, so the load is the harness's own rather than the host's.
@@ -1380,7 +1383,7 @@ class Harness:
                   "beachball": None, "load_start": loadavg(), "window_title": self.run_title(run_dir),
                   "cpu_hog_threads": hog_threads}
         hog = CpuHog(hog_threads, run_dir, self.thread_probe) if hog_threads else None
-        sampler = None
+        sampler, stack_timer = None, None
         measure_args = ["/bin/zsh", "-f", self.pane_script, "measure", run_dir, self.corpus["path"],
                         "1" if width_probe else "0", sys.executable, self.width_probe,
                         self.run_title(run_dir)]
@@ -1476,6 +1479,8 @@ class Harness:
             if args.thread_probe_s > 0:
                 sampler = self.thread_probe.ThreadSampler(terminal_pid, args.thread_probe_s)
                 sampler.start()
+            if args.stack_sample_at_s > 0:
+                stack_timer = self.stack_sample_timer(terminal_pid, run_dir, record)
             go_ns = uptime_ns()
             touch(os.path.join(run_dir, "go"))
             log(f"run {index} {arm['name']}: go (load {record['load_go']})")
@@ -1494,6 +1499,11 @@ class Harness:
                     json.dump(report, handle, indent=2)
                 record["threads"] = thread_profile(report)
                 sampler = None
+            if stack_timer:
+                stack_timer.cancel()
+                stack_timer.join(timeout=args.stack_sample_s + 90)
+                record.setdefault("stack_sample", {"skipped": "the drain ended before the sample was due"})
+                stack_timer = None
             done = wait_for(lambda: read_text(os.path.join(run_dir, "done")), 60)
             record["cat_exit_status"] = int(done) if done and done.strip().isdigit() else None
             record["time"] = parse_time_line(read_text(os.path.join(run_dir, "time.txt")))
@@ -1525,6 +1535,8 @@ class Harness:
             log(f"run {index} {arm['name']} failed: {error}")
         finally:
             touch(os.path.join(run_dir, "stop"))
+            if stack_timer:
+                stack_timer.cancel()
             if sampler:
                 sampler.stop()
             if hog:
@@ -1538,6 +1550,26 @@ class Harness:
             if terminal_pid:
                 terminate_exact(terminal_pid, token, f"{arm['name']} terminal")
         return record
+
+    def stack_sample_timer(self, pid, run_dir, record):
+        """Starts a timer that records every thread's stacks of `pid` with
+        /usr/bin/sample, --stack-sample-at-s after now (ft-yccm0.6): which
+        call each thread is blocked in mid-drain. The run's record gets the
+        file and sample's exit status."""
+        args = self.args
+        path = os.path.join(run_dir, "stack-sample.txt")
+
+        def take():
+            result = subprocess.run(["/usr/bin/sample", str(pid), str(args.stack_sample_s), "-mayDie",
+                                     "-file", path], capture_output=True, text=True,
+                                    timeout=args.stack_sample_s + 60)
+            record["stack_sample"] = {"path": path, "exit": result.returncode, "at_s": args.stack_sample_at_s,
+                                      "seconds": args.stack_sample_s, "stderr": result.stderr.strip()[-300:]}
+
+        timer = threading.Timer(args.stack_sample_at_s, take)
+        timer.daemon = True
+        timer.start()
+        return timer
 
     def sample_drain(self, cat_pid, start_ns, run_dir, record):
         period_ns = self.args.sample_ms * 1_000_000
@@ -1692,6 +1724,11 @@ def parse_args(argv):
     parser.add_argument("--thread-probe-s", type=float, default=1.0,
                         help="sample the terminal's threads (QoS class, priority, CPU) this often during the drain; "
                         "0 disables (default 1)")
+    parser.add_argument("--stack-sample-at-s", type=float, default=0.0,
+                        help="this many seconds after go, record every thread's stacks with /usr/bin/sample for "
+                        "--stack-sample-s seconds into the run's stack-sample.txt: where threads wait during the "
+                        "drain (ft-yccm0.6); 0 disables (default)")
+    parser.add_argument("--stack-sample-s", type=int, default=3, help="stack sample duration (default 3)")
     parser.add_argument("--sample-ms", type=int, default=250, help="tty offset sampling period")
     parser.add_argument("--probe-ms", type=int, default=100, help="main-thread probe period")
     parser.add_argument("--hang-ms", type=int, default=2000, help="probe latency counted as a beach ball")
