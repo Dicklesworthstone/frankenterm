@@ -4061,6 +4061,34 @@ impl ScrollbackPolicy {
     }
 }
 
+/// ft-yccm0.6 A/B switches for the scrollback path, read once from the
+/// environment; each is on unless set to 0. For measurements only:
+/// - `FT_SCROLLBACK_COLD_GEOMETRY=0` skips the wrap-geometry capture of every
+///   row spilled to the cold sink (`record_cold_geometry_row`). The cold
+///   geometry index stays empty, as after a capture that fails, and a cold
+///   rewrap takes its no-geometry path.
+/// - `FT_SCROLLBACK_WARM_COMPRESS=0` keeps rows that scroll into scrollback in
+///   the storage they had instead of compressing them. Uncompressed rows
+///   count more bytes, so the warm budget also spills sooner.
+fn scrollback_switch_on(value: Option<&std::ffi::OsStr>) -> bool {
+    !value.is_some_and(|value| value == "0")
+}
+
+#[cfg(feature = "use_serde")]
+fn cold_geometry_capture_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        scrollback_switch_on(std::env::var_os("FT_SCROLLBACK_COLD_GEOMETRY").as_deref())
+    })
+}
+
+fn scrollback_compression_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        scrollback_switch_on(std::env::var_os("FT_SCROLLBACK_WARM_COMPRESS").as_deref())
+    })
+}
+
 fn scrollback_hot_size(policy: &ScrollbackPolicy, allow_scrollback: bool) -> usize {
     if !allow_scrollback {
         return 0;
@@ -6871,6 +6899,10 @@ impl Screen {
         row: StableRowIndex,
         line: &Line,
     ) {
+        if !cold_geometry_capture_enabled() {
+            self.cold_geometry_index = None;
+            return;
+        }
         let extends = self.cold_geometry_index.as_ref().is_some_and(|index| {
             Arc::ptr_eq(&sink, &index.sink)
                 && interval.same_lineage(&index.interval)
@@ -9904,7 +9936,7 @@ impl Screen {
             }
         };
 
-        if scroll_region.start == 0 {
+        if scroll_region.start == 0 && scrollback_compression_enabled() {
             for y in self.phys_range(&(0..num_rows as VisibleRowIndex)) {
                 self.line_mut(y).compress_for_scrollback();
             }
@@ -10092,7 +10124,7 @@ impl Screen {
                 self.touch_phys_row(index, seqno);
             }
         }
-        if scroll_region.start == 0 {
+        if scroll_region.start == 0 && scrollback_compression_enabled() {
             for index in self.phys_range(&(0..num_rows as VisibleRowIndex)) {
                 self.page_compress_for_scrollback(index);
             }
@@ -10895,6 +10927,19 @@ pub(crate) mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// ft-yccm0.6: the scrollback A/B switches are on unless set to exactly
+    /// 0.
+    #[test]
+    fn scrollback_switches_are_on_unless_set_to_zero() {
+        use std::ffi::OsStr;
+
+        assert!(scrollback_switch_on(None));
+        assert!(!scrollback_switch_on(Some(OsStr::new("0"))));
+        for value in ["1", "", "off", "00"] {
+            assert!(scrollback_switch_on(Some(OsStr::new(value))), "{}", value);
+        }
+    }
 
     #[test]
     fn logical_len_limit_check_treats_overflow_as_exceeded() {
