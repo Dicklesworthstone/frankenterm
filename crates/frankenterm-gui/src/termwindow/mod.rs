@@ -123,6 +123,7 @@ pub mod keyevent;
 mod metal_cells;
 mod metal_chrome;
 mod metal_glyphs;
+mod metal_images;
 mod metal_render_thread;
 mod metal_window;
 pub mod modal;
@@ -5271,7 +5272,7 @@ impl TermWindow {
             &self.fonts,
             &self.render_metrics,
             &metal,
-            |window| {
+            |window, images_loading| {
                 let outcome = match window {
                     Some(window) => metal.render_window(width, height, window),
                     // ft-yccm0.4.2.1: the frame slots are sized for the grid.
@@ -5281,8 +5282,11 @@ impl TermWindow {
                     (&outcome, snapshot_path)
                 {
                     // The panes are shaped now: a frame not final yet
-                    // re-arms, as the WebGpu snapshot does.
-                    let readiness = self.render_snapshot_readiness();
+                    // re-arms, as the WebGpu snapshot does. An image cell
+                    // still decoding is polled by the panes' redraw time
+                    // (ft-yccm0.4.7.2).
+                    let mut readiness = self.render_snapshot_readiness();
+                    readiness.images_loading |= images_loading;
                     if readiness.is_final() {
                         write_metal_render_snapshot(
                             &metal,

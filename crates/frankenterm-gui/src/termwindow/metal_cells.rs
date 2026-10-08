@@ -108,6 +108,11 @@ pub(crate) struct MetalFrameUniforms {
     pub(crate) blinking: (bool, bool),
     /// When the cursor's blink next needs a frame.
     pub(crate) cursor_due: Option<Instant>,
+    /// When the scene's image cells next need a frame: an animation's next
+    /// frame, or a poll of an image still decoding (ft-yccm0.4.7.2).
+    pub(crate) image_due: Option<Instant>,
+    /// An image cell is still decoding, drawing nothing yet.
+    pub(crate) images_loading: bool,
 }
 
 /// A window's blink clocks for its Metal frames (ft-yccm0.4.7.3): the WebGpu
@@ -466,6 +471,9 @@ impl MetalFrame {
             passes += 1;
         }
         metrics::histogram!("gui.metal.scene.rows_rebuilt").record(update.rows_rebuilt as f64);
+        // Rows with images are rebuilt every frame (the mirror recaptures
+        // them), so this covers every image cell in the scene.
+        let (image_due, images_loading) = frame.glyphs.image_poll();
 
         let rows = frame.mirror.rows();
         let cursor_row = cursor.y - frame.mirror.first();
@@ -513,6 +521,8 @@ impl MetalFrame {
             rows_rebuilt: update.rows_rebuilt,
             blinking: frame.scene.blinking(),
             cursor_due: cursor_blink.map(|(_, due)| due),
+            image_due,
+            images_loading,
         };
         *slot = Some(frame);
         Some(uniforms)

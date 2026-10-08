@@ -233,7 +233,7 @@ pub struct RenderScreenLineParams<'a> {
 }
 
 #[inline]
-fn image_padding_fits_cell(
+pub(crate) fn image_padding_fits_cell(
     (left, top, right, bottom): (u16, u16, u16, u16),
     cell_width: isize,
     cell_height: isize,
@@ -249,7 +249,7 @@ fn image_padding_fits_cell(
 }
 
 #[inline]
-fn image_cache_padding_for_cell(cell_width: isize, cell_height: isize) -> Option<usize> {
+pub(crate) fn image_cache_padding_for_cell(cell_width: isize, cell_height: isize) -> Option<usize> {
     if cell_width <= 0 || cell_height <= 0 {
         return None;
     }
@@ -258,7 +258,7 @@ fn image_cache_padding_for_cell(cell_width: isize, cell_height: isize) -> Option
 }
 
 #[inline]
-fn canonical_image_texture_region(
+pub(crate) fn canonical_image_texture_region(
     top_left: termwiz::image::TextureCoordinate,
     bottom_right: termwiz::image::TextureCoordinate,
 ) -> Option<(f32, f32, f32, f32)> {

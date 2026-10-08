@@ -337,7 +337,8 @@ impl FrameDriver for MetalDriver {
             &fonts,
             &metrics,
             &renderer,
-            |window| match (window, update) {
+            // A decoding image is polled by the panes' redraw time.
+            |window, _images_loading| match (window, update) {
                 (Some(window), Some(update)) => {
                     renderer.render_window_into(update, width, height, window)
                 }

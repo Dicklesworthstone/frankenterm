@@ -466,15 +466,17 @@ impl MetalPanes {
         &self.rebuilt
     }
 
-    /// When the last draw's blinking text or blinking cursor next needs a
-    /// frame, as the WebGpu renderer schedules its next frame for them.
+    /// When the last draw's blinking text, blinking cursor or image cells (an
+    /// animation, or an image still decoding) next need a frame, as the
+    /// WebGpu renderer schedules its next frame for them.
     pub(crate) fn redraw_at(&self) -> Option<Instant> {
         self.redraw_at
     }
 
     /// Captures each of `panes`' changed rows and brings its scene up to
     /// date, forgets the frames of panes no longer drawn, then calls `draw`
-    /// with the window frame: `None` when no pane has a scene.
+    /// with the window frame (`None` when no pane has a scene) and whether
+    /// an image cell in it is still decoding, drawing nothing yet.
     // One parameter per frame input; a struct would only rename them.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn draw<R>(
@@ -486,7 +488,7 @@ impl MetalPanes {
         fonts: &Rc<FontConfiguration>,
         metrics: &RenderMetrics,
         renderer: &Rc<MetalRenderer>,
-        draw: impl FnOnce(Option<&WindowFrame<'_>>) -> R,
+        draw: impl FnOnce(Option<&WindowFrame<'_>>, bool) -> R,
     ) -> R {
         let mut previous = std::mem::take(&mut self.frames);
         let mut updated = Vec::with_capacity(panes.len());
@@ -501,6 +503,8 @@ impl MetalPanes {
         });
         let mut blinking = (false, false);
         let mut cursor_due = None;
+        let mut image_due = None;
+        let mut images_loading = false;
         for pane in panes {
             let Some(pane_id) = pane.inputs.pane.as_ref().map(|pane| pane.pane_id()) else {
                 continue;
@@ -525,10 +529,17 @@ impl MetalPanes {
                     blinking.1 || uniforms.blinking.1,
                 );
                 cursor_due = cursor_due.into_iter().chain(uniforms.cursor_due).min();
+                image_due = image_due.into_iter().chain(uniforms.image_due).min();
+                images_loading |= uniforms.images_loading;
                 updated.push((pane_id, pane, frame, uniforms));
             }
         }
-        self.redraw_at = phase.due(blinking).into_iter().chain(cursor_due).min();
+        self.redraw_at = phase
+            .due(blinking)
+            .into_iter()
+            .chain(cursor_due)
+            .chain(image_due)
+            .min();
         let scenes: Vec<PaneScene<'_>> = updated
             .iter()
             .map(|(pane_id, pane, frame, uniforms)| PaneScene {
@@ -542,14 +553,17 @@ impl MetalPanes {
             })
             .collect();
         let drawn = if scenes.is_empty() {
-            draw(None)
+            draw(None, images_loading)
         } else {
-            draw(Some(&WindowFrame {
-                clear,
-                panes: &scenes,
-                fills,
-                ui,
-            }))
+            draw(
+                Some(&WindowFrame {
+                    clear,
+                    panes: &scenes,
+                    fills,
+                    ui,
+                }),
+                images_loading,
+            )
         };
         drop(scenes);
         self.frames = updated

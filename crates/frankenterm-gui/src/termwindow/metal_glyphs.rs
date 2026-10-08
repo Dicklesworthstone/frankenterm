@@ -25,6 +25,9 @@
 //!   ([`GlyphCache::block_sprite_image`]) at the cell's top-left.
 //! - Decorations and cursors are its line and cursor sprites
 //!   ([`GlyphCache::line_sprite_image`], [`GlyphCache::cursor_sprite_image`]).
+//! - Image cells are their slices of the images in the glyph cache's image
+//!   cache, sampled as WebGpu's image quads sample them ([`ImageSlices`],
+//!   ft-yccm0.4.7.2).
 //!
 //! Bitmaps go to the renderer's atlases: coverage in the R8 atlas,
 //! premultiplied color in the BGRA atlas.
@@ -51,6 +54,7 @@
 //! (the render mirror clusters left to right), and
 //! `experimental_pixel_positioning`.
 
+use super::metal_images::{ImageSlices, Slice};
 use crate::customglyph::BlockKey;
 use crate::glyphcache::GlyphCache;
 use crate::utilsprites::RenderMetrics;
@@ -70,8 +74,10 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use termwiz::cell::VerticalAlign;
 use termwiz::cellcluster::CellCluster;
+use termwiz::image::ImageCell;
 use termwiz::surface::CursorShape;
 use wezterm_term::color::SrgbaTuple;
 use wezterm_term::{CellAttributes, Line};
@@ -147,6 +153,8 @@ pub(crate) struct FontGlyphs {
     lines: HashMap<LineSprite, PlacedGlyph>,
     /// Cursor sprites by shape and width in cells (ft-yccm0.4.7.3).
     cursors: HashMap<(CursorSprite, u8), PlacedGlyph>,
+    /// Image cells' slices, from the first image cell on (ft-yccm0.4.7.2).
+    images: Option<ImageSlices>,
     /// Set by the shaper when a fallback font finishes resolving.
     fallback_resolved: Arc<AtomicBool>,
     /// Also called then: the window's repaint on a resolved fallback, as the
@@ -212,6 +220,7 @@ impl FontGlyphs {
             blocks: HashMap::new(),
             lines: HashMap::new(),
             cursors: HashMap::new(),
+            images: None,
             fallback_resolved: Arc::new(AtomicBool::new(false)),
             fallback_ready: None,
             chain_changed: false,
@@ -223,6 +232,15 @@ impl FontGlyphs {
     /// resolving: the window, which repaints (ft-yccm0.4.7.3).
     pub(crate) fn set_fallback_ready(&mut self, ready: Option<FallbackReady>) {
         self.fallback_ready = ready;
+    }
+
+    /// When a frame is next due for the image cells drawn since the frame
+    /// began (an animation's next frame, or a poll of a decoding image), and
+    /// whether one of them is still decoding (ft-yccm0.4.7.2).
+    pub(crate) fn image_poll(&self) -> (Option<Instant>, bool) {
+        self.images
+            .as_ref()
+            .map_or((None, false), ImageSlices::poll)
     }
 
     /// Whether the fallback chain grew while shaping since the last call.
@@ -260,6 +278,11 @@ impl FontGlyphs {
         if fallback_resolved {
             self.shapes.clear();
         }
+        // Image slices the last frame did not draw are let go first, so
+        // their atlas slots age out.
+        if let Some(images) = &mut self.images {
+            images.begin_frame();
+        }
         let mut rebuild = std::mem::take(&mut self.reset);
         if !rebuild {
             let renderer = &self.renderer;
@@ -273,6 +296,7 @@ impl FontGlyphs {
                 .chain(self.blocks.values().map(|placed| &placed.slot))
                 .chain(self.lines.values().map(|placed| &placed.slot))
                 .chain(self.cursors.values().map(|placed| &placed.slot))
+                .chain(self.images.iter().flat_map(ImageSlices::slots))
                 .all(|slot| renderer.touch_glyph(slot));
             rebuild = !alive;
         }
@@ -281,6 +305,9 @@ impl FontGlyphs {
             self.blocks.clear();
             self.lines.clear();
             self.cursors.clear();
+            if let Some(images) = &mut self.images {
+                images.forget_placed();
+            }
         }
         rebuild || fallback_resolved
     }
@@ -675,6 +702,34 @@ impl GlyphSource for FontGlyphs {
         let placed = self.place_cursor(shape, width_cells)?;
         self.cursors.insert((shape, width_cells), placed);
         Some(placed)
+    }
+
+    /// The slice's bitmap from the pane's image cache ([`ImageSlices`]), in
+    /// the color atlas.
+    fn image_cell(&mut self, image: &ImageCell) -> Option<PlacedGlyph> {
+        if self.images.is_none() {
+            match ImageSlices::new(&self.fonts) {
+                Ok(images) => self.images = Some(images),
+                Err(err) => {
+                    log::warn!("Metal glyphs: no image cache: {err:#}");
+                    return None;
+                }
+            }
+        }
+        let cell = (self.metrics.cell_size.width, self.metrics.cell_size.height);
+        match self.images.as_mut()?.slice(image, cell)? {
+            Slice::Placed(placed) => Some(placed),
+            Slice::New {
+                key,
+                bitmap,
+                offset,
+            } => {
+                let slot = self.place_image(&bitmap, true, "an image cell")?;
+                let placed = PlacedGlyph { slot, offset };
+                self.images.as_mut()?.placed(key, placed);
+                Some(placed)
+            }
+        }
     }
 }
 
