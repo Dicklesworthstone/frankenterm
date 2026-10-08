@@ -4717,6 +4717,24 @@ impl frankenterm_term::FeedGate for FusedFeedGate {
     }
 }
 
+/// [`FusedFeedGate`] for a synchronized-output frame the parse thread held
+/// raw from its BSU through its ESU (ft-yccm0.3.2.1): the BSU and ESU are
+/// applied in place, so the terminal is in synchronized output while the
+/// frame lands, as when the frame's actions were applied with them. The
+/// parse thread has opened and drained the hold for them already.
+pub(crate) struct SynchronizedFrameFeedGate;
+
+impl frankenterm_term::FeedGate for SynchronizedFrameFeedGate {
+    fn diverts(&mut self, action: &Action) -> bool {
+        !crate::is_synchronized_output_mode_switch(action)
+            && frankenterm_term::FeedGate::diverts(&mut FusedFeedGate, action)
+    }
+
+    fn diverts_sgr(&mut self, _sgr: &Sgr) -> bool {
+        false
+    }
+}
+
 struct FundedPaneAlerts {
     dispatch: Option<crate::FundedPaneAlertDispatch>,
     output: Option<crate::PaneAlertOutput>,
@@ -5169,6 +5187,30 @@ impl LocalPane {
         bytes: &[u8],
         diverted: &mut Vec<Action>,
     ) -> Result<(), PaneActionAdmissionRefusal> {
+        self.feed_fused_through(parser, bytes, &mut FusedFeedGate, diverted)
+    }
+
+    /// [`Self::feed_fused`] for a synchronized-output frame the parse thread
+    /// held raw: its BSU and ESU are applied in place
+    /// ([`SynchronizedFrameFeedGate`]).
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    pub(crate) fn feed_fused_frame(
+        &self,
+        parser: &mut termwiz::escape::parser::Parser,
+        bytes: &[u8],
+        diverted: &mut Vec<Action>,
+    ) -> Result<(), PaneActionAdmissionRefusal> {
+        self.feed_fused_through(parser, bytes, &mut SynchronizedFrameFeedGate, diverted)
+    }
+
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    fn feed_fused_through<G: frankenterm_term::FeedGate>(
+        &self,
+        parser: &mut termwiz::escape::parser::Parser,
+        bytes: &[u8],
+        gate: &mut G,
+        diverted: &mut Vec<Action>,
+    ) -> Result<(), PaneActionAdmissionRefusal> {
         // Covers admission, apply and the durability handoff (ft-yccm0.1.5).
         let _parse_batch = procinfo::signpost_interval(procinfo::SignpostName::ParseBatch);
         let mut output = self.prepare_alert_output()?;
@@ -5187,7 +5229,7 @@ impl LocalPane {
             let mut sliced = SlicedFeed::new(bytes, FEED_SLICE_BYTES);
             let mut terminal =
                 self.run_parser_slices(terminal, &mut application, &mut |terminal, yield_now| {
-                    sliced.run(terminal, parser, &mut FusedFeedGate, diverted, yield_now)
+                    sliced.run(terminal, parser, gate, diverted, yield_now)
                 });
             drop(application);
             self.render_facts.publish(&mut terminal);
@@ -8567,8 +8609,9 @@ mod tests {
         assert!(actions.len() > 20, "{:?}", actions);
         let output_only = PaneAlertPreflight::output_only();
         let mut gate = FusedFeedGate;
+        let mut frame_gate = SynchronizedFrameFeedGate;
         let (mut charged_seen, mut sync_seen, mut plain_seen) = (0, 0, 0);
-        let mut sgr_seen = 0;
+        let (mut sgr_seen, mut switches_seen) = (0, 0);
         for action in &actions {
             let preflight = PaneAlertPreflight::for_actions(std::slice::from_ref(action), 0)
                 .expect("a bounded preflight");
@@ -8577,9 +8620,25 @@ mod tests {
                 || !preflight.historical.is_empty();
             let sync = crate::is_synchronized_output_action(action);
             assert_eq!(gate.diverts(action), charged || sync, "{:?}", action);
+            // A frame held raw applies its BSU and ESU, and diverts the
+            // rest alike.
+            let switch = crate::is_synchronized_output_mode_switch(action);
+            assert_eq!(
+                frame_gate.diverts(action),
+                charged || (sync && !switch),
+                "{:?}",
+                action
+            );
+            switches_seen += usize::from(switch);
             // The CSI fast path asks about SGR without an Action.
             if let Action::CSI(CSI::Sgr(sgr)) = action {
                 assert_eq!(gate.diverts_sgr(sgr), gate.diverts(action), "{:?}", action);
+                assert_eq!(
+                    frame_gate.diverts_sgr(sgr),
+                    gate.diverts(action),
+                    "{:?}",
+                    action
+                );
                 sgr_seen += 1;
             }
             if charged {
@@ -8593,6 +8652,7 @@ mod tests {
         // The sample covers every class.
         assert!(charged_seen >= 7, "{} charged", charged_seen);
         assert_eq!(sync_seen, 4);
+        assert_eq!(switches_seen, 2);
         assert!(plain_seen >= 10, "{} plain", plain_seen);
         assert_eq!(sgr_seen, 4);
     }

@@ -10926,6 +10926,90 @@ fn notify_synchronized_output_event(
     mux.notify(notification);
 }
 
+/// What the parse thread has reported of the synchronized-output hold for
+/// the chunk it consumes: whether the chunk touched a hold, and whether its
+/// admission went out, which it does once.
+struct ChunkHoldReport {
+    size: usize,
+    touched: bool,
+    admitted: bool,
+}
+
+impl ChunkHoldReport {
+    fn new(size: usize, holding: bool) -> Self {
+        Self {
+            size,
+            touched: holding,
+            admitted: false,
+        }
+    }
+
+    /// Reports the chunk's admission, if it touched a hold and has not.
+    fn admit(&mut self, pane: &Weak<dyn Pane>, generation: &Arc<PaneRegistrationGeneration>) {
+        if self.touched && !self.admitted && self.size > 0 {
+            notify_synchronized_output_event(
+                pane,
+                generation,
+                SynchronizedOutputEvent::Admission {
+                    decision: SynchronizedOutputAdmissionDecision::Accepted,
+                    bytes: self.size as u64,
+                },
+            );
+            self.admitted = true;
+        }
+    }
+}
+
+/// Applies `action`'s effect to the hold if it is a synchronized-output
+/// action, answers the mode query, and reports it: BSU and a nested ESU as
+/// depth changes, the ESU that drains the hold as the chunk's admission and
+/// a drain of `action_size` bytes plus the chunk, the query as such. The
+/// parse thread reports every action it decodes this way, and the BSU and
+/// ESU of a frame it holds raw where the scan finds them.
+fn report_synchronized_output_action(
+    pane: &Weak<dyn Pane>,
+    generation: &Arc<PaneRegistrationGeneration>,
+    action: &Action,
+    hold: &mut SynchronizedOutputHold,
+    chunk: &mut ChunkHoldReport,
+    action_size: usize,
+) -> SynchronizedOutputActionEffect {
+    let was_holding = hold.is_holding();
+    let effect = handle_synchronized_output_action(action, hold, |holding| {
+        respond_to_synchronized_output_query(pane, generation, holding);
+    });
+    if was_holding || hold.is_holding() {
+        chunk.touched = true;
+    }
+    if let Some(depth_outcome) = effect.depth_outcome {
+        if effect.flush {
+            chunk.admit(pane, generation);
+            notify_synchronized_output_event(
+                pane,
+                generation,
+                SynchronizedOutputEvent::Drain {
+                    cause: SynchronizedOutputDrainCause::Esu,
+                    bytes: action_size.saturating_add(chunk.size) as u64,
+                    depth_outcome: Some(depth_outcome),
+                    max_depth: hold.max_depth(),
+                },
+            );
+        } else {
+            notify_synchronized_output_event(
+                pane,
+                generation,
+                SynchronizedOutputEvent::Depth {
+                    outcome: depth_outcome,
+                    max_depth: hold.max_depth(),
+                },
+            );
+        }
+    } else if effect.handled {
+        notify_synchronized_output_event(pane, generation, SynchronizedOutputEvent::ModeQuery);
+    }
+    effect
+}
+
 /// This function applies parsed actions to the pane and notifies any
 /// mux subscribers about the output event
 fn resolve_pane_reader_mux(
@@ -11033,6 +11117,9 @@ fn fused_parse_enabled() -> bool {
 /// refused it for a reason other than capacity. The caller then parses the
 /// chunk into actions for [`send_actions_to_mux`], which handles each of
 /// those cases as before.
+///
+/// A `frame` is a synchronized-output frame held raw (see
+/// [`RawCoalescer`]): its BSU and ESU are applied in place.
 #[cfg(not(feature = "disruptor-pane-io"))]
 fn feed_chunk_to_mux(
     pane: &Weak<dyn Pane>,
@@ -11040,6 +11127,7 @@ fn feed_chunk_to_mux(
     dead: &AtomicBool,
     parser: &mut termwiz::escape::parser::Parser,
     bytes: &[u8],
+    frame: bool,
     diverted: &mut Vec<Action>,
 ) -> bool {
     if generation
@@ -11069,7 +11157,12 @@ fn feed_chunk_to_mux(
         return false;
     };
     loop {
-        match local.feed_fused(parser, bytes, diverted) {
+        let fed = if frame {
+            local.feed_fused_frame(parser, bytes, diverted)
+        } else {
+            local.feed_fused(parser, bytes, diverted)
+        };
+        match fed {
             Ok(()) => break,
             Err(crate::pane::PaneActionAdmissionRefusal::Capacity)
                 if !dead.load(Ordering::Acquire) =>
@@ -11095,6 +11188,7 @@ fn feed_chunk_to_mux(
     _dead: &AtomicBool,
     _parser: &mut termwiz::escape::parser::Parser,
     _bytes: &[u8],
+    _frame: bool,
     _diverted: &mut Vec<Action>,
 ) -> bool {
     false
@@ -11126,32 +11220,198 @@ fn count_parse_path(generation: &PaneRegistrationGeneration, fused: bool, bytes:
 /// admission are what they were and every byte is parsed once, by the fused
 /// parser.
 ///
-/// Only output that cannot hold a synchronized-output action is held: BSU,
-/// ESU and the mode-2026 query change when the loop flushes, so they are
-/// still handled as each is parsed. A chunk in which a sequence that can
-/// decode to one ends (see [`SyncControlScan`]) is parsed as before. Nothing
-/// is held raw during a hold.
+/// Only output that cannot hold a synchronized-output action is held this
+/// way: BSU, ESU and the mode-2026 query change when the loop flushes, so
+/// they are handled as each arrives. A chunk in which a sequence that can
+/// decode to one ends (see [`SyncControlScan`]) is parsed as before, unless
+/// it is a frame's.
+///
+/// A synchronized-output frame, BSU then output then ESU, as applications
+/// send them, is held raw from its BSU through its ESU, and fed fused at the
+/// ESU, where the two-stage path applied the actions it held for the frame
+/// (`framed`). The loop opens and drains the hold, and reports both, where
+/// the scan finds the BSU and the ESU, and the fused gate applies them in
+/// place, so the terminal is in synchronized output across the frame as
+/// before. Any other control during the frame ends this: the frame so far
+/// is parsed into the actions the two-stage path holds for it, and the hold
+/// goes on as before (`unframe`).
 #[derive(Default)]
 struct RawCoalescer {
     bytes: Vec<u8>,
     scan: SyncControlScan,
+    /// Where each control in the chunk last scanned ends.
+    ends: Vec<usize>,
+    /// The seven bytes consumed before the chunk last scanned, and the
+    /// seven through it: a BSU or ESU that ends in a chunk can begin in the
+    /// one before.
+    before: [u8; 7],
+    through: [u8; 7],
+    /// `bytes` is a synchronized-output frame: its BSU and the output after.
+    framed: bool,
+    /// The chunk last scanned as frames: its BSUs and ESUs, in order.
+    frame_controls: Vec<(FrameControl, usize)>,
 }
+
+/// BSU and ESU, DEC private mode 2026 set and reset, as applications send
+/// them (ft-yccm0.3.2.1).
+const SYNCHRONIZED_OUTPUT_BSU: &[u8; 8] = b"\x1b[?2026h";
+const SYNCHRONIZED_OUTPUT_ESU: &[u8; 8] = b"\x1b[?2026l";
+
+/// A control that begins or ends a frame [`RawCoalescer`] holds raw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameControl {
+    Bsu,
+    Esu,
+}
+
+impl FrameControl {
+    /// The action the parser decodes from it.
+    fn action(self) -> Action {
+        let mode = DecPrivateMode::Code(DecPrivateModeCode::SynchronizedOutput);
+        Action::CSI(CSI::Mode(match self {
+            Self::Bsu => Mode::SetDecPrivateMode(mode),
+            Self::Esu => Mode::ResetDecPrivateMode(mode),
+        }))
+    }
+}
+
+/// BSU or ESU, which a frame held raw applies in place.
+pub(crate) fn is_synchronized_output_mode_switch(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::CSI(CSI::Mode(
+            Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::SynchronizedOutput))
+                | Mode::ResetDecPrivateMode(DecPrivateMode::Code(
+                    DecPrivateModeCode::SynchronizedOutput
+                ))
+        ))
+    )
+}
+
+/// Whether the parse thread holds synchronized-output frames raw
+/// (ft-yccm0.3.2.1): on unless `FT_SYNC_FRAME_RAW_HOLDS` is `0`, `false`,
+/// `off` or `no`, which parses them into actions as they arrive, as before.
+/// Read once per parse thread.
+fn sync_frame_raw_holds_enabled() -> bool {
+    #[cfg(test)]
+    match SYNC_FRAME_RAW_HOLDS_FOR_TEST.load(Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    !std::env::var("FT_SYNC_FRAME_RAW_HOLDS").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+/// Overrides [`sync_frame_raw_holds_enabled`] for the parse threads tests
+/// start next: 1 on, 2 off, 0 as the environment says.
+#[cfg(test)]
+static SYNC_FRAME_RAW_HOLDS_FOR_TEST: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
 
 impl RawCoalescer {
     fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
 
+    fn is_framed(&self) -> bool {
+        self.framed
+    }
+
     /// Scans `chunk` as consumed, held or not, and returns whether a
-    /// synchronized-output control may end in it, so that it is not held.
-    /// Every consumed chunk goes through here, in order, so a control split
-    /// across chunks is found in the chunk that ends it.
+    /// synchronized-output control may end in it, so that it is not held as
+    /// plain output. Every consumed chunk goes through here, in order, so a
+    /// control split across chunks is found in the chunk that ends it.
     fn scan_controls(&mut self, chunk: &[u8]) -> bool {
-        self.scan.scan(chunk)
+        self.before = self.through;
+        let len = self.through.len();
+        match chunk.len().checked_sub(len) {
+            Some(start) => self.through.copy_from_slice(&chunk[start..]),
+            None => {
+                self.through.rotate_left(chunk.len());
+                self.through[len - chunk.len()..].copy_from_slice(chunk);
+            }
+        }
+        self.scan.scan(chunk, &mut self.ends)
     }
 
     fn push(&mut self, chunk: &[u8]) {
         self.bytes.extend_from_slice(chunk);
+    }
+
+    /// Whether the chunk last scanned can be taken as frames: its controls,
+    /// if any, are BSU and ESU as applications send them, each BSU opening a
+    /// hold and each ESU closing the frame held raw; and it has one, or a
+    /// frame is held. Fills `frame_controls`. A hold the two-stage path
+    /// opened stays two-stage until it ends.
+    fn plan_frames(&mut self, chunk: &[u8], holding: bool) -> bool {
+        self.frame_controls.clear();
+        if holding != self.framed {
+            return false;
+        }
+        let mut framed = self.framed;
+        for &end in &self.ends {
+            let control = match (framed, self.frame_control_at(chunk, end)) {
+                (false, Some(FrameControl::Bsu)) => FrameControl::Bsu,
+                (true, Some(FrameControl::Esu)) => FrameControl::Esu,
+                _ => return false,
+            };
+            framed = !framed;
+            self.frame_controls.push((control, end));
+        }
+        self.framed || !self.frame_controls.is_empty()
+    }
+
+    /// The control that ends at `end` in the chunk last scanned, if it is
+    /// BSU or ESU as applications send them, eight bytes from ESC. It can
+    /// begin in the chunk before, applied or held: ESC starts it afresh
+    /// whatever the parser was in, so the parser, fed the rest later, ends
+    /// it as it would have in one piece.
+    fn frame_control_at(&self, chunk: &[u8], end: usize) -> Option<FrameControl> {
+        let len = SYNCHRONIZED_OUTPUT_BSU.len();
+        let mut sequence = [0_u8; 8];
+        match end.checked_sub(len) {
+            Some(start) => sequence.copy_from_slice(&chunk[start..end]),
+            None => {
+                let carried = len - end;
+                sequence[..carried].copy_from_slice(&self.before[self.before.len() - carried..]);
+                sequence[carried..].copy_from_slice(&chunk[..end]);
+            }
+        }
+        if &sequence == SYNCHRONIZED_OUTPUT_BSU {
+            Some(FrameControl::Bsu)
+        } else if &sequence == SYNCHRONIZED_OUTPUT_ESU {
+            Some(FrameControl::Esu)
+        } else {
+            None
+        }
+    }
+
+    /// Starts a frame with its BSU, or the part of it in this chunk.
+    /// Everything held before has been applied.
+    fn begin_frame(&mut self, bsu: &[u8]) {
+        debug_assert!(self.bytes.is_empty() && !self.framed);
+        self.bytes.extend_from_slice(bsu);
+        self.framed = true;
+    }
+
+    /// Parses the frame held raw into the actions the two-stage path holds
+    /// for it, its BSU first: the hold goes on two-stage.
+    fn unframe(
+        &mut self,
+        generation: &PaneRegistrationGeneration,
+        parser: &mut termwiz::escape::parser::Parser,
+        actions: &mut Vec<Action>,
+    ) {
+        debug_assert!(self.framed && actions.is_empty());
+        self.framed = false;
+        count_parse_path(generation, false, self.bytes.len());
+        parser.parse(&self.bytes, |action| action.append_to(actions));
+        self.bytes.clear();
     }
 }
 
@@ -11203,21 +11463,41 @@ impl SyncControlScan {
     const SYNCHRONIZED_OUTPUT_MODE: i64 = 2026;
 
     /// Advances over `chunk` and returns whether a sequence that can decode
-    /// to a synchronized-output action ends in it.
-    fn scan(&mut self, chunk: &[u8]) -> bool {
+    /// to a synchronized-output action ends in it. `ends` is cleared, then
+    /// gets the offset just past each such sequence's final byte.
+    fn scan(&mut self, chunk: &[u8], ends: &mut Vec<usize>) -> bool {
+        ends.clear();
         let Some(last) = rfind_any(chunk, [0x1b, 0x9b]) else {
             // No sequence starts here; one left open may end here.
-            return self.state != SyncScanState::Ground && self.scan_bytes(chunk);
+            if self.state != SyncScanState::Ground {
+                self.scan_bytes(chunk, 0, ends);
+            }
+            return !ends.is_empty();
         };
-        if self.may_end_control(chunk) {
-            return self.scan_bytes(chunk);
+        if self.may_end_control(chunk) && self.may_mark_control(chunk) {
+            self.scan_bytes(chunk, 0, ends);
+            return !ends.is_empty();
         }
         // No control ends here, so only where the scan stands at the end
         // matters, and from the last ESC or 0x9B on that does not depend on
         // what came before.
-        let found = self.scan_bytes(&chunk[last..]);
-        debug_assert!(!found, "a control ended where none could");
+        self.scan_bytes(&chunk[last..], last, ends);
+        debug_assert!(ends.is_empty(), "a control ended where none could");
         false
+    }
+
+    /// Whether a control can end in `chunk` given its markers. Every
+    /// control has one: mode 2026's set, reset and query follow `?`, DECSTR
+    /// has `!`. It is in `chunk`, or, for a sequence still open, was in an
+    /// earlier chunk. TUI rows rarely hold either, where they often hold a
+    /// word starting with h, l or p after a space, which defeats
+    /// [`Self::may_end_control`].
+    fn may_mark_control(&self, chunk: &[u8]) -> bool {
+        let open = matches!(
+            self.state,
+            SyncScanState::CsiEntry | SyncScanState::CsiParam | SyncScanState::CsiIntermediate
+        );
+        (open && (self.dec_private || self.bang)) || find_any(chunk, *b"?!").is_some()
     }
 
     /// Whether a control can end in `chunk`. Its final byte (h, l or p)
@@ -11248,27 +11528,29 @@ impl SyncControlScan {
         false
     }
 
-    /// Steps over `bytes` and returns whether a control ends in them.
-    fn scan_bytes(&mut self, bytes: &[u8]) -> bool {
-        let mut found = false;
-        let mut rest = bytes;
+    /// Steps over `bytes`, which sit at `base` in the chunk, and records in
+    /// `ends` where each control ends.
+    fn scan_bytes(&mut self, bytes: &[u8], base: usize, ends: &mut Vec<usize>) {
+        let mut at = 0;
         loop {
             if self.state == SyncScanState::Ground {
                 // Only ESC and 0x9B leave the ground state here.
-                match find_any(rest, [0x1b, 0x9b]) {
-                    Some(at) => rest = &rest[at..],
-                    None => return found,
+                match find_any(&bytes[at..], [0x1b, 0x9b]) {
+                    Some(skip) => at += skip,
+                    None => return,
                 }
-                if let Some(len) = Self::plain_csi_len(rest) {
-                    rest = &rest[len..];
+                if let Some(len) = Self::plain_csi_len(&bytes[at..]) {
+                    at += len;
                     continue;
                 }
             }
-            let Some((&byte, tail)) = rest.split_first() else {
-                return found;
+            let Some(&byte) = bytes.get(at) else {
+                return;
             };
-            found |= self.step(byte);
-            rest = tail;
+            at += 1;
+            if self.step(byte) {
+                ends.push(base + at);
+            }
         }
     }
 
@@ -11444,11 +11726,13 @@ fn rfind_any<const N: usize>(bytes: &[u8], needles: [u8; N]) -> Option<usize> {
 
 /// Applies what the parse thread holds, in stream order: the pending
 /// two-stage actions, then the raw bytes through the fused path, then any
-/// actions the fused gate diverted (ft-yccm0.3.2.1 option 2). Raw bytes
-/// never hold a synchronized-output action (see [`RawCoalescer`]), so the
-/// diverted ones are alerts and the like, appended as the two-stage path
-/// appends them. Where the fused path declines (no local pane, a poisoned
-/// checkpoint), the bytes are parsed into actions as before.
+/// actions the fused gate diverted (ft-yccm0.3.2.1 option 2). Raw plain
+/// output never holds a synchronized-output action (see [`RawCoalescer`]),
+/// so the diverted ones are alerts and the like, appended as the two-stage
+/// path appends them. A frame held raw applies its BSU and ESU in place;
+/// the loop opened and drained its hold already. Where the fused path
+/// declines (no local pane, a poisoned checkpoint), the bytes are parsed
+/// into actions as before.
 fn flush_coalesced_output(
     pane: &Weak<dyn Pane>,
     generation: &Arc<PaneRegistrationGeneration>,
@@ -11465,14 +11749,36 @@ fn flush_coalesced_output(
         return;
     }
     let bytes = std::mem::take(&mut raw.bytes);
+    let framed = std::mem::take(&mut raw.framed);
     let mut diverted = Vec::new();
-    if feed_chunk_to_mux(pane, generation, dead, parser, &bytes, &mut diverted) {
+    if feed_chunk_to_mux(
+        pane,
+        generation,
+        dead,
+        parser,
+        &bytes,
+        framed,
+        &mut diverted,
+    ) {
         count_parse_path(generation, true, bytes.len());
     } else {
         count_parse_path(generation, false, bytes.len());
         parser.parse(&bytes, |action| diverted.push(action));
     }
     for action in diverted {
+        if framed {
+            // An alert in the frame diverted it from there on, its ESU
+            // included: applied with the actions, it ends synchronized
+            // output after the frame all the same.
+            debug_assert!(
+                !is_synchronized_output_action(&action)
+                    || is_synchronized_output_mode_switch(&action),
+                "a frame held raw decoded a synchronized-output query or reset: {:?}",
+                action
+            );
+            action.append_to(actions);
+            continue;
+        }
         debug_assert!(
             !is_synchronized_output_action(&action),
             "held raw output decoded a synchronized-output action: {:?}",
@@ -11948,6 +12254,7 @@ fn parse_buffered_data(
     let fused_parse = fused_parse_enabled();
     // Raw coalescing needs the fused path (ft-yccm0.3.2.1 option 2).
     let coalesce_raw = fused_parse && cfg!(not(feature = "disruptor-pane-io"));
+    let raw_frames = coalesce_raw && sync_frame_raw_holds_enabled();
     let mut raw = RawCoalescer::default();
 
     loop {
@@ -12117,122 +12424,188 @@ fn parse_buffered_data(
                 // the loop coalesces, and fed fused where the two-stage path
                 // applied the actions it parsed (ft-yccm0.3.2.1 option 2).
                 let control = coalesce_raw && raw.scan_controls(chunk);
-                let holdable = coalesce_raw && !hold.is_holding() && !control;
-                if !holdable && !raw.is_empty() {
-                    // This chunk is parsed as before, after what is held.
-                    flush_coalesced_output(
-                        &pane,
-                        &generation,
-                        dead,
-                        &mut parser,
-                        &mut raw,
-                        &mut actions,
-                        &mut hold,
-                    );
-                    action_size = 0;
-                    deadline = None;
+                // So is a synchronized-output frame, from its BSU through its
+                // ESU (see RawCoalescer).
+                let framed = raw_frames
+                    && (control || raw.is_framed())
+                    && raw.plan_frames(chunk, hold.is_holding());
+                if raw.is_framed() && !framed {
+                    // Another control during the frame: its hold goes on
+                    // two-stage, with the frame so far parsed into actions.
+                    raw.unframe(&generation, &mut parser, &mut actions);
                 }
-                let crossing = action_size.saturating_add(size) >= read_limit;
-                let held = holdable && !crossing;
-                if held {
-                    raw.push(chunk);
-                }
-                // The fused path (ft-yccm0.3.2.1) takes a chunk the code below
-                // would apply at once anyway: no synchronized-output hold, and
-                // enough output that it would not wait to coalesce a frame.
-                // Earlier pending actions go first, as they would in one batch,
-                // and held raw output joins this chunk in one fused feed.
-                let joined = !held && !raw.is_empty();
-                if joined {
-                    raw.push(chunk);
-                }
-                let feed: &[u8] = if joined { &raw.bytes } else { chunk };
-                let mut diverted = Vec::new();
-                let fused = !held && fused_parse && !hold.is_holding() && crossing && {
-                    if !actions.is_empty() {
-                        send_actions_to_mux(&pane, &generation, dead, std::mem::take(&mut actions));
-                        deadline = None;
-                    }
-                    feed_chunk_to_mux(&pane, &generation, dead, &mut parser, feed, &mut diverted)
-                };
-                if !held {
-                    count_parse_path(&generation, fused, feed.len());
-                }
-                let mut chunk_touched_hold = hold.is_holding();
-                let mut chunk_admission_emitted = false;
-                let mut on_action = |action: Action| {
-                    let was_holding = hold.is_holding();
-                    let effect = handle_synchronized_output_action(&action, &mut hold, |hold| {
-                        respond_to_synchronized_output_query(&pane, &generation, hold);
-                    });
-                    if was_holding || hold.is_holding() {
-                        chunk_touched_hold = true;
-                    }
-                    if let Some(depth_outcome) = effect.depth_outcome {
-                        if effect.flush {
-                            if chunk_touched_hold && !chunk_admission_emitted && size > 0 {
-                                notify_synchronized_output_event(
+                let mut report = ChunkHoldReport::new(size, hold.is_holding());
+                let fused = if framed {
+                    let plan = std::mem::take(&mut raw.frame_controls);
+                    let mut from = 0;
+                    for &(frame_control, end) in &plan {
+                        let action = frame_control.action();
+                        match frame_control {
+                            FrameControl::Bsu => {
+                                // What came before the BSU, held or in this
+                                // chunk, is applied before its hold opens, as
+                                // the two-stage path flushes the actions
+                                // parsed before it (with the BSU's first
+                                // bytes, if they came in the chunk before).
+                                let start = end.saturating_sub(SYNCHRONIZED_OUTPUT_BSU.len());
+                                raw.push(&chunk[from..start]);
+                                report_synchronized_output_action(
                                     &pane,
                                     &generation,
-                                    SynchronizedOutputEvent::Admission {
-                                        decision: SynchronizedOutputAdmissionDecision::Accepted,
-                                        bytes: size as u64,
-                                    },
+                                    &action,
+                                    &mut hold,
+                                    &mut report,
+                                    action_size,
                                 );
-                                chunk_admission_emitted = true;
+                                if !actions.is_empty() || !raw.is_empty() {
+                                    flush_coalesced_output(
+                                        &pane,
+                                        &generation,
+                                        dead,
+                                        &mut parser,
+                                        &mut raw,
+                                        &mut actions,
+                                        &mut hold,
+                                    );
+                                    action_size = 0;
+                                    deadline = None;
+                                }
+                                raw.begin_frame(&chunk[start..end]);
                             }
-                            notify_synchronized_output_event(
-                                &pane,
-                                &generation,
-                                SynchronizedOutputEvent::Drain {
-                                    cause: SynchronizedOutputDrainCause::Esu,
-                                    bytes: action_size.saturating_add(size) as u64,
-                                    depth_outcome: Some(depth_outcome),
-                                    max_depth: hold.max_depth(),
-                                },
-                            );
-                        } else {
-                            notify_synchronized_output_event(
-                                &pane,
-                                &generation,
-                                SynchronizedOutputEvent::Depth {
-                                    outcome: depth_outcome,
-                                    max_depth: hold.max_depth(),
-                                },
-                            );
+                            FrameControl::Esu => {
+                                raw.push(&chunk[from..end]);
+                                let effect = report_synchronized_output_action(
+                                    &pane,
+                                    &generation,
+                                    &action,
+                                    &mut hold,
+                                    &mut report,
+                                    action_size,
+                                );
+                                debug_assert!(effect.flush && !hold.is_holding());
+                                flush_coalesced_output(
+                                    &pane,
+                                    &generation,
+                                    dead,
+                                    &mut parser,
+                                    &mut raw,
+                                    &mut actions,
+                                    &mut hold,
+                                );
+                                action_size = 0;
+                                deadline = None;
+                            }
                         }
-                    } else if effect.handled {
-                        notify_synchronized_output_event(
+                        from = end;
+                    }
+                    raw.frame_controls = plan;
+                    // The rest of the frame, or plain output after it, held
+                    // as such.
+                    raw.push(&chunk[from..]);
+                    false
+                } else {
+                    let holdable = coalesce_raw && !hold.is_holding() && !control;
+                    if !holdable && !raw.is_empty() {
+                        // This chunk is parsed as before, after what is held.
+                        flush_coalesced_output(
                             &pane,
                             &generation,
-                            SynchronizedOutputEvent::ModeQuery,
+                            dead,
+                            &mut parser,
+                            &mut raw,
+                            &mut actions,
+                            &mut hold,
                         );
-                    }
-                    if !was_holding && hold.is_holding() && !actions.is_empty() {
-                        // Flush prior actions before entering BSU hold.
-                        send_actions_to_mux(&pane, &generation, dead, std::mem::take(&mut actions));
                         action_size = 0;
+                        deadline = None;
                     }
-                    if !effect.handled {
-                        action.append_to(&mut actions);
+                    let crossing = action_size.saturating_add(size) >= read_limit;
+                    let held = holdable && !crossing;
+                    if held {
+                        raw.push(chunk);
                     }
+                    // The fused path (ft-yccm0.3.2.1) takes a chunk the code
+                    // below would apply at once anyway: no synchronized-output
+                    // hold, and enough output that it would not wait to
+                    // coalesce a frame. Earlier pending actions go first, as
+                    // they would in one batch, and held raw output joins this
+                    // chunk in one fused feed.
+                    let joined = !held && !raw.is_empty();
+                    if joined {
+                        raw.push(chunk);
+                    }
+                    let feed: &[u8] = if joined { &raw.bytes } else { chunk };
+                    let mut diverted = Vec::new();
+                    let fused = !held && fused_parse && !hold.is_holding() && crossing && {
+                        if !actions.is_empty() {
+                            send_actions_to_mux(
+                                &pane,
+                                &generation,
+                                dead,
+                                std::mem::take(&mut actions),
+                            );
+                            deadline = None;
+                        }
+                        feed_chunk_to_mux(
+                            &pane,
+                            &generation,
+                            dead,
+                            &mut parser,
+                            feed,
+                            false,
+                            &mut diverted,
+                        )
+                    };
+                    if !held {
+                        count_parse_path(&generation, fused, feed.len());
+                    }
+                    let mut on_action = |action: Action| {
+                        let was_holding = hold.is_holding();
+                        let effect = report_synchronized_output_action(
+                            &pane,
+                            &generation,
+                            &action,
+                            &mut hold,
+                            &mut report,
+                            action_size,
+                        );
+                        if !was_holding && hold.is_holding() && !actions.is_empty() {
+                            // Flush prior actions before entering BSU hold.
+                            send_actions_to_mux(
+                                &pane,
+                                &generation,
+                                dead,
+                                std::mem::take(&mut actions),
+                            );
+                            action_size = 0;
+                        }
+                        if !effect.handled {
+                            action.append_to(&mut actions);
+                        }
 
-                    if effect.flush && !actions.is_empty() {
-                        send_actions_to_mux(&pane, &generation, dead, std::mem::take(&mut actions));
-                        action_size = 0;
+                        if effect.flush && !actions.is_empty() {
+                            send_actions_to_mux(
+                                &pane,
+                                &generation,
+                                dead,
+                                std::mem::take(&mut actions),
+                            );
+                            action_size = 0;
+                        }
+                    };
+                    if fused {
+                        // Only what the gate diverted remains, already decoded.
+                        for action in diverted {
+                            on_action(action);
+                        }
+                    } else if !held {
+                        parser.parse(feed, &mut on_action);
                     }
+                    if joined {
+                        raw.bytes.clear();
+                    }
+                    fused
                 };
-                if fused {
-                    // Only what the gate diverted remains, already decoded.
-                    for action in diverted {
-                        on_action(action);
-                    }
-                } else if !held {
-                    parser.parse(feed, &mut on_action);
-                }
-                if joined {
-                    raw.bytes.clear();
-                }
                 // Parsed, or held raw: the slot goes back to the reader once
                 // exhausted. A held chunk counts toward the checkpoint fence
                 // as the chunk the two-stage path parsed did, since a capture
@@ -12246,16 +12619,7 @@ fn parse_buffered_data(
                     dead.store(true, Ordering::Release);
                     break;
                 }
-                if chunk_touched_hold && !chunk_admission_emitted && size > 0 {
-                    notify_synchronized_output_event(
-                        &pane,
-                        &generation,
-                        SynchronizedOutputEvent::Admission {
-                            decision: SynchronizedOutputAdmissionDecision::Accepted,
-                            bytes: size as u64,
-                        },
-                    );
-                }
+                report.admit(&pane, &generation);
                 if fused && actions.is_empty() {
                     // Everything this chunk produced is applied.
                     action_size = 0;
@@ -12396,7 +12760,9 @@ fn parse_buffered_data(
 /// capture as soon as one is pending, a guardian capture once delivery and
 /// parsing have reached its fence (where the parser's recovery watermark
 /// must equal the fence). The parser then stands where the two-stage path's
-/// stood, with the same bytes behind it and the same fence ahead.
+/// stood, with the same bytes behind it and the same fence ahead. A frame
+/// held raw stays held: its hold refuses either capture, as the two-stage
+/// path's hold did.
 #[allow(clippy::too_many_arguments)]
 fn attempt_live_parser_checkpoint_after_raw(
     pane: &Weak<dyn Pane>,
@@ -12409,7 +12775,9 @@ fn attempt_live_parser_checkpoint_after_raw(
     worker: &mut ModelCheckpointWorker,
 ) -> LiveParserAttemptOutcome {
     let control = &generation.live_parser_checkpoint;
+    debug_assert!(!raw.is_framed() || hold.is_holding());
     if !raw.is_empty()
+        && !raw.is_framed()
         && (control.has_ready_model_checkpoint()
             || matches!(control.ready_checkpoint_target(), Ok(Some(_))))
     {
@@ -26500,30 +26868,41 @@ mod tests {
         }
     }
 
+    /// The synchronized-output actions the live parser, fed `stream` one
+    /// byte at a time, decodes, each with the offset of the byte it decodes
+    /// on.
+    fn synchronized_output_controls(stream: &[u8]) -> Vec<(usize, Action)> {
+        let mut parser = termwiz::escape::parser::Parser::new();
+        let mut controls = Vec::new();
+        for (at, byte) in stream.iter().enumerate() {
+            parser.parse(std::slice::from_ref(byte), |action| {
+                if is_synchronized_output_action(&action) {
+                    controls.push((at, action));
+                }
+            });
+        }
+        controls
+    }
+
     /// The offsets of the bytes on which the live parser, fed `stream` one
     /// byte at a time, decodes a synchronized-output action.
     fn synchronized_output_control_ends(stream: &[u8]) -> Vec<usize> {
-        let mut parser = termwiz::escape::parser::Parser::new();
-        let mut ends = Vec::new();
-        for (at, byte) in stream.iter().enumerate() {
-            let mut decoded = false;
-            parser.parse(std::slice::from_ref(byte), |action| {
-                decoded |= is_synchronized_output_action(&action);
-            });
-            if decoded {
-                ends.push(at);
-            }
-        }
+        let mut ends: Vec<usize> = synchronized_output_controls(stream)
+            .into_iter()
+            .map(|(at, _)| at)
+            .collect();
+        ends.dedup();
         ends
     }
 
     /// ft-yccm0.3.2.1: however the stream is cut, exactly the chunks in
-    /// which the parser decodes a synchronized-output action are flagged.
-    /// BSU, ESU, the mode-2026 query and DECSTR, in every form the parser
-    /// takes (several modes, a leading zero, a NUL inside, 8-bit CSI, CSI
-    /// as UTF-8), are parsed as they arrive; the digits 2026 in text, in an
-    /// SGR, an ANSI mode, a mode save, an OSC title or a sequence CAN
-    /// aborted are held and fed fused.
+    /// which the parser decodes a synchronized-output action are flagged,
+    /// and the scan says where in the chunk each one ends. BSU, ESU, the
+    /// mode-2026 query and DECSTR, in every form the parser takes (several
+    /// modes, a leading zero, a NUL inside, 8-bit CSI, CSI as UTF-8), are
+    /// parsed as they arrive; the digits 2026 in text, in an SGR, an ANSI
+    /// mode, a mode save, an OSC title or a sequence CAN aborted are held
+    /// and fed fused.
     #[test]
     fn sync_control_scan_flags_exactly_the_chunks_that_end_a_control() {
         let stream: &[u8] = b"ab 2026-10-07 \x1b[38;5;2026m6\x1b[?2026hcd\x1b[?1;2026l 2026\
@@ -26533,13 +26912,25 @@ mod tests {
         assert_eq!(ends.len(), 8, "the stream holds eight controls: {:?}", ends);
         let check = |cuts: &[usize]| {
             let mut scan = SyncControlScan::default();
+            let mut found = Vec::new();
             let mut start = 0;
             for &end in cuts.iter().chain(std::iter::once(&stream.len())) {
                 let chunk = &stream[start..end];
-                let ends_control = ends.iter().any(|&at| (start..end).contains(&at));
+                let in_chunk: Vec<usize> = ends
+                    .iter()
+                    .filter(|&&at| (start..end).contains(&at))
+                    .map(|&at| at + 1 - start)
+                    .collect();
                 assert_eq!(
-                    scan.scan(chunk),
-                    ends_control,
+                    scan.scan(chunk, &mut found),
+                    !in_chunk.is_empty(),
+                    "cuts {:?}: chunk {:?}",
+                    cuts,
+                    String::from_utf8_lossy(chunk)
+                );
+                assert_eq!(
+                    found,
+                    in_chunk,
                     "cuts {:?}: chunk {:?}",
                     cuts,
                     String::from_utf8_lossy(chunk)
@@ -26558,12 +26949,19 @@ mod tests {
 
     /// ft-yccm0.3.2.1: on random streams, cut at random, every chunk in
     /// which the live parser decodes a synchronized-output action is
-    /// flagged. A stream mixes CSI sequences built around mode 2026 (each
-    /// introducer form, marker, parameter list, intermediate and final,
-    /// with a stray byte spliced in at random: a C0 control, DEL, CAN, SUB,
-    /// ESC, a C1 control, 0xa0..=0xff) with loose pieces of sequences (ESC,
-    /// 8-bit and UTF-8 C1 controls, markers, intermediates, digits,
-    /// separators, finals, string introducers and terminators, UTF-8).
+    /// flagged, with the place each one ends. A stream mixes CSI sequences
+    /// built around mode 2026 (each introducer form, marker, parameter
+    /// list, intermediate and final, with a stray byte spliced in at
+    /// random: a C0 control, DEL, CAN, SUB, ESC, a C1 control,
+    /// 0xa0..=0xff) with loose pieces of sequences (ESC, 8-bit and UTF-8
+    /// C1 controls, markers, intermediates, digits, separators, finals,
+    /// string introducers and terminators, UTF-8, BSU and ESU).
+    ///
+    /// And a control the scan reports that ends the eight bytes of BSU or
+    /// ESU as applications send them, which the parse thread then holds a
+    /// frame raw by, is that action: the parser decodes it there and
+    /// nothing else, whatever came before (an open string, a broken UTF-8
+    /// character, a sequence cut short).
     #[test]
     fn sync_control_scan_never_misses_a_control_the_parser_decodes() {
         const INTRODUCERS: &[&[u8]] = &[
@@ -26622,6 +27020,12 @@ mod tests {
             b" ",
             b"a",
             b"\xf0\x9f\x98\x80",
+            SYNCHRONIZED_OUTPUT_BSU,
+            SYNCHRONIZED_OUTPUT_ESU,
+            b"\x1b]0;",
+            b"\x1bP",
+            b"\x1b_",
+            b"\xf0\x9f",
         ];
         let mut seed = 0x2026_1007_u64;
         let mut next = move |bound: usize| {
@@ -26632,6 +27036,7 @@ mod tests {
         };
         let mut controls = 0_usize;
         let mut flagged_without_control = 0_usize;
+        let mut frame_controls = 0_usize;
         for _ in 0..20_000 {
             let mut stream = Vec::new();
             for _ in 0..1 + next(12) {
@@ -26655,8 +27060,10 @@ mod tests {
                 }
                 stream.extend_from_slice(&sequence);
             }
+            let decoded_controls = synchronized_output_controls(&stream);
             let mut parser = termwiz::escape::parser::Parser::new();
             let mut scan = SyncControlScan::default();
+            let mut found = Vec::new();
             let mut start = 0;
             while start < stream.len() {
                 let end = (start + 1 + next(8)).min(stream.len());
@@ -26665,23 +27072,72 @@ mod tests {
                 parser.parse(chunk, |action| {
                     decoded |= is_synchronized_output_action(&action);
                 });
-                let flagged = scan.scan(chunk);
+                let flagged = scan.scan(chunk, &mut found);
                 assert!(
                     flagged || !decoded,
                     "stream {:?}: chunk {:?} decodes a control but was not flagged",
                     String::from_utf8_lossy(&stream),
                     String::from_utf8_lossy(chunk)
                 );
+                for (at, _) in decoded_controls
+                    .iter()
+                    .filter(|(at, _)| (start..end).contains(at))
+                {
+                    assert!(
+                        found.contains(&(at + 1 - start)),
+                        "stream {:?}: the control ending at {} is not where the scan found \
+                         controls in chunk {:?}: {:?}",
+                        String::from_utf8_lossy(&stream),
+                        at,
+                        String::from_utf8_lossy(chunk),
+                        found
+                    );
+                }
+                for &found_end in &found {
+                    let control_end = start + found_end;
+                    let Some(sequence) = control_end
+                        .checked_sub(SYNCHRONIZED_OUTPUT_BSU.len())
+                        .map(|from| &stream[from..control_end])
+                    else {
+                        continue;
+                    };
+                    let action = if sequence == SYNCHRONIZED_OUTPUT_BSU {
+                        FrameControl::Bsu.action()
+                    } else if sequence == SYNCHRONIZED_OUTPUT_ESU {
+                        FrameControl::Esu.action()
+                    } else {
+                        continue;
+                    };
+                    let there: Vec<&Action> = decoded_controls
+                        .iter()
+                        .filter(|(at, _)| at + 1 == control_end)
+                        .map(|(_, action)| action)
+                        .collect();
+                    assert_eq!(
+                        there,
+                        vec![&action],
+                        "stream {:?}: the frame control ending at {}",
+                        String::from_utf8_lossy(&stream),
+                        control_end
+                    );
+                    frame_controls += 1;
+                }
                 controls += usize::from(decoded);
                 flagged_without_control += usize::from(flagged && !decoded);
                 start = end;
             }
         }
         eprintln!(
-            "[BENCH] sync control scan: {} chunks decode a control, {} flagged without one",
-            controls, flagged_without_control
+            "[BENCH] sync control scan: {} chunks decode a control, {} flagged without one, \
+             {} BSU or ESU as applications send them",
+            controls, flagged_without_control, frame_controls
         );
         assert!(controls > 1000, "the streams decode controls: {}", controls);
+        assert!(
+            frame_controls > 1000,
+            "the streams send frames: {}",
+            frame_controls
+        );
     }
 
     /// The word-at-a-time searches the control scan uses find what a plain
@@ -26741,8 +27197,9 @@ mod tests {
     /// ft-yccm0.3.2.1: what the control scan costs the parse thread per
     /// 64 KiB ring slot, against the digit scan it replaced, on 64 MiB each
     /// of T0 cells (one in twenty an ASCII character from the operator's
-    /// pool, h, l and p included), an LF staircase, and TUI rows (CUP, SGR,
-    /// words, EL). A measurement, not a gate:
+    /// pool, h, l and p included), an LF staircase, TUI rows (CUP, SGR,
+    /// words, EL), and the same rows in frames of 24 (BSU, rows, ESU),
+    /// which the scan reads in full. A measurement, not a gate:
     /// cargo test --profile release-perf -p mux --lib -- --ignored sync_control_scan_throughput --nocapture
     #[test]
     #[ignore = "a throughput measurement; run it in release"]
@@ -26781,14 +27238,32 @@ mod tests {
             );
             n += 1;
         }
+        let mut tui_frames = Vec::new();
+        for row in tui.split_inclusive(|&byte| byte == b'K') {
+            if tui_frames.len() >= 64 << 20 {
+                break;
+            }
+            if n.is_multiple_of(24) {
+                tui_frames.extend_from_slice(SYNCHRONIZED_OUTPUT_ESU);
+                tui_frames.extend_from_slice(SYNCHRONIZED_OUTPUT_BSU);
+            }
+            tui_frames.extend_from_slice(row);
+            n += 1;
+        }
         let digit_scan = |chunk: &[u8]| chunk.windows(4).any(|w| w == b"2026");
-        for (name, corpus) in [("t0", &t0), ("seq_lines", &seq), ("tui", &tui)] {
+        for (name, corpus) in [
+            ("t0", &t0),
+            ("seq_lines", &seq),
+            ("tui", &tui),
+            ("tui_frames", &tui_frames),
+        ] {
             let mut best = [f64::INFINITY; 2];
             for _ in 0..3 {
                 let start = Instant::now();
                 let mut scan = SyncControlScan::default();
+                let mut ends = Vec::new();
                 for chunk in corpus.chunks(64 << 10) {
-                    std::hint::black_box(scan.scan(std::hint::black_box(chunk)));
+                    std::hint::black_box(scan.scan(std::hint::black_box(chunk), &mut ends));
                 }
                 best[0] = best[0].min(start.elapsed().as_secs_f64());
                 let start = Instant::now();
@@ -26862,7 +27337,8 @@ mod tests {
     /// with a mux so that its real reader and parse threads run. Output is
     /// injected into its byte ring as exact deliveries, chunk by chunk
     /// (ft-yccm0.3.2.1 option 2). The bells its mux dispatches for it, and
-    /// the synchronized-output holds ESU drains, are counted.
+    /// the synchronized-output holds ESU drains, are counted, and its
+    /// synchronized-output events kept.
     #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
     struct QuietLocalPane {
         _mux: Arc<Mux>,
@@ -26871,6 +27347,7 @@ mod tests {
         generation: Arc<PaneRegistrationGeneration>,
         bells: Arc<AtomicUsize>,
         esu_drains: Arc<AtomicUsize>,
+        sync_events: Arc<Mutex<Vec<SynchronizedOutputEvent>>>,
     }
 
     #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
@@ -26916,8 +27393,10 @@ mod tests {
             let mux = Arc::new(Mux::new(None));
             let bells = Arc::new(AtomicUsize::new(0));
             let esu_drains = Arc::new(AtomicUsize::new(0));
+            let sync_events = Arc::new(Mutex::new(Vec::new()));
             let observed_bells = Arc::clone(&bells);
             let observed_drains = Arc::clone(&esu_drains);
+            let observed_events = Arc::clone(&sync_events);
             mux.subscribe(move |notification| {
                 match notification {
                     MuxNotification::Alert {
@@ -26926,15 +27405,15 @@ mod tests {
                     } if pane_id == id => {
                         observed_bells.fetch_add(1, Ordering::Relaxed);
                     }
-                    MuxNotification::SynchronizedOutput {
-                        pane_id,
-                        event:
-                            SynchronizedOutputEvent::Drain {
-                                cause: SynchronizedOutputDrainCause::Esu,
-                                ..
-                            },
-                    } if pane_id == id => {
-                        observed_drains.fetch_add(1, Ordering::Relaxed);
+                    MuxNotification::SynchronizedOutput { pane_id, event } if pane_id == id => {
+                        if let SynchronizedOutputEvent::Drain {
+                            cause: SynchronizedOutputDrainCause::Esu,
+                            ..
+                        } = event
+                        {
+                            observed_drains.fetch_add(1, Ordering::Relaxed);
+                        }
+                        observed_events.lock().push(event);
                     }
                     _ => {}
                 }
@@ -26954,11 +27433,17 @@ mod tests {
                 generation,
                 bells,
                 esu_drains,
+                sync_events,
             })
         }
 
         fn bells(&self) -> usize {
             self.bells.load(Ordering::Relaxed)
+        }
+
+        /// The synchronized-output events the mux has reported for it.
+        fn sync_events(&self) -> Vec<SynchronizedOutputEvent> {
+            self.sync_events.lock().clone()
         }
 
         /// Synchronized-output holds that ESU drained: each one the parse
@@ -27180,8 +27665,9 @@ mod tests {
     /// reach admission. And the chunks are now fed fused: every byte of
     /// output with no synchronized-output control goes through the fused
     /// parser, the digits 2026 in text included, where before only the
-    /// chunk that crossed `read_limit` did. Real BSU and ESU are still
-    /// parsed as they arrive: every frame's hold opens and ESU drains it.
+    /// chunk that crossed `read_limit` did. Synchronized-output frames are
+    /// held raw from BSU to ESU and fed fused too, where they were parsed
+    /// as they arrived: every frame's hold still opens, and ESU drains it.
     #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
     #[test]
     fn coalesced_chunks_feed_fused_and_end_as_the_two_stage_path_does() -> anyhow::Result<()> {
@@ -27192,6 +27678,7 @@ mod tests {
             return Ok(());
         }
         let _guard = global_test_lock();
+        SYNC_FRAME_RAW_HOLDS_FOR_TEST.store(1, Ordering::Relaxed);
         // A registered local pane admits output only with a scheduler.
         let executor = promise::spawn::SimpleExecutor::new();
         let mut seed = 0x2026_1007_u64;
@@ -27278,20 +27765,414 @@ mod tests {
                 "{}: every byte counted once",
                 name
             );
-            if frames == 0 {
-                assert_eq!(
-                    two_stage, 0,
-                    "{}: chunks with no synchronized-output control take the fused path",
-                    name
+            assert_eq!(
+                two_stage, 0,
+                "{}: plain output and synchronized-output frames take the fused path",
+                name
+            );
+        }
+        Ok(())
+    }
+
+    /// Synchronized output in every shape the parse thread holds frames by
+    /// or falls back from (ft-yccm0.3.2.1): frames with a bell or a title
+    /// inside, the mode query, a nested BSU or DECSTR inside a frame, ESU
+    /// with no hold, BSU with a second mode or as 8-bit CSI, an empty
+    /// frame, and plain output with the digits 2026 between.
+    #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
+    fn mixed_synchronized_output() -> Vec<u8> {
+        let mut stream = Vec::new();
+        for n in 0..40u32 {
+            let mut put = |bytes: &[u8]| stream.extend_from_slice(bytes);
+            put(format!("plain {} of 2026\r\n", n).as_bytes());
+            put(b"\x1b[?2026h\x1b[H");
+            put(format!("frame {} row one\x1b[K\r\nrow two\x07\x1b[K\r\n", n).as_bytes());
+            put(b"\x1b[?2026l");
+            put(b"\x1b[?2026h");
+            put(format!("\x1b]2;title {}\x07titled frame\r\n", n).as_bytes());
+            put(b"\x1b[?2026l\x1b[?2026h\x1b[?2026$pqueried\r\n\x1b[?2026l");
+            put(b"\x1b[?2026hnest\x1b[?2026hed\x1b[?2026l still held\x1b[?2026l\r\n");
+            put(b"\x1b[?2026hbefore reset\x1b[!pafter reset\r\n");
+            put(b"stray \x1b[?2026l esu\r\n");
+            put(b"\x1b[?2026;25hsecond mode\x1b[?2026l\r\n");
+            put(b"\x9b?2026height-bit\x1b[?2026l\r\n");
+            put(b"\x1b[?2026h\x1b[?2026l");
+            put(format!("\x1b[3{}m2026\x1b[0m\r\n", n % 8).as_bytes());
+        }
+        stream
+    }
+
+    /// How many synchronized-output holds ESU drains in `stream`, as the
+    /// parse thread tracks holds.
+    #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
+    fn esu_drains_in(stream: &[u8]) -> usize {
+        let mut hold = SynchronizedOutputHold::default();
+        let mut drains = 0;
+        termwiz::escape::parser::Parser::new().parse(stream, |action| {
+            let effect = handle_synchronized_output_action(&action, &mut hold, |_| {});
+            drains += usize::from(matches!(
+                effect.depth_outcome,
+                Some(SynchronizedOutputDepthOutcome::Flushed)
+            ));
+        });
+        drains
+    }
+
+    /// One run of a local pane's real parse loop over `chunks`, with frames
+    /// held raw or not: its synchronized-output events, with each drain's
+    /// byte count, which depends on when the loop flushed coalesced output,
+    /// left out, and the bytes it fed fused and parsed two-stage.
+    #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
+    fn run_synchronized_output(
+        executor: &promise::spawn::SimpleExecutor,
+        chunks: &[Vec<u8>],
+        raw_frames: bool,
+    ) -> anyhow::Result<(Vec<SynchronizedOutputEvent>, (u64, u64))> {
+        let stream = chunks.concat();
+        let expected = two_stage_reference(&stream);
+        let drains = esu_drains_in(&stream);
+        SYNC_FRAME_RAW_HOLDS_FOR_TEST.store(if raw_frames { 1 } else { 2 }, Ordering::Relaxed);
+        let pane = QuietLocalPane::new()?;
+        SYNC_FRAME_RAW_HOLDS_FOR_TEST.store(0, Ordering::Relaxed);
+        let control = Arc::clone(&pane.generation.live_parser_checkpoint);
+        let owned = chunks.to_vec();
+        let delivery = std::thread::spawn(move || {
+            for chunk in owned {
+                control
+                    .write_delivered_bytes(&chunk)
+                    .expect("deliver output to the quiet pane");
+            }
+        });
+        let title_matches = || {
+            expected
+                .title
+                .as_ref()
+                .is_none_or(|title| pane.pane.get_title() == *title)
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            while executor.try_tick()? {}
+            let applied = pane.parsed_bytes() == stream.len() as u64
+                && pane.snapshot() == expected.snapshot
+                && pane.bells() == expected.bells
+                && pane.esu_drains() == drains
+                && title_matches();
+            if applied {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let arm = if raw_frames {
+                    "raw frames"
+                } else {
+                    "parsed frames"
+                };
+                assert_eq!(pane.parsed_bytes(), stream.len() as u64, "{}: parsed", arm);
+                assert_eq!(pane.snapshot(), expected.snapshot, "{}: final state", arm);
+                assert_eq!(pane.bells(), expected.bells, "{}: bells", arm);
+                assert_eq!(pane.esu_drains(), drains, "{}: holds ESU drained", arm);
+                if let Some(title) = &expected.title {
+                    assert_eq!(&pane.pane.get_title(), title, "{}: title", arm);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        delivery.join().expect("delivery thread");
+        let events = pane
+            .sync_events()
+            .into_iter()
+            .map(|event| match event {
+                SynchronizedOutputEvent::Drain {
+                    cause,
+                    depth_outcome,
+                    max_depth,
+                    ..
+                } => SynchronizedOutputEvent::Drain {
+                    cause,
+                    bytes: 0,
+                    depth_outcome,
+                    max_depth,
+                },
+                event => event,
+            })
+            .collect();
+        Ok((events, pane.parse_paths()))
+    }
+
+    /// ft-yccm0.3.2.1: with synchronized-output frames held raw from BSU to
+    /// ESU and fed fused, a local pane's real parse loop ends each stream,
+    /// cut in large chunks (1 to 32 KiB) and in small ones (1 to 40 bytes,
+    /// which split BSU and ESU), in the state the two-stage path gives it,
+    /// with the same bells and title, and reports the same synchronized-
+    /// output events, in the same order, as it does with them parsed as
+    /// they arrive (FT_SYNC_FRAME_RAW_HOLDS=0): every depth change, chunk
+    /// admission, ESU drain and mode query. The TUI frames are all fed
+    /// fused, where they were all parsed two-stage.
+    #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
+    #[test]
+    fn frames_held_raw_end_and_report_as_frames_parsed_as_they_arrive() -> anyhow::Result<()> {
+        if run_isolated_with_scheduler(
+            "tests::frames_held_raw_end_and_report_as_frames_parsed_as_they_arrive",
+            "FT_ISOLATED_RAW_FRAME_HOLDS",
+        ) {
+            return Ok(());
+        }
+        let _guard = global_test_lock();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mut seed = 0x2026_1008_u64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        let frames = parse_path_corpora()
+            .into_iter()
+            .find(|corpus| corpus.name == "sync_frames")
+            .expect("the sync_frames corpus")
+            .bytes;
+        for (name, stream) in [
+            ("sync_frames", frames),
+            ("mixed_sync", mixed_synchronized_output()),
+        ] {
+            for (cut, min, spread) in [("large", 1024, 32 * 1024), ("small", 1, 40)] {
+                let mut chunks = Vec::new();
+                let mut offset = 0;
+                while offset < stream.len() {
+                    let size = (min + next() % spread).min(stream.len() - offset);
+                    chunks.push(stream[offset..offset + size].to_vec());
+                    offset += size;
+                }
+                let (raw_events, raw_paths) = run_synchronized_output(&executor, &chunks, true)?;
+                let (parsed_events, parsed_paths) =
+                    run_synchronized_output(&executor, &chunks, false)?;
+                eprintln!(
+                    "[BENCH] mux sync frames {} {} chunks: raw frames {} fused {} two-stage, \
+                     parsed frames {} fused {} two-stage, of {}; {} events",
+                    name,
+                    cut,
+                    raw_paths.0,
+                    raw_paths.1,
+                    parsed_paths.0,
+                    parsed_paths.1,
+                    stream.len(),
+                    raw_events.len()
                 );
-            } else {
                 assert!(
-                    two_stage > 0,
-                    "{}: synchronized output is parsed as it arrives",
-                    name
+                    raw_events.iter().any(|event| matches!(
+                        event,
+                        SynchronizedOutputEvent::Drain {
+                            cause: SynchronizedOutputDrainCause::Esu,
+                            ..
+                        }
+                    )),
+                    "{} {}: holds drain",
+                    name,
+                    cut
                 );
+                assert_eq!(
+                    raw_events, parsed_events,
+                    "{} {}: the same synchronized-output events",
+                    name, cut
+                );
+                for paths in [raw_paths, parsed_paths] {
+                    assert_eq!(paths.0 + paths.1, stream.len() as u64, "{} {}", name, cut);
+                }
+                if name == "sync_frames" {
+                    assert_eq!(raw_paths.1, 0, "{} {}: frames fed fused", name, cut);
+                    if cut == "large" {
+                        assert_eq!(parsed_paths.0, 0, "{} {}: frames parsed", name, cut);
+                    }
+                } else if cut == "small" {
+                    // Large chunks of this stream all hold a control that
+                    // ends a frame held raw, or keeps one from starting.
+                    assert!(
+                        raw_paths.0 > parsed_paths.0,
+                        "{} {}: frames fed fused",
+                        name,
+                        cut
+                    );
+                }
             }
         }
+        Ok(())
+    }
+
+    /// ft-yccm0.3.2.1: a frame held raw is applied at its ESU, never in
+    /// part: output before its BSU is applied when the hold opens, with
+    /// the BSU's first bytes in the delivery before, and the frame waits,
+    /// whatever the loop's coalescing deadline does, until the ESU arrives.
+    /// So with frames parsed as they arrive.
+    #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
+    #[test]
+    fn a_frame_held_raw_is_applied_at_its_esu() -> anyhow::Result<()> {
+        if run_isolated_with_scheduler(
+            "tests::a_frame_held_raw_is_applied_at_its_esu",
+            "FT_ISOLATED_RAW_FRAME_ESU",
+        ) {
+            return Ok(());
+        }
+        let _guard = global_test_lock();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let before: &[u8] = b"before\x1b[?20";
+        let opened: &[u8] = b"26h\x1b[2;1Hframe";
+        let closed: &[u8] = b" done\x1b[?2026l after";
+        let held = two_stage_reference(b"before").snapshot;
+        let all = two_stage_reference(&[before, opened, closed].concat()).snapshot;
+        assert_ne!(held, all);
+        for raw_frames in [true, false] {
+            SYNC_FRAME_RAW_HOLDS_FOR_TEST.store(if raw_frames { 1 } else { 2 }, Ordering::Relaxed);
+            let pane = QuietLocalPane::new()?;
+            SYNC_FRAME_RAW_HOLDS_FOR_TEST.store(0, Ordering::Relaxed);
+            pane.deliver(before);
+            pane.deliver(opened);
+            let delivered = (before.len() + opened.len()) as u64;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while pane.parsed_bytes() != delivered || pane.snapshot() != held {
+                assert!(
+                    Instant::now() < deadline,
+                    "raw frames {}: the output before the BSU is applied",
+                    raw_frames
+                );
+                while executor.try_tick()? {}
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Well past the coalescing deadline.
+            for _ in 0..20 {
+                while executor.try_tick()? {}
+                std::thread::sleep(Duration::from_millis(5));
+                assert_eq!(
+                    pane.snapshot(),
+                    held,
+                    "raw frames {}: the frame waits",
+                    raw_frames
+                );
+            }
+            pane.deliver(closed);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while pane.snapshot() != all {
+                assert!(
+                    Instant::now() < deadline,
+                    "raw frames {}: the frame is applied at its ESU",
+                    raw_frames
+                );
+                while executor.try_tick()? {}
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(pane.esu_drains(), 1, "raw frames {}", raw_frames);
+            let total = delivered + closed.len() as u64;
+            let (fused, two_stage) = pane.parse_paths();
+            assert_eq!(fused + two_stage, total, "raw frames {}", raw_frames);
+            if raw_frames {
+                assert_eq!(two_stage, 0, "the frame is fed fused");
+            } else {
+                assert!(two_stage > 0, "the frame is parsed as it arrives");
+            }
+        }
+        Ok(())
+    }
+
+    /// ft-yccm0.3.2.1: what holding synchronized-output frames raw saves on
+    /// TUI output. 64 MiB of frames as agent TUIs repaint (BSU, then each
+    /// of 24 rows addressed, colored, written and cleared to its end, then
+    /// ESU), delivered in 64 KiB ring slots, drain through a local pane's
+    /// real parse loop with frames held raw and with frames parsed as they
+    /// arrive (FT_SYNC_FRAME_RAW_HOLDS=0), alternately, ABBA. Time runs from
+    /// the first delivery to the last frame drained. A measurement, not a
+    /// gate; it owns the process's scheduler, so run it alone:
+    /// cargo test --profile release-perf -p mux --lib -- --ignored --exact tests::sync_frames_drain_ab --nocapture
+    #[cfg(all(unix, not(feature = "disruptor-pane-io")))]
+    #[test]
+    #[ignore = "a throughput measurement; run it alone, in release"]
+    fn sync_frames_drain_ab() -> anyhow::Result<()> {
+        let _guard = global_test_lock();
+        let executor = promise::spawn::SimpleExecutor::new();
+        const WORDS: &[&str] = &[
+            "agent", "tool", "call", "read", "file", "edit", "diff", "test", "build", "2026", "ok",
+            "pane", "lines", "done",
+        ];
+        let mut stream = Vec::new();
+        let mut frames = 0_usize;
+        while stream.len() < 64 << 20 {
+            stream.extend_from_slice(b"\x1b[?2026h");
+            for row in 0..24_usize {
+                let mut line = format!(
+                    "\x1b[{};1H\x1b[38;5;{}m{:>5} ",
+                    row + 1,
+                    (frames + row) % 256,
+                    frames
+                );
+                let mut word = frames * 7 + row;
+                while line.len() < 84 {
+                    line.push_str(WORDS[word % WORDS.len()]);
+                    line.push(' ');
+                    word = word.wrapping_mul(5).wrapping_add(3);
+                }
+                line.push_str("\x1b[0m\x1b[K");
+                stream.extend_from_slice(line.as_bytes());
+            }
+            stream.extend_from_slice(b"\x1b[?2026l");
+            frames += 1;
+        }
+        let expected = two_stage_reference(&stream).snapshot;
+        let mut times: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+        for raw_frames in [true, false, false, true, true, false, false, true] {
+            SYNC_FRAME_RAW_HOLDS_FOR_TEST.store(if raw_frames { 1 } else { 2 }, Ordering::Relaxed);
+            let pane = QuietLocalPane::new()?;
+            SYNC_FRAME_RAW_HOLDS_FOR_TEST.store(0, Ordering::Relaxed);
+            let control = Arc::clone(&pane.generation.live_parser_checkpoint);
+            let owned = stream.clone();
+            let start = Instant::now();
+            let delivery = std::thread::spawn(move || {
+                for chunk in owned.chunks(64 << 10) {
+                    control
+                        .write_delivered_bytes(chunk)
+                        .expect("deliver output to the quiet pane");
+                }
+            });
+            let deadline = start + Duration::from_secs(120);
+            while pane.parsed_bytes() != stream.len() as u64 || pane.esu_drains() != frames {
+                assert!(Instant::now() < deadline, "the frames drain");
+                while executor.try_tick()? {}
+                std::thread::yield_now();
+            }
+            // The last drain is reported just before its frame is applied.
+            while pane.snapshot() != expected {
+                assert!(Instant::now() < deadline, "the last frame is applied");
+                while executor.try_tick()? {}
+                std::thread::yield_now();
+            }
+            let secs = start.elapsed().as_secs_f64();
+            delivery.join().expect("delivery thread");
+            let (fused, two_stage) = pane.parse_paths();
+            eprintln!(
+                "[BENCH] sync frames drain {}: {:.3} s, {:.0} MiB/s, {} fused {} two-stage",
+                if raw_frames {
+                    "raw frames"
+                } else {
+                    "parsed frames"
+                },
+                secs,
+                stream.len() as f64 / f64::from(1 << 20) / secs,
+                fused,
+                two_stage
+            );
+            times[usize::from(!raw_frames)].push(secs);
+        }
+        let median = |times: &mut Vec<f64>| {
+            times.sort_by(f64::total_cmp);
+            (times[times.len() / 2 - 1] + times[times.len() / 2]) / 2.0
+        };
+        let raw = median(&mut times[0]);
+        let parsed = median(&mut times[1]);
+        eprintln!(
+            "[BENCH] sync frames drain, {} frames, {:.0} MiB: raw frames median {:.3} s, \
+             parsed frames median {:.3} s, {:.2}x",
+            frames,
+            stream.len() as f64 / f64::from(1 << 20),
+            raw,
+            parsed,
+            parsed / raw
+        );
         Ok(())
     }
 
