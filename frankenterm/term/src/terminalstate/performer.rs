@@ -233,6 +233,59 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Runs every print buffer through the grapheme segmenter, the oracle
+    /// the one-char shortcut is checked against.
+    static FORCE_GRAPHEME_SEGMENTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Kill switch for the one-char print shortcut (ft-yccm0.3.2.6): falsey
+/// sends every print buffer through the grapheme segmenter.
+const SINGLE_CHAR_PRINT_ENV: &str = "FT_SINGLE_CHAR_PRINT_FAST_PATH";
+
+/// The graphemes of a print buffer: those `Graphemes` yields, except that a
+/// buffer of exactly one char is that one grapheme without running the
+/// segmenter (ft-yccm0.3.2.6), since one scalar value is always one
+/// extended grapheme cluster. T0 flushes such a buffer for every cell: two
+/// SGRs, then one character.
+enum PrintGraphemes<'a> {
+    One(Option<&'a str>),
+    Segmented(Graphemes<'a>),
+}
+
+impl<'a> PrintGraphemes<'a> {
+    fn new(text: &'a str) -> Self {
+        let mut chars = text.chars();
+        if chars.next().is_some() && chars.next().is_none() && Self::shortcut_enabled() {
+            Self::One(Some(text))
+        } else {
+            Self::Segmented(Graphemes::new(text))
+        }
+    }
+
+    fn shortcut_enabled() -> bool {
+        #[cfg(test)]
+        if FORCE_GRAPHEME_SEGMENTER.with(|force| force.get()) {
+            return false;
+        }
+        static ENABLED: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| !moonshot_env_falsey(SINGLE_CHAR_PRINT_ENV));
+        *ENABLED
+    }
+}
+
+impl<'a> Iterator for PrintGraphemes<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        match self {
+            Self::One(text) => text.take(),
+            Self::Segmented(graphemes) => graphemes.next(),
+        }
+    }
+}
+
+#[cfg(test)]
 static FORCE_SCALAR_PRINTABLE_ASCII_SCAN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -680,7 +733,7 @@ impl<'a> Performer<'a> {
             return;
         }
 
-        for g in Graphemes::new(text) {
+        for g in PrintGraphemes::new(text) {
             if let Some(cell) = junction.take() {
                 if self.merge_into_junction(cell, g, seqno) {
                     continue;
@@ -2927,6 +2980,57 @@ mod tests {
     /// continues the run's last character. The buffered paths segment the
     /// run and that grapheme together, so the fused path must print the same
     /// cell, with autowrap off at the last column too.
+    #[test]
+    fn a_one_char_print_buffer_prints_as_the_segmenter_would_print_it() {
+        // ft-yccm0.3.2.6: an SGR before every char flushes print buffers of
+        // one char each. Emoji and wide chars, a lone combining mark, ZWJ,
+        // VS16 and a skin-tone modifier joining the cell before, regional
+        // indicators pairing across flushes, a SpacingMark, a zero-width
+        // space and ASCII, in shifting orders, then a multi-char tail that
+        // keeps the segmenter.
+        let chars = [
+            "a",
+            "\u{1f600}",
+            "\u{4e2d}",
+            "\u{301}",
+            "\u{200d}",
+            "\u{fe0f}",
+            "\u{1f1fa}",
+            "\u{1f1f8}",
+            "\u{200b}",
+            "\u{2764}",
+            " ",
+            "\u{e9}",
+            "\u{1f3fb}",
+            "\u{903}",
+        ];
+        let mut stream = String::new();
+        let mut color = 0u32;
+        for round in 0..chars.len() {
+            for c in chars.iter().cycle().skip(round).take(chars.len()) {
+                stream.push_str(&format!("\x1b[38;5;{}m{}", color % 256, c));
+                color += 7;
+            }
+        }
+        stream.push_str("\x1b[mab\u{301}c\u{1f468}\u{200d}\u{1f469}");
+        let print = |force_segmenter: bool| {
+            FORCE_GRAPHEME_SEGMENTER.with(|force| force.set(force_segmenter));
+            let config: Arc<dyn TerminalConfiguration + Send + Sync> = Arc::new(GateTermConfig);
+            let size = TerminalSize {
+                rows: 6,
+                cols: 17,
+                pixel_width: 136,
+                pixel_height: 96,
+                dpi: 96,
+            };
+            let mut terminal = Terminal::new(size, config, "WezTerm", "test", Box::new(Vec::new()));
+            terminal.advance_bytes(stream.as_bytes());
+            FORCE_GRAPHEME_SEGMENTER.with(|force| force.set(false));
+            snapshot_terminal(&terminal)
+        };
+        assert_eq!(print(false), print(true));
+    }
+
     #[test]
     fn a_direct_ascii_run_joins_the_next_grapheme_across_an_ignored_sequence() {
         let _bulk = BulkAsciiRowWriteOverride::set(true);
