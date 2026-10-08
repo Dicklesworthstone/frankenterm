@@ -1149,6 +1149,20 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
         }))
     }
 
+    /// `store_scrollback_lines` for rows the caller holds behind `Arc`s, as a
+    /// deferred durability writer does (ft-y0gy9). The default clones each
+    /// row and stores the clones; a sink that can encode borrowed rows
+    /// overrides it to skip the clones. Either way the same rows are stored.
+    fn store_scrollback_shared_lines(
+        &self,
+        first_stable_row: StableRowIndex,
+        lines: &[Arc<Line>],
+        max_retained_rows: usize,
+    ) -> usize {
+        let owned: Vec<Line> = lines.iter().map(|line| line.as_ref().clone()).collect();
+        self.store_scrollback_lines(first_stable_row, &owned, max_retained_rows)
+    }
+
     /// Store one marker row in place of `gap_rows` rows (`gap_bytes` charged
     /// bytes) that overload dropped from durability, and return whether it
     /// was durably acknowledged. A sink that keeps durability-gap totals

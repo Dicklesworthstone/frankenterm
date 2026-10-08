@@ -201,6 +201,12 @@ fn writer_stages(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("charge_clustered", "t0_corpus"), |bench| {
         bench.iter(|| black_box(sealer.charge_clustered(black_box(&rows))));
     });
+    // What the deferred writer paid per window before it handed the store
+    // its shared rows (FT_SCROLLBACK_SHARED_ROWS=0 still does): a clone of
+    // every row, dropped after the store.
+    group.bench_function(BenchmarkId::new("clone_rows", "t0_corpus"), |bench| {
+        bench.iter(|| black_box(black_box(&rows).lines().to_vec()));
+    });
     for level in [1, -1, -3, -7] {
         let bytes = sealer.compress_rows_at(&plaintexts, level);
         eprintln!(

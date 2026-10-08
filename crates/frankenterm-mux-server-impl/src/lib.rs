@@ -700,6 +700,16 @@ mod deferred_scrollback {
         }
     }
 
+    /// Whether the writer hands the backing store its shared rows instead of
+    /// a clone of each (ft-y0gy9): on unless FT_SCROLLBACK_SHARED_ROWS=0,
+    /// read once per process. The same rows are stored either way.
+    fn shared_rows_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            super::durability_switch_on(std::env::var_os("FT_SCROLLBACK_SHARED_ROWS").as_deref())
+        })
+    }
+
     fn duration_ms(duration: Duration) -> u64 {
         u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
     }
@@ -1605,16 +1615,22 @@ mod deferred_scrollback {
             retention: usize,
         ) -> Result<(), ScrollbackSpillError> {
             let started = Instant::now();
-            // Only bounded Arc handles were captured under state. Materialize
-            // the backing-store batch outside the metadata critical section.
-            let lines: Vec<_> = pending_lines
-                .iter()
-                .map(|line| line.as_ref().clone())
-                .collect();
-            let acknowledged = self
-                .backing
-                .store_scrollback_lines(store_row, &lines, retention);
-            if acknowledged == 0 || acknowledged > lines.len() {
+            // Only bounded Arc handles were captured under state. The backing
+            // store encodes those shared rows where they are, outside the
+            // metadata critical section (ft-y0gy9). FT_SCROLLBACK_SHARED_ROWS=0
+            // hands it clones instead, as before.
+            let acknowledged = if shared_rows_enabled() {
+                self.backing
+                    .store_scrollback_shared_lines(store_row, &pending_lines, retention)
+            } else {
+                let lines: Vec<_> = pending_lines
+                    .iter()
+                    .map(|line| line.as_ref().clone())
+                    .collect();
+                self.backing
+                    .store_scrollback_lines(store_row, &lines, retention)
+            };
+            if acknowledged == 0 || acknowledged > pending_lines.len() {
                 return Err(ScrollbackSpillError::StorageUnavailable);
             }
             let durable_bytes = self.backing.retained_scrollback_bytes();
@@ -14497,10 +14513,10 @@ impl LiveScrollbackSpillSink {
 
     /// Store `lines` and count the durability syncs that took. `gap` is the
     /// (rows, bytes) a single gap-marker row stands for (ft-yccm0.2.1.6).
-    fn store_scrollback_rows(
+    fn store_scrollback_rows<L: std::borrow::Borrow<wezterm_term::Line>>(
         &self,
         stable_row: wezterm_term::StableRowIndex,
-        lines: &[wezterm_term::Line],
+        lines: &[L],
         max_retained_rows: usize,
         gap: Option<(u64, u64)>,
     ) -> usize {
@@ -14520,15 +14536,18 @@ impl LiveScrollbackSpillSink {
         if committed { committed_rows } else { 0 }
     }
 
-    fn store_scrollback_lines_transaction(
+    fn store_scrollback_lines_transaction<L: std::borrow::Borrow<wezterm_term::Line>>(
         &self,
         stable_row: wezterm_term::StableRowIndex,
-        lines: &[wezterm_term::Line],
+        lines: &[L],
         max_retained_rows: usize,
         gap: Option<(u64, u64)>,
         committed_rows: &mut usize,
     ) -> bool {
-        let Some(line) = lines.first() else {
+        let Some(line) = lines
+            .first()
+            .map(std::borrow::Borrow::<wezterm_term::Line>::borrow)
+        else {
             return false;
         };
         if lines.len() > LIVE_SCROLLBACK_WINDOW_MAX_ROWS || (gap.is_some() && lines.len() != 1) {
@@ -14863,7 +14882,12 @@ impl LiveScrollbackSpillSink {
             // ft-yccm0.2.1.4 option A: compact rows go into the open segment,
             // sealed by one AEAD operation when full and at the batch's end.
             let mut segment_first = None;
-            for (offset, line) in lines.iter().take(batch_rows).enumerate() {
+            for (offset, line) in lines
+                .iter()
+                .map(std::borrow::Borrow::<wezterm_term::Line>::borrow)
+                .take(batch_rows)
+                .enumerate()
+            {
                 let Some(row) = wezterm_term::StableRowIndex::try_from(offset)
                     .ok()
                     .and_then(|offset| stable_row.checked_add(offset))
@@ -15265,6 +15289,17 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         &self,
         stable_row: wezterm_term::StableRowIndex,
         lines: &[wezterm_term::Line],
+        max_retained_rows: usize,
+    ) -> usize {
+        self.store_scrollback_rows(stable_row, lines, max_retained_rows, None)
+    }
+
+    /// The same transaction over the caller's shared rows, encoded where they
+    /// are, without cloning each row first (ft-y0gy9).
+    fn store_scrollback_shared_lines(
+        &self,
+        stable_row: wezterm_term::StableRowIndex,
+        lines: &[Arc<wezterm_term::Line>],
         max_retained_rows: usize,
     ) -> usize {
         self.store_scrollback_rows(stable_row, lines, max_retained_rows, None)
@@ -17811,6 +17846,52 @@ mod tests {
                 expanded_rows += 1;
             }
             eprintln!("zstd level {level}: {expanded_rows} of 64 T0 rows compress");
+        }
+    }
+
+    /// ft-y0gy9: a live sink stores shared rows as it stores the same rows
+    /// owned: the same acknowledgements window by window, the same retained
+    /// rows and record bytes, and the same rows read back.
+    #[test]
+    fn shared_rows_store_and_read_back_as_owned_rows_do() {
+        let rows = scrollback_record_bench::Rows::t0_corpus(600, 3);
+        let lines = rows.lines();
+        let shared: Vec<Arc<Line>> = lines.iter().cloned().map(Arc::new).collect();
+        let owned_dir = tempfile::tempdir().unwrap();
+        let shared_dir = tempfile::tempdir().unwrap();
+        let owned_sink = windowed_test_sink(owned_dir.path());
+        let shared_sink = windowed_test_sink(shared_dir.path());
+        assert!(owned_sink.store_scrollback_line(0, &lines[0], 4096));
+        assert_eq!(
+            shared_sink.store_scrollback_shared_lines(0, &shared[..1], 4096),
+            1
+        );
+        let mut row = 1;
+        while row < lines.len() {
+            let end = (row + 256).min(lines.len());
+            let owned = owned_sink.store_scrollback_lines(row as isize, &lines[row..end], 4096);
+            let via_shared =
+                shared_sink.store_scrollback_shared_lines(row as isize, &shared[row..end], 4096);
+            assert_eq!(owned, via_shared, "window at row {row}");
+            assert!(owned > 0, "window at row {row}");
+            row += owned;
+        }
+        owned_sink.flush_scrollback().unwrap();
+        shared_sink.flush_scrollback().unwrap();
+        assert_eq!(
+            owned_sink.retained_scrollback_rows(),
+            shared_sink.retained_scrollback_rows()
+        );
+        assert_eq!(
+            owned_sink.retained_scrollback_bytes(),
+            shared_sink.retained_scrollback_bytes()
+        );
+        for probe in [0_usize, 1, 299, 599] {
+            let mut expected = lines[probe].clone();
+            let mut from_owned = owned_sink.load_scrollback_line(probe as isize).unwrap();
+            let mut from_shared = shared_sink.load_scrollback_line(probe as isize).unwrap();
+            assert_eq!(from_owned.cells_mut(), expected.cells_mut(), "row {probe}");
+            assert_eq!(from_shared.cells_mut(), expected.cells_mut(), "row {probe}");
         }
     }
 
