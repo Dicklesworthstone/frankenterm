@@ -20,7 +20,10 @@ use crate::termwindow::metal_glyphs::{FontGlyphs, MAX_SHAPE_PASSES};
 use crate::utilsprites::RenderMetrics;
 use config::ConfigHandle;
 use frankenterm_font::FontConfiguration;
-use frankenterm_gui::metal_scene::{BlinkLevels, CursorSprite, MetalScene, SceneStyle};
+use frankenterm_gui::metal_scene::{
+    BlinkLevels, CursorSprite, MetalScene, SceneStyle, cursor_attr_colors,
+    reverse_video_cursor_applies,
+};
 use frankenterm_renderer_metal::{
     BackgroundUniforms, CursorShape as MetalCursorShape, CursorUniform, MetalRenderer, TextUniforms,
 };
@@ -31,8 +34,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use termwiz::hyperlink::Hyperlink;
 use termwiz::surface::{CursorShape, CursorVisibility};
-use wezterm_term::StableRowIndex;
 use wezterm_term::color::{ColorPalette, SrgbaTuple};
+use wezterm_term::{StableRowIndex, TerminalConfiguration};
 
 /// Straight-alpha sRGB to the premultiplied RGBA the shader composites.
 fn premultiplied(color: SrgbaTuple) -> [f32; 4] {
@@ -185,8 +188,29 @@ impl MetalFrame {
                 CursorShape::Default | CursorShape::BlinkingBlock | CursorShape::SteadyBlock
             );
         let metal_shape = cursor_shape(shape, focused_and_active);
+        let bold_brightens = config.bold_brightens_ansi_colors != config::BoldBrightening::No;
+        // WebGpu's reverse-video cursor (force_reverse_video_cursor), for a
+        // pane that keeps the window's cursor colors.
+        let reverse_video_cursor = config
+            .force_reverse_video_cursor
+            .then(|| {
+                let window = config::TermConfig::new().color_palette();
+                palette.cursor_fg == window.cursor_fg && palette.cursor_bg == window.cursor_bg
+            })
+            .unwrap_or(false)
+            .then_some(config.reverse_video_cursor_min_contrast);
+        // A focused cursor is in the cursor color, or in its cell's
+        // foreground where the reverse-video cursor applies to the cell.
         let cursor_color = if focused_and_active {
-            palette.cursor_bg
+            let row = usize::try_from(cursor.y - frame.mirror.first())
+                .ok()
+                .and_then(|row| frame.mirror.rows().get(row));
+            reverse_video_cursor
+                .and_then(|min_contrast| {
+                    let (fg, bg) = cursor_attr_colors(row, cursor.x, palette, bold_brightens);
+                    reverse_video_cursor_applies(fg, bg, min_contrast).then_some(fg)
+                })
+                .unwrap_or(palette.cursor_bg)
         } else {
             palette.cursor_border
         };
@@ -200,7 +224,7 @@ impl MetalFrame {
             palette,
             generation: ((config.generation() as u64) << 32)
                 | (facts.palette_generation & 0xffff_ffff),
-            bold_brightens: config.bold_brightens_ansi_colors != config::BoldBrightening::No,
+            bold_brightens,
             selection_fg: visible(palette.selection_fg),
             selection_bg: palette.selection_bg,
             cursor_fg: if block_cursor {
@@ -216,6 +240,8 @@ impl MetalFrame {
             // compose cursor is drawn (ft-yccm0.4.7.3).
             blink: BlinkLevels::default(),
             compose: None,
+            min_contrast: config.text_min_contrast_ratio,
+            reverse_video_cursor,
         };
         let mut update = frame
             .scene

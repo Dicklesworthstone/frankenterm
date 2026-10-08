@@ -190,6 +190,45 @@ pub struct SceneStyle<'a> {
     pub blink: BlinkLevels,
     /// A compose cursor in place of the cursor above; `None` for none.
     pub compose: Option<Compose<'a>>,
+    /// `text_min_contrast_ratio`: text is moved to at least this contrast
+    /// with the color it sits on, as WebGpu's `ensure_min_contrast` moves
+    /// it; `None` for no minimum.
+    pub min_contrast: Option<f32>,
+    /// `reverse_video_cursor_min_contrast`, when `force_reverse_video_cursor`
+    /// is set and the pane keeps the window's cursor colors: text under a
+    /// focused block or compose cursor whose colors have at least this
+    /// contrast is drawn in its own background, as WebGpu's
+    /// `use_reverse_video_cursor` draws it. The cursor's own color is the
+    /// caller's ([`cursor_attr_colors`]).
+    pub reverse_video_cursor: Option<f32>,
+}
+
+/// The foreground and background of the cell at `col` of `row` as the
+/// WebGpu renderer resolves them for its cursor: from the attributes alone
+/// (bold brightening the eight ANSI colors when configured, but no reverse
+/// or blink), or the palette's own where there is no cell.
+#[must_use]
+pub fn cursor_attr_colors(
+    row: Option<&MirrorRow>,
+    col: usize,
+    palette: &ColorPalette,
+    bold_brightens: bool,
+) -> (SrgbaTuple, SrgbaTuple) {
+    let cell = row.and_then(|row| row.cells().iter().find(|cell| cell.col() == col));
+    match cell {
+        Some(cell) => (
+            resolved_fg(cell, palette, bold_brightens),
+            palette.resolve_bg(cell.bg().to_attribute()),
+        ),
+        None => (palette.foreground, palette.background),
+    }
+}
+
+/// Whether WebGpu's reverse-video cursor applies to colors `fg` on `bg`:
+/// their contrast reaches `min_contrast`.
+#[must_use]
+pub fn reverse_video_cursor_applies(fg: SrgbaTuple, bg: SrgbaTuple, min_contrast: f32) -> bool {
+    fg.contrast_ratio(&bg) >= min_contrast
 }
 
 /// How visible blinking text is (ft-yccm0.4.7.3): the WebGpu renderer's
@@ -245,9 +284,15 @@ impl RowBlink {
 
 /// `from` moved `amount` of the way to `to`, mixed in linear light as the
 /// WebGpu renderer mixes its linear colors, with `from`'s alpha.
+/// At `amount` 0 it is `from` exactly, as WebGpu's sum is, so text faded
+/// all the way stays equal to its background (which the minimum contrast
+/// leaves alone).
 #[must_use]
 pub fn mix_linear(from: SrgbaTuple, to: SrgbaTuple, amount: f32) -> SrgbaTuple {
     use frankenterm_renderer_metal::color::{linear_to_srgb, srgb_to_linear};
+    if amount == 0.0 {
+        return from;
+    }
     let mix = |from: f32, to: f32| {
         let from = srgb_to_linear(from);
         linear_to_srgb(from + (srgb_to_linear(to) - from) * amount)
@@ -268,21 +313,24 @@ struct RowCursor {
     /// width.
     cols: usize,
     /// A focused block's (or compose cursor's) text color override.
-    fg: Option<[u8; 4]>,
+    fg: Option<SrgbaTuple>,
     /// A focused block's (or compose cursor's) color, which the text under
     /// it sits on.
-    block: Option<[u8; 4]>,
+    block: Option<SrgbaTuple>,
     /// Any other cursor's sprite and color.
     sprite: Option<(CursorSprite, [u8; 4])>,
     /// A compose cursor's composition text, overlaid at `col`.
     composing: Option<String>,
+    /// The reverse-video cursor's minimum contrast (as bits), for a
+    /// focused block or compose cursor ([`SceneStyle::reverse_video_cursor`]).
+    reverse: Option<u32>,
 }
 
 impl RowCursor {
     /// The compose cursor at `col` of `row`, which covers the composition's
     /// columns or, without one (or with one of no width), the cell at `col`,
     /// as the WebGpu renderer's cursor range does.
-    fn compose(compose: &Compose<'_>, col: usize, row: &MirrorRow) -> Self {
+    fn compose(compose: &Compose<'_>, col: usize, row: &MirrorRow, reverse: Option<f32>) -> Self {
         let width = compose
             .text
             .map_or(0, |text| unicode_column_width(text, None));
@@ -297,15 +345,36 @@ impl RowCursor {
         Self {
             col,
             cols,
-            fg: Some(rgba8(compose.fg)),
-            block: Some(rgba8(compose.under)),
+            fg: Some(compose.fg),
+            block: Some(compose.under),
             sprite: Some((CursorSprite::Solid, rgba8(compose.color))),
             composing: compose.text.map(str::to_string),
+            reverse: reverse.map(f32::to_bits),
         }
     }
 
     fn covers(&self, col: usize) -> bool {
         (self.col..self.col + self.cols).contains(&col)
+    }
+
+    /// The text color, and the color under it, for text in `fg` on `bg`
+    /// under this cursor: swapped when WebGpu's reverse-video cursor applies
+    /// to them, or else the cursor's overrides (`None` keeps the text's
+    /// own).
+    fn text_colors(
+        &self,
+        fg: SrgbaTuple,
+        bg: SrgbaTuple,
+    ) -> (Option<SrgbaTuple>, Option<SrgbaTuple>) {
+        let reversed = self
+            .reverse
+            .map(f32::from_bits)
+            .is_some_and(|min| reverse_video_cursor_applies(fg, bg, min));
+        if reversed {
+            (Some(bg), Some(fg))
+        } else {
+            (self.fg, self.block)
+        }
     }
 
     /// The columns the composition text took when overlaid.
@@ -390,16 +459,22 @@ struct CellColors {
     bg: SrgbaTuple,
 }
 
-fn cell_colors(cell: &MirrorCell, style: &SceneStyle<'_>, reverse_video: bool) -> CellColors {
-    let palette = style.palette;
-    let fg = match cell.fg() {
+/// `cell`'s foreground from its attribute, with bold brightening the eight
+/// ANSI colors when configured, as WebGpu's `resolve_fg_color_attr` does.
+fn resolved_fg(cell: &MirrorCell, palette: &ColorPalette, bold_brightens: bool) -> SrgbaTuple {
+    match cell.fg() {
         MirrorColor::Palette(index)
-            if index < 8 && style.bold_brightens && cell.intensity() == Intensity::Bold =>
+            if index < 8 && bold_brightens && cell.intensity() == Intensity::Bold =>
         {
             palette.resolve_fg(ColorAttribute::PaletteIndex(index + 8))
         }
         color => palette.resolve_fg(color.to_attribute()),
-    };
+    }
+}
+
+fn cell_colors(cell: &MirrorCell, style: &SceneStyle<'_>, reverse_video: bool) -> CellColors {
+    let palette = style.palette;
+    let fg = resolved_fg(cell, palette, style.bold_brightens);
     let bg = palette.resolve_bg(cell.bg().to_attribute());
     if cell.reverse() != reverse_video {
         CellColors {
@@ -450,7 +525,8 @@ fn text_color(
 ) -> Option<[u8; 4]> {
     let colors = cell_colors(cell, style, reverse_video);
     let col = cell.col();
-    let mut fg = blinked_fg(cell, &colors, style);
+    let text_fg = blinked_fg(cell, &colors, style);
+    let mut fg = text_fg;
     let mut under = colors.bg;
     if built.selection.contains(&col) {
         if let Some(selection_fg) = style.selection_fg {
@@ -458,18 +534,33 @@ fn text_color(
         }
         under = style.selection_bg;
     }
-    let (mut fg, mut under) = (rgba8(fg), rgba8(under));
     if let Some(cursor) = &built.cursor {
         if cursor.covers(col) {
-            if let Some(cursor_fg) = cursor.fg {
+            let (cursor_fg, block) = cursor.text_colors(text_fg, colors.bg);
+            if let Some(cursor_fg) = cursor_fg {
                 fg = cursor_fg;
             }
-            if let Some(block) = cursor.block {
+            if let Some(block) = block {
                 under = block;
             }
         }
     }
-    (!cell.invisible() && fg != under).then_some(fg)
+    if cell.invisible() {
+        return None;
+    }
+    drawn_fg(style, fg, under)
+}
+
+/// Text color `fg` on `under` as drawn: moved to the minimum contrast with
+/// `under` (WebGpu's `ensure_min_contrast`, which leaves a color equal to
+/// `under` alone), and `None` when it then is the color it sits on.
+fn drawn_fg(style: &SceneStyle<'_>, fg: SrgbaTuple, under: SrgbaTuple) -> Option<[u8; 4]> {
+    let fg = style
+        .min_contrast
+        .and_then(|ratio| fg.ensure_contrast_ratio(&under, ratio))
+        .unwrap_or(fg);
+    let (fg, under) = (rgba8(fg), rgba8(under));
+    (fg != under).then_some(fg)
 }
 
 /// `color` with its brightness scaled by `brightness`, as the WebGpu renderer
@@ -603,16 +694,27 @@ impl MetalScene {
                 generation: mirror_row.generation(),
                 selection: selection(mirror_row.stable()),
                 cursor: (cursor_row == Some(row)).then(|| match &style.compose {
-                    Some(compose) => RowCursor::compose(compose, cursor.x, mirror_row),
+                    Some(compose) => RowCursor::compose(
+                        compose,
+                        cursor.x,
+                        mirror_row,
+                        style.reverse_video_cursor,
+                    ),
                     None => RowCursor {
                         col: cursor.x,
                         cols: 1,
-                        fg: style.cursor_fg.map(rgba8),
-                        block: style.cursor_bg.map(rgba8),
+                        fg: style.cursor_fg,
+                        block: style.cursor_bg,
                         sprite: style
                             .cursor_sprite
                             .map(|(shape, color)| (shape, rgba8(color))),
                         composing: None,
+                        // Only a focused block (which has a block color)
+                        // reverses the text under it.
+                        reverse: style
+                            .cursor_bg
+                            .and(style.reverse_video_cursor)
+                            .map(f32::to_bits),
                     },
                 }),
                 // Unchanged cells with blinking text want the current levels;
@@ -784,7 +886,15 @@ impl MetalScene {
             }
             let fg = match composing {
                 Some((cursor, _)) if composed.contains(&col) => {
-                    cursor.fg.filter(|fg| Some(*fg) != cursor.block)
+                    // The composition's blank attributes.
+                    let palette = style.palette;
+                    let (fg, bg) = if reverse_video {
+                        (palette.background, palette.foreground)
+                    } else {
+                        (palette.foreground, palette.background)
+                    };
+                    let (cursor_fg, block) = cursor.text_colors(fg, bg);
+                    drawn_fg(style, cursor_fg.unwrap_or(fg), block.unwrap_or(bg))
                 }
                 _ => {
                     let index =
@@ -1239,6 +1349,11 @@ mod tests {
                     fg: *rng.pick(&[palette.cursor_fg, palette.cursor_bg]),
                     under: palette.cursor_bg,
                 }),
+                // A configuration change (a new generation) may set a minimum
+                // contrast.
+                min_contrast: (generation % 2 == 1).then_some(4.5),
+                // And the reverse-video cursor.
+                reverse_video_cursor: (generation % 3 == 1).then_some(2.5),
             };
             let top = mirror.first() + rng.below(rows as u64) as StableRowIndex;
             let bottom = top + rng.below(3) as StableRowIndex;
@@ -1296,6 +1411,8 @@ mod tests {
             hover: None,
             blink: BlinkLevels::default(),
             compose: None,
+            min_contrast: None,
+            reverse_video_cursor: None,
         }
     }
 
@@ -1743,6 +1860,154 @@ mod tests {
         assert_eq!(lines, [(0, fg), (1, tinted), (2, tinted), (3, fg)]);
     }
 
+    /// ft-yccm0.4.7.3: with `text_min_contrast_ratio`, low-contrast text is
+    /// moved toward the minimum contrast with what it sits on, by the same
+    /// `ensure_contrast_ratio` WebGpu applies (light gray on white, which it
+    /// darkens). Text faded all the way by its blink is its background
+    /// exactly, which the minimum leaves alone, so it stays hidden.
+    #[test]
+    fn a_minimum_contrast_lifts_dim_text_but_not_faded_blink() {
+        let palette = ColorPalette::default();
+        let mut term = terminal(2, 10);
+        term.advance_bytes(
+            b"\x1b[38;2;150;150;150;48;2;255;255;255mab\x1b[0m \x1b[5mcd\x1b[0m\x1b[?25l",
+        );
+        let mut mirror = RenderMirror::new();
+        let mut scene = MetalScene::new();
+        let mut glyphs = SyntheticGlyphs::default();
+        let style = SceneStyle {
+            min_contrast: Some(4.5),
+            blink: BlinkLevels {
+                slow: Some(0.0),
+                rapid: None,
+            },
+            ..plain_style(&palette)
+        };
+        step(
+            &mut term,
+            &mut mirror,
+            &mut scene,
+            &mut glyphs,
+            &no_selection,
+            &style,
+        );
+        let cell = &mirror.rows()[0].cells()[0];
+        let dim = palette.resolve_fg(cell.fg().to_attribute());
+        let white = palette.resolve_bg(cell.bg().to_attribute());
+        let lifted = dim
+            .ensure_contrast_ratio(&white, 4.5)
+            .expect("light gray on white is below 4.5");
+        assert_ne!(rgba8(lifted), rgba8(dim));
+        let row: Vec<(u16, [u8; 4])> = scene
+            .text()
+            .row(0)
+            .map(|instance| (instance.col(), instance.fg()))
+            .collect();
+        assert_eq!(row, [(0, rgba8(lifted)), (1, rgba8(lifted))]);
+
+        // Without the minimum the dim text keeps its color.
+        let mut plain = MetalScene::new();
+        plain.update(
+            &mirror,
+            &SceneStyle {
+                min_contrast: None,
+                ..style
+            },
+            &no_selection,
+            &mut glyphs,
+        );
+        assert!(
+            plain
+                .text()
+                .row(0)
+                .all(|instance| instance.fg() == rgba8(dim))
+        );
+    }
+
+    /// ft-yccm0.4.7.3: WebGpu's reverse-video cursor. Under a focused block,
+    /// text whose colors have the minimum contrast is drawn in its own
+    /// background; text below it keeps the cursor foreground. The cursor's
+    /// own color comes from the cell's attribute colors, unreversed.
+    #[test]
+    fn a_reverse_video_cursor_draws_contrasting_text_in_its_background() {
+        let palette = ColorPalette::default();
+        let cursor_fg = SrgbaTuple(0.2, 0.4, 0.6, 1.0);
+        let block = SceneStyle {
+            cursor_fg: Some(cursor_fg),
+            cursor_bg: Some(palette.cursor_bg),
+            reverse_video_cursor: Some(2.5),
+            ..plain_style(&palette)
+        };
+        let drawn_at_cursor = |bytes: &[u8], style: &SceneStyle<'_>| {
+            let mut term = terminal(2, 10);
+            term.advance_bytes(bytes);
+            let mut mirror = RenderMirror::new();
+            let mut scene = MetalScene::new();
+            step(
+                &mut term,
+                &mut mirror,
+                &mut scene,
+                &mut SyntheticGlyphs::default(),
+                &no_selection,
+                style,
+            );
+            scene
+                .text()
+                .row(0)
+                .find(|instance| instance.col() == 0)
+                .map(|instance| instance.fg())
+        };
+        // Light text on black: reversed, so drawn in black.
+        assert_eq!(
+            drawn_at_cursor(b"ab\x1b[1;1H", &block),
+            Some(rgba8(palette.background))
+        );
+        // Without the option, the cursor foreground.
+        let plain_block = SceneStyle {
+            reverse_video_cursor: None,
+            ..block
+        };
+        assert_eq!(
+            drawn_at_cursor(b"ab\x1b[1;1H", &plain_block),
+            Some(rgba8(cursor_fg))
+        );
+        // Dark gray on black is below the contrast: the cursor foreground.
+        assert_eq!(
+            drawn_at_cursor(b"\x1b[38;2;20;20;20mab\x1b[1;1H", &block),
+            Some(rgba8(cursor_fg))
+        );
+
+        // The cursor's color: the attribute colors, before SGR 7 swaps them.
+        let mut term = terminal(2, 10);
+        term.advance_bytes(b"\x1b[7;31ma\x1b[0m");
+        let mut mirror = RenderMirror::new();
+        let request = CaptureRequest {
+            viewport_top: None,
+            rules: &[],
+            rules_generation: 0,
+        };
+        capture_terminal_rows(&mut term, &mut mirror, &request).expect("resident");
+        let red = palette.resolve_fg(ColorAttribute::PaletteIndex(1));
+        assert_eq!(
+            cursor_attr_colors(mirror.rows().first(), 0, &palette, true),
+            (red, palette.background)
+        );
+        assert_eq!(
+            cursor_attr_colors(None, 0, &palette, true),
+            (palette.foreground, palette.background)
+        );
+        assert!(reverse_video_cursor_applies(
+            palette.foreground,
+            palette.background,
+            2.5
+        ));
+        assert!(!reverse_video_cursor_applies(
+            palette.background,
+            palette.background,
+            2.5
+        ));
+    }
+
     /// The blink mix is in linear light, as on the WebGpu path: halfway from
     /// black to white is sRGB 188, not 128. The alpha is the background's.
     #[test]
@@ -2127,6 +2392,8 @@ mod tests {
                 hover: None,
                 blink: BlinkLevels::default(),
                 compose: None,
+                min_contrast: None,
+                reverse_video_cursor: None,
             };
             let request = CaptureRequest {
                 viewport_top: None,
