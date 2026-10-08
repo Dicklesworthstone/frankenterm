@@ -74,6 +74,10 @@ use termwiz::cellcluster::CellCluster;
 use termwiz::surface::CursorShape;
 use window::bitmaps::{BitmapImage, Image};
 
+/// Notifies the window that a fallback font resolved, from whichever thread
+/// the font's resolver completes on.
+pub(crate) type FallbackReady = Arc<dyn Fn() + Send + Sync>;
+
 /// A glyph laid out the WebGpu renderer's way, in an atlas.
 #[derive(Debug, Clone, Copy)]
 enum LaidGlyph {
@@ -137,6 +141,9 @@ pub(crate) struct FontGlyphs {
     cursors: HashMap<(CursorSprite, u8), PlacedGlyph>,
     /// Set by the shaper when a fallback font finishes resolving.
     fallback_resolved: Arc<AtomicBool>,
+    /// Also called then: the window's repaint on a resolved fallback, as the
+    /// WebGpu renderer's shaper completion notifies it.
+    fallback_ready: Option<FallbackReady>,
     /// The font's fallback chain grew while shaping this frame: the rows
     /// shaped before then are stale ([`Self::take_chain_changed`]).
     chain_changed: bool,
@@ -191,9 +198,16 @@ impl FontGlyphs {
             lines: HashMap::new(),
             cursors: HashMap::new(),
             fallback_resolved: Arc::new(AtomicBool::new(false)),
+            fallback_ready: None,
             chain_changed: false,
             reset: false,
         }
+    }
+
+    /// Who to notify when a fallback font this source asked for finishes
+    /// resolving: the window, which repaints (ft-yccm0.4.7.3).
+    pub(crate) fn set_fallback_ready(&mut self, ready: Option<FallbackReady>) {
+        self.fallback_ready = ready;
     }
 
     /// Whether the fallback chain grew while shaping since the last call.
@@ -370,9 +384,15 @@ impl FontGlyphs {
         let mut attempts = 0;
         loop {
             let resolved = Arc::clone(&self.fallback_resolved);
+            let ready = self.fallback_ready.clone();
             match font.shape(
                 text,
-                move || resolved.store(true, Ordering::Release),
+                move || {
+                    resolved.store(true, Ordering::Release);
+                    if let Some(ready) = ready {
+                        ready();
+                    }
+                },
                 BlockKey::filter_out_synthetic,
                 Some(cluster.presentation),
                 cluster.direction,

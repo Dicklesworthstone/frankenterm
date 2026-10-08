@@ -5298,6 +5298,7 @@ impl TermWindow {
                 outcome
             },
         );
+        let blink_due = panes.redraw_at();
         self.metal_panes = panes;
         if let Some(readiness) = deferred {
             self.defer_render_snapshot(readiness);
@@ -5355,6 +5356,10 @@ impl TermWindow {
                 log::warn!("Metal paint failed; retaining damage: {failure:#}");
             }
         }
+        // Blinking text, a blinking cursor and the visual bell's fade paint
+        // again when they next move, as the WebGpu paint schedules them
+        // (ft-yccm0.4.7.3).
+        self.schedule_metal_animation(blink_due);
         true
     }
 

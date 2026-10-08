@@ -15,13 +15,14 @@
 //! so the frame itself can be built on the window's render thread
 //! (ft-yccm0.4.1.2) with that thread's own fonts.
 
+use crate::colorease::ColorEase;
 use crate::selection::SelectionRange;
-use crate::termwindow::metal_glyphs::{FontGlyphs, MAX_SHAPE_PASSES};
+use crate::termwindow::metal_glyphs::{FallbackReady, FontGlyphs, MAX_SHAPE_PASSES};
 use crate::utilsprites::RenderMetrics;
 use config::ConfigHandle;
 use frankenterm_font::FontConfiguration;
 use frankenterm_gui::metal_scene::{
-    BlinkLevels, CursorSprite, MetalScene, SceneStyle, cursor_attr_colors,
+    BlinkLevels, Compose, CursorSprite, MetalScene, SceneStyle, cursor_attr_colors, mix_linear,
     reverse_video_cursor_applies,
 };
 use frankenterm_renderer_metal::{
@@ -30,8 +31,10 @@ use frankenterm_renderer_metal::{
 use mux::localpane::LocalPane;
 use mux::pane::{Pane, PaneId};
 use mux::render_mirror::{CaptureRequest, RenderMirror, capture_pane_rows};
+use mux::renderable::StableCursorPosition;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 use termwiz::hyperlink::Hyperlink;
 use termwiz::surface::{CursorShape, CursorVisibility};
 use wezterm_term::color::{ColorPalette, SrgbaTuple};
@@ -83,6 +86,10 @@ pub(crate) struct MetalFrame {
     mirror: RenderMirror,
     scene: MetalScene,
     glyphs: FontGlyphs,
+    /// The cursor and the pane's focus as last drawn, and when either last
+    /// changed, which restarts the cursor's blink (WebGpu's `prev_cursor`).
+    cursor_seen: Option<(StableCursorPosition, bool)>,
+    cursor_moved: Instant,
 }
 
 impl MetalFrame {
@@ -97,6 +104,104 @@ pub(crate) struct MetalFrameUniforms {
     pub(crate) text: TextUniforms,
     /// How many of the scene's rows this update rebuilt (ft-yccm0.4.6).
     pub(crate) rows_rebuilt: usize,
+    /// Whether the scene has slow and rapid blinking text (ft-yccm0.4.7.3).
+    pub(crate) blinking: (bool, bool),
+    /// When the cursor's blink next needs a frame.
+    pub(crate) cursor_due: Option<Instant>,
+}
+
+/// A window's blink clocks for its Metal frames (ft-yccm0.4.7.3): the WebGpu
+/// renderer's `blink_state`, `rapid_blink_state` and `cursor_blink_state`,
+/// built from the configuration as `TermWindow` builds them (and again when
+/// it changes), one set per window so its panes blink in phase. A Metal
+/// window's frames are drawn on its render thread, which keeps them there.
+pub(crate) struct MetalBlinkClocks {
+    generation: usize,
+    slow: ColorEase,
+    rapid: ColorEase,
+    cursor: ColorEase,
+}
+
+/// The text blink levels of one draw, and when each next moves.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct MetalBlinkPhase {
+    pub(crate) levels: BlinkLevels,
+    slow_due: Option<Instant>,
+    rapid_due: Option<Instant>,
+}
+
+impl MetalBlinkClocks {
+    pub(crate) fn new(config: &ConfigHandle) -> Self {
+        Self {
+            generation: config.generation(),
+            slow: ColorEase::new(
+                config.text_blink_rate,
+                config.text_blink_ease_in,
+                config.text_blink_rate,
+                config.text_blink_ease_out,
+                None,
+            ),
+            rapid: ColorEase::new(
+                config.text_blink_rate_rapid,
+                config.text_blink_rapid_ease_in,
+                config.text_blink_rate_rapid,
+                config.text_blink_rapid_ease_out,
+                None,
+            ),
+            cursor: ColorEase::new(
+                config.cursor_blink_rate,
+                config.cursor_blink_ease_in,
+                config.cursor_blink_rate,
+                config.cursor_blink_ease_out,
+                None,
+            ),
+        }
+    }
+
+    /// The text blink levels now (`intensity_continuous`, as WebGpu reads
+    /// them while shaping blinking text), from clocks rebuilt first if
+    /// `config` changed. A blink rate of 0 does not blink.
+    pub(crate) fn text_phase(&mut self, config: &ConfigHandle) -> MetalBlinkPhase {
+        if self.generation != config.generation() {
+            *self = Self::new(config);
+        }
+        let slow = (config.text_blink_rate != 0).then(|| self.slow.intensity_continuous());
+        let rapid = (config.text_blink_rate_rapid != 0).then(|| self.rapid.intensity_continuous());
+        MetalBlinkPhase {
+            levels: BlinkLevels {
+                slow: slow.map(|(level, _)| level),
+                rapid: rapid.map(|(level, _)| level),
+            },
+            slow_due: slow.map(|(_, due)| due),
+            rapid_due: rapid.map(|(_, due)| due),
+        }
+    }
+
+    /// The blink level of a cursor that last moved at `moved`, and when it
+    /// next changes, as WebGpu's `compute_cell_fg_bg` reads it.
+    fn cursor_level(&mut self, moved: Instant) -> (f32, Instant) {
+        self.cursor.update_start(moved);
+        self.cursor.intensity_continuous()
+    }
+}
+
+impl MetalBlinkPhase {
+    /// When blinking text next needs a frame, for scenes with the slow and
+    /// rapid blinks in `blinking`.
+    pub(crate) fn due(&self, (slow, rapid): (bool, bool)) -> Option<Instant> {
+        let slow = self.slow_due.filter(|_| slow);
+        let rapid = self.rapid_due.filter(|_| rapid);
+        slow.into_iter().chain(rapid).min()
+    }
+}
+
+/// A compose cursor's state in the active pane, from the window
+/// (ft-yccm0.4.7.3): WebGpu's `dead_key_or_leader`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MetalCompose {
+    /// The IME composition (`DeadKeyStatus::Composing`); `None` while a dead
+    /// key is held or the leader key is active.
+    pub(crate) text: Option<String>,
 }
 
 /// What a Metal frame needs from its window, captured on the main thread
@@ -117,6 +222,14 @@ pub(crate) struct MetalFrameInputs {
     /// Where the grid's first cell starts, in pixels: padding, tab bar and
     /// window border.
     pub(crate) grid_origin: [f32; 2],
+    /// A dead key, IME composition or the leader key in this pane, which
+    /// must be the window's active pane.
+    pub(crate) compose: Option<MetalCompose>,
+    /// The visual bell's level while it rings on this pane's cursor
+    /// (`VisualBellTarget::CursorColor`).
+    pub(crate) bell_cursor: Option<f32>,
+    /// The window's repaint when a fallback font resolves.
+    pub(crate) fallback_ready: Option<FallbackReady>,
 }
 
 impl MetalFrame {
@@ -124,12 +237,14 @@ impl MetalFrame {
     /// frame in `slot` and brings its scene up to date; `slot` then holds the
     /// frame. `None` without a pane. Runs on whichever thread draws the
     /// window: the main thread, or the window's render thread with that
-    /// thread's own `fonts` and `metrics` (ft-yccm0.4.1.2).
+    /// thread's own `fonts` and `metrics` (ft-yccm0.4.1.2). Blinking text is
+    /// drawn at `phase`, and a blinking cursor reads the window's `clocks`.
     // Pixel sizes and cell coordinates are small and non-negative.
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        clippy::cast_precision_loss
+        clippy::cast_precision_loss,
+        clippy::too_many_lines
     )]
     pub(crate) fn update(
         slot: &mut Option<MetalFrame>,
@@ -137,6 +252,8 @@ impl MetalFrame {
         fonts: &Rc<FontConfiguration>,
         metrics: &RenderMetrics,
         metal: &Rc<MetalRenderer>,
+        clocks: &mut MetalBlinkClocks,
+        phase: &MetalBlinkPhase,
     ) -> Option<MetalFrameUniforms> {
         let pane = inputs.pane.as_ref()?;
         let pane_id = pane.pane_id();
@@ -160,8 +277,13 @@ impl MetalFrame {
                     Rc::clone(metal),
                     metrics,
                 ),
+                cursor_seen: None,
+                cursor_moved: Instant::now(),
             },
         };
+        frame
+            .glyphs
+            .set_fallback_ready(inputs.fallback_ready.clone());
 
         let request = CaptureRequest {
             viewport_top: inputs.viewport_top,
@@ -181,6 +303,13 @@ impl MetalFrame {
         let palette: &ColorPalette = &facts.palette;
         let focused_and_active = inputs.focused;
         let cursor = frame.mirror.cursor();
+        // As WebGpu's `prev_cursor`: a cursor that moved, or a focus change,
+        // restarts the cursor's blink.
+        let seen = (cursor, focused_and_active);
+        if frame.cursor_seen != Some(seen) {
+            frame.cursor_seen = Some(seen);
+            frame.cursor_moved = Instant::now();
+        }
         let shape = config.default_cursor_style.effective_shape(cursor.shape);
         let block_cursor = focused_and_active
             && matches!(
@@ -199,21 +328,74 @@ impl MetalFrame {
             })
             .unwrap_or(false)
             .then_some(config.reverse_video_cursor_min_contrast);
-        // A focused cursor is in the cursor color, or in its cell's
-        // foreground where the reverse-video cursor applies to the cell.
-        let cursor_color = if focused_and_active {
-            let row = usize::try_from(cursor.y - frame.mirror.first())
-                .ok()
-                .and_then(|row| frame.mirror.rows().get(row));
-            reverse_video_cursor
-                .and_then(|min_contrast| {
-                    let (fg, bg) = cursor_attr_colors(row, cursor.x, palette, bold_brightens);
-                    reverse_video_cursor_applies(fg, bg, min_contrast).then_some(fg)
-                })
-                .unwrap_or(palette.cursor_bg)
-        } else {
-            palette.cursor_border
+        // The cell under the cursor by its attribute colors, as WebGpu's
+        // cursor quad resolves them, and whether the reverse-video cursor
+        // applies to it.
+        let cursor_cell = usize::try_from(cursor.y - frame.mirror.first())
+            .ok()
+            .and_then(|row| frame.mirror.rows().get(row));
+        let (attr_fg, attr_bg) = cursor_attr_colors(cursor_cell, cursor.x, palette, bold_brightens);
+        let reversed = reverse_video_cursor.is_some_and(|min_contrast| {
+            reverse_video_cursor_applies(attr_fg, attr_bg, min_contrast)
+        });
+        // The visual bell ringing on the cursor, or else a dead key, an IME
+        // composition or the leader key, draws a solid cursor: the first two
+        // branches of WebGpu's `compute_cell_fg_bg`.
+        let solid_base = if reversed { attr_fg } else { palette.cursor_bg };
+        let solid_color = match (inputs.bell_cursor, &inputs.compose) {
+            (Some(level), _) => {
+                let fg = if reversed { attr_bg } else { palette.cursor_fg };
+                let fg = config
+                    .text_min_contrast_ratio
+                    .and_then(|ratio| fg.ensure_contrast_ratio(&solid_base, ratio))
+                    .unwrap_or(fg);
+                let bell = config
+                    .resolved_palette
+                    .visual_bell
+                    .as_deref()
+                    .copied()
+                    .unwrap_or(fg);
+                Some(mix_linear(solid_base, bell, level))
+            }
+            (None, Some(_)) => Some(
+                config
+                    .resolved_palette
+                    .compose_cursor
+                    .as_deref()
+                    .copied()
+                    .unwrap_or(solid_base),
+            ),
+            (None, None) => None,
         };
+        let solid = solid_color.map(|color| Compose {
+            text: inputs
+                .compose
+                .as_ref()
+                .and_then(|compose| compose.text.as_deref()),
+            color,
+            fg: palette.cursor_fg,
+            under: palette.cursor_bg,
+        });
+        // Any other focused cursor blinks as WebGpu's `blinking` does.
+        let cursor_blink = (solid.is_none()
+            && focused_and_active
+            && shape.is_blinking()
+            && config.cursor_blink_rate != 0
+            && cursor.visibility == CursorVisibility::Visible)
+            .then(|| clocks.cursor_level(frame.cursor_moved));
+        // A focused cursor is in the cursor color, or in its cell's
+        // foreground where the reverse-video cursor applies to the cell; a
+        // blinking one moves toward its cell's background by its level.
+        let mut cursor_color = if !focused_and_active {
+            palette.cursor_border
+        } else if reversed {
+            attr_fg
+        } else {
+            palette.cursor_bg
+        };
+        if let Some((level, _)) = cursor_blink {
+            cursor_color = mix_linear(cursor_color, attr_bg, level);
+        }
         let selection = &inputs.selection;
         let selected = |stable| {
             selection.as_ref().map_or(0..0, |(range, rectangular)| {
@@ -235,13 +417,11 @@ impl MetalFrame {
             cursor_bg: block_cursor.then_some(palette.cursor_bg),
             cursor_sprite: cursor_sprite(metal_shape).map(|sprite| (sprite, cursor_color)),
             hover: inputs.hover.as_ref(),
-            // The window's blink levels and compose state are not passed to
-            // the frame yet, so blinking text draws as plain text and no
-            // compose cursor is drawn (ft-yccm0.4.7.3).
-            blink: BlinkLevels::default(),
-            compose: None,
+            blink: phase.levels,
+            compose: solid,
             min_contrast: config.text_min_contrast_ratio,
             reverse_video_cursor,
+            cursor_blink: cursor_blink.map(|(level, _)| level),
         };
         let mut update = frame
             .scene
@@ -270,7 +450,7 @@ impl MetalFrame {
                     .map_or(1, |cell| cell.width().clamp(1, 2) as u32);
                 CursorUniform {
                     // A cursor the scene draws as a sprite is not drawn here.
-                    shape: if cursor_sprite(metal_shape).is_some() {
+                    shape: if solid.is_some() || cursor_sprite(metal_shape).is_some() {
                         MetalCursorShape::Hidden
                     } else {
                         metal_shape
@@ -303,6 +483,8 @@ impl MetalFrame {
                 strikethrough_position: metrics.strike_row as f32,
             },
             rows_rebuilt: update.rows_rebuilt,
+            blinking: frame.scene.blinking(),
+            cursor_due: cursor_blink.map(|(_, due)| due),
         };
         *slot = Some(frame);
         Some(uniforms)
@@ -378,5 +560,44 @@ mod tests {
             premultiplied(SrgbaTuple(1.0, 0.5, 0.25, 0.5)),
             [0.5, 0.25, 0.125, 0.5]
         );
+    }
+
+    /// ft-yccm0.4.7.3: frames are scheduled for a blink only while some
+    /// scene has text with it, at the sooner of the two.
+    #[test]
+    fn blinking_text_schedules_frames_only_for_the_blinks_drawn() {
+        let now = Instant::now();
+        let (slow, rapid) = (
+            now + std::time::Duration::from_millis(40),
+            now + std::time::Duration::from_millis(10),
+        );
+        let phase = MetalBlinkPhase {
+            levels: BlinkLevels::default(),
+            slow_due: Some(slow),
+            rapid_due: Some(rapid),
+        };
+        assert_eq!(phase.due((false, false)), None);
+        assert_eq!(phase.due((true, false)), Some(slow));
+        assert_eq!(phase.due((false, true)), Some(rapid));
+        assert_eq!(phase.due((true, true)), Some(rapid));
+        assert_eq!(MetalBlinkPhase::default().due((true, true)), None);
+    }
+
+    /// The default configuration blinks text: both levels are in 0..=1 and
+    /// due again later; the cursor's level restarts when it moves.
+    #[test]
+    fn the_blink_clocks_follow_the_configuration() {
+        let config = ConfigHandle::default_config();
+        let mut clocks = MetalBlinkClocks::new(&config);
+        let phase = clocks.text_phase(&config);
+        let start = Instant::now();
+        for level in [phase.levels.slow, phase.levels.rapid] {
+            let level = level.expect("the default rates blink");
+            assert!((0.0..=1.0).contains(&level), "{level}");
+        }
+        assert!(phase.due((true, true)).is_some_and(|due| due >= start));
+        let (level, due) = clocks.cursor_level(Instant::now());
+        assert!((0.0..=1.0).contains(&level), "{level}");
+        assert!(due >= start);
     }
 }

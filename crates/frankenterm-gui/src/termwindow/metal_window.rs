@@ -20,13 +20,17 @@
 //! (render mirror, scene and glyphs) per visible pane. A pane whose rows did
 //! not change rebuilds no row, and the renderer uploads none of its rows.
 
-use super::metal_cells::{MetalFrame, MetalFrameInputs};
+use super::metal_cells::{
+    MetalBlinkClocks, MetalBlinkPhase, MetalCompose, MetalFrame, MetalFrameInputs,
+};
+use super::metal_glyphs::FallbackReady;
 use super::render::pane::pane_border_rects;
 use super::render::split::split_render_geometry;
-use super::{TermWindow, UIItem, UIItemType};
+use super::{PendingFallbackInvalidation, TermWindow, TermWindowNotif, UIItem, UIItemType};
 use crate::utilsprites::RenderMetrics;
 use ::window::RectF;
 use ::window::color::LinearRgba;
+use ::window::{DeadKeyStatus, WindowOps};
 use config::VisualBellTarget;
 use frankenterm_font::FontConfiguration;
 use frankenterm_renderer_metal::{
@@ -35,6 +39,8 @@ use frankenterm_renderer_metal::{
 use mux::pane::PaneId;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 use wezterm_term::color::SrgbaTuple;
 
 /// One visible pane of a Metal window frame, captured on the main thread.
@@ -189,6 +195,36 @@ fn bell_background(
 }
 
 impl TermWindow {
+    /// The window's repaint when a fallback font a Metal frame's shaping
+    /// asked for resolves (ft-yccm0.4.7.3): what `fallback_font_completion`
+    /// does for the WebGpu renderer's shaping, callable from every
+    /// completion, on whichever thread the font resolves.
+    pub(crate) fn metal_fallback_ready(&self) -> FallbackReady {
+        let window = Mutex::new(self.window.clone());
+        let pending = Arc::clone(&self.fallback_invalidation_pending);
+        Arc::new(move || {
+            let window = window.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(window) = window.as_ref() {
+                if let Some(ticket) = PendingFallbackInvalidation::acquire(&pending) {
+                    window.notify(TermWindowNotif::FallbackFontsReady(ticket));
+                }
+            }
+        })
+    }
+
+    /// Schedules a Metal window's next paint for what its frames animate
+    /// (ft-yccm0.4.7.3), as `paint_impl` schedules it for the other front
+    /// ends: the visual bell's fade, which `get_intensity_if_bell_target_ringing`
+    /// records in `has_animation` while the frame request is built, and
+    /// `also` (blinking text and cursors drawn on the main thread). Taking
+    /// `has_animation` leaves the next request to record its own.
+    pub(crate) fn schedule_metal_animation(&mut self, also: Option<Instant>) {
+        let animation = self.has_animation.borrow_mut().take();
+        if let Some(due) = animation.into_iter().chain(also).min() {
+            self.schedule_animation_wake(due);
+        }
+    }
+
     /// The visible panes and chrome fills of this window's Metal frame. It
     /// also rebuilds the window's hit-test items (`ui_items`) for what the
     /// frame draws, as `paint_pass` does for the other front ends: without
@@ -321,6 +357,21 @@ impl TermWindow {
                     focused: focused && pos.is_active,
                     hover: self.current_highlight.clone(),
                     grid_origin: layout.grid_origin(pos.left, pos.top),
+                    compose: (pos.is_active
+                        && (self.dead_key_status != DeadKeyStatus::None
+                            || self.leader_is_active()))
+                    .then(|| MetalCompose {
+                        text: match &self.dead_key_status {
+                            DeadKeyStatus::Composing(text) => Some(text.clone()),
+                            _ => None,
+                        },
+                    }),
+                    bell_cursor: self.get_intensity_if_bell_target_ringing(
+                        &pos.pane,
+                        &self.config,
+                        VisualBellTarget::CursorColor,
+                    ),
+                    fallback_ready: Some(self.metal_fallback_ready()),
                     pane: Some(pos.pane),
                 },
                 rect: layout.pane_rect(pos.left, pos.top, pos.width, pos.height),
@@ -375,12 +426,22 @@ pub(crate) struct MetalPanes {
     frames: HashMap<PaneId, MetalFrame>,
     /// How many rows each pane's scene rebuilt in the last draw.
     rebuilt: Vec<(PaneId, usize)>,
+    /// The window's blink clocks (ft-yccm0.4.7.3), made on the first draw.
+    blink: Option<MetalBlinkClocks>,
+    /// When the last draw's blinking text or cursor next needs a frame.
+    redraw_at: Option<Instant>,
 }
 
 impl MetalPanes {
     /// How many rows each pane drawn last rebuilt.
     pub(crate) fn rows_rebuilt(&self) -> &[(PaneId, usize)] {
         &self.rebuilt
+    }
+
+    /// When the last draw's blinking text or blinking cursor next needs a
+    /// frame, as the WebGpu renderer schedules its next frame for them.
+    pub(crate) fn redraw_at(&self) -> Option<Instant> {
+        self.redraw_at
     }
 
     /// Captures each of `panes`' changed rows and brings its scene up to
@@ -402,17 +463,44 @@ impl MetalPanes {
         let mut previous = std::mem::take(&mut self.frames);
         let mut updated = Vec::with_capacity(panes.len());
         self.rebuilt.clear();
+        self.redraw_at = None;
+        // One blink phase for the whole window, as WebGpu's window-wide
+        // blink states give all its panes.
+        let phase = panes.first().map_or_else(MetalBlinkPhase::default, |pane| {
+            self.blink
+                .get_or_insert_with(|| MetalBlinkClocks::new(&pane.inputs.config))
+                .text_phase(&pane.inputs.config)
+        });
+        let mut blinking = (false, false);
+        let mut cursor_due = None;
         for pane in panes {
             let Some(pane_id) = pane.inputs.pane.as_ref().map(|pane| pane.pane_id()) else {
                 continue;
             };
             let mut frame = previous.remove(&pane_id);
-            let uniforms = MetalFrame::update(&mut frame, &pane.inputs, fonts, metrics, renderer);
+            let clocks = self
+                .blink
+                .get_or_insert_with(|| MetalBlinkClocks::new(&pane.inputs.config));
+            let uniforms = MetalFrame::update(
+                &mut frame,
+                &pane.inputs,
+                fonts,
+                metrics,
+                renderer,
+                clocks,
+                &phase,
+            );
             if let Some((frame, uniforms)) = frame.zip(uniforms) {
                 self.rebuilt.push((pane_id, uniforms.rows_rebuilt));
+                blinking = (
+                    blinking.0 || uniforms.blinking.0,
+                    blinking.1 || uniforms.blinking.1,
+                );
+                cursor_due = cursor_due.into_iter().chain(uniforms.cursor_due).min();
                 updated.push((pane_id, pane, frame, uniforms));
             }
         }
+        self.redraw_at = phase.due(blinking).into_iter().chain(cursor_due).min();
         let scenes: Vec<PaneScene<'_>> = updated
             .iter()
             .map(|(pane_id, pane, frame, uniforms)| PaneScene {

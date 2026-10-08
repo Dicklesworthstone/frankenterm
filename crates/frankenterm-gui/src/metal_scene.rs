@@ -142,7 +142,9 @@ pub enum CursorSprite {
 /// (`compute_cell_fg_bg` with `dead_key_or_leader` on the active pane): a
 /// solid block over the composition, or else over the cursor's cell, shown
 /// even where the terminal hides its cursor, with the text in it in the
-/// cursor foreground.
+/// cursor foreground. The visual bell's cursor flash
+/// (`VisualBellTarget::CursorColor`) is drawn as the same solid block, in
+/// its fading color.
 #[derive(Debug, Clone, Copy)]
 pub struct Compose<'a> {
     /// The composition (IME preedit) text, overlaid at the cursor in blank
@@ -201,6 +203,11 @@ pub struct SceneStyle<'a> {
     /// `use_reverse_video_cursor` draws it. The cursor's own color is the
     /// caller's ([`cursor_attr_colors`]).
     pub reverse_video_cursor: Option<f32>,
+    /// A blinking focused cursor's blink level (WebGpu's cursor
+    /// `intensity_continuous`). Text under a block is drawn that far from
+    /// the cursor foreground toward its own, as WebGpu's shader mixes it;
+    /// the caller mixes the cursor's own color.
+    pub cursor_blink: Option<f32>,
 }
 
 /// The foreground and background of the cell at `col` of `row` as the
@@ -324,6 +331,9 @@ struct RowCursor {
     /// The reverse-video cursor's minimum contrast (as bits), for a
     /// focused block or compose cursor ([`SceneStyle::reverse_video_cursor`]).
     reverse: Option<u32>,
+    /// A blinking focused block's blink level (as bits)
+    /// ([`SceneStyle::cursor_blink`]).
+    blink: Option<u32>,
 }
 
 impl RowCursor {
@@ -350,6 +360,7 @@ impl RowCursor {
             sprite: Some((CursorSprite::Solid, rgba8(compose.color))),
             composing: compose.text.map(str::to_string),
             reverse: reverse.map(f32::to_bits),
+            blink: None,
         }
     }
 
@@ -375,6 +386,13 @@ impl RowCursor {
         } else {
             (self.fg, self.block)
         }
+    }
+
+    /// For text in `fg` under a blinking block: the color its drawn color
+    /// moves toward, and how far (WebGpu's `fg_color_alt` and
+    /// `fg_color_mix`).
+    fn blink_mix(&self, fg: SrgbaTuple) -> Option<(SrgbaTuple, f32)> {
+        self.blink.map(|level| (fg, f32::from_bits(level)))
     }
 
     /// The columns the composition text took when overlaid.
@@ -534,6 +552,7 @@ fn text_color(
         }
         under = style.selection_bg;
     }
+    let mut blink = None;
     if let Some(cursor) = &built.cursor {
         if cursor.covers(col) {
             let (cursor_fg, block) = cursor.text_colors(text_fg, colors.bg);
@@ -543,24 +562,37 @@ fn text_color(
             if let Some(block) = block {
                 under = block;
             }
+            blink = cursor.blink_mix(text_fg);
         }
     }
     if cell.invisible() {
         return None;
     }
-    drawn_fg(style, fg, under)
+    drawn_fg(style, fg, under, blink)
 }
 
 /// Text color `fg` on `under` as drawn: moved to the minimum contrast with
 /// `under` (WebGpu's `ensure_min_contrast`, which leaves a color equal to
-/// `under` alone), and `None` when it then is the color it sits on.
-fn drawn_fg(style: &SceneStyle<'_>, fg: SrgbaTuple, under: SrgbaTuple) -> Option<[u8; 4]> {
+/// `under` alone), and `None` when it then is the color it sits on. Under a
+/// blinking block, the color that survives the check is then mixed toward
+/// `blink`'s color, as WebGpu's shader mixes it after that check.
+fn drawn_fg(
+    style: &SceneStyle<'_>,
+    fg: SrgbaTuple,
+    under: SrgbaTuple,
+    blink: Option<(SrgbaTuple, f32)>,
+) -> Option<[u8; 4]> {
     let fg = style
         .min_contrast
         .and_then(|ratio| fg.ensure_contrast_ratio(&under, ratio))
         .unwrap_or(fg);
-    let (fg, under) = (rgba8(fg), rgba8(under));
-    (fg != under).then_some(fg)
+    if rgba8(fg) == rgba8(under) {
+        return None;
+    }
+    Some(rgba8(match blink {
+        Some((toward, level)) => mix_linear(fg, toward, level),
+        None => fg,
+    }))
 }
 
 /// `color` with its brightness scaled by `brightness`, as the WebGpu renderer
@@ -609,6 +641,18 @@ impl MetalScene {
     /// The glyph instances the text pass draws.
     pub fn text(&self) -> &CellTextGrid {
         &self.text
+    }
+
+    /// Whether the built rows have slow (SGR 5) and rapid (SGR 6) blinking
+    /// text, which needs frames as its blink level moves.
+    #[must_use]
+    pub fn blinking(&self) -> (bool, bool) {
+        self.built
+            .iter()
+            .filter_map(|built| built.blink)
+            .fold((false, false), |(slow, rapid), blink| {
+                (slow || blink.slow, rapid || blink.rapid)
+            })
     }
 
     /// Forgets every built row (the glyphs' atlas slots died, say), so the
@@ -710,11 +754,12 @@ impl MetalScene {
                             .map(|(shape, color)| (shape, rgba8(color))),
                         composing: None,
                         // Only a focused block (which has a block color)
-                        // reverses the text under it.
+                        // reverses, or blinks, the text under it.
                         reverse: style
                             .cursor_bg
                             .and(style.reverse_video_cursor)
                             .map(f32::to_bits),
+                        blink: style.cursor_bg.and(style.cursor_blink).map(f32::to_bits),
                     },
                 }),
                 // Unchanged cells with blinking text want the current levels;
@@ -894,7 +939,7 @@ impl MetalScene {
                         (palette.foreground, palette.background)
                     };
                     let (cursor_fg, block) = cursor.text_colors(fg, bg);
-                    drawn_fg(style, cursor_fg.unwrap_or(fg), block.unwrap_or(bg))
+                    drawn_fg(style, cursor_fg.unwrap_or(fg), block.unwrap_or(bg), None)
                 }
                 _ => {
                     let index =
@@ -1315,16 +1360,19 @@ mod tests {
             // Selection and cursor text sometimes in the default background
             // or in the color it sits on, and the block cursor coming and
             // going, so the glyph-hiding rule is compared with full builds.
+            // The selection's text color is a style color, so it changes
+            // with the generation, as SceneStyle requires.
+            let selection_fgs = [
+                None,
+                Some(SrgbaTuple(1.0, 1.0, 1.0, 1.0)),
+                Some(palette.background),
+                Some(palette.selection_bg),
+            ];
             let style = SceneStyle {
                 palette: &palette,
                 generation,
                 bold_brightens: true,
-                selection_fg: *rng.pick(&[
-                    None,
-                    Some(SrgbaTuple(1.0, 1.0, 1.0, 1.0)),
-                    Some(palette.background),
-                    Some(palette.selection_bg),
-                ]),
+                selection_fg: selection_fgs[generation as usize % selection_fgs.len()],
                 selection_bg: palette.selection_bg,
                 cursor_fg: (rng.below(2) == 0).then_some(SrgbaTuple(0.0, 0.0, 0.0, 1.0)),
                 cursor_bg: (rng.below(2) == 0).then_some(palette.cursor_bg),
@@ -1354,6 +1402,8 @@ mod tests {
                 min_contrast: (generation % 2 == 1).then_some(4.5),
                 // And the reverse-video cursor.
                 reverse_video_cursor: (generation % 3 == 1).then_some(2.5),
+                // The cursor blinking between frames.
+                cursor_blink: *rng.pick(&[None, Some(0.0), Some(0.5), Some(1.0)]),
             };
             let top = mirror.first() + rng.below(rows as u64) as StableRowIndex;
             let bottom = top + rng.below(3) as StableRowIndex;
@@ -1413,6 +1463,7 @@ mod tests {
             compose: None,
             min_contrast: None,
             reverse_video_cursor: None,
+            cursor_blink: None,
         }
     }
 
@@ -1924,6 +1975,85 @@ mod tests {
         );
     }
 
+    /// ft-yccm0.4.7.3: text under a blinking block moves from the cursor
+    /// foreground toward its own by the cursor's blink level, as WebGpu's
+    /// shader mixes it, while whether it is drawn at all is decided on the
+    /// cursor foreground. A new level rebuilds only the cursor's row.
+    #[test]
+    fn text_under_a_blinking_block_moves_toward_its_own_color() {
+        let palette = ColorPalette::default();
+        let cursor_fg = SrgbaTuple(0.2, 0.4, 0.6, 1.0);
+        let mut term = terminal(2, 10);
+        term.advance_bytes(b"ab\r\ncd\x1b[1;1H");
+        let mut mirror = RenderMirror::new();
+        let mut scene = MetalScene::new();
+        let mut glyphs = SyntheticGlyphs::default();
+        let blinking = |level| SceneStyle {
+            cursor_fg: Some(cursor_fg),
+            cursor_bg: Some(palette.cursor_bg),
+            cursor_blink: level,
+            ..plain_style(&palette)
+        };
+        let at_cursor = |scene: &MetalScene| {
+            scene
+                .text()
+                .row(0)
+                .find(|instance| instance.col() == 0)
+                .map(|instance| instance.fg())
+        };
+        step(
+            &mut term,
+            &mut mirror,
+            &mut scene,
+            &mut glyphs,
+            &no_selection,
+            &blinking(Some(0.0)),
+        );
+        assert_eq!(at_cursor(&scene), Some(rgba8(cursor_fg)));
+        let update = scene.update(&mirror, &blinking(Some(0.5)), &no_selection, &mut glyphs);
+        assert_eq!((update.full, update.rows_rebuilt), (false, 1));
+        assert_eq!(
+            at_cursor(&scene),
+            Some(rgba8(mix_linear(cursor_fg, palette.foreground, 0.5)))
+        );
+        scene.update(&mirror, &blinking(Some(1.0)), &no_selection, &mut glyphs);
+        assert_eq!(at_cursor(&scene), Some(rgba8(palette.foreground)));
+
+        // Text in the block's color stays hidden whatever the level.
+        let hidden = SceneStyle {
+            cursor_fg: Some(palette.cursor_bg),
+            ..blinking(Some(0.5))
+        };
+        scene.update(&mirror, &hidden, &no_selection, &mut glyphs);
+        assert_eq!(at_cursor(&scene), None);
+    }
+
+    /// ft-yccm0.4.7.3: a scene says which blinks its rows have, so the
+    /// window draws frames for them only while there are some.
+    #[test]
+    fn a_scene_reports_which_blinks_its_rows_have() {
+        let palette = ColorPalette::default();
+        let blinks_of = |bytes: &[u8]| {
+            let mut term = terminal(3, 10);
+            term.advance_bytes(bytes);
+            let mut mirror = RenderMirror::new();
+            let mut scene = MetalScene::new();
+            step(
+                &mut term,
+                &mut mirror,
+                &mut scene,
+                &mut SyntheticGlyphs::default(),
+                &no_selection,
+                &plain_style(&palette),
+            );
+            scene.blinking()
+        };
+        assert_eq!(blinks_of(b"plain"), (false, false));
+        assert_eq!(blinks_of(b"\x1b[5mslow"), (true, false));
+        assert_eq!(blinks_of(b"\x1b[6mrapid"), (false, true));
+        assert_eq!(blinks_of(b"\x1b[5ma\r\n\x1b[6mb"), (true, true));
+    }
+
     /// ft-yccm0.4.7.3: WebGpu's reverse-video cursor. Under a focused block,
     /// text whose colors have the minimum contrast is drawn in its own
     /// background; text below it keeps the cursor foreground. The cursor's
@@ -2394,6 +2524,7 @@ mod tests {
                 compose: None,
                 min_contrast: None,
                 reverse_video_cursor: None,
+                cursor_blink: None,
             };
             let request = CaptureRequest {
                 viewport_top: None,

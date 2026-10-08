@@ -379,9 +379,11 @@ impl FrameDriver for MetalDriver {
                 let frames = FrameLedger::global();
                 frames.set_max_fps(request.config.max_fps);
                 frames.record_present();
+                // Blinking text or a blinking cursor draws again when its
+                // blink next moves (ft-yccm0.4.7.3).
                 FrameReport {
                     presented: true,
-                    redraw_at: None,
+                    redraw_at: self.panes.redraw_at(),
                 }
             }
             Ok(FrameOutcome::ZeroSize) => FrameReport::default(),
@@ -653,6 +655,9 @@ impl TermWindow {
         metrics::counter!("gui.render.damage_settlement", "outcome" => settlement.label())
             .increment(1);
         self.render_wake_state.cancel();
+        // The visual bell's fade needs new requests as it moves; the render
+        // thread redraws blinking text and cursors itself (ft-yccm0.4.7.3).
+        self.schedule_metal_animation(None);
         true
     }
 }
@@ -743,6 +748,9 @@ mod tests {
                 selection: None,
                 hover: None,
                 grid_origin: [rect.x as f32, rect.y as f32],
+                compose: None,
+                bell_cursor: None,
+                fallback_ready: None,
             },
             rect,
             clear: ClearColor::from_srgba(0.0, 0.0, 0.0, 1.0),
