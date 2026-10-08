@@ -107553,7 +107553,7 @@ reason = "overly conservative pending threshold"
         let receipt = frankenterm_core::steering::SteeringReceipt::new(
             "execute the tx",
             "ws-test",
-            Some(mission.compute_hash()),
+            Some(&mission),
             Some(live_hash.clone()),
             "envelope.admit",
             Some(900),

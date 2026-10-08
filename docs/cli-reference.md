@@ -108,9 +108,19 @@ ft mission explain [--mission-file <path>] [--assignment-id <id>] [-f <plain|jso
 ft mission pause [--mission-file <path>] [--reason <text>] [-f <plain|json>]
 ft mission resume [--mission-file <path>] [-f <plain|json>]
 ft mission abort [--mission-file <path>] [--reason <text>] [-f <plain|json>]
-ft steer plan --objective <text> --scenario <clean-ready|dirty-overlap|rch-blocked|approval-required|capacity-red> [--workspace-id <id>] [--ttl-ms <n>] [-f <plain|json>]
-ft steer run --receipt <steer:id> [--mission-file <path>] [--plan-hash <hash>] [-f <plain|json>]
+ft steer plan --objective <text> --scenario <clean-ready|dirty-overlap|rch-blocked|approval-required|capacity-red> [--workspace-id <id>] [--ttl-ms <n>] [--contract-file <path>] [-f <plain|json>]
+ft steer run --receipt <steer:id> [--contract-file <path>] [--mission-file <path>] [--plan-hash <hash>] [--fail-step <step-id>] [--paused] [--kill-switch <level>] [--dry-run] [-f <plain|json>]
 ```
+
+`ft steer plan` binds the receipt to a transaction contract: `--contract-file`,
+or `.ft/mission/tx-active.json` when it exists. A receipt planned without a
+contract is planning-only, and `ft steer run` refuses it with a hint to re-plan.
+`ft steer run` checks the receipt before the run starts and again before every
+step it dispatches. The receipt must belong to this workspace, be unexpired,
+and match the contract being run (and the `--mission-file` mission, if the
+receipt bound one). A receipt that expires mid-run, or a mission edited mid-run,
+stops the remaining steps. Each run appends an attachment to the contract with
+an `attempt` number, so repeated runs of one receipt can be told apart.
 
 Transaction-contract control is currently surfaced under robot mode as
 `ft robot tx plan|run|rollback|show`; the top-level human CLI does not expose
