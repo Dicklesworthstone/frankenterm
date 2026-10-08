@@ -1044,7 +1044,7 @@ fn deserialize_teenystring<'de, D>(deserializer: D) -> Result<TeenyString, D::Er
 where
     D: Deserializer<'de>,
 {
-    let text = Zeroizing::new(String::deserialize(deserializer)?);
+    let text = Zeroizing::new(alloc::string::String::deserialize(deserializer)?);
     Ok(TeenyString::from_str(&text, None, None))
 }
 

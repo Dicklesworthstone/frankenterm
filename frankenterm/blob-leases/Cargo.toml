@@ -11,7 +11,7 @@ publish = false
 
 [dependencies]
 getrandom.workspace = true
-serde = {workspace=true, features=["derive"], optional=true}
+serde = {workspace=true, features=["derive", "std"], optional=true}
 sha2.workspace = true
 tempfile = {workspace=true, optional=true}
 thiserror.workspace = true
