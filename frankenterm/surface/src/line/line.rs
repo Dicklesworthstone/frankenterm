@@ -2463,6 +2463,10 @@ pub struct LineWrapGeometry {
     tail_basic: bool,
     head_after_basic: bool,
     tail_before_basic: bool,
+    /// The head starts with a pictograph basic starter, so a join certifies
+    /// it with `tail_before_pictograph` instead of `tail_before_basic`.
+    head_pictograph: bool,
+    tail_before_pictograph: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2479,6 +2483,15 @@ impl LineWrapGeometry {
     /// bounds retained metadata and temporary boundary-certificate text work.
     /// Standalone counts remain exact even when `supports_join()` is false.
     pub fn capture(line: &Line, max_bytes: usize) -> Option<Self> {
+        Self::capture_with(line, max_bytes, geometry_pictograph_starters())
+    }
+
+    /// [`Self::capture`], with single emoji pictographs counted among the
+    /// basic starters or not (see [`geometry_basic_starter`]). Both give the
+    /// same widths, counts and row joinability. With them, a join can also
+    /// be certified where a pictograph starts the next row, and a T0 row is
+    /// captured without segmenting its cells and seams.
+    fn capture_with(line: &Line, max_bytes: usize, pictographs: bool) -> Option<Self> {
         let available = max_bytes.checked_sub(core::mem::size_of::<Self>())?;
         // Visible tokens cannot outnumber columns in canonical physical rows.
         // Reserve once, before certificate scratch exists, so a growing width
@@ -2495,6 +2508,8 @@ impl LineWrapGeometry {
             tail_basic: false,
             head_after_basic: false,
             tail_before_basic: false,
+            head_pictograph: false,
+            tail_before_pictograph: false,
         };
         result.widths.try_reserve_exact(line.len()).ok()?;
         if result.widths.capacity() > available {
@@ -2541,7 +2556,10 @@ impl LineWrapGeometry {
             // for a later default-width decoded representation.
             let ascii = text.len() == 1 && matches!(text.as_bytes()[0], b' '..=b'~');
             let mut chars = text.chars();
-            let basic = chars.next().is_some_and(geometry_basic_starter) && chars.next().is_none();
+            let basic = chars
+                .next()
+                .is_some_and(|ch| geometry_basic_starter(ch, pictographs))
+                && chars.next().is_none();
             result.join_safe &= if ascii {
                 width == 1
             } else {
@@ -2561,7 +2579,13 @@ impl LineWrapGeometry {
                     )?;
                 }
             } else {
-                result.head_basic = text.chars().next().is_some_and(geometry_basic_starter);
+                let first = text.chars().next();
+                result.head_basic = first.is_some_and(|ch| geometry_basic_starter(ch, pictographs));
+                result.head_pictograph =
+                    result.head_basic && first.is_some_and(|ch| !geometry_basic_starter(ch, false));
+                // After any basic starter the same rules apply as after "a",
+                // a pictograph included: only a ZWJ before the boundary would
+                // differ (GB11), and a basic starter is a lone code point.
                 result.head_after_basic = basic
                     || geometry_boundary_is_separate("a", text, &mut boundary, boundary_budget)?;
             }
@@ -2573,6 +2597,18 @@ impl LineWrapGeometry {
             result.tail_basic = previous_basic;
             result.tail_before_basic = previous_basic
                 || geometry_boundary_is_separate(last, "a", &mut boundary, boundary_budget)?;
+            // Before a pictograph, a ZWJ ending this row joins it (GB11) where
+            // it would not join "a". A probe the budget cannot afford leaves
+            // this certificate off; the capture succeeds or fails as before.
+            result.tail_before_pictograph = pictographs
+                && (previous_basic
+                    || geometry_boundary_is_separate(
+                        last,
+                        GEOMETRY_PICTOGRAPH_PROBE,
+                        &mut boundary,
+                        boundary_budget,
+                    )
+                    .unwrap_or(false));
         }
         Some(result)
     }
@@ -2691,10 +2727,14 @@ impl LineWrapGeometry {
         if !self.join_safe || !other.join_safe {
             return Err(LineWrapGeometryJoinError::UncertifiedSource);
         }
+        let tail_before_head = if other.head_pictograph {
+            self.tail_before_pictograph
+        } else {
+            self.tail_before_basic
+        };
         if !self.widths.is_empty()
             && !other.widths.is_empty()
-            && !(self.tail_basic && other.head_after_basic
-                || other.head_basic && self.tail_before_basic)
+            && !(self.tail_basic && other.head_after_basic || other.head_basic && tail_before_head)
         {
             return Err(LineWrapGeometryJoinError::UncertifiedBoundary);
         }
@@ -2736,10 +2776,12 @@ impl LineWrapGeometry {
         if self.widths.is_empty() {
             self.head_basic = other.head_basic;
             self.head_after_basic = other.head_after_basic;
+            self.head_pictograph = other.head_pictograph;
         }
         if !other.widths.is_empty() {
             self.tail_basic = other.tail_basic;
             self.tail_before_basic = other.tail_before_basic;
+            self.tail_before_pictograph = other.tail_before_pictograph;
         }
         self.widths.extend_from_slice(&other.widths);
         self.physical_len = physical_len;
@@ -2801,8 +2843,44 @@ impl LineWrapGeometry {
 // continuation, RI, Hangul, Indic linker or emoji-ZWJ context. The conservative
 // set includes the CJK seam in the native profiling corpus. Other boundaries
 // require a basic starter on the opposite side or the text-bearing fallback.
-fn geometry_basic_starter(ch: char) -> bool {
+//
+// With `pictographs`, so are the emoji pictographs of the operator's T0 pool
+// (ft-yccm0.3.2.6), less the skin-tone modifiers U+1F3FB..=U+1F3FF, which
+// extend the grapheme before them. Alone, each is a grapheme of its own, as
+// "a" is, and no rule joins two of them; only a ZWJ before one does (GB11),
+// so a row's tail is also probed against GEOMETRY_PICTOGRAPH_PROBE.
+fn geometry_basic_starter(ch: char, pictographs: bool) -> bool {
     matches!(ch, ' '..='~' | '\u{4e00}'..='\u{9fff}')
+        || (pictographs
+            && matches!(
+                ch,
+                '\u{1F300}'..='\u{1F3FA}'
+                    | '\u{1F400}'..='\u{1F64F}'
+                    | '\u{1F680}'..='\u{1F6FF}'
+                    | '\u{1F900}'..='\u{1F9FF}'
+                    | '\u{1FA70}'..='\u{1FAFF}'
+            ))
+}
+
+/// The pictograph that stands for every pictograph basic starter where a join
+/// certificate probes a boundary.
+const GEOMETRY_PICTOGRAPH_PROBE: &str = "\u{1F600}";
+
+/// Whether [`LineWrapGeometry::capture`] counts single emoji pictographs as
+/// basic starters, which spares a T0 row's cells their per-cell and per-seam
+/// grapheme segmentation (ft-yccm0.3.2.6): on unless
+/// `FT_GEOMETRY_PICTOGRAPH_STARTERS=0`, the A/B arm and a rollback. Both arms
+/// give the same widths and counts. Resolved once per process.
+fn geometry_pictograph_starters() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static PICTOGRAPHS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *PICTOGRAPHS.get_or_init(|| {
+            !std::env::var_os("FT_GEOMETRY_PICTOGRAPH_STARTERS").is_some_and(|v| v == "0")
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    true
 }
 
 fn geometry_boundary_is_separate(
@@ -4977,6 +5055,222 @@ mod tests {
             );
             assert_eq!(geometry, original);
         }
+    }
+
+    /// Whether `left` then `right` segment as those two graphemes.
+    fn graphemes_split(left: &str, right: &str) -> bool {
+        let joined = format!("{}{}", left, right);
+        let mut graphemes = Graphemes::new(&joined);
+        graphemes.next() == Some(left)
+            && graphemes.next() == Some(right)
+            && graphemes.next().is_none()
+    }
+
+    /// ft-yccm0.3.2.6: every pictograph geometry counts as a basic starter
+    /// is a grapheme of its own that binds to nothing beside it: not to "a",
+    /// a CJK ideograph, a space, the probe pictograph, itself, or another
+    /// pictograph, on either side. That is what lets capture skip its cell
+    /// and seam segmentation. They are the operator's T0 pool less the five
+    /// skin-tone modifiers, which do bind to the pictograph before them. And
+    /// only a ZWJ before a pictograph binds it, which the tail probe catches.
+    #[test]
+    fn pictograph_basic_starters_are_lone_ordinary_graphemes() {
+        let mut pictographs = 0;
+        for cp in 0x1F300..=0x1FAFF_u32 {
+            let Some(ch) = char::from_u32(cp) else {
+                continue;
+            };
+            if !geometry_basic_starter(ch, true) || geometry_basic_starter(ch, false) {
+                continue;
+            }
+            pictographs += 1;
+            let text = ch.to_string();
+            for other in ["a", "\u{754c}", " ", GEOMETRY_PICTOGRAPH_PROBE, "\u{1F9FF}"]
+                .iter()
+                .copied()
+                .chain(Some(text.as_str()))
+            {
+                assert!(
+                    graphemes_split(&text, other) && graphemes_split(other, &text),
+                    "U+{:X} binds to {:?}",
+                    cp,
+                    other
+                );
+            }
+        }
+        assert_eq!(pictographs, 1376 - 5);
+        for cp in 0x1F3FB..=0x1F3FF_u32 {
+            let modifier = char::from_u32(cp).unwrap();
+            assert!(!geometry_basic_starter(modifier, true));
+            assert!(!graphemes_split(
+                GEOMETRY_PICTOGRAPH_PROBE,
+                &modifier.to_string()
+            ));
+        }
+        assert!(!graphemes_split(
+            "\u{1F469}\u{200d}",
+            GEOMETRY_PICTOGRAPH_PROBE
+        ));
+        assert!(graphemes_split("\u{1F469}\u{200d}", "a"));
+    }
+
+    /// ft-yccm0.3.2.6: on random pairs of rows built from text that does and
+    /// does not join across a seam (pictographs, skin-tone modifiers, ZWJ
+    /// sequences and a dangling ZWJ, combining marks, VS16, regional
+    /// indicators, Hangul jamo, a Devanagari conjunct, ASCII, CJK, spaces),
+    /// geometry captured with pictograph starters and without has the same
+    /// widths, counts and joinability. It certifies every join the old
+    /// capture did, and every join it certifies holds: the tail of the first
+    /// row and the head of the second are separate graphemes when joined.
+    #[test]
+    fn pictograph_starter_geometry_certifies_only_joins_that_hold() {
+        let pool = [
+            "a",
+            " ",
+            "\u{754c}",
+            "\u{1F600}",
+            "\u{1F680}",
+            "\u{1F9FF}",
+            "\u{1F3FB}",
+            "\u{1F469}\u{200d}",
+            "\u{1F468}\u{200d}\u{1F469}",
+            "\u{200d}",
+            "e\u{301}",
+            "\u{301}",
+            "\u{FE0F}",
+            "\u{1F600}\u{FE0F}",
+            "\u{1F1FA}",
+            "\u{1F1F8}",
+            "\u{1100}",
+            "\u{1161}",
+            "\u{915}\u{94d}",
+        ];
+        let mut seed = 0x2026_1008_u64;
+        let mut next = move |bound: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % bound
+        };
+        let row = |next: &mut dyn FnMut(usize) -> usize| {
+            let mut cells = Vec::new();
+            let mut texts = Vec::new();
+            for _ in 0..1 + next(5) {
+                let text = pool[next(pool.len())];
+                let cell = Cell::new_grapheme(text, CellAttributes::blank(), None);
+                let width = cell.width();
+                cells.push(cell);
+                for _ in 1..width {
+                    cells.push(Cell::blank());
+                }
+                texts.push(text);
+            }
+            (Line::from_cells(cells, 1), texts)
+        };
+        let (mut certified, mut newly_certified) = (0, 0);
+        for _ in 0..20_000 {
+            let (left, left_texts) = row(&mut next);
+            let (right, right_texts) = row(&mut next);
+            let mut joins = [false; 2];
+            for (arm, &pictographs) in [false, true].iter().enumerate() {
+                let first = LineWrapGeometry::capture_with(&left, 1 << 16, pictographs).unwrap();
+                let second = LineWrapGeometry::capture_with(&right, 1 << 16, pictographs).unwrap();
+                for (captured, line, texts) in [
+                    (&first, &left, &left_texts),
+                    (&second, &right, &right_texts),
+                ] {
+                    let old = LineWrapGeometry::capture_with(line, 1 << 16, false).unwrap();
+                    assert_eq!(captured.widths, old.widths, "{:?}", texts);
+                    assert_eq!(captured.trimmed_tokens, old.trimmed_tokens, "{:?}", texts);
+                    assert_eq!(captured.physical_len, old.physical_len, "{:?}", texts);
+                    assert_eq!(captured.join_safe, old.join_safe, "{:?}", texts);
+                }
+                let mut joined = first.clone();
+                joins[arm] = joined.try_append(&second, 1 << 16).is_ok();
+                if joins[arm] {
+                    let (seam_left, seam_right) = (*left_texts.last().unwrap(), right_texts[0]);
+                    assert!(
+                        graphemes_split(seam_left, seam_right),
+                        "certified {:?} then {:?} (pictographs {})",
+                        left_texts,
+                        right_texts,
+                        pictographs
+                    );
+                }
+            }
+            assert!(
+                joins[1] || !joins[0],
+                "{:?} then {:?}",
+                left_texts,
+                right_texts
+            );
+            certified += usize::from(joins[1]);
+            newly_certified += usize::from(joins[1] && !joins[0]);
+        }
+        assert!(certified > 1000, "{}", certified);
+        assert!(newly_certified > 0, "{}", newly_certified);
+    }
+
+    /// ft-yccm0.3.2.6: what capturing a T0 row's geometry costs with
+    /// pictograph starters and without, as the parse thread captures every
+    /// row it spills to durable scrollback: rows of 60 wide cells from the
+    /// operator's pool (one in twenty an ASCII character), alternating arms.
+    /// A measurement, not a gate:
+    /// cargo test --profile release-perf -p frankenterm-surface --features std --lib -- --ignored geometry_capture_cost_on_t0_rows --nocapture
+    #[test]
+    #[ignore = "a throughput measurement; run it in release"]
+    fn geometry_capture_cost_on_t0_rows() {
+        let mut pool: Vec<char> = [
+            (0x1F600, 0x1F64F),
+            (0x1F300, 0x1F5FF),
+            (0x1F680, 0x1F6FF),
+            (0x1F900, 0x1F9FF),
+            (0x1FA70, 0x1FAFF),
+        ]
+        .iter()
+        .flat_map(|&(start, end)| (start..=end).filter_map(char::from_u32))
+        .collect();
+        pool.extend("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".chars());
+        let mut seed = 0x2026_1008_u64;
+        let mut rows = Vec::new();
+        for _ in 0..2000 {
+            let mut cells = Vec::new();
+            while cells.len() < 119 {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let ch = pool[(seed >> 33) as usize % pool.len()];
+                let cell = Cell::new(ch, CellAttributes::blank());
+                let width = cell.width();
+                cells.push(cell);
+                for _ in 1..width {
+                    cells.push(Cell::blank());
+                }
+            }
+            rows.push(Line::from_cells(cells, 1));
+        }
+        let mut best = [f64::INFINITY; 2];
+        for _ in 0..5 {
+            for (arm, &pictographs) in [false, true].iter().enumerate() {
+                let start = std::time::Instant::now();
+                for row in &rows {
+                    std::hint::black_box(LineWrapGeometry::capture_with(
+                        std::hint::black_box(row),
+                        1 << 16,
+                        pictographs,
+                    ));
+                }
+                best[arm] = best[arm].min(start.elapsed().as_secs_f64());
+            }
+        }
+        eprintln!(
+            "[BENCH] geometry capture, {} T0 rows: without pictograph starters {:.2} us/row, \
+             with {:.2} us/row, {:.1}x, best of 5",
+            rows.len(),
+            best[0] * 1e6 / rows.len() as f64,
+            best[1] * 1e6 / rows.len() as f64,
+            best[0] / best[1]
+        );
     }
 
     #[test]
