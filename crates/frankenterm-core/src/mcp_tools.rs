@@ -21552,7 +21552,9 @@ mod tests {
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
             let (_dir, db) = temp_db_path();
-            let pane_id = 4_207;
+            // Its own pane: the contract-doctor denial test uses 4_207, and
+            // pane-state fixtures are process-global (ft-zrwue).
+            let pane_id = 4_208;
             let text = "echo indeterminate";
             let caller_key = "crash-before-receipt";
             let binding = test_submit_idempotency_binding(pane_id, text, caller_key);
