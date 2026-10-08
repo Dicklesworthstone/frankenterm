@@ -13137,6 +13137,57 @@ mod tests {
                 Some(ColdSelectionValue::Captured(Ok(Some(_))))
             )
         }));
+        // A cold worker publishes its result before it retires: its
+        // completion then takes the slot again, to drop the result if it was
+        // cancelled meanwhile. A capture that meets that hold, or that of
+        // any worker still running, reports Busy, as it should: bv19 met it
+        // at the resident capture below, and a run on ts1 at the append
+        // capture. So each step below that expects an exact answer first
+        // waits until every worker has retired: only the pane and the
+        // `owners` capture owners it names still hold the slot.
+        let await_retired_workers = |owners: usize, step: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                while executor.try_tick().unwrap() {}
+                if Arc::strong_count(&pane.cold_selection) <= 1 + owners {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "cold workers did not retire before {}",
+                    step
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        // What a capture that does not settle left behind.
+        let describe_cold_work = |request: &ColdSelectionRequest| {
+            let slot = pane.cold_selection.lock();
+            let state = match slot.iter().find(|work| work.request == *request) {
+                None => "absent".to_string(),
+                Some(work) => format!(
+                    "cancelled {}, ready {}",
+                    work.cancelled.load(Ordering::Acquire),
+                    match work.ready.as_ref().map(|ready| &ready.value) {
+                        None => "none",
+                        Some(ColdSelectionValue::Busy) => "busy",
+                        Some(ColdSelectionValue::RetryAt(_)) => "retry later",
+                        Some(ColdSelectionValue::Captured(Ok(Some(_)))) => "captured",
+                        Some(ColdSelectionValue::Captured(Ok(None))) => "captured nothing",
+                        Some(ColdSelectionValue::Captured(Err(_))) => "capture failed",
+                        Some(ColdSelectionValue::Resolved(_)) => "resolved",
+                    }
+                ),
+            };
+            let permit = crate::pane::LineReadPermit::try_acquire().is_some();
+            format!(
+                "{} works in the slot; this one {}; a line-read permit {}",
+                slot.len(),
+                state,
+                if permit { "is free" } else { "is not free" }
+            )
+        };
+        await_retired_workers(0, "the append capture");
         // Content appended below this closed group advances physical bounds,
         // not its logical layout. An already-owned cold capture must survive
         // that unrelated output and keep its original endpoint authority.
@@ -13193,6 +13244,7 @@ mod tests {
             .downcast_ref::<frankenterm_term::screen::ScreenSelectionAnchor>()
             .is_some()));
         drop(append_state);
+        await_retired_workers(0, "the abandoned captures");
         // A GUI gesture can be superseded after its real cold worker has
         // completed but before the next paint delivers the token. Twenty
         // distinct abandoned captures must not exhaust Screen's sixteen
@@ -13243,10 +13295,16 @@ mod tests {
                     }
                     assert!(
                         Instant::now() < deadline,
-                        "owned cold capture did not settle"
+                        "owned cold capture {} did not settle: {}",
+                        abandoned,
+                        describe_cold_work(&request)
                     );
                     std::thread::sleep(Duration::from_millis(1));
                 }
+                // This capture's owner (`state`) still holds the slot. Its
+                // worker retires first, so it cannot drop the cancelled token
+                // below, which the next capture must reclaim.
+                await_retired_workers(1, "the owner is dropped");
                 // Force the owner's nonblocking retirement to lose the slot
                 // race. The next capture must reclaim this cancelled strong
                 // token before registering a new one.
@@ -13316,6 +13374,8 @@ mod tests {
         assert!(survivor.as_ref().is_some_and(|state| state
             .downcast_ref::<frankenterm_term::screen::ScreenSelectionAnchor>()
             .is_some()));
+        // The admissions below try the slot once each.
+        await_retired_workers(0, "the seeded admissions");
         // A superseded completion may only retire its own generation. This
         // exercises the production RAII guard used by canceled read workers.
         let old_cancelled = Arc::new(AtomicBool::new(true));
@@ -13588,6 +13648,7 @@ mod tests {
                 })
             );
             if cols != 20 {
+                await_retired_workers(0, "the stale gesture's capture");
                 assert!(
                     matches!(
                         pane.capture_selection_anchor(
