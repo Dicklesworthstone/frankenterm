@@ -3931,16 +3931,17 @@ impl TermWindow {
     }
 
     /// Activates the native Metal front end. It has no `RenderState`: it
-    /// draws the panes' cells, glyphs, selection and cursor, inactive-pane
-    /// dimming, splits, borders and the scrollbar, but not yet the tab bar or
-    /// the modal overlays the other front ends draw (ft-yccm0.4.7.1), so the
-    /// logged identity says what is still missing.
+    /// draws the panes (cells, glyphs, images, selection, cursor, dimming),
+    /// splits, borders and the scrollbar, and the window chrome (tab bars,
+    /// modal overlays, background layers) with the other front ends' code in
+    /// its own chrome target (ft-yccm0.4.7). It is still in development and
+    /// not the default, which the logged identity says.
     fn metal_created(&mut self, metal: Rc<frankenterm_renderer_metal::MetalRenderer>) {
         self.render_wake_state.cancel();
         self.render_state = None;
 
         let render_info = format!(
-            "Metal (in development: panes, splits, borders and scrollbar; tab bar and modal overlays not yet drawn, {} submission) on {}",
+            "Metal (in development, {} submission) on {}",
             metal.submission_path(),
             metal.device().capabilities()
         );
