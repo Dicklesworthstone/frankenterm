@@ -469,6 +469,7 @@ fn chrome_layer<'a>(
         },
         quads,
         under: 0,
+        under_text: 0,
         foreground_text_hsb: [1.0; 3],
     }
 }
@@ -722,4 +723,111 @@ fn background_layers_draw_under_the_panes() {
     // cells and glyphs.
     let over = render(transparent, Some(chrome_layer(&backdrop, 1, &atlas)));
     assert_ne!(over, reference, "a layer over the panes went unnoticed");
+}
+
+/// ft-yccm0.4.7.2: quads in the `UiLayer::under_text` band (images at a
+/// negative z-index) are drawn over the panes' backgrounds and under their
+/// text, as the WebGpu renderer draws them in a line's background
+/// sub-layer. An opaque band covers every cell background, so the pane
+/// reads back as a plain pane of the band's color within 2 codes, and its
+/// glyphs still show on top; drawn over everything, the same band hides
+/// them.
+#[test]
+// Pixel sizes are small.
+#[allow(clippy::cast_precision_loss)]
+fn under_text_quads_cover_the_backgrounds_and_not_the_text() {
+    use crate::color::srgb_to_linear;
+    use crate::ui_quads::kind;
+
+    let renderer = renderer();
+    let glyph = glyph(&renderer);
+    let extent = GridExtent::new(4, 10);
+    let rect = rect_for(0, 0, extent);
+    let content = content(extent, 3, &glyph);
+    let plain = Content {
+        cells: CellBgGrid::new(extent),
+        text: CellTextGrid::new(extent),
+    };
+    let (red, green, blue) = (0.8, 0.1, 0.1);
+    let band = [UiQuad {
+        rect: [0.0, 0.0, rect.width as f32, rect.height as f32],
+        uv: [0.0, 0.0, 1.0, 1.0],
+        fg: [
+            srgb_to_linear(red),
+            srgb_to_linear(green),
+            srgb_to_linear(blue),
+            1.0,
+        ],
+        alt: [0.0; 4],
+        mix: 0.0,
+        hsv: [1.0; 3],
+        kind: kind::SOLID_COLOR,
+    }];
+    let atlas = [0u8; 64];
+    let render = |content: &Content, text: bool, clear: ClearColor, ui| {
+        let base = pane(1, rect, content, None);
+        let panes = [PaneScene {
+            clear,
+            text: base.text.filter(|_| text),
+            ..base
+        }];
+        renderer
+            .snapshot_window(
+                rect.width,
+                rect.height,
+                &WindowFrame {
+                    clear,
+                    panes: &panes,
+                    fills: &[],
+                    ui,
+                },
+            )
+            .expect("a window frame")
+    };
+    let under_text = || {
+        Some(crate::ui_quads::UiLayer {
+            under_text: 1,
+            ..chrome_layer(&band, 1, &atlas)
+        })
+    };
+
+    // Every cell background, and the pane's own clear, is covered.
+    let reference = render(
+        &plain,
+        false,
+        ClearColor::from_srgba(red, green, blue, 1.0),
+        None,
+    );
+    let covered = render(&content, false, pane_clear(), under_text());
+    if let Some((index, (got, want))) =
+        covered
+            .chunks(4)
+            .zip(reference.chunks(4))
+            .enumerate()
+            .find(|(_, (got, want))| {
+                got.iter()
+                    .zip(*want)
+                    .any(|(got, want)| (i16::from(*got) - i16::from(*want)).abs() > 2)
+            })
+    {
+        panic!("pixel {index}: drew {got:?} under the band, {want:?} as its color");
+    }
+    // The glyphs are drawn over the band.
+    let with_text = render(&content, true, pane_clear(), under_text());
+    assert_ne!(with_text, covered, "the band hid the pane's glyphs");
+    // Planted negative: the opaque band over everything hides the glyphs,
+    // so the text-or-not comparison above can tell.
+    let over = |text| {
+        render(
+            &content,
+            text,
+            pane_clear(),
+            Some(chrome_layer(&band, 1, &atlas)),
+        )
+    };
+    assert_eq!(
+        over(true),
+        over(false),
+        "an opaque band over the text left it visible"
+    );
 }

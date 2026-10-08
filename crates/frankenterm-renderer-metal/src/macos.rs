@@ -13,8 +13,8 @@ use crate::macos_frames::{
 };
 use crate::{
     ClearColor, DeviceCapabilities, FRAME_SLOT_TIMEOUT, FrameError, FrameOutcome, FrameScene,
-    FrameStats, MAX_TEXTURE_EXTENT, MetalUnavailable, SUBMISSION_ENV, SubmissionPath, WindowFrame,
-    appkit_view,
+    FrameStats, MAX_TEXTURE_EXTENT, MetalUnavailable, SUBMISSION_ENV, SubmissionPath, UiLayer,
+    WindowFrame, appkit_view,
 };
 use frankenterm_alloc::resource_ledger::GpuResourceLedger;
 use objc2::rc::Retained;
@@ -821,6 +821,26 @@ impl MetalRenderer {
         }))
     }
 
+    /// The chrome draws of a window frame that wrote `quads` quads of `ui`
+    /// into `slot`, in the order its bands are drawn: under the panes,
+    /// under their text, and over everything.
+    fn ui_draws<'a>(
+        &'a self,
+        frames: &'a FrameSlots,
+        slot: usize,
+        ui: Option<&UiLayer<'_>>,
+        quads: usize,
+        size: [u32; 2],
+    ) -> Result<[Option<UiDraw<'a>>; 3], FrameError> {
+        let under = ui.map_or(0, |ui| ui.under.min(quads));
+        let under_text = ui.map_or(under, |ui| under.saturating_add(ui.under_text).min(quads));
+        Ok([
+            self.ui_draw(frames, slot, 0..under, size)?,
+            self.ui_draw(frames, slot, under..under_text, size)?,
+            self.ui_draw(frames, slot, under_text..quads, size)?,
+        ])
+    }
+
     /// Uploads `frame`'s panes into the next frame slot, writes one uniform
     /// block per draw, and encodes and commits the frame into `target`.
     fn encode_window_frame(
@@ -906,9 +926,8 @@ impl MetalRenderer {
             };
             draws.push(draw);
         }
-        let under = frame.ui.as_ref().map_or(0, |ui| ui.under.min(ui_quads));
-        let ui_under = self.ui_draw(&frames, slot, 0..under, [width, height])?;
-        let ui = self.ui_draw(&frames, slot, under..ui_quads, [width, height])?;
+        let [ui_under, ui_under_text, ui] =
+            self.ui_draws(&frames, slot, frame.ui.as_ref(), ui_quads, [width, height])?;
         let atlases = self.atlases.borrow();
         self.submission.encode_window(
             &frames,
@@ -926,6 +945,7 @@ impl MetalRenderer {
                 },
                 draws: &draws,
                 ui_under,
+                ui_under_text,
                 ui,
             },
         )

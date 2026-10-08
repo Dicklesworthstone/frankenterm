@@ -136,8 +136,13 @@ pub struct UiLayer<'a> {
     /// How many of `quads`, from the first, are drawn under the panes:
     /// window background layers, which the WebGpu renderer draws at
     /// negative zindex. The panes' backgrounds then blend over them. The
-    /// rest are drawn over everything.
+    /// rest, after the `under_text` ones, are drawn over everything.
     pub under: usize,
+    /// How many of `quads` after the `under` ones are drawn over the panes'
+    /// backgrounds and under their text: images at a negative z-index,
+    /// which the WebGpu renderer draws in a line's background sub-layer
+    /// (ft-yccm0.4.7.2).
+    pub under_text: usize,
     /// `foreground_text_hsb`, applied to monochrome glyphs.
     pub foreground_text_hsb: [f32; 3],
 }

@@ -65,6 +65,8 @@ impl ChromeFrame {
             },
             quads: &self.quads,
             under: self.under,
+            // Pane images under the text come with ft-yccm0.4.7.2's GUI half.
+            under_text: 0,
             foreground_text_hsb: self.foreground_text_hsb,
         }
     }

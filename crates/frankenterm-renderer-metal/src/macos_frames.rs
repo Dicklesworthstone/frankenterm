@@ -1495,6 +1495,30 @@ pub(crate) struct WindowBuffers<'a> {
 /// One slot's pool of Metal 4 argument tables for window draws.
 type ArgumentTablePool = std::cell::RefCell<Vec<Retained<ProtocolObject<dyn MTL4ArgumentTable>>>>;
 
+/// Where a window frame's chrome draws find their Metal 4 argument tables,
+/// after one table per pane draw.
+#[derive(Debug, Clone, Copy)]
+struct UiTables {
+    chrome: usize,
+    under: usize,
+    under_text: usize,
+}
+
+impl UiTables {
+    fn after(draws: usize) -> Self {
+        Self {
+            chrome: draws,
+            under: draws + 1,
+            under_text: draws + 2,
+        }
+    }
+
+    /// The tables a frame needs in all.
+    fn count(self) -> usize {
+        self.under_text + 1
+    }
+}
+
 /// Everything one window frame encodes.
 pub(crate) struct EncodedWindow<'a> {
     pub(crate) target: &'a ProtocolObject<dyn MTLTexture>,
@@ -1507,6 +1531,9 @@ pub(crate) struct EncodedWindow<'a> {
     /// Window background layers, drawn first; the panes' backgrounds then
     /// blend over them.
     pub(crate) ui_under: Option<UiDraw<'a>>,
+    /// Quads over the panes' backgrounds and under their text (images at a
+    /// negative z-index).
+    pub(crate) ui_under_text: Option<UiDraw<'a>>,
     /// Window chrome, drawn last.
     pub(crate) ui: Option<UiDraw<'a>>,
 }
@@ -1925,6 +1952,9 @@ impl Metal3Submission {
             draw_ui(&encoder, under);
         }
         draw_backgrounds(&encoder, window, false);
+        if let Some(under_text) = &window.ui_under_text {
+            draw_ui(&encoder, under_text);
+        }
         let mut text_bound = false;
         for draw in window.draws {
             let Some(text) = draw.text.filter(|text| text.instances > 0) else {
@@ -2184,16 +2214,16 @@ impl Metal4Submission {
         }
     }
 
-    /// Grows a slot's argument tables to `under_table + 1` and binds them:
-    /// each draw's, then the chrome's and the background layers'.
+    /// Grows a slot's argument tables to `ui.count()` and binds them: each
+    /// draw's, then the chrome's, the background layers' and the under-text
+    /// quads'.
     fn bind_window_tables(
         &self,
         tables: &mut Vec<Retained<ProtocolObject<dyn MTL4ArgumentTable>>>,
         window: &EncodedWindow<'_>,
-        chrome_table: usize,
-        under_table: usize,
+        ui: UiTables,
     ) -> Result<(), FrameError> {
-        while tables.len() < under_table + 1 {
+        while tables.len() < ui.count() {
             let table = self
                 .device
                 .newArgumentTableWithDescriptor_error(&argument_table_descriptor())
@@ -2226,11 +2256,14 @@ impl Metal4Submission {
                 }
             }
         }
-        if let Some(ui) = &window.ui {
-            Self::bind_ui(&tables[chrome_table], ui);
+        if let Some(chrome) = &window.ui {
+            Self::bind_ui(&tables[ui.chrome], chrome);
         }
         if let Some(under) = &window.ui_under {
-            Self::bind_ui(&tables[under_table], under);
+            Self::bind_ui(&tables[ui.under], under);
+        }
+        if let Some(under_text) = &window.ui_under_text {
+            Self::bind_ui(&tables[ui.under_text], under_text);
         }
         Ok(())
     }
@@ -2242,12 +2275,12 @@ impl Metal4Submission {
     ) -> Result<(), FrameError> {
         let slot = lease.slot();
         let mut tables = self.window_tables[slot].borrow_mut();
-        // One table per draw, then the chrome's and the background layers':
-        // no draw depends on when the encoder reads a table's bindings. The
-        // lease proves this slot's previous frame, the last to read them,
+        // One table per draw, then the chrome draws' (UiTables): no draw
+        // depends on when the encoder reads a table's bindings. The lease
+        // proves this slot's previous frame, the last to read them,
         // completed.
-        let (chrome_table, under_table) = (window.draws.len(), window.draws.len() + 1);
-        self.bind_window_tables(&mut tables, window, chrome_table, under_table)?;
+        let ui_tables = UiTables::after(window.draws.len());
+        self.bind_window_tables(&mut tables, window, ui_tables)?;
         let commands = &self.command_buffers[slot];
         // The lease proves this slot's previous frame completed, so its
         // allocator's memory is free to reuse.
@@ -2264,7 +2297,7 @@ impl Metal4Submission {
         };
         let stages = MTLRenderStages::Vertex | MTLRenderStages::Fragment;
         if let Some(under) = &window.ui_under {
-            Self::draw_ui(&encoder, &tables[under_table], under, stages);
+            Self::draw_ui(&encoder, &tables[ui_tables.under], under, stages);
         }
         // The panes' backgrounds (over false), blended over any window
         // background layers, or the fills drawn over the panes' text (over
@@ -2295,6 +2328,9 @@ impl Metal4Submission {
             }
         };
         backgrounds(false);
+        if let Some(under_text) = &window.ui_under_text {
+            Self::draw_ui(&encoder, &tables[ui_tables.under_text], under_text, stages);
+        }
         let mut text_bound = false;
         for (table, draw) in tables.iter().zip(window.draws) {
             let Some(text) = draw.text.filter(|text| text.instances > 0) else {
@@ -2323,7 +2359,7 @@ impl Metal4Submission {
             backgrounds(true);
         }
         if let Some(ui) = &window.ui {
-            Self::draw_ui(&encoder, &tables[chrome_table], ui, stages);
+            Self::draw_ui(&encoder, &tables[ui_tables.chrome], ui, stages);
         }
         encoder.endEncoding();
         drop(tables);
