@@ -10915,7 +10915,9 @@ impl TermWindow {
         if self.get_viewport(pane_id).is_none() {
             return;
         }
-        self.set_viewport(pane_id, None, pane.get_dimensions());
+        // Facts, not a terminal lock: the mouse path scrolls to the bottom
+        // before reporting (ft-yccm0.2.2.2).
+        self.set_viewport(pane_id, None, mouseevent::pane_dimensions(&**pane));
     }
 
     fn get_active_pane_no_overlay(&self) -> Option<Arc<dyn Pane>> {

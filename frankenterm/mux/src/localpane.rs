@@ -1180,6 +1180,139 @@ impl ResizeCancellationToken {
     }
 }
 
+/// Same-binary control for the native A/B (ft-yccm0.2.2.2):
+/// `FT_DISABLE_LOCK_FREE_MOUSE=1` applies mouse events on the caller's
+/// thread under the terminal lock again, and the GUI's mouse path reads pane
+/// state through the locking getters instead of the published facts.
+pub fn lock_free_mouse_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("FT_DISABLE_LOCK_FREE_MOUSE").as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// How long an idle input worker waits for more input before it exits.
+const INPUT_WORKER_LINGER: Duration = Duration::from_millis(500);
+
+/// Input a pane's input worker applies to the terminal in arrival order
+/// (ft-yccm0.2.2.2): every mouse event and focus change, so the GUI thread
+/// never waits for the terminal mutex to report the mouse or a
+/// click-to-focus, and any key, paste or raw input that arrives while those
+/// are still pending, so it never overtakes them.
+#[derive(Debug)]
+enum QueuedInput {
+    Mouse(MouseEvent),
+    Focus(bool),
+    KeyDown(KeyCode, KeyModifiers),
+    KeyUp(KeyCode, KeyModifiers),
+    Paste(String),
+    UserInput(Vec<u8>),
+}
+
+impl QueuedInput {
+    fn holder(&self) -> TerminalLockHolder {
+        match self {
+            Self::Mouse(_) => TerminalLockHolder::Mouse,
+            _ => TerminalLockHolder::Other,
+        }
+    }
+
+    /// Applies the input; a focus change is republished in the render facts
+    /// as `LocalPane::focus_changed` always did.
+    fn apply(self, term: &mut Terminal, render_facts: &RenderFactsPublisher) -> Result<(), Error> {
+        match self {
+            Self::Mouse(event) => term.mouse_event(event),
+            Self::Focus(focused) => {
+                term.focus_changed(focused);
+                render_facts.publish(term);
+                Ok(())
+            }
+            Self::KeyDown(key, mods) => term.key_down(key, mods),
+            Self::KeyUp(key, mods) => term.key_up(key, mods),
+            Self::Paste(text) => term.send_paste(&text),
+            Self::UserInput(bytes) => Ok(term.write_user_input(&bytes)?),
+        }
+    }
+}
+
+#[derive(Default)]
+struct InputQueueState {
+    items: std::collections::VecDeque<QueuedInput>,
+    /// Enqueued and not yet applied, the item being applied included.
+    pending: usize,
+    worker_running: bool,
+}
+
+#[derive(Default)]
+struct InputQueue {
+    state: Mutex<InputQueueState>,
+    arrived: parking_lot::Condvar,
+}
+
+impl InputQueue {
+    /// Queues `item` behind the input already queued and returns whether a
+    /// worker must be started. With `behind_pending`, `item` is queued only
+    /// while earlier input is still pending, and is otherwise handed back to
+    /// be applied by the caller now, in order. Motion the worker has not
+    /// reached yet is replaced by newer motion with the same buttons and
+    /// modifiers; presses, releases, wheel steps and keys are never merged.
+    fn push(&self, item: QueuedInput, behind_pending: bool) -> Result<bool, QueuedInput> {
+        let mut state = self.state.lock();
+        if behind_pending && state.pending == 0 {
+            return Err(item);
+        }
+        if let (QueuedInput::Mouse(event), Some(QueuedInput::Mouse(last))) =
+            (&item, state.items.back_mut())
+        {
+            if event.kind == frankenterm_term::MouseEventKind::Move
+                && last.kind == frankenterm_term::MouseEventKind::Move
+                && last.button == event.button
+                && last.modifiers == event.modifiers
+            {
+                *last = *event;
+                return Ok(false);
+            }
+        }
+        state.items.push_back(item);
+        state.pending += 1;
+        let start = !state.worker_running;
+        state.worker_running = true;
+        drop(state);
+        self.arrived.notify_one();
+        Ok(start)
+    }
+
+    /// The next item to apply, waiting up to `linger` for one; None, with
+    /// the worker marked stopped, once the queue stays empty.
+    fn next(&self, linger: Option<Duration>) -> Option<QueuedInput> {
+        let mut state = self.state.lock();
+        loop {
+            if let Some(item) = state.items.pop_front() {
+                return Some(item);
+            }
+            let timed_out = match linger {
+                Some(linger) => self.arrived.wait_for(&mut state, linger).timed_out(),
+                None => true,
+            };
+            if timed_out && state.items.is_empty() {
+                state.worker_running = false;
+                return None;
+            }
+        }
+    }
+
+    fn applied(&self) {
+        let mut state = self.state.lock();
+        state.pending = state.pending.saturating_sub(1);
+    }
+
+    /// Whether input is still pending; a cheap check before building an
+    /// owned item that would only be handed back.
+    fn has_pending(&self) -> bool {
+        self.state.lock().pending != 0
+    }
+}
+
 #[derive(Default)]
 struct ResizeQueueState {
     pending: Option<PendingResize>,
@@ -1859,6 +1992,9 @@ pub struct LocalPane {
         Mutex<Option<crate::guardian_checkpoint::GuardianRestoredParserPrefix>>,
     guardian_checkpoint_publisher: Option<Arc<dyn GuardianLiveCheckpointPublisher>>,
     resize_queue: Arc<Mutex<ResizeQueueState>>,
+    /// Mouse events, and input behind them, applied off the caller's thread
+    /// (ft-yccm0.2.2.2).
+    input_queue: Arc<InputQueue>,
     writer: Mutex<Box<dyn Write + Send>>,
     domain_id: DomainId,
     tmux_domain: Arc<Mutex<Option<Arc<TmuxDomainState>>>>,
@@ -2785,8 +2921,16 @@ impl Pane for LocalPane {
             .map_err(LiveParserPaneCaptureError::Terminal)
     }
 
+    /// Queues the event for the pane's input worker, which reports it under
+    /// the terminal lock: the caller never waits for the terminal
+    /// (ft-yccm0.2.2.2).
     fn mouse_event(&self, event: MouseEvent) -> Result<(), Error> {
         record_input_for_current_identity(&self.mux_registration);
+        if lock_free_mouse_enabled() {
+            // Never handed back: mouse events are always queued.
+            let _ = self.queue_input(QueuedInput::Mouse(event), false);
+            return Ok(());
+        }
         self.locked_terminal_as(TerminalLockHolder::Mouse)
             .mouse_event(event)
     }
@@ -2799,6 +2943,12 @@ impl Pane for LocalPane {
                 self.locked_terminal().send_paste("detach\n")?;
             }
             return Ok(());
+        } else if self
+            .queue_input(QueuedInput::KeyDown(key, mods), true)
+            .is_ok()
+        {
+            // Behind a pending mouse event, which it must not overtake.
+            Ok(())
         } else {
             self.locked_terminal().key_down(key, mods)
         }
@@ -2806,6 +2956,12 @@ impl Pane for LocalPane {
 
     fn key_up(&self, key: KeyCode, mods: KeyModifiers) -> Result<(), Error> {
         record_input_for_current_identity(&self.mux_registration);
+        if self
+            .queue_input(QueuedInput::KeyUp(key, mods), true)
+            .is_ok()
+        {
+            return Ok(());
+        }
         self.locked_terminal().key_up(key, mods)
     }
 
@@ -2831,6 +2987,13 @@ impl Pane for LocalPane {
     /// could interleave with a paste the terminal writer is still sending.
     fn send_user_input(&self, bytes: &[u8]) -> anyhow::Result<()> {
         record_input_for_current_identity(&self.mux_registration);
+        if self.input_queue.has_pending()
+            && self
+                .queue_input(QueuedInput::UserInput(bytes.to_vec()), true)
+                .is_ok()
+        {
+            return Ok(());
+        }
         self.locked_terminal().write_user_input(bytes)?;
         Ok(())
     }
@@ -2876,10 +3039,16 @@ impl Pane for LocalPane {
     fn send_paste(&self, text: &str) -> Result<(), Error> {
         record_input_for_current_identity(&self.mux_registration);
         if self.tmux_domain.lock().is_some() {
-            Ok(())
-        } else {
-            self.locked_terminal().send_paste(text)
+            return Ok(());
         }
+        if self.input_queue.has_pending()
+            && self
+                .queue_input(QueuedInput::Paste(text.to_owned()), true)
+                .is_ok()
+        {
+            return Ok(());
+        }
+        self.locked_terminal().send_paste(text)
     }
 
     fn get_title(&self) -> String {
@@ -2937,7 +3106,15 @@ impl Pane for LocalPane {
         self.render_facts.publish(&mut terminal);
     }
 
+    /// Queued like a mouse event: a click-to-focus changes focus from the
+    /// GUI's mouse path, which never waits for the terminal
+    /// (ft-yccm0.2.2.2). The focus report still precedes the click's.
     fn focus_changed(&self, focused: bool) {
+        if lock_free_mouse_enabled() {
+            // Never handed back: focus changes are always queued.
+            let _ = self.queue_input(QueuedInput::Focus(focused), false);
+            return;
+        }
         let mut terminal = self.locked_terminal();
         terminal.focus_changed(focused);
         self.render_facts.publish(&mut terminal);
@@ -7246,6 +7423,94 @@ impl LocalPane {
             .map_err(|refusal| anyhow::anyhow!("fused feed refused: {:?}", refusal))
     }
 
+    /// Waits until the input worker has applied everything queued so far.
+    #[cfg(test)]
+    fn wait_for_queued_input(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.input_queue.has_pending() {
+            assert!(Instant::now() < deadline, "queued input was never applied");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Queues `item` for the input worker, starting one if none is running;
+    /// see [`InputQueue::push`] for `behind_pending`.
+    fn queue_input(&self, item: QueuedInput, behind_pending: bool) -> Result<(), QueuedInput> {
+        if self.input_queue.push(item, behind_pending)? {
+            self.spawn_input_worker();
+        }
+        Ok(())
+    }
+
+    fn spawn_input_worker(&self) {
+        let pane_id = self.pane_id;
+        let terminal = Arc::clone(&self.terminal);
+        let queue = Arc::clone(&self.input_queue);
+        #[cfg(feature = "disruptor-pane-io")]
+        let action_ring = Arc::clone(&self.action_ring);
+        let render_facts = Arc::clone(&self.render_facts);
+        let spawned = std::thread::Builder::new()
+            .name(format!("pane-input-{pane_id}"))
+            .spawn(move || {
+                Self::run_input_worker(
+                    pane_id,
+                    &terminal,
+                    &queue,
+                    #[cfg(feature = "disruptor-pane-io")]
+                    &action_ring,
+                    &render_facts,
+                    Some(INPUT_WORKER_LINGER),
+                );
+            });
+        if let Err(err) = spawned {
+            // The queue still marks a worker as running: drain it here
+            // rather than strand the input. Thread creation failure is rare.
+            log::error!(
+                "failed to spawn the input worker; applying input inline pane_id={} error={:#}",
+                pane_id,
+                err
+            );
+            Self::run_input_worker(
+                pane_id,
+                &self.terminal,
+                &self.input_queue,
+                #[cfg(feature = "disruptor-pane-io")]
+                &self.action_ring,
+                &self.render_facts,
+                None,
+            );
+        }
+    }
+
+    /// Applies queued input in order, each item under its own terminal
+    /// lock taken on this thread with demand registered, so a flooding
+    /// parser hands it over at its next slice (ft-yccm0.2.3). With `linger`
+    /// it waits that long for more input before exiting; without, it returns
+    /// once the queue is empty.
+    fn run_input_worker(
+        pane_id: PaneId,
+        terminal: &TerminalMutex,
+        queue: &InputQueue,
+        #[cfg(feature = "disruptor-pane-io")] action_ring: &ArrayQueue<AdmittedPaneActions>,
+        render_facts: &RenderFactsPublisher,
+        linger: Option<Duration>,
+    ) {
+        while let Some(item) = queue.next(linger) {
+            let result = {
+                let mut term = terminal.lock_as(item.holder());
+                #[cfg(feature = "disruptor-pane-io")]
+                if Self::drain_action_ring_into(action_ring, &mut term) {
+                    render_facts.publish(&mut term);
+                }
+                item.apply(&mut term, render_facts)
+            };
+            queue.applied();
+            if let Err(err) = result {
+                log::error!("pane {pane_id}: queued input was not applied: {err:#}");
+            }
+        }
+    }
+
     fn enqueue_resize(&self, size: TerminalSize, reconcile_tab: bool) -> Result<(), Error> {
         let pty_size = PtySize {
             rows: size.rows.try_into()?,
@@ -8347,6 +8612,7 @@ impl LocalPane {
             guardian_restored_prefix: Mutex::new(None),
             guardian_checkpoint_publisher,
             resize_queue: Arc::new(Mutex::new(ResizeQueueState::default())),
+            input_queue: Arc::new(InputQueue::default()),
             writer: Mutex::new(writer),
             domain_id,
             tmux_domain,
@@ -17813,8 +18079,10 @@ mod tests {
         let scrolled = apply_output(&pane, &b"line\r\n".repeat(40));
         assert!(scrolled.dimensions.scrollback_rows > primary.dimensions.scrollback_rows);
 
-        // Changes that do not come from output are published as well.
+        // Changes that do not come from output are published as well. A
+        // focus change is applied by the input worker (ft-yccm0.2.2.2).
         pane.focus_changed(true);
+        pane.wait_for_queued_input();
         assert_eq!(pane.render_facts().seqno, pane.get_current_seqno());
         pane.erase_scrollback(ScrollbackEraseMode::ScrollbackOnly);
         assert_eq!(pane.render_facts().dimensions, pane.get_dimensions());
@@ -17865,6 +18133,237 @@ mod tests {
         assert_eq!((held.cursor.x, held.cursor.y), (4, 4));
         let latest = pane.render_facts();
         assert_eq!((latest.cursor.x, latest.cursor.y), (6, 6));
+    }
+
+    /// What the terminal wrote, as the child reads it.
+    #[derive(Clone, Default)]
+    struct RecordedWrites(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for RecordedWrites {
+        fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+    }
+
+    impl RecordedWrites {
+        /// Waits until exactly `expected` has been written.
+        fn expect(&self, expected: &[u8]) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let written = self.0.lock().clone();
+                if written == expected {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline && written.len() < expected.len(),
+                    "wrote {:?}, expected {:?}",
+                    String::from_utf8_lossy(&written),
+                    String::from_utf8_lossy(expected)
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    fn input_test_pane(pane_id: PaneId, size: TerminalSize) -> (LocalPane, RecordedWrites) {
+        let writes = RecordedWrites::default();
+        let pane = make_legacy_test_pane(
+            pane_id,
+            Terminal::new(
+                size,
+                Arc::new(RenderFactsTestConfig),
+                "FrankenTerm",
+                "input-queue-test",
+                Box::new(writes.clone()),
+            ),
+        );
+        (pane, writes)
+    }
+
+    fn mouse_at(
+        kind: frankenterm_term::MouseEventKind,
+        button: frankenterm_term::MouseButton,
+        x: usize,
+        y: i64,
+    ) -> MouseEvent {
+        MouseEvent {
+            kind,
+            button,
+            x,
+            y,
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// ft-yccm0.2.2.2: mouse reports, and a key typed behind them, return
+    /// at once while another thread holds the terminal mutex, and reach the
+    /// child in order once it is free.
+    #[test]
+    fn mouse_input_never_waits_for_the_terminal_mutex() {
+        use frankenterm_term::{MouseButton as B, MouseEventKind as K};
+        let (pane, writes) = input_test_pane(793, term_size(80, 24));
+        apply_output(&pane, b"\x1b[?1000h\x1b[?1006h");
+        let held = pane.terminal.lock();
+        let started = Instant::now();
+        pane.mouse_event(mouse_at(K::Press, B::Left, 2, 1)).unwrap();
+        pane.key_down(KeyCode::Char('a'), KeyModifiers::NONE)
+            .unwrap();
+        pane.mouse_event(mouse_at(K::Release, B::Left, 2, 1))
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(writes.0.lock().is_empty(), "written under a held terminal");
+        drop(held);
+        assert!(elapsed < Duration::from_millis(100), "{:?}", elapsed);
+        pane.wait_for_queued_input();
+        writes.expect(b"\x1b[<0;3;2Ma\x1b[<0;3;2m");
+    }
+
+    /// ft-yccm0.2.2.2: queued input keeps the terminal's own encodings and
+    /// modes. X10 (1000 alone), UTF-8 (1005), SGR (1006) and SGR pixel
+    /// (1016) coordinates; clicks only (1000), drags (1002) and all motion
+    /// (1003); urxvt (1015) is not supported and leaves X10; and on the
+    /// alternate screen with no reporting the wheel sends three cursor keys
+    /// per step, in normal or application cursor mode.
+    #[test]
+    fn queued_mouse_reports_keep_every_mode_and_encoding() {
+        use frankenterm_term::{MouseButton as B, MouseEventKind as K};
+        let click = [
+            mouse_at(K::Press, B::Left, 2, 1),
+            mouse_at(K::Move, B::None, 4, 1),
+            mouse_at(K::Release, B::Left, 2, 1),
+        ];
+        let drag = [
+            mouse_at(K::Press, B::Left, 2, 1),
+            mouse_at(K::Move, B::Left, 4, 1),
+            mouse_at(K::Release, B::Left, 4, 1),
+            mouse_at(K::Move, B::None, 6, 1),
+        ];
+        let hover = [mouse_at(K::Move, B::None, 4, 1)];
+        let wide = [mouse_at(K::Press, B::Left, 200, 1)];
+        let mut pixel = mouse_at(K::Press, B::Left, 2, 1);
+        pixel.x_pixel_offset = 4;
+        pixel.y_pixel_offset = 5;
+        let wheel = [mouse_at(K::Press, B::WheelUp(1), 2, 1)];
+        let pixels = TerminalSize {
+            cols: 80,
+            rows: 24,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
+        };
+        let cases: [(&[u8], &[MouseEvent], TerminalSize, &[u8]); 10] = [
+            (
+                b"\x1b[?1000h",
+                &click,
+                term_size(80, 24),
+                b"\x1b[M #\"\x1b[M##\"",
+            ),
+            (
+                b"\x1b[?1000h\x1b[?1015h",
+                &click,
+                term_size(80, 24),
+                b"\x1b[M #\"\x1b[M##\"",
+            ),
+            (
+                b"\x1b[?1000h\x1b[?1006h",
+                &click,
+                term_size(80, 24),
+                b"\x1b[<0;3;2M\x1b[<0;3;2m",
+            ),
+            (
+                b"\x1b[?1002h\x1b[?1006h",
+                &drag,
+                term_size(80, 24),
+                b"\x1b[<0;3;2M\x1b[<32;5;2M\x1b[<0;5;2m",
+            ),
+            (
+                b"\x1b[?1003h\x1b[?1006h",
+                &hover,
+                term_size(80, 24),
+                b"\x1b[<35;5;2M",
+            ),
+            (b"\x1b[?1000h", &wide, term_size(300, 24), b"\x1b[M \xe9\""),
+            (
+                b"\x1b[?1000h\x1b[?1005h",
+                &wide,
+                term_size(300, 24),
+                b"\x1b[M \xc3\xa9\"",
+            ),
+            (
+                b"\x1b[?1000h\x1b[?1016h",
+                &[pixel],
+                pixels,
+                b"\x1b[<0;25;26M",
+            ),
+            (
+                b"\x1b[?1049h",
+                &wheel,
+                term_size(80, 24),
+                b"\x1b[A\x1b[A\x1b[A",
+            ),
+            (
+                b"\x1b[?1049h\x1b[?1h",
+                &wheel,
+                term_size(80, 24),
+                b"\x1bOA\x1bOA\x1bOA",
+            ),
+        ];
+        for (index, &(modes, events, size, expected)) in cases.iter().enumerate() {
+            let (pane, writes) = input_test_pane(800 + index, size);
+            apply_output(&pane, modes);
+            for event in events {
+                pane.mouse_event(*event).unwrap();
+            }
+            pane.wait_for_queued_input();
+            writes.expect(expected);
+        }
+    }
+
+    /// ft-yccm0.2.2.2: motion the worker has not reached collapses into the
+    /// newest; presses, releases and keys queued behind it never merge.
+    #[test]
+    fn queued_motion_coalesces_but_clicks_and_keys_do_not() {
+        use frankenterm_term::{MouseButton as B, MouseEventKind as K};
+        let (pane, writes) = input_test_pane(811, term_size(80, 24));
+        apply_output(&pane, b"\x1b[?1002h\x1b[?1006h");
+        let held = pane.terminal.lock();
+        pane.mouse_event(mouse_at(K::Press, B::Left, 2, 1)).unwrap();
+        for x in 3..9 {
+            pane.mouse_event(mouse_at(K::Move, B::Left, x, 1)).unwrap();
+        }
+        pane.key_down(KeyCode::Char('k'), KeyModifiers::NONE)
+            .unwrap();
+        for x in 9..11 {
+            pane.mouse_event(mouse_at(K::Move, B::Left, x, 1)).unwrap();
+        }
+        pane.mouse_event(mouse_at(K::Release, B::Left, 10, 1))
+            .unwrap();
+        drop(held);
+        pane.wait_for_queued_input();
+        writes.expect(b"\x1b[<0;3;2M\x1b[<32;9;2Mk\x1b[<32;11;2M\x1b[<0;11;2m");
+    }
+
+    /// ft-yccm0.2.2.2: focus changes are queued too, so a click-to-focus
+    /// reports focus before the click, with no terminal lock on the caller.
+    #[test]
+    fn queued_focus_reports_precede_the_click() {
+        use frankenterm_term::{MouseButton as B, MouseEventKind as K};
+        let (pane, writes) = input_test_pane(812, term_size(80, 24));
+        apply_output(&pane, b"\x1b[?1004h\x1b[?1000h\x1b[?1006h");
+        let held = pane.terminal.lock();
+        pane.focus_changed(false);
+        pane.focus_changed(true);
+        pane.mouse_event(mouse_at(K::Press, B::Left, 2, 1)).unwrap();
+        drop(held);
+        pane.wait_for_queued_input();
+        writes.expect(b"\x1b[O\x1b[I\x1b[<0;3;2M");
     }
 
     #[test]

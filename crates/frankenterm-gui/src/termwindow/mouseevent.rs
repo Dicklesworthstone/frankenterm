@@ -21,6 +21,33 @@ use wezterm_dynamic::ToDynamic;
 use wezterm_term::input::{MouseButton, MouseEventKind as TMEK};
 use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
 
+/// The render facts a local pane publishes, which the mouse path reads
+/// instead of locking its terminal (ft-yccm0.2.2.2). None for other panes,
+/// whose getters it keeps, and with FT_DISABLE_LOCK_FREE_MOUSE=1.
+fn published_facts(pane: &dyn Pane) -> Option<Arc<mux::pane::PaneRenderFacts>> {
+    (mux::localpane::lock_free_mouse_enabled()
+        && pane.downcast_ref::<mux::localpane::LocalPane>().is_some())
+    .then(|| pane.render_facts())
+}
+
+/// Whether `pane` reports the mouse; see [`published_facts`].
+fn mouse_grabbed(pane: &dyn Pane) -> bool {
+    published_facts(pane).map_or_else(|| pane.is_mouse_grabbed(), |facts| facts.mouse_grabbed)
+}
+
+/// Whether `pane` shows its alternate screen; see [`published_facts`].
+fn alt_screen_active(pane: &dyn Pane) -> bool {
+    published_facts(pane).map_or_else(
+        || pane.is_alt_screen_active(),
+        |facts| facts.alt_screen_active,
+    )
+}
+
+/// `pane`'s dimensions; see [`published_facts`].
+pub(super) fn pane_dimensions(pane: &dyn Pane) -> mux::renderable::RenderableDimensions {
+    published_facts(pane).map_or_else(|| pane.get_dimensions(), |facts| facts.dimensions)
+}
+
 fn checked_mouse_stable_row(viewport: StableRowIndex, row: i64) -> Option<StableRowIndex> {
     let offset = StableRowIndex::try_from(row).ok()?;
     if offset < 0 {
@@ -123,7 +150,7 @@ impl super::TermWindow {
             .sub((padding_left + border.left.get() as f32) as isize)
             .max(0) as f32)
             / cell_w;
-        let x = if !pane.is_mouse_grabbed() {
+        let x = if !mouse_grabbed(&*pane) {
             // Round the x coordinate so that we're a bit more forgiving of
             // the horizontal position when selecting cells
             x.round()
@@ -361,7 +388,7 @@ impl super::TermWindow {
             None => return,
         };
 
-        let dims = pane.get_dimensions();
+        let dims = pane_dimensions(&*pane);
         let current_viewport = self.get_viewport(pane.pane_id());
 
         let tab_bar_height = if self.show_tab_bar {
@@ -670,7 +697,7 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) {
         if let WMEK::Press(MousePress::Left) = event.kind {
-            let dims = pane.get_dimensions();
+            let dims = pane_dimensions(&*pane);
             let current_viewport = self.get_viewport(pane.pane_id());
             // Page up
             self.set_viewport(
@@ -695,7 +722,7 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) {
         if let WMEK::Press(MousePress::Left) = event.kind {
-            let dims = pane.get_dimensions();
+            let dims = pane_dimensions(&*pane);
             let current_viewport = self.get_viewport(pane.pane_id());
             // Page down
             self.set_viewport(
@@ -979,7 +1006,7 @@ impl super::TermWindow {
             // When hovering over a hyperlink, show an appropriate
             // mouse cursor to give the cue that it is clickable
             MouseCursor::Hand
-        } else if pane.is_mouse_grabbed() || outside_window {
+        } else if mouse_grabbed(&*pane) || outside_window {
             MouseCursor::Arrow
         } else {
             MouseCursor::Text
@@ -1063,7 +1090,7 @@ impl super::TermWindow {
 
                 // Since we use shift to force assessing the mouse bindings, pretend
                 // that shift is not one of the mods when the mouse is grabbed.
-                let mut mouse_reporting = pane.is_mouse_grabbed();
+                let mut mouse_reporting = mouse_grabbed(&*pane);
                 if mouse_reporting {
                     if modifiers.contains(self.config.bypass_mouse_reporting_modifiers) {
                         modifiers.remove(self.config.bypass_mouse_reporting_modifiers);
@@ -1116,7 +1143,7 @@ impl super::TermWindow {
                 let mouse_mods = config::MouseEventTriggerMods {
                     mods: modifiers,
                     mouse_reporting,
-                    alt_screen: if pane.is_alt_screen_active() {
+                    alt_screen: if alt_screen_active(&*pane) {
                         MouseEventAltScreen::True
                     } else {
                         MouseEventAltScreen::False
@@ -1264,5 +1291,72 @@ mod tests {
             active,
             42,
         ));
+    }
+
+    /// ft-yccm0.2.2.2: the mouse path's grabbed, alternate-screen and
+    /// dimension reads of a local pane are its published render facts, not
+    /// a terminal lock, for a grabbed pane on the alternate screen and for
+    /// one that is neither.
+    #[test]
+    #[cfg(unix)]
+    fn mouse_path_reads_a_local_panes_published_facts() {
+        use mux::pane::Pane;
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct FactsConfig;
+        impl wezterm_term::TerminalConfiguration for FactsConfig {
+            fn color_palette(&self) -> wezterm_term::color::ColorPalette {
+                Default::default()
+            }
+        }
+        for (id, output, grabbed) in [
+            (998_321, &b"\x1b[?1000h\x1b[?1049h"[..], true),
+            (998_322, &b"plain"[..], false),
+        ] {
+            let terminal = wezterm_term::Terminal::new(
+                wezterm_term::TerminalSize {
+                    rows: 4,
+                    cols: 20,
+                    dpi: 96,
+                    pixel_width: 160,
+                    pixel_height: 64,
+                },
+                Arc::new(FactsConfig),
+                "mouse-facts-test",
+                "test",
+                Box::new(Vec::<u8>::new()),
+            );
+            let pair = portable_pty::native_pty_system()
+                .openpty(portable_pty::PtySize::default())
+                .unwrap();
+            let writer = pair.master.take_writer().unwrap();
+            let child = pair
+                .slave
+                .spawn_command(portable_pty::CommandBuilder::new("/bin/cat"))
+                .unwrap();
+            let pane: Arc<dyn Pane> = Arc::new(mux::localpane::LocalPane::new(
+                id,
+                terminal,
+                child,
+                pair.master,
+                writer,
+                id,
+                [0x35; 16],
+                "mouse facts test".to_owned(),
+            ));
+            let mut actions = Vec::new();
+            termwiz::escape::parser::Parser::new().parse(output, |action| actions.push(action));
+            pane.perform_actions(actions).unwrap();
+
+            let facts = pane.render_facts();
+            assert_eq!(facts.mouse_grabbed, grabbed);
+            assert_eq!(facts.alt_screen_active, grabbed);
+            assert!(super::published_facts(&*pane).is_some_and(|read| Arc::ptr_eq(&read, &facts)));
+            assert_eq!(super::mouse_grabbed(&*pane), grabbed);
+            assert_eq!(super::alt_screen_active(&*pane), grabbed);
+            assert_eq!(super::pane_dimensions(&*pane), facts.dimensions);
+            pane.kill();
+        }
     }
 }
