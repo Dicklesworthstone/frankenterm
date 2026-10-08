@@ -61,6 +61,19 @@ fn kept_cell_text(text: &str) -> &str {
     }
 }
 
+/// The builder [`Line::compress_for_scrollback`] uses. Every arm leaves the
+/// same line; the older ones stay as A/B arms and rollbacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompressArm {
+    /// `from_cell_vec`, then a separate `reproduces` pass (before
+    /// ft-yccm0.3.2.6).
+    Legacy,
+    /// The checked builder over the visible cells (ft-yccm0.3.2.6).
+    Checked,
+    /// The checked builder over the row's own cells (ft-951ev).
+    Slice,
+}
+
 fn checked_materialized_end(idx: usize, width: usize) -> Option<usize> {
     let end = idx.checked_add(width)?;
     (end <= MAX_MATERIALIZED_LINE_LEN).then_some(end)
@@ -1944,20 +1957,24 @@ impl Line {
     /// re-materialize the storage in a form that is suitable
     /// for mutation.
     pub fn compress_for_scrollback(&mut self) {
-        self.compress_for_scrollback_arm(Self::compress_legacy());
+        self.compress_for_scrollback_arm(Self::compress_arm());
     }
 
-    /// `compress_for_scrollback`, through the checked builder (one pass
-    /// over the cells, presized storage) or, with `legacy`, through
-    /// `from_cell_vec` and a separate `reproduces` pass, as before
-    /// ft-yccm0.3.2.6. Both arms leave the same line.
-    fn compress_for_scrollback_arm(&mut self, legacy: bool) {
+    /// `compress_for_scrollback` through the builder `arm` names. Every arm
+    /// leaves the same line.
+    fn compress_for_scrollback_arm(&mut self, arm: CompressArm) {
         let (cv, inert) = match &self.cells {
-            CellStorage::V(v) if legacy => (
-                ClusteredLine::from_cell_vec(v.len(), self.visible_cells()),
-                false,
-            ),
-            CellStorage::V(v) => ClusteredLine::from_cells_checked(v.len(), self.visible_cells()),
+            CellStorage::V(v) => match (arm, v.physical_cells()) {
+                (CompressArm::Legacy, _) => (
+                    ClusteredLine::from_cell_vec(v.len(), self.visible_cells()),
+                    false,
+                ),
+                (CompressArm::Slice, Some(cells)) => {
+                    ClusteredLine::from_cell_slice_checked(v.len(), cells)
+                }
+                // A deferred token row has no cells of its own to slice.
+                _ => ClusteredLine::from_cells_checked(v.len(), self.visible_cells()),
+            },
             CellStorage::C(_) => return,
         };
         // Clustered storage re-segments its text, so it may only replace
@@ -1968,6 +1985,34 @@ impl Line {
             return;
         }
         self.cells = CellStorage::C(Arc::new(cv));
+    }
+
+    /// The builder `compress_for_scrollback` uses: [`CompressArm::Slice`],
+    /// unless `FT_LINE_COMPRESS_LEGACY=1` or `FT_LINE_COMPRESS_SLICE=0`.
+    fn compress_arm() -> CompressArm {
+        if Self::compress_legacy() {
+            CompressArm::Legacy
+        } else if Self::compress_slice() {
+            CompressArm::Slice
+        } else {
+            CompressArm::Checked
+        }
+    }
+
+    /// `FT_LINE_COMPRESS_SLICE=0` compresses rows for scrollback through
+    /// the checked builder over visible cells, as before ft-951ev: the A/B
+    /// arm and a rollback. Both arms leave the same line. Resolved once per
+    /// process.
+    fn compress_slice() -> bool {
+        #[cfg(feature = "std")]
+        {
+            static SLICE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *SLICE.get_or_init(|| {
+                !std::env::var_os("FT_LINE_COMPRESS_SLICE").is_some_and(|v| v == "0")
+            })
+        }
+        #[cfg(not(feature = "std"))]
+        true
     }
 
     /// `FT_LINE_COMPRESS_LEGACY=1` compresses rows for scrollback through
@@ -4836,8 +4881,10 @@ mod tests {
             assert_eq!(row.has_clustered_storage(), index == 3, "row {}", index);
             let mut legacy = row.clone();
             let mut checked = row.clone();
-            legacy.compress_for_scrollback_arm(true);
-            checked.compress_for_scrollback_arm(false);
+            let mut slice = row.clone();
+            legacy.compress_for_scrollback_arm(CompressArm::Legacy);
+            checked.compress_for_scrollback_arm(CompressArm::Checked);
+            slice.compress_for_scrollback_arm(CompressArm::Slice);
             let text = row.as_str().into_owned();
             assert_eq!(
                 checked.has_clustered_storage(),
@@ -4847,13 +4894,257 @@ mod tests {
             );
             assert_eq!(checked.has_clustered_storage(), index != last, "{:?}", text);
             assert!(checked == legacy, "{:?}", text);
-            match &checked.cells {
-                // Built here by the checked builder, not appended to before.
-                CellStorage::C(cl) if !row.has_clustered_storage() => {
-                    assert!(cl.clusters_fit(), "{:?}", text);
+            assert!(slice == checked, "{:?}", text);
+            for built in [&checked, &slice] {
+                match &built.cells {
+                    // Built here by a checked builder, not appended to before.
+                    CellStorage::C(cl) if !row.has_clustered_storage() => {
+                        assert!(cl.clusters_fit(), "{:?}", text);
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
+        }
+    }
+
+    /// A terminal row as T0 leaves it (ft-951ev): `cols` styled blanks, then
+    /// cells written left to right, each a pool character with its own
+    /// palette foreground and background, one in twenty ASCII, the rest
+    /// emoji from the operator's pool. `next` draws the randomness.
+    fn t0_row(cols: usize, next: &mut dyn FnMut(usize) -> usize) -> Line {
+        use frankenterm_cell::color::ColorAttribute;
+        const EMOJI: [(u32, u32); 5] = [
+            (0x1F600, 0x1F64F),
+            (0x1F300, 0x1F5FF),
+            (0x1F680, 0x1F6FF),
+            (0x1F900, 0x1F9FF),
+            (0x1FA70, 0x1FAFF),
+        ];
+        let mut row = Line::with_width_and_cell(cols, Cell::blank(), 1);
+        let mut column = 0;
+        while column < cols {
+            let mut attrs = CellAttributes::default();
+            attrs.set_foreground(ColorAttribute::PaletteIndex(next(256) as u8));
+            attrs.set_background(ColorAttribute::PaletteIndex(next(256) as u8));
+            let ch = if next(20) == 0 {
+                char::from(b'A' + next(26) as u8)
+            } else {
+                let (start, end) = EMOJI[next(EMOJI.len())];
+                char::from_u32(start + next((end - start + 1) as usize) as u32).unwrap()
+            };
+            let cell = Cell::new(ch, attrs);
+            let width = cell.width();
+            if column + width > cols {
+                break;
+            }
+            row.set_cell(column, cell, 1);
+            column += width;
+        }
+        row
+    }
+
+    /// ft-951ev: a row compressed for scrollback reads back as the cells it
+    /// had, through every arm: the same cells at the same columns, with the
+    /// same text, widths and attributes (colours, styles, hyperlinks and,
+    /// with images, image attachments), the same length and wrap flag; and
+    /// the arms leave the same line. Rows: 3,000 written at random columns
+    /// (overwrites split wide cells) from text that clusters and text that
+    /// does not, with runs of shared attributes; and 1,000 T0 rows.
+    #[test]
+    fn compressed_rows_read_back_as_their_cells() {
+        use crate::hyperlink::Hyperlink;
+        use frankenterm_cell::color::{ColorAttribute, SrgbaTuple};
+        use frankenterm_cell::Underline;
+        let texts = [
+            "a",
+            "Z",
+            " ",
+            "\u{754c}",
+            "\u{1F600}",
+            "\u{1F680}",
+            "\u{1F3FB}",
+            "e\u{301}",
+            "\u{301}",
+            "\u{1F1FA}",
+            "\u{1F1F8}",
+            "\u{1F468}\u{200d}\u{1F469}",
+            "\u{200d}",
+            "\u{1F600}\u{FE0F}",
+        ];
+        let link = Arc::new(Hyperlink::new("https://example.invalid/951"));
+        let mut seed = 0x951e_0002_u64;
+        let mut next = move |bound: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % bound
+        };
+        let mut rows = Vec::new();
+        for _ in 0..3000 {
+            let cols = 1 + next(40);
+            let mut row = Line::with_width_and_cell(cols, Cell::blank(), 1);
+            let mut attrs = CellAttributes::default();
+            for _ in 0..next(2 * cols) {
+                if next(2) == 0 {
+                    attrs = CellAttributes::default();
+                    match next(7) {
+                        0 => {}
+                        1 => {
+                            attrs.set_foreground(ColorAttribute::PaletteIndex(next(256) as u8));
+                        }
+                        2 => {
+                            attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(
+                                SrgbaTuple(0.25, 0.5, next(4) as f32 / 4.0, 1.0),
+                            ));
+                        }
+                        3 => {
+                            attrs.set_intensity(frankenterm_cell::Intensity::Bold);
+                            attrs.set_italic(true);
+                        }
+                        4 => {
+                            attrs.set_underline(Underline::Double);
+                            attrs.set_reverse(true);
+                        }
+                        5 => {
+                            attrs.set_hyperlink(Some(Arc::clone(&link)));
+                        }
+                        _ => {
+                            #[cfg(feature = "use_image")]
+                            {
+                                use frankenterm_cell::image::{
+                                    ImageCell, ImageData, ImageDataType, TextureCoordinate,
+                                };
+                                let image = Arc::new(ImageData::with_data(
+                                    ImageDataType::new_single_frame(1, 1, vec![1, 2, 3, 4]),
+                                ));
+                                attrs.set_image(alloc::boxed::Box::new(ImageCell::new(
+                                    TextureCoordinate::new_f32(0.0, 0.0),
+                                    TextureCoordinate::new_f32(1.0, 1.0),
+                                    image,
+                                )));
+                            }
+                            attrs.set_background(ColorAttribute::PaletteIndex(next(16) as u8));
+                        }
+                    }
+                }
+                let cell = Cell::new_grapheme(texts[next(texts.len())], attrs.clone(), None);
+                row.set_cell(next(cols), cell, 1);
+            }
+            if next(3) == 0 {
+                row.set_last_cell_was_wrapped(true, 1);
+            }
+            rows.push(row);
+        }
+        for _ in 0..1000 {
+            let mut row = t0_row(120, &mut next);
+            if next(2) == 0 {
+                row.set_last_cell_was_wrapped(true, 1);
+            }
+            rows.push(row);
+        }
+        let (mut clustered, mut kept) = (0, 0);
+        for row in &rows {
+            assert!(!row.has_clustered_storage());
+            let text = row.as_str().into_owned();
+            let mut arms = Vec::new();
+            for &arm in &[
+                CompressArm::Legacy,
+                CompressArm::Checked,
+                CompressArm::Slice,
+            ] {
+                let mut compressed = row.clone();
+                compressed.compress_for_scrollback_arm(arm);
+                assert_eq!(compressed.len(), row.len(), "{:?} {:?}", arm, text);
+                assert_eq!(
+                    compressed.last_cell_was_wrapped(),
+                    row.last_cell_was_wrapped(),
+                    "{:?} {:?}",
+                    arm,
+                    text
+                );
+                let read: Vec<_> = compressed
+                    .visible_cells()
+                    .map(|cell| {
+                        (
+                            cell.cell_index(),
+                            cell.str().to_string(),
+                            cell.width(),
+                            cell.attrs().clone(),
+                        )
+                    })
+                    .collect();
+                let had: Vec<_> = row
+                    .visible_cells()
+                    .map(|cell| {
+                        (
+                            cell.cell_index(),
+                            cell.str().to_string(),
+                            cell.width(),
+                            cell.attrs().clone(),
+                        )
+                    })
+                    .collect();
+                assert!(read == had, "{:?} {:?}", arm, text);
+                arms.push(compressed);
+            }
+            assert!(arms[1] == arms[0] && arms[2] == arms[1], "{:?}", text);
+            if arms[2].has_clustered_storage() {
+                clustered += 1;
+            } else {
+                kept += 1;
+            }
+        }
+        // Both outcomes are well represented: rows that cluster, and rows
+        // whose neighbours cluster and so stay vectors (1854 and 2146 here).
+        assert!(clustered > 1000 && kept > 1000, "{} {}", clustered, kept);
+    }
+
+    /// ft-951ev: what compressing a T0 row for scrollback costs per row, as
+    /// the parse thread compresses every row that scrolls into the warm
+    /// tier, its old cells freed included: 2,000 fresh 120-column T0 rows per
+    /// arm and round, arms alternating, best of 5. A measurement, not a gate:
+    /// cargo test --profile release-perf -p frankenterm-surface --features std --lib -- --ignored compress_cost_on_t0_rows --nocapture
+    #[test]
+    #[ignore = "a throughput measurement; run it in release"]
+    fn compress_cost_on_t0_rows() {
+        let mut seed = 0x951e_u64;
+        let mut next = move |bound: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % bound
+        };
+        let arms = [
+            ("legacy", CompressArm::Legacy),
+            ("checked", CompressArm::Checked),
+            ("slice", CompressArm::Slice),
+        ];
+        let mut best = [f64::INFINITY; 3];
+        let mut clustered = [0usize; 3];
+        for _ in 0..5 {
+            for (arm, &(_, builder)) in arms.iter().enumerate() {
+                let mut rows: Vec<Line> = (0..2000).map(|_| t0_row(120, &mut next)).collect();
+                let start = std::time::Instant::now();
+                for row in &mut rows {
+                    row.compress_for_scrollback_arm(builder);
+                }
+                best[arm] = best[arm].min(start.elapsed().as_secs_f64());
+                // A skin-tone modifier after an emoji clusters with it, so
+                // its row stays a vector.
+                clustered[arm] = rows
+                    .iter()
+                    .filter(|row| row.has_clustered_storage())
+                    .count();
+            }
+        }
+        for (arm, &(name, _)) in arms.iter().enumerate() {
+            eprintln!(
+                "[BENCH] compress for scrollback, 2000 T0 rows of 120 columns: {} {:.2} us/row \
+                 ({} rows clustered)",
+                name,
+                best[arm] * 1e6 / 2000.0,
+                clustered[arm]
+            );
         }
     }
 

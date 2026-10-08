@@ -309,6 +309,16 @@ impl VecStorage {
         })
     }
 
+    /// The row's own cells, which visible iteration steps over, unless it is
+    /// a deferred token row: its visible cells are tokens, not these.
+    pub(crate) fn physical_cells(&self) -> Option<&[Cell]> {
+        #[cfg(feature = "std")]
+        if self.cells.deferred.is_some() {
+            return None;
+        }
+        Some(&self.cells.cells)
+    }
+
     pub(crate) fn visible_cells(&self) -> CellViewIter<'_> {
         #[cfg(feature = "std")]
         if let Some(row) = &self.cells.deferred {

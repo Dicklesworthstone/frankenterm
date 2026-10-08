@@ -435,6 +435,123 @@ impl ClusteredLine {
         (line, inert)
     }
 
+    /// [`Self::from_cells_checked`] over a vector row's own cells, which it
+    /// returns the same line and inertness for (ft-951ev). It steps over the
+    /// slice as visible iteration does (a cell, then past the columns its
+    /// width covers) without building a `CellRef` per cell. A first pass
+    /// sums the visible cells' text, so the text is reserved once, exactly:
+    /// growing it copied the text and zeroized the old buffer each time (a
+    /// T0 row's ~300 bytes from a one-byte-per-cell start), and left up to
+    /// twice the bytes in every warm row. The clusters are reserved for the
+    /// visible cells. And each boundary looks up one character's inertness,
+    /// carrying the last one's to the next boundary, where it looked up two.
+    pub fn from_cell_slice_checked(hint: usize, cells: &[Cell]) -> (Self, bool) {
+        let (mut text_bytes, mut visible) = (0usize, 0usize);
+        let mut index = 0;
+        while let Some(cell) = cells.get(index) {
+            text_bytes = text_bytes.saturating_add(cell.str().len());
+            visible += 1;
+            index += cell.width().max(1);
+        }
+
+        let mut is_double_wide = FixedBitSet::with_capacity(hint);
+        // As in `build`: guard the text from its first allocation.
+        let mut text = Zeroizing::new(String::new());
+        guarded_reserve_text(&mut text, text_bytes);
+        let mut clusters: Vec<Cluster> = Vec::with_capacity(visible);
+        let mut last_cluster: Option<Cluster> = None;
+        let mut any_double = false;
+        let mut len = 0usize;
+        let mut last_cell_width = None;
+        // Whether the last char so far is inert (None at the line's start),
+        // and whether every boundary so far is.
+        let mut prev_inert: Option<bool> = None;
+        let mut inert = true;
+
+        let mut index = 0;
+        while let Some(cell) = cells.get(index) {
+            let cell_index = index;
+            let width = cell.width();
+            index += width.max(1);
+            let cell_width = Self::normalize_cell_width(width);
+            len = len.saturating_add(usize::from(cell_width));
+            last_cell_width = NonZeroU8::new(cell_width as u8);
+
+            if cell_width > 1 {
+                any_double = true;
+                is_double_wide.set(cell_index, true);
+            }
+
+            let cell_text = cell.str();
+            if inert {
+                let mut chars = cell_text.chars();
+                match chars.next() {
+                    Some(first) => {
+                        let first_inert = is_cluster_inert(first);
+                        if prev_inert.is_some_and(|prev| !(prev && first_inert)) {
+                            inert = false;
+                        } else {
+                            prev_inert = Some(match chars.next_back() {
+                                Some(last) => is_cluster_inert(last),
+                                None => first_inert,
+                            });
+                        }
+                    }
+                    None => inert = false,
+                }
+            }
+
+            guarded_push_str(&mut text, cell_text);
+
+            last_cluster = match last_cluster.take() {
+                None => Some(Cluster {
+                    cell_width,
+                    attrs: cell.attrs().clone(),
+                }),
+                Some(cluster) if cluster.attrs != *cell.attrs() => {
+                    clusters.push(cluster);
+                    Some(Cluster {
+                        cell_width,
+                        attrs: cell.attrs().clone(),
+                    })
+                }
+                Some(mut cluster) => match cluster.cell_width.checked_add(cell_width) {
+                    Some(width) => {
+                        cluster.cell_width = width;
+                        Some(cluster)
+                    }
+                    None => {
+                        clusters.push(cluster);
+                        Some(Cluster {
+                            cell_width,
+                            attrs: cell.attrs().clone(),
+                        })
+                    }
+                },
+            };
+        }
+
+        if let Some(cluster) = last_cluster.take() {
+            clusters.push(cluster);
+        }
+        clusters.shrink_to_fit();
+
+        let is_double_wide = if any_double {
+            Some(Box::new(is_double_wide))
+        } else {
+            None
+        };
+
+        let line = Self {
+            text: core::mem::take(&mut *text),
+            is_double_wide,
+            clusters,
+            len: len.min(u32::MAX as usize) as u32,
+            last_cell_width,
+        };
+        (line, inert)
+    }
+
     pub fn len(&self) -> usize {
         self.len as usize
     }
