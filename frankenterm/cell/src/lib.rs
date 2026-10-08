@@ -1899,6 +1899,70 @@ mod test {
         );
     }
 
+    /// ft-7cy5r: the Unicode 17.0 emoji in the operator's T0 pool are wide, as
+    /// in Ghostty (uucode, UCD 17.0.0). They were unassigned, so width 1, in
+    /// the Unicode 16 tables, which shifted the rest of each row by a cell.
+    /// Their Unicode 15/16 neighbours stay wide, a presentation selector keeps
+    /// the new emoji wide, and other Unicode 17 additions follow the new
+    /// tables where Ghostty agrees.
+    #[test]
+    fn unicode_17_emoji_are_wide() {
+        for c in [
+            '\u{1F6D8}',
+            '\u{1FA8A}',
+            '\u{1FA8E}',
+            '\u{1FAC8}',
+            '\u{1FACD}',
+            '\u{1FAEA}',
+            '\u{1FAEF}',
+        ] {
+            let s = c.to_string();
+            assert_eq!(grapheme_column_width(&s, None), 2, "U+{:X}", c as u32);
+            assert_eq!(unicode_column_width(&s, None), 2, "U+{:X}", c as u32);
+            assert_eq!(
+                Presentation::for_grapheme(&s),
+                (Presentation::Emoji, None),
+                "U+{:X}",
+                c as u32
+            );
+            assert_eq!(
+                unicode_column_width(&format!("A{c}"), None),
+                3,
+                "A then U+{:X}",
+                c as u32
+            );
+            assert_eq!(
+                unicode_column_width(&format!("{c}\u{FE0F}"), None),
+                2,
+                "U+{:X} VS16",
+                c as u32
+            );
+        }
+        // Unchanged neighbours from Unicode 15 and 16.
+        for c in [
+            '\u{1F6DC}',
+            '\u{1FA89}',
+            '\u{1FA8F}',
+            '\u{1FAC6}',
+            '\u{1FAE8}',
+            '\u{1FAE9}',
+        ] {
+            assert_eq!(
+                unicode_column_width(&c.to_string(), None),
+                2,
+                "U+{:X}",
+                c as u32
+            );
+        }
+        // VS15/VS16 on an older emoji are unchanged (issue_997 covers more).
+        assert_eq!(unicode_column_width("\u{2764}\u{FE0F}", None), 2);
+        assert_eq!(unicode_column_width("\u{2764}\u{FE0E}", None), 1);
+        // Other Unicode 17 additions, as Ghostty sizes them: a new wide
+        // ideograph and a new nonspacing mark after a base.
+        assert_eq!(unicode_column_width("\u{18D80}", None), 2);
+        assert_eq!(unicode_column_width("a\u{1ACF}", None), 1);
+    }
+
     #[test]
     fn issue_1573() {
         let sequence = "\u{1112}\u{1161}\u{11ab}";
