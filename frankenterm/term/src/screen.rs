@@ -15784,13 +15784,23 @@ pub(crate) mod tests {
         {
             let rows = sink.rows.lock().unwrap();
             assert!(rows.len() >= PARAGRAPHS * 3);
+            // The paragraph is "00000 " (6 cells) and nine 50-cell units:
+            // "Text reflow: ASCII ligatures ffi =>, " is 37 cells, so "界" is
+            // at unit offsets 37-38 and "面" at 39-40; ", e\u{301}, " is 5
+            // (one cell for the combined e), "🚀" 2 and ". " 2. That is 456
+            // cells at 173 columns. Row 0 holds cells 0-172. Row 1 would hold
+            // 173-345, but the seventh unit's "面" starts at 6 + 6 * 50 + 39 =
+            // 345, row 1's last column, and is two cells wide. It wraps whole
+            // to row 2 (ft-b35o7), so row 1 ends with "界" after 172 cells,
+            // its last column a blank spacer the row does not keep, and row 2
+            // starts with "面" and holds the remaining 456 - 345 = 111 cells.
             assert_eq!(
                 (0..3).map(|row| rows[&row].len()).collect::<Vec<_>>(),
-                [173, 174, 109],
-                "the parser writes the wide glyph before taking its pending wrap"
+                [173, 172, 111],
+                "a wide glyph on the last column wraps whole to the next row"
             );
-            assert_eq!(rows[&1].visible_cells().last().unwrap().str(), "面");
-            assert_eq!(rows[&2].visible_cells().next().unwrap().str(), ",");
+            assert_eq!(rows[&1].visible_cells().last().unwrap().str(), "界");
+            assert_eq!(rows[&2].visible_cells().next().unwrap().str(), "面");
             assert!(rows[&0].last_cell_was_wrapped());
             assert!(rows[&1].last_cell_was_wrapped());
             assert!(!rows[&2].last_cell_was_wrapped());
