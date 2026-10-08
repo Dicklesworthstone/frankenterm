@@ -4375,6 +4375,9 @@ mod tests {
     use alloc::collections::BTreeSet;
     use alloc::format;
     use frankenterm_cell::{Cell, CellAttributes, SemanticType};
+    // The crate is no_std without its `std` feature; tests link std through
+    // the crate root's `#[cfg(test)] extern crate std;`.
+    use std::eprintln;
 
     #[test]
     fn em_space_wrap_preserves_words_bytes_and_geometry() {

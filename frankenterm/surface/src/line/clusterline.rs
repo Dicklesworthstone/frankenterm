@@ -180,7 +180,7 @@ where
             D::Error::custom("clustered line wide-cell bitset length overflowed usize")
         })?;
         if bit_capacity > MAX_DESERIALIZED_WIDE_CELL_BITS {
-            return Err(D::Error::custom(format!(
+            return Err(D::Error::custom(alloc::format!(
                 "clustered line wide-cell bitset length {bit_capacity} exceeds maximum {MAX_DESERIALIZED_WIDE_CELL_BITS}"
             )));
         }
