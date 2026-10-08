@@ -158,6 +158,10 @@ std::thread_local! {
     static FORCE_CELL_SCHEMAS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Sealed segments this thread's readers opened (ft-yccm0.2.1.4).
     static LIVE_SCROLLBACK_SEGMENT_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Manifests this thread read from disk, and keyring mutex acquisitions
+    /// (ft-yccm0.2.1.5).
+    static LIVE_SCROLLBACK_MANIFEST_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LIVE_SCROLLBACK_KEYRING_LOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn configured_ssh_domains(config: &ConfigHandle) -> Vec<config::SshDomain> {
@@ -8021,6 +8025,20 @@ impl LiveScrollbackSpillSink {
         &self,
         keyring: &dyn guardian_output_keys::GuardianHistoricalKeyLookup,
     ) -> anyhow::Result<Option<[u8; 32]>> {
+        self.verify_replaceable_active_append_wal_with(keyring, || {
+            Self::read_manifest(&self.manifest_path)
+        })
+    }
+
+    /// [`Self::verify_replaceable_active_append_wal`] against the published
+    /// manifest `published` returns, asked for only when a WAL is retained.
+    /// A commit window passes the copy its transaction already read, under
+    /// the mutation gate and filesystem lease (ft-yccm0.2.1.5 AC2).
+    fn verify_replaceable_active_append_wal_with(
+        &self,
+        keyring: &dyn guardian_output_keys::GuardianHistoricalKeyLookup,
+        published: impl FnOnce() -> anyhow::Result<Option<LiveScrollbackManifestV1>>,
+    ) -> anyhow::Result<Option<[u8; 32]>> {
         let active_path = Self::append_wal_path(&self.manifest_path)?;
         let Some(verified) = Self::read_checksum_verified_append_wal(&active_path)? else {
             return Ok(None);
@@ -8028,8 +8046,8 @@ impl LiveScrollbackSpillSink {
         self.validate_verified_append_wal_identity(&verified)?;
         let checksum = verified.checksum;
         let active = verified.wal;
-        let manifest = Self::read_manifest(&self.manifest_path)?
-            .ok_or_else(|| anyhow::anyhow!("active append WAL has no manifest"))?;
+        let manifest =
+            published()?.ok_or_else(|| anyhow::anyhow!("active append WAL has no manifest"))?;
         let durable_pane_id = uuid::Uuid::from_bytes(self.durable_pane_id)
             .simple()
             .to_string();
@@ -8302,13 +8320,26 @@ impl LiveScrollbackSpillSink {
     /// pointer, and digest. A crash before this acknowledgement leaves the
     /// immediately-adjacent predecessor relation recoverable.
     fn advance_authenticated_append_wal_supersession(&self) -> anyhow::Result<()> {
+        self.advance_authenticated_append_wal_supersession_with(|| {
+            Self::read_manifest(&self.manifest_path)
+        })
+    }
+
+    /// [`Self::advance_authenticated_append_wal_supersession`], taking the
+    /// published manifest from `published` when there is a retained WAL to
+    /// advance. A commit window passes the copy it read once under the
+    /// mutation gate and filesystem lease (ft-yccm0.2.1.5 AC2).
+    fn advance_authenticated_append_wal_supersession_with(
+        &self,
+        published: impl FnOnce() -> anyhow::Result<Option<LiveScrollbackManifestV1>>,
+    ) -> anyhow::Result<()> {
         let active_path = Self::append_wal_path(&self.manifest_path)?;
         let Some(verified) = Self::read_checksum_verified_append_wal(&active_path)? else {
             return Ok(());
         };
         self.validate_verified_append_wal_identity(&verified)?;
         let active = verified.wal;
-        let manifest = Self::read_manifest(&self.manifest_path)?
+        let manifest = published()?
             .ok_or_else(|| anyhow::anyhow!("retained append WAL has no published manifest"))?;
         let durable_pane_id = uuid::Uuid::from_bytes(self.durable_pane_id)
             .simple()
@@ -9753,6 +9784,8 @@ impl LiveScrollbackSpillSink {
             .take(LIVE_SCROLLBACK_MANIFEST_MAX_BYTES.saturating_add(1))
             .read_to_end(&mut bytes)
             .with_context(|| format!("read scrollback manifest {}", path.display()))?;
+        #[cfg(test)]
+        LIVE_SCROLLBACK_MANIFEST_READS.with(|reads| reads.set(reads.get() + 1));
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > LIVE_SCROLLBACK_MANIFEST_MAX_BYTES {
             anyhow::bail!("scrollback manifest exceeds 1 MiB: {}", path.display());
         }
@@ -10657,6 +10690,50 @@ impl LiveScrollbackSpillSink {
         if !state.authenticated_manifest {
             return Ok(());
         }
+        let manifest = Self::read_manifest(&self.manifest_path)
+            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+        if let Some(manifest) = manifest.as_ref() {
+            let keyring = self.lock_keyring("pre-mutation manifest authentication")?;
+            if !Self::authenticate_manifest(manifest, &keyring)
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
+            {
+                return Err(ScrollbackSpillError::StorageUnavailable);
+            }
+        }
+        self.verify_authenticated_published_state_before_mutation(
+            manifest.as_ref(),
+            state,
+            ledger_pane_id,
+            allow_prepared_content_ahead,
+        )?;
+        // Re-read and re-authenticate: the manifest did not change while it
+        // was being verified.
+        match manifest.as_ref() {
+            Some(manifest) => self.revalidate_snapshot_manifest(manifest),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Self::verify_current_published_state_before_mutation`] against the
+    /// published manifest the caller read (`None`: there is none) and has
+    /// already authenticated under the keyring, without reading it again
+    /// (ft-yccm0.2.1.5 AC2). The caller must hold the mutation gate and the
+    /// filesystem lease from that read through its mutation: the lease
+    /// excludes every other writer of the manifest, so the re-read the
+    /// wrapper does to catch a change mid-verification is covered, and a
+    /// later on-disk change fails the next transaction's verification.
+    fn verify_authenticated_published_state_before_mutation(
+        &self,
+        manifest: Option<&LiveScrollbackManifestV1>,
+        state: &LiveScrollbackSpillState,
+        ledger_pane_id: u64,
+        allow_prepared_content_ahead: bool,
+    ) -> Result<(), wezterm_term::config::ScrollbackSpillError> {
+        use wezterm_term::config::ScrollbackSpillError;
+
+        if !state.authenticated_manifest {
+            return Ok(());
+        }
         // The manifest describes the published prefix; the ledger holds that
         // prefix plus any durable tail commit windows appended since
         // (ft-yccm0.2.1.2).
@@ -10666,8 +10743,6 @@ impl LiveScrollbackSpillSink {
         let tail_record_bytes = live
             .published
             .map_or(0, |published| published.tail_record_bytes);
-        let manifest = Self::read_manifest(&self.manifest_path)
-            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
         let Some(manifest) = manifest else {
             let pristine = state.revision == 0
                 && state.predecessor_generation.is_none()
@@ -10684,33 +10759,21 @@ impl LiveScrollbackSpillSink {
         let durable_pane_id = uuid::Uuid::from_bytes(self.durable_pane_id)
             .simple()
             .to_string();
-        validate_live_scrollback_manifest_identity(
-            &manifest,
-            &durable_pane_id,
-            &self.manifest_path,
-        )
-        .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-        {
-            let keyring = self.lock_keyring("pre-mutation manifest authentication")?;
-            if !Self::authenticate_manifest(&manifest, &keyring)
-                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
-            {
-                return Err(ScrollbackSpillError::StorageUnavailable);
-            }
-        }
-        let generation = live_scrollback_manifest_generation(&manifest)
+        validate_live_scrollback_manifest_identity(manifest, &durable_pane_id, &self.manifest_path)
+            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+        let generation = live_scrollback_manifest_generation(manifest)
             .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
             .map(|(epoch, revision)| {
                 wezterm_term::config::ScrollbackSnapshotGeneration::new(epoch, revision)
             });
         if generation != Some(state.snapshot_generation())
-            || live_scrollback_manifest_predecessor(&manifest)
+            || live_scrollback_manifest_predecessor(manifest)
                 .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
                 != state.predecessor_generation
-            || Self::manifest_ledger_pane_id(&manifest)
+            || Self::manifest_ledger_pane_id(manifest)
                 .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
                 != ledger_pane_id
-            || Self::manifest_row_segments(&manifest)
+            || Self::manifest_row_segments(manifest)
                 .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
                 != state.row_segments
             || manifest.durability_gaps != state.durability_gaps
@@ -10729,7 +10792,7 @@ impl LiveScrollbackSpillSink {
         let store = self.lock_store("pre-mutation logical ledger")?;
         let digest_verified = if manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4 {
             state.verified_ledger.is_some_and(|authority| {
-                let chain = expected_live_scrollback_v4_chain(&manifest).ok();
+                let chain = expected_live_scrollback_v4_chain(manifest).ok();
                 let manifest_facts_match = authority.ledger_pane_id == ledger_pane_id
                     && authority.oldest_sequence == manifest.oldest_seq
                     && authority.next_sequence == manifest.next_seq
@@ -10752,7 +10815,7 @@ impl LiveScrollbackSpillSink {
                 }
             })
         } else {
-            Self::verify_logical_ledger_digest_from_store(&manifest, ledger_pane_id, &store).is_ok()
+            Self::verify_logical_ledger_digest_from_store(manifest, ledger_pane_id, &store).is_ok()
         };
         if !digest_verified {
             if !(allow_prepared_content_ahead && manifest.publication_state == "prepared") {
@@ -10788,7 +10851,7 @@ impl LiveScrollbackSpillSink {
             }
         }
         drop(store);
-        self.revalidate_snapshot_manifest(&manifest)
+        Ok(())
     }
 
     fn lock_state(
@@ -10828,6 +10891,8 @@ impl LiveScrollbackSpillSink {
         MutexGuard<'_, guardian_output_keys::GuardianOutputKeyring>,
         wezterm_term::config::ScrollbackSpillError,
     > {
+        #[cfg(test)]
+        LIVE_SCROLLBACK_KEYRING_LOCKS.with(|locks| locks.set(locks.get() + 1));
         match self.keyring.lock() {
             Ok(keyring) => Ok(keyring),
             Err(_) => {
@@ -13407,9 +13472,12 @@ impl LiveScrollbackSpillSink {
     /// Retention is applied logically; the publication prunes physically.
     /// The caller holds the mutation gate and filesystem lease, and every
     /// record continues `previous_state`'s last nonce segment.
+    /// `published_manifest` is the manifest on disk, which the caller read
+    /// and verified under that gate and lease.
     fn commit_window_rows(
         &self,
         previous_state: &LiveScrollbackSpillState,
+        published_manifest: &LiveScrollbackManifestV1,
         stable_row: wezterm_term::StableRowIndex,
         desired_seq: u64,
         records: &[String],
@@ -13440,7 +13508,9 @@ impl LiveScrollbackSpillSink {
                         guardian_output_keys::GuardianOutputKeyring::historical_authority(
                             &self.keyring,
                         )?;
-                    self.verify_replaceable_active_append_wal(&keyring)
+                    self.verify_replaceable_active_append_wal_with(&keyring, || {
+                        Ok(Some(published_manifest.clone()))
+                    })
                 })();
                 let Ok(retained_append_wal) = retained else {
                     return false;
@@ -13832,14 +13902,47 @@ impl LiveScrollbackSpillSink {
                 Ok(false) | Err(_) => return false,
             },
         }
+        // ft-yccm0.2.1.5 AC2: the transaction reads the published manifest
+        // once and verifies, advances and continues from that copy. From
+        // here it holds the mutation gate and the filesystem lease, so no
+        // other writer replaces the manifest; after this transaction itself
+        // publishes (`publish_pending_tail` below) it reads it again.
+        let Ok(published_manifest) = Self::read_manifest(&self.manifest_path) else {
+            return false;
+        };
+        // One acquisition of the process-wide keyring mutex per window: it
+        // authenticates that manifest and resolves the active cipher. The
+        // owned cipher remains valid across rotation; encoding this batch
+        // must not exclude other panes from the shared keyring.
+        let cipher = {
+            let Ok(mut keyring) =
+                self.lock_keyring("store_scrollback_line manifest authentication and active key")
+            else {
+                return false;
+            };
+            if let Some(manifest) = published_manifest.as_ref()
+                && !matches!(Self::authenticate_manifest(manifest, &keyring), Ok(true))
+            {
+                return false;
+            }
+            let Ok(cipher) = keyring.latest_active_cipher() else {
+                return false;
+            };
+            cipher
+        };
         if self
-            .verify_current_published_state_before_mutation(&current_state, ledger_pane_id, true)
+            .verify_authenticated_published_state_before_mutation(
+                published_manifest.as_ref(),
+                &current_state,
+                ledger_pane_id,
+                true,
+            )
             .is_err()
         {
             return false;
         }
         if self
-            .advance_authenticated_append_wal_supersession()
+            .advance_authenticated_append_wal_supersession_with(|| Ok(published_manifest.clone()))
             .is_err()
         {
             return false;
@@ -13919,17 +14022,6 @@ impl LiveScrollbackSpillSink {
             }
         }
 
-        let cipher = {
-            let Ok(mut keyring) = self.lock_keyring("store_scrollback_line active key") else {
-                return false;
-            };
-            let Ok(cipher) = keyring.latest_active_cipher() else {
-                return false;
-            };
-            // The owned cipher remains valid across rotation; encoding this
-            // batch must not exclude other panes from the shared keyring.
-            cipher
-        };
         // ft-yccm0.2.1.2: a commit window continues a durable tail only when
         // it can append without a WAL: publication cadence on, the same
         // retention, and rows continuing the published nonce segment. Any
@@ -13941,16 +14033,15 @@ impl LiveScrollbackSpillSink {
             Ok(state) => *state,
             Err(_) => return false,
         };
-        if window_state.published.is_some()
+        let publishes_tail = window_state.published.is_some()
             && (gap.is_some()
                 || !self.window_continues_tail(
                     &window_state,
                     stable_row,
                     max_retained_rows,
                     &cipher,
-                ))
-            && !self.publish_pending_tail("single-batch transaction")
-        {
+                ));
+        if publishes_tail && !self.publish_pending_tail("single-batch transaction") {
             return false;
         }
 
@@ -14005,10 +14096,16 @@ impl LiveScrollbackSpillSink {
         // single-row path. Subsequent v4 batches use one generation and WAL.
         let predecessor_manifest = if manifest_prepare_required {
             None
-        } else {
+        } else if publishes_tail {
+            // This transaction just published the tail: read what it wrote.
             match Self::read_manifest(&self.manifest_path) {
                 Ok(Some(manifest)) => Some(manifest),
                 _ => return false,
+            }
+        } else {
+            match published_manifest {
+                Some(manifest) => Some(manifest),
+                None => return false,
             }
         };
         let v4_predecessor = predecessor_manifest
@@ -14178,9 +14275,13 @@ impl LiveScrollbackSpillSink {
             if row_segment.is_none() || previous_state.row_segments.last() != row_segment {
                 return false;
             }
+            let Some(published_manifest) = predecessor_manifest.as_ref() else {
+                return false;
+            };
             *committed_rows = records.len();
             return self.commit_window_rows(
                 &previous_state,
+                published_manifest,
                 stable_row,
                 desired_seq,
                 records,
@@ -14257,7 +14358,10 @@ impl LiveScrollbackSpillSink {
                 let keyring = guardian_output_keys::GuardianOutputKeyring::historical_authority(
                     &self.keyring,
                 )?;
-                self.verify_replaceable_active_append_wal(&keyring)
+                // Nothing has published since the predecessor was read.
+                self.verify_replaceable_active_append_wal_with(&keyring, || {
+                    Ok(predecessor_manifest.clone())
+                })
             })();
             let Ok(checksum) = checked else {
                 return false;
@@ -16596,6 +16700,83 @@ mod tests {
             scans() - before,
             0,
             "a steady-state commit scanned the keyring directory"
+        );
+    }
+
+    /// ft-yccm0.2.1.5 AC2/AC3: a settled commit window reads the pane's
+    /// manifest from disk at most once, rescans no keyring directory, and
+    /// locks the process-wide keyring mutex at most once (authentication and
+    /// the active cipher). The retained WAL's supersession check takes one
+    /// historical lease, which holds that mutex only to snapshot the
+    /// authority; the first window past a publication takes a second one to
+    /// check that the WAL is replaceable. Measured per window over eight
+    /// windows after the first batch has published the lineage and the
+    /// keyring's stat fast path is armed.
+    #[test]
+    fn a_settled_commit_window_reads_the_manifest_once_and_locks_the_keyring_once() {
+        use std::time::{Duration, Instant};
+
+        const WINDOWS: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let sink = windowed_test_sink(dir.path());
+        let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+        assert!(sink.store_scrollback_line(0, &prior, 4096));
+        let mut next_row = 1;
+        let window = |sink: &LiveScrollbackSpillSink, next_row: &mut usize| {
+            let lines = digest_only_test_lines(&format!("w{next_row}"), 16);
+            assert_eq!(
+                sink.store_scrollback_lines(*next_row as isize, &lines, 4096),
+                16
+            );
+            *next_row += 16;
+        };
+        // The first batch starts the nonce segment and publishes.
+        window(&sink, &mut next_row);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let mut keyring = sink.lock_keyring("settle keyring").unwrap();
+            keyring.latest_active_cipher().unwrap();
+            if keyring.fast_path_validated() {
+                break;
+            }
+            drop(keyring);
+            assert!(Instant::now() < deadline, "keyring fast path never engaged");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        // Per window: manifest reads, keyring mutex locks, historical leases
+        // and keyring directory scans.
+        let counts = || {
+            (
+                LIVE_SCROLLBACK_MANIFEST_READS.with(std::cell::Cell::get),
+                LIVE_SCROLLBACK_KEYRING_LOCKS.with(std::cell::Cell::get),
+                guardian_output_keys::HISTORICAL_LEASES.with(std::cell::Cell::get),
+                guardian_output_keys::INVENTORY_SCANS.with(std::cell::Cell::get),
+            )
+        };
+        let mut per_window = Vec::with_capacity(WINDOWS);
+        for _ in 0..WINDOWS {
+            let before = counts();
+            window(&sink, &mut next_row);
+            let after = counts();
+            per_window.push((
+                after.0 - before.0,
+                after.1 - before.1,
+                after.2 - before.2,
+                after.3 - before.3,
+            ));
+        }
+        let settled =
+            per_window
+                .iter()
+                .enumerate()
+                .all(|(index, &(reads, locks, leases, scans))| {
+                    reads <= 1 && locks <= 1 && leases <= 1 + u64::from(index == 0) && scans == 0
+                });
+        assert!(
+            settled,
+            "per window (manifest reads, keyring mutex locks, historical leases, keyring \
+             directory scans): {per_window:?}; each window reads and locks at most once, takes \
+             at most one lease (two in the first) and scans nothing"
         );
     }
 

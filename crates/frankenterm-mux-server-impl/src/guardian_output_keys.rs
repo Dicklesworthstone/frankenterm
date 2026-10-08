@@ -398,6 +398,8 @@ impl GuardianOutputKeyring {
     pub(crate) fn historical_authority(
         shared: &Mutex<Self>,
     ) -> Result<GuardianHistoricalAuthority, GuardianOutputKeyringError> {
+        #[cfg(test)]
+        HISTORICAL_LEASES.with(|leases| leases.set(leases.get() + 1));
         let (directory, validated_active) = {
             let keyring = shared
                 .lock()
@@ -1048,6 +1050,9 @@ thread_local! {
     /// Full keyring directory scans on this thread, for tests that prove a
     /// path stays off the inventory (ft-yccm0.2.1.5).
     pub(crate) static INVENTORY_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Historical leases taken on this thread: each briefly takes the
+    /// process-wide keyring mutex (ft-yccm0.2.1.5).
+    pub(crate) static HISTORICAL_LEASES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn inventory(directory: &CapDir) -> Result<Inventory, GuardianOutputKeyringError> {
