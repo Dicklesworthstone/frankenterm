@@ -11474,6 +11474,21 @@ pub mod scrollback_record_bench {
             bytes
         }
 
+        /// The decode-charge check the writer runs on every clustered row
+        /// before sealing it as schema 3 (it walks the row's cells), over
+        /// the rows in clustered storage. Returns the sum of the charges.
+        #[must_use]
+        pub fn charge_clustered(&self, rows: &Rows) -> usize {
+            rows.0
+                .iter()
+                .filter(|line| line.has_clustered_storage())
+                .map(|line| {
+                    super::clustered_scrollback_decoded_charge(line, 0)
+                        .expect("bench clustered row charges")
+                })
+                .sum()
+        }
+
         /// Each row's exact plaintext, as the writer compresses it.
         #[must_use]
         pub fn plaintexts(&self, rows: &Rows) -> Vec<Vec<u8>> {
@@ -11920,6 +11935,84 @@ pub mod scrollback_record_bench {
         #[must_use]
         pub fn segments(&self) -> &[std::ops::Range<u64>] {
             &self.segments
+        }
+    }
+
+    /// A live durable scrollback store written as the durability writer
+    /// writes it (ft-y0gy9): commit windows of a pane's rows under a
+    /// retention, so every window past the retention evicts, with the tail
+    /// published every few windows. For the writer's whole CPU per row:
+    /// encoding, sealing, the chain, eviction reads, appends, publications.
+    pub struct WriterStore {
+        sink: super::LiveScrollbackSpillSink,
+        retention: usize,
+        publish_every: usize,
+        next_row: usize,
+        windows: usize,
+    }
+
+    impl WriterStore {
+        /// The store, in `dir`, which must outlive it, holding row 0 under a
+        /// retention of `retention` rows, publishing every `publish_every`
+        /// windows (the production cadence is 1 s; this is deterministic).
+        #[must_use]
+        pub fn open(
+            dir: &std::path::Path,
+            rows: &Rows,
+            retention: usize,
+            publish_every: usize,
+        ) -> Self {
+            use wezterm_term::config::ScrollbackSpillSink as _;
+
+            let sink = super::LiveScrollbackSpillSink::open(
+                dir.to_path_buf(),
+                &config::ScrollbackSpillSinkContext {
+                    pane_id: 1,
+                    domain_id: 1,
+                    durable_pane_id: [0x5b; 16],
+                    command_description: "scrollback-writer-bench".to_string(),
+                },
+                std::time::Duration::from_secs(3600),
+            )
+            .expect("bench durable scrollback store");
+            assert!(
+                sink.store_scrollback_line(0, &rows.0[0], retention),
+                "bench first row"
+            );
+            Self {
+                sink,
+                retention,
+                publish_every: publish_every.max(1),
+                next_row: 1,
+                windows: 0,
+            }
+        }
+
+        /// Store `rows` as the next window, at the next stable rows, and
+        /// publish the tail when the cadence is due. Returns the rows stored.
+        pub fn store_window(&mut self, rows: &Rows) -> usize {
+            use wezterm_term::config::ScrollbackSpillSink as _;
+
+            let mut stored = 0;
+            while stored < rows.0.len() {
+                let committed = self.sink.store_scrollback_lines(
+                    (self.next_row + stored) as isize,
+                    &rows.0[stored..],
+                    self.retention,
+                );
+                assert!(
+                    committed > 0,
+                    "bench window at row {}",
+                    self.next_row + stored
+                );
+                stored += committed;
+            }
+            self.next_row += stored;
+            self.windows += 1;
+            if self.windows % self.publish_every == 0 {
+                self.sink.flush_scrollback().expect("bench tail publishes");
+            }
+            stored
         }
     }
 

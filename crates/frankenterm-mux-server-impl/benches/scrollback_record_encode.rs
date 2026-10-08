@@ -26,7 +26,7 @@
 //! through a terminal, as Screen hands the rows over); judge T0 by it.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankenterm_mux_server_impl::scrollback_record_bench::{Rows, Sealer};
+use frankenterm_mux_server_impl::scrollback_record_bench::{Rows, Sealer, WriterStore};
 use std::hint::black_box;
 
 const WINDOW_ROWS: usize = 4096;
@@ -192,6 +192,15 @@ fn writer_stages(c: &mut Criterion) {
             bench.iter(|| black_box(sealer.serialize_through(black_box(&rows), direct, &mut out)));
         });
     }
+    let clustered = rows
+        .lines()
+        .iter()
+        .filter(|line| line.has_clustered_storage())
+        .count();
+    eprintln!("scrollback_writer t0_corpus charge_clustered: {clustered} of {WINDOW_ROWS} rows");
+    group.bench_function(BenchmarkId::new("charge_clustered", "t0_corpus"), |bench| {
+        bench.iter(|| black_box(sealer.charge_clustered(black_box(&rows))));
+    });
     for level in [1, -1, -3, -7] {
         let bytes = sealer.compress_rows_at(&plaintexts, level);
         eprintln!(
@@ -230,5 +239,29 @@ fn writer_stages(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, record_path, writer_stages);
+/// ft-y0gy9: the durability writer's whole CPU per T0 row: 1024-row windows
+/// into a live store under a 2048-row retention (every window evicts), the
+/// tail published every second window. It includes encoding, sealing, the
+/// ledger chain, eviction reads, appends and publications, but not the
+/// deferred queue. Run as is, and with the switches
+/// (FT_SCROLLBACK_DIRECT_SERIALIZE=0, FT_SCROLLBACK_ROW_ZSTD_LEVEL=1,
+/// FT_STORE_BLOCK_READS=0) to see each change's share.
+fn writer_store(c: &mut Criterion) {
+    const WINDOW: usize = 1024;
+    let rows = Rows::t0_corpus(WINDOW, 7);
+    let dir = tempfile::tempdir().expect("bench store directory");
+    let mut store = WriterStore::open(dir.path(), &rows, 2 * WINDOW, 2);
+    // Fill the retention, so every measured window evicts.
+    for _ in 0..3 {
+        store.store_window(&rows);
+    }
+    let mut group = c.benchmark_group("scrollback_writer");
+    group.throughput(Throughput::Elements(WINDOW as u64));
+    group.bench_function(BenchmarkId::new("store_window", "t0_corpus"), |bench| {
+        bench.iter(|| black_box(store.store_window(black_box(&rows))));
+    });
+    group.finish();
+}
+
+criterion_group!(benches, record_path, writer_stages, writer_store);
 criterion_main!(benches);

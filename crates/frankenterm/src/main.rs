@@ -64522,10 +64522,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             }
                             std::process::exit(err.exit_code);
                         }
-                        let parsed = read_mission_file_capped(path).ok().and_then(|s| {
-                            frankenterm_core::plan::Mission::from_json_slice(s.as_bytes()).ok()
-                        });
-                        match parsed {
+                        match read_steering_live_mission(path) {
                             Some(m) => Some(m),
                             None => {
                                 eprintln!(
@@ -64643,9 +64640,13 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     std::process::exit(1);
                 }
 
-                contract
-                    .receipts
-                    .push(steering_receipt_tx_attachment(&stored, &live_tx_hash, now));
+                let attempt = steering_receipt_run_attempt(&contract.receipts, &stored.receipt_id);
+                contract.receipts.push(steering_receipt_tx_attachment(
+                    &stored,
+                    &live_tx_hash,
+                    now,
+                    attempt,
+                ));
 
                 let kill_switch = kill_switch.into();
                 let (real_runtime, fallback_reason) = resolve_real_tx_runtime(
@@ -64708,7 +64709,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         SteeringReceiptRevalidatingExecutor::new(
                             executor,
                             stored.clone(),
-                            live_mission.clone(),
+                            mission_file.clone(),
                             live_tx_hash.clone(),
                         ),
                         execution_contract_path,
@@ -64736,7 +64737,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         SteeringReceiptRevalidatingExecutor::new(
                             frankenterm_core::tx_execution::SyntheticStepExecutor,
                             stored.clone(),
-                            live_mission.clone(),
+                            mission_file.clone(),
                             live_tx_hash.clone(),
                         ),
                         execution_contract_path,
@@ -77507,15 +77508,32 @@ fn steering_tx_contract_hash(contract: &frankenterm_core::plan::MissionTxContrac
     contract.compute_hash()
 }
 
+/// The attempt number of the run about to start under `receipt_id`: one more
+/// than the run attachments this contract already carries for it. A run whose
+/// engine refuses still persists its attachment, so the number is what tells
+/// repeated attempts apart.
+fn steering_receipt_run_attempt(receipts: &[serde_json::Value], receipt_id: &str) -> u64 {
+    let prior = receipts
+        .iter()
+        .filter(|attachment| {
+            attachment["kind"] == "ft.steering_receipt.run"
+                && attachment["receipt_id"].as_str() == Some(receipt_id)
+        })
+        .count();
+    u64::try_from(prior).unwrap_or(u64::MAX).saturating_add(1)
+}
+
 fn steering_receipt_tx_attachment(
     receipt: &frankenterm_core::steering::SteeringReceipt,
     live_tx_hash: &str,
     attached_at_ms: i64,
+    attempt: u64,
 ) -> serde_json::Value {
     serde_json::json!({
         "kind": "ft.steering_receipt.run",
         "schema_version": 1,
         "receipt_id": receipt.receipt_id.as_str(),
+        "attempt": attempt,
         "workspace_id": receipt.workspace_id.as_str(),
         "objective": receipt.objective.as_str(),
         "mission_contract_hash": receipt.mission_contract_hash.as_deref(),
@@ -77526,29 +77544,49 @@ fn steering_receipt_tx_attachment(
     })
 }
 
+/// The mission `ft steer run --mission-file` revalidates against, read fresh.
+/// `None` when the file cannot be read or parsed.
+fn read_steering_live_mission(path: &Path) -> Option<frankenterm_core::plan::Mission> {
+    read_mission_file_capped(path)
+        .ok()
+        .and_then(|text| frankenterm_core::plan::Mission::from_json_slice(text.as_bytes()).ok())
+}
+
 #[derive(Clone)]
 struct SteeringReceiptRevalidatingExecutor<E> {
     inner: E,
     receipt: frankenterm_core::steering::SteeringReceipt,
-    live_mission: Option<frankenterm_core::plan::Mission>,
+    // Re-read at every dispatch, so a mission edited mid-run stops later
+    // steps. `None` when the run named no mission file.
+    mission_path: Option<PathBuf>,
     // Durable execution presents one-step contract views to `execute_steps`.
     // Revalidation must remain bound to the admitted full transaction identity.
     full_tx_contract_hash: String,
+    // Wall clock for the receipt's TTL. The engine's `now_ms` is the run's
+    // logical start time, the same for every step.
+    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl<E> SteeringReceiptRevalidatingExecutor<E> {
     fn new(
         inner: E,
         receipt: frankenterm_core::steering::SteeringReceipt,
-        live_mission: Option<frankenterm_core::plan::Mission>,
+        mission_path: Option<PathBuf>,
         full_tx_contract_hash: String,
     ) -> Self {
         Self {
             inner,
             receipt,
-            live_mission,
+            mission_path,
             full_tx_contract_hash,
+            clock: Arc::new(mission_now_ms),
         }
+    }
+
+    #[cfg(test)]
+    fn with_clock(mut self, clock: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
+        self.clock = Arc::new(clock);
+        self
     }
 }
 
@@ -77569,11 +77607,21 @@ impl<E: frankenterm_core::tx_execution::StepExecutor> frankenterm_core::tx_execu
         fail_step: Option<&str>,
         now_ms: i64,
     ) -> Vec<frankenterm_core::plan::TxCommitStepInput> {
+        // Every dispatch is an effect boundary (ft-7h5da.6.8): the receipt is
+        // checked against the clock and the mission file as they are now, not
+        // as they were when the run started, so a receipt that expires or a
+        // mission that drifts mid-run stops every later step. A mission file
+        // that no longer reads fails closed when the receipt bound a mission.
+        let live_now_ms = now_ms.max((self.clock)());
+        let live_mission = self
+            .mission_path
+            .as_deref()
+            .and_then(read_steering_live_mission);
         let verdict = frankenterm_core::steer_run::steer_run_gate(
             &self.receipt,
-            self.live_mission.as_ref(),
+            live_mission.as_ref(),
             Some(&self.full_tx_contract_hash),
-            now_ms,
+            live_now_ms,
         );
         if let Some(error_code) = verdict.error_code() {
             return contract
@@ -99897,6 +99945,23 @@ async fn run_diagnostics(
     config: &frankenterm_core::config::Config,
     layout: &frankenterm_core::config::WorkspaceLayout,
 ) -> Vec<DiagnosticCheck> {
+    // Select the same mux backend used by production clients. This selection
+    // is finite: the local-version compatibility probe is timeout- and
+    // output-bounded in frankenterm-core.
+    let mux_client = frankenterm_core::wezterm::build_unified_client(config);
+    run_diagnostics_with_mux_client(cx, permission_warnings, config, layout, mux_client).await
+}
+
+/// [`run_diagnostics`] against an already-selected mux client. Tests pass a
+/// client whose socket discovery cannot see a mux running on the host
+/// (ft-u506a).
+async fn run_diagnostics_with_mux_client(
+    cx: &frankenterm_core::cx::Cx,
+    permission_warnings: &[frankenterm_core::config::PermissionWarning],
+    config: &frankenterm_core::config::Config,
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    mux_client: frankenterm_core::wezterm::UnifiedClient,
+) -> Vec<DiagnosticCheck> {
     let mut checks = Vec::new();
 
     // Check 1: frankenterm-core loaded with version
@@ -100191,11 +100256,7 @@ async fn run_diagnostics(
         diagnostic
     }));
 
-    // Select the same mux backend used by production clients. This selection
-    // is finite: the local-version compatibility probe is timeout- and
-    // output-bounded in frankenterm-core.
     let wezterm_timeout = std::time::Duration::from_secs(5);
-    let mux_client = frankenterm_core::wezterm::build_unified_client(config);
     let backend_selection = mux_client.selection().clone();
     checks.push(mux_backend_diagnostic(&backend_selection));
     let host_is_idle = doctor_host_is_idle(
@@ -107182,13 +107243,14 @@ reason = "overly conservative pending threshold"
             Some(60_000),
         );
 
-        let attachment = steering_receipt_tx_attachment(&receipt, &live_hash, 1_704_200_000_010);
+        let attachment = steering_receipt_tx_attachment(&receipt, &live_hash, 1_704_200_000_010, 1);
 
         assert_eq!(attachment["kind"], "ft.steering_receipt.run");
         assert_eq!(
             attachment["receipt_id"].as_str(),
             Some(receipt.receipt_id.as_str())
         );
+        assert_eq!(attachment["attempt"], 1);
         assert_eq!(
             attachment["live_tx_contract_hash"].as_str(),
             Some(live_hash.as_str())
@@ -107197,6 +107259,21 @@ reason = "overly conservative pending threshold"
             attachment["tx_contract_hash"].as_str(),
             Some(live_hash.as_str())
         );
+    }
+
+    #[test]
+    fn steering_receipt_run_attempts_count_only_this_receipts_runs() {
+        let receipts = vec![
+            serde_json::json!({"kind": "ft.steering_receipt.run", "receipt_id": "steer:a"}),
+            serde_json::json!({"kind": "ft.steering_receipt.run", "receipt_id": "steer:b"}),
+            serde_json::json!({"kind": "other", "receipt_id": "steer:a"}),
+            serde_json::json!({"kind": "ft.steering_receipt.run", "receipt_id": "steer:a"}),
+        ];
+
+        assert_eq!(steering_receipt_run_attempt(&[], "steer:a"), 1);
+        assert_eq!(steering_receipt_run_attempt(&receipts, "steer:a"), 3);
+        assert_eq!(steering_receipt_run_attempt(&receipts, "steer:b"), 2);
+        assert_eq!(steering_receipt_run_attempt(&receipts, "steer:c"), 1);
     }
 
     #[test]
@@ -107214,9 +107291,9 @@ reason = "overly conservative pending threshold"
             1_704_200_000_000,
             Some(60_000),
         );
-        contract
-            .receipts
-            .push(steering_receipt_tx_attachment(&receipt, &live_hash, 5_151));
+        contract.receipts.push(steering_receipt_tx_attachment(
+            &receipt, &live_hash, 5_151, 1,
+        ));
         let (_dir, contract_path) = persisted_robot_tx_contract(&contract);
         let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
         let executor = RecordingStepExecutor::default();
@@ -107227,7 +107304,8 @@ reason = "overly conservative pending threshold"
                 receipt,
                 None,
                 live_hash.clone(),
-            ),
+            )
+            .with_clock(|| 5_151),
             contract_lock.authoritative_path(),
             Some(&contract_lock),
             &mut contract,
@@ -107282,7 +107360,8 @@ reason = "overly conservative pending threshold"
         let executor = RecordingStepExecutor::default();
 
         let data = execute_tx_run_with_executor(
-            SteeringReceiptRevalidatingExecutor::new(executor.clone(), receipt, None, live_hash),
+            SteeringReceiptRevalidatingExecutor::new(executor.clone(), receipt, None, live_hash)
+                .with_clock(|| 5_151),
             contract_lock.authoritative_path(),
             Some(&contract_lock),
             &mut contract,
@@ -107300,6 +107379,185 @@ reason = "overly conservative pending threshold"
             !calls.contains(&"execute_steps"),
             "stale receipt must stop before side-effecting commit steps"
         );
+        let commit_report = data.commit_report.expect("commit report should be present");
+        assert_eq!(commit_report.failed_count, 1);
+        assert_eq!(
+            commit_report.error_code.as_deref(),
+            Some("robot.steer_hash_mismatch")
+        );
+    }
+
+    #[test]
+    fn steering_receipt_revalidating_executor_stops_later_steps_once_the_receipt_expires() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut contract = sample_robot_tx_contract();
+        assert_eq!(contract.plan.steps.len(), 2, "fixture runs two steps");
+        let live_hash = steering_tx_contract_hash(&contract);
+        let created_at_ms = 1_704_200_000_000;
+        let receipt = frankenterm_core::steering::SteeringReceipt::new(
+            "execute the tx",
+            "ws-test",
+            None,
+            Some(live_hash.clone()),
+            "envelope.admit",
+            Some(900),
+            Vec::new(),
+            created_at_ms,
+            Some(60_000),
+        );
+        let (_dir, contract_path) = persisted_robot_tx_contract(&contract);
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
+        let executor = RecordingStepExecutor::default();
+        // The first step dispatches 1 s into the receipt's 60 s TTL; the second
+        // comes two minutes in, after it expired. The engine's own clock stays
+        // at the run's start for both.
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let clock = move || {
+            if dispatches.fetch_add(1, Ordering::SeqCst) == 0 {
+                created_at_ms + 1_000
+            } else {
+                created_at_ms + 120_000
+            }
+        };
+
+        let data = execute_tx_run_with_executor(
+            SteeringReceiptRevalidatingExecutor::new(executor.clone(), receipt, None, live_hash)
+                .with_clock(clock),
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
+            &mut contract,
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            None,
+            false,
+            created_at_ms + 1_000,
+        )
+        .expect("a receipt expiring mid-run should become a tx failure report");
+
+        let dispatched = executor
+            .recorded_calls()
+            .into_iter()
+            .filter(|call| *call == "execute_steps")
+            .count();
+        assert_eq!(dispatched, 1, "the step after expiry must not dispatch");
+        let commit_report = data.commit_report.expect("commit report should be present");
+        assert_eq!(commit_report.failed_count, 1);
+        assert_eq!(
+            commit_report.error_code.as_deref(),
+            Some("robot.steer_receipt_expired")
+        );
+        assert_ne!(
+            data.final_state,
+            frankenterm_core::plan::MissionTxState::Committed
+        );
+    }
+
+    /// Edits the mission file after each step it runs, as an operator
+    /// changing the mission mid-run would.
+    #[derive(Clone)]
+    struct MissionEditingStepExecutor {
+        inner: RecordingStepExecutor,
+        mission_path: PathBuf,
+    }
+
+    impl frankenterm_core::tx_execution::StepExecutor for MissionEditingStepExecutor {
+        fn evaluate_gates(
+            &self,
+            contract: &frankenterm_core::plan::MissionTxContract,
+            now_ms: i64,
+        ) -> Vec<frankenterm_core::plan::TxPrepareGateInput> {
+            self.inner.evaluate_gates(contract, now_ms)
+        }
+
+        fn execute_steps(
+            &self,
+            contract: &frankenterm_core::plan::MissionTxContract,
+            fail_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<frankenterm_core::plan::TxCommitStepInput> {
+            let inputs = self.inner.execute_steps(contract, fail_step, now_ms);
+            let mut mission =
+                read_steering_live_mission(&self.mission_path).expect("read the live mission");
+            mission.title.push_str(" (edited)");
+            std::fs::write(
+                &self.mission_path,
+                serde_json::to_vec(&mission).expect("serialize the edited mission"),
+            )
+            .expect("write the edited mission");
+            inputs
+        }
+
+        fn execute_compensations(
+            &self,
+            contract: &frankenterm_core::plan::MissionTxContract,
+            commit_report: &frankenterm_core::plan::TxCommitReport,
+            fail_for_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<frankenterm_core::plan::TxCompensationStepInput> {
+            self.inner
+                .execute_compensations(contract, commit_report, fail_for_step, now_ms)
+        }
+    }
+
+    #[test]
+    fn steering_receipt_revalidating_executor_stops_later_steps_when_the_mission_drifts() {
+        let mut contract = sample_robot_tx_contract();
+        assert_eq!(contract.plan.steps.len(), 2, "fixture runs two steps");
+        let live_hash = steering_tx_contract_hash(&contract);
+        let mission = sample_robot_mission();
+        let receipt = frankenterm_core::steering::SteeringReceipt::new(
+            "execute the tx",
+            "ws-test",
+            Some(mission.compute_hash()),
+            Some(live_hash.clone()),
+            "envelope.admit",
+            Some(900),
+            Vec::new(),
+            1_704_200_000_000,
+            Some(60_000),
+        );
+        let (dir, contract_path) = persisted_robot_tx_contract(&contract);
+        let mission_path = dir.path().join("mission.json");
+        std::fs::write(
+            &mission_path,
+            serde_json::to_vec(&mission).expect("serialize the mission"),
+        )
+        .expect("write the mission");
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
+        let recorder = RecordingStepExecutor::default();
+        let executor = MissionEditingStepExecutor {
+            inner: recorder.clone(),
+            mission_path: mission_path.clone(),
+        };
+
+        let data = execute_tx_run_with_executor(
+            SteeringReceiptRevalidatingExecutor::new(
+                executor,
+                receipt,
+                Some(mission_path),
+                live_hash,
+            )
+            .with_clock(|| 5_151),
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
+            &mut contract,
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            None,
+            false,
+            5_151,
+        )
+        .expect("a mission drifting mid-run should become a tx failure report");
+
+        // The first step ran against the receipt's mission (so the re-read
+        // parses it); the second saw the edit and refused.
+        let dispatched = recorder
+            .recorded_calls()
+            .into_iter()
+            .filter(|call| *call == "execute_steps")
+            .count();
+        assert_eq!(dispatched, 1, "the step after the edit must not dispatch");
         let commit_report = data.commit_report.expect("commit report should be present");
         assert_eq!(commit_report.failed_count, 1);
         assert_eq!(
@@ -143147,12 +143405,28 @@ A  docs/new-proof.md\n";
             .expect("enable WAL for doctor fixture");
     }
 
+    /// Doctor as it runs on a host with no mux: no discovered socket, the
+    /// CLI fallback selection, and a backend that lists no panes. Production
+    /// discovery would find whatever mux this host (or a parallel test) is
+    /// running, which made the check list change between runs (ft-u506a).
     async fn run_test_diagnostics(
         config: &frankenterm_core::config::Config,
         layout: &frankenterm_core::config::WorkspaceLayout,
     ) -> Vec<DiagnosticCheck> {
+        use frankenterm_core::wezterm::{
+            BackendSelectionInputs, MockWezterm, UnifiedClient, evaluate_backend_selection,
+        };
+
+        let selection = evaluate_backend_selection(&BackendSelectionInputs {
+            vendored_feature_enabled: cfg!(feature = "vendored"),
+            allow_vendored: true,
+            compat_message: "doctor test fixture".to_string(),
+            compat_json: None,
+            socket_discovered: false,
+        });
+        let mux_client = UnifiedClient::from_handle(Arc::new(MockWezterm::new()), selection);
         let cx = frankenterm_core::cx::for_request();
-        run_diagnostics(&cx, &[], config, layout).await
+        run_diagnostics_with_mux_client(&cx, &[], config, layout, mux_client).await
     }
 
     #[test]
@@ -143471,6 +143745,11 @@ A  docs/new-proof.md\n";
             assert_eq!(
                 statuses_1, statuses_2,
                 "check statuses must be deterministic"
+            );
+            // A host mux never reaches the fixture's checks (ft-u506a).
+            assert!(
+                !names_1.contains(&"mux scrollback"),
+                "the fixture lists no panes, so it has no scrollback row: {names_1:?}"
             );
 
             let _ = std::fs::remove_dir_all(&temp);
