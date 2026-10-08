@@ -403,6 +403,252 @@ fn read_record_growth_target(current: usize, required: usize, limit: usize) -> u
     current.saturating_mul(2).max(required).min(limit)
 }
 
+/// The window a pane-log record read is charged in: std's `BufReader`
+/// capacity, which record reads used before block reads (ft-y0gy9).
+const PANE_LOG_READ_WINDOW: usize = 8 * 1024;
+/// The most one block read asks the file for (ft-y0gy9).
+const PANE_LOG_READ_MAX_BLOCK: usize = 256 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// Forces this thread's record reads onto block reads (true) or
+    /// `BufReader` reads (false), for a same-run comparison in tests.
+    static FORCE_BLOCK_READS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether pane-log record reads go through `BlockPaneLogReader` and a
+/// `memchr` newline scan: on unless FT_STORE_BLOCK_READS=0, read once per
+/// process (ft-y0gy9). Both paths return the same records and the same
+/// errors; only the read calls and the scan differ.
+fn block_reads_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(test)]
+    if let Some(forced) = FORCE_BLOCK_READS.with(std::cell::Cell::get) {
+        return forced;
+    }
+    *ENABLED
+        .get_or_init(|| std::env::var_os("FT_STORE_BLOCK_READS").is_none_or(|value| value != "0"))
+}
+
+/// The block size for reading `count` records from `offsets`: the bytes
+/// from the first record to the one after the last (or the log's end), in
+/// window steps from one window to `PANE_LOG_READ_MAX_BLOCK`. Reading more
+/// or less than the records need changes no result, only the read calls.
+fn pane_log_read_block(offsets: &[LineOffset], count: usize, file_len: u64) -> usize {
+    let Some(first) = offsets.first() else {
+        return PANE_LOG_READ_WINDOW;
+    };
+    let end = offsets.get(count).map_or(file_len, |next| next.0);
+    usize::try_from(end.saturating_sub(first.0))
+        .unwrap_or(usize::MAX)
+        .clamp(PANE_LOG_READ_WINDOW, PANE_LOG_READ_MAX_BLOCK)
+        .next_multiple_of(PANE_LOG_READ_WINDOW)
+}
+
+/// Reads a pane log in blocks of many windows but hands out exactly the
+/// windows an 8 KiB `BufReader` hands out (ft-y0gy9). A window ends at the
+/// next `PANE_LOG_READ_WINDOW` boundary counted from the last seek (or from
+/// where reading started), or where the file ends, and the next window
+/// starts where the caller's consumption stopped. `read_pane_log_records`
+/// charges every window against its budgets, so the same windows give the
+/// same records and the same errors, at one read call per block instead of
+/// one per window.
+struct BlockPaneLogReader<R> {
+    inner: R,
+    block: Vec<u8>,
+    /// The unconsumed bytes are `block[consumed..filled]`.
+    consumed: usize,
+    filled: usize,
+    /// Bytes from the last seek, or the start, to `block[0]`.
+    block_origin: u64,
+}
+
+impl<R: Read> BlockPaneLogReader<R> {
+    fn new(inner: R, block_bytes: usize) -> Self {
+        Self {
+            inner,
+            block: vec![0; block_bytes.max(PANE_LOG_READ_WINDOW)],
+            consumed: 0,
+            filled: 0,
+            block_origin: 0,
+        }
+    }
+
+    fn discard_block(&mut self) {
+        self.consumed = 0;
+        self.filled = 0;
+        self.block_origin = 0;
+    }
+}
+
+impl<R: Read> Read for BlockPaneLogReader<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let window = self.fill_buf()?;
+        let copied = window.len().min(out.len());
+        out[..copied].copy_from_slice(&window[..copied]);
+        self.consume(copied);
+        Ok(copied)
+    }
+}
+
+impl<R: Read> BufRead for BlockPaneLogReader<R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.consumed == self.filled {
+            // As `BufReader` refills: only once everything handed out is
+            // consumed, from where it ends. Errors reach the caller.
+            self.block_origin = self
+                .block_origin
+                .checked_add(self.filled as u64)
+                .ok_or_else(|| std::io::Error::other("pane log read position overflows"))?;
+            self.consumed = 0;
+            self.filled = 0;
+            while self.filled < self.block.len() {
+                let read = self.inner.read(&mut self.block[self.filled..])?;
+                if read == 0 {
+                    break;
+                }
+                self.filled += read;
+            }
+        }
+        let at = self.block_origin + self.consumed as u64;
+        let window = PANE_LOG_READ_WINDOW as u64;
+        let to_boundary = usize::try_from(window - at % window).unwrap_or(usize::MAX);
+        let end = self.filled.min(self.consumed.saturating_add(to_boundary));
+        Ok(&self.block[self.consumed..end])
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.consumed = self.consumed.saturating_add(amount).min(self.filled);
+    }
+}
+
+impl<R: Read + Seek> Seek for BlockPaneLogReader<R> {
+    /// As `BufReader`'s, every seek discards the block; windows then count
+    /// from the new position.
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        let to = match to {
+            SeekFrom::Current(offset) => {
+                let here = self.stream_position()?;
+                SeekFrom::Start(here.checked_add_signed(offset).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "pane log seek before the start or past u64",
+                    )
+                })?)
+            }
+            other => other,
+        };
+        let position = self.inner.seek(to)?;
+        self.discard_block();
+        Ok(position)
+    }
+
+    fn stream_position(&mut self) -> std::io::Result<u64> {
+        let unconsumed = (self.filled - self.consumed) as u64;
+        self.inner
+            .stream_position()?
+            .checked_sub(unconsumed)
+            .ok_or_else(|| {
+                std::io::Error::other("pane log read position precedes its buffered bytes")
+            })
+    }
+}
+
+/// Up to `count` newline-terminated records of a pane log of `file_len`
+/// bytes, starting at `offsets`, within `max_stored_bytes`, read through
+/// `reader` from its current position; `newline` finds a window's first
+/// `\n`. `PaneLog::read_records` passes either reader (ft-y0gy9).
+fn read_pane_log_records<R: BufRead + Seek>(
+    mut reader: R,
+    file_len: u64,
+    offsets: &[LineOffset],
+    count: usize,
+    max_stored_bytes: u64,
+    newline: impl Fn(&[u8]) -> Option<usize>,
+) -> Result<Vec<String>, MmapStoreError> {
+    let mut position = reader.stream_position()?;
+    let mut total = 0;
+    let mut lines = Vec::new();
+    // Every complete record consumes at least its newline. Bound the
+    // result slots by both budgets, without reallocating for every row.
+    lines
+        .try_reserve_exact(
+            count
+                .min(offsets.len())
+                .min(usize::try_from(max_stored_bytes).unwrap_or(usize::MAX)),
+        )
+        .map_err(std::io::Error::other)?;
+    for start in offsets.iter().take(count) {
+        if start.0 > file_len {
+            return Err(MmapStoreError::OffsetOutOfBounds {
+                offset: start.0,
+                len: file_len,
+            });
+        }
+        if position != start.0 {
+            // Interrupted appends can leave gaps between indexed rows.
+            // Sequential rows need no seek or new buffered reader.
+            reader.seek(SeekFrom::Start(start.0))?;
+            position = start.0;
+        }
+        let mut bytes = Vec::new();
+        let mut terminated = false;
+        while position < file_len {
+            let buffer = reader.fill_buf()?;
+            let available = usize::try_from(file_len - position)
+                .unwrap_or(usize::MAX)
+                .min(buffer.len());
+            if available == 0 {
+                break;
+            }
+            let buffer = &buffer[..available];
+            let take = newline(buffer).map_or(available, |end| end + 1);
+            let record_bytes = u64::try_from(bytes.len())
+                .ok()
+                .and_then(|len| len.checked_add(u64::try_from(take).ok()?))
+                .ok_or(MmapStoreError::NumericOverflow("read_record_bytes"))?;
+            // Check before allocating/copying each chunk, including CRLF.
+            charge_read_bytes(total, record_bytes, max_stored_bytes)?;
+            let required = usize::try_from(record_bytes)
+                .map_err(|_| MmapStoreError::NumericOverflow("read_record_bytes"))?;
+            if required > bytes.capacity() {
+                let limit =
+                    usize::try_from((max_stored_bytes - total).min(PANE_LOG_MAX_RECORD_BYTES))
+                        .map_err(|_| MmapStoreError::NumericOverflow("read_capacity"))?;
+                // Geometric growth avoids copying the whole record for
+                // every buffered chunk. Cap the requested capacity at
+                // the remaining stored-byte budget and per-record limit.
+                let target = read_record_growth_target(bytes.capacity(), required, limit);
+                bytes
+                    .try_reserve_exact(target - bytes.len())
+                    .map_err(std::io::Error::other)?;
+            }
+            terminated = buffer[take - 1] == b'\n';
+            bytes.extend_from_slice(&buffer[..take]);
+            reader.consume(take);
+            position += u64::try_from(take)
+                .map_err(|_| MmapStoreError::NumericOverflow("read_position"))?;
+            if terminated {
+                break;
+            }
+        }
+        if !terminated {
+            break;
+        }
+        total = charge_read_bytes(
+            total,
+            u64::try_from(bytes.len())
+                .map_err(|_| MmapStoreError::NumericOverflow("read_record_bytes"))?,
+            max_stored_bytes,
+        )?;
+        while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+            bytes.pop();
+        }
+        lines.push(String::from_utf8(bytes)?);
+    }
+    Ok(lines)
+}
+
 /// An immutable, bounded view of one pane log at a stable filesystem identity.
 ///
 /// The snapshot excludes a final non-newline-terminated record because an
@@ -1668,91 +1914,27 @@ impl PaneFile {
     ) -> Result<Vec<String>, MmapStoreError> {
         // A cloned descriptor pins the same file, NOT an independent seek
         // offset. The owning store must serialize this read with other users.
-        let mut reader = BufReader::new(self.file.try_clone()?);
-        let mut position = reader.stream_position()?;
-        let mut total = 0;
-        let mut lines = Vec::new();
-        // Every complete record consumes at least its newline. Bound the
-        // result slots by both budgets, without reallocating for every row.
-        lines
-            .try_reserve_exact(
-                count
-                    .min(offsets.len())
-                    .min(usize::try_from(max_stored_bytes).unwrap_or(usize::MAX)),
-            )
-            .map_err(std::io::Error::other)?;
-        for start in offsets.iter().take(count) {
-            if start.0 > self.file_len {
-                return Err(MmapStoreError::OffsetOutOfBounds {
-                    offset: start.0,
-                    len: self.file_len,
-                });
-            }
-            if position != start.0 {
-                // Interrupted appends can leave gaps between indexed rows.
-                // Sequential rows need no seek or new buffered reader.
-                reader.seek(SeekFrom::Start(start.0))?;
-                position = start.0;
-            }
-            let mut bytes = Vec::new();
-            let mut terminated = false;
-            while position < self.file_len {
-                let buffer = reader.fill_buf()?;
-                let available = usize::try_from(self.file_len - position)
-                    .unwrap_or(usize::MAX)
-                    .min(buffer.len());
-                if available == 0 {
-                    break;
-                }
-                let buffer = &buffer[..available];
-                let take = buffer
-                    .iter()
-                    .position(|byte| *byte == b'\n')
-                    .map_or(available, |end| end + 1);
-                let record_bytes = u64::try_from(bytes.len())
-                    .ok()
-                    .and_then(|len| len.checked_add(u64::try_from(take).ok()?))
-                    .ok_or(MmapStoreError::NumericOverflow("read_record_bytes"))?;
-                // Check before allocating/copying each chunk, including CRLF.
-                charge_read_bytes(total, record_bytes, max_stored_bytes)?;
-                let required = usize::try_from(record_bytes)
-                    .map_err(|_| MmapStoreError::NumericOverflow("read_record_bytes"))?;
-                if required > bytes.capacity() {
-                    let limit =
-                        usize::try_from((max_stored_bytes - total).min(PANE_LOG_MAX_RECORD_BYTES))
-                            .map_err(|_| MmapStoreError::NumericOverflow("read_capacity"))?;
-                    // Geometric growth avoids copying the whole record for
-                    // every buffered chunk. Cap the requested capacity at
-                    // the remaining stored-byte budget and per-record limit.
-                    let target = read_record_growth_target(bytes.capacity(), required, limit);
-                    bytes
-                        .try_reserve_exact(target - bytes.len())
-                        .map_err(std::io::Error::other)?;
-                }
-                terminated = buffer[take - 1] == b'\n';
-                bytes.extend_from_slice(&buffer[..take]);
-                reader.consume(take);
-                position += u64::try_from(take)
-                    .map_err(|_| MmapStoreError::NumericOverflow("read_position"))?;
-                if terminated {
-                    break;
-                }
-            }
-            if !terminated {
-                break;
-            }
-            total = charge_read_bytes(
-                total,
-                u64::try_from(bytes.len())
-                    .map_err(|_| MmapStoreError::NumericOverflow("read_record_bytes"))?,
+        let file = self.file.try_clone()?;
+        if block_reads_enabled() {
+            let block = pane_log_read_block(offsets, count, self.file_len);
+            read_pane_log_records(
+                BlockPaneLogReader::new(file, block),
+                self.file_len,
+                offsets,
+                count,
                 max_stored_bytes,
-            )?;
-            while matches!(bytes.last(), Some(b'\n' | b'\r')) {
-                bytes.pop();
-            }
-            lines.push(String::from_utf8(bytes)?);
+                |window| memchr::memchr(b'\n', window),
+            )
+        } else {
+            read_pane_log_records(
+                BufReader::new(file),
+                self.file_len,
+                offsets,
+                count,
+                max_stored_bytes,
+                |window| window.iter().position(|byte| *byte == b'\n'),
+            )
         }
-        Ok(lines)
     }
 
     fn prune_before(&mut self, seq: u64) -> Result<(), MmapStoreError> {
@@ -4198,6 +4380,256 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A pane-log byte stream of `records` (length, content, terminator) and
+    /// each record's start (ft-y0gy9). Content 0 is printable ASCII; 1 is
+    /// multi-byte UTF-8 cut at the length, so possibly mid-character; 2 is
+    /// arbitrary bytes, invalid UTF-8 and CRs included, with no LF.
+    /// Terminator 0 is LF, 1 is CRLF, and 2 is none: the record runs into the
+    /// next one, or is the stream's torn tail.
+    fn pane_log_stream(records: &[(usize, u8, u8)], seed: u64) -> (Vec<u8>, Vec<u64>) {
+        const UTF8: &[u8] = "é\u{1f642}ж".as_bytes();
+        let mut state = seed | 1;
+        let mut stream = Vec::new();
+        let mut starts = Vec::new();
+        for &(len, content, terminator) in records {
+            starts.push(stream.len() as u64);
+            for index in 0..len {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                stream.push(match content {
+                    0 => b' ' + (state % 95) as u8,
+                    1 => UTF8[index % UTF8.len()],
+                    _ => match state as u8 {
+                        b'\n' => b'\r',
+                        byte => byte,
+                    },
+                });
+            }
+            match terminator {
+                0 => stream.push(b'\n'),
+                1 => stream.extend_from_slice(b"\r\n"),
+                _ => {}
+            }
+        }
+        (stream, starts)
+    }
+
+    /// `read_pane_log_records` over the log at `path` through `BufReader`
+    /// and the old scan, then through block reads and `memchr`, each from a
+    /// descriptor positioned at `start_at`: both results, debug-formatted.
+    fn read_pane_log_both_ways(
+        path: &Path,
+        start_at: u64,
+        file_len: u64,
+        offsets: &[LineOffset],
+        count: usize,
+        budget: u64,
+        block: usize,
+    ) -> (String, String) {
+        let open = || {
+            let mut file = File::open(path).unwrap();
+            file.seek(SeekFrom::Start(start_at)).unwrap();
+            file
+        };
+        let buffered = read_pane_log_records(
+            BufReader::new(open()),
+            file_len,
+            offsets,
+            count,
+            budget,
+            |window| window.iter().position(|byte| *byte == b'\n'),
+        );
+        let blocks = read_pane_log_records(
+            BlockPaneLogReader::new(open(), block),
+            file_len,
+            offsets,
+            count,
+            budget,
+            |window| memchr::memchr(b'\n', window),
+        );
+        (format!("{buffered:?}"), format!("{blocks:?}"))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// ft-y0gy9: block reads return exactly what `BufReader` reads
+        /// returned, records and errors alike, every error field included.
+        /// Random record streams: records across 8 KiB window edges, CRLF,
+        /// invalid UTF-8, records running into the next, torn tails, a
+        /// snapshot length short of the file. Random requests: skipped and
+        /// mid-record offsets, offsets past the end, counts, byte budgets,
+        /// block sizes, and the descriptor's starting position.
+        #[test]
+        fn block_reads_return_the_records_and_errors_buffered_reads_return(
+            records in proptest::collection::vec(
+                (
+                    prop_oneof![0usize..40, 8_180usize..8_200, 16_370usize..16_400, 0usize..20_000],
+                    0u8..3,
+                    0u8..3,
+                ),
+                0..12,
+            ),
+            seed in any::<u64>(),
+            skip_mask in any::<u16>(),
+            mid in proptest::option::of((0usize..12, 1u64..9_000)),
+            beyond in proptest::option::of(0u64..4),
+            cut in 0usize..64,
+            count in 0usize..16,
+            budget in prop_oneof![Just(u64::MAX), 0u64..120_000],
+            windows in 1usize..=32,
+            start_at in 0u64..40_000,
+            start_at_first in any::<bool>(),
+        ) {
+            let (stream, starts) = pane_log_stream(&records, seed);
+            let dir = temp_dir();
+            let path = dir.path().join("7.log");
+            std::fs::write(&path, &stream).unwrap();
+            let file_len = (stream.len() - cut.min(stream.len())) as u64;
+            let mut offsets: Vec<LineOffset> = starts
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| skip_mask & (1 << (index % 16)) == 0)
+                .map(|(_, start)| LineOffset(*start))
+                .collect();
+            if let Some((index, delta)) = mid
+                && let Some(start) = starts.get(index)
+            {
+                offsets.push(LineOffset(start + delta));
+            }
+            if let Some(extra) = beyond {
+                offsets.push(LineOffset(file_len + 1 + extra));
+            }
+            let start_at = match offsets.first() {
+                Some(first) if start_at_first => first.0,
+                _ => start_at.min(stream.len() as u64),
+            };
+            let (buffered, blocks) = read_pane_log_both_ways(
+                &path,
+                start_at,
+                file_len,
+                &offsets,
+                count,
+                budget,
+                windows * PANE_LOG_READ_WINDOW,
+            );
+            prop_assert_eq!(buffered, blocks);
+        }
+    }
+
+    /// Counts the read calls that reach the wrapped file (ft-y0gy9).
+    struct CountingReads<R> {
+        inner: R,
+        reads: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl<R: Read> Read for CountingReads<R> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            self.reads.set(self.reads.get() + 1);
+            self.inner.read(out)
+        }
+    }
+
+    impl<R: Seek> Seek for CountingReads<R> {
+        fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(to)
+        }
+    }
+
+    /// ft-y0gy9: reading 4096 records of 740 bytes, the size of a sealed T0
+    /// row, takes one read call per 256 KiB block where `BufReader` took
+    /// one per 8 KiB, and returns the same records.
+    #[test]
+    fn block_reads_issue_one_read_call_per_block() {
+        const RECORDS: usize = 4096;
+        let dir = temp_dir();
+        let path = dir.path().join("7.log");
+        let stream = format!("{}\n", "r".repeat(740)).repeat(RECORDS);
+        std::fs::write(&path, &stream).unwrap();
+        let file_len = stream.len() as u64;
+        let offsets: Vec<LineOffset> = (0..RECORDS)
+            .map(|index| LineOffset((index * 741) as u64))
+            .collect();
+        let block = pane_log_read_block(&offsets, RECORDS, file_len);
+        let read = |blocks: bool| {
+            let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+            let file = CountingReads {
+                inner: File::open(&path).unwrap(),
+                reads: std::rc::Rc::clone(&reads),
+            };
+            let records = if blocks {
+                read_pane_log_records(
+                    BlockPaneLogReader::new(file, block),
+                    file_len,
+                    &offsets,
+                    RECORDS,
+                    u64::MAX,
+                    |window| memchr::memchr(b'\n', window),
+                )
+            } else {
+                read_pane_log_records(
+                    BufReader::new(file),
+                    file_len,
+                    &offsets,
+                    RECORDS,
+                    u64::MAX,
+                    |window| window.iter().position(|byte| *byte == b'\n'),
+                )
+            }
+            .unwrap();
+            (records, reads.get())
+        };
+        let (buffered, buffered_reads) = read(false);
+        let (blocks, block_reads) = read(true);
+        eprintln!(
+            "{RECORDS} records of 741 stored bytes: {buffered_reads} read calls through \
+             BufReader, {block_reads} in {block}-byte blocks"
+        );
+        assert_eq!(block, PANE_LOG_READ_MAX_BLOCK);
+        assert_eq!(blocks.len(), RECORDS);
+        assert_eq!(blocks, buffered);
+        assert_eq!(buffered_reads, stream.len().div_ceil(PANE_LOG_READ_WINDOW));
+        assert!(
+            block_reads <= stream.len().div_ceil(block) + 1,
+            "{block_reads} read calls for {} bytes in {block}-byte blocks",
+            stream.len()
+        );
+    }
+
+    /// ft-y0gy9: the store's ranged reads return the same rows, and refuse
+    /// the same budgets, on both read paths, a torn tail included.
+    #[test]
+    fn store_ranged_reads_match_on_both_read_paths() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        for row in 0..64_usize {
+            store
+                .append_line(7, &format!("{}{row}", "x".repeat(row * 397 % 9_000)))
+                .unwrap();
+        }
+        let through = |blocks: bool, range: std::ops::Range<u64>, budget: u64| {
+            FORCE_BLOCK_READS.with(|forced| forced.set(Some(blocks)));
+            let read = store.lines_range(7, range, 64, budget);
+            FORCE_BLOCK_READS.with(|forced| forced.set(None));
+            format!("{read:?}")
+        };
+        for range in [0..64, 5..40, 63..64] {
+            for budget in [u64::MAX, 100_000, 20_000, 9_000, 0] {
+                assert_eq!(
+                    through(true, range.clone(), budget),
+                    through(false, range.clone(), budget),
+                    "rows {range:?} under {budget} bytes"
+                );
+            }
+        }
+        let pane = store.panes.get(&7).unwrap();
+        pane.file.set_len(pane.file_len - 3).unwrap();
+        let torn = through(true, 0..64, u64::MAX);
+        assert_eq!(torn, through(false, 0..64, u64::MAX));
+        assert!(torn.starts_with("Ok("), "{torn}");
     }
 
     #[test]
