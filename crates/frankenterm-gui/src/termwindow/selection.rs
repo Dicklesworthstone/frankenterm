@@ -13,6 +13,8 @@ use termwiz::surface::Line;
 use wezterm_term::StableRowIndex;
 use window::WindowOps;
 
+mod extract;
+
 /// One bounded clipboard transaction, independent of renderer cache capacity.
 /// The 64 MiB text cap and fixed deadline never reset as chunks arrive.
 #[derive(Debug)]
@@ -31,6 +33,8 @@ pub(crate) struct SelectionCopy {
     local: bool,
     local_read: Option<LocalSelectionRead>,
     remote_read_witness: Option<frankenterm_client::pane::SelectionReadWitness>,
+    /// A local copy read on a worker (ft-yccm0.2.2.4) instead of per frame.
+    extraction: Option<extract::SelectionExtraction>,
 }
 
 #[derive(Debug)]
@@ -402,6 +406,7 @@ impl SelectionCopy {
             local: false,
             local_read: None,
             remote_read_witness: None,
+            extraction: None,
         })
     }
 
@@ -1391,11 +1396,98 @@ impl super::TermWindow {
         Ok(Some(rows))
     }
 
+    /// Starts reading a committed local copy's text on a worker
+    /// (ft-yccm0.2.2.4), taking no terminal lock here. Returns false,
+    /// starting nothing, when the per-frame path reads it instead: the worker
+    /// is disabled, the pane is not local, the selection has no layout
+    /// authority, or a non-rectangular selection has no native anchor yet.
+    fn start_selection_extraction(
+        &self,
+        pane: &Arc<dyn Pane>,
+        pending: &mut crate::selection::PendingNativeSelection,
+    ) -> Result<bool, &'static str> {
+        let pane = crate::selection::selection_source_pane_arc(pane);
+        if !extract::worker_enabled()
+            || pending.text_copy.is_some()
+            || pane.downcast_ref::<mux::localpane::LocalPane>().is_none()
+            || pending.desired.authority.is_none()
+            || (pending.desired.native_anchor().is_none() && !pending.desired.rectangular)
+        {
+            return Ok(false);
+        }
+        let mut copy = SelectionCopy::new(&pending.desired, pending.desired.seqno)
+            .ok_or("The selection range is unavailable. Select the text again.")?;
+        self.arm_selection_copy_deadline(pane.pane_id(), &mut copy)?;
+        let mut worker_copy = SelectionCopy::new(&pending.desired, pending.desired.seqno)
+            .ok_or("The selection range is unavailable. Select the text again.")?;
+        worker_copy.deadline = copy.deadline;
+        worker_copy.local = true;
+        let window = self.window.clone();
+        let pane_id = pane.pane_id();
+        copy.extraction = Some(extract::SelectionExtraction::start(
+            Arc::downgrade(pane),
+            pending.desired.clone(),
+            worker_copy,
+            move |generation| {
+                if let Some(window) = window {
+                    window.notify(super::TermWindowNotif::Apply(Box::new(move |tw| {
+                        tw.complete_selection_extraction(pane_id, generation);
+                    })));
+                }
+            },
+        )?);
+        pending.text_copy = Some(copy);
+        Ok(true)
+    }
+
+    /// Copies the outcome of extraction `generation` (ft-yccm0.2.2.4) if it
+    /// still serves `pane_id`'s pending copy of the current selection. Runs
+    /// on the UI thread and takes no terminal lock.
+    fn complete_selection_extraction(&mut self, pane_id: PaneId, generation: u64) {
+        let completed = {
+            let Some(mut state) = self.pane_state(pane_id) else {
+                return;
+            };
+            let state = &mut *state;
+            extract::take_completed_copy(
+                &mut state.pending_native_selection,
+                &state.selection,
+                generation,
+            )
+        };
+        match completed {
+            Some((Ok(text), Some(destination))) => {
+                if !text.is_empty() {
+                    self.copy_to_clipboard(destination, text);
+                }
+            }
+            Some((Err(reason), Some(_))) => {
+                frankenterm_toast_notification::persistent_toast_notification(
+                    "Selection was not copied",
+                    reason,
+                );
+            }
+            _ => {}
+        }
+    }
+
     fn advance_selection_copy(
         &self,
         pane: &Arc<dyn Pane>,
         pending: &mut crate::selection::PendingNativeSelection,
     ) -> Result<Option<String>, &'static str> {
+        if let Some(extraction) = pending
+            .text_copy
+            .as_ref()
+            .and_then(|copy| copy.extraction.as_ref())
+        {
+            // The worker reads the text; its completion also arrives as a
+            // notification, whichever comes first.
+            return extraction.take_outcome().transpose();
+        }
+        if self.start_selection_extraction(pane, pending)? {
+            return Ok(None);
+        }
         let Some((authority, sequence, _)) = SelectionAuthority::capture_source(&**pane) else {
             return Ok(None);
         };
@@ -1600,6 +1692,19 @@ impl super::TermWindow {
         }
         pending.copy = Some(destination);
         pending.paint_retries_remaining = 3;
+        // A committed local selection starts its worker now, without waiting
+        // for a paint or taking a terminal lock (ft-yccm0.2.2.4).
+        if pending.committed
+            && let Err(reason) = self.start_selection_extraction(pane, pending)
+        {
+            state.pending_native_selection = None;
+            drop(state);
+            frankenterm_toast_notification::persistent_toast_notification(
+                "Selection was not copied",
+                reason,
+            );
+            return true;
+        }
         drop(state);
         if remote_authority.is_some() {
             self.retry_pending_native_selection(pane);

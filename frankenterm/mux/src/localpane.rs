@@ -2227,23 +2227,7 @@ impl Pane for LocalPane {
         lines: Range<StableRowIndex>,
         budget: &mut frankenterm_term::screen::LineReadCaptureBudget,
     ) -> Option<anyhow::Result<frankenterm_term::screen::ScreenLineRead>> {
-        let _diagnostic = MetadataRefusalDiagnostic::new();
-        Some(
-            self.terminal
-                .try_lock()
-                .ok_or_else(|| {
-                    anyhow::Error::new(metadata_busy(MetadataRefusalStage::CaptureTerminal))
-                })
-                .and_then(|term| {
-                    term.screen()
-                        .capture_line_read_with_budget(lines, budget)
-                        .inspect_err(|error| {
-                            if error.is::<frankenterm_term::screen::ColdReadMetadataBusy>() {
-                                record_metadata_refusal(MetadataRefusalStage::CaptureScreen);
-                            }
-                        })
-                }),
-        )
+        self.capture_line_read_waiting(lines, budget, Duration::ZERO)
     }
 
     fn publish_line_reads(
@@ -2313,55 +2297,13 @@ impl Pane for LocalPane {
         expected_dimensions: RenderableDimensions,
         publish: &mut dyn FnMut(),
     ) -> Result<bool, frankenterm_term::screen::ColdReadMetadataBusy> {
-        let _diagnostic = MetadataRefusalDiagnostic::new();
-        let mut term = self
-            .terminal
-            .try_lock()
-            .ok_or_else(|| metadata_busy(MetadataRefusalStage::PublishLayoutTerminal))?;
-        let Some(floor) =
-            Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)?
-        else {
-            return Ok(false);
-        };
-        let Some(dimensions) = terminal_try_get_dimensions(&mut term) else {
-            return Ok(false);
-        };
-        if expected_seqno == SequenceNo::MAX
-            || expected_seqno < floor
-            || expected_seqno > term.current_seqno()
-            || !crate::renderable::same_line_layout_geometry(&dimensions, &expected_dimensions)
-        {
-            record_metadata_refusal(MetadataRefusalStage::PublicationGeometry);
-            return Ok(false);
-        }
-        for read in reads {
-            if !term
-                .screen()
-                .try_validate_line_read(read)
-                .inspect_err(|_| {
-                    record_metadata_refusal(MetadataRefusalStage::PublishScreen);
-                })?
-            {
-                return Ok(false);
-            }
-        }
-        if reads
-            .iter()
-            .any(|read| term.screen().line_read_changes_layout(read))
-        {
-            term.increment_seqno();
-            let seqno = term.current_seqno();
-            for read in reads {
-                term.screen_mut().install_line_read_layout(read, seqno);
-            }
-            // The request named the previous layout. Advertise the new state
-            // before accepting coordinates from a refreshed client request.
-            // The CurrentPane caller sends notify_lines_ready after this
-            // false result; do not reacquire registration authority here.
-            return Ok(false);
-        }
-        publish();
-        Ok(true)
+        self.publish_line_reads_at_layout_waiting(
+            reads,
+            expected_seqno,
+            expected_dimensions,
+            publish,
+            Duration::ZERO,
+        )
     }
 
     fn capture_surface_snapshot(
@@ -5530,7 +5472,16 @@ impl LocalPane {
     pub fn selection_source_snapshot(
         &self,
     ) -> Option<(SequenceNo, SequenceNo, RenderableDimensions)> {
-        let mut term = self.terminal.try_lock()?;
+        self.selection_source_snapshot_waiting(Duration::ZERO)
+    }
+
+    /// [`Self::selection_source_snapshot`] waiting up to `wait` for the
+    /// terminal (ft-yccm0.2.2.4); see [`Self::terminal_for_read`].
+    pub fn selection_source_snapshot_waiting(
+        &self,
+        wait: Duration,
+    ) -> Option<(SequenceNo, SequenceNo, RenderableDimensions)> {
+        let mut term = self.terminal_for_read(wait)?;
         let floor = Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)
             .ok()
             .flatten()?;
@@ -5757,7 +5708,121 @@ impl LocalPane {
         RenderableDimensions,
         Option<[Option<frankenterm_term::screen::SelectionAnchorCoordinate>; 3]>,
     )> {
-        let mut term = self.terminal.try_lock()?;
+        self.selection_anchor_snapshot_waiting(anchor, Duration::ZERO)
+    }
+
+    /// The terminal for a line or anchor read: a `try_lock` when `wait` is
+    /// zero, as the UI thread asks; otherwise a wait of at most `wait` that
+    /// registers demand, so a flooding parser hands the lock over at its
+    /// next slice (ft-yccm0.2.3). Only worker threads pass a nonzero wait.
+    fn terminal_for_read(&self, wait: Duration) -> Option<TerminalGuard<'_>> {
+        if wait.is_zero() {
+            self.terminal.try_lock()
+        } else {
+            self.terminal
+                .try_lock_for_as(TerminalLockHolder::Selection, wait)
+        }
+    }
+
+    /// [`Pane::capture_line_read`] waiting up to `wait` for the terminal
+    /// (ft-yccm0.2.2.4); see [`Self::terminal_for_read`].
+    pub fn capture_line_read_waiting(
+        &self,
+        lines: Range<StableRowIndex>,
+        budget: &mut frankenterm_term::screen::LineReadCaptureBudget,
+        wait: Duration,
+    ) -> Option<anyhow::Result<frankenterm_term::screen::ScreenLineRead>> {
+        let _diagnostic = MetadataRefusalDiagnostic::new();
+        Some(
+            self.terminal_for_read(wait)
+                .ok_or_else(|| {
+                    anyhow::Error::new(metadata_busy(MetadataRefusalStage::CaptureTerminal))
+                })
+                .and_then(|term| {
+                    term.screen()
+                        .capture_line_read_with_budget(lines, budget)
+                        .inspect_err(|error| {
+                            if error.is::<frankenterm_term::screen::ColdReadMetadataBusy>() {
+                                record_metadata_refusal(MetadataRefusalStage::CaptureScreen);
+                            }
+                        })
+                }),
+        )
+    }
+
+    /// [`Pane::publish_line_reads_at_layout`] waiting up to `wait` for the
+    /// terminal (ft-yccm0.2.2.4); see [`Self::terminal_for_read`].
+    pub fn publish_line_reads_at_layout_waiting(
+        &self,
+        reads: &[frankenterm_term::screen::ScreenLineRead],
+        expected_seqno: SequenceNo,
+        expected_dimensions: RenderableDimensions,
+        publish: &mut dyn FnMut(),
+        wait: Duration,
+    ) -> Result<bool, frankenterm_term::screen::ColdReadMetadataBusy> {
+        let _diagnostic = MetadataRefusalDiagnostic::new();
+        let mut term = self
+            .terminal_for_read(wait)
+            .ok_or_else(|| metadata_busy(MetadataRefusalStage::PublishLayoutTerminal))?;
+        let Some(floor) =
+            Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)?
+        else {
+            return Ok(false);
+        };
+        let Some(dimensions) = terminal_try_get_dimensions(&mut term) else {
+            return Ok(false);
+        };
+        if expected_seqno == SequenceNo::MAX
+            || expected_seqno < floor
+            || expected_seqno > term.current_seqno()
+            || !crate::renderable::same_line_layout_geometry(&dimensions, &expected_dimensions)
+        {
+            record_metadata_refusal(MetadataRefusalStage::PublicationGeometry);
+            return Ok(false);
+        }
+        for read in reads {
+            if !term
+                .screen()
+                .try_validate_line_read(read)
+                .inspect_err(|_| {
+                    record_metadata_refusal(MetadataRefusalStage::PublishScreen);
+                })?
+            {
+                return Ok(false);
+            }
+        }
+        if reads
+            .iter()
+            .any(|read| term.screen().line_read_changes_layout(read))
+        {
+            term.increment_seqno();
+            let seqno = term.current_seqno();
+            for read in reads {
+                term.screen_mut().install_line_read_layout(read, seqno);
+            }
+            // The request named the previous layout. Advertise the new state
+            // before accepting coordinates from a refreshed client request.
+            // The CurrentPane caller sends notify_lines_ready after this
+            // false result; do not reacquire registration authority here.
+            return Ok(false);
+        }
+        publish();
+        Ok(true)
+    }
+
+    /// [`Self::selection_anchor_snapshot`] waiting up to `wait` for the
+    /// terminal (ft-yccm0.2.2.4); see [`Self::terminal_for_read`].
+    pub fn selection_anchor_snapshot_waiting(
+        &self,
+        anchor: &frankenterm_term::screen::ScreenSelectionAnchor,
+        wait: Duration,
+    ) -> Option<(
+        SequenceNo,
+        SequenceNo,
+        RenderableDimensions,
+        Option<[Option<frankenterm_term::screen::SelectionAnchorCoordinate>; 3]>,
+    )> {
+        let mut term = self.terminal_for_read(wait)?;
         let floor = Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)
             .ok()
             .flatten()?;
