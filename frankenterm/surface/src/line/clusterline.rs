@@ -983,7 +983,7 @@ fn char_graphemes_enabled() -> bool {
     {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| {
-            std::env::var_os("FT_CLUSTER_CHAR_GRAPHEMES").map_or(true, |value| value != "0")
+            std::env::var_os("FT_CLUSTER_CHAR_GRAPHEMES").is_none_or(|value| value != "0")
         })
     }
     #[cfg(not(feature = "std"))]
