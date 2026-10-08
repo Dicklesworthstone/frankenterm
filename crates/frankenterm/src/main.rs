@@ -77544,12 +77544,32 @@ fn steering_receipt_tx_attachment(
     })
 }
 
-/// The mission `ft steer run --mission-file` revalidates against, read fresh.
-/// `None` when the file cannot be read or parsed.
+/// The mission `ft steer run --mission-file` revalidates against, read fresh:
+/// only a regular file, opened without blocking (a FIFO swapped in mid-run
+/// must not stall a transaction between two steps), and capped like every
+/// mission read. `None` when it cannot be read or parsed.
 fn read_steering_live_mission(path: &Path) -> Option<frankenterm_core::plan::Mission> {
-    read_mission_file_capped(path)
-        .ok()
-        .and_then(|text| frankenterm_core::plan::Mission::from_json_slice(text.as_bytes()).ok())
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits());
+    }
+    let file = options.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MISSION_FILE_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MISSION_FILE_MAX_BYTES {
+        return None;
+    }
+    frankenterm_core::plan::Mission::from_json_slice(&bytes).ok()
 }
 
 #[derive(Clone)]
@@ -107498,6 +107518,30 @@ reason = "overly conservative pending threshold"
             self.inner
                 .execute_compensations(contract, commit_report, fail_for_step, now_ms)
         }
+    }
+
+    /// A mission path swapped to a FIFO mid-run fails the read at once
+    /// instead of blocking the run between two steps.
+    #[cfg(unix)]
+    #[test]
+    fn steering_live_mission_refuses_a_fifo_without_blocking() {
+        let dir = tempfile::tempdir().expect("create mission tempdir");
+        let fifo = dir.path().join("mission.json");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("create mission FIFO");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(read_steering_live_mission(&path).is_none());
+        });
+        let refused = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("reading a FIFO mission must not block");
+        assert!(refused, "a FIFO is not a mission file");
     }
 
     #[test]
