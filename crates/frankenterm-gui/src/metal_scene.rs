@@ -63,7 +63,9 @@ pub struct PlacedGlyph {
 pub struct ShapedGlyph {
     /// The column the glyph starts in: the shaper's cell counts of every
     /// glyph before it in the row, as the WebGpu renderer advances along a
-    /// line.
+    /// line. A zero-width glyph (a combining mark) is drawn from its base
+    /// glyph's column instead, its offset covering the cells between, so it
+    /// takes its base's colors as WebGpu gives it its cluster's.
     pub cell: usize,
     /// Placed from the top-left of that cell.
     pub glyph: PlacedGlyph,

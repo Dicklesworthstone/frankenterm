@@ -5247,6 +5247,7 @@ impl TermWindow {
         let Some(metal) = self.metal.as_ref().map(Rc::clone) else {
             return false;
         };
+        self.begin_metal_font_read();
         let captured_generation = self.damage_generation;
         let snapshot_path = self.claim_render_snapshot();
         let dimensions = self.dimensions;

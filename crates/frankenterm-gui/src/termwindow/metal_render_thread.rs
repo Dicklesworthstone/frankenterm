@@ -640,6 +640,7 @@ impl TermWindow {
     /// to here is the render thread's to draw.
     pub(super) fn publish_metal_frame(&mut self) -> bool {
         let captured_generation = self.damage_generation;
+        self.begin_metal_font_read();
         let request = self.metal_frame_request();
         let Some(render) = &self.metal_render else {
             return false;

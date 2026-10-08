@@ -520,6 +520,15 @@ impl FontGlyphs {
         Rc::new(glyphs)
     }
 
+    /// The width of `cells` cells in pixels, as an offset.
+    // Cells are a few dozen pixels wide, and a mark is a cell or two from
+    // its base.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn cells_wide(&self, cells: usize) -> i16 {
+        let width = self.metrics.cell_size.width as i64 * cells as i64;
+        width.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16
+    }
+
     /// Where `laid` is drawn from the top-left of its cell in a cluster with
     /// vertical alignment `valign`, as the WebGpu renderer positions it.
     fn place(&self, laid: LaidGlyph, valign: VerticalAlign) -> (PlacedGlyph, f32) {
@@ -575,14 +584,26 @@ impl GlyphSource for FontGlyphs {
                 }
             };
             let valign = cluster.attrs.vertical_align();
+            // A zero-width glyph (a combining mark) is drawn from the cell of
+            // the glyph it attaches to, its offset widened by the cells from
+            // there to its pen: the same pixels, in the colors of its base's
+            // cell, as WebGpu colors it with its cluster. At the end of a line
+            // its pen's cell holds no cell to take colors from.
+            let mut base = cell;
             for glyph in glyphs.iter() {
                 if let Some(laid) = glyph.laid {
-                    let (glyph, brightness) = self.place(laid, valign);
+                    let (mut placed, brightness) = self.place(laid, valign);
+                    let anchor = if glyph.num_cells == 0 { base } else { cell };
+                    placed.offset[0] =
+                        placed.offset[0].saturating_add(self.cells_wide(cell - anchor));
                     shaped.push(ShapedGlyph {
-                        cell,
-                        glyph,
+                        cell: anchor,
+                        glyph: placed,
                         brightness,
                     });
+                }
+                if glyph.num_cells > 0 {
+                    base = cell;
                 }
                 cell += usize::from(glyph.num_cells);
             }

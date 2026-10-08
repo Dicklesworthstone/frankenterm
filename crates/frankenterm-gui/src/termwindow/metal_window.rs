@@ -212,6 +212,19 @@ impl TermWindow {
         })
     }
 
+    /// Releases the fallback invalidation a resolved font queued, before a
+    /// Metal frame reads fonts, as `paint_impl` releases it for the other
+    /// front ends (ft-yccm0.4.7.3). A later resolver completion can then
+    /// queue another repaint, and the snapshot's readiness check stops
+    /// seeing a font pending. Without it the flag stays set after the first
+    /// resolution: snapshots defer forever and later resolutions never
+    /// repaint.
+    pub(crate) fn begin_metal_font_read(&mut self) {
+        if let Some(ticket) = self.fallback_invalidation_for_paint.take() {
+            ticket.begin_font_read();
+        }
+    }
+
     /// Schedules a Metal window's next paint for what its frames animate
     /// (ft-yccm0.4.7.3), as `paint_impl` schedules it for the other front
     /// ends: the visual bell's fade, which `get_intensity_if_bell_target_ringing`
