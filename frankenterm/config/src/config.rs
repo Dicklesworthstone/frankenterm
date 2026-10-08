@@ -1246,6 +1246,12 @@ pub struct Config {
     pub line_to_ele_shape_cache_size: usize,
     #[dynamic(default = "default_glyph_cache_image_cache_size")]
     pub glyph_cache_image_cache_size: usize,
+    /// Side in pixels of a window's first glyph atlas (ft-yccm0.2.6). It
+    /// grows by doubling within the GPU budget when full; starting large
+    /// avoids the rebuild-and-repaint cascade a small atlas goes through at
+    /// startup with a real font. Rounded up to a power of two.
+    #[dynamic(default = "default_glyph_atlas_initial_size")]
+    pub glyph_atlas_initial_size: usize,
 
     #[dynamic(default)]
     pub visual_bell: VisualBell,
@@ -3304,6 +3310,10 @@ impl DroppedFileQuoting {
 
 fn default_glyph_cache_image_cache_size() -> usize {
     256
+}
+
+fn default_glyph_atlas_initial_size() -> usize {
+    1024
 }
 
 fn default_shape_cache_size() -> usize {

@@ -142,8 +142,6 @@ pub mod webgpu;
 use crate::spawn::SpawnWhere;
 use prevcursor::PrevCursorPos;
 
-const ATLAS_SIZE: usize = 128;
-
 lazy_static::lazy_static! {
     static ref WINDOW_CLASS: Mutex<String> = Mutex::new(wezterm_gui_subcommands::DEFAULT_WINDOW_CLASS.to_owned());
     static ref POSITION: Mutex<Option<GuiPosition>> = Mutex::new(None);
@@ -3916,7 +3914,12 @@ impl TermWindow {
         let render_info = ctx.renderer_info();
         self.opengl_info.replace(render_info.clone());
 
-        let render_state = RenderState::new(ctx, &self.fonts, &self.render_metrics, ATLAS_SIZE)
+        // ft-yccm0.2.6: start at glyph_atlas_initial_size (1024 by default),
+        // not 128, so a real font does not cascade through rebuilds and
+        // repainted frames at startup.
+        let atlas_side =
+            crate::renderstate::initial_texture_atlas_side(self.config.glyph_atlas_initial_size);
+        let render_state = RenderState::new(ctx, &self.fonts, &self.render_metrics, atlas_side)
             .with_context(|| format!("failed to create render state for {render_info}"))?;
         log::info!(
             "Renderer initialized: {} FrankenTerm version: {}",

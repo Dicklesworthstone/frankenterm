@@ -146,8 +146,11 @@ impl crate::TermWindow {
             }
         }
 
+        // Paint passes this frame takes, retries included (ft-yccm0.2.6).
+        let mut passes = 0u64;
         let geometry_result = 'pass: {
             for pass in 0..MAX_PAINT_PASSES {
+                passes += 1;
                 let _dirty_quad_budget = self.frame_budget_should_run_render_op_with_reduce_motion(
                     OpKind::DirtyQuadRebuild,
                     OpPriority::Required,
@@ -242,6 +245,7 @@ impl crate::TermWindow {
                 "paint did not converge within {MAX_PAINT_PASSES} passes"
             ));
         };
+        FrameLedger::global().record_paint_passes(passes);
 
         let present_result = geometry_result
             .map_err(RenderAttemptFailure::paint)

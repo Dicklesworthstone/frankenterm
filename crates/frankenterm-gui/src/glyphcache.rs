@@ -1310,6 +1310,55 @@ impl GlyphCache {
             last_synced_version: 0,
         })
     }
+
+    /// A same-size atlas rebuild without a new texture (ft-yccm0.2.6): clears
+    /// the atlas in place (zeroed, packer reset, version bumped) and leaves
+    /// this cache as [`Self::with_atlas_surface`] would build it around that
+    /// atlas, keeping only the decoded-image state a replacement carries over
+    /// ([`Self::swap_decoded_image_cache_state`]). Every sprite of the old
+    /// generation (glyphs, shape bindings, image frames, utility sprites) is
+    /// dropped, so none can be drawn from the reused texture; the caller makes
+    /// new utility sprites.
+    pub fn clear_atlas_in_place(&mut self, fonts: &Rc<FontConfiguration>) {
+        // Exhaustive: a new field must say how a clear-in-place treats it.
+        let Self {
+            glyph_cache,
+            atlas,
+            fonts: cache_fonts,
+            image_cache: _,
+            image_cache_retained_bytes: _,
+            image_cache_entry_bytes: _,
+            image_revision_owners: _,
+            image_validation_rejection_order: _,
+            image_revision_owner_registrations_since_prune: _,
+            frame_cache,
+            blank_frame_cache,
+            line_glyphs,
+            block_glyphs,
+            cursor_glyphs,
+            color,
+            shape_bindings,
+            min_frame_duration,
+            last_synced_version,
+        } = self;
+        glyph_cache.clear();
+        frame_cache.clear();
+        blank_frame_cache.clear();
+        line_glyphs.clear();
+        block_glyphs.clear();
+        cursor_glyphs.clear();
+        color.clear();
+        *shape_bindings = LfuCache::new(
+            "glyph_cache.shape_bindings.hit.rate",
+            "glyph_cache.shape_bindings.miss.rate",
+            |config| config.shape_cache_size,
+            &fonts.config(),
+        );
+        *cache_fonts = Rc::clone(fonts);
+        *min_frame_duration = config::frame_interval_for_max_fps(fonts.config().max_fps);
+        *last_synced_version = 0;
+        atlas.clear();
+    }
 }
 
 impl GlyphCache {

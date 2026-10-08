@@ -183,6 +183,55 @@ pub(crate) fn replace_glyph_cache_atlas(
     Ok(util_sprites)
 }
 
+/// The same-size atlas rebuild (ft-yccm0.2.6): clears the glyph cache's atlas
+/// in place, keeping its texture, and records a new atlas generation as a
+/// replacement does. Every sprite and shape binding of the old generation is
+/// dropped ([`GlyphCache::clear_atlas_in_place`]); the caller has already
+/// released its own holders (TermWindow::recreate_texture_atlas).
+pub(crate) fn clear_glyph_cache_atlas(
+    glyph_cache: &RefCell<GlyphCache>,
+    fonts: &Rc<FontConfiguration>,
+    metrics: &RenderMetrics,
+    ledger: &GpuResourceLedger,
+) -> anyhow::Result<UtilSprites> {
+    let mut glyph_cache = glyph_cache.borrow_mut();
+    glyph_cache.clear_atlas_in_place(fonts);
+    let util_sprites = UtilSprites::new(&mut glyph_cache, metrics)?;
+    ledger.record_atlas_generation();
+    Ok(util_sprites)
+}
+
+/// Whether an atlas rebuild from side `current` to `requested` clears the
+/// existing texture in place (the same size) rather than allocating a new
+/// texture and glyph cache (growth, or any other size) (ft-yccm0.2.6).
+fn atlas_rebuild_clears_in_place(current: usize, requested: usize) -> bool {
+    requested == current
+}
+
+/// Smallest side a window's first glyph atlas starts at.
+const MIN_INITIAL_ATLAS_SIDE: usize = 128;
+/// Largest first side: wgpu's default `max_texture_dimension_2d`.
+const MAX_INITIAL_ATLAS_SIDE: usize = 8192;
+
+/// A window's first glyph atlas side for `glyph_atlas_initial_size`
+/// (ft-yccm0.2.6): a power of two of at least [`MIN_INITIAL_ATLAS_SIDE`],
+/// within the texture budget and [`MAX_INITIAL_ATLAS_SIDE`].
+pub(crate) fn initial_texture_atlas_side(configured: usize) -> usize {
+    initial_texture_atlas_side_within(
+        configured,
+        max_texture_atlas_side_for_budget(texture_atlas_vram_budget_bytes()),
+    )
+}
+
+fn initial_texture_atlas_side_within(configured: usize, budget_side: usize) -> usize {
+    configured
+        .max(MIN_INITIAL_ATLAS_SIDE)
+        .checked_next_power_of_two()
+        .unwrap_or(MAX_INITIAL_ATLAS_SIDE)
+        .min(MAX_INITIAL_ATLAS_SIDE)
+        .min(budget_side)
+}
+
 #[derive(Clone)]
 pub enum RenderContext {
     Glium(Rc<GliumContext>),
@@ -1480,6 +1529,16 @@ impl RenderState {
         size: Option<usize>,
     ) -> anyhow::Result<()> {
         let size = size.unwrap_or_else(|| self.glyph_cache.borrow().atlas.size());
+        if atlas_rebuild_clears_in_place(self.glyph_cache.borrow().atlas.size(), size) {
+            // ft-yccm0.2.6: the same size reuses the texture it has.
+            self.util_sprites = clear_glyph_cache_atlas(
+                &self.glyph_cache,
+                fonts,
+                metrics,
+                GpuResourceLedger::global(),
+            )?;
+            return Ok(());
+        }
         let surface = self.context.allocate_texture_atlas(size)?;
         self.util_sprites = replace_glyph_cache_atlas(
             &self.glyph_cache,
@@ -2028,8 +2087,8 @@ mod tests {
     #[test]
     fn the_t0_emoji_pool_draws_twice_with_no_rebuild_or_fallback_query_the_second_time() {
         use super::{
-            AtlasRebuildPolicy, LedgeredTexture, replace_glyph_cache_atlas,
-            texture_atlas_vram_budget_bytes,
+            AtlasRebuildPolicy, LedgeredTexture, atlas_rebuild_clears_in_place,
+            clear_glyph_cache_atlas, replace_glyph_cache_atlas, texture_atlas_vram_budget_bytes,
         };
         use crate::glyphcache::GlyphCache;
         use crate::utilsprites::{RenderMetrics, UtilSprites};
@@ -2043,7 +2102,8 @@ mod tests {
         use wezterm_bidi::Direction;
         use wezterm_term::{CellAttributes, Line};
 
-        // The window's first atlas side (termwindow ATLAS_SIZE).
+        // The first atlas side before ft-yccm0.2.6 (now 1024 by default): a
+        // small atlas makes the pool exercise both clears and growth.
         const FIRST_ATLAS_SIDE: usize = 128;
         // Distinct emoji on one screen of the corpus.
         const SCREEN: usize = 96;
@@ -2144,14 +2204,28 @@ mod tests {
                     eprintln!(
                         "[atlas] {round} screen {index} pass {pass}: side {current}, requested {requested}, rebuilt at {side}"
                     );
-                    util_sprites = replace_glyph_cache_atlas(
-                        &glyph_cache,
-                        &fonts,
-                        &metrics,
-                        surface(side),
-                        ledger,
-                    )
-                    .unwrap();
+                    // RenderState's choice (ft-yccm0.2.6): the same size
+                    // clears in place on the same texture; growth replaces.
+                    util_sprites = if atlas_rebuild_clears_in_place(current, side) {
+                        let texture = glyph_cache.borrow().atlas.texture();
+                        let sprites =
+                            clear_glyph_cache_atlas(&glyph_cache, &fonts, &metrics, ledger)
+                                .unwrap();
+                        assert!(
+                            Rc::ptr_eq(&texture, &glyph_cache.borrow().atlas.texture()),
+                            "a clear in place keeps the texture"
+                        );
+                        sprites
+                    } else {
+                        replace_glyph_cache_atlas(
+                            &glyph_cache,
+                            &fonts,
+                            &metrics,
+                            surface(side),
+                            ledger,
+                        )
+                        .unwrap()
+                    };
                     assert_eq!(util_sprites.white_space.texture.width(), side);
                 }
                 assert!(drawn, "a screen did not fit within {PASSES} passes");
@@ -2169,6 +2243,11 @@ mod tests {
         assert!(
             warm.1.growths > 0,
             "the warm-up grew the atlas: {:?}",
+            warm.1
+        );
+        assert!(
+            warm.1.clears > 0,
+            "the warm-up cleared an atlas in place: {:?}",
             warm.1
         );
         assert!(warm.2.queried > 0, "the warm-up resolved fallbacks");
@@ -2198,5 +2277,105 @@ mod tests {
             "only the current atlas is alive"
         );
         drop(util_sprites);
+    }
+
+    /// ft-yccm0.2.6: a same-size rebuild clears the atlas in place. The
+    /// texture is the same one (no allocation: the ledger still counts one
+    /// live atlas texture), the atlas generation and version move on, and
+    /// nothing of the old generation survives to be drawn: its glyphs are
+    /// rasterized again into new sprites and its shape bindings are released
+    /// (ft-yccm0.2.5's leak).
+    #[test]
+    fn a_clear_in_place_keeps_the_texture_and_drops_every_old_generation_sprite() {
+        use super::{LedgeredTexture, clear_glyph_cache_atlas};
+        use crate::glyphcache::GlyphCache;
+        use crate::utilsprites::{RenderMetrics, UtilSprites};
+        use ::window::bitmaps::{ImageTexture, Texture2d};
+        use frankenterm_alloc::resource_ledger::{GpuResourceLedger, GpuTexturePurpose};
+        use frankenterm_font::FontConfiguration;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use wezterm_bidi::Direction;
+
+        config::use_test_configuration();
+        let fonts = Rc::new(FontConfiguration::new(None, 96).unwrap());
+        let metrics = RenderMetrics::new(&fonts).unwrap();
+        let font = fonts.default_font().unwrap();
+        let style = fonts.config().font.clone();
+        let ledger: &'static GpuResourceLedger = Box::leak(Box::new(GpuResourceLedger::new()));
+        let surface: Rc<dyn Texture2d> = Rc::new(LedgeredTexture::new(
+            ImageTexture::new(256, 256),
+            GpuTexturePurpose::Atlas,
+            ledger,
+        ));
+        let glyph_cache = RefCell::new(GlyphCache::with_atlas_surface(&fonts, surface).unwrap());
+        let util_sprites = UtilSprites::new(&mut glyph_cache.borrow_mut(), &metrics).unwrap();
+        let infos = font
+            .blocking_shape("A", None, Direction::LeftToRight, None, None)
+            .unwrap();
+        let draw = |glyph_cache: &RefCell<GlyphCache>| {
+            glyph_cache
+                .borrow_mut()
+                .cached_glyph(&infos[0], &style, false, &font, &metrics, 1)
+                .unwrap()
+        };
+        let old_glyph = draw(&glyph_cache);
+        let old_version = old_glyph.texture.as_ref().unwrap().version;
+        let binding = Rc::new(Vec::new());
+        glyph_cache.borrow_mut().bind_shape(7, Rc::clone(&binding));
+        let texture = glyph_cache.borrow().atlas.texture();
+        let atlas_version = glyph_cache.borrow().atlas.version();
+        let generations = ledger.snapshot().atlas_generations;
+        drop(util_sprites);
+
+        let util_sprites = clear_glyph_cache_atlas(&glyph_cache, &fonts, &metrics, ledger).unwrap();
+
+        assert!(Rc::ptr_eq(&texture, &glyph_cache.borrow().atlas.texture()));
+        assert!(Rc::ptr_eq(&texture, &util_sprites.white_space.texture));
+        assert_eq!(
+            ledger.texture_counter(GpuTexturePurpose::Atlas).live_count,
+            1,
+            "a clear in place allocates no texture"
+        );
+        assert_eq!(ledger.snapshot().atlas_generations, generations + 1);
+        assert!(glyph_cache.borrow().atlas.version() > atlas_version);
+        // The old generation's shape binding is released, not pinned.
+        assert_eq!(Rc::strong_count(&binding), 1);
+        assert!(glyph_cache.borrow_mut().shape_binding(7).is_none());
+        // The old glyph is never served again: drawing it rasterizes anew
+        // into a sprite of the new generation.
+        assert_eq!(glyph_cache.borrow().glyph_entries(), 0);
+        let new_glyph = draw(&glyph_cache);
+        assert!(!Rc::ptr_eq(&old_glyph, &new_glyph));
+        assert!(new_glyph.texture.as_ref().unwrap().version > old_version);
+        assert!(new_glyph.texture.as_ref().unwrap().version > atlas_version);
+    }
+
+    /// ft-yccm0.2.6: only a rebuild at the current size clears in place;
+    /// growth (or any other size) still allocates a new texture.
+    #[test]
+    fn only_a_same_size_rebuild_clears_in_place() {
+        use super::atlas_rebuild_clears_in_place;
+        assert!(atlas_rebuild_clears_in_place(1024, 1024));
+        assert!(!atlas_rebuild_clears_in_place(1024, 2048));
+        assert!(!atlas_rebuild_clears_in_place(2048, 1024));
+    }
+
+    /// ft-yccm0.2.6: a window's first atlas side comes from
+    /// `glyph_atlas_initial_size` (1024 by default), a power of two of at
+    /// least 128, within the texture budget and wgpu's default limit.
+    #[test]
+    fn the_first_atlas_side_is_a_power_of_two_within_bounds() {
+        use super::initial_texture_atlas_side_within;
+        assert_eq!(initial_texture_atlas_side_within(1024, 16384), 1024);
+        assert_eq!(initial_texture_atlas_side_within(1000, 16384), 1024);
+        assert_eq!(initial_texture_atlas_side_within(0, 16384), 128);
+        assert_eq!(initial_texture_atlas_side_within(100_000, 16384), 8192);
+        assert_eq!(initial_texture_atlas_side_within(usize::MAX, 16384), 8192);
+        assert_eq!(initial_texture_atlas_side_within(4096, 2048), 2048);
+        assert_eq!(
+            config::ConfigHandle::default_config().glyph_atlas_initial_size,
+            1024
+        );
     }
 }

@@ -1067,6 +1067,12 @@ pub struct FrameLedger {
     stale_presented_total: AtomicU64,
     /// A pane was drawn from a reused frame since the last present.
     reused_content_pending: AtomicBool,
+    /// Frames the GUI built (presented or not), the paint passes they took,
+    /// and how many needed more than one: an atlas overflow, a quad buffer
+    /// grown or a fallback font applied repaints the frame (ft-yccm0.2.6).
+    painted_frames_total: AtomicU64,
+    paint_passes_total: AtomicU64,
+    retried_paint_frames_total: AtomicU64,
     present_failures_total: AtomicU64,
     present_interval: LatencyHistogram,
     /// Monotonic nanoseconds of the latest present; 0 before the first.
@@ -1089,6 +1095,9 @@ impl FrameLedger {
             presented_total: AtomicU64::new(0),
             stale_presented_total: AtomicU64::new(0),
             reused_content_pending: AtomicBool::new(false),
+            painted_frames_total: AtomicU64::new(0),
+            paint_passes_total: AtomicU64::new(0),
+            retried_paint_frames_total: AtomicU64::new(0),
             present_failures_total: AtomicU64::new(0),
             present_interval: LatencyHistogram::new(),
             last_present_ns: AtomicU64::new(0),
@@ -1137,11 +1146,24 @@ impl FrameLedger {
         self.reused_content_pending.store(true, Ordering::Relaxed);
     }
 
+    /// One frame built in `passes` paint passes (ft-yccm0.2.6).
+    pub fn record_paint_passes(&self, passes: u64) {
+        self.painted_frames_total.fetch_add(1, Ordering::Relaxed);
+        self.paint_passes_total.fetch_add(passes, Ordering::Relaxed);
+        if passes > 1 {
+            self.retried_paint_frames_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> FramesSnapshot {
         FramesSnapshot {
             presented_total: self.presented_total.load(Ordering::Relaxed),
             stale_presented_total: self.stale_presented_total.load(Ordering::Relaxed),
+            painted_frames_total: self.painted_frames_total.load(Ordering::Relaxed),
+            paint_passes_total: self.paint_passes_total.load(Ordering::Relaxed),
+            retried_paint_frames_total: self.retried_paint_frames_total.load(Ordering::Relaxed),
             present_failures_total: self.present_failures_total.load(Ordering::Relaxed),
             present_interval: self.present_interval.snapshot(),
             max_fps: self.max_fps.load(Ordering::Relaxed),
@@ -1164,6 +1186,15 @@ pub struct FramesSnapshot {
     /// busy); `presented_total - stale_presented_total` showed fresh content.
     #[serde(default)]
     pub stale_presented_total: u64,
+    /// Frames built, the paint passes they took, and how many needed more
+    /// than one (ft-yccm0.2.6): passes per frame is the second over the
+    /// first.
+    #[serde(default)]
+    pub painted_frames_total: u64,
+    #[serde(default)]
+    pub paint_passes_total: u64,
+    #[serde(default)]
+    pub retried_paint_frames_total: u64,
     pub present_failures_total: u64,
     /// Present-to-present intervals over the process lifetime, idle gaps
     /// included.
@@ -1178,10 +1209,13 @@ impl FramesSnapshot {
     pub fn summary_line(&self) -> String {
         let ms = |ns: u64| ns as f64 / 1_000_000.0;
         format!(
-            "Frames: presented {} (stale {}, failed {}); present interval p50 {:.2} ms, p95 {:.2} ms, max {:.2} ms; max_fps {}",
+            "Frames: presented {} (stale {}, failed {}); paint passes {} over {} frames ({} retried); present interval p50 {:.2} ms, p95 {:.2} ms, max {:.2} ms; max_fps {}",
             self.presented_total,
             self.stale_presented_total,
             self.present_failures_total,
+            self.paint_passes_total,
+            self.painted_frames_total,
+            self.retried_paint_frames_total,
             ms(self.present_interval.p50_ns),
             ms(self.present_interval.p95_ns),
             ms(self.present_interval.max_ns),
@@ -2341,8 +2375,9 @@ mod tests {
         assert_eq!(
             snapshot.summary_line(),
             format!(
-                "Frames: presented 4 (stale 0, failed 1); present interval p50 {:.2} ms, \
-                 p95 250.00 ms, max 250.00 ms; max_fps 120",
+                "Frames: presented 4 (stale 0, failed 1); paint passes 0 over 0 frames \
+                 (0 retried); present interval p50 {:.2} ms, p95 250.00 ms, max 250.00 ms; \
+                 max_fps 120",
                 snapshot.present_interval.p50_ns as f64 / 1_000_000.0
             )
         );
@@ -2356,6 +2391,16 @@ mod tests {
         let snapshot = ledger.snapshot();
         assert_eq!(snapshot.presented_total, 6);
         assert_eq!(snapshot.stale_presented_total, 1);
+
+        // ft-yccm0.2.6: paint passes per frame, and the frames that needed
+        // a retry.
+        ledger.record_paint_passes(1);
+        ledger.record_paint_passes(3);
+        ledger.record_paint_passes(1);
+        let snapshot = ledger.snapshot();
+        assert_eq!(snapshot.painted_frames_total, 3);
+        assert_eq!(snapshot.paint_passes_total, 5);
+        assert_eq!(snapshot.retried_paint_frames_total, 1);
 
         // The global ledger records against its own monotonic clock.
         let global = FrameLedger::global();
