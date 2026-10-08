@@ -140,6 +140,24 @@ impl Clone for VecStorage {
     }
 }
 
+/// Stores `cell` at `idx`, carrying over the image placements of the cell it
+/// replaces unless `clear_image_placement`: [`VecStorage::set_cell`] on a
+/// borrowed, materialized row.
+#[cfg_attr(not(feature = "use_image"), allow(unused_mut, unused_variables))]
+fn store_cell(cells: &mut [Cell], idx: usize, mut cell: Cell, clear_image_placement: bool) {
+    #[cfg(feature = "use_image")]
+    if !clear_image_placement {
+        if let Some(images) = cells[idx].attrs().images() {
+            for image in images {
+                if image.has_placement_id() {
+                    cell.attrs_mut().attach_image(Box::new(image));
+                }
+            }
+        }
+    }
+    cells[idx] = cell;
+}
+
 impl VecStorage {
     pub(crate) fn snapshot_clone(&self) -> Self {
         Self {
@@ -395,6 +413,45 @@ impl VecStorage {
             buffer.wrap_boundary.take();
         }
         &mut buffer.cells
+    }
+
+    /// `Line::set_cell_impl`'s write into a vector row with one mutable
+    /// borrow of the cells (ft-yccm0.3.2.6), where it took one per step.
+    /// In the same order:
+    /// - pad the row with blanks to `end`;
+    /// - blank a wide grapheme just before `idx`
+    ///   (`Line::invalidate_grapheme_at_or_before`);
+    /// - blank the columns a `width`-wide `cell` covers;
+    /// - store `cell`.
+    ///
+    /// Each store carries image placements over as [`Self::set_cell`] does.
+    pub(crate) fn write_cell(
+        &mut self,
+        idx: usize,
+        cell: Cell,
+        width: usize,
+        end: usize,
+        clear_image_placement: bool,
+    ) {
+        let cells = self.cells_mut();
+        if end > cells.len() {
+            cells.resize_with(end, Cell::blank);
+        }
+        if let Some(prior) = idx.checked_sub(1) {
+            if prior < cells.len() {
+                let prior_width = cells[prior].width();
+                if prior_width > 1 {
+                    let attrs = cells[prior].attrs().clone();
+                    let stop = prior.saturating_add(prior_width).min(cells.len());
+                    cells[prior..stop].fill(Cell::blank_with_attrs(attrs));
+                }
+            }
+        }
+        for offset in 1..width {
+            let blank = Cell::blank_with_attrs(cell.attrs().clone());
+            store_cell(cells, idx + offset, blank, clear_image_placement);
+        }
+        store_cell(cells, idx, cell, clear_image_placement);
     }
 
     #[cfg_attr(not(feature = "use_image"), allow(unused_mut, unused_variables))]

@@ -1590,6 +1590,28 @@ impl Line {
             */
         }
 
+        self.write_vector_cell(idx, cell, width, end_idx, clear, Self::write_split());
+    }
+
+    /// The vector-row part of `set_cell_impl`: pad, blank a wide grapheme
+    /// before `idx`, blank the columns the cell covers, store it. One storage
+    /// borrow does it all (ft-yccm0.3.2.6); `split` takes the steps one by
+    /// one as before. Both leave the same line.
+    fn write_vector_cell(
+        &mut self,
+        idx: usize,
+        cell: Cell,
+        width: usize,
+        end_idx: usize,
+        clear: bool,
+        split: bool,
+    ) {
+        if !split {
+            self.coerce_vec_storage()
+                .write_cell(idx, cell, width, end_idx, clear);
+            return;
+        }
+
         // if the line isn't wide enough, pad it out with the default attributes.
         {
             let cells = self.coerce_vec_storage();
@@ -1607,6 +1629,19 @@ impl Line {
         }
 
         self.raw_set_cell(idx, cell, clear);
+    }
+
+    /// `FT_LINE_WRITE_SPLIT=1` writes vector-row cells step by step, each
+    /// step borrowing the storage, as before ft-yccm0.3.2.6: the A/B arm and
+    /// a rollback. Both arms leave the same line. Resolved once per process.
+    fn write_split() -> bool {
+        #[cfg(feature = "std")]
+        {
+            static SPLIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *SPLIT.get_or_init(|| std::env::var_os("FT_LINE_WRITE_SPLIT").is_some_and(|v| v == "1"))
+        }
+        #[cfg(not(feature = "std"))]
+        false
     }
 
     /// Place text starting at the specified column index.
@@ -4597,6 +4632,55 @@ mod tests {
                 assert_eq!(clustered.len(), width, "{text:?} at {width}");
                 assert!(clustered == vector, "{:?} at {}", text, width);
                 assert_eq!(clustered.current_seqno(), vector.current_seqno());
+            }
+        }
+    }
+
+    /// ft-yccm0.3.2.6: writing a vector row's cell with one storage borrow
+    /// leaves the line the step-by-step writes leave. Random narrow, wide,
+    /// combining and emoji cells with new colors land on random columns:
+    /// past the end, on wide heads and their placeholders, and over each
+    /// other.
+    #[test]
+    fn one_borrow_vector_writes_match_step_by_step_writes() {
+        use frankenterm_cell::color::ColorAttribute;
+        let glyphs = [
+            ("a", 1),
+            ("\u{4e2d}", 2),
+            ("\u{1f600}", 2),
+            (" ", 1),
+            ("e\u{301}", 1),
+        ];
+        let mut seed = 0x2026_1007_u64;
+        let mut next = move |bound: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % bound
+        };
+        for case in 0..2000 {
+            let mut pen = CellAttributes::default();
+            pen.set_background(ColorAttribute::PaletteIndex(4));
+            let mut joined = Line::with_width_and_cell(8, Cell::blank_with_attrs(pen), 1);
+            let mut split = joined.clone();
+            for step in 0..12 {
+                let (text, width) = glyphs[next(glyphs.len())];
+                let mut attrs = CellAttributes::default();
+                attrs.set_foreground(ColorAttribute::PaletteIndex(next(256) as u8));
+                let cell = Cell::new_grapheme_with_width(text, width, attrs);
+                let idx = next(14);
+                let width = normalize_cell_width(cell.width());
+                let clear = next(2) == 0;
+                joined.write_vector_cell(idx, cell.clone(), width, idx + width, clear, false);
+                split.write_vector_cell(idx, cell, width, idx + width, clear, true);
+                assert!(
+                    joined == split,
+                    "case {} step {}: {:?} at {}",
+                    case,
+                    step,
+                    text,
+                    idx
+                );
             }
         }
     }
