@@ -13,14 +13,33 @@
 //! | Metal render thread while the window is focused | [`ThreadQos::UserInteractive`] |
 //! | Durable scrollback writer | [`ThreadQos::Utility`] |
 //!
+//! # The task role caps every class (ft-yccm0.6)
+//!
+//! macOS squashes user-interactive and user-initiated requests to the
+//! default class's priority (31) in a process without an application task
+//! role. Any process not launched as an app has none: one started from a
+//! shell, tmux or a test harness. The request still succeeds and
+//! [`current_thread_qos`] reads it back, but the scheduler runs the thread at
+//! 31, level with every unclassified busy thread on the host. A loaded host
+//! then starves the very threads that asked to come first.
+//! [`ensure_application_task_role`] gives such a process the role macOS
+//! keeps for "may render UI, focus unknown" (`TASK_DEFAULT_APPLICATION`),
+//! which lifts the cap, and [`set_current_thread_qos`] calls it before the
+//! first request above default, so every caller gets the class it asks for:
+//! the GUI, the headless mux server, tests. [`current_thread_base_priority`]
+//! reads the priority the class actually gives (see
+//! [`ThreadQos::base_priority`]).
+//!
 //! On every platform other than macOS the functions are no-ops:
-//! [`set_current_thread_qos`] returns `Ok(false)` and
-//! [`current_thread_qos`] returns `None`.
+//! [`set_current_thread_qos`] returns `Ok(false)`, [`current_thread_qos`]
+//! and [`current_thread_base_priority`] return `None`, and
+//! [`ensure_application_task_role`] returns
+//! [`ApplicationTaskRole::Unsupported`].
 //!
 //! # UNSAFE-CONTRACT
 //!
-//! The macOS implementation makes three libpthread calls, each in its own
-//! `unsafe` block:
+//! The macOS implementation makes these calls, each in its own `unsafe`
+//! block:
 //!
 //! 1. `pthread_set_qos_class_self_np(class, 0)` changes only the calling
 //!    thread. `class` is always one of the five named classes, never
@@ -37,6 +56,26 @@
 //!    than into libc's Rust `qos_class_t` enum: a value a future OS might add
 //!    therefore never becomes an invalid Rust enum discriminant. It is mapped
 //!    through [`ThreadQos::from_raw`], and an unknown value reads as `None`.
+//! 4. Reading `mach_task_self_` by value: a `mach_port_t` static libSystem
+//!    sets to the task's own port before `main` and never changes. It is
+//!    declared here with libSystem's type because libc deprecates both its
+//!    declaration and its `mach_task_self()` wrapper.
+//! 5. `task_policy_get(task, TASK_CATEGORY_POLICY, policy, count,
+//!    get_default)` reads the calling task's `task_category_policy`, a
+//!    single `integer_t` role, into an `i32` local. `count` is a local set to
+//!    1, the policy's size in `integer_t`s, and `get_default` is an `i32`
+//!    local (`boolean_t` is 4 bytes). The task is the caller's own port.
+//! 6. `task_policy_set(task, TASK_CATEGORY_POLICY, policy, 1)` sets only the
+//!    calling task's role, and only to `TASK_DEFAULT_APPLICATION`, a role an
+//!    unprivileged task may give itself. `policy` points to an `i32` local
+//!    that lives for the call.
+//! 7. `pthread_threadid_np(pthread_self(), id)` writes the calling thread's
+//!    64-bit id into a `u64` local. `proc_pidinfo(getpid(),
+//!    PROC_PIDTHREADID64INFO, id, buffer, size)` fills a zeroed local
+//!    `libc::proc_threadinfo` (plain integers and a `c_char` array, valid
+//!    when zeroed) with the calling thread's info, and `size` is exactly that
+//!    struct's size. The result is used only when the call reports filling
+//!    all of it.
 
 /// A thread QoS class. The raw values are the C `qos_class_t` constants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -82,20 +121,104 @@ impl ThreadQos {
     pub fn from_raw(raw: u32) -> Option<Self> {
         Self::ALL.into_iter().find(|qos| qos.raw() == raw)
     }
+
+    /// The base scheduling priority macOS runs a thread of this class at,
+    /// once its process has an application task role (the kernel's
+    /// `thread_qos_policy_params`). Without one, user-interactive and
+    /// user-initiated threads run at the default class's 31.
+    pub const fn base_priority(self) -> i32 {
+        match self {
+            ThreadQos::UserInteractive => 46,
+            ThreadQos::UserInitiated => 37,
+            ThreadQos::Default => 31,
+            ThreadQos::Utility => 20,
+            ThreadQos::Background => 4,
+        }
+    }
 }
+
+/// What [`ensure_application_task_role`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplicationTaskRole {
+    /// The process already had a role, the raw `task_role_t` (for example
+    /// one macOS gives a process launched as an app); left alone.
+    AlreadyAssigned(i32),
+    /// The process had none; it now has `TASK_DEFAULT_APPLICATION`.
+    Assigned,
+    /// Not macOS: there are no task roles.
+    Unsupported,
+}
+
+/// Set by [`keep_launched_task_role`].
+static KEEP_LAUNCHED_TASK_ROLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Whether [`set_current_thread_qos`] has given the process its role.
+static TASK_ROLE_ENSURED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Sets the calling thread's QoS class.
 ///
 /// Returns `Ok(true)` once macOS has applied it and `Ok(false)` on platforms
-/// without QoS classes, where this is a no-op.
+/// without QoS classes, where this is a no-op. A class above default only
+/// takes effect in a process with an application task role, so the first
+/// such request gives the process one ([`ensure_application_task_role`]),
+/// unless [`keep_launched_task_role`] or `FT_KEEP_TASK_ROLE=1` in the
+/// environment said not to (an A/B of ft-yccm0.6 in one build; see the
+/// module docs).
 pub fn set_current_thread_qos(qos: ThreadQos) -> std::io::Result<bool> {
+    if qos.base_priority() > ThreadQos::Default.base_priority() {
+        ensure_task_role_once();
+    }
     imp::set_current_thread_qos(qos)
 }
 
-/// The calling thread's QoS class. `None` on platforms without QoS classes,
-/// or when the class is unspecified or unknown to this build.
+fn ensure_task_role_once() {
+    use std::sync::atomic::Ordering;
+
+    static KEEP_FROM_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if KEEP_LAUNCHED_TASK_ROLE.load(Ordering::Relaxed)
+        || TASK_ROLE_ENSURED.load(Ordering::Acquire)
+        || *KEEP_FROM_ENV
+            .get_or_init(|| std::env::var_os("FT_KEEP_TASK_ROLE").is_some_and(|value| value == "1"))
+    {
+        return;
+    }
+    match ensure_application_task_role() {
+        Ok(_) => TASK_ROLE_ENSURED.store(true, Ordering::Release),
+        Err(err) => log::warn!(
+            "no application task role ({err}): QoS classes above default run at the default \
+             priority"
+        ),
+    }
+}
+
+/// From now on, [`set_current_thread_qos`] leaves the process's task role as
+/// it was launched, so classes above default may run at the default
+/// priority. For an A/B of ft-yccm0.6 in one build.
+pub fn keep_launched_task_role() {
+    KEEP_LAUNCHED_TASK_ROLE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The calling thread's QoS class, as requested. `None` on platforms without
+/// QoS classes, or when the class is unspecified or unknown to this build.
 pub fn current_thread_qos() -> Option<ThreadQos> {
     imp::current_thread_qos()
+}
+
+/// The calling thread's base scheduling priority, which is what its QoS
+/// class actually gives it (compare [`ThreadQos::base_priority`]). `None` off
+/// macOS, or when the kernel does not report it.
+pub fn current_thread_base_priority() -> Option<i32> {
+    imp::current_thread_base_priority()
+}
+
+/// Gives the process an application task role when it has none, so the QoS
+/// classes its threads ask for take effect (ft-yccm0.6). A role macOS
+/// already gave the process (as it does an app it launched) is left alone;
+/// none at all becomes `TASK_DEFAULT_APPLICATION`, "may render UI, focus
+/// unknown". Call it early in a process that shows a window, before it
+/// starts threads that ask for user-initiated or user-interactive QoS.
+pub fn ensure_application_task_role() -> std::io::Result<ApplicationTaskRole> {
+    imp::ensure_application_task_role()
 }
 
 #[cfg(target_os = "macos")]
@@ -145,6 +268,104 @@ mod imp {
             None
         }
     }
+
+    // In libSystem. libc does not declare the task_policy calls
+    // (mach/task_policy.h), and deprecates its own mach_task_self_.
+    extern "C" {
+        static mach_task_self_: libc::mach_port_t;
+        fn task_policy_get(
+            task: libc::mach_port_t,
+            flavor: libc::c_uint,
+            policy_info: *mut libc::c_int,
+            policy_info_count: *mut libc::c_uint,
+            get_default: *mut libc::c_int,
+        ) -> libc::kern_return_t;
+        fn task_policy_set(
+            task: libc::mach_port_t,
+            flavor: libc::c_uint,
+            policy_info: *mut libc::c_int,
+            policy_info_count: libc::c_uint,
+        ) -> libc::kern_return_t;
+    }
+
+    const TASK_CATEGORY_POLICY: libc::c_uint = 1;
+    const TASK_UNSPECIFIED: libc::c_int = 0;
+    pub(super) const TASK_DEFAULT_APPLICATION: libc::c_int = 7;
+    // sys/proc_info.h: the thread named by its 64-bit id.
+    const PROC_PIDTHREADID64INFO: libc::c_int = 15;
+
+    fn task_self() -> libc::mach_port_t {
+        // SAFETY: UNSAFE-CONTRACT 4. Read by value; set before main and
+        // never changed.
+        unsafe { mach_task_self_ }
+    }
+
+    fn kern_error(call: &str, rc: libc::kern_return_t) -> std::io::Error {
+        std::io::Error::other(format!("{call} failed: kern_return_t {rc}"))
+    }
+
+    pub(super) fn current_task_role() -> std::io::Result<libc::c_int> {
+        let mut role: libc::c_int = TASK_UNSPECIFIED;
+        let mut count: libc::c_uint = 1;
+        let mut get_default: libc::c_int = 0;
+        // SAFETY: UNSAFE-CONTRACT 5. The caller's own task; every pointer is
+        // to a live local of the size the call writes.
+        let rc = unsafe {
+            task_policy_get(
+                task_self(),
+                TASK_CATEGORY_POLICY,
+                &mut role,
+                &mut count,
+                &mut get_default,
+            )
+        };
+        if rc == 0 {
+            Ok(role)
+        } else {
+            Err(kern_error("task_policy_get", rc))
+        }
+    }
+
+    pub(super) fn ensure_application_task_role() -> std::io::Result<super::ApplicationTaskRole> {
+        let role = current_task_role()?;
+        if role != TASK_UNSPECIFIED {
+            return Ok(super::ApplicationTaskRole::AlreadyAssigned(role));
+        }
+        let mut role = TASK_DEFAULT_APPLICATION;
+        // SAFETY: UNSAFE-CONTRACT 6. Sets only the caller's own role, to one
+        // an unprivileged task may give itself.
+        let rc = unsafe { task_policy_set(task_self(), TASK_CATEGORY_POLICY, &mut role, 1) };
+        if rc == 0 {
+            Ok(super::ApplicationTaskRole::Assigned)
+        } else {
+            Err(kern_error("task_policy_set", rc))
+        }
+    }
+
+    pub(super) fn current_thread_base_priority() -> Option<i32> {
+        let mut id: u64 = 0;
+        // SAFETY: UNSAFE-CONTRACT 7. The calling thread; `id` is a live local.
+        let rc = unsafe { libc::pthread_threadid_np(libc::pthread_self(), &mut id) };
+        if rc != 0 {
+            return None;
+        }
+        // SAFETY: UNSAFE-CONTRACT 7. Plain integers and a c_char array: a
+        // zeroed proc_threadinfo is a valid value.
+        let mut info: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
+        let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_threadinfo>()).ok()?;
+        // SAFETY: UNSAFE-CONTRACT 7. `info` is a live local of exactly `size`
+        // bytes.
+        let filled = unsafe {
+            libc::proc_pidinfo(
+                libc::getpid(),
+                PROC_PIDTHREADID64INFO,
+                id,
+                std::ptr::addr_of_mut!(info).cast::<libc::c_void>(),
+                size,
+            )
+        };
+        (filled == size).then_some(info.pth_priority)
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -157,6 +378,14 @@ mod imp {
 
     pub(super) fn current_thread_qos() -> Option<ThreadQos> {
         None
+    }
+
+    pub(super) fn current_thread_base_priority() -> Option<i32> {
+        None
+    }
+
+    pub(super) fn ensure_application_task_role() -> std::io::Result<super::ApplicationTaskRole> {
+        Ok(super::ApplicationTaskRole::Unsupported)
     }
 }
 
@@ -201,15 +430,107 @@ mod tests {
         }
     }
 
+    /// ft-yccm0.6: a test binary, like a GUI a harness starts, is launched
+    /// from a shell and has no application task role, so macOS runs
+    /// user-initiated and user-interactive threads at the default priority.
+    /// Once the process has a role, every class runs at its own base
+    /// priority; a second call leaves the role alone.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn with_an_application_role_each_class_runs_at_its_own_priority() {
+        let first = ensure_application_task_role().expect("ensure the role");
+        assert!(
+            matches!(
+                first,
+                ApplicationTaskRole::Assigned | ApplicationTaskRole::AlreadyAssigned(_)
+            ),
+            "{first:?}"
+        );
+        assert_eq!(
+            ensure_application_task_role().expect("ensure the role again"),
+            ApplicationTaskRole::AlreadyAssigned(imp::current_task_role().expect("read the role"))
+        );
+        assert_ne!(imp::current_task_role().expect("read the role"), 0);
+        for qos in ThreadQos::ALL {
+            assert_eq!(
+                base_priority_after_asking_for(qos),
+                Some(qos.base_priority()),
+                "{qos:?}"
+            );
+        }
+    }
+
+    /// The base priority a fresh thread runs at once it asked for `qos`,
+    /// read before anything waits on it: a thread blocked joining it would
+    /// lend it its own priority (a turnstile push), so a utility or
+    /// background thread joined from a default thread reads 31.
+    #[cfg(target_os = "macos")]
+    fn base_priority_after_asking_for(qos: ThreadQos) -> Option<i32> {
+        let (report, observed) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            set_current_thread_qos(qos).expect("set QoS");
+            report
+                .send(current_thread_base_priority())
+                .expect("report the priority");
+        });
+        let observed = observed.recv().expect("the QoS thread reports");
+        thread.join().expect("QoS thread");
+        observed
+    }
+
+    /// ft-yccm0.6: in a process nothing gave a role (this test binary, rerun
+    /// on this one test, since the role is process-wide), a thread's first
+    /// request above default gives the process its role, so the class takes
+    /// effect.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_first_request_above_default_takes_effect_in_a_fresh_process() {
+        const NAME: &str =
+            "thread_qos::tests::a_first_request_above_default_takes_effect_in_a_fresh_process";
+        if std::env::var_os("PROCINFO_QOS_FRESH_PROCESS").is_some() {
+            assert_eq!(imp::current_task_role().expect("read the role"), 0);
+            assert_eq!(
+                base_priority_after_asking_for(ThreadQos::UserInitiated),
+                Some(ThreadQos::UserInitiated.base_priority())
+            );
+            assert_eq!(
+                imp::current_task_role().expect("read the role"),
+                imp::TASK_DEFAULT_APPLICATION
+            );
+            return;
+        }
+        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", NAME, "--test-threads", "1"])
+            .env("PROCINFO_QOS_FRESH_PROCESS", "1")
+            .env_remove("FT_KEEP_TASK_ROLE")
+            .output()
+            .expect("run the test in a fresh process");
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        assert!(
+            child.status.success() && stdout.contains("1 passed"),
+            "fresh process: {}\n{stdout}\n{}",
+            child.status,
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
+
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn the_helper_is_a_no_op_off_macos() {
         let observed = std::thread::spawn(|| {
             let applied = set_current_thread_qos(ThreadQos::UserInitiated).expect("no-op");
-            (applied, current_thread_qos())
+            (
+                applied,
+                current_thread_qos(),
+                current_thread_base_priority(),
+            )
         })
         .join()
         .expect("QoS thread");
-        assert_eq!(observed, (false, None));
+        assert_eq!(observed, (false, None, None));
+        assert_eq!(
+            ensure_application_task_role().expect("no-op"),
+            ApplicationTaskRole::Unsupported
+        );
     }
 }

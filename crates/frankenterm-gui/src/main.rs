@@ -3889,6 +3889,36 @@ fn log_renderer_rollout_env_overrides() {
     }
 }
 
+/// ft-yccm0.6: a GUI started from a shell, tmux or a harness has no
+/// application task role, and macOS then runs the threads that ask for
+/// user-initiated or user-interactive QoS (pane gather and parse, the render
+/// thread) at the default priority, level with every busy thread on a loaded
+/// host. Give it the role macOS keeps for "may render UI" before those
+/// threads start (procinfo's QoS helper would also give it on the first
+/// such request). A GUI launched as an app keeps the role macOS gave it.
+/// `FT_KEEP_TASK_ROLE=1` keeps the role it was launched with, for an A/B of
+/// this in one build.
+fn give_the_process_an_application_task_role() {
+    if std::env::var_os("FT_KEEP_TASK_ROLE").is_some_and(|value| value == "1") {
+        procinfo::keep_launched_task_role();
+        log::debug!("FT_KEEP_TASK_ROLE=1: task role left as launched");
+        return;
+    }
+    match procinfo::ensure_application_task_role() {
+        Ok(procinfo::ApplicationTaskRole::Assigned) => {
+            log::debug!("task role: none, now TASK_DEFAULT_APPLICATION; thread QoS classes apply")
+        }
+        Ok(procinfo::ApplicationTaskRole::AlreadyAssigned(role)) => {
+            log::debug!("task role {role} kept")
+        }
+        Ok(procinfo::ApplicationTaskRole::Unsupported) => {}
+        Err(err) => log::warn!(
+            "no application task role ({err}): threads asking for QoS above default run at the \
+             default priority"
+        ),
+    }
+}
+
 fn maybe_show_configuration_error_window() {
     let warnings = config::configuration_warnings_and_errors();
     if !warnings.is_empty() {
@@ -5697,6 +5727,7 @@ fn run() -> anyhow::Result<()> {
     // Inline bootstrap (env_bootstrap has too many Lua deps).
     // Sets version info, executable env vars, locale, cleans env.
     frankenterm_bootstrap();
+    give_the_process_an_application_task_role();
     register_gui_lua_modules();
 
     stats::Stats::init()?;

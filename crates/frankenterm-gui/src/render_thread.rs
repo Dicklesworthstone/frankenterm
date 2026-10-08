@@ -831,6 +831,8 @@ mod tests {
         reconfigured: Vec<SurfaceState>,
         torn: usize,
         qos: Vec<Option<ThreadQos>>,
+        /// Each frame's effective base priority (ft-yccm0.6).
+        base_priority: Vec<Option<i32>>,
         dropped_on: Option<std::thread::ThreadId>,
     }
 
@@ -858,6 +860,9 @@ mod tests {
                 .frames
                 .push((self.drawable, surface.state.geometry()));
             record.qos.push(procinfo::current_thread_qos());
+            record
+                .base_priority
+                .push(procinfo::current_thread_base_priority());
             FrameReport {
                 presented: true,
                 redraw_at: None,
@@ -1058,19 +1063,35 @@ mod tests {
         ));
     }
 
+    /// The class follows focus, and it is the priority the thread actually
+    /// runs at, not only the class it asked for: in a process without an
+    /// application task role (a test binary, a GUI started from a shell)
+    /// macOS would run both at the default 31 (ft-yccm0.6).
     #[test]
     fn the_thread_qos_follows_focus() {
         let (thread, record) =
             spawn_recording(correlated(0), Duration::from_millis(1), Duration::ZERO);
-        let qos_of_last_frame = || record.lock().unwrap().qos.last().copied().flatten();
-        let expect = |qos: ThreadQos| cfg!(target_os = "macos").then_some(qos);
+        let last_frame = || {
+            let record = record.lock().unwrap();
+            (
+                record.qos.last().copied().flatten(),
+                record.base_priority.last().copied().flatten(),
+            )
+        };
+        let expect = |qos: ThreadQos| {
+            if cfg!(target_os = "macos") {
+                (Some(qos), Some(qos.base_priority()))
+            } else {
+                (None, None)
+            }
+        };
         assert!(correlated(0).focused);
-        assert!(eventually(|| qos_of_last_frame() == expect(FOCUSED_QOS)));
+        assert!(eventually(|| last_frame() == expect(FOCUSED_QOS)));
         thread.post_surface(correlated(1));
         assert!(!correlated(1).focused);
-        assert!(eventually(|| qos_of_last_frame() == expect(UNFOCUSED_QOS)));
+        assert!(eventually(|| last_frame() == expect(UNFOCUSED_QOS)));
         thread.post_surface(correlated(2));
-        assert!(eventually(|| qos_of_last_frame() == expect(FOCUSED_QOS)));
+        assert!(eventually(|| last_frame() == expect(FOCUSED_QOS)));
     }
 
     #[test]
