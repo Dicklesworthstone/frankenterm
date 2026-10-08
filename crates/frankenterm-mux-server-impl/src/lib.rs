@@ -162,6 +162,18 @@ std::thread_local! {
     /// (ft-yccm0.2.1.5).
     static LIVE_SCROLLBACK_MANIFEST_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_KEYRING_LOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Record bytes this thread appended to a ledger, bytes it hashed
+    /// (chain links and digests), and record bytes it read back from a
+    /// ledger (ft-y0gy9).
+    static LIVE_SCROLLBACK_RECORD_BYTES_APPENDED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static LIVE_SCROLLBACK_BYTES_HASHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static LIVE_SCROLLBACK_RECORD_BYTES_READ_BACK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Add `bytes` to one of this thread's byte counters (ft-y0gy9).
+#[cfg(test)]
+fn count_test_bytes(counter: &'static std::thread::LocalKey<std::cell::Cell<u64>>, bytes: usize) {
+    counter.with(|count| count.set(count.get().saturating_add(bytes as u64)));
 }
 
 fn configured_ssh_domains(config: &ConfigHandle) -> Vec<config::SshDomain> {
@@ -4604,6 +4616,8 @@ fn live_scrollback_incremental_chain_next(
 ) -> anyhow::Result<[u8; 32]> {
     #[cfg(test)]
     LIVE_SCROLLBACK_CHAIN_LINK_HASHES.with(|count| count.set(count.get() + 1));
+    #[cfg(test)]
+    count_test_bytes(&LIVE_SCROLLBACK_BYTES_HASHED, record.len());
     let mut hasher = Sha256::new();
     hasher.update(LIVE_SCROLLBACK_INCREMENTAL_CHAIN_DOMAIN);
     hasher.update(predecessor);
@@ -4625,9 +4639,12 @@ fn live_scrollback_authority_record_at(
 ) -> anyhow::Result<String> {
     #[cfg(test)]
     LIVE_SCROLLBACK_AUTHORITY_RECORD_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
-    store
+    let record = store
         .line_at(ledger_pane_id, sequence)?
-        .ok_or_else(|| anyhow::anyhow!("authenticated ledger is missing sequence {sequence}"))
+        .ok_or_else(|| anyhow::anyhow!("authenticated ledger is missing sequence {sequence}"))?;
+    #[cfg(test)]
+    count_test_bytes(&LIVE_SCROLLBACK_RECORD_BYTES_READ_BACK, record.len());
+    Ok(record)
 }
 
 /// Read-ahead belongs only to one append projection while its store guard is
@@ -4702,6 +4719,11 @@ impl<'a> LedgerEvictionReader<'a> {
                             |bytes, record| bytes.and_then(|bytes| bytes.checked_add(record.capacity())),
                         );
                         if retained_capacity.is_some_and(|bytes| bytes <= Self::BYTE_LIMIT) {
+                            #[cfg(test)]
+                            count_test_bytes(
+                                &LIVE_SCROLLBACK_RECORD_BYTES_READ_BACK,
+                                records.iter().map(String::len).sum(),
+                            );
                             self.records = records.into_iter();
                             break;
                         }
@@ -5107,6 +5129,8 @@ impl LiveScrollbackLogicalLedgerHasher {
 }
 
 fn update_scrollback_digest_bytes(hasher: &mut Sha256, bytes: &[u8]) -> anyhow::Result<()> {
+    #[cfg(test)]
+    count_test_bytes(&LIVE_SCROLLBACK_BYTES_HASHED, bytes.len());
     hasher.update(
         u64::try_from(bytes.len())
             .map_err(|_| anyhow::anyhow!("logical ledger field length exceeds u64"))?
@@ -6938,12 +6962,18 @@ impl LiveScrollbackSpillSink {
             .ok_or_else(|| anyhow::anyhow!("append WAL read byte budget overflows"))?;
         #[cfg(test)]
         LIVE_SCROLLBACK_AUTHORITY_BATCH_READS.with(|reads| reads.set(reads.get() + 1));
-        Ok(store.lines_range(
+        let records = store.lines_range(
             wal.ledger_pane_id,
             wal.appended_sequence..end,
             count,
             max_stored_bytes,
-        )?)
+        )?;
+        #[cfg(test)]
+        count_test_bytes(
+            &LIVE_SCROLLBACK_RECORD_BYTES_READ_BACK,
+            records.iter().map(String::len).sum(),
+        );
+        Ok(records)
     }
 
     fn incremental_append_wal_target_authority(
@@ -11423,6 +11453,107 @@ pub mod scrollback_record_bench {
                 .sum()
         }
 
+        /// The exact plaintext of every row through the writer's path, with
+        /// `exact_varbincode` (`direct`) or `varbincode` forced (ft-y0gy9).
+        /// Returns its total bytes.
+        #[must_use]
+        pub fn serialize_through(&self, rows: &Rows, direct: bool, out: &mut Vec<u8>) -> usize {
+            super::SCROLLBACK_SERIALIZER_OVERRIDE.with(|forced| forced.set(Some(direct)));
+            let bytes = rows
+                .0
+                .iter()
+                .map(|line| {
+                    assert!(
+                        super::serialize_exact_semantic_scrollback_line_into(line, out),
+                        "bench row serializes"
+                    );
+                    out.len()
+                })
+                .sum();
+            super::SCROLLBACK_SERIALIZER_OVERRIDE.with(|forced| forced.set(None));
+            bytes
+        }
+
+        /// Each row's exact plaintext, as the writer compresses it.
+        #[must_use]
+        pub fn plaintexts(&self, rows: &Rows) -> Vec<Vec<u8>> {
+            rows.0
+                .iter()
+                .map(|line| {
+                    super::serialize_exact_semantic_scrollback_line(line)
+                        .expect("bench row serializes")
+                        .to_vec()
+                })
+                .collect()
+        }
+
+        /// Compress each plaintext as its own frame at zstd `level`, with
+        /// the writer's window and its rule (a row under 256 bytes, or one
+        /// that would not shrink, stays plain). Returns the payload bytes
+        /// the rows would seal (ft-y0gy9).
+        #[must_use]
+        pub fn compress_rows_at(&self, plaintexts: &[Vec<u8>], level: i32) -> usize {
+            let mut compressor = zstd::bulk::Compressor::new(level).expect("bench zstd level");
+            compressor
+                .window_log(super::EXACT_SCROLLBACK_ZSTD_WINDOW_LOG)
+                .expect("bench zstd window");
+            let mut payload = Vec::new();
+            plaintexts
+                .iter()
+                .map(|plaintext| {
+                    if plaintext.len() < 256 {
+                        return plaintext.len();
+                    }
+                    payload.resize(plaintext.len(), 0);
+                    compressor
+                        .compress_to_buffer(plaintext, &mut payload[..])
+                        .ok()
+                        .map(|bytes| bytes + super::EXACT_SCROLLBACK_ZSTD_HEADER_BYTES)
+                        .filter(|bytes| *bytes < plaintext.len())
+                        .unwrap_or(plaintext.len())
+                })
+                .sum()
+        }
+
+        /// Compress the plaintexts as one frame per segment of at most
+        /// `segment_rows` rows and 128 KiB, at zstd `level`. Measurement for
+        /// the owner's format decision only: the store compresses rows
+        /// alone, and never across rows (ft-y0gy9). Returns the total bytes.
+        #[must_use]
+        pub fn compress_segments_at(
+            &self,
+            plaintexts: &[Vec<u8>],
+            segment_rows: usize,
+            level: i32,
+        ) -> usize {
+            let mut compressor = zstd::bulk::Compressor::new(level).expect("bench zstd level");
+            let mut segment = Vec::new();
+            let mut total = 0;
+            let mut rows = 0;
+            let mut flush = |segment: &mut Vec<u8>| {
+                if !segment.is_empty() {
+                    total += compressor
+                        .compress(segment)
+                        .expect("bench segment compresses")
+                        .len();
+                    segment.clear();
+                }
+            };
+            for plaintext in plaintexts {
+                if rows == segment_rows
+                    || segment.len() + plaintext.len()
+                        > super::LIVE_SCROLLBACK_SEGMENT_TARGET_PLAINTEXT_BYTES
+                {
+                    flush(&mut segment);
+                    rows = 0;
+                }
+                segment.extend_from_slice(plaintext);
+                rows += 1;
+            }
+            flush(&mut segment);
+            total
+        }
+
         /// Plaintext then compression (the input sealing gets); returns the
         /// total bytes sealing would take: (plaintext, compressed-or-plain).
         #[must_use]
@@ -12169,6 +12300,37 @@ pub mod scrollback_record_bench {
     }
 }
 
+/// The zstd level each exact row's frame is written at when no override
+/// names one (ft-y0gy9). Level -1 leaves literals raw. On T0 rows (bench
+/// scrollback_writer, 4096 rows) it compressed in 7.5 ms where level 1
+/// took 24.0 ms, and its payloads were 0.933 of the plaintext where level
+/// 1's were 0.777. Rows under 256 bytes are never compressed.
+/// FT_SCROLLBACK_ROW_ZSTD_LEVEL=1 restores level 1.
+const EXACT_SCROLLBACK_ROW_ZSTD_LEVEL: i32 = -1;
+
+/// The zstd level of each exact row's own frame: FT_SCROLLBACK_ROW_ZSTD_LEVEL
+/// when it names one in -7..=3, otherwise `EXACT_SCROLLBACK_ROW_ZSTD_LEVEL`,
+/// read once per process (ft-y0gy9). Every level writes one frame per row
+/// that the same bounded decoder reads; levels below 1 store literals raw
+/// instead of Huffman-coding them, which is most of level 1's time on T0
+/// rows.
+fn exact_scrollback_row_zstd_level() -> i32 {
+    static LEVEL: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        parse_exact_scrollback_row_zstd_level(
+            std::env::var_os("FT_SCROLLBACK_ROW_ZSTD_LEVEL").as_deref(),
+        )
+    })
+}
+
+fn parse_exact_scrollback_row_zstd_level(value: Option<&std::ffi::OsStr>) -> i32 {
+    value
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .filter(|level| (-7..=3).contains(level))
+        .unwrap_or(EXACT_SCROLLBACK_ROW_ZSTD_LEVEL)
+}
+
 /// Compress only the exact semantic bytes, before the existing AEAD boundary.
 /// Each frame is independent; the thread-local context only reuses workspace,
 /// never a dictionary from another row. Failed or unhelpful compression leaves
@@ -12194,7 +12356,8 @@ fn compress_exact_scrollback_plaintext_into(plaintext: &[u8], payload: &mut Vec<
         .try_with(|slot| {
             let mut slot = slot.try_borrow_mut().ok()?;
             if slot.is_none() {
-                let mut compressor = zstd::bulk::Compressor::new(1).ok()?;
+                let mut compressor =
+                    zstd::bulk::Compressor::new(exact_scrollback_row_zstd_level()).ok()?;
                 compressor
                     .window_log(EXACT_SCROLLBACK_ZSTD_WINDOW_LOG)
                     .ok()?;
@@ -12417,13 +12580,23 @@ fn serialize_semantic_scrollback_payload_into<T: Serialize>(
     out: &mut Vec<u8>,
 ) -> bool {
     let start = out.len();
-    let mut plaintext =
-        BoundedScrollbackPlaintext::new(out, LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE);
-    let serialization = {
-        let mut serializer = varbincode::Serializer::new(&mut plaintext);
-        semantic.serialize(&mut serializer)
+    let serialized = if direct_scrollback_serialization_enabled() {
+        exact_varbincode::serialize_into(
+            semantic,
+            out,
+            LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+        )
+        .is_ok()
+    } else {
+        let mut plaintext =
+            BoundedScrollbackPlaintext::new(out, LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE);
+        let serialization = {
+            let mut serializer = varbincode::Serializer::new(&mut plaintext);
+            semantic.serialize(&mut serializer)
+        };
+        !plaintext.exceeded && serialization.is_ok()
     };
-    if plaintext.exceeded || serialization.is_err() || plaintext.bytes.len() == start {
+    if !serialized || out.len() == start {
         wipe_scrollback_plaintext(out);
         return false;
     }
@@ -12553,6 +12726,431 @@ impl Write for BoundedScrollbackPlaintext<'_> {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// Whether a durability switch read from the environment is on: anything
+/// but exactly `0` (ft-y0gy9). The switches exist for native A/B arms.
+fn durability_switch_on(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|value| value != "0")
+}
+
+std::thread_local! {
+    /// Forces this thread's exact rows through `exact_varbincode` (true) or
+    /// `varbincode` (false), for a same-run A/B in tests and benches.
+    static SCROLLBACK_SERIALIZER_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether exact rows serialize through `exact_varbincode`: on unless
+/// FT_SCROLLBACK_DIRECT_SERIALIZE=0, read once per process. Both encoders
+/// write the same bytes; only the writer's CPU differs (ft-y0gy9).
+fn direct_scrollback_serialization_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    SCROLLBACK_SERIALIZER_OVERRIDE
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(|| {
+            *ENABLED.get_or_init(|| {
+                durability_switch_on(std::env::var_os("FT_SCROLLBACK_DIRECT_SERIALIZE").as_deref())
+            })
+        })
+}
+
+/// varbincode's encoding, which every exact row's plaintext is decoded with,
+/// written straight into a bounded buffer (ft-y0gy9). `varbincode::Serializer`
+/// writes through `&mut dyn Write`: a virtual call per field and per byte of
+/// every varint, which was most of the durability writer's serialization
+/// time. This writes the same bytes with static dispatch:
+/// - integers wider than a byte as LEB128, signed ones in its signed form;
+/// - `u8` and `i8` as one byte, floats little-endian, `bool` as 0 or 1;
+/// - strings and byte slices as a `u64` length, then the bytes;
+/// - sequences and maps as a `u64` length, which they must have;
+/// - `None` as a 0 byte, `Some` as a 1 byte and the value;
+/// - variants as their `u32` index; structs and tuples with no framing.
+///
+/// Tests compare it byte for byte with varbincode.
+mod exact_varbincode {
+    use serde::ser::{self, Serialize};
+
+    /// Why serialization stopped. The bytes written before it are the
+    /// caller's to wipe.
+    #[derive(Debug)]
+    pub enum Error {
+        /// The output would pass its bound.
+        Exceeded,
+        /// The output could not grow.
+        Allocation,
+        /// A sequence or map without a length, which varbincode refuses too.
+        SequenceMustHaveLength,
+        /// A value's own serialization failed.
+        Custom(String),
+    }
+
+    impl std::fmt::Display for Error {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Exceeded => formatter.write_str("serialization exceeds its byte bound"),
+                Self::Allocation => formatter.write_str("serialization output cannot grow"),
+                Self::SequenceMustHaveLength => {
+                    formatter.write_str("a sequence or map must have a length")
+                }
+                Self::Custom(message) => formatter.write_str(message),
+            }
+        }
+    }
+
+    impl std::error::Error for Error {}
+
+    impl ser::Error for Error {
+        fn custom<T: std::fmt::Display>(message: T) -> Self {
+            Self::Custom(message.to_string())
+        }
+    }
+
+    /// Appends to `out`, refusing to grow it past `max_bytes` in all.
+    pub struct Serializer<'a> {
+        out: &'a mut Vec<u8>,
+        max_bytes: usize,
+    }
+
+    /// Append `value`'s varbincode encoding to `out`, whose length must stay
+    /// at most `max_bytes`. On an error `out` may hold a partial encoding.
+    pub fn serialize_into<T: Serialize + ?Sized>(
+        value: &T,
+        out: &mut Vec<u8>,
+        max_bytes: usize,
+    ) -> Result<(), Error> {
+        value.serialize(&mut Serializer { out, max_bytes })
+    }
+
+    impl Serializer<'_> {
+        #[inline]
+        fn push(&mut self, bytes: &[u8]) -> Result<(), Error> {
+            let next_len = self
+                .out
+                .len()
+                .checked_add(bytes.len())
+                .ok_or(Error::Exceeded)?;
+            if next_len > self.max_bytes {
+                return Err(Error::Exceeded);
+            }
+            self.out
+                .try_reserve(bytes.len())
+                .map_err(|_| Error::Allocation)?;
+            self.out.extend_from_slice(bytes);
+            Ok(())
+        }
+
+        /// leb128's unsigned form: seven bits a byte, low first, the high
+        /// bit set on every byte but the last.
+        #[inline]
+        fn unsigned(&mut self, mut value: u64) -> Result<(), Error> {
+            let mut encoded = [0_u8; 10];
+            let mut len = 0;
+            loop {
+                let mut byte = (value & 0x7f) as u8;
+                value >>= 7;
+                if value != 0 {
+                    byte |= 0x80;
+                }
+                encoded[len] = byte;
+                len += 1;
+                if value == 0 {
+                    return self.push(&encoded[..len]);
+                }
+            }
+        }
+
+        /// leb128's signed form: it ends once the bits left are all copies
+        /// of the sign bit.
+        #[inline]
+        fn signed(&mut self, mut value: i64) -> Result<(), Error> {
+            let mut encoded = [0_u8; 10];
+            let mut len = 0;
+            loop {
+                let mut byte = value as u8;
+                value >>= 6;
+                let done = value == 0 || value == -1;
+                if done {
+                    byte &= 0x7f;
+                } else {
+                    value >>= 1;
+                    byte |= 0x80;
+                }
+                encoded[len] = byte;
+                len += 1;
+                if done {
+                    return self.push(&encoded[..len]);
+                }
+            }
+        }
+    }
+
+    impl ser::Serializer for &mut Serializer<'_> {
+        type Ok = ();
+        type Error = Error;
+        type SerializeSeq = Self;
+        type SerializeTuple = Self;
+        type SerializeTupleStruct = Self;
+        type SerializeTupleVariant = Self;
+        type SerializeMap = Self;
+        type SerializeStruct = Self;
+        type SerializeStructVariant = Self;
+
+        fn serialize_bool(self, value: bool) -> Result<(), Error> {
+            self.unsigned(u64::from(value))
+        }
+
+        fn serialize_i8(self, value: i8) -> Result<(), Error> {
+            self.push(&value.to_le_bytes())
+        }
+
+        fn serialize_i16(self, value: i16) -> Result<(), Error> {
+            self.signed(i64::from(value))
+        }
+
+        fn serialize_i32(self, value: i32) -> Result<(), Error> {
+            self.signed(i64::from(value))
+        }
+
+        fn serialize_i64(self, value: i64) -> Result<(), Error> {
+            self.signed(value)
+        }
+
+        fn serialize_u8(self, value: u8) -> Result<(), Error> {
+            self.push(&[value])
+        }
+
+        fn serialize_u16(self, value: u16) -> Result<(), Error> {
+            self.unsigned(u64::from(value))
+        }
+
+        fn serialize_u32(self, value: u32) -> Result<(), Error> {
+            self.unsigned(u64::from(value))
+        }
+
+        fn serialize_u64(self, value: u64) -> Result<(), Error> {
+            self.unsigned(value)
+        }
+
+        fn serialize_f32(self, value: f32) -> Result<(), Error> {
+            self.push(&value.to_le_bytes())
+        }
+
+        fn serialize_f64(self, value: f64) -> Result<(), Error> {
+            self.push(&value.to_le_bytes())
+        }
+
+        fn serialize_char(self, value: char) -> Result<(), Error> {
+            self.unsigned(u64::from(u32::from(value)))
+        }
+
+        fn serialize_str(self, value: &str) -> Result<(), Error> {
+            self.serialize_bytes(value.as_bytes())
+        }
+
+        fn serialize_bytes(self, value: &[u8]) -> Result<(), Error> {
+            self.unsigned(value.len() as u64)?;
+            self.push(value)
+        }
+
+        fn serialize_none(self) -> Result<(), Error> {
+            self.push(&[0])
+        }
+
+        fn serialize_some<T: Serialize + ?Sized>(self, value: &T) -> Result<(), Error> {
+            self.push(&[1])?;
+            value.serialize(self)
+        }
+
+        fn serialize_unit(self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn serialize_unit_struct(self, _name: &'static str) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn serialize_unit_variant(
+            self,
+            _name: &'static str,
+            variant_index: u32,
+            _variant: &'static str,
+        ) -> Result<(), Error> {
+            self.unsigned(u64::from(variant_index))
+        }
+
+        fn serialize_newtype_struct<T: Serialize + ?Sized>(
+            self,
+            _name: &'static str,
+            value: &T,
+        ) -> Result<(), Error> {
+            value.serialize(self)
+        }
+
+        fn serialize_newtype_variant<T: Serialize + ?Sized>(
+            self,
+            _name: &'static str,
+            variant_index: u32,
+            _variant: &'static str,
+            value: &T,
+        ) -> Result<(), Error> {
+            self.unsigned(u64::from(variant_index))?;
+            value.serialize(self)
+        }
+
+        fn serialize_seq(self, len: Option<usize>) -> Result<Self, Error> {
+            let len = len.ok_or(Error::SequenceMustHaveLength)?;
+            self.unsigned(len as u64)?;
+            Ok(self)
+        }
+
+        fn serialize_tuple(self, _len: usize) -> Result<Self, Error> {
+            Ok(self)
+        }
+
+        fn serialize_tuple_struct(self, _name: &'static str, _len: usize) -> Result<Self, Error> {
+            Ok(self)
+        }
+
+        fn serialize_tuple_variant(
+            self,
+            _name: &'static str,
+            variant_index: u32,
+            _variant: &'static str,
+            _len: usize,
+        ) -> Result<Self, Error> {
+            self.unsigned(u64::from(variant_index))?;
+            Ok(self)
+        }
+
+        fn serialize_map(self, len: Option<usize>) -> Result<Self, Error> {
+            let len = len.ok_or(Error::SequenceMustHaveLength)?;
+            self.unsigned(len as u64)?;
+            Ok(self)
+        }
+
+        fn serialize_struct(self, _name: &'static str, _len: usize) -> Result<Self, Error> {
+            Ok(self)
+        }
+
+        fn serialize_struct_variant(
+            self,
+            _name: &'static str,
+            variant_index: u32,
+            _variant: &'static str,
+            _len: usize,
+        ) -> Result<Self, Error> {
+            self.unsigned(u64::from(variant_index))?;
+            Ok(self)
+        }
+
+        fn is_human_readable(&self) -> bool {
+            false
+        }
+    }
+
+    impl ser::SerializeSeq for &mut Serializer<'_> {
+        type Ok = ();
+        type Error = Error;
+
+        fn serialize_element<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
+            value.serialize(&mut **self)
+        }
+
+        fn end(self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    impl ser::SerializeTuple for &mut Serializer<'_> {
+        type Ok = ();
+        type Error = Error;
+
+        fn serialize_element<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
+            value.serialize(&mut **self)
+        }
+
+        fn end(self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    impl ser::SerializeTupleStruct for &mut Serializer<'_> {
+        type Ok = ();
+        type Error = Error;
+
+        fn serialize_field<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
+            value.serialize(&mut **self)
+        }
+
+        fn end(self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    impl ser::SerializeTupleVariant for &mut Serializer<'_> {
+        type Ok = ();
+        type Error = Error;
+
+        fn serialize_field<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
+            value.serialize(&mut **self)
+        }
+
+        fn end(self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    impl ser::SerializeMap for &mut Serializer<'_> {
+        type Ok = ();
+        type Error = Error;
+
+        fn serialize_key<T: Serialize + ?Sized>(&mut self, key: &T) -> Result<(), Error> {
+            key.serialize(&mut **self)
+        }
+
+        fn serialize_value<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
+            value.serialize(&mut **self)
+        }
+
+        fn end(self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    impl ser::SerializeStruct for &mut Serializer<'_> {
+        type Ok = ();
+        type Error = Error;
+
+        fn serialize_field<T: Serialize + ?Sized>(
+            &mut self,
+            _key: &'static str,
+            value: &T,
+        ) -> Result<(), Error> {
+            value.serialize(&mut **self)
+        }
+
+        fn end(self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    impl ser::SerializeStructVariant for &mut Serializer<'_> {
+        type Ok = ();
+        type Error = Error;
+
+        fn serialize_field<T: Serialize + ?Sized>(
+            &mut self,
+            _key: &'static str,
+            value: &T,
+        ) -> Result<(), Error> {
+            value.serialize(&mut **self)
+        }
+
+        fn end(self) -> Result<(), Error> {
+            Ok(())
+        }
     }
 }
 
@@ -13594,6 +14192,11 @@ impl LiveScrollbackSpillSink {
             let chunk_slices: Vec<&[&str]> = chunk_refs.iter().map(Vec::as_slice).collect();
             let appended_seq = store.append_line_chunks(ledger_pane_id, &chunk_slices)?;
             #[cfg(test)]
+            count_test_bytes(
+                &LIVE_SCROLLBACK_RECORD_BYTES_APPENDED,
+                records.iter().map(String::len).sum(),
+            );
+            #[cfg(test)]
             LIVE_SCROLLBACK_CONTENT_GROUPS.with(|count| count.set(count.get() + 1));
             anyhow::ensure!(
                 appended_seq == desired_seq,
@@ -13691,6 +14294,11 @@ impl LiveScrollbackSpillSink {
                 anyhow::ensure!(
                     u64::try_from(rows.len())? == count,
                     "the ledger is missing rows of its durable tail"
+                );
+                #[cfg(test)]
+                count_test_bytes(
+                    &LIVE_SCROLLBACK_RECORD_BYTES_READ_BACK,
+                    rows.iter().map(String::len).sum(),
                 );
                 rows
             };
@@ -14400,6 +15008,11 @@ impl LiveScrollbackSpillSink {
             );
             let record_refs: Vec<_> = records.iter().map(String::as_str).collect();
             let appended_seq = store.append_lines(ledger_pane_id, &record_refs)?;
+            #[cfg(test)]
+            count_test_bytes(
+                &LIVE_SCROLLBACK_RECORD_BYTES_APPENDED,
+                records.iter().map(String::len).sum(),
+            );
             #[cfg(test)]
             LIVE_SCROLLBACK_CONTENT_GROUPS.with(|count| count.set(count.get() + 1));
             anyhow::ensure!(
@@ -16778,6 +17391,345 @@ mod tests {
              directory scans): {per_window:?}; each window reads and locks at most once, takes \
              at most one lease (two in the first) and scans nothing"
         );
+    }
+
+    /// The exact-row plaintext of `line` through each encoder: (sealable,
+    /// bytes).
+    fn exact_plaintext_through(line: &Line, direct: bool) -> (bool, Vec<u8>) {
+        SCROLLBACK_SERIALIZER_OVERRIDE.with(|forced| forced.set(Some(direct)));
+        let mut plaintext = Vec::new();
+        let sealable = serialize_exact_semantic_scrollback_line_into(line, &mut plaintext);
+        SCROLLBACK_SERIALIZER_OVERRIDE.with(|forced| forced.set(None));
+        (sealable, plaintext)
+    }
+
+    /// ft-y0gy9: `exact_varbincode` writes the bytes varbincode writes: for
+    /// every kind of value serde hands a serializer, at the integer values
+    /// where LEB128 changes length, and for exact rows of every shape the
+    /// store seals, through the production path with each encoder forced.
+    #[test]
+    fn direct_serialization_writes_the_bytes_varbincode_writes() {
+        #[derive(Serialize)]
+        struct UnitStruct;
+        #[derive(Serialize)]
+        struct Newtype(u32);
+        #[derive(Serialize)]
+        struct TupleStruct(i16, char, bool);
+        #[derive(Serialize)]
+        enum Variant {
+            Unit,
+            Newtype(i64),
+            Tuple(u8, i8),
+            Struct { float: f32, double: f64 },
+        }
+        struct Bytes(&'static [u8]);
+        impl Serialize for Bytes {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_bytes(self.0)
+            }
+        }
+        #[derive(Serialize)]
+        struct Every {
+            unit: (),
+            unit_struct: UnitStruct,
+            newtype: Newtype,
+            tuple_struct: TupleStruct,
+            pair: (u16, String),
+            variants: Vec<Variant>,
+            missing: Option<u64>,
+            present: Option<&'static str>,
+            map: std::collections::BTreeMap<u32, Vec<u8>>,
+            bytes: Bytes,
+        }
+        fn direct<T: Serialize>(value: &T) -> Vec<u8> {
+            let mut out = Vec::new();
+            exact_varbincode::serialize_into(value, &mut out, usize::MAX).unwrap();
+            out
+        }
+        fn assert_same<T: Serialize>(value: &T, label: &str) {
+            assert_eq!(
+                direct(value),
+                varbincode::serialize(value).unwrap(),
+                "{label}"
+            );
+        }
+
+        assert_same(
+            &Every {
+                unit: (),
+                unit_struct: UnitStruct,
+                newtype: Newtype(300),
+                tuple_struct: TupleStruct(-300, '\u{1f600}', true),
+                pair: (65_535, "pair \u{1f680}".to_string()),
+                variants: vec![
+                    Variant::Unit,
+                    Variant::Newtype(-1),
+                    Variant::Tuple(255, -128),
+                    Variant::Struct {
+                        float: -0.5,
+                        double: f64::NAN,
+                    },
+                ],
+                missing: None,
+                present: Some("present"),
+                map: [(0, vec![]), (200, vec![1, 2, 3])].into_iter().collect(),
+                bytes: Bytes(b"\x00\xffbytes"),
+            },
+            "every serde kind",
+        );
+        for value in [
+            0,
+            1,
+            63,
+            64,
+            127,
+            128,
+            255,
+            256,
+            16_383,
+            16_384,
+            u64::from(u16::MAX),
+            u64::from(u32::MAX),
+            u64::MAX - 1,
+            u64::MAX,
+        ] {
+            assert_same(&value, "u64");
+            assert_same(&(value as u32), "u32");
+            assert_same(&(value as u16), "u16");
+            assert_same(&(value as u8), "u8");
+        }
+        for value in [
+            0,
+            1,
+            -1,
+            63,
+            -64,
+            64,
+            -65,
+            127,
+            -128,
+            8_191,
+            -8_192,
+            8_192,
+            -8_193,
+            i64::from(i32::MIN),
+            i64::from(i32::MAX),
+            i64::MIN,
+            i64::MAX,
+        ] {
+            assert_same(&value, "i64");
+            assert_same(&(value as i32), "i32");
+            assert_same(&(value as i16), "i16");
+            assert_same(&(value as i8), "i8");
+        }
+
+        let mut rows: Vec<Line> = scrollback_record_bench::Rows::t0_corpus(256, 11)
+            .lines()
+            .to_vec();
+        rows.extend_from_slice(scrollback_record_bench::Rows::printable(8, 9).lines());
+        rows.extend_from_slice(scrollback_record_bench::Rows::printable(8, 91).lines());
+        rows.extend_from_slice(scrollback_record_bench::Rows::emoji_colors(8, 80).lines());
+        rows.extend_from_slice(
+            scrollback_record_bench::Rows::emoji_colors(8, 80)
+                .compressed_for_scrollback()
+                .lines(),
+        );
+        let mut attrs = CellAttributes::blank();
+        attrs.set_italic(true);
+        attrs.set_reverse(true);
+        attrs.set_underline_color(termwiz::color::ColorAttribute::PaletteIndex(9));
+        attrs.set_hyperlink(Some(Arc::new(termwiz::cell::Hyperlink::new_with_id(
+            "https://scrollback.example/direct",
+            "direct-row",
+        ))));
+        let mut linked = Line::from_text("linked \u{1f600} row, then plain text", &attrs, 7, None);
+        linked.set_last_cell_was_wrapped(true, 7);
+        rows.push(linked.clone());
+        linked.compress_for_scrollback();
+        rows.push(linked);
+        assert!(rows.iter().any(Line::has_clustered_storage));
+        assert!(rows.iter().any(|line| !line.has_clustered_storage()));
+        for (index, line) in rows.iter().enumerate() {
+            let label = format!("row {index}");
+            assert_same(line, &label);
+            assert_same(
+                &ExactSemanticScrollbackLineRef {
+                    schema: EXACT_SCROLLBACK_SCHEMA_CLUSTERED,
+                    line,
+                    cell_widths: &[1, 2],
+                },
+                &label,
+            );
+            let direct_row = exact_plaintext_through(line, true);
+            assert!(direct_row.0, "{label} is sealable");
+            assert_eq!(
+                direct_row,
+                exact_plaintext_through(line, false),
+                "{label}: the exact plaintext"
+            );
+        }
+    }
+
+    /// ft-y0gy9: both encoders refuse a row at the same byte bound: an
+    /// encoding of exactly the bound succeeds, one byte more fails.
+    #[test]
+    fn direct_serialization_refuses_at_the_same_byte_bound() {
+        let rows = scrollback_record_bench::Rows::t0_corpus(4, 5);
+        let line = &rows.lines()[0];
+        let encoded = varbincode::serialize(line).unwrap().len();
+        for (bound, fits) in [(encoded, true), (encoded - 1, false), (0, false)] {
+            let mut direct = Vec::new();
+            let direct_fits = exact_varbincode::serialize_into(line, &mut direct, bound).is_ok();
+            let mut via_varbincode = Vec::new();
+            let mut bounded = BoundedScrollbackPlaintext::new(&mut via_varbincode, bound);
+            let serialized = {
+                let mut serializer = varbincode::Serializer::new(&mut bounded);
+                line.serialize(&mut serializer).is_ok()
+            };
+            let varbincode_fits = serialized && !bounded.exceeded;
+            assert_eq!(
+                (direct_fits, varbincode_fits),
+                (fits, fits),
+                "a {encoded}-byte row under a {bound}-byte bound"
+            );
+        }
+    }
+
+    /// ft-y0gy9: what the durability writer does per T0 record byte in
+    /// steady state, with retention evicting and the tail publishing: bytes
+    /// hashed (chain links, WAL and ledger digests) and record bytes read
+    /// back from the ledger, each per record byte appended, and durability
+    /// syncs per window. 8192 T0 rows in 1024-row windows under a 2048-row
+    /// retention, filled first so every measured window evicts, with the tail
+    /// published every second window.
+    #[test]
+    fn t0_steady_state_writer_hashes_and_reads_back_per_appended_byte() {
+        const ROWS: usize = 8192;
+        const WINDOW: usize = 1024;
+        const RETENTION: usize = 2048;
+        const PUBLISH_EVERY: usize = 2;
+        let rows = scrollback_record_bench::Rows::t0_corpus(ROWS, 9);
+        let lines = rows.lines();
+        let dir = tempfile::tempdir().unwrap();
+        let sink = windowed_test_sink(dir.path());
+        assert!(sink.store_scrollback_line(0, &lines[0], RETENTION));
+        let store_window = |start: usize| {
+            let mut row = start;
+            let end = (start + WINDOW).min(ROWS);
+            while row < end {
+                let stored = sink.store_scrollback_lines(row as isize, &lines[row..end], RETENTION);
+                assert!(stored > 0, "window at row {row}");
+                row += stored;
+            }
+            end
+        };
+        let mut row = 1;
+        while row <= RETENTION {
+            row = store_window(row);
+        }
+        sink.flush_scrollback().unwrap();
+        let counts = || {
+            (
+                LIVE_SCROLLBACK_RECORD_BYTES_APPENDED.with(std::cell::Cell::get),
+                LIVE_SCROLLBACK_BYTES_HASHED.with(std::cell::Cell::get),
+                LIVE_SCROLLBACK_RECORD_BYTES_READ_BACK.with(std::cell::Cell::get),
+                frankenterm_core::storage::mmap_store::thread_durability_sync_count(),
+            )
+        };
+        let before = counts();
+        let measured_rows = ROWS - row;
+        let mut windows = 0;
+        while row < ROWS {
+            row = store_window(row);
+            windows += 1;
+            if windows % PUBLISH_EVERY == 0 || row == ROWS {
+                sink.flush_scrollback().unwrap();
+            }
+        }
+        let after = counts();
+        let (appended, hashed, read_back, syncs) = (
+            after.0 - before.0,
+            after.1 - before.1,
+            after.2 - before.2,
+            after.3 - before.3,
+        );
+        let manifest = published_manifest(&sink);
+        assert_eq!(manifest.next_seq, ROWS as u64);
+        assert_eq!(manifest.retained_rows, RETENTION as u64);
+        let per_appended = |bytes: u64| bytes as f64 / appended as f64;
+        eprintln!(
+            "T0 steady state, {windows} windows of {WINDOW} rows, retention {RETENTION}, a \
+             publication every {PUBLISH_EVERY} windows: {appended} record bytes appended \
+             ({:.1} per row); per appended byte {:.2} bytes hashed and {:.2} read back; \
+             {:.1} syncs per window",
+            appended as f64 / measured_rows as f64,
+            per_appended(hashed),
+            per_appended(read_back),
+            syncs as f64 / windows as f64,
+        );
+        // Every appended record is hashed into the chain at least once, and
+        // every evicted one is read back to advance the chain's anchor.
+        assert!(
+            hashed >= appended,
+            "{hashed} bytes hashed for {appended} appended"
+        );
+        assert!(read_back > 0, "evictions read the evicted records back");
+    }
+
+    /// ft-y0gy9: FT_SCROLLBACK_ROW_ZSTD_LEVEL parses as documented, and a
+    /// T0 row's frame written at any level it accepts expands to the row's
+    /// exact plaintext through the store's existing bounded decoder.
+    #[test]
+    fn row_frames_at_every_accepted_zstd_level_expand_through_the_same_decoder() {
+        use std::ffi::OsStr;
+
+        let parse = |value: &str| parse_exact_scrollback_row_zstd_level(Some(OsStr::new(value)));
+        assert_eq!(
+            parse_exact_scrollback_row_zstd_level(None),
+            EXACT_SCROLLBACK_ROW_ZSTD_LEVEL
+        );
+        assert_eq!(parse("-3"), -3);
+        assert_eq!(parse(" 2 "), 2);
+        for refused in ["4", "-8", "fast", ""] {
+            assert_eq!(
+                parse(refused),
+                EXACT_SCROLLBACK_ROW_ZSTD_LEVEL,
+                "{refused:?}"
+            );
+        }
+        let rows = scrollback_record_bench::Rows::t0_corpus(64, 13);
+        for level in -7..=3 {
+            let mut compressor = zstd::bulk::Compressor::new(level).unwrap();
+            compressor
+                .window_log(EXACT_SCROLLBACK_ZSTD_WINDOW_LOG)
+                .unwrap();
+            let mut expanded_rows = 0;
+            for line in rows.lines() {
+                let plaintext = serialize_exact_semantic_scrollback_line(line).unwrap();
+                let mut payload = Zeroizing::new(EXACT_SCROLLBACK_ZSTD_MAGIC.to_vec());
+                payload.extend_from_slice(&u32::try_from(plaintext.len()).unwrap().to_le_bytes());
+                payload.extend_from_slice(&compressor.compress(&plaintext).unwrap());
+                if payload.len() >= plaintext.len() {
+                    // The store keeps such a row plain.
+                    continue;
+                }
+                let expanded = expand_exact_scrollback_plaintext(payload, plaintext.len()).unwrap();
+                assert_eq!(expanded.as_slice(), plaintext.as_slice(), "level {level}");
+                expanded_rows += 1;
+            }
+            eprintln!("zstd level {level}: {expanded_rows} of 64 T0 rows compress");
+        }
+    }
+
+    #[test]
+    fn durability_switches_are_on_unless_set_to_zero() {
+        use std::ffi::OsStr;
+
+        assert!(durability_switch_on(None));
+        assert!(durability_switch_on(Some(OsStr::new("1"))));
+        assert!(durability_switch_on(Some(OsStr::new(""))));
+        assert!(durability_switch_on(Some(OsStr::new("00"))));
+        assert!(!durability_switch_on(Some(OsStr::new("0"))));
     }
 
     #[cfg(unix)]

@@ -166,5 +166,69 @@ fn record_path(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, record_path);
+/// ft-y0gy9: the durability writer's two largest costs on T0 rows, each
+/// with its alternatives in one run. Serialization: varbincode (through
+/// `&mut dyn Write`) against `exact_varbincode` (the same bytes). Per-row
+/// compression at zstd level 1 (the store's) and at negative levels, which
+/// leave literals uncompressed and decode with the same decoder. Whole
+/// segments as one frame are measured for the owner's format decision only.
+/// Before timing, each prints its bytes per row.
+fn writer_stages(c: &mut Criterion) {
+    let sealer = Sealer::new();
+    let rows = Rows::t0_corpus(WINDOW_ROWS, 7);
+    let plaintexts = sealer.plaintexts(&rows);
+    let plaintext_bytes: usize = plaintexts.iter().map(Vec::len).sum();
+    let per_row = |bytes: usize| bytes as f64 / WINDOW_ROWS as f64;
+    let mut group = c.benchmark_group("scrollback_writer");
+    group.throughput(Throughput::Bytes(rows.text_bytes()));
+    let mut out = Vec::new();
+    for (name, direct) in [("serialize_varbincode", false), ("serialize_direct", true)] {
+        let bytes = sealer.serialize_through(&rows, direct, &mut out);
+        eprintln!(
+            "scrollback_writer t0_corpus {name}: {:.1} plaintext bytes per row",
+            per_row(bytes)
+        );
+        group.bench_function(BenchmarkId::new(name, "t0_corpus"), |bench| {
+            bench.iter(|| black_box(sealer.serialize_through(black_box(&rows), direct, &mut out)));
+        });
+    }
+    for level in [1, -1, -3, -7] {
+        let bytes = sealer.compress_rows_at(&plaintexts, level);
+        eprintln!(
+            "scrollback_writer t0_corpus compress_rows level {level}: {:.1} payload bytes per row \
+             ({:.3} of {:.1} plaintext)",
+            per_row(bytes),
+            bytes as f64 / plaintext_bytes as f64,
+            per_row(plaintext_bytes),
+        );
+        group.bench_with_input(
+            BenchmarkId::new("compress_rows", format!("t0_corpus_level{level}")),
+            &level,
+            |bench, &level| {
+                bench.iter(|| black_box(sealer.compress_rows_at(black_box(&plaintexts), level)));
+            },
+        );
+    }
+    for level in [1, -1] {
+        let bytes = sealer.compress_segments_at(&plaintexts, 1024, level);
+        eprintln!(
+            "scrollback_writer t0_corpus compress_segments level {level}: {:.1} bytes per row \
+             ({:.3} of plaintext)",
+            per_row(bytes),
+            bytes as f64 / plaintext_bytes as f64,
+        );
+        group.bench_with_input(
+            BenchmarkId::new("compress_segments", format!("t0_corpus_level{level}")),
+            &level,
+            |bench, &level| {
+                bench.iter(|| {
+                    black_box(sealer.compress_segments_at(black_box(&plaintexts), 1024, level))
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(benches, record_path, writer_stages);
 criterion_main!(benches);
