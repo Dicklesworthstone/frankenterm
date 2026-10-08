@@ -1,0 +1,9 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "images under and over text\n\u001b[4munder\u001b[24m \u001b_Ga=T,f=32,s=2,v=1,c=10,r=1,i=1,p=1,z=-1,C=1,q=2;/wAAoAAA/6A=\u001b\\text drawn over\n\u001b[4mover\u001b[24m  \u001b_Ga=T,f=32,s=2,v=1,c=10,r=1,i=2,p=1,z=1,C=1,q=2;/wAAoAAA/6A=\u001b\\text drawn under\n\u001b[?25l",
+    "config": {
+      "enable_kitty_graphics": true
+    }
+  }
+}

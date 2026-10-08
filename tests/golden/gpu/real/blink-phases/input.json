@@ -1,0 +1,15 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "\u001b[5mslow blink\u001b[25m \u001b[6mrapid blink\u001b[25m plain\n\u001b[5;4;31mred underlined blink\u001b[0m \u001b[5;7mreverse blink\u001b[0m\ncursor: \u001b[1 q",
+    "config": {
+      "text_blink_rate": 500,
+      "text_blink_rate_rapid": 250,
+      "cursor_blink_rate": 800
+    },
+    "snapshot": {
+      "focus": true,
+      "blink": 0.5
+    }
+  }
+}
