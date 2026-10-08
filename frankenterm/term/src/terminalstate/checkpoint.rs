@@ -1069,6 +1069,10 @@ impl CheckpointCellAttributes {
         if value.has_image_attachments() {
             return Err(TerminalCheckpointError::UnsupportedGraphicsState);
         }
+        // A protected cell or pen would come back unprotected.
+        if value.protected() {
+            return Err(TerminalCheckpointError::UnsupportedCharacterProtection);
+        }
         Ok(Self {
             intensity: value.intensity(),
             underline: value.underline(),
@@ -3866,6 +3870,11 @@ impl TerminalCheckpointV3 {
         validate_custom_cell_width_maps(&custom_cell_width_maps, limits, &mut screen_usage)?;
         replay_config.validate(limits, custom_cell_width_maps.len(), &mut screen_usage)?;
         Self::preflight_terminal_fields(terminal, limits, &mut screen_usage, true)?;
+        // Restore starts with protection off; any other mode decides which
+        // erases keep protected cells, possibly in cold scrollback.
+        if terminal.protected_mode != ProtectedMode::Off {
+            return Err(TerminalCheckpointError::UnsupportedCharacterProtection);
+        }
         let kitty_max_image_id = terminal
             .kitty_img
             .checkpoint_high_water_if_quiescent()
@@ -4934,6 +4943,8 @@ impl TerminalState {
             batch_config,
             screen: screens,
             pen: restored_pen,
+            // Capture refuses any other mode.
+            protected_mode: ProtectedMode::Off,
             cursor: restored_cursor,
             wrap_next,
             clear_semantic_attribute_on_newline,
@@ -5012,6 +5023,9 @@ impl TerminalState {
 #[derive(Debug, Eq, PartialEq)]
 pub enum TerminalCheckpointError {
     UnsupportedGraphicsState,
+    /// A protected cell or pen, or a protection mode other than off: state
+    /// the checkpoint format does not hold (DECSCA, SPA).
+    UnsupportedCharacterProtection,
     UnsupportedVersion {
         observed: u32,
         supported: u32,
@@ -5086,6 +5100,9 @@ impl std::fmt::Display for TerminalCheckpointError {
         match self {
             Self::UnsupportedGraphicsState => formatter.write_str(
                 "terminal contains graphics state unsupported by checkpointing",
+            ),
+            Self::UnsupportedCharacterProtection => formatter.write_str(
+                "terminal contains character protection unsupported by checkpointing",
             ),
             Self::UnsupportedVersion {
                 observed,
@@ -5441,6 +5458,34 @@ mod tests {
             TerminalCheckpointV3::capture(&terminal),
             Err(TerminalCheckpointError::UnsupportedGraphicsState)
         );
+    }
+
+    /// The format holds no character protection (DECSCA, SPA), so capture
+    /// refuses while a pen, a cell or the protection mode could still
+    /// change what an erase keeps.
+    #[test]
+    fn character_protection_fails_closed() {
+        let refused = Err(TerminalCheckpointError::UnsupportedCharacterProtection);
+        let mut terminal = terminal();
+        terminal.advance_bytes(b"\x1b[1\"q");
+        assert_eq!(TerminalCheckpointV3::capture(&terminal), refused);
+
+        // DECSCA 0 stops protecting, but leaves the DEC mode.
+        terminal.advance_bytes(b"P\x1b[0\"q");
+        assert_eq!(TerminalCheckpointV3::capture(&terminal), refused);
+
+        // DECSTR turns protection off; the cell printed before stays
+        // protected for a later DECSCA or SPA.
+        terminal.advance_bytes(b"\x1b[!p");
+        assert_eq!(TerminalCheckpointV3::capture(&terminal), refused);
+        terminal.advance_bytes(b"\x1b[2J");
+        assert!(TerminalCheckpointV3::capture(&terminal).is_ok());
+
+        // SPA's mode outlasts EPA, until an ED 2 keeps no protected cell.
+        terminal.advance_bytes(b"\x1bV\x1bW");
+        assert_eq!(TerminalCheckpointV3::capture(&terminal), refused);
+        terminal.advance_bytes(b"\x1b[2J");
+        assert!(TerminalCheckpointV3::capture(&terminal).is_ok());
     }
 
     #[test]

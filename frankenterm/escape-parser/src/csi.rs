@@ -1229,6 +1229,29 @@ pub enum Edit {
 
     /// REP - Repeat the preceding character n times
     Repeat(u32),
+
+    /// SL - SCROLL LEFT (ECMA-48 8.3.121), `CSI Ps SP @`: the data moves n
+    /// character positions to the left. xterm applies it to the scrolling
+    /// region, deleting n columns at its left margin (`xtermScrollLR`).
+    ScrollLeft(u32),
+
+    /// SR - SCROLL RIGHT (ECMA-48 8.3.135), `CSI Ps SP A`: the data moves n
+    /// character positions to the right, inserting n columns at the
+    /// scrolling region's left margin.
+    ScrollRight(u32),
+
+    /// DECSED - SELECTIVE ERASE IN DISPLAY, `CSI ? Ps J`: ED, except that
+    /// characters protected by DECSCA (or SPA) are left alone.
+    SelectiveEraseInDisplay(EraseInDisplay),
+
+    /// DECSEL - SELECTIVE ERASE IN LINE, `CSI ? Ps K`: EL, except that
+    /// protected characters are left alone.
+    SelectiveEraseInLine(EraseInLine),
+
+    /// DECSCA - SELECT CHARACTER PROTECTION ATTRIBUTE, `CSI Ps " q`: `true`
+    /// for Ps 1, so that DECSED and DECSEL cannot erase the characters
+    /// printed next; `false` for 0 (the default) and 2.
+    SelectCharacterProtection(bool),
 }
 
 trait EncodeCSIParam {
@@ -1279,6 +1302,17 @@ impl Display for Edit {
             Edit::ScrollUp(n) => n.write_csi(f, "S")?,
             Edit::EraseInDisplay(n) => n.write_csi(f, "J")?,
             Edit::Repeat(n) => n.write_csi(f, "b")?,
+            Edit::ScrollLeft(n) => n.write_csi(f, " @")?,
+            Edit::ScrollRight(n) => n.write_csi(f, " A")?,
+            Edit::SelectiveEraseInDisplay(n) => {
+                write!(f, "?")?;
+                n.write_csi(f, "J")?
+            }
+            Edit::SelectiveEraseInLine(n) => {
+                write!(f, "?")?;
+                n.write_csi(f, "K")?
+            }
+            Edit::SelectCharacterProtection(protected) => write!(f, "{}\"q", u8::from(*protected))?,
         }
         Ok(())
     }
@@ -1860,6 +1894,15 @@ impl<'a> CSIParser<'a> {
         match (self.control, self.orig_params) {
             ('k', [.., CsiParam::P(b' ')]) => self.select_character_path(params),
             ('q', [.., CsiParam::P(b' ')]) => self.cursor_style(params),
+            ('@', [.., CsiParam::P(b' ')]) => self.scroll_left_right(params, true),
+            ('A', [.., CsiParam::P(b' ')]) => self.scroll_left_right(params, false),
+            ('q', [.., CsiParam::P(b'"')]) => self.select_character_protection(params),
+            ('J', [CsiParam::P(b'?'), ..]) => {
+                parse!(Edit, SelectiveEraseInDisplay, self.focus(params, 1, 0))
+            }
+            ('K', [CsiParam::P(b'?'), ..]) => {
+                parse!(Edit, SelectiveEraseInLine, self.focus(params, 1, 0))
+            }
             ('y', [.., CsiParam::P(b'*')]) => self.checksum_area(params),
 
             ('c', [CsiParam::P(b'='), ..]) => self
@@ -2078,6 +2121,28 @@ impl<'a> CSIParser<'a> {
             ] => Ok(self.advance_by(4, params, CSI::SelectCharacterPath(path(*a)?, *b))),
             _ => Err(()),
         }
+    }
+
+    /// SL (`CSI Ps SP @`) or SR (`CSI Ps SP A`): a count, default 1, with 0
+    /// read as 1 (xterm's `one_if_default`).
+    fn scroll_left_right(&mut self, params: &'a [CsiParam], left: bool) -> Result<CSI, ()> {
+        let n = u32::parse_params(self.focus(params, 0, 1))?;
+        Ok(CSI::Edit(if left {
+            Edit::ScrollLeft(n)
+        } else {
+            Edit::ScrollRight(n)
+        }))
+    }
+
+    /// DECSCA (`CSI Ps " q`), as xterm's `CASE_DECSCA` reads it: Ps 1
+    /// protects; 0, 2 and the default do not.
+    fn select_character_protection(&mut self, params: &'a [CsiParam]) -> Result<CSI, ()> {
+        let protected = match self.focus(params, 0, 1) {
+            [] | [CsiParam::Integer(0)] | [CsiParam::Integer(2)] => false,
+            [CsiParam::Integer(1)] => true,
+            _ => return Err(()),
+        };
+        Ok(CSI::Edit(Edit::SelectCharacterProtection(protected)))
     }
 
     fn cursor_style(&mut self, params: &'a [CsiParam]) -> Result<CSI, ()> {

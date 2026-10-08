@@ -58,6 +58,20 @@ pub(crate) enum CharSet {
     DecLineDrawing,
 }
 
+/// The character protection mode the last DECSCA or SPA selected: xterm's
+/// `protected_mode` (charproc.c), which decides the erases that keep
+/// protected cells (util.c `do_erase_char`, `do_erase_line`,
+/// `do_erase_display`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProtectedMode {
+    /// None since the last reset: every erase clears protected cells.
+    Off,
+    /// SPA (ESC V): ED, EL and ECH keep protected cells too.
+    Iso,
+    /// DECSCA: only DECSED and DECSEL keep them.
+    Dec,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MouseEncoding {
     X10,
@@ -382,6 +396,8 @@ pub struct TerminalState {
     /// The current set of attributes in effect for the next
     /// attempt to print to the display
     pen: CellAttributes,
+    /// Which erases keep the cells the pen's protection marked.
+    protected_mode: ProtectedMode,
     /// The current cursor position, relative to the top left
     /// of the screen.  0-based index.
     cursor: CursorPosition,
@@ -1041,6 +1057,7 @@ impl TerminalState {
             batch_config,
             screen,
             pen: CellAttributes::default(),
+            protected_mode: ProtectedMode::Off,
             cursor: CursorPosition::default(),
             top_and_bottom_margins: 0..size.rows as VisibleRowIndex,
             left_and_right_margins: 0..size.cols,
@@ -2142,6 +2159,8 @@ impl TerminalState {
             Device::SoftReset => {
                 // TODO: see https://vt100.net/docs/vt510-rm/DECSTR.html
                 self.pen = CellAttributes::default();
+                // xterm's ReallyReset (charproc.c), "Reset DECSCA".
+                self.protected_mode = ProtectedMode::Off;
                 self.insert = false;
                 self.dec_origin_mode = false;
                 // Note that xterm deviates from the documented DECSTR
@@ -3078,18 +3097,102 @@ impl TerminalState {
     }
 
     fn erase_in_display(&mut self, erase: EraseInDisplay) {
+        self.erase_in_display_with(erase, false);
+    }
+
+    /// Whether an erase keeps protected cells. xterm's `do_erase_char`,
+    /// `do_erase_line` and `do_erase_display` (util.c) honor protection in
+    /// SPA's mode, and in DECSCA's only for DECSED and DECSEL (`selective`).
+    fn erase_skips_protected(&self, selective: bool) -> bool {
+        match self.protected_mode {
+            ProtectedMode::Off => false,
+            ProtectedMode::Iso => true,
+            ProtectedMode::Dec => selective,
+        }
+    }
+
+    /// The parts of columns `cols` of row `y` that hold no protected cell,
+    /// and whether any protected cell lies within `cols`.
+    fn unprotected_runs(
+        &self,
+        y: VisibleRowIndex,
+        cols: Range<usize>,
+    ) -> (Vec<Range<usize>>, bool) {
+        let screen = self.screen();
+        let line = screen.phys_line(screen.phys_row(y));
+        let mut runs = Vec::new();
+        let mut start = cols.start;
+        let mut kept = false;
+        for cell in line.visible_cells() {
+            let x = cell.cell_index();
+            if x >= cols.end {
+                break;
+            }
+            let end = x.saturating_add(cell.width().max(1));
+            if end <= cols.start || !cell.attrs().protected() {
+                continue;
+            }
+            kept = true;
+            if x > start {
+                runs.push(start..x);
+            }
+            start = start.max(end);
+        }
+        if start < cols.end {
+            runs.push(start..cols.end);
+        }
+        (runs, kept)
+    }
+
+    /// Erases the unprotected cells in columns `cols` of row `y`, as xterm's
+    /// `ClearInLine2` (util.c) does while protection is honored. Returns
+    /// whether a protected cell was kept.
+    fn clear_unprotected(
+        &mut self,
+        y: VisibleRowIndex,
+        cols: Range<usize>,
+        pen: &CellAttributes,
+        seqno: SequenceNo,
+        bidi_mode: BidiMode,
+    ) -> bool {
+        let (runs, kept) = self.unprotected_runs(y, cols);
+        let screen = self.screen_mut();
+        for run in runs {
+            screen.clear_line(y, run, pen, seqno, bidi_mode);
+        }
+        kept
+    }
+
+    /// ED, or with `selective` DECSED (`CSI ? Ps J`). When protected cells
+    /// are kept, the rows keep their line size too (xterm clears them with
+    /// `ClearInLine`, not `ClearBufRows`), and an erase of the whole screen
+    /// that keeps none turns protection off, as `do_erase_display` does
+    /// (util.c, case 2, which ED 0 from the home position and ED 1 from the
+    /// last cell also take).
+    fn erase_in_display_with(&mut self, erase: EraseInDisplay, selective: bool) {
         let seqno = self.seqno;
         let cy = self.cursor.y;
         let pen = self.pen.clone_sgr_only();
         let rows = self.screen().physical_rows as VisibleRowIndex;
-        let col_range = 0..self.screen().physical_cols;
+        let cols = self.screen().physical_cols;
+        let col_range = 0..cols;
+        let skip_protected = self.erase_skips_protected(selective);
+        let whole_screen = match erase {
+            EraseInDisplay::EraseDisplay => true,
+            EraseInDisplay::EraseToEndOfDisplay => cy == 0 && self.cursor.x == 0,
+            EraseInDisplay::EraseToStartOfDisplay => {
+                cy == rows - 1 && self.cursor.x.saturating_add(1) >= cols
+            }
+            EraseInDisplay::EraseScrollback => false,
+        };
+        let mut kept = false;
         let row_range = match erase {
             EraseInDisplay::EraseToEndOfDisplay => {
-                self.perform_csi_edit(Edit::EraseInLine(EraseInLine::EraseToEndOfLine));
+                kept |= self.erase_in_line_with(EraseInLine::EraseToEndOfLine, selective);
                 cy.saturating_add(1)..rows
             }
             EraseInDisplay::EraseToStartOfDisplay => {
-                self.perform_csi_edit(Edit::EraseInLine(EraseInLine::EraseToStartOfLine));
+                kept |= self.erase_in_line_with(EraseInLine::EraseToStartOfLine, selective);
                 0..cy
             }
             EraseInDisplay::EraseDisplay => 0..rows,
@@ -3100,6 +3203,17 @@ impl TerminalState {
                 return;
             }
         };
+
+        if skip_protected {
+            let bidi_mode = self.get_bidi_mode();
+            for y in row_range {
+                kept |= self.clear_unprotected(y, col_range.clone(), &pen, seqno, bidi_mode);
+            }
+            if whole_screen && !kept {
+                self.protected_mode = ProtectedMode::Off;
+            }
+            return;
+        }
 
         {
             let bidi_mode = self.get_bidi_mode();
@@ -3121,6 +3235,82 @@ impl TerminalState {
             mode.hint = *hint;
         }
         mode
+    }
+
+    /// EL, or with `selective` DECSEL (`CSI ? Ps K`). Returns whether a
+    /// protected cell was kept.
+    fn erase_in_line_with(&mut self, erase: EraseInLine, selective: bool) -> bool {
+        let seqno = self.seqno;
+        let cx = self.cursor.x;
+        let cy = self.cursor.y;
+        let pen = self.pen.clone_sgr_only();
+        let cols = self.screen().physical_cols;
+        let bidi_mode = self.get_bidi_mode();
+        let range = match erase {
+            // If wrap_next is true, then cx is effectively 1 column to the right.
+            // It feels wrong to handle this here, but in trying to centralize
+            // the logic for updating the cursor position, it causes regressions
+            // in the test suite.
+            // So this is here for now until a better solution is found.
+            // <https://github.com/wezterm/wezterm/issues/3548>
+            EraseInLine::EraseToEndOfLine => {
+                // Bind the start of the range to a variable: without
+                // the binding (or extra parens), the parser treats
+                // the `if` block as a statement and then the trailing
+                // `..cols` becomes a RangeTo, which then doesn't unify
+                // with the other match arms that produce Range<usize>.
+                let start = if self.wrap_next {
+                    next_col_saturating(cx)
+                } else {
+                    cx
+                };
+                start..cols
+            }
+            EraseInLine::EraseToStartOfLine => 0..next_col_saturating(cx),
+            EraseInLine::EraseLine => 0..cols,
+        };
+
+        if self.erase_skips_protected(selective) {
+            return self.clear_unprotected(cy, range, &pen, seqno, bidi_mode);
+        }
+        self.screen_mut()
+            .clear_line(cy, range, &pen, seqno, bidi_mode);
+        false
+    }
+
+    /// SL (`CSI Ps SP @`) and SR (`CSI Ps SP A`), as xterm's `xtermScrollLR`
+    /// and `xtermColScroll` (util.c) apply them: with the cursor inside the
+    /// margins, every row within the top and bottom margins loses (SL) or
+    /// gains (SR) `n` cells at the left margin (`ScrnDeleteChar`,
+    /// `ScrnInsertChar`). The cells that appear take the current colours, as
+    /// xterm's `ClearCells` (screen.c) gives them; FrankenTerm's ICH still
+    /// inserts default blanks. The cursor stays where it is.
+    fn scroll_left_right(&mut self, n: u32, left: bool) {
+        if !self.top_and_bottom_margins.contains(&self.cursor.y)
+            || !self.left_and_right_margins.contains(&self.cursor.x)
+        {
+            return;
+        }
+        let seqno = self.seqno;
+        let left_margin = self.left_and_right_margins.start;
+        let right_margin = self.left_and_right_margins.end;
+        let count = usize::try_from(n)
+            .unwrap_or(usize::MAX)
+            .min(right_margin - left_margin);
+        let rows = self.top_and_bottom_margins.clone();
+        let blank_attr = self.pen.clone_sgr_only();
+        let blank = Cell::blank_with_attrs(blank_attr.clone());
+        let screen = self.screen_mut();
+        for y in rows {
+            for _ in 0..count {
+                if left {
+                    screen.erase_cell(left_margin, y, right_margin, seqno, blank_attr.clone());
+                } else {
+                    screen.insert_cell(left_margin, y, right_margin, seqno);
+                    screen.set_cell(left_margin, y, &blank, seqno);
+                }
+            }
+        }
     }
 
     fn perform_csi_edit(&mut self, edit: Edit) {
@@ -3163,8 +3353,18 @@ impl TerminalState {
                 let y = self.cursor.y;
                 let x = self.cursor.x;
                 let limit = add_u32_to_usize_saturating(x, n).min(self.screen().physical_cols);
-                {
-                    let blank = Cell::blank_with_attrs(self.pen.clone_sgr_only());
+                let blank = Cell::blank_with_attrs(self.pen.clone_sgr_only());
+                if self.erase_skips_protected(false) {
+                    // SPA's protected cells survive ECH (util.c
+                    // `do_erase_char`, `ClearInLine2`).
+                    let (runs, _) = self.unprotected_runs(y, x..limit);
+                    let screen = self.screen_mut();
+                    for run in runs {
+                        for x in run {
+                            screen.set_cell(x, y, &blank, seqno);
+                        }
+                    }
+                } else {
                     let screen = self.screen_mut();
                     for x in x..limit as usize {
                         screen.set_cell(x, y, &blank, seqno);
@@ -3173,37 +3373,7 @@ impl TerminalState {
             }
 
             Edit::EraseInLine(erase) => {
-                let cx = self.cursor.x;
-                let cy = self.cursor.y;
-                let pen = self.pen.clone_sgr_only();
-                let cols = self.screen().physical_cols;
-                let bidi_mode = self.get_bidi_mode();
-                let range = match erase {
-                    // If wrap_next is true, then cx is effectively 1 column to the right.
-                    // It feels wrong to handle this here, but in trying to centralize
-                    // the logic for updating the cursor position, it causes regressions
-                    // in the test suite.
-                    // So this is here for now until a better solution is found.
-                    // <https://github.com/wezterm/wezterm/issues/3548>
-                    EraseInLine::EraseToEndOfLine => {
-                        // Bind the start of the range to a variable: without
-                        // the binding (or extra parens), the parser treats
-                        // the `if` block as a statement and then the trailing
-                        // `..cols` becomes a RangeTo, which then doesn't unify
-                        // with the other match arms that produce Range<usize>.
-                        let start = if self.wrap_next {
-                            next_col_saturating(cx)
-                        } else {
-                            cx
-                        };
-                        start..cols
-                    }
-                    EraseInLine::EraseToStartOfLine => 0..next_col_saturating(cx),
-                    EraseInLine::EraseLine => 0..cols,
-                };
-
-                self.screen_mut()
-                    .clear_line(cy, range, &pen, seqno, bidi_mode);
+                self.erase_in_line_with(erase, false);
             }
             Edit::InsertCharacter(n) => {
                 // https://vt100.net/docs/vt510-rm/ICH.html
@@ -3245,6 +3415,18 @@ impl TerminalState {
             Edit::ScrollDown(n) => self.scroll_down(n as usize),
             Edit::ScrollUp(n) => self.scroll_up(n as usize),
             Edit::EraseInDisplay(erase) => self.erase_in_display(erase),
+            Edit::SelectiveEraseInDisplay(erase) => self.erase_in_display_with(erase, true),
+            Edit::SelectiveEraseInLine(erase) => {
+                self.erase_in_line_with(erase, true);
+            }
+            Edit::ScrollLeft(n) => self.scroll_left_right(n, true),
+            Edit::ScrollRight(n) => self.scroll_left_right(n, false),
+            Edit::SelectCharacterProtection(protected) => {
+                // xterm's CASE_DECSCA (charproc.c): DEC mode, and the
+                // protection of what is printed next.
+                self.protected_mode = ProtectedMode::Dec;
+                self.pen.set_protected(protected);
+            }
             Edit::Repeat(n) => {
                 let mut y = self.cursor.y;
                 let mut x = self.cursor.x;
@@ -3651,9 +3833,14 @@ impl TerminalState {
             Sgr::Reset => {
                 let link = self.pen.hyperlink().map(Arc::clone);
                 let semantic_type = self.pen.semantic_type();
+                // SGR 0 leaves character protection alone: xterm's
+                // resetRendition (charproc.c) clears SGR_MASK, SGR_MASK2 and
+                // INVISIBLE, not PROTECTED.
+                let protected = self.pen.protected();
                 self.pen = CellAttributes::default();
                 self.pen.set_hyperlink(link);
                 self.pen.set_semantic_type(semantic_type);
+                self.pen.set_protected(protected);
             }
             Sgr::Intensity(intensity) => {
                 self.pen.set_intensity(intensity);

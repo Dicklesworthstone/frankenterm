@@ -870,6 +870,35 @@ mod tests {
                     .to_vec(),
             ),
             (
+                // SL and SR within the top and bottom margins, then within
+                // DECLRMM margins with a wide character at the left margin,
+                // and an SL from outside the margins, which does nothing.
+                "scroll_left_right",
+                "0123456789\r\nabcdefghij\r\nklmnopqrst\r\nuvwxyz0123\r\n\u{4e2d}\u{6587}456789\x1b[2;5r\x1b[3;1H\x1b[2 @\x1b[44m\x1b[0 A\x1b[m\x1b[ A\x1b[?69h\x1b[1;7s\x1b[5;2H\x1b[1 @\x1b[3 A\x1b[s\x1b[?69l\x1b[r\x1b[1;1H\x1b[2;4r\x1b[1;1H\x1b[ @\x1b[r"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            (
+                // DECSCA cells, wide and narrow, with SGR 0 inside the
+                // protected run, kept by DECSEL and DECSED and erased by ED
+                // in DEC mode; then DECSTR, after which DECSEL clears them.
+                "protection_decsca",
+                "\x1b[1\"qAB\x1b[1;44mC\x1b[0mD\u{4e2d}\x1b[0\"qxy\x1b[2;1H\x1b[1\"qPQ\x1b[2\"qrs\x1b[1;3H\x1b[?K\x1b[2;3H\x1b[?1K\x1b[?2J\x1b[3;1H\x1b[1\"qkeep\x1b[0\"q\x1b[3;3H\x1b[?0J\x1b[2J\x1b[4;1H\x1b[1\"qGONE\x1b[!p\x1b[?2K"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            (
+                // An SPA box that ED, EL and ECH keep, with a coloured pen;
+                // DECSCA then switches to DEC mode and ED erases it. A new
+                // SPA over a screen an ED 2 empties turns protection off, so
+                // EL erases what follows.
+                "protection_spa",
+                "\x1b[2J\x1bV\x1b[2;3HPROT\x1b[3;3HPROT\x1bW\x1b[2;1Hfree\x1b[3;9Hmore\x1b[44m\x1b[2;4H\x1b[J\x1b[1J\x1b[3;1H\x1b[2K\x1b[2;1H\x1b[8X\x1b[2J\x1b[m\x1b[0\"q\x1b[2J\x1bV\x1b[2Jlost\x1b[1;1H\x1b[2K"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            ("dec_graphics_5f", b"\x1b(0_q_\x1b(B_".to_vec()),
+            (
                 "graphemes",
                 "e\u{301} \u{4e2d}\u{6587} \u{1f468}\u{200d}\u{1f469} \u{2764}\u{fe0f} ab\u{301}"
                     .as_bytes()

@@ -92,6 +92,7 @@ impl core::fmt::Debug for CellAttributes {
             .field("wrapped", &self.wrapped())
             .field("overline", &self.overline())
             .field("semantic_type", &self.semantic_type())
+            .field("protected", &self.protected())
             .field("foreground", &self.foreground)
             .field("background", &self.background)
             .field("fat", &self.fat)
@@ -700,6 +701,12 @@ impl CellAttributes {
     bitfield!(overline, set_overline, 12);
     bitfield!(semantic_type, set_semantic_type, SemanticType, 0b11, 13);
     bitfield!(vertical_align, set_vertical_align, VerticalAlign, 0b11, 15);
+    // The character protection attribute: xterm's PROTECTED (ptyx.h), set on
+    // the pen by DECSCA 1 and SPA and cleared by DECSCA 0/2 and EPA. A
+    // protected cell survives DECSED and DECSEL, and also ED, EL and ECH
+    // while the last protection mode set was SPA's (charproc.c CASE_DECSCA,
+    // CASE_SPA, CASE_EPA; util.c ClearInLine2).
+    bitfield!(protected, set_protected, 17);
 
     pub const fn blank() -> Self {
         Self {
@@ -948,6 +955,9 @@ impl CellAttributes {
         res.set_underline(Underline::None);
         res.set_overline(false);
         res.set_strikethrough(false);
+        // An erased or inserted blank is never protected: xterm's ClearCells
+        // (screen.c) stores only the colour flags with the blank.
+        res.set_protected(false);
         res
     }
 
@@ -2400,6 +2410,33 @@ mod test {
         let cloned = a.clone_sgr_only();
         assert!(!cloned.overline());
         assert!(!cloned.strikethrough());
+    }
+
+    #[test]
+    fn clone_sgr_only_clears_protection_and_keeps_the_rest() {
+        let mut a = CellAttributes::blank();
+        a.set_protected(true)
+            .set_reverse(true)
+            .set_background(ColorAttribute::PaletteIndex(4));
+        let cloned = a.clone_sgr_only();
+        assert!(!cloned.protected());
+        assert!(cloned.reverse());
+        assert_eq!(cloned.background(), ColorAttribute::PaletteIndex(4));
+    }
+
+    #[test]
+    fn bitfield_protected_is_its_own_bit() {
+        let mut a = CellAttributes::blank();
+        a.set_vertical_align(VerticalAlign::SubScript)
+            .set_semantic_type(SemanticType::Prompt);
+        let before = a.clone();
+        a.set_protected(true);
+        assert!(a.protected());
+        assert_eq!(a.vertical_align(), VerticalAlign::SubScript);
+        assert_eq!(a.semantic_type(), SemanticType::Prompt);
+        assert!(!a.attribute_bits_equal(&before));
+        a.set_protected(false);
+        assert_eq!(a, before);
     }
 
     // ── CellAttributes: apply_change ────────────────────────

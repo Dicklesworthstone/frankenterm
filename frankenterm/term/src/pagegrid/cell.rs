@@ -253,7 +253,12 @@ impl PackedCell {
     const STYLE_SHIFT: u32 = 29;
     const STYLE_MASK: u64 = 0xFFFF_FFFF << 29;
     const WRAPPED: u64 = 1 << 61;
-    pub const RESERVED: u64 = 0b11 << 62;
+    /// Legacy `CellAttributes::protected` (DECSCA, SPA). It is a cell bit
+    /// rather than a style bit: the inline style's 32 bits are full, and a
+    /// pen's protection must not cost a print run anything beyond its
+    /// template.
+    const PROTECTED: u64 = 1 << 62;
+    pub const RESERVED: u64 = 1 << 63;
 
     pub const fn from_bits(bits: u64) -> Self {
         Self(bits)
@@ -305,6 +310,10 @@ impl PackedCell {
 
     pub fn is_wrapped(self) -> bool {
         self.0 & Self::WRAPPED != 0
+    }
+
+    pub fn is_protected(self) -> bool {
+        self.0 & Self::PROTECTED != 0
     }
 
     pub fn semantic(self) -> SemanticType {
@@ -361,6 +370,10 @@ impl PackedCell {
 
     pub fn with_wrapped(self, on: bool) -> Self {
         self.with_flag(Self::WRAPPED, on)
+    }
+
+    pub fn with_protected(self, on: bool) -> Self {
+        self.with_flag(Self::PROTECTED, on)
     }
 
     pub fn with_semantic(self, semantic: SemanticType) -> Self {

@@ -3,7 +3,7 @@
 # commit body; see fixtures/conformance/README.md.
 PASS vttest/character-sets/00
 PASS vttest/character-sets/01
-XFAIL vttest/character-sets/02
+PASS vttest/character-sets/02
 PASS vttest/character-sets/03
 XFAIL vttest/character-sets/04
 PASS vttest/character-sets/05
@@ -97,9 +97,9 @@ XFAIL vttest/iso6429-colors/65
 PASS vttest/iso6429-colors/66
 PASS vttest/iso6429-colors/67
 PASS vttest/iso6429-colors/68
-XFAIL vttest/iso6429-colors/69
+PASS vttest/iso6429-colors/69
 PASS vttest/iso6429-colors/70
-XFAIL vttest/iso6429-colors/71
+PASS vttest/iso6429-colors/71
 PASS vttest/iso6429-colors/72
 PASS vttest/iso6429-colors/73
 PASS vttest/iso6429-colors/74
@@ -131,14 +131,14 @@ XFAIL vttest/iso6429-misc/03
 PASS vttest/iso6429-misc/04
 PASS vttest/iso6429-misc/05
 PASS vttest/iso6429-misc/06
-XFAIL vttest/iso6429-misc/07
+PASS vttest/iso6429-misc/07
 PASS vttest/iso6429-misc/08
-XFAIL vttest/iso6429-misc/09
+PASS vttest/iso6429-misc/09
 PASS vttest/iso6429-misc/10
 PASS vttest/iso6429-misc/11
 PASS vttest/iso6429-misc/12
 PASS vttest/iso6429-misc/13
-XFAIL vttest/iso6429-misc/14
+PASS vttest/iso6429-misc/14
 PASS vttest/iso6429-misc/15
 PASS vttest/known-bugs/00
 PASS vttest/known-bugs/01
@@ -223,7 +223,7 @@ PASS vttest/vt220-screen-display/05
 PASS vttest/vt220-screen-display/06
 PASS vttest/vt220-screen-display/07
 PASS vttest/vt220-screen-display/08
-XFAIL vttest/vt220-screen-display/09
+PASS vttest/vt220-screen-display/09
 PASS vttest/vt220-screen-display/10
 PASS vttest/vt220-screen-display/11
 PASS vttest/vt220-screen-display/12
@@ -291,6 +291,12 @@ PASS esctest/el/erased-cells-take-the-background
 PASS esctest/ech/erases-without-shifting
 PASS esctest/ech/default-one
 PASS esctest/ech/stops-at-the-right-edge
+PASS esctest/decsed/keeps-decsca-protected-cells
+PASS esctest/decsel/keeps-decsca-protected-cells
+PASS esctest/decsca/ed-el-and-ech-erase-protected-cells
+PASS esctest/decsca/sgr-0-keeps-protection
+PASS esctest/spa/ed-el-and-ech-keep-the-protected-area
+PASS esctest/epa/ends-the-protected-area
 PASS esctest/il/inserts-at-the-cursor-row
 PASS esctest/il/inserts-n-lines
 PASS esctest/il/stays-inside-the-region
@@ -310,6 +316,10 @@ PASS esctest/rep/repeats-the-last-character
 PASS esctest/su/scrolls-up
 PASS esctest/sd/scrolls-down
 PASS esctest/su/stays-inside-the-region
+PASS esctest/sl/scrolls-the-region-left
+PASS esctest/sr/scrolls-the-region-right
+PASS esctest/sl/stays-inside-left-and-right-margins
+PASS esctest/sl/outside-the-margins-does-nothing
 PASS esctest/decstbm/homes-the-cursor
 PASS esctest/decstbm/no-params-is-the-full-screen
 PASS esctest/decstbm/top-past-bottom-is-ignored
@@ -364,6 +374,7 @@ PASS esctest/sgr/applies-to-later-cells-only
 PASS esctest/charset/dec-graphics-in-g0
 PASS esctest/charset/so-si-switch-to-g1
 PASS esctest/charset/uk-national
+PASS esctest/charset/dec-graphics-5f-is-blank
 PASS esctest/decaln/fills-with-e
 PASS esctest/decaln/resets-the-margins
 XFAIL esctest/altscreen/1049-switches-to-a-blank-screen

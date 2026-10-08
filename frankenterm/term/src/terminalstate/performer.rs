@@ -1,6 +1,6 @@
 use crate::terminal::{Alert, Progress};
 use crate::terminalstate::{
-    default_color_map, CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry,
+    default_color_map, CharSet, MouseEncoding, ProtectedMode, TabStop, UnicodeVersionStackEntry,
 };
 use crate::{
     CellAttributes, ClipboardSelection, LineSize, Position, TerminalState, VisibleRowIndex, DCS, ST,
@@ -710,6 +710,10 @@ impl<'a> Performer<'a> {
             || (!self.shift_out && self.g0_charset == CharSet::DecLineDrawing)
         {
             match g {
+                // 0x5F is a blank in the VT100 table (User Guide table 3-9);
+                // xterm's xtermCharSetIn (charsets.c) stores it as cell 0,
+                // the blank, ahead of dec2ucs's 0x60-0x7E (fontutils.c).
+                "_" => " ",
                 "`" => "◆",
                 "a" => "▒",
                 "b" => "␉",
@@ -1642,6 +1646,19 @@ impl<'a> Performer<'a> {
             Esc::Code(EscCode::DecSaveCursorPosition) => self.dec_save_cursor(),
             Esc::Code(EscCode::DecRestoreCursorPosition) => self.dec_restore_cursor(),
 
+            // SPA and EPA (ECMA-48 8.3.142, 8.3.49), as xterm's CASE_SPA and
+            // CASE_EPA (charproc.c) take them: the cells printed in between
+            // are protected, and SPA's mode makes ED, EL and ECH keep them
+            // until DECSCA, a reset or an erase of the whole screen that
+            // finds none changes the mode.
+            Esc::Code(EscCode::StartOfGuardedArea) => {
+                self.protected_mode = ProtectedMode::Iso;
+                self.pen.set_protected(true);
+            }
+            Esc::Code(EscCode::EndOfGuardedArea) => {
+                self.pen.set_protected(false);
+            }
+
             Esc::Code(EscCode::DecDoubleHeightTopHalfLine) => {
                 let idx = self.screen.phys_row(self.cursor.y);
                 self.screen.set_line_size(idx, LineSize::DoubleHeightTop, seqno);
@@ -1683,6 +1700,7 @@ impl<'a> Performer<'a> {
             Esc::Code(EscCode::FullReset) => {
                 let seqno = self.seqno;
                 self.pen = Default::default();
+                self.protected_mode = ProtectedMode::Off;
                 self.cursor = Default::default();
                 self.wrap_next = false;
                 self.clear_semantic_attribute_on_newline = false;

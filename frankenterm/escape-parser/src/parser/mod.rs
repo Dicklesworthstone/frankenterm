@@ -1984,8 +1984,9 @@ mod test {
     use super::*;
     use crate::color::ColorSpec;
     use crate::csi::{
-        CharacterPath, DecPrivateMode, DecPrivateModeCode, Device, Intensity, Mode, Sgr, Underline,
-        Window, XtSmGraphics, XtSmGraphicsItem, XtermKeyModifierResource,
+        CharacterPath, Cursor, DecPrivateMode, DecPrivateModeCode, Device, Edit, EraseInDisplay,
+        EraseInLine, Intensity, Mode, Sgr, Underline, Window, XtSmGraphics, XtSmGraphicsItem,
+        XtermKeyModifierResource,
     };
     use crate::{EscCode, OneBased};
     use k9::assert_equal as assert_eq;
@@ -3800,6 +3801,84 @@ mod test {
             actions
         );
         assert_eq!(encode(&actions), "\x1bP1;2zABC\x1b\\");
+    }
+
+    #[test]
+    fn scroll_left_and_right() {
+        assert_eq!(
+            round_trip_parse("\x1b[ @"),
+            vec![Action::CSI(CSI::Edit(Edit::ScrollLeft(1)))]
+        );
+        assert_eq!(
+            round_trip_parse("\x1b[3 @"),
+            vec![Action::CSI(CSI::Edit(Edit::ScrollLeft(3)))]
+        );
+        assert_eq!(
+            round_trip_parse("\x1b[ A"),
+            vec![Action::CSI(CSI::Edit(Edit::ScrollRight(1)))]
+        );
+        assert_eq!(
+            round_trip_parse("\x1b[12 A"),
+            vec![Action::CSI(CSI::Edit(Edit::ScrollRight(12)))]
+        );
+        // 0 counts as 1 (xterm's one_if_default), as vttest sends it.
+        parse_as("\x1b[0 @", "\x1b[ @");
+        parse_as("\x1b[0 A", "\x1b[ A");
+        // ICH and CUU keep their own finals.
+        assert_eq!(
+            round_trip_parse("\x1b[2@\x1b[2A"),
+            vec![
+                Action::CSI(CSI::Edit(Edit::InsertCharacter(2))),
+                Action::CSI(CSI::Cursor(Cursor::Up(2))),
+            ]
+        );
+    }
+
+    #[test]
+    fn selective_erase_and_character_protection() {
+        assert_eq!(
+            round_trip_parse("\x1b[?J\x1b[?1J\x1b[?2J"),
+            vec![
+                Action::CSI(CSI::Edit(Edit::SelectiveEraseInDisplay(
+                    EraseInDisplay::EraseToEndOfDisplay
+                ))),
+                Action::CSI(CSI::Edit(Edit::SelectiveEraseInDisplay(
+                    EraseInDisplay::EraseToStartOfDisplay
+                ))),
+                Action::CSI(CSI::Edit(Edit::SelectiveEraseInDisplay(
+                    EraseInDisplay::EraseDisplay
+                ))),
+            ]
+        );
+        assert_eq!(
+            round_trip_parse("\x1b[?K\x1b[?1K\x1b[?2K"),
+            vec![
+                Action::CSI(CSI::Edit(Edit::SelectiveEraseInLine(
+                    EraseInLine::EraseToEndOfLine
+                ))),
+                Action::CSI(CSI::Edit(Edit::SelectiveEraseInLine(
+                    EraseInLine::EraseToStartOfLine
+                ))),
+                Action::CSI(CSI::Edit(Edit::SelectiveEraseInLine(
+                    EraseInLine::EraseLine
+                ))),
+            ]
+        );
+        parse_as("\x1b[?0K", "\x1b[?K");
+        assert_eq!(
+            round_trip_parse("\x1b[1\"q\x1b[0\"q"),
+            vec![
+                Action::CSI(CSI::Edit(Edit::SelectCharacterProtection(true))),
+                Action::CSI(CSI::Edit(Edit::SelectCharacterProtection(false))),
+            ]
+        );
+        // The default and 2 do not protect, as xterm's CASE_DECSCA reads them.
+        parse_as("\x1b[\"q\x1b[2\"q", "\x1b[0\"q\x1b[0\"q");
+        // Other values are not DECSCA's.
+        assert!(matches!(
+            Parser::new().parse_as_vec(b"\x1b[3\"q").as_slice(),
+            [Action::CSI(CSI::Unspecified(_))]
+        ));
     }
 
     #[test]

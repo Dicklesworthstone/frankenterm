@@ -5,8 +5,6 @@
 # starts passing must lose its entry (the runner reports it as XPASS).
 # Never add an entry to make a run green without saying what is wrong.
 
-# dec-5f
-vttest/character-sets/02 DEC Special Graphics maps 0x5F to a blank (VT100 table, xterm dec2ucs); frankenterm-term prints '_' (golden row 13 corrected).
 # iso2022
 vttest/character-sets/04 frankenterm-term implements no 96-character sets (ESC - A, ESC . A, ESC / A), locking shifts LS2/LS3 or single shifts SS2/SS3, so the Latin-1 set prints as ASCII. Golden: GL 2/1-7/14 through a Latin-1 96-set map to the upper half; 2/0 stays SPACE and an ignored DEL keeps a pending single shift.
 vttest/character-sets/06 frankenterm-term implements no 96-character sets (ESC - A, ESC . A, ESC / A), locking shifts LS2/LS3, or single shifts SS2/SS3, so the Latin-1 set prints as ASCII. Golden: GL 2/1-7/14 through a Latin-1 96-set map to the upper half (2/0 stays SPACE); the 8-bit GR bytes, ill-formed UTF-8 here, become 32 U+FFFD per row, which the GR rows already match.
@@ -18,16 +16,6 @@ vttest/double-sized-characters/06 On a double-width line HT moves the cursor pas
 # rep
 vttest/iso6429-misc/03 REP repeats again after a preceding REP; ECMA-48 leaves REP after a control function undefined and xterm repeats only right after a graphic character, so vttest expects 2 '+' per row, not 12.
 vttest/iso6429-colors/65 REP repeats again after a preceding REP; ECMA-48 leaves REP after a control function undefined and xterm repeats only right after a graphic character, so vttest expects 2 '+' per row, not 12.
-# sl
-vttest/iso6429-misc/07 SL (CSI Ps SP @, scroll left) is not implemented, so vttest's diagonal of '*' never becomes the centered column.
-vttest/iso6429-colors/69 SL (CSI Ps SP @, scroll left) is not implemented, so vttest's diagonal of '*' never becomes the centered column.
-# sr
-vttest/iso6429-misc/09 SR (CSI Ps SP A, scroll right) is not implemented, so vttest's diagonal of '*' never becomes the centered column.
-vttest/iso6429-colors/71 SR (CSI Ps SP A, scroll right) is not implemented, so vttest's diagonal of '*' never becomes the centered column.
-# spa
-vttest/iso6429-misc/14 SPA/EPA (ESC V / ESC W) protected areas are not implemented, so ED, EL and ECH erase vttest's protected box.
-# decsca
-vttest/vt220-screen-display/09 DECSCA protection with selective erase DECSED/DECSEL (CSI ? J, CSI ? K) is not implemented, so the unprotected '*' marks survive.
 
 # esctest-style cases
 esctest/altscreen/1049-switches-to-a-blank-screen Mode 1049 also homes the cursor and resets the pen when it switches (inherited from WezTerm); xterm saves the cursor, switches and clears, leaving the position alone.

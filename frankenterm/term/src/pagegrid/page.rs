@@ -58,6 +58,8 @@ pub struct CellWrite<'a> {
     pub style: StyleSpec<'a>,
     pub semantic: SemanticType,
     pub wrapped: bool,
+    /// Legacy `CellAttributes::protected` (DECSCA, SPA).
+    pub protected: bool,
     pub hyperlink: Option<&'a Arc<Hyperlink>>,
     pub images: &'a [Box<ImageCell>],
     /// Legacy `set_cell_clearing_image_placements`: drop, rather than carry
@@ -74,6 +76,7 @@ impl<'a> CellWrite<'a> {
             style,
             semantic: SemanticType::Output,
             wrapped: false,
+            protected: false,
             hyperlink: None,
             images: &[],
             clear_image_placements: false,
@@ -320,6 +323,7 @@ impl Page {
         let mut attrs = style_attributes(cell.style(), &self.styles);
         attrs.set_semantic_type(cell.semantic());
         attrs.set_wrapped(cell.is_wrapped());
+        attrs.set_protected(cell.is_protected());
         if let Some(link) = self.hyperlink(row, x) {
             attrs.set_hyperlink(Some(Arc::clone(link)));
         }
@@ -522,6 +526,7 @@ impl Page {
             .with_style(style)
             .with_semantic(attrs.semantic_type())
             .with_wrapped(attrs.wrapped())
+            .with_protected(attrs.protected())
             .with_codepoint(glyph.codepoint())
             .with_wide(cell.width() >= 2);
         if !matches!(attrs.semantic_type(), SemanticType::Output) {
@@ -943,7 +948,8 @@ impl Page {
         let template = PackedCell::BLANK
             .with_style(style)
             .with_semantic(cell.semantic)
-            .with_wrapped(cell.wrapped);
+            .with_wrapped(cell.wrapped)
+            .with_protected(cell.protected);
         let mut has_image = false;
         if cell.wide {
             has_image |= self.store_written(slot, x + 1, template, &cell, false);
@@ -998,6 +1004,7 @@ impl Page {
             style,
             semantic: attrs.semantic_type(),
             wrapped: attrs.wrapped(),
+            protected: attrs.protected(),
             hyperlink: attrs.hyperlink(),
             images: &images,
             clear_image_placements,
@@ -1047,6 +1054,7 @@ impl Page {
             .with_style(style)
             .with_semantic(cell.semantic)
             .with_wrapped(cell.wrapped)
+            .with_protected(cell.protected)
             .with_hyperlink(cell.hyperlink.is_some());
         for (offset, &byte) in bytes.iter().enumerate() {
             let glyph = if byte == b' ' {
@@ -1131,6 +1139,7 @@ impl Page {
             .with_style(style)
             .with_semantic(cell.semantic)
             .with_wrapped(cell.wrapped)
+            .with_protected(cell.protected)
             .with_hyperlink(cell.hyperlink.is_some());
         for (offset, &byte) in bytes.iter().enumerate() {
             let col = x + offset;
@@ -1259,7 +1268,8 @@ impl Page {
             let bits = PackedCell::BLANK
                 .with_style(style)
                 .with_semantic(blank.semantic)
-                .with_wrapped(blank.wrapped);
+                .with_wrapped(blank.wrapped)
+                .with_protected(blank.protected);
             let has_image = self.store_written(slot, insert_at, bits, &blank, false);
             flags |= blank.summary_flags(style, has_image);
             len += 1;

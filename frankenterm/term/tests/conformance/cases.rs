@@ -403,6 +403,68 @@ fn erasing() -> Vec<EscCase> {
                 t.rows(3, &["3333333", DIGITS[3]])
             },
         ),
+        small(
+            "decsed/keeps-decsca-protected-cells",
+            "VT510 DECSCA, DECSED; xterm charproc.c CASE_DECSED, util.c ClearInLine2",
+            |t| {
+                digits(t);
+                t.feed("\x1b[2;3H\x1b[1\"qAB\x1b[0\"q\x1b[4;5H\x1b[1\"qC\x1b[0\"q");
+                t.feed("\x1b[3;1H\x1b[?2J");
+                t.screen(&["", "  AB", "", "    C"])?;
+                t.cursor(3, 1)
+            },
+        ),
+        small(
+            "decsel/keeps-decsca-protected-cells",
+            "VT510 DECSEL; xterm charproc.c CASE_DECSEL",
+            |t| {
+                digits(t);
+                t.feed("\x1b[3;4H\x1b[1\"qPP\x1b[0\"q\x1b[3;5H\x1b[?K");
+                t.row(3, "333PP")?;
+                t.feed("\x1b[?1K");
+                t.row(3, "   PP")?;
+                t.feed("\x1b[?2K");
+                t.row(3, "   PP")
+            },
+        ),
+        small(
+            "decsca/ed-el-and-ech-erase-protected-cells",
+            "ctlseqs DECSCA: only DECSED and DECSEL honor it; xterm util.c do_erase_display",
+            |t| {
+                digits(t);
+                t.feed("\x1b[1\"qA\x1b[2;1HB\x1b[3;1HC\x1b[0\"q");
+                t.feed("\x1b[1;1H\x1b[X\x1b[2;1H\x1b[K\x1b[3;1H\x1b[J");
+                t.screen(&[" 111111111"])
+            },
+        ),
+        small(
+            "decsca/sgr-0-keeps-protection",
+            "xterm charproc.c resetRendition: SGR 0 leaves PROTECTED",
+            |t| {
+                digits(t);
+                t.feed("\x1b[1\"q\x1b[1mA\x1b[0mB\x1b[0\"q\x1b[1;1H\x1b[?2K");
+                t.row(1, "AB")
+            },
+        ),
+        small(
+            "spa/ed-el-and-ech-keep-the-protected-area",
+            "ECMA-48 SPA, EPA; xterm charproc.c CASE_SPA, util.c do_erase_line",
+            |t| {
+                digits(t);
+                t.feed("\x1b[2;3H\x1bVPRO\x1bW\x1b[2;1H\x1b[2K\x1b[2;1H\x1b[10X");
+                t.feed("\x1b[1;1H\x1b[2J");
+                t.screen(&["", "  PRO"])
+            },
+        ),
+        small(
+            "epa/ends-the-protected-area",
+            "ECMA-48 EPA; xterm charproc.c CASE_EPA",
+            |t| {
+                digits(t);
+                t.feed("\x1bVA\x1bWB\x1b[2J");
+                t.screen(&["A"])
+            },
+        ),
     ]
 }
 
@@ -507,6 +569,56 @@ fn inserting_and_deleting() -> Vec<EscCase> {
             t.feed("\x1b[2;4r\x1b[S");
             t.screen(&[DIGITS[0], DIGITS[2], DIGITS[3], "", DIGITS[4]])
         }),
+        small(
+            "sl/scrolls-the-region-left",
+            "ECMA-48 SL; xterm charproc.c CASE_SL, util.c xtermColScroll",
+            |t| {
+                digits(t);
+                t.feed("\x1b[2;4r\x1b[3;5H\x1b[2 @");
+                t.screen(&[DIGITS[0], "22222222", "33333333", "44444444", DIGITS[4]])?;
+                t.cursor(3, 5)
+            },
+        ),
+        small(
+            "sr/scrolls-the-region-right",
+            "ECMA-48 SR; xterm charproc.c CASE_SR (0 counts as 1)",
+            |t| {
+                digits(t);
+                t.feed("\x1b[2;4r\x1b[3;5H\x1b[0 A");
+                t.screen(&[
+                    DIGITS[0],
+                    " 222222222",
+                    " 333333333",
+                    " 444444444",
+                    DIGITS[4],
+                ])?;
+                t.cursor(3, 5)
+            },
+        ),
+        small(
+            "sl/stays-inside-left-and-right-margins",
+            "xterm util.c xtermColScroll: deletes at the left margin, up to the right one",
+            |t| {
+                digits(t);
+                t.feed("\x1b[?69h\x1b[3;7s\x1b[2;4r\x1b[3;4H\x1b[ @");
+                t.screen(&[
+                    DIGITS[0],
+                    "222222 222",
+                    "333333 333",
+                    "444444 444",
+                    DIGITS[4],
+                ])
+            },
+        ),
+        small(
+            "sl/outside-the-margins-does-nothing",
+            "xterm util.c xtermColScroll: the cursor must be inside the margins",
+            |t| {
+                digits(t);
+                t.feed("\x1b[2;4r\x1b[1;1H\x1b[ @\x1b[5;1H\x1b[ A");
+                t.screen(&DIGITS)
+            },
+        ),
     ]
 }
 
@@ -868,6 +980,14 @@ fn charsets_and_screen_ops() -> Vec<EscCase> {
             t.feed("\x1b(A#\x1b(B#");
             t.row(1, "\u{a3}#")
         }),
+        case(
+            "charset/dec-graphics-5f-is-blank",
+            "VT100 User Guide table 3-9; xterm charsets.c xtermCharSetIn",
+            |t| {
+                t.feed("\x1b(0^_`\x1b(B_");
+                t.row(1, "^ \u{25c6}_")
+            },
+        ),
         small("decaln/fills-with-e", "VT510 DECALN", |t| {
             t.feed("\x1b[3;3H\x1b#8");
             t.screen(&["EEEEEEEEEE"; 5])?;

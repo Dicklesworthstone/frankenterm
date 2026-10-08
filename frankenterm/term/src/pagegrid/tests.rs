@@ -60,7 +60,11 @@ fn packed_cell_bits_sit_where_the_adr_puts_them() {
         (1 << 28) | (0xFFFF_FFFF << 29)
     );
     assert_eq!(blank.with_wrapped(true).bits(), 1 << 61);
-    assert_eq!(PackedCell::RESERVED, 0b11 << 62);
+    // Character protection (DECSCA, SPA) took bit 62 of the two the ADR
+    // left reserved; the inline style had no room for it.
+    assert_eq!(blank.with_protected(true).bits(), 1 << 62);
+    assert!(blank.with_protected(true).is_protected());
+    assert_eq!(PackedCell::RESERVED, 1 << 63);
 
     // Inline style from its low bit: attrs 14, fg 9, bg 9.
     let style = InlineStyle::new(0x3FFF, 256, 256);
@@ -80,6 +84,10 @@ fn packed_cell_bits_sit_where_the_adr_puts_them() {
     assert_eq!(
         full.with_semantic(SemanticType::Output).bits(),
         !PackedCell::RESERVED & !(0b11 << 24)
+    );
+    assert_eq!(
+        full.with_protected(false).bits(),
+        !PackedCell::RESERVED & !(1 << 62)
     );
 }
 

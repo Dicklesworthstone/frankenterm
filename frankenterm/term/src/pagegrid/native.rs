@@ -224,6 +224,7 @@ fn write_grapheme(
         style,
         semantic: attr.semantic_type(),
         wrapped: attr.wrapped(),
+        protected: attr.protected(),
         hyperlink: attr.hyperlink(),
         images: &images,
         clear_image_placements: false,
@@ -289,6 +290,7 @@ pub fn set_ascii_run(
         let mut write = CellWrite::new(Glyph::Blank, style);
         write.semantic = attr.semantic_type();
         write.wrapped = attr.wrapped();
+        write.protected = attr.protected();
         write.hyperlink = attr.hyperlink();
         let stored = if appends {
             page.append_ascii(row, x, text.as_bytes(), write, seqno)
@@ -332,6 +334,7 @@ pub fn set_ascii_run(
             style,
             semantic: attr.semantic_type(),
             wrapped: attr.wrapped(),
+            protected: attr.protected(),
             hyperlink: attr.hyperlink(),
             images: &images,
             clear_image_placements: false,
@@ -565,6 +568,7 @@ pub fn erase_cell(
     let mut blank = CellWrite::new(Glyph::Blank, style);
     blank.semantic = blank_attr.semantic_type();
     blank.wrapped = blank_attr.wrapped();
+    blank.protected = blank_attr.protected();
     blank.hyperlink = blank_attr.hyperlink();
     blank.images = &images;
     page.erase_cell_with_margin(row, x, right_margin, blank, seqno);
@@ -779,6 +783,7 @@ fn append_blanks(
         let mut write = CellWrite::new(Glyph::Blank, style);
         write.semantic = attr.semantic_type();
         write.wrapped = attr.wrapped();
+        write.protected = attr.protected();
         write.hyperlink = attr.hyperlink();
         let appended = page.append_ascii(row, x, &SPACES[..n], write, seqno);
         debug_assert!(appended, "an empty row takes its blanks");
