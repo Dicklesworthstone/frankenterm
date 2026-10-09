@@ -21167,9 +21167,14 @@ mod tests {
             .await;
             sleep(Duration::from_millis(30)).await;
             let started = Instant::now();
-            let summary = handle.shutdown_with_timeout(Duration::from_secs(2)).await;
+            // Production budget: a tighter test-only budget made the clean mark
+            // fail on loaded workers (ft-fbngg). A bridge stuck on its 30 s timer
+            // still exhausts this budget, so the clean assertion keeps its teeth.
+            let summary = handle
+                .shutdown_with_timeout(DEFAULT_RUNTIME_SHUTDOWN_TIMEOUT)
+                .await;
             assert!(summary.is_clean(), "{:?}", summary.warnings);
-            assert!(started.elapsed() < Duration::from_secs(5));
+            assert!(started.elapsed() < Duration::from_secs(10));
             assert_eq!(snapshot_settlement_counts(&db_path), (1, 1, 1));
         });
     }
@@ -21202,9 +21207,11 @@ mod tests {
             let caller_cx = crate::cx::for_testing();
             // Mandatory cleanup must remain independent of a cancelled caller.
             caller_cx.cancel_with(crate::outcome::CancelKind::User, Some("fixture shutdown"));
+            // Production budget: ordering, not wall-clock speed, is under test
+            // here, and a 2 s budget failed the clean mark under load (ft-fbngg).
             let shutdown = handle.shutdown_with_settlement_with_cx(
                 &caller_cx,
-                Duration::from_secs(2),
+                DEFAULT_RUNTIME_SHUTDOWN_TIMEOUT,
                 |cleanup_cx| async move {
                     assert!(cleanup_cx.checkpoint().is_ok());
                     assert!(!entered.swap(true, Ordering::SeqCst), "settle exactly once");
