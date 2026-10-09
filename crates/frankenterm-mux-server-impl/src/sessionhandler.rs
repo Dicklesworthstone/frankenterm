@@ -3056,6 +3056,10 @@ pub(crate) struct PerPane {
     #[cfg(test)]
     panic_next_legacy_enqueue_recovery: bool,
     pub(crate) notifications: PendingPaneAlerts,
+    // Whether this session has sent the pane's user vars as they stood when
+    // it first rendered the pane. Alerts reach `notifications` only after the
+    // pane is tracked, so vars set before the client attached need this.
+    sent_initial_user_vars: bool,
 }
 
 impl Default for PerPane {
@@ -3074,6 +3078,7 @@ impl Default for PerPane {
             #[cfg(test)]
             panic_next_legacy_enqueue_recovery: false,
             notifications: PendingPaneAlerts::default(),
+            sent_initial_user_vars: false,
         }
     }
 }
@@ -4856,6 +4861,50 @@ fn maybe_push_pane_changes(
     push_pane_changes_with_observation(pane, sender, per_pane, false).map(|_| ())
 }
 
+/// Send the pane's current user vars once per session, as `SetUserVar`
+/// alerts, so a client that attaches after a var was set still sees it.
+///
+/// The vars are read before the retained alert backlog is drained. Any change
+/// that races with the read is also in that backlog, which is sent after
+/// these, so the client ends on the latest value.
+fn send_initial_user_vars(
+    pane: &CurrentPane<'_>,
+    sender: &PduSender,
+    per_pane: &Arc<Mutex<PerPane>>,
+) -> anyhow::Result<()> {
+    if lock_per_pane_or_retire(per_pane, "checking initial user vars")?.sent_initial_user_vars {
+        return Ok(());
+    }
+    // Read outside the per-pane lock: alert retention takes that lock from
+    // mux notification callbacks.
+    let mut user_vars = pane.copy_user_vars().into_iter().collect::<Vec<_>>();
+    user_vars.sort_unstable();
+    {
+        let mut state = lock_per_pane_or_retire(per_pane, "sending initial user vars")?;
+        state.ensure_legacy_transport_idle()?;
+        if std::mem::replace(&mut state.sent_initial_user_vars, true) {
+            return Ok(());
+        }
+    }
+    for (name, value) in user_vars {
+        let sent = sender.send_bulk(DecodedPdu {
+            pdu: Pdu::NotifyAlert(NotifyAlert {
+                pane_id: pane.pane_id(),
+                alert: Alert::SetUserVar { name, value },
+            }),
+            serial: 0,
+        });
+        if let Err(err) = sent {
+            // Resend the full set on the next push. Repeating a var the
+            // client already has only re-inserts the same value.
+            lock_per_pane_or_retire(per_pane, "retrying initial user vars")?
+                .sent_initial_user_vars = false;
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
 /// A poll needs its own source observation: its correlated reply may be
 /// consumed while earlier unilateral deltas remain queued at the client.
 /// Reuse the exact prepared delta, or the freshly sampled no-change baseline,
@@ -4887,6 +4936,8 @@ fn push_pane_changes_with_observation(
             }
         }
     }
+
+    send_initial_user_vars(pane, &sender, &per_pane)?;
 
     let config_generation = config::configuration().generation();
     let (mut notifications_remaining, first_notification_batch) = {
@@ -14051,6 +14102,7 @@ mod tests {
         cursor_line_start_override: Option<StableRowIndex>,
         writer_sink: ParkingMutex<FakePaneWriter>,
         mux_registration: Arc<mux::PaneRegistrationSlot>,
+        user_vars: Mutex<HashMap<String, String>>,
     }
 
     impl FakePane {
@@ -14073,6 +14125,7 @@ mod tests {
                 cursor_line_start_override: None,
                 writer_sink: ParkingMutex::new(FakePaneWriter::default()),
                 mux_registration: Arc::new(mux::PaneRegistrationSlot::default()),
+                user_vars: Mutex::new(HashMap::new()),
                 changed_lines: Mutex::new(RangeSet::new()),
                 changed_since_seqnos: Mutex::new(Vec::new()),
                 line_read_count: AtomicUsize::new(0),
@@ -14169,11 +14222,22 @@ mod tests {
         fn written_bytes(&self) -> Vec<u8> {
             self.writer_sink.lock().applied.clone()
         }
+
+        fn set_user_var(&self, name: &str, value: &str) {
+            self.user_vars
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), value.to_string());
+        }
     }
 
     impl Pane for FakePane {
         fn pane_id(&self) -> PaneId {
             self.pane_id
+        }
+
+        fn copy_user_vars(&self) -> HashMap<String, String> {
+            self.user_vars.lock().unwrap().clone()
         }
 
         fn mux_registration_slot(&self) -> &Arc<mux::PaneRegistrationSlot> {
@@ -23347,6 +23411,133 @@ mod tests {
         assert_eq!(state.notifications.protected_prefix_len, 0);
         assert!(state.transactional_dirty);
         assert_eq!(state.legacy_enqueue_phase, LegacyRenderEnqueuePhase::Idle);
+    }
+
+    fn sent_user_vars(captured: &Mutex<Vec<DecodedPdu>>) -> Vec<(String, String)> {
+        captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|decoded| match &decoded.pdu {
+                Pdu::NotifyAlert(NotifyAlert {
+                    alert: Alert::SetUserVar { name, value },
+                    ..
+                }) => Some((name.clone(), value.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn first_push_sends_user_vars_set_before_the_client_attached() {
+        let fake = Arc::new(FakePane::new(None));
+        fake.set_user_var("stage", "build");
+        fake.set_user_var("agent", "claude");
+        let pane: Arc<dyn Pane> = fake.clone();
+        let (_mux, registration) = register_test_pane(&pane);
+
+        // The vars were set before this session tracked the pane, so no
+        // SetUserVar alert is in its backlog. A later exact event is.
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        per_pane
+            .lock()
+            .unwrap()
+            .push_notification(Alert::Bell)
+            .expect("retain a post-attach exact event");
+        let (sender, captured) = capturing_sender();
+        registration
+            .try_with_current(|current| {
+                maybe_push_pane_changes(&current, sender.clone(), Arc::clone(&per_pane))
+            })
+            .expect("test pane registration remains current")
+            .expect("first push should enqueue");
+
+        assert_eq!(
+            sent_user_vars(&captured),
+            vec![
+                ("agent".to_string(), "claude".to_string()),
+                ("stage".to_string(), "build".to_string()),
+            ],
+            "an attaching client must receive every current user var"
+        );
+        let alerts = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|decoded| match &decoded.pdu {
+                Pdu::NotifyAlert(NotifyAlert { alert, .. }) => Some(alert.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            alerts.last(),
+            Some(&Alert::Bell),
+            "retained alerts follow the initial vars so a racing change wins"
+        );
+
+        // Later pushes in the same session carry only changes.
+        captured.lock().unwrap().clear();
+        registration
+            .try_with_current(|current| {
+                maybe_push_pane_changes(&current, sender, Arc::clone(&per_pane))
+            })
+            .expect("test pane registration remains current")
+            .expect("second push should enqueue");
+        assert!(sent_user_vars(&captured).is_empty());
+
+        // A reconnect is a new session with fresh per-pane state, so it gets
+        // the current vars again.
+        fake.set_user_var("stage", "test");
+        let reconnected = Arc::new(Mutex::new(PerPane::default()));
+        let (sender, captured) = capturing_sender();
+        registration
+            .try_with_current(|current| {
+                maybe_push_pane_changes(&current, sender, Arc::clone(&reconnected))
+            })
+            .expect("test pane registration remains current")
+            .expect("reconnect push should enqueue");
+        assert_eq!(
+            sent_user_vars(&captured),
+            vec![
+                ("agent".to_string(), "claude".to_string()),
+                ("stage".to_string(), "test".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_initial_user_var_send_is_retried_on_the_next_push() {
+        let fake = Arc::new(FakePane::new(None));
+        fake.set_user_var("stage", "build");
+        let pane: Arc<dyn Pane> = fake.clone();
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let failing = PduSender::new(|decoded, _| {
+            if matches!(&decoded.pdu, Pdu::NotifyAlert(_)) {
+                Err(anyhow!("synthetic user var enqueue failure"))
+            } else {
+                Ok(())
+            }
+        });
+        registration
+            .try_with_current(|current| {
+                maybe_push_pane_changes(&current, failing, Arc::clone(&per_pane))
+            })
+            .expect("test pane registration remains current")
+            .expect_err("the synthetic user var enqueue must fail");
+        assert!(!per_pane.lock().unwrap().sent_initial_user_vars);
+
+        let (sender, captured) = capturing_sender();
+        registration
+            .try_with_current(|current| {
+                maybe_push_pane_changes(&current, sender, Arc::clone(&per_pane))
+            })
+            .expect("test pane registration remains current")
+            .expect("retry push should enqueue");
+        assert_eq!(
+            sent_user_vars(&captured),
+            vec![("stage".to_string(), "build".to_string())]
+        );
     }
 
     #[test]
