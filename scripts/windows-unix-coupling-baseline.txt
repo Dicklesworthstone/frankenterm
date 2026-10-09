@@ -53,6 +53,10 @@ crates/frankenterm-mux-server-impl/src/generation_lifetime.rs	std::os::unix::fs:
 crates/frankenterm-mux-server-impl/src/generation_lifetime.rs	std::os::unix::fs::symlink("lease-target", &lease)
 crates/frankenterm-mux-server-impl/src/guardian_output_keys.rs	use std::os::fd::AsFd as _;
 crates/frankenterm-mux-server-impl/src/guardian_proxy.rs	fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+# ft-y0gy9 crash-step tests (a_tail_killed_between_window_sync_and_publication...,
+# scrollback_transaction_killed_at_every_named_step..., a_gap_marker_killed_at_every_step...)
+# are #[cfg(unix)]; the import sits ~30 lines into each, beyond the eight-line lookback.
+crates/frankenterm-mux-server-impl/src/lib.rs	use std::os::unix::process::ExitStatusExt as _;
 crates/frankenterm-pty-guardian/src/broker.rs	raw_fd: std::os::fd::RawFd,
 crates/frankenterm-pty-guardian/src/broker.rs	use std::os::fd::{AsFd, BorrowedFd};
 crates/frankenterm-pty-guardian/src/broker.rs	use std::os::unix::fs::{PermissionsExt as _, symlink};
