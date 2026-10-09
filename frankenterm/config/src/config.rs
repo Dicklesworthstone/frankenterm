@@ -3594,8 +3594,8 @@ mod tests {
                 "freetype_lcd_filter_weights",
                 Value::Array(
                     [0x10u64, 0x40, 0x70, 0x40, 0x10]
-                        .into_iter()
-                        .map(Value::U64)
+                        .iter()
+                        .map(|&w| Value::U64(w))
                         .collect(),
                 ),
             ),
