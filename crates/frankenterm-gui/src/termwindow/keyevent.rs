@@ -48,6 +48,10 @@ pub struct KeyTableState {
     stack: Vec<KeyTableStateEntry>,
 }
 
+/// Set while typed keys are being dropped at the layout restore gate, so the
+/// drop is logged once per stall instead of once per key.
+static INPUT_DROP_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl KeyTableState {
     pub fn activate(&mut self, args: KeyTableArgs) {
         if args.replace_current {
@@ -220,6 +224,22 @@ enum OnlyKeyBindings {
 }
 
 impl super::TermWindow {
+    /// `pane_input_ready` for typed keys, logging once when keys start being
+    /// dropped and once when they are accepted again.
+    fn typed_input_ready(&self, pane: &Arc<dyn Pane>) -> bool {
+        let ready = self.pane_input_ready(pane);
+        let was_dropping = INPUT_DROP_LOGGED.swap(!ready, std::sync::atomic::Ordering::Relaxed);
+        if !ready && !was_dropping {
+            log::warn!(
+                "dropping typed input for pane {}: its remote layout restore is pending",
+                pane.pane_id()
+            );
+        } else if ready && was_dropping {
+            log::warn!("typed input accepted again for pane {}", pane.pane_id());
+        }
+        ready
+    }
+
     fn encode_win32_input(&self, pane: &Arc<dyn Pane>, key: &KeyEvent) -> Option<String> {
         if !self.config.allow_win32_input_mode
             || pane.get_keyboard_encoding() != KeyboardEncoding::Win32
@@ -408,7 +428,7 @@ impl super::TermWindow {
 
             if bypass_compose {
                 if let Key::Code(term_key) = self.win_key_code_to_termwiz_key_code(keycode) {
-                    if !self.pane_input_ready(pane) {
+                    if !self.typed_input_ready(pane) {
                         return true;
                     }
                     let tw_raw_modifiers = raw_modifiers;
@@ -730,7 +750,7 @@ impl super::TermWindow {
                     return;
                 }
 
-                if !self.pane_input_ready(&pane) {
+                if !self.typed_input_ready(&pane) {
                     return;
                 }
                 let res = if let Some(encoded) = self.encode_win32_input(&pane, &window_key) {
@@ -797,7 +817,7 @@ impl super::TermWindow {
                 if self.config.debug_key_events {
                     log::info!("send to pane string={:?}", s);
                 }
-                if !self.pane_input_ready(&pane) {
+                if !self.typed_input_ready(&pane) {
                     return;
                 }
                 pane.send_user_input(s.as_bytes()).ok();

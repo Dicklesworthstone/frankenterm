@@ -231,7 +231,7 @@ pub(crate) fn reattach_needs_fresh_attachment(error: &anyhow::Error) -> bool {
     })
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 enum ClientTopologySessionState {
     #[default]
     Unbound,
@@ -313,6 +313,10 @@ impl FocusAdvisories {
     }
 }
 
+/// How long typed input may wait for a pending remote layout restore. The
+/// restore normally lands in milliseconds; past this, input is accepted again.
+const LAYOUT_RESTORE_INPUT_FENCE_LIMIT: Duration = Duration::from_secs(5);
+
 pub struct ClientInner {
     pub client: Client,
     pub local_domain_id: DomainId,
@@ -334,6 +338,11 @@ pub struct ClientInner {
     layout_snapshot: Mutex<Option<Arc<RemoteLayoutSnapshot>>>,
     layout_failed: AtomicBool,
     user_var_hydration: Mutex<UserVarHydrationState>,
+    /// When the GUI first saw this attachment's layout restore pending.
+    /// Typed input waits for the restore, but never longer than
+    /// `LAYOUT_RESTORE_INPUT_FENCE_LIMIT`.
+    layout_pending_since: Mutex<Option<Instant>>,
+    layout_fence_expired_logged: AtomicBool,
     detached: AtomicBool,
 }
 
@@ -1997,6 +2006,8 @@ impl ClientInner {
             layout_snapshot: Mutex::new(None),
             layout_failed: AtomicBool::new(false),
             user_var_hydration: Mutex::new(UserVarHydrationState::default()),
+            layout_pending_since: Mutex::new(None),
+            layout_fence_expired_logged: AtomicBool::new(false),
             detached: AtomicBool::new(false),
         }
     }
@@ -3072,7 +3083,26 @@ impl ClientDomain {
             return false;
         }
         let pending = lock_or_recover(&inner.layout_snapshot, "layout_snapshot").is_none();
-        pending
+        let mut since = lock_or_recover(&inner.layout_pending_since, "layout_pending_since");
+        if !pending {
+            *since = None;
+            return false;
+        }
+        let started = *since.get_or_insert_with(Instant::now);
+        drop(since);
+        if started.elapsed() < LAYOUT_RESTORE_INPUT_FENCE_LIMIT {
+            return true;
+        }
+        // A restore that never publishes and never fails would otherwise
+        // drop every typed key for good. Accept input again and say so once.
+        if !inner.layout_fence_expired_logged.swap(true, Ordering::AcqRel) {
+            log::warn!(
+                "remote layout restore for domain {} still pending after {:?}; accepting typed input",
+                self.local_domain_id,
+                LAYOUT_RESTORE_INPUT_FENCE_LIMIT
+            );
+        }
+        false
     }
 
     fn publish_layout_snapshot(
@@ -3138,13 +3168,36 @@ impl ClientDomain {
     }
 
     fn refresh_layout_snapshot(&self, mux: &Arc<Mux>, inner: &Arc<ClientInner>) {
-        if let Err(error) = self.publish_layout_snapshot(mux, inner) {
-            *lock_or_recover(&inner.layout_snapshot, "layout_snapshot") = None;
-            inner.layout_failed.store(true, Ordering::Release);
-            log::warn!("remote layout publication unavailable: {error:#}");
-        } else {
-            inner.layout_failed.store(false, Ordering::Release);
+        let unpublished = match self.publish_layout_snapshot(mux, inner) {
+            Err(error) => Some(format!("{error:#}")),
+            // publish_layout_snapshot returns Ok without a snapshot when the
+            // topology session is not current or the RPC scope is gone. Left
+            // alone, layout_restore_pending would stay true and drop input.
+            Ok(())
+                if self.durable_layout_binding().is_some()
+                    && lock_or_recover(&inner.layout_snapshot, "layout_snapshot").is_none()
+                    && !matches!(
+                        *lock_or_recover(&inner.topology_session, "topology_session"),
+                        ClientTopologySessionState::Bound(ClientTopologySession::Legacy46)
+                    ) =>
+            {
+                Some(format!(
+                    "nothing to publish (topology session {:?})",
+                    *lock_or_recover(&inner.topology_session, "topology_session")
+                ))
+            }
+            Ok(()) => None,
+        };
+        match unpublished {
+            Some(reason) => {
+                *lock_or_recover(&inner.layout_snapshot, "layout_snapshot") = None;
+                inner.layout_failed.store(true, Ordering::Release);
+                log::warn!("remote layout publication unavailable: {reason}");
+            }
+            None => inner.layout_failed.store(false, Ordering::Release),
         }
+        *lock_or_recover(&inner.layout_pending_since, "layout_pending_since") = None;
+        inner.layout_fence_expired_logged.store(false, Ordering::Release);
         if let Some(observer) = LAYOUT_READY_OBSERVER.get() {
             observer(self.local_domain_id);
         }
@@ -6944,6 +6997,56 @@ mod tests {
         assert!(!user_var_snapshot_may_retry(&anyhow!(
             "unclassified transport failure"
         )));
+    }
+
+    /// A client domain with a durable layout binding and an Unbound topology
+    /// session, so its layout restore is pending.
+    fn pending_layout_domain(
+        mux: &Arc<Mux>,
+        domain_id: DomainId,
+    ) -> (Arc<ClientInner>, Arc<ClientDomain>) {
+        fn ready(_: ClientEndpointFingerprint) -> DomainBindingFuture {
+            Box::pin(async { Ok(codec::DomainBindingId::from_bytes([0x44; 16])) })
+        }
+        let config = ClientDomainConfig::Unix(UnixDomain {
+            name: format!("layout-fence-test-{domain_id}"),
+            ..UnixDomain::default()
+        });
+        let (client, _peer) = Client::new_test_client_with_rpc_peer(Some(domain_id), config);
+        let inner = Arc::new(ClientInner::new(domain_id, client, None, None, false));
+        let domain = register_test_client_domain(mux, &inner);
+        asupersync_block_on(domain.resolve_layout_binding_with(ready))
+            .expect("test layout binding resolves");
+        assert!(domain.layout_restore_pending(), "restore starts pending");
+        (inner, domain)
+    }
+
+    #[test]
+    fn layout_refresh_that_publishes_nothing_stops_fencing_input() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, domain) = pending_layout_domain(&mux, 91_027);
+
+        // The topology session is not Current, so publish_layout_snapshot
+        // returns Ok without a snapshot. Typed input must not wait forever.
+        domain.refresh_layout_snapshot(&mux, &inner);
+        assert!(inner.layout_failed.load(Ordering::Acquire));
+        assert!(!domain.layout_restore_pending());
+    }
+
+    #[test]
+    fn layout_restore_input_fence_expires() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, domain) = pending_layout_domain(&mux, 91_028);
+
+        assert!(domain.layout_restore_pending(), "still within the limit");
+        *lock_or_recover(&inner.layout_pending_since, "layout_pending_since") = Some(
+            Instant::now() - LAYOUT_RESTORE_INPUT_FENCE_LIMIT - Duration::from_millis(1),
+        );
+        assert!(!domain.layout_restore_pending(), "the fence ends after the limit");
     }
 
     fn register_test_client_domain(mux: &Arc<Mux>, inner: &Arc<ClientInner>) -> Arc<ClientDomain> {
