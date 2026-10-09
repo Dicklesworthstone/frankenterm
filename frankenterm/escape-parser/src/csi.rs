@@ -5101,8 +5101,7 @@ mod test {
     /// settings.
     fn fast_decode(params: &[CsiParam], control: u8) -> Option<Vec<CSI>> {
         if control == b'm' {
-            let mut out: [Sgr; crate::parser::SGR_RUN_MAX] =
-                core::array::from_fn(|_| Sgr::Reset);
+            let mut out: [Sgr; crate::parser::SGR_RUN_MAX] = core::array::from_fn(|_| Sgr::Reset);
             let count = decode_sgr(params, &mut out)?;
             return Some(out[..count].iter().cloned().map(CSI::Sgr).collect());
         }
@@ -5220,7 +5219,11 @@ mod test {
             let params = fast_params(&text);
             let expected: Vec<CSI> = CSI::parse(&params, false, 'm').collect();
             assert_eq!(expected.len(), count);
-            assert_eq!(fast_decode(&params, b'm'), Some(expected), "{count} settings");
+            assert_eq!(
+                fast_decode(&params, b'm'),
+                Some(expected),
+                "{count} settings"
+            );
         }
         let over = fast_params(&vec!["1"; room + 1].join(";"));
         assert_eq!(fast_decode(&over, b'm'), None, "{} settings", room + 1);

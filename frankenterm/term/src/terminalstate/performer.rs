@@ -1661,11 +1661,13 @@ impl<'a> Performer<'a> {
 
             Esc::Code(EscCode::DecDoubleHeightTopHalfLine) => {
                 let idx = self.screen.phys_row(self.cursor.y);
-                self.screen.set_line_size(idx, LineSize::DoubleHeightTop, seqno);
+                self.screen
+                    .set_line_size(idx, LineSize::DoubleHeightTop, seqno);
             }
             Esc::Code(EscCode::DecDoubleHeightBottomHalfLine) => {
                 let idx = self.screen.phys_row(self.cursor.y);
-                self.screen.set_line_size(idx, LineSize::DoubleHeightBottom, seqno);
+                self.screen
+                    .set_line_size(idx, LineSize::DoubleHeightBottom, seqno);
             }
             Esc::Code(EscCode::DecDoubleWidthLine) => {
                 let idx = self.screen.phys_row(self.cursor.y);

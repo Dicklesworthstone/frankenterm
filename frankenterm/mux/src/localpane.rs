@@ -1956,13 +1956,17 @@ impl std::ops::Deref for TerminalGuard<'_> {
     type Target = Terminal;
 
     fn deref(&self) -> &Terminal {
-        self.guard.as_ref().expect("terminal guard is held until dropped")
+        self.guard
+            .as_ref()
+            .expect("terminal guard is held until dropped")
     }
 }
 
 impl std::ops::DerefMut for TerminalGuard<'_> {
     fn deref_mut(&mut self) -> &mut Terminal {
-        self.guard.as_mut().expect("terminal guard is held until dropped")
+        self.guard
+            .as_mut()
+            .expect("terminal guard is held until dropped")
     }
 }
 
@@ -2355,7 +2359,10 @@ impl Pane for LocalPane {
         // treat an empty result as complete. Only paint uses the loading cache;
         // RPCs use owned worker plans. Preserve complete synchronous results
         // until these remaining consumers acquire an awaited read contract.
-        terminal_get_lines(&mut self.locked_terminal_as(TerminalLockHolder::Paint), lines)
+        terminal_get_lines(
+            &mut self.locked_terminal_as(TerminalLockHolder::Paint),
+            lines,
+        )
     }
 
     fn capture_line_read(
@@ -3099,9 +3106,7 @@ impl Pane for LocalPane {
         let mut terminal = self.locked_terminal();
         match erase_mode {
             ScrollbackEraseMode::ScrollbackOnly => terminal.erase_scrollback(),
-            ScrollbackEraseMode::ScrollbackAndViewport => {
-                terminal.erase_scrollback_and_viewport()
-            }
+            ScrollbackEraseMode::ScrollbackAndViewport => terminal.erase_scrollback_and_viewport(),
         }
         self.render_facts.publish(&mut terminal);
     }
@@ -7879,8 +7884,7 @@ impl LocalPane {
                     let Some(seam) = retry_cold_resize_step("seam_capture", &cancelled, || {
                         registration
                             .try_with_current(|_| {
-                                let Some(term) =
-                                    terminal.try_lock_as(TerminalLockHolder::Resize)
+                                let Some(term) = terminal.try_lock_as(TerminalLockHolder::Resize)
                                 else {
                                     return Ok(None);
                                 };
@@ -7949,8 +7953,7 @@ impl LocalPane {
                     let Some(plan) = retry_cold_resize_step("index_capture", &cancelled, || {
                         registration
                             .try_with_current(|_| -> anyhow::Result<_> {
-                                let Some(term) =
-                                    terminal.try_lock_as(TerminalLockHolder::Resize)
+                                let Some(term) = terminal.try_lock_as(TerminalLockHolder::Resize)
                                 else {
                                     return Ok(None);
                                 };
@@ -17888,12 +17891,7 @@ mod tests {
                 .iter()
                 .find(|(row, _)| *row == stable_row)
                 .map(|(_, text)| {
-                    Line::from_text(
-                        text,
-                        &frankenterm_term::CellAttributes::blank(),
-                        0,
-                        None,
-                    )
+                    Line::from_text(text, &frankenterm_term::CellAttributes::blank(), 0, None)
                 })
         }
 
@@ -18026,7 +18024,8 @@ mod tests {
     fn apply_output(pane: &LocalPane, output: &[u8]) -> Arc<crate::pane::PaneRenderFacts> {
         let mut actions = Vec::new();
         termwiz::escape::parser::Parser::new().parse(output, |action| actions.push(action));
-        pane.perform_actions(actions).expect("test action admission");
+        pane.perform_actions(actions)
+            .expect("test action admission");
         let facts = pane.render_facts();
         // The publication matches the blocking accessors exactly.
         assert_eq!(facts.seqno, pane.get_current_seqno());
@@ -18446,7 +18445,11 @@ mod tests {
             let (waits, holds) = lock_counts(holder);
             action();
             let (waits_after, holds_after) = lock_counts(holder);
-            assert!(waits_after > waits, "{:?} acquisition was not recorded", holder);
+            assert!(
+                waits_after > waits,
+                "{:?} acquisition was not recorded",
+                holder
+            );
             assert!(holds_after > holds, "{:?} hold was not recorded", holder);
         };
         expect_recorded(TerminalLockHolder::Parser, &|| {

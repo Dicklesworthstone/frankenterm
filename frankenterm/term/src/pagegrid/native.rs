@@ -17,11 +17,11 @@ use super::cell::{classify, Glyph, PackedCell, StyleClass};
 use super::page::{CellWrite, Page, StyleSpec};
 use super::row::RowHeader;
 use crate::config::BidiMode;
+use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_bidi::ParagraphDirectionHint;
 use frankenterm_cell::image::ImageCell;
 use frankenterm_cell::{Cell, CellAttributes, SemanticType};
 use frankenterm_surface::line::clustered_append_breaks;
-use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_surface::{Line, SequenceNo};
 use std::ops::Range;
 
@@ -719,7 +719,8 @@ pub fn blank_band(
 /// legacy keeps every cell.
 pub fn semantic_zone_ranges(page: &Page, row: u32) -> Vec<(SemanticType, Range<u16>)> {
     let len = page.row_len(row);
-    let is_blank = |x: usize| page.cell(row, x).with_hidden(false).with_wide(false) == PackedCell::BLANK;
+    let is_blank =
+        |x: usize| page.cell(row, x).with_hidden(false).with_wide(false) == PackedCell::BLANK;
     let mut last_non_blank = len;
     for x in 0..len {
         if !page.cell(row, x).is_hidden() && !is_blank(x) {
@@ -753,7 +754,12 @@ pub fn semantic_zone_ranges(page: &Page, row: u32) -> Vec<(SemanticType, Range<u
 /// The visible cell a grapheme printed at `cursor_x` may continue, as the
 /// performer's merge looks for it (ft-yccm0.2.14): the one at the cursor
 /// when a wrap is pending, otherwise the last one before the cursor.
-pub fn merge_candidate(page: &Page, row: u32, cursor_x: usize, pending_wrap: bool) -> Option<usize> {
+pub fn merge_candidate(
+    page: &Page,
+    row: u32,
+    cursor_x: usize,
+    pending_wrap: bool,
+) -> Option<usize> {
     let len = page.row_len(row);
     if pending_wrap && cursor_x < len && !page.cell(row, cursor_x).is_hidden() {
         return Some(cursor_x);
@@ -899,9 +905,9 @@ mod tests {
                 attrs.set_wrapped(true);
             }
             5 => {
-                attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(
-                    SrgbaTuple(0.25, 0.5, 0.75, 1.0),
-                ));
+                attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(SrgbaTuple(
+                    0.25, 0.5, 0.75, 1.0,
+                )));
             }
             6 => {
                 attrs.set_semantic_type(SemanticType::Prompt);
@@ -976,19 +982,58 @@ mod tests {
 
     #[derive(Clone, Debug)]
     enum Op {
-        SetCell { x: usize, glyph: usize, attrs: u8 },
-        Grapheme { x: usize, glyph: usize, attrs: u8 },
-        Ascii { x: usize, text: usize, attrs: u8 },
-        Wrapped { wrapped: bool },
-        Fill { start: usize, end: usize, attrs: u8 },
+        SetCell {
+            x: usize,
+            glyph: usize,
+            attrs: u8,
+        },
+        Grapheme {
+            x: usize,
+            glyph: usize,
+            attrs: u8,
+        },
+        Ascii {
+            x: usize,
+            text: usize,
+            attrs: u8,
+        },
+        Wrapped {
+            wrapped: bool,
+        },
+        Fill {
+            start: usize,
+            end: usize,
+            attrs: u8,
+        },
         Compress,
-        Insert { x: usize, margin: usize },
-        Delete { x: usize, margin: usize, attrs: u8 },
-        Size { size: usize },
+        Insert {
+            x: usize,
+            margin: usize,
+        },
+        Delete {
+            x: usize,
+            margin: usize,
+            attrs: u8,
+        },
+        Size {
+            size: usize,
+        },
         Align,
-        TakeBand { start: usize, end: usize },
-        PutBand { start: usize, cells: Vec<(usize, u8)>, end: usize, attrs: u8 },
-        BlankBand { start: usize, end: usize, attrs: u8 },
+        TakeBand {
+            start: usize,
+            end: usize,
+        },
+        PutBand {
+            start: usize,
+            cells: Vec<(usize, u8)>,
+            end: usize,
+            attrs: u8,
+        },
+        BlankBand {
+            start: usize,
+            end: usize,
+            attrs: u8,
+        },
     }
 
     const SIZES: [LineSize; 4] = [

@@ -9334,7 +9334,9 @@ impl Screen {
     #[cfg(test)]
     pub(crate) fn rows_held_by_views(&self) -> usize {
         self.lines.page().map_or(0, |rows| {
-            (0..rows.len()).filter(|&index| rows.is_edited(index)).count()
+            (0..rows.len())
+                .filter(|&index| rows.is_edited(index))
+                .count()
         })
     }
 
@@ -9782,7 +9784,13 @@ impl Screen {
         if rows_to_copy > 0 {
             for dest_row in phys_scroll.start..phys_scroll.start + rows_to_copy {
                 let src_row = dest_row + num_rows;
-                self.copy_margin_band(src_row, dest_row, left_and_right_margins, &blank_attr, seqno);
+                self.copy_margin_band(
+                    src_row,
+                    dest_row,
+                    left_and_right_margins,
+                    &blank_attr,
+                    seqno,
+                );
             }
         }
 
@@ -9818,7 +9826,15 @@ impl Screen {
 
         // and place them into the dest
         if let Some((page, row)) = self.page_row(dest) {
-            if native::put_band(page, row, margins.start, &cells, margins.end, blank_attr, seqno) {
+            if native::put_band(
+                page,
+                row,
+                margins.start,
+                &cells,
+                margins.end,
+                blank_attr,
+                seqno,
+            ) {
                 return;
             }
         }
@@ -10410,7 +10426,13 @@ impl Screen {
         if rows_to_copy > 0 {
             for src_row in (phys_scroll.start..phys_scroll.start + rows_to_copy).rev() {
                 let dest_row = src_row + num_rows;
-                self.copy_margin_band(src_row, dest_row, left_and_right_margins, &blank_attr, seqno);
+                self.copy_margin_band(
+                    src_row,
+                    dest_row,
+                    left_and_right_margins,
+                    &blank_attr,
+                    seqno,
+                );
             }
         }
 
