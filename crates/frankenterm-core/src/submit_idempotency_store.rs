@@ -165,6 +165,7 @@ impl SubmitIdempotencyError {
 pub enum SubmitIdempotencyOpenFailureSite {
     LeafMetadata,
     LeafType,
+    LeafLinkCount,
     OpenedLeafMetadata,
     OpenedLeafType,
     NamedLeafMissing,
@@ -219,6 +220,7 @@ impl fmt::Display for SubmitIdempotencyOpenFailureSite {
         formatter.write_str(match self {
             Self::LeafMetadata => "leaf_metadata",
             Self::LeafType => "leaf_type",
+            Self::LeafLinkCount => "leaf_link_count",
             Self::OpenedLeafMetadata => "opened_leaf_metadata",
             Self::OpenedLeafType => "opened_leaf_type",
             Self::NamedLeafMissing => "named_leaf_missing",
@@ -1001,6 +1003,14 @@ fn store_leaf_metadata_nofollow(
         }
         Ok(metadata) if !metadata.is_file() => Err(SubmitIdempotencyError::OpenFailed {
             site: SubmitIdempotencyOpenFailureSite::LeafType,
+        }),
+        // A second name for a store file, such as a planted hard link, keeps
+        // its contents reachable outside the pinned private directory
+        // (ft-7h5da.3.5.4). Callers re-check after opening, so this holds on
+        // both sides of the open.
+        #[cfg(unix)]
+        Ok(metadata) if metadata.nlink() > 1 => Err(SubmitIdempotencyError::OpenFailed {
+            site: SubmitIdempotencyOpenFailureSite::LeafLinkCount,
         }),
         Ok(metadata) => Ok(Some(metadata)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => Ok(None),
@@ -3956,6 +3966,64 @@ mod tests {
             Err(SubmitIdempotencyError::SymlinkRejected)
         );
         assert!(!real_parent.join("nested-ft").exists());
+    }
+
+    /// ft-7h5da.3.5.4: a planted hard link, FIFO or directory at the database
+    /// name or any journal sidecar name fails closed without being opened.
+    /// The hard link's other name keeps its contents, and a bad sidecar is
+    /// refused before the database is created.
+    #[cfg(unix)]
+    #[test]
+    fn hostile_hard_links_fifos_and_directories_at_store_names_fail_closed() {
+        let open_failure = |site| Err(SubmitIdempotencyError::OpenFailed { site });
+        for (index, filename) in std::iter::once(STORE_FILENAME)
+            .chain(STORE_AUXILIARY_FILENAMES)
+            .enumerate()
+        {
+            let is_database = filename == STORE_FILENAME;
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let outside = dir.path().join(format!("outside-{index}"));
+            std::fs::write(&outside, b"planted").expect("write link target");
+            std::fs::hard_link(&outside, dir.path().join(filename)).expect("plant hard link");
+            assert_eq!(
+                claim(dir.path(), &binding(17, filename)),
+                open_failure(SubmitIdempotencyOpenFailureSite::LeafLinkCount),
+                "hard link at {filename}"
+            );
+            assert_eq!(
+                std::fs::read(&outside).expect("read link target"),
+                b"planted"
+            );
+            if !is_database {
+                assert!(!database_path(dir.path()).exists(), "{filename}");
+            }
+
+            let non_regular_site = if is_database {
+                SubmitIdempotencyOpenFailureSite::DatabaseType
+            } else {
+                SubmitIdempotencyOpenFailureSite::LeafType
+            };
+            let fifo_dir = tempfile::tempdir().expect("tempdir");
+            let status = std::process::Command::new("mkfifo")
+                .arg(fifo_dir.path().join(filename))
+                .status()
+                .expect("run mkfifo");
+            assert!(status.success(), "mkfifo {filename}");
+            assert_eq!(
+                claim(fifo_dir.path(), &binding(17, filename)),
+                open_failure(non_regular_site),
+                "FIFO at {filename}"
+            );
+
+            let directory_dir = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir(directory_dir.path().join(filename)).expect("plant directory");
+            assert_eq!(
+                claim(directory_dir.path(), &binding(17, filename)),
+                open_failure(non_regular_site),
+                "directory at {filename}"
+            );
+        }
     }
 
     #[cfg(unix)]
