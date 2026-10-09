@@ -42,6 +42,9 @@ crates/frankenterm-core/tests/frankensqlite_gate_tests.rs	use std::os::unix::fs:
 crates/frankenterm-core/tests/integration_native_events.rs	std::os::unix::fs::symlink(&real_parent, &symlink_parent).expect("create parent symlink");
 crates/frankenterm-core/tests/integration_native_events.rs	std::os::unix::net::UnixListener::bind(&socket_path).expect("bind replacement socket");
 crates/frankenterm-core/tests/integration_native_events.rs	use std::os::unix::fs::{MetadataExt, PermissionsExt};
+# ft-yykm1: the whole test file is gated by the inner attribute #![cfg(unix)],
+# which the guard's lookback does not recognize.
+crates/frankenterm-core/tests/wezterm_cli_timeout_reaps_child.rs	use std::os::unix::fs::PermissionsExt as _;
 crates/frankenterm-gui/src/domain_reconnect_manifest.rs	std::os::unix::fs::symlink(&outside, &legacy).expect("plant legacy namespace symlink");
 crates/frankenterm-gui/src/domain_reconnect_manifest.rs	std::os::unix::fs::symlink(other.path(), &manifest_paths(other.path())[0])
 crates/frankenterm-gui/src/native_bridge.rs	let listener = std::os::unix::net::UnixListener::bind(&socket_path)
