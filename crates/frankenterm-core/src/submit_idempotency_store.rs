@@ -1656,13 +1656,26 @@ fn fresh_owner_nonce() -> Result<[u8; OWNER_NONCE_BYTES], SubmitIdempotencyError
     Ok(nonce)
 }
 
+/// Logical bytes one row charges against the byte ceiling. Parameters: ?1 the
+/// per-record overhead, ?2 the completed state, ?3 the retryable state, ?4 the
+/// receipt reserve every unsettled row holds.
+macro_rules! logical_record_bytes_sql {
+    () => {
+        "(?1 + length(CAST(idempotency_key AS BLOB)) + length(CAST(pane_id AS BLOB)) + length(CAST(request_sha256 AS BLOB)) + length(CAST(effect_sha256 AS BLOB)) + length(owner_nonce) + CASE WHEN state = ?2 THEN length(CAST(receipt_json AS BLOB)) WHEN state = ?3 THEN 0 ELSE ?4 END)"
+    };
+}
+
 fn store_usage(
     conn: &Connection,
     limits: StoreLimits,
 ) -> Result<(i64, i64), SubmitIdempotencyError> {
     map_sqlite(
         conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(?1 + length(CAST(idempotency_key AS BLOB)) + length(CAST(pane_id AS BLOB)) + length(CAST(request_sha256 AS BLOB)) + length(CAST(effect_sha256 AS BLOB)) + length(owner_nonce) + CASE WHEN state = ?2 THEN length(CAST(receipt_json AS BLOB)) WHEN state = ?3 THEN 0 ELSE ?4 END), 0) FROM verified_submit_idempotency",
+            concat!(
+                "SELECT COUNT(*), COALESCE(SUM(",
+                logical_record_bytes_sql!(),
+                "), 0) FROM verified_submit_idempotency"
+            ),
             params![
                 LOGICAL_RECORD_OVERHEAD_BYTES,
                 STATE_COMPLETED,
@@ -2503,6 +2516,203 @@ where
     };
     map_sqlite(tx.commit(), SubmitIdempotencyError::ClaimFailed)?;
     Ok(state)
+}
+
+/// Logical bytes of the largest new reserved record: the schema caps keys at
+/// 90 bytes and pane ids at 20 digits.
+const MAX_NEW_RECORD_LOGICAL_BYTES: i64 = LOGICAL_RECORD_OVERHEAD_BYTES
+    + 90
+    + 20
+    + 64
+    + 64
+    + OWNER_NONCE_BYTES as i64
+    + MAX_RECEIPT_JSON_BYTES as i64;
+
+/// Per-state row count, oldest update, logical bytes, and the rows (and their
+/// bytes) already past their retention horizon. ?1-?4 as in
+/// `logical_record_bytes_sql!`; ?5 and ?6 are the completed and retryable
+/// eviction cutoffs, matching `evict_expired_settled_rows_locked`.
+const CENSUS_SQL: &str = concat!(
+    "SELECT state, COUNT(*), MIN(updated_unix_ms), COALESCE(SUM(",
+    logical_record_bytes_sql!(),
+    "), 0), COALESCE(SUM(CASE WHEN (state = ?2 AND updated_unix_ms < ?5) OR (state = ?3 AND updated_unix_ms < ?6) THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN (state = ?2 AND updated_unix_ms < ?5) OR (state = ?3 AND updated_unix_ms < ?6) THEN ",
+    logical_record_bytes_sql!(),
+    " ELSE 0 END), 0) FROM verified_submit_idempotency GROUP BY state"
+);
+
+/// Content-free occupancy of the store for health surfaces: counts and byte
+/// totals only, never keys, panes, or receipts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubmitIdempotencyCensus {
+    pub active_owner: u64,
+    pub effect_applied_receipt_pending: u64,
+    pub in_doubt: u64,
+    pub completed: u64,
+    pub retryable: u64,
+    /// Logical bytes charged against the byte ceiling.
+    pub logical_bytes: u64,
+    /// Settled rows already past their retention horizon, which pressured
+    /// admissions may evict, and the logical bytes they hold.
+    pub evictable_records: u64,
+    pub evictable_logical_bytes: u64,
+    /// Last update of the oldest active, effect-applied, or in-doubt row.
+    pub oldest_unresolved_updated_unix_ms: Option<i64>,
+    pub max_records: u64,
+    pub max_logical_bytes: u64,
+}
+
+impl SubmitIdempotencyCensus {
+    #[must_use]
+    pub const fn records(&self) -> u64 {
+        self.active_owner
+            .saturating_add(self.effect_applied_receipt_pending)
+            .saturating_add(self.in_doubt)
+            .saturating_add(self.completed)
+            .saturating_add(self.retryable)
+    }
+
+    /// Rows that are never evicted: active, effect-applied, and in-doubt.
+    #[must_use]
+    pub const fn unresolved(&self) -> u64 {
+        self.active_owner
+            .saturating_add(self.effect_applied_receipt_pending)
+            .saturating_add(self.in_doubt)
+    }
+
+    /// Rows eviction cannot reclaim now: unresolved authority plus settled
+    /// rows still inside their retention horizon.
+    #[must_use]
+    pub const fn pinned_records(&self) -> u64 {
+        self.records().saturating_sub(self.evictable_records)
+    }
+
+    #[must_use]
+    pub const fn pinned_logical_bytes(&self) -> u64 {
+        self.logical_bytes
+            .saturating_sub(self.evictable_logical_bytes)
+    }
+
+    /// Whether a new caller key fits once every evictable row is reclaimed.
+    /// When false, new verified sends fail with `capacity_exceeded`.
+    #[must_use]
+    pub const fn admits_new_key(&self) -> bool {
+        self.pinned_records() < self.max_records
+            && self
+                .pinned_logical_bytes()
+                .saturating_add(MAX_NEW_RECORD_LOGICAL_BYTES as u64)
+                <= self.max_logical_bytes
+    }
+}
+
+/// Read-only occupancy census, or `None` when no store exists yet. It never
+/// creates the store and takes no write lock.
+///
+/// # Errors
+/// Returns a finite [`SubmitIdempotencyError`] for unsafe paths, a foreign or
+/// corrupt schema, or a malformed row.
+pub fn census(ft_dir: &Path) -> Result<Option<SubmitIdempotencyCensus>, SubmitIdempotencyError> {
+    census_with_limits_at(ft_dir, PRODUCTION_LIMITS, now_unix_ms())
+}
+
+fn census_with_limits_at(
+    ft_dir: &Path,
+    limits: StoreLimits,
+    now: i64,
+) -> Result<Option<SubmitIdempotencyCensus>, SubmitIdempotencyError> {
+    let Some(mut conn) = open_store(ft_dir, StoreOpenMode::Existing)? else {
+        return Ok(None);
+    };
+    let mut census = SubmitIdempotencyCensus {
+        max_records: u64::try_from(limits.max_records)
+            .map_err(|_| SubmitIdempotencyError::CapacityExceeded)?,
+        max_logical_bytes: u64::try_from(limits.max_logical_bytes)
+            .map_err(|_| SubmitIdempotencyError::CapacityExceeded)?,
+        ..SubmitIdempotencyCensus::default()
+    };
+    let tx = map_sqlite(
+        conn.transaction_with_behavior(TransactionBehavior::Deferred),
+        SubmitIdempotencyError::ClaimFailed,
+    )?;
+    match schema_header(&tx)? {
+        (STORE_APPLICATION_ID, STORE_SCHEMA_VERSION) => validate_initialized_schema_locked(&tx)?,
+        // A claim that failed before initializing leaves a blank database.
+        (0, 0) => {
+            validate_blank_schema(&tx)?;
+            return Ok(Some(census));
+        }
+        _ => return Err(SubmitIdempotencyError::SchemaMismatch),
+    }
+    let rows = {
+        let mut statement =
+            map_sqlite(tx.prepare(CENSUS_SQL), SubmitIdempotencyError::ClaimFailed)?;
+        let mapped = map_sqlite(
+            statement.query_map(
+                params![
+                    LOGICAL_RECORD_OVERHEAD_BYTES,
+                    STATE_COMPLETED,
+                    STATE_RETRYABLE,
+                    limits.receipt_reserve_bytes,
+                    now.saturating_sub(limits.completed_retention_ms),
+                    now.saturating_sub(limits.retryable_retention_ms),
+                ],
+                |row| {
+                    Ok([
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ])
+                },
+            ),
+            SubmitIdempotencyError::ClaimFailed,
+        )?;
+        map_sqlite(
+            mapped.collect::<Result<Vec<_>, _>>(),
+            SubmitIdempotencyError::ClaimFailed,
+        )?
+    };
+    let non_negative =
+        |value: i64| u64::try_from(value).map_err(|_| SubmitIdempotencyError::RecordCorrupt);
+    for [
+        state,
+        count,
+        oldest_update,
+        bytes,
+        evictable,
+        evictable_bytes,
+    ] in rows
+    {
+        let count = non_negative(count)?;
+        match state {
+            STATE_ACTIVE_OWNER => census.active_owner = count,
+            STATE_EFFECT_APPLIED_RECEIPT_PENDING => census.effect_applied_receipt_pending = count,
+            STATE_IN_DOUBT => census.in_doubt = count,
+            STATE_COMPLETED => census.completed = count,
+            STATE_RETRYABLE => census.retryable = count,
+            _ => return Err(SubmitIdempotencyError::RecordCorrupt),
+        }
+        if matches!(
+            state,
+            STATE_ACTIVE_OWNER | STATE_EFFECT_APPLIED_RECEIPT_PENDING | STATE_IN_DOUBT
+        ) {
+            census.oldest_unresolved_updated_unix_ms = Some(
+                census
+                    .oldest_unresolved_updated_unix_ms
+                    .map_or(oldest_update, |oldest| oldest.min(oldest_update)),
+            );
+        }
+        census.logical_bytes = census.logical_bytes.saturating_add(non_negative(bytes)?);
+        census.evictable_records = census
+            .evictable_records
+            .saturating_add(non_negative(evictable)?);
+        census.evictable_logical_bytes = census
+            .evictable_logical_bytes
+            .saturating_add(non_negative(evictable_bytes)?);
+    }
+    map_sqlite(tx.commit(), SubmitIdempotencyError::ClaimFailed)?;
+    Ok(Some(census))
 }
 
 #[cfg(test)]
@@ -3787,6 +3997,168 @@ mod tests {
         assert!(
             !database_path(dir.path()).exists(),
             "limit validation precedes store creation"
+        );
+    }
+
+    #[test]
+    fn census_without_a_store_is_none_and_never_creates_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(census(dir.path()), Ok(None));
+        assert!(!database_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn census_counts_states_bytes_and_retention_eligibility_exactly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let limits = PRODUCTION_LIMITS;
+        let completed = binding(24, "census-completed");
+        let retryable = binding(24, "census-retryable");
+        let in_doubt = binding(24, "census-in-doubt");
+        let pending = binding(24, "census-pending");
+        let active = binding(24, "census-active");
+        let token = claim_at(dir.path(), &completed, limits, 1_000);
+        transition_from_active_owner_at(
+            dir.path(),
+            &completed,
+            token,
+            STATE_EFFECT_APPLIED_RECEIPT_PENDING,
+            None,
+            1_000,
+        )
+        .expect("mark effect applied");
+        complete_at(
+            dir.path(),
+            &completed,
+            token,
+            &receipt_for(&completed),
+            1_000,
+        )
+        .expect("complete receipt");
+        let token = claim_at(dir.path(), &retryable, limits, 1_000);
+        transition_from_active_owner_at(
+            dir.path(),
+            &retryable,
+            token,
+            STATE_RETRYABLE,
+            Some(RetryableReason::PolicyDenied),
+            1_000,
+        )
+        .expect("mark retryable");
+        let token = claim_at(dir.path(), &in_doubt, limits, 1_000);
+        transition_from_active_owner_at(dir.path(), &in_doubt, token, STATE_IN_DOUBT, None, 1_000)
+            .expect("mark in doubt");
+        let token = claim_at(dir.path(), &pending, limits, 2_000);
+        transition_from_active_owner_at(
+            dir.path(),
+            &pending,
+            token,
+            STATE_EFFECT_APPLIED_RECEIPT_PENDING,
+            None,
+            2_000,
+        )
+        .expect("mark effect applied");
+        claim_at(dir.path(), &active, limits, 3_000);
+
+        let (records, bytes) =
+            store_usage(&raw_connection(dir.path()), limits).expect("store usage");
+        let retryable_bytes = new_record_logical_bytes(&retryable, limits)
+            .expect("record bytes")
+            .checked_sub(limits.receipt_reserve_bytes)
+            .expect("retryable rows hold no receipt reserve");
+        let after_retryable_horizon = 1_000 + RETRYABLE_RETENTION_MS + 1;
+        let first = census_with_limits_at(dir.path(), limits, after_retryable_horizon)
+            .expect("census")
+            .expect("store exists");
+        assert_eq!(
+            first,
+            SubmitIdempotencyCensus {
+                active_owner: 1,
+                effect_applied_receipt_pending: 1,
+                in_doubt: 1,
+                completed: 1,
+                retryable: 1,
+                logical_bytes: u64::try_from(bytes).expect("bytes"),
+                evictable_records: 1,
+                evictable_logical_bytes: u64::try_from(retryable_bytes).expect("bytes"),
+                oldest_unresolved_updated_unix_ms: Some(1_000),
+                max_records: u64::try_from(MAX_STORE_RECORDS).expect("records"),
+                max_logical_bytes: u64::try_from(MAX_STORE_LOGICAL_BYTES).expect("bytes"),
+            }
+        );
+        assert_eq!(i64::try_from(first.records()).expect("records"), records);
+        assert_eq!(first.unresolved(), 3);
+        assert!(first.admits_new_key());
+
+        // Past the completed horizon both settled rows are eligible, and the
+        // census agrees exactly with what eviction then deletes.
+        let after_completed_horizon = 1_000 + COMPLETED_RETENTION_MS + 1;
+        let second = census_with_limits_at(dir.path(), limits, after_completed_horizon)
+            .expect("census")
+            .expect("store exists");
+        assert_eq!(second.evictable_records, 2);
+        let evicted = evict_expired_settled_rows_locked(
+            &raw_connection(dir.path()),
+            "",
+            limits,
+            after_completed_horizon,
+        )
+        .expect("evict expired rows");
+        assert_eq!(
+            u64::try_from(evicted).expect("evicted"),
+            second.evictable_records
+        );
+        let third = census_with_limits_at(dir.path(), limits, after_completed_horizon)
+            .expect("census")
+            .expect("store exists");
+        assert_eq!(third.records(), 3);
+        assert_eq!(third.evictable_records, 0);
+        assert_eq!(third.logical_bytes, second.pinned_logical_bytes());
+    }
+
+    #[test]
+    fn census_admission_verdict_counts_only_pinned_rows() {
+        let record = MAX_NEW_RECORD_LOGICAL_BYTES as u64;
+        let base = SubmitIdempotencyCensus {
+            max_records: 10,
+            max_logical_bytes: 10 * record,
+            ..SubmitIdempotencyCensus::default()
+        };
+        let expired_settled = SubmitIdempotencyCensus {
+            completed: 10,
+            logical_bytes: 10 * record,
+            evictable_records: 10,
+            evictable_logical_bytes: 10 * record,
+            ..base
+        };
+        assert!(
+            expired_settled.admits_new_key(),
+            "a full store of expired settled rows still admits"
+        );
+        let one_free_slot = SubmitIdempotencyCensus {
+            in_doubt: 9,
+            logical_bytes: 9 * record,
+            ..base
+        };
+        assert!(one_free_slot.admits_new_key());
+        let records_pinned = SubmitIdempotencyCensus {
+            in_doubt: 10,
+            logical_bytes: 10 * record,
+            ..base
+        };
+        assert!(!records_pinned.admits_new_key());
+        let bytes_pinned = SubmitIdempotencyCensus {
+            in_doubt: 1,
+            logical_bytes: 9 * record + 1,
+            ..base
+        };
+        assert!(!bytes_pinned.admits_new_key());
+    }
+
+    #[test]
+    fn largest_new_record_bound_matches_a_maximal_binding() {
+        assert_eq!(
+            new_record_logical_bytes(&binding(u64::MAX, "largest"), PRODUCTION_LIMITS),
+            Ok(MAX_NEW_RECORD_LOGICAL_BYTES)
         );
     }
 

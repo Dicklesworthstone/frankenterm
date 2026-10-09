@@ -28116,6 +28116,73 @@ fn watcher_lock_diagnostic_check(status: &frankenterm_core::lock::LockStatus) ->
     }
 }
 
+const SUBMIT_IDEMPOTENCY_STORE_CHECK: &str = "submit idempotency store";
+
+/// Content-free occupancy of the verified-submit idempotency store. Settled
+/// rows are evicted past their retention horizon, so a full store is normal;
+/// only rows eviction cannot reclaim (unresolved sends and settled rows still
+/// inside their horizon) can refuse new idempotency keys.
+fn submit_idempotency_store_diagnostic_check(
+    census: Result<
+        Option<frankenterm_core::submit_idempotency_store::SubmitIdempotencyCensus>,
+        frankenterm_core::submit_idempotency_store::SubmitIdempotencyError,
+    >,
+    now_unix_ms: i64,
+) -> DiagnosticCheck {
+    let census = match census {
+        Ok(Some(census)) => census,
+        Ok(None) => {
+            return DiagnosticCheck::ok_with_detail(
+                SUBMIT_IDEMPOTENCY_STORE_CHECK,
+                "not created; no verified send has used an idempotency key yet",
+            );
+        }
+        Err(error) => {
+            return DiagnosticCheck::warning(
+                SUBMIT_IDEMPOTENCY_STORE_CHECK,
+                format!("store could not be inspected ({})", error.error_class()),
+                "Verified sends with an idempotency key fail closed until the store opens; review the .ft directory permissions",
+            );
+        }
+    };
+    let mut detail = format!(
+        "{} of {} records, {} of {} logical bytes; completed {}, retryable {}, active {}, effect pending {}, in doubt {}; {} evictable",
+        census.records(),
+        census.max_records,
+        census.logical_bytes,
+        census.max_logical_bytes,
+        census.completed,
+        census.retryable,
+        census.active_owner,
+        census.effect_applied_receipt_pending,
+        census.in_doubt,
+        census.evictable_records,
+    );
+    if let Some(oldest) = census.oldest_unresolved_updated_unix_ms {
+        let age_secs = now_unix_ms.saturating_sub(oldest).max(0) / 1000;
+        detail.push_str(&format!("; oldest unresolved {age_secs}s old"));
+    }
+    if !census.admits_new_key() {
+        return DiagnosticCheck::error(
+            SUBMIT_IDEMPOTENCY_STORE_CHECK,
+            detail,
+            "New sends with an idempotency key fail with capacity_exceeded: unresolved and recent rows fill the store. Investigate the injector errors behind in-doubt sends; completed receipts become evictable after 24 hours",
+        );
+    }
+    let three_quarters_pinned = census.pinned_records().saturating_mul(4)
+        >= census.max_records.saturating_mul(3)
+        || census.pinned_logical_bytes().saturating_mul(4)
+            >= census.max_logical_bytes.saturating_mul(3);
+    if three_quarters_pinned {
+        return DiagnosticCheck::warning(
+            SUBMIT_IDEMPOTENCY_STORE_CHECK,
+            detail,
+            "Three quarters of the store is pinned by unresolved or recent rows; investigate the injector errors behind in-doubt sends before new keys are refused",
+        );
+    }
+    DiagnosticCheck::ok_with_detail(SUBMIT_IDEMPOTENCY_STORE_CHECK, detail)
+}
+
 fn open_cli_read_only_connection(db_path: &str) -> rusqlite::Result<rusqlite::Connection> {
     let conn = rusqlite::Connection::open_with_flags(
         db_path,
@@ -100125,6 +100192,13 @@ async fn run_diagnostics_with_mux_client(
         }
     }
 
+    // Check 4b: verified-submit idempotency store occupancy. Read-only; a
+    // missing store is never created here.
+    checks.push(submit_idempotency_store_diagnostic_check(
+        frankenterm_core::submit_idempotency_store::census(&layout.ft_dir),
+        now_epoch_ms(),
+    ));
+
     // Check 5: Lock file (watcher status)
     let watcher_lock_status = frankenterm_core::lock::check_running(&layout.lock_path);
     checks.push(watcher_lock_diagnostic_check(&watcher_lock_status));
@@ -143798,6 +143872,82 @@ A  docs/new-proof.md\n";
 
             let _ = std::fs::remove_dir_all(&temp);
         });
+    }
+
+    #[test]
+    fn submit_idempotency_store_check_grades_only_pinned_capacity() {
+        use frankenterm_core::submit_idempotency_store::{
+            SubmitIdempotencyCensus, SubmitIdempotencyError,
+        };
+        let missing = submit_idempotency_store_diagnostic_check(Ok(None), 0);
+        assert_eq!(missing.status, DiagnosticStatus::Ok);
+
+        let base = SubmitIdempotencyCensus {
+            max_records: 100,
+            max_logical_bytes: 100 * 70_000,
+            ..SubmitIdempotencyCensus::default()
+        };
+        // A store at its record ceiling is healthy when eviction can reclaim it.
+        let full_but_evictable = SubmitIdempotencyCensus {
+            completed: 99,
+            in_doubt: 1,
+            logical_bytes: 100 * 800,
+            evictable_records: 80,
+            evictable_logical_bytes: 80 * 800,
+            oldest_unresolved_updated_unix_ms: Some(1_000),
+            ..base
+        };
+        let healthy =
+            submit_idempotency_store_diagnostic_check(Ok(Some(full_but_evictable)), 61_000);
+        assert_eq!(healthy.status, DiagnosticStatus::Ok);
+        let detail = healthy.detail.as_deref().unwrap_or_default();
+        assert!(detail.contains("100 of 100 records"), "{detail}");
+        assert!(detail.contains("in doubt 1"), "{detail}");
+        assert!(detail.contains("80 evictable"), "{detail}");
+        assert!(detail.contains("oldest unresolved 60s old"), "{detail}");
+
+        let three_quarters_in_doubt = SubmitIdempotencyCensus {
+            in_doubt: 75,
+            logical_bytes: 75 * 800,
+            ..base
+        };
+        assert_eq!(
+            submit_idempotency_store_diagnostic_check(Ok(Some(three_quarters_in_doubt)), 0).status,
+            DiagnosticStatus::Warning
+        );
+
+        let records_pinned = SubmitIdempotencyCensus {
+            in_doubt: 100,
+            logical_bytes: 100 * 800,
+            ..base
+        };
+        let refused = submit_idempotency_store_diagnostic_check(Ok(Some(records_pinned)), 0);
+        assert_eq!(refused.status, DiagnosticStatus::Error);
+        assert!(
+            refused
+                .recommendation
+                .as_deref()
+                .is_some_and(|text| text.contains("capacity_exceeded"))
+        );
+
+        let bytes_pinned = SubmitIdempotencyCensus {
+            in_doubt: 10,
+            logical_bytes: base.max_logical_bytes,
+            ..base
+        };
+        assert_eq!(
+            submit_idempotency_store_diagnostic_check(Ok(Some(bytes_pinned)), 0).status,
+            DiagnosticStatus::Error
+        );
+
+        let unreadable = submit_idempotency_store_diagnostic_check(
+            Err(SubmitIdempotencyError::SchemaMismatch),
+            0,
+        );
+        assert_eq!(unreadable.status, DiagnosticStatus::Warning);
+        assert!(unreadable.detail.as_deref().is_some_and(|text| {
+            text.contains(SubmitIdempotencyError::SchemaMismatch.error_class())
+        }));
     }
 
     fn latest_release_fixture(tag: &str) -> serde_json::Value {
