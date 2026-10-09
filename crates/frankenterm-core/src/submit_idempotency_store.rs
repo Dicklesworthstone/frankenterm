@@ -3957,4 +3957,90 @@ mod tests {
         );
         assert!(!real_parent.join("nested-ft").exists());
     }
+
+    #[cfg(unix)]
+    const REAL_SIDECAR_PROBE_ENV: &str = "FT_SUBMIT_STORE_REAL_SIDECAR_PROBE";
+    #[cfg(unix)]
+    const REAL_SIDECAR_TEST: &str = "submit_idempotency_store::tests::real_sqlite_sidecars_are_owner_only_from_creation_under_a_permissive_umask";
+
+    /// ft-7h5da.3.5.4: the WAL and SHM files real SQLite creates for the store
+    /// are owner-only from creation, even under a fully permissive umask. No
+    /// hardening helper runs between SQLite creating them and the check. A new
+    /// journal file gets the database file's mode (os_unix.c
+    /// findCreateFileMode), and robust_open fchmods it past the umask, so the
+    /// store's 0600 database leaf is what keeps them private. The probe runs in
+    /// a child process because the umask is process-wide.
+    #[cfg(unix)]
+    #[test]
+    fn real_sqlite_sidecars_are_owner_only_from_creation_under_a_permissive_umask() {
+        if std::env::var_os(REAL_SIDECAR_PROBE_ENV).is_some() {
+            real_sidecar_probe();
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                REAL_SIDECAR_TEST,
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(REAL_SIDECAR_PROBE_ENV, "1")
+            .output()
+            .expect("run the sidecar probe");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "probe failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the probe must actually run: {stdout}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn real_sidecar_probe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        rustix::process::umask(rustix::fs::Mode::empty());
+        let mode_of = |path: &Path| {
+            std::fs::metadata(path)
+                .unwrap_or_else(|error| panic!("{} must exist: {error}", path.display()))
+                .permissions()
+                .mode()
+                & 0o777
+        };
+
+        // Creation and recreation: the store's own private leaf, then plain
+        // SQLite, which creates both sidecars on the first write and again
+        // after a close deleted them.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pinned = CapDir::open_ambient_dir(dir.path(), cap_std::ambient_authority())
+            .expect("pin the store directory");
+        ensure_private_database_leaf(&pinned, StoreOpenMode::Create).expect("private leaf");
+        let database = database_path(dir.path());
+        let wal = dir.path().join(STORE_WAL_FILENAME);
+        let shm = dir.path().join(STORE_SHM_FILENAME);
+        for round in ["first creation", "recreation after close"] {
+            let conn = Connection::open(&database).expect("open the store database");
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .expect("enable WAL");
+            conn.execute_batch(
+                "BEGIN IMMEDIATE; CREATE TABLE IF NOT EXISTS probe(x); \
+                 INSERT INTO probe VALUES (1); COMMIT;",
+            )
+            .expect("first authority-bearing write");
+            for path in [&database, &wal, &shm] {
+                assert_eq!(mode_of(path), 0o600, "{round}: {}", path.display());
+            }
+            drop(conn);
+            assert!(!wal.exists(), "closing the last connection removes the WAL");
+        }
+
+        // The production claim path under the same umask.
+        let store = tempfile::tempdir().expect("tempdir");
+        let _token = claim_token(store.path(), &binding(16, "permissive-umask"));
+        assert_eq!(mode_of(&database_path(store.path())), 0o600);
+    }
 }
