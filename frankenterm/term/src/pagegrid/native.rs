@@ -1089,11 +1089,13 @@ mod tests {
             }),
             Just(Op::Compress),
             (0usize..12, 0usize..13).prop_map(|(x, margin)| Op::Insert { x, margin }),
-            (0usize..13, 0usize..13, 0u8..16).prop_map(|(x, margin, attrs)| Op::Delete {
-                x,
-                margin,
-                attrs
-            }),
+            // DCH and SL delete only inside the margins: x is left of the
+            // right margin, which is at least 1 and at most the row width.
+            // An x past the margin grew a full row past COLS, which no
+            // screen sequence can do (ft-5jngl).
+            (1usize..13)
+                .prop_flat_map(|margin| (0..margin, Just(margin), 0u8..16))
+                .prop_map(|(x, margin, attrs)| Op::Delete { x, margin, attrs }),
             (0..SIZES.len()).prop_map(|size| Op::Size { size }),
             Just(Op::Align),
             (0usize..12, 0usize..13).prop_map(|(start, end)| Op::TakeBand { start, end }),

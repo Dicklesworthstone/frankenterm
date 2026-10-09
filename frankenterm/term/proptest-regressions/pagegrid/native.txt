@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc e616cd44dd4220e81d165d1babd06a030c260f7d685d3b91157bbd6e2b4b9717 # shrinks to ops = [PutBand { start: 5, cells: [(5, 0), (5, 0)], end: 0, attrs: 0 }, PutBand { start: 8, cells: [], end: 0, attrs: 0 }, Ascii { x: 7, text: 0, attrs: 0 }]
 cc dc8cad5fa0fcc4021875f79fc2ae564519b2256019a6c17732854248c01f1b7e # shrinks to ops = [Grapheme { x: 0, glyph: 11, attrs: 0 }]
+cc 6ede3aad52163c9347890707911fb7f4cdd31a5730b1c983290ac6144a31193c # shrinks to ops = [PutBand { start: 9, cells: [(5, 0), (0, 0), (5, 0)], end: 0, attrs: 0 }, Delete { x: 12, margin: 1, attrs: 0 }, Compress]
