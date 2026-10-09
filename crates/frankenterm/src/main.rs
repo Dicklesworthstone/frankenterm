@@ -107432,9 +107432,9 @@ reason = "overly conservative pending threshold"
         // The first step dispatches 1 s into the receipt's 60 s TTL; the second
         // comes two minutes in, after it expired. The engine's own clock stays
         // at the run's start for both.
-        let dispatches = Arc::new(AtomicUsize::new(0));
+        let clock_reads = Arc::new(AtomicUsize::new(0));
         let clock = move || {
-            if dispatches.fetch_add(1, Ordering::SeqCst) == 0 {
+            if clock_reads.fetch_add(1, Ordering::SeqCst) == 0 {
                 created_at_ms + 1_000
             } else {
                 created_at_ms + 120_000
