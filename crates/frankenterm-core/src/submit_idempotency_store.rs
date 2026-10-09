@@ -70,6 +70,15 @@ const MAX_CALLER_KEY_BYTES: usize = 256;
 const MAX_STORE_RECORDS: i64 = 16_384;
 const MAX_STORE_LOGICAL_BYTES: i64 = 128 * 1024 * 1024;
 const LOGICAL_RECORD_OVERHEAD_BYTES: i64 = 128;
+/// A completed receipt stays exactly replayable for at least this long. Under
+/// capacity pressure an admission may evict older completed rows; the same
+/// caller key is then admitted as a new request.
+const COMPLETED_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
+/// A proven pre-effect denial is re-claimable anyway; its row only pins the
+/// request binding, so it is evictable sooner than a completed receipt.
+const RETRYABLE_RETENTION_MS: i64 = 60 * 60 * 1000;
+/// Upper bound on rows one pressured admission evicts.
+const EVICTION_BATCH_ROWS: i64 = 64;
 
 const CREATE_TABLE_SQL: &str = "CREATE TABLE verified_submit_idempotency (idempotency_key TEXT COLLATE BINARY PRIMARY KEY NOT NULL, schema_version INTEGER NOT NULL, pane_id TEXT COLLATE BINARY NOT NULL, request_sha256 TEXT COLLATE BINARY NOT NULL, effect_sha256 TEXT COLLATE BINARY NOT NULL, state INTEGER NOT NULL CHECK (state IN (1, 2, 3, 4, 5)), retryable_reason INTEGER, receipt_json TEXT COLLATE BINARY, generation INTEGER NOT NULL CHECK (generation >= 1), owner_nonce BLOB NOT NULL CHECK (typeof(owner_nonce) = 'blob' AND length(owner_nonce) = 32), lease_expires_unix_ms INTEGER CHECK (lease_expires_unix_ms IS NULL OR lease_expires_unix_ms >= 0), created_unix_ms INTEGER NOT NULL, updated_unix_ms INTEGER NOT NULL, CHECK (created_unix_ms >= 0 AND updated_unix_ms >= created_unix_ms), CHECK (length(CAST(idempotency_key AS BLOB)) BETWEEN 71 AND 90), CHECK (length(CAST(pane_id AS BLOB)) BETWEEN 1 AND 20), CHECK (length(CAST(request_sha256 AS BLOB)) = 64 AND request_sha256 NOT GLOB '*[^0-9a-f]*'), CHECK (length(CAST(effect_sha256 AS BLOB)) = 64 AND effect_sha256 NOT GLOB '*[^0-9a-f]*'), CHECK (receipt_json IS NULL OR length(CAST(receipt_json AS BLOB)) <= 65536), CHECK ((state = 1 AND retryable_reason IS NULL AND receipt_json IS NULL AND lease_expires_unix_ms IS NOT NULL) OR (state IN (2, 3) AND retryable_reason IS NULL AND receipt_json IS NULL AND lease_expires_unix_ms IS NULL) OR (state = 4 AND retryable_reason IS NULL AND receipt_json IS NOT NULL AND lease_expires_unix_ms IS NULL) OR (state = 5 AND retryable_reason IN (1, 2) AND receipt_json IS NULL AND lease_expires_unix_ms IS NULL))) STRICT, WITHOUT ROWID";
 const CREATE_INDEX_SQL: &str = "CREATE INDEX verified_submit_idempotency_request_lookup ON verified_submit_idempotency (pane_id COLLATE BINARY, request_sha256 COLLATE BINARY)";
@@ -523,6 +532,9 @@ struct StoreLimits {
     max_records: i64,
     max_logical_bytes: i64,
     receipt_reserve_bytes: i64,
+    completed_retention_ms: i64,
+    retryable_retention_ms: i64,
+    eviction_batch_rows: i64,
 }
 
 struct PreparedStorePath {
@@ -535,6 +547,9 @@ const PRODUCTION_LIMITS: StoreLimits = StoreLimits {
     max_records: MAX_STORE_RECORDS,
     max_logical_bytes: MAX_STORE_LOGICAL_BYTES,
     receipt_reserve_bytes: MAX_RECEIPT_JSON_BYTES as i64,
+    completed_retention_ms: COMPLETED_RETENTION_MS,
+    retryable_retention_ms: RETRYABLE_RETENTION_MS,
+    eviction_batch_rows: EVICTION_BATCH_ROWS,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -1679,36 +1694,78 @@ fn new_record_logical_bytes(
         .ok_or(SubmitIdempotencyError::CapacityExceeded)
 }
 
-fn ensure_new_record_capacity(
+fn usage_admits(
     conn: &Connection,
-    binding: &SubmitIdempotencyBinding,
     limits: StoreLimits,
-) -> Result<(), SubmitIdempotencyError> {
+    added_records: i64,
+    added_bytes: i64,
+) -> Result<bool, SubmitIdempotencyError> {
     let (records, bytes) = store_usage(conn, limits)?;
-    let new_bytes = new_record_logical_bytes(binding, limits)?;
-    if records >= limits.max_records
-        || bytes
-            .checked_add(new_bytes)
-            .is_none_or(|total| total > limits.max_logical_bytes)
-    {
-        Err(SubmitIdempotencyError::CapacityExceeded)
+    Ok(records
+        .checked_add(added_records)
+        .is_some_and(|total| total <= limits.max_records)
+        && bytes
+            .checked_add(added_bytes)
+            .is_some_and(|total| total <= limits.max_logical_bytes))
+}
+
+/// Delete at most `limits.eviction_batch_rows` settled rows whose retention
+/// horizon has passed, oldest first. It runs inside the caller's IMMEDIATE
+/// transaction, so eviction commits or rolls back atomically with the
+/// admission it makes room for: a crash, cancellation, or failed commit leaves
+/// every row in place. Active, effect-applied, and in-doubt rows are never
+/// candidates, and neither is the row being claimed. A backwards clock only
+/// shrinks the candidate set.
+fn evict_expired_settled_rows_locked(
+    conn: &Connection,
+    claimed_key: &str,
+    limits: StoreLimits,
+    now: i64,
+) -> Result<usize, SubmitIdempotencyError> {
+    map_sqlite(
+        conn.execute(
+            "DELETE FROM verified_submit_idempotency WHERE idempotency_key IN (SELECT idempotency_key FROM verified_submit_idempotency WHERE idempotency_key COLLATE BINARY <> ?1 COLLATE BINARY AND ((state = ?2 AND updated_unix_ms < ?3) OR (state = ?4 AND updated_unix_ms < ?5)) ORDER BY updated_unix_ms ASC, idempotency_key ASC LIMIT ?6)",
+            params![
+                claimed_key,
+                STATE_COMPLETED,
+                now.saturating_sub(limits.completed_retention_ms),
+                STATE_RETRYABLE,
+                now.saturating_sub(limits.retryable_retention_ms),
+                limits.eviction_batch_rows,
+            ],
+        ),
+        SubmitIdempotencyError::ClaimFailed,
+    )
+}
+
+/// Admit `added_records` and `added_bytes`, evicting one bounded batch of
+/// expired settled rows first when the store is at its ceiling. Returns the
+/// number of evicted rows.
+fn ensure_capacity_locked(
+    conn: &Connection,
+    claimed_key: &str,
+    limits: StoreLimits,
+    now: i64,
+    added_records: i64,
+    added_bytes: i64,
+) -> Result<usize, SubmitIdempotencyError> {
+    if usage_admits(conn, limits, added_records, added_bytes)? {
+        return Ok(0);
+    }
+    let evicted = evict_expired_settled_rows_locked(conn, claimed_key, limits, now)?;
+    if evicted > 0 && usage_admits(conn, limits, added_records, added_bytes)? {
+        Ok(evicted)
     } else {
-        Ok(())
+        Err(SubmitIdempotencyError::CapacityExceeded)
     }
 }
 
-fn ensure_reclaim_capacity(
-    conn: &Connection,
-    limits: StoreLimits,
-) -> Result<(), SubmitIdempotencyError> {
-    let (_, bytes) = store_usage(conn, limits)?;
-    if bytes
-        .checked_add(limits.receipt_reserve_bytes)
-        .is_none_or(|total| total > limits.max_logical_bytes)
-    {
-        Err(SubmitIdempotencyError::CapacityExceeded)
-    } else {
-        Ok(())
+fn log_evicted_rows(evicted: usize) {
+    if evicted > 0 {
+        tracing::info!(
+            evicted_rows = evicted,
+            "submit idempotency store evicted settled records past their retention horizon"
+        );
     }
 }
 
@@ -1746,6 +1803,11 @@ fn expire_active_owner_locked(
 /// A `Retryable` row is atomically re-claimed. `InDoubt` never auto-retries;
 /// callers must reconcile it explicitly. `Completed` returns the original,
 /// bounded receipt.
+///
+/// At the record or byte ceiling, admission first evicts one bounded batch of
+/// settled rows older than their retention horizon (completed receipts after
+/// 24 hours, retryable denials after 1 hour) in the same transaction. An
+/// evicted key is admitted as a new request; unresolved rows are never evicted.
 ///
 /// # Errors
 /// Returns a finite [`SubmitIdempotencyError`] for invalid bindings, unsafe
@@ -1816,10 +1878,15 @@ where
     F: FnMut() -> i64,
 {
     validate_binding(binding)?;
+    // SQLite reads a negative LIMIT as unbounded, so a malformed batch or
+    // horizon must fail closed rather than evict early or without bound.
     if limits.max_records < 1
         || limits.max_logical_bytes < 1
         || limits.receipt_reserve_bytes < 1
         || limits.receipt_reserve_bytes > MAX_RECEIPT_JSON_BYTES as i64
+        || limits.eviction_batch_rows < 1
+        || limits.completed_retention_ms < 0
+        || limits.retryable_retention_ms < 0
     {
         return Err(SubmitIdempotencyError::CapacityExceeded);
     }
@@ -1842,7 +1909,14 @@ where
     }
     match read_header(&tx, binding, SubmitIdempotencyError::ClaimFailed)? {
         None => {
-            ensure_new_record_capacity(&tx, binding, limits)?;
+            let evicted = ensure_capacity_locked(
+                &tx,
+                binding.key(),
+                limits,
+                now,
+                1,
+                new_record_logical_bytes(binding, limits)?,
+            )?;
             let owner_nonce = owner_nonce_factory()?;
             let lease_expires = now
                 .checked_add(OWNER_LEASE_DURATION_MS)
@@ -1871,6 +1945,7 @@ where
                 return Err(SubmitIdempotencyError::ClaimFailed);
             }
             map_sqlite(tx.commit(), SubmitIdempotencyError::ClaimFailed)?;
+            log_evicted_rows(evicted);
             claim_outcome_after_commit(
                 ft_dir,
                 binding,
@@ -1917,7 +1992,15 @@ where
             Ok(ClaimOutcome::Completed(receipt))
         }
         Some(header) if header.state == STATE_RETRYABLE => {
-            ensure_reclaim_capacity(&tx, limits)?;
+            // Re-claiming turns a receipt-free row into a reserved one.
+            let evicted = ensure_capacity_locked(
+                &tx,
+                binding.key(),
+                limits,
+                now,
+                0,
+                limits.receipt_reserve_bytes,
+            )?;
             let owner_nonce = owner_nonce_factory()?;
             let next_generation = header
                 .generation
@@ -1952,6 +2035,7 @@ where
                 return Err(SubmitIdempotencyError::ClaimFailed);
             }
             map_sqlite(tx.commit(), SubmitIdempotencyError::ClaimFailed)?;
+            log_evicted_rows(evicted);
             claim_outcome_after_commit(
                 ft_dir,
                 binding,
@@ -3399,7 +3483,7 @@ mod tests {
                 .checked_mul(2)
                 .and_then(|value| value.checked_sub(1))
                 .expect("test capacity"),
-            receipt_reserve_bytes: MAX_RECEIPT_JSON_BYTES as i64,
+            ..PRODUCTION_LIMITS
         };
         let first_token = match claim_with_nonce_limits_and_time(
             dir.path(),
@@ -3449,7 +3533,7 @@ mod tests {
         let limits = StoreLimits {
             max_records: 1,
             max_logical_bytes: exact_capacity,
-            receipt_reserve_bytes: MAX_RECEIPT_JSON_BYTES as i64,
+            ..PRODUCTION_LIMITS
         };
         let token = match claim_with_nonce_limits_and_time(
             dir.path(),
@@ -3477,6 +3561,309 @@ mod tests {
         assert_eq!(
             claim(dir.path(), &binding),
             Ok(ClaimOutcome::Completed(receipt))
+        );
+    }
+
+    fn claim_at(
+        ft_dir: &Path,
+        binding: &SubmitIdempotencyBinding,
+        limits: StoreLimits,
+        now: i64,
+    ) -> ClaimToken {
+        match claim_with_nonce_limits_and_time(ft_dir, binding, [4; OWNER_NONCE_BYTES], limits, now)
+            .expect("claim")
+        {
+            ClaimOutcome::Claimed(token) => token,
+            other => panic!("expected a fresh claim, got {other:?}"),
+        }
+    }
+
+    fn row_count(ft_dir: &Path) -> i64 {
+        raw_connection(ft_dir)
+            .query_row(
+                "SELECT COUNT(*) FROM verified_submit_idempotency",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count rows")
+    }
+
+    #[test]
+    fn capacity_pressure_evicts_only_settled_rows_past_their_retention_horizon() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let limits = StoreLimits {
+            max_records: 4,
+            completed_retention_ms: 1_000,
+            retryable_retention_ms: 100,
+            ..PRODUCTION_LIMITS
+        };
+        let completed = binding(20, "evict-completed");
+        let in_doubt = binding(20, "evict-in-doubt");
+        let pending = binding(20, "evict-pending");
+        let retryable = binding(20, "evict-retryable");
+        let completed_receipt = receipt(&completed, SubmitReceiptState::Submitted);
+        let token = claim_at(dir.path(), &completed, limits, 1_000);
+        transition_from_active_owner_at(
+            dir.path(),
+            &completed,
+            token,
+            STATE_EFFECT_APPLIED_RECEIPT_PENDING,
+            None,
+            1_000,
+        )
+        .expect("mark effect applied");
+        complete_at(dir.path(), &completed, token, &completed_receipt, 1_000)
+            .expect("complete receipt");
+        assert_eq!(persisted_updated_at(dir.path(), &completed), 1_000);
+        let token = claim_at(dir.path(), &in_doubt, limits, 1_000);
+        transition_from_active_owner_at(dir.path(), &in_doubt, token, STATE_IN_DOUBT, None, 1_000)
+            .expect("mark in doubt");
+        let token = claim_at(dir.path(), &pending, limits, 1_000);
+        transition_from_active_owner_at(
+            dir.path(),
+            &pending,
+            token,
+            STATE_EFFECT_APPLIED_RECEIPT_PENDING,
+            None,
+            1_000,
+        )
+        .expect("mark effect applied");
+        let token = claim_at(dir.path(), &retryable, limits, 1_000);
+        transition_from_active_owner_at(
+            dir.path(),
+            &retryable,
+            token,
+            STATE_RETRYABLE,
+            Some(RetryableReason::PolicyDenied),
+            1_000,
+        )
+        .expect("mark retryable");
+
+        // At the retryable horizon nothing has expired yet.
+        let first_new = binding(20, "evict-first-new");
+        assert_eq!(
+            claim_with_nonce_limits_and_time(
+                dir.path(),
+                &first_new,
+                [5; OWNER_NONCE_BYTES],
+                limits,
+                1_100,
+            ),
+            Err(SubmitIdempotencyError::CapacityExceeded)
+        );
+        assert_eq!(row_count(dir.path()), 4);
+
+        // One millisecond later only the retryable row is a candidate; the
+        // completed receipt, still inside its horizon, replays exactly.
+        claim_at(dir.path(), &first_new, limits, 1_101);
+        assert_eq!(lookup_at(dir.path(), &retryable, 1_102), Ok(None));
+        assert_eq!(
+            claim_with_nonce_limits_and_time(
+                dir.path(),
+                &completed,
+                [6; OWNER_NONCE_BYTES],
+                limits,
+                2_000,
+            ),
+            Ok(ClaimOutcome::Completed(completed_receipt))
+        );
+        let second_new = binding(20, "evict-second-new");
+        assert_eq!(
+            claim_with_nonce_limits_and_time(
+                dir.path(),
+                &second_new,
+                [7; OWNER_NONCE_BYTES],
+                limits,
+                2_000,
+            ),
+            Err(SubmitIdempotencyError::CapacityExceeded)
+        );
+        claim_at(dir.path(), &second_new, limits, 2_001);
+        assert_eq!(lookup_at(dir.path(), &completed, 2_002), Ok(None));
+
+        // Unresolved authority is never evicted, however old: the store stays
+        // full of active, effect-applied, and in-doubt rows.
+        let third_new = binding(20, "evict-third-new");
+        assert_eq!(
+            claim_with_nonce_limits_and_time(
+                dir.path(),
+                &third_new,
+                [8; OWNER_NONCE_BYTES],
+                limits,
+                4_102_444_800_000,
+            ),
+            Err(SubmitIdempotencyError::CapacityExceeded)
+        );
+        assert_eq!(row_count(dir.path()), 4);
+        assert_eq!(
+            lookup_at(dir.path(), &in_doubt, 3_000),
+            Ok(Some(StoredSubmitState::InDoubt))
+        );
+        assert_eq!(
+            lookup_at(dir.path(), &pending, 3_000),
+            Ok(Some(StoredSubmitState::EffectAppliedReceiptPending))
+        );
+    }
+
+    #[test]
+    fn retryable_reclaim_under_pressure_never_evicts_its_own_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binding = binding(21, "evict-self");
+        let record_bytes =
+            new_record_logical_bytes(&binding, PRODUCTION_LIMITS).expect("bounded record size");
+        let roomy = StoreLimits {
+            max_records: 1,
+            max_logical_bytes: record_bytes,
+            retryable_retention_ms: 100,
+            ..PRODUCTION_LIMITS
+        };
+        let token = claim_at(dir.path(), &binding, roomy, 1_000);
+        transition_from_active_owner_at(
+            dir.path(),
+            &binding,
+            token,
+            STATE_RETRYABLE,
+            Some(RetryableReason::ApprovalRequired),
+            1_000,
+        )
+        .expect("mark retryable");
+        let tight = StoreLimits {
+            max_logical_bytes: record_bytes.checked_sub(1).expect("test capacity"),
+            ..roomy
+        };
+        assert_eq!(
+            claim_with_nonce_limits_and_time(
+                dir.path(),
+                &binding,
+                [3; OWNER_NONCE_BYTES],
+                tight,
+                50_000,
+            ),
+            Err(SubmitIdempotencyError::CapacityExceeded),
+            "the expired row being re-claimed is not an eviction candidate"
+        );
+        assert_eq!(
+            lookup_at(dir.path(), &binding, 50_001),
+            Ok(Some(StoredSubmitState::Retryable(
+                RetryableReason::ApprovalRequired
+            )))
+        );
+        assert_eq!(claim_at(dir.path(), &binding, roomy, 50_002).generation, 2);
+    }
+
+    #[test]
+    fn malformed_eviction_limits_fail_closed_before_opening_the_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binding = binding(23, "malformed-eviction");
+        for limits in [
+            StoreLimits {
+                eviction_batch_rows: 0,
+                ..PRODUCTION_LIMITS
+            },
+            StoreLimits {
+                eviction_batch_rows: -1,
+                ..PRODUCTION_LIMITS
+            },
+            StoreLimits {
+                completed_retention_ms: -1,
+                ..PRODUCTION_LIMITS
+            },
+            StoreLimits {
+                retryable_retention_ms: -1,
+                ..PRODUCTION_LIMITS
+            },
+        ] {
+            assert_eq!(
+                claim_with_nonce_limits_and_time(
+                    dir.path(),
+                    &binding,
+                    [2; OWNER_NONCE_BYTES],
+                    limits,
+                    1_000,
+                ),
+                Err(SubmitIdempotencyError::CapacityExceeded)
+            );
+        }
+        assert!(
+            !database_path(dir.path()).exists(),
+            "limit validation precedes store creation"
+        );
+    }
+
+    /// Complete one unique key every 100 ms and return the store's record and
+    /// logical-byte high-water marks.
+    fn run_unique_key_workload(limits: StoreLimits, keys: usize) -> (i64, i64) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bindings: Vec<_> = (0..keys)
+            .map(|index| binding(22, &format!("workload-{index}")))
+            .collect();
+        let mut high_water = (0, 0);
+        for (index, binding) in bindings.iter().enumerate() {
+            let now = 10_000 + 100 * i64::try_from(index).expect("small index");
+            let token = claim_at(dir.path(), binding, limits, now);
+            transition_from_active_owner_at(
+                dir.path(),
+                binding,
+                token,
+                STATE_EFFECT_APPLIED_RECEIPT_PENDING,
+                None,
+                now,
+            )
+            .expect("mark effect applied");
+            complete_at(dir.path(), binding, token, &receipt_for(binding), now)
+                .expect("complete receipt");
+            let (records, bytes) =
+                store_usage(&raw_connection(dir.path()), limits).expect("store usage");
+            high_water = (high_water.0.max(records), high_water.1.max(bytes));
+            // The oldest receipt inside the retention horizon replays exactly.
+            let oldest_retained = &bindings[index.saturating_sub(9)];
+            assert_eq!(
+                claim_with_nonce_limits_and_time(
+                    dir.path(),
+                    oldest_retained,
+                    [1; OWNER_NONCE_BYTES],
+                    limits,
+                    now,
+                ),
+                Ok(ClaimOutcome::Completed(receipt_for(oldest_retained)))
+            );
+        }
+        assert_eq!(
+            lookup_at(dir.path(), &bindings[0], 10_000_000),
+            Ok(None),
+            "the workload must have evicted its oldest receipt"
+        );
+        high_water
+    }
+
+    fn receipt_for(binding: &SubmitIdempotencyBinding) -> SubmitReceipt {
+        receipt(binding, SubmitReceiptState::Submitted)
+    }
+
+    #[test]
+    fn unique_keys_past_the_ceiling_keep_admitting_within_bounded_usage() {
+        let record_bound = StoreLimits {
+            max_records: 16,
+            completed_retention_ms: 1_000,
+            eviction_batch_rows: 4,
+            ..PRODUCTION_LIMITS
+        };
+        let (records, bytes) = run_unique_key_workload(record_bound, 60);
+        assert!(records <= record_bound.max_records, "records {records}");
+        assert!(bytes <= record_bound.max_logical_bytes, "bytes {bytes}");
+
+        let record_bytes = new_record_logical_bytes(&binding(22, "workload-0"), PRODUCTION_LIMITS)
+            .expect("bounded record size");
+        let byte_bound = StoreLimits {
+            max_records: PRODUCTION_LIMITS.max_records,
+            max_logical_bytes: record_bytes.checked_mul(2).expect("test capacity"),
+            ..record_bound
+        };
+        let (records, bytes) = run_unique_key_workload(byte_bound, 150);
+        assert!(bytes <= byte_bound.max_logical_bytes, "bytes {bytes}");
+        assert!(
+            records < 150,
+            "byte pressure must have evicted, records {records}"
         );
     }
 
@@ -4029,6 +4416,8 @@ mod tests {
     #[cfg(unix)]
     const REAL_SIDECAR_PROBE_ENV: &str = "FT_SUBMIT_STORE_REAL_SIDECAR_PROBE";
     #[cfg(unix)]
+    const CRASH_WRITER_ENV: &str = "FT_SUBMIT_STORE_CRASH_WRITER";
+    #[cfg(unix)]
     const REAL_SIDECAR_TEST: &str = "submit_idempotency_store::tests::real_sqlite_sidecars_are_owner_only_from_creation_under_a_permissive_umask";
 
     /// ft-7h5da.3.5.4: the WAL and SHM files real SQLite creates for the store
@@ -4041,6 +4430,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn real_sqlite_sidecars_are_owner_only_from_creation_under_a_permissive_umask() {
+        // Checked first: the crashing writer inherits the probe's environment.
+        if let Some(database) = std::env::var_os(CRASH_WRITER_ENV) {
+            crash_writer(Path::new(&database));
+        }
         if std::env::var_os(REAL_SIDECAR_PROBE_ENV).is_some() {
             real_sidecar_probe();
             return;
@@ -4106,9 +4499,79 @@ mod tests {
             assert!(!wal.exists(), "closing the last connection removes the WAL");
         }
 
+        // Journal-mode transition: the rollback journal is owner-only while a
+        // write holds it, and the WAL is again after switching back.
+        let journal = dir.path().join(STORE_ROLLBACK_JOURNAL_FILENAME);
+        let conn = Connection::open(&database).expect("reopen the store database");
+        conn.pragma_update(None, "journal_mode", "DELETE")
+            .expect("leave WAL");
+        conn.execute_batch("BEGIN IMMEDIATE; INSERT INTO probe VALUES (2);")
+            .expect("write under a rollback journal");
+        assert_eq!(mode_of(&journal), 0o600, "rollback journal during a write");
+        conn.execute_batch("COMMIT;").expect("commit");
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .expect("return to WAL");
+        conn.execute_batch("INSERT INTO probe VALUES (3);")
+            .expect("write in WAL again");
+        for path in [&wal, &shm] {
+            assert_eq!(
+                mode_of(path),
+                0o600,
+                "after returning to WAL: {}",
+                path.display()
+            );
+        }
+        drop(conn);
+
         // The production claim path under the same umask.
         let store = tempfile::tempdir().expect("tempdir");
         let _token = claim_token(store.path(), &binding(16, "permissive-umask"));
         assert_eq!(mode_of(&database_path(store.path())), 0o600);
+
+        // Crash recovery: a writer that dies with committed, uncheckpointed
+        // WAL frames leaves both sidecars behind. They are owner-only, and the
+        // production path then recovers the store.
+        let crashed = tempfile::tempdir().expect("tempdir");
+        let _token = claim_token(crashed.path(), &binding(16, "before-crash"));
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                REAL_SIDECAR_TEST,
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CRASH_WRITER_ENV, database_path(crashed.path()))
+            .status()
+            .expect("run the crashing writer");
+        assert!(!status.success(), "the writer must die mid-session");
+        for path in [
+            crashed.path().join(STORE_WAL_FILENAME),
+            crashed.path().join(STORE_SHM_FILENAME),
+        ] {
+            assert_eq!(
+                mode_of(&path),
+                0o600,
+                "left by the crash: {}",
+                path.display()
+            );
+        }
+        let _token = claim_token(crashed.path(), &binding(16, "after-crash"));
+        assert_eq!(mode_of(&database_path(crashed.path())), 0o600);
+    }
+
+    /// Commits a write that stays in the WAL, then dies without closing the
+    /// connection, as a crashed process would.
+    #[cfg(unix)]
+    fn crash_writer(database: &Path) -> ! {
+        let conn = Connection::open(database).expect("open the store database");
+        conn.pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("keep frames in the WAL");
+        conn.execute_batch(
+            "BEGIN IMMEDIATE; \
+             UPDATE verified_submit_idempotency SET updated_unix_ms = updated_unix_ms; \
+             COMMIT;",
+        )
+        .expect("committed write left in the WAL");
+        std::process::abort();
     }
 }
