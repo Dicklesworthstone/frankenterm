@@ -1,6 +1,8 @@
-//! Live, read-only audit-log sources for the attention router, shared by
+//! Live, read-only sources for the attention router, shared by
 //! `ft attention` / `ft robot attention` and MCP `wa.attention`
-//! (ft-7h5da.7.11, ft-7h5da.7.7, ft-7h5da.3.9).
+//! (ft-7h5da.7.11, ft-7h5da.7.7, ft-7h5da.3.9): the workspace database's
+//! audit log, events, reservations and mutes, plus (CLI only) the crash
+//! bundle directory.
 //!
 //! The workspace database is opened read-only: no migration, no writer, and
 //! nothing created, so attention stays read-only. Only the columns the router
@@ -10,13 +12,13 @@
 use std::path::Path;
 
 use crate::attention_router::{
-    AttentionRouterNotificationMute, AttentionRouterSourceAdapterInput,
+    AttentionRouterNotificationMute, AttentionRouterSourceAdapterInput, CrashBundleRow,
     MANUAL_RESERVATIONS_MAX_ROWS, ManualReservationRow, POLICY_GATE_AUDIT_MAX_ROWS,
-    POLICY_GATE_AUDIT_WINDOW_MS, PolicyGateAuditRow, UNHANDLED_EVENTS_MAX_ROWS,
-    UNHANDLED_EVENTS_WINDOW_MS, UnhandledEventRow, VERIFIED_SUBMIT_AUDIT_MAX_ROWS,
-    approval_required_observation_from_audit, manual_reservations_observation,
-    policy_denied_observation_from_audit, unhandled_events_observation,
-    verified_submit_observation_from_receipts,
+    POLICY_GATE_AUDIT_WINDOW_MS, PolicyGateAuditRow, RECENT_CRASH_BUNDLES_MAX,
+    RECENT_CRASH_BUNDLES_WINDOW_MS, UNHANDLED_EVENTS_MAX_ROWS, UNHANDLED_EVENTS_WINDOW_MS,
+    UnhandledEventRow, VERIFIED_SUBMIT_AUDIT_MAX_ROWS, approval_required_observation_from_audit,
+    manual_reservations_observation, policy_denied_observation_from_audit,
+    unhandled_events_observation, verified_submit_observation_from_receipts,
 };
 use crate::robot_types::SubmitReceipt;
 use crate::storage::EventMuteRecord;
@@ -211,6 +213,39 @@ pub fn read_live_attention_audit(db_path: &Path, now_ms: u64) -> LiveAttentionAu
     }
 }
 
+/// The watcher's crash bundles written within the attention window, newest
+/// first, for the live `incident_bundles` source. Discovery is the crash
+/// module's bounded, fail-closed listing; only each bundle's directory name
+/// and modification time are read here. A missing directory means no crash.
+#[must_use]
+pub fn read_recent_crash_bundles(crash_dir: &Path, now_ms: u64) -> Option<Vec<CrashBundleRow>> {
+    if !crash_dir.exists() {
+        return Some(Vec::new());
+    }
+    if !crash_dir.is_dir() {
+        return None;
+    }
+    let since = now_ms.saturating_sub(RECENT_CRASH_BUNDLES_WINDOW_MS);
+    Some(
+        crate::crash::list_crash_bundles(crash_dir, RECENT_CRASH_BUNDLES_MAX)
+            .into_iter()
+            .filter_map(|bundle| {
+                let name = bundle.path.file_name()?.to_string_lossy().into_owned();
+                let modified_at_ms = std::fs::metadata(&bundle.path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|age| u64::try_from(age.as_millis()).ok())?;
+                (modified_at_ms >= since).then_some(CrashBundleRow {
+                    name,
+                    modified_at_ms,
+                })
+            })
+            .collect(),
+    )
+}
+
 /// Active, unexpired manual reservations, with the storage reader's
 /// predicate. The free-text reason column is never selected.
 fn query_active_manual_reservations(
@@ -372,6 +407,57 @@ mod tests {
         assert_eq!(audit.events, Some(Vec::new()));
         assert_eq!(audit.reservations, Some(Vec::new()));
         assert!(!db_path.exists(), "a read never creates the database");
+    }
+
+    #[test]
+    fn recent_crash_bundles_surface_only_their_name_and_age() {
+        const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let crash_dir = dir.path().join("crash");
+        assert_eq!(
+            read_recent_crash_bundles(&crash_dir, 1_000),
+            Some(Vec::new()),
+            "no crash directory, no crash"
+        );
+        std::fs::create_dir(&crash_dir).expect("crash dir");
+        let report = crate::crash::CrashReport {
+            message: "SECRET PANIC".to_string(),
+            location: Some("src/secret.rs:1:1".to_string()),
+            backtrace: None,
+            timestamp: 1_700_000_000,
+            pid: 1,
+            thread_name: None,
+        };
+        let bundle = crate::crash::write_crash_bundle(&crash_dir, &report, None, None)
+            .expect("write crash bundle");
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_millis(),
+        )
+        .expect("ms");
+        let recent = read_recent_crash_bundles(&crash_dir, now_ms).expect("readable");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(
+            recent[0].name,
+            bundle.file_name().expect("name").to_string_lossy()
+        );
+        assert_eq!(
+            read_recent_crash_bundles(&crash_dir, now_ms + 2 * DAY_MS).map(|rows| rows.len()),
+            Some(0),
+            "a bundle older than the window is not an attention item"
+        );
+        let observation = crate::attention_router::crash_bundles_observation(Some(&recent), now_ms);
+        let rendered = serde_json::to_string(&observation).expect("serialize");
+        assert!(
+            !rendered.contains("SECRET PANIC") && !rendered.contains("secret.rs"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("ft reproduce export --kind crash"),
+            "{rendered}"
+        );
     }
 
     #[test]

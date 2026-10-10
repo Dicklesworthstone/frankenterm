@@ -13156,6 +13156,18 @@ async fn build_cli_attention_router_payload(
             None => frankenterm_core::attention_live::LiveAttentionAudit::unreadable(),
         };
         frankenterm_core::attention_live::apply_live_attention_audit(&mut input, &audit);
+        let crash_bundles = layout.as_ref().and_then(|layout| {
+            frankenterm_core::attention_live::read_recent_crash_bundles(
+                &layout.crash_dir,
+                input.generated_at_ms,
+            )
+        });
+        input.observations.push(
+            frankenterm_core::attention_router::crash_bundles_observation(
+                crash_bundles.as_deref(),
+                input.generated_at_ms,
+            ),
+        );
     }
     Ok(build_attention_router_surface_payload(
         &input,

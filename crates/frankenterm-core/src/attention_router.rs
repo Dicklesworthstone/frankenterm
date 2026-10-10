@@ -3235,6 +3235,79 @@ pub fn manual_reservations_observation(
     observation
 }
 
+/// Crash history a live `incident_bundles` source covers.
+pub const RECENT_CRASH_BUNDLES_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
+/// Newest crash bundles a live `incident_bundles` source considers.
+pub const RECENT_CRASH_BUNDLES_MAX: usize = 8;
+
+/// A crash bundle directory a live `incident_bundles` source uses: its name
+/// and modification time only. The crash message and backtrace stay on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrashBundleRow {
+    pub name: String,
+    pub modified_at_ms: u64,
+}
+
+/// Live `incident_bundles` source from the watcher's crash bundles written in
+/// the last [`RECENT_CRASH_BUNDLES_WINDOW_MS`]: each is one fact asking for
+/// review (`ft reproduce export --kind crash`), muted per bundle once
+/// reviewed. `None` means the crash directory could not be read.
+#[must_use]
+pub fn crash_bundles_observation(
+    bundles: Option<&[CrashBundleRow]>,
+    now_ms: u64,
+) -> AttentionRouterSourceObservation {
+    const SOURCE_ID: &str = "incident_bundles.recent_crashes";
+    const API: &str = "crash_dir.read_only";
+    let Some(bundles) = bundles else {
+        return AttentionRouterSourceObservation::new(
+            SOURCE_ID,
+            AttentionRouterSourceKind::IncidentBundles,
+            AttentionRouterSourceHealth::Unavailable,
+            API,
+            "the crash bundle directory could not be read",
+        )
+        .live(now_ms, 0)
+        .with_fact(
+            AttentionRouterSourceFact::new(
+                AttentionRouterSourceFactKind::SourceUnavailable,
+                "the local crash bundle directory is unavailable",
+            )
+            .with_reason_code("incident_bundles.unavailable"),
+        );
+    };
+    let freshness_ms = bundles
+        .iter()
+        .map(|bundle| bundle.modified_at_ms)
+        .max()
+        .map_or(0, |newest| now_ms.saturating_sub(newest));
+    let mut observation = AttentionRouterSourceObservation::new(
+        SOURCE_ID,
+        AttentionRouterSourceKind::IncidentBundles,
+        AttentionRouterSourceHealth::Available,
+        API,
+        format!("{} crash bundles in the last 24 hours", bundles.len()),
+    )
+    .live(now_ms, freshness_ms)
+    .items_seen(u64::try_from(bundles.len()).unwrap_or(u64::MAX));
+    for bundle in bundles {
+        let age_s = now_ms.saturating_sub(bundle.modified_at_ms) / 1000;
+        let mute_key = format!("attention.incident_bundles.{}", bundle.name);
+        observation = observation.with_fact(
+            AttentionRouterSourceFact::new(
+                AttentionRouterSourceFactKind::IncidentBundleOpen,
+                format!(
+                    "watcher crash bundle {} ({age_s}s old) needs review: ft reproduce export --kind crash [mute: ft mute add {mute_key}]",
+                    bundle.name
+                ),
+            )
+            .with_reason_code("incident.bundle_open")
+            .with_notification_identity_key(mute_key),
+        );
+    }
+    observation
+}
+
 fn missing_source_observation(
     source_kind: AttentionRouterSourceKind,
     generated_at_ms: u64,
@@ -4166,6 +4239,55 @@ mod tests {
         assert!(quiet.facts.is_empty());
         let unreadable = unhandled_events_observation(None, now);
         assert_eq!(unreadable.health, AttentionRouterSourceHealth::Unavailable);
+    }
+
+    #[test]
+    fn live_crash_bundles_are_incident_blockers_until_muted() {
+        let now = 1_770_000_000_000_u64;
+        let bundle = CrashBundleRow {
+            name: "wa_crash_20260210_120000".to_string(),
+            modified_at_ms: now - 120_000,
+        };
+        let observation = crash_bundles_observation(Some(std::slice::from_ref(&bundle)), now);
+        assert_eq!(
+            observation.source_kind,
+            AttentionRouterSourceKind::IncidentBundles
+        );
+        assert_eq!(observation.freshness_ms, Some(120_000));
+        let fact = &observation.facts[0];
+        assert_eq!(fact.fact, AttentionRouterSourceFactKind::IncidentBundleOpen);
+        assert!(fact.summary.contains("(120s old)"), "{}", fact.summary);
+        let key = "attention.incident_bundles.wa_crash_20260210_120000";
+        assert_eq!(fact.notification_identity_key.as_deref(), Some(key));
+
+        let incidents = |snapshot: &AttentionRouterSnapshot| {
+            snapshot
+                .items
+                .iter()
+                .filter(|item| {
+                    item.classification == AttentionRouterClassification::BlockedInfra
+                        && item
+                            .reason_codes
+                            .iter()
+                            .any(|code| code == "incident.bundle_open")
+                })
+                .count()
+        };
+        let snapshot = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation.clone()),
+        );
+        assert_eq!(incidents(&snapshot), 1);
+        let muted = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation)
+                .with_notification_mute(AttentionRouterNotificationMute::global(key)),
+        );
+        assert_eq!(incidents(&muted), 0, "a reviewed bundle is muted");
+        assert_eq!(
+            crash_bundles_observation(None, now).health,
+            AttentionRouterSourceHealth::Unavailable
+        );
     }
 
     #[test]

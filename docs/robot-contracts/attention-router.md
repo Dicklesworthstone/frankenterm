@@ -44,7 +44,11 @@ selected into a fact. They also add `pane_reservations`: each active,
 unexpired manual reservation (an operator hold from `ft intervene` or
 `ft reserve`, newest 64) is a do-not-touch item naming the pane, the holder
 and the time left; workflow and agent reservations, and the free-text
-reason, are left out.
+reason, are left out. The CLI (not MCP, like the watcher envelope) also adds
+`incident_bundles`: each watcher crash bundle written in the last 24 hours
+(newest 8, from the crash directory) is a blocker asking for review with
+`ft reproduce export --kind crash`, muted per bundle once reviewed; only the
+bundle's directory name and age are read, never its message or backtrace.
 Each live policy-gate, drift and event fact carries a stable mute key, printed
 in its summary (`[mute: ft mute add attention.<source>...]`, or the event's
 `evt:` identity). Live runs load active `ft mute` records from the same
