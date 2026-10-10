@@ -66,7 +66,7 @@ Sending text while alt-screen is active could:
 The safety policy blocks sends to alt-screen panes by default.",
     suggestions: &[
         "Exit the full-screen application first",
-        "Preview the policy decision with `ft send <pane-id> <text> --dry-run`",
+        "Use `ft send <pane-id> <text> --dry-run` to preview the policy decision",
         "Configure policy to allow specific alt-screen apps",
     ],
     see_also: &["ft why --recent", "ft status --pane-id <id>"],
@@ -106,9 +106,9 @@ pub static DENY_RECENT_GAP: ExplanationTemplate = ExplanationTemplate {
 The policy requires a prompt marker (OSC 133) or manual confirmation.",
     suggestions: &[
         "Check the pane manually to see its state",
-        "Once the pane is verified ready, approve with `ft approve <code>` and retry with `--approval-code <code>`",
+        "Verify the pane is ready, then approve with `ft approve <code>` and retry with `--approval-code <code>`",
         "Enable OSC 133 support in your shell for better detection",
-        "Set [safety].block_recent_gap = false in ft.toml to turn this check off",
+        "Configure [safety].block_recent_gap = false in ft.toml to turn this check off",
     ],
     see_also: &["ft status --pane-id <id>", "ft why --recent"],
 };
@@ -1241,7 +1241,7 @@ mod tests {
         let template = &DENY_ALT_SCREEN;
         let formatted = format_explanation(template, None);
         let exit_pos = formatted.find("Exit the full-screen").unwrap();
-        let use_pos = formatted.find("Preview the policy decision").unwrap();
+        let use_pos = formatted.find("Use `ft send").unwrap();
         let configure_pos = formatted.find("Configure policy").unwrap();
         assert!(
             exit_pos < use_pos && use_pos < configure_pos,
