@@ -133,8 +133,9 @@ ft reproduce export --kind crash --format json
 
 ## Replaying Bundles
 
-Replay validates a bundle's contents and checks for consistency. Three
-replay modes are available, each with a defined set of checks.
+Replay validates a bundle's contents and checks for consistency. Two replay
+modes are available, `policy` (the default) and `rules`, each with a defined
+set of checks.
 
 ### Policy mode
 
@@ -174,25 +175,12 @@ ft reproduce replay /path/to/bundle --mode rules
 
 Use this when investigating rule or pattern matching issues.
 
-### Workflow mode
+### No workflow mode
 
-Validates workflow step logs and execution traces:
-
-```bash
-ft reproduce replay /path/to/bundle --mode workflow
-```
-
-**Checks run:**
-1. `manifest_valid`
-2. `version_compatible`
-3. `redaction_report_valid`
-4. `no_secrets_leaked`
-5. `workflow_steps_valid` — step logs have required fields
-6. `workflow_timing_valid` — step timestamps are monotonic
-7. `workflow_no_raw_output` — step output is within bounds
-8. `files_complete`
-
-Use this when investigating workflow failures or timing issues.
+`--mode` accepts only `policy` (the default) and `rules`; any other value is
+rejected. To investigate a workflow failure, verify the bundle with
+`--mode policy` and inspect the workflow itself with
+`ft workflow status <execution_id>`.
 
 ## Privacy Budget
 
@@ -643,8 +631,9 @@ $ ft reproduce replay /path/to/bundle --mode rules
 ```bash
 # A workflow timed out mid-execution
 $ ft reproduce export --kind manual
-# Replay to check step timing and logs
-$ ft reproduce replay /path/to/bundle --mode workflow
+# Verify the bundle, then inspect the workflow's own steps
+$ ft reproduce replay /path/to/bundle --mode policy
+$ ft workflow status <execution_id>
 ```
 
 ## Sharing Bundles
@@ -667,11 +656,11 @@ tar czf incident_bundle.tar.gz wa_incident_crash_20260206_183000/
 
 ### Internal sharing
 
-For internal debugging, the `verbose` tier provides more data. Adjust the
-budget by passing options to the export:
+For internal debugging that needs more history than an incident bundle's
+fixed budget, a diagnostic bundle takes explicit limits:
 
 ```bash
-ft reproduce export --kind manual --events 200
+ft diag bundle --events 200 --audit 100 --workflows 100
 ```
 
 ## Diagnostic Bundles
@@ -713,8 +702,11 @@ println!("Files: {:?}", result.files);
 ### Robot mode
 
 ```bash
-ft robot reproduce export --kind crash --format json
+ft reproduce export --kind crash --format json
 ```
+
+There is no `ft robot reproduce`; the human command's `--format json` output is
+the machine-readable form.
 
 Returns a JSON response envelope with the bundle path and file list.
 

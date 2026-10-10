@@ -645,9 +645,9 @@ and the static verifier is
 Use these commands as diagnostics only:
 
 ```bash
-ft robot swarm-capacity status --format json --level 3
-ft robot swarm-capacity plan --add-panes 12 --format json --level 3
-ft robot swarm-capacity explain <decision-id> --format json
+ft robot --format json swarm-capacity status --level 3
+ft robot --format json swarm-capacity plan --add-panes 12 --level 3
+ft robot --format json swarm-capacity explain <decision-id>
 ft doctor --json
 ft status --health
 ```
@@ -660,15 +660,15 @@ ft status --health
 | `resource_pressure` | Resource cockpit, workload admission, storage, memory, or RCH pressure is red/black/unavailable. | Pause new admission and preserve the pressure artifact; continue only read-only/status work or already-admitted proof lanes whose evidence remains attributable. | Do not cancel builds, drain workers, clean files, or repair services without explicit operator approval. |
 
 Local-only swarm example: run
-`ft robot swarm-capacity plan --add-panes 4 --format json --level 3` before
+`ft robot --format json swarm-capacity plan --add-panes 4 --level 3` before
 opening another local pane. If the doctor reports `stale_telemetry`, refresh
-only with `ft robot swarm-capacity status --format json --level 3`,
+only with `ft robot --format json swarm-capacity status --level 3`,
 `ft doctor --json`, and `ft status --health`. If it reports
 `capacity_refused`, keep the local swarm size fixed and switch to docs/static,
 Beads-comment, or status-only work that does not require extra panes.
 
 RCH-assisted build-heavy swarm example: run
-`ft robot swarm-capacity plan --add-panes 12 --format json --level 3` before
+`ft robot --format json swarm-capacity plan --add-panes 12 --level 3` before
 admitting another batch of remote proof lanes. If the doctor reports
 `target_class_unavailable`, cite
 `docs/attestations/perf/swarm-capacity-envelope.json` and
@@ -746,7 +746,7 @@ ft mission objective-plan --objective "pick the next safe docs/static slice" --f
 Robot surface:
 
 ```bash
-ft robot mission objective-plan --objective "recover from no ready beads" --format toon
+ft robot --format toon mission objective-plan --objective "recover from no ready beads"
 ```
 
 MCP surface:

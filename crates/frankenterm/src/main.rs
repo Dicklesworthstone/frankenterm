@@ -138392,79 +138392,151 @@ printf x > "$MINISIGN_MARKER"
             .collect()
     }
 
-    /// Runnable `ft ...` lines in README.md's shell fences: continuations
-    /// joined, a `$ ` prompt and trailing comments, pipes and redirections
-    /// cut, and synopsis lines (`[optional]`, `{a|b}`, `...`) skipped.
-    fn readme_example_commands(readme: &str) -> Vec<String> {
-        let mut commands = Vec::new();
-        let mut in_shell_fence = false;
-        let mut in_fence = false;
-        let mut continued = String::new();
-        for raw in readme.lines() {
-            let trimmed = raw.trim();
-            if let Some(language) = trimmed.strip_prefix("```") {
-                in_fence = !in_fence;
-                in_shell_fence = in_fence
-                    && matches!(
-                        language.trim().to_ascii_lowercase().as_str(),
-                        "bash" | "sh" | "shell" | "console"
-                    );
-                continued.clear();
-                continue;
-            }
-            if !in_shell_fence {
-                continue;
-            }
-            if let Some(head) = trimmed.strip_suffix('\\') {
-                continued.push_str(head);
-                continued.push(' ');
-                continue;
-            }
-            let joined = format!("{continued}{trimmed}");
-            continued.clear();
-            let joined = joined.trim();
-            let mut line = joined.strip_prefix("$ ").map_or(joined, str::trim);
-            if !line.starts_with("ft ") {
-                continue;
-            }
-            for cut in [" #", " | ", " && ", " || ", " > ", " 2>"] {
-                if let Some(index) = line.find(cut) {
-                    line = &line[..index];
+    /// Runnable `ft ...` lines in a markdown file's shell fences. Within one
+    /// fence, continuations are joined; a fence that uses a `$ ` prompt counts
+    /// only its prompted lines (the rest is printed output). Trailing
+    /// comments, pipes and redirections are cut, and synopsis lines
+    /// (`[optional]`, `{a|b}`, `a|b`, `...`) are skipped.
+    fn doc_example_commands(markdown: &str) -> Vec<String> {
+        fn fence_commands(fence: &[&str], commands: &mut Vec<String>) {
+            let mut joined_lines = Vec::new();
+            let mut continued = String::new();
+            for raw in fence {
+                let trimmed = raw.trim();
+                if let Some(head) = trimmed.strip_suffix('\\') {
+                    continued.push_str(head);
+                    continued.push(' ');
+                    continue;
                 }
+                joined_lines.push(format!("{continued}{trimmed}").trim().to_string());
+                continued.clear();
             }
-            let line = line.trim();
-            if ["[", "{", "..."]
-                .into_iter()
-                .any(|token| line.contains(token))
-            {
+            let prompted = joined_lines.iter().any(|line| line.starts_with("$ "));
+            for joined in &joined_lines {
+                let mut line = joined.as_str();
+                if prompted {
+                    let Some(command) = line.strip_prefix("$ ") else {
+                        continue;
+                    };
+                    line = command.trim();
+                }
+                if !line.starts_with("ft ") {
+                    continue;
+                }
+                for cut in [" #", " | ", " && ", " || ", " > ", " 2>"] {
+                    if let Some(index) = line.find(cut) {
+                        line = &line[..index];
+                    }
+                }
+                let line = line.trim();
+                if ["[", "{", "...", "|"]
+                    .into_iter()
+                    .any(|token| line.contains(token))
+                {
+                    continue;
+                }
+                commands.push(line.to_string());
+            }
+        }
+
+        let mut commands = Vec::new();
+        let mut fence: Option<(bool, Vec<&str>)> = None;
+        for raw in markdown.lines() {
+            if let Some(language) = raw.trim().strip_prefix("```") {
+                match fence.take() {
+                    Some((shell, lines)) => {
+                        if shell {
+                            fence_commands(&lines, &mut commands);
+                        }
+                    }
+                    None => {
+                        let shell = matches!(
+                            language.trim().to_ascii_lowercase().as_str(),
+                            "bash" | "sh" | "shell" | "console"
+                        );
+                        fence = Some((shell, Vec::new()));
+                    }
+                }
                 continue;
             }
-            commands.push(line.to_string());
+            if let Some((_, lines)) = fence.as_mut() {
+                lines.push(raw);
+            }
         }
         commands
     }
 
-    /// README examples are copied by humans and agents alike; every runnable
-    /// one must parse with the current CLI.
+    /// README and operator-doc examples are copied by humans and agents
+    /// alike; every runnable one must parse with the current CLI.
     #[test]
-    fn readme_ft_examples_parse_with_the_current_cli() {
-        let commands = readme_example_commands(include_str!("../../../README.md"));
-        assert!(
-            commands.len() > 100,
-            "README lost its examples ({})",
-            commands.len()
-        );
-        let failures: Vec<String> = commands
-            .iter()
-            .filter_map(|command| {
-                Cli::try_parse_from(example_command_words(command))
-                    .err()
-                    .map(|error| format!("{command}: {:?}", error.kind()))
-            })
-            .collect();
+    fn documented_ft_examples_parse_with_the_current_cli() {
+        let documents = [
+            ("README.md", include_str!("../../../README.md")),
+            (
+                "docs/operator-playbook.md",
+                include_str!("../../../docs/operator-playbook.md"),
+            ),
+            (
+                "docs/operator-runbook.md",
+                include_str!("../../../docs/operator-runbook.md"),
+            ),
+            (
+                "docs/incident-bundles.md",
+                include_str!("../../../docs/incident-bundles.md"),
+            ),
+            (
+                "docs/session-persistence.md",
+                include_str!("../../../docs/session-persistence.md"),
+            ),
+            (
+                "docs/session-persistence-troubleshooting.md",
+                include_str!("../../../docs/session-persistence-troubleshooting.md"),
+            ),
+            (
+                "docs/storage-tuning.md",
+                include_str!("../../../docs/storage-tuning.md"),
+            ),
+            (
+                "docs/search-explainability.md",
+                include_str!("../../../docs/search-explainability.md"),
+            ),
+            (
+                "docs/swarm-playbook.md",
+                include_str!("../../../docs/swarm-playbook.md"),
+            ),
+            (
+                "docs/high-core-swarm-runbook.md",
+                include_str!("../../../docs/high-core-swarm-runbook.md"),
+            ),
+            (
+                "docs/noise-control.md",
+                include_str!("../../../docs/noise-control.md"),
+            ),
+            (
+                "docs/approvals.md",
+                include_str!("../../../docs/approvals.md"),
+            ),
+            (
+                "docs/explain-match.md",
+                include_str!("../../../docs/explain-match.md"),
+            ),
+        ];
+        let mut checked = 0;
+        let mut failures = Vec::new();
+        for (document, markdown) in documents {
+            let commands = doc_example_commands(markdown);
+            assert!(!commands.is_empty(), "{document} lost its examples");
+            for command in commands {
+                checked += 1;
+                if let Err(error) = Cli::try_parse_from(example_command_words(&command)) {
+                    failures.push(format!("{document}: {command}: {:?}", error.kind()));
+                }
+            }
+        }
+        assert!(checked > 300, "documented examples shrank to {checked}");
         assert!(
             failures.is_empty(),
-            "README examples the CLI rejects: {failures:#?}"
+            "documented examples the CLI rejects: {failures:#?}"
         );
     }
 
