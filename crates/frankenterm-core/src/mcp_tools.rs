@@ -1605,14 +1605,24 @@ fn load_mcp_rehearsal_manifest(
 }
 
 // wa.attention tool
-pub(super) struct WaAttentionTool;
+pub(super) struct WaAttentionTool {
+    /// Workspace database for `live` runs; `None` in degraded mode.
+    db_path: Option<Arc<PathBuf>>,
+}
+
+impl WaAttentionTool {
+    #[must_use]
+    pub(super) fn new(db_path: Option<Arc<PathBuf>>) -> Self {
+        Self { db_path }
+    }
+}
 
 impl ToolHandler for WaAttentionTool {
     fn definition(&self) -> Tool {
         Tool {
             name: "wa.attention".to_string(),
             description: Some(
-                "Read attention-router status, next action, or item explanation from caller-supplied evidence (robot parity)"
+                "Read attention-router status, next action, or item explanation from caller-supplied evidence or, with live, the workspace audit log (robot parity)"
                     .to_string(),
             ),
             input_schema: serde_json::json!({
@@ -1622,7 +1632,8 @@ impl ToolHandler for WaAttentionTool {
                     "item_id": { "type": "string", "description": "Attention item id to explain when surface=explain" },
                     "input": { "type": "object", "description": "AttentionRouterSourceAdapterInput object; omitted input yields an explicit degraded no-input snapshot" },
                     "generated_at_ms": { "type": "integer", "minimum": 0 },
-                    "workspace": { "type": "string", "description": "Workspace label used only when input is omitted or workspace override is desired" }
+                    "workspace": { "type": "string", "description": "Workspace label used only when input is omitted or workspace override is desired" },
+                    "live": { "type": "boolean", "default": false, "description": "When input is omitted, add the live read-only sources from the workspace audit log (policy denials, unresolved approval holds, verified-submit drift) and honor active ft mutes; reported unavailable when the server has no workspace database" }
                 },
                 "additionalProperties": false
             }),
@@ -1660,6 +1671,7 @@ impl ToolHandler for WaAttentionTool {
             return envelope_to_content(envelope);
         };
 
+        let live = params.live && params.input.is_none();
         let mut input = params.input.unwrap_or_else(|| {
             AttentionRouterSourceAdapterInput::new(
                 params.generated_at_ms.unwrap_or_else(now_ms),
@@ -1674,6 +1686,17 @@ impl ToolHandler for WaAttentionTool {
             .filter(|workspace| !workspace.trim().is_empty())
         {
             input.workspace = workspace;
+        }
+        // A caller-supplied input is scored exactly; a live run adds the
+        // audit-backed sources, the same ones `ft attention` reads.
+        if live {
+            let audit = match self.db_path.as_deref() {
+                Some(db_path) => {
+                    crate::attention_live::read_live_attention_audit(db_path, input.generated_at_ms)
+                }
+                None => crate::attention_live::LiveAttentionAudit::unreadable(),
+            };
+            crate::attention_live::apply_live_attention_audit(&mut input, &audit);
         }
 
         let payload = build_attention_router_surface_payload(
@@ -15718,7 +15741,7 @@ mod tests {
             WaAccountsRefreshTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
             WaMissionObjectivePlanTool.definition(),
             WaOperatingEnvelopeTool.definition(),
-            WaAttentionTool.definition(),
+            WaAttentionTool::new(None).definition(),
             WaRehearsalScoreTool::new(Arc::clone(&cfg)).definition(),
             WaMissionStateTool::new(Arc::clone(&cfg)).definition(),
             WaMissionExplainTool::new(Arc::clone(&cfg)).definition(),
@@ -20239,7 +20262,7 @@ mod tests {
 
     #[test]
     fn wa_attention_tool_is_read_only_and_explains_inline_input() {
-        let tool = WaAttentionTool;
+        let tool = WaAttentionTool::new(None);
         let status = parse_json_content(
             tool.call(
                 &test_mcp_context(),
@@ -20304,6 +20327,85 @@ mod tests {
         assert_eq!(
             explain["data"]["selected_item"]["recommended_action"]["mutates"],
             false
+        );
+    }
+
+    #[test]
+    fn wa_attention_live_reads_the_workspace_audit_log_only_when_asked() {
+        let (_dir, db) = temp_db_path();
+        let now = now_ms();
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db.to_string_lossy())
+                .await
+                .expect("storage");
+            storage
+                .record_audit_action(crate::storage::AuditActionRecord {
+                    id: 0,
+                    ts: i64::try_from(now).expect("epoch ms") - 1_000,
+                    actor_kind: "robot".to_string(),
+                    actor_id: Some("BlueLake".to_string()),
+                    correlation_id: None,
+                    pane_id: Some(7),
+                    domain: None,
+                    action_kind: "send_text".to_string(),
+                    policy_decision: "deny".to_string(),
+                    decision_reason: Some("blocked".to_string()),
+                    rule_id: Some("command_gate.destructive".to_string()),
+                    input_summary: Some("rm -rf /secret-canary".to_string()),
+                    verification_summary: None,
+                    decision_context: None,
+                    result: "denied".to_string(),
+                })
+                .await
+                .expect("record denial");
+            storage.shutdown().await.expect("storage shutdown");
+        });
+        let denial_items = |envelope: &serde_json::Value| {
+            envelope["data"]["snapshot"]["items"]
+                .as_array()
+                .map_or(0, |items| {
+                    items
+                        .iter()
+                        .filter(|item| {
+                            item["reason_codes"].as_array().is_some_and(|codes| {
+                                codes.iter().any(|code| code == "policy.denied")
+                            })
+                        })
+                        .count()
+                })
+        };
+        let status = |tool: &WaAttentionTool, live: bool| {
+            parse_json_content(
+                tool.call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "surface": "status",
+                        "generated_at_ms": now,
+                        "live": live
+                    }),
+                )
+                .expect("wa.attention status should respond"),
+            )
+        };
+
+        let tool = WaAttentionTool::new(Some(Arc::clone(&db)));
+        let live = status(&tool, true);
+        assert_eq!(live["ok"], true, "envelope: {live}");
+        assert_eq!(denial_items(&live), 1, "the live run reads the audit log");
+        assert!(
+            !live.to_string().contains("secret-canary"),
+            "the action input never leaves the database"
+        );
+        assert_eq!(
+            denial_items(&status(&tool, false)),
+            0,
+            "without live, only caller input is scored"
+        );
+        assert_eq!(
+            denial_items(&status(&WaAttentionTool::new(None), true)),
+            0,
+            "a degraded server reports the audit sources unavailable"
         );
     }
 

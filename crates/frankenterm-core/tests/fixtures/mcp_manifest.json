@@ -297,7 +297,7 @@
     },
     {
       "annotations": null,
-      "description": "Read attention-router status, next action, or item explanation from caller-supplied evidence (robot parity)",
+      "description": "Read attention-router status, next action, or item explanation from caller-supplied evidence or, with live, the workspace audit log (robot parity)",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
@@ -318,6 +318,11 @@
           "item_id": {
             "description": "Attention item id to explain when surface=explain",
             "type": "string"
+          },
+          "live": {
+            "default": false,
+            "description": "When input is omitted, add the live read-only sources from the workspace audit log (policy denials, unresolved approval holds, verified-submit drift) and honor active ft mutes; reported unavailable when the server has no workspace database",
+            "type": "boolean"
           },
           "surface": {
             "default": "status",

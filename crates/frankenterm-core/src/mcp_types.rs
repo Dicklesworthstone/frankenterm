@@ -70,6 +70,10 @@ pub(super) struct AttentionParams {
     pub generated_at_ms: Option<u64>,
     #[serde(default)]
     pub workspace: Option<String>,
+    /// Without `input`, add the live audit-log sources from this server's
+    /// workspace database (read-only).
+    #[serde(default)]
+    pub live: bool,
 }
 
 #[derive(Debug, Deserialize)]

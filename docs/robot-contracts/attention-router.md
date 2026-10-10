@@ -7,8 +7,12 @@ Status: live read-only surface with caller-supplied source-adapter input.
 same surface payload is exposed through `ft attention ...`, `ft robot attention
 ...`, MCP tool `wa.attention`, and MCP resources
 `wa://attention-router/current` plus `wa://attention-router/items/{item_id}`.
-A recorded `--input` is replayed exactly. Without one, `ft attention` and `ft
-robot attention` add live, read-only sources: the watcher's operating envelope
+A recorded `--input` is replayed exactly. MCP `wa.attention` with `live: true`
+and no `input` adds the same audit-backed sources and mutes described below
+(not the watcher envelope), read from the server's workspace database; a
+degraded server without one reports them unavailable. Without `--input`,
+`ft attention` and `ft robot attention` add live, read-only sources: the
+watcher's operating envelope
 (IPC health) and the policy gate from the local audit log, meaning actions
 denied (`policy_denied_audit`) or still held for approval (`approval_store`) in
 the last 24 hours, newest 64 per decision, grouped by actor, action kind, and

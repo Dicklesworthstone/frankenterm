@@ -348,7 +348,9 @@ async fn build_server_inner(
         ))))
         .tool(FormatAwareToolHandler::new(WaMissionObjectivePlanTool))
         .tool(FormatAwareToolHandler::new(WaOperatingEnvelopeTool))
-        .tool(FormatAwareToolHandler::new(WaAttentionTool))
+        .tool(FormatAwareToolHandler::new(WaAttentionTool::new(
+            db_path.clone(),
+        )))
         .tool(FormatAwareToolHandler::new(WaRehearsalScoreTool::new(
             Arc::clone(&config),
         )))
