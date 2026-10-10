@@ -13147,7 +13147,7 @@ async fn build_cli_attention_router_payload(
             ),
         );
         let audit = match layout.as_ref() {
-            Some(layout) => read_live_attention_audit(&layout.db_path, input.generated_at_ms).await,
+            Some(layout) => read_live_attention_audit(&layout.db_path, input.generated_at_ms),
             None => LiveAttentionAudit::unreadable(),
         };
         input.observations.push(
@@ -13184,8 +13184,8 @@ async fn build_cli_attention_router_payload(
 /// Live audit-log inputs for the attention router. `None` marks a read
 /// failure for that input.
 struct LiveAttentionAudit {
-    denied: Option<Vec<frankenterm_core::storage::AuditActionRecord>>,
-    approval_required: Option<Vec<frankenterm_core::storage::AuditActionRecord>>,
+    denied: Option<Vec<frankenterm_core::attention_router::PolicyGateAuditRow>>,
+    approval_required: Option<Vec<frankenterm_core::attention_router::PolicyGateAuditRow>>,
     receipts: Option<Vec<(i64, frankenterm_core::robot_types::SubmitReceipt)>>,
     /// Active `ft mute` records; empty when unreadable, so a read failure
     /// shows items rather than hiding them.
@@ -13221,11 +13221,36 @@ fn attention_mute_from_record(
     }
 }
 
-/// Recent denied and approval-required audit rows and verified-send receipts
-/// for the live attention router, within the attention router's window and
-/// row caps. A workspace without a database has no audit history (empty, not
-/// unreadable), and no database is created here.
-async fn read_live_attention_audit(db_path: &Path, now_ms: u64) -> LiveAttentionAudit {
+/// Selects the [`PolicyGateAuditRow`] fields (pane = `target_pane_id`, as
+/// the storage audit reader maps it). Input, reason and context columns are
+/// never selected.
+///
+/// [`PolicyGateAuditRow`]: frankenterm_core::attention_router::PolicyGateAuditRow
+const LIVE_POLICY_GATE_COLUMNS: &str =
+    "a.ts, a.actor_kind, a.actor_id, a.target_pane_id, a.action_kind, a.rule_id";
+
+fn policy_gate_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<frankenterm_core::attention_router::PolicyGateAuditRow> {
+    Ok(frankenterm_core::attention_router::PolicyGateAuditRow {
+        ts: row.get(0)?,
+        actor_kind: row.get(1)?,
+        actor_id: row.get(2)?,
+        pane_id: row
+            .get::<_, Option<i64>>(3)?
+            .and_then(|pane_id| u64::try_from(pane_id).ok()),
+        action_kind: row.get(4)?,
+        rule_id: row.get(5)?,
+    })
+}
+
+/// Recent denied and unresolved approval-required audit rows, verified-send
+/// receipts, and active `ft mute` records for the live attention router,
+/// within the attention router's window and row caps. Reads use a SQLite
+/// read-only connection: no migration, no writer, nothing created, so
+/// attention stays read-only. A workspace without a database has no audit
+/// history (empty, not unreadable).
+fn read_live_attention_audit(db_path: &Path, now_ms: u64) -> LiveAttentionAudit {
     use frankenterm_core::attention_router::{
         POLICY_GATE_AUDIT_MAX_ROWS, POLICY_GATE_AUDIT_WINDOW_MS, VERIFIED_SUBMIT_AUDIT_MAX_ROWS,
     };
@@ -13238,67 +13263,105 @@ async fn read_live_attention_audit(db_path: &Path, now_ms: u64) -> LiveAttention
             mutes: Vec::new(),
         };
     }
-    let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-    let Ok(storage) =
-        frankenterm_core::storage::StorageHandle::new_with_cx(&cx, &db_path.to_string_lossy())
-            .await
-    else {
+    let Ok(conn) = open_cli_read_only_connection(&db_path.to_string_lossy()) else {
         return LiveAttentionAudit::unreadable();
     };
-    let since = i64::try_from(now_ms.saturating_sub(POLICY_GATE_AUDIT_WINDOW_MS)).ok();
-    let decided = |decision: &str| frankenterm_core::storage::AuditQuery {
-        limit: Some(POLICY_GATE_AUDIT_MAX_ROWS),
-        policy_decision: Some(decision.to_string()),
-        since,
-        ..Default::default()
-    };
-    let denied = storage
-        .get_audit_actions_with_cx(&cx, decided("deny"))
-        .await
-        .ok();
-    let approval_required = storage
-        .get_audit_actions_with_cx(&cx, decided("require_approval"))
-        .await
-        .ok();
-    // Verified sends attach their SubmitReceipt to the allowed send_text
-    // audit row; rows without one, or with another summary, are skipped.
-    let receipts = storage
-        .get_audit_actions_with_cx(
-            &cx,
-            frankenterm_core::storage::AuditQuery {
-                limit: Some(VERIFIED_SUBMIT_AUDIT_MAX_ROWS),
-                action_kind: Some("send_text".to_string()),
-                policy_decision: Some("allow".to_string()),
-                since,
-                ..Default::default()
-            },
-        )
-        .await
-        .ok()
-        .map(|rows| {
-            rows.into_iter()
-                .filter_map(|row| {
-                    let receipt = serde_json::from_str::<
-                        frankenterm_core::robot_types::SubmitReceipt,
-                    >(row.verification_summary.as_deref()?)
-                    .ok()?;
-                    Some((row.ts, receipt))
-                })
-                .collect::<Vec<_>>()
-        });
-    let mutes = storage
-        .list_active_mutes_with_cx(&cx, i64::try_from(now_ms).unwrap_or(i64::MAX))
-        .await
-        .unwrap_or_default();
-    if let Err(error) = storage.shutdown_with_cx(&cx).await {
-        tracing::debug!(%error, "attention router audit read: storage shutdown failed");
-    }
+    let since = i64::try_from(now_ms.saturating_sub(POLICY_GATE_AUDIT_WINDOW_MS)).unwrap_or(0);
+    let now = i64::try_from(now_ms).unwrap_or(i64::MAX);
+    let gate_limit = i64::try_from(POLICY_GATE_AUDIT_MAX_ROWS).unwrap_or(i64::MAX);
+    let receipt_limit = i64::try_from(VERIFIED_SUBMIT_AUDIT_MAX_ROWS).unwrap_or(i64::MAX);
     LiveAttentionAudit {
-        denied,
-        approval_required,
-        receipts,
-        mutes,
+        denied: query_policy_gate_rows(
+            &conn,
+            &format!(
+                "SELECT {LIVE_POLICY_GATE_COLUMNS} FROM audit_actions a \
+                 WHERE a.policy_decision = 'deny' AND a.ts >= ?1 \
+                 ORDER BY a.ts DESC, a.id DESC LIMIT ?2"
+            ),
+            since,
+            gate_limit,
+        )
+        .ok(),
+        // An approval-required action followed by an allowed action from the
+        // same actor, action kind and pane was approved and ran.
+        approval_required: query_policy_gate_rows(
+            &conn,
+            &format!(
+                "SELECT {LIVE_POLICY_GATE_COLUMNS} FROM audit_actions a \
+                 WHERE a.policy_decision = 'require_approval' AND a.ts >= ?1 \
+                 AND NOT EXISTS (SELECT 1 FROM audit_actions b \
+                     WHERE b.target_pane_id IS a.target_pane_id AND b.ts > a.ts \
+                     AND b.policy_decision = 'allow' AND b.action_kind = a.action_kind \
+                     AND b.actor_kind = a.actor_kind AND b.actor_id IS a.actor_id) \
+                 ORDER BY a.ts DESC, a.id DESC LIMIT ?2"
+            ),
+            since,
+            gate_limit,
+        )
+        .ok(),
+        receipts: query_verified_send_receipts(&conn, since, receipt_limit).ok(),
+        mutes: query_active_event_mutes(&conn, now).unwrap_or_default(),
     }
+}
+
+fn query_policy_gate_rows(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    since: i64,
+    limit: i64,
+) -> rusqlite::Result<Vec<frankenterm_core::attention_router::PolicyGateAuditRow>> {
+    let mut statement = conn.prepare(sql)?;
+    let rows = statement.query_map(rusqlite::params![since, limit], policy_gate_row)?;
+    rows.collect()
+}
+
+/// Verified sends attach their SubmitReceipt to the allowed send_text audit
+/// row; summaries that are not receipts are skipped.
+fn query_verified_send_receipts(
+    conn: &rusqlite::Connection,
+    since: i64,
+    limit: i64,
+) -> rusqlite::Result<Vec<(i64, frankenterm_core::robot_types::SubmitReceipt)>> {
+    let mut statement = conn.prepare(
+        "SELECT ts, verification_summary FROM audit_actions \
+         WHERE action_kind = 'send_text' AND policy_decision = 'allow' AND ts >= ?1 \
+         AND verification_summary IS NOT NULL \
+         ORDER BY ts DESC, id DESC LIMIT ?2",
+    )?;
+    let rows = statement.query_map(rusqlite::params![since, limit], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(ts, summary)| {
+            serde_json::from_str::<frankenterm_core::robot_types::SubmitReceipt>(&summary)
+                .ok()
+                .map(|receipt| (ts, receipt))
+        })
+        .collect())
+}
+
+/// Active `ft mute` records, with the storage mute reader's predicate.
+fn query_active_event_mutes(
+    conn: &rusqlite::Connection,
+    now_ms: i64,
+) -> rusqlite::Result<Vec<frankenterm_core::storage::EventMuteRecord>> {
+    let mut statement = conn.prepare(
+        "SELECT identity_key, scope, created_at, expires_at, created_by, reason \
+         FROM event_mutes WHERE expires_at IS NULL OR expires_at > ?1",
+    )?;
+    let rows = statement.query_map(rusqlite::params![now_ms], |row| {
+        Ok(frankenterm_core::storage::EventMuteRecord {
+            identity_key: row.get(0)?,
+            scope: row.get(1)?,
+            created_at: row.get(2)?,
+            expires_at: row.get(3)?,
+            created_by: row.get(4)?,
+            reason: row.get(5)?,
+        })
+    })?;
+    rows.collect()
 }
 
 fn attention_router_value_label<T: serde::Serialize>(value: &T) -> String {
@@ -137806,31 +137869,72 @@ printf x > "$MINISIGN_MARKER"
                 .await
                 .expect("storage");
             let now = now_ms_i64();
-            for (actor, rule) in [
-                ("BlueLake", "command_gate.destructive"),
-                ("BlueLake", "command_gate.destructive"),
-                ("GreenRiver", "command_gate.network"),
+            // (actor, action, pane, decision, rule, age_ms)
+            for (actor, action, pane, decision, rule, age) in [
+                (
+                    "BlueLake",
+                    "send_text",
+                    7,
+                    "deny",
+                    "command_gate.destructive",
+                    1_000,
+                ),
+                (
+                    "BlueLake",
+                    "send_text",
+                    7,
+                    "deny",
+                    "command_gate.destructive",
+                    1_000,
+                ),
+                (
+                    "GreenRiver",
+                    "send_text",
+                    7,
+                    "deny",
+                    "command_gate.network",
+                    1_000,
+                ),
+                // Approved and then ran: resolved, so not pending.
+                (
+                    "BlueLake",
+                    "send_text",
+                    8,
+                    "require_approval",
+                    "approval.send",
+                    5_000,
+                ),
+                ("BlueLake", "send_text", 8, "allow", "approval.send", 4_000),
+                // Still waiting for a decision.
+                (
+                    "GreenRiver",
+                    "spawn",
+                    9,
+                    "require_approval",
+                    "approval.spawn",
+                    3_000,
+                ),
             ] {
                 storage
                     .record_audit_action(AuditActionRecord {
                         id: 0,
-                        ts: now - 1_000,
+                        ts: now - age,
                         actor_kind: "robot".to_string(),
                         actor_id: Some(actor.to_string()),
                         correlation_id: None,
-                        pane_id: Some(7),
+                        pane_id: Some(pane),
                         domain: Some("local".to_string()),
-                        action_kind: "send_text".to_string(),
-                        policy_decision: "deny".to_string(),
+                        action_kind: action.to_string(),
+                        policy_decision: decision.to_string(),
                         decision_reason: Some("blocked".to_string()),
                         rule_id: Some(rule.to_string()),
                         input_summary: Some("rm -rf /secret-canary".to_string()),
                         verification_summary: None,
                         decision_context: None,
-                        result: "denied".to_string(),
+                        result: "recorded".to_string(),
                     })
                     .await
-                    .expect("record denial");
+                    .expect("record audit action");
             }
             storage
                 .add_event_mute(EventMuteRecord {
@@ -137879,6 +137983,26 @@ printf x > "$MINISIGN_MARKER"
                     .reason_codes
                     .iter()
                     .any(|code| code == "policy_rule.command_gate.destructive")
+            );
+            let pending: Vec<_> = payload
+                .snapshot
+                .items
+                .iter()
+                .filter(|item| {
+                    item.reason_codes
+                        .iter()
+                        .any(|code| code == "approval.required")
+                })
+                .collect();
+            assert_eq!(
+                pending.len(),
+                1,
+                "an approval followed by an allowed run is resolved: {pending:?}"
+            );
+            assert!(
+                pending[0].redacted_summary.contains("GreenRiver"),
+                "{}",
+                pending[0].redacted_summary
             );
             let rendered = serde_json::to_string(&payload).expect("serialize payload");
             assert!(!rendered.contains("secret-canary"), "no action input leaks");

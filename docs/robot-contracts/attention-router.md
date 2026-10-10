@@ -10,8 +10,12 @@ same surface payload is exposed through `ft attention ...`, `ft robot attention
 A recorded `--input` is replayed exactly. Without one, `ft attention` and `ft
 robot attention` add live, read-only sources: the watcher's operating envelope
 (IPC health) and the policy gate from the local audit log, meaning actions
-denied (`policy_denied_audit`) or held for approval (`approval_store`) in the
-last 24 hours, newest 64 per decision, grouped by actor, action kind, and rule.
+denied (`policy_denied_audit`) or still held for approval (`approval_store`) in
+the last 24 hours, newest 64 per decision, grouped by actor, action kind, and
+rule. An approval-required action followed by an allowed action from the same
+actor, action kind, and pane counts as approved and is dropped. The audit log
+is read through a SQLite read-only connection (no migration, no writer), and
+the input, reason, and context columns are never selected.
 They also add `verified_submit`, built from the SubmitReceipts that verified
 sends attach to their audit rows (newest 1000 in 24 hours). Receipts are grouped
 by agent type over the outcomes the agent's UI decides, so policy outcomes and

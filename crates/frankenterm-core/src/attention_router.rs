@@ -2625,27 +2625,53 @@ pub const POLICY_GATE_AUDIT_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
 /// Newest audit rows a live policy-gate source reads for each decision.
 pub const POLICY_GATE_AUDIT_MAX_ROWS: usize = 64;
 
+/// The audit-row fields a live policy-gate source uses. The action input, the
+/// policy's free-text reason, and the decision context are deliberately absent
+/// (they can echo command text), so no fact can carry them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyGateAuditRow {
+    pub ts: i64,
+    pub actor_kind: String,
+    pub actor_id: Option<String>,
+    pub pane_id: Option<u64>,
+    pub action_kind: String,
+    pub rule_id: Option<String>,
+}
+
+impl From<&crate::storage::AuditActionRecord> for PolicyGateAuditRow {
+    fn from(record: &crate::storage::AuditActionRecord) -> Self {
+        Self {
+            ts: record.ts,
+            actor_kind: record.actor_kind.clone(),
+            actor_id: record.actor_id.clone(),
+            pane_id: record.pane_id,
+            action_kind: record.action_kind.clone(),
+            rule_id: record.rule_id.clone(),
+        }
+    }
+}
+
 /// Live `policy_denied_audit` source from recent audit actions whose policy
 /// decision was `deny`, read by the caller within
 /// [`POLICY_GATE_AUDIT_WINDOW_MS`] and [`POLICY_GATE_AUDIT_MAX_ROWS`]. One
-/// fact per actor, action kind, and rule, counting its denials. Facts name the
-/// actor, action kind, panes, and rule id only: never the action input or the
-/// policy's free-text reason, which can echo command text. `None` means the
-/// audit log could not be read.
+/// fact per actor, action kind, and rule, counting its denials. `None` means
+/// the audit log could not be read.
 #[must_use]
 pub fn policy_denied_observation_from_audit(
-    denied: Option<&[crate::storage::AuditActionRecord]>,
+    denied: Option<&[PolicyGateAuditRow]>,
     now_ms: u64,
 ) -> AttentionRouterSourceObservation {
     policy_gate_observation(PolicyGate::Denied, denied, now_ms)
 }
 
 /// Live `approval_store` source from recent audit actions whose policy
-/// decision was `require_approval`; see
-/// [`policy_denied_observation_from_audit`] for the bounds and redaction.
+/// decision was `require_approval` and that are still unresolved: the caller
+/// drops any followed by an allowed action from the same actor, action kind,
+/// and pane, since that action was approved and ran. See
+/// [`policy_denied_observation_from_audit`] for the bounds and grouping.
 #[must_use]
 pub fn approval_required_observation_from_audit(
-    approval_required: Option<&[crate::storage::AuditActionRecord]>,
+    approval_required: Option<&[PolicyGateAuditRow]>,
     now_ms: u64,
 ) -> AttentionRouterSourceObservation {
     policy_gate_observation(PolicyGate::ApprovalRequired, approval_required, now_ms)
@@ -2703,7 +2729,7 @@ impl PolicyGate {
 
 fn policy_gate_observation(
     gate: PolicyGate,
-    actions: Option<&[crate::storage::AuditActionRecord]>,
+    actions: Option<&[PolicyGateAuditRow]>,
     now_ms: u64,
 ) -> AttentionRouterSourceObservation {
     let Some(actions) = actions else {
@@ -3549,6 +3575,8 @@ mod tests {
             ),
             audit_row(1, None, "spawn", None, None, "deny", at(9_000)),
         ];
+        // Converting a full audit record drops its input, reason and context.
+        let denied: Vec<PolicyGateAuditRow> = denied.iter().map(PolicyGateAuditRow::from).collect();
         let observation = policy_denied_observation_from_audit(Some(&denied), now);
         assert_eq!(
             observation.source_kind,
@@ -3611,7 +3639,7 @@ mod tests {
         );
         assert_eq!(blockers(&muted), 1, "the muted group is suppressed");
 
-        let required = [audit_row(
+        let required = [PolicyGateAuditRow::from(&audit_row(
             4,
             Some("BlueLake"),
             "send_text",
@@ -3619,7 +3647,7 @@ mod tests {
             Some("approval.send"),
             "require_approval",
             at(2_000),
-        )];
+        ))];
         let approval = approval_required_observation_from_audit(Some(&required), now);
         assert_eq!(
             approval.source_kind,
