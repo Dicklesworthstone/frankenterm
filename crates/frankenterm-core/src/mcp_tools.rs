@@ -20333,7 +20333,7 @@ mod tests {
     #[test]
     fn wa_attention_live_reads_the_workspace_audit_log_only_when_asked() {
         let (_dir, db) = temp_db_path();
-        let now = now_ms();
+        let now = super::now_ms();
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
             let storage = StorageHandle::new(&db.to_string_lossy())
