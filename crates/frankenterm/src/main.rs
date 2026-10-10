@@ -138145,6 +138145,90 @@ printf x > "$MINISIGN_MARKER"
                     .await
                     .expect("record audit action");
             }
+            // A detection storm: five identical critical events on pane 3, plus
+            // a warning whose identity the operator muted.
+            storage
+                .upsert_pane(frankenterm_core::storage::PaneRecord {
+                    pane_id: 3,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: None,
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: now - 60_000,
+                    last_seen_at: now,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                })
+                .await
+                .expect("pane");
+            let event = |rule: &str, event_type: &str, severity: &str, age: i64| {
+                frankenterm_core::storage::StoredEvent {
+                    id: 0,
+                    pane_id: 3,
+                    rule_id: rule.to_string(),
+                    agent_type: "codex".to_string(),
+                    event_type: event_type.to_string(),
+                    severity: severity.to_string(),
+                    confidence: 0.9,
+                    extracted: Some(serde_json::json!({"reset": "5pm"})),
+                    matched_text: Some("SECRET MATCH secret-canary".to_string()),
+                    segment_id: None,
+                    detected_at: now - age,
+                    dedupe_key: None,
+                    handled_at: None,
+                    handled_by_workflow_id: None,
+                    handled_status: None,
+                }
+            };
+            for age in [1_000, 2_000, 3_000, 4_000, 5_000] {
+                storage
+                    .record_event(event(
+                        "codex.usage.reached",
+                        "usage.reached",
+                        "critical",
+                        age,
+                    ))
+                    .await
+                    .expect("storm event");
+            }
+            storage
+                .record_event(event(
+                    "claude_code.auth.login_required",
+                    "auth.login_required",
+                    "warning",
+                    1_000,
+                ))
+                .await
+                .expect("muted event");
+            let muted_event_key = frankenterm_core::events::event_identity_key(
+                &frankenterm_core::patterns::Detection {
+                    rule_id: "claude_code.auth.login_required".to_string(),
+                    agent_type: frankenterm_core::patterns::AgentType::Unknown,
+                    event_type: "auth.login_required".to_string(),
+                    severity: frankenterm_core::patterns::Severity::Info,
+                    confidence: 0.0,
+                    extracted: serde_json::json!({"reset": "5pm"}),
+                    matched_text: String::new(),
+                    span: (0, 0),
+                },
+                3,
+                None,
+            );
+            storage
+                .add_event_mute(EventMuteRecord {
+                    identity_key: muted_event_key,
+                    scope: "workspace".to_string(),
+                    created_at: now,
+                    expires_at: None,
+                    created_by: None,
+                    reason: None,
+                })
+                .await
+                .expect("event mute");
             storage
                 .add_event_mute(EventMuteRecord {
                     identity_key:
@@ -138213,8 +138297,33 @@ printf x > "$MINISIGN_MARKER"
                 "{}",
                 pending[0].redacted_summary
             );
+            let events: Vec<_> = payload
+                .snapshot
+                .items
+                .iter()
+                .filter(|item| {
+                    item.reason_codes
+                        .iter()
+                        .any(|code| code == "event.unhandled")
+                })
+                .collect();
+            assert_eq!(
+                events.len(),
+                1,
+                "the storm is one item and the muted identity is suppressed: {events:?}"
+            );
+            assert!(
+                events[0]
+                    .redacted_summary
+                    .contains("5 unhandled critical codex.usage.reached"),
+                "{}",
+                events[0].redacted_summary
+            );
             let rendered = serde_json::to_string(&payload).expect("serialize payload");
-            assert!(!rendered.contains("secret-canary"), "no action input leaks");
+            assert!(
+                !rendered.contains("secret-canary") && !rendered.contains("SECRET MATCH"),
+                "no action input or matched text leaks"
+            );
 
             let _ = std::fs::remove_dir_all(&temp);
         });
