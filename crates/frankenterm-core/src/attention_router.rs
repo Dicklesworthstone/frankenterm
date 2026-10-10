@@ -3308,6 +3308,82 @@ pub fn crash_bundles_observation(
     observation
 }
 
+/// The workspace's active mission transaction contract
+/// (`.ft/mission/tx-active.json`): its id and lifecycle only. Intent text,
+/// steps and receipts stay in the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveTxRow {
+    pub tx_id: String,
+    pub state: crate::plan::MissionTxState,
+}
+
+/// Live `mission_tx_status` source from the active transaction contract: a
+/// failed or compensating transaction is a blocker until it is rolled back
+/// or settled. `Some(None)` means no active contract; `None` means it could
+/// not be read.
+#[must_use]
+pub fn active_tx_observation(
+    active: Option<Option<&ActiveTxRow>>,
+    now_ms: u64,
+) -> AttentionRouterSourceObservation {
+    use crate::plan::MissionTxState;
+
+    const SOURCE_ID: &str = "mission_tx_status.active";
+    const API: &str = "workspace.mission.tx_active_contract";
+    let Some(active) = active else {
+        return AttentionRouterSourceObservation::new(
+            SOURCE_ID,
+            AttentionRouterSourceKind::MissionTxStatus,
+            AttentionRouterSourceHealth::Unavailable,
+            API,
+            "the active transaction contract could not be read",
+        )
+        .live(now_ms, 0)
+        .with_fact(
+            AttentionRouterSourceFact::new(
+                AttentionRouterSourceFactKind::SourceUnavailable,
+                "the active transaction contract is unreadable",
+            )
+            .with_reason_code("mission_tx_status.unavailable"),
+        );
+    };
+    let mut observation = AttentionRouterSourceObservation::new(
+        SOURCE_ID,
+        AttentionRouterSourceKind::MissionTxStatus,
+        AttentionRouterSourceHealth::Available,
+        API,
+        match active {
+            Some(tx) => format!("active transaction {} is {:?}", tx.tx_id, tx.state),
+            None => "no active transaction contract".to_string(),
+        },
+    )
+    .live(now_ms, 0);
+    let Some(tx) = active else {
+        return observation;
+    };
+    let (reason_code, next) = match tx.state {
+        MissionTxState::Failed => ("tx.failed", "roll it back with ft tx rollback"),
+        MissionTxState::Compensating => (
+            "tx.compensating",
+            "let compensation finish, then check ft tx show",
+        ),
+        _ => return observation,
+    };
+    let mute_key = format!("attention.mission_tx_status.{}", tx.tx_id);
+    observation = observation.with_fact(
+        AttentionRouterSourceFact::new(
+            AttentionRouterSourceFactKind::MissionTxState,
+            format!(
+                "transaction {} is {:?}: {next} [mute: ft mute add {mute_key}]",
+                tx.tx_id, tx.state
+            ),
+        )
+        .with_reason_code(reason_code)
+        .with_notification_identity_key(mute_key),
+    );
+    observation
+}
+
 fn missing_source_observation(
     source_kind: AttentionRouterSourceKind,
     generated_at_ms: u64,
@@ -4239,6 +4315,64 @@ mod tests {
         assert!(quiet.facts.is_empty());
         let unreadable = unhandled_events_observation(None, now);
         assert_eq!(unreadable.health, AttentionRouterSourceHealth::Unavailable);
+    }
+
+    #[test]
+    fn live_active_tx_is_a_blocker_only_while_failed_or_compensating() {
+        use crate::plan::MissionTxState;
+
+        let now = 1_770_000_000_000_u64;
+        let tx = |state| ActiveTxRow {
+            tx_id: "tx:deploy-42".to_string(),
+            state,
+        };
+        let failed = tx(MissionTxState::Failed);
+        let observation = active_tx_observation(Some(Some(&failed)), now);
+        assert_eq!(
+            observation.source_kind,
+            AttentionRouterSourceKind::MissionTxStatus
+        );
+        assert_eq!(observation.facts.len(), 1);
+        let fact = &observation.facts[0];
+        assert_eq!(fact.reason_codes, ["tx.failed"]);
+        assert!(fact.summary.contains("ft tx rollback"), "{}", fact.summary);
+        let blockers = |snapshot: &AttentionRouterSnapshot| {
+            snapshot
+                .items
+                .iter()
+                .filter(|item| item.reason_codes.iter().any(|code| code == "tx.failed"))
+                .count()
+        };
+        let snapshot = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation.clone()),
+        );
+        assert_eq!(blockers(&snapshot), 1);
+        let muted = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation)
+                .with_notification_mute(AttentionRouterNotificationMute::global(
+                    "attention.mission_tx_status.tx:deploy-42",
+                )),
+        );
+        assert_eq!(blockers(&muted), 0);
+
+        let compensating = tx(MissionTxState::Compensating);
+        assert_eq!(
+            active_tx_observation(Some(Some(&compensating)), now).facts[0].reason_codes,
+            ["tx.compensating"]
+        );
+        let committed = tx(MissionTxState::Committed);
+        assert!(
+            active_tx_observation(Some(Some(&committed)), now)
+                .facts
+                .is_empty()
+        );
+        assert!(active_tx_observation(Some(None), now).facts.is_empty());
+        assert_eq!(
+            active_tx_observation(None, now).health,
+            AttentionRouterSourceHealth::Unavailable
+        );
     }
 
     #[test]

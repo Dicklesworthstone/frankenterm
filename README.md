@@ -968,11 +968,12 @@ anything. Without `--input` it reads live sources:
 - verified-submit profile drift;
 - unhandled warning and critical detection events;
 - operator pane holds;
-- watcher crash bundles from the last day.
+- watcher crash bundles from the last day;
+- a failed or compensating mission transaction.
 
 Each item carries its reasons, a safe next action and a mute key. MCP
 `wa.attention` with `live: true` reads the same database sources, but not the
-watcher envelope or crash bundles. The JSON contract is in
+watcher envelope, crash bundles or the transaction contract. The JSON contract is in
 `docs/robot-contracts/attention-router.md`.
 
 ```bash

@@ -49,6 +49,10 @@ reason, are left out. The CLI (not MCP, like the watcher envelope) also adds
 (newest 8, from the crash directory) is a blocker asking for review with
 `ft reproduce export --kind crash`, muted per bundle once reviewed; only the
 bundle's directory name and age are read, never its message or backtrace.
+The CLI also adds `mission_tx_status` from the active transaction contract
+(`.ft/mission/tx-active.json`, the `ft tx` default): a `failed` or
+`compensating` transaction is a blocker until it is rolled back or settled.
+Only the contract's id and lifecycle are read.
 Each live policy-gate, drift and event fact carries a stable mute key, printed
 in its summary (`[mute: ft mute add attention.<source>...]`, or the event's
 `evt:` identity). Live runs load active `ft mute` records from the same

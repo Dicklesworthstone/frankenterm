@@ -12,8 +12,8 @@
 use std::path::Path;
 
 use crate::attention_router::{
-    AttentionRouterNotificationMute, AttentionRouterSourceAdapterInput, CrashBundleRow,
-    MANUAL_RESERVATIONS_MAX_ROWS, ManualReservationRow, POLICY_GATE_AUDIT_MAX_ROWS,
+    ActiveTxRow, AttentionRouterNotificationMute, AttentionRouterSourceAdapterInput,
+    CrashBundleRow, MANUAL_RESERVATIONS_MAX_ROWS, ManualReservationRow, POLICY_GATE_AUDIT_MAX_ROWS,
     POLICY_GATE_AUDIT_WINDOW_MS, PolicyGateAuditRow, RECENT_CRASH_BUNDLES_MAX,
     RECENT_CRASH_BUNDLES_WINDOW_MS, UNHANDLED_EVENTS_MAX_ROWS, UNHANDLED_EVENTS_WINDOW_MS,
     UnhandledEventRow, VERIFIED_SUBMIT_AUDIT_MAX_ROWS, approval_required_observation_from_audit,
@@ -246,6 +246,42 @@ pub fn read_recent_crash_bundles(crash_dir: &Path, now_ms: u64) -> Option<Vec<Cr
     )
 }
 
+/// The workspace's active mission transaction contract
+/// (`<ft_dir>/mission/tx-active.json`, the `ft tx` default): only its id and
+/// lifecycle are deserialized. `Some(None)` means there is none; `None` means
+/// it exists but could not be read, is oversized, or does not parse.
+#[must_use]
+pub fn read_active_tx(ft_dir: &Path) -> Option<Option<ActiveTxRow>> {
+    const MAX_CONTRACT_BYTES: u64 = 8 * 1024 * 1024;
+
+    #[derive(serde::Deserialize)]
+    struct ContractIntent {
+        tx_id: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ContractLifecycle {
+        intent: ContractIntent,
+        lifecycle_state: crate::plan::MissionTxState,
+    }
+
+    let path = ft_dir.join("mission").join("tx-active.json");
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(None),
+        Err(_) => return None,
+    };
+    if !metadata.is_file() || metadata.len() > MAX_CONTRACT_BYTES {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    let contract: ContractLifecycle = serde_json::from_str(&text).ok()?;
+    Some(Some(ActiveTxRow {
+        tx_id: contract.intent.tx_id,
+        state: contract.lifecycle_state,
+    }))
+}
+
 /// Active, unexpired manual reservations, with the storage reader's
 /// predicate. The free-text reason column is never selected.
 fn query_active_manual_reservations(
@@ -407,6 +443,34 @@ mod tests {
         assert_eq!(audit.events, Some(Vec::new()));
         assert_eq!(audit.reservations, Some(Vec::new()));
         assert!(!db_path.exists(), "a read never creates the database");
+    }
+
+    #[test]
+    fn active_tx_reads_only_id_and_lifecycle_and_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(read_active_tx(dir.path()), Some(None), "no contract, no tx");
+        let mission = dir.path().join("mission");
+        std::fs::create_dir(&mission).expect("mission dir");
+        let contract = mission.join("tx-active.json");
+        std::fs::write(
+            &contract,
+            r#"{"tx_version":1,"intent":{"tx_id":"tx:deploy-42","objective":"SECRET OBJECTIVE"},
+               "lifecycle_state":"failed","receipts":[]}"#,
+        )
+        .expect("contract");
+        assert_eq!(
+            read_active_tx(dir.path()),
+            Some(Some(ActiveTxRow {
+                tx_id: "tx:deploy-42".to_string(),
+                state: crate::plan::MissionTxState::Failed,
+            }))
+        );
+        std::fs::write(&contract, "not json").expect("garbage");
+        assert_eq!(
+            read_active_tx(dir.path()),
+            None,
+            "unparseable is unreadable"
+        );
     }
 
     #[test]

@@ -2116,8 +2116,9 @@ NOTES:
     exactly. Without it, it reads live sources: the watcher's operating
     envelope, the last 24 hours of policy denials and approval holds,
     verified-submit drift, unhandled warning and critical events, operator
-    pane holds and recent crash bundles. Sources it cannot read are reported
-    unavailable, never guessed.
+    pane holds, recent crash bundles and a failed or compensating mission
+    transaction. Sources it cannot read are reported unavailable, never
+    guessed.
 
 SEE ALSO:
     ft robot attention status
@@ -13172,6 +13173,15 @@ async fn build_cli_attention_router_payload(
                 input.generated_at_ms,
             ),
         );
+        let active_tx = layout
+            .as_ref()
+            .and_then(|layout| frankenterm_core::attention_live::read_active_tx(&layout.ft_dir));
+        input
+            .observations
+            .push(frankenterm_core::attention_router::active_tx_observation(
+                active_tx.as_ref().map(Option::as_ref),
+                input.generated_at_ms,
+            ));
     }
     Ok(build_attention_router_surface_payload(
         &input,
