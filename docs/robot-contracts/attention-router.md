@@ -34,13 +34,21 @@ the pane of the newest unconfirmed receipt, carrying counts and the latest
 profile. It signals again only after the agent type recovers and relapses,
 and a 6-hour dedupe bucket holds it to one event per agent type across
 watcher restarts.
-Each live policy-gate and drift fact carries a stable mute key, printed in its
-summary (`[mute: ft mute add attention.<source>...]`). Live runs load active
-`ft mute` records from the same database, so a muted key's item is suppressed
-(and counted in the explanation) instead of resurfacing every run.
-Policy-gate and receipt facts never carry the action input, the policy's
-free-text reason, or idempotency keys, and a workspace without a database is
-not created. Every other source appears only through caller input and is
+They also add `events`: unhandled warning and critical detection events from
+the last 24 hours (newest 256), leaving out events an operator triaged as
+`resolved` or `dismissed` (`ft events triage <id> --state resolved`). Events
+are grouped by their event identity, the redacted hash `ft mute` keys events
+by, so a repeating detection is one blocker with a count, and a critical one
+carries `event.critical`. Matched text and extracted values are never
+selected into a fact.
+Each live policy-gate, drift and event fact carries a stable mute key, printed
+in its summary (`[mute: ft mute add attention.<source>...]`, or the event's
+`evt:` identity). Live runs load active `ft mute` records from the same
+database, so a muted key's item is suppressed (and counted in the
+explanation) instead of resurfacing every run.
+Policy-gate, receipt and event facts never carry the action input, the
+policy's free-text reason, idempotency keys or matched text, and a workspace
+without a database is not created. Every other source appears only through caller input and is
 otherwise reported missing. The attention surfaces mutate nothing; only the
 watcher's drift monitor above writes, and only its own events.
 

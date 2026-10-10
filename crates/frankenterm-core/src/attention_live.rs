@@ -11,9 +11,10 @@ use std::path::Path;
 
 use crate::attention_router::{
     AttentionRouterNotificationMute, AttentionRouterSourceAdapterInput, POLICY_GATE_AUDIT_MAX_ROWS,
-    POLICY_GATE_AUDIT_WINDOW_MS, PolicyGateAuditRow, VERIFIED_SUBMIT_AUDIT_MAX_ROWS,
+    POLICY_GATE_AUDIT_WINDOW_MS, PolicyGateAuditRow, UNHANDLED_EVENTS_MAX_ROWS,
+    UNHANDLED_EVENTS_WINDOW_MS, UnhandledEventRow, VERIFIED_SUBMIT_AUDIT_MAX_ROWS,
     approval_required_observation_from_audit, policy_denied_observation_from_audit,
-    verified_submit_observation_from_receipts,
+    unhandled_events_observation, verified_submit_observation_from_receipts,
 };
 use crate::robot_types::SubmitReceipt;
 use crate::storage::EventMuteRecord;
@@ -25,6 +26,8 @@ pub struct LiveAttentionAudit {
     pub denied: Option<Vec<PolicyGateAuditRow>>,
     pub approval_required: Option<Vec<PolicyGateAuditRow>>,
     pub receipts: Option<Vec<(i64, SubmitReceipt)>>,
+    /// Unhandled warning and critical detection events.
+    pub events: Option<Vec<UnhandledEventRow>>,
     /// Active `ft mute` records; empty when unreadable, so a read failure
     /// shows items rather than hiding them.
     pub mutes: Vec<EventMuteRecord>,
@@ -39,6 +42,7 @@ impl LiveAttentionAudit {
             denied: None,
             approval_required: None,
             receipts: None,
+            events: None,
             mutes: Vec::new(),
         }
     }
@@ -51,6 +55,7 @@ impl LiveAttentionAudit {
             denied: Some(Vec::new()),
             approval_required: Some(Vec::new()),
             receipts: Some(Vec::new()),
+            events: Some(Vec::new()),
             mutes: Vec::new(),
         }
     }
@@ -96,6 +101,10 @@ pub fn apply_live_attention_audit(
             audit.receipts.as_deref(),
             now_ms,
         ));
+    input.observations.push(unhandled_events_observation(
+        audit.events.as_deref(),
+        now_ms,
+    ));
     // Operator mutes (`ft mute add <key>`) suppress matching live facts.
     input
         .notification_mutes
@@ -175,8 +184,76 @@ pub fn read_live_attention_audit(db_path: &Path, now_ms: u64) -> LiveAttentionAu
         )
         .ok(),
         receipts: query_verified_send_receipts(&conn, since, receipt_limit).ok(),
+        events: query_unhandled_events(
+            &conn,
+            i64::try_from(now_ms.saturating_sub(UNHANDLED_EVENTS_WINDOW_MS)).unwrap_or(0),
+            i64::try_from(UNHANDLED_EVENTS_MAX_ROWS).unwrap_or(i64::MAX),
+        )
+        .ok(),
         mutes: query_active_event_mutes(&conn, now).unwrap_or_default(),
     }
+}
+
+/// Unhandled warning and critical events, newest first, with the identity
+/// key `ft mute` uses (computed as storage computes it). The extracted
+/// values feed only that redacted hash; matched text is never selected.
+fn query_unhandled_events(
+    conn: &rusqlite::Connection,
+    since: i64,
+    limit: i64,
+) -> rusqlite::Result<Vec<UnhandledEventRow>> {
+    let mut statement = conn.prepare(
+        "SELECT e.pane_id, e.rule_id, e.event_type, e.severity, e.detected_at, e.extracted, \
+         p.pane_uuid FROM events e LEFT JOIN panes p ON p.pane_id = e.pane_id \
+         WHERE e.handled_at IS NULL AND e.severity IN ('warning', 'critical') \
+         AND e.detected_at >= ?1 \
+         AND (e.triage_state IS NULL OR e.triage_state NOT IN ('resolved', 'dismissed')) \
+         ORDER BY e.detected_at DESC, e.id DESC LIMIT ?2",
+    )?;
+    let rows = statement.query_map(rusqlite::params![since, limit], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+        ))
+    })?;
+    let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(pane_id, rule_id, event_type, severity, detected_at, extracted, pane_uuid)| {
+                let pane_id = u64::try_from(pane_id).unwrap_or(0);
+                let detection = crate::patterns::Detection {
+                    rule_id: rule_id.clone(),
+                    agent_type: crate::patterns::AgentType::Unknown,
+                    event_type,
+                    severity: crate::patterns::Severity::Info,
+                    confidence: 0.0,
+                    extracted: extracted
+                        .as_deref()
+                        .and_then(|text| serde_json::from_str(text).ok())
+                        .unwrap_or(serde_json::Value::Null),
+                    matched_text: String::new(),
+                    span: (0, 0),
+                };
+                UnhandledEventRow {
+                    pane_id,
+                    identity_key: crate::events::event_identity_key(
+                        &detection,
+                        pane_id,
+                        pane_uuid.as_deref(),
+                    ),
+                    rule_id,
+                    severity,
+                    detected_at,
+                }
+            },
+        )
+        .collect())
 }
 
 fn query_policy_gate_rows(
@@ -251,7 +328,71 @@ mod tests {
         assert_eq!(audit.denied, Some(Vec::new()));
         assert_eq!(audit.approval_required, Some(Vec::new()));
         assert_eq!(audit.receipts.as_ref().map(Vec::len), Some(0));
+        assert_eq!(audit.events, Some(Vec::new()));
         assert!(!db_path.exists(), "a read never creates the database");
+    }
+
+    #[test]
+    fn unhandled_events_are_recent_untriaged_warnings_or_criticals_keyed_like_ft_mute() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("ft.db");
+        let now_ms: u64 = 200_000_000;
+        let recent = 199_940_000;
+        let conn = rusqlite::Connection::open(&db_path).expect("create db");
+        conn.execute_batch(&format!(
+            "CREATE TABLE panes (pane_id INTEGER PRIMARY KEY, pane_uuid TEXT);
+             CREATE TABLE events (id INTEGER PRIMARY KEY, pane_id INTEGER NOT NULL,
+                 rule_id TEXT NOT NULL, event_type TEXT NOT NULL, severity TEXT NOT NULL,
+                 extracted TEXT, matched_text TEXT, detected_at INTEGER NOT NULL,
+                 handled_at INTEGER, triage_state TEXT);
+             INSERT INTO panes VALUES (3, 'uuid-3');
+             INSERT INTO events VALUES (1, 3, 'codex.usage.reached', 'usage.reached',
+                 'critical', '{{\"reset\":\"5pm\"}}', 'SECRET TEXT', {recent}, NULL, NULL);
+             INSERT INTO events VALUES (2, 3, 'codex.usage.reached', 'usage.reached',
+                 'info', NULL, NULL, {recent}, NULL, NULL);
+             INSERT INTO events VALUES (3, 3, 'codex.usage.reached', 'usage.reached',
+                 'warning', NULL, NULL, {recent}, {recent}, NULL);
+             INSERT INTO events VALUES (4, 3, 'codex.usage.reached', 'usage.reached',
+                 'warning', NULL, NULL, {recent}, NULL, 'resolved');
+             INSERT INTO events VALUES (5, 4, 'claude.compaction', 'session.compaction',
+                 'warning', NULL, NULL, 1000, NULL, NULL);"
+        ))
+        .expect("schema and rows");
+        drop(conn);
+
+        let audit = read_live_attention_audit(&db_path, now_ms);
+        let events = audit.events.as_ref().expect("events readable");
+        assert_eq!(
+            events.len(),
+            1,
+            "info, handled, resolved and stale events are left out: {events:?}"
+        );
+        let detection = crate::patterns::Detection {
+            rule_id: "codex.usage.reached".to_string(),
+            agent_type: crate::patterns::AgentType::Unknown,
+            event_type: "usage.reached".to_string(),
+            severity: crate::patterns::Severity::Info,
+            confidence: 0.0,
+            extracted: serde_json::json!({"reset": "5pm"}),
+            matched_text: String::new(),
+            span: (0, 0),
+        };
+        assert_eq!(
+            events[0].identity_key,
+            crate::events::event_identity_key(&detection, 3, Some("uuid-3"))
+        );
+        assert_eq!(events[0].severity, "critical");
+        assert_eq!(events[0].pane_id, 3);
+        // No audit table here: those inputs fail on their own, events still read.
+        assert!(audit.denied.is_none() && audit.receipts.is_none());
+
+        let mut input = AttentionRouterSourceAdapterInput::new(now_ms, "workspace");
+        apply_live_attention_audit(&mut input, &audit);
+        let rendered = serde_json::to_string(&input).expect("serialize");
+        assert!(
+            !rendered.contains("SECRET TEXT") && !rendered.contains("5pm"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -265,7 +406,11 @@ mod tests {
 
         let mut input = AttentionRouterSourceAdapterInput::new(1_000, "workspace");
         apply_live_attention_audit(&mut input, &audit);
-        assert_eq!(input.observations.len(), 3, "denied, approvals, receipts");
+        assert_eq!(
+            input.observations.len(),
+            4,
+            "denied, approvals, receipts, events"
+        );
         assert!(input.notification_mutes.is_empty());
     }
 }

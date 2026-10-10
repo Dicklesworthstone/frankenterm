@@ -3053,6 +3053,113 @@ pub fn verified_submit_observation_from_receipts(
     observation
 }
 
+/// Detection history a live `events` source covers.
+pub const UNHANDLED_EVENTS_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
+/// Newest unhandled detection events a live `events` source reads.
+pub const UNHANDLED_EVENTS_MAX_ROWS: usize = 256;
+
+/// The event fields a live `events` source uses. Matched text and extracted
+/// values never leave the database; `identity_key` is the redacted hash
+/// `ft mute` keys events by (`crate::events::event_identity_key`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnhandledEventRow {
+    pub pane_id: u64,
+    pub rule_id: String,
+    pub severity: String,
+    pub detected_at: i64,
+    pub identity_key: String,
+}
+
+/// Live `events` source from unhandled warning and critical detection
+/// events, read by the caller within [`UNHANDLED_EVENTS_WINDOW_MS`] and
+/// [`UNHANDLED_EVENTS_MAX_ROWS`] (events an operator triaged as resolved or
+/// dismissed are left out). One fact per event identity, the key `ft mute`
+/// uses, so a muted event drops out and a repeating one is one item with a
+/// count. `None` means the events could not be read.
+#[must_use]
+pub fn unhandled_events_observation(
+    events: Option<&[UnhandledEventRow]>,
+    now_ms: u64,
+) -> AttentionRouterSourceObservation {
+    const SOURCE_ID: &str = "events.unhandled";
+    const API: &str = "storage.events.read_unhandled";
+    let Some(events) = events else {
+        return AttentionRouterSourceObservation::new(
+            SOURCE_ID,
+            AttentionRouterSourceKind::Events,
+            AttentionRouterSourceHealth::Unavailable,
+            API,
+            "detection events could not be read",
+        )
+        .live(now_ms, 0)
+        .with_fact(
+            AttentionRouterSourceFact::new(
+                AttentionRouterSourceFactKind::SourceUnavailable,
+                "the local events table is unavailable",
+            )
+            .with_reason_code("events.unavailable"),
+        );
+    };
+    // identity -> (newest row, occurrences, any critical)
+    let mut identities: std::collections::BTreeMap<&str, (&UnhandledEventRow, u64, bool)> =
+        std::collections::BTreeMap::new();
+    for event in events {
+        let critical = event.severity == "critical";
+        let entry = identities
+            .entry(event.identity_key.as_str())
+            .or_insert((event, 0, false));
+        if event.detected_at > entry.0.detected_at {
+            entry.0 = event;
+        }
+        entry.1 += 1;
+        entry.2 |= critical;
+    }
+    let freshness_ms = events
+        .iter()
+        .map(|event| event.detected_at)
+        .max()
+        .map_or(0, |newest| {
+            now_ms.saturating_sub(u64::try_from(newest).unwrap_or(0))
+        });
+    let mut observation = AttentionRouterSourceObservation::new(
+        SOURCE_ID,
+        AttentionRouterSourceKind::Events,
+        AttentionRouterSourceHealth::Available,
+        API,
+        format!(
+            "{} unhandled warning or critical events ({} distinct) in the last 24 hours",
+            events.len(),
+            identities.len()
+        ),
+    )
+    .live(now_ms, freshness_ms)
+    .items_seen(u64::try_from(events.len()).unwrap_or(u64::MAX));
+    for (identity_key, (newest, occurrences, critical)) in identities {
+        let age_s = now_ms.saturating_sub(u64::try_from(newest.detected_at).unwrap_or(0)) / 1000;
+        let (fact_kind, severity) = if critical {
+            (AttentionRouterSourceFactKind::EventCritical, "critical")
+        } else {
+            (AttentionRouterSourceFactKind::EventUnhandled, "warning")
+        };
+        let mut fact = AttentionRouterSourceFact::new(
+            fact_kind,
+            format!(
+                "{occurrences} unhandled {severity} {} event(s) on pane {}, newest {age_s}s ago [mute: ft mute add {identity_key}]",
+                newest.rule_id, newest.pane_id
+            ),
+        )
+        .count(occurrences)
+        .with_affected_path(format!("pane:{}", newest.pane_id))
+        .with_reason_code("event.unhandled")
+        .with_notification_identity_key(identity_key);
+        if critical {
+            fact = fact.with_reason_code("event.critical");
+        }
+        observation = observation.with_fact(fact);
+    }
+    observation
+}
+
 fn missing_source_observation(
     source_kind: AttentionRouterSourceKind,
     generated_at_ms: u64,
@@ -3893,6 +4000,96 @@ mod tests {
         assert_eq!(quiet.health, AttentionRouterSourceHealth::Available);
         assert!(quiet.facts.is_empty());
         let unreadable = verified_submit_observation_from_receipts(None, now);
+        assert_eq!(unreadable.health, AttentionRouterSourceHealth::Unavailable);
+    }
+
+    #[test]
+    fn live_events_source_groups_unhandled_events_by_mute_identity() {
+        let now = 1_770_000_000_000_u64;
+        let row = |identity: &str, rule: &str, severity: &str, pane: u64, ago_ms: i64| {
+            UnhandledEventRow {
+                pane_id: pane,
+                rule_id: rule.to_string(),
+                severity: severity.to_string(),
+                detected_at: i64::try_from(now).unwrap() - ago_ms,
+                identity_key: identity.to_string(),
+            }
+        };
+        let events = [
+            row("evt:aa", "codex.usage.reached", "warning", 3, 90_000),
+            row("evt:aa", "codex.usage.reached", "critical", 3, 30_000),
+            row("evt:bb", "claude.compaction", "warning", 5, 5_000),
+        ];
+        let observation = unhandled_events_observation(Some(&events), now);
+        assert_eq!(observation.source_kind, AttentionRouterSourceKind::Events);
+        assert_eq!(observation.health, AttentionRouterSourceHealth::Available);
+        assert_eq!(observation.items_seen, Some(3));
+        assert_eq!(observation.freshness_ms, Some(5_000));
+        assert_eq!(observation.facts.len(), 2, "one fact per event identity");
+        let repeated = &observation.facts[0];
+        assert_eq!(repeated.fact, AttentionRouterSourceFactKind::EventCritical);
+        assert_eq!(repeated.count, Some(2));
+        assert_eq!(
+            repeated.notification_identity_key.as_deref(),
+            Some("evt:aa")
+        );
+        assert_eq!(repeated.affected_paths, ["pane:3"]);
+        assert!(
+            repeated
+                .reason_codes
+                .iter()
+                .any(|code| code == "event.critical")
+        );
+        assert!(
+            repeated
+                .summary
+                .contains("2 unhandled critical codex.usage.reached")
+                && repeated.summary.contains("newest 30s ago")
+                && repeated.summary.contains("ft mute add evt:aa"),
+            "{}",
+            repeated.summary
+        );
+        let single = &observation.facts[1];
+        assert_eq!(single.fact, AttentionRouterSourceFactKind::EventUnhandled);
+        assert_eq!(single.count, Some(1));
+
+        let event_items = |snapshot: &AttentionRouterSnapshot| {
+            snapshot
+                .items
+                .iter()
+                .filter(|item| {
+                    item.kind == AttentionRouterItemKind::Blocker
+                        && item
+                            .reason_codes
+                            .iter()
+                            .any(|code| code == "event.unhandled")
+                })
+                .count()
+        };
+        let snapshot = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation.clone()),
+        );
+        assert_eq!(
+            event_items(&snapshot),
+            2,
+            "each unhandled identity is a blocker"
+        );
+        let muted = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation)
+                .with_notification_mute(AttentionRouterNotificationMute::global("evt:aa")),
+        );
+        assert_eq!(
+            event_items(&muted),
+            1,
+            "ft mute add <identity> drops that event"
+        );
+
+        let quiet = unhandled_events_observation(Some(&[]), now);
+        assert_eq!(quiet.health, AttentionRouterSourceHealth::Available);
+        assert!(quiet.facts.is_empty());
+        let unreadable = unhandled_events_observation(None, now);
         assert_eq!(unreadable.health, AttentionRouterSourceHealth::Unavailable);
     }
 
