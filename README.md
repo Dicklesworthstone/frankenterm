@@ -983,8 +983,10 @@ ft mission plan                                # validate mission contract + com
 ft mission run                                 # advance lifecycle into execution
 ft mission status                              # lifecycle + assignment summary
 ft mission explain                             # legal lifecycle transitions
-ft mission pause / resume / abort              # canonical lifecycle transitions
-ft mission objective-plan --objective "<text>" # capacity-aware objective planner (ft-auy2g)
+ft mission pause                               # canonical lifecycle transitions
+ft mission resume
+ft mission abort
+ft mission objective-plan --objective "<text>" # read-only objective planner (ft-auy2g)
 ft tx plan                                     # validate tx contract + summarize lifecycle
 ft tx run                                      # prepare + commit, deterministically
 ft tx run --fail-step tx-step:commit

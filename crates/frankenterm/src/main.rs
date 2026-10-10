@@ -138339,57 +138339,139 @@ printf x > "$MINISIGN_MARKER"
         }
     }
 
+    /// Shell-split a documented example command (quotes respected, so `""`
+    /// stays an empty word) and fill what a reader would substitute:
+    /// `<placeholder>` text and `$VARIABLE` words become `0`.
+    fn example_command_words(command: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut word = String::new();
+        let mut in_word = false;
+        let mut quote: Option<char> = None;
+        for character in command.chars() {
+            match (quote, character) {
+                (Some(open), c) if c == open => quote = None,
+                (Some(_), c) => word.push(c),
+                (None, '"' | '\'') => {
+                    quote = Some(character);
+                    in_word = true;
+                }
+                (None, c) if c.is_whitespace() => {
+                    if in_word {
+                        words.push(std::mem::take(&mut word));
+                        in_word = false;
+                    }
+                }
+                (None, c) => {
+                    word.push(c);
+                    in_word = true;
+                }
+            }
+        }
+        if in_word {
+            words.push(word);
+        }
+        words
+            .into_iter()
+            .map(|word| {
+                if word.starts_with('$') {
+                    return "0".to_string();
+                }
+                let mut filled = String::new();
+                let mut rest = word.as_str();
+                while let Some(start) = rest.find('<') {
+                    let Some(end) = rest[start..].find('>') else {
+                        break;
+                    };
+                    filled.push_str(&rest[..start]);
+                    filled.push('0');
+                    rest = &rest[start + end + 1..];
+                }
+                filled.push_str(rest);
+                filled
+            })
+            .collect()
+    }
+
+    /// Runnable `ft ...` lines in README.md's shell fences: continuations
+    /// joined, a `$ ` prompt and trailing comments, pipes and redirections
+    /// cut, and synopsis lines (`[optional]`, `{a|b}`, `...`) skipped.
+    fn readme_example_commands(readme: &str) -> Vec<String> {
+        let mut commands = Vec::new();
+        let mut in_shell_fence = false;
+        let mut in_fence = false;
+        let mut continued = String::new();
+        for raw in readme.lines() {
+            let trimmed = raw.trim();
+            if let Some(language) = trimmed.strip_prefix("```") {
+                in_fence = !in_fence;
+                in_shell_fence = in_fence
+                    && matches!(
+                        language.trim().to_ascii_lowercase().as_str(),
+                        "bash" | "sh" | "shell" | "console"
+                    );
+                continued.clear();
+                continue;
+            }
+            if !in_shell_fence {
+                continue;
+            }
+            if let Some(head) = trimmed.strip_suffix('\\') {
+                continued.push_str(head);
+                continued.push(' ');
+                continue;
+            }
+            let joined = format!("{continued}{trimmed}");
+            continued.clear();
+            let joined = joined.trim();
+            let mut line = joined.strip_prefix("$ ").map_or(joined, str::trim);
+            if !line.starts_with("ft ") {
+                continue;
+            }
+            for cut in [" #", " | ", " && ", " || ", " > ", " 2>"] {
+                if let Some(index) = line.find(cut) {
+                    line = &line[..index];
+                }
+            }
+            let line = line.trim();
+            if ["[", "{", "..."]
+                .into_iter()
+                .any(|token| line.contains(token))
+            {
+                continue;
+            }
+            commands.push(line.to_string());
+        }
+        commands
+    }
+
+    /// README examples are copied by humans and agents alike; every runnable
+    /// one must parse with the current CLI.
+    #[test]
+    fn readme_ft_examples_parse_with_the_current_cli() {
+        let commands = readme_example_commands(include_str!("../../../README.md"));
+        assert!(
+            commands.len() > 100,
+            "README lost its examples ({})",
+            commands.len()
+        );
+        let failures: Vec<String> = commands
+            .iter()
+            .filter_map(|command| {
+                Cli::try_parse_from(example_command_words(command))
+                    .err()
+                    .map(|error| format!("{command}: {:?}", error.kind()))
+            })
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "README examples the CLI rejects: {failures:#?}"
+        );
+    }
+
     /// Agents copy quick-start commands verbatim, so every runnable one must
     /// still parse. `<placeholder>` text becomes `0` before parsing.
     #[test]
     fn robot_quick_start_commands_parse_with_the_current_cli() {
-        fn shell_split(command: &str) -> Vec<String> {
-            let mut words = Vec::new();
-            let mut word = String::new();
-            let mut in_word = false;
-            let mut quote: Option<char> = None;
-            for character in command.chars() {
-                match (quote, character) {
-                    (Some(open), c) if c == open => quote = None,
-                    (Some(_), c) => word.push(c),
-                    (None, '"' | '\'') => {
-                        quote = Some(character);
-                        in_word = true;
-                    }
-                    (None, c) if c.is_whitespace() => {
-                        if in_word {
-                            words.push(std::mem::take(&mut word));
-                            in_word = false;
-                        }
-                    }
-                    (None, c) => {
-                        word.push(c);
-                        in_word = true;
-                    }
-                }
-            }
-            if in_word {
-                words.push(word);
-            }
-            words
-                .into_iter()
-                .map(|word| {
-                    let mut filled = String::new();
-                    let mut rest = word.as_str();
-                    while let Some(start) = rest.find('<') {
-                        let Some(end) = rest[start..].find('>') else {
-                            break;
-                        };
-                        filled.push_str(&rest[..start]);
-                        filled.push('0');
-                        rest = &rest[start + end + 1..];
-                    }
-                    filled.push_str(rest);
-                    filled
-                })
-                .collect()
-        }
-
         let quick_start = build_robot_quick_start();
         let commands = quick_start
             .core_loop
@@ -138405,7 +138487,7 @@ printf x > "$MINISIGN_MARKER"
         let mut parsed = 0;
         let mut failures = Vec::new();
         for command in commands {
-            match Cli::try_parse_from(shell_split(command)) {
+            match Cli::try_parse_from(example_command_words(command)) {
                 Ok(_) => parsed += 1,
                 Err(error) => failures.push(format!("{command}: {:?}", error.kind())),
             }
