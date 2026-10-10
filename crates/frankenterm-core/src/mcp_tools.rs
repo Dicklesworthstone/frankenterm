@@ -9237,6 +9237,100 @@ async fn mcp_submit_idempotency_complete(
     .await
 }
 
+async fn mcp_submit_idempotency_reconcile(
+    ft_dir: &Path,
+    binding: &crate::verified_submit::SubmitIdempotencyBinding,
+    resolution: crate::submit_idempotency_store::SubmitReconciliation,
+) -> Result<
+    crate::submit_idempotency_store::ReconcileOutcome,
+    crate::submit_idempotency_store::SubmitIdempotencyError,
+> {
+    let ft_dir = ft_dir.to_path_buf();
+    let binding = binding.clone();
+    mcp_submit_idempotency_spawn_blocking(
+        crate::submit_idempotency_store::SubmitIdempotencyError::TransitionFailed,
+        move || crate::submit_idempotency_store::reconcile(&ft_dir, &binding, resolution),
+    )
+    .await
+}
+
+/// Audit one reconciliation attempt: pane, mode and outcome class, with the
+/// caller key as the correlation id (as verified sends record it). The request
+/// text never enters the row.
+async fn record_mcp_submit_reconcile_audit(
+    storage: &StorageHandle,
+    cx: &crate::cx::Cx,
+    pane_id: u64,
+    binding: &crate::verified_submit::SubmitIdempotencyBinding,
+    reconciliation: mcp_types::McpSubmitReconciliation,
+    outcome: &Result<
+        crate::submit_idempotency_store::ReconcileOutcome,
+        crate::submit_idempotency_store::SubmitIdempotencyError,
+    >,
+) {
+    use crate::submit_idempotency_store::ReconcileOutcome;
+
+    let mode = match reconciliation {
+        mcp_types::McpSubmitReconciliation::Settle => "settle",
+        mcp_types::McpSubmitReconciliation::Abandon => "abandon",
+    };
+    let (result, detail) = match outcome {
+        Ok(ReconcileOutcome::Settled(_)) => ("success", "settled".to_string()),
+        Ok(ReconcileOutcome::Abandoned) => ("success", "abandoned".to_string()),
+        Err(error) => ("failed", format!("refused:{}", error.error_class())),
+    };
+    let record = crate::storage::AuditActionRecord {
+        id: 0,
+        ts: i64::try_from(mcp_types::now_ms()).unwrap_or(i64::MAX),
+        actor_kind: "mcp".to_string(),
+        actor_id: None,
+        correlation_id: Some(binding.caller_key().to_string()),
+        pane_id: Some(pane_id),
+        domain: None,
+        action_kind: "submit_reconcile".to_string(),
+        policy_decision: "allow".to_string(),
+        decision_reason: Some(detail),
+        rule_id: Some(crate::submit_idempotency_store::RECONCILED_EVIDENCE_RULE_ID.to_string()),
+        input_summary: Some(format!("reconcile={mode}")),
+        verification_summary: None,
+        decision_context: None,
+        result: result.to_string(),
+    };
+    if let Err(error) = storage.record_audit_action_with_cx(cx, record).await {
+        tracing::warn!(%error, "wa.send could not audit a submit reconciliation");
+    }
+}
+
+fn mcp_reconciled_submit(pane_id: u64, receipt: &crate::robot_types::SubmitReceipt) -> McpSendData {
+    McpSendData {
+        pane_id,
+        injection: InjectionResult::Allowed {
+            decision: PolicyDecision::allow_with_rule(
+                crate::submit_idempotency_store::RECONCILED_EVIDENCE_RULE_ID,
+            ),
+            summary: "unresolved submit settled by reconciliation; nothing was sent".to_string(),
+            pane_id,
+            action: ActionKind::SendText,
+            audit_action_id: None,
+        },
+        wait_for: None,
+        verification_error: crate::verified_submit::submit_guarantee_failure_message(receipt),
+        submit: Some(receipt.clone()),
+        output_omissions: None,
+        dry_run: false,
+    }
+}
+
+fn mcp_abandoned_submit(pane_id: u64) -> McpSendData {
+    mcp_blocked_submit_replay(
+        pane_id,
+        "The unresolved send for this idempotency key was abandoned; send the same request again to retry it",
+        "submit_idempotency.abandoned",
+        "unresolved submit abandoned by reconciliation",
+        "Prior send abandoned; nothing was sent",
+    )
+}
+
 fn mcp_completed_submit_replay(
     pane_id: u64,
     receipt: &crate::robot_types::SubmitReceipt,
@@ -9276,7 +9370,7 @@ fn mcp_effect_pending_submit_replay(pane_id: u64) -> McpSendData {
         "A prior send applied its pane effect but receipt finalization is pending; automatic replay is disabled",
         "submit_idempotency.effect_applied_receipt_pending_noop",
         "effect-applied duplicate submit replay suppressed",
-        "Prior send effect was applied but its receipt is pending; automatic resend refused",
+        "Prior send effect was applied but its receipt is pending; automatic resend refused (settle it with reconcile)",
     )
 }
 
@@ -9286,7 +9380,7 @@ fn mcp_indeterminate_submit_replay(pane_id: u64) -> McpSendData {
         "A prior send with this idempotency key has an indeterminate outcome; automatic replay is disabled",
         "submit_idempotency.in_doubt_noop",
         "indeterminate duplicate submit replay suppressed",
-        "Prior send outcome is indeterminate; automatic resend refused",
+        "Prior send outcome is indeterminate; automatic resend refused (settle or abandon it with reconcile)",
     )
 }
 
@@ -9520,7 +9614,8 @@ impl ToolHandler for WaSendTool {
                     "idempotency_key": { "type": "string", "minLength": 1, "maxLength": MAX_MCP_SUBMIT_IDEMPOTENCY_KEY_BYTES, "description": "Caller replay key; a completed identical non-dry-run send returns its stored receipt without re-sending, while an interrupted/indeterminate prior send refuses automatic replay" },
                     "wait_for": { "type": "string", "maxLength": MAX_MCP_WAIT_PATTERN_BYTES, "description": "Wait for a pattern after sending" },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "default": 30, "description": "Wait-for timeout (seconds)" },
-                    "wait_for_regex": { "type": "boolean", "default": false, "description": "Treat wait_for as regex" }
+                    "wait_for_regex": { "type": "boolean", "default": false, "description": "Treat wait_for as regex" },
+                    "reconcile": { "type": "string", "enum": ["settle", "abandon"], "description": "Resolve the unresolved prior send for this exact request and idempotency_key instead of sending: settle closes it with an unverified receipt that later replays return; abandon frees the key for a resend and is refused once the prior send's effect was applied" }
                 },
                 "required": ["pane_id", "text"],
                 "additionalProperties": false
@@ -9564,6 +9659,19 @@ impl ToolHandler for WaSendTool {
             {
                 return error;
             }
+        }
+        if params.reconcile.is_some() && (params.idempotency_key.is_none() || params.dry_run) {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                "reconcile needs the original request's idempotency_key and no dry_run",
+                Some(
+                    "Repeat the exact request that was refused as in doubt, with the same \
+                     idempotency_key, and add reconcile."
+                        .to_string(),
+                ),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
         }
 
         // [ft-05hfm] Bound the text payload before any downstream
@@ -9732,6 +9840,35 @@ impl ToolHandler for WaSendTool {
                         dry_run: false,
                     });
                 }
+            }
+
+            // Operator reconciliation (ft-7h5da.3.5.1), gated by the same
+            // authorization: settle or abandon the unresolved claim for this
+            // exact request. Nothing is sent, and the outcome is audited
+            // without the request text.
+            if let (Some(reconciliation), Some(binding)) =
+                (params.reconcile, submit_idempotency_binding.as_ref())
+            {
+                let outcome =
+                    mcp_submit_idempotency_reconcile(ft_dir, binding, reconciliation.into()).await;
+                record_mcp_submit_reconcile_audit(
+                    &storage,
+                    &wezterm_cx,
+                    params.pane_id,
+                    binding,
+                    reconciliation,
+                    &outcome,
+                )
+                .await;
+                return match outcome {
+                    Ok(crate::submit_idempotency_store::ReconcileOutcome::Settled(receipt)) => {
+                        Ok(mcp_reconciled_submit(params.pane_id, &receipt))
+                    }
+                    Ok(crate::submit_idempotency_store::ReconcileOutcome::Abandoned) => {
+                        Ok(mcp_abandoned_submit(params.pane_id))
+                    }
+                    Err(error) => Err(mcp_submit_idempotency_storage_error(error)),
+                };
             }
 
             // Complete every read-only preparation step before claiming. The
@@ -21615,6 +21752,152 @@ mod tests {
                     .expect("lookup in-doubt claim"),
                 Some(crate::submit_idempotency_store::StoredSubmitState::InDoubt)
             );
+        });
+    }
+
+    #[test]
+    fn wa_send_reconcile_settles_or_abandons_an_unresolved_claim_without_sending() {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let (_dir, db) = temp_db_path();
+            let pane_id = 4_209;
+            let text = "echo reconcile";
+            let ft_dir = db.parent().expect("test database parent");
+            let seed_in_doubt = |caller_key: &str| {
+                let binding = test_submit_idempotency_binding(pane_id, text, caller_key);
+                let token = match crate::submit_idempotency_store::claim(ft_dir, &binding)
+                    .expect("seed active claim")
+                {
+                    crate::submit_idempotency_store::ClaimOutcome::Claimed(token) => token,
+                    other => panic!("expected fresh claim, got {other:?}"),
+                };
+                crate::submit_idempotency_store::mark_in_doubt(ft_dir, &binding, token)
+                    .expect("seed in-doubt state");
+                binding
+            };
+            seed_in_doubt("reconcile-settle");
+            let abandoned = seed_in_doubt("reconcile-abandon");
+
+            let mut cfg = Config::default();
+            cfg.safety.require_prompt_active = false;
+            cfg.safety.rate_limit_per_pane = 100;
+            cfg.safety.rate_limit_global = 100;
+            let cfg = Arc::new(cfg);
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.add_default_pane(pane_id).await;
+            let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let tool = WaSendTool::with_wezterm_handle(
+                Arc::clone(&cfg),
+                Arc::clone(&db),
+                Arc::clone(&mock) as crate::wezterm::WeztermHandle,
+            );
+            let call = |arguments: serde_json::Value| {
+                parse_json_content(
+                    tool.call(&test_mcp_context(), arguments)
+                        .expect("wa.send returns an envelope"),
+                )
+            };
+
+            let keyless = call(serde_json::json!({
+                "pane_id": pane_id, "text": text, "reconcile": "settle"
+            }));
+            assert_eq!(keyless["ok"], false);
+            assert_eq!(keyless["error_code"], MCP_ERR_INVALID_ARGS);
+
+            let settled = call(serde_json::json!({
+                "pane_id": pane_id,
+                "text": text,
+                "idempotency_key": "reconcile-settle",
+                "reconcile": "settle"
+            }));
+            assert_eq!(settled["ok"], true, "envelope: {settled:?}");
+            assert_eq!(settled["data"]["injection"]["status"], "allowed");
+            assert_eq!(
+                settled["data"]["injection"]["decision"]["rule_id"],
+                crate::submit_idempotency_store::RECONCILED_EVIDENCE_RULE_ID
+            );
+            assert_eq!(
+                settled["data"]["submit"]["state"],
+                "verification_unavailable"
+            );
+            assert_eq!(settled["data"]["submit"]["guarantee_met"], false);
+            let replay = call(serde_json::json!({
+                "pane_id": pane_id, "text": text, "idempotency_key": "reconcile-settle"
+            }));
+            assert_eq!(
+                replay["data"]["injection"]["decision"]["rule_id"],
+                "submit_idempotency.duplicate_noop",
+                "later replays return the settled receipt"
+            );
+            assert_eq!(replay["data"]["submit"], settled["data"]["submit"]);
+
+            let freed = call(serde_json::json!({
+                "pane_id": pane_id,
+                "text": text,
+                "idempotency_key": "reconcile-abandon",
+                "reconcile": "abandon"
+            }));
+            assert_eq!(freed["ok"], true, "envelope: {freed:?}");
+            assert_eq!(freed["data"]["injection"]["status"], "denied");
+            assert_eq!(
+                freed["data"]["injection"]["decision"]["rule_id"],
+                "submit_idempotency.abandoned"
+            );
+            assert_eq!(
+                crate::submit_idempotency_store::lookup(ft_dir, &abandoned)
+                    .expect("lookup abandoned claim"),
+                None,
+                "the key is free for a resend"
+            );
+
+            let content = mock
+                .pane_state(pane_id)
+                .await
+                .expect("mock pane should exist")
+                .content;
+            assert!(!content.contains(text), "reconciliation never sends");
+
+            let storage = StorageHandle::new(&db.to_string_lossy())
+                .await
+                .expect("open audit storage");
+            let audit = storage
+                .get_audit_actions(crate::storage::AuditQuery {
+                    action_kind: Some("submit_reconcile".to_string()),
+                    ..crate::storage::AuditQuery::default()
+                })
+                .await
+                .expect("read audit");
+            let mut rows: Vec<(String, Option<String>, Option<String>)> = audit
+                .iter()
+                .map(|row| {
+                    (
+                        row.result.clone(),
+                        row.decision_reason.clone(),
+                        row.input_summary.clone(),
+                    )
+                })
+                .collect();
+            rows.sort();
+            assert_eq!(
+                rows,
+                [
+                    (
+                        "success".to_string(),
+                        Some("abandoned".to_string()),
+                        Some("reconcile=abandon".to_string())
+                    ),
+                    (
+                        "success".to_string(),
+                        Some("settled".to_string()),
+                        Some("reconcile=settle".to_string())
+                    ),
+                ]
+            );
+            assert!(audit.iter().all(|row| {
+                row.input_summary
+                    .as_deref()
+                    .is_some_and(|summary| !summary.contains(text))
+            }));
         });
     }
 

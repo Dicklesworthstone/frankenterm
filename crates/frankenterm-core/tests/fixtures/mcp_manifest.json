@@ -1553,6 +1553,11 @@
             "minimum": 0,
             "type": "integer"
           },
+          "reconcile": {
+            "description": "Resolve the unresolved prior send for this exact request and idempotency_key instead of sending: settle closes it with an unverified receipt that later replays return; abandon frees the key for a resend and is refused once the prior send's effect was applied",
+            "enum": ["settle", "abandon"],
+            "type": "string"
+          },
           "submit_level": {
             "description": "Optional SubmitReceipt guarantee level; setting this enables verified-submit receipts",
             "enum": ["write", "composer", "submitted", "working"],

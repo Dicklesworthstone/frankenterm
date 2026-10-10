@@ -379,6 +379,26 @@ pub(super) struct SendParams {
     pub timeout_secs: u64,
     #[serde(default)]
     pub wait_for_regex: bool,
+    /// Resolve an unresolved claim for this exact request instead of sending.
+    #[serde(default)]
+    pub reconcile: Option<McpSubmitReconciliation>,
+}
+
+/// `wa.send` reconcile mode (ft-7h5da.3.5.1).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum McpSubmitReconciliation {
+    Settle,
+    Abandon,
+}
+
+impl From<McpSubmitReconciliation> for crate::submit_idempotency_store::SubmitReconciliation {
+    fn from(value: McpSubmitReconciliation) -> Self {
+        match value {
+            McpSubmitReconciliation::Settle => Self::Settle,
+            McpSubmitReconciliation::Abandon => Self::Abandon,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

@@ -6,7 +6,8 @@
 //! `effect_applied_receipt_pending` and `in_doubt`, so replay never treats a
 //! successful injector call as an unperformed write merely because later wait,
 //! audit, or receipt work was interrupted. This is an at-most-once automatic
-//! effect contract; reconciliation remains an explicit future operation.
+//! effect contract; an unresolved claim changes only through the explicit
+//! [`reconcile`] operation, which settles it or abandons it.
 
 use crate::robot_types::{SubmitGuaranteeLevel, SubmitReceipt, SubmitReceiptState};
 use crate::verified_submit::SubmitIdempotencyBinding;
@@ -2563,6 +2564,167 @@ where
     Ok(state)
 }
 
+/// Evidence rule on the receipt [`reconcile`] writes when it settles a claim.
+pub const RECONCILED_EVIDENCE_RULE_ID: &str = "submit_idempotency.operator_reconciled";
+
+/// How an operator resolves a claim automatic replay cannot settle: an
+/// in-doubt outcome, a receipt still pending after an applied effect, or an
+/// owner whose lease expired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitReconciliation {
+    /// Close the claim with a completed, unverified receipt. Replays return
+    /// it and never resend; it then ages out like any completed receipt.
+    Settle,
+    /// Free the caller key so the same request can be sent again. Refused
+    /// when the injector already reported the write as applied, because a
+    /// resend would duplicate it.
+    Abandon,
+}
+
+/// What [`reconcile`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    /// The claim now holds this completed receipt.
+    Settled(SubmitReceipt),
+    /// The claim was removed; the caller key is unused again.
+    Abandoned,
+}
+
+/// Settle or abandon an unresolved claim (ft-7h5da.3.5.1). The binding must
+/// match the original request exactly. A live owner, a completed or
+/// retryable claim, and abandoning an applied effect are refused with
+/// [`SubmitIdempotencyError::InvalidTransition`]. Callers own the policy
+/// check and the audit record.
+///
+/// # Errors
+/// Returns a finite [`SubmitIdempotencyError`] when the claim is absent,
+/// conflicts with the binding, is not unresolved, or cannot be committed.
+pub fn reconcile(
+    ft_dir: &Path,
+    binding: &SubmitIdempotencyBinding,
+    resolution: SubmitReconciliation,
+) -> Result<ReconcileOutcome, SubmitIdempotencyError> {
+    reconcile_with_clock(ft_dir, binding, resolution, now_unix_ms)
+}
+
+fn reconciled_receipt(binding: &SubmitIdempotencyBinding) -> SubmitReceipt {
+    let evidence_rule_ids = vec![RECONCILED_EVIDENCE_RULE_ID.to_string()];
+    let guarantee_level = binding.guarantee_level();
+    SubmitReceipt {
+        state: SubmitReceiptState::VerificationUnavailable,
+        guarantee_level,
+        guarantee_met: guarantee_level.is_met_by(
+            SubmitReceiptState::VerificationUnavailable,
+            &evidence_rule_ids,
+        ),
+        agent_type: None,
+        profile_id: None,
+        profile_version: None,
+        attempts: 1,
+        evidence_rule_ids,
+        elapsed_ms: 0,
+        polls: 0,
+        cursor_before: None,
+        cursor_after: None,
+        idempotency_key: binding.caller_key().to_string(),
+    }
+}
+
+fn reconcile_with_clock<F>(
+    ft_dir: &Path,
+    binding: &SubmitIdempotencyBinding,
+    resolution: SubmitReconciliation,
+    mut clock: F,
+) -> Result<ReconcileOutcome, SubmitIdempotencyError>
+where
+    F: FnMut() -> i64,
+{
+    validate_binding(binding)?;
+    let mut conn =
+        open_store(ft_dir, StoreOpenMode::Existing)?.ok_or(SubmitIdempotencyError::MissingClaim)?;
+    let tx = map_sqlite(
+        conn.transaction_with_behavior(TransactionBehavior::Immediate),
+        SubmitIdempotencyError::TransitionFailed,
+    )?;
+    initialize_or_validate_schema_locked(&tx, false)?;
+    let now = clock();
+    if now < 0 {
+        return Err(SubmitIdempotencyError::TransitionFailed);
+    }
+    let Some(header) = read_header(&tx, binding, SubmitIdempotencyError::TransitionFailed)? else {
+        return Err(SubmitIdempotencyError::MissingClaim);
+    };
+    let effect_applied = match header.state {
+        STATE_EFFECT_APPLIED_RECEIPT_PENDING => true,
+        STATE_IN_DOUBT => false,
+        STATE_ACTIVE_OWNER => {
+            let lease_expires = header
+                .lease_expires_unix_ms
+                .ok_or(SubmitIdempotencyError::RecordCorrupt)?;
+            let maximum_credible_expiry = now
+                .checked_add(MAX_OWNER_LEASE_FUTURE_MS)
+                .unwrap_or(i64::MAX);
+            if lease_expires > now && lease_expires <= maximum_credible_expiry {
+                // A live owner may still finish; reconciling would race it.
+                return Err(SubmitIdempotencyError::InvalidTransition);
+            }
+            false
+        }
+        _ => return Err(SubmitIdempotencyError::InvalidTransition),
+    };
+    let (changed, outcome) = match resolution {
+        SubmitReconciliation::Abandon => {
+            if effect_applied {
+                return Err(SubmitIdempotencyError::InvalidTransition);
+            }
+            let changed = map_sqlite(
+                tx.execute(
+                    "DELETE FROM verified_submit_idempotency \
+                     WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY AND state = ?2 \
+                       AND generation = ?3 AND owner_nonce = ?4",
+                    params![
+                        binding.key(),
+                        header.state,
+                        header.generation,
+                        &header.owner_nonce[..],
+                    ],
+                ),
+                SubmitIdempotencyError::TransitionFailed,
+            )?;
+            (changed, ReconcileOutcome::Abandoned)
+        }
+        SubmitReconciliation::Settle => {
+            let receipt = reconciled_receipt(binding);
+            let receipt_json = serialize_receipt(binding, &receipt)?;
+            let changed = map_sqlite(
+                tx.execute(
+                    "UPDATE verified_submit_idempotency \
+                     SET state = ?2, retryable_reason = NULL, receipt_json = ?3, \
+                         lease_expires_unix_ms = NULL, updated_unix_ms = ?4 \
+                     WHERE idempotency_key COLLATE BINARY = ?1 COLLATE BINARY AND state = ?5 \
+                       AND generation = ?6 AND owner_nonce = ?7",
+                    params![
+                        binding.key(),
+                        STATE_COMPLETED,
+                        receipt_json,
+                        now.max(header.updated_unix_ms),
+                        header.state,
+                        header.generation,
+                        &header.owner_nonce[..],
+                    ],
+                ),
+                SubmitIdempotencyError::TransitionFailed,
+            )?;
+            (changed, ReconcileOutcome::Settled(receipt))
+        }
+    };
+    if changed != 1 {
+        return Err(SubmitIdempotencyError::TransitionFailed);
+    }
+    map_sqlite(tx.commit(), SubmitIdempotencyError::TransitionFailed)?;
+    Ok(outcome)
+}
+
 /// Logical bytes of the largest new reserved record: the schema caps keys at
 /// 90 bytes and pane ids at 20 digits.
 const MAX_NEW_RECORD_LOGICAL_BYTES: i64 = LOGICAL_RECORD_OVERHEAD_BYTES
@@ -3043,6 +3205,129 @@ mod tests {
         let ambiguous_token = claim_token(dir.path(), &ambiguous);
         mark_in_doubt(dir.path(), &ambiguous, ambiguous_token).expect("mark in doubt");
         assert_eq!(claim(dir.path(), &ambiguous), Ok(ClaimOutcome::InDoubt));
+    }
+
+    #[test]
+    fn reconcile_settles_or_abandons_only_unresolved_claims() {
+        use SubmitReconciliation::{Abandon, Settle};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // In doubt, settled: replays return the unverified receipt.
+        let in_doubt = binding(7, "reconcile-in-doubt");
+        let in_doubt_token = claim_token(dir.path(), &in_doubt);
+        mark_in_doubt(dir.path(), &in_doubt, in_doubt_token).expect("mark in doubt");
+        let Ok(ReconcileOutcome::Settled(settled)) = reconcile(dir.path(), &in_doubt, Settle)
+        else {
+            panic!("an in-doubt claim settles");
+        };
+        assert_eq!(settled.state, SubmitReceiptState::VerificationUnavailable);
+        assert!(
+            !settled.guarantee_met,
+            "an operator settlement verifies nothing"
+        );
+        assert_eq!(settled.evidence_rule_ids, [RECONCILED_EVIDENCE_RULE_ID]);
+        assert_eq!(settled.idempotency_key, "reconcile-in-doubt");
+        assert_eq!(
+            claim(dir.path(), &in_doubt),
+            Ok(ClaimOutcome::Completed(settled.clone()))
+        );
+        assert_eq!(
+            reconcile(dir.path(), &in_doubt, Settle),
+            Err(SubmitIdempotencyError::InvalidTransition),
+            "a settled claim is no longer unresolved"
+        );
+        assert_eq!(
+            complete(
+                dir.path(),
+                &in_doubt,
+                in_doubt_token,
+                &receipt(&in_doubt, SubmitReceiptState::Submitted)
+            ),
+            Err(SubmitIdempotencyError::InvalidTransition),
+            "the stale owner cannot overwrite the settlement"
+        );
+
+        // Applied effect: abandoning would allow a duplicate send.
+        let pending = binding(7, "reconcile-pending");
+        let pending_token = claim_token(dir.path(), &pending);
+        mark_effect_applied_receipt_pending(dir.path(), &pending, pending_token)
+            .expect("mark pending");
+        assert_eq!(
+            reconcile(dir.path(), &pending, Abandon),
+            Err(SubmitIdempotencyError::InvalidTransition)
+        );
+        assert!(matches!(
+            reconcile(dir.path(), &pending, Settle),
+            Ok(ReconcileOutcome::Settled(_))
+        ));
+
+        // In doubt, abandoned: the key is claimable again.
+        let abandoned = binding(7, "reconcile-abandon");
+        let abandoned_token = claim_token(dir.path(), &abandoned);
+        mark_in_doubt(dir.path(), &abandoned, abandoned_token).expect("mark in doubt");
+        assert_eq!(
+            reconcile(dir.path(), &abandoned, Abandon),
+            Ok(ReconcileOutcome::Abandoned)
+        );
+        assert!(matches!(
+            claim(dir.path(), &abandoned),
+            Ok(ClaimOutcome::Claimed(_))
+        ));
+
+        // A live owner is refused; one whose lease expired is unresolved.
+        let live = binding(7, "reconcile-live");
+        let _live_token = claim_token(dir.path(), &live);
+        assert_eq!(
+            reconcile(dir.path(), &live, Settle),
+            Err(SubmitIdempotencyError::InvalidTransition)
+        );
+        let stale = binding(7, "reconcile-stale");
+        assert!(matches!(
+            claim_with_nonce_limits_and_time(
+                dir.path(),
+                &stale,
+                [2; OWNER_NONCE_BYTES],
+                PRODUCTION_LIMITS,
+                1_000,
+            ),
+            Ok(ClaimOutcome::Claimed(_))
+        ));
+        assert_eq!(
+            reconcile_with_clock(dir.path(), &stale, Abandon, || 10_000_000),
+            Ok(ReconcileOutcome::Abandoned)
+        );
+
+        // Completed, absent and conflicting requests are refused.
+        let completed = binding(7, "reconcile-completed");
+        let completed_token = claim_token(dir.path(), &completed);
+        complete_owned(
+            dir.path(),
+            &completed,
+            completed_token,
+            &receipt(&completed, SubmitReceiptState::Submitted),
+        );
+        assert_eq!(
+            reconcile(dir.path(), &completed, Settle),
+            Err(SubmitIdempotencyError::InvalidTransition)
+        );
+        assert_eq!(
+            reconcile(dir.path(), &binding(7, "reconcile-absent"), Settle),
+            Err(SubmitIdempotencyError::MissingClaim)
+        );
+        let conflicting = idempotency_binding(SubmitIdempotencyRequest {
+            pane_id: 7,
+            text: "a different request",
+            caller_key: "reconcile-in-doubt",
+            guarantee_level: SubmitGuaranteeLevel::Submitted,
+            wait_for: None,
+            wait_for_regex: false,
+            timeout_secs: 30,
+        });
+        assert_eq!(
+            reconcile(dir.path(), &conflicting, Settle),
+            Err(SubmitIdempotencyError::RequestConflict)
+        );
     }
 
     #[test]
