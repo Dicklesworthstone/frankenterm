@@ -955,6 +955,7 @@ ft search "<query>" --limit 50
 ```bash
 ft why --list                # list explanation templates
 ft why deny.alt_screen       # explain a common policy denial
+ft why FT-1001               # explain the error code an error message names
 ```
 
 ### Workflows

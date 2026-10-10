@@ -347,6 +347,27 @@ pub static FT_1024: ErrorCodeDef = ErrorCodeDef {
     doc_link: None,
 };
 
+/// FT-1025: ft and the running mux are from different releases
+pub static FT_1025: ErrorCodeDef = ErrorCodeDef {
+    code: "FT-1025",
+    category: ErrorCategory::Wezterm,
+    title: "ft and the running mux are from different releases",
+    description: "The mux at the discovered socket speaks a codec generation this ft cannot use: \
+                  the two compatibility windows do not overlap. Retrying cannot fix it.",
+    causes: &[
+        "The ft CLI was upgraded without FrankenTerm.app, or the reverse",
+        "ft discovered the socket of an older or newer mux than intended",
+    ],
+    recovery_steps: &[
+        RecoveryStep::with_command("Show which socket ft found", "ft doctor --json"),
+        RecoveryStep::with_command("Show ft's generation", "ft --version"),
+        RecoveryStep::text(
+            "Install the same release of ft and FrankenTerm.app, or point ft at a matching mux",
+        ),
+    ],
+    doc_link: None,
+};
+
 /// FT-1030: WezTerm circuit breaker is open
 pub static FT_1030: ErrorCodeDef = ErrorCodeDef {
     code: "FT-1030",
@@ -565,7 +586,6 @@ pub static FT_2010: ErrorCodeDef = ErrorCodeDef {
     ],
     recovery_steps: &[
         RecoveryStep::with_command("Check watcher status", "ft status"),
-        RecoveryStep::with_command("View gap events", "ft events --type gap"),
         RecoveryStep::text(
             "Gaps are tracked and will not affect search accuracy for captured content",
         ),
@@ -794,7 +814,7 @@ pub static FT_3002: ErrorCodeDef = ErrorCodeDef {
         "Custom pack path is incorrect",
     ],
     recovery_steps: &[
-        RecoveryStep::with_command("List available packs", "ft rules packs"),
+        RecoveryStep::with_command("List available packs", "ft ext list"),
         RecoveryStep::text("Check the pack name in ft.toml [patterns] section"),
         RecoveryStep::text("Use built-in packs: core.codex, core.claude, core.gemini"),
     ],
@@ -865,7 +885,7 @@ pub static FT_4001: ErrorCodeDef = ErrorCodeDef {
     recovery_steps: &[
         RecoveryStep::text("Wait for the application to exit"),
         RecoveryStep::text("Close the application manually (e.g., :q in vim)"),
-        RecoveryStep::with_command("Check pane status", "ft status --pane <id>"),
+        RecoveryStep::with_command("Check pane status", "ft status --pane-id <id>"),
     ],
     doc_link: None,
 };
@@ -885,10 +905,10 @@ pub static FT_4002: ErrorCodeDef = ErrorCodeDef {
     ],
     recovery_steps: &[
         RecoveryStep::text("Wait for the current command to finish"),
-        RecoveryStep::with_command("Send Ctrl-C to cancel", "ft send <id> --ctrl-c"),
+        RecoveryStep::text("Send Ctrl-C to the pane yourself to cancel the running command"),
         RecoveryStep::with_command(
             "Use --wait-for to wait for prompt",
-            "ft send <id> --wait-for 'prompt'",
+            "ft send <id> <text> --wait-for 'prompt'",
         ),
     ],
     doc_link: None,
@@ -929,7 +949,7 @@ pub static FT_4010: ErrorCodeDef = ErrorCodeDef {
     recovery_steps: &[
         RecoveryStep::text("Review the action carefully"),
         RecoveryStep::with_command("Approve with code", "ft robot approve <CODE>"),
-        RecoveryStep::with_command("See what was blocked", "ft why <CODE>"),
+        RecoveryStep::with_command("See what was held", "ft why --recent require_approval"),
     ],
     doc_link: None,
 };
@@ -948,7 +968,7 @@ pub static FT_4020: ErrorCodeDef = ErrorCodeDef {
     ],
     recovery_steps: &[
         RecoveryStep::with_command("Check policy details", "ft why deny.<reason>"),
-        RecoveryStep::with_command("Check pane status", "ft status --pane <id>"),
+        RecoveryStep::with_command("Check pane status", "ft status --pane-id <id>"),
         RecoveryStep::text("Review ft.toml [safety] section for policy rules"),
     ],
     doc_link: None,
@@ -1009,7 +1029,7 @@ pub static FT_5010: ErrorCodeDef = ErrorCodeDef {
         "Prerequisites not met",
     ],
     recovery_steps: &[
-        RecoveryStep::with_command("Check pane status", "ft status --pane <id>"),
+        RecoveryStep::with_command("Check pane status", "ft status --pane-id <id>"),
         RecoveryStep::text("Ensure the triggering condition is still present"),
         RecoveryStep::text("Manually put the pane in the required state"),
     ],
@@ -1029,9 +1049,12 @@ pub static FT_5020: ErrorCodeDef = ErrorCodeDef {
         "Stale lock from crashed workflow",
     ],
     recovery_steps: &[
-        RecoveryStep::with_command("Check running workflows", "ft workflow status"),
+        RecoveryStep::with_command(
+            "Check running workflows",
+            "ft robot workflow status --active",
+        ),
         RecoveryStep::text("Wait for the current workflow to complete"),
-        RecoveryStep::with_command("Abort stuck workflow", "ft workflow abort <id>"),
+        RecoveryStep::with_command("Abort stuck workflow", "ft robot workflow abort <id>"),
     ],
     doc_link: None,
 };
@@ -1049,9 +1072,12 @@ pub static FT_5030: ErrorCodeDef = ErrorCodeDef {
         "Stale lock from a crashed workflow",
     ],
     recovery_steps: &[
-        RecoveryStep::with_command("Check running workflows", "ft workflow status"),
+        RecoveryStep::with_command(
+            "Check running workflows",
+            "ft robot workflow status --active",
+        ),
         RecoveryStep::text("Wait for the current workflow to complete"),
-        RecoveryStep::with_command("Abort stuck workflow", "ft workflow abort <id>"),
+        RecoveryStep::with_command("Abort stuck workflow", "ft robot workflow abort <id>"),
     ],
     doc_link: None,
 };
@@ -1071,7 +1097,7 @@ pub static FT_6001: ErrorCodeDef = ErrorCodeDef {
     ],
     recovery_steps: &[
         RecoveryStep::with_command("Start the watcher", "ft watch"),
-        RecoveryStep::with_command("Check watcher status", "ft daemon status"),
+        RecoveryStep::with_command("Check watcher status", "ft status"),
         RecoveryStep::text("Ensure you have permission to access the socket"),
     ],
     doc_link: None,
@@ -1092,7 +1118,10 @@ pub static FT_7001: ErrorCodeDef = ErrorCodeDef {
     ],
     recovery_steps: &[
         RecoveryStep::with_command("Initialize config", "ft config init"),
-        RecoveryStep::with_command("Show config path", "ft config show --path"),
+        RecoveryStep::with_command(
+            "Show the resolved config paths",
+            "ft config show --effective",
+        ),
         RecoveryStep::text("ft will use defaults if no config file exists"),
     ],
     doc_link: None,
@@ -1289,6 +1318,7 @@ pub static ERROR_CATALOG: LazyLock<HashMap<&'static str, &'static ErrorCodeDef>>
         m.insert("FT-1022", &FT_1022);
         m.insert("FT-1023", &FT_1023);
         m.insert("FT-1024", &FT_1024);
+        m.insert("FT-1025", &FT_1025);
         m.insert("FT-1030", &FT_1030);
         // Storage errors
         m.insert("FT-2001", &FT_2001);

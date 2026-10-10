@@ -14634,6 +14634,60 @@ struct RobotWhyData {
     see_also: Option<Vec<String>>,
 }
 
+/// `ft why` / `ft robot why` data for a code that is not an explanation
+/// template: an `FT-xxxx` code from the error catalog, which every rendered
+/// error's footer names, or a `robot.*` error code with its recovery hint.
+fn why_data_for_error_code(code: &str) -> Option<RobotWhyData> {
+    fn category_name(category: frankenterm_core::error_codes::ErrorCategory) -> String {
+        serde_json::to_value(category)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "internal".to_string())
+    }
+
+    if let Some(def) = frankenterm_core::error_codes::get_error_code(&code.to_ascii_uppercase()) {
+        let mut explanation = def.description.to_string();
+        if !def.causes.is_empty() {
+            explanation.push_str("\n\nCommon causes:");
+            for cause in def.causes {
+                explanation.push_str("\n- ");
+                explanation.push_str(cause);
+            }
+        }
+        let suggestions: Vec<String> = def
+            .recovery_steps
+            .iter()
+            .map(|step| match &step.command {
+                Some(command) => format!("{}: {command}", step.description),
+                None => step.description.to_string(),
+            })
+            .collect();
+        return Some(RobotWhyData {
+            code: def.code.to_string(),
+            category: category_name(def.category),
+            title: def.title.to_string(),
+            explanation,
+            suggestions: (!suggestions.is_empty()).then_some(suggestions),
+            see_also: def.doc_link.map(|link| vec![link.to_string()]),
+        });
+    }
+    let robot_code = frankenterm_core::robot_types::ErrorCode::parse(code)?;
+    let hint = frankenterm_core::robot_types::hint_for(&robot_code)?;
+    Some(RobotWhyData {
+        code: robot_code.as_str().to_string(),
+        category: category_name(robot_code.category()),
+        title: if robot_code.is_retryable() {
+            "Retryable robot error"
+        } else {
+            "Robot error"
+        }
+        .to_string(),
+        explanation: hint.to_string(),
+        suggestions: None,
+        see_also: None,
+    })
+}
+
 /// Robot approve command response data (matches wa-robot-approve.json schema)
 #[derive(Debug, serde::Serialize)]
 struct RobotApproveData {
@@ -57340,14 +57394,17 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 };
                                 let response = RobotResponse::success(data, elapsed_ms(start));
                                 print_robot_response(&response, format, stats)?;
+                            } else if let Some(data) = why_data_for_error_code(&code) {
+                                let response = RobotResponse::success(data, elapsed_ms(start));
+                                print_robot_response(&response, format, stats)?;
                             } else {
                                 // Code not found - list available codes as hint
                                 let available = list_template_ids();
                                 let hint = if available.is_empty() {
-                                    "No explanation templates available.".to_string()
+                                    "No explanation templates available; FT-xxxx and robot.* error codes are also accepted.".to_string()
                                 } else {
                                     format!(
-                                        "Available codes: {}",
+                                        "Available codes: {}; FT-xxxx and robot.* error codes are also accepted",
                                         available[..available.len().min(10)].join(", ")
                                     )
                                 };
@@ -65394,9 +65451,23 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     let formatted = format_explanation(template, None);
                     println!("{formatted}");
                 }
+            } else if let Some(data) = why_data_for_error_code(&id) {
+                if output_format.is_json() {
+                    let response = serde_json::json!({
+                        "ok": true,
+                        "error_code": data,
+                        "version": frankenterm_core::VERSION,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&response)?);
+                } else if let Some(def) = frankenterm_core::error_codes::get_error_code(&data.code)
+                {
+                    print!("{}", def.format_plain());
+                } else {
+                    println!("{}: {}\n\n{}", data.code, data.title, data.explanation);
+                }
             } else {
                 let error = bounded_prefixed_diagnostic("Unknown explanation id: ", &id, 600, 600);
-                let hint = "Use 'ft why --list' to see available templates.";
+                let hint = "Use 'ft why --list' to see available templates; FT-xxxx and robot.* error codes are also accepted.";
                 if output_format.is_json() {
                     let response = serde_json::json!({
                         "ok": false,
@@ -138224,11 +138295,13 @@ printf x > "$MINISIGN_MARKER"
     /// Literals passed to `contains`/`starts_with` are matchers, and a few
     /// prose sentences start with "ft"; neither is a suggestion.
     fn product_command_hints(source: &str) -> Vec<String> {
-        const PROSE: [&str; 4] = [
+        const PROSE: [&str; 6] = [
             "ft detected ",
             "ft monitors ",
             "ft Master",
             "ft <command> --help",
+            "ft version too old",
+            "ft will ",
         ];
         let production = source
             .find("#[cfg(test)]\nmod ")
@@ -138483,6 +138556,10 @@ printf x > "$MINISIGN_MARKER"
                 include_str!("../../frankenterm-core/src/error.rs"),
             ),
             (
+                "error_codes.rs (frankenterm-core-error-types)",
+                include_str!("../../frankenterm-core-error-types/src/error_codes.rs"),
+            ),
+            (
                 "explanations.rs",
                 include_str!("../../frankenterm-core/src/explanations.rs"),
             ),
@@ -138578,6 +138655,50 @@ printf x > "$MINISIGN_MARKER"
             failures.is_empty(),
             "product code suggests commands the CLI rejects: {failures:#?}"
         );
+    }
+
+    /// Every rendered error ends with "Run `ft why FT-xxxx` for more
+    /// details", so each code the renderer can emit must resolve; robot.*
+    /// codes with a recovery hint resolve too (robot help names
+    /// `ft robot why robot.policy_denied`).
+    #[test]
+    fn why_resolves_every_rendered_error_code_and_robot_codes() {
+        let renderer = include_str!("../../frankenterm-core/src/output/error_renderer.rs");
+        let production = renderer
+            .find("#[cfg(test)]\nmod ")
+            .map_or(renderer, |index| &renderer[..index]);
+        let mut codes = Vec::new();
+        let mut rest = production;
+        while let Some(start) = rest.find("\"FT-") {
+            let tail = &rest[start + 1..];
+            let end = tail.find('"').unwrap_or(tail.len());
+            codes.push(tail[..end].to_string());
+            rest = &tail[end..];
+        }
+        codes.sort();
+        codes.dedup();
+        assert!(codes.len() > 40, "rendered codes shrank: {codes:?}");
+        let unexplained: Vec<_> = codes
+            .iter()
+            .filter(|code| why_data_for_error_code(code).is_none())
+            .collect();
+        assert!(
+            unexplained.is_empty(),
+            "ft why cannot explain rendered error codes: {unexplained:?}"
+        );
+
+        let lower = why_data_for_error_code("ft-1001").expect("codes are case-insensitive");
+        assert_eq!(lower.code, "FT-1001");
+        assert_eq!(lower.category, "wezterm");
+        assert!(lower.suggestions.is_some());
+
+        let robot = why_data_for_error_code("robot.policy_denied").expect("robot code");
+        assert_eq!(robot.category, "policy");
+        assert!(robot.explanation.contains("ft why --recent denied"));
+
+        assert!(why_data_for_error_code("robot.no_such_code").is_none());
+        assert!(why_data_for_error_code("FT-0000").is_none());
+        assert!(why_data_for_error_code("deny.alt_screen").is_none());
     }
 
     /// Every command's `--help` EXAMPLES section must parse: each line is
