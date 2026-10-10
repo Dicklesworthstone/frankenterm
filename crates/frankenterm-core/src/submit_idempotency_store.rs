@@ -77,8 +77,12 @@ const COMPLETED_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 /// A proven pre-effect denial is re-claimable anyway; its row only pins the
 /// request binding, so it is evictable sooner than a completed receipt.
 const RETRYABLE_RETENTION_MS: i64 = 60 * 60 * 1000;
-/// Upper bound on rows one pressured admission evicts.
+/// Rows one eviction statement deletes.
 const EVICTION_BATCH_ROWS: i64 = 64;
+/// Eviction statements one pressured admission may run. Under byte pressure a
+/// single batch of small completed rows can free less than one reserved
+/// record, so admission keeps evicting up to this bound.
+const EVICTION_BATCHES_PER_ADMISSION: i64 = 16;
 
 const CREATE_TABLE_SQL: &str = "CREATE TABLE verified_submit_idempotency (idempotency_key TEXT COLLATE BINARY PRIMARY KEY NOT NULL, schema_version INTEGER NOT NULL, pane_id TEXT COLLATE BINARY NOT NULL, request_sha256 TEXT COLLATE BINARY NOT NULL, effect_sha256 TEXT COLLATE BINARY NOT NULL, state INTEGER NOT NULL CHECK (state IN (1, 2, 3, 4, 5)), retryable_reason INTEGER, receipt_json TEXT COLLATE BINARY, generation INTEGER NOT NULL CHECK (generation >= 1), owner_nonce BLOB NOT NULL CHECK (typeof(owner_nonce) = 'blob' AND length(owner_nonce) = 32), lease_expires_unix_ms INTEGER CHECK (lease_expires_unix_ms IS NULL OR lease_expires_unix_ms >= 0), created_unix_ms INTEGER NOT NULL, updated_unix_ms INTEGER NOT NULL, CHECK (created_unix_ms >= 0 AND updated_unix_ms >= created_unix_ms), CHECK (length(CAST(idempotency_key AS BLOB)) BETWEEN 71 AND 90), CHECK (length(CAST(pane_id AS BLOB)) BETWEEN 1 AND 20), CHECK (length(CAST(request_sha256 AS BLOB)) = 64 AND request_sha256 NOT GLOB '*[^0-9a-f]*'), CHECK (length(CAST(effect_sha256 AS BLOB)) = 64 AND effect_sha256 NOT GLOB '*[^0-9a-f]*'), CHECK (receipt_json IS NULL OR length(CAST(receipt_json AS BLOB)) <= 65536), CHECK ((state = 1 AND retryable_reason IS NULL AND receipt_json IS NULL AND lease_expires_unix_ms IS NOT NULL) OR (state IN (2, 3) AND retryable_reason IS NULL AND receipt_json IS NULL AND lease_expires_unix_ms IS NULL) OR (state = 4 AND retryable_reason IS NULL AND receipt_json IS NOT NULL AND lease_expires_unix_ms IS NULL) OR (state = 5 AND retryable_reason IN (1, 2) AND receipt_json IS NULL AND lease_expires_unix_ms IS NULL))) STRICT, WITHOUT ROWID";
 const CREATE_INDEX_SQL: &str = "CREATE INDEX verified_submit_idempotency_request_lookup ON verified_submit_idempotency (pane_id COLLATE BINARY, request_sha256 COLLATE BINARY)";
@@ -535,6 +539,7 @@ struct StoreLimits {
     completed_retention_ms: i64,
     retryable_retention_ms: i64,
     eviction_batch_rows: i64,
+    eviction_batches_per_admission: i64,
 }
 
 struct PreparedStorePath {
@@ -550,6 +555,7 @@ const PRODUCTION_LIMITS: StoreLimits = StoreLimits {
     completed_retention_ms: COMPLETED_RETENTION_MS,
     retryable_retention_ms: RETRYABLE_RETENTION_MS,
     eviction_batch_rows: EVICTION_BATCH_ROWS,
+    eviction_batches_per_admission: EVICTION_BATCHES_PER_ADMISSION,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -1724,11 +1730,10 @@ fn usage_admits(
 
 /// Delete at most `limits.eviction_batch_rows` settled rows whose retention
 /// horizon has passed, oldest first. It runs inside the caller's IMMEDIATE
-/// transaction, so eviction commits or rolls back atomically with the
-/// admission it makes room for: a crash, cancellation, or failed commit leaves
-/// every row in place. Active, effect-applied, and in-doubt rows are never
-/// candidates, and neither is the row being claimed. A backwards clock only
-/// shrinks the candidate set.
+/// transaction, so a crash, cancellation, or failed commit leaves every row in
+/// place. Active, effect-applied, and in-doubt rows are never candidates, and
+/// neither is the row being claimed. A backwards clock only shrinks the
+/// candidate set.
 fn evict_expired_settled_rows_locked(
     conn: &Connection,
     claimed_key: &str,
@@ -1751,9 +1756,20 @@ fn evict_expired_settled_rows_locked(
     )
 }
 
-/// Admit `added_records` and `added_bytes`, evicting one bounded batch of
-/// expired settled rows first when the store is at its ceiling. Returns the
-/// number of evicted rows.
+/// What an admission's capacity check did.
+enum CapacityOutcome {
+    Admitted {
+        evicted: usize,
+    },
+    /// Still over a ceiling after `evicted` expired rows were removed.
+    Refused {
+        evicted: usize,
+    },
+}
+
+/// Admit `added_records` and `added_bytes`, evicting expired settled rows in
+/// bounded batches while the store is over a ceiling, up to
+/// `limits.eviction_batches_per_admission` batches.
 fn ensure_capacity_locked(
     conn: &Connection,
     claimed_key: &str,
@@ -1761,16 +1777,38 @@ fn ensure_capacity_locked(
     now: i64,
     added_records: i64,
     added_bytes: i64,
-) -> Result<usize, SubmitIdempotencyError> {
+) -> Result<CapacityOutcome, SubmitIdempotencyError> {
+    let mut evicted = 0_usize;
+    for _ in 0..limits.eviction_batches_per_admission {
+        if usage_admits(conn, limits, added_records, added_bytes)? {
+            return Ok(CapacityOutcome::Admitted { evicted });
+        }
+        let batch = evict_expired_settled_rows_locked(conn, claimed_key, limits, now)?;
+        if batch == 0 {
+            return Ok(CapacityOutcome::Refused { evicted });
+        }
+        evicted = evicted.saturating_add(batch);
+    }
     if usage_admits(conn, limits, added_records, added_bytes)? {
-        return Ok(0);
-    }
-    let evicted = evict_expired_settled_rows_locked(conn, claimed_key, limits, now)?;
-    if evicted > 0 && usage_admits(conn, limits, added_records, added_bytes)? {
-        Ok(evicted)
+        Ok(CapacityOutcome::Admitted { evicted })
     } else {
-        Err(SubmitIdempotencyError::CapacityExceeded)
+        Ok(CapacityOutcome::Refused { evicted })
     }
+}
+
+/// Refuse an admission the ceiling still blocks. Rows it already evicted were
+/// all past their retention horizon, so they are committed rather than rolled
+/// back: otherwise a deficit larger than one admission's eviction bound would
+/// refuse every later admission forever.
+fn refuse_after_eviction(
+    tx: rusqlite::Transaction<'_>,
+    evicted: usize,
+) -> Result<ClaimOutcome, SubmitIdempotencyError> {
+    if evicted > 0 {
+        map_sqlite(tx.commit(), SubmitIdempotencyError::ClaimFailed)?;
+        log_evicted_rows(evicted);
+    }
+    Err(SubmitIdempotencyError::CapacityExceeded)
 }
 
 fn log_evicted_rows(evicted: usize) {
@@ -1817,9 +1855,9 @@ fn expire_active_owner_locked(
 /// callers must reconcile it explicitly. `Completed` returns the original,
 /// bounded receipt.
 ///
-/// At the record or byte ceiling, admission first evicts one bounded batch of
-/// settled rows older than their retention horizon (completed receipts after
-/// 24 hours, retryable denials after 1 hour) in the same transaction. An
+/// At the record or byte ceiling, admission first evicts settled rows older
+/// than their retention horizon (completed receipts after 24 hours, retryable
+/// denials after 1 hour) in bounded batches within the same transaction. An
 /// evicted key is admitted as a new request; unresolved rows are never evicted.
 ///
 /// # Errors
@@ -1898,6 +1936,7 @@ where
         || limits.receipt_reserve_bytes < 1
         || limits.receipt_reserve_bytes > MAX_RECEIPT_JSON_BYTES as i64
         || limits.eviction_batch_rows < 1
+        || limits.eviction_batches_per_admission < 1
         || limits.completed_retention_ms < 0
         || limits.retryable_retention_ms < 0
     {
@@ -1922,14 +1961,17 @@ where
     }
     match read_header(&tx, binding, SubmitIdempotencyError::ClaimFailed)? {
         None => {
-            let evicted = ensure_capacity_locked(
+            let evicted = match ensure_capacity_locked(
                 &tx,
                 binding.key(),
                 limits,
                 now,
                 1,
                 new_record_logical_bytes(binding, limits)?,
-            )?;
+            )? {
+                CapacityOutcome::Admitted { evicted } => evicted,
+                CapacityOutcome::Refused { evicted } => return refuse_after_eviction(tx, evicted),
+            };
             let owner_nonce = owner_nonce_factory()?;
             let lease_expires = now
                 .checked_add(OWNER_LEASE_DURATION_MS)
@@ -2006,14 +2048,17 @@ where
         }
         Some(header) if header.state == STATE_RETRYABLE => {
             // Re-claiming turns a receipt-free row into a reserved one.
-            let evicted = ensure_capacity_locked(
+            let evicted = match ensure_capacity_locked(
                 &tx,
                 binding.key(),
                 limits,
                 now,
                 0,
                 limits.receipt_reserve_bytes,
-            )?;
+            )? {
+                CapacityOutcome::Admitted { evicted } => evicted,
+                CapacityOutcome::Refused { evicted } => return refuse_after_eviction(tx, evicted),
+            };
             let owner_nonce = owner_nonce_factory()?;
             let next_generation = header
                 .generation
@@ -2604,8 +2649,9 @@ impl SubmitIdempotencyCensus {
     }
 }
 
-/// Read-only occupancy census, or `None` when no store exists yet. It never
-/// creates the store and takes no write lock.
+/// Occupancy census, or `None` when no store exists yet. It never creates the
+/// store, changes no record, and takes no write lock; like every store open it
+/// re-hardens the permissions of the store's own files.
 ///
 /// # Errors
 /// Returns a finite [`SubmitIdempotencyError`] for unsafe paths, a foreign or
@@ -3975,6 +4021,10 @@ mod tests {
                 ..PRODUCTION_LIMITS
             },
             StoreLimits {
+                eviction_batches_per_admission: 0,
+                ..PRODUCTION_LIMITS
+            },
+            StoreLimits {
                 completed_retention_ms: -1,
                 ..PRODUCTION_LIMITS
             },
@@ -3997,6 +4047,70 @@ mod tests {
         assert!(
             !database_path(dir.path()).exists(),
             "limit validation precedes store creation"
+        );
+    }
+
+    #[test]
+    fn byte_pressure_keeps_evicting_until_admission_and_keeps_refused_progress() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let roomy = StoreLimits {
+            completed_retention_ms: 1_000,
+            ..PRODUCTION_LIMITS
+        };
+        // Fixed-width caller keys give every completed row the same size.
+        let fill: Vec<_> = (0..20)
+            .map(|index| binding(25, &format!("fill-{index:02}")))
+            .collect();
+        for item in &fill {
+            let token = claim_at(dir.path(), item, roomy, 1_000);
+            transition_from_active_owner_at(
+                dir.path(),
+                item,
+                token,
+                STATE_EFFECT_APPLIED_RECEIPT_PENDING,
+                None,
+                1_000,
+            )
+            .expect("mark effect applied");
+            complete_at(dir.path(), item, token, &receipt_for(item), 1_000)
+                .expect("complete receipt");
+        }
+        let (records, bytes) =
+            store_usage(&raw_connection(dir.path()), roomy).expect("store usage");
+        assert_eq!(records, 20);
+        let row = bytes / 20;
+        assert_eq!(row * 20, bytes, "every completed row has the same size");
+        let new_key = binding(25, "fill-new");
+        let record = new_record_logical_bytes(&new_key, roomy).expect("record bytes");
+        // Admission fits only once at most two completed rows remain, so it
+        // needs 18 evictions; one row per batch and 16 batches per admission.
+        let tight = StoreLimits {
+            max_logical_bytes: 2 * row + record,
+            eviction_batch_rows: 1,
+            eviction_batches_per_admission: 16,
+            ..roomy
+        };
+        assert_eq!(
+            claim_with_nonce_limits_and_time(
+                dir.path(),
+                &new_key,
+                [9; OWNER_NONCE_BYTES],
+                tight,
+                10_000,
+            ),
+            Err(SubmitIdempotencyError::CapacityExceeded)
+        );
+        assert_eq!(
+            row_count(dir.path()),
+            4,
+            "a refused admission keeps the 16 expired rows it evicted"
+        );
+        // The next admission needs only two more batches and succeeds.
+        claim_at(dir.path(), &new_key, tight, 10_001);
+        assert_eq!(row_count(dir.path()), 3);
+        assert_eq!(
+            lookup_at(dir.path(), &new_key, 10_002),
+            Ok(Some(StoredSubmitState::ActiveOwner))
         );
     }
 
@@ -4790,6 +4904,8 @@ mod tests {
     #[cfg(unix)]
     const CRASH_WRITER_ENV: &str = "FT_SUBMIT_STORE_CRASH_WRITER";
     #[cfg(unix)]
+    const CRASH_WRITER_EXIT_CODE: i32 = 86;
+    #[cfg(unix)]
     const REAL_SIDECAR_TEST: &str = "submit_idempotency_store::tests::real_sqlite_sidecars_are_owner_only_from_creation_under_a_permissive_umask";
 
     /// ft-7h5da.3.5.4: the WAL and SHM files real SQLite creates for the store
@@ -4915,7 +5031,11 @@ mod tests {
             .env(CRASH_WRITER_ENV, database_path(crashed.path()))
             .status()
             .expect("run the crashing writer");
-        assert!(!status.success(), "the writer must die mid-session");
+        assert_eq!(
+            status.code(),
+            Some(CRASH_WRITER_EXIT_CODE),
+            "the writer must commit and then die without closing"
+        );
         for path in [
             crashed.path().join(STORE_WAL_FILENAME),
             crashed.path().join(STORE_SHM_FILENAME),
@@ -4931,8 +5051,11 @@ mod tests {
         assert_eq!(mode_of(&database_path(crashed.path())), 0o600);
     }
 
-    /// Commits a write that stays in the WAL, then dies without closing the
-    /// connection, as a crashed process would.
+    /// Commits a write that stays in the WAL, then exits without closing the
+    /// connection, as a crashed process would: `process::exit` runs no
+    /// destructors, so SQLite never checkpoints or removes its sidecars. Unlike
+    /// `abort`, it leaves no core dump or crash report, and its distinct exit
+    /// code proves the write committed before the process died.
     #[cfg(unix)]
     fn crash_writer(database: &Path) -> ! {
         let conn = Connection::open(database).expect("open the store database");
@@ -4944,6 +5067,6 @@ mod tests {
              COMMIT;",
         )
         .expect("committed write left in the WAL");
-        std::process::abort();
+        std::process::exit(CRASH_WRITER_EXIT_CODE);
     }
 }

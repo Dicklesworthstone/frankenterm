@@ -109,9 +109,9 @@ All tools accept an optional `format?: "json" | "toon"` parameter (default: `jso
   - Response notes: text payloads are redacted before serialization; policy gates may return `FT-MCP-0006`.
 
 - `wa.send`
-  - Params: `{ pane_id: u64, text: string, dry_run?: bool=false, wait_for?: string, timeout_secs?: u64=30, wait_for_regex?: bool=false }`
+  - Params: `{ pane_id: u64, text: string, dry_run?: bool=false, verify_submit?: bool=false, submit_level?: "write" | "composer" | "submitted" | "working", idempotency_key?: string (1-256 bytes), wait_for?: string, timeout_secs?: u64=30 (1-600), wait_for_regex?: bool=false }`
   - Response notes: non-dry-run send responses may include `data.submit`, a durable submit receipt keyed by `idempotency_key` and aligned with the audit `correlation_id`.
-  - Duplicate protection: replaying an identical send returns the original completed receipt for at least 24 hours; a proven pre-effect denial (policy denied, approval required) stays bound for at least 1 hour. Only when the store is at its ceiling (16384 records or 128 MiB) does a new send evict a bounded batch of settled records older than those horizons; a later identical send is then admitted as new. Pending and in-doubt records are never evicted, so a store full of unresolved authority keeps refusing new sends with `capacity_exceeded`.
+  - Duplicate protection (with `idempotency_key`): replaying an identical send returns the original completed receipt for at least 24 hours; a proven pre-effect denial (policy denied, approval required) stays bound for at least 1 hour. Only when the store is at its ceiling (16384 records or 128 MiB) does a new send evict settled records older than those horizons, in bounded batches; a later identical send is then admitted as new. Pending and in-doubt records are never evicted, so a store full of unresolved authority keeps refusing new sends with `capacity_exceeded`.
 
 - `wa.wait_for`
   - Params: `{ pane_id: u64, pattern: string, timeout_secs?: u64=30, tail?: u64=200, regex?: bool=false }`
