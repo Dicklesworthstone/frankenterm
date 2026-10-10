@@ -1015,7 +1015,7 @@ ft audit --decision deny                 # only denied decisions
 ```bash
 ft triage                               # summarize issues (health/crashes/events)
 ft diag bundle --output /tmp/ft-diag    # collect diagnostic bundle
-ft reproduce --kind crash               # export latest crash bundle
+ft reproduce export --kind crash        # export latest crash bundle
 ft doctor                               # environment health check
 ft doctor --json                        # machine-readable diagnostics
 ft proof-doctor                         # validate evidence artifacts in docs/attestations/
@@ -4105,7 +4105,7 @@ For point-in-time debugging:
 - `ft status --health` — fleet snapshot
 - `ft triage` — issues summary
 - `ft diag bundle --output /tmp/ft-diag` — collect everything for handoff
-- `ft reproduce --kind crash` — incident bundle for forensics
+- `ft reproduce export --kind crash` — incident bundle for forensics
 
 For continuous monitoring, prefer Prometheus + SSE. For incident response, prefer the bundle + cockpit data.
 
