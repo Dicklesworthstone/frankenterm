@@ -1637,7 +1637,7 @@ frankenterm/                              # <!--count:workspace_members-->83<!--
 │   ├── frankenterm-core-mcp/             # MCP type boundary
 │   ├── frankenterm-core-test-macros/     # #[lab_runtime_test] proc macros
 │   │
-│   │   # ── 12 leaf type crates (zero first-party deps) ──
+│   │   # ── 12 leaf type crates (no first-party deps but one) ──
 │   ├── frankenterm-core-resource-types/
 │   ├── frankenterm-core-error-types/
 │   ├── frankenterm-core-config-types/
@@ -1674,7 +1674,7 @@ frankenterm/                              # <!--count:workspace_members-->83<!--
 
 ### Sub-crate extraction invariants
 
-- **Leaf type crates** (`*-types`) declare zero first-party dependencies.
+- **Leaf type crates** (`*-types`) declare no first-party dependencies, with one exception: `frankenterm-core-audit-types` depends on `frankenterm-core-replay-types`.
 - **Cluster sub-crates** (`*-ars`, `*-tantivy`, `*-replay`, `*-fleet`) depend on `frankenterm-core` and, where needed, shared leaf types.
 - **Core imports shared leaves**, including the feature-gated MCP type crate. The connector boundary imports connector types, not core.
 - **Normal/build dependency cycles are forbidden.** Dev-dependency cycles let core tests exercise the extracted clusters.
@@ -1743,7 +1743,7 @@ frankenterm/                              # <!--count:workspace_members-->83<!--
 |---|---|---|
 | `frankenterm-core-ars` | Adaptive/Autonomous Reflex System (15 modules) — drift detection, evidence ledger, blast radius, regime analysis | Heavy ML/statistics surface that shouldn't be in everyone's compile graph |
 | `frankenterm-core-tantivy` | Full Tantivy lexical search stack (~16k LOC) | Tantivy is a heavy dep; sub-crating it lets `frankenterm-core` test paths skip it |
-| `frankenterm-core-replay` | Replay + replay-assessment harness (~25k LOC) | Determinism testing has its own dep set (proptest, criterion) |
+| `frankenterm-core-replay` | Replay + replay-assessment harness (~40k LOC) | Determinism testing has its own dep set (proptest, criterion) |
 | `frankenterm-core-fleet` | Fleet dashboard | Will host multi-host coordination; partial extraction in progress |
 | `frankenterm-core-connectors` | Connector type boundary | Reuses connector types without importing the core runtime |
 | `frankenterm-core-mcp` | MCP type boundary | MCP integration is feature-gated; types live in their own crate so consumers can depend on schemas without dragging in the server |
@@ -1753,7 +1753,7 @@ frankenterm/                              # <!--count:workspace_members-->83<!--
 ### Dependency rules (enforced by the build, not just by convention)
 
 1. **Core imports shared type crates.** The normal dependency direction for extracted implementation clusters is cluster → core; core's dev-dependencies can exercise those clusters in tests.
-2. **Leaf type crates declare zero first-party deps.** They depend only on external libs (serde, etc.).
+2. **Leaf type crates declare no first-party deps.** They depend only on external libs (serde, etc.), except that `frankenterm-core-audit-types` uses `frankenterm-core-replay-types`.
 3. **Implementation clusters depend on core and shared leaves.** MCP and connector type boundaries have narrower dependency graphs; the `frankenterm-core-*` prefix alone does not identify a cluster.
 4. **`tokio` ban** at the `cargo-deny` layer fails the build if any first-party `Cargo.toml` declares `tokio` directly.
 5. **Cycle detection** runs in the release gate (`scripts/release-gates.sh`, DSR quality) via `cargo-deny` + the workspace-topology crate (`frankenterm-topo`).
@@ -2031,21 +2031,18 @@ A "rule pack" is a versioned, named collection of detection rules. The default p
 | Mode | Backend | Best for | Latency target |
 |---|---|---|---|
 | `lexical` (default) | SQLite FTS5 | Known strings, exact errors, identifiers | <10 ms |
-| `semantic` | fastembed embeddings via FrankenSearch | Conceptual queries ("connection issues"), paraphrased content | depends on embedding model |
+| `semantic` | FNV-1a hash embeddings (`fnv1a-hash-128`) | Token-overlap similarity on reworded queries; not true paraphrase understanding | vector scan over stored embeddings |
 | `hybrid` | RRF fusion of lexical + semantic | Best of both; recommended when in doubt | lexical + semantic + fusion overhead |
 
 ### Lexical (FTS5 + Tantivy)
 
 SQLite FTS5 indexes captured output at write time. A Tantivy secondary index exists as a separate crate but is not populated on the production path.
 
-### Semantic (fastembed)
+### Semantic (hash embeddings)
 
 Every appended segment also gets a 128-dimension FNV-1a hash embedding (`fnv1a-hash-128`) stored alongside it. Queries are embedded the same way and matched by vector similarity. This is a lexical-flavored semantic lane, not an ML model; fastembed and the embedder daemon are not on the production path.
 
-The semantic backend is feature-gated because:
-1. The embedder model is ~100 MB on disk
-2. Embedding generation has non-trivial CPU cost
-3. Many use cases (debugging known errors) don't need it
+It sits behind the `semantic-search` feature, which the `ft` binary enables by default; without it, semantic and hybrid modes return lexical-only results.
 
 ### Hybrid (RRF fusion)
 
@@ -2055,7 +2052,7 @@ Hybrid mode runs both backends in parallel and fuses results with Reciprocal Ran
 score(doc) = sum over backends of 1 / (k + rank_in_backend(doc))
 ```
 
-`k` defaults to 60 (the canonical RRF constant). Hybrid mode is the recommended default when you don't know in advance whether a query is best served by exact matching or paraphrase recall. The cost is roughly `lexical_latency + semantic_latency + small fusion overhead`.
+`k` defaults to 60 (the canonical RRF constant). Hybrid mode is the recommended default when you don't know in advance whether a query is best served by exact matching or by the looser token-overlap recall of the hash-embedding lane. The cost is roughly `lexical_latency + semantic_latency + small fusion overhead`.
 
 ### Future-query recall caveat
 
@@ -2458,9 +2455,9 @@ ft attestation verify docs/attestations/<version>.json
 ```
 
 This:
-1. Re-derives every `artifact_sha256` by reading the artifact from disk and hashing it
+1. Re-derives every `artifacts[].sha256` by reading the artifact from disk and hashing it
 2. Recomputes the canonical signing payload (deterministic serialization of the slots + metadata)
-3. Verifies that `canonical_payload_sha256` matches the recomputed hash
+3. Verifies that `signature.canonical_sha256` matches the recomputed hash
 4. Verifies that the `.sigstore` file's hash + size match the recorded values
 5. Verifies the Sigstore signature against the canonical payload using the Fulcio cert + Rekor entry
 
@@ -2650,7 +2647,7 @@ Beyond delta capture, `ft` has a separate **recorder** subsystem that produces h
 
 ### Replay
 
-The replay subsystem is its own crate (`frankenterm-core-replay`, ~25k LOC, 24 modules). It accepts a recorded session and produces:
+The replay subsystem is its own crate (`frankenterm-core-replay`, ~40k LOC, 31 source files). It accepts a recorded session and produces:
 - A normalized event DAG (decision graph with causal edges)
 - A virtual-clock harness so timing-dependent steps can be replayed deterministically
 - A diff engine that compares two replays, useful for catching nondeterminism in workflow handlers
@@ -2799,12 +2796,12 @@ Every `ft` error is a typed envelope with a stable code, a human-readable messag
 | `storage.*` | DB / FTS5 / migration errors |
 | `wezterm.*` | Mux backend errors (subset of `robot.wezterm_*`) |
 | `cass.*` | Cross-Agent Session Search errors |
-| `caut.*` | Caut (Cross-Agent Universal Tooling) errors |
+| `caut.*` | Errors from the `caut` account-usage CLI wrapper |
 | `connector.*` | Connector fabric errors |
 
 ### Categories (`ErrorCategory`)
 
-Each code is classified into a category for routing: `Wezterm`, `Internal`, `Policy`, `Storage`, `Network`, `Validation`, `RateLimit`, etc. Categories enable bulk policy decisions (e.g., "retry every `Network` error, alert on every `Internal`").
+Each code is classified into a category for routing, one per code range: `Wezterm` (1xxx), `Storage` (2xxx), `Pattern` (3xxx), `Policy` (4xxx), `Workflow` (5xxx), `Network` (6xxx), `Config` (7xxx), and `Internal` (9xxx). Categories enable bulk policy decisions (e.g., "retry every `Network` error, alert on every `Internal`").
 
 ### Retryability
 
@@ -2894,7 +2891,7 @@ The native event bridge subscribes to OS-level signals from the mux/GUI process:
 
 ### Implementation
 
-`native_events.rs` houses the bridge. It uses asupersync channels (broadcast for fanout, watch for single-value updates). The emitter side lives in the GUI / mux process and ships through the codec layer. The receiver side in `ft watch` subscribes per-pane.
+`native_events.rs` houses the bridge. It forwards native events to the runtime over an asupersync `mpsc` channel. The emitter side lives in the GUI / mux process and ships through the codec layer. The receiver side in `ft watch` subscribes per-pane.
 
 ### Fallback
 
@@ -2910,7 +2907,7 @@ When the native event bridge is unavailable (running against an older mux, or ag
 
 - Letting the contract shape stabilize while implementation evolves means external authors can start writing against it.
 - Replay determinism, fuel budgets, and policy-gating story can be designed before the runtime arrives.
-- `extensions.rs` lives in `frankenterm-core` and is feature-gated; building without the feature elides the surface entirely.
+- `extensions.rs` lives in `frankenterm-core` and is compiled into every build; it holds contract types only, with no runtime behind them.
 
 ### Intended capabilities (when wired)
 
@@ -2967,11 +2964,11 @@ Under `ft watch`, webhook delivery retries transport errors, 408, 429 and 5xx up
 
 ### Surface
 
-The IPC server (`ipc.rs`) listens on a Unix domain socket (or named pipe on Windows) configured via `[ipc]`. The socket is created with mode `0600`. Token authentication is opt-in: set `[ipc].tokens` (each with a scope) and clients present `FT_IPC_TOKEN`; with no tokens configured (the default), socket file permissions are the only access control and read/write scopes are not enforced.
+The IPC server (`ipc.rs`) listens on a Unix domain socket configured via `[ipc]` (Windows uses an AF_UNIX socket too, through the in-tree `frankenterm-uds` transport). The socket is created with mode `0600`. Token authentication is opt-in: set `[ipc].tokens` (each with a scope) and clients present `FT_IPC_TOKEN`; with no tokens configured (the default), socket file permissions are the only access control and read/write scopes are not enforced.
 
 ### Scope
 
-`IpcScope` is a per-token permission level: `read`, `write`, or `all`. Each request declares the scope it needs (mutating RPCs need `write`), and the watcher checks it against the presenting token before dispatch, but only when tokens are configured. The socket itself is always local (Unix domain socket or named pipe).
+`IpcScope` is a per-token permission level: `read`, `write`, or `all`. Each request declares the scope it needs (mutating RPCs need `write`), and the watcher checks it against the presenting token before dispatch, but only when tokens are configured. The socket itself is always local (a Unix domain socket on every platform).
 
 ### Why an IPC layer at all
 
@@ -3011,11 +3008,11 @@ ft backup import /tmp/ft-snapshot --dry-run --yes         # show what would happ
 
 ### Retention
 
-Retention is governed by both `retention_days` and `max_backups`. Whichever bound is hit first triggers pruning. Pruning is per-cycle and emits an audit row.
+Retention is governed by both `retention_days` and `max_backups`. Whichever bound is hit first triggers pruning. Pruning runs after each scheduled backup; it deletes old archives on disk and writes no audit row.
 
 ### Disaster recovery drills
 
-`disaster_recovery_drills` (see deep dive above) exercises the backup/restore path on a schedule with operator-defined RTO/RPO targets. Reports include pass / fail / degraded verdicts. The `ContinuityReport` cold-start case was fixed in 2026-04 to report `Unknown` (not `Healthy`) when no drills have run yet; see CHANGELOG / br-ft-38rxl.
+`disaster_recovery_drills` (see deep dive above) models backup/restore drills against operator-defined RTO/RPO targets. Nothing schedules or invokes it today, so no drill runs on its own. Reports include pass / fail / degraded verdicts. The `ContinuityReport` cold-start case was fixed in 2026-04 to report `Unknown` (not `Healthy`) when no drills have run yet; see CHANGELOG / br-ft-38rxl.
 
 ---
 
@@ -3059,7 +3056,7 @@ The `ft` binary (`-p frankenterm`) turns nearly every surface on by default; the
 | `mcp` | MCP stdio server (`ft mcp serve`) | **on** | MCP integration unavailable |
 | `web` | HTTP server + SSE streaming (`ft web`) | **on** | No web surface |
 | `distributed` | Distributed mode (`ft distributed agent`, aggregator) | **on** | Distributed unavailable |
-| `semantic-search` | fastembed embeddings + Tantivy semantic backend | **on** | Hybrid/semantic modes return lexical-only |
+| `semantic-search` | Hash-embedding semantic lane for semantic and hybrid search | **on** | Hybrid/semantic modes return lexical-only |
 | `ftui`, `tui-dashboard`, `tui-widgets` | FrankenTUI dashboard backend and widgets | **on** | TUI dashboard unavailable |
 | `vendored` | Vendored migration map for upgrades | **on** | Older DBs need manual upgrade path |
 | `metrics` | Prometheus `/metrics` exporter started by `ft watch --metrics` | **on** | No Prometheus endpoint; `ft doctor --json` remains the only metrics surface |
@@ -3237,13 +3234,15 @@ and per-pane disk volume depends directly on output rate and retention.
 | 51–200 panes | 300–500 | synthetic benchmark budget: ~200 MB | **required** | optional |
 | 200+ panes | 500–1000 + per-pane priorities | target-class artifact required (see [target hardware](docs/perf/target-class-hardware.md)) | required | recommended (split across aggregators) |
 
-### When to enable each feature flag
+### What each default feature buys
 
-- **`--features semantic-search`**: when operators do conceptual queries ("connection issues") more than exact-string searches. Costs ~100 MB resident for the embedder model.
-- **`--features web`**: when wiring `ft` into a non-CLI tool (dashboard, webhook router, downstream service).
-- **`--features distributed`**: when the agent fleet spans multiple hosts.
-- **`--features mcp`**: when integrating with MCP-aware agent hosts.
-- **`--features ftui`**: when the operator wants an in-terminal dashboard.
+All of these are on in a default `ft` build ([feature matrix](#compile-time-feature-matrix)); keep them in a `--no-default-features` build only where they apply:
+
+- **`semantic-search`**: the hash-embedding lane behind semantic and hybrid search. It is model-free, so the cost is an embedding row per segment rather than a resident model.
+- **`web`**: wiring `ft` into a non-CLI tool (dashboard, webhook router, downstream service).
+- **`distributed`**: an agent fleet that spans multiple hosts.
+- **`mcp`**: integrating with MCP-aware agent hosts.
+- **`ftui`**: an in-terminal dashboard.
 
 ### Tuning knobs
 
@@ -3455,7 +3454,7 @@ Each handler can declare `trigger_policy()` returning `WorkflowTriggerPolicy::al
 
 ## Deep Dive: Saved Searches and Scheduled Queries
 
-`ft search saved` (or `ft robot search`'s saved-search routes) lets operators bookmark FTS queries and optionally schedule them to re-run periodically.
+`ft search saved` lets operators bookmark FTS queries and optionally schedule them to re-run periodically.
 
 ### Commands
 
@@ -3472,11 +3471,11 @@ ft search saved disable <name>                          # stop scheduled executi
 
 - **Polling-free alerting.** A scheduled saved search can route results into the notification pipeline (e.g., "every 5 min, check for `panic` across all panes; alert if any match").
 - **Auditable.** Scheduled-search results are persisted as events with the search name attached.
-- **Bounded cost.** The minimum interval is 1000 ms; the search executes against indexed FTS5 / Tantivy data so each run is bounded.
+- **Bounded cost.** The minimum interval is 1000 ms; the search executes against the indexed FTS5 data so each run is bounded.
 
 ### Saved-search storage
 
-The `saved_searches` table holds: name, query string, mode (lexical/semantic/hybrid), filters (pane, since, until), schedule interval, enabled flag.
+The `saved_searches` table holds: name, query string, optional pane filter, a since mode (`last_run` by default) with an optional `since_ms`, schedule interval, enabled flag, and the last run's time, result count and error. Saved searches run lexical queries; there is no per-search mode or `until` bound.
 
 ---
 
@@ -3860,8 +3859,8 @@ This section catalogs every non-trivial algorithm or data structure the project 
 | Algorithm | Where | Why this one |
 |---|---|---|
 | **SQLite FTS5** | Storage (lexical index) | Bundled with rusqlite (no system dep); BM25-like ranking; reliable on commodity hardware. |
-| **Tantivy** | `frankenterm-core-tantivy` | Richer scoring + faster ranked queries; complements FTS5 when relevance matters more than raw matching. |
-| **fastembed embeddings** | `search/` semantic backend | Quantized models, ONNX runtime, low memory footprint. Feature-gated because not all users need semantic. |
+| **Tantivy** | `frankenterm-core-tantivy` | Richer scoring + faster ranked queries when relevance matters more than raw matching. The crate exists, but its index is not populated on the production path. |
+| **FNV-1a hash embeddings** | `search/` semantic lane | Deterministic, model-free and cheap enough to embed every segment at write time; fastembed/ONNX models are not on the production path. |
 | **Reciprocal Rank Fusion (RRF)** | `search/` hybrid mode | `score(doc) = sum 1/(k + rank)` with k=60 (canonical). Robust to rank-vs-score scale differences across backends. |
 
 ### Concurrency & cancellation
