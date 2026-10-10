@@ -3075,23 +3075,23 @@ The current reality-check round (ft-tf6g3) is wiring the formal-methods substrat
 
 ## Compile-Time Feature Matrix
 
-`ft` is feature-gated extensively so a default build stays small and trimmed-down builds still work.
+The `ft` binary (`-p frankenterm`) turns nearly every surface on by default; the features exist so trimmed builds still compile. Defaults below come from `crates/frankenterm/Cargo.toml`.
 
 | Feature | What it enables | Default | Disable cost |
 |---|---|---|---|
 | `agent-detection` | `ft robot agents list / running / configure` family | **on** | Calls return `robot.feature_not_available`; no inventory |
-| `mcp` | MCP stdio server (`ft mcp serve`) | off | MCP integration unavailable |
-| `mcp-client` | MCP client transport (depends on fastmcp) | off | MCP-driven tool calls unavailable |
-| `web` | HTTP server + SSE streaming (`ft web`) | off | No web surface |
-| `distributed` | Distributed mode (`ft distributed agent`, aggregator) | off | Distributed unavailable |
-| `semantic-search` | fastembed embeddings + Tantivy semantic backend | off | Hybrid/semantic modes return lexical-only |
-| `ftui` | FrankenTUI dashboard backend | off | TUI dashboard unavailable |
+| `mcp` | MCP stdio server (`ft mcp serve`) | **on** | MCP integration unavailable |
+| `web` | HTTP server + SSE streaming (`ft web`) | **on** | No web surface |
+| `distributed` | Distributed mode (`ft distributed agent`, aggregator) | **on** | Distributed unavailable |
+| `semantic-search` | fastembed embeddings + Tantivy semantic backend | **on** | Hybrid/semantic modes return lexical-only |
+| `ftui`, `tui-dashboard`, `tui-widgets` | FrankenTUI dashboard backend and widgets | **on** | TUI dashboard unavailable |
+| `vendored` | Vendored migration map for upgrades | **on** | Older DBs need manual upgrade path |
+| `metrics` | Prometheus `/metrics` exporter started by `ft watch --metrics` | **on** | No Prometheus endpoint; `ft doctor --json` remains the only metrics surface |
+| `subprocess-bridge` | Subprocess-bridge mission/tx surface | **on** | Subprocess-based mission steps unavailable |
+| `browser`, `native-wezterm`, `session-resume`, `redis-session`, `sync`, `jemalloc`, `asupersync-runtime` | Remaining default surfaces and the allocator/runtime choice | **on** | The matching surface is compiled out |
 | `tui-oracle` | Legacy ratatui parity oracle for regression checks | off | Dev-only |
-| `disk-pressure` | Disk-pressure telemetry source | off | Envelope uses fallback signals |
-| `vendored` | Vendored migration map for upgrades | off | Older DBs need manual upgrade path |
-| `metrics` | Prometheus `/metrics` exporter started by `ft watch --metrics` | off | No Prometheus endpoint; `ft doctor --json` remains the only metrics surface |
-| `subprocess-bridge` | Subprocess-bridge mission/tx surface | off | Subprocess-based mission steps unavailable |
-| `__journal_types_placeholder` | Test-only placeholder for unbuilt journal types | off | Test-internal |
+
+`mcp-client` (the MCP client transport) and `disk-pressure` (disk-pressure telemetry) are `frankenterm-core` features. The `ft` binary depends on the core crate without its defaults and does not enable them, so its operating envelope uses fallback disk signals.
 
 ### `--all-features` build
 
@@ -3099,7 +3099,7 @@ The current reality-check round (ft-tf6g3) is wiring the formal-methods substrat
 
 ### Trimming for embedded / minimal builds
 
-`cargo build -p frankenterm --profile release-interactive --no-default-features` produces the smallest shipped-profile binary. Agent-inventory robot calls become unavailable; everything else stays. Robust for headless / scripted use.
+`cargo build -p frankenterm --profile release-interactive --no-default-features` produces the smallest shipped-profile binary. It drops every default surface in the table above (agent inventory, MCP server, web/SSE, distributed mode, semantic search, the TUI dashboard, the metrics endpoint and the rest), so add back with `--features` only what a headless or scripted deployment needs.
 
 ---
 
