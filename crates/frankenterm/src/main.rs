@@ -2112,8 +2112,12 @@ SEE ALSO:
     ft attention explain attention:ready_now:beads_ready:ft-docs --format toon
 
 NOTES:
-    This surface is input-backed and read-only. Without --input it emits a
-    degraded snapshot that explicitly marks required sources unavailable.
+    This surface is read-only. With --input it replays that recorded input
+    exactly. Without it, it reads live sources: the watcher's operating
+    envelope, the last 24 hours of policy denials and approval holds,
+    verified-submit drift, unhandled warning and critical events, operator
+    pane holds and recent crash bundles. Sources it cannot read are reported
+    unavailable, never guessed.
 
 SEE ALSO:
     ft robot attention status

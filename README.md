@@ -958,6 +958,31 @@ ft why deny.alt_screen       # explain a common policy denial
 ft why FT-1001               # explain the error code an error message names
 ```
 
+### Attention console
+
+`ft attention` ranks what needs an operator or agent next, without changing
+anything. Without `--input` it reads live sources:
+
+- the watcher's operating envelope;
+- policy denials and approval holds from the last 24 hours of the audit log;
+- verified-submit profile drift;
+- unhandled warning and critical detection events;
+- operator pane holds;
+- watcher crash bundles from the last day.
+
+Each item carries its reasons, a safe next action and a mute key. MCP
+`wa.attention` with `live: true` reads the same database sources, but not the
+watcher envelope or crash bundles. The JSON contract is in
+`docs/robot-contracts/attention-router.md`.
+
+```bash
+ft attention status               # scored snapshot and source health
+ft attention next                 # the highest-priority safe next action
+ft attention explain              # why the next item ranks first
+ft robot attention next           # the same, as a robot envelope
+ft mute add <identity_key>        # stop one item resurfacing (the key is in its summary)
+```
+
 ### Workflows
 
 ```bash
