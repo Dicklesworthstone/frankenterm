@@ -5117,7 +5117,7 @@ enum RobotRulesCommands {
 
     /// Show details for a specific rule
     Show {
-        /// Rule ID (e.g., "codex.usage_reached")
+        /// Rule ID (e.g., "codex.usage.reached")
         rule_id: String,
     },
 
@@ -6541,7 +6541,7 @@ enum RulesCommands {
 
     /// Show full details for a specific rule
     Show {
-        /// Rule ID (e.g., "codex.usage_reached")
+        /// Rule ID (e.g., "codex.usage.reached")
         rule_id: String,
 
         /// Output format: auto, plain, or json
