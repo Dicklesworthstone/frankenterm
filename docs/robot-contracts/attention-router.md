@@ -37,7 +37,8 @@ summary (`[mute: ft mute add attention.<source>...]`). Live runs load active
 Policy-gate and receipt facts never carry the action input, the policy's
 free-text reason, or idempotency keys, and a workspace without a database is
 not created. Every other source appears only through caller input and is
-otherwise reported missing. Nothing mutates project state.
+otherwise reported missing. The attention surfaces mutate nothing; only the
+watcher's drift monitor above writes, and only its own events.
 
 Operator runbook: `docs/operator-runbook.md` section 2C.
 
