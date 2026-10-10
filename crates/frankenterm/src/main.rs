@@ -13168,6 +13168,10 @@ async fn build_cli_attention_router_payload(
                 input.generated_at_ms,
             ),
         );
+        // Operator mutes (`ft mute add <key>`) suppress matching live facts.
+        input
+            .notification_mutes
+            .extend(audit.mutes.iter().map(attention_mute_from_record));
     }
     Ok(build_attention_router_surface_payload(
         &input,
@@ -13183,6 +13187,9 @@ struct LiveAttentionAudit {
     denied: Option<Vec<frankenterm_core::storage::AuditActionRecord>>,
     approval_required: Option<Vec<frankenterm_core::storage::AuditActionRecord>>,
     receipts: Option<Vec<(i64, frankenterm_core::robot_types::SubmitReceipt)>>,
+    /// Active `ft mute` records; empty when unreadable, so a read failure
+    /// shows items rather than hiding them.
+    mutes: Vec<frankenterm_core::storage::EventMuteRecord>,
 }
 
 impl LiveAttentionAudit {
@@ -13191,7 +13198,26 @@ impl LiveAttentionAudit {
             denied: None,
             approval_required: None,
             receipts: None,
+            mutes: Vec::new(),
         }
+    }
+}
+
+/// An `ft mute` record as an attention-router mute: global scope stays
+/// global; anything else applies to this workspace, whose database holds it.
+fn attention_mute_from_record(
+    record: &frankenterm_core::storage::EventMuteRecord,
+) -> frankenterm_core::attention_router::AttentionRouterNotificationMute {
+    use frankenterm_core::attention_router::AttentionRouterNotificationMute;
+
+    let mute = if record.scope == "global" {
+        AttentionRouterNotificationMute::global(record.identity_key.clone())
+    } else {
+        AttentionRouterNotificationMute::workspace_current(record.identity_key.clone())
+    };
+    match record.reason.as_deref() {
+        Some(reason) => mute.with_reason(reason),
+        None => mute,
     }
 }
 
@@ -13209,6 +13235,7 @@ async fn read_live_attention_audit(db_path: &Path, now_ms: u64) -> LiveAttention
             denied: Some(Vec::new()),
             approval_required: Some(Vec::new()),
             receipts: Some(Vec::new()),
+            mutes: Vec::new(),
         };
     }
     let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
@@ -13259,6 +13286,10 @@ async fn read_live_attention_audit(db_path: &Path, now_ms: u64) -> LiveAttention
                 })
                 .collect::<Vec<_>>()
         });
+    let mutes = storage
+        .list_active_mutes_with_cx(&cx, i64::try_from(now_ms).unwrap_or(i64::MAX))
+        .await
+        .unwrap_or_default();
     if let Err(error) = storage.shutdown_with_cx(&cx).await {
         tracing::debug!(%error, "attention router audit read: storage shutdown failed");
     }
@@ -13266,6 +13297,7 @@ async fn read_live_attention_audit(db_path: &Path, now_ms: u64) -> LiveAttention
         denied,
         approval_required,
         receipts,
+        mutes,
     }
 }
 
@@ -137733,6 +137765,29 @@ printf x > "$MINISIGN_MARKER"
                 "operating envelope is healthy for this static fixture",
                 "operating_envelope.static_slice_allowed",
             ))
+    }
+
+    #[test]
+    fn cli_attention_maps_ft_mute_records_to_router_mutes() {
+        use frankenterm_core::attention_router::AttentionRouterMuteScope;
+        use frankenterm_core::storage::EventMuteRecord;
+
+        let record = |scope: &str, reason: Option<&str>| EventMuteRecord {
+            identity_key: "attention.verified_submit.drift.codex".to_string(),
+            scope: scope.to_string(),
+            created_at: 1,
+            expires_at: None,
+            created_by: None,
+            reason: reason.map(str::to_string),
+        };
+        let global = attention_mute_from_record(&record("global", Some("known drift")));
+        assert_eq!(global.identity_key, "attention.verified_submit.drift.codex");
+        assert_eq!(global.scope, AttentionRouterMuteScope::Global);
+        assert_eq!(global.reason.as_deref(), Some("known drift"));
+        let workspace = attention_mute_from_record(&record("workspace", None));
+        assert_eq!(workspace.scope, AttentionRouterMuteScope::Workspace);
+        assert_eq!(workspace.workspace, None, "applies to this workspace");
+        assert_eq!(workspace.reason, None);
     }
 
     #[test]

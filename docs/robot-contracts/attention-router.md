@@ -19,6 +19,10 @@ failed sends are excluded. An agent type with at least 8 such receipts, at
 least half of them stuck in the composer or unverifiable, raises a
 `submit_profile_drift` blocker: an agent CLI update has probably broken composer
 detection, so recheck its submit profile before trusting verified sends to it.
+Each live policy-gate and drift fact carries a stable mute key, printed in its
+summary (`[mute: ft mute add attention.<source>...]`). Live runs load active
+`ft mute` records from the same database, so a muted key's item is suppressed
+(and counted in the explanation) instead of resurfacing every run.
 Policy-gate and receipt facts never carry the action input, the policy's
 free-text reason, or idempotency keys, and a workspace without a database is
 not created. Every other source appears only through caller input and is

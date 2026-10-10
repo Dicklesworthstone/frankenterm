@@ -2780,18 +2780,24 @@ fn policy_gate_observation(
                 format!("pane {} and {more} more", listed.join(", "))
             }
         };
+        // A stable key lets an operator `ft mute add` an expected pattern.
+        let mute_key = format!(
+            "attention.{}.{actor}.{action_kind}.{rule}",
+            gate.source_kind().slug()
+        );
         observation = observation.with_fact(
             AttentionRouterSourceFact::new(
                 gate.fact_kind(),
                 format!(
-                    "{action_kind} by {actor} {} {count} time(s), rule {rule}, {panes}",
+                    "{action_kind} by {actor} {} {count} time(s), rule {rule}, {panes} [mute: ft mute add {mute_key}]",
                     gate.verb()
                 ),
             )
             .count(count)
             .with_agent_name(actor)
             .with_reason_code(gate.reason_code())
-            .with_reason_code(format!("policy_rule.{rule}")),
+            .with_reason_code(format!("policy_rule.{rule}"))
+            .with_notification_identity_key(mute_key),
         );
     }
     observation
@@ -2925,18 +2931,20 @@ pub fn verified_submit_observation_from_receipts(
             continue;
         }
         let profile = tally.profile.as_deref().unwrap_or("no submit profile");
+        let mute_key = format!("attention.verified_submit.drift.{agent}");
         observation = observation.with_fact(
             AttentionRouterSourceFact::new(
                 AttentionRouterSourceFactKind::SubmitProfileDrift,
                 format!(
-                    "{agent}: {unconfirmed} of {} verified sends unconfirmed ({} stuck in composer, {} unverifiable), {profile}",
+                    "{agent}: {unconfirmed} of {} verified sends unconfirmed ({} stuck in composer, {} unverifiable), {profile} [mute: ft mute add {mute_key}]",
                     tally.observed, tally.stuck_in_composer, tally.verification_unavailable
                 ),
             )
             .count(unconfirmed)
             .with_agent_name(agent.clone())
             .with_reason_code("verified_submit.profile_drift")
-            .with_reason_code(format!("agent_type.{agent}")),
+            .with_reason_code(format!("agent_type.{agent}"))
+            .with_notification_identity_key(mute_key),
         );
     }
     observation
@@ -3569,21 +3577,39 @@ mod tests {
                 .reason_codes
                 .contains(&"policy_rule.unspecified".to_string())
         );
+        let mute_key = "attention.policy_denied_audit.BlueLake.send_text.command_gate.destructive";
+        assert_eq!(blue.notification_identity_key.as_deref(), Some(mute_key));
+        assert!(blue.summary.contains(mute_key), "{}", blue.summary);
         let rendered = serde_json::to_string(&observation).expect("serialize");
         assert!(
             !rendered.contains("secret-canary"),
             "no action input, free-text reason, or decision context: {rendered}"
         );
         let snapshot = build_attention_router_snapshot(
-            &AttentionRouterSourceAdapterInput::new(now, "/repo").with_observation(observation),
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation.clone()),
         );
-        assert!(
+        let blockers = |snapshot: &AttentionRouterSnapshot| {
             snapshot
                 .items
                 .iter()
-                .any(|item| item.kind == AttentionRouterItemKind::Blocker),
-            "a live policy denial is a blocker"
+                .filter(|item| item.kind == AttentionRouterItemKind::Blocker)
+                .count()
+        };
+        assert_eq!(
+            blockers(&snapshot),
+            2,
+            "each live denial group is a blocker"
         );
+        // An operator mute on the printed key suppresses exactly that group.
+        let muted = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation)
+                .with_notification_mute(AttentionRouterNotificationMute::workspace_current(
+                    mute_key,
+                )),
+        );
+        assert_eq!(blockers(&muted), 1, "the muted group is suppressed");
 
         let required = [audit_row(
             4,
@@ -3700,21 +3726,37 @@ mod tests {
             "{}",
             fact.summary
         );
+        assert_eq!(
+            fact.notification_identity_key.as_deref(),
+            Some("attention.verified_submit.drift.codex")
+        );
         let rendered = serde_json::to_string(&observation).expect("serialize");
         assert!(!rendered.contains("secret-canary"), "{rendered}");
-        let snapshot = build_attention_router_snapshot(
-            &AttentionRouterSourceAdapterInput::new(now, "/repo").with_observation(observation),
-        );
-        assert!(
+        let drift_blocker = |snapshot: &AttentionRouterSnapshot| {
             snapshot.items.iter().any(|item| {
                 item.kind == AttentionRouterItemKind::Blocker
                     && item
                         .reason_codes
                         .iter()
                         .any(|code| code == "verified_submit.profile_drift")
-            }),
+            })
+        };
+        let snapshot = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation.clone()),
+        );
+        assert!(
+            drift_blocker(&snapshot),
             "submit-profile drift is a blocker"
         );
+        let muted = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation)
+                .with_notification_mute(AttentionRouterNotificationMute::global(
+                    "attention.verified_submit.drift.codex",
+                )),
+        );
+        assert!(!drift_blocker(&muted), "a muted drift key is suppressed");
 
         // Exactly half of eight samples drifts; seven samples never do.
         let at_threshold: Vec<_> = (0..8)
