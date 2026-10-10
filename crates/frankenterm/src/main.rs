@@ -48858,7 +48858,7 @@ async fn run_verified_submit_drift_monitor(
                         "verified sends to this agent type mostly stay unconfirmed; its submit profile has probably drifted"
                     );
                     if let Some(event_id) = outcome.inserted_event_id() {
-                        event_bus.publish(Event::PatternDetected {
+                        let _ = event_bus.publish(Event::PatternDetected {
                             pane_id,
                             pane_uuid: None,
                             detection,
@@ -50295,14 +50295,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 connect_addr,
                 agent_id,
             } => {
-                run_distributed_agent(
+                Box::pin(run_distributed_agent(
                     &layout,
                     &config,
                     resolved_config_path.as_deref(),
                     connect,
                     connect_addr,
                     agent_id,
-                )
+                ))
                 .await?;
             }
         },
