@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::patterns::{AgentType, SubmitProfile};
 use crate::policy::InjectionResult;
@@ -255,6 +256,76 @@ pub fn submit_guarantee_failure_message(receipt: &SubmitReceipt) -> Option<Strin
             receipt.state.as_str()
         )
     })
+}
+
+/// Fresh receipts built in this process, by agent type and state (W2.8).
+/// Agent types come from the built-in submit profiles, so the key set stays
+/// small; a receipt without one counts as `unknown`.
+static SUBMIT_RECEIPT_COUNTS: Mutex<BTreeMap<(String, &'static str), u64>> =
+    Mutex::new(BTreeMap::new());
+
+/// Distinct (agent type, state) keys kept before new agent types fold into
+/// `other`.
+const SUBMIT_RECEIPT_COUNT_MAX_KEYS: usize = 64;
+
+/// One process-wide verified-submit receipt counter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitReceiptCount {
+    pub agent_type: String,
+    pub state: &'static str,
+    pub count: u64,
+}
+
+/// Count a freshly built receipt and emit its structured tracing event.
+///
+/// Call once per send, after the final receipt is built; receipts replayed
+/// from the idempotency store are not new sends. The event carries ids,
+/// state, timing, and the guarantee outcome, never the sent text or the
+/// caller's idempotency key.
+pub fn record_submit_receipt(pane_id: u64, receipt: &SubmitReceipt) {
+    let agent_type = receipt.agent_type.as_deref().unwrap_or("unknown");
+    let state = receipt.state.as_str();
+    {
+        let mut counts = SUBMIT_RECEIPT_COUNTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut key = (agent_type.to_string(), state);
+        if counts.len() >= SUBMIT_RECEIPT_COUNT_MAX_KEYS && !counts.contains_key(&key) {
+            key.0 = "other".to_string();
+        }
+        let count = counts.entry(key).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+    tracing::info!(
+        target: "frankenterm::verified_submit",
+        pane_id,
+        agent_type,
+        profile_id = receipt.profile_id.as_deref().unwrap_or(""),
+        profile_version = receipt.profile_version.as_deref().unwrap_or(""),
+        state,
+        guarantee_level = receipt.guarantee_level.as_str(),
+        guarantee_met = receipt.guarantee_met,
+        elapsed_ms = receipt.elapsed_ms,
+        polls = receipt.polls,
+        attempts = receipt.attempts,
+        "verified submit receipt"
+    );
+}
+
+/// Snapshot of the process-wide receipt counters, ordered by agent type and
+/// state.
+#[must_use]
+pub fn submit_receipt_counts() -> Vec<SubmitReceiptCount> {
+    SUBMIT_RECEIPT_COUNTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .map(|((agent_type, state), count)| SubmitReceiptCount {
+            agent_type: agent_type.clone(),
+            state: *state,
+            count: *count,
+        })
+        .collect()
 }
 
 /// First capture delay after the send, re-capture interval, and poll budget
@@ -1256,5 +1327,49 @@ mod tests {
                 state.as_str()
             );
         }
+    }
+
+    #[test]
+    fn receipt_counters_count_fresh_receipts_by_agent_type_and_state() {
+        // A private agent type keeps receipts recorded by parallel tests out
+        // of these counts.
+        let agent_type = "w28-counter-probe";
+        let receipt = |state| SubmitReceipt {
+            state,
+            guarantee_level: SubmitGuaranteeLevel::Write,
+            guarantee_met: false,
+            agent_type: Some(agent_type.to_string()),
+            profile_id: Some("probe.default".to_string()),
+            profile_version: Some("1".to_string()),
+            attempts: 1,
+            evidence_rule_ids: Vec::new(),
+            elapsed_ms: 5,
+            polls: 1,
+            cursor_before: None,
+            cursor_after: None,
+            idempotency_key: "caller-nonce".to_string(),
+        };
+        for state in [
+            SubmitReceiptState::Submitted,
+            SubmitReceiptState::StuckInComposer,
+            SubmitReceiptState::StuckInComposer,
+            SubmitReceiptState::VerificationUnavailable,
+        ] {
+            record_submit_receipt(7, &receipt(state));
+        }
+
+        let probe: Vec<(&str, u64)> = submit_receipt_counts()
+            .into_iter()
+            .filter(|count| count.agent_type == agent_type)
+            .map(|count| (count.state, count.count))
+            .collect();
+        assert_eq!(
+            probe,
+            vec![
+                ("stuck_in_composer", 2),
+                ("submitted", 1),
+                ("verification_unavailable", 1),
+            ]
+        );
     }
 }

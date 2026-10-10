@@ -1267,7 +1267,12 @@ async fn handle_connection_impl(
     match (method, path) {
         ("GET", "/metrics") => {
             let snapshot = collector.collect().await;
-            let body = snapshot.render_prometheus(prefix);
+            let mut body = snapshot.render_prometheus(prefix);
+            render_verified_submit_receipts(
+                &mut body,
+                &sanitize_prefix(prefix),
+                &crate::verified_submit::submit_receipt_counts(),
+            );
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
                 body.len(),
@@ -1463,6 +1468,34 @@ fn push_cost_attribution_gauge<F>(
     for estimate in estimates {
         let labels = cost_attribution_labels(estimate);
         let _ = writeln!(output, "{name}{labels} {}", value(estimate));
+    }
+}
+
+/// Process-wide verified-submit receipt counters (W2.8). They live outside
+/// [`MetricsSnapshot`] because they are process state, not runtime state;
+/// the watcher counts the verified sends its workflows make.
+fn render_verified_submit_receipts(
+    output: &mut String,
+    prefix: &str,
+    counts: &[crate::verified_submit::SubmitReceiptCount],
+) {
+    use std::fmt::Write as _;
+
+    if counts.is_empty() {
+        return;
+    }
+    let name = metric_name(prefix, "verified_submit_receipts_total");
+    let _ = writeln!(
+        output,
+        "# HELP {name} Verified-submit receipts built in this process, by agent type and state"
+    );
+    let _ = writeln!(output, "# TYPE {name} counter");
+    for count in counts {
+        let labels = format_prometheus_labels(&[
+            ("agent_type", count.agent_type.as_str()),
+            ("state", count.state),
+        ]);
+        let _ = writeln!(output, "{name}{labels} {}", count.count);
     }
 }
 
@@ -1922,6 +1955,34 @@ mod pure_tests {
         // Special chars in prefix should be replaced with _.
         let rendered = snap.render_prometheus("my-app.v2");
         assert!(rendered.contains("my_app_v2_uptime_seconds"));
+    }
+
+    #[test]
+    fn verified_submit_receipts_render_as_one_labeled_counter() {
+        let mut rendered = String::new();
+        render_verified_submit_receipts(&mut rendered, "ft", &[]);
+        assert!(rendered.is_empty(), "no receipts, no metric family");
+
+        let counts = [
+            crate::verified_submit::SubmitReceiptCount {
+                agent_type: "codex".to_string(),
+                state: "stuck_in_composer",
+                count: 3,
+            },
+            crate::verified_submit::SubmitReceiptCount {
+                agent_type: "unknown".to_string(),
+                state: "submitted",
+                count: 1,
+            },
+        ];
+        render_verified_submit_receipts(&mut rendered, "ft", &counts);
+        assert_eq!(
+            rendered,
+            "# HELP ft_verified_submit_receipts_total Verified-submit receipts built in this process, by agent type and state\n\
+             # TYPE ft_verified_submit_receipts_total counter\n\
+             ft_verified_submit_receipts_total{agent_type=\"codex\",state=\"stuck_in_composer\"} 3\n\
+             ft_verified_submit_receipts_total{agent_type=\"unknown\",state=\"submitted\"} 1\n"
+        );
     }
 
     #[test]

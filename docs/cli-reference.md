@@ -468,7 +468,14 @@ selects `write`, `composer`, `submitted`, or `working`. The receipt records the
 submission state, requested guarantee level, `guarantee_met`, verification
 polls, elapsed time, evidence rule IDs, and idempotency key persisted as the
 audit `correlation_id`; replay it with
-`ft audit --correlation-id <idempotency_key>`.
+`ft audit --correlation-id <idempotency_key>`. In the long-running processes
+(MCP `wa.send`, workflow `send_verified` in the watcher) every freshly built
+receipt is also logged as a
+`frankenterm::verified_submit` tracing event with `pane_id`, `agent_type`,
+`profile_id`, `profile_version`, `state`, `guarantee_level`, `guarantee_met`,
+`elapsed_ms`, `polls`, and `attempts`, never the sent text or the idempotency
+key; `ft watch --metrics` counts the watcher's receipts as
+`verified_submit_receipts_total{agent_type,state}`.
 
 `ft robot health` includes an `active_agents` snapshot for operator
 convergence polling. The snapshot is bounded and evidence-linked; unavailable

@@ -4091,15 +4091,12 @@ GET /stream/deltas       (pane_id, max_hz)
 
 ### 4. Prometheus metrics (when enabled)
 
-The watcher exposes Prometheus metrics for:
-- Capture throughput (bytes/sec, lines/sec)
-- Pattern detection latency (per rule pack)
-- Storage write queue depth + flush latency
-- FTS5 + Tantivy query latency
-- Workflow execution count + latency (per workflow id)
-- Tx phase latency (prepare / commit / compensate)
-- Fleet memory pressure tier
-- Policy denial counts by category
+`ft watch --metrics` (built with the `metrics` feature) serves `/metrics` on localhost, every name under the configured `[metrics] prefix`:
+- Uptime, observed panes, capture queue depth and capacity, storage write queue depth
+- Segments persisted, events recorded, ingest lag (average, maximum, sum and count), age of the last DB write
+- Native output coalescing (input events and bytes, emitted batches and bytes, largest batch, coalesce ratio)
+- Event bus publish, drop, subscriber, lag and per-channel queue figures
+- `verified_submit_receipts_total{agent_type,state}`: verified-submit receipts built in the watcher process (workflow `send_verified`); the MCP server logs its `wa.send` receipts as `frankenterm::verified_submit` tracing events instead
 
 ### 5. `ft doctor --json` + diagnostic bundles
 

@@ -9962,6 +9962,7 @@ impl ToolHandler for WaSendTool {
                     // claim key and request fingerprint remain store-private.
                     receipt.idempotency_key = binding.caller_key().to_string();
                 }
+                crate::verified_submit::record_submit_receipt(params.pane_id, &receipt);
                 // The exact receipt is now fully constructed. Persist it
                 // before best-effort audit attachment or any unrelated await.
                 // Always attempt completion for Allowed, even when the prior
