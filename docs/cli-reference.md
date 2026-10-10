@@ -177,6 +177,8 @@ are already evictable, and the age of the oldest unresolved send. It never
 creates the store or changes a record, and prints no keys, panes, or receipts. A store at its ceiling is normal while eviction can reclaim
 it; the row warns when three quarters is pinned by unresolved or recent rows and
 errors when a new idempotency key would be refused with `capacity_exceeded`.
+In-doubt keys never resolve on their own: the row names MCP `wa.send` with
+`reconcile` (`settle` or `abandon`, see the MCP API spec) whenever any exist.
 
 ### Session persistence and forensic export
 

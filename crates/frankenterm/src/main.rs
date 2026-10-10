@@ -28173,11 +28173,16 @@ fn submit_idempotency_store_diagnostic_check(
         let age_secs = now_unix_ms.saturating_sub(oldest).max(0) / 1000;
         detail.push_str(&format!("; oldest unresolved {age_secs}s old"));
     }
+    // An in-doubt key never resolves on its own: replays are refused until
+    // an operator settles or abandons it.
+    if census.in_doubt > 0 {
+        detail.push_str("; settle or abandon in-doubt keys with MCP wa.send reconcile");
+    }
     if !census.admits_new_key() {
         return DiagnosticCheck::error(
             SUBMIT_IDEMPOTENCY_STORE_CHECK,
             detail,
-            "New sends with an idempotency key fail with capacity_exceeded: unresolved and recent rows fill the store. Investigate the injector errors behind in-doubt sends; completed receipts become evictable after 24 hours",
+            "New sends with an idempotency key fail with capacity_exceeded: unresolved and recent rows fill the store. Investigate the injector errors behind in-doubt sends, then settle or abandon each with MCP wa.send reconcile; completed receipts become evictable after 24 hours",
         );
     }
     let three_quarters_pinned = census.pinned_records().saturating_mul(4)
@@ -28188,7 +28193,7 @@ fn submit_idempotency_store_diagnostic_check(
         return DiagnosticCheck::warning(
             SUBMIT_IDEMPOTENCY_STORE_CHECK,
             detail,
-            "Three quarters of the store is pinned by unresolved or recent rows; investigate the injector errors behind in-doubt sends before new keys are refused",
+            "Three quarters of the store is pinned by unresolved or recent rows; investigate the injector errors behind in-doubt sends and settle or abandon each with MCP wa.send reconcile before new keys are refused",
         );
     }
     DiagnosticCheck::ok_with_detail(SUBMIT_IDEMPOTENCY_STORE_CHECK, detail)
@@ -144956,6 +144961,7 @@ A  docs/new-proof.md\n";
         assert!(detail.contains("in doubt 1"), "{detail}");
         assert!(detail.contains("80 evictable"), "{detail}");
         assert!(detail.contains("oldest unresolved 60s old"), "{detail}");
+        assert!(detail.contains("wa.send reconcile"), "{detail}");
 
         let three_quarters_in_doubt = SubmitIdempotencyCensus {
             in_doubt: 75,
@@ -144974,12 +144980,9 @@ A  docs/new-proof.md\n";
         };
         let refused = submit_idempotency_store_diagnostic_check(Ok(Some(records_pinned)), 0);
         assert_eq!(refused.status, DiagnosticStatus::Error);
-        assert!(
-            refused
-                .recommendation
-                .as_deref()
-                .is_some_and(|text| text.contains("capacity_exceeded"))
-        );
+        assert!(refused.recommendation.as_deref().is_some_and(|text| {
+            text.contains("capacity_exceeded") && text.contains("wa.send reconcile")
+        }));
 
         let bytes_pinned = SubmitIdempotencyCensus {
             in_doubt: 10,
