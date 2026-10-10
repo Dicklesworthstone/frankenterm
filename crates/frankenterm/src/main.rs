@@ -124452,7 +124452,10 @@ printf x > "$MINISIGN_MARKER"
                 format!("#!/usr/bin/env bash\nprintf '{listing}'\n"),
             )
             .expect("write fake ps");
-            std::fs::set_permissions(fake_bin.join("ps"), std::fs::Permissions::from_mode(0o555))
+            // Owner-writable: each census call rewrites the same fake ps, and
+            // a read-only 0o555 file refused the second write for any
+            // non-root user.
+            std::fs::set_permissions(fake_bin.join("ps"), std::fs::Permissions::from_mode(0o755))
                 .expect("make fake ps executable");
             let script = format!(
                 "set -euo pipefail\nexport FT_INSTALL_TEST_LIBRARY_ONLY=1\nexport FT_INSTALL_TEST_ENABLE_RESOURCE_OVERRIDES=1\nexport FT_INSTALL_TEST_FORCE_PS_CENSUS=1\nsource {}\nunset FT_INSTALL_TEST_MUX_OWNERSHIP_STATE\nSYSTEM_INSTALL=0\nDEST={}\ninstaller_mux_ownership_state\n",
