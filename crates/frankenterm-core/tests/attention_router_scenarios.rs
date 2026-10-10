@@ -307,6 +307,9 @@ fn fact_kind_for_action(action: AttentionRouterSafeAction) -> AttentionRouterSou
         | AttentionRouterSafeAction::ReplyToThreadWithBoundedContext => {
             AttentionRouterSourceFactKind::Manual
         }
+        AttentionRouterSafeAction::RecheckSubmitProfileBeforeTrustingVerifiedSends => {
+            AttentionRouterSourceFactKind::SubmitProfileDrift
+        }
     }
 }
 

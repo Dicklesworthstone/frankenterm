@@ -12,10 +12,17 @@ robot attention` add live, read-only sources: the watcher's operating envelope
 (IPC health) and the policy gate from the local audit log, meaning actions
 denied (`policy_denied_audit`) or held for approval (`approval_store`) in the
 last 24 hours, newest 64 per decision, grouped by actor, action kind, and rule.
-Policy-gate facts never carry the action input or the policy's free-text
-reason, and a workspace without a database is not created. Every other source
-appears only through caller input and is otherwise reported missing. Nothing
-mutates project state.
+They also add `verified_submit`, built from the SubmitReceipts that verified
+sends attach to their audit rows (newest 1000 in 24 hours). Receipts are grouped
+by agent type over the outcomes the agent's UI decides, so policy outcomes and
+failed sends are excluded. An agent type with at least 8 such receipts, at
+least half of them stuck in the composer or unverifiable, raises a
+`submit_profile_drift` blocker: an agent CLI update has probably broken composer
+detection, so recheck its submit profile before trusting verified sends to it.
+Policy-gate and receipt facts never carry the action input, the policy's
+free-text reason, or idempotency keys, and a workspace without a database is
+not created. Every other source appears only through caller input and is
+otherwise reported missing. Nothing mutates project state.
 
 Operator runbook: `docs/operator-runbook.md` section 2C.
 

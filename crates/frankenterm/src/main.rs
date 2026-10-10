@@ -13130,9 +13130,9 @@ async fn build_cli_attention_router_payload(
 ) -> anyhow::Result<AttentionRouterSurfacePayload> {
     let mut input = load_attention_router_input(workspace_root, input_path, generated_at_ms)?;
     // A recorded --input is replayed exactly; a live run adds real sources:
-    // the watcher's operating envelope (per-governor advisories) and the
-    // policy gate (recent denied and approval-required actions) from the
-    // local audit log.
+    // the watcher's operating envelope (per-governor advisories) and, from the
+    // local audit log, the policy gate (recent denied and approval-required
+    // actions) and verified-send receipts (submit-profile drift).
     if input_path.is_none() {
         let layout = config.workspace_layout(Some(workspace_root)).ok();
         let snapshot = match layout.as_ref() {
@@ -13146,19 +13146,25 @@ async fn build_cli_attention_router_payload(
                 SPAWN_ADMISSION_MAX_AGE_MS,
             ),
         );
-        let (denied, approval_required) = match layout.as_ref() {
-            Some(layout) => read_policy_gate_audit(&layout.db_path, input.generated_at_ms).await,
-            None => (None, None),
+        let audit = match layout.as_ref() {
+            Some(layout) => read_live_attention_audit(&layout.db_path, input.generated_at_ms).await,
+            None => LiveAttentionAudit::unreadable(),
         };
         input.observations.push(
             frankenterm_core::attention_router::policy_denied_observation_from_audit(
-                denied.as_deref(),
+                audit.denied.as_deref(),
                 input.generated_at_ms,
             ),
         );
         input.observations.push(
             frankenterm_core::attention_router::approval_required_observation_from_audit(
-                approval_required.as_deref(),
+                audit.approval_required.as_deref(),
+                input.generated_at_ms,
+            ),
+        );
+        input.observations.push(
+            frankenterm_core::attention_router::verified_submit_observation_from_receipts(
+                audit.receipts.as_deref(),
                 input.generated_at_ms,
             ),
         );
@@ -13171,49 +13177,96 @@ async fn build_cli_attention_router_payload(
     ))
 }
 
-type PolicyGateAuditRows = Option<Vec<frankenterm_core::storage::AuditActionRecord>>;
+/// Live audit-log inputs for the attention router. `None` marks a read
+/// failure for that input.
+struct LiveAttentionAudit {
+    denied: Option<Vec<frankenterm_core::storage::AuditActionRecord>>,
+    approval_required: Option<Vec<frankenterm_core::storage::AuditActionRecord>>,
+    receipts: Option<Vec<(i64, frankenterm_core::robot_types::SubmitReceipt)>>,
+}
 
-/// Recent denied and approval-required audit rows for the live attention
-/// router, bounded by the attention router's window and row cap. A workspace
-/// without a database has no audit history (empty, not unreadable), and no
-/// database is created here; `None` marks a read failure.
-async fn read_policy_gate_audit(
-    db_path: &Path,
-    now_ms: u64,
-) -> (PolicyGateAuditRows, PolicyGateAuditRows) {
+impl LiveAttentionAudit {
+    const fn unreadable() -> Self {
+        Self {
+            denied: None,
+            approval_required: None,
+            receipts: None,
+        }
+    }
+}
+
+/// Recent denied and approval-required audit rows and verified-send receipts
+/// for the live attention router, within the attention router's window and
+/// row caps. A workspace without a database has no audit history (empty, not
+/// unreadable), and no database is created here.
+async fn read_live_attention_audit(db_path: &Path, now_ms: u64) -> LiveAttentionAudit {
     use frankenterm_core::attention_router::{
-        POLICY_GATE_AUDIT_MAX_ROWS, POLICY_GATE_AUDIT_WINDOW_MS,
+        POLICY_GATE_AUDIT_MAX_ROWS, POLICY_GATE_AUDIT_WINDOW_MS, VERIFIED_SUBMIT_AUDIT_MAX_ROWS,
     };
 
     if !db_path.exists() {
-        return (Some(Vec::new()), Some(Vec::new()));
+        return LiveAttentionAudit {
+            denied: Some(Vec::new()),
+            approval_required: Some(Vec::new()),
+            receipts: Some(Vec::new()),
+        };
     }
     let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     let Ok(storage) =
         frankenterm_core::storage::StorageHandle::new_with_cx(&cx, &db_path.to_string_lossy())
             .await
     else {
-        return (None, None);
+        return LiveAttentionAudit::unreadable();
     };
     let since = i64::try_from(now_ms.saturating_sub(POLICY_GATE_AUDIT_WINDOW_MS)).ok();
-    let query = |decision: &str| frankenterm_core::storage::AuditQuery {
+    let decided = |decision: &str| frankenterm_core::storage::AuditQuery {
         limit: Some(POLICY_GATE_AUDIT_MAX_ROWS),
         policy_decision: Some(decision.to_string()),
         since,
         ..Default::default()
     };
     let denied = storage
-        .get_audit_actions_with_cx(&cx, query("deny"))
+        .get_audit_actions_with_cx(&cx, decided("deny"))
         .await
         .ok();
     let approval_required = storage
-        .get_audit_actions_with_cx(&cx, query("require_approval"))
+        .get_audit_actions_with_cx(&cx, decided("require_approval"))
         .await
         .ok();
+    // Verified sends attach their SubmitReceipt to the allowed send_text
+    // audit row; rows without one, or with another summary, are skipped.
+    let receipts = storage
+        .get_audit_actions_with_cx(
+            &cx,
+            frankenterm_core::storage::AuditQuery {
+                limit: Some(VERIFIED_SUBMIT_AUDIT_MAX_ROWS),
+                action_kind: Some("send_text".to_string()),
+                policy_decision: Some("allow".to_string()),
+                since,
+                ..Default::default()
+            },
+        )
+        .await
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    let receipt = serde_json::from_str::<
+                        frankenterm_core::robot_types::SubmitReceipt,
+                    >(row.verification_summary.as_deref()?)
+                    .ok()?;
+                    Some((row.ts, receipt))
+                })
+                .collect::<Vec<_>>()
+        });
     if let Err(error) = storage.shutdown_with_cx(&cx).await {
         tracing::debug!(%error, "attention router audit read: storage shutdown failed");
     }
-    (denied, approval_required)
+    LiveAttentionAudit {
+        denied,
+        approval_required,
+        receipts,
+    }
 }
 
 fn attention_router_value_label<T: serde::Serialize>(value: &T) -> String {

@@ -52,6 +52,7 @@ pub enum AttentionRouterSourceKind {
     IncidentBundles,
     Manual,
     Fixture,
+    VerifiedSubmit,
 }
 
 impl AttentionRouterSourceKind {
@@ -73,6 +74,7 @@ impl AttentionRouterSourceKind {
             Self::IncidentBundles => "incident_bundles",
             Self::Manual => "manual",
             Self::Fixture => "fixture",
+            Self::VerifiedSubmit => "verified_submit",
         }
     }
 }
@@ -163,6 +165,7 @@ pub enum AttentionRouterSourceFactKind {
     SourceUnavailable,
     SourceNotConfigured,
     Manual,
+    SubmitProfileDrift,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -548,6 +551,7 @@ pub enum AttentionRouterSafeAction {
     TriageUnhandledEventBeforeClaimingMoreWork,
     WaitForConnectorRecoveryOrUseReadOnlyFallback,
     InvestigateIncidentBundleBeforeContinuing,
+    RecheckSubmitProfileBeforeTrustingVerifiedSends,
 }
 
 impl AttentionRouterSafeAction {
@@ -624,6 +628,9 @@ impl AttentionRouterSafeAction {
             }
             Self::InvestigateIncidentBundleBeforeContinuing => {
                 "Investigate the incident bundle evidence before continuing mutable work."
+            }
+            Self::RecheckSubmitProfileBeforeTrustingVerifiedSends => {
+                "Recheck the agent type's submit profile against its current CLI before trusting verified sends to it."
             }
         }
     }
@@ -1271,6 +1278,22 @@ fn rule_from_fact(
                 "replay_denied_action",
                 "bypass_policy_gate",
                 "forge_approval_token",
+            ],
+        ));
+    }
+
+    if fact.fact == AttentionRouterSourceFactKind::SubmitProfileDrift
+        || contains_reason(reason_codes, &["verified_submit.profile_drift"])
+    {
+        return Some(rule(
+            AttentionRouterClassification::BlockedInfra,
+            AttentionRouterItemKind::Blocker,
+            AttentionRouterSafeAction::RecheckSubmitProfileBeforeTrustingVerifiedSends,
+            AttentionRouterConfidence::Medium,
+            &[
+                "treat_unconfirmed_send_as_delivered",
+                "auto_resend_unconfirmed_prompt",
+                "disable_verified_submit_globally",
             ],
         ));
     }
@@ -2774,6 +2797,151 @@ fn policy_gate_observation(
     observation
 }
 
+/// Newest verified-send receipts a live verified-submit source reads.
+pub const VERIFIED_SUBMIT_AUDIT_MAX_ROWS: usize = 1_000;
+
+/// One agent type's UI-observable verified-send outcomes.
+#[derive(Default)]
+struct VerifiedSubmitTally {
+    observed: u64,
+    stuck_in_composer: u64,
+    verification_unavailable: u64,
+    profile: Option<String>,
+}
+/// Fewest UI-observable receipts for one agent type before its unconfirmed
+/// share can count as drift.
+pub const VERIFIED_SUBMIT_DRIFT_MIN_SAMPLES: u64 = 8;
+/// Share of UI-observable receipts left unconfirmed (stuck in the composer or
+/// unverifiable) at or above which an agent type's submit profile is drifting.
+pub const VERIFIED_SUBMIT_DRIFT_PERCENT: u64 = 50;
+
+/// Live `verified_submit` source from recent verified-send receipts
+/// (W2.8, ft-7h5da.3.9), each paired with its audit timestamp in epoch ms.
+/// Receipts are grouped by agent type over the outcomes the agent's UI
+/// decides: submitted, queued behind an operation, stuck in the composer,
+/// unverifiable, or crashed to a shell. Policy outcomes and failed sends say
+/// nothing about the UI and are left out. An agent type with at least
+/// [`VERIFIED_SUBMIT_DRIFT_MIN_SAMPLES`] such receipts, of which at least
+/// [`VERIFIED_SUBMIT_DRIFT_PERCENT`] percent stayed unconfirmed, raises a
+/// `submit_profile_drift` fact: an agent CLI update has probably broken
+/// composer detection, so verified sends to it can no longer be trusted.
+/// `None` means the receipts could not be read.
+#[must_use]
+pub fn verified_submit_observation_from_receipts(
+    receipts: Option<&[(i64, crate::robot_types::SubmitReceipt)]>,
+    now_ms: u64,
+) -> AttentionRouterSourceObservation {
+    use crate::robot_types::SubmitReceiptState;
+
+    const SOURCE_ID: &str = "verified_submit.recent_receipts";
+    const API: &str = "storage.audit_actions.verification_summary";
+    let Some(receipts) = receipts else {
+        return AttentionRouterSourceObservation::new(
+            SOURCE_ID,
+            AttentionRouterSourceKind::VerifiedSubmit,
+            AttentionRouterSourceHealth::Unavailable,
+            API,
+            "verified-send receipts could not be read",
+        )
+        .live(now_ms, 0)
+        .with_fact(
+            AttentionRouterSourceFact::new(
+                AttentionRouterSourceFactKind::SourceUnavailable,
+                "the local audit log is unavailable",
+            )
+            .with_reason_code("verified_submit.audit_unavailable"),
+        );
+    };
+    let mut tallies: std::collections::BTreeMap<String, VerifiedSubmitTally> =
+        std::collections::BTreeMap::new();
+    // Receipts arrive newest first, so the first profile seen is the latest.
+    for (_, receipt) in receipts {
+        let observable = matches!(
+            receipt.state,
+            SubmitReceiptState::Submitted
+                | SubmitReceiptState::QueuedBehindOperation
+                | SubmitReceiptState::StuckInComposer
+                | SubmitReceiptState::VerificationUnavailable
+                | SubmitReceiptState::PaneCrashedToShell
+        );
+        if !observable {
+            continue;
+        }
+        let agent = receipt
+            .agent_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|agent| !agent.is_empty())
+            .unwrap_or("unknown")
+            .to_string();
+        let tally = tallies.entry(agent).or_default();
+        tally.observed = tally.observed.saturating_add(1);
+        match receipt.state {
+            SubmitReceiptState::StuckInComposer => {
+                tally.stuck_in_composer = tally.stuck_in_composer.saturating_add(1);
+            }
+            SubmitReceiptState::VerificationUnavailable => {
+                tally.verification_unavailable = tally.verification_unavailable.saturating_add(1);
+            }
+            _ => {}
+        }
+        if tally.profile.is_none() {
+            tally.profile = receipt.profile_id.as_ref().map(|profile_id| {
+                match receipt.profile_version.as_deref() {
+                    Some(version) => format!("{profile_id} v{version}"),
+                    None => profile_id.clone(),
+                }
+            });
+        }
+    }
+    let freshness_ms = receipts
+        .iter()
+        .map(|(ts, _)| *ts)
+        .max()
+        .map_or(0, |newest| {
+            now_ms.saturating_sub(u64::try_from(newest).unwrap_or(0))
+        });
+    let mut observation = AttentionRouterSourceObservation::new(
+        SOURCE_ID,
+        AttentionRouterSourceKind::VerifiedSubmit,
+        AttentionRouterSourceHealth::Available,
+        API,
+        format!(
+            "{} verified-send receipts from {} agent types in the last 24 hours",
+            receipts.len(),
+            tallies.len()
+        ),
+    )
+    .live(now_ms, freshness_ms)
+    .items_seen(u64::try_from(receipts.len()).unwrap_or(u64::MAX));
+    for (agent, tally) in tallies {
+        let unconfirmed = tally
+            .stuck_in_composer
+            .saturating_add(tally.verification_unavailable);
+        let drifting = tally.observed >= VERIFIED_SUBMIT_DRIFT_MIN_SAMPLES
+            && unconfirmed.saturating_mul(100)
+                >= tally.observed.saturating_mul(VERIFIED_SUBMIT_DRIFT_PERCENT);
+        if !drifting {
+            continue;
+        }
+        let profile = tally.profile.as_deref().unwrap_or("no submit profile");
+        observation = observation.with_fact(
+            AttentionRouterSourceFact::new(
+                AttentionRouterSourceFactKind::SubmitProfileDrift,
+                format!(
+                    "{agent}: {unconfirmed} of {} verified sends unconfirmed ({} stuck in composer, {} unverifiable), {profile}",
+                    tally.observed, tally.stuck_in_composer, tally.verification_unavailable
+                ),
+            )
+            .count(unconfirmed)
+            .with_agent_name(agent.clone())
+            .with_reason_code("verified_submit.profile_drift")
+            .with_reason_code(format!("agent_type.{agent}")),
+        );
+    }
+    observation
+}
+
 fn missing_source_observation(
     source_kind: AttentionRouterSourceKind,
     generated_at_ms: u64,
@@ -3450,6 +3618,135 @@ mod tests {
             unreadable.facts[0].fact,
             AttentionRouterSourceFactKind::SourceUnavailable
         );
+    }
+
+    fn submit_receipt(
+        agent: &str,
+        state: crate::robot_types::SubmitReceiptState,
+    ) -> crate::robot_types::SubmitReceipt {
+        crate::robot_types::SubmitReceipt {
+            state,
+            guarantee_level: crate::robot_types::SubmitGuaranteeLevel::Submitted,
+            guarantee_met: false,
+            agent_type: Some(agent.to_string()),
+            profile_id: Some(format!("{agent}.default")),
+            profile_version: Some("3".to_string()),
+            attempts: 1,
+            evidence_rule_ids: Vec::new(),
+            elapsed_ms: 10,
+            polls: 1,
+            cursor_before: None,
+            cursor_after: None,
+            idempotency_key: "secret-canary-key".to_string(),
+        }
+    }
+
+    #[test]
+    fn live_verified_submit_source_flags_agent_types_whose_sends_stay_unconfirmed() {
+        use crate::robot_types::SubmitReceiptState as State;
+
+        let now: u64 = 1_800_000_000_000;
+        let ts = i64::try_from(now).expect("epoch ms") - 2_000;
+        let mut receipts = Vec::new();
+        // codex: 5 of 8 UI-observable sends unconfirmed.
+        for state in [
+            State::StuckInComposer,
+            State::StuckInComposer,
+            State::VerificationUnavailable,
+            State::VerificationUnavailable,
+            State::VerificationUnavailable,
+            State::Submitted,
+            State::Submitted,
+            State::QueuedBehindOperation,
+        ] {
+            receipts.push((ts, submit_receipt("codex", state)));
+        }
+        // Policy and transport outcomes are not evidence about the UI.
+        for state in [
+            State::PolicyDenied,
+            State::RequiresApproval,
+            State::SendFailed,
+        ] {
+            receipts.push((ts, submit_receipt("codex", state)));
+        }
+        // claude_code: 3 of 7 unconfirmed, below the sample floor anyway.
+        for state in [
+            State::StuckInComposer,
+            State::StuckInComposer,
+            State::StuckInComposer,
+            State::Submitted,
+            State::Submitted,
+            State::Submitted,
+            State::Submitted,
+        ] {
+            receipts.push((ts, submit_receipt("claude_code", state)));
+        }
+        let observation = verified_submit_observation_from_receipts(Some(&receipts), now);
+        assert_eq!(
+            observation.source_kind,
+            AttentionRouterSourceKind::VerifiedSubmit
+        );
+        assert_eq!(observation.health, AttentionRouterSourceHealth::Available);
+        assert_eq!(observation.items_seen, Some(18));
+        assert_eq!(observation.freshness_ms, Some(2_000));
+        assert_eq!(observation.facts.len(), 1, "only codex drifts");
+        let fact = &observation.facts[0];
+        assert_eq!(fact.fact, AttentionRouterSourceFactKind::SubmitProfileDrift);
+        assert_eq!(fact.count, Some(5));
+        assert_eq!(fact.agent_names, ["codex"]);
+        assert!(fact.summary.contains("5 of 8"), "{}", fact.summary);
+        assert!(
+            fact.summary.contains("codex.default v3"),
+            "{}",
+            fact.summary
+        );
+        let rendered = serde_json::to_string(&observation).expect("serialize");
+        assert!(!rendered.contains("secret-canary"), "{rendered}");
+        let snapshot = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo").with_observation(observation),
+        );
+        assert!(
+            snapshot.items.iter().any(|item| {
+                item.kind == AttentionRouterItemKind::Blocker
+                    && item
+                        .reason_codes
+                        .iter()
+                        .any(|code| code == "verified_submit.profile_drift")
+            }),
+            "submit-profile drift is a blocker"
+        );
+
+        // Exactly half of eight samples drifts; seven samples never do.
+        let at_threshold: Vec<_> = (0..8)
+            .map(|index| {
+                let state = if index < 4 {
+                    State::VerificationUnavailable
+                } else {
+                    State::Submitted
+                };
+                (ts, submit_receipt("gemini", state))
+            })
+            .collect();
+        assert_eq!(
+            verified_submit_observation_from_receipts(Some(&at_threshold), now)
+                .facts
+                .len(),
+            1
+        );
+        let below_floor: Vec<_> = (0..7)
+            .map(|_| (ts, submit_receipt("gemini", State::VerificationUnavailable)))
+            .collect();
+        assert!(
+            verified_submit_observation_from_receipts(Some(&below_floor), now)
+                .facts
+                .is_empty()
+        );
+
+        let quiet = verified_submit_observation_from_receipts(Some(&[]), now);
+        assert_eq!(quiet.health, AttentionRouterSourceHealth::Available);
+        assert!(quiet.facts.is_empty());
+        let unreadable = verified_submit_observation_from_receipts(None, now);
+        assert_eq!(unreadable.health, AttentionRouterSourceHealth::Unavailable);
     }
 
     fn source(
