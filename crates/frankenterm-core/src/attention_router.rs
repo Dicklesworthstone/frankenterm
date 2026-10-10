@@ -2832,20 +2832,144 @@ fn policy_gate_observation(
 /// Newest verified-send receipts a live verified-submit source reads.
 pub const VERIFIED_SUBMIT_AUDIT_MAX_ROWS: usize = 1_000;
 
-/// One agent type's UI-observable verified-send outcomes.
-#[derive(Default)]
-struct VerifiedSubmitTally {
-    observed: u64,
-    stuck_in_composer: u64,
-    verification_unavailable: u64,
-    profile: Option<String>,
-}
 /// Fewest UI-observable receipts for one agent type before its unconfirmed
 /// share can count as drift.
 pub const VERIFIED_SUBMIT_DRIFT_MIN_SAMPLES: u64 = 8;
 /// Share of UI-observable receipts left unconfirmed (stuck in the composer or
 /// unverifiable) at or above which an agent type's submit profile is drifting.
 pub const VERIFIED_SUBMIT_DRIFT_PERCENT: u64 = 50;
+/// Rule id of the event the watcher records when an agent type starts
+/// drifting.
+pub const VERIFIED_SUBMIT_DRIFT_RULE_ID: &str = "core.verified_submit:profile_drift";
+
+/// One agent type's verified-send outcomes that its UI decides: submitted,
+/// queued behind an operation, stuck in the composer, unverifiable, or
+/// crashed to a shell. Policy outcomes and failed sends say nothing about the
+/// UI and are not counted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VerifiedSubmitAgentTally {
+    pub agent_type: String,
+    pub observed: u64,
+    pub stuck_in_composer: u64,
+    pub verification_unavailable: u64,
+    /// Latest submit profile seen, as `id vVERSION`.
+    pub profile: Option<String>,
+}
+
+impl VerifiedSubmitAgentTally {
+    /// Receipts stuck in the composer or unverifiable.
+    #[must_use]
+    pub const fn unconfirmed(&self) -> u64 {
+        self.stuck_in_composer
+            .saturating_add(self.verification_unavailable)
+    }
+
+    /// At least [`VERIFIED_SUBMIT_DRIFT_MIN_SAMPLES`] receipts, of which at
+    /// least [`VERIFIED_SUBMIT_DRIFT_PERCENT`] percent stayed unconfirmed: an
+    /// agent CLI update has probably broken composer detection.
+    #[must_use]
+    pub const fn is_drifting(&self) -> bool {
+        self.observed >= VERIFIED_SUBMIT_DRIFT_MIN_SAMPLES
+            && self.unconfirmed().saturating_mul(100)
+                >= self.observed.saturating_mul(VERIFIED_SUBMIT_DRIFT_PERCENT)
+    }
+
+    /// The detection the watcher records and publishes when this agent type
+    /// starts drifting. It carries counts, the agent type and the latest
+    /// profile, never sent text or idempotency keys.
+    #[must_use]
+    pub fn drift_detection(&self) -> crate::patterns::Detection {
+        use crate::patterns::{AgentType, Detection, Severity};
+
+        let agent_type = match self.agent_type.as_str() {
+            "codex" => AgentType::Codex,
+            "claude_code" => AgentType::ClaudeCode,
+            "gemini" => AgentType::Gemini,
+            _ => AgentType::Unknown,
+        };
+        Detection {
+            rule_id: VERIFIED_SUBMIT_DRIFT_RULE_ID.to_string(),
+            agent_type,
+            event_type: "submit_profile.drift".to_string(),
+            severity: Severity::Warning,
+            confidence: 1.0,
+            extracted: serde_json::json!({
+                "agent_type": self.agent_type,
+                "observed": self.observed,
+                "unconfirmed": self.unconfirmed(),
+                "stuck_in_composer": self.stuck_in_composer,
+                "verification_unavailable": self.verification_unavailable,
+                "profile": self.profile,
+            }),
+            matched_text: String::new(),
+            span: (0, 0),
+        }
+    }
+}
+
+/// The agent type a receipt is tallied under: its trimmed agent type, or
+/// `unknown` when it has none.
+#[must_use]
+pub fn verified_submit_receipt_agent(receipt: &crate::robot_types::SubmitReceipt) -> &str {
+    receipt
+        .agent_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|agent| !agent.is_empty())
+        .unwrap_or("unknown")
+}
+
+/// Tally verified-send receipts, newest first, per agent type (ordered by
+/// agent type). A receipt without an agent type counts as `unknown`.
+#[must_use]
+pub fn verified_submit_agent_tallies<'a>(
+    receipts: impl IntoIterator<Item = &'a crate::robot_types::SubmitReceipt>,
+) -> Vec<VerifiedSubmitAgentTally> {
+    use crate::robot_types::SubmitReceiptState;
+
+    let mut tallies: std::collections::BTreeMap<String, VerifiedSubmitAgentTally> =
+        std::collections::BTreeMap::new();
+    for receipt in receipts {
+        let observable = matches!(
+            receipt.state,
+            SubmitReceiptState::Submitted
+                | SubmitReceiptState::QueuedBehindOperation
+                | SubmitReceiptState::StuckInComposer
+                | SubmitReceiptState::VerificationUnavailable
+                | SubmitReceiptState::PaneCrashedToShell
+        );
+        if !observable {
+            continue;
+        }
+        let agent = verified_submit_receipt_agent(receipt);
+        let tally = tallies
+            .entry(agent.to_string())
+            .or_insert_with(|| VerifiedSubmitAgentTally {
+                agent_type: agent.to_string(),
+                ..VerifiedSubmitAgentTally::default()
+            });
+        tally.observed = tally.observed.saturating_add(1);
+        match receipt.state {
+            SubmitReceiptState::StuckInComposer => {
+                tally.stuck_in_composer = tally.stuck_in_composer.saturating_add(1);
+            }
+            SubmitReceiptState::VerificationUnavailable => {
+                tally.verification_unavailable = tally.verification_unavailable.saturating_add(1);
+            }
+            _ => {}
+        }
+        // Newest first, so the first profile seen is the latest.
+        if tally.profile.is_none() {
+            tally.profile = receipt.profile_id.as_ref().map(|profile_id| {
+                match receipt.profile_version.as_deref() {
+                    Some(version) => format!("{profile_id} v{version}"),
+                    None => profile_id.clone(),
+                }
+            });
+        }
+    }
+    tallies.into_values().collect()
+}
 
 /// Live `verified_submit` source from recent verified-send receipts
 /// (W2.8, ft-7h5da.3.9), each paired with its audit timestamp in epoch ms.
@@ -2863,8 +2987,6 @@ pub fn verified_submit_observation_from_receipts(
     receipts: Option<&[(i64, crate::robot_types::SubmitReceipt)]>,
     now_ms: u64,
 ) -> AttentionRouterSourceObservation {
-    use crate::robot_types::SubmitReceiptState;
-
     const SOURCE_ID: &str = "verified_submit.recent_receipts";
     const API: &str = "storage.audit_actions.verification_summary";
     let Some(receipts) = receipts else {
@@ -2884,48 +3006,7 @@ pub fn verified_submit_observation_from_receipts(
             .with_reason_code("verified_submit.audit_unavailable"),
         );
     };
-    let mut tallies: std::collections::BTreeMap<String, VerifiedSubmitTally> =
-        std::collections::BTreeMap::new();
-    // Receipts arrive newest first, so the first profile seen is the latest.
-    for (_, receipt) in receipts {
-        let observable = matches!(
-            receipt.state,
-            SubmitReceiptState::Submitted
-                | SubmitReceiptState::QueuedBehindOperation
-                | SubmitReceiptState::StuckInComposer
-                | SubmitReceiptState::VerificationUnavailable
-                | SubmitReceiptState::PaneCrashedToShell
-        );
-        if !observable {
-            continue;
-        }
-        let agent = receipt
-            .agent_type
-            .as_deref()
-            .map(str::trim)
-            .filter(|agent| !agent.is_empty())
-            .unwrap_or("unknown")
-            .to_string();
-        let tally = tallies.entry(agent).or_default();
-        tally.observed = tally.observed.saturating_add(1);
-        match receipt.state {
-            SubmitReceiptState::StuckInComposer => {
-                tally.stuck_in_composer = tally.stuck_in_composer.saturating_add(1);
-            }
-            SubmitReceiptState::VerificationUnavailable => {
-                tally.verification_unavailable = tally.verification_unavailable.saturating_add(1);
-            }
-            _ => {}
-        }
-        if tally.profile.is_none() {
-            tally.profile = receipt.profile_id.as_ref().map(|profile_id| {
-                match receipt.profile_version.as_deref() {
-                    Some(version) => format!("{profile_id} v{version}"),
-                    None => profile_id.clone(),
-                }
-            });
-        }
-    }
+    let tallies = verified_submit_agent_tallies(receipts.iter().map(|(_, receipt)| receipt));
     let freshness_ms = receipts
         .iter()
         .map(|(ts, _)| *ts)
@@ -2946,16 +3027,12 @@ pub fn verified_submit_observation_from_receipts(
     )
     .live(now_ms, freshness_ms)
     .items_seen(u64::try_from(receipts.len()).unwrap_or(u64::MAX));
-    for (agent, tally) in tallies {
-        let unconfirmed = tally
-            .stuck_in_composer
-            .saturating_add(tally.verification_unavailable);
-        let drifting = tally.observed >= VERIFIED_SUBMIT_DRIFT_MIN_SAMPLES
-            && unconfirmed.saturating_mul(100)
-                >= tally.observed.saturating_mul(VERIFIED_SUBMIT_DRIFT_PERCENT);
-        if !drifting {
+    for tally in tallies {
+        if !tally.is_drifting() {
             continue;
         }
+        let agent = tally.agent_type.as_str();
+        let unconfirmed = tally.unconfirmed();
         let profile = tally.profile.as_deref().unwrap_or("no submit profile");
         let mute_key = format!("attention.verified_submit.drift.{agent}");
         observation = observation.with_fact(
@@ -2967,7 +3044,7 @@ pub fn verified_submit_observation_from_receipts(
                 ),
             )
             .count(unconfirmed)
-            .with_agent_name(agent.clone())
+            .with_agent_name(agent)
             .with_reason_code("verified_submit.profile_drift")
             .with_reason_code(format!("agent_type.{agent}"))
             .with_notification_identity_key(mute_key),
@@ -3817,6 +3894,69 @@ mod tests {
         assert!(quiet.facts.is_empty());
         let unreadable = verified_submit_observation_from_receipts(None, now);
         assert_eq!(unreadable.health, AttentionRouterSourceHealth::Unavailable);
+    }
+
+    #[test]
+    fn verified_submit_tallies_mark_drift_at_the_threshold_and_build_a_content_free_event() {
+        use crate::robot_types::SubmitReceiptState as State;
+
+        // gemini: exactly 4 of 8 unconfirmed, the 50 % boundary.
+        let mut receipts = vec![
+            submit_receipt("gemini", State::StuckInComposer),
+            submit_receipt("gemini", State::VerificationUnavailable),
+            submit_receipt("gemini", State::VerificationUnavailable),
+            submit_receipt("gemini", State::StuckInComposer),
+        ];
+        for _ in 0..4 {
+            receipts.push(submit_receipt("gemini", State::Submitted));
+        }
+        // codex: 3 of 7 unconfirmed and below the sample floor.
+        for state in [State::StuckInComposer; 3] {
+            receipts.push(submit_receipt("codex", state));
+        }
+        for _ in 0..4 {
+            receipts.push(submit_receipt("codex", State::Submitted));
+        }
+        let mut anonymous = submit_receipt("ignored", State::PaneCrashedToShell);
+        anonymous.agent_type = None;
+        receipts.push(anonymous);
+        receipts.push(submit_receipt("gemini", State::SendFailed));
+
+        let tallies = verified_submit_agent_tallies(&receipts);
+        let agents: Vec<&str> = tallies.iter().map(|t| t.agent_type.as_str()).collect();
+        assert_eq!(agents, ["codex", "gemini", "unknown"]);
+        let gemini = &tallies[1];
+        assert_eq!(
+            (
+                gemini.observed,
+                gemini.stuck_in_composer,
+                gemini.verification_unavailable
+            ),
+            (8, 2, 2),
+            "the send failure is not UI evidence"
+        );
+        assert_eq!(gemini.unconfirmed(), 4);
+        assert!(gemini.is_drifting(), "half unconfirmed meets the threshold");
+        assert_eq!(gemini.profile.as_deref(), Some("gemini.default v3"));
+        assert!(
+            !tallies[0].is_drifting(),
+            "seven samples are below the floor"
+        );
+        assert_eq!(tallies[2].observed, 1);
+
+        let detection = gemini.drift_detection();
+        assert_eq!(detection.rule_id, VERIFIED_SUBMIT_DRIFT_RULE_ID);
+        assert_eq!(detection.agent_type, crate::patterns::AgentType::Gemini);
+        assert_eq!(detection.event_type, "submit_profile.drift");
+        assert_eq!(detection.severity, crate::patterns::Severity::Warning);
+        assert_eq!(detection.extracted["unconfirmed"], 4);
+        assert_eq!(detection.extracted["profile"], "gemini.default v3");
+        let serialized = serde_json::to_string(&detection).expect("detection serializes");
+        assert!(!serialized.contains("secret-canary-key"));
+        assert_eq!(
+            tallies[2].drift_detection().agent_type,
+            crate::patterns::AgentType::Unknown
+        );
     }
 
     fn source(

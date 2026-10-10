@@ -23,6 +23,13 @@ failed sends are excluded. An agent type with at least 8 such receipts, at
 least half of them stuck in the composer or unverifiable, raises a
 `submit_profile_drift` blocker: an agent CLI update has probably broken composer
 detection, so recheck its submit profile before trusting verified sends to it.
+A running `ft watch` applies the same rule every 5 minutes. The first time an
+agent type crosses it, the watcher records and publishes a warning event,
+`core.verified_submit:profile_drift` (event type `submit_profile.drift`), on
+the pane of the newest unconfirmed receipt, carrying counts and the latest
+profile. It signals again only after the agent type recovers and relapses,
+and a 6-hour dedupe bucket holds it to one event per agent type across
+watcher restarts.
 Each live policy-gate and drift fact carries a stable mute key, printed in its
 summary (`[mute: ft mute add attention.<source>...]`). Live runs load active
 `ft mute` records from the same database, so a muted key's item is suppressed

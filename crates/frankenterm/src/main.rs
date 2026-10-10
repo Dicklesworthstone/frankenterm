@@ -48285,6 +48285,18 @@ async fn run_watcher(
         frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(task, shutdown_flag)
     };
 
+    // Raises submit-profile drift (W2.8) as a recorded, published event.
+    let verified_submit_drift_monitor_handle = {
+        let storage = scheduler_storage.clone();
+        let event_bus = Arc::clone(&event_bus);
+        let shutdown_flag = Arc::clone(&handle.shutdown_flag);
+        let task_shutdown_flag = Arc::clone(&shutdown_flag);
+        let task = frankenterm_core::runtime_async::task::spawn(async move {
+            run_verified_submit_drift_monitor(storage, event_bus, task_shutdown_flag).await;
+        });
+        frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(task, shutdown_flag)
+    };
+
     #[cfg(feature = "metrics")]
     let metrics_handle: Option<frankenterm_core::metrics::MetricsServerHandle> =
         if config.metrics.enabled {
@@ -48710,6 +48722,16 @@ async fn run_watcher(
     {
         shutdown_failures.push(error);
     }
+    if let Err(error) = settle_watcher_background_task(
+        "verified_submit_drift_monitor",
+        verified_submit_drift_monitor_handle,
+        &background_shutdown_cx,
+        true,
+    )
+    .await
+    {
+        shutdown_failures.push(error);
+    }
     if let Some(distributed_listener_handle) = distributed_listener_handle
         && let Err(error) = settle_watcher_background_task(
             "distributed_listener",
@@ -48880,6 +48902,178 @@ fn saved_search_scheduler_state_drops_deleted_search_ids() {
     retain_live_saved_search_state(&mut state, &live_search_ids);
 
     assert_eq!(state, HashMap::from([("live".to_string(), 1_u32)]));
+}
+
+/// How often `ft watch` re-reads recent verified-send receipts for submit
+/// profile drift (W2.8, ft-7h5da.3.9).
+const VERIFIED_SUBMIT_DRIFT_CHECK_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+/// Allowed sends read per drift check. Only those that carry a receipt count,
+/// up to the attention router's receipt window.
+const VERIFIED_SUBMIT_DRIFT_SCAN_ROWS: usize = 5_000;
+/// One drift event per agent type per bucket survives watcher restarts.
+const VERIFIED_SUBMIT_DRIFT_DEDUPE_BUCKET_MS: i64 = 6 * 60 * 60 * 1000;
+
+/// Agent types whose recent verified sends newly drift, each with the pane
+/// of its newest unconfirmed receipt (0 when no receipt names a pane).
+/// `records` are allowed sends, newest first. `signaled` holds the agent
+/// types already raised; one that recovers leaves it, so a relapse raises a
+/// new event.
+fn verified_submit_drift_alerts(
+    records: &[frankenterm_core::storage::AuditActionRecord],
+    signaled: &mut std::collections::BTreeSet<String>,
+) -> Vec<(
+    u64,
+    frankenterm_core::attention_router::VerifiedSubmitAgentTally,
+)> {
+    use frankenterm_core::attention_router::{
+        VERIFIED_SUBMIT_AUDIT_MAX_ROWS, verified_submit_agent_tallies,
+        verified_submit_receipt_agent,
+    };
+    use frankenterm_core::robot_types::{SubmitReceipt, SubmitReceiptState};
+
+    let receipts: Vec<(Option<u64>, SubmitReceipt)> = records
+        .iter()
+        .filter_map(|record| {
+            let summary = record.verification_summary.as_deref()?;
+            let receipt = serde_json::from_str::<SubmitReceipt>(summary).ok()?;
+            Some((record.pane_id, receipt))
+        })
+        .take(VERIFIED_SUBMIT_AUDIT_MAX_ROWS)
+        .collect();
+    let drifting: Vec<_> =
+        verified_submit_agent_tallies(receipts.iter().map(|(_, receipt)| receipt))
+            .into_iter()
+            .filter(frankenterm_core::attention_router::VerifiedSubmitAgentTally::is_drifting)
+            .collect();
+    signaled.retain(|agent| drifting.iter().any(|tally| &tally.agent_type == agent));
+    let mut alerts = Vec::new();
+    for tally in drifting {
+        if !signaled.insert(tally.agent_type.clone()) {
+            continue;
+        }
+        let pane_of = |unconfirmed_only: bool| {
+            receipts.iter().find_map(|(pane, receipt)| {
+                let unconfirmed = matches!(
+                    receipt.state,
+                    SubmitReceiptState::StuckInComposer
+                        | SubmitReceiptState::VerificationUnavailable
+                );
+                (verified_submit_receipt_agent(receipt) == tally.agent_type
+                    && (unconfirmed || !unconfirmed_only))
+                    .then_some(*pane)
+                    .flatten()
+            })
+        };
+        let pane_id = pane_of(true).or_else(|| pane_of(false)).unwrap_or(0);
+        alerts.push((pane_id, tally));
+    }
+    alerts
+}
+
+/// Watcher task: when an agent type's recent verified sends start to stay
+/// mostly unconfirmed, record a `core.verified_submit:profile_drift` event
+/// and publish it, so notifications and workflows see the drift without
+/// anyone running `ft attention`. Uses the attention router's drift rule.
+async fn run_verified_submit_drift_monitor(
+    storage: frankenterm_core::storage::StorageHandle,
+    event_bus: Arc<frankenterm_core::events::EventBus>,
+    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+
+    use frankenterm_core::events::Event;
+    use frankenterm_core::storage::{AuditQuery, StoredEvent};
+
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+    let mut signaled = std::collections::BTreeSet::new();
+    loop {
+        frankenterm_core::runtime_async::select! {
+            () = frankenterm_core::runtime_async::sleep(VERIFIED_SUBMIT_DRIFT_CHECK_INTERVAL) => {}
+            () = wait_for_shutdown(Arc::clone(&shutdown_flag)) => break,
+        }
+        if shutdown_flag.load(Ordering::SeqCst) {
+            break;
+        }
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
+        let storage_cx =
+            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+        let query = AuditQuery {
+            action_kind: Some("send_text".to_string()),
+            policy_decision: Some("allow".to_string()),
+            since: Some(now.saturating_sub(DAY_MS)),
+            limit: Some(VERIFIED_SUBMIT_DRIFT_SCAN_ROWS),
+            ..AuditQuery::default()
+        };
+        let records = match storage.get_audit_actions_with_cx(&storage_cx, query).await {
+            Ok(records) => records,
+            Err(error) => {
+                tracing::warn!(%error, "verified-submit drift monitor: failed to read the audit log");
+                continue;
+            }
+        };
+        for (pane_id, tally) in verified_submit_drift_alerts(&records, &mut signaled) {
+            let detection = tally.drift_detection();
+            let stored_event = StoredEvent {
+                id: 0,
+                pane_id,
+                rule_id: detection.rule_id.clone(),
+                agent_type: detection.agent_type.to_string(),
+                event_type: detection.event_type.clone(),
+                severity: "warning".to_string(),
+                confidence: detection.confidence,
+                extracted: Some(detection.extracted.clone()),
+                matched_text: None,
+                segment_id: None,
+                detected_at: now,
+                dedupe_key: Some(format!(
+                    "verified_submit_drift:{}:{}",
+                    tally.agent_type,
+                    now / VERIFIED_SUBMIT_DRIFT_DEDUPE_BUCKET_MS
+                )),
+                handled_at: None,
+                handled_by_workflow_id: None,
+                handled_status: None,
+            };
+            match storage
+                .record_event_outcome_with_cx(&storage_cx, stored_event)
+                .await
+            {
+                Ok(outcome) => {
+                    tracing::warn!(
+                        agent_type = %tally.agent_type,
+                        observed = tally.observed,
+                        unconfirmed = tally.unconfirmed(),
+                        "verified sends to this agent type mostly stay unconfirmed; its submit profile has probably drifted"
+                    );
+                    if let Some(event_id) = outcome.inserted_event_id() {
+                        event_bus.publish(Event::PatternDetected {
+                            pane_id,
+                            pane_uuid: None,
+                            detection,
+                            event_id: Some(event_id),
+                        });
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        agent_type = %tally.agent_type,
+                        %error,
+                        "verified-submit drift monitor: failed to record the drift event"
+                    );
+                    // Retry on the next check instead of staying silent.
+                    signaled.remove(&tally.agent_type);
+                }
+            }
+        }
+    }
 }
 
 async fn run_saved_search_scheduler(
@@ -137854,6 +138048,83 @@ printf x > "$MINISIGN_MARKER"
         assert_eq!(workspace.scope, AttentionRouterMuteScope::Workspace);
         assert_eq!(workspace.workspace, None, "applies to this workspace");
         assert_eq!(workspace.reason, None);
+    }
+
+    #[test]
+    fn verified_submit_drift_alerts_signal_each_episode_once_on_an_unconfirmed_pane() {
+        use frankenterm_core::robot_types::{
+            SubmitGuaranteeLevel, SubmitReceipt, SubmitReceiptState as State,
+        };
+        use frankenterm_core::storage::AuditActionRecord;
+
+        let row = |pane: Option<u64>, agent: &str, state: State| AuditActionRecord {
+            id: 0,
+            ts: 0,
+            actor_kind: "mcp".to_string(),
+            actor_id: None,
+            correlation_id: None,
+            pane_id: pane,
+            domain: None,
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: None,
+            rule_id: None,
+            input_summary: None,
+            verification_summary: Some(
+                serde_json::to_string(&SubmitReceipt {
+                    state,
+                    guarantee_level: SubmitGuaranteeLevel::Submitted,
+                    guarantee_met: false,
+                    agent_type: Some(agent.to_string()),
+                    profile_id: Some(format!("{agent}.default")),
+                    profile_version: Some("1".to_string()),
+                    attempts: 1,
+                    evidence_rule_ids: Vec::new(),
+                    elapsed_ms: 1,
+                    polls: 1,
+                    cursor_before: None,
+                    cursor_after: None,
+                    idempotency_key: "k".to_string(),
+                })
+                .expect("receipt json"),
+            ),
+            decision_context: None,
+            result: "success".to_string(),
+        };
+        // Newest first: a confirmed send on pane 4, then unconfirmed ones on
+        // pane 9 (and one with no registered pane), then older successes.
+        let mut drifting = vec![
+            row(Some(4), "codex", State::Submitted),
+            row(None, "codex", State::StuckInComposer),
+            row(Some(9), "codex", State::VerificationUnavailable),
+        ];
+        for _ in 0..4 {
+            drifting.push(row(Some(9), "codex", State::StuckInComposer));
+        }
+        drifting.push(row(Some(4), "codex", State::Submitted));
+        // A row without a receipt is not evidence.
+        let mut bare = row(Some(1), "codex", State::Submitted);
+        bare.verification_summary = None;
+        drifting.push(bare);
+
+        let mut signaled = std::collections::BTreeSet::new();
+        let alerts = verified_submit_drift_alerts(&drifting, &mut signaled);
+        assert_eq!(alerts.len(), 1);
+        let (pane, tally) = &alerts[0];
+        assert_eq!(*pane, 9, "the newest unconfirmed receipt with a pane");
+        assert_eq!((tally.observed, tally.unconfirmed()), (8, 6));
+        assert!(verified_submit_drift_alerts(&drifting, &mut signaled).is_empty());
+
+        let recovered: Vec<_> = (0..8)
+            .map(|_| row(Some(2), "codex", State::Submitted))
+            .collect();
+        assert!(verified_submit_drift_alerts(&recovered, &mut signaled).is_empty());
+        assert!(signaled.is_empty(), "recovery re-arms the signal");
+        assert_eq!(
+            verified_submit_drift_alerts(&drifting, &mut signaled).len(),
+            1,
+            "a relapse raises a new event"
+        );
     }
 
     /// Live attention end to end: audit rows and an `ft mute` record in a real
