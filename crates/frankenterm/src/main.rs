@@ -138371,6 +138371,41 @@ printf x > "$MINISIGN_MARKER"
         );
     }
 
+    /// The API schema registry, and the API reference generated from it, may
+    /// only name robot commands the CLI defines. `a / b` lists alternatives;
+    /// flags are not checked.
+    #[test]
+    fn api_schema_robot_commands_exist_in_the_cli() {
+        let cli = <Cli as clap::CommandFactory>::command();
+        let mut checked = 0;
+        let mut missing = Vec::new();
+        for endpoint in frankenterm_core::api_schema::SchemaRegistry::canonical().endpoints {
+            let Some(robot_command) = endpoint.robot_command.as_deref() else {
+                continue;
+            };
+            for alternative in robot_command.split(" / ") {
+                checked += 1;
+                let mut command = &cli;
+                for word in alternative
+                    .split_whitespace()
+                    .filter(|word| !word.starts_with('-'))
+                {
+                    if let Some(next) = command.find_subcommand(word) {
+                        command = next;
+                    } else {
+                        missing.push(alternative.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(checked > 20, "schema lost its robot commands ({checked})");
+        assert!(
+            missing.is_empty(),
+            "API schema names robot commands the CLI lacks: {missing:?}"
+        );
+    }
+
     /// `ft robot help` may only name subcommand paths the CLI defines.
     #[test]
     fn robot_help_names_only_existing_robot_subcommands() {
