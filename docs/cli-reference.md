@@ -8,7 +8,7 @@ Use it as the command-truth companion to:
 - `docs/ft-xbnl0-4-6-completion-evidence.md`
 - `docs/ft-xbnl0-5-7-completion-evidence.md`
 
-Commands marked as feature-gated require building with the corresponding feature.
+Commands marked as feature-gated sit behind a Cargo feature. The `ft` binary enables all of the ones named here by default, so they only need re-enabling in a `--no-default-features` build.
 
 ## Human CLI (implemented)
 
@@ -24,7 +24,7 @@ ft get-text <pane_id> [--tail <n>] [--escapes]
 ```
 
 Distributed mode notes:
-- With `--features distributed` and `[distributed].enabled = true`, `ft watch` also acts as the aggregator listener.
+- With `[distributed].enabled = true` (and the default `distributed` feature), `ft watch` also acts as the aggregator listener.
 - Remote agents connect with `ft distributed agent --connect <host:port> --agent-id <name>`.
 - Aggregated remote panes are persisted into the same DB and surface through `ft status`, `ft search`, `ft robot state`, MCP `wa.state`, and `wa://panes`.
 
@@ -122,9 +122,17 @@ receipt bound one). A receipt that expires mid-run, or a mission edited mid-run,
 stops the remaining steps. Each run appends an attachment to the contract with
 an `attempt` number, so repeated runs of one receipt can be told apart.
 
-Transaction-contract control is currently surfaced under robot mode as
-`ft robot tx plan|run|rollback|show`; the top-level human CLI does not expose
-`ft tx` today.
+Transaction-contract control is available to humans and robots alike:
+
+```bash
+ft tx plan [--contract-file <path>] [-f <plain|json>]
+ft tx run [--contract-file <path>] [--fail-step <step>] [--paused] [--kill-switch <level>] [--dry-run] [-f <plain|json>]
+ft tx rollback [--contract-file <path>] [--fail-compensation-for-step <step>] [-f <plain|json>]
+ft tx show [--contract-file <path>] [--include-contract] [-f <plain|json>]
+```
+
+The contract defaults to `.ft/mission/tx-active.json` in the workspace. Robot
+callers use the same subcommands as `ft robot tx plan|run|rollback|show`.
 
 ### Proof queue and deferred replay
 
@@ -159,7 +167,7 @@ ft doctor
 ft doctor --json
 ft diag bundle [--output <dir>] [--events <n>] [--audit <n>] [--workflows <n>]
 ft reproduce export [--kind <crash|manual>] [--out <dir>] [--format <text|json>]
-ft reproduce replay <bundle_dir> [--mode <full|policy|rules>]
+ft reproduce replay <bundle_dir> [--mode <policy|rules>]   # default policy
 ```
 
 `ft doctor` includes a `submit idempotency store` row for the store kept
@@ -202,7 +210,7 @@ retains the lock inode to preserve one flock authority.
 
 ### Web server and streaming API
 
-Requires `--features web`.
+Behind the `web` feature, which is on by default.
 
 ```bash
 ft web [--port <n>]
@@ -254,7 +262,8 @@ ft setup [--list-hosts] [--dry-run] [--apply]
 ft setup local
 ft setup remote <host> [--yes] [--install-ft \
   (--ft-version <release-tag> | \
-   --ft-path <target-ft> --mux-server-path <target-mux-server>) \
+   --ft-path <target-ft> --mux-server-path <target-mux-server> \
+   --guardian-path <target-pty-guardian>) \
   --transaction-id <32-lowercase-hex>]
 ft setup config
 ft setup patch [--remove]
@@ -298,7 +307,7 @@ ft auth bootstrap <service> [--account <name>] [--timeout-secs <1..=1800>]
 ```
 
 Notes:
-- `ft auth` requires the `browser` feature to enable Playwright-based flows.
+- `ft auth` uses the `browser` feature (on by default) for Playwright-based flows.
 - `ft auth test` validates bounded local runtime/profile/storage-state evidence;
   it does not launch a browser or prove that a remote service still accepts the
   persisted credentials.
@@ -310,10 +319,10 @@ Notes:
 ## Feature-gated commands
 
 ```bash
-ft tui          # requires --features tui
-ft mcp serve    # requires --features mcp
-ft web          # requires --features web; serves HTTP + SSE `/stream/*`
-ft sync         # requires --features sync
+ft tui          # feature tui or ftui (ftui is on by default)
+ft mcp serve    # feature mcp (on by default)
+ft web          # feature web (on by default); serves HTTP + SSE `/stream/*`
+ft sync         # feature sync (on by default)
 ```
 
 ## Robot mode (stable JSON/TOON)
@@ -513,31 +522,27 @@ Policy/redaction:
 
 MCP tools mirror robot mode. See `docs/mcp-api-spec.md` and `docs/json-schema/` for details.
 
-Tools (tool IDs currently still use the `wa.*` prefix):
-- wa.state
-- wa.get_text
-- wa.send
-- wa.wait_for
-- wa.search
-- wa.events
-- wa.events_annotate
-- wa.events_triage
-- wa.events_label
-- wa.workflow_run
-- wa.accounts
-- wa.accounts_refresh
-- wa.rules_list
-- wa.rules_test
-- wa.rules_show
-- wa.rules_lint
-- wa.reserve
-- wa.release
-- wa.reservations
-- wa.approve
-- wa.why
-- wa.workflow_list
-- wa.workflow_status
-- wa.workflow_abort
+Tools (tool IDs currently still use the `wa.*` prefix), as registered in
+`mcp_bridge.rs`. Always available, including in degraded mode without a
+workspace database:
+- wa.state, wa.get_text, wa.wait_for
+- wa.rules_list, wa.rules_test
+- wa.cass_search, wa.cass_view, wa.cass_status
+- wa.tx_plan, wa.tx_show
+- wa.attention, wa.rehearsal_score, wa.operating_envelope
+- wa.mission_objective_plan, wa.mission_state, wa.mission_explain, wa.steer_plan
+
+Registered only with a workspace database (audited handlers):
+- wa.dom, wa.search, wa.events, wa.await_event
+- wa.events_annotate, wa.events_triage, wa.events_label
+- wa.reservations, wa.reserve, wa.release
+- wa.send, wa.workflow_run, wa.workflow_status
+- wa.accounts, wa.accounts_refresh
+- wa.tx_run, wa.tx_rollback
+- wa.mission_pause, wa.mission_resume, wa.mission_abort
+
+There are no MCP tools for rule details or linting, approvals, `why`, or
+workflow listing and abort; use the robot CLI for those.
 
 Resources (resource URIs currently still use the `wa://` scheme):
 - wa://panes
