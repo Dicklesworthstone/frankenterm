@@ -138417,6 +138417,29 @@ printf x > "$MINISIGN_MARKER"
         );
     }
 
+    /// `ft robot help` may only name subcommand paths the CLI defines.
+    #[test]
+    fn robot_help_names_only_existing_robot_subcommands() {
+        let cli = <Cli as clap::CommandFactory>::command();
+        let robot = cli.find_subcommand("robot").expect("robot subcommand");
+        let mut missing = Vec::new();
+        for entry in build_robot_help().commands {
+            let mut command = robot;
+            for word in entry.name.split_whitespace() {
+                if let Some(next) = command.find_subcommand(word) {
+                    command = next;
+                } else {
+                    missing.push(entry.name.to_string());
+                    break;
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "robot help names commands the CLI lacks: {missing:?}"
+        );
+    }
+
     #[test]
     fn robot_help_and_quick_start_list_blocker_radar_surface() {
         let help = build_robot_help();
