@@ -138725,15 +138725,23 @@ printf x > "$MINISIGN_MARKER"
                     continue;
                 };
                 let words: Vec<&str> = command.split_whitespace().collect();
+                // `ft robot <family> <action>` is a template, not a command.
+                let command_word = if words.get(1) == Some(&"robot") {
+                    words.get(2)
+                } else {
+                    words.get(1)
+                };
                 let shorthand = words.iter().any(|word| {
                     word.contains('*')
                         || word.contains('…')
+                        || *word == "/"
                         || (word.contains('/')
                             && !word.starts_with(['.', '/', '~', '$', '<'])
                             && !word.contains('.'))
                 }) || words
                     .get(1)
-                    .is_some_and(|word| word.starts_with(|c: char| c.is_ascii_digit()));
+                    .is_some_and(|word| word.starts_with(|c: char| c.is_ascii_digit()))
+                    || command_word.is_some_and(|word| word.starts_with('<'));
                 if !shorthand {
                     commands.push(command.to_string());
                 }

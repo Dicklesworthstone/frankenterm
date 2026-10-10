@@ -351,12 +351,12 @@ pub static FT_1024: ErrorCodeDef = ErrorCodeDef {
 pub static FT_1025: ErrorCodeDef = ErrorCodeDef {
     code: "FT-1025",
     category: ErrorCategory::Wezterm,
-    title: "ft and the running mux are from different releases",
+    title: "The ft CLI and the running mux are from different releases",
     description: "The mux at the discovered socket speaks a codec generation this ft cannot use: \
                   the two compatibility windows do not overlap. Retrying cannot fix it.",
     causes: &[
         "The ft CLI was upgraded without FrankenTerm.app, or the reverse",
-        "ft discovered the socket of an older or newer mux than intended",
+        "The socket ft discovered belongs to an older or newer mux than intended",
     ],
     recovery_steps: &[
         RecoveryStep::with_command("Show which socket ft found", "ft doctor --json"),

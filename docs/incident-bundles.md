@@ -315,7 +315,7 @@ Each `sources[]` entry must include:
 | Source | Default collection | Required safety behavior |
 | --- | --- | --- |
 | `robot_state` | `ft robot state` or internal equivalent without pane writes. | Include pane ids, titles, domains, cwd where already exposed, state, and timestamps. Do not include full text. |
-| `pane_text_summaries` | Bounded `ft robot get-text --tail` summaries only when privacy tier permits. | Redact and truncate; use placeholders for sensitive or excluded panes. |
+| `pane_text_summaries` | Bounded `ft robot get-text <pane-id> --tail <n>` summaries only when privacy tier permits. | Redact and truncate; use placeholders for sensitive or excluded panes. |
 | `tailer_capture_health` | Runtime/tailer/capture health snapshots and lag counters. | Report unavailable fields explicitly instead of synthesizing green health. |
 | `resource_pressure_cockpit` | Current resource cockpit snapshot if the producer is wired. | Preserve `measured`, `simulated`, `unavailable`, and `stale` states from the cockpit contract. |
 | `proof_rch_evidence` | Paths and verdict summaries for existing proof/RCH artifacts. | Do not run new proof commands. Do not treat RCH sync, queue, or transfer logs as proof. |
@@ -705,7 +705,7 @@ println!("Files: {:?}", result.files);
 ft reproduce export --kind crash --format json
 ```
 
-There is no `ft robot reproduce`; the human command's `--format json` output is
+There is no robot-mode `reproduce` command; the human command's `--format json` output is
 the machine-readable form.
 
 Returns a JSON response envelope with the bundle path and file list.
