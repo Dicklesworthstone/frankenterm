@@ -137790,6 +137790,103 @@ printf x > "$MINISIGN_MARKER"
         assert_eq!(workspace.reason, None);
     }
 
+    /// Live attention end to end: audit rows and an `ft mute` record in a real
+    /// workspace database reach the scored payload through the CLI builder.
+    #[test]
+    fn cli_attention_live_run_reads_policy_gate_audit_and_honors_ft_mute() {
+        use frankenterm_core::storage::{AuditActionRecord, EventMuteRecord};
+
+        run_async_test(async {
+            let temp = unique_temp_dir("attention_live_policy_gate");
+            let config = frankenterm_core::config::Config::default();
+            let layout = config.workspace_layout(Some(&temp)).expect("layout");
+            std::fs::create_dir_all(&layout.ft_dir).expect("ft dir");
+            let db_path = layout.db_path.to_string_lossy().to_string();
+            let storage = frankenterm_core::storage::StorageHandle::new(&db_path)
+                .await
+                .expect("storage");
+            let now = now_ms_i64();
+            for (actor, rule) in [
+                ("BlueLake", "command_gate.destructive"),
+                ("BlueLake", "command_gate.destructive"),
+                ("GreenRiver", "command_gate.network"),
+            ] {
+                storage
+                    .record_audit_action(AuditActionRecord {
+                        id: 0,
+                        ts: now - 1_000,
+                        actor_kind: "robot".to_string(),
+                        actor_id: Some(actor.to_string()),
+                        correlation_id: None,
+                        pane_id: Some(7),
+                        domain: Some("local".to_string()),
+                        action_kind: "send_text".to_string(),
+                        policy_decision: "deny".to_string(),
+                        decision_reason: Some("blocked".to_string()),
+                        rule_id: Some(rule.to_string()),
+                        input_summary: Some("rm -rf /secret-canary".to_string()),
+                        verification_summary: None,
+                        decision_context: None,
+                        result: "denied".to_string(),
+                    })
+                    .await
+                    .expect("record denial");
+            }
+            storage
+                .add_event_mute(EventMuteRecord {
+                    identity_key:
+                        "attention.policy_denied_audit.GreenRiver.send_text.command_gate.network"
+                            .to_string(),
+                    scope: "workspace".to_string(),
+                    created_at: now,
+                    expires_at: None,
+                    created_by: None,
+                    reason: Some("expected network denials".to_string()),
+                })
+                .await
+                .expect("mute");
+            storage.shutdown().await.expect("storage shutdown");
+
+            let payload = build_cli_attention_router_payload(
+                &config,
+                &temp,
+                None,
+                Some(u64::try_from(now).expect("epoch ms")),
+                AttentionRouterSurface::Status,
+                "test.attention.live",
+                None,
+            )
+            .await
+            .expect("live payload");
+            let denials: Vec<_> = payload
+                .snapshot
+                .items
+                .iter()
+                .filter(|item| item.reason_codes.iter().any(|code| code == "policy.denied"))
+                .collect();
+            assert_eq!(
+                denials.len(),
+                1,
+                "the muted GreenRiver group is suppressed: {denials:?}"
+            );
+            assert!(
+                denials[0].redacted_summary.contains("BlueLake"),
+                "{}",
+                denials[0].redacted_summary
+            );
+            assert!(
+                denials[0]
+                    .reason_codes
+                    .iter()
+                    .any(|code| code == "policy_rule.command_gate.destructive")
+            );
+            let rendered = serde_json::to_string(&payload).expect("serialize payload");
+            assert!(!rendered.contains("secret-canary"), "no action input leaks");
+
+            let _ = std::fs::remove_dir_all(&temp);
+        });
+    }
+
     #[test]
     fn cli_attention_plain_render_includes_nudge_plan_receipt_review_fields() {
         let input = cli_attention_ready_input();
