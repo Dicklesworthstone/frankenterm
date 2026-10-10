@@ -322,7 +322,7 @@ pub fn submit_receipt_counts() -> Vec<SubmitReceiptCount> {
         .iter()
         .map(|((agent_type, state), count)| SubmitReceiptCount {
             agent_type: agent_type.clone(),
-            state: *state,
+            state,
             count: *count,
         })
         .collect()
