@@ -1622,7 +1622,7 @@ impl ToolHandler for WaAttentionTool {
         Tool {
             name: "wa.attention".to_string(),
             description: Some(
-                "Read attention-router status, next action, or item explanation from caller-supplied evidence or, with live, the workspace audit log (robot parity)"
+                "Read attention-router status, next action, or item explanation from caller-supplied evidence or, with live, the workspace database: audit log, unhandled events, operator pane holds (robot parity)"
                     .to_string(),
             ),
             input_schema: serde_json::json!({
@@ -1633,7 +1633,7 @@ impl ToolHandler for WaAttentionTool {
                     "input": { "type": "object", "description": "AttentionRouterSourceAdapterInput object; omitted input yields an explicit degraded no-input snapshot" },
                     "generated_at_ms": { "type": "integer", "minimum": 0 },
                     "workspace": { "type": "string", "description": "Workspace label used only when input is omitted or workspace override is desired" },
-                    "live": { "type": "boolean", "default": false, "description": "When input is omitted, add the live read-only sources from the workspace audit log (policy denials, unresolved approval holds, verified-submit drift) and honor active ft mutes; reported unavailable when the server has no workspace database" }
+                    "live": { "type": "boolean", "default": false, "description": "When input is omitted, add the live read-only sources from the workspace database (policy denials, unresolved approval holds, verified-submit drift, unhandled warning and critical events, operator pane holds) and honor active ft mutes; reported unavailable when the server has no workspace database" }
                 },
                 "additionalProperties": false
             }),
