@@ -2597,6 +2597,183 @@ pub fn operating_envelope_observation_from_health(
     observation
 }
 
+/// Audit history a live policy-gate source covers.
+pub const POLICY_GATE_AUDIT_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
+/// Newest audit rows a live policy-gate source reads for each decision.
+pub const POLICY_GATE_AUDIT_MAX_ROWS: usize = 64;
+
+/// Live `policy_denied_audit` source from recent audit actions whose policy
+/// decision was `deny`, read by the caller within
+/// [`POLICY_GATE_AUDIT_WINDOW_MS`] and [`POLICY_GATE_AUDIT_MAX_ROWS`]. One
+/// fact per actor, action kind, and rule, counting its denials. Facts name the
+/// actor, action kind, panes, and rule id only: never the action input or the
+/// policy's free-text reason, which can echo command text. `None` means the
+/// audit log could not be read.
+#[must_use]
+pub fn policy_denied_observation_from_audit(
+    denied: Option<&[crate::storage::AuditActionRecord]>,
+    now_ms: u64,
+) -> AttentionRouterSourceObservation {
+    policy_gate_observation(PolicyGate::Denied, denied, now_ms)
+}
+
+/// Live `approval_store` source from recent audit actions whose policy
+/// decision was `require_approval`; see
+/// [`policy_denied_observation_from_audit`] for the bounds and redaction.
+#[must_use]
+pub fn approval_required_observation_from_audit(
+    approval_required: Option<&[crate::storage::AuditActionRecord]>,
+    now_ms: u64,
+) -> AttentionRouterSourceObservation {
+    policy_gate_observation(PolicyGate::ApprovalRequired, approval_required, now_ms)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PolicyGate {
+    Denied,
+    ApprovalRequired,
+}
+
+impl PolicyGate {
+    const fn source_kind(self) -> AttentionRouterSourceKind {
+        match self {
+            Self::Denied => AttentionRouterSourceKind::PolicyDeniedAudit,
+            Self::ApprovalRequired => AttentionRouterSourceKind::ApprovalStore,
+        }
+    }
+
+    const fn fact_kind(self) -> AttentionRouterSourceFactKind {
+        match self {
+            Self::Denied => AttentionRouterSourceFactKind::PolicyDeniedAudit,
+            Self::ApprovalRequired => AttentionRouterSourceFactKind::PolicyRequireApproval,
+        }
+    }
+
+    const fn source_id(self) -> &'static str {
+        match self {
+            Self::Denied => "policy_denied_audit.recent",
+            Self::ApprovalRequired => "approval_store.recent_required",
+        }
+    }
+
+    const fn api(self) -> &'static str {
+        match self {
+            Self::Denied => "storage.audit_actions.policy_decision=deny",
+            Self::ApprovalRequired => "storage.audit_actions.policy_decision=require_approval",
+        }
+    }
+
+    const fn reason_code(self) -> &'static str {
+        match self {
+            Self::Denied => "policy.denied",
+            Self::ApprovalRequired => "approval.required",
+        }
+    }
+
+    const fn verb(self) -> &'static str {
+        match self {
+            Self::Denied => "denied",
+            Self::ApprovalRequired => "required approval",
+        }
+    }
+}
+
+fn policy_gate_observation(
+    gate: PolicyGate,
+    actions: Option<&[crate::storage::AuditActionRecord]>,
+    now_ms: u64,
+) -> AttentionRouterSourceObservation {
+    let Some(actions) = actions else {
+        return AttentionRouterSourceObservation::new(
+            gate.source_id(),
+            gate.source_kind(),
+            AttentionRouterSourceHealth::Unavailable,
+            gate.api(),
+            "the local audit log could not be read",
+        )
+        .live(now_ms, 0)
+        .with_fact(
+            AttentionRouterSourceFact::new(
+                AttentionRouterSourceFactKind::SourceUnavailable,
+                "the local audit log is unavailable",
+            )
+            .with_reason_code(format!("{}.audit_unavailable", gate.source_kind().slug())),
+        );
+    };
+    // (actor, action kind, rule) -> (actions, panes)
+    let mut groups: std::collections::BTreeMap<
+        (String, String, String),
+        (u64, std::collections::BTreeSet<u64>),
+    > = std::collections::BTreeMap::new();
+    for action in actions {
+        let actor = action
+            .actor_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|actor_id| !actor_id.is_empty())
+            .unwrap_or(action.actor_kind.as_str())
+            .to_string();
+        let rule = action
+            .rule_id
+            .clone()
+            .unwrap_or_else(|| "unspecified".to_string());
+        let group = groups
+            .entry((actor, action.action_kind.clone(), rule))
+            .or_default();
+        group.0 = group.0.saturating_add(1);
+        if let Some(pane_id) = action.pane_id {
+            group.1.insert(pane_id);
+        }
+    }
+    let freshness_ms = actions
+        .iter()
+        .map(|action| action.ts)
+        .max()
+        .map_or(0, |newest| {
+            now_ms.saturating_sub(u64::try_from(newest).unwrap_or(0))
+        });
+    let mut observation = AttentionRouterSourceObservation::new(
+        gate.source_id(),
+        gate.source_kind(),
+        AttentionRouterSourceHealth::Available,
+        gate.api(),
+        format!(
+            "{} audited actions {} in the last 24 hours",
+            actions.len(),
+            gate.verb()
+        ),
+    )
+    .live(now_ms, freshness_ms)
+    .items_seen(u64::try_from(actions.len()).unwrap_or(u64::MAX));
+    for ((actor, action_kind, rule), (count, panes)) in groups {
+        let panes = if panes.is_empty() {
+            "no pane".to_string()
+        } else {
+            let listed: Vec<String> = panes.iter().take(4).map(u64::to_string).collect();
+            let more = panes.len().saturating_sub(listed.len());
+            if more == 0 {
+                format!("pane {}", listed.join(", "))
+            } else {
+                format!("pane {} and {more} more", listed.join(", "))
+            }
+        };
+        observation = observation.with_fact(
+            AttentionRouterSourceFact::new(
+                gate.fact_kind(),
+                format!(
+                    "{action_kind} by {actor} {} {count} time(s), rule {rule}, {panes}",
+                    gate.verb()
+                ),
+            )
+            .count(count)
+            .with_agent_name(actor)
+            .with_reason_code(gate.reason_code())
+            .with_reason_code(format!("policy_rule.{rule}")),
+        );
+    }
+    observation
+}
+
 fn missing_source_observation(
     source_kind: AttentionRouterSourceKind,
     generated_at_ms: u64,
@@ -3141,6 +3318,138 @@ mod tests {
 
         let absent = operating_envelope_observation_from_health(None, now, 90_000);
         assert_eq!(absent.health, AttentionRouterSourceHealth::Unavailable);
+    }
+
+    fn audit_row(
+        id: i64,
+        actor_id: Option<&str>,
+        action_kind: &str,
+        pane_id: Option<u64>,
+        rule_id: Option<&str>,
+        policy_decision: &str,
+        ts: i64,
+    ) -> crate::storage::AuditActionRecord {
+        crate::storage::AuditActionRecord {
+            id,
+            ts,
+            actor_kind: "robot".to_string(),
+            actor_id: actor_id.map(str::to_string),
+            correlation_id: None,
+            pane_id,
+            domain: Some("local".to_string()),
+            action_kind: action_kind.to_string(),
+            policy_decision: policy_decision.to_string(),
+            decision_reason: Some("blocked rm -rf /secret-canary".to_string()),
+            rule_id: rule_id.map(str::to_string),
+            input_summary: Some("rm -rf /secret-canary".to_string()),
+            verification_summary: None,
+            decision_context: Some("{\"text\":\"secret-canary\"}".to_string()),
+            result: "denied".to_string(),
+        }
+    }
+
+    #[test]
+    fn live_policy_gate_sources_group_audit_rows_without_their_input() {
+        let now: u64 = 1_800_000_000_000;
+        let at = |ago: i64| i64::try_from(now).expect("epoch ms") - ago;
+        let denied = vec![
+            audit_row(
+                3,
+                Some("BlueLake"),
+                "send_text",
+                Some(7),
+                Some("command_gate.destructive"),
+                "deny",
+                at(1_000),
+            ),
+            audit_row(
+                2,
+                Some("BlueLake"),
+                "send_text",
+                Some(9),
+                Some("command_gate.destructive"),
+                "deny",
+                at(5_000),
+            ),
+            audit_row(1, None, "spawn", None, None, "deny", at(9_000)),
+        ];
+        let observation = policy_denied_observation_from_audit(Some(&denied), now);
+        assert_eq!(
+            observation.source_kind,
+            AttentionRouterSourceKind::PolicyDeniedAudit
+        );
+        assert_eq!(observation.health, AttentionRouterSourceHealth::Available);
+        assert!(observation.live);
+        assert_eq!(observation.items_seen, Some(3));
+        assert_eq!(observation.freshness_ms, Some(1_000));
+        assert_eq!(observation.facts.len(), 2, "grouped by actor, action, rule");
+        let blue = observation
+            .facts
+            .iter()
+            .find(|fact| fact.agent_names == ["BlueLake"])
+            .expect("BlueLake group");
+        assert_eq!(blue.count, Some(2));
+        assert!(blue.summary.contains("pane 7, 9"), "{}", blue.summary);
+        assert!(blue.reason_codes.contains(&"policy.denied".to_string()));
+        let anonymous = observation
+            .facts
+            .iter()
+            .find(|fact| fact.agent_names == ["robot"])
+            .expect("an actor without an id falls back to its kind");
+        assert!(
+            anonymous
+                .reason_codes
+                .contains(&"policy_rule.unspecified".to_string())
+        );
+        let rendered = serde_json::to_string(&observation).expect("serialize");
+        assert!(
+            !rendered.contains("secret-canary"),
+            "no action input, free-text reason, or decision context: {rendered}"
+        );
+        let snapshot = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo").with_observation(observation),
+        );
+        assert!(
+            snapshot
+                .items
+                .iter()
+                .any(|item| item.kind == AttentionRouterItemKind::Blocker),
+            "a live policy denial is a blocker"
+        );
+
+        let required = [audit_row(
+            4,
+            Some("BlueLake"),
+            "send_text",
+            Some(7),
+            Some("approval.send"),
+            "require_approval",
+            at(2_000),
+        )];
+        let approval = approval_required_observation_from_audit(Some(&required), now);
+        assert_eq!(
+            approval.source_kind,
+            AttentionRouterSourceKind::ApprovalStore
+        );
+        assert_eq!(
+            approval.facts[0].fact,
+            AttentionRouterSourceFactKind::PolicyRequireApproval
+        );
+        assert!(
+            approval.facts[0]
+                .reason_codes
+                .contains(&"approval.required".to_string())
+        );
+
+        let quiet = policy_denied_observation_from_audit(Some(&[]), now);
+        assert_eq!(quiet.health, AttentionRouterSourceHealth::Available);
+        assert!(quiet.facts.is_empty());
+        let unreadable = policy_denied_observation_from_audit(None, now);
+        assert_eq!(unreadable.health, AttentionRouterSourceHealth::Unavailable);
+        assert_eq!(
+            unreadable.facts[0].fact,
+            AttentionRouterSourceFactKind::SourceUnavailable
+        );
     }
 
     fn source(

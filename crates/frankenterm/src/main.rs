@@ -13129,18 +13129,37 @@ async fn build_cli_attention_router_payload(
     requested_item_id: Option<&str>,
 ) -> anyhow::Result<AttentionRouterSurfacePayload> {
     let mut input = load_attention_router_input(workspace_root, input_path, generated_at_ms)?;
-    // A recorded --input is replayed exactly; a live run adds the watcher's
-    // operating envelope (per-governor advisories) as a real source.
+    // A recorded --input is replayed exactly; a live run adds real sources:
+    // the watcher's operating envelope (per-governor advisories) and the
+    // policy gate (recent denied and approval-required actions) from the
+    // local audit log.
     if input_path.is_none() {
-        let snapshot = match config.workspace_layout(Some(workspace_root)) {
-            Ok(layout) => load_runtime_health_snapshot_at(&layout.ipc_socket_path).await,
-            Err(_) => None,
+        let layout = config.workspace_layout(Some(workspace_root)).ok();
+        let snapshot = match layout.as_ref() {
+            Some(layout) => load_runtime_health_snapshot_at(&layout.ipc_socket_path).await,
+            None => None,
         };
         input.observations.push(
             frankenterm_core::attention_router::operating_envelope_observation_from_health(
                 snapshot.as_ref(),
                 input.generated_at_ms,
                 SPAWN_ADMISSION_MAX_AGE_MS,
+            ),
+        );
+        let (denied, approval_required) = match layout.as_ref() {
+            Some(layout) => read_policy_gate_audit(&layout.db_path, input.generated_at_ms).await,
+            None => (None, None),
+        };
+        input.observations.push(
+            frankenterm_core::attention_router::policy_denied_observation_from_audit(
+                denied.as_deref(),
+                input.generated_at_ms,
+            ),
+        );
+        input.observations.push(
+            frankenterm_core::attention_router::approval_required_observation_from_audit(
+                approval_required.as_deref(),
+                input.generated_at_ms,
             ),
         );
     }
@@ -13150,6 +13169,51 @@ async fn build_cli_attention_router_payload(
         source,
         requested_item_id,
     ))
+}
+
+type PolicyGateAuditRows = Option<Vec<frankenterm_core::storage::AuditActionRecord>>;
+
+/// Recent denied and approval-required audit rows for the live attention
+/// router, bounded by the attention router's window and row cap. A workspace
+/// without a database has no audit history (empty, not unreadable), and no
+/// database is created here; `None` marks a read failure.
+async fn read_policy_gate_audit(
+    db_path: &Path,
+    now_ms: u64,
+) -> (PolicyGateAuditRows, PolicyGateAuditRows) {
+    use frankenterm_core::attention_router::{
+        POLICY_GATE_AUDIT_MAX_ROWS, POLICY_GATE_AUDIT_WINDOW_MS,
+    };
+
+    if !db_path.exists() {
+        return (Some(Vec::new()), Some(Vec::new()));
+    }
+    let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+    let Ok(storage) =
+        frankenterm_core::storage::StorageHandle::new_with_cx(&cx, &db_path.to_string_lossy())
+            .await
+    else {
+        return (None, None);
+    };
+    let since = i64::try_from(now_ms.saturating_sub(POLICY_GATE_AUDIT_WINDOW_MS)).ok();
+    let query = |decision: &str| frankenterm_core::storage::AuditQuery {
+        limit: Some(POLICY_GATE_AUDIT_MAX_ROWS),
+        policy_decision: Some(decision.to_string()),
+        since,
+        ..Default::default()
+    };
+    let denied = storage
+        .get_audit_actions_with_cx(&cx, query("deny"))
+        .await
+        .ok();
+    let approval_required = storage
+        .get_audit_actions_with_cx(&cx, query("require_approval"))
+        .await
+        .ok();
+    if let Err(error) = storage.shutdown_with_cx(&cx).await {
+        tracing::debug!(%error, "attention router audit read: storage shutdown failed");
+    }
+    (denied, approval_required)
 }
 
 fn attention_router_value_label<T: serde::Serialize>(value: &T) -> String {

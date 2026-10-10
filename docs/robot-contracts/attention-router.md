@@ -7,8 +7,15 @@ Status: live read-only surface with caller-supplied source-adapter input.
 same surface payload is exposed through `ft attention ...`, `ft robot attention
 ...`, MCP tool `wa.attention`, and MCP resources
 `wa://attention-router/current` plus `wa://attention-router/items/{item_id}`.
-Without explicit input the surface emits an explicit degraded no-input
-snapshot; it does not collect live state or mutate project state.
+A recorded `--input` is replayed exactly. Without one, `ft attention` and `ft
+robot attention` add live, read-only sources: the watcher's operating envelope
+(IPC health) and the policy gate from the local audit log, meaning actions
+denied (`policy_denied_audit`) or held for approval (`approval_store`) in the
+last 24 hours, newest 64 per decision, grouped by actor, action kind, and rule.
+Policy-gate facts never carry the action input or the policy's free-text
+reason, and a workspace without a database is not created. Every other source
+appears only through caller input and is otherwise reported missing. Nothing
+mutates project state.
 
 Operator runbook: `docs/operator-runbook.md` section 2C.
 
