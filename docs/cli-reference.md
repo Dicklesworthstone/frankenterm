@@ -324,7 +324,7 @@ Notes:
 ft tui          # feature tui or ftui (ftui is on by default)
 ft mcp serve    # feature mcp (on by default)
 ft web          # feature web (on by default); serves HTTP + SSE `/stream/*`
-ft sync         # feature sync (on by default)
+ft sync status  # feature sync (on by default)
 ```
 
 ## Robot mode (stable JSON/TOON)

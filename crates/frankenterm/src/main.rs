@@ -817,7 +817,7 @@ SEE ALSO:
     #[command(after_help = r#"EXAMPLES:
     ft workflow list                  List workflow executions
     ft workflow status <id>           Show specific execution details
-    ft workflow run <name>            Manually trigger a workflow
+    ft workflow run <name> --pane <id>  Manually trigger a workflow
 
 SEE ALSO:
     ft events     Detection events that trigger workflows
@@ -1381,7 +1381,7 @@ SEE ALSO:
     /// Secret scanning utilities
     #[command(after_help = r#"EXAMPLES:
     ft secrets scan                    Scan stored output and store a report
-    ft secrets scan --pane 3           Scope scan to a single pane
+    ft secrets scan --pane-id 3        Scope scan to a single pane
     ft secrets report                  Show latest report for scope
     ft secrets report --format json    Machine-readable output
 
@@ -3376,7 +3376,7 @@ enum ReplayCommands {
     ft replay parity
     ft replay parity --pane-id 3
     ft replay parity --run-id shadow-window-20260307
-    ft replay parity --intentional-delta NTM-PARITY-012=TOON stats wording differs
+    ft replay parity --intentional-delta "NTM-PARITY-012=TOON stats wording differs"
 "#)]
     Parity {
         /// Override the parity corpus fixture path
@@ -3530,7 +3530,7 @@ enum SecretsCommands {
     /// Run a secret scan over stored segments and record the report
     #[command(after_help = r#"EXAMPLES:
     ft secrets scan
-    ft secrets scan --pane 3
+    ft secrets scan --pane-id 3
     ft secrets scan --since 1700000000000 --until 1700003600000
     ft secrets scan --format json"#)]
     Scan {
@@ -3570,7 +3570,7 @@ enum SecretsCommands {
     /// Show the latest secret scan report for a scope
     #[command(after_help = r#"EXAMPLES:
     ft secrets report
-    ft secrets report --pane 3
+    ft secrets report --pane-id 3
     ft secrets report --format json"#)]
     Report {
         /// Output format: auto, plain, or json
