@@ -3160,6 +3160,81 @@ pub fn unhandled_events_observation(
     observation
 }
 
+/// Newest active manual pane reservations a live `pane_reservations` source
+/// reads.
+pub const MANUAL_RESERVATIONS_MAX_ROWS: usize = 64;
+
+/// The reservation fields a live `pane_reservations` source uses. The
+/// operator's free-text reason never leaves the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManualReservationRow {
+    pub reservation_id: i64,
+    pub pane_id: u64,
+    pub owner_id: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+/// Live `pane_reservations` source from active, unexpired manual
+/// reservations: panes an operator paused or quarantined (`ft intervene`,
+/// `ft reserve`), which agents must leave alone until released or expired.
+/// One fact per reservation. `None` means the reservations could not be read.
+#[must_use]
+pub fn manual_reservations_observation(
+    reservations: Option<&[ManualReservationRow]>,
+    now_ms: u64,
+) -> AttentionRouterSourceObservation {
+    const SOURCE_ID: &str = "pane_reservations.manual";
+    const API: &str = "storage.pane_reservations.active_manual";
+    let Some(reservations) = reservations else {
+        return AttentionRouterSourceObservation::new(
+            SOURCE_ID,
+            AttentionRouterSourceKind::PaneReservations,
+            AttentionRouterSourceHealth::Unavailable,
+            API,
+            "pane reservations could not be read",
+        )
+        .live(now_ms, 0)
+        .with_fact(
+            AttentionRouterSourceFact::new(
+                AttentionRouterSourceFactKind::SourceUnavailable,
+                "the local pane reservation table is unavailable",
+            )
+            .with_reason_code("pane_reservations.unavailable"),
+        );
+    };
+    let mut observation = AttentionRouterSourceObservation::new(
+        SOURCE_ID,
+        AttentionRouterSourceKind::PaneReservations,
+        AttentionRouterSourceHealth::Available,
+        API,
+        format!("{} active manual pane reservations", reservations.len()),
+    )
+    .live(now_ms, 0)
+    .items_seen(u64::try_from(reservations.len()).unwrap_or(u64::MAX));
+    for reservation in reservations {
+        let expires_in_s = u64::try_from(reservation.expires_at)
+            .unwrap_or(0)
+            .saturating_sub(now_ms)
+            / 1000;
+        let mute_key = format!("attention.pane_reservations.{}", reservation.reservation_id);
+        observation = observation.with_fact(
+            AttentionRouterSourceFact::new(
+                AttentionRouterSourceFactKind::PaneReservationActive,
+                format!(
+                    "pane {} is held by {} (manual reservation {}), expires in {expires_in_s}s [mute: ft mute add {mute_key}]",
+                    reservation.pane_id, reservation.owner_id, reservation.reservation_id
+                ),
+            )
+            .with_agent_name(reservation.owner_id.as_str())
+            .with_affected_path(format!("pane:{}", reservation.pane_id))
+            .with_reason_code("reservation.active_manual")
+            .with_notification_identity_key(mute_key),
+        );
+    }
+    observation
+}
+
 fn missing_source_observation(
     source_kind: AttentionRouterSourceKind,
     generated_at_ms: u64,
@@ -4091,6 +4166,61 @@ mod tests {
         assert!(quiet.facts.is_empty());
         let unreadable = unhandled_events_observation(None, now);
         assert_eq!(unreadable.health, AttentionRouterSourceHealth::Unavailable);
+    }
+
+    #[test]
+    fn live_manual_reservations_are_do_not_touch_items_per_hold() {
+        let now = 1_770_000_000_000_u64;
+        let held = ManualReservationRow {
+            reservation_id: 41,
+            pane_id: 7,
+            owner_id: "operator".to_string(),
+            created_at: 1_769_999_000_000,
+            expires_at: 1_770_000_600_000,
+        };
+        let observation = manual_reservations_observation(Some(std::slice::from_ref(&held)), now);
+        assert_eq!(
+            observation.source_kind,
+            AttentionRouterSourceKind::PaneReservations
+        );
+        assert_eq!(observation.facts.len(), 1);
+        let fact = &observation.facts[0];
+        assert_eq!(
+            fact.fact,
+            AttentionRouterSourceFactKind::PaneReservationActive
+        );
+        assert_eq!(fact.affected_paths, ["pane:7"]);
+        assert_eq!(fact.agent_names, ["operator"]);
+        assert_eq!(
+            fact.notification_identity_key.as_deref(),
+            Some("attention.pane_reservations.41")
+        );
+        assert!(fact.summary.contains("expires in 600s"), "{}", fact.summary);
+
+        let held_items = |snapshot: &AttentionRouterSnapshot| {
+            snapshot
+                .items
+                .iter()
+                .filter(|item| item.classification == AttentionRouterClassification::DoNotTouch)
+                .count()
+        };
+        let snapshot = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation.clone()),
+        );
+        assert_eq!(held_items(&snapshot), 1, "an operator hold is do-not-touch");
+        let muted = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation)
+                .with_notification_mute(AttentionRouterNotificationMute::global(
+                    "attention.pane_reservations.41",
+                )),
+        );
+        assert_eq!(held_items(&muted), 0);
+        assert_eq!(
+            manual_reservations_observation(None, now).health,
+            AttentionRouterSourceHealth::Unavailable
+        );
     }
 
     #[test]

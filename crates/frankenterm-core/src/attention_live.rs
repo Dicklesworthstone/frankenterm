@@ -10,11 +10,13 @@
 use std::path::Path;
 
 use crate::attention_router::{
-    AttentionRouterNotificationMute, AttentionRouterSourceAdapterInput, POLICY_GATE_AUDIT_MAX_ROWS,
+    AttentionRouterNotificationMute, AttentionRouterSourceAdapterInput,
+    MANUAL_RESERVATIONS_MAX_ROWS, ManualReservationRow, POLICY_GATE_AUDIT_MAX_ROWS,
     POLICY_GATE_AUDIT_WINDOW_MS, PolicyGateAuditRow, UNHANDLED_EVENTS_MAX_ROWS,
     UNHANDLED_EVENTS_WINDOW_MS, UnhandledEventRow, VERIFIED_SUBMIT_AUDIT_MAX_ROWS,
-    approval_required_observation_from_audit, policy_denied_observation_from_audit,
-    unhandled_events_observation, verified_submit_observation_from_receipts,
+    approval_required_observation_from_audit, manual_reservations_observation,
+    policy_denied_observation_from_audit, unhandled_events_observation,
+    verified_submit_observation_from_receipts,
 };
 use crate::robot_types::SubmitReceipt;
 use crate::storage::EventMuteRecord;
@@ -28,6 +30,8 @@ pub struct LiveAttentionAudit {
     pub receipts: Option<Vec<(i64, SubmitReceipt)>>,
     /// Unhandled warning and critical detection events.
     pub events: Option<Vec<UnhandledEventRow>>,
+    /// Active, unexpired manual pane reservations (operator holds).
+    pub reservations: Option<Vec<ManualReservationRow>>,
     /// Active `ft mute` records; empty when unreadable, so a read failure
     /// shows items rather than hiding them.
     pub mutes: Vec<EventMuteRecord>,
@@ -43,6 +47,7 @@ impl LiveAttentionAudit {
             approval_required: None,
             receipts: None,
             events: None,
+            reservations: None,
             mutes: Vec::new(),
         }
     }
@@ -56,6 +61,7 @@ impl LiveAttentionAudit {
             approval_required: Some(Vec::new()),
             receipts: Some(Vec::new()),
             events: Some(Vec::new()),
+            reservations: Some(Vec::new()),
             mutes: Vec::new(),
         }
     }
@@ -76,8 +82,9 @@ pub fn attention_mute_from_record(record: &EventMuteRecord) -> AttentionRouterNo
     }
 }
 
-/// Add the audit-backed live sources (policy denials, unresolved approval
-/// holds, verified-submit drift) and the active `ft mute` records to `input`.
+/// Add the database-backed live sources (policy denials, unresolved approval
+/// holds, verified-submit drift, unhandled events, manual pane holds) and the
+/// active `ft mute` records to `input`.
 pub fn apply_live_attention_audit(
     input: &mut AttentionRouterSourceAdapterInput,
     audit: &LiveAttentionAudit,
@@ -103,6 +110,10 @@ pub fn apply_live_attention_audit(
         ));
     input.observations.push(unhandled_events_observation(
         audit.events.as_deref(),
+        now_ms,
+    ));
+    input.observations.push(manual_reservations_observation(
+        audit.reservations.as_deref(),
         now_ms,
     ));
     // Operator mutes (`ft mute add <key>`) suppress matching live facts.
@@ -190,8 +201,38 @@ pub fn read_live_attention_audit(db_path: &Path, now_ms: u64) -> LiveAttentionAu
             i64::try_from(UNHANDLED_EVENTS_MAX_ROWS).unwrap_or(i64::MAX),
         )
         .ok(),
+        reservations: query_active_manual_reservations(
+            &conn,
+            now,
+            i64::try_from(MANUAL_RESERVATIONS_MAX_ROWS).unwrap_or(i64::MAX),
+        )
+        .ok(),
         mutes: query_active_event_mutes(&conn, now).unwrap_or_default(),
     }
+}
+
+/// Active, unexpired manual reservations, with the storage reader's
+/// predicate. The free-text reason column is never selected.
+fn query_active_manual_reservations(
+    conn: &rusqlite::Connection,
+    now_ms: i64,
+    limit: i64,
+) -> rusqlite::Result<Vec<ManualReservationRow>> {
+    let mut statement = conn.prepare(
+        "SELECT id, pane_id, owner_id, created_at, expires_at FROM pane_reservations \
+         WHERE status = 'active' AND expires_at > ?1 AND owner_kind = 'manual' \
+         ORDER BY created_at DESC, id DESC LIMIT ?2",
+    )?;
+    let rows = statement.query_map(rusqlite::params![now_ms, limit], |row| {
+        Ok(ManualReservationRow {
+            reservation_id: row.get(0)?,
+            pane_id: u64::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+            owner_id: row.get(2)?,
+            created_at: row.get(3)?,
+            expires_at: row.get(4)?,
+        })
+    })?;
+    rows.collect()
 }
 
 /// Unhandled warning and critical events, newest first, with the identity
@@ -329,7 +370,47 @@ mod tests {
         assert_eq!(audit.approval_required, Some(Vec::new()));
         assert_eq!(audit.receipts.as_ref().map(Vec::len), Some(0));
         assert_eq!(audit.events, Some(Vec::new()));
+        assert_eq!(audit.reservations, Some(Vec::new()));
         assert!(!db_path.exists(), "a read never creates the database");
+    }
+
+    #[test]
+    fn manual_reservations_are_active_unexpired_operator_holds_without_their_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("ft.db");
+        let conn = rusqlite::Connection::open(&db_path).expect("create db");
+        conn.execute_batch(
+            "CREATE TABLE pane_reservations (id INTEGER PRIMARY KEY, pane_id INTEGER NOT NULL,
+                 owner_kind TEXT NOT NULL, owner_id TEXT NOT NULL, reason TEXT,
+                 created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+                 released_at INTEGER, status TEXT NOT NULL DEFAULT 'active');
+             INSERT INTO pane_reservations VALUES
+                 (1, 7, 'manual', 'operator', 'SECRET REASON', 1000, 900000, NULL, 'active'),
+                 (2, 8, 'manual', 'operator', NULL, 1000, 2000, NULL, 'active'),
+                 (3, 9, 'manual', 'operator', NULL, 1000, 900000, 5000, 'released'),
+                 (4, 10, 'workflow', 'wf-1', NULL, 1000, 900000, NULL, 'active');",
+        )
+        .expect("schema and rows");
+        drop(conn);
+
+        let audit = read_live_attention_audit(&db_path, 300_000);
+        let reservations = audit.reservations.as_ref().expect("reservations readable");
+        assert_eq!(
+            reservations.as_slice(),
+            [ManualReservationRow {
+                reservation_id: 1,
+                pane_id: 7,
+                owner_id: "operator".to_string(),
+                created_at: 1000,
+                expires_at: 900_000,
+            }],
+            "expired, released and workflow holds are left out"
+        );
+        let mut input = AttentionRouterSourceAdapterInput::new(300_000, "workspace");
+        apply_live_attention_audit(&mut input, &audit);
+        let rendered = serde_json::to_string(&input).expect("serialize");
+        assert!(!rendered.contains("SECRET REASON"), "{rendered}");
+        assert!(rendered.contains("expires in 600s"), "{rendered}");
     }
 
     #[test]
@@ -408,8 +489,8 @@ mod tests {
         apply_live_attention_audit(&mut input, &audit);
         assert_eq!(
             input.observations.len(),
-            4,
-            "denied, approvals, receipts, events"
+            5,
+            "denied, approvals, receipts, events, reservations"
         );
         assert!(input.notification_mutes.is_empty());
     }

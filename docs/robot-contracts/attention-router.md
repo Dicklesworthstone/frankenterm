@@ -40,7 +40,11 @@ the last 24 hours (newest 256), leaving out events an operator triaged as
 are grouped by their event identity, the redacted hash `ft mute` keys events
 by, so a repeating detection is one blocker with a count, and a critical one
 carries `event.critical`. Matched text and extracted values are never
-selected into a fact.
+selected into a fact. They also add `pane_reservations`: each active,
+unexpired manual reservation (an operator hold from `ft intervene` or
+`ft reserve`, newest 64) is a do-not-touch item naming the pane, the holder
+and the time left; workflow and agent reservations, and the free-text
+reason, are left out.
 Each live policy-gate, drift and event fact carries a stable mute key, printed
 in its summary (`[mute: ft mute add attention.<source>...]`, or the event's
 `evt:` identity). Live runs load active `ft mute` records from the same
