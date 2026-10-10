@@ -4080,6 +4080,7 @@ GET /stream/deltas       (pane_id, max_hz)
 - Native output coalescing (input events and bytes, emitted batches and bytes, largest batch, coalesce ratio)
 - Event bus publish, drop, subscriber, lag and per-channel queue figures
 - `verified_submit_receipts_total{agent_type,state}`: verified-submit receipts built in the watcher process (workflow `send_verified`); the MCP server logs its `wa.send` receipts as `frankenterm::verified_submit` tracing events instead
+- `verified_submit_idempotency_keys{state}` and `verified_submit_idempotency_oldest_unresolved_age_seconds`: the `wa.send` idempotency store's keys per state and the age of its oldest unresolved key, from a census the watcher takes every 5 minutes; an `in_doubt` key never clears without `wa.send` `reconcile`
 
 ### 5. `ft doctor --json` + diagnostic bundles
 

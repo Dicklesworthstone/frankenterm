@@ -24,6 +24,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const STORE_FILENAME: &str = "submit_idempotency.sqlite3";
@@ -2822,6 +2823,27 @@ pub fn census(ft_dir: &Path) -> Result<Option<SubmitIdempotencyCensus>, SubmitId
     census_with_limits_at(ft_dir, PRODUCTION_LIMITS, now_unix_ms())
 }
 
+/// The last census the watcher published for `/metrics`. Process state, like
+/// the verified-submit receipt counters: the store is read periodically by
+/// the watcher, never by a scrape.
+static PUBLISHED_CENSUS: Mutex<Option<SubmitIdempotencyCensus>> = Mutex::new(None);
+
+/// Publish the watcher's latest census for `/metrics`; `None` withdraws it
+/// (the store could not be read, so stale numbers must not be exported).
+pub fn publish_census(census: Option<SubmitIdempotencyCensus>) {
+    *PUBLISHED_CENSUS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = census;
+}
+
+/// The census most recently published by [`publish_census`].
+#[must_use]
+pub fn published_census() -> Option<SubmitIdempotencyCensus> {
+    *PUBLISHED_CENSUS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
 fn census_with_limits_at(
     ft_dir: &Path,
     limits: StoreLimits,
@@ -4404,6 +4426,19 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         assert_eq!(census(dir.path()), Ok(None));
         assert!(!database_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn published_census_is_the_last_one_published_and_none_withdraws_it() {
+        let stranded = SubmitIdempotencyCensus {
+            in_doubt: 3,
+            oldest_unresolved_updated_unix_ms: Some(42),
+            ..SubmitIdempotencyCensus::default()
+        };
+        publish_census(Some(stranded));
+        assert_eq!(published_census(), Some(stranded));
+        publish_census(None);
+        assert_eq!(published_census(), None);
     }
 
     #[test]

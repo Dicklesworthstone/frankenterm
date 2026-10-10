@@ -48143,14 +48143,22 @@ async fn run_watcher(
         frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(task, shutdown_flag)
     };
 
-    // Raises submit-profile drift (W2.8) as a recorded, published event.
+    // Raises submit-profile drift (W2.8) as a recorded, published event, and
+    // publishes the idempotency store's backlog for /metrics. MCP keeps the
+    // store beside the database, as ft doctor reads it.
     let verified_submit_drift_monitor_handle = {
         let storage = scheduler_storage.clone();
         let event_bus = Arc::clone(&event_bus);
+        let store_dir = layout
+            .db_path
+            .parent()
+            .unwrap_or(&layout.ft_dir)
+            .to_path_buf();
         let shutdown_flag = Arc::clone(&handle.shutdown_flag);
         let task_shutdown_flag = Arc::clone(&shutdown_flag);
         let task = frankenterm_core::runtime_async::task::spawn(async move {
-            run_verified_submit_drift_monitor(storage, event_bus, task_shutdown_flag).await;
+            run_verified_submit_drift_monitor(storage, event_bus, store_dir, task_shutdown_flag)
+                .await;
         });
         frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(task, shutdown_flag)
     };
@@ -48833,9 +48841,31 @@ fn verified_submit_drift_alerts(
 /// mostly unconfirmed, record a `core.verified_submit:profile_drift` event
 /// and publish it, so notifications and workflows see the drift without
 /// anyone running `ft attention`. Uses the attention router's drift rule.
+/// Publish the verified-submit idempotency store's census for `/metrics`.
+/// The store is read only here, on the watcher's own cadence, never per
+/// scrape; a store that cannot be read withdraws the numbers instead of
+/// leaving stale ones.
+async fn publish_submit_idempotency_census(store_dir: &std::path::Path) {
+    use frankenterm_core::submit_idempotency_store as store;
+
+    let dir = store_dir.to_path_buf();
+    match frankenterm_core::runtime_async::task::spawn_blocking(move || store::census(&dir)).await {
+        Ok(Ok(census)) => store::publish_census(Some(census.unwrap_or_default())),
+        Ok(Err(error)) => {
+            tracing::warn!(
+                error_class = error.error_class(),
+                "verified-submit idempotency census failed; withdrawing its metrics"
+            );
+            store::publish_census(None);
+        }
+        Err(_) => store::publish_census(None),
+    }
+}
+
 async fn run_verified_submit_drift_monitor(
     storage: frankenterm_core::storage::StorageHandle,
     event_bus: Arc<frankenterm_core::events::EventBus>,
+    idempotency_store_dir: std::path::PathBuf,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
 ) {
     use std::sync::atomic::Ordering;
@@ -48847,6 +48877,7 @@ async fn run_verified_submit_drift_monitor(
 
     let mut signaled = std::collections::BTreeSet::new();
     loop {
+        publish_submit_idempotency_census(&idempotency_store_dir).await;
         frankenterm_core::runtime_async::select! {
             () = frankenterm_core::runtime_async::sleep(VERIFIED_SUBMIT_DRIFT_CHECK_INTERVAL) => {}
             () = wait_for_shutdown(Arc::clone(&shutdown_flag)) => break,

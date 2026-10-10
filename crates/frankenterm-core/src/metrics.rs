@@ -1273,6 +1273,12 @@ async fn handle_connection_impl(
                 &sanitize_prefix(prefix),
                 &crate::verified_submit::submit_receipt_counts(),
             );
+            render_submit_idempotency_backlog(
+                &mut body,
+                &sanitize_prefix(prefix),
+                crate::submit_idempotency_store::published_census(),
+                i64::try_from(epoch_ms_u64()).unwrap_or(i64::MAX),
+            );
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
                 body.len(),
@@ -1496,6 +1502,58 @@ fn render_verified_submit_receipts(
             ("state", count.state),
         ]);
         let _ = writeln!(output, "{name}{labels} {}", count.count);
+    }
+}
+
+/// The verified-submit idempotency backlog from the watcher's last store
+/// census: keys per state, and the age of the oldest unresolved (active,
+/// effect-pending or in-doubt) key, which never resolves without an owner or
+/// an operator's `wa.send reconcile`.
+fn render_submit_idempotency_backlog(
+    output: &mut String,
+    prefix: &str,
+    census: Option<crate::submit_idempotency_store::SubmitIdempotencyCensus>,
+    now_unix_ms: i64,
+) {
+    use std::fmt::Write as _;
+
+    let Some(census) = census else {
+        return;
+    };
+    let name = metric_name(prefix, "verified_submit_idempotency_keys");
+    let _ = writeln!(
+        output,
+        "# HELP {name} Verified-submit idempotency keys by state at the watcher's last store census"
+    );
+    let _ = writeln!(output, "# TYPE {name} gauge");
+    for (state, count) in [
+        ("active_owner", census.active_owner),
+        (
+            "effect_applied_receipt_pending",
+            census.effect_applied_receipt_pending,
+        ),
+        ("in_doubt", census.in_doubt),
+        ("completed", census.completed),
+        ("retryable", census.retryable),
+    ] {
+        let labels = format_prometheus_labels(&[("state", state)]);
+        let _ = writeln!(output, "{name}{labels} {count}");
+    }
+    if let Some(oldest) = census.oldest_unresolved_updated_unix_ms {
+        let name = metric_name(
+            prefix,
+            "verified_submit_idempotency_oldest_unresolved_age_seconds",
+        );
+        let _ = writeln!(
+            output,
+            "# HELP {name} Age of the oldest active, effect-pending or in-doubt idempotency key"
+        );
+        let _ = writeln!(output, "# TYPE {name} gauge");
+        let _ = writeln!(
+            output,
+            "{name} {}",
+            now_unix_ms.saturating_sub(oldest).max(0) / 1000
+        );
     }
 }
 
@@ -1983,6 +2041,45 @@ mod pure_tests {
              ft_verified_submit_receipts_total{agent_type=\"codex\",state=\"stuck_in_composer\"} 3\n\
              ft_verified_submit_receipts_total{agent_type=\"unknown\",state=\"submitted\"} 1\n"
         );
+    }
+
+    #[test]
+    fn submit_idempotency_backlog_renders_keys_by_state_and_the_oldest_unresolved_age() {
+        use crate::submit_idempotency_store::SubmitIdempotencyCensus;
+
+        let mut rendered = String::new();
+        render_submit_idempotency_backlog(&mut rendered, "ft", None, 0);
+        assert!(rendered.is_empty(), "no published census, no metric family");
+
+        let settled = SubmitIdempotencyCensus {
+            completed: 4,
+            ..SubmitIdempotencyCensus::default()
+        };
+        render_submit_idempotency_backlog(&mut rendered, "ft", Some(settled), 0);
+        assert!(rendered.contains("ft_verified_submit_idempotency_keys{state=\"completed\"} 4\n"));
+        assert!(rendered.contains("ft_verified_submit_idempotency_keys{state=\"in_doubt\"} 0\n"));
+        assert!(
+            !rendered.contains("oldest_unresolved"),
+            "no unresolved key, no age gauge: {rendered}"
+        );
+
+        let mut rendered = String::new();
+        let stranded = SubmitIdempotencyCensus {
+            in_doubt: 2,
+            effect_applied_receipt_pending: 1,
+            oldest_unresolved_updated_unix_ms: Some(10_000),
+            ..SubmitIdempotencyCensus::default()
+        };
+        render_submit_idempotency_backlog(&mut rendered, "ft", Some(stranded), 130_500);
+        assert!(rendered.contains("# TYPE ft_verified_submit_idempotency_keys gauge\n"));
+        assert!(rendered.contains("ft_verified_submit_idempotency_keys{state=\"in_doubt\"} 2\n"));
+        assert!(rendered.contains(
+            "ft_verified_submit_idempotency_keys{state=\"effect_applied_receipt_pending\"} 1\n"
+        ));
+        assert!(rendered.contains(
+            "# TYPE ft_verified_submit_idempotency_oldest_unresolved_age_seconds gauge\n\
+             ft_verified_submit_idempotency_oldest_unresolved_age_seconds 120\n"
+        ));
     }
 
     #[test]

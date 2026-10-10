@@ -486,7 +486,10 @@ receipt is also logged as a
 `profile_id`, `profile_version`, `state`, `guarantee_level`, `guarantee_met`,
 `elapsed_ms`, `polls`, and `attempts`, never the sent text or the idempotency
 key; `ft watch --metrics` counts the watcher's receipts as
-`verified_submit_receipts_total{agent_type,state}`.
+`verified_submit_receipts_total{agent_type,state}`. It also exports the
+idempotency store's backlog from a census the watcher takes every 5 minutes:
+`verified_submit_idempotency_keys{state}` and, while any key is unresolved,
+`verified_submit_idempotency_oldest_unresolved_age_seconds`.
 
 `ft robot health` includes an `active_agents` snapshot for operator
 convergence polling. The snapshot is bounded and evidence-linked; unavailable
