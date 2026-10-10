@@ -366,16 +366,16 @@ Honest status of every shipped surface, without migration-era hand-waving.
 | Search / events / audit / workflows / mission / tx | **Supported** | Backed by local storage, policy, and workflow subsystems |
 | Robot mode | **Supported** | All core families: `state`, `get-text`, `send`, `wait-for`, `search`, `events`, `rules`, `workflow`, `agents`, `accounts`, `reservations`, `mission`, `tx`, `health`, `proof status`, `approve`, `checkpoint`, `context`, `work`, `fleet`, `profile`, `connector`, `kill-switch` (persisted operator switch with scoped fence receipts; [docs/robot-contracts/kill-switch.md](docs/robot-contracts/kill-switch.md)). NTM-gap fallback retired. **Caveats:** the `agents` family is gated behind the (default-on) `agent-detection` feature — a `--no-default-features` build returns `robot.feature_not_available` for it (see the [Compile-Time Feature Matrix](#compile-time-feature-matrix)); the `connector` family's non-dry-run `uninstall`/`rollback` are approval-blocked pending the robot approval-token gate (see [docs/robot-contracts/connector.md](docs/robot-contracts/connector.md)) |
 | Operating envelope | **Supported** | `ft.operating_envelope.v1` planner contract + golden fixtures; fails closed on missing or critical-pressure telemetry |
-| Mission objective planner | **Supported** | Capacity-aware planner for safe swarm orchestration (ft-auy2g) |
+| Mission objective planner | **Supported** | Read-only objective planner; the capacity posture is caller-supplied (`--capacity-posture`), not read from the operating envelope (ft-auy2g) |
 | Incident bundles | **Partial** | `ft reproduce export` collects recent events, stored pane rows, DB metadata, config, git state and the beads snapshot; audit tail included, process tree opt-in (`--process-sample`); GPU, render and BSU/ESU collectors are not on the production path |
 | Session persistence | **Capture/inspect/export supported; restore execution unavailable** | Snapshot save/list/inspect/pane-membership diff/delete, `ft session doctor`, `ft session dump`, and read-only `ft session list-durable` / `export-durable` ship. The live dump is a private, redacted, checksummed export of live pane text plus bounded topology metadata; the durable export reads the committed cold-scrollback prefix for one stable pane UUID. Neither is a process checkpoint or executable restore image. `ft snapshot restore` and robot checkpoint rollback accept metadata-only `--dry-run` descriptor/status reporting, but every non-dry invocation fails closed before database resolution, process discovery, subprocess launch, or mux mutation. Production does not currently restore panes, processes, hot viewport, mux domains, window/workspace placement, durable tab order, stable active-tab identity, or full appearance. |
 | Reality-check + attestation | **Supported** | `ft attestation verify` / `show` ship as a thin Rust wrapper over `scripts/attestation-verify.sh`. Signed bundles live in `docs/attestations/` |
 | Deferred proof queue | **Supported with fail-closed proof prerequisite** | `ft proof queue/status/replay/attach` and `ft robot proof status` expose source-landed proof intents. Replay executes only through remote-required RCH when admission is explicitly `admitted`; local Cargo is never substituted. Release-slot evidence stays under `docs/attestations/proofs/deferred-proof-replay.json`; current W8.2 remote proof remains blocked on RCH admission. |
-| Web API / SSE | **Supported behind `--features web`** | `/health`, `/panes`, `/events`, `/search`, `/stream/events`, `/stream/deltas` |
-| Distributed mode | **Supported behind `--features distributed`** | Remote panes persist into the same DB and surface through status/search/state; live `get-text` for distributed panes is intentionally unavailable |
-| MCP server | **Supported behind `--features mcp`** | stdio tool surface; per-family Robot parity is scoped in [`docs/robot-contracts/mcp-robot-surface-matrix.md`](docs/robot-contracts/mcp-robot-surface-matrix.md) |
+| Web API / SSE | **Supported (`web` feature, on by default)** | `/health`, `/panes`, `/events`, `/search`, `/stream/events`, `/stream/deltas` |
+| Distributed mode | **Supported (`distributed` feature, on by default)** | Remote panes persist into the same DB and surface through status/search/state; live `get-text` for distributed panes is intentionally unavailable |
+| MCP server | **Supported (`mcp` feature, on by default)** | stdio tool surface; per-family Robot parity is scoped in [`docs/robot-contracts/mcp-robot-surface-matrix.md`](docs/robot-contracts/mcp-robot-surface-matrix.md) |
 | Semantic search | **Supported (hash embeddings)** | Hybrid mode fuses FTS5 with a built-in FNV-1a hash-embedding lane via RRF; fastembed/ML models and a Tantivy index are not on the production path |
-| Browser auth tooling | **Feature-gated** | `ft auth` is real, but only in builds that include the browser feature and a usable browser stack |
+| Browser auth tooling | **Feature-gated (on by default)** | `ft auth` is real; it needs the `browser` feature (in default builds) and a usable browser stack on the host |
 | GUI (FrankenTerm.app) | **Supported on macOS** | Native macOS bundle; live render-state plumbing, BSU/ESU sync-output, classified drag handlers, command-palette domain labels |
 
 ---
@@ -1060,7 +1060,7 @@ Cargo, target-class capacity, live-pane mutation, or production-scale behavior.
 
 ### Web API (feature-gated)
 
-Build with `--features web`, then run `ft web` to expose a local HTTP surface on `127.0.0.1:8000` by default.
+Run `ft web` (the `web` feature is in default builds) to expose a local HTTP surface on `127.0.0.1:8000` by default.
 
 ```bash
 ft web
