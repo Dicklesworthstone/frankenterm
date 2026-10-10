@@ -40012,7 +40012,7 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 summary: "Fetch recent pattern detection events (with optional workflow preview)",
                 examples: vec![
                     "ft robot events",
-                    "ft robot events --rule-id codex.usage_reached",
+                    "ft robot events --rule-id codex.usage.reached",
                     "ft robot events --would-handle --dry-run",
                 ],
             },
@@ -138337,6 +138337,84 @@ printf x > "$MINISIGN_MARKER"
             },
             _ => panic!("expected Robot command"),
         }
+    }
+
+    /// Agents copy quick-start commands verbatim, so every runnable one must
+    /// still parse. `<placeholder>` text becomes `0` before parsing.
+    #[test]
+    fn robot_quick_start_commands_parse_with_the_current_cli() {
+        fn shell_split(command: &str) -> Vec<String> {
+            let mut words = Vec::new();
+            let mut word = String::new();
+            let mut in_word = false;
+            let mut quote: Option<char> = None;
+            for character in command.chars() {
+                match (quote, character) {
+                    (Some(open), c) if c == open => quote = None,
+                    (Some(_), c) => word.push(c),
+                    (None, '"' | '\'') => {
+                        quote = Some(character);
+                        in_word = true;
+                    }
+                    (None, c) if c.is_whitespace() => {
+                        if in_word {
+                            words.push(std::mem::take(&mut word));
+                            in_word = false;
+                        }
+                    }
+                    (None, c) => {
+                        word.push(c);
+                        in_word = true;
+                    }
+                }
+            }
+            if in_word {
+                words.push(word);
+            }
+            words
+                .into_iter()
+                .map(|word| {
+                    let mut filled = String::new();
+                    let mut rest = word.as_str();
+                    while let Some(start) = rest.find('<') {
+                        let Some(end) = rest[start..].find('>') else {
+                            break;
+                        };
+                        filled.push_str(&rest[..start]);
+                        filled.push('0');
+                        rest = &rest[start + end + 1..];
+                    }
+                    filled.push_str(rest);
+                    filled
+                })
+                .collect()
+        }
+
+        let quick_start = build_robot_quick_start();
+        let commands = quick_start
+            .core_loop
+            .iter()
+            .map(|step| step.command)
+            .chain(
+                quick_start
+                    .commands
+                    .iter()
+                    .flat_map(|command| command.examples.iter().copied()),
+            )
+            .filter(|command| command.starts_with("ft "));
+        let mut parsed = 0;
+        let mut failures = Vec::new();
+        for command in commands {
+            match Cli::try_parse_from(shell_split(command)) {
+                Ok(_) => parsed += 1,
+                Err(error) => failures.push(format!("{command}: {:?}", error.kind())),
+            }
+        }
+        assert!(parsed > 50, "quick start lost its examples ({parsed})");
+        assert!(
+            failures.is_empty(),
+            "quick-start commands the CLI rejects: {failures:#?}"
+        );
     }
 
     #[test]
