@@ -476,7 +476,8 @@ impl SchemaRegistry {
                     title: "Show Rule".into(),
                     description: "Show full rule details".into(),
                     robot_command: Some("robot rules show".into()),
-                    mcp_tool: Some("wa.rules_show".into()),
+                    // No registered MCP twin (mcp_bridge.rs tool catalogs).
+                    mcp_tool: None,
                     schema_file: "wa-robot-rules-show.json".into(),
                     stable: false,
                     since: "0.1.0".into(),
@@ -577,7 +578,8 @@ impl SchemaRegistry {
                     title: "Submit Approval".into(),
                     description: "Submit an approval code".into(),
                     robot_command: Some("robot approve".into()),
-                    mcp_tool: Some("wa.approve".into()),
+                    // No registered MCP twin (mcp_bridge.rs tool catalogs).
+                    mcp_tool: None,
                     schema_file: "wa-robot-approve.json".into(),
                     stable: true,
                     since: "0.1.0".into(),

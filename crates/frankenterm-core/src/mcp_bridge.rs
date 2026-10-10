@@ -751,6 +751,28 @@ mod tests {
         build_server_degraded(config)
     }
 
+    /// The API schema registry (and the docs generated from it) may only name
+    /// MCP tools this server registers; it once advertised wa.rules_show and
+    /// wa.approve, which never existed.
+    #[test]
+    fn api_schema_mcp_tools_are_registered_tools() {
+        let registered: std::collections::BTreeSet<&str> = DEGRADED_MODE_BASE_TOOL_NAMES
+            .iter()
+            .chain(DB_GATED_AUDITED_TOOL_NAMES)
+            .copied()
+            .collect();
+        let unregistered: Vec<String> = crate::api_schema::SchemaRegistry::canonical()
+            .endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.mcp_tool.clone())
+            .filter(|tool| !registered.contains(tool.as_str()))
+            .collect();
+        assert!(
+            unregistered.is_empty(),
+            "API schema names MCP tools the server does not register: {unregistered:?}"
+        );
+    }
+
     #[test]
     fn cancelled_owner_rejects_startup_before_catalog_registration() {
         let _guard = mcp_bridge_counter_test_lock();
