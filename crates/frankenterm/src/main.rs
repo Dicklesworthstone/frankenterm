@@ -100192,10 +100192,13 @@ async fn run_diagnostics_with_mux_client(
         }
     }
 
-    // Check 4b: verified-submit idempotency store occupancy. Read-only; a
-    // missing store is never created here.
+    // Check 4b: verified-submit idempotency store occupancy. No record changes
+    // and a missing store is never created. MCP keeps the store beside the
+    // database, which a configured absolute db_path can move out of .ft.
     checks.push(submit_idempotency_store_diagnostic_check(
-        frankenterm_core::submit_idempotency_store::census(&layout.ft_dir),
+        frankenterm_core::submit_idempotency_store::census(
+            layout.db_path.parent().unwrap_or(&layout.ft_dir),
+        ),
         now_epoch_ms(),
     ));
 

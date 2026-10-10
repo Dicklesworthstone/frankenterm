@@ -162,11 +162,11 @@ ft reproduce export [--kind <crash|manual>] [--out <dir>] [--format <text|json>]
 ft reproduce replay <bundle_dir> [--mode <full|policy|rules>]
 ```
 
-`ft doctor` includes a read-only `submit idempotency store` row: record and
-logical-byte occupancy, per-state counts (completed, retryable, active, effect
-pending, in doubt), how many settled rows are already evictable, and the age of
-the oldest unresolved send. It never creates the store and prints no keys,
-panes, or receipts. A store at its ceiling is normal while eviction can reclaim
+`ft doctor` includes a `submit idempotency store` row for the store kept
+beside the database: record and logical-byte occupancy, per-state counts
+(completed, retryable, active, effect pending, in doubt), how many settled rows
+are already evictable, and the age of the oldest unresolved send. It never
+creates the store or changes a record, and prints no keys, panes, or receipts. A store at its ceiling is normal while eviction can reclaim
 it; the row warns when three quarters is pinned by unresolved or recent rows and
 errors when a new idempotency key would be refused with `capacity_exceeded`.
 
