@@ -138533,6 +138533,120 @@ printf x > "$MINISIGN_MARKER"
         );
     }
 
+    /// `ft ...` spans in backticks outside fenced blocks: prose often names a
+    /// command without its arguments, so only spans that name a missing
+    /// subcommand or flag, or pass a rejected value, fail. Shorthand is not a
+    /// command: alternations (`run/rollback`), wildcards, ellipses and
+    /// version strings (`ft 0.13.0`) are skipped.
+    fn inline_doc_commands(markdown: &str) -> Vec<String> {
+        let mut commands = Vec::new();
+        let mut in_fence = false;
+        for line in markdown.lines() {
+            if line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+                continue;
+            }
+            if in_fence {
+                continue;
+            }
+            for (index, span) in line.split('`').enumerate() {
+                if index % 2 == 0 {
+                    continue;
+                }
+                let Some(command) = runnable_example(span) else {
+                    continue;
+                };
+                let words: Vec<&str> = command.split_whitespace().collect();
+                let shorthand = words.iter().any(|word| {
+                    word.contains('*')
+                        || word.contains('…')
+                        || (word.contains('/')
+                            && !word.starts_with(['.', '/', '~', '$', '<'])
+                            && !word.contains('.'))
+                }) || words
+                    .get(1)
+                    .is_some_and(|word| word.starts_with(|c: char| c.is_ascii_digit()));
+                if !shorthand {
+                    commands.push(command.to_string());
+                }
+            }
+        }
+        commands
+    }
+
+    #[test]
+    fn documented_inline_ft_commands_name_real_commands() {
+        use clap::error::ErrorKind;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut documents: Vec<std::path::PathBuf> = [
+            "README.md",
+            "docs/operator-playbook.md",
+            "docs/operator-runbook.md",
+            "docs/incident-bundles.md",
+            "docs/session-persistence.md",
+            "docs/session-persistence-troubleshooting.md",
+            "docs/storage-tuning.md",
+            "docs/search-explainability.md",
+            "docs/swarm-playbook.md",
+            "docs/high-core-swarm-runbook.md",
+            "docs/noise-control.md",
+            "docs/approvals.md",
+            "docs/explain-match.md",
+            "docs/cli-reference.md",
+            "docs/frankenterm-gui-user-guide.md",
+            "docs/ft-xbnl0-5-3-blessed-tuning-playbook.md",
+            "docs/flight-recorder/alerts-wa-oegrb-8-4.md",
+            "docs/flight-recorder/ops-runbook-wa-oegrb-8-4.md",
+            "docs/flight-recorder/incident-response-wa-oegrb-8-5.md",
+            "docs/resource-pressure-cockpit-contract.md",
+            "docs/blocker-radar-runbook.md",
+            "docs/context-horizon-contract.md",
+            "docs/rch-admission-contract.md",
+            "docs/saved-searches-spec.md",
+        ]
+        .into_iter()
+        .map(|path| root.join(path))
+        .collect();
+        let contracts = std::fs::read_dir(root.join("docs/robot-contracts"))
+            .expect("docs/robot-contracts is readable");
+        for entry in contracts {
+            let path = entry.expect("contract entry").path();
+            if path.extension().is_some_and(|extension| extension == "md") {
+                documents.push(path);
+            }
+        }
+        let mut checked = 0;
+        let mut failures = Vec::new();
+        for document in &documents {
+            let markdown = std::fs::read_to_string(document)
+                .unwrap_or_else(|error| panic!("{}: {error}", document.display()));
+            for command in inline_doc_commands(&markdown) {
+                checked += 1;
+                if let Err(error) = Cli::try_parse_from(example_command_words(&command))
+                    && !matches!(
+                        error.kind(),
+                        ErrorKind::MissingRequiredArgument
+                            | ErrorKind::MissingSubcommand
+                            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                            | ErrorKind::DisplayHelp
+                            | ErrorKind::DisplayVersion
+                    )
+                {
+                    failures.push(format!(
+                        "{}: {command}: {:?}",
+                        document.strip_prefix(&root).unwrap_or(document).display(),
+                        error.kind()
+                    ));
+                }
+            }
+        }
+        assert!(checked > 400, "inline doc commands shrank to {checked}");
+        assert!(
+            failures.is_empty(),
+            "docs name commands the CLI rejects: {failures:#?}"
+        );
+    }
+
     /// Remediation hints, see-also lists, tutorials and error hints tell
     /// operators and agents which `ft` command to run next; every one must
     /// parse with the current CLI.

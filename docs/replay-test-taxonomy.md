@@ -138,7 +138,7 @@ The replay system requires six distinct test coverage classes. Each track
 | E-01 | Capture-replay roundtrip | `ft replay` on captured trace exits 0, equivalence report shows L1 pass |
 | E-02 | Regression suite pass | `ft replay regression-suite` exits 0 on clean codebase |
 | E-03 | Regression suite detect | `ft replay regression-suite` exits non-zero after intentional pattern change |
-| E-04 | Counterfactual diff | `ft replay --candidate <modified_rules>` produces decision-diff with expected divergences |
+| E-04 | Counterfactual diff | `ft replay diff --baseline <baseline.ftreplay> --candidate <candidate.ftreplay>` produces decision-diff with expected divergences |
 | E-05 | Speed control | Replay at 1x, 2x, instant all produce L1-equivalent results |
 | E-06 | Pane filter | Replay with `--pane-filter` produces subset-equivalent results |
 

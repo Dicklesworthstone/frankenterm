@@ -188,7 +188,7 @@ it didn't:
 
 Muted events are stored normally — they appear in event listings and
 search results. Their status is `muted` rather than `unhandled`. Use
-`ft events list` to see all events including muted ones.
+`ft events` to see all events including muted ones.
 
 ## Configuration Summary
 

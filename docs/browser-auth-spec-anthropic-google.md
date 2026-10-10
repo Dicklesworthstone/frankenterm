@@ -108,7 +108,7 @@ pub enum AuthResult {
 
 ## 9. Recommended Trigger Points
 
-- **Manual**: `ft status --refresh-auth` (explicit operator request).
+- **Manual**: `ft auth bootstrap <service>` (explicit operator request).
 - **Workflow**: `handle_usage_limits` for Anthropic/Gemini.
 - **Periodic**: optional background refresh with a strict cooldown.
 
