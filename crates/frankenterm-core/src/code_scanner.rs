@@ -1554,6 +1554,12 @@ mod tests {
         use crate::runtime_async::CompatRuntime;
         use std::os::unix::fs::{PermissionsExt, symlink};
 
+        /// Caller deadline and scan timeout for tests that spawn real git and
+        /// scanner processes. Speed is not under test, and on a saturated
+        /// full-suite worker spawning alone outran the former 5 s. Tests of
+        /// the timeout path set their own short `timeout_ms`.
+        const PROCESS_TEST_BUDGET: Duration = Duration::from_secs(30);
+
         struct Fixture {
             base: PathBuf,
             root: PathBuf,
@@ -1621,7 +1627,7 @@ report() {{
                     scope: ScanScope::Path {
                         path: PathBuf::from("src"),
                     },
-                    timeout_ms: 5000,
+                    timeout_ms: 30_000,
                 }
             }
 
@@ -1642,7 +1648,7 @@ report() {{
                     .args(args)
                     .stdout_limit(MAX_STDERR_BYTES)
                     .stderr_limit(MAX_STDERR_BYTES)
-                    .output_blocking(Duration::from_secs(5))
+                    .output_blocking(PROCESS_TEST_BUDGET)
                     .unwrap();
                 assert!(
                     output.status.success(),
@@ -1680,7 +1686,7 @@ exit 1"#,
                         &mut PolicyEngine::permissive(),
                         ActorKind::Human,
                         &fixture.request(),
-                        Instant::now() + Duration::from_secs(5),
+                        Instant::now() + PROCESS_TEST_BUDGET,
                     )
                     .await
                     .unwrap();
@@ -1790,7 +1796,7 @@ report 0"#,
                             &mut PolicyEngine::permissive(),
                             ActorKind::Human,
                             &request,
-                            Instant::now() + Duration::from_secs(5),
+                            Instant::now() + PROCESS_TEST_BUDGET,
                         )
                         .await
                         .unwrap();
@@ -1861,7 +1867,7 @@ report 0"#,
                             &mut PolicyEngine::permissive(),
                             ActorKind::Human,
                             &request,
-                            Instant::now() + Duration::from_secs(5),
+                            Instant::now() + PROCESS_TEST_BUDGET,
                         )
                         .await
                         .unwrap_err();
@@ -1884,7 +1890,7 @@ report 0"#,
         fn immutable_snapshot_survives_project_mutation_and_detects_changed_captured_bytes() {
             let fixture = Fixture::new("report 0", SUPPORTED_UBS_VERSION);
             let cx = crate::cx::for_testing();
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + PROCESS_TEST_BUDGET;
             let source = open_root_nofollow(&fixture.root).unwrap();
             let destination = open_root_nofollow(&fixture.base.join("retained")).unwrap();
             let paths = BTreeSet::from([PathBuf::from("src/selected.rs")]);
@@ -1935,7 +1941,7 @@ report 0"#,
                             &mut PolicyEngine::permissive(),
                             ActorKind::Human,
                             &request,
-                            Instant::now() + Duration::from_secs(5),
+                            Instant::now() + PROCESS_TEST_BUDGET,
                         )
                         .await
                         .unwrap_err();
@@ -1967,7 +1973,7 @@ report 0"#,
                             &mut policy,
                             ActorKind::Human,
                             &fixture.request(),
-                            Instant::now() + Duration::from_secs(5),
+                            Instant::now() + PROCESS_TEST_BUDGET,
                         )
                         .await
                         .unwrap_err();
@@ -2020,7 +2026,7 @@ report 0"#,
                             &mut PolicyEngine::permissive(),
                             ActorKind::Human,
                             &fixture.request(),
-                            Instant::now() + Duration::from_secs(5),
+                            Instant::now() + PROCESS_TEST_BUDGET,
                         )
                         .await
                         .unwrap_err();
@@ -2055,7 +2061,7 @@ report 0"#,
                         &mut PolicyEngine::permissive(),
                         ActorKind::Human,
                         &fixture.request(),
-                        Instant::now() + Duration::from_secs(5),
+                        Instant::now() + PROCESS_TEST_BUDGET,
                     )
                     .await
                     .unwrap_err();
@@ -2065,7 +2071,7 @@ report 0"#,
                 let canceller = cx.clone();
                 let marker = fixture.base.join("scan.pid");
                 let trigger = std::thread::spawn(move || {
-                    let deadline = Instant::now() + Duration::from_secs(4);
+                    let deadline = Instant::now() + PROCESS_TEST_BUDGET / 2;
                     while !marker.is_file() && Instant::now() < deadline {
                         std::thread::sleep(Duration::from_millis(5));
                     }
@@ -2085,7 +2091,7 @@ report 0"#,
                         &mut PolicyEngine::permissive(),
                         ActorKind::Human,
                         &fixture.request(),
-                        Instant::now() + Duration::from_secs(5),
+                        Instant::now() + PROCESS_TEST_BUDGET,
                     )
                     .await
                     .unwrap_err();
@@ -2142,7 +2148,7 @@ report 0"#,
                 let mut policy = PolicyEngine::permissive();
                 let result = source.restore(
                     &crate::cx::for_testing(),
-                    Instant::now() + Duration::from_secs(5),
+                    Instant::now() + PROCESS_TEST_BUDGET,
                     &mut policy,
                 );
                 assert!(
@@ -2200,7 +2206,7 @@ report 0"#,
                         &mut PolicyEngine::permissive(),
                         ActorKind::Human,
                         &request,
-                        Instant::now() + Duration::from_secs(5),
+                        Instant::now() + PROCESS_TEST_BUDGET,
                     )
                     .await
                     .unwrap_err();
@@ -2219,7 +2225,7 @@ report 0"#,
                             &mut PolicyEngine::permissive(),
                             ActorKind::Human,
                             &fixture.request(),
-                            Instant::now() + Duration::from_secs(5),
+                            Instant::now() + PROCESS_TEST_BUDGET,
                         )
                         .await
                         .unwrap_err();
@@ -2235,7 +2241,7 @@ report 0"#,
         fn snapshot_capability_rejects_replaced_ancestor_and_retains_original_bytes() {
             let fixture = Fixture::new("report 0", SUPPORTED_UBS_VERSION);
             let cx = crate::cx::for_testing();
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + PROCESS_TEST_BUDGET;
             let source = open_root_nofollow(&fixture.root).unwrap();
             let (paths, _) = collect_rust_paths(&cx, deadline, &source, Path::new("src")).unwrap();
             let outside = fixture.base.join("outside");
@@ -2299,7 +2305,7 @@ report 0"#,
             let directory = open_root_nofollow(&fixture.root).unwrap();
             let (paths, excluded) = collect_rust_paths(
                 &cx,
-                Instant::now() + Duration::from_secs(5),
+                Instant::now() + PROCESS_TEST_BUDGET,
                 &directory,
                 Path::new(""),
             )
