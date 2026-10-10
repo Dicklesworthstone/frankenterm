@@ -1279,7 +1279,7 @@ impl WaModel {
         } else {
             self.triage_queued_action = None;
             self.view_state.error_message =
-                Some("Saved search has no schedule; set one via `ft search saved schedule`".into());
+                Some("Saved search has no schedule; set one via `ft search saved schedule <name> <interval-ms>`".into());
         }
     }
 
@@ -3245,7 +3245,7 @@ fn render_panes_view(
         let next_action = if selected_profile != active_profile {
             format!("Apply selected profile: ft rules profile apply {selected_profile}")
         } else if !pane.unhandled_badge.is_empty() {
-            format!("Run: ft workflow list --pane {}", pane.pane_id)
+            format!("Run: ft events --pane-id {} --unhandled", pane.pane_id)
         } else {
             format!("Inspect: ft robot get-text {} --tail 120", pane.pane_id)
         };

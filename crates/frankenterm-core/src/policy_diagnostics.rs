@@ -297,7 +297,7 @@ fn check_quarantine(engine: &PolicyEngine, now_ms: u64) -> RuntimeHealthCheck {
         )
         .with_evidence(&format!("active_quarantines={}", active.len()))
         .with_remediation(
-            RemediationHint::text("Review kill switch state: ft audit --decision deny")
+            RemediationHint::with_command("Review kill switch state", "ft audit --decision deny")
                 .effort(RemediationEffort::High),
         )
     } else if ks_level == crate::policy_quarantine::KillSwitchLevel::SoftStop {
@@ -452,8 +452,11 @@ fn check_approvals(engine: &mut PolicyEngine, now_ms: u64) -> RuntimeHealthCheck
             snap.total, snap.approved, snap.rejected, snap.revoked,
         ))
         .with_remediation(
-            RemediationHint::text("Review and resolve pending approvals: ft approve --list")
-                .effort(RemediationEffort::Medium),
+            RemediationHint::with_command(
+                "Review and resolve pending approvals",
+                "ft approvals list",
+            )
+            .effort(RemediationEffort::Medium),
         )
     } else {
         RuntimeHealthCheck::pass(

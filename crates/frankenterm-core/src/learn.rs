@@ -446,8 +446,8 @@ impl TutorialEngine {
                             "Run: ft watch".into(),
                             "The watcher starts in the background".into(),
                         ],
-                        verification_command: Some("ft status --json".into()),
-                        verification_pattern: Some("\"running\"\\s*:\\s*true".into()),
+                        verification_command: Some("ft status --health".into()),
+                        verification_pattern: Some("\"watcher_running\"\\s*:\\s*true".into()),
                         requirements: vec![Requirement::WeztermRunning],
                         can_simulate: true,
                     },
@@ -629,7 +629,7 @@ impl TutorialEngine {
                         description: "Preview a workflow step plan without executing side effects"
                             .into(),
                         instructions: vec![
-                            "Run: ft workflow run handle_compaction --dry-run".into(),
+                            "Run: ft workflow run handle_compaction --pane <pane-id> --dry-run".into(),
                             "Inspect the generated steps and verification expectations.".into(),
                         ],
                         verification_command: None,
@@ -901,7 +901,7 @@ impl TutorialEngine {
                             "Ask FrankenTerm to explain its decisions: why a detection fired, why a workflow ran."
                                 .into(),
                         instructions: vec![
-                            "Run: ft why <event-id> -- to trace a detection back to its rule and workflow.".into(),
+                            "Run: ft why --recent -- to trace recent decisions back to their rules and workflows.".into(),
                             "Review the explain output: matched rule, anchors hit, regex groups, workflow steps.".into(),
                             "Goal: debug unexpected detections or missing matches.".into(),
                         ],

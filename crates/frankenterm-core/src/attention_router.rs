@@ -3142,7 +3142,7 @@ fn push_unique(values: &mut Vec<String>, value: impl Into<String>) {
     }
 }
 
-// ── W6.2 (ft-7h5da.7.2): deterministic ranked `ft robot next` advisory view ──
+// ── W6.2 (ft-7h5da.7.2): deterministic ranked `ft robot attention next` advisory view ──
 //
 // Layers a deterministic ranking (severity x age x pane-priority) with a
 // MANDATORY `reasons[]` rationale and a self-teaching `suggested_command` on top
@@ -3224,7 +3224,7 @@ pub struct AttentionRouterNextScore {
     pub composite: u64,
 }
 
-/// A single ranked entry in the `ft robot next` advisory view.
+/// A single ranked entry in the `ft robot attention next` advisory view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttentionRouterNextEntry {
     /// 1-based position in the full ranked list (assigned before any budget
@@ -3362,16 +3362,16 @@ fn attention_router_next_suggested_command(item: &AttentionRouterItem) -> String
     if let Some(hint) = item.recommended_action.command_hint.as_ref() {
         let trimmed = hint.trim();
         if !trimmed.is_empty() {
-            return bounded_string(trimmed, "ft robot next --explain");
+            return bounded_string(trimmed, "ft robot attention explain");
         }
     }
     // Otherwise derive a safe, self-teaching default from the subject. `br show`
-    // and `ft robot next --explain` are read-only and always valid.
+    // and `ft robot attention explain` are read-only and always valid.
     let command = match item.subject.bead_id.as_deref() {
         Some(bead_id) if !bead_id.trim().is_empty() => format!("br show {}", bead_id.trim()),
-        _ => format!("ft robot next --explain {}", item.item_id),
+        _ => format!("ft robot attention explain {}", item.item_id),
     };
-    bounded_string(command, "ft robot next --explain")
+    bounded_string(command, "ft robot attention explain")
 }
 
 fn attention_router_next_estimated_tokens(

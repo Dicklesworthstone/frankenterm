@@ -1398,8 +1398,8 @@ impl StorageError {
                 "Database corruption detected. Capture diagnostics, then restore from a known-good backup before retrying.",
             )
             .command("Run diagnostics", "ft doctor")
-            .command("List backups", "ft backup list")
-            .alternative("If you have a recent backup, restore it with `ft backup restore <path>`.")
+            .command("Check database integrity", "ft db check")
+            .alternative("If you have a recent backup (exports default to .ft/backups/), restore it with `ft backup import <path>`.")
             .alternative("If no backup exists, copy the database aside before attempting manual recovery."),
             Self::NotFound(_) => Remediation::new("The requested resource was not found.")
                 .command("List resources", "ft status")

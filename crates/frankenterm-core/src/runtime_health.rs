@@ -965,8 +965,8 @@ pub fn check_telemetry_log(log: &RuntimeTelemetryLog) -> RuntimeHealthCheck {
                 snap.tier_counts[0], snap.tier_counts[1], snap.tier_counts[2], snap.tier_counts[3]
             ))
             .with_remediation(RemediationHint::with_command(
-                "Check recent error events",
-                "ft debug dump-telemetry --filter error",
+                "Check the runtime health snapshot",
+                "ft status --health",
             ));
         }
     }
@@ -983,8 +983,8 @@ pub fn check_telemetry_log(log: &RuntimeTelemetryLog) -> RuntimeHealthCheck {
         )
         .with_failure_class(FailureClass::Overload)
         .with_remediation(RemediationHint::with_command(
-            "Investigate critical events",
-            "ft debug dump-telemetry --filter tier=black",
+            "Investigate critical events in the runtime health snapshot",
+            "ft status --health",
         ));
     }
 
@@ -1184,8 +1184,8 @@ pub fn check_failure_patterns(log: &RuntimeTelemetryLog) -> RuntimeHealthCheck {
         .with_tier(HealthTier::Black)
         .with_remediation(
             RemediationHint::with_command(
-                "Review panic backtraces",
-                "ft debug dump-telemetry --filter panic",
+                "Export the latest crash bundle with its backtrace",
+                "ft reproduce export --kind crash",
             )
             .effort(RemediationEffort::High),
         );
@@ -1285,8 +1285,8 @@ pub fn checks_from_policy_dashboard(
                 "quarantine_density" => {
                     check.remediation.push(
                         RemediationHint::with_command(
-                            "Review quarantined components",
-                            "ft robot policy quarantine-list",
+                            "Review quarantined panes (manual reservations)",
+                            "ft reservations",
                         )
                         .effort(RemediationEffort::Medium),
                     );
@@ -1310,7 +1310,7 @@ pub fn checks_from_policy_dashboard(
                     check.remediation.push(
                         RemediationHint::with_command(
                             "Review and reset kill switch when safe",
-                            "ft robot policy kill-switch reset",
+                            "ft robot kill-switch reset",
                         )
                         .effort(RemediationEffort::Low),
                     );
@@ -1606,7 +1606,7 @@ pub fn report_from_health_snapshot(snapshot: &HealthSnapshot) -> RuntimeDoctorRe
 // Robot types for health/doctor surfaces
 // =============================================================================
 
-/// Response data for `ft robot health` / `ft doctor --format json`.
+/// Response data for `ft robot health` / `ft doctor --json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthCheckData {
     /// Overall health tier.

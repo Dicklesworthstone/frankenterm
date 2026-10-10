@@ -1177,7 +1177,7 @@ pub fn render_panes_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         let next_action = if selected_profile_name != active_profile_name {
             format!("Apply selected profile: ft rules profile apply {selected_profile_name}")
         } else if pane.unhandled_event_count > 0 {
-            format!("Run: ft workflow list --pane {}", pane.pane_id)
+            format!("Run: ft events --pane-id {} --unhandled", pane.pane_id)
         } else {
             format!("Inspect: ft robot get-text {} --tail 120", pane.pane_id)
         };
@@ -1543,7 +1543,7 @@ pub fn render_events_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
             )));
             if !event.handled {
                 details.push(Line::from(format!(
-                    "  ft events --pane {} --unhandled",
+                    "  ft events --pane-id {} --unhandled",
                     event.pane_id
                 )));
             }

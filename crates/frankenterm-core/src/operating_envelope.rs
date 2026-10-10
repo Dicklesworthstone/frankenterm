@@ -2203,7 +2203,7 @@ fn not_collected_snapshot(
 ) -> OperatingEnvelopeSourceSnapshot {
     let mut snapshot =
         OperatingEnvelopeSourceSnapshot::new(source_id, source_kind).not_collected(reason_code);
-    snapshot.command_or_api = "ft swarm envelope current".to_string();
+    snapshot.command_or_api = "ft swarm envelope --scenario current".to_string();
     snapshot.collected_at_ms = Some(generated_at_ms);
     snapshot
 }

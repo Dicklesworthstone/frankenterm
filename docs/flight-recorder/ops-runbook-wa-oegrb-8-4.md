@@ -67,7 +67,7 @@ Actions:
 3. If user impact is active, apply rollback posture from rollout plan:
 - disable recorder and keep lexical-safe search defaults.
 4. Capture evidence bundle:
-- `ft reproduce --kind manual`
+- `ft reproduce export --kind manual`
 - `ft diag bundle --output /tmp/ft-diag-recorder-db`
 5. Open/attach incident with bundle paths and health snapshot JSON.
 
@@ -118,7 +118,7 @@ Actions:
 1. Move to safe rollout posture (Phase 0 or prior known-good phase).
 2. Collect latest crash bundle and incident bundle:
 ```bash
-ft reproduce --kind crash
+ft reproduce export --kind crash
 ft diag bundle --output /tmp/ft-diag-crash-loop
 ```
 3. Route incident as critical with crash/health artifacts attached.

@@ -1275,7 +1275,10 @@ impl SuggestionRule for AccountLowRule {
                 self.id(),
             )
             .with_priority(Priority::High)
-            .with_action(SuggestedAction::new("Switch account", "ft accounts switch")),
+            .with_action(SuggestedAction::new(
+                "Preview next account",
+                "ft accounts --pick",
+            )),
         )
     }
 
@@ -1372,7 +1375,7 @@ impl SuggestionRule for FirstWorkflowRule {
             .with_priority(Priority::Low)
             .with_action(SuggestedAction::new(
                 "Preview workflow",
-                format!("ft workflow run \"{workflow}\" --dry-run"),
+                format!("ft workflow run \"{workflow}\" --pane <pane-id> --dry-run"),
             ))
             .with_dismissable(true),
         )
@@ -1590,7 +1593,7 @@ impl SuggestionRule for AltScreenWarningRule {
             .with_priority(Priority::High)
             .with_action(SuggestedAction::new(
                 "Check pane state",
-                format!("ft robot state --pane {}", pane_ids[0]),
+                format!("ft status --pane-id {}", pane_ids[0]),
             )),
         )
     }

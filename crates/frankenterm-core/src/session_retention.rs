@@ -2420,7 +2420,7 @@ fn admit_session_cleanup_attempt(
             } else {
                 "open"
             },
-            "session cleanup suppressed: an earlier cleanup attempt is unresolved; inspect `ft session doctor` and acknowledge it with `ft session acknowledge-cleanup`"
+            "session cleanup suppressed: an earlier cleanup attempt is unresolved; inspect `ft session doctor` and acknowledge it with `ft session acknowledge-cleanup <attempt> --force`"
         );
         return Err(SessionCleanupError::UnresolvedAttempt);
     }

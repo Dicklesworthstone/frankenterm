@@ -1089,8 +1089,8 @@ mod tests {
         assert!(
             alternatives
                 .iter()
-                .any(|alt| alt.contains("ft backup restore")),
-            "expected backup restore guidance in alternatives: {alternatives:?}"
+                .any(|alt| alt.contains("ft backup import")),
+            "expected backup import guidance in alternatives: {alternatives:?}"
         );
         assert!(
             alternatives

@@ -693,7 +693,7 @@ impl QueryClient for ProductionQueryClient {
                 actions: vec![
                     action(
                         "Export crash bundle",
-                        "ft reproduce --kind crash".to_string(),
+                        "ft reproduce export --kind crash".to_string(),
                     ),
                     action("Run diagnostics", "ft doctor".to_string()),
                 ],
@@ -757,7 +757,7 @@ impl QueryClient for ProductionQueryClient {
                 actions: vec![
                     action(
                         "List unhandled events",
-                        format!("ft events --pane {} --unhandled", event.pane_id),
+                        format!("ft events --pane-id {} --unhandled", event.pane_id),
                     ),
                     action(
                         "Explain detection",

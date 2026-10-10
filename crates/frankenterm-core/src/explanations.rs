@@ -66,10 +66,10 @@ Sending text while alt-screen is active could:
 The safety policy blocks sends to alt-screen panes by default.",
     suggestions: &[
         "Exit the full-screen application first",
-        "Use --force if you're certain this is safe",
+        "Preview the policy decision with `ft send <pane-id> <text> --dry-run`",
         "Configure policy to allow specific alt-screen apps",
     ],
-    see_also: &["ft policy", "ft status --pane <id>"],
+    see_also: &["ft why --recent", "ft status --pane-id <id>"],
 };
 
 /// Explanation for command-running blocking.
@@ -90,7 +90,7 @@ wa waits for command completion before sending unless overridden.",
         "Use Ctrl-C to cancel the running command first",
         "Use --wait-for to send after a specific pattern",
     ],
-    see_also: &["ft status", "ft send --wait-for"],
+    see_also: &["ft status", "ft send <pane-id> <text> --wait-for <pattern>"],
 };
 
 /// Explanation for recent gap blocking.
@@ -106,10 +106,11 @@ pub static DENY_RECENT_GAP: ExplanationTemplate = ExplanationTemplate {
 The policy requires a prompt marker (OSC 133) or manual confirmation.",
     suggestions: &[
         "Check the pane manually to see its state",
-        "Use --force if you've verified the pane is ready",
+        "Once the pane is verified ready, approve with `ft approve <code>` and retry with `--approval-code <code>`",
         "Enable OSC 133 support in your shell for better detection",
+        "Set [safety].block_recent_gap = false in ft.toml to turn this check off",
     ],
-    see_also: &["ft capabilities --pane <id>"],
+    see_also: &["ft status --pane-id <id>", "ft why --recent"],
 };
 
 /// Explanation for rate limit blocking.
@@ -130,7 +131,7 @@ Current rate limits are configured in ft.toml under [safety.rate_limits].",
         "Check rate limit configuration in ft.toml",
         "Use --dry-run to test without hitting limits",
     ],
-    see_also: &["ft config show", "ft policy"],
+    see_also: &["ft config show", "ft why --recent"],
 };
 
 /// Explanation for unknown pane blocking.
@@ -172,7 +173,7 @@ Configure capabilities in ft.toml under [safety.capabilities].",
         "Update policy configuration to grant capability",
         "Use --dry-run to see what would happen",
     ],
-    see_also: &["ft policy", "ft config show"],
+    see_also: &["ft why --recent", "ft config show"],
 };
 
 // ============================================================================
@@ -201,7 +202,7 @@ The handle_usage_limits workflow will:
         "Check account status with: caut status",
         "Configure account pool in ft.toml",
     ],
-    see_also: &["ft workflow status", "caut"],
+    see_also: &["ft workflow status <execution-id>", "caut"],
 };
 
 /// Explanation for compaction workflow trigger.
@@ -225,7 +226,7 @@ The handle_compaction workflow can:
         "Consider shorter task batches to avoid compaction",
         "Use 'ft search' to find pre-compaction context",
     ],
-    see_also: &["ft workflow status", "ft search"],
+    see_also: &["ft workflow status <execution-id>", "ft search"],
 };
 
 /// Explanation for error workflow trigger.
@@ -249,7 +250,7 @@ The error recovery workflow can:
         "Review agent output with 'ft get-text <pane>'",
         "Verify external service connectivity",
     ],
-    see_also: &["ft robot events", "ft get-text"],
+    see_also: &["ft robot events", "ft get-text <pane-id>"],
 };
 
 /// Explanation for approval workflow trigger.
@@ -273,7 +274,7 @@ wa's approval system allows:
         "Use 'ft approve <token>' to grant one-time approval",
         "Configure auto-approval policies for trusted operations",
     ],
-    see_also: &["ft approve", "ft policy"],
+    see_also: &["ft approve <code>", "ft approvals list"],
 };
 
 // ============================================================================
@@ -345,7 +346,7 @@ The combined score exceeds the configured threshold for automatic allow.",
         "Configure risk thresholds in ft.toml under [policy.risk]",
         "Add weight overrides for trusted operations",
     ],
-    see_also: &["ft policy", "ft config show"],
+    see_also: &["ft why --recent", "ft config show"],
 };
 
 /// Explanation for high risk score denial.
@@ -369,7 +370,7 @@ explicit override or configuration changes.",
         "Configure hard overrides in ft.toml if this is a false positive",
         "Consider using a workflow with explicit approval gates",
     ],
-    see_also: &["ft policy", "ft config show"],
+    see_also: &["ft why --recent", "ft config show"],
 };
 
 /// Explanation for alt-screen risk factor.
@@ -388,9 +389,9 @@ This factor adds significant weight (default: 60) to the risk score because:
     suggestions: &[
         "Wait for the application to exit",
         "Use the application's native input method",
-        "Check 'ft status --pane <id>' for alt-screen state",
+        "Check 'ft status --pane-id <id>' for alt-screen state",
     ],
-    see_also: &["ft status", "ft policy"],
+    see_also: &["ft status", "ft why --recent"],
 };
 
 /// Explanation for destructive content risk factor.
@@ -411,7 +412,7 @@ potentially irreversible operations.",
         "Consider using --dry-run if available",
         "Use explicit file paths instead of wildcards",
     ],
-    see_also: &["ft policy"],
+    see_also: &["ft why --recent"],
 };
 
 /// Explanation for sudo elevation risk factor.
@@ -431,7 +432,7 @@ This factor adds moderate weight (default: 30) because:
         "Consider reducing weight in trusted environments",
         "Review sudo configuration for the target pane",
     ],
-    see_also: &["ft policy"],
+    see_also: &["ft why --recent"],
 };
 
 /// Explanation for terminal-control-byte risk factor.
@@ -453,7 +454,7 @@ to send control bytes becomes visible in policy review and audit trails.",
         "Review whether the target pane should accept control-byte input",
         "Use approval-gated workflows for interrupt or escape-sequence actions",
     ],
-    see_also: &["ft policy", "ft send"],
+    see_also: &["ft why --recent", "ft send <pane-id> <text> --dry-run"],
 };
 
 // ============================================================================
@@ -1240,7 +1241,7 @@ mod tests {
         let template = &DENY_ALT_SCREEN;
         let formatted = format_explanation(template, None);
         let exit_pos = formatted.find("Exit the full-screen").unwrap();
-        let use_pos = formatted.find("Use --force").unwrap();
+        let use_pos = formatted.find("Preview the policy decision").unwrap();
         let configure_pos = formatted.find("Configure policy").unwrap();
         assert!(
             exit_pos < use_pos && use_pos < configure_pos,
@@ -1252,7 +1253,7 @@ mod tests {
     fn format_explanation_see_also_comma_separated() {
         let template = &DENY_ALT_SCREEN;
         let formatted = format_explanation(template, None);
-        assert!(formatted.contains("ft policy, ft status --pane <id>"));
+        assert!(formatted.contains("ft why --recent, ft status --pane-id <id>"));
     }
 
     #[test]

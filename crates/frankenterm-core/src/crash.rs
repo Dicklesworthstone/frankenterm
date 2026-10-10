@@ -7684,7 +7684,7 @@ fn incident_verification_next_commands(
         commands.push("rch --json status --workers".to_string());
     }
     if summary.resource_pressure.is_some() {
-        commands.push("ft doctor --format json".to_string());
+        commands.push("ft doctor --json".to_string());
     }
     commands.sort();
     commands.dedup();

@@ -833,7 +833,7 @@ SEE ALSO:
     ft mission run                     Advance mission into active execution state
     ft mission status                  Show mission lifecycle + assignment summary
     ft mission explain                 Show legal lifecycle transitions and contracts
-    ft mission pause --reason overload Pause active mission dispatch
+    ft mission pause --reason overload  Pause active mission dispatch
     ft mission resume                  Resume blocked/retry-pending mission state
     ft mission abort --reason operator_cancel
 
@@ -1659,7 +1659,7 @@ SEE ALSO:
     /// Configuration management commands
     #[command(after_help = r#"EXAMPLES:
     ft config show                    Show current configuration
-    ft config show --effective --json Machine-readable effective config
+    ft config show --effective --json  Machine-readable effective config
     ft config init                    Create default config file
     ft config validate                Check config for errors
     ft config profile diff incident   Preview profile changes
@@ -1747,9 +1747,9 @@ SEE ALSO:
 
     /// Backup and restore commands
     #[command(after_help = r#"EXAMPLES:
-    ft backup create                  Create a database backup
-    ft backup list                    List available backups
-    ft backup restore <path>          Restore from a backup file
+    ft backup export                  Export a backup to .ft/backups/
+    ft backup import <path> --verify  Verify a backup without importing
+    ft backup import <path>           Restore from a backup directory
 
 SEE ALSO:
     ft db         Database maintenance
@@ -1786,7 +1786,7 @@ SEE ALSO:
     ft session delete <id>            Delete a session
     ft session acknowledge-recovery <id> --force
                                       Allow cleanup of proven-dead recovery data
-    ft session preserve-recovery <id> Keep recovery data protected
+    ft session preserve-recovery <id>  Keep recovery data protected
     ft session doctor                 Health check on session data
     ft session acknowledge-cleanup <attempt> --force
                                       Resume retention after an interrupted cleanup
@@ -1835,7 +1835,7 @@ SEE ALSO:
     /// Extension management (list, install, remove, validate, info)
     #[command(after_help = r#"EXAMPLES:
     ft ext list                       List all extensions
-    ft ext install ./my-patterns.toml Install from local file
+    ft ext install ./my-patterns.toml  Install from local file
     ft ext remove my-patterns         Remove an extension
     ft ext validate ./pack.toml       Validate extension file
     ft ext info codex                 Show extension details
@@ -1853,8 +1853,8 @@ SEE ALSO:
     ft record export session.war                        Export to Asciinema cast
     ft record export session.war --format html -o out.html  Export to HTML player
     ft record export session.war --no-redact            Keep secrets in output
-    ft record export session.war --title "Demo Session" Set recording title
-    ft record export session.war --redact-pattern "TOKEN_\w+" Add custom redaction
+    ft record export session.war --title "Demo Session"  Set recording title
+    ft record export session.war --redact-pattern "TOKEN_\w+"  Add custom redaction
 
 SEE ALSO:
     ft reproduce    Incident bundles
@@ -1919,7 +1919,7 @@ NOTES:
     #[command(after_help = r#"EXAMPLES:
     ft reserve 3 --owner-id agent-1   Reserve pane 3 for agent-1
     ft reserve 3 --ttl 3600           Reserve for 1 hour
-    ft reserve 3 --reason "migration" Add a reason
+    ft reserve 3 --reason "migration"  Add a reason
 
 SEE ALSO:
     ft reservations   List active reservations
@@ -2010,7 +2010,7 @@ SEE ALSO:
     ft export events --pane-id 3          Export events for pane 3
     ft export audit --since 1706000000   Export audit since timestamp
     ft export audit --actor workflow      Export workflow-initiated audit actions
-    ft export audit --action auth_required Export auth-related audit entries
+    ft export audit --action auth_required  Export auth-related audit entries
     ft export workflows --limit 50        Export last 50 workflows
     ft export sessions --no-redact        Export sessions without redaction (WARNING)
     ft export reservations --pretty       Pretty-print JSON output
@@ -2197,7 +2197,7 @@ SEE ALSO:
     ft analytics daily                Daily breakdown table
     ft analytics by-agent             Per-agent breakdown
     ft analytics export --format csv  Export raw metrics as CSV
-    ft analytics export --format json Export raw metrics as JSON
+    ft analytics export --format json  Export raw metrics as JSON
 
 SEE ALSO:
     ft events     View detected events
@@ -8891,7 +8891,7 @@ enum AuthCommands {
     /// Validate local browser runtime/profile evidence without launching a browser
     #[command(after_help = r#"EXAMPLES:
     ft auth test openai --account work     Validate local state for 'work'
-    ft auth test openai --timeout-secs 120 Bound the runtime readiness probe
+    ft auth test openai --timeout-secs 120  Bound the runtime readiness probe
 
 OUTCOMES:
     LocalStateReady  Runtime and persisted state are locally valid; live auth is unverified
@@ -8939,7 +8939,7 @@ OUTCOMES:
     /// Interactively bootstrap a browser profile (one-time login)
     #[command(after_help = r#"EXAMPLES:
     ft auth bootstrap openai               Bootstrap OpenAI profile
-    ft auth bootstrap openai --account work Bootstrap specific account
+    ft auth bootstrap openai --account work  Bootstrap specific account
 
 NOTE: Opens a visible browser window. You must complete login manually."#)]
     Bootstrap {
@@ -61188,7 +61188,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 None => {
                                     emit_bounded_error(
                                         output_format,
-                                        "Saved search has no schedule interval; use 'ft search saved schedule'.",
+                                        "Saved search has no schedule interval; use 'ft search saved schedule <name> <interval-ms>'.",
                                     );
                                     std::process::exit(1);
                                 }
@@ -63044,7 +63044,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         "Result: not started — pane {pane} is locked by workflow '{held_by_workflow}' (execution {held_by_execution})"
                                     );
                                     eprintln!(
-                                        "\nHint: Wait for the running workflow to finish, or abort it with 'ft robot workflows abort {held_by_execution}'."
+                                        "\nHint: Wait for the running workflow to finish, or abort it with 'ft robot workflow abort {held_by_execution}'."
                                     );
                                     if let Err(e) = storage.shutdown().await {
                                         tracing::warn!(
@@ -64879,7 +64879,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     let hint = stored.tx_contract_hash.is_none().then(|| {
                         format!(
                             "receipt {} was planned without a tx contract; re-plan with \
-                             `ft steer plan --contract-file {}` to bind this contract",
+                             `ft steer plan --objective <objective> --scenario <scenario> --contract-file {}` to bind this contract",
                             stored.receipt_id,
                             execution_contract_path.display()
                         )
@@ -70460,7 +70460,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 eprintln!(
                     "ft record stop: requires an active watcher with recording enabled.\n\
                      For standalone recordings started with `ft record start`, press Ctrl+C.\n\
-                     To stop a watcher-managed recording, use `ft robot rpc record-stop`."
+                     A watcher-managed recording has no CLI stop yet; it ends when the watcher stops (`ft stop`)."
                 );
                 std::process::exit(1);
             }
@@ -71945,7 +71945,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     let mut actions = vec![
                                         serde_json::json!({
                                             "command": format!(
-                                                "ft events --pane {} --unhandled",
+                                                "ft events --pane-id {} --unhandled",
                                                 event.pane_id
                                             ),
                                             "label": "List unhandled events"
@@ -71994,7 +71994,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                             .take(120)
                                             .collect::<String>(),
                                         "action": format!(
-                                            "ft events --pane {} --unhandled",
+                                            "ft events --pane-id {} --unhandled",
                                             event.pane_id
                                         ),
                                         "actions": actions,
@@ -92081,7 +92081,7 @@ async fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Re
     }
 
     println!("\nNext steps:");
-    println!("  ft daemon start");
+    println!("  ft watch");
     println!("  ft status");
     println!("  ft robot state");
 
@@ -100338,7 +100338,7 @@ async fn run_diagnostics_with_mux_client(
                                             "schema v{} (needs migration to v{})",
                                             version, target
                                         ),
-                                        "Run 'ft daemon start' to auto-migrate",
+                                        "Run 'ft db migrate' to apply pending migrations",
                                     ));
                                 }
                                 std::cmp::Ordering::Greater => {
@@ -129628,7 +129628,7 @@ printf x > "$MINISIGN_MARKER"
             "warning",
             "unhandled event",
             vec![
-                ("ft events --pane 3 --unhandled", "List unhandled events"),
+                ("ft events --pane-id 3 --unhandled", "List unhandled events"),
                 ("ft why --recent --pane 3", "Explain detection"),
                 ("ft show 3", "Show pane details"),
             ],
@@ -129637,7 +129637,7 @@ printf x > "$MINISIGN_MARKER"
 
         let actions = item["actions"].as_array().unwrap();
         assert_eq!(actions.len(), 3);
-        assert_eq!(actions[0]["command"], "ft events --pane 3 --unhandled");
+        assert_eq!(actions[0]["command"], "ft events --pane-id 3 --unhandled");
         assert_eq!(actions[0]["label"], "List unhandled events");
         assert_eq!(actions[1]["command"], "ft why --recent --pane 3");
         assert_eq!(actions[2]["command"], "ft show 3");
@@ -129687,7 +129687,7 @@ printf x > "$MINISIGN_MARKER"
         let section_actions: Vec<(&str, &str)> = vec![
             ("health", "ft doctor"),
             ("crashes", "ft reproduce export --kind crash"),
-            ("events", "ft events --pane 1 --unhandled"),
+            ("events", "ft events --pane-id 1 --unhandled"),
             ("workflows", "ft workflow status wf-1"),
         ];
 
@@ -129720,7 +129720,7 @@ printf x > "$MINISIGN_MARKER"
             "error",
             "[pane 7] pattern_match: error_detect",
             vec![
-                ("ft events --pane 7 --unhandled", "List unhandled"),
+                ("ft events --pane-id 7 --unhandled", "List unhandled"),
                 ("ft why --recent --pane 7", "Explain detection"),
                 ("ft show 7", "Show pane"),
             ],
@@ -138192,11 +138192,103 @@ printf x > "$MINISIGN_MARKER"
             .collect()
     }
 
+    /// The runnable part of a documented `ft ...` line: trailing comments,
+    /// pipes and redirections are cut, and synopsis lines (`[optional]`,
+    /// `{a|b}`, `a|b`, `...`) are skipped.
+    fn runnable_example(line: &str) -> Option<&str> {
+        if !line.starts_with("ft ") {
+            return None;
+        }
+        let mut line = line;
+        for cut in [" #", " | ", " && ", " || ", " > ", " 2>"] {
+            if let Some(index) = line.find(cut) {
+                line = &line[..index];
+            }
+        }
+        let line = line.trim();
+        (!["[", "{", "...", "|"]
+            .into_iter()
+            .any(|token| line.contains(token)))
+        .then_some(line)
+    }
+
+    /// `ft ...` commands that product code hands to operators and agents:
+    /// string literals that start with `ft ` and backtick spans that do, in
+    /// the source before its unit-test module, comment lines skipped. Format
+    /// arguments (`{pane_id}`) stand in as `0`, like `<placeholders>`.
+    /// Literals passed to `contains`/`starts_with` are matchers, and a few
+    /// prose sentences start with "ft"; neither is a suggestion.
+    fn product_command_hints(source: &str) -> Vec<String> {
+        const PROSE: [&str; 4] = [
+            "ft detected ",
+            "ft monitors ",
+            "ft Master",
+            "ft <command> --help",
+        ];
+        let production = source
+            .find("#[cfg(test)]\nmod ")
+            .map_or(source, |index| &source[..index]);
+        let mut candidates = Vec::new();
+        for line in production.lines() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let mut rest = line;
+            while let Some(start) = rest.find("\"ft ") {
+                let matcher =
+                    rest[..start].ends_with("contains(") || rest[..start].ends_with("starts_with(");
+                let mut literal = String::new();
+                let mut chars = rest[start + 1..].char_indices();
+                let mut end = rest.len();
+                while let Some((offset, character)) = chars.next() {
+                    match character {
+                        '"' => {
+                            end = start + 1 + offset + 1;
+                            break;
+                        }
+                        '\\' => match chars.next() {
+                            Some((_, 'n' | 't' | 'r')) => literal.push(' '),
+                            Some((_, escaped)) => literal.push(escaped),
+                            None => {}
+                        },
+                        other => literal.push(other),
+                    }
+                }
+                if !matcher {
+                    candidates.push(literal);
+                }
+                rest = &rest[end..];
+            }
+            for (index, span) in line.split('`').enumerate() {
+                if index % 2 == 1 && span.starts_with("ft ") {
+                    candidates.push(span.to_string());
+                }
+            }
+        }
+        candidates
+            .into_iter()
+            .filter(|candidate| !PROSE.iter().any(|prose| candidate.starts_with(prose)))
+            .filter_map(|candidate| {
+                let mut filled = String::new();
+                let mut rest = candidate.as_str();
+                while let Some(start) = rest.find('{') {
+                    let Some(end) = rest[start..].find('}') else {
+                        break;
+                    };
+                    filled.push_str(&rest[..start]);
+                    filled.push('0');
+                    rest = &rest[start + end + 1..];
+                }
+                filled.push_str(rest);
+                runnable_example(filled.trim()).map(str::to_string)
+            })
+            .collect()
+    }
+
     /// Runnable `ft ...` lines in a markdown file's shell fences. Within one
     /// fence, continuations are joined; a fence that uses a `$ ` prompt counts
-    /// only its prompted lines (the rest is printed output). Trailing
-    /// comments, pipes and redirections are cut, and synopsis lines
-    /// (`[optional]`, `{a|b}`, `a|b`, `...`) are skipped.
+    /// only its prompted lines (the rest is printed output); see
+    /// [`runnable_example`] for the cuts and skips.
     fn doc_example_commands(markdown: &str) -> Vec<String> {
         fn fence_commands(fence: &[&str], commands: &mut Vec<String>) {
             let mut joined_lines = Vec::new();
@@ -138220,22 +138312,9 @@ printf x > "$MINISIGN_MARKER"
                     };
                     line = command.trim();
                 }
-                if !line.starts_with("ft ") {
-                    continue;
+                if let Some(command) = runnable_example(line) {
+                    commands.push(command.to_string());
                 }
-                for cut in [" #", " | ", " && ", " || ", " > ", " 2>"] {
-                    if let Some(index) = line.find(cut) {
-                        line = &line[..index];
-                    }
-                }
-                let line = line.trim();
-                if ["[", "{", "...", "|"]
-                    .into_iter()
-                    .any(|token| line.contains(token))
-                {
-                    continue;
-                }
-                commands.push(line.to_string());
             }
         }
 
@@ -138320,6 +138399,42 @@ printf x > "$MINISIGN_MARKER"
                 "docs/explain-match.md",
                 include_str!("../../../docs/explain-match.md"),
             ),
+            (
+                "docs/cli-reference.md",
+                include_str!("../../../docs/cli-reference.md"),
+            ),
+            (
+                "docs/frankenterm-gui-user-guide.md",
+                include_str!("../../../docs/frankenterm-gui-user-guide.md"),
+            ),
+            (
+                "docs/ft-xbnl0-5-3-blessed-tuning-playbook.md",
+                include_str!("../../../docs/ft-xbnl0-5-3-blessed-tuning-playbook.md"),
+            ),
+            (
+                "docs/flight-recorder/alerts-wa-oegrb-8-4.md",
+                include_str!("../../../docs/flight-recorder/alerts-wa-oegrb-8-4.md"),
+            ),
+            (
+                "docs/flight-recorder/ops-runbook-wa-oegrb-8-4.md",
+                include_str!("../../../docs/flight-recorder/ops-runbook-wa-oegrb-8-4.md"),
+            ),
+            (
+                "docs/flight-recorder/incident-response-wa-oegrb-8-5.md",
+                include_str!("../../../docs/flight-recorder/incident-response-wa-oegrb-8-5.md"),
+            ),
+            (
+                "docs/resource-pressure-cockpit-contract.md",
+                include_str!("../../../docs/resource-pressure-cockpit-contract.md"),
+            ),
+            (
+                "docs/blocker-radar-runbook.md",
+                include_str!("../../../docs/blocker-radar-runbook.md"),
+            ),
+            (
+                "docs/context-horizon-contract.md",
+                include_str!("../../../docs/context-horizon-contract.md"),
+            ),
         ];
         let mut checked = 0;
         let mut failures = Vec::new();
@@ -138333,10 +138448,186 @@ printf x > "$MINISIGN_MARKER"
                 }
             }
         }
-        assert!(checked > 300, "documented examples shrank to {checked}");
+        assert!(checked > 450, "documented examples shrank to {checked}");
         assert!(
             failures.is_empty(),
             "documented examples the CLI rejects: {failures:#?}"
+        );
+    }
+
+    /// Remediation hints, see-also lists, tutorials and error hints tell
+    /// operators and agents which `ft` command to run next; every one must
+    /// parse with the current CLI.
+    #[test]
+    fn product_command_hints_parse_with_the_current_cli() {
+        let sources = [
+            (
+                "asupersync_observability.rs",
+                include_str!("../../frankenterm-core/src/asupersync_observability.rs"),
+            ),
+            (
+                "attention_router.rs",
+                include_str!("../../frankenterm-core/src/attention_router.rs"),
+            ),
+            (
+                "crash.rs",
+                include_str!("../../frankenterm-core/src/crash.rs"),
+            ),
+            (
+                "error.rs",
+                include_str!("../../frankenterm-core/src/error.rs"),
+            ),
+            (
+                "explanations.rs",
+                include_str!("../../frankenterm-core/src/explanations.rs"),
+            ),
+            (
+                "incident_bundle.rs",
+                include_str!("../../frankenterm-core/src/incident_bundle.rs"),
+            ),
+            (
+                "learn.rs",
+                include_str!("../../frankenterm-core/src/learn.rs"),
+            ),
+            (
+                "ntm_importer.rs",
+                include_str!("../../frankenterm-core/src/ntm_importer.rs"),
+            ),
+            (
+                "operating_envelope.rs",
+                include_str!("../../frankenterm-core/src/operating_envelope.rs"),
+            ),
+            (
+                "operator_runbooks.rs",
+                include_str!("../../frankenterm-core/src/operator_runbooks.rs"),
+            ),
+            (
+                "output/error_renderer.rs",
+                include_str!("../../frankenterm-core/src/output/error_renderer.rs"),
+            ),
+            (
+                "policy_diagnostics.rs",
+                include_str!("../../frankenterm-core/src/policy_diagnostics.rs"),
+            ),
+            (
+                "robot_types.rs",
+                include_str!("../../frankenterm-core/src/robot_types.rs"),
+            ),
+            (
+                "runtime_diagnostics_ux.rs",
+                include_str!("../../frankenterm-core/src/runtime_diagnostics_ux.rs"),
+            ),
+            (
+                "runtime_health.rs",
+                include_str!("../../frankenterm-core/src/runtime_health.rs"),
+            ),
+            (
+                "session_retention.rs",
+                include_str!("../../frankenterm-core/src/session_retention.rs"),
+            ),
+            (
+                "storage_workload_advisor.rs",
+                include_str!("../../frankenterm-core/src/storage_workload_advisor.rs"),
+            ),
+            (
+                "suggestions.rs",
+                include_str!("../../frankenterm-core/src/suggestions.rs"),
+            ),
+            (
+                "tui/app.rs",
+                include_str!("../../frankenterm-core/src/tui/app.rs"),
+            ),
+            (
+                "tui/ftui_backend.rs",
+                include_str!("../../frankenterm-core/src/tui/ftui_backend.rs"),
+            ),
+            (
+                "tui/query.rs",
+                include_str!("../../frankenterm-core/src/tui/query.rs"),
+            ),
+            (
+                "tui/views.rs",
+                include_str!("../../frankenterm-core/src/tui/views.rs"),
+            ),
+            (
+                "workflows/handlers.rs",
+                include_str!("../../frankenterm-core/src/workflows/handlers.rs"),
+            ),
+        ];
+        let mut checked = 0;
+        let mut failures = Vec::new();
+        for (file, source) in sources {
+            let hints = product_command_hints(source);
+            assert!(!hints.is_empty(), "{file} lost its command hints");
+            for hint in hints {
+                checked += 1;
+                if let Err(error) = Cli::try_parse_from(example_command_words(&hint))
+                    && error.kind() != clap::error::ErrorKind::DisplayVersion
+                {
+                    failures.push(format!("{file}: {hint}: {:?}", error.kind()));
+                }
+            }
+        }
+        assert!(checked > 100, "product command hints shrank to {checked}");
+        assert!(
+            failures.is_empty(),
+            "product code suggests commands the CLI rejects: {failures:#?}"
+        );
+    }
+
+    /// Every command's `--help` EXAMPLES section must parse: each line is
+    /// `ft <args>`, then two or more spaces, then a description.
+    #[test]
+    fn cli_help_examples_parse_with_the_current_cli() {
+        fn collect(command: &clap::Command, examples: &mut Vec<(String, String)>) {
+            if let Some(help) = command.get_after_help() {
+                let mut in_examples = false;
+                for line in help.to_string().lines() {
+                    if line.trim() == "EXAMPLES:" {
+                        in_examples = true;
+                        continue;
+                    }
+                    if line.starts_with(|c: char| !c.is_whitespace()) {
+                        in_examples = false;
+                        continue;
+                    }
+                    let example = line.trim();
+                    if !in_examples {
+                        continue;
+                    }
+                    let command_text = example.split("  ").next().unwrap_or_default();
+                    if let Some(runnable) = runnable_example(command_text) {
+                        examples.push((command.get_name().to_string(), runnable.to_string()));
+                    }
+                }
+            }
+            for subcommand in command.get_subcommands() {
+                collect(subcommand, examples);
+            }
+        }
+
+        let cli = <Cli as clap::CommandFactory>::command();
+        let mut examples = Vec::new();
+        collect(&cli, &mut examples);
+        let mut failures = Vec::new();
+        for (owner, example) in &examples {
+            if let Err(error) = Cli::try_parse_from(example_command_words(example))
+                && !matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                )
+            {
+                failures.push(format!("{owner}: {example}: {:?}", error.kind()));
+            }
+        }
+        assert!(
+            examples.len() > 300,
+            "help examples shrank to {}",
+            examples.len()
+        );
+        assert!(
+            failures.is_empty(),
+            "help examples the CLI rejects: {failures:#?}"
         );
     }
 
@@ -142145,11 +142436,11 @@ A  docs/new-proof.md\n";
         let check = DiagnosticCheck::warning(
             "database",
             "schema v1 (needs migration to v2)",
-            "Run 'ft daemon start' to auto-migrate",
+            "Run 'ft db migrate' to apply pending migrations",
         );
         assert_eq!(check.status, DiagnosticStatus::Warning);
         assert!(check.detail.unwrap().contains("schema v1"));
-        assert!(check.recommendation.unwrap().contains("auto-migrate"));
+        assert!(check.recommendation.unwrap().contains("ft db migrate"));
     }
 
     #[test]
@@ -143281,7 +143572,7 @@ A  docs/new-proof.md\n";
         .with_remediation(
             frankenterm_core::runtime_health::RemediationHint::with_command(
                 "Review connector throttles",
-                "ft robot policy quarantine-list",
+                "ft reservations",
             ),
         );
 
@@ -143292,7 +143583,7 @@ A  docs/new-proof.md\n";
         assert_eq!(diagnostic.detail.as_deref(), Some("throttling active"));
         assert_eq!(
             diagnostic.recommendation.as_deref(),
-            Some("Review connector throttles: ft robot policy quarantine-list"),
+            Some("Review connector throttles: ft reservations"),
         );
     }
 

@@ -446,7 +446,7 @@ pub fn hint_for(code: &ErrorCode) -> Option<&'static str> {
     Some(match code.as_str() {
         // Wezterm / pane lifecycle
         "robot.pane_not_found" => {
-            "Run `ft list-panes` to discover live panes; the pane id may have been recycled."
+            "Run `ft robot state` to discover live panes; the pane id may have been recycled."
         }
         "robot.wezterm_not_found" => {
             "Install WezTerm or set `FT_WEZTERM_PATH` to the binary location."
@@ -482,15 +482,15 @@ pub fn hint_for(code: &ErrorCode) -> Option<&'static str> {
         "robot.rate_limited" => "Back off and retry; the operation tripped the rate limiter.",
         // Policy / approval
         "robot.policy_denied" => {
-            "Run `ft policy explain <action>` to see which rule blocked the request."
+            "Run `ft why --recent denied` to see which rule blocked the request."
         }
         "robot.require_approval" => {
-            "Approve via `ft approve <id>` or wait for the configured approver."
+            "Approve via `ft approve <code>` or wait for the configured approver."
         }
         "robot.approval_error" => "Approval pipeline failed; check the approval-store status.",
         // Storage
         "robot.storage_error" => {
-            "Check disk space and storage health (`ft storage doctor`); retry after recovery."
+            "Check disk space and storage health (`ft db check`); retry after recovery."
         }
         "robot.fts_query_error" => {
             "Re-issue the query with simpler syntax; FTS5 rejected the input."
@@ -522,7 +522,7 @@ pub fn hint_for(code: &ErrorCode) -> Option<&'static str> {
         }
         // Mission lifecycle
         "robot.mission_kill_switch_activated" => {
-            "Clear the killswitch via `ft mission unkill` after investigating the trip cause."
+            "The run's kill-switch level blocked this gate; after investigating the trip cause, rerun with `--kill-switch off`."
         }
         "robot.mission_reservation_conflict" => {
             "Another mission holds the reservation; retry after release."
@@ -5204,20 +5204,22 @@ mod tests {
     fn hint_for_anchors_high_traffic_codes() {
         let pane = ErrorCode::parse("robot.pane_not_found").unwrap();
         assert!(
-            hint_for(&pane).unwrap().contains("ft list-panes"),
-            "pane_not_found hint must direct operator at ft list-panes"
+            hint_for(&pane).unwrap().contains("ft robot state"),
+            "pane_not_found hint must direct operator at ft robot state"
         );
 
         let policy = ErrorCode::parse("robot.policy_denied").unwrap();
         assert!(
-            hint_for(&policy).unwrap().contains("ft policy explain"),
-            "policy_denied hint must direct operator at ft policy explain"
+            hint_for(&policy)
+                .unwrap()
+                .contains("ft why --recent denied"),
+            "policy_denied hint must direct operator at ft why --recent denied"
         );
 
         let killswitch = ErrorCode::parse("robot.mission_kill_switch_activated").unwrap();
         assert!(
-            hint_for(&killswitch).unwrap().contains("ft mission unkill"),
-            "killswitch hint must direct operator at ft mission unkill"
+            hint_for(&killswitch).unwrap().contains("--kill-switch off"),
+            "killswitch hint must direct operator at rerunning with --kill-switch off"
         );
 
         let mux_indeterminate = ErrorCode::parse("robot.wezterm_mutation_indeterminate").unwrap();

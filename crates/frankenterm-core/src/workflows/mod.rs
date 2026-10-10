@@ -11348,7 +11348,7 @@ Try again at 3:00 PM UTC.
 
             let steps_text = plan.operator_steps.join(" ");
             assert!(
-                steps_text.contains("ft accounts status"),
+                steps_text.contains("`ft accounts`"),
                 "should suggest checking accounts: {steps_text}"
             );
         }
