@@ -3962,7 +3962,7 @@ mod tests {
     fn live_policy_gate_sources_group_audit_rows_without_their_input() {
         let now: u64 = 1_800_000_000_000;
         let at = |ago: i64| i64::try_from(now).expect("epoch ms") - ago;
-        let denied = vec![
+        let denied = [
             audit_row(
                 3,
                 Some("BlueLake"),
