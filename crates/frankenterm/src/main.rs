@@ -988,6 +988,7 @@ SEE ALSO:
     /// Explain decisions and workflows using built-in templates or recent audit trail
     #[command(after_help = r#"EXAMPLES:
     ft why deny.alt_screen            Explain alt-screen denial
+    ft why FT-1001                    Explain the error code an error message names
     ft why --list                     List all explanation templates
     ft why --recent                   Show recent deny decisions
     ft why --recent --pane 3          Recent denials for pane 3
@@ -998,8 +999,9 @@ SEE ALSO:
     ft rules      Detection rule definitions
     ft approve    Validate approval codes"#)]
     Why {
-        /// Template ID to explain (e.g., "deny.alt_screen"), or decision type
-        /// when --recent is used (e.g., "denied", "require_approval")
+        /// Template ID (e.g., "deny.alt_screen"), FT-xxxx or robot.* error
+        /// code to explain, or decision type when --recent is used (e.g.,
+        /// "denied", "require_approval")
         template_id: Option<String>,
 
         /// Filter templates by category prefix (deny/workflow/event)
