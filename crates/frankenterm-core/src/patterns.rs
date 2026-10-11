@@ -10517,7 +10517,12 @@ rules:
         let root = tempfile::tempdir().unwrap();
         let filename = OsString::from_vec(b"non-utf8-\xFF.yaml".to_vec());
         let pack_path = root.path().join(filename);
-        fs::write(&pack_path, minimal_yaml_pack()).unwrap();
+        // APFS and HFS+ refuse names that are not valid UTF-8 (EILSEQ), so the
+        // pack this test is about cannot exist on them.
+        if let Err(error) = fs::write(&pack_path, minimal_yaml_pack()) {
+            assert_eq!(error.raw_os_error(), Some(libc::EILSEQ), "{error}");
+            return;
+        }
 
         let packs = discover_packs_from_dir(root.path()).unwrap();
         assert_eq!(packs.len(), 1);

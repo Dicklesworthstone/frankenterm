@@ -2391,6 +2391,11 @@ mod tests {
         let uppercase_lock = dir.join(format!("{}.bin.lock", "AB".repeat(32)));
         write_private(&lowercase_lock, &[]);
         write_private(&uppercase_lock, &[]);
+        // A case-insensitive filesystem (APFS's default) keeps both names as
+        // one file, so the uppercase companion this test is about cannot exist.
+        if fs::read_dir(&dir).unwrap().count() < 2 {
+            return;
+        }
 
         let out = scan_orphans(&dir, &AlwaysOrphaned, recovery_limits()).unwrap();
 

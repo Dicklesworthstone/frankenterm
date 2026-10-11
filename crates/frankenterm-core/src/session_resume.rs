@@ -4313,17 +4313,23 @@ mod tests {
         let over = exact
             .with_output_limits(64, 2)
             .expect("limits are below hard admission ceilings");
+        // `exec` keeps the process alive without forking: a `sleep` forked
+        // while the tree is being signalled can outlive the settle window and
+        // turn the expected cap error into CleanupIncomplete (seen on macOS).
         let error = over
-            .run_casr(&["-c", "printf 'abc' >&2; while :; do sleep 1; done"])
+            .run_casr(&["-c", "printf 'abc' >&2; exec sleep 600"])
             .expect_err("first byte beyond stderr cap must fail closed");
-        assert!(matches!(
-            &error,
-            SessionResumeError::CaptureLimitExceeded {
-                stream: CommandOutputStream::Stderr,
-                observed: 3,
-                limit: 2,
-            }
-        ));
+        assert!(
+            matches!(
+                &error,
+                SessionResumeError::CaptureLimitExceeded {
+                    stream: CommandOutputStream::Stderr,
+                    observed: 3,
+                    limit: 2,
+                }
+            ),
+            "{error:?}"
+        );
         assert!(!error.to_string().contains("abc"));
     }
 

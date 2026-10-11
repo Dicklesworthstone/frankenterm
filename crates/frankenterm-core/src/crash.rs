@@ -11252,7 +11252,12 @@ mod tests {
 
         let raw_name = std::ffi::OsString::from_vec(b"ft_crash_legacy_\xff".to_vec());
         let raw_path = tmp.path().join(raw_name);
-        fs::create_dir(&raw_path).unwrap();
+        // APFS and HFS+ refuse names that are not valid UTF-8 (EILSEQ), so the
+        // bundle this test is about cannot exist on them.
+        if let Err(error) = fs::create_dir(&raw_path) {
+            assert_eq!(error.raw_os_error(), Some(libc::EILSEQ), "{error}");
+            return;
+        }
         let mut newer = test_report();
         newer.timestamp = 2_000;
         fs::write(
