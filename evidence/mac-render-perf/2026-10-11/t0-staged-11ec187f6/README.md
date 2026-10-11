@@ -42,3 +42,15 @@ The arms overlap completely, so the durable scrollback store no longer costs
 measurable T0 throughput at this SHA (0.15.2's freeze came from per-row synced
 store commits under the terminal lock). An earlier 2-rep pass showed one 18.4 s
 store-ON run during a load spike; it did not recur in these 12 runs.
+
+## Parser buffer 128 KiB vs 512 KiB (parser-buffer-receipt.json)
+
+Four runs per arm, ABBA, arm B adding
+`config.mux_output_parser_buffer_size = 512 * 1024`, load 17-23.
+
+| Arm | Runs | Mean total |
+|---|---|---|
+| 128 KiB (default) | 9.617, 9.965, 9.921, 8.136 s | 9.776 s |
+| 512 KiB | 9.540, 9.759, 9.673, 8.555 s | 9.611 s |
+
+No measurable difference either way on T0 at this SHA.
