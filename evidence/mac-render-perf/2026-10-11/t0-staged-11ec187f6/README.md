@@ -26,3 +26,19 @@ Screen Recording nor Accessibility permission, so it ran with `--no-fps
 Ghostty is not pinned and its two runs differ by 7.4% (limit 5%). Treat the
 ordering, not the 7% gap, as the finding: on the operator's file this build
 drains at least as fast as Ghostty, where 0.15.2 beach-balled.
+
+## Durable store ON vs OFF (store-on-off-receipt.json)
+
+Same build and file, six runs per arm, ABBA, arm B adding
+`config.scrollback_tiered_enabled = false`. Load rose from 15 to 30 during the
+runs (another project's jobs).
+
+| Arm | Runs | Mean total |
+|---|---|---|
+| store ON (default) | 8.854, 9.394, 10.897, 10.161, 9.348, 9.428 s | 9.418 s |
+| store OFF | 8.319, 10.083, 10.609, 10.741, 9.659, 8.543 s | 9.877 s |
+
+The arms overlap completely, so the durable scrollback store no longer costs
+measurable T0 throughput at this SHA (0.15.2's freeze came from per-row synced
+store commits under the terminal lock). An earlier 2-rep pass showed one 18.4 s
+store-ON run during a load spike; it did not recur in these 12 runs.
