@@ -521,3 +521,18 @@ If a paste does not arrive:
   terminal's own answers to the program's queries (device attributes, cursor
   position reports and similar) are dropped once 64 KiB of them are waiting
   unread; the log then says `terminal reply backlog is full`.
+
+If the window stops responding while a pane floods output (0.15.x):
+
+- In 0.15.2 and nearby builds, each row that scrolls out of memory is written
+  to the durable scrollback store, with a full disk sync, while the terminal is
+  locked. A pane printing a large file can then stall the whole window. Newer
+  builds write the store outside the terminal lock, in batches; check what you
+  run with `ft --version` and the app's About box.
+- Until you move to a newer build, set `config.scrollback_tiered_enabled = false`
+  in `frankenterm.lua`. Scrollback then stays in memory and nothing is written to
+  the store. The cost is RAM: every pane keeps all `scrollback_lines` rows in
+  memory, so lower `scrollback_lines` (default 3,500) if you raised it; at
+  100,000 lines, dozens of agent panes can take gigabytes.
+- Remove any oversized `config.mux_output_parser_buffer_size` override; the
+  default is 128 KiB.
