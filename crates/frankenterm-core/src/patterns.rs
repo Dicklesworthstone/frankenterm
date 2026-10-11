@@ -3341,6 +3341,15 @@ fn builtin_codex_submit_profile() -> SubmitProfile {
     }
 }
 
+/// Codex usage warnings: the older "24% of your 4h limit remaining" and the
+/// current CLI's "less than 25% of your 5h limit left" or "... of your weekly
+/// limit left" (codex-cli 0.162).
+const CODEX_USAGE_WARNING_REGEX: &str = r"(?P<remaining>\d+)% of your (?:(?P<limit_hours>\d+)h|(?P<limit_window>[A-Za-z]+)) limit (?:remaining|left)";
+
+/// Codex usage limit: a reset time when the message gives one, else the
+/// limit sentence itself (optionally naming the exhausted model).
+const CODEX_USAGE_REACHED_REGEX: &str = r"(?i)try again at (?P<reset_time>[^.]+)|(?:hit|reached) your usage limit(?:\s+for\s+(?P<model>\S+?))?\.(?=\s|$)(?![\s\S]{0,300}?try again at)";
+
 /// Builtin Codex pack with rules for OpenAI Codex CLI detection
 fn builtin_codex_pack() -> PatternPack {
     PatternPack::new(
@@ -3354,7 +3363,7 @@ fn builtin_codex_pack() -> PatternPack {
                 event_type: "usage.warning".to_string(),
                 severity: Severity::Info,
                 anchors: vec!["less than 25%".to_string()],
-                regex: Some(r"(?P<remaining>\d+)% of your (?P<limit_hours>\d+)h limit remaining".to_string()),
+                regex: Some(CODEX_USAGE_WARNING_REGEX.to_string()),
                 description: "Codex usage below 25% remaining".to_string(),
                 remediation: None,
                 workflow: None,
@@ -3368,7 +3377,7 @@ fn builtin_codex_pack() -> PatternPack {
                 event_type: "usage.warning".to_string(),
                 severity: Severity::Warning,
                 anchors: vec!["less than 10%".to_string()],
-                regex: Some(r"(?P<remaining>\d+)% of your (?P<limit_hours>\d+)h limit remaining".to_string()),
+                regex: Some(CODEX_USAGE_WARNING_REGEX.to_string()),
                 description: "Codex usage below 10% remaining".to_string(),
                 remediation: Some("Consider pausing work soon".to_string()),
                 workflow: None,
@@ -3382,7 +3391,7 @@ fn builtin_codex_pack() -> PatternPack {
                 event_type: "usage.warning".to_string(),
                 severity: Severity::Warning,
                 anchors: vec!["less than 5%".to_string()],
-                regex: Some(r"(?P<remaining>\d+)% of your (?P<limit_hours>\d+)h limit remaining".to_string()),
+                regex: Some(CODEX_USAGE_WARNING_REGEX.to_string()),
                 description: "Codex usage below 5% remaining - critical threshold".to_string(),
                 remediation: Some("Save work and prepare for limit".to_string()),
                 workflow: Some("handle_usage_warning".to_string()),
@@ -3399,13 +3408,22 @@ fn builtin_codex_pack() -> PatternPack {
                 anchors: vec![
                     "You've hit your usage limit".to_string(),
                     "You've reached your usage limit".to_string(),
+                    // codex-cli 0.162 prints a typographic apostrophe (U+2019).
+                    "You\u{2019}ve hit your usage limit".to_string(),
+                    "You\u{2019}ve reached your usage limit".to_string(),
                 ],
                 // Case-insensitive: the shipped Codex binary (0.133) prints
                 // "You've hit your usage limit. Try again at 4:32 PM." (capital T
                 // at sentence start) and "... or try again at ..." mid-sentence;
                 // a case-sensitive regex missed the primary form (found by the
                 // headless-mux observe smoke, 2026-09-02).
-                regex: Some(r"(?i)try again at (?P<reset_time>[^.]+)".to_string()),
+                // The second branch is a limit with no reset time (codex-cli
+                // 0.162: "Upgrade to Plus ...", "Visit ... to purchase more
+                // credits", "... for <model>. Switch to another model now");
+                // it stands down when a "try again at" follows, so a message
+                // captured in one segment is one detection (split across
+                // segments, the two halves are two detections).
+                regex: Some(CODEX_USAGE_REACHED_REGEX.to_string()),
                 description: "Codex usage limit reached".to_string(),
                 remediation: Some("Wait for reset or switch account".to_string()),
                 workflow: Some("handle_usage_limits".to_string()),
@@ -3578,12 +3596,17 @@ fn builtin_claude_code_pack() -> PatternPack {
                     "Conversation compacted".to_string(),
                     "Auto-compact".to_string(),
                     "context compacted".to_string(),
+                    // Claude Code 2.1 also renders "Conversation summarized
+                    // (ctrl+o for history)" and the row "Compacted · 45.2k
+                    // tokens summarized (ctrl+o to see them)".
+                    "Conversation summarized".to_string(),
+                    "tokens summarized (ctrl+o".to_string(),
                 ],
                 regex: Some(
                     // Token-count notices must contain both counts. The real
                     // Conversation compacted banner is a separate complete-line
                     // alternative, not an optional suffix that accepts fragments.
-                    r"(?m)(?:(?:Conversation compacted(?:\s*\([^)]+\))?|Auto-compact:\s*(?:context compacted|summarized)|context compacted)[:\s]+(?:(?:compacted|summarized)\s+)?(?P<tokens_before>\d(?:[\d,]*\d)?)\s+tokens?\s+to\s+(?P<tokens_after>\d(?:[\d,]*\d)?)\b|Conversation compacted(?:[ \t]*\([^\r\n)]+\))?[ \t]*\r?$)".to_string()
+                    r"(?m)(?:(?:Conversation compacted(?:\s*\([^)]+\))?|Auto-compact:\s*(?:context compacted|summarized)|context compacted)[:\s]+(?:(?:compacted|summarized)\s+)?(?P<tokens_before>\d(?:[\d,]*\d)?)\s+tokens?\s+to\s+(?P<tokens_after>\d(?:[\d,]*\d)?)\b|Conversation (?:compacted|summarized)(?:[ \t]*\([^\r\n)]+\))?[ \t]*\r?$|Compacted\W{1,5}(?P<tokens_summarized>\d[\d.,]*k?) tokens summarized)".to_string()
                 ),
                 description: "Claude Code context compaction event".to_string(),
                 remediation: Some("Context was reduced - some history may be lost".to_string()),
@@ -3619,8 +3642,17 @@ fn builtin_claude_code_pack() -> PatternPack {
                     "usage limit".to_string(),
                     "approaching limit".to_string(),
                     "token limit".to_string(),
+                    // Claude Code 2.1: "You've used 90% of your session limit
+                    // · resets 3pm" and "Approaching weekly limit · resets ...".
+                    "You've used".to_string(),
+                    "Approaching session limit".to_string(),
+                    "Approaching weekly limit".to_string(),
+                    "Approaching Opus limit".to_string(),
+                    "Approaching Sonnet limit".to_string(),
                 ],
-                regex: Some(r"(?P<remaining>\d+)%?\s*(?:remaining|left|of limit)".to_string()),
+                regex: Some(
+                    r"(?P<remaining>\d+)%?\s*(?:remaining|left|of limit)|used (?P<used_percent>\d+)% of your (?P<limit>\w+) limit|Approaching (?P<approaching>session|weekly|Opus|Sonnet) limit".to_string(),
+                ),
                 description: "Claude Code usage warning".to_string(),
                 remediation: Some("Consider saving work soon".to_string()),
                 workflow: None,
@@ -3639,6 +3671,13 @@ fn builtin_claude_code_pack() -> PatternPack {
                     "limit reached".to_string(),
                     "quota exceeded".to_string(),
                     "You've hit your limit".to_string(),
+                    // Claude Code 2.1: "You've hit your session limit · resets
+                    // 3pm (America/New_York)". Named limits only: a bare
+                    // "You've hit your" also prefixes Codex's usage limit.
+                    "You've hit your session limit".to_string(),
+                    "You've hit your weekly limit".to_string(),
+                    "You've hit your Opus limit".to_string(),
+                    "You've hit your Sonnet limit".to_string(),
                 ],
                 regex: Some(
                     r"(?:retry|reset(?:s)?|try again).*?(?P<reset_time>\d+\s*(?:seconds?|minutes?|hours?)|[\d:]+\s*(?:AM|PM|UTC)|\d+(?::\d+)?\s*(?:am|pm|AM|PM)(?:\s*\([^)]+\))?)".to_string()
@@ -3722,6 +3761,11 @@ fn builtin_claude_code_pack() -> PatternPack {
                     "login required".to_string(),
                     "please authenticate".to_string(),
                     "auth required".to_string(),
+                    // Claude Code 2.1: "Not logged in · Please run /login",
+                    // "Login expired · Please run /login", "Authentication
+                    // required · Sign in again to continue".
+                    "Please run /login".to_string(),
+                    "Sign in again to continue".to_string(),
                 ],
                 regex: None,
                 description: "Claude Code login/authentication required via browser".to_string(),
@@ -3764,8 +3808,10 @@ fn builtin_claude_code_pack() -> PatternPack {
                     "Permission".to_string(),
                     "Do you want".to_string(),
                 ],
+                // make/create/edit: Claude Code's file prompts ("Do you want to
+                // make this edit to main.rs?", "Do you want to create ...?").
                 regex: Some(
-                    r"(?P<action>run|execute|write|delete|send|allow|proceed).*?\?".to_string()
+                    r"(?P<action>run|execute|write|delete|send|allow|proceed|make|create|edit).*?\?".to_string()
                 ),
                 description: "Claude Code approval/permission prompt".to_string(),
                 remediation: Some("User input required for approval".to_string()),
@@ -3784,9 +3830,14 @@ fn builtin_claude_code_pack() -> PatternPack {
                     "context window".to_string(),
                     "context limit".to_string(),
                     "running low on context".to_string(),
+                    // Claude Code 2.1: "Context low (8% remaining) · Run
+                    // /compact ...", "12% until auto-compact", "88% context used".
+                    "Context low".to_string(),
+                    "until auto-compact".to_string(),
+                    "context used".to_string(),
                 ],
                 regex: Some(
-                    r"(?P<percent>\d+)%?\s*(?:of context|context (?:used|remaining))".to_string()
+                    r"(?P<percent>\d+)%?\s*(?:of context|context (?:used|remaining))|Context low \((?P<remaining_percent>\d+)% remaining\)|(?P<until_compact_percent>\d+)% until auto-compact".to_string()
                 ),
                 description: "Claude Code context window warning".to_string(),
                 remediation: Some("Consider compacting or starting new session".to_string()),
@@ -3806,8 +3857,10 @@ fn builtin_claude_code_pack() -> PatternPack {
                     "Extended thinking".to_string(),
                     "ultrathink".to_string(),
                 ],
+                // "…": Claude Code 2.1 renders "✻ Thinking…" with a single
+                // ellipsis character (U+2026), not three dots.
                 regex: Some(
-                    r"(?:Thinking|Extended thinking)(?:\.{3}|\s+for\s+(?P<duration>\d+)\s*(?:seconds?|s))".to_string()
+                    r"(?:Thinking|Extended thinking)(?:\.{3}|…|\s+for\s+(?P<duration>\d+)\s*(?:seconds?|s))".to_string()
                 ),
                 description: "Claude Code extended thinking mode".to_string(),
                 remediation: None,
@@ -4032,6 +4085,9 @@ fn builtin_gemini_pack() -> PatternPack {
                     "Usage limit reached for all Pro models".to_string(),
                     "Usage limit reached for Pro models".to_string(),
                     "Usage limit reached for your Pro models".to_string(),
+                    // Gemini CLI 0.47 names a non-Pro model: "Usage limit
+                    // reached for gemini-3-flash."
+                    "Usage limit reached for gemini-".to_string(),
                 ],
                 regex: None,
                 description: "Gemini usage limit reached".to_string(),
@@ -4140,6 +4196,11 @@ fn builtin_gemini_pack() -> PatternPack {
                     "authorize this app".to_string(),
                     "complete authentication".to_string(),
                     "sign in with Google".to_string(),
+                    // Gemini CLI 0.47: "Please visit the following URL to
+                    // authorize the application:" and "Waiting for
+                    // authentication... (Press Esc or Ctrl+C to cancel)".
+                    "authorize the application".to_string(),
+                    "Waiting for authentication".to_string(),
                 ],
                 regex: None,
                 description: "Gemini CLI OAuth authentication required via browser".to_string(),
@@ -4189,8 +4250,15 @@ fn builtin_wezterm_pack() -> PatternPack {
                     "pane exited".to_string(),
                     "shell exited".to_string(),
                     "process exited".to_string(),
+                    // The mux's own exit notice (localpane.rs): "⚠️  Process
+                    // zsh didn't exit cleanly" then "Exited with code 1.", or
+                    // "👍 Process zsh completed.".
+                    "didn't exit cleanly".to_string(),
+                    "👍 Process ".to_string(),
                 ],
-                regex: Some(r"(?:exit(?:ed)?|status)[:\s]+(?P<exit_code>\d+)".to_string()),
+                regex: Some(
+                    r"(?:(?:exit(?:ed)?|status)[:\s]+|Exited with code )(?P<exit_code>\d+)|👍 Process (?P<command>.+?) completed\.".to_string(),
+                ),
                 description: "WezTerm pane process exited".to_string(),
                 remediation: None,
                 workflow: None,
