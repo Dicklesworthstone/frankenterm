@@ -6802,10 +6802,7 @@ fn dispatch_client_request_if_admitted(
 /// the client with stale user vars for every pane it had not shown yet. Only
 /// `SetUserVar` is forwarded; other alerts for untracked panes are still
 /// dropped.
-fn untracked_pane_alert_pdu(
-    pane_id: mux::pane::PaneId,
-    alert: wezterm_term::Alert,
-) -> Option<Pdu> {
+fn untracked_pane_alert_pdu(pane_id: mux::pane::PaneId, alert: wezterm_term::Alert) -> Option<Pdu> {
     matches!(alert, wezterm_term::Alert::SetUserVar { .. })
         .then(|| Pdu::NotifyAlert(codec::NotifyAlert { pane_id, alert }))
 }

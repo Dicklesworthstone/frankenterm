@@ -5019,7 +5019,12 @@ fn listed_pane_ids(listing: &ListPanesResponse) -> Vec<PaneId> {
             mux::tab::PaneNode::Leaf(entry) => pane_ids.push(entry.pane_id),
         }
     }
-    pane_ids.extend(listing.floating_panes.iter().map(|floating| floating.pane.pane_id));
+    pane_ids.extend(
+        listing
+            .floating_panes
+            .iter()
+            .map(|floating| floating.pane.pane_id),
+    );
     pane_ids
 }
 
@@ -23703,10 +23708,7 @@ mod tests {
 
     /// Two tabs in one window, each with one fake pane, as a GUI sees a mux
     /// with a foreground tab and a background tab.
-    fn mux_with_two_tabs(
-        first: &Arc<FakePane>,
-        second: &Arc<FakePane>,
-    ) -> (Arc<Mux>, ScopedMux) {
+    fn mux_with_two_tabs(first: &Arc<FakePane>, second: &Arc<FakePane>) -> (Arc<Mux>, ScopedMux) {
         let size = test_tab_size();
         let mux = Arc::new(Mux::new(None));
         let mux_guard = ScopedMux::install(&mux);
