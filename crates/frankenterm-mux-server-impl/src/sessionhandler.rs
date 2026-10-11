@@ -3069,7 +3069,7 @@ pub(crate) struct PerPane {
 /// alerts only as they happen. So the session sends each pane's current vars
 /// once, either after a pane listing or on the pane's first render push,
 /// whichever comes first.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct AnnouncedUserVars(Arc<parking_lot::Mutex<HashSet<PaneId>>>);
 
 impl AnnouncedUserVars {
@@ -7585,6 +7585,7 @@ impl SessionHandler {
             owner: SessionOwner::new(mux_owner),
             topology_stream_id: TopologyStreamId::from_bytes(*uuid::Uuid::new_v4().as_bytes()),
             per_pane: HashMap::new(),
+            announced_user_vars: AnnouncedUserVars::default(),
             selection_anchors: Arc::new(parking_lot::Mutex::new(RemoteSelectionAnchors::default())),
             selection_anchor_expiry_task: None,
             push_coordinator: None,
