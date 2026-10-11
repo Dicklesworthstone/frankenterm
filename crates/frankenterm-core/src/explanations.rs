@@ -67,9 +67,9 @@ The safety policy blocks sends to alt-screen panes by default.",
     suggestions: &[
         "Exit the full-screen application first",
         "Use `ft send <pane-id> <text> --dry-run` to preview the policy decision",
-        "Configure policy to allow specific alt-screen apps",
+        "Check that [safety].block_alt_screen = true (the default): agent sends then ask for approval instead of being denied; human sends are always denied",
     ],
-    see_also: &["ft why --recent", "ft status --pane-id <id>"],
+    see_also: &["ft why --recent", "ft get-text <id> --tail 20"],
 };
 
 /// Explanation for command-running blocking.
@@ -389,9 +389,9 @@ This factor adds significant weight (default: 60) to the risk score because:
     suggestions: &[
         "Wait for the application to exit",
         "Use the application's native input method",
-        "Check 'ft status --pane-id <id>' for alt-screen state",
+        "Check what the pane is showing with `ft get-text <id> --tail 20`",
     ],
-    see_also: &["ft status", "ft why --recent"],
+    see_also: &["ft why deny.alt_screen", "ft why --recent"],
 };
 
 /// Explanation for destructive content risk factor.
@@ -1242,7 +1242,9 @@ mod tests {
         let formatted = format_explanation(template, None);
         let exit_pos = formatted.find("Exit the full-screen").unwrap();
         let use_pos = formatted.find("Use `ft send").unwrap();
-        let configure_pos = formatted.find("Configure policy").unwrap();
+        let configure_pos = formatted
+            .find("Check that [safety].block_alt_screen")
+            .unwrap();
         assert!(
             exit_pos < use_pos && use_pos < configure_pos,
             "Suggestions should appear in order"
@@ -1253,7 +1255,7 @@ mod tests {
     fn format_explanation_see_also_comma_separated() {
         let template = &DENY_ALT_SCREEN;
         let formatted = format_explanation(template, None);
-        assert!(formatted.contains("ft why --recent, ft status --pane-id <id>"));
+        assert!(formatted.contains("ft why --recent, ft get-text <id> --tail 20"));
     }
 
     #[test]

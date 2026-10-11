@@ -297,8 +297,18 @@ fn check_quarantine(engine: &PolicyEngine, now_ms: u64) -> RuntimeHealthCheck {
         )
         .with_evidence(&format!("active_quarantines={}", active.len()))
         .with_remediation(
-            RemediationHint::with_command("Review kill switch state", "ft audit --decision deny")
-                .effort(RemediationEffort::High),
+            RemediationHint::with_command(
+                "Review who tripped the kill switch and why",
+                "ft robot kill-switch status",
+            )
+            .effort(RemediationEffort::High),
+        )
+        .with_remediation(
+            RemediationHint::with_command(
+                "Reset it once the cause is resolved",
+                "ft robot kill-switch reset",
+            )
+            .effort(RemediationEffort::Low),
         )
     } else if ks_level == crate::policy_quarantine::KillSwitchLevel::SoftStop {
         RuntimeHealthCheck::warn(

@@ -376,7 +376,8 @@ pub struct DiffRunResult {
 // RegressionSuiteResult — suite aggregate
 // ============================================================================
 
-/// Result of a regression suite run (`ft replay regression-suite`).
+/// Result of a regression suite run (a planned suite command; no CLI emits
+/// this yet, so per-pair `ft replay diff --budget` is today's gate).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegressionSuiteResult {
     /// Number of artifacts tested.

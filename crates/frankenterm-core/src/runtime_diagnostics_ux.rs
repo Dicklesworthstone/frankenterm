@@ -196,11 +196,13 @@ pub fn standard_diagnostic_templates() -> Vec<DiagnosticTemplate> {
                     step: 2,
                     instruction: "Repair the database (FTS rebuild, WAL checkpoint, vacuum)".into(),
                     command: Some("ft db repair".into()),
-                    expected_outcome: "Data restored to consistent state".into(),
+                    expected_outcome:
+                        "Indexes and WAL consistent again; rows lost to corruption stay lost, so re-run ft db check"
+                            .into(),
                     robot_safe: false,
                 },
             ],
-            escalation_hint: "Preserve corrupted state for forensics before repairing: ft diag bundle"
+            escalation_hint: "Copy the database and its -wal/-shm files aside before repairing; ft diag bundle holds only a redacted health summary, not the database"
                 .into(),
             error_code: "RT-CORRUPTION-001".into(),
             certified: true,
@@ -297,7 +299,9 @@ pub fn standard_diagnostic_templates() -> Vec<DiagnosticTemplate> {
                     robot_safe: false,
                 },
             ],
-            escalation_hint: "Capture diagnostic bundle with crash artifacts: ft diag bundle".into(),
+            escalation_hint:
+                "Attach the exported crash bundle, plus redacted runtime context from ft diag bundle"
+                    .into(),
             error_code: "RT-PANIC-001".into(),
             certified: true,
         },
@@ -316,7 +320,7 @@ pub fn standard_diagnostic_templates() -> Vec<DiagnosticTemplate> {
                 RemediationStep {
                     step: 2,
                     instruction:
-                        "If the operation is intentional, find its approval code and run ft approve <code>"
+                        "If the operation is intentional, approve it with the code from the denial (ft approve <code>) or by row id from this list (ft approvals approve <id>)"
                             .into(),
                     command: Some("ft approvals list".into()),
                     expected_outcome: "Operation proceeds after approval".into(),

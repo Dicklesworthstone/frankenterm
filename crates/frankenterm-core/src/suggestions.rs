@@ -1277,7 +1277,7 @@ impl SuggestionRule for AccountLowRule {
             .with_priority(Priority::High)
             .with_action(SuggestedAction::new(
                 "Preview next account",
-                "ft accounts --pick",
+                format!("ft accounts --service {} --pick", account.service),
             )),
         )
     }
@@ -1601,8 +1601,8 @@ impl SuggestionRule for AltScreenWarningRule {
             )
             .with_priority(Priority::High)
             .with_action(SuggestedAction::new(
-                "Check pane state",
-                format!("ft status --pane-id {}", pane_ids[0]),
+                "See what the pane is showing",
+                format!("ft get-text {} --tail 20", pane_ids[0]),
             )),
         )
     }
@@ -2281,13 +2281,20 @@ mod tests {
     fn test_account_low_rule_triggers() {
         let rule = AccountLowRule::default();
         let mut ctx = SuggestionContext::new();
-        ctx.add_account(make_account("acct-1", 10.0));
+        let mut account = make_account("acct-1", 10.0);
+        account.service = "anthropic".to_string();
+        ctx.add_account(account);
 
         assert!(rule.applies(&ctx));
         let suggestion = rule.generate(&ctx).expect("expected suggestion");
         assert_eq!(suggestion.suggestion_type, SuggestionType::Warning);
         assert!(suggestion.message.contains("10"));
-        assert!(suggestion.action.is_some());
+        // The CLI defaults --service to openai, so the preview must name the
+        // low account's own service.
+        assert_eq!(
+            suggestion.action.expect("action").command,
+            "ft accounts --service anthropic --pick"
+        );
     }
 
     #[test]
