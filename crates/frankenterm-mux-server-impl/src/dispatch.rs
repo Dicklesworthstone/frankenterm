@@ -6795,6 +6795,21 @@ fn dispatch_client_request_if_admitted(
     Ok(RequestDispatchOutcome::Dispatched)
 }
 
+/// The PDU to send at once for an alert on a pane this session does not track.
+///
+/// A client tracks a pane only after it renders or sends input to it, so
+/// background tabs are untracked. Their alerts used to be dropped, which left
+/// the client with stale user vars for every pane it had not shown yet. Only
+/// `SetUserVar` is forwarded; other alerts for untracked panes are still
+/// dropped.
+fn untracked_pane_alert_pdu(
+    pane_id: mux::pane::PaneId,
+    alert: wezterm_term::Alert,
+) -> Option<Pdu> {
+    matches!(alert, wezterm_term::Alert::SetUserVar { .. })
+        .then(|| Pdu::NotifyAlert(codec::NotifyAlert { pane_id, alert }))
+}
+
 fn retain_pane_alert_or_trip(
     per_pane: &Arc<std::sync::Mutex<PerPane>>,
     terminal: &DispatchTerminal,
@@ -7089,6 +7104,14 @@ where
                             if let Some(per_pane) = handler.per_pane_if_present(pane_id) {
                                 retain_pane_alert_or_trip(&per_pane, &terminal, pane_id, alert)?;
                                 handler.schedule_tracked_pane_push(pane_id);
+                            } else if let Some(pdu) = untracked_pane_alert_pdu(pane_id, alert) {
+                                pending_outbound = Some(prepare_unilateral_pdu(
+                                    pdu,
+                                    reservation,
+                                    batch_rx,
+                                    &mut deferred_item,
+                                    &terminal,
+                                )?);
                             }
                         }
                         MuxNotification::SaveToDownloads { .. } => {}
@@ -7523,6 +7546,22 @@ mod tests {
         let (item_tx, _item_rx) = bounded(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
         let (terminal, _terminal_rx) = DispatchTerminal::channel();
         TopologyStreamCoordinator::new(item_tx, terminal, TopologyStreamId::from_bytes([0x5a; 16]))
+    }
+
+    #[test]
+    fn untracked_pane_user_var_is_forwarded_at_once() {
+        // A background tab's pane is untracked. Its user var changes must
+        // still reach the client, or the tab bar shows stale state.
+        let alert = Alert::SetUserVar {
+            name: "claude_state".to_string(),
+            value: "waiting".to_string(),
+        };
+        assert_eq!(
+            untracked_pane_alert_pdu(41, alert.clone()),
+            Some(Pdu::NotifyAlert(codec::NotifyAlert { pane_id: 41, alert }))
+        );
+        assert_eq!(untracked_pane_alert_pdu(41, Alert::Bell), None);
+        assert_eq!(untracked_pane_alert_pdu(41, Alert::PaletteChanged), None);
     }
 
     #[test]

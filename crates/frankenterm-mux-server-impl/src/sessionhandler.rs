@@ -3056,10 +3056,42 @@ pub(crate) struct PerPane {
     #[cfg(test)]
     panic_next_legacy_enqueue_recovery: bool,
     pub(crate) notifications: PendingPaneAlerts,
-    // Whether this session has sent the pane's user vars as they stood when
-    // it first rendered the pane. Alerts reach `notifications` only after the
-    // pane is tracked, so vars set before the client attached need this.
-    sent_initial_user_vars: bool,
+    // The session's record of panes whose current user vars it has sent.
+    // Alerts reach `notifications` only after the pane is tracked, so vars
+    // set before the client attached are sent once on the first render push
+    // unless a pane listing already sent them.
+    announced_user_vars: AnnouncedUserVars,
+}
+
+/// Panes whose current user vars one session has sent to its client.
+///
+/// A client starts with no user vars, and the server forwards `SetUserVar`
+/// alerts only as they happen. So the session sends each pane's current vars
+/// once, either after a pane listing or on the pane's first render push,
+/// whichever comes first.
+#[derive(Clone, Default)]
+pub(crate) struct AnnouncedUserVars(Arc<parking_lot::Mutex<HashSet<PaneId>>>);
+
+impl AnnouncedUserVars {
+    /// Returns true if the caller should send this pane's vars now.
+    fn claim(&self, pane_id: PaneId) -> bool {
+        self.0.lock().insert(pane_id)
+    }
+
+    /// Undo a claim whose vars were not sent, so a later attempt sends them.
+    fn release(&self, pane_id: PaneId) {
+        self.0.lock().remove(&pane_id);
+    }
+
+    fn contains(&self, pane_id: PaneId) -> bool {
+        self.0.lock().contains(&pane_id)
+    }
+
+    /// Forget panes that are no longer listed, so the set stays bounded by
+    /// the live panes.
+    fn retain_listed(&self, listed: &HashSet<PaneId>) {
+        self.0.lock().retain(|pane_id| listed.contains(pane_id));
+    }
 }
 
 impl Default for PerPane {
@@ -3078,7 +3110,7 @@ impl Default for PerPane {
             #[cfg(test)]
             panic_next_legacy_enqueue_recovery: false,
             notifications: PendingPaneAlerts::default(),
-            sent_initial_user_vars: false,
+            announced_user_vars: AnnouncedUserVars::default(),
         }
     }
 }
@@ -3346,10 +3378,13 @@ impl Drop for PanePushStateGuard {
 }
 
 impl TrackedPane {
-    fn exact(registration: PaneRegistrationHandle) -> Self {
+    fn exact(registration: PaneRegistrationHandle, announced_user_vars: AnnouncedUserVars) -> Self {
         Self {
             registration: Some(registration),
-            state: Arc::new(Mutex::new(PerPane::default())),
+            state: Arc::new(Mutex::new(PerPane {
+                announced_user_vars,
+                ..PerPane::default()
+            })),
             push_state: Arc::new(AtomicUsize::new(PANE_PUSH_IDLE)),
             live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
@@ -4872,37 +4907,120 @@ fn send_initial_user_vars(
     sender: &PduSender,
     per_pane: &Arc<Mutex<PerPane>>,
 ) -> anyhow::Result<()> {
-    if lock_per_pane_or_retire(per_pane, "checking initial user vars")?.sent_initial_user_vars {
+    let pane_id = pane.pane_id();
+    let announced = lock_per_pane_or_retire(per_pane, "checking initial user vars")?
+        .announced_user_vars
+        .clone();
+    if announced.contains(pane_id) {
         return Ok(());
     }
     // Read outside the per-pane lock: alert retention takes that lock from
     // mux notification callbacks.
-    let mut user_vars = pane.copy_user_vars().into_iter().collect::<Vec<_>>();
-    user_vars.sort_unstable();
-    {
-        let mut state = lock_per_pane_or_retire(per_pane, "sending initial user vars")?;
-        state.ensure_legacy_transport_idle()?;
-        if std::mem::replace(&mut state.sent_initial_user_vars, true) {
-            return Ok(());
+    let user_vars = sorted_user_vars(pane.copy_user_vars());
+    lock_per_pane_or_retire(per_pane, "sending initial user vars")?
+        .ensure_legacy_transport_idle()?;
+    if !announced.claim(pane_id) {
+        return Ok(());
+    }
+    send_user_vars(pane_id, user_vars, sender).inspect_err(|_| {
+        // Resend the full set on the next push. Repeating a var the client
+        // already has only re-inserts the same value.
+        announced.release(pane_id);
+    })
+}
+
+/// Most `SetUserVar` alerts a pane listing may add after its response.
+///
+/// A client holds unilateral PDUs that arrive before it finishes attaching,
+/// and gives up above 1024 of them. This leaves room for the other PDUs of
+/// that window. Panes past the limit keep their claim open and are sent by
+/// a later listing or by their first render push.
+const LISTED_USER_VAR_ALERT_LIMIT: usize = 512;
+
+/// Send the current user vars of every listed pane this session has not sent
+/// yet, right after the listing response.
+///
+/// A client learns of background panes from the listing but does not render
+/// them, so without this it has no user vars for them until each var changes.
+/// This runs on the main thread, which also delivers alert notifications, so
+/// no `SetUserVar` alert for a later change can be queued between reading the
+/// vars here and queueing them. Changes after the read reach the client after
+/// these alerts.
+fn announce_listed_user_vars(
+    mux: &Mux,
+    sender: &PduSender,
+    announced: &AnnouncedUserVars,
+    listed: &[PaneId],
+) {
+    announced.retain_listed(&listed.iter().copied().collect());
+    let mut budget = LISTED_USER_VAR_ALERT_LIMIT;
+    for &pane_id in listed {
+        if announced.contains(pane_id) {
+            continue;
+        }
+        let Some(pane) = mux.get_pane(pane_id) else {
+            continue;
+        };
+        let user_vars = sorted_user_vars(pane.copy_user_vars());
+        if user_vars.len() > budget {
+            log::debug!(
+                "deferring user vars of pane {pane_id} and later panes: \
+                 listing alert limit {LISTED_USER_VAR_ALERT_LIMIT} reached"
+            );
+            return;
+        }
+        if !announced.claim(pane_id) {
+            continue;
+        }
+        budget -= user_vars.len();
+        if let Err(err) = send_user_vars(pane_id, user_vars, sender) {
+            announced.release(pane_id);
+            log::debug!("stopped sending listed user vars at pane {pane_id}: {err:#}");
+            return;
         }
     }
+}
+
+fn sorted_user_vars(user_vars: HashMap<String, String>) -> Vec<(String, String)> {
+    let mut user_vars = user_vars.into_iter().collect::<Vec<_>>();
+    user_vars.sort_unstable();
+    user_vars
+}
+
+fn send_user_vars(
+    pane_id: PaneId,
+    user_vars: Vec<(String, String)>,
+    sender: &PduSender,
+) -> anyhow::Result<()> {
     for (name, value) in user_vars {
-        let sent = sender.send_bulk(DecodedPdu {
+        sender.send_bulk(DecodedPdu {
             pdu: Pdu::NotifyAlert(NotifyAlert {
-                pane_id: pane.pane_id(),
+                pane_id,
                 alert: Alert::SetUserVar { name, value },
             }),
             serial: 0,
-        });
-        if let Err(err) = sent {
-            // Resend the full set on the next push. Repeating a var the
-            // client already has only re-inserts the same value.
-            lock_per_pane_or_retire(per_pane, "retrying initial user vars")?
-                .sent_initial_user_vars = false;
-            return Err(err);
-        }
+        })?;
     }
     Ok(())
+}
+
+/// Pane ids in a listing, in listing order: tab trees first, then floating
+/// panes.
+fn listed_pane_ids(listing: &ListPanesResponse) -> Vec<PaneId> {
+    let mut pane_ids = Vec::new();
+    let mut nodes = listing.tabs.iter().rev().collect::<Vec<_>>();
+    while let Some(node) = nodes.pop() {
+        match node {
+            mux::tab::PaneNode::Empty => {}
+            mux::tab::PaneNode::Split { left, right, .. } => {
+                nodes.push(right);
+                nodes.push(left);
+            }
+            mux::tab::PaneNode::Leaf(entry) => pane_ids.push(entry.pane_id),
+        }
+    }
+    pane_ids.extend(listing.floating_panes.iter().map(|floating| floating.pane.pane_id));
+    pane_ids
 }
 
 /// A poll needs its own source observation: its correlated reply may be
@@ -7338,6 +7456,7 @@ pub struct SessionHandler {
     owner: SessionOwner,
     topology_stream_id: TopologyStreamId,
     per_pane: HashMap<PaneId, TrackedPane>,
+    announced_user_vars: AnnouncedUserVars,
     selection_anchors: Arc<parking_lot::Mutex<RemoteSelectionAnchors>>,
     selection_anchor_expiry_task: Option<promise::spawn::MainThreadSpawnedTask<()>>,
     push_coordinator: Option<Arc<PanePushCoordinator>>,
@@ -7418,6 +7537,7 @@ impl SessionHandler {
             owner,
             topology_stream_id,
             per_pane: HashMap::new(),
+            announced_user_vars: AnnouncedUserVars::default(),
             selection_anchors,
             selection_anchor_expiry_task: None,
             push_coordinator: Some(coordinator),
@@ -7545,10 +7665,13 @@ impl SessionHandler {
                     if let Some(coordinator) = coordinator {
                         coordinator.remove(pane_id);
                     }
-                    *tracked = TrackedPane::exact(registration.clone());
+                    *tracked =
+                        TrackedPane::exact(registration.clone(), self.announced_user_vars.clone());
                 }
             })
-            .or_insert_with(|| TrackedPane::exact(registration.clone()));
+            .or_insert_with(|| {
+                TrackedPane::exact(registration.clone(), self.announced_user_vars.clone())
+            });
         Arc::clone(&tracked.state)
     }
 
@@ -7556,7 +7679,10 @@ impl SessionHandler {
     fn per_pane(&mut self, pane_id: PaneId) -> Arc<Mutex<PerPane>> {
         let tracked = self.per_pane.entry(pane_id).or_insert_with(|| TrackedPane {
             registration: None,
-            state: Arc::new(Mutex::new(PerPane::default())),
+            state: Arc::new(Mutex::new(PerPane {
+                announced_user_vars: self.announced_user_vars.clone(),
+                ..PerPane::default()
+            })),
             push_state: Arc::new(AtomicUsize::new(PANE_PUSH_IDLE)),
             live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         });
@@ -7585,6 +7711,9 @@ impl SessionHandler {
                 .as_ref()
                 .is_none_or(|registration| registration.try_with_current(|_| ()).is_none())
         });
+        if should_remove || !self.per_pane.contains_key(&pane_id) {
+            self.announced_user_vars.release(pane_id);
+        }
         if should_remove {
             if let Some(tracked) = self.per_pane.get(&pane_id) {
                 tracked.live.store(false, Ordering::Release);
@@ -8019,6 +8148,8 @@ impl SessionHandler {
             }
             Pdu::ListPanes(ListPanes {}) => {
                 let queued_at = Instant::now();
+                let sender = self.to_write_tx.clone();
+                let announced = self.announced_user_vars.clone();
                 schedule_main_thread_snapshot_rpc(
                     MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
                     |send_response| async move {
@@ -8032,7 +8163,16 @@ impl SessionHandler {
                         }
                         .await;
                         record_pane_snapshot_collection_wall("pdu4", started_at, response.is_ok());
+                        let listed = match &response {
+                            Ok(Pdu::ListPanesResponse(listing)) => listed_pane_ids(listing),
+                            _ => Vec::new(),
+                        };
                         send_response(response);
+                        if !listed.is_empty()
+                            && let Ok(mux) = session_mux(&authority)
+                        {
+                            announce_listed_user_vars(&mux, &sender, &announced, &listed);
+                        }
                     },
                     send_response,
                 );
@@ -8043,6 +8183,8 @@ impl SessionHandler {
             }) => {
                 let stream_id = self.topology_stream_id;
                 let queued_at = Instant::now();
+                let sender = self.to_write_tx.clone();
+                let announced = self.announced_user_vars.clone();
                 schedule_main_thread_snapshot_rpc(
                     MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
                     |send_response| async move {
@@ -8070,7 +8212,19 @@ impl SessionHandler {
                         }
                         .await;
                         record_pane_snapshot_collection_wall("pdu82", started_at, response.is_ok());
+                        let listed = match &response {
+                            Ok(Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse {
+                                outcome: ListPanesCoherentOutcome::Snapshot(snapshot),
+                                ..
+                            })) => listed_pane_ids(&snapshot.panes),
+                            _ => Vec::new(),
+                        };
                         send_response(response);
+                        if !listed.is_empty()
+                            && let Ok(mux) = session_mux(&authority)
+                        {
+                            announce_listed_user_vars(&mux, &sender, &announced, &listed);
+                        }
                     },
                     send_response,
                 );
@@ -23525,7 +23679,13 @@ mod tests {
             })
             .expect("test pane registration remains current")
             .expect_err("the synthetic user var enqueue must fail");
-        assert!(!per_pane.lock().unwrap().sent_initial_user_vars);
+        assert!(
+            !per_pane
+                .lock()
+                .unwrap()
+                .announced_user_vars
+                .contains(pane.pane_id())
+        );
 
         let (sender, captured) = capturing_sender();
         registration
@@ -23538,6 +23698,183 @@ mod tests {
             sent_user_vars(&captured),
             vec![("stage".to_string(), "build".to_string())]
         );
+    }
+
+    /// Two tabs in one window, each with one fake pane, as a GUI sees a mux
+    /// with a foreground tab and a background tab.
+    fn mux_with_two_tabs(
+        first: &Arc<FakePane>,
+        second: &Arc<FakePane>,
+    ) -> (Arc<Mux>, ScopedMux) {
+        let size = test_tab_size();
+        let mux = Arc::new(Mux::new(None));
+        let mux_guard = ScopedMux::install(&mux);
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        drop(window);
+        for fake in [first, second] {
+            let pane: Arc<dyn Pane> = fake.clone();
+            let tab = Arc::new(mux::tab::Tab::new(&size));
+            tab.assign_pane(&pane);
+            mux.add_tab_and_active_pane(&tab)
+                .expect("register test tab and pane");
+            mux.add_tab_to_window(&tab, window_id)
+                .expect("attach test tab to window");
+        }
+        (mux, mux_guard)
+    }
+
+    fn user_vars_by_pane(captured: &Mutex<Vec<DecodedPdu>>) -> Vec<(PaneId, String, String)> {
+        captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|decoded| match &decoded.pdu {
+                Pdu::NotifyAlert(NotifyAlert {
+                    pane_id,
+                    alert: Alert::SetUserVar { name, value },
+                }) => Some((*pane_id, name.clone(), value.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn listing_sends_user_vars_of_panes_the_client_never_rendered() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
+        let shown = Arc::new(FakePane::new_with_id(8_001, None));
+        let background = Arc::new(FakePane::new_with_id(8_002, None));
+        // Set before the client attached, as Claude's hooks do.
+        background.set_user_var("claude_state", "working");
+        shown.set_user_var("claude_state", "idle");
+        let (mux, _mux_guard) = mux_with_two_tabs(&shown, &background);
+
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux)).unwrap();
+        handler.process_one(DecodedPdu {
+            serial: 131,
+            pdu: Pdu::ListPanesCoherent(ListPanesCoherent {
+                supported: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+                required: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+            }),
+        });
+        tick_until_response(&executor, &captured, 3);
+
+        {
+            let sent = captured.lock().unwrap();
+            assert_eq!(sent[0].serial, 131);
+            assert!(
+                matches!(sent[0].pdu, Pdu::ListPanesCoherentResponse(_)),
+                "the listing response must come before the vars of the panes it lists"
+            );
+            assert!(sent[1..].iter().all(|decoded| decoded.serial == 0));
+        }
+        assert_eq!(
+            user_vars_by_pane(&captured),
+            vec![
+                (8_001, "claude_state".to_string(), "idle".to_string()),
+                (8_002, "claude_state".to_string(), "working".to_string()),
+            ],
+            "every listed pane's current vars must reach the client"
+        );
+        assert!(
+            handler.per_pane_if_present(8_002).is_none(),
+            "the background pane was never rendered or tracked"
+        );
+
+        // A later resync lists the same panes. The client already has their
+        // vars, so they are not sent again.
+        captured.lock().unwrap().clear();
+        handler.process_one(DecodedPdu {
+            serial: 132,
+            pdu: Pdu::ListPanes(ListPanes {}),
+        });
+        tick_until_response(&executor, &captured, 1);
+        drain_simple_executor(&executor);
+        assert!(user_vars_by_pane(&captured).is_empty());
+
+        // Nor does the first render push of a pane already listed.
+        let shown_pane: Arc<dyn Pane> = shown.clone();
+        let registration = mux
+            .capture_pane_registration(&shown_pane)
+            .expect("shown pane is registered");
+        let per_pane = handler.per_pane_for_registration(&registration);
+        let (push_sender, pushed) = capturing_sender();
+        registration
+            .try_with_current(|current| {
+                maybe_push_pane_changes(&current, push_sender, Arc::clone(&per_pane))
+            })
+            .expect("test pane registration remains current")
+            .expect("first push should enqueue");
+        assert!(user_vars_by_pane(&pushed).is_empty());
+    }
+
+    #[test]
+    fn listing_sends_vars_of_a_pane_added_after_the_last_listing() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
+        let first = Arc::new(FakePane::new_with_id(8_011, None));
+        let second = Arc::new(FakePane::new_with_id(8_012, None));
+        first.set_user_var("agent", "claude");
+        second.set_user_var("agent", "codex");
+        let (mux, _mux_guard) = mux_with_two_tabs(&first, &second);
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux)).unwrap();
+
+        // Pretend the client already got the first pane's vars.
+        handler.announced_user_vars.claim(8_011);
+        handler.process_one(DecodedPdu {
+            serial: 133,
+            pdu: Pdu::ListPanes(ListPanes {}),
+        });
+        tick_until_response(&executor, &captured, 2);
+        assert_eq!(
+            user_vars_by_pane(&captured),
+            vec![(8_012, "agent".to_string(), "codex".to_string())]
+        );
+
+        // A removed pane is forgotten, so the set stays bounded.
+        handler.remove_per_pane(8_012);
+        assert!(!handler.announced_user_vars.contains(8_012));
+        assert!(handler.announced_user_vars.contains(8_011));
+    }
+
+    #[test]
+    fn listing_user_vars_stay_under_the_client_pre_ready_limit() {
+        let mux = Arc::new(Mux::new(None));
+        let mut listed = Vec::new();
+        for pane_id in 0..4 {
+            let fake = Arc::new(FakePane::new_with_id(8_100 + pane_id, None));
+            for var in 0..(LISTED_USER_VAR_ALERT_LIMIT / 3) {
+                fake.set_user_var(&format!("var{var}"), "x");
+            }
+            let pane: Arc<dyn Pane> = fake;
+            mux.add_pane(&pane).expect("register test pane");
+            listed.push(8_100 + pane_id);
+        }
+        let announced = AnnouncedUserVars::default();
+        let (sender, captured) = capturing_sender();
+
+        announce_listed_user_vars(&mux, &sender, &announced, &listed);
+        let sent = user_vars_by_pane(&captured);
+        assert!(sent.len() <= LISTED_USER_VAR_ALERT_LIMIT);
+        assert_eq!(sent.len(), 3 * (LISTED_USER_VAR_ALERT_LIMIT / 3));
+        assert!(announced.contains(8_102));
+        assert!(
+            !announced.contains(8_103),
+            "a pane past the limit stays unsent so a later listing or push sends it"
+        );
+
+        captured.lock().unwrap().clear();
+        announce_listed_user_vars(&mux, &sender, &announced, &listed);
+        let sent = user_vars_by_pane(&captured);
+        assert!(sent.iter().all(|(pane_id, _, _)| *pane_id == 8_103));
+        assert_eq!(sent.len(), LISTED_USER_VAR_ALERT_LIMIT / 3);
     }
 
     #[test]
