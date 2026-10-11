@@ -1622,7 +1622,7 @@ impl ToolHandler for WaAttentionTool {
         Tool {
             name: "wa.attention".to_string(),
             description: Some(
-                "Read attention-router status, next action, or item explanation from caller-supplied evidence or, with live, the workspace database: audit log, unhandled events, operator pane holds (robot parity)"
+                "Read attention-router status, next action, or item explanation from caller-supplied evidence or, with live, the workspace database: audit log, unhandled events, operator pane holds (ft robot attention also reads the watcher envelope, crash bundles, the active transaction, git status and ready beads)"
                     .to_string(),
             ),
             input_schema: serde_json::json!({

@@ -2823,22 +2823,24 @@ pub fn census(ft_dir: &Path) -> Result<Option<SubmitIdempotencyCensus>, SubmitId
     census_with_limits_at(ft_dir, PRODUCTION_LIMITS, now_unix_ms())
 }
 
-/// The last census the watcher published for `/metrics`. Process state, like
-/// the verified-submit receipt counters: the store is read periodically by
-/// the watcher, never by a scrape.
-static PUBLISHED_CENSUS: Mutex<Option<SubmitIdempotencyCensus>> = Mutex::new(None);
+/// The last census the watcher published for `/metrics`, with when it was
+/// taken (epoch ms). Process state, like the verified-submit receipt
+/// counters: the store is read periodically by the watcher, never by a
+/// scrape.
+static PUBLISHED_CENSUS: Mutex<Option<(SubmitIdempotencyCensus, i64)>> = Mutex::new(None);
 
 /// Publish the watcher's latest census for `/metrics`; `None` withdraws it
 /// (the store could not be read, so stale numbers must not be exported).
 pub fn publish_census(census: Option<SubmitIdempotencyCensus>) {
     *PUBLISHED_CENSUS
         .lock()
-        .unwrap_or_else(PoisonError::into_inner) = census;
+        .unwrap_or_else(PoisonError::into_inner) = census.map(|census| (census, now_unix_ms()));
 }
 
-/// The census most recently published by [`publish_census`].
+/// The census most recently published by [`publish_census`] and when it was
+/// taken (epoch ms), so a scrape can tell a stalled census from a fresh one.
 #[must_use]
-pub fn published_census() -> Option<SubmitIdempotencyCensus> {
+pub fn published_census() -> Option<(SubmitIdempotencyCensus, i64)> {
     *PUBLISHED_CENSUS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -4435,8 +4437,11 @@ mod tests {
             oldest_unresolved_updated_unix_ms: Some(42),
             ..SubmitIdempotencyCensus::default()
         };
+        let before = now_unix_ms();
         publish_census(Some(stranded));
-        assert_eq!(published_census(), Some(stranded));
+        let (published, taken_at) = published_census().expect("published");
+        assert_eq!(published, stranded);
+        assert!(taken_at >= before, "{taken_at} < {before}");
         publish_census(None);
         assert_eq!(published_census(), None);
     }

@@ -488,7 +488,9 @@ receipt is also logged as a
 key; `ft watch --metrics` counts the watcher's receipts as
 `verified_submit_receipts_total{agent_type,state}`. It also exports the
 idempotency store's backlog from a census the watcher takes every 5 minutes:
-`verified_submit_idempotency_keys{state}` and, while any key is unresolved,
+`verified_submit_idempotency_keys{state}`,
+`verified_submit_idempotency_census_age_seconds` (how old that census is)
+and, while any key is unresolved,
 `verified_submit_idempotency_oldest_unresolved_age_seconds`.
 
 `ft robot health` includes an `active_agents` snapshot for operator

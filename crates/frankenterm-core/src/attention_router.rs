@@ -1039,6 +1039,13 @@ pub fn build_attention_router_surface_payload_from_snapshot(
         requested_item_id,
         selected_item.as_ref(),
     );
+    // `next` acts on the item it selected (which passes over source-health
+    // items when anything actionable exists); the other surfaces report the
+    // snapshot's top-ranked action.
+    let next_action = match (surface, selected_item.as_ref()) {
+        (AttentionRouterSurface::Next, Some(item)) => Some(item.recommended_action.clone()),
+        _ => snapshot.next_action.clone(),
+    };
     AttentionRouterSurfacePayload {
         schema: ATTENTION_ROUTER_SURFACE_SCHEMA.to_string(),
         contract_id: ATTENTION_ROUTER_CONTRACT_ID.to_string(),
@@ -1053,7 +1060,7 @@ pub fn build_attention_router_surface_payload_from_snapshot(
         side_effects_executed: false,
         degraded_mode: attention_router_degraded_mode(&snapshot),
         selected_item,
-        next_action: snapshot.next_action.clone(),
+        next_action,
         explanation,
         mcp_resources: attention_router_mcp_resources(),
         snapshot,
@@ -1225,11 +1232,33 @@ fn rule_from_fact(
     fact: &AttentionRouterSourceFact,
     reason_codes: &[String],
 ) -> Option<AttentionRouterRule> {
-    let text = format!(
-        "{} {} {}",
-        source.source_summary, fact.summary, source.command_or_api
-    )
-    .to_ascii_lowercase();
+    // Live typed facts embed user-chosen identifiers in their summaries
+    // (actors, rule ids, transaction ids, reservation owners, paths, bead
+    // ids), so only their kind and reason codes classify them, never the
+    // prose heuristics below.
+    let typed_live_fact = matches!(
+        fact.fact,
+        AttentionRouterSourceFactKind::PolicyDeniedAudit
+            | AttentionRouterSourceFactKind::PolicyRequireApproval
+            | AttentionRouterSourceFactKind::SubmitProfileDrift
+            | AttentionRouterSourceFactKind::EventUnhandled
+            | AttentionRouterSourceFactKind::EventCritical
+            | AttentionRouterSourceFactKind::IncidentBundleOpen
+            | AttentionRouterSourceFactKind::MissionTxState
+            | AttentionRouterSourceFactKind::PaneReservationActive
+    ) || matches!(
+        source.source_id.as_str(),
+        LIVE_GIT_SOURCE_ID | LIVE_BEADS_SOURCE_ID
+    );
+    let text = if typed_live_fact {
+        String::new()
+    } else {
+        format!(
+            "{} {} {}",
+            source.source_summary, fact.summary, source.command_or_api
+        )
+        .to_ascii_lowercase()
+    };
 
     if contains_text(
         &text,
@@ -1381,6 +1410,24 @@ fn rule_from_fact(
                 "choose_winner_from_conflicting_metadata",
                 "stage_unowned_tracker_changes",
                 "force_release_without_status_check",
+            ],
+        ));
+    }
+
+    // An operator's hold on a pane (ft intervene / ft reserve): leave the
+    // pane alone, rather than the file-path rules below.
+    if fact.fact == AttentionRouterSourceFactKind::PaneReservationActive
+        && contains_reason(reason_codes, &["reservation.active_manual"])
+    {
+        return Some(rule(
+            AttentionRouterClassification::DoNotTouch,
+            AttentionRouterItemKind::Ownership,
+            AttentionRouterSafeAction::WaitForReservationReleaseOrExpiryThenRecheck,
+            AttentionRouterConfidence::High,
+            &[
+                "send_input_to_held_pane",
+                "run_workflow_on_held_pane",
+                "release_operator_hold",
             ],
         ));
     }
@@ -2382,7 +2429,15 @@ fn selected_attention_router_item(
 ) -> Option<AttentionRouterItem> {
     match surface {
         AttentionRouterSurface::Status => None,
-        AttentionRouterSurface::Next => snapshot.items.first().cloned(),
+        // An unavailable source stays visible (status, degraded mode) but is
+        // never picked over actionable work: the contract continues from the
+        // remaining sources, so Agent Mail being down does not stall a swarm.
+        AttentionRouterSurface::Next => snapshot
+            .items
+            .iter()
+            .find(|item| item.kind != AttentionRouterItemKind::SourceHealth)
+            .or_else(|| snapshot.items.first())
+            .cloned(),
         AttentionRouterSurface::Explain => match requested_item_id {
             Some(item_id) => snapshot
                 .items
@@ -3055,27 +3110,38 @@ pub fn verified_submit_observation_from_receipts(
 
 /// Detection history a live `events` source covers.
 pub const UNHANDLED_EVENTS_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
-/// Newest unhandled detection events a live `events` source reads.
+/// Newest groups of identical unhandled detection events (same pane, rule,
+/// type and extracted values) a live `events` source reads. A source that
+/// fills it reports itself degraded rather than silently dropping older ones.
 pub const UNHANDLED_EVENTS_MAX_ROWS: usize = 256;
 
-/// The event fields a live `events` source uses. Matched text and extracted
-/// values never leave the database; `identity_key` is the redacted hash
-/// `ft mute` keys events by (`crate::events::event_identity_key`).
+/// One group of identical unhandled events, as a live `events` source uses
+/// it. Matched text and extracted values never leave the database;
+/// `identity_key` is the redacted hash `ft mute` keys events by
+/// (`crate::events::event_identity_key`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnhandledEventRow {
     pub pane_id: u64,
     pub rule_id: String,
-    pub severity: String,
-    pub detected_at: i64,
     pub identity_key: String,
+    /// Events in the group.
+    pub occurrences: u64,
+    /// Detection time of the newest event in the group.
+    pub newest_at: i64,
+    /// Any event in the group is critical (the rest are warnings).
+    pub critical: bool,
+    /// Any event in the group was taken by a workflow that failed.
+    pub handling_failed: bool,
 }
 
 /// Live `events` source from unhandled warning and critical detection
 /// events, read by the caller within [`UNHANDLED_EVENTS_WINDOW_MS`] and
-/// [`UNHANDLED_EVENTS_MAX_ROWS`] (events an operator triaged as resolved or
-/// dismissed are left out). One fact per event identity, the key `ft mute`
-/// uses, so a muted event drops out and a repeating one is one item with a
-/// count. `None` means the events could not be read.
+/// [`UNHANDLED_EVENTS_MAX_ROWS`]. Events whose handling workflow failed count
+/// as unhandled; events an operator triaged as resolved or dismissed, and the
+/// watcher's own submit-profile drift events (already the `verified_submit`
+/// item), are left out. One fact per event identity, the key `ft mute` uses,
+/// so a muted event drops out and a repeating one is one item with a count.
+/// `None` means the events could not be read.
 #[must_use]
 pub fn unhandled_events_observation(
     events: Option<&[UnhandledEventRow]>,
@@ -3100,52 +3166,72 @@ pub fn unhandled_events_observation(
             .with_reason_code("events.unavailable"),
         );
     };
-    // identity -> (newest row, occurrences, any critical)
-    let mut identities: std::collections::BTreeMap<&str, (&UnhandledEventRow, u64, bool)> =
+    // identity -> (newest group, occurrences, any critical, any failed handling)
+    let mut identities: std::collections::BTreeMap<&str, (&UnhandledEventRow, u64, bool, bool)> =
         std::collections::BTreeMap::new();
-    for event in events {
-        let critical = event.severity == "critical";
+    for group in events {
         let entry = identities
-            .entry(event.identity_key.as_str())
-            .or_insert((event, 0, false));
-        if event.detected_at > entry.0.detected_at {
-            entry.0 = event;
+            .entry(group.identity_key.as_str())
+            .or_insert((group, 0, false, false));
+        if group.newest_at > entry.0.newest_at {
+            entry.0 = group;
         }
-        entry.1 += 1;
-        entry.2 |= critical;
+        entry.1 = entry.1.saturating_add(group.occurrences);
+        entry.2 |= group.critical;
+        entry.3 |= group.handling_failed;
     }
+    let total: u64 = events.iter().map(|group| group.occurrences).sum();
     let freshness_ms = events
         .iter()
-        .map(|event| event.detected_at)
+        .map(|group| group.newest_at)
         .max()
         .map_or(0, |newest| {
             now_ms.saturating_sub(u64::try_from(newest).unwrap_or(0))
         });
+    let truncated = events.len() >= UNHANDLED_EVENTS_MAX_ROWS;
     let mut observation = AttentionRouterSourceObservation::new(
         SOURCE_ID,
         AttentionRouterSourceKind::Events,
-        AttentionRouterSourceHealth::Available,
+        if truncated {
+            AttentionRouterSourceHealth::Degraded
+        } else {
+            AttentionRouterSourceHealth::Available
+        },
         API,
         format!(
-            "{} unhandled warning or critical events ({} distinct) in the last 24 hours",
-            events.len(),
-            identities.len()
+            "{total} unhandled warning or critical events ({} distinct) in the last 24 hours{}",
+            identities.len(),
+            if truncated {
+                "; older groups were not read"
+            } else {
+                ""
+            }
         ),
     )
     .live(now_ms, freshness_ms)
-    .items_seen(u64::try_from(events.len()).unwrap_or(u64::MAX));
-    for (identity_key, (newest, occurrences, critical)) in identities {
-        let age_s = now_ms.saturating_sub(u64::try_from(newest.detected_at).unwrap_or(0)) / 1000;
-        let (fact_kind, severity) = if critical {
-            (AttentionRouterSourceFactKind::EventCritical, "critical")
+    .items_seen(total);
+    if truncated {
+        observation = observation.with_reason_code("events.truncated");
+    }
+    for (identity_key, (newest, occurrences, critical, handling_failed)) in identities {
+        let age_s = now_ms.saturating_sub(u64::try_from(newest.newest_at).unwrap_or(0)) / 1000;
+        let fact_kind = if critical {
+            AttentionRouterSourceFactKind::EventCritical
         } else {
-            (AttentionRouterSourceFactKind::EventUnhandled, "warning")
+            AttentionRouterSourceFactKind::EventUnhandled
         };
         let mut fact = AttentionRouterSourceFact::new(
             fact_kind,
             format!(
-                "{occurrences} unhandled {severity} {} event(s) on pane {}, newest {age_s}s ago [mute: ft mute add {identity_key}]",
-                newest.rule_id, newest.pane_id
+                "{occurrences} unhandled {} event(s) on pane {}{}{}, newest {age_s}s ago [mute: ft mute add {identity_key}]",
+                newest.rule_id,
+                newest.pane_id,
+                if critical { ", including critical" } else { "" },
+                if handling_failed {
+                    ", a handling workflow failed"
+                } else {
+                    ""
+                },
             ),
         )
         .count(occurrences)
@@ -3154,6 +3240,9 @@ pub fn unhandled_events_observation(
         .with_notification_identity_key(identity_key);
         if critical {
             fact = fact.with_reason_code("event.critical");
+        }
+        if handling_failed {
+            fact = fact.with_reason_code("event.handling_failed");
         }
         observation = observation.with_fact(fact);
     }
@@ -3240,21 +3329,24 @@ pub const RECENT_CRASH_BUNDLES_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
 /// Newest crash bundles a live `incident_bundles` source considers.
 pub const RECENT_CRASH_BUNDLES_MAX: usize = 8;
 
-/// A crash bundle directory a live `incident_bundles` source uses: its name
-/// and modification time only. The crash message and backtrace stay on disk.
+/// A crash bundle a live `incident_bundles` source uses: its directory name
+/// and crash time only. The crash message and backtrace never reach a fact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrashBundleRow {
     pub name: String,
-    pub modified_at_ms: u64,
+    pub crashed_at_ms: u64,
 }
 
 /// Live `incident_bundles` source from the watcher's crash bundles written in
 /// the last [`RECENT_CRASH_BUNDLES_WINDOW_MS`]: each is one fact asking for
 /// review (`ft reproduce export --kind crash`), muted per bundle once
-/// reviewed. `None` means the crash directory could not be read.
+/// reviewed. `complete` is false when the bounded discovery could not prove
+/// its list (the source is then degraded, never "no crash"). `None` means
+/// the crash directory could not be read.
 #[must_use]
 pub fn crash_bundles_observation(
     bundles: Option<&[CrashBundleRow]>,
+    complete: bool,
     now_ms: u64,
 ) -> AttentionRouterSourceObservation {
     const SOURCE_ID: &str = "incident_bundles.recent_crashes";
@@ -3278,20 +3370,35 @@ pub fn crash_bundles_observation(
     };
     let freshness_ms = bundles
         .iter()
-        .map(|bundle| bundle.modified_at_ms)
+        .map(|bundle| bundle.crashed_at_ms)
         .max()
         .map_or(0, |newest| now_ms.saturating_sub(newest));
     let mut observation = AttentionRouterSourceObservation::new(
         SOURCE_ID,
         AttentionRouterSourceKind::IncidentBundles,
-        AttentionRouterSourceHealth::Available,
+        if complete {
+            AttentionRouterSourceHealth::Available
+        } else {
+            AttentionRouterSourceHealth::Degraded
+        },
         API,
-        format!("{} crash bundles in the last 24 hours", bundles.len()),
+        format!(
+            "{} crash bundles in the last 24 hours{}",
+            bundles.len(),
+            if complete {
+                ""
+            } else {
+                "; the crash directory could not be fully listed"
+            }
+        ),
     )
     .live(now_ms, freshness_ms)
     .items_seen(u64::try_from(bundles.len()).unwrap_or(u64::MAX));
+    if !complete {
+        observation = observation.with_reason_code("incident_bundles.incomplete");
+    }
     for bundle in bundles {
-        let age_s = now_ms.saturating_sub(bundle.modified_at_ms) / 1000;
+        let age_s = now_ms.saturating_sub(bundle.crashed_at_ms) / 1000;
         let mute_key = format!("attention.incident_bundles.{}", bundle.name);
         observation = observation.with_fact(
             AttentionRouterSourceFact::new(
@@ -3361,15 +3468,18 @@ pub fn active_tx_observation(
     let Some(tx) = active else {
         return observation;
     };
-    let (reason_code, next) = match tx.state {
-        MissionTxState::Failed => ("tx.failed", "roll it back with ft tx rollback"),
+    let (state, next) = match tx.state {
+        MissionTxState::Failed => ("failed", "roll it back with ft tx rollback"),
         MissionTxState::Compensating => (
-            "tx.compensating",
+            "compensating",
             "let compensation finish, then check ft tx show",
         ),
         _ => return observation,
     };
-    let mute_key = format!("attention.mission_tx_status.{}", tx.tx_id);
+    let reason_code = format!("tx.{state}");
+    // The state is part of the key: muting a compensating transaction must
+    // not silence it if compensation fails and it returns to failed.
+    let mute_key = format!("attention.mission_tx_status.{}.{state}", tx.tx_id);
     observation = observation.with_fact(
         AttentionRouterSourceFact::new(
             AttentionRouterSourceFactKind::MissionTxState,
@@ -3382,6 +3492,353 @@ pub fn active_tx_observation(
         .with_notification_identity_key(mute_key),
     );
     observation
+}
+
+/// Source id of the live `git` source. Its facts name paths, which are
+/// user-chosen text, so they are classified by kind and reason codes only.
+pub const LIVE_GIT_SOURCE_ID: &str = "git.live_status";
+/// Source id of the live `beads` source (bead ids are user-chosen text too).
+pub const LIVE_BEADS_SOURCE_ID: &str = "beads.live_ready";
+/// Paths a live `git` fact lists; its count covers all of them.
+pub const LIVE_GIT_MAX_LISTED_PATHS: usize = 20;
+/// Ready bead ids a live `beads` fact lists, highest priority first.
+pub const LIVE_BEADS_MAX_LISTED: usize = 10;
+
+/// The workspace's `git status`, as the live `git` source uses it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitStatusSummary {
+    /// Commits the branch is ahead of its upstream (0 without one).
+    pub ahead: u64,
+    /// Commits the branch is behind its upstream (0 without one).
+    pub behind: u64,
+    /// Every path with uncommitted changes (staged, unstaged, untracked or
+    /// unmerged), in git's order.
+    pub uncommitted_paths: Vec<String>,
+    /// The paths with staged changes.
+    pub staged_paths: Vec<String>,
+    pub untracked: u64,
+    pub unmerged: u64,
+}
+
+/// Parse `git status --porcelain=v2 --branch -z`. `None` when a record is
+/// not one the format defines, so a misread never looks like a clean tree.
+#[must_use]
+pub fn parse_git_status_porcelain_v2(raw: &[u8]) -> Option<GitStatusSummary> {
+    let mut summary = GitStatusSummary::default();
+    let mut records = raw
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty());
+    while let Some(record) = records.next() {
+        let record = String::from_utf8_lossy(record);
+        let (tag, rest) = record.split_once(' ')?;
+        // Fields after the tag, the path last: ordinary changes carry XY and
+        // six more, renames and copies one more (score), unmerged entries
+        // XY and eight more.
+        let field_count = match tag {
+            "#" => {
+                if let Some(divergence) = rest.strip_prefix("branch.ab ") {
+                    let (ahead, behind) = divergence.split_once(' ')?;
+                    summary.ahead = ahead.strip_prefix('+')?.parse().ok()?;
+                    summary.behind = behind.strip_prefix('-')?.parse().ok()?;
+                }
+                continue;
+            }
+            "?" => {
+                summary.untracked += 1;
+                summary.uncommitted_paths.push(rest.to_string());
+                continue;
+            }
+            "!" => continue,
+            "1" => 8,
+            "2" => 9,
+            "u" => 10,
+            _ => return None,
+        };
+        let fields: Vec<&str> = rest.splitn(field_count, ' ').collect();
+        let (Some(xy), Some(path)) = (fields.first(), fields.get(field_count - 1)) else {
+            return None;
+        };
+        if tag == "u" {
+            summary.unmerged += 1;
+        } else if !xy.starts_with('.') {
+            summary.staged_paths.push((*path).to_string());
+        }
+        summary.uncommitted_paths.push((*path).to_string());
+        if tag == "2" {
+            // A rename or copy is followed by its original path.
+            records.next()?;
+        }
+    }
+    Some(summary)
+}
+
+/// What the live `git` source could read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveGitStatus {
+    Read(GitStatusSummary),
+    /// The workspace is not inside a git work tree.
+    NotARepository,
+    /// git could not be run or its output not read; the reason code says why.
+    Unavailable(&'static str),
+}
+
+/// Live `git` source from the workspace's `git status`: uncommitted paths
+/// are a dirty-overlap item (edit and stage only disjoint paths), with staged
+/// paths and upstream divergence as context facts.
+#[must_use]
+pub fn git_status_observation(
+    status: &LiveGitStatus,
+    now_ms: u64,
+) -> AttentionRouterSourceObservation {
+    const API: &str = "git status --porcelain=v2 --branch -z";
+    let summary = match status {
+        LiveGitStatus::Read(summary) => summary,
+        LiveGitStatus::NotARepository => {
+            return AttentionRouterSourceObservation::new(
+                LIVE_GIT_SOURCE_ID,
+                AttentionRouterSourceKind::Git,
+                AttentionRouterSourceHealth::NotConfigured,
+                API,
+                "the workspace is not a git work tree",
+            )
+            .live(now_ms, 0)
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::SourceNotConfigured,
+                    "no git work tree at the workspace root",
+                )
+                .with_reason_code("git.not_a_repository"),
+            );
+        }
+        LiveGitStatus::Unavailable(reason_code) => {
+            return AttentionRouterSourceObservation::new(
+                LIVE_GIT_SOURCE_ID,
+                AttentionRouterSourceKind::Git,
+                AttentionRouterSourceHealth::Unavailable,
+                API,
+                "git status could not be read",
+            )
+            .live(now_ms, 0)
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::SourceUnavailable,
+                    "git status could not be read",
+                )
+                .with_reason_code(*reason_code),
+            );
+        }
+    };
+    let listed = |paths: &[String]| {
+        paths
+            .iter()
+            .take(LIVE_GIT_MAX_LISTED_PATHS)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let uncommitted = summary.uncommitted_paths.len();
+    let mut observation = AttentionRouterSourceObservation::new(
+        LIVE_GIT_SOURCE_ID,
+        AttentionRouterSourceKind::Git,
+        AttentionRouterSourceHealth::Available,
+        API,
+        if uncommitted == 0 {
+            "the working tree is clean".to_string()
+        } else {
+            format!("{uncommitted} paths have uncommitted changes")
+        },
+    )
+    .live(now_ms, 0)
+    .items_seen(u64::try_from(uncommitted).unwrap_or(u64::MAX));
+    if uncommitted > 0 {
+        let paths = listed(&summary.uncommitted_paths);
+        let mut fact = AttentionRouterSourceFact::new(
+            AttentionRouterSourceFactKind::GitDirtyPaths,
+            format!(
+                "{uncommitted} paths have uncommitted changes ({} untracked, {} unmerged): {}{}",
+                summary.untracked,
+                summary.unmerged,
+                paths.join(", "),
+                if uncommitted > paths.len() {
+                    ", ..."
+                } else {
+                    ""
+                }
+            ),
+        )
+        .count(u64::try_from(uncommitted).unwrap_or(u64::MAX))
+        .with_reason_code("git.dirty_paths");
+        if summary.unmerged > 0 {
+            fact = fact.with_reason_code("git.unmerged_paths");
+        }
+        for path in paths {
+            fact = fact.with_affected_path(path);
+        }
+        observation = observation.with_fact(fact);
+    }
+    if !summary.staged_paths.is_empty() {
+        let staged = summary.staged_paths.len();
+        let mut fact = AttentionRouterSourceFact::new(
+            AttentionRouterSourceFactKind::GitStagedPaths,
+            format!("{staged} paths are staged but not committed"),
+        )
+        .count(u64::try_from(staged).unwrap_or(u64::MAX))
+        .with_reason_code("git.staged_paths");
+        for path in listed(&summary.staged_paths) {
+            fact = fact.with_affected_path(path);
+        }
+        observation = observation.with_fact(fact);
+    }
+    if summary.ahead > 0 || summary.behind > 0 {
+        let mut fact = AttentionRouterSourceFact::new(
+            AttentionRouterSourceFactKind::GitBranchDivergence,
+            format!(
+                "the branch is {} commits ahead of and {} behind its upstream",
+                summary.ahead, summary.behind
+            ),
+        )
+        .count(summary.ahead.saturating_add(summary.behind));
+        if summary.ahead > 0 {
+            fact = fact.with_reason_code("git.branch_ahead");
+        }
+        if summary.behind > 0 {
+            fact = fact.with_reason_code("git.branch_behind");
+        }
+        observation = observation.with_fact(fact);
+    }
+    observation
+}
+
+/// A ready bead, as the live `beads` source uses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyBeadRow {
+    pub id: String,
+    pub priority: u8,
+}
+
+/// Parse `br ready --json` (an array of issues, or an object holding them
+/// under `issues`): each issue's id and priority. Epics are left out: they
+/// are containers, not claimable work. `None` when the output is not that
+/// shape.
+#[must_use]
+pub fn parse_br_ready_json(raw: &[u8]) -> Option<Vec<ReadyBeadRow>> {
+    let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let issues = match &value {
+        serde_json::Value::Array(issues) => issues,
+        serde_json::Value::Object(object) => object.get("issues")?.as_array()?,
+        _ => return None,
+    };
+    let mut rows = Vec::with_capacity(issues.len());
+    for issue in issues {
+        let id = issue.get("id")?.as_str()?.trim();
+        if id.is_empty() {
+            return None;
+        }
+        if issue.get("issue_type").and_then(serde_json::Value::as_str) == Some("epic") {
+            continue;
+        }
+        let priority = issue
+            .get("priority")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|priority| u8::try_from(priority).ok())
+            .unwrap_or(u8::MAX);
+        rows.push(ReadyBeadRow {
+            id: id.to_string(),
+            priority,
+        });
+    }
+    Some(rows)
+}
+
+/// What the live `beads` source could read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveReadyBeads {
+    Read(Vec<ReadyBeadRow>),
+    /// The workspace has no `.beads` tracker.
+    NotConfigured,
+    /// `br` could not be run or its output not read; the reason code says why.
+    Unavailable(&'static str),
+}
+
+/// Live `beads` source from `br ready`: one ready-work item naming the
+/// highest-priority ready beads (most urgent first, `br`'s own order within
+/// a priority), with the total count.
+#[must_use]
+pub fn ready_beads_observation(
+    beads: &LiveReadyBeads,
+    now_ms: u64,
+) -> AttentionRouterSourceObservation {
+    const API: &str = "br ready --json";
+    let rows = match beads {
+        LiveReadyBeads::Read(rows) => rows,
+        LiveReadyBeads::NotConfigured => {
+            return AttentionRouterSourceObservation::new(
+                LIVE_BEADS_SOURCE_ID,
+                AttentionRouterSourceKind::Beads,
+                AttentionRouterSourceHealth::NotConfigured,
+                API,
+                "the workspace has no beads tracker",
+            )
+            .live(now_ms, 0)
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::SourceNotConfigured,
+                    "no .beads directory at the workspace root",
+                )
+                .with_reason_code("beads.not_configured"),
+            );
+        }
+        LiveReadyBeads::Unavailable(reason_code) => {
+            return AttentionRouterSourceObservation::new(
+                LIVE_BEADS_SOURCE_ID,
+                AttentionRouterSourceKind::Beads,
+                AttentionRouterSourceHealth::Unavailable,
+                API,
+                "ready beads could not be read",
+            )
+            .live(now_ms, 0)
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::SourceUnavailable,
+                    "br ready could not be read",
+                )
+                .with_reason_code(*reason_code),
+            );
+        }
+    };
+    let mut ordered: Vec<&ReadyBeadRow> = rows.iter().collect();
+    ordered.sort_by_key(|row| row.priority);
+    let observation = AttentionRouterSourceObservation::new(
+        LIVE_BEADS_SOURCE_ID,
+        AttentionRouterSourceKind::Beads,
+        AttentionRouterSourceHealth::Available,
+        API,
+        format!("{} ready beads", rows.len()),
+    )
+    .live(now_ms, 0)
+    .items_seen(u64::try_from(rows.len()).unwrap_or(u64::MAX));
+    let Some(top) = ordered.first() else {
+        return observation;
+    };
+    let listed: Vec<&str> = ordered
+        .iter()
+        .take(LIVE_BEADS_MAX_LISTED)
+        .map(|row| row.id.as_str())
+        .collect();
+    let mut fact = AttentionRouterSourceFact::new(
+        AttentionRouterSourceFactKind::BeadsReady,
+        format!(
+            "{} ready beads; highest priority first (P{}): {}",
+            rows.len(),
+            top.priority,
+            listed.join(", ")
+        ),
+    )
+    .count(u64::try_from(rows.len()).unwrap_or(u64::MAX))
+    .with_reason_code("beads.ready_available");
+    for id in listed {
+        fact = fact.with_bead_id(id);
+    }
+    observation.with_fact(fact)
 }
 
 fn missing_source_observation(
@@ -4230,29 +4687,42 @@ mod tests {
     #[test]
     fn live_events_source_groups_unhandled_events_by_mute_identity() {
         let now = 1_770_000_000_000_u64;
-        let row = |identity: &str, rule: &str, severity: &str, pane: u64, ago_ms: i64| {
-            UnhandledEventRow {
-                pane_id: pane,
-                rule_id: rule.to_string(),
-                severity: severity.to_string(),
-                detected_at: i64::try_from(now).unwrap() - ago_ms,
-                identity_key: identity.to_string(),
-            }
+        // Two groups (different raw extracted text) share one identity.
+        let group = |identity: &str,
+                     rule: &str,
+                     occurrences: u64,
+                     critical: bool,
+                     handling_failed: bool,
+                     pane: u64,
+                     ago_ms: i64| UnhandledEventRow {
+            pane_id: pane,
+            rule_id: rule.to_string(),
+            identity_key: identity.to_string(),
+            occurrences,
+            newest_at: i64::try_from(now).unwrap() - ago_ms,
+            critical,
+            handling_failed,
         };
         let events = [
-            row("evt:aa", "codex.usage.reached", "warning", 3, 90_000),
-            row("evt:aa", "codex.usage.reached", "critical", 3, 30_000),
-            row("evt:bb", "claude.compaction", "warning", 5, 5_000),
+            group("evt:aa", "codex.usage.reached", 3, false, false, 3, 90_000),
+            group("evt:aa", "codex.usage.reached", 1, true, true, 3, 30_000),
+            group("evt:bb", "claude.compaction", 1, false, false, 5, 5_000),
         ];
         let observation = unhandled_events_observation(Some(&events), now);
         assert_eq!(observation.source_kind, AttentionRouterSourceKind::Events);
         assert_eq!(observation.health, AttentionRouterSourceHealth::Available);
-        assert_eq!(observation.items_seen, Some(3));
+        assert_eq!(observation.items_seen, Some(5));
         assert_eq!(observation.freshness_ms, Some(5_000));
         assert_eq!(observation.facts.len(), 2, "one fact per event identity");
         let repeated = &observation.facts[0];
         assert_eq!(repeated.fact, AttentionRouterSourceFactKind::EventCritical);
-        assert_eq!(repeated.count, Some(2));
+        assert_eq!(repeated.count, Some(4));
+        assert!(
+            repeated
+                .reason_codes
+                .iter()
+                .any(|code| code == "event.handling_failed")
+        );
         assert_eq!(
             repeated.notification_identity_key.as_deref(),
             Some("evt:aa")
@@ -4267,7 +4737,8 @@ mod tests {
         assert!(
             repeated
                 .summary
-                .contains("2 unhandled critical codex.usage.reached")
+                .contains("4 unhandled codex.usage.reached event(s) on pane 3, including critical")
+                && repeated.summary.contains("a handling workflow failed")
                 && repeated.summary.contains("newest 30s ago")
                 && repeated.summary.contains("ft mute add evt:aa"),
             "{}",
@@ -4315,6 +4786,29 @@ mod tests {
         assert!(quiet.facts.is_empty());
         let unreadable = unhandled_events_observation(None, now);
         assert_eq!(unreadable.health, AttentionRouterSourceHealth::Unavailable);
+
+        // A read that filled the group cap says so instead of looking complete.
+        let full: Vec<_> = (0..UNHANDLED_EVENTS_MAX_ROWS)
+            .map(|index| {
+                group(
+                    &format!("evt:{index}"),
+                    "codex.usage.reached",
+                    1,
+                    false,
+                    false,
+                    3,
+                    1_000,
+                )
+            })
+            .collect();
+        let truncated = unhandled_events_observation(Some(&full), now);
+        assert_eq!(truncated.health, AttentionRouterSourceHealth::Degraded);
+        assert!(
+            truncated
+                .reason_codes
+                .iter()
+                .any(|code| code == "events.truncated")
+        );
     }
 
     #[test]
@@ -4322,8 +4816,10 @@ mod tests {
         use crate::plan::MissionTxState;
 
         let now = 1_770_000_000_000_u64;
+        // The id carries words the prose heuristics react to ("enospc",
+        // "disk-pressure"); the typed fact must still be a tx blocker.
         let tx = |state| ActiveTxRow {
-            tx_id: "tx:deploy-42".to_string(),
+            tx_id: "tx:enospc-disk-pressure-fix".to_string(),
             state,
         };
         let failed = tx(MissionTxState::Failed);
@@ -4340,22 +4836,34 @@ mod tests {
             snapshot
                 .items
                 .iter()
-                .filter(|item| item.reason_codes.iter().any(|code| code == "tx.failed"))
+                .filter(|item| {
+                    item.classification == AttentionRouterClassification::BlockedDomain
+                        && item.reason_codes.iter().any(|code| code == "tx.failed")
+                })
                 .count()
         };
         let snapshot = build_attention_router_snapshot(
             &AttentionRouterSourceAdapterInput::new(now, "/repo")
                 .with_observation(observation.clone()),
         );
-        assert_eq!(blockers(&snapshot), 1);
+        assert_eq!(blockers(&snapshot), 1, "classified by kind, not prose");
         let muted = build_attention_router_snapshot(
             &AttentionRouterSourceAdapterInput::new(now, "/repo")
-                .with_observation(observation)
+                .with_observation(observation.clone())
                 .with_notification_mute(AttentionRouterNotificationMute::global(
-                    "attention.mission_tx_status.tx:deploy-42",
+                    "attention.mission_tx_status.tx:enospc-disk-pressure-fix.failed",
                 )),
         );
         assert_eq!(blockers(&muted), 0);
+        // A mute taken while it was compensating does not hide the failure.
+        let muted_while_compensating = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo")
+                .with_observation(observation)
+                .with_notification_mute(AttentionRouterNotificationMute::global(
+                    "attention.mission_tx_status.tx:enospc-disk-pressure-fix.compensating",
+                )),
+        );
+        assert_eq!(blockers(&muted_while_compensating), 1);
 
         let compensating = tx(MissionTxState::Compensating);
         assert_eq!(
@@ -4380,13 +4888,14 @@ mod tests {
         let now = 1_770_000_000_000_u64;
         let bundle = CrashBundleRow {
             name: "wa_crash_20260210_120000".to_string(),
-            modified_at_ms: now - 120_000,
+            crashed_at_ms: now - 120_000,
         };
-        let observation = crash_bundles_observation(Some(std::slice::from_ref(&bundle)), now);
+        let observation = crash_bundles_observation(Some(std::slice::from_ref(&bundle)), true, now);
         assert_eq!(
             observation.source_kind,
             AttentionRouterSourceKind::IncidentBundles
         );
+        assert_eq!(observation.health, AttentionRouterSourceHealth::Available);
         assert_eq!(observation.freshness_ms, Some(120_000));
         let fact = &observation.facts[0];
         assert_eq!(fact.fact, AttentionRouterSourceFactKind::IncidentBundleOpen);
@@ -4419,18 +4928,29 @@ mod tests {
         );
         assert_eq!(incidents(&muted), 0, "a reviewed bundle is muted");
         assert_eq!(
-            crash_bundles_observation(None, now).health,
+            crash_bundles_observation(None, true, now).health,
             AttentionRouterSourceHealth::Unavailable
+        );
+        // A listing that could not be proven complete is degraded, not "no crash".
+        let partial = crash_bundles_observation(Some(&[]), false, now);
+        assert_eq!(partial.health, AttentionRouterSourceHealth::Degraded);
+        assert!(
+            partial
+                .reason_codes
+                .iter()
+                .any(|code| code == "incident_bundles.incomplete")
         );
     }
 
     #[test]
     fn live_manual_reservations_are_do_not_touch_items_per_hold() {
         let now = 1_770_000_000_000_u64;
+        // The holder's name would trip the disk-pressure prose heuristic; a
+        // pane hold must still classify as do-not-touch.
         let held = ManualReservationRow {
             reservation_id: 41,
             pane_id: 7,
-            owner_id: "operator".to_string(),
+            owner_id: "disk-pressure-fix".to_string(),
             created_at: 1_769_999_000_000,
             expires_at: 1_770_000_600_000,
         };
@@ -4446,7 +4966,7 @@ mod tests {
             AttentionRouterSourceFactKind::PaneReservationActive
         );
         assert_eq!(fact.affected_paths, ["pane:7"]);
-        assert_eq!(fact.agent_names, ["operator"]);
+        assert_eq!(fact.agent_names, ["disk-pressure-fix"]);
         assert_eq!(
             fact.notification_identity_key.as_deref(),
             Some("attention.pane_reservations.41")
@@ -4465,6 +4985,19 @@ mod tests {
                 .with_observation(observation.clone()),
         );
         assert_eq!(held_items(&snapshot), 1, "an operator hold is do-not-touch");
+        let do_not_touch = snapshot
+            .items
+            .iter()
+            .find(|item| item.classification == AttentionRouterClassification::DoNotTouch)
+            .expect("hold item");
+        assert!(
+            do_not_touch
+                .forbidden_actions
+                .iter()
+                .any(|action| action == "send_input_to_held_pane"),
+            "{:?}",
+            do_not_touch.forbidden_actions
+        );
         let muted = build_attention_router_snapshot(
             &AttentionRouterSourceAdapterInput::new(now, "/repo")
                 .with_observation(observation)
@@ -4476,6 +5009,233 @@ mod tests {
         assert_eq!(
             manual_reservations_observation(None, now).health,
             AttentionRouterSourceHealth::Unavailable
+        );
+    }
+
+    #[test]
+    fn git_porcelain_v2_parser_reads_every_record_kind() {
+        let raw = [
+            "# branch.oid 0123456789abcdef0123456789abcdef01234567",
+            "# branch.head main",
+            "# branch.upstream origin/main",
+            "# branch.ab +3 -1",
+            "1 M. N... 100644 100644 100644 aaaa bbbb src/staged.rs",
+            "1 .M N... 100644 100644 100644 aaaa aaaa src/edited file.rs",
+            "1 MM N... 100644 100644 100644 aaaa bbbb src/both.rs",
+            "2 R. N... 100644 100644 100644 aaaa aaaa R100 src/new_name.rs",
+            "src/old_name.rs",
+            "u UU N... 100644 100644 100644 100644 aaaa bbbb cccc src/conflict.rs",
+            "? notes/untracked note.md",
+            "! target/ignored",
+        ]
+        .join("\0");
+        let summary = parse_git_status_porcelain_v2(raw.as_bytes()).expect("parses");
+        assert_eq!((summary.ahead, summary.behind), (3, 1));
+        assert_eq!(
+            summary.uncommitted_paths,
+            [
+                "src/staged.rs",
+                "src/edited file.rs",
+                "src/both.rs",
+                "src/new_name.rs",
+                "src/conflict.rs",
+                "notes/untracked note.md",
+            ]
+        );
+        assert_eq!(
+            summary.staged_paths,
+            ["src/staged.rs", "src/both.rs", "src/new_name.rs"]
+        );
+        assert_eq!((summary.untracked, summary.unmerged), (1, 1));
+
+        assert_eq!(
+            parse_git_status_porcelain_v2(b"# branch.head main\0"),
+            Some(GitStatusSummary::default()),
+            "a clean tree without an upstream"
+        );
+        for malformed in [
+            &b"X unknown record\0"[..],
+            b"1 M. too few fields\0",
+            b"# branch.ab 3 1\0",
+            b"2 R. N... 100644 100644 100644 aaaa aaaa R100 src/renamed.rs\0",
+        ] {
+            assert_eq!(
+                parse_git_status_porcelain_v2(malformed),
+                None,
+                "{}",
+                String::from_utf8_lossy(malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn live_git_source_makes_uncommitted_paths_a_dirty_overlap_item() {
+        let now = 1_770_000_000_000_u64;
+        let mut summary = GitStatusSummary {
+            ahead: 2,
+            behind: 0,
+            uncommitted_paths: (0..25)
+                .map(|index| format!("src/file_{index}.rs"))
+                .collect(),
+            staged_paths: vec!["src/file_0.rs".to_string()],
+            untracked: 4,
+            unmerged: 0,
+        };
+        // A path that reads like a disk-pressure blocker is still only a path.
+        summary.uncommitted_paths[0] = "docs/disk-pressure-cleanup approval.md".to_string();
+        let observation = git_status_observation(&LiveGitStatus::Read(summary), now);
+        assert_eq!(observation.health, AttentionRouterSourceHealth::Available);
+        assert_eq!(observation.items_seen, Some(25));
+        let dirty = observation
+            .facts
+            .iter()
+            .find(|fact| fact.fact == AttentionRouterSourceFactKind::GitDirtyPaths)
+            .expect("dirty fact");
+        assert_eq!(dirty.count, Some(25));
+        assert_eq!(dirty.affected_paths.len(), LIVE_GIT_MAX_LISTED_PATHS);
+        assert!(dirty.summary.contains("4 untracked") && dirty.summary.ends_with(", ..."));
+        assert!(observation.facts.iter().any(|fact| fact.fact
+            == AttentionRouterSourceFactKind::GitStagedPaths
+            && fact.count == Some(1)));
+        assert!(observation.facts.iter().any(|fact| {
+            fact.fact == AttentionRouterSourceFactKind::GitBranchDivergence
+                && fact.reason_codes == ["git.branch_ahead"]
+        }));
+
+        let snapshot = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo").with_observation(observation),
+        );
+        let items: Vec<_> = snapshot
+            .items
+            .iter()
+            .filter(|item| {
+                item.reason_codes
+                    .iter()
+                    .any(|code| code == "git.dirty_paths")
+            })
+            .collect();
+        assert_eq!(items.len(), 1, "{:?}", snapshot.items);
+        assert_eq!(
+            items[0].classification,
+            AttentionRouterClassification::DirtyOverlap
+        );
+        assert_eq!(
+            items[0].recommended_action.action,
+            AttentionRouterSafeAction::AvoidOverlappingPathsAndClaimOnlyDisjointReadyWork
+        );
+
+        let clean = git_status_observation(&LiveGitStatus::Read(GitStatusSummary::default()), now);
+        assert_eq!(clean.health, AttentionRouterSourceHealth::Available);
+        assert!(clean.facts.is_empty());
+        let not_repo = git_status_observation(&LiveGitStatus::NotARepository, now);
+        assert_eq!(not_repo.health, AttentionRouterSourceHealth::NotConfigured);
+        let not_repo_items = build_attention_router_snapshot(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo").with_observation(not_repo),
+        )
+        .items;
+        assert!(
+            !not_repo_items.iter().any(|item| item
+                .reason_codes
+                .iter()
+                .any(|code| code.starts_with("git."))),
+            "no git work tree is not an attention item: {not_repo_items:?}"
+        );
+        let failed = git_status_observation(&LiveGitStatus::Unavailable("git.status_failed"), now);
+        assert_eq!(failed.health, AttentionRouterSourceHealth::Unavailable);
+    }
+
+    #[test]
+    fn br_ready_parser_and_live_beads_source_rank_by_priority() {
+        let raw = br#"[
+            {"id": "ft-low", "priority": 3, "issue_type": "task"},
+            {"id": "ft-epic", "priority": 0, "issue_type": "epic"},
+            {"id": "ft-disk-pressure-cleanup", "priority": 1, "issue_type": "bug"},
+            {"id": "ft-urgent", "priority": 0, "issue_type": "bug"},
+            {"id": "ft-unranked", "issue_type": "task"}
+        ]"#;
+        let rows = parse_br_ready_json(raw).expect("array form");
+        assert_eq!(rows.len(), 4, "the epic is left out");
+        assert_eq!(rows[3].priority, u8::MAX);
+        let wrapped = format!(
+            "{{\"issues\": {}}}",
+            std::str::from_utf8(raw).expect("utf8")
+        );
+        assert_eq!(parse_br_ready_json(wrapped.as_bytes()), Some(rows.clone()));
+        assert_eq!(parse_br_ready_json(b"not json"), None);
+        assert_eq!(parse_br_ready_json(br#"[{"priority": 1}]"#), None);
+
+        let now = 1_770_000_000_000_u64;
+        let observation = ready_beads_observation(&LiveReadyBeads::Read(rows), now);
+        assert_eq!(observation.items_seen, Some(4));
+        let fact = &observation.facts[0];
+        assert_eq!(fact.fact, AttentionRouterSourceFactKind::BeadsReady);
+        assert_eq!(fact.count, Some(4));
+        assert_eq!(
+            fact.bead_ids,
+            [
+                "ft-urgent",
+                "ft-disk-pressure-cleanup",
+                "ft-low",
+                "ft-unranked"
+            ]
+        );
+
+        // An unavailable source never outranks ready work for `next`, and a
+        // bead id that reads like a blocker is still ready work.
+        let input =
+            AttentionRouterSourceAdapterInput::new(now, "/repo").with_observation(observation);
+        let next = build_attention_router_surface_payload(
+            &input,
+            AttentionRouterSurface::Next,
+            "test.next",
+            None,
+        );
+        assert_eq!(
+            next.next_action.as_ref().map(|action| action.action),
+            Some(AttentionRouterSafeAction::ClaimReadyStaticSliceReservePathsAndRunStaticChecks),
+            "next_action follows the selected item"
+        );
+        assert_eq!(
+            next.snapshot
+                .next_action
+                .as_ref()
+                .map(|action| action.action),
+            Some(AttentionRouterSafeAction::RefreshUnavailableSourceOrUseRemainingReadOnlyContext),
+            "the snapshot still ranks the missing sources first"
+        );
+        let selected = next.selected_item.expect("ready work is selected");
+        assert_eq!(
+            selected.classification,
+            AttentionRouterClassification::ReadyNow
+        );
+        assert_eq!(
+            selected.recommended_action.action,
+            AttentionRouterSafeAction::ClaimReadyStaticSliceReservePathsAndRunStaticChecks
+        );
+        assert!(next.degraded_mode.active, "missing sources stay reported");
+        assert!(
+            next.snapshot
+                .items
+                .iter()
+                .any(|item| item.kind == AttentionRouterItemKind::SourceHealth)
+        );
+
+        let empty = ready_beads_observation(&LiveReadyBeads::Read(Vec::new()), now);
+        assert!(empty.facts.is_empty());
+        assert_eq!(
+            ready_beads_observation(&LiveReadyBeads::NotConfigured, now).health,
+            AttentionRouterSourceHealth::NotConfigured
+        );
+        // With nothing actionable, `next` still surfaces the source problem.
+        let blind = build_attention_router_surface_payload(
+            &AttentionRouterSourceAdapterInput::new(now, "/repo"),
+            AttentionRouterSurface::Next,
+            "test.next",
+            None,
+        );
+        assert_eq!(
+            blind.selected_item.expect("source health item").kind,
+            AttentionRouterItemKind::SourceHealth
         );
     }
 

@@ -3228,7 +3228,7 @@ enum RecordCommands {
         output: Option<PathBuf>,
     },
 
-    /// Stop an active recording
+    /// Explain how to stop a recording (Ctrl+C in the `ft record start` terminal)
     Stop {
         /// Pane ID to stop recording (default: current pane)
         #[arg(long)]
@@ -13137,9 +13137,12 @@ async fn build_cli_attention_router_payload(
 ) -> anyhow::Result<AttentionRouterSurfacePayload> {
     let mut input = load_attention_router_input(workspace_root, input_path, generated_at_ms)?;
     // A recorded --input is replayed exactly; a live run adds real sources:
-    // the watcher's operating envelope (per-governor advisories) and, from the
-    // local audit log, the policy gate (recent denied and approval-required
-    // actions) and verified-send receipts (submit-profile drift).
+    // the watcher's operating envelope (per-governor advisories); from the
+    // workspace database, the policy gate (recent denied and approval-required
+    // actions), verified-send receipts (submit-profile drift), unhandled
+    // events and operator pane holds; the crash directory; the active
+    // mission transaction contract; and the workspace's git status and
+    // ready beads.
     if input_path.is_none() {
         let layout = config.workspace_layout(Some(workspace_root)).ok();
         let snapshot = match layout.as_ref() {
@@ -13169,7 +13172,10 @@ async fn build_cli_attention_router_payload(
         });
         input.observations.push(
             frankenterm_core::attention_router::crash_bundles_observation(
-                crash_bundles.as_deref(),
+                crash_bundles
+                    .as_ref()
+                    .map(|(bundles, _)| bundles.as_slice()),
+                crash_bundles.as_ref().is_none_or(|(_, complete)| *complete),
                 input.generated_at_ms,
             ),
         );
@@ -13180,6 +13186,18 @@ async fn build_cli_attention_router_payload(
             .observations
             .push(frankenterm_core::attention_router::active_tx_observation(
                 active_tx.as_ref().map(Option::as_ref),
+                input.generated_at_ms,
+            ));
+        input
+            .observations
+            .push(frankenterm_core::attention_router::git_status_observation(
+                &frankenterm_core::attention_live::read_git_status(workspace_root),
+                input.generated_at_ms,
+            ));
+        input
+            .observations
+            .push(frankenterm_core::attention_router::ready_beads_observation(
+                &frankenterm_core::attention_live::read_ready_beads(workspace_root),
                 input.generated_at_ms,
             ));
     }
@@ -14699,7 +14717,8 @@ fn why_data_for_error_code(code: &str) -> Option<RobotWhyData> {
             see_also: def.doc_link.map(|link| vec![link.to_string()]),
         });
     }
-    let robot_code = frankenterm_core::robot_types::ErrorCode::parse(code)?;
+    // robot.* wire codes are lowercase; accept any case like FT-xxxx above.
+    let robot_code = frankenterm_core::robot_types::ErrorCode::parse(&code.to_ascii_lowercase())?;
     let hint = frankenterm_core::robot_types::hint_for(&robot_code)?;
     Some(RobotWhyData {
         code: robot_code.as_str().to_string(),
@@ -48171,17 +48190,19 @@ async fn run_watcher(
         frankenterm_core::watchdog::WatchdogHandle::adopt_shutdown_task(task, shutdown_flag)
     };
 
-    // Raises submit-profile drift (W2.8) as a recorded, published event, and
-    // publishes the idempotency store's backlog for /metrics. MCP keeps the
-    // store beside the database, as ft doctor reads it.
+    // Raises submit-profile drift (W2.8) as a recorded, published event and,
+    // when metrics are served, publishes the idempotency store's backlog for
+    // /metrics. MCP keeps the store beside the database, as ft doctor reads it.
     let verified_submit_drift_monitor_handle = {
         let storage = scheduler_storage.clone();
         let event_bus = Arc::clone(&event_bus);
-        let store_dir = layout
-            .db_path
-            .parent()
-            .unwrap_or(&layout.ft_dir)
-            .to_path_buf();
+        let store_dir = (cfg!(feature = "metrics") && config.metrics.enabled).then(|| {
+            layout
+                .db_path
+                .parent()
+                .unwrap_or(&layout.ft_dir)
+                .to_path_buf()
+        });
         let shutdown_flag = Arc::clone(&handle.shutdown_flag);
         let task_shutdown_flag = Arc::clone(&shutdown_flag);
         let task = frankenterm_core::runtime_async::task::spawn(async move {
@@ -48865,10 +48886,6 @@ fn verified_submit_drift_alerts(
     alerts
 }
 
-/// Watcher task: when an agent type's recent verified sends start to stay
-/// mostly unconfirmed, record a `core.verified_submit:profile_drift` event
-/// and publish it, so notifications and workflows see the drift without
-/// anyone running `ft attention`. Uses the attention router's drift rule.
 /// Publish the verified-submit idempotency store's census for `/metrics`.
 /// The store is read only here, on the watcher's own cadence, never per
 /// scrape; a store that cannot be read withdraws the numbers instead of
@@ -48890,10 +48907,16 @@ async fn publish_submit_idempotency_census(store_dir: &std::path::Path) {
     }
 }
 
+/// Watcher task: when an agent type's recent verified sends start to stay
+/// mostly unconfirmed, record a `core.verified_submit:profile_drift` event
+/// and publish it, so notifications and workflows see the drift without
+/// anyone running `ft attention`. Uses the attention router's drift rule.
+/// With metrics enabled (`idempotency_store_dir` set) it also publishes the
+/// idempotency store's census on the same cadence.
 async fn run_verified_submit_drift_monitor(
     storage: frankenterm_core::storage::StorageHandle,
     event_bus: Arc<frankenterm_core::events::EventBus>,
-    idempotency_store_dir: std::path::PathBuf,
+    idempotency_store_dir: Option<std::path::PathBuf>,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
 ) {
     use std::sync::atomic::Ordering;
@@ -48905,7 +48928,9 @@ async fn run_verified_submit_drift_monitor(
 
     let mut signaled = std::collections::BTreeSet::new();
     loop {
-        publish_submit_idempotency_census(&idempotency_store_dir).await;
+        if let Some(store_dir) = idempotency_store_dir.as_deref() {
+            publish_submit_idempotency_census(store_dir).await;
+        }
         frankenterm_core::runtime_async::select! {
             () = frankenterm_core::runtime_async::sleep(VERIFIED_SUBMIT_DRIFT_CHECK_INTERVAL) => {}
             () = wait_for_shutdown(Arc::clone(&shutdown_flag)) => break,
@@ -57460,10 +57485,10 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 // Code not found - list available codes as hint
                                 let available = list_template_ids();
                                 let hint = if available.is_empty() {
-                                    "No explanation templates available; FT-xxxx and robot.* error codes are also accepted.".to_string()
+                                    "No explanation templates available; FT-xxxx codes and robot.* codes that carry a recovery hint are also accepted.".to_string()
                                 } else {
                                     format!(
-                                        "Available codes: {}; FT-xxxx and robot.* error codes are also accepted",
+                                        "Available codes: {}; FT-xxxx codes and robot.* codes that carry a recovery hint are also accepted",
                                         available[..available.len().min(10)].join(", ")
                                     )
                                 };
@@ -65526,7 +65551,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 }
             } else {
                 let error = bounded_prefixed_diagnostic("Unknown explanation id: ", &id, 600, 600);
-                let hint = "Use 'ft why --list' to see available templates; FT-xxxx and robot.* error codes are also accepted.";
+                let hint = "Use 'ft why --list' to see available templates; FT-xxxx codes and robot.* codes that carry a recovery hint are also accepted.";
                 if output_format.is_json() {
                     let response = serde_json::json!({
                         "ok": false,
@@ -70590,12 +70615,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             }
 
             RecordCommands::Stop { pane, all } => {
-                // Stop requires IPC to the running watcher
+                // Every recording today is a foreground `ft record start`
+                // process; the watcher never records, so there is nothing to
+                // signal over IPC.
                 let _ = (pane, all);
                 eprintln!(
-                    "ft record stop: requires an active watcher with recording enabled.\n\
-                     For standalone recordings started with `ft record start`, press Ctrl+C.\n\
-                     A watcher-managed recording has no CLI stop yet; it ends when the watcher stops (`ft stop`)."
+                    "ft record stop: no background recordings exist to stop.\n\
+                     A recording started with `ft record start` runs in its own terminal: press Ctrl+C there to stop and save it,\n\
+                     or start it with --auto-stop <duration> (e.g. 30m)."
                 );
                 std::process::exit(1);
             }
@@ -138313,9 +138340,9 @@ printf x > "$MINISIGN_MARKER"
                 "the storm is one item and the muted identity is suppressed: {events:?}"
             );
             assert!(
-                events[0]
-                    .redacted_summary
-                    .contains("5 unhandled critical codex.usage.reached"),
+                events[0].redacted_summary.contains(
+                    "5 unhandled codex.usage.reached event(s) on pane 3, including critical"
+                ),
                 "{}",
                 events[0].redacted_summary
             );
@@ -138985,6 +139012,8 @@ printf x > "$MINISIGN_MARKER"
         let robot = why_data_for_error_code("robot.policy_denied").expect("robot code");
         assert_eq!(robot.category, "policy");
         assert!(robot.explanation.contains("ft why --recent denied"));
+        let upper = why_data_for_error_code("ROBOT.POLICY_DENIED").expect("robot codes too");
+        assert_eq!(upper.code, "robot.policy_denied");
 
         assert!(why_data_for_error_code("robot.no_such_code").is_none());
         assert!(why_data_for_error_code("FT-0000").is_none());

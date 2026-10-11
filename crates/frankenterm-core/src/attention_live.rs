@@ -2,7 +2,8 @@
 //! `ft attention` / `ft robot attention` and MCP `wa.attention`
 //! (ft-7h5da.7.11, ft-7h5da.7.7, ft-7h5da.3.9): the workspace database's
 //! audit log, events, reservations and mutes, plus (CLI only) the crash
-//! bundle directory.
+//! bundle directory, the workspace's `git status` and its ready beads
+//! (`br ready`), each under a time and output bound.
 //!
 //! The workspace database is opened read-only: no migration, no writer, and
 //! nothing created, so attention stays read-only. Only the columns the router
@@ -13,12 +14,14 @@ use std::path::Path;
 
 use crate::attention_router::{
     ActiveTxRow, AttentionRouterNotificationMute, AttentionRouterSourceAdapterInput,
-    CrashBundleRow, MANUAL_RESERVATIONS_MAX_ROWS, ManualReservationRow, POLICY_GATE_AUDIT_MAX_ROWS,
-    POLICY_GATE_AUDIT_WINDOW_MS, PolicyGateAuditRow, RECENT_CRASH_BUNDLES_MAX,
-    RECENT_CRASH_BUNDLES_WINDOW_MS, UNHANDLED_EVENTS_MAX_ROWS, UNHANDLED_EVENTS_WINDOW_MS,
-    UnhandledEventRow, VERIFIED_SUBMIT_AUDIT_MAX_ROWS, approval_required_observation_from_audit,
-    manual_reservations_observation, policy_denied_observation_from_audit,
-    unhandled_events_observation, verified_submit_observation_from_receipts,
+    CrashBundleRow, LiveGitStatus, LiveReadyBeads, MANUAL_RESERVATIONS_MAX_ROWS,
+    ManualReservationRow, POLICY_GATE_AUDIT_MAX_ROWS, POLICY_GATE_AUDIT_WINDOW_MS,
+    PolicyGateAuditRow, RECENT_CRASH_BUNDLES_MAX, RECENT_CRASH_BUNDLES_WINDOW_MS,
+    UNHANDLED_EVENTS_MAX_ROWS, UNHANDLED_EVENTS_WINDOW_MS, UnhandledEventRow,
+    VERIFIED_SUBMIT_AUDIT_MAX_ROWS, approval_required_observation_from_audit,
+    manual_reservations_observation, parse_br_ready_json, parse_git_status_porcelain_v2,
+    policy_denied_observation_from_audit, unhandled_events_observation,
+    verified_submit_observation_from_receipts,
 };
 use crate::robot_types::SubmitReceipt;
 use crate::storage::EventMuteRecord;
@@ -214,36 +217,48 @@ pub fn read_live_attention_audit(db_path: &Path, now_ms: u64) -> LiveAttentionAu
 }
 
 /// The watcher's crash bundles written within the attention window, newest
-/// first, for the live `incident_bundles` source. Discovery is the crash
-/// module's bounded, fail-closed listing; only each bundle's directory name
-/// and modification time are read here. A missing directory means no crash.
+/// first, for the live `incident_bundles` source, and whether the crash
+/// module's bounded discovery could prove its list complete (an unreadable
+/// bundle or a directory changing mid-scan makes it incomplete, which the
+/// source reports instead of claiming "no crash"). Each bundle's crash time
+/// comes from its report, falling back to the directory's modification time;
+/// its message and backtrace never leave this function. A missing directory
+/// means no crash; `None` means the path is not a readable directory.
 #[must_use]
-pub fn read_recent_crash_bundles(crash_dir: &Path, now_ms: u64) -> Option<Vec<CrashBundleRow>> {
+pub fn read_recent_crash_bundles(
+    crash_dir: &Path,
+    now_ms: u64,
+) -> Option<(Vec<CrashBundleRow>, bool)> {
     if !crash_dir.exists() {
-        return Some(Vec::new());
+        return Some((Vec::new(), true));
     }
     if !crash_dir.is_dir() {
         return None;
     }
     let since = now_ms.saturating_sub(RECENT_CRASH_BUNDLES_WINDOW_MS);
-    Some(
-        crate::crash::list_crash_bundles(crash_dir, RECENT_CRASH_BUNDLES_MAX)
-            .into_iter()
-            .filter_map(|bundle| {
-                let name = bundle.path.file_name()?.to_string_lossy().into_owned();
-                let modified_at_ms = std::fs::metadata(&bundle.path)
+    let discovery = crate::crash::discover_crash_bundles(crash_dir, RECENT_CRASH_BUNDLES_MAX);
+    let complete = discovery.completeness.is_complete();
+    let bundles = discovery
+        .bundles
+        .into_iter()
+        .filter_map(|bundle| {
+            let name = bundle.path.file_name()?.to_string_lossy().into_owned();
+            let crashed_at_ms = match bundle.report.as_ref() {
+                Some(report) => report.timestamp.saturating_mul(1000),
+                None => std::fs::metadata(&bundle.path)
                     .and_then(|metadata| metadata.modified())
                     .ok()?
                     .duration_since(std::time::UNIX_EPOCH)
                     .ok()
-                    .and_then(|age| u64::try_from(age.as_millis()).ok())?;
-                (modified_at_ms >= since).then_some(CrashBundleRow {
-                    name,
-                    modified_at_ms,
-                })
+                    .and_then(|age| u64::try_from(age.as_millis()).ok())?,
+            };
+            (crashed_at_ms >= since).then_some(CrashBundleRow {
+                name,
+                crashed_at_ms,
             })
-            .collect(),
-    )
+        })
+        .collect();
+    Some((bundles, complete))
 }
 
 /// The workspace's active mission transaction contract
@@ -252,7 +267,10 @@ pub fn read_recent_crash_bundles(crash_dir: &Path, now_ms: u64) -> Option<Vec<Cr
 /// it exists but could not be read, is oversized, or does not parse.
 #[must_use]
 pub fn read_active_tx(ft_dir: &Path) -> Option<Option<ActiveTxRow>> {
-    const MAX_CONTRACT_BYTES: u64 = 8 * 1024 * 1024;
+    use std::io::Read as _;
+
+    // The same bound `ft tx` loads contracts under.
+    let max_bytes = u64::try_from(crate::tx_execution::TX_CONTRACT_MAX_BYTES).unwrap_or(u64::MAX);
 
     #[derive(serde::Deserialize)]
     struct ContractIntent {
@@ -266,20 +284,121 @@ pub fn read_active_tx(ft_dir: &Path) -> Option<Option<ActiveTxRow>> {
     }
 
     let path = ft_dir.join("mission").join("tx-active.json");
-    let metadata = match std::fs::metadata(&path) {
-        Ok(metadata) => metadata,
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(None),
         Err(_) => return None,
     };
-    if !metadata.is_file() || metadata.len() > MAX_CONTRACT_BYTES {
+    if !file.metadata().ok()?.is_file() {
         return None;
     }
-    let text = std::fs::read_to_string(&path).ok()?;
+    // Bound the read itself, so a file grown or swapped after the size check
+    // is still never read past the cap.
+    let mut text = String::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_string(&mut text)
+        .ok()?;
+    if u64::try_from(text.len()).unwrap_or(u64::MAX) > max_bytes {
+        return None;
+    }
     let contract: ContractLifecycle = serde_json::from_str(&text).ok()?;
     Some(Some(ActiveTxRow {
         tx_id: contract.intent.tx_id,
         state: contract.lifecycle_state,
     }))
+}
+
+/// How long a live `git` or `br` read may take.
+const LIVE_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Output a live `git` or `br` read may produce.
+const LIVE_COMMAND_STDOUT_LIMIT: usize = 8 * 1024 * 1024;
+
+fn run_live_command(
+    program: &str,
+    args: &[&str],
+    workspace_root: &Path,
+) -> std::io::Result<std::process::Output> {
+    let mut command = crate::runtime_async::process::Command::new(program);
+    command
+        .args(args)
+        .current_dir(workspace_root)
+        // Stable diagnostics to classify, and no index refresh: a plain
+        // `git status` takes index.lock in a tree other agents commit to.
+        .env("LC_ALL", "C")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .kill_on_drop(true)
+        .stdout_limit(LIVE_COMMAND_STDOUT_LIMIT);
+    command.output_blocking(LIVE_COMMAND_TIMEOUT)
+}
+
+/// The workspace's `git status`, for the live `git` source. Read-only, with
+/// a time and output bound; paths stay in the facts as listed paths only.
+#[must_use]
+pub fn read_git_status(workspace_root: &Path) -> LiveGitStatus {
+    let output = match run_live_command(
+        "git",
+        &[
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "-z",
+            "--untracked-files=normal",
+        ],
+        workspace_root,
+    ) {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return LiveGitStatus::Unavailable("git.not_installed");
+        }
+        Err(_) => return LiveGitStatus::Unavailable("git.status_failed"),
+    };
+    if !output.status.success() {
+        return if String::from_utf8_lossy(&output.stderr).contains("not a git repository") {
+            LiveGitStatus::NotARepository
+        } else {
+            LiveGitStatus::Unavailable("git.status_failed")
+        };
+    }
+    parse_git_status_porcelain_v2(&output.stdout).map_or(
+        LiveGitStatus::Unavailable("git.status_unparseable"),
+        LiveGitStatus::Read,
+    )
+}
+
+/// Ready beads, for the live `beads` source: `br ready --json` in the
+/// workspace, without `br`'s automatic JSONL import or export, so reading
+/// attention never rewrites the tracker. A workspace without `.beads` has no
+/// tracker.
+#[must_use]
+pub fn read_ready_beads(workspace_root: &Path) -> LiveReadyBeads {
+    if !workspace_root.join(".beads").is_dir() {
+        return LiveReadyBeads::NotConfigured;
+    }
+    let output = match run_live_command(
+        "br",
+        &[
+            "--no-auto-import",
+            "--no-auto-flush",
+            "ready",
+            "--json",
+            "--sort",
+            "priority",
+        ],
+        workspace_root,
+    ) {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return LiveReadyBeads::Unavailable("beads.br_not_installed");
+        }
+        Err(_) => return LiveReadyBeads::Unavailable("beads.br_failed"),
+    };
+    if !output.status.success() {
+        return LiveReadyBeads::Unavailable("beads.br_failed");
+    }
+    parse_br_ready_json(&output.stdout).map_or(
+        LiveReadyBeads::Unavailable("beads.br_output_unparseable"),
+        LiveReadyBeads::Read,
+    )
 }
 
 /// Active, unexpired manual reservations, with the storage reader's
@@ -306,38 +425,65 @@ fn query_active_manual_reservations(
     rows.collect()
 }
 
-/// Unhandled warning and critical events, newest first, with the identity
-/// key `ft mute` uses (computed as storage computes it). The extracted
-/// values feed only that redacted hash; matched text is never selected.
+/// Unhandled warning and critical events, grouped in SQL by pane, rule, type
+/// and extracted values (so a detection storm costs one row, and the cap
+/// counts groups, not repeats), newest group first, each with the identity
+/// key `ft mute` uses (computed as storage computes it). An event whose
+/// handling workflow failed is still unhandled. Events triaged as resolved
+/// or dismissed, and the watcher's own drift events (already the
+/// `verified_submit` item), are left out. Extracted values feed only the
+/// redacted identity hash; matched text is never selected.
 fn query_unhandled_events(
     conn: &rusqlite::Connection,
     since: i64,
     limit: i64,
 ) -> rusqlite::Result<Vec<UnhandledEventRow>> {
     let mut statement = conn.prepare(
-        "SELECT e.pane_id, e.rule_id, e.event_type, e.severity, e.detected_at, e.extracted, \
-         p.pane_uuid FROM events e LEFT JOIN panes p ON p.pane_id = e.pane_id \
-         WHERE e.handled_at IS NULL AND e.severity IN ('warning', 'critical') \
-         AND e.detected_at >= ?1 \
-         AND (e.triage_state IS NULL OR e.triage_state NOT IN ('resolved', 'dismissed')) \
-         ORDER BY e.detected_at DESC, e.id DESC LIMIT ?2",
+        "SELECT e.pane_id, e.rule_id, e.event_type, e.extracted, p.pane_uuid, COUNT(*), \
+         MAX(e.detected_at), MAX(e.severity = 'critical'), MAX(e.handled_at IS NOT NULL) \
+         FROM events e LEFT JOIN panes p ON p.pane_id = e.pane_id \
+         WHERE (e.handled_at IS NULL OR e.handled_status IN ('failed', 'error')) \
+         AND e.severity IN ('warning', 'critical') AND e.detected_at >= ?1 \
+         AND (e.triage_state IS NULL OR lower(e.triage_state) NOT IN ('resolved', 'dismissed')) \
+         AND e.rule_id <> ?3 \
+         GROUP BY e.pane_id, e.rule_id, e.event_type, e.extracted, p.pane_uuid \
+         ORDER BY MAX(e.detected_at) DESC LIMIT ?2",
     )?;
-    let rows = statement.query_map(rusqlite::params![since, limit], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, Option<String>>(5)?,
-            row.get::<_, Option<String>>(6)?,
-        ))
-    })?;
+    let rows = statement.query_map(
+        rusqlite::params![
+            since,
+            limit,
+            crate::attention_router::VERIFIED_SUBMIT_DRIFT_RULE_ID
+        ],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)? != 0,
+                row.get::<_, i64>(8)? != 0,
+            ))
+        },
+    )?;
     let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows
         .into_iter()
         .map(
-            |(pane_id, rule_id, event_type, severity, detected_at, extracted, pane_uuid)| {
+            |(
+                pane_id,
+                rule_id,
+                event_type,
+                extracted,
+                pane_uuid,
+                occurrences,
+                newest_at,
+                critical,
+                handling_failed,
+            )| {
                 let pane_id = u64::try_from(pane_id).unwrap_or(0);
                 let detection = crate::patterns::Detection {
                     rule_id: rule_id.clone(),
@@ -360,8 +506,10 @@ fn query_unhandled_events(
                         pane_uuid.as_deref(),
                     ),
                     rule_id,
-                    severity,
-                    detected_at,
+                    occurrences: u64::try_from(occurrences).unwrap_or(0),
+                    newest_at,
+                    critical,
+                    handling_failed,
                 }
             },
         )
@@ -480,39 +628,38 @@ mod tests {
         let crash_dir = dir.path().join("crash");
         assert_eq!(
             read_recent_crash_bundles(&crash_dir, 1_000),
-            Some(Vec::new()),
+            Some((Vec::new(), true)),
             "no crash directory, no crash"
         );
         std::fs::create_dir(&crash_dir).expect("crash dir");
+        // The crash time comes from the report, not the directory mtime.
+        let crashed_at_s: u64 = 1_770_000_000;
         let report = crate::crash::CrashReport {
             message: "SECRET PANIC".to_string(),
             location: Some("src/secret.rs:1:1".to_string()),
             backtrace: None,
-            timestamp: 1_700_000_000,
+            timestamp: crashed_at_s,
             pid: 1,
             thread_name: None,
         };
         let bundle = crate::crash::write_crash_bundle(&crash_dir, &report, None, None)
             .expect("write crash bundle");
-        let now_ms = u64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_millis(),
-        )
-        .expect("ms");
-        let recent = read_recent_crash_bundles(&crash_dir, now_ms).expect("readable");
+        let now_ms = crashed_at_s * 1000 + 60_000;
+        let (recent, complete) = read_recent_crash_bundles(&crash_dir, now_ms).expect("readable");
+        assert!(complete);
         assert_eq!(recent.len(), 1);
         assert_eq!(
             recent[0].name,
             bundle.file_name().expect("name").to_string_lossy()
         );
+        assert_eq!(recent[0].crashed_at_ms, crashed_at_s * 1000);
         assert_eq!(
-            read_recent_crash_bundles(&crash_dir, now_ms + 2 * DAY_MS).map(|rows| rows.len()),
+            read_recent_crash_bundles(&crash_dir, now_ms + 2 * DAY_MS).map(|(rows, _)| rows.len()),
             Some(0),
             "a bundle older than the window is not an attention item"
         );
-        let observation = crate::attention_router::crash_bundles_observation(Some(&recent), now_ms);
+        let observation =
+            crate::attention_router::crash_bundles_observation(Some(&recent), complete, now_ms);
         let rendered = serde_json::to_string(&observation).expect("serialize");
         assert!(
             !rendered.contains("SECRET PANIC") && !rendered.contains("secret.rs"),
@@ -568,25 +715,32 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("ft.db");
         let now_ms: u64 = 200_000_000;
-        let recent = 199_940_000;
+        let recent: i64 = 199_940_000;
+        let older: i64 = 199_900_000;
         let conn = rusqlite::Connection::open(&db_path).expect("create db");
         conn.execute_batch(&format!(
             "CREATE TABLE panes (pane_id INTEGER PRIMARY KEY, pane_uuid TEXT);
              CREATE TABLE events (id INTEGER PRIMARY KEY, pane_id INTEGER NOT NULL,
                  rule_id TEXT NOT NULL, event_type TEXT NOT NULL, severity TEXT NOT NULL,
                  extracted TEXT, matched_text TEXT, detected_at INTEGER NOT NULL,
-                 handled_at INTEGER, triage_state TEXT);
+                 handled_at INTEGER, handled_status TEXT, triage_state TEXT);
              INSERT INTO panes VALUES (3, 'uuid-3');
              INSERT INTO events VALUES (1, 3, 'codex.usage.reached', 'usage.reached',
-                 'critical', '{{\"reset\":\"5pm\"}}', 'SECRET TEXT', {recent}, NULL, NULL);
+                 'critical', '{{\"reset\":\"5pm\"}}', 'SECRET TEXT', {recent}, NULL, NULL, NULL);
+             INSERT INTO events VALUES (6, 3, 'codex.usage.reached', 'usage.reached',
+                 'warning', '{{\"reset\":\"5pm\"}}', NULL, {older}, NULL, NULL, NULL);
+             INSERT INTO events VALUES (7, 3, 'codex.usage.reached', 'usage.reached',
+                 'warning', '{{\"reset\":\"5pm\"}}', NULL, {older}, {recent}, 'error', NULL);
              INSERT INTO events VALUES (2, 3, 'codex.usage.reached', 'usage.reached',
-                 'info', NULL, NULL, {recent}, NULL, NULL);
+                 'info', NULL, NULL, {recent}, NULL, NULL, NULL);
              INSERT INTO events VALUES (3, 3, 'codex.usage.reached', 'usage.reached',
-                 'warning', NULL, NULL, {recent}, {recent}, NULL);
+                 'warning', NULL, NULL, {recent}, {recent}, 'completed', NULL);
              INSERT INTO events VALUES (4, 3, 'codex.usage.reached', 'usage.reached',
-                 'warning', NULL, NULL, {recent}, NULL, 'resolved');
+                 'warning', NULL, NULL, {recent}, NULL, NULL, 'Resolved');
+             INSERT INTO events VALUES (8, 3, 'core.verified_submit:profile_drift',
+                 'submit_profile.drift', 'warning', NULL, NULL, {recent}, NULL, NULL, NULL);
              INSERT INTO events VALUES (5, 4, 'claude.compaction', 'session.compaction',
-                 'warning', NULL, NULL, 1000, NULL, NULL);"
+                 'warning', NULL, NULL, 1000, NULL, NULL, NULL);"
         ))
         .expect("schema and rows");
         drop(conn);
@@ -596,7 +750,15 @@ mod tests {
         assert_eq!(
             events.len(),
             1,
-            "info, handled, resolved and stale events are left out: {events:?}"
+            "info, completed, resolved (any case), drift and stale events are left out; \
+             the three identical ones are one group: {events:?}"
+        );
+        assert_eq!(events[0].occurrences, 3);
+        assert_eq!(events[0].newest_at, recent);
+        assert!(events[0].critical);
+        assert!(
+            events[0].handling_failed,
+            "the 'error' handling still counts"
         );
         let detection = crate::patterns::Detection {
             rule_id: "codex.usage.reached".to_string(),
@@ -612,7 +774,6 @@ mod tests {
             events[0].identity_key,
             crate::events::event_identity_key(&detection, 3, Some("uuid-3"))
         );
-        assert_eq!(events[0].severity, "critical");
         assert_eq!(events[0].pane_id, 3);
         // No audit table here: those inputs fail on their own, events still read.
         assert!(audit.denied.is_none() && audit.receipts.is_none());
@@ -643,5 +804,29 @@ mod tests {
             "denied, approvals, receipts, events, reservations"
         );
         assert!(input.notification_mutes.is_empty());
+    }
+
+    #[test]
+    fn live_git_and_beads_sources_read_the_workspace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(read_ready_beads(dir.path()), LiveReadyBeads::NotConfigured);
+        let Ok(init) = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+        else {
+            eprintln!("git is not installed; skipping the live git read");
+            return;
+        };
+        assert!(init.success());
+        std::fs::write(dir.path().join("new file.txt"), "x").expect("write");
+        match read_git_status(dir.path()) {
+            LiveGitStatus::Read(summary) => {
+                assert_eq!(summary.uncommitted_paths, ["new file.txt"]);
+                assert_eq!(summary.untracked, 1);
+                assert!(summary.staged_paths.is_empty());
+            }
+            other => panic!("expected a readable work tree: {other:?}"),
+        }
     }
 }

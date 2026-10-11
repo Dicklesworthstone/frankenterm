@@ -35,24 +35,51 @@ profile. It signals again only after the agent type recovers and relapses,
 and a 6-hour dedupe bucket holds it to one event per agent type across
 watcher restarts.
 They also add `events`: unhandled warning and critical detection events from
-the last 24 hours (newest 256), leaving out events an operator triaged as
-`resolved` or `dismissed` (`ft events triage <id> --state resolved`). Events
-are grouped by their event identity, the redacted hash `ft mute` keys events
-by, so a repeating detection is one blocker with a count, and a critical one
-carries `event.critical`. Matched text and extracted values are never
-selected into a fact. They also add `pane_reservations`: each active,
-unexpired manual reservation (an operator hold from `ft intervene` or
-`ft reserve`, newest 64) is a do-not-touch item naming the pane, the holder
-and the time left; workflow and agent reservations, and the free-text
-reason, are left out. The CLI (not MCP, like the watcher envelope) also adds
-`incident_bundles`: each watcher crash bundle written in the last 24 hours
-(newest 8, from the crash directory) is a blocker asking for review with
-`ft reproduce export --kind crash`, muted per bundle once reviewed; only the
-bundle's directory name and age are read, never its message or backtrace.
-The CLI also adds `mission_tx_status` from the active transaction contract
-(`.ft/mission/tx-active.json`, the `ft tx` default): a `failed` or
-`compensating` transaction is a blocker until it is rolled back or settled.
-Only the contract's id and lifecycle are read.
+the last 24 hours, counting an event whose handling workflow failed
+(`event.handling_failed`) and leaving out events an operator triaged as
+resolved or dismissed, in any case
+(`ft events triage <id> --state resolved`), and the drift monitor's own drift events (already the
+`verified_submit` item). Identical events are grouped in the database and
+then by event identity, the redacted hash `ft mute` keys events by, so a
+repeating detection is one blocker with a count; a group with a critical
+event carries `event.critical`. The newest 256 groups are read; a run that
+fills that cap reports the source degraded (`events.truncated`). Matched
+text and extracted values are never selected into a fact. They also add
+`pane_reservations`: each active, unexpired manual reservation (an operator
+hold from `ft intervene` or `ft reserve`, newest 64) is a do-not-touch item
+naming the pane, the holder and the time left; workflow and agent
+reservations, and the free-text reason, are left out. The CLI (not MCP, like
+the watcher envelope) also adds `incident_bundles`: each watcher crash
+bundle from the last 24 hours by its report's crash time (newest 8, from the
+crash directory) is a blocker asking for review with
+`ft reproduce export --kind crash`, muted per bundle once reviewed. A listing the crash module
+cannot prove complete (an unreadable bundle, a directory changing mid-scan)
+reports the source degraded (`incident_bundles.incomplete`) instead of "no
+crash"; only each bundle's name and crash time reach a fact, never its
+message or backtrace. The CLI also adds `mission_tx_status` from the active
+transaction contract (`.ft/mission/tx-active.json`, the `ft tx` default,
+read under the same 16 MiB bound): a `failed` or `compensating` transaction
+is a blocker until it is rolled back or settled, with a mute key per
+transaction and state. Only the contract's id and lifecycle are read. These
+typed live facts are classified by their kind and reason codes only, never
+by words in their summaries (which carry actor names, rule ids,
+transaction ids and holder names).
+The CLI also adds `git` and `beads` from the workspace root, each read under a
+5-second and 8 MiB bound. `git status --porcelain=v2 --branch -z` runs with
+`GIT_OPTIONAL_LOCKS=0`, so it never takes `index.lock` in a tree other agents
+commit to. Uncommitted paths (staged, unstaged, untracked or unmerged) are one
+`dirty_overlap` item listing the first 20 paths: edit and stage only disjoint
+paths. Staged paths and divergence from the upstream are context facts. A
+workspace that is not a git work tree reports the source `not_configured`.
+`br --no-auto-import --no-auto-flush ready --json` lists ready beads without
+rewriting the tracker. Epics are left out, and the rest are one `ready_now`
+item naming the 10 most urgent, highest priority first. A workspace without
+`.beads` reports `not_configured`. Both sources are classified by fact kind
+and reason code only, never by words in paths or bead ids.
+`next` picks the highest-ranked item that is not a source-health item, so an
+unavailable source (Agent Mail, RCH) stays visible in `status` and the
+degraded mode but never displaces actionable work. With nothing else to
+choose, `next` returns the source-health item.
 Each live policy-gate, drift and event fact carries a stable mute key, printed
 in its summary (`[mute: ft mute add attention.<source>...]`, or the event's
 `evt:` identity). Live runs load active `ft mute` records from the same
@@ -60,8 +87,8 @@ database, so a muted key's item is suppressed (and counted in the
 explanation) instead of resurfacing every run.
 Policy-gate, receipt and event facts never carry the action input, the
 policy's free-text reason, idempotency keys or matched text, and a workspace
-without a database is not created. Every other source appears only through caller input and is
-otherwise reported missing. The attention surfaces mutate nothing; only the
+without a database is not created. Every other source (Agent Mail, RCH, pane
+state) appears only through caller input and is otherwise reported missing. The attention surfaces mutate nothing; only the
 watcher's drift monitor above writes, and only its own events.
 
 Operator runbook: `docs/operator-runbook.md` section 2C.
