@@ -65,7 +65,10 @@ typed live facts are classified by their kind and reason codes only, never
 by words in their summaries (which carry actor names, rule ids,
 transaction ids and holder names).
 The CLI also adds `git` and `beads` from the workspace root, each read under a
-5-second and 8 MiB bound. `git status --porcelain=v2 --branch -z` runs with
+5-second and 8 MiB bound. MCP `wa.attention` adds them too on a live run, from
+the server's own workspace and only when that workspace's database is the one
+the server serves; the caller's `workspace` argument never selects the
+directory. `git status --porcelain=v2 --branch -z` runs with
 `GIT_OPTIONAL_LOCKS=0`, so it never takes `index.lock` in a tree other agents
 commit to. Uncommitted paths (staged, unstaged, untracked or unmerged) are one
 `dirty_overlap` item listing the first 20 paths: edit and stage only disjoint

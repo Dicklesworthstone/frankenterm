@@ -297,7 +297,7 @@
     },
     {
       "annotations": null,
-      "description": "Read attention-router status, next action, or item explanation from caller-supplied evidence or, with live, the workspace database: audit log, unhandled events, operator pane holds (ft robot attention also reads the watcher envelope, crash bundles, the active transaction, git status and ready beads)",
+      "description": "Read attention-router status, next action, or item explanation from caller-supplied evidence or, with live, the workspace database: audit log, unhandled events, operator pane holds, plus the server workspace's git status and ready beads (ft robot attention also reads the watcher envelope, crash bundles and the active transaction)",
       "input_schema": {
         "additionalProperties": false,
         "properties": {

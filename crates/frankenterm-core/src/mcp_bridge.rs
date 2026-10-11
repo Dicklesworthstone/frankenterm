@@ -270,6 +270,19 @@ pub async fn build_server_with_db(
 /// reachable via the explicit `build_server_degraded` entry —
 /// this private helper does NOT enforce that invariant
 /// (callers above are responsible for gating).
+/// The workspace whose git status and ready beads `wa.attention` reads on a
+/// live run: the one this server resolves, and only when that workspace's
+/// database is the one the server serves. A caller never chooses it.
+fn mcp_attention_workspace_root(
+    config: &Config,
+    db_path: Option<&std::path::Path>,
+) -> Option<Arc<PathBuf>> {
+    let served = std::fs::canonicalize(db_path?).ok()?;
+    let layout = config.workspace_layout(None).ok()?;
+    let resolved = std::fs::canonicalize(&layout.db_path).ok()?;
+    (resolved == served).then(|| Arc::new(layout.root))
+}
+
 async fn build_server_inner(
     cx: &crate::cx::Cx,
     config: &Config,
@@ -348,9 +361,14 @@ async fn build_server_inner(
         ))))
         .tool(FormatAwareToolHandler::new(WaMissionObjectivePlanTool))
         .tool(FormatAwareToolHandler::new(WaOperatingEnvelopeTool))
-        .tool(FormatAwareToolHandler::new(WaAttentionTool::new(
-            db_path.clone(),
-        )))
+        .tool(FormatAwareToolHandler::new(
+            WaAttentionTool::new(db_path.clone()).with_workspace_root(
+                mcp_attention_workspace_root(
+                    config.as_ref(),
+                    db_path.as_deref().map(PathBuf::as_path),
+                ),
+            ),
+        ))
         .tool(FormatAwareToolHandler::new(WaRehearsalScoreTool::new(
             Arc::clone(&config),
         )))

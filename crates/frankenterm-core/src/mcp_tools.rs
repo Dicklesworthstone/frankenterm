@@ -1608,12 +1608,25 @@ fn load_mcp_rehearsal_manifest(
 pub(super) struct WaAttentionTool {
     /// Workspace database for `live` runs; `None` in degraded mode.
     db_path: Option<Arc<PathBuf>>,
+    /// The server's own workspace, whose git status and ready beads `live`
+    /// runs read. Never the caller's `workspace` argument, which would let a
+    /// caller list arbitrary directories.
+    workspace_root: Option<Arc<PathBuf>>,
 }
 
 impl WaAttentionTool {
     #[must_use]
     pub(super) fn new(db_path: Option<Arc<PathBuf>>) -> Self {
-        Self { db_path }
+        Self {
+            db_path,
+            workspace_root: None,
+        }
+    }
+
+    #[must_use]
+    pub(super) fn with_workspace_root(mut self, workspace_root: Option<Arc<PathBuf>>) -> Self {
+        self.workspace_root = workspace_root;
+        self
     }
 }
 
@@ -1622,7 +1635,7 @@ impl ToolHandler for WaAttentionTool {
         Tool {
             name: "wa.attention".to_string(),
             description: Some(
-                "Read attention-router status, next action, or item explanation from caller-supplied evidence or, with live, the workspace database: audit log, unhandled events, operator pane holds (ft robot attention also reads the watcher envelope, crash bundles, the active transaction, git status and ready beads)"
+                "Read attention-router status, next action, or item explanation from caller-supplied evidence or, with live, the workspace database: audit log, unhandled events, operator pane holds, plus the server workspace's git status and ready beads (ft robot attention also reads the watcher envelope, crash bundles and the active transaction)"
                     .to_string(),
             ),
             input_schema: serde_json::json!({
@@ -1688,7 +1701,8 @@ impl ToolHandler for WaAttentionTool {
             input.workspace = workspace;
         }
         // A caller-supplied input is scored exactly; a live run adds the
-        // audit-backed sources, the same ones `ft attention` reads.
+        // audit-backed sources, the same ones `ft attention` reads, and the
+        // server workspace's git status and ready beads when it has one.
         if live {
             let audit = match self.db_path.as_deref() {
                 Some(db_path) => {
@@ -1697,6 +1711,20 @@ impl ToolHandler for WaAttentionTool {
                 None => crate::attention_live::LiveAttentionAudit::unreadable(),
             };
             crate::attention_live::apply_live_attention_audit(&mut input, &audit);
+            if let Some(root) = self.workspace_root.as_deref() {
+                input
+                    .observations
+                    .push(crate::attention_router::git_status_observation(
+                        &crate::attention_live::read_git_status(root),
+                        input.generated_at_ms,
+                    ));
+                input
+                    .observations
+                    .push(crate::attention_router::ready_beads_observation(
+                        &crate::attention_live::read_ready_beads(root),
+                        input.generated_at_ms,
+                    ));
+            }
         }
 
         let payload = build_attention_router_surface_payload(
@@ -20406,6 +20434,63 @@ mod tests {
             denial_items(&status(&WaAttentionTool::new(None), true)),
             0,
             "a degraded server reports the audit sources unavailable"
+        );
+    }
+
+    #[test]
+    fn wa_attention_live_reads_the_server_workspace_git_status_never_the_callers() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let Ok(init) = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(workspace.path())
+            .status()
+        else {
+            eprintln!("git is not installed; skipping");
+            return;
+        };
+        assert!(init.success());
+        std::fs::write(workspace.path().join("dirty.txt"), "x").expect("write");
+        let git_source = |tool: &WaAttentionTool, caller_workspace: &str| {
+            let envelope = parse_json_content(
+                tool.call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "surface": "status",
+                        "live": true,
+                        "workspace": caller_workspace
+                    }),
+                )
+                .expect("wa.attention status should respond"),
+            );
+            envelope["data"]["snapshot"]["sources"]
+                .as_array()
+                .and_then(|sources| {
+                    sources
+                        .iter()
+                        .find(|source| source["source_kind"] == "git")
+                        .cloned()
+                })
+                .expect("a git source is always reported")
+        };
+
+        let tool = WaAttentionTool::new(None)
+            .with_workspace_root(Some(Arc::new(workspace.path().to_path_buf())));
+        let read = git_source(&tool, "/");
+        assert_eq!(
+            read["source_id"],
+            crate::attention_router::LIVE_GIT_SOURCE_ID
+        );
+        assert_eq!(read["health"], "available");
+        assert_eq!(read["items_seen"], 1, "the server workspace's dirty file");
+
+        // Without a server workspace the caller's path is never read.
+        let unread = git_source(
+            &WaAttentionTool::new(None),
+            &workspace.path().to_string_lossy(),
+        );
+        assert_ne!(
+            unread["source_id"],
+            crate::attention_router::LIVE_GIT_SOURCE_ID
         );
     }
 
