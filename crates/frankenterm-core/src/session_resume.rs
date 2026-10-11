@@ -4279,17 +4279,23 @@ mod tests {
             .clone()
             .with_output_limits(2, 64)
             .expect("limits are below hard admission ceilings");
+        // `exec` for the same reason as the stderr twin below: a `sleep`
+        // forked by a shell loop while the tree is being signalled can
+        // outlive the settle window (seen on macOS).
         let error = over
-            .run_casr(&["-c", "printf 'abc'; while :; do sleep 1; done"])
+            .run_casr(&["-c", "printf 'abc'; exec sleep 600"])
             .expect_err("first byte beyond stdout cap must fail closed");
-        assert!(matches!(
-            &error,
-            SessionResumeError::CaptureLimitExceeded {
-                stream: CommandOutputStream::Stdout,
-                observed: 3,
-                limit: 2,
-            }
-        ));
+        assert!(
+            matches!(
+                &error,
+                SessionResumeError::CaptureLimitExceeded {
+                    stream: CommandOutputStream::Stdout,
+                    observed: 3,
+                    limit: 2,
+                }
+            ),
+            "{error:?}"
+        );
         assert!(!error.to_string().contains("abc"));
     }
 

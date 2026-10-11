@@ -547,23 +547,28 @@ fn dedup_fingerprint_update_value(hash: u128, value: DedupFingerprintValue<'_>) 
     }
 }
 
+// Thread-local like the dedup counter below: a process-wide counter also
+// counted other tests' detections between a test's reset and its read.
 #[cfg(test)]
-static DETECT_WITH_CONTEXT_MATERIALIZATION_COUNT: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    static DETECT_WITH_CONTEXT_MATERIALIZATION_COUNT: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
 
 #[inline]
 fn record_detect_with_context_materialization() {
     #[cfg(test)]
-    saturating_atomic_add(&DETECT_WITH_CONTEXT_MATERIALIZATION_COUNT, 1);
+    DETECT_WITH_CONTEXT_MATERIALIZATION_COUNT.with(|c| c.set(c.get().saturating_add(1)));
 }
 
 #[cfg(test)]
 fn reset_detect_with_context_materialization_count() {
-    DETECT_WITH_CONTEXT_MATERIALIZATION_COUNT.store(0, Ordering::Relaxed);
+    DETECT_WITH_CONTEXT_MATERIALIZATION_COUNT.with(|c| c.set(0));
 }
 
 #[cfg(test)]
 fn detect_with_context_materialization_count() -> u64 {
-    DETECT_WITH_CONTEXT_MATERIALIZATION_COUNT.load(Ordering::Relaxed)
+    DETECT_WITH_CONTEXT_MATERIALIZATION_COUNT.with(std::cell::Cell::get)
 }
 
 // Perf-regression instrumentation (ft-zo4hw / ft-wo323): number of
