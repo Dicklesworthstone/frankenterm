@@ -235,6 +235,28 @@ impl RulePredicate {
 // Predicate evaluation
 // =============================================================================
 
+/// Whether any of `domains` names the pane, case-insensitively: the domain
+/// the pane resolved to, or the `ssh:<host>` alias a remote cwd reports.
+/// Callers now resolve the mux's own domain name (ft-hr0cw) where they used
+/// to guess from the cwd, and the alias keeps rules written against a remote
+/// host's guess matching, so resolving the real domain never silently drops
+/// such a deny.
+pub(crate) fn pane_domain_in(domains: &[String], input: &PolicyInput) -> bool {
+    let cwd_alias = input
+        .pane_cwd
+        .as_deref()
+        .and_then(|cwd| crate::wezterm::CwdInfo::parse(cwd).domain_alias());
+    domains.iter().any(|rule_domain| {
+        input
+            .domain
+            .as_deref()
+            .is_some_and(|domain| rule_domain.eq_ignore_ascii_case(domain))
+            || cwd_alias
+                .as_deref()
+                .is_some_and(|alias| rule_domain.eq_ignore_ascii_case(alias))
+    })
+}
+
 /// Evaluates a [`RulePredicate`] against a [`PolicyInput`].
 ///
 /// Returns `true` if the predicate matches the input.
@@ -294,15 +316,7 @@ pub fn evaluate_predicate(pred: &RulePredicate, input: &PolicyInput) -> bool {
             }
         }
 
-        RulePredicate::DomainIn { domains } => {
-            if domains.is_empty() {
-                return true;
-            }
-            match &input.domain {
-                Some(d) => domains.iter().any(|dom| dom.eq_ignore_ascii_case(d)),
-                None => false,
-            }
-        }
+        RulePredicate::DomainIn { domains } => domains.is_empty() || pane_domain_in(domains, input),
 
         RulePredicate::CommandRegex { patterns } => {
             if patterns.is_empty() {
@@ -444,14 +458,7 @@ pub fn evaluate_with_trace(pred: &RulePredicate, input: &PolicyInput) -> Predica
         }
 
         RulePredicate::DomainIn { domains } => {
-            let matched = if domains.is_empty() {
-                true
-            } else {
-                input
-                    .domain
-                    .as_ref()
-                    .is_some_and(|d| domains.iter().any(|dom| dom.eq_ignore_ascii_case(d)))
-            };
+            let matched = domains.is_empty() || pane_domain_in(domains, input);
             PredicateTrace {
                 description: format!("domain_in({domains:?})"),
                 matched,

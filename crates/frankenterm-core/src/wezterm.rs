@@ -219,7 +219,9 @@ pub trait MuxInterface: Send + Sync {
     /// cwd fallback cannot tell a proxied remote pane from a local one.
     /// Best effort and user-facing only: a backend or peer without the
     /// request leaves the fields untouched, so callers keep the inferred
-    /// domain. Background loops should not pay this extra round trip.
+    /// domain. Background loops should not pay this extra round trip; the
+    /// mux client's single-pane `get_pane_with_cx` pays it, because a pane is
+    /// fetched alone to act on it.
     fn annotate_pane_domains_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -679,9 +681,20 @@ impl CwdInfo {
     /// WezTerm uses file:// URIs:
     /// - Local: `file:///home/user` (host empty, 3 slashes)
     /// - Remote: `file://hostname/path` (host present, 2 slashes before host)
+    ///
+    /// `localhost` and this machine's own hostname are local: shell
+    /// integration (OSC 7) reports `file://$HOSTNAME/...` for every local
+    /// shell, so a host naming this machine is not a remote cwd.
+    #[must_use]
+    pub fn parse(uri: &str) -> Self {
+        Self::parse_with_local_hostname(uri, local_hostname())
+    }
+
+    /// [`parse`](Self::parse) against an explicit local hostname; with `None`
+    /// only `localhost` is local.
     #[must_use]
     #[allow(clippy::option_if_let_else)] // if-let-else is clearer for this multi-branch logic
-    pub fn parse(uri: &str) -> Self {
+    pub fn parse_with_local_hostname(uri: &str, local_hostname: Option<&str>) -> Self {
         let uri = uri.trim();
 
         if uri.is_empty() {
@@ -710,7 +723,7 @@ impl CwdInfo {
                 // Remote path: host/path
                 let host = &rest[..slash_pos];
                 let path = &rest[slash_pos..];
-                let is_localhost = host.eq_ignore_ascii_case("localhost");
+                let is_localhost = cwd_host_is_local(host, local_hostname);
                 Self {
                     raw_uri: uri.to_string(),
                     path: percent_decode_file_uri_path(path),
@@ -723,7 +736,7 @@ impl CwdInfo {
                 }
             } else {
                 // Just host, no path
-                let is_localhost = rest.eq_ignore_ascii_case("localhost");
+                let is_localhost = cwd_host_is_local(rest, local_hostname);
                 Self {
                     raw_uri: uri.to_string(),
                     path: String::new(),
@@ -745,6 +758,47 @@ impl CwdInfo {
             }
         }
     }
+
+    /// The `ssh:<host>` alias a remote cwd suggests. Shell integration
+    /// reports the host the shell runs on, which says nothing about which
+    /// mux domain owns the pane, so this is a hint, never ownership.
+    #[must_use]
+    pub fn domain_alias(&self) -> Option<String> {
+        (self.is_remote && !self.host.is_empty()).then(|| format!("ssh:{}", self.host))
+    }
+}
+
+/// This machine's hostname, read once.
+fn local_hostname() -> Option<&'static str> {
+    static LOCAL_HOSTNAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    LOCAL_HOSTNAME
+        .get_or_init(|| {
+            hostname::get()
+                .ok()?
+                .into_string()
+                .ok()
+                .filter(|name| !name.is_empty())
+        })
+        .as_deref()
+}
+
+/// Whether a cwd URI host names this machine: `localhost`, or the local
+/// hostname compared case-insensitively, also when one side is the other's
+/// first label (`mac-mini` for `Mac-mini.local`).
+fn cwd_host_is_local(host: &str, local_hostname: Option<&str>) -> bool {
+    fn first_label(name: &str) -> &str {
+        name.split('.').next().unwrap_or(name)
+    }
+
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let Some(local) = local_hostname else {
+        return false;
+    };
+    host.eq_ignore_ascii_case(local)
+        || (!host.contains('.') && host.eq_ignore_ascii_case(first_label(local)))
+        || (!local.contains('.') && local.eq_ignore_ascii_case(first_label(host)))
 }
 
 fn percent_decode_file_uri_path(path: &str) -> String {
@@ -925,14 +979,10 @@ impl PaneInfo {
             return name.to_string();
         }
 
-        // Try to infer from cwd URI
-        let cwd_info = self.parsed_cwd();
-        if cwd_info.is_remote && !cwd_info.host.is_empty() {
-            return format!("ssh:{}", cwd_info.host);
-        }
-
-        // Default to local
-        "local".to_string()
+        // Try to infer from cwd URI, else default to local
+        self.parsed_cwd()
+            .domain_alias()
+            .unwrap_or_else(|| "local".to_string())
     }
 
     /// Get the title, with a default fallback
@@ -1825,13 +1875,20 @@ impl WeztermClient {
     /// capability context (ft-xbnl0.2.3 Cx-first entry point).
     ///
     /// Delegates to [`list_panes_with_cx`](Self::list_panes_with_cx)
-    /// so the underlying pane listing respects caller Cx.
+    /// so the underlying pane listing respects caller Cx, then fills the
+    /// pane's owning domain ([`annotate_pane_domains_with_cx`](Self::annotate_pane_domains_with_cx),
+    /// one more bounded round trip). A single pane is fetched to act on it:
+    /// policy `pane_domains` rules, audit records and robot output must see
+    /// the domain the mux reports, not a cwd guess (ft-hr0cw).
     pub async fn get_pane_with_cx(&self, cx: &crate::cx::Cx, pane_id: u64) -> Result<PaneInfo> {
         let panes = self.list_panes_with_cx(cx).await?;
-        panes
+        let mut pane = panes
             .into_iter()
             .find(|p| p.pane_id == pane_id)
-            .ok_or_else(|| WeztermError::PaneNotFound(pane_id).into())
+            .ok_or(WeztermError::PaneNotFound(pane_id))?;
+        self.annotate_pane_domains_with_cx(cx, std::slice::from_mut(&mut pane))
+            .await;
+        Ok(pane)
     }
 
     /// Get text content from a pane
@@ -6261,6 +6318,59 @@ mod tests {
         assert!(!cwd.is_remote);
         assert_eq!(cwd.host, "");
         assert_eq!(cwd.path, "");
+    }
+
+    #[test]
+    fn cwd_info_domain_alias_names_only_a_remote_host() {
+        assert_eq!(
+            CwdInfo::parse("file://prod/home/agent").domain_alias(),
+            Some("ssh:prod".to_string())
+        );
+        assert_eq!(CwdInfo::parse("file:///home/agent").domain_alias(), None);
+        assert_eq!(
+            CwdInfo::parse("file://localhost/home/agent").domain_alias(),
+            None
+        );
+        assert_eq!(CwdInfo::parse("/home/agent").domain_alias(), None);
+        assert_eq!(CwdInfo::parse("").domain_alias(), None);
+    }
+
+    #[test]
+    fn cwd_info_treats_this_machines_hostname_as_local() {
+        // OSC 7 reports file://$HOSTNAME/... for every local shell.
+        let local = CwdInfo::parse_with_local_hostname(
+            "file://mac-mini-max/Users/agent/projects",
+            Some("mac-mini-max"),
+        );
+        assert!(!local.is_remote);
+        assert_eq!(local.host, "");
+        assert_eq!(local.path, "/Users/agent/projects");
+        assert_eq!(local.domain_alias(), None);
+
+        // Case and the short/qualified forms of the same name are local too.
+        for (host, hostname) in [
+            ("Mac-Mini-Max", "mac-mini-max"),
+            ("mac-mini-max", "Mac-mini-max.local"),
+            ("mac-mini-max.local", "mac-mini-max"),
+        ] {
+            let cwd =
+                CwdInfo::parse_with_local_hostname(&format!("file://{host}/tmp"), Some(hostname));
+            assert!(!cwd.is_remote, "{host} names {hostname}");
+        }
+        let host_only =
+            CwdInfo::parse_with_local_hostname("file://mac-mini-max", Some("mac-mini-max"));
+        assert!(!host_only.is_remote);
+
+        // Another machine stays remote, including one sharing a first label.
+        for (host, hostname) in [
+            ("hetzner1", Some("mac-mini-max")),
+            ("db1.prod", Some("db1.dev")),
+            ("mac-mini-max", None),
+        ] {
+            let cwd = CwdInfo::parse_with_local_hostname(&format!("file://{host}/data"), hostname);
+            assert!(cwd.is_remote, "{host} vs {hostname:?}");
+            assert_eq!(cwd.domain_alias(), Some(format!("ssh:{host}")));
+        }
     }
 
     #[test]

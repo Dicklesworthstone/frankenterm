@@ -201,14 +201,17 @@ proptest! {
         prop_assert!(info.host.is_empty());
     }
 
-    /// Parsing a remote file:// URI yields host and is_remote=true.
+    /// Parsing a remote file:// URI yields host and is_remote=true. The local
+    /// hostname is pinned to none: a generated host could name the machine
+    /// running the test, which `parse` treats as local.
     #[test]
     fn prop_parse_remote_uri(
         host in "[a-z]{3,10}",
         path in "/[a-z]{2,10}/[a-z]{2,10}",
     ) {
+        prop_assume!(host != "localhost");
         let uri = format!("file://{host}{path}");
-        let info = CwdInfo::parse(&uri);
+        let info = CwdInfo::parse_with_local_hostname(&uri, None);
         prop_assert_eq!(&info.host, &host);
         prop_assert_eq!(&info.path, &path);
         prop_assert!(info.is_remote);

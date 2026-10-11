@@ -4256,12 +4256,12 @@ fn matches_rule(match_on: &PolicyRuleMatch, input: &PolicyInput) -> bool {
         }
     }
 
-    // Check pane domain
-    if !match_on.pane_domains.is_empty() {
-        match &input.domain {
-            Some(domain) if match_on.pane_domains.iter().any(|d| d == domain) => {}
-            _ => return false,
-        }
+    // Check pane domain, exactly as the DSL's domain_in predicate does (the
+    // resolved domain or a remote cwd's ssh:<host> alias, any case).
+    if !match_on.pane_domains.is_empty()
+        && !crate::policy_dsl::pane_domain_in(&match_on.pane_domains, input)
+    {
+        return false;
     }
 
     // Check pane title (glob matching)
@@ -15261,6 +15261,53 @@ mod tests {
         };
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
         assert!(!matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn domain_rules_keep_the_cwd_alias_once_the_real_domain_is_known() {
+        // A deny written against the cwd guess still fires for a pane whose
+        // authoritative domain the mux now reports (ft-hr0cw), through the
+        // production DSL path (and its debug parity check with matches_rule).
+        let deny_on = |domain: &str| PolicyRulesConfig {
+            enabled: true,
+            rules: vec![PolicyRule {
+                id: format!("deny-{domain}"),
+                description: None,
+                priority: 100,
+                match_on: PolicyRuleMatch {
+                    pane_domains: vec![domain.to_string()],
+                    ..Default::default()
+                },
+                decision: PolicyRuleDecision::Deny,
+                message: None,
+            }],
+        };
+        let decision = |config: &PolicyRulesConfig, input: &PolicyInput| {
+            evaluate_policy_rules(config, input).decision
+        };
+        let remote_shell = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_domain("hz1")
+            .with_pane_cwd("file://prod/home/agent");
+        assert_eq!(
+            decision(&deny_on("ssh:prod"), &remote_shell),
+            Some(PolicyRuleDecision::Deny)
+        );
+        assert_eq!(
+            decision(&deny_on("HZ1"), &remote_shell),
+            Some(PolicyRuleDecision::Deny),
+            "domains compare in any case"
+        );
+
+        let local_shell = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_domain("hz1")
+            .with_pane_cwd("file:///home/agent");
+        assert_eq!(decision(&deny_on("ssh:prod"), &local_shell), None);
+        let localhost = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_domain("local")
+            .with_pane_cwd("file://localhost/home/agent");
+        assert_eq!(decision(&deny_on("ssh:prod"), &localhost), None);
+        let no_cwd = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_domain("local");
+        assert_eq!(decision(&deny_on("ssh:prod"), &no_cwd), None);
     }
 
     #[test]
