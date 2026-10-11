@@ -1496,10 +1496,16 @@ impl SnapshotPublicationStore {
         }
 
         for _ in 0..4 {
-            let cap_file = self
-                .root_dir
-                .open_with(lock_leaf, &opts)
-                .map_err(|e| PublicationError::io(&lock_path, e))?;
+            let cap_file = match self.root_dir.open_with(lock_leaf, &opts) {
+                Ok(file) => file,
+                // A create-open can report NotFound while another publisher
+                // creates the same name (cap-std's beneath-resolution on
+                // macOS fails this way in 3 of 4 concurrent first-time
+                // acquisitions). The name exists now: this is contention, so
+                // retry, ending as PublicationBusy like any other race.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(PublicationError::io(&lock_path, error)),
+            };
 
             check_opened_file_security(&cap_file, &lock_path)?;
 
