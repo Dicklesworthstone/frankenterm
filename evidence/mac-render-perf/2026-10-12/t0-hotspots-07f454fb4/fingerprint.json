@@ -1,0 +1,33 @@
+{
+  "schema": "ft.mac-render.fingerprint.v1",
+  "bead": "ft-yccm0.1.1",
+  "date": "2026-10-12",
+  "host": "mac-studio",
+  "hardware": {
+    "model": "Mac17,15",
+    "cpu": "Apple M5 Ultra",
+    "performance_cores": 12,
+    "efficiency_cores": 24,
+    "memory_bytes": 274877906944
+  },
+  "os": { "product_version": "27.0.1", "build": "26A434" },
+  "toolchain": "rustc 1.100.0-nightly (908501772 2026-08-30)",
+  "source_sha": "07f454fb48c0dbc08f8e4666b5804a3ba8f4c56e",
+  "profiled_build": {
+    "binary": "frankenterm-gui",
+    "profile": "release-perf (opt-level 3, thin LTO, debug line-tables-only, not stripped)",
+    "rustflags": "-Z threads=4 -C force-frame-pointers=yes"
+  },
+  "compared_build": {
+    "bundle": "FrankenTerm.app 0.15.21 built from the same SHA, profile release-interactive (stripped)",
+    "atomic_build_id": "fb71b7b1a711e8fb851ee66ca5a4eb91c54d43049f1f153e4836d7b81d16f8f0"
+  },
+  "corpus": {
+    "path": "~/color-emoji-random.bin",
+    "bytes": 749801000,
+    "sha256": "a442d89593da3bbfd1d059e186b999387098c2aa7d8d4a8df88f47b811c43767"
+  },
+  "harness": "scripts/mac-gui-throughput.sh --no-fps --no-beachball-probe (over SSH: no Screen Recording or Accessibility grant)",
+  "load_avg_1m": { "profile_runs": "28-31", "ft_vs_ghostty_runs": "11-13" },
+  "swap": "total 3072M, used 1909M"
+}
