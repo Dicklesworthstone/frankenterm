@@ -13,7 +13,7 @@ use frankenterm_core::font_features::{AxisVector, GlyphFormat, derive_axis_atlas
 use frankenterm_core::subpixel_positioning::SubpixelBin;
 use frankenterm_font::units::*;
 use frankenterm_font::{FontConfiguration, GlyphInfo, LoadedFont, LoadedFontId};
-use lfucache::LfuCache;
+use lfucache::{LfuCache, RateCounter};
 use ordered_float::NotNan;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -1257,6 +1257,10 @@ pub struct GlyphCache {
     /// The cursor is `0` until the first paint pass calls
     /// `snapshot_atlas_version`.
     last_synced_version: u64,
+    /// Glyph lookup statistics, emitted in batches: a lookup runs per glyph
+    /// per frame, too often to emit each (see `lfucache::RateCounter`).
+    glyph_hits: RateCounter,
+    glyph_misses: RateCounter,
 }
 
 impl GlyphCache {
@@ -1308,6 +1312,8 @@ impl GlyphCache {
             ),
             min_frame_duration: config::frame_interval_for_max_fps(fonts.config().max_fps),
             last_synced_version: 0,
+            glyph_hits: RateCounter::new("glyph_cache.glyph_cache.hit.rate"),
+            glyph_misses: RateCounter::new("glyph_cache.glyph_cache.miss.rate"),
         })
     }
 
@@ -1340,6 +1346,9 @@ impl GlyphCache {
             shape_bindings,
             min_frame_duration,
             last_synced_version,
+            // Lookup statistics continue across a clear.
+            glyph_hits: _,
+            glyph_misses: _,
         } = self;
         glyph_cache.clear();
         frame_cache.clear();
@@ -2022,10 +2031,10 @@ impl GlyphCache {
         };
 
         if let Some(entry) = self.glyph_cache.get(&key as &dyn GlyphKeyTrait) {
-            metrics::histogram!("glyph_cache.glyph_cache.hit.rate").record(1.);
+            self.glyph_hits.add_one();
             return Ok((Rc::clone(entry), true));
         }
-        metrics::histogram!("glyph_cache.glyph_cache.miss.rate").record(1.);
+        self.glyph_misses.add_one();
 
         let glyph = self.load_glyph(info, font, followed_by_space, num_cells)?;
         self.glyph_cache.insert(key.to_owned(), Rc::clone(&glyph));
