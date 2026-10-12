@@ -226,6 +226,35 @@ enum ClientTopologySessionState {
     Revoked(ClientTopologySessionError),
 }
 
+/// The session a layout receipt is scoped to, so the GUI can remember tab
+/// order across restarts. A current-codec server supplies its incarnation. A
+/// codec-46 server has none, but its numeric tab IDs stay valid for the life
+/// of that server process, which outlives many GUI restarts; its tabs are
+/// scoped to a session derived from the durable binding instead. Without this,
+/// order on legacy hosts was never saved and every reopen fell back to the
+/// server's creation order. If such a server restarts, a saved ID can match an
+/// unrelated new tab: the cost is a misplaced tab, never a lost one.
+fn layout_session(
+    state: &ClientTopologySessionState,
+    binding: DurableClientBinding,
+) -> Option<MuxSessionIncarnation> {
+    match state {
+        ClientTopologySessionState::Bound(ClientTopologySession::Current(session)) => {
+            Some(*session)
+        }
+        ClientTopologySessionState::Bound(ClientTopologySession::Legacy46) => {
+            let mut hasher = openssl::sha::Sha256::new();
+            hasher.update(b"frankenterm-legacy46-layout-session-v1");
+            hasher.update(&binding.binding_id.as_bytes());
+            let digest = hasher.finish();
+            let mut bytes = [0; 16];
+            bytes.copy_from_slice(&digest[..16]);
+            Some(MuxSessionIncarnation::from_bytes(bytes))
+        }
+        ClientTopologySessionState::Unbound | ClientTopologySessionState::Revoked(_) => None,
+    }
+}
+
 pub struct ClientInner {
     pub client: Client,
     pub local_domain_id: DomainId,
@@ -2994,9 +3023,11 @@ impl ClientDomain {
         let Some(binding) = self.durable_layout_binding() else {
             return Ok(());
         };
-        let session = match *lock_or_recover(&inner.topology_session, "topology_session") {
-            ClientTopologySessionState::Bound(ClientTopologySession::Current(session)) => session,
-            _ => return Ok(()),
+        let Some(session) = layout_session(
+            &lock_or_recover(&inner.topology_session, "topology_session"),
+            binding,
+        ) else {
+            return Ok(());
         };
         let rpc = inner.client.rpc_scope();
         if !rpc.is_available() {
@@ -7381,6 +7412,37 @@ mod tests {
         );
         assert_eq!(mux.iter_windows().len(), 2);
         assert_eq!(mux.iter_panes().len(), 2);
+    }
+
+    #[test]
+    fn layout_session_scopes_legacy_tabs_to_their_binding() {
+        let binding = |byte| DurableClientBinding {
+            fingerprint: ClientEndpointFingerprint([byte; 32]),
+            binding_id: codec::DomainBindingId::from_bytes([byte; 16]),
+        };
+        let legacy = ClientTopologySessionState::Bound(ClientTopologySession::Legacy46);
+        let first = layout_session(&legacy, binding(0x21)).expect("legacy tabs get a session");
+        // Stable across GUI restarts: the same binding derives the same session.
+        assert_eq!(layout_session(&legacy, binding(0x21)), Some(first));
+        // Two legacy hosts never alias each other's numeric tab IDs.
+        assert_ne!(layout_session(&legacy, binding(0x22)), Some(first));
+        assert_ne!(first.as_bytes(), [0; 16]);
+
+        let incarnation = MuxSessionIncarnation::from_bytes([0xa5; 16]);
+        let current =
+            ClientTopologySessionState::Bound(ClientTopologySession::Current(incarnation));
+        assert_eq!(layout_session(&current, binding(0x21)), Some(incarnation));
+        assert_eq!(
+            layout_session(&ClientTopologySessionState::Unbound, binding(0x21)),
+            None
+        );
+        assert_eq!(
+            layout_session(
+                &ClientTopologySessionState::Revoked(ClientTopologySessionError::Changed),
+                binding(0x21)
+            ),
+            None
+        );
     }
 
     #[test]

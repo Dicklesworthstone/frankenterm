@@ -79,6 +79,8 @@ struct LiveLayout {
     receipts: Vec<Arc<RemoteLayoutSnapshot>>,
     slots: HashMap<mux::tab::TabId, StableTabSlot>,
     unavailable: std::collections::BTreeSet<crate::window_state_persist::DomainBindingId>,
+    /// Bindings whose complete current tab set is in `slots`.
+    attached: std::collections::BTreeSet<crate::window_state_persist::DomainBindingId>,
 }
 
 impl LiveLayout {
@@ -91,6 +93,7 @@ impl LiveLayout {
                 .iter()
                 .map(|binding| binding.binding_id())
                 .collect(),
+            attached: Default::default(),
         };
         for domain in mux.iter_domains() {
             let Some(client) = domain.downcast_ref::<ClientDomain>() else {
@@ -104,6 +107,7 @@ impl LiveLayout {
                     receipt.binding().binding_id.as_bytes(),
                 );
                 result.unavailable.remove(&binding);
+                result.attached.insert(binding);
                 for entry in receipt.tabs() {
                     anyhow::ensure!(result.slots.len() < 16_384, "live layout exceeds tab bound");
                     let slot = StableTabSlot::remote(
@@ -131,7 +135,7 @@ impl LiveLayout {
                     continue;
                 }
                 // A client tab without a current receipt is unavailable, not a
-                // local tab. In particular codec46 numeric IDs cannot persist.
+                // local tab.
                 if tab.iter_panes().iter().any(|pane| {
                     mux.get_domain(pane.pane.domain_id())
                         .is_none_or(|domain| domain.downcast_ref::<ClientDomain>().is_some())
@@ -160,8 +164,56 @@ impl LiveLayout {
     }
 }
 
+/// What one capture pass persists: changed overlays, the windows that own
+/// them, and saved overlays that can never be restored again.
+struct CapturePlan {
+    updates: Vec<(Option<u64>, MixedDomainLayoutOverlay)>,
+    owned: Vec<(MuxWindowId, OwnedLayoutWindow)>,
+    orphans: Vec<(LayoutWindowId, u64)>,
+}
+
 impl LayoutLifecycle {
     fn capture_changes(&mut self, mux: &Arc<Mux>, live: &LiveLayout) -> anyhow::Result<()> {
+        let CapturePlan {
+            updates,
+            owned,
+            orphans,
+        } = self.plan_capture(mux, live)?;
+        for (window_id, revision) in orphans {
+            match crate::window_state_persist::queue_layout_overlay_delete(
+                window_id,
+                Some(revision),
+            ) {
+                Ok(_) => self
+                    .startup
+                    .overlays
+                    .retain(|overlay| overlay.window_id() != window_id),
+                Err(error) => log::warn!("stale tab layout retained: {error}"),
+            }
+        }
+        if updates.is_empty() {
+            return Ok(());
+        }
+        live.with_current(mux, || {
+            crate::window_state_persist::queue_layout_overlays(updates).map_err(Into::into)
+        })?;
+        for (id, owned) in owned {
+            // A local edit supersedes the startup placement, including edits
+            // made while another domain is unavailable.
+            if let Some(startup) = self
+                .startup
+                .overlays
+                .iter_mut()
+                .find(|overlay| overlay.window_id() == owned.overlay.window_id())
+            {
+                *startup = owned.overlay.clone();
+            }
+            self.owned.insert(id, owned);
+        }
+        Ok(())
+    }
+
+    fn plan_capture(&self, mux: &Arc<Mux>, live: &LiveLayout) -> anyhow::Result<CapturePlan> {
         let mut updates = Vec::new();
         let mut next_owned = Vec::new();
         for id in mux.iter_windows_bounded(4_096)? {
@@ -198,15 +250,13 @@ impl LayoutLifecycle {
                 // persist a competing freshly minted ID before restore runs.
                 continue;
             }
-            // Pure remote order belongs to its server. This store describes
-            // local/mixed composition only, including retained unavailable slots.
-            let pure_remote = slots.first().is_some_and(|first| match first {
-                StableTabSlot::Remote { binding_id, session_id, remote_window_id, .. } => slots.iter().all(|slot|
-                    matches!(slot, StableTabSlot::Remote { binding_id: b, session_id: s, remote_window_id: w, .. }
-                        if b == binding_id && s == session_id && w == remote_window_id)),
-                _ => false,
-            });
-            if old.is_none() && (pure_remote || slots.is_empty()) {
+            // Windows holding one remote window's tabs are saved too. Their
+            // server would own the order if GUI reorders reached it, but a
+            // reorder only moves the local mirror (and codec-46 servers have no
+            // reorder RPC at all), so this overlay is the only record of the
+            // order the user arranged; without it every reopen showed the
+            // server's creation order.
+            if old.is_none() && slots.is_empty() {
                 continue;
             }
             let active = order
@@ -253,26 +303,38 @@ impl LayoutLifecycle {
                 },
             ));
         }
-        if updates.is_empty() {
-            return Ok(());
-        }
-        live.with_current(mux, || {
-            crate::window_state_persist::queue_layout_overlays(updates).map_err(Into::into)
-        })?;
-        for (id, owned) in next_owned {
-            // A local edit supersedes the startup placement, including edits
-            // made while another domain is unavailable.
-            if let Some(startup) = self
-                .startup
-                .overlays
-                .iter_mut()
-                .find(|overlay| overlay.window_id() == owned.overlay.window_id())
-            {
-                *startup = owned.overlay.clone();
-            }
-            self.owned.insert(id, owned);
-        }
-        Ok(())
+        Ok(CapturePlan {
+            updates,
+            owned: next_owned,
+            orphans: self.orphaned_overlays(live),
+        })
+    }
+
+    /// Saved overlays made only of tabs from hosts attached right now, none of
+    /// which exist any more (closed, or their server restarted). They can never
+    /// be restored, and left alone they would pile up until the store's quota
+    /// rejected every later save.
+    fn orphaned_overlays(&self, live: &LiveLayout) -> Vec<(LayoutWindowId, u64)> {
+        let live_identities: std::collections::HashSet<_> =
+            live.slots.values().map(|slot| slot.identity()).collect();
+        self.startup
+            .overlays
+            .iter()
+            .filter(|overlay| {
+                !self.restored.contains(&overlay.window_id())
+                    && !self
+                        .owned
+                        .values()
+                        .any(|owned| owned.overlay.window_id() == overlay.window_id())
+                    && !overlay.slots().is_empty()
+                    && overlay.slots().iter().all(|slot| {
+                        slot.remote_binding()
+                            .is_some_and(|binding| live.attached.contains(&binding))
+                            && !live_identities.contains(&slot.identity())
+                    })
+            })
+            .map(|overlay| (overlay.window_id(), overlay.local_revision()))
+            .collect()
     }
 
     fn restore(&mut self, mux: &Arc<Mux>, live: &LiveLayout) -> anyhow::Result<()> {
@@ -1836,6 +1898,182 @@ mod tests {
         }
         left.cancel();
         right.cancel();
+    }
+
+    #[test]
+    fn single_host_window_order_survives_a_gui_restart() {
+        use super::{LayoutLifecycle, LiveLayout, StableMuxSessionId, StableTabSlot};
+        use crate::window_state_persist::DomainBindingId;
+        use mux::Mux;
+        use mux::activity::Activity;
+        use mux::tab::Tab;
+        use std::collections::{BTreeSet, HashMap};
+        use std::sync::Arc;
+
+        let binding = DomainBindingId::from_bytes([0x5a; 16]);
+        let session = StableMuxSessionId::from_bytes([0x6b; 16]);
+        let slot = |remote_tab_id| StableTabSlot::remote(binding, session, 7, remote_tab_id);
+        // One GUI process attached to a remote window whose server lists remote
+        // tabs 10, 11, 12 in creation order. Returns the window and its tabs in
+        // that order.
+        let attach = |mux: &Arc<Mux>| {
+            let window = mux.new_empty_window(None, None);
+            let tabs: Vec<_> = (0..3)
+                .map(|_| Arc::new(Tab::new(&Default::default())))
+                .collect();
+            for tab in &tabs {
+                mux.add_tab_no_panes(tab).unwrap();
+                mux.add_tab_to_window(tab, *window).unwrap();
+            }
+            let live = LiveLayout {
+                receipts: Vec::new(),
+                slots: tabs
+                    .iter()
+                    .zip(10..)
+                    .map(|(tab, remote_tab_id)| (tab.tab_id(), slot(remote_tab_id)))
+                    .collect(),
+                unavailable: BTreeSet::new(),
+                attached: BTreeSet::from([binding]),
+            };
+            (window, tabs, live)
+        };
+        let order = |mux: &Arc<Mux>, window| {
+            mux.window_order_snapshot(window)
+                .unwrap()
+                .unwrap()
+                .ordered_tab_ids()
+                .collect::<Vec<_>>()
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let startup =
+            crate::window_state_persist::load_snapshot_at(&temp.path().join("layout.json"))
+                .unwrap();
+
+        // First run: the user arranges the tabs as 12, 10, 11 with 10 active.
+        let mux = Arc::new(Mux::new(None));
+        let _activity = Activity::new_for_mux(&mux);
+        let (window, tabs, live) = attach(&mux);
+        let snapshot = mux.window_order_snapshot(*window).unwrap().unwrap();
+        mux.apply_window_order_mirrors(vec![mux::window::WindowOrderMirror {
+            expected: snapshot,
+            ordered_tabs: vec![
+                Arc::clone(&tabs[2]),
+                Arc::clone(&tabs[0]),
+                Arc::clone(&tabs[1]),
+            ],
+            active_tab: Some(Arc::clone(&tabs[0])),
+        }])
+        .unwrap();
+        let lifecycle = LayoutLifecycle {
+            startup: startup.clone(),
+            owned: HashMap::new(),
+            restored: Default::default(),
+        };
+        let plan = lifecycle.plan_capture(&mux, &live).unwrap();
+        assert_eq!(plan.updates.len(), 1, "a single-host window must be saved");
+        let saved = plan.updates[0].1.clone();
+        assert_eq!(saved.slots(), [slot(12), slot(10), slot(11)].as_slice());
+        assert_eq!(saved.active(), Some(slot(10)));
+        assert!(plan.orphans.is_empty());
+        window.cancel();
+
+        // Second run: the server still lists 10, 11, 12; restore reapplies the
+        // saved order and active tab.
+        let mux = Arc::new(Mux::new(None));
+        let _activity = Activity::new_for_mux(&mux);
+        let (window, tabs, live) = attach(&mux);
+        assert_eq!(
+            order(&mux, *window),
+            tabs.iter().map(|t| t.tab_id()).collect::<Vec<_>>()
+        );
+        let mut startup = startup;
+        startup.overlays = vec![saved.clone()];
+        let mut lifecycle = LayoutLifecycle {
+            startup,
+            owned: HashMap::new(),
+            restored: Default::default(),
+        };
+        lifecycle.restore(&mux, &live).unwrap();
+        assert_eq!(
+            order(&mux, *window),
+            vec![tabs[2].tab_id(), tabs[0].tab_id(), tabs[1].tab_id()]
+        );
+        assert_eq!(
+            mux.window_order_snapshot(*window)
+                .unwrap()
+                .unwrap()
+                .active_tab_id(),
+            Some(tabs[0].tab_id())
+        );
+        // The restored window keeps its saved overlay, so later edits update it
+        // in place instead of minting a new one.
+        assert_eq!(
+            lifecycle.owned[&*window].overlay.window_id(),
+            saved.window_id()
+        );
+        assert!(
+            lifecycle
+                .plan_capture(&mux, &live)
+                .unwrap()
+                .updates
+                .is_empty()
+        );
+        window.cancel();
+    }
+
+    #[test]
+    fn saved_layouts_whose_tabs_are_gone_are_pruned_only_when_their_host_is_attached() {
+        use super::{LayoutLifecycle, LiveLayout, MixedDomainLayoutOverlay};
+        use super::{StableMuxSessionId, StableTabSlot};
+        use crate::window_state_persist::DomainBindingId;
+        use mux::Mux;
+        use std::collections::{BTreeSet, HashMap};
+        use std::sync::Arc;
+
+        let binding = DomainBindingId::from_bytes([0x71; 16]);
+        let old_session = StableMuxSessionId::from_bytes([0x72; 16]);
+        let temp = tempfile::tempdir().unwrap();
+        let mut startup =
+            crate::window_state_persist::load_snapshot_at(&temp.path().join("layout.json"))
+                .unwrap();
+        let stale_id = startup.new_layout_window_id().unwrap();
+        let stale = StableTabSlot::remote(binding, old_session, 1, 40);
+        startup.overlays = vec![
+            MixedDomainLayoutOverlay::new(stale_id, "default", 3, vec![stale], Some(stale))
+                .unwrap(),
+        ];
+        let lifecycle = LayoutLifecycle {
+            startup,
+            owned: HashMap::new(),
+            restored: Default::default(),
+        };
+        let mux = Arc::new(Mux::new(None));
+        let live = |attached: BTreeSet<DomainBindingId>| LiveLayout {
+            receipts: Vec::new(),
+            slots: HashMap::new(),
+            unavailable: BTreeSet::new(),
+            attached,
+        };
+
+        // Host not attached yet (or unreachable): its saved order must survive.
+        let detached = live(BTreeSet::new());
+        assert!(lifecycle.orphaned_overlays(&detached).is_empty());
+        assert!(
+            lifecycle
+                .plan_capture(&mux, &detached)
+                .unwrap()
+                .orphans
+                .is_empty()
+        );
+
+        // Host attached and none of the saved tabs exist: prune at its revision.
+        let attached = live(BTreeSet::from([binding]));
+        assert_eq!(lifecycle.orphaned_overlays(&attached), vec![(stale_id, 3)]);
+
+        // A saved tab that is still live keeps the overlay.
+        let mut still_live = live(BTreeSet::from([binding]));
+        still_live.slots.insert(usize::MAX - 1, stale);
+        assert!(lifecycle.orphaned_overlays(&still_live).is_empty());
     }
 
     #[test]
