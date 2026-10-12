@@ -1491,9 +1491,14 @@ mod tests {
         assert!(released.load(Ordering::Acquire));
         assert!(grabbed && alt_screen, "the pane reads as grabbed");
         assert_eq!(read_dims, dims);
-        assert_eq!(
-            after.main_thread_blocked_waits, before.main_thread_blocked_waits,
-            "the mouse path waited for the held terminal on the main thread"
+        // A bound, not an equality: the ledger is process-wide, and a test
+        // on another thread named "main" (paint's bounded capture) may wait
+        // in the same window. Waiting out the holder would be ~500 ms.
+        let blocked =
+            Duration::from_nanos(after.main_thread_blocked_ns - before.main_thread_blocked_ns);
+        assert!(
+            blocked < Duration::from_millis(50),
+            "the main thread was blocked {blocked:?} while the terminal was held for {HOLD:?}"
         );
         eprintln!("mouse path while the terminal was held: {elapsed:?}");
         // Honest slack for a loaded debug build; any wait would be ~500 ms.

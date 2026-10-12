@@ -1878,7 +1878,14 @@ impl TerminalMutex {
                 self.served.fetch_add(1, Ordering::AcqRel);
             }
         }
-        guard.map(|guard| TerminalGuard::acquired(guard, holder, waited.max(1)))
+        match guard {
+            Some(guard) => Some(TerminalGuard::acquired(guard, holder, waited.max(1))),
+            None => {
+                // Giving up acquired nothing, but blocked this thread.
+                TerminalLockLedger::global().record_abandoned_wait(waited, on_main_thread());
+                None
+            }
+        }
     }
 
     /// A probe for availability; not an acquisition, so nothing is recorded.
@@ -18798,6 +18805,39 @@ mod tests {
         let half_hold = u64::try_from(held_for.as_nanos() / 2).unwrap();
         assert!(after.main_thread_max_wait_ns >= half_hold);
         assert!(after.holders["paint"].wait.max_ns >= half_hold);
+    }
+
+    /// A paint capture that waits out its bounded budget and gives up still
+    /// blocked the main thread for that budget, and is counted as blocking.
+    #[test]
+    fn an_abandoned_capture_wait_on_the_main_thread_counts_as_blocking() {
+        let pane = render_facts_test_pane(795);
+        let pane = &pane;
+        let budget = render_capture_wait();
+        let before = TerminalLockLedger::global().snapshot();
+        let captured = std::thread::scope(|scope| {
+            let _held = pane.terminal.lock();
+            // std names the process's main thread "main"; so does this one.
+            std::thread::Builder::new()
+                .name("main".to_string())
+                .spawn_scoped(scope, move || {
+                    pane.try_capture_render_frame(None, 0, 0, &[], false)
+                        .is_some()
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        });
+        let after = TerminalLockLedger::global().snapshot();
+        assert!(!captured, "the capture gave up while the lock was held");
+        assert!(after.main_thread_blocked_waits > before.main_thread_blocked_waits);
+        let blocked = after.main_thread_blocked_ns - before.main_thread_blocked_ns;
+        assert!(
+            blocked >= u64::try_from(budget.as_nanos() / 2).unwrap(),
+            "blocked {} ns for a capture budget of {:?}",
+            blocked,
+            budget
+        );
     }
 
     /// With signposts on, a parse batch opens a "parse batch" interval and a

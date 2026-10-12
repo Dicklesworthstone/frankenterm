@@ -1865,11 +1865,13 @@ mod tests {
 
     /// ft-yccm0.2.2.3 acceptance: while another thread holds a local pane's
     /// terminal mutex for 500 ms, every terminal read paint makes for that
-    /// pane returns at once on the main thread. These are the published
+    /// pane returns without waiting out the holder. These are the published
     /// facts (the IME caret, the padding background, splits, the Metal
     /// clear color), the frame capture with its fallback to the frame last
     /// painted, the scroll bar (from the drawn frame) and the selection
-    /// stamp after rendering. The M.4 ledger records no main-thread wait.
+    /// stamp after rendering. Only the capture waits, for its bounded budget
+    /// (ft-5ca68), and the M.4 ledger counts that wait as main-thread
+    /// blocking.
     #[test]
     fn paint_never_waits_for_a_terminal_another_thread_holds() {
         use frankenterm_alloc::resource_ledger::TerminalLockLedger;
@@ -1937,11 +1939,15 @@ mod tests {
         );
         assert!(stamp.is_none(), "the busy selection stamp is skipped");
         assert_eq!(facts.dimensions, dims);
-        assert_eq!(
-            after.main_thread_blocked_waits, before.main_thread_blocked_waits,
-            "a paint read waited for the held terminal on the main thread"
-        );
+        // Bounds, not equalities: the ledger is process-wide, and a test on
+        // another thread named "main" may wait in the same window.
+        let blocked =
+            Duration::from_nanos(after.main_thread_blocked_ns - before.main_thread_blocked_ns);
         // Honest slack for a loaded debug build; any wait would be ~500 ms.
+        assert!(
+            blocked < Duration::from_millis(50),
+            "the main thread was blocked {blocked:?} while the terminal was held for {HOLD:?}"
+        );
         assert!(
             elapsed < Duration::from_millis(50),
             "paint's terminal reads took {elapsed:?} while the terminal was held for {HOLD:?}"
