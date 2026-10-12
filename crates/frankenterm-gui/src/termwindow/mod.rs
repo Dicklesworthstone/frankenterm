@@ -4960,6 +4960,15 @@ impl TermWindow {
                 myself.created(RenderContext::Glium(Rc::clone(&gl)))?;
             }
             if let Some(webgpu) = webgpu {
+                // The surface was configured with the size requested before
+                // the window existed. A resize that arrived while the renderer
+                // was initializing updated `dimensions` but found no surface,
+                // and the window can differ from the request (AppKit rounds to
+                // whole points: 471 px becomes 472). Later resizes to the same
+                // size are no-ops, so without this the surface stayed a pixel
+                // short and the layout was squeezed into it (ft-rsodi).
+                // `resize` does nothing when the sizes already match.
+                webgpu.resize(myself.dimensions);
                 myself.webgpu.replace(Rc::clone(&webgpu));
                 myself.created(RenderContext::WebGpu(Rc::clone(&webgpu)))?;
             }
