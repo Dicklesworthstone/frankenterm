@@ -3643,6 +3643,22 @@ mod deferred_scrollback {
         started.elapsed()
     }
 
+    /// The writer counts a batch after the store acknowledges it, a moment
+    /// after its rows become visible there. Returns the settled count.
+    #[cfg(test)]
+    fn wait_for_batches(sink: &DeferredScrollbackSpillSink, batches: u64) -> u64 {
+        let started = Instant::now();
+        while sink.committed_batches() < batches {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the writer acknowledged {} of {batches} batches",
+                sink.committed_batches()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        sink.committed_batches()
+    }
+
     #[test]
     fn commit_windows_gather_parse_batches_into_one_transaction() {
         let (store, sink) = windowed_sink(
@@ -3664,7 +3680,7 @@ mod deferred_scrollback {
         assert!(store.rows().is_empty(), "the window is still open");
         // The burst ends: the idle close commits it as one transaction.
         wait_for_rows(&store, 80);
-        assert_eq!(sink.committed_batches(), 1);
+        assert_eq!(wait_for_batches(&sink, 1), 1);
         let expected: Vec<_> = (0..80).map(|row| (row, GatedStore::text(row))).collect();
         assert_eq!(store.rows(), expected);
     }
@@ -3695,7 +3711,7 @@ mod deferred_scrollback {
         // The 16th row reaches the window bytes and closes the window.
         assert!(sink.store_scrollback_line(15, &GatedStore::line(15), 1 << 20));
         assert!(wait_for_rows(&store, 16) < Duration::from_secs(4));
-        assert_eq!(sink.committed_batches(), 1);
+        assert_eq!(wait_for_batches(&sink, 1), 1);
 
         // A pane close commits the open window at once.
         for row in 16..19 {
@@ -3706,7 +3722,7 @@ mod deferred_scrollback {
         assert_eq!(store.rows().len(), 16, "the new window is open");
         sink.request_scrollback_commit().unwrap();
         assert!(wait_for_rows(&store, 19) < Duration::from_secs(4));
-        assert_eq!(sink.committed_batches(), 2);
+        assert_eq!(wait_for_batches(&sink, 2), 2);
     }
 
     #[test]
@@ -3748,7 +3764,7 @@ mod deferred_scrollback {
             sink.request_scrollback_flush().unwrap();
             wait_for_rows(&store, row as usize + 1);
         }
-        assert_eq!(sink.committed_batches(), 3);
+        assert_eq!(wait_for_batches(&sink, 3), 3);
     }
 
     /// A failed assertion must also release a writer blocked in a test store.
@@ -3776,6 +3792,9 @@ mod deferred_scrollback {
             0x79,
         );
         assert!(sink.store_scrollback_line(0, &GatedStore::line(0), 64));
+        // The parser's handoff: the writer now holds its own reference, as
+        // whenever it checks a window. Without one the pane reads as closed.
+        sink.request_scrollback_flush().unwrap();
         let state = sink.state.lock().unwrap();
         let checking = sink.clone();
         let (sent, received) = std::sync::mpsc::sync_channel(1);
@@ -4239,8 +4258,18 @@ mod deferred_scrollback {
             assert!(failing.store_scrollback_line(row, &GatedStore::line(row), 64));
         }
         failing.request_scrollback_flush().unwrap();
+        // The degraded pane is exported through the resource snapshot that
+        // `ft doctor --json` reads (this pane id is unique to this test).
+        // The writer updates it just after the pane's own health.
+        let failing_label = uuid::Uuid::from_bytes([0x61; 16]).to_string();
+        let exported_degraded = || {
+            DurabilityLedger::global()
+                .snapshot()
+                .degraded_panes
+                .contains_key(&failing_label)
+        };
         let deadline = Instant::now() + Duration::from_secs(10);
-        while failing.durability_failure().is_none() {
+        while failing.durability_failure().is_none() || !exported_degraded() {
             assert!(
                 Instant::now() < deadline,
                 "the writer panic was not surfaced"
@@ -4248,12 +4277,7 @@ mod deferred_scrollback {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(failing.writer_panicked());
-        // The degraded pane is exported through the resource snapshot that
-        // `ft doctor --json` reads (this pane id is unique to this test).
-        let failing_label = uuid::Uuid::from_bytes([0x61; 16]).to_string();
-        let exported = DurabilityLedger::global().snapshot();
-        assert!(exported.degraded_panes.contains_key(&failing_label));
-        assert!(exported.writer_panics_total >= 1);
+        assert!(DurabilityLedger::global().snapshot().writer_panics_total >= 1);
         // The parser sees a degraded pane, never a panic, and keeps its rows.
         assert_eq!(
             failing.request_scrollback_flush(),
@@ -4295,13 +4319,13 @@ mod deferred_scrollback {
         }
         let expected: Vec<_> = (0..8).map(|row| (row, GatedStore::text(row))).collect();
         assert_eq!(failing_store.rows(), expected);
-        assert!(
-            !DurabilityLedger::global()
-                .snapshot()
-                .degraded_panes
-                .contains_key(&failing_label),
-            "a recovered pane leaves the exported degraded set"
-        );
+        while exported_degraded() {
+            assert!(
+                Instant::now() < deadline,
+                "a recovered pane leaves the exported degraded set"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
@@ -11703,10 +11727,16 @@ mod scrollback_crash_points {
         });
         if ARMED.lock().is_ok_and(|armed| *armed == Some(step)) {
             #[cfg(unix)]
-            let _ = rustix::process::kill_process(
-                rustix::process::getpid(),
-                rustix::process::Signal::KILL,
-            );
+            {
+                let _ = rustix::process::kill_process(
+                    rustix::process::getpid(),
+                    rustix::process::Signal::KILL,
+                );
+                // A SIGKILL sent to this process can take effect after kill
+                // returns (macOS under load). An immediate abort() then won
+                // the race and the child died of SIGABRT, so wait for it.
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            }
             std::process::abort();
         }
     }
