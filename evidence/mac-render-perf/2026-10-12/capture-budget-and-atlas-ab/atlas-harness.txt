@@ -1,0 +1,37 @@
+22:39:14.461Z run directory /Users/jemanuel/ft-build/capture-ab/atlas-harness; argv --gui-bin /Users/jemanuel/ft-build/capture-ab/frankenterm-gui --ft-bin /Users/jemanuel/ft-staging/5351e/app/FrankenTerm.app/Contents/MacOS/ft --corpus-file /Users/jemanuel/color-emoji-random.bin --no-fps --no-beachball-probe --baseline ft --baseline-ft-lua 'config.glyph_atlas_initial_size = 128' --reps 3 --out /Users/jemanuel/ft-build/capture-ab/atlas-harness
+22:39:14.703Z preflight: screen capture False, accessibility False
+22:39:14.706Z display refresh 60 Hz; FrankenTerm max_fps 120 (throttle 8.333334 ms, within one refresh period)
+22:39:14.721Z hashing /Users/jemanuel/color-emoji-random.bin (read-only)
+22:39:15.031Z corpus T0 color_emoji_random: /Users/jemanuel/color-emoji-random.bin (749801000 bytes, sha256 a442d89593da3bbfd1d059e186b999387098c2aa7d8d4a8df88f47b811c43767)
+22:39:15.797Z isolation probe: no mux visible under the harness environment (ft exit 1)
+22:39:15.806Z launch ft: /Users/jemanuel/ft-build/capture-ab/frankenterm-gui --config-file /Users/jemanuel/ft-build/capture-ab/atlas-harness/runs/00-ft/frankenterm.lua start --always-new-process -- /bin/zsh -f /Users/jemanuel/ft-build/capture-ab/atlas-harness/pane.zsh measure /Users/jemanuel/ft-build/capture-ab/atlas-harness/runs/00-ft /Users/jemanuel/color-emoji-random.bin 1 /opt/homebrew/opt/python@3.14/bin/python3.14 /Users/jemanuel/ft-build/capture-ab/atlas-harness/width_probe.py ftgt-atlas-harness-00-ft
+22:39:16.454Z run 0 ft: terminal pid 18539, pane shell pid 18638
+22:39:19.495Z run 0 ft: go (load [40.5, 75.31, 91.56])
+22:39:34.017Z cat pid 19283: 58 offset samples, drain 14.396 s
+22:39:39.429Z launch ft_baseline: /Users/jemanuel/ft-build/capture-ab/frankenterm-gui --config-file /Users/jemanuel/ft-build/capture-ab/atlas-harness/runs/01-ft_baseline/frankenterm.lua start --always-new-process -- /bin/zsh -f /Users/jemanuel/ft-build/capture-ab/atlas-harness/pane.zsh measure /Users/jemanuel/ft-build/capture-ab/atlas-harness/runs/01-ft_baseline /Users/jemanuel/color-emoji-random.bin 1 /opt/homebrew/opt/python@3.14/bin/python3.14 /Users/jemanuel/ft-build/capture-ab/atlas-harness/width_probe.py ftgt-atlas-harness-01-ft_baseline
+22:39:39.877Z run 1 ft_baseline: terminal pid 26283, pane shell pid 26336
+22:39:42.906Z run 1 ft_baseline: go (load [40.46, 72.98, 90.35])
+22:40:03.497Z cat pid 27336: 82 offset samples, drain 20.396 s
+22:40:10.513Z launch ft_baseline: /Users/jemanuel/ft-build/capture-ab/frankenterm-gui --config-file /Users/jemanuel/ft-build/capture-ab/atlas-harness/runs/02-ft_baseline/frankenterm.lua start --always-new-process -- /bin/zsh -f /Users/jemanuel/ft-build/capture-ab/atlas-harness/pane.zsh measure /Users/jemanuel/ft-build/capture-ab/atlas-harness/runs/02-ft_baseline /Users/jemanuel/color-emoji-random.bin 0 /opt/homebrew/opt/python@3.14/bin/python3.14 /Users/jemanuel/ft-build/capture-ab/atlas-harness/width_probe.py ftgt-atlas-harness-02-ft_baseline
+22:40:10.995Z run 2 ft_baseline: terminal pid 36127, pane shell pid 36141
+22:40:14.036Z run 2 ft_baseline: go (load [39.08, 69.11, 88.24])
+22:40:31.834Z cat pid 36658: 71 offset samples, drain 17.750 s
+22:40:36.525Z launch ft: /Users/jemanuel/ft-build/capture-ab/frankenterm-gui --config-file /Users/jemanuel/ft-build/capture-ab/atlas-harness/runs/03-ft/frankenterm.lua start --always-new-process -- /bin/zsh -f /Users/jemanuel/ft-build/capture-ab/atlas-harness/pane.zsh measure /Users/jemanuel/ft-build/capture-ab/atlas-harness/runs/03-ft /Users/jemanuel/color-emoji-random.bin 0 /opt/homebrew/opt/python@3.14/bin/python3.14 /Users/jemanuel/ft-build/capture-ab/atlas-harness/width_probe.py ftgt-atlas-harness-03-ft
+22:40:36.883Z run 3 ft: terminal pid 42614, pane shell pid 42627
+22:40:39.904Z run 3 ft: go (load [37.45, 66.3, 86.67])
+22:40:58.314Z cat pid 43431: 74 offset samples, drain 18.371 s
+22:41:03.030Z launch ft: /Users/jemanuel/ft-build/capture-ab/frankenterm-gui --config-file /Users/jemanuel/ft-build/capture-ab/atlas-harness/runs/04-ft/frankenterm.lua start --always-new-process -- /bin/zsh -f /Users/jemanuel/ft-build/capture-ab/atlas-harness/pane.zsh measure /Users/jemanuel/ft-build/capture-ab/atlas-harness/runs/04-ft /Users/jemanuel/color-emoji-random.bin 0 /opt/homebrew/opt/python@3.14/bin/python3.14 /Users/jemanuel/ft-build/capture-ab/atlas-harness/width_probe.py ftgt-atlas-harness-04-ft
+22:41:03.460Z run 4 ft: terminal pid 50752, pane shell pid 50875
+22:41:06.476Z run 4 ft: go (load [50.24, 67.58, 86.58])
+22:41:19.910Z cat pid 51352: 54 offset samples, drain 13.375 s
+22:41:23.841Z launch ft_baseline: /Users/jemanuel/ft-build/capture-ab/frankenterm-gui --config-file /Users/jemanuel/ft-build/capture-ab/atlas-harness/runs/05-ft_baseline/frankenterm.lua start --always-new-process -- /bin/zsh -f /Users/jemanuel/ft-build/capture-ab/atlas-harness/pane.zsh measure /Users/jemanuel/ft-build/capture-ab/atlas-harness/runs/05-ft_baseline /Users/jemanuel/color-emoji-random.bin 0 /opt/homebrew/opt/python@3.14/bin/python3.14 /Users/jemanuel/ft-build/capture-ab/atlas-harness/width_probe.py ftgt-atlas-harness-05-ft_baseline
+22:41:24.196Z run 5 ft_baseline: terminal pid 56445, pane shell pid 56488
+22:41:27.261Z run 5 ft_baseline: go (load [45.33, 65.38, 85.35])
+22:41:41.170Z cat pid 56870: 55 offset samples, drain 13.762 s
+T0 color_emoji_random 749801000 bytes, load at go [[40.5, 75.31, 91.56], [40.46, 72.98, 90.35], [39.08, 69.11, 88.24], [37.45, 66.3, 86.67], [50.24, 67.58, 86.58], [45.33, 65.38, 85.35]]
+  ft: time total 14.464 s, FPS unavailable, beach balls 0
+  ft_baseline: time total 17.772 s, FPS unavailable, beach balls 0
+  drain verdict: NO_ADMISSIBLE_RATIO (ft total_s CV 17.1% > 5.0%; ft_baseline total_s CV 19.2% > 5.0%)
+  FPS verdict:   NO_ADMISSIBLE_RATIO (FPS not measured (--no-fps); ft has no mean_fps values; ft_baseline has no mean_fps values)
+  width parity:  0 disagreement(s) over 1376 codepoints
+receipt: /Users/jemanuel/ft-build/capture-ab/atlas-harness/receipt.json
