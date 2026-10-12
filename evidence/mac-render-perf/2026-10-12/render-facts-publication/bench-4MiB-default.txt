@@ -1,0 +1,66 @@
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.76s
+     Running benches/render_facts_publication.rs (/Users/jemanuel/cargo-targets/ft-5351-bench/release/build/mux/d59bcd7acc655773/out/render_facts_publication-d59bcd7acc655773)
+[BENCH] {"bench":"render_facts_publication","bead":"ft-yccm0.2.2.1","path":"actions","corpus":"color_emoji_random","corpus_bytes":4194304,"seed":20261005,"batch_bytes":4096,"reads":1024,"pairs":10,"publish_median_ms":16.189,"skip_median_ms":15.453,"publish_cv_pct":46.01,"skip_cv_pct":6.40,"overhead_pct":4.766,"paired_median_overhead_pct":2.684,"threshold_pct":1,"verdict":"NO_ADMISSIBLE_RATIO (CV publish 46.01% / skip 6.40% > 5%)","load_avg_before":"{ 19.38 44.12 81.35 }","load_avg_after":"{ 19.38 44.12 81.35 }"}
+[BENCH] {"bench":"render_facts_publication","bead":"ft-yccm0.2.2.1","path":"actions","corpus":"color_emoji_random","corpus_bytes":4194304,"seed":20261005,"batch_bytes":131072,"reads":32,"pairs":10,"publish_median_ms":15.854,"skip_median_ms":15.617,"publish_cv_pct":5.22,"skip_cv_pct":4.38,"overhead_pct":1.513,"paired_median_overhead_pct":2.674,"threshold_pct":1,"verdict":"NO_ADMISSIBLE_RATIO (CV publish 5.22% / skip 4.38% > 5%)","load_avg_before":"{ 19.38 44.12 81.35 }","load_avg_after":"{ 19.38 44.12 81.35 }"}
+[BENCH] {"bench":"render_facts_publication","bead":"ft-yccm0.2.2.1","path":"fused","corpus":"color_emoji_random","corpus_bytes":4194304,"seed":20261005,"batch_bytes":4096,"reads":1024,"pairs":10,"publish_median_ms":13.735,"skip_median_ms":13.405,"publish_cv_pct":7.87,"skip_cv_pct":10.07,"overhead_pct":2.463,"paired_median_overhead_pct":1.390,"threshold_pct":1,"verdict":"NO_ADMISSIBLE_RATIO (CV publish 7.87% / skip 10.07% > 5%)","load_avg_before":"{ 19.38 44.12 81.35 }","load_avg_after":"{ 19.38 44.12 81.35 }"}
+[BENCH] {"bench":"render_facts_publication","bead":"ft-yccm0.2.2.1","path":"fused","corpus":"color_emoji_random","corpus_bytes":4194304,"seed":20261005,"batch_bytes":131072,"reads":32,"pairs":10,"publish_median_ms":12.775,"skip_median_ms":12.659,"publish_cv_pct":8.83,"skip_cv_pct":1.56,"overhead_pct":0.913,"paired_median_overhead_pct":1.082,"threshold_pct":1,"verdict":"NO_ADMISSIBLE_RATIO (CV publish 8.83% / skip 1.56% > 5%)","load_avg_before":"{ 19.38 44.12 81.35 }","load_avg_after":"{ 19.38 44.12 81.35 }"}
+Gnuplot not found, using plotters backend
+Benchmarking render_facts_publication/publish/actions_batch_4KiB
+Benchmarking render_facts_publication/publish/actions_batch_4KiB: Warming up for 3.0000 s
+Benchmarking render_facts_publication/publish/actions_batch_4KiB: Collecting 10 samples in estimated 5.7895 s (330 iterations)
+Benchmarking render_facts_publication/publish/actions_batch_4KiB: Analyzing
+render_facts_publication/publish/actions_batch_4KiB
+                        time:   [15.401 ms 15.562 ms 15.855 ms]
+                        thrpt:  [252.29 MiB/s 257.04 MiB/s 259.73 MiB/s]
+Benchmarking render_facts_publication/skip/actions_batch_4KiB
+Benchmarking render_facts_publication/skip/actions_batch_4KiB: Warming up for 3.0000 s
+Benchmarking render_facts_publication/skip/actions_batch_4KiB: Collecting 10 samples in estimated 5.6878 s (330 iterations)
+Benchmarking render_facts_publication/skip/actions_batch_4KiB: Analyzing
+render_facts_publication/skip/actions_batch_4KiB
+                        time:   [15.405 ms 15.603 ms 15.743 ms]
+                        thrpt:  [254.09 MiB/s 256.37 MiB/s 259.66 MiB/s]
+Benchmarking render_facts_publication/publish/actions_batch_128KiB
+Benchmarking render_facts_publication/publish/actions_batch_128KiB: Warming up for 3.0000 s
+Benchmarking render_facts_publication/publish/actions_batch_128KiB: Collecting 10 samples in estimated 5.7907 s (330 iterations)
+Benchmarking render_facts_publication/publish/actions_batch_128KiB: Analyzing
+render_facts_publication/publish/actions_batch_128KiB
+                        time:   [15.408 ms 15.485 ms 15.602 ms]
+                        thrpt:  [256.37 MiB/s 258.31 MiB/s 259.60 MiB/s]
+Benchmarking render_facts_publication/skip/actions_batch_128KiB
+Benchmarking render_facts_publication/skip/actions_batch_128KiB: Warming up for 3.0000 s
+Benchmarking render_facts_publication/skip/actions_batch_128KiB: Collecting 10 samples in estimated 5.5422 s (330 iterations)
+Benchmarking render_facts_publication/skip/actions_batch_128KiB: Analyzing
+render_facts_publication/skip/actions_batch_128KiB
+                        time:   [14.682 ms 14.916 ms 15.140 ms]
+                        thrpt:  [264.21 MiB/s 268.17 MiB/s 272.45 MiB/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking render_facts_publication/publish/fused_batch_4KiB
+Benchmarking render_facts_publication/publish/fused_batch_4KiB: Warming up for 3.0000 s
+Benchmarking render_facts_publication/publish/fused_batch_4KiB: Collecting 10 samples in estimated 5.5853 s (385 iterations)
+Benchmarking render_facts_publication/publish/fused_batch_4KiB: Analyzing
+render_facts_publication/publish/fused_batch_4KiB
+                        time:   [13.867 ms 14.437 ms 14.809 ms]
+                        thrpt:  [270.11 MiB/s 277.06 MiB/s 288.46 MiB/s]
+Benchmarking render_facts_publication/skip/fused_batch_4KiB
+Benchmarking render_facts_publication/skip/fused_batch_4KiB: Warming up for 3.0000 s
+Benchmarking render_facts_publication/skip/fused_batch_4KiB: Collecting 10 samples in estimated 5.8304 s (385 iterations)
+Benchmarking render_facts_publication/skip/fused_batch_4KiB: Analyzing
+render_facts_publication/skip/fused_batch_4KiB
+                        time:   [14.053 ms 14.248 ms 14.520 ms]
+                        thrpt:  [275.49 MiB/s 280.75 MiB/s 284.65 MiB/s]
+Benchmarking render_facts_publication/publish/fused_batch_128KiB
+Benchmarking render_facts_publication/publish/fused_batch_128KiB: Warming up for 3.0000 s
+Benchmarking render_facts_publication/publish/fused_batch_128KiB: Collecting 10 samples in estimated 5.3581 s (385 iterations)
+Benchmarking render_facts_publication/publish/fused_batch_128KiB: Analyzing
+render_facts_publication/publish/fused_batch_128KiB
+                        time:   [13.565 ms 13.775 ms 13.918 ms]
+                        thrpt:  [287.40 MiB/s 290.38 MiB/s 294.89 MiB/s]
+Benchmarking render_facts_publication/skip/fused_batch_128KiB
+Benchmarking render_facts_publication/skip/fused_batch_128KiB: Warming up for 3.0000 s
+Benchmarking render_facts_publication/skip/fused_batch_128KiB: Collecting 10 samples in estimated 5.5451 s (385 iterations)
+Benchmarking render_facts_publication/skip/fused_batch_128KiB: Analyzing
+render_facts_publication/skip/fused_batch_128KiB
+                        time:   [13.050 ms 13.205 ms 13.394 ms]
+                        thrpt:  [298.64 MiB/s 302.92 MiB/s 306.51 MiB/s]
+
