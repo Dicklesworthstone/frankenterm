@@ -168,6 +168,10 @@ std::thread_local! {
     static LIVE_SCROLLBACK_RECORD_BYTES_APPENDED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_BYTES_HASHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_RECORD_BYTES_READ_BACK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Exercise the real publication trigger with a small bounded fixture.
+    static LIVE_SCROLLBACK_PUBLICATION_BYTE_THRESHOLD: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(LIVE_SCROLLBACK_CUMULATIVE_WAL_MAX_RECORD_BYTES / 2)
+    };
 }
 
 /// Add `bytes` to one of this thread's byte counters (ft-y0gy9).
@@ -787,22 +791,43 @@ mod deferred_scrollback {
             }
             // An open commit window keeps gathering rows; `scheduled` stays
             // set, so further requests do not queue the sink again.
-            let window = sink.commit_window(Instant::now());
-            match window {
-                CommitWindow::Open { closes_at } => {
-                    self.lock_queue().windows.push((closes_at, sink));
-                    return;
+            loop {
+                match sink.commit_window(Instant::now()) {
+                    CommitWindow::Open { .. } => {
+                        let mut queue = self.lock_queue();
+                        // Pair the final decision with parking. A concurrent
+                        // commit either closes this check or finds the parked
+                        // sink when it expedites. Contention retries outside
+                        // the queue lock without closing a fresh window.
+                        match sink.try_commit_window(Instant::now()) {
+                            Some(CommitWindow::Open { closes_at }) => {
+                                queue.windows.push((closes_at, sink));
+                                return;
+                            }
+                            Some(CommitWindow::Closed(_)) => break,
+                            None => continue,
+                        }
+                    }
+                    CommitWindow::Closed(reason) => {
+                        log::debug!(
+                            target: "mux::scrollback_durability",
+                            "pane={} commit window closed: {reason}",
+                            sink.pane_label
+                        );
+                        break;
+                    }
                 }
-                CommitWindow::Closed(reason) => log::debug!(
-                    target: "mux::scrollback_durability",
-                    "pane={} commit window closed: {reason}",
-                    sink.pane_label
-                ),
             }
             // Clear before draining: a row admitted during this drain
             // schedules another pass instead of waiting for the next batch.
             sink.scheduled.store(false, Ordering::Release);
-            if sink.drain_scheduled().is_ok() {
+            if sink.drain_scheduled(DrainMode::Scheduled).is_ok() {
+                // A turn never chases arrivals behind its captured batch.
+                // Re-enter the policy and the shared FIFO for the remainder,
+                // including a commit request whose rows are already durable.
+                if sink.needs_service() {
+                    sink.schedule();
+                }
                 return;
             }
             let retry_at = sink.retry_not_before().unwrap_or_else(Instant::now);
@@ -831,6 +856,7 @@ mod deferred_scrollback {
         line: Arc<Line>,
         retention: usize,
         charged_bytes: usize,
+        admitted_at: Instant,
     }
 
     /// How every durability-gap marker row begins. Output can print it too,
@@ -895,6 +921,19 @@ mod deferred_scrollback {
         Closed(&'static str),
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum DrainMode {
+        Scheduled,
+        Flush,
+    }
+
+    /// Publish after all rows admitted through this frontier are durable.
+    /// `None` is a request to publish an empty queue, not no request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct CommitRequest {
+        through: Option<StableRowIndex>,
+    }
+
     impl Pending {
         fn start(&self) -> StableRowIndex {
             match self {
@@ -943,6 +982,13 @@ mod deferred_scrollback {
         window_opened: Option<Instant>,
         /// When the newest row was admitted, for the idle close.
         last_admitted: Option<Instant>,
+        /// An explicit commit survives partial acknowledgements and failed
+        /// publication. New arrivals and later requests cannot move the
+        /// earliest outstanding frontier.
+        commit_requested: Option<CommitRequest>,
+        /// Later requests coalesce here while the earliest frontier finishes,
+        /// so repeated close/flush requests cannot keep moving its goal.
+        commit_followup: Option<CommitRequest>,
         // An acknowledged suffix, transferred from pending without cloning or
         // serializing cells. First reflow can read its cold/hot boundary here.
         // Uses the same cell/text charge as pending, not a total heap estimate.
@@ -977,8 +1023,6 @@ mod deferred_scrollback {
         progress_signal: Condvar,
         health: Mutex<WriterHealth>,
         committed_batches: AtomicU64,
-        /// A close (or explicit commit request) ends the open commit window.
-        commit_now: AtomicBool,
     }
 
     impl State {
@@ -998,6 +1042,8 @@ mod deferred_scrollback {
                 shedding: false,
                 window_opened: None,
                 last_admitted: None,
+                commit_requested: None,
+                commit_followup: None,
                 cached: VecDeque::new(),
                 cached_bytes: 0,
                 durable_bytes,
@@ -1204,7 +1250,6 @@ mod deferred_scrollback {
                 progress_signal: Condvar::new(),
                 health: Mutex::new(WriterHealth::default()),
                 committed_batches: AtomicU64::new(0),
-                commit_now: AtomicBool::new(false),
             }))
         }
 
@@ -1340,9 +1385,24 @@ mod deferred_scrollback {
         /// Whether the writer should commit this sink's queued rows now
         /// (ft-yccm0.2.1.2), or when its open commit window closes.
         fn commit_window(&self, now: Instant) -> CommitWindow {
-            if self.commit_now.load(Ordering::Acquire) {
-                return CommitWindow::Closed("commit requested");
+            let Ok(state) = self.state.lock() else {
+                return CommitWindow::Closed("state unavailable");
+            };
+            self.commit_window_for_state(now, &state)
+        }
+
+        /// The final parking check owns the global writer queue. A clear or
+        /// replacement can hold state across storage IO, so contention must
+        /// retry outside that queue instead of waiting or forcing a commit.
+        fn try_commit_window(&self, now: Instant) -> Option<CommitWindow> {
+            match self.state.try_lock() {
+                Ok(state) => Some(self.commit_window_for_state(now, &state)),
+                Err(TryLockError::WouldBlock) => None,
+                Err(TryLockError::Poisoned(_)) => Some(CommitWindow::Closed("state unavailable")),
             }
+        }
+
+        fn commit_window_for_state(&self, now: Instant, state: &State) -> CommitWindow {
             if self.self_ref.strong_count() <= 1 {
                 return CommitWindow::Closed("pane closed");
             }
@@ -1353,9 +1413,9 @@ mod deferred_scrollback {
             if self.writer.queued_bytes() >= self.writer.queue_budget() / 2 {
                 return CommitWindow::Closed("queue pressure");
             }
-            let Ok(state) = self.state.lock() else {
-                return CommitWindow::Closed("state unavailable");
-            };
+            if state.commit_requested.is_some() {
+                return CommitWindow::Closed("commit requested");
+            }
             if state.pending.is_empty() {
                 return CommitWindow::Closed("nothing queued");
             }
@@ -1383,10 +1443,97 @@ mod deferred_scrollback {
             }
         }
 
-        /// One drain by the writer or an explicit flush. The outcome is
-        /// recorded under the gate, so a stale failure can never overwrite a
-        /// later drain's recovery. Panics are contained here.
-        fn drain_scheduled(&self) -> Result<(), ScrollbackSpillError> {
+        fn needs_service(&self) -> bool {
+            self.pending_rows.load(Ordering::Acquire) != 0
+                || self
+                    .state
+                    .try_lock()
+                    // A destructive operation may own state during IO. A
+                    // conservative extra turn is preferable to blocking the
+                    // parser or missing an outstanding publication request.
+                    .map_or(true, |state| state.commit_requested.is_some())
+        }
+
+        /// Called under drain_gate for a synchronous flush or a closed pane,
+        /// and directly for an asynchronous commit request. Admission and
+        /// destructive replacement share state, so the frontier belongs to
+        /// exactly the currently retained lineage.
+        fn request_commit(&self) -> Result<CommitRequest, ScrollbackSpillError> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            let request = CommitRequest {
+                through: state.newest_exclusive,
+            };
+            match state.commit_requested {
+                Some(pending) if request.through > pending.through => {
+                    state.commit_followup = Some(request);
+                }
+                Some(_) => {}
+                None => state.commit_requested = Some(request),
+            }
+            Ok(request)
+        }
+
+        /// The caller holds drain_gate. Publish a satisfied request without
+        /// holding state across storage IO; a later, larger request remains
+        /// pending, and a failed publication never consumes the request.
+        fn publish_requested_commit(
+            &self,
+            captured: Option<CommitRequest>,
+        ) -> Result<(), ScrollbackSpillError> {
+            let publish = {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+                if state.publication_uncertain {
+                    return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
+                }
+                let satisfied = |request: &CommitRequest| {
+                    request.through.is_none_or(|through| {
+                        state
+                            .pending
+                            .front()
+                            .is_none_or(|front| front.start() >= through)
+                    })
+                };
+                captured.as_ref().is_some_and(satisfied)
+                    || state.commit_requested.as_ref().is_some_and(satisfied)
+            };
+            if publish {
+                self.backing.flush_scrollback()?;
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+                if state.commit_requested.is_some_and(|request| {
+                    request.through.is_none_or(|through| {
+                        state
+                            .pending
+                            .front()
+                            .is_none_or(|front| front.start() >= through)
+                    })
+                }) {
+                    let followup = state.commit_followup.take();
+                    state.commit_requested = followup.filter(|request| {
+                        request.through.is_some_and(|through| {
+                            state
+                                .pending
+                                .front()
+                                .is_some_and(|front| front.start() < through)
+                        })
+                    });
+                }
+            }
+            Ok(())
+        }
+
+        /// One bounded writer turn, or an explicit flush through a captured
+        /// frontier. The outcome is recorded under the gate, so a stale
+        /// failure cannot overwrite a later recovery. Panics are contained.
+        fn drain_scheduled(&self, mode: DrainMode) -> Result<(), ScrollbackSpillError> {
             // The gate guards no data: pending-row invariants live in state,
             // which is never held across backing IO by a drain. A drain that
             // panicked left every unacknowledged row pending, and the backing
@@ -1395,19 +1542,38 @@ mod deferred_scrollback {
                 .drain_gate
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            // This drain empties the queue, which closes the window. A commit
-            // request or a closed pane also publishes the backing's manifest
-            // (ft-yccm0.2.1.2).
-            let publish =
-                self.commit_now.swap(false, Ordering::AcqRel) || self.self_ref.strong_count() <= 1;
             let outcome = frankenterm_sigpipe::catch_recoverable(
                 frankenterm_sigpipe::RecoverablePanicSite::StorageWriter,
                 std::panic::AssertUnwindSafe(|| -> Result<(), ScrollbackSpillError> {
-                    self.drain()?;
-                    if publish {
-                        self.backing.flush_scrollback()?;
+                    let flush_request = if mode == DrainMode::Flush {
+                        Some(self.request_commit()?)
+                    } else {
+                        None
+                    };
+                    if self.self_ref.strong_count() <= 1 {
+                        self.request_commit()?;
                     }
-                    Ok(())
+                    let (through, request) = {
+                        let state = self
+                            .state
+                            .lock()
+                            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+                        // A synchronous flush owns its captured newest
+                        // frontier even when an older asynchronous request
+                        // is still pending.
+                        let request = flush_request.or(state.commit_requested);
+                        let through =
+                            request.map_or(state.newest_exclusive, |request| request.through);
+                        (through, request)
+                    };
+                    self.drain_through(through, mode == DrainMode::Scheduled)?;
+                    // The pane may close while the captured write is in
+                    // flight. Keep its remaining rows and publication alive
+                    // across subsequent finite writer turns.
+                    if self.self_ref.strong_count() <= 1 {
+                        self.request_commit()?;
+                    }
+                    self.publish_requested_commit(request)
                 }),
             );
             let (error, panicked) = match outcome {
@@ -1452,9 +1618,24 @@ mod deferred_scrollback {
                 .checked_add(line.visible_text_bytes()?)
         }
 
-        /// The caller holds operation. Never hold state across backing IO.
+        /// The caller holds drain_gate. Snapshot callers also hold operation,
+        /// so their captured frontier is the entire admitted queue. Never hold
+        /// state across backing IO.
         fn drain(&self) -> Result<(), ScrollbackSpillError> {
-            let result = self.drain_entries();
+            let through = self
+                .state
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
+                .newest_exclusive;
+            self.drain_through(through, false)
+        }
+
+        fn drain_through(
+            &self,
+            through: Option<StableRowIndex>,
+            one_batch: bool,
+        ) -> Result<(), ScrollbackSpillError> {
+            let result = self.drain_entries(through, one_batch);
             if let Ok(mut state) = self.state.lock() {
                 // Nothing is in flight between drains, whatever the outcome.
                 state.in_flight = 0;
@@ -1462,7 +1643,11 @@ mod deferred_scrollback {
             result
         }
 
-        fn drain_entries(&self) -> Result<(), ScrollbackSpillError> {
+        fn drain_entries(
+            &self,
+            through: Option<StableRowIndex>,
+            one_batch: bool,
+        ) -> Result<(), ScrollbackSpillError> {
             enum Next {
                 Rows {
                     stable_row: StableRowIndex,
@@ -1476,6 +1661,11 @@ mod deferred_scrollback {
                     store_row: StableRowIndex,
                 },
             }
+            // An empty captured frontier never includes a later arrival.
+            let Some(through) = through else {
+                return Ok(());
+            };
+            let window_bytes = self.writer.commit_policy().window_bytes;
             loop {
                 let next = {
                     let mut state = self
@@ -1489,17 +1679,29 @@ mod deferred_scrollback {
                     let skip = state.store_skip();
                     let next = match state.pending.front() {
                         None => None,
+                        Some(front) if front.start() >= through => None,
                         Some(Pending::Gap(gap)) => Some(Next::Gap {
                             gap: *gap,
                             store_row: gap.start - skip,
                         }),
                         Some(Pending::Row(first)) => {
+                            let mut bytes = 0usize;
                             let lines: Vec<_> = state
                                 .pending
                                 .iter()
                                 .take(MAX_BATCH_ROWS)
                                 .map_while(|entry| match entry {
-                                    Pending::Row(row) if row.retention == first.retention => {
+                                    Pending::Row(row)
+                                        if row.retention == first.retention
+                                            && row.stable_row < through
+                                            // A single row is indivisible;
+                                            // otherwise a turn respects the
+                                            // configured window byte target.
+                                            && (bytes == 0
+                                                || row.charged_bytes
+                                                    <= window_bytes.saturating_sub(bytes)) =>
+                                    {
+                                        bytes = bytes.saturating_add(row.charged_bytes);
                                         Some(Arc::clone(&row.line))
                                     }
                                     _ => None,
@@ -1540,6 +1742,9 @@ mod deferred_scrollback {
                         retention,
                     }) => self.write_rows(stable_row, store_row, lines, cached, retention)?,
                 }
+                if one_batch {
+                    return Ok(());
+                }
             }
         }
 
@@ -1576,9 +1781,10 @@ mod deferred_scrollback {
                 _ => return Err(ScrollbackSpillError::SnapshotRowMissing),
             }
             state.in_flight = 0;
-            if state.pending.is_empty() {
-                state.window_opened = None;
-            }
+            state.window_opened = state.pending.front().and_then(|entry| match entry {
+                Pending::Row(row) => Some(row.admitted_at),
+                Pending::Gap(_) => None,
+            });
             state.written_gaps.push_back(gap);
             state.prune_written_gaps(store_oldest);
             // The cached suffix serves contiguous acknowledged rows only.
@@ -1654,9 +1860,10 @@ mod deferred_scrollback {
                 state.cache_acknowledged(row);
             }
             state.in_flight = 0;
-            if state.pending.is_empty() {
-                state.window_opened = None;
-            }
+            state.window_opened = state.pending.front().and_then(|entry| match entry {
+                Pending::Row(row) => Some(row.admitted_at),
+                Pending::Gap(_) => None,
+            });
             state.durable_bytes = durable_bytes;
             self.pending_rows
                 .store(state.pending.len(), Ordering::Release);
@@ -1860,6 +2067,7 @@ mod deferred_scrollback {
             };
             let was_empty = state.pending.is_empty();
             let was_full = window_full(state);
+            let now = Instant::now();
             if as_gap {
                 let at_unix_ms = unix_now_ms();
                 let span = GapSpan {
@@ -1886,13 +2094,13 @@ mod deferred_scrollback {
                     line: Arc::new(line.clone()),
                     retention,
                     charged_bytes: charge,
+                    admitted_at: now,
                 }));
                 state.pending_bytes += charge;
                 self.writer.charge(charge);
             }
             // The commit window opens with the first queued row; reaching a
             // size threshold closes it early (ft-yccm0.2.1.2).
-            let now = Instant::now();
             if was_empty {
                 state.window_opened = Some(now);
             }
@@ -2020,16 +2228,15 @@ mod deferred_scrollback {
             true
         }
 
-        /// Explicit sync point: drains on the calling thread, serialized with
-        /// the writer, and returns once every admitted row is durable and the
-        /// backing's manifest describes it.
+        /// Explicit sync point: serialized with the writer, capture the
+        /// admitted frontier and return once it is durable and published.
+        /// Concurrent later arrivals belong to a subsequent commit window.
         fn flush_scrollback(&self) -> Result<(), ScrollbackSpillError> {
-            self.commit_now.store(true, Ordering::Release);
-            self.drain_scheduled()
+            self.drain_scheduled(DrainMode::Flush)
         }
 
         fn request_scrollback_flush(&self) -> Result<(), ScrollbackSpillError> {
-            if self.pending_rows.load(Ordering::Acquire) != 0 {
+            if self.needs_service() {
                 self.schedule();
             }
             self.durability_failure().map_or(Ok(()), Err)
@@ -2037,10 +2244,12 @@ mod deferred_scrollback {
 
         /// Pane close: commit now rather than at the window's end.
         fn request_scrollback_commit(&self) -> Result<(), ScrollbackSpillError> {
-            self.commit_now.store(true, Ordering::Release);
-            let result = self.request_scrollback_flush();
+            self.request_commit()?;
+            // A queue can be empty while its durable tail still needs a
+            // manifest publication. Such a request also owns a writer turn.
+            self.schedule();
             self.writer.expedite(self);
-            result
+            self.durability_failure().map_or(Ok(()), Err)
         }
 
         fn await_scrollback_capacity(&self, timeout: Duration) -> ScrollbackCapacityWait {
@@ -2826,6 +3035,11 @@ mod deferred_scrollback {
     struct GateState {
         closed: bool,
         inside: usize,
+        entered_calls: usize,
+        allowed_calls: Option<usize>,
+        acknowledge_rows: Option<usize>,
+        published_frontiers: Vec<usize>,
+        fail_next_flush: bool,
         panic_on_store: bool,
         writer_thread: Option<String>,
         writer_qos: Option<procinfo::ThreadQos>,
@@ -2853,6 +3067,46 @@ mod deferred_scrollback {
 
         fn set_panic(&self, panic_on_store: bool) {
             self.gate.lock().unwrap().panic_on_store = panic_on_store;
+        }
+
+        fn allow_calls(&self, calls: usize) {
+            self.gate.lock().unwrap().allowed_calls = Some(calls);
+            self.gate_signal.notify_all();
+        }
+
+        fn wait_for_calls(&self, calls: usize) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut gate = self.gate.lock().unwrap();
+            while gate.entered_calls < calls {
+                let now = Instant::now();
+                assert!(now < deadline, "the writer never entered call {calls}");
+                gate = self
+                    .gate_signal
+                    .wait_timeout(gate, deadline - now)
+                    .unwrap()
+                    .0;
+            }
+        }
+
+        fn wait_for_publications(&self, count: usize) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut gate = self.gate.lock().unwrap();
+            while gate.published_frontiers.len() < count {
+                let now = Instant::now();
+                assert!(
+                    now < deadline,
+                    "the writer never published frontier {count}"
+                );
+                gate = self
+                    .gate_signal
+                    .wait_timeout(gate, deadline - now)
+                    .unwrap()
+                    .0;
+            }
+        }
+
+        fn published_frontiers(&self) -> Vec<usize> {
+            self.gate.lock().unwrap().published_frontiers.clone()
         }
 
         fn inside(&self) -> usize {
@@ -2903,7 +3157,7 @@ mod deferred_scrollback {
             lines: &[Line],
             _retention: usize,
         ) -> usize {
-            {
+            let acknowledged = {
                 let mut gate = self.gate.lock().unwrap();
                 gate.writer_thread = std::thread::current().name().map(str::to_owned);
                 gate.writer_qos = procinfo::current_thread_qos();
@@ -2912,23 +3166,39 @@ mod deferred_scrollback {
                     panic!("injected scrollback store panic");
                 }
                 gate.inside += 1;
+                gate.entered_calls += 1;
+                let call = gate.entered_calls;
                 self.gate_signal.notify_all();
-                while gate.closed {
+                while gate.closed || gate.allowed_calls.is_some_and(|allowed| call > allowed) {
                     gate = self.gate_signal.wait(gate).unwrap();
                 }
                 gate.inside -= 1;
-            }
+                gate.acknowledge_rows
+                    .unwrap_or(lines.len())
+                    .min(lines.len())
+            };
             let mut rows = self.rows.lock().unwrap();
             if rows.last().is_some_and(|(last, _)| last + 1 != first) {
                 return 0;
             }
-            for (offset, line) in lines.iter().enumerate() {
+            for (offset, line) in lines.iter().take(acknowledged).enumerate() {
                 rows.push((
                     first + offset as StableRowIndex,
                     line.as_str().trim_end().to_string(),
                 ));
             }
-            lines.len()
+            acknowledged
+        }
+
+        fn flush_scrollback(&self) -> Result<(), ScrollbackSpillError> {
+            let frontier = self.rows.lock().unwrap().len();
+            let mut gate = self.gate.lock().unwrap();
+            if std::mem::take(&mut gate.fail_next_flush) {
+                return Err(ScrollbackSpillError::StorageUnavailable);
+            }
+            gate.published_frontiers.push(frontier);
+            self.gate_signal.notify_all();
+            Ok(())
         }
 
         fn load_scrollback_line(&self, stable_row: StableRowIndex) -> Option<Line> {
@@ -3479,6 +3749,345 @@ mod deferred_scrollback {
             wait_for_rows(&store, row as usize + 1);
         }
         assert_eq!(sink.committed_batches(), 3);
+    }
+
+    /// A failed assertion must also release a writer blocked in a test store.
+    #[cfg(test)]
+    struct ReleaseGatedStores(Vec<Arc<GatedStore>>);
+
+    #[cfg(test)]
+    impl Drop for ReleaseGatedStores {
+        fn drop(&mut self) {
+            for store in &self.0 {
+                store.set_closed(false);
+                store.allow_calls(usize::MAX);
+            }
+        }
+    }
+
+    #[test]
+    fn window_eligibility_does_not_wait_on_state_held_by_a_destructive_operation() {
+        let (_store, sink) = windowed_sink(
+            CommitPolicy {
+                window: Duration::from_secs(120),
+                idle: Duration::from_secs(120),
+                ..CommitPolicy::default()
+            },
+            0x79,
+        );
+        assert!(sink.store_scrollback_line(0, &GatedStore::line(0), 64));
+        let state = sink.state.lock().unwrap();
+        let checking = sink.clone();
+        let (sent, received) = std::sync::mpsc::sync_channel(1);
+        let checker = std::thread::spawn(move || {
+            let _queue = checking.writer.shared.lock_queue();
+            sent.send(checking.try_commit_window(Instant::now()))
+                .unwrap();
+        });
+        let result = received.recv_timeout(Duration::from_millis(500));
+        drop(state);
+        checker.join().unwrap();
+        assert_eq!(result, Ok(None));
+        assert!(matches!(
+            sink.commit_window(Instant::now()),
+            CommitWindow::Open { .. }
+        ));
+        sink.flush_scrollback().unwrap();
+    }
+
+    #[test]
+    fn scheduled_turns_yield_to_quiet_pane_while_hot_pane_replenishes() {
+        let writer = DurabilityWriter::spawn();
+        writer.set_commit_policy(CommitPolicy {
+            window: Duration::ZERO,
+            ..CommitPolicy::default()
+        });
+        let hot_store = Arc::new(GatedStore::default());
+        let quiet_store = Arc::new(GatedStore::default());
+        let _release = ReleaseGatedStores(vec![hot_store.clone(), quiet_store.clone()]);
+        hot_store.allow_calls(0);
+        quiet_store.allow_calls(0);
+        let hot =
+            DeferredScrollbackSpillSink::with_writer(hot_store.clone(), [0x71; 16], writer.clone())
+                .unwrap();
+        let quiet =
+            DeferredScrollbackSpillSink::with_writer(quiet_store.clone(), [0x72; 16], writer)
+                .unwrap();
+        assert!(hot.store_scrollback_line(0, &GatedStore::line(0), 64));
+        hot.request_scrollback_flush().unwrap();
+        hot_store.wait_for_calls(1);
+
+        // The hot pane already owns the next queue entry when the quiet pane
+        // arrives. Keep replenishing it before every captured write returns.
+        assert!(hot.store_scrollback_line(1, &GatedStore::line(1), 64));
+        hot.request_scrollback_flush().unwrap();
+        assert!(quiet.store_scrollback_line(0, &GatedStore::line(0), 64));
+        quiet.request_scrollback_flush().unwrap();
+        hot_store.allow_calls(1);
+        hot_store.wait_for_calls(2);
+        assert!(hot.store_scrollback_line(2, &GatedStore::line(2), 64));
+        hot.request_scrollback_flush().unwrap();
+        hot_store.allow_calls(2);
+
+        // A drain-until-empty loop instead enters hot call 3 and strands the
+        // quiet pane behind it. Finite turns reach the quiet pane first.
+        quiet_store.wait_for_calls(1);
+        assert_eq!(hot_store.gate.lock().unwrap().entered_calls, 2);
+        assert_eq!(hot_store.rows().len(), 2);
+        assert_eq!(hot.pending_rows.load(Ordering::Acquire), 1);
+        quiet_store.allow_calls(1);
+        hot_store.allow_calls(3);
+        wait_for_rows(&hot_store, 3);
+        wait_for_rows(&quiet_store, 1);
+        hot.flush_scrollback().unwrap();
+        quiet.flush_scrollback().unwrap();
+        assert_eq!(hot.durability_failure(), None);
+        assert_eq!(quiet.durability_failure(), None);
+    }
+
+    #[test]
+    fn scheduled_turn_opens_a_new_window_for_arrivals_behind_its_capture() {
+        let (store, sink) = windowed_sink(
+            CommitPolicy {
+                window: Duration::from_secs(120),
+                window_bytes: 1 << 30,
+                idle: Duration::from_secs(120),
+            },
+            0x73,
+        );
+        let _release = ReleaseGatedStores(vec![store.clone()]);
+        store.allow_calls(0);
+        assert!(sink.store_scrollback_line(0, &GatedStore::line(0), 64));
+        sink.request_scrollback_commit().unwrap();
+        store.wait_for_calls(1);
+        assert!(sink.store_scrollback_line(1, &GatedStore::line(1), 64));
+        sink.request_scrollback_flush().unwrap();
+        store.allow_calls(1);
+        store.wait_for_publications(1);
+        {
+            let _drain = sink.drain_gate.lock().unwrap();
+            let state = sink.state.lock().unwrap();
+            let Some(Pending::Row(first)) = state.pending.front() else {
+                panic!("the fresh arrival must remain in the next window");
+            };
+            assert_eq!(first.stable_row, 1);
+            assert_eq!(state.window_opened, Some(first.admitted_at));
+            assert!(state.commit_requested.is_none());
+        }
+        assert_eq!(store.rows().len(), 1);
+        assert!(matches!(
+            sink.commit_window(Instant::now()),
+            CommitWindow::Open { .. }
+        ));
+        // A no-op handoff also cannot replay the already acknowledged row.
+        for _ in 0..32 {
+            sink.request_scrollback_flush().unwrap();
+        }
+        store.allow_calls(2);
+        sink.request_scrollback_commit().unwrap();
+        store.wait_for_publications(2);
+        assert_eq!(
+            store.rows(),
+            vec![(0, GatedStore::text(0)), (1, GatedStore::text(1))]
+        );
+        assert_eq!(store.published_frontiers(), vec![1, 2]);
+    }
+
+    #[test]
+    fn partial_turn_acknowledgements_preserve_each_requested_publication_frontier() {
+        let (store, sink) = windowed_sink(
+            CommitPolicy {
+                window: Duration::from_secs(120),
+                idle: Duration::from_secs(120),
+                ..CommitPolicy::default()
+            },
+            0x74,
+        );
+        let _release = ReleaseGatedStores(vec![store.clone()]);
+        store.gate.lock().unwrap().acknowledge_rows = Some(1);
+        store.allow_calls(0);
+        for row in 0..3 {
+            assert!(sink.store_scrollback_line(row, &GatedStore::line(row), 64));
+        }
+        sink.request_scrollback_commit().unwrap();
+        store.wait_for_calls(1);
+        assert!(sink.store_scrollback_line(3, &GatedStore::line(3), 64));
+        sink.request_scrollback_commit().unwrap();
+        store.allow_calls(1);
+        store.wait_for_calls(2);
+        assert!(store.published_frontiers().is_empty());
+        assert!(sink.store_scrollback_line(4, &GatedStore::line(4), 64));
+        sink.request_scrollback_commit().unwrap();
+        store.allow_calls(2);
+        store.wait_for_calls(3);
+        assert!(store.published_frontiers().is_empty());
+        // Repeated requests during early partial ACKs must not keep moving
+        // the original frontier. It publishes when call 3 acknowledges it;
+        // the bounded follow-up represents the latest later request.
+        store.allow_calls(3);
+        store.wait_for_calls(4);
+        assert_eq!(store.published_frontiers(), vec![3]);
+        assert_eq!(
+            sink.state.lock().unwrap().commit_requested,
+            Some(CommitRequest { through: Some(5) })
+        );
+        store.allow_calls(4);
+        store.wait_for_calls(5);
+        assert_eq!(store.published_frontiers(), vec![3]);
+        store.allow_calls(5);
+        store.wait_for_publications(2);
+        assert_eq!(store.published_frontiers(), vec![3, 5]);
+        assert_eq!(
+            store.rows(),
+            (0..5)
+                .map(|row| (row, GatedStore::text(row)))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn explicit_flush_publishes_its_frontier_without_chasing_later_arrivals() {
+        let (store, sink) = windowed_sink(CommitPolicy::default(), 0x75);
+        let _release = ReleaseGatedStores(vec![store.clone()]);
+        store.gate.lock().unwrap().acknowledge_rows = Some(1);
+        store.allow_calls(0);
+        assert!(sink.store_scrollback_line(0, &GatedStore::line(0), 64));
+        // Retain an older asynchronous intent without handing it to the
+        // worker yet. The synchronous flush must still capture all 3 rows.
+        sink.request_commit().unwrap();
+        for row in 1..3 {
+            assert!(sink.store_scrollback_line(row, &GatedStore::line(row), 64));
+        }
+        let flushing = sink.clone();
+        let (done, completion) = std::sync::mpsc::sync_channel(1);
+        let flusher = std::thread::spawn(move || {
+            done.send(flushing.flush_scrollback()).unwrap();
+        });
+        store.wait_for_calls(1);
+        assert!(sink.store_scrollback_line(3, &GatedStore::line(3), 64));
+        sink.request_scrollback_commit().unwrap();
+        store.allow_calls(3);
+        assert_eq!(
+            completion.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Ok(())
+        );
+        flusher.join().unwrap();
+        // The later asynchronous request is still pending, with its write
+        // blocked. The synchronous caller's three rows are already published.
+        store.wait_for_calls(4);
+        assert_eq!(store.rows().len(), 3);
+        assert_eq!(store.published_frontiers(), vec![3]);
+        store.allow_calls(4);
+        store.wait_for_publications(2);
+        assert_eq!(store.published_frontiers(), vec![3, 4]);
+    }
+
+    #[test]
+    fn an_empty_queue_retries_a_failed_commit_publication() {
+        let (store, sink) = windowed_sink(CommitPolicy::default(), 0x76);
+        store.gate.lock().unwrap().fail_next_flush = true;
+        assert!(sink.store_scrollback_line(0, &GatedStore::line(0), 64));
+        assert_eq!(
+            sink.flush_scrollback(),
+            Err(ScrollbackSpillError::StorageUnavailable)
+        );
+        assert_eq!(sink.pending_rows.load(Ordering::Acquire), 0);
+        assert_eq!(store.rows().len(), 1);
+        assert!(store.published_frontiers().is_empty());
+        assert_eq!(
+            sink.durability_failure(),
+            Some(ScrollbackSpillError::StorageUnavailable)
+        );
+        assert!(matches!(
+            sink.request_scrollback_flush(),
+            Ok(()) | Err(ScrollbackSpillError::StorageUnavailable)
+        ));
+        store.wait_for_publications(1);
+        let _drain = sink.drain_gate.lock().unwrap();
+        assert!(sink.state.lock().unwrap().commit_requested.is_none());
+        assert_eq!(sink.durability_failure(), None);
+        assert_eq!(store.published_frontiers(), vec![1]);
+        assert_eq!(store.rows().len(), 1, "publication must not replay rows");
+    }
+
+    #[test]
+    fn a_closed_pane_finishes_partial_turns_and_publishes_before_release() {
+        let (store, sink) = windowed_sink(CommitPolicy::default(), 0x77);
+        let _release = ReleaseGatedStores(vec![store.clone()]);
+        store.gate.lock().unwrap().acknowledge_rows = Some(1);
+        store.allow_calls(0);
+        for row in 0..3 {
+            assert!(sink.store_scrollback_line(row, &GatedStore::line(row), 64));
+        }
+        sink.request_scrollback_commit().unwrap();
+        store.wait_for_calls(1);
+        let closed = Arc::downgrade(&sink);
+        drop(sink);
+        store.allow_calls(1);
+        store.wait_for_calls(2);
+        store.allow_calls(2);
+        store.wait_for_calls(3);
+        assert!(store.published_frontiers().is_empty());
+        store.allow_calls(3);
+        store.wait_for_publications(1);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while closed.upgrade().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the writer retained a completed closed pane"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(store.rows().len(), 3);
+        assert_eq!(store.published_frontiers(), vec![3]);
+    }
+
+    #[test]
+    fn a_coalesced_gap_can_cover_a_commit_frontier_in_one_scheduled_turn() {
+        let (store, sink) = windowed_sink(
+            CommitPolicy {
+                window: Duration::ZERO,
+                ..CommitPolicy::default()
+            },
+            0x78,
+        );
+        let _release = ReleaseGatedStores(vec![store.clone()]);
+        store.allow_calls(0);
+        assert!(sink.store_scrollback_line(0, &GatedStore::line(0), 64));
+        sink.request_scrollback_flush().unwrap();
+        store.wait_for_calls(1);
+        let charge = DeferredScrollbackSpillSink::row_charge(&GatedStore::line(1)).unwrap();
+        sink.set_writer_budget(2 * charge);
+        assert!(sink.store_scrollback_line(1, &GatedStore::line(1), 64));
+        sink.request_scrollback_commit().unwrap();
+        for row in 2..5 {
+            assert!(sink.store_scrollback_line(row, &GatedStore::line(row), 64));
+        }
+        let gap = {
+            let state = sink.state.lock().unwrap();
+            let Pending::Gap(gap) = state.pending[1] else {
+                panic!("overload must coalesce behind the in-flight row");
+            };
+            assert_eq!(gap.start, 1);
+            assert!(
+                gap.end > 2,
+                "the coalesced gap crosses the requested frontier"
+            );
+            gap
+        };
+        sink.set_writer_budget(DEFAULT_QUEUE_BUDGET_BYTES);
+        store.allow_calls(1);
+        store.wait_for_calls(2);
+        assert!(store.published_frontiers().is_empty());
+        store.allow_calls(2);
+        store.wait_for_publications(1);
+        assert_eq!(store.published_frontiers(), vec![2]);
+        assert_eq!(store.rows()[1], (1, gap.marker_text()));
+        assert_eq!(sink.load_scrollback_line(2).map(|line| line.len()), Some(0));
+        store.allow_calls(usize::MAX);
+        sink.flush_scrollback().unwrap();
+        assert_eq!(sink.durability_failure(), None);
+        assert!(sink.queued_gaps().is_empty());
     }
 
     #[test]
@@ -7550,13 +8159,24 @@ impl LiveScrollbackSpillSink {
             observed_oldest <= wal.target_oldest_sequence,
             "append WAL recovery ledger pruned beyond its authenticated target"
         );
+        let keep_from =
+            store_segment_keep_from(store, wal.ledger_pane_id, wal.target_oldest_sequence)?;
         if observed_oldest < wal.target_oldest_sequence {
-            let keep_from =
-                store_segment_keep_from(store, wal.ledger_pane_id, wal.target_oldest_sequence)?;
             store
-                .prune_before_keeping(wal.ledger_pane_id, wal.target_oldest_sequence, keep_from)
+                .prune_before(wal.ledger_pane_id, wal.target_oldest_sequence)
                 .context("recover append WAL retention cut")?;
         }
+        // A crash may already have published the retention cut while leaving
+        // physical compaction unfinished. Complete bounded maintenance even
+        // when the logical oldest row is already the authenticated target.
+        store
+            .compact_pane_if_stale_keeping(
+                wal.ledger_pane_id,
+                LIVE_SCROLLBACK_COMPACT_MIN_STALE_BYTES,
+                keep_from,
+                Some(LIVE_SCROLLBACK_REPLACEMENT_MAX_COMMITTED_BYTES),
+            )
+            .context("compact recovered append WAL target within manifest bound")?;
         Self::verify_append_wal_target_store(wal, store)?;
         let verified_ledger = if wal.is_incremental() {
             Some(Self::verify_incremental_append_wal_target_chain_cold(
@@ -14163,8 +14783,12 @@ impl LiveScrollbackSpillSink {
     /// the tail is near the bounds one cumulative WAL may name.
     fn publication_due(&self, published: &LiveScrollbackPublishedPrefix, live_next: u64) -> bool {
         let tail_rows = live_next.saturating_sub(published.authority.next_sequence);
+        #[cfg(not(test))]
+        let byte_threshold = LIVE_SCROLLBACK_CUMULATIVE_WAL_MAX_RECORD_BYTES / 2;
+        #[cfg(test)]
+        let byte_threshold = LIVE_SCROLLBACK_PUBLICATION_BYTE_THRESHOLD.with(std::cell::Cell::get);
         tail_rows >= LIVE_SCROLLBACK_CUMULATIVE_WAL_MAX_ROWS / 2
-            || published.tail_record_bytes >= LIVE_SCROLLBACK_CUMULATIVE_WAL_MAX_RECORD_BYTES / 2
+            || published.tail_record_bytes >= byte_threshold
             || self
                 .last_publication
                 .lock()
@@ -14341,10 +14965,11 @@ impl LiveScrollbackSpillSink {
                 live.content_epoch,
                 published.revision,
             ));
-        live.published = Some(LiveScrollbackPublishedPrefix {
+        let published = LiveScrollbackPublishedPrefix {
             tail_record_bytes,
             ..published
-        });
+        };
+        live.published = Some(published);
         *state = live;
         drop(state);
         log::debug!(
@@ -14454,13 +15079,14 @@ impl LiveScrollbackSpillSink {
             if let Some(oldest) = target.oldest_sequence {
                 // The segment holding the oldest row stays readable whole.
                 let keep_from = store_segment_keep_from(&store, ledger_pane_id, oldest)?;
-                store.prune_before_keeping(ledger_pane_id, oldest, keep_from)?;
+                store.prune_before(ledger_pane_id, oldest)?;
                 #[cfg(test)]
                 scrollback_crash_points::reach("retention_pruned");
                 store.compact_pane_if_stale_keeping(
                     ledger_pane_id,
                     LIVE_SCROLLBACK_COMPACT_MIN_STALE_BYTES,
                     keep_from,
+                    Some(LIVE_SCROLLBACK_REPLACEMENT_MAX_COMMITTED_BYTES),
                 )?;
                 #[cfg(test)]
                 scrollback_crash_points::reach("compacted");
@@ -15202,13 +15828,14 @@ impl LiveScrollbackSpillSink {
                     .ok_or_else(|| anyhow::anyhow!("scrollback retention cut overflows"))?;
                 // The segment holding the oldest row stays readable whole.
                 let keep_from = store_segment_keep_from(&store, ledger_pane_id, prune_before_seq)?;
-                store.prune_before_keeping(ledger_pane_id, prune_before_seq, keep_from)?;
+                store.prune_before(ledger_pane_id, prune_before_seq)?;
                 #[cfg(test)]
                 scrollback_crash_points::reach("retention_pruned");
                 store.compact_pane_if_stale_keeping(
                     ledger_pane_id,
                     LIVE_SCROLLBACK_COMPACT_MIN_STALE_BYTES,
                     keep_from,
+                    Some(LIVE_SCROLLBACK_REPLACEMENT_MAX_COMMITTED_BYTES),
                 )?;
                 #[cfg(test)]
                 scrollback_crash_points::reach("compacted");
@@ -20019,6 +20646,51 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn a_commit_window_crossing_the_byte_threshold_publishes_immediately() {
+        struct RestoreThreshold(u64);
+        impl Drop for RestoreThreshold {
+            fn drop(&mut self) {
+                LIVE_SCROLLBACK_PUBLICATION_BYTE_THRESHOLD.with(|limit| limit.set(self.0));
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sink = windowed_test_sink(dir.path());
+        let rows = digest_only_test_lines("publication-byte-frontier", 6);
+        assert!(sink.store_scrollback_line(0, &rows[0], 16));
+        assert_eq!(sink.store_scrollback_lines(1, &rows[1..3], 16), 2);
+        assert_eq!(sink.store_scrollback_lines(3, &rows[3..5], 16), 2);
+        let before = published_manifest(&sink);
+        assert_eq!(before.next_seq, 3);
+        let previous_bytes = sink
+            .lock_state("test byte frontier before final window")
+            .unwrap()
+            .published
+            .unwrap()
+            .tail_record_bytes;
+        let _restore = RestoreThreshold(
+            LIVE_SCROLLBACK_PUBLICATION_BYTE_THRESHOLD
+                .with(|limit| limit.replace(previous_bytes + 1)),
+        );
+        // The previous prefix is below the trigger; the next record crosses
+        // it. Passing the old prefix to publication_due strands this window.
+        assert_eq!(sink.store_scrollback_lines(5, &rows[5..], 16), 1);
+        let published = published_manifest(&sink);
+        assert_eq!(published.next_seq, 6);
+        assert!(
+            sink.lock_state("test byte frontier published")
+                .unwrap()
+                .published
+                .is_none()
+        );
+        drop(sink);
+        let reopened =
+            LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                .unwrap();
+        assert_rows_read_back_from(&reopened, 0, &rows.iter().collect::<Vec<_>>());
+    }
+
     /// ft-yccm0.2.1.2 AC1/AC2: with a publication cadence, a process's first
     /// batch (which starts its nonce segment) is a single-batch transaction
     /// that publishes; every later commit window appends its rows under
@@ -20139,8 +20811,8 @@ mod tests {
     /// as segments, one AEAD operation each, and retention stays exact. The
     /// oldest retained row here sits inside a segment whose first rows
     /// retention evicted: the store keeps those rows only as the slack that
-    /// authenticates the segment (tests compact on every prune, so the slack
-    /// survives compaction), and they never read back. Every retained row
+    /// authenticates the segment through amortized compaction, and they never
+    /// read back as retained rows. Every retained row
     /// reads back exactly through a cold read, a ranged read, a snapshot and
     /// export, before and after reopen.
     #[test]
@@ -20182,10 +20854,11 @@ mod tests {
             let ledger_pane_id = sink.active_ledger_pane_id();
             let store = sink.lock_store("test segment slack").unwrap();
             assert_eq!(store.oldest_seq(ledger_pane_id), Some(14), "{case}");
-            assert_eq!(
-                store.pruned_tail_start(ledger_pane_id),
-                Some(11),
-                "{case}: the slack is exactly the segment's evicted rows"
+            assert!(
+                store
+                    .pruned_tail_start(ledger_pane_id)
+                    .is_some_and(|first| first <= 11),
+                "{case}: amortized slack still includes every authentication support row"
             );
             let slack = store
                 .lines_range_reaching_pruned(ledger_pane_id, 11..21, 16, 1 << 20)
@@ -24724,10 +25397,9 @@ mod tests {
         }
 
         assert_eq!(sink.retained_scrollback_rows(), 2);
-        assert_eq!(
-            sink.physical_scrollback_bytes(),
-            sink.retained_scrollback_bytes() as u64,
-            "test-threshold compaction should rewrite the stale prefix away"
+        assert!(
+            sink.physical_scrollback_bytes() <= 2 * sink.retained_scrollback_bytes() as u64 + 64,
+            "amortized compaction bounds stale slack by the retained payload plus bounded headers"
         );
         assert_eq!(sink.oldest_scrollback_row(), Some(2));
         assert!(sink.load_scrollback_line(1).is_none());
@@ -27126,10 +27798,9 @@ mod tests {
         assert_eq!(sink.retained_scrollback_rows(), max_retained_rows);
         let oldest_retained_row = (1024 - max_retained_rows) as wezterm_term::StableRowIndex;
         assert_eq!(sink.oldest_scrollback_row(), Some(oldest_retained_row));
-        assert_eq!(
-            sink.physical_scrollback_bytes(),
-            sink.retained_scrollback_bytes() as u64,
-            "test-threshold compaction should keep physical bytes to retained records"
+        assert!(
+            sink.physical_scrollback_bytes() <= 2 * sink.retained_scrollback_bytes() as u64 + 64,
+            "single-row segments keep at most one retained payload of stale slack plus headers"
         );
         assert!(
             sink.physical_scrollback_bytes() < 256 * 1024,
