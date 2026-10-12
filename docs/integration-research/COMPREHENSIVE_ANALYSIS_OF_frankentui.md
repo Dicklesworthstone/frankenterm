@@ -43,7 +43,7 @@ frankentui/
 │   └── ftui-tty          (2 files, ~3K LOC)   — Native Unix backend
 ├── Web/Platform (3 crates)
 │   ├── ftui-web          (6 files, ~7K LOC)   — WASM backend
-│   ├── ftui-pty          (8 files, ~9K LOC)   — PTY utilities (bridges frankenterm-core)
+│   ├── ftui-pty          (8 files, ~9K LOC)   — PTY utilities (crates.io frankenterm-core 0.2.0 VT engine)
 │   └── ftui-simd         (1 file, ~17 LOC)    — Reserved for SIMD experiments
 ├── Extended (2 crates)
 │   ├── ftui-extras       (91 files, ~136K LOC) — Feature-gated plugins (charts, canvas, etc.)
@@ -67,7 +67,7 @@ ftui-core (foundation — events, capabilities)
   ├── ftui-runtime (Elm event loop, Model/Cmd)
   │   └── ftui-widgets (48+ widgets)
   │       └── ftui-extras (feature-gated plugins)
-  └── ftui-pty (PTY utilities — bridges to frankenterm-core)
+  └── ftui-pty (PTY utilities — uses FrankenTUI's own crates.io frankenterm-core VT engine)
 ```
 
 ---
@@ -85,7 +85,7 @@ ftui-core (foundation — events, capabilities)
 | **ftui-style** | minimal (depends on ftui-render) |
 | **ftui-runtime** | optional: `im` (persistent DS), `opentelemetry`, `serde` |
 | **ftui-widgets** | optional: `regex`, `serde` |
-| **ftui-pty** | `frankenterm-core` (with `ws-codec` feature) |
+| **ftui-pty** | crates.io `frankenterm-core` 0.2.0 (with `ws-codec` feature) — FrankenTUI's VT engine, not this repo's `crates/frankenterm-core` |
 
 ### Key Feature Flags
 
@@ -318,9 +318,9 @@ FrankenTerm's CLI could use inline mode to show a status bar while preserving sc
 - Workflow progress
 - Alert notifications
 
-#### 5. PTY Bridge Already Exists
+#### 5. PTY Bridge Is Not an Existing Seam
 
-`ftui-pty` already depends on `frankenterm-core` with `ws-codec` feature for WebSocket-based PTY multiplexing. This is an existing integration point.
+`ftui-pty` depends on crates.io `frankenterm-core` 0.2.0 with the `ws-codec` feature. That crate is FrankenTUI's own host-agnostic VT engine, published from the frankentui repository, and shares only its name with this repository's swarm core (`crates/frankenterm-core`, never published). There is no existing code path between `ftui-pty` and FrankenTerm. Its bridge starts a fresh PTY per WebSocket connection, so it cannot attach to FrankenTerm's mux panes.
 
 ### Dependency Cost
 
