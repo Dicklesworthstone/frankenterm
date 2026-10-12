@@ -1334,12 +1334,14 @@ impl RpcProtocolAuthority {
         // default instead of inheriting authority from a broad `<=` cutoff.
         // Above the legacy surface, only the fenced-topology trio, the
         // explicitly coordinated reliable-input request/reply and sampled
-        // paste request, the reliable-pane-write request/reply, and the
-        // renderable coordinator's layout-fenced line request/reply and the
-        // selection coordinator's capture/resolve/release pairs are active.
+        // paste request, the reliable-pane-write request/reply, the
+        // renderable coordinator's layout-fenced line request/reply, the
+        // selection coordinator's capture/resolve/release pairs, and the
+        // user-variable hydration request/reply (115-116, codec 70), whose
+        // coordinator is the ordered `UserVarDeliveryQueue`, are active.
         matches!(
             spec.ident,
-            0..=4 | 8..=14 | 20 | 22..=78 | 81..=83 | 96..=109
+            0..=4 | 8..=14 | 20 | 22..=78 | 81..=83 | 96..=109 | 115..=116
         )
     }
 
@@ -14053,6 +14055,7 @@ mod tests {
         expected.extend(22..=78);
         expected.extend(81..=83);
         expected.extend(96..=109);
+        expected.extend(115..=116);
 
         let actual = Pdu::all_wire_specs()
             .iter()
@@ -14118,6 +14121,40 @@ mod tests {
                 ));
             }
         }
+    }
+
+    /// ft-bsgyk: the user-variable hydration pair is active once codec 70 is
+    /// agreed, and refused before registration or on an older dialect.
+    #[test]
+    fn user_var_endpoints_require_v70_and_registered_protocol() {
+        let generation = NonZeroU64::new(17).unwrap();
+        let request = &<GetPaneUserVarsV1 as PduWireIdent>::WIRE_SPEC;
+        let reply = &<GetPaneUserVarsV1Response as PduWireIdent>::WIRE_SPEC;
+        let current = RpcProtocolAuthority::established_for_test(generation, CODEC_VERSION);
+        for point in [
+            RpcOutboundAdmissionPoint::Preflight,
+            RpcOutboundAdmissionPoint::Enqueue,
+            RpcOutboundAdmissionPoint::Dequeue,
+        ] {
+            current.validate_outbound(request, point).unwrap();
+        }
+        current
+            .validate_inbound(reply, PduWireRole::CorrelatedReply)
+            .unwrap();
+        let bootstrap = RpcProtocolAuthority::new(generation);
+        assert!(matches!(
+            bootstrap.validate_outbound(request, RpcOutboundAdmissionPoint::Preflight),
+            Err(OrdinaryMuxProtocolError::PhaseViolation { .. })
+        ));
+        let older = RpcProtocolAuthority::established_for_test(generation, 69);
+        assert!(matches!(
+            older.validate_outbound(request, RpcOutboundAdmissionPoint::Preflight),
+            Err(OrdinaryMuxProtocolError::DialectViolation { required: 70, .. })
+        ));
+        assert!(matches!(
+            older.validate_inbound(reply, PduWireRole::CorrelatedReply),
+            Err(OrdinaryMuxProtocolError::DialectViolation { required: 70, .. })
+        ));
     }
 
     #[test]
