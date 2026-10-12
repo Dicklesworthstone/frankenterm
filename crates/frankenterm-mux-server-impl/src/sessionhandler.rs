@@ -85,6 +85,11 @@ use wezterm_term::terminal::Alert;
 
 const SEND_KEY_DOWN_MAIN_THREAD_ESTIMATED_BYTES: usize = 4 * 1024;
 const MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES: usize = 4 * 1024;
+// The decoded map includes hash-table storage in addition to its bounded
+// strings. Retain this admission for the entire source-fence wait, then let
+// the outbound queue account for the response after enqueue.
+const PANE_USER_VARS_SNAPSHOT_ESTIMATED_BYTES: usize =
+    2 * codec::MAX_PANE_USER_VARS_RESPONSE_DECOMPRESSED_BYTES;
 const RELIABLE_INPUT_RETRY_AFTER_NS: u64 = 1_000_000;
 const PRODUCTION_TRACE_SHARDS: u16 = 64;
 const PRODUCTION_TRACE_TOTAL_SLOTS: u32 = 16_384;
@@ -2425,6 +2430,7 @@ impl MuxRequestErrorContext {
                 | Pdu::GetPaneRenderableDimensions(_)
                 | Pdu::GetPaneTieredScrollbackStatusesV1(_)
                 | Pdu::GetPaneDomainsV1(_)
+                | Pdu::GetPaneUserVarsV1(_)
                 | Pdu::GetPaneRenderChanges(_)
                 | Pdu::GetPaneRenderStateV1(_)
                 | Pdu::GetPaneRenderDeliveryV1(_)
@@ -7966,6 +7972,71 @@ impl SessionHandler {
                     send_response,
                 );
             }
+            Pdu::GetPaneUserVarsV1(request) => {
+                let pane_id = request.pane_id;
+                let pane_gone = move || {
+                    Pdu::GetPaneUserVarsV1Response(codec::GetPaneUserVarsV1Response {
+                        pane_id,
+                        outcome: codec::PaneUserVarsOutcomeV1::PaneGone,
+                    })
+                };
+                // Capture the registration at admission. A deferred request
+                // must never resolve its numeric ID through a replacement.
+                let registration = match authority.capture_current_pane_opt(pane_id) {
+                    Ok(Some(registration)) => registration,
+                    Ok(None) => {
+                        send_response(Ok(pane_gone()));
+                        return;
+                    }
+                    Err(error) => {
+                        send_response(Err(error.into()));
+                        return;
+                    }
+                };
+                schedule_main_thread_snapshot_rpc(
+                    PANE_USER_VARS_SNAPSHOT_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        let result: anyhow::Result<()> = async {
+                            let _session = session_mux(&authority)?;
+                            let Some(snapshot) = registration.capture_user_vars_snapshot(
+                                codec::MAX_PANE_USER_VARS,
+                                codec::MAX_PANE_USER_VAR_TEXT_BYTES,
+                            ) else {
+                                send_response(Ok(pane_gone()));
+                                return Ok(());
+                            };
+                            let mut snapshot = snapshot.map_err(|error| {
+                                if error.is::<mux::pane::PaneUserVarsSnapshotBusy>() {
+                                    // Producer/storage backpressure must not
+                                    // block the main thread or look permanent.
+                                    anyhow::Error::new(MuxServerRejection::quota_exceeded())
+                                } else {
+                                    error
+                                }
+                            })?;
+                            snapshot.wait_ready().await;
+                            // This enqueue must happen while the source
+                            // publication fence and exact pane output lease
+                            // remain alive. Earlier live alerts precede this
+                            // response; later alerts and removal follow it.
+                            send_response(Ok(Pdu::GetPaneUserVarsV1Response(
+                                codec::GetPaneUserVarsV1Response {
+                                    pane_id,
+                                    outcome: codec::PaneUserVarsOutcomeV1::Snapshot {
+                                        user_vars: snapshot.take_user_vars(),
+                                    },
+                                },
+                            )));
+                            Ok(())
+                        }
+                        .await;
+                        if let Err(error) = result {
+                            send_response(Err(error));
+                        }
+                    },
+                    send_response,
+                );
+            }
             Pdu::ListPanes(ListPanes {}) => {
                 let queued_at = Instant::now();
                 schedule_main_thread_snapshot_rpc(
@@ -10393,6 +10464,7 @@ impl SessionHandler {
             | Pdu::ListPanesCoherentResponse { .. }
             | Pdu::ListPanesTabStacksResponse { .. }
             | Pdu::ListPanesOrderedV1Response { .. }
+            | Pdu::GetPaneUserVarsV1Response { .. }
             | Pdu::ReorderWindowTabsV1Response { .. }
             | Pdu::WindowOrderEventV1 { .. }
             | Pdu::GetPaneRenderDeliveryV1Response { .. }

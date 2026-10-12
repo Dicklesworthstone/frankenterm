@@ -2605,6 +2605,49 @@ impl Pane for LocalPane {
         self.locked_terminal().user_vars().clone()
     }
 
+    fn capture_user_vars_snapshot(
+        &self,
+        max_entries: usize,
+        max_text_bytes: usize,
+    ) -> anyhow::Result<crate::pane::PaneUserVarsSnapshot> {
+        // A parser slice can release terminal while its alerts are still
+        // staged. Fence complete producer batches, then drain any action ring.
+        // The producer may also be waiting for durability capacity while it
+        // owns application; a metadata RPC must yield instead of blocking main.
+        let _application = self
+            .output_application
+            .try_lock()
+            .ok_or(crate::pane::PaneUserVarsSnapshotBusy)?;
+        let terminal = self
+            .terminal
+            .try_lock()
+            .ok_or(crate::pane::PaneUserVarsSnapshotBusy)?;
+        #[cfg(feature = "disruptor-pane-io")]
+        let terminal = {
+            // Applying queued batches briefly takes staging. Its production
+            // owners also hold terminal, so this probe excludes an existing
+            // holder before the drain without reversing the lock order.
+            drop(
+                self.alert_staging
+                    .try_lock()
+                    .ok_or(crate::pane::PaneUserVarsSnapshotBusy)?,
+            );
+            let mut terminal = terminal;
+            self.drain_action_ring_locked(&mut terminal);
+            terminal
+        };
+        let staging = self
+            .alert_staging
+            .try_lock()
+            .ok_or(crate::pane::PaneUserVarsSnapshotBusy)?;
+        crate::pane::PaneUserVarsSnapshot::capture(
+            terminal.user_vars(),
+            max_entries,
+            max_text_bytes,
+            &staging.dispatch,
+        )
+    }
+
     fn exit_behavior(&self) -> Option<ExitBehavior> {
         // If we are ssh, and we've not yet fully connected,
         // then override exit_behavior so that we can show
@@ -4948,7 +4991,7 @@ impl FundedPaneAlerts {
         let terminal = self.terminal.clone();
         let mut historical = self.historical.take().expect("funded historical receipts");
         let mut completion = PaneAlertCompletion { delivered: false };
-        dispatch.publish(
+        dispatch.publish_stateful(
             queue,
             async move {
                 wait_for_alert_terminal_unlock(&terminal).await;
@@ -4956,14 +4999,19 @@ impl FundedPaneAlerts {
                 #[cfg(test)]
                 ALERT_MAIN_HANDOFFS.fetch_add(1, Ordering::Release);
             },
-            async move {
+            move |mut ordering| async move {
+                // Mux subscribers need every occurrence, but a slow Lua
+                // callback must not prevent a metadata RPC from replying.
+                for alert in &alerts {
+                    if !output.dispatch_alert(alert.clone()) {
+                        return;
+                    }
+                }
+                ordering.begin_history().await;
                 for alert in alerts {
                     if crate::HistoricalAlertDemand::for_alert(&alert).is_some()
                         && !output.deliver_historical(&mut historical, &alert)
                     {
-                        return;
-                    }
-                    if !output.dispatch_alert(alert) {
                         return;
                     }
                     historical.finish_delivered().await;
@@ -19393,6 +19441,344 @@ mod tests {
         assert_eq!(
             reads_after, 0,
             "capture_surface_snapshot must perform zero cold storage reads"
+        );
+    }
+
+    #[test]
+    fn user_var_snapshot_cancelled_middle_preserves_state_predecessor() {
+        use futures::FutureExt;
+
+        let queue = crate::PaneAlertDispatchQueue::default();
+        let first_vars = HashMap::from([("stage".to_string(), "first".to_string())]);
+        let first = crate::pane::PaneUserVarsSnapshot::capture(&first_vars, 1, 32, &queue).unwrap();
+        let middle =
+            crate::pane::PaneUserVarsSnapshot::capture(&HashMap::new(), 1, 32, &queue).unwrap();
+        let last_vars = HashMap::from([("stage".to_string(), "last".to_string())]);
+        let mut last =
+            crate::pane::PaneUserVarsSnapshot::capture(&last_vars, 1, 32, &queue).unwrap();
+
+        // Canceling an intervening request must not let a later response pass
+        // the earlier response that still owns the state publication fence.
+        drop(middle);
+        assert!(last.wait_ready().now_or_never().is_none());
+        drop(first);
+        assert!(last.wait_ready().now_or_never().is_some());
+        assert_eq!(last.take_user_vars(), last_vars);
+    }
+
+    #[test]
+    fn user_var_snapshot_cancelled_wait_preserves_state_predecessor() {
+        use futures::FutureExt;
+
+        let queue = crate::PaneAlertDispatchQueue::default();
+        let first =
+            crate::pane::PaneUserVarsSnapshot::capture(&HashMap::new(), 1, 32, &queue).unwrap();
+        let mut next =
+            crate::pane::PaneUserVarsSnapshot::capture(&HashMap::new(), 1, 32, &queue).unwrap();
+
+        // Each now_or_never drops a pending wait future while retaining its
+        // snapshot. Retrying must still await the original predecessor.
+        assert!(next.wait_ready().now_or_never().is_none());
+        assert!(next.wait_ready().now_or_never().is_none());
+        drop(first);
+        assert!(next.wait_ready().now_or_never().is_some());
+        assert!(next.take_user_vars().is_empty());
+    }
+
+    #[test]
+    fn user_var_snapshot_rejects_oversize_before_installing_fence() {
+        use futures::FutureExt;
+
+        let queue = crate::PaneAlertDispatchQueue::default();
+        let vars = HashMap::from([("name".to_string(), "value".to_string())]);
+        assert!(crate::pane::PaneUserVarsSnapshot::capture(&vars, 0, 9, &queue).is_err());
+        assert!(crate::pane::PaneUserVarsSnapshot::capture(&vars, 1, 8, &queue).is_err());
+
+        // Rejection must leave no unresolved predecessor behind. Exact
+        // boundary values are accepted as a complete authoritative map.
+        let mut snapshot = crate::pane::PaneUserVarsSnapshot::capture(&vars, 1, 9, &queue).unwrap();
+        assert!(snapshot.wait_ready().now_or_never().is_some());
+        assert_eq!(snapshot.take_user_vars(), vars);
+        assert!(snapshot.take_user_vars().is_empty());
+    }
+
+    #[test]
+    fn user_var_snapshot_reads_pre_registration_terminal_state() {
+        use futures::FutureExt;
+
+        let mut terminal = guardian_lifetime_test_terminal();
+        terminal.advance_bytes(b"\x1b]1337;SetUserVar=stage=YmFja2dyb3VuZA==\x07");
+        let pane = make_legacy_test_pane(814, terminal);
+
+        assert!(pane.capture_user_vars_snapshot(0, 64).is_err());
+        assert!(pane.capture_user_vars_snapshot(1, 14).is_err());
+        let mut snapshot = pane.capture_user_vars_snapshot(1, 15).unwrap();
+        assert!(snapshot.wait_ready().now_or_never().is_some());
+        assert_eq!(
+            snapshot.take_user_vars(),
+            HashMap::from([("stage".to_string(), "background".to_string())])
+        );
+    }
+
+    #[test]
+    fn user_var_snapshot_publication_does_not_wait_for_historical_receipts() {
+        use futures::FutureExt;
+
+        // The main-thread scheduler is process global. Exercise the real
+        // producer and consumer path in a fresh process, with a hard timeout.
+        const CHILD: &str = "FT_USER_VAR_SNAPSHOT_HISTORY_CHILD";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "localpane::tests::user_var_snapshot_publication_does_not_wait_for_historical_receipts",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    let output = child.wait_with_output().unwrap();
+                    assert!(
+                        output.status.success(),
+                        "snapshot subprocess failed: {}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert!(String::from_utf8_lossy(&output.stdout)
+                        .contains("USER_VAR_SNAPSHOT_HISTORY_SUCCESS"));
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    panic!(
+                        "snapshot subprocess timed out: {}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn pump_until(executor: &promise::spawn::SimpleExecutor, mut done: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done() {
+                while executor.try_tick().unwrap() {}
+                assert!(Instant::now() < deadline, "snapshot publication stalled");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        let domain: Arc<dyn Domain> =
+            Arc::new(crate::domain::LocalDomain::new("snapshot-history").unwrap());
+        let pane = Arc::new(LocalPane::new(
+            815,
+            guardian_lifetime_test_terminal(),
+            Box::new(ColdResizeTestChild::default()),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            domain.domain_id(),
+            [0xa3; 16],
+            "snapshot-history".into(),
+        ));
+        let dynamic: Arc<dyn Pane> = pane.clone();
+        let mux = Arc::new(crate::Mux::new(Some(domain)));
+        let generation = crate::PaneRegistrationGeneration::new(
+            pane.pane_id(),
+            &mux.pane_retirements,
+            Arc::downgrade(&mux),
+        );
+        {
+            let _registration = mux.pane_registration.lock();
+            mux.insert_pane_registration_locked(
+                pane.pane_id(),
+                pane.domain_id(),
+                &dynamic,
+                &generation,
+            )
+            .unwrap();
+        }
+        pane.mux_registration
+            .reserve(mux.capture_pane_registration(&dynamic).unwrap())
+            .unwrap()
+            .commit()
+            .unwrap()
+            .finalize();
+
+        let executor = promise::spawn::SimpleExecutor::try_with_limits(
+            promise::spawn::MainThreadAdmissionLimits::new(32, 1024 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let tab = Arc::new(crate::tab::Tab::new(&term_size(80, 24)));
+        mux.add_tab_no_panes(&tab).unwrap();
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_to_window(&tab, window_id).unwrap();
+        drop(window);
+        tab.assign_pane(&dynamic);
+
+        let ordinary_values = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = Arc::clone(&ordinary_values);
+        mux.subscribe(move |notification| {
+            if let crate::MuxNotification::Alert {
+                alert: Alert::SetUserVar { name, value },
+                ..
+            } = notification
+            {
+                assert_eq!(name, "stage");
+                observed.lock().push(value);
+            }
+            true
+        })
+        .unwrap();
+
+        let held = Arc::new(Mutex::new(None::<crate::HistoricalAlertCompletion>));
+        let captured = Arc::new(Mutex::new(None::<crate::pane::PaneUserVarsSnapshot>));
+        let historical_values = Arc::new(Mutex::new(Vec::<String>::new()));
+        let held_for_callback = Arc::clone(&held);
+        let captured_for_callback = Arc::clone(&captured);
+        let history_for_callback = Arc::clone(&historical_values);
+        let history = mux
+            .subscribe_historical_alerts(
+                move |window| window == Some(window_id),
+                |_| Some((0, 0)),
+                move |_| {
+                    let held = Arc::clone(&held_for_callback);
+                    let captured = Arc::clone(&captured_for_callback);
+                    let values = Arc::clone(&history_for_callback);
+                    Ok(Box::new(move |callback_pane, alert, completion| {
+                        let Alert::SetUserVar { value, .. } = alert else {
+                            panic!("expected user variable")
+                        };
+                        values.lock().push(value.clone());
+                        if value == "first" {
+                            // A Lua/history consumer may need this metadata
+                            // before acknowledging the historical occurrence.
+                            let snapshot =
+                                callback_pane.capture_user_vars_snapshot(16, 4096).unwrap();
+                            assert!(captured.lock().replace(snapshot).is_none());
+                            assert!(held.lock().replace(completion).is_none());
+                        } else {
+                            drop(completion);
+                        }
+                    }))
+                },
+            )
+            .unwrap();
+        let user_var = |value: &str| {
+            Action::OperatingSystemCommand(Box::new(
+                termwiz::escape::osc::OperatingSystemCommand::ITermProprietary(
+                    termwiz::escape::osc::ITermProprietary::SetUserVar {
+                        name: "stage".into(),
+                        value: value.into(),
+                    },
+                ),
+            ))
+        };
+
+        pane.perform_actions(vec![user_var("first")]).unwrap();
+        // Also drain the optional action ring, without rendering the pane.
+        assert_eq!(pane.copy_user_vars().get("stage").unwrap(), "first");
+        pump_until(&executor, || captured.lock().is_some());
+        let mut first_snapshot = captured.lock().take().unwrap();
+        assert!(held.lock().is_some());
+        assert!(first_snapshot.wait_ready().now_or_never().is_some());
+        assert_eq!(
+            first_snapshot.take_user_vars(),
+            HashMap::from([("stage".to_string(), "first".to_string())])
+        );
+        assert_eq!(&*ordinary_values.lock(), &["first"]);
+
+        // The terminal changes now, but its notification and the next
+        // snapshot cannot pass the response whose publication guard we hold.
+        pane.perform_actions(vec![user_var("second")]).unwrap();
+        let mut second_snapshot = pane.capture_user_vars_snapshot(16, 4096).unwrap();
+        assert!(second_snapshot.wait_ready().now_or_never().is_none());
+        while executor.try_tick().unwrap() {}
+        assert_eq!(&*ordinary_values.lock(), &["first"]);
+        drop(first_snapshot);
+
+        pump_until(&executor, || ordinary_values.lock().len() == 2);
+        assert!(second_snapshot.wait_ready().now_or_never().is_some());
+        assert_eq!(
+            second_snapshot.take_user_vars(),
+            HashMap::from([("stage".to_string(), "second".to_string())])
+        );
+        assert!(held.lock().is_some());
+        assert_eq!(&*historical_values.lock(), &["first"]);
+        drop(second_snapshot);
+
+        // Historical callbacks still retain their own FIFO. Releasing the
+        // first receipt finally permits the second callback to run.
+        drop(held.lock().take());
+        pump_until(&executor, || historical_values.lock().len() == 2);
+        assert_eq!(&*ordinary_values.lock(), &["first", "second"]);
+        assert_eq!(&*historical_values.lock(), &["first", "second"]);
+        pump_until(&executor, || {
+            executor.admission_snapshot().active_tasks == 0
+        });
+        drop(history);
+        println!("USER_VAR_SNAPSHOT_HISTORY_SUCCESS");
+    }
+
+    #[test]
+    fn user_var_snapshot_reports_busy_without_waiting_for_source_locks() {
+        use futures::FutureExt;
+
+        fn require_nonblocking_refusal<H>(pane: Arc<LocalPane>, held: H) {
+            let (tx, rx) = sync_channel(1);
+            let caller = std::thread::spawn(move || {
+                tx.send(pane.capture_user_vars_snapshot(1, 64).map(|_| ()))
+                    .unwrap();
+            });
+            let response = rx.recv_timeout(Duration::from_millis(500));
+            // Always release and join before asserting so a blocking
+            // implementation fails this test without hanging the test process.
+            drop(held);
+            caller.join().unwrap();
+            let error = response
+                .expect("metadata snapshot waited for a source lock")
+                .expect_err("a contended source must refuse capture");
+            assert!(error
+                .downcast_ref::<crate::pane::PaneUserVarsSnapshotBusy>()
+                .is_some());
+        }
+
+        let pane = Arc::new(make_legacy_test_pane(
+            816,
+            guardian_lifetime_test_terminal(),
+        ));
+        require_nonblocking_refusal(Arc::clone(&pane), pane.output_application.lock());
+        require_nonblocking_refusal(Arc::clone(&pane), pane.terminal.lock());
+        require_nonblocking_refusal(Arc::clone(&pane), pane.alert_staging.lock());
+
+        let mut snapshot = pane.capture_user_vars_snapshot(1, 64).unwrap();
+        assert!(snapshot.wait_ready().now_or_never().is_some());
+        assert!(snapshot.take_user_vars().is_empty());
+    }
+
+    #[test]
+    fn user_var_snapshot_does_not_retain_sparse_source_table_capacity() {
+        use futures::FutureExt;
+
+        let queue = crate::PaneAlertDispatchQueue::default();
+        let mut vars = HashMap::with_capacity(16_384);
+        vars.insert("name".to_string(), "value".to_string());
+        assert!(vars.capacity() >= 16_384);
+
+        let mut snapshot = crate::pane::PaneUserVarsSnapshot::capture(&vars, 1, 9, &queue).unwrap();
+        assert!(snapshot.wait_ready().now_or_never().is_some());
+        let retained = snapshot.take_user_vars();
+        assert_eq!(retained, vars);
+        assert!(
+            retained.capacity() <= 16,
+            "one entry must not inherit a formerly large source table"
         );
     }
 }

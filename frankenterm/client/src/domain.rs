@@ -1,13 +1,14 @@
 use crate::client::{
-    with_mux_rpc_bootstrap_timeout, Client, RpcConsumerKind, RpcGenerationAbortGuard,
-    RpcGenerationScope, RpcTopologySnapshot,
+    reserve_client_main_thread, with_mux_rpc_bootstrap_timeout, Client, RpcConsumerKind,
+    RpcGenerationAbortGuard, RpcGenerationScope, RpcTopologySnapshot,
 };
 use crate::pane::{ClientPane, ClientResizeCoordinator, QueuedResizeIntent, ReliableInputQueue};
 use anyhow::{anyhow, bail, ensure, Context};
 use async_trait::async_trait;
-use codec::{FloatingPaneSnapshotEntry, ListPanesResponse, SpawnV2, SplitPane};
+use codec::{FloatingPaneSnapshotEntry, ListPanesResponse, PduWireIdent, SpawnV2, SplitPane};
 use config::keyassignment::SpawnTabDomain;
 use config::{SshDomain, TlsDomainClient, UnixDomain};
+use futures::StreamExt;
 use mux::client::ClientId;
 use mux::connui::{ConnectionUI, ConnectionUIParams};
 use mux::domain::{alloc_domain_id, Domain, DomainId, DomainState};
@@ -25,11 +26,12 @@ use mux::{
 use portable_pty::CommandBuilder;
 use promise::spawn::spawn_into_new_thread;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::TryFrom;
 use std::future::Future;
 use std::hash::Hash;
 use std::marker::PhantomData;
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::rc::Rc;
 #[cfg(test)]
@@ -243,7 +245,79 @@ pub struct ClientInner {
     layout_tab_owners: Mutex<HashMap<TabId, WindowId>>,
     layout_snapshot: Mutex<Option<Arc<RemoteLayoutSnapshot>>>,
     layout_failed: AtomicBool,
+    user_var_hydration: Mutex<UserVarHydrationState>,
     detached: AtomicBool,
+}
+
+#[derive(Default)]
+struct UserVarHydrationState {
+    generation: Option<NonZeroU64>,
+    running: bool,
+    census_requested: bool,
+    pending_panes: BTreeSet<PaneId>,
+    waiters: Vec<async_channel::Sender<anyhow::Result<()>>>,
+}
+
+impl UserVarHydrationState {
+    fn request(&mut self, pane_id: Option<PaneId>) {
+        match pane_id {
+            Some(pane_id)
+                if !self.census_requested
+                    && (self.pending_panes.len() < 4096
+                        || self.pending_panes.contains(&pane_id)) =>
+            {
+                self.pending_panes.insert(pane_id);
+            }
+            Some(_) if self.census_requested => {}
+            // A burst beyond the bounded targeted set becomes one complete
+            // census rather than losing a refresh or retaining more IDs.
+            _ => {
+                self.census_requested = true;
+                self.pending_panes.clear();
+            }
+        }
+    }
+}
+
+fn user_var_snapshot_may_retry(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::client::RemoteRejectionError>()
+        .is_some_and(|error| {
+            error.response.request_ident == codec::GetPaneUserVarsV1::IDENT
+                && error.response.effect == codec::MuxErrorEffect::NOT_APPLIED
+                && error.response.retry == codec::MuxErrorRetry::SAFE_AFTER_BACKOFF
+        })
+}
+
+struct UserVarHydrationGuard {
+    inner: Arc<ClientInner>,
+    rpc: RpcGenerationScope,
+    armed: bool,
+}
+
+impl Drop for UserVarHydrationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let waiters = {
+            let mut state = lock_or_recover(&self.inner.user_var_hydration, "user_var_hydration");
+            if state.generation != self.rpc.connection_generation() {
+                return;
+            }
+            state.running = false;
+            state.census_requested = false;
+            state.pending_panes.clear();
+            std::mem::take(&mut state.waiters)
+        };
+        for waiter in waiters {
+            let _ = waiter.try_send(Err(anyhow!(
+                "user-variable hydration failed or was cancelled"
+            )));
+        }
+        self.rpc
+            .abort_exact_generation("user-variable hydration failed or was cancelled");
+    }
 }
 
 /// A committed attachment's remote identities. Construction is private: a
@@ -1833,6 +1907,7 @@ impl ClientInner {
             layout_tab_owners: Mutex::new(HashMap::new()),
             layout_snapshot: Mutex::new(None),
             layout_failed: AtomicBool::new(false),
+            user_var_hydration: Mutex::new(UserVarHydrationState::default()),
             detached: AtomicBool::new(false),
         }
     }
@@ -3270,6 +3345,7 @@ impl ClientDomain {
             .client
             .publish_rpc_transport_ready(&rpc, readiness_guard)
             .await?;
+        Self::request_user_var_hydration(Arc::clone(&mux), Arc::clone(&expected), rpc.clone())?;
         Self::flush_bootstrap_resizes(&mux, &expected);
         client_domain.refresh_layout_snapshot(&mux, &expected);
         ui.close();
@@ -3286,6 +3362,224 @@ impl ClientDomain {
             return Self::sync_remote_topology(mux, self, expected, rpc, None).await;
         }
         Ok(false)
+    }
+
+    /// Start or coalesce a complete metadata census after pane mappings and
+    /// transport readiness have committed. Only four bounded pane replies can
+    /// be outstanding, regardless of server population. Metadata convergence
+    /// therefore continues beyond the fixed connection-bootstrap timeout.
+    fn request_user_var_hydration(
+        mux: Arc<Mux>,
+        inner: Arc<ClientInner>,
+        rpc: RpcGenerationScope,
+    ) -> anyhow::Result<async_channel::Receiver<anyhow::Result<()>>> {
+        Self::request_user_var_hydration_inner(mux, inner, rpc, None)
+    }
+
+    pub(crate) fn request_pane_user_var_hydration(
+        mux: Arc<Mux>,
+        inner: Arc<ClientInner>,
+        rpc: RpcGenerationScope,
+        pane_id: PaneId,
+    ) -> anyhow::Result<()> {
+        Self::request_user_var_hydration_inner(mux, inner, rpc, Some(pane_id))?;
+        Ok(())
+    }
+
+    fn request_user_var_hydration_inner(
+        mux: Arc<Mux>,
+        inner: Arc<ClientInner>,
+        rpc: RpcGenerationScope,
+        pane_id: Option<PaneId>,
+    ) -> anyhow::Result<async_channel::Receiver<anyhow::Result<()>>> {
+        let (waiter, completion) = async_channel::bounded(1);
+        if !rpc
+            .agreed_codec_version()
+            .is_some_and(|version| version >= codec::GET_PANE_USER_VARS_V1_MIN_CODEC_VERSION)
+        {
+            metrics::counter!("mux.client.user_vars.hydration", "outcome" => "legacy_unavailable")
+                .increment(1);
+            log::debug!(
+                "remote codec has no authoritative user-variable snapshot protocol; initial background values remain unavailable until updated"
+            );
+            let _ = waiter.try_send(Ok(()));
+            return Ok(completion);
+        }
+        let generation = rpc
+            .connection_generation()
+            .context("user-variable hydration has no live generation")?;
+        let mut state = lock_or_recover(&inner.user_var_hydration, "user_var_hydration");
+        ensure!(
+            rpc.is_ready(),
+            "user-variable hydration requires committed RPC readiness"
+        );
+        if state.generation != Some(generation) {
+            *state = UserVarHydrationState {
+                generation: Some(generation),
+                ..UserVarHydrationState::default()
+            };
+        }
+        state.waiters.retain(|waiter| !waiter.is_closed());
+        ensure!(
+            state.waiters.len() < 64,
+            "user-variable hydration waiter limit reached"
+        );
+        let reservation = if state.running {
+            None
+        } else {
+            Some(reserve_client_main_thread(
+                promise::spawn::MainThreadServiceClass::Topology,
+                4096,
+                "user-variable hydration census",
+            )?)
+        };
+        state.waiters.push(waiter);
+        state.request(pane_id);
+        if let Some(reservation) = reservation {
+            state.running = true;
+            drop(state);
+            let mut guard = UserVarHydrationGuard {
+                inner: Arc::clone(&inner),
+                rpc: rpc.clone(),
+                armed: true,
+            };
+            reservation
+                .spawn(async move {
+                    let result = Self::hydrate_user_vars(&mux, &inner, &rpc, &mut guard).await;
+                    if let Err(error) = result {
+                        metrics::counter!("mux.client.user_vars.hydration", "outcome" => "failed")
+                            .increment(1);
+                        log::error!("remote user-variable hydration failed: {error:#}");
+                    }
+                })
+                .detach();
+        }
+        Ok(completion)
+    }
+
+    async fn hydrate_user_vars(
+        mux: &Arc<Mux>,
+        inner: &Arc<ClientInner>,
+        rpc: &RpcGenerationScope,
+        guard: &mut UserVarHydrationGuard,
+    ) -> anyhow::Result<()> {
+        let current = || {
+            rpc.is_ready()
+                && !inner.is_detached()
+                && mux.get_domain(inner.local_domain_id).is_some_and(|domain| {
+                    domain
+                        .downcast_ref::<Self>()
+                        .is_some_and(|domain| domain.inner_is_current(inner))
+                })
+        };
+        loop {
+            ensure!(current(), "user-variable hydration attachment retired");
+            let (full_census, targets) = {
+                let mut state = lock_or_recover(&inner.user_var_hydration, "user_var_hydration");
+                ensure!(
+                    state.generation == rpc.connection_generation(),
+                    "user-variable hydration generation changed"
+                );
+                (
+                    std::mem::take(&mut state.census_requested),
+                    std::mem::take(&mut state.pending_panes),
+                )
+            };
+            let mut panes = {
+                let mappings = lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane");
+                if full_census {
+                    mappings
+                        .iter()
+                        .map(|(remote, local)| (*remote, *local))
+                        .collect::<Vec<_>>()
+                } else {
+                    targets
+                        .into_iter()
+                        .filter_map(|remote| mappings.get(&remote).map(|local| (remote, *local)))
+                        .collect()
+                }
+            };
+            panes.sort_unstable_by_key(|(remote, _)| *remote);
+            let mut requests = futures::stream::iter(panes.into_iter().map(|(remote, local)| {
+                Self::hydrate_one_pane_user_vars(mux, inner, rpc, remote, local)
+            }))
+            .buffer_unordered(4);
+            while let Some(result) = requests.next().await {
+                result?;
+                ensure!(
+                    current(),
+                    "user-variable hydration attachment retired during reply application"
+                );
+            }
+            let waiters = {
+                let mut state = lock_or_recover(&inner.user_var_hydration, "user_var_hydration");
+                ensure!(
+                    state.generation == rpc.connection_generation(),
+                    "user-variable hydration generation changed before completion"
+                );
+                if state.census_requested || !state.pending_panes.is_empty() {
+                    continue;
+                }
+                state.running = false;
+                guard.armed = false;
+                std::mem::take(&mut state.waiters)
+            };
+            for waiter in waiters {
+                let _ = waiter.try_send(Ok(()));
+            }
+            metrics::counter!("mux.client.user_vars.hydration", "outcome" => "complete")
+                .increment(1);
+            return Ok(());
+        }
+    }
+
+    async fn hydrate_one_pane_user_vars(
+        mux: &Mux,
+        inner: &Arc<ClientInner>,
+        rpc: &RpcGenerationScope,
+        remote: PaneId,
+        local: PaneId,
+    ) -> anyhow::Result<()> {
+        // Scheduler and outbound quota pressure is temporary and explicitly
+        // retryable. Keep the same four census slots during backoff so a busy
+        // server cannot turn one census into an unbounded retry population.
+        for attempt in 0..8 {
+            ensure!(rpc.is_ready(), "user-variable hydration generation retired");
+            let belongs = mux.get_pane(local).is_some_and(|pane| {
+                pane.downcast_ref::<ClientPane>().is_some_and(|pane| {
+                    pane.belongs_to_client(inner) && pane.remote_pane_id() == remote
+                })
+            });
+            if !belongs {
+                return Ok(());
+            }
+            match rpc
+                .get_pane_user_vars_v1(codec::GetPaneUserVarsV1 { pane_id: remote })
+                .await
+            {
+                Ok(response) => {
+                    ensure!(
+                        response.pane_id == remote,
+                        "user-variable reply changed its requested pane identity"
+                    );
+                    return Ok(());
+                }
+                Err(error) if attempt < 7 && user_var_snapshot_may_retry(&error) => {
+                    metrics::counter!("mux.client.user_vars.hydration", "outcome" => "backoff")
+                        .increment(1);
+                    log::debug!("remote pane {remote} user-variable snapshot temporarily rejected: {error:#}");
+                    promise::spawn::sleep(std::time::Duration::from_millis(
+                        (50_u64 << attempt).min(2000),
+                    ))
+                    .await;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("hydrating remote pane {remote} user variables"));
+                }
+            }
+        }
+        unreachable!("the final metadata attempt returns its response or error")
     }
 
     async fn sync_remote_topology(
@@ -3344,6 +3638,9 @@ impl ClientDomain {
             })
             .map_err(anyhow::Error::new)??;
         domain.refresh_layout_snapshot(&mux, &inner);
+        if prepared && rpc.is_ready() {
+            Self::request_user_var_hydration(mux, inner, rpc.clone())?;
+        }
         Ok(prepared)
     }
 
@@ -4905,6 +5202,7 @@ impl ClientDomain {
         }
         .await;
         bootstrap_result?;
+        Self::request_user_var_hydration(Arc::clone(mux), Arc::clone(&inner), rpc.clone())?;
         Self::flush_bootstrap_resizes(mux, &inner);
         domain.refresh_layout_snapshot(mux, &inner);
         cleanup.disarm();
@@ -5131,7 +5429,7 @@ impl Domain for ClientDomain {
             })?;
             let rpc = inner.client.rpc_scope();
             ensure!(
-                Self::sync_remote_topology(Arc::clone(mux), self, inner, &rpc, window_id,).await?,
+                Self::sync_remote_topology(Arc::clone(mux), self, inner, &rpc, window_id).await?,
                 "client attachment retired while coalescing an attach request"
             );
             return Ok(());
@@ -6072,6 +6370,215 @@ mod tests {
             assert_eq!(mappings.get_remote(&local), Some(&remote));
         }
         assert_eq!(mappings.len(), 3);
+    }
+
+    #[test]
+    fn background_user_variable_hydration_covers_large_population_and_reconnection_with_four_slots()
+    {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let config = ClientDomainConfig::Unix(UnixDomain::default());
+        let (client, peer) = Client::new_test_client_with_rpc_peer(Some(91_038), config);
+        let inner = Arc::new(ClientInner::new(91_038, client, None, None, false));
+        let _domain = register_test_client_domain(&mux, &inner);
+        let pump = || {
+            for _ in 0..32 {
+                if !executor.try_tick().unwrap() {
+                    break;
+                }
+            }
+        };
+        for index in 0..600 {
+            let remote = 10_000 + index;
+            let local = 20_000 + index;
+            let pane: Arc<dyn Pane> = Arc::new(
+                ClientPane::new(
+                    &inner,
+                    local,
+                    51,
+                    remote,
+                    TerminalSize {
+                        cols: 80,
+                        rows: 24,
+                        pixel_width: 800,
+                        pixel_height: 480,
+                        dpi: 96,
+                    },
+                    "background shell",
+                    false,
+                )
+                .unwrap(),
+            );
+            mux.add_pane(&pane).unwrap();
+            lock_or_recover(&inner.remote_to_local_pane, "test metadata mapping")
+                .insert(remote, local);
+            // Pane registration independently sends the initial palette. Drain
+            // that setup one pane at a time before measuring census traffic.
+            pump();
+            assert!(matches!(
+                promise::spawn::block_on(peer.respond_next_unit()).unwrap(),
+                codec::Pdu::SetPalette(_)
+            ));
+            pump();
+        }
+        assert!(peer.is_empty());
+        for reconnect in [false, true] {
+            if reconnect {
+                peer.replace_ready_generation(&inner.client, codec::CODEC_VERSION)
+                    .unwrap();
+            }
+            let rpc = inner.client.rpc_scope();
+            let first = ClientDomain::request_user_var_hydration(
+                Arc::clone(&mux),
+                Arc::clone(&inner),
+                rpc.clone(),
+            )
+            .unwrap();
+            let coalesced = ClientDomain::request_user_var_hydration(
+                Arc::clone(&mux),
+                Arc::clone(&inner),
+                rpc.clone(),
+            )
+            .unwrap();
+            assert!(
+                rpc.is_ready(),
+                "background hydration must not revoke attachment readiness"
+            );
+            assert!(
+                first.try_recv().is_err(),
+                "the completion receipt must await the census"
+            );
+            assert!(
+                peer.is_empty(),
+                "starting a census must enqueue one worker, not one task per pane"
+            );
+            pump();
+            assert_eq!(peer.queued_len(), 4);
+            let mut observed = HashSet::new();
+            for _ in 0..600 {
+                assert!(
+                    peer.queued_len() <= 4,
+                    "census RPC concurrency must stay bounded as population grows"
+                );
+                let pane_id = promise::spawn::block_on(peer.respond_next_user_vars(
+                    codec::PaneUserVarsOutcomeV1::Snapshot {
+                        user_vars: HashMap::new(),
+                    },
+                ))
+                .unwrap();
+                assert!(
+                    observed.insert(pane_id),
+                    "coalescing before worker start must not repeat initial snapshots"
+                );
+                pump();
+            }
+            assert_eq!(observed, (10_000..10_600).collect());
+            first.try_recv().unwrap().unwrap();
+            coalesced.try_recv().unwrap().unwrap();
+            assert!(peer.is_empty());
+            assert!(!lock_or_recover(&inner.user_var_hydration, "test metadata worker").running);
+            for _ in 0..1000 {
+                ClientDomain::request_pane_user_var_hydration(
+                    Arc::clone(&mux),
+                    Arc::clone(&inner),
+                    rpc.clone(),
+                    10_023,
+                )
+                .unwrap();
+            }
+            pump();
+            assert_eq!(
+                peer.queued_len(),
+                1,
+                "a burst of new keys in one pane must not rescan the other 599 panes"
+            );
+            assert_eq!(
+                promise::spawn::block_on(peer.respond_next_user_vars(
+                    codec::PaneUserVarsOutcomeV1::Snapshot {
+                        user_vars: HashMap::new()
+                    },
+                ))
+                .unwrap(),
+                10_023
+            );
+            pump();
+            assert!(peer.is_empty());
+        }
+    }
+
+    #[test]
+    fn user_variable_refresh_targets_coalesce_and_overflow_to_one_complete_census() {
+        let mut state = UserVarHydrationState::default();
+        for pane in 0..4096 {
+            state.request(Some(pane));
+        }
+        state.request(Some(0));
+        assert_eq!(state.pending_panes.len(), 4096);
+        assert!(!state.census_requested);
+        state.request(Some(4096));
+        assert!(state.census_requested);
+        assert!(
+            state.pending_panes.is_empty(),
+            "overflow must retain a full census obligation without an unbounded ID set"
+        );
+        state.request(Some(4097));
+        assert!(
+            state.pending_panes.is_empty(),
+            "a pending census subsumes later targeted requests"
+        );
+        state.census_requested = false;
+        state.request(Some(3));
+        state.request(None);
+        assert!(state.census_requested);
+        assert!(state.pending_panes.is_empty());
+    }
+
+    #[test]
+    fn user_variable_hydration_skips_old_codecs_and_only_retries_typed_safe_rejections() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (client, peer) = Client::new_test_client_with_rpc_peer(
+            Some(91_039),
+            ClientDomainConfig::Unix(UnixDomain::default()),
+        );
+        peer.replace_ready_generation(&client, codec::GET_PANE_USER_VARS_V1_MIN_CODEC_VERSION - 1)
+            .unwrap();
+        let inner = Arc::new(ClientInner::new(91_039, client, None, None, false));
+        ClientDomain::request_user_var_hydration(
+            Arc::clone(&mux),
+            Arc::clone(&inner),
+            inner.client.rpc_scope(),
+        )
+        .unwrap()
+        .try_recv()
+        .unwrap()
+        .unwrap();
+        assert!(
+            peer.is_empty(),
+            "older codecs must never receive the additive metadata PDU"
+        );
+        let rejection = |response: codec::ErrorResponse| {
+            crate::client::remote_rejection_error(
+                "get_pane_user_vars_v1",
+                codec::GetPaneUserVarsV1::IDENT,
+                &response,
+            )
+        };
+        assert!(user_var_snapshot_may_retry(&rejection(
+            codec::ErrorResponse::quota_exceeded(codec::GetPaneUserVarsV1::IDENT)
+        )));
+        assert!(!user_var_snapshot_may_retry(&rejection(
+            codec::ErrorResponse::invalid_request(codec::GetPaneUserVarsV1::IDENT)
+        )));
+        assert!(!user_var_snapshot_may_retry(&rejection(
+            codec::ErrorResponse::quota_exceeded(codec::ListPanes::IDENT)
+        )));
+        assert!(!user_var_snapshot_may_retry(&anyhow!(
+            "unclassified transport failure"
+        )));
     }
 
     fn register_test_client_domain(mux: &Arc<Mux>, inner: &Arc<ClientInner>) -> Arc<ClientDomain> {

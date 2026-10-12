@@ -2143,7 +2143,66 @@ impl AdmittedHistoricalAlerts {
 /// needs. The successor is released only after delivery completes or cancels.
 #[derive(Default)]
 pub struct PaneAlertDispatchQueue {
-    tail: Mutex<Option<promise::Future<()>>>,
+    tail: Mutex<Option<PaneStatePublication>>,
+    // State publication must not wait for a Lua consumer: that consumer may
+    // itself need an authoritative metadata RPC before it can finish.
+    state_tail: Mutex<Option<PaneStatePublication>>,
+}
+
+pub(crate) type PaneStatePublication =
+    futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
+
+impl PaneAlertDispatchQueue {
+    fn fence_tail(
+        tail: &Mutex<Option<PaneStatePublication>>,
+    ) -> (Option<PaneStatePublication>, promise::Promise<()>) {
+        use futures::FutureExt;
+        let mut completion = promise::Promise::new();
+        let own_gate = completion
+            .get_future()
+            .expect("new state publication future");
+        let mut tail = tail.lock();
+        let predecessor = tail.take();
+        let prior = predecessor.clone();
+        *tail = Some(
+            async move {
+                // Cancellation releases only this producer's gate. A later
+                // producer still waits for all of its predecessors.
+                if let Some(prior) = prior {
+                    prior.await;
+                }
+                let _ = own_gate.await;
+            }
+            .boxed()
+            .shared(),
+        );
+        (predecessor, completion)
+    }
+
+    pub(crate) fn fence_state(&self) -> (Option<PaneStatePublication>, promise::Promise<()>) {
+        Self::fence_tail(&self.state_tail)
+    }
+}
+
+/// Separates ordered model publication from ordered historical callbacks.
+/// Dropping either phase releases its successor, including cancellation.
+pub struct PaneAlertDispatchOrdering {
+    state_completion: Option<promise::Promise<()>>,
+    historical_predecessor: Option<PaneStatePublication>,
+    _historical_completion: promise::Promise<()>,
+}
+
+impl PaneAlertDispatchOrdering {
+    /// Call after publishing every ordinary mux alert in the batch, before
+    /// invoking historical consumers. Metadata snapshots can then complete
+    /// even when a consumer awaits an RPC on this same pane.
+    pub async fn begin_history(&mut self) {
+        drop(self.state_completion.take());
+        if let Some(predecessor) = self.historical_predecessor.as_mut() {
+            predecessor.await;
+        }
+        self.historical_predecessor = None;
+    }
 }
 
 /// Both executor hops are funded before a producer changes its model. Dropping
@@ -2205,22 +2264,36 @@ impl FundedPaneAlertDispatch {
         B: std::future::Future<Output = ()> + Send + 'static,
         D: std::future::Future<Output = ()> + Send + 'static,
     {
-        let mut completion = promise::Promise::<()>::new();
-        let successor = completion
-            .get_future()
-            .expect("new alert completion future");
-        let predecessor = queue.tail.lock().replace(successor);
+        self.publish_stateful(queue, ready, move |mut ordering| async move {
+            ordering.begin_history().await;
+            deliver.await;
+        });
+    }
+
+    /// Publish state in producer order independently of historical callback
+    /// completion. The caller publishes its ordinary mux alerts, calls
+    /// `begin_history`, and only then invokes/awaits historical consumers.
+    pub fn publish_stateful<B, F, D>(self, queue: &PaneAlertDispatchQueue, ready: B, deliver: F)
+    where
+        B: std::future::Future<Output = ()> + Send + 'static,
+        F: FnOnce(PaneAlertDispatchOrdering) -> D + Send + 'static,
+        D: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (predecessor, completion) = PaneAlertDispatchQueue::fence_tail(&queue.tail);
+        let (state_predecessor, state_completion) = queue.fence_state();
+        let ordering = PaneAlertDispatchOrdering {
+            state_completion: Some(state_completion),
+            historical_predecessor: predecessor,
+            _historical_completion: completion,
+        };
         let Self { background, main } = self;
         background.spawn(async move {
-            if let Some(predecessor) = predecessor {
-                let _ = predecessor.await;
+            if let Some(predecessor) = state_predecessor {
+                predecessor.await;
             }
             ready.await;
             main.spawn(async move {
-                // Capture the entire promise before polling deliver: even an
-                // unpolled cancellation must release the next admitted batch.
-                let _completion = completion;
-                deliver.await;
+                deliver(ordering).await;
             })
             .detach();
         });
@@ -5188,7 +5261,9 @@ mod pane_registration_handle {
             self.deliver_historical(batch, &alert) && self.dispatch_alert(alert)
         }
 
-        pub(crate) fn dispatch_alert(&self, alert: Alert) -> bool {
+        /// Publish the ordinary mux occurrence without awaiting historical
+        /// subscribers. Callers retain this exact output generation.
+        pub fn dispatch_alert(&self, alert: Alert) -> bool {
             let Some(owner) = self.registration.generation.owner.upgrade() else {
                 return false;
             };
@@ -6617,6 +6692,30 @@ mod pane_registration_handle {
             Some(result)
         }
 
+        /// Capture metadata for this exact registration, retaining its output
+        /// continuation until the caller enqueues the response. Removal and
+        /// numeric-id reuse cannot pass an in-flight snapshot.
+        pub fn capture_user_vars_snapshot(
+            &self,
+            max_entries: usize,
+            max_text_bytes: usize,
+        ) -> Option<anyhow::Result<RegisteredPaneUserVarsSnapshot>> {
+            let pane = self.pane.upgrade()?;
+            let mux = self.generation.owner.upgrade()?;
+            let output = mux.reserve_pane_output_for_reader(
+                &pane,
+                &self.generation,
+                promise::spawn::is_scheduler_configured(),
+            )?;
+            Some(
+                pane.capture_user_vars_snapshot(max_entries, max_text_bytes)
+                    .map(|snapshot| RegisteredPaneUserVarsSnapshot {
+                        snapshot,
+                        _output: output,
+                    }),
+            )
+        }
+
         /// Capture recipients outside terminal/tab mutation locks. Membership
         /// is an admission snapshot; delivery revalidates current membership.
         pub fn reserve_alert_output(&self) -> Option<PaneAlertOutput> {
@@ -7165,6 +7264,22 @@ struct PaneOutputBatch {
 struct PaneOutputContinuation {
     batch: Arc<PaneOutputBatch>,
     operation: Option<PaneRegistrationOperationLease>,
+}
+
+/// An ordered metadata snapshot bound to one live pane incarnation.
+pub struct RegisteredPaneUserVarsSnapshot {
+    snapshot: pane::PaneUserVarsSnapshot,
+    _output: PaneOutputContinuation,
+}
+
+impl RegisteredPaneUserVarsSnapshot {
+    pub async fn wait_ready(&mut self) {
+        self.snapshot.wait_ready().await;
+    }
+
+    pub fn take_user_vars(&mut self) -> HashMap<String, String> {
+        self.snapshot.take_user_vars()
+    }
 }
 
 impl PaneOutputContinuation {

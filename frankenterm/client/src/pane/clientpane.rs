@@ -48,6 +48,10 @@ use wezterm_term::{
 };
 
 const MAX_RENDER_APPLICATION_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+// One complete accepted snapshot plus one complete replacement population can
+// overlap while bounded targeted refreshes reconcile silent source evictions.
+const MAX_CLIENT_USER_VARS: usize = 2 * MAX_PANE_USER_VARS;
+const MAX_CLIENT_USER_VAR_TEXT_BYTES: usize = 2 * MAX_PANE_USER_VAR_TEXT_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionReadError {
@@ -3383,19 +3387,31 @@ impl PreparedClientHistoricalAlerts {
             dispatch,
             alerts,
         } = self;
-        dispatch.publish(queue, std::future::ready(()), async move {
-            if committed.await.is_err() {
-                return;
-            }
-            for alert in alerts {
-                if !output.dispatch_historical(&mut receipts, alert) {
+        dispatch.publish_stateful(
+            queue,
+            std::future::ready(()),
+            move |mut ordering| async move {
+                if committed.await.is_err() {
                     return;
                 }
-                receipts.finish_delivered().await;
-            }
-            receipts.finish().await;
-            drop(output);
-        });
+                for alert in &alerts {
+                    if !output.dispatch_alert(alert.clone()) {
+                        return;
+                    }
+                }
+                // A Lua callback may issue another metadata RPC. The source
+                // snapshot waits only for state publication, not that callback.
+                ordering.begin_history().await;
+                for alert in alerts {
+                    if !output.deliver_historical(&mut receipts, &alert) {
+                        return;
+                    }
+                    receipts.finish_delivered().await;
+                }
+                receipts.finish().await;
+                drop(output);
+            },
+        );
         gate
     }
 }
@@ -3700,7 +3716,87 @@ fn validate_render_application_resources(
     Ok(())
 }
 
+/// Validate a whole historical batch before any pane state changes. Keeping
+/// only borrowed replacements also bounds scratch space by the admitted alert
+/// population, without cloning the complete retained variable map.
+fn validate_user_var_updates<'a>(
+    current: &HashMap<String, String>,
+    updates: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> anyhow::Result<()> {
+    let mut updates = updates.into_iter().peekable();
+    if updates.peek().is_none() {
+        return Ok(());
+    }
+    let mut count = current.len();
+    if count > MAX_CLIENT_USER_VARS {
+        bail!("client user-variable map exceeds {MAX_CLIENT_USER_VARS} entries");
+    }
+    let mut bytes = current.iter().try_fold(0usize, |bytes, (name, value)| {
+        bytes
+            .checked_add(name.len())
+            .and_then(|bytes| bytes.checked_add(value.len()))
+            .filter(|bytes| *bytes <= MAX_CLIENT_USER_VAR_TEXT_BYTES)
+            .context("client user-variable text limit exceeded")
+    })?;
+    let mut replacements: HashMap<&str, usize> = HashMap::new();
+    for (name, value) in updates {
+        let previous = replacements
+            .get(name)
+            .copied()
+            .or_else(|| current.get(name).map(String::len));
+        if let Some(previous) = previous {
+            bytes = bytes
+                .checked_sub(previous)
+                .context("client user-variable text accounting underflow")?;
+        } else {
+            count += 1;
+            if count > MAX_CLIENT_USER_VARS {
+                bail!("client user-variable map exceeds {MAX_CLIENT_USER_VARS} entries");
+            }
+            bytes = bytes
+                .checked_add(name.len())
+                .context("client user-variable text accounting overflow")?;
+        }
+        bytes = bytes
+            .checked_add(value.len())
+            .filter(|bytes| *bytes <= MAX_CLIENT_USER_VAR_TEXT_BYTES)
+            .context("client user-variable text limit exceeded")?;
+        replacements.insert(name, value.len());
+    }
+    Ok(())
+}
+
 impl ClientPane {
+    pub(crate) fn has_user_var(&self, name: &str) -> bool {
+        self.user_vars.lock().contains_key(name)
+    }
+
+    pub(crate) fn apply_user_vars_snapshot(
+        &self,
+        registration: &PaneRegistrationHandle,
+        rpc: &RpcGenerationScope,
+        user_vars: HashMap<String, String>,
+    ) -> anyhow::Result<bool> {
+        rpc.commit_sync(RpcConsumerKind::PaneUnilateral, || {
+            registration
+                .try_with_current(|current| {
+                    if !current.is_same_pane_ref(self) {
+                        return false;
+                    }
+                    let mut current_vars = self.user_vars.lock();
+                    if *current_vars == user_vars {
+                        return false;
+                    }
+                    // Absence is authoritative as well: reconnect and resync
+                    // must forget variables evicted or removed at the source.
+                    *current_vars = user_vars;
+                    true
+                })
+                .unwrap_or(false)
+        })
+        .map_err(anyhow::Error::new)
+    }
+
     fn owns_forwarded_read(&self, read: &ForwardedLayoutRead) -> bool {
         read.request.pane_id == self.remote_pane_id
             && read.rpc.same_generation(&self.client.client.rpc_scope())
@@ -4566,11 +4662,27 @@ impl ClientPane {
             }
         };
         let mut historical_commit = None;
+        let mut user_var_limit_error = None;
         let application = rpc.commit_sync(RpcConsumerKind::PaneUnilateral, || {
             let mut geometry_changed = false;
             let result = registration.try_with_current_output(|current| {
                 if !current.is_same_pane_ref(self) {
                     return None;
+                }
+                let mut user_vars = self.user_vars.lock();
+                if let Err(error) = validate_user_var_updates(
+                    &user_vars,
+                    alerts
+                        .iter()
+                        .filter_map(|notification| match &notification.alert {
+                            Alert::SetUserVar { name, value } => {
+                                Some((name.as_str(), value.as_str()))
+                            }
+                            _ => None,
+                        }),
+                ) {
+                    user_var_limit_error = Some(error);
+                    return Some(false);
                 }
                 let applied = {
                     let mut application = self.render_application_state.lock();
@@ -4591,6 +4703,17 @@ impl ClientPane {
                 if !applied {
                     return Some(false);
                 }
+                // Publish before releasing the map lock. A downstream mux
+                // captures its snapshot and FIFO cut under this same lock.
+                for NotifyAlert { alert, .. } in &alerts {
+                    if let Alert::SetUserVar { name, value } = alert {
+                        user_vars.insert(name.clone(), value.clone());
+                    }
+                }
+                if let Some(historical) = historical.take() {
+                    historical_commit = Some(historical.publish(&self.historical_alert_dispatch));
+                }
+                drop(user_vars);
                 *self.mouse_grabbed.lock() = mouse_grabbed;
                 *self.alt_screen_active.lock() = alt_screen_active;
 
@@ -4616,9 +4739,7 @@ impl ClientPane {
                 }
                 for NotifyAlert { alert, .. } in alerts {
                     match &alert {
-                        Alert::SetUserVar { name, value } => {
-                            self.user_vars.lock().insert(name.clone(), value.clone());
-                        }
+                        Alert::SetUserVar { .. } => {}
                         Alert::OutputSinceFocusLost => {
                             *self.unseen_output.lock() = true;
                         }
@@ -4631,9 +4752,6 @@ impl ClientPane {
                         current.dispatch_alert(alert);
                     }
                 }
-                if let Some(historical) = historical.take() {
-                    historical_commit = Some(historical.publish(&self.historical_alert_dispatch));
-                }
                 Some(true)
             });
             if geometry_changed {
@@ -4645,6 +4763,13 @@ impl ClientPane {
             result
         });
 
+        if let Some(error) = user_var_limit_error {
+            log::error!(
+                "remote pane {} user-variable retention rejected before render mutation: {error:#}",
+                self.remote_pane_id
+            );
+            rpc.abort_exact_generation("client user-variable retention limit exceeded");
+        }
         let failure_stage = match application {
             Ok(Some(Some(true))) => {
                 if let Some(mut gate) = historical_commit.take() {
@@ -4864,11 +4989,20 @@ impl ClientPane {
                     }
                 };
                 let mut historical_commit = None;
+                let mut user_var_limit_error = None;
                 rpc.commit_sync(RpcConsumerKind::PaneUnilateral, || {
                     let _ = registration.try_with_current(|current| {
+                        let mut user_vars = self.user_vars.lock();
                         match &alert {
                             Alert::SetUserVar { name, value } => {
-                                self.user_vars.lock().insert(name.clone(), value.clone());
+                                if let Err(error) = validate_user_var_updates(
+                                    &user_vars,
+                                    [(name.as_str(), value.as_str())],
+                                ) {
+                                    user_var_limit_error = Some(error);
+                                    return;
+                                }
+                                user_vars.insert(name.clone(), value.clone());
                             }
                             Alert::OutputSinceFocusLost => {
                                 *self.unseen_output.lock() = true;
@@ -4881,12 +5015,19 @@ impl ClientPane {
                         if let Some(historical) = historical.take() {
                             historical_commit =
                                 Some(historical.publish(&self.historical_alert_dispatch));
+                            drop(user_vars);
                         } else {
+                            drop(user_vars);
                             current.dispatch_alert(alert);
                         }
                     });
                 })
                 .map_err(anyhow::Error::new)?;
+                if let Some(error) = user_var_limit_error {
+                    log::error!("remote pane {} user-variable retention rejected before mutation: {error:#}", self.remote_pane_id);
+                    rpc.abort_exact_generation("client user-variable retention limit exceeded");
+                    return Err(error);
+                }
                 if let Some(mut gate) = historical_commit {
                     gate.result(Ok(()));
                 }
@@ -5842,6 +5983,39 @@ impl Pane for ClientPane {
 
     fn copy_user_vars(&self) -> HashMap<String, String> {
         self.user_vars.lock().clone()
+    }
+
+    fn capture_user_vars_snapshot(
+        &self,
+        max_entries: usize,
+        max_text_bytes: usize,
+    ) -> anyhow::Result<mux::pane::PaneUserVarsSnapshot> {
+        let user_vars = self
+            .user_vars
+            .try_lock()
+            .ok_or(mux::pane::PaneUserVarsSnapshotBusy)?;
+        let fits = user_vars.len() <= max_entries
+            && user_vars
+                .iter()
+                .try_fold(0usize, |bytes, (name, value)| {
+                    bytes
+                        .checked_add(name.len())
+                        .and_then(|bytes| bytes.checked_add(value.len()))
+                        .filter(|bytes| *bytes <= max_text_bytes)
+                })
+                .is_some();
+        if !fits {
+            // A live change can overlap evicted keys until the upstream
+            // targeted refresh arrives. Downstream clients retry that bounded
+            // transition instead of treating it as an oversized source map.
+            return Err(mux::pane::PaneUserVarsSnapshotBusy.into());
+        }
+        mux::pane::PaneUserVarsSnapshot::capture(
+            &user_vars,
+            max_entries,
+            max_text_bytes,
+            &self.historical_alert_dispatch,
+        )
     }
 
     fn get_semantic_zones(&self) -> anyhow::Result<Vec<SemanticZone>> {
@@ -10268,6 +10442,25 @@ mod tests {
         );
         while executor.try_tick().unwrap() {}
         assert_eq!(&*names.lock().unwrap(), &["first"]);
+        // Model a metadata request made by the still-running first Lua
+        // callback. State publication must complete independently of that
+        // callback's historical receipt, including the later legacy event.
+        let mut snapshot = pane.capture_user_vars_snapshot(1024, 1024 * 1024).unwrap();
+        {
+            let mut ready = Box::pin(snapshot.wait_ready());
+            let progress = promise::spawn::block_on(std::future::poll_fn(|context| {
+                Poll::Ready(ready.as_mut().poll(context))
+            }));
+            assert!(
+                matches!(progress, Poll::Ready(())),
+                "metadata snapshot must not await Lua historical completion"
+            );
+        }
+        assert_eq!(
+            snapshot.take_user_vars().get("legacy").map(String::as_str),
+            Some("value")
+        );
+        drop(snapshot);
         drop(held.lock().unwrap().take());
         pump(2);
         assert_eq!(&*names.lock().unwrap(), &["first", "second"]);
@@ -11464,6 +11657,195 @@ mod tests {
             "unexpected dual-owner rejection: {:#}",
             error,
         );
+    }
+
+    #[test]
+    fn live_user_variable_churn_fails_before_exceeding_retention_bounds() {
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(17);
+        let pane = test_client_pane(&inner, 32, 29);
+        let dynamic: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&dynamic).unwrap();
+        let registration = mux.capture_pane_registration(&dynamic).unwrap();
+        let rpc = inner.client.rpc_scope();
+        let initial = (0..MAX_CLIENT_USER_VARS)
+            .map(|index| (format!("key-{index}"), String::new()))
+            .collect();
+        pane.apply_user_vars_snapshot(&registration, &rpc, initial)
+            .unwrap();
+        let result = promise::spawn::block_on(pane.process_unilateral(
+            &registration,
+            &rpc,
+            Pdu::NotifyAlert(NotifyAlert {
+                pane_id: 29,
+                alert: Alert::SetUserVar {
+                    name: "one-too-many".into(),
+                    value: "rejected".into(),
+                },
+            }),
+        ));
+        assert!(result.is_err());
+        assert_eq!(pane.user_vars.lock().len(), MAX_CLIENT_USER_VARS);
+        assert!(!pane.has_user_var("one-too-many"));
+        assert!(
+            !rpc.is_ready(),
+            "overflow must retire the exact connection explicitly"
+        );
+    }
+
+    #[test]
+    fn user_variable_text_bounds_account_for_repeated_key_replacement() {
+        let map = HashMap::from([(
+            "key".to_string(),
+            "x".repeat(MAX_CLIENT_USER_VAR_TEXT_BYTES - 3),
+        )]);
+        assert!(validate_user_var_updates(&map, [("key", "small"), ("key", "new")]).is_ok());
+        assert!(validate_user_var_updates(&map, [("another-key", "")]).is_err());
+        assert!(validate_user_var_updates(&map, [("key", ""), ("another-key", "value")]).is_ok());
+        assert_eq!(
+            map["key"].len(),
+            MAX_CLIENT_USER_VAR_TEXT_BYTES - 3,
+            "preflight must not mutate before every bound has been checked"
+        );
+    }
+
+    #[test]
+    fn full_source_snapshot_allows_bounded_live_rollover_until_refresh() {
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(17);
+        let pane = test_client_pane(&inner, 32, 29);
+        let dynamic: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&dynamic).unwrap();
+        let registration = mux.capture_pane_registration(&dynamic).unwrap();
+        let rpc = inner.client.rpc_scope();
+        let initial: HashMap<_, _> = (0..MAX_PANE_USER_VARS)
+            .map(|index| (format!("key-{index}"), String::new()))
+            .collect();
+        pane.apply_user_vars_snapshot(&registration, &rpc, initial.clone())
+            .unwrap();
+        promise::spawn::block_on(pane.process_unilateral(
+            &registration,
+            &rpc,
+            Pdu::NotifyAlert(NotifyAlert {
+                pane_id: 29,
+                alert: Alert::SetUserVar {
+                    name: "new-key".into(),
+                    value: "ready".into(),
+                },
+            }),
+        ))
+        .unwrap();
+        assert!(rpc.is_ready());
+        assert_eq!(pane.user_vars.lock().len(), MAX_PANE_USER_VARS + 1);
+        let busy = pane
+            .capture_user_vars_snapshot(MAX_PANE_USER_VARS, MAX_PANE_USER_VAR_TEXT_BYTES)
+            .err()
+            .unwrap();
+        assert!(busy.is::<mux::pane::PaneUserVarsSnapshotBusy>());
+        let mut refreshed = initial;
+        refreshed.remove("key-0");
+        refreshed.insert("new-key".into(), "ready".into());
+        pane.apply_user_vars_snapshot(&registration, &rpc, refreshed)
+            .unwrap();
+        assert!(!pane.has_user_var("key-0"));
+        assert!(pane.has_user_var("new-key"));
+        assert!(pane
+            .capture_user_vars_snapshot(MAX_PANE_USER_VARS, MAX_PANE_USER_VAR_TEXT_BYTES)
+            .is_ok());
+    }
+
+    #[test]
+    fn user_variable_snapshot_replaces_evicted_values_without_historical_callbacks() {
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let observed = Arc::clone(&events);
+        mux.subscribe(move |notification| {
+            if let MuxNotification::Alert {
+                alert: Alert::SetUserVar { name, value },
+                ..
+            } = notification
+            {
+                observed.lock().unwrap().push((name, value));
+            }
+            true
+        })
+        .unwrap();
+        let inner = test_client_inner(17);
+        let pane = test_client_pane(&inner, 32, 29);
+        let dynamic: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&dynamic).unwrap();
+        let registration = mux.capture_pane_registration(&dynamic).unwrap();
+        let rpc = inner.client.rpc_scope();
+        pane.user_vars
+            .lock()
+            .insert("evicted-before-reconnect".into(), "old".into());
+        let snapshot: HashMap<_, _> = (0..600)
+            .map(|index| (format!("variable-{index}"), format!("value-{index}")))
+            .collect();
+        assert!(pane
+            .apply_user_vars_snapshot(&registration, &rpc, snapshot.clone())
+            .unwrap());
+        assert_eq!(pane.copy_user_vars(), snapshot);
+        assert!(
+            !pane
+                .apply_user_vars_snapshot(&registration, &rpc, snapshot)
+                .unwrap(),
+            "an unchanged census must not request another title refresh"
+        );
+        assert!(pane
+            .apply_user_vars_snapshot(&registration, &rpc, HashMap::new())
+            .unwrap());
+        assert!(
+            pane.copy_user_vars().is_empty(),
+            "an empty source map authoritatively removes old values"
+        );
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "initial metadata must not synthesize historical user-var events"
+        );
+        let _locked = pane.user_vars.lock();
+        let busy = pane
+            .capture_user_vars_snapshot(1024, 1024 * 1024)
+            .err()
+            .expect("snapshot capture must not block behind a map commit");
+        assert!(busy.is::<mux::pane::PaneUserVarsSnapshotBusy>());
+    }
+
+    #[test]
+    fn user_variable_snapshot_rejects_wrong_removed_and_retired_owners() {
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(17);
+        let pane = test_client_pane(&inner, 32, 29);
+        let other = test_client_pane(&inner, 33, 30);
+        let dynamic: Arc<dyn Pane> = pane.clone();
+        let other_dynamic: Arc<dyn Pane> = other.clone();
+        mux.add_pane(&dynamic).unwrap();
+        mux.add_pane(&other_dynamic).unwrap();
+        let registration = mux.capture_pane_registration(&dynamic).unwrap();
+        let other_registration = mux.capture_pane_registration(&other_dynamic).unwrap();
+        let rpc = inner.client.rpc_scope();
+        let snapshot = || HashMap::from([("state".into(), "must-not-apply".into())]);
+        assert!(!pane
+            .apply_user_vars_snapshot(&other_registration, &rpc, snapshot())
+            .unwrap());
+        mux.remove_pane(pane.pane_id());
+        assert!(!pane
+            .apply_user_vars_snapshot(&registration, &rpc, snapshot())
+            .unwrap());
+        rpc.abort_exact_generation("retire snapshot test generation");
+        assert!(other
+            .apply_user_vars_snapshot(&other_registration, &rpc, snapshot())
+            .is_err());
+        assert!(pane.copy_user_vars().is_empty());
+        assert!(other.copy_user_vars().is_empty());
     }
 
     #[test]

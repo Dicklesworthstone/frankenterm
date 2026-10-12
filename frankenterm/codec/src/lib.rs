@@ -3569,6 +3569,18 @@ macro_rules! pdu_encoded_body_limit {
             max_zstd_encoded_bytes: MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_ZSTD_ENCODED_BYTES,
         }
     };
+    (GetPaneUserVarsV1, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_PANE_USER_VARS_REQUEST_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_PANE_USER_VARS_REQUEST_ZSTD_ENCODED_BYTES,
+        }
+    };
+    (GetPaneUserVarsV1Response, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_PANE_USER_VARS_RESPONSE_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_PANE_USER_VARS_RESPONSE_ZSTD_ENCODED_BYTES,
+        }
+    };
     (GetImageCellResponse, none) => {
         PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
             max_decompressed_bytes: MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES,
@@ -4324,7 +4336,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 69;
+pub const CODEC_VERSION: usize = 70;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -4914,6 +4926,12 @@ pdu! {
         => deserialize_get_pane_domains_v1_response;
     GetPaneRenderStateV1: 114, 69, client_request, none,
         render, render, normal;
+    GetPaneUserVarsV1: 115, 70, client_request, none,
+        state_sync, query, normal
+        => deserialize_get_pane_user_vars_v1;
+    GetPaneUserVarsV1Response: 116, 70, server_reply, none,
+        state_sync, bulk_data, bulk
+        => deserialize_get_pane_user_vars_v1_response;
 }
 
 impl Pdu {
@@ -4934,6 +4952,7 @@ impl Pdu {
             Self::EvictPaneWarmScrollbackV1Response(value) => value.validate()?,
             Self::GetPaneDomainsV1(value) => value.validate()?,
             Self::GetPaneDomainsV1Response(value) => value.validate()?,
+            Self::GetPaneUserVarsV1Response(value) => value.validate()?,
             Self::SendKeyDownTracedV1(value) => value.validate()?,
             Self::SendPasteTracedV1(value) => value.validate()?,
             Self::ReliableKeyEventV1(value) => value.validate()?,
@@ -6414,6 +6433,8 @@ impl Pdu {
                 ..
             }) => pane_id.try_into_mux().ok(),
             Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse { pane_id, .. })
+            | Pdu::GetPaneUserVarsV1(GetPaneUserVarsV1 { pane_id })
+            | Pdu::GetPaneUserVarsV1Response(GetPaneUserVarsV1Response { pane_id, .. })
             | Pdu::GetLinesAtLayout(GetLinesAtLayout { pane_id, .. })
             | Pdu::GetLinesAtLayoutResponse(GetLinesAtLayoutResponse { pane_id, .. })
             | Pdu::CaptureSelectionAnchorV1(CaptureSelectionAnchorV1 { pane_id, .. })
@@ -14774,6 +14795,242 @@ fn deserialize_get_pane_domains_v1_response(
     Ok(response)
 }
 
+pub const GET_PANE_USER_VARS_V1_MIN_CODEC_VERSION: usize = 70;
+pub const MAX_PANE_USER_VARS: usize = 16_384;
+pub const MAX_PANE_USER_VARS_REQUEST_DECOMPRESSED_BYTES: usize = 16;
+pub const MAX_PANE_USER_VARS_REQUEST_ZSTD_ENCODED_BYTES: usize = 128;
+pub const MAX_PANE_USER_VARS_RESPONSE_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_PANE_USER_VARS_RESPONSE_ZSTD_ENCODED_BYTES: usize = 16 * 1024 * 1024;
+/// Aggregate UTF-8 bytes in the keys and values of one complete snapshot.
+/// The reserved space covers both length prefixes of every possible entry,
+/// the map length, pane id, and outcome tag even at their widest encodings.
+pub const MAX_PANE_USER_VAR_TEXT_BYTES: usize =
+    MAX_PANE_USER_VARS_RESPONSE_DECOMPRESSED_BYTES - 32 * MAX_PANE_USER_VARS - 64;
+
+/// Read a complete user-variable map without registering a pane for rendering.
+/// Clients request snapshots after installing any supported pane census and
+/// order their application with `NotifyAlert(SetUserVar)` on the same stream.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GetPaneUserVarsV1 {
+    pub pane_id: PaneId,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PaneUserVarsOutcomeV1 {
+    /// Authoritative replacement, including an empty map. This also clears
+    /// values evicted by the terminal since a client's previous snapshot.
+    Snapshot {
+        #[serde(
+            serialize_with = "serialize_pane_user_vars",
+            deserialize_with = "deserialize_pane_user_vars"
+        )]
+        user_vars: HashMap<String, String>,
+    },
+    /// The requested exact pane registration was absent or retired.
+    PaneGone,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GetPaneUserVarsV1Response {
+    pub pane_id: PaneId,
+    pub outcome: PaneUserVarsOutcomeV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum PaneUserVarsError {
+    #[error("pane user variable count {count} exceeds maximum {max}")]
+    TooManyEntries { count: usize, max: usize },
+    #[error("pane user variable text exceeds maximum {max} bytes")]
+    TextLimit { max: usize },
+}
+
+fn checked_pane_user_var_text_bytes(
+    retained: usize,
+    name: &str,
+    value: &str,
+) -> Result<usize, PaneUserVarsError> {
+    retained
+        .checked_add(name.len())
+        .and_then(|bytes| bytes.checked_add(value.len()))
+        .filter(|bytes| *bytes <= MAX_PANE_USER_VAR_TEXT_BYTES)
+        .ok_or(PaneUserVarsError::TextLimit {
+            max: MAX_PANE_USER_VAR_TEXT_BYTES,
+        })
+}
+
+fn validate_pane_user_vars(user_vars: &HashMap<String, String>) -> Result<(), PaneUserVarsError> {
+    if user_vars.len() > MAX_PANE_USER_VARS {
+        return Err(PaneUserVarsError::TooManyEntries {
+            count: user_vars.len(),
+            max: MAX_PANE_USER_VARS,
+        });
+    }
+    user_vars.iter().try_fold(0, |retained, (name, value)| {
+        checked_pane_user_var_text_bytes(retained, name, value)
+    })?;
+    Ok(())
+}
+
+impl GetPaneUserVarsV1Response {
+    pub fn validate(&self) -> Result<(), PaneUserVarsError> {
+        if let PaneUserVarsOutcomeV1::Snapshot { user_vars } = &self.outcome {
+            validate_pane_user_vars(user_vars)?;
+        }
+        Ok(())
+    }
+}
+
+fn serialize_pane_user_vars<S>(
+    user_vars: &HashMap<String, String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap as _;
+
+    validate_pane_user_vars(user_vars).map_err(serde::ser::Error::custom)?;
+    // HashMap iteration must not make two identical snapshots produce
+    // different wire bytes. The count was admitted before allocating refs.
+    let mut entries = user_vars.iter().collect::<Vec<_>>();
+    entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    let mut map = serializer.serialize_map(Some(entries.len()))?;
+    for (name, value) in entries {
+        map.serialize_entry(name, value)?;
+    }
+    map.end()
+}
+
+struct PaneUserVarText(String);
+
+impl<'de> Deserialize<'de> for PaneUserVarText {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct TextVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for TextVisitor {
+            type Value = PaneUserVarText;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("bounded pane user variable text")
+            }
+
+            fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let text = String::deserialize(deserializer)?;
+                if text.len() > MAX_PANE_USER_VAR_TEXT_BYTES {
+                    return Err(serde::de::Error::custom(PaneUserVarsError::TextLimit {
+                        max: MAX_PANE_USER_VAR_TEXT_BYTES,
+                    }));
+                }
+                Ok(PaneUserVarText(text))
+            }
+        }
+
+        deserializer.deserialize_newtype_struct(
+            bounded_varbincode::PANE_USER_VAR_TEXT_V1_NEWTYPE,
+            TextVisitor,
+        )
+    }
+}
+
+struct PaneUserVarsVisitor;
+
+impl<'de> serde::de::Visitor<'de> for PaneUserVarsVisitor {
+    type Value = HashMap<String, String>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a bounded map of unique pane user variables")
+    }
+
+    fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(self)
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let hinted = map.size_hint().unwrap_or(0);
+        if hinted > MAX_PANE_USER_VARS {
+            return Err(serde::de::Error::custom(
+                PaneUserVarsError::TooManyEntries {
+                    count: hinted,
+                    max: MAX_PANE_USER_VARS,
+                },
+            ));
+        }
+        let mut user_vars = HashMap::new();
+        user_vars.try_reserve(hinted).map_err(|_| {
+            serde::de::Error::custom("could not allocate bounded pane user variable map")
+        })?;
+        let mut retained = 0;
+        while let Some(PaneUserVarText(name)) = map.next_key()? {
+            if user_vars.len() >= MAX_PANE_USER_VARS {
+                return Err(serde::de::Error::custom(
+                    PaneUserVarsError::TooManyEntries {
+                        count: user_vars.len().saturating_add(1),
+                        max: MAX_PANE_USER_VARS,
+                    },
+                ));
+            }
+            if user_vars.contains_key(&name) {
+                return Err(serde::de::Error::custom(
+                    "pane user variable snapshot contains a duplicate key",
+                ));
+            }
+            let PaneUserVarText(value) = map.next_value()?;
+            retained = checked_pane_user_var_text_bytes(retained, &name, &value)
+                .map_err(serde::de::Error::custom)?;
+            user_vars.insert(name, value);
+        }
+        Ok(user_vars)
+    }
+}
+
+fn deserialize_pane_user_vars<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserializer.deserialize_newtype_struct(
+        bounded_varbincode::PANE_USER_VARS_V1_NEWTYPE,
+        PaneUserVarsVisitor,
+    )
+}
+
+fn deserialize_get_pane_user_vars_v1(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<GetPaneUserVarsV1, Error> {
+    deserialize_exact_payload_with_limit(
+        data,
+        is_compressed,
+        "GetPaneUserVarsV1",
+        MAX_PANE_USER_VARS_REQUEST_DECOMPRESSED_BYTES,
+    )
+}
+
+fn deserialize_get_pane_user_vars_v1_response(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<GetPaneUserVarsV1Response, Error> {
+    let response: GetPaneUserVarsV1Response = deserialize_exact_payload_with_limit(
+        data,
+        is_compressed,
+        "GetPaneUserVarsV1Response",
+        MAX_PANE_USER_VARS_RESPONSE_DECOMPRESSED_BYTES,
+    )?;
+    response.validate()?;
+    Ok(response)
+}
+
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetSemanticZones {
     pub pane_id: PaneId,
@@ -22381,7 +22638,7 @@ mod test {
 
     #[test]
     fn codec_v65_additive_line_layout_preserves_the_v61_compatibility_floor() {
-        assert_eq!(CODEC_VERSION, 69);
+        assert_eq!(CODEC_VERSION, 70);
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
         assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 54);
         assert!(!codec_version_supports_ordered_window_v1(50));
@@ -24234,7 +24491,7 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 69);
+        assert_eq!(CODEC_VERSION, 70);
     }
 
     #[test]
@@ -24248,6 +24505,239 @@ mod test {
             request.minimum_codec_version(),
             Some(GET_PANE_RENDER_STATE_V1_MIN_CODEC_VERSION)
         );
+    }
+
+    #[test]
+    fn pane_user_vars_round_trip_empty_populated_and_removed_at_codec_70() {
+        let request = Pdu::GetPaneUserVarsV1(GetPaneUserVarsV1 {
+            pane_id: PaneId::MAX,
+        });
+        let populated = HashMap::from([
+            ("agent".to_string(), "claude".to_string()),
+            ("stage".to_string(), "🦀 compiling".to_string()),
+        ]);
+        for pdu in [
+            request,
+            Pdu::GetPaneUserVarsV1Response(GetPaneUserVarsV1Response {
+                pane_id: 42,
+                outcome: PaneUserVarsOutcomeV1::Snapshot {
+                    user_vars: populated,
+                },
+            }),
+            Pdu::GetPaneUserVarsV1Response(GetPaneUserVarsV1Response {
+                pane_id: 42,
+                outcome: PaneUserVarsOutcomeV1::Snapshot {
+                    user_vars: HashMap::new(),
+                },
+            }),
+            Pdu::GetPaneUserVarsV1Response(GetPaneUserVarsV1Response {
+                pane_id: 42,
+                outcome: PaneUserVarsOutcomeV1::PaneGone,
+            }),
+        ] {
+            for mode in [CompressionMode::Never, CompressionMode::Always] {
+                let frame = pdu.encode_frame_with_mode(17, mode).unwrap();
+                let decoded = Pdu::decode(frame.as_slice()).unwrap();
+                assert_eq!(decoded.serial, 17);
+                assert_eq!(decoded.pdu, pdu);
+            }
+            assert_eq!(pdu.minimum_codec_version(), Some(70));
+        }
+        assert_eq!(GET_PANE_USER_VARS_V1_MIN_CODEC_VERSION, 70);
+        assert_eq!(GetPaneUserVarsV1::IDENT, 115);
+        assert_eq!(GetPaneUserVarsV1Response::IDENT, 116);
+        assert_eq!(
+            check_compat(CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, 69, 61),
+            Ok(CompatDecision::Compatible { agreed: 69 }),
+            "older peers remain compatible without receiving the new request"
+        );
+        assert!(
+            !GetPaneUserVarsV1Response::WIRE_SPEC
+                .authorizes(PduProducer::Server, PduWireRole::Unilateral),
+            "snapshots must not consume pre-ready unilateral capacity"
+        );
+    }
+
+    #[test]
+    fn pane_user_vars_maximal_count_and_text_fit_one_bounded_response() {
+        let mut user_vars = (0..MAX_PANE_USER_VARS)
+            .map(|index| (format!("var{index:05}"), String::new()))
+            .collect::<HashMap<_, _>>();
+        let key_bytes = user_vars.keys().map(String::len).sum::<usize>();
+        *user_vars.get_mut("var00000").unwrap() =
+            "v".repeat(MAX_PANE_USER_VAR_TEXT_BYTES - key_bytes);
+        let response = GetPaneUserVarsV1Response {
+            pane_id: PaneId::MAX,
+            outcome: PaneUserVarsOutcomeV1::Snapshot { user_vars },
+        };
+        response.validate().unwrap();
+        let pdu = Pdu::GetPaneUserVarsV1Response(response);
+        for mode in [CompressionMode::Never, CompressionMode::Always] {
+            let frame = pdu.encode_frame_with_mode(18, mode).unwrap();
+            assert_eq!(Pdu::decode(frame.as_slice()).unwrap().pdu, pdu);
+            if mode == CompressionMode::Never {
+                assert!(
+                    decode_raw(frame.as_slice()).unwrap().data.len()
+                        <= MAX_PANE_USER_VARS_RESPONSE_DECOMPRESSED_BYTES
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pane_user_var_snapshot_encoding_is_deterministic() {
+        let encode = |entries: [(&str, &str); 3]| {
+            Pdu::GetPaneUserVarsV1Response(GetPaneUserVarsV1Response {
+                pane_id: 7,
+                outcome: PaneUserVarsOutcomeV1::Snapshot {
+                    user_vars: entries
+                        .iter()
+                        .map(|&(name, value)| (name.to_string(), value.to_string()))
+                        .collect(),
+                },
+            })
+            .encode_frame_with_mode(19, CompressionMode::Never)
+            .unwrap()
+        };
+        assert_eq!(
+            encode([("z", "last"), ("a", "first"), ("m", "middle")]),
+            encode([("m", "middle"), ("a", "first"), ("z", "last")])
+        );
+    }
+
+    #[test]
+    fn pane_user_vars_reject_oversized_producer_maps_without_truncation() {
+        let response = |user_vars| {
+            Pdu::GetPaneUserVarsV1Response(GetPaneUserVarsV1Response {
+                pane_id: 7,
+                outcome: PaneUserVarsOutcomeV1::Snapshot { user_vars },
+            })
+        };
+        assert!(response(
+            (0..=MAX_PANE_USER_VARS)
+                .map(|index| (index.to_string(), String::new()))
+                .collect()
+        )
+        .encode_frame(20)
+        .is_err());
+        assert!(
+            response(HashMap::from([(
+                "x".to_string(),
+                "y".repeat(MAX_PANE_USER_VAR_TEXT_BYTES)
+            )]))
+            .encode_frame(20)
+            .is_err(),
+            "aggregate byte accounting must include variable names"
+        );
+    }
+
+    #[test]
+    fn pane_user_vars_reject_hostile_lengths_and_duplicate_keys_before_retention() {
+        let frame_response = |payload: &[u8], compressed| {
+            let mut frame = Vec::new();
+            encode_raw(
+                GetPaneUserVarsV1Response::IDENT,
+                21,
+                payload,
+                compressed,
+                &mut frame,
+            )
+            .unwrap();
+            frame
+        };
+        // The integer tuple matches pane-id, Snapshot enum tag, and map
+        // count. No entries follow: the declared count must fail before EOF.
+        let (count_payload, _) = serialize_with_mode(
+            &(42_usize, 0_u32, MAX_PANE_USER_VARS + 1),
+            CompressionMode::Never,
+        )
+        .unwrap();
+        let error = Pdu::decode(frame_response(&count_payload, false).as_slice()).unwrap_err();
+        assert!(format!("{error:#}").contains("pane user variables length"));
+        assert!(format!("{error:#}").contains(&MAX_PANE_USER_VARS.to_string()));
+
+        // An oversized key length is rejected before allocating or trying to
+        // read its missing bytes, under the user-var-specific text admission.
+        let (text_payload, _) = serialize_with_mode(
+            &(42_usize, 0_u32, 1_usize, MAX_PANE_USER_VAR_TEXT_BYTES + 1),
+            CompressionMode::Never,
+        )
+        .unwrap();
+        let error = Pdu::decode(frame_response(&text_payload, false).as_slice()).unwrap_err();
+        assert!(format!("{error:#}").contains("pane user variable text bytes length"));
+
+        // A sequence of string pairs has the map's raw varbincode shape and
+        // lets this malformed producer retain a repeated key on the wire.
+        for mode in [CompressionMode::Never, CompressionMode::Always] {
+            let (duplicate, compressed) = serialize_with_mode(
+                &(42_usize, 0_u32, vec![("stage", "old"), ("stage", "new")]),
+                mode,
+            )
+            .unwrap();
+            let error = Pdu::decode(frame_response(&duplicate, compressed).as_slice()).unwrap_err();
+            assert!(format!("{error:#}").contains("duplicate key"));
+        }
+    }
+
+    #[test]
+    fn pane_user_vars_exact_decoders_reject_trailing_schema_bytes_and_oversized_frames() {
+        let request = GetPaneUserVarsV1 { pane_id: 9 };
+        let response = GetPaneUserVarsV1Response {
+            pane_id: 9,
+            outcome: PaneUserVarsOutcomeV1::PaneGone,
+        };
+        for (ident, payload) in [
+            (
+                GetPaneUserVarsV1::IDENT,
+                serialize_with_mode(&request, CompressionMode::Never)
+                    .unwrap()
+                    .0,
+            ),
+            (
+                GetPaneUserVarsV1Response::IDENT,
+                serialize_with_mode(&response, CompressionMode::Never)
+                    .unwrap()
+                    .0,
+            ),
+        ] {
+            let mut trailing = payload;
+            trailing.push(0);
+            for compressed in [false, true] {
+                let body = if compressed {
+                    zstd::encode_all(trailing.as_slice(), 0).unwrap()
+                } else {
+                    trailing.clone()
+                };
+                let mut frame = Vec::new();
+                encode_raw(ident, 22, &body, compressed, &mut frame).unwrap();
+                let error = Pdu::decode(frame.as_slice()).unwrap_err();
+                assert!(format!("{error:#}").contains("trailing"));
+            }
+        }
+        for (spec, plain, compressed) in [
+            (
+                GetPaneUserVarsV1::WIRE_SPEC,
+                MAX_PANE_USER_VARS_REQUEST_DECOMPRESSED_BYTES,
+                MAX_PANE_USER_VARS_REQUEST_ZSTD_ENCODED_BYTES,
+            ),
+            (
+                GetPaneUserVarsV1Response::WIRE_SPEC,
+                MAX_PANE_USER_VARS_RESPONSE_DECOMPRESSED_BYTES,
+                MAX_PANE_USER_VARS_RESPONSE_ZSTD_ENCODED_BYTES,
+            ),
+        ] {
+            assert_eq!(
+                spec.encoded_body_limit,
+                PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+                    max_decompressed_bytes: plain,
+                    max_zstd_encoded_bytes: compressed,
+                }
+            );
+            assert!(compressed >= zstd::zstd_safe::compress_bound(plain));
+            let mut frame = Vec::new();
+            encode_raw(spec.ident, 23, &vec![0; plain + 1], false, &mut frame).unwrap();
+            assert!(Pdu::decode(frame.as_slice()).is_err());
+        }
     }
 
     #[test]
@@ -24856,7 +25346,7 @@ mod test {
     fn pdu_wire_registry_covers_every_assigned_id_and_only_the_historical_gaps() {
         const GAPS: &[u64] = &[5, 6, 7, 15, 16, 17, 18, 19, 21];
 
-        for ident in 0..=114 {
+        for ident in 0..=116 {
             let spec = Pdu::wire_spec_for_ident(ident);
             assert_eq!(
                 spec.is_none(),
@@ -24870,9 +25360,9 @@ mod test {
             }
         }
 
-        assert!(Pdu::wire_spec_for_ident(115).is_none());
+        assert!(Pdu::wire_spec_for_ident(117).is_none());
         assert!(Pdu::wire_spec_for_ident(u64::MAX).is_none());
-        assert_eq!(Pdu::all_wire_specs().len(), 115 - GAPS.len());
+        assert_eq!(Pdu::all_wire_specs().len(), 117 - GAPS.len());
     }
 
     #[test]
@@ -24917,6 +25407,7 @@ mod test {
                 110..=111 => 67,
                 112..=113 => 68,
                 114 => 69,
+                115..=116 => 70,
                 ident => panic!("unexpected assigned PDU ID {}", ident),
             };
             assert_eq!(
@@ -24952,10 +25443,11 @@ mod test {
             1, 3, 9, 11, 12, 13, 14, 22, 24, 26, 28, 31, 33, 34, 35, 36, 38, 40, 41, 43, 45, 46,
             48, 50, 51, 56, 57, 58, 59, 60, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
             77, 80, 81, 85, 86, 88, 91, 93, 95, 96, 98, 99, 100, 102, 104, 106, 108, 110, 112, 114,
+            115,
         ];
         const SERVER_REPLIES: &[u64] = &[
             0, 2, 4, 8, 10, 23, 25, 27, 29, 30, 32, 42, 47, 49, 52, 61, 76, 78, 82, 87, 89, 92, 94,
-            97, 101, 103, 105, 107, 109, 111, 113,
+            97, 101, 103, 105, 107, 109, 111, 113, 116,
         ];
         const SERVER_UNILATERALS: &[u64] = &[
             20, 25, 37, 38, 39, 44, 53, 54, 55, 56, 57, 58, 79, 83, 84, 90,
@@ -25050,9 +25542,22 @@ mod test {
                 | 74
                 | 88
                 | 89 => Class::InteractiveState,
-                3 | 4 | 37 | 39 | 44 | 53..=55 | 75 | 76 | 81..=83 | 86 | 87 | 90 | 110 | 111 => {
-                    Class::StateSync
-                }
+                3
+                | 4
+                | 37
+                | 39
+                | 44
+                | 53..=55
+                | 75
+                | 76
+                | 81..=83
+                | 86
+                | 87
+                | 90
+                | 110
+                | 111
+                | 115
+                | 116 => Class::StateSync,
                 24 | 25 | 79 | 80 | 84 | 85 | 91 | 92 | 114 => Class::Render,
                 22 | 31 | 41 | 46 | 51 | 52 | 60 | 61 | 77 | 93 | 102 | 104..=109 | 112 => {
                     Class::Query
@@ -25084,8 +25589,9 @@ mod test {
                 | 93
                 | 102
                 | 104..=109
-                | 112 => Cap::Query,
-                4 | 13 | 20 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 99 | 103 | 113 => {
+                | 112
+                | 115 => Cap::Query,
+                4 | 13 | 20 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 99 | 103 | 113 | 116 => {
                     Cap::BulkData
                 }
                 ident => panic!("PDU {} is missing from the admission-cap census", ident),
@@ -25126,8 +25632,9 @@ mod test {
                 | 90..=93
                 | 102
                 | 104..=112
-                | 114 => Qos::Normal,
-                4 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 103 | 113 => Qos::Bulk,
+                | 114
+                | 115 => Qos::Normal,
+                4 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 | 103 | 113 | 116 => Qos::Bulk,
                 ident => panic!("PDU {} is missing from the queue-QoS census", ident),
             };
 
@@ -26074,7 +26581,7 @@ mod test {
     #[test]
     fn check_compat_current_build_keeps_v61_floor_after_additive_v65() {
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
-        assert_eq!(CODEC_VERSION, 69);
+        assert_eq!(CODEC_VERSION, 70);
         assert!(check_compat(62, 61, 60, 58).is_err());
         assert_eq!(
             check_compat(62, 61, 61, 61),
@@ -26959,21 +27466,21 @@ mod test {
 
     #[test]
     fn decode_accepts_valid_non_canonical_leb128_headers() {
-        let wire = [0x84, 0x00, 0x81, 0x00, 0xF3, 0x00];
+        let wire = [0x84, 0x00, 0x81, 0x00, 0xF5, 0x00];
         let decoded = Pdu::decode(wire.as_slice()).expect("valid non-canonical header");
         assert_eq!(decoded.serial, 1);
-        assert_eq!(decoded.pdu, Pdu::Invalid { ident: 115 });
+        assert_eq!(decoded.pdu, Pdu::Invalid { ident: 117 });
     }
 
     #[test]
     fn decode_raw_async_accepts_valid_non_canonical_leb128_headers() {
         runtime::block_on(async {
-            let mut reader = runtime::Cursor::new(vec![0x84, 0x00, 0x81, 0x00, 0xF3, 0x00]);
+            let mut reader = runtime::Cursor::new(vec![0x84, 0x00, 0x81, 0x00, 0xF5, 0x00]);
             let decoded = Pdu::decode_async(&mut reader, None)
                 .await
                 .expect("valid non-canonical header");
             assert_eq!(decoded.serial, 1);
-            assert_eq!(decoded.pdu, Pdu::Invalid { ident: 115 });
+            assert_eq!(decoded.pdu, Pdu::Invalid { ident: 117 });
         });
     }
 

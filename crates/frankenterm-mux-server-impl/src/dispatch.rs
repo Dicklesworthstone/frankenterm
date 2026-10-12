@@ -76,13 +76,14 @@ const PANE_ALERT_BACKLOG_FAILURE: &str =
 const TOPOLOGY_FENCE_MAX_EVENTS: usize = 4096;
 const TOPOLOGY_FENCE_MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024;
 /// Accounted topology values retain their original 4 MiB connection ceiling;
-/// a complete snapshot frame has a separate ceiling shared by PDU82 and PDU87.
+/// complete snapshots have a separate ceiling shared by PDU82, PDU87 and PDU116.
 /// Their aggregate
 /// permits one maximum snapshot to coexist with the separately bounded
 /// successor queue, while each class remains unable to borrow the other's
-/// tranche. This retained-owner budget begins when the complete encoded frame
-/// is reserved; codec-bounded transient serialization/compression workspace is
-/// a separate peak-memory concern and is not represented by these counters.
+/// tranche. PDU116 reserves bounded frame storage before encoding; its source
+/// map stays covered by the handler's admission until that frame is enqueued.
+/// Codec-bounded transient serialization/compression workspace is a separate
+/// peak-memory concern and is not represented by these counters.
 const OUTBOUND_ACCOUNTED_MAX_RETAINED_BYTES: usize =
     codec::MAX_LIST_PANES_ORDERED_V1_RESPONSE_FRAME_BYTES + TOPOLOGY_FENCE_MAX_RETAINED_BYTES;
 
@@ -1577,6 +1578,17 @@ fn queue_response_pdu_with_emission_authority(
     delivery_class: PduDeliveryClass,
     emission_authority: ServerEmissionAuthority,
 ) -> anyhow::Result<()> {
+    if matches!(&pdu, Pdu::GetPaneUserVarsV1Response(_)) {
+        return queue_user_vars_snapshot_response(
+            item_tx,
+            terminal,
+            budget,
+            pdu,
+            serial,
+            emission_authority,
+        )
+        .inspect_err(|_| terminal.trip(RESPONSE_QUEUE_FAILURE));
+    }
     let class = match delivery_class {
         PduDeliveryClass::Control => OutboundClass::Control,
         PduDeliveryClass::Bulk => OutboundClass::Bulk,
@@ -1591,6 +1603,187 @@ fn queue_response_pdu_with_emission_authority(
         0,
         emission_authority,
     )
+}
+
+fn user_vars_snapshot_frame_capacity(plan: &codec::PduOutboundPlan) -> anyhow::Result<usize> {
+    // Auto may retain a compressed Vec with spare compressBound capacity.
+    // PDU116 has a one-byte identifier; length and serial are at most ten
+    // bytes each. Reserve its backing allocation, not just the wire length.
+    plan.maximum_compression_output_bytes()
+        .max(plan.maximum_encoded_payload_bytes())
+        .checked_add(21)
+        .map(|capacity| capacity.max(plan.maximum_frame_bytes()))
+        .context("counting bounded pane user-variable frame storage")
+}
+
+fn user_vars_snapshot_codec_peak_bytes(
+    plan: &codec::PduOutboundPlan,
+    frame_capacity: usize,
+) -> anyhow::Result<usize> {
+    // In addition to the codec's logical storage estimate, cover an old and
+    // replacement compressor/frame allocation while the raw payload lives.
+    // The source map and the final queued frame have separate reservations.
+    frame_capacity
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(plan.logical_payload_bytes()))
+        .map(|bytes| bytes.max(plan.codec_peak_bytes()))
+        .context("counting pane user-variable codec peak storage")
+}
+
+fn user_vars_snapshot_codec_rejection(
+    outcome: promise::spawn::MainThreadReservationOutcome,
+) -> codec::ErrorResponse {
+    use promise::spawn::MainThreadReservationOutcome as Outcome;
+    let ident = <codec::GetPaneUserVarsV1 as codec::PduWireIdent>::IDENT;
+    let (label, error) = match outcome {
+        Outcome::Reserved(_) => unreachable!("an admitted codec stage must retain its reservation"),
+        Outcome::RetryableFull(_) => (
+            "retryable_full",
+            codec::ErrorResponse::quota_exceeded(ident),
+        ),
+        Outcome::RetiredGeneration(_) => (
+            "retired_generation",
+            codec::ErrorResponse::quota_exceeded(ident),
+        ),
+        Outcome::SchedulerUnavailable => (
+            "scheduler_unavailable",
+            codec::ErrorResponse::backend_failure(ident),
+        ),
+        Outcome::InvalidSize(_) => ("invalid_size", codec::ErrorResponse::invalid_request(ident)),
+        Outcome::AuthorityExhausted(_) => (
+            "authority_exhausted",
+            codec::ErrorResponse::backend_failure(ident),
+        ),
+        Outcome::Coalesced(_) => (
+            "invalid_coalescing",
+            codec::ErrorResponse::backend_failure(ident),
+        ),
+    };
+    metrics::counter!("mux.dispatch.user_vars_snapshot.codec_admission", "outcome" => label)
+        .increment(1);
+    error
+}
+
+fn queue_user_vars_snapshot_rejection(
+    item_tx: &Sender<Item>,
+    terminal: &DispatchTerminal,
+    budget: &Arc<OutboundBudget>,
+    serial: u64,
+    error: codec::ErrorResponse,
+) -> anyhow::Result<()> {
+    queue_response_pdu_with_accounting(
+        item_tx,
+        terminal,
+        budget,
+        Pdu::ErrorResponse(error),
+        serial,
+        OutboundClass::Control,
+        0,
+        ServerEmissionAuthority::Ordinary,
+    )
+}
+
+fn queue_user_vars_snapshot_response(
+    item_tx: &Sender<Item>,
+    terminal: &DispatchTerminal,
+    budget: &Arc<OutboundBudget>,
+    pdu: Pdu,
+    serial: u64,
+    emission_authority: ServerEmissionAuthority,
+) -> anyhow::Result<()> {
+    let authority = EncodedPduAuthority::capture(&pdu, serial, emission_authority);
+    authority.validate(terminal)?;
+    let prepared = pdu
+        .prepare_outbound(
+            codec::PduProducer::Server,
+            codec::PduWireRole::CorrelatedReply,
+            None,
+            codec::CompressionMode::Auto,
+        )
+        .context("planning bounded pane user-variable response")?;
+    let frame_capacity = user_vars_snapshot_frame_capacity(prepared.plan())?;
+    let codec_peak_bytes = user_vars_snapshot_codec_peak_bytes(prepared.plan(), frame_capacity)?;
+    let reservation = {
+        let Some(admission) = terminal.admit() else {
+            anyhow::bail!("mux dispatch connection is already terminal");
+        };
+        match budget.try_reserve(OutboundClass::Snapshot, frame_capacity) {
+            Ok(reservation) => Some(reservation),
+            Err(
+                OutboundBudgetLimit::RetainedBytes | OutboundBudgetLimit::SnapshotRetainedBytes,
+            ) => {
+                // A bounded census can have four simultaneous replies. Byte
+                // pressure must not turn that ordinary concurrency into a
+                // failed attachment; the client can request a fresh cut later.
+                drop(admission);
+                metrics::counter!("mux.dispatch.user_vars_snapshot.retryable_pressure")
+                    .increment(1);
+                None
+            }
+            Err(limit) => {
+                admission.trip(OUTBOUND_BUDGET_OVERFLOW);
+                drop(admission);
+                return Err(outbound_budget_rejection(OutboundClass::Snapshot, limit));
+            }
+        }
+    };
+    let Some(mut reservation) = reservation else {
+        drop(prepared);
+        return queue_user_vars_snapshot_rejection(
+            item_tx,
+            terminal,
+            budget,
+            serial,
+            codec::ErrorResponse::quota_exceeded(
+                <codec::GetPaneUserVarsV1 as codec::PduWireIdent>::IDENT,
+            ),
+        );
+    };
+    // Fund codec intermediates independently of the retained frame tranche.
+    // Holding this admission without spawning a task is intentional: this
+    // synchronous encode is already inside the admitted source-snapshot task.
+    let codec_reservation = match promise::spawn::try_reserve_main_thread_with_low_priority(
+        promise::spawn::MainThreadServiceClass::Topology,
+        codec_peak_bytes,
+    ) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+        outcome => {
+            let error = user_vars_snapshot_codec_rejection(outcome);
+            drop(prepared);
+            drop(reservation);
+            return queue_user_vars_snapshot_rejection(item_tx, terminal, budget, serial, error);
+        }
+    };
+    // The consumed prepared owner releases its full source map before queue
+    // publication. No typed map can outlive the handler's admission through
+    // a stalled socket, and no second payload-sized frame copy is needed.
+    let bytes = prepared
+        .encode_frame(serial)
+        .context("encoding admitted pane user-variable response")?;
+    drop(codec_reservation);
+    anyhow::ensure!(
+        bytes.capacity() <= frame_capacity,
+        "pane user-variable frame exceeded its admitted allocation bound"
+    );
+    reweight_accounted_batch(
+        terminal,
+        std::slice::from_mut(&mut reservation),
+        bytes.capacity(),
+    )?;
+    queue_prepared_snapshot_response(
+        item_tx,
+        terminal,
+        EncodedOutboundFrame {
+            bytes,
+            reservation,
+            authority,
+        },
+    )
+    .map_err(|rejected| {
+        let OrderedSnapshotQueueRejection { error, owner } = rejected;
+        drop(owner);
+        error
+    })
 }
 
 fn queue_response_pdu_with_accounting(
@@ -1775,6 +1968,22 @@ fn queue_prepared_ordered_snapshot_response(
     terminal: &DispatchTerminal,
     frame: EncodedOutboundFrame,
 ) -> Result<(), OrderedSnapshotQueueRejection> {
+    queue_prepared_snapshot_response(item_tx, terminal, frame)
+}
+
+/// Shared FIFO admission for a complete snapshot frame. The retained wire
+/// authority distinguishes ordinary PDU116 from the private ordered fence.
+fn queue_prepared_snapshot_response(
+    item_tx: &Sender<Item>,
+    terminal: &DispatchTerminal,
+    frame: EncodedOutboundFrame,
+) -> Result<(), OrderedSnapshotQueueRejection> {
+    if let Err(error) = frame.authority.validate(terminal) {
+        return Err(OrderedSnapshotQueueRejection {
+            error,
+            owner: OrderedSnapshotFrameOwner::Reserved(frame),
+        });
+    }
     if terminal.is_tripped() {
         return Err(OrderedSnapshotQueueRejection {
             error: anyhow::anyhow!("mux dispatch connection is already terminal"),
@@ -3084,6 +3293,28 @@ impl TopologyStreamCoordinator {
             Pdu::ListPanesOrderedV1Response(response) => self
                 .validate_and_complete_ordered_fence_response(serial, response)
                 .inspect_err(|_| self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE)),
+            Pdu::GetPaneUserVarsV1Response(response) => {
+                {
+                    let state = self.state.lock();
+                    if matches!(
+                        &state.phase,
+                        TopologyStreamPhase::Fencing(fence) if fence.serial == serial
+                    ) {
+                        self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+                        anyhow::bail!("pane metadata response used a topology fence serial");
+                    }
+                }
+                // Planning and encoding may visit a bounded but large map.
+                // Keep that work outside the topology coordinator mutex.
+                queue_response_pdu(
+                    &self.item_tx,
+                    &self.terminal,
+                    &self.outbound_budget,
+                    Pdu::GetPaneUserVarsV1Response(response),
+                    serial,
+                    delivery_class,
+                )
+            }
             other => {
                 let mut state = self.state.lock();
                 if matches!(
@@ -7083,6 +7314,21 @@ where
                             )?);
                         }
                         MuxNotification::Alert { pane_id, alert } => {
+                            // User variables are pane metadata, including for
+                            // background panes that never register rendering.
+                            // Keep all live occurrences on this FIFO: a tracked
+                            // render backlog must not replay old values after
+                            // an authoritative metadata snapshot.
+                            if matches!(&alert, wezterm_term::Alert::SetUserVar { .. }) {
+                                pending_outbound = Some(prepare_unilateral_pdu(
+                                    Pdu::NotifyAlert(codec::NotifyAlert { pane_id, alert }),
+                                    reservation,
+                                    batch_rx,
+                                    &mut deferred_item,
+                                    &terminal,
+                                )?);
+                                continue;
+                            }
                             // ft-12e8l: use the non-inserting accessor. If the pane
                             // was already removed, re-inserting a fresh PerPane here
                             // would leak because no later PaneRemoved can retire it.
@@ -8827,6 +9073,428 @@ mod tests {
         assert_eq!(released.retained_bytes, 0);
         assert_eq!(released.total_slots, 0);
         assert_eq!(released.bulk_slots, 0);
+    }
+
+    #[test]
+    fn user_var_snapshot_frame_retention_survives_partial_write_and_flush() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = promise::spawn::SimpleExecutor::new();
+        let (coordinator, item_rx, terminal_rx, _, _) = bound_topology_coordinator();
+        let coordinator = Arc::new(coordinator);
+        let sender = pdu_sender_for_topology(&coordinator);
+        let mut name = String::with_capacity(4096);
+        name.push_str("stage");
+        let mut value = String::with_capacity(16 * 1024);
+        value.push_str("background");
+        let text_capacity = name.capacity() + value.capacity();
+        let mut user_vars = std::collections::HashMap::with_capacity(64);
+        user_vars.insert(name, value);
+        let response = codec::GetPaneUserVarsV1Response {
+            pane_id: 91,
+            outcome: codec::PaneUserVarsOutcomeV1::Snapshot { user_vars },
+        };
+        let expected = response.clone();
+        sender
+            .send_control(DecodedPdu {
+                pdu: Pdu::Pong(Pong {}),
+                serial: 201,
+            })
+            .unwrap();
+        sender
+            .send_control(DecodedPdu {
+                pdu: Pdu::GetPaneUserVarsV1Response(response),
+                serial: 202,
+            })
+            .unwrap();
+        sender
+            .send_control(DecodedPdu {
+                pdu: Pdu::Pong(Pong {}),
+                serial: 203,
+            })
+            .unwrap();
+        let queued = coordinator.outbound_budget.snapshot();
+        assert_eq!(queued.total_slots, 3);
+        assert_eq!(queued.bulk_slots, 0);
+        assert!(queued.retained_bytes > 0);
+        assert!(
+            queued.retained_bytes < text_capacity,
+            "the queued owner must release the typed map and its spare capacity"
+        );
+        assert_eq!(queued.snapshot_retained_bytes, queued.retained_bytes);
+        assert_eq!(executor.admission_snapshot().active_tasks, 0);
+        assert_eq!(executor.admission_snapshot().active_estimated_bytes, 0);
+        assert_eq!(take_written_pdu(&item_rx).serial, 201);
+
+        let Item::WritePdu(WritePayload::Encoded(frame)) = item_rx.try_recv().unwrap() else {
+            panic!("user-variable response must enqueue an already admitted frame");
+        };
+        assert_eq!(queued.retained_bytes, frame.bytes.capacity());
+        let mut deferred = None;
+        let mut pending = prepare_pending_outbound_batch(
+            WritePayload::Encoded(frame),
+            &item_rx,
+            &mut deferred,
+            CompressionMode::Never,
+            &coordinator.terminal,
+        )
+        .unwrap();
+        assert!(matches!(
+            deferred.as_ref(),
+            Some(Item::WritePdu(WritePayload::Typed(queued))) if queued.decoded.serial == 203
+        ));
+        let encoded = coordinator.outbound_budget.snapshot();
+        assert_eq!(encoded.total_slots, 2);
+        assert_eq!(encoded.snapshot_retained_bytes, pending.bytes.capacity());
+        assert_eq!(encoded.retained_bytes, pending.bytes.capacity());
+        assert_eq!(encoded.peak_retained_bytes, queued.peak_retained_bytes);
+
+        let mut stream = ChunkedDispatchStream {
+            max_write_size: Some(1),
+            ..ChunkedDispatchStream::default()
+        };
+        assert_eq!(
+            promise::spawn::block_on(service_pending_outbound(
+                &mut stream,
+                &mut pending,
+                None,
+                &coordinator.terminal,
+            ))
+            .unwrap(),
+            OutboundService::Progress
+        );
+        assert_eq!(pending.offset, 1);
+        assert!(pending.offset < pending.bytes.len());
+        while pending.phase == PendingOutboundPhase::Writing {
+            assert_eq!(coordinator.outbound_budget.snapshot(), encoded);
+            assert_eq!(
+                promise::spawn::block_on(service_pending_outbound(
+                    &mut stream,
+                    &mut pending,
+                    None,
+                    &coordinator.terminal,
+                ))
+                .unwrap(),
+                OutboundService::Progress
+            );
+        }
+        assert!(stream.flush_offsets.is_empty());
+        assert_eq!(coordinator.outbound_budget.snapshot(), encoded);
+        assert_eq!(
+            promise::spawn::block_on(service_pending_outbound(
+                &mut stream,
+                &mut pending,
+                None,
+                &coordinator.terminal,
+            ))
+            .unwrap(),
+            OutboundService::Complete
+        );
+        assert_eq!(stream.flush_offsets, [stream.bytes.len()]);
+        assert_eq!(coordinator.outbound_budget.snapshot(), encoded);
+        let decoded = Pdu::decode(&mut Cursor::new(&stream.bytes)).unwrap();
+        assert_eq!(decoded.serial, 202);
+        assert_eq!(decoded.pdu, Pdu::GetPaneUserVarsV1Response(expected));
+
+        drop(pending);
+        let flushed = coordinator.outbound_budget.snapshot();
+        assert_eq!(flushed.total_slots, 1);
+        assert_eq!(flushed.retained_bytes, 0);
+        assert_eq!(flushed.snapshot_retained_bytes, 0);
+        drop(deferred);
+        assert_outbound_live_counters_zero(&coordinator);
+        assert!(item_rx.is_empty());
+        assert!(terminal_rx.is_empty());
+    }
+
+    #[test]
+    fn user_var_snapshot_byte_pressure_is_retryable_without_retiring_the_connection() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = promise::spawn::SimpleExecutor::new();
+        let (coordinator, item_rx, terminal_rx, _, _) = bound_topology_coordinator();
+        let response = codec::GetPaneUserVarsV1Response {
+            pane_id: 92,
+            outcome: codec::PaneUserVarsOutcomeV1::Snapshot {
+                user_vars: std::collections::HashMap::new(),
+            },
+        };
+        let predecessor = coordinator
+            .outbound_budget
+            .try_reserve(
+                OutboundClass::Snapshot,
+                OutboundRetainedClass::Snapshot.maximum(),
+            )
+            .unwrap();
+        for serial in 204..208 {
+            coordinator
+                .queue_response(
+                    DecodedPdu {
+                        pdu: Pdu::GetPaneUserVarsV1Response(response.clone()),
+                        serial,
+                    },
+                    PduDeliveryClass::Control,
+                )
+                .expect("all four census slots must receive retryable correlated errors");
+        }
+        let full = coordinator.outbound_budget.snapshot();
+        assert_eq!(
+            full.snapshot_retained_bytes,
+            OutboundRetainedClass::Snapshot.maximum()
+        );
+        assert_eq!(full.topology_retained_bytes, 0);
+        assert_eq!(full.total_slots, 5);
+        assert_eq!(item_rx.len(), 4);
+        for serial in 204..208 {
+            let decoded = take_written_pdu(&item_rx);
+            assert_eq!(decoded.serial, serial);
+            let Pdu::ErrorResponse(error) = decoded.pdu else {
+                panic!("byte pressure must return an error for this exact request");
+            };
+            assert_eq!(
+                error.request_ident,
+                <codec::GetPaneUserVarsV1 as codec::PduWireIdent>::IDENT
+            );
+            assert_eq!(error.code, codec::MuxErrorCode::QUOTA_EXCEEDED);
+            assert_eq!(error.effect, codec::MuxErrorEffect::NOT_APPLIED);
+            assert_eq!(error.retry, codec::MuxErrorRetry::SAFE_AFTER_BACKOFF);
+        }
+        assert!(!coordinator.terminal.is_tripped());
+        assert!(terminal_rx.is_empty());
+        drop(predecessor);
+        assert_outbound_live_counters_zero(&coordinator);
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    pdu: Pdu::GetPaneUserVarsV1Response(response.clone()),
+                    serial: 208,
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect("the same attachment can retry after earlier frames release capacity");
+        let decoded = take_written_pdu(&item_rx);
+        assert_eq!(decoded.serial, 208);
+        assert_eq!(decoded.pdu, Pdu::GetPaneUserVarsV1Response(response));
+        assert_outbound_live_counters_zero(&coordinator);
+        assert!(item_rx.is_empty());
+        assert!(terminal_rx.is_empty());
+        assert_eq!(executor.admission_snapshot().active_tasks, 0);
+        assert_eq!(executor.admission_snapshot().active_estimated_bytes, 0);
+    }
+
+    #[test]
+    fn user_var_snapshot_codec_pressure_releases_admission_before_transport_retention() {
+        use promise::spawn::{
+            MainThreadAdmissionLimits, MainThreadReservationOutcome, MainThreadServiceClass,
+            SimpleExecutor, try_reserve_main_thread_with_low_priority,
+        };
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let response = Pdu::GetPaneUserVarsV1Response(codec::GetPaneUserVarsV1Response {
+            pane_id: 95,
+            outcome: codec::PaneUserVarsOutcomeV1::Snapshot {
+                user_vars: std::collections::HashMap::from([(
+                    "stage".to_string(),
+                    "background".to_string(),
+                )]),
+            },
+        });
+        let prepared = response
+            .clone()
+            .prepare_outbound(
+                codec::PduProducer::Server,
+                codec::PduWireRole::CorrelatedReply,
+                None,
+                codec::CompressionMode::Auto,
+            )
+            .unwrap();
+        let frame_capacity = user_vars_snapshot_frame_capacity(prepared.plan()).unwrap();
+        let codec_peak_bytes =
+            user_vars_snapshot_codec_peak_bytes(prepared.plan(), frame_capacity).unwrap();
+        drop(prepared);
+        let executor = SimpleExecutor::try_with_limits(
+            MainThreadAdmissionLimits::new(8, codec_peak_bytes, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let blocker = match try_reserve_main_thread_with_low_priority(
+            MainThreadServiceClass::Topology,
+            codec_peak_bytes,
+        ) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            outcome => panic!("expected codec-capacity blocker, got {outcome:?}"),
+        };
+        let occupied = executor.admission_snapshot();
+        assert_eq!(occupied.active_tasks, 1);
+        assert_eq!(occupied.active_estimated_bytes, codec_peak_bytes);
+        let (coordinator, item_rx, terminal_rx, _, _) = bound_topology_coordinator();
+        for serial in 210..214 {
+            coordinator
+                .queue_response(
+                    DecodedPdu {
+                        pdu: response.clone(),
+                        serial,
+                    },
+                    PduDeliveryClass::Control,
+                )
+                .expect("codec pressure must preserve a retryable request reply");
+            assert_eq!(executor.admission_snapshot(), occupied);
+            let outbound = coordinator.outbound_budget.snapshot();
+            assert_eq!(outbound.retained_bytes, 0);
+            assert_eq!(outbound.snapshot_retained_bytes, 0);
+            let decoded = take_written_pdu(&item_rx);
+            assert_eq!(decoded.serial, serial);
+            let Pdu::ErrorResponse(error) = decoded.pdu else {
+                panic!("codec pressure must return the correlated refusal");
+            };
+            assert_eq!(
+                error.request_ident,
+                <codec::GetPaneUserVarsV1 as codec::PduWireIdent>::IDENT
+            );
+            assert_eq!(error.code, codec::MuxErrorCode::QUOTA_EXCEEDED);
+            assert_eq!(error.effect, codec::MuxErrorEffect::NOT_APPLIED);
+            assert_eq!(error.retry, codec::MuxErrorRetry::SAFE_AFTER_BACKOFF);
+            assert_outbound_live_counters_zero(&coordinator);
+        }
+        assert_eq!(executor.queue_snapshot().depth, 0);
+        assert!(terminal_rx.is_empty());
+        drop(blocker);
+        assert_eq!(executor.admission_snapshot().active_tasks, 0);
+        assert_eq!(executor.admission_snapshot().active_estimated_bytes, 0);
+
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    pdu: response.clone(),
+                    serial: 214,
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect("released codec capacity must allow the same attachment to retry");
+        assert_eq!(executor.admission_snapshot().active_tasks, 0);
+        assert_eq!(executor.admission_snapshot().active_estimated_bytes, 0);
+        assert!(
+            coordinator
+                .outbound_budget
+                .snapshot()
+                .snapshot_retained_bytes
+                > 0
+        );
+        let decoded = take_written_pdu(&item_rx);
+        assert_eq!(decoded.serial, 214);
+        assert_eq!(decoded.pdu, response);
+        assert_outbound_live_counters_zero(&coordinator);
+        assert!(!coordinator.terminal.is_tripped());
+        assert!(terminal_rx.is_empty());
+    }
+
+    #[test]
+    fn user_var_snapshot_maximum_map_fits_one_admitted_frame() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = promise::spawn::SimpleExecutor::new();
+        // Keep the production source-task estimate live while the largest
+        // codec stage asks for its independent admission on the same pool.
+        let source_reservation = match promise::spawn::try_reserve_main_thread_with_low_priority(
+            promise::spawn::MainThreadServiceClass::Topology,
+            2 * codec::MAX_PANE_USER_VARS_RESPONSE_DECOMPRESSED_BYTES,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            outcome => panic!("expected source-snapshot admission, got {outcome:?}"),
+        };
+        let source_admission = executor.admission_snapshot();
+        let (coordinator, item_rx, terminal_rx, _, _) = bound_topology_coordinator();
+        let mut user_vars = (0..codec::MAX_PANE_USER_VARS)
+            .map(|index| (format!("var{index:05}"), String::new()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let key_bytes = user_vars.keys().map(String::len).sum::<usize>();
+        let value_bytes = codec::MAX_PANE_USER_VAR_TEXT_BYTES - key_bytes;
+        *user_vars.get_mut("var00000").unwrap() = "v".repeat(value_bytes);
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    pdu: Pdu::GetPaneUserVarsV1Response(codec::GetPaneUserVarsV1Response {
+                        pane_id: 94,
+                        outcome: codec::PaneUserVarsOutcomeV1::Snapshot { user_vars },
+                    }),
+                    serial: 209,
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect("a legitimate maximum map must fit without typed/encoded overlap rejection");
+        let queued = coordinator.outbound_budget.snapshot();
+        assert_eq!(queued.total_slots, 1);
+        assert!(queued.snapshot_retained_bytes > 0);
+        assert!(queued.snapshot_retained_bytes <= OutboundRetainedClass::Snapshot.maximum());
+        assert_eq!(executor.admission_snapshot(), source_admission);
+        drop(source_reservation);
+        assert_eq!(executor.admission_snapshot().active_tasks, 0);
+        assert_eq!(executor.admission_snapshot().active_estimated_bytes, 0);
+        let decoded = take_written_pdu(&item_rx);
+        assert_eq!(decoded.serial, 209);
+        let Pdu::GetPaneUserVarsV1Response(codec::GetPaneUserVarsV1Response {
+            pane_id: 94,
+            outcome: codec::PaneUserVarsOutcomeV1::Snapshot { user_vars },
+        }) = decoded.pdu
+        else {
+            panic!("maximum map must remain a complete snapshot response");
+        };
+        assert_eq!(user_vars.len(), codec::MAX_PANE_USER_VARS);
+        assert_eq!(user_vars.get("var00000").unwrap().len(), value_bytes);
+        assert_outbound_live_counters_zero(&coordinator);
+        assert!(item_rx.is_empty());
+        assert!(terminal_rx.is_empty());
+    }
+
+    #[test]
+    fn user_var_snapshot_failed_enqueue_releases_only_its_own_charge() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = promise::spawn::SimpleExecutor::new();
+        let (coordinator, item_rx, terminal_rx, _, _) =
+            bound_topology_coordinator_with_item_capacity(1);
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    pdu: Pdu::Pong(Pong {}),
+                    serial: 206,
+                },
+                PduDeliveryClass::Control,
+            )
+            .unwrap();
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    pdu: Pdu::GetPaneUserVarsV1Response(codec::GetPaneUserVarsV1Response {
+                        pane_id: 93,
+                        outcome: codec::PaneUserVarsOutcomeV1::Snapshot {
+                            user_vars: std::collections::HashMap::from([(
+                                "stage".to_string(),
+                                "background".to_string(),
+                            )]),
+                        },
+                    }),
+                    serial: 207,
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect_err("the full FIFO must reject the new map");
+        assert_eq!(terminal_rx.try_recv().unwrap(), RESPONSE_QUEUE_FAILURE);
+        let rejected = coordinator.outbound_budget.snapshot();
+        assert_eq!(rejected.total_slots, 1);
+        assert_eq!(rejected.snapshot_retained_bytes, 0);
+        assert_eq!(rejected.retained_bytes, 0);
+        assert!(rejected.peak_retained_bytes > 0);
+        assert_eq!(executor.admission_snapshot().active_tasks, 0);
+        assert_eq!(executor.admission_snapshot().active_estimated_bytes, 0);
+        assert_eq!(take_written_pdu(&item_rx).serial, 206);
+        assert_outbound_live_counters_zero(&coordinator);
+        assert!(item_rx.is_empty());
+        assert!(terminal_rx.is_empty());
     }
 
     #[test]
@@ -15716,7 +16384,7 @@ mod tests {
             assert!(!spec.authorizes(codec::PduProducer::Client, codec::PduWireRole::Request));
         }
 
-        for ident in [76, 78, 82, 83] {
+        for ident in [76, 78, 82, 83, 116] {
             let spec = Pdu::wire_spec_for_ident(ident)
                 .expect("every request-implied post-v46 server family must remain registered");
             assert!(

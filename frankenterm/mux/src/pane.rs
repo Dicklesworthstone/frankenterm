@@ -34,6 +34,69 @@ pub(crate) fn reserve_recovered_pane_ids(maximum: usize) -> anyhow::Result<()> {
 }
 pub type PaneId = usize;
 
+/// No snapshot was captured because a producer or model reader owns the source.
+/// Callers may retry after yielding without blocking the main thread.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("pane user-variable snapshot source is busy")]
+pub struct PaneUserVarsSnapshotBusy;
+
+/// A bounded authoritative user-variable map at one state-publication cut.
+/// Keep this guard until its response has been enqueued: later live alerts
+/// wait for it, while earlier historical callbacks are free to await RPCs.
+pub struct PaneUserVarsSnapshot {
+    user_vars: HashMap<String, String>,
+    predecessor: Option<crate::PaneStatePublication>,
+    _completion: Option<promise::Promise<()>>,
+}
+
+impl PaneUserVarsSnapshot {
+    /// The caller holds the same model/producer lock used when publishing
+    /// alerts to `queue`. Admission precedes cloning and linking the fence.
+    pub fn capture(
+        user_vars: &HashMap<String, String>,
+        max_entries: usize,
+        max_text_bytes: usize,
+        queue: &crate::PaneAlertDispatchQueue,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            user_vars.len() <= max_entries,
+            "user-variable snapshot entry limit"
+        );
+        let text_bytes = user_vars.iter().try_fold(0usize, |bytes, (name, value)| {
+            bytes.checked_add(name.len())?.checked_add(value.len())
+        });
+        anyhow::ensure!(
+            text_bytes.is_some_and(|bytes| bytes <= max_text_bytes),
+            "user-variable snapshot byte limit"
+        );
+        // A sparse source may retain a table sized for many former entries.
+        // Build a fresh table so admission bounds the snapshot's allocation,
+        // independently of that source allocation's historical high-water mark.
+        let mut retained = HashMap::new();
+        retained.try_reserve(user_vars.len())?;
+        for (name, value) in user_vars {
+            retained.insert(name.clone(), value.clone());
+        }
+        let (predecessor, completion) = queue.fence_state();
+        Ok(Self {
+            user_vars: retained,
+            predecessor,
+            _completion: Some(completion),
+        })
+    }
+
+    pub async fn wait_ready(&mut self) {
+        if let Some(predecessor) = self.predecessor.as_mut() {
+            predecessor.await;
+        }
+        self.predecessor = None;
+    }
+
+    pub fn take_user_vars(&mut self) -> HashMap<String, String> {
+        std::mem::take(&mut self.user_vars)
+    }
+}
+
 /// Backend-owned state. Only the originating pane may interpret this capability.
 pub type PaneSelectionAnchor = Box<dyn std::any::Any + Send + Sync>;
 pub type PaneLayoutRead = Box<dyn std::any::Any + Send + Sync>;
@@ -1209,6 +1272,24 @@ pub trait Pane: Downcast + Send + Sync {
 
     fn copy_user_vars(&self) -> HashMap<String, String> {
         HashMap::new()
+    }
+
+    /// Capture a map and its publication fence without rendering the pane.
+    /// Stateful backends override this under their producer/model lock.
+    fn capture_user_vars_snapshot(
+        &self,
+        _max_entries: usize,
+        _max_text_bytes: usize,
+    ) -> anyhow::Result<PaneUserVarsSnapshot> {
+        anyhow::ensure!(
+            self.copy_user_vars().is_empty(),
+            "pane backend does not support ordered user-variable snapshots"
+        );
+        Ok(PaneUserVarsSnapshot {
+            user_vars: HashMap::new(),
+            predecessor: None,
+            _completion: None,
+        })
     }
 
     fn erase_scrollback(&self, _erase_mode: ScrollbackEraseMode) {}
