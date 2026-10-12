@@ -1359,4 +1359,148 @@ mod tests {
             pane.kill();
         }
     }
+
+    /// ft-yccm0.2.2.2 acceptance: while another thread holds a local pane's
+    /// terminal mutex for 500 ms, the mouse path on the main thread returns
+    /// at once. Its reads (grabbed, alternate screen, dimensions) are
+    /// published facts, and the report for a grabbed pane is queued for the
+    /// pane to apply after the holder. The M.4 ledger records no wait.
+    #[test]
+    #[cfg(unix)]
+    fn mouse_path_never_waits_for_a_terminal_another_thread_holds() {
+        use frankenterm_alloc::resource_ledger::TerminalLockLedger;
+        use mux::pane::{Pane, WithPaneLines};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        /// Holds a pane's terminal mutex from inside `with_lines_mut`.
+        struct HoldTerminal {
+            held: std::sync::mpsc::SyncSender<()>,
+            hold: Duration,
+        }
+        impl WithPaneLines for HoldTerminal {
+            fn with_lines_mut(
+                &mut self,
+                _first: StableRowIndex,
+                _lines: &mut [&mut termwiz::surface::Line],
+            ) {
+                let _ = self.held.send(());
+                std::thread::sleep(self.hold);
+            }
+        }
+        #[derive(Debug)]
+        struct FactsConfig;
+        impl wezterm_term::TerminalConfiguration for FactsConfig {
+            fn color_palette(&self) -> wezterm_term::color::ColorPalette {
+                Default::default()
+            }
+        }
+
+        const HOLD: Duration = Duration::from_millis(500);
+        let terminal = wezterm_term::Terminal::new(
+            wezterm_term::TerminalSize {
+                rows: 4,
+                cols: 20,
+                dpi: 96,
+                pixel_width: 160,
+                pixel_height: 64,
+            },
+            Arc::new(FactsConfig),
+            "mouse-hold-test",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let child = pair
+            .slave
+            .spawn_command(portable_pty::CommandBuilder::new("/bin/cat"))
+            .unwrap();
+        let pane: Arc<dyn Pane> = Arc::new(mux::localpane::LocalPane::new(
+            998_323,
+            terminal,
+            child,
+            pair.master,
+            writer,
+            998_323,
+            [0x36; 16],
+            "mouse hold test".to_owned(),
+        ));
+        // SGR mouse reporting on the alternate screen: a grabbed pane.
+        let mut actions = Vec::new();
+        termwiz::escape::parser::Parser::new()
+            .parse(b"\x1b[?1000h\x1b[?1006h\x1b[?1049h", |action| {
+                actions.push(action)
+            });
+        pane.perform_actions(actions).unwrap();
+        let dims = pane.render_facts().dimensions;
+
+        let released = AtomicBool::new(false);
+        let (elapsed, grabbed, alt_screen, read_dims, before, after) =
+            std::thread::scope(|scope| {
+                let (held_tx, held_rx) = std::sync::mpsc::sync_channel(1);
+                let (pane, released) = (&pane, &released);
+                scope.spawn(move || {
+                    pane.with_lines_mut(
+                        0..1,
+                        &mut HoldTerminal {
+                            held: held_tx,
+                            hold: HOLD,
+                        },
+                    );
+                    released.store(true, Ordering::Release);
+                });
+                held_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("the holder took the terminal");
+                let before = TerminalLockLedger::global().snapshot();
+                // The ledger counts waits by threads named "main", the name
+                // std gives the process's main thread, the AppKit thread.
+                let reads = std::thread::Builder::new()
+                    .name("main".to_string())
+                    .spawn_scoped(scope, move || {
+                        let started = Instant::now();
+                        let grabbed = super::mouse_grabbed(&**pane);
+                        let alt_screen = super::alt_screen_active(&**pane);
+                        let read_dims = super::pane_dimensions(&**pane);
+                        pane.mouse_event(wezterm_term::MouseEvent {
+                            kind: wezterm_term::input::MouseEventKind::Press,
+                            x: 3,
+                            y: 1,
+                            x_pixel_offset: 0,
+                            y_pixel_offset: 0,
+                            button: wezterm_term::input::MouseButton::Left,
+                            modifiers: wezterm_term::KeyModifiers::NONE,
+                        })
+                        .unwrap();
+                        (started.elapsed(), grabbed, alt_screen, read_dims)
+                    })
+                    .unwrap()
+                    .join()
+                    .unwrap();
+                let after = TerminalLockLedger::global().snapshot();
+                assert!(
+                    !released.load(Ordering::Acquire),
+                    "the terminal was held throughout the mouse path"
+                );
+                (reads.0, reads.1, reads.2, reads.3, before, after)
+            });
+        assert!(released.load(Ordering::Acquire));
+        assert!(grabbed && alt_screen, "the pane reads as grabbed");
+        assert_eq!(read_dims, dims);
+        assert_eq!(
+            after.main_thread_blocked_waits, before.main_thread_blocked_waits,
+            "the mouse path waited for the held terminal on the main thread"
+        );
+        eprintln!("mouse path while the terminal was held: {elapsed:?}");
+        // Honest slack for a loaded debug build; any wait would be ~500 ms.
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "the mouse path took {elapsed:?} while the terminal was held for {HOLD:?}"
+        );
+        pane.kill();
+    }
 }
