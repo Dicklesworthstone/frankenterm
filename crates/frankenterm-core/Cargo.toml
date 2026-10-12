@@ -11,6 +11,10 @@ readme = "../../README.md"
 keywords = ["terminal", "frankenterm", "automation", "ai-agents"]
 categories = ["development-tools"]
 autobenches = false
+# The crates.io name `frankenterm-core` belongs to FrankenTUI's VT engine
+# (0.2.0, used by ftui-pty); publishing this crate would overwrite that
+# identity with the swarm core.
+publish = false
 
 [lints]
 workspace = true

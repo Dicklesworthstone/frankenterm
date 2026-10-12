@@ -309,7 +309,7 @@ doctor_frankentui list-profiles        # List available profiles
 
 ### 7.2 Existing Integration Points
 
-1. **ftui-pty**: WsPtyBridge for WebSocket-to-PTY bridging, already integrates with `frankenterm-core` via `flow_control` module
+1. **ftui-pty**: WsPtyBridge for WebSocket-to-PTY bridging, using the `flow_control` module of crates.io `frankenterm-core` 0.2.0 (FrankenTUI's VT engine; unrelated to this repo's `crates/frankenterm-core`)
 2. **ftui-web**: WASM backend with `DeterministicClock` and `WebEventSource` for FrankenTerm web frontend
 3. **Telemetry**: Both projects emit JSONL evidence; standardizing on shared sink is straightforward
 
