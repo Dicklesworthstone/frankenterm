@@ -4394,7 +4394,7 @@ pub mod process {
                 "process signal helper deadline elapsed before spawn",
             ));
         }
-        let mut helper = command.spawn()?;
+        let mut helper = spawn_without_unmarked_descriptors(command)?;
         let completion_deadline =
             process_deadline_after(PROCESS_SIGNAL_HELPER_TIMEOUT).min(overall_deadline);
         match reap_signal_helper_until(&mut helper, completion_deadline) {
@@ -5498,10 +5498,53 @@ pub mod process {
         }
     }
 
+    /// Keeps a child from inheriting another command's capture descriptors
+    /// (ft-o277t).
+    ///
+    /// Only Linux creates a socket pair close-on-exec in one step. Elsewhere
+    /// `socketpair` returns inheritable descriptors and a second call marks
+    /// them, and a child that another thread forks between the two keeps
+    /// both ends for its whole life. The command they belong to then never
+    /// sees end-of-file: it failed with `CommandOutputCaptureIncomplete`
+    /// after its child had exited normally, and the bystander held the other
+    /// command's stdin. A loaded host stretches the gap from microseconds to
+    /// a scheduling quantum (on macOS, 16 of 30 runs of the bridge tests in
+    /// parallel failed this way, and none of 30 run one at a time).
+    ///
+    /// Creation is exclusive and brief; spawns share the lock, so they wait
+    /// only for a creation, never for each other. It covers the commands
+    /// this module spawns, which are the ones that live long. A probe
+    /// spawned directly elsewhere (`sysctl`, `ps`) can still inherit a pair,
+    /// for the few milliseconds it runs.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    static CAPTURE_DESCRIPTOR_INHERITANCE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    /// Runs `create`, which makes descriptors and marks them close-on-exec,
+    /// while no command is being spawned.
+    fn while_no_command_spawns<T>(create: impl FnOnce() -> T) -> T {
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let _no_spawn = CAPTURE_DESCRIPTOR_INHERITANCE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        create()
+    }
+
+    /// Spawns `command` while no capture descriptor is still inheritable.
+    fn spawn_without_unmarked_descriptors(
+        command: &mut std::process::Command,
+    ) -> std::io::Result<std::process::Child> {
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let _all_marked = CAPTURE_DESCRIPTOR_INHERITANCE
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        command.spawn()
+    }
+
     fn process_capture_socketpair(
         stream: &'static str,
     ) -> std::io::Result<(FileDescriptor, FileDescriptor)> {
-        socketpair().map_err(|error| process_capture_setup_error(stream, error))
+        while_no_command_spawns(socketpair)
+            .map_err(|error| process_capture_setup_error(stream, error))
     }
 
     fn validate_command_input(stdin: Option<&[u8]>, limit: usize) -> std::io::Result<()> {
@@ -5552,7 +5595,7 @@ pub mod process {
         let mut retry_delays = exec_busy_retry_delays.iter().copied();
         loop {
             check_output_command_abort(cancel, deadline)?;
-            match command.spawn() {
+            match spawn_without_unmarked_descriptors(command) {
                 Ok(child) => return Ok(child),
                 Err(error) if is_exec_busy_error(&error) => {
                     let Some(delay) = retry_delays.next() else {
@@ -6120,6 +6163,27 @@ pub mod process {
         use super::*;
         #[cfg(unix)]
         use crate::runtime_async::CompatRuntime;
+
+        /// A spawn takes `CAPTURE_DESCRIPTOR_INHERITANCE` shared, so it has
+        /// to wait out a creation, which holds it alone. Checked from inside
+        /// a creation and without waiting: holding the lock any longer would
+        /// stall every other test's spawns.
+        #[cfg(all(unix, not(target_os = "linux")))]
+        #[test]
+        fn capture_descriptors_are_created_while_no_command_can_spawn() {
+            let a_spawn_would_wait =
+                while_no_command_spawns(|| CAPTURE_DESCRIPTOR_INHERITANCE.try_read().is_err());
+            assert!(a_spawn_would_wait);
+
+            let (reader, writer) = process_capture_socketpair("test").unwrap();
+            drop((reader, writer));
+            let mut command = std::process::Command::new("/usr/bin/true");
+            let status = spawn_without_unmarked_descriptors(&mut command)
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert!(status.success());
+        }
 
         #[cfg(unix)]
         #[test]

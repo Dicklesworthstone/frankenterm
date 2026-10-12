@@ -852,20 +852,27 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn invoke_daemon_holds_stdout_reports_incomplete_capture() {
-        let b = bridge("sh").with_timeout(Duration::from_millis(500));
+        // The timeout is longer than a loaded host needs to start `sh`, and
+        // the daemon outlives it, so only the post-exit drain bound can end
+        // the call before either.
+        let timeout = Duration::from_secs(4);
+        let b = bridge("sh").with_timeout(timeout);
         let start = std::time::Instant::now();
         // The main 'sh' process exits immediately, but the background 'sleep' process
         // inherits stdout and holds it open.
-        let err = b.invoke(&["-c", "sleep 1 >&1 2>/dev/null &"]).unwrap_err();
-        assert!(start.elapsed() < Duration::from_secs(2));
-        assert!(matches!(
-            err,
-            BridgeError::CaptureIncomplete {
-                stdout_open: true,
-                drain_timeout_ms: 100,
-                ..
-            }
-        ));
+        let err = b.invoke(&["-c", "sleep 5 >&1 2>/dev/null &"]).unwrap_err();
+        assert!(start.elapsed() < timeout, "{:?} {err:?}", start.elapsed());
+        assert!(
+            matches!(
+                err,
+                BridgeError::CaptureIncomplete {
+                    stdout_open: true,
+                    drain_timeout_ms: 100,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -880,18 +887,25 @@ mod tests {
             json!({"ok": true})
         );
 
+        // The child stays alive with `exec`, as one process. A shell loop
+        // forks a `sleep` every second, and cleanup must then signal and
+        // outwait a process group inside its 250 ms budget: on a loaded host
+        // that reports incomplete cleanup instead of the cap (seen on macOS).
         let over = bridge("sh").with_stdout_limit(payload.len() - 1);
         let error = over
-            .invoke(&["-c", "printf '{\"ok\":true}'; while :; do sleep 1; done"])
+            .invoke(&["-c", "printf '{\"ok\":true}'; exec sleep 600"])
             .expect_err("first byte beyond stdout cap must fail closed");
-        assert!(matches!(
-            error,
-            BridgeError::OutputTooLarge {
-                stream: CommandOutputStream::Stdout,
-                observed,
-                limit
-            } if observed >= payload.len() && limit == payload.len() - 1
-        ));
+        assert!(
+            matches!(
+                error,
+                BridgeError::OutputTooLarge {
+                    stream: CommandOutputStream::Stdout,
+                    observed,
+                    limit
+                } if observed >= payload.len() && limit == payload.len() - 1
+            ),
+            "{error:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -899,19 +913,19 @@ mod tests {
     fn invoke_stderr_overflow_is_typed_and_content_free() {
         let error = bridge("sh")
             .with_stderr_limit(1)
-            .invoke(&[
-                "-c",
-                "printf 'raw-child-output-canary' >&2; while :; do sleep 1; done",
-            ])
+            .invoke(&["-c", "printf 'raw-child-output-canary' >&2; exec sleep 600"])
             .expect_err("stderr flood must hit the configured cap");
-        assert!(matches!(
-            &error,
-            BridgeError::OutputTooLarge {
-                stream: CommandOutputStream::Stderr,
-                limit: 1,
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                &error,
+                BridgeError::OutputTooLarge {
+                    stream: CommandOutputStream::Stderr,
+                    limit: 1,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
         assert!(!error.to_string().contains("raw-child-output-canary"));
     }
 
@@ -926,16 +940,19 @@ mod tests {
 
         let over = exact.with_stderr_limit(2);
         let error = over
-            .invoke(&["-c", "printf 'abc' >&2; while :; do sleep 1; done"])
+            .invoke(&["-c", "printf 'abc' >&2; exec sleep 600"])
             .expect_err("first byte beyond stderr cap must fail closed");
-        assert!(matches!(
-            error,
-            BridgeError::OutputTooLarge {
-                stream: CommandOutputStream::Stderr,
-                observed,
-                limit: 2,
-            } if observed >= 3
-        ));
+        assert!(
+            matches!(
+                error,
+                BridgeError::OutputTooLarge {
+                    stream: CommandOutputStream::Stderr,
+                    observed,
+                    limit: 2,
+                } if observed >= 3
+            ),
+            "{error:?}"
+        );
     }
 
     #[cfg(unix)]
