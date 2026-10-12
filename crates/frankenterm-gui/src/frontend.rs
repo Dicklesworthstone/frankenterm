@@ -81,10 +81,14 @@ struct LiveLayout {
     unavailable: std::collections::BTreeSet<crate::window_state_persist::DomainBindingId>,
     /// Bindings whose complete current tab set is in `slots`.
     attached: std::collections::BTreeSet<crate::window_state_persist::DomainBindingId>,
+    /// This process's local mux session. It is minted fresh at every launch,
+    /// so a saved local slot from any other session can never match again.
+    local_session: StableLocalSessionId,
 }
 
 impl LiveLayout {
     fn capture(mux: &Arc<Mux>, startup: &LayoutStateSnapshot) -> anyhow::Result<Self> {
+        let (session, _) = mux.topology_snapshot_authority()?;
         let mut result = Self {
             receipts: Vec::new(),
             slots: HashMap::new(),
@@ -94,6 +98,7 @@ impl LiveLayout {
                 .map(|binding| binding.binding_id())
                 .collect(),
             attached: Default::default(),
+            local_session: StableLocalSessionId::from_bytes(session.as_bytes()),
         };
         for domain in mux.iter_domains() {
             let Some(client) = domain.downcast_ref::<ClientDomain>() else {
@@ -125,7 +130,6 @@ impl LiveLayout {
             })?;
             result.receipts.push(receipt);
         }
-        let (session, _) = mux.topology_snapshot_authority()?;
         for window in mux.iter_windows_bounded(4_096)? {
             let Some(order) = mux.window_order_snapshot(window)? else {
                 continue;
@@ -146,7 +150,7 @@ impl LiveLayout {
                 result.slots.insert(
                     tab.tab_id(),
                     StableTabSlot::local(
-                        StableLocalSessionId::from_bytes(session.as_bytes()),
+                        result.local_session,
                         StableLocalTabId::from_bytes(*tab.durable_id().as_bytes()),
                     ),
                 );
@@ -310,10 +314,11 @@ impl LayoutLifecycle {
         })
     }
 
-    /// Saved overlays made only of tabs from hosts attached right now, none of
-    /// which exist any more (closed, or their server restarted). They can never
-    /// be restored, and left alone they would pile up until the store's quota
-    /// rejected every later save.
+    /// Saved overlays none of whose tabs can ever be restored: remote tabs that
+    /// no longer exist on a host attached right now (closed, or the server
+    /// restarted), and local tabs from an earlier launch. Left alone they pile
+    /// up (one per launch for the local window) until the store's quota rejects
+    /// every later save.
     fn orphaned_overlays(&self, live: &LiveLayout) -> Vec<(LayoutWindowId, u64)> {
         let live_identities: std::collections::HashSet<_> =
             live.slots.values().map(|slot| slot.identity()).collect();
@@ -327,10 +332,12 @@ impl LayoutLifecycle {
                         .values()
                         .any(|owned| owned.overlay.window_id() == overlay.window_id())
                     && !overlay.slots().is_empty()
-                    && overlay.slots().iter().all(|slot| {
-                        slot.remote_binding()
-                            .is_some_and(|binding| live.attached.contains(&binding))
-                            && !live_identities.contains(&slot.identity())
+                    && overlay.slots().iter().all(|slot| match *slot {
+                        StableTabSlot::Remote { binding_id, .. } => {
+                            live.attached.contains(&binding_id)
+                                && !live_identities.contains(&slot.identity())
+                        }
+                        StableTabSlot::Local { session_id, .. } => session_id != live.local_session,
                     })
             })
             .map(|overlay| (overlay.window_id(), overlay.local_revision()))
@@ -1934,6 +1941,7 @@ mod tests {
                     .collect(),
                 unavailable: BTreeSet::new(),
                 attached: BTreeSet::from([binding]),
+                local_session: super::StableLocalSessionId::from_bytes([0x01; 16]),
             };
             (window, tabs, live)
         };
@@ -2022,9 +2030,9 @@ mod tests {
     }
 
     #[test]
-    fn saved_layouts_whose_tabs_are_gone_are_pruned_only_when_their_host_is_attached() {
+    fn saved_layouts_are_pruned_only_when_none_of_their_tabs_can_return() {
         use super::{LayoutLifecycle, LiveLayout, MixedDomainLayoutOverlay};
-        use super::{StableMuxSessionId, StableTabSlot};
+        use super::{StableLocalSessionId, StableLocalTabId, StableMuxSessionId, StableTabSlot};
         use crate::window_state_persist::DomainBindingId;
         use mux::Mux;
         use std::collections::{BTreeSet, HashMap};
@@ -2048,11 +2056,13 @@ mod tests {
             restored: Default::default(),
         };
         let mux = Arc::new(Mux::new(None));
+        let this_launch = StableLocalSessionId::from_bytes([0x73; 16]);
         let live = |attached: BTreeSet<DomainBindingId>| LiveLayout {
             receipts: Vec::new(),
             slots: HashMap::new(),
             unavailable: BTreeSet::new(),
             attached,
+            local_session: this_launch,
         };
 
         // Host not attached yet (or unreachable): its saved order must survive.
@@ -2074,6 +2084,34 @@ mod tests {
         let mut still_live = live(BTreeSet::from([binding]));
         still_live.slots.insert(usize::MAX - 1, stale);
         assert!(lifecycle.orphaned_overlays(&still_live).is_empty());
+
+        // Local tabs: a slot from an earlier launch can never return, one from
+        // this launch can. A dead local slot next to a remote slot of a host
+        // that has not attached yet keeps the overlay.
+        let local =
+            |session| StableTabSlot::local(session, StableLocalTabId::from_bytes([0x74; 16]));
+        let earlier = local(StableLocalSessionId::from_bytes([0x75; 16]));
+        let mut lifecycle = lifecycle;
+        let only_overlay = |lifecycle: &mut LayoutLifecycle, slots: Vec<StableTabSlot>| {
+            let id = lifecycle.startup.new_layout_window_id().unwrap();
+            let overlay = MixedDomainLayoutOverlay::new(
+                id,
+                "default",
+                2,
+                slots.clone(),
+                slots.first().copied(),
+            );
+            lifecycle.startup.overlays = vec![overlay.unwrap()];
+            id
+        };
+        let id = only_overlay(&mut lifecycle, vec![earlier]);
+        assert_eq!(lifecycle.orphaned_overlays(&detached), vec![(id, 2)]);
+        only_overlay(&mut lifecycle, vec![local(this_launch)]);
+        assert!(lifecycle.orphaned_overlays(&detached).is_empty());
+        only_overlay(&mut lifecycle, vec![earlier, stale]);
+        assert!(lifecycle.orphaned_overlays(&detached).is_empty());
+        let id = only_overlay(&mut lifecycle, vec![earlier, stale]);
+        assert_eq!(lifecycle.orphaned_overlays(&attached), vec![(id, 2)]);
     }
 
     #[test]
