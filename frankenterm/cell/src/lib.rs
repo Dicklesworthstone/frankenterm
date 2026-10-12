@@ -1917,6 +1917,26 @@ mod test {
             1
         );
 
+        // ft-vylyj: a keycap's VS16 widens it like any other variation
+        // sequence, although the keycap mark follows the selector.
+        for keycap in [
+            "1\u{FE0F}\u{20E3}",
+            "#\u{FE0F}\u{20E3}",
+            "*\u{FE0F}\u{20E3}",
+        ] {
+            assert_eq!(
+                Graphemes::new(keycap).collect::<Vec<_>>(),
+                vec![keycap.to_string()]
+            );
+            assert_eq!(unicode_column_width(keycap, None), 2, "{keycap:?}");
+            assert_eq!(
+                unicode_column_width(keycap, Some(&UnicodeVersion::new(9))),
+                1,
+                "{keycap:?}"
+            );
+        }
+        assert_eq!(unicode_column_width("1\u{FE0E}\u{20E3}", None), 1);
+
         let copyright_text_presentation = "\u{00A9}";
         assert_eq!(
             Graphemes::new(copyright_text_presentation).collect::<Vec<_>>(),

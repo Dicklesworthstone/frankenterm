@@ -1548,14 +1548,15 @@ pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
 
     /// The default unicode version to assume.
     /// This affects how the width of certain sequences is interpreted.
-    /// At the time of writing, we default to 9 even though the current
-    /// version of unicode is 14.  14 introduced emoji presentation selectors
-    /// that also alter the width of certain sequences, and that is too
-    /// new for most deployed applications.
-    // Coupled with config/src/lib.rs:default_unicode_version
+    /// 14 makes an emoji presentation selector (VS16) widen its character
+    /// to two cells, as Ghostty and kitty do and as the width libraries of
+    /// the agent CLIs this terminal hosts (string-width, unicode-width)
+    /// assume. Under 9, "⚠️" took one cell here and two in the program
+    /// that printed it, shifting the rest of its line.
+    // Coupled with config/src/config.rs:default_unicode_version
     fn unicode_version(&self) -> UnicodeVersion {
         UnicodeVersion {
-            version: 9,
+            version: 14,
             ambiguous_are_wide: false,
             cell_widths: None,
         }

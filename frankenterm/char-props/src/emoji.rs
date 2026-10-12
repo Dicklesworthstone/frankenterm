@@ -48,6 +48,15 @@ impl Presentation {
         if let Some((a, b)) = VARIATION_MAP.get(s) {
             return (*a, Some(*b));
         }
+        // A variation sequence that the grapheme continues keeps its
+        // selector (ft-vylyj): a keycap is "1", VS16, then U+20E3, and the
+        // map's keys are only the base and the selector.
+        let mut chars = s.char_indices().skip(1);
+        if let Some((at, selector @ ('\u{FE0E}' | '\u{FE0F}'))) = chars.next() {
+            if let Some((a, b)) = VARIATION_MAP.get(&s[..at + selector.len_utf8()]) {
+                return (*a, Some(*b));
+            }
+        }
         Self::scan(s)
     }
 
@@ -305,6 +314,41 @@ mod tests {
         // '#' and '*' are keycap base characters but have text presentation
         assert_eq!(Presentation::for_char('#'), Presentation::Text);
         assert_eq!(Presentation::for_char('*'), Presentation::Text);
+    }
+
+    /// ft-vylyj: a keycap's selector names its presentation although the
+    /// keycap mark follows it, so "1️⃣" is emoji and "1︎⃣" text.
+    #[test]
+    fn keycap_sequences_keep_their_selector() {
+        for base in ['0', '1', '9', '#', '*'] {
+            for (selector, explicit) in [
+                ('\u{FE0F}', Presentation::Emoji),
+                ('\u{FE0E}', Presentation::Text),
+            ] {
+                for skip in [false, true] {
+                    assert_eq!(
+                        Presentation::for_grapheme_with(&format!("{base}{selector}\u{20E3}"), skip),
+                        (Presentation::Text, Some(explicit)),
+                        "{base:?} {selector:?} skip={skip}"
+                    );
+                }
+            }
+        }
+        // Without a selector the keycap names no presentation.
+        assert_eq!(
+            Presentation::for_grapheme("1\u{20E3}"),
+            (Presentation::Text, None)
+        );
+    }
+
+    /// A selector that a ZWJ sequence continues is kept too: the heart of
+    /// "❤️‍🔥" asked for emoji.
+    #[test]
+    fn a_continued_variation_sequence_keeps_its_selector() {
+        assert_eq!(
+            Presentation::for_grapheme("\u{2764}\u{FE0F}\u{200D}\u{1F525}"),
+            (Presentation::Text, Some(Presentation::Emoji))
+        );
     }
 
     #[test]

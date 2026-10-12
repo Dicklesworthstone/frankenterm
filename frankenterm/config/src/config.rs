@@ -2913,9 +2913,10 @@ fn default_gui_startup_args() -> Vec<String> {
     vec!["start".to_string()]
 }
 
-// Coupled with term/src/config.rs:TerminalConfiguration::unicode_version
+// Coupled with term/src/config.rs:TerminalConfiguration::unicode_version,
+// which says why the default is 14 rather than 9.
 fn default_unicode_version() -> u8 {
-    9
+    14
 }
 
 fn default_mux_env_remove() -> Vec<String> {
@@ -3946,8 +3947,8 @@ mod tests {
     }
 
     #[test]
-    fn default_unicode_version_is_nine() {
-        assert_eq!(default_unicode_version(), 9);
+    fn default_unicode_version_widens_vs16_emoji() {
+        assert_eq!(default_unicode_version(), 14);
     }
 
     #[test]
