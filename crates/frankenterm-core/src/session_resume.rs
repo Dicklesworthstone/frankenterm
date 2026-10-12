@@ -29,6 +29,7 @@ use crate::runtime_async::process::{
     CommandProcessCleanupIncomplete, CommandTimedOut, DEFAULT_COMMAND_STDERR_LIMIT_BYTES,
     DEFAULT_COMMAND_STDOUT_LIMIT_BYTES, decode_captured_bytes_lossy,
 };
+use crate::system_symlinks::resolve_system_symlinks;
 
 // =============================================================================
 // Agent provider enum
@@ -1907,7 +1908,14 @@ pub fn discover_antigravity_conversations_in_dir(
     discover_antigravity_conversations_in_dir_with_checkpoint(conversations_dir, || Ok(()))
 }
 
+/// Opens `path` from its root without following a symlink, except the
+/// system's own among its ancestors (`/var` and `/tmp` on macOS), which
+/// [`resolve_system_symlinks`] rewrites first.
 fn open_session_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    open_resolved_session_directory_tree_nofollow(&resolve_system_symlinks(path))
+}
+
+fn open_resolved_session_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
     if path
         .components()
         .any(|component| matches!(component, std::path::Component::ParentDir))
@@ -1928,7 +1936,7 @@ fn open_session_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std:
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let parent = open_session_directory_tree_nofollow(parent_path)?;
+    let parent = open_resolved_session_directory_tree_nofollow(parent_path)?;
     open_session_child_directory_nofollow(&parent, Path::new(leaf))
 }
 

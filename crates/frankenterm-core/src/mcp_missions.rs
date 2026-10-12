@@ -1448,6 +1448,10 @@ mod tests {
         let baseline = make_tx_contract(1);
         std::fs::write(&path, serde_json::to_vec_pretty(&baseline).unwrap()).unwrap();
         let guard = crate::tx_execution::acquire_tx_contract_lock(dir.path(), &path).unwrap();
+        // The lock names the contract canonically, and saves must name it
+        // the same way, as the tools do. A temporary directory is under a
+        // symlink on macOS (/var), so its own spelling is not that name.
+        let path = guard.authoritative_path().to_path_buf();
 
         // First save replaces the existing authoritative contract.
         let contract = make_tx_contract(3);

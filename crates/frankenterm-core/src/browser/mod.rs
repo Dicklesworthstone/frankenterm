@@ -43,6 +43,7 @@ use cap_std::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StorageError};
+use crate::system_symlinks::resolve_system_symlinks;
 
 pub mod anthropic_auth;
 pub mod bootstrap;
@@ -1611,7 +1612,14 @@ fn path_has_parent_component(path: &Path) -> bool {
         .any(|component| matches!(component, std::path::Component::ParentDir))
 }
 
+/// Opens `path` from its root without following a symlink, except the
+/// system's own among its ancestors (`/var` and `/tmp` on macOS), which
+/// [`resolve_system_symlinks`] rewrites first.
 fn open_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    open_resolved_directory_tree_nofollow(&resolve_system_symlinks(path))
+}
+
+fn open_resolved_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
     if path_has_parent_component(path) {
         return Err(private_io_error(
             "private directory path contains a parent component",
@@ -1629,11 +1637,17 @@ fn open_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let parent = open_directory_tree_nofollow(parent_path)?;
+    let parent = open_resolved_directory_tree_nofollow(parent_path)?;
     open_child_directory_path_nofollow(&parent, Path::new(leaf))
 }
 
+/// Like [`open_directory_tree_nofollow`], creating the directories that are
+/// missing.
 fn ensure_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    ensure_resolved_directory_tree_nofollow(&resolve_system_symlinks(path))
+}
+
+fn ensure_resolved_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
     if path_has_parent_component(path) {
         return Err(private_io_error(
             "private directory path contains a parent component",
@@ -1651,7 +1665,7 @@ fn ensure_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::D
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let parent = ensure_directory_tree_nofollow(parent_path)?;
+    let parent = ensure_resolved_directory_tree_nofollow(parent_path)?;
     let leaf = Path::new(leaf);
     let created = match create_private_child_directory(&parent, leaf) {
         Ok(()) => true,

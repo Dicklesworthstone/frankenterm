@@ -776,6 +776,7 @@ pub mod swarm_pipeline;
 pub mod swarm_scheduler;
 pub mod swarm_tail_risk_conformal;
 pub mod swarm_work_queue;
+mod system_symlinks;
 pub mod tailer;
 // ft-y0loj.1: tantivy_* + recorder_lexical_* modules extracted into the
 // `frankenterm-core-tantivy` sub-crate. The `recorder-lexical` feature

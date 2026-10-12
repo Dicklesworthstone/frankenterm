@@ -77,6 +77,7 @@ use crate::scrollback_mmap_writer::{
     LinearRecordSnapshot, LinearRecordSourceIdentity, MmapScrollbackError,
     read_linear_records_in_directory,
 };
+use crate::system_symlinks::resolve_system_symlinks;
 use cap_fs_ext::{DirExt as _, FollowSymlinks, MetadataExt as _, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir as CapDir, OpenOptions as CapOpenOptions};
 use fs2::FileExt;
@@ -2006,7 +2007,14 @@ fn header_matches_filename(leaf: &Path, header: &ScrollbackHeader) -> bool {
     hex::decode_to_slice(stem, &mut decoded).is_ok() && decoded == header.pane_uuid
 }
 
+/// Opens `path` from its root without following a symlink, except the
+/// system's own among its ancestors (`/var` and `/tmp` on macOS), which
+/// [`resolve_system_symlinks`] rewrites first.
 fn open_directory_tree_nofollow(path: &Path) -> std::io::Result<CapDir> {
+    open_resolved_directory_tree_nofollow(&resolve_system_symlinks(path))
+}
+
+fn open_resolved_directory_tree_nofollow(path: &Path) -> std::io::Result<CapDir> {
     if path
         .components()
         .any(|component| matches!(component, std::path::Component::ParentDir))
@@ -2028,7 +2036,7 @@ fn open_directory_tree_nofollow(path: &Path) -> std::io::Result<CapDir> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let parent = open_directory_tree_nofollow(parent_path)?;
+    let parent = open_resolved_directory_tree_nofollow(parent_path)?;
     parent.open_dir_nofollow(leaf)
 }
 
