@@ -5009,6 +5009,17 @@ struct UserVarWorkerGuard {
     armed: bool,
 }
 
+impl UserVarWorkerGuard {
+    /// A clean finish: dropping the guard then leaves the queue open.
+    ///
+    /// A method rather than `guard.armed = false` in the worker: only `Drop`
+    /// reads the flag, which rustc's liveness lint cannot see through the
+    /// async block's capture, so a bare assignment reads as dead.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
 impl Drop for UserVarWorkerGuard {
     fn drop(&mut self) {
         if !self.armed {
@@ -5125,7 +5136,7 @@ impl UserVarDeliveryQueue {
             .spawn(async move {
                 let result = queue.drain(&authority).await;
                 match result {
-                    Ok(()) => guard.armed = false,
+                    Ok(()) => guard.disarm(),
                     Err(error) => log::error!("ordered user-variable delivery failed: {error:#}"),
                 }
             })

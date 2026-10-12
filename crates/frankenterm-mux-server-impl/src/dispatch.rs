@@ -9293,7 +9293,8 @@ mod tests {
         let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let response = Pdu::GetPaneUserVarsV1Response(codec::GetPaneUserVarsV1Response {
+        // `Pdu` is not `Clone`; its payload is, so each use wraps a copy.
+        let payload = codec::GetPaneUserVarsV1Response {
             pane_id: 95,
             outcome: codec::PaneUserVarsOutcomeV1::Snapshot {
                 user_vars: std::collections::HashMap::from([(
@@ -9301,9 +9302,9 @@ mod tests {
                     "background".to_string(),
                 )]),
             },
-        });
-        let prepared = response
-            .clone()
+        };
+        let response = || Pdu::GetPaneUserVarsV1Response(payload.clone());
+        let prepared = response()
             .prepare_outbound(
                 codec::PduProducer::Server,
                 codec::PduWireRole::CorrelatedReply,
@@ -9334,7 +9335,7 @@ mod tests {
             coordinator
                 .queue_response(
                     DecodedPdu {
-                        pdu: response.clone(),
+                        pdu: response(),
                         serial,
                     },
                     PduDeliveryClass::Control,
@@ -9367,7 +9368,7 @@ mod tests {
         coordinator
             .queue_response(
                 DecodedPdu {
-                    pdu: response.clone(),
+                    pdu: response(),
                     serial: 214,
                 },
                 PduDeliveryClass::Control,
@@ -9384,7 +9385,7 @@ mod tests {
         );
         let decoded = take_written_pdu(&item_rx);
         assert_eq!(decoded.serial, 214);
-        assert_eq!(decoded.pdu, response);
+        assert_eq!(decoded.pdu, response());
         assert_outbound_live_counters_zero(&coordinator);
         assert!(!coordinator.terminal.is_tripped());
         assert!(terminal_rx.is_empty());

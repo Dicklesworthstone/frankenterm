@@ -805,7 +805,7 @@ mod deferred_scrollback {
                                 return;
                             }
                             Some(CommitWindow::Closed(_)) => break,
-                            None => continue,
+                            None => {}
                         }
                     }
                     CommitWindow::Closed(reason) => {

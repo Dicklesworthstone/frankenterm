@@ -14893,7 +14893,7 @@ where
     // HashMap iteration must not make two identical snapshots produce
     // different wire bytes. The count was admitted before allocating refs.
     let mut entries = user_vars.iter().collect::<Vec<_>>();
-    entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    entries.sort_unstable_by_key(|(name, _)| *name);
     let mut map = serializer.serialize_map(Some(entries.len()))?;
     for (name, value) in entries {
         map.serialize_entry(name, value)?;
