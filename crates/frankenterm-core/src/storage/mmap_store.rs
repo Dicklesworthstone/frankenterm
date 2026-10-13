@@ -5746,7 +5746,7 @@ mod tests {
             let pane = store.panes.get_mut(&1).unwrap();
             let path = if substitute_pending {
                 PANE_SEQUENCE_JOURNAL_FAULT.with(|fault| {
-                    fault.set(Some(PaneSequenceJournalFault::CheckpointPartialWrite))
+                    fault.set(Some(PaneSequenceJournalFault::CheckpointPartialWrite));
                 });
                 let failed = pane.checkpoint_base_seq(6);
                 PANE_SEQUENCE_JOURNAL_FAULT.with(|fault| fault.set(None));
