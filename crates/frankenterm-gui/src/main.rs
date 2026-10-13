@@ -3166,6 +3166,23 @@ impl Publish {
         }
     }
 
+    fn require_existing_gui_executable(
+        &mut self,
+        running: &std::path::Path,
+        launching: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        if running != launching {
+            // Every install lives at its own versioned bundle path, so an
+            // upgrade launched while the predecessor runs lands here. Like a
+            // version change, it starts its own GUI, but it is the one later
+            // launches should reach: publish it. Not publishing left the
+            // pointer on the predecessor, dead once that quit (ft-i6k24).
+            *self = Self::NoConnectButShouldPublish;
+            anyhow::bail!("Running GUI is a different executable from us, will start a new one");
+        }
+        Ok(())
+    }
+
     fn require_existing_gui_version(
         &mut self,
         running_version: &str,
@@ -3213,11 +3230,10 @@ impl Publish {
                     let res = block_on(executor.run(async move {
                         let vers = client.verify_version_compat(&ui).await?;
 
-                        if vers.executable_path != std::env::current_exe().context("resolve executable path")? {
-                            *self = Publish::NoConnect;
-                            anyhow::bail!(
-                                "Running GUI is a different executable from us, will start a new one");
-                        }
+                        self.require_existing_gui_executable(
+                            &vers.executable_path,
+                            &std::env::current_exe().context("resolve executable path")?,
+                        )?;
                         if vers.config_file_path
                             != std::env::var_os("WEZTERM_CONFIG_FILE").map(Into::into)
                         {
@@ -3998,6 +4014,27 @@ mod tests {
         );
         assert!(matches!(publish, Publish::NoConnectButShouldPublish));
         assert!(publish.should_publish());
+    }
+
+    #[test]
+    fn different_executable_gui_starts_its_own_and_publishes_it() {
+        let mut publish = Publish::TryPath(PathBuf::from("existing-gui.sock"));
+        publish
+            .require_existing_gui_executable(
+                std::path::Path::new("/Applications/.frankenterm-versions/old/frankenterm-gui"),
+                std::path::Path::new("/Applications/.frankenterm-versions/new/frankenterm-gui"),
+            )
+            .expect_err("a different executable must not delegate its spawn");
+        assert!(matches!(publish, Publish::NoConnectButShouldPublish));
+        assert!(publish.should_publish());
+
+        let socket = PathBuf::from("existing-gui.sock");
+        let mut publish = Publish::TryPath(socket.clone());
+        let same = std::path::Path::new("/Applications/FrankenTerm.app/frankenterm-gui");
+        publish
+            .require_existing_gui_executable(same, same)
+            .expect("the same executable may retain its existing GUI");
+        assert!(matches!(&publish, Publish::TryPath(path) if path == &socket));
     }
 
     #[test]
