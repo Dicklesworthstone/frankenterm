@@ -9,10 +9,16 @@
     "crash_to_shell"
   ],
   "samples": {
-    "composer_nonempty": ["Type your message", "Press Enter to send", "ctrl+j for newline"],
+    "composer_nonempty": ["› ftprobe composer text", "Type your message", "Press Enter to send", "ctrl+j for newline"],
     "composer_cleared": ["Thinking", "working", "Token usage:"],
-    "working_state": ["Running command", "Reading file", "Editing file"],
-    "queued_behind_operation": ["waiting for approval", "operation in progress", "queued"],
+    "working_state": ["Working (1s • esc to interrupt)", "Running command", "Reading file", "Editing file"],
+    "queued_behind_operation": [
+      "Would you like to run the following command?",
+      "Press enter to confirm or esc to cancel",
+      "Messages to be submitted after next tool call (press esc to interrupt and send immediately)",
+      "waiting for approval",
+      "operation in progress"
+    ],
     "crash_to_shell": [
       "thread 'main' panicked",
       "Traceback (most recent call last)",

@@ -3303,9 +3303,15 @@ fn builtin_codex_submit_profile() -> SubmitProfile {
     SubmitProfile {
         id: "codex.default".to_string(),
         agent_type: AgentType::Codex,
-        version: "2026-06-08".to_string(),
+        // Anchors re-captured from live codex-cli 0.162.1 panes on 2026-10-12.
+        version: "2026-10-12".to_string(),
         anchors: SubmitProfileAnchors {
+            // 0.162 draws no send/newline hint; the composer is the last
+            // `› ` line (submitted turns are echoed with the same glyph, which
+            // the classifier handles by only reading text after the last one).
+            // The older hints stay for earlier CLI versions.
             composer_nonempty: vec![
+                "\u{203a}".to_string(),
                 "Press Enter to send".to_string(),
                 "ctrl+j for newline".to_string(),
                 "Type your message".to_string(),
@@ -3315,16 +3321,24 @@ fn builtin_codex_submit_profile() -> SubmitProfile {
                 "working".to_string(),
                 "Token usage:".to_string(),
             ],
+            // The status line names the reasoning step ("Working", or a
+            // model-written header), but always ends "esc to interrupt".
             working_state: vec![
+                "esc to interrupt".to_string(),
                 "Thinking".to_string(),
                 "Running".to_string(),
                 "Reading".to_string(),
                 "Editing".to_string(),
             ],
+            // Approval overlay and the busy-turn message queue in 0.162. No
+            // bare "queued": agent output mentioning a queued job matched it
+            // and held every later send as queued.
             queued_behind_operation: vec![
+                "Would you like to run the following command?".to_string(),
+                "Press enter to confirm or esc to cancel".to_string(),
+                "Messages to be submitted after next tool call".to_string(),
                 "waiting for approval".to_string(),
                 "operation in progress".to_string(),
-                "queued".to_string(),
             ],
             crash_to_shell: vec![
                 "thread 'main' panicked".to_string(),
@@ -3538,9 +3552,12 @@ fn builtin_claude_code_submit_profile() -> SubmitProfile {
     SubmitProfile {
         id: "claude_code.default".to_string(),
         agent_type: AgentType::ClaudeCode,
-        version: "2026-09-25".to_string(),
+        version: "2026-10-12".to_string(),
         anchors: SubmitProfileAnchors {
+            // Claude Code 2.1.296 prompts with `❯` (captured 2026-10-12) and
+            // echoes submitted turns the same way; `>` was the older prompt.
             composer_nonempty: vec![
+                "\u{276f}".to_string(),
                 ">".to_string(),
                 "shift+enter".to_string(),
                 "Press Enter to send".to_string(),
@@ -6349,7 +6366,7 @@ rules:
                 .anchors
                 .queued_behind_operation
                 .iter()
-                .any(|anchor| anchor == "queued")
+                .any(|anchor| anchor == "Messages to be submitted after next tool call")
         );
     }
 

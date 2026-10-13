@@ -9,7 +9,7 @@
     "crash_to_shell"
   ],
   "samples": {
-    "composer_nonempty": [">", "shift+enter", "Press Enter to send"],
+    "composer_nonempty": ["❯ ftprobe composer text", ">", "shift+enter", "Press Enter to send"],
     "composer_cleared": ["Thinking", "Using tool", "Tool call:"],
     "working_state": ["Thinking", "Using tool", "Executing:"],
     "queued_behind_operation": ["Approve?", "Allow?", "Permission"],

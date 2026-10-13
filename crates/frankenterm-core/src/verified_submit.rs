@@ -557,23 +557,21 @@ pub fn classify_verified_submit(input: VerifiedSubmitInput<'_>) -> VerifiedSubmi
         );
     }
 
-    if let Some(evidence_id) = first_anchor_match(
+    if let Some(evidence_id) = composer_anchor_holds_command(
         profile,
-        "composer_nonempty",
         &profile.anchors.composer_nonempty,
         &after_tail,
+        &command_lower,
     ) {
-        if !command_lower.is_empty() && after_tail.contains(&command_lower) {
-            return report_with_profile(
-                SubmitReceiptState::StuckInComposer,
-                profile,
-                attempts,
-                input.polls,
-                cursor_before,
-                cursor_after,
-                vec![evidence_id],
-            );
-        }
+        return report_with_profile(
+            SubmitReceiptState::StuckInComposer,
+            profile,
+            attempts,
+            input.polls,
+            cursor_before,
+            cursor_after,
+            vec![evidence_id],
+        );
     }
 
     if capture_delta_submitted(input.before_text, input.after_text, &command_lower) {
@@ -763,6 +761,35 @@ fn first_anchor_match(
             !anchor.is_empty() && after_tail_lower.contains(&anchor.to_ascii_lowercase())
         })
         .map(|(index, _)| format!("submit_profile:{}:{group}:{index}", profile.id))
+}
+
+/// Agent CLIs draw the input box below the conversation and echo each
+/// submitted turn with the same marker (Codex 0.162 renders both as
+/// `› <text>`, Claude Code 2.1 as `❯ <text>`). So the command proves a stuck
+/// composer only when it follows the anchor's last occurrence; matching it
+/// anywhere on screen read every completed send as stuck. An anchor drawn
+/// below the input box can only fall back to weaker evidence, never to a false
+/// success.
+fn composer_anchor_holds_command(
+    profile: &SubmitProfile,
+    anchors: &[String],
+    after_tail_lower: &str,
+    command_lower: &str,
+) -> Option<String> {
+    if command_lower.is_empty() {
+        return None;
+    }
+    anchors
+        .iter()
+        .enumerate()
+        .find(|(_, anchor)| {
+            let anchor = anchor.trim().to_ascii_lowercase();
+            !anchor.is_empty()
+                && after_tail_lower
+                    .rfind(&anchor)
+                    .is_some_and(|at| after_tail_lower[at + anchor.len()..].contains(command_lower))
+        })
+        .map(|(index, _)| format!("submit_profile:{}:composer_nonempty:{index}", profile.id))
 }
 
 fn capture_tail(text: &str) -> &str {
@@ -1056,6 +1083,128 @@ mod tests {
             report.evidence_rule_ids,
             vec!["submit_profile:codex.default:insufficient_evidence"]
         );
+    }
+
+    // Real pane captures (paths shortened) from codex-cli 0.162.1 and Claude
+    // Code 2.1.296, 2026-10-12. Both CLIs echo a submitted turn with the same
+    // glyph as the composer, which is drawn last.
+    const CODEX_STATUS: &str = "  GPT-6-Astra xhigh \u{b7} ~/scratch/probe \u{2026}  \u{26a0} 2 warnings \u{b7} f2 to view\n";
+    const CODEX_COMMAND: &str = "ftprobe: reply with the single word OK and do nothing else";
+    const CLAUDE_RULE: &str = "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n";
+
+    fn builtin_profile(agent_type: AgentType) -> SubmitProfile {
+        crate::patterns::PatternEngine::default()
+            .submit_profile_for_agent(agent_type)
+            .expect("builtin submit profile")
+            .clone()
+    }
+
+    fn classify_capture(
+        profile: &SubmitProfile,
+        command: &str,
+        before: &str,
+        after: &str,
+    ) -> VerifiedSubmitReport {
+        classify_verified_submit(VerifiedSubmitInput {
+            pane_id: 7,
+            command_text: command,
+            agent_type: profile.agent_type,
+            profile: Some(profile),
+            before_text: Some(before),
+            after_text: Some(after),
+            after_semantic_snapshot: None,
+            attempts: 1,
+            polls: 1,
+        })
+    }
+
+    #[test]
+    fn codex_0_162_captures_classify_each_composer_state() {
+        let profile = builtin_profile(AgentType::Codex);
+        let empty = format!("\u{203a} Ask Codex to do anything\n\n{CODEX_STATUS}");
+        let history = format!("\u{203a} {CODEX_COMMAND}\n\n");
+
+        let stuck = format!("\u{203a} {CODEX_COMMAND}\n\n{CODEX_STATUS}");
+        let report = classify_capture(&profile, CODEX_COMMAND, &empty, &stuck);
+        assert_eq!(report.state, SubmitReceiptState::StuckInComposer);
+        assert_eq!(
+            report.evidence_rule_ids,
+            vec!["submit_profile:codex.default:composer_nonempty:0"]
+        );
+
+        let working =
+            format!("{history}\u{2022} Working (1s \u{2022} esc to interrupt)\n\n{empty}");
+        let report = classify_capture(&profile, CODEX_COMMAND, &empty, &working);
+        assert_eq!(report.state, SubmitReceiptState::Submitted);
+
+        // A turn that finished before the poll still shows the echoed command,
+        // but the composer below it is empty again: never "stuck".
+        let finished =
+            format!("{history}\u{2022} OK\n\n  Worked for 3s \u{2022} 7:58 PM\n\n{empty}");
+        let report = classify_capture(&profile, CODEX_COMMAND, &empty, &finished);
+        assert_ne!(report.state, SubmitReceiptState::StuckInComposer);
+
+        let queued = format!(
+            "{history}\u{2022} Working (3s \u{2022} esc to interrupt)\n\n\
+             \u{2022} Messages to be submitted after next tool call (press esc to interrupt and send immediately)\n\
+             \x20 \u{21b3} ftprobe second message while busy\n\n{empty}"
+        );
+        let report = classify_capture(
+            &profile,
+            "ftprobe second message while busy",
+            &empty,
+            &queued,
+        );
+        assert_eq!(report.state, SubmitReceiptState::QueuedBehindOperation);
+
+        let approval = format!(
+            "{history}\u{2022} Running touch probe.txt\n\n  Would you like to run the following command?\n\n\
+             \x20 $ touch probe.txt\n\n\u{203a} 1. Yes, proceed (y)\n\
+             \x20 3. No, and tell Codex what to do differently (esc)\n\n\
+             \x20 Press enter to confirm or esc to cancel\n"
+        );
+        let report = classify_capture(&profile, CODEX_COMMAND, &empty, &approval);
+        assert_eq!(report.state, SubmitReceiptState::QueuedBehindOperation);
+    }
+
+    #[test]
+    fn agent_output_mentioning_a_queued_job_does_not_hold_codex_sends() {
+        let profile = builtin_profile(AgentType::Codex);
+        let empty = format!("\u{203a} Ask Codex to do anything\n\n{CODEX_STATUS}");
+        let after = format!(
+            "\u{2022} The release build is queued on the worker.\n\n\u{203a} {CODEX_COMMAND}\n\n\
+             \u{2022} Working (0s \u{2022} esc to interrupt)\n\n{empty}"
+        );
+        let report = classify_capture(&profile, CODEX_COMMAND, &empty, &after);
+        assert_eq!(report.state, SubmitReceiptState::Submitted);
+    }
+
+    #[test]
+    fn claude_code_2_1_captures_classify_each_composer_state() {
+        let profile = builtin_profile(AgentType::ClaudeCode);
+        let command = "ftprobe: reply with the single word OK and do nothing else";
+        let footer = "  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle)\n";
+        let empty = format!("{CLAUDE_RULE}\u{276f}\n{CLAUDE_RULE}{footer}");
+
+        let stuck = format!("{CLAUDE_RULE}\u{276f} {command}\n{CLAUDE_RULE}{footer}");
+        let report = classify_capture(&profile, command, &empty, &stuck);
+        assert_eq!(report.state, SubmitReceiptState::StuckInComposer);
+        assert_eq!(
+            report.evidence_rule_ids,
+            vec!["submit_profile:claude_code.default:composer_nonempty:0"]
+        );
+
+        let history = format!("\u{276f} {command}\n\n\u{23fa} OK\n\n");
+        let finished = format!("{history}\u{273b} Baked for 2s \u{b7} done 8:05 PM\n\n{empty}");
+        let report = classify_capture(&profile, command, &empty, &finished);
+        assert_ne!(report.state, SubmitReceiptState::StuckInComposer);
+
+        let working = format!(
+            "{history}{CLAUDE_RULE}\u{276f}\n{CLAUDE_RULE}  \u{23f5}\u{23f5} bypass permissions on \
+             (shift+tab to cycle) \u{b7} esc to interrupt\n"
+        );
+        let report = classify_capture(&profile, command, &empty, &working);
+        assert_eq!(report.state, SubmitReceiptState::Submitted);
     }
 
     #[test]
