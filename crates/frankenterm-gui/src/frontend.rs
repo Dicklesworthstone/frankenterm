@@ -505,6 +505,13 @@ fn topology_needs_workspace_reconcile(change: &mux::FrozenWindowTopologyChange) 
 
 fn layout_attachment_ready(_: mux::domain::DomainId) {
     schedule_layout_reconcile(true);
+    // Every remote topology refresh withdraws the attachment's layout receipt
+    // until it is republished here. A capture in that gap finds no slots for
+    // the attachment's tabs and skips their window, so a reorder made then was
+    // never saved until some later local change (a crash right after lost it).
+    // Capture again once the receipt is back; this coalesces into the same pass
+    // and runs after the restore.
+    schedule_layout_reconcile(false);
 }
 
 struct LayoutReconcileAdmission<'a> {
