@@ -2660,7 +2660,7 @@ fn pane_alerts_coalesce(existing: &Alert, incoming: &Alert) -> bool {
     )
 }
 
-fn pane_alert_is_exact_event(alert: &Alert) -> bool {
+pub(crate) fn pane_alert_is_exact_event(alert: &Alert) -> bool {
     matches!(
         alert,
         Alert::Bell
@@ -3094,15 +3094,192 @@ struct TrackedPane {
 
 struct PendingPanePush {
     tracked: TrackedPane,
+    /// Earliest attempt instant before pacing: the enqueue instant, or the
+    /// capture-contention backoff deadline of a retried attempt.
     ready_at: Instant,
     retry_delay: std::time::Duration,
+    /// This attempt was expedited and must keep bypassing pacing if it has
+    /// to retry after capture contention.
+    expedited: bool,
+}
+
+/// Output-driven pushes of a pane without recent input start at most once per
+/// this interval (ft-4p4uo). Output inside the window coalesces into the one
+/// pending push, which always runs when the window closes, so the final
+/// screen is never dropped. One 60 Hz frame: a background pane cannot be
+/// painted faster than this by the client anyway.
+const PANE_PUSH_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// After committed key or text input for a pane, its pushes skip pacing and
+/// overtake queued output-driven pushes of other panes for this long, so the
+/// echo is not queued behind noisy siblings (ft-4p4uo). Under contention the
+/// overtaking alternates with those siblings, so none of them starves.
+const PANE_PUSH_INTERACTIVE_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Coordinator-owned pacing state of one pane. It outlives the pane's pending
+/// entry because the pacing window starts at the previous attempt.
+#[derive(Clone, Copy, Debug, Default)]
+struct PanePushPacing {
+    /// Start of the most recent coordinator capture attempt for this pane.
+    last_attempt: Option<Instant>,
+    /// Committed input made this pane interactive until this instant.
+    interactive_until: Option<Instant>,
+    /// The next attempt bypasses pacing because a bounded exact-event alert
+    /// backlog is waiting for it.
+    expedite: bool,
+}
+
+impl PanePushPacing {
+    fn is_interactive(&self, now: Instant) -> bool {
+        self.interactive_until.is_some_and(|until| now < until)
+    }
+
+    /// Earliest instant a pending push with pre-pacing deadline `floor` may
+    /// start. Interactive and expedited panes only honor `floor`, so a
+    /// capture-contention backoff still applies to them.
+    fn ready_at(&self, floor: Instant, now: Instant) -> Instant {
+        if self.expedite || self.is_interactive(now) {
+            return floor;
+        }
+        self.last_attempt
+            .and_then(|last| last.checked_add(PANE_PUSH_MIN_INTERVAL))
+            .map_or(floor, |paced| paced.max(floor))
+    }
+
+    /// No longer influences scheduling and may be forgotten.
+    fn is_spent(&self, now: Instant) -> bool {
+        !self.expedite && !self.is_interactive(now) && self.ready_at(now, now) <= now
+    }
 }
 
 #[derive(Default)]
 struct PanePushQueue {
     pending: HashMap<PaneId, PendingPanePush>,
     order: VecDeque<PaneId>,
+    pacing: HashMap<PaneId, PanePushPacing>,
+    /// The previous pick let an interactive pane overtake a ready pane
+    /// without recent input, so the next pick belongs to such a pane.
+    owes_fifo_turn: bool,
     closed: bool,
+}
+
+impl PanePushQueue {
+    /// Queue one push unless the pane already has one pending; the pending
+    /// push captures the newest screen when it runs, so it covers this one.
+    fn admit(&mut self, pane_id: PaneId, mut pending: PendingPanePush) {
+        if self.pending.contains_key(&pane_id) {
+            return;
+        }
+        if std::mem::take(&mut pending.expedited) {
+            self.pacing.entry(pane_id).or_default().expedite = true;
+        }
+        self.order.push_back(pane_id);
+        self.pending.insert(pane_id, pending);
+    }
+
+    /// Choose the pane to attempt at `now`.
+    ///
+    /// A pane without recent input is not ready until
+    /// [`PANE_PUSH_MIN_INTERVAL`] after its previous attempt. Among ready
+    /// panes the oldest interactive one runs first, so a keystroke's echo
+    /// waits for at most one other push. Each time that overtakes a ready
+    /// non-interactive pane, the following pick goes to the oldest such pane:
+    /// a pane that floods output while being typed into cannot starve its
+    /// siblings. With nothing ready, returns how long until the earliest
+    /// pending push becomes ready.
+    fn take_next(
+        &mut self,
+        now: Instant,
+    ) -> (
+        Option<(PaneId, PendingPanePush)>,
+        Option<std::time::Duration>,
+    ) {
+        let mut interactive = None;
+        let mut oldest_plain = None;
+        let mut delay: Option<std::time::Duration> = None;
+        for (index, id) in self.order.iter().enumerate() {
+            let Some(pending) = self.pending.get(id) else {
+                continue;
+            };
+            let pacing = self.pacing.get(id).copied().unwrap_or_default();
+            let ready_at = pacing.ready_at(pending.ready_at, now);
+            if ready_at > now {
+                let remaining = ready_at.duration_since(now);
+                delay = Some(delay.map_or(remaining, |current| current.min(remaining)));
+                continue;
+            }
+            if pacing.is_interactive(now) {
+                interactive = interactive.or(Some(index));
+            } else {
+                oldest_plain = oldest_plain.or(Some(index));
+            }
+        }
+        let chosen = match (interactive, oldest_plain) {
+            (Some(_), Some(plain)) if self.owes_fifo_turn => {
+                self.owes_fifo_turn = false;
+                Some(plain)
+            }
+            (Some(input), plain) => {
+                self.owes_fifo_turn = plain.is_some();
+                Some(input)
+            }
+            (None, plain) => {
+                self.owes_fifo_turn = false;
+                plain
+            }
+        };
+        let Some(index) = chosen else {
+            if self.pending.is_empty() {
+                // The coordinator is about to park; drop pacing state that no
+                // longer affects any decision so it stays bounded.
+                self.pacing.retain(|_, pacing| !pacing.is_spent(now));
+            }
+            return (None, delay);
+        };
+        // `index` was found above with its pending entry present.
+        let Some((id, mut pending)) = self
+            .order
+            .remove(index)
+            .and_then(|id| self.pending.remove(&id).map(|pending| (id, pending)))
+        else {
+            return (None, delay);
+        };
+        let pacing = self.pacing.entry(id).or_default();
+        pacing.last_attempt = Some(now);
+        pending.expedited = std::mem::take(&mut pacing.expedite);
+        (Some((id, pending)), None)
+    }
+
+    /// Returns whether the pane has a pending push that may now be ready.
+    fn mark_interactive(&mut self, pane_id: PaneId, now: Instant) -> bool {
+        if let Some(until) = now.checked_add(PANE_PUSH_INTERACTIVE_WINDOW) {
+            let pacing = self.pacing.entry(pane_id).or_default();
+            pacing.interactive_until = Some(
+                pacing
+                    .interactive_until
+                    .map_or(until, |current| current.max(until)),
+            );
+        }
+        self.pending.contains_key(&pane_id)
+    }
+
+    /// Returns whether the pane has a pending push that may now be ready.
+    fn expedite(&mut self, pane_id: PaneId) -> bool {
+        self.pacing.entry(pane_id).or_default().expedite = true;
+        self.pending.contains_key(&pane_id)
+    }
+
+    fn clear(&mut self) {
+        for (_, pending) in self.pending.drain() {
+            pending
+                .tracked
+                .push_state
+                .store(PANE_PUSH_IDLE, Ordering::Release);
+        }
+        self.order.clear();
+        self.pacing.clear();
+        self.owes_fifo_turn = false;
+    }
 }
 
 struct PanePushCoordinator {
@@ -3117,13 +3294,7 @@ impl PanePushCoordinator {
             Err(error) => {
                 let mut queue = error.into_inner();
                 queue.closed = true;
-                for (_, pending) in queue.pending.drain() {
-                    pending
-                        .tracked
-                        .push_state
-                        .store(PANE_PUSH_IDLE, Ordering::Release);
-                }
-                queue.order.clear();
+                queue.clear();
                 self.queue.clear_poison();
                 queue
             }
@@ -3141,13 +3312,39 @@ impl PanePushCoordinator {
             let _ = self.wake.try_send(());
             return;
         }
-        if !queue.pending.contains_key(&pane_id) {
-            queue.order.push_back(pane_id);
-            queue.pending.insert(pane_id, pending);
-        }
+        queue.admit(pane_id, pending);
         drop(queue);
         // A full one-element wake channel already represents all pending bits.
         let _ = self.wake.try_send(());
+    }
+
+    /// Committed key or text input for `pane_id`: its pushes skip pacing and
+    /// run ahead of other panes for [`PANE_PUSH_INTERACTIVE_WINDOW`].
+    fn mark_interactive(&self, pane_id: PaneId) {
+        let mut queue = self.lock_queue();
+        if queue.closed {
+            return;
+        }
+        let queued = queue.mark_interactive(pane_id, Instant::now());
+        drop(queue);
+        if queued {
+            // A paced push of this pane may be ready now; re-evaluate.
+            let _ = self.wake.try_send(());
+        }
+    }
+
+    /// The next push of `pane_id` carries an exact-event alert from a bounded
+    /// backlog, so it must not wait out a pacing window.
+    fn expedite(&self, pane_id: PaneId) {
+        let mut queue = self.lock_queue();
+        if queue.closed {
+            return;
+        }
+        let queued = queue.expedite(pane_id);
+        drop(queue);
+        if queued {
+            let _ = self.wake.try_send(());
+        }
     }
 
     fn remove(&self, pane_id: PaneId) {
@@ -3159,6 +3356,8 @@ impl PanePushCoordinator {
                 .store(PANE_PUSH_IDLE, Ordering::Release);
             queue.order.retain(|id| *id != pane_id);
         }
+        // A replacement registration starts with fresh pacing.
+        queue.pacing.remove(&pane_id);
         drop(queue);
         let _ = self.wake.try_send(());
     }
@@ -3166,13 +3365,7 @@ impl PanePushCoordinator {
     fn close(&self) {
         let mut queue = self.lock_queue();
         queue.closed = true;
-        for (_, pending) in queue.pending.drain() {
-            pending
-                .tracked
-                .push_state
-                .store(PANE_PUSH_IDLE, Ordering::Release);
-        }
-        queue.order.clear();
+        queue.clear();
         drop(queue);
         let _ = self.wake.try_send(());
     }
@@ -3189,27 +3382,7 @@ impl PanePushCoordinator {
                 if queue.closed {
                     return;
                 }
-                let now = Instant::now();
-                let mut next = None;
-                let mut delay = None;
-                for _ in 0..queue.order.len() {
-                    let Some(id) = queue.order.pop_front() else {
-                        break;
-                    };
-                    let Some(pending) = queue.pending.get(&id) else {
-                        continue;
-                    };
-                    if pending.ready_at <= now {
-                        next = queue.pending.remove(&id).map(|pending| (id, pending));
-                        break;
-                    }
-                    let remaining = pending.ready_at.duration_since(now);
-                    delay = Some(delay.map_or(remaining, |current: std::time::Duration| {
-                        current.min(remaining)
-                    }));
-                    queue.order.push_back(id);
-                }
-                (next, delay)
+                queue.take_next(Instant::now())
             };
             let Some((pane_id, mut pending)) = next else {
                 let cx = frankenterm_core::cx::Cx::current()
@@ -3253,6 +3426,9 @@ impl PanePushCoordinator {
                 Ok(Ok(())) => {
                     pending.retry_delay = std::time::Duration::from_millis(1);
                     pending.ready_at = Instant::now();
+                    // Output that re-dirtied the pane during this push waits
+                    // out the pacing window; only a new alert expedites again.
+                    pending.expedited = false;
                     let dirty = pending
                         .tracked
                         .push_state
@@ -3285,6 +3461,11 @@ impl PanePushCoordinator {
                     };
                     metrics::counter!("mux.server.detached_render_capture_retry", "cause" => cause)
                         .increment(1);
+                    // The backoff is a floor. A pane without recent input is
+                    // also paced from this attempt, so under a parser flood it
+                    // retries once per pacing window instead of spinning on
+                    // the bare try-lock; interactive and expedited panes keep
+                    // the short backoff.
                     pending.ready_at = Instant::now() + pending.retry_delay;
                     pending.retry_delay =
                         (pending.retry_delay * 2).min(std::time::Duration::from_millis(16));
@@ -3342,6 +3523,22 @@ impl Drop for PanePushStateGuard {
     fn drop(&mut self) {
         if !self.disarmed {
             self.state.store(PANE_PUSH_IDLE, Ordering::Release);
+        }
+    }
+}
+
+/// Marks one pane interactive in its session's push coordinator. Input tasks
+/// call [`Self::mark`] only after the pane input is committed, so the window
+/// covers the echo even when the task waited in the main-thread queue.
+struct PaneInputActivity {
+    coordinator: Weak<PanePushCoordinator>,
+    pane_id: PaneId,
+}
+
+impl PaneInputActivity {
+    fn mark(&self) {
+        if let Some(coordinator) = self.coordinator.upgrade() {
+            coordinator.mark_interactive(self.pane_id);
         }
     }
 }
@@ -7582,12 +7779,40 @@ impl SessionHandler {
         self.schedule_tracked_pane_push(pane_id);
     }
 
+    /// Handle that an input task uses to mark `pane_id` interactive once its
+    /// input is committed (ft-4p4uo).
+    fn pane_input_activity(&self, pane_id: PaneId) -> PaneInputActivity {
+        PaneInputActivity {
+            coordinator: self
+                .push_coordinator
+                .as_ref()
+                .map_or_else(Weak::new, Arc::downgrade),
+            pane_id,
+        }
+    }
+
+    /// Like [`Self::schedule_tracked_pane_push`] for a retained exact-event
+    /// alert: the push bypasses output pacing, because the alert holds a
+    /// slot of a bounded backlog whose overflow is terminal for the session.
+    pub(crate) fn schedule_tracked_pane_alert_push(&self, pane_id: PaneId) {
+        if !self.per_pane.contains_key(&pane_id) {
+            return;
+        }
+        if let Some(coordinator) = &self.push_coordinator {
+            coordinator.expedite(pane_id);
+        }
+        self.schedule_tracked_pane_push(pane_id);
+    }
+
     /// Push cached pane changes only for panes this session already tracks.
     ///
     /// Mux notifications can arrive after `PaneRemoved`; those notifications
     /// must not recreate `per_pane` state for a pane that will never emit a
     /// later removal notification. Client request paths still use
     /// `schedule_pane_push`, which intentionally creates first-use state.
+    ///
+    /// The session's coordinator paces these output-driven pushes per pane
+    /// unless the pane received input recently (ft-4p4uo).
     pub(crate) fn schedule_tracked_pane_push(&self, pane_id: PaneId) {
         if let Some(tracked) = self.per_pane.get(&pane_id) {
             let Some(_) = tracked.registration.as_ref() else {
@@ -7615,6 +7840,7 @@ impl SessionHandler {
                                 tracked: tracked.clone(),
                                 ready_at: Instant::now(),
                                 retry_delay: std::time::Duration::from_millis(1),
+                                expedited: false,
                             },
                         );
                     } else {
@@ -8227,6 +8453,7 @@ impl SessionHandler {
                 let sender = self.to_write_tx.clone();
                 let registration = pane_authority.registration();
                 let per_pane = self.per_pane_for_registration(&registration);
+                let input_activity = self.pane_input_activity(pane_id);
                 let estimated_bytes = main_thread_rpc_estimated_bytes(data.len());
                 schedule_main_thread_rpc(
                     MainThreadServiceClass::Input,
@@ -8236,6 +8463,7 @@ impl SessionHandler {
                             move || {
                                 pane_authority.try_with_pane(|pane| {
                                     pane.write_all(&data)?;
+                                    input_activity.mark();
                                     push_pane_changes_after_committed_input(
                                         pane, sender, per_pane, "write",
                                     );
@@ -8316,6 +8544,7 @@ impl SessionHandler {
                 let sender = self.to_write_tx.clone();
                 let registration = pane_authority.registration();
                 let per_pane = self.per_pane_for_registration(&registration);
+                let input_activity = self.pane_input_activity(pane_id);
                 let estimated_bytes = main_thread_rpc_estimated_bytes(data.len());
                 if let Some(trace_authority) = admitted_input_trace {
                     let (request_authority, pane_operation) = pane_authority.into_parts();
@@ -8371,6 +8600,7 @@ impl SessionHandler {
                                     dispatch_started_at,
                                 );
                             }
+                            input_activity.mark();
                             let _ = registration.try_with_current(|pane| {
                                 push_input_dispatch_changes_after_committed_input(
                                     &pane,
@@ -8396,6 +8626,7 @@ impl SessionHandler {
                             move || {
                                 pane_authority.try_with_pane(|pane| {
                                     pane.send_paste(&data)?;
+                                    input_activity.mark();
                                     push_input_dispatch_changes_after_committed_input(
                                         pane,
                                         sender,
@@ -8673,6 +8904,7 @@ impl SessionHandler {
                 };
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane_for_registration(&registration);
+                let input_activity = self.pane_input_activity(pane_id);
                 #[cfg(test)]
                 let force_begin_side_effect_failure =
                     self.reliable_input_test_fault == ReliableInputTestFault::BeginSideEffectFalse;
@@ -8781,6 +9013,7 @@ impl SessionHandler {
                         outcome,
                     )));
                     if applied {
+                        input_activity.mark();
                         let _ = registration.try_with_current(|pane| {
                             push_input_dispatch_changes_after_committed_input(
                                 &pane,
@@ -8890,6 +9123,7 @@ impl SessionHandler {
                 };
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane_for_registration(&registration);
+                let input_activity = self.pane_input_activity(request.pane_id);
                 #[cfg(test)]
                 let force_begin_side_effect_failure =
                     self.reliable_input_test_fault == ReliableInputTestFault::BeginSideEffectFalse;
@@ -9034,6 +9268,7 @@ impl SessionHandler {
                         && matches!(&outcome, ReliableKeyEventOutcomeV1::Applied);
                     send_response(Ok(reliable_key_response(&request, outcome)));
                     if push_committed_key_down {
+                        input_activity.mark();
                         let _ = registration.try_with_current(|pane| {
                             push_input_dispatch_changes_after_committed_input(
                                 &pane,
@@ -9073,6 +9308,7 @@ impl SessionHandler {
                 let sender = self.to_write_tx.clone();
                 let registration = pane_authority.registration();
                 let per_pane = self.per_pane_for_registration(&registration);
+                let input_activity = self.pane_input_activity(pane_id);
                 debug_assert!(
                     admitted_input_trace.is_none(),
                     "retired PDU95 must never attach trace authority to legacy input"
@@ -9092,6 +9328,7 @@ impl SessionHandler {
                         move || {
                             pane_authority.try_with_pane(|pane| {
                                 pane.key_down(event.key, event.modifiers)?;
+                                input_activity.mark();
                                 push_input_dispatch_changes_after_committed_input(
                                     pane,
                                     sender,
@@ -25064,7 +25301,8 @@ mod tests {
     #[test]
     fn detached_render_push_redirtied_during_capture_yields_to_input() {
         let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
-        let executor = SimpleExecutor::new();
+        // The re-dirtied push waits out a pacing window, which needs a timer.
+        let executor = SimpleExecutor::with_io_runtime().unwrap();
         let mux = Arc::new(Mux::new(None));
         let _mux_guard = ScopedMux::install(&mux);
         let handler_slot: Arc<Mutex<Option<SessionHandler>>> = Arc::new(Mutex::new(None));
@@ -25127,7 +25365,13 @@ mod tests {
         }
         assert_eq!(input.key_down_count(), 1);
         assert_eq!(callbacks.load(Ordering::Relaxed), first_capture_callbacks);
-        drain_simple_executor(&executor);
+        // The render pane received no input, so its re-dirtied push runs once
+        // its pacing window closes (ft-4p4uo), then completes.
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while state.load(Ordering::Acquire) != PANE_PUSH_IDLE && Instant::now() < deadline {
+            drain_simple_executor(&executor);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         assert_eq!(state.load(Ordering::Acquire), PANE_PUSH_IDLE);
         assert!(callbacks.load(Ordering::Relaxed) > first_capture_callbacks);
         assert!(captured.lock().unwrap().iter().any(|decoded| {
@@ -25343,6 +25587,384 @@ mod tests {
                 Pdu::GetPaneRenderChangesResponse(response)
                     if response.pane_id == render.pane_id())));
         }
+    }
+
+    fn pacing_ms(millis: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(millis)
+    }
+
+    /// A pending push for the pure queue tests; the queue never touches the
+    /// pane, so no registration is needed.
+    fn pacing_test_push(ready_at: Instant) -> PendingPanePush {
+        PendingPanePush {
+            tracked: TrackedPane {
+                registration: None,
+                state: Arc::new(Mutex::new(PerPane::default())),
+                push_state: Arc::new(AtomicUsize::new(PANE_PUSH_SCHEDULED)),
+                live: Arc::new(AtomicBool::new(true)),
+            },
+            ready_at,
+            retry_delay: pacing_ms(1),
+            expedited: false,
+        }
+    }
+
+    #[test]
+    fn render_push_pacing_attempts_noisy_pane_at_most_once_per_interval() {
+        let start = Instant::now();
+        let mut queue = PanePushQueue::default();
+        let mut attempts = Vec::new();
+        // The pane's output re-dirties it every millisecond for 100 ms.
+        for tick in 0..100 {
+            let now = start + pacing_ms(tick);
+            queue.admit(7, pacing_test_push(now));
+            let (next, delay) = queue.take_next(now);
+            if tick == 1 {
+                assert_eq!(delay, Some(pacing_ms(15)), "sleep until the window closes");
+            }
+            if let Some((pane_id, _)) = next {
+                assert_eq!(pane_id, 7);
+                attempts.push(now - start);
+            }
+        }
+        assert_eq!(
+            attempts,
+            [0, 16, 32, 48, 64, 80, 96].map(pacing_ms).to_vec(),
+            "one attempt per pacing window, not one per output burst"
+        );
+    }
+
+    #[test]
+    fn render_push_pacing_keeps_trailing_push_when_output_stops_inside_window() {
+        let start = Instant::now();
+        let mut queue = PanePushQueue::default();
+        queue.admit(7, pacing_test_push(start));
+        assert!(queue.take_next(start).0.is_some());
+        // The last output arrives 5 ms into the window; then the pane is quiet.
+        let last_output = start + pacing_ms(5);
+        queue.admit(7, pacing_test_push(last_output));
+        let (next, delay) = queue.take_next(last_output);
+        assert!(next.is_none());
+        assert_eq!(
+            delay,
+            Some(pacing_ms(11)),
+            "the coordinator must wake at window end"
+        );
+        assert!(
+            queue.pending.contains_key(&7),
+            "coalesced output is retained"
+        );
+        // No further output: the retained push still runs when the window closes.
+        let (next, delay) = queue.take_next(start + PANE_PUSH_MIN_INTERVAL);
+        assert_eq!(next.map(|(pane_id, _)| pane_id), Some(7));
+        assert_eq!(delay, None);
+        assert!(queue.pending.is_empty() && queue.order.is_empty());
+    }
+
+    #[test]
+    fn render_push_pacing_runs_input_pane_first_and_unpaced() {
+        let start = Instant::now();
+        let mut queue = PanePushQueue::default();
+        // Noisy panes 1-3 and input pane 9 were each pushed at `start`.
+        for pane_id in [1, 2, 3, 9] {
+            queue.admit(pane_id, pacing_test_push(start));
+        }
+        for _ in 0..4 {
+            assert!(queue.take_next(start).0.is_some());
+        }
+        // Output re-dirties panes 1-3 and a never-pushed pane 4, all queued
+        // ahead of pane 9. A key for pane 9 commits at +2 ms and its echo
+        // arrives at +3 ms, still inside pane 9's own pacing window.
+        let output = start + pacing_ms(2);
+        for pane_id in [1, 2, 3, 4] {
+            queue.admit(pane_id, pacing_test_push(output));
+        }
+        assert!(
+            !queue.mark_interactive(9, output),
+            "pane 9 had nothing queued"
+        );
+        let echo = start + pacing_ms(3);
+        queue.admit(9, pacing_test_push(echo));
+        assert_eq!(queue.take_next(echo).0.map(|(id, _)| id), Some(9));
+        assert_eq!(queue.take_next(echo).0.map(|(id, _)| id), Some(4));
+        let (next, delay) = queue.take_next(echo);
+        assert!(next.is_none(), "panes 1-3 are still inside their windows");
+        assert_eq!(delay, Some(pacing_ms(13)));
+        // The interactive pane keeps skipping pacing for the whole window.
+        let more_echo = start + pacing_ms(4);
+        queue.admit(9, pacing_test_push(more_echo));
+        assert_eq!(queue.take_next(more_echo).0.map(|(id, _)| id), Some(9));
+        // The paced panes then run in their original order.
+        let window_end = start + PANE_PUSH_MIN_INTERVAL;
+        let mut order = Vec::new();
+        while let (Some((pane_id, _)), _) = queue.take_next(window_end) {
+            order.push(pane_id);
+        }
+        assert_eq!(order, [1, 2, 3]);
+        // After the input window expires, pane 9 is paced like any other.
+        let expired = output + PANE_PUSH_INTERACTIVE_WINDOW;
+        queue.admit(9, pacing_test_push(expired));
+        assert!(queue.take_next(expired).0.is_some());
+        let next_output = expired + pacing_ms(1);
+        queue.admit(9, pacing_test_push(next_output));
+        assert!(queue.take_next(next_output).0.is_none());
+    }
+
+    #[test]
+    fn render_push_pacing_typed_into_flooding_pane_cannot_starve_siblings() {
+        let start = Instant::now();
+        let mut queue = PanePushQueue::default();
+        let mut pushes: HashMap<PaneId, Vec<std::time::Duration>> = HashMap::new();
+        // Pane 9 floods output while it is being typed into; panes 5 and 6
+        // flood output without input. One coordinator turn per millisecond.
+        for tick in 0..160 {
+            let now = start + pacing_ms(tick);
+            queue.mark_interactive(9, now);
+            for pane_id in [5, 6, 9] {
+                queue.admit(pane_id, pacing_test_push(now));
+            }
+            if let Some((pane_id, _)) = queue.take_next(now).0 {
+                pushes.entry(pane_id).or_default().push(now - start);
+            }
+        }
+        for pane_id in [5, 6] {
+            let times = &pushes[&pane_id];
+            assert!(times.len() >= 9, "pane {pane_id} starved: {times:?}");
+            assert!(
+                times.windows(2).all(|pair| pair[1]
+                    .checked_sub(pair[0])
+                    .is_some_and(|gap| gap <= pacing_ms(18))),
+                "pane {pane_id} fell behind its pacing rate: {times:?}"
+            );
+        }
+        let typed = &pushes[&9];
+        assert!(
+            typed.windows(2).all(|pair| pair[1]
+                .checked_sub(pair[0])
+                .is_some_and(|gap| gap <= pacing_ms(2))),
+            "the typed-into pane waits for at most one other push: {typed:?}"
+        );
+    }
+
+    #[test]
+    fn render_push_pacing_expedited_alert_skips_window_and_survives_retry() {
+        let start = Instant::now();
+        let mut queue = PanePushQueue::default();
+        queue.admit(7, pacing_test_push(start));
+        assert!(queue.take_next(start).0.is_some());
+        // An exact-event alert is retained 2 ms into the pane's window.
+        let alert = start + pacing_ms(2);
+        queue.admit(7, pacing_test_push(alert));
+        assert!(queue.expedite(7), "the pending push becomes eligible now");
+        let (pane_id, mut retry) = queue.take_next(alert).0.expect("expedited push is unpaced");
+        assert!(retry.expedited);
+        // Capture contention: the retry keeps its short backoff floor.
+        retry.ready_at = alert + pacing_ms(1);
+        queue.admit(pane_id, retry);
+        assert_eq!(queue.take_next(alert).1, Some(pacing_ms(1)));
+        assert_eq!(
+            queue.take_next(alert + pacing_ms(1)).0.map(|(id, _)| id),
+            Some(7)
+        );
+        // Plain output after the delivered alert is paced again.
+        let output = alert + pacing_ms(2);
+        queue.admit(7, pacing_test_push(output));
+        assert!(queue.take_next(output).0.is_none());
+    }
+
+    #[test]
+    fn render_push_pacing_state_is_forgotten_once_spent() {
+        let start = Instant::now();
+        let mut queue = PanePushQueue::default();
+        queue.admit(7, pacing_test_push(start));
+        queue.mark_interactive(8, start);
+        assert!(queue.take_next(start).0.is_some());
+        let (next, delay) = queue.take_next(start);
+        assert!(next.is_none() && delay.is_none(), "nothing pending");
+        assert_eq!(queue.pacing.len(), 2, "recent pacing state still decides");
+        let later = start + PANE_PUSH_INTERACTIVE_WINDOW;
+        assert!(queue.take_next(later).0.is_none());
+        assert!(
+            queue.pacing.is_empty(),
+            "spent pacing state must not accumulate per tracked pane"
+        );
+    }
+
+    #[test]
+    fn paced_render_push_delivers_ordered_frames_and_final_state() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = SimpleExecutor::with_io_runtime().unwrap();
+        let mux = Arc::new(Mux::new(None));
+        let pane = Arc::new(FakePane::new_with_id(8_931, None));
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_dyn).unwrap();
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, mux).unwrap();
+        handler.schedule_pane_push(pane.pane_id());
+        drain_simple_executor(&executor);
+        let state = Arc::clone(&handler.per_pane[&pane.pane_id()].push_state);
+        // Continuous output for 120 ms: a new screen roughly every millisecond.
+        let first_output_seqno: SequenceNo = 1_000;
+        let mut seqno = first_output_seqno;
+        let started = Instant::now();
+        while started.elapsed() < pacing_ms(120) {
+            seqno += 1;
+            {
+                let mut screen = pane.state.lock().unwrap();
+                screen.seqno = seqno;
+                screen.title = format!("output-{seqno}");
+            }
+            handler.schedule_tracked_pane_push(pane.pane_id());
+            drain_simple_executor(&executor);
+            std::thread::sleep(pacing_ms(1));
+        }
+        // Output stops; nothing else schedules the pane.
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while state.load(Ordering::Acquire) != PANE_PUSH_IDLE && Instant::now() < deadline {
+            drain_simple_executor(&executor);
+            std::thread::sleep(pacing_ms(1));
+        }
+        assert_eq!(state.load(Ordering::Acquire), PANE_PUSH_IDLE);
+        let elapsed = started.elapsed();
+        let delivered: Vec<SequenceNo> = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|decoded| match &decoded.pdu {
+                Pdu::GetPaneRenderChangesResponse(response)
+                    if response.pane_id == pane.pane_id()
+                        && response.seqno > first_output_seqno =>
+                {
+                    Some(response.seqno)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            delivered.windows(2).all(|pair| pair[0] < pair[1]),
+            "frames must stay in order: {delivered:?}"
+        );
+        assert_eq!(
+            delivered.last(),
+            Some(&seqno),
+            "the final screen must be delivered after output stops"
+        );
+        let window_bound = elapsed.as_millis() / PANE_PUSH_MIN_INTERVAL.as_millis() + 1;
+        assert!(
+            u128::try_from(delivered.len()).unwrap() <= window_bound,
+            "{} pushes in {elapsed:?} exceeds one per pacing window",
+            delivered.len()
+        );
+        drop(handler);
+        drain_simple_executor(&executor);
+    }
+
+    #[test]
+    fn committed_key_down_echo_push_overtakes_queued_noisy_panes() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = SimpleExecutor::with_io_runtime().unwrap();
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let noisy: Vec<Arc<FakePane>> = (8_941..8_944)
+            .map(|pane_id| Arc::new(FakePane::new_with_id(pane_id, None)))
+            .collect();
+        let input = Arc::new(FakePane::new_with_id(8_949, None));
+        let panes: Vec<Arc<FakePane>> = noisy
+            .iter()
+            .cloned()
+            .chain(std::iter::once(Arc::clone(&input)))
+            .collect();
+        for pane in &panes {
+            let pane_dyn: Arc<dyn Pane> = pane.clone();
+            mux.add_pane(&pane_dyn).unwrap();
+        }
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux)).unwrap();
+        for pane in &panes {
+            handler.schedule_pane_push(pane.pane_id());
+        }
+        drain_simple_executor(&executor);
+        handler.process_one(DecodedPdu {
+            serial: 9_841,
+            pdu: Pdu::SendKeyDown(SendKeyDown {
+                pane_id: input.pane_id(),
+                event: termwiz::input::KeyEvent {
+                    key: KeyCode::Char('x'),
+                    modifiers: KeyModifiers::NONE,
+                },
+                input_serial: InputSerial::empty(),
+            }),
+        });
+        drain_simple_executor(&executor);
+        assert_eq!(input.key_down_count(), 1);
+        {
+            let now = Instant::now();
+            let queue = handler
+                .push_coordinator
+                .as_ref()
+                .unwrap()
+                .queue
+                .lock()
+                .unwrap();
+            assert!(
+                queue.pacing[&input.pane_id()].is_interactive(now),
+                "committed key input marks its pane interactive"
+            );
+            assert!(
+                noisy.iter().all(|pane| !queue
+                    .pacing
+                    .get(&pane.pane_id())
+                    .is_some_and(|pacing| pacing.is_interactive(now))),
+                "panes without input stay paced"
+            );
+        }
+        let before = captured.lock().unwrap().len();
+        // Noisy output queues first; the echo of the key arrives last.
+        for (seqno, pane) in (200..).zip(&noisy) {
+            let mut screen = pane.state.lock().unwrap();
+            screen.seqno = seqno;
+            screen.title = format!("noise-{seqno}");
+            drop(screen);
+            handler.schedule_tracked_pane_push(pane.pane_id());
+        }
+        {
+            let mut screen = input.state.lock().unwrap();
+            screen.seqno = 300;
+            screen.title = "echo".to_string();
+        }
+        handler.schedule_tracked_pane_push(input.pane_id());
+        let delivered = || -> Vec<PaneId> {
+            captured.lock().unwrap()[before..]
+                .iter()
+                .filter_map(|decoded| match &decoded.pdu {
+                    Pdu::GetPaneRenderChangesResponse(response) if response.seqno >= 200 => {
+                        Some(response.pane_id)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while delivered().len() < panes.len() && Instant::now() < deadline {
+            drain_simple_executor(&executor);
+            std::thread::sleep(pacing_ms(1));
+        }
+        let delivered = delivered();
+        assert_eq!(
+            delivered.first(),
+            Some(&input.pane_id()),
+            "the echo must not wait behind queued noisy panes: {delivered:?}"
+        );
+        let mut delivered_sorted = delivered.clone();
+        delivered_sorted.sort_unstable();
+        let mut expected: Vec<PaneId> = panes.iter().map(|pane| pane.pane_id()).collect();
+        expected.sort_unstable();
+        assert_eq!(
+            delivered_sorted, expected,
+            "every pane's final output is delivered"
+        );
+        drop(handler);
+        drain_simple_executor(&executor);
     }
 
     #[test]

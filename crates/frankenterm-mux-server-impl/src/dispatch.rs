@@ -3,7 +3,7 @@
 use crate::sessionhandler::{
     AdmittedInputTraceV1, DispatchTraceAuthority, PduDeliveryClass, PduSender, PerPane,
     SessionAuthority, SessionHandler, SessionOwner, SessionTraceProducer,
-    frozen_window_order_to_codec, retire_poisoned_pane_render,
+    frozen_window_order_to_codec, pane_alert_is_exact_event, retire_poisoned_pane_render,
     validate_ordered_snapshot_projection,
 };
 use anyhow::Context;
@@ -7333,8 +7333,16 @@ where
                             // was already removed, re-inserting a fresh PerPane here
                             // would leak because no later PaneRemoved can retire it.
                             if let Some(per_pane) = handler.per_pane_if_present(pane_id) {
+                                // Exact events occupy a bounded backlog until
+                                // pushed, so they must not wait out output
+                                // pacing (ft-4p4uo); state alerts coalesce.
+                                let exact_event = pane_alert_is_exact_event(&alert);
                                 retain_pane_alert_or_trip(&per_pane, &terminal, pane_id, alert)?;
-                                handler.schedule_tracked_pane_push(pane_id);
+                                if exact_event {
+                                    handler.schedule_tracked_pane_alert_push(pane_id);
+                                } else {
+                                    handler.schedule_tracked_pane_push(pane_id);
+                                }
                             }
                         }
                         MuxNotification::SaveToDownloads { .. } => {}
