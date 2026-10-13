@@ -1240,7 +1240,8 @@ pub struct Config {
     /// `max_fps`, and a value above `max_fps` is capped at it. Honored on
     /// macOS. Unfocused windows keep updating, just less often. Translucent
     /// windows stacked on one another all count as visible to the OS, so
-    /// without this each one repaints at `max_fps` while its agents animate.
+    /// without this each one repaints at `max_fps` while the pane it shows
+    /// animates, even when no one can see it.
     #[dynamic(default, validate = "validate_unfocused_max_fps")]
     pub unfocused_max_fps: Option<u64>,
 

@@ -161,7 +161,7 @@ Current default key set from `crates/frankenterm-gui/frankenterm.toml`:
 | `resize_wrap_kp_*` (optional) | unset | advanced KP tuning knobs |
 | `[[ssh_domains]]` (optional) | auto-discovered from `~/.ssh/config` | explicit named SSH targets |
 | `max_fps` | `60` | lower on constrained GPUs |
-| `unfocused_max_fps` | unset (`max_fps`) | macOS: repaint limit for windows without keyboard focus, capped at `max_fps`. With many windows of animated agent output, `10` saves most of their repaint work; stacked translucent windows count as visible to macOS, so nothing else throttles them |
+| `unfocused_max_fps` | unset (`max_fps`) | macOS: repaint limit for windows without keyboard focus, capped at `max_fps`. With many windows showing animated agent output, `10` saves most of their repaint work; stacked translucent windows count as visible to macOS, so nothing else throttles them |
 | `front_end` | `"WebGpu"` | rendering backend; without a config file the built-in default is `"OpenGL"`. Values: `"WebGpu"`, `"OpenGL"`, `"Software"`, `"Metal"` (see below) |
 | `check_for_updates` | `false` | disable update checks by default |
 | `automatically_reload_config` | `true` | hot-reload config changes |
