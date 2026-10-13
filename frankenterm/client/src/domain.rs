@@ -259,8 +259,9 @@ fn layout_session(
 /// Focus changes this client advised (SetFocusedPane) whose `PaneFocused`
 /// echo has not arrived yet, oldest first.
 ///
-/// Legacy (codec-46) servers broadcast every focus change to all clients,
-/// including the one that made it. Applying our own late echoes as remote
+/// Servers broadcast every focus change to all clients, including the one that
+/// made it; current servers do too, not only legacy (codec-46) ones, so this
+/// applies to every attachment. Applying our own late echoes as remote
 /// commands made two quick local focus changes (attach focusing the server's
 /// active tab, then layout restore selecting the saved one) chase each other:
 /// each stale echo moved local focus back and was advised again, and whichever
