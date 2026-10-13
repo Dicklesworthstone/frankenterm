@@ -586,6 +586,7 @@ impl Window {
                 window: None,
                 screen_changed: false,
                 paint_throttled: false,
+                focused: false,
                 repaint_slot: None,
                 invalidated: true,
                 gl_context_pair: None,
@@ -1713,6 +1714,9 @@ struct Inner {
     window: Option<WeakPtr>,
     screen_changed: bool,
     paint_throttled: bool,
+    /// Whether this is the key window; paces repaints by
+    /// `Config::max_fps_for_focus`.
+    focused: bool,
     /// The latest paint's throttle slot (`crate::repaint_slot`, ft-1w85m).
     repaint_slot: Option<Instant>,
     window_id: usize,
@@ -2427,20 +2431,20 @@ impl WindowView {
 
     extern "C" fn did_become_key(this: &mut Object, _sel: Sel, _id: id) {
         if let Some(this) = Self::get_this(this) {
-            this.inner
-                .borrow_mut()
-                .events
-                .dispatch(WindowEvent::FocusChanged(true));
+            let mut inner = this.inner.borrow_mut();
+            inner.focused = true;
+            inner.events.dispatch(WindowEvent::FocusChanged(true));
+            drop(inner);
             this.update_application_presentation(true);
         }
     }
 
     extern "C" fn did_resign_key(this: &mut Object, _sel: Sel, _id: id) {
         if let Some(this) = Self::get_this(this) {
-            this.inner
-                .borrow_mut()
-                .events
-                .dispatch(WindowEvent::FocusChanged(false));
+            let mut inner = this.inner.borrow_mut();
+            inner.focused = false;
+            inner.events.dispatch(WindowEvent::FocusChanged(false));
+            drop(inner);
             this.update_application_presentation(true);
         }
     }
@@ -3335,7 +3339,9 @@ impl WindowView {
                 inner.paint_throttled = true;
 
                 let window_id = inner.window_id;
-                let interval = config::frame_interval_for_max_fps(inner.config.max_fps);
+                let interval = config::frame_interval_for_max_fps(
+                    inner.config.max_fps_for_focus(inner.focused),
+                );
                 let slot = crate::repaint_slot(inner.repaint_slot, paint_started, interval);
                 inner.repaint_slot = Some(slot);
                 let connection = Connection::get().map(|connection| Rc::downgrade(&connection));

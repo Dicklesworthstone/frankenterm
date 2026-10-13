@@ -1236,6 +1236,14 @@ pub struct Config {
     #[dynamic(default = "default_max_fps", validate = "validate_max_fps")]
     pub max_fps: u64,
 
+    /// Repaint-rate limit for a window without keyboard focus; unset uses
+    /// `max_fps`, and a value above `max_fps` is capped at it. Honored on
+    /// macOS. Unfocused windows keep updating, just less often. Translucent
+    /// windows stacked on one another all count as visible to the OS, so
+    /// without this each one repaints at `max_fps` while its agents animate.
+    #[dynamic(default, validate = "validate_unfocused_max_fps")]
+    pub unfocused_max_fps: Option<u64>,
+
     #[dynamic(default = "default_shape_cache_size")]
     pub shape_cache_size: usize,
     #[dynamic(default = "default_line_state_cache_size")]
@@ -1339,6 +1347,14 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The repaint-rate limit for a window, by whether it has keyboard focus.
+    pub fn max_fps_for_focus(&self, focused: bool) -> u64 {
+        match self.unfocused_max_fps {
+            Some(unfocused) if !focused => unfocused.min(self.max_fps),
+            _ => self.max_fps,
+        }
+    }
+
     pub fn load() -> LoadedConfig {
         Self::load_with_overrides(&frankenterm_dynamic::Value::default())
     }
@@ -2712,6 +2728,15 @@ fn validate_max_fps(value: &u64) -> Result<(), String> {
     }
 }
 
+fn validate_unfocused_max_fps(value: &Option<u64>) -> Result<(), String> {
+    match value {
+        Some(fps) if !(MIN_MAX_FPS..=MAX_MAX_FPS).contains(fps) => Err(format!(
+            "unfocused_max_fps must be in {MIN_MAX_FPS}..={MAX_MAX_FPS}, got {fps}"
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Convert a configured repaint-rate limit into a nonzero repaint interval.
 ///
 /// Dynamic configuration rejects values outside [`MIN_MAX_FPS`] through
@@ -3806,6 +3831,27 @@ mod tests {
     }
 
     #[test]
+    fn unfocused_windows_repaint_at_their_own_cap() {
+        let mut config = Config::default_config();
+        config.max_fps = 30;
+        assert_eq!(config.unfocused_max_fps, None, "off by default");
+        assert_eq!(config.max_fps_for_focus(false), 30);
+        assert_eq!(config.max_fps_for_focus(true), 30);
+
+        config.unfocused_max_fps = Some(10);
+        assert_eq!(config.max_fps_for_focus(false), 10);
+        assert_eq!(config.max_fps_for_focus(true), 30);
+
+        config.unfocused_max_fps = Some(120);
+        assert_eq!(config.max_fps_for_focus(false), 30, "never above max_fps");
+
+        assert!(validate_unfocused_max_fps(&None).is_ok());
+        assert!(validate_unfocused_max_fps(&Some(MIN_MAX_FPS)).is_ok());
+        assert!(validate_unfocused_max_fps(&Some(0)).is_err());
+        assert!(validate_unfocused_max_fps(&Some(MAX_MAX_FPS + 1)).is_err());
+    }
+
+    #[test]
     fn frame_interval_is_nonzero_for_valid_and_defensive_inputs() {
         assert_eq!(frame_interval_for_max_fps(0), Duration::from_secs(1));
         assert_eq!(
@@ -4253,6 +4299,24 @@ mod tests {
         assert!(message.contains("max_fps"), "unexpected error: {}", message);
         assert!(
             message.contains("1..=1000"),
+            "unexpected error: {}",
+            message
+        );
+        assert!(message.contains("got 0"), "unexpected error: {}", message);
+    }
+
+    #[test]
+    fn config_from_dynamic_reads_and_validates_unfocused_max_fps() {
+        let load = |fps: u64| {
+            let mut obj = std::collections::BTreeMap::new();
+            obj.insert(Value::String("unfocused_max_fps".into()), Value::U64(fps));
+            Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+        };
+        let config = load(10).expect("a valid unfocused_max_fps loads");
+        assert_eq!(config.unfocused_max_fps, Some(10));
+        let message = load(0).expect_err("zero must be rejected").to_string();
+        assert!(
+            message.contains("unfocused_max_fps"),
             "unexpected error: {}",
             message
         );

@@ -3977,6 +3977,12 @@ const MAX_STALE_SURFACE_RETRIES: u32 = 3;
 const MAX_PAINT_RETRIES: u32 = 2;
 const MAX_BACKEND_RETRIES: u32 = 3;
 const OCCLUDED_REPAINT_PROBE_DELAY: Duration = Duration::from_millis(250);
+/// How long `schedule_update_title` gathers title, cwd and progress alerts
+/// before one `update_title`. A changed tab bar repaints the whole window, and
+/// agents in background tabs animate their titles (spinners) constantly, so at
+/// one 60 Hz frame (16 ms) a window of idle visible content still repainted at
+/// its `max_fps`. 100 ms keeps a 10 Hz spinner animated in the tab bar.
+const TITLE_UPDATE_COALESCE: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderWakeTicket(u64);
@@ -6121,7 +6127,7 @@ impl TermWindow {
                     } => {
                         // Coalesce: agents emitting OSC 7 / OSC 9;4 across multiple
                         // attached muxes can fire dozens of these per second.
-                        // Schedule one frame-bounded update_title instead. ft-9d60d.
+                        // Schedule one coalesced update_title instead. ft-9d60d.
                         self.schedule_update_title();
                     }
                     MuxNotification::Alert {
@@ -8283,7 +8289,8 @@ impl TermWindow {
         }
     }
 
-    /// Schedule a coalesced `update_title()` at most once per ~16 ms frame.
+    /// Schedule a coalesced `update_title()` at most once per
+    /// [`TITLE_UPDATE_COALESCE`].
     ///
     /// Multiple mux subscribers (one per attached domain) re-emit Alerts like
     /// `Progress`, `CurrentWorkingDirectoryChanged`, and `OutputSinceFocusLost`
@@ -8291,8 +8298,8 @@ impl TermWindow {
     /// directly per Alert produces O(N_tabs × N_panes × Lua_roundtrip)
     /// allocation churn per call, dozens of times per second — the dominant
     /// driver of the wezterm-gui RSS leak observed in production. Coalescing
-    /// to one frame caps the call rate at ~60/sec independent of fanout.
-    /// See ft-9d60d.
+    /// caps the call rate (10/sec) independent of fanout, and with it the
+    /// whole-window repaints that tab-bar title changes cause. See ft-9d60d.
     fn schedule_update_title(&mut self) {
         if self.pending_update_title {
             metrics::histogram!("update_title.coalesced").record(1.);
@@ -8310,8 +8317,7 @@ impl TermWindow {
                 promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
                     reservation
                         .spawn_local(async move {
-                            // ~one frame at 60 Hz. Imperceptible delay for OSC-driven UI.
-                            sleep(Duration::from_millis(16)).await;
+                            sleep(TITLE_UPDATE_COALESCE).await;
                             window.notify(TermWindowNotif::Apply(Box::new(|tw| {
                                 tw.pending_update_title = false;
                                 tw.update_title();
