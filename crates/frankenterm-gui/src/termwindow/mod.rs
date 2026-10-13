@@ -2246,6 +2246,9 @@ pub struct TermWindow {
     /// When true, an `Apply` notification is already in flight that will run
     /// `update_title` on the next frame and clear this flag. See ft-9d60d.
     pending_update_title: bool,
+    /// Whether the coalesced refresh in flight also runs the status event
+    /// (`update_title`) rather than only the tab bar (`update_title_impl`).
+    pending_update_title_status: bool,
     pending_scale_changes: LinkedList<resize::ScaleChange>,
     /// Terminal dimensions
     terminal_size: TerminalSize,
@@ -4706,6 +4709,7 @@ impl TermWindow {
             resizes_pending: 0,
             is_repaint_pending: false,
             pending_update_title: false,
+            pending_update_title_status: false,
             pending_scale_changes: LinkedList::new(),
             terminal_size,
             render_state,
@@ -6026,14 +6030,17 @@ impl TermWindow {
                     actions.request_repaint();
                 }
                 if let Some(title_refresh) = title_refresh {
-                    // Release the single-flight bit before reading live state;
-                    // output during this refresh can retain a successor ticket.
+                    // Release the single-flight bit; the coalesced refresh
+                    // reads live state when it runs, so alerts arriving
+                    // meanwhile are covered by it.
                     title_refresh.begin_refresh();
-                    self.update_title_impl(Some(&actions));
-                    // A title/progress-only refresh can change the tab bar
-                    // without any pane output. Retain its native repaint under
-                    // this admission before the visibility check returns.
-                    actions.request_repaint();
+                    // A changed tab bar repaints the whole window, and agents
+                    // animate their titles in background tabs all the time.
+                    // Refreshing here on every alert (with an unconditional
+                    // repaint) held such windows at max_fps; the coalesced
+                    // refresh repaints only when the tab bar changed, at most
+                    // once per TITLE_UPDATE_COALESCE.
+                    self.schedule_title_refresh(false);
                 }
                 if interest.iter().any(|word| *word != 0) {
                     self.record_idle_event(idle_detector::IdleEvent::PtyData);
@@ -8301,6 +8308,14 @@ impl TermWindow {
     /// caps the call rate (10/sec) independent of fanout, and with it the
     /// whole-window repaints that tab-bar title changes cause. See ft-9d60d.
     fn schedule_update_title(&mut self) {
+        self.schedule_title_refresh(true);
+    }
+
+    /// The coalescing behind [`Self::schedule_update_title`]. `with_status`
+    /// also runs the status event; a tab-bar-only refresh (title alerts) does
+    /// not, so animated agent titles do not drive the Lua status handler.
+    fn schedule_title_refresh(&mut self, with_status: bool) {
+        self.pending_update_title_status |= with_status;
         if self.pending_update_title {
             metrics::histogram!("update_title.coalesced").record(1.);
             return;
@@ -8320,7 +8335,11 @@ impl TermWindow {
                             sleep(TITLE_UPDATE_COALESCE).await;
                             window.notify(TermWindowNotif::Apply(Box::new(|tw| {
                                 tw.pending_update_title = false;
-                                tw.update_title();
+                                if std::mem::take(&mut tw.pending_update_title_status) {
+                                    tw.update_title();
+                                } else {
+                                    tw.update_title_impl(None);
+                                }
                             })));
                         })
                         .detach();
