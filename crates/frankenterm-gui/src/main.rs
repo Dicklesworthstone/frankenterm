@@ -1068,6 +1068,15 @@ async fn populate_local_recovery_window_after_remote_failure(
     let recovery_domain = mux
         .get_domain_by_name("local")
         .context("local recovery domain is not available after remote attach failure")?;
+    // A failed first attach can retire the still-empty window it was handed
+    // (e.g. the proxy exits during the version handshake). Spawning into that
+    // id then failed and aborted startup (ft-aoiku); recover into a new window.
+    let window_id = if mux.get_window(window_id).is_some() {
+        window_id
+    } else {
+        let builder = mux.new_empty_window(None, None);
+        *builder
+    };
     let config = config::configuration();
     let dpi = config.dpi.unwrap_or_else(::window::default_dpi);
     crate::spawn::attach_domain_to_window_or_spawn_recovery(
