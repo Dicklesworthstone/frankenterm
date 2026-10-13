@@ -48,6 +48,24 @@ pub struct KeyTableState {
     stack: Vec<KeyTableStateEntry>,
 }
 
+/// Set while sending keys to panes fails, so the failure is logged once per
+/// stall instead of once per key.
+static KEY_SEND_FAILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Log when sending a key to a pane starts failing and when it works again.
+/// The error text names the cause; key contents are never logged.
+fn note_key_send_result<T>(pane: &Arc<dyn Pane>, result: &anyhow::Result<T>) {
+    let failing = result.is_err();
+    let was_failing = KEY_SEND_FAILING.swap(failing, std::sync::atomic::Ordering::Relaxed);
+    if let Err(err) = result {
+        if !was_failing {
+            log::warn!("typed input for pane {} was not sent: {err:#}", pane.pane_id());
+        }
+    } else if was_failing {
+        log::warn!("typed input is being sent again, pane {}", pane.pane_id());
+    }
+}
+
 impl KeyTableState {
     pub fn activate(&mut self, args: KeyTableArgs) {
         if args.replace_current {
@@ -444,12 +462,13 @@ impl super::TermWindow {
                             );
                         }
 
-                        did_encode = if is_down {
+                        let res = if is_down {
                             pane.key_down(term_key, tw_raw_modifiers)
                         } else {
                             pane.key_up(term_key, tw_raw_modifiers)
-                        }
-                        .is_ok();
+                        };
+                        note_key_send_result(&pane, &res);
+                        did_encode = res.is_ok();
                     };
 
                     if did_encode {
@@ -762,6 +781,7 @@ impl super::TermWindow {
                     }
                 };
 
+                note_key_send_result(&pane, &res);
                 if res.is_ok() {
                     if window_key.key_is_down
                         && !key.is_modifier()
