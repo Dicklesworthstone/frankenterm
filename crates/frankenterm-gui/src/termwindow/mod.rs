@@ -3994,9 +3994,9 @@ const MAX_BACKEND_RETRIES: u32 = 3;
 const OCCLUDED_REPAINT_PROBE_DELAY: Duration = Duration::from_millis(250);
 /// How long `schedule_update_title` gathers title, cwd and progress alerts
 /// before one `update_title`. A changed tab bar repaints the whole window, and
-/// agents in background tabs animate their titles (spinners) constantly, so at
-/// one 60 Hz frame (16 ms) a window of idle visible content still repainted at
-/// its `max_fps`. 100 ms keeps a 10 Hz spinner animated in the tab bar.
+/// agents in background tabs animate their titles (spinners) constantly; at
+/// one 60 Hz frame (16 ms) those changes alone could hold a window at its
+/// `max_fps`. 100 ms keeps a 10 Hz spinner animated in the tab bar.
 const TITLE_UPDATE_COALESCE: Duration = Duration::from_millis(100);
 /// A coalesced title refresh still pending after this long was dropped on
 /// the way back (the window's `notify` is refused under main-thread
@@ -6065,10 +6065,9 @@ impl TermWindow {
                     title_refresh.begin_refresh();
                     // A changed tab bar repaints the whole window, and agents
                     // animate their titles in background tabs all the time.
-                    // Refreshing here on every alert (with an unconditional
-                    // repaint) held such windows at max_fps; the coalesced
-                    // refresh repaints only when the tab bar changed, at most
-                    // once per TITLE_UPDATE_COALESCE.
+                    // This refreshed at once with an unconditional repaint;
+                    // the coalesced refresh repaints only when the tab bar
+                    // changed, at most once per TITLE_UPDATE_COALESCE.
                     self.schedule_title_refresh(false);
                 }
                 if interest.iter().any(|word| *word != 0) {
