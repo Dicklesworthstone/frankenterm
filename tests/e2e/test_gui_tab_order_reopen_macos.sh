@@ -35,6 +35,9 @@
 #                    XDG_RUNTIME_DIR (systemd-run --user, so it outlives ssh),
 #                    then FT_TO_PROXY="ssh -o BatchMode=yes HOST 'nc -N -U /tmp/X/run/frankenterm/sock'".
 #                    Restart that mux between runs; spawned tabs accumulate.
+#   FT_TO_LUA_ATTACH 1 = the relaunch also attaches the domain from a Lua
+#                    gui-startup timer after opening a local window (the
+#                    author's config does this on top of auto-connect)
 #   FT_TO_KEEP       1 = keep the scratch directory for inspection
 set -uo pipefail
 
@@ -64,6 +67,7 @@ launch_gui() { # home [gui args...]
     open -g -n --env HOME="$home" --env FT_TO_HOME="$home" --env FT_TO_DIR="$E" \
         ${FT_TO_PROXY:+--env "FT_TO_PROXY=$FT_TO_PROXY"} \
         ${FT_TO_SPACED:+--env "FT_TO_SPACED=$FT_TO_SPACED"} \
+        ${FT_TO_LUA_ATTACH:+--env "FT_TO_LUA_ATTACH=$FT_TO_LUA_ATTACH"} \
         --env FRANKENTERM_LUA_CONFIG=1 --stderr "$home/gui.err" \
         -a "$APP" --args --config-file "$E/gui.lua" "$@"
 }

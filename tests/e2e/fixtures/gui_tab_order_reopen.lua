@@ -29,6 +29,25 @@ config.automatically_reload_config = false
 config.status_update_interval = 400
 config.check_for_updates = false
 
+-- FT_TO_LUA_ATTACH=1: start up the way the author's config does: a local
+-- window first, then the remote domain attached from Lua on a timer (on top of
+-- remembered-domain auto-connect).
+if os.getenv('FT_TO_LUA_ATTACH') == '1' then
+  ft.on('gui-startup', function(cmd)
+    if cmd and cmd.args and #cmd.args > 0 then
+      ft.mux.spawn_window(cmd)
+      return
+    end
+    ft.mux.spawn_window {}
+    ft.time.call_after(1.0, function()
+      local domain = ft.mux.get_domain('e2e')
+      if domain and domain:state() ~= 'Attached' then
+        domain:attach()
+      end
+    end)
+  end)
+end
+
 local function read1(p)
   local f = io.open(p, 'r')
   if not f then return nil end
