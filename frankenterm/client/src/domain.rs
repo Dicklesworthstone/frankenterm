@@ -219,6 +219,18 @@ enum ClientTopologySessionError {
     DialectChanged,
 }
 
+/// Whether a failed reattach found a different server session (the remote
+/// mux restarted, or its dialect changed). Such an attachment can never
+/// resume: it is detached, and only a fresh attachment shows the domain again.
+pub(crate) fn reattach_needs_fresh_attachment(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<ClientTopologySessionError>(),
+            Some(ClientTopologySessionError::Changed | ClientTopologySessionError::DialectChanged)
+        )
+    })
+}
+
 #[derive(Default)]
 enum ClientTopologySessionState {
     #[default]
@@ -8343,6 +8355,25 @@ mod tests {
         assert_eq!(inner.remote_to_local_tab_id(51), None);
         apply([0xa3; 16]).expect("valid first session still attaches after invalid input");
         assert_eq!(mux.iter_panes().len(), 1);
+    }
+
+    #[test]
+    fn only_a_different_server_session_needs_a_fresh_attachment() {
+        // As the reconnect loop sees it: the typed error under the snapshot
+        // application context.
+        for fresh in [
+            ClientTopologySessionError::Changed,
+            ClientTopologySessionError::DialectChanged,
+        ] {
+            let error = anyhow::Error::new(fresh).context("applying coherent topology snapshot");
+            assert!(reattach_needs_fresh_attachment(&error), "{:#}", error);
+        }
+        let reserved = anyhow::Error::new(ClientTopologySessionError::ReservedIdentity)
+            .context("applying coherent topology snapshot");
+        assert!(!reattach_needs_fresh_attachment(&reserved));
+        assert!(!reattach_needs_fresh_attachment(&anyhow!(
+            "remote mux session identity changed; a fresh domain attachment is required"
+        )));
     }
 
     #[test]

@@ -10321,6 +10321,8 @@ impl Client {
                                                                 return;
                                                             }
                                                             let result_ui = reattach_ui.clone();
+                                                            let domain_name =
+                                                                dispatch.domain.domain_name().to_string();
                                                             let result =
                                                                 ClientDomain::reattach_if_current(
                                                                     Arc::clone(&dispatch.mux),
@@ -10334,9 +10336,23 @@ impl Client {
                                                                 log::error!(
                                                                     "reconnected mux client reattach failed: {err:#}"
                                                                 );
-                                                                result_ui.output_str(&format!(
-                                                                    "Transport reconnected, but domain {local_domain_id} remains unavailable because codec/topology reattach failed: {err}\n"
-                                                                ));
+                                                                if crate::domain::reattach_needs_fresh_attachment(&err) {
+                                                                    // This attachment is detached next, and the
+                                                                    // auto-connect supervisor reattaches the domain
+                                                                    // in a new window. "Remains unavailable" here
+                                                                    // contradicted that window for the whole
+                                                                    // linger (ft-7lnrp).
+                                                                    result_ui.title(&format!(
+                                                                        "FrankenTerm: {domain_name} mux restarted"
+                                                                    ));
+                                                                    result_ui.output_str(&format!(
+                                                                        "The remote mux for domain {domain_name} restarted, so its earlier tabs are gone. If the domain reconnects automatically, it reopens in a new window shortly; otherwise attach it again.\n"
+                                                                    ));
+                                                                } else {
+                                                                    result_ui.output_str(&format!(
+                                                                        "Transport reconnected, but domain {domain_name} remains unavailable because codec/topology reattach failed: {err:#}\n"
+                                                                    ));
+                                                                }
                                                                 return;
                                                             }
                                                             if !dispatch.rpc_generation_is_live() {
