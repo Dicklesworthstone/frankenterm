@@ -3437,6 +3437,7 @@ impl ClientDomain {
             .publish_rpc_transport_ready(&rpc, readiness_guard)
             .await?;
         Self::request_user_var_hydration(Arc::clone(&mux), Arc::clone(&expected), rpc.clone())?;
+        Self::start_pane_push_tracking(&expected, rpc.clone());
         Self::flush_bootstrap_resizes(&mux, &expected);
         client_domain.refresh_layout_snapshot(&mux, &expected);
         ui.close();
@@ -3733,6 +3734,55 @@ impl ClientDomain {
             Self::request_user_var_hydration(mux, inner, rpc.clone())?;
         }
         Ok(prepared)
+    }
+
+    /// Ask the server about every pane of this attachment, once the connection
+    /// is ready, so that it pushes their later changes.
+    ///
+    /// A current-codec server pushes a pane's title, working directory and
+    /// output only to a session that has already asked about that pane. The
+    /// paint path asks for the panes it draws; without this pass a tab that is
+    /// attached or reconnected behind another tab keeps the title it had at
+    /// that moment until it is first shown (ft-pzu8b). Four requests are
+    /// outstanding at a time, whatever the population, and their replies are
+    /// not needed: the changes arrive as ordinary pushes.
+    pub(crate) fn start_pane_push_tracking(inner: &Arc<ClientInner>, rpc: RpcGenerationScope) {
+        if !crate::pane::needs_push_tracking_request(rpc.agreed_codec_version()) {
+            return;
+        }
+        let mut panes = lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane")
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        if panes.is_empty() {
+            return;
+        }
+        panes.sort_unstable();
+        let reservation = match reserve_client_main_thread(
+            promise::spawn::MainThreadServiceClass::Background,
+            4096,
+            "pane push tracking",
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                // Not fatal: each pane still asks when it is first painted.
+                log::warn!("remote panes will be tracked as they are shown: {error:#}");
+                return;
+            }
+        };
+        reservation
+            .spawn(async move {
+                let mut requests = futures::stream::iter(panes.into_iter().map(|pane_id| {
+                    rpc.get_pane_render_changes(codec::GetPaneRenderChanges { pane_id })
+                }))
+                .buffer_unordered(4);
+                while requests.next().await.is_some() {
+                    if !rpc.is_ready() {
+                        break;
+                    }
+                }
+            })
+            .detach();
     }
 
     pub(crate) fn flush_bootstrap_resizes(mux: &Mux, inner: &ClientInner) {
@@ -5294,6 +5344,7 @@ impl ClientDomain {
         .await;
         bootstrap_result?;
         Self::request_user_var_hydration(Arc::clone(mux), Arc::clone(&inner), rpc.clone())?;
+        Self::start_pane_push_tracking(&inner, rpc.clone());
         Self::flush_bootstrap_resizes(mux, &inner);
         domain.refresh_layout_snapshot(mux, &inner);
         cleanup.disarm();
@@ -6508,6 +6559,75 @@ mod tests {
     }
 
     #[test]
+    fn ready_connection_asks_about_every_pane_four_at_a_time() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let config = ClientDomainConfig::Unix(UnixDomain::default());
+        let (client, peer) = Client::new_test_client_with_rpc_peer(Some(91_041), config);
+        let inner = Arc::new(ClientInner::new(91_041, client, None, None, false));
+        let _domain = register_test_client_domain(&mux, &inner);
+        let pump = || {
+            for _ in 0..32 {
+                if !executor.try_tick().unwrap() {
+                    break;
+                }
+            }
+        };
+        // The pass asks by remote pane id. None of these panes is ever painted.
+        for index in 0..50 {
+            lock_or_recover(&inner.remote_to_local_pane, "test pane mapping")
+                .insert(10_000 + index, 20_000 + index);
+        }
+
+        peer.replace_ready_generation(&inner.client, codec::LEGACY46_CODEC_VERSION)
+            .unwrap();
+        ClientDomain::start_pane_push_tracking(&inner, inner.client.rpc_scope());
+        pump();
+        assert!(
+            peer.is_empty(),
+            "a codec 46 server is not asked about panes that are not painted"
+        );
+
+        // The initial attachment, then a reconnect: the new server session
+        // tracks nothing until it is asked again.
+        for _ in 0..2 {
+            peer.replace_ready_generation(&inner.client, codec::CODEC_VERSION)
+                .unwrap();
+            ClientDomain::start_pane_push_tracking(&inner, inner.client.rpc_scope());
+            assert!(
+                peer.is_empty(),
+                "starting the pass must enqueue one worker, not one task per pane"
+            );
+            pump();
+            let mut asked = HashSet::new();
+            for _ in 0..50 {
+                assert!(
+                    (1..=4).contains(&peer.queued_len()),
+                    "at most four requests may be outstanding: {}",
+                    peer.queued_len()
+                );
+                let request =
+                    promise::spawn::block_on(peer.respond_next_registration_request()).unwrap();
+                let codec::Pdu::GetPaneRenderChanges(codec::GetPaneRenderChanges { pane_id }) =
+                    request
+                else {
+                    panic!("the pass sends only pane polls, got {:?}", request);
+                };
+                assert!(
+                    asked.insert(pane_id),
+                    "pane {} was asked about twice",
+                    pane_id
+                );
+                pump();
+            }
+            assert_eq!(asked, (10_000..10_050).collect());
+            assert!(peer.is_empty());
+        }
+    }
+
+    #[test]
     fn background_user_variable_hydration_covers_large_population_and_reconnection_with_four_slots()
     {
         let scope = MuxTestScope::enter();
@@ -6549,14 +6669,13 @@ mod tests {
             mux.add_pane(&pane).unwrap();
             lock_or_recover(&inner.remote_to_local_pane, "test metadata mapping")
                 .insert(remote, local);
-            // Pane registration independently sends the initial palette. Drain
-            // that setup one pane at a time before measuring census traffic.
-            pump();
-            assert!(matches!(
-                promise::spawn::block_on(peer.respond_next_unit()).unwrap(),
-                codec::Pdu::SetPalette(_)
-            ));
-            pump();
+            // Pane registration independently sends the initial palette and
+            // the pane's bootstrap poll. Drain that setup one pane at a time
+            // before measuring census traffic.
+            let requests = peer.answer_pane_registration(&pump);
+            assert!(requests
+                .iter()
+                .any(|request| matches!(request, codec::Pdu::SetPalette(_))));
         }
         assert!(peer.is_empty());
         for reconnect in [false, true] {
@@ -8460,12 +8579,23 @@ mod tests {
         // Registration separately schedules the initial palette update. Drain
         // and identify that request before measuring resize traffic; otherwise
         // a later executor tick can mistake palette setup for a resize echo.
-        while executor.try_tick().unwrap() {}
-        for _ in 0..tab_count {
-            let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
-            assert!(matches!(request, codec::Pdu::SetPalette(_)));
-        }
-        while executor.try_tick().unwrap() {}
+        let requests = peer.answer_pane_registration(|| while executor.try_tick().unwrap() {});
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request, codec::Pdu::SetPalette(_)))
+                .count(),
+            tab_count
+        );
+        // Each pane the snapshot created polls without being painted: only
+        // then does the server push its later title and output changes.
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request, codec::Pdu::GetPaneRenderChanges(_)))
+                .count(),
+            tab_count
+        );
         assert!(peer.is_empty(), "pane registration setup must be settled");
         let tab = mux
             .get_tab(inner.remote_to_local_tab_id(51).unwrap())
@@ -8630,14 +8760,14 @@ mod tests {
         }
         mux.activate_tab_exact_in_window(window_id, &tabs[2], false)
             .expect("activate third attached tab");
-        while executor.try_tick().unwrap() {}
-        for _ in 0..3 {
-            assert!(matches!(
-                promise::spawn::block_on(peer.respond_next_unit()).unwrap(),
-                codec::Pdu::SetPalette(_)
-            ));
-        }
-        while executor.try_tick().unwrap() {}
+        let requests = peer.answer_pane_registration(|| while executor.try_tick().unwrap() {});
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request, codec::Pdu::SetPalette(_)))
+                .count(),
+            3
+        );
         assert!(peer.is_empty());
 
         // The observed bridge changed B's pixels and DPI, keeping 80x24 cells.

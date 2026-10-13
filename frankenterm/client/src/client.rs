@@ -11002,29 +11002,60 @@ impl TestRpcPeer {
         &self,
         client: &Client,
     ) -> anyhow::Result<()> {
-        let message = self.receiver.recv().await?;
-        let ReaderMessage::SendPdu {
-            binding,
-            lease,
-            promise,
-        } = message
-        else {
-            bail!("expected queued resize request");
-        };
-        let prepared = lease
-            .claim_for_reader()?
-            .context("resize lease cancelled")?;
-        anyhow::ensure!(matches!(prepared.pdu(), Pdu::Resize(_)), "expected resize");
-        let error = client.rpc_transport.retirement_error(
-            binding,
-            RpcRetirementStage::AwaitingResponse,
-            RpcDeliveryCertainty::OutcomeUnknown,
-            "injected resize reply loss after effect became ambiguous",
-        );
-        promise
-            .try_send(Err(anyhow::Error::new(error)))
-            .map_err(|_| anyhow!("resize caller retired before injected reply failure"))?;
-        Ok(())
+        loop {
+            let message = self.receiver.recv().await?;
+            let ReaderMessage::SendPdu {
+                binding,
+                lease,
+                promise,
+            } = message
+            else {
+                bail!("expected queued resize request");
+            };
+            let prepared = lease
+                .claim_for_reader()?
+                .context("resize lease cancelled")?;
+            if let Some((_, reply)) = Self::registration_reply(prepared.pdu()) {
+                // A pane that registered before this resize can still have its
+                // bootstrap poll or palette queued ahead of it.
+                promise
+                    .send(Ok(PendingRpcReply::pdu(reply)))
+                    .await
+                    .map_err(|_| anyhow!("pane-registration RPC caller retired before response"))?;
+                continue;
+            }
+            anyhow::ensure!(matches!(prepared.pdu(), Pdu::Resize(_)), "expected resize");
+            let error = client.rpc_transport.retirement_error(
+                binding,
+                RpcRetirementStage::AwaitingResponse,
+                RpcDeliveryCertainty::OutcomeUnknown,
+                "injected resize reply loss after effect became ambiguous",
+            );
+            promise
+                .try_send(Err(anyhow::Error::new(error)))
+                .map_err(|_| anyhow!("resize caller retired before injected reply failure"))?;
+            return Ok(());
+        }
+    }
+
+    /// The request and the reply a server gives when the request is one that
+    /// pane registration sends: its palette (unit) or its bootstrap liveness
+    /// poll (alive).
+    fn registration_reply(request: &Pdu) -> Option<(Pdu, Pdu)> {
+        match request {
+            Pdu::SetPalette(request) => Some((
+                Pdu::SetPalette(request.clone()),
+                Pdu::UnitResponse(UnitResponse {}),
+            )),
+            Pdu::GetPaneRenderChanges(request) => Some((
+                Pdu::GetPaneRenderChanges(request.clone()),
+                Pdu::LivenessResponse(LivenessResponse {
+                    pane_id: request.pane_id,
+                    is_alive: true,
+                }),
+            )),
+            _ => None,
+        }
     }
 
     pub(crate) async fn discard_next_queued_rpc(&self) -> anyhow::Result<()> {
@@ -11256,6 +11287,60 @@ impl TestRpcPeer {
             .map_err(|_| anyhow!("test unit-response RPC caller retired before response"))?;
         drop(prepared);
         Ok(request)
+    }
+
+    /// Answer the next queued request, which must be one a pane sends when it
+    /// registers: its palette (unit reply) or its liveness poll (alive).
+    pub(crate) async fn respond_next_registration_request(&self) -> anyhow::Result<Pdu> {
+        let message = self
+            .receiver
+            .recv()
+            .await
+            .context("test RPC peer queue closed before pane-registration request")?;
+        let ReaderMessage::SendPdu {
+            binding,
+            lease,
+            promise,
+        } = message
+        else {
+            bail!("test RPC peer received a non-PDU control message");
+        };
+        if !lease.matches(binding) {
+            bail!("test pane-registration RPC lease lost its exact binding");
+        }
+        let prepared = lease.claim_for_reader()?.ok_or_else(|| {
+            anyhow!("test pane-registration RPC was cancelled before reader claim")
+        })?;
+        let Some((request, reply)) = Self::registration_reply(prepared.pdu()) else {
+            bail!(
+                "test pane-registration RPC peer received unexpected {}",
+                prepared.pdu().pdu_name()
+            );
+        };
+        promise
+            .send(Ok(PendingRpcReply::pdu(reply)))
+            .await
+            .map_err(|_| anyhow!("test pane-registration RPC caller retired before response"))?;
+        drop(prepared);
+        Ok(request)
+    }
+
+    /// Answer every request that pane registration queues (each pane's
+    /// palette and, on a current-codec connection, its bootstrap liveness
+    /// poll) until `run_until_idle` leaves the queue empty. Returns the
+    /// requests in arrival order.
+    pub(crate) fn answer_pane_registration(&self, mut run_until_idle: impl FnMut()) -> Vec<Pdu> {
+        let mut requests = Vec::new();
+        loop {
+            run_until_idle();
+            if self.receiver.is_empty() {
+                return requests;
+            }
+            requests.push(
+                promise::spawn::block_on(self.respond_next_registration_request())
+                    .expect("pane registration sends only its palette and its liveness poll"),
+            );
+        }
     }
 
     pub(crate) async fn respond_next_lines(

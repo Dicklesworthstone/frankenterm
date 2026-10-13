@@ -2530,15 +2530,6 @@ impl RenderableInner {
             return Ok(());
         }
 
-        // Liveness backstop only: jump straight to the max interval after the
-        // bootstrap poll instead of ramping 20ms -> ... -> max. Real updates arrive
-        // via the server's unilateral push, and a dead connection is detected at
-        // ~RTT by the transport reader thread + the PaneRemoved push, so the poll is
-        // just a slow backstop. The first poll still fires immediately (the pane is
-        // constructed with last_poll = initial_last_poll(now)) to register the
-        // server-side push tracking that all subsequent pushes depend on. [zero-poll]
-        self.poll_interval = max_poll_interval();
-
         let Some(registration) = self.mux_registration.load() else {
             return Ok(());
         };
@@ -2558,6 +2549,19 @@ impl RenderableInner {
             }
         };
 
+        // Liveness backstop only: jump straight to the max interval after the
+        // bootstrap poll instead of ramping 20ms -> ... -> max. Real updates arrive
+        // via the server's unilateral push, and a dead connection is detected at
+        // ~RTT by the transport reader thread + the PaneRemoved push, so the poll is
+        // just a slow backstop. The first poll still fires immediately (the pane is
+        // constructed with last_poll = initial_last_poll(now)) to register the
+        // server-side push tracking that all subsequent pushes depend on. [zero-poll]
+        //
+        // Set only once this poll is really issued: an attempt that could not
+        // start (no registration yet, or the scheduler refused it) must leave
+        // the bootstrap poll eligible on the next call, not a backstop interval
+        // away.
+        self.poll_interval = max_poll_interval();
         self.last_poll = Instant::now();
         self.poll_in_progress.store(true, Ordering::SeqCst);
         let remote_pane_id = self.remote_pane_id;
@@ -6940,11 +6944,14 @@ mod tests {
         );
         let registered: Arc<dyn mux::pane::Pane> = pane.clone();
         mux.add_pane(&registered).unwrap();
-        while executor.try_tick().unwrap() {}
-        assert!(!peer.is_empty(), "binding must produce its palette RPC");
-        promise::spawn::block_on(peer.respond_next_unit()).unwrap();
-        while executor.try_tick().unwrap() {}
-        assert!(peer.is_empty());
+        let requests = peer.answer_pane_registration(|| while executor.try_tick().unwrap() {});
+        assert!(
+            requests
+                .iter()
+                .any(|request| matches!(request, codec::Pdu::SetPalette(_))),
+            "binding must produce its palette RPC: {:?}",
+            requests
+        );
         let repaint_requests = Arc::new(AtomicUsize::new(0));
         let observed_repaints = Arc::clone(&repaint_requests);
         let weak_renderable = Arc::downgrade(&pane.renderable);
@@ -7214,11 +7221,14 @@ mod tests {
         );
         let registered: Arc<dyn mux::pane::Pane> = pane.clone();
         mux.add_pane(&registered).unwrap();
-        while executor.try_tick().unwrap() {}
-        assert!(!peer.is_empty());
-        promise::spawn::block_on(peer.respond_next_unit()).unwrap();
-        while executor.try_tick().unwrap() {}
-        assert!(peer.is_empty());
+        let requests = peer.answer_pane_registration(|| while executor.try_tick().unwrap() {});
+        assert!(
+            requests
+                .iter()
+                .any(|request| matches!(request, codec::Pdu::SetPalette(_))),
+            "binding must produce its palette RPC: {:?}",
+            requests
+        );
         let deadline = Instant::now() + Duration::from_secs(15);
         {
             let state = pane.renderable.lock();

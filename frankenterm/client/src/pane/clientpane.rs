@@ -2927,6 +2927,21 @@ impl ReliableInputQueue {
     }
 }
 
+/// Whether this client must ask a server at this codec version about a pane
+/// before the server pushes that pane's changes.
+///
+/// A server pushes a pane's title, working directory and output only to a
+/// session that has already asked about that pane. The paint path asks, but
+/// only for panes it draws, so a tab that has never been shown would keep the
+/// title it was created or attached with (ft-pzu8b). Current-codec servers get
+/// one request per pane. Codec 46 servers have the same rule but stay on
+/// first-paint polling: those hosts hold hundreds of panes, and asking about
+/// each one would subscribe this client to every pane's output on a server
+/// without the current push coordinator and admission budgets.
+pub(crate) fn needs_push_tracking_request(agreed_codec_version: Option<usize>) -> bool {
+    agreed_codec_version.is_some_and(|version| version != LEGACY46_CODEC_VERSION)
+}
+
 fn should_process_unilateral_render_delta(
     current_seqno: SequenceNo,
     incoming_seqno: SequenceNo,
@@ -5686,9 +5701,22 @@ impl Pane for ClientPane {
                             return Ok(());
                         }
 
-                        rpc.set_configured_palette_for_pane(request)
-                            .await
-                            .map(|_| ())
+                        let palette = rpc.set_configured_palette_for_pane(request);
+                        if !needs_push_tracking_request(rpc.agreed_codec_version()) {
+                            // Codec 46, or a pane created while the connection
+                            // was still bootstrapping: that scope carries no
+                            // codec, and `ClientDomain::start_pane_push_tracking`
+                            // asks about the pane once the connection is ready.
+                            return palette.await.map(|_| ());
+                        }
+                        // A pane created on a ready connection (a new tab or
+                        // split). Its reply is not needed, and its failure
+                        // must not fail the palette.
+                        let tracking = rpc.get_pane_render_changes(GetPaneRenderChanges {
+                            pane_id: remote_pane_id,
+                        });
+                        let (palette, _tracking) = futures::join!(palette, tracking);
+                        palette.map(|_| ())
                     })
                     .detach();
             }
@@ -7959,29 +7987,110 @@ mod tests {
         let pane = test_client_pane(inner, local_id, remote_id);
         let registered: Arc<dyn Pane> = pane.clone();
         mux.add_pane(&registered).unwrap();
-        // Binding admits a palette RPC. Complete it before deliberately
-        // exhausting scheduler capacity, or binding correctly retires the
-        // transport and the test never reaches resize admission at all.
-        for _ in 0..16 {
-            if !executor.try_tick().unwrap() {
-                break;
-            }
-        }
-        assert!(!peer.is_empty(), "pane binding must admit its palette RPC");
-        let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        // Binding admits a palette RPC and, on a current-codec connection, the
+        // pane's bootstrap poll. Complete them before deliberately exhausting
+        // scheduler capacity, or binding correctly retires the transport and
+        // the test never reaches resize admission at all.
+        let requests = answer_registration_requests(executor, peer);
         assert!(
-            matches!(request, Pdu::SetPalette(SetPalette { pane_id, .. }) if pane_id == remote_id)
-        );
-        for _ in 0..16 {
-            if !executor.try_tick().unwrap() {
-                break;
-            }
-        }
-        assert!(
-            peer.is_empty(),
-            "binding must not leave unrelated RPCs queued"
+            requests.iter().any(|request| matches!(
+                request,
+                Pdu::SetPalette(SetPalette { pane_id, .. }) if *pane_id == remote_id
+            )),
+            "pane binding must admit its palette RPC: {:?}",
+            requests
         );
         pane
+    }
+
+    fn answer_registration_requests(
+        executor: &promise::spawn::SimpleExecutor,
+        peer: &TestRpcPeer,
+    ) -> Vec<Pdu> {
+        peer.answer_pane_registration(|| {
+            for _ in 0..16 {
+                if !executor.try_tick().unwrap() {
+                    break;
+                }
+            }
+        })
+    }
+
+    fn liveness_polls_for(requests: &[Pdu], remote_id: PaneId) -> usize {
+        requests
+            .iter()
+            .filter(|request| {
+                matches!(
+                    request,
+                    Pdu::GetPaneRenderChanges(GetPaneRenderChanges { pane_id }) if *pane_id == remote_id
+                )
+            })
+            .count()
+    }
+
+    #[test]
+    fn current_codec_pane_asks_about_itself_when_it_registers_without_being_painted() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        peer.replace_ready_generation(&inner.client, codec::CODEC_VERSION)
+            .unwrap();
+        let pane = test_client_pane(&inner, 40, 29);
+        let registered: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&registered).unwrap();
+
+        // Nothing has painted this pane. The server pushes its title and
+        // output only once this session has asked about it.
+        let requests = answer_registration_requests(&executor, &peer);
+        assert_eq!(
+            liveness_polls_for(&requests, 29),
+            1,
+            "a registered pane must ask once without waiting for a paint: {requests:?}"
+        );
+    }
+
+    #[test]
+    fn codec46_pane_keeps_polling_from_its_first_paint() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        peer.replace_ready_generation(&inner.client, LEGACY46_CODEC_VERSION)
+            .unwrap();
+        let pane = test_client_pane(&inner, 40, 29);
+
+        // A changed-rows query before registration cannot poll. It must not
+        // use up the bootstrap poll either.
+        let _ = pane.get_changed_since(0..1, 0);
+        assert!(peer.is_empty());
+
+        let registered: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&registered).unwrap();
+        let requests = answer_registration_requests(&executor, &peer);
+        assert_eq!(
+            liveness_polls_for(&requests, 29),
+            0,
+            "a codec 46 pane must not be asked about at registration: {requests:?}"
+        );
+
+        let _ = pane.get_changed_since(0..1, 0);
+        let requests = answer_registration_requests(&executor, &peer);
+        assert_eq!(
+            liveness_polls_for(&requests, 29),
+            1,
+            "the first paint after registration must issue the bootstrap poll: {requests:?}"
+        );
+    }
+
+    #[test]
+    fn only_current_codec_servers_get_a_push_tracking_request() {
+        assert!(needs_push_tracking_request(Some(codec::CODEC_VERSION)));
+        assert!(!needs_push_tracking_request(Some(LEGACY46_CODEC_VERSION)));
+        // No agreed codec: the connection is not ready, or is gone.
+        assert!(!needs_push_tracking_request(None));
     }
 
     fn mouse_test_event(kind: wezterm_term::MouseEventKind) -> MouseEvent {
