@@ -117,9 +117,37 @@ fn guarded_reserve_text(target: &mut String, additional: usize) {
         let grown_capacity = target.capacity().saturating_mul(2).max(required);
         let mut replacement = Zeroizing::new(String::with_capacity(grown_capacity));
         replacement.push_str(target);
-        target.zeroize();
         core::mem::swap(target, &mut *replacement);
+        // The guard now holds the old buffer. Wipe it here rather than in the
+        // guard's drop, which would store one byte at a time.
+        let mut old = core::mem::take(&mut *replacement);
+        wipe_text_allocation(&mut old);
     }
+}
+
+/// Zero every byte of `text`'s allocation with volatile stores and leave it
+/// empty with the same capacity.
+///
+/// The guarantee is `String::zeroize`'s: each byte of the capacity, used or
+/// spare, receives a volatile zero store. `String::zeroize` stores one byte
+/// at a time with a fence per byte, which made dropping evicted scrollback
+/// rows about 30% of the parser lane's CPU under a flood (ft-3floy); this
+/// stores eight bytes at a time.
+fn wipe_text_allocation(text: &mut String) {
+    let mut bytes = core::mem::take(text).into_bytes();
+    zero_whole_allocation(&mut bytes);
+    bytes.clear();
+    *text = String::from_utf8(bytes).unwrap_or_default();
+}
+
+/// Extend `bytes` to its capacity (no reallocation) and volatile-zero all of
+/// it, eight bytes per store where alignment allows.
+fn zero_whole_allocation(bytes: &mut Vec<u8>) {
+    bytes.resize(bytes.capacity(), 0);
+    let (head, words, tail) = bytemuck::pod_align_to_mut::<u8, u64>(bytes);
+    head.zeroize();
+    words.zeroize();
+    tail.zeroize();
 }
 
 fn guarded_push_str(target: &mut String, fragment: &str) {
@@ -897,7 +925,7 @@ impl ClusteredLine {
     }
 
     fn wipe_owned_text(&mut self) {
-        self.text.zeroize();
+        wipe_text_allocation(&mut self.text);
     }
 }
 
@@ -1251,6 +1279,58 @@ mod test {
 
         assert!(line.text.is_empty());
         assert_eq!(line.text.capacity(), capacity);
+    }
+
+    #[test]
+    fn whole_allocation_zeroing_covers_used_and_spare_bytes() {
+        // Lengths and capacities around the 8-byte word boundary. The spare
+        // capacity still holds text from before the truncate.
+        for len in [0usize, 1, 7, 8, 9, 15, 16, 17, 63, 64, 65, 200] {
+            let mut bytes = Vec::with_capacity(len * 2 + 3);
+            bytes.extend(core::iter::repeat_n(b'x', len * 2 + 3));
+            bytes.truncate(len);
+            let capacity = bytes.capacity();
+            let address = bytes.as_ptr();
+
+            zero_whole_allocation(&mut bytes);
+
+            assert_eq!(
+                bytes.len(),
+                capacity,
+                "len {len}: whole allocation addressed"
+            );
+            assert_eq!(bytes.as_ptr(), address, "len {len}: zeroed in place");
+            assert!(
+                bytes.iter().all(|byte| *byte == 0),
+                "len {}: text survived",
+                len
+            );
+        }
+    }
+
+    #[test]
+    fn text_wipe_leaves_an_empty_string_with_the_same_allocation() {
+        let mut text = String::with_capacity(37);
+        text.push_str("semantic terminal text");
+        let capacity = text.capacity();
+        let address = text.as_ptr();
+
+        wipe_text_allocation(&mut text);
+
+        assert!(text.is_empty());
+        assert_eq!(text.capacity(), capacity);
+        assert_eq!(text.as_ptr(), address);
+    }
+
+    #[test]
+    fn growing_line_text_wipes_the_buffer_it_leaves() {
+        let mut text = String::new();
+        guarded_reserve_text(&mut text, 4);
+        text.push_str("abcd");
+        let before = text.capacity();
+        guarded_reserve_text(&mut text, before + 1);
+        assert!(text.capacity() > before);
+        assert_eq!(text, "abcd", "the content moves to the grown buffer");
     }
 
     #[test]
