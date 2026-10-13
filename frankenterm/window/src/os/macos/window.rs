@@ -2433,6 +2433,15 @@ impl WindowView {
         if let Some(this) = Self::get_this(this) {
             let mut inner = this.inner.borrow_mut();
             inner.focused = true;
+            // A throttle taken at a lower unfocused rate would hold the
+            // focus repaint back for up to that longer interval. Let the
+            // paint that the focus change requests start now; the stale
+            // completion then leaves the new throttle alone (slot check).
+            if inner.paint_throttled
+                && inner.config.max_fps_for_focus(false) < inner.config.max_fps_for_focus(true)
+            {
+                inner.paint_throttled = false;
+            }
             inner.events.dispatch(WindowEvent::FocusChanged(true));
             drop(inner);
             this.update_application_presentation(true);
@@ -3384,6 +3393,11 @@ impl WindowView {
                                 }
                                 let invalidated = {
                                     let mut state = original_state.borrow_mut();
+                                    if state.repaint_slot != Some(slot) {
+                                        // A newer paint owns the throttle:
+                                        // focus released this one early.
+                                        return;
+                                    }
                                     state.paint_throttled = false;
                                     state.invalidated
                                 };

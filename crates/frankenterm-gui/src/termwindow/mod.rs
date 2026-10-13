@@ -2259,6 +2259,8 @@ pub struct TermWindow {
     /// Whether the coalesced refresh in flight also runs the status event
     /// (`update_title`) rather than only the tab bar (`update_title_impl`).
     pending_update_title_status: bool,
+    /// When the coalesced refresh in flight was scheduled.
+    pending_update_title_at: Option<Instant>,
     pending_scale_changes: LinkedList<resize::ScaleChange>,
     /// Terminal dimensions
     terminal_size: TerminalSize,
@@ -3996,6 +3998,10 @@ const OCCLUDED_REPAINT_PROBE_DELAY: Duration = Duration::from_millis(250);
 /// one 60 Hz frame (16 ms) a window of idle visible content still repainted at
 /// its `max_fps`. 100 ms keeps a 10 Hz spinner animated in the tab bar.
 const TITLE_UPDATE_COALESCE: Duration = Duration::from_millis(100);
+/// A coalesced title refresh still pending after this long was dropped on
+/// the way back (the window's `notify` is refused under main-thread
+/// saturation); re-arm rather than coalesce every later change into it.
+const TITLE_UPDATE_LOST_AFTER: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderWakeTicket(u64);
@@ -4720,6 +4726,7 @@ impl TermWindow {
             is_repaint_pending: false,
             pending_update_title: false,
             pending_update_title_status: false,
+            pending_update_title_at: None,
             pending_scale_changes: LinkedList::new(),
             terminal_size,
             render_state,
@@ -6000,20 +6007,22 @@ impl TermWindow {
                         window,
                     )
                 });
+                let cleaned_up = matches!(cleanup_result, Ok(true));
                 if let Err(error) = cleanup_result {
                     log::error!("retained GUI pane cleanup failed; owner will retry: {error:#}");
                 }
                 // Empty retained wakes include credit returns: retry visible
                 // state admission through the ordinary paced native repaint.
-                // A wake that carries only pane work repaints through that
-                // work instead: visible output below, the coalesced title
-                // refresh when the tab bar changed, and the invalidation
-                // branches. Agents in background tabs send such wakes all
-                // the time, and repainting on each one held their windows at
-                // max_fps for content nobody could see.
+                // So do wakes that cleaned up a removed pane. A wake that
+                // carries only pane work repaints through that work instead:
+                // visible output below, the coalesced title refresh when the
+                // tab bar changed, and the invalidation branches. Agents in
+                // background tabs send such wakes all the time, and
+                // repainting on each one held their windows at max_fps for
+                // content nobody could see.
                 let carries_pane_work =
                     title_refresh.is_some() || interest.iter().any(|word| *word != 0);
-                if pane_cleanup.take_credit_wake() || !carries_pane_work {
+                if pane_cleanup.take_credit_wake() || cleaned_up || !carries_pane_work {
                     actions.request_repaint();
                 }
                 if reconcile
@@ -8337,10 +8346,17 @@ impl TermWindow {
     fn schedule_title_refresh(&mut self, with_status: bool) {
         self.pending_update_title_status |= with_status;
         if self.pending_update_title {
-            metrics::histogram!("update_title.coalesced").record(1.);
-            return;
+            let lost = self
+                .pending_update_title_at
+                .is_some_and(|at| at.elapsed() > TITLE_UPDATE_LOST_AFTER);
+            if !lost {
+                metrics::histogram!("update_title.coalesced").record(1.);
+                return;
+            }
+            log::warn!("coalesced title refresh never ran; scheduling a new one");
         }
         self.pending_update_title = true;
+        self.pending_update_title_at = Some(Instant::now());
         metrics::histogram!("update_title.scheduled").record(1.);
 
         if let Some(window) = self.window.as_ref() {
