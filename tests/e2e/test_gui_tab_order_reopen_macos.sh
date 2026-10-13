@@ -38,6 +38,7 @@
 #   FT_TO_LUA_ATTACH 1 = the relaunch also attaches the domain from a Lua
 #                    gui-startup timer after opening a local window (the
 #                    author's config does this on top of auto-connect)
+#   FT_TO_RUST_LOG   RUST_LOG for the GUIs (logs land in <home>/gui.err)
 #   FT_TO_KEEP       1 = keep the scratch directory for inspection
 set -uo pipefail
 
@@ -68,6 +69,7 @@ launch_gui() { # home [gui args...]
         ${FT_TO_PROXY:+--env "FT_TO_PROXY=$FT_TO_PROXY"} \
         ${FT_TO_SPACED:+--env "FT_TO_SPACED=$FT_TO_SPACED"} \
         ${FT_TO_LUA_ATTACH:+--env "FT_TO_LUA_ATTACH=$FT_TO_LUA_ATTACH"} \
+        ${FT_TO_RUST_LOG:+--env "RUST_LOG=$FT_TO_RUST_LOG"} \
         --env FRANKENTERM_LUA_CONFIG=1 --stderr "$home/gui.err" \
         -a "$APP" --args --config-file "$E/gui.lua" "$@"
 }

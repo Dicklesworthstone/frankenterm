@@ -26,7 +26,7 @@ use mux::{
 use portable_pty::CommandBuilder;
 use promise::spawn::spawn_into_new_thread;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::future::Future;
 use std::hash::Hash;
@@ -38,6 +38,7 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::time::{Duration, Instant};
 use wezterm_term::TerminalSize;
 
 thread_local! {
@@ -255,6 +256,50 @@ fn layout_session(
     }
 }
 
+/// Focus changes this client advised (SetFocusedPane) whose `PaneFocused`
+/// echo has not arrived yet, oldest first.
+///
+/// Legacy (codec-46) servers broadcast every focus change to all clients,
+/// including the one that made it. Applying our own late echoes as remote
+/// commands made two quick local focus changes (attach focusing the server's
+/// active tab, then layout restore selecting the saved one) chase each other:
+/// each stale echo moved local focus back and was advised again, and whichever
+/// echo landed last won (ft-ox00h).
+#[derive(Debug, Default)]
+pub(crate) struct FocusAdvisories {
+    in_flight: VecDeque<(PaneId, Instant)>,
+}
+
+impl FocusAdvisories {
+    /// Generous for a loaded SSH proxy; an advisory the server never echoes
+    /// (focus was already there) must not mask a genuine remote change forever.
+    const ECHO_WINDOW: Duration = Duration::from_secs(10);
+    const MAX_IN_FLIGHT: usize = 32;
+
+    pub(crate) fn advised(&mut self, pane_id: PaneId, now: Instant) {
+        if self.in_flight.len() == Self::MAX_IN_FLIGHT {
+            self.in_flight.pop_front();
+        }
+        self.in_flight.push_back((pane_id, now));
+    }
+
+    /// Whether a remote `PaneFocused` should move local focus. An echo of one
+    /// of our own in-flight advisories only confirms what we already applied
+    /// locally (and settles every older advisory); anything else is a genuine
+    /// remote focus change.
+    pub(crate) fn is_remote_change(&mut self, pane_id: PaneId, now: Instant) -> bool {
+        self.in_flight
+            .retain(|(_, at)| now.saturating_duration_since(*at) < Self::ECHO_WINDOW);
+        match self.in_flight.iter().position(|(id, _)| *id == pane_id) {
+            Some(echo) => {
+                self.in_flight.drain(..=echo);
+                false
+            }
+            None => true,
+        }
+    }
+}
+
 pub struct ClientInner {
     pub client: Client,
     pub local_domain_id: DomainId,
@@ -266,6 +311,7 @@ pub struct ClientInner {
     remote_to_local_pane: Mutex<HashMap<PaneId, PaneId>>,
     spare_local_pane_ids: Mutex<Vec<PaneId>>,
     pub focused_remote_pane_id: Mutex<Option<PaneId>>,
+    pub(crate) focus_advisories: Mutex<FocusAdvisories>,
     pub(crate) reliable_input_queue: Arc<ReliableInputQueue>,
     pub(crate) resize_coordinator: Arc<ClientResizeCoordinator>,
     pub(crate) fetch_retry_coordinator: Arc<crate::pane::FetchRetryCoordinator>,
@@ -1928,6 +1974,7 @@ impl ClientInner {
             remote_to_local_pane: Mutex::new(HashMap::new()),
             spare_local_pane_ids: Mutex::new(Vec::new()),
             focused_remote_pane_id: Mutex::new(None),
+            focus_advisories: Mutex::new(FocusAdvisories::default()),
             reliable_input_queue: ReliableInputQueue::new(),
             resize_coordinator: ClientResizeCoordinator::new(),
             fetch_retry_coordinator: crate::pane::FetchRetryCoordinator::new(),
@@ -5606,6 +5653,50 @@ mod tests {
             .build()
             .expect("build client-domain test runtime")
             .block_on(future)
+    }
+
+    #[test]
+    fn own_focus_echoes_never_move_local_focus() {
+        // The ft-ox00h sequence against a legacy server: attach focuses the
+        // server's active pane 0, layout restore then selects the saved pane 2,
+        // and the server echoes both, in order.
+        let t0 = Instant::now();
+        let mut focus = FocusAdvisories::default();
+        focus.advised(0, t0);
+        focus.advised(2, t0);
+        assert!(!focus.is_remote_change(0, t0), "stale echo of pane 0");
+        assert!(!focus.is_remote_change(2, t0), "echo of the restored pane");
+        // Another client focusing a pane is still applied.
+        assert!(focus.is_remote_change(5, t0));
+        // A later echo of a settled advisory is a genuine change again.
+        assert!(focus.is_remote_change(0, t0));
+    }
+
+    #[test]
+    fn a_newer_echo_settles_older_unechoed_advisories() {
+        let t0 = Instant::now();
+        let mut focus = FocusAdvisories::default();
+        // The server does not echo a focus it already had, so 1 never returns.
+        focus.advised(1, t0);
+        focus.advised(3, t0);
+        assert!(!focus.is_remote_change(3, t0));
+        assert!(
+            focus.is_remote_change(1, t0),
+            "pane 1's advisory was superseded, so a later focus there is remote"
+        );
+    }
+
+    #[test]
+    fn unechoed_focus_advisories_expire() {
+        let t0 = Instant::now();
+        let mut focus = FocusAdvisories::default();
+        focus.advised(4, t0);
+        let later = t0 + FocusAdvisories::ECHO_WINDOW;
+        assert!(focus.is_remote_change(4, later));
+        for pane in 0..(FocusAdvisories::MAX_IN_FLIGHT + 8) {
+            focus.advised(pane, t0);
+        }
+        assert_eq!(focus.in_flight.len(), FocusAdvisories::MAX_IN_FLIGHT);
     }
 
     #[test]

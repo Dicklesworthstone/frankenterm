@@ -5054,6 +5054,18 @@ impl ClientPane {
                 // has been changed on the server, so we work to apply
                 // it here.
                 log::trace!("advised of remote pane focus: {pane_id}");
+                if !lock_or_recover(&self.client.focus_advisories, "focus_advisories")
+                    .is_remote_change(pane_id, Instant::now())
+                {
+                    return Ok(());
+                }
+                // Record the remote focus as already advised so activating its
+                // tab locally does not send it straight back.
+                lock_or_recover(
+                    &self.client.focused_remote_pane_id,
+                    "focused_remote_pane_id",
+                )
+                .replace(pane_id);
 
                 rpc.commit_sync(RpcConsumerKind::PaneUnilateral, || {
                     let _ = registration.try_with_current(|current| {
@@ -5958,6 +5970,8 @@ impl Pane for ClientPane {
         );
         if *focused_pane != Some(self.remote_pane_id) {
             focused_pane.replace(self.remote_pane_id);
+            lock_or_recover(&self.client.focus_advisories, "focus_advisories")
+                .advised(self.remote_pane_id, Instant::now());
             let client = Arc::clone(&self.client);
             let remote_pane_id = self.remote_pane_id;
             let request = client.client.set_focused_pane_id(SetFocusedPane {
