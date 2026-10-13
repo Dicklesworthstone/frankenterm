@@ -167,8 +167,10 @@ Current default key set from `crates/frankenterm-gui/frankenterm.toml`:
 | `automatically_reload_config` | `true` | hot-reload config changes |
 
 `front_end = "Metal"` selects the native Metal renderer on macOS. It is in
-development: today it only clears the window to the background color and draws
-no terminal content, so keep `"WebGpu"` for daily use. When Metal is unavailable
+development. It draws terminal text, colors, the cursor and the tab bar, and
+builds each window's frames on its own render thread, rebuilding only changed
+rows. Pixel parity with WebGpu is still being verified, so keep `"WebGpu"` for
+daily use. When Metal is unavailable
 (not macOS, no Metal device, a GPU older than the Apple7/M1 family, or a window
 without a `CAMetalLayer`), the GUI logs
 `front_end=Metal unavailable (reason=<code>)` and falls back to WebGpu. The
