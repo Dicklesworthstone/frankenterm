@@ -165,6 +165,9 @@ struct GuiPaneCleanupOwner {
     owner: Mutex<Weak<Mux>>,
     wake: Mutex<Option<flume::Sender<()>>>,
     admission_pending: AtomicBool,
+    /// Set when a returned credit woke the retained refresh to retry
+    /// admission; that refresh then repaints even if it carries other work.
+    credit_wake: AtomicBool,
     retry_pending: AtomicBool,
     allocation_pending: AtomicBool,
     retired: AtomicBool,
@@ -201,6 +204,7 @@ impl GuiPaneCleanupOwner {
             ),
             wake: Mutex::new(None),
             admission_pending: AtomicBool::new(false),
+            credit_wake: AtomicBool::new(false),
             retry_pending: AtomicBool::new(false),
             allocation_pending: AtomicBool::new(false),
             retired: AtomicBool::new(false),
@@ -257,8 +261,14 @@ impl GuiPaneCleanupOwner {
 
     fn credit_returned(&self) {
         if self.admission_pending.swap(false, Ordering::AcqRel) {
+            self.credit_wake.store(true, Ordering::Release);
             self.wake();
         }
+    }
+
+    /// Whether a credit return woke the retained refresh since the last call.
+    fn take_credit_wake(&self) -> bool {
+        self.credit_wake.swap(false, Ordering::AcqRel)
     }
 
     fn update_capacity(&self, capacity: usize) {
@@ -5995,7 +6005,17 @@ impl TermWindow {
                 }
                 // Empty retained wakes include credit returns: retry visible
                 // state admission through the ordinary paced native repaint.
-                actions.request_repaint();
+                // A wake that carries only pane work repaints through that
+                // work instead: visible output below, the coalesced title
+                // refresh when the tab bar changed, and the invalidation
+                // branches. Agents in background tabs send such wakes all
+                // the time, and repainting on each one held their windows at
+                // max_fps for content nobody could see.
+                let carries_pane_work =
+                    title_refresh.is_some() || interest.iter().any(|word| *word != 0);
+                if pane_cleanup.take_credit_wake() || !carries_pane_work {
+                    actions.request_repaint();
+                }
                 if reconcile
                     || attached_tabs
                         .as_ref()
