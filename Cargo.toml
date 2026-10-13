@@ -96,6 +96,7 @@ exclude = [
     "frankenterm/bidi/generate",
     "vendor/libssh-rs-sys",
     "vendor/block",
+    "vendor/cairo-sys-rs",
 ]
 
 # Limit default workspace operations (check/clippy/test) to the ft crates.
@@ -717,6 +718,9 @@ libssh-rs-sys = { path = "vendor/libssh-rs-sys" }
 # Preserve Cocoa's block API while correcting its opaque runtime-class ABI.
 # Published archive identity and native proof boundary: vendor/block/README.md.
 block = { path = "vendor/block" }
+# Static cairo + pixman from vendored sources (upstream WezTerm deps/cairo), so
+# macOS bundles carry no Homebrew dylib closure: vendor/cairo-sys-rs/README.md.
+cairo-sys-rs = { path = "vendor/cairo-sys-rs" }
 # k9 0.12.0 on crates.io still pulls terminal_size 0.2 -> rustix 0.37, whose
 # feature probe enables removed rustc_* layout attributes on current nightly.
 # The pinned upstream revision keeps the same k9 version but updates terminal_size to 0.4.
