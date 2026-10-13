@@ -1,0 +1,12 @@
+build after 19:38:36
+build before 19:39:34
+corpus $SCRATCH/e2e/3floy/corpus/seq_lines-67108864-000000000135288d.bin d07e1bf9614185ea
+run 1 before rc=0 load=[41.42 43.15 37.09] secs=2.094 MiB/s=30.6 load_avg_1m=41.42 sanity=ok
+run 1 after rc=0 load=[40.82 43.00 37.07] secs=1.557 MiB/s=41.1 load_avg_1m=40.82 sanity=ok
+run 2 before rc=0 load=[40.82 43.00 37.07] secs=2.053 MiB/s=31.2 load_avg_1m=40.82 sanity=ok
+run 2 after rc=0 load=[40.12 42.81 37.04] secs=1.603 MiB/s=39.9 load_avg_1m=40.12 sanity=ok
+run 3 before rc=0 load=[40.12 42.81 37.04] secs=2.017 MiB/s=31.7 load_avg_1m=40.12 sanity=ok
+run 3 after rc=0 load=[40.12 42.81 37.04] secs=1.604 MiB/s=39.9 load_avg_1m=40.12 sanity=ok
+sampled before load=[38.91 42.52 36.97]
+sampled after load=[38.11 42.29 36.93]
+done
