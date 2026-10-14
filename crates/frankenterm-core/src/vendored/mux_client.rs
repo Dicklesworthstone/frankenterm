@@ -2991,6 +2991,7 @@ impl DirectMuxClient {
             };
             let read_from_top = start == scrollback_top;
             let mut out = String::new();
+            let mut replies = 0usize;
             while start < end {
                 checkpoint_mux_cx(cx, self.connection_id, "text_read_chunk")?;
                 let chunk_end = start.saturating_add(chunk_rows).min(end);
@@ -3131,7 +3132,23 @@ impl DirectMuxClient {
                         return Ok(Ok(limit));
                     }
                 }
+                replies += 1;
                 start = chunk_end;
+            }
+            // One reply is one capture under the pane's terminal lock, which
+            // the server published only after re-validating this fence's
+            // layout: it cannot tear, so it needs no final fence. Stitched
+            // chunks, and an empty read, must still prove the source stood
+            // still. A pane under continuous output never does, so a tail of
+            // it failed all three attempts even at 100 KB/s (ft-wpgjw).
+            if replies == 1 {
+                return Ok(Ok(finish_mux_text_read(
+                    out,
+                    tail,
+                    content_tail,
+                    read_from_top,
+                    total_rows,
+                )));
             }
             let phase_started = diagnostics.start_phase();
             let final_state = self.get_pane_render_state_with_cx(cx, pane_id, true).await;
@@ -8127,7 +8144,9 @@ mod tests {
                             // that rejected the previous attempt, then settles.
                             // Reusing those pre-suspension observations spends
                             // all three attempts before reaching source 5.
-                            text_read_state(count.0.min(5), 0, 3)
+                            // Two chunks: a single reply needs no final fence
+                            // (ft-wpgjw).
+                            text_read_state(count.0.min(5), 0, 600)
                         }
                         Pdu::GetLinesAtLayout(request) => {
                             let seqno = request.layout.seqno;
@@ -8150,12 +8169,19 @@ mod tests {
                         .unwrap();
                 assert_eq!(
                     client.get_text_with_cx(&cx, 9, 100_000).await.unwrap(),
-                    MuxTextReadResult::Text(text_read_expected(0..3, "current")),
+                    MuxTextReadResult::Text(text_read_expected(0..600, "current")),
                     "yield and timed retry must each start from a fresh source fence"
                 );
                 assert_eq!(
                     *counts.lock().unwrap(),
-                    (6, vec![1, 3, 5]),
+                    (
+                        6,
+                        if rejected_chunk {
+                            vec![1, 3, 5, 5]
+                        } else {
+                            vec![1, 1, 3, 3, 5, 5]
+                        }
+                    ),
                     "refresh after each suspension and retain the final success fence"
                 );
                 drop(client);
@@ -8187,7 +8213,13 @@ mod tests {
                         Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                             let mut count = seen.lock().unwrap();
                             count.0 += 1;
-                            text_read_state(if quota { 7 } else { count.0 }, 0, 3)
+                            // A changing snapshot needs two chunks: a single
+                            // reply needs no final fence (ft-wpgjw).
+                            text_read_state(
+                                if quota { 7 } else { count.0 },
+                                0,
+                                if quota { 3 } else { 600 },
+                            )
                         }
                         Pdu::GetLinesAtLayout(request) => {
                             seen.lock().unwrap().1 += 1;
@@ -8238,7 +8270,7 @@ mod tests {
                     ));
                     assert_eq!(
                         *counts.lock().unwrap(),
-                        (6, 3),
+                        (6, 6),
                         "three attempts each have independent initial and final fences"
                     );
                 }
@@ -8514,8 +8546,10 @@ mod tests {
                             let mut count = seen.lock().unwrap();
                             count.0 += 1;
                             // Three changing attempts, then one stable source
-                            // for a separate caller-initiated transaction.
-                            text_read_state(count.0.min(7), 0, 3)
+                            // for a separate caller-initiated transaction. Two
+                            // chunks: a single reply needs no final fence
+                            // (ft-wpgjw).
+                            text_read_state(count.0.min(7), 0, 600)
                         }
                         Pdu::GetLinesAtLayout(request) => {
                             let mut count = seen.lock().unwrap();
@@ -8570,7 +8604,10 @@ mod tests {
                         attempts: 3,
                     }) if phase == expected_phase
                 ));
-                assert_eq!(*counts.lock().unwrap(), (6, 3));
+                assert_eq!(
+                    *counts.lock().unwrap(),
+                    (6, if rejected_chunk { 3 } else { 6 })
+                );
                 let stats = pool.stats_with_cx(&cx).await.unwrap();
                 assert_eq!(stats.recovery_attempts, 0, "no second retry budget");
                 assert_eq!(stats.connections_created, 1);
@@ -8578,9 +8615,12 @@ mod tests {
 
                 assert_eq!(
                     pool.get_text_with_cx(&cx, 9, 100_000).await.unwrap(),
-                    MuxTextReadResult::Text(text_read_expected(0..3, "settled"))
+                    MuxTextReadResult::Text(text_read_expected(0..600, "settled"))
                 );
-                assert_eq!(*counts.lock().unwrap(), (8, 4));
+                assert_eq!(
+                    *counts.lock().unwrap(),
+                    (8, if rejected_chunk { 5 } else { 8 })
+                );
                 let stats = pool.stats_with_cx(&cx).await.unwrap();
                 assert_eq!(stats.connections_created, 1, "aligned stream stays usable");
                 assert_eq!(stats.pool.total_acquired, 2);
@@ -8592,6 +8632,52 @@ mod tests {
             };
             run_async_test(future.with_subscriber(subscriber));
         }
+    }
+
+    /// ft-wpgjw: one reply is one capture under the pane's terminal lock,
+    /// published only after the server re-validated the fence's layout, so a
+    /// single-chunk read of a pane whose source moves on every observation
+    /// needs no final fence. It used to fail all three attempts, so `ft
+    /// get-text --tail` of any continuously printing pane failed.
+    #[test]
+    fn single_reply_text_read_of_a_changing_pane_needs_no_final_fence() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let counts = Arc::new(StdMutex::new((0usize, 0usize)));
+            let seen = Arc::clone(&counts);
+            let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                Some(match pdu {
+                    Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
+                        let mut count = seen.lock().unwrap();
+                        count.0 += 1;
+                        text_read_state(count.0, 0, 3)
+                    }
+                    Pdu::GetLinesAtLayout(request) => {
+                        seen.lock().unwrap().1 += 1;
+                        text_read_reply(request, "streaming")
+                    }
+                    other => panic!("unexpected text request {other:?}"),
+                })
+            })
+            .await;
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
+            assert_eq!(
+                client.get_text_with_cx(&cx, 9, 100_000).await.unwrap(),
+                MuxTextReadResult::Text(text_read_expected(0..3, "streaming"))
+            );
+            assert_eq!(
+                *counts.lock().unwrap(),
+                (1, 1),
+                "one fence and one reply; no final fence"
+            );
+            drop(client);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
     }
 
     #[test]

@@ -6,8 +6,8 @@ Native macOS (mac-studio, M5 Ultra, load 30-50 from other agents), 2026-10-14.
 dirs and socket) whose only pane runs `producer`, waits `WARM` seconds, then
 runs `ft get-text <pane> --tail 20` `reads` times and counts refusals, plus the
 server's `owned line read failed` log lines. `rate.py N` writes N 80-column
-lines every 10 ms. `ft` is the installed d79bd79 CLI in every run; only the
-server differs. base = installed d79bd79 server; fix = main d8dc89513 plus this
+lines every 10 ms (`rate.py N T`: every T ms). In this first table `ft` is the
+installed d79bd79 CLI in every run and only the server differs. base = installed d79bd79 server; fix = main d8dc89513 plus this
 change, release build.
 
 | producer | warm | base ok/total | fix ok/total |
@@ -34,7 +34,7 @@ reads (layout check, capture, publish) and the PDU114 render-state observation
 now wait up to 1 ms with demand registered, the main-thread bound GUI paints
 already use (ft-yccm0.2.2.3). Background pushes still only try.
 
-## Remaining (separate bead)
+## Remaining (ft-wpgjw, fixed below)
 At max rate the pane's line-layout floor moves on almost every observation,
 reaching the current seqno. A temporary log showed fence seqno 5565 against
 floor 5571, then 5578 vs 5580, and so on. `scrollback_rows` stays at 3524: the
@@ -43,3 +43,29 @@ cold tier evicts its oldest rows continuously, and
 Every fenced read issued even one or two seqnos earlier is then rejected, and
 after three re-fences the client gives up with `mux_text_snapshot_changed`. At
 ≤800 KB/s per pane this does not happen.
+
+## ft-wpgjw: layout-floor churn and the client's final fence
+
+Two more changes:
+- **Server (c6cc3a7b1).** Evicting the oldest cold rows no longer moves the
+  line-layout floor unless a cold visual layout is installed.
+- **Client.** A text read served by exactly one GetLinesAtLayout reply skips
+  the final source fence. That reply was captured atomically and published
+  against the fence's layout. Stitched chunks still require it.
+
+With only the server change, capture refusals fell from 58 to 2. Reads still
+failed on the client's final fence (`seqno` must be unchanged across fence,
+read and fence, which a continuously printing pane never satisfies): 8/30 at
+max rate, 7/20 at 8 MB/s.
+
+Both changes (new `ft` and new server, release builds of main c6cc3a7b1 plus
+the client change):
+
+| producer | old ft + old server (d79bd79) | new ft + new server |
+|---|---|---|
+| max rate | 2/30 | 30/30 |
+| rate.py 1000 (8 MB/s, bursts every 10 ms) | 15/20, 20/20 | 20/20 |
+| rate.py 1 1 (one line per ms, continuous, 80 KB/s) | 18/20 | 20/20 |
+
+Coherence: at 8 MB/s each returned `--tail 20` was 20 consecutive sequence
+numbers, with no gaps or malformed rows.
