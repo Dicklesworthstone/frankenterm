@@ -248,7 +248,7 @@
         "author": "Jeff Emanuel",
         "classification": "feat",
         "committed_at": "2026-10-14T18:24:28-04:00",
-        "sha": "2787f8ce246d11db07af86ee68af0233a4fe21a4",
+        "sha": "b3e184414dc81fedb0392160745e3d2e7b71b7cf",
         "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
       },
       "name": "config",
@@ -561,7 +561,7 @@
         "author": "Jeff Emanuel",
         "classification": "feat",
         "committed_at": "2026-10-14T18:24:28-04:00",
-        "sha": "2787f8ce246d11db07af86ee68af0233a4fe21a4",
+        "sha": "b3e184414dc81fedb0392160745e3d2e7b71b7cf",
         "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
       },
       "name": "color-funcs",
@@ -578,7 +578,7 @@
         "author": "Jeff Emanuel",
         "classification": "feat",
         "committed_at": "2026-10-14T18:24:28-04:00",
-        "sha": "2787f8ce246d11db07af86ee68af0233a4fe21a4",
+        "sha": "b3e184414dc81fedb0392160745e3d2e7b71b7cf",
         "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
       },
       "name": "filesystem",
@@ -617,7 +617,7 @@
         "author": "Jeff Emanuel",
         "classification": "feat",
         "committed_at": "2026-10-14T18:24:28-04:00",
-        "sha": "2787f8ce246d11db07af86ee68af0233a4fe21a4",
+        "sha": "b3e184414dc81fedb0392160745e3d2e7b71b7cf",
         "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
       },
       "name": "procinfo-funcs",
@@ -634,7 +634,7 @@
         "author": "Jeff Emanuel",
         "classification": "feat",
         "committed_at": "2026-10-14T18:24:28-04:00",
-        "sha": "2787f8ce246d11db07af86ee68af0233a4fe21a4",
+        "sha": "b3e184414dc81fedb0392160745e3d2e7b71b7cf",
         "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
       },
       "name": "serde-funcs",
@@ -651,7 +651,7 @@
         "author": "Jeff Emanuel",
         "classification": "feat",
         "committed_at": "2026-10-14T18:24:28-04:00",
-        "sha": "2787f8ce246d11db07af86ee68af0233a4fe21a4",
+        "sha": "b3e184414dc81fedb0392160745e3d2e7b71b7cf",
         "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
       },
       "name": "share-data",
@@ -668,7 +668,7 @@
         "author": "Jeff Emanuel",
         "classification": "feat",
         "committed_at": "2026-10-14T18:24:28-04:00",
-        "sha": "2787f8ce246d11db07af86ee68af0233a4fe21a4",
+        "sha": "b3e184414dc81fedb0392160745e3d2e7b71b7cf",
         "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
       },
       "name": "spawn-funcs",
@@ -685,7 +685,7 @@
         "author": "Jeff Emanuel",
         "classification": "feat",
         "committed_at": "2026-10-14T18:24:28-04:00",
-        "sha": "2787f8ce246d11db07af86ee68af0233a4fe21a4",
+        "sha": "b3e184414dc81fedb0392160745e3d2e7b71b7cf",
         "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
       },
       "name": "ssh-funcs",
@@ -1207,7 +1207,7 @@
   },
   "fork_repo": "frankenterm",
   "fork_side_commit_total": 3187,
-  "generated_at": "2026-10-14T22:25:29.185311Z",
+  "generated_at": "2026-10-14T22:26:22.512002Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
