@@ -31,3 +31,21 @@ hypothesis is refuted. 95dc36174 stays: an opaque window now presents through an
 Metal front end already does. Its comment in `webgpu.rs` was corrected to these numbers. Defect 1's
 acceptance criterion (default decorations within 2 points of the shadow-disabled figure) is not met
 by it.
+
+## Follow-up: does the shadow cost scale with the present rate? (`ws_gpu_fps.py`, `fps-mini-old.jsonl`)
+
+Same host and windows, installed b088a4e, 2 cycles, arms in rotation: shadow on/off x `max_fps` 60/30.
+
+| arm | block 1 | block 2 | GUI fps (3 windows) |
+|-----|---------|---------|---------------------|
+| shadow, 60 | 33.3% | 35.6% | 167-168 |
+| shadow, 30 | 29.4% | 32.6% | 84 |
+| no shadow, 60 | 13.5% | 13.1% | 167-168 |
+| no shadow, 30 | 13.0% | 13.2% | 84 |
+
+(WindowServer's baseline was higher than in the first A/B: ~13% without shadows, against 6%.)
+
+Halving every window's frame rate barely moves the shadow cost (~20 points either way): three
+unsynchronized windows still change the screen on most refreshes, and the cost goes with the
+compositor's frames, not each window's. So `unfocused_max_fps` alone does not remove it; only fewer
+shadowed windows updating, or no shadow, does.
