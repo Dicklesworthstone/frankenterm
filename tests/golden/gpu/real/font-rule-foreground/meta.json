@@ -31,15 +31,15 @@
     },
     {
       "path": "/System/Library/Fonts/Hiragino Sans GB.ttc",
-      "sha256": "97e5861e11656538bed9397730d7f46e2f1b0f07692f18e87c079f7ce9ff6bdc"
+      "sha256": "ca1e9bf621f13ddc4800bfb74d0124571dfc25a1678a28d6e7dbcf39fad2504a"
     },
     {
       "path": "/System/Library/Fonts/AppleSDGothicNeo.ttc",
-      "sha256": "e33989af92c53dd2b80efd88f50c404094a046658d0e7a7692619587570e616c"
+      "sha256": "f2fe69e39644d04a9484802044836ba9d4a950aed2e32b006a3e16d5df5f49f1"
     }
   ],
-  "font_set_sha": "sha256:9b73d400a32f66d074dc9f1d66c4ad79a4508b7f18e46a0e96ea5420e0518c49",
-  "generated_at_runner": "WebGPU: name=Apple M4 Pro, device_type=IntegratedGpu, backend=Metal, vendor=0, device=0 FrankenTerm version: FrankenTerm 0.15.21 (d12642825db4c845318c09437dd1c36b4f36f2d6)",
+  "font_set_sha": "sha256:f0880cd54d9cdc264834a618c530d790906055bdbeaa989a85b18acdad790b7c",
+  "generated_at_runner": "WebGPU: name=Apple M5 Ultra, device_type=IntegratedGpu, backend=Metal, vendor=0, device=0 FrankenTerm version: FrankenTerm 0.15.21 (aba622a376579ef787421ce7cfec70c916e5d923)",
   "harness_version": 1,
   "rasterizer": "frankenterm-gui WebGpu front end; FreeType rasterizer; HarfBuzz shaper",
   "texture_format": "presented surface (RGBA8 readback)",
