@@ -25,6 +25,16 @@ app's window, AppKit reported it occluded, and it parked: 0 frames presented.
 mac-mini-old (M4, macOS 26.5, 60 Hz) with T0, 1a11ac1: parser hold p99 0.786
 ms (max 4.2-4.8 ms) in 80x12 and in 240x30 windows.
 
+**Host load caveat.** mini-max was not idle. Its mem-watch log shows a 1-minute
+load average of 11-31 on 14 cores during these runs (16:19-16:27 EDT). A later
+run of the 4525dadbe diagnostic build at load 326 (rustc builds and Blender)
+had a third of all paints wait exactly ~10 ms. Over the same run, no holder
+kept the lock that long (parser hold p99 0.8-1.6 ms), and the main thread was
+blocked 1.4-2.1 s per run. A woken main thread waited one macOS scheduling
+quantum (10 ms) for a CPU. So the paint-wait figures and the 65-200 ms parser
+holds below are upper bounds under CPU contention, not FrankenTerm's own
+latency. AC3 needs a run on an idle M4 Pro.
+
 ## Against AC3
 - **Parser hold p99 <= 2 ms: met** on the M4 Pro under T1 (0.92-1.05 ms) and
   T0 (1.05 ms). The 2.1-2.6 ms of the 2026-10-12 T0 profile runs was on

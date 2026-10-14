@@ -98,6 +98,7 @@ subprocess.run(['open', '-g', '-n', '--env', f'HOME={home}', '--env', f'FT_HA_HO
                 '--env', f'FT_CV_Y={os.environ.get("FT_CV_Y", "")}',
                 '--env', f'FT_HA_COLS={os.environ.get("FT_HA_COLS", "")}',
                 '--env', f'FT_HA_ROWS={os.environ.get("FT_HA_ROWS", "")}',
+                '--env', f'RUST_LOG={os.environ.get("RUST_LOG", "warn")}',
                 '--stderr', f'{home}/err', '-a', APP, '--args', '--config-file', CONF, 'start'],
                check=True)
 pid = None
