@@ -3,7 +3,7 @@
 - [ ] Open gitk and review changes since last release.
 
 	- [ ] Print all public API changes:
-          `git diff $(git describe | sed 's/-.*//').. src/*.h`
+          `git diff $(git describe --abbrev=0).. src/*.h`
 
     - [ ]  Document them in NEWS.
            All API and API semantic changes should be clearly marked as API additions, API changes, or API deletions.
@@ -36,6 +36,6 @@
 
 - [ ] Push the commit and tag out: `git push --follow-tags`.
 
-- [ ] There should be a GitHub release automatically created.
-      When it does, go to that release page and add description.
-      The description should be the NEWS file additions.
+- [ ] Wait a few minutes and the CI job will create a GitHub release automatically, and it will use the NEWS file additions for release description.
+      Take a look at the release and make any needed edits needed.
+      The release should also automatically include Windows binaries, but they take a bit longer to build and upload.

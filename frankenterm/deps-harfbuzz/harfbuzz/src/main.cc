@@ -43,6 +43,7 @@
 #endif
 
 #if !defined(HB_NO_COLOR) && !defined(HB_NO_DRAW)
+#ifndef HB_NO_SVG
 static void
 svg_dump (hb_face_t *face, unsigned face_index)
 {
@@ -72,6 +73,7 @@ svg_dump (hb_face_t *face, unsigned face_index)
     hb_blob_destroy (blob);
   }
 }
+#endif
 
 /* _png API is so easy to use unlike the below code, don't get confused */
 static void
@@ -228,9 +230,10 @@ layered_glyph_dump (hb_font_t *font, hb_draw_funcs_t *funcs, unsigned face_index
 	snprintf (output_path, sizeof output_path, "out/colr-%u-%u-%u.svg", gid, palette, face_index);
 	FILE *f = fopen (output_path, "wb");
 	fprintf (f, "<svg xmlns=\"http://www.w3.org/2000/svg\""
-		    " viewBox=\"%d %d %d %d\">\n",
+		    " viewBox=\"%d %d %lld %lld\">\n",
 		    extents.x_bearing, 0,
-		    extents.x_bearing + extents.width, -extents.height);
+		    (long long) extents.x_bearing + extents.width,
+		    -(long long) extents.height);
 	draw_data_t draw_data;
 	draw_data.ascender = extents.y_bearing;
 	draw_data.f = f;
@@ -278,9 +281,10 @@ dump_glyphs (hb_font_t *font, hb_draw_funcs_t *funcs, unsigned face_index)
     snprintf (output_path, sizeof output_path, "out/%u-%u.svg", face_index, gid);
     FILE *f = fopen (output_path, "wb");
     fprintf (f, "<svg xmlns=\"http://www.w3.org/2000/svg\""
-		" viewBox=\"%d %d %d %d\"><path d=\"",
+		" viewBox=\"%d %d %lld %lld\"><path d=\"",
 		extents.x_bearing, 0,
-		extents.x_bearing + extents.width, font_extents.ascender - font_extents.descender);
+		(long long) extents.x_bearing + extents.width,
+		(long long) font_extents.ascender - font_extents.descender);
     draw_data_t draw_data;
     draw_data.ascender = font_extents.ascender;
     draw_data.f = f;
@@ -327,9 +331,11 @@ dump_glyphs (hb_blob_t *blob, const char *font_name)
       printf ("Dumping png (CBDT/sbix)...\n");
     png_dump (face, face_index);
 
+#ifndef HB_NO_SVG
     if (hb_ot_color_has_svg (face))
       printf ("Dumping svg (SVG )...\n");
     svg_dump (face, face_index);
+#endif
 
     if (hb_ot_color_has_layers (face) && hb_ot_color_has_palettes (face))
       printf ("Dumping layered color glyphs (COLR/CPAL)...\n");

@@ -1,12 +1,13 @@
 project('harfbuzz', ['c', 'cpp'],
   meson_version: '>= 0.60.0',
-  version: '11.2.1',
+  version: '14.6.0',
   default_options: [
     'cpp_eh=none',          # Just to support msvc, we are passing -fno-exceptions also anyway
     # 'cpp_rtti=false',     # Do NOT enable, wraps inherit it and ICU needs RTTI
     'cpp_std=c++11',
     'wrap_mode=nofallback', # Use --wrap-mode=default to revert, https://github.com/harfbuzz/harfbuzz/pull/2548
     'buildtype=debugoptimized',
+    'b_ndebug=if-release',  # Disable asserts in release builds
   ],
 )
 
@@ -15,9 +16,7 @@ cairo_min_version = '>= 1.10.0'
 chafa_min_version = '>= 1.6.0'
 icu_min_version = '>= 49.0'
 graphite2_min_version = '>= 1.2.0'
-
-freetype_min_version_actual = '>= 2.4.2'
-freetype_min_version = '>= 12.0.6'    # Corresponds to `freetype_min_version_actual`
+freetype_min_version = '>= 20.0.14'
 
 hb_version_arr = meson.project_version().split('.')
 hb_version_major = hb_version_arr[0].to_int()
@@ -31,7 +30,6 @@ hb_libtool_version_info = '@0@:0:@0@'.format(hb_version_int)
 pkgmod = import('pkgconfig')
 cpp = meson.get_compiler('cpp')
 null_dep = dependency('', required: false)
-
 
 # Includes Microsoft Clang compiler with GNU arguments, see
 # https://github.com/harfbuzz/harfbuzz/pull/4394
@@ -103,45 +101,14 @@ check_funcs = [
   ['isatty', {'prefix': '#include <unistd.h>'}],
   ['uselocale', {'prefix': '#include <locale.h>'}],
   ['newlocale', {'prefix': '#include <locale.h>'}],
+  ['localeconv_l', {'prefix': '#include <locale.h>'}],
+  ['sincos', {'prefix': '#define _GNU_SOURCE\n#include <math.h>'}],
   ['sincosf', {'prefix': '#define _GNU_SOURCE\n#include <math.h>'}],
 ]
 
 m_dep = cpp.find_library('m', required: false)
 
-# Painful hack to handle multiple dependencies but also respect options
-if get_option('freetype').disabled()
-  freetype_dep = dependency('', required: false)
-else
-  # Sadly, FreeType's versioning schemes are different between pkg-config and CMake
-
-  # Try pkg-config name
-  freetype_dep = dependency('freetype2',
-                            version: freetype_min_version,
-                            method: 'pkg-config',
-                            required: false,
-                            allow_fallback: false)
-  if not freetype_dep.found()
-    # Try cmake name
-    freetype_dep = dependency('Freetype',
-                              version: freetype_min_version_actual,
-                              method: 'cmake',
-                              required: false,
-                              allow_fallback: false)
-    # Subproject fallback
-    if not freetype_dep.found()
-      freetype_proj = subproject('freetype2',
-                                version: freetype_min_version_actual,
-                                required: get_option('freetype'),
-                                default_options: ['harfbuzz=disabled'])
-      if freetype_proj.found()
-        freetype_dep = freetype_proj.get_variable('freetype_dep')
-      else
-        freetype_dep = dependency('', required: false)
-      endif
-    endif
-  endif
-endif
-
+freetype_dep = dependency('freetype2', version: freetype_min_version, required: get_option('freetype'), default_options: ['harfbuzz=disabled'])
 glib_dep = dependency('glib-2.0', version: glib_min_version, required: get_option('glib'))
 gobject_dep = dependency('gobject-2.0', version: glib_min_version, required: get_option('gobject'))
 graphite2_dep = dependency('graphite2', version: graphite2_min_version, required: get_option('graphite2'))
@@ -150,13 +117,7 @@ wasm_dep = cpp.find_library('iwasm', required: get_option('wasm'))
 # How to check whether iwasm was built, and hence requires, LLVM?
 #llvm_dep = cpp.find_library('LLVM-15', required: get_option('wasm'))
 
-# pkg-config: icu-uc, cmake: ICU but with components
-icu_dep = dependency('icu-uc', 'ICU',
-                          version: icu_min_version,
-                          components: 'uc',
-                          required: get_option('icu'),
-                          allow_fallback: true)
-
+icu_dep = dependency('icu-uc', version: icu_min_version, required: get_option('icu'))
 if icu_dep.found() and icu_dep.version().version_compare('>=75.1') and (get_option('cpp_std') == 'c++11' or get_option('cpp_std') == 'c++14')
   cpp17_arg = cpp.get_argument_syntax() == 'msvc' ? '/std:c++17' : '-std=c++17'
   add_project_arguments(cpp17_arg, language: 'cpp')
@@ -198,6 +159,8 @@ if not get_option('cairo').disabled()
 endif
 
 chafa_dep = dependency('chafa', version: chafa_min_version, required: get_option('chafa'))
+png_dep = dependency('libpng', required: get_option('png'))
+zlib_dep = dependency('zlib', required: get_option('zlib'))
 
 fontations_dep_found = false
 if get_option('fontations').enabled()
@@ -205,10 +168,15 @@ if get_option('fontations').enabled()
   fontations_dep_found = true
 endif
 
-harfruzz_dep_found = false
-if get_option('harfruzz').enabled()
+harfrust_dep_found = false
+if get_option('harfrust').enabled()
   add_languages(['rust'], native: false, required : true)
-  harfruzz_dep_found = true
+  harfrust_dep_found = true
+endif
+
+kbts_dep = null_dep
+if get_option('kbts').enabled()
+  kbts_dep = subproject('kbts').get_variable('kbts_dep')
 endif
 
 conf = configuration_data()
@@ -252,12 +220,24 @@ if chafa_dep.found()
   conf.set('HAVE_CHAFA', 1)
 endif
 
+if png_dep.found()
+  conf.set('HAVE_PNG', 1)
+endif
+
+if zlib_dep.found()
+  conf.set('HAVE_ZLIB', 1)
+endif
+
 if fontations_dep_found
   conf.set('HAVE_FONTATIONS', 1)
 endif
 
-if harfruzz_dep_found
-  conf.set('HAVE_HARFRUZZ', 1)
+if harfrust_dep_found
+  conf.set('HAVE_HARFRUST', 1)
+endif
+
+if kbts_dep.found()
+  conf.set('HAVE_KBTS', 1)
 endif
 
 if wasm_dep.found()
@@ -279,6 +259,18 @@ endif
 
 if get_option('experimental_api')
   conf.set('HB_EXPERIMENTAL_API', 1)
+endif
+
+if not get_option('raster').disabled()
+  conf.set('HAVE_RASTER', 1)
+endif
+
+if not get_option('vector').disabled()
+  conf.set('HAVE_VECTOR', 1)
+endif
+
+if not get_option('subset').disabled()
+  conf.set('HAVE_SUBSET', 1)
 endif
 
 if freetype_dep.found()
@@ -365,9 +357,6 @@ if host_machine.system() != 'windows'
   endif
 endif
 
-conf.set_quoted('PACKAGE_NAME', 'HarfBuzz')
-conf.set_quoted('PACKAGE_VERSION', meson.project_version())
-
 foreach check : check_headers
   name = check[0]
 
@@ -453,7 +442,17 @@ endif
 configure_file(output: 'config.h', configuration: conf)
 
 alias_target('lib', libharfbuzz)
-alias_target('libs', libharfbuzz, libharfbuzz_subset)
+libs = [libharfbuzz]
+if not get_option('subset').disabled()
+  libs += [libharfbuzz_subset]
+endif
+if not get_option('raster').disabled()
+  libs += [libharfbuzz_raster]
+endif
+if not get_option('vector').disabled()
+  libs += [libharfbuzz_vector]
+endif
+alias_target('libs', libs)
 
 # Re glib, see https://github.com/harfbuzz/harfbuzz/issues/4153#issuecomment-2646347531
 add_test_setup('default',
@@ -479,26 +478,38 @@ build_summary = {
      'FreeType': conf.get('HAVE_FREETYPE', 0) == 1,
      'Fontations': conf.get('HAVE_FONTATIONS', 0) == 1,
     },
-  'Dependencies used for command-line utilities':
-    {'Cairo': conf.get('HAVE_CAIRO', 0) == 1,
-     'Chafa': conf.get('HAVE_CHAFA', 0) == 1,
-    },
   'Additional shapers':
     {'Graphite2': conf.get('HAVE_GRAPHITE2', 0) == 1,
      'WebAssembly (experimental)': conf.get('HAVE_WASM', 0) == 1,
     },
-  'Platform shapers (not normally needed)':
+  'Platform / other shapers (not normally needed)':
     {'CoreText': conf.get('HAVE_CORETEXT', 0) == 1,
      'DirectWrite': conf.get('HAVE_DIRECTWRITE', 0) == 1,
      'GDI/Uniscribe': (conf.get('HAVE_GDI', 0) == 1) and (conf.get('HAVE_UNISCRIBE', 0) == 1),
-     'HarfRuzz': conf.get('HAVE_HARFRUZZ', 0) == 1,
+     'HarfRust': conf.get('HAVE_HARFRUST', 0) == 1,
+     'kbts': conf.get('HAVE_KBTS', 0) == 1,
+    },
+  'Additional libraries':
+    {'Subset': not get_option('subset').disabled(),
+     'Raster (experimental)': not get_option('raster').disabled(),
+     'Vector (experimental)': not get_option('vector').disabled(),
+     'GPU (experimental)': not get_option('gpu').disabled(),
+    },
+  'Dependencies used by additional libraries':
+    {'PNG': conf.get('HAVE_PNG', 0) == 1,
+     'Zlib': conf.get('HAVE_ZLIB', 0) == 1,
     },
   'Other features':
-    {'Documentation': conf.get('HAVE_GTK_DOC', 0) == 1,
+    {'Utilities': not get_option('utilities').disabled(),
+     'Documentation': conf.get('HAVE_GTK_DOC', 0) == 1,
      'GObject bindings': conf.get('HAVE_GOBJECT', 0) == 1,
      'Cairo integration': conf.get('HAVE_CAIRO', 0) == 1,
      'Introspection': conf.get('HAVE_INTROSPECTION', 0) == 1,
      'Experimental APIs': conf.get('HB_EXPERIMENTAL_API', 0) == 1,
+    },
+  'Dependencies used by command-line utilities':
+    {'Cairo': conf.get('HAVE_CAIRO', 0) == 1,
+     'Chafa': conf.get('HAVE_CHAFA', 0) == 1,
     },
   'Testing':
     {'Tests': get_option('tests').enabled(),

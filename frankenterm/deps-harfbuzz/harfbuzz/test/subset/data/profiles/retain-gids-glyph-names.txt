@@ -1,2 +1,0 @@
---glyph-names
---retain-gids

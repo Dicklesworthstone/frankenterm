@@ -5,14 +5,15 @@ namespace OT {
 namespace Layout {
 namespace GPOS_impl {
 
+template <typename Types, typename RowCount=typename Types::HBUINT>
 struct AnchorMatrix
 {
-  HBUINT16      rows;                   /* Number of rows */
-  UnsizedArrayOf<Offset16To<Anchor, AnchorMatrix>>
+  RowCount      rows;                   /* Number of rows */
+  UnsizedArrayOf<typename Types::template OffsetTo<Anchor, AnchorMatrix>>
                 matrixZ;                /* Matrix of offsets to Anchor tables--
                                          * from beginning of AnchorMatrix table */
   public:
-  DEFINE_SIZE_ARRAY (2, matrixZ);
+  DEFINE_SIZE_ARRAY (sizeof (RowCount), matrixZ);
 
   bool sanitize (hb_sanitize_context_t *c, unsigned int cols) const
   {
@@ -76,6 +77,13 @@ struct AnchorMatrix
     }
 
     return_trace (true);
+  }
+
+  bool offset_is_null (unsigned row, unsigned col, unsigned num_cols) const
+  {
+    if (unlikely (row >= rows || col >= num_cols)) return true;
+    auto &offset = matrixZ[row * num_cols + col];
+    return offset.is_null ();
   }
 };
 

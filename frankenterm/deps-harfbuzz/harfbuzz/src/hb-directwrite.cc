@@ -47,13 +47,13 @@ static struct hb_directwrite_global_lazy_loader_t : hb_lazy_loader_t<hb_directwr
 {
   static hb_directwrite_global_t * create ()
   {
-    hb_directwrite_global_t *global = new hb_directwrite_global_t;
+    hb_directwrite_global_t *global = hb_directwrite_object_create<hb_directwrite_global_t> ();
 
     if (unlikely (!global))
       return nullptr;
     if (unlikely (!global->success))
     {
-      delete global;
+      hb_directwrite_object_destroy (global);
       return nullptr;
     }
 
@@ -63,7 +63,7 @@ static struct hb_directwrite_global_lazy_loader_t : hb_lazy_loader_t<hb_directwr
   }
   static void destroy (hb_directwrite_global_t *l)
   {
-    delete l;
+    hb_directwrite_object_destroy (l);
   }
   static hb_directwrite_global_t * get_null ()
   {
@@ -116,7 +116,9 @@ dw_face_create (hb_blob_t *blob, unsigned index)
   if (unlikely (!global))
     FAIL ("Couldn't load DirectWrite!");
 
-  DWriteFontFileStream *fontFileStream = new DWriteFontFileStream (blob);
+  DWriteFontFileStream *fontFileStream = hb_directwrite_object_create<DWriteFontFileStream> (blob);
+  if (unlikely (!fontFileStream))
+    FAIL ("Failed to allocate font file stream!");
 
   IDWriteFontFile *fontFile;
   auto hr = global->dwriteFactory->CreateCustomFontFileReference (&fontFileStream->fontFileKey, sizeof (fontFileStream->fontFileKey),
@@ -162,6 +164,56 @@ _hb_directwrite_table_data_release (void *data)
 }
 
 static hb_blob_t *
+_hb_directwrite_get_file_blob (IDWriteFontFace *dw_face)
+{
+  UINT32 file_count;
+  if (FAILED (dw_face->GetFiles(&file_count, NULL)))
+    return nullptr;
+
+  hb_vector_t<IDWriteFontFile *> files;
+  if (unlikely (!files.resize_exact (file_count)))
+    return nullptr;
+  if (FAILED (dw_face->GetFiles(&file_count, files.arrayZ)))
+    return nullptr;
+
+  hb_blob_t *blob = nullptr;
+  for (UINT32 i = 0; i < file_count; i++)
+  {
+    LPCVOID reference_key;
+    UINT32 reference_key_size;
+    if (FAILED (files[i]->GetReferenceKey(&reference_key, &reference_key_size)))
+      continue;
+
+    IDWriteFontFileLoader *loader;
+    if (FAILED (files[i]->GetLoader(&loader)))
+      continue;
+    
+    IDWriteFontFileStream *stream;
+    if (FAILED (loader->CreateStreamFromKey (reference_key, reference_key_size, &stream)))
+    {
+      loader->Release ();
+      continue;
+    }
+
+    UINT64 file_size;
+    const void *fragment;
+    void *context;
+    if (FAILED (stream->GetFileSize(&file_size)) ||
+        FAILED (stream->ReadFileFragment (&fragment, 0, file_size, &context)))
+    {
+      loader->Release ();
+      continue;
+    }
+    blob = hb_blob_create ((const char *) fragment, file_size, HB_MEMORY_MODE_DUPLICATE, NULL, NULL);
+    stream->ReleaseFileFragment (context);
+    loader->Release ();
+    break;
+  }
+
+  return blob;
+}
+
+static hb_blob_t *
 _hb_directwrite_reference_table (hb_face_t *face HB_UNUSED, hb_tag_t tag, void *user_data)
 {
   IDWriteFontFace *dw_face = ((IDWriteFontFace *) user_data);
@@ -169,6 +221,9 @@ _hb_directwrite_reference_table (hb_face_t *face HB_UNUSED, hb_tag_t tag, void *
   uint32_t length;
   void *table_context;
   BOOL exists;
+  if (tag == HB_TAG_NONE)
+    return _hb_directwrite_get_file_blob (dw_face);
+
   if (FAILED (dw_face->TryGetFontTable (hb_uint32_swap (tag), &data,
 					&length, &table_context, &exists)))
     return nullptr;
@@ -260,7 +315,7 @@ hb_directwrite_face_create_from_file_or_fail (const char   *file_name,
  * Creates an #hb_face_t face object from the specified
  * blob and face index.
  *
- * This is similar in functionality to hb_face_create_from_blob_or_fail(),
+ * This is similar in functionality to hb_face_create_or_fail(),
  * but uses the DirectWrite library for loading the font data.
  *
  * Return value: (transfer full): The new face object, or `NULL` if
@@ -397,6 +452,7 @@ hb_directwrite_font_get_dw_font_face (hb_font_t *font)
   return (IDWriteFontFace *) (const void *) font->data.directwrite;
 }
 
+#ifndef HB_DISABLE_DEPRECATED
 
 /**
 * hb_directwrite_font_get_dw_font:
@@ -414,5 +470,7 @@ hb_directwrite_font_get_dw_font (hb_font_t *font)
 {
   return nullptr;
 }
+
+#endif
 
 #endif

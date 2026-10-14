@@ -7,32 +7,27 @@ namespace OT {
 namespace Layout {
 namespace GPOS_impl {
 
-typedef AnchorMatrix BaseArray;         /* base-major--
-                                         * in order of BaseCoverage Index--,
-                                         * mark-minor--
-                                         * ordered by class--zero-based. */
-
 template <typename Types>
 struct MarkBasePosFormat1_2
 {
   protected:
   HBUINT16      format;                 /* Format identifier--format = 1 */
-  typename Types::template OffsetTo<Coverage>
+  typename Types::template LOffsetTo<Coverage>
                 markCoverage;           /* Offset to MarkCoverage table--from
                                          * beginning of MarkBasePos subtable */
-  typename Types::template OffsetTo<Coverage>
+  typename Types::template LOffsetTo<Coverage>
                 baseCoverage;           /* Offset to BaseCoverage table--from
                                          * beginning of MarkBasePos subtable */
   HBUINT16      classCount;             /* Number of classes defined for marks */
-  typename Types::template OffsetTo<MarkArray>
+  typename Types::template LOffsetTo<MarkArray<Types>>
                 markArray;              /* Offset to MarkArray table--from
                                          * beginning of MarkBasePos subtable */
-  typename Types::template OffsetTo<BaseArray>
+  typename Types::template LOffsetTo<AnchorMatrix<Types>>
                 baseArray;              /* Offset to BaseArray table--from
                                          * beginning of MarkBasePos subtable */
 
   public:
-  DEFINE_SIZE_STATIC (4 + 4 * Types::size);
+  DEFINE_SIZE_STATIC (4 + 4 * Types::LOffset::static_size);
 
     bool sanitize (hb_sanitize_context_t *c) const
   {
@@ -57,7 +52,7 @@ struct MarkBasePosFormat1_2
     + hb_zip (this+markCoverage, this+markArray)
     | hb_filter (c->glyph_set, hb_first)
     | hb_map (hb_second)
-    | hb_apply ([&] (const MarkRecord& record) { record.collect_variation_indices (c, &(this+markArray)); })
+    | hb_apply ([&] (const MarkRecord<Types>& record) { record.collect_variation_indices (c, &(this+markArray)); })
     ;
 
     hb_map_t klass_mapping;
@@ -87,6 +82,9 @@ struct MarkBasePosFormat1_2
     if (unlikely (!(this+markCoverage).collect_coverage (c->input))) return;
     if (unlikely (!(this+baseCoverage).collect_coverage (c->input))) return;
   }
+
+  void collect_second_glyphs (hb_set_digest_t *digest) const
+  { (this+baseCoverage).collect_coverage (digest); }
 
   const Coverage &get_coverage () const { return this+markCoverage; }
 
@@ -209,19 +207,22 @@ struct MarkBasePosFormat1_2
     ;
 
     new_coverage.reset ();
-    + base_iter
-    | hb_map (hb_first)
-    | hb_map (glyph_map)
-    | hb_sink (new_coverage)
-    ;
-
-    if (!out->baseCoverage.serialize_serialize (c->serializer, new_coverage.iter ()))
-      return_trace (false);
-
     hb_sorted_vector_t<unsigned> base_indexes;
-    for (const unsigned row : + base_iter
-                              | hb_map (hb_second))
+    auto &base_array = (this+baseArray);
+    for (const auto _ : + base_iter)
     {
+      unsigned row = _.second;
+      bool non_empty = + hb_range ((unsigned) classCount)
+                       | hb_filter (klass_mapping)
+                       | hb_map ([&] (const unsigned col) { return !base_array.offset_is_null (row, col, (unsigned) classCount); })
+                       | hb_any
+                       ;
+
+      if (!non_empty) continue;
+      
+      hb_codepoint_t new_g = glyph_map.get ( _.first);
+      new_coverage.push (new_g);
+
       + hb_range ((unsigned) classCount)
       | hb_filter (klass_mapping)
       | hb_map ([&] (const unsigned col) { return row * (unsigned) classCount + col; })
@@ -229,8 +230,12 @@ struct MarkBasePosFormat1_2
       ;
     }
 
+    if (!new_coverage) return_trace (false);
+    if (!out->baseCoverage.serialize_serialize (c->serializer, new_coverage.iter ()))
+      return_trace (false);
+
     return_trace (out->baseArray.serialize_subset (c, baseArray, this,
-						   base_iter.len (),
+						   new_coverage.length,
 						   base_indexes.iter ()));
   }
 };

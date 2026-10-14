@@ -8,11 +8,12 @@ namespace OT {
 namespace Layout {
 namespace GPOS_impl {
 
-struct SinglePosFormat1 : ValueBase
+template <typename Types>
+struct SinglePosFormat1_3 : ValueBase
 {
   protected:
   HBUINT16      format;                 /* Format identifier--format = 1 */
-  Offset16To<Coverage>
+  typename Types::template LOffsetTo<Coverage>
                 coverage;               /* Offset to Coverage table--from
                                          * beginning of subtable */
   ValueFormat   valueFormat;            /* Defines the types of data in the
@@ -21,7 +22,7 @@ struct SinglePosFormat1 : ValueBase
                                          * value(s)--applied to all glyphs in
                                          * the Coverage table */
   public:
-  DEFINE_SIZE_ARRAY (6, values);
+  DEFINE_SIZE_ARRAY (2 + Types::LOffset::static_size + ValueFormat::static_size, values);
 
   bool sanitize (hb_sanitize_context_t *c) const
   {
@@ -100,7 +101,7 @@ struct SinglePosFormat1 : ValueBase
     if (likely (index == NOT_COVERED)) return false;
 
     /* This is ugly... */
-    hb_buffer_t buffer;
+    hb_buffer_t buffer {};
     buffer.props.direction = direction;
     OT::hb_ot_apply_context_t c (1, font, &buffer, table_blob);
 
