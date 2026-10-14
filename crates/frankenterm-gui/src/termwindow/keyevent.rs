@@ -467,7 +467,7 @@ impl super::TermWindow {
                         } else {
                             pane.key_up(term_key, tw_raw_modifiers)
                         };
-                        note_key_send_result(&pane, &res);
+                        note_key_send_result(pane, &res);
                         did_encode = res.is_ok();
                     };
 
