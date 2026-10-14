@@ -5709,6 +5709,9 @@ impl TermWindow {
         }
 
         let dimensions = self.dimensions;
+        // A reload can change the window's translucency; the surface follows
+        // it at the configure that precedes acquisition.
+        webgpu.set_opaque_content(background::window_content_is_opaque(&self.config));
         let acquired = match Self::acquire_webgpu_frame_with_repair(&webgpu, dimensions) {
             Ok(acquired) => acquired,
             Err(failure) => {

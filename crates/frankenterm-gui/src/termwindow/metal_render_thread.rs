@@ -612,8 +612,7 @@ impl TermWindow {
             clear,
             grid: GridExtent::new(self.terminal_size.rows, self.terminal_size.cols),
             font_scale: self.fonts.get_font_scale(),
-            opaque: self.window_background.is_empty()
-                && self.config.window_background_opacity >= 1.0,
+            opaque: super::background::window_content_is_opaque(&self.config),
         }
     }
 
