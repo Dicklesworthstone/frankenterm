@@ -28,6 +28,10 @@ crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(outside.path(
 # is #[cfg(unix)]; the symlink is beyond the bounded source lookback.
 crates/frankenterm-core/src/recorder_storage.rs	std::os::unix::fs::symlink(&victim, &staging).unwrap();
 crates/frankenterm-core/src/scrollback_mmap_writer.rs	use std::os::unix::fs::PermissionsExt as _;
+# ft-r937n: both lines are inside `#[cfg(unix)] mod unix` (system_symlinks.rs lines 43-384);
+# the module gate precedes them by more than the eight-line lookback.
+crates/frankenterm-core/src/system_symlinks.rs	std::os::unix::fs::symlink(&target, &link).unwrap();
+crates/frankenterm-core/src/system_symlinks.rs	use std::os::unix::fs::MetadataExt as _;
 # ft-xxfwy.48: inside #[cfg(unix)] mission_store_late_leaf_attack_refuses_and_releases_lock_registry;
 # the function-level gate precedes this closure by more than the eight-line lookback.
 crates/frankenterm-core/src/tx_execution.rs	std::os::unix::fs::symlink(&retained, &path).unwrap();
