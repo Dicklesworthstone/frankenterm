@@ -5478,9 +5478,11 @@ impl LocalPane {
         let mut observation = observation
             .try_lock()
             .ok_or_else(|| metadata_busy(MetadataRefusalStage::LayoutObservation))?;
+        // Eviction of the oldest cold rows leaves retained coordinates alone
+        // and no longer moves the floor (ft-wpgjw).
         let Some(source_changed) = term
             .screen_mut()
-            .refresh_cold_source_observation()
+            .refresh_cold_source_coordinates()
             .inspect_err(|_| {
                 record_metadata_refusal(MetadataRefusalStage::SinkInterval);
             })?
@@ -17127,6 +17129,58 @@ mod tests {
                 name
             );
         }
+    }
+
+    /// ft-wpgjw: a full scrollback evicts its oldest cold rows on every spill.
+    /// That leaves retained rows' coordinates alone, so it must not move the
+    /// line-layout floor: under heavy output the floor reached the current
+    /// sequence on almost every observation and no layout-fenced read (`ft
+    /// get-text`) survived its round trip. Losing the newest rows still moves
+    /// it.
+    #[test]
+    fn evicting_oldest_cold_rows_keeps_the_line_layout_floor() {
+        let sink = Arc::new(ColdResizeTestSink::default());
+        let mut terminal = Terminal::new(
+            term_size(20, 2),
+            Arc::new(ColdResizeTestConfig(sink.clone())),
+            "FrankenTerm",
+            "layout-floor-eviction",
+            Box::new(Vec::new()),
+        );
+        terminal.advance_bytes(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\n");
+        let pane = LocalPane::new(
+            723,
+            terminal,
+            Box::new(KillCountingChild {
+                kills: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            [0x83; 16],
+            "layout-floor-eviction".to_string(),
+        );
+        let (floor, dimensions) = pane.get_line_layout().unwrap().unwrap();
+        assert!(sink.rows.lock().1.len() >= 3, "output spilled cold rows");
+        {
+            let mut rows = sink.rows.lock();
+            let oldest = *rows.1.first_key_value().unwrap().0;
+            rows.1.remove(&oldest);
+        }
+        let (after, after_dimensions) = pane.get_line_layout().unwrap().unwrap();
+        assert_eq!(after, floor, "oldest-row eviction keeps the floor");
+        assert_eq!(
+            after_dimensions.scrollback_top,
+            dimensions.scrollback_top + 1,
+            "the geometry still follows the eviction"
+        );
+        {
+            let mut rows = sink.rows.lock();
+            let newest = *rows.1.last_key_value().unwrap().0;
+            rows.1.remove(&newest);
+        }
+        let (truncated, _) = pane.get_line_layout().unwrap().unwrap();
+        assert!(truncated > floor, "losing the newest row moves the floor");
     }
 
     #[test]

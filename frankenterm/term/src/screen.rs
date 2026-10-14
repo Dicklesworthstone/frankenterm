@@ -302,6 +302,16 @@ impl std::fmt::Display for ColdReadMetadataBusy {
 
 impl std::error::Error for ColdReadMetadataBusy {}
 
+/// How the cold source moved since the previous observation.
+#[cfg(feature = "use_serde")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColdSourceChange {
+    Unchanged,
+    /// Only the oldest rows left; every retained row is still retained.
+    OldestEvicted,
+    Changed,
+}
+
 /// The captured source interval was invalidated before historical IO began.
 /// This does not classify an IO, authentication, or decoding failure as transient.
 #[cfg(feature = "use_serde")]
@@ -5174,38 +5184,79 @@ impl Screen {
     pub fn refresh_cold_source_observation(
         &mut self,
     ) -> Result<Option<bool>, ColdReadMetadataBusy> {
+        Ok(self
+            .refresh_cold_source()?
+            .map(|change| change != ColdSourceChange::Unchanged))
+    }
+
+    /// [`Self::refresh_cold_source_observation`], reporting only changes that
+    /// can move the coordinates of retained rows (ft-wpgjw). Evicting the
+    /// oldest cold rows cannot: retained rows keep their stable index, and
+    /// reads validate retention of their exact rows separately. Once the
+    /// scrollback is full every spill evicts, so counting eviction as a change
+    /// moved a pane's line-layout floor on almost every observation under
+    /// heavy output and no layout-fenced read survived its round trip. An
+    /// installed cold visual layout is anchored at the interval's start, so
+    /// while one exists eviction still counts.
+    #[cfg(feature = "use_serde")]
+    pub fn refresh_cold_source_coordinates(
+        &mut self,
+    ) -> Result<Option<bool>, ColdReadMetadataBusy> {
+        Ok(self.refresh_cold_source()?.map(|change| match change {
+            ColdSourceChange::Unchanged => false,
+            ColdSourceChange::OldestEvicted => self.cold_visual_layout_for_comparison().is_some(),
+            ColdSourceChange::Changed => true,
+        }))
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn refresh_cold_source(&mut self) -> Result<Option<ColdSourceChange>, ColdReadMetadataBusy> {
         let Some(sink) = self
             .config
             .scrollback_spill_sink()
             .filter(|_| self.allow_scrollback)
         else {
-            return Ok(Some(self.cold_source_observation.take().is_some()));
+            return Ok(Some(if self.cold_source_observation.take().is_some() {
+                ColdSourceChange::Changed
+            } else {
+                ColdSourceChange::Unchanged
+            }));
         };
         let now = match sink.try_capture_scrollback_interval() {
             crate::config::ScrollbackIntervalCapture::Ready(now) => now,
             crate::config::ScrollbackIntervalCapture::Busy => return Err(ColdReadMetadataBusy),
             crate::config::ScrollbackIntervalCapture::Unavailable => return Ok(None),
         };
-        let changed = self
-            .cold_source_observation
-            .as_ref()
-            .is_none_or(|(before_sink, before)| {
-                !Arc::ptr_eq(before_sink, &sink)
-                    || match (before.rows(), now.rows()) {
-                        (Some(before_rows), Some(now_rows)) => {
-                            before_rows.start != now_rows.start
-                                || now_rows.end < before_rows.end
-                                || !now.retains(before, before_rows)
+        let change = match self.cold_source_observation.as_ref() {
+            Some((before_sink, before)) if Arc::ptr_eq(before_sink, &sink) => {
+                match (before.rows(), now.rows()) {
+                    (Some(before_rows), Some(now_rows)) => {
+                        if before_rows.start == now_rows.start
+                            && now_rows.end >= before_rows.end
+                            && now.retains(before, before_rows.clone())
+                        {
+                            ColdSourceChange::Unchanged
+                        } else if before_rows.start < now_rows.start
+                            && now_rows.start < before_rows.end
+                            && now_rows.end >= before_rows.end
+                            && now.retains(before, now_rows.start..before_rows.end)
+                        {
+                            ColdSourceChange::OldestEvicted
+                        } else {
+                            ColdSourceChange::Changed
                         }
-                        (None, None) => false,
-                        _ => true,
                     }
-            });
-        if changed {
+                    (None, None) => ColdSourceChange::Unchanged,
+                    _ => ColdSourceChange::Changed,
+                }
+            }
+            _ => ColdSourceChange::Changed,
+        };
+        if change != ColdSourceChange::Unchanged {
             self.cold_index_budget_exhausted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         }
         self.cold_source_observation = Some((sink, now));
-        Ok(Some(changed))
+        Ok(Some(change))
     }
 
     /// Authoritative scrollback geometry derived from the active cold observation,
@@ -14417,6 +14468,15 @@ pub(crate) mod tests {
             !screen.validates_line_read(&older),
             "retained source is not authority to roll back a shifted layout"
         );
+        // ft-wpgjw: the installed reflowed layout is anchored at the oldest
+        // cold row, so evicting that row is a coordinate change.
+        assert_eq!(screen.refresh_cold_source_coordinates(), Ok(Some(false)));
+        sink.state.lock().unwrap().1.remove(&0);
+        assert_eq!(
+            screen.refresh_cold_source_coordinates(),
+            Ok(Some(true)),
+            "eviction under an installed cold visual layout moves coordinates"
+        );
     }
 
     #[test]
@@ -21739,5 +21799,73 @@ pub(crate) mod tests {
         );
         assert_eq!(unavail_screen.refresh_cold_source_observation(), Ok(None));
         assert_eq!(unavail_screen.observed_scrollback_geometry(), None);
+    }
+
+    /// ft-wpgjw: evicting the oldest cold rows keeps every retained row's
+    /// stable coordinates, so without an installed cold visual layout it is
+    /// not a coordinate change; it still refreshes the observation (geometry,
+    /// index budget). Losing newer rows or the lineage is a change.
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn evicting_oldest_cold_rows_is_not_a_coordinate_change() {
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        let source = Line::from_text("cold", &CellAttributes::blank(), 1, None);
+        {
+            let mut rows = sink.rows.lock().unwrap();
+            for r in -6..0 {
+                rows.insert(r, source.clone());
+            }
+        }
+        let mut screen = test_screen_with_config(
+            3,
+            8,
+            96,
+            TestTermConfig {
+                cold_sink: Some(sink.clone()),
+                ..TestTermConfig::default()
+            },
+        );
+        assert_eq!(screen.refresh_cold_source_coordinates(), Ok(Some(true)));
+        assert_eq!(screen.refresh_cold_source_coordinates(), Ok(Some(false)));
+        assert_eq!(screen.observed_scrollback_geometry(), Some((-6, 9)));
+
+        sink.rows.lock().unwrap().remove(&-6);
+        assert_eq!(
+            screen.refresh_cold_source_coordinates(),
+            Ok(Some(false)),
+            "oldest-row eviction leaves retained coordinates alone"
+        );
+        assert_eq!(screen.observed_scrollback_geometry(), Some((-5, 8)));
+        sink.rows.lock().unwrap().remove(&-5);
+        assert_eq!(
+            screen.refresh_cold_source_observation(),
+            Ok(Some(true)),
+            "the observation itself still changed"
+        );
+
+        sink.rows.lock().unwrap().remove(&-1);
+        assert_eq!(
+            screen.refresh_cold_source_coordinates(),
+            Ok(Some(true)),
+            "losing the newest cold row is a change"
+        );
+        *sink.interval_identity.lock().unwrap() =
+            crate::config::ScrollbackIntervalIdentity::default();
+        assert_eq!(
+            screen.refresh_cold_source_coordinates(),
+            Ok(Some(true)),
+            "a new lineage is a change"
+        );
+        {
+            let mut rows = sink.rows.lock().unwrap();
+            rows.remove(&-4);
+            rows.remove(&-3);
+            rows.remove(&-2);
+        }
+        assert_eq!(
+            screen.refresh_cold_source_coordinates(),
+            Ok(Some(true)),
+            "evicting every observed row is a change"
+        );
     }
 }
