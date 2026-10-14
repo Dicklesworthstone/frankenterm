@@ -69,3 +69,29 @@ the client change):
 
 Coherence: at 8 MB/s each returned `--tail 20` was 20 consecutive sequence
 numbers, with no gaps or malformed rows.
+
+## Follow-up: publication window and the newest-rows tail
+
+ft-4p4uo's swarm-echo harness (4 unthrottled noise panes, Linux) still died:
+every failure was `stage=publish reason=source_changed` on 44-row noise
+tails. Publication requires every captured resident row unchanged, and a pane
+at full rate rewrote its cursor row in the 1-20 ms between capture and
+publication. Two changes:
+
+- **Server (198fc06c7).** A read whose rows are all resident is captured,
+  hydrated and published in one terminal-lock hold.
+- **Client (28b15f103).** A one-chunk tail is one unfenced GetLines for the
+  pane's newest rows, which the server clamps at capture time. They are hot
+  even when the fenced rows would have spilled cold.
+
+30 reads each, this server and ft:
+
+| producer | reads | server-side line-read failures |
+|---|---|---|
+| max rate | 30/30 | 0 |
+| rate.py 1000 (8 MB/s) | 30/30 | 0 |
+| rate.py 1 1 (continuous) | 30/30 | 0 |
+
+With the server change alone, max rate gave 29/30, with 10 publish refusals
+on rows that had spilled cold. The run directories are kept (the script no
+longer deletes them).
