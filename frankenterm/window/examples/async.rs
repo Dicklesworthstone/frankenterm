@@ -85,6 +85,7 @@ impl MyWindow {
             | WindowEvent::AdviseModifiersLedStatus(_, _)
             | WindowEvent::Notification(_)
             | WindowEvent::FocusChanged(_)
+            | WindowEvent::OcclusionChanged(_)
             | WindowEvent::DraggedFile(_)
             | WindowEvent::DroppedFile(_)
             | WindowEvent::DroppedUrl(_)

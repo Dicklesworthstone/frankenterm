@@ -623,7 +623,7 @@ impl TermWindow {
             pixel_width: pixels(self.dimensions.pixel_width),
             pixel_height: pixels(self.dimensions.pixel_height),
             dpi: pixels(self.dimensions.dpi),
-            occluded: false,
+            occluded: self.occluded,
             focused: self.focused.is_some(),
         }
     }

@@ -2245,6 +2245,11 @@ pub struct TermWindow {
     os_parameters: Option<parameters::Parameters>,
     /// When we most recently received keyboard focus
     pub focused: Option<Instant>,
+    /// No part of the window is visible (macOS occlusion, ft-34at5).
+    occluded: bool,
+    /// Bumped on every occlusion change, so a delayed surface park only
+    /// applies to the occlusion that scheduled it.
+    occlusion_generation: u64,
     fonts: Rc<FontConfiguration>,
     /// Window dimensions and dpi
     pub dimensions: Dimensions,
@@ -3883,6 +3888,58 @@ impl TermWindow {
             .unwrap_or_else(TierSwapDoctorReport::no_atlases_in_process)
     }
 
+    /// A window hidden for [`SURFACE_PARK_DELAY`] parks its WebGPU surface,
+    /// releasing its window-size drawables; showing it again unparks the
+    /// surface and repaints (ft-34at5).
+    fn occlusion_changed(&mut self, occluded: bool, window: &Window) {
+        if self.occluded == occluded {
+            return;
+        }
+        self.occluded = occluded;
+        self.occlusion_generation = self.occlusion_generation.wrapping_add(1);
+        if !occluded {
+            if self
+                .webgpu
+                .as_ref()
+                .is_some_and(|webgpu| webgpu.unpark_surface())
+            {
+                metrics::counter!("gui.surface.park", "action" => "unparked").increment(1);
+                self.note_render_surface_recovery_signal();
+            }
+            window.invalidate();
+            return;
+        }
+        if self.webgpu.is_none() {
+            return;
+        }
+        let generation = self.occlusion_generation;
+        let window = window.clone();
+        match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Background,
+            4 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                reservation
+                    .spawn_local(async move {
+                        sleep(SURFACE_PARK_DELAY).await;
+                        window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
+                            if tw.occluded
+                                && tw.occlusion_generation == generation
+                                && tw.webgpu.as_ref().is_some_and(|webgpu| webgpu.park_surface())
+                            {
+                                metrics::counter!("gui.surface.park", "action" => "parked")
+                                    .increment(1);
+                            }
+                        })));
+                    })
+                    .detach();
+            }
+            rejected => {
+                log::debug!("not parking the hidden window's surface: {rejected:?}");
+            }
+        }
+    }
+
     fn focus_changed(&mut self, focused: bool, window: &Window) {
         self.record_idle_event(idle_detector::IdleEvent::FocusChange);
         log::trace!("Setting focus to {:?}", focused);
@@ -3998,6 +4055,12 @@ const OCCLUDED_REPAINT_PROBE_DELAY: Duration = Duration::from_millis(250);
 /// one 60 Hz frame (16 ms) those changes alone could hold a window at its
 /// `max_fps`. 100 ms keeps a 10 Hz spinner animated in the tab bar.
 const TITLE_UPDATE_COALESCE: Duration = Duration::from_millis(100);
+
+/// How long a window stays hidden before its WebGPU surface is parked
+/// (ft-34at5). Long enough that switching between windows does not park
+/// the ones briefly covered.
+const SURFACE_PARK_DELAY: Duration = Duration::from_secs(5);
+
 /// A coalesced title refresh still pending after this long was dropped on
 /// the way back (the window's `notify` is refused under main-thread
 /// saturation); re-arm rather than coalesce every later change into it.
@@ -4715,6 +4778,8 @@ impl TermWindow {
             config_overrides: wezterm_dynamic::Value::Object(Default::default()),
             palette: None,
             focused: None,
+            occluded: false,
+            occlusion_generation: 0,
             mux_window_id,
             mux_window_id_for_subscriptions: Arc::new(Mutex::new(mux_window_id)),
             pending_mux_geometry: Arc::new(Mutex::new(PendingMuxGeometry::default())),
@@ -5100,6 +5165,11 @@ impl TermWindow {
             }
             WindowEvent::FocusChanged(focused) => {
                 self.focus_changed(focused, window);
+                self.post_metal_surface();
+                Ok(true)
+            }
+            WindowEvent::OcclusionChanged(occluded) => {
+                self.occlusion_changed(occluded, window);
                 self.post_metal_surface();
                 Ok(true)
             }

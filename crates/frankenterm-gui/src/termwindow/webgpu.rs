@@ -700,8 +700,15 @@ pub struct WebGpuState {
     surface_alpha_modes: RefCell<Vec<wgpu::CompositeAlphaMode>>,
     /// The window draws no translucent pixels; see `set_opaque_content`.
     opaque_content: Cell<bool>,
+    /// The window is hidden and its surface is held at [`PARKED_EXTENT`];
+    /// see `park_surface`.
+    parked: Cell<bool>,
     pub handle: RawHandlePair,
 }
+
+/// The surface extent of a parked (hidden) window. Configuring it releases
+/// the layer's window-size drawables (ft-34at5).
+const PARKED_EXTENT: (u32, u32) = (1, 1);
 
 pub struct RawHandlePair {
     window: RawWindowHandle,
@@ -1683,7 +1690,30 @@ impl WebGpuState {
             needs_force_configure: Cell::new(false),
             surface_alpha_modes: RefCell::new(caps.alpha_modes),
             opaque_content: Cell::new(opaque_content),
+            parked: Cell::new(false),
         })
+    }
+
+    /// Hold a hidden window's surface at [`PARKED_EXTENT`], so the layer
+    /// drops its window-size drawables (ft-34at5: ~240 MB per 6K window),
+    /// and take no frame until [`Self::unpark_surface`]. Call it only
+    /// between frames. Returns whether the surface was not parked already.
+    pub(crate) fn park_surface(&self) -> bool {
+        if self.parked.replace(true) {
+            return false;
+        }
+        let dims = *self.dimensions.borrow();
+        if let Err(err) = self.configure_surface(dims, false) {
+            log::warn!("failed to park webgpu surface: {err:#}");
+        }
+        true
+    }
+
+    /// Let a parked surface take frames again; the configure before the next
+    /// acquisition restores the window's extent. Returns whether it was
+    /// parked.
+    pub(crate) fn unpark_surface(&self) -> bool {
+        self.parked.replace(false)
     }
 
     /// Record whether the window draws only opaque pixels. A change takes
@@ -1796,7 +1826,11 @@ impl WebGpuState {
         let dims = self.effective_surface_dimensions(dims);
         let previous_requested = *self.dimensions.borrow();
         *self.dimensions.borrow_mut() = dims;
-        let (width, height) = resize_surface_extent(dims);
+        let (width, height) = if self.parked.get() {
+            PARKED_EXTENT
+        } else {
+            resize_surface_extent(dims)
+        };
         if width == 0 || height == 0 {
             // Preserve the last valid applied configuration.  Mutating it to
             // zero would make our model disagree with wgpu, which rejects a
@@ -1850,6 +1884,11 @@ impl WebGpuState {
         dims: Dimensions,
     ) -> anyhow::Result<SurfaceConfigureOutcome> {
         self.profile_native_stage("configure", || {
+            if self.parked.get() {
+                // A hidden window takes no frame; unparking reopens it.
+                self.configure_surface(dims, false)?;
+                return Ok(SurfaceConfigureOutcome::DeferredZeroExtent);
+            }
             let outcome = self.configure_surface(dims, false)?;
             if outcome == SurfaceConfigureOutcome::Ready && self.needs_force_configure.get() {
                 return self.configure_surface(dims, true);

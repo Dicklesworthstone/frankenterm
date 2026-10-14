@@ -587,6 +587,7 @@ impl Window {
                 screen_changed: false,
                 paint_throttled: false,
                 focused: false,
+                occluded: false,
                 repaint_slot: None,
                 invalidated: true,
                 gl_context_pair: None,
@@ -1717,6 +1718,8 @@ struct Inner {
     /// Whether this is the key window; paces repaints by
     /// `Config::max_fps_for_focus`.
     focused: bool,
+    /// No part of the window is visible (`NSWindowOcclusionState`).
+    occluded: bool,
     /// The latest paint's throttle slot (`crate::repaint_slot`, ft-1w85m).
     repaint_slot: Option<Instant>,
     window_id: usize,
@@ -2445,6 +2448,26 @@ impl WindowView {
             inner.events.dispatch(WindowEvent::FocusChanged(true));
             drop(inner);
             this.update_application_presentation(true);
+        }
+    }
+
+    extern "C" fn did_change_occlusion_state(this: &mut Object, _sel: Sel, notification: id) {
+        // NSWindowOcclusionStateVisible: some part of the window is visible.
+        const VISIBLE: NSUInteger = 1 << 1;
+        let window: id = unsafe { msg_send![notification, object] };
+        if window.is_null() {
+            return;
+        }
+        let state: NSUInteger = unsafe { msg_send![window, occlusionState] };
+        let occluded = state & VISIBLE == 0;
+        if let Some(this) = Self::get_this(this) {
+            let mut inner = this.inner.borrow_mut();
+            if inner.occluded != occluded {
+                inner.occluded = occluded;
+                inner
+                    .events
+                    .dispatch(WindowEvent::OcclusionChanged(occluded));
+            }
         }
     }
 
@@ -3610,6 +3633,10 @@ impl WindowView {
             cls.add_method(
                 sel!(windowDidResignKey:),
                 Self::did_resign_key as extern "C" fn(&mut Object, Sel, id),
+            );
+            cls.add_method(
+                sel!(windowDidChangeOcclusionState:),
+                Self::did_change_occlusion_state as extern "C" fn(&mut Object, Sel, id),
             );
 
             cls.add_method(
