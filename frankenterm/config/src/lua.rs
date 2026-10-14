@@ -435,6 +435,14 @@ end
         let time_mod = get_or_create_sub_module(&lua, "time")?;
         time_mod.set("call_after", lua.create_function(lua_time_call_after)?)?;
         time_mod.set("now", lua.create_function(lua_time_now)?)?;
+        time_mod.set("parse", lua.create_function(lua_time_parse)?)?;
+        time_mod.set(
+            "parse_rfc3339",
+            lua.create_function(lua_time_parse_rfc3339)?,
+        )?;
+        wezterm_mod.set("strftime", lua.create_function(lua_strftime)?)?;
+        wezterm_mod.set("strftime_utc", lua.create_function(lua_strftime_utc)?)?;
+        wezterm_mod.set("sleep_ms", lua.create_async_function(lua_sleep_ms)?)?;
 
         wezterm_mod.set(
             "default_hyperlink_rules",
@@ -716,13 +724,98 @@ async fn dispatch_lua_timer_callback(callback: LuaTimerCallback) {
     }
 }
 
-/// `wezterm.time.now()` — returns seconds since UNIX epoch as a float.
-fn lua_time_now(_: &Lua, _: ()) -> mlua::Result<f64> {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    Ok(secs)
+/// A point in time, as WezTerm's `wezterm.time` returns it: `:format(fmt)`
+/// in local time, `:format_utc(fmt)` (strftime formats), comparisons, and
+/// `tostring`. Status bars use `wezterm.time.now():format('%H:%M')`.
+#[derive(Clone, Copy, Debug)]
+pub struct LuaTime {
+    utc: chrono::DateTime<chrono::Utc>,
+}
+
+impl mlua::UserData for LuaTime {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_meta_method(mlua::MetaMethod::ToString, |_, this, ()| {
+            Ok(format!("Time(utc: {})", this.utc.to_rfc3339()))
+        });
+        methods.add_meta_method(
+            mlua::MetaMethod::Eq,
+            |_, this, other: mlua::UserDataRef<LuaTime>| Ok(this.utc == other.utc),
+        );
+        methods.add_meta_method(
+            mlua::MetaMethod::Lt,
+            |_, this, other: mlua::UserDataRef<LuaTime>| Ok(this.utc < other.utc),
+        );
+        methods.add_meta_method(
+            mlua::MetaMethod::Le,
+            |_, this, other: mlua::UserDataRef<LuaTime>| Ok(this.utc <= other.utc),
+        );
+        methods.add_method("format", |_, this, format: String| {
+            let local: chrono::DateTime<chrono::Local> = this.utc.into();
+            strftime_checked(&local, &format)
+        });
+        methods.add_method("format_utc", |_, this, format: String| {
+            strftime_checked(&this.utc, &format)
+        });
+    }
+}
+
+/// `format` with strftime syntax. An invalid specifier is an error rather
+/// than the panic chrono's `Display` raises for it.
+fn strftime_checked<Tz: chrono::TimeZone>(
+    time: &chrono::DateTime<Tz>,
+    format: &str,
+) -> mlua::Result<String>
+where
+    Tz::Offset: std::fmt::Display,
+{
+    use std::fmt::Write;
+    let mut out = String::new();
+    write!(out, "{}", time.format(format))
+        .map_err(|_| mlua::Error::external(format!("invalid strftime format {format:?}")))?;
+    Ok(out)
+}
+
+/// `wezterm.time.now()`: the current time.
+fn lua_time_now(_: &Lua, _: ()) -> mlua::Result<LuaTime> {
+    Ok(LuaTime {
+        utc: chrono::Utc::now(),
+    })
+}
+
+/// `wezterm.time.parse(text, format)`: `text` read with a strftime format
+/// that includes an offset.
+fn lua_time_parse(_: &Lua, (text, format): (String, String)) -> mlua::Result<LuaTime> {
+    let time = chrono::DateTime::parse_from_str(&text, &format).map_err(|err| {
+        mlua::Error::external(format!(
+            "{err:#} while parsing {text} using format {format}"
+        ))
+    })?;
+    Ok(LuaTime { utc: time.into() })
+}
+
+/// `wezterm.time.parse_rfc3339(text)`.
+fn lua_time_parse_rfc3339(_: &Lua, text: String) -> mlua::Result<LuaTime> {
+    let time = chrono::DateTime::parse_from_rfc3339(&text).map_err(|err| {
+        mlua::Error::external(format!("{err:#} while parsing {text} as an RFC3339 time"))
+    })?;
+    Ok(LuaTime { utc: time.into() })
+}
+
+/// `wezterm.strftime(format)`: the local time now, formatted.
+fn lua_strftime(_: &Lua, format: String) -> mlua::Result<String> {
+    strftime_checked(&chrono::Local::now(), &format)
+}
+
+/// `wezterm.strftime_utc(format)`: the UTC time now, formatted.
+fn lua_strftime_utc(_: &Lua, format: String) -> mlua::Result<String> {
+    strftime_checked(&chrono::Utc::now(), &format)
+}
+
+/// `wezterm.sleep_ms(ms)`: suspends the calling coroutine for `ms`
+/// milliseconds on the project's timer.
+async fn lua_sleep_ms(_: Lua, milliseconds: u64) -> mlua::Result<()> {
+    promise::spawn::sleep(std::time::Duration::from_millis(milliseconds)).await;
+    Ok(())
 }
 
 /// `wezterm.time.call_after(seconds, function)` — schedules `function` to be
@@ -1330,6 +1423,37 @@ mod test {
             }
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn time_values_format_parse_and_compare_like_wezterm() -> anyhow::Result<()> {
+        let lua = make_lua_context(Path::new("testing"))?;
+        let (utc, iso, ordered, clock_len): (String, String, bool, usize) = lua
+            .load(
+                r#"
+                local w = require('wezterm')
+                local t = w.time.parse_rfc3339('2026-10-14T12:34:56Z')
+                local later = w.time.parse('2026-10-14 13:00:00 +0000', '%Y-%m-%d %H:%M:%S %z')
+                return t:format_utc('%H:%M:%S'), tostring(t), t < later and later > t and t == t,
+                    #w.strftime('%H:%M') + #w.time.now():format('%H:%M') + #w.strftime_utc('%H')
+            "#,
+            )
+            .eval()?;
+        assert_eq!(utc, "12:34:56");
+        assert_eq!(iso, "Time(utc: 2026-10-14T12:34:56+00:00)");
+        assert!(ordered);
+        assert_eq!(clock_len, 5 + 5 + 2);
+
+        let bad_format = lua
+            .load("return require('wezterm').strftime('%Q')")
+            .exec()
+            .expect_err("an invalid strftime specifier");
+        assert!(
+            bad_format.to_string().contains("invalid strftime format"),
+            "{}",
+            bad_format
+        );
+        Ok(())
     }
 
     #[test]

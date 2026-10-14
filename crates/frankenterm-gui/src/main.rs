@@ -2908,10 +2908,17 @@ fn log_gui_hook_result(event_name: &str, result: anyhow::Result<bool>) {
 }
 
 fn register_gui_lua_modules() {
-    let setup_funcs: [config::lua::SetupFunc; 6] = [
+    let setup_funcs: [config::lua::SetupFunc; 13] = [
         termwiz_funcs::register,
         mux_lua::register,
         url_funcs::register,
+        color_funcs::register,
+        filesystem::register,
+        procinfo_funcs::register,
+        serde_funcs::register,
+        share_data::register,
+        spawn_funcs::register,
+        ssh_funcs::register,
         // `gui.screens()` and `gui.get_appearance()`: GUI-only, so the
         // headless mux server does not register them.
         window_funcs::register,
@@ -3988,6 +3995,43 @@ mod tests {
             .eval()
             .expect("type of gui.screens");
         assert_eq!(screens, "function");
+    }
+
+    /// The rest of WezTerm's Lua API that configs call at load time or from
+    /// event handlers (the operator's own `open-uri` handler calls
+    /// `run_child_process`) is in the GUI's Lua context.
+    #[test]
+    fn gui_lua_context_has_the_wezterm_lua_api() {
+        register_gui_lua_modules();
+        let lua = config::lua::make_lua_context(std::path::Path::new("")).expect("lua context");
+        let missing: String = lua
+            .load(
+                r#"
+                local w = require('frankenterm')
+                local missing = {}
+                for _, name in ipairs {
+                  'run_child_process', 'background_child_process', 'open_with', 'json_parse',
+                  'json_encode', 'read_dir', 'glob', 'enumerate_ssh_hosts', 'default_ssh_domains',
+                  'strftime', 'strftime_utc', 'sleep_ms', 'gradient_colors',
+                  'get_builtin_color_schemes',
+                } do
+                  if type(w[name]) ~= 'function' then table.insert(missing, name) end
+                end
+                for _, sub in ipairs { 'serde', 'procinfo', 'color' } do
+                  if type(w[sub]) ~= 'table' then table.insert(missing, sub) end
+                end
+                if w.GLOBAL == nil then table.insert(missing, 'GLOBAL') end
+                return table.concat(missing, ' ')
+            "#,
+            )
+            .eval()
+            .expect("probe the Lua API");
+        assert_eq!(missing, "", "missing from the GUI's Lua context");
+        let n: i64 = lua
+            .load("return require('wezterm').json_parse('{\"n\": 3}').n")
+            .eval()
+            .expect("json_parse");
+        assert_eq!(n, 3);
     }
 
     /// ft-yccm0.2.8: this binary links the GUI's `malloc_conf` export, so the

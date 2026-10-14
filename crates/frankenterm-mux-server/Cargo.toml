@@ -34,6 +34,13 @@ log.workspace = true
 metrics.workspace = true
 mux.workspace = true
 mux-lua.workspace = true
+color-funcs.workspace = true
+filesystem.workspace = true
+procinfo-funcs.workspace = true
+serde-funcs.workspace = true
+share-data.workspace = true
+spawn-funcs.workspace = true
+ssh-funcs.workspace = true
 mlua.workspace = true
 openssl.workspace = true
 portable-pty = { workspace=true, features = ["serde_support"]}

@@ -1,0 +1,12 @@
+[package]
+name = "spawn-funcs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+bstr.workspace = true
+config.workspace = true
+frankenterm-open-url.workspace = true
+promise.workspace = true

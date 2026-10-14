@@ -91,6 +91,15 @@ members = [
     "frankenterm/lua-api-crates/mux-lua",
     "frankenterm/lua-api-crates/url-funcs",
     "frankenterm/lua-api-crates/window-funcs",
+    # The rest of WezTerm's Lua API (wezterm.run_child_process, json_parse,
+    # GLOBAL, read_dir, procinfo, ssh hosts), ported to mlua 0.12.
+    "frankenterm/lua-api-crates/color-funcs",
+    "frankenterm/lua-api-crates/filesystem",
+    "frankenterm/lua-api-crates/procinfo-funcs",
+    "frankenterm/lua-api-crates/serde-funcs",
+    "frankenterm/lua-api-crates/share-data",
+    "frankenterm/lua-api-crates/spawn-funcs",
+    "frankenterm/lua-api-crates/ssh-funcs",
 ]
 exclude = [
     "frankenterm/char-props/codegen",
@@ -559,6 +568,13 @@ tabout = { path = "frankenterm/tabout" }
 mux-lua = { path = "frankenterm/lua-api-crates/mux-lua" }
 url-funcs = { path = "frankenterm/lua-api-crates/url-funcs" }
 window-funcs = { path = "frankenterm/lua-api-crates/window-funcs" }
+color-funcs = { path = "frankenterm/lua-api-crates/color-funcs" }
+filesystem = { path = "frankenterm/lua-api-crates/filesystem" }
+procinfo-funcs = { path = "frankenterm/lua-api-crates/procinfo-funcs" }
+serde-funcs = { path = "frankenterm/lua-api-crates/serde-funcs" }
+share-data = { path = "frankenterm/lua-api-crates/share-data" }
+spawn-funcs = { path = "frankenterm/lua-api-crates/spawn-funcs" }
+ssh-funcs = { path = "frankenterm/lua-api-crates/ssh-funcs" }
 frankenterm-mux-server-impl = { path = "crates/frankenterm-mux-server-impl" }
 frankenterm-sigpipe = { path = "crates/frankenterm-sigpipe" }
 frankenterm-renderer-metal = { path = "crates/frankenterm-renderer-metal" }

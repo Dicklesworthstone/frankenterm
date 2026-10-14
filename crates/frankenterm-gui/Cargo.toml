@@ -128,6 +128,13 @@ umask.workspace = true
 mux-lua.workspace = true
 url-funcs.workspace = true
 window-funcs.workspace = true
+color-funcs.workspace = true
+filesystem.workspace = true
+procinfo-funcs.workspace = true
+serde-funcs.workspace = true
+share-data.workspace = true
+spawn-funcs.workspace = true
+ssh-funcs.workspace = true
 # Workspace aliases (wezterm-* -> frankenterm-* packages)
 # NOTE: frankenterm-dynamic is the canonical dep name. The extern crate alias
 # in main.rs provides `wezterm_dynamic` for vendored code that uses the old name.

@@ -27,6 +27,7 @@ async-asupersync = [
 [dependencies]
 anyhow.workspace = true
 bitflags.workspace = true
+chrono.workspace = true
 colorgrad.workspace = true
 dirs-next.workspace = true
 enum-display-derive.workspace = true

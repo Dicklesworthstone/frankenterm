@@ -281,8 +281,16 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
     }
 
     // Expose `wezterm.mux` before the config's Lua context is first built so
-    // a `mux-startup` handler can spawn windows and tabs, as in the GUI.
+    // a `mux-startup` handler can spawn windows and tabs, as in the GUI. The
+    // server reads the same config file, so it gets the same Lua API.
     config::lua::add_context_setup_func(mux_lua::register);
+    config::lua::add_context_setup_func(color_funcs::register);
+    config::lua::add_context_setup_func(filesystem::register);
+    config::lua::add_context_setup_func(procinfo_funcs::register);
+    config::lua::add_context_setup_func(serde_funcs::register);
+    config::lua::add_context_setup_func(share_data::register);
+    config::lua::add_context_setup_func(spawn_funcs::register);
+    config::lua::add_context_setup_func(ssh_funcs::register);
 
     config::common_init(
         opts.config_file.as_ref(),
