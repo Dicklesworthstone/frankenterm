@@ -175,8 +175,24 @@ fn content_tail_rows(out: &str, n: usize) -> (String, bool) {
     (text, start == 0)
 }
 
+/// Line reads the server refuses as `resource_busy` are re-sent this many
+/// times. Such a read was not applied and is safe to repeat. The server waits
+/// 1 ms for a pane's terminal per attempt, so on a contended host, where a
+/// preempted lock holder keeps it for many milliseconds, three retries over
+/// ~21 ms still lost reads that ended a swarm-echo run (ft-4p4uo: every
+/// server-side refusal was `stage=capture reason=metadata_busy`). Six cover
+/// ~161 ms.
+const MAX_RESOURCE_BUSY_RETRIES: usize = 6;
+
+/// The pause before retry `attempt` (from 0): 1, 10, 10, 20, 40, 80 ms.
 fn mux_read_retry_delay(attempt: usize) -> Duration {
-    Duration::from_millis(if attempt == 0 { 1 } else { 10 })
+    Duration::from_millis(match attempt {
+        0 => 1,
+        1 | 2 => 10,
+        3 => 20,
+        4 => 40,
+        _ => 80,
+    })
 }
 
 async fn text_snapshot_retry_with_cx(cx: &Cx, attempt: usize) -> Result<(), DirectMuxError> {
@@ -870,6 +886,15 @@ impl PendingRenderChanges {
         Ok(self.by_pane.contains_key(&pane_id))
     }
 
+    /// The pane with the most queued changes, if any pane has more than one.
+    fn deepest_queue(&self) -> Option<u64> {
+        self.by_pane
+            .iter()
+            .filter(|(_, queue)| queue.has_tail())
+            .max_by_key(|(_, queue)| queue.tail.len())
+            .map(|(pane_id, _)| *pane_id)
+    }
+
     fn validate(&self) -> Result<(), DirectMuxError> {
         self.totals.validate(Self::RESOURCE)?;
         if self.is_empty() == self.by_pane.is_empty() {
@@ -1536,7 +1561,7 @@ pub struct DirectMuxClient {
     #[cfg(test)]
     render_retention_codec_stats: RenderRetentionCodecStats,
     #[cfg(test)]
-    get_lines_retry_delays: [Option<Duration>; 3],
+    get_lines_retry_delays: [Option<Duration>; MAX_RESOURCE_BUSY_RETRIES],
     #[cfg(test)]
     render_read_retry_delays: [Option<Duration>; 2],
 }
@@ -2388,7 +2413,7 @@ impl DirectMuxClient {
             #[cfg(test)]
             render_retention_codec_stats: RenderRetentionCodecStats::default(),
             #[cfg(test)]
-            get_lines_retry_delays: [None; 3],
+            get_lines_retry_delays: [None; MAX_RESOURCE_BUSY_RETRIES],
             #[cfg(test)]
             render_read_retry_delays: [None; 2],
             config,
@@ -2815,7 +2840,6 @@ impl DirectMuxClient {
         pane_id: u64,
         lines: Vec<std::ops::Range<isize>>,
     ) -> Result<GetLinesResponse, DirectMuxError> {
-        const MAX_RESOURCE_BUSY_RETRIES: usize = 3;
         let budget = self
             .config
             .write_timeout
@@ -2823,7 +2847,7 @@ impl DirectMuxClient {
         let deadline = crate::runtime_async::timer_now_with_cx(cx) + budget;
         #[cfg(test)]
         {
-            self.get_lines_retry_delays = [None; 3];
+            self.get_lines_retry_delays = [None; MAX_RESOURCE_BUSY_RETRIES];
         }
         let result = crate::runtime_async::timeout_with_cx(cx, budget, async {
             let mut busy_retries = 0usize;
@@ -2926,7 +2950,6 @@ impl DirectMuxClient {
         tail: Option<usize>,
     ) -> Result<Result<MuxTextReadResult, codec::ErrorResponse>, DirectMuxError> {
         const MAX_SNAPSHOT_ATTEMPTS: usize = 3;
-        const MAX_RESOURCE_BUSY_RETRIES: usize = 3;
         if self
             .peer_generation
             .as_ref()
@@ -2939,7 +2962,7 @@ impl DirectMuxClient {
         }
         #[cfg(test)]
         {
-            self.get_lines_retry_delays = [None; 3];
+            self.get_lines_retry_delays = [None; MAX_RESOURCE_BUSY_RETRIES];
         }
         let mut chunk_rows = 512isize;
         let mut busy_retries = 0usize;
@@ -5148,35 +5171,33 @@ impl DirectMuxClient {
         }
         let pane_id = payload.pane_id as u64;
         let snapshot = self.encode_render_change_snapshot(&payload)?;
-        let pending = self.encode_pending_render_change(payload)?;
+        let mut pending = self.encode_pending_render_change(payload)?;
 
         self.pending_render_changes.validate()?;
-        let aggregate_count = self
-            .pending_render_changes
-            .len()
-            .checked_add(reserved_local_count)
-            .ok_or(DirectMuxError::RetainedStateAccounting {
-                resource: PendingRenderChanges::RESOURCE,
-            })?;
-        let aggregate_bytes = self
-            .pending_render_changes
-            .retained_bytes()
-            .checked_add(reserved_local_bytes)
-            .ok_or(DirectMuxError::RetainedStateAccounting {
-                resource: PendingRenderChanges::RESOURCE,
-            })?;
         let pending_limit = RetentionLimit {
             max_count: self.config.max_pending_render_changes,
             max_bytes: self.config.max_pending_render_change_bytes,
         };
-        let _ = checked_retention_after_insert(
-            PendingRenderChanges::RESOURCE,
-            aggregate_count,
-            aggregate_bytes,
-            None,
-            pending.retained_bytes(),
+        if let Err(full) = self.check_pending_render_admission(
+            &pending,
+            reserved_local_count,
+            reserved_local_bytes,
             pending_limit,
-        )?;
+        ) {
+            if !matches!(full, DirectMuxError::RetentionLimitExceeded { .. }) {
+                return Err(full);
+            }
+            pending = match self.relieve_pending_render_pressure(pending, pending_limit)? {
+                Some(pending) => pending,
+                None => return Err(full),
+            };
+            self.check_pending_render_admission(
+                &pending,
+                reserved_local_count,
+                reserved_local_bytes,
+                pending_limit,
+            )?;
+        }
 
         let next_pending = self
             .pending_render_changes
@@ -5195,6 +5216,107 @@ impl DirectMuxClient {
         self.pending_render_changes
             .commit_insert(pending, next_pending);
         Ok(())
+    }
+
+    /// Whether `pending` fits the unilateral render queue beside the batch's
+    /// reserved local sidebands.
+    fn check_pending_render_admission(
+        &self,
+        pending: &RetainedRenderChange,
+        reserved_local_count: usize,
+        reserved_local_bytes: usize,
+        limit: RetentionLimit,
+    ) -> Result<(), DirectMuxError> {
+        let aggregate_count = self
+            .pending_render_changes
+            .len()
+            .checked_add(reserved_local_count)
+            .ok_or(DirectMuxError::RetainedStateAccounting {
+                resource: PendingRenderChanges::RESOURCE,
+            })?;
+        let aggregate_bytes = self
+            .pending_render_changes
+            .retained_bytes()
+            .checked_add(reserved_local_bytes)
+            .ok_or(DirectMuxError::RetainedStateAccounting {
+                resource: PendingRenderChanges::RESOURCE,
+            })?;
+        checked_retention_after_insert(
+            PendingRenderChanges::RESOURCE,
+            aggregate_count,
+            aggregate_bytes,
+            None,
+            pending.retained_bytes(),
+            limit,
+        )
+        .map(|_| ())
+    }
+
+    /// Makes room in a full unilateral render queue instead of failing the
+    /// client (ft-4p4uo: panes flooding faster than their polls consumed
+    /// filled the 512-entry queue, and the next push aborted a text read).
+    /// If `pending`'s pane already has queued changes, they and `pending`
+    /// become one change, which is returned in its place. Otherwise the
+    /// pane with the deepest queue is coalesced and `pending` is returned
+    /// unchanged. `None` when every queued pane holds a single change, so
+    /// the queue is genuinely at its limit.
+    ///
+    /// Only a push that would otherwise be refused is coalesced, so below
+    /// the limit every change is still delivered once, in order.
+    fn relieve_pending_render_pressure(
+        &mut self,
+        pending: RetainedRenderChange,
+        limit: RetentionLimit,
+    ) -> Result<Option<RetainedRenderChange>, DirectMuxError> {
+        let pane_id = pending.pane_id;
+        if self.pending_render_changes.contains_pane(pane_id)? {
+            let newer = pending.decode(self.connection_id)?;
+            let merged = self.take_coalesced_render_changes(pane_id, Some(newer))?;
+            tracing::debug!(
+                connection_id = self.connection_id,
+                pane_id,
+                phase = "render_queue_coalesce",
+                "coalesced a pane's queued render changes at the retention limit"
+            );
+            return merged
+                .map(|merged| self.encode_pending_render_change(merged))
+                .transpose();
+        }
+        let Some(deepest) = self.pending_render_changes.deepest_queue() else {
+            return Ok(None);
+        };
+        if let Some(merged) = self.take_coalesced_render_changes(deepest, None)? {
+            let merged = self.encode_pending_render_change(merged)?;
+            let next = self.pending_render_changes.admit_insert(&merged, limit)?;
+            self.pending_render_changes.commit_insert(merged, next);
+        }
+        tracing::debug!(
+            connection_id = self.connection_id,
+            pane_id = deepest,
+            phase = "render_queue_coalesce",
+            "coalesced the deepest pane render queue at the retention limit"
+        );
+        Ok(Some(pending))
+    }
+
+    /// Removes `pane_id`'s queued render changes and folds them, oldest
+    /// first, and then `newer`, into one change.
+    fn take_coalesced_render_changes(
+        &mut self,
+        pane_id: u64,
+        newer: Option<GetPaneRenderChangesResponse>,
+    ) -> Result<Option<GetPaneRenderChangesResponse>, DirectMuxError> {
+        let mut merged: Option<GetPaneRenderChangesResponse> = None;
+        while let Some(change) = self.take_pending_render_change(pane_id)? {
+            merged = Some(match merged {
+                Some(older) => coalesce_render_changes(older, change),
+                None => change,
+            });
+        }
+        Ok(match (merged, newer) {
+            (Some(older), Some(newer)) => Some(coalesce_render_changes(older, newer)),
+            (merged, newer) => merged.or(newer),
+        })
     }
 
     fn take_pending_render_change(
@@ -5626,6 +5748,49 @@ fn checked_retention_after_insert(
         });
     }
     Ok((requested_count, requested_bytes))
+}
+
+/// One render change equivalent to applying `older` and then `newer` to the
+/// same pane: `newer`'s state (cursor, dimensions, title, seqno, ...), every
+/// row either marked dirty, and `newer`'s bonus lines. `older`'s bonus lines
+/// may be stale after `newer`, so their rows are marked dirty instead and
+/// the consumer fetches them. The input acknowledgement stays at the latest
+/// one either reported.
+fn coalesce_render_changes(
+    older: GetPaneRenderChangesResponse,
+    newer: GetPaneRenderChangesResponse,
+) -> GetPaneRenderChangesResponse {
+    let mut rows = older.dirty_lines;
+    rows.extend(
+        older
+            .bonus_lines
+            .lines()
+            .map(|(row, _)| *row..row.saturating_add(1)),
+    );
+    rows.extend(newer.dirty_lines.iter().cloned());
+    GetPaneRenderChangesResponse {
+        dirty_lines: union_row_ranges(rows),
+        input_serial: newer.input_serial.or(older.input_serial),
+        ..newer
+    }
+}
+
+/// The non-empty ranges of `rows`, sorted, with overlapping and adjacent
+/// ranges joined.
+fn union_row_ranges(
+    mut rows: Vec<std::ops::Range<frankenterm_term::StableRowIndex>>,
+) -> Vec<std::ops::Range<frankenterm_term::StableRowIndex>> {
+    rows.retain(|range| range.start < range.end);
+    rows.sort_by_key(|range| range.start);
+    let mut joined: Vec<std::ops::Range<frankenterm_term::StableRowIndex>> =
+        Vec::with_capacity(rows.len());
+    for range in rows {
+        match joined.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => joined.push(range),
+        }
+    }
+    joined
 }
 
 fn duration_to_ms_u64(duration: Duration) -> u64 {
@@ -6381,6 +6546,83 @@ mod tests {
             input_serial: None,
             seqno,
         }
+    }
+
+    #[test]
+    fn coalesced_render_changes_union_dirty_rows_and_keep_the_newest_state() {
+        let mut older = test_render_change(7, 1, "old");
+        older.dirty_lines = vec![0..1, 3..5];
+        older.bonus_lines = test_bonus_lines(&["row 0", "row 1"]);
+        older.input_serial = Some(InputSerial::from_millis_since_epoch(5));
+        let mut newer = test_render_change(7, 2, "new");
+        newer.dirty_lines = vec![10..11, 4..6];
+        let merged = coalesce_render_changes(older, newer);
+        // Older bonus rows 0 and 1 are refetched rather than kept stale.
+        assert_eq!(merged.dirty_lines, vec![0..2, 3..6, 10..11]);
+        assert_eq!(merged.seqno, 2);
+        assert_eq!(merged.title, "new");
+        assert_eq!(merged.bonus_lines.lines().count(), 0);
+        assert_eq!(
+            merged.input_serial,
+            Some(InputSerial::from_millis_since_epoch(5))
+        );
+        assert_eq!(
+            union_row_ranges(vec![5..5, 2..4, 0..2]),
+            std::iter::once(0..4).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_full_render_queue_coalesces_instead_of_failing_the_client() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let (_dir, path, _server) =
+                render_read_server(1, |_, _| (Vec::new(), None, Vec::new())).await;
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .expect("connect");
+            client.config.max_pending_render_changes = 3;
+            let push = |client: &mut DirectMuxClient, pane_id, seqno, row: isize| {
+                let mut change = test_render_change(pane_id, seqno, &format!("{pane_id}-{seqno}"));
+                change.dirty_lines = std::iter::once(row..row + 1).collect();
+                client.stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(change))
+            };
+
+            // A pane pushed past the limit: its queue folds into one change.
+            for seqno in 1..=4 {
+                push(&mut client, 7, seqno, seqno as isize * 2).expect("push pane 7");
+            }
+            assert_eq!(client.pending_render_changes.len(), 1);
+            let merged = client
+                .take_pending_render_change(7)
+                .expect("take")
+                .expect("merged change");
+            assert_eq!(merged.dirty_lines, vec![2..3, 4..5, 6..7, 8..9]);
+            assert_eq!((merged.seqno, merged.title.as_str()), (4, "7-4"));
+
+            // A new pane at the limit: the deepest queue makes room.
+            push(&mut client, 8, 1, 0).expect("push pane 8");
+            push(&mut client, 8, 2, 1).expect("push pane 8");
+            push(&mut client, 9, 1, 0).expect("push pane 9");
+            push(&mut client, 10, 1, 0).expect("pane 8 coalesces to admit pane 10");
+            assert_eq!(client.pending_render_changes.len(), 3);
+            assert_eq!(
+                client
+                    .take_pending_render_change(8)
+                    .expect("take")
+                    .expect("pane 8")
+                    .dirty_lines,
+                std::iter::once(0..2).collect::<Vec<_>>()
+            );
+
+            // Every queued pane holds a single change: the limit stands.
+            push(&mut client, 11, 1, 0).expect("refill");
+            let full = push(&mut client, 12, 1, 0).expect_err("three panes, one change each");
+            assert!(matches!(
+                full,
+                DirectMuxError::RetentionLimitExceeded { .. }
+            ));
+        });
     }
 
     fn preload_compressed_render_sideband(
@@ -9190,7 +9432,7 @@ mod tests {
             );
             assert_eq!(
                 client.get_lines_retry_delays,
-                [Some(Duration::from_millis(1)), None, None],
+                [Some(Duration::from_millis(1)), None, None, None, None, None],
                 "actual successful retry must schedule only the short initial delay"
             );
             drop(client);
@@ -9236,8 +9478,8 @@ mod tests {
             rejection.validate().unwrap();
             assert_eq!(
                 requests.load(Ordering::SeqCst),
-                4,
-                "repeated busy must stop bounded at cap (1 initial + 3 retries = 4 requests)"
+                7,
+                "repeated busy must stop bounded at cap (1 initial + 6 retries = 7 requests)"
             );
             assert_eq!(
                 client.get_lines_retry_delays,
@@ -9245,6 +9487,9 @@ mod tests {
                     Some(Duration::from_millis(1)),
                     Some(Duration::from_millis(10)),
                     Some(Duration::from_millis(10)),
+                    Some(Duration::from_millis(20)),
+                    Some(Duration::from_millis(40)),
+                    Some(Duration::from_millis(80)),
                 ]
             );
             drop(client);
@@ -9349,18 +9594,18 @@ mod tests {
                                     GetLinesAtLayout::IDENT,
                                 ))
                             }
-                            // Call 3: third busy refusal (busy_retries: 2 -> 3)
-                            3 => {
+                            // Calls 3-6: busy refusals (busy_retries: 2 -> 6)
+                            3..=6 => {
                                 assert_eq!(request.layout.seqno, 8);
                                 Pdu::ErrorResponse(codec::ErrorResponse::resource_busy(
                                     GetLinesAtLayout::IDENT,
                                 ))
                             }
-                            // Call 4: fourth busy refusal; budget is exhausted (3 retries used).
-                            // If allowance had reset upon the snapshot change, this would retry (call 5).
+                            // Call 7: seventh busy refusal; budget is exhausted (6 retries used).
+                            // If allowance had reset upon the snapshot change, this would retry (call 8).
                             // Because allowance is shared across the whole transaction,
                             // the client must NOT retry here and must return the error.
-                            4 => {
+                            7 => {
                                 assert_eq!(request.layout.seqno, 8);
                                 Pdu::ErrorResponse(codec::ErrorResponse::resource_busy(
                                     GetLinesAtLayout::IDENT,
@@ -9389,8 +9634,8 @@ mod tests {
             rejection.validate().unwrap();
             assert_eq!(
                 chunk_calls.load(Ordering::SeqCst),
-                5,
-                "shared budget must cap total busy retries at 3 across changed snapshots (no reset)"
+                8,
+                "shared budget must cap total busy retries at 6 across changed snapshots (no reset)"
             );
             drop(client);
             timeout(Duration::from_secs(5), server)
@@ -9553,8 +9798,8 @@ mod tests {
             rejection.validate().unwrap();
             assert_eq!(
                 requests.load(Ordering::SeqCst),
-                4,
-                "repeated busy must stop bounded at cap (1 initial + 3 retries = 4 requests)"
+                7,
+                "repeated busy must stop bounded at cap (1 initial + 6 retries = 7 requests)"
             );
             drop(client);
             timeout(Duration::from_secs(5), server)
