@@ -4167,8 +4167,11 @@ fn acquire_recorder_path_leases(
         // uses the filesystem's name equivalence, including for absent targets.
         // Do not configure different per-directory case-folding policies for it.
         let mut options = recorder_open_options();
-        options.create(true).read(true).write(true);
-        let file = RecorderLeaseFile::new(directory.open_with(&name, &options)?.into_std());
+        options.read(true).write(true);
+        // Recorders sharing a path create this lease together (ft-nd1c0).
+        let file = RecorderLeaseFile::new(
+            crate::lock::open_or_create_exclusively(&directory, &name, &options)?.into_std(),
+        );
         let mut lease = RecorderPathLease {
             parent,
             directory,
@@ -4302,9 +4305,10 @@ impl AppendLogStateFile {
         let temporary_name = state_name.with_extension("tmp");
         let lock_name = recorder_state_lock_path(&state_name);
         let mut options = recorder_open_options();
-        options.create(true).read(true).write(true);
-        let mut lock =
-            RecorderLeaseFile::new(directory.open_with(&lock_name, &options)?.into_std());
+        options.read(true).write(true);
+        let mut lock = RecorderLeaseFile::new(
+            crate::lock::open_or_create_exclusively(&directory, &lock_name, &options)?.into_std(),
+        );
         let metadata = CapMetadata::from_file(&lock)?;
         if !metadata.is_file() || recorder_link_count(&metadata)? != 1 {
             return Err(invalid_recorder_path(

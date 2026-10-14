@@ -11851,7 +11851,6 @@ fn acquire_checkpoint_artifact_publication_lock(
     options
         .read(true)
         .write(true)
-        .create(true)
         .truncate(false)
         .follow(FollowSymlinks::No);
     #[cfg(unix)]
@@ -11860,7 +11859,8 @@ fn acquire_checkpoint_artifact_publication_lock(
 
         options.mode(0o600);
     }
-    let cap_file = parent.open_with(lock_leaf, &options)?;
+    // Concurrent `ft` processes create this lock together (ft-nd1c0).
+    let cap_file = crate::lock::open_or_create_exclusively(parent, lock_leaf, &options)?;
     let handle_metadata = cap_file.metadata()?;
     let path_metadata = parent.symlink_metadata(lock_leaf)?;
     let opened_snapshot =

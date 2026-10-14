@@ -630,6 +630,41 @@ fn reprobe_opened_lock(
     }
 }
 
+/// Open `name` in `directory` with `options`, creating the file if it does not
+/// exist yet. Any create flag in `options` is ignored: the name is only ever
+/// created with `create_new` (O_CREAT|O_EXCL), and a creator that loses the
+/// race opens the winner's file.
+///
+/// Use this for every name that several processes may create at once (lock
+/// files, shared store control files). On macOS 27 a non-exclusive O_CREAT
+/// `openat` relative to a directory descriptor, which cap-std always uses, can
+/// fail with ENOENT while another process creates the same name: 4 processes
+/// released together got ENOENT on 36-40% of opens, and on 6.7% even when
+/// released through pipes. A full-path `open` and an O_EXCL `openat` never did
+/// (0 of 8000 and 0 of 6000). See ft-nd1c0.
+pub fn open_or_create_exclusively(
+    directory: &CapDir,
+    name: impl AsRef<Path>,
+    options: &CapOpenOptions,
+) -> io::Result<cap_std::fs::File> {
+    let name = name.as_ref();
+    let mut existing = options.clone();
+    existing.create(false).create_new(false);
+    match directory.open_with(name, &existing) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut fresh = existing.clone();
+            fresh.create_new(true);
+            match directory.open_with(name, &fresh) {
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    directory.open_with(name, &existing)
+                }
+                created => created,
+            }
+        }
+        opened => opened,
+    }
+}
+
 fn open_lock_leaf_nofollow_with_hook(
     lock_path: &Path,
     create: bool,
@@ -653,14 +688,15 @@ fn open_lock_leaf_nofollow_with_hook(
     };
 
     let mut options = CapOpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .create(create)
-        .follow(FollowSymlinks::No);
+    options.read(true).write(true).follow(FollowSymlinks::No);
     #[cfg(unix)]
     CapOpenOptionsPlatformExt::mode(&mut options, 0o600);
-    let cap_file = match directory.open_with(name, &options) {
+    let opened = if create {
+        open_or_create_exclusively(&directory, name, &options)
+    } else {
+        directory.open_with(name, &options)
+    };
+    let cap_file = match opened {
         Ok(file) => file,
         Err(error) => {
             if let Ok(current) = directory.symlink_metadata(name) {
@@ -1573,6 +1609,50 @@ fn check_running_with_hooks(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// ft-nd1c0: the shared-name opener creates an absent file, opens an
+    /// existing one without truncating it, and never creates non-exclusively,
+    /// even when the caller's options ask for it.
+    #[test]
+    fn open_or_create_exclusively_creates_once_and_reopens_the_same_file() {
+        use std::io::{Read as _, Write as _};
+
+        let tmp = TempDir::new().unwrap();
+        let directory = CapDir::open_ambient_dir(tmp.path(), cap_std::ambient_authority()).unwrap();
+        let mut options = CapOpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            .follow(FollowSymlinks::No);
+        #[cfg(unix)]
+        CapOpenOptionsPlatformExt::mode(&mut options, 0o600);
+
+        let mut created = open_or_create_exclusively(&directory, "shared.lock", &options).unwrap();
+        created.write_all(b"held").unwrap();
+        let created_metadata = created.metadata().unwrap();
+        #[cfg(unix)]
+        assert_eq!(created_metadata.mode() & 0o777, 0o600);
+
+        let mut reopened = open_or_create_exclusively(&directory, "shared.lock", &options).unwrap();
+        #[cfg(unix)]
+        {
+            let reopened_metadata = reopened.metadata().unwrap();
+            assert_eq!(
+                (created_metadata.dev(), created_metadata.ino()),
+                (reopened_metadata.dev(), reopened_metadata.ino()),
+                "a second opener gets the first creator's file"
+            );
+        }
+        let mut contents = String::new();
+        reopened.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "held", "reopening never truncates");
+
+        // Absent parent directory: still an error, not a created file.
+        let gone = directory.open_with("missing/shared.lock", CapOpenOptions::new().read(true));
+        assert!(gone.is_err());
+        assert!(open_or_create_exclusively(&directory, "missing/shared.lock", &options).is_err());
+    }
 
     #[test]
     fn acquire_and_release_lock() {

@@ -2505,14 +2505,14 @@ impl BrowserProfile {
         options
             .read(true)
             .write(true)
-            .create(true)
             .truncate(false)
             .follow(FollowSymlinks::No);
         #[cfg(unix)]
         options.mode(0o600);
-        let file = lock_directory
-            .open_with(&lock_file_name, &options)?
-            .into_std();
+        // Agents working one profile create this lock together (ft-nd1c0).
+        let file =
+            crate::lock::open_or_create_exclusively(&lock_directory, &lock_file_name, &options)?
+                .into_std();
         let preliminary_metadata = file.metadata()?;
         if !preliminary_metadata.is_file() {
             return Err(private_io_error(

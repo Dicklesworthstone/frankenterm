@@ -604,38 +604,26 @@ fn sync_directory(directory: &CapDir) -> Result<(), DomainReconnectManifestError
     Ok(())
 }
 
-/// Opens to the lock authority made before giving up on a create race.
-const LOCK_OPEN_ATTEMPTS: usize = 8;
-
 /// Opens (creating if needed) the lock authority in the pinned `directory`.
 ///
-/// Darwin answers the loser of two concurrent `open(O_CREAT)` calls for one
-/// name with ENOENT instead of opening the file the winner just created
-/// (measured on macOS 26.2, xnu-12377: 99% of synchronized two-thread races;
-/// an immediate retry opened the file every time). Two GUI instances that
-/// create a namespace's lock together hit exactly that (ft-y5xik). A NotFound
-/// is therefore retried, but only while the pinned directory is still the one
-/// `path` names: a directory that was removed or replaced fails closed.
+/// Two GUI instances create a namespace's lock together (ft-y5xik), and Darwin
+/// can answer a non-exclusive concurrent `openat(O_CREAT)` of one name with
+/// ENOENT instead of opening the file the winner just created (99% of
+/// synchronized two-thread races on macOS 26.2; 36-40% across processes on
+/// macOS 27, ft-nd1c0). The name is therefore only created exclusively and a
+/// loser opens the winner's file, which no longer needs retries. A failure in
+/// a directory that was removed or replaced since it was pinned fails closed
+/// as such.
 fn open_lock_authority(
     path: &Path,
     directory: &CapDir,
     name: &OsStr,
     options: &CapOpenOptions,
 ) -> Result<CapFile, DomainReconnectManifestError> {
-    let mut attempt = 1;
-    loop {
-        match directory.open_with(name, options) {
-            Ok(file) => return Ok(file),
-            Err(error)
-                if error.kind() == io::ErrorKind::NotFound && attempt < LOCK_OPEN_ATTEMPTS =>
-            {
-                validate_pinned_directory_identity(path, directory)?;
-                attempt += 1;
-                std::thread::yield_now();
-            }
-            Err(error) => return Err(DomainReconnectManifestError::io("open lock", error)),
-        }
-    }
+    frankenterm_core::lock::open_or_create_exclusively(directory, name, options).or_else(|error| {
+        validate_pinned_directory_identity(path, directory)?;
+        Err(DomainReconnectManifestError::io("open lock", error))
+    })
 }
 
 struct ManifestLease {
@@ -665,11 +653,7 @@ impl ManifestLease {
             }
         };
         let mut options = CapOpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            .create(true)
-            .follow(FollowSymlinks::No);
+        options.read(true).write(true).follow(FollowSymlinks::No);
         #[cfg(unix)]
         options.mode(0o600);
         let lock_authority = open_lock_authority(path, &directory, name, &options)?;

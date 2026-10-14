@@ -1571,17 +1571,15 @@ fn acquire_recovery_lease(lock_path: &Path) -> std::io::Result<LockProbeOutcome>
     let directory_identity = metadata_identity(&directory_metadata);
 
     let mut options = CapOpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .create(true)
-        .follow(FollowSymlinks::No);
+    options.read(true).write(true).follow(FollowSymlinks::No);
     #[cfg(unix)]
     {
         use cap_std::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    let lock_file = directory.open_with(&lock_leaf, &options)?.into_std();
+    // A recovery racing another opener creates the lock exclusively (ft-nd1c0).
+    let lock_file =
+        crate::lock::open_or_create_exclusively(&directory, &lock_leaf, &options)?.into_std();
     let path_metadata = directory.symlink_metadata(&lock_leaf)?;
     let handle_metadata = lock_file.metadata()?;
     validate_candidate_metadata(&path_metadata, &directory_metadata)

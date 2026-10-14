@@ -2135,9 +2135,11 @@ fn nofollow_open_options(read: bool, write: bool) -> CapOpenOptions {
     options
 }
 
+/// Options for opening a lock file. Concurrent processes create the same lock
+/// names, so callers open them through
+/// [`crate::lock::open_or_create_exclusively`] (ft-nd1c0).
 fn lock_open_options() -> CapOpenOptions {
     let mut options = nofollow_open_options(true, true);
-    options.create(true);
     #[cfg(unix)]
     options.mode(0o600);
     #[cfg(windows)]
@@ -2881,15 +2883,17 @@ impl IdempotencyStore {
         let lock_relative = Path::new(EXECUTION_LOCK_DIR_NAME).join(&lock_name);
         let lock_display = spool.display(&lock_relative);
         let options = lock_open_options();
-        let lock_file = spool
-            .execution_lock_dir
-            .open_with(&lock_name, &options)
-            .map_err(|err| IdempotencyError::LedgerPersist {
-                reason: format!(
-                    "open execution lock {} for {execution_id} without following symlinks: {err}",
-                    lock_display.display()
-                ),
-            })?;
+        let lock_file = crate::lock::open_or_create_exclusively(
+            &spool.execution_lock_dir,
+            &lock_name,
+            &options,
+        )
+        .map_err(|err| IdempotencyError::LedgerPersist {
+            reason: format!(
+                "open execution lock {} for {execution_id} without following symlinks: {err}",
+                lock_display.display()
+            ),
+        })?;
         let metadata = lock_file
             .metadata()
             .map_err(|err| IdempotencyError::LedgerPersist {
@@ -3343,15 +3347,14 @@ impl IdempotencyStore {
         let lock_name = PathBuf::from("spool_catalog.lock");
         let lock_display = spool.display_path.join(PLAN_LOCK_DIR_NAME).join(&lock_name);
         let options = lock_open_options();
-        let lock_file = spool
-            .plan_lock_dir
-            .open_with(&lock_name, &options)
-            .map_err(|err| IdempotencyError::LedgerPersist {
-                reason: format!(
-                    "open spool catalog lock {} without following symlinks: {err}",
-                    lock_display.display()
-                ),
-            })?;
+        let lock_file =
+            crate::lock::open_or_create_exclusively(&spool.plan_lock_dir, &lock_name, &options)
+                .map_err(|err| IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "open spool catalog lock {} without following symlinks: {err}",
+                        lock_display.display()
+                    ),
+                })?;
         let metadata = lock_file
             .metadata()
             .map_err(|err| IdempotencyError::LedgerPersist {
@@ -3451,9 +3454,8 @@ impl IdempotencyStore {
         let lock_name = plan_lock_name(plan_id, plan_hash);
         let lock_display = spool.display_path.join(PLAN_LOCK_DIR_NAME).join(&lock_name);
         let options = lock_open_options();
-        let lock_file = spool
-            .plan_lock_dir
-            .open_with(&lock_name, &options)
+        let lock_file =
+            crate::lock::open_or_create_exclusively(&spool.plan_lock_dir, &lock_name, &options)
             .map_err(|err| IdempotencyError::LedgerPersist {
                 reason: format!(
                     "open plan catalog lock {} for plan {plan_id:?} ({plan_hash:016x}) without following symlinks: {err}",
@@ -3575,9 +3577,8 @@ impl IdempotencyStore {
         let lock_name = PathBuf::from(format!("plan-{digest}.proof.lock"));
         let lock_display = spool.display_path.join(KEY_LOCK_DIR_NAME).join(&lock_name);
         let options = lock_open_options();
-        let lock_file = spool
-            .key_lock_dir
-            .open_with(&lock_name, &options)
+        let lock_file =
+            crate::lock::open_or_create_exclusively(&spool.key_lock_dir, &lock_name, &options)
             .map_err(|err| IdempotencyError::LedgerPersist {
                 reason: format!(
                     "open {mode:?} transaction proof barrier {} for plan {plan_id:?} without following symlinks: {err}",
@@ -3638,16 +3639,15 @@ impl IdempotencyStore {
         let lock_name = PathBuf::from(format!("{key_hash}.lock"));
         let lock_display = spool.display_path.join(KEY_LOCK_DIR_NAME).join(&lock_name);
         let options = lock_open_options();
-        let lock_file = spool
-            .key_lock_dir
-            .open_with(&lock_name, &options)
-            .map_err(|err| IdempotencyError::LedgerPersist {
-                reason: format!(
-                    "open idempotency key lock {} for {} without following symlinks: {err}",
-                    lock_display.display(),
-                    idem_key.as_str()
-                ),
-            })?;
+        let lock_file =
+            crate::lock::open_or_create_exclusively(&spool.key_lock_dir, &lock_name, &options)
+                .map_err(|err| IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "open idempotency key lock {} for {} without following symlinks: {err}",
+                        lock_display.display(),
+                        idem_key.as_str()
+                    ),
+                })?;
         let metadata = lock_file
             .metadata()
             .map_err(|err| IdempotencyError::LedgerPersist {

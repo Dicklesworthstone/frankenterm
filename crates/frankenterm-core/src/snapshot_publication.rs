@@ -1484,10 +1484,7 @@ impl SnapshotPublicationStore {
         }
 
         let mut opts = snapshot_read_options();
-        opts.read(true)
-            .write(true)
-            .create(true)
-            .follow(FollowSymlinks::No);
+        opts.read(true).write(true).follow(FollowSymlinks::No);
 
         #[cfg(unix)]
         {
@@ -1496,16 +1493,12 @@ impl SnapshotPublicationStore {
         }
 
         for _ in 0..4 {
-            let cap_file = match self.root_dir.open_with(lock_leaf, &opts) {
-                Ok(file) => file,
-                // A create-open can report NotFound while another publisher
-                // creates the same name (cap-std's beneath-resolution on
-                // macOS fails this way in 3 of 4 concurrent first-time
-                // acquisitions). The name exists now: this is contention, so
-                // retry, ending as PublicationBusy like any other race.
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(PublicationError::io(&lock_path, error)),
-            };
+            // Publishers create this one name together. A non-exclusive
+            // create-open of it could fail NotFound on macOS; an exclusive
+            // create cannot (ft-nd1c0).
+            let cap_file =
+                crate::lock::open_or_create_exclusively(&self.root_dir, lock_leaf, &opts)
+                    .map_err(|error| PublicationError::io(&lock_path, error))?;
 
             check_opened_file_security(&cap_file, &lock_path)?;
 
