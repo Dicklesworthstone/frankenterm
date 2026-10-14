@@ -580,7 +580,7 @@ crossterm = "0.29.0"
 ftui = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/frankentui", rev = "18facd3f2a2c51b8b06ff589e6b905e6a63f5a96", default-features = false, features = ["runtime", "crossterm"] }
 
 # ZIP archives (for .ftx extension packages)
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.1", default-features = false, features = ["deflate"] }
 
 # WASM runtime (optional, for scripting/extensions)
 wasmtime = { version = "49.0.1", default-features = false, features = ["anyhow", "cranelift", "async", "component-model", "runtime", "std"] }
