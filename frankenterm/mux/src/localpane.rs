@@ -2392,37 +2392,7 @@ impl Pane for LocalPane {
         reads: &[frankenterm_term::screen::ScreenLineRead],
         publish: &mut dyn FnMut(),
     ) -> Result<bool, frankenterm_term::screen::ColdReadMetadataBusy> {
-        let _diagnostic = MetadataRefusalDiagnostic::new();
-        let mut term = self
-            .terminal
-            .try_lock()
-            .ok_or_else(|| metadata_busy(MetadataRefusalStage::PublishTerminal))?;
-        for read in reads {
-            if !term
-                .screen()
-                .try_validate_line_read(read)
-                .inspect_err(|_| {
-                    record_metadata_refusal(MetadataRefusalStage::PublishScreen);
-                })?
-            {
-                return Ok(false);
-            }
-        }
-        let changed = reads
-            .iter()
-            .any(|read| term.screen().line_read_changes_layout(read));
-        if changed {
-            if term.current_seqno() == SequenceNo::MAX {
-                return Ok(false);
-            }
-            term.increment_seqno();
-        }
-        let seqno = term.current_seqno();
-        for read in reads {
-            term.screen_mut().install_line_read_layout(read, seqno);
-        }
-        publish();
-        Ok(true)
+        self.publish_line_reads_waiting(reads, publish, Duration::ZERO)
     }
 
     fn get_line_layout(
@@ -2431,20 +2401,7 @@ impl Pane for LocalPane {
         Option<(SequenceNo, RenderableDimensions)>,
         frankenterm_term::screen::ColdReadMetadataBusy,
     > {
-        let _diagnostic = MetadataRefusalDiagnostic::new();
-        let mut term = self
-            .terminal
-            .try_lock()
-            .ok_or_else(|| metadata_busy(MetadataRefusalStage::LayoutTerminal))?;
-        let Some(floor) =
-            Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)?
-        else {
-            return Ok(None);
-        };
-        let Some(dimensions) = terminal_try_get_dimensions(&mut term) else {
-            return Ok(None);
-        };
-        Ok(Some((floor, dimensions)))
+        self.get_line_layout_waiting(Duration::ZERO)
     }
 
     fn publish_line_reads_at_layout(
@@ -2467,121 +2424,7 @@ impl Pane for LocalPane {
         &self,
         baseline: SequenceNo,
     ) -> Option<Result<PaneSurfaceSnapshot, frankenterm_term::screen::ColdReadMetadataBusy>> {
-        let _diagnostic = MetadataRefusalDiagnostic::new();
-        let mut term = match self.terminal.try_lock_as(TerminalLockHolder::Paint) {
-            Some(term) => term,
-            None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceTerminal))),
-        };
-        #[cfg(feature = "disruptor-pane-io")]
-        self.drain_action_ring_locked(&mut term);
-
-        match self.tmux_domain.try_lock() {
-            Some(guard) if guard.is_some() => return None,
-            Some(_) => {}
-            None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceTmux))),
-        }
-
-        let line_layout_floor =
-            match Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term) {
-                Ok(Some(floor)) => floor,
-                // Let the existing source-fence path retire an exhausted
-                // sequence domain instead of turning it into retryable busy.
-                Ok(None) if term.current_seqno() == SequenceNo::MAX => return None,
-                Ok(None) => {
-                    return Some(Err(metadata_busy(MetadataRefusalStage::LayoutUnavailable)))
-                }
-                Err(busy) => return Some(Err(busy)),
-            };
-
-        let dimensions = match terminal_try_get_dimensions(&mut term) {
-            Some(dims) => dims,
-            None => {
-                return Some(Err(metadata_busy(
-                    MetadataRefusalStage::DimensionsUnavailable,
-                )))
-            }
-        };
-
-        let mouse_grabbed = term.is_mouse_grabbed();
-        let alt_screen_active = term.is_alt_screen_active();
-
-        let tiered_scrollback_status = match term.screen().try_tiered_scrollback_status() {
-            Ok(status) => status.map(Into::into),
-            Err(busy) => {
-                record_metadata_refusal(MetadataRefusalStage::SinkUsage);
-                return Some(Err(busy));
-            }
-        };
-
-        let cursor_position = terminal_get_cursor_position(&mut term);
-
-        let source_sequence = term.current_seqno();
-
-        let damage_baseline = crate::pane::changed_since_query_baseline(baseline, source_sequence);
-
-        let viewport_range = match StableRowIndex::try_from(dimensions.viewport_rows)
-            .ok()
-            .and_then(|len| dimensions.physical_top.checked_add(len))
-        {
-            Some(end) => dimensions.physical_top..end,
-            None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceGeometry))),
-        };
-
-        let dirty_lines = terminal_get_dirty_lines(&mut term, viewport_range, damage_baseline);
-
-        let screen = term.screen();
-
-        let phys_start = match screen.stable_row_to_phys(dimensions.physical_top) {
-            Some(phys) => phys,
-            None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceGeometry))),
-        };
-        let phys_end = match phys_start.checked_add(dimensions.viewport_rows) {
-            Some(end) => end,
-            None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceGeometry))),
-        };
-        let lines = screen.lines_in_phys_range(phys_start..phys_end);
-        if lines.len() != dimensions.viewport_rows {
-            return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceGeometry)));
-        }
-        let viewport_lines = (dimensions.physical_top, lines);
-
-        let cursor_phys = match screen.stable_row_to_phys(cursor_position.y) {
-            Some(phys) => phys,
-            None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceGeometry))),
-        };
-        let cursor_end = match cursor_phys.checked_add(1) {
-            Some(end) => end,
-            None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceGeometry))),
-        };
-        let cursor_row_lines = screen.lines_in_phys_range(cursor_phys..cursor_end);
-        if cursor_row_lines.len() != 1 {
-            return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceGeometry)));
-        }
-        let cursor_lines = (cursor_position.y, cursor_row_lines);
-
-        let raw_title = term.get_title().to_string();
-        let cached_cwd = term.get_current_dir().cloned();
-
-        drop(term);
-
-        let title = self.resolve_pane_title(raw_title);
-        let working_dir =
-            cached_cwd.or_else(|| self.divine_current_working_dir(CachePolicy::AllowStale));
-
-        Some(Ok(PaneSurfaceSnapshot {
-            source_sequence,
-            line_layout_floor: Some(line_layout_floor),
-            dimensions,
-            mouse_grabbed,
-            alt_screen_active,
-            tiered_scrollback_status,
-            cursor_position,
-            title,
-            working_dir,
-            dirty_lines,
-            viewport_lines,
-            cursor_lines,
-        }))
+        self.capture_surface_snapshot_waiting(baseline, Duration::ZERO)
     }
 
     fn get_logical_lines(&self, lines: Range<StableRowIndex>) -> Vec<LogicalLine> {
@@ -6052,6 +5895,199 @@ impl LocalPane {
         }
         publish();
         Ok(true)
+    }
+
+    /// [`Pane::publish_line_reads`] waiting up to `wait` for the terminal
+    /// (ft-pjjeg); see [`Self::terminal_for_read`].
+    pub fn publish_line_reads_waiting(
+        &self,
+        reads: &[frankenterm_term::screen::ScreenLineRead],
+        publish: &mut dyn FnMut(),
+        wait: Duration,
+    ) -> Result<bool, frankenterm_term::screen::ColdReadMetadataBusy> {
+        let _diagnostic = MetadataRefusalDiagnostic::new();
+        let mut term = self
+            .terminal_for_read(wait)
+            .ok_or_else(|| metadata_busy(MetadataRefusalStage::PublishTerminal))?;
+        for read in reads {
+            if !term
+                .screen()
+                .try_validate_line_read(read)
+                .inspect_err(|_| {
+                    record_metadata_refusal(MetadataRefusalStage::PublishScreen);
+                })?
+            {
+                return Ok(false);
+            }
+        }
+        let changed = reads
+            .iter()
+            .any(|read| term.screen().line_read_changes_layout(read));
+        if changed {
+            if term.current_seqno() == SequenceNo::MAX {
+                return Ok(false);
+            }
+            term.increment_seqno();
+        }
+        let seqno = term.current_seqno();
+        for read in reads {
+            term.screen_mut().install_line_read_layout(read, seqno);
+        }
+        publish();
+        Ok(true)
+    }
+
+    /// [`Pane::get_line_layout`] waiting up to `wait` for the terminal
+    /// (ft-pjjeg); see [`Self::terminal_for_read`].
+    pub fn get_line_layout_waiting(
+        &self,
+        wait: Duration,
+    ) -> Result<
+        Option<(SequenceNo, RenderableDimensions)>,
+        frankenterm_term::screen::ColdReadMetadataBusy,
+    > {
+        let _diagnostic = MetadataRefusalDiagnostic::new();
+        let mut term = self
+            .terminal_for_read(wait)
+            .ok_or_else(|| metadata_busy(MetadataRefusalStage::LayoutTerminal))?;
+        let Some(floor) =
+            Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)?
+        else {
+            return Ok(None);
+        };
+        let Some(dimensions) = terminal_try_get_dimensions(&mut term) else {
+            return Ok(None);
+        };
+        Ok(Some((floor, dimensions)))
+    }
+
+    /// [`Pane::capture_surface_snapshot`] waiting up to `wait` for the
+    /// terminal as a paint does (ft-pjjeg): while it waits it registers
+    /// demand, so a flooding parser hands the lock over at its next slice
+    /// boundary (ft-yccm0.2.3). A zero wait only tries the lock.
+    pub fn capture_surface_snapshot_waiting(
+        &self,
+        baseline: SequenceNo,
+        wait: Duration,
+    ) -> Option<Result<PaneSurfaceSnapshot, frankenterm_term::screen::ColdReadMetadataBusy>> {
+        let _diagnostic = MetadataRefusalDiagnostic::new();
+        let mut term = match self
+            .terminal
+            .try_lock_for_as(TerminalLockHolder::Paint, wait)
+        {
+            Some(term) => term,
+            None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceTerminal))),
+        };
+        #[cfg(feature = "disruptor-pane-io")]
+        self.drain_action_ring_locked(&mut term);
+
+        match self.tmux_domain.try_lock() {
+            Some(guard) if guard.is_some() => return None,
+            Some(_) => {}
+            None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceTmux))),
+        }
+
+        let line_layout_floor =
+            match Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term) {
+                Ok(Some(floor)) => floor,
+                // Let the existing source-fence path retire an exhausted
+                // sequence domain instead of turning it into retryable busy.
+                Ok(None) if term.current_seqno() == SequenceNo::MAX => return None,
+                Ok(None) => {
+                    return Some(Err(metadata_busy(MetadataRefusalStage::LayoutUnavailable)))
+                }
+                Err(busy) => return Some(Err(busy)),
+            };
+
+        let dimensions = match terminal_try_get_dimensions(&mut term) {
+            Some(dims) => dims,
+            None => {
+                return Some(Err(metadata_busy(
+                    MetadataRefusalStage::DimensionsUnavailable,
+                )))
+            }
+        };
+
+        let mouse_grabbed = term.is_mouse_grabbed();
+        let alt_screen_active = term.is_alt_screen_active();
+
+        let tiered_scrollback_status = match term.screen().try_tiered_scrollback_status() {
+            Ok(status) => status.map(Into::into),
+            Err(busy) => {
+                record_metadata_refusal(MetadataRefusalStage::SinkUsage);
+                return Some(Err(busy));
+            }
+        };
+
+        let cursor_position = terminal_get_cursor_position(&mut term);
+
+        let source_sequence = term.current_seqno();
+
+        let damage_baseline = crate::pane::changed_since_query_baseline(baseline, source_sequence);
+
+        let viewport_range = match StableRowIndex::try_from(dimensions.viewport_rows)
+            .ok()
+            .and_then(|len| dimensions.physical_top.checked_add(len))
+        {
+            Some(end) => dimensions.physical_top..end,
+            None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceGeometry))),
+        };
+
+        let dirty_lines = terminal_get_dirty_lines(&mut term, viewport_range, damage_baseline);
+
+        let screen = term.screen();
+
+        let phys_start = match screen.stable_row_to_phys(dimensions.physical_top) {
+            Some(phys) => phys,
+            None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceGeometry))),
+        };
+        let phys_end = match phys_start.checked_add(dimensions.viewport_rows) {
+            Some(end) => end,
+            None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceGeometry))),
+        };
+        let lines = screen.lines_in_phys_range(phys_start..phys_end);
+        if lines.len() != dimensions.viewport_rows {
+            return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceGeometry)));
+        }
+        let viewport_lines = (dimensions.physical_top, lines);
+
+        let cursor_phys = match screen.stable_row_to_phys(cursor_position.y) {
+            Some(phys) => phys,
+            None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceGeometry))),
+        };
+        let cursor_end = match cursor_phys.checked_add(1) {
+            Some(end) => end,
+            None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceGeometry))),
+        };
+        let cursor_row_lines = screen.lines_in_phys_range(cursor_phys..cursor_end);
+        if cursor_row_lines.len() != 1 {
+            return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceGeometry)));
+        }
+        let cursor_lines = (cursor_position.y, cursor_row_lines);
+
+        let raw_title = term.get_title().to_string();
+        let cached_cwd = term.get_current_dir().cloned();
+
+        drop(term);
+
+        let title = self.resolve_pane_title(raw_title);
+        let working_dir =
+            cached_cwd.or_else(|| self.divine_current_working_dir(CachePolicy::AllowStale));
+
+        Some(Ok(PaneSurfaceSnapshot {
+            source_sequence,
+            line_layout_floor: Some(line_layout_floor),
+            dimensions,
+            mouse_grabbed,
+            alt_screen_active,
+            tiered_scrollback_status,
+            cursor_position,
+            title,
+            working_dir,
+            dirty_lines,
+            viewport_lines,
+            cursor_lines,
+        }))
     }
 
     /// [`Self::selection_anchor_snapshot`] waiting up to `wait` for the
@@ -16976,6 +17012,121 @@ mod tests {
             "a given-up wait was not served"
         );
         drop(held);
+    }
+
+    /// ft-pjjeg: the mux server's RPC reads of a pane (line reads, the
+    /// render-state observation) wait for its terminal like a paint does. The
+    /// wait registers demand, so a flooding parser hands the lock over at its
+    /// next slice; with no wait they only try, and are refused while the
+    /// parser holds the lock. Before the fix `ft get-text` of a pane printing
+    /// continuously was refused resource_busy in 28 of 30 attempts.
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    #[test]
+    fn rpc_reads_wait_for_a_flooding_parser_to_hand_the_terminal_over() {
+        type Read = Arc<dyn Fn(&LocalPane, Duration) -> bool + Send + Sync>;
+        let sink = Arc::new(ColdResizeTestSink::default());
+        sink.witness_admission.store(true, Ordering::Relaxed);
+        let mut terminal = Terminal::new(
+            term_size(20, 2),
+            Arc::new(ColdResizeTestConfig(sink.clone())),
+            "FrankenTerm",
+            "rpc-read-wait",
+            Box::new(Vec::new()),
+        );
+        terminal.advance_bytes(b"first\r\nsecond\r\nthird\r\nfourth\r\nfifth\r\n");
+        let pane = Arc::new(LocalPane::new(
+            722,
+            terminal,
+            Box::new(KillCountingChild {
+                kills: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            [0x82; 16],
+            "rpc-read-wait".to_string(),
+        ));
+        let first = *sink.rows.lock().1.first_key_value().unwrap().0;
+        let prior = Arc::new(
+            pane.capture_line_read(first..first + 1, &mut Default::default())
+                .unwrap()
+                .unwrap()
+                .with_requested_physical_rows_only()
+                .hydrate(|| false)
+                .unwrap(),
+        );
+        let reads: [(&str, Read); 4] = [
+            (
+                "capture_line_read",
+                Arc::new(move |pane: &LocalPane, wait| {
+                    matches!(
+                        pane.capture_line_read_waiting(
+                            first..first + 1,
+                            &mut Default::default(),
+                            wait
+                        ),
+                        Some(Ok(_))
+                    )
+                }),
+            ),
+            (
+                "publish_line_reads",
+                Arc::new(move |pane: &LocalPane, wait| {
+                    pane.publish_line_reads_waiting(std::slice::from_ref(&*prior), &mut || {}, wait)
+                        .is_ok()
+                }),
+            ),
+            (
+                "get_line_layout",
+                Arc::new(|pane: &LocalPane, wait| pane.get_line_layout_waiting(wait).is_ok()),
+            ),
+            (
+                "capture_surface_snapshot",
+                Arc::new(|pane: &LocalPane, wait| {
+                    matches!(pane.capture_surface_snapshot_waiting(0, wait), Some(Ok(_)))
+                }),
+            ),
+        ];
+        // A busy terminal is an Err (or Some(Err)); anything else means the
+        // read got the lock.
+        for (name, read) in reads {
+            assert!(
+                read(&pane, Duration::ZERO),
+                "{}: an idle terminal serves it",
+                name
+            );
+            let held = pane.terminal.lock_as(TerminalLockHolder::Parser);
+            assert!(
+                !read(&pane, Duration::ZERO),
+                "{}: a zero wait only tries",
+                name
+            );
+            assert!(
+                !pane.terminal.demanded(),
+                "{}: a zero wait registers no demand",
+                name
+            );
+            let waiting = {
+                let (pane, read) = (Arc::clone(&pane), Arc::clone(&read));
+                std::thread::spawn(move || read(&pane, Duration::from_secs(30)))
+            };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !pane.terminal.demanded() {
+                assert!(
+                    Instant::now() < deadline,
+                    "{}: the read never registered demand",
+                    name
+                );
+                std::thread::yield_now();
+            }
+            // The parser answers demand at its next slice boundary.
+            pane.terminal.hand_over(held);
+            assert!(
+                waiting.join().unwrap(),
+                "{}: the handed-over lock served the read",
+                name
+            );
+        }
     }
 
     #[test]

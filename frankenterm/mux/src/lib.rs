@@ -4767,6 +4767,102 @@ mod pane_registration_handle {
             self.pane.capture_surface_snapshot(baseline)
         }
 
+        fn local(&self) -> Option<&crate::localpane::LocalPane> {
+            self.pane.downcast_ref::<crate::localpane::LocalPane>()
+        }
+
+        /// [`Self::capture_surface_snapshot`] that waits up to `wait` for a
+        /// local pane's terminal, registering demand so a flooding parser
+        /// hands it over at its next slice (ft-pjjeg). Other panes only try.
+        pub fn capture_surface_snapshot_waiting(
+            &self,
+            baseline: termwiz::surface::SequenceNo,
+            wait: std::time::Duration,
+        ) -> Option<
+            Result<
+                crate::pane::PaneSurfaceSnapshot,
+                frankenterm_term::screen::ColdReadMetadataBusy,
+            >,
+        > {
+            match self.local() {
+                Some(local) => local.capture_surface_snapshot_waiting(baseline, wait),
+                None => self.pane.capture_surface_snapshot(baseline),
+            }
+        }
+
+        /// [`Self::capture_line_read`] waiting up to `wait` (ft-pjjeg); see
+        /// [`Self::capture_surface_snapshot_waiting`].
+        pub fn capture_line_read_waiting(
+            &self,
+            range: std::ops::Range<frankenterm_term::StableRowIndex>,
+            budget: &mut frankenterm_term::screen::LineReadCaptureBudget,
+            wait: std::time::Duration,
+        ) -> Option<anyhow::Result<frankenterm_term::screen::ScreenLineRead>> {
+            match self.local() {
+                Some(local) => local.capture_line_read_waiting(range, budget, wait),
+                None => self.pane.capture_line_read(range, budget),
+            }
+        }
+
+        /// [`Self::publish_line_reads`] waiting up to `wait` (ft-pjjeg); see
+        /// [`Self::capture_surface_snapshot_waiting`].
+        pub fn publish_line_reads_waiting(
+            &self,
+            reads: &[frankenterm_term::screen::ScreenLineRead],
+            publish: &mut dyn FnMut(),
+            wait: std::time::Duration,
+        ) -> Result<bool, frankenterm_term::screen::ColdReadMetadataBusy> {
+            match self.local() {
+                Some(local) => local.publish_line_reads_waiting(reads, publish, wait),
+                None => self.pane.publish_line_reads(reads, publish),
+            }
+        }
+
+        /// [`Self::get_line_layout`] waiting up to `wait` (ft-pjjeg); see
+        /// [`Self::capture_surface_snapshot_waiting`].
+        pub fn get_line_layout_waiting(
+            &self,
+            wait: std::time::Duration,
+        ) -> Result<
+            Option<(
+                termwiz::surface::SequenceNo,
+                crate::renderable::RenderableDimensions,
+            )>,
+            frankenterm_term::screen::ColdReadMetadataBusy,
+        > {
+            match self.local() {
+                Some(local) => local.get_line_layout_waiting(wait),
+                None => self.pane.get_line_layout(),
+            }
+        }
+
+        /// [`Self::publish_line_reads_at_layout`] waiting up to `wait`
+        /// (ft-pjjeg); see [`Self::capture_surface_snapshot_waiting`].
+        pub fn publish_line_reads_at_layout_waiting(
+            &self,
+            reads: &[frankenterm_term::screen::ScreenLineRead],
+            expected_seqno: termwiz::surface::SequenceNo,
+            expected_dimensions: crate::renderable::RenderableDimensions,
+            publish: &mut dyn FnMut(),
+            wait: std::time::Duration,
+        ) -> Result<bool, frankenterm_term::screen::ColdReadMetadataBusy> {
+            match self.local() {
+                Some(local) => local.publish_line_reads_at_layout_waiting(
+                    reads,
+                    expected_seqno,
+                    expected_dimensions,
+                    publish,
+                    wait,
+                ),
+                None => self.pane.publish_line_reads_at_layout(
+                    reads,
+                    expected_seqno,
+                    expected_dimensions,
+                    publish,
+                ),
+            }
+        }
+
         pub fn palette(&self) -> frankenterm_term::color::ColorPalette {
             self.pane.palette()
         }

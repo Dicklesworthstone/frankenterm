@@ -1,0 +1,45 @@
+# ft-pjjeg: tail reads of a streaming pane refused with resource_busy
+
+Native macOS (mac-studio, M5 Ultra, load 30-50 from other agents), 2026-10-14.
+
+`repro.sh BIN_DIR [reads] [producer]` starts a private mux server (own HOME, XDG
+dirs and socket) whose only pane runs `producer`, waits `WARM` seconds, then
+runs `ft get-text <pane> --tail 20` `reads` times and counts refusals, plus the
+server's `owned line read failed` log lines. `rate.py N` writes N 80-column
+lines every 10 ms. `ft` is the installed d79bd79 CLI in every run; only the
+server differs. base = installed d79bd79 server; fix = main d8dc89513 plus this
+change, release build.
+
+| producer | warm | base ok/total | fix ok/total |
+|---|---|---|---|
+| `cat /usr/share/dict/words` loop (max rate) | 3 s | 2/30 | 12/30 |
+| rate.py 10 (1,000 lines/s, 80 KB/s) | 8 s | — | 20/20 |
+| rate.py 100 (10,000 lines/s, 800 KB/s) | 6 s | 20/20 | 20/20 |
+| rate.py 1000 (100,000 lines/s, 8 MB/s), run 1 | 6 s | 15/20 | 12/20 |
+| rate.py 1000, run 2 | 6 s | 20/20 | 18/20 |
+
+Server-side refusals at max rate:
+- base: capture `metadata_busy` 19, plus the render-state fence (PDU114) refused
+  for 23 of the 28 failed reads. The client prints those as
+  `code=unknown_future`, because the project-level rejection codes have no
+  resource_busy.
+- fix: no `metadata_busy`. Every capture failure, 58 of 58, is "line read
+  layout changed or unavailable".
+
+## Cause (fixed here)
+The server's RPC reads took the pane's terminal with a bare `try_lock`, which
+registers no demand. A parser applying continuous output hands the lock over
+only to registered demand (ft-yccm0.2.3), so the reads almost never got it. Line
+reads (layout check, capture, publish) and the PDU114 render-state observation
+now wait up to 1 ms with demand registered, the main-thread bound GUI paints
+already use (ft-yccm0.2.2.3). Background pushes still only try.
+
+## Remaining (separate bead)
+At max rate the pane's line-layout floor moves on almost every observation,
+reaching the current seqno. A temporary log showed fence seqno 5565 against
+floor 5571, then 5578 vs 5580, and so on. `scrollback_rows` stays at 3524: the
+cold tier evicts its oldest rows continuously, and
+`refresh_cold_source_observation` counts start movement as a source change.
+Every fenced read issued even one or two seqnos earlier is then rejected, and
+after three re-fences the client gives up with `mux_text_snapshot_changed`. At
+≤800 KB/s per pane this does not happen.

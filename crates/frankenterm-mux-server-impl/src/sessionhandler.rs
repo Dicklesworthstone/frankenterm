@@ -220,6 +220,16 @@ struct LineReadPublicationChanged;
 #[error("cold read worker capacity exhausted")]
 struct LineReadWorkerCapacity;
 
+/// Longest an RPC read of a pane (a line read, or a render-state observation)
+/// waits on the owner thread for the pane's terminal lock, per lock taken
+/// (ft-pjjeg). While it waits it registers demand, so a flooding parser hands
+/// the lock over at its next slice boundary (ft-yccm0.2.3). A bare try_lock
+/// almost never found the lock free during a flood: `ft get-text` of a pane
+/// printing continuously failed with resource_busy in 28 of 30 attempts. 1 ms
+/// is the main-thread wait bound GUI paints use (ft-yccm0.2.2.3 AC3).
+/// Background pushes still only try.
+const RPC_READ_TERMINAL_WAIT: std::time::Duration = std::time::Duration::from_millis(1);
+
 fn line_read_failure_reason(error: &anyhow::Error) -> &'static str {
     if error
         .downcast_ref::<wezterm_term::screen::ColdReadPayloadLimit>()
@@ -3607,8 +3617,9 @@ impl PaneRenderBaseline {
         pane: &CurrentPane<'_>,
         force_with_input_dispatch_serial: Option<InputSerial>,
         force_for_atomic_effects: bool,
+        terminal_wait: std::time::Duration,
     ) -> SurfacePreparation {
-        let mut snapshot = match pane.capture_surface_snapshot(self.seqno) {
+        let mut snapshot = match pane.capture_surface_snapshot_waiting(self.seqno, terminal_wait) {
             Some(Ok(snapshot)) => Some(snapshot),
             Some(Err(_)) => return SurfacePreparation::MetadataBusy,
             None => None,
@@ -3621,7 +3632,7 @@ impl PaneRenderBaseline {
         // its layout floor. Contention must not look like history eviction.
         let (line_layout_floor, dims) = match snapshot.as_ref() {
             Some(snapshot) => (snapshot.line_layout_floor, snapshot.dimensions),
-            None => match pane.get_line_layout() {
+            None => match pane.get_line_layout_waiting(terminal_wait) {
                 Ok(Some((floor, dims))) => (Some(floor), dims),
                 Ok(None) => (self.line_layout_floor, pane.get_dimensions()),
                 Err(_) => return SurfacePreparation::MetadataBusy,
@@ -3810,10 +3821,12 @@ impl PerPane {
         pane: &CurrentPane<'_>,
         force_with_input_dispatch_serial: Option<InputSerial>,
     ) -> Result<Option<GetPaneRenderChangesResponse>, PaneRenderPreparationError> {
-        match self
-            .baseline
-            .prepare_surface_changes(pane, force_with_input_dispatch_serial, false)
-        {
+        match self.baseline.prepare_surface_changes(
+            pane,
+            force_with_input_dispatch_serial,
+            false,
+            std::time::Duration::ZERO,
+        ) {
             SurfacePreparation::MetadataBusy => {
                 self.mark_transactional_dirty();
                 Err(PaneRenderPreparationError::MetadataBusy)
@@ -3869,8 +3882,19 @@ fn prepare_legacy_render(
         state.ensure_legacy_transport_idle()?;
         (state.baseline.clone(), state.baseline_revision)
     };
-    let surface =
-        prior_baseline.prepare_surface_changes(pane, force_with_input_dispatch_serial, false);
+    // Only the correlated observation RPC (PDU114) may wait for a flooding
+    // parser; pushes keep their lock-contention pacing (ft-pjjeg).
+    let terminal_wait = if observe {
+        RPC_READ_TERMINAL_WAIT
+    } else {
+        std::time::Duration::ZERO
+    };
+    let surface = prior_baseline.prepare_surface_changes(
+        pane,
+        force_with_input_dispatch_serial,
+        false,
+        terminal_wait,
+    );
 
     let mut state = lock_per_pane_or_retire(per_pane, "publishing the legacy render baseline")?;
     state.ensure_legacy_transport_idle()?;
@@ -4490,6 +4514,7 @@ impl PaneRenderPreparation {
             pane,
             self.force_with_input_dispatch_serial,
             force_for_atomic_effects,
+            std::time::Duration::ZERO,
         );
 
         let (source_start, source_query, source_end) = match &surface {
@@ -10000,16 +10025,17 @@ impl SessionHandler {
                         let captured = recover_line_read_callback(|| {
                             with_current_pane(&authority, &registration, |pane| {
                                 if let Some(layout) = layout {
-                                    if !pane.get_line_layout()?.is_some_and(
-                                        |(floor, dimensions)| {
+                                    if !pane
+                                        .get_line_layout_waiting(RPC_READ_TERMINAL_WAIT)?
+                                        .is_some_and(|(floor, dimensions)| {
                                             floor <= layout.seqno
                                                 && layout.seqno <= pane.get_current_seqno()
                                                 && mux::renderable::same_line_layout_geometry(
                                                     &dimensions,
                                                     &layout.dimensions,
                                                 )
-                                        },
-                                    ) {
+                                        })
+                                    {
                                         pane.notify_lines_ready();
                                         return Err(anyhow!(
                                             "line read layout changed or unavailable"
@@ -10019,7 +10045,11 @@ impl SessionHandler {
                                 let mut budget =
                                     wezterm_term::screen::LineReadCaptureBudget::default();
                                 for range in &lines {
-                                    match pane.capture_line_read(range.clone(), &mut budget) {
+                                    match pane.capture_line_read_waiting(
+                                        range.clone(),
+                                        &mut budget,
+                                        RPC_READ_TERMINAL_WAIT,
+                                    ) {
                                         Some(plan) => retain_line_read_plan(
                                             &mut plans,
                                             plan?,
@@ -10145,13 +10175,19 @@ impl SessionHandler {
                                             }
                                         };
                                         let accepted = match layout {
-                                            Some(layout) => pane.publish_line_reads_at_layout(
+                                            Some(layout) => pane
+                                                .publish_line_reads_at_layout_waiting(
+                                                    plans,
+                                                    layout.seqno,
+                                                    layout.dimensions,
+                                                    &mut publish,
+                                                    RPC_READ_TERMINAL_WAIT,
+                                                )?,
+                                            None => pane.publish_line_reads_waiting(
                                                 plans,
-                                                layout.seqno,
-                                                layout.dimensions,
                                                 &mut publish,
+                                                RPC_READ_TERMINAL_WAIT,
                                             )?,
-                                            None => pane.publish_line_reads(plans, &mut publish)?,
                                         };
                                         if layout.is_some() && !accepted {
                                             pane.notify_lines_ready();
@@ -22148,17 +22184,23 @@ mod tests {
         registration
             .try_with_current(|current| {
                 let baseline = PaneRenderBaseline::default();
-                let SurfacePreparation::Changes(split) =
-                    baseline.prepare_surface_changes(&current, None, false)
-                else {
+                let SurfacePreparation::Changes(split) = baseline.prepare_surface_changes(
+                    &current,
+                    None,
+                    false,
+                    std::time::Duration::ZERO,
+                ) else {
                     panic!("initial split capture must contain a surface");
                 };
                 let prior_reads = pane.line_read_count.load(Ordering::Relaxed);
                 assert_eq!(prior_reads, 2);
                 pane.coherent_surface.store(true, Ordering::Release);
-                let SurfacePreparation::Changes(coherent) =
-                    baseline.prepare_surface_changes(&current, None, false)
-                else {
+                let SurfacePreparation::Changes(coherent) = baseline.prepare_surface_changes(
+                    &current,
+                    None,
+                    false,
+                    std::time::Duration::ZERO,
+                ) else {
                     panic!("coherent capture must contain the same surface");
                 };
                 assert_eq!(coherent.response, split.response);
@@ -22169,7 +22211,12 @@ mod tests {
 
                 pane.line_layout_busy.store(true, Ordering::Release);
                 assert!(matches!(
-                    baseline.prepare_surface_changes(&current, None, false),
+                    baseline.prepare_surface_changes(
+                        &current,
+                        None,
+                        false,
+                        std::time::Duration::ZERO
+                    ),
                     SurfacePreparation::MetadataBusy
                 ));
                 assert_eq!(pane.line_read_count.load(Ordering::Relaxed), prior_reads);
@@ -22583,20 +22630,28 @@ mod tests {
         let (_mux, registration) = register_test_pane(&pane);
         registration
             .try_with_current(|current| {
-                let SurfacePreparation::Changes(initial) =
-                    PaneRenderBaseline::default().prepare_surface_changes(&current, None, false)
+                let SurfacePreparation::Changes(initial) = PaneRenderBaseline::default()
+                    .prepare_surface_changes(&current, None, false, std::time::Duration::ZERO)
                 else {
                     panic!("initial surface");
                 };
                 let mut baseline = initial.baseline;
                 assert!(matches!(
-                    baseline.prepare_surface_changes(&current, None, false),
+                    baseline.prepare_surface_changes(
+                        &current,
+                        None,
+                        false,
+                        std::time::Duration::ZERO
+                    ),
                     SurfacePreparation::NoChange { .. }
                 ));
                 baseline.line_layout_floor = Some(8);
-                let SurfacePreparation::Changes(changed) =
-                    baseline.prepare_surface_changes(&current, None, false)
-                else {
+                let SurfacePreparation::Changes(changed) = baseline.prepare_surface_changes(
+                    &current,
+                    None,
+                    false,
+                    std::time::Duration::ZERO,
+                ) else {
                     panic!("layout-only change must be sent");
                 };
                 assert_eq!(changed.response.dirty_lines, vec![-1_000_000_000..0]);
@@ -22609,9 +22664,12 @@ mod tests {
                         .all(|(row, _)| *row >= 0)
                 );
                 assert!(matches!(
-                    changed
-                        .baseline
-                        .prepare_surface_changes(&current, None, false),
+                    changed.baseline.prepare_surface_changes(
+                        &current,
+                        None,
+                        false,
+                        std::time::Duration::ZERO
+                    ),
                     SurfacePreparation::NoChange { .. }
                 ));
             })
