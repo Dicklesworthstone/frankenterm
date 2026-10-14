@@ -30,7 +30,8 @@ cleanup() {
   for _ in $(seq 25); do kill -0 "$MUX_PID" 2>/dev/null || break; sleep 0.2; done
   kill -0 "$MUX_PID" 2>/dev/null && kill -9 "$MUX_PID"
   wait "$MUX_PID" 2>/dev/null
-  if [ "${KEEP:-0}" = 1 ]; then echo "kept $D"; else rm -rf -- "$D"; fi
+  # Never deletes (AGENTS.md RULE 1): the run directory stays for review.
+  echo "run directory kept: $D"
 }
 trap cleanup EXIT
 for _ in $(seq 150); do grep -q "pid=$MUX_PID" "$SOCK.lock" 2>/dev/null && [ -S "$SOCK" ] && break; sleep 0.2; done
