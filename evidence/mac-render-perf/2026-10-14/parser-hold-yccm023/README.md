@@ -37,6 +37,19 @@ ms (max 4.2-4.8 ms) in 80x12 and in 240x30 windows.
   runtime of the signed bundle blocks it, so the operation is not identified
   yet.
 
+mac-studio (M5 Ultra, load ~40). The window opened behind the operator's
+windows, so AppKit reported it occluded and it presented nothing; the parser
+ran with no paint demand.
+
+| run | hold p50 / p95 / p99 / max (ms) |
+|---|---|
+| T1 | 0.006 / 0.655 / 0.786 / 4.96 |
+| T0 | 0.005 / 0.786 / 0.918 / 1.54 |
+| T1 with `sample` attached (1 ms interrupts) | 0.057 / 1.835 / 2.621 / 5.87 |
+
+No 65-200 ms outlier occurred in three studio T1 runs.
+
 A slice check that yields before one more stretch would cross the 2 ms budget
-was written and then dropped. Holds here rarely reach the budget, so it had
-nothing to fix.
+was written and then dropped. Holds rarely reach the budget on either machine
+(p99 under 1.1 ms), so it had nothing to fix. The 2.6 ms p99 appeared only with
+the sampler attached.
