@@ -816,6 +816,41 @@ mod tests {
         .unwrap()
     }
 
+    /// ft-yccm0.2.5, the cache_gpu_handle fence on `MetalPanes.frames`: a
+    /// draw keeps only the frames of the panes it drew, so a pane no longer
+    /// drawn (a hidden tab, a closed split) drops its frame and the glyph
+    /// sources and image slices the frame held.
+    #[test]
+    fn a_pane_no_longer_drawn_drops_its_frame() {
+        config::use_test_configuration();
+        let config = config::configuration();
+        let fonts = Rc::new(FontConfiguration::new(Some(config), 144).unwrap());
+        let metrics = RenderMetrics::new(&fonts).unwrap();
+        let renderer = Rc::new(MetalRenderer::offscreen().expect("this Mac runs Metal"));
+        let (left, right) = (TestPane::new(9101), TestPane::new(9102));
+        let both = [
+            pane_request(&left, PixelRect::new(0, 0, 640, 768), true),
+            pane_request(&right, PixelRect::new(640, 0, 640, 768), false),
+        ];
+        let mut panes = MetalPanes::default();
+        let mut draw = |requests: &[MetalPaneRequest]| {
+            panes.draw(
+                requests,
+                &[],
+                None,
+                ClearColor::from_srgba(0.0, 0.0, 0.0, 1.0),
+                &fonts,
+                &metrics,
+                &renderer,
+                |frame, _| frame.is_some(),
+            );
+            panes.kept_frames()
+        };
+        assert_eq!(draw(&both), vec![9101, 9102]);
+        assert_eq!(draw(&both[..1]), vec![9101], "the hidden pane's frame is dropped");
+        assert_eq!(draw(&both), vec![9101, 9102], "and rebuilt when drawn again");
+    }
+
     /// Waits up to 20 s for `done`.
     fn eventually(mut done: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(20);

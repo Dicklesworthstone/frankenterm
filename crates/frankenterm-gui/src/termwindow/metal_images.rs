@@ -381,4 +381,41 @@ mod tests {
         let halved = sample_slice(&atlas, [4, 2], [0, 0], [4, 2], [0.0, 0.0, 1.0, 1.0], [2, 1]);
         assert_eq!(texels(&halved), [(1, 1), (3, 1)]);
     }
+
+    /// ft-yccm0.2.5, the cache_gpu_handle fence on `MetalPanes.frames`: an
+    /// image that outgrows the CPU texture replaces the texture together with
+    /// the glyph cache over it, and the outgrown texture is freed.
+    #[test]
+    fn an_outgrown_image_texture_is_freed_with_its_glyph_cache() {
+        use std::sync::Arc;
+        use termwiz::image::{ImageData, ImageDataType, TextureCoordinate};
+
+        config::use_test_configuration();
+        let fonts = Rc::new(FontConfiguration::new(None, 96).unwrap());
+        let mut slices = ImageSlices::new(&fonts).unwrap();
+        let first = Rc::downgrade(&slices.surface);
+        let side = u32::try_from(FIRST_SIDE + 100).unwrap();
+        let pixels = vec![255u8; (side * side * 4) as usize];
+        let image = ImageCell::new(
+            TextureCoordinate::new_f32(0.0, 0.0),
+            TextureCoordinate::new_f32(1.0, 1.0),
+            Arc::new(ImageData::with_data(ImageDataType::Rgba8 {
+                width: side,
+                height: side,
+                hash: ImageDataType::hash_bytes(&pixels),
+                data: pixels,
+            })),
+        );
+        // The image decodes in the background; frames poll it until it draws.
+        let deadline = Instant::now() + std::time::Duration::from_secs(20);
+        let mut drawn = slices.slice(&image, (8, 16)).is_some();
+        while !drawn && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            slices.begin_frame();
+            drawn = slices.slice(&image, (8, 16)).is_some();
+        }
+        assert!(drawn, "the image draws");
+        assert!(slices.side > FIRST_SIDE, "the texture grew to {}", slices.side);
+        assert!(first.upgrade().is_none(), "the outgrown texture is freed");
+    }
 }

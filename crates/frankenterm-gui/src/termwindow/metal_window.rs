@@ -466,6 +466,14 @@ impl MetalPanes {
         &self.rebuilt
     }
 
+    /// The panes whose frames the last draw kept, in pane order.
+    #[cfg(test)]
+    pub(crate) fn kept_frames(&self) -> Vec<PaneId> {
+        let mut panes: Vec<PaneId> = self.frames.keys().copied().collect();
+        panes.sort_unstable();
+        panes
+    }
+
     /// When the last draw's blinking text, blinking cursor or image cells (an
     /// animation, or an image still decoding) next need a frame, as the
     /// WebGpu renderer schedules its next frame for them.
