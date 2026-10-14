@@ -1768,7 +1768,14 @@ const PARSER_HOLD_BUDGET: Duration = Duration::from_millis(2);
 /// Without the wait, a paint during a flood almost always found the lock
 /// held and presented the old frame again: the default front end showed ~3
 /// new frames per second at ~26 presents (nv13 T0).
-const RENDER_CAPTURE_WAIT: Duration = Duration::from_millis(4);
+///
+/// 1 ms, the main-thread wait bound of ft-yccm0.2.2.3's AC3. The handoff
+/// almost always arrives inside it: in the native T0 A/B (evidence
+/// mac-render-perf/2026-10-12/capture-budget-and-atlas-ab) 1 ms kept the
+/// longest main-thread wait at about 1.5 ms where 4 ms let single waits reach
+/// 10-14 ms, halved total blocking, and reused a pane's last frame in 3-6
+/// presents per ~1000 instead of 2.
+const RENDER_CAPTURE_WAIT: Duration = Duration::from_millis(1);
 
 /// [`RENDER_CAPTURE_WAIT`], or `FRANKENTERM_RENDER_CAPTURE_WAIT_MS` when set
 /// (0: try the lock only, as before), read once.
