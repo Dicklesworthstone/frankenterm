@@ -105,6 +105,7 @@ impl crate::TermWindow {
                 (view, None, Some(snapshot))
             }
         };
+        let gpu_encode = procinfo::signpost_interval(procinfo::SignpostName::GpuEncode);
         let mut encoder = webgpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -251,8 +252,10 @@ impl crate::TermWindow {
         // are synchronously infallible. Device-loss errors reported later by
         // wgpu are outside this synchronous seam; a successful return does not
         // prove asynchronous GPU completion or visible scanout.
+        let command_buffer = encoder.finish();
+        drop(gpu_encode);
         let _submission = webgpu.profile_native_stage("submit", || {
-            webgpu.queue.submit(std::iter::once(encoder.finish()))
+            webgpu.queue.submit(std::iter::once(command_buffer))
         });
         if let Some(readback) = readback {
             if let Err(err) = readback.finish(&webgpu.device) {

@@ -1263,7 +1263,14 @@ impl WebGpuState {
         } else {
             None
         };
+        // Instruments signposts (ft-yccm0.1.5) for the stages it names.
+        let signpost = match stage {
+            "submit" => procinfo::signpost_interval(procinfo::SignpostName::Commit),
+            "present" => procinfo::signpost_interval(procinfo::SignpostName::PresentCallback),
+            _ => procinfo::SignpostInterval::inert(),
+        };
         let result = work();
+        drop(signpost);
         if let Some(begin) = begin {
             if let Some(end) = self.native_submission_mach_ns() {
                 log::debug!(

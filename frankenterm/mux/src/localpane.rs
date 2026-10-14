@@ -6672,6 +6672,7 @@ impl LocalPane {
         rules: &[termwiz::hyperlink::Rule],
         detect_password_input: bool,
     ) -> Option<NativeRenderFrame> {
+        let _snapshot = procinfo::signpost_interval(procinfo::SignpostName::RenderSnapshot);
         let mut term = self
             .terminal
             .try_lock_for_as(TerminalLockHolder::Paint, render_capture_wait())?;
@@ -18845,6 +18846,26 @@ mod tests {
             blocked,
             budget
         );
+    }
+
+    /// With signposts on, a paint capture opens a "render snapshot" interval
+    /// and a paint terminal-lock interval (macOS); elsewhere they are no-ops.
+    #[test]
+    fn render_captures_request_signpost_intervals_when_enabled() {
+        let pane = render_facts_test_pane(795);
+        procinfo::set_signposts_enabled(true);
+        let before = procinfo::signpost_intervals_requested();
+        let captured = pane
+            .try_capture_render_frame(None, 0, 0, &[], false)
+            .is_some();
+        let after = procinfo::signpost_intervals_requested();
+        procinfo::set_signposts_enabled(false);
+        assert!(captured, "an idle pane captures");
+        if cfg!(target_os = "macos") {
+            assert!(after >= before + 2, "{} -> {}", before, after);
+        } else {
+            assert_eq!(after, before);
+        }
     }
 
     /// With signposts on, a parse batch opens a "parse batch" interval and a
