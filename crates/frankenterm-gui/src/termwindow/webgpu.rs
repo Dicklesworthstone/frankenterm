@@ -1207,10 +1207,12 @@ fn should_configure_surface(
 }
 
 /// `opaque`: the window draws no translucent pixels. On Metal, wgpu sets the
-/// CAMetalLayer's opaque flag from this mode, and WindowServer rebuilds the
-/// shadow of a shadowed window over a non-opaque layer from the layer's alpha
-/// on every presented frame: about twice the compositing cost of a
-/// translucent window (ft-yccm0.7).
+/// CAMetalLayer's opaque flag from this mode, as the Metal front end sets it
+/// for the same windows, so the compositor need not blend the layer. It does
+/// not make the window shadow cheaper: with three shadowed windows presenting
+/// at 56 fps, WindowServer's GPU share was the same with an opaque layer
+/// (28.7%) as without (28.8%), and 6.1% with the shadow disabled
+/// (ft-yccm0.7, mac-mini-old, 2026-10-14).
 fn select_composite_alpha_mode(
     alpha_modes: &[wgpu::CompositeAlphaMode],
     opaque: bool,
