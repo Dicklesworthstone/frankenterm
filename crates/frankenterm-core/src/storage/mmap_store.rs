@@ -149,6 +149,16 @@ pub enum MmapStoreError {
     TruncateIntoPrunedPrefix { next_seq: u64, oldest: u64 },
 }
 
+impl MmapStoreError {
+    /// A read-only snapshot saw the pane log or sequence journal change while
+    /// it read them: a race with that pane's live writer, not damage. The
+    /// caller may retry the snapshot.
+    #[must_use]
+    pub fn is_concurrent_change(&self) -> bool {
+        matches!(self, Self::InvalidPaneLogHeader(detail) if detail.ends_with("changed during snapshot"))
+    }
+}
+
 const COLD_ERASURE_DATA_SHARDS: usize = 3;
 const COLD_ERASURE_TOTAL_SHARDS: usize = 5;
 const COLD_ERASURE_VERSION: u8 = 1;

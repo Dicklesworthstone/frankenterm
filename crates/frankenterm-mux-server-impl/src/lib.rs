@@ -6447,6 +6447,31 @@ pub const LIVE_SCROLLBACK_EXPORT_MAX_TRANSCRIPT_BYTES: usize = 256 * 1024 * 1024
 pub const LIVE_SCROLLBACK_EXPORT_MAX_PHYSICAL_BYTES: u64 = 1024 * 1024 * 1024;
 const LIVE_SCROLLBACK_DISCOVERY_EXTRA_ENTRIES: usize = 4096;
 
+/// Discovery attempts after the first when a pane's store refused it.
+const LIVE_SCROLLBACK_DISCOVERY_RETRIES: usize = 3;
+const LIVE_SCROLLBACK_DISCOVERY_RETRY_PAUSE: std::time::Duration =
+    std::time::Duration::from_millis(25);
+
+/// A live pane's store changed while discovery read it: a race with the
+/// writer, which republishes a busy pane's manifest about once a second (and
+/// with every overload gap marker), not evidence of corruption.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct LiveScrollbackChangedDuringDiscovery(&'static str);
+
+/// Whether discovery lost a race with the pane's writer: the manifest or
+/// directory changed, or the ledger snapshot saw its files change.
+fn live_scrollback_discovery_raced_writer(error: &anyhow::Error) -> bool {
+    error.is::<LiveScrollbackChangedDuringDiscovery>()
+        || error.chain().any(|cause| {
+            cause
+                .downcast_ref::<frankenterm_core::storage::mmap_store::MmapStoreError>()
+                .is_some_and(
+                    frankenterm_core::storage::mmap_store::MmapStoreError::is_concurrent_change,
+                )
+        })
+}
+
 /// Read a pane ledger as its manifest publishes it (ft-yccm0.2.1.2). A
 /// complete authenticated v4 manifest names a prefix that the ledger may
 /// extend with a durable, not yet published tail; that tail reads as an
@@ -17188,7 +17213,7 @@ pub fn list_live_scrollback_panes(
     let mut panes = Vec::with_capacity(pane_paths.len());
     for (durable_pane_id, pane_path) in pane_paths {
         let manifest_path = pane_path.join("manifest.json");
-        let result = (|| -> anyhow::Result<LiveScrollbackManifestV1> {
+        let discover = || -> anyhow::Result<LiveScrollbackManifestV1> {
             let metadata_before = validate_live_scrollback_directory(&pane_path, true)?;
             let manifest_before = LiveScrollbackSpillSink::read_manifest(&manifest_path)?
                 .ok_or_else(|| anyhow::anyhow!("live scrollback manifest is missing"))?;
@@ -17235,13 +17260,16 @@ pub fn list_live_scrollback_panes(
                 } else {
                     None
                 };
-            let manifest_after = LiveScrollbackSpillSink::read_manifest(&manifest_path)?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("live scrollback manifest disappeared during discovery")
-                })?;
+            let manifest_after = LiveScrollbackSpillSink::read_manifest(&manifest_path)?.ok_or(
+                LiveScrollbackChangedDuringDiscovery(
+                    "live scrollback manifest disappeared during discovery",
+                ),
+            )?;
             anyhow::ensure!(
                 manifest_before == manifest_after,
-                "live scrollback manifest changed during discovery"
+                LiveScrollbackChangedDuringDiscovery(
+                    "live scrollback manifest changed during discovery"
+                )
             );
             validate_live_scrollback_manifest_identity(
                 &manifest_after,
@@ -17285,10 +17313,34 @@ pub fn list_live_scrollback_panes(
             let metadata_after = std::fs::symlink_metadata(&pane_path)?;
             anyhow::ensure!(
                 !filesystem_metadata_changed(&metadata_before, &metadata_after)?,
-                "live scrollback pane directory changed during discovery"
+                LiveScrollbackChangedDuringDiscovery(
+                    "live scrollback pane directory changed during discovery"
+                )
             );
             Ok(manifest_after)
-        })();
+        };
+        // A busy pane's writer republishes while discovery reads, and a
+        // publication prunes the ledger before it writes the new manifest, so
+        // a refusal can be a race rather than damage. Retry a few times; a
+        // refusal that persists while the manifest kept changing between
+        // attempts is a live writer (changing), and one that persists over
+        // an unchanged manifest is damage (corrupt).
+        let probe = || {
+            LiveScrollbackSpillSink::read_manifest(&manifest_path)
+                .ok()
+                .flatten()
+        };
+        let first_probe = probe();
+        let mut writer_active = false;
+        let mut result = discover();
+        for _ in 0..LIVE_SCROLLBACK_DISCOVERY_RETRIES {
+            if result.is_ok() {
+                break;
+            }
+            std::thread::sleep(LIVE_SCROLLBACK_DISCOVERY_RETRY_PAUSE);
+            writer_active |= first_probe.is_none() || probe() != first_probe;
+            result = discover();
+        }
         match result {
             Ok(manifest) => panes.push(LiveScrollbackDurablePane {
                 durable_pane_id,
@@ -17304,7 +17356,12 @@ pub fn list_live_scrollback_panes(
             }),
             Err(error) => panes.push(LiveScrollbackDurablePane {
                 durable_pane_id,
-                state: "corrupt".to_string(),
+                state: if writer_active || live_scrollback_discovery_raced_writer(&error) {
+                    "changing"
+                } else {
+                    "corrupt"
+                }
+                .to_string(),
                 source_pane_id: None,
                 source_domain_id: None,
                 command_description: None,
@@ -21864,6 +21921,72 @@ mod tests {
                 "{step}"
             );
         }
+    }
+
+    /// A busy pane's writer republishes its manifest while `ft session
+    /// list-durable` reads the store. Losing that race is not corruption:
+    /// discovery retries, and a store that keeps changing lists as
+    /// "changing", never "corrupt". The ft-yccm0.2.1.6 native stress receipt
+    /// listed a flooding pane as corrupt on every attempt.
+    #[test]
+    fn listing_a_store_its_writer_keeps_republishing_never_reports_corrupt() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const RETENTION: usize = 64;
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(
+            LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                .unwrap(),
+        );
+        let first = Line::from_text("busy", &CellAttributes::blank(), 1, None);
+        assert!(sink.store_scrollback_line(0, &first, RETENTION));
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (sink, stop) = (Arc::clone(&sink), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                // Each gap marker is its own transaction and publication.
+                let mut row: wezterm_term::StableRowIndex = 1;
+                while !stop.load(Ordering::Acquire) {
+                    let marker = Line::from_text(
+                        &format!(
+                            "[durability gap: 1 rows ({row}..{}), 10 bytes, reason=overload, at_unix_ms=1]",
+                            row + 1
+                        ),
+                        &CellAttributes::blank(),
+                        1,
+                        None,
+                    );
+                    assert!(sink.store_scrollback_gap_marker(row, &marker, RETENTION, 1, 10));
+                    row += 1;
+                }
+                row
+            })
+        };
+        let mut changing = 0;
+        for _ in 0..100 {
+            let panes = list_live_scrollback_panes(dir.path(), 16).unwrap();
+            assert_eq!(panes.len(), 1);
+            match panes[0].state.as_str() {
+                "changing" => changing += 1,
+                "corrupt" => panic!(
+                    "a republished store listed as corrupt: {:?}",
+                    panes[0].error
+                ),
+                _ => {}
+            }
+        }
+        stop.store(true, Ordering::Release);
+        let rows = writer.join().unwrap();
+        assert!(rows > 2, "the writer republished during the listings");
+        eprintln!(
+            "listings that saw a changing store: {changing}/100, markers written: {}",
+            rows - 1
+        );
+        let settled = list_live_scrollback_panes(dir.path(), 16).unwrap();
+        assert!(
+            settled[0].state != "changing" && settled[0].state != "corrupt",
+            "a quiet store lists as written: {:?}",
+            settled[0]
+        );
     }
 
     #[test]
