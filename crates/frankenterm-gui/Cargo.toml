@@ -127,6 +127,7 @@ termwiz.workspace = true
 umask.workspace = true
 mux-lua.workspace = true
 url-funcs.workspace = true
+window-funcs.workspace = true
 # Workspace aliases (wezterm-* -> frankenterm-* packages)
 # NOTE: frankenterm-dynamic is the canonical dep name. The extern crate alias
 # in main.rs provides `wezterm_dynamic` for vendored code that uses the old name.

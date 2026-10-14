@@ -4373,6 +4373,7 @@ dependencies = [
  "wgpu",
  "winapi",
  "window",
+ "window-funcs",
  "windows",
 ]
 
@@ -13157,6 +13158,17 @@ dependencies = [
  "xkbcommon",
  "zbus",
  "zvariant",
+]
+
+[[package]]
+name = "window-funcs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "config",
+ "frankenterm-dynamic",
+ "luahelper",
+ "window",
 ]
 
 [[package]]

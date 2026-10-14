@@ -2908,10 +2908,13 @@ fn log_gui_hook_result(event_name: &str, result: anyhow::Result<bool>) {
 }
 
 fn register_gui_lua_modules() {
-    let setup_funcs: [config::lua::SetupFunc; 5] = [
+    let setup_funcs: [config::lua::SetupFunc; 6] = [
         termwiz_funcs::register,
         mux_lua::register,
         url_funcs::register,
+        // `gui.screens()` and `gui.get_appearance()`: GUI-only, so the
+        // headless mux server does not register them.
+        window_funcs::register,
         scripting::register,
         stats::register,
     ];
@@ -3966,6 +3969,26 @@ fn maybe_show_configuration_error_window() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The GUI's Lua context has `gui.get_appearance()` and `gui.screens()`
+    /// (window-funcs, unregistered since the GUI was vendored). Configs pick
+    /// a light or dark theme with the first; with no window connection yet it
+    /// answers "Light".
+    #[test]
+    fn gui_lua_context_has_window_funcs() {
+        register_gui_lua_modules();
+        let lua = config::lua::make_lua_context(std::path::Path::new("")).expect("lua context");
+        let appearance: String = lua
+            .load("return require('frankenterm').gui.get_appearance()")
+            .eval()
+            .expect("gui.get_appearance()");
+        assert_eq!(appearance, "Light");
+        let screens: String = lua
+            .load("return type(require('wezterm').gui.screens)")
+            .eval()
+            .expect("type of gui.screens");
+        assert_eq!(screens, "function");
+    }
 
     /// ft-yccm0.2.8: this binary links the GUI's `malloc_conf` export, so the
     /// running jemalloc must report exactly the tuned options. Reading them

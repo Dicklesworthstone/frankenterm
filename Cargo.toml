@@ -90,6 +90,7 @@ members = [
     "frankenterm/tabout",
     "frankenterm/lua-api-crates/mux-lua",
     "frankenterm/lua-api-crates/url-funcs",
+    "frankenterm/lua-api-crates/window-funcs",
 ]
 exclude = [
     "frankenterm/char-props/codegen",
@@ -557,6 +558,7 @@ wezterm-surface = { path = "frankenterm/surface", package = "frankenterm-surface
 tabout = { path = "frankenterm/tabout" }
 mux-lua = { path = "frankenterm/lua-api-crates/mux-lua" }
 url-funcs = { path = "frankenterm/lua-api-crates/url-funcs" }
+window-funcs = { path = "frankenterm/lua-api-crates/window-funcs" }
 frankenterm-mux-server-impl = { path = "crates/frankenterm-mux-server-impl" }
 frankenterm-sigpipe = { path = "crates/frankenterm-sigpipe" }
 frankenterm-renderer-metal = { path = "crates/frankenterm-renderer-metal" }
