@@ -1,0 +1,4 @@
+A visible: {'fps': 46.0, 'Owned physical footprint (unmapped) (graphics)': 100.0, 'IOSurface': 44.0, 'IOAccelerator (graphics)': 6.0, 'footprint_mib': 250.0}
+A minimized, +12 s: {'fps': 0.0, 'IOSurface': 44.0, 'Owned physical footprint (unmapped) (graphics)': 12.0, 'IOAccelerator (graphics)': 3.4, 'footprint_mib': 159.0}
+A restored: first new frame 2.51 s after t=39.5
+A restored, +3 s: {'fps': 48.1, 'Owned physical footprint (unmapped) (graphics)': 102.0, 'IOSurface': 44.0, 'IOAccelerator (graphics)': 6.0, 'footprint_mib': 257.0}
