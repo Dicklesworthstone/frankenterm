@@ -59,3 +59,19 @@ therefore holds about 42k rows. At this flood rate that is about 0.1 s of
 output, which is why even the default budget sheds rows on this machine.
 Queueing compressed rows (`compress_for_scrollback`) would make the same
 budget hold an order of magnitude more.
+
+## Follow-up: charge rows at their real size
+
+The queue now charges a row `Line::retained_bytes()`: text and attribute runs
+for a clustered row, the usual spilled form. Before, every row was charged as
+a `Cell` per column. Same new `ft` in both arms, 64 MiB budget, interleaved
+(`charge-ab.txt`):
+
+| arm | bytes per gap row | gap markers per 10 s run | rows durably written |
+|---|---|---|---|
+| old server (08:23 build) | ~1,588 | 55, 24, 124 | 2.4%, 0.4%, 0.1% |
+| new server | ~252 | 20, 18, 27 | 8.9%, 4.9%, 18% |
+
+The ingest rate is unchanged (0.55-0.68 vs 0.59-0.62 M lines/s). Fewer
+markers leave more real rows in the retained window. The budget remains a
+true bound on queued memory; before, it held about a sixth of what it allowed.

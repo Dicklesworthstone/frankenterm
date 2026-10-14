@@ -1609,13 +1609,11 @@ mod deferred_scrollback {
         // Charges cell storage and grapheme bytes without allocating a second
         // text serialization under the terminal lock. Shared attribute/image
         // payloads are not a claim about total process memory usage.
+        /// Queue memory a row holds: its retained bytes, so a clustered row
+        /// (the usual form by the time it spills) is charged its text and
+        /// attribute runs rather than a Cell per column (ft-yccm0.2.1.6).
         pub(super) fn row_charge(line: &Line) -> Option<usize> {
-            let cells = line
-                .len()
-                .checked_mul(std::mem::size_of::<wezterm_term::Cell>())?;
-            cells
-                .checked_add(std::mem::size_of::<Line>())?
-                .checked_add(line.visible_text_bytes()?)
+            line.retained_bytes()
         }
 
         /// The caller holds drain_gate. Snapshot callers also hold operation,
@@ -19076,10 +19074,12 @@ mod tests {
         // queue held, and overflow sheds the oldest queued rows into an
         // explicit gap. The parser never waits, and no row disappears.
         let (_dir, backing, deferred) = deferred_test_sink();
-        let row_bytes = deferred_scrollback::DeferredScrollbackSpillSink::row_charge(
-            &Line::from_text("retained", &CellAttributes::blank(), 0, None),
-        )
-        .unwrap();
+        // Rows spill in the clustered form the screen compresses them to, and
+        // are charged at that size (ft-yccm0.2.1.6).
+        let mut spilled = Line::from_text("retained", &CellAttributes::blank(), 0, None);
+        spilled.compress_for_scrollback();
+        let row_bytes =
+            deferred_scrollback::DeferredScrollbackSpillSink::row_charge(&spilled).unwrap();
         let budget = LIVE_SCROLLBACK_APPEND_MAX_ROWS * row_bytes;
         deferred.set_writer_budget(budget);
         let pane = deferred_test_pane(deferred.clone(), 8192);

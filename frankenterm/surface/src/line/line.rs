@@ -1329,6 +1329,36 @@ impl Line {
         }
     }
 
+    /// Approximate bytes an owned copy of this line keeps allocated: the
+    /// struct, its zones and its cells. Clustered storage counts its text,
+    /// attribute runs and their heap (the snapshot clone cost) behind its
+    /// `Arc`; vector storage counts one `Cell` per column plus its visible
+    /// text, an upper bound for grapheme text kept out of line. Shared
+    /// payloads (hyperlinks, images) are not counted. For charging memory
+    /// budgets such as the durability queue, which billed every row as
+    /// vector cells and so held about a tenth of the clustered rows it could
+    /// (ft-yccm0.2.1.6). `None` on overflow.
+    pub fn retained_bytes(&self) -> Option<usize> {
+        let zone_bytes = self
+            .zones
+            .len()
+            .checked_mul(core::mem::size_of::<ZoneRange>())?;
+        let cell_bytes = match &self.cells {
+            CellStorage::V(_) => self
+                .len()
+                .checked_mul(core::mem::size_of::<Cell>())?
+                .checked_add(self.visible_text_bytes()?)?,
+            CellStorage::C(line) => line
+                .snapshot_clone_cost(usize::MAX)?
+                .0
+                .checked_add(core::mem::size_of::<ClusteredLine>())?
+                .checked_add(2 * core::mem::size_of::<usize>())?,
+        };
+        core::mem::size_of::<Self>()
+            .checked_add(zone_bytes)?
+            .checked_add(cell_bytes)
+    }
+
     /// Count UTF-8 bytes in visible cells, excluding wide-cell padding.
     /// Clustered storage already owns the contiguous visible text, so this
     /// path neither allocates nor repeats Unicode grapheme segmentation.
@@ -4542,6 +4572,30 @@ mod tests {
             line.compress_for_scrollback();
             assert_eq!(line.visible_text_bytes(), expected);
         }
+    }
+
+    /// ft-yccm0.2.1.6: a clustered row is charged its text and attribute
+    /// runs, a vector row one Cell per column. A plain 62-column row, the
+    /// usual spilled form, costs a small fraction clustered.
+    #[test]
+    fn retained_bytes_charges_clustered_rows_their_text_not_a_cell_per_column() {
+        let text = alloc::format!("seq {:012} {}", 1, "y".repeat(45));
+        let vector = Line::from_text(&text, &CellAttributes::blank(), 1, None);
+        assert!(vector.clustered_storage_owners().is_none());
+        let mut clustered = vector.clone();
+        clustered.compress_for_scrollback();
+        assert!(clustered.clustered_storage_owners().is_some());
+        assert_eq!(clustered.as_str(), vector.as_str());
+        let vector_bytes = vector.retained_bytes().unwrap();
+        let clustered_bytes = clustered.retained_bytes().unwrap();
+        assert!(vector_bytes >= text.len() * core::mem::size_of::<Cell>());
+        assert!(clustered_bytes >= text.len() + core::mem::size_of::<Line>());
+        assert!(
+            clustered_bytes * 5 < vector_bytes,
+            "clustered {} vs vector {}",
+            clustered_bytes,
+            vector_bytes
+        );
     }
 
     #[test]
