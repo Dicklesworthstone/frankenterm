@@ -15,7 +15,6 @@ usage: ws_gpu_ab.py OLD.app NEW.app [cycles]
 import json
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -153,7 +152,8 @@ try:
             rows.append(block(arm, app, n, noshadow))
             time.sleep(4)
 finally:
-    shutil.rmtree(D, ignore_errors=True)
+    # Never deletes (AGENTS.md RULE 1).
+    print('run directory kept:', D)
 
 for arm in ('old', 'new', 'new-noshadow'):
     ws = sorted(r['windowserver_gpu_pct'] for r in rows if r and r['arm'] == arm)

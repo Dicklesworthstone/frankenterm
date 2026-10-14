@@ -240,16 +240,6 @@ fn bounded_active_background_layer_count(requested: usize) -> usize {
     requested.min(MAX_ACTIVE_BACKGROUND_LAYERS)
 }
 
-/// The window draws no translucent pixels, so its GPU layer can be opaque:
-/// only a configured transparency or background layer makes it translucent.
-/// Decided from the configuration rather than the loaded layers, which arrive
-/// asynchronously after the first frames. The legacy
-/// `window_background_image`/`window_background_gradient` options become
-/// `background` layers when the configuration is resolved.
-pub(crate) fn window_content_is_opaque(config: &config::Config) -> bool {
-    config.background.is_empty() && config.window_background_opacity >= 1.0
-}
-
 fn background_image_validation_limits(max_decoded_bytes: usize) -> ImageDataValidationLimits {
     ImageDataValidationLimits {
         max_decoded_bytes: max_decoded_bytes.min(MAX_BACKGROUND_DECODED_BYTES),
@@ -3437,20 +3427,5 @@ mod tests {
             ),
             (300, 300)
         );
-    }
-
-    #[test]
-    fn window_content_is_opaque_only_without_transparency_or_layers() {
-        let mut config = config::Config::default_config();
-        assert!(window_content_is_opaque(&config));
-
-        config.window_background_opacity = 0.95;
-        assert!(!window_content_is_opaque(&config));
-
-        config.window_background_opacity = 1.0;
-        config.window_background_gradient = Some(test_gradient(GradientOrientation::Vertical, None));
-        let layer = BackgroundLayer::with_legacy(&config).expect("legacy gradient layer");
-        config.background = vec![layer];
-        assert!(!window_content_is_opaque(&config));
     }
 }

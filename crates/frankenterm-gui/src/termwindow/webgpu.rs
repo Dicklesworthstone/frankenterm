@@ -1460,7 +1460,7 @@ impl WebGpuState {
         // <https://github.com/wezterm/wezterm/issues/3565>
         let view_formats = select_surface_view_formats(format, &downlevel_caps);
         let (surface_width, surface_height) = initial_surface_extent(dimensions);
-        let opaque_content = super::background::window_content_is_opaque(config);
+        let opaque_content = config.window_content_is_opaque();
         let alpha_mode = select_composite_alpha_mode(&caps.alpha_modes, opaque_content);
 
         // ft-mpc9b.10.3: log the chosen surface's color space at

@@ -132,6 +132,30 @@ impl BackgroundLayer {
             height: BackgroundSize::Dimension(Dimension::Percent(1.)),
         })
     }
+
+    /// Whether this layer covers the whole window with opaque pixels: an
+    /// opaque color or gradient at full opacity, sized to the window and
+    /// fixed to its border box. An image file is never assumed opaque.
+    pub fn fills_window_opaquely(&self) -> bool {
+        let opaque_source = match &self.source {
+            BackgroundSource::Color(color) => color.3 >= 1.0,
+            BackgroundSource::Gradient(gradient) => gradient.is_opaque(),
+            BackgroundSource::File(_) => false,
+        };
+        let fills = |size: &BackgroundSize| match size {
+            BackgroundSize::Cover => true,
+            BackgroundSize::Dimension(Dimension::Percent(fraction)) => *fraction >= 1.0,
+            BackgroundSize::Contain | BackgroundSize::Dimension(_) => false,
+        };
+        opaque_source
+            && self.opacity >= 1.0
+            && matches!(self.origin, BackgroundOrigin::BorderBox)
+            && matches!(self.attachment, BackgroundAttachment::Fixed)
+            && self.horizontal_offset.is_none()
+            && self.vertical_offset.is_none()
+            && fills(&self.width)
+            && fills(&self.height)
+    }
 }
 
 /// <https://developer.mozilla.org/en-US/docs/Web/CSS/background-size>
@@ -463,6 +487,15 @@ pub struct Gradient {
 impl_lua_conversion_dynamic!(Gradient);
 
 impl Gradient {
+    /// Whether every color of the gradient parses and is opaque. Presets are.
+    pub fn is_opaque(&self) -> bool {
+        self.preset.is_some()
+            || (!self.colors.is_empty()
+                && self.colors.iter().all(|color| {
+                    colorgrad::Color::from_html(color).is_ok_and(|color| color.a >= 1.0)
+                }))
+    }
+
     pub fn build(&self) -> anyhow::Result<Box<dyn colorgrad::Gradient>> {
         use colorgrad::{BlendMode as CGMode, Gradient as _};
 
@@ -729,5 +762,104 @@ mod tests {
         let c = a.clone();
         assert_eq!(a, b);
         assert_eq!(a, c);
+    }
+
+    // --- window_content_is_opaque ---
+
+    fn gradient_layer(colors: &[&str]) -> BackgroundLayer {
+        let mut config = Config::default_config();
+        config.window_background_gradient = Some(Gradient {
+            orientation: GradientOrientation::Linear { angle: Some(-45.0) },
+            colors: colors.iter().map(|c| c.to_string()).collect(),
+            preset: None,
+            interpolation: Interpolation::Linear,
+            blend: BlendMode::Rgb,
+            segment_size: None,
+            segment_smoothness: None,
+            noise: None,
+        });
+        BackgroundLayer::with_legacy(&config).expect("gradient layer")
+    }
+
+    fn with_layers(opacity: f32, layers: Vec<BackgroundLayer>) -> Config {
+        let mut config = Config::default_config();
+        config.window_background_opacity = opacity;
+        config.background = layers;
+        config
+    }
+
+    #[test]
+    fn window_content_is_opaque_without_layers_only_at_full_opacity() {
+        assert!(with_layers(1.0, vec![]).window_content_is_opaque());
+        assert!(!with_layers(0.95, vec![]).window_content_is_opaque());
+    }
+
+    #[test]
+    fn opaque_full_window_bottom_layer_keeps_the_window_opaque() {
+        let opaque = gradient_layer(&["#060a10", "#0a1018", "#0e1420"]);
+        assert!(opaque.fills_window_opaquely());
+        assert!(with_layers(1.0, vec![opaque.clone()]).window_content_is_opaque());
+        assert!(!with_layers(0.95, vec![opaque.clone()]).window_content_is_opaque());
+
+        // Layers above an opaque bottom layer are drawn over it.
+        let mut translucent = opaque.clone();
+        translucent.opacity = 0.5;
+        assert!(
+            with_layers(1.0, vec![opaque.clone(), translucent.clone()]).window_content_is_opaque()
+        );
+        assert!(!with_layers(1.0, vec![translucent, opaque.clone()]).window_content_is_opaque());
+
+        let mut color = opaque;
+        color.source = BackgroundSource::Color(SrgbaTuple(0.1, 0.2, 0.3, 1.0).into());
+        color.width = BackgroundSize::Cover;
+        assert!(color.fills_window_opaquely());
+    }
+
+    #[test]
+    fn bottom_layer_that_may_show_through_is_not_opaque() {
+        let opaque = gradient_layer(&["#060a10", "#0e1420"]);
+        type Change = fn(&mut BackgroundLayer);
+        let variants: [(&str, Change); 11] = [
+            ("layer opacity", |l| l.opacity = 0.92),
+            ("translucent color stop", |l| {
+                l.source = gradient_layer(&["#060a10", "#0e142080"]).source
+            }),
+            ("unparseable color stop", |l| {
+                l.source = gradient_layer(&["#060a10", "not a color"]).source
+            }),
+            ("translucent color", |l| {
+                l.source = BackgroundSource::Color(SrgbaTuple(0.1, 0.2, 0.3, 0.9).into())
+            }),
+            ("image file", |l| {
+                l.source = BackgroundSource::File(ImageFileSourceWrap {
+                    inner: ImageFileSource {
+                        path: "/nonexistent.png".to_string(),
+                        speed: 1.0,
+                    },
+                })
+            }),
+            ("contained", |l| l.width = BackgroundSize::Contain),
+            ("half height", |l| {
+                l.height = BackgroundSize::Dimension(Dimension::Percent(0.5))
+            }),
+            ("pixel width", |l| {
+                l.width = BackgroundSize::Dimension(Dimension::Pixels(4000.0))
+            }),
+            ("offset", |l| {
+                l.vertical_offset = Some(Dimension::Pixels(10.0))
+            }),
+            ("scrolls", |l| l.attachment = BackgroundAttachment::Scroll),
+            ("padding box", |l| l.origin = BackgroundOrigin::PaddingBox),
+        ];
+        for (name, change) in variants {
+            let mut layer = opaque.clone();
+            change(&mut layer);
+            assert!(!layer.fills_window_opaquely(), "{}", name);
+            assert!(
+                !with_layers(1.0, vec![layer]).window_content_is_opaque(),
+                "{}",
+                name
+            );
+        }
     }
 }

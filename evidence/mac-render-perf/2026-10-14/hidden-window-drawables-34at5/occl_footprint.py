@@ -12,7 +12,6 @@ usage: occl_footprint.py APP
 import json
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -129,4 +128,5 @@ try:
 finally:
     for p in pids:
         stop(p)
-    shutil.rmtree(D, ignore_errors=True)
+    # Never deletes (AGENTS.md RULE 1).
+    print('run directory kept:', D)

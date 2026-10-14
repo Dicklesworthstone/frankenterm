@@ -1348,6 +1348,21 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Whether the window draws only opaque pixels: it is not translucent,
+    /// and it has no background layers or its bottom layer fills the window
+    /// with opaque color, which everything else is drawn over. Decided from
+    /// the configuration, not the loaded layers, which arrive after the first
+    /// frames; until a layer loads the window paints its opaque terminal
+    /// background. The legacy `window_background_image` and
+    /// `window_background_gradient` options are `background` layers by now.
+    pub fn window_content_is_opaque(&self) -> bool {
+        self.window_background_opacity >= 1.0
+            && self
+                .background
+                .first()
+                .is_none_or(BackgroundLayer::fills_window_opaquely)
+    }
+
     /// The repaint-rate limit for a window, by whether it has keyboard focus.
     pub fn max_fps_for_focus(&self, focused: bool) -> u64 {
         match self.unfocused_max_fps {
