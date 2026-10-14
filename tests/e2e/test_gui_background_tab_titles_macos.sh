@@ -120,9 +120,24 @@ run_case() { # attach|spawn|reconnect
             for child in $(pgrep -P "$(gui_pid "$E/g2")"); do
                 ps -o command= -p "$child" | grep -qE "nc -U|/bin/sh -c" && kill "$child"
             done
+            # The reconnect has happened once the last tab's title moves on from
+            # its value at the cut. Wait up to 30 s for that (a loaded host can
+            # take well over the old fixed 3 s), then judge a full window from
+            # there. Titles that never resume still fail.
+            local frozen resumed_at="" resumed
+            frozen="$(awk -v t="$cut_at" '$1 <= t' "$E/g2/titles.log" | tail -1 | awk -F'|' '{print $NF}')"
+            for _ in $(seq 60); do
+                resumed="$(awk -v t="$cut_at" '$1 > t' "$E/g2/titles.log" |
+                    awk -F'|' -v f="$frozen" '$NF != f { print $1; exit }')"
+                if [[ -n "$resumed" ]]; then
+                    resumed_at="${resumed%% *}"
+                    break
+                fi
+                sleep 0.5
+            done
+            [[ -n "$resumed_at" ]] || resumed_at="$cut_at"
             sleep "$SECONDS_PER_CASE"
-            # Judge only what was recorded after the reconnect had time to finish.
-            awk -v t="$cut_at" '$1 > t + 3' "$E/g2/titles.log" >"$E/g2/titles.after"
+            awk -v t="$resumed_at" '$1 >= t' "$E/g2/titles.log" >"$E/g2/titles.after"
             mv "$E/g2/titles.after" "$E/g2/titles.log"
         else
             sleep "$SECONDS_PER_CASE"
