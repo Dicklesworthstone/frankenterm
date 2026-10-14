@@ -5574,16 +5574,16 @@ fn contract_ft_0rlfq_terminal_backend_unavailable_leaves_no_transaction_evidence
         .output()
         .expect("ft tx run should report the unavailable terminal backend");
 
-    // `mission.tx.execution_failed` maps to MISSION_EXIT_VALIDATION (5) since
-    // 37fb43d0e; this test was written against the older INVALID_INPUT (7)
-    // mapping and had been red at v0.15.1 too.
-    assert_eq!(output.status.code(), Some(5));
+    // An unavailable terminal backend is a typed runtime-unavailable refusal
+    // since f049e66bd (ft-n13o4): MISSION_EXIT_IO (4) with the cause's own
+    // error code, not the generic execution failure (5).
+    assert_eq!(output.status.code(), Some(4));
     let payload: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("failure stdout should be valid JSON");
     assert_eq!(payload["ok"], false);
     assert_eq!(
         payload["error_code"].as_str(),
-        Some("mission.tx.execution_failed")
+        Some("mission.tx.terminal_unavailable")
     );
     let error = payload["error"]
         .as_str()
