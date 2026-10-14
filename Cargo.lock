@@ -4827,6 +4827,7 @@ dependencies = [
  "ahash",
  "arc-swap",
  "bitflags 2.13.2",
+ "crossterm",
  "signal-hook 0.4.4",
  "unicode-display-width",
  "unicode-segmentation",

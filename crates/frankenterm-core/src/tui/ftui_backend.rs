@@ -5111,9 +5111,15 @@ pub fn run_tui<Q: QueryClient + Send + Sync + 'static>(
     let query: Arc<dyn QueryClient + Send + Sync> = Arc::new(query);
     let model = WaModel::new(query, config);
 
-    ftui::App::fullscreen(model)
-        .run()
-        .map_err(|e| crate::Error::runtime_backend("ftui_tui_run", e.to_string()))?;
+    // The ftui runtime owns the terminal; hold the output gate while it
+    // draws, and release it before the caller logs any error.
+    let result = {
+        let _session = super::terminal_session::RuntimeOwnedSessionGuard::enter(
+            super::ftui_compat::ScreenMode::AltScreen,
+        );
+        ftui::App::fullscreen(model).run()
+    };
+    result.map_err(|e| crate::Error::runtime_backend("ftui_tui_run", e.to_string()))?;
 
     Ok(())
 }

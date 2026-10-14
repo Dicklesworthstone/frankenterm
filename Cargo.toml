@@ -575,7 +575,9 @@ crossterm = "0.29.0"
 
 # FrankenTUI (optional, migration target for TUI — see docs/adr/0001-adopt-frankentui-for-tui-migration.md)
 # Git dep; use .cargo/config.toml for local path overrides during development.
-ftui = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/frankentui", rev = "18facd3f2a2c51b8b06ff589e6b905e6a63f5a96", default-features = false, features = ["runtime"] }
+# `crossterm` is the backend `AppBuilder::run()` needs: without it `ft tui` exits
+# before its first frame (ft-utjx0). The native ftui-tty backend is Unix-only.
+ftui = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/frankentui", rev = "18facd3f2a2c51b8b06ff589e6b905e6a63f5a96", default-features = false, features = ["runtime", "crossterm"] }
 
 # ZIP archives (for .ftx extension packages)
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }

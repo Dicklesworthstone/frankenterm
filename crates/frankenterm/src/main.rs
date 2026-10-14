@@ -100615,6 +100615,7 @@ async fn run_diagnostics_with_mux_client(
     // Check 7: Feature flags
     let features: Vec<&str> = [
         (cfg!(feature = "tui"), "tui"),
+        (cfg!(feature = "ftui"), "ftui"),
         (cfg!(feature = "browser"), "browser"),
         (cfg!(feature = "mcp"), "mcp"),
         (cfg!(feature = "web"), "web"),
