@@ -80,6 +80,11 @@ deny = [
 # `check bans` and therefore does not grade advisory classes in that lane.
 yanked = "warn"
 unmaintained = "all"
+# Same for unsoundness advisories: the default scope reports only direct
+# dependencies, which hid transitive findings such as faster-hex
+# RUSTSEC-2026-0306 (fixed by aba622a37) and lru RUSTSEC-2026-0253 (lru 0.16
+# via ftui-text and tantivy; open, #119).
+unsound = "all"
 ignore = []
 
 [licenses]
