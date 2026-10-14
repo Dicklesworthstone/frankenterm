@@ -83,19 +83,19 @@
     {
       "authors_raw": null,
       "classification_summary": {
-        "feat": 1,
+        "feat": 2,
         "fix": 9,
         "other": 1,
         "rename": 1,
         "test": 6
       },
-      "fork_side_commit_count": 18,
+      "fork_side_commit_count": 19,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "feat",
-        "committed_at": "2026-08-07T16:01:59-04:00",
-        "sha": "fc25ce71341fc88ed6f2b44b60d17bf14b948f0d",
-        "subject": "feat(images): harden kitty/APC image pipeline, cell storage, and glyph cache"
+        "committed_at": "2026-10-08T17:36:56-04:00",
+        "sha": "4292de04e8cec4b82fe50fcb969d4f3cad883f9b",
+        "subject": "feat(cell,blob-leases): support alloc serde deserialization in TeenyString"
       },
       "name": "frankenterm-blob-leases",
       "path": "frankenterm/blob-leases",
@@ -106,21 +106,21 @@
       "classification_summary": {
         "cosmetic": 2,
         "docs": 1,
-        "feat": 5,
-        "fix": 16,
-        "other": 3,
+        "feat": 6,
+        "fix": 19,
+        "other": 5,
         "refactor": 1,
         "rename": 1,
         "security-fix": 2,
         "test": 5
       },
-      "fork_side_commit_count": 36,
+      "fork_side_commit_count": 42,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-14T04:31:12-04:00",
-        "sha": "f743df19ffa8b7f745a662807d372102d8c0e1ad",
-        "subject": "fix(cell): preserve zero width when cloning heap-backed text"
+        "committed_at": "2026-10-11T20:28:32-04:00",
+        "sha": "d2be79b862c4996519deb6050bbc22b3853bbeb8",
+        "subject": "fix(unicode): widen VS16 emoji and keycaps by default, as Ghostty and the agent CLIs do (ft-vylyj)"
       },
       "name": "frankenterm-cell",
       "path": "frankenterm/cell",
@@ -131,19 +131,19 @@
       "classification_summary": {
         "docs": 1,
         "feat": 2,
-        "fix": 6,
-        "other": 5,
+        "fix": 9,
+        "other": 6,
         "refactor": 2,
         "rename": 1,
         "test": 6
       },
-      "fork_side_commit_count": 23,
+      "fork_side_commit_count": 27,
       "last_modified": {
-        "author": "dependabot[bot]",
-        "classification": "other",
-        "committed_at": "2026-09-28T13:41:39Z",
-        "sha": "e73b0d7e4a618381683087d7158d4967d8552aab",
-        "subject": "deps: bump the rust-deps group with 14 updates"
+        "author": "Jeff Emanuel",
+        "classification": "fix",
+        "committed_at": "2026-10-11T20:28:32-04:00",
+        "sha": "d2be79b862c4996519deb6050bbc22b3853bbeb8",
+        "subject": "fix(unicode): widen VS16 emoji and keycaps by default, as Ghostty and the agent CLIs do (ft-vylyj)"
       },
       "name": "frankenterm-char-props",
       "path": "frankenterm/char-props",
@@ -155,8 +155,9 @@
         "chore": 3,
         "cleanup": 2,
         "cosmetic": 20,
+        "docs": 1,
         "feat": 55,
-        "fix": 124,
+        "fix": 131,
         "other": 17,
         "refactor": 5,
         "rename": 2,
@@ -164,13 +165,13 @@
         "security-fix": 2,
         "test": 40
       },
-      "fork_side_commit_count": 274,
+      "fork_side_commit_count": 282,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-05T13:51:12-04:00",
-        "sha": "10f9adeeab13084f20b047b11edddf382eca0191",
-        "subject": "fix(client): place a spawned or moved tab best-effort instead of failing a committed operation"
+        "committed_at": "2026-10-13T18:25:41-04:00",
+        "sha": "8c08f32ef57213e157d7ce736f2bc7494cddeeac",
+        "subject": "fix(client): remote tabs the GUI has never shown keep their titles up to date"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -184,7 +185,7 @@
         "cosmetic": 21,
         "docs": 2,
         "feat": 46,
-        "fix": 65,
+        "fix": 67,
         "other": 21,
         "refactor": 2,
         "rename": 2,
@@ -192,13 +193,13 @@
         "security-fix": 1,
         "test": 84
       },
-      "fork_side_commit_count": 251,
+      "fork_side_commit_count": 253,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-02T21:41:17-04:00",
-        "sha": "f049e66bd3c8409f1e7d62cf735cc831dcb5269d",
-        "subject": "fix(release): land the eleven v0.15.21 ship-blockers and review should-fixes (ft-u5tr5)"
+        "committed_at": "2026-10-12T07:49:17-04:00",
+        "sha": "9aeb5680320e357f1b36c4d2052d6e0fa9e180fc",
+        "subject": "fix(codec,client,mux-server): repair the clippy and test-compile breaks from 0f196211b and 3d6e0d24a"
       },
       "name": "codec",
       "path": "frankenterm/codec",
@@ -232,22 +233,23 @@
         "chore": 3,
         "cleanup": 1,
         "cosmetic": 5,
-        "feat": 45,
-        "fix": 51,
-        "other": 10,
+        "docs": 1,
+        "feat": 53,
+        "fix": 53,
+        "other": 15,
         "refactor": 5,
         "rename": 1,
         "runtime-swap": 8,
         "security-fix": 2,
         "test": 15
       },
-      "fork_side_commit_count": 146,
+      "fork_side_commit_count": 162,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-10-03T22:08:31-04:00",
-        "sha": "f16d1dcfe280ecf43be7c8e3d75598fbb51d467b",
-        "subject": "fix(config): detect WSL2 kernels"
+        "classification": "feat",
+        "committed_at": "2026-10-14T18:24:28-04:00",
+        "sha": "2787f8ce246d11db07af86ee68af0233a4fe21a4",
+        "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
       },
       "name": "config",
       "path": "frankenterm/config",
@@ -296,16 +298,17 @@
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
         "feat": 3,
-        "fix": 1,
+        "fix": 4,
+        "security-fix": 1,
         "test": 1
       },
-      "fork_side_commit_count": 5,
+      "fork_side_commit_count": 9,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-12T17:31:34-04:00",
-        "sha": "2d8536c20c2e99eb40e337ca0f2ae5f7e7cad108",
-        "subject": "test(font): pin HarfBuzz function-table sharing across independent faces"
+        "classification": "fix",
+        "committed_at": "2026-10-13T21:04:55-04:00",
+        "sha": "ad2b366bc8df91e5be6a5c18b686de267ca60375",
+        "subject": "fix(font): update vendored FreeType 2.13.3 -> 2.14.3"
       },
       "name": "freetype",
       "path": "frankenterm/deps-freetype",
@@ -316,16 +319,16 @@
       "classification_summary": {
         "cosmetic": 1,
         "feat": 3,
-        "fix": 6,
+        "fix": 7,
         "test": 1
       },
-      "fork_side_commit_count": 11,
+      "fork_side_commit_count": 12,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-12T17:31:34-04:00",
-        "sha": "2d8536c20c2e99eb40e337ca0f2ae5f7e7cad108",
-        "subject": "test(font): pin HarfBuzz function-table sharing across independent faces"
+        "classification": "fix",
+        "committed_at": "2026-10-13T21:12:32-04:00",
+        "sha": "267710265875dc555a71e33a1765b3b33c0a34e5",
+        "subject": "fix(font): update vendored HarfBuzz 11.2.1 -> 14.6.0"
       },
       "name": "harfbuzz",
       "path": "frankenterm/deps-harfbuzz",
@@ -398,23 +401,23 @@
       "authors_raw": "[\"Wez Furlong\"]",
       "classification_summary": {
         "chore": 2,
-        "cosmetic": 5,
+        "cosmetic": 6,
         "docs": 1,
-        "feat": 7,
-        "fix": 21,
-        "other": 6,
+        "feat": 8,
+        "fix": 22,
+        "other": 9,
         "refactor": 1,
         "rename": 1,
-        "security-fix": 51,
+        "security-fix": 53,
         "test": 6
       },
-      "fork_side_commit_count": 101,
+      "fork_side_commit_count": 109,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "security-fix",
-        "committed_at": "2026-10-03T22:08:30-04:00",
-        "sha": "e9ac786722ed92d964b29b698586de6df295a429",
-        "subject": "fix(escape-parser): keep semicolons inside OSC 8 hyperlink URIs"
+        "classification": "cosmetic",
+        "committed_at": "2026-10-08T21:04:46-04:00",
+        "sha": "9c8212bc51ddcb58bab90f0c1b6bce9ab2425bdb",
+        "subject": "style: rustfmt six files whose committed formatting broke the workspace format gate"
       },
       "name": "frankenterm-escape-parser",
       "path": "frankenterm/escape-parser",
@@ -446,20 +449,20 @@
         "cleanup": 1,
         "cosmetic": 8,
         "docs": 1,
-        "feat": 2,
+        "feat": 4,
         "fix": 23,
-        "other": 6,
+        "other": 8,
         "refactor": 1,
         "rename": 1,
         "test": 2
       },
-      "fork_side_commit_count": 45,
+      "fork_side_commit_count": 49,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-14T18:23:42-04:00",
-        "sha": "86a9350cb06e6568faf58b715f134d6042b0c111",
-        "subject": "fix(font): trim native glyph names at the C terminator"
+        "classification": "other",
+        "committed_at": "2026-10-08T09:30:41-04:00",
+        "sha": "f59d21f0dd4a895c3e3fa832303c995d1c7f09c3",
+        "subject": "perf(font): a run of single-codepoint clusters is laid out without HarfBuzz from a printable ASCII table and a bounded cluster cache when no lookup of the face can join its glyphs, so a repeated T0 emoji row costs no HarfBuzz call (ft-yccm0.4.3.3) code-first, batch-verify pending"
       },
       "name": "frankenterm-font",
       "path": "frankenterm/font",
@@ -533,19 +536,53 @@
         "cosmetic": 2,
         "feat": 4,
         "fix": 2,
-        "other": 2,
+        "other": 3,
         "refactor": 3
       },
-      "fork_side_commit_count": 13,
+      "fork_side_commit_count": 14,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "refactor",
-        "committed_at": "2026-08-07T23:53:54-04:00",
-        "sha": "0d50fcd963db1c4102d4f8cf0a037b5001e8978a",
-        "subject": "refactor(platform): surface, term, window, scripting, and test harness polish"
+        "classification": "other",
+        "committed_at": "2026-10-12T08:20:01-04:00",
+        "sha": "cc87ad61641589efeae514e800e501323114a741",
+        "subject": "perf(gui,lfucache): count cache lookups in place and emit .rate metrics every 256, cutting the GUI main thread's metrics overhead from 4.8% to 0.3%"
       },
       "name": "lfucache",
       "path": "frankenterm/lfucache",
+      "version": "0.1.0"
+    },
+    {
+      "authors_raw": null,
+      "classification_summary": {
+        "feat": 1
+      },
+      "fork_side_commit_count": 1,
+      "last_modified": {
+        "author": "Jeff Emanuel",
+        "classification": "feat",
+        "committed_at": "2026-10-14T18:24:28-04:00",
+        "sha": "2787f8ce246d11db07af86ee68af0233a4fe21a4",
+        "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
+      },
+      "name": "color-funcs",
+      "path": "frankenterm/lua-api-crates/color-funcs",
+      "version": "0.1.0"
+    },
+    {
+      "authors_raw": null,
+      "classification_summary": {
+        "feat": 1
+      },
+      "fork_side_commit_count": 1,
+      "last_modified": {
+        "author": "Jeff Emanuel",
+        "classification": "feat",
+        "committed_at": "2026-10-14T18:24:28-04:00",
+        "sha": "2787f8ce246d11db07af86ee68af0233a4fe21a4",
+        "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
+      },
+      "name": "filesystem",
+      "path": "frankenterm/lua-api-crates/filesystem",
       "version": "0.1.0"
     },
     {
@@ -568,6 +605,91 @@
       },
       "name": "mux-lua",
       "path": "frankenterm/lua-api-crates/mux-lua",
+      "version": "0.1.0"
+    },
+    {
+      "authors_raw": null,
+      "classification_summary": {
+        "feat": 1
+      },
+      "fork_side_commit_count": 1,
+      "last_modified": {
+        "author": "Jeff Emanuel",
+        "classification": "feat",
+        "committed_at": "2026-10-14T18:24:28-04:00",
+        "sha": "2787f8ce246d11db07af86ee68af0233a4fe21a4",
+        "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
+      },
+      "name": "procinfo-funcs",
+      "path": "frankenterm/lua-api-crates/procinfo-funcs",
+      "version": "0.1.0"
+    },
+    {
+      "authors_raw": null,
+      "classification_summary": {
+        "feat": 1
+      },
+      "fork_side_commit_count": 1,
+      "last_modified": {
+        "author": "Jeff Emanuel",
+        "classification": "feat",
+        "committed_at": "2026-10-14T18:24:28-04:00",
+        "sha": "2787f8ce246d11db07af86ee68af0233a4fe21a4",
+        "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
+      },
+      "name": "serde-funcs",
+      "path": "frankenterm/lua-api-crates/serde-funcs",
+      "version": "0.1.0"
+    },
+    {
+      "authors_raw": null,
+      "classification_summary": {
+        "feat": 1
+      },
+      "fork_side_commit_count": 1,
+      "last_modified": {
+        "author": "Jeff Emanuel",
+        "classification": "feat",
+        "committed_at": "2026-10-14T18:24:28-04:00",
+        "sha": "2787f8ce246d11db07af86ee68af0233a4fe21a4",
+        "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
+      },
+      "name": "share-data",
+      "path": "frankenterm/lua-api-crates/share-data",
+      "version": "0.1.0"
+    },
+    {
+      "authors_raw": null,
+      "classification_summary": {
+        "feat": 1
+      },
+      "fork_side_commit_count": 1,
+      "last_modified": {
+        "author": "Jeff Emanuel",
+        "classification": "feat",
+        "committed_at": "2026-10-14T18:24:28-04:00",
+        "sha": "2787f8ce246d11db07af86ee68af0233a4fe21a4",
+        "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
+      },
+      "name": "spawn-funcs",
+      "path": "frankenterm/lua-api-crates/spawn-funcs",
+      "version": "0.1.0"
+    },
+    {
+      "authors_raw": null,
+      "classification_summary": {
+        "feat": 1
+      },
+      "fork_side_commit_count": 1,
+      "last_modified": {
+        "author": "Jeff Emanuel",
+        "classification": "feat",
+        "committed_at": "2026-10-14T18:24:28-04:00",
+        "sha": "2787f8ce246d11db07af86ee68af0233a4fe21a4",
+        "subject": "feat(lua): port the rest of WezTerm's Lua API (run_child_process, json, GLOBAL, color, ...)"
+      },
+      "name": "ssh-funcs",
+      "path": "frankenterm/lua-api-crates/ssh-funcs",
       "version": "0.1.0"
     },
     {
@@ -612,6 +734,24 @@
       "version": "0.1.0"
     },
     {
+      "authors_raw": null,
+      "classification_summary": {
+        "feat": 1,
+        "refactor": 1
+      },
+      "fork_side_commit_count": 2,
+      "last_modified": {
+        "author": "Jeff Emanuel",
+        "classification": "refactor",
+        "committed_at": "2026-03-02T14:51:01-05:00",
+        "sha": "5f6ed1f5ce27876b4448919ddd4268c4bc65f0f0",
+        "subject": "refactor: simplify Lua API crate module imports via extern crate aliases"
+      },
+      "name": "window-funcs",
+      "path": "frankenterm/lua-api-crates/window-funcs",
+      "version": "0.1.0"
+    },
+    {
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
         "cosmetic": 2,
@@ -638,24 +778,24 @@
       "classification_summary": {
         "chore": 10,
         "cleanup": 3,
-        "cosmetic": 31,
+        "cosmetic": 32,
         "docs": 6,
-        "feat": 210,
-        "fix": 302,
-        "other": 55,
+        "feat": 223,
+        "fix": 314,
+        "other": 72,
         "refactor": 12,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 112
+        "test": 114
       },
-      "fork_side_commit_count": 753,
+      "fork_side_commit_count": 798,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-10-04T20:10:32-04:00",
-        "sha": "263afba88b7fd6d06941fbd0b8ce3ed1a6c5e4c0",
-        "subject": "fix(mux,client,mux-server): close an exited pane's tab; apply snapshots without server-closed tabs; mux Lua in the server"
+        "classification": "other",
+        "committed_at": "2026-10-14T16:31:38-04:00",
+        "sha": "4525dadbe8b3820982066790f37d0c5502cecde9",
+        "subject": "diag(mux): debug-log slow main-thread terminal waits and long parser holds"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -686,20 +826,21 @@
       "authors_raw": null,
       "classification_summary": {
         "cosmetic": 1,
-        "feat": 2,
-        "fix": 6,
-        "other": 1,
+        "feat": 3,
+        "fix": 7,
+        "other": 2,
         "refactor": 1,
         "rename": 1,
+        "runtime-swap": 1,
         "test": 5
       },
-      "fork_side_commit_count": 17,
+      "fork_side_commit_count": 21,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-08-11T12:01:27-04:00",
-        "sha": "53b9e854768d4bb04a837e62f41a50dba79e258f",
-        "subject": "feat(session): host identity v5 (machine fence + process domain); schema v43"
+        "classification": "runtime-swap",
+        "committed_at": "2026-10-08T02:48:36-04:00",
+        "sha": "bd7d270ec15b6607cff98bc0725b85085a9445ea",
+        "subject": "perf(promise,gui,procinfo): every busy GUI pool thread starts with an explicit QoS class: promise's two asupersync runtimes and its background I/O thread at user-initiated, frame decoding and background gradients at user-initiated, background image decodes at utility; none runs at the host's default 31 (ft-yccm0.6 slice 3) code-first, batch-verify pending, native proof pending"
       },
       "name": "procinfo",
       "path": "frankenterm/procinfo",
@@ -713,16 +854,16 @@
         "fix": 27,
         "other": 5,
         "refactor": 3,
-        "runtime-swap": 4,
+        "runtime-swap": 5,
         "test": 8
       },
-      "fork_side_commit_count": 61,
+      "fork_side_commit_count": 62,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-21T04:32:20-04:00",
-        "sha": "d824eeded272b2e21f4fd099e52c3c02bf268f33",
-        "subject": "fix(alerts): fund historical GUI delivery before pane mutation"
+        "classification": "runtime-swap",
+        "committed_at": "2026-10-08T02:48:36-04:00",
+        "sha": "bd7d270ec15b6607cff98bc0725b85085a9445ea",
+        "subject": "perf(promise,gui,procinfo): every busy GUI pool thread starts with an explicit QoS class: promise's two asupersync runtimes and its background I/O thread at user-initiated, frame decoding and background gradients at user-initiated, background image decodes at utility; none runs at the host's default 31 (ft-yccm0.6 slice 3) code-first, batch-verify pending, native proof pending"
       },
       "name": "promise",
       "path": "frankenterm/promise",
@@ -734,18 +875,18 @@
         "cosmetic": 5,
         "feat": 7,
         "fix": 25,
-        "other": 4,
+        "other": 5,
         "refactor": 2,
         "runtime-swap": 1,
         "test": 17
       },
-      "fork_side_commit_count": 61,
+      "fork_side_commit_count": 62,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-21T12:17:19-04:00",
-        "sha": "adfd20c31c5a5b3bf29abb09a0ac33ae5c88f6a9",
-        "subject": "test: restore serialized fixtures and exercise shared await service"
+        "classification": "other",
+        "committed_at": "2026-10-06T23:17:31-04:00",
+        "sha": "655b7fcdd7bd412e9f21aa1c4431faf99c5fccd1",
+        "subject": "perf(mux): the pane reader gathers PTY output into ring-slot batches: under 1 KiB it publishes at once, above it it keeps reading what is buffered for up to 3 ms, and an idle parser cuts the gather short through a self-pipe (ft-yccm0.3.1.2 slice 1) code-first, batch-verify pending"
       },
       "name": "portable-pty",
       "path": "frankenterm/pty",
@@ -849,21 +990,21 @@
         "chore": 3,
         "cleanup": 1,
         "cosmetic": 8,
-        "feat": 14,
-        "fix": 53,
-        "other": 32,
+        "feat": 16,
+        "fix": 59,
+        "other": 44,
         "refactor": 3,
         "rename": 1,
         "security-fix": 2,
-        "test": 23
+        "test": 25
       },
-      "fork_side_commit_count": 140,
+      "fork_side_commit_count": 162,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-09-26T04:07:27-04:00",
-        "sha": "68982b572d7f6667d1e429eeb10f4a279ae0345b",
-        "subject": "style: rustfmt surface line.rs and the MCP robot surface matrix test"
+        "classification": "fix",
+        "committed_at": "2026-10-14T11:34:50-04:00",
+        "sha": "c961d1d2ddeee44e5665dda3bf1fe232ed032c3f",
+        "subject": "fix(mux-server): charge durability-queue rows their real size (ft-yccm0.2.1.6)"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -894,23 +1035,23 @@
       "classification_summary": {
         "chore": 1,
         "cleanup": 3,
-        "cosmetic": 15,
+        "cosmetic": 16,
         "docs": 2,
-        "feat": 59,
-        "fix": 141,
-        "other": 61,
+        "feat": 74,
+        "fix": 163,
+        "other": 75,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
-        "test": 71
+        "test": 79
       },
-      "fork_side_commit_count": 366,
+      "fork_side_commit_count": 426,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-03T22:08:30-04:00",
-        "sha": "3b1a20ef669bc99b5202b2c34bb53ec821cbfbf0",
-        "subject": "fix(term): RIS also clears modifyOtherKeys, DECLRMM and bidi overrides"
+        "committed_at": "2026-10-14T14:11:09-04:00",
+        "sha": "198fc06c7f345dc899340013ef32121a67016992",
+        "subject": "fix(mux-server): read resident line ranges atomically under one terminal hold (ft-pjjeg)"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1013,19 +1154,19 @@
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
         "cosmetic": 1,
-        "feat": 1,
-        "fix": 4,
+        "feat": 2,
+        "fix": 6,
         "other": 2,
         "security-fix": 2,
         "test": 4
       },
-      "fork_side_commit_count": 14,
+      "fork_side_commit_count": 17,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-16T14:45:16-04:00",
-        "sha": "99213c76c1a3323df93636eb149ecf80d76cbccf",
-        "subject": "fix(parser): retain leading empty OSC fields and correct property oracles"
+        "committed_at": "2026-10-06T20:07:07-04:00",
+        "sha": "8ae0acb8bcf97b2e6eb6d5dfd7306fc0ca6cbf84",
+        "subject": "fix(vtparse): a raw 0x80..0x9f byte in the ground state is a C1 control again, the parser's legacy contract; the maximal-subpart UTF-8 decoding stays (ft-fjxga rework)"
       },
       "name": "vtparse",
       "path": "frankenterm/vtparse",
@@ -1039,20 +1180,20 @@
         "cosmetic": 8,
         "docs": 2,
         "feat": 18,
-        "fix": 99,
-        "other": 14,
+        "fix": 101,
+        "other": 17,
         "refactor": 6,
         "rename": 1,
         "runtime-swap": 1,
         "test": 3
       },
-      "fork_side_commit_count": 156,
+      "fork_side_commit_count": 161,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-10-03T22:08:41-04:00",
-        "sha": "de1036bc97856e32c9d578472548d32936bdd20c",
-        "subject": "fix(window): compare macOS first-responder pointers with ptr::eq"
+        "classification": "other",
+        "committed_at": "2026-10-14T15:34:51-04:00",
+        "sha": "1a11ac1f2e391af9a64fd9ae16e832ed8c3d3331",
+        "subject": "perf(macos): park windows hidden behind another FrankenTerm window"
       },
       "name": "window",
       "path": "frankenterm/window",
@@ -1065,10 +1206,10 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2982,
-  "generated_at": "2026-10-05T17:51:19.606926Z",
+  "fork_side_commit_total": 3187,
+  "generated_at": "2026-10-14T22:25:29.185311Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
-  "vendored_crate_count": 47,
+  "vendored_crate_count": 55,
   "vendored_root": "frankenterm/"
 }
