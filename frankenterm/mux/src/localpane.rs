@@ -1761,6 +1761,10 @@ const HANDOFF_WAIT: Duration = Duration::from_millis(1);
 #[cfg(not(feature = "disruptor-pane-io"))]
 const PARSER_HOLD_BUDGET: Duration = Duration::from_millis(2);
 
+/// A parser hold at least this long is logged at debug level (ft-t162y).
+#[cfg(not(feature = "disruptor-pane-io"))]
+const SLOW_PARSER_STRETCH: Duration = Duration::from_millis(20);
+
 /// Longest a paint waits for a pane's terminal lock before drawing the pane
 /// from the frame it last painted (ft-yccm0.2.2.3). While it waits, a
 /// flooding parser hands the lock over at its next slice boundary (within
@@ -1932,9 +1936,23 @@ fn hold_signpost(holder: TerminalLockHolder) -> procinfo::SignpostName {
     }
 }
 
+/// A main-thread wait for a pane's terminal at least this long is logged at
+/// debug level with its backtrace, to name the caller: paints wait at most
+/// [`RENDER_CAPTURE_WAIT`], so a longer wait comes from an unbounded locker
+/// (ft-yccm0.2.3 AC3).
+const SLOW_MAIN_THREAD_WAIT_NS: u64 = 2_000_000;
+
 impl<'a> TerminalGuard<'a> {
     fn acquired(guard: MutexGuard<'a, Terminal>, holder: TerminalLockHolder, wait_ns: u64) -> Self {
-        TerminalLockLedger::global().record_wait(holder, wait_ns, on_main_thread());
+        let on_main = on_main_thread();
+        TerminalLockLedger::global().record_wait(holder, wait_ns, on_main);
+        if on_main && wait_ns >= SLOW_MAIN_THREAD_WAIT_NS && log::log_enabled!(log::Level::Debug) {
+            log::debug!(
+                "main thread waited {} us for a pane terminal as {holder:?}:\n{}",
+                wait_ns / 1000,
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
         Self {
             guard: Some(guard),
             holder,
@@ -5156,6 +5174,17 @@ impl LocalPane {
             let progress = step(&mut terminal, &mut || {
                 self.terminal.demanded() || held_since.elapsed() >= PARSER_HOLD_BUDGET
             });
+            let stretch = held_since.elapsed();
+            if stretch >= SLOW_PARSER_STRETCH {
+                // One stretch between checks ran far past the budget
+                // (ft-t162y): 65-200 ms once per T1 flood on an M4 Pro.
+                log::debug!(
+                    "pane {} parser held the terminal {stretch:?} in one hold ({progress:?}, {} handoffs so far, seqno {})",
+                    self.pane_id,
+                    handoffs,
+                    terminal.current_seqno()
+                );
+            }
             if progress == SliceProgress::Done {
                 break;
             }
