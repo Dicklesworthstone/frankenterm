@@ -848,7 +848,32 @@ fn run_fixtures(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let golden = load_png_rgba8(&golden_path(&root, &fixture)?)?;
+        let golden_file = golden_path(&root, &fixture)?;
+        if !golden_file.is_file() {
+            // A fixture with no recorded golden cannot pass, but it must not
+            // stop the remaining fixtures from being compared.
+            failed += 1;
+            let error = format!(
+                "missing golden {}; record it with --update-goldens",
+                golden_file.display()
+            );
+            emit_json(json!({
+                "phase": "fixture",
+                "name": fixture.name,
+                "render_ms": render_ms,
+                "error": error,
+                "status": "fail",
+            }));
+            receipt_rows.push(json!({
+                "fixture": fixture.name,
+                "kind": fixture.input.kind,
+                "status": "fail",
+                "error": error,
+                "renderer": render_outcome.renderer_info,
+            }));
+            continue;
+        }
+        let golden = load_png_rgba8(&golden_file)?;
         let compare_start = Instant::now();
         let comparison = compare_images(&actual, &golden, fixture.meta.thresholds)?;
         let reference = reference_check(&root, &fixture, &actual)?;
@@ -2203,7 +2228,11 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, Box<dyn std
 }
 
 fn load_png_rgba8(path: &Path) -> Result<RgbaImage, Box<dyn std::error::Error>> {
-    Ok(ImageReader::open(path)?.decode()?.to_rgba8())
+    let image = ImageReader::open(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?
+        .decode()
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(image.to_rgba8())
 }
 
 fn write_png_deterministic(
