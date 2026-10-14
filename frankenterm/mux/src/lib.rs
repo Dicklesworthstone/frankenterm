@@ -4863,6 +4863,23 @@ mod pane_registration_handle {
             }
         }
 
+        /// [`crate::localpane::LocalPane::read_resident_lines_atomically`];
+        /// `None` (use the worker path) for other pane types.
+        pub fn read_resident_lines_atomically(
+            &self,
+            ranges: &[std::ops::Range<frankenterm_term::StableRowIndex>],
+            layout: Option<(
+                termwiz::surface::SequenceNo,
+                crate::renderable::RenderableDimensions,
+            )>,
+            max_rows: usize,
+            wait: std::time::Duration,
+            publish: &mut dyn FnMut(&[frankenterm_term::screen::ScreenLineRead]),
+        ) -> Option<anyhow::Result<bool>> {
+            self.local()?
+                .read_resident_lines_atomically(ranges, layout, max_rows, wait, publish)
+        }
+
         pub fn palette(&self) -> frankenterm_term::color::ColorPalette {
             self.pane.palette()
         }

@@ -220,6 +220,12 @@ struct LineReadPublicationChanged;
 #[error("cold read worker capacity exhausted")]
 struct LineReadWorkerCapacity;
 
+/// The requester abandoned this read (a refused capture, or a retired
+/// session) while its reply was being prepared.
+#[derive(Debug, thiserror::Error)]
+#[error("cold read cancelled")]
+struct LineReadCancelled;
+
 /// Longest an RPC read of a pane (a line read, or a render-state observation)
 /// waits on the owner thread for the pane's terminal lock, per lock taken
 /// (ft-pjjeg). While it waits it registers demand, so a flooding parser hands
@@ -229,6 +235,12 @@ struct LineReadWorkerCapacity;
 /// is the main-thread wait bound GUI paints use (ft-yccm0.2.2.3 AC3).
 /// Background pushes still only try.
 const RPC_READ_TERMINAL_WAIT: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Largest line read whose rows are all resident that the owner thread
+/// captures, hydrates and publishes in one terminal-lock hold (ft-pjjeg).
+/// Tail reads (requested rows plus a viewport) fit; larger reads take the
+/// worker path.
+const ATOMIC_LINE_READ_MAX_ROWS: usize = 256;
 
 fn line_read_failure_reason(error: &anyhow::Error) -> &'static str {
     if error
@@ -287,6 +299,37 @@ fn retain_line_read_plan(
     Ok(())
 }
 
+/// The wire rows of hydrated line reads, compressed and checked against the
+/// reply structure limits.
+fn owned_line_payload(
+    plans: &[wezterm_term::screen::ScreenLineRead],
+    cancelled: &impl Fn() -> bool,
+) -> anyhow::Result<codec::SerializedLines> {
+    anyhow::ensure!(!cancelled(), LineReadCancelled);
+    let mut rows = Vec::new();
+    for plan in plans {
+        for (index, source) in plan.lines().enumerate() {
+            anyhow::ensure!(!cancelled(), LineReadCancelled);
+            let stable = stable_row_offset(plan.first_row(), index)
+                .ok_or_else(|| anyhow!("line read range overflow"))?;
+            let mut line = source.clone();
+            line.compress_for_scrollback();
+            rows.push((stable, line));
+        }
+    }
+    anyhow::ensure!(!cancelled(), LineReadCancelled);
+    let payload = codec::SerializedLines::from(rows);
+    let counts = payload.validate_structure()?;
+    anyhow::ensure!(
+        counts.lines <= codec::MAX_RENDER_APPLICATION_LINES
+            && counts.cells <= codec::MAX_RENDER_APPLICATION_CELLS
+            && counts.hyperlink_spans <= codec::MAX_RENDER_APPLICATION_HYPERLINK_SPANS
+            && counts.images <= codec::MAX_RENDER_APPLICATION_IMAGE_REFERENCES,
+        "line reply structure limit"
+    );
+    Ok(payload)
+}
+
 fn complete_owned_line_read(
     result: anyhow::Result<Vec<wezterm_term::screen::ScreenLineRead>>,
     permit: mux::pane::LineReadPermit,
@@ -298,31 +341,15 @@ fn complete_owned_line_read(
     } else {
         "reply_prepare"
     };
+    // A cancelled read failed for its requester's reason (a refused capture
+    // is recorded there; a retired session is no read failure). Counting the
+    // worker's cancellation as well logged every refused capture twice, the
+    // second time as a misleading hydrate failure.
+    let hydration_cancelled = result.is_err() && cancelled();
     let (retirement, retired) = std::sync::mpsc::sync_channel(1);
     let mut retained_cells = Vec::new();
     let result = result.and_then(|plans| {
-        anyhow::ensure!(!cancelled(), "cold read cancelled");
-        let mut rows = Vec::new();
-        for plan in &plans {
-            for (index, source) in plan.lines().enumerate() {
-                anyhow::ensure!(!cancelled(), "cold read cancelled");
-                let stable = stable_row_offset(plan.first_row(), index)
-                    .ok_or_else(|| anyhow!("line read range overflow"))?;
-                let mut line = source.clone();
-                line.compress_for_scrollback();
-                rows.push((stable, line));
-            }
-        }
-        anyhow::ensure!(!cancelled(), "cold read cancelled");
-        let payload = codec::SerializedLines::from(rows);
-        let counts = payload.validate_structure()?;
-        anyhow::ensure!(
-            counts.lines <= codec::MAX_RENDER_APPLICATION_LINES
-                && counts.cells <= codec::MAX_RENDER_APPLICATION_CELLS
-                && counts.hyperlink_spans <= codec::MAX_RENDER_APPLICATION_HYPERLINK_SPANS
-                && counts.images <= codec::MAX_RENDER_APPLICATION_IMAGE_REFERENCES,
-            "line reply structure limit"
-        );
+        let payload = owned_line_payload(&plans, &cancelled)?;
         let mut bytes_left = wezterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES;
         let mut work_left = 65_536;
         // SerializedLines normalizes cells to vector storage. Retain a forced
@@ -330,19 +357,22 @@ fn complete_owned_line_read(
         retained_cells = payload
             .lines()
             .map(|(_, line)| {
-                anyhow::ensure!(!cancelled(), "cold read cancelled");
+                anyhow::ensure!(!cancelled(), LineReadCancelled);
                 line.try_clone_for_snapshot(&mut bytes_left, &mut work_left)
                     .ok_or_else(|| anyhow!("line reply retirement budget"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        anyhow::ensure!(!cancelled(), "cold read cancelled");
+        anyhow::ensure!(!cancelled(), LineReadCancelled);
         Ok(OwnedLineReply {
             plans,
             payload: Some(payload),
             retirement,
         })
     });
-    if let Err(error) = &result {
+    if let Err(error) = &result
+        && !hydration_cancelled
+        && !error.is::<LineReadCancelled>()
+    {
         record_line_read_failure(failure_stage, error);
     }
     complete(result);
@@ -9983,6 +10013,96 @@ impl SessionHandler {
                                         return;
                                     }
                                 }
+                            }
+                        }
+                        // Rows that are all resident (any tail of live output)
+                        // are captured, hydrated and published in one
+                        // terminal-lock hold, with the reply sent under it.
+                        // Through the worker, a pane printing continuously
+                        // changed its cursor row between capture and
+                        // publication and every fenced tail was refused
+                        // (ft-pjjeg). Cold reads still take the worker.
+                        let mut atomic_sent = false;
+                        let mut atomic_failure = None;
+                        let atomic = recover_line_read_callback(|| {
+                            with_current_pane(&authority, &registration, |pane| {
+                                let result = pane.read_resident_lines_atomically(
+                                    &lines,
+                                    layout.map(|layout| (layout.seqno, layout.dimensions)),
+                                    ATOMIC_LINE_READ_MAX_ROWS,
+                                    RPC_READ_TERMINAL_WAIT,
+                                    &mut |reads| {
+                                        // A fenced reply promises the caller's
+                                        // exact coordinates, as on the worker path.
+                                        let exact = layout.is_none()
+                                            || reads.iter().zip(&lines).all(|(read, range)| {
+                                                read.first_row() == range.start
+                                                    && usize::try_from(
+                                                        range
+                                                            .end
+                                                            .saturating_sub(range.start)
+                                                            .max(0),
+                                                    ) == Ok(read.requested_row_count())
+                                            });
+                                        if !exact {
+                                            atomic_failure =
+                                                Some(MuxServerRejection::backend_failure().into());
+                                            return;
+                                        }
+                                        match owned_line_payload(reads, &|| false) {
+                                            Ok(lines) => {
+                                                atomic_sent = true;
+                                                send_response(Ok(match layout {
+                                                    Some(layout) => Pdu::GetLinesAtLayoutResponse(
+                                                        codec::GetLinesAtLayoutResponse {
+                                                            pane_id,
+                                                            layout,
+                                                            lines,
+                                                        },
+                                                    ),
+                                                    None => {
+                                                        Pdu::GetLinesResponse(GetLinesResponse {
+                                                            pane_id,
+                                                            lines,
+                                                        })
+                                                    }
+                                                }));
+                                            }
+                                            Err(error) => atomic_failure = Some(error),
+                                        }
+                                    },
+                                );
+                                if layout.is_some() && matches!(result, Some(Ok(false))) {
+                                    pane.notify_lines_ready();
+                                }
+                                Ok(result)
+                            })
+                        });
+                        match atomic {
+                            Ok(None) => {}
+                            Ok(Some(Ok(_))) if atomic_sent => {
+                                if let Some(timing) = &mut timing {
+                                    timing.outcome = "success";
+                                }
+                                return;
+                            }
+                            Ok(Some(Ok(_))) => {
+                                let error = atomic_failure
+                                    .unwrap_or_else(|| LineReadPublicationChanged.into());
+                                if let Some(timing) = &mut timing {
+                                    timing.outcome = line_read_failure_reason(&error);
+                                }
+                                record_line_read_failure("publish", &error);
+                                send_response(Err(error));
+                                return;
+                            }
+                            Ok(Some(Err(error))) | Err(error) => {
+                                if let Some(timing) = &mut timing {
+                                    timing.outcome = line_read_failure_reason(&error);
+                                }
+                                record_line_read_failure("capture", &error);
+                                send_response(Err(error));
+                                return;
                             }
                         }
                         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));

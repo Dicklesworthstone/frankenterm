@@ -5853,12 +5853,29 @@ impl LocalPane {
         let mut term = self
             .terminal_for_read(wait)
             .ok_or_else(|| metadata_busy(MetadataRefusalStage::PublishLayoutTerminal))?;
-        let Some(floor) =
-            Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)?
+        self.publish_line_reads_at_layout_locked(
+            &mut term,
+            reads,
+            expected_seqno,
+            expected_dimensions,
+            publish,
+        )
+    }
+
+    /// [`Self::publish_line_reads_at_layout_waiting`] with the terminal held.
+    fn publish_line_reads_at_layout_locked(
+        &self,
+        term: &mut TerminalGuard<'_>,
+        reads: &[frankenterm_term::screen::ScreenLineRead],
+        expected_seqno: SequenceNo,
+        expected_dimensions: RenderableDimensions,
+        publish: &mut dyn FnMut(),
+    ) -> Result<bool, frankenterm_term::screen::ColdReadMetadataBusy> {
+        let Some(floor) = Self::refresh_line_layout_floor(&self.line_layout_observation, term)?
         else {
             return Ok(false);
         };
-        let Some(dimensions) = terminal_try_get_dimensions(&mut term) else {
+        let Some(dimensions) = terminal_try_get_dimensions(term) else {
             return Ok(false);
         };
         if expected_seqno == SequenceNo::MAX
@@ -5911,6 +5928,15 @@ impl LocalPane {
         let mut term = self
             .terminal_for_read(wait)
             .ok_or_else(|| metadata_busy(MetadataRefusalStage::PublishTerminal))?;
+        Self::publish_line_reads_locked(&mut term, reads, publish)
+    }
+
+    /// [`Self::publish_line_reads_waiting`] with the terminal held.
+    fn publish_line_reads_locked(
+        term: &mut TerminalGuard<'_>,
+        reads: &[frankenterm_term::screen::ScreenLineRead],
+        publish: &mut dyn FnMut(),
+    ) -> Result<bool, frankenterm_term::screen::ColdReadMetadataBusy> {
         for read in reads {
             if !term
                 .screen()
@@ -5937,6 +5963,75 @@ impl LocalPane {
         }
         publish();
         Ok(true)
+    }
+
+    /// Line reads whose rows are all resident, captured, hydrated and
+    /// published in one terminal-lock hold (ft-pjjeg). The worker path
+    /// releases the terminal between capture and publication, and publication
+    /// requires every captured resident row unchanged. A pane printing
+    /// continuously rewrites its cursor row in that window, so a fenced tail
+    /// of it was refused every time. Holding the lock leaves no window, and
+    /// `publish` runs under it like any publication, so the reply stays
+    /// ordered against pushes.
+    ///
+    /// `None` when a range needs cold rows or the ranges exceed `max_rows`:
+    /// the caller takes the worker path. `Some(Ok(false))` is a refused
+    /// publication (the fenced layout changed).
+    pub fn read_resident_lines_atomically(
+        &self,
+        ranges: &[Range<StableRowIndex>],
+        layout: Option<(SequenceNo, RenderableDimensions)>,
+        max_rows: usize,
+        wait: Duration,
+        publish: &mut dyn FnMut(&[frankenterm_term::screen::ScreenLineRead]),
+    ) -> Option<anyhow::Result<bool>> {
+        let rows = ranges.iter().try_fold(0usize, |rows, range| {
+            rows.checked_add(usize::try_from(range.end.saturating_sub(range.start)).ok()?)
+        })?;
+        if rows > max_rows {
+            return None;
+        }
+        let _diagnostic = MetadataRefusalDiagnostic::new();
+        let Some(mut term) = self.terminal_for_read(wait) else {
+            return Some(Err(
+                metadata_busy(MetadataRefusalStage::CaptureTerminal).into()
+            ));
+        };
+        let mut budget = frankenterm_term::screen::LineReadCaptureBudget::default();
+        let mut reads = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let read = match term
+                .screen()
+                .capture_line_read_with_budget(range.clone(), &mut budget)
+            {
+                Ok(read) => read,
+                Err(error) => {
+                    if error.is::<frankenterm_term::screen::ColdReadMetadataBusy>() {
+                        record_metadata_refusal(MetadataRefusalStage::CaptureScreen);
+                    }
+                    return Some(Err(error));
+                }
+            };
+            if !read.is_resident_only() {
+                return None;
+            }
+            match read.hydrate(|| false) {
+                Ok(read) => reads.push(read),
+                Err(error) => return Some(Err(error)),
+            }
+        }
+        let mut publish_reads = || publish(&reads);
+        let published = match layout {
+            Some((seqno, dimensions)) => self.publish_line_reads_at_layout_locked(
+                &mut term,
+                &reads,
+                seqno,
+                dimensions,
+                &mut publish_reads,
+            ),
+            None => Self::publish_line_reads_locked(&mut term, &reads, &mut publish_reads),
+        };
+        Some(published.map_err(Into::into))
     }
 
     /// [`Pane::get_line_layout`] waiting up to `wait` for the terminal
@@ -17131,6 +17226,110 @@ mod tests {
         }
     }
 
+    /// ft-pjjeg: a fenced tail of a pane that keeps printing. Through the
+    /// worker path the read is captured, then published after its cursor row
+    /// changed, and publication refuses it. Read atomically, the same rows
+    /// publish the current text. Cold rows and oversized reads take the
+    /// worker path (`None`), and a held terminal with no wait is busy.
+    #[test]
+    fn resident_line_reads_capture_and_publish_in_one_terminal_hold() {
+        let sink = Arc::new(ColdResizeTestSink::default());
+        let mut terminal = Terminal::new(
+            term_size(20, 2),
+            Arc::new(ColdResizeTestConfig(sink.clone())),
+            "FrankenTerm",
+            "atomic-resident-read",
+            Box::new(Vec::new()),
+        );
+        terminal.advance_bytes(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\npartial");
+        let pane = LocalPane::new(
+            724,
+            terminal,
+            Box::new(KillCountingChild {
+                kills: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            [0x84; 16],
+            "atomic-resident-read".to_string(),
+        );
+        let (_floor, dimensions) = pane.get_line_layout().unwrap().unwrap();
+        let tail = dimensions.physical_top..dimensions.physical_top + 2;
+        let fence = pane.get_current_seqno();
+
+        let captured = pane
+            .capture_line_read(tail.clone(), &mut Default::default())
+            .unwrap()
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        pane.terminal.lock().advance_bytes(b" more");
+        assert_eq!(
+            pane.publish_line_reads_at_layout(
+                std::slice::from_ref(&captured),
+                fence,
+                dimensions,
+                &mut || panic!("a changed resident row was published"),
+            ),
+            Ok(false),
+            "the worker path refuses a row that changed after capture"
+        );
+
+        let mut published = Vec::new();
+        let result = pane.read_resident_lines_atomically(
+            std::slice::from_ref(&tail),
+            Some((fence, dimensions)),
+            256,
+            Duration::ZERO,
+            &mut |reads| {
+                published = reads
+                    .iter()
+                    .flat_map(|read| read.lines())
+                    .map(|line| line.as_str().trim_end().to_string())
+                    .collect();
+            },
+        );
+        assert!(matches!(result, Some(Ok(true))), "{:?}", result);
+        assert_eq!(published.last().map(String::as_str), Some("partial more"));
+
+        let cold = *sink.rows.lock().1.first_key_value().expect("cold rows").0;
+        assert!(
+            pane.read_resident_lines_atomically(
+                std::slice::from_ref(&(cold..cold + 1)),
+                None,
+                256,
+                Duration::ZERO,
+                &mut |_| panic!("a cold read was published atomically"),
+            )
+            .is_none(),
+            "cold rows take the worker path"
+        );
+        assert!(
+            pane.read_resident_lines_atomically(
+                std::slice::from_ref(&tail),
+                None,
+                1,
+                Duration::ZERO,
+                &mut |_| panic!("an oversized read was published atomically"),
+            )
+            .is_none(),
+            "reads over the row cap take the worker path"
+        );
+        let held = pane.terminal.lock_as(TerminalLockHolder::Parser);
+        assert!(matches!(
+            pane.read_resident_lines_atomically(
+                std::slice::from_ref(&tail),
+                None,
+                256,
+                Duration::ZERO,
+                &mut |_| panic!("published without the terminal"),
+            ),
+            Some(Err(_))
+        ));
+        drop(held);
+    }
+
     /// ft-wpgjw: a full scrollback evicts its oldest cold rows on every spill.
     /// That leaves retained rows' coordinates alone, so it must not move the
     /// line-layout floor: under heavy output the floor reached the current
@@ -18889,65 +19088,80 @@ mod tests {
     /// yielding suppressed, one hold as before ft-yccm0.2.3: its time is the
     /// unsliced apply time, and the same fairness check must fail on it.
     /// Both batches still land exactly as one unsliced feed.
+    ///
+    /// The two arms run one after the other, so a load spike during only the
+    /// sliced arm (the parallel test suite at load ~90: unsliced 94-107 ms,
+    /// then a sliced p99 of 10-12 ms) failed a bound derived from the earlier
+    /// arm. Up to three pairs are measured; each must meet the unchanged
+    /// bound on its own, and a real fairness regression fails every one.
     #[cfg(not(feature = "disruptor-pane-io"))]
     #[test]
     fn a_waiting_reader_is_served_at_slice_boundaries_under_a_parser_flood() {
         let flood = t0_flood(80_000);
-        let unsliced_pane = render_facts_test_pane(845);
-        let unsliced = FloodReads::record(&unsliced_pane, || {
-            let mut terminal = unsliced_pane.terminal.lock_as(TerminalLockHolder::Parser);
-            let mut sliced = SlicedFeed::new(&flood, FEED_SLICE_BYTES);
-            let progress = sliced.run(
-                &mut terminal,
-                &mut termwiz::escape::parser::Parser::new(),
-                &mut FusedFeedGate,
-                &mut Vec::new(),
-                &mut || false,
+        let mut attempts = Vec::new();
+        for _ in 0..3 {
+            let unsliced_pane = render_facts_test_pane(845);
+            let unsliced = FloodReads::record(&unsliced_pane, || {
+                let mut terminal = unsliced_pane.terminal.lock_as(TerminalLockHolder::Parser);
+                let mut sliced = SlicedFeed::new(&flood, FEED_SLICE_BYTES);
+                let progress = sliced.run(
+                    &mut terminal,
+                    &mut termwiz::escape::parser::Parser::new(),
+                    &mut FusedFeedGate,
+                    &mut Vec::new(),
+                    &mut || false,
+                );
+                assert!(progress == SliceProgress::Done);
+            });
+            let pane = render_facts_test_pane(841);
+            let sliced = FloodReads::record(&pane, || {
+                let mut diverted = Vec::new();
+                pane.feed_fused(
+                    &mut termwiz::escape::parser::Parser::new(),
+                    &flood,
+                    &mut diverted,
+                )
+                .expect("an unregistered pane admits output");
+                assert!(diverted.is_empty(), "T0 output diverts nothing");
+            });
+            for (name, reads) in [("unsliced", &unsliced), ("sliced", &sliced)] {
+                eprintln!(
+                    "[BENCH] parser flood {} bytes, {name}: applied in {:?}, {} reader samples, \
+                     {} mid-batch, p99 wait {:?}, max {:?}",
+                    flood.len(),
+                    reads.apply_time,
+                    reads.waits.len(),
+                    reads.mid_batch_reads,
+                    reads.p99(),
+                    reads.waits.iter().max().copied().unwrap_or_default()
+                );
+            }
+
+            let negative = unsliced.fairness_failures(unsliced.apply_time);
+            assert!(
+                negative.contains(&"no handoff: the reader was never served mid-batch")
+                    && negative.contains(&"p99 wait is not far below the unsliced apply time"),
+                "with yielding suppressed the fairness check must fail, but it found only {:?}",
+                negative
             );
-            assert!(progress == SliceProgress::Done);
-        });
-        let pane = render_facts_test_pane(841);
-        let sliced = FloodReads::record(&pane, || {
-            let mut diverted = Vec::new();
-            pane.feed_fused(
-                &mut termwiz::escape::parser::Parser::new(),
-                &flood,
-                &mut diverted,
-            )
-            .expect("an unregistered pane admits output");
-            assert!(diverted.is_empty(), "T0 output diverts nothing");
-        });
-        for (name, reads) in [("unsliced", &unsliced), ("sliced", &sliced)] {
-            eprintln!(
-                "[BENCH] parser flood {} bytes, {name}: applied in {:?}, {} reader samples, \
-                 {} mid-batch, p99 wait {:?}, max {:?}",
-                flood.len(),
-                reads.apply_time,
-                reads.waits.len(),
-                reads.mid_batch_reads,
-                reads.p99(),
-                reads.waits.iter().max().copied().unwrap_or_default()
-            );
+            let failures = sliced.fairness_failures(unsliced.apply_time);
+            if failures.is_empty() {
+                let reference = render_facts_test_pane(842);
+                reference.terminal.lock().advance_bytes(&flood);
+                let expected = terminal_cells_and_cursor(&reference);
+                assert!(
+                    terminal_cells_and_cursor(&pane) == expected,
+                    "the sliced batch must land as one unsliced feed"
+                );
+                assert!(terminal_cells_and_cursor(&unsliced_pane) == expected);
+                return;
+            }
+            attempts.push(failures);
         }
-
-        let negative = unsliced.fairness_failures(unsliced.apply_time);
-        assert!(
-            negative.contains(&"no handoff: the reader was never served mid-batch")
-                && negative.contains(&"p99 wait is not far below the unsliced apply time"),
-            "with yielding suppressed the fairness check must fail, but it found only {:?}",
-            negative
+        panic!(
+            "the sliced reader failed the fairness bound in every attempt: {:?}",
+            attempts
         );
-        let failures = sliced.fairness_failures(unsliced.apply_time);
-        assert!(failures.is_empty(), "{:?}", failures);
-
-        let reference = render_facts_test_pane(842);
-        reference.terminal.lock().advance_bytes(&flood);
-        let expected = terminal_cells_and_cursor(&reference);
-        assert!(
-            terminal_cells_and_cursor(&pane) == expected,
-            "the sliced batch must land as one unsliced feed"
-        );
-        assert!(terminal_cells_and_cursor(&unsliced_pane) == expected);
     }
 
     /// ft-yccm0.2.3: the two-stage path hands the lock over the same way,

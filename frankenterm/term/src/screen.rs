@@ -1791,6 +1791,11 @@ impl ScreenLineRead {
     pub fn requested_row_count(&self) -> usize {
         self.end.saturating_sub(self.first) as usize
     }
+    /// Every row of this read is resident: no cold rows and no cold layout to
+    /// hydrate, so hydration and publication need nothing but the terminal.
+    pub fn is_resident_only(&self) -> bool {
+        self.first >= self.resident_first && self.layout.is_none()
+    }
     pub fn payload_bytes(&self) -> usize {
         self.payload_bytes
     }
