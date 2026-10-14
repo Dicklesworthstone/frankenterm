@@ -1,0 +1,12 @@
+build after 22:02:24
+build before 22:03:20
+corpus $SCRATCH/e2e/recycle/corpus/seq_lines-67108864-000000000135288d.bin d07e1bf9614185ea
+run 1 before rc=0 load=[37.55 37.63 34.99] secs=1.459 MiB/s=43.9 load_avg_1m=37.55 sanity=ok
+run 1 after rc=0 load=[37.55 37.63 34.99] secs=1.077 MiB/s=59.4 load_avg_1m=37.55 sanity=ok
+run 2 before rc=0 load=[37.55 37.63 34.99] secs=1.490 MiB/s=42.9 load_avg_1m=37.55 sanity=ok
+run 2 after rc=0 load=[37.98 37.71 35.04] secs=1.057 MiB/s=60.6 load_avg_1m=37.98 sanity=ok
+run 3 before rc=0 load=[37.98 37.71 35.04] secs=1.471 MiB/s=43.5 load_avg_1m=37.98 sanity=ok
+run 3 after rc=0 load=[37.98 37.71 35.04] secs=1.043 MiB/s=61.3 load_avg_1m=37.98 sanity=ok
+sampled before load=[37.35 37.59 35.01]
+sampled after load=[37.35 37.59 35.01]
+done

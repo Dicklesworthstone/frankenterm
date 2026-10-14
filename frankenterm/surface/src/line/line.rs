@@ -453,6 +453,34 @@ impl Line {
         }
     }
 
+    /// Turn this line into one equal to `Line::new(seqno)`, reusing its
+    /// clustered storage when this line is that storage's only owner.
+    ///
+    /// The screen recycles a row evicted from scrollback as the new blank row
+    /// at the bottom. Dropping it and calling `Line::new` paid for wiping and
+    /// freeing the old row, a fresh allocation, and the regrowth of its text
+    /// buffer as the new row was written (ft-yccm0.2.9). The old text is still
+    /// wiped. A row whose text buffer is unusually large is not kept.
+    pub fn recycle_as_new(mut self, seqno: SequenceNo) -> Self {
+        const MAX_RECYCLED_TEXT_CAPACITY: usize = 4096;
+        if let CellStorage::C(clustered) = &mut self.cells {
+            if let Some(clustered) = Arc::get_mut(clustered) {
+                if clustered.text_capacity() <= MAX_RECYCLED_TEXT_CAPACITY {
+                    clustered.reset_for_reuse();
+                    self.zones.clear();
+                    self.seqno = seqno;
+                    self.bits = LineBits::NONE;
+                    #[cfg(feature = "appdata")]
+                    {
+                        *lock_or_recover(&self.appdata) = None;
+                    }
+                    return self;
+                }
+            }
+        }
+        Self::new(seqno)
+    }
+
     /// Computes a hash over the line that will change if the way that
     /// the line contents are shaped would change.
     /// This is independent of the seqno and is based purely on the
@@ -5951,6 +5979,56 @@ mod tests {
                 assert!(!changed.is_same_reflow_source(&frozen));
             }
         }
+    }
+
+    #[test]
+    fn recycled_clustered_row_equals_a_new_line_and_keeps_its_text_buffer() {
+        let mut line = Line::new(1);
+        assert!(line.append_ascii_cell_run(0, &"x".repeat(200), CellAttributes::blank(), 1));
+        line.set_last_cell_was_wrapped(true, 1);
+        let text = match &line.cells {
+            CellStorage::C(clustered) => clustered.text.as_ptr(),
+            CellStorage::V(_) => panic!("an ASCII run on a new line stays clustered"),
+        };
+
+        let recycled = line.recycle_as_new(7);
+
+        assert_eq!(recycled, Line::new(7));
+        assert_eq!(recycled.len(), 0);
+        assert!(!recycled.last_cell_was_wrapped());
+        match &recycled.cells {
+            CellStorage::C(clustered) => {
+                assert!(clustered.text.is_empty());
+                assert_eq!(clustered.text.as_ptr(), text, "the text buffer is reused");
+            }
+            CellStorage::V(_) => panic!("a recycled row stays clustered"),
+        }
+
+        // Written again, it behaves like a fresh row.
+        let mut recycled = recycled;
+        assert!(recycled.append_ascii_cell_run(0, "abc", CellAttributes::blank(), 8));
+        let mut fresh = Line::new(7);
+        assert!(fresh.append_ascii_cell_run(0, "abc", CellAttributes::blank(), 8));
+        assert_eq!(recycled, fresh);
+        assert_eq!(recycled.as_str(), "abc");
+    }
+
+    #[test]
+    fn recycling_a_shared_or_vector_row_allocates_a_new_line() {
+        let mut line = Line::new(1);
+        assert!(line.append_ascii_cell_run(0, "shared", CellAttributes::blank(), 1));
+        let other_owner = line.clone();
+        let recycled = line.recycle_as_new(2);
+        assert_eq!(recycled, Line::new(2));
+        assert_eq!(
+            other_owner.as_str(),
+            "shared",
+            "the other owner keeps its text"
+        );
+
+        let vector = Line::with_width_and_cell(4, Cell::blank(), 1);
+        assert!(matches!(vector.cells, CellStorage::V(_)));
+        assert_eq!(vector.recycle_as_new(3), Line::new(3));
     }
 
     #[test]

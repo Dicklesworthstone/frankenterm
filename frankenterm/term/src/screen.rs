@@ -10002,7 +10002,7 @@ impl Screen {
                     removed_from_top = removed_from_top.saturating_add(1);
                 }
                 let line = if default_blank == blank_attr {
-                    Line::new(seqno)
+                    line.recycle_as_new(seqno)
                 } else {
                     // Make the line like a new one of the appropriate width
                     line.resize_and_clear(self.physical_cols, seqno, blank_attr.clone());

@@ -927,6 +927,21 @@ impl ClusteredLine {
     fn wipe_owned_text(&mut self) {
         wipe_text_allocation(&mut self.text);
     }
+
+    /// Return this row to the state of [`ClusteredLine::new`] while keeping
+    /// its text and cluster allocations. The old text is wiped first, exactly
+    /// as dropping the row would.
+    pub(crate) fn reset_for_reuse(&mut self) {
+        self.wipe_owned_text();
+        self.is_double_wide = None;
+        self.clusters.clear();
+        self.len = 0;
+        self.last_cell_width = None;
+    }
+
+    pub(crate) fn text_capacity(&self) -> usize {
+        self.text.capacity()
+    }
 }
 
 impl Drop for ClusteredLine {
