@@ -66,6 +66,35 @@ fn breaks_between(prev: Option<char>, next: char) -> bool {
     prev.is_none_or(|prev| is_cluster_inert(prev) && is_cluster_inert(next))
 }
 
+/// The longest pair of neighbouring cells [`segments_apart`] checks; longer
+/// pairs (long ZWJ sequences) take the whole-line check.
+const SEGMENTS_APART_MAX_BYTES: usize = 64;
+
+/// Whether re-segmenting a line's text, as clustered storage reads it back,
+/// reads a cell holding `prev` as exactly that grapheme when a cell holding
+/// `next` follows it. `None` when the pair is too long to check here.
+///
+/// Exact for a boundary [`breaks_between`] cannot vouch for (ft-yccm0.3.2.6
+/// follow-up): `Graphemes` is a state machine that starts afresh after each
+/// break, so once every earlier boundary of the line is a break, its state
+/// at the end of `prev` depends on `prev` alone, and segmenting the pair
+/// decides this boundary as segmenting the whole line does. Rows of mixed
+/// scripts (a combining mark, a variation selector or RTL letters at a cell
+/// edge) almost never cluster across cells, but failed the char test at
+/// such a boundary, and their compression re-segmented and compared the
+/// whole line instead.
+/// `pair` is the caller's scratch for the two cells' text; keep it in
+/// `Zeroizing`, as terminal text is wiped wherever this crate holds it.
+fn segments_apart(prev: &str, next: &str, pair: &mut String) -> Option<bool> {
+    if prev.len() + next.len() > SEGMENTS_APART_MAX_BYTES {
+        return None;
+    }
+    pair.clear();
+    pair.push_str(prev);
+    pair.push_str(next);
+    Some(Graphemes::new(pair).next() == Some(prev))
+}
+
 /// The rule clustered storage appends by: whether a cell starting with
 /// `next` may follow one ending in `prev` (`None` at the start of the line)
 /// without the two clustering into one grapheme. The PageGrid engine
@@ -492,8 +521,11 @@ impl ClusteredLine {
         let mut len = 0usize;
         let mut last_cell_width = None;
         // Whether the last char so far is inert (None at the line's start),
-        // and whether every boundary so far is.
+        // the previous cell's text, and whether every boundary so far is
+        // known to break.
         let mut prev_inert: Option<bool> = None;
+        let mut prev_text = "";
+        let mut pair = Zeroizing::new(String::new());
         let mut inert = true;
 
         let mut index = 0;
@@ -516,13 +548,16 @@ impl ClusteredLine {
                 match chars.next() {
                     Some(first) => {
                         let first_inert = is_cluster_inert(first);
-                        if prev_inert.is_some_and(|prev| !(prev && first_inert)) {
+                        if prev_inert.is_some_and(|prev| !(prev && first_inert))
+                            && segments_apart(prev_text, cell_text, &mut pair) != Some(true)
+                        {
                             inert = false;
                         } else {
                             prev_inert = Some(match chars.next_back() {
                                 Some(last) => is_cluster_inert(last),
                                 None => first_inert,
                             });
+                            prev_text = cell_text;
                         }
                     }
                     None => inert = false,
@@ -1519,5 +1554,128 @@ mod test {
             let text: String = chars.into_iter().collect();
             assert_cluster_graphemes_segment(&text);
         }
+    }
+
+    /// ft-yccm0.3.2.6 follow-up: a pair of cells reads back apart exactly
+    /// when segmentation breaks between them.
+    #[test]
+    fn segments_apart_follows_grapheme_segmentation() {
+        let mut pair = String::new();
+        // A combining mark, a regional-indicator partner, a ZWJ emoji tail
+        // and a lone ZWJ all join the cell before them.
+        assert_eq!(segments_apart("e", "\u{301}", &mut pair), Some(false));
+        assert_eq!(
+            segments_apart("\u{1F1FA}", "\u{1F1F8}", &mut pair),
+            Some(false)
+        );
+        assert_eq!(
+            segments_apart("\u{1F468}\u{200d}", "\u{1F469}", &mut pair),
+            Some(false)
+        );
+        assert_eq!(segments_apart("a", "\u{200d}", &mut pair), Some(false));
+        assert_eq!(
+            segments_apart("\u{1F600}", "\u{1F3FB}", &mut pair),
+            Some(false)
+        );
+        // Whole graphemes with a non-inert char at the edge stay apart.
+        assert_eq!(segments_apart("e\u{301}", "x", &mut pair), Some(true));
+        assert_eq!(
+            segments_apart("\u{1F1FA}\u{1F1F8}", "\u{1F1EC}", &mut pair),
+            Some(true)
+        );
+        assert_eq!(
+            segments_apart("\u{2764}\u{FE0F}", "a", &mut pair),
+            Some(true)
+        );
+        assert_eq!(segments_apart("\u{644}", "\u{627}", &mut pair), Some(true));
+        assert_eq!(segments_apart("\u{5E9}", "\u{5DC}", &mut pair), Some(true));
+        // A cell that is itself more than one grapheme does not read back.
+        assert_eq!(segments_apart("ab", "c", &mut pair), Some(false));
+        // Too long to check here: the whole-line check decides.
+        let long = "\u{1F468}\u{200d}".repeat(10);
+        assert_eq!(segments_apart(&long, "a", &mut pair), None);
+    }
+
+    /// ft-yccm0.3.2.6 follow-up: the slice builder vouches for a row only
+    /// when re-reading the clustered text yields exactly its cells, and,
+    /// with every neighbouring pair short enough to check, whenever it does.
+    #[test]
+    fn slice_builder_vouches_exactly_when_the_row_reads_back() {
+        let texts = [
+            "a",
+            " ",
+            "\u{754c}",
+            "\u{1F600}",
+            "\u{1F3FB}",
+            "e\u{301}",
+            "\u{301}",
+            "\u{1F1FA}",
+            "\u{1F1F8}",
+            "\u{1F1FA}\u{1F1F8}",
+            "\u{1F468}\u{200d}\u{1F469}",
+            "\u{200d}",
+            "\u{1F600}\u{FE0F}",
+            "\u{644}",
+            "\u{627}",
+            "\u{915}\u{94D}",
+            "\u{915}",
+            "\u{1100}",
+            "\u{1161}",
+            "\u{AC00}",
+            "\u{600}",
+        ];
+        let mut seed = 0x326f_0001_u64;
+        let mut next = move |bound: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % bound
+        };
+        let (mut vouched, mut refused) = (0, 0);
+        for _ in 0..20_000 {
+            let cells: Vec<Cell> = (0..1 + next(12))
+                .map(|_| {
+                    Cell::new_grapheme(texts[next(texts.len())], CellAttributes::blank(), None)
+                })
+                .collect();
+            // Visible cells as the slice builder steps over them: wide
+            // cells are followed by the columns they cover.
+            let mut row = Vec::new();
+            for cell in &cells {
+                let width = cell.width().max(1);
+                row.push(cell.clone());
+                for _ in 1..width {
+                    row.push(Cell::blank());
+                }
+            }
+            let (line, inert) = ClusteredLine::from_cell_slice_checked(row.len(), &row);
+            let reads_back = {
+                let mut own = line.iter();
+                cells.iter().all(|cell| {
+                    own.next().is_some_and(|mine| {
+                        mine.str() == cell.str()
+                            && mine.width()
+                                == usize::from(ClusteredLine::normalize_cell_width(cell.width()))
+                    })
+                }) && own.next().is_none()
+            };
+            if inert {
+                vouched += 1;
+                assert!(
+                    reads_back,
+                    "vouched for a row that does not read back: {:?}",
+                    cells
+                );
+            } else {
+                refused += 1;
+                assert!(!reads_back, "refused a row that reads back: {:?}", cells);
+            }
+        }
+        assert!(
+            vouched > 1000 && refused > 1000,
+            "{} vouched, {} refused",
+            vouched,
+            refused
+        );
     }
 }
