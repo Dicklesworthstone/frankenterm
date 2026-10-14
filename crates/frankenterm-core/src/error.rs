@@ -536,6 +536,7 @@ pub enum MuxOperation {
     ReleaseSelectionAnchor,
     ReadPaneRenderableDimensions,
     ReadSemanticZones,
+    ReadPaneUserVars,
     SendText,
     ResizePane,
     AdjustPaneSize,
@@ -590,6 +591,7 @@ impl MuxOperation {
             Self::ReleaseSelectionAnchor => "release_selection_anchor",
             Self::ReadPaneRenderableDimensions => "read_pane_renderable_dimensions",
             Self::ReadSemanticZones => "read_semantic_zones",
+            Self::ReadPaneUserVars => "read_pane_user_vars",
             Self::SendText => "send_text",
             Self::ResizePane => "resize_pane",
             Self::AdjustPaneSize => "adjust_pane_size",
@@ -664,6 +666,9 @@ pub enum MuxRejectionCode {
     QuotaExceeded,
     BackendFailure,
     IndeterminateMutation,
+    /// The pane was too busy (e.g. applying a flood of output) to serve a
+    /// read; nothing was applied and the read may be retried after backoff.
+    ResourceBusy,
     UnknownFuture,
 }
 
@@ -682,6 +687,7 @@ impl MuxRejectionCode {
             Self::QuotaExceeded => "quota_exceeded",
             Self::BackendFailure => "backend_failure",
             Self::IndeterminateMutation => "indeterminate_mutation",
+            Self::ResourceBusy => "resource_busy",
             Self::UnknownFuture => "unknown_future",
         }
     }
@@ -867,7 +873,8 @@ impl MuxRejection {
             }
             MuxRejectionCode::DeadlineExceeded
             | MuxRejectionCode::QuotaExceeded
-            | MuxRejectionCode::BackendFailure => {
+            | MuxRejectionCode::BackendFailure
+            | MuxRejectionCode::ResourceBusy => {
                 matches!(self.effect, MuxEffectCertainty::NotApplied)
                     && matches!(self.retry, MuxRetryAuthority::SafeAfterBackoff)
             }
@@ -1122,7 +1129,8 @@ impl WeztermError {
                 MuxRejectionCode::Cancelled
                 | MuxRejectionCode::DeadlineExceeded
                 | MuxRejectionCode::QuotaExceeded
-                | MuxRejectionCode::BackendFailure => NetworkErrorKind::Transient,
+                | MuxRejectionCode::BackendFailure
+                | MuxRejectionCode::ResourceBusy => NetworkErrorKind::Transient,
                 MuxRejectionCode::PaneNotFound
                 | MuxRejectionCode::TabNotFound
                 | MuxRejectionCode::WindowNotFound

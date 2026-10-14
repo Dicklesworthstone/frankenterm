@@ -57,7 +57,8 @@ impl ErrorRenderer {
                     | MuxRejectionCode::PolicyRejected
                     | MuxRejectionCode::Cancelled
                     | MuxRejectionCode::QuotaExceeded
-                    | MuxRejectionCode::BackendFailure => "FT-1020",
+                    | MuxRejectionCode::BackendFailure
+                    | MuxRejectionCode::ResourceBusy => "FT-1020",
                 },
                 WeztermError::ParseError(_) => "FT-1021",
                 WeztermError::VersionSkew { .. } => "FT-1025",

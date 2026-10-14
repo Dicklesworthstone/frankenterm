@@ -189,6 +189,7 @@ pub fn classify_error_message(msg: &str) -> ProtocolErrorKind {
         return if lower.ends_with("deadline_exceeded")
             || lower.ends_with("quota_exceeded")
             || lower.ends_with("backend_failure")
+            || lower.ends_with("resource_busy")
             || lower.ends_with("cancelled")
         {
             ProtocolErrorKind::Transient
@@ -1613,6 +1614,10 @@ mod tests {
             ),
             (
                 codec::ErrorResponse::backend_failure(request_ident),
+                transient_retry,
+            ),
+            (
+                codec::ErrorResponse::resource_busy(request_ident),
                 transient_retry,
             ),
             (

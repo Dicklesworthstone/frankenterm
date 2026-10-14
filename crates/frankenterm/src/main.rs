@@ -9174,6 +9174,7 @@ const ROBOT_ERR_MUX_CANCELLED: &str = "robot.mux_cancelled";
 const ROBOT_ERR_MUX_QUOTA_EXCEEDED: &str = "robot.mux_quota_exceeded";
 const ROBOT_ERR_MUX_BACKEND_FAILURE: &str = "robot.mux_backend_failure";
 const ROBOT_ERR_MUX_UNKNOWN_FUTURE: &str = "robot.mux_unknown_future";
+const ROBOT_ERR_MUX_RESOURCE_BUSY: &str = "robot.mux_resource_busy";
 const ROBOT_ERR_WEZTERM_MUTATION_INDETERMINATE: &str = "robot.wezterm_mutation_indeterminate";
 const ROBOT_ERR_RESERVATION_CONFLICT: &str = "robot.reservation_conflict";
 const ROBOT_ERR_STORAGE: &str = "robot.storage_error";
@@ -41928,6 +41929,10 @@ fn map_mux_rejection_code_to_robot(
                 "The mutation may already have taken effect. Reconcile live mux state and verify the intended postcondition; do not blindly retry."
                     .to_string(),
             ),
+        ),
+        MuxRejectionCode::ResourceBusy => (
+            ROBOT_ERR_MUX_RESOURCE_BUSY,
+            Some("The pane was too busy to serve the read; nothing was applied. Retry after backoff.".to_string()),
         ),
         MuxRejectionCode::UnknownFuture => (
             ROBOT_ERR_MUX_UNKNOWN_FUTURE,
@@ -132181,6 +132186,7 @@ printf x > "$MINISIGN_MARKER"
                 MuxRejectionCode::IndeterminateMutation,
                 ROBOT_ERR_WEZTERM_MUTATION_INDETERMINATE,
             ),
+            (MuxRejectionCode::ResourceBusy, ROBOT_ERR_MUX_RESOURCE_BUSY),
             (
                 MuxRejectionCode::UnknownFuture,
                 ROBOT_ERR_MUX_UNKNOWN_FUTURE,
@@ -132210,7 +132216,8 @@ printf x > "$MINISIGN_MARKER"
             let (effect, retry) = match code {
                 MuxRejectionCode::DeadlineExceeded
                 | MuxRejectionCode::QuotaExceeded
-                | MuxRejectionCode::BackendFailure => (
+                | MuxRejectionCode::BackendFailure
+                | MuxRejectionCode::ResourceBusy => (
                     MuxEffectCertainty::NotApplied,
                     MuxRetryAuthority::SafeAfterBackoff,
                 ),

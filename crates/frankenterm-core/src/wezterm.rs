@@ -3362,6 +3362,7 @@ impl WeztermClient {
                 "quota_exceeded" => MuxRejectionCode::QuotaExceeded,
                 "backend_failure" => MuxRejectionCode::BackendFailure,
                 "indeterminate_mutation" => MuxRejectionCode::IndeterminateMutation,
+                "resource_busy" => MuxRejectionCode::ResourceBusy,
                 "unknown_future" => MuxRejectionCode::UnknownFuture,
                 _ => return None,
             };
@@ -3454,6 +3455,7 @@ impl WeztermClient {
                 )
                 | ("get_dimensions", MuxOperation::ReadPaneRenderableDimensions)
                 | ("get_semantic_zones", MuxOperation::ReadSemanticZones)
+                | ("get_pane_user_vars_v1", MuxOperation::ReadPaneUserVars)
                 | ("write_to_pane" | "send_paste", MuxOperation::SendText)
                 | ("resize", MuxOperation::ResizePane)
                 | ("adjust_pane_size", MuxOperation::AdjustPaneSize)
@@ -3777,6 +3779,7 @@ impl WeztermClient {
             Some("ReleaseSelectionAnchorV1") => MuxOperation::ReleaseSelectionAnchor,
             Some("GetPaneRenderableDimensions") => MuxOperation::ReadPaneRenderableDimensions,
             Some("GetSemanticZones") => MuxOperation::ReadSemanticZones,
+            Some("GetPaneUserVarsV1") => MuxOperation::ReadPaneUserVars,
             Some("WriteToPane" | "SendPaste" | "SendPasteTracedV1" | "ReliablePaneWriteV1") => {
                 MuxOperation::SendText
             }
@@ -3846,6 +3849,7 @@ impl WeztermClient {
             codec::MuxErrorCode::QUOTA_EXCEEDED => MuxRejectionCode::QuotaExceeded,
             codec::MuxErrorCode::BACKEND_FAILURE => MuxRejectionCode::BackendFailure,
             codec::MuxErrorCode::INDETERMINATE_MUTATION => MuxRejectionCode::IndeterminateMutation,
+            codec::MuxErrorCode::RESOURCE_BUSY => MuxRejectionCode::ResourceBusy,
             _ => MuxRejectionCode::UnknownFuture,
         };
         let object = response.object.map(|object| MuxObjectIdentity {
@@ -8541,6 +8545,7 @@ mod tests {
             codec::ErrorResponse::deadline_exceeded(request_ident),
             codec::ErrorResponse::quota_exceeded(request_ident),
             codec::ErrorResponse::backend_failure(request_ident),
+            codec::ErrorResponse::resource_busy(request_ident),
             codec::ErrorResponse::indeterminate_mutation(
                 request_ident,
                 Some(codec::MuxErrorObject {
@@ -8741,6 +8746,13 @@ mod tests {
                 "indeterminate",
                 "reconcile_before_retry",
                 MuxRejectionCode::IndeterminateMutation,
+            ),
+            (
+                "resource_busy",
+                "none",
+                "not_applied",
+                "safe_after_backoff",
+                MuxRejectionCode::ResourceBusy,
             ),
             (
                 "unknown_future",

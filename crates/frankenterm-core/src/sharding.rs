@@ -907,7 +907,8 @@ fn classify_backend_error(error: &crate::Error) -> ShardBackendErrorClass {
                 | MuxRejectionCode::InvalidRequest
                 | MuxRejectionCode::PolicyRejected
                 | MuxRejectionCode::QuotaExceeded
-                | MuxRejectionCode::BackendFailure => ShardBackendErrorClass::CommandFailed,
+                | MuxRejectionCode::BackendFailure
+                | MuxRejectionCode::ResourceBusy => ShardBackendErrorClass::CommandFailed,
             },
         },
         crate::Error::Storage(
