@@ -2990,6 +2990,53 @@ impl DirectMuxClient {
                 _ => (scrollback_top, None),
             };
             let read_from_top = start == scrollback_top;
+            // A tail inside one chunk is read as the pane's newest rows at
+            // capture time. An unfenced GetLines range that runs past the
+            // newest row is clamped by the server to the newest rows, which
+            // are hot, so the server captures and publishes them in one
+            // terminal hold. At full output rate, rows computed from this
+            // fence could scroll into cold history before the server captured
+            // them and then fail at the cold/hot seam (ft-pjjeg).
+            if content_tail.is_some() && !read_from_top && end - start <= chunk_rows {
+                let count = end - start;
+                let phase_started = diagnostics.start_phase();
+                let response = self
+                    .get_lines_with_cx(
+                        cx,
+                        pane_id,
+                        std::iter::once(isize::MAX - count..isize::MAX).collect(),
+                    )
+                    .await;
+                diagnostics.phase("newest_rows", phase_started);
+                let response = response?;
+                if response.pane_id as u64 != pane_id {
+                    return Err(mux_text_contract_error(
+                        MuxTextContractReason::ReplyPaneMismatch,
+                    ));
+                }
+                let (lines, _images) = response.lines.extract_data();
+                if lines.windows(2).any(|pair| pair[1].0 != pair[0].0 + 1) {
+                    return Err(mux_text_contract_error(
+                        MuxTextContractReason::ReplyRowOrderMismatch,
+                    ));
+                }
+                let mut out = String::new();
+                for (_, line) in lines {
+                    checkpoint_mux_cx(cx, self.connection_id, "text_read_append")?;
+                    if let Err(limit) =
+                        append_mux_text_line(&mut out, line.as_str().as_ref(), max_output_bytes)
+                    {
+                        return Ok(Ok(limit));
+                    }
+                }
+                return Ok(Ok(finish_mux_text_read(
+                    out,
+                    tail,
+                    content_tail,
+                    false,
+                    total_rows,
+                )));
+            }
             let mut out = String::new();
             let mut replies = 0usize;
             while start < end {
@@ -7384,6 +7431,32 @@ mod tests {
         })
     }
 
+    /// The server's clamp of an unfenced range that runs past the newest
+    /// row: the newest rows, as many as requested, ending at `newest_end`.
+    fn text_read_newest_reply(request: GetLines, newest_end: isize, generation: &str) -> Pdu {
+        let count = request
+            .lines
+            .iter()
+            .map(|range| range.end - range.start)
+            .sum::<isize>();
+        let lines = (newest_end - count..newest_end)
+            .map(|row| {
+                let mut line = frankenterm_term::Line::from_text(
+                    &text_read_row(row, generation),
+                    &termwiz::cell::CellAttributes::default(),
+                    1,
+                    None,
+                );
+                line.set_last_cell_was_wrapped(row % 2 == 0, 1);
+                (row, line)
+            })
+            .collect::<Vec<_>>();
+        Pdu::GetLinesResponse(GetLinesResponse {
+            pane_id: request.pane_id,
+            lines: lines.into(),
+        })
+    }
+
     fn text_read_expected(range: std::ops::Range<isize>, generation: &str) -> String {
         let mut expected = String::new();
         for row in range {
@@ -8829,12 +8902,13 @@ mod tests {
                     Pdu::GetPaneRenderChanges(_) | Pdu::GetPaneRenderStateV1(_) => {
                         text_read_state(7, -7, 600)
                     }
-                    Pdu::GetLinesAtLayout(request) => {
-                        assert_eq!(request.layout.seqno, 7);
+                    // A one-chunk tail is read as the pane's newest rows
+                    // (ft-pjjeg); a fenced read would panic here.
+                    Pdu::GetLines(request) => {
                         assert_eq!(request.pane_id, 9);
                         let range = request.lines[0].clone();
                         seen.lock().unwrap().push(range.clone());
-                        text_read_reply(request, "café 中文 e\u{301} 👩‍💻")
+                        text_read_newest_reply(request, 593, "café 中文 e\u{301} 👩‍💻")
                     }
                     other => panic!("unexpected text request {other:?}"),
                 })
@@ -8858,9 +8932,9 @@ mod tests {
             );
             assert_eq!(
                 *ranges.lock().unwrap(),
-                vec![519..593],
-                "only the tail plus one viewport (24 rows) may be requested; \
-                 prefix rows -7..519 never cross the wire"
+                vec![isize::MAX - 74..isize::MAX],
+                "only the tail plus one viewport (74 rows) may be requested, as the \
+                 pane's newest rows; prefix rows -7..519 never cross the wire"
             );
             drop(client);
             timeout(Duration::from_secs(5), server)
@@ -9043,8 +9117,10 @@ mod tests {
             let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
                 .await
                 .unwrap();
+            // Over one chunk (550 + 24 rows > 512), so the tail is read fenced
+            // in chunks; a one-chunk tail reads the newest rows instead.
             let result = client
-                .get_text_tail_with_cx(&cx, 9, 100_000, Some(50))
+                .get_text_tail_with_cx(&cx, 9, 100_000, Some(550))
                 .await
                 .unwrap();
 
@@ -9052,7 +9128,7 @@ mod tests {
                 result,
                 MuxTextReadResult::Bounded {
                     // Row 602 is blank (602 % 7 == 0): the content tail ends at 601.
-                    text: text_read_expected(552..602, "new"),
+                    text: text_read_expected(52..602, "new"),
                     original_lines: 600,
                     original_bytes: None,
                     truncated: true,
@@ -9061,7 +9137,7 @@ mod tests {
 
             assert_eq!(
                 *ranges.lock().unwrap(),
-                vec![519..593, 529..603],
+                vec![19..531, 29..541, 541..603],
                 "retry must recompute the suffix range against the updated layout"
             );
 
