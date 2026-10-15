@@ -827,20 +827,20 @@
       "classification_summary": {
         "cosmetic": 1,
         "feat": 3,
-        "fix": 7,
+        "fix": 8,
         "other": 3,
         "refactor": 1,
         "rename": 1,
         "runtime-swap": 1,
         "test": 5
       },
-      "fork_side_commit_count": 22,
+      "fork_side_commit_count": 23,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-10-15T06:44:29-04:00",
-        "sha": "435b800be227ce305b114525331644733fb0109a",
-        "subject": "perf(mux): durability and shed-release threads run below input and parse on Linux (ft-4p4uo)"
+        "classification": "fix",
+        "committed_at": "2026-10-15T09:32:23-04:00",
+        "sha": "68211106847a2c2b2ecaff495dcb516ca32110c1",
+        "subject": "fix(mux): background threads stay below input when ananicy re-nices the server (ft-4p4uo)"
       },
       "name": "procinfo",
       "path": "frankenterm/procinfo",
@@ -1206,8 +1206,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 3192,
-  "generated_at": "2026-10-15T12:34:46.397865Z",
+  "fork_side_commit_total": 3193,
+  "generated_at": "2026-10-15T13:32:54.707589Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
