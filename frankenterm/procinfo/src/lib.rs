@@ -45,8 +45,9 @@ pub use signpost::{
 };
 pub use thread_qos::{
     current_thread_base_priority, current_thread_qos, ensure_application_task_role,
-    keep_launched_task_role, set_current_thread_qos, set_current_thread_qos_for_life,
-    start_thread_at, ApplicationTaskRole, ThreadQos,
+    keep_launched_task_role, reassert_current_thread_qos_for_life, set_current_thread_qos,
+    set_current_thread_qos_for_life, start_thread_at, ApplicationTaskRole, ThreadQos,
+    QOS_REASSERT_INTERVAL,
 };
 
 #[derive(Debug, Copy, Clone)]

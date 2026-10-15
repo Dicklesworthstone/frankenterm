@@ -83,12 +83,17 @@
 //!    all of it.
 //!
 //! The Linux implementation of [`set_current_thread_qos_for_life`] calls
-//! `getpriority(PRIO_PROCESS, 0)` and `setpriority(PRIO_PROCESS, 0, nice)`,
-//! each in its own `unsafe` block. Neither takes a pointer. On Linux,
-//! `PRIO_PROCESS` with `who` 0 names the calling thread only, not its
-//! siblings (setpriority(2), NOTES). The new niceness is the current one plus
-//! a fixed step, capped at 19, so the call only ever lowers the thread's
-//! priority, which needs no privilege.
+//! `getpriority(PRIO_PROCESS, 0)`, `getpriority(PRIO_PROCESS, pid)` and
+//! `setpriority(PRIO_PROCESS, 0, nice)`, each in its own `unsafe` block.
+//! None takes a pointer. On Linux, `PRIO_PROCESS` with `who` 0 names the
+//! calling thread only, not its siblings, and with the process id it names
+//! the main thread (setpriority(2), NOTES). Before reading the main thread
+//! it zeroes the calling thread's `errno` through `__errno_location()`, a
+//! pointer to that thread's own slot, so a failed read is told from a
+//! niceness of -1. The new niceness is the main thread's plus a fixed step,
+//! capped at 19, and is applied only when it is above the thread's current
+//! one, so the call only ever lowers the thread's priority, which needs no
+//! privilege.
 
 /// A thread QoS class. The raw values are the C `qos_class_t` constants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -220,21 +225,20 @@ pub fn start_thread_at(qos: ThreadQos) {
 /// [`set_current_thread_qos`] for a thread that keeps a class below
 /// [`ThreadQos::Default`] for its whole life, such as the durable scrollback
 /// writer. Linux has no QoS classes, so there it lowers the thread's CPU
-/// priority instead: 5 nice steps for utility, 10 for background, on top of
-/// the process's niceness. Without that, such a thread competes equally with
-/// the threads that dispatch input and parse output (ft-4p4uo). An
-/// unprivileged thread cannot raise its priority back, so a thread that
-/// changes class later (the render thread) must use [`set_current_thread_qos`].
-/// Returns whether anything was applied.
+/// priority instead: 5 nice steps for utility, 10 for background, below the
+/// process's main thread. Without that, such a thread competes equally with
+/// the threads that dispatch input and parse output (ft-4p4uo). It never
+/// raises the thread's priority, so calling it again changes nothing unless
+/// something else re-niced the thread (see
+/// [`reassert_current_thread_qos_for_life`]). An unprivileged thread cannot
+/// raise its priority back, so a thread that changes class later (the render
+/// thread) must use [`set_current_thread_qos`]. Returns whether anything was
+/// applied.
 pub fn set_current_thread_qos_for_life(qos: ThreadQos) -> std::io::Result<bool> {
     let applied = set_current_thread_qos(qos)?;
     #[cfg(target_os = "linux")]
     {
-        let steps = match qos {
-            ThreadQos::Utility => 5,
-            ThreadQos::Background => 10,
-            _ => 0,
-        };
+        let steps = nice_steps_for_life(qos);
         if steps > 0 {
             linux::lower_current_thread_niceness(steps)?;
             return Ok(true);
@@ -243,21 +247,102 @@ pub fn set_current_thread_qos_for_life(qos: ThreadQos) -> std::io::Result<bool> 
     Ok(applied)
 }
 
+/// How long [`reassert_current_thread_qos_for_life`] lets a re-niced thread
+/// run before it lowers the thread again.
+pub const QOS_REASSERT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Lowers the calling thread again as [`set_current_thread_qos_for_life`]
+/// did, if something has re-niced it since, at most once per
+/// [`QOS_REASSERT_INTERVAL`]. On Linux a process manager can undo the
+/// lowering: ananicy-cpp, on every ACFS host, gives every thread of
+/// `frankenterm-mux-server` nice -10 on each 15 s scan, which put the
+/// durability writer level with the input thread again (ft-4p4uo). Call it
+/// before each unit of work on such a thread; between reassertions it costs
+/// one clock read. A no-op elsewhere.
+pub fn reassert_current_thread_qos_for_life(qos: ThreadQos) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::cell::Cell;
+        use std::time::Instant;
+        thread_local! {
+            static LAST: Cell<Option<Instant>> = const { Cell::new(None) };
+        }
+        let steps = nice_steps_for_life(qos);
+        if steps == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let due = LAST.with(|last| match last.get() {
+            Some(at) if now.saturating_duration_since(at) < QOS_REASSERT_INTERVAL => false,
+            _ => {
+                last.set(Some(now));
+                true
+            }
+        });
+        if due {
+            let _ = linux::lower_current_thread_niceness(steps);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = qos;
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn nice_steps_for_life(qos: ThreadQos) -> i32 {
+    match qos {
+        ThreadQos::Utility => 5,
+        ThreadQos::Background => 10,
+        _ => 0,
+    }
+}
+
+/// The niceness to give a thread that should sit `steps` below the main
+/// thread, or `None` when it already sits at least that low: the call never
+/// raises a thread's priority. Capped at 19.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn niceness_to_assert(current: i32, main_thread: i32, steps: i32) -> Option<i32> {
+    let wanted = main_thread.saturating_add(steps).min(19);
+    (current < wanted).then_some(wanted)
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
-    /// Adds `steps` to the calling thread's niceness, capped at 19.
+    /// Puts the calling thread `steps` nice levels below the process's main
+    /// thread (capped at 19), unless it already sits lower. When the main
+    /// thread's niceness cannot be read, the calling thread's own stands in.
     pub(super) fn lower_current_thread_niceness(steps: i32) -> std::io::Result<()> {
         // SAFETY: UNSAFE-CONTRACT (Linux). No pointers; `who` 0 is the calling
         // thread, which always exists, so the read cannot fail (its -1 is a
         // valid niceness, not an error).
         let current = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
-        let wanted = current.saturating_add(steps).min(19);
+        let main_thread = main_thread_niceness().unwrap_or(current);
+        let Some(wanted) = super::niceness_to_assert(current, main_thread, steps) else {
+            return Ok(());
+        };
         // SAFETY: UNSAFE-CONTRACT (Linux). No pointers; `who` 0 is the calling
-        // thread, and `wanted` is never below its current niceness.
+        // thread, and `wanted` is above its current niceness.
         if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, wanted) } == 0 {
             Ok(())
         } else {
             Err(std::io::Error::last_os_error())
+        }
+    }
+
+    /// The niceness of the process's main thread, whose thread id is the
+    /// process id. `None` if it cannot be read (it has exited).
+    fn main_thread_niceness() -> Option<i32> {
+        let pid = std::process::id();
+        // SAFETY: UNSAFE-CONTRACT (Linux). `__errno_location` returns the
+        // calling thread's own errno slot, valid for the thread's life;
+        // zeroing it first is how getpriority(2) tells its -1 from an error.
+        unsafe { *libc::__errno_location() = 0 };
+        // SAFETY: UNSAFE-CONTRACT (Linux). No pointers; `who` names the main
+        // thread, and an exited one only makes the call fail.
+        let nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid) };
+        if nice == -1 && std::io::Error::last_os_error().raw_os_error() != Some(0) {
+            None
+        } else {
+            Some(nice)
         }
     }
 
@@ -613,29 +698,66 @@ mod tests {
         );
     }
 
-    /// On Linux a utility or background thread for life is niced, and only
-    /// that thread: its spawner and its siblings keep their priority.
+    /// The niceness asserted sits `steps` below the main thread and never
+    /// raises a thread's priority. With ananicy-cpp's rule for the mux
+    /// server every thread is re-niced to -10, main included; the writer
+    /// goes back to -5, still five steps below input (ft-4p4uo).
+    #[test]
+    fn asserted_niceness_follows_the_main_thread_and_never_raises_priority() {
+        assert_eq!(niceness_to_assert(0, 0, 5), Some(5));
+        assert_eq!(niceness_to_assert(-10, -10, 5), Some(-5));
+        assert_eq!(niceness_to_assert(-10, 0, 5), Some(5));
+        assert_eq!(niceness_to_assert(5, 0, 5), None, "already there");
+        assert_eq!(niceness_to_assert(12, 0, 5), None, "already lower");
+        assert_eq!(niceness_to_assert(0, 17, 10), Some(19), "capped at 19");
+        assert_eq!(niceness_to_assert(19, 17, 10), None);
+    }
+
+    /// On Linux a utility or background thread for life is niced below the
+    /// main thread, and only that thread: its spawner and its siblings keep
+    /// their priority. Doing it again changes nothing, and a thread already
+    /// lower is not raised.
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_lowers_only_the_calling_threads_priority_for_life() {
         let spawner = linux::current_thread_niceness();
+        // The test runs on a harness thread; its niceness is the process's.
+        let main_thread = spawner;
         for (qos, steps) in [
             (ThreadQos::Utility, 5),
             (ThreadQos::Background, 10),
             (ThreadQos::Default, 0),
             (ThreadQos::UserInitiated, 0),
         ] {
-            let (before, applied, after) = std::thread::spawn(move || {
+            let (before, applied, after, again) = std::thread::spawn(move || {
                 let before = linux::current_thread_niceness();
                 let applied =
                     set_current_thread_qos_for_life(qos).expect("lowering needs no privilege");
-                (before, applied, linux::current_thread_niceness())
+                let after = linux::current_thread_niceness();
+                set_current_thread_qos_for_life(qos).expect("lowering needs no privilege");
+                (before, applied, after, linux::current_thread_niceness())
             })
             .join()
             .expect("niced thread");
-            assert_eq!(after, (before + steps).min(19), "{qos:?}");
+            let expected = if steps > 0 {
+                (main_thread + steps).min(19)
+            } else {
+                before
+            };
+            assert_eq!(after, expected, "{qos:?}");
+            assert_eq!(again, after, "{qos:?}: idempotent");
             assert_eq!(applied, steps > 0, "{qos:?}");
         }
+        let lower = std::thread::spawn(move || {
+            // SAFETY: test-only; no pointers, lowers only this thread.
+            unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, (main_thread + 15).min(19)) };
+            set_current_thread_qos_for_life(ThreadQos::Utility).expect("no-op");
+            reassert_current_thread_qos_for_life(ThreadQos::Utility);
+            linux::current_thread_niceness()
+        })
+        .join()
+        .expect("lower thread");
+        assert_eq!(lower, (main_thread + 15).min(19), "never raised");
         assert_eq!(
             linux::current_thread_niceness(),
             spawner,

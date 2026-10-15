@@ -508,7 +508,12 @@ mod deferred_scrollback {
                 .name(SHED_RELEASE_THREAD_NAME.to_string())
                 .spawn(move || {
                     let _ = procinfo::set_current_thread_qos_for_life(procinfo::ThreadQos::Utility);
-                    receiver.into_iter().for_each(drop);
+                    for garbage in receiver {
+                        procinfo::reassert_current_thread_qos_for_life(
+                            procinfo::ThreadQos::Utility,
+                        );
+                        drop(garbage);
+                    }
                 })
                 .ok()
                 .map(|_| sender)
@@ -762,6 +767,9 @@ mod deferred_scrollback {
 
         fn run(&self) {
             while let Some(sink) = self.next_sink() {
+                // ananicy-cpp re-nices every thread of the server to the
+                // input thread's level every 15 s on ACFS hosts (ft-4p4uo).
+                procinfo::reassert_current_thread_qos_for_life(procinfo::ThreadQos::Utility);
                 self.service(sink);
             }
         }
