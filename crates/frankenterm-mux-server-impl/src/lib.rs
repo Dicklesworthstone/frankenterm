@@ -1016,8 +1016,17 @@ mod deferred_scrollback {
         /// When the first row still queued was admitted: the open commit
         /// window's start (ft-yccm0.2.1.2).
         window_opened: Option<Instant>,
-        /// When the newest row was admitted, for the idle close.
+        /// When the newest row was admitted, for the idle close: exact for
+        /// a row that opened a window, otherwise the time a commit-window
+        /// check first saw `admitted_since_check`.
         last_admitted: Option<Instant>,
+        /// Rows were admitted behind the window's first one since the last
+        /// commit-window check, which reads no clock per row.
+        admitted_since_check: bool,
+        /// When the first row admitted since the drain last captured
+        /// arrived: every later row before the next capture is committed in
+        /// that row's window and carries its time.
+        uncaptured_since: Option<Instant>,
         /// An explicit commit survives partial acknowledgements and failed
         /// publication. New arrivals and later requests cannot move the
         /// earliest outstanding frontier.
@@ -1081,6 +1090,8 @@ mod deferred_scrollback {
                 shedding: false,
                 window_opened: None,
                 last_admitted: None,
+                admitted_since_check: false,
+                uncaptured_since: None,
                 commit_requested: None,
                 commit_followup: None,
                 cached: VecDeque::new(),
@@ -1164,7 +1175,15 @@ mod deferred_scrollback {
         /// first, until `need` bytes are freed or none are left. Adjacent
         /// gaps coalesce into one. Returns the bytes freed, the dropped rows
         /// (to be released outside the state lock) and the new gap spans.
-        fn shed(&mut self, need: usize, at_unix_ms: u64) -> (usize, Vec<Pending>, Vec<GapSpan>) {
+        /// `clock` gives the wall time a new gap records; it is read only if
+        /// a row is shed (overload calls this for every row another pane's
+        /// queue keeps over budget).
+        fn shed(
+            &mut self,
+            need: usize,
+            clock: impl Fn() -> u64,
+        ) -> (usize, Vec<Pending>, Vec<GapSpan>) {
+            let mut read = None;
             let mut freed = 0;
             let mut dropped = Vec::new();
             let mut spans = Vec::new();
@@ -1191,6 +1210,7 @@ mod deferred_scrollback {
                     Pending::Gap(gap) => gap.retention,
                 };
                 dropped.extend(self.pending.drain(index..end));
+                let at_unix_ms = *read.get_or_insert_with(&clock);
                 let mut span = GapSpan {
                     start: first,
                     end: last,
@@ -1444,10 +1464,10 @@ mod deferred_scrollback {
         /// Whether the writer should commit this sink's queued rows now
         /// (ft-yccm0.2.1.2), or when its open commit window closes.
         fn commit_window(&self, now: Instant) -> CommitWindow {
-            let Ok(state) = self.state.lock() else {
+            let Ok(mut state) = self.state.lock() else {
                 return CommitWindow::Closed("state unavailable");
             };
-            self.commit_window_for_state(now, &state)
+            self.commit_window_for_state(now, &mut state)
         }
 
         /// The final parking check owns the global writer queue. A clear or
@@ -1455,13 +1475,19 @@ mod deferred_scrollback {
         /// retry outside that queue instead of waiting or forcing a commit.
         fn try_commit_window(&self, now: Instant) -> Option<CommitWindow> {
             match self.state.try_lock() {
-                Ok(state) => Some(self.commit_window_for_state(now, &state)),
+                Ok(mut state) => Some(self.commit_window_for_state(now, &mut state)),
                 Err(TryLockError::WouldBlock) => None,
                 Err(TryLockError::Poisoned(_)) => Some(CommitWindow::Closed("state unavailable")),
             }
         }
 
-        fn commit_window_for_state(&self, now: Instant, state: &State) -> CommitWindow {
+        fn commit_window_for_state(&self, now: Instant, state: &mut State) -> CommitWindow {
+            // Rows admitted since the last check arrived by `now`. Counting
+            // them as arriving now can hold the idle close back by at most
+            // one idle interval, never past the window's age.
+            if std::mem::take(&mut state.admitted_since_check) {
+                state.last_admitted = Some(now);
+            }
             if self.self_ref.strong_count() <= 1 {
                 return CommitWindow::Closed("pane closed");
             }
@@ -1786,6 +1812,8 @@ mod deferred_scrollback {
                         Some(Next::Gap { .. }) => 1,
                         Some(Next::Rows { lines, .. }) => lines.len(),
                     };
+                    // Arrivals from here on open the next window.
+                    state.uncaptured_since = None;
                     next
                 };
                 match next {
@@ -2109,7 +2137,7 @@ mod deferred_scrollback {
             let queued = self.writer.queued_bytes();
             let as_gap = if queued.saturating_add(charge) > budget {
                 let need = queued.saturating_add(charge).saturating_sub(budget / 2);
-                let (freed, mut gone, mut spans) = state.shed(need, unix_now_ms());
+                let (freed, mut gone, mut spans) = state.shed(need, unix_now_ms);
                 self.writer.release(freed);
                 dropped.append(&mut gone);
                 gaps.append(&mut spans);
@@ -2127,15 +2155,26 @@ mod deferred_scrollback {
             };
             let was_empty = state.pending.is_empty();
             let was_full = window_full(state);
-            let now = Instant::now();
+            // One clock read per commit window, not per row (ft-yccm0.2.1.8):
+            // on macOS it was ~80 ns of a short row's ~285 under the terminal
+            // lock. A row behind the first one the drain has not captured yet
+            // is committed in that row's window, so it carries that row's
+            // admission time: when its window opened.
+            let (now, read_clock) = match state.uncaptured_since {
+                Some(opened) if !was_empty => (opened, false),
+                _ => {
+                    let now = Instant::now();
+                    state.uncaptured_since = Some(now);
+                    (now, true)
+                }
+            };
             if as_gap {
-                let at_unix_ms = unix_now_ms();
-                let span = GapSpan {
+                let mut span = GapSpan {
                     start: stable_row,
                     end: next,
                     retention,
                     bytes: charge,
-                    at_unix_ms,
+                    at_unix_ms: 0,
                 };
                 let tail = state.pending.len().checked_sub(1);
                 match (tail, state.pending.back_mut()) {
@@ -2144,8 +2183,13 @@ mod deferred_scrollback {
                     {
                         last.end = next;
                         last.bytes += charge;
+                        // The row joins that gap and its time.
+                        span.at_unix_ms = last.at_unix_ms;
                     }
-                    _ => state.pending.push_back(Pending::Gap(span)),
+                    _ => {
+                        span.at_unix_ms = unix_now_ms();
+                        state.pending.push_back(Pending::Gap(span));
+                    }
                 }
                 gaps.push(span);
             } else {
@@ -2164,7 +2208,12 @@ mod deferred_scrollback {
             if was_empty {
                 state.window_opened = Some(now);
             }
-            state.last_admitted = Some(now);
+            if read_clock {
+                state.last_admitted = Some(now);
+                state.admitted_since_check = false;
+            } else {
+                state.admitted_since_check = true;
+            }
             *close_window = !was_full && window_full(state);
             self.pending_rows
                 .store(state.pending.len(), Ordering::Release);
@@ -3989,6 +4038,87 @@ mod deferred_scrollback {
             sink.commit_window(Instant::now()),
             CommitWindow::Open { .. }
         ));
+        sink.flush_scrollback().unwrap();
+    }
+
+    #[test]
+    fn rows_behind_a_window_start_read_no_clock_and_hold_the_idle_close_one_check() {
+        let idle = Duration::from_secs(120);
+        let (_store, sink) = windowed_sink(
+            CommitPolicy {
+                window: Duration::from_secs(1000),
+                idle,
+                ..CommitPolicy::default()
+            },
+            0x7a,
+        );
+        assert!(sink.store_scrollback_line(0, &GatedStore::line(0), 64));
+        sink.request_scrollback_flush().unwrap();
+        // Let the writer make its first check and park the sink, so no
+        // check of its own runs during this test.
+        let started = Instant::now();
+        while sink.writer.shared.lock_queue().windows.is_empty() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the writer never parked the sink"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (opened, first_admitted) = {
+            let state = sink.state.lock().unwrap();
+            (state.window_opened.unwrap(), state.last_admitted.unwrap())
+        };
+        assert_eq!(
+            opened, first_admitted,
+            "the row that opens a window reads the clock"
+        );
+        assert!(sink.store_scrollback_line(1, &GatedStore::line(1), 64));
+        assert!(sink.store_scrollback_line(2, &GatedStore::line(2), 64));
+        {
+            let state = sink.state.lock().unwrap();
+            for entry in &state.pending {
+                let Pending::Row(row) = entry else {
+                    panic!("only rows are queued");
+                };
+                assert_eq!(row.admitted_at, opened, "row {}", row.stable_row);
+            }
+            assert_eq!(state.last_admitted, Some(first_admitted));
+            assert!(state.admitted_since_check);
+        }
+        // A check after the first row's idle close sees the later arrivals
+        // and counts them from itself: still open, one idle interval on.
+        let check = first_admitted + idle + Duration::from_secs(1);
+        assert_eq!(
+            sink.commit_window(check),
+            CommitWindow::Open {
+                closes_at: check + idle
+            }
+        );
+        // Nothing new by the next check: the idle close.
+        assert_eq!(
+            sink.commit_window(check + idle),
+            CommitWindow::Closed("idle")
+        );
+        // After a drain captures the queue, the next arrival opens the next
+        // window: it reads the clock, so that window starts at its admission.
+        // (The capture as the drain makes it, without writing anything.)
+        std::thread::sleep(Duration::from_millis(2));
+        {
+            let mut state = sink.state.lock().unwrap();
+            state.in_flight = state.pending.len();
+            state.uncaptured_since = None;
+        }
+        assert!(sink.store_scrollback_line(3, &GatedStore::line(3), 64));
+        {
+            let mut state = sink.state.lock().unwrap();
+            let Some(Pending::Row(next)) = state.pending.back() else {
+                panic!("row 3 is queued");
+            };
+            assert!(next.admitted_at > opened);
+            assert_eq!(state.last_admitted, Some(next.admitted_at));
+            assert!(!state.admitted_since_check);
+            state.in_flight = 0;
+        }
         sink.flush_scrollback().unwrap();
     }
 
