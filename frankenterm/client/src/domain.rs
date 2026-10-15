@@ -3596,8 +3596,9 @@ impl ClientDomain {
                 Self::hydrate_one_pane_user_vars(mux, inner, rpc, remote, local)
             }))
             .buffer_unordered(4);
+            let mut busy = Vec::new();
             while let Some(result) = requests.next().await {
-                result?;
+                busy.extend(result?);
                 ensure!(
                     current(),
                     "user-variable hydration attachment retired during reply application"
@@ -3609,6 +3610,13 @@ impl ClientDomain {
                     state.generation == rpc.connection_generation(),
                     "user-variable hydration generation changed before completion"
                 );
+                // A pane printing continuously can keep its snapshot busy
+                // through every attempt. Ask it again on the next pass; it
+                // used to fail the whole census, so no pane got its values
+                // (ft-ypblq).
+                for remote in busy {
+                    state.request(Some(remote));
+                }
                 if state.census_requested || !state.pending_panes.is_empty() {
                     continue;
                 }
@@ -3625,13 +3633,15 @@ impl ClientDomain {
         }
     }
 
+    /// Returns `Some(remote)` when the pane's snapshot was still busy after
+    /// every attempt.
     async fn hydrate_one_pane_user_vars(
         mux: &Mux,
         inner: &Arc<ClientInner>,
         rpc: &RpcGenerationScope,
         remote: PaneId,
         local: PaneId,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<PaneId>> {
         // Scheduler and outbound quota pressure is temporary and explicitly
         // retryable. Keep the same four census slots during backoff so a busy
         // server cannot turn one census into an unbounded retry population.
@@ -3643,7 +3653,7 @@ impl ClientDomain {
                 })
             });
             if !belongs {
-                return Ok(());
+                return Ok(None);
             }
             match rpc
                 .get_pane_user_vars_v1(codec::GetPaneUserVarsV1 { pane_id: remote })
@@ -3654,9 +3664,15 @@ impl ClientDomain {
                         response.pane_id == remote,
                         "user-variable reply changed its requested pane identity"
                     );
-                    return Ok(());
+                    return Ok(None);
                 }
-                Err(error) if attempt < 7 && user_var_snapshot_may_retry(&error) => {
+                Err(error) if attempt == 7 && user_var_snapshot_may_retry(&error) => {
+                    metrics::counter!("mux.client.user_vars.hydration", "outcome" => "deferred")
+                        .increment(1);
+                    log::debug!("remote pane {remote} user-variable snapshot still busy; asking again next pass: {error:#}");
+                    return Ok(Some(remote));
+                }
+                Err(error) if user_var_snapshot_may_retry(&error) => {
                     metrics::counter!("mux.client.user_vars.hydration", "outcome" => "backoff")
                         .increment(1);
                     log::debug!("remote pane {remote} user-variable snapshot temporarily rejected: {error:#}");
@@ -6760,6 +6776,101 @@ mod tests {
             pump();
             assert!(peer.is_empty());
         }
+    }
+
+    /// ft-ypblq: a pane printing continuously can keep its user-variable
+    /// snapshot busy through every attempt. It is asked again on the next
+    /// pass; the other panes are not failed with it, nor asked again.
+    #[test]
+    fn busy_user_variable_snapshot_is_asked_again_without_failing_the_census() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let config = ClientDomainConfig::Unix(UnixDomain::default());
+        let (client, peer) = Client::new_test_client_with_rpc_peer(Some(91_040), config);
+        let inner = Arc::new(ClientInner::new(91_040, client, None, None, false));
+        let _domain = register_test_client_domain(&mux, &inner);
+        let pump = || {
+            for _ in 0..32 {
+                if !executor.try_tick().unwrap() {
+                    break;
+                }
+            }
+        };
+        let (flooding, quiet) = (10_000, 10_001);
+        for remote in [flooding, quiet] {
+            let local = remote + 10_000;
+            let pane: Arc<dyn Pane> = Arc::new(
+                ClientPane::new(
+                    &inner,
+                    local,
+                    51,
+                    remote,
+                    TerminalSize {
+                        cols: 80,
+                        rows: 24,
+                        pixel_width: 800,
+                        pixel_height: 480,
+                        dpi: 96,
+                    },
+                    "background shell",
+                    false,
+                )
+                .unwrap(),
+            );
+            mux.add_pane(&pane).unwrap();
+            lock_or_recover(&inner.remote_to_local_pane, "test metadata mapping")
+                .insert(remote, local);
+            peer.answer_pane_registration(&pump);
+        }
+        assert!(peer.is_empty());
+        let rpc = inner.client.rpc_scope();
+        let census =
+            ClientDomain::request_user_var_hydration(Arc::clone(&mux), Arc::clone(&inner), rpc)
+                .unwrap();
+        // The backoff sleeps are real: one pass of 8 attempts takes ~5 s.
+        let next_request = || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while peer.is_empty() {
+                assert!(Instant::now() < deadline, "no user-variable request");
+                pump();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        // The flooding pane is refused for one full pass of 8 attempts, then
+        // answered on the next pass.
+        let mut flooding_asks = 0;
+        let mut quiet_asks = 0;
+        while flooding_asks < 9 {
+            next_request();
+            let refuse = flooding_asks < 8;
+            let (pane, _) = promise::spawn::block_on(
+                peer.answer_next_user_vars(move |pane| refuse && pane == flooding),
+            )
+            .unwrap();
+            if pane == flooding {
+                flooding_asks += 1;
+            } else {
+                assert_eq!(pane, quiet);
+                quiet_asks += 1;
+            }
+            pump();
+            if flooding_asks < 9 {
+                assert!(
+                    census.try_recv().is_err(),
+                    "the census waits for every pane, and a busy one does not fail it"
+                );
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock_or_recover(&inner.user_var_hydration, "test metadata worker").running {
+            assert!(Instant::now() < deadline, "census did not complete");
+            pump();
+        }
+        assert_eq!(quiet_asks, 1, "the quiet pane is not asked again");
+        census.try_recv().unwrap().unwrap();
+        assert!(peer.is_empty());
     }
 
     #[test]

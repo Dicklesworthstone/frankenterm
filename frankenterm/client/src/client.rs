@@ -11455,6 +11455,48 @@ impl TestRpcPeer {
             .map_err(|_| anyhow!("user-variable caller retired"))?;
         Ok(pane_id)
     }
+
+    /// Answers the next user-variable snapshot with an empty snapshot, or,
+    /// when `busy(pane)`, refuses it as a server does while the pane's
+    /// sources are busy (`quota_exceeded`, retry after backoff). Returns the
+    /// pane and whether it was refused.
+    pub(crate) async fn answer_next_user_vars(
+        &self,
+        busy: impl Fn(PaneId) -> bool,
+    ) -> anyhow::Result<(PaneId, bool)> {
+        let ReaderMessage::SendPdu {
+            binding,
+            lease,
+            promise,
+        } = self.receiver.recv().await?
+        else {
+            bail!("expected user-variable snapshot RPC");
+        };
+        anyhow::ensure!(lease.matches(binding), "user-variable RPC lease mismatch");
+        let prepared = lease
+            .claim_for_reader()?
+            .context("user-variable RPC cancelled")?;
+        let Pdu::GetPaneUserVarsV1(request) = prepared.pdu() else {
+            bail!("unexpected user-variable RPC {}", prepared.pdu().pdu_name());
+        };
+        let pane_id = request.pane_id;
+        let refused = busy(pane_id);
+        let reply = if refused {
+            Pdu::ErrorResponse(ErrorResponse::quota_exceeded(GetPaneUserVarsV1::IDENT))
+        } else {
+            Pdu::GetPaneUserVarsV1Response(GetPaneUserVarsV1Response {
+                pane_id,
+                outcome: PaneUserVarsOutcomeV1::Snapshot {
+                    user_vars: HashMap::new(),
+                },
+            })
+        };
+        promise
+            .send(Ok(PendingRpcReply::pdu(reply)))
+            .await
+            .map_err(|_| anyhow!("user-variable caller retired"))?;
+        Ok((pane_id, refused))
+    }
 }
 
 #[cfg(test)]
