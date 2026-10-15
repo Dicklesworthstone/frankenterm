@@ -1,0 +1,7 @@
+pane command      seq 1 2000000
+pane emitted         18.78 MB
+mux disk writes      87.41 MB  (4.66x of emitted)
+workspace grew       18.53 MB
+mux footprint       129.81 MB
+{"emitted_bytes": 18777780, "mux_disk_bytes_written": 87412736, "amplification": 4.66}
+workspace: /tmp/ftwa-lk3kt7

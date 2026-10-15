@@ -1,0 +1,7 @@
+pane command      yes 012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789 | head -n 200000
+pane emitted         18.20 MB
+mux disk writes      38.47 MB  (2.11x of emitted)
+workspace grew       37.93 MB
+mux footprint        80.12 MB
+{"emitted_bytes": 18200000, "mux_disk_bytes_written": 38473728, "amplification": 2.11}
+workspace: /tmp/ftwa-aagdF8
