@@ -1284,21 +1284,24 @@ pub async fn emit_event(lua: Lua, (name, args): (String, mlua::MultiValue)) -> m
     }
 }
 
+/// The handler that `emit_sync_callback` would call for `name`: the first
+/// one registered with `wezterm.on`, or None when there is none.
+pub fn sync_callback_handler(lua: &Lua, name: &str) -> mlua::Result<Option<mlua::Function>> {
+    let decorated_name = format!("wezterm-event-{}", name);
+    let tbl: mlua::Value = lua.named_registry_value(&decorated_name)?;
+    match tbl {
+        mlua::Value::Table(tbl) => tbl.sequence_values::<mlua::Function>().next().transpose(),
+        _ => Ok(None),
+    }
+}
+
 pub fn emit_sync_callback<A>(lua: &Lua, (name, args): (String, A)) -> mlua::Result<mlua::Value>
 where
     A: IntoLuaMulti,
 {
-    let decorated_name = format!("wezterm-event-{}", name);
-    let tbl: mlua::Value = lua.named_registry_value(&decorated_name)?;
-    match tbl {
-        mlua::Value::Table(tbl) => {
-            if let Some(func) = tbl.sequence_values::<mlua::Function>().next() {
-                let func = func?;
-                return func.call(args);
-            }
-            Ok(mlua::Value::Nil)
-        }
-        _ => Ok(mlua::Value::Nil),
+    match sync_callback_handler(lua, &name)? {
+        Some(func) => func.call(args),
+        None => Ok(mlua::Value::Nil),
     }
 }
 
