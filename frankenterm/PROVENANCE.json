@@ -781,7 +781,7 @@
         "cosmetic": 32,
         "docs": 6,
         "feat": 223,
-        "fix": 315,
+        "fix": 316,
         "other": 73,
         "refactor": 12,
         "rename": 2,
@@ -789,13 +789,13 @@
         "security-fix": 7,
         "test": 114
       },
-      "fork_side_commit_count": 800,
+      "fork_side_commit_count": 801,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-10-15T15:59:04-04:00",
-        "sha": "5c975470f147228e581f3063a4fe01165cb38fac",
-        "subject": "diag(mux): name every slow main-thread terminal wait and long hold; per-batch handoff log moves to trace (ft-yccm0.2.2.3, ft-t162y)"
+        "classification": "fix",
+        "committed_at": "2026-10-15T19:54:08-04:00",
+        "sha": "d8ecd16cc4cb1a88d3543dacbe55175bd9eba1bd",
+        "subject": "fix(mux,mux-server): review of today's store and diagnostics changes: no logging under the terminal lock, bounded release backlog, exact zero-width runs"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1206,8 +1206,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 3200,
-  "generated_at": "2026-10-15T22:42:33.226814Z",
+  "fork_side_commit_total": 3201,
+  "generated_at": "2026-10-15T23:54:21.948277Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
