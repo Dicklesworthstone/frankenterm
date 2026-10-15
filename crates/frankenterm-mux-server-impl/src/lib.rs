@@ -1033,6 +1033,9 @@ mod deferred_scrollback {
         durable_bytes: usize,
         oldest: Option<StableRowIndex>,
         newest_exclusive: Option<StableRowIndex>,
+        /// The receipt of the clear that produced this state; dropped with
+        /// the state by anything that replaces it.
+        last_clear: Option<ScrollbackClearCommit>,
     }
 
     pub struct DeferredScrollbackSpillSink {
@@ -1085,7 +1088,27 @@ mod deferred_scrollback {
                 durable_bytes,
                 oldest,
                 newest_exclusive,
+                last_clear: None,
             }
+        }
+
+        /// The last clear's receipt while nothing has reached the sink since:
+        /// no row or gap queued, captured, written or cached, no frontier, no
+        /// commit outstanding and no uncertain publication. Clearing again
+        /// would change nothing durable.
+        fn unchanged_since_clear(&self) -> Option<ScrollbackClearCommit> {
+            let receipt = self.last_clear?;
+            (!self.publication_uncertain
+                && self.pending.is_empty()
+                && self.in_flight == 0
+                && self.written_gaps.is_empty()
+                && self.cached.is_empty()
+                && self.durable_bytes == 0
+                && self.oldest.is_none()
+                && self.newest_exclusive.is_none()
+                && self.commit_requested.is_none()
+                && self.commit_followup.is_none())
+            .then_some(receipt)
         }
 
         /// How far below `stable_row` its store row is: one less than each
@@ -2680,6 +2703,21 @@ mod deferred_scrollback {
                 .operation
                 .lock()
                 .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            // An Ink TUI taller than its terminal redraws with ESC[2J ESC[3J
+            // ESC[H, many times a second, and its frames scroll only into the
+            // in-memory hot tier. When nothing has reached this sink since its
+            // last clear, that clear still stands; publishing it again (a
+            // manifest and a truncation, 2-9 ms under the pane's terminal
+            // lock) would change nothing durable.
+            if let Some(receipt) = self
+                .state
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
+                .unchanged_since_clear()
+                .filter(|_| self.backing.retained_scrollback_rows() == 0)
+            {
+                return Ok(receipt);
+            }
             // Wait out an in-flight writer batch: an append landing after the
             // clear would resurrect rows from before it. A successful explicit
             // clear discards both the durable generation and its queued
@@ -2711,6 +2749,7 @@ mod deferred_scrollback {
                 &mut *state,
                 State {
                     interval_identity,
+                    last_clear: Some(receipt),
                     ..State::empty(0, None, None)
                 },
             );
@@ -2721,6 +2760,46 @@ mod deferred_scrollback {
             Ok(receipt)
         }
     }
+    /// ESC[3J repeated with nothing reaching the sink in between (an Ink
+    /// redraw whose frames stay in the hot tier) reuses the last clear
+    /// instead of publishing another one; any row in between makes the next
+    /// clear a real, durable one again.
+    #[test]
+    fn repeated_clear_with_nothing_spilled_reuses_the_last_durable_clear() {
+        use wezterm_term::CellAttributes;
+
+        let (_dir, backing, deferred) = super::tests::deferred_test_sink();
+        let first = deferred.clear_scrollback().unwrap();
+        assert_eq!(
+            deferred.clear_scrollback().unwrap(),
+            first,
+            "nothing to clear"
+        );
+        assert_eq!(deferred.clear_scrollback().unwrap(), first);
+
+        let line = Line::from_text("row", &CellAttributes::blank(), 1, None);
+        assert!(
+            deferred
+                .store_scrollback_line_with_receipt(5, &line, 4)
+                .accepted()
+        );
+        let queued = deferred.clear_scrollback().unwrap();
+        assert_ne!(queued, first, "a queued row needs a real clear");
+        assert_eq!(deferred.clear_scrollback().unwrap(), queued);
+
+        assert!(
+            deferred
+                .store_scrollback_line_with_receipt(6, &line, 4)
+                .accepted()
+        );
+        deferred.flush_scrollback().unwrap();
+        assert_eq!(backing.retained_scrollback_rows(), 1);
+        let durable = deferred.clear_scrollback().unwrap();
+        assert_ne!(durable, queued, "a durable row needs a real clear");
+        assert_eq!(backing.retained_scrollback_rows(), 0);
+        assert_eq!(deferred.clear_scrollback().unwrap(), durable);
+    }
+
     #[test]
     fn deferred_admission_receipt_binds_exact_pending_row_and_rejects_busy_or_reused_source() {
         use wezterm_term::CellAttributes;
