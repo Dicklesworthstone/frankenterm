@@ -6815,7 +6815,17 @@ impl Screen {
         let max_retained_rows = self.cold_sink_retention_rows();
         if max_retained_rows > 0 {
             let Some(sink) = self.config.scrollback_spill_sink() else {
-                return false;
+                // ft-qvt9l: no store ever opened for this pane (a full disk,
+                // a directory it cannot create). Keep classic bounded
+                // scrollback: hold rows until the whole `scrollback_lines`
+                // is resident, then let the oldest go, instead of holding
+                // every row in memory for the pane's life. The scroll that
+                // offers this row adds a new one, so it goes once the rows
+                // left plus that one would reach the limit.
+                let resident_limit = self
+                    .physical_rows
+                    .saturating_add(self.scrollback_policy.size);
+                return self.lines.len().saturating_add(1) >= resident_limit;
             };
             #[cfg(not(feature = "use_serde"))]
             if !sink.store_scrollback_line(stable_row, line, max_retained_rows) {
@@ -10043,10 +10053,10 @@ impl Screen {
                     if !self.record_scrollback_spill(stable_row, &line, seqno) {
                         self.lines.insert(remove_idx, line);
                         spill_blocked = true;
-                        if !self
+                        if self
                             .config
                             .scrollback_spill_sink()
-                            .is_some_and(|sink| sink.requires_scrollback_flush())
+                            .is_some_and(|sink| !sink.requires_scrollback_flush())
                         {
                             warn!(
                                 "cold scrollback persistence failed at stable row {}; retaining the row in memory",
@@ -10091,10 +10101,10 @@ impl Screen {
                     let stable_row = self.stable_row_index_for_removed_top(removed_from_top);
                     if !self.record_scrollback_spill(stable_row, &removed, seqno) {
                         self.lines.insert(remove_idx, removed);
-                        if !self
+                        if self
                             .config
                             .scrollback_spill_sink()
-                            .is_some_and(|sink| sink.requires_scrollback_flush())
+                            .is_some_and(|sink| !sink.requires_scrollback_flush())
                         {
                             warn!(
                                 "cold scrollback persistence failed at stable row {}; retaining the row in memory",
@@ -20498,6 +20508,57 @@ pub(crate) mod tests {
         assert_eq!(screen.stable_row_index_offset, 0);
         assert_eq!(screen.scrollback_tiering.warm_spill_lines_total, 0);
         assert_eq!(screen.scrollback_tiering.cold_spill_lines_total, 0);
+    }
+
+    /// ft-qvt9l: a pane whose spill store never opened keeps classic bounded
+    /// scrollback. Rows are held until all of `scrollback_lines` is resident,
+    /// then the oldest go; before, every row past the hot tier stayed in
+    /// memory for the pane's life.
+    #[test]
+    fn tiered_scrollback_without_cold_sink_stays_bounded_by_scrollback_lines() {
+        let mut screen = test_screen_with_config(
+            2,
+            8,
+            96,
+            TestTermConfig {
+                scrollback: 16,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 1,
+                    warm_max_bytes: 0,
+                },
+                cold_sink: None,
+                ..TestTermConfig::default()
+            },
+        );
+        let attrs = CellAttributes::blank();
+        for seq in 1..=40 {
+            let bottom = screen.phys_row(1);
+            screen.lines[bottom] = Line::from_text(&format!("line-{seq}"), &attrs, seq, None);
+            screen.scroll_up(&(0..2), 1, seq, attrs.clone(), bidi_mode());
+            assert!(
+                screen.lines.len() <= 2 + 16,
+                "{} rows resident after {} scrolls",
+                screen.lines.len(),
+                seq
+            );
+        }
+        let retained: Vec<_> = screen
+            .lines
+            .iter()
+            .map(|line| line.as_str().into_owned())
+            .filter(|line| line.starts_with("line-"))
+            .collect();
+        assert_eq!(
+            retained,
+            (24..=40)
+                .map(|seq| format!("line-{seq}"))
+                .collect::<Vec<_>>(),
+            "the newest rows stay"
+        );
+        assert_eq!(screen.lines.len(), 2 + 16);
+        // Rows line-1..=line-23 and the screen's first blank row went.
+        assert_eq!(screen.stable_row_index_offset, 24, "dropped rows advance");
     }
 
     #[test]
