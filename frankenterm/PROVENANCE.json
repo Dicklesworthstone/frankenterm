@@ -782,20 +782,20 @@
         "docs": 6,
         "feat": 223,
         "fix": 315,
-        "other": 72,
+        "other": 73,
         "refactor": 12,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
         "test": 114
       },
-      "fork_side_commit_count": 799,
+      "fork_side_commit_count": 800,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-10-14T22:35:49-04:00",
-        "sha": "7423c55193f5ead6e7393af34a1e478be6087dd1",
-        "subject": "fix(mux): cold selection workers publish through momentary lock contention (ft-450cx)"
+        "classification": "other",
+        "committed_at": "2026-10-15T15:59:04-04:00",
+        "sha": "5c975470f147228e581f3063a4fe01165cb38fac",
+        "subject": "diag(mux): name every slow main-thread terminal wait and long hold; per-batch handoff log moves to trace (ft-yccm0.2.2.3, ft-t162y)"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1206,8 +1206,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 3196,
-  "generated_at": "2026-10-15T18:11:50.707221Z",
+  "fork_side_commit_total": 3197,
+  "generated_at": "2026-10-15T19:59:34.141721Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
