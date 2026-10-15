@@ -27,7 +27,7 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 HELPER="${SCRIPT_DIR}/ghostty_h2h.py"
 PROBE_SRC="${SCRIPT_DIR}/ghostty-h2h-probe"
 # AGENTS.md: every web request carries this user agent.
-USER_AGENT="OpenAI File Downloader, XaiImageApiFetch/1.0"
+USER_AGENT="frankenterm-bench (+https://github.com/Dicklesworthstone/frankenterm)"
 # --fetch-zig bounds, in seconds: connecting, and the whole ~50 MB download.
 FETCH_CONNECT_TIMEOUT="${FT_H2H_FETCH_CONNECT_TIMEOUT:-20}"
 FETCH_MAX_TIME="${FT_H2H_FETCH_MAX_TIME:-900}"
