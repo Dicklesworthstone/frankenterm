@@ -498,14 +498,18 @@ mod deferred_scrollback {
     /// released this way: the admitting parser holds its pane's terminal
     /// lock, and freeing one shed (~75k rows) there held it 53 ms in a debug
     /// build. On a loaded host every read of that pane, through 6 retries
-    /// over ~161 ms, got resource_busy (ft-4p4uo).
+    /// over ~161 ms, got resource_busy (ft-4p4uo). The thread runs at utility
+    /// priority, so freeing does not compete with input and parsing.
     fn release_off_thread(garbage: Box<dyn Send>) {
         static RELEASE: OnceLock<Option<std::sync::mpsc::Sender<Box<dyn Send>>>> = OnceLock::new();
         let sender = RELEASE.get_or_init(|| {
             let (sender, receiver) = std::sync::mpsc::channel::<Box<dyn Send>>();
             std::thread::Builder::new()
                 .name(SHED_RELEASE_THREAD_NAME.to_string())
-                .spawn(move || receiver.into_iter().for_each(drop))
+                .spawn(move || {
+                    let _ = procinfo::set_current_thread_qos_for_life(procinfo::ThreadQos::Utility);
+                    receiver.into_iter().for_each(drop);
+                })
                 .ok()
                 .map(|_| sender)
         });
@@ -628,9 +632,10 @@ mod deferred_scrollback {
                 .name(DURABILITY_THREAD_NAME.to_string())
                 .spawn(move || {
                     // Durability need not finish promptly; keep it off the
-                    // performance cores that parse output (ft-yccm0.3.1.3).
+                    // performance cores that parse output (ft-yccm0.3.1.3),
+                    // and on Linux below the input and parse threads.
                     if let Err(error) =
-                        procinfo::set_current_thread_qos(procinfo::ThreadQos::Utility)
+                        procinfo::set_current_thread_qos_for_life(procinfo::ThreadQos::Utility)
                     {
                         log::warn!(
                             "{DURABILITY_THREAD_NAME} thread keeps its default QoS class: {error}"
