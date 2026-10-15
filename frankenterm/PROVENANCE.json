@@ -1039,19 +1039,19 @@
         "docs": 2,
         "feat": 74,
         "fix": 165,
-        "other": 76,
+        "other": 77,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
         "test": 79
       },
-      "fork_side_commit_count": 429,
+      "fork_side_commit_count": 430,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "other",
-        "committed_at": "2026-10-15T13:09:39-04:00",
-        "sha": "e9fccf5bd6ddebdc1675896b9d48b0cdc4b1bdc5",
-        "subject": "bench(term): mux_fused_sliced ingest lane; parser slicing costs ~1.5% (ft-yccm0.2.3 AC3), T1 parser outlier gone at lower load (ft-t162y)"
+        "committed_at": "2026-10-15T18:25:33-04:00",
+        "sha": "fa8646e7d0f7d6784e5d5a68ac6fc641cac37652",
+        "subject": "perf(term): cold-geometry rows hold their wrap geometry inline, not behind a per-row Arc (ft-yccm0.2.1.8)"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1206,8 +1206,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 3198,
-  "generated_at": "2026-10-15T21:44:56.570434Z",
+  "fork_side_commit_total": 3199,
+  "generated_at": "2026-10-15T22:26:04.279852Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
