@@ -611,6 +611,10 @@ pub struct RenderableInner {
     implicit_hyperlink_rules: Vec<Rule>,
 
     fetch_limiter: RateLimiter,
+    /// The latest render delta scrolled the screen (`physical_top` moved).
+    /// Read-ahead waits for a settled screen: rows above a streaming
+    /// viewport scroll away before a fetch returns (ft-2760r).
+    screen_scrolling: bool,
     fetch_retry_wake: async_channel::Sender<()>,
     deferred_fetches: Vec<DeferredLineFetch>,
     failed_fetch_authority: Option<(PaneRegistrationHandle, RpcGenerationScope, LineReadLayout)>,
@@ -709,6 +713,7 @@ impl RenderableInner {
             title: title.to_string(),
             working_dir: None,
             fetch_limiter,
+            screen_scrolling: false,
             fetch_retry_wake,
             deferred_fetches: Vec::new(),
             failed_fetch_authority: None,
@@ -1416,6 +1421,8 @@ impl RenderableInner {
         {
             self.cursor_position = delta.cursor_position;
         }
+        self.screen_scrolling =
+            !reset_layout && delta.dimensions.physical_top != self.dimensions.physical_top;
         self.dimensions = delta.dimensions;
         self.tiered_scrollback_status = delta.tiered_scrollback_status;
         self.title = delta.title;
@@ -4542,7 +4549,15 @@ impl RenderableState {
         // been changed optimistically by a local resize. Out-of-bounds GetLines
         // requests are shifted back into the server's retained rows, so probing
         // below the screen can retransmit the entire visible viewport.
-        let [before, after] = prefetch_ranges(&lines, &inner.dimensions);
+        // While output scrolls the screen, the rows above it are cold history
+        // by the time a fetch arrives: the server refused each one and the
+        // fetch budget for on-screen rows went to them (ft-2760r: ~50 refused
+        // reads a second from a GUI attached to a flooding pane).
+        let [before, after] = if inner.screen_scrolling {
+            [0..0, 0..0]
+        } else {
+            prefetch_ranges(&lines, &inner.dimensions)
+        };
         let needs_prefetch =
             before
                 .clone()
@@ -5916,6 +5931,64 @@ mod tests {
             assert!(inner.lines.iter().all(|(row, entry)| {
                 (0..4).contains(row) && matches!(entry, LineEntry::Line(_))
             }));
+        }
+    }
+
+    /// ft-2760r: read-ahead waits for a settled screen. While output scrolls
+    /// the screen, the rows above the viewport are cold history before a
+    /// fetch of them returns, and the fetch budget belongs to on-screen rows.
+    #[test]
+    fn read_ahead_waits_for_a_settled_screen() {
+        for (physical_top, read_ahead) in [(8, true), (10, false)] {
+            let renderable = test_renderable_state();
+            let state = renderable.lock();
+            let delta = {
+                let mut inner = state.inner.borrow_mut();
+                inner.dimensions.viewport_rows = 4;
+                inner.dimensions.scrollback_rows = 14;
+                inner.dimensions.scrollback_top = 0;
+                inner.dimensions.physical_top = 8;
+                inner.seqno = 7;
+                inner.fetch_limiter = super::RateLimiter::new(|_| 1);
+                for row in 8..14 {
+                    let line =
+                        Line::from_text(&format!("row {row}"), &CellAttributes::default(), 7, None);
+                    inner.lines.put(row, LineEntry::Line(line));
+                }
+                let mut dimensions = inner.dimensions;
+                dimensions.physical_top = physical_top;
+                codec::GetPaneRenderChangesResponse {
+                    pane_id: 743,
+                    mouse_grabbed: false,
+                    alt_screen_active: false,
+                    cursor_position: inner.cursor_position,
+                    dimensions,
+                    tiered_scrollback_status: None,
+                    dirty_lines: Vec::new(),
+                    title: "read-ahead".to_string(),
+                    working_dir: None,
+                    bonus_lines: codec::SerializedLines::from(Vec::new()),
+                    input_serial: None,
+                    seqno: 8,
+                }
+            };
+            assert!(state
+                .inner
+                .borrow_mut()
+                .apply_changes_to_surface(delta, Vec::new()));
+            let (first, visible) = state.get_lines(physical_top..physical_top + 4);
+            assert_eq!(first, physical_top);
+            assert_eq!(visible.len(), 4);
+            assert_eq!(
+                state
+                    .inner
+                    .borrow_mut()
+                    .fetch_limiter
+                    .non_blocking_admittance_check(1),
+                !read_ahead,
+                "read-ahead after a delta moving physical_top 8 -> {}",
+                physical_top
+            );
         }
     }
 

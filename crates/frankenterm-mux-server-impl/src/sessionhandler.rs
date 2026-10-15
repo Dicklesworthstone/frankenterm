@@ -233,8 +233,79 @@ struct LineReadCancelled;
 /// almost never found the lock free during a flood: `ft get-text` of a pane
 /// printing continuously failed with resource_busy in 28 of 30 attempts. 1 ms
 /// is the main-thread wait bound GUI paints use (ft-yccm0.2.2.3 AC3).
-/// Background pushes still only try.
+/// Background pushes wait the same while [`push_wait_budget`] lasts.
 const RPC_READ_TERMINAL_WAIT: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// How much main-thread time background pane pushes may spend in pushes
+/// that wait for a flooding parser (ft-2760r). A push that only tries the
+/// terminal lock almost never got it during a flood, so a GUI attached over
+/// a mux domain painted a flooding pane at 25.9-27.1 fps against 58.7-60.5
+/// for the same pane local to it; waiting [`RPC_READ_TERMINAL_WAIT`] raised
+/// that to 55.7-57.1 (mac-mini-old, evidence/mac-render-perf/2026-10-14/
+/// push-rate-2760r). Pushes run on the server's main thread, which also
+/// dispatches every client's input, so waiting pushes may use at most
+/// [`BUDGET`](push_wait_budget::BUDGET) of each
+/// [`WINDOW`](push_wait_budget::WINDOW): one flooding pane gets the full
+/// rate, while many cannot take more than an eighth of the main thread.
+/// Past the budget a push only tries the lock, as before.
+mod push_wait_budget {
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    /// One 60 Hz frame, the push pacing interval.
+    pub(super) const WINDOW: Duration = Duration::from_millis(16);
+    /// Time waiting pushes may take per window.
+    pub(super) const BUDGET: Duration = Duration::from_millis(2);
+
+    thread_local! {
+        static SPENT: Cell<(Option<Instant>, Duration)> = const { Cell::new((None, Duration::ZERO)) };
+    }
+
+    /// The terminal-lock wait for the next push on this thread.
+    pub(super) fn terminal_wait() -> Duration {
+        let now = Instant::now();
+        SPENT.with(|spent| {
+            let (started, used) = spent.get();
+            let fresh = started.is_none_or(|started| now.duration_since(started) >= WINDOW);
+            if fresh {
+                spent.set((Some(now), Duration::ZERO));
+                super::RPC_READ_TERMINAL_WAIT
+            } else if used < BUDGET {
+                super::RPC_READ_TERMINAL_WAIT
+            } else {
+                Duration::ZERO
+            }
+        })
+    }
+
+    /// Records the time a waiting push took.
+    pub(super) fn charge(elapsed: Duration) {
+        SPENT.with(|spent| {
+            let (started, used) = spent.get();
+            spent.set((started, used.saturating_add(elapsed)));
+        });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn waiting_pushes_stop_at_the_budget_and_resume_next_window() {
+            SPENT.with(|spent| spent.set((None, Duration::ZERO)));
+            assert!(!terminal_wait().is_zero());
+            charge(BUDGET.saturating_sub(Duration::from_micros(1)));
+            assert!(!terminal_wait().is_zero(), "budget not yet spent");
+            charge(Duration::from_micros(1));
+            assert!(terminal_wait().is_zero(), "budget spent: try only");
+            SPENT.with(|spent| {
+                let (started, used) = spent.get();
+                spent.set((started.and_then(|s| s.checked_sub(WINDOW)), used));
+            });
+            assert!(!terminal_wait().is_zero(), "a new window restores it");
+        }
+    }
+}
 
 /// Largest line read whose rows are all resident that the owner thread
 /// captures, hydrates and publishes in one terminal-lock hold (ft-pjjeg).
@@ -3912,19 +3983,24 @@ fn prepare_legacy_render(
         state.ensure_legacy_transport_idle()?;
         (state.baseline.clone(), state.baseline_revision)
     };
-    // Only the correlated observation RPC (PDU114) may wait for a flooding
-    // parser; pushes keep their lock-contention pacing (ft-pjjeg).
+    // The correlated observation RPC (PDU114) waits for a flooding parser;
+    // a push waits too while the main thread's push-wait budget lasts, and
+    // otherwise only tries the lock (ft-2760r).
     let terminal_wait = if observe {
         RPC_READ_TERMINAL_WAIT
     } else {
-        std::time::Duration::ZERO
+        push_wait_budget::terminal_wait()
     };
+    let prepare_started = Instant::now();
     let surface = prior_baseline.prepare_surface_changes(
         pane,
         force_with_input_dispatch_serial,
         false,
         terminal_wait,
     );
+    if !observe && !terminal_wait.is_zero() {
+        push_wait_budget::charge(prepare_started.elapsed());
+    }
 
     let mut state = lock_per_pane_or_retire(per_pane, "publishing the legacy render baseline")?;
     state.ensure_legacy_transport_idle()?;
