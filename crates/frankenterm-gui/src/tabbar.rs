@@ -843,12 +843,12 @@ end)
     #[test]
     fn config_lua_value_is_reused_until_the_config_changes() -> anyhow::Result<()> {
         let lua = lua_with_script("local wezterm = require 'wezterm'")?;
-        let config = ConfigHandle::detached(config::Config::default_config());
+        let config = ConfigHandle::default_config();
         let first = config_as_lua(&lua, &config)?;
         let again = config_as_lua(&lua, &config.clone())?;
         assert_eq!(first.to_pointer(), again.to_pointer(), "same config must reuse its Lua table");
 
-        let other = ConfigHandle::detached(config::Config::default_config());
+        let other = ConfigHandle::default_config();
         let converted = config_as_lua(&lua, &other)?;
         assert_ne!(first.to_pointer(), converted.to_pointer(), "a new config must be converted again");
 
