@@ -147,10 +147,16 @@ fn run(arm: Arm, data: &[u8], serial: u8) -> RunResult {
         }
     }
     let secs = start.elapsed().as_secs_f64();
+    let gap_rows = DurabilityLedger::global().snapshot().gap_rows_total - gaps_before;
+    if let Some(sink) = &handoff {
+        // Untimed: let the writer finish this run's backlog, so the next run
+        // does not start against a writer still busy with this one.
+        let _ = sink.flush_scrollback();
+    }
     RunResult {
         secs,
         kept,
-        gap_rows: DurabilityLedger::global().snapshot().gap_rows_total - gaps_before,
+        gap_rows,
     }
 }
 

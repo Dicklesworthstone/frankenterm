@@ -513,14 +513,37 @@ mod deferred_scrollback {
                             procinfo::ThreadQos::Utility,
                         );
                         drop(garbage);
+                        RELEASE_BACKLOG.fetch_sub(1, Ordering::AcqRel);
                     }
                 })
                 .ok()
                 .map(|_| sender)
         });
         if let Some(sender) = sender {
-            // Fails only once the thread is gone; the garbage is freed here.
-            let _ = sender.send(garbage);
+            RELEASE_BACKLOG.fetch_add(1, Ordering::AcqRel);
+            if let Err(unsent) = sender.send(garbage) {
+                // The thread is gone; the garbage is freed here.
+                RELEASE_BACKLOG.fetch_sub(1, Ordering::AcqRel);
+                drop(unsent);
+            }
+        }
+    }
+
+    /// Boxes sent to the release thread and not yet freed there.
+    static RELEASE_BACKLOG: AtomicUsize = AtomicUsize::new(0);
+
+    /// More than this many unfreed boxes and the durability writer frees its
+    /// own garbage: the channel is unbounded, and a starved release thread
+    /// must not let committed rows pile up in memory.
+    const WRITER_RELEASE_BACKLOG_MAX: usize = 16;
+
+    /// The writer's committed rows: freed on the release thread unless its
+    /// backlog is long, then here, with no lock held (ft-yccm0.2.1.8).
+    fn release_writer_garbage(garbage: Box<dyn Send>) {
+        if RELEASE_BACKLOG.load(Ordering::Acquire) >= WRITER_RELEASE_BACKLOG_MAX {
+            drop(garbage);
+        } else {
+            release_off_thread(garbage);
         }
     }
 
@@ -1989,7 +2012,7 @@ mod deferred_scrollback {
             // The writer bounds how much scrollback becomes durable in a
             // flood; freeing a batch's rows (zeroizing the last owner's
             // text) was ~15% of its time. The release thread does it.
-            release_off_thread(Box::new((evicted, cached_lines, pending_lines)));
+            release_writer_garbage(Box::new((evicted, cached_lines, pending_lines)));
             metrics::counter!("mux.scrollback.deferred_rows_durable")
                 .increment(acknowledged as u64);
             metrics::histogram!("mux.scrollback.durability_commit_latency_us")
@@ -13830,6 +13853,10 @@ fn clustered_scrollback_decoded_charge(
     if let Some(runs) = line.single_width_ascii_runs() {
         let mut charge = plaintext_bytes;
         for (cells, attrs) in runs {
+            // The walk never visits a run with no cells, so neither do we.
+            if cells == 0 {
+                continue;
+            }
             let materialized = std::mem::size_of::<termwiz::cell::Cell>()
                 .checked_add(attrs.snapshot_clone_heap_bytes()?)?;
             charge = charge.checked_add(materialized.checked_mul(cells)?)?;

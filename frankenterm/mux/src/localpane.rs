@@ -1942,6 +1942,9 @@ struct TerminalGuard<'a> {
     guard: Option<MutexGuard<'a, Terminal>>,
     holder: TerminalLockHolder,
     acquired: Instant,
+    /// A main-thread wait of at least SLOW_MAIN_THREAD_WAIT_NS (with debug
+    /// logging on) that is logged once the mutex is released; 0 if none.
+    slow_main_wait_ns: u64,
     // Declared after `guard`, so the interval ends once the mutex is free.
     _hold_interval: procinfo::SignpostInterval,
 }
@@ -1986,17 +1989,19 @@ impl<'a> TerminalGuard<'a> {
     fn acquired(guard: MutexGuard<'a, Terminal>, holder: TerminalLockHolder, wait_ns: u64) -> Self {
         let on_main = on_main_thread();
         TerminalLockLedger::global().record_wait(holder, wait_ns, on_main);
-        if on_main && wait_ns >= SLOW_MAIN_THREAD_WAIT_NS && log::log_enabled!(log::Level::Debug) {
-            log::debug!(
-                "main thread waited {} us for a pane terminal as {holder:?}:\n{}",
-                wait_ns / 1000,
-                std::backtrace::Backtrace::force_capture()
-            );
-        }
+        let slow_main_wait_ns = if on_main
+            && wait_ns >= SLOW_MAIN_THREAD_WAIT_NS
+            && log::log_enabled!(log::Level::Debug)
+        {
+            wait_ns
+        } else {
+            0
+        };
         Self {
             guard: Some(guard),
             holder,
             acquired: Instant::now(),
+            slow_main_wait_ns,
             _hold_interval: procinfo::signpost_interval(hold_signpost(holder)),
         }
     }
@@ -2005,32 +2010,51 @@ impl<'a> TerminalGuard<'a> {
     /// `parking_lot::MutexGuard::unlock_fair` does.
     fn unlock_fair(mut this: Self) {
         if let Some(guard) = this.guard.take() {
-            this.record_hold();
+            let held = this.record_hold();
             MutexGuard::unlock_fair(guard);
+            log_slow_lock(this.holder, this.slow_main_wait_ns, held);
         }
     }
 
-    fn record_hold(&self) {
+    /// Records the hold that is ending and returns its length.
+    fn record_hold(&self) -> u64 {
         let held = u64::try_from(self.acquired.elapsed().as_nanos()).unwrap_or(u64::MAX);
         TerminalLockLedger::global().record_hold(self.holder, held);
-        // Name the holder of a long hold by where it releases, which is in
-        // the function that held it (ft-t162y: 85-149 ms parser holds that no
-        // slice stretch logged).
-        if held >= SLOW_TERMINAL_HOLD_NS && log::log_enabled!(log::Level::Debug) {
-            log::debug!(
-                "terminal held {} us as {:?}, released at:\n{}",
-                held / 1000,
-                self.holder,
-                std::backtrace::Backtrace::force_capture()
-            );
-        }
+        held
+    }
+}
+
+/// Logs, at debug level with a backtrace, a slow main-thread wait for this
+/// hold (`waited`, 0 if it was not slow) and a long hold (ft-yccm0.2.2.3,
+/// ft-t162y). Both are named by where the guard is released, which is in the
+/// function that took it. Called after the mutex is released, so capturing
+/// the backtrace and writing the log do not lengthen the hold.
+fn log_slow_lock(holder: TerminalLockHolder, waited: u64, held: u64) {
+    let long_hold = held >= SLOW_TERMINAL_HOLD_NS;
+    if (waited == 0 && !long_hold) || !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+    let backtrace = std::backtrace::Backtrace::force_capture();
+    if waited != 0 {
+        log::debug!(
+            "main thread waited {} us for a pane terminal as {holder:?}, released at:\n{backtrace}",
+            waited / 1000
+        );
+    }
+    if long_hold {
+        log::debug!(
+            "terminal held {} us as {holder:?}, released at:\n{backtrace}",
+            held / 1000
+        );
     }
 }
 
 impl Drop for TerminalGuard<'_> {
     fn drop(&mut self) {
-        if self.guard.is_some() {
-            self.record_hold();
+        if let Some(guard) = self.guard.take() {
+            let held = self.record_hold();
+            drop(guard);
+            log_slow_lock(self.holder, self.slow_main_wait_ns, held);
         }
     }
 }
