@@ -828,19 +828,19 @@
         "cosmetic": 1,
         "feat": 3,
         "fix": 7,
-        "other": 2,
+        "other": 3,
         "refactor": 1,
         "rename": 1,
         "runtime-swap": 1,
         "test": 5
       },
-      "fork_side_commit_count": 21,
+      "fork_side_commit_count": 22,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "runtime-swap",
-        "committed_at": "2026-10-08T02:48:36-04:00",
-        "sha": "bd7d270ec15b6607cff98bc0725b85085a9445ea",
-        "subject": "perf(promise,gui,procinfo): every busy GUI pool thread starts with an explicit QoS class: promise's two asupersync runtimes and its background I/O thread at user-initiated, frame decoding and background gradients at user-initiated, background image decodes at utility; none runs at the host's default 31 (ft-yccm0.6 slice 3) code-first, batch-verify pending, native proof pending"
+        "classification": "other",
+        "committed_at": "2026-10-15T06:44:29-04:00",
+        "sha": "435b800be227ce305b114525331644733fb0109a",
+        "subject": "perf(mux): durability and shed-release threads run below input and parse on Linux (ft-4p4uo)"
       },
       "name": "procinfo",
       "path": "frankenterm/procinfo",
@@ -1206,8 +1206,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 3190,
-  "generated_at": "2026-10-15T02:36:01.550628Z",
+  "fork_side_commit_total": 3191,
+  "generated_at": "2026-10-15T10:44:54.864680Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
