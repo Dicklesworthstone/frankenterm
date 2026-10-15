@@ -1597,6 +1597,9 @@ mod tests {
 
     fn glyph_with_cluster(cluster: u32) -> GlyphInfo {
         GlyphInfo {
+            // The font crate keeps `text` only with debug assertions (its
+            // own `test` cfg is not set when this crate's tests build it).
+            #[cfg(debug_assertions)]
             text: String::new(),
             only_char: None,
             is_space: false,

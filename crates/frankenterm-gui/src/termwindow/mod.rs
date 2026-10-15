@@ -9226,7 +9226,7 @@ impl TermWindow {
     }
 
     fn scroll_to_prompt(&mut self, amount: isize, pane: &Arc<dyn Pane>) -> anyhow::Result<()> {
-        let dims = pane.get_dimensions();
+        let dims = mouseevent::pane_dimensions(&**pane);
         let position = self
             .get_viewport(pane.pane_id())
             .unwrap_or(dims.physical_top);
@@ -9249,7 +9249,9 @@ impl TermWindow {
     }
 
     fn scroll_by_page(&mut self, amount: f64, pane: &Arc<dyn Pane>) -> anyhow::Result<()> {
-        let dims = pane.get_dimensions();
+        // Facts, not a terminal lock: scrolling a pane that floods must not
+        // wait for its parser (ft-yccm0.2.2.6).
+        let dims = mouseevent::pane_dimensions(&**pane);
         let position = self
             .get_viewport(pane.pane_id())
             .unwrap_or(dims.physical_top) as f64
@@ -9273,7 +9275,8 @@ impl TermWindow {
     }
 
     fn scroll_by_line(&mut self, amount: isize, pane: &Arc<dyn Pane>) -> anyhow::Result<()> {
-        let dims = pane.get_dimensions();
+        // The mouse wheel lands here; see scroll_by_page.
+        let dims = mouseevent::pane_dimensions(&**pane);
         let position = self
             .get_viewport(pane.pane_id())
             .unwrap_or(dims.physical_top)
@@ -11048,7 +11051,7 @@ impl TermWindow {
     }
 
     fn scroll_to_top(&mut self, pane: &Arc<dyn Pane>) {
-        let dims = pane.get_dimensions();
+        let dims = mouseevent::pane_dimensions(&**pane);
         self.set_viewport(pane.pane_id(), Some(dims.scrollback_top), dims);
     }
 

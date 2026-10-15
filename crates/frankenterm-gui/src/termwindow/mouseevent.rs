@@ -416,7 +416,7 @@ impl super::TermWindow {
         // in ScrollHit::thumb
         let row = ScrollHit::thumb_top_to_scroll_top(
             effective_thumb_top,
-            &*pane,
+            &dims,
             current_viewport,
             self.dimensions.pixel_height.saturating_sub(
                 y_offset as usize + border.bottom.get() + bottom_bar_height as usize,
