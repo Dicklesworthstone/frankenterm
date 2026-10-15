@@ -446,10 +446,13 @@ pub struct PreparedColdLayout {
 
 /// Width information belongs to immutable admitted source rows, independently
 /// of the current viewport coordinates. Payload remains in the spill sink.
+/// The geometry is held inline, not behind its own `Arc`: pages are what
+/// snapshots share, and a per-row allocation (and its later free) cost every
+/// row that scrolls into the store on the parse thread (ft-yccm0.2.1.8).
 #[cfg(feature = "use_serde")]
 #[derive(Debug, Clone)]
 struct ColdGeometryRow {
-    geometry: Arc<LineWrapGeometry>,
+    geometry: LineWrapGeometry,
     wrapped: bool,
 }
 
@@ -589,9 +592,11 @@ impl ColdGeometryIndex {
         if !geometry.supports_join() {
             return None;
         }
+        // The row's slot in its page, inline struct included, is charged
+        // with the page; the row adds only its width buffer.
         let bytes = geometry
             .retained_bytes()
-            .checked_add(2 * std::mem::size_of::<usize>())?;
+            .checked_sub(std::mem::size_of::<LineWrapGeometry>())?;
         if bytes > available {
             return None;
         }
@@ -630,7 +635,7 @@ impl ColdGeometryIndex {
         self.geometry_bytes = self.geometry_bytes.checked_add(bytes)?;
         tail.geometry_bytes = tail.geometry_bytes.checked_add(bytes)?;
         tail.rows.push(ColdGeometryRow {
-            geometry: Arc::new(geometry),
+            geometry,
             wrapped: line.last_cell_was_wrapped(),
         });
         self.source.end = end;
@@ -1469,7 +1474,7 @@ impl ScreenLineRead {
                 replacement_geometry = rebuilt;
                 (&replacement_geometry, line.last_cell_was_wrapped())
             } else {
-                (captured.geometry.as_ref(), captured.wrapped)
+                (&captured.geometry, captured.wrapped)
             };
             cell_visits = match cell_visits.checked_add(geometry.physical_len().max(1)) {
                 Some(visits) if visits <= Self::MAX_INDEX_CELL_VISITS => visits,
