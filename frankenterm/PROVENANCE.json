@@ -157,7 +157,7 @@
         "cosmetic": 20,
         "docs": 1,
         "feat": 55,
-        "fix": 131,
+        "fix": 132,
         "other": 17,
         "refactor": 5,
         "rename": 2,
@@ -165,13 +165,13 @@
         "security-fix": 2,
         "test": 40
       },
-      "fork_side_commit_count": 282,
+      "fork_side_commit_count": 283,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-13T18:25:41-04:00",
-        "sha": "8c08f32ef57213e157d7ce736f2bc7494cddeeac",
-        "subject": "fix(client): remote tabs the GUI has never shown keep their titles up to date"
+        "committed_at": "2026-10-14T22:13:48-04:00",
+        "sha": "d96d5369a1686ba1dbf171ca0c58947ff69f5a11",
+        "subject": "fix(remote): flooding pane paints at the local rate; read-ahead waits for a settled screen (ft-2760r)"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -1206,8 +1206,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 3187,
-  "generated_at": "2026-10-14T22:26:22.512002Z",
+  "fork_side_commit_total": 3188,
+  "generated_at": "2026-10-15T02:14:19.916574Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
