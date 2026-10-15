@@ -1261,7 +1261,8 @@ mod deferred_scrollback {
             (freed, dropped, spans)
         }
 
-        fn prune_cached(&mut self) {
+        /// Pruned rows move to `evicted`; see [`Self::cache_acknowledged`].
+        fn prune_cached(&mut self, evicted: &mut Vec<Pending>) {
             while self.cached.front().is_some_and(|row| {
                 self.oldest.is_none_or(|oldest| row.stable_row < oldest)
                     || self.cached.len() > MAX_CACHED_ROWS
@@ -1269,15 +1270,21 @@ mod deferred_scrollback {
             }) {
                 if let Some(row) = self.cached.pop_front() {
                     self.cached_bytes -= row.charged_bytes;
+                    evicted.push(Pending::Row(row));
                 }
             }
         }
 
-        fn cache_acknowledged(&mut self, row: PendingRow) {
+        /// Rows this lets go of (the row itself, when it is not cached) move
+        /// to `evicted`, for the caller to free after it releases the state
+        /// lock: freeing a row zeroizes its text, and admission waits on
+        /// this lock under the terminal lock (ft-yccm0.2.1.8).
+        fn cache_acknowledged(&mut self, row: PendingRow, evicted: &mut Vec<Pending>) {
             // A skipped row breaks the contiguous suffix. Mutable image
             // handles cannot stand in for the serialized backing-store image.
             if row.charged_bytes > MAX_CACHED_BYTES || row.line.has_image_attachments() {
-                self.cached.clear();
+                evicted.extend(self.cached.drain(..).map(Pending::Row));
+                evicted.push(Pending::Row(row));
                 self.cached_bytes = 0;
                 return;
             }
@@ -1286,16 +1293,18 @@ mod deferred_scrollback {
             {
                 if let Some(oldest) = self.cached.pop_front() {
                     self.cached_bytes -= oldest.charged_bytes;
+                    evicted.push(Pending::Row(oldest));
                 }
             }
             if self.cached.try_reserve(1).is_err() {
-                self.cached.clear();
+                evicted.extend(self.cached.drain(..).map(Pending::Row));
+                evicted.push(Pending::Row(row));
                 self.cached_bytes = 0;
                 return;
             }
             self.cached_bytes += row.charged_bytes;
             self.cached.push_back(row);
-            self.prune_cached();
+            self.prune_cached(evicted);
         }
     }
 
@@ -1947,13 +1956,14 @@ mod deferred_scrollback {
             // captured rows, so they are still the front. Keep the owned
             // plaintext until the backing sink acknowledges durability.
             let mut acknowledged_bytes = 0usize;
+            let mut evicted = Vec::new();
             for _ in 0..acknowledged {
                 let Some(Pending::Row(row)) = state.pending.pop_front() else {
                     return Err(ScrollbackSpillError::SnapshotRowMissing);
                 };
                 state.pending_bytes -= row.charged_bytes;
                 acknowledged_bytes += row.charged_bytes;
-                state.cache_acknowledged(row);
+                state.cache_acknowledged(row, &mut evicted);
             }
             state.in_flight = 0;
             state.window_opened = state.pending.front().and_then(|entry| match entry {
@@ -1976,8 +1986,10 @@ mod deferred_scrollback {
             self.writer.release(acknowledged_bytes);
             self.committed_batches.fetch_add(1, Ordering::AcqRel);
             self.publish_progress();
-            drop(cached_lines);
-            drop(pending_lines);
+            // The writer bounds how much scrollback becomes durable in a
+            // flood; freeing a batch's rows (zeroizing the last owner's
+            // text) was ~15% of its time. The release thread does it.
+            release_off_thread(Box::new((evicted, cached_lines, pending_lines)));
             metrics::counter!("mux.scrollback.deferred_rows_durable")
                 .increment(acknowledged as u64);
             metrics::histogram!("mux.scrollback.durability_commit_latency_us")
@@ -2250,7 +2262,12 @@ mod deferred_scrollback {
                 .store(state.pending.len(), Ordering::Release);
             state.oldest = Some(oldest);
             state.newest_exclusive = Some(next);
-            state.prune_cached();
+            // A row pruned here usually shares its text with the row Screen
+            // still holds, so freeing it is cheap; a send per row to the
+            // release thread would cost more.
+            let mut pruned = Vec::new();
+            state.prune_cached(&mut pruned);
+            drop(pruned);
             self.unreported_admitted.fetch_add(1, Ordering::Relaxed);
             let interval = match state.interval_identity.capture(Some(oldest..next)) {
                 ScrollbackIntervalCapture::Ready(interval) => Some(interval),
