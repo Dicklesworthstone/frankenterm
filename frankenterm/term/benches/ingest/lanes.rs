@@ -1,4 +1,4 @@
-//! The six ingest lanes and the end-state sanity checks.
+//! The ingest lanes and the end-state sanity checks.
 //!
 //! - `parse`: `Parser::parse` into a reused `Vec<Action>`, cleared per chunk.
 //! - `term`: `Terminal::advance_bytes` per chunk (the fused single-stage path).
@@ -12,6 +12,13 @@
 //!   diverts (alert sources and synchronized-output controls, as the mux
 //!   gate does) are applied afterwards with `perform_actions`.
 //! - `prod_config_fused`: `mux_fused` with [`ProdConfig`], the GUI's path.
+//! - `mux_fused_sliced`: `mux_fused` fed through [`SlicedFeed`] as the mux
+//!   parse thread does since ft-yccm0.2.3 (`run_parser_slices` in
+//!   `frankenterm/mux/src/localpane.rs`): 1 KiB slices ending before a
+//!   control byte, and a new output batch whenever a hold reaches the 2 ms
+//!   budget. Nothing waits on the lock here, so it yields on the budget
+//!   alone. It leaves out what the mux does at each handoff (one fair unlock
+//!   and relock, and a render-facts publish), at most 500 times a second.
 //!
 //! Timing covers the ingest loop only: terminal construction, the end-state
 //! summary and dropping the terminal fall outside it.
@@ -22,7 +29,7 @@ use std::hash::{Hash, Hasher};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use frankenterm_cell::UnicodeVersion;
 use frankenterm_escape_parser::parser::Parser;
@@ -33,7 +40,10 @@ use frankenterm_term::config::{
     BidiMode, GridEngine, NewlineCanon, Osc52WritePolicy, ScrollbackTierConfig,
     TerminalConfigurationRevision,
 };
-use frankenterm_term::{FeedGate, Terminal, TerminalConfiguration, TerminalSize};
+use frankenterm_term::{
+    FeedGate, SliceProgress, SlicedFeed, Terminal, TerminalConfiguration, TerminalSize,
+    FEED_SLICE_BYTES,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Lane {
@@ -46,10 +56,12 @@ pub enum Lane {
     /// The `term` lane with the screen's rows in PageGrid pages
     /// (ft-yccm0.3.3.4, `FT_GRID_ENGINE=page`).
     TermPage,
+    /// `mux_fused` applied in budgeted slices (ft-yccm0.2.3).
+    MuxFusedSliced,
 }
 
 impl Lane {
-    pub const ALL: [Lane; 7] = [
+    pub const ALL: [Lane; 8] = [
         Lane::Parse,
         Lane::Term,
         Lane::MuxTwoStage,
@@ -57,6 +69,7 @@ impl Lane {
         Lane::MuxFused,
         Lane::ProdConfigFused,
         Lane::TermPage,
+        Lane::MuxFusedSliced,
     ];
 
     pub fn name(self) -> &'static str {
@@ -68,6 +81,7 @@ impl Lane {
             Lane::MuxFused => "mux_fused",
             Lane::ProdConfigFused => "prod_config_fused",
             Lane::TermPage => "term_page",
+            Lane::MuxFusedSliced => "mux_fused_sliced",
         }
     }
 
@@ -412,6 +426,10 @@ impl FeedGate for MuxGate {
     }
 }
 
+/// The mux parser's longest lock hold before it hands over
+/// (`PARSER_HOLD_BUDGET` in `frankenterm/mux/src/localpane.rs`).
+const PARSER_HOLD_BUDGET: Duration = Duration::from_millis(2);
+
 /// Feeds `prelude` untimed, then `data` timed, through `lane` in
 /// `geometry.chunk`-sized pieces.
 pub fn run_lane(lane: Lane, prelude: &[u8], data: &[u8], geometry: &Geometry) -> LaneRun {
@@ -469,6 +487,43 @@ pub fn run_lane(lane: Lane, prelude: &[u8], data: &[u8], geometry: &Geometry) ->
             let start = Instant::now();
             for piece in data.chunks(chunk) {
                 terminal.feed(&mut parser, piece, &mut MuxGate, &mut diverted);
+                if !diverted.is_empty() {
+                    terminal.perform_actions(std::mem::take(&mut diverted));
+                }
+            }
+            let secs = start.elapsed().as_secs_f64();
+            LaneRun {
+                lane,
+                bytes: data.len(),
+                prelude_bytes: prelude.len(),
+                secs,
+                actions: None,
+                terminal: Some(terminal),
+            }
+        }
+        Lane::MuxFusedSliced => {
+            let mut terminal = new_terminal(lane, geometry);
+            let mut parser = Parser::new();
+            let mut diverted = Vec::new();
+            if !prelude.is_empty() {
+                terminal.feed(&mut parser, prelude, &mut MuxGate, &mut diverted);
+                terminal.perform_actions(std::mem::take(&mut diverted));
+            }
+            let start = Instant::now();
+            for piece in data.chunks(chunk) {
+                let mut sliced = SlicedFeed::new(piece, FEED_SLICE_BYTES);
+                let mut held_since = Instant::now();
+                while sliced.run(
+                    &mut terminal,
+                    &mut parser,
+                    &mut MuxGate,
+                    &mut diverted,
+                    &mut || held_since.elapsed() >= PARSER_HOLD_BUDGET,
+                ) == SliceProgress::Yielded
+                {
+                    // Where the mux hands the lock over and takes it again.
+                    held_since = Instant::now();
+                }
                 if !diverted.is_empty() {
                     terminal.perform_actions(std::mem::take(&mut diverted));
                 }

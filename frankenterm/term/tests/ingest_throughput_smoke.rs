@@ -620,7 +620,11 @@ fn each_lane_run_becomes_one_json_line_with_the_required_fields() {
         // (ft-yccm0.3.2.1).
         let counts_actions = !matches!(
             lane,
-            Lane::Term | Lane::TermPage | Lane::MuxFused | Lane::ProdConfigFused
+            Lane::Term
+                | Lane::TermPage
+                | Lane::MuxFused
+                | Lane::ProdConfigFused
+                | Lane::MuxFusedSliced
         );
         assert_eq!(record["actions"].is_null(), !counts_actions, "{line}");
     }
