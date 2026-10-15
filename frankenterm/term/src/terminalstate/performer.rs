@@ -287,6 +287,41 @@ impl<'a> Iterator for PrintGraphemes<'a> {
     }
 }
 
+/// Whether grapheme `g` may continue the cell before it with no ZWJ between
+/// them (ft-cklgg): as a regional indicator, a wide Extend such as an emoji
+/// modifier, a spacing mark, Hangul jamo or a syllable, a conjunct's
+/// consonant, or after a Prepend. Only blocks that hold none of those heads
+/// are ruled out, so that emoji, CJK, box-drawing and icon floods skip the
+/// check; segmenting with the cell before it decides the rest. After a
+/// Prepend anything continues, so a ruled-out head split from one still
+/// prints apart.
+fn may_continue_without_zwj(g: &str) -> bool {
+    g.chars().next().is_some_and(|head| {
+        !matches!(
+            u32::from(head),
+            // ASCII, which continues only a Prepend.
+            0x00..=0x7F
+                // Symbols, arrows, box drawing, shapes and dingbats.
+                | 0x2100..=0x2BFF
+                // Kana letters (the voiced sound marks are U+3099-U+309A).
+                | 0x3041..=0x3096
+                | 0x30A0..=0x30FF
+                // CJK ideographs.
+                | 0x3400..=0x4DBF
+                | 0x4E00..=0x9FFF
+                | 0x20000..=0x3FFFF
+                // Private use: Nerd Font and Powerline glyphs.
+                | 0xE000..=0xF8FF
+                | 0xF0000..=0x10FFFF
+                // Emoji, except the regional indicators U+1F1E6-U+1F1FF
+                // and the modifiers U+1F3FB-U+1F3FF.
+                | 0x1F000..=0x1F1E5
+                | 0x1F200..=0x1F3FA
+                | 0x1F400..=0x1FAFF
+        )
+    })
+}
+
 #[cfg(test)]
 static FORCE_SCALAR_PRINTABLE_ASCII_SCAN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -477,6 +512,31 @@ impl<'a> Performer<'a> {
     }
 
     fn recluster_at_cursor(&mut self, suffix: &str, require_prior_trailing_zwj: bool) -> bool {
+        self.continue_grapheme_at_cursor(suffix, require_prior_trailing_zwj, false)
+            .is_some()
+    }
+
+    /// ft-cklgg: merges the prefix of `text` that continues the cell an
+    /// earlier flush wrote before the cursor, as one flush of both would
+    /// have segmented them, and returns its length. A lone regional
+    /// indicator, for one, takes only the first indicator of a run, and the
+    /// rest pairs up after it.
+    fn continue_cell_before_cursor(&mut self, text: &str) -> Option<usize> {
+        if !may_continue_without_zwj(text) {
+            return None;
+        }
+        self.continue_grapheme_at_cursor(text, false, true)
+    }
+
+    /// Joins `text` (all of it, or with `prefix_only` the part that
+    /// segments together with it) to the cell a continuation at the cursor
+    /// belongs to, and returns the length joined.
+    fn continue_grapheme_at_cursor(
+        &mut self,
+        text: &str,
+        require_prior_trailing_zwj: bool,
+        prefix_only: bool,
+    ) -> Option<usize> {
         let cursor_x = self.cursor.x;
         let cursor_y = self.cursor.y;
         let seqno = self.seqno;
@@ -494,7 +554,7 @@ impl<'a> Performer<'a> {
         if require_prior_trailing_zwj
             && self.last_printed_rules_out_zwj_tail(cursor_x, cursor_y, on_cursor_cell)
         {
-            return false;
+            return None;
         }
         #[cfg(test)]
         RECLUSTER_ROW_WALKS.with(|walks| walks.set(walks.get() + 1));
@@ -524,18 +584,24 @@ impl<'a> Performer<'a> {
                 Some((cell.idx, cell.text.to_string(), cell.width, cell.attrs()))
             })
         };
-        let Some((idx, text, width, attrs)) = merge else {
-            return false;
-        };
+        let (idx, cell_text, width, attrs) = merge?;
 
-        let combined = format!("{text}{suffix}");
-        if Graphemes::new(combined.as_str()).count() != 1 {
-            return false;
-        }
+        let mut combined = format!("{cell_text}{text}");
+        let joined = if prefix_only {
+            let first = Graphemes::new(combined.as_str()).next()?.len();
+            let joined = first.checked_sub(cell_text.len()).filter(|&n| n > 0)?;
+            combined.truncate(first);
+            joined
+        } else {
+            if Graphemes::new(combined.as_str()).count() != 1 {
+                return None;
+            }
+            text.len()
+        };
 
         let combined_width = grapheme_column_width(&combined, Some(&self.unicode_version));
         if !(width..=2).contains(&combined_width) {
-            return false;
+            return None;
         }
 
         let ends_in_zwj = combined.ends_with('\u{200d}');
@@ -544,7 +610,9 @@ impl<'a> Performer<'a> {
         }
         // ft-b35o7: widened on the right margin's column, it no longer fits.
         if self.widened_grapheme_overflows(idx, width, combined_width) {
-            return self.wrap_widened_grapheme(&combined, combined_width, attrs, seqno);
+            return self
+                .wrap_widened_grapheme(&combined, combined_width, attrs, seqno)
+                .then_some(joined);
         }
         let (cursor_x, wrap_next) = {
             let screen = self.screen_mut();
@@ -562,7 +630,7 @@ impl<'a> Performer<'a> {
         self.cursor.x = cursor_x;
         self.wrap_next = wrap_next;
         self.note_printed(cursor_y, idx, combined_width, ends_in_zwj);
-        true
+        Some(joined)
     }
 
     fn active_charset(&self) -> CharSet {
@@ -786,7 +854,24 @@ impl<'a> Performer<'a> {
             return;
         }
 
+        // ft-cklgg: `text` may continue the cell an earlier flush wrote (a
+        // PTY read may have split them), with no ZWJ between the two
+        // although both have width: a regional-indicator pair, an emoji
+        // modifier, Hangul jamo, a spacing mark, a conjunct. The junction
+        // check below settles that for a direct ASCII run's last cell.
+        let text = match junction {
+            None => self
+                .continue_cell_before_cursor(text)
+                .map_or(text, |joined| &text[joined..]),
+            Some(_) => text,
+        };
+        // Whether whatever came before `g` is settled: a cell printed from
+        // `text` (`Graphemes` broke between the two), or the check above.
+        // After a grapheme that printed nothing, `g` may yet continue the
+        // cell before it.
+        let mut printed_cell = true;
         for g in PrintGraphemes::new(text) {
+            let follows_segmented_cell = std::mem::replace(&mut printed_cell, false);
             if let Some(cell) = junction.take() {
                 if self.merge_into_junction(cell, g, seqno) {
                     continue;
@@ -844,6 +929,14 @@ impl<'a> Performer<'a> {
             // A multi-byte grapheme only continues its left neighbour when that
             // cell ends in ZWJ, which cannot exist until one has been written.
             if g.len() > 1 && self.zwj_tail_cell_possible && self.recluster_at_cursor(g, true) {
+                continue;
+            }
+            // ft-cklgg: as above, after a grapheme that printed nothing.
+            if !follows_segmented_cell
+                && g.len() > 1
+                && may_continue_without_zwj(g)
+                && self.recluster_at_cursor(g, false)
+            {
                 continue;
             }
 
@@ -915,6 +1008,7 @@ impl<'a> Performer<'a> {
             self.screen_mut()
                 .set_cell_grapheme(x, y, g, print_width, pen, seqno);
             self.note_printed(y, x, print_width, ends_in_zwj);
+            printed_cell = true;
 
             if !wrappable {
                 self.cursor.x = next_x;
@@ -2763,6 +2857,136 @@ mod tests {
         }
     }
 
+    /// ft-cklgg: two pieces that join with no ZWJ between them, though both
+    /// have width, render the same whatever byte a PTY read splits them at.
+    #[test]
+    fn non_zwj_joins_render_the_same_at_every_split() {
+        let cases: &[&str] = &[
+            // Regional-indicator pair (GB12/13), and flags then a lone one.
+            "\u{1F1FA}\u{1F1F8}",
+            "\u{1F1FA}\u{1F1F8}\u{1F1EC}\u{1F1E7}\u{1F1EB}",
+            // Emoji modifier, an Extend two cells wide (GB9).
+            "\u{1F469}\u{1F3FD}",
+            // Hangul L + V and L + LV syllable (GB6).
+            "\u{1100}\u{1161}",
+            "\u{1100}\u{AC00}",
+            // Spacing marks (GB9a): Devanagari AA, and Thai SARA AM, which
+            // has width.
+            "\u{0915}\u{093E}",
+            "\u{0E01}\u{0E33}",
+            // Halfwidth voiced sound mark, an Extend with width.
+            "\u{FF76}\u{FF9E}",
+            // Devanagari conjunct (GB9c).
+            "\u{0915}\u{094D}\u{0937}",
+        ];
+        let mixed = format!("ab{}\x1b[31m{}cd{}", cases.concat(), cases[0], cases[2]);
+        let render = |chunks: &[&[u8]]| {
+            let mut term = make_terminal();
+            for chunk in chunks {
+                term.advance_bytes(chunk);
+            }
+            let mut snapshot = snapshot_terminal(&term);
+            // Each call stamps the lines it changes with a new seqno.
+            for line in &mut snapshot.all_lines {
+                line.seqno = 0;
+            }
+            snapshot
+        };
+        for stream in cases.iter().copied().chain(std::iter::once(mixed.as_str())) {
+            let bytes = stream.as_bytes();
+            let whole = render(&[bytes]);
+            for split in 1..bytes.len() {
+                assert_eq!(
+                    render(&[&bytes[..split], &bytes[split..]]),
+                    whole,
+                    "{:?} split at byte {}",
+                    stream,
+                    split
+                );
+            }
+            for size in 1..=7 {
+                let chunks: Vec<&[u8]> = bytes.chunks(size).collect();
+                assert_eq!(
+                    render(&chunks),
+                    whole,
+                    "{:?} in {}-byte chunks",
+                    stream,
+                    size
+                );
+            }
+        }
+        // The pairs this is about do form one cell when whole.
+        for (stream, x) in [("\u{1F1FA}\u{1F1F8}", 2), ("\u{1F469}\u{1F3FD}", 2)] {
+            let mut term = make_terminal();
+            term.advance_bytes(stream.as_bytes());
+            assert_eq!(term.cursor_pos().x, x, "{:?}", stream);
+        }
+    }
+
+    /// ft-cklgg: by the segmenter itself, no head `may_continue_without_zwj`
+    /// rules out continues a tail that does not end in ZWJ (that path's) or
+    /// a Prepend (left apart, as documented). Sampled, since unoptimized
+    /// segmenter lookups are slow; the blocks' first and last characters are
+    /// always checked.
+    #[test]
+    fn ruled_out_heads_never_continue_a_non_zwj_tail() {
+        let tails = [
+            "a",
+            "\u{1F1FA}",
+            "\u{1F600}",
+            "\u{1F469}\u{1F3FD}",
+            "\u{1100}",
+            "\u{1161}",
+            "\u{11A8}",
+            "\u{AC00}",
+            "\u{AC01}",
+            "\u{0915}\u{094D}",
+            "e\u{0301}",
+            "\u{0E01}",
+        ];
+        let edges = [
+            0x2100, 0x2BFF, 0x3041, 0x3096, 0x30A0, 0x30FF, 0x3400, 0x4DBF, 0x4E00, 0x9FFF, 0xE000,
+            0xF8FF, 0x1F000, 0x1F1E5, 0x1F200, 0x1F3FA, 0x1F400, 0x1FAFF, 0x20000, 0x3FFFF,
+            0xF0000, 0x10FFFF,
+        ];
+        let mut checked = 0;
+        for cp in (0x20_u32..0x7F)
+            .chain((0x2000..=0x10FFFF).step_by(29))
+            .chain(edges)
+        {
+            let Some(head) = char::from_u32(cp) else {
+                continue;
+            };
+            let head = head.to_string();
+            if may_continue_without_zwj(&head) {
+                continue;
+            }
+            checked += 1;
+            for tail in tails {
+                let pair = format!("{}{}", tail, head);
+                assert_ne!(
+                    Graphemes::new(&pair).count(),
+                    1,
+                    "U+{:X} continued {:?}",
+                    cp,
+                    tail
+                );
+            }
+        }
+        assert!(checked > 5_000, "only {} heads checked", checked);
+        for head in [
+            "\u{1F1F8}",
+            "\u{1F3FD}",
+            "\u{1161}",
+            "\u{AC00}",
+            "\u{FF9E}",
+            "\u{0E33}",
+            "\u{0937}",
+        ] {
+            assert!(may_continue_without_zwj(head), "{:?}", head);
+        }
+    }
+
     /// ft-yccm0.2.14 batch verify 4: the differential stream above panicked in
     /// `Line::erase_cell_with_margin` ("removal index should be < len"). A
     /// grapheme that clusters with the previous cell but arrives in a later
@@ -2771,6 +2995,7 @@ mod tests {
     /// storage, which re-segmented the two cells into one, so the row's
     /// `len()` exceeded its materialized cells. Minimized: the second scalar
     /// in a later call or after an SGR, then CUB and DCH inside the row.
+    /// Since ft-cklgg the two join into one cell, split or not.
     #[test]
     fn zwj_tail_gate_regression_clustering_neighbours_then_dch() {
         let cases: &[(&str, &str)] = &[("\u{1F1FA}", "\u{1F1F8}"), ("\u{1F600}", "\u{1F3FD}")];
@@ -2785,6 +3010,13 @@ mod tests {
                     let screen = term.screen();
                     let top = screen.physical_rows.min(screen.scrollback_rows());
                     let row = screen.scrollback_rows() - top;
+                    // Split or not, the two now form one cell (ft-cklgg).
+                    let mut whole = make_terminal();
+                    whole.advance_bytes(format!("{first}{gap}{second}\x1b[D\x1b[P").as_bytes());
+                    let expected = snapshot_terminal(&whole).all_lines[row]
+                        .cells
+                        .first()
+                        .map(|cell| cell.0.clone());
                     screen.with_phys_lines(row..row + 1, |lines| {
                         let line = lines[0];
                         let widths: usize = line.visible_cells().map(|cell| cell.width()).sum();
@@ -2797,7 +3029,7 @@ mod tests {
                             line.visible_cells()
                                 .next()
                                 .map(|cell| cell.str().to_string()),
-                            Some(first.to_string())
+                            expected
                         );
                     });
                 }
