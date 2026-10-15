@@ -818,6 +818,7 @@ mod deferred_scrollback {
         }
 
         fn service(&self, sink: Arc<DeferredScrollbackSpillSink>) {
+            sink.publish_metrics();
             if let Some(retry_at) = sink.retry_not_before() {
                 if retry_at > Instant::now() {
                     // Still backing off; `scheduled` stays set.
@@ -1071,6 +1072,13 @@ mod deferred_scrollback {
         progress_signal: Condvar,
         health: Mutex<WriterHealth>,
         committed_batches: AtomicU64,
+        /// Admitted rows and overload-gap rows and bytes not yet added to the
+        /// `metrics` counters. The parser only bumps these; the writer
+        /// publishes them once per turn, since every metrics call goes
+        /// through the GUI's recorder (ft-yccm0.2.1.8).
+        unreported_admitted: AtomicU64,
+        unreported_gap_rows: AtomicU64,
+        unreported_gap_bytes: AtomicU64,
     }
 
     impl State {
@@ -1329,6 +1337,9 @@ mod deferred_scrollback {
                 progress_signal: Condvar::new(),
                 health: Mutex::new(WriterHealth::default()),
                 committed_batches: AtomicU64::new(0),
+                unreported_admitted: AtomicU64::new(0),
+                unreported_gap_rows: AtomicU64::new(0),
+                unreported_gap_bytes: AtomicU64::new(0),
             }))
         }
 
@@ -2039,13 +2050,33 @@ mod deferred_scrollback {
             admission
         }
 
+        /// Adds the rows admitted and the gap rows and bytes counted since
+        /// the last call to their `metrics` counters. Called by the writer
+        /// each time it services this sink, and when the sink drops.
+        fn publish_metrics(&self) {
+            let admitted = self.unreported_admitted.swap(0, Ordering::Relaxed);
+            if admitted != 0 {
+                metrics::counter!("mux.scrollback.deferred_rows_admitted").increment(admitted);
+            }
+            let gap_rows = self.unreported_gap_rows.swap(0, Ordering::Relaxed);
+            if gap_rows != 0 {
+                metrics::counter!("mux.scrollback.durability_gap_rows_total").increment(gap_rows);
+            }
+            let gap_bytes = self.unreported_gap_bytes.swap(0, Ordering::Relaxed);
+            if gap_bytes != 0 {
+                metrics::counter!("mux.scrollback.durability_gap_bytes_total").increment(gap_bytes);
+            }
+        }
+
         /// Logs and counts rows dropped from durability. Entering overload is
         /// a warning; further gaps while it lasts are debug detail.
         fn report_gaps(&self, gaps: &[GapSpan], entered: bool) {
             let rows: StableRowIndex = gaps.iter().map(GapSpan::rows).sum();
             let bytes: usize = gaps.iter().map(|gap| gap.bytes).sum();
-            metrics::counter!("mux.scrollback.durability_gap_rows_total").increment(rows as u64);
-            metrics::counter!("mux.scrollback.durability_gap_bytes_total").increment(bytes as u64);
+            self.unreported_gap_rows
+                .fetch_add(rows as u64, Ordering::Relaxed);
+            self.unreported_gap_bytes
+                .fetch_add(bytes as u64, Ordering::Relaxed);
             if self.writer.publishes() {
                 // Gap records are counted when their markers are written.
                 DurabilityLedger::global().record_gaps(0, rows as u64, bytes as u64);
@@ -2220,7 +2251,7 @@ mod deferred_scrollback {
             state.oldest = Some(oldest);
             state.newest_exclusive = Some(next);
             state.prune_cached();
-            metrics::counter!("mux.scrollback.deferred_rows_admitted").increment(1);
+            self.unreported_admitted.fetch_add(1, Ordering::Relaxed);
             let interval = match state.interval_identity.capture(Some(oldest..next)) {
                 ScrollbackIntervalCapture::Ready(interval) => Some(interval),
                 _ => None,
@@ -2231,6 +2262,7 @@ mod deferred_scrollback {
 
     impl Drop for DeferredScrollbackSpillSink {
         fn drop(&mut self) {
+            self.publish_metrics();
             // Never silent: rows dropped here were admitted but never became
             // durable (pane closed while its store was failing, or without a
             // durability handoff). No IO here; the dropping thread may be a UI
@@ -4038,6 +4070,71 @@ mod deferred_scrollback {
             sink.commit_window(Instant::now()),
             CommitWindow::Open { .. }
         ));
+        sink.flush_scrollback().unwrap();
+    }
+
+    #[test]
+    fn admission_counts_rows_for_the_writer_to_publish_to_metrics() {
+        use metrics::{
+            Counter, CounterFn, Gauge, Histogram, Key, KeyName, Metadata, SharedString, Unit,
+        };
+        use std::sync::atomic::AtomicUsize;
+
+        struct Add(Arc<AtomicU64>);
+        impl CounterFn for Add {
+            fn increment(&self, value: u64) {
+                self.0.fetch_add(value, Ordering::SeqCst);
+            }
+            fn absolute(&self, value: u64) {
+                self.0.store(value, Ordering::SeqCst);
+            }
+        }
+        #[derive(Default)]
+        struct Admitted {
+            rows: Arc<AtomicU64>,
+            registrations: AtomicUsize,
+        }
+        impl metrics::Recorder for Admitted {
+            fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+            fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+            fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+            fn register_counter(&self, key: &Key, _: &Metadata<'_>) -> Counter {
+                self.registrations.fetch_add(1, Ordering::SeqCst);
+                if key.name() == "mux.scrollback.deferred_rows_admitted" {
+                    Counter::from_arc(Arc::new(Add(Arc::clone(&self.rows))))
+                } else {
+                    Counter::noop()
+                }
+            }
+            fn register_gauge(&self, _: &Key, _: &Metadata<'_>) -> Gauge {
+                Gauge::noop()
+            }
+            fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
+                Histogram::noop()
+            }
+        }
+
+        let (_store, sink) = windowed_sink(
+            CommitPolicy {
+                window: Duration::from_secs(120),
+                idle: Duration::from_secs(120),
+                ..CommitPolicy::default()
+            },
+            0x7b,
+        );
+        let recorder = Admitted::default();
+        // Admission (the parser, under the terminal lock) touches no metric.
+        metrics::with_local_recorder(&recorder, || {
+            for row in 0..3 {
+                assert!(sink.store_scrollback_line(row, &GatedStore::line(row), 64));
+            }
+        });
+        assert_eq!(recorder.registrations.load(Ordering::SeqCst), 0);
+        // The writer's turn publishes the count once.
+        metrics::with_local_recorder(&recorder, || sink.publish_metrics());
+        assert_eq!(recorder.rows.load(Ordering::SeqCst), 3);
+        metrics::with_local_recorder(&recorder, || sink.publish_metrics());
+        assert_eq!(recorder.rows.load(Ordering::SeqCst), 3, "published once");
         sink.flush_scrollback().unwrap();
     }
 
