@@ -229,6 +229,23 @@ impl Clone for Line {
     }
 }
 
+impl Line {
+    /// A copy of the row's content without its appdata cache, which `clone`
+    /// carries over under a lock: for copies that only keep the content,
+    /// such as the durability queue every scrolled row enters
+    /// (ft-yccm0.2.1.8). `PartialEq` ignores appdata, so it equals `clone`.
+    pub fn clone_content(&self) -> Self {
+        Self {
+            cells: self.cells.clone(),
+            zones: self.zones.clone(),
+            seqno: self.seqno,
+            bits: self.bits,
+            #[cfg(feature = "appdata")]
+            appdata: Mutex::new(None),
+        }
+    }
+}
+
 impl PartialEq for Line {
     fn eq(&self, other: &Self) -> bool {
         self.seqno == other.seqno && self.bits == other.bits && self.cells == other.cells
@@ -5968,6 +5985,19 @@ mod tests {
         let mut line = Line::from_cells(cells, 1);
         line.compress_for_scrollback();
         line
+    }
+
+    #[test]
+    #[cfg(feature = "appdata")]
+    fn clone_content_equals_clone_without_the_appdata_cache() {
+        let line = clustered_ascii_row(&[("ls -la".to_owned(), 0), (" ~/x".to_owned(), 2)]);
+        let cache = Arc::new(7u32);
+        line.set_appdata(Arc::clone(&cache));
+        let content = line.clone_content();
+        assert_eq!(content, line);
+        assert_eq!(content, line.clone());
+        assert!(content.get_appdata().is_none());
+        assert!(line.clone().get_appdata().is_some());
     }
 
     #[test]

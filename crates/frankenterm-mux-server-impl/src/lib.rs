@@ -2238,7 +2238,7 @@ mod deferred_scrollback {
             } else {
                 state.pending.push_back(Pending::Row(PendingRow {
                     stable_row,
-                    line: Arc::new(line.clone()),
+                    line: Arc::new(line.clone_content()),
                     retention,
                     charged_bytes: charge,
                     admitted_at: now,
