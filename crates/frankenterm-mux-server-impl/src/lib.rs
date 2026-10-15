@@ -13805,6 +13805,29 @@ fn clustered_scrollback_decoded_charge(
     if !line.has_clustered_storage() || line.len() > LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE {
         return None;
     }
+    // A row of single-width printable ASCII passes every check below by
+    // construction, and the cells of one attribute run share their
+    // attributes, so each run is charged at once. The per-cell walk was 16%
+    // of the durability writer's time in a flood (ft-yccm0.2.1.8). Same
+    // result as the walk (clustered_decoded_charge_shortcut_matches_the_cell_walk).
+    if let Some(runs) = line.single_width_ascii_runs() {
+        let mut charge = plaintext_bytes;
+        for (cells, attrs) in runs {
+            let materialized = std::mem::size_of::<termwiz::cell::Cell>()
+                .checked_add(attrs.snapshot_clone_heap_bytes()?)?;
+            charge = charge.checked_add(materialized.checked_mul(cells)?)?;
+        }
+        return Some(charge);
+    }
+    clustered_scrollback_decoded_charge_by_cell(line, plaintext_bytes)
+}
+
+/// [`clustered_scrollback_decoded_charge`] cell by cell, for any clustered
+/// row within the length limit.
+fn clustered_scrollback_decoded_charge_by_cell(
+    line: &wezterm_term::Line,
+    plaintext_bytes: usize,
+) -> Option<usize> {
     let mut charge = plaintext_bytes;
     let mut columns = 0usize;
     let mut text_bytes = 0usize;
@@ -23466,6 +23489,53 @@ mod tests {
                 > LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE
         );
         assert_eq!(serialize_exact_semantic_scrollback_line(&line), expected);
+    }
+
+    /// A clustered row with one attribute run per entry of `runs`: its text,
+    /// a palette color (0 = default) and whether it carries a hyperlink.
+    fn clustered_row_with_runs(runs: &[(String, u8, bool)]) -> wezterm_term::Line {
+        let mut cells = Vec::new();
+        for (text, color, link) in runs {
+            let mut attrs = termwiz::cell::CellAttributes::default();
+            if *color > 0 {
+                attrs.set_foreground(termwiz::color::ColorAttribute::PaletteIndex(*color));
+            }
+            if *link {
+                attrs.set_hyperlink(Some(Arc::new(termwiz::hyperlink::Hyperlink::new(
+                    "https://example.com/run",
+                ))));
+            }
+            cells.extend(
+                text.chars()
+                    .map(|ch| termwiz::cell::Cell::new(ch, attrs.clone())),
+            );
+        }
+        let mut line = wezterm_term::Line::from_cells(cells, 1);
+        line.compress_for_scrollback();
+        line
+    }
+
+    proptest::proptest! {
+        /// ft-yccm0.2.1.8: charging a single-width ASCII row per attribute
+        /// run gives what the per-cell walk gives, overflow included.
+        #[test]
+        fn clustered_decoded_charge_shortcut_matches_the_cell_walk(
+            runs in proptest::collection::vec(
+                ("[ -~]{1,30}", 0u8..4, proptest::bool::ANY),
+                1..6,
+            ),
+            plaintext in proptest::prop_oneof![
+                0usize..10_000,
+                proptest::strategy::Just(usize::MAX - 64),
+            ],
+        ) {
+            let line = clustered_row_with_runs(&runs);
+            proptest::prop_assert!(line.single_width_ascii_runs().is_some());
+            proptest::prop_assert_eq!(
+                clustered_scrollback_decoded_charge(&line, plaintext),
+                clustered_scrollback_decoded_charge_by_cell(&line, plaintext)
+            );
+        }
     }
 
     #[test]

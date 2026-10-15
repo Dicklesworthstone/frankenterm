@@ -2024,6 +2024,20 @@ impl Line {
         }
     }
 
+    /// The attribute runs, as (cells, attributes) in column order, of a
+    /// non-empty clustered row whose every cell is one printable ASCII byte
+    /// of width 1; `None` for any other row. A caller that would visit every
+    /// cell only to read widths and attributes can work per run instead
+    /// (ft-yccm0.2.1.8).
+    pub fn single_width_ascii_runs(
+        &self,
+    ) -> Option<impl Iterator<Item = (usize, &CellAttributes)> + '_> {
+        match &self.cells {
+            CellStorage::V(_) => None,
+            CellStorage::C(cl) => cl.single_width_ascii_runs(),
+        }
+    }
+
     /// Iterates the visible cells, respecting the width of the cell.
     /// For instance, a double-width cell overlaps the following (blank)
     /// cell, so that blank cell is omitted from the iterator results.

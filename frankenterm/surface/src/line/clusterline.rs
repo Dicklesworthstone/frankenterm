@@ -629,6 +629,20 @@ impl ClusteredLine {
         .then_some(self.text.as_str())
     }
 
+    /// The attribute runs, as (cells, attributes), of a row that
+    /// [`Self::single_width_printable_ascii`] accepts. There each cluster's
+    /// width is its number of cells.
+    pub(crate) fn single_width_ascii_runs(
+        &self,
+    ) -> Option<impl Iterator<Item = (usize, &CellAttributes)> + '_> {
+        self.single_width_printable_ascii()?;
+        Some(
+            self.clusters
+                .iter()
+                .map(|cluster| (usize::from(cluster.cell_width), &cluster.attrs)),
+        )
+    }
+
     /// Whether the clusters hold no spare capacity.
     #[cfg(test)]
     pub(crate) fn clusters_fit(&self) -> bool {
