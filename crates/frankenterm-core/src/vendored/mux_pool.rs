@@ -2045,6 +2045,60 @@ mod tests {
         spawn_mock_server_unexpected_batch_render_connections(temp_dir, 1).await
     }
 
+    /// Spawn a mock mux server that completes the handshake but never answers
+    /// a render poll (4tenz.5.5.3.5.8.4).
+    async fn spawn_mock_server_stalling_render(temp_dir: &tempfile::TempDir) -> PathBuf {
+        let socket_path = temp_dir.path().join("mux-pool-test-stalling-render.sock");
+        let listener = compat_unix::bind(&socket_path)
+            .await
+            .expect("bind mock mux listener");
+
+        task::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(conn) => conn,
+                    Err(_) => break,
+                };
+
+                task::spawn(async move {
+                    let mut read_buf = StreamingPduBuffer::new();
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = match unix_stream_read(&mut stream, &mut temp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        read_buf.extend_from_slice(&temp[..read]);
+                        let mut responses: Vec<(u64, Pdu)> = Vec::new();
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                            let response = match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                        codec_vers: CODEC_VERSION,
+                                        version_string: "mock-mux-pool-stall".to_string(),
+                                        executable_path: PathBuf::from("/bin/wezterm"),
+                                        config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                                    })
+                                }
+                                Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                                _ => continue,
+                            };
+                            responses.push((decoded.serial, response));
+                        }
+                        for (serial, pdu) in responses {
+                            if write_response_pdu(&mut stream, &pdu, serial).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        socket_path
+    }
+
     /// Spawn a mock mux server that injects one unexpected render response on
     /// each of the first `bad_connections` connections.
     async fn spawn_mock_server_unexpected_batch_render_connections(
@@ -4254,6 +4308,58 @@ mod tests {
             );
             assert_eq!(stats.pool.total_acquired, 1);
             assert_eq!(stats.pool.idle_count, 0);
+        });
+    }
+
+    /// 4tenz.5.5.3.5.8.4: a server that never answers cannot stretch a batch
+    /// render poll past its one `pipeline_timeout`, however many pipelined
+    /// and sequential-fallback attempts recovery allows. Before 3d69c22ae
+    /// each attempt had a timeout window of its own.
+    #[test]
+    fn stalled_render_batch_spends_one_timeout_across_retries_and_fallback() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server_stalling_render(&temp_dir).await;
+            let timeout = Duration::from_millis(400);
+            let pool = MuxPool::new(MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 4,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+                recovery: MuxRecoveryConfig {
+                    enabled: true,
+                    retry_policy: RetryPolicy::new(
+                        Duration::ZERO,
+                        Duration::ZERO,
+                        1.0,
+                        0.0,
+                        Some(4),
+                    ),
+                },
+                pipeline_depth: 4,
+                pipeline_timeout: timeout,
+            });
+
+            let started = std::time::Instant::now();
+            let error = pool
+                .get_pane_render_changes_batch(vec![1, 2, 3])
+                .await
+                .expect_err("a server that never answers must time out");
+            let elapsed = started.elapsed();
+            assert!(
+                matches!(
+                    error,
+                    MuxPoolError::Mux(DirectMuxError::BatchTimeout { timeout_ms: 400 })
+                ),
+                "{error:?}"
+            );
+            // One window plus scheduler slack; four attempts would take four.
+            assert!(
+                elapsed < timeout * 2,
+                "took {elapsed:?} against a {timeout:?} budget"
+            );
         });
     }
 
