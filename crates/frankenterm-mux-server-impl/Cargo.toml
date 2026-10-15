@@ -96,5 +96,9 @@ harness = false
 name = "scrollback_cold_read"
 harness = false
 
+[[bench]]
+name = "scrollback_ingest"
+harness = false
+
 [lints]
 workspace = true

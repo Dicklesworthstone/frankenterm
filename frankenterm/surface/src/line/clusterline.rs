@@ -619,6 +619,16 @@ impl ClusteredLine {
         self.len as usize
     }
 
+    /// The text, when it is non-empty and every cell is one printable ASCII
+    /// byte of width 1, so cell `i` is byte `i`.
+    pub(crate) fn single_width_printable_ascii(&self) -> Option<&str> {
+        (!self.text.is_empty()
+            && self.text.len() == self.len()
+            && self.is_double_wide.is_none()
+            && self.text.bytes().all(|byte| matches!(byte, b' '..=b'~')))
+        .then_some(self.text.as_str())
+    }
+
     /// Whether the clusters hold no spare capacity.
     #[cfg(test)]
     pub(crate) fn clusters_fit(&self) -> bool {

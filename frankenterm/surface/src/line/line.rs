@@ -2014,6 +2014,16 @@ impl Line {
         }
     }
 
+    /// The text of a non-empty row whose every cell is one printable ASCII
+    /// byte of width 1 (cell `i` is byte `i`), when its storage shows that
+    /// without visiting the cells.
+    fn single_width_printable_ascii(&self) -> Option<&str> {
+        match &self.cells {
+            CellStorage::V(_) => None,
+            CellStorage::C(cl) => cl.single_width_printable_ascii(),
+        }
+    }
+
     /// Iterates the visible cells, respecting the width of the cell.
     /// For instance, a double-width cell overlaps the following (blank)
     /// cell, so that blank cell is omitted from the iterator results.
@@ -2641,6 +2651,18 @@ impl LineWrapGeometry {
     /// be certified where a pictograph starts the next row, and a T0 row is
     /// captured without segmenting its cells and seams.
     fn capture_with(line: &Line, max_bytes: usize, pictographs: bool) -> Option<Self> {
+        Self::capture_cells(line, max_bytes, pictographs, true)
+    }
+
+    /// [`Self::capture_with`]; `ascii_rows` takes the shortcut for a row of
+    /// single-width printable ASCII (see below). Tests compare it with the
+    /// general loop.
+    fn capture_cells(
+        line: &Line,
+        max_bytes: usize,
+        pictographs: bool,
+        ascii_rows: bool,
+    ) -> Option<Self> {
         let available = max_bytes.checked_sub(core::mem::size_of::<Self>())?;
         // Visible tokens cannot outnumber columns in canonical physical rows.
         // Reserve once, before certificate scratch exists, so a growing width
@@ -2665,6 +2687,35 @@ impl LineWrapGeometry {
             return None;
         }
         let boundary_budget = max_bytes.checked_sub(result.retained_bytes())?;
+        // Every row of plain output that scrolls into the durable store is
+        // captured on the parse thread, under the terminal lock: 0.6 of the
+        // 0.9 us per 80-column row with the store on (ft-yccm0.2.1.8). When
+        // each cell is one printable ASCII byte of width 1, every cell is a
+        // basic starter, so the loop below segments nothing and certifies
+        // every boundary and both ends; only the widths, the separators and
+        // the trimmed length depend on the text.
+        if let Some(text) = ascii_rows
+            .then(|| line.single_width_printable_ascii())
+            .flatten()
+        {
+            if text.len() > max_bytes {
+                return None;
+            }
+            result.widths.extend(
+                text.bytes()
+                    .map(|byte| if byte == b' ' { 1 | 0x80 } else { 1 }),
+            );
+            result.trimmed_tokens = text
+                .bytes()
+                .rposition(|byte| byte != b' ')
+                .map_or(0, |last| last + 1);
+            result.head_basic = true;
+            result.head_after_basic = true;
+            result.tail_basic = true;
+            result.tail_before_basic = true;
+            result.tail_before_pictograph = pictographs;
+            return Some(result);
+        }
         let mut previous: Option<&str> = None;
         let mut previous_basic = false;
         let mut columns = 0usize;
@@ -5883,6 +5934,84 @@ mod tests {
             best[1] * 1e6 / rows.len() as f64,
             best[0] / best[1]
         );
+    }
+
+    /// A clustered row of printable ASCII cells in `runs`, one attribute
+    /// run each (colors 0..3 alternate so neighbouring runs can differ).
+    fn clustered_ascii_row(runs: &[(String, u8)]) -> Line {
+        let mut cells = Vec::new();
+        for (text, color) in runs {
+            let mut attrs = CellAttributes::default();
+            if *color > 0 {
+                attrs.set_foreground(frankenterm_cell::color::ColorAttribute::PaletteIndex(
+                    *color,
+                ));
+            }
+            for ch in text.chars() {
+                cells.push(Cell::new(ch, attrs.clone()));
+            }
+        }
+        let mut line = Line::from_cells(cells, 1);
+        line.compress_for_scrollback();
+        line
+    }
+
+    #[test]
+    fn ascii_row_geometry_shortcut_applies_only_to_single_width_printable_ascii() {
+        let ascii = clustered_ascii_row(&[("ls -la  ".to_owned(), 0), ("~/x".to_owned(), 2)]);
+        assert_eq!(ascii.single_width_printable_ascii(), Some("ls -la  ~/x"));
+        for text in ["", "e\u{301}", "\u{4e2d}a", "a\u{1F600}"] {
+            let mut line = Line::from_text(text, &CellAttributes::default(), 1, None);
+            line.compress_for_scrollback();
+            assert_eq!(line.single_width_printable_ascii(), None, "{text:?}");
+        }
+        // Vector storage is never read through the shortcut.
+        let vector = Line::from_cells(vec![Cell::new('a', CellAttributes::default())], 1);
+        assert_eq!(vector.single_width_printable_ascii(), None);
+        // Edge rows: all spaces, one cell, trailing spaces, budgets that refuse.
+        for (text, max_bytes) in [
+            ("    ", 1 << 16),
+            ("x", 1 << 16),
+            ("a b  ", 1 << 16),
+            ("abcdef", core::mem::size_of::<LineWrapGeometry>() + 6),
+            ("abcdef", core::mem::size_of::<LineWrapGeometry>() + 5),
+            ("abcdef", 3),
+        ] {
+            let line = clustered_ascii_row(&[(text.to_owned(), 0)]);
+            for pictographs in [false, true] {
+                assert_eq!(
+                    LineWrapGeometry::capture_cells(&line, max_bytes, pictographs, true),
+                    LineWrapGeometry::capture_cells(&line, max_bytes, pictographs, false),
+                    "{text:?} max_bytes={max_bytes} pictographs={pictographs}"
+                );
+            }
+        }
+    }
+
+    proptest::proptest! {
+        /// ft-yccm0.2.1.8: the single-width ASCII shortcut of geometry
+        /// capture gives exactly what the per-cell loop gives, budgets and
+        /// refusals included.
+        #[test]
+        fn ascii_row_geometry_shortcut_matches_the_cell_loop(
+            runs in proptest::collection::vec(("[ -~]{0,40}", 0u8..3), 1..6),
+            budget in proptest::prop_oneof![
+                proptest::strategy::Just(1usize << 16),
+                0usize..(core::mem::size_of::<LineWrapGeometry>() + 300),
+            ],
+            pictographs in proptest::bool::ANY,
+        ) {
+            let line = clustered_ascii_row(&runs);
+            let text: String = runs.iter().map(|(text, _)| text.as_str()).collect();
+            proptest::prop_assert_eq!(
+                line.single_width_printable_ascii().is_some(),
+                !text.is_empty()
+            );
+            proptest::prop_assert_eq!(
+                LineWrapGeometry::capture_cells(&line, budget, pictographs, true),
+                LineWrapGeometry::capture_cells(&line, budget, pictographs, false)
+            );
+        }
     }
 
     #[test]
