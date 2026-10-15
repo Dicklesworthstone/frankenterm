@@ -6600,11 +6600,11 @@ fn resolve_workspace_root_with_env(
     env_path: Option<&str>,
 ) -> crate::Result<PathBuf> {
     if let Some(path) = explicit {
-        return resolve_path(path);
+        return resolve_path(path).map(physical_operator_root);
     }
 
     if let Some(env_path) = env_path {
-        return resolve_path(Path::new(env_path));
+        return resolve_path(Path::new(env_path)).map(physical_operator_root);
     }
 
     std::env::current_dir().map_err(|e| {
@@ -6613,6 +6613,49 @@ fn resolve_workspace_root_with_env(
         ))
         .into()
     })
+}
+
+/// A workspace root the operator named (`--workspace`, `FT_WORKSPACE`), as
+/// its physical path when a symlink of the operator's own leads to it
+/// (ft-bzu2o), as the current directory already is. The no-follow walkers
+/// refuse a link they cannot tell from repository content, so the root must
+/// not hold one; links below it stay refused. Its deepest existing ancestor
+/// is resolved and the rest, not created yet, kept. A root reached only
+/// through the system's own top-level links (macOS `/tmp`, `/var`) keeps its
+/// spelling: the walkers go through those (ft-r937n), and rows keyed by the
+/// root keep matching.
+#[cfg(unix)]
+fn physical_operator_root(root: PathBuf) -> PathBuf {
+    let mut existing = root.as_path();
+    let mut missing = Vec::new();
+    let resolved = loop {
+        if let Ok(resolved) = std::fs::canonicalize(existing) {
+            break resolved;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name);
+                existing = parent;
+            }
+            _ => return root,
+        }
+    };
+    let physical = missing
+        .iter()
+        .rev()
+        .fold(resolved, |path, name| path.join(name));
+    if crate::system_symlinks::resolve_system_symlinks(&root).as_ref() == physical.as_path() {
+        root
+    } else {
+        physical
+    }
+}
+
+/// Windows has no such links to resolve, and `canonicalize` would turn the
+/// root into a verbatim `\\?\` path.
+#[cfg(not(unix))]
+fn physical_operator_root(root: PathBuf) -> PathBuf {
+    root
 }
 
 // Provide a fallback for dirs crate
@@ -7196,6 +7239,46 @@ disabled_rules = ["codex.usage_warning"]
         let cwd = std::env::current_dir().expect("cwd");
         let root = resolve_workspace_root_with_env(None, Some("env-workspace")).expect("resolve");
         assert_eq!(root, cwd.join("env-workspace"));
+    }
+
+    /// ft-bzu2o: a root named through the operator's own symlink resolves to
+    /// its physical path, existing or not yet created, from the CLI or the
+    /// environment. One reached only through the system's links keeps its
+    /// spelling (a temporary directory is under macOS's `/var`).
+    #[cfg(unix)]
+    #[test]
+    fn named_workspace_through_an_operator_symlink_is_physical_ft_bzu2o() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("real dir");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        let physical = std::fs::canonicalize(&real).expect("canonical");
+
+        let resolve = |explicit: Option<&Path>, env: Option<&str>| {
+            resolve_workspace_root_with_env(explicit, env).expect("resolve")
+        };
+        assert_eq!(resolve(Some(&link), None), physical);
+        assert_eq!(
+            resolve(Some(&link.join("new").join("app")), None),
+            physical.join("new").join("app")
+        );
+        assert_eq!(resolve(None, link.to_str()), physical);
+        assert_eq!(resolve(Some(&real), None), real);
+        assert_eq!(resolve(Some(&real.join("new")), None), real.join("new"));
+
+        // Scrollback opens under the resolved root, while the no-follow walk
+        // still refuses the link itself.
+        let open_scrollback = |root: &Path| {
+            crate::scrollback_mmap_writer::MmapScrollback::open(
+                crate::scrollback_mmap_writer::MmapScrollbackConfig::new(
+                    root.join(".ft").join("scrollback"),
+                    "pane-bzu2o",
+                ),
+            )
+        };
+        assert!(open_scrollback(&resolve(Some(&link), None)).is_ok());
+        assert!(open_scrollback(&link).is_err());
     }
 
     #[test]
