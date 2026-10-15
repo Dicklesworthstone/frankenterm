@@ -244,6 +244,15 @@ struct ColdSelectionReady {
 const MAX_COLD_SELECTION_WORK: usize = 16;
 const COLD_SELECTION_WORK_LEASE: Duration = Duration::from_secs(5);
 
+/// Longest a cold selection worker waits, on its own thread, for the terminal
+/// and then the selection slot to publish its result (ft-450cx). With a bare
+/// try_lock, any momentary holder (a flooding parser, a paint, a caller
+/// polling the slot) made the worker drop its finished result. The next poll
+/// then read storage again, and after a storage refusal skipped the
+/// refusal's retry backoff. Waiting for the terminal registers demand, so a
+/// flooding parser hands it over at its next slice (ft-yccm0.2.3).
+const COLD_SELECTION_PUBLISH_WAIT: Duration = Duration::from_millis(1);
+
 // Independent gestures cannot cancel one another's hydration. Finished work
 // retains only an opaque token or three coordinates; the shared LineReadPermit
 // still bounds all decoded payloads and active workers.
@@ -6549,10 +6558,15 @@ impl LocalPane {
                 // exact live pane lease; no main-thread payload cache is needed.
                 let published = worker_registration
                     .try_with_current(|pane| {
-                        let Some(mut term) = terminal.try_lock() else {
+                        let Some(mut term) = terminal.try_lock_for_as(
+                            TerminalLockHolder::Selection,
+                            COLD_SELECTION_PUBLISH_WAIT,
+                        ) else {
                             return false;
                         };
-                        let Some(mut slot) = completion.slot.try_lock() else {
+                        let Some(mut slot) =
+                            completion.slot.try_lock_for(COLD_SELECTION_PUBLISH_WAIT)
+                        else {
                             return false;
                         };
                         slot.retain(|work| {
@@ -13843,14 +13857,33 @@ mod tests {
                 let deadline = Instant::now() + Duration::from_secs(5);
                 loop {
                     while executor.try_tick().unwrap() {}
-                    if pane.cold_selection.lock().iter().any(|work| {
-                        work.request == request
-                            && matches!(
+                    let captured = pane
+                        .cold_selection
+                        .lock()
+                        .iter()
+                        .find(|work| work.request == request)
+                        .map(|work| {
+                            matches!(
                                 work.ready.as_ref().map(|ready| &ready.value),
                                 Some(ColdSelectionValue::Captured(Ok(Some(_))))
                             )
-                    }) {
-                        break;
+                        });
+                    match captured {
+                        Some(true) => break,
+                        Some(false) => {}
+                        // A worker that could not publish retires its work
+                        // and asks for a repaint. Poll again as that paint
+                        // would (ft-450cx).
+                        None => assert!(matches!(
+                            pane.capture_selection_anchor_capability(
+                                selection_sequence,
+                                selection_dimensions,
+                                points,
+                                &mut state,
+                            ),
+                            Ok(crate::pane::PaneSelectionAnchorStatus::Pending)
+                                | Err(crate::pane::PaneSelectionAnchorError::Busy)
+                        )),
                     }
                     assert!(
                         Instant::now() < deadline,
