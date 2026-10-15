@@ -10,7 +10,8 @@ use crate::default_config_with_overrides_applied;
 use crate::exec_domain::ExecDomain;
 use crate::font::{
     AllowSquareGlyphOverflow, DisplayPixelGeometry, FontLocatorSelection, FontRasterizerSelection,
-    FontShaperSelection, FreeTypeLoadFlags, FreeTypeLoadTarget, StyleRule, TextStyle,
+    FontShaperSelection, FreeTypeLcdFilter, FreeTypeLoadFlags, FreeTypeLoadTarget, StyleRule,
+    TextStyle,
 };
 use crate::frontend::FrontEndSelection;
 use crate::keyassignment::{
@@ -502,6 +503,18 @@ pub struct Config {
     #[dynamic(default)]
     pub freetype_pcf_long_family_names: bool,
 
+    /// Selects the LCD filter that FreeType applies to subpixel glyph
+    /// renders (`freetype_load_target` or `freetype_render_target` set to
+    /// `HorizontalLcd` or `VerticalLcd`). Has no effect on grayscale renders.
+    #[dynamic(default)]
+    pub freetype_lcd_filter: FreeTypeLcdFilter,
+
+    /// Five custom FIR filter weights (0-255) for subpixel glyph renders.
+    /// When set, these replace the weights of `freetype_lcd_filter`.
+    /// For example `{ 0x08, 0x4d, 0x56, 0x4d, 0x08 }` is the `Default` filter.
+    #[dynamic(default, validate = "validate_freetype_lcd_filter_weights")]
+    pub freetype_lcd_filter_weights: Option<Vec<u8>>,
+
     /// Specify the features to enable when using harfbuzz for font shaping.
     /// There is some light documentation here:
     /// <https://harfbuzz.github.io/shaping-opentype-features.html>
@@ -961,6 +974,27 @@ pub struct Config {
     pub window_background_image_hsb: Option<HsbTransform>,
     #[dynamic(default)]
     pub foreground_text_hsb: HsbTransform,
+
+    /// Gamma adjustment for glyph coverage, modelled on kitty's
+    /// `text_composition_strategy`. Higher values make text thicker. The
+    /// effect is scaled by the luminance difference between text and
+    /// background: dark text on a light background gets the full curve,
+    /// light text on a dark background very little of it.
+    ///
+    /// When neither this nor `text_contrast` is set, glyphs are blended in
+    /// gamma space exactly as before (kitty's `legacy`), which makes light
+    /// text on a dark background look thin. Setting either one switches
+    /// text to linear-light blending, then applies this curve.
+    /// `text_gamma = 1.0` alone gives plain linear blending.
+    #[dynamic(default, validate = "validate_text_gamma")]
+    pub text_gamma: Option<f32>,
+
+    /// Extra multiplicative contrast for glyph coverage, as a percentage
+    /// from 0 to 100 (kitty's second `text_composition_strategy` number).
+    /// Setting it also switches text to linear-light blending; see
+    /// `text_gamma`.
+    #[dynamic(default, validate = "validate_text_contrast")]
+    pub text_contrast: Option<f32>,
 
     #[dynamic(default)]
     pub background: Vec<BackgroundLayer>,
@@ -2707,6 +2741,34 @@ fn validate_resize_wrap_kp_lookahead_limit(value: &usize) -> Result<(), String> 
     }
 }
 
+fn validate_freetype_lcd_filter_weights(value: &Option<Vec<u8>>) -> Result<(), String> {
+    match value {
+        Some(weights) if weights.len() != 5 => Err(format!(
+            "freetype_lcd_filter_weights must have exactly 5 values, got {}",
+            weights.len()
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn validate_text_gamma(value: &Option<f32>) -> Result<(), String> {
+    match value {
+        Some(gamma) if !(gamma.is_finite() && *gamma >= 0.01) => {
+            Err(format!("text_gamma {gamma} must be 0.01 or more"))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_text_contrast(value: &Option<f32>) -> Result<(), String> {
+    match value {
+        Some(contrast) if !(0.0..=100.0).contains(contrast) => Err(format!(
+            "text_contrast {contrast} must be between 0 and 100"
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn validate_percent_0_100(value: &u8) -> Result<(), String> {
     if *value > 100 {
         Err(format!("value {value} must be between 0 and 100"))
@@ -3500,6 +3562,75 @@ mod tests {
             .check_consistency()
             .expect_err("zero healthy-session fence would erase every finite failure budget");
         assert!(error.to_string().contains("healthy_session_ms"));
+    }
+
+    // ── Text rendering ─────────────────────────────────────────
+
+    fn config_from_pairs(pairs: Vec<(&str, Value)>) -> anyhow::Result<Config> {
+        let mut obj = frankenterm_dynamic::Object::default();
+        for (key, value) in pairs {
+            obj.insert(Value::String(key.to_string()), value);
+        }
+        Ok(Config::from_dynamic(
+            &Value::Object(obj),
+            FromDynamicOptions::default(),
+        )?)
+    }
+
+    #[test]
+    fn text_rendering_options_default_to_legacy_behaviour() {
+        let config = config_from_pairs(vec![]).unwrap();
+        assert_eq!(config.freetype_lcd_filter, FreeTypeLcdFilter::Default);
+        assert_eq!(config.freetype_lcd_filter_weights, None);
+        assert_eq!(config.text_gamma, None);
+        assert_eq!(config.text_contrast, None);
+    }
+
+    #[test]
+    fn text_rendering_options_parse_from_dynamic() {
+        let config = config_from_pairs(vec![
+            ("freetype_lcd_filter", Value::String("Light".to_string())),
+            (
+                "freetype_lcd_filter_weights",
+                Value::Array(
+                    [0x10u64, 0x40, 0x70, 0x40, 0x10]
+                        .iter()
+                        .map(|&w| Value::U64(w))
+                        .collect(),
+                ),
+            ),
+            ("text_gamma", Value::F64(1.7f64.into())),
+            ("text_contrast", Value::U64(30)),
+        ])
+        .unwrap();
+        assert_eq!(config.freetype_lcd_filter, FreeTypeLcdFilter::Light);
+        assert_eq!(
+            config.freetype_lcd_filter_weights,
+            Some(vec![0x10, 0x40, 0x70, 0x40, 0x10])
+        );
+        assert_eq!(config.text_gamma, Some(1.7));
+        assert_eq!(config.text_contrast, Some(30.0));
+
+        for name in ["Default", "Light", "None"] {
+            let config =
+                config_from_pairs(vec![("freetype_lcd_filter", Value::String(name.into()))])
+                    .unwrap();
+            assert_eq!(format!("{:?}", config.freetype_lcd_filter), name);
+        }
+    }
+
+    #[test]
+    fn text_rendering_options_reject_out_of_range_values() {
+        let four_weights = Value::Array((0..4u64).map(Value::U64).collect());
+        assert!(config_from_pairs(vec![("freetype_lcd_filter_weights", four_weights)]).is_err());
+        assert!(config_from_pairs(vec![(
+            "freetype_lcd_filter",
+            Value::String("Blurry".into())
+        )])
+        .is_err());
+        assert!(config_from_pairs(vec![("text_gamma", Value::F64(0.0f64.into()))]).is_err());
+        assert!(config_from_pairs(vec![("text_contrast", Value::U64(101))]).is_err());
+        assert!(config_from_pairs(vec![("text_contrast", Value::F64((-1.0f64).into()))]).is_err());
     }
 
     // ── DroppedFileQuoting::escape ─────────────────────────────

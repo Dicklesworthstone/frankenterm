@@ -5,7 +5,7 @@ use crate::parser::ParsedFont;
 #[cfg(not(windows))]
 use crate::rasterizer::colr::DrawOp;
 use anyhow::{anyhow, Context};
-use config::{configuration, FreeTypeLoadFlags, FreeTypeLoadTarget};
+use config::{configuration, FreeTypeLcdFilter, FreeTypeLoadFlags, FreeTypeLoadTarget};
 pub use freetype::*;
 use memmap2::{Mmap, MmapOptions};
 use rangeset::RangeSet;
@@ -1155,6 +1155,14 @@ impl Face {
     }
 }
 
+fn lcd_filter_to_ft(filter: FreeTypeLcdFilter) -> FT_LcdFilter {
+    match filter {
+        FreeTypeLcdFilter::Default => FT_LcdFilter::FT_LCD_FILTER_DEFAULT,
+        FreeTypeLcdFilter::Light => FT_LcdFilter::FT_LCD_FILTER_LIGHT,
+        FreeTypeLcdFilter::None => FT_LcdFilter::FT_LCD_FILTER_NONE,
+    }
+}
+
 pub struct Library {
     lib: FT_Library,
 }
@@ -1203,12 +1211,17 @@ impl Library {
             }
         }
 
-        // Due to patent concerns, the freetype library disables the LCD
-        // filtering feature by default, and since we always build our
-        // own copy of freetype, it is likewise disabled by default for
-        // us too.  As a result, this call will generally fail.
-        // Freetype is still able to render a decent result without it!
-        lib.set_lcd_filter(FT_LcdFilter::FT_LCD_FILTER_DEFAULT).ok();
+        // These calls fail when freetype is built without
+        // FT_CONFIG_OPTION_SUBPIXEL_RENDERING. Our vendored build enables
+        // it, but a failure here is harmless: freetype still renders a
+        // decent result without a filter.
+        lib.set_lcd_filter(lcd_filter_to_ft(config.freetype_lcd_filter))
+            .ok();
+        if let Some(weights) = &config.freetype_lcd_filter_weights {
+            if let Ok(weights) = <[u8; 5]>::try_from(weights.as_slice()) {
+                lib.set_lcd_filter_weights(weights).ok();
+            }
+        }
 
         Ok(lib)
     }
@@ -1277,6 +1290,17 @@ impl Library {
         unsafe {
             ft_result(FT_Library_SetLcdFilter(self.lib, filter), ())
                 .context("FT_Library_SetLcdFilter")
+        }
+    }
+
+    /// Replace the LCD filter with a custom five-tap FIR filter.
+    pub fn set_lcd_filter_weights(&mut self, mut weights: [u8; 5]) -> anyhow::Result<()> {
+        unsafe {
+            ft_result(
+                FT_Library_SetLcdFilterWeights(self.lib, weights.as_mut_ptr()),
+                (),
+            )
+            .context("FT_Library_SetLcdFilterWeights")
         }
     }
 }
@@ -1554,4 +1578,28 @@ pub fn composite_mode_to_operator(mode: FT_Composite_Mode) -> cairo::Operator {
 
 fn ft_make_tag(a: u8, b: u8, c: u8, d: u8) -> FT_ULong {
     (a as FT_ULong) << 24 | (b as FT_ULong) << 16 | (c as FT_ULong) << 8 | (d as FT_ULong)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // FreeType returns Unimplemented_Feature for these calls when it is built
+    // without FT_CONFIG_OPTION_SUBPIXEL_RENDERING, which would make
+    // freetype_lcd_filter silently do nothing.
+    #[test]
+    fn every_lcd_filter_and_custom_weights_are_accepted() {
+        config::use_test_configuration();
+        let mut lib = Library::new().unwrap();
+        for filter in [
+            FreeTypeLcdFilter::Default,
+            FreeTypeLcdFilter::Light,
+            FreeTypeLcdFilter::None,
+        ] {
+            lib.set_lcd_filter(lcd_filter_to_ft(filter))
+                .unwrap_or_else(|err| panic!("{filter:?}: {err:#}"));
+        }
+        lib.set_lcd_filter_weights([0x10, 0x40, 0x70, 0x40, 0x10])
+            .unwrap();
+    }
 }

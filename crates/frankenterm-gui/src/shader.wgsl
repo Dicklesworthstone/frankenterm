@@ -49,6 +49,11 @@ struct ShaderUniform {
   foreground_text_hsb: vec3<f32>,
   milliseconds: u32,
   projection: mat4x4<f32>,
+  // text_gamma / text_contrast; see text_composition.rs.
+  // x: enabled (0 or 1), y: 1 / text_gamma, z: 1 + text_contrast / 100.
+  text_composition: vec4<f32>,
+  // Linear color of the background the text is assumed to sit on (rgb).
+  text_background: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> uniforms: ShaderUniform;
 
@@ -80,6 +85,17 @@ fn apply_hsv(c: vec4<f32>, transform: vec3<f32>) -> vec4<f32>
 {
   let hsv = rgb2hsv(c.rgb) * transform;
   return vec4<f32>(hsv2rgb(hsv).rgb, c.a);
+}
+
+const LUMINANCE = vec3<f32>(0.2126, 0.7152, 0.0722);
+
+// kitty's text_composition_strategy curve. The surface is sRGB, so the
+// blend already happens in linear light and needs no further conversion.
+fn adjust_coverage(coverage: f32, fg_luminance: f32, bg_luminance: f32) -> f32
+{
+  let weight = (1.0 - fg_luminance + bg_luminance) * 0.5;
+  let curved = mix(coverage, pow(coverage, uniforms.text_composition.y), weight);
+  return clamp(curved * uniforms.text_composition.z, 0.0, 1.0);
 }
 
 @vertex
@@ -154,6 +170,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
   }
 
   color = apply_hsv(color, hsv);
+
+  if uniforms.text_composition.x > 0.5 && in.has_color == IS_GLYPH {
+    let fg = clamp(color.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    let bg = clamp(uniforms.text_background.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    color.a = adjust_coverage(color.a, dot(fg, LUMINANCE), dot(bg, LUMINANCE));
+  }
 
   return color;
 }
