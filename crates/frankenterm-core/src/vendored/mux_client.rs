@@ -175,8 +175,9 @@ fn content_tail_rows(out: &str, n: usize) -> (String, bool) {
     (text, start == 0)
 }
 
-/// Line reads the server refuses as `resource_busy` are re-sent this many
-/// times. Such a read was not applied and is safe to repeat. The server waits
+/// Line reads and render-state reads the server refuses as `resource_busy`
+/// are re-sent this many times. Such a read was not applied and is safe to
+/// repeat. The server waits
 /// 1 ms for a pane's terminal per attempt, so on a contended host, where a
 /// preempted lock holder keeps it for many milliseconds, three retries over
 /// ~21 ms still lost reads that ended a swarm-echo run (ft-4p4uo: every
@@ -1563,7 +1564,7 @@ pub struct DirectMuxClient {
     #[cfg(test)]
     get_lines_retry_delays: [Option<Duration>; MAX_RESOURCE_BUSY_RETRIES],
     #[cfg(test)]
-    render_read_retry_delays: [Option<Duration>; 2],
+    render_read_retry_delays: [Option<Duration>; MAX_RESOURCE_BUSY_RETRIES],
 }
 
 impl std::fmt::Debug for DirectMuxClient {
@@ -2415,7 +2416,7 @@ impl DirectMuxClient {
             #[cfg(test)]
             get_lines_retry_delays: [None; MAX_RESOURCE_BUSY_RETRIES],
             #[cfg(test)]
-            render_read_retry_delays: [None; 2],
+            render_read_retry_delays: [None; MAX_RESOURCE_BUSY_RETRIES],
             config,
         };
 
@@ -2720,7 +2721,7 @@ impl DirectMuxClient {
         // another read. All attempts share the original operation's budget.
         #[cfg(test)]
         {
-            self.render_read_retry_delays = [None; 2];
+            self.render_read_retry_delays = [None; MAX_RESOURCE_BUSY_RETRIES];
         }
         let budget = self
             .config
@@ -2731,7 +2732,7 @@ impl DirectMuxClient {
         // caller's earlier capability deadline still bounds timeout_with_cx.
         let deadline = crate::runtime_async::timer_now_with_cx(cx) + budget;
         let result = crate::runtime_async::timeout_with_cx(cx, budget, async {
-            for attempt in 0..3 {
+            for attempt in 0..=MAX_RESOURCE_BUSY_RETRIES {
                 checkpoint_mux_cx(cx, self.connection_id, "render_read_retry")?;
                 if crate::runtime_async::timer_now_with_cx(cx) >= deadline {
                     return Err(DirectMuxError::ReadTimeout);
@@ -2783,7 +2784,20 @@ impl DirectMuxClient {
                     }
                     response => self.settle_single_render_response(pane_id, response, true),
                 };
-                if attempt < 2 && settled.as_ref().is_err_and(is_retryable_render_rejection) {
+                // A busy refusal (the server's 1 ms terminal wait expired)
+                // gets a line read's retries: with only two, over ~11 ms, the
+                // text fence of `ft get-text` on a flooding pane ended every
+                // swarm-echo run that failed with resource_busy, while its
+                // line reads recovered (ft-4p4uo).
+                let retries = match &settled {
+                    Err(DirectMuxError::RemoteRejection(error))
+                        if error.code == codec::MuxErrorCode::RESOURCE_BUSY =>
+                    {
+                        MAX_RESOURCE_BUSY_RETRIES
+                    }
+                    _ => 2,
+                };
+                if attempt < retries && settled.as_ref().is_err_and(is_retryable_render_rejection) {
                     tracing::debug!(
                         pane_id,
                         attempt,
@@ -13032,7 +13046,7 @@ mod tests {
             for (case, expected_requests) in [
                 ("recover", 2),
                 ("busy-recover", 2),
-                ("busy-persistent", 3),
+                ("busy-persistent", 7),
                 ("never", 1),
                 ("effect", 1),
                 ("wrong-request", 1),
@@ -13155,7 +13169,7 @@ mod tests {
                     );
                     assert_eq!(
                         client.render_read_retry_delays,
-                        [Some(Duration::from_millis(1)), None],
+                        [Some(Duration::from_millis(1)), None, None, None, None, None],
                         "a transient read race must not impose the sustained-contention delay"
                     );
                 } else if matches!(case, "cancel" | "extreme-cancel") {
@@ -13170,17 +13184,30 @@ mod tests {
                 } else {
                     assert!(result.is_err(), "rejection must not become a frame: {case}");
                 }
-                if matches!(case, "persistent" | "busy-persistent" | "extreme") {
+                if matches!(case, "persistent" | "extreme") {
                     assert_eq!(
                         client.render_read_retry_delays,
                         [
                             Some(Duration::from_millis(1)),
-                            Some(Duration::from_millis(10))
+                            Some(Duration::from_millis(10)),
+                            None,
+                            None,
+                            None,
+                            None
                         ],
                         "persistent read contention keeps the bounded longer backoff"
                     );
+                } else if case == "busy-persistent" {
+                    assert_eq!(
+                        client.render_read_retry_delays,
+                        [1, 10, 10, 20, 40, 80].map(|ms| Some(Duration::from_millis(ms))),
+                        "a busy terminal gets a line read's ~161 ms of retries"
+                    );
                 } else if matches!(case, "never" | "effect" | "wrong-request" | "eof") {
-                    assert_eq!(client.render_read_retry_delays, [None; 2]);
+                    assert_eq!(
+                        client.render_read_retry_delays,
+                        [None; MAX_RESOURCE_BUSY_RETRIES]
+                    );
                 }
                 drop(client);
                 let requests = server.await.expect("server");
