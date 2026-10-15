@@ -1038,20 +1038,20 @@
         "cosmetic": 16,
         "docs": 2,
         "feat": 74,
-        "fix": 164,
+        "fix": 165,
         "other": 75,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
         "test": 79
       },
-      "fork_side_commit_count": 427,
+      "fork_side_commit_count": 428,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-15T08:30:19-04:00",
-        "sha": "b63f57ffa2210a22780a623113d981b1183d35bf",
-        "subject": "fix(term): graphemes that join without a ZWJ render the same at every PTY read split (ft-cklgg)"
+        "committed_at": "2026-10-15T09:45:22-04:00",
+        "sha": "18b381a22c627e5c22e6abf21771f090bd7d8535",
+        "subject": "fix(term): a pane whose scrollback store never opened keeps bounded scrollback (ft-qvt9l)"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1206,8 +1206,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 3193,
-  "generated_at": "2026-10-15T13:32:54.707589Z",
+  "fork_side_commit_total": 3194,
+  "generated_at": "2026-10-15T13:45:34.776646Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
