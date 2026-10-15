@@ -1902,7 +1902,20 @@ impl TerminalMutex {
             Some(guard) => Some(TerminalGuard::acquired(guard, holder, waited.max(1))),
             None => {
                 // Giving up acquired nothing, but blocked this thread.
-                TerminalLockLedger::global().record_abandoned_wait(waited, on_main_thread());
+                let on_main = on_main_thread();
+                TerminalLockLedger::global().record_abandoned_wait(waited, on_main);
+                // A bounded wait that ran far past its bound means the
+                // waiting thread itself was descheduled (ft-yccm0.2.2.3).
+                if on_main
+                    && waited >= SLOW_MAIN_THREAD_WAIT_NS
+                    && log::log_enabled!(log::Level::Debug)
+                {
+                    log::debug!(
+                        "main thread gave up after {} us (bound {wait:?}) waiting for a pane terminal as {holder:?}:\n{}",
+                        waited / 1000,
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
                 None
             }
         }
@@ -1951,6 +1964,24 @@ fn hold_signpost(holder: TerminalLockHolder) -> procinfo::SignpostName {
 /// (ft-yccm0.2.3 AC3).
 const SLOW_MAIN_THREAD_WAIT_NS: u64 = 2_000_000;
 
+/// A terminal-lock hold at least this long is logged at debug level with the
+/// backtrace of its release.
+const SLOW_TERMINAL_HOLD_NS: u64 = 20_000_000;
+
+/// This thread's CPU time so far (zero where unsupported).
+fn thread_cpu_time() -> Duration {
+    #[cfg(unix)]
+    {
+        let now = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+        Duration::new(
+            u64::try_from(now.tv_sec).unwrap_or(0),
+            u32::try_from(now.tv_nsec).unwrap_or(0),
+        )
+    }
+    #[cfg(not(unix))]
+    Duration::ZERO
+}
+
 impl<'a> TerminalGuard<'a> {
     fn acquired(guard: MutexGuard<'a, Terminal>, holder: TerminalLockHolder, wait_ns: u64) -> Self {
         let on_main = on_main_thread();
@@ -1982,6 +2013,17 @@ impl<'a> TerminalGuard<'a> {
     fn record_hold(&self) {
         let held = u64::try_from(self.acquired.elapsed().as_nanos()).unwrap_or(u64::MAX);
         TerminalLockLedger::global().record_hold(self.holder, held);
+        // Name the holder of a long hold by where it releases, which is in
+        // the function that held it (ft-t162y: 85-149 ms parser holds that no
+        // slice stretch logged).
+        if held >= SLOW_TERMINAL_HOLD_NS && log::log_enabled!(log::Level::Debug) {
+            log::debug!(
+                "terminal held {} us as {:?}, released at:\n{}",
+                held / 1000,
+                self.holder,
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
     }
 }
 
@@ -5178,6 +5220,11 @@ impl LocalPane {
         step: &mut dyn FnMut(&mut Terminal, &mut dyn FnMut() -> bool) -> SliceProgress,
     ) -> TerminalGuard<'a> {
         let mut held_since = Instant::now();
+        // With debug logging on, a slow stretch also reports this thread's
+        // CPU time over it: far less than the stretch means the parser was
+        // descheduled or blocked while holding the lock, not working.
+        let diagnose = log::log_enabled!(log::Level::Debug);
+        let mut cpu_since = diagnose.then(thread_cpu_time);
         let mut handoffs = 0_u64;
         loop {
             let progress = step(&mut terminal, &mut || {
@@ -5187,8 +5234,9 @@ impl LocalPane {
             if stretch >= SLOW_PARSER_STRETCH {
                 // One stretch between checks ran far past the budget
                 // (ft-t162y): 65-200 ms once per T1 flood on an M4 Pro.
+                let cpu = cpu_since.map(|since| thread_cpu_time().saturating_sub(since));
                 log::debug!(
-                    "pane {} parser held the terminal {stretch:?} in one hold ({progress:?}, {} handoffs so far, seqno {})",
+                    "pane {} parser held the terminal {stretch:?} in one hold, {cpu:?} of it on CPU ({progress:?}, {} handoffs so far, seqno {})",
                     self.pane_id,
                     handoffs,
                     terminal.current_seqno()
@@ -5210,10 +5258,14 @@ impl LocalPane {
             terminal = self.terminal.lock_as(TerminalLockHolder::Parser);
             application.resume();
             held_since = Instant::now();
+            cpu_since = diagnose.then(thread_cpu_time);
         }
         if handoffs > 0 {
             metrics::counter!("mux.parser.terminal_lock_handoffs").increment(handoffs);
-            log::debug!(
+            // Trace, not debug: this runs for nearly every batch of a flood,
+            // still under the terminal lock, so at debug a slow stderr write
+            // became a long parser hold of its own (ft-t162y).
+            log::trace!(
                 "pane {} applied one batch in {} lock holds",
                 self.pane_id,
                 handoffs + 1
