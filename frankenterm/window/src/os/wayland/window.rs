@@ -482,20 +482,20 @@ impl WaylandWindow {
             compositor.create_surface_with_data(&qh, surface_data)
         };
 
-        let fractional_scale = conn
-            .wayland_state
-            .borrow()
-            .fractional_scale
-            .as_ref()
-            .map(|(manager, viewporter)| FractionalScaleSurface {
-                fractional: manager.get_fractional_scale(
-                    &surface,
-                    &qh,
-                    FractionalScaleData { window_id },
-                ),
-                viewport: viewporter.get_viewport(&surface, &qh, GlobalData),
-                preferred: None,
-            });
+        let fractional_scale =
+            conn.wayland_state
+                .borrow()
+                .fractional_scale
+                .as_ref()
+                .map(|(manager, viewporter)| FractionalScaleSurface {
+                    fractional: manager.get_fractional_scale(
+                        &surface,
+                        &qh,
+                        FractionalScaleData { window_id },
+                    ),
+                    viewport: viewporter.get_viewport(&surface, &qh, GlobalData),
+                    preferred: None,
+                });
 
         let ResolvedGeometry {
             x: _,
@@ -1310,16 +1310,14 @@ impl WaylandWindowInner {
         if fractional.preferred == Some(scale) {
             return;
         }
-        let logical = checked_pixel_dimensions(
-            self.dimensions.pixel_width,
-            self.dimensions.pixel_height,
-        )
-        .and_then(|(width, height)| {
-            Some((
-                u32::try_from(self.pixels_to_surface(width)).ok()?,
-                u32::try_from(self.pixels_to_surface(height)).ok()?,
-            ))
-        });
+        let logical =
+            checked_pixel_dimensions(self.dimensions.pixel_width, self.dimensions.pixel_height)
+                .and_then(|(width, height)| {
+                    Some((
+                        u32::try_from(self.pixels_to_surface(width)).ok()?,
+                        u32::try_from(self.pixels_to_surface(height)).ok()?,
+                    ))
+                });
         log::debug!("Wayland preferred fractional scale is now {scale}");
         if let Some(fractional) = self.fractional_scale.as_mut() {
             fractional.preferred = Some(scale);
@@ -1343,7 +1341,9 @@ impl WaylandWindowInner {
 
         if let Some((x, y)) = PendingMouse::coords(&pending_mouse) {
             let coords = match self.fractional_scale() {
-                Some(scale) => Point::new((x * scale).floor() as isize, (y * scale).floor() as isize),
+                Some(scale) => {
+                    Point::new((x * scale).floor() as isize, (y * scale).floor() as isize)
+                }
                 None => Point::new(
                     self.surface_to_pixels(x as i32) as isize,
                     self.surface_to_pixels(y as i32) as isize,
@@ -1508,8 +1508,8 @@ impl WaylandWindowInner {
                 };
                 let surface_udata = SurfaceUserData::from_wl(self.surface());
                 let fractional = self.fractional_scale();
-                let factor = fractional
-                    .unwrap_or_else(|| surface_udata.surface_data.scale_factor() as f64);
+                let factor =
+                    fractional.unwrap_or_else(|| surface_udata.surface_data.scale_factor() as f64);
                 let old_dimensions = self.dimensions;
 
                 let dpi = self
@@ -1527,7 +1527,11 @@ impl WaylandWindowInner {
                     .unwrap_or_else(|| self.config.dpi.unwrap_or(factor * crate::DEFAULT_DPI));
                 // A fractional scale gives a fractional DPI (1.1 -> 105.6);
                 // round it so fonts are not sized for the next step down.
-                let dpi = if fractional.is_some() { dpi.round() } else { dpi } as usize;
+                let dpi = if fractional.is_some() {
+                    dpi.round()
+                } else {
+                    dpi
+                } as usize;
 
                 // Do this early because this affects surface_to_pixels/pixels_to_surface
                 self.dimensions.dpi = dpi;
@@ -1758,7 +1762,12 @@ impl WaylandWindowInner {
     fn ime_pixels_to_surface(&self, pixels: i32) -> i32 {
         match self.fractional_scale() {
             Some(scale) => fractional_pixels_to_surface(pixels, scale),
-            None => pixels / SurfaceUserData::from_wl(self.surface()).surface_data().scale_factor(),
+            None => {
+                pixels
+                    / SurfaceUserData::from_wl(self.surface())
+                        .surface_data()
+                        .scale_factor()
+            }
         }
     }
 
@@ -2559,10 +2568,11 @@ impl HasWindowHandle for WaylandWindow {
 mod tests {
     use super::{
         checked_pixel_dimensions, checked_surface_dimensions, compositor_repeat_transition,
-        fractional_pixels_to_surface, fractional_surface_to_pixels, preferred_scale_from_wire,
-        key_repeat_first_due, key_repeat_timer_plan, key_repeat_timing, key_repeat_window_event,
-        new_pending_first_configure, read_pipe_with_timeout, resolve_pending_first_configure,
-        validate_resize_increments, CompositorRepeatTransition, KeyRepeatAbort, KeyRepeatTimerPlan,
+        fractional_pixels_to_surface, fractional_surface_to_pixels, key_repeat_first_due,
+        key_repeat_timer_plan, key_repeat_timing, key_repeat_window_event,
+        new_pending_first_configure, preferred_scale_from_wire, read_pipe_with_timeout,
+        resolve_pending_first_configure, validate_resize_increments, CompositorRepeatTransition,
+        KeyRepeatAbort, KeyRepeatTimerPlan,
     };
     use crate::{
         Handled, KeyCode, KeyEvent, Modifiers, RawKeyEvent, ResizeIncrement, WindowEvent,
@@ -2956,5 +2966,4 @@ mod tests {
             }
         }
     }
-
 }

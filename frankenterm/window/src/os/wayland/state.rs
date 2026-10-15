@@ -111,7 +111,11 @@ impl WaylandState {
         };
         log::debug!(
             "Wayland fractional scaling: {}",
-            if fractional_scale.is_some() { "enabled" } else { "unavailable or disabled" }
+            if fractional_scale.is_some() {
+                "enabled"
+            } else {
+                "unavailable or disabled"
+            }
         );
         let wayland_state = WaylandState {
             registry: RegistryState::new(globals),
