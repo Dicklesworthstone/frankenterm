@@ -144,6 +144,16 @@ pub(super) fn parse_stream_max_hz(qs: &QueryString<'_>, runtime_limits: WebRunti
         .min(runtime_limits.stream_max_max_hz)
 }
 
+/// Minimum spacing between frames of a stream limited to `max_hz`
+/// (4tenz.12): `ceil(1 s / max_hz)` in nanoseconds, as `ft robot
+/// watch-events --max-hz` spaces events. Millisecond floor division let
+/// rates that do not divide 1000 (3 Hz) run over their limit. A zero rate
+/// never gets here (`parse_stream_max_hz` maps it to the default) and is
+/// spaced as 1 Hz, not unlimited.
+fn stream_min_interval(max_hz: u64) -> Duration {
+    Duration::from_nanos(1_000_000_000_u64.div_ceil(max_hz.max(1)))
+}
+
 pub(super) fn parse_event_stream_channel(
     qs: &QueryString<'_>,
 ) -> std::result::Result<EventStreamChannel, Response> {
@@ -729,7 +739,7 @@ pub(super) fn handle_stream_events(
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
         let producer = async move {
             let child_cx = stream_cx;
-            let min_interval = Duration::from_millis((1000 / max_hz.max(1)).max(1));
+            let min_interval = stream_min_interval(max_hz);
             let mut next_emit_at = Instant::now();
             let mut seq = 0_u64;
             let mut consecutive_drops = 0_u64;
@@ -994,7 +1004,7 @@ pub(super) fn handle_stream_deltas(
         let started_at_ms = epoch_ms_now();
         let producer = async move {
             let child_cx = stream_cx;
-            let min_interval = Duration::from_millis((1000 / max_hz.max(1)).max(1));
+            let min_interval = stream_min_interval(max_hz);
             let mut next_emit_at = Instant::now();
             let mut seq = 0_u64;
             let mut consecutive_drops = 0_u64;
@@ -1192,6 +1202,7 @@ mod tests {
     use super::{
         Event, EventStreamChannel, STREAM_MAX_CONSECUTIVE_DROPS, SseEvent,
         frame_to_sse_with_event_id, mpsc, parse_event_stream_channel, persisted_event_id,
+        stream_min_interval,
     };
     use crate::runtime_async::CompatRuntime;
     use crate::web_framework::QueryString;
@@ -1523,6 +1534,24 @@ mod tests {
             parse_stream_max_hz(&qs),
             default_limits().stream_default_max_hz
         );
+    }
+
+    #[test]
+    fn stream_min_interval_never_permits_more_than_max_hz() {
+        use std::time::Duration;
+
+        assert_eq!(stream_min_interval(3), Duration::from_nanos(333_333_334));
+        assert_eq!(stream_min_interval(50), Duration::from_millis(20));
+        assert_eq!(stream_min_interval(0), Duration::from_secs(1));
+        assert_eq!(stream_min_interval(u64::MAX), Duration::from_nanos(1));
+        for max_hz in [1, 3, 7, 50, 333, 500, 1001, 1_000_000, u64::MAX] {
+            let interval = stream_min_interval(max_hz);
+            assert!(interval > Duration::ZERO, "max_hz {max_hz}");
+            assert!(
+                interval.as_nanos() * u128::from(max_hz) >= 1_000_000_000,
+                "max_hz {max_hz} interval {interval:?}"
+            );
+        }
     }
 
     #[test]
