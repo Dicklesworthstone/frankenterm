@@ -14,6 +14,14 @@
 //!   whose store could not open);
 //! - `untiered`: `scrollback_tiered_enabled = false`.
 //!
+//! After each chunk the store arm does what `LocalPane` does after a parse
+//! batch (`drain_scrollback_outside_terminal`, without its lock handoffs or
+//! capacity wait): it trims hot-tier overflow into the sink's queue and
+//! hands the queue to the durability writer. Without that handoff the
+//! writer never drains, the queue reaches its budget a few hundred thousand
+//! rows in, and every later row takes the overload (gap) path; each run
+//! prints the gap rows it caused.
+//!
 //! Lines are `seq`-like (`1\r\n2\r\n...`, as a pty delivers `seq 1 N`) or,
 //! with a width, each row's number padded with `x` to that many columns.
 //! Each run's store directory is kept and printed (no deletion here).
@@ -25,7 +33,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use wezterm_term::{Terminal, TerminalConfiguration, TerminalSize};
+use frankenterm_alloc::resource_ledger::DurabilityLedger;
+use wezterm_term::config::ScrollbackSpillSink;
+use wezterm_term::{DeferredScrollbackTrim, Terminal, TerminalConfiguration, TerminalSize};
 
 const ROWS: usize = 40;
 const COLS: usize = 120;
@@ -60,8 +70,26 @@ fn corpus(rows: usize, width: usize) -> Vec<u8> {
     out
 }
 
-fn run(arm: Arm, data: &[u8], serial: u8) -> (f64, Option<std::path::PathBuf>) {
+/// `LocalPane::drain_scrollback_outside_terminal` after a parse batch, minus
+/// its lock handoffs and its wait for queue capacity.
+fn drain_like_a_pane(terminal: &mut Terminal, sink: &Arc<dyn ScrollbackSpillSink>) {
+    while matches!(
+        terminal.trim_deferred_scrollback(),
+        DeferredScrollbackTrim::Yielded
+    ) {}
+    // Errors are counted by the sink; the bench only needs the handoff.
+    let _ = sink.request_scrollback_flush();
+}
+
+struct RunResult {
+    secs: f64,
+    kept: Option<std::path::PathBuf>,
+    gap_rows: u64,
+}
+
+fn run(arm: Arm, data: &[u8], serial: u8) -> RunResult {
     let mut kept = None;
+    let mut handoff: Option<Arc<dyn ScrollbackSpillSink>> = None;
     let term_config: Arc<dyn TerminalConfiguration + Send + Sync> = match arm {
         Arm::Store => {
             config::use_this_configuration(config::Config::default_config());
@@ -80,6 +108,7 @@ fn run(arm: Arm, data: &[u8], serial: u8) -> (f64, Option<std::path::PathBuf>) {
                 frankenterm_mux_server_impl::open_scrollback_spill_sink(dir.clone(), &context)
                     .expect("open the durable scrollback store");
             kept = Some(dir);
+            handoff = Some(Arc::clone(&sink));
             Arc::new(config::TermConfig::with_config_and_scrollback_spill_sink(
                 config::configuration(),
                 Some(sink),
@@ -109,11 +138,20 @@ fn run(arm: Arm, data: &[u8], serial: u8) -> (f64, Option<std::path::PathBuf>) {
         "scrollback-ingest-bench",
         Box::new(std::io::sink()),
     );
+    let gaps_before = DurabilityLedger::global().snapshot().gap_rows_total;
     let start = Instant::now();
     for chunk in data.chunks(CHUNK) {
         terminal.advance_bytes(chunk);
+        if let Some(sink) = &handoff {
+            drain_like_a_pane(&mut terminal, sink);
+        }
     }
-    (start.elapsed().as_secs_f64(), kept)
+    let secs = start.elapsed().as_secs_f64();
+    RunResult {
+        secs,
+        kept,
+        gap_rows: DurabilityLedger::global().snapshot().gap_rows_total - gaps_before,
+    }
 }
 
 fn median(values: &mut [f64]) -> f64 {
@@ -147,14 +185,17 @@ fn main() {
         };
         for index in order {
             serial = serial.wrapping_add(1);
-            let (elapsed, kept) = run(arms[index], &data, serial);
+            let result = run(arms[index], &data, serial);
             eprintln!(
-                "round {round} {:>8}: {elapsed:.3} s{}",
+                "round {round} {:>8}: {:.3} s{}",
                 arms[index].name(),
-                kept.map(|dir| format!(" (store {})", dir.display()))
+                result.secs,
+                result
+                    .kept
+                    .map(|dir| format!(" ({} gap rows; store {})", result.gap_rows, dir.display()))
                     .unwrap_or_default()
             );
-            secs[index].push(elapsed);
+            secs[index].push(result.secs);
         }
     }
     let base = median(&mut secs[2].clone());
