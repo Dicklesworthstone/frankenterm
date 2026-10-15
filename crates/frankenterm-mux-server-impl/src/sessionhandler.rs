@@ -248,6 +248,12 @@ const RPC_READ_TERMINAL_WAIT: std::time::Duration = std::time::Duration::from_mi
 /// [`WINDOW`](push_wait_budget::WINDOW): one flooding pane gets the full
 /// rate, while many cannot take more than an eighth of the main thread.
 /// Past the budget a push only tries the lock, as before.
+///
+/// While this thread committed key or text input within
+/// [`INPUT_QUIET`](push_wait_budget::INPUT_QUIET), pushes only try the lock:
+/// a waiting push delays the next keystroke's dispatch. In a swarm-echo A/B
+/// (vmi1156319, 6 pairs) waiting pushes added ~2 ms to the p50 echo and 6-11
+/// ms to the p90 in 3 of 4 comparable pairs.
 mod push_wait_budget {
     use std::cell::Cell;
     use std::time::{Duration, Instant};
@@ -256,14 +262,29 @@ mod push_wait_budget {
     pub(super) const WINDOW: Duration = Duration::from_millis(16);
     /// Time waiting pushes may take per window.
     pub(super) const BUDGET: Duration = Duration::from_millis(2);
+    /// How long after committed input pushes only try the lock.
+    pub(super) const INPUT_QUIET: Duration = super::PANE_PUSH_INTERACTIVE_WINDOW;
 
     thread_local! {
         static SPENT: Cell<(Option<Instant>, Duration)> = const { Cell::new((None, Duration::ZERO)) };
+        /// When this thread last committed key or text input.
+        static LAST_INPUT: Cell<Option<Instant>> = const { Cell::new(None) };
+    }
+
+    /// Records committed key or text input on this thread.
+    pub(super) fn note_input() {
+        LAST_INPUT.with(|last| last.set(Some(Instant::now())));
     }
 
     /// The terminal-lock wait for the next push on this thread.
     pub(super) fn terminal_wait() -> Duration {
         let now = Instant::now();
+        let typing = LAST_INPUT
+            .with(Cell::get)
+            .is_some_and(|at| now.duration_since(at) < INPUT_QUIET);
+        if typing {
+            return Duration::ZERO;
+        }
         SPENT.with(|spent| {
             let (started, used) = spent.get();
             let fresh = started.is_none_or(|started| now.duration_since(started) >= WINDOW);
@@ -303,6 +324,16 @@ mod push_wait_budget {
                 spent.set((started.and_then(|s| s.checked_sub(WINDOW)), used));
             });
             assert!(!terminal_wait().is_zero(), "a new window restores it");
+        }
+
+        #[test]
+        fn pushes_only_try_the_lock_while_input_is_recent() {
+            SPENT.with(|spent| spent.set((None, Duration::ZERO)));
+            assert!(!terminal_wait().is_zero());
+            note_input();
+            assert!(terminal_wait().is_zero(), "input just committed: try only");
+            LAST_INPUT.with(|last| last.set(Instant::now().checked_sub(INPUT_QUIET)));
+            assert!(!terminal_wait().is_zero(), "input went quiet: wait again");
         }
     }
 }
@@ -3648,6 +3679,7 @@ struct PaneInputActivity {
 
 impl PaneInputActivity {
     fn mark(&self) {
+        push_wait_budget::note_input();
         if let Some(coordinator) = self.coordinator.upgrade() {
             coordinator.mark_interactive(self.pane_id);
         }

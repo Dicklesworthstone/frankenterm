@@ -491,6 +491,29 @@ mod deferred_scrollback {
     const RETRY_BACKOFF_MIN: Duration = Duration::from_millis(100);
     const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(2);
     pub const DURABILITY_THREAD_NAME: &str = "scrollback-durability";
+    pub const SHED_RELEASE_THREAD_NAME: &str = "scrollback-shed-release";
+
+    /// Frees `garbage` on the shed-release thread instead of the caller's, or
+    /// here if that thread cannot run. Rows shed into an overload gap are
+    /// released this way: the admitting parser holds its pane's terminal
+    /// lock, and freeing one shed (~75k rows) there held it 53 ms in a debug
+    /// build. On a loaded host every read of that pane, through 6 retries
+    /// over ~161 ms, got resource_busy (ft-4p4uo).
+    fn release_off_thread(garbage: Box<dyn Send>) {
+        static RELEASE: OnceLock<Option<std::sync::mpsc::Sender<Box<dyn Send>>>> = OnceLock::new();
+        let sender = RELEASE.get_or_init(|| {
+            let (sender, receiver) = std::sync::mpsc::channel::<Box<dyn Send>>();
+            std::thread::Builder::new()
+                .name(SHED_RELEASE_THREAD_NAME.to_string())
+                .spawn(move || receiver.into_iter().for_each(drop))
+                .ok()
+                .map(|_| sender)
+        });
+        if let Some(sender) = sender {
+            // Fails only once the thread is gone; the garbage is freed here.
+            let _ = sender.send(garbage);
+        }
+    }
 
     /// The single thread that performs durable scrollback IO for every pane.
     ///
@@ -1941,8 +1964,11 @@ mod deferred_scrollback {
             if close_window {
                 self.writer.expedite(self);
             }
-            // Last-reference Line destruction happens outside the state lock.
-            drop(dropped);
+            // Shed rows are the last references to their Lines: free them
+            // outside the state lock and off this (terminal-holding) thread.
+            if !dropped.is_empty() {
+                release_off_thread(Box::new(dropped));
+            }
             if !gaps.is_empty() {
                 self.report_gaps(&gaps, entered_overload);
             }
@@ -3380,6 +3406,68 @@ mod deferred_scrollback {
             "caught up below half the budget"
         );
         assert_eq!(sink.durability_failure(), None);
+    }
+
+    #[test]
+    fn shed_rows_are_freed_off_the_admitting_thread() {
+        use wezterm_term::CellAttributes;
+
+        /// Parks the release thread until the test opens it, so rows an
+        /// admission handed over are observably still alive.
+        struct Gate(std::sync::mpsc::Receiver<()>);
+        impl Drop for Gate {
+            fn drop(&mut self) {
+                let _ = self.0.recv_timeout(Duration::from_secs(10));
+            }
+        }
+
+        let (_dir, _backing, deferred) = super::tests::deferred_test_sink();
+        // Every live copy of a row holds this link, so its count tracks them.
+        let hyperlink = Arc::new(termwiz::cell::Hyperlink::new_with_id(
+            "https://shed.example/",
+            "shed",
+        ));
+        let mut attrs = CellAttributes::blank();
+        attrs.set_hyperlink(Some(Arc::clone(&hyperlink)));
+        let line = |row: StableRowIndex| Line::from_text(&format!("shed {row}"), &attrs, 0, None);
+        let charge = DeferredScrollbackSpillSink::row_charge(&line(99)).unwrap();
+        deferred.writer.set_queue_budget(charge * 1_000);
+        for row in 0..100 {
+            assert!(deferred.store_scrollback_line(row, &line(row), 10_000));
+        }
+        let queued = Arc::strong_count(&hyperlink);
+        let (open, gate) = std::sync::mpsc::channel();
+        release_off_thread(Box::new(Gate(gate)));
+
+        // Over budget, the oldest queued rows become a gap.
+        deferred.writer.set_queue_budget(charge * 50);
+        assert!(deferred.store_scrollback_line(100, &line(100), 10_000));
+        let shed = deferred
+            .state
+            .lock()
+            .unwrap()
+            .pending
+            .iter()
+            .filter_map(|entry| match entry {
+                Pending::Gap(gap) => Some(gap.rows()),
+                Pending::Row(_) => None,
+            })
+            .sum::<StableRowIndex>();
+        assert!(shed >= 50, "the admission shed {shed} rows");
+        assert!(
+            Arc::strong_count(&hyperlink) > queued,
+            "the admitting thread freed the shed rows itself"
+        );
+
+        open.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&hyperlink) > queued / 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            Arc::strong_count(&hyperlink) <= queued / 2,
+            "the release thread frees the shed rows"
+        );
     }
 
     #[test]
