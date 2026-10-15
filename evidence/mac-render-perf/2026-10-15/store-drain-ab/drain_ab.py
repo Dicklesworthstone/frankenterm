@@ -13,6 +13,9 @@ launched with `open -g -n`, and is stopped by the exact pid found by that
 HOME. Run directories are kept (AGENTS.md RULE 1).
 
 usage: drain_ab.py APP CORPUS ROUNDS [label]
+With DA_ARMS="name=APP:on|off,..." the runs rotate through those arms
+instead (each round reverses the previous order), e.g. two builds' store-on
+arms beside one build's store-off arm.
 """
 import json
 import os
@@ -94,8 +97,9 @@ def du_mb(path):
     return int(out.split()[0]) // 1024 if out else -1
 
 
-def run(arm):
-    d = tempfile.mkdtemp(prefix=f'ftda.{arm}.', dir='/tmp')
+def run(arm, app=APP, name=None):
+    name = name or arm
+    d = tempfile.mkdtemp(prefix=f'ftda.{name}.', dir='/tmp')
     conf, home, out = os.path.join(d, 'c.lua'), os.path.join(d, 'home'), os.path.join(d, 'secs')
     os.makedirs(home)
     with open(conf, 'w') as f:
@@ -106,7 +110,7 @@ def run(arm):
                     '--env', f'FT_DA_OUT={out}', '--env', f'FT_DA_ARM={arm}',
                     '--env', f'FT_CV_Y={os.environ.get("FT_CV_Y", "")}',
                     '--env', 'RUST_LOG=warn', '--stderr', f'{home}/err',
-                    '-a', APP, '--args', '--config-file', conf, 'start'], check=True)
+                    '-a', app, '--args', '--config-file', conf, 'start'], check=True)
     pid = None
     for _ in range(80):
         pid = gui_pid(home)
@@ -136,11 +140,28 @@ def run(arm):
     fps = None
     if snap and snap.get('frames'):
         fps = snap['frames'].get('presented_total')
-    return {'arm': arm, 'secs': secs, 'load_1m': round(load, 2), 'dir': d,
+    return {'arm': name, 'secs': secs, 'load_1m': round(load, 2), 'dir': d,
             'dir_mb': du_mb(d), 'presented_total': fps}
 
 
 results = []
+ARMS = [a for a in os.environ.get('DA_ARMS', '').split(',') if a]
+if ARMS:
+    arms = []
+    for spec in ARMS:
+        name, rest = spec.split('=', 1)
+        app, store = rest.rsplit(':', 1)
+        arms.append((name, app, store))
+    for r in range(ROUNDS):
+        for name, app, store in (arms if r % 2 == 0 else arms[::-1]):
+            rec = run(store, app, name)
+            rec.update(label=LABEL, round=r)
+            results.append(rec)
+            print(json.dumps(rec), flush=True)
+    for name, _, _ in arms:
+        v = sorted(x['secs'] for x in results if x['arm'] == name)
+        print(f'{LABEL}: {name} median {v[len(v) // 2] if len(v) % 2 else (v[len(v) // 2 - 1] + v[len(v) // 2]) / 2:.3f} s {v}', flush=True)
+    sys.exit(0)
 for r in range(ROUNDS):
     order = ('on', 'off') if r % 2 == 0 else ('off', 'on')
     for arm in order:

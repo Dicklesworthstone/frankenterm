@@ -86,3 +86,33 @@ admission. The sampled 38% share of the clock overstated its cost, because
 an `isb`-fenced counter read attracts samples. What remains per row is the
 line clone into the queue (25% of admission), its box (10%), the locks and
 queue push, and freeing cold-geometry pages.
+
+## After both changes: GUI, three arms in one session
+
+These runs are on mac-mini-max with load 9-13, using `drain_ab.py` with
+`DA_ARMS` so that every round runs the three arms below and each round
+reverses the previous one's order:
+
+- bundle 0a4d33e with the store on;
+- bundle fad26a2 (c7560a181 + fad26a293) with the store on;
+- bundle fad26a2 with the store off.
+
+Raw records are in `gui-runs-3arm.txt`.
+
+| corpus | 0a4d33e on | fad26a2 on | fad26a2 off | on/off before -> after | store's added drain time |
+|---|---|---|---|---|---|
+| `seq 1 20000000` | 21.115 s | 19.140 s | 14.810 s | 1.43 -> 1.29 | 6.3 s -> 4.3 s (-32%) |
+| `seq 1 2000000` | 2.099 s | 1.924 s | 1.575 s | 1.33 -> 1.22 | 0.52 s -> 0.35 s (-33%) |
+
+The old store-on arm ran faster here than it did in the first session
+(21.1 s against 25.1 s on the same corpus). The host was less loaded, so
+only within-session comparisons count.
+
+**The A1.8 gate still fails on line output** (1.22-1.29 against 1.05). The
+remaining cost is about 215 ns per 20M-run row, the same as the in-process
+bench's store-minus-untiered gap (~180 ns). That cost is per-row work on the
+parse thread under the terminal lock: admission into the queue, the line
+clone, cold-geometry capture and page frees. Meeting 1.05 needs that work
+off the parse thread, for example batched admission per lock hold, with
+geometry captured on the durability writer. Micro-optimizing this path is
+not enough.
