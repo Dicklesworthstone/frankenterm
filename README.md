@@ -372,6 +372,7 @@ Honest status of every shipped surface, without migration-era hand-waving.
 | Reality-check + attestation | **Supported** | `ft attestation verify` / `show` ship as a thin Rust wrapper over `scripts/attestation-verify.sh`. Signed bundles live in `docs/attestations/` |
 | Deferred proof queue | **Supported with fail-closed proof prerequisite** | `ft proof queue/status/replay/attach` and `ft robot proof status` expose source-landed proof intents. Replay executes only through remote-required RCH when admission is explicitly `admitted`; local Cargo is never substituted. Release-slot evidence stays under `docs/attestations/proofs/deferred-proof-replay.json`; current W8.2 remote proof remains blocked on RCH admission. |
 | Web API / SSE | **Supported (`web` feature, on by default)** | `/health`, `/panes`, `/events`, `/search`, `/stream/events`, `/stream/deltas` |
+| Browser fleet viewer | **Preview: read-only, loopback only** | `ft web --ui-dir <package>` serves a FrankenTUI WASM viewer of panes and live detections at `/ui/` ([Browser fleet viewer](#browser-fleet-viewer-preview)). No authentication, Tailscale mode, terminal attach or DSR-packaged asset set yet; those are tracked under `ft-browser-frankenterm-7z4il` |
 | Distributed mode | **Supported (`distributed` feature, on by default)** | Remote panes persist into the same DB and surface through status/search/state; live `get-text` for distributed panes is intentionally unavailable |
 | MCP server | **Supported (`mcp` feature, on by default)** | stdio tool surface; per-family Robot parity is scoped in [`docs/robot-contracts/mcp-robot-surface-matrix.md`](docs/robot-contracts/mcp-robot-surface-matrix.md) |
 | Semantic search | **Supported (hash embeddings)** | Hybrid mode fuses FTS5 with a built-in FNV-1a hash-embedding lane via RRF; fastembed/ML models and a Tantivy index are not on the production path |
@@ -1100,6 +1101,19 @@ curl -N "http://127.0.0.1:8000/stream/deltas?pane_id=3&max_hz=50"
 Streaming query parameters: `pane_id` filters to one pane; `max_hz` caps delivery rate for backpressure control; `/stream/events` also accepts `channel=all|deltas|detections|signals`. Streaming responses use schema `ft.stream.v1`, send keepalive comments when idle, emit `lag` frames when a slow client misses events, and redact secret material before emission.
 
 `/stream/events` has two event sources. Standalone `ft web` tails detections that a watcher persists to the same database (250 ms poll; `FT_WEB_STORAGE_TAIL=0` disables it). `ft watch --web [--web-port N]` runs the API inside the watcher and streams its live event bus directly, with no polling delay.
+
+#### Browser fleet viewer (preview)
+
+`ft web --ui-dir <package>` (or `FT_WEB_UI_DIR`, or `ft watch --web --web-ui-dir <package>`) also serves a read-only fleet viewer at `/ui/`: a FrankenTUI model compiled to WebAssembly, painted by the FrankenTerm WebGPU renderer from frankentui. It lists the recorded panes, shows recent and live detections from `/stream/events`, and marks the stream live, connecting or offline with the age of its data. Keys: `Tab`/`1`/`2` switch views, `j`/`k` move, `r` refetches. It never writes to a pane.
+
+```bash
+RCH_CARGO_WRAPPER_BYPASS=1 scripts/build-browser-ui.sh /tmp/ft-ui    # needs the wasm32 target and wasm-bindgen 0.2.128
+ft web --ui-dir /tmp/ft-ui/site                                       # then open http://127.0.0.1:8000/ui/
+```
+
+The build script fetches the renderer's last source revision from the frankentui repository, checks the archive's SHA-256, and builds it with the dependency lock vendored in `crates/frankenterm-browser-ui/renderer.lock`. The package's `manifest.json` records every file's SHA-256. At startup `ft web` reads exactly those files, checks each digest, and serves them from memory: a tampered or incomplete package stops startup, and no request path reaches the filesystem. The page carries a same-origin Content-Security-Policy. WebGPU is required; browsers without it show an error instead of a blank page. `tests/e2e/test_browser_fleet_viewer.sh` drives a real headless Chrome against a viewer fed by the headless capture-and-detect smoke.
+
+The server is still loopback-only and unauthenticated, so the viewer is for the local machine (or a tunnel you control). Authenticated tailnet access, terminal attach and DSR packaging are the open milestones of `ft-browser-frankenterm-7z4il`.
 
 `ft web` runs no capture pipeline of its own. `/stream/events` is fed by a storage tail: the server follows newly persisted `events` rows written by the watcher (another process) and republishes them on its in-process bus, so a detection reaches SSE clients within one poll interval (250 ms) after `ft watch` stores it. The tail starts after the newest existing row, so a restart never replays history. Embedders that publish to the same bus in-process can disable it with `WebServerConfig::with_storage_event_tail(false)`.
 

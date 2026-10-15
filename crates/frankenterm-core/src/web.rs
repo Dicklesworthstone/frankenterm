@@ -30,6 +30,7 @@ mod openapi;
 mod router;
 mod server;
 mod sse;
+mod ui_assets;
 mod websocket;
 
 pub use extractors::redact_depth_limit_hit_count;
@@ -38,6 +39,7 @@ pub use server::{run_web_server_with_cx, start_web_server_with_cx};
 pub use sse::{
     epoch_clock_anomaly_count, sse_events_dropped_count, sse_streams_terminated_by_drop_cap_count,
 };
+pub use ui_assets::{UI_PACKAGE_SCHEMA, UiAsset, UiAssetError, UiAssetSet};
 
 #[cfg(test)]
 use crate::VERSION;
@@ -159,6 +161,8 @@ pub struct WebServerConfig {
     /// processes, so the durable table is the bridge (ft-zeo5o). Disable when
     /// an in-process producer already publishes to the same bus.
     storage_event_tail: bool,
+    /// The verified browser fleet viewer package served under `/ui/`.
+    ui_assets: Option<Arc<UiAssetSet>>,
 }
 
 impl std::fmt::Debug for WebServerConfig {
@@ -171,6 +175,10 @@ impl std::fmt::Debug for WebServerConfig {
             .field("event_bus", &self.event_bus.is_some())
             .field("allow_public_bind", &self.allow_public_bind)
             .field("storage_event_tail", &self.storage_event_tail)
+            .field(
+                "ui_assets",
+                &self.ui_assets.as_ref().map(|set| set.manifest_sha256()),
+            )
             .finish()
     }
 }
@@ -187,7 +195,15 @@ impl WebServerConfig {
             event_bus: None,
             allow_public_bind: false,
             storage_event_tail: true,
+            ui_assets: None,
         }
+    }
+
+    /// Serve a verified browser fleet viewer package under `/ui/`.
+    #[must_use]
+    pub fn with_ui_assets(mut self, ui_assets: Arc<UiAssetSet>) -> Self {
+        self.ui_assets = Some(ui_assets);
+        self
     }
 
     /// Override the port.
@@ -465,8 +481,9 @@ fn build_app(
     event_bus: Option<Arc<EventBus>>,
     runtime_limits: WebRuntimeLimits,
     event_source: &'static str,
+    ui_assets: Option<Arc<UiAssetSet>>,
 ) -> App {
-    router::build_app(storage, event_bus, runtime_limits, event_source)
+    router::build_app(storage, event_bus, runtime_limits, event_source, ui_assets)
 }
 
 #[cfg(test)]

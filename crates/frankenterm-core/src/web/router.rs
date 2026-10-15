@@ -10,10 +10,14 @@ use super::handlers::{
 };
 use super::middleware::{AppState, BodySizeGuard, RequestSpanLogger, StateInjector};
 use super::sse::{handle_stream_deltas, handle_stream_events};
+use super::ui_assets::UiAssetSet;
 use crate::events::EventBus;
 use crate::policy::Redactor;
 use crate::storage::StorageHandle;
-use crate::web_framework::{App, AppConfig, Method, Request, RequestContext, WebStreamLifecycle};
+use crate::web_framework::{
+    App, AppBuilder, AppConfig, Method, Request, RequestContext, Response, ResponseBody,
+    StatusCode, WebStreamLifecycle,
+};
 use std::sync::Arc;
 
 pub(super) fn build_app(
@@ -21,6 +25,7 @@ pub(super) fn build_app(
     event_bus: Option<Arc<EventBus>>,
     runtime_limits: WebRuntimeLimits,
     event_source: &'static str,
+    ui_assets: Option<Arc<UiAssetSet>>,
 ) -> App {
     let streams = WebStreamLifecycle::new();
     let state = AppState {
@@ -30,7 +35,7 @@ pub(super) fn build_app(
         runtime_limits,
     };
 
-    App::builder()
+    let builder = App::builder()
         // The framework's own body cap (and, through it, the server's parser
         // bound) is the advertised limit, not the framework's 1 MiB default.
         .config(AppConfig::new().max_body_size(runtime_limits.max_request_body_bytes))
@@ -86,6 +91,43 @@ pub(super) fn build_app(
             "/stream/deltas",
             Method::Get,
             |_ctx: &RequestContext, req: &mut Request| handle_stream_deltas(req),
-        )
-        .build()
+        );
+    match ui_assets {
+        Some(ui) => with_ui_routes(builder, &ui).build(),
+        None => builder.build(),
+    }
+}
+
+/// Serve the browser fleet viewer: every manifest file at `/ui/<path>`, and
+/// the page itself at `/ui/`.
+fn with_ui_routes(mut builder: AppBuilder, ui: &Arc<UiAssetSet>) -> AppBuilder {
+    for path in ui.paths().map(str::to_owned).collect::<Vec<_>>() {
+        let set = Arc::clone(ui);
+        let route = format!("/ui/{path}");
+        builder = builder.route(
+            route,
+            Method::Get,
+            move |_ctx: &RequestContext, _req: &mut Request| {
+                let response = set.response(&path);
+                async move { response }
+            },
+        );
+    }
+    let set = Arc::clone(ui);
+    builder.route(
+        "/ui/",
+        Method::Get,
+        move |_ctx: &RequestContext, req: &mut Request| {
+            // The router ignores trailing slashes, but the page's relative
+            // asset URLs resolve against `/` without one: send `/ui` to `/ui/`.
+            let response = if req.path().ends_with('/') {
+                set.response("index.html")
+            } else {
+                Response::with_status(StatusCode::PERMANENT_REDIRECT)
+                    .header("location", b"/ui/".to_vec())
+                    .body(ResponseBody::Bytes(Vec::new()))
+            };
+            async move { response }
+        },
+    )
 }

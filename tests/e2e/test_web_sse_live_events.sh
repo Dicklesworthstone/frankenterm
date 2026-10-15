@@ -15,7 +15,13 @@
 # Usage: tests/e2e/test_web_sse_live_events.sh [BIN_DIR] [PORT]
 #   BIN_DIR defaults to target/debug (needs ft + frankenterm-mux-server, built
 #   with the `web` feature); PORT defaults to 18777.
-# Writes receipt.json + web.log + stream.txt into a fresh workspace dir.
+# Writes receipt.json + web.log + stream.txt into a fresh harness dir.
+#
+# The smoke refuses a non-empty evidence directory (824c3c4db), so it gets a
+# fresh workspace of its own and `ft web` joins that workspace once the
+# smoke's watcher has created the database. The watcher then still has to
+# list, send, capture and detect, so the subscriptions below are in place
+# before the detection is persisted, as before.
 set -u
 BIN_DIR="${1:-target/debug}"
 PORT="${2:-18777}"
@@ -25,19 +31,24 @@ HERE=$(cd "$(dirname "$0")/../.." && pwd)
 SMOKE="$HERE/scripts/smoke/headless-mux-observe.sh"
 [ -x "$SMOKE" ] || { echo "missing smoke script: $SMOKE" >&2; exit 2; }
 
-D=$(mktemp -d "${TMPDIR:-/tmp}/ft-sse-XXXXXX")
-mkdir -p "$D/.ft"; chmod 700 "$D/.ft"
-printf '[storage]\ndb_path = "ft.db"\n' > "$D/ft.toml"; chmod 600 "$D/ft.toml"
-echo "workspace: $D"
+D=$(mktemp -d "${TMPDIR:-/tmp}/ft-sse-XXXXXX")     # harness files
+W=$(mktemp -d "${TMPDIR:-/tmp}/ft-sse-ws-XXXXXX")  # the producer's workspace
+echo "harness: $D"
+echo "workspace: $W"
 
-export FT_WORKSPACE="$D"
-"$FT" -c "$D/ft.toml" web --port "$PORT" > "$D/web.log" 2>&1 &
+# Producer: the real pipeline (mux server + watcher + send + detect).
+( "$SMOKE" "$BIN_DIR" "$W" > "$D/producer.log" 2>&1; echo $? > "$D/producer.exit" ) &
+PRODUCER_JOB=$!
+for _ in $(seq 1 300); do [ -f "$W/.ft/ft.db" ] && break; sleep 0.2; done
+[ -f "$W/.ft/ft.db" ] || { echo "the producer never created its database: $(tail -3 "$D/producer.log")" >&2; wait "$PRODUCER_JOB"; exit 1; }
+
+"$FT" -c "$W/ft.toml" --workspace "$W" web --port "$PORT" > "$D/web.log" 2>&1 &
 WEB=$!
 # Readiness: the server logs "ft web listening on" once bound (a debug build can
 # take several seconds to open storage first). Never probe with an unbounded curl.
 for _ in $(seq 1 150); do grep -q 'ft web listening on' "$D/web.log" 2>/dev/null && break; sleep 0.2; done
-grep -q 'ft web listening on' "$D/web.log" || { echo "ft web never listened: $(tail -3 "$D/web.log")" >&2; kill "$WEB" 2>/dev/null; exit 1; }
-# Subscribe before the producer runs; the tail republishes rows persisted after it started.
+grep -q 'ft web listening on' "$D/web.log" || { echo "ft web never listened: $(tail -3 "$D/web.log")" >&2; kill "$WEB" 2>/dev/null; wait "$PRODUCER_JOB"; exit 1; }
+# The tail republishes rows persisted after the server started.
 curl -s -N --max-time 60 "http://127.0.0.1:$PORT/stream/events" > "$D/stream.txt" 2> "$D/curl.err" &
 CURL=$!
 # Second mode: /stream/deltas is DB-backed (periodic segment scans, all panes
@@ -45,11 +56,9 @@ CURL=$!
 # `delta` frames on a standalone ft web too.
 curl -s -N --max-time 60 "http://127.0.0.1:$PORT/stream/deltas" > "$D/deltas.txt" 2> "$D/curl-deltas.err" &
 CURL_DELTAS=$!
-sleep 1
 
-# Producer: the real pipeline (mux server + watcher + send + detect) in the SAME workspace.
-"$SMOKE" "$BIN_DIR" "$D" > "$D/producer.log" 2>&1
-PRODUCER=$?
+wait "$PRODUCER_JOB"
+PRODUCER=$(cat "$D/producer.exit" 2>/dev/null || echo 2)
 
 # Give the tail one poll interval plus slack, then stop.
 sleep 3

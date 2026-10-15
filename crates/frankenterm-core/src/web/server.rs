@@ -215,6 +215,7 @@ pub async fn start_web_server_with_cx(
         config.event_bus,
         runtime_limits,
         event_source,
+        config.ui_assets,
     );
     let (local_addr, runtime) = FrameworkWebRuntime::start_with_cx(cx, bind_addr, app).await?;
 

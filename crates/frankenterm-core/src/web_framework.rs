@@ -13,8 +13,6 @@ use std::time::Duration;
 use tracing::warn;
 
 #[allow(unused_imports)]
-pub(crate) use fastapi::AppConfig;
-#[allow(unused_imports)]
 pub(crate) use fastapi::core::{
     BoxFuture, ControlFlow, Cx, Middleware, OpenApiConfig, StartupOutcome,
 };
@@ -22,6 +20,8 @@ pub(crate) use fastapi::core::{
 pub(crate) use fastapi::http::{ParseLimits, QueryString};
 #[allow(unused_imports)]
 pub(crate) use fastapi::prelude::{App, Method, Request, RequestContext, Response, StatusCode};
+#[allow(unused_imports)]
+pub(crate) use fastapi::{AppBuilder, AppConfig};
 #[allow(unused_imports)]
 pub(crate) use fastapi::{ResponseBody, ServerConfig, ServerError, TcpServer};
 

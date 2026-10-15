@@ -4,6 +4,7 @@ members = [
     "crates/frankenterm",
     "crates/frankenterm-build-identity",
     "crates/frankenterm-core",
+    "crates/frankenterm-browser-ui",
     "crates/frankenterm-redactor",
     "crates/frankenterm-core-ars",
     "crates/frankenterm-core-tantivy",

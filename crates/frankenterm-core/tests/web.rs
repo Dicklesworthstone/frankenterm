@@ -323,6 +323,123 @@ mod web_tests {
         });
     }
 
+    fn header_value<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
+        let head = raw.split_once("\r\n\r\n").map_or(raw, |(head, _)| head);
+        head.lines().skip(1).find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
+
+    async fn fetch_path(addr: SocketAddr, path: &str) -> std::io::Result<String> {
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        fetch_raw(addr, request.as_bytes()).await
+    }
+
+    /// `ft web --ui-dir` serves exactly the manifest's verified files under
+    /// `/ui/`, beside an unchanged API; nothing else on disk is reachable.
+    #[test]
+    fn web_serves_verified_ui_package_beside_the_api() {
+        use frankenterm_core::web::{UI_PACKAGE_SCHEMA, UiAssetSet};
+        use sha2::{Digest, Sha256};
+
+        let package = tempfile::tempdir().unwrap();
+        let files: &[(&str, &str)] = &[
+            ("index.html", "<!doctype html><title>fleet viewer</title>"),
+            ("app.mjs", "export const viewer = true;"),
+            ("pkg/viewer_bg.wasm", "wasm-module-bytes"),
+        ];
+        let mut listed = serde_json::Map::new();
+        for (rel, text) in files {
+            let path = package.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            listed.insert(
+                (*rel).to_string(),
+                hex::encode(Sha256::digest(text.as_bytes())).into(),
+            );
+        }
+        std::fs::write(
+            package.path().join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({"schema": UI_PACKAGE_SCHEMA, "files": listed}))
+                .unwrap(),
+        )
+        .unwrap();
+        // On disk inside the package directory, but not in the manifest.
+        std::fs::write(package.path().join("secret.txt"), "never served").unwrap();
+        let set = Arc::new(UiAssetSet::load(package.path()).expect("package verifies"));
+
+        run_async_test(async move {
+            let server =
+                start_web_server(WebServerConfig::default().with_port(0).with_ui_assets(set))
+                    .await
+                    .unwrap();
+            let addr = server.bound_addr();
+            let index = fetch_path(addr, "/ui/").await;
+            let bare = fetch_path(addr, "/ui").await;
+            let module = fetch_path(addr, "/ui/app.mjs").await;
+            let wasm = fetch_path(addr, "/ui/pkg/viewer_bg.wasm").await;
+            let unlisted = fetch_path(addr, "/ui/secret.txt").await;
+            let manifest = fetch_path(addr, "/ui/manifest.json").await;
+            let health = fetch_health(addr).await;
+            server.shutdown().await.unwrap();
+
+            let index = index.unwrap();
+            assert_eq!(extract_status(&index), 200, "{index}");
+            assert_eq!(extract_body(&index), files[0].1);
+            assert_eq!(
+                header_value(&index, "content-type"),
+                Some("text/html; charset=utf-8")
+            );
+            let csp = header_value(&index, "content-security-policy").expect("CSP on the page");
+            assert!(
+                csp.contains("script-src 'self' 'wasm-unsafe-eval'"),
+                "{csp}"
+            );
+            assert_eq!(header_value(&index, "x-frame-options"), Some("DENY"));
+
+            let bare = bare.unwrap();
+            assert_eq!(extract_status(&bare), 308, "{bare}");
+            assert_eq!(header_value(&bare, "location"), Some("/ui/"));
+
+            let module = module.unwrap();
+            assert_eq!(extract_status(&module), 200);
+            assert_eq!(
+                header_value(&module, "content-type"),
+                Some("text/javascript; charset=utf-8")
+            );
+            assert_eq!(
+                header_value(&module, "x-content-type-options"),
+                Some("nosniff")
+            );
+            let wasm = wasm.unwrap();
+            assert_eq!(
+                header_value(&wasm, "content-type"),
+                Some("application/wasm")
+            );
+            assert_eq!(extract_body(&wasm), files[2].1);
+
+            assert_eq!(extract_status(&unlisted.unwrap()), 404);
+            assert_eq!(extract_status(&manifest.unwrap()), 404);
+            assert_eq!(extract_status(&health.unwrap()), 200);
+        });
+    }
+
+    /// Without a package there is no `/ui/` at all.
+    #[test]
+    fn web_without_ui_package_has_no_ui_routes() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
+            let addr = server.bound_addr();
+            let index = fetch_path(addr, "/ui/").await;
+            server.shutdown().await.unwrap();
+            assert_eq!(extract_status(&index.unwrap()), 404);
+        });
+    }
+
     /// A chunked body carries no Content-Length, so only the parser's own
     /// bound can refuse it. That bound follows the advertised body cap
     /// (64 KiB + header allowance), not the framework's 1 MiB default.

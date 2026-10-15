@@ -530,6 +530,12 @@ SEE ALSO:
         #[arg(long, requires = "web")]
         web_port: Option<u16>,
 
+        /// Serve the browser fleet viewer at `/ui/` from this package
+        /// directory (built by scripts/build-browser-ui.sh)
+        #[cfg(feature = "web")]
+        #[arg(long, requires = "web", value_name = "DIR")]
+        web_ui_dir: Option<PathBuf>,
+
         /// Disable single-instance lock (DANGEROUS: may corrupt data)
         #[arg(long)]
         dangerous_disable_lock: bool,
@@ -2163,6 +2169,11 @@ SEE ALSO:
         /// Port override; defaults to [tuning.web] default_port
         #[arg(long)]
         port: Option<u16>,
+
+        /// Serve the browser fleet viewer at `/ui/` from this package
+        /// directory (built by scripts/build-browser-ui.sh)
+        #[arg(long, env = "FT_WEB_UI_DIR", value_name = "DIR")]
+        ui_dir: Option<PathBuf>,
     },
 
     /// Launch the interactive TUI (requires --features tui or --features ftui)
@@ -47062,20 +47073,43 @@ async fn run_distributed_agent(
     Ok(())
 }
 
-/// Run the observation watcher daemon with crash-loop backoff.
+/// Load and verify the browser fleet viewer package for `ft web --ui-dir` /
+/// `ft watch --web-ui-dir`. A package that fails verification stops startup:
+/// serving a partial or unverified viewer is worse than serving none.
+#[cfg(feature = "web")]
+fn load_web_ui_assets(
+    dir: Option<&Path>,
+) -> anyhow::Result<Option<Arc<frankenterm_core::web::UiAssetSet>>> {
+    let Some(dir) = dir else {
+        return Ok(None);
+    };
+    let set = frankenterm_core::web::UiAssetSet::load(dir)
+        .map_err(|error| anyhow::anyhow!("browser UI package {}: {error}", dir.display()))?;
+    tracing::info!(
+        files = set.len(),
+        manifest_sha256 = set.manifest_sha256(),
+        "Serving the browser fleet viewer at /ui/"
+    );
+    Ok(Some(Arc::new(set)))
+}
+
 /// How `ft watch` should serve the read-only web API, if at all.
 ///
 /// In-process serving is the only way a client sees an event at publish time:
 /// a standalone `ft web` has no in-process publisher and can only replay rows
 /// the watcher already persisted, at the storage tail's poll latency
 /// (ft-xxfwy.19).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 #[cfg_attr(not(feature = "web"), allow(dead_code))]
 struct WatcherWebOptions {
     enabled: bool,
     port: Option<u16>,
+    /// Browser fleet viewer package, verified before the watcher starts.
+    #[cfg(feature = "web")]
+    ui_assets: Option<Arc<frankenterm_core::web::UiAssetSet>>,
 }
 
+/// Run the observation watcher daemon with crash-loop backoff.
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 async fn run_watcher_with_backoff(
     cx: &frankenterm_core::cx::Cx,
@@ -47109,7 +47143,7 @@ async fn run_watcher_with_backoff(
             notify_only,
             notify_filter.clone(),
             notify_via.clone(),
-            web,
+            web.clone(),
             disable_lock,
             dangerous_bind_any,
         ))
@@ -48154,7 +48188,7 @@ async fn run_watcher(
         let resolved_port = web
             .port
             .unwrap_or_else(|| frankenterm_core::web::resolve_port(Some(web_tuning)));
-        let web_config = frankenterm_core::web::WebServerConfig::new(resolved_port)
+        let mut web_config = frankenterm_core::web::WebServerConfig::new(resolved_port)
             .with_host(frankenterm_core::web::resolve_host(Some(web_tuning)))
             .with_runtime_limits(frankenterm_core::web::resolve_runtime_limits(Some(
                 web_tuning,
@@ -48162,6 +48196,9 @@ async fn run_watcher(
             .with_storage(handle.storage.clone())
             .with_event_bus(Arc::clone(&event_bus))
             .with_storage_event_tail(false);
+        if let Some(ui_assets) = &web.ui_assets {
+            web_config = web_config.with_ui_assets(Arc::clone(ui_assets));
+        }
         let web_cx =
             frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
         let server = frankenterm_core::web::start_web_server_with_cx(&web_cx, web_config)
@@ -50394,6 +50431,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             web,
             #[cfg(feature = "web")]
             web_port,
+            #[cfg(feature = "web")]
+            web_ui_dir,
             dangerous_disable_lock,
             dangerous_bind_any,
         }) => {
@@ -50408,6 +50447,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             let web_options = WatcherWebOptions {
                 enabled: web,
                 port: web_port,
+                ui_assets: load_web_ui_assets(web_ui_dir.as_deref())?,
             };
             #[cfg(not(feature = "web"))]
             let web_options = WatcherWebOptions::default();
@@ -72615,7 +72655,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
         }
 
         #[cfg(feature = "web")]
-        Some(Commands::Web { port }) => {
+        Some(Commands::Web { port, ui_dir }) => {
+            let ui_assets = load_web_ui_assets(ui_dir.as_deref())?;
             let db_path = layout.db_path.to_string_lossy();
             // ft-xbnl0.2.3 tick 298/300: cx-first web server storage + orchestrator.
             let web_cx = frankenterm_core::cx::Cx::current()
@@ -72626,7 +72667,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             let web_tuning = &config.tuning.web;
             let resolved_port =
                 port.unwrap_or_else(|| frankenterm_core::web::resolve_port(Some(web_tuning)));
-            let web_config = frankenterm_core::web::WebServerConfig::new(resolved_port)
+            let mut web_config = frankenterm_core::web::WebServerConfig::new(resolved_port)
                 .with_host(frankenterm_core::web::resolve_host(Some(web_tuning)))
                 .with_runtime_limits(frankenterm_core::web::resolve_runtime_limits(Some(
                     web_tuning,
@@ -72638,6 +72679,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 .with_storage_event_tail(
                     std::env::var("FT_WEB_STORAGE_TAIL").map_or(true, |value| value != "0"),
                 );
+            if let Some(ui_assets) = ui_assets {
+                web_config = web_config.with_ui_assets(ui_assets);
+            }
             frankenterm_core::web::run_web_server_with_cx(&web_cx, web_config).await?;
         }
 
@@ -100619,6 +100663,7 @@ async fn run_diagnostics_with_mux_client(
 
     // Check 7: Feature flags
     let features: Vec<&str> = [
+        (cfg!(feature = "ftui"), "ftui"),
         (cfg!(feature = "tui"), "tui"),
         (cfg!(feature = "ftui"), "ftui"),
         (cfg!(feature = "browser"), "browser"),

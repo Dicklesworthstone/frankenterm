@@ -1424,7 +1424,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "117725a109d387c937a1533ce01b450cbde6b88abceea8473c4d7a85853cda3c"
 dependencies = [
  "lazy_static",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2752,7 +2752,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3739,6 +3739,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankenterm-browser-ui"
+version = "0.15.21"
+dependencies = [
+ "ftui-core 0.9.0",
+ "ftui-render 0.9.0",
+ "ftui-runtime 0.9.0",
+ "ftui-web",
+ "getrandom 0.4.3",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "frankenterm-build-identity"
 version = "0.15.21"
 
@@ -3899,12 +3914,12 @@ dependencies = [
  "fs2",
  "ft-perf-gate",
  "ftui",
- "ftui-backend",
- "ftui-core",
- "ftui-layout",
- "ftui-render",
- "ftui-runtime",
- "ftui-style",
+ "ftui-backend 0.2.1",
+ "ftui-core 0.2.1",
+ "ftui-layout 0.2.1",
+ "ftui-render 0.2.1",
+ "ftui-runtime 0.2.1",
+ "ftui-style 0.2.1",
  "ftui-widgets",
  "futures",
  "half",
@@ -4792,7 +4807,7 @@ checksum = "94e7099f6313ecacbe1256e8ff9d617b75d1bcb16a6fddef94866d225a01a14a"
 dependencies = [
  "io-lifetimes 2.0.4",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4849,13 +4864,22 @@ name = "ftui"
 version = "0.2.1"
 source = "git+https://github.com/Dicklesworthstone/frankentui?rev=18facd3f2a2c51b8b06ff589e6b905e6a63f5a96#18facd3f2a2c51b8b06ff589e6b905e6a63f5a96"
 dependencies = [
- "ftui-core",
- "ftui-layout",
- "ftui-render",
- "ftui-runtime",
- "ftui-style",
- "ftui-text",
+ "ftui-core 0.2.1",
+ "ftui-layout 0.2.1",
+ "ftui-render 0.2.1",
+ "ftui-runtime 0.2.1",
+ "ftui-style 0.2.1",
+ "ftui-text 0.2.1",
  "ftui-widgets",
+]
+
+[[package]]
+name = "ftui-a11y"
+version = "0.9.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=befbd2471a1ec4a6b8ce0a0df32116c317cca9db#befbd2471a1ec4a6b8ce0a0df32116c317cca9db"
+dependencies = [
+ "ahash",
+ "ftui-core 0.9.0",
 ]
 
 [[package]]
@@ -4863,8 +4887,17 @@ name = "ftui-backend"
 version = "0.2.1"
 source = "git+https://github.com/Dicklesworthstone/frankentui?rev=18facd3f2a2c51b8b06ff589e6b905e6a63f5a96#18facd3f2a2c51b8b06ff589e6b905e6a63f5a96"
 dependencies = [
- "ftui-core",
- "ftui-render",
+ "ftui-core 0.2.1",
+ "ftui-render 0.2.1",
+]
+
+[[package]]
+name = "ftui-backend"
+version = "0.9.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=befbd2471a1ec4a6b8ce0a0df32116c317cca9db#befbd2471a1ec4a6b8ce0a0df32116c317cca9db"
+dependencies = [
+ "ftui-core 0.9.0",
+ "ftui-render 0.9.0",
 ]
 
 [[package]]
@@ -4884,18 +4917,54 @@ dependencies = [
 ]
 
 [[package]]
+name = "ftui-core"
+version = "0.9.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=befbd2471a1ec4a6b8ce0a0df32116c317cca9db#befbd2471a1ec4a6b8ce0a0df32116c317cca9db"
+dependencies = [
+ "ahash",
+ "arc-swap",
+ "base64 0.23.1",
+ "bitflags 2.13.2",
+ "getrandom 0.3.4",
+ "getrandom 0.4.3",
+ "libc",
+ "signal-hook 0.4.4",
+ "unicode-display-width",
+ "unicode-segmentation",
+ "unicode-width",
+ "web-time",
+]
+
+[[package]]
 name = "ftui-i18n"
 version = "0.2.1"
 source = "git+https://github.com/Dicklesworthstone/frankentui?rev=18facd3f2a2c51b8b06ff589e6b905e6a63f5a96#18facd3f2a2c51b8b06ff589e6b905e6a63f5a96"
+
+[[package]]
+name = "ftui-i18n"
+version = "0.9.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=befbd2471a1ec4a6b8ce0a0df32116c317cca9db#befbd2471a1ec4a6b8ce0a0df32116c317cca9db"
 
 [[package]]
 name = "ftui-layout"
 version = "0.2.1"
 source = "git+https://github.com/Dicklesworthstone/frankentui?rev=18facd3f2a2c51b8b06ff589e6b905e6a63f5a96#18facd3f2a2c51b8b06ff589e6b905e6a63f5a96"
 dependencies = [
- "ftui-core",
+ "ftui-core 0.2.1",
  "rustc-hash 2.1.3",
  "serde",
+]
+
+[[package]]
+name = "ftui-layout"
+version = "0.9.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=befbd2471a1ec4a6b8ce0a0df32116c317cca9db#befbd2471a1ec4a6b8ce0a0df32116c317cca9db"
+dependencies = [
+ "ftui-core 0.9.0",
+ "rustc-hash 2.1.3",
+ "serde",
+ "serde_json",
+ "smallvec",
 ]
 
 [[package]]
@@ -4906,7 +4975,23 @@ dependencies = [
  "ahash",
  "bitflags 2.13.2",
  "bumpalo",
- "ftui-core",
+ "ftui-core 0.2.1",
+ "memchr",
+ "smallvec",
+ "unicode-segmentation",
+ "web-time",
+]
+
+[[package]]
+name = "ftui-render"
+version = "0.9.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=befbd2471a1ec4a6b8ce0a0df32116c317cca9db#befbd2471a1ec4a6b8ce0a0df32116c317cca9db"
+dependencies = [
+ "ahash",
+ "bitflags 2.13.2",
+ "bumpalo",
+ "ftui-a11y",
+ "ftui-core 0.9.0",
  "memchr",
  "smallvec",
  "unicode-segmentation",
@@ -4918,13 +5003,34 @@ name = "ftui-runtime"
 version = "0.2.1"
 source = "git+https://github.com/Dicklesworthstone/frankentui?rev=18facd3f2a2c51b8b06ff589e6b905e6a63f5a96#18facd3f2a2c51b8b06ff589e6b905e6a63f5a96"
 dependencies = [
- "ftui-backend",
- "ftui-core",
- "ftui-i18n",
- "ftui-layout",
- "ftui-render",
- "ftui-style",
- "ftui-text",
+ "ftui-backend 0.2.1",
+ "ftui-core 0.2.1",
+ "ftui-i18n 0.2.1",
+ "ftui-layout 0.2.1",
+ "ftui-render 0.2.1",
+ "ftui-style 0.2.1",
+ "ftui-text 0.2.1",
+ "tracing",
+ "unicode-segmentation",
+ "unicode-width",
+ "web-time",
+]
+
+[[package]]
+name = "ftui-runtime"
+version = "0.9.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=befbd2471a1ec4a6b8ce0a0df32116c317cca9db#befbd2471a1ec4a6b8ce0a0df32116c317cca9db"
+dependencies = [
+ "arc-swap",
+ "ftui-a11y",
+ "ftui-backend 0.9.0",
+ "ftui-core 0.9.0",
+ "ftui-i18n 0.9.0",
+ "ftui-layout 0.9.0",
+ "ftui-render 0.9.0",
+ "ftui-style 0.9.0",
+ "ftui-text 0.9.0",
+ "rustix 1.1.4",
  "tracing",
  "unicode-segmentation",
  "unicode-width",
@@ -4938,7 +5044,18 @@ source = "git+https://github.com/Dicklesworthstone/frankentui?rev=18facd3f2a2c51
 dependencies = [
  "ahash",
  "arc-swap",
- "ftui-render",
+ "ftui-render 0.2.1",
+ "tracing",
+]
+
+[[package]]
+name = "ftui-style"
+version = "0.9.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=befbd2471a1ec4a6b8ce0a0df32116c317cca9db#befbd2471a1ec4a6b8ce0a0df32116c317cca9db"
+dependencies = [
+ "ahash",
+ "arc-swap",
+ "ftui-render 0.9.0",
  "tracing",
 ]
 
@@ -4947,10 +5064,10 @@ name = "ftui-text"
 version = "0.2.1"
 source = "git+https://github.com/Dicklesworthstone/frankentui?rev=18facd3f2a2c51b8b06ff589e6b905e6a63f5a96#18facd3f2a2c51b8b06ff589e6b905e6a63f5a96"
 dependencies = [
- "ftui-core",
- "ftui-layout",
- "ftui-render",
- "ftui-style",
+ "ftui-core 0.2.1",
+ "ftui-layout 0.2.1",
+ "ftui-render 0.2.1",
+ "ftui-style 0.2.1",
  "lru 0.16.4",
  "ropey",
  "rustc-hash 2.1.3",
@@ -4961,17 +5078,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "ftui-text"
+version = "0.9.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=befbd2471a1ec4a6b8ce0a0df32116c317cca9db#befbd2471a1ec4a6b8ce0a0df32116c317cca9db"
+dependencies = [
+ "ftui-core 0.9.0",
+ "ftui-layout 0.9.0",
+ "ftui-style 0.9.0",
+ "lru 0.18.5",
+ "ropey",
+ "rustc-hash 2.1.3",
+ "smallvec",
+ "tracing",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
+name = "ftui-web"
+version = "0.9.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=befbd2471a1ec4a6b8ce0a0df32116c317cca9db#befbd2471a1ec4a6b8ce0a0df32116c317cca9db"
+dependencies = [
+ "ftui-a11y",
+ "ftui-backend 0.9.0",
+ "ftui-core 0.9.0",
+ "ftui-layout 0.9.0",
+ "ftui-render 0.9.0",
+ "ftui-runtime 0.9.0",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ftui-widgets"
 version = "0.2.1"
 source = "git+https://github.com/Dicklesworthstone/frankentui?rev=18facd3f2a2c51b8b06ff589e6b905e6a63f5a96#18facd3f2a2c51b8b06ff589e6b905e6a63f5a96"
 dependencies = [
  "ahash",
  "bitflags 2.13.2",
- "ftui-core",
- "ftui-layout",
- "ftui-render",
- "ftui-style",
- "ftui-text",
+ "ftui-core 0.2.1",
+ "ftui-layout 0.2.1",
+ "ftui-render 0.2.1",
+ "ftui-style 0.2.1",
+ "ftui-text 0.2.1",
  "unicode-segmentation",
  "unicode-width",
  "web-time",
@@ -6794,7 +6943,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20fd6de4ccfcc187e38bc21cfa543cb5a302cb86a8b114eb7f0bf0dc9f8ac00f"
 dependencies = [
  "io-lifetimes 3.0.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6949,9 +7098,9 @@ dependencies = [
 
 [[package]]
 name = "js-sys"
-version = "0.3.104"
+version = "0.3.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e0c1080212aad755ea003d18543e8768dd432c48819efd73a7bf1e39b7a5a3a"
+checksum = "ce57d20d1ea864ce2ac172ab472d409214f4fd359f0b2a2775abdf522e2af99e"
 dependencies = [
  "cfg-if",
  "futures-util",
@@ -8471,7 +8620,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9166,7 +9315,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -10008,7 +10157,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -10021,7 +10170,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10589,9 +10738,9 @@ dependencies = [
 
 [[package]]
 name = "smallvec"
-version = "1.15.2"
+version = "1.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
 dependencies = [
  "serde",
 ]
@@ -11108,10 +11257,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12286,9 +12435,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen"
-version = "0.2.127"
+version = "0.2.128"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b70935747edd64d89de3efa29d73789b806c15798f8e7dca4d8ac356b50ce70"
+checksum = "aecb87a33d3b0c5e3b7aa46336eaf486cffafbd281b195e4c8b80d50df2351bf"
 dependencies = [
  "cfg-if",
  "once_cell",
@@ -12299,9 +12448,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-futures"
-version = "0.4.77"
+version = "0.4.78"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b7777d5cc23d0e91404e53ce2d5e8ec7acae3026b16233dba62cd3246457950"
+checksum = "6ef4c5d3d2cdf5c54f4231181768f5510842e350db025faf1f7163b1030ed928"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -12309,9 +12458,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro"
-version = "0.2.127"
+version = "0.2.128"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77775f8f3f7217702089053b94958f8f54061a3f663417df76e19cbdcca29bc1"
+checksum = "a690d511e3c1a8b3a55e33511e3c2c00c78415cd23650f32b808627f5696b9ed"
 dependencies = [
  "quote",
  "wasm-bindgen-macro-support",
@@ -12319,22 +12468,22 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro-support"
-version = "0.2.127"
+version = "0.2.128"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e11d33f857dc2fb11b8bc75aee111aa9cbeb12cd9f25efd3d4c2a3dd4e235284"
+checksum = "411e4887f0071ef2d2164a9d5fdf2d20efbef78fccd3a78b0c10a1dc5295e48a"
 dependencies = [
  "bumpalo",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.5",
  "wasm-bindgen-shared",
 ]
 
 [[package]]
 name = "wasm-bindgen-shared"
-version = "0.2.127"
+version = "0.2.128"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ef64dbcc55df09c7e5a46182d181c2cfa3e925f3da937ea764728b4bbb9dcbf"
+checksum = "81941cd78d0c92026c33e5e01312845a4cb1e9af3407f9134b100dd03144103e"
 dependencies = [
  "unicode-ident",
 ]
@@ -12796,9 +12945,9 @@ dependencies = [
 
 [[package]]
 name = "web-sys"
-version = "0.3.104"
+version = "0.3.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c435338968042f4f59a557f690a253676d47ce13ceb55d70100e7facf6620a30"
+checksum = "9fbddc4a036f00ec4f18c83445bd3115cb306a91da554919a099d9222fe4a7f8"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -13177,7 +13326,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -13590,7 +13739,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f3fd376f71958b862e7afb20cfe5a22830e1963462f3a17f49d82a6c1d1f42d"
 dependencies = [
  "bitflags 2.13.2",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
