@@ -181,18 +181,22 @@ fn content_tail_rows(out: &str, n: usize) -> (String, bool) {
 /// 1 ms for a pane's terminal per attempt, so on a contended host, where a
 /// preempted lock holder keeps it for many milliseconds, three retries over
 /// ~21 ms still lost reads that ended a swarm-echo run (ft-4p4uo: every
-/// server-side refusal was `stage=capture reason=metadata_busy`). Six cover
-/// ~161 ms.
-const MAX_RESOURCE_BUSY_RETRIES: usize = 6;
+/// server-side refusal was `stage=capture reason=metadata_busy`). Six over
+/// ~161 ms still lost one run in six on a saturated 6-core host (ab10,
+/// echo p99 0.25-0.47 s); eight cover ~641 ms.
+const MAX_RESOURCE_BUSY_RETRIES: usize = 8;
 
-/// The pause before retry `attempt` (from 0): 1, 10, 10, 20, 40, 80 ms.
+/// The pause before retry `attempt` (from 0): 1, 10, 10, 20, 40, 80, 160,
+/// 320 ms.
 fn mux_read_retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(match attempt {
         0 => 1,
         1 | 2 => 10,
         3 => 20,
         4 => 40,
-        _ => 80,
+        5 => 80,
+        6 => 160,
+        _ => 320,
     })
 }
 
@@ -9446,7 +9450,16 @@ mod tests {
             );
             assert_eq!(
                 client.get_lines_retry_delays,
-                [Some(Duration::from_millis(1)), None, None, None, None, None],
+                [
+                    Some(Duration::from_millis(1)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None
+                ],
                 "actual successful retry must schedule only the short initial delay"
             );
             drop(client);
@@ -9492,8 +9505,8 @@ mod tests {
             rejection.validate().unwrap();
             assert_eq!(
                 requests.load(Ordering::SeqCst),
-                7,
-                "repeated busy must stop bounded at cap (1 initial + 6 retries = 7 requests)"
+                9,
+                "repeated busy must stop bounded at cap (1 initial + 8 retries = 9 requests)"
             );
             assert_eq!(
                 client.get_lines_retry_delays,
@@ -9504,6 +9517,8 @@ mod tests {
                     Some(Duration::from_millis(20)),
                     Some(Duration::from_millis(40)),
                     Some(Duration::from_millis(80)),
+                    Some(Duration::from_millis(160)),
+                    Some(Duration::from_millis(320)),
                 ]
             );
             drop(client);
@@ -9608,18 +9623,18 @@ mod tests {
                                     GetLinesAtLayout::IDENT,
                                 ))
                             }
-                            // Calls 3-6: busy refusals (busy_retries: 2 -> 6)
-                            3..=6 => {
+                            // Calls 3-8: busy refusals (busy_retries: 2 -> 8)
+                            3..=8 => {
                                 assert_eq!(request.layout.seqno, 8);
                                 Pdu::ErrorResponse(codec::ErrorResponse::resource_busy(
                                     GetLinesAtLayout::IDENT,
                                 ))
                             }
-                            // Call 7: seventh busy refusal; budget is exhausted (6 retries used).
-                            // If allowance had reset upon the snapshot change, this would retry (call 8).
+                            // Call 9: ninth busy refusal; budget is exhausted (8 retries used).
+                            // If allowance had reset upon the snapshot change, this would retry (call 10).
                             // Because allowance is shared across the whole transaction,
                             // the client must NOT retry here and must return the error.
-                            7 => {
+                            9 => {
                                 assert_eq!(request.layout.seqno, 8);
                                 Pdu::ErrorResponse(codec::ErrorResponse::resource_busy(
                                     GetLinesAtLayout::IDENT,
@@ -9648,8 +9663,8 @@ mod tests {
             rejection.validate().unwrap();
             assert_eq!(
                 chunk_calls.load(Ordering::SeqCst),
-                8,
-                "shared budget must cap total busy retries at 6 across changed snapshots (no reset)"
+                10,
+                "shared budget must cap total busy retries at 8 across changed snapshots (no reset)"
             );
             drop(client);
             timeout(Duration::from_secs(5), server)
@@ -9812,8 +9827,8 @@ mod tests {
             rejection.validate().unwrap();
             assert_eq!(
                 requests.load(Ordering::SeqCst),
-                7,
-                "repeated busy must stop bounded at cap (1 initial + 6 retries = 7 requests)"
+                9,
+                "repeated busy must stop bounded at cap (1 initial + 8 retries = 9 requests)"
             );
             drop(client);
             timeout(Duration::from_secs(5), server)
@@ -13046,7 +13061,7 @@ mod tests {
             for (case, expected_requests) in [
                 ("recover", 2),
                 ("busy-recover", 2),
-                ("busy-persistent", 7),
+                ("busy-persistent", 9),
                 ("never", 1),
                 ("effect", 1),
                 ("wrong-request", 1),
@@ -13169,7 +13184,16 @@ mod tests {
                     );
                     assert_eq!(
                         client.render_read_retry_delays,
-                        [Some(Duration::from_millis(1)), None, None, None, None, None],
+                        [
+                            Some(Duration::from_millis(1)),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None
+                        ],
                         "a transient read race must not impose the sustained-contention delay"
                     );
                 } else if matches!(case, "cancel" | "extreme-cancel") {
@@ -13193,6 +13217,8 @@ mod tests {
                             None,
                             None,
                             None,
+                            None,
+                            None,
                             None
                         ],
                         "persistent read contention keeps the bounded longer backoff"
@@ -13200,8 +13226,8 @@ mod tests {
                 } else if case == "busy-persistent" {
                     assert_eq!(
                         client.render_read_retry_delays,
-                        [1, 10, 10, 20, 40, 80].map(|ms| Some(Duration::from_millis(ms))),
-                        "a busy terminal gets a line read's ~161 ms of retries"
+                        [1, 10, 10, 20, 40, 80, 160, 320].map(|ms| Some(Duration::from_millis(ms))),
+                        "a busy terminal gets a line read's ~641 ms of retries"
                     );
                 } else if matches!(case, "never" | "effect" | "wrong-request" | "eof") {
                     assert_eq!(
