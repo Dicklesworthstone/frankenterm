@@ -1038,20 +1038,20 @@
         "cosmetic": 16,
         "docs": 2,
         "feat": 74,
-        "fix": 163,
+        "fix": 164,
         "other": 75,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
         "test": 79
       },
-      "fork_side_commit_count": 426,
+      "fork_side_commit_count": 427,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-14T14:11:09-04:00",
-        "sha": "198fc06c7f345dc899340013ef32121a67016992",
-        "subject": "fix(mux-server): read resident line ranges atomically under one terminal hold (ft-pjjeg)"
+        "committed_at": "2026-10-15T08:30:19-04:00",
+        "sha": "b63f57ffa2210a22780a623113d981b1183d35bf",
+        "subject": "fix(term): graphemes that join without a ZWJ render the same at every PTY read split (ft-cklgg)"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1206,8 +1206,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 3191,
-  "generated_at": "2026-10-15T10:44:54.864680Z",
+  "fork_side_commit_total": 3192,
+  "generated_at": "2026-10-15T12:34:46.397865Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
