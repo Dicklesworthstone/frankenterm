@@ -259,8 +259,6 @@ pub enum FreeTypeLcdFilter {
     /// FIR3 filter with weights 0x00 0x55 0x56 0x55 0x00. Sharper than
     /// `Default`, with somewhat more color fringing.
     Light,
-    /// The filter used before FreeType 2.3.0. Not recommended.
-    Legacy,
     /// No filtering. Strong color fringes.
     None,
 }

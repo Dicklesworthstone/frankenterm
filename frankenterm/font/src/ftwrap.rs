@@ -1159,7 +1159,6 @@ fn lcd_filter_to_ft(filter: FreeTypeLcdFilter) -> FT_LcdFilter {
     match filter {
         FreeTypeLcdFilter::Default => FT_LcdFilter::FT_LCD_FILTER_DEFAULT,
         FreeTypeLcdFilter::Light => FT_LcdFilter::FT_LCD_FILTER_LIGHT,
-        FreeTypeLcdFilter::Legacy => FT_LcdFilter::FT_LCD_FILTER_LEGACY,
         FreeTypeLcdFilter::None => FT_LcdFilter::FT_LCD_FILTER_NONE,
     }
 }
@@ -1595,7 +1594,6 @@ mod tests {
         for filter in [
             FreeTypeLcdFilter::Default,
             FreeTypeLcdFilter::Light,
-            FreeTypeLcdFilter::Legacy,
             FreeTypeLcdFilter::None,
         ] {
             lib.set_lcd_filter(lcd_filter_to_ft(filter))

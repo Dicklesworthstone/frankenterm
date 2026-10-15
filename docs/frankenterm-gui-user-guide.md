@@ -331,7 +331,7 @@ These keys tune how glyphs are rasterized and blended. All of them work in
 |---|---|---|
 | `freetype_load_target` | `"Normal"` | Hinting mode: `Normal`, `Light`, `Mono`, `HorizontalLcd` or `VerticalLcd`. |
 | `freetype_render_target` | unset (uses `freetype_load_target`) | Render mode. `HorizontalLcd` or `VerticalLcd` turns on subpixel text. |
-| `freetype_lcd_filter` | `"Default"` | FreeType LCD filter for subpixel text: `Default`, `Light`, `Legacy` or `None`. No effect on grayscale text. |
+| `freetype_lcd_filter` | `"Default"` | FreeType LCD filter for subpixel text: `Default`, `Light` or `None`. No effect on grayscale text. |
 | `freetype_lcd_filter_weights` | unset | Five FIR weights (0-255) that replace the filter's own, for example `[0x08, 0x4d, 0x56, 0x4d, 0x08]` (the `Default` filter). |
 | `text_gamma` | unset | Coverage gamma, 0.01 or more. Higher values make text thicker, mostly dark text on a light background. |
 | `text_contrast` | unset | Extra coverage contrast, a percentage from 0 to 100. |
@@ -339,10 +339,10 @@ These keys tune how glyphs are rasterized and blended. All of them work in
 The LCD filters, from FreeType: `Default` uses weights
 `0x08 0x4d 0x56 0x4d 0x08` and gives the least color fringing. `Light` uses
 `0x00 0x55 0x56 0x55 0x00`; it is sharper, with a little more fringing.
-`Legacy` is the pre-2.3 filter. `None` turns filtering off and shows strong
-color fringes. `freetype_lcd_filter` and `freetype_lcd_filter_weights` are
-read when fonts load, so a reload applies them but per-window config
-overrides do not.
+`None` turns filtering off and shows strong color fringes. FreeType 2.14
+removed the pre-2.3 `Legacy` filters, so there is no `Legacy` option.
+`freetype_lcd_filter` and `freetype_lcd_filter_weights` are read when fonts
+load, so a reload applies them but per-window config overrides do not.
 
 `text_gamma` and `text_contrast` follow kitty's `text_composition_strategy`.
 When neither is set, glyphs blend in gamma (sRGB) space as they always have.

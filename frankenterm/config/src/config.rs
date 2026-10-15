@@ -3611,7 +3611,7 @@ mod tests {
         assert_eq!(config.text_gamma, Some(1.7));
         assert_eq!(config.text_contrast, Some(30.0));
 
-        for name in ["Default", "Legacy", "None"] {
+        for name in ["Default", "Light", "None"] {
             let config =
                 config_from_pairs(vec![("freetype_lcd_filter", Value::String(name.into()))])
                     .unwrap();
