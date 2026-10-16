@@ -56,6 +56,9 @@ const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// connection costs the pane its lease, so these steps wait as long as a
 /// whole-mux capture may take.
 const CHECKPOINT_STAGE_IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a checkpoint-class request waits for the protocol authority a
+/// job holds before closing retryably; below the client's I/O deadline.
+const CHECKPOINT_AUTHORITY_WAIT: Duration = Duration::from_secs(4);
 const TOKEN_PUBLICATION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const TOKEN_PUBLICATION_LOCK_RETRY: Duration = Duration::from_millis(10);
 const TOKEN_STAGE_COMMIT_MAGIC: [u8; 4] = *b"FTGC";
@@ -1672,6 +1675,39 @@ impl GuardianService {
                             self.runtime.record_replay_wait_deferred();
                             return FrameProcessing::PendingCheckpoint;
                         }
+                    }
+                    if matches!(
+                        self.runtime.replay_wait_readiness(&request),
+                        GuardianReplayWaitReadiness::AuthorityInFlight
+                    ) {
+                        // The sole protocol authority is out with a job (a
+                        // checkpoint step, an output commit). Closing made a
+                        // mux's capture fail mid-publication and leave a
+                        // checkpoint no recovery root names; wait for the
+                        // authority instead, bounded below the client's I/O
+                        // deadline, exactly as a replay wait does.
+                        let Some(deadline) = Instant::now().checked_add(CHECKPOINT_AUTHORITY_WAIT)
+                        else {
+                            request.zeroize_payload();
+                            return FrameProcessing::Close;
+                        };
+                        if connection.deferred_replay.is_some() {
+                            request.zeroize_payload();
+                            return FrameProcessing::Close;
+                        }
+                        let Some(effect_lease) = effect_lease.take() else {
+                            request.zeroize_payload();
+                            return FrameProcessing::Close;
+                        };
+                        connection.pending_checkpoint = Some(route);
+                        connection.deferred_replay = Some(DeferredGuardianReplay::new(
+                            request,
+                            route,
+                            effect_lease,
+                            deadline,
+                        ));
+                        self.runtime.record_replay_wait_deferred();
+                        return FrameProcessing::PendingCheckpoint;
                     }
                     let Some(effect_lease) = effect_lease.take() else {
                         request.zeroize_payload();
