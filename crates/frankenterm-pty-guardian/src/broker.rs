@@ -5735,10 +5735,11 @@ impl BrokerControlServiceV1 {
             let bytes = Zeroizing::new(vec![0; count]);
             // Allocate before transferring either irreplaceable facet.
             let reader = pane.proxy_reader.take().ok_or(())?;
-            let Some(journal) = pane.output_journal.take() else {
+            let Some(mut journal) = pane.output_journal.take() else {
                 pane.proxy_reader = Some(reader);
                 return Err(());
             };
+            journal.release_through(pane.buffer_start_sequence);
             let job = BrokerOutputDrainJobV1 {
                 pane_id: request.header.durable_pane_id,
                 sequence: pane.next_output_sequence,
@@ -18301,6 +18302,17 @@ impl BrokerDurableOutputJournalV1 {
         result
     }
 
+    /// The guardian acknowledged output through `acknowledged_bytes` only
+    /// after committing it to its own journal, so a later rollover may
+    /// reclaim this pane's sealed broker segments at or below it.
+    fn release_through(&mut self, acknowledged_bytes: u64) {
+        match &mut self.backend {
+            BrokerOutputJournalBackendV1::Chain(chain) => chain.release_through(acknowledged_bytes),
+            #[cfg(test)]
+            BrokerOutputJournalBackendV1::Segment(_) => {}
+        }
+    }
+
     #[cfg(test)]
     fn raw_segment(&self) -> &GuardianOutputJournal {
         match &self.backend {
@@ -19669,6 +19681,7 @@ impl BrokerAdoptedPaneV1 {
             .ok_or(BrokerError::ProxyCapacityExhausted)?;
         self.output_buffer.extend(&chunk[..bytes_drained]);
         let durable_journal_sequence = if let Some(journal) = self.output_journal.as_mut() {
+            journal.release_through(self.buffer_start_sequence);
             Some(
                 journal
                     .append_and_sync(output_sequence_start, &chunk[..bytes_drained])?
