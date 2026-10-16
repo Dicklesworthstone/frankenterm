@@ -876,7 +876,7 @@ static RELIABLE_INPUT_LANE_ABORTS: std::sync::atomic::AtomicU64 =
 
 fn log_reliable_input_lane_aborted(outcome: &'static str, dropped: usize) {
     let aborts = RELIABLE_INPUT_LANE_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    if aborts == 1 || aborts % 256 == 0 {
+    if aborts == 1 || aborts.is_multiple_of(256) {
         log::warn!(
             "mux server rejected reliable input ({outcome}); dropped {dropped} queued key or \
              write events ({aborts} aborted lanes so far)"

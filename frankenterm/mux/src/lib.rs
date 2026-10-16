@@ -10842,7 +10842,7 @@ fn log_reliable_input_ledger_full(client_id: &ClientId) {
     let refusals = RELIABLE_INPUT_LEDGER_FULL_REFUSALS.fetch_add(1, Ordering::Relaxed) + 1;
     metrics::counter!("mux.reliable_input.client_admission", "outcome" => "capacity")
         .increment(1);
-    if refusals == 1 || refusals % 256 == 0 {
+    if refusals == 1 || refusals.is_multiple_of(256) {
         log::error!(
             "reliable input refused for client pid {} (id {}): the ledger already holds \
              {MAX_RELIABLE_INPUT_CLIENTS} clients with input history; typed keys from this \
