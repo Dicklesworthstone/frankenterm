@@ -115,6 +115,8 @@ const CHECKPOINT_CATALOG_FILE_PREFIX: &str = "checkpoint-catalog-";
 const CHECKPOINT_CATALOG_CANDIDATE_SUFFIX: &str = ".ftgccandidate";
 const CHECKPOINT_CATALOG_MARKER_SUFFIX: &str = ".ftgccommit";
 const CHECKPOINT_CATALOG_STAGING_SUFFIX: &str = ".staging";
+const CHECKPOINT_CATALOG_ACK_PROOF_PREFIX: &str = "acked-";
+const CHECKPOINT_CATALOG_ACK_PROOF_SUFFIX: &str = ".ftgcack";
 const CHECKPOINT_CATALOG_LEGACY_CANDIDATE_MAGIC: [u8; 8] = *b"FTGCC002";
 const CHECKPOINT_CATALOG_LEGACY_MARKER_MAGIC: [u8; 8] = *b"FTGCM002";
 const CHECKPOINT_CATALOG_LEGACY_VERSION: u32 = 2;
@@ -3949,7 +3951,7 @@ impl GuardianCheckpointStageStore {
             let ack_path = checkpoint_ack_path(inner, shape.key(), inspection.publication_id)?;
             let ack_plaintext_bytes = u32::try_from(CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES)
                 .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
-            if inspection.ack_present {
+            let durable_ack = if inspection.ack_present {
                 let ack_entry = census
                     .entries
                     .iter()
@@ -3971,6 +3973,7 @@ impl GuardianCheckpointStageStore {
                     expected_mux,
                     &ack_record,
                 )?;
+                ack_record
             } else {
                 // Validate and encrypt before creating a file; an invalid tuple
                 // must not leave a torn finalizer behind. Exact retries above
@@ -3988,6 +3991,7 @@ impl GuardianCheckpointStageStore {
                 match checkpoint_create_record_new(inner, &ack_path)? {
                     CheckpointStageCreateOutcome::Created(file) => {
                         checkpoint_write_created_record(inner, &ack_path, file, &prepared_ack)?;
+                        prepared_ack
                     }
                     CheckpointStageCreateOutcome::Existing => {
                         let refreshed = checkpoint_stage_census(inner)?;
@@ -4012,9 +4016,13 @@ impl GuardianCheckpointStageStore {
                             expected_mux,
                             &ack_record,
                         )?;
+                        ack_record
                     }
                 }
-            }
+            };
+            // A recovery root may name this member long after the stage
+            // reclaims the upload; offline verification then reads this copy.
+            checkpoint_catalog_write_ack_proof(inner, member.metadata.identity, &durable_ack)?;
             Ok(GuardianCheckpointStageReplyV1::Acked {
                 upload_id: shape.upload_id,
                 completion_id: inspection.publication_id,
@@ -6819,6 +6827,68 @@ fn checkpoint_catalog_path(
     Ok(inner.directory_path.join(name))
 }
 
+/// Where a published Pane member keeps a copy of its encrypted ACK
+/// finalizer, so offline verification of a recovery root that names it still
+/// works after the stage reclaims the upload. The name does not start with
+/// `checkpoint-`, so neither the stage census nor the catalog scan reads it;
+/// it lives and goes with its member.
+fn checkpoint_catalog_ack_proof_path(
+    inner: &GuardianCheckpointStageStoreInner,
+    identity: CheckpointCatalogIdentity,
+) -> Result<PathBuf, GuardianCheckpointStageStoreError> {
+    let name = format!(
+        "{CHECKPOINT_CATALOG_ACK_PROOF_PREFIX}{}{CHECKPOINT_CATALOG_ACK_PROOF_SUFFIX}",
+        checkpoint_catalog_base_name(identity)
+    );
+    if name.len() > inner.name_max {
+        return Err(GuardianCheckpointStageStoreError::NameLimit);
+    }
+    Ok(inner.directory_path.join(name))
+}
+
+/// Durably keep `ack` as `identity`'s ACK proof. An existing proof is kept;
+/// verification authenticates whatever it holds.
+fn checkpoint_catalog_write_ack_proof(
+    inner: &GuardianCheckpointStageStoreInner,
+    identity: CheckpointCatalogIdentity,
+    ack: &GuardianEncryptedCheckpointStageRecordV1,
+) -> Result<(), GuardianCheckpointStageStoreError> {
+    let path = checkpoint_catalog_ack_proof_path(inner, identity)?;
+    match checkpoint_create_record_new(inner, &path)? {
+        CheckpointStageCreateOutcome::Created(file) => {
+            checkpoint_write_created_record(inner, &path, file, ack)
+        }
+        CheckpointStageCreateOutcome::Existing => Ok(()),
+    }
+}
+
+/// A census-style entry naming `identity`'s ACK proof, if it exists.
+fn checkpoint_catalog_ack_proof_entry(
+    inner: &GuardianCheckpointStageStoreInner,
+    identity: CheckpointCatalogIdentity,
+    key: CheckpointStageUploadKey,
+    completion_id: Uuid,
+) -> Result<Option<CheckpointStageCensusEntry>, GuardianCheckpointStageStoreError> {
+    let path = checkpoint_catalog_ack_proof_path(inner, identity)?;
+    match open_private_file_at(&inner.directory, &inner.directory_path, &path, false) {
+        Ok(file) => {
+            let metadata = file.metadata().map_err(|error| {
+                GuardianCheckpointStageStoreError::io("checkpoint-ack-proof-metadata", error)
+            })?;
+            Ok(Some(CheckpointStageCensusEntry {
+                key,
+                role: CheckpointStageFileRole::Ack {
+                    publication_id: completion_id,
+                },
+                path,
+                bytes: metadata.len(),
+            }))
+        }
+        Err(error) if output_name_was_reclaimed(&error) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn checkpoint_catalog_staging_path(
     inner: &GuardianCheckpointStageStoreInner,
     canonical_path: &Path,
@@ -7275,16 +7345,15 @@ fn checkpoint_stage_reclaim_superseded(
         else {
             continue;
         };
+        let member_of = |key: &CheckpointStageUploadKey, capture_generation: u64| {
+            catalog.published.iter().find(|member| {
+                member.format == CheckpointCatalogFormat::ProtectedV3
+                    && member.metadata.upload_id == key.upload_id
+                    && member.metadata.capture_generation == capture_generation
+            })
+        };
         let member_generation = |key: &CheckpointStageUploadKey, capture_generation: u64| {
-            catalog
-                .published
-                .iter()
-                .find(|member| {
-                    member.format == CheckpointCatalogFormat::ProtectedV3
-                        && member.metadata.upload_id == key.upload_id
-                        && member.metadata.capture_generation == capture_generation
-                })
-                .map(|member| member.metadata.identity.generation)
+            member_of(key, capture_generation).map(|member| member.metadata.identity.generation)
         };
         let Some((newest_generation, newest_capture_generation, newest_key)) = uploads
             .iter()
@@ -7307,7 +7376,15 @@ fn checkpoint_stage_reclaim_superseded(
                 } else {
                     *capture_generation < newest_capture_generation
                 };
-            if superseded {
+            // A recovery root may still name a published member; its ACK
+            // proof must outlive the upload, or offline verification fails.
+            let proof_kept = || {
+                member_of(key, *capture_generation).is_none_or(|member| {
+                    checkpoint_stage_preserve_ack_proof(inner, &census, member, *key)
+                        .unwrap_or(false)
+                })
+            };
+            if superseded && (!*acknowledged || proof_kept()) {
                 reclaim.insert(*key);
             }
         }
@@ -7350,6 +7427,40 @@ fn checkpoint_stage_reclaim_superseded(
     Ok(reclaim.len())
 }
 
+/// Make sure `member` has its ACK proof, copying the stage's ACK record when an
+/// older guardian acknowledged it before proofs existed. False when there is
+/// no ACK record to copy.
+fn checkpoint_stage_preserve_ack_proof(
+    inner: &GuardianCheckpointStageStoreInner,
+    census: &CheckpointStageCensus,
+    member: &PublishedCheckpointCatalogMember,
+    key: CheckpointStageUploadKey,
+) -> Result<bool, GuardianCheckpointStageStoreError> {
+    let completion_id = member.metadata.completion_id;
+    if checkpoint_catalog_ack_proof_entry(inner, member.metadata.identity, key, completion_id)?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    let Some(ack) = census.entries.iter().find(|entry| {
+        entry.key == key
+            && entry.role
+                == (CheckpointStageFileRole::Ack {
+                    publication_id: completion_id,
+                })
+    }) else {
+        return Ok(false);
+    };
+    let (_, record, _) = checkpoint_read_record(
+        inner,
+        ack,
+        u32::try_from(CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES)
+            .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+    )?;
+    checkpoint_catalog_write_ack_proof(inner, member.metadata.identity, &record)?;
+    Ok(true)
+}
+
 /// Whether one upload is sealed and acknowledged, from its own records.
 fn checkpoint_stage_upload_acknowledged(
     inner: &GuardianCheckpointStageStoreInner,
@@ -7383,14 +7494,23 @@ fn checkpoint_stage_unlink(
     inner: &GuardianCheckpointStageStoreInner,
     entry: &CheckpointStageCensusEntry,
 ) -> Result<(), GuardianCheckpointStageStoreError> {
-    let file = open_private_file_at(&inner.directory, &inner.directory_path, &entry.path, false)?;
+    checkpoint_unlink_record_path(inner, &entry.path)
+}
+
+/// Unlink one record file the store wrote (a stage record or an ACK proof)
+/// and forget its durability.
+fn checkpoint_unlink_record_path(
+    inner: &GuardianCheckpointStageStoreInner,
+    path: &Path,
+) -> Result<(), GuardianCheckpointStageStoreError> {
+    let file = open_private_file_at(&inner.directory, &inner.directory_path, path, false)?;
     let metadata = file.metadata().map_err(|error| {
         GuardianCheckpointStageStoreError::io("checkpoint-reclaim-metadata", error)
     })?;
     validate_private_file_metadata(&metadata, None)?;
     let identity = FileIdentity::capture(&metadata, Some(metadata.len()));
     drop(file);
-    let name = output_child_name(&inner.directory_path, &entry.path)?;
+    let name = output_child_name(&inner.directory_path, path)?;
     rustix::fs::unlinkat(&inner.directory, name, rustix::fs::AtFlags::empty()).map_err(
         |error| GuardianCheckpointStageStoreError::io("checkpoint-reclaim-unlink", error.into()),
     )?;
@@ -12212,6 +12332,22 @@ fn checkpoint_catalog_validate_candidate_records(
     inner: &GuardianCheckpointStageStoreInner,
     candidate: &CheckpointCatalogCandidate,
 ) -> Result<(), GuardianCheckpointStageStoreError> {
+    checkpoint_catalog_candidate_completion(inner, candidate).map(drop)
+}
+
+/// Authenticate a catalog candidate's copied stage records (Begin, every
+/// chunk, Seal) and return the upload shape and the durable completion they
+/// prove, exactly as the stage upload itself would.
+fn checkpoint_catalog_candidate_completion(
+    inner: &GuardianCheckpointStageStoreInner,
+    candidate: &CheckpointCatalogCandidate,
+) -> Result<
+    (
+        CheckpointStageRequestShape,
+        mux::guardian_checkpoint::GuardianCheckpointDurableCompletionReceiptV1,
+    ),
+    GuardianCheckpointStageStoreError,
+> {
     let metadata = candidate.metadata;
     checkpoint_catalog_validate_metadata(&metadata)?;
     let expected_records = usize::try_from(metadata.chunk_count)
@@ -12346,7 +12482,7 @@ fn checkpoint_catalog_validate_candidate_records(
     if seal_record.context().kind() != GuardianCheckpointStageRecordKindV1::SealManifest {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
-    let _completion_receipt = inner.cipher.inspect_durable_manifest_receipt(
+    let completion_receipt = inner.cipher.inspect_durable_manifest_receipt(
         &shape.binding,
         seal_request,
         metadata.completion_id,
@@ -12354,7 +12490,7 @@ fn checkpoint_catalog_validate_candidate_records(
         ordered_chunk_set_identity,
         seal_record,
     )?;
-    Ok(())
+    Ok((shape, completion_receipt))
 }
 
 fn checkpoint_catalog_adoption_binding(
@@ -12418,9 +12554,9 @@ fn checkpoint_catalog_require_existing_ack(
             && entry.key.upload_id == metadata.upload_id
             && entry.role == CheckpointStageFileRole::Candidate
     });
-    let entry = candidates
-        .next()
-        .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+    let Some(entry) = candidates.next() else {
+        return checkpoint_catalog_require_ack_proof(inner, member);
+    };
     if candidates.next().is_some() {
         return Err(GuardianCheckpointStageStoreError::Conflict);
     }
@@ -12516,6 +12652,65 @@ fn checkpoint_catalog_require_existing_ack(
         .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
     let (_, ack_record, _) =
         checkpoint_read_record(inner, ack, CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES as u32)?;
+    let ack_request = GuardianCheckpointStageRequestV1::ack(
+        shape.scope,
+        shape.upload_id,
+        shape.descriptor,
+        shape.chunk_bytes,
+        metadata.completion_id,
+    )?;
+    inner.cipher.inspect_ack_finalizer_from_catalog(
+        &completion,
+        &ack_request,
+        &binding,
+        evidence,
+        metadata.adoption_mux_incarnation,
+        &ack_record,
+    )?;
+    Ok(())
+}
+
+/// `checkpoint_catalog_require_existing_ack` once the stage has reclaimed the
+/// upload: the member's own copied records prove its durable completion, and
+/// its ACK proof must authenticate as that completion's finalizer under the
+/// adopting mux, exactly as the stage's ACK record would.
+fn checkpoint_catalog_require_ack_proof(
+    inner: &GuardianCheckpointStageStoreInner,
+    member: &PublishedCheckpointCatalogMember,
+) -> Result<(), GuardianCheckpointStageStoreError> {
+    let metadata = member.metadata;
+    let bytes = checkpoint_catalog_read_file(
+        inner,
+        &member.candidate_path,
+        member.candidate_file_identity,
+        CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+    )?;
+    let candidate = checkpoint_catalog_decode_candidate(&bytes)?;
+    if candidate.format != CheckpointCatalogFormat::ProtectedV3
+        || candidate.metadata != metadata
+        || candidate.checksum != member.candidate_checksum
+    {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let (shape, completion) = checkpoint_catalog_candidate_completion(inner, &candidate)?;
+    let entry = checkpoint_catalog_ack_proof_entry(
+        inner,
+        metadata.identity,
+        shape.key(),
+        metadata.completion_id,
+    )?
+    .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+    let (_, ack_record, _) = checkpoint_read_record(
+        inner,
+        &entry,
+        u32::try_from(CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES)
+            .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+    )?;
+    let binding = checkpoint_catalog_adoption_binding(&candidate)?;
+    let evidence = candidate
+        .adoption_evidence
+        .as_ref()
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
     let ack_request = GuardianCheckpointStageRequestV1::ack(
         shape.scope,
         shape.upload_id,
@@ -13727,10 +13922,24 @@ fn checkpoint_catalog_reclaim_oldest_pane_members(
     }
     let mut unlinked_files = 0_usize;
     for name in read_directory_names(&inner.directory)? {
+        let Some(text) = name.to_str() else {
+            continue;
+        };
+        // Leftovers older than every member: an unmarked candidate, or an ACK
+        // proof whose member is gone.
+        let proof_base = text
+            .strip_prefix(CHECKPOINT_CATALOG_ACK_PROOF_PREFIX)
+            .and_then(|rest| rest.strip_suffix(CHECKPOINT_CATALOG_ACK_PROOF_SUFFIX));
+        let parsed = match proof_base {
+            Some(base) => checkpoint_catalog_parse_path(&format!(
+                "{base}{CHECKPOINT_CATALOG_CANDIDATE_SUFFIX}"
+            )),
+            None => checkpoint_catalog_parse_path(text),
+        };
         let Some((
             identity,
             CheckpointCatalogPathKind::Canonical(CheckpointCatalogPathRole::Candidate),
-        )) = name.to_str().and_then(checkpoint_catalog_parse_path)
+        )) = parsed
         else {
             continue;
         };
@@ -13738,18 +13947,22 @@ fn checkpoint_catalog_reclaim_oldest_pane_members(
             continue;
         }
         let path = inner.directory_path.join(&name);
-        let file = open_private_file_at(&inner.directory, &inner.directory_path, &path, false)?;
-        let metadata = file.metadata().map_err(|error| {
-            GuardianCheckpointStageStoreError::io("checkpoint-catalog-leftover-metadata", error)
-        })?;
-        validate_private_file_metadata(&metadata, None)?;
-        drop(file);
-        unlink_owned_output_file(
-            &inner.directory,
-            &inner.directory_path,
-            &path,
-            FileIdentity::capture(&metadata, Some(metadata.len())),
-        )?;
+        if proof_base.is_some() {
+            checkpoint_unlink_record_path(inner, &path)?;
+        } else {
+            let file = open_private_file_at(&inner.directory, &inner.directory_path, &path, false)?;
+            let metadata = file.metadata().map_err(|error| {
+                GuardianCheckpointStageStoreError::io("checkpoint-catalog-leftover-metadata", error)
+            })?;
+            validate_private_file_metadata(&metadata, None)?;
+            drop(file);
+            unlink_owned_output_file(
+                &inner.directory,
+                &inner.directory_path,
+                &path,
+                FileIdentity::capture(&metadata, Some(metadata.len())),
+            )?;
+        }
         unlinked_files += 1;
     }
     let excess = scan
@@ -13787,6 +14000,15 @@ fn checkpoint_catalog_reclaim_oldest_pane_members(
                 &member.candidate_path,
                 member.candidate_file_identity,
             )?;
+            // Last, so a crash leaves at most a proof older than every
+            // member, which the next pass finishes, never a member without
+            // its proof.
+            let proof = checkpoint_catalog_ack_proof_path(inner, member.metadata.identity)?;
+            match checkpoint_unlink_record_path(inner, &proof) {
+                Err(GuardianCheckpointStageStoreError::Output(error))
+                    if output_name_was_reclaimed(&error) => {}
+                result => result?,
+            }
             reclaimed += 1;
         }
     }
@@ -16350,12 +16572,14 @@ mod tests {
         let journal = pipeline.prepare_pane(guardian, pane)?;
         let mut state = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
         let retained = u64::try_from(CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS)?;
-        // Twelve acknowledged captures of one pane: half again the eight
-        // members a pane scope may ever hold, so without reclamation the
-        // ninth publication is refused.
+        // Sixteen acknowledged captures of one pane: twice the eight members a
+        // pane scope may ever hold (without reclamation the ninth publication
+        // is refused). The sixteenth Begin finds the stage full and reclaims
+        // every upload but the newest acknowledged one, including those of
+        // two members the catalog still retains.
         let mut output = Vec::new();
         let mut checkpoints = Vec::new();
-        for capture in 0..12_u64 {
+        for capture in 0..16_u64 {
             let appended = format!("capture {capture};");
             output.extend_from_slice(appended.as_bytes());
             let (checkpoint_id, _) = checkpoint_catalog_stage_and_publish(
@@ -16402,6 +16626,28 @@ mod tests {
                     <= CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS
             );
         }
+
+        // Every retained member still verifies offline with its ACK, as a
+        // recovery root naming it requires, including members whose stage
+        // upload is gone.
+        store.with_exclusive_directory(|inner| {
+            let catalog =
+                checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })?;
+            let census = checkpoint_stage_census(inner)?;
+            assert!(
+                catalog.published.iter().any(|member| {
+                    !census
+                        .uploads
+                        .iter()
+                        .any(|key| key.upload_id == member.metadata.upload_id)
+                }),
+                "some retained member's upload must have left the stage"
+            );
+            for member in &catalog.published {
+                checkpoint_catalog_require_existing_ack(inner, member)?;
+            }
+            Ok(())
+        })?;
 
         // A restore of the newest capture still works from the pruned chain.
         let maximum_plaintext_bytes = 64 * 1024;
