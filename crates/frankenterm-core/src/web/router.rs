@@ -101,7 +101,7 @@ pub(super) fn build_app(
 /// Serve the browser fleet viewer: every manifest file at `/ui/<path>`, and
 /// the page itself at `/ui/`.
 fn with_ui_routes(mut builder: AppBuilder, ui: &Arc<UiAssetSet>) -> AppBuilder {
-    for path in ui.paths().map(str::to_owned).collect::<Vec<_>>() {
+    for path in ui.paths().map(str::to_owned) {
         let set = Arc::clone(ui);
         let route = format!("/ui/{path}");
         builder = builder.route(
