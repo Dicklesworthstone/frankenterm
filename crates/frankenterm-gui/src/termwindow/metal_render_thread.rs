@@ -587,6 +587,31 @@ impl TermWindow {
         Ok(())
     }
 
+    /// The selection share of a Metal frame, which the WebGpu pane painter
+    /// does while drawing: reconcile each visible pane's selection with its
+    /// changed rows, and stage the coordinates the frame shows, so that mouse
+    /// selection resolves against them once the frame is presented. Runs
+    /// before the frame's damage generation is captured: reconciling can mark
+    /// rows dirty.
+    pub(super) fn stage_metal_selection_frames(&mut self) {
+        for state in self.pane_state.borrow_mut().values_mut() {
+            state.selection_frame.begin_attempt();
+        }
+        for pos in self.get_panes_to_render() {
+            if let Err(err) = self.check_for_dirty_lines_and_invalidate_selection(&pos.pane, None) {
+                log::debug!(
+                    "Metal selection reconcile for pane {}: {err:#}",
+                    pos.pane.pane_id()
+                );
+                continue;
+            }
+            let stamp = self.selection_frame_stamp_for_position(&pos.pane, &pos);
+            if let Some(mut state) = self.pane_state(pos.pane.pane_id()) {
+                state.selection_frame.stage(stamp, stamp, true);
+            }
+        }
+    }
+
     /// What the render thread's next frame needs from this window.
     pub(super) fn metal_frame_request(&mut self) -> MetalFrameRequest {
         let (mut panes, splits) = self.metal_window_panes();
@@ -639,6 +664,7 @@ impl TermWindow {
     /// draws: publish what the frame needs and wake the thread. The damage up
     /// to here is the render thread's to draw.
     pub(super) fn publish_metal_frame(&mut self) -> bool {
+        self.stage_metal_selection_frames();
         let captured_generation = self.damage_generation;
         self.begin_metal_font_read();
         let request = self.metal_frame_request();
@@ -647,6 +673,9 @@ impl TermWindow {
         };
         render.post_surface(self.metal_surface());
         render.publish(request);
+        // The render thread draws this request next: mouse selection resolves
+        // against the coordinates staged for it.
+        self.settle_presented_selection_frames(captured_generation.value, 0);
         let settlement = super::apply_presented_render_attempt(
             &mut self.dirty_lines,
             self.damage_generation,

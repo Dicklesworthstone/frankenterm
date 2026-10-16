@@ -323,6 +323,32 @@ impl crate::TermWindow {
     /// swap from bypassing the bounded retry lane via an immediate animation or
     /// frame-budget repaint.
     pub(crate) fn complete_presented_paint(&mut self, outcome: PaintOutcome) {
+        self.settle_presented_selection_frames(
+            outcome.damage_generation.value,
+            outcome.submission_mach_ns.unwrap_or_default(),
+        );
+        if outcome.post_present.should_force_frame_budget_paint {
+            if let Some(window) = self.window.clone() {
+                window.invalidate();
+            }
+        }
+
+        if let Some(next_due) = outcome.post_present.animation_wake(self.focused.is_some()) {
+            self.schedule_animation_wake(next_due);
+        }
+    }
+
+    /// Promotes each pane's staged selection frame to the presented one, then
+    /// runs the selection work that waits on a presented frame: copy
+    /// deadlines and pending selection retries. Every front end runs this once
+    /// the backend accepts a frame (Metal from `publish_metal_frame` and
+    /// `do_paint_metal`): mouse selection resolves against the presented
+    /// frame, so a front end that skipped it could not select at all.
+    pub(crate) fn settle_presented_selection_frames(
+        &mut self,
+        damage_generation: u64,
+        submission_mach_ns: u64,
+    ) {
         let now = Instant::now();
         let mut expired_copy = false;
         for (pane_id, state) in self.pane_state.borrow_mut().iter_mut() {
@@ -342,11 +368,11 @@ impl crate::TermWindow {
                     target: "frankenterm_gui::native_present_profile",
                     "native_present_complete pane_id={} damage={} source_sequence={} viewport={} geometry={:?} submission_mach_ns={}",
                     pane_id,
-                    outcome.damage_generation.value,
+                    damage_generation,
                     frame.source_sequence,
                     frame.viewport,
                     frame.geometry,
-                    outcome.submission_mach_ns.unwrap_or_default(),
+                    submission_mach_ns,
                 );
             }
         }
@@ -392,15 +418,6 @@ impl crate::TermWindow {
             if retry {
                 self.schedule_animation_wake(Instant::now() + Duration::from_millis(16));
             }
-        }
-        if outcome.post_present.should_force_frame_budget_paint {
-            if let Some(window) = self.window.clone() {
-                window.invalidate();
-            }
-        }
-
-        if let Some(next_due) = outcome.post_present.animation_wake(self.focused.is_some()) {
-            self.schedule_animation_wake(next_due);
         }
     }
 

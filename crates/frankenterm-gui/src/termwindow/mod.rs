@@ -5364,6 +5364,7 @@ impl TermWindow {
             return false;
         };
         self.begin_metal_font_read();
+        self.stage_metal_selection_frames();
         let captured_generation = self.damage_generation;
         let snapshot_path = self.claim_render_snapshot();
         let dimensions = self.dimensions;
@@ -5431,6 +5432,7 @@ impl TermWindow {
                 let frames = frankenterm_alloc::resource_ledger::FrameLedger::global();
                 frames.set_max_fps(self.config.max_fps);
                 frames.record_present();
+                self.settle_presented_selection_frames(captured_generation.value, 0);
                 let settlement = apply_presented_render_attempt(
                     &mut self.dirty_lines,
                     self.damage_generation,
