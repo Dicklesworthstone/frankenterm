@@ -61,7 +61,7 @@ use crate::client::{
     ClientId, ClientInfo, ClientRegistrationGeneration, ClientRegistrationOperationLease,
 };
 use crate::guardian_checkpoint::{
-    capture_and_bind_live_parser_checkpoint, LiveParserCaptureAndBindError, LiveParserCheckpointAck,
+    capture_and_bind_live_parser_checkpoint, LiveParserCheckpointAck,
 };
 #[cfg(test)]
 use crate::guardian_checkpoint::{GuardianCheckpointBoundary, GuardianCheckpointBoundaryError};
@@ -12420,7 +12420,8 @@ fn attempt_live_parser_checkpoint(
             return LiveParserAttemptOutcome::Fatal;
         }
         Ok(Err(error)) => {
-            if matches!(&error, LiveParserCaptureAndBindError::Pane(_)) {
+            if error.leaves_live_parser_consistent() {
+                log::warn!("live parser checkpoint capture failed; the pane continues: {error:?}");
                 control.complete_capture(
                     request.request_id(),
                     Err(LiveParserCheckpointError::CaptureAndBind),

@@ -5353,6 +5353,27 @@ pub(crate) enum LiveParserCaptureAndBindError {
     Boundary(#[source] GuardianCheckpointBoundaryError),
 }
 
+impl LiveParserCaptureAndBindError {
+    /// Whether this capture can fail without ending the pane. A pane callback
+    /// failure, or a recovery image refused after the parser consumed exactly
+    /// the requested boundary, leaves the live model and stream intact; only
+    /// that snapshot is lost. Identity, watermark and leftover-action failures
+    /// mean the stream itself is in doubt.
+    pub(crate) const fn leaves_live_parser_consistent(&self) -> bool {
+        matches!(
+            self,
+            Self::Pane(_)
+                | Self::Boundary(
+                    GuardianCheckpointBoundaryError::EmptyTerminalPayload
+                        | GuardianCheckpointBoundaryError::TerminalPayloadLengthOutOfRange
+                        | GuardianCheckpointBoundaryError::InvalidCanonicalTerminalPayload
+                        | GuardianCheckpointBoundaryError::GeometryOutOfRange
+                        | GuardianCheckpointBoundaryError::ZeroGeometry
+                )
+        )
+    }
+}
+
 /// Opaque authority minted only by the exact pending checkpoint state
 /// transition. Callers cannot supply or replace any Ack identity component.
 pub(crate) struct LiveParserCaptureRequest {
@@ -8913,6 +8934,32 @@ mod tests {
         let descriptor = GuardianCheckpointArtifactDescriptorV1::from_live_capture(&capture)
             .expect("construct record descriptor");
         (descriptor, segment, output, capture)
+    }
+
+    #[test]
+    fn only_a_refused_recovery_image_or_pane_callback_spares_the_live_parser() {
+        use GuardianCheckpointBoundaryError as B;
+        use LiveParserCaptureAndBindError as E;
+        for spared in [
+            E::Pane(LiveParserPaneCaptureError::Unsupported),
+            E::Boundary(B::EmptyTerminalPayload),
+            E::Boundary(B::TerminalPayloadLengthOutOfRange),
+            E::Boundary(B::InvalidCanonicalTerminalPayload),
+            E::Boundary(B::GeometryOutOfRange),
+            E::Boundary(B::ZeroGeometry),
+        ] {
+            assert!(spared.leaves_live_parser_consistent(), "{:?}", spared);
+        }
+        for fatal in [
+            E::RegistrationIdentityMismatch,
+            E::PendingActionsRemain,
+            E::Boundary(B::ParserWatermarkMismatch),
+            E::Boundary(B::NilRegistrationWireIdentity),
+            E::Boundary(B::ExpectedPaneIdentityMismatch),
+            E::Boundary(B::OutputSegmentMismatch),
+        ] {
+            assert!(!fatal.leaves_live_parser_consistent(), "{:?}", fatal);
+        }
     }
 
     #[test]
