@@ -12572,6 +12572,12 @@ mod tests {
                 .claim_session(stream_id)
                 .expect("sampled harness connection claims one recorder shard");
             let (sender, captured) = capturing_sender();
+            // The session reserves its render coordinator's main-thread slot.
+            // Run what is already queued first: publication above, and any
+            // task a thread left by an earlier test spawned onto this
+            // process-global executor (ft-vz24s), or both can fill a
+            // two-slot executor and refuse that reservation.
+            drain_simple_executor(&executor);
             let mut handler = SessionHandler::new_for_session_with_topology_stream(
                 sender,
                 SessionOwner::new(Arc::clone(&mux)),
@@ -13182,6 +13188,46 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// ft-vz24s: the executor is process-global, so a thread an earlier test
+    /// left running can spawn onto this test's executor, as
+    /// `Mux::notify_from_any_thread` does off the main thread. Such a task
+    /// must not keep the sampled harness from admitting its session.
+    #[test]
+    fn sampled_harness_runs_stray_cross_thread_tasks_before_admitting_its_session() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::try_with_limits(
+            MainThreadAdmissionLimits::new(2, 12 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let strays_ran = Arc::new(AtomicUsize::new(0));
+        let ran = Arc::clone(&strays_ran);
+        thread::spawn(move || {
+            match try_reserve_main_thread(MainThreadServiceClass::Topology, 1024) {
+                MainThreadReservationOutcome::Reserved(reservation) => reservation
+                    .spawn(async move {
+                        ran.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .detach(),
+                outcome => panic!("expected the stray task's admission, got {outcome:?}"),
+            }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(executor.admission_snapshot().active_tasks, 1);
+        let harness = SampledReliableHarness::new_with_executor(
+            Arc::new(FakePane::new_with_id(7_102, None)),
+            trace_recorder(1),
+            22,
+            "sampled-stray-task",
+            42_102,
+            executor,
+        );
+        assert_eq!(strays_ran.load(Ordering::SeqCst), 1);
+        assert_eq!(harness.executor.admission_snapshot().active_tasks, 1);
     }
 
     #[test]
