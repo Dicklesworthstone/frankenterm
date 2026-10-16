@@ -1312,6 +1312,25 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
         max_retained_rows: usize,
     ) -> Result<ScrollbackReplaceCommit, ScrollbackSpillError>;
 
+    /// [`Self::replace_scrollback_prefix`] for a caller whose model is
+    /// authoritative past `ancestor`, such as a guardian restore that has
+    /// replayed every output record after its checkpoint. Under the same
+    /// mutation boundary, the sink accepts its currently published generation
+    /// when it shares `ancestor`'s content epoch at a revision no older than
+    /// `ancestor`'s: rows a dead writer appended or published after the
+    /// checkpoint are superseded by `prefix`, never merged with it. The
+    /// receipt keeps the epoch and advances the current revision by exactly
+    /// one, so its revision exceeds `ancestor`'s. The default accepts only
+    /// `ancestor` itself.
+    fn replace_scrollback_prefix_superseding(
+        &self,
+        ancestor: ScrollbackSnapshotGeneration,
+        prefix: ScrollbackPrefix<'_>,
+        max_retained_rows: usize,
+    ) -> Result<ScrollbackReplaceCommit, ScrollbackSpillError> {
+        self.replace_scrollback_prefix(Some(ancestor), prefix, max_retained_rows)
+    }
+
     /// Commit a logical clear before returning success.
     ///
     /// Physical reclamation may be retried after this method returns, but

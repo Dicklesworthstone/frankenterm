@@ -364,6 +364,12 @@ impl ScreenOrAlt {
         self.alt_screen.finish_recovery_without_scrollback();
         Ok(())
     }
+
+    /// Only the primary screen holds cold scrollback.
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn supersede_recovered_cold_successors(&mut self) {
+        self.screen.supersede_recovered_cold_successors();
+    }
 }
 
 /// Configuration that per-character and per-row ingest paths read, captured
@@ -1178,6 +1184,11 @@ impl TerminalState {
             kitty_image_max_transmission_bytes,
             refreshed_unicode_version,
         }
+    }
+
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn supersede_recovered_cold_successors(&mut self) {
+        self.screen.supersede_recovered_cold_successors();
     }
 
     #[cfg(feature = "use_serde")]

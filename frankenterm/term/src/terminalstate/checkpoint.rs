@@ -6090,6 +6090,90 @@ mod tests {
         assert_eq!(sink.load_scrollback_line(oldest).unwrap(), original);
     }
 
+    /// A guardian restore replays every output record after its checkpoint,
+    /// so a row a dead writer spilled after the checkpoint is already in the
+    /// model: activation supersedes the advanced store with the model's
+    /// exact cold prefix, keeping neither the stale row nor a duplicate.
+    #[test]
+    fn cold_seam_checkpoint_supersedes_an_advanced_store_when_asked() {
+        use crate::config::ScrollbackSpillSink;
+
+        let (mut live, sink) = crate::screen::tests::cold_seam_test_terminal();
+        let limits = TerminalCheckpointLimits::default();
+        let config = live.get_config();
+        let mut prepared = live
+            .screen()
+            .capture_cold_seam_reflow()
+            .unwrap()
+            .expect("fixture must exercise a real cold/resident seam")
+            .hydrate(|| false)
+            .unwrap();
+        assert!(prepared.is_ready());
+        live.increment_seqno();
+        let seqno = live.current_seqno();
+        assert!(live
+            .screen_mut()
+            .install_cold_seam_reflow(&mut prepared, seqno)
+            .unwrap());
+        let canonical = TerminalCheckpointV3::capture_with_limits(&live, limits)
+            .unwrap()
+            .to_canonical_json(limits)
+            .unwrap();
+        let inert = TerminalCheckpointV3::decode_canonical_json(&canonical, limits)
+            .unwrap()
+            .restore_inert(config)
+            .unwrap();
+        let oldest = sink.oldest_scrollback_row().unwrap();
+        let original = sink.load_scrollback_line(oldest).unwrap();
+        // The dead writer's last spill: one more row past the checkpoint's
+        // cold prefix, after the checkpoint pinned its generation.
+        let stale_tail =
+            oldest + crate::StableRowIndex::try_from(sink.retained_scrollback_rows()).unwrap();
+        assert!(sink.store_scrollback_line(stale_tail, &original, 32));
+
+        let failure = match inert.into_live(Box::new(std::io::sink())) {
+            Ok(_) => panic!("strict activation must refuse an advanced cold store"),
+            Err(failure) => failure,
+        };
+        assert_eq!(
+            failure.error(),
+            &crate::InertTerminalError::ScrollbackActivation(
+                crate::config::ScrollbackActivationError::Spill(
+                    crate::config::ScrollbackSpillError::SnapshotGenerationMismatch,
+                ),
+            )
+        );
+        let (_, mut recovered) = failure.into_parts();
+        let model = recovered.checkpoint().unwrap();
+        let ancestor = model.primary_screen.cold_snapshot_generation.unwrap();
+        recovered.supersede_cold_scrollback_successors();
+        let activated = match recovered.into_live(Box::new(std::io::sink())) {
+            Ok(activated) => activated,
+            Err(failure) => panic!("superseding activation failed: {:?}", failure.error()),
+        };
+
+        let first_resident = activated.screen().phys_to_stable_row_index(0);
+        assert_eq!(sink.oldest_scrollback_row(), Some(oldest));
+        assert_eq!(
+            sink.retained_scrollback_rows(),
+            usize::try_from(first_resident - oldest).unwrap(),
+            "the store holds exactly the published prefix, contiguous and without duplicates"
+        );
+        assert!(
+            sink.load_scrollback_line(first_resident).is_none(),
+            "no stored row survives past the published prefix"
+        );
+        // Reading the cold rows back from the store yields the model's rows.
+        let after = TerminalCheckpointV3::capture_with_limits(&activated, limits).unwrap();
+        assert_eq!(after.primary_screen.lines, model.primary_screen.lines);
+        let committed = after.primary_screen.cold_snapshot_generation.unwrap();
+        assert_eq!(committed.content_epoch, ancestor.content_epoch);
+        assert!(
+            committed.revision > ancestor.revision + 1,
+            "the successor advances the store's generation, not the checkpoint's"
+        );
+    }
+
     #[test]
     fn canonical_restore_roundtrips_complete_semantic_projection() {
         let config: Arc<dyn TerminalConfiguration + Send + Sync> =

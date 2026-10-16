@@ -985,6 +985,16 @@ impl InertTerminal {
         .map_err(InertTerminalError::Checkpoint)
     }
 
+    /// Let [`Self::into_live`] supersede a cold scrollback store that
+    /// advanced past this checkpoint's cold generation in the same content
+    /// epoch, instead of refusing it. Only a caller that has replayed every
+    /// output record after the checkpoint may ask: its model then holds every
+    /// row the store gained since, and activation publishes exactly that
+    /// model's cold prefix.
+    pub fn supersede_cold_scrollback_successors(&mut self) {
+        self.terminal.state.supersede_recovered_cold_successors();
+    }
+
     /// Consume the off-topology model and replace its entire discard writer
     /// with a newly spawned live writer.  Buffered replay replies are owned by
     /// the discarded writer object and cannot cross this transition.

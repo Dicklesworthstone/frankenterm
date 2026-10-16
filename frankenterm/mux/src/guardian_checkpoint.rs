@@ -5032,10 +5032,15 @@ impl GuardianRestoredTerminal {
     }
 
     pub fn activate(
-        self,
+        mut self,
         writer: Box<dyn std::io::Write + Send>,
     ) -> anyhow::Result<(frankenterm_term::Terminal, GuardianRestoredParserPrefix)> {
         use crate::guardian_protocol::GuardianCheckpointOutputBoundaryV1;
+        // The model has replayed every guardian record after its checkpoint,
+        // so it holds every row the cold store gained since: the rows a dead
+        // mux spilled, published or adopted on reopen after that checkpoint
+        // are superseded by the model's exact cold prefix, not merged.
+        self.terminal.supersede_cold_scrollback_successors();
         let terminal = self.terminal.into_live(writer).map_err(|failure| {
             let (error, _) = failure.into_parts();
             anyhow::anyhow!("restored guardian model activation failed: {error}")

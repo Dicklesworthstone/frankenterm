@@ -2752,71 +2752,16 @@ mod deferred_scrollback {
             prefix: ScrollbackPrefix<'_>,
             retention: usize,
         ) -> Result<ScrollbackReplaceCommit, ScrollbackSpillError> {
-            let _operation = self
-                .operation
-                .lock()
-                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-            // An in-flight writer batch must finish before the generation
-            // changes under it.
-            let _drain = self
-                .drain_gate
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-            if state.publication_uncertain {
-                return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
-            }
-            if !state.pending.is_empty() {
-                return Err(ScrollbackSpillError::SnapshotGenerationMismatch);
-            }
-            // Allocate before the durable commit; capture remains Busy until
-            // bounds and identity are installed together under this guard.
-            let interval_identity = ScrollbackIntervalIdentity::default();
-            let oldest = prefix.oldest_stable_row();
-            let newest = prefix.newest_stable_row_exclusive();
-            let receipt = match self
-                .backing
-                .replace_scrollback_prefix(expected, prefix, retention)
-            {
-                Ok(receipt) => receipt,
-                Err(error) => {
-                    state.publication_uncertain =
-                        error == ScrollbackSpillError::CommitOutcomeIndeterminate;
-                    return Err(error);
-                }
-            };
-            let generation = receipt.generation();
-            let valid_generation = match expected {
-                Some(expected) => {
-                    generation.content_epoch() == expected.content_epoch()
-                        && expected.revision().checked_add(1) == Some(generation.revision())
-                }
-                None => generation.revision() == 1,
-            };
-            if receipt.oldest_stable_row() != oldest
-                || receipt.newest_stable_row_exclusive() != newest
-                || !valid_generation
-            {
-                state.publication_uncertain = true;
-                return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
-            }
-            // The replaced prefix is written row for row, so its store rows
-            // equal its stable rows again: no gap offset survives.
-            *state = State {
-                interval_identity,
-                ..State::empty(
-                    self.backing.retained_scrollback_bytes(),
-                    receipt.oldest_stable_row(),
-                    Some(receipt.newest_stable_row_exclusive()),
-                )
-            };
-            self.pending_rows.store(0, Ordering::Release);
-            drop(state);
-            self.publish_progress();
-            Ok(receipt)
+            self.replace_prefix_with(expected, false, prefix, retention)
+        }
+
+        fn replace_scrollback_prefix_superseding(
+            &self,
+            ancestor: ScrollbackSnapshotGeneration,
+            prefix: ScrollbackPrefix<'_>,
+            retention: usize,
+        ) -> Result<ScrollbackReplaceCommit, ScrollbackSpillError> {
+            self.replace_prefix_with(Some(ancestor), true, prefix, retention)
         }
 
         fn clear_scrollback(&self) -> Result<ScrollbackClearCommit, ScrollbackSpillError> {
@@ -2876,6 +2821,95 @@ mod deferred_scrollback {
             );
             self.pending_rows.store(0, Ordering::Release);
             self.writer.release(released);
+            drop(state);
+            self.publish_progress();
+            Ok(receipt)
+        }
+    }
+
+    impl DeferredScrollbackSpillSink {
+        /// Both replacement entry points; `supersede` passes an expected
+        /// generation to the backing sink as an ancestor.
+        fn replace_prefix_with(
+            &self,
+            expected: Option<ScrollbackSnapshotGeneration>,
+            supersede: bool,
+            prefix: ScrollbackPrefix<'_>,
+            retention: usize,
+        ) -> Result<ScrollbackReplaceCommit, ScrollbackSpillError> {
+            let _operation = self
+                .operation
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            // An in-flight writer batch must finish before the generation
+            // changes under it.
+            let _drain = self
+                .drain_gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            if state.publication_uncertain {
+                return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
+            }
+            if !state.pending.is_empty() {
+                return Err(ScrollbackSpillError::SnapshotGenerationMismatch);
+            }
+            // Allocate before the durable commit; capture remains Busy until
+            // bounds and identity are installed together under this guard.
+            let interval_identity = ScrollbackIntervalIdentity::default();
+            let oldest = prefix.oldest_stable_row();
+            let newest = prefix.newest_stable_row_exclusive();
+            // The backing sink checks a superseding ancestor under its own
+            // mutation boundary, while these locks keep this sink's writer
+            // from admitting a row in between.
+            let replaced = match expected {
+                Some(ancestor) if supersede => self
+                    .backing
+                    .replace_scrollback_prefix_superseding(ancestor, prefix, retention),
+                expected => self
+                    .backing
+                    .replace_scrollback_prefix(expected, prefix, retention),
+            };
+            let receipt = match replaced {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    state.publication_uncertain =
+                        error == ScrollbackSpillError::CommitOutcomeIndeterminate;
+                    return Err(error);
+                }
+            };
+            let generation = receipt.generation();
+            let valid_generation = match expected {
+                Some(expected) => {
+                    generation.content_epoch() == expected.content_epoch()
+                        && expected.revision().checked_add(1).is_some_and(|revision| {
+                            generation.revision() == revision
+                                || (supersede && generation.revision() > revision)
+                        })
+                }
+                None => generation.revision() == 1,
+            };
+            if receipt.oldest_stable_row() != oldest
+                || receipt.newest_stable_row_exclusive() != newest
+                || !valid_generation
+            {
+                state.publication_uncertain = true;
+                return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
+            }
+            // The replaced prefix is written row for row, so its store rows
+            // equal its stable rows again: no gap offset survives.
+            *state = State {
+                interval_identity,
+                ..State::empty(
+                    self.backing.retained_scrollback_bytes(),
+                    receipt.oldest_stable_row(),
+                    Some(receipt.newest_stable_row_exclusive()),
+                )
+            };
+            self.pending_rows.store(0, Ordering::Release);
             drop(state);
             self.publish_progress();
             Ok(receipt)
@@ -16930,6 +16964,105 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         wezterm_term::config::ScrollbackReplaceCommit,
         wezterm_term::config::ScrollbackSpillError,
     > {
+        self.replace_scrollback_prefix_with(expected_generation, false, prefix, max_retained_rows)
+    }
+
+    fn replace_scrollback_prefix_superseding(
+        &self,
+        ancestor: wezterm_term::config::ScrollbackSnapshotGeneration,
+        prefix: wezterm_term::config::ScrollbackPrefix<'_>,
+        max_retained_rows: usize,
+    ) -> Result<
+        wezterm_term::config::ScrollbackReplaceCommit,
+        wezterm_term::config::ScrollbackSpillError,
+    > {
+        self.replace_scrollback_prefix_with(Some(ancestor), true, prefix, max_retained_rows)
+    }
+
+    fn clear_scrollback(
+        &self,
+    ) -> Result<
+        wezterm_term::config::ScrollbackClearCommit,
+        wezterm_term::config::ScrollbackSpillError,
+    > {
+        use wezterm_term::config::{ScrollbackClearCommit, ScrollbackSpillError};
+
+        let _mutation_gate = self.lock_mutation_gate("clear_scrollback")?;
+        let _filesystem_mutation_lease = self.lock_filesystem_mutation("clear_scrollback")?;
+        self.forget_cold_segment();
+        let ledger_pane_id = self.active_ledger_pane_id();
+        let current_state = *self.lock_state("clear_scrollback current state")?;
+        if current_state.transaction_quarantined {
+            return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
+        }
+        self.verify_current_published_state_before_mutation(&current_state, ledger_pane_id, true)?;
+        self.advance_authenticated_append_wal_supersession()
+            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+        // Prove the physical store is available before publishing a logical
+        // clear. Holding this guard through publication also prevents a clear
+        // manifest from becoming durable after store-lock poisoning has made
+        // reclamation impossible to even attempt.
+        let mut store = self.lock_store("clear_scrollback store availability")?;
+        let (previous, clear_generation) = {
+            let mut state = self.lock_state("clear_scrollback state reset")?;
+            let previous = *state;
+            *state = self.clear_successor_state(&previous, ledger_pane_id);
+            (previous, state.snapshot_generation())
+        };
+        // Publish the clear intent before truncating the content log. If the
+        // process dies between these operations, constructor recovery observes
+        // `cleared` and completes the idempotent clear before accepting data.
+        if let Err(error) = self.persist_manifest("cleared") {
+            if error.outcome_indeterminate() {
+                if let Ok(mut state) = self.lock_state("clear_scrollback quarantine publication") {
+                    state.transaction_quarantined = true;
+                }
+                log::error!("scrollback clear publication outcome is indeterminate");
+                return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
+            }
+            *self.lock_state("clear_scrollback manifest rollback")? = previous;
+            log::error!("failed to publish scrollback clear intent");
+            return Err(ScrollbackSpillError::StorageUnavailable);
+        }
+        if let Err(error) = self.advance_authenticated_append_wal_supersession() {
+            log::warn!(
+                "deferred append WAL supersession acknowledgement after committed scrollback clear: {error:#}"
+            );
+        }
+        let physical_reclaimed = store.clear_pane(ledger_pane_id).is_ok();
+        drop(store);
+        if physical_reclaimed {
+            if let Ok(mut state) = self.lock_state("clear_scrollback physical completion") {
+                state.clear_pending_physical_reclamation = false;
+            } else {
+                log::error!("scrollback state unavailable after committed physical clear");
+            }
+        } else {
+            // The `cleared` manifest is already durable, so the logical clear
+            // is committed. Keep the old bytes unreachable and retry their
+            // physical reclamation before accepting a later row.
+            log::error!("deferred physical reclamation after committed scrollback clear");
+        }
+        Ok(ScrollbackClearCommit::new(clear_generation))
+    }
+}
+
+impl LiveScrollbackSpillSink {
+    /// The compare-and-swap behind both replacement entry points. With
+    /// `supersede`, an expected generation is an ancestor: the published
+    /// generation is accepted when it shares the ancestor's content epoch at
+    /// a revision no older than the ancestor's, and it becomes the
+    /// predecessor the successor manifest names.
+    fn replace_scrollback_prefix_with(
+        &self,
+        expected_generation: Option<wezterm_term::config::ScrollbackSnapshotGeneration>,
+        supersede: bool,
+        prefix: wezterm_term::config::ScrollbackPrefix<'_>,
+        max_retained_rows: usize,
+    ) -> Result<
+        wezterm_term::config::ScrollbackReplaceCommit,
+        wezterm_term::config::ScrollbackSpillError,
+    > {
         use wezterm_term::config::{
             ScrollbackReplaceCommit, ScrollbackSnapshotGeneration, ScrollbackSpillError,
         };
@@ -16966,6 +17099,21 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         } else {
             self.lock_store("replace_scrollback_prefix CAS rows")?
                 .line_count(previous_ledger_pane_id)
+        };
+        // Superseding: rows this lineage gained after the ancestor (tail
+        // windows a dead writer committed, or adopted on reopen) are replaced
+        // under this same mutation boundary, never merged.
+        let expected_generation = match expected_generation {
+            Some(ancestor) if supersede => {
+                let published = previous_state.snapshot_generation();
+                if published.content_epoch() != ancestor.content_epoch()
+                    || published.revision() < ancestor.revision()
+                {
+                    return Err(ScrollbackSpillError::SnapshotGenerationMismatch);
+                }
+                Some(published)
+            }
+            expected => expected,
         };
         let successor_generation = match expected_generation {
             Some(expected) => {
@@ -17281,73 +17429,6 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             prefix.oldest_stable_row(),
             prefix.newest_stable_row_exclusive(),
         ))
-    }
-
-    fn clear_scrollback(
-        &self,
-    ) -> Result<
-        wezterm_term::config::ScrollbackClearCommit,
-        wezterm_term::config::ScrollbackSpillError,
-    > {
-        use wezterm_term::config::{ScrollbackClearCommit, ScrollbackSpillError};
-
-        let _mutation_gate = self.lock_mutation_gate("clear_scrollback")?;
-        let _filesystem_mutation_lease = self.lock_filesystem_mutation("clear_scrollback")?;
-        self.forget_cold_segment();
-        let ledger_pane_id = self.active_ledger_pane_id();
-        let current_state = *self.lock_state("clear_scrollback current state")?;
-        if current_state.transaction_quarantined {
-            return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
-        }
-        self.verify_current_published_state_before_mutation(&current_state, ledger_pane_id, true)?;
-        self.advance_authenticated_append_wal_supersession()
-            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-        // Prove the physical store is available before publishing a logical
-        // clear. Holding this guard through publication also prevents a clear
-        // manifest from becoming durable after store-lock poisoning has made
-        // reclamation impossible to even attempt.
-        let mut store = self.lock_store("clear_scrollback store availability")?;
-        let (previous, clear_generation) = {
-            let mut state = self.lock_state("clear_scrollback state reset")?;
-            let previous = *state;
-            *state = self.clear_successor_state(&previous, ledger_pane_id);
-            (previous, state.snapshot_generation())
-        };
-        // Publish the clear intent before truncating the content log. If the
-        // process dies between these operations, constructor recovery observes
-        // `cleared` and completes the idempotent clear before accepting data.
-        if let Err(error) = self.persist_manifest("cleared") {
-            if error.outcome_indeterminate() {
-                if let Ok(mut state) = self.lock_state("clear_scrollback quarantine publication") {
-                    state.transaction_quarantined = true;
-                }
-                log::error!("scrollback clear publication outcome is indeterminate");
-                return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
-            }
-            *self.lock_state("clear_scrollback manifest rollback")? = previous;
-            log::error!("failed to publish scrollback clear intent");
-            return Err(ScrollbackSpillError::StorageUnavailable);
-        }
-        if let Err(error) = self.advance_authenticated_append_wal_supersession() {
-            log::warn!(
-                "deferred append WAL supersession acknowledgement after committed scrollback clear: {error:#}"
-            );
-        }
-        let physical_reclaimed = store.clear_pane(ledger_pane_id).is_ok();
-        drop(store);
-        if physical_reclaimed {
-            if let Ok(mut state) = self.lock_state("clear_scrollback physical completion") {
-                state.clear_pending_physical_reclamation = false;
-            } else {
-                log::error!("scrollback state unavailable after committed physical clear");
-            }
-        } else {
-            // The `cleared` manifest is already durable, so the logical clear
-            // is committed. Keep the old bytes unreachable and retry their
-            // physical reclamation before accepting a later row.
-            log::error!("deferred physical reclamation after committed scrollback clear");
-        }
-        Ok(ScrollbackClearCommit::new(clear_generation))
     }
 }
 
@@ -19190,6 +19271,90 @@ mod tests {
             deferred.clear_scrollback().is_err(),
             "uncertainty requires reopen"
         );
+    }
+
+    /// Guardian restore: the checkpoint pinned the store's generation, then
+    /// the writer kept spilling (every spilled row advances the revision).
+    /// The restored model replayed those rows from the guardian journal, so
+    /// a superseding replacement publishes exactly its prefix over them,
+    /// while the strict compare-and-swap keeps refusing.
+    #[test]
+    fn deferred_scrollback_superseding_replacement_replaces_rows_spilled_after_the_ancestor() {
+        use wezterm_term::config::{
+            ScrollbackPrefix, ScrollbackSnapshotGeneration, ScrollbackSnapshotLimits,
+            ScrollbackSpillError,
+        };
+        let (_dir, backing, deferred) = deferred_test_sink();
+        let attrs = CellAttributes::blank();
+        let row = |text: &str| Line::from_text(text, &attrs, 5, None);
+        assert!(deferred.store_scrollback_line(10, &row("checkpointed"), 8));
+        let ancestor = deferred
+            .snapshot_scrollback(
+                11,
+                ScrollbackSnapshotLimits {
+                    max_rows: 8,
+                    max_stored_bytes: 1024 * 1024,
+                    max_decoded_bytes: 1024 * 1024,
+                    max_physical_bytes: 1024 * 1024,
+                },
+            )
+            .unwrap()
+            .generation();
+        assert!(deferred.store_scrollback_line(11, &row("spilled after"), 8));
+        assert!(deferred.store_scrollback_line(12, &row("spilled after too"), 8));
+        deferred.flush_scrollback().unwrap();
+
+        let model = [row("checkpointed"), row("replayed")];
+        let prefix = || ScrollbackPrefix::from_slices(Some(10), 12, &model, &[]).unwrap();
+        assert_eq!(
+            deferred
+                .replace_scrollback_prefix(Some(ancestor), prefix(), 8)
+                .map(|_| ()),
+            Err(ScrollbackSpillError::SnapshotGenerationMismatch),
+            "the strict compare-and-swap refuses an advanced store"
+        );
+        let foreign = ScrollbackSnapshotGeneration::new([0xa5; 16], ancestor.revision());
+        let ahead = ScrollbackSnapshotGeneration::new(ancestor.content_epoch(), u64::MAX - 1);
+        for refused in [foreign, ahead] {
+            assert_eq!(
+                deferred
+                    .replace_scrollback_prefix_superseding(refused, prefix(), 8)
+                    .map(|_| ()),
+                Err(ScrollbackSpillError::SnapshotGenerationMismatch),
+                "only a same-epoch ancestor at or behind the store may be superseded"
+            );
+        }
+        let published = backing
+            .lock_state("superseding regression")
+            .unwrap()
+            .snapshot_generation();
+        assert!(published.revision() > ancestor.revision());
+
+        let receipt = deferred
+            .replace_scrollback_prefix_superseding(ancestor, prefix(), 8)
+            .unwrap();
+        assert_eq!(
+            receipt.generation(),
+            ScrollbackSnapshotGeneration::new(ancestor.content_epoch(), published.revision() + 1),
+            "the successor advances the published generation, not the ancestor"
+        );
+        assert_eq!(
+            (
+                receipt.oldest_stable_row(),
+                receipt.newest_stable_row_exclusive()
+            ),
+            (Some(10), 12)
+        );
+        assert_eq!(deferred.load_scrollback_line(10), Some(row("checkpointed")));
+        assert_eq!(deferred.load_scrollback_line(11), Some(row("replayed")));
+        assert_eq!(
+            deferred.load_scrollback_line(12),
+            None,
+            "no stale tail row survives"
+        );
+        assert_eq!(deferred.retained_scrollback_rows(), 2);
+        assert!(deferred.store_scrollback_line(12, &row("live again"), 8));
+        assert_eq!(deferred.load_scrollback_line(12), Some(row("live again")));
     }
 
     #[test]
