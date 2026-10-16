@@ -408,16 +408,16 @@
         "other": 9,
         "refactor": 1,
         "rename": 1,
-        "security-fix": 53,
+        "security-fix": 54,
         "test": 6
       },
-      "fork_side_commit_count": 109,
+      "fork_side_commit_count": 110,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-10-08T21:04:46-04:00",
-        "sha": "9c8212bc51ddcb58bab90f0c1b6bce9ab2425bdb",
-        "subject": "style: rustfmt six files whose committed formatting broke the workspace format gate"
+        "classification": "security-fix",
+        "committed_at": "2026-10-16T14:06:53-04:00",
+        "sha": "a39a055b614c4f71eb3d14ac588c3d0871043750",
+        "subject": "perf(escape-parser): validate a parse call's input once and hand runs out as slices of it, not one from_utf8 per run (ft-yccm0.3.2.6)"
       },
       "name": "frankenterm-escape-parser",
       "path": "frankenterm/escape-parser",
@@ -1206,8 +1206,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 3219,
-  "generated_at": "2026-10-16T17:59:37.186127Z",
+  "fork_side_commit_total": 3220,
+  "generated_at": "2026-10-16T18:07:06.021458Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
