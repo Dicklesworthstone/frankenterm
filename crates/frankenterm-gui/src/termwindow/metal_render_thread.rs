@@ -876,8 +876,16 @@ mod tests {
             panes.kept_frames()
         };
         assert_eq!(draw(&both), vec![9101, 9102]);
-        assert_eq!(draw(&both[..1]), vec![9101], "the hidden pane's frame is dropped");
-        assert_eq!(draw(&both), vec![9101, 9102], "and rebuilt when drawn again");
+        assert_eq!(
+            draw(&both[..1]),
+            vec![9101],
+            "the hidden pane's frame is dropped"
+        );
+        assert_eq!(
+            draw(&both),
+            vec![9101, 9102],
+            "and rebuilt when drawn again"
+        );
     }
 
     /// Waits up to 20 s for `done`.

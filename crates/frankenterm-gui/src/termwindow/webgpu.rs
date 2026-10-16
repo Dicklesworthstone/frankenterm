@@ -1731,7 +1731,10 @@ impl WebGpuState {
     }
 
     fn desired_alpha_mode(&self) -> wgpu::CompositeAlphaMode {
-        select_composite_alpha_mode(&self.surface_alpha_modes.borrow(), self.opaque_content.get())
+        select_composite_alpha_mode(
+            &self.surface_alpha_modes.borrow(),
+            self.opaque_content.get(),
+        )
     }
 
     /// Re-account the swapchain drawables after a configure applied `config`.

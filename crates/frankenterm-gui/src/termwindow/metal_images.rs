@@ -415,7 +415,11 @@ mod tests {
             drawn = slices.slice(&image, (8, 16)).is_some();
         }
         assert!(drawn, "the image draws");
-        assert!(slices.side > FIRST_SIDE, "the texture grew to {}", slices.side);
+        assert!(
+            slices.side > FIRST_SIDE,
+            "the texture grew to {}",
+            slices.side
+        );
         assert!(first.upgrade().is_none(), "the outgrown texture is freed");
     }
 }

@@ -3925,7 +3925,10 @@ impl TermWindow {
                         window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
                             if tw.occluded
                                 && tw.occlusion_generation == generation
-                                && tw.webgpu.as_ref().is_some_and(|webgpu| webgpu.park_surface())
+                                && tw
+                                    .webgpu
+                                    .as_ref()
+                                    .is_some_and(|webgpu| webgpu.park_surface())
                             {
                                 metrics::counter!("gui.surface.park", "action" => "parked")
                                     .increment(1);
