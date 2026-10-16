@@ -20,7 +20,8 @@
 # 3,000-line burst and then a line a second while recovery captures run
 # every 2 s for N seconds. Recovery must publish by halfway and again
 # after it, never disable itself, and keep the checkpoint stage at most
-# 8 uploads, the pane catalog at most 4 members, and each output journal
+# 8 uploads, the pane catalog at most 8 members (the guardian keeps the
+# newest 8 so failed captures cannot reclaim a committed root's member), and each output journal
 # at most a few segments. Keep N under ~180 so tick 0 stays in the tail.
 set -uo pipefail
 # The guardian refuses group- or world-writable directories on its paths
@@ -132,7 +133,7 @@ if [ "$SOAK" -gt 0 ]; then
     || fail "recovery disabled itself $DISABLED time(s)"
   [ $((UPLOADS + GENESIS)) -le 8 ] && pass "stage bounded ($UPLOADS pane + $GENESIS genesis uploads)" \
     || fail "stage holds $UPLOADS pane + $GENESIS genesis uploads"
-  [ "$MEMBERS" -le 4 ] && pass "catalog bounded ($MEMBERS members)" || fail "catalog holds $MEMBERS members"
+  [ "$MEMBERS" -le 8 ] && pass "catalog bounded ($MEMBERS members)" || fail "catalog holds $MEMBERS members"
   [ "$RSEG" -le 4 ] && [ "$BSEG" -le 4 ] && pass "journals bounded (guardian $RSEG, broker $BSEG segments)" \
     || fail "journal segments: guardian $RSEG, broker $BSEG"
 fi
