@@ -143,6 +143,13 @@ const CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_RECORD_BYTES: u64 =
 const CHECKPOINT_CATALOG_RESTORE_BINDING_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-catalog-restore-binding.v1\0";
 const CHECKPOINT_CATALOG_MAX_PUBLISHED_MEMBERS: usize = 8;
+/// Pane members a publication keeps: the newest few, so both of the mux's
+/// recovery roots and a capture still in flight name members that exist.
+const CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS: usize = 4;
+const _: () = assert!(
+    CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS > 1
+        && CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS <= CHECKPOINT_CATALOG_MAX_PUBLISHED_MEMBERS
+);
 // One immutable candidate and marker per retained member, plus one bounded
 // crash candidate per generation. No reclamation is performed in this phase.
 const CHECKPOINT_CATALOG_MAX_RELEVANT_FILES: usize = CHECKPOINT_CATALOG_MAX_PUBLISHED_MEMBERS * 3;
@@ -7144,10 +7151,12 @@ fn checkpoint_stage_reclaim_superseded(
             continue;
         };
         for (key, capture_generation, acknowledged) in uploads {
+            // An acknowledged upload had a published member; if catalog
+            // reclamation already removed it, the upload is older still.
             let superseded = *key != newest_key
                 && if *acknowledged {
                     member_generation(key, *capture_generation)
-                        .is_some_and(|generation| generation < newest_generation)
+                        .is_none_or(|generation| generation < newest_generation)
                 } else {
                     *capture_generation < newest_capture_generation
                 };
@@ -12446,9 +12455,21 @@ fn checkpoint_catalog_validate_chain(
             checkpoint_id: prior.metadata.checkpoint_id,
             boundary_id: prior.metadata.boundary_id,
         });
+        // Reclamation unlinks the oldest Pane members, so the oldest one left
+        // may name a predecessor that is gone; it must still name the
+        // generation right before its own.
+        let pruned_base = previous.is_none()
+            && member.metadata.identity.generation > 1
+            && matches!(
+                member.metadata.identity.scope,
+                CheckpointCatalogScope::Pane { .. }
+            )
+            && member.metadata.predecessor.is_some_and(|predecessor| {
+                predecessor.generation.checked_add(1) == Some(member.metadata.identity.generation)
+            });
         if Some(member.metadata.identity.scope) != expected_scope
-            || member.metadata.predecessor != expected_predecessor
-            || previous.is_none() != (member.metadata.identity.generation == 1)
+            || (member.metadata.predecessor != expected_predecessor && !pruned_base)
+            || (previous.is_none() != (member.metadata.identity.generation == 1) && !pruned_base)
             || previous.is_some_and(|prior| {
                 prior.format == CheckpointCatalogFormat::ProtectedV3
                     && member.format == CheckpointCatalogFormat::LegacyV2
@@ -12675,9 +12696,18 @@ fn checkpoint_catalog_scan(
         }
     }
     checkpoint_catalog_validate_chain(&mut published)?;
+    // An unmarked candidate older than every published member is what an
+    // interrupted reclamation leaves behind (it unlinks the marker first),
+    // never a publication still in flight; reclamation finishes it.
+    let oldest_published = published
+        .first()
+        .map(|member| member.metadata.identity.generation);
     let unpublished_candidates = candidates
         .into_iter()
-        .filter(|candidate| !candidate.published)
+        .filter(|candidate| {
+            !candidate.published
+                && oldest_published.is_none_or(|oldest| candidate.identity.generation >= oldest)
+        })
         .collect();
     inner
         .persistence
@@ -13526,6 +13556,99 @@ fn checkpoint_catalog_publish_genesis_stage(
     Ok(head.clone())
 }
 
+/// Before a Pane publication, unlink every published member older than the
+/// newest `CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS - 1`, so the scope holds at
+/// most that many once the new member is published, and finish any
+/// reclamation an interruption left. Only a contiguous oldest prefix goes,
+/// stopping at a member an active replay snapshot pins, and while the replay
+/// state is busy no member goes this time. Each member's marker goes before
+/// its candidate, so an interruption leaves an unmarked candidate older than
+/// every published member, which a scan never mistakes for a publication in
+/// flight. Returns how many members went.
+fn checkpoint_catalog_reclaim_oldest_pane_members(
+    inner: &GuardianCheckpointStageStoreInner,
+    scan: &CheckpointCatalogScan,
+) -> Result<usize, GuardianCheckpointStageStoreError> {
+    let Some(oldest) = scan.published.first() else {
+        return Ok(0);
+    };
+    let scope = oldest.metadata.identity.scope;
+    if !matches!(scope, CheckpointCatalogScope::Pane { .. }) {
+        return Ok(0);
+    }
+    let mut unlinked_files = 0_usize;
+    for name in read_directory_names(&inner.directory)? {
+        let Some((
+            identity,
+            CheckpointCatalogPathKind::Canonical(CheckpointCatalogPathRole::Candidate),
+        )) = name.to_str().and_then(checkpoint_catalog_parse_path)
+        else {
+            continue;
+        };
+        if identity.scope != scope || identity.generation >= oldest.metadata.identity.generation {
+            continue;
+        }
+        let path = inner.directory_path.join(&name);
+        let file = open_private_file_at(&inner.directory, &inner.directory_path, &path, false)?;
+        let metadata = file.metadata().map_err(|error| {
+            GuardianCheckpointStageStoreError::io("checkpoint-catalog-leftover-metadata", error)
+        })?;
+        validate_private_file_metadata(&metadata, None)?;
+        drop(file);
+        unlink_owned_output_file(
+            &inner.directory,
+            &inner.directory_path,
+            &path,
+            FileIdentity::capture(&metadata, Some(metadata.len())),
+        )?;
+        unlinked_files += 1;
+    }
+    let excess = scan
+        .published
+        .len()
+        .saturating_sub(CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS - 1);
+    let mut reclaimed = 0;
+    if excess > 0
+        && let Ok(replay) = inner.replay.try_lock()
+    {
+        let pinned: Vec<CheckpointCatalogIdentity> = replay
+            .snapshots
+            .values()
+            .flat_map(|snapshot| {
+                [
+                    snapshot.catalog.selected.metadata.identity,
+                    snapshot.catalog.settled_head_identity,
+                ]
+            })
+            .collect();
+        drop(replay);
+        for member in scan.published.iter().take(excess) {
+            if pinned.contains(&member.metadata.identity) {
+                break;
+            }
+            unlink_owned_output_file(
+                &inner.directory,
+                &inner.directory_path,
+                &member.marker_path,
+                member.marker_file_identity,
+            )?;
+            unlink_owned_output_file(
+                &inner.directory,
+                &inner.directory_path,
+                &member.candidate_path,
+                member.candidate_file_identity,
+            )?;
+            reclaimed += 1;
+        }
+    }
+    if reclaimed != 0 || unlinked_files != 0 {
+        inner.directory.sync_all().map_err(|error| {
+            GuardianCheckpointStageStoreError::io("checkpoint-catalog-reclaim-sync", error)
+        })?;
+    }
+    Ok(reclaimed)
+}
+
 fn checkpoint_catalog_publish_sealed_stage(
     inner: &GuardianCheckpointStageStoreInner,
     request: &GuardianCheckpointStageRequestV1,
@@ -13536,7 +13659,7 @@ fn checkpoint_catalog_publish_sealed_stage(
     }
     let shape = CheckpointStageRequestShape::from_request(request)?;
     let scope = CheckpointCatalogScope::from_stage_scope(shape.path_scope);
-    let scan = checkpoint_catalog_scan(inner, scope)?;
+    let mut scan = checkpoint_catalog_scan(inner, scope)?;
     if let Some(existing) = scan.published.iter().find(|member| {
         member.metadata.checkpoint_id == shape.descriptor.checkpoint_id().into_bytes()
             && member.metadata.capture_generation == shape.descriptor.capture_generation()
@@ -13585,6 +13708,13 @@ fn checkpoint_catalog_publish_sealed_stage(
             return Ok(existing.clone());
         }
         return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    if matches!(scope, CheckpointCatalogScope::Pane { .. })
+        && scan.unpublished_candidates.is_empty()
+        && scan.staged_files.is_empty()
+        && checkpoint_catalog_reclaim_oldest_pane_members(inner, &scan)? != 0
+    {
+        scan = checkpoint_catalog_scan(inner, scope)?;
     }
     if scan.published.len() >= CHECKPOINT_CATALOG_MAX_PUBLISHED_MEMBERS
         || scan
@@ -16053,6 +16183,124 @@ mod tests {
                 })?;
             assert_eq!(published, 2);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_keeps_the_newest_pane_members_and_restores_from_a_pruned_chain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-catalog-reclaim-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0xc1100);
+        let mux = Uuid::from_u128(0xc1101);
+        let pane = Uuid::from_u128(0xc1102);
+        let generation = 1;
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
+        let retained = u64::try_from(CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS)?;
+        // Twelve acknowledged captures of one pane: half again the eight
+        // members a pane scope may ever hold, so without reclamation the
+        // ninth publication is refused.
+        let mut output = Vec::new();
+        let mut checkpoints = Vec::new();
+        for capture in 0..12_u64 {
+            let appended = format!("capture {capture};");
+            output.extend_from_slice(appended.as_bytes());
+            let (checkpoint_id, _) = checkpoint_catalog_stage_and_publish(
+                &pipeline,
+                &store,
+                &journal,
+                &mut state,
+                guardian,
+                mux,
+                pane,
+                generation,
+                capture + 1,
+                0xc1_0000 + u128::from(capture) * 0x10,
+                appended.as_bytes(),
+                &output,
+            )?;
+            checkpoints.push(checkpoint_id);
+            let (begin, completion) = checkpoint_catalog_newest_begin(&store, pane)?;
+            store.apply_ack_from_committed_catalog(
+                GuardianCheckpointStageRequestV1::ack(
+                    begin.scope(),
+                    begin.upload_id(),
+                    begin.descriptor(),
+                    begin.chunk_bytes(),
+                    completion,
+                )?,
+                mux,
+            )?;
+            // Exactly the newest members remain, a contiguous suffix of the
+            // chain; the scan accepts its pruned base.
+            let generations: Vec<u64> = store.with_exclusive_directory(|inner| {
+                Ok(
+                    checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })?
+                        .published
+                        .iter()
+                        .map(|member| member.metadata.identity.generation)
+                        .collect(),
+                )
+            })?;
+            let first = (capture + 1).saturating_sub(retained - 1).max(1);
+            assert_eq!(generations, (first..=capture + 1).collect::<Vec<_>>());
+            assert!(
+                checkpoint_stage_upload_keys(&store)?.len()
+                    <= CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS
+            );
+        }
+
+        // A restore of the newest capture still works from the pruned chain.
+        let maximum_plaintext_bytes = 64 * 1024;
+        let open = GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::LatestCompatible,
+            max_plaintext_bytes: maximum_plaintext_bytes,
+            max_records: 4,
+            wait_millis: 0,
+        };
+        let open_request = checkpoint_catalog_replay_request(
+            guardian,
+            mux,
+            Uuid::from_u128(0xc1200),
+            pane,
+            generation,
+            open,
+        )?;
+        let preflight = state.preflight_replay(&open_request)?;
+        let restored = observe_replay_page(
+            store.apply_replay(&open_request, preflight, Some(&journal))?,
+            maximum_plaintext_bytes,
+        )?;
+        assert_ne!(restored.checkpoint_plaintext.len(), 0);
+
+        // An exact request for a reclaimed capture is refused, not served
+        // from some other member.
+        let reclaimed = GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::ExactCheckpoint {
+                checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes(checkpoints[0])?,
+                capture_generation: generation,
+            },
+            max_plaintext_bytes: maximum_plaintext_bytes,
+            max_records: 4,
+            wait_millis: 0,
+        };
+        let reclaimed_request = checkpoint_catalog_replay_request(
+            guardian,
+            mux,
+            Uuid::from_u128(0xc1201),
+            pane,
+            generation,
+            reclaimed,
+        )?;
+        let preflight = state.preflight_replay(&reclaimed_request)?;
+        assert!(matches!(
+            store.apply_replay(&reclaimed_request, preflight, Some(&journal)),
+            Err(GuardianCheckpointStageStoreError::CandidateAbsent)
+        ));
         Ok(())
     }
 
