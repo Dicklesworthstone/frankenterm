@@ -30,6 +30,9 @@
 #   * Nothing is deleted. Stale sockets are moved to $STATE/stale-sockets after
 #     a connect attempt proves no listener.
 set -euo pipefail
+# The guardian refuses group- or world-writable directories on its paths, and
+# a host umask of 002 creates exactly those. Keep any stricter umask.
+umask "$(printf '%04o' $(( 8#$(umask) | 8#022 )))"
 
 SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 INSTANCE=${FTG_INSTANCE:-}
@@ -421,10 +424,18 @@ svc_stop() {  # <logical name>
     systemd) systemctl --user stop "$(unit "$1")" ;;
     launchd) launchctl bootout "gui/$(id -u)/$(unit "$1")" 2>/dev/null || true ;;
     direct)
+      # Like systemd's stop: a grace period, then SIGKILL. A replacement must
+      # never start beside a predecessor that still holds the guardian's
+      # recovery custody (a mux mid-capture can take half a minute to exit).
       local pid
       pid=$(svc_pid "$1")
-      [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null || true
-      for _ in $(seq 30); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+      [ -n "$pid" ] || return 0
+      kill -TERM "$pid" 2>/dev/null || return 0
+      for _ in $(seq 120); do kill -0 "$pid" 2>/dev/null || return 0; sleep 0.5; done
+      log "$1 (pid $pid) ignored SIGTERM for 60s; sending SIGKILL"
+      kill -KILL "$pid" 2>/dev/null || true
+      for _ in $(seq 20); do kill -0 "$pid" 2>/dev/null || return 0; sleep 0.5; done
+      die "$1 (pid $pid) survived SIGKILL"
       ;;
   esac
 }

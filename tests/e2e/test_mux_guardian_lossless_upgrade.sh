@@ -23,6 +23,9 @@
 # 8 uploads, the pane catalog at most 4 members, and each output journal
 # at most a few segments. Keep N under ~180 so tick 0 stays in the tail.
 set -uo pipefail
+# The guardian refuses group- or world-writable directories on its paths
+# (a umask of 002 on some hosts); keep any stricter umask.
+umask "$(printf '%04o' $(( 8#$(umask) | 8#022 )))"
 SOAK=${SOAK_SECONDS:-0}
 OLD=${1:?old family dir}
 NEW=${2:?new family dir}
