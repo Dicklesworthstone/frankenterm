@@ -4826,6 +4826,13 @@ struct SelectedRecoveryCheckpoint {
     boundary_id: [u8; 32],
     payload_digest: [u8; 32],
     payload_bytes: u64,
+    /// Successor generations that earlier attempts at this same selection
+    /// already claimed (each through an authenticated recovery intent bound
+    /// to this root, image and checkpoint) before failing or dying without
+    /// a newer publication. Only `claim_recovery` advances it, along exactly
+    /// that intent chain; the guardian journal still holds every record
+    /// after the checkpoint, whoever owned the lease meanwhile.
+    traversed_successors: u64,
 }
 
 impl SelectedRecoveryCheckpoint {
@@ -4861,7 +4868,11 @@ impl SelectedRecoveryCheckpoint {
     }
 
     fn validate_attach(self, pane_id: Uuid, generation: u64) -> Result<(), GuardianProxyError> {
-        if pane_id != self.pane_id || self.generation.checked_add(1) != Some(generation) {
+        let successor = self
+            .generation
+            .checked_add(1)
+            .and_then(|successor| successor.checked_add(self.traversed_successors));
+        if pane_id != self.pane_id || successor != Some(generation) {
             return Err(GuardianProxyError::InvalidConfiguration(
                 "recovery attachment differs from the selected pane and successor generation",
             ));
@@ -4972,6 +4983,7 @@ impl GuardianProxyLeasePlan {
             boundary_id: publication.output_boundary_identity,
             payload_digest,
             payload_bytes,
+            traversed_successors: 0,
         };
         let RecoverySpawnCustody::Original(custody) = &pane.spawn_custody else {
             return Err(GuardianProxyError::InvalidConfiguration(
@@ -5402,6 +5414,14 @@ impl GuardianProxyLeasePlan {
                 .predecessor_generation
                 .checked_add(1)
                 .ok_or_else(rejected)?;
+            // Each traversal below follows an authenticated child intent that
+            // keeps this selection's root, image and checkpoint, so the
+            // generations between the checkpoint and this one were claimed by
+            // earlier attempts at this same recovery.
+            let traversed_successors = generation
+                .checked_sub(selected.generation)
+                .and_then(|claims| claims.checked_sub(1))
+                .ok_or_else(rejected)?;
             let mut current_reservation =
                 if intent.target_mux_incarnation == self.census.mux_incarnation() {
                     let identity = GuardianPaneLeaseIdentity::new(
@@ -5554,7 +5574,10 @@ impl GuardianProxyLeasePlan {
                         .map_err(map_replay_client_error)?,
                 );
                 staging.spawn_custody = Some(original);
-                staging.selected_checkpoint = Some(selected);
+                staging.selected_checkpoint = Some(SelectedRecoveryCheckpoint {
+                    traversed_successors,
+                    ..selected
+                });
                 return Ok(staging);
             }
 
@@ -10755,6 +10778,16 @@ mod tests {
             .unwrap();
         assert_eq!(staging.actor.lock().identity().generation(), 4);
         assert_eq!(staging.actor.lock().identity().mux_incarnation(), owner);
+        // The whole-mux restore (`--recovery-restore`) holds the traversed
+        // lease to the same selection: the dead attempts claimed 2 and 3.
+        let selected = staging.selected_checkpoint.unwrap();
+        assert_eq!(selected.traversed_successors, 2);
+        selected
+            .validate_root(
+                SelectedRecoveryRoot::from_validated(recovery),
+                staging.identity(),
+            )
+            .expect("a retried recovery activates at the generation its intent chain reached");
         let stale = GuardianClient::connect_for_genesis(socket, token, Uuid::new_v4())
             .unwrap()
             .resolve_mux_successor(
@@ -12111,6 +12144,7 @@ mod tests {
             boundary_id: fixture.descriptor.boundary_id().into_bytes(),
             payload_digest: fixture.descriptor.terminal_payload_digest(),
             payload_bytes: fixture.descriptor.total_bytes(),
+            traversed_successors: 0,
         };
         for control in 0..7 {
             let mut expected = selected;
@@ -12192,6 +12226,30 @@ mod tests {
             ..selected
         };
         assert!(exhausted.validate_attach(selected.pane_id, 0).is_err());
+        // Two earlier attempts at this selection claimed generation + 1 and
+        // + 2; the third attaches at + 3 and nowhere else.
+        let retried = SelectedRecoveryCheckpoint {
+            traversed_successors: 2,
+            ..selected
+        };
+        assert!(
+            retried
+                .validate_attach(selected.pane_id, selected.generation + 3)
+                .is_ok()
+        );
+        for refused in [
+            selected.generation + 1,
+            selected.generation + 2,
+            selected.generation + 4,
+        ] {
+            assert!(retried.validate_attach(selected.pane_id, refused).is_err());
+        }
+        let overflowing = SelectedRecoveryCheckpoint {
+            generation: u64::MAX - 1,
+            traversed_successors: 1,
+            ..selected
+        };
+        assert!(overflowing.validate_attach(selected.pane_id, 0).is_err());
     }
 
     fn genesis_checkpoint_fixture() -> (GuardianCheckpointDescriptorV1, Zeroizing<Vec<u8>>) {
