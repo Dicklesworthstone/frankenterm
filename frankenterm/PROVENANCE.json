@@ -993,18 +993,18 @@
         "feat": 16,
         "fix": 59,
         "other": 51,
-        "refactor": 3,
+        "refactor": 4,
         "rename": 1,
         "security-fix": 2,
         "test": 25
       },
-      "fork_side_commit_count": 169,
+      "fork_side_commit_count": 170,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-10-16T13:59:24-04:00",
-        "sha": "db81b59b7a576d9de812cef19f302e96cceaabc9",
-        "subject": "perf(surface): a reused row wipes only the text it holds, and a gap is filled with spaces in bulk (ft-yccm0.3.2.6)"
+        "classification": "refactor",
+        "committed_at": "2026-10-16T15:23:39-04:00",
+        "sha": "7b3823c421503c199054b002c50209589cb60b11",
+        "subject": "refactor(surface): ClusteredLine's text is private, read through text() (review of db81b59b7)"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -1038,20 +1038,20 @@
         "cosmetic": 16,
         "docs": 2,
         "feat": 74,
-        "fix": 169,
+        "fix": 170,
         "other": 77,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
         "test": 79
       },
-      "fork_side_commit_count": 434,
+      "fork_side_commit_count": 435,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-16T13:59:24-04:00",
-        "sha": "30ebc2ff70409977cf5c1ff92f715882b99e2966",
-        "subject": "fix(term): a store-less tiered pane recycles a row per scroll at its limit instead of freeing and allocating alternately (ft-qvt9l.1)"
+        "committed_at": "2026-10-16T15:23:39-04:00",
+        "sha": "c80177441b0912bce95fc548cb619a97bd439975",
+        "subject": "fix(term): a store-less page-engine pane at its limit no longer drops every row above the hot tier in one scroll, nor warns per newline (ft-qvt9l.1)"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1206,8 +1206,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 3220,
-  "generated_at": "2026-10-16T18:07:06.021458Z",
+  "fork_side_commit_total": 3222,
+  "generated_at": "2026-10-16T19:23:53.027372Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
