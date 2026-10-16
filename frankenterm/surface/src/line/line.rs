@@ -1342,7 +1342,7 @@ impl Line {
                 }
                 Cow::Owned(s)
             }
-            CellStorage::C(cl) => Cow::Borrowed(&cl.text),
+            CellStorage::C(cl) => Cow::Borrowed(cl.text()),
         }
     }
 
@@ -1383,7 +1383,7 @@ impl Line {
     /// Returns `None` if the sum of vector-cell text lengths overflows.
     pub fn visible_text_bytes(&self) -> Option<usize> {
         match &self.cells {
-            CellStorage::C(line) => Some(line.text.len()),
+            CellStorage::C(line) => Some(line.text().len()),
             CellStorage::V(cells) => cells
                 .visible_cells()
                 .try_fold(0usize, |bytes, cell| bytes.checked_add(cell.str().len())),
@@ -1909,7 +1909,7 @@ impl Line {
 
     pub fn prune_trailing_blanks(&mut self, seqno: SequenceNo) {
         if let CellStorage::C(cl) = &mut self.cells {
-            if !cl.text.ends_with(' ') {
+            if !cl.text().ends_with(' ') {
                 return;
             }
             if Arc::make_mut(cl).prune_trailing_blanks() {
@@ -6459,7 +6459,7 @@ mod tests {
         assert!(line.append_ascii_cell_run(0, &"x".repeat(200), CellAttributes::blank(), 1));
         line.set_last_cell_was_wrapped(true, 1);
         let text = match &line.cells {
-            CellStorage::C(clustered) => clustered.text.as_ptr(),
+            CellStorage::C(clustered) => clustered.text().as_ptr(),
             CellStorage::V(_) => panic!("an ASCII run on a new line stays clustered"),
         };
 
@@ -6470,8 +6470,8 @@ mod tests {
         assert!(!recycled.last_cell_was_wrapped());
         match &recycled.cells {
             CellStorage::C(clustered) => {
-                assert!(clustered.text.is_empty());
-                assert_eq!(clustered.text.as_ptr(), text, "the text buffer is reused");
+                assert!(clustered.text().is_empty());
+                assert_eq!(clustered.text().as_ptr(), text, "the text buffer is reused");
             }
             CellStorage::V(_) => panic!("a recycled row stays clustered"),
         }
@@ -6531,7 +6531,7 @@ mod tests {
                 (CellStorage::C(live), CellStorage::C(snapshot), CellStorage::C(cloned)) => {
                     assert!(Arc::ptr_eq(live, snapshot));
                     assert!(Arc::ptr_eq(live, cloned));
-                    assert_eq!(live.text.as_ptr(), snapshot.text.as_ptr());
+                    assert_eq!(live.text().as_ptr(), snapshot.text().as_ptr());
                 }
                 _ => panic!("clustered clones must retain clustered shared storage"),
             }
@@ -6577,7 +6577,7 @@ mod tests {
         let restored: CellStorage = serde_json::from_value(expected.clone()).unwrap();
         if let CellStorage::C(other) = &restored {
             assert!(!Arc::ptr_eq(payload, other));
-            assert_eq!(payload.text, other.text);
+            assert_eq!(payload.text(), other.text());
             assert_eq!(payload.len(), other.len());
             assert_eq!(
                 payload.last_cell_was_wrapped(),

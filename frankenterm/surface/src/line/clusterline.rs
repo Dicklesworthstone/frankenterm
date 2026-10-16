@@ -110,7 +110,9 @@ pub fn clustered_append_breaks(prev: Option<char>, next: char) -> bool {
 #[cfg_attr(feature = "use_serde", derive(Serialize))]
 #[derive(PartialEq)]
 pub(crate) struct ClusteredLine {
-    pub text: String,
+    /// Private: [`wipe_text_in_use`] relies on this text changing only
+    /// through this module's appends, trailing-space pops and wipes.
+    text: String,
     #[cfg_attr(
         feature = "use_serde",
         serde(
@@ -670,6 +672,11 @@ impl ClusteredLine {
 
     pub fn len(&self) -> usize {
         self.len as usize
+    }
+
+    /// The row's text, read-only: writes stay in this module.
+    pub(crate) fn text(&self) -> &str {
+        &self.text
     }
 
     /// The text, when it is non-empty and every cell is one printable ASCII

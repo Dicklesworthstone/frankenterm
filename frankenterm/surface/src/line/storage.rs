@@ -59,7 +59,7 @@ mod test {
         };
         let snapshot = original.clone();
         drop(original);
-        assert_eq!(weak.upgrade().unwrap().text, "owned");
+        assert_eq!(weak.upgrade().unwrap().text(), "owned");
         drop(snapshot);
         assert!(
             weak.upgrade().is_none(),
