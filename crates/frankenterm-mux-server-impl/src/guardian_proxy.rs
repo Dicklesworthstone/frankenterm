@@ -1693,8 +1693,12 @@ fn query_guardian_checkpoint_stage(
     request_id: Uuid,
 ) -> Result<GuardianCheckpointStageReplyV1, GuardianProxyError> {
     let started = Instant::now();
-    let admission_budget = Duration::from_millis(250);
-    for attempt in 0..32 {
+    // A Seal or ACK of a multi-megabyte checkpoint, or a replay page, can hold
+    // the guardian's single protocol state well past a quarter second, and it
+    // closes every request that arrives meanwhile. Two seconds with backoff
+    // lets this capture finish instead of failing its whole recovery round.
+    let admission_budget = Duration::from_secs(2);
+    for attempt in 0..32_u32 {
         let request =
             GuardianCheckpointStageRequestV1::query(scope, upload_id, descriptor, chunk_bytes)
                 .map_err(GuardianProxyError::ReplayProtocol)?;
@@ -1705,7 +1709,7 @@ fn query_guardian_checkpoint_stage(
                     return Err(error);
                 }
                 metrics::counter!("mux.guardian_proxy.checkpoint_query_retry_total").increment(1);
-                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                std::thread::sleep(remaining.min(Duration::from_millis(10 << attempt.min(3))));
                 if started.elapsed() >= admission_budget {
                     return Err(error);
                 }
