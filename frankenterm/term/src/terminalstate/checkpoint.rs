@@ -3342,7 +3342,7 @@ impl StagedRecoveryCheckpoint {
         let mut checkpoint = self.hot.materialize_cold_history(self.limits)?;
         let rows = checkpoint.primary_rows();
         let cols = checkpoint.primary_cols();
-        let payload = checkpoint.to_canonical_json_trimming_history(self.limits)?;
+        let payload = checkpoint.encode_trimming_history(self.limits)?;
         Ok(crate::RecoveryTerminalCheckpointV3::from_canonical_parts(
             payload,
             rows,
@@ -4439,7 +4439,7 @@ impl TerminalCheckpointV3 {
     /// `drop_oldest_primary_history_to_fit`). A recovery image of the newest
     /// history beats none: a payload its decoder refused used to poison the
     /// pane's live parser and end the pane.
-    fn to_canonical_json_trimming_history(
+    fn encode_trimming_history(
         &mut self,
         limits: TerminalCheckpointLimits,
     ) -> Result<Zeroizing<Vec<u8>>, TerminalCheckpointError> {
@@ -4493,8 +4493,7 @@ impl TerminalCheckpointV3 {
         }
 
         let mut dropped = 0;
-        while (structural > structural_target || encoded > encoded_target) && dropped < droppable
-        {
+        while (structural > structural_target || encoded > encoded_target) && dropped < droppable {
             structural -= shares[dropped].0;
             encoded -= shares[dropped].1;
             dropped += 1;
@@ -4634,7 +4633,7 @@ impl TerminalCheckpointV3 {
         };
         let rows = active_screen.physical_rows as usize;
         let cols = active_screen.physical_cols as usize;
-        let canonical_payload = self.to_canonical_json_trimming_history(limits)?;
+        let canonical_payload = self.encode_trimming_history(limits)?;
         Ok(crate::RecoveryTerminalCheckpointV3::from_canonical_parts(
             canonical_payload,
             rows,
@@ -5915,12 +5914,7 @@ mod tests {
     }
 
     /// A 4x10 terminal holding about 100 lines of scrollback, and its checkpoint.
-    fn checkpoint_with_scrollback() -> (
-        Arc<dyn TerminalConfiguration + Send + Sync>,
-        TerminalCheckpointV3,
-    ) {
-        let config: Arc<dyn TerminalConfiguration + Send + Sync> =
-            Arc::new(RichCheckpointTestConfig);
+    fn checkpoint_with_scrollback() -> TerminalCheckpointV3 {
         let mut live = Terminal::new(
             TerminalSize {
                 rows: 4,
@@ -5929,7 +5923,7 @@ mod tests {
                 pixel_height: 80,
                 dpi: 96,
             },
-            Arc::clone(&config),
+            Arc::new(RichCheckpointTestConfig),
             "FrankenTerm",
             "history-budget",
             Box::new(std::io::sink()),
@@ -5941,7 +5935,7 @@ mod tests {
             TerminalCheckpointV3::capture_with_limits(&live, TerminalCheckpointLimits::default())
                 .unwrap();
         assert!(checkpoint.primary_screen.lines.len() > 100);
-        (config, checkpoint)
+        checkpoint
     }
 
     /// Default limits with a retained-memory budget of `retained` bytes.
@@ -5956,7 +5950,7 @@ mod tests {
 
     #[test]
     fn encoder_refuses_a_payload_its_decoder_would_refuse() {
-        let (_config, checkpoint) = checkpoint_with_scrollback();
+        let checkpoint = checkpoint_with_scrollback();
         let full = checkpoint
             .to_canonical_json(TerminalCheckpointLimits::default())
             .unwrap();
@@ -5986,7 +5980,7 @@ mod tests {
 
     #[test]
     fn live_capture_drops_only_the_oldest_history_until_its_decoder_admits_it() {
-        let (config, checkpoint) = checkpoint_with_scrollback();
+        let checkpoint = checkpoint_with_scrollback();
         let full = checkpoint
             .to_canonical_json(TerminalCheckpointLimits::default())
             .unwrap();
@@ -5995,7 +5989,7 @@ mod tests {
         let tight = limits_with_retained_budget(charged / 2);
 
         let mut trimmed = checkpoint.clone();
-        let payload = trimmed.to_canonical_json_trimming_history(tight).unwrap();
+        let payload = trimmed.encode_trimming_history(tight).unwrap();
         let before = &checkpoint.primary_screen;
         let after = &trimmed.primary_screen;
         let dropped = before.lines.len() - after.lines.len();
@@ -6015,13 +6009,15 @@ mod tests {
         assert!(fitted <= tight.max_retained_capture_bytes - tight.max_retained_capture_bytes / 8);
         let restored = TerminalCheckpointV3::decode_canonical_json(&payload, tight)
             .unwrap()
-            .restore_inert(Arc::clone(&config))
+            .restore_inert(Arc::new(RichCheckpointTestConfig))
             .unwrap()
             .into_live(Box::new(std::io::sink()))
             .unwrap();
-        let recaptured =
-            TerminalCheckpointV3::capture_with_limits(&restored, TerminalCheckpointLimits::default())
-                .unwrap();
+        let recaptured = TerminalCheckpointV3::capture_with_limits(
+            &restored,
+            TerminalCheckpointLimits::default(),
+        )
+        .unwrap();
         assert_eq!(recaptured.primary_screen.lines, after.lines);
         assert_eq!(
             recaptured.primary_screen.stable_row_index_offset,
@@ -6031,7 +6027,7 @@ mod tests {
         // A capture within budget is left whole.
         let mut whole = checkpoint.clone();
         whole
-            .to_canonical_json_trimming_history(TerminalCheckpointLimits::default())
+            .encode_trimming_history(TerminalCheckpointLimits::default())
             .unwrap();
         assert!(whole == checkpoint);
     }
