@@ -1,0 +1,1 @@
+[BENCH] ingest_throughput lane=term corpus=file:unicode_mix-67108864-000000000135288d.bin bytes=67108864 secs=1.978 MiB/s=32.4 load_avg_1m=2.42 sanity=ok

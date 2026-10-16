@@ -1,0 +1,3416 @@
+{
+  "schema": "ft.bench.ghostty-h2h.v1",
+  "bead": "ft-yccm0.1.3",
+  "mode": "measure",
+  "started_utc": "2026-10-16T18:19:39Z",
+  "contract": {
+    "path": "/Users/jemanuel/.cache/fth2h/ft/docs/perf/incumbents/ghostty.md",
+    "sha256": "8f36664acefd660a53921a54277bcb014f93fc73ddf10709d36ef441204584be"
+  },
+  "zig": {
+    "version": "0.16.0",
+    "tarball": "/Users/jemanuel/.cache/fth2h/work/dl/zig-aarch64-macos-0.16.0.tar.xz",
+    "tarball_sha256": "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489",
+    "path": "/Users/jemanuel/.cache/fth2h/work/toolchain/zig-0.16.0-b23d70deaa87-20261016T164157Z-26152/zig-aarch64-macos-0.16.0/zig"
+  },
+  "app": {
+    "path": "/Users/jemanuel/.cache/fth2h/Ghostty.app",
+    "bundle_id": "com.mitchellh.ghostty",
+    "short_version": "8f0dd3709",
+    "build": "18093",
+    "binary": "Contents/MacOS/ghostty",
+    "binary_sha256": "888267fe57e5dfa1d709c5086bf6cb0ddc7ce118632352e0c7330fbc6fb40e22"
+  },
+  "ghostty": {
+    "src": "/Users/jemanuel/.cache/fth2h/ghostty",
+    "commit": "e500d414f2ef688d86d0228f39e8ca1a1285f72a",
+    "describe": "e500d414f",
+    "version": "1.3.2-dev",
+    "checkout_clean": true,
+    "build_flags": "-Demit-bench -Doptimize=ReleaseFast -Demit-macos-app=false"
+  },
+  "binaries": {
+    "ghostty_bench": {
+      "path": "/Users/jemanuel/.cache/fth2h/work/ghostty-e500d414f2ef-zig0.16.0/out/bin/ghostty-bench",
+      "sha256": "74643d910e1a35f698aba4eaad34db4753b99ff483e629a6b65095b92e1af95a"
+    },
+    "ghostty_probe": {
+      "path": "/Users/jemanuel/.cache/fth2h/work/probe-e500d414f2ef-zig0.16.0-5e61c3cd5de2/out/bin/ghostty-h2h-probe",
+      "sha256": "4ca27e68afb63d15873a0d59b29ff2a8fac961a398d3a454522d1b6b68eb6784",
+      "source_sha256": "5e61c3cd5de26958e36de8c7e0a3fb2e7c528aed133d76c54a648caead52eb10"
+    },
+    "frankenterm": {
+      "path": "/Users/jemanuel/.cache/fth2h/work/ft-target/release-perf/examples/ingest_throughput",
+      "sha256": "4582559033272fe9fa847f3df9098510b3f299e27a1ab033df22531f07773877",
+      "profile": "release-perf"
+    }
+  },
+  "frankenterm": {
+    "git_head": "920ce2787f2fb36504a430f1e2c355f9beffa3eb",
+    "tree_dirty": false,
+    "lane": "term",
+    "scrollback": 3500,
+    "chunk_bytes": 65536
+  },
+  "fingerprint": {
+    "system": "Darwin",
+    "kernel": "25.5.0",
+    "machine": "arm64",
+    "model": "Mac16,10",
+    "cpu": "Apple M4",
+    "ncpu": 10,
+    "performance_cores": 4,
+    "efficiency_cores": 6,
+    "memory_bytes": 34359738368,
+    "os_version": "26.5",
+    "os_build": "25F71",
+    "thermal": [
+      "Note: No thermal warning level has been recorded",
+      "Note: No performance warning level has been recorded",
+      "Note: No CPU power status has been recorded"
+    ],
+    "load_avg": [
+      2.87,
+      3.37,
+      2.88
+    ],
+    "hyperfine": "hyperfine 1.20.0",
+    "zig": "0.16.0",
+    "rustc": "rustc 1.100.0-nightly (908501772 2026-08-30)",
+    "macos_sdk": null,
+    "python": "3.14.6"
+  },
+  "finished_utc": "2026-10-16T18:23:01Z",
+  "pins": {
+    "ghostty_commit": "e500d414f2ef688d86d0228f39e8ca1a1285f72a",
+    "ghostty_version": "1.3.2-dev",
+    "zig_version": "0.16.0",
+    "zig_tarball": "zig-aarch64-macos-0.16.0.tar.xz",
+    "zig_tarball_url": "https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz",
+    "zig_tarball_sha256": "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489",
+    "zig_tarball_top_dir": "zig-aarch64-macos-0.16.0",
+    "build_flags": "-Demit-bench -Doptimize=ReleaseFast -Demit-macos-app=false",
+    "bench_binary": "bin/ghostty-bench",
+    "bench_action": "+terminal-stream",
+    "bench_read_chunk_bytes": 65536,
+    "bench_default_scrollback_bytes": 10000,
+    "geometries": [
+      {
+        "rows": 80,
+        "cols": 120
+      },
+      {
+        "rows": 117,
+        "cols": 512
+      }
+    ],
+    "primary_corpus": "color_emoji_random",
+    "app_path": "/Applications/Ghostty.app",
+    "app_bundle_id": "com.mitchellh.ghostty",
+    "app_short_version": "8f0dd3709",
+    "app_build": "18093",
+    "app_binary": "Contents/MacOS/ghostty",
+    "app_binary_sha256": "888267fe57e5dfa1d709c5086bf6cb0ddc7ce118632352e0c7330fbc6fb40e22",
+    "ft_profile": "release-perf",
+    "ft_scrollback": 3500,
+    "ft_chunk_bytes": 65536,
+    "min_runs": 10,
+    "warmup": 3,
+    "max_cv_pct": 5.0,
+    "max_load_1m": 4.0
+  },
+  "gates": {
+    "max_cv_pct": 5.0,
+    "max_load_1m": 4.0,
+    "min_runs": 10,
+    "rounds": 10,
+    "warmup": 3,
+    "order": "ABBA",
+    "contract_max_cv_pct": 5.0,
+    "contract_max_load_1m": 4.0
+  },
+  "inputs": [
+    {
+      "corpus": "color_emoji_random",
+      "path": "/Users/jemanuel/.cache/fth2h/work/corpus/color_emoji_random-67108864-000000000135288d.bin",
+      "bytes": 67108864,
+      "sha256": "7222c37a2842a8442302e35ac29a82b4fc7fa2d556d7504d83c4d17b571dbfa9",
+      "source": "generated",
+      "seed": 20261005
+    },
+    {
+      "corpus": "color_random",
+      "path": "/Users/jemanuel/.cache/fth2h/work/corpus/color_random-67108864-000000000135288d.bin",
+      "bytes": 67108864,
+      "sha256": "ec4903b7ec210e162d245d7fafe29d5207364466abf98e2ddc1d8eea01085c41",
+      "source": "generated",
+      "seed": 20261005
+    },
+    {
+      "corpus": "seq_lines",
+      "path": "/Users/jemanuel/.cache/fth2h/work/corpus/seq_lines-67108864-000000000135288d.bin",
+      "bytes": 67108864,
+      "sha256": "d07e1bf9614185eac008cfa31cf516978d2fed62b7bf5880e35ee9a6f5f90459",
+      "source": "generated",
+      "seed": 20261005
+    },
+    {
+      "corpus": "long_lines",
+      "path": "/Users/jemanuel/.cache/fth2h/work/corpus/long_lines-67108864-000000000135288d.bin",
+      "bytes": 67108864,
+      "sha256": "336f8a167e6ae10627ba2d7f10cc489c8f7e29887a919f2efee0f0f4e157a22e",
+      "source": "generated",
+      "seed": 20261005
+    },
+    {
+      "corpus": "unicode_mix",
+      "path": "/Users/jemanuel/.cache/fth2h/work/corpus/unicode_mix-67108864-000000000135288d.bin",
+      "bytes": 67108864,
+      "sha256": "f3ab8fc9d700fd8359dc0c137b5eabf766ebe3882fa4424b5d01fa105650223f",
+      "source": "generated",
+      "seed": 20261005
+    },
+    {
+      "corpus": "tui_repaint",
+      "path": "/Users/jemanuel/.cache/fth2h/work/corpus/tui_repaint-67108864-000000000135288d.bin",
+      "bytes": 67108864,
+      "sha256": "2b5da0b39204f06396a51a4d2dc62956472e9b3eefec99db25afd6d3db070719",
+      "source": "generated",
+      "seed": 20261005
+    }
+  ],
+  "rows": [
+    {
+      "schema": "ft.bench.ghostty-h2h-row.v1",
+      "corpus": "color_emoji_random",
+      "input_sha256": "7222c37a2842a8442302e35ac29a82b4fc7fa2d556d7504d83c4d17b571dbfa9",
+      "geometry": {
+        "rows": 80,
+        "cols": 120
+      },
+      "ft_scrollback": 3500,
+      "ft_chunk_bytes": 65536,
+      "commands": {
+        "ghostty": "'/Users/jemanuel/.cache/fth2h/work/ghostty-e500d414f2ef-zig0.16.0/out/bin/ghostty-bench' +terminal-stream --data='/Users/jemanuel/.cache/fth2h/work/corpus/color_emoji_random-67108864-000000000135288d.bin' --terminal-rows=80 --terminal-cols=120",
+        "frankenterm": "'/Users/jemanuel/.cache/fth2h/work/ft-target/release-perf/examples/ingest_throughput' --lane term --from-file '/Users/jemanuel/.cache/fth2h/work/corpus/color_emoji_random-67108864-000000000135288d.bin' --rows 80 --cols 120 --scrollback 3500 --chunk 65536"
+      },
+      "arms": {
+        "ghostty": {
+          "n": 10,
+          "median_s": 0.34933154200000005,
+          "p95_s": 0.3539955,
+          "mean_s": 0.3490309083,
+          "stddev_s": 0.0035406211804808224,
+          "cv_pct": 1.014414797166782,
+          "min_s": 0.341309166,
+          "max_s": 0.3539955,
+          "times_s": [
+            0.35069662500000004,
+            0.348964125,
+            0.348043416,
+            0.349625375,
+            0.341309166,
+            0.34903770900000003,
+            0.350161,
+            0.3539955,
+            0.345840959,
+            0.35263520800000003
+          ],
+          "peak_rss_bytes_median": 45924352.0
+        },
+        "frankenterm": {
+          "n": 10,
+          "median_s": 0.2544258955,
+          "p95_s": 0.26448662500000003,
+          "mean_s": 0.2551674873,
+          "stddev_s": 0.0034221011442395794,
+          "cv_pct": 1.3411195840229522,
+          "min_s": 0.25267825,
+          "max_s": 0.26448662500000003,
+          "times_s": [
+            0.26448662500000003,
+            0.25578612500000003,
+            0.254176958,
+            0.254103833,
+            0.253148166,
+            0.25267825,
+            0.25479945800000003,
+            0.254969167,
+            0.254674833,
+            0.25285145800000003
+          ],
+          "internal_lane_secs_untimed_runs": [
+            0.218605333,
+            0.213814125
+          ],
+          "state_fingerprints": [
+            "f7218a8722d6996a"
+          ],
+          "peak_rss_bytes_median": 80191488.0
+        }
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-01.json",
+          "ghostty_s": 0.35069662500000004,
+          "ghostty_peak_rss_bytes": 11894784,
+          "frankenterm_s": 0.26448662500000003,
+          "frankenterm_peak_rss_bytes": 80248832
+        },
+        {
+          "round": 2,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-02.json",
+          "frankenterm_s": 0.25578612500000003,
+          "frankenterm_peak_rss_bytes": 80003072,
+          "ghostty_s": 0.348964125,
+          "ghostty_peak_rss_bytes": 80003072
+        },
+        {
+          "round": 3,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-03.json",
+          "ghostty_s": 0.348043416,
+          "ghostty_peak_rss_bytes": 11862016,
+          "frankenterm_s": 0.254176958,
+          "frankenterm_peak_rss_bytes": 80232448
+        },
+        {
+          "round": 4,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-04.json",
+          "frankenterm_s": 0.254103833,
+          "frankenterm_peak_rss_bytes": 79986688,
+          "ghostty_s": 0.349625375,
+          "ghostty_peak_rss_bytes": 79986688
+        },
+        {
+          "round": 5,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-05.json",
+          "ghostty_s": 0.341309166,
+          "ghostty_peak_rss_bytes": 11862016,
+          "frankenterm_s": 0.253148166,
+          "frankenterm_peak_rss_bytes": 80232448
+        },
+        {
+          "round": 6,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-06.json",
+          "frankenterm_s": 0.25267825,
+          "frankenterm_peak_rss_bytes": 80019456,
+          "ghostty_s": 0.34903770900000003,
+          "ghostty_peak_rss_bytes": 80019456
+        },
+        {
+          "round": 7,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-07.json",
+          "ghostty_s": 0.350161,
+          "ghostty_peak_rss_bytes": 11862016,
+          "frankenterm_s": 0.25479945800000003,
+          "frankenterm_peak_rss_bytes": 80183296
+        },
+        {
+          "round": 8,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-08.json",
+          "frankenterm_s": 0.254969167,
+          "frankenterm_peak_rss_bytes": 80232448,
+          "ghostty_s": 0.3539955,
+          "ghostty_peak_rss_bytes": 80232448
+        },
+        {
+          "round": 9,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-09.json",
+          "ghostty_s": 0.345840959,
+          "ghostty_peak_rss_bytes": 11878400,
+          "frankenterm_s": 0.254674833,
+          "frankenterm_peak_rss_bytes": 80199680
+        },
+        {
+          "round": 10,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-10.json",
+          "frankenterm_s": 0.25285145800000003,
+          "frankenterm_peak_rss_bytes": 79953920,
+          "ghostty_s": 0.35263520800000003,
+          "ghostty_peak_rss_bytes": 79953920
+        }
+      ],
+      "load_1m": {
+        "samples": [
+          {
+            "at": "2026-10-16T18:19:49Z",
+            "load_1m": 2.8
+          },
+          {
+            "at": "2026-10-16T18:19:51Z",
+            "load_1m": 2.8
+          },
+          {
+            "at": "2026-10-16T18:19:52Z",
+            "load_1m": 2.82
+          },
+          {
+            "at": "2026-10-16T18:19:53Z",
+            "load_1m": 2.82
+          },
+          {
+            "at": "2026-10-16T18:19:53Z",
+            "load_1m": 2.82
+          },
+          {
+            "at": "2026-10-16T18:19:54Z",
+            "load_1m": 2.82
+          },
+          {
+            "at": "2026-10-16T18:19:55Z",
+            "load_1m": 2.82
+          },
+          {
+            "at": "2026-10-16T18:19:55Z",
+            "load_1m": 2.82
+          },
+          {
+            "at": "2026-10-16T18:19:56Z",
+            "load_1m": 2.82
+          },
+          {
+            "at": "2026-10-16T18:19:57Z",
+            "load_1m": 2.67
+          },
+          {
+            "at": "2026-10-16T18:19:57Z",
+            "load_1m": 2.67
+          }
+        ],
+        "peak": 2.82
+      },
+      "paired": {
+        "pairs": 10,
+        "ft_wins": 10,
+        "median_pair_speedup": 1.3717784332456464
+      },
+      "ft_speedup": 1.3730188167894257,
+      "ft_speedup_unadmitted": 1.3730188167894257,
+      "hyperfine_json": [
+        "round-01.json",
+        "round-02.json",
+        "round-03.json",
+        "round-04.json",
+        "round-05.json",
+        "round-06.json",
+        "round-07.json",
+        "round-08.json",
+        "round-09.json",
+        "round-10.json"
+      ],
+      "verdict": "ft_faster",
+      "refusal_reasons": [],
+      "dir": "rows/color_emoji_random@80x120"
+    },
+    {
+      "schema": "ft.bench.ghostty-h2h-row.v1",
+      "corpus": "color_emoji_random",
+      "input_sha256": "7222c37a2842a8442302e35ac29a82b4fc7fa2d556d7504d83c4d17b571dbfa9",
+      "geometry": {
+        "rows": 117,
+        "cols": 512
+      },
+      "ft_scrollback": 3500,
+      "ft_chunk_bytes": 65536,
+      "commands": {
+        "ghostty": "'/Users/jemanuel/.cache/fth2h/work/ghostty-e500d414f2ef-zig0.16.0/out/bin/ghostty-bench' +terminal-stream --data='/Users/jemanuel/.cache/fth2h/work/corpus/color_emoji_random-67108864-000000000135288d.bin' --terminal-rows=117 --terminal-cols=512",
+        "frankenterm": "'/Users/jemanuel/.cache/fth2h/work/ft-target/release-perf/examples/ingest_throughput' --lane term --from-file '/Users/jemanuel/.cache/fth2h/work/corpus/color_emoji_random-67108864-000000000135288d.bin' --rows 117 --cols 512 --scrollback 3500 --chunk 65536"
+      },
+      "arms": {
+        "ghostty": {
+          "n": 10,
+          "median_s": 0.36483658350000003,
+          "p95_s": 0.369666417,
+          "mean_s": 0.3647790794,
+          "stddev_s": 0.0024483614856794927,
+          "cv_pct": 0.6711902145557893,
+          "min_s": 0.3617425,
+          "max_s": 0.369666417,
+          "times_s": [
+            0.364593084,
+            0.365080083,
+            0.36572912500000004,
+            0.366030334,
+            0.366568416,
+            0.369666417,
+            0.36178983400000003,
+            0.3617425,
+            0.36422033400000003,
+            0.36237066700000004
+          ],
+          "peak_rss_bytes_median": 60112896.0
+        },
+        "frankenterm": {
+          "n": 10,
+          "median_s": 0.253555,
+          "p95_s": 0.28526970900000004,
+          "mean_s": 0.2583284958,
+          "stddev_s": 0.010268729896512447,
+          "cv_pct": 3.975066654846541,
+          "min_s": 0.251883417,
+          "max_s": 0.28526970900000004,
+          "times_s": [
+            0.255465916,
+            0.253753,
+            0.28526970900000004,
+            0.252856208,
+            0.261320667,
+            0.26367125,
+            0.25331295800000003,
+            0.25239483300000004,
+            0.253357,
+            0.251883417
+          ],
+          "internal_lane_secs_untimed_runs": [
+            0.209045792,
+            0.209146417
+          ],
+          "state_fingerprints": [
+            "c6fae10faa58d071"
+          ],
+          "peak_rss_bytes_median": 108265472.0
+        }
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-01.json",
+          "ghostty_s": 0.364593084,
+          "ghostty_peak_rss_bytes": 13434880,
+          "frankenterm_s": 0.255465916,
+          "frankenterm_peak_rss_bytes": 108265472
+        },
+        {
+          "round": 2,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-02.json",
+          "frankenterm_s": 0.253753,
+          "frankenterm_peak_rss_bytes": 108265472,
+          "ghostty_s": 0.365080083,
+          "ghostty_peak_rss_bytes": 108265472
+        },
+        {
+          "round": 3,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-03.json",
+          "ghostty_s": 0.36572912500000004,
+          "ghostty_peak_rss_bytes": 13418496,
+          "frankenterm_s": 0.28526970900000004,
+          "frankenterm_peak_rss_bytes": 108249088
+        },
+        {
+          "round": 4,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-04.json",
+          "frankenterm_s": 0.252856208,
+          "frankenterm_peak_rss_bytes": 108232704,
+          "ghostty_s": 0.366030334,
+          "ghostty_peak_rss_bytes": 108232704
+        },
+        {
+          "round": 5,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-05.json",
+          "ghostty_s": 0.366568416,
+          "ghostty_peak_rss_bytes": 13451264,
+          "frankenterm_s": 0.261320667,
+          "frankenterm_peak_rss_bytes": 108265472
+        },
+        {
+          "round": 6,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-06.json",
+          "frankenterm_s": 0.26367125,
+          "frankenterm_peak_rss_bytes": 108363776,
+          "ghostty_s": 0.369666417,
+          "ghostty_peak_rss_bytes": 108363776
+        },
+        {
+          "round": 7,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-07.json",
+          "ghostty_s": 0.36178983400000003,
+          "ghostty_peak_rss_bytes": 13434880,
+          "frankenterm_s": 0.25331295800000003,
+          "frankenterm_peak_rss_bytes": 108265472
+        },
+        {
+          "round": 8,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-08.json",
+          "frankenterm_s": 0.25239483300000004,
+          "frankenterm_peak_rss_bytes": 106774528,
+          "ghostty_s": 0.3617425,
+          "ghostty_peak_rss_bytes": 106774528
+        },
+        {
+          "round": 9,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-09.json",
+          "ghostty_s": 0.36422033400000003,
+          "ghostty_peak_rss_bytes": 13434880,
+          "frankenterm_s": 0.253357,
+          "frankenterm_peak_rss_bytes": 108265472
+        },
+        {
+          "round": 10,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-10.json",
+          "frankenterm_s": 0.251883417,
+          "frankenterm_peak_rss_bytes": 108314624,
+          "ghostty_s": 0.36237066700000004,
+          "ghostty_peak_rss_bytes": 108314624
+        }
+      ],
+      "load_1m": {
+        "samples": [
+          {
+            "at": "2026-10-16T18:19:58Z",
+            "load_1m": 2.67
+          },
+          {
+            "at": "2026-10-16T18:20:01Z",
+            "load_1m": 2.67
+          },
+          {
+            "at": "2026-10-16T18:20:01Z",
+            "load_1m": 2.67
+          },
+          {
+            "at": "2026-10-16T18:20:02Z",
+            "load_1m": 2.62
+          },
+          {
+            "at": "2026-10-16T18:20:03Z",
+            "load_1m": 2.62
+          },
+          {
+            "at": "2026-10-16T18:20:03Z",
+            "load_1m": 2.62
+          },
+          {
+            "at": "2026-10-16T18:20:04Z",
+            "load_1m": 2.62
+          },
+          {
+            "at": "2026-10-16T18:20:05Z",
+            "load_1m": 2.62
+          },
+          {
+            "at": "2026-10-16T18:20:05Z",
+            "load_1m": 2.62
+          },
+          {
+            "at": "2026-10-16T18:20:06Z",
+            "load_1m": 2.62
+          },
+          {
+            "at": "2026-10-16T18:20:07Z",
+            "load_1m": 2.97
+          }
+        ],
+        "peak": 2.97
+      },
+      "paired": {
+        "pairs": 10,
+        "ft_wins": 10,
+        "median_pair_speedup": 1.4307365751622187
+      },
+      "ft_speedup": 1.4388853838417703,
+      "ft_speedup_unadmitted": 1.4388853838417703,
+      "hyperfine_json": [
+        "round-01.json",
+        "round-02.json",
+        "round-03.json",
+        "round-04.json",
+        "round-05.json",
+        "round-06.json",
+        "round-07.json",
+        "round-08.json",
+        "round-09.json",
+        "round-10.json"
+      ],
+      "verdict": "ft_faster",
+      "refusal_reasons": [],
+      "dir": "rows/color_emoji_random@117x512"
+    },
+    {
+      "schema": "ft.bench.ghostty-h2h-row.v1",
+      "corpus": "color_random",
+      "input_sha256": "ec4903b7ec210e162d245d7fafe29d5207364466abf98e2ddc1d8eea01085c41",
+      "geometry": {
+        "rows": 80,
+        "cols": 120
+      },
+      "ft_scrollback": 3500,
+      "ft_chunk_bytes": 65536,
+      "commands": {
+        "ghostty": "'/Users/jemanuel/.cache/fth2h/work/ghostty-e500d414f2ef-zig0.16.0/out/bin/ghostty-bench' +terminal-stream --data='/Users/jemanuel/.cache/fth2h/work/corpus/color_random-67108864-000000000135288d.bin' --terminal-rows=80 --terminal-cols=120",
+        "frankenterm": "'/Users/jemanuel/.cache/fth2h/work/ft-target/release-perf/examples/ingest_throughput' --lane term --from-file '/Users/jemanuel/.cache/fth2h/work/corpus/color_random-67108864-000000000135288d.bin' --rows 80 --cols 120 --scrollback 3500 --chunk 65536"
+      },
+      "arms": {
+        "ghostty": {
+          "n": 10,
+          "median_s": 0.2318807705,
+          "p95_s": 0.233655417,
+          "mean_s": 0.2320518834,
+          "stddev_s": 0.0007297785740763589,
+          "cv_pct": 0.31448939926007896,
+          "min_s": 0.23118141700000003,
+          "max_s": 0.233655417,
+          "times_s": [
+            0.231857208,
+            0.23143950000000002,
+            0.23118141700000003,
+            0.233655417,
+            0.23190433300000002,
+            0.2328425,
+            0.2321735,
+            0.23146912500000003,
+            0.231849292,
+            0.232146542
+          ],
+          "peak_rss_bytes_median": 46776320.0
+        },
+        "frankenterm": {
+          "n": 10,
+          "median_s": 0.32484225,
+          "p95_s": 0.32950487500000003,
+          "mean_s": 0.32423374580000003,
+          "stddev_s": 0.003764798062190671,
+          "cv_pct": 1.1611370225827589,
+          "min_s": 0.318376125,
+          "max_s": 0.32950487500000003,
+          "times_s": [
+            0.32593916700000003,
+            0.318376125,
+            0.323745333,
+            0.320360333,
+            0.327508833,
+            0.32950487500000003,
+            0.326442208,
+            0.322674667,
+            0.327704125,
+            0.32008179200000003
+          ],
+          "internal_lane_secs_untimed_runs": [
+            0.282989166,
+            0.278649833
+          ],
+          "state_fingerprints": [
+            "0380b275210cf5dd"
+          ],
+          "peak_rss_bytes_median": 83795968.0
+        }
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-01.json",
+          "ghostty_s": 0.231857208,
+          "ghostty_peak_rss_bytes": 10010624,
+          "frankenterm_s": 0.32593916700000003,
+          "frankenterm_peak_rss_bytes": 83820544
+        },
+        {
+          "round": 2,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-02.json",
+          "frankenterm_s": 0.318376125,
+          "frankenterm_peak_rss_bytes": 83542016,
+          "ghostty_s": 0.23143950000000002,
+          "ghostty_peak_rss_bytes": 83542016
+        },
+        {
+          "round": 3,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-03.json",
+          "ghostty_s": 0.23118141700000003,
+          "ghostty_peak_rss_bytes": 9977856,
+          "frankenterm_s": 0.323745333,
+          "frankenterm_peak_rss_bytes": 83804160
+        },
+        {
+          "round": 4,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-04.json",
+          "frankenterm_s": 0.320360333,
+          "frankenterm_peak_rss_bytes": 83836928,
+          "ghostty_s": 0.233655417,
+          "ghostty_peak_rss_bytes": 83836928
+        },
+        {
+          "round": 5,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-05.json",
+          "ghostty_s": 0.23190433300000002,
+          "ghostty_peak_rss_bytes": 9977856,
+          "frankenterm_s": 0.327508833,
+          "frankenterm_peak_rss_bytes": 83787776
+        },
+        {
+          "round": 6,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-06.json",
+          "frankenterm_s": 0.32950487500000003,
+          "frankenterm_peak_rss_bytes": 83804160,
+          "ghostty_s": 0.2328425,
+          "ghostty_peak_rss_bytes": 83804160
+        },
+        {
+          "round": 7,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-07.json",
+          "ghostty_s": 0.2321735,
+          "ghostty_peak_rss_bytes": 9994240,
+          "frankenterm_s": 0.326442208,
+          "frankenterm_peak_rss_bytes": 83787776
+        },
+        {
+          "round": 8,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-08.json",
+          "frankenterm_s": 0.322674667,
+          "frankenterm_peak_rss_bytes": 83820544,
+          "ghostty_s": 0.23146912500000003,
+          "ghostty_peak_rss_bytes": 83820544
+        },
+        {
+          "round": 9,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-09.json",
+          "ghostty_s": 0.231849292,
+          "ghostty_peak_rss_bytes": 10010624,
+          "frankenterm_s": 0.327704125,
+          "frankenterm_peak_rss_bytes": 83787776
+        },
+        {
+          "round": 10,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-10.json",
+          "frankenterm_s": 0.32008179200000003,
+          "frankenterm_peak_rss_bytes": 83755008,
+          "ghostty_s": 0.232146542,
+          "ghostty_peak_rss_bytes": 83755008
+        }
+      ],
+      "load_1m": {
+        "samples": [
+          {
+            "at": "2026-10-16T18:20:08Z",
+            "load_1m": 2.97
+          },
+          {
+            "at": "2026-10-16T18:20:10Z",
+            "load_1m": 2.97
+          },
+          {
+            "at": "2026-10-16T18:20:10Z",
+            "load_1m": 2.97
+          },
+          {
+            "at": "2026-10-16T18:20:11Z",
+            "load_1m": 2.97
+          },
+          {
+            "at": "2026-10-16T18:20:12Z",
+            "load_1m": 2.97
+          },
+          {
+            "at": "2026-10-16T18:20:12Z",
+            "load_1m": 2.97
+          },
+          {
+            "at": "2026-10-16T18:20:13Z",
+            "load_1m": 2.97
+          },
+          {
+            "at": "2026-10-16T18:20:14Z",
+            "load_1m": 2.97
+          },
+          {
+            "at": "2026-10-16T18:20:14Z",
+            "load_1m": 2.97
+          },
+          {
+            "at": "2026-10-16T18:20:15Z",
+            "load_1m": 2.97
+          },
+          {
+            "at": "2026-10-16T18:20:15Z",
+            "load_1m": 2.97
+          }
+        ],
+        "peak": 2.97
+      },
+      "paired": {
+        "pairs": 10,
+        "ft_wins": 0,
+        "median_pair_speedup": 0.7127176696875033
+      },
+      "ft_speedup": 0.7138257738948675,
+      "ft_speedup_unadmitted": 0.7138257738948675,
+      "hyperfine_json": [
+        "round-01.json",
+        "round-02.json",
+        "round-03.json",
+        "round-04.json",
+        "round-05.json",
+        "round-06.json",
+        "round-07.json",
+        "round-08.json",
+        "round-09.json",
+        "round-10.json"
+      ],
+      "verdict": "ghostty_faster",
+      "refusal_reasons": [],
+      "dir": "rows/color_random@80x120"
+    },
+    {
+      "schema": "ft.bench.ghostty-h2h-row.v1",
+      "corpus": "color_random",
+      "input_sha256": "ec4903b7ec210e162d245d7fafe29d5207364466abf98e2ddc1d8eea01085c41",
+      "geometry": {
+        "rows": 117,
+        "cols": 512
+      },
+      "ft_scrollback": 3500,
+      "ft_chunk_bytes": 65536,
+      "commands": {
+        "ghostty": "'/Users/jemanuel/.cache/fth2h/work/ghostty-e500d414f2ef-zig0.16.0/out/bin/ghostty-bench' +terminal-stream --data='/Users/jemanuel/.cache/fth2h/work/corpus/color_random-67108864-000000000135288d.bin' --terminal-rows=117 --terminal-cols=512",
+        "frankenterm": "'/Users/jemanuel/.cache/fth2h/work/ft-target/release-perf/examples/ingest_throughput' --lane term --from-file '/Users/jemanuel/.cache/fth2h/work/corpus/color_random-67108864-000000000135288d.bin' --rows 117 --cols 512 --scrollback 3500 --chunk 65536"
+      },
+      "arms": {
+        "ghostty": {
+          "n": 10,
+          "median_s": 0.2325292505,
+          "p95_s": 0.23422129100000003,
+          "mean_s": 0.23235641240000002,
+          "stddev_s": 0.0011454788968100432,
+          "cv_pct": 0.4929835527147445,
+          "min_s": 0.23040854200000002,
+          "max_s": 0.23422129100000003,
+          "times_s": [
+            0.23283191600000003,
+            0.23314516600000001,
+            0.23040854200000002,
+            0.232354417,
+            0.232098417,
+            0.231894916,
+            0.23422129100000003,
+            0.232704084,
+            0.23073562500000003,
+            0.23316975
+          ],
+          "peak_rss_bytes_median": 65937408.0
+        },
+        "frankenterm": {
+          "n": 10,
+          "median_s": 0.316445666,
+          "p95_s": 0.322061209,
+          "mean_s": 0.3165772458,
+          "stddev_s": 0.0022301181641679758,
+          "cv_pct": 0.7044467641799086,
+          "min_s": 0.31416841700000003,
+          "max_s": 0.322061209,
+          "times_s": [
+            0.316263791,
+            0.316627541,
+            0.31554645800000003,
+            0.315590125,
+            0.31416841700000003,
+            0.31419083400000003,
+            0.322061209,
+            0.31673758300000004,
+            0.317313583,
+            0.31727291700000004
+          ],
+          "internal_lane_secs_untimed_runs": [
+            0.272558917,
+            0.2757075
+          ],
+          "state_fingerprints": [
+            "7eaee571e55308c3"
+          ],
+          "peak_rss_bytes_median": 122576896.0
+        }
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-01.json",
+          "ghostty_s": 0.23283191600000003,
+          "ghostty_peak_rss_bytes": 10846208,
+          "frankenterm_s": 0.316263791,
+          "frankenterm_peak_rss_bytes": 122617856
+        },
+        {
+          "round": 2,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-02.json",
+          "frankenterm_s": 0.316627541,
+          "frankenterm_peak_rss_bytes": 122585088,
+          "ghostty_s": 0.23314516600000001,
+          "ghostty_peak_rss_bytes": 122585088
+        },
+        {
+          "round": 3,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-03.json",
+          "ghostty_s": 0.23040854200000002,
+          "ghostty_peak_rss_bytes": 10797056,
+          "frankenterm_s": 0.31554645800000003,
+          "frankenterm_peak_rss_bytes": 122552320
+        },
+        {
+          "round": 4,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-04.json",
+          "frankenterm_s": 0.315590125,
+          "frankenterm_peak_rss_bytes": 121028608,
+          "ghostty_s": 0.232354417,
+          "ghostty_peak_rss_bytes": 121028608
+        },
+        {
+          "round": 5,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-05.json",
+          "ghostty_s": 0.232098417,
+          "ghostty_peak_rss_bytes": 10813440,
+          "frankenterm_s": 0.31416841700000003,
+          "frankenterm_peak_rss_bytes": 122568704
+        },
+        {
+          "round": 6,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-06.json",
+          "frankenterm_s": 0.31419083400000003,
+          "frankenterm_peak_rss_bytes": 122568704,
+          "ghostty_s": 0.231894916,
+          "ghostty_peak_rss_bytes": 122568704
+        },
+        {
+          "round": 7,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-07.json",
+          "ghostty_s": 0.23422129100000003,
+          "ghostty_peak_rss_bytes": 10829824,
+          "frankenterm_s": 0.322061209,
+          "frankenterm_peak_rss_bytes": 122601472
+        },
+        {
+          "round": 8,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-08.json",
+          "frankenterm_s": 0.31673758300000004,
+          "frankenterm_peak_rss_bytes": 122601472,
+          "ghostty_s": 0.232704084,
+          "ghostty_peak_rss_bytes": 122601472
+        },
+        {
+          "round": 9,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-09.json",
+          "ghostty_s": 0.23073562500000003,
+          "ghostty_peak_rss_bytes": 10813440,
+          "frankenterm_s": 0.317313583,
+          "frankenterm_peak_rss_bytes": 122601472
+        },
+        {
+          "round": 10,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-10.json",
+          "frankenterm_s": 0.31727291700000004,
+          "frankenterm_peak_rss_bytes": 121044992,
+          "ghostty_s": 0.23316975,
+          "ghostty_peak_rss_bytes": 121044992
+        }
+      ],
+      "load_1m": {
+        "samples": [
+          {
+            "at": "2026-10-16T18:20:16Z",
+            "load_1m": 2.97
+          },
+          {
+            "at": "2026-10-16T18:20:18Z",
+            "load_1m": 2.97
+          },
+          {
+            "at": "2026-10-16T18:20:19Z",
+            "load_1m": 2.97
+          },
+          {
+            "at": "2026-10-16T18:20:20Z",
+            "load_1m": 2.97
+          },
+          {
+            "at": "2026-10-16T18:20:20Z",
+            "load_1m": 2.97
+          },
+          {
+            "at": "2026-10-16T18:20:21Z",
+            "load_1m": 2.97
+          },
+          {
+            "at": "2026-10-16T18:20:22Z",
+            "load_1m": 2.97
+          },
+          {
+            "at": "2026-10-16T18:20:22Z",
+            "load_1m": 2.9
+          },
+          {
+            "at": "2026-10-16T18:20:23Z",
+            "load_1m": 2.9
+          },
+          {
+            "at": "2026-10-16T18:20:23Z",
+            "load_1m": 2.9
+          },
+          {
+            "at": "2026-10-16T18:20:24Z",
+            "load_1m": 2.9
+          }
+        ],
+        "peak": 2.97
+      },
+      "paired": {
+        "pairs": 10,
+        "ft_wins": 0,
+        "median_pair_speedup": 0.7355569208838748
+      },
+      "ft_speedup": 0.7348157218876241,
+      "ft_speedup_unadmitted": 0.7348157218876241,
+      "hyperfine_json": [
+        "round-01.json",
+        "round-02.json",
+        "round-03.json",
+        "round-04.json",
+        "round-05.json",
+        "round-06.json",
+        "round-07.json",
+        "round-08.json",
+        "round-09.json",
+        "round-10.json"
+      ],
+      "verdict": "ghostty_faster",
+      "refusal_reasons": [],
+      "dir": "rows/color_random@117x512"
+    },
+    {
+      "schema": "ft.bench.ghostty-h2h-row.v1",
+      "corpus": "seq_lines",
+      "input_sha256": "d07e1bf9614185eac008cfa31cf516978d2fed62b7bf5880e35ee9a6f5f90459",
+      "geometry": {
+        "rows": 80,
+        "cols": 120
+      },
+      "ft_scrollback": 3500,
+      "ft_chunk_bytes": 65536,
+      "commands": {
+        "ghostty": "'/Users/jemanuel/.cache/fth2h/work/ghostty-e500d414f2ef-zig0.16.0/out/bin/ghostty-bench' +terminal-stream --data='/Users/jemanuel/.cache/fth2h/work/corpus/seq_lines-67108864-000000000135288d.bin' --terminal-rows=80 --terminal-cols=120",
+        "frankenterm": "'/Users/jemanuel/.cache/fth2h/work/ft-target/release-perf/examples/ingest_throughput' --lane term --from-file '/Users/jemanuel/.cache/fth2h/work/corpus/seq_lines-67108864-000000000135288d.bin' --rows 80 --cols 120 --scrollback 3500 --chunk 65536"
+      },
+      "arms": {
+        "ghostty": {
+          "n": 10,
+          "median_s": 0.26387752100000006,
+          "p95_s": 0.266036417,
+          "mean_s": 0.2618892417,
+          "stddev_s": 0.0036554213677981295,
+          "cv_pct": 1.3957890534447752,
+          "min_s": 0.25564416700000003,
+          "max_s": 0.266036417,
+          "times_s": [
+            0.266036417,
+            0.26403075000000004,
+            0.256793167,
+            0.264047458,
+            0.258940292,
+            0.260533041,
+            0.265097666,
+            0.264045167,
+            0.25564416700000003,
+            0.263724292
+          ],
+          "peak_rss_bytes_median": 40927232.0
+        },
+        "frankenterm": {
+          "n": 10,
+          "median_s": 0.975964625,
+          "p95_s": 0.992054167,
+          "mean_s": 0.9780000873000001,
+          "stddev_s": 0.006525478631313434,
+          "cv_pct": 0.6672267943583273,
+          "min_s": 0.969876916,
+          "max_s": 0.992054167,
+          "times_s": [
+            0.9794571660000001,
+            0.9838502910000001,
+            0.992054167,
+            0.969876916,
+            0.975849166,
+            0.9744102090000001,
+            0.976080084,
+            0.9725514580000001,
+            0.981966208,
+            0.973905208
+          ],
+          "internal_lane_secs_untimed_runs": [
+            0.951598,
+            0.9445485
+          ],
+          "state_fingerprints": [
+            "93073af563a551a8"
+          ],
+          "peak_rss_bytes_median": 72253440.0
+        }
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-01.json",
+          "ghostty_s": 0.266036417,
+          "ghostty_peak_rss_bytes": 9568256,
+          "frankenterm_s": 0.9794571660000001,
+          "frankenterm_peak_rss_bytes": 72286208
+        },
+        {
+          "round": 2,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-02.json",
+          "frankenterm_s": 0.9838502910000001,
+          "frankenterm_peak_rss_bytes": 72253440,
+          "ghostty_s": 0.26403075000000004,
+          "ghostty_peak_rss_bytes": 72253440
+        },
+        {
+          "round": 3,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-03.json",
+          "ghostty_s": 0.256793167,
+          "ghostty_peak_rss_bytes": 9519104,
+          "frankenterm_s": 0.992054167,
+          "frankenterm_peak_rss_bytes": 72237056
+        },
+        {
+          "round": 4,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-04.json",
+          "frankenterm_s": 0.969876916,
+          "frankenterm_peak_rss_bytes": 72253440,
+          "ghostty_s": 0.264047458,
+          "ghostty_peak_rss_bytes": 72253440
+        },
+        {
+          "round": 5,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-05.json",
+          "ghostty_s": 0.258940292,
+          "ghostty_peak_rss_bytes": 9519104,
+          "frankenterm_s": 0.975849166,
+          "frankenterm_peak_rss_bytes": 72253440
+        },
+        {
+          "round": 6,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-06.json",
+          "frankenterm_s": 0.9744102090000001,
+          "frankenterm_peak_rss_bytes": 72253440,
+          "ghostty_s": 0.260533041,
+          "ghostty_peak_rss_bytes": 72253440
+        },
+        {
+          "round": 7,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-07.json",
+          "ghostty_s": 0.265097666,
+          "ghostty_peak_rss_bytes": 9551872,
+          "frankenterm_s": 0.976080084,
+          "frankenterm_peak_rss_bytes": 72253440
+        },
+        {
+          "round": 8,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-08.json",
+          "frankenterm_s": 0.9725514580000001,
+          "frankenterm_peak_rss_bytes": 72269824,
+          "ghostty_s": 0.264045167,
+          "ghostty_peak_rss_bytes": 72269824
+        },
+        {
+          "round": 9,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-09.json",
+          "ghostty_s": 0.25564416700000003,
+          "ghostty_peak_rss_bytes": 9601024,
+          "frankenterm_s": 0.981966208,
+          "frankenterm_peak_rss_bytes": 72269824
+        },
+        {
+          "round": 10,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-10.json",
+          "frankenterm_s": 0.973905208,
+          "frankenterm_peak_rss_bytes": 72269824,
+          "ghostty_s": 0.263724292,
+          "ghostty_peak_rss_bytes": 72269824
+        }
+      ],
+      "load_1m": {
+        "samples": [
+          {
+            "at": "2026-10-16T18:20:25Z",
+            "load_1m": 2.9
+          },
+          {
+            "at": "2026-10-16T18:20:30Z",
+            "load_1m": 2.9
+          },
+          {
+            "at": "2026-10-16T18:20:32Z",
+            "load_1m": 2.75
+          },
+          {
+            "at": "2026-10-16T18:20:33Z",
+            "load_1m": 2.75
+          },
+          {
+            "at": "2026-10-16T18:20:34Z",
+            "load_1m": 2.75
+          },
+          {
+            "at": "2026-10-16T18:20:36Z",
+            "load_1m": 2.75
+          },
+          {
+            "at": "2026-10-16T18:20:37Z",
+            "load_1m": 2.61
+          },
+          {
+            "at": "2026-10-16T18:20:38Z",
+            "load_1m": 2.61
+          },
+          {
+            "at": "2026-10-16T18:20:40Z",
+            "load_1m": 2.61
+          },
+          {
+            "at": "2026-10-16T18:20:41Z",
+            "load_1m": 2.61
+          },
+          {
+            "at": "2026-10-16T18:20:42Z",
+            "load_1m": 2.56
+          }
+        ],
+        "peak": 2.9
+      },
+      "paired": {
+        "pairs": 10,
+        "ft_wins": 0,
+        "median_pair_speedup": 0.26957763848379857
+      },
+      "ft_speedup": 0.27037611224894553,
+      "ft_speedup_unadmitted": 0.27037611224894553,
+      "hyperfine_json": [
+        "round-01.json",
+        "round-02.json",
+        "round-03.json",
+        "round-04.json",
+        "round-05.json",
+        "round-06.json",
+        "round-07.json",
+        "round-08.json",
+        "round-09.json",
+        "round-10.json"
+      ],
+      "verdict": "ghostty_faster",
+      "refusal_reasons": [],
+      "dir": "rows/seq_lines@80x120"
+    },
+    {
+      "schema": "ft.bench.ghostty-h2h-row.v1",
+      "corpus": "seq_lines",
+      "input_sha256": "d07e1bf9614185eac008cfa31cf516978d2fed62b7bf5880e35ee9a6f5f90459",
+      "geometry": {
+        "rows": 117,
+        "cols": 512
+      },
+      "ft_scrollback": 3500,
+      "ft_chunk_bytes": 65536,
+      "commands": {
+        "ghostty": "'/Users/jemanuel/.cache/fth2h/work/ghostty-e500d414f2ef-zig0.16.0/out/bin/ghostty-bench' +terminal-stream --data='/Users/jemanuel/.cache/fth2h/work/corpus/seq_lines-67108864-000000000135288d.bin' --terminal-rows=117 --terminal-cols=512",
+        "frankenterm": "'/Users/jemanuel/.cache/fth2h/work/ft-target/release-perf/examples/ingest_throughput' --lane term --from-file '/Users/jemanuel/.cache/fth2h/work/corpus/seq_lines-67108864-000000000135288d.bin' --rows 117 --cols 512 --scrollback 3500 --chunk 65536"
+      },
+      "arms": {
+        "ghostty": {
+          "n": 10,
+          "median_s": 0.425947917,
+          "p95_s": 0.44040991700000004,
+          "mean_s": 0.4267188751,
+          "stddev_s": 0.008037077747738583,
+          "cv_pct": 1.883459630384319,
+          "min_s": 0.414783583,
+          "max_s": 0.44040991700000004,
+          "times_s": [
+            0.429948292,
+            0.43854266700000005,
+            0.422424208,
+            0.42630116700000004,
+            0.421359333,
+            0.41961912500000004,
+            0.42820579200000003,
+            0.414783583,
+            0.42559466700000004,
+            0.44040991700000004
+          ],
+          "peak_rss_bytes_median": 42622976.0
+        },
+        "frankenterm": {
+          "n": 10,
+          "median_s": 1.0961206875,
+          "p95_s": 1.151114958,
+          "mean_s": 1.1051804541999999,
+          "stddev_s": 0.01986802184011533,
+          "cv_pct": 1.797717446468692,
+          "min_s": 1.091821375,
+          "max_s": 1.151114958,
+          "times_s": [
+            1.091821375,
+            1.09651925,
+            1.131155333,
+            1.095156709,
+            1.092698083,
+            1.096540042,
+            1.095489083,
+            1.095722125,
+            1.105587584,
+            1.151114958
+          ],
+          "internal_lane_secs_untimed_runs": [
+            1.056582667,
+            1.115495584
+          ],
+          "state_fingerprints": [
+            "029b6e4e8af143bb"
+          ],
+          "peak_rss_bytes_median": 75268096.0
+        }
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-01.json",
+          "ghostty_s": 0.429948292,
+          "ghostty_peak_rss_bytes": 9994240,
+          "frankenterm_s": 1.091821375,
+          "frankenterm_peak_rss_bytes": 75284480
+        },
+        {
+          "round": 2,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-02.json",
+          "frankenterm_s": 1.09651925,
+          "frankenterm_peak_rss_bytes": 75268096,
+          "ghostty_s": 0.43854266700000005,
+          "ghostty_peak_rss_bytes": 75268096
+        },
+        {
+          "round": 3,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-03.json",
+          "ghostty_s": 0.422424208,
+          "ghostty_peak_rss_bytes": 9977856,
+          "frankenterm_s": 1.131155333,
+          "frankenterm_peak_rss_bytes": 75218944
+        },
+        {
+          "round": 4,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-04.json",
+          "frankenterm_s": 1.095156709,
+          "frankenterm_peak_rss_bytes": 75284480,
+          "ghostty_s": 0.42630116700000004,
+          "ghostty_peak_rss_bytes": 75284480
+        },
+        {
+          "round": 5,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-05.json",
+          "ghostty_s": 0.421359333,
+          "ghostty_peak_rss_bytes": 9961472,
+          "frankenterm_s": 1.092698083,
+          "frankenterm_peak_rss_bytes": 75268096
+        },
+        {
+          "round": 6,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-06.json",
+          "frankenterm_s": 1.096540042,
+          "frankenterm_peak_rss_bytes": 75268096,
+          "ghostty_s": 0.41961912500000004,
+          "ghostty_peak_rss_bytes": 75268096
+        },
+        {
+          "round": 7,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-07.json",
+          "ghostty_s": 0.42820579200000003,
+          "ghostty_peak_rss_bytes": 9945088,
+          "frankenterm_s": 1.095489083,
+          "frankenterm_peak_rss_bytes": 75251712
+        },
+        {
+          "round": 8,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-08.json",
+          "frankenterm_s": 1.095722125,
+          "frankenterm_peak_rss_bytes": 75251712,
+          "ghostty_s": 0.414783583,
+          "ghostty_peak_rss_bytes": 75251712
+        },
+        {
+          "round": 9,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-09.json",
+          "ghostty_s": 0.42559466700000004,
+          "ghostty_peak_rss_bytes": 9994240,
+          "frankenterm_s": 1.105587584,
+          "frankenterm_peak_rss_bytes": 75251712
+        },
+        {
+          "round": 10,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-10.json",
+          "frankenterm_s": 1.151114958,
+          "frankenterm_peak_rss_bytes": 75300864,
+          "ghostty_s": 0.44040991700000004,
+          "ghostty_peak_rss_bytes": 75300864
+        }
+      ],
+      "load_1m": {
+        "samples": [
+          {
+            "at": "2026-10-16T18:20:44Z",
+            "load_1m": 2.56
+          },
+          {
+            "at": "2026-10-16T18:20:51Z",
+            "load_1m": 2.52
+          },
+          {
+            "at": "2026-10-16T18:20:52Z",
+            "load_1m": 2.47
+          },
+          {
+            "at": "2026-10-16T18:20:54Z",
+            "load_1m": 2.47
+          },
+          {
+            "at": "2026-10-16T18:20:55Z",
+            "load_1m": 2.47
+          },
+          {
+            "at": "2026-10-16T18:20:57Z",
+            "load_1m": 2.44
+          },
+          {
+            "at": "2026-10-16T18:20:59Z",
+            "load_1m": 2.44
+          },
+          {
+            "at": "2026-10-16T18:21:00Z",
+            "load_1m": 2.44
+          },
+          {
+            "at": "2026-10-16T18:21:02Z",
+            "load_1m": 2.32
+          },
+          {
+            "at": "2026-10-16T18:21:03Z",
+            "load_1m": 2.32
+          },
+          {
+            "at": "2026-10-16T18:21:05Z",
+            "load_1m": 2.32
+          }
+        ],
+        "peak": 2.56
+      },
+      "paired": {
+        "pairs": 10,
+        "ft_wins": 0,
+        "median_pair_speedup": 0.3852812659490601
+      },
+      "ft_speedup": 0.3885958196551235,
+      "ft_speedup_unadmitted": 0.3885958196551235,
+      "hyperfine_json": [
+        "round-01.json",
+        "round-02.json",
+        "round-03.json",
+        "round-04.json",
+        "round-05.json",
+        "round-06.json",
+        "round-07.json",
+        "round-08.json",
+        "round-09.json",
+        "round-10.json"
+      ],
+      "verdict": "ghostty_faster",
+      "refusal_reasons": [],
+      "dir": "rows/seq_lines@117x512"
+    },
+    {
+      "schema": "ft.bench.ghostty-h2h-row.v1",
+      "corpus": "long_lines",
+      "input_sha256": "336f8a167e6ae10627ba2d7f10cc489c8f7e29887a919f2efee0f0f4e157a22e",
+      "geometry": {
+        "rows": 80,
+        "cols": 120
+      },
+      "ft_scrollback": 3500,
+      "ft_chunk_bytes": 65536,
+      "commands": {
+        "ghostty": "'/Users/jemanuel/.cache/fth2h/work/ghostty-e500d414f2ef-zig0.16.0/out/bin/ghostty-bench' +terminal-stream --data='/Users/jemanuel/.cache/fth2h/work/corpus/long_lines-67108864-000000000135288d.bin' --terminal-rows=80 --terminal-cols=120",
+        "frankenterm": "'/Users/jemanuel/.cache/fth2h/work/ft-target/release-perf/examples/ingest_throughput' --lane term --from-file '/Users/jemanuel/.cache/fth2h/work/corpus/long_lines-67108864-000000000135288d.bin' --rows 80 --cols 120 --scrollback 3500 --chunk 65536"
+      },
+      "arms": {
+        "ghostty": {
+          "n": 10,
+          "median_s": 0.077015,
+          "p95_s": 0.08022875,
+          "mean_s": 0.07740622080000001,
+          "stddev_s": 0.00116659488618284,
+          "cv_pct": 1.5071074057433378,
+          "min_s": 0.076275541,
+          "max_s": 0.08022875,
+          "times_s": [
+            0.077273542,
+            0.07733933300000001,
+            0.076701375,
+            0.078600166,
+            0.08022875,
+            0.076935792,
+            0.076275541,
+            0.077035667,
+            0.076994333,
+            0.07667770900000001
+          ],
+          "peak_rss_bytes_median": 40902656.0
+        },
+        "frankenterm": {
+          "n": 10,
+          "median_s": 0.172727146,
+          "p95_s": 0.17487154100000002,
+          "mean_s": 0.17292709570000003,
+          "stddev_s": 0.0011870546417661993,
+          "cv_pct": 0.6864480299984586,
+          "min_s": 0.17110804100000002,
+          "max_s": 0.17487154100000002,
+          "times_s": [
+            0.17293929200000002,
+            0.173263375,
+            0.172641291,
+            0.17482250000000002,
+            0.17487154100000002,
+            0.172810292,
+            0.17246845900000002,
+            0.17170216600000002,
+            0.17264400000000002,
+            0.17110804100000002
+          ],
+          "internal_lane_secs_untimed_runs": [
+            0.127301458,
+            0.125764625
+          ],
+          "state_fingerprints": [
+            "8e98983e434a950e"
+          ],
+          "peak_rss_bytes_median": 72237056.0
+        }
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-01.json",
+          "ghostty_s": 0.077273542,
+          "ghostty_peak_rss_bytes": 9584640,
+          "frankenterm_s": 0.17293929200000002,
+          "frankenterm_peak_rss_bytes": 72269824
+        },
+        {
+          "round": 2,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-02.json",
+          "frankenterm_s": 0.173263375,
+          "frankenterm_peak_rss_bytes": 72237056,
+          "ghostty_s": 0.07733933300000001,
+          "ghostty_peak_rss_bytes": 72237056
+        },
+        {
+          "round": 3,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-03.json",
+          "ghostty_s": 0.076701375,
+          "ghostty_peak_rss_bytes": 9519104,
+          "frankenterm_s": 0.172641291,
+          "frankenterm_peak_rss_bytes": 72237056
+        },
+        {
+          "round": 4,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-04.json",
+          "frankenterm_s": 0.17482250000000002,
+          "frankenterm_peak_rss_bytes": 72237056,
+          "ghostty_s": 0.078600166,
+          "ghostty_peak_rss_bytes": 72237056
+        },
+        {
+          "round": 5,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-05.json",
+          "ghostty_s": 0.08022875,
+          "ghostty_peak_rss_bytes": 9551872,
+          "frankenterm_s": 0.17487154100000002,
+          "frankenterm_peak_rss_bytes": 72253440
+        },
+        {
+          "round": 6,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-06.json",
+          "frankenterm_s": 0.172810292,
+          "frankenterm_peak_rss_bytes": 72237056,
+          "ghostty_s": 0.076935792,
+          "ghostty_peak_rss_bytes": 72237056
+        },
+        {
+          "round": 7,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-07.json",
+          "ghostty_s": 0.076275541,
+          "ghostty_peak_rss_bytes": 9584640,
+          "frankenterm_s": 0.17246845900000002,
+          "frankenterm_peak_rss_bytes": 72237056
+        },
+        {
+          "round": 8,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-08.json",
+          "frankenterm_s": 0.17170216600000002,
+          "frankenterm_peak_rss_bytes": 72237056,
+          "ghostty_s": 0.077035667,
+          "ghostty_peak_rss_bytes": 72237056
+        },
+        {
+          "round": 9,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-09.json",
+          "ghostty_s": 0.076994333,
+          "ghostty_peak_rss_bytes": 9568256,
+          "frankenterm_s": 0.17264400000000002,
+          "frankenterm_peak_rss_bytes": 72220672
+        },
+        {
+          "round": 10,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-10.json",
+          "frankenterm_s": 0.17110804100000002,
+          "frankenterm_peak_rss_bytes": 72220672,
+          "ghostty_s": 0.07667770900000001,
+          "ghostty_peak_rss_bytes": 72220672
+        }
+      ],
+      "load_1m": {
+        "samples": [
+          {
+            "at": "2026-10-16T18:21:06Z",
+            "load_1m": 2.32
+          },
+          {
+            "at": "2026-10-16T18:21:08Z",
+            "load_1m": 2.46
+          },
+          {
+            "at": "2026-10-16T18:21:08Z",
+            "load_1m": 2.46
+          },
+          {
+            "at": "2026-10-16T18:21:08Z",
+            "load_1m": 2.46
+          },
+          {
+            "at": "2026-10-16T18:21:09Z",
+            "load_1m": 2.46
+          },
+          {
+            "at": "2026-10-16T18:21:09Z",
+            "load_1m": 2.46
+          },
+          {
+            "at": "2026-10-16T18:21:09Z",
+            "load_1m": 2.46
+          },
+          {
+            "at": "2026-10-16T18:21:09Z",
+            "load_1m": 2.46
+          },
+          {
+            "at": "2026-10-16T18:21:10Z",
+            "load_1m": 2.46
+          },
+          {
+            "at": "2026-10-16T18:21:10Z",
+            "load_1m": 2.46
+          },
+          {
+            "at": "2026-10-16T18:21:10Z",
+            "load_1m": 2.46
+          }
+        ],
+        "peak": 2.46
+      },
+      "paired": {
+        "pairs": 10,
+        "ft_wins": 0,
+        "median_pair_speedup": 0.4465966430567959
+      },
+      "ft_speedup": 0.4458766429221264,
+      "ft_speedup_unadmitted": 0.4458766429221264,
+      "hyperfine_json": [
+        "round-01.json",
+        "round-02.json",
+        "round-03.json",
+        "round-04.json",
+        "round-05.json",
+        "round-06.json",
+        "round-07.json",
+        "round-08.json",
+        "round-09.json",
+        "round-10.json"
+      ],
+      "verdict": "ghostty_faster",
+      "refusal_reasons": [],
+      "dir": "rows/long_lines@80x120"
+    },
+    {
+      "schema": "ft.bench.ghostty-h2h-row.v1",
+      "corpus": "long_lines",
+      "input_sha256": "336f8a167e6ae10627ba2d7f10cc489c8f7e29887a919f2efee0f0f4e157a22e",
+      "geometry": {
+        "rows": 117,
+        "cols": 512
+      },
+      "ft_scrollback": 3500,
+      "ft_chunk_bytes": 65536,
+      "commands": {
+        "ghostty": "'/Users/jemanuel/.cache/fth2h/work/ghostty-e500d414f2ef-zig0.16.0/out/bin/ghostty-bench' +terminal-stream --data='/Users/jemanuel/.cache/fth2h/work/corpus/long_lines-67108864-000000000135288d.bin' --terminal-rows=117 --terminal-cols=512",
+        "frankenterm": "'/Users/jemanuel/.cache/fth2h/work/ft-target/release-perf/examples/ingest_throughput' --lane term --from-file '/Users/jemanuel/.cache/fth2h/work/corpus/long_lines-67108864-000000000135288d.bin' --rows 117 --cols 512 --scrollback 3500 --chunk 65536"
+      },
+      "arms": {
+        "ghostty": {
+          "n": 10,
+          "median_s": 0.06908293700000001,
+          "p95_s": 0.069747209,
+          "mean_s": 0.06912871670000001,
+          "stddev_s": 0.0004131048092686638,
+          "cv_pct": 0.597587846251258,
+          "min_s": 0.068482917,
+          "max_s": 0.069747209,
+          "times_s": [
+            0.069142625,
+            0.069444167,
+            0.06913554100000001,
+            0.069747209,
+            0.06879625,
+            0.069732875,
+            0.068482917,
+            0.069030333,
+            0.068755167,
+            0.06902008300000001
+          ],
+          "peak_rss_bytes_median": 41902080.0
+        },
+        "frankenterm": {
+          "n": 10,
+          "median_s": 0.13979312500000002,
+          "p95_s": 0.146795375,
+          "mean_s": 0.1402513085,
+          "stddev_s": 0.0023774018446940126,
+          "cv_pct": 1.6951013649145472,
+          "min_s": 0.13844541700000002,
+          "max_s": 0.146795375,
+          "times_s": [
+            0.139788875,
+            0.138962084,
+            0.13982975,
+            0.139272834,
+            0.140653834,
+            0.139797375,
+            0.146795375,
+            0.13844541700000002,
+            0.13981912500000002,
+            0.139148416
+          ],
+          "internal_lane_secs_untimed_runs": [
+            0.096145875,
+            0.094940125
+          ],
+          "state_fingerprints": [
+            "aefa9625c0396b13"
+          ],
+          "peak_rss_bytes_median": 73883648.0
+        }
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-01.json",
+          "ghostty_s": 0.069142625,
+          "ghostty_peak_rss_bytes": 9961472,
+          "frankenterm_s": 0.139788875,
+          "frankenterm_peak_rss_bytes": 73891840
+        },
+        {
+          "round": 2,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-02.json",
+          "frankenterm_s": 0.138962084,
+          "frankenterm_peak_rss_bytes": 73859072,
+          "ghostty_s": 0.069444167,
+          "ghostty_peak_rss_bytes": 73859072
+        },
+        {
+          "round": 3,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-03.json",
+          "ghostty_s": 0.06913554100000001,
+          "ghostty_peak_rss_bytes": 9928704,
+          "frankenterm_s": 0.13982975,
+          "frankenterm_peak_rss_bytes": 73908224
+        },
+        {
+          "round": 4,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-04.json",
+          "frankenterm_s": 0.139272834,
+          "frankenterm_peak_rss_bytes": 73809920,
+          "ghostty_s": 0.069747209,
+          "ghostty_peak_rss_bytes": 73809920
+        },
+        {
+          "round": 5,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-05.json",
+          "ghostty_s": 0.06879625,
+          "ghostty_peak_rss_bytes": 9977856,
+          "frankenterm_s": 0.140653834,
+          "frankenterm_peak_rss_bytes": 73891840
+        },
+        {
+          "round": 6,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-06.json",
+          "frankenterm_s": 0.139797375,
+          "frankenterm_peak_rss_bytes": 73908224,
+          "ghostty_s": 0.069732875,
+          "ghostty_peak_rss_bytes": 73908224
+        },
+        {
+          "round": 7,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-07.json",
+          "ghostty_s": 0.068482917,
+          "ghostty_peak_rss_bytes": 9994240,
+          "frankenterm_s": 0.146795375,
+          "frankenterm_peak_rss_bytes": 73842688
+        },
+        {
+          "round": 8,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-08.json",
+          "frankenterm_s": 0.13844541700000002,
+          "frankenterm_peak_rss_bytes": 73859072,
+          "ghostty_s": 0.069030333,
+          "ghostty_peak_rss_bytes": 73859072
+        },
+        {
+          "round": 9,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-09.json",
+          "ghostty_s": 0.068755167,
+          "ghostty_peak_rss_bytes": 9961472,
+          "frankenterm_s": 0.13981912500000002,
+          "frankenterm_peak_rss_bytes": 73891840
+        },
+        {
+          "round": 10,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-10.json",
+          "frankenterm_s": 0.139148416,
+          "frankenterm_peak_rss_bytes": 73875456,
+          "ghostty_s": 0.06902008300000001,
+          "ghostty_peak_rss_bytes": 73875456
+        }
+      ],
+      "load_1m": {
+        "samples": [
+          {
+            "at": "2026-10-16T18:21:11Z",
+            "load_1m": 2.46
+          },
+          {
+            "at": "2026-10-16T18:21:12Z",
+            "load_1m": 2.42
+          },
+          {
+            "at": "2026-10-16T18:21:12Z",
+            "load_1m": 2.42
+          },
+          {
+            "at": "2026-10-16T18:21:12Z",
+            "load_1m": 2.42
+          },
+          {
+            "at": "2026-10-16T18:21:13Z",
+            "load_1m": 2.42
+          },
+          {
+            "at": "2026-10-16T18:21:13Z",
+            "load_1m": 2.42
+          },
+          {
+            "at": "2026-10-16T18:21:13Z",
+            "load_1m": 2.42
+          },
+          {
+            "at": "2026-10-16T18:21:13Z",
+            "load_1m": 2.42
+          },
+          {
+            "at": "2026-10-16T18:21:14Z",
+            "load_1m": 2.42
+          },
+          {
+            "at": "2026-10-16T18:21:14Z",
+            "load_1m": 2.42
+          },
+          {
+            "at": "2026-10-16T18:21:14Z",
+            "load_1m": 2.42
+          }
+        ],
+        "peak": 2.46
+      },
+      "paired": {
+        "pairs": 10,
+        "ft_wins": 0,
+        "median_pair_speedup": 0.49531977071326383
+      },
+      "ft_speedup": 0.4941797888844677,
+      "ft_speedup_unadmitted": 0.4941797888844677,
+      "hyperfine_json": [
+        "round-01.json",
+        "round-02.json",
+        "round-03.json",
+        "round-04.json",
+        "round-05.json",
+        "round-06.json",
+        "round-07.json",
+        "round-08.json",
+        "round-09.json",
+        "round-10.json"
+      ],
+      "verdict": "ghostty_faster",
+      "refusal_reasons": [],
+      "dir": "rows/long_lines@117x512"
+    },
+    {
+      "schema": "ft.bench.ghostty-h2h-row.v1",
+      "corpus": "unicode_mix",
+      "input_sha256": "f3ab8fc9d700fd8359dc0c137b5eabf766ebe3882fa4424b5d01fa105650223f",
+      "geometry": {
+        "rows": 80,
+        "cols": 120
+      },
+      "ft_scrollback": 3500,
+      "ft_chunk_bytes": 65536,
+      "commands": {
+        "ghostty": "'/Users/jemanuel/.cache/fth2h/work/ghostty-e500d414f2ef-zig0.16.0/out/bin/ghostty-bench' +terminal-stream --data='/Users/jemanuel/.cache/fth2h/work/corpus/unicode_mix-67108864-000000000135288d.bin' --terminal-rows=80 --terminal-cols=120",
+        "frankenterm": "'/Users/jemanuel/.cache/fth2h/work/ft-target/release-perf/examples/ingest_throughput' --lane term --from-file '/Users/jemanuel/.cache/fth2h/work/corpus/unicode_mix-67108864-000000000135288d.bin' --rows 80 --cols 120 --scrollback 3500 --chunk 65536"
+      },
+      "arms": {
+        "ghostty": {
+          "n": 10,
+          "median_s": 0.4120866245,
+          "p95_s": 0.42139570800000004,
+          "mean_s": 0.41340304149999996,
+          "stddev_s": 0.0043529439409970856,
+          "cv_pct": 1.0529540192067228,
+          "min_s": 0.407958541,
+          "max_s": 0.42139570800000004,
+          "times_s": [
+            0.407958541,
+            0.4112055,
+            0.408964209,
+            0.41580404200000004,
+            0.412062666,
+            0.41211058300000003,
+            0.410013,
+            0.418265166,
+            0.41625100000000004,
+            0.42139570800000004
+          ],
+          "peak_rss_bytes_median": 42196992.0
+        },
+        "frankenterm": {
+          "n": 10,
+          "median_s": 2.0065960205,
+          "p95_s": 2.058153458,
+          "mean_s": 2.0154179956,
+          "stddev_s": 0.023391112876602074,
+          "cv_pct": 1.1606085153386965,
+          "min_s": 1.993235833,
+          "max_s": 2.058153458,
+          "times_s": [
+            2.035583875,
+            2.00146975,
+            1.993235833,
+            2.008598041,
+            1.993761416,
+            1.9982098750000001,
+            2.004594,
+            2.012485875,
+            2.048087833,
+            2.058153458
+          ],
+          "internal_lane_secs_untimed_runs": [
+            1.978208375,
+            1.993025125
+          ],
+          "state_fingerprints": [
+            "48c067ef09161dfa"
+          ],
+          "peak_rss_bytes_median": 74014720.0
+        }
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-01.json",
+          "ghostty_s": 0.407958541,
+          "ghostty_peak_rss_bytes": 10551296,
+          "frankenterm_s": 2.035583875,
+          "frankenterm_peak_rss_bytes": 74137600
+        },
+        {
+          "round": 2,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-02.json",
+          "frankenterm_s": 2.00146975,
+          "frankenterm_peak_rss_bytes": 73908224,
+          "ghostty_s": 0.4112055,
+          "ghostty_peak_rss_bytes": 73908224
+        },
+        {
+          "round": 3,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-03.json",
+          "ghostty_s": 0.408964209,
+          "ghostty_peak_rss_bytes": 10534912,
+          "frankenterm_s": 1.993235833,
+          "frankenterm_peak_rss_bytes": 74022912
+        },
+        {
+          "round": 4,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-04.json",
+          "frankenterm_s": 2.008598041,
+          "frankenterm_peak_rss_bytes": 74104832,
+          "ghostty_s": 0.41580404200000004,
+          "ghostty_peak_rss_bytes": 74104832
+        },
+        {
+          "round": 5,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-05.json",
+          "ghostty_s": 0.412062666,
+          "ghostty_peak_rss_bytes": 10518528,
+          "frankenterm_s": 1.993761416,
+          "frankenterm_peak_rss_bytes": 73728000
+        },
+        {
+          "round": 6,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-06.json",
+          "frankenterm_s": 1.9982098750000001,
+          "frankenterm_peak_rss_bytes": 74006528,
+          "ghostty_s": 0.41211058300000003,
+          "ghostty_peak_rss_bytes": 74006528
+        },
+        {
+          "round": 7,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-07.json",
+          "ghostty_s": 0.410013,
+          "ghostty_peak_rss_bytes": 10502144,
+          "frankenterm_s": 2.004594,
+          "frankenterm_peak_rss_bytes": 74153984
+        },
+        {
+          "round": 8,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-08.json",
+          "frankenterm_s": 2.012485875,
+          "frankenterm_peak_rss_bytes": 73826304,
+          "ghostty_s": 0.418265166,
+          "ghostty_peak_rss_bytes": 73826304
+        },
+        {
+          "round": 9,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-09.json",
+          "ghostty_s": 0.41625100000000004,
+          "ghostty_peak_rss_bytes": 10567680,
+          "frankenterm_s": 2.048087833,
+          "frankenterm_peak_rss_bytes": 73924608
+        },
+        {
+          "round": 10,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-10.json",
+          "frankenterm_s": 2.058153458,
+          "frankenterm_peak_rss_bytes": 74121216,
+          "ghostty_s": 0.42139570800000004,
+          "ghostty_peak_rss_bytes": 74121216
+        }
+      ],
+      "load_1m": {
+        "samples": [
+          {
+            "at": "2026-10-16T18:21:17Z",
+            "load_1m": 2.46
+          },
+          {
+            "at": "2026-10-16T18:21:26Z",
+            "load_1m": 2.83
+          },
+          {
+            "at": "2026-10-16T18:21:29Z",
+            "load_1m": 2.84
+          },
+          {
+            "at": "2026-10-16T18:21:31Z",
+            "load_1m": 2.84
+          },
+          {
+            "at": "2026-10-16T18:21:34Z",
+            "load_1m": 2.77
+          },
+          {
+            "at": "2026-10-16T18:21:36Z",
+            "load_1m": 2.77
+          },
+          {
+            "at": "2026-10-16T18:21:39Z",
+            "load_1m": 2.79
+          },
+          {
+            "at": "2026-10-16T18:21:41Z",
+            "load_1m": 2.79
+          },
+          {
+            "at": "2026-10-16T18:21:44Z",
+            "load_1m": 2.73
+          },
+          {
+            "at": "2026-10-16T18:21:46Z",
+            "load_1m": 2.73
+          },
+          {
+            "at": "2026-10-16T18:21:49Z",
+            "load_1m": 2.83
+          }
+        ],
+        "peak": 2.84
+      },
+      "paired": {
+        "pairs": 10,
+        "ft_wins": 0,
+        "median_pair_speedup": 0.2053138977934441
+      },
+      "ft_speedup": 0.2053660130340122,
+      "ft_speedup_unadmitted": 0.2053660130340122,
+      "hyperfine_json": [
+        "round-01.json",
+        "round-02.json",
+        "round-03.json",
+        "round-04.json",
+        "round-05.json",
+        "round-06.json",
+        "round-07.json",
+        "round-08.json",
+        "round-09.json",
+        "round-10.json"
+      ],
+      "verdict": "ghostty_faster",
+      "refusal_reasons": [],
+      "dir": "rows/unicode_mix@80x120"
+    },
+    {
+      "schema": "ft.bench.ghostty-h2h-row.v1",
+      "corpus": "unicode_mix",
+      "input_sha256": "f3ab8fc9d700fd8359dc0c137b5eabf766ebe3882fa4424b5d01fa105650223f",
+      "geometry": {
+        "rows": 117,
+        "cols": 512
+      },
+      "ft_scrollback": 3500,
+      "ft_chunk_bytes": 65536,
+      "commands": {
+        "ghostty": "'/Users/jemanuel/.cache/fth2h/work/ghostty-e500d414f2ef-zig0.16.0/out/bin/ghostty-bench' +terminal-stream --data='/Users/jemanuel/.cache/fth2h/work/corpus/unicode_mix-67108864-000000000135288d.bin' --terminal-rows=117 --terminal-cols=512",
+        "frankenterm": "'/Users/jemanuel/.cache/fth2h/work/ft-target/release-perf/examples/ingest_throughput' --lane term --from-file '/Users/jemanuel/.cache/fth2h/work/corpus/unicode_mix-67108864-000000000135288d.bin' --rows 117 --cols 512 --scrollback 3500 --chunk 65536"
+      },
+      "arms": {
+        "ghostty": {
+          "n": 10,
+          "median_s": 0.866197417,
+          "p95_s": 0.8955867500000001,
+          "mean_s": 0.8710122291000001,
+          "stddev_s": 0.012124221232079811,
+          "cv_pct": 1.3919691167376067,
+          "min_s": 0.859634667,
+          "max_s": 0.8955867500000001,
+          "times_s": [
+            0.8600546250000001,
+            0.8611463330000001,
+            0.879969416,
+            0.8761080830000001,
+            0.8955867500000001,
+            0.8828265420000001,
+            0.862401041,
+            0.864477625,
+            0.859634667,
+            0.867917209
+          ],
+          "peak_rss_bytes_median": 42606592.0
+        },
+        "frankenterm": {
+          "n": 10,
+          "median_s": 2.0178811665,
+          "p95_s": 2.030705583,
+          "mean_s": 2.0199872417,
+          "stddev_s": 0.007117572011874035,
+          "cv_pct": 0.35235727557783786,
+          "min_s": 2.009723709,
+          "max_s": 2.030705583,
+          "times_s": [
+            2.025970625,
+            2.018003708,
+            2.029289541,
+            2.030705583,
+            2.023986042,
+            2.009723709,
+            2.017134542,
+            2.017758625,
+            2.013775958,
+            2.013524084
+          ],
+          "internal_lane_secs_untimed_runs": [
+            1.969143292,
+            1.952919584
+          ],
+          "state_fingerprints": [
+            "80e6ec868cc5e13a"
+          ],
+          "peak_rss_bytes_median": 74227712.0
+        }
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-01.json",
+          "ghostty_s": 0.8600546250000001,
+          "ghostty_peak_rss_bytes": 11075584,
+          "frankenterm_s": 2.025970625,
+          "frankenterm_peak_rss_bytes": 74268672
+        },
+        {
+          "round": 2,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-02.json",
+          "frankenterm_s": 2.018003708,
+          "frankenterm_peak_rss_bytes": 74219520,
+          "ghostty_s": 0.8611463330000001,
+          "ghostty_peak_rss_bytes": 74219520
+        },
+        {
+          "round": 3,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-03.json",
+          "ghostty_s": 0.879969416,
+          "ghostty_peak_rss_bytes": 11042816,
+          "frankenterm_s": 2.029289541,
+          "frankenterm_peak_rss_bytes": 74055680
+        },
+        {
+          "round": 4,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-04.json",
+          "frankenterm_s": 2.030705583,
+          "frankenterm_peak_rss_bytes": 74153984,
+          "ghostty_s": 0.8761080830000001,
+          "ghostty_peak_rss_bytes": 74153984
+        },
+        {
+          "round": 5,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-05.json",
+          "ghostty_s": 0.8955867500000001,
+          "ghostty_peak_rss_bytes": 11026432,
+          "frankenterm_s": 2.023986042,
+          "frankenterm_peak_rss_bytes": 74317824
+        },
+        {
+          "round": 6,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-06.json",
+          "frankenterm_s": 2.009723709,
+          "frankenterm_peak_rss_bytes": 74137600,
+          "ghostty_s": 0.8828265420000001,
+          "ghostty_peak_rss_bytes": 74137600
+        },
+        {
+          "round": 7,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-07.json",
+          "ghostty_s": 0.862401041,
+          "ghostty_peak_rss_bytes": 11059200,
+          "frankenterm_s": 2.017134542,
+          "frankenterm_peak_rss_bytes": 74285056
+        },
+        {
+          "round": 8,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-08.json",
+          "frankenterm_s": 2.017758625,
+          "frankenterm_peak_rss_bytes": 74252288,
+          "ghostty_s": 0.864477625,
+          "ghostty_peak_rss_bytes": 74252288
+        },
+        {
+          "round": 9,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-09.json",
+          "ghostty_s": 0.859634667,
+          "ghostty_peak_rss_bytes": 11026432,
+          "frankenterm_s": 2.013775958,
+          "frankenterm_peak_rss_bytes": 74121216
+        },
+        {
+          "round": 10,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-10.json",
+          "frankenterm_s": 2.013524084,
+          "frankenterm_peak_rss_bytes": 74235904,
+          "ghostty_s": 0.867917209,
+          "ghostty_peak_rss_bytes": 74235904
+        }
+      ],
+      "load_1m": {
+        "samples": [
+          {
+            "at": "2026-10-16T18:21:53Z",
+            "load_1m": 2.92
+          },
+          {
+            "at": "2026-10-16T18:22:05Z",
+            "load_1m": 2.85
+          },
+          {
+            "at": "2026-10-16T18:22:08Z",
+            "load_1m": 2.79
+          },
+          {
+            "at": "2026-10-16T18:22:11Z",
+            "load_1m": 2.79
+          },
+          {
+            "at": "2026-10-16T18:22:14Z",
+            "load_1m": 2.72
+          },
+          {
+            "at": "2026-10-16T18:22:17Z",
+            "load_1m": 2.72
+          },
+          {
+            "at": "2026-10-16T18:22:20Z",
+            "load_1m": 2.66
+          },
+          {
+            "at": "2026-10-16T18:22:22Z",
+            "load_1m": 2.69
+          },
+          {
+            "at": "2026-10-16T18:22:25Z",
+            "load_1m": 2.69
+          },
+          {
+            "at": "2026-10-16T18:22:28Z",
+            "load_1m": 2.64
+          },
+          {
+            "at": "2026-10-16T18:22:31Z",
+            "load_1m": 2.64
+          }
+        ],
+        "peak": 2.92
+      },
+      "paired": {
+        "pairs": 10,
+        "ft_wins": 0,
+        "median_pair_speedup": 0.42973923774724004
+      },
+      "ft_speedup": 0.42926086599163465,
+      "ft_speedup_unadmitted": 0.42926086599163465,
+      "hyperfine_json": [
+        "round-01.json",
+        "round-02.json",
+        "round-03.json",
+        "round-04.json",
+        "round-05.json",
+        "round-06.json",
+        "round-07.json",
+        "round-08.json",
+        "round-09.json",
+        "round-10.json"
+      ],
+      "verdict": "ghostty_faster",
+      "refusal_reasons": [],
+      "dir": "rows/unicode_mix@117x512"
+    },
+    {
+      "schema": "ft.bench.ghostty-h2h-row.v1",
+      "corpus": "tui_repaint",
+      "input_sha256": "2b5da0b39204f06396a51a4d2dc62956472e9b3eefec99db25afd6d3db070719",
+      "geometry": {
+        "rows": 80,
+        "cols": 120
+      },
+      "ft_scrollback": 3500,
+      "ft_chunk_bytes": 65536,
+      "commands": {
+        "ghostty": "'/Users/jemanuel/.cache/fth2h/work/ghostty-e500d414f2ef-zig0.16.0/out/bin/ghostty-bench' +terminal-stream --data='/Users/jemanuel/.cache/fth2h/work/corpus/tui_repaint-67108864-000000000135288d.bin' --terminal-rows=80 --terminal-cols=120",
+        "frankenterm": "'/Users/jemanuel/.cache/fth2h/work/ft-target/release-perf/examples/ingest_throughput' --lane term --from-file '/Users/jemanuel/.cache/fth2h/work/corpus/tui_repaint-67108864-000000000135288d.bin' --rows 80 --cols 120 --scrollback 3500 --chunk 65536"
+      },
+      "arms": {
+        "ghostty": {
+          "n": 10,
+          "median_s": 0.2968272295,
+          "p95_s": 0.29745308400000003,
+          "mean_s": 0.29675313340000004,
+          "stddev_s": 0.0006731820574672419,
+          "cv_pct": 0.22684918260318587,
+          "min_s": 0.295197875,
+          "max_s": 0.29745308400000003,
+          "times_s": [
+            0.297339583,
+            0.297074709,
+            0.29745308400000003,
+            0.29642433300000004,
+            0.29657975000000003,
+            0.29730300000000004,
+            0.296503583,
+            0.295197875,
+            0.297150625,
+            0.296504792
+          ],
+          "peak_rss_bytes_median": 40214528.0
+        },
+        "frankenterm": {
+          "n": 10,
+          "median_s": 0.48211618750000007,
+          "p95_s": 0.48854570900000005,
+          "mean_s": 0.4825104917,
+          "stddev_s": 0.0025659119926976074,
+          "cv_pct": 0.5317836683006177,
+          "min_s": 0.4796305,
+          "max_s": 0.48854570900000005,
+          "times_s": [
+            0.48323466600000003,
+            0.48444162500000004,
+            0.480167,
+            0.48854570900000005,
+            0.48255650000000005,
+            0.480974041,
+            0.482674292,
+            0.481204709,
+            0.48167587500000003,
+            0.4796305
+          ],
+          "internal_lane_secs_untimed_runs": [
+            0.440240625,
+            0.437496709
+          ],
+          "state_fingerprints": [
+            "e9300c2bfc49435e"
+          ],
+          "peak_rss_bytes_median": 70975488.0
+        }
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-01.json",
+          "ghostty_s": 0.297339583,
+          "ghostty_peak_rss_bytes": 9453568,
+          "frankenterm_s": 0.48323466600000003,
+          "frankenterm_peak_rss_bytes": 70991872
+        },
+        {
+          "round": 2,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-02.json",
+          "frankenterm_s": 0.48444162500000004,
+          "frankenterm_peak_rss_bytes": 70991872,
+          "ghostty_s": 0.297074709,
+          "ghostty_peak_rss_bytes": 70991872
+        },
+        {
+          "round": 3,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-03.json",
+          "ghostty_s": 0.29745308400000003,
+          "ghostty_peak_rss_bytes": 9420800,
+          "frankenterm_s": 0.480167,
+          "frankenterm_peak_rss_bytes": 70959104
+        },
+        {
+          "round": 4,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-04.json",
+          "frankenterm_s": 0.48854570900000005,
+          "frankenterm_peak_rss_bytes": 70991872,
+          "ghostty_s": 0.29642433300000004,
+          "ghostty_peak_rss_bytes": 70991872
+        },
+        {
+          "round": 5,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-05.json",
+          "ghostty_s": 0.29657975000000003,
+          "ghostty_peak_rss_bytes": 9388032,
+          "frankenterm_s": 0.48255650000000005,
+          "frankenterm_peak_rss_bytes": 70942720
+        },
+        {
+          "round": 6,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-06.json",
+          "frankenterm_s": 0.480974041,
+          "frankenterm_peak_rss_bytes": 70975488,
+          "ghostty_s": 0.29730300000000004,
+          "ghostty_peak_rss_bytes": 70975488
+        },
+        {
+          "round": 7,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-07.json",
+          "ghostty_s": 0.296503583,
+          "ghostty_peak_rss_bytes": 9437184,
+          "frankenterm_s": 0.482674292,
+          "frankenterm_peak_rss_bytes": 70959104
+        },
+        {
+          "round": 8,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-08.json",
+          "frankenterm_s": 0.481204709,
+          "frankenterm_peak_rss_bytes": 70975488,
+          "ghostty_s": 0.295197875,
+          "ghostty_peak_rss_bytes": 70975488
+        },
+        {
+          "round": 9,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-09.json",
+          "ghostty_s": 0.297150625,
+          "ghostty_peak_rss_bytes": 9420800,
+          "frankenterm_s": 0.48167587500000003,
+          "frankenterm_peak_rss_bytes": 70991872
+        },
+        {
+          "round": 10,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-10.json",
+          "frankenterm_s": 0.4796305,
+          "frankenterm_peak_rss_bytes": 70975488,
+          "ghostty_s": 0.296504792,
+          "ghostty_peak_rss_bytes": 70975488
+        }
+      ],
+      "load_1m": {
+        "samples": [
+          {
+            "at": "2026-10-16T18:22:34Z",
+            "load_1m": 2.58
+          },
+          {
+            "at": "2026-10-16T18:22:37Z",
+            "load_1m": 2.62
+          },
+          {
+            "at": "2026-10-16T18:22:38Z",
+            "load_1m": 2.62
+          },
+          {
+            "at": "2026-10-16T18:22:39Z",
+            "load_1m": 2.62
+          },
+          {
+            "at": "2026-10-16T18:22:40Z",
+            "load_1m": 2.62
+          },
+          {
+            "at": "2026-10-16T18:22:41Z",
+            "load_1m": 2.62
+          },
+          {
+            "at": "2026-10-16T18:22:41Z",
+            "load_1m": 2.62
+          },
+          {
+            "at": "2026-10-16T18:22:42Z",
+            "load_1m": 2.97
+          },
+          {
+            "at": "2026-10-16T18:22:43Z",
+            "load_1m": 2.97
+          },
+          {
+            "at": "2026-10-16T18:22:44Z",
+            "load_1m": 2.97
+          },
+          {
+            "at": "2026-10-16T18:22:45Z",
+            "load_1m": 2.97
+          }
+        ],
+        "peak": 2.97
+      },
+      "paired": {
+        "pairs": 10,
+        "ft_wins": 0,
+        "median_pair_speedup": 0.6149560207271585
+      },
+      "ft_speedup": 0.6156757171734666,
+      "ft_speedup_unadmitted": 0.6156757171734666,
+      "hyperfine_json": [
+        "round-01.json",
+        "round-02.json",
+        "round-03.json",
+        "round-04.json",
+        "round-05.json",
+        "round-06.json",
+        "round-07.json",
+        "round-08.json",
+        "round-09.json",
+        "round-10.json"
+      ],
+      "verdict": "ghostty_faster",
+      "refusal_reasons": [],
+      "dir": "rows/tui_repaint@80x120"
+    },
+    {
+      "schema": "ft.bench.ghostty-h2h-row.v1",
+      "corpus": "tui_repaint",
+      "input_sha256": "2b5da0b39204f06396a51a4d2dc62956472e9b3eefec99db25afd6d3db070719",
+      "geometry": {
+        "rows": 117,
+        "cols": 512
+      },
+      "ft_scrollback": 3500,
+      "ft_chunk_bytes": 65536,
+      "commands": {
+        "ghostty": "'/Users/jemanuel/.cache/fth2h/work/ghostty-e500d414f2ef-zig0.16.0/out/bin/ghostty-bench' +terminal-stream --data='/Users/jemanuel/.cache/fth2h/work/corpus/tui_repaint-67108864-000000000135288d.bin' --terminal-rows=117 --terminal-cols=512",
+        "frankenterm": "'/Users/jemanuel/.cache/fth2h/work/ft-target/release-perf/examples/ingest_throughput' --lane term --from-file '/Users/jemanuel/.cache/fth2h/work/corpus/tui_repaint-67108864-000000000135288d.bin' --rows 117 --cols 512 --scrollback 3500 --chunk 65536"
+      },
+      "arms": {
+        "ghostty": {
+          "n": 10,
+          "median_s": 0.561788312,
+          "p95_s": 0.564777667,
+          "mean_s": 0.5609488332000001,
+          "stddev_s": 0.003456933954540161,
+          "cv_pct": 0.6162654684242171,
+          "min_s": 0.551843875,
+          "max_s": 0.564777667,
+          "times_s": [
+            0.562084333,
+            0.5605885420000001,
+            0.564777667,
+            0.560268917,
+            0.5626475830000001,
+            0.562274833,
+            0.562722666,
+            0.560787625,
+            0.5614922910000001,
+            0.551843875
+          ],
+          "peak_rss_bytes_median": 40583168.0
+        },
+        "frankenterm": {
+          "n": 10,
+          "median_s": 0.48220450000000004,
+          "p95_s": 0.48521637500000003,
+          "mean_s": 0.4810670292,
+          "stddev_s": 0.0033263260860007795,
+          "cv_pct": 0.6914475289508739,
+          "min_s": 0.47359595800000004,
+          "max_s": 0.48521637500000003,
+          "times_s": [
+            0.483638875,
+            0.481842541,
+            0.482566459,
+            0.482703125,
+            0.47872095800000003,
+            0.48521637500000003,
+            0.48317633400000004,
+            0.479901375,
+            0.479308292,
+            0.47359595800000004
+          ],
+          "internal_lane_secs_untimed_runs": [
+            0.439094583,
+            0.434117833
+          ],
+          "state_fingerprints": [
+            "18a0e4173d5c43b4"
+          ],
+          "peak_rss_bytes_median": 71008256.0
+        }
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-01.json",
+          "ghostty_s": 0.562084333,
+          "ghostty_peak_rss_bytes": 10125312,
+          "frankenterm_s": 0.483638875,
+          "frankenterm_peak_rss_bytes": 71008256
+        },
+        {
+          "round": 2,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-02.json",
+          "frankenterm_s": 0.481842541,
+          "frankenterm_peak_rss_bytes": 71008256,
+          "ghostty_s": 0.5605885420000001,
+          "ghostty_peak_rss_bytes": 71008256
+        },
+        {
+          "round": 3,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-03.json",
+          "ghostty_s": 0.564777667,
+          "ghostty_peak_rss_bytes": 10141696,
+          "frankenterm_s": 0.482566459,
+          "frankenterm_peak_rss_bytes": 71008256
+        },
+        {
+          "round": 4,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-04.json",
+          "frankenterm_s": 0.482703125,
+          "frankenterm_peak_rss_bytes": 71024640,
+          "ghostty_s": 0.560268917,
+          "ghostty_peak_rss_bytes": 71024640
+        },
+        {
+          "round": 5,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-05.json",
+          "ghostty_s": 0.5626475830000001,
+          "ghostty_peak_rss_bytes": 10108928,
+          "frankenterm_s": 0.47872095800000003,
+          "frankenterm_peak_rss_bytes": 71024640
+        },
+        {
+          "round": 6,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-06.json",
+          "frankenterm_s": 0.48521637500000003,
+          "frankenterm_peak_rss_bytes": 71008256,
+          "ghostty_s": 0.562274833,
+          "ghostty_peak_rss_bytes": 71008256
+        },
+        {
+          "round": 7,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-07.json",
+          "ghostty_s": 0.562722666,
+          "ghostty_peak_rss_bytes": 10158080,
+          "frankenterm_s": 0.48317633400000004,
+          "frankenterm_peak_rss_bytes": 71041024
+        },
+        {
+          "round": 8,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-08.json",
+          "frankenterm_s": 0.479901375,
+          "frankenterm_peak_rss_bytes": 71008256,
+          "ghostty_s": 0.560787625,
+          "ghostty_peak_rss_bytes": 71008256
+        },
+        {
+          "round": 9,
+          "order": [
+            "ghostty",
+            "frankenterm"
+          ],
+          "file": "round-09.json",
+          "ghostty_s": 0.5614922910000001,
+          "ghostty_peak_rss_bytes": 10141696,
+          "frankenterm_s": 0.479308292,
+          "frankenterm_peak_rss_bytes": 71024640
+        },
+        {
+          "round": 10,
+          "order": [
+            "frankenterm",
+            "ghostty"
+          ],
+          "file": "round-10.json",
+          "frankenterm_s": 0.47359595800000004,
+          "frankenterm_peak_rss_bytes": 71008256,
+          "ghostty_s": 0.551843875,
+          "ghostty_peak_rss_bytes": 71008256
+        }
+      ],
+      "load_1m": {
+        "samples": [
+          {
+            "at": "2026-10-16T18:22:46Z",
+            "load_1m": 2.97
+          },
+          {
+            "at": "2026-10-16T18:22:50Z",
+            "load_1m": 2.89
+          },
+          {
+            "at": "2026-10-16T18:22:51Z",
+            "load_1m": 2.89
+          },
+          {
+            "at": "2026-10-16T18:22:52Z",
+            "load_1m": 2.9
+          },
+          {
+            "at": "2026-10-16T18:22:53Z",
+            "load_1m": 2.9
+          },
+          {
+            "at": "2026-10-16T18:22:55Z",
+            "load_1m": 2.9
+          },
+          {
+            "at": "2026-10-16T18:22:56Z",
+            "load_1m": 2.9
+          },
+          {
+            "at": "2026-10-16T18:22:57Z",
+            "load_1m": 3.07
+          },
+          {
+            "at": "2026-10-16T18:22:58Z",
+            "load_1m": 3.07
+          },
+          {
+            "at": "2026-10-16T18:22:59Z",
+            "load_1m": 3.07
+          },
+          {
+            "at": "2026-10-16T18:23:00Z",
+            "load_1m": 3.07
+          }
+        ],
+        "peak": 3.07
+      },
+      "paired": {
+        "pairs": 10,
+        "ft_wins": 10,
+        "median_pair_speedup": 1.1649264620947506
+      },
+      "ft_speedup": 1.165041620308396,
+      "ft_speedup_unadmitted": 1.165041620308396,
+      "hyperfine_json": [
+        "round-01.json",
+        "round-02.json",
+        "round-03.json",
+        "round-04.json",
+        "round-05.json",
+        "round-06.json",
+        "round-07.json",
+        "round-08.json",
+        "round-09.json",
+        "round-10.json"
+      ],
+      "verdict": "ft_faster",
+      "refusal_reasons": [],
+      "dir": "rows/tui_repaint@117x512"
+    }
+  ],
+  "emoji_width_parity": [
+    {
+      "schema": "ft.bench.ghostty-h2h-parity.v1",
+      "geometry": {
+        "rows": 80,
+        "cols": 120
+      },
+      "line_feeds": 0,
+      "ghostty": {
+        "cursor_x": 86,
+        "cursor_y": 79,
+        "pending_wrap": false,
+        "total_rows": 39433,
+        "written_rows": 39433,
+        "wraps": 39432,
+        "wrap_flagged_rows": 39432,
+        "bench_equivalent_total_rows": 625
+      },
+      "frankenterm": {
+        "cursor_x": 7,
+        "cursor_y": 79,
+        "retained_rows": 39296,
+        "written_rows": 39296,
+        "wraps": 39295,
+        "scrollback": 79186,
+        "state_fingerprint": "abca75ac5ff66239",
+        "sanity": "ok"
+      },
+      "ghostty_wrap_flags_consistent": true,
+      "agree": false,
+      "disagreements": [
+        "rows written: ghostty 39433, frankenterm 39296 (wraps 39432 vs 39295)",
+        "final cursor column: ghostty 86, frankenterm 7"
+      ],
+      "corpus": "color_emoji_random"
+    },
+    {
+      "schema": "ft.bench.ghostty-h2h-parity.v1",
+      "geometry": {
+        "rows": 117,
+        "cols": 512
+      },
+      "line_feeds": 0,
+      "ghostty": {
+        "cursor_x": 321,
+        "cursor_y": 116,
+        "pending_wrap": false,
+        "total_rows": 9217,
+        "written_rows": 9217,
+        "wraps": 9216,
+        "wrap_flagged_rows": 9216,
+        "bench_equivalent_total_rows": 196
+      },
+      "frankenterm": {
+        "cursor_x": 54,
+        "cursor_y": 116,
+        "retained_rows": 9186,
+        "written_rows": 9186,
+        "wraps": 9185,
+        "scrollback": 18902,
+        "state_fingerprint": "cc1108777805f61f",
+        "sanity": "ok"
+      },
+      "ghostty_wrap_flags_consistent": true,
+      "agree": false,
+      "disagreements": [
+        "rows written: ghostty 9217, frankenterm 9186 (wraps 9216 vs 9185)",
+        "final cursor column: ghostty 321, frankenterm 54"
+      ],
+      "corpus": "color_emoji_random"
+    }
+  ],
+  "primary": {
+    "corpus": "color_emoji_random"
+  },
+  "verdict": "ft_faster"
+}
