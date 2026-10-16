@@ -781,7 +781,7 @@
         "cosmetic": 32,
         "docs": 6,
         "feat": 223,
-        "fix": 316,
+        "fix": 318,
         "other": 73,
         "refactor": 12,
         "rename": 2,
@@ -789,13 +789,13 @@
         "security-fix": 7,
         "test": 114
       },
-      "fork_side_commit_count": 801,
+      "fork_side_commit_count": 803,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-15T19:54:08-04:00",
-        "sha": "d8ecd16cc4cb1a88d3543dacbe55175bd9eba1bd",
-        "subject": "fix(mux,mux-server): review of today's store and diagnostics changes: no logging under the terminal lock, bounded release backlog, exact zero-width runs"
+        "committed_at": "2026-10-16T00:33:13-04:00",
+        "sha": "0700c21c6142bf3ea107181a11be0d3737aa114d",
+        "subject": "fix(mux): spell the live-parser survival test as a match so the authority macro inventory stays closed"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1038,20 +1038,20 @@
         "cosmetic": 16,
         "docs": 2,
         "feat": 74,
-        "fix": 165,
+        "fix": 167,
         "other": 77,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
         "test": 79
       },
-      "fork_side_commit_count": 430,
+      "fork_side_commit_count": 432,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-10-15T18:25:33-04:00",
-        "sha": "fa8646e7d0f7d6784e5d5a68ac6fc641cac37652",
-        "subject": "perf(term): cold-geometry rows hold their wrap geometry inline, not behind a per-row Arc (ft-yccm0.2.1.8)"
+        "classification": "fix",
+        "committed_at": "2026-10-16T00:26:33-04:00",
+        "sha": "ff69c70c65d19939fb6d26cace9642aebed8534e",
+        "subject": "fix(term): checkpoint history-budget tests compile, and the trimming encoder is encode_trimming_history"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1206,8 +1206,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 3207,
-  "generated_at": "2026-10-16T02:32:36.118262Z",
+  "fork_side_commit_total": 3211,
+  "generated_at": "2026-10-16T09:06:15.960521Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
