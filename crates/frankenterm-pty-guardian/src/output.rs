@@ -2573,6 +2573,59 @@ impl PaneJournalAuthority {
     }
 }
 
+/// A broker-owned PTY's sole output authority over its pane's published
+/// segment chain. Deliberately not `Clone`: exactly one writer appends each
+/// drained read, and it owns the segment manager outright.
+pub struct GuardianBrokerOutputChainV1 {
+    authority: Box<PaneJournalAuthority>,
+}
+
+impl GuardianBrokerOutputChainV1 {
+    pub(crate) fn durable_pane_id(&self) -> Uuid {
+        self.authority.manifest.snapshot.durable_pane_id
+    }
+
+    /// Append one drained PTY read that begins at plaintext byte
+    /// `output_sequence_start`. A full segment is sealed and its successor
+    /// published first, so record sequence and plaintext bytes stay contiguous
+    /// across segments. Any failure is sticky.
+    pub(crate) fn append_read(
+        &mut self,
+        output_sequence_start: u64,
+        payload: &[u8],
+    ) -> Result<GuardianOutputAppendReceipt, GuardianOutputError> {
+        let authority = &mut self.authority;
+        let expected_sequence = authority.current_journal.next_sequence();
+        let expected_end = u64::try_from(payload.len())
+            .ok()
+            .and_then(|bytes| output_sequence_start.checked_add(bytes));
+        if authority.failed
+            || authority.current_journal.cumulative_plaintext_bytes() != output_sequence_start
+            || expected_sequence.is_none()
+            || expected_end.is_none()
+        {
+            authority.failed = true;
+            return Err(GuardianOutputError::FilesystemAuthority(
+                "guardian broker output read does not extend its chain",
+            ));
+        }
+        let receipt = authority.append_and_sync(payload).map_err(|_| {
+            GuardianOutputError::FilesystemAuthority("guardian broker output append failed")
+        })?;
+        if Some(receipt.sequence()) != expected_sequence
+            || usize::try_from(receipt.payload_bytes()).ok() != Some(payload.len())
+            || Some(receipt.cumulative_plaintext_bytes()) != expected_end
+            || !authority.receipt_is_current(receipt)
+        {
+            authority.failed = true;
+            return Err(GuardianOutputError::FilesystemAuthority(
+                "guardian broker output receipt does not match its read",
+            ));
+        }
+        Ok(receipt)
+    }
+}
+
 /// Process-local append handle for one pane's bounded immutable segment chain.
 #[derive(Clone)]
 pub struct GuardianPaneOutputJournal {
@@ -2624,15 +2677,17 @@ impl GuardianPaneOutputJournal {
     /// Consume one freshly published single-segment chain into the persistent
     /// broker's sole synchronous output-journal authority.
     ///
-    /// The ordinary guardian keeps the segment manager so it can roll over in
-    /// its bounded worker pool. A broker-owned PTY instead needs the exact raw
-    /// journal beside the child and appends before exposing each output prefix.
-    /// This one-way conversion is permitted only before the handle was cloned
-    /// and only while the complete manifest, path, and empty-chain invariants
-    /// still match. It never reopens a path or infers authority from a name.
-    pub(crate) fn into_fresh_broker_journal(
+    /// The ordinary guardian appends through its bounded worker pool. A
+    /// broker-owned PTY instead appends beside the child before exposing each
+    /// output prefix, through the same segment manager: a full segment is
+    /// sealed and its successor published, so the PTY outlives one segment's
+    /// record and byte caps. This one-way conversion is permitted only before
+    /// the handle was cloned and only while the complete manifest, path, and
+    /// empty-chain invariants still match. It never reopens a path or infers
+    /// authority from a name.
+    pub(crate) fn into_fresh_broker_chain(
         self,
-    ) -> Result<GuardianOutputJournal, GuardianOutputError> {
+    ) -> Result<GuardianBrokerOutputChainV1, GuardianOutputError> {
         if self.initial_next_sequence != Some(1)
             || self.initial_cumulative_plaintext_bytes != 0
             || self.initial_remaining_records == 0
@@ -2687,7 +2742,9 @@ impl GuardianPaneOutputJournal {
                 "guardian broker output conversion found a non-fresh published chain",
             ));
         }
-        Ok(authority.current_journal)
+        Ok(GuardianBrokerOutputChainV1 {
+            authority: Box::new(authority),
+        })
     }
 
     fn validate_checkpoint_record_origin(
@@ -19713,18 +19770,61 @@ mod tests {
         let pane_id = Uuid::new_v4();
         let handle = pipeline.prepare_pane(guardian_incarnation, pane_id)?;
 
-        let mut journal = handle.into_fresh_broker_journal()?;
-        assert_eq!(journal.identity().durable_pane_id(), pane_id);
-        assert_eq!(journal.record_count(), 0);
-        assert_eq!(journal.cumulative_plaintext_bytes(), 0);
-        assert_eq!(journal.next_sequence(), Some(1));
-        assert_eq!(journal.tail(), GuardianOutputJournalTail::Clean);
-        assert!(!journal.directory_entry_sync_required());
+        let mut chain = handle.into_fresh_broker_chain()?;
+        assert_eq!(chain.durable_pane_id(), pane_id);
+        assert_eq!(chain.authority.current_journal.record_count(), 0);
+        assert_eq!(chain.authority.current_journal.next_sequence(), Some(1));
+        assert_eq!(
+            chain.authority.current_journal.tail(),
+            GuardianOutputJournalTail::Clean
+        );
 
-        let receipt = journal.append_and_sync(b"broker-owned-prefix")?;
+        let receipt = chain.append_read(0, b"broker-owned-prefix")?;
         assert_eq!(receipt.sequence(), 1);
-        assert_eq!(journal.record_count(), 1);
-        assert_eq!(journal.terminal_receipt(), Some(receipt));
+        assert_eq!(receipt.cumulative_plaintext_bytes(), 19);
+        assert_eq!(
+            chain.authority.current_journal.terminal_receipt(),
+            Some(receipt)
+        );
+        // A read that does not start where the chain ends is refused, and the
+        // refusal is sticky.
+        assert!(chain.append_read(0, b"replayed").is_err());
+        assert!(chain.append_read(19, b"next").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn broker_output_chain_rolls_over_instead_of_stalling_the_pty()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let policy = tiny_rotation_policy(4);
+        let (_directory, _poll, pipeline) =
+            pipeline_with_policy("ft-guardian-output-broker-rollover-", policy)?;
+        let pane_id = Uuid::new_v4();
+        let mut chain = pipeline
+            .prepare_pane(Uuid::new_v4(), pane_id)?
+            .into_fresh_broker_chain()?;
+
+        // One record per segment: each read after the first seals the
+        // segment it fills and publishes a successor, as a long-lived PTY's
+        // 2,049th read does under the production policy.
+        let reads: [&[u8]; 4] = [b"first", b"second", b"third", b"fourth"];
+        let mut start = 0_u64;
+        for (index, read) in reads.iter().enumerate() {
+            let receipt = chain.append_read(start, read)?;
+            start += u64::try_from(read.len())?;
+            assert_eq!(receipt.sequence(), u64::try_from(index)? + 1);
+            assert_eq!(receipt.cumulative_plaintext_bytes(), start);
+            assert_eq!(chain.authority.segments.len(), index + 1);
+        }
+        assert_eq!(chain.authority.manifest.snapshot.segments.len(), 4);
+        assert_eq!(
+            recover_all_segment_bytes(&chain.authority)?,
+            b"firstsecondthirdfourth"
+        );
+
+        // The policy's segment budget still bounds the chain; reclamation,
+        // not an unbounded chain, is what lets a PTY run forever.
+        assert!(chain.append_read(start, b"fifth").is_err());
         Ok(())
     }
 
@@ -19741,7 +19841,7 @@ mod tests {
         let attempted_duplicate = retained.clone();
 
         assert!(matches!(
-            attempted_duplicate.into_fresh_broker_journal(),
+            attempted_duplicate.into_fresh_broker_chain(),
             Err(GuardianOutputError::FilesystemAuthority(
                 "guardian broker output conversion requires sole journal authority"
             ))

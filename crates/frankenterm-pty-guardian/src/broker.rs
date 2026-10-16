@@ -60,7 +60,8 @@
 
 use crate::SealedAtomicBuildIdentity;
 use crate::output::{
-    GuardianOutputPipeline, GuardianPaneOutputJournal, GuardianPublishedGenesisAdmissionPermitV1,
+    GuardianBrokerOutputChainV1, GuardianOutputPipeline, GuardianPaneOutputJournal,
+    GuardianPublishedGenesisAdmissionPermitV1,
 };
 use crate::transport::{
     GuardianServiceError, GuardianTokenEffectLease, GuardianTokenPathAuthority,
@@ -75,9 +76,9 @@ use mio::{Events, Interest, Poll, Token, Waker};
 use mux::guardian_checkpoint::{
     GuardianGenesisReservationIdentityV1, GuardianSpawnCustodyContextV1,
 };
-use mux::guardian_output_journal::{
-    GuardianOutputAppendReceipt, GuardianOutputJournal, GuardianOutputJournalTail,
-};
+use mux::guardian_output_journal::GuardianOutputAppendReceipt;
+#[cfg(test)]
+use mux::guardian_output_journal::{GuardianOutputJournal, GuardianOutputJournalTail};
 use mux::guardian_protocol::{
     GUARDIAN_MAC_BYTES, GUARDIAN_MAX_PANES, GUARDIAN_MAX_PAYLOAD_BYTES,
     GuardianBrokerControlAuthenticatorV1, GuardianBrokerLeaseWalAuthenticatorV1,
@@ -18211,17 +18212,43 @@ impl std::fmt::Debug for BrokerControlLeaseV1 {
     }
 }
 
-/// One fresh, activated encrypted output segment bound to a prepared pane.
+/// Where a broker-owned PTY durably appends each drained read.
+enum BrokerOutputJournalBackendV1 {
+    /// The broker output pipeline's published segment chain. A full segment
+    /// is sealed and its successor published, so the PTY outlives one
+    /// segment's record and byte caps.
+    Chain(GuardianBrokerOutputChainV1),
+    /// One raw segment that never rolls over. Unit tests bind these to drive
+    /// the pump and its failure paths under exact journal limits.
+    #[cfg(test)]
+    Segment(Box<GuardianOutputJournal>),
+}
+
+/// One fresh, activated encrypted output journal bound to a prepared pane.
 ///
 /// The broker may expose only the synchronized plaintext prefix. A failed
 /// append is sticky because the on-disk disposition can be ambiguous even
 /// though the bytes already drained from the PTY remain in memory.
 struct BrokerDurableOutputJournalV1 {
-    journal: GuardianOutputJournal,
+    backend: BrokerOutputJournalBackendV1,
     failed: bool,
 }
 
 impl BrokerDurableOutputJournalV1 {
+    fn bind_fresh_chain(
+        chain: GuardianBrokerOutputChainV1,
+        durable_pane_id: Uuid,
+    ) -> Result<Self, BrokerError> {
+        if chain.durable_pane_id() != durable_pane_id {
+            return Err(BrokerError::DurableOutputJournalBindingMismatch);
+        }
+        Ok(Self {
+            backend: BrokerOutputJournalBackendV1::Chain(chain),
+            failed: false,
+        })
+    }
+
+    #[cfg(test)]
     fn bind_fresh(
         journal: GuardianOutputJournal,
         durable_pane_id: Uuid,
@@ -18246,7 +18273,7 @@ impl BrokerDurableOutputJournalV1 {
             return Err(BrokerError::DurableOutputJournalUnavailable);
         }
         Ok(Self {
-            journal,
+            backend: BrokerOutputJournalBackendV1::Segment(Box::new(journal)),
             failed: false,
         })
     }
@@ -18259,46 +18286,70 @@ impl BrokerDurableOutputJournalV1 {
         if self.failed {
             return Err(BrokerError::DurableOutputJournalUnavailable);
         }
-        let Some(expected_record_sequence) = self.journal.next_sequence() else {
-            self.failed = true;
-            return Err(BrokerError::DurableOutputJournalUnavailable);
-        };
-        if self.journal.cumulative_plaintext_bytes() != output_sequence_start
-            || self.journal.tail() != GuardianOutputJournalTail::Clean
-            || self.journal.is_poisoned()
-            || self.journal.directory_entry_sync_required()
-        {
-            self.failed = true;
-            return Err(BrokerError::DurableOutputJournalUnavailable);
-        }
-        let payload_bytes = u32::try_from(payload.len())
-            .map_err(|_| BrokerError::DurableOutputJournalReceiptMismatch)?;
-        let expected_output_sequence_end = output_sequence_start
-            .checked_add(u64::from(payload_bytes))
-            .ok_or(BrokerError::DurableOutputJournalReceiptMismatch)?;
-        let receipt = match self.journal.append_and_sync(payload) {
-            Ok(receipt) => receipt,
-            Err(_) => {
-                self.failed = true;
-                return Err(BrokerError::DurableOutputJournalUnavailable);
+        let result = match &mut self.backend {
+            BrokerOutputJournalBackendV1::Chain(chain) => chain
+                .append_read(output_sequence_start, payload)
+                .map_err(|_| BrokerError::DurableOutputJournalUnavailable),
+            #[cfg(test)]
+            BrokerOutputJournalBackendV1::Segment(journal) => {
+                append_to_raw_output_segment(journal, output_sequence_start, payload)
             }
         };
-        let receipt_matches = receipt.segment_id() == self.journal.identity().segment_id()
-            && receipt.sequence() == expected_record_sequence
-            && receipt.payload_bytes() == payload_bytes
-            && receipt.cumulative_plaintext_bytes() == expected_output_sequence_end
-            && self.journal.record_count() == expected_record_sequence
-            && self.journal.cumulative_plaintext_bytes() == expected_output_sequence_end
-            && self.journal.terminal_receipt() == Some(receipt)
-            && self.journal.tail() == GuardianOutputJournalTail::Clean
-            && !self.journal.is_poisoned()
-            && !self.journal.directory_entry_sync_required();
-        if !receipt_matches {
+        if result.is_err() {
             self.failed = true;
-            return Err(BrokerError::DurableOutputJournalReceiptMismatch);
         }
-        Ok(receipt)
+        result
     }
+
+    #[cfg(test)]
+    fn raw_segment(&self) -> &GuardianOutputJournal {
+        match &self.backend {
+            BrokerOutputJournalBackendV1::Segment(journal) => journal,
+            BrokerOutputJournalBackendV1::Chain(_) => {
+                panic!("this test bound a published chain, not a raw segment")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn append_to_raw_output_segment(
+    journal: &mut GuardianOutputJournal,
+    output_sequence_start: u64,
+    payload: &[u8],
+) -> Result<GuardianOutputAppendReceipt, BrokerError> {
+    let expected_record_sequence = journal
+        .next_sequence()
+        .ok_or(BrokerError::DurableOutputJournalUnavailable)?;
+    if journal.cumulative_plaintext_bytes() != output_sequence_start
+        || journal.tail() != GuardianOutputJournalTail::Clean
+        || journal.is_poisoned()
+        || journal.directory_entry_sync_required()
+    {
+        return Err(BrokerError::DurableOutputJournalUnavailable);
+    }
+    let payload_bytes = u32::try_from(payload.len())
+        .map_err(|_| BrokerError::DurableOutputJournalReceiptMismatch)?;
+    let expected_output_sequence_end = output_sequence_start
+        .checked_add(u64::from(payload_bytes))
+        .ok_or(BrokerError::DurableOutputJournalReceiptMismatch)?;
+    let receipt = journal
+        .append_and_sync(payload)
+        .map_err(|_| BrokerError::DurableOutputJournalUnavailable)?;
+    let receipt_matches = receipt.segment_id() == journal.identity().segment_id()
+        && receipt.sequence() == expected_record_sequence
+        && receipt.payload_bytes() == payload_bytes
+        && receipt.cumulative_plaintext_bytes() == expected_output_sequence_end
+        && journal.record_count() == expected_record_sequence
+        && journal.cumulative_plaintext_bytes() == expected_output_sequence_end
+        && journal.terminal_receipt() == Some(receipt)
+        && journal.tail() == GuardianOutputJournalTail::Clean
+        && !journal.is_poisoned()
+        && !journal.directory_entry_sync_required();
+    if !receipt_matches {
+        return Err(BrokerError::DurableOutputJournalReceiptMismatch);
+    }
+    Ok(receipt)
 }
 
 /// Child-free broker typestate after PTY allocation and before durable
@@ -18433,6 +18484,7 @@ impl BrokerPreparedPaneV1 {
     /// Bind one empty, directory-synchronized encrypted output segment before
     /// the child can exist. Binding is one-way; a mismatched or previously
     /// used segment drops the child-free prepared reservation fail-closed.
+    #[cfg(test)]
     pub(crate) fn bind_fresh_output_journal(
         mut self,
         journal: GuardianOutputJournal,
@@ -18448,15 +18500,23 @@ impl BrokerPreparedPaneV1 {
     }
 
     /// Consume the output pipeline's exact fresh manifest-bound handle into
-    /// the broker-owned synchronous journal used by the persistent PTY pump.
+    /// the broker-owned synchronous chain used by the persistent PTY pump.
+    /// Binding is one-way and happens before the child can exist.
     pub(crate) fn bind_fresh_published_output_journal(
-        self,
+        mut self,
         journal: GuardianPaneOutputJournal,
     ) -> Result<Self, BrokerError> {
-        let journal = journal
-            .into_fresh_broker_journal()
+        if self.output_journal.is_some() {
+            return Err(BrokerError::DurableOutputJournalAlreadyBound);
+        }
+        let chain = journal
+            .into_fresh_broker_chain()
             .map_err(|_| BrokerError::DurableOutputJournalUnavailable)?;
-        self.bind_fresh_output_journal(journal)
+        self.output_journal = Some(BrokerDurableOutputJournalV1::bind_fresh_chain(
+            chain,
+            self.binding.durable_pane_id,
+        )?);
+        Ok(self)
     }
 
     #[must_use]
@@ -31171,12 +31231,12 @@ mod tests {
                 .as_ref()
                 .expect("adopted pane retained output journal");
             assert_eq!(
-                durable.journal.record_count(),
+                durable.raw_segment().record_count(),
                 u64::try_from(pumps.len()).expect("record count fits u64")
             );
-            assert_eq!(durable.journal.cumulative_plaintext_bytes(), 9);
+            assert_eq!(durable.raw_segment().cumulative_plaintext_bytes(), 9);
             let mut cursor = durable
-                .journal
+                .raw_segment()
                 .recovery_cursor(1, 32)
                 .expect("open authenticated output recovery cursor");
             let mut recovered = Vec::new();
@@ -31193,7 +31253,7 @@ mod tests {
                     .expect("deliver authenticated recovered output");
                 assert_eq!(recovered_receipt.sequence(), recovered_records);
             }
-            assert_eq!(recovered_records, durable.journal.record_count());
+            assert_eq!(recovered_records, durable.raw_segment().record_count());
             assert_eq!(recovered, b"journaled");
         }
 
@@ -31318,8 +31378,11 @@ mod tests {
             .as_ref()
             .expect("retained failed durable journal");
         assert!(durable.failed);
-        assert_eq!(durable.journal.record_count(), 1);
-        assert_eq!(durable.journal.cumulative_plaintext_bytes(), durable_end);
+        assert_eq!(durable.raw_segment().record_count(), 1);
+        assert_eq!(
+            durable.raw_segment().cumulative_plaintext_bytes(),
+            durable_end
+        );
         assert_eq!(
             pane.pump_ready_output_durably(),
             Err(BrokerError::DurableOutputJournalUnavailable),
