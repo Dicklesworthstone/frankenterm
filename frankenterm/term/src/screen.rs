@@ -6828,18 +6828,23 @@ impl Screen {
         line: &Line,
         seqno: SequenceNo,
     ) -> bool {
-        self.record_scrollback_spill_replaced(stable_row, line, seqno, true)
+        // The row has left `lines`, and the scroll offering it adds one.
+        let rows_left = self.lines.len().saturating_add(1);
+        self.record_scrollback_spill_leaving(stable_row, line, seqno, rows_left)
     }
 
-    /// [`Self::record_scrollback_spill`]. `replaced` says whether the scroll
-    /// offering the row adds a new one in its place: scroll_up's move loop
-    /// does, its extra removals past the hot tier do not (ft-qvt9l.1).
-    fn record_scrollback_spill_replaced(
+    /// [`Self::record_scrollback_spill`], where `rows_left` is how many rows
+    /// the screen holds once the offered row has gone, counting rows the
+    /// scroll still adds; only a pane without a store reads it (ft-qvt9l.1).
+    /// scroll_up's move loop has removed the row and adds one (`len + 1`),
+    /// its extra removals add none (`len`), and page_scroll_up removes its
+    /// rows only after offering them all.
+    fn record_scrollback_spill_leaving(
         &mut self,
         stable_row: StableRowIndex,
         line: &Line,
         seqno: SequenceNo,
-        replaced: bool,
+        rows_left: usize,
     ) -> bool {
         if !self.allow_scrollback {
             return true;
@@ -6858,17 +6863,17 @@ impl Screen {
                 // a directory it cannot create). Keep classic bounded
                 // scrollback: hold rows until the whole `scrollback_lines`
                 // is resident, then let the oldest go, instead of holding
-                // every row in memory for the pane's life. When the scroll
-                // that offers this row adds a new one, the row goes once the
-                // rows left plus that one would reach the limit; an extra
-                // removal goes only while the rows left still reach it.
-                // Counting the new row for those too freed one more row on
-                // one scroll and refused the next (ft-qvt9l.1), so at the
-                // limit every other new row was allocated, not recycled.
+                // every row in memory for the pane's life. The row goes
+                // while the rows left would still reach the limit. Counting a
+                // new row for scroll_up's extra removals too freed one more
+                // row on one scroll and refused the next, so at the limit
+                // every other new row was allocated, not recycled; the page
+                // engine, offering rows before removing any, dropped every row
+                // above the hot tier at once (ft-qvt9l.1).
                 let resident_limit = self
                     .physical_rows
                     .saturating_add(self.scrollback_policy.size);
-                return self.lines.len().saturating_add(usize::from(replaced)) >= resident_limit;
+                return rows_left >= resident_limit;
             };
             #[cfg(not(feature = "use_serde"))]
             if !sink.store_scrollback_line(stable_row, line, max_retained_rows) {
@@ -10142,7 +10147,9 @@ impl Screen {
             if let Some(removed) = self.lines.remove(remove_idx) {
                 if remove_idx == 0 && scrollback_ok {
                     let stable_row = self.stable_row_index_for_removed_top(removed_from_top);
-                    if !self.record_scrollback_spill_replaced(stable_row, &removed, seqno, false) {
+                    let rows_left = self.lines.len();
+                    if !self.record_scrollback_spill_leaving(stable_row, &removed, seqno, rows_left)
+                    {
                         self.lines.insert(remove_idx, removed);
                         if self
                             .config
@@ -10285,7 +10292,14 @@ impl Screen {
                 let stable_row = self.stable_row_index_for_removed_top(removed_from_top);
                 let accepted = if self.cold_sink_retention_rows() > 0 {
                     let line = self.lines[removed_from_top].clone();
-                    self.record_scrollback_spill(stable_row, &line, seqno)
+                    // Rows are trimmed only after this loop: count the ones
+                    // already admitted and the rows the scroll appends.
+                    let rows_left = self
+                        .lines
+                        .len()
+                        .saturating_sub(removed_from_top + 1)
+                        .saturating_add(num_rows);
+                    self.record_scrollback_spill_leaving(stable_row, &line, seqno, rows_left)
                 } else {
                     // Without a cold sink only the row's length is read.
                     let len = self
@@ -10302,11 +10316,14 @@ impl Screen {
             }
             admitted += 1;
         }
+        // As in legacy scroll_up: only a store that writes synchronously
+        // failed. A deferred store refuses while its queue is full, and a
+        // pane without a store refuses rows it keeps by design (ft-qvt9l).
         if refused
-            && !self
+            && self
                 .config
                 .scrollback_spill_sink()
-                .is_some_and(|sink| sink.requires_scrollback_flush())
+                .is_some_and(|sink| !sink.requires_scrollback_flush())
         {
             warn!(
                 "cold scrollback persistence failed at stable row {}; retaining the row in memory",
@@ -11092,6 +11109,8 @@ pub(crate) mod tests {
         kp_cost_model: MonospaceKpCostModel,
         scorecard_enabled: bool,
         readability_gate: ResizeReadabilityGatePolicy,
+        /// `None` keeps the trait's choice (FT_GRID_ENGINE, else legacy).
+        grid_engine: Option<GridEngine>,
     }
 
     impl Default for TestTermConfig {
@@ -11112,6 +11131,7 @@ pub(crate) mod tests {
                     max_total_badness_delta: 0,
                     max_fallback_ratio_percent: 100,
                 },
+                grid_engine: None,
             }
         }
     }
@@ -11123,6 +11143,10 @@ pub(crate) mod tests {
 
         fn scrollback_tier_config(&self) -> crate::config::ScrollbackTierConfig {
             self.scrollback_tier
+        }
+
+        fn grid_engine(&self) -> GridEngine {
+            self.grid_engine.unwrap_or_else(GridEngine::from_env)
         }
 
         fn scrollback_spill_sink(&self) -> Option<Arc<dyn crate::config::ScrollbackSpillSink>> {
@@ -17868,6 +17892,7 @@ pub(crate) mod tests {
                     max_total_badness_delta: 67_890,
                     max_fallback_ratio_percent: 150,
                 },
+                ..TestTermConfig::default()
             },
         );
 
@@ -20576,6 +20601,56 @@ pub(crate) mod tests {
     /// scrollback. Rows are held until all of `scrollback_lines` is resident,
     /// then the oldest go; before, every row past the hot tier stayed in
     /// memory for the pane's life.
+    /// ft-qvt9l.1 on page rows: page_scroll_up offers every row past the hot
+    /// tier before trimming any, and a store-less pane at its limit admitted
+    /// them all, falling to the hot tier in one scroll. It now keeps exactly
+    /// its limit and lets one row go per scroll, as legacy rows do.
+    #[test]
+    fn page_engine_tiered_scrollback_without_cold_sink_keeps_its_limit() {
+        let mut screen = test_screen_with_config(
+            2,
+            8,
+            96,
+            TestTermConfig {
+                scrollback: 16,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 1,
+                    warm_max_bytes: 0,
+                },
+                cold_sink: None,
+                grid_engine: Some(GridEngine::Page),
+                ..TestTermConfig::default()
+            },
+        );
+        assert_eq!(screen.grid_engine(), GridEngine::Page);
+        let attrs = CellAttributes::blank();
+        for seq in 1..=40 {
+            let offset_before = screen.stable_row_index_offset;
+            screen.scroll_up(&(0..2), 1, seq, attrs.clone(), bidi_mode());
+            assert!(
+                screen.lines.len() <= 2 + 16,
+                "{} rows resident after {} scrolls",
+                screen.lines.len(),
+                seq
+            );
+            if seq > 16 {
+                assert_eq!(
+                    screen.lines.len(),
+                    2 + 16,
+                    "rows resident after {seq} scrolls"
+                );
+                assert_eq!(
+                    screen.stable_row_index_offset,
+                    offset_before + 1,
+                    "one row goes per scroll at the limit ({seq})"
+                );
+            }
+        }
+        assert_eq!(screen.grid_engine(), GridEngine::Page, "the page path ran");
+        assert_eq!(screen.stable_row_index_offset, 24);
+    }
+
     #[test]
     fn tiered_scrollback_without_cold_sink_stays_bounded_by_scrollback_lines() {
         let mut screen = test_screen_with_config(
@@ -21330,6 +21405,7 @@ pub(crate) mod tests {
                     max_total_badness_delta: 2000,
                     max_fallback_ratio_percent: 20,
                 },
+                ..TestTermConfig::default()
             },
         )
     }
