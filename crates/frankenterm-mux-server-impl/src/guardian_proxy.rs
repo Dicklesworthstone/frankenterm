@@ -245,8 +245,9 @@ impl GuardianDomain {
     }
 }
 
-impl GuardianDomain {
-    fn capture_recovery_policy(
+#[async_trait::async_trait(?Send)]
+impl Domain for GuardianDomain {
+    fn recovery_policy(
         &self,
         captured_config: &config::ConfigHandle,
     ) -> anyhow::Result<mux::domain::DomainRecoveryPolicy> {
@@ -288,24 +289,6 @@ impl GuardianDomain {
             socket_path: self.socket_path.clone(),
             token_path: self.token_path.clone(),
         })
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl Domain for GuardianDomain {
-    fn recovery_policy(
-        &self,
-        captured_config: &config::ConfigHandle,
-    ) -> anyhow::Result<mux::domain::DomainRecoveryPolicy> {
-        let policy = self.capture_recovery_policy(captured_config);
-        // A refusal disables whole-mux recovery, and the capture reports only
-        // "domain_policy"; say why. These messages carry no pane content.
-        if let Err(error) = &policy
-            && !error.is::<mux::domain::DomainRecoveryPolicyBusy>()
-        {
-            log::warn!("guardian domain recovery policy refused: {error:#}");
-        }
-        policy
     }
 
     async fn spawn_pane(

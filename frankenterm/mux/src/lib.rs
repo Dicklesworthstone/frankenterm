@@ -21221,16 +21221,24 @@ impl Mux {
                 if domain.domain_id() != *domain_id || domain.domain_name().len() > 65536 {
                     return Err(MuxTopologyCaptureError::UnsupportedDomainPolicy);
                 }
+                // A refusal ends whole-mux recovery for this mux, and the
+                // capture error names no domain: say which one and why. Domain
+                // names and policy refusals carry no pane content.
+                let refused = |error: &anyhow::Error| {
+                    log::warn!(
+                        "domain {:?} has no recoverable policy: {error:#}",
+                        domain.domain_name()
+                    );
+                    MuxTopologyCaptureError::UnsupportedDomainPolicy
+                };
                 let policy = domain.recovery_policy(&captured_config).map_err(|error| {
                     if error.is::<domain::DomainRecoveryPolicyBusy>() {
                         MuxTopologyCaptureError::DomainPolicyBusy
                     } else {
-                        MuxTopologyCaptureError::UnsupportedDomainPolicy
+                        refused(&error)
                     }
                 })?;
-                policy
-                    .validate()
-                    .map_err(|_| MuxTopologyCaptureError::UnsupportedDomainPolicy)?;
+                policy.validate().map_err(|error| refused(&error))?;
                 domain_policy_bytes = domain_policy_bytes
                     .checked_add(
                         policy
