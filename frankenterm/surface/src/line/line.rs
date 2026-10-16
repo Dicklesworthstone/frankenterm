@@ -2637,6 +2637,86 @@ pub struct LineWrapReport {
     pub scorecard: LineWrapScorecard,
 }
 
+/// The token widths of a [`LineWrapGeometry`]: per token its width (low
+/// seven bits), with 0x80 set when it is a wrap separator. A row of at most
+/// [`TokenWidths::ASCII_MAX`] single-width printable ASCII cells keeps only a
+/// bitmap of its spaces, inline (ft-yccm0.2.1.8): every row of plain output
+/// that scrolls into the durable store is captured on the parse thread, and
+/// allocating and later freeing a width buffer per row was most of that
+/// cost. The two forms compare by their tokens.
+#[derive(Debug, Clone)]
+enum TokenWidths {
+    Cells(Vec<u8>),
+    /// `len` tokens of width 1; bit `i` of `spaces` marks token `i` a space.
+    Ascii {
+        len: u16,
+        spaces: [u64; 4],
+    },
+}
+
+impl TokenWidths {
+    /// The longest row held in the inline form.
+    const ASCII_MAX: usize = 256;
+
+    /// The inline form of a row of single-width printable ASCII `text`, at
+    /// most [`Self::ASCII_MAX`] bytes.
+    fn ascii(text: &[u8]) -> Self {
+        let mut spaces = [0u64; 4];
+        for (index, _) in text.iter().enumerate().filter(|(_, byte)| **byte == b' ') {
+            spaces[index / 64] |= 1 << (index % 64);
+        }
+        Self::Ascii {
+            len: <u16 as core::convert::TryFrom<usize>>::try_from(text.len()).unwrap_or(u16::MAX),
+            spaces,
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Cells(widths) => widths.len(),
+            Self::Ascii { len, .. } => usize::from(*len),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Heap bytes this owns; the inline form owns none.
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Cells(widths) => widths.capacity(),
+            Self::Ascii { .. } => 0,
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<u8> {
+        match self {
+            Self::Cells(widths) => widths.get(index).copied(),
+            Self::Ascii { len, spaces } => (index < usize::from(*len)).then(|| {
+                if (spaces[index / 64] >> (index % 64)) & 1 == 1 {
+                    1 | 0x80
+                } else {
+                    1
+                }
+            }),
+        }
+    }
+
+    fn iter(&self) -> impl ExactSizeIterator<Item = u8> + '_ {
+        // `get` is `Some` for every index below `len`.
+        (0..self.len()).map(move |index| self.get(index).unwrap_or(0))
+    }
+}
+
+impl PartialEq for TokenWidths {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for TokenWidths {}
+
 /// Width and ordinary-space snapshot of a physical row or certified logical join.
 /// No text, attributes, cells, images or output rows are retained. Capture is
 /// fallible under the caller's byte budget; a refused join must use the ordinary
@@ -2645,7 +2725,7 @@ pub struct LineWrapReport {
 /// not equivalent to `Line::append_line`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineWrapGeometry {
-    widths: Vec<u8>,
+    widths: TokenWidths,
     physical_len: usize,
     trimmed_tokens: usize,
     join_safe: bool,
@@ -2702,7 +2782,7 @@ impl LineWrapGeometry {
             return None;
         }
         let mut result = Self {
-            widths: Vec::new(),
+            widths: TokenWidths::Cells(Vec::new()),
             physical_len: line.len(),
             trimmed_tokens: 0,
             join_safe: line.len() <= u32::MAX as usize,
@@ -2713,29 +2793,35 @@ impl LineWrapGeometry {
             head_pictograph: false,
             tail_before_pictograph: false,
         };
-        result.widths.try_reserve_exact(line.len()).ok()?;
-        if result.widths.capacity() > available {
-            return None;
-        }
-        let boundary_budget = max_bytes.checked_sub(result.retained_bytes())?;
         // Every row of plain output that scrolls into the durable store is
         // captured on the parse thread, under the terminal lock: 0.6 of the
         // 0.9 us per 80-column row with the store on (ft-yccm0.2.1.8). When
         // each cell is one printable ASCII byte of width 1, every cell is a
         // basic starter, so the loop below segments nothing and certifies
         // every boundary and both ends; only the widths, the separators and
-        // the trimmed length depend on the text.
+        // the trimmed length depend on the text. Such a row refuses exactly
+        // where the loop's path does: when its widths cannot fit `available`
+        // (checked above). A short one keeps its spaces inline.
         if let Some(text) = ascii_rows
             .then(|| line.single_width_printable_ascii())
             .flatten()
         {
-            if text.len() > max_bytes {
-                return None;
-            }
-            result.widths.extend(
-                text.bytes()
-                    .map(|byte| if byte == b' ' { 1 | 0x80 } else { 1 }),
-            );
+            let bytes = text.as_bytes();
+            result.widths = if bytes.len() <= TokenWidths::ASCII_MAX {
+                TokenWidths::ascii(bytes)
+            } else {
+                let mut widths = Vec::new();
+                widths.try_reserve_exact(bytes.len()).ok()?;
+                if widths.capacity() > available {
+                    return None;
+                }
+                widths.extend(
+                    bytes
+                        .iter()
+                        .map(|&byte| if byte == b' ' { 1 | 0x80 } else { 1 }),
+                );
+                TokenWidths::Cells(widths)
+            };
             result.trimmed_tokens = text
                 .bytes()
                 .rposition(|byte| byte != b' ')
@@ -2747,6 +2833,13 @@ impl LineWrapGeometry {
             result.tail_before_pictograph = pictographs;
             return Some(result);
         }
+        let mut widths = Vec::new();
+        widths.try_reserve_exact(line.len()).ok()?;
+        if widths.capacity() > available {
+            return None;
+        }
+        let boundary_budget = max_bytes
+            .checked_sub(core::mem::size_of::<Self>().saturating_add(widths.capacity()))?;
         let mut previous: Option<&str> = None;
         let mut previous_basic = false;
         let mut columns = 0usize;
@@ -2756,10 +2849,10 @@ impl LineWrapGeometry {
             let width = cell.width();
             // Current cells use widths 0..=2. Refuse a future extended width
             // rather than silently truncating it in this compact encoding.
-            if width > 2 || result.widths.len() == result.widths.capacity() {
+            if width > 2 || widths.len() == widths.capacity() {
                 return None;
             }
-            result.widths.push(
+            widths.push(
                 width as u8
                     | if is_wrap_separator(cell.str()) {
                         0x80
@@ -2774,7 +2867,7 @@ impl LineWrapGeometry {
                 CellRef::ClusterRef { text, .. } => text,
             };
             if text != " " {
-                result.trimmed_tokens = result.widths.len();
+                result.trimmed_tokens = widths.len();
             }
             result.join_safe &= cell.cell_index() == columns && (1..=2).contains(&width);
             columns = columns.checked_add(width.max(1))?;
@@ -2823,6 +2916,7 @@ impl LineWrapGeometry {
             previous = Some(text);
             previous_basic = basic;
         }
+        result.widths = TokenWidths::Cells(widths);
         result.join_safe &= columns == line.len();
         if let Some(last) = previous {
             result.tail_basic = previous_basic;
@@ -2864,7 +2958,7 @@ impl LineWrapGeometry {
     /// Owned allocation plus the inline representation; an external Arc header
     /// and collection slots must be charged separately by their owner.
     pub fn retained_bytes(&self) -> usize {
-        core::mem::size_of::<Self>().saturating_add(self.widths.capacity())
+        core::mem::size_of::<Self>().saturating_add(self.widths.heap_bytes())
     }
 
     /// Conservative upper bound for live planner allocations, including the
@@ -2983,28 +3077,44 @@ impl LineWrapGeometry {
         let Some(available) = max_bytes.checked_sub(core::mem::size_of::<Self>()) else {
             return Err(LineWrapGeometryJoinError::ByteBudget);
         };
-        if len > available || self.widths.capacity() > available {
+        let capacity = self.widths.heap_bytes();
+        if len > available || capacity > available {
             return Err(LineWrapGeometryJoinError::ByteBudget);
         }
-        if len > self.widths.capacity()
-            && self
-                .widths
-                .capacity()
+        if len > capacity
+            && capacity
                 .checked_add(len)
                 .is_none_or(|peak| peak > available)
         {
             return Err(LineWrapGeometryJoinError::ByteBudget);
         }
-        if self.widths.try_reserve_exact(other.widths.len()).is_err() {
+        // A join grows a width buffer; an inline row becomes one first, sized
+        // for the join. Every refusal above has passed, and none below can
+        // fire for it, so a refused join still leaves `self` as it was.
+        if let TokenWidths::Ascii { .. } = self.widths {
+            let mut cells = Vec::new();
+            if cells.try_reserve_exact(len).is_err() {
+                return Err(LineWrapGeometryJoinError::Allocation);
+            }
+            if cells.capacity() > available {
+                return Err(LineWrapGeometryJoinError::ByteBudget);
+            }
+            cells.extend(self.widths.iter());
+            self.widths = TokenWidths::Cells(cells);
+        }
+        let TokenWidths::Cells(widths) = &mut self.widths else {
+            return Err(LineWrapGeometryJoinError::Allocation);
+        };
+        if widths.try_reserve_exact(other.widths.len()).is_err() {
             return Err(LineWrapGeometryJoinError::Allocation);
         }
-        if self.widths.capacity() > available {
+        if widths.capacity() > available {
             return Err(LineWrapGeometryJoinError::ByteBudget);
         }
         if other.trimmed_tokens > 0 {
-            self.trimmed_tokens = self.widths.len() + other.trimmed_tokens;
+            self.trimmed_tokens = widths.len() + other.trimmed_tokens;
         }
-        if self.widths.is_empty() {
+        if widths.is_empty() {
             self.head_basic = other.head_basic;
             self.head_after_basic = other.head_after_basic;
             self.head_pictograph = other.head_pictograph;
@@ -3014,7 +3124,7 @@ impl LineWrapGeometry {
             self.tail_before_basic = other.tail_before_basic;
             self.tail_before_pictograph = other.tail_before_pictograph;
         }
-        self.widths.extend_from_slice(&other.widths);
+        widths.extend(other.widths.iter());
         self.physical_len = physical_len;
         Ok(())
     }
@@ -3031,12 +3141,13 @@ impl LineWrapGeometry {
         if self.physical_len <= cols || self.trimmed_tokens == 0 {
             return 1;
         }
-        let widths = &self.widths[..self.trimmed_tokens];
+        let tokens = self.trimmed_tokens;
+        let widths = || self.widths.iter().take(tokens);
         #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
         let cache_key = {
             let mut hasher = SipHasher::new();
-            widths.len().hash(&mut hasher);
-            for &width in widths {
+            tokens.hash(&mut hasher);
+            for width in widths() {
                 usize::from(width & 0x7f).hash(&mut hasher);
                 (width & 0x80 != 0).hash(&mut hasher);
             }
@@ -3050,12 +3161,9 @@ impl LineWrapGeometry {
         if let Some(count) = memoized_wrap_point_cache_row_count(cache_key) {
             return count;
         }
-        scratch.rebuild_metadata(
-            widths
-                .iter()
-                .map(|&width| (usize::from(width & 0x7f), width & 0x80 != 0)),
-        );
-        let (plan, scorecard) = wrap_plan_and_scorecard(widths.len(), cols, cost_model, scratch);
+        scratch
+            .rebuild_metadata(widths().map(|width| (usize::from(width & 0x7f), width & 0x80 != 0)));
+        let (plan, scorecard) = wrap_plan_and_scorecard(tokens, cols, cost_model, scratch);
         #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
         memoized_wrap_point_cache_insert(
             cache_key,
@@ -6033,6 +6141,73 @@ mod tests {
     }
 
     proptest::proptest! {
+        /// ft-yccm0.2.1.8: the inline ASCII widths behave as the per-token
+        /// buffer does: equality, wrap planning, joins in either order and
+        /// with either form, and refusals. Rows run past ASCII_MAX so both
+        /// forms and the u64 word edges are covered.
+        #[test]
+        fn inline_ascii_widths_plan_and_join_as_the_token_buffer(
+            first in "[ -~]{1,300}",
+            second in "[ -~]{1,300}",
+            cols in 1usize..400,
+            budget in proptest::prop_oneof![
+                proptest::strategy::Just(1usize << 16),
+                0usize..(core::mem::size_of::<LineWrapGeometry>() + 700),
+            ],
+        ) {
+            let a_line = clustered_ascii_row(&[(first.clone(), 0)]);
+            let b_line = clustered_ascii_row(&[(second.clone(), 1)]);
+            let a_fast = LineWrapGeometry::capture_cells(&a_line, 1 << 16, true, true).unwrap();
+            let a_slow = LineWrapGeometry::capture_cells(&a_line, 1 << 16, true, false).unwrap();
+            let b_fast = LineWrapGeometry::capture_cells(&b_line, 1 << 16, true, true).unwrap();
+            let b_slow = LineWrapGeometry::capture_cells(&b_line, 1 << 16, true, false).unwrap();
+            proptest::prop_assert_eq!(
+                matches!(a_fast.widths, TokenWidths::Ascii { .. }),
+                first.len() <= TokenWidths::ASCII_MAX
+            );
+            proptest::prop_assert_eq!(&a_fast, &a_slow);
+            if first.len() <= TokenWidths::ASCII_MAX {
+                proptest::prop_assert_eq!(
+                    a_fast.retained_bytes(),
+                    core::mem::size_of::<LineWrapGeometry>()
+                );
+            }
+            let model = MonospaceKpCostModel::terminal_default();
+            let mut scratch = LineWrapWidthPrefixScratch::default();
+            proptest::prop_assert_eq!(
+                a_fast.row_count(cols, model, &mut scratch),
+                a_slow.row_count(cols, model, &mut scratch)
+            );
+            let mut unbounded = a_slow.clone();
+            unbounded.try_append(&b_slow, usize::MAX).unwrap();
+            for (left, right) in [(&a_fast, &b_fast), (&a_fast, &b_slow), (&a_slow, &b_fast)] {
+                let mut joined = left.clone();
+                let mut reference = a_slow.clone();
+                let outcome = joined.try_append(right, budget);
+                let expected = reference.try_append(&b_slow, budget);
+                match (outcome, expected) {
+                    // An inline row has no buffer to keep while the joined one
+                    // grows, so it escapes the buffer form's growth peak: it
+                    // may join where that form refuses its budget.
+                    (Ok(()), Err(LineWrapGeometryJoinError::ByteBudget))
+                        if matches!(left.widths, TokenWidths::Ascii { .. }) =>
+                    {
+                        proptest::prop_assert_eq!(&joined, &unbounded);
+                    }
+                    (outcome, expected) => {
+                        proptest::prop_assert_eq!(outcome, expected);
+                        proptest::prop_assert_eq!(&joined, &reference);
+                    }
+                }
+                if outcome.is_ok() {
+                    proptest::prop_assert_eq!(
+                        joined.row_count(cols, model, &mut scratch),
+                        unbounded.row_count(cols, model, &mut scratch)
+                    );
+                }
+            }
+        }
+
         /// ft-yccm0.2.1.8: the single-width ASCII shortcut of geometry
         /// capture gives exactly what the per-cell loop gives, budgets and
         /// refusals included.
