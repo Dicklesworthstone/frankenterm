@@ -781,7 +781,7 @@
         "cosmetic": 32,
         "docs": 6,
         "feat": 223,
-        "fix": 318,
+        "fix": 323,
         "other": 73,
         "refactor": 12,
         "rename": 2,
@@ -789,13 +789,13 @@
         "security-fix": 7,
         "test": 114
       },
-      "fork_side_commit_count": 803,
+      "fork_side_commit_count": 808,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-16T00:33:13-04:00",
-        "sha": "0700c21c6142bf3ea107181a11be0d3737aa114d",
-        "subject": "fix(mux): spell the live-parser survival test as a match so the authority macro inventory stays closed"
+        "committed_at": "2026-10-16T12:17:09-04:00",
+        "sha": "0c2e62c7b35765069addb2823ef123112cc0ac9c",
+        "subject": "fix(recovery): an SSH config host no longer disables whole-mux recovery for good"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -992,19 +992,19 @@
         "cosmetic": 8,
         "feat": 16,
         "fix": 59,
-        "other": 50,
+        "other": 51,
         "refactor": 3,
         "rename": 1,
         "security-fix": 2,
         "test": 25
       },
-      "fork_side_commit_count": 168,
+      "fork_side_commit_count": 169,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "other",
-        "committed_at": "2026-10-15T22:32:23-04:00",
-        "sha": "c0a1aebd5b820a74d7e50a458bc4e117ff72f741",
-        "subject": "perf(surface): read a plain-ASCII row eight bytes at a time when capturing its wrap geometry (ft-yccm0.2.1.8)"
+        "committed_at": "2026-10-16T13:59:24-04:00",
+        "sha": "db81b59b7a576d9de812cef19f302e96cceaabc9",
+        "subject": "perf(surface): a reused row wipes only the text it holds, and a gap is filled with spaces in bulk (ft-yccm0.3.2.6)"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -1038,20 +1038,20 @@
         "cosmetic": 16,
         "docs": 2,
         "feat": 74,
-        "fix": 167,
+        "fix": 169,
         "other": 77,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
         "test": 79
       },
-      "fork_side_commit_count": 432,
+      "fork_side_commit_count": 434,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-10-16T00:26:33-04:00",
-        "sha": "ff69c70c65d19939fb6d26cace9642aebed8534e",
-        "subject": "fix(term): checkpoint history-budget tests compile, and the trimming encoder is encode_trimming_history"
+        "committed_at": "2026-10-16T13:59:24-04:00",
+        "sha": "30ebc2ff70409977cf5c1ff92f715882b99e2966",
+        "subject": "fix(term): a store-less tiered pane recycles a row per scroll at its limit instead of freeing and allocating alternately (ft-qvt9l.1)"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1206,8 +1206,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 3211,
-  "generated_at": "2026-10-16T09:06:15.960521Z",
+  "fork_side_commit_total": 3219,
+  "generated_at": "2026-10-16T17:59:37.186127Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
