@@ -263,14 +263,21 @@ impl Domain for GuardianDomain {
             .state
             .try_lock()
             .ok_or(mux::domain::DomainRecoveryPolicyBusy)?;
-        anyhow::ensure!(
-            state.unadopted_birth.is_none()
-                || state
-                    .publication
-                    .as_ref()
-                    .is_some_and(|receipt| receipt.was_published()),
-            "guardian domain retains an unpublished birth during recovery capture"
-        );
+        if state.unadopted_birth.is_some() {
+            match state.publication.as_ref() {
+                Some(receipt) if receipt.was_published() => {}
+                // A settled birth whose pane is about to be registered: the
+                // next capture sees it published. Refusing it as unsupported
+                // disabled recovery for the mux's lifetime whenever the first
+                // capture raced the first spawn.
+                Some(receipt) if receipt.is_pending() => {
+                    return Err(mux::domain::DomainRecoveryPolicyBusy.into());
+                }
+                _ => anyhow::bail!(
+                    "guardian domain retains an unpublished birth during recovery capture"
+                ),
+            }
+        }
         anyhow::ensure!(
             [self.socket_path.as_path(), self.token_path.as_path()]
                 .iter()
@@ -7384,6 +7391,19 @@ mod tests {
                 mux.iter_panes().is_empty(),
                 "Domain birth published before commit"
             );
+            // Settled but not yet registered: recovery retries, it does not
+            // give up on the mux.
+            assert!(!domain.admission.load(Ordering::Acquire));
+            assert!(
+                domain
+                    .recovery_policy(&config::configuration())
+                    .unwrap_err()
+                    .is::<mux::domain::DomainRecoveryPolicyBusy>()
+            );
+            assert!(matches!(
+                mux.capture_topology_coherent(Default::default()),
+                Err(mux::MuxTopologyCaptureError::DomainPolicyBusy)
+            ));
             let pane = unpublished.publish(&mux).unwrap();
             let published_birth = domain.state.lock().unadopted_birth;
             assert!(published_birth.is_some());
