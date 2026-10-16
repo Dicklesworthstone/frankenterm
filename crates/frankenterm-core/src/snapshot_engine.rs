@@ -200,7 +200,7 @@ fn topology_change(
         Some("domains changed during capture")
     } else if captured.windows != rechecked.windows {
         Some("windows changed during capture")
-    } else if captured.tabs != rechecked.tabs {
+    } else if !tabs_agree(captured, rechecked) {
         Some("tabs changed during capture")
     } else if !pane_bindings_agree(&captured.pane_bindings, &rechecked.pane_bindings) {
         Some("pane bindings changed during capture")
@@ -211,6 +211,57 @@ fn topology_change(
         Some("workspaces changed during capture")
     } else {
         None
+    }
+}
+
+/// Whether a topology recheck still has the same tabs. A guardian pane's leaf
+/// in a split tree is compared without what its output changes (title,
+/// directory, screen, cursor and scroll position): the recovery image takes
+/// only a leaf's identity from the tree, and that pane's journal replays the
+/// rest.
+#[cfg(feature = "frankenterm-deps")]
+fn tabs_agree(captured: &mux::MuxCapturedTopology, rechecked: &mux::MuxCapturedTopology) -> bool {
+    let guardian: HashSet<usize> = captured
+        .pane_bindings
+        .iter()
+        .filter(|pane| pane.spawn_custody.is_some())
+        .map(|pane| pane.pane_id)
+        .collect();
+    captured.tabs.len() == rechecked.tabs.len()
+        && captured
+            .tabs
+            .iter()
+            .zip(&rechecked.tabs)
+            .all(|(before, after)| {
+                if guardian.is_empty() {
+                    return before == after;
+                }
+                let (mut before, mut after) = (before.clone(), after.clone());
+                strip_guardian_leaf_volatility(&mut before.split_tree, &guardian);
+                strip_guardian_leaf_volatility(&mut after.split_tree, &guardian);
+                before == after
+            })
+}
+
+#[cfg(feature = "frankenterm-deps")]
+fn strip_guardian_leaf_volatility(node: &mut mux::tab::PaneNode, guardian: &HashSet<usize>) {
+    match node {
+        mux::tab::PaneNode::Empty => {}
+        mux::tab::PaneNode::Leaf(entry) => {
+            if guardian.contains(&entry.pane_id) {
+                entry.title.clear();
+                entry.working_dir = None;
+                entry.alt_screen_active = false;
+                entry.cursor_pos = Default::default();
+                entry.physical_top = 0;
+                entry.top_row = 0;
+                entry.left_col = 0;
+            }
+        }
+        mux::tab::PaneNode::Split { left, right, .. } => {
+            strip_guardian_leaf_volatility(left, guardian);
+            strip_guardian_leaf_volatility(right, guardian);
+        }
     }
 }
 
@@ -24368,5 +24419,124 @@ mod tests {
             &[moved]
         ));
         assert!(!pane_bindings_agree(std::slice::from_ref(&guardian), &[]));
+    }
+
+    #[cfg(feature = "frankenterm-deps")]
+    #[test]
+    fn a_printing_guardian_pane_keeps_its_tab_cut_but_a_model_pane_does_not() {
+        let size = frankenterm_term::TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 640,
+            pixel_height: 384,
+            dpi: 96,
+        };
+        let provenance = mux::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1 {
+            original: mux::guardian_checkpoint::GuardianSpawnCustodyScopeV1 {
+                broker_lineage: uuid::Uuid::from_u128(21),
+                guardian_incarnation: uuid::Uuid::from_u128(22),
+                mux_incarnation: uuid::Uuid::from_u128(23),
+                broker_build: [0; 32],
+                guardian_build: [0; 32],
+                mux_build: [0; 32],
+                pane_id: uuid::Uuid::from_u128(0),
+                effect_id: uuid::Uuid::from_u128(24),
+            },
+            current_mux_incarnation: uuid::Uuid::from_u128(23),
+            current_lease_generation: 1,
+            acknowledged_successor: None,
+        };
+        // Pane 0 is guardian-owned, pane 1 model-only; one tab each.
+        let pane_bindings = (0..2_usize)
+            .map(|index| mux::MuxCapturedPaneBinding {
+                pane_id: index,
+                pane_uuid: uuid::Uuid::from_u128(index as u128).to_string(),
+                spawn_custody: (index == 0).then_some(provenance),
+                registration_wire_identity: [index as u8; 16],
+                domain_id: 0,
+                domain_name: "local".into(),
+                window_id: 0,
+                tab_id: index,
+                lane: mux::MuxCapturedPaneLane::Tiled,
+                title: String::new(),
+                cwd: None,
+                size,
+                alt_screen_active: false,
+                cursor_pos: (0, 0),
+                is_active_in_tab: true,
+                is_zoomed_in_tab: false,
+            })
+            .collect();
+        let tabs = (0..2_usize)
+            .map(|index| mux::MuxCapturedTab {
+                tab_id: index,
+                durable_tab_id: uuid::Uuid::from_u128(100 + index as u128),
+                window_id: 0,
+                title: String::new(),
+                size,
+                size_before_zoom: size,
+                active_pane_id: Some(index),
+                zoomed_pane_id: None,
+                split_tree: mux::tab::PaneNode::Leaf(mux::tab::PaneEntry {
+                    window_id: 0,
+                    tab_id: index,
+                    pane_id: index,
+                    title: String::new(),
+                    size,
+                    working_dir: None,
+                    alt_screen_active: false,
+                    is_active_pane: true,
+                    is_zoomed_pane: false,
+                    workspace: "default".into(),
+                    cursor_pos: Default::default(),
+                    physical_top: 0,
+                    top_row: 0,
+                    left_col: 0,
+                    tty_name: None,
+                }),
+                floating_panes: vec![],
+                floating_focus: None,
+                pane_stacks: vec![],
+                underlying_tiled_active_pane_id: Some(index),
+                runtime_state: Default::default(),
+            })
+            .collect();
+        let captured = mux::MuxCapturedTopology {
+            session_incarnation: mux::MuxSessionIncarnation::from_bytes([3; 16]),
+            default_domain_id: Some(0),
+            domains: vec![],
+            topology_revision: mux::TopologyRevision::new(1),
+            captured_at_epoch_ms: 1,
+            client_workspace: None,
+            default_workspace: "default".into(),
+            workspaces: vec![],
+            windows: vec![],
+            tabs,
+            pane_bindings,
+        };
+        // What printing changes in a pane's split-tree leaf.
+        let printed = |pane_id: usize| {
+            let mut topology = captured.clone();
+            let mux::tab::PaneNode::Leaf(entry) = &mut topology.tabs[pane_id].split_tree else {
+                unreachable!("fixture tabs are single leaves");
+            };
+            entry.title = "printed".into();
+            entry.alt_screen_active = true;
+            entry.physical_top = 40;
+            entry.top_row = 40;
+            topology
+        };
+        assert_eq!(topology_change(&captured, &printed(0)), None);
+        assert_eq!(
+            topology_change(&captured, &printed(1)),
+            Some("tabs changed during capture")
+        );
+        // A resize stays structural for the guardian pane too.
+        let mut resized = captured.clone();
+        resized.tabs[0].size.cols = 120;
+        assert_eq!(
+            topology_change(&captured, &resized),
+            Some("tabs changed during capture")
+        );
     }
 }
