@@ -347,7 +347,7 @@ impl crate::TermWindow {
     pub(crate) fn settle_presented_selection_frames(
         &mut self,
         damage_generation: u64,
-        submission_mach_ns: u64,
+        submission_mach_ns: u128,
     ) {
         let now = Instant::now();
         let mut expired_copy = false;
