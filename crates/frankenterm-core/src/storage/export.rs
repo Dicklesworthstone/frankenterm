@@ -31,9 +31,8 @@ pub(super) fn build_export_where(
     let mut params: Vec<ToSqlValue<'static>> = Vec::new();
 
     if let Some(pane_id) = query.pane_id {
-        let pane_id = i64::try_from(pane_id).map_err(|_| {
-            StorageError::Database("export pane_id exceeds i64 range".to_string())
-        })?;
+        let pane_id = i64::try_from(pane_id)
+            .map_err(|_| StorageError::Database("export pane_id exceeds i64 range".to_string()))?;
         clauses.push(format!("pane_id = ?{}", params.len() + 1));
         params.push(ToSqlValue::Integer(pane_id));
     }
@@ -693,8 +692,7 @@ mod export_json_parse_drop_tests {
                     ))
                     .unwrap();
                 let error = query_export_workflows(&backend, &ExportQuery::default())
-                    .err()
-                    .expect("malformed present workflow JSON must fail export")
+                    .expect_err("malformed present workflow JSON must fail export")
                     .to_string();
                 assert!(error.contains(&format!("workflow_executions.{column}")));
                 assert!(!error.contains("EXPORT_PRIVATE_SENTINEL"));
@@ -713,8 +711,7 @@ mod export_json_parse_drop_tests {
                 ))
                 .unwrap();
             let error = query_export_sessions(&backend, &ExportQuery::default())
-                .err()
-                .expect("malformed session metadata must fail export")
+                .expect_err("malformed session metadata must fail export")
                 .to_string();
             assert!(error.contains("agent_sessions.external_meta"));
         }
@@ -805,9 +802,15 @@ mod export_json_parse_drop_tests {
         };
         assert_eq!(query_export_segments(&backend, &query).unwrap()[0].id, 1);
         assert_eq!(query_export_gaps(&backend, &query).unwrap()[0].id, 1);
-        assert_eq!(query_export_workflows(&backend, &query).unwrap()[0].id, "w-1");
+        assert_eq!(
+            query_export_workflows(&backend, &query).unwrap()[0].id,
+            "w-1"
+        );
         assert_eq!(query_export_sessions(&backend, &query).unwrap()[0].id, 1);
-        assert_eq!(query_export_reservations(&backend, &query).unwrap()[0].id, 1);
+        assert_eq!(
+            query_export_reservations(&backend, &query).unwrap()[0].id,
+            1
+        );
     }
 
     #[test]
@@ -831,7 +834,11 @@ mod export_json_parse_drop_tests {
         assert!(query_export_gaps(&backend, &query).unwrap().is_empty());
         assert!(query_export_workflows(&backend, &query).unwrap().is_empty());
         assert!(query_export_sessions(&backend, &query).unwrap().is_empty());
-        assert!(query_export_reservations(&backend, &query).unwrap().is_empty());
+        assert!(
+            query_export_reservations(&backend, &query)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -866,8 +873,7 @@ mod export_json_parse_drop_tests {
         let backend = MockBackend::new();
         assert!(!backend.supports_lossless_cells());
         let error = query_export_segments(&backend, &ExportQuery::default())
-            .err()
-            .expect("the legacy string-cell fallback cannot produce faithful exports")
+            .expect_err("the legacy string-cell fallback cannot produce faithful exports")
             .to_string();
         assert!(error.contains("lossless SQL cells"));
     }
