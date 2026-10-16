@@ -6029,6 +6029,99 @@ mod tests {
         );
     }
 
+    /// A checkpoint-class request that arrives while a job holds the sole
+    /// protocol authority waits for it and is served, instead of meeting a
+    /// closed connection (which made a mux's capture fail mid-publication).
+    #[test]
+    fn checkpoint_request_waits_for_the_protocol_authority_a_job_holds() {
+        use mux::guardian_protocol::GuardianCheckpointDescriptorV1;
+
+        let directory = tempfile::Builder::new()
+            .prefix("ft-guardian-authority-wait-")
+            .tempdir_in(crate::canonical_test_temp_root())
+            .unwrap()
+            .keep();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let token = directory.join("token");
+        let socket = directory.join("guardian.sock");
+        provision_guardian_token(&token).unwrap();
+        let config = GuardianServiceConfig::new(
+            socket.clone(),
+            token.clone(),
+            8,
+            1,
+            65_536,
+            65_536,
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let mut service = GuardianService::bind(config).unwrap();
+        let (connected_tx, connected_rx) = std::sync::mpsc::sync_channel(1);
+        let (send_tx, send_rx) = std::sync::mpsc::sync_channel(1);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let client = std::thread::spawn(move || {
+            let mut client = GuardianClient::connect(&socket, &token, Uuid::new_v4()).unwrap();
+            connected_tx.send(()).unwrap();
+            send_rx.recv().unwrap();
+            let effect = Uuid::new_v4();
+            let descriptor = GuardianCheckpointDescriptorV1::for_genesis_artifact(
+                effect,
+                &transport_checkpoint(),
+            )
+            .unwrap();
+            let query = GuardianCheckpointStageRequestV1::query(
+                GuardianCheckpointScopeV1::Genesis {
+                    spawn_effect_id: effect,
+                },
+                Uuid::new_v4(),
+                descriptor,
+                1_024,
+            )
+            .unwrap();
+            result_tx
+                .send(client.checkpoint_stage(Uuid::new_v4(), query))
+                .unwrap();
+        });
+        let deadline = Instant::now() + CLIENT_IO_TIMEOUT;
+        while connected_rx.try_recv().is_err() {
+            assert!(Instant::now() < deadline, "client never connected");
+            service.poll_once().unwrap();
+        }
+
+        let held = service.runtime.take_protocol_for_test().unwrap();
+        let deferred_before = service.runtime.counters().replay_waits_deferred;
+        send_tx.send(()).unwrap();
+        // The request arrives while the authority is out and is parked.
+        let deadline = Instant::now() + CLIENT_IO_TIMEOUT;
+        while service.runtime.counters().replay_waits_deferred == deferred_before {
+            assert!(Instant::now() < deadline, "request was never parked");
+            service.poll_once().unwrap();
+        }
+        for _ in 0..20 {
+            service.poll_once().unwrap();
+        }
+        assert!(
+            result_rx.try_recv().is_err(),
+            "a parked request is neither answered nor closed while the authority is out"
+        );
+
+        service.runtime.restore_protocol_for_test(held);
+        let mut result = None;
+        let deadline = Instant::now() + CLIENT_IO_TIMEOUT;
+        while result.is_none() {
+            assert!(Instant::now() < deadline, "parked request never served");
+            service.poll_once().unwrap();
+            result = result_rx.try_recv().ok();
+        }
+        // Served by the protocol (here, refused: this connection has no
+        // Genesis authority), never closed as busy.
+        assert!(
+            !matches!(result, Some(Err(GuardianClientError::Io(_)))),
+            "parked request was closed: {result:?}"
+        );
+        client.join().unwrap();
+    }
+
     #[test]
     fn genesis_staging_real_service_preserves_owner_and_reconnect_progress() {
         use mux::guardian_protocol::GuardianCheckpointDescriptorV1;

@@ -2115,6 +2115,17 @@ impl GuardianRuntime {
     /// straight to the worker so it can return the canonical typed outcome.
     /// A wait is eligible only while the exact requested next sequence remains
     /// the live pane's durable watermark and the pane can still append output.
+    /// Hold the sole protocol authority as an in-flight job does.
+    #[cfg(test)]
+    pub(crate) fn take_protocol_for_test(&mut self) -> Option<GuardianProtocolState> {
+        self.protocol.take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn restore_protocol_for_test(&mut self, protocol: GuardianProtocolState) {
+        self.protocol = Some(protocol);
+    }
+
     pub(crate) fn replay_wait_readiness(
         &self,
         request: &AuthenticatedGuardianRequest,
