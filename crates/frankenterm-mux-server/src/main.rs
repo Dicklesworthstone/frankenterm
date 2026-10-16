@@ -281,16 +281,8 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
     }
 
     // Expose `wezterm.mux` before the config's Lua context is first built so
-    // a `mux-startup` handler can spawn windows and tabs, as in the GUI. The
-    // server reads the same config file, so it gets the same Lua API.
-    config::lua::add_context_setup_func(mux_lua::register);
-    config::lua::add_context_setup_func(color_funcs::register);
-    config::lua::add_context_setup_func(filesystem::register);
-    config::lua::add_context_setup_func(procinfo_funcs::register);
-    config::lua::add_context_setup_func(serde_funcs::register);
-    config::lua::add_context_setup_func(share_data::register);
-    config::lua::add_context_setup_func(spawn_funcs::register);
-    config::lua::add_context_setup_func(ssh_funcs::register);
+    // a `mux-startup` handler can spawn windows and tabs, as in the GUI.
+    register_server_lua_modules();
 
     config::common_init(
         opts.config_file.as_ref(),
@@ -869,6 +861,29 @@ fn set_mux_socket_environment(config: &config::ConfigHandle) {
     }
 }
 
+/// The Lua modules a config can use in the server. The server reads the
+/// GUI's config file, so it registers the GUI's modules except the GUI's own
+/// (`window_funcs`, `scripting`, `stats`). A config that builds its status
+/// text with `wezterm.format` at load time (or reads `wezterm.nerdfonts`,
+/// `wezterm.url`) otherwise fails to load here: `format` is nil.
+fn register_server_lua_modules() {
+    let setup_funcs: [config::lua::SetupFunc; 10] = [
+        termwiz_funcs::register,
+        mux_lua::register,
+        url_funcs::register,
+        color_funcs::register,
+        filesystem::register,
+        procinfo_funcs::register,
+        serde_funcs::register,
+        share_data::register,
+        spawn_funcs::register,
+        ssh_funcs::register,
+    ];
+    for setup in setup_funcs {
+        config::lua::add_context_setup_func(setup);
+    }
+}
+
 /// An explicit `--config-file` that does not load must stop the server.
 ///
 /// `config::common_init` keeps the last good configuration (the defaults on a
@@ -997,6 +1012,37 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::PathBuf;
     use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// The server reads the GUI's config file, so a config that builds status
+    /// text with `wezterm.format` at load time (as the operator's does), or
+    /// reads `wezterm.nerdfonts` or `wezterm.url`, must load here too.
+    #[test]
+    fn server_lua_context_has_the_text_and_url_modules_configs_use_at_load() {
+        register_server_lua_modules();
+        let lua = config::lua::make_lua_context(std::path::Path::new("")).expect("lua context");
+        let missing: String = lua
+            .load(
+                r#"
+                local w = require('frankenterm')
+                local missing = {}
+                if type(w.format) ~= 'function' then table.insert(missing, 'format') end
+                if w.nerdfonts == nil then table.insert(missing, 'nerdfonts') end
+                if type(w.url) ~= 'table' or type(w.url.parse) ~= 'function' then
+                  table.insert(missing, 'url.parse')
+                end
+                if type(w.mux) ~= 'table' then table.insert(missing, 'mux') end
+                return table.concat(missing, ',')
+                "#,
+            )
+            .eval()
+            .expect("probe the server's Lua API");
+        assert_eq!(missing, "");
+        let status: String = lua
+            .load("return require('frankenterm').format { { Text = 'ok' } }")
+            .eval()
+            .expect("format a status string at load time");
+        assert!(status.contains("ok"), "{status:?}");
+    }
 
     fn test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();

@@ -4484,7 +4484,9 @@ dependencies = [
  "share-data",
  "spawn-funcs",
  "ssh-funcs",
+ "termwiz-funcs",
  "umask",
+ "url-funcs",
  "winapi",
 ]
 

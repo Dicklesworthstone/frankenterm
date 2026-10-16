@@ -41,6 +41,8 @@ serde-funcs.workspace = true
 share-data.workspace = true
 spawn-funcs.workspace = true
 ssh-funcs.workspace = true
+termwiz-funcs.workspace = true
+url-funcs.workspace = true
 mlua.workspace = true
 openssl.workspace = true
 portable-pty = { workspace=true, features = ["serde_support"]}
