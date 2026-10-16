@@ -3609,7 +3609,7 @@ impl GuardianCheckpointStageStore {
             .map_err(GuardianCheckpointStageStoreError::Protocol)?;
         self.with_exclusive_directory(|inner| {
             let mut census = checkpoint_stage_census(inner)?;
-            let mut inspection = checkpoint_inspect_upload(
+            let inspection = checkpoint_inspect_upload(
                 inner,
                 &census,
                 &shape,
@@ -3633,19 +3633,35 @@ impl GuardianCheckpointStageStore {
             }
             let record_bytes = checkpoint_record_bytes_for_plaintext(bytes.len())?;
             checkpoint_stage_require_capacity(inner, &census, shape.key(), 1, record_bytes)?;
-            let path = checkpoint_chunk_path(inner, shape.key(), inspection.publication_id, index)?;
-            match checkpoint_create_record_new(inner, &path)? {
+            let publication_id = inspection.publication_id;
+            let path = checkpoint_chunk_path(inner, shape.key(), publication_id, index)?;
+            // The upload's prefix was authenticated above, under this same
+            // exclusive directory lock; only the record written here is new.
+            // Re-running the whole census and re-opening every chunk after
+            // each write made an upload quadratic: an 11 MB checkpoint took
+            // the guardian tens of seconds, during which the pane's reader,
+            // which uploads inline, delivered no output.
+            let written = match checkpoint_create_record_new(inner, &path)? {
                 CheckpointStageCreateOutcome::Created(file) => {
                     let intent = GuardianCheckpointStageSealIntentV1::chunk(
                         &shape.binding,
                         shape.upload_id,
-                        inspection.publication_id,
+                        publication_id,
                         index,
                         offset,
-                        bytes,
+                        bytes.clone(),
                     )?;
                     let record = inner.cipher.seal(intent)?;
                     checkpoint_write_created_record(inner, &path, file, &record)?;
+                    checkpoint_stage_census_entry(
+                        inner,
+                        shape.key(),
+                        CheckpointStageFileRole::Chunk {
+                            publication_id,
+                            index,
+                        },
+                        path,
+                    )?
                 }
                 CheckpointStageCreateOutcome::Existing => {
                     census = checkpoint_stage_census(inner)?;
@@ -3653,24 +3669,29 @@ impl GuardianCheckpointStageStore {
                         inner,
                         &census,
                         &shape,
-                        inspection.publication_id,
+                        publication_id,
                         index,
                         offset,
                         bytes,
                     )?;
+                    return checkpoint_chunk_progress(&shape, index);
                 }
-            }
-            census = checkpoint_stage_census(inner)?;
-            inspection = checkpoint_inspect_upload(
+            };
+            let total_bytes = written.bytes;
+            checkpoint_validate_exact_chunk_retry(
                 inner,
-                &census,
+                &CheckpointStageCensus {
+                    entries: vec![written],
+                    uploads: BTreeSet::from([shape.key()]),
+                    total_files: 1,
+                    total_bytes,
+                },
                 &shape,
-                CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
-            )?
-            .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
-            if inspection.next_index <= index {
-                return Err(GuardianCheckpointStageStoreError::Poisoned);
-            }
+                publication_id,
+                index,
+                offset,
+                bytes,
+            )?;
             checkpoint_chunk_progress(&shape, index)
         })
     }
@@ -7146,6 +7167,27 @@ fn checkpoint_stage_census(
         entries,
         uploads,
         total_bytes,
+    })
+}
+
+/// The census entry of one known Stage file, checked exactly as
+/// `checkpoint_stage_census` checks each file it lists.
+fn checkpoint_stage_census_entry(
+    inner: &GuardianCheckpointStageStoreInner,
+    key: CheckpointStageUploadKey,
+    role: CheckpointStageFileRole,
+    path: PathBuf,
+) -> Result<CheckpointStageCensusEntry, GuardianCheckpointStageStoreError> {
+    let file = open_private_file_at(&inner.directory, &inner.directory_path, &path, false)?;
+    let metadata = file.metadata().map_err(|error| {
+        GuardianCheckpointStageStoreError::io("checkpoint-census-metadata", error)
+    })?;
+    validate_private_file_metadata(&metadata, None)?;
+    Ok(CheckpointStageCensusEntry {
+        key,
+        role,
+        path,
+        bytes: metadata.len(),
     })
 }
 

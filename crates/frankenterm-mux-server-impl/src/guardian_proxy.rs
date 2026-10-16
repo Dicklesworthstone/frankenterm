@@ -62,7 +62,10 @@ const GUARDIAN_RESTORE_REOPEN_ATTEMPTS: usize = 2;
 const GUARDIAN_RESTORE_MAX_PAGES: usize = 65_536;
 const GUARDIAN_REPLAY_IDLE_POLL_MIN_INTERVAL: Duration = Duration::from_millis(50);
 const GUARDIAN_REPLAY_IDLE_POLL_MAX_INTERVAL: Duration = Duration::from_millis(1_000);
-const GUARDIAN_CHECKPOINT_STAGE_CHUNK_BYTES: u32 = 64 * 1_024;
+// The protocol's largest chunk: a pane's reader uploads its checkpoint inline,
+// and every chunk is a guardian round trip under the Stage directory lock.
+const GUARDIAN_CHECKPOINT_STAGE_CHUNK_BYTES: u32 =
+    mux::guardian_protocol::GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES;
 const GUARDIAN_CHECKPOINT_QUERY_ATTEMPTS: usize = 2;
 const GUARDIAN_RETIREMENT_RETRY_MIN_INTERVAL: Duration = Duration::from_millis(50);
 const GUARDIAN_RETIREMENT_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(5);
