@@ -69,7 +69,7 @@ make_checkout() {
     mkdir -p "$dir"
     git -C "$dir" init -q
     printf '.{\n    .name = .ghostty,\n    .version = "1.3.2-dev",\n    .minimum_zig_version = "0.16.0",\n}\n' >"$dir/build.zig.zon"
-    printf '.zig-cache/\nzig-out/\n' >"$dir/.gitignore"
+    printf '.zig-cache/\nzig-out/\nzig-pkg/\n' >"$dir/.gitignore"
     git -C "$dir" add build.zig.zon .gitignore
     git -C "$dir" -c user.name=h2h-test -c user.email=h2h-test@invalid commit -q -m "fake ghostty"
 }
@@ -77,6 +77,9 @@ make_checkout "$T/ghostty"
 COMMIT="$(git -C "$T/ghostty" rev-parse HEAD)"
 git clone -q "$T/ghostty" "$T/ghostty-dirty"
 git clone -q "$T/ghostty" "$T/ghostty-writes"
+for clone in ghostty-fetch ghostty-fetch-outside ghostty-many; do
+    git clone -q "$T/ghostty" "$T/$clone"
+done
 
 mkdir -p "$T/zigsrc/zig-fake-0.16.0"
 cp "$FIXTURES/fake-zig" "$T/zigsrc/zig-fake-0.16.0/zig"
@@ -220,6 +223,14 @@ expect "a dirty checkout is drift" 3 "local changes before the build" \
     --contract "$C" --ghostty-src "$T/ghostty-dirty" --zig-tarball "$T/zig-fake.tar.xz" --work "$T/w1" --check-pins
 FAKE_ZIG_WRITE_IGNORED=1 expect "a build writing into the checkout, even under .gitignore, is drift" 3 "wrote into the Ghostty checkout" \
     --contract "$C" --ghostty-src "$T/ghostty-writes" --zig-tarball "$T/zig-fake.tar.xz" --work "$T/w-writes" --check-pins
+FAKE_ZIG_FETCH_PKG=1 expect "a fresh checkout's packages are fetched into zig-pkg/ before the build" 0 "PINS OK" \
+    --contract "$C" --ghostty-src "$T/ghostty-fetch" --zig-tarball "$T/zig-fake.tar.xz" --work "$T/w-fetch" --check-pins
+check "the fetch filled zig-pkg/" test -f "$T/ghostty-fetch/zig-pkg/fake-pkg/build.zig.zon"
+check "git still sees a clean checkout after the fetch" test -z "$(git -C "$T/ghostty-fetch" status --porcelain)"
+FAKE_ZIG_FETCH_OUTSIDE=1 expect "a fetch writing outside zig-pkg/ is drift" 3 "outside zig-pkg/" \
+    --contract "$C" --ghostty-src "$T/ghostty-fetch-outside" --zig-tarball "$T/zig-fake.tar.xz" --work "$T/w-fetch-outside" --check-pins
+FAKE_ZIG_WRITE_MANY=2000 expect "a build writing thousands of files is drift, not SIGPIPE" 3 "wrote into the Ghostty checkout" \
+    --contract "$C" --ghostty-src "$T/ghostty-many" --zig-tarball "$T/zig-fake.tar.xz" --work "$T/w-many" --check-pins
 make_contract "$T/c-zigsha.md" "zig_tarball_sha256=$(printf '0%.0s' {1..64})"
 expect "a zig tarball with another SHA-256 is drift" 3 "has SHA-256" \
     --contract "$T/c-zigsha.md" --ghostty-src "$T/ghostty" --zig-tarball "$T/zig-fake.tar.xz" --work "$T/w1" --check-pins

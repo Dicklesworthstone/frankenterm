@@ -271,7 +271,7 @@ verify_checkout() {
     [[ $head == "$(pin ghostty_commit)" ]] || drift "the Ghostty checkout is at $head, pinned $(pin ghostty_commit)"
     dirty="$(checkout_status)"
     if [[ -n $dirty ]]; then
-        printf '%s\n' "$dirty" | head -20 >&2
+        printf '%s\n' "$dirty" | sed -n '1,20p' >&2
         drift "the Ghostty checkout has local changes $when"
     fi
     version="$(sed -n 's/^[[:space:]]*\.version = "\(.*\)",[[:space:]]*$/\1/p' "$GHOSTTY_SRC/build.zig.zon" | head -1)"
@@ -384,22 +384,55 @@ stamp_matches() {
     [[ "$(h2h get "$stamp" binary_sha256 2>/dev/null)" == "$(sha256 "$binary")" ]]
 }
 
+# Up to 20 paths in the Ghostty checkout newer than the marker $1, outside
+# .git and outside the optional top-level directory $2. The checkout root is
+# not listed: creating any entry in it (zig-pkg/ included) touches its mtime,
+# and the entry itself is listed. sed reads find's whole output: `head` would
+# exit early and, under pipefail, end the runner with SIGPIPE (141) instead of
+# the drift report.
+checkout_writes_since() {
+    local marker="$1" allowed="${2:-}"
+    local prune=(-path "$GHOSTTY_SRC/.git")
+    [[ -z $allowed ]] || prune+=(-o -path "$GHOSTTY_SRC/$allowed")
+    find "$GHOSTTY_SRC" -mindepth 1 \( "${prune[@]}" \) -prune -o -newer "$marker" ! -name .DS_Store -print | sed -n '1,20p'
+}
+
 zig_build() {
     local what="$1" tree="$2" prefix="$3" cache="$4" logfile marker written
     shift 4
     logfile="$(dirname "$prefix")/build-$STAMP_UTC.log"
     # git status cannot see writes under ignored paths (.zig-cache, zig-out,
     # macos/GhosttyKit.xcframework), so also look for anything in the
-    # checkout newer than a marker taken just before the build.
+    # checkout newer than a marker taken just before each step.
+    #
+    # zig 0.16 keeps fetched packages in zig-pkg/ under the build root, and a
+    # path dependency on the checkout fetches into the checkout's zig-pkg/, so
+    # the first build of a fresh checkout writes there. Fetch first, allowing
+    # writes only under zig-pkg/ (ignored by git; zig checks every package
+    # against its hash in build.zig.zon). The build after it must write
+    # nothing into the checkout.
+    marker="$(dirname "$prefix")/fetch-$STAMP_UTC.marker"
+    : >"$marker"
+    sleep 1
+    log "fetching $what's packages: (cd $tree && zig build --fetch=all --cache-dir $cache)"
+    if ! (cd -- "$tree" && "$ZIG" build --fetch=all --cache-dir "$cache") >"$logfile" 2>&1; then
+        tail -40 "$logfile" >&2
+        die 4 "fetching packages for $what failed; full log: $logfile"
+    fi
+    written="$(checkout_writes_since "$marker" zig-pkg)"
+    if [[ -n $written ]]; then
+        printf '%s\n' "$written" >&2
+        drift "fetching packages for $what wrote into the Ghostty checkout outside zig-pkg/"
+    fi
     marker="$(dirname "$prefix")/build-$STAMP_UTC.marker"
     : >"$marker"
     sleep 1
     log "building $what: (cd $tree && zig build $* --prefix $prefix --cache-dir $cache)"
-    if ! (cd -- "$tree" && "$ZIG" build "$@" --prefix "$prefix" --cache-dir "$cache") >"$logfile" 2>&1; then
+    if ! (cd -- "$tree" && "$ZIG" build "$@" --prefix "$prefix" --cache-dir "$cache") >>"$logfile" 2>&1; then
         tail -40 "$logfile" >&2
         die 4 "building $what failed; full log: $logfile"
     fi
-    written="$(find "$GHOSTTY_SRC" -path "$GHOSTTY_SRC/.git" -prune -o -newer "$marker" ! -name .DS_Store -print | head -20)"
+    written="$(checkout_writes_since "$marker")"
     if [[ -n $written ]]; then
         printf '%s\n' "$written" >&2
         drift "building $what wrote into the Ghostty checkout"

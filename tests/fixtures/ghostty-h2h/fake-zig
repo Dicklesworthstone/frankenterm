@@ -3,7 +3,9 @@
 # `version` prints $FAKE_ZIG_VERSION (default 0.16.0). `build` installs the
 # fake ghostty-bench (run from the Ghostty checkout) or the fake width probe
 # (run from the probe tree, whose build.zig.zon must point at the checkout)
-# into --prefix, and logs each build to $FAKE_LOG.
+# into --prefix, and logs each build to $FAKE_LOG. `build --fetch=...` logs a
+# fetch and, with $FAKE_ZIG_FETCH_PKG, fills zig-pkg/ as zig 0.16 does (with
+# $FAKE_ZIG_FETCH_OUTSIDE it also writes outside zig-pkg/).
 set -eu
 
 case "${1:-}" in
@@ -12,6 +14,20 @@ case "${1:-}" in
         ;;
     build)
         shift
+        case " $* " in
+            *" --fetch"*)
+                echo "fetch $PWD" >>"$FAKE_LOG"
+                if [ -n "${FAKE_ZIG_FETCH_PKG:-}" ]; then
+                    mkdir -p zig-pkg/fake-pkg
+                    echo pkg >zig-pkg/fake-pkg/build.zig.zon
+                fi
+                if [ -n "${FAKE_ZIG_FETCH_OUTSIDE:-}" ]; then
+                    mkdir -p .zig-cache
+                    echo fetched >.zig-cache/fetched
+                fi
+                exit 0
+                ;;
+        esac
         args="$*"
         prefix=""
         while [ $# -gt 0 ]; do
@@ -35,6 +51,14 @@ case "${1:-}" in
             if [ -n "${FAKE_ZIG_WRITE_IGNORED:-}" ]; then
                 mkdir -p .zig-cache
                 echo cache >.zig-cache/fake
+            fi
+            if [ -n "${FAKE_ZIG_WRITE_MANY:-}" ]; then
+                mkdir -p .zig-cache
+                i=0
+                while [ "$i" -lt "$FAKE_ZIG_WRITE_MANY" ]; do
+                    echo cache >".zig-cache/many-$i"
+                    i=$((i + 1))
+                done
             fi
         fi
         ;;
