@@ -2664,42 +2664,36 @@ impl PaneJournalAuthority {
         Ok(bytes)
     }
 
-    /// Unlink what a durable rebased manifest superseded: each superseded
-    /// manifest's publication marker before the manifest itself, so no
-    /// marker ever names a missing manifest, then the reclaimed segments.
-    /// A file that cannot be unlinked stays counted, and on a later scan a
-    /// superseded manifest is never mistaken for history.
+    /// Unlink what a durable rebased manifest superseded: the reclaimed
+    /// segments first, while a superseded manifest still names each one, then
+    /// each superseded manifest (see `unlink_superseded_manifest`). A crash
+    /// anywhere in between leaves only files a cold open can recognize as
+    /// leftovers and finish unlinking. A file that cannot be unlinked stays
+    /// counted.
     fn unlink_reclaimed(
         &self,
         superseded: &[ManifestPathAuthority],
         reclaimed: &[SegmentPathAuthority],
     ) -> ReclaimedOutputFiles {
         let mut unlinked = ReclaimedOutputFiles::default();
-        let mut unlink = |path: &Path, identity: FileIdentity| {
-            match unlink_owned_output_file(&self.directory, &self.directory_path, path, identity)
-            {
-                Ok(bytes) => {
-                    unlinked.bytes = unlinked.bytes.saturating_add(bytes);
-                    true
-                }
-                Err(error) => {
-                    log::warn!("guardian output reclamation kept {}: {error}", path.display());
-                    false
-                }
-            }
-        };
-        for manifest in superseded {
-            if unlink(&manifest.publication_path, manifest.publication_file_identity) {
-                unlinked.manifest_files += 1;
-                if unlink(&manifest.path, manifest.file_identity) {
-                    unlinked.manifest_files += 1;
-                }
-            }
-        }
         for segment in reclaimed {
-            if unlink(&segment.path, segment.file_identity) {
+            if unlink_counted_output_file(
+                &self.directory,
+                &self.directory_path,
+                &segment.path,
+                segment.file_identity,
+                &mut unlinked,
+            ) {
                 unlinked.segment_files += 1;
             }
+        }
+        for manifest in superseded {
+            unlink_superseded_manifest(
+                &self.directory,
+                &self.directory_path,
+                manifest,
+                &mut unlinked,
+            );
         }
         if let Err(error) = self.directory.sync_all() {
             log::warn!("guardian output reclamation directory sync failed: {error}");
@@ -9029,8 +9023,11 @@ fn validate_manifest_structure(
     // An unrebased manifest lists every segment since sequence 1, one more per
     // revision. A rebased one starts at a segment whose predecessor was
     // reclaimed, so it lists fewer segments than its revision.
-    let rebased = segments.first().is_some_and(manifest_segment_is_rebased_base);
-    let segment_count = u64::try_from(segments.len()).map_err(|_| GuardianOutputError::Allocation)?;
+    let rebased = segments
+        .first()
+        .is_some_and(manifest_segment_is_rebased_base);
+    let segment_count =
+        u64::try_from(segments.len()).map_err(|_| GuardianOutputError::Allocation)?;
     if revision == 0
         || (!rebased && revision != segment_count)
         || (rebased && revision <= segment_count)
@@ -9383,6 +9380,7 @@ struct PanePublicationScan {
     head: Option<DiscoveredManifest>,
     manifest_history: Vec<ManifestPathAuthority>,
     history_base_segments: usize,
+    superseded: Vec<DiscoveredManifest>,
     segments: Vec<DiscoveredSegment>,
     relevant_files: usize,
     relevant_file_bytes: u64,
@@ -9508,11 +9506,12 @@ fn scan_pane_publications(
         ));
     }
     let manifests = pair_manifest_publications(&mut manifest_candidates, manifest_publications)?;
-    let (head, manifest_history, history_base_segments) = select_manifest_chain(manifests)?;
+    let selected = select_manifest_chain(manifests)?;
     Ok(PanePublicationScan {
-        head,
-        manifest_history,
-        history_base_segments,
+        head: selected.head,
+        manifest_history: selected.history,
+        history_base_segments: selected.history_base_segments,
+        superseded: selected.superseded,
         segments,
         relevant_files,
         relevant_file_bytes,
@@ -9566,14 +9565,28 @@ fn pair_manifest_publications(
     Ok(manifests)
 }
 
-/// Select the published manifest history and its head, and report how many
-/// segments the history's first manifest lists.
+/// One pane's published manifest history as a scan found it.
+struct SelectedManifestChain {
+    head: Option<DiscoveredManifest>,
+    history: Vec<ManifestPathAuthority>,
+    /// Segments the history's first manifest lists.
+    history_base_segments: usize,
+    /// Published manifests a later rebased manifest superseded: leftovers of
+    /// a reclamation a crash interrupted.
+    superseded: Vec<DiscoveredManifest>,
+}
+
+/// Select the published manifest history and its head.
 fn select_manifest_chain(
     mut manifests: Vec<DiscoveredManifest>,
-) -> Result<(Option<DiscoveredManifest>, Vec<ManifestPathAuthority>, usize), GuardianOutputError>
-{
+) -> Result<SelectedManifestChain, GuardianOutputError> {
     if manifests.is_empty() {
-        return Ok((None, Vec::new(), 0));
+        return Ok(SelectedManifestChain {
+            head: None,
+            history: Vec::new(),
+            history_base_segments: 0,
+            superseded: Vec::new(),
+        });
     }
     manifests.sort_by_key(|candidate| candidate.snapshot.revision);
     // A rebased publication supersedes every earlier revision. Reclamation
@@ -9608,8 +9621,8 @@ fn select_manifest_chain(
                 "guardian output rebased manifest does not follow its predecessor",
             ));
         }
-        manifests.drain(..base);
     }
+    let superseded: Vec<DiscoveredManifest> = manifests.drain(..base).collect();
     let mut manifest_history = Vec::new();
     manifest_history
         .try_reserve_exact(manifests.len())
@@ -9660,7 +9673,12 @@ fn select_manifest_chain(
         });
         head = candidate;
     }
-    Ok((Some(head), manifest_history, history_base_segments))
+    Ok(SelectedManifestChain {
+        head: Some(head),
+        history: manifest_history,
+        history_base_segments,
+        superseded,
+    })
 }
 
 fn parse_segment_file_name(remainder: &str) -> Option<Uuid> {
@@ -9911,6 +9929,26 @@ fn open_scanned_pane_segment_manager(
             "guardian output manifest authority is outside its pane policy",
         ));
     }
+    let leftovers = unlink_reclamation_leftovers(
+        directory,
+        directory_path,
+        &discovered_head.snapshot,
+        &scan.superseded,
+        &scan.segments,
+    );
+    let physical_segment_files = scan
+        .segments
+        .len()
+        .checked_sub(leftovers.segment_files)
+        .ok_or(GuardianOutputError::Allocation)?;
+    let relevant_files = scan
+        .relevant_files
+        .checked_sub(leftovers.segment_files + leftovers.manifest_files)
+        .ok_or(GuardianOutputError::Allocation)?;
+    let relevant_file_bytes = scan
+        .relevant_file_bytes
+        .checked_sub(leftovers.bytes)
+        .ok_or(GuardianOutputError::Allocation)?;
     let mut segment_paths = Vec::new();
     segment_paths
         .try_reserve_exact(policy.max_segments)
@@ -9958,10 +9996,10 @@ fn open_scanned_pane_segment_manager(
         policy,
         persistence,
         total_committed_log_bytes,
-        total_relevant_file_bytes: scan.relevant_file_bytes,
+        total_relevant_file_bytes: relevant_file_bytes,
         total_records,
-        physical_segment_files: scan.segments.len(),
-        relevant_files: scan.relevant_files,
+        physical_segment_files,
+        relevant_files,
         failed: false,
     };
     authority.validate_path_authority().map_err(|_| {
@@ -10651,6 +10689,113 @@ fn unlink_owned_output_file(
     rustix::fs::unlinkat(directory, name, rustix::fs::AtFlags::empty())
         .map_err(|error| GuardianOutputError::io("output-reclaim-unlink", error.into()))?;
     Ok(bytes)
+}
+
+/// Unlink one owned output file, adding its bytes to `unlinked`. A failure is
+/// logged and leaves the file counted.
+fn unlink_counted_output_file(
+    directory: &File,
+    directory_path: &Path,
+    path: &Path,
+    identity: FileIdentity,
+    unlinked: &mut ReclaimedOutputFiles,
+) -> bool {
+    match unlink_owned_output_file(directory, directory_path, path, identity) {
+        Ok(bytes) => {
+            unlinked.bytes = unlinked.bytes.saturating_add(bytes);
+            true
+        }
+        Err(error) => {
+            log::warn!(
+                "guardian output reclamation kept {}: {error}",
+                path.display()
+            );
+            false
+        }
+    }
+}
+
+/// Unlink one superseded manifest: its publication marker first, so no
+/// marker ever names a missing manifest, then the manifest itself.
+fn unlink_superseded_manifest(
+    directory: &File,
+    directory_path: &Path,
+    manifest: &ManifestPathAuthority,
+    unlinked: &mut ReclaimedOutputFiles,
+) {
+    if unlink_counted_output_file(
+        directory,
+        directory_path,
+        &manifest.publication_path,
+        manifest.publication_file_identity,
+        unlinked,
+    ) {
+        unlinked.manifest_files += 1;
+        if unlink_counted_output_file(
+            directory,
+            directory_path,
+            &manifest.path,
+            manifest.file_identity,
+            unlinked,
+        ) {
+            unlinked.manifest_files += 1;
+        }
+    }
+}
+
+/// Finish a reclamation a crash interrupted: unlink every segment that only a
+/// superseded manifest names, then every superseded manifest. A segment no
+/// manifest names is a rollover's crash candidate and is kept.
+fn unlink_reclamation_leftovers(
+    directory: &File,
+    directory_path: &Path,
+    head: &OutputManifestSnapshot,
+    superseded: &[DiscoveredManifest],
+    segments: &[DiscoveredSegment],
+) -> ReclaimedOutputFiles {
+    let mut unlinked = ReclaimedOutputFiles::default();
+    if superseded.is_empty() {
+        return unlinked;
+    }
+    let names = |snapshot: &OutputManifestSnapshot, segment_id: Uuid| {
+        snapshot
+            .segments
+            .iter()
+            .any(|identity| identity.segment_id() == segment_id)
+    };
+    for segment in segments {
+        if !names(head, segment.segment_id)
+            && superseded
+                .iter()
+                .any(|manifest| names(&manifest.snapshot, segment.segment_id))
+            && unlink_counted_output_file(
+                directory,
+                directory_path,
+                &segment.path,
+                segment.file_identity,
+                &mut unlinked,
+            )
+        {
+            unlinked.segment_files += 1;
+        }
+    }
+    for manifest in superseded {
+        unlink_superseded_manifest(
+            directory,
+            directory_path,
+            &ManifestPathAuthority {
+                path: manifest.path.clone(),
+                file_identity: manifest.file_identity,
+                publication_path: manifest.publication_path.clone(),
+                publication_file_identity: manifest.publication_file_identity,
+            },
+            &mut unlinked,
+        );
+    }
+    if let Err(error) = directory.sync_all() {
+        log::warn!("guardian output leftover reclamation directory sync failed: {error}");
+    }
+    unlinked
 }
 
 fn open_private_file_read_only_at_identity(
@@ -20118,6 +20263,163 @@ mod tests {
         // The policy's segment budget still bounds the chain; reclamation,
         // not an unbounded chain, is what lets a PTY run forever.
         assert!(chain.append_read(start, b"fifth").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn broker_chain_reclaims_acknowledged_output_so_a_busy_pty_never_fills_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let policy = tiny_rotation_policy(4);
+        let (_directory, _poll, pipeline) =
+            pipeline_with_policy("ft-guardian-output-broker-reclaim-", policy)?;
+        let guardian_incarnation = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let mut chain = pipeline
+            .prepare_pane(guardian_incarnation, pane_id)?
+            .into_fresh_broker_chain()?;
+
+        // Five times the four segments the policy allows, each read
+        // acknowledged before the next one, as a guardian keeping up with a
+        // busy PTY does. Without reclamation the fifth read is refused.
+        let mut start = 0_u64;
+        for index in 0..20_u32 {
+            let read = format!("read-{index:02}");
+            chain.release_through(start);
+            let receipt = chain.append_read(start, read.as_bytes())?;
+            start = receipt.cumulative_plaintext_bytes();
+            assert_eq!(receipt.sequence(), u64::from(index) + 1);
+            let authority = &chain.authority;
+            assert_eq!(authority.manifest.snapshot.revision, u64::from(index) + 1);
+            assert_eq!(authority.segments.len(), 1, "read {index}");
+            assert_eq!(authority.manifest_history.len(), 1);
+            assert_eq!(authority.history_base_segments, 1);
+            assert_eq!(authority.physical_segment_files, 1);
+            assert_eq!(authority.relevant_files, 3);
+            assert_eq!(authority.total_records, 1);
+            // One segment, its manifest and its publication marker: every
+            // reclaimed file is gone from disk, not just from the chain.
+            assert_eq!(
+                list_relevant_pane_paths(&authority.directory_path, guardian_incarnation, pane_id)?
+                    .len(),
+                3
+            );
+        }
+        assert_eq!(recover_all_segment_bytes(&chain.authority)?, b"read-19");
+        Ok(())
+    }
+
+    #[test]
+    fn rebased_chain_reopens_past_crash_leftovers_of_its_reclamation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let policy = tiny_rotation_policy(4);
+        let (directory, poll, pipeline) =
+            pipeline_with_policy("ft-guardian-output-rebase-reopen-", policy)?;
+        let guardian_incarnation = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let journal = pipeline.prepare_pane(guardian_incarnation, pane_id)?;
+        for payload in [b"a".as_slice(), b"bb".as_slice(), b"ccc".as_slice()] {
+            durable_commit(&pipeline, pane_id, &journal, payload)?;
+        }
+
+        // Keep copies of what reclamation is about to unlink: the first
+        // segment, the second, and all three manifests with their markers.
+        let saved = kept_private_directory("ft-guardian-output-rebase-saved-")?;
+        let output_directory = journal
+            .authority
+            .lock()
+            .map_err(|_| "journal authority was poisoned")?
+            .directory_path
+            .clone();
+        let before = list_relevant_pane_paths(&output_directory, guardian_incarnation, pane_id)?;
+        assert_eq!(before.len(), 9);
+        for path in &before {
+            std::fs::copy(
+                path,
+                saved.join(path.file_name().ok_or("unnamed pane file")?),
+            )?;
+        }
+
+        // Output through "bb" (byte 3) is no longer needed, so the rollover
+        // for "dddd" drops the first two segments and keeps "ccc".
+        journal
+            .authority
+            .lock()
+            .map_err(|_| "journal authority was poisoned")?
+            .raise_reclaim_floor(3);
+        let receipt = durable_commit(&pipeline, pane_id, &journal, b"dddd")?;
+        assert_eq!(receipt.sequence(), 4);
+        {
+            let authority = journal
+                .authority
+                .lock()
+                .map_err(|_| "journal authority was poisoned")?;
+            assert_eq!(authority.manifest.snapshot.revision, 4);
+            assert_eq!(authority.segments.len(), 2);
+            assert_eq!(authority.history_base_segments, 2);
+            assert_eq!(authority.manifest_history.len(), 1);
+            assert_eq!(authority.physical_segment_files, 2);
+            assert_eq!(authority.relevant_files, 4);
+            assert_eq!(recover_all_segment_bytes(&authority)?, b"cccdddd");
+        }
+        assert_eq!(
+            list_relevant_pane_paths(&output_directory, guardian_incarnation, pane_id)?.len(),
+            4
+        );
+
+        // A crash after the rebased manifest became durable but before any
+        // unlink leaves every superseded file behind.
+        for path in &before {
+            if !path.exists() {
+                std::fs::copy(
+                    saved.join(path.file_name().ok_or("unnamed pane file")?),
+                    path,
+                )?;
+            }
+        }
+        drop(journal);
+        drop(pipeline);
+        drop(poll);
+
+        let (_reopened_poll, reopened_pipeline) = reopen_pipeline(&directory, policy)?;
+        let reopened = cold_open_test_pane_after_owner_drop(
+            &reopened_pipeline,
+            guardian_incarnation,
+            pane_id,
+        )?;
+        {
+            let mut authority = reopened
+                .authority
+                .lock()
+                .map_err(|_| "reopened journal authority was poisoned")?;
+            // The rebased manifest is the whole history, and the cold open
+            // finished the interrupted reclamation: the superseded manifests
+            // and the segments only they named are gone.
+            assert_eq!(authority.manifest.snapshot.revision, 4);
+            assert_eq!(authority.manifest_history.len(), 1);
+            assert_eq!(authority.segments.len(), 2);
+            assert_eq!(authority.physical_segment_files, 2);
+            assert_eq!(authority.relevant_files, 4);
+            assert_eq!(recover_all_segment_bytes(&authority)?, b"cccdddd");
+            authority.raise_reclaim_floor(10);
+        }
+        assert_eq!(
+            list_relevant_pane_paths(&output_directory, guardian_incarnation, pane_id)?.len(),
+            4
+        );
+        let receipt = durable_commit(&reopened_pipeline, pane_id, &reopened, b"eeeee")?;
+        assert_eq!(receipt.sequence(), 5);
+        let authority = reopened
+            .authority
+            .lock()
+            .map_err(|_| "reopened journal authority was poisoned")?;
+        assert_eq!(authority.manifest.snapshot.revision, 5);
+        assert_eq!(authority.segments.len(), 1);
+        assert_eq!(authority.physical_segment_files, 1);
+        assert_eq!(recover_all_segment_bytes(&authority)?, b"eeeee");
+        assert_eq!(
+            list_relevant_pane_paths(&output_directory, guardian_incarnation, pane_id)?.len(),
+            3
+        );
         Ok(())
     }
 
