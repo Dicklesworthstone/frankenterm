@@ -157,21 +157,21 @@
         "cosmetic": 20,
         "docs": 1,
         "feat": 55,
-        "fix": 133,
+        "fix": 135,
         "other": 17,
         "refactor": 5,
         "rename": 2,
         "runtime-swap": 4,
         "security-fix": 2,
-        "test": 40
+        "test": 41
       },
-      "fork_side_commit_count": 284,
+      "fork_side_commit_count": 287,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-10-14T22:21:51-04:00",
-        "sha": "3ae42b80d5236a56432fc99262bc93e1ded17ed4",
-        "subject": "fix(client): a busy pane no longer fails user-variable hydration for every pane (ft-ypblq)"
+        "classification": "test",
+        "committed_at": "2026-10-15T21:06:50-04:00",
+        "sha": "d3dc77b68c289a47557e2eb1d19eeb320a145ecb",
+        "subject": "test(client): split the render-thread spawn regression into fetch and liveness tests"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -992,19 +992,19 @@
         "cosmetic": 8,
         "feat": 16,
         "fix": 59,
-        "other": 49,
+        "other": 50,
         "refactor": 3,
         "rename": 1,
         "security-fix": 2,
         "test": 25
       },
-      "fork_side_commit_count": 167,
+      "fork_side_commit_count": 168,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "other",
-        "committed_at": "2026-10-15T20:45:59-04:00",
-        "sha": "ed48e40f5a1e8a1c7987309f18b3437810b22600",
-        "subject": "perf(surface): a join copies a buffer-form row's widths as a slice again (ft-yccm0.2.1.8)"
+        "committed_at": "2026-10-15T22:32:23-04:00",
+        "sha": "c0a1aebd5b820a74d7e50a458bc4e117ff72f741",
+        "subject": "perf(surface): read a plain-ASCII row eight bytes at a time when capturing its wrap geometry (ft-yccm0.2.1.8)"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -1206,8 +1206,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 3203,
-  "generated_at": "2026-10-16T00:46:11.993168Z",
+  "fork_side_commit_total": 3207,
+  "generated_at": "2026-10-16T02:32:36.118262Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
