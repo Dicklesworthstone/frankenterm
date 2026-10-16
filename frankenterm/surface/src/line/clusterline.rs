@@ -137,6 +137,35 @@ impl core::fmt::Debug for ClusteredLine {
     }
 }
 
+/// Whether every byte of `text` is printable ASCII (`b' '..=b'~'`), eight
+/// bytes at a time. Every row of plain output that scrolls into the durable
+/// store is checked on the parse thread (ft-yccm0.2.1.8), where a branch per
+/// byte was a large part of capturing its wrap geometry.
+fn printable_ascii(text: &[u8]) -> bool {
+    const ONES: u64 = u64::from_le_bytes([1; 8]);
+    let (words, rest) = text.as_chunks::<8>();
+    // The last few bytes, first byte lowest, shifted into a word of spaces.
+    // Copying them into one instead made 1-7 byte rows slower than the byte
+    // loop this replaces.
+    let tail = rest
+        .iter()
+        .rev()
+        .fold(0x20 * ONES, |word, &byte| word << 8 | u64::from(byte));
+    // A byte below 0x80 is below b' ' exactly when adding 0x60 leaves its
+    // high bit clear, and is 0x7f exactly when adding 1 sets it; neither sum
+    // carries into the next byte. A byte from 0x80 up sets its own high bit,
+    // which marks the word whatever its sums carry.
+    words
+        .iter()
+        .map(|&word| u64::from_le_bytes(word))
+        .chain(core::iter::once(tail))
+        .fold(0, |bad, word| {
+            bad | word | word.wrapping_add(ONES) | !word.wrapping_add(0x60 * ONES)
+        })
+        & (0x80 * ONES)
+        == 0
+}
+
 fn guarded_reserve_text(target: &mut String, additional: usize) {
     let required = target
         .len()
@@ -625,7 +654,7 @@ impl ClusteredLine {
         (!self.text.is_empty()
             && self.text.len() == self.len()
             && self.is_double_wide.is_none()
-            && self.text.bytes().all(|byte| matches!(byte, b' '..=b'~')))
+            && printable_ascii(self.text.as_bytes()))
         .then_some(self.text.as_str())
     }
 
@@ -1559,6 +1588,26 @@ mod test {
     }
 
     proptest::proptest! {
+        /// ft-yccm0.2.1.8: the word-at-a-time check agrees with a byte-by-byte
+        /// one, on mostly printable text with the bytes at either edge of the
+        /// range, at every length across the eight-byte words.
+        #[test]
+        fn printable_ascii_matches_a_byte_by_byte_check(
+            bytes in proptest::collection::vec(
+                proptest::prop_oneof![
+                    12 => 0x20u8..=0x7e,
+                    1 => proptest::sample::select(vec![0x00u8, 0x1f, 0x7f, 0x80, 0x9f, 0xa0, 0xdf, 0xe0, 0xff]),
+                    1 => proptest::num::u8::ANY,
+                ],
+                0..40,
+            ),
+        ) {
+            proptest::prop_assert_eq!(
+                printable_ascii(&bytes),
+                bytes.iter().all(|byte| matches!(byte, b' '..=b'~'))
+            );
+        }
+
         /// ft-y0gy9: random texts mixing inert chars with every kind that
         /// joins segment exactly as `Graphemes` segments them.
         #[test]

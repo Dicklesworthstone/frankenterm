@@ -2659,16 +2659,50 @@ impl TokenWidths {
     const ASCII_MAX: usize = 256;
 
     /// The inline form of a row of single-width printable ASCII `text`, at
-    /// most [`Self::ASCII_MAX`] bytes.
-    fn ascii(text: &[u8]) -> Self {
+    /// most [`Self::ASCII_MAX`] bytes, and the row's length without its
+    /// trailing spaces. Eight bytes at a time: a branch per byte was most of
+    /// capturing such a row on the parse thread.
+    fn ascii(text: &[u8]) -> (Self, usize) {
+        const ONES: u64 = u64::from_le_bytes([1; 8]);
+        // Moves bit 8i + 7 (byte i's high bit) to bit 56 + i. No two of
+        // the shifted copies overlap, so nothing carries.
+        const GATHER: u64 = 0x0102_0408_1020_4080;
+        debug_assert!(text.len() <= Self::ASCII_MAX);
+        debug_assert!(text.iter().all(|byte| matches!(byte, b' '..=b'~')));
         let mut spaces = [0u64; 4];
-        for (index, _) in text.iter().enumerate().filter(|(_, byte)| **byte == b' ') {
-            spaces[index / 64] |= 1 << (index % 64);
+        let mut mark = |chunk: usize, word: u64| {
+            // A printable byte is a space exactly when adding 0x5f leaves
+            // its high bit clear; no sum carries into the next byte.
+            let marks = !word.wrapping_add(0x5f * ONES) & (0x80 * ONES);
+            spaces[chunk / 8] |= ((marks >> 7).wrapping_mul(GATHER) >> 56) << (chunk % 8 * 8);
+        };
+        let (words, tail) = text.as_chunks::<8>();
+        for (chunk, &word) in words.iter().enumerate() {
+            mark(chunk, u64::from_le_bytes(word));
         }
-        Self::Ascii {
-            len: <u16 as core::convert::TryFrom<usize>>::try_from(text.len()).unwrap_or(u16::MAX),
-            spaces,
+        if !tail.is_empty() {
+            // First byte lowest, shifted into a word of non-spaces. Copying
+            // them into one instead made 1-7 byte rows slower than the byte
+            // loop this replaces.
+            let word = tail
+                .iter()
+                .rev()
+                .fold(u64::from(b'x') * ONES, |word, &byte| {
+                    word << 8 | u64::from(byte)
+                });
+            mark(words.len(), word);
         }
+        let len = text.len();
+        let trimmed = (0..len.div_ceil(64))
+            .rev()
+            .find_map(|word| {
+                let cells = len.saturating_sub(word * 64).min(64);
+                let visible = u64::MAX.checked_shr(64 - cells as u32).unwrap_or(0) & !spaces[word];
+                (visible != 0).then(|| word * 64 + 64 - visible.leading_zeros() as usize)
+            })
+            .unwrap_or(0);
+        let len = <u16 as core::convert::TryFrom<usize>>::try_from(len).unwrap_or(u16::MAX);
+        (Self::Ascii { len, spaces }, trimmed)
     }
 
     fn len(&self) -> usize {
@@ -2807,8 +2841,8 @@ impl LineWrapGeometry {
             .flatten()
         {
             let bytes = text.as_bytes();
-            result.widths = if bytes.len() <= TokenWidths::ASCII_MAX {
-                TokenWidths::ascii(bytes)
+            if bytes.len() <= TokenWidths::ASCII_MAX {
+                (result.widths, result.trimmed_tokens) = TokenWidths::ascii(bytes);
             } else {
                 let mut widths = Vec::new();
                 widths.try_reserve_exact(bytes.len()).ok()?;
@@ -2820,12 +2854,12 @@ impl LineWrapGeometry {
                         .iter()
                         .map(|&byte| if byte == b' ' { 1 | 0x80 } else { 1 }),
                 );
-                TokenWidths::Cells(widths)
-            };
-            result.trimmed_tokens = text
-                .bytes()
-                .rposition(|byte| byte != b' ')
-                .map_or(0, |last| last + 1);
+                result.widths = TokenWidths::Cells(widths);
+                result.trimmed_tokens = bytes
+                    .iter()
+                    .rposition(|&byte| byte != b' ')
+                    .map_or(0, |last| last + 1);
+            }
             result.head_basic = true;
             result.head_after_basic = true;
             result.tail_basic = true;
@@ -6144,6 +6178,39 @@ mod tests {
     }
 
     proptest::proptest! {
+        /// ft-yccm0.2.1.8: the word-at-a-time space bitmap and trimmed length
+        /// of the inline form match a byte-by-byte reading, on rows dense
+        /// with spaces and trailing runs of them, at every length up to
+        /// ASCII_MAX.
+        #[test]
+        fn inline_ascii_spaces_match_a_byte_by_byte_reading(
+            text in "[ x~!]{0,256}",
+            trailing in 0usize..70,
+        ) {
+            let mut text = text;
+            text.truncate(TokenWidths::ASCII_MAX.saturating_sub(trailing));
+            text.extend(core::iter::repeat_n(' ', trailing));
+            let bytes = text.as_bytes();
+            let (widths, trimmed) = TokenWidths::ascii(bytes);
+            let mut expected = [0u64; 4];
+            for (index, &byte) in bytes.iter().enumerate() {
+                if byte == b' ' {
+                    expected[index / 64] |= 1 << (index % 64);
+                }
+            }
+            match widths {
+                TokenWidths::Ascii { len, spaces } => {
+                    proptest::prop_assert_eq!(usize::from(len), bytes.len());
+                    proptest::prop_assert_eq!(spaces, expected);
+                }
+                TokenWidths::Cells(_) => proptest::prop_assert!(false, "not inline"),
+            }
+            proptest::prop_assert_eq!(
+                trimmed,
+                bytes.iter().rposition(|&byte| byte != b' ').map_or(0, |last| last + 1)
+            );
+        }
+
         /// ft-yccm0.2.1.8: the inline ASCII widths behave as the per-token
         /// buffer does: equality, wrap planning, joins in either order and
         /// with either form, and refusals. Rows run past ASCII_MAX so both
