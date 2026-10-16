@@ -11187,6 +11187,19 @@ fn process_connector_outbound_runtime_event(
     event: &Event,
     now_ms: u64,
 ) {
+    route_connector_outbound_runtime_event(bridge, event, now_ms);
+    // The bridge's policy engine lives as long as the runtime, and its rate
+    // limiter keeps an entry per (pane, action) it authorized. A pane that
+    // left takes its entries with it. This runs after routing, because a rule
+    // matching `pane.disappeared` authorizes, and so records, one more.
+    bridge.policy_engine_mut().handle_lifecycle_event(event);
+}
+
+fn route_connector_outbound_runtime_event(
+    bridge: &mut ConnectorOutboundBridge,
+    event: &Event,
+    now_ms: u64,
+) {
     let Some(outbound_event) = OutboundEvent::from_runtime_event(event, now_ms) else {
         return;
     };
@@ -16519,6 +16532,78 @@ mod tests {
 
             storage.shutdown().await.expect("shutdown test storage");
         });
+    }
+
+    /// A pane that disappears takes its rate-limit entries out of the
+    /// bridge's long-lived policy engine, also when a rule routed
+    /// `pane.disappeared` itself (which authorizes, and records, once more).
+    #[test]
+    fn connector_outbound_pane_disappearance_drops_its_policy_rate_limit_entries() {
+        use crate::connector_outbound_bridge::{
+            ConnectorActionKind, ConnectorOutboundBridge, ConnectorOutboundBridgeConfig,
+            OutboundEventSource, OutboundRoutingRule,
+        };
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        for (rule_id, source, prefix) in [
+            (
+                "notify-usage",
+                OutboundEventSource::PatternDetected,
+                "pattern.",
+            ),
+            (
+                "notify-pane-gone",
+                OutboundEventSource::PaneLifecycle,
+                "pane.",
+            ),
+        ] {
+            bridge.add_rule(OutboundRoutingRule {
+                rule_id: rule_id.to_string(),
+                source_filter: Some(source),
+                event_type_prefix: Some(prefix.to_string()),
+                min_severity: None,
+                target_connector: "worker".to_string(),
+                action_kind: ConnectorActionKind::Invoke,
+                enabled: true,
+                priority: 0,
+            });
+        }
+        let detected = |pane_id| Event::PatternDetected {
+            pane_id,
+            pane_uuid: None,
+            detection: crate::patterns::Detection {
+                rule_id: "codex.usage.reached".to_string(),
+                agent_type: crate::patterns::AgentType::Codex,
+                event_type: "usage.reached".to_string(),
+                severity: crate::patterns::Severity::Warning,
+                confidence: 0.95,
+                extracted: serde_json::json!({}),
+                matched_text: "[redacted]".to_string(),
+                span: (0, 10),
+            },
+            event_id: i64::try_from(pane_id).ok(),
+        };
+        process_connector_outbound_runtime_event(&mut bridge, &detected(7), 5_000);
+        process_connector_outbound_runtime_event(&mut bridge, &detected(8), 5_001);
+        let tracked = bridge.policy_engine().tracked_rate_limit_entry_count();
+        assert!(
+            tracked >= 2,
+            "both panes' routed actions are rate limited: {tracked}"
+        );
+
+        process_connector_outbound_runtime_event(
+            &mut bridge,
+            &Event::PaneDisappeared { pane_id: 7 },
+            5_002,
+        );
+
+        let remaining = bridge.policy_engine().tracked_rate_limit_entry_count();
+        assert!(remaining >= 1, "pane 8 keeps its entries: {remaining}");
+        process_connector_outbound_runtime_event(
+            &mut bridge,
+            &Event::PaneDisappeared { pane_id: 8 },
+            5_003,
+        );
+        assert_eq!(bridge.policy_engine().tracked_rate_limit_entry_count(), 0);
     }
 
     #[test]

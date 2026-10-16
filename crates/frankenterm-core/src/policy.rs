@@ -6415,6 +6415,14 @@ impl PolicyEngine {
         lock_rate_limiter(&self.rate_limiter).remove_pane(pane_id);
     }
 
+    /// `(pane, action)` rate-limit entries currently tracked (ft-yjt9e):
+    /// telemetry, and the check that lifecycle cleanup reaches a
+    /// long-lived engine such as `ConnectorOutboundBridge`'s.
+    #[must_use]
+    pub fn tracked_rate_limit_entry_count(&self) -> usize {
+        lock_rate_limiter(&self.rate_limiter).tracked_pane_entry_count()
+    }
+
     /// Garbage-collect expired rate-limit entries (ft-yjt9e).
     ///
     /// Defense-in-depth for panes that disappear without firing a
