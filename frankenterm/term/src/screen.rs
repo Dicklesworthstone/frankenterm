@@ -6828,6 +6828,19 @@ impl Screen {
         line: &Line,
         seqno: SequenceNo,
     ) -> bool {
+        self.record_scrollback_spill_replaced(stable_row, line, seqno, true)
+    }
+
+    /// [`Self::record_scrollback_spill`]. `replaced` says whether the scroll
+    /// offering the row adds a new one in its place: scroll_up's move loop
+    /// does, its extra removals past the hot tier do not (ft-qvt9l.1).
+    fn record_scrollback_spill_replaced(
+        &mut self,
+        stable_row: StableRowIndex,
+        line: &Line,
+        seqno: SequenceNo,
+        replaced: bool,
+    ) -> bool {
         if !self.allow_scrollback {
             return true;
         }
@@ -6845,13 +6858,17 @@ impl Screen {
                 // a directory it cannot create). Keep classic bounded
                 // scrollback: hold rows until the whole `scrollback_lines`
                 // is resident, then let the oldest go, instead of holding
-                // every row in memory for the pane's life. The scroll that
-                // offers this row adds a new one, so it goes once the rows
-                // left plus that one would reach the limit.
+                // every row in memory for the pane's life. When the scroll
+                // that offers this row adds a new one, the row goes once the
+                // rows left plus that one would reach the limit; an extra
+                // removal goes only while the rows left still reach it.
+                // Counting the new row for those too freed one more row on
+                // one scroll and refused the next (ft-qvt9l.1), so at the
+                // limit every other new row was allocated, not recycled.
                 let resident_limit = self
                     .physical_rows
                     .saturating_add(self.scrollback_policy.size);
-                return self.lines.len().saturating_add(1) >= resident_limit;
+                return self.lines.len().saturating_add(usize::from(replaced)) >= resident_limit;
             };
             #[cfg(not(feature = "use_serde"))]
             if !sink.store_scrollback_line(stable_row, line, max_retained_rows) {
@@ -10125,7 +10142,7 @@ impl Screen {
             if let Some(removed) = self.lines.remove(remove_idx) {
                 if remove_idx == 0 && scrollback_ok {
                     let stable_row = self.stable_row_index_for_removed_top(removed_from_top);
-                    if !self.record_scrollback_spill(stable_row, &removed, seqno) {
+                    if !self.record_scrollback_spill_replaced(stable_row, &removed, seqno, false) {
                         self.lines.insert(remove_idx, removed);
                         if self
                             .config
@@ -20580,6 +20597,7 @@ pub(crate) mod tests {
         for seq in 1..=40 {
             let bottom = screen.phys_row(1);
             screen.lines[bottom] = Line::from_text(&format!("line-{seq}"), &attrs, seq, None);
+            let offset_before = screen.stable_row_index_offset;
             screen.scroll_up(&(0..2), 1, seq, attrs.clone(), bidi_mode());
             assert!(
                 screen.lines.len() <= 2 + 16,
@@ -20587,6 +20605,21 @@ pub(crate) mod tests {
                 screen.lines.len(),
                 seq
             );
+            // ft-qvt9l.1: once full, each scroll lets exactly one row go and
+            // recycles it; it used to free a second row and then refuse the
+            // next scroll, alternating 17 and 18 resident rows.
+            if seq > 16 {
+                assert_eq!(
+                    screen.lines.len(),
+                    2 + 16,
+                    "rows resident after {seq} scrolls"
+                );
+                assert_eq!(
+                    screen.stable_row_index_offset,
+                    offset_before + 1,
+                    "one row goes per scroll at the limit ({seq})"
+                );
+            }
         }
         let retained: Vec<_> = screen
             .lines
