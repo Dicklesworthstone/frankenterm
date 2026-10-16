@@ -992,19 +992,19 @@
         "cosmetic": 8,
         "feat": 16,
         "fix": 59,
-        "other": 52,
+        "other": 53,
         "refactor": 4,
         "rename": 1,
         "security-fix": 2,
         "test": 25
       },
-      "fork_side_commit_count": 171,
+      "fork_side_commit_count": 172,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "other",
-        "committed_at": "2026-10-16T15:46:36-04:00",
-        "sha": "19577fe698efa10bdf2fa76dd0ac8ddc2c1e70fe",
-        "subject": "perf(surface): three per-line costs of a scroll-heavy flood: a blank-cell test that built two cells, an appdata lock on an owned row, and an uninlined char-table check (ft-yccm0.3.2.6)"
+        "committed_at": "2026-10-16T15:55:54-04:00",
+        "sha": "0372320483d1759faf1e4c25239656ea4c9d56b4",
+        "subject": "perf(surface): check a printed ASCII run a word at a time (ft-yccm0.3.2.6)"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -1206,8 +1206,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 3223,
-  "generated_at": "2026-10-16T19:46:50.792959Z",
+  "fork_side_commit_total": 3224,
+  "generated_at": "2026-10-16T19:56:08.277452Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
