@@ -112,7 +112,7 @@ use std::io::{Read, Write};
 use std::num::NonZeroU64;
 #[cfg(windows)]
 use std::os::raw::c_int;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -10654,9 +10654,12 @@ pub struct Mux {
 
 /// Maximum number of distinct client incarnations whose latest reliable input
 /// identity is retained for one mux lifetime. Reconnects reuse the same
-/// [`ClientId`] entry. A new identity beyond this bound is admitted as an
-/// ordinary client but receives a typed reliable-input refusal rather than
-/// growing mux memory without limit.
+/// [`ClientId`] entry. An entry is created on the client's first reliable
+/// input claim, not at registration, and an entry that never claimed is
+/// removed when its client unregisters, so request-only clients (such as
+/// `cli` invocations) never hold a slot. A new identity beyond this bound is
+/// admitted as an ordinary client but receives a typed reliable-input refusal
+/// rather than growing mux memory without limit.
 pub const MAX_RELIABLE_INPUT_CLIENTS: usize = 4_096;
 
 /// Opaque authority for one operation admitted against one exact client
@@ -10797,18 +10800,56 @@ impl ReliableInputLedger {
         }
     }
 
-    fn prepare_client(&mut self, client_id: &ClientId) -> bool {
-        if self.clients.contains_key(client_id) {
-            return true;
+    /// Return the client's ledger, creating it on first use. `None` means the
+    /// ledger is full of clients that have already claimed input.
+    fn client_ledger(
+        &mut self,
+        client_id: &ClientId,
+    ) -> Option<Arc<Mutex<ReliableInputClientLedger>>> {
+        if let Some(ledger) = self.clients.get(client_id) {
+            return Some(Arc::clone(ledger));
         }
         if self.clients.len() >= MAX_RELIABLE_INPUT_CLIENTS {
-            return false;
+            return None;
         }
-        self.clients.insert(
-            client_id.clone(),
-            Arc::new(Mutex::new(ReliableInputClientLedger::new())),
+        let ledger = Arc::new(Mutex::new(ReliableInputClientLedger::new()));
+        self.clients
+            .insert(client_id.clone(), Arc::clone(&ledger));
+        Some(ledger)
+    }
+
+    /// Drop the entry of an unregistered client that never claimed input.
+    /// An entry with a pending or terminal claim is kept, because a
+    /// reconnect with the same identity may retry that serial and must be
+    /// deduplicated against it.
+    fn remove_unused_client(&mut self, client_id: &ClientId) {
+        let unused = self.clients.get(client_id).is_some_and(|ledger| {
+            let ledger = ledger.lock();
+            ledger.pending.is_none() && ledger.terminal.is_none()
+        });
+        if unused {
+            self.clients.remove(client_id);
+        }
+    }
+}
+
+/// Counts reliable input claims refused because the ledger is full. The
+/// refusal is logged on the first occurrence and then every 256th, so a full
+/// ledger is visible without logging every key.
+static RELIABLE_INPUT_LEDGER_FULL_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+fn log_reliable_input_ledger_full(client_id: &ClientId) {
+    let refusals = RELIABLE_INPUT_LEDGER_FULL_REFUSALS.fetch_add(1, Ordering::Relaxed) + 1;
+    metrics::counter!("mux.reliable_input.client_admission", "outcome" => "capacity")
+        .increment(1);
+    if refusals == 1 || refusals.is_multiple_of(256) {
+        log::error!(
+            "reliable input refused for client pid {} (id {}): the ledger already holds \
+             {MAX_RELIABLE_INPUT_CLIENTS} clients with input history; typed keys from this \
+             client are dropped until the mux server restarts ({refusals} refusals so far)",
+            client_id.pid,
+            client_id.id,
         );
-        true
     }
 }
 
@@ -14387,11 +14428,6 @@ impl Mux {
     }
 
     pub fn register_client(&self, client_id: Arc<ClientId>) {
-        let reliable_input_prepared = self.reliable_input.lock().prepare_client(&client_id);
-        if !reliable_input_prepared {
-            metrics::counter!("mux.reliable_input.client_admission", "outcome" => "capacity")
-                .increment(1);
-        }
         let replaced = {
             let mut clients = self.clients.write();
             if clients
@@ -14558,11 +14594,16 @@ impl Mux {
         input_serial: u64,
         payload: ReliableInputPayloadFingerprint,
     ) -> ReliableInputClaimOutcome {
-        if !self.client_operation_is_current(client) {
+        if !client
+            .owner
+            .upgrade()
+            .is_some_and(|owner| std::ptr::eq(owner.as_ref(), self))
+        {
             return ReliableInputClaimOutcome::ClientRegistrationRetired;
         }
-        self.claim_reliable_input(
+        self.claim_reliable_input_for_generation(
             Some(client.client_id()),
+            Some(&client.generation),
             registration,
             input_serial,
             payload,
@@ -14614,22 +14655,46 @@ impl Mux {
         input_serial: u64,
         payload: ReliableInputPayloadFingerprint,
     ) -> ReliableInputClaimOutcome {
+        self.claim_reliable_input_for_generation(
+            client_id,
+            None,
+            registration,
+            input_serial,
+            payload,
+        )
+    }
+
+    /// Lock order is `clients` -> `reliable_input` -> client ledger, the same
+    /// as `unregister_client_if_same`. The registration read guard is held
+    /// until the pending claim is published, so unregister cannot remove the
+    /// client's ledger entry between the lookup and the claim.
+    fn claim_reliable_input_for_generation(
+        &self,
+        client_id: Option<&Arc<ClientId>>,
+        generation: Option<&Arc<ClientRegistrationGeneration>>,
+        registration: &PaneRegistrationHandle,
+        input_serial: u64,
+        payload: ReliableInputPayloadFingerprint,
+    ) -> ReliableInputClaimOutcome {
         if input_serial == 0 {
             return ReliableInputClaimOutcome::IdentityConflict;
         }
         let Some(client_id) = client_id else {
             return ReliableInputClaimOutcome::ClientNotRegistered;
         };
-        if !self.client_registration_is_current(client_id) {
+        let clients = self.clients.read();
+        let current = clients.get(client_id.as_ref()).is_some_and(|info| {
+            Arc::ptr_eq(&info.client_id, client_id)
+                && generation.is_none_or(|generation| {
+                    Arc::ptr_eq(&info.registration_generation, generation)
+                })
+        });
+        if !current {
             return ReliableInputClaimOutcome::ClientRegistrationRetired;
         }
-        let Some(client_ledger) = self
-            .reliable_input
-            .lock()
-            .clients
-            .get(client_id.as_ref())
-            .cloned()
-        else {
+        let Some(client_ledger) = self.reliable_input.lock().client_ledger(client_id) else {
+            drop(clients);
+            log_reliable_input_ledger_full(client_id);
             return ReliableInputClaimOutcome::ClientLedgerUnavailable;
         };
         let mut ledger = client_ledger.lock();
@@ -14687,6 +14752,7 @@ impl Mux {
             side_effect_started: false,
         });
         drop(ledger);
+        drop(clients);
         ReliableInputClaimOutcome::Execute(ReliableInputCommitPermit {
             client: client_ledger,
             claim_id,
@@ -15019,6 +15085,11 @@ impl Mux {
             });
             if owns_registration {
                 clients.remove(client_id.as_ref());
+                // Still under the registration write guard, so no claim for
+                // this identity can be between its lookup and its publish.
+                self.reliable_input
+                    .lock()
+                    .remove_unused_client(client_id.as_ref());
                 true
             } else {
                 false
@@ -29788,12 +29859,194 @@ mod tests {
         let mut client_id = ClientId::new();
         for id in 0..MAX_RELIABLE_INPUT_CLIENTS {
             client_id.id = id;
-            assert!(ledger.prepare_client(&client_id));
+            assert!(ledger.client_ledger(&client_id).is_some());
         }
         assert_eq!(ledger.clients.len(), MAX_RELIABLE_INPUT_CLIENTS);
         client_id.id = MAX_RELIABLE_INPUT_CLIENTS;
-        assert!(!ledger.prepare_client(&client_id));
+        assert!(ledger.client_ledger(&client_id).is_none());
         assert_eq!(ledger.clients.len(), MAX_RELIABLE_INPUT_CLIENTS);
+    }
+
+    fn claim_test_key(
+        mux: &Mux,
+        client: &Arc<ClientId>,
+        registration: &PaneRegistrationHandle,
+        input_serial: u64,
+        event: &KeyEvent,
+    ) -> ReliableInputClaimOutcome {
+        mux.claim_reliable_key_event(
+            Some(client),
+            registration,
+            input_serial,
+            ReliableInputKeyKind::KeyDown,
+            event,
+        )
+    }
+
+    /// Regression test for the 2026-10-12 lost-keys report: a long-running
+    /// mux server saw more than 4096 short-lived clients (mostly `cli`
+    /// calls that never type). Every registration took a ledger slot and none
+    /// was released, so later GUI clients had every typed key refused.
+    #[test]
+    fn reliable_input_ledger_is_not_exhausted_by_clients_that_never_type() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, _kills) = KillCountingPane::new(305, test_size());
+        let (_tab, _window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("reliable input pane registration");
+        let event = reliable_input_test_event('k');
+
+        let typing_client = Arc::new(ClientId::new());
+        mux.register_client(Arc::clone(&typing_client));
+        let ReliableInputClaimOutcome::Execute(mut permit) =
+            claim_test_key(&mux, &typing_client, &registration, 1, &event)
+        else {
+            panic!("a GUI client admitted before the churn must own execution");
+        };
+        assert!(permit.begin_side_effect());
+        assert!(permit.commit_key_applied());
+
+        let mut churn = ClientId::new();
+        for id in 0..MAX_RELIABLE_INPUT_CLIENTS + 100 {
+            churn.id = 1_000_000 + id;
+            let client = Arc::new(churn.clone());
+            mux.register_client(Arc::clone(&client));
+            assert!(mux.unregister_client_if_same(&client));
+        }
+        assert_eq!(
+            mux.reliable_input.lock().clients.len(),
+            1,
+            "clients that never claimed input must not keep a ledger slot"
+        );
+
+        let ReliableInputClaimOutcome::Execute(mut permit) =
+            claim_test_key(&mux, &typing_client, &registration, 2, &event)
+        else {
+            panic!("the admitted GUI client must keep typing after the churn");
+        };
+        assert!(permit.begin_side_effect());
+        assert!(permit.commit_key_applied());
+
+        let late_gui = Arc::new(ClientId::new());
+        mux.register_client(Arc::clone(&late_gui));
+        assert!(
+            matches!(
+                claim_test_key(&mux, &late_gui, &registration, 1, &event),
+                ReliableInputClaimOutcome::Execute(_)
+            ),
+            "a GUI client started after the churn must be able to type"
+        );
+    }
+
+    #[test]
+    fn reliable_input_ledger_refusal_clears_when_a_slot_frees() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, _kills) = KillCountingPane::new(306, test_size());
+        let (_tab, _window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("reliable input pane registration");
+        let event = reliable_input_test_event('f');
+
+        // Fill the ledger with clients whose entries hold no claim yet, so
+        // the slot of an unregistered one is released.
+        let mut filler = ClientId::new();
+        {
+            let mut ledger = mux.reliable_input.lock();
+            for id in 0..MAX_RELIABLE_INPUT_CLIENTS {
+                filler.id = 2_000_000 + id;
+                assert!(ledger.client_ledger(&filler).is_some());
+            }
+        }
+        let client = Arc::new(ClientId::new());
+        mux.register_client(Arc::clone(&client));
+        assert!(matches!(
+            claim_test_key(&mux, &client, &registration, 1, &event),
+            ReliableInputClaimOutcome::ClientLedgerUnavailable
+        ));
+
+        let freed = Arc::new(filler.clone());
+        mux.register_client(Arc::clone(&freed));
+        assert!(mux.unregister_client_if_same(&freed));
+        assert!(
+            matches!(
+                claim_test_key(&mux, &client, &registration, 1, &event),
+                ReliableInputClaimOutcome::Execute(_)
+            ),
+            "an earlier capacity refusal must not stick to a registered client"
+        );
+    }
+
+    #[test]
+    fn reliable_input_history_survives_unregister_and_reconnect() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, _kills) = KillCountingPane::new(307, test_size());
+        let (_tab, _window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("reliable input pane registration");
+        let event = reliable_input_test_event('r');
+
+        let client = Arc::new(ClientId::new());
+        mux.register_client(Arc::clone(&client));
+        let ReliableInputClaimOutcome::Execute(mut permit) =
+            claim_test_key(&mux, &client, &registration, 21, &event)
+        else {
+            panic!("first claim must own execution");
+        };
+        assert!(permit.begin_side_effect());
+        assert!(permit.commit_key_applied());
+
+        // The reply is lost and the connection drops before the client learns
+        // the outcome. It reconnects with the same identity and retries.
+        assert!(mux.unregister_client_if_same(&client));
+        let reconnected = Arc::new(client.as_ref().clone());
+        mux.register_client(Arc::clone(&reconnected));
+        assert!(matches!(
+            claim_test_key(&mux, &reconnected, &registration, 21, &event),
+            ReliableInputClaimOutcome::DuplicateApplied(ReliableInputAppliedEffect::KeyEvent)
+        ));
+    }
+
+    #[test]
+    fn reliable_input_pending_claim_survives_unregister() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, _kills) = KillCountingPane::new(308, test_size());
+        let (_tab, _window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("reliable input pane registration");
+        let event = reliable_input_test_event('p');
+
+        let client = Arc::new(ClientId::new());
+        mux.register_client(Arc::clone(&client));
+        let ReliableInputClaimOutcome::Execute(mut permit) =
+            claim_test_key(&mux, &client, &registration, 31, &event)
+        else {
+            panic!("first claim must own execution");
+        };
+        assert!(permit.begin_side_effect());
+        assert!(mux.unregister_client_if_same(&client));
+
+        let reconnected = Arc::new(client.as_ref().clone());
+        mux.register_client(Arc::clone(&reconnected));
+        assert!(
+            matches!(
+                claim_test_key(&mux, &reconnected, &registration, 31, &event),
+                ReliableInputClaimOutcome::DuplicatePending
+            ),
+            "an in-flight claim must still deduplicate after unregister"
+        );
+        assert!(permit.commit_key_applied());
+        assert!(matches!(
+            claim_test_key(&mux, &reconnected, &registration, 31, &event),
+            ReliableInputClaimOutcome::DuplicateApplied(ReliableInputAppliedEffect::KeyEvent)
+        ));
     }
 
     #[test]
