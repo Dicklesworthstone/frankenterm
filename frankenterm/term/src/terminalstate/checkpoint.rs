@@ -123,11 +123,22 @@ impl std::io::Write for BoundedCheckpointWriter {
 struct JsonStructuralBudget {
     retained_bytes: usize,
     limits: TerminalCheckpointLimits,
+    /// The ceiling a failed pass exceeded, as (resource, observed, maximum),
+    /// so a refusal reports a typed resource limit rather than a parse error.
+    exceeded: Option<(&'static str, usize, usize)>,
 }
 
 impl JsonStructuralBudget {
     const MAX_DEPTH: usize = 128;
     const BYTES_PER_NODE: usize = 64;
+
+    fn new(limits: TerminalCheckpointLimits) -> Self {
+        Self {
+            retained_bytes: 0,
+            limits,
+            exceeded: None,
+        }
+    }
 
     fn charge(&mut self, bytes: usize) -> Result<(), &'static str> {
         self.retained_bytes = self
@@ -135,6 +146,11 @@ impl JsonStructuralBudget {
             .checked_add(bytes)
             .ok_or("checkpoint structural accounting overflow")?;
         if self.retained_bytes > self.limits.max_retained_capture_bytes {
+            self.exceeded = Some((
+                "json_structural_bytes",
+                self.retained_bytes,
+                self.limits.max_retained_capture_bytes,
+            ));
             return Err("checkpoint structural memory limit");
         }
         Ok(())
@@ -146,6 +162,11 @@ impl JsonStructuralBudget {
 
     fn charge_string(&mut self, value: &str) -> Result<(), &'static str> {
         if value.len() > self.limits.max_string_bytes {
+            self.exceeded = Some((
+                "json_string_bytes",
+                value.len(),
+                self.limits.max_string_bytes,
+            ));
             return Err("checkpoint string limit");
         }
         self.charge_node()?;
@@ -186,16 +207,54 @@ impl JsonStructuralVisitor<'_> {
         self.budget.charge_string(value).map_err(E::custom)
     }
 
-    fn child_depth<E: serde::de::Error>(&self) -> Result<usize, E> {
+    fn child_depth<E: serde::de::Error>(&mut self) -> Result<usize, E> {
         let depth = self
             .depth
             .checked_add(1)
             .ok_or_else(|| E::custom("checkpoint nesting overflow"))?;
         if depth > JsonStructuralBudget::MAX_DEPTH {
+            self.budget.exceeded = Some(("json_depth", depth, JsonStructuralBudget::MAX_DEPTH));
             return Err(E::custom("checkpoint nesting limit"));
         }
         Ok(depth)
     }
+}
+
+/// Run the decoder's allocation-light structural pass over canonical JSON and
+/// return the memory it charges. `to_canonical_json` runs the same pass, so a
+/// checkpoint its own decoder would refuse is never emitted.
+fn json_structural_retained_bytes(
+    bytes: &[u8],
+    limits: TerminalCheckpointLimits,
+) -> Result<usize, TerminalCheckpointError> {
+    let mut budget = JsonStructuralBudget::new(limits);
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let pass = JsonStructuralSeed {
+        budget: &mut budget,
+        depth: 0,
+    }
+    .deserialize(&mut deserializer)
+    .and_then(|()| deserializer.end());
+    match (pass, budget.exceeded) {
+        (Ok(()), _) => Ok(budget.retained_bytes),
+        (Err(_), Some((resource, observed, maximum))) => {
+            Err(resource_limit(resource, observed, maximum))
+        }
+        (Err(_), None) => Err(TerminalCheckpointError::Serialization),
+    }
+}
+
+/// The structural charge and byte length of `value`'s compact JSON. The
+/// plaintext encoding is zeroized as soon as it has been measured.
+fn measure_canonical_json<T: serde::Serialize + ?Sized>(
+    value: &T,
+    limits: TerminalCheckpointLimits,
+) -> Result<(usize, usize), TerminalCheckpointError> {
+    let encoded = Zeroizing::new(
+        serde_json::to_vec(value).map_err(|_| TerminalCheckpointError::Serialization)?,
+    );
+    let structural = json_structural_retained_bytes(&encoded, limits)?;
+    Ok((structural, encoded.len()))
 }
 
 impl<'de> serde::de::Visitor<'de> for JsonStructuralVisitor<'_> {
@@ -3064,10 +3123,7 @@ impl PreparedTerminalCheckpointV2Migration {
         if !bytes.starts_with(b"{\"version\":2,") {
             return Err(TerminalCheckpointError::NonCanonicalEncoding);
         }
-        let mut budget = JsonStructuralBudget {
-            retained_bytes: 0,
-            limits,
-        };
+        let mut budget = JsonStructuralBudget::new(limits);
         let mut decoder = serde_json::Deserializer::from_slice(bytes);
         JsonStructuralSeed {
             budget: &mut budget,
@@ -3283,10 +3339,10 @@ impl StagedRecoveryCheckpoint {
     pub fn materialize(
         self,
     ) -> Result<crate::RecoveryTerminalCheckpointV3, TerminalCheckpointError> {
-        let checkpoint = self.hot.materialize_cold_history(self.limits)?;
+        let mut checkpoint = self.hot.materialize_cold_history(self.limits)?;
         let rows = checkpoint.primary_rows();
         let cols = checkpoint.primary_cols();
-        let payload = checkpoint.to_canonical_json(self.limits)?;
+        let payload = checkpoint.to_canonical_json_trimming_history(self.limits)?;
         Ok(crate::RecoveryTerminalCheckpointV3::from_canonical_parts(
             payload,
             rows,
@@ -4366,8 +4422,116 @@ impl TerminalCheckpointV3 {
 
     /// Encode the unique compact JSON representation under a writer-enforced
     /// byte ceiling.  Validation runs first, so impossible state is never
-    /// emitted as a recovery authority.
+    /// emitted as a recovery authority, and the decoder's structural pass
+    /// runs last, so neither is a payload the decoder would refuse.
     pub fn to_canonical_json(
+        &self,
+        limits: TerminalCheckpointLimits,
+    ) -> Result<Zeroizing<Vec<u8>>, TerminalCheckpointError> {
+        let encoded = self.encode_validated_canonical_json(limits)?;
+        json_structural_retained_bytes(&encoded, limits)?;
+        Ok(encoded)
+    }
+
+    /// Like `to_canonical_json` for a live recovery capture, except that a
+    /// checkpoint over the decoder's structural or encoded-byte budget first
+    /// gives up its oldest primary-screen scrollback (see
+    /// `drop_oldest_primary_history_to_fit`). A recovery image of the newest
+    /// history beats none: a payload its decoder refused used to poison the
+    /// pane's live parser and end the pane.
+    fn to_canonical_json_trimming_history(
+        &mut self,
+        limits: TerminalCheckpointLimits,
+    ) -> Result<Zeroizing<Vec<u8>>, TerminalCheckpointError> {
+        match self.to_canonical_json(limits) {
+            Err(TerminalCheckpointError::ResourceLimit {
+                resource: "json_structural_bytes" | "encoded_bytes",
+                ..
+            }) => {
+                self.drop_oldest_primary_history_to_fit(limits)?;
+                self.to_canonical_json(limits)
+            }
+            result => result,
+        }
+    }
+
+    /// Drop the fewest oldest primary-screen scrollback lines that bring the
+    /// canonical encoding within 7/8 of both the decoder's structural budget
+    /// and the encoded-byte ceiling. Each line's share is measured alone: the
+    /// structural pass charges every node once wherever it sits, so the shares
+    /// add up exactly. The cold prefix is the oldest history, so it shrinks
+    /// first; the stable row offset moves past the dropped lines.
+    fn drop_oldest_primary_history_to_fit(
+        &mut self,
+        limits: TerminalCheckpointLimits,
+    ) -> Result<(), TerminalCheckpointError> {
+        let structural_target =
+            limits.max_retained_capture_bytes - limits.max_retained_capture_bytes / 8;
+        let encoded_target = limits.max_encoded_bytes - limits.max_encoded_bytes / 8;
+        let measuring = TerminalCheckpointLimits {
+            max_retained_capture_bytes: usize::MAX,
+            max_string_bytes: usize::MAX,
+            ..limits
+        };
+
+        let rows = self.primary_screen.physical_rows as usize;
+        let droppable = self.primary_screen.lines.len().saturating_sub(rows);
+        let mut shares = Vec::with_capacity(droppable);
+        for line in &self.primary_screen.lines[..droppable] {
+            let (structural, bytes) = measure_canonical_json(line, measuring)?;
+            // Inside the lines array a line also costs its separating comma.
+            shares.push((structural, bytes + 1));
+        }
+        let scrollback: Vec<CheckpointLine> =
+            self.primary_screen.lines.drain(..droppable).collect();
+        let rest = measure_canonical_json(&*self, measuring);
+        self.primary_screen.lines.splice(0..0, scrollback);
+        let (mut structural, mut encoded) = rest?;
+        for (line_structural, line_bytes) in &shares {
+            structural = structural.saturating_add(*line_structural);
+            encoded = encoded.saturating_add(*line_bytes);
+        }
+
+        let mut dropped = 0;
+        while (structural > structural_target || encoded > encoded_target) && dropped < droppable
+        {
+            structural -= shares[dropped].0;
+            encoded -= shares[dropped].1;
+            dropped += 1;
+        }
+        if structural > structural_target {
+            return Err(resource_limit(
+                "json_structural_bytes",
+                structural,
+                structural_target,
+            ));
+        }
+        if encoded > encoded_target {
+            return Err(resource_limit("encoded_bytes", encoded, encoded_target));
+        }
+        if dropped == 0 {
+            return Ok(());
+        }
+        self.primary_screen.lines.drain(..dropped);
+        let dropped = u64::try_from(dropped)
+            .map_err(|_| TerminalCheckpointError::ArithmeticOverflow("screen.dropped_history"))?;
+        self.primary_screen.stable_row_index_offset = self
+            .primary_screen
+            .stable_row_index_offset
+            .checked_add(dropped)
+            .ok_or(TerminalCheckpointError::ArithmeticOverflow(
+                "screen.stable_row_index_offset",
+            ))?;
+        self.primary_screen.cold_prefix_line_count = self
+            .primary_screen
+            .cold_prefix_line_count
+            .saturating_sub(dropped);
+        Ok(())
+    }
+
+    /// `to_canonical_json` without the structural pass: decoding has already
+    /// run that pass over the bytes it compares this re-encoding against.
+    fn encode_validated_canonical_json(
         &self,
         limits: TerminalCheckpointLimits,
     ) -> Result<Zeroizing<Vec<u8>>, TerminalCheckpointError> {
@@ -4430,25 +4594,12 @@ impl TerminalCheckpointV3 {
             return Err(TerminalCheckpointError::NonCanonicalEncoding);
         }
 
-        let mut budget = JsonStructuralBudget {
-            retained_bytes: 0,
-            limits,
-        };
-        let mut structural_deserializer = serde_json::Deserializer::from_slice(bytes);
-        JsonStructuralSeed {
-            budget: &mut budget,
-            depth: 0,
-        }
-        .deserialize(&mut structural_deserializer)
-        .map_err(|_| TerminalCheckpointError::Serialization)?;
-        structural_deserializer
-            .end()
-            .map_err(|_| TerminalCheckpointError::Serialization)?;
+        json_structural_retained_bytes(bytes, limits)?;
 
         let checkpoint: Self =
             serde_json::from_slice(bytes).map_err(|_| TerminalCheckpointError::Serialization)?;
-        checkpoint.validate(limits)?;
-        let canonical = checkpoint.to_canonical_json(limits)?;
+        // Validates, then re-encodes: the structural pass already ran above.
+        let canonical = checkpoint.encode_validated_canonical_json(limits)?;
         if canonical.as_slice() != bytes {
             return Err(TerminalCheckpointError::NonCanonicalEncoding);
         }
@@ -4472,7 +4623,7 @@ impl TerminalCheckpointV3 {
     }
 
     pub fn into_recovery_checkpoint_at_external_parser_ground(
-        self,
+        mut self,
         ground: frankenterm_escape_parser::parser::RecoveryGroundBoundary<'_>,
         limits: TerminalCheckpointLimits,
     ) -> Result<crate::RecoveryTerminalCheckpointV3, TerminalCheckpointError> {
@@ -4483,7 +4634,7 @@ impl TerminalCheckpointV3 {
         };
         let rows = active_screen.physical_rows as usize;
         let cols = active_screen.physical_cols as usize;
-        let canonical_payload = self.to_canonical_json(limits)?;
+        let canonical_payload = self.to_canonical_json_trimming_history(limits)?;
         Ok(crate::RecoveryTerminalCheckpointV3::from_canonical_parts(
             canonical_payload,
             rows,
@@ -5763,6 +5914,128 @@ mod tests {
         );
     }
 
+    /// A 4x10 terminal holding about 100 lines of scrollback, and its checkpoint.
+    fn checkpoint_with_scrollback() -> (
+        Arc<dyn TerminalConfiguration + Send + Sync>,
+        TerminalCheckpointV3,
+    ) {
+        let config: Arc<dyn TerminalConfiguration + Send + Sync> =
+            Arc::new(RichCheckpointTestConfig);
+        let mut live = Terminal::new(
+            TerminalSize {
+                rows: 4,
+                cols: 10,
+                pixel_width: 100,
+                pixel_height: 80,
+                dpi: 96,
+            },
+            Arc::clone(&config),
+            "FrankenTerm",
+            "history-budget",
+            Box::new(std::io::sink()),
+        );
+        for line in 0..104 {
+            live.advance_bytes(format!("line {line:04}\r\n").as_bytes());
+        }
+        let checkpoint =
+            TerminalCheckpointV3::capture_with_limits(&live, TerminalCheckpointLimits::default())
+                .unwrap();
+        assert!(checkpoint.primary_screen.lines.len() > 100);
+        (config, checkpoint)
+    }
+
+    /// Default limits with a retained-memory budget of `retained` bytes.
+    fn limits_with_retained_budget(retained: usize) -> TerminalCheckpointLimits {
+        TerminalCheckpointLimits {
+            max_retained_capture_bytes: retained,
+            max_replay_actions_per_record: retained
+                / std::mem::size_of::<frankenterm_escape_parser::Action>(),
+            ..TerminalCheckpointLimits::default()
+        }
+    }
+
+    #[test]
+    fn encoder_refuses_a_payload_its_decoder_would_refuse() {
+        let (_config, checkpoint) = checkpoint_with_scrollback();
+        let full = checkpoint
+            .to_canonical_json(TerminalCheckpointLimits::default())
+            .unwrap();
+        let charged =
+            json_structural_retained_bytes(&full, TerminalCheckpointLimits::default()).unwrap();
+        let tight = limits_with_retained_budget(charged / 2);
+        tight.validate_policy().unwrap();
+
+        // The decoder's structural pass refuses the full payload, and the
+        // encoder now says so too, with the same typed limit, instead of
+        // emitting a recovery image nothing can decode.
+        assert!(matches!(
+            TerminalCheckpointV3::decode_canonical_json(&full, tight),
+            Err(TerminalCheckpointError::ResourceLimit {
+                resource: "json_structural_bytes",
+                ..
+            })
+        ));
+        assert!(matches!(
+            checkpoint.to_canonical_json(tight),
+            Err(TerminalCheckpointError::ResourceLimit {
+                resource: "json_structural_bytes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn live_capture_drops_only_the_oldest_history_until_its_decoder_admits_it() {
+        let (config, checkpoint) = checkpoint_with_scrollback();
+        let full = checkpoint
+            .to_canonical_json(TerminalCheckpointLimits::default())
+            .unwrap();
+        let charged =
+            json_structural_retained_bytes(&full, TerminalCheckpointLimits::default()).unwrap();
+        let tight = limits_with_retained_budget(charged / 2);
+
+        let mut trimmed = checkpoint.clone();
+        let payload = trimmed.to_canonical_json_trimming_history(tight).unwrap();
+        let before = &checkpoint.primary_screen;
+        let after = &trimmed.primary_screen;
+        let dropped = before.lines.len() - after.lines.len();
+        assert!(dropped > 0, "an over-budget capture must give up history");
+        assert!(
+            after.lines.len() > before.physical_rows as usize,
+            "the newest history is kept"
+        );
+        // Exactly the oldest lines go; the newest stay, in order.
+        assert_eq!(after.lines[..], before.lines[dropped..]);
+        assert_eq!(
+            after.stable_row_index_offset,
+            before.stable_row_index_offset + dropped as u64
+        );
+        // It fits with the 1/8 headroom, and its decoder admits it.
+        let fitted = json_structural_retained_bytes(&payload, tight).unwrap();
+        assert!(fitted <= tight.max_retained_capture_bytes - tight.max_retained_capture_bytes / 8);
+        let restored = TerminalCheckpointV3::decode_canonical_json(&payload, tight)
+            .unwrap()
+            .restore_inert(Arc::clone(&config))
+            .unwrap()
+            .into_live(Box::new(std::io::sink()))
+            .unwrap();
+        let recaptured =
+            TerminalCheckpointV3::capture_with_limits(&restored, TerminalCheckpointLimits::default())
+                .unwrap();
+        assert_eq!(recaptured.primary_screen.lines, after.lines);
+        assert_eq!(
+            recaptured.primary_screen.stable_row_index_offset,
+            after.stable_row_index_offset
+        );
+
+        // A capture within budget is left whole.
+        let mut whole = checkpoint.clone();
+        whole
+            .to_canonical_json_trimming_history(TerminalCheckpointLimits::default())
+            .unwrap();
+        assert!(whole == checkpoint);
+    }
+
     #[test]
     fn cold_seam_checkpoint_rejects_replaced_source_and_preserves_retryable_text() {
         use crate::config::ScrollbackSpillSink;
@@ -6244,10 +6517,7 @@ mod tests {
         }
         let prepared =
             PreparedTerminalCheckpointV2Migration::decode_canonical_json(&source, limits).unwrap();
-        let mut budget = JsonStructuralBudget {
-            retained_bytes: 0,
-            limits,
-        };
+        let mut budget = JsonStructuralBudget::new(limits);
         let mut decoder = serde_json::Deserializer::from_slice(&source);
         JsonStructuralSeed {
             budget: &mut budget,
