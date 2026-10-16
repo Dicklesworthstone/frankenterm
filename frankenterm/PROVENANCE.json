@@ -992,19 +992,19 @@
         "cosmetic": 8,
         "feat": 16,
         "fix": 59,
-        "other": 47,
+        "other": 48,
         "refactor": 3,
         "rename": 1,
         "security-fix": 2,
         "test": 25
       },
-      "fork_side_commit_count": 165,
+      "fork_side_commit_count": 166,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "other",
-        "committed_at": "2026-10-15T18:42:19-04:00",
-        "sha": "56fdd42dff142472324a2c742d188daa3554d4f0",
-        "subject": "perf(mux-server): the durability queue copies a row's content without its appdata lock (ft-yccm0.2.1.8)"
+        "committed_at": "2026-10-15T20:41:50-04:00",
+        "sha": "7f5cac907d8170c66d10c8aab7fcb37d093c2b17",
+        "subject": "perf(surface): wrap geometry of a short plain-ASCII row keeps its spaces inline instead of a per-row width buffer (ft-yccm0.2.1.8)"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -1206,8 +1206,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 3201,
-  "generated_at": "2026-10-15T23:54:21.948277Z",
+  "fork_side_commit_total": 3202,
+  "generated_at": "2026-10-16T00:42:02.195148Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 55,
