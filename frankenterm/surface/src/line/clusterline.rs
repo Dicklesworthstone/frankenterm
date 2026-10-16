@@ -144,8 +144,9 @@ impl core::fmt::Debug for ClusteredLine {
 /// Whether every byte of `text` is printable ASCII (`b' '..=b'~'`), eight
 /// bytes at a time. Every row of plain output that scrolls into the durable
 /// store is checked on the parse thread (ft-yccm0.2.1.8), where a branch per
-/// byte was a large part of capturing its wrap geometry.
-fn printable_ascii(text: &[u8]) -> bool {
+/// byte was a large part of capturing its wrap geometry, and every printed
+/// ASCII run is checked before it is appended (ft-yccm0.3.2.6).
+pub(crate) fn printable_ascii(text: &[u8]) -> bool {
     const ONES: u64 = u64::from_le_bytes([1; 8]);
     let (words, rest) = text.as_chunks::<8>();
     // The last few bytes, first byte lowest, shifted into a word of spaces.

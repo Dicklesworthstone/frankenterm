@@ -1635,10 +1635,9 @@ impl Line {
         if text.is_empty() {
             return true;
         }
-        if !text
-            .as_bytes()
-            .iter()
-            .all(|byte| *byte == b' ' || byte.is_ascii_graphic())
+        // Printable ASCII, a word at a time: one row of long lines is 120
+        // or more bytes, and the byte-at-a-time check was ~21% of that flood.
+        if !crate::line::clusterline::printable_ascii(text.as_bytes())
             || checked_materialized_end(idx, text.len()).is_none()
         {
             return false;
