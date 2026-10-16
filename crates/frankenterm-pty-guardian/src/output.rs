@@ -16824,8 +16824,14 @@ mod tests {
     #[test]
     fn guardian_journal_keeps_only_the_output_its_retained_checkpoints_replay()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (_directory, _poll, pipeline) =
-            pipeline_with_policy("ft-guardian-journal-floor-", one_record_segment_policy(8))?;
+        // Room for the retained members' output and a little more: twice as
+        // many one-record captures as segments, so without a floor the
+        // journal refuses a record halfway through.
+        let segments = CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS + 4;
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-journal-floor-",
+            one_record_segment_policy(segments),
+        )?;
         let store = pipeline.checkpoint_stage_store();
         let guardian = Uuid::from_u128(0xd1100);
         let mux = Uuid::from_u128(0xd1101);
@@ -16833,11 +16839,9 @@ mod tests {
         let generation = 1;
         let journal = pipeline.prepare_pane(guardian, pane)?;
         let mut state = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
-        // Twelve captures of one record each through an eight-segment
-        // journal: without a floor the ninth record is refused.
         let mut output = Vec::new();
         let mut appended_after: Vec<Vec<u8>> = Vec::new();
-        for capture in 0..12_u64 {
+        for capture in 0..u64::try_from(2 * segments)? {
             let appended = format!("c{capture:02};");
             output.extend_from_slice(appended.as_bytes());
             for earlier in &mut appended_after {
