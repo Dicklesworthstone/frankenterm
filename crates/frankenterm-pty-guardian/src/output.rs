@@ -2139,6 +2139,14 @@ struct SegmentPathAuthority {
     file_identity: FileIdentity,
 }
 
+/// What a rollover's reclamation actually unlinked.
+#[derive(Default)]
+struct ReclaimedOutputFiles {
+    segment_files: usize,
+    manifest_files: usize,
+    bytes: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ManifestPredecessor {
     manifest_id: Uuid,
@@ -2177,6 +2185,12 @@ struct PaneJournalAuthority {
     segments: Vec<SegmentPathAuthority>,
     manifest: PublishedManifestAuthority,
     manifest_history: Vec<ManifestPathAuthority>,
+    /// Segments the history's first manifest lists: 1 for a chain published
+    /// from sequence 1, more after a rollover reclaimed a prefix.
+    history_base_segments: usize,
+    /// Plaintext bytes this chain's owner no longer needs. A rollover
+    /// reclaims every sealed segment that ends at or below it.
+    reclaim_floor_bytes: u64,
     directory: File,
     directory_path: PathBuf,
     cipher: GuardianOutputCipher,
@@ -2342,7 +2356,12 @@ impl PaneJournalAuthority {
             .map_err(|_| OutputCommitError::SegmentManager)?;
         if self.segments.is_empty()
             || self.segments.len() != self.manifest.snapshot.segments.len()
-            || self.segments.len() != self.manifest_history.len()
+            || self.history_base_segments == 0
+            || self
+                .manifest_history
+                .len()
+                .checked_add(self.history_base_segments - 1)
+                != Some(self.segments.len())
             || self.physical_segment_files < self.segments.len()
             || self.physical_segment_files > self.policy.max_segments
             || self.relevant_files < minimum_relevant_files
@@ -2414,19 +2433,64 @@ impl PaneJournalAuthority {
         Ok(())
     }
 
-    fn rollover(&mut self, payload_bytes: usize) -> Result<(), OutputCommitError> {
-        if self.physical_segment_files >= self.policy.max_segments
-            || self
-                .relevant_files
-                .checked_add(3)
-                .is_none_or(|files| files > OUTPUT_MAX_RELEVANT_FILES_PER_PANE)
-        {
-            return Err(OutputCommitError::Capacity);
+    /// Raise the plaintext byte position below which this chain's owner no
+    /// longer needs output. It never moves backward.
+    fn raise_reclaim_floor(&mut self, floor_bytes: u64) {
+        self.reclaim_floor_bytes = self.reclaim_floor_bytes.max(floor_bytes);
+    }
+
+    /// How many leading segments end at or below the reclaim floor. The
+    /// segment `terminal` seals counts too: its successor names it.
+    fn reclaimable_segment_count(&self, terminal: GuardianOutputAppendReceipt) -> usize {
+        let mut count = 0;
+        for index in 0..self.segments.len() {
+            let end = match self.segments.get(index + 1) {
+                Some(next) => next
+                    .segment_identity
+                    .predecessor()
+                    .map(|predecessor| predecessor.cumulative_plaintext_bytes()),
+                None => Some(terminal.cumulative_plaintext_bytes()),
+            };
+            if !end.is_some_and(|end| end <= self.reclaim_floor_bytes) {
+                break;
+            }
+            count += 1;
         }
+        count
+    }
+
+    /// Seal the current segment and publish its successor. Sealed segments
+    /// that end at or below the reclaim floor leave the chain in the same
+    /// publication: the successor manifest starts at the first segment kept,
+    /// and once it is durable the superseded manifests and the reclaimed
+    /// segments are unlinked.
+    fn rollover(&mut self, payload_bytes: usize) -> Result<(), OutputCommitError> {
         let terminal = self
             .current_journal
             .terminal_receipt()
             .ok_or(OutputCommitError::Capacity)?;
+        let reclaimed = self.reclaimable_segment_count(terminal);
+        let superseded_manifests = if reclaimed == 0 {
+            0
+        } else {
+            self.manifest_history.len()
+        };
+        let next_physical_segment_files = self
+            .physical_segment_files
+            .checked_sub(reclaimed)
+            .and_then(|files| files.checked_add(1))
+            .ok_or(OutputCommitError::Capacity)?;
+        let next_relevant_files = self
+            .relevant_files
+            .checked_sub(reclaimed)
+            .and_then(|files| files.checked_sub(superseded_manifests.checked_mul(2)?))
+            .and_then(|files| files.checked_add(3))
+            .ok_or(OutputCommitError::Capacity)?;
+        if next_physical_segment_files > self.policy.max_segments
+            || next_relevant_files > OUTPUT_MAX_RELEVANT_FILES_PER_PANE
+        {
+            return Err(OutputCommitError::Capacity);
+        }
         let first_sequence = terminal
             .sequence()
             .checked_add(1)
@@ -2435,27 +2499,38 @@ impl PaneJournalAuthority {
         let next_segment_count = self
             .segments
             .len()
-            .checked_add(1)
+            .checked_sub(reclaimed)
+            .and_then(|segments| segments.checked_add(1))
             .ok_or(OutputCommitError::Capacity)?;
         let next_manifest_bytes =
             manifest_encoded_bytes(next_segment_count).map_err(|_| OutputCommitError::Capacity)?;
+        let reclaimed_bytes = self.reclaimable_file_bytes(reclaimed, superseded_manifests)?;
         let projected_total_files = self
             .total_relevant_file_bytes
-            .checked_add(OUTPUT_V3_FILE_HEADER_BYTES)
+            .checked_sub(reclaimed_bytes)
+            .and_then(|bytes| bytes.checked_add(OUTPUT_V3_FILE_HEADER_BYTES))
             .and_then(|bytes| bytes.checked_add(next_manifest_bytes))
             .and_then(|bytes| bytes.checked_add(frame_bytes))
             .ok_or(OutputCommitError::Capacity)?;
         if projected_total_files > self.policy.max_durable_pane_bytes {
             return Err(OutputCommitError::Capacity);
         }
-        validate_replayable_segment_chain(
-            &self.directory,
-            &self.directory_path,
-            &self.segments,
-            &self.cipher,
-            self.policy,
-        )
-        .map_err(|_| OutputCommitError::SegmentManager)?;
+        // Authenticate every segment that stays before sealing; reclaimed
+        // output is never read again.
+        let retained_totals = match self.segments.get(reclaimed..) {
+            Some(retained) if !retained.is_empty() => Some(
+                authenticate_segment_chain_read_only(
+                    &self.directory,
+                    &self.directory_path,
+                    retained,
+                    &self.cipher,
+                    self.policy,
+                )
+                .map(|(_, log_bytes, records)| (log_bytes, records))
+                .map_err(|_| OutputCommitError::SegmentManager)?,
+            ),
+            _ => None,
+        };
         self.segments
             .try_reserve(1)
             .map_err(|_| OutputCommitError::SegmentManager)?;
@@ -2473,10 +2548,17 @@ impl PaneJournalAuthority {
             self.policy.journal_limits,
         )
         .map_err(|_| OutputCommitError::SegmentManager)?;
-        let mut identities = self.manifest.snapshot.segments.clone();
+        let retained_identities = self
+            .manifest
+            .snapshot
+            .segments
+            .get(reclaimed..)
+            .ok_or(OutputCommitError::SegmentManager)?;
+        let mut identities = Vec::new();
         identities
-            .try_reserve(1)
+            .try_reserve_exact(retained_identities.len() + 1)
             .map_err(|_| OutputCommitError::SegmentManager)?;
+        identities.extend_from_slice(retained_identities);
         identities.push(successor_path.segment_identity);
         let next_manifest = publish_successor_manifest(
             &self.directory,
@@ -2486,33 +2568,143 @@ impl PaneJournalAuthority {
         )
         .map_err(|_| OutputCommitError::SegmentManager)?;
 
-        self.total_committed_log_bytes = self
-            .total_committed_log_bytes
-            .checked_add(successor_journal.committed_bytes())
-            .ok_or(OutputCommitError::Capacity)?;
-        self.total_relevant_file_bytes = self
-            .total_relevant_file_bytes
-            .checked_add(successor_journal.committed_bytes())
-            .and_then(|bytes| bytes.checked_add(next_manifest_bytes))
-            .ok_or(OutputCommitError::Capacity)?;
-        self.physical_segment_files = self
-            .physical_segment_files
-            .checked_add(1)
-            .ok_or(OutputCommitError::Capacity)?;
-        self.relevant_files = self
-            .relevant_files
-            .checked_add(3)
-            .ok_or(OutputCommitError::Capacity)?;
-        self.current_journal = successor_journal;
-        self.segments.push(successor_path);
-        self.manifest_history.push(ManifestPathAuthority {
+        let successor_bytes = successor_journal.committed_bytes();
+        let next_manifest_path = ManifestPathAuthority {
             path: next_manifest.path.clone(),
             file_identity: next_manifest.file_identity,
             publication_path: next_manifest.publication_path.clone(),
             publication_file_identity: next_manifest.publication_file_identity,
-        });
+        };
+        if reclaimed == 0 {
+            self.total_committed_log_bytes = self
+                .total_committed_log_bytes
+                .checked_add(successor_bytes)
+                .ok_or(OutputCommitError::Capacity)?;
+            self.total_relevant_file_bytes = self
+                .total_relevant_file_bytes
+                .checked_add(successor_bytes)
+                .and_then(|bytes| bytes.checked_add(next_manifest_bytes))
+                .ok_or(OutputCommitError::Capacity)?;
+            self.physical_segment_files = next_physical_segment_files;
+            self.relevant_files = next_relevant_files;
+            self.current_journal = successor_journal;
+            self.segments.push(successor_path);
+            self.manifest_history.push(next_manifest_path);
+            self.manifest = next_manifest;
+            return Ok(());
+        }
+
+        // The rebased manifest is durable: from here the chain is exactly
+        // its segments, whatever happens to the files it no longer names.
+        let superseded = std::mem::replace(&mut self.manifest_history, vec![next_manifest_path]);
+        let reclaimed_segments: Vec<SegmentPathAuthority> =
+            self.segments.drain(..reclaimed).collect();
+        let (retained_log_bytes, retained_records) = retained_totals.unwrap_or((0, 0));
+        self.total_committed_log_bytes = retained_log_bytes
+            .checked_add(successor_bytes)
+            .ok_or(OutputCommitError::Capacity)?;
+        self.total_records = retained_records;
+        self.current_journal = successor_journal;
+        self.segments.push(successor_path);
+        self.history_base_segments = self.segments.len();
         self.manifest = next_manifest;
+        let unlinked = self.unlink_reclaimed(&superseded, &reclaimed_segments);
+        self.physical_segment_files = self
+            .physical_segment_files
+            .checked_sub(unlinked.segment_files)
+            .and_then(|files| files.checked_add(1))
+            .ok_or(OutputCommitError::SegmentManager)?;
+        self.relevant_files = self
+            .relevant_files
+            .checked_sub(unlinked.segment_files + unlinked.manifest_files)
+            .and_then(|files| files.checked_add(3))
+            .ok_or(OutputCommitError::SegmentManager)?;
+        self.total_relevant_file_bytes = self
+            .total_relevant_file_bytes
+            .checked_sub(unlinked.bytes)
+            .and_then(|bytes| bytes.checked_add(successor_bytes))
+            .and_then(|bytes| bytes.checked_add(next_manifest_bytes))
+            .ok_or(OutputCommitError::SegmentManager)?;
         Ok(())
+    }
+
+    /// Bytes the files a rollover would reclaim hold now: the leading
+    /// `segments` segment files and every file of the `manifests` oldest
+    /// manifests (publication markers are empty).
+    fn reclaimable_file_bytes(
+        &self,
+        segments: usize,
+        manifests: usize,
+    ) -> Result<u64, OutputCommitError> {
+        let mut bytes = 0_u64;
+        for segment in self.segments.iter().take(segments) {
+            let length = owned_output_file_len(
+                &self.directory,
+                &self.directory_path,
+                &segment.path,
+                segment.file_identity,
+            )
+            .map_err(|_| OutputCommitError::SegmentManager)?;
+            bytes = bytes
+                .checked_add(length)
+                .ok_or(OutputCommitError::Capacity)?;
+        }
+        for manifest in self.manifest_history.iter().take(manifests) {
+            let length = owned_output_file_len(
+                &self.directory,
+                &self.directory_path,
+                &manifest.path,
+                manifest.file_identity,
+            )
+            .map_err(|_| OutputCommitError::SegmentManager)?;
+            bytes = bytes
+                .checked_add(length)
+                .ok_or(OutputCommitError::Capacity)?;
+        }
+        Ok(bytes)
+    }
+
+    /// Unlink what a durable rebased manifest superseded: each superseded
+    /// manifest's publication marker before the manifest itself, so no
+    /// marker ever names a missing manifest, then the reclaimed segments.
+    /// A file that cannot be unlinked stays counted, and on a later scan a
+    /// superseded manifest is never mistaken for history.
+    fn unlink_reclaimed(
+        &self,
+        superseded: &[ManifestPathAuthority],
+        reclaimed: &[SegmentPathAuthority],
+    ) -> ReclaimedOutputFiles {
+        let mut unlinked = ReclaimedOutputFiles::default();
+        let mut unlink = |path: &Path, identity: FileIdentity| {
+            match unlink_owned_output_file(&self.directory, &self.directory_path, path, identity)
+            {
+                Ok(bytes) => {
+                    unlinked.bytes = unlinked.bytes.saturating_add(bytes);
+                    true
+                }
+                Err(error) => {
+                    log::warn!("guardian output reclamation kept {}: {error}", path.display());
+                    false
+                }
+            }
+        };
+        for manifest in superseded {
+            if unlink(&manifest.publication_path, manifest.publication_file_identity) {
+                unlinked.manifest_files += 1;
+                if unlink(&manifest.path, manifest.file_identity) {
+                    unlinked.manifest_files += 1;
+                }
+            }
+        }
+        for segment in reclaimed {
+            if unlink(&segment.path, segment.file_identity) {
+                unlinked.segment_files += 1;
+            }
+        }
+        if let Err(error) = self.directory.sync_all() {
+            log::warn!("guardian output reclamation directory sync failed: {error}");
+        }
+        unlinked
     }
 
     fn receipt_is_current(&self, receipt: GuardianOutputAppendReceipt) -> bool {
@@ -2583,6 +2775,13 @@ pub struct GuardianBrokerOutputChainV1 {
 impl GuardianBrokerOutputChainV1 {
     pub(crate) fn durable_pane_id(&self) -> Uuid {
         self.authority.manifest.snapshot.durable_pane_id
+    }
+
+    /// Output through plaintext byte `acknowledged_bytes` is durable beyond
+    /// this chain (the guardian committed it to its own journal), so the next
+    /// rollover may reclaim every sealed segment that ends at or below it.
+    pub(crate) fn release_through(&mut self, acknowledged_bytes: u64) {
+        self.authority.raise_reclaim_floor(acknowledged_bytes);
     }
 
     /// Append one drained PTY read that begins at plaintext byte
@@ -8827,8 +9026,14 @@ fn validate_manifest_structure(
     predecessor: Option<ManifestPredecessor>,
     segments: &[GuardianOutputSegmentIdentity],
 ) -> Result<(), GuardianOutputError> {
+    // An unrebased manifest lists every segment since sequence 1, one more per
+    // revision. A rebased one starts at a segment whose predecessor was
+    // reclaimed, so it lists fewer segments than its revision.
+    let rebased = segments.first().is_some_and(manifest_segment_is_rebased_base);
+    let segment_count = u64::try_from(segments.len()).map_err(|_| GuardianOutputError::Allocation)?;
     if revision == 0
-        || usize::try_from(revision).ok() != Some(segments.len())
+        || (!rebased && revision != segment_count)
+        || (rebased && revision <= segment_count)
         || segments.is_empty()
         || segments.len() > OUTPUT_MAX_SEGMENTS_PER_PANE
         || (revision == 1) != predecessor.is_none()
@@ -8839,7 +9044,7 @@ fn validate_manifest_structure(
     }
     for (index, identity) in segments.iter().copied().enumerate() {
         if index == 0 {
-            if identity.first_sequence() != 1 || identity.predecessor().is_some() {
+            if (identity.first_sequence() == 1) != identity.predecessor().is_none() {
                 return Err(GuardianOutputError::FilesystemAuthority(
                     "guardian output manifest initial segment is invalid",
                 ));
@@ -8858,6 +9063,11 @@ fn validate_manifest_structure(
         }
     }
     Ok(())
+}
+
+/// Whether a chain's first segment follows a reclaimed predecessor.
+fn manifest_segment_is_rebased_base(segment: &GuardianOutputSegmentIdentity) -> bool {
+    segment.predecessor().is_some()
 }
 
 fn encode_manifest(snapshot: &mut OutputManifestSnapshot) -> Result<Vec<u8>, GuardianOutputError> {
@@ -9172,6 +9382,7 @@ struct DiscoveredSegment {
 struct PanePublicationScan {
     head: Option<DiscoveredManifest>,
     manifest_history: Vec<ManifestPathAuthority>,
+    history_base_segments: usize,
     segments: Vec<DiscoveredSegment>,
     relevant_files: usize,
     relevant_file_bytes: u64,
@@ -9297,10 +9508,11 @@ fn scan_pane_publications(
         ));
     }
     let manifests = pair_manifest_publications(&mut manifest_candidates, manifest_publications)?;
-    let (head, manifest_history) = select_manifest_chain(manifests)?;
+    let (head, manifest_history, history_base_segments) = select_manifest_chain(manifests)?;
     Ok(PanePublicationScan {
         head,
         manifest_history,
+        history_base_segments,
         segments,
         relevant_files,
         relevant_file_bytes,
@@ -9354,20 +9566,63 @@ fn pair_manifest_publications(
     Ok(manifests)
 }
 
+/// Select the published manifest history and its head, and report how many
+/// segments the history's first manifest lists.
 fn select_manifest_chain(
     mut manifests: Vec<DiscoveredManifest>,
-) -> Result<(Option<DiscoveredManifest>, Vec<ManifestPathAuthority>), GuardianOutputError> {
+) -> Result<(Option<DiscoveredManifest>, Vec<ManifestPathAuthority>, usize), GuardianOutputError>
+{
     if manifests.is_empty() {
-        return Ok((None, Vec::new()));
+        return Ok((None, Vec::new(), 0));
     }
     manifests.sort_by_key(|candidate| candidate.snapshot.revision);
+    // A rebased publication supersedes every earlier revision. Reclamation
+    // unlinks those right after publishing it, so any that remain are crash
+    // leftovers, never history.
+    let base = manifests
+        .iter()
+        .rposition(|candidate| {
+            candidate
+                .snapshot
+                .segments
+                .first()
+                .is_some_and(manifest_segment_is_rebased_base)
+        })
+        .unwrap_or(0);
+    if base > 0 {
+        let previous = &manifests[base - 1].snapshot;
+        let rebased = &manifests[base].snapshot;
+        // A rebase keeps a suffix of its predecessor's segments and may add
+        // the successor it rolled over to.
+        let kept = &rebased.segments[..rebased.segments.len() - 1];
+        if previous.revision.checked_add(1) == Some(rebased.revision)
+            && (rebased.predecessor
+                != Some(ManifestPredecessor {
+                    manifest_id: previous.manifest_id,
+                    checksum: previous.checksum,
+                })
+                || !(previous.segments.ends_with(&rebased.segments)
+                    || previous.segments.ends_with(kept)))
+        {
+            return Err(GuardianOutputError::FilesystemAuthority(
+                "guardian output rebased manifest does not follow its predecessor",
+            ));
+        }
+        manifests.drain(..base);
+    }
     let mut manifest_history = Vec::new();
     manifest_history
         .try_reserve_exact(manifests.len())
         .map_err(|_| GuardianOutputError::Allocation)?;
     let mut iterator = manifests.into_iter();
     let mut head = iterator.next().ok_or(GuardianOutputError::Allocation)?;
-    if head.snapshot.revision != 1 || head.snapshot.predecessor.is_some() {
+    let history_base_segments = head.snapshot.segments.len();
+    let rebased_base = head
+        .snapshot
+        .segments
+        .first()
+        .is_some_and(manifest_segment_is_rebased_base);
+    if !rebased_base && (head.snapshot.revision != 1 || head.snapshot.predecessor.is_some()) {
         return Err(GuardianOutputError::FilesystemAuthority(
             "guardian output manifest history has no unique initial publication",
         ));
@@ -9405,7 +9660,7 @@ fn select_manifest_chain(
         });
         head = candidate;
     }
-    Ok((Some(head), manifest_history))
+    Ok((Some(head), manifest_history, history_base_segments))
 }
 
 fn parse_segment_file_name(remainder: &str) -> Option<Uuid> {
@@ -9572,6 +9827,8 @@ fn open_or_create_pane_segment_manager(
         segments,
         manifest,
         manifest_history,
+        history_base_segments: 1,
+        reclaim_floor_bytes: 0,
         directory: directory
             .try_clone()
             .map_err(|error| GuardianOutputError::io("output-directory-clone", error))?,
@@ -9691,6 +9948,8 @@ fn open_scanned_pane_segment_manager(
             publication_file_identity: discovered_head.publication_file_identity,
         },
         manifest_history: scan.manifest_history,
+        history_base_segments: scan.history_base_segments,
+        reclaim_floor_bytes: 0,
         directory: directory
             .try_clone()
             .map_err(|error| GuardianOutputError::io("output-directory-clone", error))?,
@@ -9814,7 +10073,11 @@ fn authenticate_segment_chain_read_only(
             ));
         }
         if index == 0 {
-            if segment.segment_identity.predecessor().is_some() {
+            // A rebased chain's base names its reclaimed predecessor; only an
+            // unrebased chain's base starts at sequence 1 with none.
+            if (segment.segment_identity.first_sequence() == 1)
+                != segment.segment_identity.predecessor().is_none()
+            {
                 return Err(GuardianOutputError::FilesystemAuthority(
                     "guardian output initial segment has a predecessor",
                 ));
@@ -10358,6 +10621,36 @@ fn open_private_file_read_only_at(
     Err(GuardianOutputError::FilesystemAuthority(
         "descriptor-relative read-only guardian output file access is unsupported on this Unix target",
     ))
+}
+
+/// The length of one file this pane's chain owns, read only while the name
+/// still holds the exact file the chain pinned.
+fn owned_output_file_len(
+    directory: &File,
+    directory_path: &Path,
+    path: &Path,
+    identity: FileIdentity,
+) -> Result<u64, GuardianOutputError> {
+    let file = open_private_file_read_only_at_identity(directory, directory_path, path, identity)?;
+    file.metadata()
+        .map(|metadata| metadata.len())
+        .map_err(|error| GuardianOutputError::io("output-reclaim-metadata", error))
+}
+
+/// Unlink one file this pane's chain owns and no longer references, only
+/// while the name still holds the exact file the chain pinned. Returns the
+/// bytes it held.
+fn unlink_owned_output_file(
+    directory: &File,
+    directory_path: &Path,
+    path: &Path,
+    identity: FileIdentity,
+) -> Result<u64, GuardianOutputError> {
+    let bytes = owned_output_file_len(directory, directory_path, path, identity)?;
+    let name = output_child_name(directory_path, path)?;
+    rustix::fs::unlinkat(directory, name, rustix::fs::AtFlags::empty())
+        .map_err(|error| GuardianOutputError::io("output-reclaim-unlink", error.into()))?;
+    Ok(bytes)
 }
 
 fn open_private_file_read_only_at_identity(
