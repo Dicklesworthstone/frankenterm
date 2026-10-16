@@ -5360,17 +5360,19 @@ impl LiveParserCaptureAndBindError {
     /// that snapshot is lost. Identity, watermark and leftover-action failures
     /// mean the stream itself is in doubt.
     pub(crate) const fn leaves_live_parser_consistent(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::Pane(_)
-                | Self::Boundary(
-                    GuardianCheckpointBoundaryError::EmptyTerminalPayload
-                        | GuardianCheckpointBoundaryError::TerminalPayloadLengthOutOfRange
-                        | GuardianCheckpointBoundaryError::InvalidCanonicalTerminalPayload
-                        | GuardianCheckpointBoundaryError::GeometryOutOfRange
-                        | GuardianCheckpointBoundaryError::ZeroGeometry
-                )
-        )
+            | Self::Boundary(
+                GuardianCheckpointBoundaryError::EmptyTerminalPayload
+                | GuardianCheckpointBoundaryError::TerminalPayloadLengthOutOfRange
+                | GuardianCheckpointBoundaryError::InvalidCanonicalTerminalPayload
+                | GuardianCheckpointBoundaryError::GeometryOutOfRange
+                | GuardianCheckpointBoundaryError::ZeroGeometry,
+            ) => true,
+            Self::RegistrationIdentityMismatch | Self::PendingActionsRemain | Self::Boundary(_) => {
+                false
+            }
+        }
     }
 }
 
