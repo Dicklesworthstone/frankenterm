@@ -3124,7 +3124,10 @@ impl LineWrapGeometry {
             self.tail_before_basic = other.tail_before_basic;
             self.tail_before_pictograph = other.tail_before_pictograph;
         }
-        widths.extend(other.widths.iter());
+        match &other.widths {
+            TokenWidths::Cells(cells) => widths.extend_from_slice(cells),
+            TokenWidths::Ascii { .. } => widths.extend(other.widths.iter()),
+        }
         self.physical_len = physical_len;
         Ok(())
     }
