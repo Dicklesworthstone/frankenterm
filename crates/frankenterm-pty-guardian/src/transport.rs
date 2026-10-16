@@ -282,6 +282,10 @@ struct DeferredGuardianReplay {
     route: GuardianCheckpointRoute,
     effect_lease: Option<GuardianTokenEffectLease>,
     deadline: Instant,
+    /// A synchronous request (a probe, a census page, a child observation)
+    /// that met the protocol authority out with a job: served by `dispatch`,
+    /// not the checkpoint worker, once the authority returns.
+    dispatch: bool,
     #[cfg(test)]
     wipe_probe: Option<Arc<AtomicBool>>,
 }
@@ -299,9 +303,21 @@ impl DeferredGuardianReplay {
             route,
             effect_lease: Some(effect_lease),
             deadline,
+            dispatch: false,
             #[cfg(test)]
             wipe_probe: None,
         }
+    }
+
+    fn new_dispatch(
+        request: AuthenticatedGuardianRequest,
+        route: GuardianCheckpointRoute,
+        effect_lease: GuardianTokenEffectLease,
+        deadline: Instant,
+    ) -> Self {
+        let mut deferred = Self::new(request, route, effect_lease, deadline);
+        deferred.dispatch = true;
+        deferred
     }
 
     #[cfg(test)]
@@ -1729,6 +1745,44 @@ impl GuardianService {
                         GuardianCheckpointSubmission::CloseRetryably => FrameProcessing::Close,
                     };
                 }
+                if matches!(
+                    self.runtime.replay_wait_readiness(&request),
+                    GuardianReplayWaitReadiness::AuthorityInFlight
+                ) {
+                    // A probe, census page or child observation meets the
+                    // authority out with a job almost every time on a busy
+                    // guardian; closing it made upgrade verification and
+                    // child observation fail for a minute at a time. Wait for
+                    // the authority as a checkpoint request does.
+                    let (Some(route), Some(deadline)) = (
+                        GuardianCheckpointRoute::new(
+                            token,
+                            connection.generation,
+                            request.header().request_id,
+                        ),
+                        Instant::now().checked_add(CHECKPOINT_AUTHORITY_WAIT),
+                    ) else {
+                        request.zeroize_payload();
+                        return FrameProcessing::Close;
+                    };
+                    if connection.deferred_replay.is_some() {
+                        request.zeroize_payload();
+                        return FrameProcessing::Close;
+                    }
+                    let Some(effect_lease) = effect_lease.take() else {
+                        request.zeroize_payload();
+                        return FrameProcessing::Close;
+                    };
+                    connection.pending_checkpoint = Some(route);
+                    connection.deferred_replay = Some(DeferredGuardianReplay::new_dispatch(
+                        request,
+                        route,
+                        effect_lease,
+                        deadline,
+                    ));
+                    self.runtime.record_replay_wait_deferred();
+                    return FrameProcessing::PendingCheckpoint;
+                }
                 let response = self.runtime.dispatch(&request);
                 request.zeroize_payload();
                 match response {
@@ -1921,6 +1975,18 @@ impl GuardianService {
             }
 
             let route = deferred.route;
+            if deferred.dispatch {
+                let Some((mut request, _effect_lease)) = deferred.take_submission() else {
+                    self.finish_connection(token, connection);
+                    continue;
+                };
+                // Answered synchronously: the authority stays here, so the
+                // remaining waits are served in this pass too.
+                let response = self.runtime.dispatch(&request);
+                request.zeroize_payload();
+                self.route_checkpoint_response(token, connection, response);
+                continue;
+            }
             let Some((request, effect_lease)) = deferred.take_submission() else {
                 self.finish_connection(token, connection);
                 continue;
@@ -6118,6 +6184,77 @@ mod tests {
         assert!(
             !matches!(result, Some(Err(GuardianClientError::Io(_)))),
             "parked request was closed: {result:?}"
+        );
+        client.join().unwrap();
+    }
+
+    /// A synchronous request (here a census page, as a probe or an upgrade
+    /// verification sends) waits for the authority a job holds and is
+    /// answered, instead of meeting a closed connection.
+    #[test]
+    fn census_waits_for_the_protocol_authority_a_job_holds() {
+        let directory = tempfile::Builder::new()
+            .prefix("ft-guardian-census-wait-")
+            .tempdir_in(crate::canonical_test_temp_root())
+            .unwrap()
+            .keep();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let token = directory.join("token");
+        let socket = directory.join("guardian.sock");
+        provision_guardian_token(&token).unwrap();
+        let config = GuardianServiceConfig::new(
+            socket.clone(),
+            token.clone(),
+            8,
+            1,
+            65_536,
+            65_536,
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let mut service = GuardianService::bind(config).unwrap();
+        let (connected_tx, connected_rx) = std::sync::mpsc::sync_channel(1);
+        let (send_tx, send_rx) = std::sync::mpsc::sync_channel(1);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let client = std::thread::spawn(move || {
+            let mut client = GuardianClient::connect(&socket, &token, Uuid::new_v4()).unwrap();
+            connected_tx.send(()).unwrap();
+            send_rx.recv().unwrap();
+            result_tx.send(client.census_snapshot()).unwrap();
+        });
+        let deadline = Instant::now() + CLIENT_IO_TIMEOUT;
+        while connected_rx.try_recv().is_err() {
+            assert!(Instant::now() < deadline, "client never connected");
+            service.poll_once().unwrap();
+        }
+
+        let held = service.runtime.take_protocol_for_test().unwrap();
+        let deferred_before = service.runtime.counters().replay_waits_deferred;
+        send_tx.send(()).unwrap();
+        let deadline = Instant::now() + CLIENT_IO_TIMEOUT;
+        while service.runtime.counters().replay_waits_deferred == deferred_before {
+            assert!(Instant::now() < deadline, "census was never parked");
+            service.poll_once().unwrap();
+        }
+        for _ in 0..20 {
+            service.poll_once().unwrap();
+        }
+        assert!(
+            result_rx.try_recv().is_err(),
+            "a parked census is neither answered nor closed while the authority is out"
+        );
+
+        service.runtime.restore_protocol_for_test(held);
+        let mut result = None;
+        let deadline = Instant::now() + CLIENT_IO_TIMEOUT;
+        while result.is_none() {
+            assert!(Instant::now() < deadline, "parked census never answered");
+            service.poll_once().unwrap();
+            result = result_rx.try_recv().ok();
+        }
+        assert!(
+            matches!(result, Some(Ok(ref entries)) if entries.is_empty()),
+            "the parked census is answered by the protocol: {result:?}"
         );
         client.join().unwrap();
     }
