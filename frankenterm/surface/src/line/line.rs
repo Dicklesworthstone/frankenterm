@@ -487,9 +487,15 @@ impl Line {
                     self.zones.clear();
                     self.seqno = seqno;
                     self.bits = LineBits::NONE;
+                    // The row is owned here, so no one else can hold the
+                    // lock: clearing through `get_mut` skips a lock and an
+                    // unlock per recycled row (~3% of a `seq` flood).
                     #[cfg(feature = "appdata")]
                     {
-                        *lock_or_recover(&self.appdata) = None;
+                        *self
+                            .appdata
+                            .get_mut()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                     }
                     return self;
                 }
@@ -1644,8 +1650,11 @@ impl Line {
         if !cl.can_append_cell_at(idx, text) {
             return false;
         }
-        // Past the end, `set_cell` leaves a blank cell implicit.
-        let implicit = if idx > cl.len() && Cell::new(' ', attr.clone()) == Cell::blank() {
+        // Past the end, `set_cell` leaves a blank cell implicit. A space
+        // with `attr` is the blank cell exactly when `attr` is blank; this
+        // compares that without building and comparing two cells, which was
+        // ~4% of a raw `seq` flood, where every line starts past the end.
+        let implicit = if idx > cl.len() && attr == CellAttributes::blank() {
             text.bytes().take_while(|&byte| byte == b' ').count()
         } else {
             0

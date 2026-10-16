@@ -33,6 +33,7 @@ struct Cluster {
 /// U+3099-U+309A), CJK ideographs, Hangul syllables, fullwidth forms (minus
 /// U+FF9E-U+FF9F) and the emoji blocks minus the skin-tone modifiers
 /// U+1F3FB-U+1F3FF. Anything else is treated as able to cluster.
+#[inline]
 pub(crate) fn is_cluster_inert(c: char) -> bool {
     matches!(
         u32::from(c),
@@ -62,6 +63,7 @@ pub(crate) fn is_cluster_inert(c: char) -> bool {
 
 /// Whether a grapheme boundary is guaranteed between a cell whose text ends
 /// in `prev` (`None` for the start of the line) and one starting with `next`.
+#[inline]
 fn breaks_between(prev: Option<char>, next: char) -> bool {
     prev.is_none_or(|prev| is_cluster_inert(prev) && is_cluster_inert(next))
 }
