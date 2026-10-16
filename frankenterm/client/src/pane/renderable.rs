@@ -7283,6 +7283,7 @@ mod tests {
     #[test]
     fn row_capture_on_a_render_thread_spawns_tasks_the_main_thread_can_run() {
         use mux::render_mirror::{capture_pane_rows, CaptureRequest, RenderMirror};
+        use std::convert::TryFrom;
 
         let scope = crate::MuxTestScope::enter();
         let executor = promise::spawn::SimpleExecutor::new();
