@@ -26,6 +26,7 @@ pub mod replay_liveness_receipts;
 pub mod replay_mcp;
 pub mod replay_merge;
 pub mod replay_performance;
+pub mod replay_policy_recommendations;
 pub mod replay_post_incident;
 pub mod replay_provenance;
 pub mod replay_remediation;
