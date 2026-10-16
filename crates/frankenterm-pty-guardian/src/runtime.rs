@@ -1364,7 +1364,24 @@ fn execute_checkpoint_stage_job(
             store.apply_runtime_seal(permit, journal)
         }
         GuardianCheckpointStageKindV1::Ack => {
-            store.apply_ack_from_committed_catalog(stage, job.request.header().mux_incarnation)
+            let pane_id = match stage.scope() {
+                mux::guardian_protocol::GuardianCheckpointScopeV1::Pane { pane_id, .. } => {
+                    Some(pane_id)
+                }
+                mux::guardian_protocol::GuardianCheckpointScopeV1::Genesis { .. } => None,
+            };
+            let acked =
+                store.apply_ack_from_committed_catalog(stage, job.request.header().mux_incarnation);
+            // An acknowledged capture may have let the catalog drop older
+            // members, so the pane's journal no longer needs the records
+            // before its oldest one; the next rollover reclaims them.
+            if acked.is_ok()
+                && let (Some(pane_id), Some(journal)) = (pane_id, job.journal.as_ref())
+                && let Ok(floor) = store.pane_output_reclaim_floor(pane_id)
+            {
+                journal.release_through_sequence(floor);
+            }
+            acked
         }
     };
     let reply = reply.ok()?;
@@ -3748,8 +3765,9 @@ impl GuardianRuntime {
                                 output.durable_plaintext_bytes =
                                     receipt.cumulative_plaintext_bytes();
                                 output.expected_sequence = receipt.sequence().checked_add(1);
+                                // The journal counts what reclamation freed.
                                 output.remaining_record_capacity =
-                                    output.remaining_record_capacity.saturating_sub(1);
+                                    output.journal.remaining_records();
                                 pane.pending_ack = Some(ack);
                                 self.counters.pty_bytes_durably_committed = self
                                     .counters
@@ -3805,15 +3823,8 @@ impl GuardianRuntime {
                                     .checked_add(u64::from(receipt.payload_bytes()))
                                     == Some(receipt.cumulative_plaintext_bytes()) =>
                         {
-                            let Some(remaining_record_capacity) =
-                                pane.output.remaining_record_capacity.checked_sub(1)
-                            else {
-                                pane.output.failed = true;
-                                pane.output.waiting_for_slot = false;
-                                self.counters.output_commit_failures =
-                                    self.counters.output_commit_failures.saturating_add(1);
-                                continue;
-                            };
+                            // The journal counts what reclamation freed.
+                            let remaining_record_capacity = pane.output.journal.remaining_records();
                             pane.output.durable_plaintext_bytes =
                                 receipt.cumulative_plaintext_bytes();
                             pane.output.expected_sequence = receipt.sequence().checked_add(1);

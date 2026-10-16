@@ -2198,6 +2198,9 @@ struct PaneJournalAuthority {
     /// Plaintext bytes this chain's owner no longer needs. A rollover
     /// reclaims every sealed segment that ends at or below it.
     reclaim_floor_bytes: u64,
+    /// The same floor as a record sequence, for an owner that knows which
+    /// records it no longer needs rather than which bytes.
+    reclaim_floor_sequence: u64,
     directory: File,
     directory_path: PathBuf,
     cipher: GuardianOutputCipher,
@@ -2446,19 +2449,29 @@ impl PaneJournalAuthority {
         self.reclaim_floor_bytes = self.reclaim_floor_bytes.max(floor_bytes);
     }
 
-    /// How many leading segments end at or below the reclaim floor. The
+    /// Raise the last record sequence this chain's owner no longer needs. It
+    /// never moves backward.
+    fn raise_reclaim_floor_sequence(&mut self, floor_sequence: u64) {
+        self.reclaim_floor_sequence = self.reclaim_floor_sequence.max(floor_sequence);
+    }
+
+    /// How many leading segments end at or below a reclaim floor. The
     /// segment `terminal` seals counts too: its successor names it.
     fn reclaimable_segment_count(&self, terminal: GuardianOutputAppendReceipt) -> usize {
         let mut count = 0;
         for index in 0..self.segments.len() {
             let end = match self.segments.get(index + 1) {
-                Some(next) => next
-                    .segment_identity
-                    .predecessor()
-                    .map(|predecessor| predecessor.cumulative_plaintext_bytes()),
-                None => Some(terminal.cumulative_plaintext_bytes()),
+                Some(next) => next.segment_identity.predecessor().map(|predecessor| {
+                    (
+                        predecessor.cumulative_plaintext_bytes(),
+                        predecessor.last_sequence(),
+                    )
+                }),
+                None => Some((terminal.cumulative_plaintext_bytes(), terminal.sequence())),
             };
-            if !end.is_some_and(|end| end <= self.reclaim_floor_bytes) {
+            if !end.is_some_and(|(bytes, sequence)| {
+                bytes <= self.reclaim_floor_bytes || sequence <= self.reclaim_floor_sequence
+            }) {
                 break;
             }
             count += 1;
@@ -2726,34 +2739,68 @@ impl PaneJournalAuthority {
         let Ok(frame_bytes) = output_frame_bytes(1) else {
             return false;
         };
-        if self
-            .total_relevant_file_bytes
-            .checked_add(frame_bytes)
-            .is_none_or(|bytes| bytes > self.policy.max_durable_pane_bytes)
-        {
-            return false;
-        }
         if journal_can_append(&self.current_journal, self.policy.journal_limits, 1).unwrap_or(false)
         {
-            return true;
+            return self
+                .total_relevant_file_bytes
+                .checked_add(frame_bytes)
+                .is_some_and(|bytes| bytes <= self.policy.max_durable_pane_bytes);
         }
-        self.physical_segment_files < self.policy.max_segments
+        // The next record needs a rollover, which also reclaims whatever the
+        // owner has released.
+        let Some(terminal) = self.current_journal.terminal_receipt() else {
+            return false;
+        };
+        let reclaimed = self.reclaimable_segment_count(terminal);
+        let superseded_manifests = if reclaimed == 0 {
+            0
+        } else {
+            self.manifest_history.len()
+        };
+        let Ok(reclaimed_bytes) = self.reclaimable_file_bytes(reclaimed, superseded_manifests)
+        else {
+            return false;
+        };
+        self.physical_segment_files.saturating_sub(reclaimed) < self.policy.max_segments
             && self
                 .relevant_files
+                .saturating_sub(reclaimed + 2 * superseded_manifests)
                 .checked_add(3)
                 .is_some_and(|files| files <= OUTPUT_MAX_RELEVANT_FILES_PER_PANE)
-            && self.current_journal.terminal_receipt().is_some()
             && self.current_journal.next_sequence().is_some()
             && self
                 .total_relevant_file_bytes
-                .checked_add(OUTPUT_V3_FILE_HEADER_BYTES)
+                .checked_sub(reclaimed_bytes)
+                .and_then(|bytes| bytes.checked_add(OUTPUT_V3_FILE_HEADER_BYTES))
                 .and_then(|bytes| {
-                    manifest_encoded_bytes(self.segments.len().checked_add(1)?)
+                    let segments = self.segments.len().checked_sub(reclaimed)?.checked_add(1)?;
+                    manifest_encoded_bytes(segments)
                         .ok()
                         .and_then(|manifest| bytes.checked_add(manifest))
                 })
                 .and_then(|bytes| bytes.checked_add(frame_bytes))
                 .is_some_and(|bytes| bytes <= self.policy.max_durable_pane_bytes)
+    }
+
+    /// Records the next rollover would reclaim.
+    fn reclaimable_records(&self) -> u64 {
+        let Some(terminal) = self.current_journal.terminal_receipt() else {
+            return 0;
+        };
+        let reclaimed = self.reclaimable_segment_count(terminal);
+        let Some(first) = self.segments.first() else {
+            return 0;
+        };
+        if reclaimed == 0 {
+            return 0;
+        }
+        self.segments
+            .get(reclaimed)
+            .map_or_else(
+                || terminal.sequence().saturating_add(1),
+                |kept| kept.segment_identity.first_sequence(),
+            )
+            .saturating_sub(first.segment_identity.first_sequence())
     }
 
     fn remaining_records(&self) -> Result<u64, GuardianOutputError> {
@@ -2860,6 +2907,29 @@ impl GuardianPaneOutputJournal {
             .lock()
             .map(|authority| authority.can_accept_min_record())
             .unwrap_or(false)
+    }
+
+    /// No restore can need records through `sequence` any more, so a later
+    /// rollover may reclaim every sealed segment that ends at or before it.
+    pub(crate) fn release_through_sequence(&self, sequence: u64) {
+        if let Ok(mut authority) = self.authority.lock() {
+            authority.raise_reclaim_floor_sequence(sequence);
+        }
+    }
+
+    /// Records this chain can still accept, counting what the next rollover
+    /// would reclaim.
+    pub(crate) fn remaining_records(&self) -> u64 {
+        self.authority
+            .lock()
+            .ok()
+            .and_then(|authority| {
+                authority
+                    .remaining_records()
+                    .ok()
+                    .map(|remaining| remaining.saturating_add(authority.reclaimable_records()))
+            })
+            .unwrap_or(0)
     }
 
     pub(crate) const fn initial_next_sequence(&self) -> Option<u64> {
@@ -4918,6 +4988,47 @@ impl GuardianCheckpointStageStore {
         })
     }
 
+    /// The last output record no restore of this pane can need: the one
+    /// before its oldest published Pane member's boundary record, which a
+    /// replay Open re-reads to authenticate that member's origin. Zero while
+    /// the pane has no Pane member, since a Genesis replay reads the whole
+    /// journal.
+    pub(crate) fn pane_output_reclaim_floor(
+        &self,
+        pane_id: Uuid,
+    ) -> Result<u64, GuardianCheckpointStageStoreError> {
+        self.with_exclusive_directory(|inner| {
+            let catalog = checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id })?;
+            let Some(oldest) = catalog.published.first() else {
+                return Ok(0);
+            };
+            let bytes = checkpoint_catalog_read_file(
+                inner,
+                &oldest.candidate_path,
+                oldest.candidate_file_identity,
+                CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+            )?;
+            let candidate = checkpoint_catalog_decode_candidate(&bytes)?;
+            let record = candidate
+                .records
+                .first()
+                .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+            let plaintext = inner.cipher.open(
+                &record.context(),
+                record,
+                u32::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES)
+                    .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+            )?;
+            let begin = GuardianCheckpointStageRequestV1::decode(&plaintext)?;
+            Ok(begin
+                .descriptor()
+                .canonical_descriptor()?
+                .origin()
+                .output_sequence()
+                .map_or(0, |sequence| sequence.saturating_sub(1)))
+        })
+    }
+
     fn with_exclusive_directory<T>(
         &self,
         operation: impl FnOnce(
@@ -5488,7 +5599,11 @@ fn guardian_replay_capture_output(
     segments
         .try_reserve_exact(authority.segments.len())
         .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
-    let mut previous_terminal = None;
+    // A rebased chain's first segment names its reclaimed predecessor.
+    let mut previous_terminal = authority
+        .segments
+        .first()
+        .and_then(|segment| segment.segment_identity.predecessor());
     let mut total_committed_bytes = 0_u64;
     for (index, segment) in authority.segments.iter().enumerate() {
         let file = open_private_file_read_only_at_identity(
@@ -5642,39 +5757,71 @@ fn guardian_replay_validate_resume(
     Ok(())
 }
 
+/// Whether an output error only says a pinned name no longer exists. Output
+/// reclamation unlinks superseded manifests and reclaimed segments; a replay
+/// that pinned them keeps reading through the descriptors it opened, and every
+/// record it serves is still authenticated. A name that now holds some other
+/// file is never excused.
+fn output_name_was_reclaimed(error: &GuardianOutputError) -> bool {
+    matches!(
+        error,
+        GuardianOutputError::Io { source, .. } if source.kind() == ErrorKind::NotFound
+    )
+}
+
+/// `validate_file_identity_at`, except that a name reclamation removed passes.
+fn validate_pinned_name_unless_reclaimed(
+    directory: &File,
+    directory_path: &Path,
+    path: &Path,
+    identity: FileIdentity,
+) -> Result<(), GuardianOutputError> {
+    match validate_file_identity_at(directory, directory_path, path, identity) {
+        Err(error) if output_name_was_reclaimed(&error) => Ok(()),
+        result => result,
+    }
+}
+
 fn guardian_replay_validate_output_pin(
     output: &GuardianReplayOutputPin,
 ) -> Result<(), GuardianCheckpointStageStoreError> {
-    let manifest_file = open_private_file_read_only_at_identity(
+    match open_private_file_read_only_at_identity(
         &output.directory,
         &output.directory_path,
         &output.manifest_path,
         output.manifest_file_identity,
-    )?;
-    let manifest_metadata = manifest_file.metadata().map_err(|error| {
-        GuardianCheckpointStageStoreError::io("replay-manifest-metadata", error)
-    })?;
-    if !output.manifest_file_identity.matches(&manifest_metadata) {
-        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    ) {
+        Ok(manifest_file) => {
+            let manifest_metadata = manifest_file.metadata().map_err(|error| {
+                GuardianCheckpointStageStoreError::io("replay-manifest-metadata", error)
+            })?;
+            if !output.manifest_file_identity.matches(&manifest_metadata) {
+                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            }
+            let manifest_bytes = read_manifest_file_bounded(manifest_file, &manifest_metadata)?;
+            let manifest = decode_manifest(&manifest_bytes)?;
+            if manifest.durable_pane_id != output.manifest.durable_pane_id
+                || manifest.guardian_incarnation != output.manifest.guardian_incarnation
+                || manifest.manifest_id != output.manifest.manifest_id
+                || manifest.revision != output.manifest.revision
+                || manifest.predecessor != output.manifest.predecessor
+                || manifest.segments != output.manifest.segments
+                || manifest.checksum != output.manifest.checksum
+            {
+                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            }
+            validate_pinned_name_unless_reclaimed(
+                &output.directory,
+                &output.directory_path,
+                &output.publication_path,
+                output.publication_file_identity,
+            )?;
+        }
+        // A rebased manifest superseded the pinned one; the pin's own copy
+        // of that manifest still names the segments this replay reads.
+        Err(error) if output_name_was_reclaimed(&error) => {}
+        Err(error) => return Err(error.into()),
     }
-    let manifest_bytes = read_manifest_file_bounded(manifest_file, &manifest_metadata)?;
-    let manifest = decode_manifest(&manifest_bytes)?;
-    if manifest.durable_pane_id != output.manifest.durable_pane_id
-        || manifest.guardian_incarnation != output.manifest.guardian_incarnation
-        || manifest.manifest_id != output.manifest.manifest_id
-        || manifest.revision != output.manifest.revision
-        || manifest.predecessor != output.manifest.predecessor
-        || manifest.segments != output.manifest.segments
-        || manifest.checksum != output.manifest.checksum
-    {
-        return Err(GuardianCheckpointStageStoreError::Poisoned);
-    }
-    let _publication_authority = open_private_file_read_only_at_identity(
-        &output.directory,
-        &output.directory_path,
-        &output.publication_path,
-        output.publication_file_identity,
-    )?;
     if output.segments.len() != output.manifest.segments.len()
         || output
             .segments
@@ -5685,7 +5832,7 @@ fn guardian_replay_validate_output_pin(
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
     for segment in &output.segments {
-        validate_file_identity_at(
+        validate_pinned_name_unless_reclaimed(
             &output.directory,
             &output.directory_path,
             &segment.authority.path,
@@ -5699,7 +5846,7 @@ fn guardian_replay_validate_output_pin(
         if segment.terminal_receipt.is_some() {
             segment.read_work.lock().unwrap().terminal_frames += 1;
         }
-        validate_file_identity_at(
+        validate_pinned_name_unless_reclaimed(
             &output.directory,
             &output.directory_path,
             &segment.authority.path,
@@ -5739,7 +5886,7 @@ fn guardian_replay_recover_receipt(
             .receipt_before_bookmark(&bookmark)?
             .filter(|receipt| receipt.sequence() == sequence)
             .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
-        validate_file_identity_at(
+        validate_pinned_name_unless_reclaimed(
             &output.directory,
             &output.directory_path,
             &segment.authority.path,
@@ -5762,7 +5909,7 @@ fn guardian_replay_recover_receipt(
     {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
-    validate_file_identity_at(
+    validate_pinned_name_unless_reclaimed(
         &output.directory,
         &output.directory_path,
         &segment.authority.path,
@@ -6142,7 +6289,7 @@ fn guardian_replay_output_page(
                 break;
             }
         }
-        validate_file_identity_at(
+        validate_pinned_name_unless_reclaimed(
             &output.directory,
             &output.directory_path,
             &segment.authority.path,
@@ -10054,6 +10201,7 @@ fn open_or_create_pane_segment_manager(
         manifest_history,
         history_base_segments: 1,
         reclaim_floor_bytes: 0,
+        reclaim_floor_sequence: 0,
         directory: directory
             .try_clone()
             .map_err(|error| GuardianOutputError::io("output-directory-clone", error))?,
@@ -10195,6 +10343,7 @@ fn open_scanned_pane_segment_manager(
         manifest_history: scan.manifest_history,
         history_base_segments: scan.history_base_segments,
         reclaim_floor_bytes: 0,
+        reclaim_floor_sequence: 0,
         directory: directory
             .try_clone()
             .map_err(|error| GuardianOutputError::io("output-directory-clone", error))?,
@@ -16301,6 +16450,241 @@ mod tests {
             store.apply_replay(&reclaimed_request, preflight, Some(&journal)),
             Err(GuardianCheckpointStageStoreError::CandidateAbsent)
         ));
+        Ok(())
+    }
+
+    /// Replay one snapshot to completion one record per page, running
+    /// `between_pages` after each acknowledged page, and return the output it
+    /// delivered after its checkpoint.
+    #[allow(clippy::too_many_arguments)]
+    fn replay_output_suffix(
+        store: &GuardianCheckpointStageStore,
+        state: &GuardianProtocolState,
+        journal: &GuardianPaneOutputJournal,
+        guardian: Uuid,
+        mux: Uuid,
+        pane: Uuid,
+        generation: u64,
+        selector: GuardianReplaySelectorV1,
+        request_base: u128,
+        between_pages: &mut dyn FnMut() -> Result<(), Box<dyn std::error::Error>>,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let maximum_plaintext_bytes = 64 * 1024;
+        let mut request_identity = request_base;
+        let mut replay = GuardianReplayRequestV1::Open {
+            selector,
+            max_plaintext_bytes: maximum_plaintext_bytes,
+            max_records: 1,
+            wait_millis: 0,
+        };
+        let mut suffix = Vec::new();
+        loop {
+            let request = checkpoint_catalog_replay_request(
+                guardian,
+                mux,
+                Uuid::from_u128(request_identity),
+                pane,
+                generation,
+                replay,
+            )?;
+            request_identity += 1;
+            let observed = observe_replay_page(
+                store.apply_replay(&request, state.preflight_replay(&request)?, Some(journal))?,
+                maximum_plaintext_bytes,
+            )?;
+            suffix.extend_from_slice(&observed.output_plaintext);
+            ack_observed_replay_page(
+                store,
+                state,
+                guardian,
+                mux,
+                Uuid::from_u128(request_identity),
+                pane,
+                generation,
+                &observed,
+            )?;
+            request_identity += 1;
+            if observed.complete {
+                return Ok(suffix);
+            }
+            between_pages()?;
+            replay = GuardianReplayRequestV1::Continue {
+                cursor: observed.next_cursor.ok_or("nonterminal replay cursor")?,
+            };
+        }
+    }
+
+    /// A policy small enough that every record seals a segment, with room
+    /// for the four retained checkpoints' output and little more.
+    fn one_record_segment_policy(max_segments: usize) -> OutputSegmentPolicy {
+        OutputSegmentPolicy {
+            journal_limits: GuardianOutputJournalLimits {
+                max_record_bytes: 64,
+                max_log_bytes: 512,
+                max_records: 1,
+            },
+            max_segments,
+            max_durable_pane_bytes: 64 * 1024,
+        }
+    }
+
+    #[test]
+    fn guardian_journal_keeps_only_the_output_its_retained_checkpoints_replay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) =
+            pipeline_with_policy("ft-guardian-journal-floor-", one_record_segment_policy(8))?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0xd1100);
+        let mux = Uuid::from_u128(0xd1101);
+        let pane = Uuid::from_u128(0xd1102);
+        let generation = 1;
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
+        // Twelve captures of one record each through an eight-segment
+        // journal: without a floor the ninth record is refused.
+        let mut output = Vec::new();
+        let mut appended_after: Vec<Vec<u8>> = Vec::new();
+        for capture in 0..12_u64 {
+            let appended = format!("c{capture:02};");
+            output.extend_from_slice(appended.as_bytes());
+            for earlier in &mut appended_after {
+                earlier.extend_from_slice(appended.as_bytes());
+            }
+            appended_after.push(Vec::new());
+            checkpoint_catalog_stage_and_publish(
+                &pipeline,
+                &store,
+                &journal,
+                &mut state,
+                guardian,
+                mux,
+                pane,
+                generation,
+                capture + 1,
+                0xd1_0000 + u128::from(capture) * 0x10,
+                appended.as_bytes(),
+                &output,
+            )?;
+            let (begin, completion) = checkpoint_catalog_newest_begin(&store, pane)?;
+            store.apply_ack_from_committed_catalog(
+                GuardianCheckpointStageRequestV1::ack(
+                    begin.scope(),
+                    begin.upload_id(),
+                    begin.descriptor(),
+                    begin.chunk_bytes(),
+                    completion,
+                )?,
+                mux,
+            )?;
+            // What the runtime does after every acknowledged capture.
+            journal.release_through_sequence(store.pane_output_reclaim_floor(pane)?);
+            let authority = journal
+                .authority
+                .lock()
+                .map_err(|_| "journal authority was poisoned")?;
+            assert!(
+                authority.segments.len() <= CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS + 1,
+                "capture {capture}: {} segments",
+                authority.segments.len()
+            );
+        }
+
+        // Every retained checkpoint still replays exactly the output after it.
+        let retained = store.with_exclusive_directory(|inner| {
+            Ok(
+                checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })?
+                    .published
+                    .iter()
+                    .map(|member| {
+                        (
+                            member.metadata.checkpoint_id,
+                            member.metadata.identity.generation,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })?;
+        assert_eq!(retained.len(), CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS);
+        for (index, (checkpoint_id, catalog_generation)) in retained.iter().enumerate() {
+            let suffix = replay_output_suffix(
+                &store,
+                &state,
+                &journal,
+                guardian,
+                mux,
+                pane,
+                generation,
+                GuardianReplaySelectorV1::ExactCheckpoint {
+                    checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes(*checkpoint_id)?,
+                    capture_generation: generation,
+                },
+                0xd1_9000 + u128::try_from(index)? * 0x100,
+                &mut || Ok(()),
+            )?;
+            let capture = usize::try_from(*catalog_generation)? - 1;
+            assert_eq!(
+                suffix, appended_after[capture],
+                "member {catalog_generation}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn replay_keeps_serving_pages_after_reclamation_unlinks_what_it_pinned()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-replay-reclaimed-pin-",
+            one_record_segment_policy(8),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0xd2100);
+        let mux = Uuid::from_u128(0xd2101);
+        let pane = Uuid::from_u128(0xd2102);
+        let generation = 1;
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
+        let (checkpoint_id, _) = checkpoint_catalog_stage_and_publish(
+            &pipeline, &store, &journal, &mut state, guardian, mux, pane, generation, 1, 0xd2_0000,
+            b"base;", b"base;",
+        )?;
+        for record in [b"r1;".as_slice(), b"r2;", b"r3;"] {
+            durable_commit(&pipeline, pane, &journal, record)?;
+        }
+        // Between pages, release everything and roll the chain forward until
+        // every manifest and segment the open snapshot pinned is unlinked.
+        let mut rolled = false;
+        let suffix = replay_output_suffix(
+            &store,
+            &state,
+            &journal,
+            guardian,
+            mux,
+            pane,
+            generation,
+            GuardianReplaySelectorV1::ExactCheckpoint {
+                checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes(checkpoint_id)?,
+                capture_generation: generation,
+            },
+            0xd2_9000,
+            &mut || {
+                if !rolled {
+                    rolled = true;
+                    journal.release_through_sequence(u64::MAX);
+                    for record in [b"x1;".as_slice(), b"x2;"] {
+                        durable_commit(&pipeline, pane, &journal, record)?;
+                    }
+                    let authority = journal
+                        .authority
+                        .lock()
+                        .map_err(|_| "journal authority was poisoned")?;
+                    assert_eq!(authority.segments.len(), 1);
+                }
+                Ok(())
+            },
+        )?;
+        assert!(rolled, "the snapshot must span the reclamation");
+        assert_eq!(suffix, b"r1;r2;r3;");
         Ok(())
     }
 
