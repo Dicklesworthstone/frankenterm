@@ -139,6 +139,11 @@ struct ExecBootstrapArgs {
 #[cfg(unix)]
 fn main() -> anyhow::Result<()> {
     retain_guardian_atomic_component_identity()?;
+    // Warnings (a slow checkpoint step, say) reach the service log; the
+    // guardian never logs terminal content.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .format_timestamp_millis()
+        .init();
     let args = Cli::parse();
     match args.command {
         Command::Serve(args) => {

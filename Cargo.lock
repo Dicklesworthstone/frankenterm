@@ -4565,6 +4565,7 @@ version = "0.15.21"
 dependencies = [
  "anyhow",
  "clap",
+ "env_logger",
  "frankenterm-build-identity",
  "frankenterm-sigpipe",
  "frankenterm-term",

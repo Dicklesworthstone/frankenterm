@@ -1340,6 +1340,8 @@ fn execute_checkpoint_stage_job(
             stage.scope(),
             mux::guardian_protocol::GuardianCheckpointScopeV1::Genesis { .. }
         );
+    let kind = stage.kind();
+    let started = std::time::Instant::now();
     let reply = match stage.kind() {
         GuardianCheckpointStageKindV1::Begin => store.apply_begin(&stage),
         GuardianCheckpointStageKindV1::Chunk => store.apply_chunk(stage),
@@ -1384,6 +1386,16 @@ fn execute_checkpoint_stage_job(
             acked
         }
     };
+    // The mux waits for this reply on the pane's own connection with a 5 s
+    // I/O deadline, and a missed deadline costs the pane its lease.
+    let elapsed = started.elapsed();
+    if elapsed >= std::time::Duration::from_secs(1) {
+        log::warn!(
+            "guardian checkpoint {kind:?} took {} ms ({})",
+            elapsed.as_millis(),
+            if reply.is_ok() { "applied" } else { "refused" }
+        );
+    }
     let reply = reply.ok()?;
     job.retain_genesis_begin = retain_genesis_begin;
     GuardianResponseEnvelope::reply(&job.request, &GuardianReply::CheckpointStage(reply)).ok()

@@ -51,6 +51,11 @@ const MAX_TOTAL_OUTPUT_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const AUTHENTICATION_DEADLINE: Duration = Duration::from_secs(5);
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// A checkpoint Stage step can make the guardian authenticate and publish a
+/// whole checkpoint before it replies. A missed I/O deadline on a pane's own
+/// connection costs the pane its lease, so these steps wait as long as a
+/// whole-mux capture may take.
+const CHECKPOINT_STAGE_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const TOKEN_PUBLICATION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const TOKEN_PUBLICATION_LOCK_RETRY: Duration = Duration::from_millis(10);
 const TOKEN_STAGE_COMMIT_MAGIC: [u8; 4] = *b"FTGC";
@@ -2830,7 +2835,16 @@ impl GuardianClient {
             effect_id,
             payload,
         );
-        match self.exchange(request)? {
+        self.stream
+            .set_read_timeout(Some(CHECKPOINT_STAGE_IO_TIMEOUT))
+            .inspect_err(|error| log_client_io_failure("stage_read_timeout", error))?;
+        let exchanged = self.exchange(request);
+        // As in with_client_io_deadline: a failed exchange's error wins over
+        // a failed restoration.
+        let restored = self.stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT));
+        let reply = exchanged?;
+        restored.inspect_err(|error| log_client_io_failure("reset_read_timeout", error))?;
+        match reply {
             GuardianReply::CheckpointStage(reply) if reply.upload_id() == upload_id => Ok(reply),
             _ => Err(GuardianClientError::UnexpectedReply),
         }
