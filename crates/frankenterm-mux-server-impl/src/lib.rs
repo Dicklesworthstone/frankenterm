@@ -30026,16 +30026,22 @@ mod tests {
         ));
 
         // The same Unix entry is still a real connectable client in GUI mode.
-        // Its unsupported recovery policy must continue to refuse capture.
+        // It has no durable recovery policy, so while it hosts no pane the
+        // image leaves it out (a pane in it would refuse the capture).
         update_mux_domains(&handle)?;
         assert!(
             mux.get_domain_by_name("owned-listener")
                 .is_some_and(|domain| domain.is::<ClientDomain>())
         );
-        assert!(matches!(
-            mux.capture_topology_coherent(Default::default()),
-            Err(mux::MuxTopologyCaptureError::UnsupportedDomainPolicy)
-        ));
+        let captured = mux.capture_topology_coherent(Default::default())?;
+        assert_eq!(
+            captured
+                .domains
+                .iter()
+                .map(|domain| domain.name.as_str())
+                .collect::<Vec<_>>(),
+            ["guardian"]
+        );
         Ok(())
     }
 

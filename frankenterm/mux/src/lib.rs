@@ -21216,6 +21216,9 @@ impl Mux {
                 .as_ref()
                 .map(|registration| registration.domain_id);
             let mut captured_domains = Vec::with_capacity(domain_candidates.len());
+            // Domains with no durable policy, left out of the image while they
+            // host no pane (checked against the pane census below).
+            let mut unrecoverable_domains: Vec<(DomainId, anyhow::Error)> = Vec::new();
             let mut domain_policy_bytes = 0usize;
             for (domain_id, domain) in &domain_candidates {
                 if domain.domain_id() != *domain_id || domain.domain_name().len() > 65536 {
@@ -21231,13 +21234,21 @@ impl Mux {
                     );
                     MuxTopologyCaptureError::UnsupportedDomainPolicy
                 };
-                let policy = domain.recovery_policy(&captured_config).map_err(|error| {
-                    if error.is::<domain::DomainRecoveryPolicyBusy>() {
-                        MuxTopologyCaptureError::DomainPolicyBusy
-                    } else {
-                        refused(&error)
+                let policy = match domain.recovery_policy(&captured_config) {
+                    Ok(policy) => policy,
+                    Err(error) if error.is::<domain::DomainRecoveryPolicyBusy>() => {
+                        return Err(MuxTopologyCaptureError::DomainPolicyBusy);
                     }
-                })?;
+                    // A transport with no durable policy, such as the SSH
+                    // domains every host in ~/.ssh/config registers, is never
+                    // needed by a restore while it hosts no pane. Refusing it
+                    // disabled recovery on any mux with an SSH config.
+                    Err(error) if Some(*domain_id) != default_domain_id => {
+                        unrecoverable_domains.push((*domain_id, error));
+                        continue;
+                    }
+                    Err(error) => return Err(refused(&error)),
+                };
                 policy.validate().map_err(|error| refused(&error))?;
                 domain_policy_bytes = domain_policy_bytes
                     .checked_add(
@@ -21369,6 +21380,21 @@ impl Mux {
                 })
                 .collect();
             let domains_guard = self.domains.read().clone();
+            // A pane in a domain left out of the image could not be restored.
+            if let Some((domain_id, error)) = unrecoverable_domains.iter().find(|(domain_id, _)| {
+                panes_guard
+                    .values()
+                    .any(|registration| registration.domain_id == *domain_id)
+            }) {
+                log::warn!(
+                    "a pane's domain {:?} has no recoverable policy: {error:#}",
+                    domains_guard
+                        .get(domain_id)
+                        .map(|domain| domain.domain_name().to_owned())
+                        .unwrap_or_default()
+                );
+                return Err(MuxTopologyCaptureError::UnsupportedDomainPolicy);
+            }
 
             let mut pane_bindings = Vec::new();
             for tab in &captured_tabs {
@@ -21652,6 +21678,9 @@ impl Mux {
             // capture must be able to refuse a newly unresolved spawn.
             let mut domain_policies_current = true;
             for (domain_id, domain) in &domain_candidates {
+                if unrecoverable_domains.iter().any(|(id, _)| id == domain_id) {
+                    continue;
+                }
                 let expected = &captured_domains[captured_domains
                     .binary_search_by_key(domain_id, |domain| domain.domain_id)
                     .expect("captured domain census preserves every candidate")];

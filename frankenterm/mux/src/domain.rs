@@ -1960,6 +1960,25 @@ mod tests {
             ));
             drop(held);
             assert!(mux.capture_topology_coherent(Default::default()).is_ok());
+            // A non-default domain with no durable policy and no pane (the
+            // domain an ~/.ssh/config host registers, say) is left out of the
+            // image instead of refusing whole-mux recovery.
+            let pane_less: Arc<dyn Domain> = Arc::new(LocalDomain::new_exec_domain(ExecDomain {
+                name: "pane-less-callback".into(),
+                fixup_command: "uncaptured-function".into(),
+                label: None,
+            })?);
+            mux.add_domain(&pane_less)?;
+            let captured = mux.capture_topology_coherent(Default::default())?;
+            assert_eq!(captured.default_domain_id, Some(native.domain_id()));
+            assert_eq!(
+                captured
+                    .domains
+                    .iter()
+                    .map(|domain| domain.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["busy-backend"]
+            );
         }
         let domain = LocalDomain::new_exec_domain(ExecDomain {
             name: "callback-domain".into(),
