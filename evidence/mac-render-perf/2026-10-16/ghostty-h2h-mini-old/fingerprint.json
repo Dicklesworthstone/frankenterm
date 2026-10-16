@@ -1,0 +1,28 @@
+{
+  "system": "Darwin",
+  "kernel": "25.5.0",
+  "machine": "arm64",
+  "model": "Mac16,10",
+  "cpu": "Apple M4",
+  "ncpu": 10,
+  "performance_cores": 4,
+  "efficiency_cores": 6,
+  "memory_bytes": 34359738368,
+  "os_version": "26.5",
+  "os_build": "25F71",
+  "thermal": [
+    "Note: No thermal warning level has been recorded",
+    "Note: No performance warning level has been recorded",
+    "Note: No CPU power status has been recorded"
+  ],
+  "load_avg": [
+    2.7,
+    5.35,
+    4.6
+  ],
+  "hyperfine": "hyperfine 1.20.0",
+  "zig": "0.16.0",
+  "rustc": "rustc 1.100.0-nightly (908501772 2026-08-30)",
+  "macos_sdk": null,
+  "python": "3.14.6"
+}

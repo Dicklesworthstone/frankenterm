@@ -1379,13 +1379,35 @@ enum GroundRun<'a> {
 /// still holds for every later byte up to it. Without the cache, each run
 /// cut short by malformed UTF-8 would scan the rest of the input again,
 /// which is quadratic on long input with no controls in it.
+///
+/// It also holds the input's longest valid UTF-8 prefix, validated once on
+/// first use: a run inside it is a `&str` slice of it, with no
+/// `core::str::from_utf8` call per run. On a raw `seq` flood (an ASCII run
+/// of a few digits per line) that call was 8% of the parse (ft-yccm0.3.2.6).
 #[derive(Default)]
-struct RunExtents {
+struct RunExtents<'a> {
     control: Option<usize>,
     c1: Option<usize>,
+    valid: Option<&'a str>,
 }
 
-impl RunExtents {
+impl<'a> RunExtents<'a> {
+    /// `bytes[start..end]` as a `&str`, when it lies in the input's valid
+    /// UTF-8 prefix on character boundaries; `None` otherwise. `bytes` is
+    /// the whole input of this parse call, as for the other positions.
+    #[inline]
+    fn text(&mut self, bytes: &'a [u8], start: usize, end: usize) -> Option<&'a str> {
+        let valid = *self
+            .valid
+            .get_or_insert_with(|| match core::str::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(error) => {
+                    core::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap_or_default()
+                }
+            });
+        valid.get(start..end)
+    }
+
     /// The first control or DEL at or after `from`, or the input's length.
     #[inline]
     fn control_from(&mut self, bytes: &[u8], from: usize, scan: AsciiScan) -> usize {
@@ -1428,7 +1450,7 @@ fn ground_run<'a>(
     start: usize,
     scan: AsciiScan,
     simd_utf8: bool,
-    extents: &mut RunExtents,
+    extents: &mut RunExtents<'a>,
 ) -> GroundRun<'a> {
     if simd_utf8 {
         ground_run_bulk(bytes, start, scan, extents)
@@ -1480,11 +1502,11 @@ fn ground_run_bulk<'a>(
     bytes: &'a [u8],
     start: usize,
     scan: AsciiScan,
-    extents: &mut RunExtents,
+    extents: &mut RunExtents<'a>,
 ) -> GroundRun<'a> {
     let ascii_end = start + ascii_stretch(bytes, start, scan);
     if bytes.get(ascii_end).is_none_or(|&next| next < 0x80) {
-        return ascii_run(&bytes[start..ascii_end]);
+        return ascii_run(bytes, start, ascii_end, extents);
     }
     if ascii_end == start {
         let Some((c, len)) = decode_utf8_char(&bytes[start..]) else {
@@ -1502,9 +1524,12 @@ fn ground_run_bulk<'a>(
         .control_from(bytes, ascii_end, scan)
         .min(extents.c1_from(bytes, ascii_end, scan));
     let candidate = &bytes[start..limit];
-    let text = match core::str::from_utf8(candidate) {
-        Ok(text) => Some(text),
-        Err(error) => core::str::from_utf8(&candidate[..error.valid_up_to()]).ok(),
+    let text = match extents.text(bytes, start, limit) {
+        Some(text) => Some(text),
+        None => match core::str::from_utf8(candidate) {
+            Ok(text) => Some(text),
+            Err(error) => core::str::from_utf8(&candidate[..error.valid_up_to()]).ok(),
+        },
     };
     let Some(text) = text else {
         return GroundRun::None;
@@ -1520,16 +1545,24 @@ fn ground_run_bulk<'a>(
     }
 }
 
-/// A run of printable ASCII.
+/// The run of printable ASCII `bytes[start..end]`.
 #[inline]
-fn ascii_run(run: &[u8]) -> GroundRun<'_> {
-    match run {
+fn ascii_run<'a>(
+    bytes: &'a [u8],
+    start: usize,
+    end: usize,
+    extents: &mut RunExtents<'a>,
+) -> GroundRun<'a> {
+    match &bytes[start..end] {
         [] => GroundRun::None,
         [byte] => GroundRun::One(char::from(*byte), 1),
-        _ => core::str::from_utf8(run).map_or(GroundRun::None, |text| GroundRun::Text {
-            text,
-            ascii: true,
-        }),
+        run => extents
+            .text(bytes, start, end)
+            .or_else(|| core::str::from_utf8(run).ok())
+            .map_or(GroundRun::None, |text| GroundRun::Text {
+                text,
+                ascii: true,
+            }),
     }
 }
 

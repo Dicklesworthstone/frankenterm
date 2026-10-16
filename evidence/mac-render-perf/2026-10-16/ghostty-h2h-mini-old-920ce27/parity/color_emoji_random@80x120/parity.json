@@ -1,0 +1,35 @@
+{
+  "schema": "ft.bench.ghostty-h2h-parity.v1",
+  "geometry": {
+    "rows": 80,
+    "cols": 120
+  },
+  "line_feeds": 0,
+  "ghostty": {
+    "cursor_x": 86,
+    "cursor_y": 79,
+    "pending_wrap": false,
+    "total_rows": 39433,
+    "written_rows": 39433,
+    "wraps": 39432,
+    "wrap_flagged_rows": 39432,
+    "bench_equivalent_total_rows": 625
+  },
+  "frankenterm": {
+    "cursor_x": 7,
+    "cursor_y": 79,
+    "retained_rows": 39296,
+    "written_rows": 39296,
+    "wraps": 39295,
+    "scrollback": 79186,
+    "state_fingerprint": "abca75ac5ff66239",
+    "sanity": "ok"
+  },
+  "ghostty_wrap_flags_consistent": true,
+  "agree": false,
+  "disagreements": [
+    "rows written: ghostty 39433, frankenterm 39296 (wraps 39432 vs 39295)",
+    "final cursor column: ghostty 86, frankenterm 7"
+  ],
+  "corpus": "color_emoji_random"
+}

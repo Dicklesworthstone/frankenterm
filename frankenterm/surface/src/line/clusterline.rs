@@ -208,6 +208,30 @@ fn zero_whole_allocation(bytes: &mut Vec<u8>) {
     tail.zeroize();
 }
 
+/// Volatile-zero `bytes`, eight bytes per store where alignment allows.
+fn zero_bytes(bytes: &mut [u8]) {
+    let (head, words, tail) = bytemuck::pod_align_to_mut::<u8, u64>(bytes);
+    head.zeroize();
+    words.zeroize();
+    tail.zeroize();
+}
+
+/// Zero the bytes `text` holds with volatile stores and leave it empty with
+/// the same allocation, for a row that is reused (see
+/// [`ClusteredLine::reset_for_reuse`]). The spare capacity of a row's text
+/// never held that row's text: the text only grows by appending, its one
+/// shrink pops a trailing space, and growing wipes the buffer it leaves.
+/// Dropping the row still zeroes the whole allocation
+/// ([`wipe_text_allocation`]). Zeroing only the bytes in use skips filling
+/// the spare capacity and then storing zeros over it again, which was about
+/// a sixth of a `seq` flood's parse time (ft-yccm0.3.2.6).
+fn wipe_text_in_use(text: &mut String) {
+    let mut bytes = core::mem::take(text).into_bytes();
+    zero_bytes(&mut bytes);
+    bytes.clear();
+    *text = String::from_utf8(bytes).unwrap_or_default();
+}
+
 fn guarded_push_str(target: &mut String, fragment: &str) {
     guarded_reserve_text(target, fragment.len());
     target.push_str(fragment);
@@ -832,9 +856,17 @@ impl ClusteredLine {
         if count == 0 {
             return;
         }
+        // A gap filled one char at a time was the largest single cost of a
+        // raw `seq` flood, whose lines start where the last one ended.
+        const SPACES: &str = "                                                                ";
         guarded_reserve_text(&mut self.text, count);
         self.extend_clusters(count, &CellAttributes::blank());
-        self.text.extend(core::iter::repeat_n(' ', count));
+        let mut left = count;
+        while left > 0 {
+            let take = left.min(SPACES.len());
+            self.text.push_str(&SPACES[..take]);
+            left -= take;
+        }
         self.last_cell_width = NonZeroU8::new(1);
         self.len = self.len.saturating_add(count.min(u32::MAX as usize) as u32);
     }
@@ -1017,10 +1049,11 @@ impl ClusteredLine {
     }
 
     /// Return this row to the state of [`ClusteredLine::new`] while keeping
-    /// its text and cluster allocations. The old text is wiped first, exactly
-    /// as dropping the row would.
+    /// its text and cluster allocations. Every byte of the old text is wiped
+    /// first; the spare capacity, which never held it, is left to the wipe
+    /// that dropping the row does ([`wipe_text_in_use`]).
     pub(crate) fn reset_for_reuse(&mut self) {
-        self.wipe_owned_text();
+        wipe_text_in_use(&mut self.text);
         self.is_double_wide = None;
         self.clusters.clear();
         self.len = 0;
@@ -1409,6 +1442,39 @@ mod test {
                 len
             );
         }
+    }
+
+    #[test]
+    fn in_use_zeroing_covers_every_used_byte_at_any_alignment() {
+        // Lengths around the 8-byte word boundary, from offsets 0..8 so the
+        // unaligned head and tail are both exercised.
+        let mut backing = vec![b'x'; 300];
+        for offset in 0..8 {
+            for len in [0usize, 1, 7, 8, 9, 15, 16, 17, 63, 64, 65, 200] {
+                backing.fill(b'x');
+                zero_bytes(&mut backing[offset..offset + len]);
+                assert!(
+                    backing[offset..offset + len].iter().all(|byte| *byte == 0),
+                    "offset {} len {}: text survived",
+                    offset,
+                    len
+                );
+                assert!(
+                    backing[..offset].iter().all(|byte| *byte == b'x')
+                        && backing[offset + len..].iter().all(|byte| *byte == b'x'),
+                    "offset {} len {}: wrote outside the bytes in use",
+                    offset,
+                    len
+                );
+            }
+        }
+        let mut text = String::with_capacity(37);
+        text.push_str("semantic terminal text");
+        let (capacity, address) = (text.capacity(), text.as_ptr());
+        wipe_text_in_use(&mut text);
+        assert!(text.is_empty());
+        assert_eq!(text.capacity(), capacity);
+        assert_eq!(text.as_ptr(), address);
     }
 
     #[test]
