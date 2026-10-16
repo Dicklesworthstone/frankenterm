@@ -145,9 +145,14 @@ const CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_RECORD_BYTES: u64 =
 const CHECKPOINT_CATALOG_RESTORE_BINDING_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-catalog-restore-binding.v1\0";
 const CHECKPOINT_CATALOG_MAX_PUBLISHED_MEMBERS: usize = 8;
-/// Pane members a publication keeps: the newest few, so both of the mux's
-/// recovery roots and a capture still in flight name members that exist.
-const CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS: usize = 4;
+/// Pane members a publication keeps: both of the mux's retained recovery
+/// roots must still name members that exist, and every capture that
+/// published a member but failed before its whole-mux commit adds one the
+/// guardian cannot tell apart (each is acknowledged before that commit). The
+/// newest 8 survive 5 such failures in a row; at 4, two failures on a busy
+/// guardian reclaimed the older root's member and the mux's recovery store
+/// rejected its own committed graph for good.
+const CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS: usize = CHECKPOINT_CATALOG_MAX_PUBLISHED_MEMBERS;
 const _: () = assert!(
     CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS > 1
         && CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS <= CHECKPOINT_CATALOG_MAX_PUBLISHED_MEMBERS
