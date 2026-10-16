@@ -51,7 +51,10 @@ STATE=$HOME/.local/state/frankenterm-guardian-e2e
 RUN=$XDG_RUNTIME_DIR/frankenterm-guardian-e2e
 [ "$(uname -s)" = Darwin ] && RUN=$STATE/run
 MARK="FTGX_MARK_$$"
-mkdir -p "$XDG_CONFIG_HOME/frankenterm"
+mkdir -p "$XDG_CONFIG_HOME/frankenterm" "$HOME/.ssh"
+# Real hosts have an SSH config, and the mux registers a domain per host in
+# it; those domains must not stop recovery (they once disabled it for good).
+printf 'Host ftgx-e2e-planted-host\n  HostName 127.0.0.1\n' > "$HOME/.ssh/config"
 BURST=""
 [ "$SOAK" -gt 0 ] && BURST="j=0; while [ \$j -lt 3000 ]; do echo burst \$j; j=\$((j+1)); sleep 0.002; done; "
 cat > "$XDG_CONFIG_HOME/frankenterm/mux-server-e2e.toml" <<TOML
