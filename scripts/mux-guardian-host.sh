@@ -214,10 +214,13 @@ guardian_probe() {  # prints "ready <panes>" or "down"; logs why when down
   echo down
 }
 
-wait_guardian_ready() {  # <timeout secs>
-  local deadline=$(( $(date +%s) + $1 ))
+wait_guardian_ready() {  # <timeout secs>; prints the first "ready <panes>" probe
+  # Callers use this probe's pane count: a second probe right after it can
+  # meet the guardian busy again and fail.
+  local deadline=$(( $(date +%s) + $1 )) probe
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    case $(guardian_probe) in ready*) return 0 ;; esac
+    probe=$(guardian_probe)
+    case $probe in ready*) echo "$probe"; return 0 ;; esac
     sleep 1
   done
   return 1
@@ -252,9 +255,8 @@ mux_args() {  # common mux flags, one per line
 }
 
 run_mux() {
-  wait_guardian_ready 60 || die "guardian not ready at $GUARDIAN_SOCK"
   local probe panes args=()
-  probe=$(guardian_probe)
+  probe=$(wait_guardian_ready 60) || die "guardian not ready at $GUARDIAN_SOCK"
   case "$probe" in ready\ [0-9]*) ;; *) die "guardian not ready at $GUARDIAN_SOCK" ;; esac
   panes=$(echo "$probe" | awk '{print $2}')
   while IFS= read -r a; do args+=("$a"); done < <(mux_args)
@@ -567,7 +569,7 @@ cmd_install() {
   svc_active pty-broker || svc_start pty-broker
   for _ in $(seq 30); do [ -S "$BROKER_SOCK" ] && break; sleep 1; done
   svc_active pty-guardian || svc_start pty-guardian
-  wait_guardian_ready 60 || die "guardian did not become ready; see logs"
+  wait_guardian_ready 60 >/dev/null || die "guardian did not become ready; see logs"
   if svc_active mux-server; then
     log "mux already running"
   else
@@ -613,9 +615,8 @@ cmd_upgrade() {
 
   svc_active mux-server || die "mux is not running; refusing to upgrade a stopped mux"
   # A guardian busy with checkpoints and replay closes probes retryably.
-  wait_guardian_ready 60 || die "guardian is not ready; refusing"
   local probe panes ids children
-  probe=$(guardian_probe)
+  probe=$(wait_guardian_ready 60) || die "guardian is not ready; refusing"
   case "$probe" in ready\ [0-9]*) ;; *) die "guardian is not ready; refusing" ;; esac
   panes=$(echo "$probe" | awk '{print $2}')
   ids=$(mux_pane_ids)
@@ -658,8 +659,7 @@ cmd_rollback() {
   [ -n "$prev" ] || die "no previous mux family recorded"
   local cur probe panes ids children
   cur=$(readlink "$BASE/mux-current")
-  wait_guardian_ready 60 || die "guardian is not ready; refusing"
-  probe=$(guardian_probe)
+  probe=$(wait_guardian_ready 60) || die "guardian is not ready; refusing"
   case "$probe" in ready\ [0-9]*) ;; *) die "guardian is not ready; refusing" ;; esac
   panes=$(echo "$probe" | awk '{print $2}')
   ids=$(mux_pane_ids)

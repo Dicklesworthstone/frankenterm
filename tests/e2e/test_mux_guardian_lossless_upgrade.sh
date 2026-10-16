@@ -79,7 +79,8 @@ check_history() {
     fail "history after $1: first=$first last=$last rows=$n duplicated=$dups"
   fi
   [ "$SOAK" -gt 0 ] || return 0
-  b=$(echo "$text" | grep -E '^burst [0-9]+ *$' | awk '{print $2}' | sort -n)
+  # get-text is JSON: rows are joined by escaped newlines, so match unanchored.
+  b=$(echo "$text" | grep -o 'burst [0-9]*' | awk '{print $2}' | sort -n)
   bn=$(echo "$b" | grep -c .); bdups=$(echo "$b" | uniq -d | grep -c .)
   bfirst=$(echo "$b" | head -1)
   if [ "$bn" -ge 1 ] && [ "$bdups" = 0 ] && [ "$(echo "$b" | tail -1)" = 2999 ] \
