@@ -155,8 +155,8 @@ pub enum WholeMuxCaptureError {
     CaptureDeadline,
     #[error("model capture exceeds the retained checkpoint byte limit")]
     CaptureByteLimit,
-    #[error("mux topology, pane registration, or terminal model changed during capture")]
-    StaleCapture,
+    #[error("mux topology, pane registration, or terminal model changed during capture: {0}")]
+    StaleCapture(&'static str),
     #[error("capture capability context stopped")]
     Context(#[from] SnapshotError),
     #[error("coherent mux topology capture failed")]
@@ -182,6 +182,36 @@ pub enum WholeMuxCaptureError {
 enum CapturedPaneCheckpoint {
     Model(mux::ModelParserCheckpointAck),
     Guardian(Box<mux::guardian_checkpoint::PublishedGuardianCheckpoint>),
+}
+
+/// The first part of a topology recheck that differs from the capture, if any.
+#[cfg(feature = "frankenterm-deps")]
+fn topology_change(
+    captured: &mux::MuxCapturedTopology,
+    rechecked: &mux::MuxCapturedTopology,
+) -> Option<&'static str> {
+    if captured.session_incarnation != rechecked.session_incarnation {
+        Some("mux incarnation changed during capture")
+    } else if captured.topology_revision != rechecked.topology_revision {
+        Some("topology revision changed during capture")
+    } else if captured.domains != rechecked.domains
+        || captured.default_domain_id != rechecked.default_domain_id
+    {
+        Some("domains changed during capture")
+    } else if captured.windows != rechecked.windows {
+        Some("windows changed during capture")
+    } else if captured.tabs != rechecked.tabs {
+        Some("tabs changed during capture")
+    } else if !pane_bindings_agree(&captured.pane_bindings, &rechecked.pane_bindings) {
+        Some("pane bindings changed during capture")
+    } else if captured.workspaces != rechecked.workspaces
+        || captured.client_workspace != rechecked.client_workspace
+        || captured.default_workspace != rechecked.default_workspace
+    {
+        Some("workspaces changed during capture")
+    } else {
+        None
+    }
 }
 
 /// Whether a topology recheck still names the same panes in the same places.
@@ -290,7 +320,9 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
     };
     let captured = mux.capture_topology_coherent(config)?;
     if hex::encode(captured.session_incarnation.as_bytes()) != expected.mux_incarnation_id {
-        return Err(WholeMuxCaptureError::StaleCapture);
+        return Err(WholeMuxCaptureError::StaleCapture(
+            "mux incarnation differs from the publication identity",
+        ));
     }
     let mut checkpoints = Vec::with_capacity(captured.pane_bindings.len());
     let mut total_bytes = 0usize;
@@ -328,7 +360,9 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
                 if let Some(live_err) = source.downcast_ref::<mux::LiveParserCheckpointError>() {
                     match live_err {
                         mux::LiveParserCheckpointError::StaleRegistration => {
-                            WholeMuxCaptureError::StaleCapture
+                            WholeMuxCaptureError::StaleCapture(
+                                "guardian pane registration changed during its checkpoint",
+                            )
                         }
                         mux::LiveParserCheckpointError::CheckpointBusy
                         | mux::LiveParserCheckpointError::GuardianDeliveryBusy => {
@@ -350,7 +384,9 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
             if capture.registration_wire_identity() != pane.registration_wire_identity
                 || capture.durable_pane_id().to_string() != pane.pane_uuid
             {
-                return Err(WholeMuxCaptureError::StaleCapture);
+                return Err(WholeMuxCaptureError::StaleCapture(
+                    "guardian checkpoint names another registration",
+                ));
             }
             total_bytes = total_bytes
                 .checked_add(capture.terminal_checkpoint().canonical_payload().len())
@@ -379,7 +415,9 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
             snapshot_cx_checkpoint(cx)?;
             let ack = result.map_err(|source| match source {
                 mux::LiveParserCheckpointError::StaleRegistration => {
-                    WholeMuxCaptureError::StaleCapture
+                    WholeMuxCaptureError::StaleCapture(
+                        "pane registration changed during its checkpoint",
+                    )
                 }
                 mux::LiveParserCheckpointError::CheckpointBusy => WholeMuxCaptureError::Busy,
                 source => WholeMuxCaptureError::Pane {
@@ -390,7 +428,9 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
             if ack.registration_wire_identity != pane.registration_wire_identity
                 || ack.durable_pane_id.to_string() != pane.pane_uuid
             {
-                return Err(WholeMuxCaptureError::StaleCapture);
+                return Err(WholeMuxCaptureError::StaleCapture(
+                    "model checkpoint names another registration",
+                ));
             }
             total_bytes = total_bytes
                 .checked_add(ack.terminal_checkpoint.canonical_payload().len())
@@ -423,22 +463,17 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
             }
         };
         if !is_current {
-            return Err(WholeMuxCaptureError::StaleCapture);
+            return Err(WholeMuxCaptureError::StaleCapture(match checkpoint {
+                CapturedPaneCheckpoint::Model(_) => "a model pane changed after its checkpoint",
+                CapturedPaneCheckpoint::Guardian(_) => {
+                    "a guardian pane's registration or lease changed after its checkpoint"
+                }
+            }));
         }
     }
     let rechecked = mux.capture_topology_coherent(config)?;
-    if captured.session_incarnation != rechecked.session_incarnation
-        || captured.topology_revision != rechecked.topology_revision
-        || captured.domains != rechecked.domains
-        || captured.default_domain_id != rechecked.default_domain_id
-        || captured.windows != rechecked.windows
-        || captured.tabs != rechecked.tabs
-        || !pane_bindings_agree(&captured.pane_bindings, &rechecked.pane_bindings)
-        || captured.workspaces != rechecked.workspaces
-        || captured.client_workspace != rechecked.client_workspace
-        || captured.default_workspace != rechecked.default_workspace
-    {
-        return Err(WholeMuxCaptureError::StaleCapture);
+    if let Some(changed) = topology_change(&captured, &rechecked) {
+        return Err(WholeMuxCaptureError::StaleCapture(changed));
     }
     snapshot_cx_checkpoint(cx)?;
     if Instant::now() >= deadline {
@@ -13538,7 +13573,9 @@ mod tests {
                 &expected,
                 Duration::from_secs(1),
             ),
-            Err(WholeMuxCaptureError::StaleCapture)
+            Err(WholeMuxCaptureError::StaleCapture(
+                "mux incarnation differs from the publication identity"
+            ))
         ));
         assert!(!authority.in_progress.load(Ordering::Acquire));
         assert!(!authority.reconciliation_is_required());
@@ -13662,7 +13699,12 @@ mod tests {
         );
         assert!(reached_boundary.get());
         assert!(
-            matches!(result, Err(WholeMuxCaptureError::StaleCapture)),
+            matches!(
+                result,
+                Err(WholeMuxCaptureError::StaleCapture(
+                    "domains changed during capture"
+                ))
+            ),
             "{result:?}"
         );
         assert!(store.inspect_root_candidates().unwrap().0.is_empty());
@@ -13780,7 +13822,12 @@ mod tests {
             "capture must reach the actual ACK boundary"
         );
         assert!(
-            matches!(changed, Err(WholeMuxCaptureError::StaleCapture)),
+            matches!(
+                changed,
+                Err(WholeMuxCaptureError::StaleCapture(
+                    "a model pane changed after its checkpoint"
+                ))
+            ),
             "{changed:?}"
         );
         assert_eq!(owned.pane.get_title(), "A");
