@@ -21809,6 +21809,54 @@ impl Mux {
         })
     }
 
+    /// Whether a guardian checkpoint still belongs to the exact pane
+    /// registration and guardian lease it was captured from, so a recovery
+    /// image may name it. Unlike `guardian_checkpoint_is_current` it admits
+    /// output parsed after the checkpoint: the guardian journal holds every
+    /// byte after its boundary and a restore replays them, so a guardian pane
+    /// needs no common cut with the rest of the mux. A pane that never stops
+    /// printing could otherwise never be part of a published image.
+    pub fn guardian_checkpoint_is_restorable(
+        &self,
+        pane_id: PaneId,
+        published: &crate::guardian_checkpoint::PublishedGuardianCheckpoint,
+    ) -> bool {
+        let capture = published.capture();
+        let current = {
+            let panes = self.panes.read();
+            let Some(registered) = panes.get(&pane_id) else {
+                return false;
+            };
+            (
+                Arc::clone(&registered.pane),
+                Arc::clone(&registered.generation),
+            )
+        };
+        if current.1.wire_identity != capture.registration_wire_identity()
+            || current.0.durable_pane_id() != Some(*capture.durable_pane_id().as_bytes())
+        {
+            return false;
+        }
+        let Some(local) = current.0.downcast_ref::<crate::localpane::LocalPane>() else {
+            return false;
+        };
+        if local.guardian_lease_identity() != Some(published.owner()) {
+            return false;
+        }
+        {
+            let state = current.1.live_parser_checkpoint.state.lock();
+            if state.dead || state.poison.is_some() || !state.attached || !state.guardian_mode {
+                return false;
+            }
+        }
+        let _registration = self.pane_registration.lock();
+        let panes = self.panes.read();
+        panes.get(&pane_id).is_some_and(|registered| {
+            Arc::ptr_eq(&current.0, &registered.pane)
+                && Arc::ptr_eq(&current.1, &registered.generation)
+        })
+    }
+
     /// Recheck an exact guardian checkpoint contribution without mutating the terminal
     /// or blocking behind terminal I/O.
     ///

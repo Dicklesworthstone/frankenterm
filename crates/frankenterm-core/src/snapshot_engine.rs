@@ -184,6 +184,29 @@ enum CapturedPaneCheckpoint {
     Guardian(Box<mux::guardian_checkpoint::PublishedGuardianCheckpoint>),
 }
 
+/// Whether a topology recheck still names the same panes in the same places.
+/// A guardian pane's title, directory, cursor and screen are left out: they
+/// change with every byte it prints, the recovery image takes them from that
+/// pane's own checkpoint, and its journal replays everything after it.
+#[cfg(feature = "frankenterm-deps")]
+fn pane_bindings_agree(
+    captured: &[mux::MuxCapturedPaneBinding],
+    rechecked: &[mux::MuxCapturedPaneBinding],
+) -> bool {
+    captured.len() == rechecked.len()
+        && captured.iter().zip(rechecked).all(|(before, after)| {
+            if before.spawn_custody.is_none() {
+                return before == after;
+            }
+            let mut after = after.clone();
+            after.title.clone_from(&before.title);
+            after.cwd.clone_from(&before.cwd);
+            after.cursor_pos = before.cursor_pos;
+            after.alt_screen_active = before.alt_screen_active;
+            *before == after
+        })
+}
+
 /// Capture actual mux/parser state and publish an encrypted offline recovery image.
 ///
 /// Run on an owned blocking worker, never a mux or readiness thread. There is
@@ -384,7 +407,11 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
     }
     // Every checkpoint precedes every validation read. Unchanged monotonic
     // witnesses establish a common cut between those two passes; equal visible
-    // state alone would incorrectly admit an A -> B -> A change.
+    // state alone would incorrectly admit an A -> B -> A change. A guardian
+    // pane needs no common cut: its journal holds every byte after its
+    // checkpoint and a restore replays them, so it must only still be the same
+    // registration under the same lease. Otherwise a pane that keeps printing
+    // could never be part of a published image.
     for (pane, checkpoint) in captured.pane_bindings.iter().zip(&checkpoints) {
         snapshot_cx_checkpoint(cx)?;
         let is_current = match checkpoint {
@@ -392,7 +419,7 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
                 mux.model_checkpoint_is_current(pane.pane_id, ack)
             }
             CapturedPaneCheckpoint::Guardian(published) => {
-                mux.guardian_checkpoint_is_current(pane.pane_id, published)
+                mux.guardian_checkpoint_is_restorable(pane.pane_id, published)
             }
         };
         if !is_current {
@@ -406,7 +433,7 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
         || captured.default_domain_id != rechecked.default_domain_id
         || captured.windows != rechecked.windows
         || captured.tabs != rechecked.tabs
-        || captured.pane_bindings != rechecked.pane_bindings
+        || !pane_bindings_agree(&captured.pane_bindings, &rechecked.pane_bindings)
         || captured.workspaces != rechecked.workspaces
         || captured.client_workspace != rechecked.client_workspace
         || captured.default_workspace != rechecked.default_workspace
@@ -24215,5 +24242,84 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
         saturating_telemetry_add(&counter, 1);
         assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[cfg(feature = "frankenterm-deps")]
+    #[test]
+    fn a_printing_guardian_pane_keeps_its_topology_cut_but_a_model_pane_does_not() {
+        let size = frankenterm_term::TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 640,
+            pixel_height: 384,
+            dpi: 96,
+        };
+        let binding = |spawn_custody| mux::MuxCapturedPaneBinding {
+            pane_id: 1,
+            pane_uuid: uuid::Uuid::from_u128(1).to_string(),
+            spawn_custody,
+            registration_wire_identity: [7; 16],
+            domain_id: 0,
+            domain_name: "local".into(),
+            window_id: 0,
+            tab_id: 0,
+            lane: mux::MuxCapturedPaneLane::Tiled,
+            title: "before".into(),
+            cwd: Some("/before".into()),
+            size,
+            alt_screen_active: false,
+            cursor_pos: (0, 1),
+            is_active_in_tab: true,
+            is_zoomed_in_tab: false,
+        };
+        let provenance = mux::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1 {
+            original: mux::guardian_checkpoint::GuardianSpawnCustodyScopeV1 {
+                broker_lineage: uuid::Uuid::from_u128(11),
+                guardian_incarnation: uuid::Uuid::from_u128(12),
+                mux_incarnation: uuid::Uuid::from_u128(13),
+                broker_build: [0; 32],
+                guardian_build: [0; 32],
+                mux_build: [0; 32],
+                pane_id: uuid::Uuid::from_u128(1),
+                effect_id: uuid::Uuid::from_u128(14),
+            },
+            current_mux_incarnation: uuid::Uuid::from_u128(13),
+            current_lease_generation: 1,
+            acknowledged_successor: None,
+        };
+        // What printing changes: title, directory, cursor and screen.
+        let printed = |mut pane: mux::MuxCapturedPaneBinding| {
+            pane.title = "after".into();
+            pane.cwd = Some("/after".into());
+            pane.cursor_pos = (5, 9);
+            pane.alt_screen_active = true;
+            pane
+        };
+
+        let guardian = binding(Some(provenance));
+        assert!(pane_bindings_agree(
+            std::slice::from_ref(&guardian),
+            &[printed(guardian.clone())]
+        ));
+        let model = binding(None);
+        assert!(!pane_bindings_agree(
+            std::slice::from_ref(&model),
+            &[printed(model.clone())]
+        ));
+
+        // A resize or a move is structural for every pane.
+        let mut resized = guardian.clone();
+        resized.size.cols = 120;
+        assert!(!pane_bindings_agree(
+            std::slice::from_ref(&guardian),
+            &[resized]
+        ));
+        let mut moved = guardian.clone();
+        moved.tab_id = 3;
+        assert!(!pane_bindings_agree(
+            std::slice::from_ref(&guardian),
+            &[moved]
+        ));
+        assert!(!pane_bindings_agree(std::slice::from_ref(&guardian), &[]));
     }
 }

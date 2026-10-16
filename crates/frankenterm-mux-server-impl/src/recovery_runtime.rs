@@ -61,6 +61,19 @@ pub struct RecoveryOptions {
     pub recovery_timeout_seconds: Option<u64>,
 }
 
+/// One error and every cause beneath it, colon separated. Capture errors
+/// carry identities and reasons, never pane content.
+fn recovery_error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
 fn parse_identity(value: &str) -> Result<[u8; 32], String> {
     let mut identity = [0; 32];
     hex::decode_to_slice(value, &mut identity).map_err(|_| "expected 64 hex digits".to_owned())?;
@@ -575,6 +588,18 @@ impl PeriodicRecovery {
             #[cfg(test)]
             if let Err(error) = &outcome {
                 eprintln!("periodic recovery test capture failed: {error:?}");
+            }
+            // The outcome below is only a label; operators need the cause.
+            if let Err(error) = &outcome
+                && !matches!(
+                    error,
+                    WholeMuxCaptureError::Busy | WholeMuxCaptureError::Context(_)
+                )
+            {
+                log::warn!(
+                    "mux periodic recovery capture failed: {}",
+                    recovery_error_chain(error)
+                );
             }
             let (published_generation, error, terminal) = match outcome {
                 Ok(receipt) => {

@@ -8954,6 +8954,14 @@ mod tests {
             !mux.guardian_checkpoint_is_current(pane_id, &quiet),
             "quiet capture before child output must be stale (detected ABA/mutation)"
         );
+        // Stale for a common cut, yet still this registration's checkpoint
+        // under this lease: its journal replays the output that followed, so a
+        // recovery image may name it.
+        assert!(
+            mux.guardian_checkpoint_is_restorable(pane_id, &quiet),
+            "output after a guardian checkpoint must not make it unrestorable"
+        );
+        assert!(mux.guardian_checkpoint_is_restorable(pane_id, &published));
         drop(quiet);
         let captured = mux.capture_topology_coherent(Default::default()).unwrap();
         assert_eq!(captured.pane_bindings.len(), 1);
@@ -9533,6 +9541,10 @@ mod tests {
             !mux.guardian_checkpoint_is_current(pane_id, &published),
             "predecessor registration was detached; must be stale on predecessor mux"
         );
+        assert!(
+            !mux.guardian_checkpoint_is_restorable(pane_id, &published),
+            "a detached registration's checkpoint must not be restorable"
+        );
 
         assert!(
             successor_mux.guardian_checkpoint_is_current(successor_pane.pane_id(), &gen2_published),
@@ -9543,6 +9555,14 @@ mod tests {
         assert!(
             !successor_mux.guardian_checkpoint_is_current(unknown_pane_id, &gen2_published),
             "unknown pane ID must reject guardian checkpoint"
+        );
+        assert!(
+            !successor_mux.guardian_checkpoint_is_restorable(unknown_pane_id, &gen2_published),
+            "unknown pane ID must not restore a guardian checkpoint"
+        );
+        assert!(
+            successor_mux
+                .guardian_checkpoint_is_restorable(successor_pane.pane_id(), &gen2_published)
         );
 
         // A real model-only capture must not acquire guardian authority merely
@@ -9576,6 +9596,10 @@ mod tests {
         assert!(
             !successor_mux.guardian_checkpoint_is_current(successor_pane.pane_id(), &published),
             "predecessor gen1 capture must not be current under successor mux (lease/incarnation mismatch)"
+        );
+        assert!(
+            !successor_mux.guardian_checkpoint_is_restorable(successor_pane.pane_id(), &published),
+            "a predecessor lease's capture must not be restorable under the successor"
         );
 
         // Deterministic cancellation during live guardian wait blocked on live parser
