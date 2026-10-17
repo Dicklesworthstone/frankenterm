@@ -1,0 +1,45 @@
+#!/bin/sh
+# Fake zig for scripts/test_ghostty_headless_h2h.sh (ft-yccm0.1.3).
+# `version` prints $FAKE_ZIG_VERSION (default 0.16.0). `build` installs the
+# fake ghostty-bench (run from the Ghostty checkout) or the fake width probe
+# (run from the probe tree, whose build.zig.zon must point at the checkout)
+# into --prefix, and logs each build to $FAKE_LOG.
+set -eu
+
+case "${1:-}" in
+    version)
+        echo "${FAKE_ZIG_VERSION:-0.16.0}"
+        ;;
+    build)
+        shift
+        args="$*"
+        prefix=""
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --prefix) prefix="$2"; shift 2 ;;
+                --cache-dir) mkdir -p "$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        [ -n "$prefix" ] || { echo "fake zig: no --prefix" >&2; exit 2; }
+        mkdir -p "$prefix/bin"
+        if grep -q ghostty_h2h_probe build.zig.zon 2>/dev/null; then
+            dep="$(sed -n 's/^.*\.ghostty = \.{ \.path = "\(.*\)" },.*$/\1/p' build.zig.zon)"
+            [ -f "$dep/build.zig.zon" ] || { echo "fake zig: probe dependency path '$dep' is not the checkout" >&2; exit 1; }
+            echo "probe $PWD" >>"$FAKE_LOG"
+            cp "$FAKE_BIN_DIR/fake-probe" "$prefix/bin/ghostty-h2h-probe"
+        else
+            [ -f build.zig.zon ] || { echo "fake zig: not in the Ghostty checkout" >&2; exit 1; }
+            echo "bench $PWD $args" >>"$FAKE_LOG"
+            cp "$FAKE_BIN_DIR/fake-ghostty-bench" "$prefix/bin/ghostty-bench"
+            if [ -n "${FAKE_ZIG_WRITE_IGNORED:-}" ]; then
+                mkdir -p .zig-cache
+                echo cache >.zig-cache/fake
+            fi
+        fi
+        ;;
+    *)
+        echo "fake zig: unsupported command: $*" >&2
+        exit 2
+        ;;
+esac
