@@ -4339,9 +4339,19 @@ impl GuardianReplayTailReader {
     }
 
     fn retain_transport_retry(&mut self, error: GuardianProxyError) -> io::Error {
+        // A guardian out of replay capacity refused the request before
+        // admitting anything (other panes' replays hold the snapshots until
+        // their pages are acknowledged), so the exact request retries like an
+        // I/O failure instead of ending the pane.
+        let capacity_refused = matches!(
+            error,
+            GuardianProxyError::Client(GuardianClientError::Rejected(
+                GuardianRejectionCode::CapacityExhausted
+            ))
+        );
         self.transport_retry_pending = !self.delivery_failed
             && (self.pending_replay.is_some() || self.pending_ack.is_some())
-            && replay_error_is_retryable_io(&error);
+            && (replay_error_is_retryable_io(&error) || capacity_refused);
         error.into()
     }
 

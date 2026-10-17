@@ -105,10 +105,14 @@ const CHECKPOINT_STAGE_EXPIRY_PLAINTEXT_BYTES: usize = 376;
 const CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES: u64 = 296;
 const CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD: usize = 1_027;
 const CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD: u64 = 268_740_576;
-// Production Stage, catalog publication, and Query use this bounded retention
-// today. Phase A has no deletion or ACK-backed reclamation, so keep the limit
-// deliberately finite while checkpoint ACK and upgrade activation stay off.
-const CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS: usize = 8;
+// The stage's disk is bounded by its totals, sized for eight worst-case
+// uploads (8 x 1,027 files, 8 x 256 MiB). The upload count is a separate,
+// larger bound: every pane holds an upload (its newest acknowledged one, or
+// its Genesis upload until its first capture) plus one in flight, real
+// checkpoints are megabytes, and an eight-upload count refused the ninth
+// pane's spawn or capture on any fleet host. A Begin is admitted only if its
+// whole upload fits the totals, reclaiming first when it does not.
+const CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS: usize = 256;
 const CHECKPOINT_STAGE_MAX_FILES: usize = 8_216;
 const CHECKPOINT_STAGE_MAX_BYTES: u64 = 2_149_924_608;
 const CHECKPOINT_CATALOG_FILE_PREFIX: &str = "checkpoint-catalog-";
@@ -173,8 +177,12 @@ const CHECKPOINT_CATALOG_MAX_RELEVANT_BYTES: u64 =
     CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES * 16 + CHECKPOINT_CATALOG_MARKER_BYTES as u64 * 8;
 const REPLAY_SNAPSHOT_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian-replay-snapshot.v1\0";
 const REPLAY_REQUEST_BINDING_DOMAIN: &[u8] = b"frankenterm.guardian-replay-request.v1\0";
-const REPLAY_MAX_ACTIVE_SNAPSHOTS: usize = 8;
-const REPLAY_MAX_REQUEST_BINDINGS: usize = 64;
+/// Every pane a mux starts or restores replays through a snapshot until its
+/// first page is acknowledged, and only an acknowledged snapshot can be
+/// evicted: with eight, twelve panes starting at once had their ninth replay
+/// refused. Each snapshot holds a few descriptors, so the bound stays finite.
+const REPLAY_MAX_ACTIVE_SNAPSHOTS: usize = 32;
+const REPLAY_MAX_REQUEST_BINDINGS: usize = 256;
 const REPLAY_MAX_OUTSTANDING_PAGES_PER_SNAPSHOT: usize = 1;
 const _: () = assert!(REPLAY_MAX_OUTSTANDING_PAGES_PER_SNAPSHOT == 1);
 
@@ -224,14 +232,10 @@ impl GuardianCheckpointStagePolicy {
                 )
             })
             .ok_or(GuardianOutputError::Allocation)?;
-        let minimum_files = self
-            .max_retained_uploads
-            .checked_mul(CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD)
-            .ok_or(GuardianOutputError::Allocation)?;
-        let minimum_bytes = u64::try_from(self.max_retained_uploads)
-            .ok()
-            .and_then(|uploads| uploads.checked_mul(CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD))
-            .ok_or(GuardianOutputError::Allocation)?;
+        // The totals must hold one worst-case upload; Begin admission keeps
+        // every admitted upload within them.
+        let minimum_files = CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD;
+        let minimum_bytes = CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD;
         if self.max_retained_uploads == 0
             || protocol_files_per_upload != CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD
             || protocol_bytes_per_upload != CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD
@@ -3596,24 +3600,30 @@ impl GuardianCheckpointStageStore {
                     return Err(GuardianCheckpointStageStoreError::Poisoned);
                 }
                 let publication_id = Uuid::new_v4();
-                let record_bytes = checkpoint_record_bytes_for_plaintext(begin_payload.len())?;
-                let mut admitted =
-                    checkpoint_stage_require_capacity(inner, &census, shape.key(), 1, record_bytes);
+                // Admit the whole upload, not just its candidate record.
+                let need = CheckpointStageNeed::for_upload(&shape)?;
+                let mut admitted = checkpoint_stage_require_capacity(
+                    inner,
+                    &census,
+                    shape.key(),
+                    need.files,
+                    need.bytes,
+                );
                 let reclaimers: [CheckpointStageReclaimer; 2] = [
                     checkpoint_stage_reclaim_superseded,
                     checkpoint_stage_reclaim_for_capacity,
                 ];
                 for reclaim in reclaimers {
                     if matches!(admitted, Err(GuardianCheckpointStageStoreError::Capacity))
-                        && reclaim(inner)? != 0
+                        && reclaim(inner, need)? != 0
                     {
                         census = checkpoint_stage_census(inner)?;
                         admitted = checkpoint_stage_require_capacity(
                             inner,
                             &census,
                             shape.key(),
-                            1,
-                            record_bytes,
+                            need.files,
+                            need.bytes,
                         );
                     }
                 }
@@ -7461,6 +7471,7 @@ fn checkpoint_stage_require_capacity(
 /// kind. Unreadable uploads and catalogs are kept.
 fn checkpoint_stage_reclaim_superseded(
     inner: &GuardianCheckpointStageStoreInner,
+    _need: CheckpointStageNeed,
 ) -> Result<usize, GuardianCheckpointStageStoreError> {
     let census = checkpoint_stage_census(inner)?;
     let mut reclaim = BTreeSet::new();
@@ -7584,8 +7595,48 @@ fn checkpoint_stage_reclaim_superseded(
     Ok(reclaim.len())
 }
 
-type CheckpointStageReclaimer =
-    fn(&GuardianCheckpointStageStoreInner) -> Result<usize, GuardianCheckpointStageStoreError>;
+/// The room a Begin needs: its whole upload (candidate, chunks, seal and ACK
+/// records), so that a stage short of room reclaims before an upload starts,
+/// not when a chunk halfway through it is refused.
+#[derive(Clone, Copy, Debug)]
+struct CheckpointStageNeed {
+    files: usize,
+    bytes: u64,
+}
+
+impl CheckpointStageNeed {
+    fn for_upload(
+        shape: &CheckpointStageRequestShape,
+    ) -> Result<Self, GuardianCheckpointStageStoreError> {
+        let chunks = usize::try_from(shape.total_chunks)
+            .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
+        let files = chunks
+            .checked_add(3)
+            .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+        let bytes = [
+            CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES,
+            CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES,
+            CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES,
+        ]
+        .into_iter()
+        .try_fold(0_u64, |total, plaintext| {
+            total.checked_add(checkpoint_record_bytes_for_plaintext(plaintext).ok()?)
+        })
+        .and_then(|total| total.checked_add(shape.total_bytes))
+        .and_then(|total| {
+            u64::from(shape.total_chunks)
+                .checked_mul(CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES)
+                .and_then(|overhead| total.checked_add(overhead))
+        })
+        .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+        Ok(Self { files, bytes })
+    }
+}
+
+type CheckpointStageReclaimer = fn(
+    &GuardianCheckpointStageStoreInner,
+    CheckpointStageNeed,
+) -> Result<usize, GuardianCheckpointStageStoreError>;
 
 /// How long an unsealed upload may sit untouched before a full stage reclaims
 /// it: far past any live publisher's step deadline, so only an upload whose
@@ -7593,45 +7644,80 @@ type CheckpointStageReclaimer =
 const CHECKPOINT_STAGE_ABANDONED_UPLOAD_AGE: std::time::Duration =
     std::time::Duration::from_secs(600);
 
-/// When reclaiming superseded uploads leaves the stage full, unlink the
-/// oldest uploads whose content lives on elsewhere, or that nothing will ever
-/// finish, until at most half the stage is in use:
+/// When reclaiming superseded uploads leaves too little room for `need`,
+/// unlink, oldest first and only until the new upload fits, uploads whose
+/// content lives on elsewhere or that nothing will ever finish:
 ///
 /// - an acknowledged Pane upload whose published member keeps an ACK proof
 ///   that authenticates, a pane's newest included: Query answers for it from
 ///   that member, so a quiescent pane still confirms its acknowledgement;
-/// - a Genesis upload whose spawn published its genesis member;
 /// - an unsealed upload untouched for `CHECKPOINT_STAGE_ABANDONED_UPLOAD_AGE`;
 ///   a live publisher that finds it gone starts again from Begin.
 ///
-/// A sealed but unacknowledged upload stays: its mux may still adopt it.
-/// Without this pass, eight panes that each hold one newest acknowledged
-/// upload, eight spawns before their first capture, or eight closed panes'
-/// last uploads fill the stage for good and refuse every later Begin.
+/// A sealed but unacknowledged upload stays: its mux may still adopt it. A
+/// Genesis upload stays until its pane publishes a Pane member (the
+/// superseded pass reclaims it then): a recovery root committed before the
+/// pane's first capture names its genesis checkpoint, and verifying that root
+/// reads the upload. Without this pass, closed panes' last uploads and
+/// long-quiescent panes' newest ones would fill the stage for good.
 fn checkpoint_stage_reclaim_for_capacity(
     inner: &GuardianCheckpointStageStoreInner,
+    need: CheckpointStageNeed,
 ) -> Result<usize, GuardianCheckpointStageStoreError> {
     let census = checkpoint_stage_census(inner)?;
-    let target = inner.policy.max_retained_uploads / 2;
-    let Some(excess) = census.uploads.len().checked_sub(target).filter(|n| *n > 0) else {
-        return Ok(0);
+    let policy = inner.policy;
+    let fits = |uploads: usize, files: usize, bytes: u64| {
+        uploads < policy.max_retained_uploads
+            && files
+                .checked_add(need.files)
+                .is_some_and(|files| files <= policy.max_stage_files)
+            && bytes
+                .checked_add(need.bytes)
+                .is_some_and(|bytes| bytes <= policy.max_stage_bytes)
     };
+    let (mut uploads, mut files, mut bytes) =
+        (census.uploads.len(), census.total_files, census.total_bytes);
+    if fits(uploads, files, bytes) {
+        return Ok(0);
+    }
+    // Oldest first: a closed or long-quiescent pane's upload goes before one
+    // an active pane will supersede soon anyway. Each upload is judged only
+    // when it is reached, since judging reads its records and its catalog.
+    let mut by_age: Vec<(Option<std::time::SystemTime>, CheckpointStageUploadKey)> = census
+        .entries
+        .iter()
+        .filter(|entry| entry.role == CheckpointStageFileRole::Candidate)
+        .map(|entry| (entry.modified, entry.key))
+        .collect();
+    by_age.sort();
     let now = std::time::SystemTime::now();
     let mut pane_catalogs: BTreeMap<Uuid, Option<CheckpointCatalogScan>> = BTreeMap::new();
-    let mut reclaimable = Vec::new();
-    for key in &census.uploads {
-        let entries = || census.entries.iter().filter(|entry| entry.key == *key);
-        let Some(candidate) =
-            entries().find(|entry| entry.role == CheckpointStageFileRole::Candidate)
+    let mut reclaimed = 0;
+    for (_, key) in by_age {
+        if fits(uploads, files, bytes) {
+            break;
+        }
+        let mut entries: Vec<&CheckpointStageCensusEntry> = census
+            .entries
+            .iter()
+            .filter(|entry| entry.key == key)
+            .collect();
+        let Some(candidate) = entries
+            .iter()
+            .copied()
+            .find(|entry| entry.role == CheckpointStageFileRole::Candidate)
         else {
             continue;
         };
-        let sealed =
-            entries().any(|entry| matches!(entry.role, CheckpointStageFileRole::Seal { .. }));
-        let acked =
-            entries().any(|entry| matches!(entry.role, CheckpointStageFileRole::Ack { .. }));
+        let sealed = entries
+            .iter()
+            .any(|entry| matches!(entry.role, CheckpointStageFileRole::Seal { .. }));
+        let acked = entries
+            .iter()
+            .any(|entry| matches!(entry.role, CheckpointStageFileRole::Ack { .. }));
         let abandoned = !sealed
-            && entries()
+            && entries
+                .iter()
                 .filter_map(|entry| entry.modified)
                 .max()
                 .and_then(|written| now.duration_since(written).ok())
@@ -7653,34 +7739,24 @@ fn checkpoint_stage_reclaim_for_capacity(
                 });
                 member.is_some_and(|member| {
                     checkpoint_stage_upload_acknowledged(inner, &census, candidate).unwrap_or(false)
-                        && checkpoint_stage_preserve_ack_proof(inner, &census, member, *key)
+                        && checkpoint_stage_preserve_ack_proof(inner, &census, member, key)
                             .unwrap_or(false)
                 })
             }
-            CheckpointStagePathScope::Pane { .. } => false,
-            CheckpointStagePathScope::Genesis { spawn_effect_id } => {
-                checkpoint_catalog_scan(inner, CheckpointCatalogScope::Genesis { spawn_effect_id })
-                    .is_ok_and(|genesis| !genesis.published.is_empty())
+            CheckpointStagePathScope::Pane { .. } | CheckpointStagePathScope::Genesis { .. } => {
+                false
             }
         };
-        if durable_elsewhere || abandoned {
-            reclaimable.push((candidate.modified, *key));
+        if !(durable_elsewhere || abandoned) {
+            continue;
         }
-    }
-    // Oldest first: a closed or long-quiescent pane's upload goes before one
-    // an active pane will supersede soon anyway.
-    reclaimable.sort();
-    let mut reclaimed = 0;
-    for (_, key) in reclaimable.into_iter().take(excess) {
-        let mut entries: Vec<&CheckpointStageCensusEntry> = census
-            .entries
-            .iter()
-            .filter(|entry| entry.key == key)
-            .collect();
         entries.sort_by_key(|entry| entry.role != CheckpointStageFileRole::Candidate);
-        for entry in entries {
+        for entry in &entries {
             checkpoint_stage_unlink(inner, entry)?;
         }
+        uploads -= 1;
+        files = files.saturating_sub(entries.len());
+        bytes = bytes.saturating_sub(entries.iter().map(|entry| entry.bytes).sum::<u64>());
         reclaimed += 1;
     }
     if reclaimed != 0 {
@@ -16837,6 +16913,38 @@ mod tests {
         })
     }
 
+    /// The upload count the stage-limit tests run under.
+    const TEST_STAGE_UPLOADS: usize = 8;
+
+    /// The same stage directory under a smaller upload count, so a test meets
+    /// the stage's limits with a handful of uploads.
+    fn stage_with_upload_limit(
+        store: &GuardianCheckpointStageStore,
+        max_retained_uploads: usize,
+    ) -> GuardianCheckpointStageStore {
+        let inner = &store.inner;
+        GuardianCheckpointStageStore {
+            inner: Arc::new(GuardianCheckpointStageStoreInner {
+                directory: inner.directory.try_clone().expect("clone stage directory"),
+                directory_path: inner.directory_path.clone(),
+                cipher: inner.cipher.clone(),
+                persistence: Arc::clone(&inner.persistence),
+                policy: GuardianCheckpointStagePolicy {
+                    max_retained_uploads,
+                    ..inner.policy
+                }
+                .validate()
+                .expect("test stage policy"),
+                name_max: inner.name_max,
+                gate: Mutex::new(()),
+                durable_records: Mutex::new(Vec::new()),
+                replay: Mutex::new(GuardianReplayState::new()),
+                custody_sync_failure: std::sync::atomic::AtomicU8::new(0),
+                custody_publication_cut: std::sync::atomic::AtomicU8::new(0),
+            }),
+        }
+    }
+
     fn checkpoint_stage_upload_keys(
         store: &GuardianCheckpointStageStore,
     ) -> Result<BTreeSet<CheckpointStageUploadKey>, GuardianCheckpointStageStoreError> {
@@ -16850,7 +16958,7 @@ mod tests {
             "ft-guardian-stage-reclaim-",
             OutputSegmentPolicy::production(),
         )?;
-        let store = pipeline.checkpoint_stage_store();
+        let store = stage_with_upload_limit(&pipeline.checkpoint_stage_store(), TEST_STAGE_UPLOADS);
         let guardian = Uuid::from_u128(0x5e100);
         let mux = Uuid::from_u128(0x5e101);
         // Six panes with two acknowledged captures each: twelve uploads
@@ -16897,10 +17005,7 @@ mod tests {
                 } else {
                     newest.push((pane, begin, completion, key));
                 }
-                assert!(
-                    checkpoint_stage_upload_keys(&store)?.len()
-                        <= CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS
-                );
+                assert!(checkpoint_stage_upload_keys(&store)?.len() <= TEST_STAGE_UPLOADS);
             }
         }
 
@@ -16945,7 +17050,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let (_directory, _poll, pipeline) =
             pipeline_with_policy("ft-guardian-stage-full-", OutputSegmentPolicy::production())?;
-        let store = pipeline.checkpoint_stage_store();
+        let store = stage_with_upload_limit(&pipeline.checkpoint_stage_store(), TEST_STAGE_UPLOADS);
         let guardian = Uuid::from_u128(0x5f100);
         let mux = Uuid::from_u128(0x5f101);
         // A pane that closed (or whose mux died) mid-upload long ago.
@@ -17031,10 +17136,7 @@ mod tests {
                     mux,
                 )?;
                 newest.insert(pane, (begin, completion));
-                assert!(
-                    checkpoint_stage_upload_keys(&store)?.len()
-                        <= CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS
-                );
+                assert!(checkpoint_stage_upload_keys(&store)?.len() <= TEST_STAGE_UPLOADS);
             }
         }
 
@@ -17245,7 +17347,7 @@ mod tests {
             "ft-guardian-catalog-reclaim-",
             OutputSegmentPolicy::production(),
         )?;
-        let store = pipeline.checkpoint_stage_store();
+        let store = stage_with_upload_limit(&pipeline.checkpoint_stage_store(), TEST_STAGE_UPLOADS);
         let guardian = Uuid::from_u128(0xc1100);
         let mux = Uuid::from_u128(0xc1101);
         let pane = Uuid::from_u128(0xc1102);
@@ -17302,10 +17404,7 @@ mod tests {
             })?;
             let first = (capture + 1).saturating_sub(retained - 1).max(1);
             assert_eq!(generations, (first..=capture + 1).collect::<Vec<_>>());
-            assert!(
-                checkpoint_stage_upload_keys(&store)?.len()
-                    <= CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS
-            );
+            assert!(checkpoint_stage_upload_keys(&store)?.len() <= TEST_STAGE_UPLOADS);
         }
 
         // Every retained member still verifies offline with its ACK, as a
@@ -21097,15 +21196,18 @@ mod tests {
         assert_eq!(CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD, 1_027);
         assert_eq!(CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD, expected_upload_bytes);
         assert_eq!(expected_upload_bytes, 268_740_576);
+        // Disk is bounded by the totals, sized for eight worst-case uploads;
+        // the upload count is a separate, larger bound (every pane holds an
+        // upload), and Begin admits an upload only if all of it fits.
         assert_eq!(
             policy.max_stage_files,
-            policy.max_retained_uploads * CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD
+            8 * CHECKPOINT_STAGE_MAX_FILES_PER_UPLOAD
         );
         assert_eq!(
             policy.max_stage_bytes,
-            u64::try_from(policy.max_retained_uploads).expect("retention count")
-                * CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD
+            8 * CHECKPOINT_STAGE_MAX_BYTES_PER_UPLOAD
         );
+        assert_eq!(policy.max_retained_uploads, 256);
         let expected_catalog_candidate_bytes = GUARDIAN_MAX_CHECKPOINT_BYTES
             + (u64::from(GUARDIAN_MAX_CHECKPOINT_CHUNKS) + 2) * record_overhead
             + u64::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES).expect("candidate bytes")
