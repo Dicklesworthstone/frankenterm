@@ -11,10 +11,12 @@ mod ingest;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use ingest::cache::{self, CacheOutcome};
 use ingest::cli::{self, Entry, Source};
 use ingest::corpus::{self, Corpus, DEFAULT_SEED, DEFAULT_SIZE, GENERATOR_VERSION};
+use ingest::deferred::Deferred;
 use ingest::lanes::{self, Expectation, Geometry, GridSummary, Lane, LaneRun};
 
 const PIN_SIZE: usize = 64 * 1024;
@@ -421,14 +423,14 @@ fn the_cache_reuses_verified_corpora_and_regenerates_bad_ones() {
 
     let first = cache::load_or_generate(&dir, corpus, size, seed).expect("generate");
     assert_eq!(first.outcome, CacheOutcome::Generated);
-    assert_eq!(first.bytes, expected);
-    assert_eq!(first.sha256, cache::sha256_hex(&expected));
+    assert_eq!(*first.bytes, expected);
+    assert_eq!(*first.sha256.get(), cache::sha256_hex(&expected));
     assert_eq!(first.path, path);
 
     let second = cache::load_or_generate(&dir, corpus, size, seed).expect("reuse");
     assert_eq!(second.outcome, CacheOutcome::Reused);
-    assert_eq!(second.bytes, expected);
-    assert_eq!(second.sha256, first.sha256);
+    assert_eq!(*second.bytes, expected);
+    assert_eq!(second.sha256.get(), first.sha256.get());
 
     // Same length, different content: the SHA check catches it.
     let mut tampered = expected.clone();
@@ -436,7 +438,7 @@ fn the_cache_reuses_verified_corpora_and_regenerates_bad_ones() {
     std::fs::write(&path, &tampered).expect("tamper");
     let third = cache::load_or_generate(&dir, corpus, size, seed).expect("regenerate");
     assert_eq!(third.outcome, CacheOutcome::Generated);
-    assert_eq!(third.bytes, expected);
+    assert_eq!(*third.bytes, expected);
 
     // A truncated file is regenerated too.
     std::fs::write(&path, &expected[..size / 2]).expect("truncate");
@@ -446,7 +448,7 @@ fn the_cache_reuses_verified_corpora_and_regenerates_bad_ones() {
     // So is a corpus written by another generator version.
     let mut sidecar = path.as_os_str().to_owned();
     sidecar.push(".sha256");
-    std::fs::write(&sidecar, format!("{} generator-v0\n", first.sha256)).expect("sidecar");
+    std::fs::write(&sidecar, format!("{} generator-v0\n", first.sha256.get())).expect("sidecar");
     let fifth = cache::load_or_generate(&dir, corpus, size, seed).expect("regenerate");
     assert_eq!(fifth.outcome, CacheOutcome::Generated);
     let sixth = cache::load_or_generate(&dir, corpus, size, seed).expect("reuse");
@@ -454,7 +456,7 @@ fn the_cache_reuses_verified_corpora_and_regenerates_bad_ones() {
 
     let external = cache::load_file(&path).expect("read file");
     assert_eq!(external.outcome, CacheOutcome::External);
-    assert_eq!(external.sha256, first.sha256);
+    assert_eq!(external.sha256.get(), first.sha256.get());
 }
 
 fn args(list: &[&str]) -> Vec<String> {
@@ -578,8 +580,8 @@ fn each_lane_run_becomes_one_json_line_with_the_required_fields() {
         seed: Some(DEFAULT_SEED),
         expectation: Expectation::for_generated(&bytes, &geometry, corpus.is_line_oriented()),
         corpus: cache::LoadedCorpus {
-            sha256: cache::sha256_hex(&bytes),
-            bytes,
+            sha256: Deferred::ready(cache::sha256_hex(&bytes)),
+            bytes: Arc::new(bytes),
             path: PathBuf::from("color_emoji_random.bin"),
             outcome: CacheOutcome::Generated,
         },
@@ -614,7 +616,7 @@ fn each_lane_run_becomes_one_json_line_with_the_required_fields() {
         assert_eq!(record["profile"], "release-perf");
         assert_eq!(record["sanity"], "ok");
         assert_eq!(record["load_avg_1m"], 1.5);
-        assert_eq!(record["corpus_sha256"], input.corpus.sha256.as_str());
+        assert_eq!(record["corpus_sha256"], input.corpus.sha256.get().as_str());
         assert_eq!(record["cursor_x"].is_null(), lane == Lane::Parse, "{line}");
         // The fused lanes apply as they parse and count no actions, like term
         // (ft-yccm0.3.2.1).

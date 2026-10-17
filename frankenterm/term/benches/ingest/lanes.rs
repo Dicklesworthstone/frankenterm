@@ -25,8 +25,11 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::convert::TryFrom;
+use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::hint::black_box;
+use std::io::{self, Read};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -430,6 +433,69 @@ impl FeedGate for MuxGate {
 /// (`PARSER_HOLD_BUDGET` in `frankenterm/mux/src/localpane.rs`).
 const PARSER_HOLD_BUDGET: Duration = Duration::from_millis(2);
 
+/// [`run_lane`] for a `term` lane reading the file at `path`
+/// `geometry.chunk` bytes at a time into one reused buffer, each piece fed
+/// as it is read (`--stream`): how ghostty-bench reads its data file (64 KiB
+/// at a time) and a PTY reader reads its pane. A whole-process comparison
+/// (hyperfine, `vsghostty.py`) then no longer charges FT for reading the
+/// whole corpus into fresh memory first and parsing it back out of DRAM.
+/// Every piece but the last is a whole chunk, as in [`run_lane`], so the
+/// terminal ends the same. The timing includes the reads.
+pub fn run_term_lane_streaming(
+    lane: Lane,
+    prelude: &[u8],
+    path: &Path,
+    geometry: &Geometry,
+) -> io::Result<LaneRun> {
+    if !matches!(lane, Lane::Term | Lane::TermPage) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only the term lanes stream",
+        ));
+    }
+    let mut terminal = new_terminal(lane, geometry);
+    if !prelude.is_empty() {
+        terminal.advance_bytes(prelude);
+    }
+    let mut file = File::open(path)?;
+    let mut buffer = vec![0_u8; geometry.chunk.max(1)];
+    let mut bytes = 0;
+    let start = Instant::now();
+    loop {
+        let filled = fill(&mut file, &mut buffer)?;
+        if filled > 0 {
+            terminal.advance_bytes(&buffer[..filled]);
+            bytes += filled;
+        }
+        if filled < buffer.len() {
+            break;
+        }
+    }
+    let secs = start.elapsed().as_secs_f64();
+    Ok(LaneRun {
+        lane,
+        bytes,
+        prelude_bytes: prelude.len(),
+        secs,
+        actions: None,
+        terminal: Some(terminal),
+    })
+}
+
+/// Reads until `buffer` is full or the file ends; how much it read.
+fn fill(file: &mut File, buffer: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match file.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(filled)
+}
+
 /// Feeds `prelude` untimed, then `data` timed, through `lane` in
 /// `geometry.chunk`-sized pieces.
 pub fn run_lane(lane: Lane, prelude: &[u8], data: &[u8], geometry: &Geometry) -> LaneRun {
@@ -645,9 +711,14 @@ impl Expectation {
     /// file must still leave visible text, so a file that ends by clearing the
     /// screen fails the check by design.
     pub fn for_file(data: &[u8], geometry: &Geometry) -> Self {
+        Self::for_file_of(u64::try_from(data.len()).unwrap_or(u64::MAX), geometry)
+    }
+
+    /// [`Self::for_file`] for a file of `bytes` bytes not read into memory.
+    pub fn for_file_of(bytes: u64, geometry: &Geometry) -> Self {
         Self {
             min_retained_rows: geometry.rows,
-            requires_visible_text: !data.is_empty(),
+            requires_visible_text: bytes > 0,
         }
     }
 }

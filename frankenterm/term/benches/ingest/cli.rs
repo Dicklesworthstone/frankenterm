@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 
 use super::cache::{self, LoadedCorpus};
 use super::corpus::{Corpus, DEFAULT_SEED, DEFAULT_SIZE};
+use super::deferred::Deferred;
 use super::lanes::{self, Expectation, Geometry, GridSummary, Lane, LaneRun};
 
 pub const USAGE: &str = "\
@@ -30,6 +31,9 @@ Options:
                     long_lines | unicode_mix | tui_repaint | all; comma-separated
   --from-file PATH  drive the lanes with PATH instead, e.g. the operator's
                     color-emoji-random.bin
+  --stream          with --from-file and the term lanes: read PATH a chunk at a
+                    time and feed each piece as it is read, as ghostty-bench and a
+                    PTY reader do (the timing then includes the reads)
   --size N          generated corpus size in bytes, or with a K/KiB/M/MiB/G/GiB or
                     KB/MB/GB suffix (default 64MiB)
   --seed N          generator seed, decimal or 0x-hex (default 20261005)
@@ -74,6 +78,9 @@ pub struct Options {
     pub gen_only: bool,
     /// Feed `lanes::STICKY_ZWJ_PRELUDE` untimed before each lane run.
     pub sticky_zwj: bool,
+    /// Read the `--from-file` corpus as the lanes run, a chunk at a time
+    /// (`lanes::run_term_lane_streaming`).
+    pub stream: bool,
     pub allow_debug: bool,
     pub help: bool,
 }
@@ -190,6 +197,7 @@ pub fn parse_args(
         corpus_dir: None,
         gen_only: false,
         sticky_zwj: false,
+        stream: false,
         allow_debug: test_mode,
         help: false,
     };
@@ -207,6 +215,7 @@ pub fn parse_args(
             "-h" | "--help" => options.help = true,
             "--gen-only" => options.gen_only = true,
             "--sticky-zwj" => options.sticky_zwj = true,
+            "--stream" => options.stream = true,
             "--allow-debug" => options.allow_debug = true,
             "--lane" => {
                 let value = take_value(flag, inline, &mut rest)?;
@@ -252,6 +261,15 @@ pub fn parse_args(
     }
     if file_flag && options.gen_only {
         return Err("--gen-only generates corpora; it cannot take --from-file".to_string());
+    }
+    if options.stream
+        && (!file_flag
+            || !options
+                .lanes
+                .iter()
+                .all(|lane| matches!(lane, Lane::Term | Lane::TermPage)))
+    {
+        return Err("--stream takes --from-file and only the term lanes".to_string());
     }
     if options.geometry.chunk == 0 {
         return Err("the chunk size must be positive".to_string());
@@ -400,7 +418,7 @@ pub fn lane_record(
         corpus: &input.label,
         corpus_source: input.corpus.outcome.name(),
         corpus_path: input.corpus.path.display().to_string(),
-        corpus_sha256: &input.corpus.sha256,
+        corpus_sha256: input.corpus.sha256.get(),
         seed: input.seed,
         bytes: run.bytes,
         prelude_bytes: run.prelude_bytes,
@@ -432,23 +450,36 @@ pub fn lane_record(
 
 /// Runs every requested lane over `input`; returns the number of lanes whose
 /// final state failed the sanity checks.
-fn run_lanes(options: &Options, input: &Input, context: &RecordContext) -> usize {
+fn run_lanes(
+    options: &Options,
+    input: &Input,
+    context: &Deferred<RecordContext>,
+) -> Result<usize, String> {
     let mut failures = 0;
     for &lane in &options.lanes {
-        let load_avg_1m = load_avg_1m();
+        // Sampled as the lane starts, off the ingest thread (macOS spawns
+        // `sysctl` for it).
+        let load_avg = Deferred::spawn(load_avg_1m);
         let prelude: &[u8] = if options.sticky_zwj {
             lanes::STICKY_ZWJ_PRELUDE
         } else {
             &[]
         };
-        let run = lanes::run_lane(lane, prelude, &input.corpus.bytes, &options.geometry);
+        let run = if options.stream {
+            let path = &input.corpus.path;
+            lanes::run_term_lane_streaming(lane, prelude, path, &options.geometry)
+                .map_err(|error| format!("cannot stream {}: {error}", path.display()))?
+        } else {
+            lanes::run_lane(lane, prelude, &input.corpus.bytes, &options.geometry)
+        };
         let (summary, verdict) = lanes::evaluate(&run, &options.geometry, &input.expectation);
+        let load_avg_1m = *load_avg.get();
         let outcome = Outcome {
             summary,
             verdict,
             load_avg_1m,
         };
-        let record = lane_record(&run, input, &outcome, &options.geometry, context);
+        let record = lane_record(&run, input, &outcome, &options.geometry, context.get());
         println!("{record}");
         eprintln!(
             "[BENCH] ingest_throughput lane={} corpus={} bytes={} secs={:.3} MiB/s={:.1} load_avg_1m={} sanity={}",
@@ -464,7 +495,7 @@ fn run_lanes(options: &Options, input: &Input, context: &RecordContext) -> usize
             failures += 1;
         }
     }
-    failures
+    Ok(failures)
 }
 
 fn file_label(path: &Path) -> String {
@@ -476,22 +507,32 @@ fn file_label(path: &Path) -> String {
 }
 
 fn run(options: &Options) -> Result<usize, String> {
-    let context = RecordContext::capture();
-    if context.debug_assertions {
+    // Off the ingest thread: it spawns `git`.
+    let context = Deferred::spawn(RecordContext::capture);
+    if cfg!(debug_assertions) {
         eprintln!("ingest_throughput: unoptimized build; these numbers are not measurements");
     }
     let corpora = match &options.source {
         Source::File(path) => {
-            let corpus = cache::load_file(path)
-                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-            let expectation = Expectation::for_file(&corpus.bytes, &options.geometry);
+            let unreadable = |error| format!("cannot read {}: {error}", path.display());
+            let (corpus, expectation) = if options.stream {
+                let bytes = std::fs::metadata(path).map_err(unreadable)?.len();
+                (
+                    cache::stream_file(path).map_err(unreadable)?,
+                    Expectation::for_file_of(bytes, &options.geometry),
+                )
+            } else {
+                let corpus = cache::load_file(path).map_err(unreadable)?;
+                let expectation = Expectation::for_file(&corpus.bytes, &options.geometry);
+                (corpus, expectation)
+            };
             let input = Input {
                 label: file_label(path),
                 seed: None,
                 corpus,
                 expectation,
             };
-            return Ok(run_lanes(options, &input, &context));
+            return run_lanes(options, &input, &context);
         }
         Source::Generated(corpora) => corpora,
     };
@@ -517,7 +558,7 @@ fn run(options: &Options) -> Result<usize, String> {
                     "corpus": corpus.name(),
                     "corpus_source": loaded.outcome.name(),
                     "corpus_path": loaded.path.display().to_string(),
-                    "corpus_sha256": loaded.sha256,
+                    "corpus_sha256": loaded.sha256.get(),
                     "seed": options.seed,
                     "bytes": loaded.bytes.len(),
                 })
@@ -532,7 +573,7 @@ fn run(options: &Options) -> Result<usize, String> {
             corpus: loaded,
             expectation,
         };
-        failures += run_lanes(options, &input, &context);
+        failures += run_lanes(options, &input, &context)?;
     }
     Ok(failures)
 }
