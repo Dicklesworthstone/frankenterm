@@ -541,27 +541,53 @@ struct GuardianCheckpointStageStoreInner {
     gate: Mutex<()>,
     durable_records: Mutex<Vec<FileIdentity>>,
     replay: Mutex<GuardianReplayState>,
-    /// Checksums of catalog candidates whose records a store of this process
-    /// has already authenticated in this directory under this key (see
-    /// `checkpoint_catalog_validate_decoded_candidate_records`).
-    validated_candidates: CheckpointCatalogValidatedMemo,
+    /// What stores of this process have learned about this directory's
+    /// catalogs under this key (see `checkpoint_catalog_memo`).
+    catalog_memo: Arc<CheckpointCatalogMemo>,
     #[cfg(test)]
     custody_sync_failure: std::sync::atomic::AtomicU8,
     #[cfg(test)]
     custody_publication_cut: std::sync::atomic::AtomicU8,
+    /// Published candidate files read in full.
+    #[cfg(test)]
+    catalog_candidate_reads: std::sync::atomic::AtomicUsize,
+    /// Catalog candidates' payloads decoded and validated.
+    #[cfg(test)]
+    catalog_payload_validations: std::sync::atomic::AtomicUsize,
+    /// Stands in for `CHECKPOINT_CATALOG_SUMMARY_SETTLE`.
+    #[cfg(test)]
+    catalog_summary_settle: Mutex<std::time::Duration>,
 }
 
 /// Validated candidate checksums a memo remembers before it starts over.
 const CHECKPOINT_CATALOG_VALIDATED_MEMO_ENTRIES: usize = 4096;
 
+/// Candidate summaries a memo remembers before it starts over.
+const CHECKPOINT_CATALOG_SUMMARY_ENTRIES: usize = 1024;
+
+/// How long a published candidate's file must have gone unchanged before
+/// its summary is remembered (see `CheckpointCatalogFileStamp`).
+const CHECKPOINT_CATALOG_SUMMARY_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Directories (with their keys) whose memos this process keeps with no
 /// store open before it forgets those.
 const CHECKPOINT_CATALOG_VALIDATED_MEMO_SCOPES: usize = 64;
 
-type CheckpointCatalogValidatedMemo = Arc<Mutex<BTreeSet<[u8; OUTPUT_MANIFEST_CHECKSUM_BYTES]>>>;
+/// What every store of this process shares about one output directory's
+/// catalogs under one key.
+#[derive(Default)]
+struct CheckpointCatalogMemo {
+    /// Checksums of candidates whose records have been authenticated (see
+    /// `checkpoint_catalog_validate_decoded_candidate_records`).
+    validated: Mutex<BTreeSet<[u8; OUTPUT_MANIFEST_CHECKSUM_BYTES]>>,
+    /// Published candidates read, decoded and authenticated, by the stamp
+    /// of the file they were read from (see
+    /// `checkpoint_catalog_read_published_candidate`).
+    summaries: Mutex<BTreeMap<CheckpointCatalogFileStamp, Arc<CheckpointCatalogCandidateSummary>>>,
+}
 
-/// The validated-candidate memo every store of this process shares for one
-/// output directory and key.
+/// The memo every store of this process shares for one output directory
+/// and key.
 ///
 /// The recovery verifier reopens a pane's custody through a fresh store for
 /// every pane, twice per capture (once to select the predecessor root, once
@@ -571,12 +597,12 @@ type CheckpointCatalogValidatedMemo = Arc<Mutex<BTreeSet<[u8; OUTPUT_MANIFEST_CH
 /// the catalogs. A checksum authenticates the same bytes again under the same
 /// key, and the key id commits to that key, so a memo scoped to the directory
 /// and the key id keeps exactly the guarantee the per-store memo had.
-fn checkpoint_catalog_validated_memo(
+fn checkpoint_catalog_memo(
     directory: DirectoryIdentity,
     key_id: [u8; 8],
-) -> CheckpointCatalogValidatedMemo {
-    static MEMOS: Mutex<BTreeMap<(DirectoryIdentity, [u8; 8]), CheckpointCatalogValidatedMemo>> =
-        Mutex::new(BTreeMap::new());
+) -> Arc<CheckpointCatalogMemo> {
+    type Scope = (DirectoryIdentity, [u8; 8]);
+    static MEMOS: Mutex<BTreeMap<Scope, Arc<CheckpointCatalogMemo>>> = Mutex::new(BTreeMap::new());
     let mut memos = MEMOS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1589,6 +1615,7 @@ struct PublishedCheckpointCatalogMember {
     candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
     candidate_path: PathBuf,
     candidate_file_identity: FileIdentity,
+    candidate_file_stamp: CheckpointCatalogFileStamp,
     marker_path: PathBuf,
     marker_file_identity: FileIdentity,
 }
@@ -2012,7 +2039,7 @@ struct DiscoveredCheckpointCatalogCandidate {
     identity: CheckpointCatalogIdentity,
     path: PathBuf,
     file_identity: FileIdentity,
-    bytes: u64,
+    stamp: CheckpointCatalogFileStamp,
     published: bool,
 }
 
@@ -3619,7 +3646,7 @@ impl GuardianCheckpointStageStore {
                 gate: Mutex::new(()),
                 durable_records: Mutex::new(Vec::new()),
                 replay: Mutex::new(GuardianReplayState::new()),
-                validated_candidates: checkpoint_catalog_validated_memo(
+                catalog_memo: checkpoint_catalog_memo(
                     persistence.directory_identity,
                     output_cipher.key_id(),
                 ),
@@ -3628,6 +3655,12 @@ impl GuardianCheckpointStageStore {
                 custody_sync_failure: std::sync::atomic::AtomicU8::new(0),
                 #[cfg(test)]
                 custody_publication_cut: std::sync::atomic::AtomicU8::new(0),
+                #[cfg(test)]
+                catalog_candidate_reads: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                catalog_payload_validations: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                catalog_summary_settle: Mutex::new(CHECKPOINT_CATALOG_SUMMARY_SETTLE),
             }),
         })
     }
@@ -5718,13 +5751,12 @@ fn guardian_replay_open_catalog_descriptor(
     {
         return Err(GuardianCheckpointStageStoreError::Conflict);
     }
-    let bytes = checkpoint_catalog_read_file(
+    let (candidate, source) = checkpoint_catalog_read_published_candidate(
         inner,
         &member.candidate_path,
         member.candidate_file_identity,
-        CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+        member.candidate_file_stamp,
     )?;
-    let candidate = checkpoint_catalog_decode_candidate(&bytes)?;
     if candidate.format != CheckpointCatalogFormat::ProtectedV3
         || candidate.metadata != member.metadata
         || candidate.checksum != member.candidate_checksum
@@ -5735,7 +5767,9 @@ fn guardian_replay_open_catalog_descriptor(
     // second, and the full check decodes the whole terminal checkpoint, so
     // a growing scrollback made each open slower until the checkpoint
     // worker was saturated and recovery captures overran their budget.
-    checkpoint_catalog_validate_decoded_candidate_records(inner, &candidate)?;
+    if source == CheckpointCatalogCandidateSource::File {
+        checkpoint_catalog_validate_decoded_candidate_records(inner, &candidate)?;
+    }
     if let Some(origin) = genesis_origin {
         if candidate.checksum != origin.catalog_candidate_checksum
             || !checkpoint_catalog_genesis_metadata_matches_reservation(
@@ -6215,17 +6249,24 @@ fn guardian_replay_snapshot_digest(
     Ok(hasher.finalize().into())
 }
 
+/// The pinned selected member, decoded, once it and the settled head are
+/// still the catalog's, and where it came from: a summary (its Begin record
+/// alone) when its file has not changed since an authenticated read. Every
+/// page a pane's reader takes lands here, and reading and hashing both
+/// members for each was most of a 12-pane successor's checksum time; only a
+/// checkpoint page needs the selected member's records.
 fn guardian_replay_validate_catalog_pin(
     inner: &GuardianCheckpointStageStoreInner,
     pin: &GuardianReplayCatalogPin,
-) -> Result<CheckpointCatalogCandidate, GuardianCheckpointStageStoreError> {
-    let selected_bytes = checkpoint_catalog_read_file(
+) -> Result<
+    (CheckpointCatalogCandidate, CheckpointCatalogCandidateSource),
+    GuardianCheckpointStageStoreError,
+> {
+    let (selected, source) = checkpoint_catalog_reread_published_candidate(
         inner,
         &pin.selected.candidate_path,
         pin.selected.candidate_file_identity,
-        CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
     )?;
-    let selected = checkpoint_catalog_decode_candidate(&selected_bytes)?;
     let selected_marker_bytes = checkpoint_catalog_read_file(
         inner,
         &pin.selected.marker_path,
@@ -6250,18 +6291,18 @@ fn guardian_replay_validate_catalog_pin(
         {
             return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
         }
-        checkpoint_catalog_validate_decoded_candidate_records(inner, &selected)?;
+        if source == CheckpointCatalogCandidateSource::File {
+            checkpoint_catalog_validate_decoded_candidate_records(inner, &selected)?;
+        }
     } else {
         let _adoption = checkpoint_catalog_recover_adoption_evidence(inner, &selected)?;
     }
 
-    let head_bytes = checkpoint_catalog_read_file(
+    let (head, _) = checkpoint_catalog_reread_published_candidate(
         inner,
         &pin.settled_head_candidate_path,
         pin.settled_head_candidate_file_identity,
-        CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
     )?;
-    let head = checkpoint_catalog_decode_candidate(&head_bytes)?;
     let head_marker_bytes = checkpoint_catalog_read_file(
         inner,
         &pin.settled_head_marker_path,
@@ -6274,6 +6315,30 @@ fn guardian_replay_validate_catalog_pin(
         || head.checksum != pin.settled_head_candidate_checksum
         || !checkpoint_catalog_marker_matches_candidate(&head_marker, &head)
     {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    Ok((selected, source))
+}
+
+/// The pinned selected member with all its records, for a checkpoint page,
+/// when its pin was checked from a summary.
+fn guardian_replay_selected_records(
+    inner: &GuardianCheckpointStageStoreInner,
+    pin: &GuardianReplayCatalogPin,
+    checked: CheckpointCatalogCandidate,
+    source: CheckpointCatalogCandidateSource,
+) -> Result<CheckpointCatalogCandidate, GuardianCheckpointStageStoreError> {
+    if source == CheckpointCatalogCandidateSource::File {
+        return Ok(checked);
+    }
+    let bytes = checkpoint_catalog_read_file(
+        inner,
+        &pin.selected.candidate_path,
+        pin.selected.candidate_file_identity,
+        CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+    )?;
+    let selected = checkpoint_catalog_decode_candidate(&bytes)?;
+    if selected.checksum != checked.checksum || selected.metadata != checked.metadata {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
     Ok(selected)
@@ -6526,7 +6591,7 @@ fn guardian_replay_build_page(
     incoming_cursor: Option<GuardianReplayCursorV1>,
 ) -> Result<(GuardianReplayPageDelivery, GuardianReplayIssuedPage), GuardianCheckpointStageStoreError>
 {
-    let candidate = guardian_replay_validate_catalog_pin(inner, &snapshot.catalog)?;
+    let (candidate, source) = guardian_replay_validate_catalog_pin(inner, &snapshot.catalog)?;
     let (
         phase,
         page_index,
@@ -6574,6 +6639,8 @@ fn guardian_replay_build_page(
             // Consume this page's already-authenticated catalog bytes. Reopening
             // and authenticating the entire candidate again here repeats the
             // same full-checkpoint work without adding an authority boundary.
+            let candidate =
+                guardian_replay_selected_records(inner, &snapshot.catalog, candidate, source)?;
             let chunk =
                 guardian_replay_checkpoint_chunk(inner, snapshot, &candidate, checkpoint_offset)?;
             let chunk_bytes = u64::try_from(chunk.byte_len())
@@ -12982,6 +13049,270 @@ fn checkpoint_catalog_read_file(
     Ok(bytes)
 }
 
+/// A catalog file's identity, size, and last modification and status
+/// change, as a census's `fstat` reports them: what any write through the
+/// file system changes.
+///
+/// A summary is remembered only for a file whose status last changed at
+/// least `CHECKPOINT_CATALOG_SUMMARY_SETTLE` before it was read (git's rule
+/// for "racily clean" index entries). A later write then gives the file a
+/// change time later than the one remembered, even where the file system
+/// keeps coarse timestamps, so a file rewritten in place never matches its
+/// old stamp; a file renamed onto the name is another inode.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CheckpointCatalogFileStamp {
+    device: u64,
+    inode: u64,
+    bytes: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl CheckpointCatalogFileStamp {
+    fn capture(metadata: &Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            bytes: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+
+    /// Whether the file's status last changed at least `settle` before
+    /// `now`.
+    fn settled(self, now: std::time::SystemTime, settle: std::time::Duration) -> bool {
+        let (seconds, nanos) = self.changed;
+        let (Ok(seconds), Ok(nanos)) = (u64::try_from(seconds), u32::try_from(nanos)) else {
+            return false;
+        };
+        if nanos >= 1_000_000_000 {
+            return false;
+        }
+        std::time::UNIX_EPOCH
+            .checked_add(std::time::Duration::new(seconds, nanos))
+            .and_then(|changed| now.duration_since(changed).ok())
+            .is_some_and(|age| age >= settle)
+    }
+}
+
+/// A stage record as persisted: records are deliberately not `Clone`.
+struct PersistedCheckpointStageRecord {
+    header: [u8; GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES],
+    ciphertext: Vec<u8>,
+}
+
+impl PersistedCheckpointStageRecord {
+    fn of(record: &GuardianEncryptedCheckpointStageRecordV1) -> Option<Self> {
+        let mut ciphertext = Vec::new();
+        ciphertext
+            .try_reserve_exact(record.ciphertext_bytes())
+            .ok()?;
+        ciphertext.extend_from_slice(record.ciphertext());
+        Some(Self {
+            header: record.fixed_header(),
+            ciphertext,
+        })
+    }
+
+    fn record(
+        &self,
+        max_plaintext_bytes: u32,
+    ) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointStageStoreError> {
+        let mut ciphertext = Vec::new();
+        ciphertext
+            .try_reserve_exact(self.ciphertext.len())
+            .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+        ciphertext.extend_from_slice(&self.ciphertext);
+        GuardianEncryptedCheckpointStageRecordV1::from_persisted(
+            &self.header,
+            ciphertext,
+            max_plaintext_bytes,
+        )
+        .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)
+    }
+}
+
+/// What a scan, a replay open and an Ack check take from a published
+/// candidate whose records have been authenticated: everything but the
+/// chunk and Seal records.
+struct CheckpointCatalogCandidateSummary {
+    format: CheckpointCatalogFormat,
+    metadata: CheckpointCatalogMetadata,
+    checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+    begin: PersistedCheckpointStageRecord,
+    adoption_evidence: Option<PersistedCheckpointStageRecord>,
+}
+
+impl CheckpointCatalogCandidateSummary {
+    fn of(candidate: &CheckpointCatalogCandidate) -> Option<Self> {
+        Some(Self {
+            format: candidate.format,
+            metadata: candidate.metadata,
+            checksum: candidate.checksum,
+            begin: PersistedCheckpointStageRecord::of(candidate.records.first()?)?,
+            adoption_evidence: match &candidate.adoption_evidence {
+                Some(evidence) => Some(PersistedCheckpointStageRecord::of(evidence)?),
+                None => None,
+            },
+        })
+    }
+
+    /// The candidate with its Begin record as its only record.
+    fn candidate(&self) -> Result<CheckpointCatalogCandidate, GuardianCheckpointStageStoreError> {
+        Ok(CheckpointCatalogCandidate {
+            format: self.format,
+            metadata: self.metadata,
+            records: vec![
+                self.begin
+                    .record(GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES)?,
+            ],
+            checksum: self.checksum,
+            adoption_evidence: self
+                .adoption_evidence
+                .as_ref()
+                .map(|evidence| {
+                    evidence.record(GUARDIAN_CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_BYTES)
+                })
+                .transpose()?,
+        })
+    }
+}
+
+/// Whether a published candidate came from its file or from the summary of
+/// an earlier read of the unchanged file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckpointCatalogCandidateSource {
+    /// Read and decoded: every record, not yet authenticated here.
+    File,
+    /// The summary: its records are its Begin record alone, so it must
+    /// never be authenticated, encoded or completed again.
+    Summary,
+}
+
+/// The published candidate at `path`, whose census found it with
+/// `file_identity` and `stamp`, decoded, and where it came from.
+///
+/// Every scan read and hashed every member of a pane's catalog, and a pane's
+/// reader opens a replay snapshot, which scans, about once a second: a 12-pane
+/// successor's guardian spent a fifth of its checkpoint worker hashing
+/// members that had not changed. A file still at the stamp of a read whose
+/// records were authenticated (`checkpoint_catalog_remember_candidate`)
+/// still holds those bytes, so that read's summary stands in for reading it
+/// again, while the checksum it names is known authenticated.
+///
+/// `stamp` must come from a census taken under the directory lock this call
+/// still holds (a scan's member, used before the lock is released): a stamp
+/// kept from an earlier hold may name a file that has changed since.
+fn checkpoint_catalog_read_published_candidate(
+    inner: &GuardianCheckpointStageStoreInner,
+    path: &Path,
+    file_identity: FileIdentity,
+    stamp: CheckpointCatalogFileStamp,
+) -> Result<
+    (CheckpointCatalogCandidate, CheckpointCatalogCandidateSource),
+    GuardianCheckpointStageStoreError,
+> {
+    let summary = inner
+        .catalog_memo
+        .summaries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&stamp)
+        .cloned();
+    if let Some(summary) = summary {
+        let authenticated = inner
+            .catalog_memo
+            .validated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&summary.checksum);
+        if authenticated {
+            return Ok((
+                summary.candidate()?,
+                CheckpointCatalogCandidateSource::Summary,
+            ));
+        }
+    }
+    #[cfg(test)]
+    inner
+        .catalog_candidate_reads
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let bytes = checkpoint_catalog_read_file(
+        inner,
+        path,
+        file_identity,
+        CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+    )?;
+    if u64::try_from(bytes.len()).ok() != Some(stamp.bytes) {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    Ok((
+        checkpoint_catalog_decode_candidate(&bytes)?,
+        CheckpointCatalogCandidateSource::File,
+    ))
+}
+
+/// [`checkpoint_catalog_read_published_candidate`] of a member pinned under
+/// an earlier directory lock hold (a replay snapshot's): the file is opened
+/// and stamped now, so a summary stands in only for a file unchanged since
+/// an authenticated read of it.
+fn checkpoint_catalog_reread_published_candidate(
+    inner: &GuardianCheckpointStageStoreInner,
+    path: &Path,
+    file_identity: FileIdentity,
+) -> Result<
+    (CheckpointCatalogCandidate, CheckpointCatalogCandidateSource),
+    GuardianCheckpointStageStoreError,
+> {
+    let file = open_private_file_at(&inner.directory, &inner.directory_path, path, false)?;
+    let metadata = file.metadata().map_err(|error| {
+        GuardianCheckpointStageStoreError::io("checkpoint-catalog-pin-metadata", error)
+    })?;
+    validate_private_file_metadata(&metadata, file_identity.expected_len)?;
+    if !file_identity.matches(&metadata) {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    checkpoint_catalog_read_published_candidate(
+        inner,
+        path,
+        file_identity,
+        CheckpointCatalogFileStamp::capture(&metadata),
+    )
+}
+
+/// Remember the summary of a published candidate read from the file that
+/// `stamp` describes, whose records the caller has just authenticated, once
+/// that file has settled (see `CheckpointCatalogFileStamp`).
+fn checkpoint_catalog_remember_candidate(
+    inner: &GuardianCheckpointStageStoreInner,
+    stamp: CheckpointCatalogFileStamp,
+    candidate: &CheckpointCatalogCandidate,
+) {
+    #[cfg(not(test))]
+    let settle = CHECKPOINT_CATALOG_SUMMARY_SETTLE;
+    #[cfg(test)]
+    let settle = *inner
+        .catalog_summary_settle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !stamp.settled(std::time::SystemTime::now(), settle) {
+        return;
+    }
+    let Some(summary) = CheckpointCatalogCandidateSummary::of(candidate) else {
+        return;
+    };
+    let mut summaries = inner
+        .catalog_memo
+        .summaries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if summaries.len() >= CHECKPOINT_CATALOG_SUMMARY_ENTRIES {
+        summaries.clear();
+    }
+    summaries.insert(stamp, Arc::new(summary));
+}
+
 fn checkpoint_catalog_validate_candidate_records(
     inner: &GuardianCheckpointStageStoreInner,
     candidate: &CheckpointCatalogCandidate,
@@ -13000,7 +13331,7 @@ fn checkpoint_catalog_validate_candidate_records(
 /// candidate's header and records and this store's keys, and a decoded
 /// candidate's checksum is a domain-separated SHA-256 of exactly those bytes,
 /// which decoding verified. A checksum authenticated by any store of this
-/// process for the same directory and key (`checkpoint_catalog_validated_memo`)
+/// process for the same directory and key (`checkpoint_catalog_memo`)
 /// therefore names bytes that authenticate again, and is not checked twice.
 /// A candidate built in memory has no checksum yet and must take the
 /// unmemoized check.
@@ -13012,7 +13343,8 @@ fn checkpoint_catalog_validate_decoded_candidate_records(
         inner: &GuardianCheckpointStageStoreInner,
     ) -> std::sync::MutexGuard<'_, BTreeSet<[u8; OUTPUT_MANIFEST_CHECKSUM_BYTES]>> {
         inner
-            .validated_candidates
+            .catalog_memo
+            .validated
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -13110,10 +13442,29 @@ fn checkpoint_catalog_candidate_completion(
 
     let payload_bytes = usize::try_from(metadata.total_bytes)
         .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
+    // A checksum this process has authenticated names bytes whose payload
+    // was validated then (see
+    // `checkpoint_catalog_validate_decoded_candidate_records`), and the
+    // validation (decoding the whole terminal checkpoint and encoding it
+    // again) is a function of those bytes and this key alone. A recovery
+    // reopen of a member whose stage upload is reclaimed spent a fifth of a
+    // successor's capture validating it again. The chunks are still opened:
+    // their ordered identity binds the Seal. A candidate built in memory has
+    // no checksum.
+    let payload_validated = candidate.checksum != [0; OUTPUT_MANIFEST_CHECKSUM_BYTES]
+        && inner
+            .catalog_memo
+            .validated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&candidate.checksum);
     let mut payload = Zeroizing::new(Vec::new());
-    payload
-        .try_reserve_exact(payload_bytes)
-        .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+    if !payload_validated {
+        payload
+            .try_reserve_exact(payload_bytes)
+            .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+    }
+    let mut assembled_bytes = 0_usize;
     let mut chunk_set = GuardianCheckpointOrderedChunkSetBuilderV1::new(
         metadata.total_bytes,
         shape.chunk_bytes,
@@ -13144,7 +13495,12 @@ fn checkpoint_catalog_candidate_completion(
             return Err(GuardianCheckpointStageStoreError::Poisoned);
         }
         chunk_set.push_authenticated_chunk(index, offset, &chunk)?;
-        payload.extend_from_slice(&chunk);
+        assembled_bytes = assembled_bytes
+            .checked_add(chunk.len())
+            .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+        if !payload_validated {
+            payload.extend_from_slice(&chunk);
+        }
         let expected = GuardianCheckpointStageSealIntentV1::chunk(
             &shape.binding,
             shape.upload_id,
@@ -13157,10 +13513,16 @@ fn checkpoint_catalog_candidate_completion(
             return Err(GuardianCheckpointStageStoreError::Poisoned);
         }
     }
-    if payload.len() != payload_bytes {
+    if assembled_bytes != payload_bytes {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
-    shape.descriptor.validate_canonical_payload(&payload)?;
+    if !payload_validated {
+        #[cfg(test)]
+        inner
+            .catalog_payload_validations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        shape.descriptor.validate_canonical_payload(&payload)?;
+    }
     let ordered_chunk_set_identity = chunk_set.finish()?;
     let seal_request = GuardianCheckpointStageRequestV1::seal(
         shape.scope,
@@ -13314,13 +13676,13 @@ fn checkpoint_catalog_require_existing_ack(
             .ok_or(GuardianCheckpointStageStoreError::OutOfOrder)?,
         &seal_record,
     )?;
-    let bytes = checkpoint_catalog_read_file(
+    // Only the metadata, checksum and adoption evidence are needed here.
+    let (candidate, _) = checkpoint_catalog_read_published_candidate(
         inner,
         &member.candidate_path,
         member.candidate_file_identity,
-        CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+        member.candidate_file_stamp,
     )?;
-    let candidate = checkpoint_catalog_decode_candidate(&bytes)?;
     if candidate.format != CheckpointCatalogFormat::ProtectedV3
         || candidate.metadata != metadata
         || candidate.checksum != member.candidate_checksum
@@ -13614,7 +13976,7 @@ fn checkpoint_catalog_scan(
                     identity,
                     path,
                     file_identity,
-                    bytes: metadata.len(),
+                    stamp: CheckpointCatalogFileStamp::capture(&metadata),
                     published: false,
                 });
             }
@@ -13679,22 +14041,20 @@ fn checkpoint_catalog_scan(
         if candidate_entry.published {
             return Err(GuardianCheckpointStageStoreError::Poisoned);
         }
-        let candidate_bytes = checkpoint_catalog_read_file(
+        let (candidate, source) = checkpoint_catalog_read_published_candidate(
             inner,
             &candidate_entry.path,
             candidate_entry.file_identity,
-            CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+            candidate_entry.stamp,
         )?;
-        if u64::try_from(candidate_bytes.len()).ok() != Some(candidate_entry.bytes) {
-            return Err(GuardianCheckpointStageStoreError::Poisoned);
-        }
-        let candidate = checkpoint_catalog_decode_candidate(&candidate_bytes)?;
         if candidate.metadata.identity != candidate_entry.identity
             || !checkpoint_catalog_marker_matches_candidate(&discovered_marker.marker, &candidate)
         {
             return Err(GuardianCheckpointStageStoreError::Poisoned);
         }
-        checkpoint_catalog_validate_decoded_candidate_records(inner, &candidate)?;
+        if source == CheckpointCatalogCandidateSource::File {
+            checkpoint_catalog_validate_decoded_candidate_records(inner, &candidate)?;
+        }
         let authenticated_generic_restore = match (
             candidate.format,
             candidate.metadata.identity.scope,
@@ -13719,6 +14079,9 @@ fn checkpoint_catalog_scan(
                 None
             }
         };
+        if source == CheckpointCatalogCandidateSource::File {
+            checkpoint_catalog_remember_candidate(inner, candidate_entry.stamp, &candidate);
+        }
         candidate_entry.published = true;
         published.push(PublishedCheckpointCatalogMember {
             format: candidate.format,
@@ -13726,6 +14089,7 @@ fn checkpoint_catalog_scan(
             candidate_checksum: candidate.checksum,
             candidate_path: candidate_entry.path.clone(),
             candidate_file_identity: candidate_entry.file_identity,
+            candidate_file_stamp: candidate_entry.stamp,
             marker_path: discovered_marker.path,
             marker_file_identity: discovered_marker.file_identity,
         });
@@ -17285,9 +17649,12 @@ mod tests {
                 gate: Mutex::new(()),
                 durable_records: Mutex::new(Vec::new()),
                 replay: Mutex::new(GuardianReplayState::new()),
-                validated_candidates: Arc::clone(&inner.validated_candidates),
+                catalog_memo: Arc::clone(&inner.catalog_memo),
                 custody_sync_failure: std::sync::atomic::AtomicU8::new(0),
                 custody_publication_cut: std::sync::atomic::AtomicU8::new(0),
+                catalog_candidate_reads: std::sync::atomic::AtomicUsize::new(0),
+                catalog_payload_validations: std::sync::atomic::AtomicUsize::new(0),
+                catalog_summary_settle: Mutex::new(CHECKPOINT_CATALOG_SUMMARY_SETTLE),
             }),
         }
     }
@@ -17727,7 +18094,8 @@ mod tests {
             assert_eq!(scan.published.len(), 1);
             assert!(
                 inner
-                    .validated_candidates
+                    .catalog_memo
+                    .validated
                     .lock()
                     .unwrap()
                     .contains(&scan.published[0].candidate_checksum),
@@ -17793,7 +18161,8 @@ mod tests {
         let remembers = |store: &GuardianCheckpointStageStore| {
             store
                 .inner
-                .validated_candidates
+                .catalog_memo
+                .validated
                 .lock()
                 .unwrap()
                 .contains(&checksum)
@@ -17812,6 +18181,194 @@ mod tests {
             !remembers(&foreign),
             "a store under another key authenticates for itself"
         );
+        Ok(())
+    }
+
+    /// Completing a member (its chunks opened, its Seal checked) validates
+    /// its payload only for a checksum this process has not authenticated:
+    /// once authenticated, a member read again completes without decoding
+    /// the checkpoint again. A candidate built in memory (no checksum)
+    /// validates every time, and so does a member whose checksum the memo
+    /// has forgotten.
+    #[test]
+    fn a_member_payload_is_validated_once_per_authenticated_checksum()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-catalog-payload-memo-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0xaf100);
+        let mux = Uuid::from_u128(0xaf101);
+        let pane = Uuid::from_u128(0xaf102);
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
+        checkpoint_catalog_stage_and_publish(
+            &pipeline, &store, &journal, &mut state, guardian, mux, pane, 1, 1, 0xaf_0000,
+            b"memo;", b"memo;",
+        )?;
+        store.with_exclusive_directory(|inner| {
+            let validations = || {
+                inner
+                    .catalog_payload_validations
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            };
+            let scan =
+                checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })?;
+            let member = &scan.published[0];
+            let bytes = checkpoint_catalog_read_file(
+                inner,
+                &member.candidate_path,
+                member.candidate_file_identity,
+                CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+            )?;
+            let candidate = checkpoint_catalog_decode_candidate(&bytes)?;
+
+            let authenticated = validations();
+            let (shape, _receipt) = checkpoint_catalog_candidate_completion(inner, &candidate)?;
+            assert_eq!(validations(), authenticated, "an authenticated payload");
+
+            let mut in_memory = checkpoint_catalog_decode_candidate(&bytes)?;
+            in_memory.checksum = [0; OUTPUT_MANIFEST_CHECKSUM_BYTES];
+            let (validated, _receipt) = checkpoint_catalog_candidate_completion(inner, &in_memory)?;
+            assert_eq!(
+                validations(),
+                authenticated + 1,
+                "a candidate built in memory"
+            );
+            assert_eq!(validated.key(), shape.key());
+
+            inner.catalog_memo.validated.lock().unwrap().clear();
+            let (_shape, _receipt) = checkpoint_catalog_candidate_completion(inner, &candidate)?;
+            assert_eq!(validations(), authenticated + 2, "a forgotten checksum");
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// A member whose file has gone unchanged since an authenticated read
+    /// (past the settle window) is scanned, opened for replay and checked
+    /// for its Ack from that read's summary, without reading the file. A
+    /// file that changed within the window is read every time, and one
+    /// rewritten in place is read again: its damage is found.
+    #[test]
+    fn a_settled_member_is_scanned_from_its_summary_until_its_file_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-catalog-summary-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0xae100);
+        let mux = Uuid::from_u128(0xae101);
+        let pane = Uuid::from_u128(0xae102);
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
+        checkpoint_catalog_stage_and_publish(
+            &pipeline, &store, &journal, &mut state, guardian, mux, pane, 1, 1, 0xae_0000, b"sum;",
+            b"sum;",
+        )?;
+        let (begin, completion) = checkpoint_catalog_newest_begin(&store, pane)?;
+        store.apply_ack_from_committed_catalog(
+            GuardianCheckpointStageRequestV1::ack(
+                begin.scope(),
+                begin.upload_id(),
+                begin.descriptor(),
+                begin.chunk_bytes(),
+                completion,
+            )?,
+            mux,
+        )?;
+        let reads = || {
+            store
+                .inner
+                .catalog_candidate_reads
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let scan = || {
+            store.with_exclusive_directory(|inner| {
+                checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })
+            })
+        };
+        let descriptor_and_ack = || {
+            store.with_exclusive_directory(|inner| {
+                let scan =
+                    checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })?;
+                let member = &scan.published[0];
+                checkpoint_catalog_require_existing_ack(inner, member)?;
+                guardian_replay_open_catalog_descriptor(inner, member, None)
+            })
+        };
+
+        // Each scan and the replay open read the member (the Ack check reads
+        // it through the same path while the stage still holds the upload).
+        let unsettled = reads();
+        let candidate_path = scan()?.published[0].candidate_path.clone();
+        let from_file = descriptor_and_ack()?;
+        assert!(
+            reads() - unsettled >= 3,
+            "a member changed within the settle window is read every time: {} reads",
+            reads() - unsettled
+        );
+
+        *store.inner.catalog_summary_settle.lock().unwrap() = Duration::ZERO;
+        let settled = reads();
+        let first = scan()?;
+        let summarized = scan()?;
+        let from_summary = descriptor_and_ack()?;
+        // A replay page checks its pin from the summary; a checkpoint page
+        // still gets every record.
+        let (pin_source, records) = store.with_exclusive_directory(|inner| {
+            let scan =
+                checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })?;
+            let member = &scan.published[0];
+            let pin = GuardianReplayCatalogPin {
+                genesis_origin: None,
+                selected: member.clone(),
+                settled_head_identity: member.metadata.identity,
+                settled_head_candidate_checksum: member.candidate_checksum,
+                settled_head_candidate_path: member.candidate_path.clone(),
+                settled_head_candidate_file_identity: member.candidate_file_identity,
+                settled_head_marker_path: member.marker_path.clone(),
+                settled_head_marker_file_identity: member.marker_file_identity,
+            };
+            let (checked, source) = guardian_replay_validate_catalog_pin(inner, &pin)?;
+            let full = guardian_replay_selected_records(inner, &pin, checked, source)?;
+            Ok((source, full.records.len()))
+        })?;
+        assert_eq!(pin_source, CheckpointCatalogCandidateSource::Summary);
+        assert!(records > 2, "{} records", records);
+        assert_eq!(reads() - settled, 1, "a settled member is read once");
+        assert_eq!(summarized.published.len(), 1);
+        assert_eq!(
+            summarized.published[0].candidate_checksum,
+            first.published[0].candidate_checksum
+        );
+        assert_eq!(
+            summarized.published[0].metadata,
+            first.published[0].metadata
+        );
+        assert_eq!(summarized.generic_restore_evidence.len(), 1);
+        assert!(
+            from_summary == from_file,
+            "a replay open takes the descriptor the file gives"
+        );
+
+        // Past any timestamp granule, so the rewrite's change time differs.
+        std::thread::sleep(Duration::from_millis(1100));
+        let mut bytes = std::fs::read(&candidate_path)?;
+        bytes[CHECKPOINT_CATALOG_HEADER_BYTES + 8] ^= 0x40;
+        let mut file = OpenOptions::new().write(true).open(&candidate_path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        let rewritten = reads();
+        let rescanned = scan();
+        assert!(
+            matches!(rescanned, Err(GuardianCheckpointStageStoreError::Poisoned)),
+            "a member rewritten in place is read again and fails: {:?}",
+            rescanned.map(|scan| scan.published.len())
+        );
+        assert_eq!(reads() - rewritten, 1);
         Ok(())
     }
 
@@ -20979,6 +21536,7 @@ mod tests {
             candidate_checksum: [0x57; 32],
             candidate_path: PathBuf::from("protected-genesis-candidate"),
             candidate_file_identity: file_identity,
+            candidate_file_stamp: checkpoint_catalog_test_stamp(1, 1),
             marker_path: PathBuf::from("protected-genesis-marker"),
             marker_file_identity: file_identity,
         };
@@ -21060,6 +21618,17 @@ mod tests {
         );
     }
 
+    /// A stamp for a catalog file no test reads.
+    fn checkpoint_catalog_test_stamp(inode: u64, bytes: u64) -> CheckpointCatalogFileStamp {
+        CheckpointCatalogFileStamp {
+            device: 1,
+            inode,
+            bytes,
+            modified: (1, 0),
+            changed: (1, 0),
+        }
+    }
+
     fn checkpoint_catalog_test_unpublished_candidate(
         identity: CheckpointCatalogIdentity,
         path: PathBuf,
@@ -21076,7 +21645,7 @@ mod tests {
                 links: 1,
                 expected_len: Some(100),
             },
-            bytes: 100,
+            stamp: checkpoint_catalog_test_stamp(inode, 100),
             published: false,
         }
     }
@@ -21555,6 +22124,7 @@ mod tests {
             candidate_checksum: [0x71; 32],
             candidate_path: PathBuf::from("genesis-candidate-one"),
             candidate_file_identity: file_identity,
+            candidate_file_stamp: checkpoint_catalog_test_stamp(1, 1),
             marker_path: PathBuf::from("genesis-marker-one"),
             marker_file_identity: file_identity,
         };
@@ -21642,6 +22212,7 @@ mod tests {
             candidate_checksum,
             candidate_path: PathBuf::from(format!("candidate-{identity_byte}")),
             candidate_file_identity: file_identity,
+            candidate_file_stamp: checkpoint_catalog_test_stamp(u64::from(identity_byte) + 1, 1),
             marker_path: PathBuf::from(format!("marker-{identity_byte}")),
             marker_file_identity: file_identity,
         }
