@@ -168,6 +168,22 @@ impl PageRows {
     /// record, so the row stays a view until an edit through it has.
     pub fn page_row(&mut self, index: usize) -> Option<(&mut Page, u32)> {
         let stable = self.stable(index);
+        let view = &self.views[index];
+        if view.edited || view.line.get().is_some() {
+            return self.page_row_from_view(index, stable);
+        }
+        self.list.row_mut(stable)
+    }
+
+    /// [`Self::page_row`] of a row with a view, out of line: storing an
+    /// edited view back and dropping a cached one made the frame of every
+    /// printed run's lookup, which almost never has a view.
+    #[inline(never)]
+    fn page_row_from_view(
+        &mut self,
+        index: usize,
+        stable: StableRowIndex,
+    ) -> Option<(&mut Page, u32)> {
         let view = &mut self.views[index];
         let line = view.line.take();
         if std::mem::take(&mut view.edited) {
