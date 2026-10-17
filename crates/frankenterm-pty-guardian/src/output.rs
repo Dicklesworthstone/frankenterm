@@ -429,6 +429,8 @@ struct CheckpointStageCensusEntry {
     role: CheckpointStageFileRole,
     path: PathBuf,
     bytes: u64,
+    /// When the record was written; records are immutable once created.
+    modified: Option<std::time::SystemTime>,
 }
 
 struct CheckpointStageCensus {
@@ -3556,17 +3558,23 @@ impl GuardianCheckpointStageStore {
                 let record_bytes = checkpoint_record_bytes_for_plaintext(begin_payload.len())?;
                 let mut admitted =
                     checkpoint_stage_require_capacity(inner, &census, shape.key(), 1, record_bytes);
-                if matches!(admitted, Err(GuardianCheckpointStageStoreError::Capacity))
-                    && checkpoint_stage_reclaim_superseded(inner)? != 0
-                {
-                    census = checkpoint_stage_census(inner)?;
-                    admitted = checkpoint_stage_require_capacity(
-                        inner,
-                        &census,
-                        shape.key(),
-                        1,
-                        record_bytes,
-                    );
+                let reclaimers: [CheckpointStageReclaimer; 2] = [
+                    checkpoint_stage_reclaim_superseded,
+                    checkpoint_stage_reclaim_for_capacity,
+                ];
+                for reclaim in reclaimers {
+                    if matches!(admitted, Err(GuardianCheckpointStageStoreError::Capacity))
+                        && reclaim(inner)? != 0
+                    {
+                        census = checkpoint_stage_census(inner)?;
+                        admitted = checkpoint_stage_require_capacity(
+                            inner,
+                            &census,
+                            shape.key(),
+                            1,
+                            record_bytes,
+                        );
+                    }
                 }
                 admitted?;
                 let path = checkpoint_candidate_path(inner, shape.key())?;
@@ -3713,9 +3721,13 @@ impl GuardianCheckpointStageStore {
             let recovered = (|| {
                 let census = checkpoint_stage_census(inner)?;
                 if !census.entries.iter().any(|entry| entry.key == shape.key()) {
-                    return Ok(GuardianCheckpointStageReplyV1::Absent {
-                        upload_id: shape.upload_id,
-                    });
+                    // A full stage reclaims acknowledged uploads, a pane's
+                    // newest included; its published member answers for it.
+                    return Ok(checkpoint_stage_query_published(inner, &shape)?.unwrap_or(
+                        GuardianCheckpointStageReplyV1::Absent {
+                            upload_id: shape.upload_id,
+                        },
+                    ));
                 }
                 let inspection = checkpoint_inspect_upload(
                     inner,
@@ -6872,20 +6884,50 @@ fn checkpoint_catalog_ack_proof_path(
     Ok(inner.directory_path.join(name))
 }
 
-/// Durably keep `ack` as `identity`'s ACK proof. An existing proof is kept;
-/// verification authenticates whatever it holds.
+/// Durably keep `ack`, the stage's authenticated ACK record, as `identity`'s
+/// ACK proof. It is published whole through a staging file, so a crash never
+/// leaves a torn proof under its name. A proof already there must hold
+/// exactly these bytes: one that does not (an older guardian tore it
+/// mid-write) is this guardian's own file and is replaced, because the stage
+/// reclaims the upload once its proof exists and the torn copy would then be
+/// the only one.
 fn checkpoint_catalog_write_ack_proof(
     inner: &GuardianCheckpointStageStoreInner,
     identity: CheckpointCatalogIdentity,
     ack: &GuardianEncryptedCheckpointStageRecordV1,
 ) -> Result<(), GuardianCheckpointStageStoreError> {
     let path = checkpoint_catalog_ack_proof_path(inner, identity)?;
-    match checkpoint_create_record_new(inner, &path)? {
-        CheckpointStageCreateOutcome::Created(file) => {
-            checkpoint_write_created_record(inner, &path, file, ack)
+    let header = ack.fixed_header();
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(header.len() + ack.ciphertext().len())
+        .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(ack.ciphertext());
+    match open_private_file_at(&inner.directory, &inner.directory_path, &path, false) {
+        Ok(existing) => {
+            let mut held = Vec::new();
+            existing
+                .take(u64::try_from(bytes.len()).map_or(u64::MAX, |len| len.saturating_add(1)))
+                .read_to_end(&mut held)
+                .map_err(|error| {
+                    GuardianCheckpointStageStoreError::io("checkpoint-ack-proof-read", error)
+                })?;
+            if !checkpoint_bytes_match(&held, &bytes) {
+                checkpoint_unlink_record_path(inner, &path)?;
+            }
         }
-        CheckpointStageCreateOutcome::Existing => Ok(()),
+        Err(error) if output_name_was_reclaimed(&error) => {}
+        Err(error) => return Err(error.into()),
     }
+    checkpoint_catalog_publish_file(
+        inner,
+        &path,
+        &bytes,
+        "checkpoint-ack-proof-write",
+        "checkpoint-ack-proof-sync",
+    )
+    .map(drop)
 }
 
 /// A census-style entry naming `identity`'s ACK proof, if it exists.
@@ -6908,6 +6950,7 @@ fn checkpoint_catalog_ack_proof_entry(
                 },
                 path,
                 bytes: metadata.len(),
+                modified: metadata.modified().ok(),
             }))
         }
         Err(error) if output_name_was_reclaimed(&error) => Ok(None),
@@ -7157,6 +7200,7 @@ fn checkpoint_stage_census(
             role,
             path,
             bytes: metadata.len(),
+            modified: metadata.modified().ok(),
         });
         uploads.insert(key);
         if uploads.len() > inner.policy.max_retained_uploads {
@@ -7193,6 +7237,7 @@ fn checkpoint_stage_census_entry(
         role,
         path,
         bytes: metadata.len(),
+        modified: metadata.modified().ok(),
     })
 }
 
@@ -7474,9 +7519,215 @@ fn checkpoint_stage_reclaim_superseded(
     Ok(reclaim.len())
 }
 
-/// Make sure `member` has its ACK proof, copying the stage's ACK record when an
-/// older guardian acknowledged it before proofs existed. False when there is
-/// no ACK record to copy.
+type CheckpointStageReclaimer =
+    fn(&GuardianCheckpointStageStoreInner) -> Result<usize, GuardianCheckpointStageStoreError>;
+
+/// How long an unsealed upload may sit untouched before a full stage reclaims
+/// it: far past any live publisher's step deadline, so only an upload whose
+/// pane closed or whose mux died mid-upload qualifies.
+const CHECKPOINT_STAGE_ABANDONED_UPLOAD_AGE: std::time::Duration =
+    std::time::Duration::from_secs(600);
+
+/// When reclaiming superseded uploads leaves the stage full, unlink the
+/// oldest uploads whose content lives on elsewhere, or that nothing will ever
+/// finish, until at most half the stage is in use:
+///
+/// - an acknowledged Pane upload whose published member keeps an ACK proof
+///   that authenticates, a pane's newest included: Query answers for it from
+///   that member, so a quiescent pane still confirms its acknowledgement;
+/// - a Genesis upload whose spawn published its genesis member;
+/// - an unsealed upload untouched for `CHECKPOINT_STAGE_ABANDONED_UPLOAD_AGE`;
+///   a live publisher that finds it gone starts again from Begin.
+///
+/// A sealed but unacknowledged upload stays: its mux may still adopt it.
+/// Without this pass, eight panes that each hold one newest acknowledged
+/// upload, eight spawns before their first capture, or eight closed panes'
+/// last uploads fill the stage for good and refuse every later Begin.
+fn checkpoint_stage_reclaim_for_capacity(
+    inner: &GuardianCheckpointStageStoreInner,
+) -> Result<usize, GuardianCheckpointStageStoreError> {
+    let census = checkpoint_stage_census(inner)?;
+    let target = inner.policy.max_retained_uploads / 2;
+    let Some(excess) = census.uploads.len().checked_sub(target).filter(|n| *n > 0) else {
+        return Ok(0);
+    };
+    let now = std::time::SystemTime::now();
+    let mut pane_catalogs: BTreeMap<Uuid, Option<CheckpointCatalogScan>> = BTreeMap::new();
+    let mut reclaimable = Vec::new();
+    for key in &census.uploads {
+        let entries = || census.entries.iter().filter(|entry| entry.key == *key);
+        let Some(candidate) =
+            entries().find(|entry| entry.role == CheckpointStageFileRole::Candidate)
+        else {
+            continue;
+        };
+        let sealed =
+            entries().any(|entry| matches!(entry.role, CheckpointStageFileRole::Seal { .. }));
+        let acked =
+            entries().any(|entry| matches!(entry.role, CheckpointStageFileRole::Ack { .. }));
+        let abandoned = !sealed
+            && entries()
+                .filter_map(|entry| entry.modified)
+                .max()
+                .and_then(|written| now.duration_since(written).ok())
+                .is_some_and(|age| age >= CHECKPOINT_STAGE_ABANDONED_UPLOAD_AGE);
+        let durable_elsewhere = match key.scope {
+            CheckpointStagePathScope::Pane {
+                pane_id,
+                generation,
+            } if acked => {
+                let catalog = pane_catalogs.entry(pane_id).or_insert_with(|| {
+                    checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id }).ok()
+                });
+                let member = catalog.as_ref().and_then(|catalog| {
+                    catalog.published.iter().find(|member| {
+                        member.format == CheckpointCatalogFormat::ProtectedV3
+                            && member.metadata.upload_id == key.upload_id
+                            && member.metadata.capture_generation == generation
+                    })
+                });
+                member.is_some_and(|member| {
+                    checkpoint_stage_upload_acknowledged(inner, &census, candidate).unwrap_or(false)
+                        && checkpoint_stage_preserve_ack_proof(inner, &census, member, *key)
+                            .unwrap_or(false)
+                })
+            }
+            CheckpointStagePathScope::Pane { .. } => false,
+            CheckpointStagePathScope::Genesis { spawn_effect_id } => {
+                checkpoint_catalog_scan(inner, CheckpointCatalogScope::Genesis { spawn_effect_id })
+                    .is_ok_and(|genesis| !genesis.published.is_empty())
+            }
+        };
+        if durable_elsewhere || abandoned {
+            reclaimable.push((candidate.modified, *key));
+        }
+    }
+    // Oldest first: a closed or long-quiescent pane's upload goes before one
+    // an active pane will supersede soon anyway.
+    reclaimable.sort();
+    let mut reclaimed = 0;
+    for (_, key) in reclaimable.into_iter().take(excess) {
+        let mut entries: Vec<&CheckpointStageCensusEntry> = census
+            .entries
+            .iter()
+            .filter(|entry| entry.key == key)
+            .collect();
+        entries.sort_by_key(|entry| entry.role != CheckpointStageFileRole::Candidate);
+        for entry in entries {
+            checkpoint_stage_unlink(inner, entry)?;
+        }
+        reclaimed += 1;
+    }
+    if reclaimed != 0 {
+        inner.directory.sync_all().map_err(|error| {
+            GuardianCheckpointStageStoreError::io("checkpoint-reclaim-directory-sync", error)
+        })?;
+    }
+    Ok(reclaimed)
+}
+
+/// Query's answer for a Pane upload the stage no longer holds: Acked when a
+/// published member names it and that member's ACK proof authenticates, as
+/// recovery verifies it. None when no member names it (or the pane's catalog
+/// cannot be read, which leaves the upload unproven).
+fn checkpoint_stage_query_published(
+    inner: &GuardianCheckpointStageStoreInner,
+    shape: &CheckpointStageRequestShape,
+) -> Result<Option<GuardianCheckpointStageReplyV1>, GuardianCheckpointStageStoreError> {
+    let CheckpointStagePathScope::Pane {
+        pane_id,
+        generation,
+    } = shape.path_scope
+    else {
+        return Ok(None);
+    };
+    // Every new upload's first Query lands here; a scan reads every member
+    // whole, so look at candidate headers first.
+    if matches!(
+        checkpoint_catalog_names_upload(inner, pane_id, shape.upload_id),
+        Ok(false)
+    ) {
+        return Ok(None);
+    }
+    let Ok(catalog) = checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id })
+    else {
+        return Ok(None);
+    };
+    let Some(member) = catalog.published.iter().find(|member| {
+        member.format == CheckpointCatalogFormat::ProtectedV3
+            && member.metadata.upload_id == shape.upload_id
+            && member.metadata.capture_generation == generation
+    }) else {
+        return Ok(None);
+    };
+    let published = checkpoint_catalog_require_ack_proof(inner, member)?;
+    if published.key() != shape.key()
+        || published.descriptor != shape.descriptor
+        || published.chunk_bytes != shape.chunk_bytes
+    {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    Ok(Some(GuardianCheckpointStageReplyV1::Acked {
+        upload_id: shape.upload_id,
+        completion_id: member.metadata.completion_id,
+        checkpoint_id: shape.descriptor.checkpoint_id(),
+        boundary_id: shape.descriptor.boundary_id(),
+        total_bytes: shape.total_bytes,
+    }))
+}
+
+/// Whether a candidate in `pane_id`'s catalog may have been published from
+/// `upload_id`, judged from candidate headers alone. A header that cannot be
+/// read says yes, leaving the verdict to a full scan.
+fn checkpoint_catalog_names_upload(
+    inner: &GuardianCheckpointStageStoreInner,
+    pane_id: Uuid,
+    upload_id: Uuid,
+) -> Result<bool, GuardianCheckpointStageStoreError> {
+    for name in read_directory_names(&inner.directory)? {
+        let Some((
+            identity,
+            CheckpointCatalogPathKind::Canonical(CheckpointCatalogPathRole::Candidate),
+        )) = name.to_str().and_then(checkpoint_catalog_parse_path)
+        else {
+            continue;
+        };
+        if identity.scope != (CheckpointCatalogScope::Pane { pane_id }) {
+            continue;
+        }
+        let path = inner.directory_path.join(&name);
+        let mut header = [0_u8; CHECKPOINT_CATALOG_HEADER_BYTES];
+        let named = open_private_file_at(&inner.directory, &inner.directory_path, &path, false)
+            .ok()
+            .and_then(|mut file| file.read_exact(&mut header).ok())
+            .and_then(|()| checkpoint_catalog_candidate_header_upload_id(&header).ok())
+            .is_none_or(|named| named == upload_id);
+        if named {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The upload a catalog candidate was published from, decoded from the head
+/// of its header exactly as `checkpoint_catalog_decode_candidate` reads it.
+fn checkpoint_catalog_candidate_header_upload_id(
+    header: &[u8],
+) -> Result<Uuid, GuardianCheckpointStageStoreError> {
+    let mut decoder = ManifestDecoder::new(header);
+    CheckpointCatalogFormat::from_candidate_header(decoder.take::<8>()?, decoder.u32()?)?;
+    // Scope tag, predecessor flag, padding, scope, generation, candidate id.
+    decoder.take::<4>()?;
+    decoder.uuid()?;
+    decoder.u64()?;
+    decoder.uuid()?;
+    Ok(decoder.uuid()?)
+}
+
+/// Make sure `member` has an ACK proof that authenticates, copying the stage's
+/// ACK record when an older guardian acknowledged it before proofs existed or
+/// left a torn one. False when no authenticated copy could be made, so the
+/// upload holding the only good ACK record stays.
 fn checkpoint_stage_preserve_ack_proof(
     inner: &GuardianCheckpointStageStoreInner,
     census: &CheckpointStageCensus,
@@ -7486,6 +7737,7 @@ fn checkpoint_stage_preserve_ack_proof(
     let completion_id = member.metadata.completion_id;
     if checkpoint_catalog_ack_proof_entry(inner, member.metadata.identity, key, completion_id)?
         .is_some()
+        && checkpoint_catalog_require_ack_proof(inner, member).is_ok()
     {
         return Ok(true);
     }
@@ -7505,7 +7757,7 @@ fn checkpoint_stage_preserve_ack_proof(
             .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
     )?;
     checkpoint_catalog_write_ack_proof(inner, member.metadata.identity, &record)?;
-    Ok(true)
+    Ok(checkpoint_catalog_require_ack_proof(inner, member).is_ok())
 }
 
 /// Whether one upload is sealed and acknowledged, from its own records.
@@ -12602,7 +12854,7 @@ fn checkpoint_catalog_require_existing_ack(
             && entry.role == CheckpointStageFileRole::Candidate
     });
     let Some(entry) = candidates.next() else {
-        return checkpoint_catalog_require_ack_proof(inner, member);
+        return checkpoint_catalog_require_ack_proof(inner, member).map(drop);
     };
     if candidates.next().is_some() {
         return Err(GuardianCheckpointStageStoreError::Conflict);
@@ -12720,11 +12972,12 @@ fn checkpoint_catalog_require_existing_ack(
 /// `checkpoint_catalog_require_existing_ack` once the stage has reclaimed the
 /// upload: the member's own copied records prove its durable completion, and
 /// its ACK proof must authenticate as that completion's finalizer under the
-/// adopting mux, exactly as the stage's ACK record would.
+/// adopting mux, exactly as the stage's ACK record would. Returns the shape of
+/// the upload the member was published from.
 fn checkpoint_catalog_require_ack_proof(
     inner: &GuardianCheckpointStageStoreInner,
     member: &PublishedCheckpointCatalogMember,
-) -> Result<(), GuardianCheckpointStageStoreError> {
+) -> Result<CheckpointStageRequestShape, GuardianCheckpointStageStoreError> {
     let metadata = member.metadata;
     let bytes = checkpoint_catalog_read_file(
         inner,
@@ -12773,7 +13026,7 @@ fn checkpoint_catalog_require_ack_proof(
         metadata.adoption_mux_incarnation,
         &ack_record,
     )?;
-    Ok(())
+    Ok(shape)
 }
 
 fn checkpoint_catalog_recover_adoption_evidence(
@@ -13973,9 +14226,13 @@ fn checkpoint_catalog_reclaim_oldest_pane_members(
             continue;
         };
         // Leftovers older than every member: an unmarked candidate, or an ACK
-        // proof whose member is gone.
+        // proof (or the staging copy of one) whose member is gone.
         let proof_base = text
             .strip_prefix(CHECKPOINT_CATALOG_ACK_PROOF_PREFIX)
+            .map(|rest| {
+                rest.strip_suffix(CHECKPOINT_CATALOG_STAGING_SUFFIX)
+                    .unwrap_or(rest)
+            })
             .and_then(|rest| rest.strip_suffix(CHECKPOINT_CATALOG_ACK_PROOF_SUFFIX));
         let parsed = match proof_base {
             Some(base) => checkpoint_catalog_parse_path(&format!(
@@ -14020,9 +14277,18 @@ fn checkpoint_catalog_reclaim_oldest_pane_members(
     if excess > 0
         && let Ok(replay) = inner.replay.try_lock()
     {
+        // A snapshot whose terminal page its mux acknowledged has replayed
+        // everything it pinned; only one still replaying keeps its members.
+        // A finished restore's snapshot lingers until eviction, and pinning
+        // it stopped reclamation for good once that member became the oldest.
         let pinned: Vec<CheckpointCatalogIdentity> = replay
             .snapshots
             .values()
+            .filter(|snapshot| {
+                !snapshot
+                    .issued
+                    .is_some_and(|issued| issued.terminal && issued.acknowledged)
+            })
             .flat_map(|snapshot| {
                 [
                     snapshot.catalog.selected.metadata.identity,
@@ -16605,6 +16871,304 @@ mod tests {
     }
 
     #[test]
+    fn stage_keeps_admitting_captures_when_every_pane_holds_its_newest_upload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) =
+            pipeline_with_policy("ft-guardian-stage-full-", OutputSegmentPolicy::production())?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0x5f100);
+        let mux = Uuid::from_u128(0x5f101);
+        // A pane that closed (or whose mux died) mid-upload long ago.
+        let abandoned_pane = Uuid::from_u128(0x5f1ff);
+        let abandoned_journal = pipeline.prepare_pane(guardian, abandoned_pane)?;
+        let abandoned_output = b"abandoned;";
+        let receipt = durable_commit(
+            &pipeline,
+            abandoned_pane,
+            &abandoned_journal,
+            abandoned_output,
+        )?;
+        let abandoned_begin = checkpoint_catalog_test_record_stage_request(
+            GuardianCheckpointStageKindV1::Begin,
+            abandoned_pane,
+            1,
+            Uuid::from_u128(0x5f1fe),
+            &checkpoint_catalog_test_terminal(abandoned_output),
+            receipt,
+            1_024,
+            None,
+        )?;
+        store.apply_begin(&abandoned_begin)?;
+        let abandoned_key = CheckpointStageRequestShape::from_request(&abandoned_begin)?.key();
+        store.with_exclusive_directory(|inner| {
+            let path = checkpoint_candidate_path(inner, abandoned_key)?;
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|file| {
+                    file.set_modified(
+                        std::time::SystemTime::now() - CHECKPOINT_STAGE_ABANDONED_UPLOAD_AGE * 2,
+                    )
+                })
+                .map_err(|error| GuardianCheckpointStageStoreError::io("test-backdate", error))
+        })?;
+
+        // Twelve panes, more than the eight uploads the stage retains, each
+        // with an acknowledged capture and then a second one. Each pane's
+        // newest upload is never superseded, so before a full stage could
+        // reclaim acknowledged uploads the ninth pane's first Begin was
+        // refused and no pane could checkpoint again.
+        let mut panes = Vec::new();
+        for pane_index in 0..12_u128 {
+            let pane = Uuid::from_u128(0x5f200 + pane_index);
+            panes.push((
+                pane_index,
+                pane,
+                pipeline.prepare_pane(guardian, pane)?,
+                checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?,
+                Vec::new(),
+            ));
+        }
+        let mut newest = BTreeMap::new();
+        for capture in 0..2_u64 {
+            for (pane_index, pane, journal, state, output) in &mut panes {
+                let (pane_index, pane) = (*pane_index, *pane);
+                let appended = format!("pane {pane_index} capture {capture};");
+                output.extend_from_slice(appended.as_bytes());
+                checkpoint_catalog_stage_and_publish(
+                    &pipeline,
+                    &store,
+                    journal,
+                    state,
+                    guardian,
+                    mux,
+                    pane,
+                    1,
+                    capture + 1,
+                    0x5f00_0000 + pane_index * 0x100 + u128::from(capture) * 0x10,
+                    appended.as_bytes(),
+                    output,
+                )?;
+                let (begin, completion) = checkpoint_catalog_newest_begin(&store, pane)?;
+                store.apply_ack_from_committed_catalog(
+                    GuardianCheckpointStageRequestV1::ack(
+                        begin.scope(),
+                        begin.upload_id(),
+                        begin.descriptor(),
+                        begin.chunk_bytes(),
+                        completion,
+                    )?,
+                    mux,
+                )?;
+                newest.insert(pane, (begin, completion));
+                assert!(
+                    checkpoint_stage_upload_keys(&store)?.len()
+                        <= CHECKPOINT_STAGE_MAX_RETAINED_UPLOADS
+                );
+            }
+        }
+
+        let retained = checkpoint_stage_upload_keys(&store)?;
+        assert!(
+            !retained.contains(&abandoned_key),
+            "an upload untouched for ten minutes goes once the stage is full"
+        );
+        // Every pane still confirms its newest acknowledgement, whether the
+        // stage holds the upload or only the published member answers.
+        let mut answered_from_catalog = 0;
+        for (pane, (begin, completion)) in &newest {
+            let key = CheckpointStageRequestShape::from_request(begin)?.key();
+            answered_from_catalog += usize::from(!retained.contains(&key));
+            let reply = store.apply_query(GuardianCheckpointStageRequestV1::query(
+                begin.scope(),
+                begin.upload_id(),
+                begin.descriptor(),
+                begin.chunk_bytes(),
+            )?)?;
+            assert!(
+                matches!(
+                    reply,
+                    GuardianCheckpointStageReplyV1::Acked {
+                        completion_id,
+                        checkpoint_id,
+                        boundary_id,
+                        total_bytes,
+                        ..
+                    } if completion_id == *completion
+                        && checkpoint_id == begin.descriptor().checkpoint_id()
+                        && boundary_id == begin.descriptor().boundary_id()
+                        && total_bytes == begin.descriptor().total_bytes()
+                ),
+                "pane {pane}"
+            );
+        }
+        assert!(answered_from_catalog > 0);
+        // An upload no member names is still Absent, catalog or not.
+        let (begin, _) = &newest[&Uuid::from_u128(0x5f200)];
+        let stranger = Uuid::from_u128(0x5f3ff);
+        assert!(matches!(
+            store.apply_query(GuardianCheckpointStageRequestV1::query(
+                begin.scope(),
+                stranger,
+                begin.descriptor(),
+                begin.chunk_bytes(),
+            )?)?,
+            GuardianCheckpointStageReplyV1::Absent { upload_id } if upload_id == stranger
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_finished_restore_does_not_pin_the_catalog_against_later_captures()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-catalog-unpin-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0xc2100);
+        let mux = Uuid::from_u128(0xc2101);
+        let pane = Uuid::from_u128(0xc2102);
+        let generation = 1;
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
+        let mut output = Vec::new();
+        let mut publish = |capture: u64,
+                           state: &mut GuardianProtocolState|
+         -> Result<(), Box<dyn std::error::Error>> {
+            let appended = format!("capture {capture};");
+            output.extend_from_slice(appended.as_bytes());
+            checkpoint_catalog_stage_and_publish(
+                &pipeline,
+                &store,
+                &journal,
+                state,
+                guardian,
+                mux,
+                pane,
+                generation,
+                capture + 1,
+                0xc2_0000 + u128::from(capture) * 0x10,
+                appended.as_bytes(),
+                &output,
+            )?;
+            let (begin, completion) = checkpoint_catalog_newest_begin(&store, pane)?;
+            store.apply_ack_from_committed_catalog(
+                GuardianCheckpointStageRequestV1::ack(
+                    begin.scope(),
+                    begin.upload_id(),
+                    begin.descriptor(),
+                    begin.chunk_bytes(),
+                    completion,
+                )?,
+                mux,
+            )?;
+            Ok(())
+        };
+        publish(0, &mut state)?;
+        publish(1, &mut state)?;
+        // A restore replays the newest member to its acknowledged end; its
+        // snapshot stays behind until eviction.
+        replay_output_suffix(
+            &store,
+            &state,
+            &journal,
+            guardian,
+            mux,
+            pane,
+            generation,
+            GuardianReplaySelectorV1::LatestCompatible,
+            0xc2_9000,
+            &mut || Ok(()),
+        )?;
+        // Twice the retained members later, every capture still publishes.
+        // While the finished snapshot pinned its member, the capture that
+        // made it the oldest found reclamation stopped there and the catalog
+        // full, and every later one was refused.
+        for capture in 2..2 + 2 * u64::try_from(CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS)? {
+            publish(capture, &mut state)?;
+        }
+        let members = store.with_exclusive_directory(|inner| {
+            Ok(
+                checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })?
+                    .published
+                    .len(),
+            )
+        })?;
+        assert_eq!(members, CHECKPOINT_CATALOG_RETAINED_PANE_MEMBERS);
+        Ok(())
+    }
+
+    #[test]
+    fn a_torn_ack_proof_is_replaced_before_its_upload_is_reclaimed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-ack-proof-torn-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0xac100);
+        let mux = Uuid::from_u128(0xac101);
+        let pane = Uuid::from_u128(0xac102);
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
+        checkpoint_catalog_stage_and_publish(
+            &pipeline, &store, &journal, &mut state, guardian, mux, pane, 1, 1, 0xac_0000,
+            b"torn;", b"torn;",
+        )?;
+        let (begin, completion) = checkpoint_catalog_newest_begin(&store, pane)?;
+        let ack = GuardianCheckpointStageRequestV1::ack(
+            begin.scope(),
+            begin.upload_id(),
+            begin.descriptor(),
+            begin.chunk_bytes(),
+            completion,
+        )?;
+        store.apply_ack_from_committed_catalog(ack, mux)?;
+        let key = CheckpointStageRequestShape::from_request(&begin)?.key();
+        store.with_exclusive_directory(|inner| {
+            let catalog =
+                checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })?;
+            let member = catalog
+                .published
+                .last()
+                .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+            // An older guardian died mid-write, or the disk filled: half a
+            // proof under its final name.
+            let proof = checkpoint_catalog_ack_proof_path(inner, member.metadata.identity)?;
+            let held = std::fs::metadata(&proof)
+                .map_err(|error| GuardianCheckpointStageStoreError::io("test-proof", error))?
+                .len();
+            OpenOptions::new()
+                .write(true)
+                .open(&proof)
+                .and_then(|file| file.set_len(held / 2))
+                .map_err(|error| GuardianCheckpointStageStoreError::io("test-tear", error))?;
+            assert!(checkpoint_catalog_require_ack_proof(inner, member).is_err());
+            // The stage keeps the upload's good ACK record until the proof
+            // authenticates again, and then may let it go.
+            let census = checkpoint_stage_census(inner)?;
+            assert!(checkpoint_stage_preserve_ack_proof(
+                inner, &census, member, key
+            )?);
+            checkpoint_catalog_require_ack_proof(inner, member)?;
+            Ok(())
+        })?;
+        // An exact Ack retry finds the repaired proof in place.
+        store.apply_ack_from_committed_catalog(
+            GuardianCheckpointStageRequestV1::ack(
+                begin.scope(),
+                begin.upload_id(),
+                begin.descriptor(),
+                begin.chunk_bytes(),
+                completion,
+            )?,
+            mux,
+        )?;
+        Ok(())
+    }
+
+    #[test]
     fn catalog_keeps_the_newest_pane_members_and_restores_from_a_pruned_chain()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_directory, _poll, pipeline) = pipeline_with_policy(
@@ -16808,7 +17372,7 @@ mod tests {
     }
 
     /// A policy small enough that every record seals a segment, with room
-    /// for the four retained checkpoints' output and little more.
+    /// for the retained checkpoints' output and little more.
     fn one_record_segment_policy(max_segments: usize) -> OutputSegmentPolicy {
         OutputSegmentPolicy {
             journal_limits: GuardianOutputJournalLimits {

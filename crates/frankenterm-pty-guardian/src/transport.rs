@@ -56,9 +56,24 @@ const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// connection costs the pane its lease, so these steps wait as long as a
 /// whole-mux capture may take.
 const CHECKPOINT_STAGE_IO_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a checkpoint-class request waits for the protocol authority a
-/// job holds before closing retryably; below the client's I/O deadline.
+/// How long a request waits for the protocol authority a job holds before
+/// closing retryably; below the client's I/O deadline.
 const CHECKPOINT_AUTHORITY_WAIT: Duration = Duration::from_secs(4);
+/// The same wait for a Stage step or catalog adoption, whose client allows
+/// `CHECKPOINT_STAGE_IO_TIMEOUT`: another pane's Seal or adoption can hold
+/// the authority for several seconds on a loaded host, and closing the
+/// waiting step at four seconds failed a capture its client would have
+/// finished.
+const CHECKPOINT_STAGE_AUTHORITY_WAIT: Duration = Duration::from_secs(25);
+
+const fn checkpoint_authority_wait(operation: GuardianOperation) -> Duration {
+    match operation {
+        GuardianOperation::CheckpointStage | GuardianOperation::Checkpoint => {
+            CHECKPOINT_STAGE_AUTHORITY_WAIT
+        }
+        _ => CHECKPOINT_AUTHORITY_WAIT,
+    }
+}
 const TOKEN_PUBLICATION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const TOKEN_PUBLICATION_LOCK_RETRY: Duration = Duration::from_millis(10);
 const TOKEN_STAGE_COMMIT_MAGIC: [u8; 4] = *b"FTGC";
@@ -282,6 +297,9 @@ struct DeferredGuardianReplay {
     route: GuardianCheckpointRoute,
     effect_lease: Option<GuardianTokenEffectLease>,
     deadline: Instant,
+    /// When the request arrived: a replay wait that first waited for the
+    /// protocol authority still owes its client only `wait_millis` from here.
+    parked_at: Instant,
     /// A synchronous request (a probe, a census page, a child observation)
     /// that met the protocol authority out with a job: served by `dispatch`,
     /// not the checkpoint worker, once the authority returns.
@@ -303,6 +321,7 @@ impl DeferredGuardianReplay {
             route,
             effect_lease: Some(effect_lease),
             deadline,
+            parked_at: Instant::now(),
             dispatch: false,
             #[cfg(test)]
             wipe_probe: None,
@@ -318,6 +337,14 @@ impl DeferredGuardianReplay {
         let mut deferred = Self::new(request, route, effect_lease, deadline);
         deferred.dispatch = true;
         deferred
+    }
+
+    /// Whether a replay wait has used the `wait_millis` its client asked for,
+    /// counted from arrival, not from when a busy authority came back.
+    fn replay_wait_elapsed(&self, now: Instant, wait_millis: u16) -> bool {
+        self.parked_at
+            .checked_add(Duration::from_millis(u64::from(wait_millis)))
+            .is_none_or(|release| now >= release)
     }
 
     #[cfg(test)]
@@ -1702,7 +1729,8 @@ impl GuardianService {
                         // checkpoint no recovery root names; wait for the
                         // authority instead, bounded below the client's I/O
                         // deadline, exactly as a replay wait does.
-                        let Some(deadline) = Instant::now().checked_add(CHECKPOINT_AUTHORITY_WAIT)
+                        let Some(deadline) = Instant::now()
+                            .checked_add(checkpoint_authority_wait(request.header().operation))
                         else {
                             request.zeroize_payload();
                             return FrameProcessing::Close;
@@ -1925,7 +1953,13 @@ impl GuardianService {
                 .map_or(GuardianReplayWaitReadiness::Immediate, |request| {
                     self.runtime.replay_wait_readiness(request)
                 });
+            let wait_elapsed = matches!(
+                readiness,
+                GuardianReplayWaitReadiness::Pending { wait_millis }
+                    if deferred.replay_wait_elapsed(now, wait_millis)
+            );
             if now >= deferred.deadline
+                || wait_elapsed
                 || matches!(readiness, GuardianReplayWaitReadiness::Immediate)
             {
                 self.deferred_replay_tokens
@@ -1961,7 +1995,10 @@ impl GuardianService {
                     self.connections.insert(token, connection);
                     continue;
                 }
-                GuardianReplayWaitReadiness::Pending { .. } if !deadline_elapsed => {
+                GuardianReplayWaitReadiness::Pending { wait_millis }
+                    if !deadline_elapsed
+                        && !deferred.replay_wait_elapsed(Instant::now(), wait_millis) =>
+                {
                     connection.deferred_replay = Some(deferred);
                     self.connections.insert(token, connection);
                     continue;
@@ -1974,9 +2011,26 @@ impl GuardianService {
                 }
             }
 
+            // A guarded stop may have fenced requests while this one waited:
+            // answer it exactly as the fence answers a fresh frame, never
+            // spawn or mutate on behalf of a guardian that is draining.
+            if self.lifecycle.request_fence().is_err() {
+                let Some((mut request, _effect_lease)) = deferred.take_submission() else {
+                    self.finish_connection(token, connection);
+                    continue;
+                };
+                connection.close_after_write = true;
+                let response = GuardianResponseEnvelope::rejection(
+                    &request,
+                    GuardianRejectionCode::InvalidRequest,
+                );
+                request.zeroize_payload();
+                self.route_checkpoint_response(token, connection, Some(response));
+                continue;
+            }
             let route = deferred.route;
             if deferred.dispatch {
-                let Some((mut request, _effect_lease)) = deferred.take_submission() else {
+                let Some((mut request, mut effect_lease)) = deferred.take_submission() else {
                     self.finish_connection(token, connection);
                     continue;
                 };
@@ -1984,6 +2038,13 @@ impl GuardianService {
                 // remaining waits are served in this pass too.
                 let response = self.runtime.dispatch(&request);
                 request.zeroize_payload();
+                // As for a fresh frame: a token effect revoked while the
+                // request ran voids its reply.
+                if effect_lease.validate().is_err() {
+                    self.transport_failures = self.transport_failures.saturating_add(1);
+                    self.finish_connection(token, connection);
+                    continue;
+                }
                 self.route_checkpoint_response(token, connection, response);
                 continue;
             }
@@ -2937,6 +2998,20 @@ impl GuardianClient {
             effect_id,
             payload,
         );
+        match self.exchange_checkpoint_step(request)? {
+            GuardianReply::CheckpointStage(reply) if reply.upload_id() == upload_id => Ok(reply),
+            _ => Err(GuardianClientError::UnexpectedReply),
+        }
+    }
+
+    /// Exchange one Stage step or catalog adoption under
+    /// `CHECKPOINT_STAGE_IO_TIMEOUT`: the guardian may authenticate, copy and
+    /// publish a whole checkpoint before it replies, and a missed deadline on
+    /// a pane's own connection costs the pane its lease.
+    fn exchange_checkpoint_step(
+        &mut self,
+        request: GuardianRequestEnvelope,
+    ) -> Result<GuardianReply, GuardianClientError> {
         self.stream
             .set_read_timeout(Some(CHECKPOINT_STAGE_IO_TIMEOUT))
             .inspect_err(|error| log_client_io_failure("stage_read_timeout", error))?;
@@ -2946,10 +3021,7 @@ impl GuardianClient {
         let restored = self.stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT));
         let reply = exchanged?;
         restored.inspect_err(|error| log_client_io_failure("reset_read_timeout", error))?;
-        match reply {
-            GuardianReply::CheckpointStage(reply) if reply.upload_id() == upload_id => Ok(reply),
-            _ => Err(GuardianClientError::UnexpectedReply),
-        }
+        Ok(reply)
     }
 
     /// Adopt one exact sealed checkpoint through the pane mutation sequence.
@@ -2978,7 +3050,7 @@ impl GuardianClient {
             Some(effect_id),
             intent.encode().to_vec(),
         );
-        match self.exchange(request)? {
+        match self.exchange_checkpoint_step(request)? {
             GuardianReply::CheckpointReceipt(receipt)
                 if receipt.pane_id() == pane_id
                     && receipt.generation() == generation
