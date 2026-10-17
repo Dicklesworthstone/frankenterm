@@ -258,9 +258,18 @@ pub fn set_grapheme_run(
     let clustered = is_clustered(page, row);
     // Text a cell keeps whole: not what `stored_text` replaces, nor longer
     // than the arena keeps (whose last character a later check would read).
+    // Every refused text but the empty one starts with a control byte, which
+    // printed text never does: testing that byte first keeps mixed-script
+    // runs, whose cells vary in length, off length-dependent branches.
     let kept_whole = |text: &str| {
-        !matches!(text.as_bytes(), [] | b"\r\n" | [0x00..=0x1f | 0x7f])
-            && text.len() <= MAX_GRAPHEME_BYTES
+        let bytes = text.as_bytes();
+        match bytes.first() {
+            None => false,
+            Some(&(0x00..=0x1f | 0x7f)) => {
+                bytes.len() != 1 && bytes != b"\r\n" && bytes.len() <= MAX_GRAPHEME_BYTES
+            }
+            Some(_) => bytes.len() <= MAX_GRAPHEME_BYTES,
+        }
     };
     if (clustered && x > len)
         || !cells.iter().all(|&(text, _)| kept_whole(text))
