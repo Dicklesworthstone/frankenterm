@@ -509,12 +509,64 @@ pub fn fill_blank(
     }
     page.touch_row(row, seqno);
     set_vector(page, row);
-    for x in cols.start..end {
-        // A fill replaces cells outright: no placement carries over.
-        page.write_legacy(row, x, &cell, true, seqno);
+    if !fill_blank_run(page, row, cols.start..end, attr, seqno) {
+        for x in cols.start..end {
+            // A fill replaces cells outright: no placement carries over.
+            page.write_legacy(row, x, &cell, true, seqno);
+        }
     }
     page.prune_trailing_blanks(row, seqno);
     true
+}
+
+/// Spaces for [`fill_blank_run`].
+const FILL_SPACES: [u8; 512] = [b' '; 512];
+
+/// [`fill_blank`]'s cells written in one run (ft-yccm0.3.2.6): a space, as
+/// `Page::put_ascii` and `Page::append_ascii` store it, is the blank that
+/// `write_legacy` of `Cell::blank_with_attrs(attr)` stores, with the style
+/// resolved once and one header update for the run instead of a
+/// classification, an image vector and a full cell write per column. An
+/// erase in line under a colored pen (every TUI repaint) filled cell by
+/// cell, over half of a repaint's ingest. Returns false, writing nothing,
+/// for a run longer than `FILL_SPACES`, a pen with images, or a run the
+/// page declines (wide, hidden or image cells in or just before it); the
+/// caller then writes each cell.
+fn fill_blank_run(
+    page: &mut Page,
+    row: u32,
+    cols: Range<usize>,
+    attr: &CellAttributes,
+    seqno: SequenceNo,
+) -> bool {
+    let Some(spaces) = FILL_SPACES.get(..cols.len()) else {
+        return false;
+    };
+    if attr.images().is_some_and(|images| !images.is_empty()) {
+        return false;
+    }
+    let class = classify(attr);
+    let mut cache = None;
+    let style = match &class {
+        StyleClass::Inline(inline) => StyleSpec::Inline(*inline),
+        StyleClass::Rich(rich) => StyleSpec::Rich {
+            style: rich,
+            cache: &mut cache,
+        },
+    };
+    let mut write = CellWrite::new(Glyph::Blank, style);
+    write.semantic = attr.semantic_type();
+    write.wrapped = attr.wrapped();
+    write.hyperlink = attr.hyperlink();
+    let stored = if cols.start <= page.row_len(row) {
+        page.put_ascii(row, cols.start, spaces, write, seqno)
+    } else {
+        page.append_ascii(row, cols.start, spaces, write, seqno)
+    };
+    if stored && attr.protected() {
+        page.protect_cells(row, cols);
+    }
+    stored
 }
 
 /// Legacy `Line::compress_for_scrollback`: a vector row becomes clustered
@@ -1117,6 +1169,12 @@ mod tests {
             end: usize,
             attrs: u8,
         },
+        /// `Screen::set_cell_grapheme_run`'s native write of a printed run.
+        GraphemeRun {
+            x: usize,
+            glyphs: Vec<usize>,
+            attrs: u8,
+        },
     }
 
     const SIZES: [LineSize; 4] = [
@@ -1199,6 +1257,13 @@ mod tests {
                 end,
                 attrs
             }),
+            // At most three cells of width two from column 6 still fit.
+            (
+                0usize..7,
+                prop::collection::vec(0..GLYPHS.len(), 1..4),
+                0u8..16
+            )
+                .prop_map(|(x, glyphs, attrs)| Op::GraphemeRun { x, glyphs, attrs }),
         ]
     }
 
@@ -1380,6 +1445,30 @@ mod tests {
                         }
                         blank_band(&mut page, row, *start..*end, &blank, seqno);
                         true
+                    }
+                    Op::GraphemeRun { x, glyphs, attrs: a } => {
+                        let attr = attrs(*a);
+                        let cells: Vec<(&str, u8)> = glyphs
+                            .iter()
+                            .map(|&glyph| {
+                                let (text, width) = GLYPHS[glyph];
+                                (text, width.clamp(1, 2) as u8)
+                            })
+                            .collect();
+                        // Legacy writes each cell where the one before ended.
+                        let before = line.clone();
+                        let mut col = *x;
+                        for &(text, width) in &cells {
+                            let width = usize::from(width);
+                            line.set_cell_grapheme(col, text, width, attr.clone(), seqno);
+                            col += width;
+                        }
+                        if set_grapheme_run(&mut page, row, *x, &cells, &attr, seqno) {
+                            true
+                        } else {
+                            assert_same_row(&page, row, &before, "declined grapheme run");
+                            false
+                        }
                     }
                 };
                 if !native {
