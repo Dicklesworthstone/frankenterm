@@ -21960,13 +21960,6 @@ impl Mux {
         })
     }
 
-    /// Whether a guardian checkpoint still belongs to the exact pane
-    /// registration and guardian lease it was captured from, so a recovery
-    /// image may name it. Unlike `guardian_checkpoint_is_current` it admits
-    /// output parsed after the checkpoint: the guardian journal holds every
-    /// byte after its boundary and a restore replays them, so a guardian pane
-    /// needs no common cut with the rest of the mux. A pane that never stops
-    /// printing could otherwise never be part of a published image.
     /// While a recovery root publisher runs, each guardian pane adopts live
     /// checkpoints only from the member its newest committed root names up to
     /// `GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT` after it, so the guardian, which
@@ -21998,6 +21991,13 @@ impl Mux {
                 .root_committed(published.receipt().effect_id())
     }
 
+    /// Whether a guardian checkpoint still belongs to the exact pane
+    /// registration and guardian lease it was captured from, so a recovery
+    /// image may name it. Unlike `guardian_checkpoint_is_current` it admits
+    /// output parsed after the checkpoint: the guardian journal holds every
+    /// byte after its boundary and a restore replays them, so a guardian pane
+    /// needs no common cut with the rest of the mux. A pane that never stops
+    /// printing could otherwise never be part of a published image.
     pub fn guardian_checkpoint_is_restorable(
         &self,
         pane_id: PaneId,
