@@ -1501,6 +1501,8 @@ impl<'a> Performer<'a> {
             || self.newline_mode
             || self.dec_origin_mode
             || self.state.enable_conpty_quirks
+            // A carriage return would reset the pen's semantic type.
+            || self.clear_semantic_attribute_on_newline
             || self.accumulating_title.is_some()
             || self.active_charset() != CharSet::Ascii
             || !Self::bulk_ascii_row_write_enabled()
@@ -1531,32 +1533,181 @@ impl<'a> Performer<'a> {
         loop {
             self.flood_line_feed(&bidi_mode, plan.as_ref());
             at += 1;
-            // One scan finds the line's end and checks it is plain: its
-            // first byte that is not printable ASCII must be a line feed.
-            // The line after the flood is left for the parser, which may
-            // yet find it continues past `bytes`. (Validating the whole
-            // flood as UTF-8 once instead cost a second scan: 1% fewer
-            // instructions on `seq`, 1% more on long lines.)
-            let rest = &bytes[at..];
-            let line = scan.printable_len(rest);
-            if rest.get(line) != Some(&b'\n') {
+            // The line is plain if its first byte that is neither printable
+            // ASCII nor a tab or carriage return (a PTY ends every line in
+            // CR LF) is a line feed. A line that is not, or that `bytes` does
+            // not finish, is left whole for the parser: a line is only
+            // written once its end is known. (Validating the whole flood as
+            // UTF-8 once instead cost a second scan: 1% fewer instructions
+            // on `seq`, 1% more on long lines.)
+            let end = at + scan.printable_len(&bytes[at..]);
+            match bytes.get(end) {
+                Some(b'\n') => {
+                    self.flood_text(
+                        &bytes[at..end],
+                        &mut flood_pen,
+                        bottom,
+                        plan.as_ref(),
+                        &bidi_mode,
+                    );
+                    at = end;
+                }
+                Some(b'\t' | b'\r') => {
+                    match self.flood_line_with_controls(
+                        bytes,
+                        at,
+                        end,
+                        scan,
+                        &mut flood_pen,
+                        bottom,
+                        plan.as_ref(),
+                        &bidi_mode,
+                    ) {
+                        Some(line_feed) => at = line_feed,
+                        None => return at,
+                    }
+                }
+                _ => return at,
+            }
+        }
+    }
+
+    /// The rest of [`Self::line_flood`] for a line starting at `at` whose
+    /// first tab or carriage return is at `first_stop`: the line feed that
+    /// ends it, once it is written, or `None` when the line is not plain
+    /// or `bytes` does not finish it. A tab or carriage return is the
+    /// control it is; like the line feed after the line, it ends whatever
+    /// the text before it printed. (Neither changes the pen: the flood
+    /// declines when a carriage return would reset its semantic type.)
+    /// Text before a control, or after the last, may be empty: writing it
+    /// is nothing. Where the first stops are is remembered, so a line is
+    /// scanned once: scanning it again control by control was a tenth of a
+    /// `long_lines` flood. Kept out of line, it leaves the loop over plain
+    /// lines its registers (inlined, `seq` ran 0.3-0.7% more instructions).
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn flood_line_with_controls(
+        &mut self,
+        bytes: &[u8],
+        at: usize,
+        first_stop: usize,
+        scan: frankenterm_escape_parser::parser::AsciiScan,
+        pen: &mut Option<Option<crate::pagegrid::native::FloodPen>>,
+        bottom: VisibleRowIndex,
+        plan: Option<&crate::screen::FloodScroll>,
+        bidi_mode: &crate::config::BidiMode,
+    ) -> Option<usize> {
+        let mut stops = [0_usize; 8];
+        let mut stop_count = 0;
+        let mut end = first_stop;
+        loop {
+            match bytes.get(end) {
+                Some(b'\t' | b'\r') => {
+                    if let Some(stop) = stops.get_mut(stop_count) {
+                        *stop = end;
+                    }
+                    stop_count += 1;
+                    end += 1;
+                }
+                Some(b'\n') => break,
+                _ => return None,
+            }
+            end += scan.printable_len(&bytes[end..]);
+        }
+        let mut start = at;
+        for index in 0..stop_count {
+            // Stops past those remembered are found again.
+            let stop = match stops.get(index) {
+                Some(&stop) => stop,
+                None => start + scan.printable_len(&bytes[start..end]),
+            };
+            self.flood_text(&bytes[start..stop], pen, bottom, plan, bidi_mode);
+            let code = if bytes[stop] == b'\t' {
+                ControlCode::HorizontalTab
+            } else {
+                ControlCode::CarriageReturn
+            };
+            Performer::control(self, code);
+            self.last_printed = None;
+            start = stop + 1;
+        }
+        self.flood_text(&bytes[start..end], pen, bottom, plan, bidi_mode);
+        Some(end)
+    }
+
+    /// One plain run of a flood line, which a tab or the line feed follows
+    /// within the flood: [`Self::flood_write`] a row at a time, wrapping as
+    /// `write_ascii_run` wraps ([`Self::flood_wrap`]), else what
+    /// `print_ascii_run` (or `print`) does with what is left.
+    #[inline]
+    fn flood_text(
+        &mut self,
+        mut text: &[u8],
+        pen: &mut Option<Option<crate::pagegrid::native::FloodPen>>,
+        bottom: VisibleRowIndex,
+        plan: Option<&crate::screen::FloodScroll>,
+        bidi_mode: &crate::config::BidiMode,
+    ) {
+        while !text.is_empty() {
+            if self.wrap_next {
+                self.flood_wrap(plan, bidi_mode);
+            }
+            let room = self
+                .left_and_right_margins
+                .end
+                .saturating_sub(self.cursor.x);
+            let take = room.min(text.len());
+            if take == 0 || !self.flood_write(&text[..take], pen, bottom) {
                 break;
             }
-            if line > 0 && !self.flood_write(&rest[..line], &mut flood_pen, bottom) {
-                // Only the general path needs the line as `str` (checking it
-                // for every line was 7% of a `seq` flood).
-                let Ok(text) = std::str::from_utf8(&rest[..line]) else {
-                    break;
-                };
-                if !self.write_ascii_run(text) {
-                    // Unreachable under the checks above; the next line
-                    // feed flushes it as it would have.
-                    self.print_string(text);
-                }
-            }
-            at += line;
+            text = &text[take..];
         }
-        at
+        if text.is_empty() {
+            return;
+        }
+        // Only the general path needs the line as `str` (checking it for
+        // every line was 7% of a `seq` flood). Printable ASCII always is.
+        let owned;
+        let text = match std::str::from_utf8(text) {
+            Ok(text) => text,
+            Err(_) => {
+                owned = text
+                    .iter()
+                    .map(|&byte| char::from(byte))
+                    .collect::<String>();
+                owned.as_str()
+            }
+        };
+        if !self.write_ascii_run(text) {
+            // Unreachable under the flood's checks; the tab or line feed
+            // after it flushes it as it would have.
+            self.print_string(text);
+        }
+    }
+
+    /// `wrap_before_print` within a flood, on the bottom row of a full
+    /// screen and without conpty quirks: the row is marked as wrapped, and
+    /// `new_line(true)` scrolls and returns the cursor to the left margin.
+    fn flood_wrap(
+        &mut self,
+        plan: Option<&crate::screen::FloodScroll>,
+        bidi_mode: &crate::config::BidiMode,
+    ) {
+        let seqno = self.seqno;
+        {
+            let y = self.cursor.y;
+            let screen = self.screen_mut();
+            let phys = screen.phys_row(y);
+            screen.set_last_cell_was_wrapped(phys, true, seqno);
+        }
+        let scrolled =
+            plan.is_some_and(|plan| self.state.screen.flood_scroll_line(plan, seqno, bidi_mode));
+        if !scrolled {
+            self.scroll_up(1);
+        }
+        self.cursor.x = self.left_and_right_margins.start;
+        self.cursor.seqno = seqno;
+        self.wrap_next = false;
     }
 
     /// `write_ascii_run` for a flood line that fits the rest of the bottom
@@ -4091,6 +4242,11 @@ mod tests {
             1 => Just("\u{301}".as_bytes().to_vec()),
             1 => Just("\u{1f680}".as_bytes().to_vec()),
             1 => Just(b"\x1b]0;title\x07".to_vec()),
+            // Semantic prompts: input until the end of the line (which a
+            // carriage return ends), input, output.
+            1 => Just(b"\x1b]133;I\x07".to_vec()),
+            1 => Just(b"\x1b]133;B\x07".to_vec()),
+            1 => Just(b"\x1b]133;C\x07".to_vec()),
         ]
     }
 
@@ -4185,5 +4341,37 @@ mod tests {
         term.line_flood = false;
         let mut performer = Performer::new(&mut term);
         assert_eq!(performer.line_flood(b"\nab\n", AsciiScan::DEFAULT), 0);
+    }
+
+    /// A flood remembers where a line's first tabs and carriage returns
+    /// are and finds any later ones again: a line with more of them than it
+    /// remembers, one that starts with a tab, and one that ends in CR LF
+    /// all leave what the per-line path leaves.
+    #[test]
+    fn a_flood_line_with_many_tabs_and_carriage_returns_matches_the_per_line_path() {
+        let mut bytes = b"start\r\n".to_vec();
+        for _ in 0..3 {
+            bytes.extend_from_slice(b"\ta\tbb\rc\t\td\re\tf\tgg\th\ri\tjjjjjjj\tk\tl\r\n");
+            bytes.extend_from_slice(b"\t\tlead\tthen text\r\n");
+            bytes.extend_from_slice(b"plain\n");
+        }
+        for cols in [7, 12, 40] {
+            let mut per_line = line_flood_terminal(3, cols, false);
+            let mut flood = line_flood_terminal(3, cols, true);
+            per_line.advance_bytes(&bytes);
+            flood.advance_bytes(&bytes);
+            assert_eq!(
+                snapshot_terminal(&flood),
+                snapshot_terminal(&per_line),
+                "{cols} columns"
+            );
+            per_line.advance_bytes(b"Z");
+            flood.advance_bytes(b"Z");
+            assert_eq!(
+                snapshot_terminal(&flood),
+                snapshot_terminal(&per_line),
+                "{cols} columns + Z"
+            );
+        }
     }
 }

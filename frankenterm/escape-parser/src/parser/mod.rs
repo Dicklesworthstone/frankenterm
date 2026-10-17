@@ -408,10 +408,11 @@ pub trait Handler {
 
     /// A line-feed flood (ft-wd6cy): `bytes` starts with a ground-state line
     /// feed. A handler may take it together with the complete lines after it,
-    /// each a run of printable ASCII (`0x20..=0x7e`, possibly empty) ending in
-    /// a line feed, exactly as [`Handler::control`]`(LineFeed)` for each line
-    /// feed and [`Handler::print_ascii_run`] (or [`Handler::print`] for one
-    /// byte) for each run would apply them. Returns how many bytes it took:
+    /// each printable ASCII (`0x20..=0x7e`), horizontal tabs and carriage
+    /// returns (possibly none) ending in a line feed, exactly as
+    /// [`Handler::control`] for each control and [`Handler::print_ascii_run`] (or
+    /// [`Handler::print`] for one byte) for each run between them would apply
+    /// them. Returns how many bytes it took:
     /// 0, the default, declines, and the parser goes on byte by byte;
     /// otherwise a prefix of `bytes` ending in a line feed. A trailing line
     /// without its line feed is never taken. `scan` is the parser's own
