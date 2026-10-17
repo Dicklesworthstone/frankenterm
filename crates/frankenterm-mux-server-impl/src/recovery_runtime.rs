@@ -635,7 +635,7 @@ impl PeriodicRecovery {
                 }
                 Err(WholeMuxCaptureError::Busy) => (None, Some("busy"), false),
                 Err(
-                    WholeMuxCaptureError::CaptureDeadline
+                    WholeMuxCaptureError::CaptureDeadline { .. }
                     | WholeMuxCaptureError::StaleCapture(_)
                     | WholeMuxCaptureError::Topology(_)
                     | WholeMuxCaptureError::Pane { .. }

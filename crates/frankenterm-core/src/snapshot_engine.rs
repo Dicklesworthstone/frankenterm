@@ -151,8 +151,18 @@ pub enum WholeMuxCaptureError {
     InvalidTimeout,
     #[error("publication authority path is not representable")]
     InvalidAuthorityPath,
-    #[error("model capture exhausted its total time budget")]
-    CaptureDeadline,
+    /// With how far the capture got: its panes are captured one after
+    /// another under the one budget.
+    #[error(
+        "model capture exhausted its total time budget after {elapsed_ms} ms with {taken} of {panes} pane checkpoints taken (slowest: pane {slowest_pane:?} in {slowest_ms} ms)"
+    )]
+    CaptureDeadline {
+        elapsed_ms: u128,
+        taken: usize,
+        panes: usize,
+        slowest_pane: Option<usize>,
+        slowest_ms: u128,
+    },
     #[error("model capture exceeds the retained checkpoint byte limit")]
     CaptureByteLimit,
     #[error("mux topology, pane registration, or terminal model changed during capture: {0}")]
@@ -308,16 +318,16 @@ impl CaptureTiming {
         }
     }
 
-    /// [`WholeMuxCaptureError::CaptureDeadline`], logged with the timing.
+    /// [`WholeMuxCaptureError::CaptureDeadline`] with the timing, which the
+    /// mux logs as the capture's failure.
     fn deadline(&self) -> WholeMuxCaptureError {
-        log::warn!(
-            "model capture budget exhausted after {} ms with {} of {} pane checkpoints taken; slowest (pane, ms): {:?}",
-            self.started.elapsed().as_millis(),
-            self.taken,
-            self.panes,
-            self.slowest.map(|(pane, took)| (pane, took.as_millis())),
-        );
-        WholeMuxCaptureError::CaptureDeadline
+        WholeMuxCaptureError::CaptureDeadline {
+            elapsed_ms: self.started.elapsed().as_millis(),
+            taken: self.taken,
+            panes: self.panes,
+            slowest_pane: self.slowest.map(|(pane, _)| pane),
+            slowest_ms: self.slowest.map_or(0, |(_, took)| took.as_millis()),
+        }
     }
 }
 
