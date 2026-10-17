@@ -1380,25 +1380,33 @@ enum GroundRun<'a> {
 /// cut short by malformed UTF-8 would scan the rest of the input again,
 /// which is quadratic on long input with no controls in it.
 ///
-/// It also holds the input's longest valid UTF-8 prefix, validated once on
-/// first use: a run inside it is a `&str` slice of it, with no
-/// `core::str::from_utf8` call per run. On a raw `seq` flood (an ASCII run
-/// of a few digits per line) that call was 8% of the parse (ft-yccm0.3.2.6).
+/// It also holds the longest valid UTF-8 stretch of the input from the
+/// first run on, validated once on first use: a run inside it is a `&str`
+/// slice of it, with no `core::str::from_utf8` call per run. On a raw `seq`
+/// flood (an ASCII run of a few digits per line) that call was 8% of the
+/// parse (ft-yccm0.3.2.6). It starts at the first run, not the input's
+/// start: a read that splits a character leaves the next read beginning
+/// with its continuation bytes, which no valid prefix of the input covers,
+/// and every run of that read was then validated on its own.
 #[derive(Default)]
 struct RunExtents<'a> {
     control: Option<usize>,
     c1: Option<usize>,
-    valid: Option<&'a str>,
+    /// Where the validated stretch starts, and the stretch.
+    valid: Option<(usize, &'a str)>,
 }
 
 impl<'a> RunExtents<'a> {
-    /// `bytes[start..end]` as a `&str`, when it lies in the input's valid
-    /// UTF-8 prefix on character boundaries; `None` otherwise. `bytes` is
-    /// the whole input of this parse call, as for the other positions.
+    /// `bytes[start..end]` as a `&str`, when it lies in the validated
+    /// stretch on character boundaries; `None` otherwise. `bytes` is the
+    /// whole input of this parse call, as for the other positions, and runs
+    /// come in order, so `start` is never before the first run's.
     #[inline]
     fn text(&mut self, bytes: &'a [u8], start: usize, end: usize) -> Option<&'a str> {
-        let valid = *self.valid.get_or_insert_with(|| valid_utf8_prefix(bytes));
-        valid.get(start..end)
+        let (base, valid) = *self
+            .valid
+            .get_or_insert_with(|| (start, valid_utf8_prefix(&bytes[start..])));
+        valid.get(start.checked_sub(base)?..end.checked_sub(base)?)
     }
 
     /// The first control or DEL at or after `from`, or the input's length.
@@ -1539,13 +1547,37 @@ fn ground_run_bulk<'a>(
 /// `simdutf8` (NEON on aarch64; on x86 AVX2 or SSE4.2, detected at run time
 /// with `std`). On mixed-script text, where few blocks are all ASCII,
 /// `core::str::from_utf8` was 8% of the ingest (ft-yccm0.3.2.6).
+///
+/// A read often ends inside a character the next read completes; that
+/// incomplete tail is left out first, so such input takes one pass.
 fn valid_utf8_prefix(bytes: &[u8]) -> &str {
-    if let Ok(text) = simdutf8::basic::from_utf8(bytes) {
+    let complete = bytes.len() - incomplete_utf8_tail_len(bytes);
+    if let Ok(text) = simdutf8::basic::from_utf8(&bytes[..complete]) {
         return text;
     }
-    let valid = simdutf8::compat::from_utf8(bytes)
-        .map_or_else(|error| error.valid_up_to(), str::len);
+    let valid =
+        simdutf8::compat::from_utf8(bytes).map_or_else(|error| error.valid_up_to(), str::len);
     simdutf8::basic::from_utf8(&bytes[..valid]).unwrap_or_default()
+}
+
+/// The length of the lead byte and continuation bytes at the end of
+/// `bytes` that start a character without completing it: 0 when the last
+/// character is complete, or when the tail is not such a start at all.
+/// Such a tail is never part of a valid prefix, so leaving it out keeps
+/// the longest valid prefix whenever the rest is valid.
+fn incomplete_utf8_tail_len(bytes: &[u8]) -> usize {
+    let tail = &bytes[bytes.len().saturating_sub(3)..];
+    let Some(lead) = tail.iter().rposition(|&byte| !matches!(byte, 0x80..=0xbf)) else {
+        return 0;
+    };
+    let needed = match tail[lead] {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return 0,
+    };
+    let present = tail.len() - lead;
+    if present < needed { present } else { 0 }
 }
 
 /// The run of printable ASCII `bytes[start..end]`.
