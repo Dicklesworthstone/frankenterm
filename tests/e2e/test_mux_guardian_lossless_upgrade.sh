@@ -261,10 +261,22 @@ PID4=$(child_pid)
 
 step "teardown"
 "$TOOL" stop-all --i-accept-pane-loss
-sleep 1
 # Pane processes, and the broker, guardian and mux (their paths are in $S).
-LEFT=$({ pgrep -f "$MARK "; pgrep -f -- "$S/"; } | sort -u | tr '\n' ' ')
-[ -z "$LEFT" ] && pass "no leftover processes" || fail "leftover processes: $LEFT"
+# stop-all waits for the services; a pane's shell learns its PTY closed
+# (SIGHUP) only after the broker is gone, so give stragglers 10 s, and name
+# whatever is still alive then.
+LEFT=""
+for _ in $(seq 20); do
+  LEFT=$({ pgrep -f "$MARK "; pgrep -f -- "$S/"; } | sort -u | tr '\n' ' ')
+  [ -z "$LEFT" ] && break
+  sleep 0.5
+done
+if [ -z "$LEFT" ]; then
+  pass "no leftover processes"
+else
+  fail "leftover processes: $LEFT"
+  for p in $LEFT; do ps -o pid=,ppid=,etime=,command= -p "$p" 2>/dev/null || true; done
+fi
 
 echo "sandbox: $S"
 if [ "$FAILS" = 0 ]; then echo "RESULT: PASS"; else echo "RESULT: FAIL ($FAILS)"; exit 1; fi
