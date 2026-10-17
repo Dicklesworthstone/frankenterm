@@ -20,9 +20,13 @@
 # 3,000-line burst and then a line a second while recovery captures run
 # every 2 s for N seconds. Recovery must publish by halfway and again
 # after it, never disable itself, and keep the checkpoint stage at most
-# 8 uploads, the pane catalog at most 8 members (the guardian keeps the
-# newest 8 so failed captures cannot reclaim a committed root's member), and each output journal
-# at most a few segments. Keep N under ~180 so tick 0 stays in the tail.
+# 8 uploads, each pane catalog at most 8 members (the guardian keeps the
+# newest 8 so failed captures cannot reclaim a committed root's member),
+# and each output journal at most a few segments. Keep N under ~180 so
+# tick 0 stays in the tail.
+#
+# E2E_PANES=N (default 1) runs N panes; every one must keep its process,
+# id and history across the upgrade and the rollback.
 set -uo pipefail
 # The guardian refuses group- or world-writable directories on its paths
 # (a umask of 002 on some hosts); keep any stricter umask.
@@ -51,14 +55,45 @@ fail() { echo "FAIL: $*"; FAILS=$((FAILS + 1)); }
 STATE=$HOME/.local/state/frankenterm-guardian-e2e
 RUN=$XDG_RUNTIME_DIR/frankenterm-guardian-e2e
 [ "$(uname -s)" = Darwin ] && RUN=$STATE/run
+# Matched with the following " tick" everywhere, so run 123's pattern never
+# matches run 1234's processes.
 MARK="FTGX_MARK_$$"
+# However the script ends, nothing it started may outlive it.
+trap '"$TOOL" stop-all --i-accept-pane-loss >/dev/null 2>&1 || true' EXIT
 mkdir -p "$XDG_CONFIG_HOME/frankenterm" "$HOME/.ssh"
 # Real hosts have an SSH config, and the mux registers a domain per host in
 # it; those domains must not stop recovery (they once disabled it for good).
 printf 'Host ftgx-e2e-planted-host\n  HostName 127.0.0.1\n' > "$HOME/.ssh/config"
 BURST=""
 [ "$SOAK" -gt 0 ] && BURST="j=0; while [ \$j -lt 3000 ]; do echo burst \$j; j=\$((j+1)); sleep 0.002; done; "
-cat > "$XDG_CONFIG_HOME/frankenterm/mux-server-e2e.toml" <<TOML
+# E2E_PANES=N runs N panes, as a fleet host does: pane 0 as below, pane k
+# ticking "$MARK pk tick". The guardian's stage, catalog and replay limits
+# are per guardian, so one pane alone never meets them.
+PANES=${E2E_PANES:-1}
+prog() {  # <pane index> -> its shell program
+  local tag="" burst=""
+  [ "$1" -gt 0 ] && tag="p$1 "
+  [ "$1" = 0 ] && burst=$BURST
+  echo "${burst}i=0; while :; do echo \"$MARK ${tag}tick \$i\"; i=\$((i+1)); sleep 1; done"
+}
+if [ "$PANES" -gt 1 ]; then
+  # Only a Lua config can open more than one pane at startup (a mux-startup
+  # hook, which a --recovery-restore start never runs).
+  export FRANKENTERM_LUA_CONFIG=1
+  export FTG_MUX_TOML=$XDG_CONFIG_HOME/frankenterm/mux-server-e2e.lua
+  {
+    echo "local wezterm = require 'wezterm'"
+    echo "local progs = {"
+    for k in $(seq 0 $((PANES - 1))); do echo "  [==[$(prog "$k")]==],"; done
+    echo "}"
+    echo "wezterm.on('mux-startup', function()"
+    echo "  local _, _, window = wezterm.mux.spawn_window { args = { '/bin/bash', '-c', progs[1] } }"
+    echo "  for k = 2, #progs do window:spawn_tab { args = { '/bin/bash', '-c', progs[k] } } end"
+    echo "end)"
+    echo "return { unix_domains = { { name = 'unix', socket_path = [==[$RUN/mux.sock]==] } } }"
+  } > "$FTG_MUX_TOML"
+else
+  cat > "$XDG_CONFIG_HOME/frankenterm/mux-server-e2e.toml" <<TOML
 default_prog = ["/bin/bash", "-c", "${BURST}i=0; while :; do echo \\"$MARK tick \$i\\"; i=\$((i+1)); sleep 1; done"]
 ${E2E_MUX_TOML_EXTRA:-}
 
@@ -66,9 +101,34 @@ ${E2E_MUX_TOML_EXTRA:-}
 name = "unix"
 socket_path = "$RUN/mux.sock"
 TOML
+fi
 
-ft_text() {  # <family dir> -> pane 0 text, whole history
-  WEZTERM_UNIX_SOCKET=$RUN/mux.sock "$1/ft" robot get-text 0 --tail 5000 2>/dev/null
+ft_text() {  # <family dir> [pane id] -> that pane's text, whole history
+  WEZTERM_UNIX_SOCKET=$RUN/mux.sock "$1/ft" robot get-text "${2:-0}" --tail 5000 2>/dev/null
+}
+pane_ids() {  # <family dir> -> the mux's pane ids, one per line
+  WEZTERM_UNIX_SOCKET=$RUN/mux.sock "$1/ft" robot state 2>/dev/null | python3 -c 'import json,sys
+for p in json.load(sys.stdin).get("data") or []: print(p["pane_id"])' 2>/dev/null
+}
+# <label> <family dir>: every pane but pane 0 (check_history's) shows its own
+# ticks exactly once, from 0 with no gap.
+check_other_panes() {
+  [ "$PANES" -gt 1 ] || return 0
+  local id text tag t n last dups good=0
+  for id in $(pane_ids "$2"); do
+    text=$(ft_text "$2" "$id")
+    tag=$(echo "$text" | grep -o "$MARK p[0-9]* tick" | head -1 | awk '{print $2}')
+    [ -n "$tag" ] || continue
+    t=$(echo "$text" | grep -o "$MARK $tag tick [0-9]*" | awk '{print $4}' | sort -n)
+    n=$(echo "$t" | grep -c .); last=$(echo "$t" | tail -1); dups=$(echo "$t" | uniq -d | grep -c .)
+    if [ "$(echo "$t" | head -1)" = 0 ] && [ "$n" = $((last + 1)) ] && [ "$dups" = 0 ]; then
+      good=$((good + 1))
+    else
+      fail "pane $id ($tag) history after $1: rows=$n last=$last duplicated=$dups"
+    fi
+  done
+  [ "$good" = $((PANES - 1)) ] && pass "all $good other panes' histories intact after $1" \
+    || fail "only $good of $((PANES - 1)) other panes intact after $1"
 }
 # <label> <family dir>: every tick printed so far appears exactly once, from
 # tick 0 with no gap, and any burst rows still in the history are unique and
@@ -97,7 +157,7 @@ check_history() {
     fail "burst history after $1: rows=$bn first=${bfirst:-none} duplicated=$bdups"
   fi
 }
-child_pid() { pgrep -f "^/bin/bash -c .*echo \"$MARK" | head -1; }
+child_pid() { pgrep -f "^/bin/bash -c .*echo \"$MARK tick" | head -1; }
 count() { command ls "$1" 2>/dev/null | grep -c -- "$2"; }
 
 step "install $(basename "$OLD")"
@@ -115,7 +175,7 @@ if [ "$SOAK" -gt 0 ]; then
   sleep $(( SOAK - SOAK / 2 ))
   PUBLISHED=$(grep -c "published local generation" "$LOG")
   REJECTED=$(grep -cE "capture_rejected|admission exhausted" "$LOG")
-  DISABLED=$(grep -c "disabled=true" "$LOG")
+  DISABLED=$(grep -cE "disabled=true|publication lane disabled" "$LOG")
   RECV=$STATE/receiver/guardian-output-v3
   BROK=$STATE/broker/guardian-output-v3
   UPLOADS=$(command ls "$RECV" | grep '^checkpoint-pane-.*candidate\.ftgcp$' | wc -l | tr -d ' ')
@@ -131,32 +191,42 @@ if [ "$SOAK" -gt 0 ]; then
     || fail "recovery stalled ($HALFWAY generations by halfway, $PUBLISHED by the end)"
   [ "$DISABLED" = 0 ] && pass "recovery never disabled itself" \
     || fail "recovery disabled itself $DISABLED time(s)"
+  # The stage bound is the guardian's; catalogs and journals are per pane.
   [ $((UPLOADS + GENESIS)) -le 8 ] && pass "stage bounded ($UPLOADS pane + $GENESIS genesis uploads)" \
     || fail "stage holds $UPLOADS pane + $GENESIS genesis uploads"
-  [ "$MEMBERS" -le 8 ] && pass "catalog bounded ($MEMBERS members)" || fail "catalog holds $MEMBERS members"
-  [ "$RSEG" -le 4 ] && [ "$BSEG" -le 4 ] && pass "journals bounded (guardian $RSEG, broker $BSEG segments)" \
-    || fail "journal segments: guardian $RSEG, broker $BSEG"
+  [ "$MEMBERS" -le $((8 * PANES)) ] && pass "catalogs bounded ($MEMBERS members, $PANES pane(s))" \
+    || fail "catalogs hold $MEMBERS members for $PANES pane(s)"
+  [ "$RSEG" -le $((4 * PANES)) ] && [ "$BSEG" -le $((4 * PANES)) ] \
+    && pass "journals bounded (guardian $RSEG, broker $BSEG segments, $PANES pane(s))" \
+    || fail "journal segments: guardian $RSEG, broker $BSEG for $PANES pane(s)"
 fi
 
 step "upgrade -> $(basename "$NEW")"
 UPGRADE_FLAGS=()
 # One available build: still prove a real lossless restart onto the same family.
 [ "$(cd "$OLD" && pwd -P)" = "$(cd "$NEW" && pwd -P)" ] && UPGRADE_FLAGS=(--force)
-if "$TOOL" upgrade --family "$NEW" "${UPGRADE_FLAGS[@]}"; then pass "upgrade reported success"; else fail "upgrade"; fi
+# bash 3.2 (macOS /bin/bash) calls an empty "${a[@]}" unbound under set -u.
+if "$TOOL" upgrade --family "$NEW" ${UPGRADE_FLAGS[@]+"${UPGRADE_FLAGS[@]}"}; then
+  pass "upgrade reported success"
+else
+  fail "upgrade"
+fi
 PID2=$(child_pid)
 [ -n "$PID1" ] && [ "$PID1" = "$PID2" ] && pass "same pane process after upgrade ($PID2)" \
   || fail "pane process changed across upgrade: $PID1 -> ${PID2:-none}"
 check_history upgrade "$NEW"
+check_other_panes upgrade "$NEW"
 
 step "rollback"
 if "$TOOL" rollback; then pass "rollback reported success"; else fail "rollback"; fi
 PID3=$(child_pid)
 [ "$PID1" = "$PID3" ] && pass "same pane process after rollback" || fail "pane process changed across rollback"
 check_history rollback "$OLD"
+check_other_panes rollback "$OLD"
 
 step "power loss + reinstall"
 for f in "$STATE"/run.*.pid; do kill -KILL "$(cat "$f")" 2>/dev/null; done
-for p in $(pgrep -f "$MARK"); do kill -KILL "$p" 2>/dev/null; done
+for p in $(pgrep -f "$MARK "); do kill -KILL "$p" 2>/dev/null; done
 sleep 1
 if "$TOOL" install --family "$NEW" --manager direct; then pass "install after power loss"; else fail "install after power loss"; fi
 sleep 4
@@ -167,7 +237,8 @@ PID4=$(child_pid)
 step "teardown"
 "$TOOL" stop-all --i-accept-pane-loss
 sleep 1
-LEFT=$(pgrep -f "$MARK" | tr '\n' ' ')
+# Pane processes, and the broker, guardian and mux (their paths are in $S).
+LEFT=$({ pgrep -f "$MARK "; pgrep -f -- "$S/"; } | sort -u | tr '\n' ' ')
 [ -z "$LEFT" ] && pass "no leftover processes" || fail "leftover processes: $LEFT"
 
 echo "sandbox: $S"

@@ -91,18 +91,42 @@ check_family() {  # <dir>
   [ "$m" = "$g" ] || die "family $d mixes versions (mux $m, guardian $g)"
 }
 
+content_hash() {  # <file> -> first 6 hex of its sha256
+  (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") | cut -c1-6
+}
+
+same_family() {  # <dir> <dir>: the three binaries are byte-identical
+  local b
+  for b in frankenterm-mux-server frankenterm-pty-guardian ft; do
+    cmp -s "$1/$b" "$2/$b" || return 1
+  done
+}
+
 publish_family() {  # <src dir> -> echoes installed dir; immutable once published
-  local src=$1 tag dest
+  # Runs inside $(...), where bash suspends set -e: every step checks itself.
+  local src=$1 tag dest b
   check_family "$src"
   tag=$(family_tag "$src") || die "cannot read family version from $src"
   dest=$BASE/families/$tag
+  # The tag names a commit, not the bytes: a build from a dirty tree shares
+  # its commit's tag. Never let it silently stand for another build.
+  if [ -d "$dest" ] && ! same_family "$src" "$dest"; then
+    tag=$tag-b$(content_hash "$src/frankenterm-mux-server")
+    dest=$BASE/families/$tag
+    if [ -d "$dest" ] && ! same_family "$src" "$dest"; then
+      die "family $tag is already published with other binaries"
+    fi
+  fi
   if [ -d "$dest" ]; then
     log "family $tag already published"
   else
-    mkdir -p "$BASE/families"
-    cp -R "$src" "$dest.partial.$$"
-    chmod 0755 "$dest.partial.$$"/frankenterm-mux-server "$dest.partial.$$"/frankenterm-pty-guardian "$dest.partial.$$"/ft
-    mv "$dest.partial.$$" "$dest"
+    mkdir -p "$BASE/families" || die "cannot create $BASE/families"
+    cp -R "$src" "$dest.partial.$$" || die "copying $src failed"
+    for b in frankenterm-mux-server frankenterm-pty-guardian ft; do
+      chmod 0755 "$dest.partial.$$/$b" || die "cannot mark $b executable"
+    done
+    same_family "$src" "$dest.partial.$$" || die "the copy of $src does not match it"
+    mv "$dest.partial.$$" "$dest" || die "cannot publish family $tag"
     log "published family $tag"
   fi
   echo "$dest"
@@ -189,8 +213,13 @@ write_default_mux_toml() {
 
 # ----------------------------------------------------------------- sockets ---
 socket_has_listener() {  # <path>
-  if command -v nc >/dev/null 2>&1; then nc -U -z "$1" >/dev/null 2>&1; return; fi
-  python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])' "$1" 2>/dev/null
+  # A real connect. `nc -U -z` differs between netcat flavours (busybox and
+  # netcat-traditional report a live socket as dead), so it is a last resort.
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])' "$1" 2>/dev/null
+    return
+  fi
+  nc -U -z "$1" >/dev/null 2>&1
 }
 
 retire_stale_socket() {  # <path>; only when nothing is listening
@@ -259,6 +288,8 @@ mux_args() {  # common mux flags, one per line
 
 run_mux() {
   local probe panes args=()
+  # The broker check below needs the manager that runs the broker.
+  load_manager
   probe=$(wait_guardian_ready 60) || die "guardian not ready at $GUARDIAN_SOCK"
   case "$probe" in ready\ [0-9]*) ;; *) die "guardian not ready at $GUARDIAN_SOCK" ;; esac
   panes=$(echo "$probe" | awk '{print $2}')
@@ -295,13 +326,22 @@ unit() {  # logical name -> manager-specific identifier
   esac
 }
 
+service_env() {  # NAME=value per line: what a service needs to resolve these paths
+  printf '%s\n' "FTG_INSTANCE=$INSTANCE" "FTG_BASE=$BASE" "FTG_STATE=$STATE" "FTG_RUN=$RUN" \
+    "FTG_CONFIG_DIR=$CONFIG_DIR" "FTG_MUX_TOML=$MUX_TOML" "FTG_RECOVERY_INTERVAL=$RECOVERY_INTERVAL"
+}
+
 write_services() {
-  local host_script=$BASE/bin/mux-guardian-host.sh
+  local host_script=$BASE/bin/mux-guardian-host.sh pair
   case "$MANAGER" in
     systemd)
       local d=$HOME/.config/systemd/user
       mkdir -p "$d"
-      local env="Environment=FTG_INSTANCE=$INSTANCE"
+      # Every resolved path and the recovery interval, not just the instance:
+      # an install with FTG_STATE or FTG_RUN set must run its services there.
+      local env=""
+      while IFS= read -r pair; do env="$env${env:+
+}Environment=\"$pair\""; done < <(service_env)
       cat > "$d/$(unit pty-broker).partial" <<EOF
 [Unit]
 Description=FrankenTerm PTY broker$SUFFIX (owns guardian-backed panes; restarting it ends them)
@@ -353,8 +393,11 @@ EOF
       systemctl --user enable "$(unit pty-broker)" "$(unit pty-guardian)" "$(unit mux-server)" >/dev/null 2>&1
       ;;
     launchd)
-      local d=$HOME/Library/LaunchAgents n label keep sub
+      local d=$HOME/Library/LaunchAgents n label keep sub env=""
       mkdir -p "$d" "$STATE/logs"
+      while IFS= read -r pair; do
+        env="$env<key>${pair%%=*}</key><string>${pair#*=}</string>"
+      done < <(service_env)
       for n in pty-broker pty-guardian mux-server; do
         label=$(unit $n)
         # Only the mux restarts on failure. A broker or guardian restart cannot
@@ -370,7 +413,7 @@ EOF
 <plist version="1.0"><dict>
   <key>Label</key><string>$label</string>
   <key>ProgramArguments</key><array><string>$host_script</string><string>$sub</string></array>
-  <key>EnvironmentVariables</key><dict><key>FTG_INSTANCE</key><string>$INSTANCE</string></dict>
+  <key>EnvironmentVariables</key><dict>$env</dict>
   <key>RunAtLoad</key><true/>
   $keep
   <key>ProcessType</key><string>Interactive</string>
@@ -390,7 +433,7 @@ svc_active() {  # <logical name>
   case "$MANAGER" in
     systemd) systemctl --user is-active --quiet "$(unit "$1")" ;;
     launchd) launchctl print "gui/$(id -u)/$(unit "$1")" 2>/dev/null | grep -q 'state = running' ;;
-    direct) [ -f "$STATE/run.$1.pid" ] && kill -0 "$(cat "$STATE/run.$1.pid")" 2>/dev/null ;;
+    direct) [ -n "$(direct_pid "$1")" ] ;;
   esac
 }
 
@@ -398,7 +441,7 @@ svc_pid() {  # <logical name> -> main pid or empty
   case "$MANAGER" in
     systemd) systemctl --user show -p MainPID --value "$(unit "$1")" 2>/dev/null | grep -v '^0$' || true ;;
     launchd) launchctl print "gui/$(id -u)/$(unit "$1")" 2>/dev/null | awk '/^\tpid = /{print $3}' || true ;;
-    direct) [ -f "$STATE/run.$1.pid" ] && cat "$STATE/run.$1.pid" || true ;;
+    direct) direct_pid "$1" ;;
   esac
 }
 
@@ -411,12 +454,32 @@ svc_start() {  # <logical name>
       launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null || launchctl kickstart "gui/$(id -u)/$(unit "$1")"
       ;;
     direct)
-      local sub
+      local sub pair envs=()
       case $1 in pty-broker) sub=run-broker ;; pty-guardian) sub=run-guardian ;; mux-server) sub=run-mux ;; esac
-      FTG_INSTANCE=$INSTANCE nohup "$BASE/bin/mux-guardian-host.sh" "$sub" >> "$STATE/logs/$1.log" 2>&1 < /dev/null &
+      while IFS= read -r pair; do envs+=("$pair"); done < <(service_env)
+      env "${envs[@]}" nohup "$BASE/bin/mux-guardian-host.sh" "$sub" \
+        >> "$STATE/logs/$1.log" 2>&1 < /dev/null &
       echo $! > "$STATE/run.$1.pid"
       ;;
   esac
+}
+
+direct_pid() {  # <logical name> -> the pid file's pid, if it still runs that service
+  # A pid file outlives a reboot and pids are reused: trust it only while the
+  # process is this instance's service (its host script, or the binary that
+  # script execs, both under $BASE), so nothing here signals a stranger.
+  local pid role cmd
+  [ -f "$STATE/run.$1.pid" ] || return 0
+  pid=$(cat "$STATE/run.$1.pid")
+  case $1 in
+    pty-broker) role='run-broker|broker-serve' ;;
+    pty-guardian) role='run-guardian|pty-guardian serve' ;;
+    mux-server) role='run-mux|frankenterm-mux-server' ;;
+  esac
+  cmd=$(ps -ww -o command= -p "$pid" 2>/dev/null) || return 0
+  case $cmd in *"$BASE/"*) ;; *) return 0 ;; esac
+  echo "$cmd" | grep -Eq -- "$role" && echo "$pid"
+  return 0
 }
 
 svc_stop() {  # <logical name>
@@ -440,12 +503,38 @@ svc_stop() {  # <logical name>
   esac
 }
 
-svc_restart_mux() {
+svc_restart_mux() {  # returns non-zero, never exits, when the manager refuses
   case "$MANAGER" in
-    systemd) systemctl --user restart "$(unit mux-server)" ;;
+    systemd)
+      # Manual restarts count against StartLimitBurst: a few swaps within
+      # five minutes made systemd refuse the next one mid-upgrade.
+      systemctl --user reset-failed "$(unit mux-server)" 2>/dev/null || true
+      systemctl --user restart "$(unit mux-server)"
+      ;;
     launchd) launchctl kickstart -k "gui/$(id -u)/$(unit mux-server)" ;;
-    direct) svc_stop mux-server; svc_start mux-server ;;
+    direct) svc_stop mux-server && svc_start mux-server ;;
   esac
+}
+
+# ------------------------------------------------------------- host script ---
+# run-mux builds the mux's flags, so a mux family runs under the host script
+# that installed it: each family keeps its own copy, and swapping the mux to
+# a family installs that family's script, so a rollback never hands an old
+# mux a newer script's flags.
+family_script() { echo "$BASE/bin/host-$(basename "$1").sh"; }  # <family dir>
+record_family_script() {  # <family dir> <script>: <script> goes with that family
+  local f
+  f=$(family_script "$1")
+  mkdir -p "$BASE/bin"
+  cp "$2" "$f.new.$$" && chmod 0755 "$f.new.$$" && mv -f "$f.new.$$" "$f" \
+    || die "cannot record the host script of $(basename "$1")"
+}
+use_family_script() {  # <family dir>: install its recorded host script
+  local f bin=$BASE/bin/mux-guardian-host.sh
+  f=$(family_script "$1")
+  [ -e "$f" ] || return 0
+  [ -e "$bin" ] && cmp -s "$f" "$bin" && return 0
+  cp -p "$f" "$bin.new.$$" && mv -f "$bin.new.$$" "$bin" || die "cannot install the host script"
 }
 
 # ------------------------------------------------------------------ checks ---
@@ -530,13 +619,27 @@ cmd_install() {
   mkdir -p "$BASE/bin" "$STATE"
   chmod 0700 "$STATE"
   echo "$MANAGER" > "$STATE/manager"
-  cp "$SELF" "$BASE/bin/mux-guardian-host.sh.new.$$" && chmod 0755 "$BASE/bin/mux-guardian-host.sh.new.$$"
-  mv -f "$BASE/bin/mux-guardian-host.sh.new.$$" "$BASE/bin/mux-guardian-host.sh"
+  echo "$RECOVERY_INTERVAL" > "$STATE/recovery-interval"
 
   local dest
   dest=$(publish_family "$family")
-  [ -L "$BASE/guardian-family" ] || set_link "$BASE/guardian-family" "$dest"
-  [ -L "$BASE/mux-current" ] || set_link "$BASE/mux-current" "$dest"
+  record_family_script "$dest" "$SELF"
+  # The broker and guardian stay on the family pinned at first install, and
+  # the mux changes only through upgrade; say so rather than ignore --family.
+  if [ -L "$BASE/guardian-family" ]; then
+    [ "$(link_target "$BASE/guardian-family")" = "$dest" ] \
+      || log "keeping the pinned guardian family $(basename "$(link_target "$BASE/guardian-family")")"
+  else
+    set_link "$BASE/guardian-family" "$dest"
+  fi
+  if [ -L "$BASE/mux-current" ]; then
+    [ "$(link_target "$BASE/mux-current")" = "$dest" ] \
+      || log "keeping mux $(basename "$(link_target "$BASE/mux-current")"); use upgrade to change it"
+  else
+    set_link "$BASE/mux-current" "$dest"
+  fi
+  use_family_script "$(link_target "$BASE/mux-current")"
+  [ -e "$BASE/bin/mux-guardian-host.sh" ] || use_family_script "$dest"
   provision_state
   write_default_mux_toml
 
@@ -598,33 +701,20 @@ cmd_install() {
 
 load_manager() {
   MANAGER=${MANAGER:-$(cat "$STATE/manager" 2>/dev/null || default_manager)}
+  # The services run with the interval recorded at install; judge snapshot
+  # freshness by that one, not by whatever this shell happens to set.
+  if [ -z "${FTG_RECOVERY_INTERVAL:-}" ] && [ -s "$STATE/recovery-interval" ]; then
+    RECOVERY_INTERVAL=$(cat "$STATE/recovery-interval")
+  fi
 }
 
-cmd_upgrade() {
-  local family="" timeout=90 force=0
-  while [ $# -gt 0 ]; do
-    case $1 in
-      --family) family=$2; shift 2 ;;
-      --timeout) timeout=$2; shift 2 ;;
-      --force) force=1; shift ;;  # restart losslessly even onto the same family
-      *) die "upgrade: unknown option $1" ;;
-    esac
-  done
-  [ -n "$family" ] || die "upgrade: --family DIR required"
-  load_manager
-  [ -L "$BASE/mux-current" ] || die "not installed (no $BASE/mux-current); run install first"
-  cp "$SELF" "$BASE/bin/mux-guardian-host.sh.new.$$" && chmod 0755 "$BASE/bin/mux-guardian-host.sh.new.$$"
-  mv -f "$BASE/bin/mux-guardian-host.sh.new.$$" "$BASE/bin/mux-guardian-host.sh"
-
-  local dest current
-  dest=$(publish_family "$family")
-  current=$(readlink "$BASE/mux-current")
-  if [ "$current" = "$dest" ] && [ "$force" != 1 ]; then
-    log "mux already runs $(basename "$dest")"
-    return 0
-  fi
-
-  svc_active mux-server || die "mux is not running; refusing to upgrade a stopped mux"
+# Replace the running mux with family <to> losslessly and verify it; when
+# that fails, put back <from>, its links and its host script, and verify
+# that.
+swap_mux() {  # <from dir> <to dir> <timeout> <verb>
+  local from=$1 to=$2 timeout=$3 verb=$4 previous
+  previous=$(link_target "$BASE/mux-previous")
+  svc_active mux-server || die "mux is not running; refusing to $verb a stopped mux"
   # A guardian busy with checkpoints and replay closes probes retryably.
   local probe panes ids children
   probe=$(wait_guardian_ready 60) || die "guardian is not ready; refusing"
@@ -646,40 +736,61 @@ cmd_upgrade() {
     || die "no fresh recovery snapshot within ${fresh_within}s; refusing (see the mux log)"
   log "fresh recovery snapshot published"
 
-  set_link "$BASE/mux-previous" "$current"
-  set_link "$BASE/mux-current" "$dest"
-  log "switching mux $(basename "$current") -> $(basename "$dest")"
-  svc_restart_mux
-  if verify_mux "$dest" "$panes" "$ids" "$children" "$timeout"; then
-    log "upgrade complete: $(basename "$current") -> $(basename "$dest")"
+  # A family installed before scripts were recorded keeps the one it runs.
+  [ -e "$(family_script "$from")" ] \
+    || record_family_script "$from" "$BASE/bin/mux-guardian-host.sh"
+  use_family_script "$to"
+  set_link "$BASE/mux-previous" "$from"
+  set_link "$BASE/mux-current" "$to"
+  log "switching mux $(basename "$from") -> $(basename "$to")"
+  if svc_restart_mux && verify_mux "$to" "$panes" "$ids" "$children" "$timeout"; then
+    log "$verb complete: $(basename "$from") -> $(basename "$to")"
     return 0
   fi
-  log "upgrade verification failed; rolling back to $(basename "$current")"
-  set_link "$BASE/mux-current" "$current"
-  svc_restart_mux
-  if verify_mux "$current" "$panes" "$ids" "$children" "$timeout"; then
-    die "upgrade rolled back to $(basename "$current"); panes preserved"
+  log "$verb verification failed; putting back $(basename "$from")"
+  use_family_script "$from"
+  set_link "$BASE/mux-current" "$from"
+  if [ -n "$previous" ]; then set_link "$BASE/mux-previous" "$previous"; fi
+  if svc_restart_mux && verify_mux "$from" "$panes" "$ids" "$children" "$timeout"; then
+    die "$verb rolled back to $(basename "$from"); panes preserved"
   fi
-  die "upgrade AND rollback verification failed; inspect status and logs before acting"
+  die "$verb AND rollback verification failed; inspect status and logs before acting"
+}
+
+cmd_upgrade() {
+  local family="" timeout=90 force=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --family) family=$2; shift 2 ;;
+      --timeout) timeout=$2; shift 2 ;;
+      --force) force=1; shift ;;  # restart losslessly even onto the same family
+      *) die "upgrade: unknown option $1" ;;
+    esac
+  done
+  [ -n "$family" ] || die "upgrade: --family DIR required"
+  case $timeout in ''|*[!0-9]*) die "upgrade: --timeout takes whole seconds, not '$timeout'" ;; esac
+  load_manager
+  [ -L "$BASE/mux-current" ] || die "not installed (no $BASE/mux-current); run install first"
+
+  local dest current
+  dest=$(publish_family "$family")
+  current=$(readlink "$BASE/mux-current")
+  if [ "$current" = "$dest" ] && [ "$force" != 1 ]; then
+    log "mux already runs $(basename "$dest")"
+    return 0
+  fi
+  # This script's run-mux goes with the family it installs.
+  record_family_script "$dest" "$SELF"
+  swap_mux "$current" "$dest" "$timeout" upgrade
 }
 
 cmd_rollback() {
   load_manager
-  local prev
+  local prev cur
   prev=$(link_target "$BASE/mux-previous")
   [ -n "$prev" ] || die "no previous mux family recorded"
-  local cur probe panes ids children
   cur=$(readlink "$BASE/mux-current")
-  probe=$(wait_guardian_ready 60) || die "guardian is not ready; refusing"
-  case "$probe" in ready\ [0-9]*) ;; *) die "guardian is not ready; refusing" ;; esac
-  panes=$(echo "$probe" | awk '{print $2}')
-  ids=$(mux_pane_ids)
-  children=$(broker_children)
-  set_link "$BASE/mux-previous" "$cur"
-  set_link "$BASE/mux-current" "$prev"
-  svc_restart_mux
-  verify_mux "$prev" "$panes" "$ids" "$children" 90 || die "rollback verification failed"
-  log "rolled back to $(basename "$prev")"
+  swap_mux "$cur" "$prev" 90 rollback
 }
 
 cmd_status() {
