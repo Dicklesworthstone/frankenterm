@@ -1056,6 +1056,17 @@ impl ScrollbackLineAdmission {
     }
 }
 
+/// Outcome of [`ScrollbackSpillSink::await_scrollback_capacity`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollbackCapacityWait {
+    /// Durability made progress since the refusal; retry admission now.
+    Progressed,
+    /// The writer is still working; no progress before the timeout.
+    TimedOut,
+    /// The durability path is failing. Every refused row stays owned.
+    Failed(ScrollbackSpillError),
+}
+
 /// External cold-scrollback sink used by tiered scrollback integrations.
 ///
 /// The terminal model owns full-fidelity [`Line`] values and knows exactly when
@@ -1138,6 +1149,24 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
         }))
     }
 
+    /// Store one marker row in place of `gap_rows` rows (`gap_bytes` charged
+    /// bytes) that overload dropped from durability, and return whether it
+    /// was durably acknowledged. A sink that keeps durability-gap totals
+    /// publishes them together with the marker; the default stores the
+    /// marker as an ordinary row.
+    fn store_scrollback_gap_marker(
+        &self,
+        stable_row: StableRowIndex,
+        marker: &Line,
+        max_retained_rows: usize,
+        gap_rows: u64,
+        gap_bytes: u64,
+    ) -> bool {
+        let _ = (gap_rows, gap_bytes);
+        self.store_scrollback_lines(stable_row, std::slice::from_ref(marker), max_retained_rows)
+            == 1
+    }
+
     /// Whether parser-side maintenance must drain this sink outside the
     /// terminal mutex before admitting another output batch.
     fn requires_scrollback_flush(&self) -> bool {
@@ -1145,10 +1174,49 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
     }
 
     /// Make all admitted rows durable. Errors retain every unacknowledged row
-    /// in memory. The parser applies backpressure outside the terminal mutex;
-    /// callers must not treat failure as permission to discard queued rows.
+    /// in memory. Callers must not treat failure as permission to discard
+    /// queued rows. This blocks on storage; parsers use
+    /// [`Self::request_scrollback_flush`] instead.
     fn flush_scrollback(&self) -> Result<(), ScrollbackSpillError> {
         Ok(())
+    }
+
+    /// Hand admitted rows to the sink's durability writer without waiting.
+    ///
+    /// Parser maintenance calls this after every applied batch and when its
+    /// pane closes. A sink with its own writer only schedules work here: no
+    /// storage IO, and no wait on a lock held across storage IO. An error
+    /// reports an already-degraded durability path; rows stay owned. The
+    /// default (a synchronous sink) flushes inline, which is its contract.
+    fn request_scrollback_flush(&self) -> Result<(), ScrollbackSpillError> {
+        self.flush_scrollback()
+    }
+
+    /// Like [`Self::request_scrollback_flush`], but the writer commits now
+    /// instead of waiting for its commit window to close (pane close,
+    /// ft-yccm0.2.1.2). Still never waits on storage.
+    fn request_scrollback_commit(&self) -> Result<(), ScrollbackSpillError> {
+        self.request_scrollback_flush()
+    }
+
+    /// Wait at most `timeout` for durability progress after this sink
+    /// refused an admission.
+    ///
+    /// Progress (an acknowledged batch or a finished clear/replace) since the
+    /// refusal returns at once, so a writer that is merely behind wakes the
+    /// parser as soon as capacity frees. The timeout bounds how long a parser
+    /// goes without re-checking pane close; it is not a retry interval.
+    /// The default synchronous sink does the flush itself. On failure it has
+    /// no progress signal, so it waits out `timeout` rather than letting the
+    /// caller spin.
+    fn await_scrollback_capacity(&self, timeout: std::time::Duration) -> ScrollbackCapacityWait {
+        match self.flush_scrollback() {
+            Ok(()) => ScrollbackCapacityWait::Progressed,
+            Err(error) => {
+                std::thread::sleep(timeout);
+                ScrollbackCapacityWait::Failed(error)
+            }
+        }
     }
 
     /// Hydrate a previously stored stable row.
@@ -1510,6 +1578,36 @@ pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
 
     fn log_unknown_escape_sequences(&self) -> bool {
         false
+    }
+
+    /// The storage for the screen's rows (ft-yccm0.3.3.4): legacy `Line`s,
+    /// or PageGrid pages. By default `FT_GRID_ENGINE=page` selects pages and
+    /// anything else, or no value, legacy. A screen reads this once, when it
+    /// is built.
+    fn grid_engine(&self) -> GridEngine {
+        GridEngine::from_env()
+    }
+}
+
+/// The storage for a screen's rows; see
+/// [`TerminalConfiguration::grid_engine`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GridEngine {
+    /// A `Line` per row: the oracle, and the default until the flip (B3.9).
+    #[default]
+    Legacy,
+    /// PageGrid pages, with legacy `Line` views for readers.
+    Page,
+}
+
+impl GridEngine {
+    /// `FT_GRID_ENGINE`: `page` (any case) selects pages; anything else,
+    /// or no value, legacy.
+    pub fn from_env() -> Self {
+        match std::env::var("FT_GRID_ENGINE") {
+            Ok(value) if value.trim().eq_ignore_ascii_case("page") => GridEngine::Page,
+            _ => GridEngine::Legacy,
+        }
     }
 }
 impl_downcast!(TerminalConfiguration);

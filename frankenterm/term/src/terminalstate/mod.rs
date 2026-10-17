@@ -20,7 +20,8 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::io::{BufWriter, Write};
 use std::num::NonZeroUsize;
-use std::sync::mpsc::{channel, Sender};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use terminfo::{Database, Value};
 use termwiz::input::KeyboardEncoding;
@@ -298,9 +299,7 @@ impl ScreenOrAlt {
     fn dirty_top_phys_rows(&mut self, seqno: SequenceNo) {
         let num_rows = self.screen.physical_rows;
         for line_idx in 0..num_rows {
-            self.screen
-                .line_mut(line_idx)
-                .update_last_change_seqno(seqno);
+            self.screen.touch_phys_row(line_idx, seqno);
         }
     }
 
@@ -353,9 +352,31 @@ impl ScreenOrAlt {
     }
 }
 
+/// Configuration that per-character and per-row ingest paths read, captured
+/// at the start of every parse batch (ft-yccm0.2.4). The GUI's `TermConfig`
+/// locks a mutex and clones an `Arc` on every read, which `print` used to pay
+/// per character. A change takes effect at the next batch boundary.
+#[derive(Clone, Debug)]
+struct BatchConfig {
+    max_accumulating_title_len: usize,
+    normalize_output_to_unicode_nfc: bool,
+    bidi_mode: BidiMode,
+}
+
+impl BatchConfig {
+    fn capture(config: &dyn TerminalConfiguration) -> Self {
+        Self {
+            max_accumulating_title_len: config.max_accumulating_title_len(),
+            normalize_output_to_unicode_nfc: config.normalize_output_to_unicode_nfc(),
+            bidi_mode: config.bidi_mode(),
+        }
+    }
+}
+
 /// Manages the state for the terminal
 pub struct TerminalState {
     config: Arc<dyn TerminalConfiguration>,
+    batch_config: BatchConfig,
 
     screen: ScreenOrAlt,
     /// The current set of attributes in effect for the next
@@ -497,9 +518,12 @@ pub struct TerminalState {
     unicode_version_stack: Vec<UnicodeVersionStackEntry>,
 
     /// Whether any cell of either screen may hold text ending in U+200D (ZWJ).
-    /// Only the performer writes arbitrary grapheme text, so this becomes true
-    /// the first time it writes such a cell and stays true; restored state
-    /// starts true because its cells were not written by this performer.
+    /// New grapheme text reaches cells only through the performer, so this
+    /// becomes true the first time it writes such a cell and stays true. Other
+    /// writers copy or re-lay-out existing cells (reflow, rectangle copies, and
+    /// cold-history layouts read back from this pane's own spill store), which
+    /// cannot introduce a ZWJ tail this performer never wrote. Restored
+    /// checkpoints start true because their cells came from elsewhere.
     /// While false, a multi-byte grapheme cannot continue its left neighbour,
     /// so `print` skips the cluster-continuation scan entirely.
     zwj_tail_cell_possible: bool,
@@ -580,9 +604,21 @@ fn default_color_map() -> HashMap<u16, RgbColor> {
 /// back-pressure when there is a lot of data to read,
 /// and we're in control of the write side, which represents
 /// input from the interactive user, or pastes.
+///
+/// Neither `write` nor `flush` ever waits for the writer thread: a child that
+/// stops reading its input must not stall the parser or the GUI while they
+/// hold the terminal lock (ft-yccm0.2.2.5). Completion is observable only
+/// through [`TerminalState::writer_barrier`].
 enum ThreadedWriter {
     Live {
         sender: Sender<WriterMessage>,
+        counters: Arc<WriterCounters>,
+        /// The class of every byte written until the next class change.
+        class: WriteClass,
+        /// Whether the reply unit in progress (the writes since the last
+        /// flush) is being dropped. Decided once per unit, so a reply reaches
+        /// the child whole or not at all.
+        reply_unit_dropped: Option<bool>,
     },
     #[cfg(feature = "use_serde")]
     Inert,
@@ -601,9 +637,135 @@ pub(crate) struct PreparedRecoveryConfiguration {
     refreshed_unicode_version: Option<UnicodeVersion>,
 }
 
+/// Who produced bytes headed for the child's input.
+///
+/// Both classes share one FIFO, so replies stay ordered relative to user
+/// input; they differ only under backpressure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteClass {
+    /// Keystrokes, pastes, mouse and focus reports. Never dropped.
+    UserInput,
+    /// Answers to the child's own queries (DA, DSR/CPR, DECRQSS, DECRQM,
+    /// XTVERSION, OSC color queries, kitty graphics acknowledgements). Dropped
+    /// whole, and counted, once [`REPLY_BACKLOG_LIMIT`] is reached.
+    Reply,
+}
+
+/// Unwritten reply bytes at which further replies are dropped. A child with
+/// this many unanswered query replies has stopped reading its input, and a
+/// backlog of stale answers is useless to it. User input is never dropped.
+pub const REPLY_BACKLOG_LIMIT: usize = 64 * 1024;
+
+/// The largest paste [`TerminalState::send_paste`] accepts. A larger paste is
+/// refused whole with [`PasteTooLarge`] rather than truncated.
+pub const MAX_PASTE_BYTES: usize = 64 * 1024 * 1024;
+
+/// A paste refused because it is larger than [`MAX_PASTE_BYTES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasteTooLarge {
+    pub len: usize,
+    pub limit: usize,
+}
+
+impl std::fmt::Display for PasteTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "paste of {} bytes refused: the limit is {} bytes; nothing was sent",
+            self.len, self.limit
+        )
+    }
+}
+
+impl std::error::Error for PasteTooLarge {}
+
+/// Writer queue accounting, as reported by [`TerminalState::writer_backlog`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriterBacklog {
+    /// User-input bytes enqueued but not yet written to the child.
+    pub pending_input_bytes: usize,
+    /// Reply bytes enqueued but not yet written to the child.
+    pub pending_reply_bytes: usize,
+    /// Reply units dropped because the reply backlog was full.
+    pub dropped_replies: u64,
+    /// Bytes in those dropped replies.
+    pub dropped_reply_bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct WriterCounters {
+    pending_input_bytes: AtomicUsize,
+    pending_reply_bytes: AtomicUsize,
+    dropped_replies: AtomicU64,
+    dropped_reply_bytes: AtomicU64,
+}
+
+impl WriterCounters {
+    fn pending(&self, class: WriteClass) -> &AtomicUsize {
+        match class {
+            WriteClass::UserInput => &self.pending_input_bytes,
+            WriteClass::Reply => &self.pending_reply_bytes,
+        }
+    }
+
+    fn snapshot(&self) -> WriterBacklog {
+        WriterBacklog {
+            pending_input_bytes: self.pending_input_bytes.load(Ordering::Relaxed),
+            pending_reply_bytes: self.pending_reply_bytes.load(Ordering::Relaxed),
+            dropped_replies: self.dropped_replies.load(Ordering::Relaxed),
+            dropped_reply_bytes: self.dropped_reply_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Completion of everything a terminal enqueued for its child before the
+/// barrier was taken; see [`TerminalState::writer_barrier`].
+#[must_use = "a barrier does nothing unless waited on"]
+pub struct WriterBarrier {
+    state: WriterBarrierState,
+}
+
+enum WriterBarrierState {
+    Pending(Receiver<std::io::Result<()>>),
+    /// An inert (checkpoint-restored, not yet activated) writer has nothing
+    /// to drain.
+    #[cfg_attr(not(feature = "use_serde"), allow(dead_code))]
+    Complete,
+    Unavailable(std::io::ErrorKind),
+}
+
+impl WriterBarrier {
+    /// Blocks until the writer thread has written and flushed every byte
+    /// enqueued before the barrier, or until `timeout` elapses.
+    ///
+    /// A child that stops reading its input blocks this indefinitely, so it
+    /// must never run on the GUI main thread or while the terminal lock is
+    /// held: take the barrier under the lock, release the lock, then wait.
+    pub fn wait(self, timeout: std::time::Duration) -> std::io::Result<()> {
+        match self.state {
+            WriterBarrierState::Complete => Ok(()),
+            WriterBarrierState::Unavailable(kind) => {
+                Err(std::io::Error::new(kind, "terminal writer is unavailable"))
+            }
+            WriterBarrierState::Pending(ack) => match ack.recv_timeout(timeout) {
+                Ok(result) => result,
+                Err(RecvTimeoutError::Timeout) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "terminal writer did not drain before the timeout",
+                )),
+                Err(RecvTimeoutError::Disconnected) => Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "terminal writer stopped before the barrier",
+                )),
+            },
+        }
+    }
+}
+
 enum WriterMessage {
-    Data(Vec<u8>),
-    Flush(Sender<std::io::Result<()>>),
+    Data { bytes: Vec<u8>, class: WriteClass },
+    Flush,
+    Barrier(Sender<std::io::Result<()>>),
 }
 
 impl ThreadedWriter {
@@ -626,17 +788,28 @@ impl ThreadedWriter {
             .map_err(|_| std::io::Error::other("terminal writer name allocation failed"))?;
         thread_name.push_str(THREAD_NAME);
 
+        let counters = Arc::new(WriterCounters::default());
+        let thread_counters = Arc::clone(&counters);
         std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
                 while let Ok(msg) = receiver.recv() {
                     match msg {
-                        WriterMessage::Data(buf) => {
-                            if writer.write_all(&buf).is_err() {
+                        WriterMessage::Data { bytes, class } => {
+                            let result = writer.write_all(&bytes);
+                            thread_counters
+                                .pending(class)
+                                .fetch_sub(bytes.len(), Ordering::Relaxed);
+                            if result.is_err() {
                                 break;
                             }
                         }
-                        WriterMessage::Flush(ack) => {
+                        WriterMessage::Flush => {
+                            if writer.flush().is_err() {
+                                break;
+                            }
+                        }
+                        WriterMessage::Barrier(ack) => {
                             let result = writer.flush();
                             let should_break = result.is_err();
                             let _ = ack.send(result);
@@ -646,29 +819,124 @@ impl ThreadedWriter {
                         }
                     }
                 }
+                // The child's input is gone. Discard what is still queued so
+                // the backlog counters stay truthful; pending barriers see a
+                // disconnect and report BrokenPipe.
+                for msg in receiver.try_iter() {
+                    if let WriterMessage::Data { bytes, class } = msg {
+                        thread_counters
+                            .pending(class)
+                            .fetch_sub(bytes.len(), Ordering::Relaxed);
+                    }
+                }
             })?;
 
-        Ok(Self::Live { sender })
+        Ok(Self::Live {
+            sender,
+            counters,
+            class: WriteClass::Reply,
+            reply_unit_dropped: None,
+        })
     }
 
     #[cfg(feature = "use_serde")]
     const fn inert() -> Self {
         Self::Inert
     }
+
+    fn class(&self) -> WriteClass {
+        match self {
+            Self::Live { class, .. } => *class,
+            #[cfg(feature = "use_serde")]
+            Self::Inert => WriteClass::Reply,
+            Self::Failed => WriteClass::Reply,
+        }
+    }
+
+    /// Changes the class of subsequent writes. The caller flushes first, so
+    /// no buffered byte changes class.
+    fn set_class(&mut self, new_class: WriteClass) {
+        if let Self::Live {
+            class,
+            reply_unit_dropped,
+            ..
+        } = self
+        {
+            *class = new_class;
+            *reply_unit_dropped = None;
+        }
+    }
+
+    fn backlog(&self) -> WriterBacklog {
+        match self {
+            Self::Live { counters, .. } => counters.snapshot(),
+            #[cfg(feature = "use_serde")]
+            Self::Inert => WriterBacklog::default(),
+            Self::Failed => WriterBacklog::default(),
+        }
+    }
+
+    fn barrier(&self) -> WriterBarrier {
+        let state = match self {
+            Self::Live { sender, .. } => {
+                let (ack_sender, ack_receiver) = channel();
+                match sender.send(WriterMessage::Barrier(ack_sender)) {
+                    Ok(()) => WriterBarrierState::Pending(ack_receiver),
+                    Err(_) => WriterBarrierState::Unavailable(std::io::ErrorKind::BrokenPipe),
+                }
+            }
+            #[cfg(feature = "use_serde")]
+            Self::Inert => WriterBarrierState::Complete,
+            Self::Failed => WriterBarrierState::Unavailable(std::io::ErrorKind::BrokenPipe),
+        };
+        WriterBarrier { state }
+    }
 }
 
 impl std::io::Write for ThreadedWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
-            Self::Live { sender } => {
+            Self::Live {
+                sender,
+                counters,
+                class,
+                reply_unit_dropped,
+            } => {
+                if *class == WriteClass::Reply {
+                    let dropped = *reply_unit_dropped.get_or_insert_with(|| {
+                        let full = counters.pending_reply_bytes.load(Ordering::Relaxed)
+                            >= REPLY_BACKLOG_LIMIT;
+                        if full {
+                            let dropped = counters.dropped_replies.fetch_add(1, Ordering::Relaxed) + 1;
+                            if dropped.is_power_of_two() {
+                                log::warn!(
+                                    "terminal reply backlog is full ({REPLY_BACKLOG_LIMIT} bytes); the child is not reading its input, {dropped} replies dropped so far"
+                                );
+                            }
+                        }
+                        full
+                    });
+                    if dropped {
+                        counters
+                            .dropped_reply_bytes
+                            .fetch_add(buf.len() as u64, Ordering::Relaxed);
+                        return Ok(buf.len());
+                    }
+                }
                 let mut owned = Vec::new();
                 owned
                     .try_reserve_exact(buf.len())
                     .map_err(|_| std::io::Error::other("terminal writer allocation failed"))?;
                 owned.extend_from_slice(buf);
-                sender
-                    .send(WriterMessage::Data(owned))
-                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?;
+                let pending = counters.pending(*class);
+                pending.fetch_add(buf.len(), Ordering::Relaxed);
+                if let Err(err) = sender.send(WriterMessage::Data {
+                    bytes: owned,
+                    class: *class,
+                }) {
+                    pending.fetch_sub(buf.len(), Ordering::Relaxed);
+                    return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, err));
+                }
                 Ok(buf.len())
             }
             #[cfg(feature = "use_serde")]
@@ -680,16 +948,20 @@ impl std::io::Write for ThreadedWriter {
         }
     }
 
+    /// Enqueues a flush and returns at once. It never waits for the writer
+    /// thread; use [`TerminalState::writer_barrier`] to observe completion.
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
-            Self::Live { sender } => {
-                let (ack_sender, ack_receiver) = channel();
+            Self::Live {
+                sender,
+                reply_unit_dropped,
+                ..
+            } => {
+                // A flush ends the reply unit in progress.
+                *reply_unit_dropped = None;
                 sender
-                    .send(WriterMessage::Flush(ack_sender))
-                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?;
-                ack_receiver
-                    .recv()
-                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?
+                    .send(WriterMessage::Flush)
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))
             }
             #[cfg(feature = "use_serde")]
             Self::Inert => Ok(()),
@@ -762,9 +1034,11 @@ impl TerminalState {
         let unicode_version = config.unicode_version();
         let kitty_budget = config.kitty_image_budget_bytes();
         let kitty_max_transmission = config.kitty_image_max_transmission_bytes();
+        let batch_config = BatchConfig::capture(config.as_ref());
 
         TerminalState {
             config,
+            batch_config,
             screen,
             pen: CellAttributes::default(),
             cursor: CursorPosition::default(),
@@ -940,6 +1214,7 @@ impl TerminalState {
     /// sequence number advances only when rows moved, so renderers re-read
     /// the changed scrollback extent.
     pub fn evict_warm_scrollback(&mut self) -> usize {
+        self.refresh_batch_config();
         let seqno = next_sequence_no(self.seqno);
         let evicted = self.screen.screen.evict_warm_scrollback(seqno);
         if evicted > 0 {
@@ -963,6 +1238,19 @@ impl TerminalState {
             self.unicode_version = config.unicode_version();
         }
         self.config = config;
+        self.refresh_batch_config();
+    }
+
+    /// Re-reads the configuration the ingest hot paths cache: this state's
+    /// [`BatchConfig`] and both screens' scrollback policy. `Terminal` calls
+    /// it at the start of every parse batch, and the entry points that size
+    /// scrollback outside a batch call it too. The refresh is unconditional:
+    /// `TermConfig` folds the live pane count into the tier config without
+    /// bumping its revision.
+    pub(crate) fn refresh_batch_config(&mut self) {
+        self.batch_config = BatchConfig::capture(self.config.as_ref());
+        self.screen.screen.refresh_scrollback_policy();
+        self.screen.alt_screen.refresh_scrollback_policy();
     }
 
     pub fn get_config(&self) -> Arc<dyn TerminalConfiguration> {
@@ -1161,6 +1449,7 @@ impl TerminalState {
     /// alternate screen is active. The caller releases the terminal between
     /// slices and drains the sink only when blocked or settled after progress.
     pub fn trim_deferred_scrollback(&mut self) -> DeferredScrollbackTrim {
+        self.refresh_batch_config();
         let result = self.screen.screen.trim_deferred_scrollback(self.seqno);
         if result.moved() {
             self.increment_seqno();
@@ -1234,6 +1523,12 @@ impl TerminalState {
         self.bracketed_paste
     }
 
+    /// Returns true if the application asked for focus in/out reports
+    /// (DECSET 1004).
+    pub fn focus_tracking_enabled(&self) -> bool {
+        self.focus_tracking
+    }
+
     /// Advise the terminal about a change in its focus state
     pub fn focus_changed(&mut self, focused: bool) {
         if focused == self.focused {
@@ -1257,8 +1552,8 @@ impl TerminalState {
             }
         }
         if self.focus_tracking {
-            write!(self.writer, "{}{}", CSI, if focused { "I" } else { "O" }).ok();
-            self.writer.flush().ok();
+            let report = if focused { "\x1b[I" } else { "\x1b[O" };
+            self.write_user_input(report.as_bytes()).ok();
         }
         self.focused = focused;
         if !focused {
@@ -1293,7 +1588,19 @@ impl TerminalState {
     /// in the bracketing, otherwise it is fed to the writer as-is.
     /// De-fang the text by removing any embedded bracketed paste
     /// sequence that may be present.
+    ///
+    /// A paste larger than [`MAX_PASTE_BYTES`] is refused whole with
+    /// [`PasteTooLarge`]; nothing is sent. Otherwise the paste is queued in
+    /// full behind earlier input and never dropped, however slowly the child
+    /// reads it.
     pub fn send_paste(&mut self, text: &str) -> Result<(), Error> {
+        if text.len() > MAX_PASTE_BYTES {
+            return Err(PasteTooLarge {
+                len: text.len(),
+                limit: MAX_PASTE_BYTES,
+            }
+            .into());
+        }
         let mut buf = String::new();
         if self.bracketed_paste {
             buf.push_str("\x1b[200~");
@@ -1313,9 +1620,64 @@ impl TerminalState {
             buf.push_str("\x1b[201~");
         }
 
-        self.writer.write_all(buf.as_bytes())?;
-        self.writer.flush()?;
+        self.write_user_input(buf.as_bytes())?;
         Ok(())
+    }
+
+    /// Runs `f` with every write classed as user input (keys, pastes, mouse
+    /// and focus reports), which backpressure never drops. Bytes buffered
+    /// before the call go out first under their own class; nesting is safe.
+    pub(crate) fn with_user_input<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let previous = self.writer.get_ref().class();
+        if previous != WriteClass::UserInput {
+            // Hand buffered replies over as replies before the class changes.
+            // A failure here means the writer is gone, which `f` reports.
+            self.writer.flush().ok();
+            self.writer.get_mut().set_class(WriteClass::UserInput);
+        }
+        let result = f(self);
+        if previous != WriteClass::UserInput {
+            self.writer.flush().ok();
+            self.writer.get_mut().set_class(previous);
+        }
+        result
+    }
+
+    /// Queues user input (keys, pastes, composed text) behind everything
+    /// already written. Never blocks and is never dropped under backpressure.
+    pub fn write_user_input(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.with_user_input(|term| {
+            term.writer.write_all(bytes)?;
+            term.writer.flush()
+        })
+    }
+
+    /// Queues a reply to one of the child's queries behind everything already
+    /// written, without waiting. Replies are dropped whole once
+    /// [`REPLY_BACKLOG_LIMIT`] unwritten reply bytes accumulate.
+    pub fn enqueue_reply(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.writer.write_all(bytes)?;
+        self.writer.flush()
+    }
+
+    /// Hands every buffered byte to the writer thread and returns a barrier
+    /// that completes once the writer has written and flushed all of them.
+    ///
+    /// This is the only way to observe write completion. Never wait on the
+    /// barrier on the GUI main thread or while holding the terminal lock:
+    /// take it under the lock, release the lock, then wait.
+    pub fn writer_barrier(&mut self) -> WriterBarrier {
+        if let Err(err) = self.writer.flush() {
+            return WriterBarrier {
+                state: WriterBarrierState::Unavailable(err.kind()),
+            };
+        }
+        self.writer.get_ref().barrier()
+    }
+
+    /// The writer queue's current backlog and reply-drop counters.
+    pub fn writer_backlog(&self) -> WriterBacklog {
+        self.writer.get_ref().backlog()
     }
 
     /// Informs the terminal that the viewport of the window has resized to the
@@ -1384,6 +1746,7 @@ impl TerminalState {
         prepared: Option<&mut ScreenReflowPreparation>,
     ) {
         self.increment_seqno();
+        self.refresh_batch_config();
         let (cursor_main, cursor_alt) = self.resize_cursors();
 
         let (adjusted_cursor_main, adjusted_cursor_alt) = self.screen.resize(
@@ -1436,10 +1799,8 @@ impl TerminalState {
     pub fn make_all_lines_dirty(&mut self) {
         self.increment_seqno();
         let seqno = self.seqno;
-        let screen = &mut self.screen;
-        screen.for_each_phys_line_mut(|_, line| {
-            line.update_last_change_seqno(seqno);
-        });
+        // One floor for page-engine rows (ft-yccm0.3.3.4).
+        self.screen.touch_all_rows(seqno);
     }
 
     /// Returns the 0-based cursor position relative to the top left of
@@ -2198,7 +2559,7 @@ impl TerminalState {
                     mode,
                     true,
                     self.bidi_enabled
-                        .unwrap_or_else(|| self.config.bidi_mode().enabled),
+                        .unwrap_or(self.batch_config.bidi_mode.enabled),
                 );
             }
 
@@ -2562,7 +2923,7 @@ impl TerminalState {
 
         for y in top..=bottom {
             let line_idx = screen.phys_row(VisibleRowIndex::from(y_origin.saturating_add(y)));
-            let line = screen.line_mut(line_idx);
+            let line = screen.phys_line(line_idx);
             let left = x_origin.saturating_add(left as usize);
             let right = x_origin.saturating_add(right as usize);
             for cell in line.visible_cells().skip(left) {
@@ -2703,13 +3064,13 @@ impl TerminalState {
             for y in row_range {
                 screen.clear_line(y, col_range.clone(), &pen, seqno, bidi_mode);
                 let line_idx = screen.phys_row(y);
-                screen.line_mut(line_idx).set_single_width(seqno);
+                screen.set_line_size(line_idx, LineSize::Single, seqno);
             }
         }
     }
 
     fn get_bidi_mode(&self) -> BidiMode {
-        let mut mode = self.config.bidi_mode();
+        let mut mode = self.batch_config.bidi_mode;
         if let Some(enabled) = &self.bidi_enabled {
             mode.enabled = *enabled;
         }
@@ -2848,23 +3209,22 @@ impl TerminalState {
                 let top_and_bottom_margins = self.top_and_bottom_margins.clone();
 
                 // Resolve the source cell.  It may be a double-wide character.
+                // Page-engine rows are read and written natively
+                // (ft-yccm0.3.3.4).
                 let cell = {
                     let screen = self.screen_mut();
                     let to_copy = x.saturating_sub(1);
                     let line_idx = screen.phys_row(y);
-                    let line = screen.line_mut(line_idx);
 
-                    match line.cells_mut().get(to_copy).cloned() {
-                        None => Cell::blank(),
-                        Some(candidate) => {
+                    match screen.repeat_source(line_idx, to_copy) {
+                        (None, _) => Cell::blank(),
+                        (Some(candidate), prior) => {
                             if candidate.str() == " " && to_copy > 0 {
                                 // It's a blank.  It may be the second part of
                                 // a double-wide pair; look ahead of it.
-                                let prior = &line.cells_mut()[to_copy - 1];
-                                if prior.width() > 1 {
-                                    prior.clone()
-                                } else {
-                                    candidate
+                                match prior {
+                                    Some(prior) if prior.width() > 1 => prior,
+                                    _ => candidate,
                                 }
                             } else {
                                 candidate
@@ -2877,9 +3237,7 @@ impl TerminalState {
                     {
                         let screen = self.screen_mut();
                         let line_idx = screen.phys_row(y);
-                        let line = screen.line_mut(line_idx);
-
-                        line.set_cell(x, cell.clone(), seqno);
+                        screen.repeat_cell(line_idx, x, &cell, seqno);
                     }
                     x = next_col_saturating(x);
                     if x > last_col_in(&left_and_right_margins) {
@@ -3312,34 +3670,32 @@ impl TerminalState {
         let mut zones = vec![];
 
         let first_stable_row = screen.phys_to_stable_row_index(0);
-        screen.for_each_phys_line_mut(|idx, line| {
+        // Page-engine rows are read natively (ft-yccm0.3.3.4).
+        screen.for_each_semantic_zone_range(|idx, semantic_type, range| {
             let stable_row = first_stable_row + idx as StableRowIndex;
+            let zone_end_x = range.end.saturating_sub(1) as usize;
+            let new_zone = match current_zone.as_ref() {
+                None => true,
+                Some(zone) => zone.semantic_type != semantic_type,
+            };
 
-            for zone_range in line.semantic_zone_ranges() {
-                let zone_end_x = zone_range.range.end.saturating_sub(1) as usize;
-                let new_zone = match current_zone.as_ref() {
-                    None => true,
-                    Some(zone) => zone.semantic_type != zone_range.semantic_type,
-                };
-
-                if new_zone {
-                    if let Some(zone) = current_zone.take() {
-                        zones.push(zone);
-                    }
-
-                    current_zone.replace(SemanticZone {
-                        start_x: zone_range.range.start as usize,
-                        start_y: stable_row,
-                        end_x: zone_end_x,
-                        end_y: stable_row,
-                        semantic_type: zone_range.semantic_type,
-                    });
+            if new_zone {
+                if let Some(zone) = current_zone.take() {
+                    zones.push(zone);
                 }
 
-                if let Some(zone) = current_zone.as_mut() {
-                    zone.end_x = zone_end_x;
-                    zone.end_y = stable_row;
-                }
+                current_zone.replace(SemanticZone {
+                    start_x: range.start as usize,
+                    start_y: stable_row,
+                    end_x: zone_end_x,
+                    end_y: stable_row,
+                    semantic_type,
+                });
+            }
+
+            if let Some(zone) = current_zone.as_mut() {
+                zone.end_x = zone_end_x;
+                zone.end_y = stable_row;
             }
         });
         if let Some(zone) = current_zone.take() {
@@ -3808,6 +4164,275 @@ mod tests {
         (terminal, data)
     }
 
+    /// Waits until the writer thread has written everything the terminal
+    /// queued for its child; the writer never blocks the terminal itself.
+    fn drain_writer(terminal: &mut TerminalState) {
+        terminal
+            .writer_barrier()
+            .wait(std::time::Duration::from_secs(10))
+            .expect("terminal writer drained");
+    }
+
+    /// A terminal whose child is the write end of a real pipe. Nothing reads
+    /// the pipe until the test starts a reader, so a write larger than the
+    /// pipe buffer blocks the writer thread exactly as a stalled child does.
+    fn terminal_with_paused_reader() -> (TerminalState, std::io::PipeReader) {
+        let (reader, writer) = std::io::pipe().expect("pipe");
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
+            kitty_budget: 1024,
+            unicode_version: UnicodeVersion::new(14),
+            scorecard_enabled: false,
+            checksum_rectangular_area: false,
+        });
+        let terminal = TerminalState::new(
+            TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            },
+            config,
+            "test-program",
+            "1.0",
+            Box::new(writer),
+        );
+        (terminal, reader)
+    }
+
+    /// Resumes the child: reads the pipe to EOF on another thread.
+    fn resume_reader(mut reader: std::io::PipeReader) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut all = Vec::new();
+            std::io::Read::read_to_end(&mut reader, &mut all).expect("read pipe");
+            all
+        })
+    }
+
+    /// Runs `f` on its own thread and fails if it takes more than ten
+    /// seconds: a writer that blocked the caller would otherwise hang forever.
+    fn finishes_promptly<T: Send + 'static>(
+        what: &str,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(f());
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("{} blocked on the terminal writer", what))
+    }
+
+    /// More than any pipe buffer holds, so the writer thread blocks in
+    /// `write_all` until the reader resumes.
+    const STALLING_PASTE_BYTES: usize = 1 << 20;
+
+    #[test]
+    fn input_and_replies_never_block_on_a_child_that_stops_reading() {
+        let (terminal, reader) = terminal_with_paused_reader();
+        let paste = "x".repeat(STALLING_PASTE_BYTES);
+        let reply: &[u8] = b"\x1b[0n";
+        let mut terminal = finishes_promptly("queueing for a stalled child", move || {
+            let mut terminal = terminal;
+            terminal.send_paste(&paste).unwrap();
+            for _ in 0..100 {
+                terminal
+                    .key_down(KeyCode::Char('k'), KeyModifiers::NONE)
+                    .unwrap();
+                terminal.perform_device(Device::StatusReport);
+            }
+            terminal
+                .mouse_event(MouseEvent {
+                    kind: MouseEventKind::Press,
+                    button: MouseButton::Left,
+                    modifiers: KeyModifiers::NONE,
+                    x: 0,
+                    y: 0,
+                    x_pixel_offset: 0,
+                    y_pixel_offset: 0,
+                })
+                .unwrap();
+            terminal.focus_changed(false);
+            terminal
+        });
+
+        let backlog = terminal.writer_backlog();
+        assert_eq!(
+            backlog.pending_input_bytes,
+            STALLING_PASTE_BYTES + 100,
+            "the stalled paste and every keystroke stay queued: {backlog:?}"
+        );
+        assert_eq!(
+            backlog.pending_reply_bytes,
+            100 * reply.len(),
+            "{backlog:?}"
+        );
+        assert_eq!(backlog.dropped_replies, 0, "{backlog:?}");
+
+        let read = resume_reader(reader);
+        drain_writer(&mut terminal);
+        assert_eq!(terminal.writer_backlog(), WriterBacklog::default());
+        drop(terminal);
+        let output = read.join().unwrap();
+
+        let mut expected = "x".repeat(STALLING_PASTE_BYTES).into_bytes();
+        for _ in 0..100 {
+            expected.push(b'k');
+            expected.extend_from_slice(reply);
+        }
+        // Mouse reporting and focus tracking are off, so neither writes.
+        assert_eq!(output.len(), expected.len());
+        assert!(
+            output == expected,
+            "replies and keystrokes must keep FIFO order"
+        );
+    }
+
+    #[test]
+    fn replies_are_dropped_whole_once_the_child_stops_reading_but_input_is_kept() {
+        let (mut terminal, reader) = terminal_with_paused_reader();
+        terminal
+            .send_paste(&"x".repeat(STALLING_PASTE_BYTES))
+            .unwrap();
+        // A reply written in two pieces must reach the child whole or not at
+        // all: the drop decision is made once per flushed unit.
+        let reply: [&[u8]; 2] = [b"\x1b[?2026;", b"2$y"];
+        let reply_len = reply[0].len() + reply[1].len();
+        let replies = REPLY_BACKLOG_LIMIT / reply_len + 100;
+        let mut expected_tail = Vec::new();
+        let mut kept_replies = 0usize;
+        for i in 0..replies {
+            if i % 1000 == 0 {
+                terminal
+                    .key_down(KeyCode::Char('k'), KeyModifiers::NONE)
+                    .unwrap();
+                expected_tail.push(b'k');
+            }
+            let kept = terminal.writer_backlog().pending_reply_bytes < REPLY_BACKLOG_LIMIT;
+            // Bypass the BufWriter so each piece is a separate queue write:
+            // the unit straddling the limit must not be cut in half.
+            let threaded = terminal.writer.get_mut();
+            threaded.write_all(reply[0]).unwrap();
+            threaded.write_all(reply[1]).unwrap();
+            threaded.flush().unwrap();
+            if kept {
+                kept_replies += 1;
+                expected_tail.extend_from_slice(reply[0]);
+                expected_tail.extend_from_slice(reply[1]);
+            }
+        }
+
+        let backlog = terminal.writer_backlog();
+        assert!(
+            kept_replies < replies,
+            "the backlog limit was never reached"
+        );
+        assert_eq!(
+            backlog.pending_reply_bytes,
+            kept_replies * reply_len,
+            "{backlog:?}"
+        );
+        assert!(
+            backlog.pending_reply_bytes >= REPLY_BACKLOG_LIMIT,
+            "{:?}",
+            backlog
+        );
+        assert_eq!(
+            backlog.dropped_replies,
+            (replies - kept_replies) as u64,
+            "{backlog:?}"
+        );
+        assert_eq!(
+            backlog.dropped_reply_bytes,
+            ((replies - kept_replies) * reply_len) as u64,
+            "{backlog:?}"
+        );
+        let keystrokes = replies.div_ceil(1000);
+        assert_eq!(
+            backlog.pending_input_bytes,
+            STALLING_PASTE_BYTES + keystrokes,
+            "user input is never dropped: {backlog:?}"
+        );
+
+        let read = resume_reader(reader);
+        drain_writer(&mut terminal);
+        drop(terminal);
+        let output = read.join().unwrap();
+        let (paste, tail) = output.split_at(STALLING_PASTE_BYTES);
+        assert!(paste.iter().all(|&b| b == b'x'));
+        assert!(
+            tail == expected_tail.as_slice(),
+            "every kept reply arrives whole and in order with the keystrokes"
+        );
+    }
+
+    #[test]
+    fn writer_barrier_times_out_while_the_child_is_stalled_then_completes() {
+        let (mut terminal, reader) = terminal_with_paused_reader();
+        terminal
+            .send_paste(&"x".repeat(STALLING_PASTE_BYTES))
+            .unwrap();
+        let err = terminal
+            .writer_barrier()
+            .wait(std::time::Duration::from_millis(50))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+
+        let read = resume_reader(reader);
+        drain_writer(&mut terminal);
+        drop(terminal);
+        assert_eq!(read.join().unwrap().len(), STALLING_PASTE_BYTES);
+    }
+
+    #[test]
+    fn oversized_paste_is_refused_whole_and_later_input_still_flows() {
+        let (mut terminal, output) = terminal_state_with_capture(false);
+        let err = terminal
+            .send_paste(&"y".repeat(MAX_PASTE_BYTES + 1))
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<PasteTooLarge>(),
+            Some(&PasteTooLarge {
+                len: MAX_PASTE_BYTES + 1,
+                limit: MAX_PASTE_BYTES,
+            })
+        );
+        assert!(err.to_string().contains("nothing was sent"), "{}", err);
+        terminal.send_paste("ok").unwrap();
+        drain_writer(&mut terminal);
+        assert_eq!(output.lock().unwrap().as_slice(), b"ok");
+    }
+
+    #[test]
+    fn user_input_class_nests_and_is_restored_after_every_input_path() {
+        let (mut terminal, output) = terminal_state_with_capture(false);
+        assert_eq!(terminal.writer.get_ref().class(), WriteClass::Reply);
+        terminal.with_user_input(|terminal| {
+            assert_eq!(terminal.writer.get_ref().class(), WriteClass::UserInput);
+            terminal.with_user_input(|terminal| {
+                assert_eq!(terminal.writer.get_ref().class(), WriteClass::UserInput);
+            });
+            assert_eq!(terminal.writer.get_ref().class(), WriteClass::UserInput);
+        });
+        assert_eq!(terminal.writer.get_ref().class(), WriteClass::Reply);
+
+        terminal
+            .key_down(KeyCode::Char('a'), KeyModifiers::NONE)
+            .unwrap();
+        assert_eq!(terminal.writer.get_ref().class(), WriteClass::Reply);
+        terminal.send_paste("b").unwrap();
+        assert_eq!(terminal.writer.get_ref().class(), WriteClass::Reply);
+        terminal.focus_tracking = true;
+        terminal.focus_changed(false);
+        assert_eq!(terminal.writer.get_ref().class(), WriteClass::Reply);
+        terminal.enqueue_reply(b"R").unwrap();
+
+        drain_writer(&mut terminal);
+        assert_eq!(output.lock().unwrap().as_slice(), b"ab\x1b[OR");
+        assert_eq!(terminal.writer_backlog(), WriterBacklog::default());
+    }
+
     #[test]
     fn checksum_rectangular_area_suppressed_by_default() {
         let (mut terminal, output) = terminal_state_with_capture(false);
@@ -3820,6 +4445,7 @@ mod tests {
             bottom: OneBased::new(1),
             right: OneBased::new(1),
         });
+        drain_writer(&mut terminal);
 
         assert!(
             output.lock().unwrap().is_empty(),
@@ -3839,6 +4465,7 @@ mod tests {
             bottom: OneBased::new(1),
             right: OneBased::new(1),
         });
+        drain_writer(&mut terminal);
 
         let output = output.lock().unwrap().clone();
         assert!(

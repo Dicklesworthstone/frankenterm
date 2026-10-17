@@ -1,9 +1,10 @@
 #![allow(clippy::many_single_char_names)]
+use crate::csi::{Sgr, decode_common_csi, decode_sgr};
 #[cfg(feature = "tmux_cc")]
 use crate::tmux_cc::Event;
 use crate::{
-    Action, CSI, DeviceControlMode, EnterDeviceControlMode, Esc, OperatingSystemCommand,
-    ShortDeviceControl,
+    Action, CSI, ControlCode, DeviceControlMode, EnterDeviceControlMode, Esc,
+    OperatingSystemCommand, ShortDeviceControl,
 };
 #[cfg(feature = "tmux_cc")]
 use core::borrow::BorrowMut;
@@ -14,7 +15,9 @@ use vtparse::{CsiParam, VTActor, VTParser};
 
 use crate::allocate::*;
 
+mod ascii;
 mod sixel;
+pub use ascii::AsciiScan;
 use sixel::SixelBuilder;
 
 const MAX_TCAP_NAMES: usize = 512;
@@ -96,6 +99,91 @@ fn env_flag_truthy(_name: &str) -> bool {
         }
     }
     false
+}
+
+/// Kill switch for the CSI fast path (ft-yccm0.3.2.4): a falsey value turns
+/// it off for newly constructed parsers. See [`Parser::set_csi_fast_path`].
+#[cfg(feature = "std")]
+const CSI_FAST_PATH_ENV: &str = "FT_CSI_FAST_PATH";
+
+/// Resolve the default `csi_fast_path` setting for a freshly constructed
+/// [`Parser`]: on unless `FT_CSI_FAST_PATH` is set falsey. `no_std` builds
+/// use the default.
+#[inline]
+fn default_csi_fast_path() -> bool {
+    #[cfg(feature = "std")]
+    {
+        let value = std::env::var(CSI_FAST_PATH_ENV).ok();
+        return csi_fast_path_default_for_value(value.as_deref());
+    }
+    #[cfg(not(feature = "std"))]
+    csi_fast_path_default_for_value(None)
+}
+
+/// Kill switch for the 256-color SGR shortcut (ft-yccm0.3.2.6): a falsey
+/// value turns it off for newly constructed parsers. See
+/// [`Parser::set_palette_sgr_fast_path`].
+#[cfg(feature = "std")]
+const PALETTE_SGR_FAST_PATH_ENV: &str = "FT_PALETTE_SGR_FAST_PATH";
+
+/// Resolve the default `palette_sgr_fast_path` setting for a freshly
+/// constructed [`Parser`]: on unless `FT_PALETTE_SGR_FAST_PATH` is falsey.
+#[inline]
+fn default_palette_sgr_fast_path() -> bool {
+    #[cfg(feature = "std")]
+    {
+        let value = std::env::var(PALETTE_SGR_FAST_PATH_ENV).ok();
+        return csi_fast_path_default_for_value(value.as_deref());
+    }
+    #[cfg(not(feature = "std"))]
+    csi_fast_path_default_for_value(None)
+}
+
+/// Kill switch and width choice for the ground-state ASCII scan
+/// (ft-yccm0.3.2.2): falsey selects the scalar scan for newly constructed
+/// parsers, and `16`, `32` or `64` a `std::simd` width. See
+/// [`AsciiScan::for_env_value`] and [`Parser::set_ascii_scan`].
+#[cfg(feature = "std")]
+const PARSER_SIMD_ENV: &str = "FT_PARSER_SIMD";
+
+/// Resolve the default [`AsciiScan`] for a freshly constructed [`Parser`].
+/// `no_std` builds use [`AsciiScan::DEFAULT`].
+#[inline]
+fn default_ascii_scan() -> AsciiScan {
+    #[cfg(feature = "std")]
+    {
+        let value = std::env::var(PARSER_SIMD_ENV).ok();
+        return AsciiScan::for_env_value(value.as_deref());
+    }
+    #[cfg(not(feature = "std"))]
+    AsciiScan::for_env_value(None)
+}
+
+/// Kill switch for validating a printable run's UTF-8 in one pass
+/// (ft-yccm0.3.2.3): a falsey value makes newly constructed parsers check
+/// each character on its own, the oracle. See [`Parser::set_simd_utf8`].
+#[cfg(feature = "std")]
+const PARSER_SIMD_UTF8_ENV: &str = "FT_PARSER_SIMD_UTF8";
+
+/// Resolve the default `simd_utf8` setting for a freshly constructed
+/// [`Parser`]: on unless `FT_PARSER_SIMD_UTF8` is set falsey.
+#[inline]
+fn default_simd_utf8() -> bool {
+    #[cfg(feature = "std")]
+    {
+        let value = std::env::var(PARSER_SIMD_UTF8_ENV).ok();
+        return csi_fast_path_default_for_value(value.as_deref());
+    }
+    #[cfg(not(feature = "std"))]
+    csi_fast_path_default_for_value(None)
+}
+
+/// Pure policy core for [`default_csi_fast_path`] and
+/// [`default_simd_utf8`], testable without touching the process
+/// environment: on unless the value is falsey.
+#[inline]
+fn csi_fast_path_default_for_value(value: Option<&str>) -> bool {
+    !value.is_some_and(env_value_is_falsey)
 }
 
 #[inline]
@@ -277,6 +365,83 @@ struct ParseState {
 
 const MAX_SHORT_DCS_BYTES: usize = 8 * 1024 * 1024;
 
+/// Receives what [`Parser::parse_with`] decodes, one call per action, in
+/// stream order (ft-yccm0.3.2.1). The parser is generic over the handler, so
+/// every call is static dispatch, and nothing is collected: a handler that
+/// applies each action as it arrives needs no `Vec<Action>`.
+///
+/// Only [`Handler::action`] is required. The other methods carry the hot
+/// actions without building an [`Action`]; a printable run arrives as a
+/// borrowed `&str` rather than an owned `String`. Their defaults forward
+/// exactly the `Action` that [`Parser::parse`] produces, so overriding none
+/// of them reproduces the `Action` stream.
+pub trait Handler {
+    /// Every action the other methods do not take themselves.
+    fn action(&mut self, action: Action);
+
+    /// [`Action::Print`].
+    #[inline]
+    fn print(&mut self, c: char) {
+        self.action(Action::Print(c));
+    }
+
+    /// [`Action::PrintString`]: a run of ground-state printable characters.
+    #[inline]
+    fn print_str(&mut self, text: &str) {
+        self.action(Action::PrintString(text.to_string()));
+    }
+
+    /// [`Action::PrintString`] for a run that is all printable ASCII
+    /// (`0x20..=0x7e`) and at least two bytes long (ft-yccm0.3.2.2). A
+    /// handler that knows each byte is one narrow cell can write the run
+    /// straight into a row; the default hands it to [`Handler::print_str`].
+    #[inline]
+    fn print_ascii_run(&mut self, run: &str) {
+        self.print_str(run);
+    }
+
+    /// [`Action::Control`].
+    #[inline]
+    fn control(&mut self, code: ControlCode) {
+        self.action(Action::Control(code));
+    }
+
+    /// [`Action::CSI`].
+    #[inline]
+    fn csi(&mut self, csi: CSI) {
+        self.action(Action::CSI(csi));
+    }
+
+    /// [`Action::Esc`].
+    #[inline]
+    fn esc(&mut self, esc: Esc) {
+        self.action(Action::Esc(esc));
+    }
+
+    /// One [`Action::CSI`]`(`[`CSI::Sgr`]`)` per setting, in order. The CSI
+    /// fast path (ft-yccm0.3.2.4) hands over the settings of consecutive SGR
+    /// sequences in one call; nothing lies between them, so nothing can
+    /// observe the pen in between.
+    #[inline]
+    fn sgr(&mut self, sgrs: &[Sgr]) {
+        for sgr in sgrs {
+            self.csi(CSI::Sgr(sgr.clone()));
+        }
+    }
+}
+
+/// The [`Handler`] for consumers that want [`Action`] values (the mux codec,
+/// the recorder, scripting, tests): every action reaches the closure as the
+/// `Action` that [`Parser::parse`] has always produced.
+pub struct ActionCollector<F: FnMut(Action)>(pub F);
+
+impl<F: FnMut(Action)> Handler for ActionCollector<F> {
+    #[inline]
+    fn action(&mut self, action: Action) {
+        (self.0)(action)
+    }
+}
+
 /// The `Parser` struct holds the state machine that is used to decode
 /// a sequence of bytes.  The byte sequence can be streaming into the
 /// state machine.
@@ -302,6 +467,97 @@ pub struct Parser {
     /// disables it for newly constructed parsers, and
     /// [`Parser::set_print_batching`] overrides the resolved default.
     print_batching: bool,
+    /// The CSI fast path (ft-yccm0.3.2.4); see [`Parser::set_csi_fast_path`].
+    csi_fast_path: bool,
+    /// The 256-color SGR shortcut inside the CSI fast path
+    /// (ft-yccm0.3.2.6); see [`Parser::set_palette_sgr_fast_path`].
+    palette_sgr_fast_path: bool,
+    /// The ground-state ASCII scan (ft-yccm0.3.2.2); see
+    /// [`Parser::set_ascii_scan`].
+    ascii_scan: AsciiScan,
+    /// One UTF-8 validation per printable run (ft-yccm0.3.2.3); see
+    /// [`Parser::set_simd_utf8`].
+    simd_utf8: bool,
+    /// The fast path's parameter array, reused for every sequence: fixed
+    /// size, never on the heap, and never cleared (only the prefix a scan
+    /// writes is read).
+    csi_params: [CsiParam; CSI_FAST_MAX_PARAMS],
+    /// The settings of the SGR sequences the fast path is decoding, handed
+    /// to [`Handler::sgr`] together.
+    sgr_run: [Sgr; SGR_RUN_MAX],
+    last_sgr: LastSgr,
+}
+
+/// Parameters the CSI fast path holds. A sequence with more goes through
+/// the state machine.
+pub(crate) const CSI_FAST_MAX_PARAMS: usize = 32;
+
+/// SGR settings one [`Handler::sgr`] call carries at most, and so the most
+/// `decode_sgr` is given room for. One sequence of [`CSI_FAST_MAX_PARAMS`]
+/// parameters decodes to at most half of that plus one, so it always fits
+/// once the run is handed over: every SGR the fast path scans is decoded,
+/// whatever its number of settings.
+pub(crate) const SGR_RUN_MAX: usize = 32;
+
+const _: () = assert!(CSI_FAST_MAX_PARAMS / 2 < SGR_RUN_MAX);
+
+/// Longest SGR parameter string the last-SGR cache keeps.
+const LAST_SGR_KEY_MAX: usize = 24;
+
+/// Most settings the last-SGR cache keeps.
+const LAST_SGR_MAX: usize = 4;
+
+/// The one-entry last-SGR cache (ft-yccm0.3.2.4): the parameter bytes of the
+/// last SGR sequence the fast path decoded, and its settings. A sequence
+/// with the same bytes is answered from here, with no parameter scan and no
+/// decode. The settings are a pure function of those bytes, so a hit is
+/// never stale.
+///
+/// The pen is a plain value that each setting updates in place, with no
+/// style set to hash or probe as Ghostty has, so decoding is the work a hit
+/// saves.
+struct LastSgr {
+    key: [u8; LAST_SGR_KEY_MAX],
+    key_len: usize,
+    sgrs: [Sgr; LAST_SGR_MAX],
+    /// The number of settings held; 0 while the cache is empty.
+    count: usize,
+}
+
+impl LastSgr {
+    fn new() -> Self {
+        Self {
+            key: [0; LAST_SGR_KEY_MAX],
+            key_len: 0,
+            sgrs: core::array::from_fn(|_| Sgr::Reset),
+            count: 0,
+        }
+    }
+
+    /// Given the bytes after `ESC[`, the length of the cached parameters
+    /// plus the `m` when those bytes start with them.
+    #[inline]
+    fn hit(&self, body: &[u8]) -> Option<usize> {
+        if self.count == 0 {
+            return None;
+        }
+        let len = self.key_len;
+        let sequence = body.get(..=len)?;
+        (sequence[len] == b'm' && sequence[..len] == self.key[..len]).then_some(len + 1)
+    }
+
+    /// Remembers `sgrs` as what the parameter bytes `key` decode to. An
+    /// entry too large to keep leaves the cache as it was.
+    #[inline]
+    fn store(&mut self, key: &[u8], sgrs: &[Sgr]) {
+        if key.len() > LAST_SGR_KEY_MAX || sgrs.len() > LAST_SGR_MAX {
+            return;
+        }
+        self.key[..key.len()].copy_from_slice(key);
+        self.key_len = key.len();
+        self.sgrs[..sgrs.len()].clone_from_slice(sgrs);
+        self.count = sgrs.len();
+    }
 }
 
 /// Bounded partial sequence; no emitted actions are discarded. The parser
@@ -409,6 +665,13 @@ impl Parser {
             pending_sequence_bytes: 0,
             recovery_stream_bytes: Some(0),
             print_batching: default_print_batching(),
+            csi_fast_path: default_csi_fast_path(),
+            palette_sgr_fast_path: default_palette_sgr_fast_path(),
+            ascii_scan: default_ascii_scan(),
+            simd_utf8: default_simd_utf8(),
+            csi_params: [CsiParam::Integer(0); CSI_FAST_MAX_PARAMS],
+            sgr_run: core::array::from_fn(|_| Sgr::Reset),
+            last_sgr: LastSgr::new(),
         }
     }
 
@@ -528,6 +791,81 @@ impl Parser {
         self.state.borrow().table_dispatch
     }
 
+    /// Turns the CSI fast path (ft-yccm0.3.2.4) on or off. It is on unless
+    /// `FT_CSI_FAST_PATH` is falsey, and it runs only with print batching.
+    ///
+    /// At ground state it scans a complete CSI sequence straight from the
+    /// bytes into a fixed parameter array, instead of feeding the state
+    /// machine a byte at a time. The common finals are then decoded by a
+    /// direct match, and SGR settings by an allocation-free decoder with a
+    /// one-entry last-SGR cache. The settings of consecutive SGR sequences
+    /// go to [`Handler::sgr`] together, and a lone codepoint between
+    /// escapes is decoded in place rather than by the state machine's UTF-8
+    /// decoder.
+    ///
+    /// Every other sequence is handed to the state machine or to
+    /// [`CSI::parse`] exactly as before. The action stream is identical
+    /// either way; off, every CSI goes through the state machine.
+    pub fn set_csi_fast_path(&mut self, on: bool) {
+        self.csi_fast_path = on;
+    }
+
+    /// Whether the CSI fast path is on. See [`Parser::set_csi_fast_path`].
+    pub fn csi_fast_path(&self) -> bool {
+        self.csi_fast_path
+    }
+
+    /// Turns the 256-color SGR shortcut (ft-yccm0.3.2.6) on or off. It is
+    /// on unless `FT_PALETTE_SGR_FAST_PATH` is falsey, and it applies only
+    /// within the CSI fast path. `ESC [ 38;5;N m` and `ESC [ 48;5;N m`, with
+    /// N at most 255 in at most three digits, become the settings
+    /// [`decode_sgr`] gives them, read straight from the bytes: no parameter
+    /// array, no decode, no store into the last-SGR cache (a pure memo of
+    /// bytes to settings, which may stay older). T0 sends two per cell, each
+    /// with a new color. The action stream is identical either way.
+    pub fn set_palette_sgr_fast_path(&mut self, on: bool) {
+        self.palette_sgr_fast_path = on;
+    }
+
+    /// Chooses how the ground state finds the end of a printable-ASCII
+    /// stretch (ft-yccm0.3.2.2). The default is [`AsciiScan::DEFAULT`]
+    /// unless `FT_PARSER_SIMD` says otherwise; `FT_PARSER_SIMD=0` selects
+    /// the scalar scan. It applies with print batching. Every choice yields
+    /// the same action stream.
+    pub fn set_ascii_scan(&mut self, scan: AsciiScan) {
+        self.ascii_scan = scan;
+    }
+
+    /// The ground-state ASCII scan in use. See [`Parser::set_ascii_scan`].
+    pub fn ascii_scan(&self) -> AsciiScan {
+        self.ascii_scan
+    }
+
+    /// Chooses how the ground state checks the UTF-8 of a printable run
+    /// (ft-yccm0.3.2.3). It is on unless `FT_PARSER_SIMD_UTF8` is falsey,
+    /// and it applies with print batching.
+    ///
+    /// On:
+    /// - the run's extent (up to the first control, DEL or C1 control) is
+    ///   found with the [`AsciiScan`] in use;
+    /// - its UTF-8 is validated once, by the same `core::str::from_utf8`
+    ///   that hands the handler its `&str`;
+    /// - a lone character with no printable byte after it is decoded and
+    ///   checked in place.
+    ///
+    /// Off, every character is checked on its own and the run is then
+    /// validated again: the oracle. The action stream is identical either
+    /// way.
+    pub fn set_simd_utf8(&mut self, on: bool) {
+        self.simd_utf8 = on;
+    }
+
+    /// Whether printable runs are validated in one pass. See
+    /// [`Parser::set_simd_utf8`].
+    pub fn simd_utf8(&self) -> bool {
+        self.simd_utf8
+    }
+
     /// advance with tmux parser, bypass VTParse
     #[cfg(feature = "tmux_cc")]
     fn advance_tmux_bytes(&mut self, bytes: &[u8]) -> crate::Result<Vec<Event>> {
@@ -548,7 +886,15 @@ impl Parser {
         result
     }
 
-    pub fn parse<F: FnMut(Action)>(&mut self, bytes: &[u8], mut callback: F) {
+    /// Decodes `bytes` and hands every action to `callback` as an [`Action`].
+    pub fn parse<F: FnMut(Action)>(&mut self, bytes: &[u8], callback: F) {
+        self.parse_with(bytes, &mut ActionCollector(callback));
+    }
+
+    /// Decodes `bytes` into `handler`, one call per action, with no
+    /// intermediate `Action` storage; see [`Handler`]. Stream-position
+    /// tracking is the same as [`Parser::parse`].
+    pub fn parse_with<H: Handler + ?Sized>(&mut self, bytes: &[u8], handler: &mut H) {
         // Taking the prior position before invoking caller code makes unwind
         // fail closed. If a callback panics after the parser consumed any part
         // of this slice, the position remains `None` and this parser can never
@@ -556,7 +902,7 @@ impl Parser {
         let prior_stream_bytes = self.recovery_stream_bytes.take();
         self.pending_sequence_bytes = 0;
         for action in core::mem::take(&mut self.pending_actions) {
-            callback(action);
+            handler.action(action);
         }
         #[cfg(feature = "tmux_cc")]
         let is_tmux_mode: bool = self.state.borrow().tmux_state.is_some();
@@ -564,7 +910,7 @@ impl Parser {
         if is_tmux_mode {
             match self.advance_tmux_bytes(bytes) {
                 Ok(tmux_events) => {
-                    callback(Action::DeviceControl(DeviceControlMode::TmuxEvents(
+                    handler.action(Action::DeviceControl(DeviceControlMode::TmuxEvents(
                         Box::new(tmux_events),
                     )));
                 }
@@ -574,7 +920,7 @@ impl Parser {
                     let mut parser_state = self.state.borrow_mut();
                     parser_state.tmux_state = None;
                     let mut perform = Performer {
-                        callback: &mut callback,
+                        handler: &mut *handler,
                         state: &mut parser_state,
                     };
                     self.state_machine
@@ -586,14 +932,14 @@ impl Parser {
         }
 
         if self.print_batching {
-            self.parse_ground_batched(bytes, &mut callback);
+            self.parse_ground_batched(bytes, handler);
             self.finish_recovery_stream_advance(prior_stream_bytes, bytes.len());
             return;
         }
 
         {
             let mut perform = Performer {
-                callback: &mut callback,
+                handler,
                 state: &mut self.state.borrow_mut(),
             };
             self.state_machine.parse(bytes, &mut perform);
@@ -617,47 +963,171 @@ impl Parser {
     /// is identical to the scalar path modulo print coalescing, including
     /// across chunk boundaries (an incomplete trailing multibyte sequence is
     /// deferred to the scalar path, which correctly parks in `Utf8Sequence`).
-    fn parse_ground_batched<F: FnMut(Action)>(&mut self, bytes: &[u8], callback: &mut F) {
-        // Runs shorter than this stay on the scalar path: a one-codepoint
-        // `PrintString` would allocate a `String` where `Print(char)` does not,
-        // which would regress control-sequence-heavy streams.
-        const MIN_BATCH_CHARS: usize = 2;
-
+    ///
+    /// With the CSI fast path on (ft-yccm0.3.2.4), two more ground-state
+    /// shapes skip the state machine, by the same invariant. A run of one
+    /// codepoint prints as the `Action::Print` the machine would emit. A
+    /// complete CSI sequence that [`Parser::ground_csi`] takes dispatches as
+    /// the machine would dispatch it, ending in Ground.
+    fn parse_ground_batched<H: Handler + ?Sized>(&mut self, bytes: &[u8], handler: &mut H) {
+        let csi_fast_path = self.csi_fast_path;
+        let ascii_scan = self.ascii_scan;
+        let simd_utf8 = self.simd_utf8;
+        let mut extents = RunExtents::default();
         let n = bytes.len();
         let mut i = 0;
         while i < n {
-            if can_start_printable_run(bytes[i]) && self.state_machine.is_ground() {
-                let (run_end, char_count) = scan_printable_run(bytes, i);
-                if char_count >= MIN_BATCH_CHARS {
-                    // `scan_printable_run` only extends across complete, valid
-                    // UTF-8, so the slice is guaranteed valid UTF-8.
-                    debug_assert!(core::str::from_utf8(&bytes[i..run_end]).is_ok());
-                    if let Ok(s) = core::str::from_utf8(&bytes[i..run_end]) {
-                        callback(Action::PrintString(s.to_string()));
-                        i = run_end;
+            if self.state_machine.is_ground() {
+                let byte = bytes[i];
+                if can_start_printable_run(byte) {
+                    match ground_run(bytes, i, ascii_scan, simd_utf8, &mut extents) {
+                        GroundRun::Text { text, ascii } => {
+                            if ascii {
+                                handler.print_ascii_run(text);
+                            } else {
+                                handler.print_str(text);
+                            }
+                            i += text.len();
+                            continue;
+                        }
+                        // A lone codepoint, such as the character between two
+                        // SGR sequences, decoded here rather than byte by byte
+                        // in the state machine's UTF-8 decoder.
+                        GroundRun::One(c, len) if csi_fast_path => {
+                            handler.print(c);
+                            i += len;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                } else if byte == 0x1b && csi_fast_path {
+                    let consumed = self.ground_csi(bytes, i, &mut *handler);
+                    if consumed > 0 {
+                        i += consumed;
                         continue;
                     }
                 }
             }
 
-            // Scalar segment: feed bytes through the real state machine until we
-            // exhaust the input or reach a ground-state batchable boundary.
+            // Scalar segment: the byte at `i`, which no fast path took, goes
+            // through the real state machine, and so does every byte after it
+            // up to a ground-state boundary where a fast path may apply.
             let mut state = self.state.borrow_mut();
             let mut perform = Performer {
-                callback: &mut *callback,
+                handler: &mut *handler,
                 state: &mut state,
             };
-            while i < n {
-                if can_start_printable_run(bytes[i]) && self.state_machine.is_ground() {
-                    let (_run_end, char_count) = scan_printable_run(bytes, i);
-                    if char_count >= MIN_BATCH_CHARS {
+            loop {
+                self.state_machine.parse_byte(bytes[i], &mut perform);
+                i += 1;
+                if i >= n {
+                    break;
+                }
+                if self.state_machine.is_ground() {
+                    let byte = bytes[i];
+                    let boundary = if csi_fast_path {
+                        byte == 0x1b || can_start_printable_run(byte)
+                    } else {
+                        can_start_printable_run(byte)
+                            && matches!(
+                                ground_run(bytes, i, ascii_scan, simd_utf8, &mut extents),
+                                GroundRun::Text { .. }
+                            )
+                    };
+                    if boundary {
                         break;
                     }
                 }
-                self.state_machine.parse_byte(bytes[i], &mut perform);
-                i += 1;
             }
         }
+    }
+
+    /// The CSI fast path (ft-yccm0.3.2.4) at the ground-state ESC
+    /// `bytes[start]`. Returns how many bytes it consumed, or 0 when the
+    /// state machine must take the ESC.
+    ///
+    /// It takes the complete CSI sequences that [`scan_csi`] accepts, plus
+    /// any further ones that follow immediately while each is an SGR:
+    /// - An SGR whose parameter bytes are the last-SGR cache's is answered
+    ///   from the cache.
+    /// - Any other SGR is decoded by `decode_sgr`.
+    /// - A common final is decoded by `decode_common_csi`.
+    /// - Everything else goes to [`dispatch_csi`], exactly as the state
+    ///   machine's `csi_dispatch` would send it.
+    ///
+    /// The settings of consecutive SGR sequences reach [`Handler::sgr`] in
+    /// one call, with no flush or print boundary between them. They are
+    /// handed over before any other action, so the stream order holds.
+    fn ground_csi<H: Handler + ?Sized>(
+        &mut self,
+        bytes: &[u8],
+        start: usize,
+        handler: &mut H,
+    ) -> usize {
+        let mut i = start;
+        let mut run = 0;
+        while bytes.get(i) == Some(&0x1b) && bytes.get(i + 1) == Some(&b'[') {
+            let body = i + 2;
+            if let Some(len) = self.last_sgr.hit(&bytes[body..]) {
+                let cached = &self.last_sgr.sgrs[..self.last_sgr.count];
+                if run + cached.len() > SGR_RUN_MAX {
+                    handler.sgr(&self.sgr_run[..run]);
+                    run = 0;
+                }
+                self.sgr_run[run..run + cached.len()].clone_from_slice(cached);
+                run += cached.len();
+                i = body + len;
+                continue;
+            }
+            if self.palette_sgr_fast_path {
+                if let Some((sgr, len)) = palette_sgr(&bytes[body..]) {
+                    // Flushed as the scan's five parameters would be.
+                    if run + 5 / 2 + 1 > SGR_RUN_MAX {
+                        handler.sgr(&self.sgr_run[..run]);
+                        run = 0;
+                    }
+                    self.sgr_run[run] = sgr;
+                    run += 1;
+                    i = body + len;
+                    continue;
+                }
+            }
+            let Some((fin, count)) = scan_csi(bytes, i, &mut self.csi_params) else {
+                break;
+            };
+            let params = &self.csi_params[..count];
+            let control = bytes[fin];
+            if control == b'm' {
+                if run + count / 2 + 1 > SGR_RUN_MAX {
+                    handler.sgr(&self.sgr_run[..run]);
+                    run = 0;
+                }
+                if let Some(decoded) = decode_sgr(params, &mut self.sgr_run[run..]) {
+                    self.last_sgr
+                        .store(&bytes[body..fin], &self.sgr_run[run..run + decoded]);
+                    run += decoded;
+                    i = fin + 1;
+                    continue;
+                }
+            }
+            // Any other sequence ends the run, which applies first.
+            if run > 0 {
+                handler.sgr(&self.sgr_run[..run]);
+                run = 0;
+            }
+            let decoded =
+                control != b'm' && decode_common_csi(params, control, &mut |csi| handler.csi(csi));
+            if !decoded {
+                let table_dispatch = self.state.borrow().table_dispatch;
+                dispatch_csi(params, false, control, table_dispatch, &mut *handler);
+            }
+            i = fin + 1;
+            break;
+        }
+        if run > 0 {
+            handler.sgr(&self.sgr_run[..run]);
+        }
+        i - start
     }
 
     /// A specialized version of the parser that halts after recognizing the
@@ -679,14 +1149,14 @@ impl Parser {
         let mut first_idx = None;
         {
             let mut perform = Performer {
-                callback: &mut |action| {
+                handler: &mut ActionCollector(|action| {
                     // capture the action, but only if it is the first one
                     // we've seen.  Preserve an existing one if any.
                     if first.borrow().is_some() {
                         return;
                     }
                     *first.borrow_mut() = Some(action);
-                },
+                }),
                 state: &mut self.state.borrow_mut(),
             };
             for (idx, b) in bytes.iter().enumerate() {
@@ -747,7 +1217,7 @@ impl Parser {
             self.state_machine.parse_byte(
                 *b,
                 &mut Performer {
-                    callback: &mut |action| actions.push_back(action),
+                    handler: &mut ActionCollector(|action| actions.push_back(action)),
                     state: &mut self.state.borrow_mut(),
                 },
             );
@@ -780,8 +1250,8 @@ impl Parser {
     }
 }
 
-struct Performer<'a, F: FnMut(Action) + 'a> {
-    callback: &'a mut F,
+struct Performer<'a, H: Handler + ?Sized + 'a> {
+    handler: &'a mut H,
     state: &'a mut ParseState,
 }
 
@@ -828,15 +1298,18 @@ fn can_start_printable_run(byte: u8) -> bool {
     matches!(byte, 0x20..=0x7e) || byte >= 0xc2
 }
 
-fn scan_printable_run(bytes: &[u8], start: usize) -> (usize, usize) {
+/// The run described above. `ascii_scan` finds each ASCII stretch
+/// (ft-yccm0.3.2.2); the result does not depend on which scan it is.
+fn scan_printable_run(bytes: &[u8], start: usize, ascii_scan: AsciiScan) -> (usize, usize) {
     let n = bytes.len();
     let mut i = start;
     let mut chars = 0usize;
     while i < n {
         let b = bytes[i];
-        if (0x20..=0x7e).contains(&b) {
-            i += 1;
-            chars += 1;
+        if ascii::is_printable_ascii(b) {
+            let stretch = ascii_stretch(bytes, i, ascii_scan);
+            i += stretch;
+            chars += stretch;
             continue;
         }
         let seq_len = match b {
@@ -869,14 +1342,414 @@ fn scan_printable_run(bytes: &[u8], start: usize) -> (usize, usize) {
     (i, chars)
 }
 
-impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
+/// The printable-ASCII stretch at `bytes[at]`, 0 when that byte is not
+/// printable ASCII (ft-yccm0.3.2.2). A one-byte stretch (the character
+/// between two escapes) is settled by the next byte, so it never reaches a
+/// `std::simd` scan.
+#[inline]
+fn ascii_stretch(bytes: &[u8], at: usize, scan: AsciiScan) -> usize {
+    if !bytes
+        .get(at)
+        .is_some_and(|&byte| ascii::is_printable_ascii(byte))
+    {
+        return 0;
+    }
+    match bytes.get(at + 1) {
+        Some(&next) if ascii::is_printable_ascii(next) => scan.printable_len(&bytes[at..]),
+        _ => 1,
+    }
+}
+
+/// What starts at a ground-state byte that can start a printable run.
+#[derive(Clone, Debug, PartialEq)]
+enum GroundRun<'a> {
+    /// No printable character: the state machine takes the byte.
+    None,
+    /// Exactly one character, and its length in bytes. It is printed as
+    /// `Action::Print`, so no `String` is built for it.
+    One(char, usize),
+    /// Two or more characters, and whether they are all ASCII.
+    Text { text: &'a str, ascii: bool },
+}
+
+/// Where the next control (or DEL) and the next `0xc2 0x00..=0x9f` pair lie
+/// in one parse call's input, as absolute positions (ft-yccm0.3.2.3).
+///
+/// Runs are scanned left to right, so a position found from an earlier byte
+/// still holds for every later byte up to it. Without the cache, each run
+/// cut short by malformed UTF-8 would scan the rest of the input again,
+/// which is quadratic on long input with no controls in it.
+#[derive(Default)]
+struct RunExtents {
+    control: Option<usize>,
+    c1: Option<usize>,
+}
+
+impl RunExtents {
+    /// The first control or DEL at or after `from`, or the input's length.
+    #[inline]
+    fn control_from(&mut self, bytes: &[u8], from: usize, scan: AsciiScan) -> usize {
+        match self.control {
+            Some(at) if at >= from => at,
+            _ => {
+                let at = from + scan.control_free_len(&bytes[from..]);
+                self.control = Some(at);
+                at
+            }
+        }
+    }
+
+    /// The first `0xc2` at or after `from` followed by a byte below 0xa0,
+    /// or the input's length. In valid UTF-8 that pair is a C1 control. In
+    /// malformed UTF-8 the `0xc2` cannot start a character, so a run stops
+    /// there either way.
+    #[inline]
+    fn c1_from(&mut self, bytes: &[u8], from: usize, scan: AsciiScan) -> usize {
+        match self.c1 {
+            Some(at) if at >= from => at,
+            _ => {
+                let at = scan
+                    .c1_position(&bytes[from..])
+                    .map_or(bytes.len(), |at| from + at);
+                self.c1 = Some(at);
+                at
+            }
+        }
+    }
+}
+
+/// The maximal printable run at `bytes[start]`, whose bytes the state
+/// machine would print one character at a time and end in Ground (see
+/// [`scan_printable_run`]). With `simd_utf8` it is found by
+/// [`ground_run_bulk`], otherwise by the oracle; both give the same run.
+#[inline]
+fn ground_run<'a>(
+    bytes: &'a [u8],
+    start: usize,
+    scan: AsciiScan,
+    simd_utf8: bool,
+    extents: &mut RunExtents,
+) -> GroundRun<'a> {
+    if simd_utf8 {
+        ground_run_bulk(bytes, start, scan, extents)
+    } else {
+        ground_run_scalar(bytes, start, scan)
+    }
+}
+
+/// The oracle: [`scan_printable_run`] checks each character on its own,
+/// and the run is validated again to hand it over as `&str`.
+fn ground_run_scalar(bytes: &[u8], start: usize, scan: AsciiScan) -> GroundRun<'_> {
+    let (end, chars) = scan_printable_run(bytes, start, scan);
+    let run = &bytes[start..end];
+    match chars {
+        0 => GroundRun::None,
+        1 => decode_scanned_char(run).map_or(GroundRun::None, |c| GroundRun::One(c, run.len())),
+        // `scan_printable_run` only extends across complete, valid UTF-8.
+        _ => core::str::from_utf8(run).map_or(GroundRun::None, |text| GroundRun::Text {
+            text,
+            ascii: run.len() == chars,
+        }),
+    }
+}
+
+/// The run with one UTF-8 validation (ft-yccm0.3.2.3).
+///
+/// Steps:
+/// 1. The printable-ASCII stretch is scanned first. When a control, DEL or
+///    the end of the input follows it, the run is all ASCII.
+/// 2. Otherwise a lone character with no printable byte after it (T0's
+///    emoji between two escapes) is decoded and checked in place by
+///    [`decode_utf8_char`].
+/// 3. Otherwise the run can reach as far as the first control, DEL or
+///    `0xc2 0x00..=0x9f` pair (a C1 control in UTF-8, which the state
+///    machine executes), found with the `std::simd` scans in
+///    [`RunExtents`]. That stretch is validated once by
+///    `core::str::from_utf8`, which also yields the `&str` handed over. The
+///    run ends where the valid UTF-8 ends, at an invalid or incomplete
+///    sequence, which the state machine then decodes, replacement
+///    characters and all.
+///
+/// Only a run cut short by such a sequence is validated a second time, to
+/// obtain its shorter `&str`.
+///
+/// A separate `std::simd` UTF-8 validator would not save that pass: safe
+/// Rust only makes a `&str` from bytes by `core::str::from_utf8`, so it
+/// would be a second validation, not a replacement.
+fn ground_run_bulk<'a>(
+    bytes: &'a [u8],
+    start: usize,
+    scan: AsciiScan,
+    extents: &mut RunExtents,
+) -> GroundRun<'a> {
+    let ascii_end = start + ascii_stretch(bytes, start, scan);
+    if bytes.get(ascii_end).is_none_or(|&next| next < 0x80) {
+        return ascii_run(&bytes[start..ascii_end]);
+    }
+    if ascii_end == start {
+        let Some((c, len)) = decode_utf8_char(&bytes[start..]) else {
+            return GroundRun::None;
+        };
+        if bytes
+            .get(start + len)
+            .is_none_or(|&next| next < 0x20 || next == 0x7f)
+        {
+            return GroundRun::One(c, len);
+        }
+    }
+
+    let limit = extents
+        .control_from(bytes, ascii_end, scan)
+        .min(extents.c1_from(bytes, ascii_end, scan));
+    let candidate = &bytes[start..limit];
+    let text = match core::str::from_utf8(candidate) {
+        Ok(text) => Some(text),
+        Err(error) => core::str::from_utf8(&candidate[..error.valid_up_to()]).ok(),
+    };
+    let Some(text) = text else {
+        return GroundRun::None;
+    };
+    let mut chars = text.chars();
+    match (chars.next(), chars.next()) {
+        (None, _) => GroundRun::None,
+        (Some(c), None) => GroundRun::One(c, text.len()),
+        _ => GroundRun::Text {
+            text,
+            ascii: text.len() <= ascii_end - start,
+        },
+    }
+}
+
+/// A run of printable ASCII.
+#[inline]
+fn ascii_run(run: &[u8]) -> GroundRun<'_> {
+    match run {
+        [] => GroundRun::None,
+        [byte] => GroundRun::One(char::from(*byte), 1),
+        _ => core::str::from_utf8(run).map_or(GroundRun::None, |text| GroundRun::Text {
+            text,
+            ascii: true,
+        }),
+    }
+}
+
+/// One complete, well-formed UTF-8 sequence of two to four bytes at the
+/// start of `bytes` (Unicode Table 3-7) that is not a C1 control: its
+/// character and length (ft-yccm0.3.2.3). Checked and decoded here, with no
+/// call into `core::str::from_utf8`. `None` for anything else, including
+/// ASCII, an incomplete sequence, overlongs, surrogates, values beyond
+/// U+10FFFF, and `0xc2 0x80..=0x9f`.
+#[inline]
+fn decode_utf8_char(bytes: &[u8]) -> Option<(char, usize)> {
+    let continuation = |at: usize| -> Option<u32> {
+        bytes
+            .get(at)
+            .filter(|b| matches!(b, 0x80..=0xbf))
+            .map(|&b| u32::from(b & 0x3f))
+    };
+    let lead = *bytes.first()?;
+    let (value, len) = match lead {
+        0xc2..=0xdf => {
+            let low = continuation(1)?;
+            // `0xc2 0x80..=0x9f` is a C1 control.
+            if lead == 0xc2 && low < 0x20 {
+                return None;
+            }
+            ((u32::from(lead & 0x1f) << 6) | low, 2)
+        }
+        0xe0..=0xef => {
+            let second = *bytes.get(1)?;
+            let allowed = match lead {
+                0xe0 => 0xa0..=0xbf,
+                0xed => 0x80..=0x9f,
+                _ => 0x80..=0xbf,
+            };
+            if !allowed.contains(&second) {
+                return None;
+            }
+            let value =
+                (u32::from(lead & 0x0f) << 12) | (u32::from(second & 0x3f) << 6) | continuation(2)?;
+            (value, 3)
+        }
+        0xf0..=0xf4 => {
+            let second = *bytes.get(1)?;
+            let allowed = match lead {
+                0xf0 => 0x90..=0xbf,
+                0xf4 => 0x80..=0x8f,
+                _ => 0x80..=0xbf,
+            };
+            if !allowed.contains(&second) {
+                return None;
+            }
+            let value = (u32::from(lead & 0x07) << 18)
+                | (u32::from(second & 0x3f) << 12)
+                | (continuation(2)? << 6)
+                | continuation(3)?;
+            (value, 4)
+        }
+        _ => return None,
+    };
+    Some((char::from_u32(value)?, len))
+}
+
+/// Decodes one codepoint [`scan_printable_run`] accepted: a printable ASCII
+/// byte or one complete, valid UTF-8 sequence.
+#[inline]
+fn decode_scanned_char(sequence: &[u8]) -> Option<char> {
+    let value = match *sequence {
+        [a] => u32::from(a),
+        [a, b] => (u32::from(a & 0x1f) << 6) | u32::from(b & 0x3f),
+        [a, b, c] => (u32::from(a & 0x0f) << 12) | (u32::from(b & 0x3f) << 6) | u32::from(c & 0x3f),
+        [a, b, c, d] => {
+            (u32::from(a & 0x07) << 18)
+                | (u32::from(b & 0x3f) << 12)
+                | (u32::from(c & 0x3f) << 6)
+                | u32::from(d & 0x3f)
+        }
+        _ => return None,
+    };
+    char::from_u32(value)
+}
+
+/// Scans the CSI sequence whose ESC is `bytes[esc]` for the CSI fast path
+/// (ft-yccm0.3.2.4). Its parameters go into `params` exactly as the state
+/// machine hands them to `csi_dispatch`:
+/// - digits accumulate, saturating, into an `Integer`;
+/// - each `;` or `:` is a `P` after the integer before it;
+/// - a leading private marker (`<`, `=`, `>`, `?`) is a `P` first.
+///
+/// Returns the index of the final byte and the number of parameters.
+///
+/// It returns `None`, leaving the bytes to the state machine, for any
+/// sequence it does not reproduce:
+/// - no `[` after the ESC;
+/// - a sequence still incomplete at the end of `bytes`;
+/// - intermediates;
+/// - a second or misplaced marker, or a leading `:` (the state machine
+///   ignores those sequences);
+/// - a control, DEL or non-ASCII byte inside;
+/// - more parameters than `params` holds.
+///
+/// The state machine never truncates the parameters of a sequence this
+/// accepts.
+fn scan_csi(bytes: &[u8], esc: usize, params: &mut [CsiParam]) -> Option<(usize, usize)> {
+    if bytes.get(esc + 1) != Some(&b'[') {
+        return None;
+    }
+    let first = esc + 2;
+    let mut i = first;
+    let mut count = 0;
+    if let marker @ 0x3c..=0x3f = *bytes.get(i)? {
+        *params.get_mut(count)? = CsiParam::P(marker);
+        count += 1;
+        i += 1;
+    }
+    let mut current: Option<i64> = None;
+    loop {
+        match *bytes.get(i)? {
+            digit @ b'0'..=b'9' => {
+                let value = current.unwrap_or(0);
+                current = Some(
+                    value
+                        .saturating_mul(10)
+                        .saturating_add(i64::from(digit - b'0')),
+                );
+            }
+            separator @ (b':' | b';') => {
+                if separator == b':' && i == first {
+                    return None;
+                }
+                if let Some(value) = current.take() {
+                    *params.get_mut(count)? = CsiParam::Integer(value);
+                    count += 1;
+                }
+                *params.get_mut(count)? = CsiParam::P(separator);
+                count += 1;
+            }
+            0x40..=0x7e => {
+                if let Some(value) = current {
+                    *params.get_mut(count)? = CsiParam::Integer(value);
+                    count += 1;
+                }
+                return Some((i, count));
+            }
+            _ => return None,
+        }
+        i += 1;
+    }
+}
+
+/// The 256-color SGR shortcut (ft-yccm0.3.2.6): `body`, the bytes after an
+/// `ESC [`, opening with `38;5;N m` or `48;5;N m`, N one to three digits of
+/// value at most 255. Returns the setting [`decode_sgr`] decodes from those
+/// parameters, and the length up to and including the `m`; `None` for any
+/// other bytes, which take the scan and decode as before.
+#[inline]
+fn palette_sgr(body: &[u8]) -> Option<(Sgr, usize)> {
+    let foreground = match body.get(..5)? {
+        b"38;5;" => true,
+        b"48;5;" => false,
+        _ => return None,
+    };
+    let digits = body.get(5..)?;
+    let count = digits
+        .iter()
+        .take(4)
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if !(1..=3).contains(&count) || digits.get(count) != Some(&b'm') {
+        return None;
+    }
+    let value = digits[..count]
+        .iter()
+        .fold(0_u16, |value, digit| value * 10 + u16::from(digit - b'0'));
+    let color = crate::color::ColorSpec::PaletteIndex(u8::try_from(value).ok()?);
+    let sgr = if foreground {
+        Sgr::Foreground(color)
+    } else {
+        Sgr::Background(color)
+    };
+    Some((sgr, 5 + count + 1))
+}
+
+/// Hands `handler` the items of a dispatched CSI sequence: the D2 table
+/// decoder's when table dispatch is on and it takes the sequence, otherwise
+/// [`CSI::parse`]'s. The state machine's `csi_dispatch` and the CSI fast
+/// path's fallback share it.
+fn dispatch_csi<H: Handler + ?Sized>(
+    params: &[CsiParam],
+    parameters_truncated: bool,
+    control: u8,
+    table_dispatch: bool,
+    handler: &mut H,
+) {
+    // D2 (ft-round5-gauntlet-lw0s7.12): offer the sequence to the
+    // table-driven fast decoder first; it emits a byte-identical action
+    // stream for the common shapes (and emits nothing when it declines).
+    if table_dispatch
+        && CSI::parse_fast(
+            params,
+            parameters_truncated,
+            control as char,
+            &mut |action| handler.csi(action),
+        )
+    {
+        return;
+    }
+    for action in CSI::parse(params, parameters_truncated, control as char) {
+        handler.csi(action);
+    }
+}
+
+impl<'a, H: Handler + ?Sized> VTActor for Performer<'a, H> {
+    #[inline]
     fn print(&mut self, c: char) {
-        (self.callback)(Action::Print(c));
+        self.handler.print(c);
     }
 
     fn execute_c0_or_c1(&mut self, byte: u8) {
         match FromPrimitive::from_u8(byte) {
-            Some(code) => (self.callback)(Action::Control(code)),
+            Some(code) => self.handler.control(code),
             None => error!(
                 "impossible C0/C1 control code {:?} 0x{:x} was dropped",
                 byte as char, byte
@@ -886,7 +1759,7 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
 
     fn apc_dispatch(&mut self, data: Vec<u8>) {
         if let Some(img) = super::KittyImage::parse_apc(&data) {
-            (self.callback)(Action::KittyImage(Box::new(img)))
+            self.handler.action(Action::KittyImage(Box::new(img)))
         } else {
             log::trace!("Ignoring APC data: {:?}", String::from_utf8_lossy(&data));
         }
@@ -930,14 +1803,15 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
                     crate::tmux_cc::Parser::new_with_max_retained_bytes(max_string_sequence_bytes),
                 ));
             }
-            (self.callback)(Action::DeviceControl(DeviceControlMode::Enter(Box::new(
-                EnterDeviceControlMode {
-                    byte,
-                    params: params.to_vec(),
-                    intermediates: intermediates.to_vec(),
-                    ignored_extra_intermediates,
-                },
-            ))));
+            self.handler
+                .action(Action::DeviceControl(DeviceControlMode::Enter(Box::new(
+                    EnterDeviceControlMode {
+                        byte,
+                        params: params.to_vec(),
+                        intermediates: intermediates.to_vec(),
+                        ignored_extra_intermediates,
+                    },
+                ))));
         }
     }
 
@@ -1007,9 +1881,9 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
                 match result {
                     Ok(optional_events) => {
                         if let Some(tmux_event) = optional_events {
-                            (self.callback)(Action::DeviceControl(DeviceControlMode::TmuxEvents(
-                                Box::new(vec![tmux_event]),
-                            )));
+                            self.handler.action(Action::DeviceControl(
+                                DeviceControlMode::TmuxEvents(Box::new(vec![tmux_event])),
+                            ));
                         }
                     }
                     Err(_) => {
@@ -1018,7 +1892,8 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
                 }
                 return;
             }
-            (self.callback)(Action::DeviceControl(DeviceControlMode::Data(data)));
+            self.handler
+                .action(Action::DeviceControl(DeviceControlMode::Data(data)));
         }
     }
 
@@ -1028,7 +1903,7 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
             return;
         }
         if let Some(dcs) = self.state.dcs.take() {
-            (self.callback)(Action::DeviceControl(
+            self.handler.action(Action::DeviceControl(
                 DeviceControlMode::ShortDeviceControl(Box::new(dcs)),
             ));
         } else if let Some(mut sixel) = self.state.sixel.take() {
@@ -1039,7 +1914,7 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
                 }
             }
             if sixel.should_emit() {
-                (self.callback)(Action::Sixel(Box::new(sixel.sixel)));
+                self.handler.action(Action::Sixel(Box::new(sixel.sixel)));
             }
         } else if let Some(tcap) = self.state.get_tcap.take() {
             let (names, error) = tcap.finish();
@@ -1049,10 +1924,11 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
                 }
             }
             if let Some(names) = names {
-                (self.callback)(Action::XtGetTcap(names));
+                self.handler.action(Action::XtGetTcap(names));
             }
         } else {
-            (self.callback)(Action::DeviceControl(DeviceControlMode::Exit));
+            self.handler
+                .action(Action::DeviceControl(DeviceControlMode::Exit));
         }
     }
 
@@ -1063,29 +1939,18 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
         } else {
             OperatingSystemCommand::parse(osc)
         };
-        (self.callback)(Action::OperatingSystemCommand(Box::new(parsed)));
+        self.handler
+            .action(Action::OperatingSystemCommand(Box::new(parsed)));
     }
 
     fn csi_dispatch(&mut self, params: &[CsiParam], parameters_truncated: bool, control: u8) {
-        // D2 (ft-round5-gauntlet-lw0s7.12): offer the sequence to the
-        // table-driven fast decoder first; it emits a byte-identical action
-        // stream for the common shapes (and emits nothing when it declines).
-        if self.state.table_dispatch {
-            let cb = &mut *self.callback;
-            if CSI::parse_fast(
-                params,
-                parameters_truncated,
-                control as char,
-                &mut |action| {
-                    cb(Action::CSI(action));
-                },
-            ) {
-                return;
-            }
-        }
-        for action in CSI::parse(params, parameters_truncated, control as char) {
-            (self.callback)(Action::CSI(action));
-        }
+        dispatch_csi(
+            params,
+            parameters_truncated,
+            control,
+            self.state.table_dispatch,
+            &mut *self.handler,
+        );
     }
 
     fn esc_dispatch(
@@ -1103,14 +1968,14 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
         if ignored_extra_intermediates || intermediates.len() > 1 {
             return;
         }
-        (self.callback)(Action::Esc(Esc::parse(
+        self.handler.esc(Esc::parse(
             if intermediates.len() == 1 {
                 Some(intermediates[0])
             } else {
                 None
             },
             control,
-        )));
+        ));
     }
 }
 
@@ -1619,37 +2484,49 @@ mod test {
 
     #[test]
     fn scan_printable_run_boundaries() {
+        // Every ASCII scan must find the same run.
+        fn scan_with_every_scan(bytes: &[u8], start: usize) -> (usize, usize) {
+            let oracle = scan_printable_run(bytes, start, AsciiScan::Scalar);
+            for scan in AsciiScan::ALL {
+                assert_eq!(scan_printable_run(bytes, start, scan), oracle, "{:?}", scan);
+            }
+            oracle
+        }
         // Pure ASCII printable run, stops at first control.
-        assert_eq!(scan_printable_run(b"abc\n", 0), (3, 3));
+        assert_eq!(scan_with_every_scan(b"abc\n", 0), (3, 3));
         // DEL terminates the run.
-        assert_eq!(scan_printable_run(b"ab\x7fc", 0), (2, 2));
+        assert_eq!(scan_with_every_scan(b"ab\x7fc", 0), (2, 2));
         // ESC terminates the run.
-        assert_eq!(scan_printable_run(b"ab\x1b[m", 0), (2, 2));
+        assert_eq!(scan_with_every_scan(b"ab\x1b[m", 0), (2, 2));
         // 2-byte UTF-8 (é) counts as one char.
-        assert_eq!(scan_printable_run(b"a\xc3\xa9b", 0), (4, 3));
+        assert_eq!(scan_with_every_scan(b"a\xc3\xa9b", 0), (4, 3));
         // Latin-1 NBSP (U+00A0) prints in ground -> batchable.
-        assert_eq!(scan_printable_run(b"a\xc2\xa0b", 0), (4, 3));
+        assert_eq!(scan_with_every_scan(b"a\xc2\xa0b", 0), (4, 3));
         // 3-byte (€) and 4-byte (🚀) sequences.
-        assert_eq!(scan_printable_run("€".as_bytes(), 0), (3, 1));
-        assert_eq!(scan_printable_run("🚀".as_bytes(), 0), (4, 1));
+        assert_eq!(scan_with_every_scan("€".as_bytes(), 0), (3, 1));
+        assert_eq!(scan_with_every_scan("🚀".as_bytes(), 0), (4, 1));
         // C1-via-UTF-8 (0xC2 0x9B == U+009B == CSI) stops the run immediately.
-        assert_eq!(scan_printable_run(b"\xc2\x9bx", 0), (0, 0));
-        assert_eq!(scan_printable_run(b"ab\xc2\x9bx", 0), (2, 2));
+        assert_eq!(scan_with_every_scan(b"\xc2\x9bx", 0), (0, 0));
+        assert_eq!(scan_with_every_scan(b"ab\xc2\x9bx", 0), (2, 2));
         // The 0x9F/0xA0 boundary: 0x9F is C1 (stop), 0xA0 prints.
-        assert_eq!(scan_printable_run(b"\xc2\x9f", 0), (0, 0));
-        assert_eq!(scan_printable_run(b"\xc2\xa0", 0), (2, 1));
+        assert_eq!(scan_with_every_scan(b"\xc2\x9f", 0), (0, 0));
+        assert_eq!(scan_with_every_scan(b"\xc2\xa0", 0), (2, 1));
         // Incomplete trailing multibyte sequence is deferred (not consumed).
-        assert_eq!(scan_printable_run(b"ab\xe2\x82", 0), (2, 2));
-        assert_eq!(scan_printable_run(b"ab\xc3", 0), (2, 2));
+        assert_eq!(scan_with_every_scan(b"ab\xe2\x82", 0), (2, 2));
+        assert_eq!(scan_with_every_scan(b"ab\xc3", 0), (2, 2));
         // Invalid encodings stop the run.
-        assert_eq!(scan_printable_run(b"a\xffb", 0), (1, 1));
-        assert_eq!(scan_printable_run(b"a\xc0\x80b", 0), (1, 1)); // overlong NUL
-        assert_eq!(scan_printable_run(b"a\xc2Zb", 0), (1, 1)); // bad continuation
+        assert_eq!(scan_with_every_scan(b"a\xffb", 0), (1, 1));
+        assert_eq!(scan_with_every_scan(b"a\xc0\x80b", 0), (1, 1)); // overlong NUL
+        assert_eq!(scan_with_every_scan(b"a\xc2Zb", 0), (1, 1)); // bad continuation
         // Raw C1 / stray continuation bytes are not run material.
-        assert_eq!(scan_printable_run(b"\x80\x81", 0), (0, 0));
+        assert_eq!(scan_with_every_scan(b"\x80\x81", 0), (0, 0));
         // Empty / fully-consumed.
-        assert_eq!(scan_printable_run(b"", 0), (0, 0));
-        assert_eq!(scan_printable_run(b"abc", 3), (3, 0));
+        assert_eq!(scan_with_every_scan(b"", 0), (0, 0));
+        assert_eq!(scan_with_every_scan(b"abc", 3), (3, 0));
+        // ASCII stretches longer than a SIMD block, around UTF-8 and stops.
+        let long = "x".repeat(70) + "\u{e9}" + &"y".repeat(40) + "\x1b[m";
+        assert_eq!(scan_with_every_scan(long.as_bytes(), 0), (112, 111));
+        assert_eq!(scan_with_every_scan(long.as_bytes(), 5), (112, 106));
     }
 
     #[test]
@@ -1901,14 +2778,428 @@ mod test {
         }
     }
 
+    /// ft-yccm0.3.2.1: a handler that takes every hot action itself sees
+    /// the stream `parse` produces, in order, whole and byte by byte, under
+    /// every parser mode. `&mut dyn Handler` works too.
+    #[test]
+    fn parse_with_hands_a_handler_the_same_stream_as_parse() {
+        #[derive(Default)]
+        struct Recorder(Vec<Action>);
+
+        impl Handler for Recorder {
+            fn action(&mut self, action: Action) {
+                self.0.push(action);
+            }
+            fn print(&mut self, c: char) {
+                self.0.push(Action::Print(c));
+            }
+            fn print_str(&mut self, text: &str) {
+                self.0.push(Action::PrintString(text.to_string()));
+            }
+            fn print_ascii_run(&mut self, run: &str) {
+                self.0.push(Action::PrintString(run.to_string()));
+            }
+            fn control(&mut self, code: ControlCode) {
+                self.0.push(Action::Control(code));
+            }
+            fn csi(&mut self, csi: CSI) {
+                self.0.push(Action::CSI(csi));
+            }
+            fn esc(&mut self, esc: Esc) {
+                self.0.push(Action::Esc(esc));
+            }
+            fn sgr(&mut self, sgrs: &[Sgr]) {
+                self.0
+                    .extend(sgrs.iter().cloned().map(|sgr| Action::CSI(CSI::Sgr(sgr))));
+            }
+        }
+
+        let inputs: &[&[u8]] = &[
+            b"hello world",
+            "caf\u{e9} \u{20ac}1 \u{1f680} \u{65e5}\x1b[31mred\x1b[0m".as_bytes(),
+            b"\x1b[1;4;38;5;196;48;2;1;2;3mX\x1b[m\r\n\x07tail",
+            b"\x1b]0;title\x07body\x1b]8;;http://x\x1b\\link\x1b]8;;\x1b\\",
+            b"\x1bP$qm\x1b\\\x1bPq#0;2;0;0;0#0~~\x1b\\after",
+            b"\x1b(0lqk\x1b(B\x1b7\x1b8\x1bMab",
+            b"a\xe4\x1b[1mb\x9bz\x1b[?2026h\x1b[?2026l",
+            "\x1b[38;5;196m\x1b[48;5;21m\u{1f600}\x1b[38;5;196m\x1b[48;5;21m\u{e9}\x1b[5;9H\x1b[K"
+                .as_bytes(),
+        ];
+        for &batching in &[false, true] {
+            for &table in &[false, true] {
+                let configure = |parser: &mut Parser| {
+                    parser.set_print_batching(batching);
+                    parser.set_table_dispatch(table);
+                };
+                for bytes in inputs {
+                    let mut reference = Parser::new();
+                    configure(&mut reference);
+                    let expected = reference.parse_as_vec(bytes);
+
+                    let mut parser = Parser::new();
+                    configure(&mut parser);
+                    let mut recorder = Recorder::default();
+                    parser.parse_with(bytes, &mut recorder);
+                    assert_eq!(recorder.0, expected);
+
+                    // Byte at a time the runs split differently, so compare
+                    // with `parse` fed the same way.
+                    let mut reference = Parser::new();
+                    configure(&mut reference);
+                    let mut expected = Vec::new();
+                    let mut parser = Parser::new();
+                    configure(&mut parser);
+                    let mut recorder = Recorder::default();
+                    for byte in bytes.iter() {
+                        let byte = core::slice::from_ref(byte);
+                        reference.parse(byte, |action| expected.push(action));
+                        parser.parse_with(byte, &mut recorder as &mut dyn Handler);
+                    }
+                    assert_eq!(recorder.0, expected);
+                }
+            }
+        }
+    }
+
+    /// ft-yccm0.3.2.3: `decode_utf8_char` takes exactly the first character
+    /// `core::str::from_utf8` accepts, minus ASCII and the C1 controls.
+    /// Checked over every two- and three-byte input, and every four-byte
+    /// input with a representative third and fourth byte. Plain `assert!`
+    /// keeps millions of checks fast; k9 formats every call.
+    #[test]
+    fn decode_utf8_char_matches_std_on_every_short_input() {
+        fn expected(bytes: &[u8]) -> Option<(char, usize)> {
+            let valid = match core::str::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(error) => core::str::from_utf8(&bytes[..error.valid_up_to()]).ok()?,
+            };
+            let c = valid.chars().next()?;
+            (!c.is_ascii() && !('\u{80}'..='\u{9f}').contains(&c)).then_some((c, c.len_utf8()))
+        }
+        const EDGES: [u8; 9] = [0x00, 0x7f, 0x80, 0x8f, 0x90, 0xa0, 0xbf, 0xc0, 0xff];
+        for lead in 0..=0xffu8 {
+            let one = [lead];
+            assert!(decode_utf8_char(&one) == expected(&one), "{one:02x?}");
+            for second in 0..=0xffu8 {
+                let two = [lead, second];
+                assert!(decode_utf8_char(&two) == expected(&two), "{two:02x?}");
+                // An ASCII lead never decodes; its longer inputs add nothing.
+                if lead < 0x80 {
+                    continue;
+                }
+                for third in 0..=0xffu8 {
+                    let three = [lead, second, third];
+                    assert!(decode_utf8_char(&three) == expected(&three), "{three:02x?}");
+                }
+                for third in EDGES {
+                    for fourth in EDGES {
+                        let four = [lead, second, third, fourth];
+                        assert!(decode_utf8_char(&four) == expected(&four), "{four:02x?}");
+                    }
+                }
+            }
+        }
+        // Every valid four-byte sequence's extremes.
+        for text in ["\u{10000}", "\u{1f600}", "\u{10ffff}"] {
+            let bytes = text.as_bytes();
+            assert!(decode_utf8_char(bytes) == expected(bytes), "{text:?}");
+        }
+    }
+
+    /// Text pieces for the run equivalence property: ASCII, valid UTF-8 of
+    /// every length (Latin-1 supplement, C1 controls encoded in UTF-8, CJK,
+    /// emoji), controls and DEL, and malformed UTF-8 (stray continuations,
+    /// overlongs, surrogates, values past U+10FFFF, truncated sequences).
+    fn arb_run_piece() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+        use proptest::prelude::*;
+        const PIECES: &[&[u8]] = &[
+            b"a",
+            b"text with spaces ",
+            b"0123456789abcdef0123456789",
+            "\u{e9}".as_bytes(),
+            "\u{a0}".as_bytes(),
+            "\u{85}".as_bytes(),
+            "\u{9b}".as_bytes(),
+            "\u{20ac}".as_bytes(),
+            "\u{2500}\u{2502}\u{250c}".as_bytes(),
+            "\u{4e2d}\u{6587}".as_bytes(),
+            "\u{1f600}".as_bytes(),
+            "\u{fe0f}\u{200d}".as_bytes(),
+            b"\x1b",
+            b"\r\n",
+            b"\x7f",
+            b"\x80",
+            b"\xbf",
+            b"\xc0\x80",
+            b"\xc1\xbf",
+            b"\xe0\x80\x80",
+            b"\xed\xa0\x80",
+            b"\xf0\x80\x80\x80",
+            b"\xf4\x90\x80\x80",
+            b"\xf8\x88\x80\x80\x80",
+            b"\xe2\x82",
+            b"\xf0\x9f\x98",
+            b"\xc3",
+            b"\xff",
+        ];
+        proptest::collection::vec(proptest::sample::select(PIECES), 0..24)
+            .prop_map(|pieces| pieces.concat())
+    }
+
+    proptest::proptest! {
+        /// ft-yccm0.3.2.3: the one-validation run is the oracle's run, with
+        /// every `AsciiScan`, from every byte that can start a run.
+        #[test]
+        fn ground_run_bulk_matches_the_oracle(bytes in arb_run_piece()) {
+            for scan in AsciiScan::ALL {
+                // One cache across increasing starts, as within a parse call.
+                let mut shared = RunExtents::default();
+                for (start, &byte) in bytes.iter().enumerate() {
+                    if !can_start_printable_run(byte) {
+                        continue;
+                    }
+                    let oracle = ground_run_scalar(&bytes, start, AsciiScan::Scalar);
+                    proptest::prop_assert_eq!(
+                        ground_run_bulk(&bytes, start, scan, &mut RunExtents::default()),
+                        oracle.clone(),
+                        "{:?} from {}",
+                        scan,
+                        start
+                    );
+                    proptest::prop_assert_eq!(
+                        ground_run_bulk(&bytes, start, scan, &mut shared),
+                        oracle,
+                        "{:?} from {} with a shared cache",
+                        scan,
+                        start
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn csi_fast_path_default_policy_is_on_unless_falsey() {
+        assert!(csi_fast_path_default_for_value(None));
+        for truthy in ["1", "on", "true", "yes"] {
+            assert!(csi_fast_path_default_for_value(Some(truthy)), "{truthy}");
+        }
+        for falsey in ["", "0", "false", "OFF", " no "] {
+            assert!(!csi_fast_path_default_for_value(Some(falsey)), "{falsey:?}");
+        }
+        let mut parser = Parser::new();
+        parser.set_csi_fast_path(false);
+        assert!(!parser.csi_fast_path());
+        parser.set_csi_fast_path(true);
+        assert!(parser.csi_fast_path());
+    }
+
+    /// One byte of a CSI sequence's body, biased toward what the scanner
+    /// branches on: digits (long runs overflow), separators, markers,
+    /// intermediates, finals, and bytes that abort or interrupt a sequence.
+    fn arb_csi_body_byte() -> impl proptest::strategy::Strategy<Value = u8> {
+        use proptest::prelude::*;
+        prop_oneof![
+            8 => proptest::sample::select(b"0123456789".to_vec()),
+            3 => proptest::sample::select(b";:".to_vec()),
+            1 => proptest::sample::select(b"?<=>".to_vec()),
+            1 => proptest::sample::select(b" !$*".to_vec()),
+            2 => proptest::sample::select(b"mHJKABCDrhlu@`~".to_vec()),
+            1 => proptest::sample::select(vec![0x07, 0x0a, 0x18, 0x1b, 0x7f, 0x9b, 0xc3, 0xe2]),
+        ]
+    }
+
+    proptest::proptest! {
+        /// ft-yccm0.3.2.4: whenever the CSI fast path's scanner takes a
+        /// sequence, the state machine fed the same bytes from ground
+        /// dispatches exactly that sequence, with the same parameters and
+        /// untruncated, and is back in ground.
+        #[test]
+        fn scan_csi_reproduces_the_state_machine_dispatch(
+            body in proptest::collection::vec(arb_csi_body_byte(), 0..40),
+        ) {
+            let mut bytes = b"\x1b[".to_vec();
+            bytes.extend_from_slice(&body);
+            let mut params = [CsiParam::Integer(0); CSI_FAST_MAX_PARAMS];
+            if let Some((fin, count)) = scan_csi(&bytes, 0, &mut params) {
+                let mut machine = VTParser::new();
+                let mut actor = vtparse::CollectingVTActor::default();
+                machine.parse(&bytes[..=fin], &mut actor);
+                proptest::prop_assert!(machine.is_ground());
+                let expected = vec![vtparse::VTAction::CsiDispatch {
+                    params: params[..count].to_vec(),
+                    parameters_truncated: false,
+                    byte: bytes[fin],
+                }];
+                proptest::prop_assert_eq!(actor.into_vec(), expected);
+            }
+        }
+    }
+
+    /// ft-yccm0.3.2.4: a sequence with the last SGR's parameter bytes is
+    /// answered from the cache, and nothing else is.
+    #[test]
+    fn last_sgr_cache_answers_only_the_same_parameter_bytes() {
+        use crate::color::ColorSpec;
+        let mut parser = Parser::new();
+        parser.set_print_batching(true);
+        parser.set_csi_fast_path(true);
+        // The 256-color shortcut (ft-yccm0.3.2.6) decodes these sequences
+        // without storing them; this test is the cache's.
+        parser.set_palette_sgr_fast_path(false);
+        assert_eq!(
+            parser.parse_as_vec(b"\x1b[38;5;196m"),
+            vec![Action::CSI(CSI::Sgr(Sgr::Foreground(
+                ColorSpec::PaletteIndex(196)
+            )))]
+        );
+        assert_eq!(
+            &parser.last_sgr.key[..parser.last_sgr.key_len],
+            b"38;5;196".as_slice()
+        );
+
+        // Poison the entry with a setting these bytes never decode to: only
+        // a hit can return it.
+        let poison = Sgr::Inverse(true);
+        parser
+            .last_sgr
+            .store(b"38;5;196", core::slice::from_ref(&poison));
+        assert_eq!(
+            parser.parse_as_vec(b"\x1b[38;5;196mX\x1b[38;5;196m"),
+            vec![
+                Action::CSI(CSI::Sgr(poison.clone())),
+                Action::Print('X'),
+                Action::CSI(CSI::Sgr(poison.clone())),
+            ]
+        );
+
+        // Another final, a longer list sharing the prefix and a shorter one
+        // all miss, and decode as the state machine path does.
+        for bytes in [
+            b"\x1b[38;5;196H".as_slice(),
+            b"\x1b[38;5;196;1m",
+            b"\x1b[38;5;19mZ",
+            b"\x1b[38;5;196",
+        ] {
+            parser
+                .last_sgr
+                .store(b"38;5;196", core::slice::from_ref(&poison));
+            let mut reference = Parser::new();
+            reference.set_csi_fast_path(false);
+            assert_eq!(
+                parser.parse_as_vec(bytes),
+                reference.parse_as_vec(bytes),
+                "{:?}",
+                bytes
+            );
+        }
+    }
+
+    /// ft-yccm0.3.2.6: the 256-color SGR shortcut leaves the action stream
+    /// the scan and decode give, for every index to 300 (past 255 included),
+    /// leading zeros, empty and longer lists, other finals and selectors, a
+    /// cut-off sequence, and every cut of the stream in two.
+    #[test]
+    fn palette_sgr_shortcut_leaves_the_action_stream_unchanged() {
+        let mut stream = Vec::new();
+        for n in 0..=300u32 {
+            stream.extend_from_slice(
+                format!("\x1b[38;5;{}mA\x1b[48;5;{}m\u{1f600}", n, n * 7 % 301).as_bytes(),
+            );
+        }
+        for shape in [
+            "\x1b[38;5;007m",
+            "\x1b[48;5;0255m",
+            "\x1b[38;5;256m",
+            "\x1b[48;5;999m",
+            "\x1b[38;5;m",
+            "\x1b[38;5;12;1m",
+            "\x1b[48;5;12H",
+            "\x1b[38;5;1x",
+            "\x1b[038;5;9m",
+            "\x1b[58;5;9m",
+            "\x1b[38;2;1;2;3m",
+            "\x1b[38;5;3",
+        ] {
+            stream.extend_from_slice(shape.as_bytes());
+            stream.push(b'Z');
+        }
+        let parse = |shortcut: bool, cut: usize| {
+            let mut parser = Parser::new();
+            parser.set_print_batching(true);
+            parser.set_csi_fast_path(true);
+            parser.set_palette_sgr_fast_path(shortcut);
+            let mut actions = parser.parse_as_vec(&stream[..cut]);
+            actions.extend(parser.parse_as_vec(&stream[cut..]));
+            actions
+        };
+        for cut in (0..=stream.len()).step_by(7) {
+            assert_eq!(parse(true, cut), parse(false, cut), "cut at {}", cut);
+        }
+    }
+
+    /// ft-yccm0.3.2.4: the operator's T0 shape. Each pair of SGR sequences
+    /// reaches the handler as one run, and the character between escapes as
+    /// one `Print`, decoded without the state machine.
+    #[test]
+    fn consecutive_sgr_sequences_reach_the_handler_as_one_run() {
+        use crate::color::ColorSpec;
+        #[derive(Default)]
+        struct Runs {
+            runs: Vec<Vec<Sgr>>,
+            other: Vec<Action>,
+        }
+        impl Handler for Runs {
+            fn action(&mut self, action: Action) {
+                self.other.push(action);
+            }
+            fn sgr(&mut self, sgrs: &[Sgr]) {
+                self.runs.push(sgrs.to_vec());
+            }
+        }
+
+        let bytes =
+            "\x1b[38;5;196m\x1b[48;5;21m\u{1f600}\x1b[38;5;7m\x1b[48;2;1;2;3m\u{1f680}".as_bytes();
+        let mut parser = Parser::new();
+        parser.set_print_batching(true);
+        parser.set_csi_fast_path(true);
+        let mut runs = Runs::default();
+        parser.parse_with(bytes, &mut runs);
+        let palette = ColorSpec::PaletteIndex;
+        let rgb: ColorSpec = crate::color::RgbColor::new_8bpc(1, 2, 3).into();
+        assert_eq!(
+            runs.runs,
+            vec![
+                vec![Sgr::Foreground(palette(196)), Sgr::Background(palette(21))],
+                vec![Sgr::Foreground(palette(7)), Sgr::Background(rgb)],
+            ]
+        );
+        assert_eq!(
+            runs.other,
+            vec![Action::Print('\u{1f600}'), Action::Print('\u{1f680}')]
+        );
+
+        // Forty SGR sequences in a row overflow one run; the stream is still
+        // the state machine path's.
+        let many = "\x1b[1m\x1b[38;5;9m".repeat(20) + "x";
+        let mut fast = Parser::new();
+        fast.set_csi_fast_path(true);
+        let mut slow = Parser::new();
+        slow.set_csi_fast_path(false);
+        assert_eq!(
+            fast.parse_as_vec(many.as_bytes()),
+            slow.parse_as_vec(many.as_bytes())
+        );
+    }
+
     #[test]
     fn overflowed_esc_dispatch_rejects_even_a_short_retained_prefix() {
         let p = Parser::new();
         let mut actions = Vec::new();
-        let mut callback = |action| actions.push(action);
+        let mut collector = ActionCollector(|action| actions.push(action));
         let mut state = p.state.borrow_mut();
         let mut performer = Performer {
-            callback: &mut callback,
+            handler: &mut collector,
             state: &mut state,
         };
         performer.esc_dispatch(&[], &[], true, b'X');

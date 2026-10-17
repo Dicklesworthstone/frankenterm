@@ -4925,9 +4925,13 @@ impl TerminalState {
         );
         let mut restored_image_cache = lru::LruCache::unbounded();
         restored_image_cache.resize(NonZeroUsize::new(16).expect("nonzero cache capacity"));
+        // Hot per-batch configuration is derived from the restoring config,
+        // exactly as a freshly constructed terminal captures it.
+        let batch_config = BatchConfig::capture(config.as_ref());
 
         Ok(TerminalState {
             config,
+            batch_config,
             screen: screens,
             pen: restored_pen,
             cursor: restored_cursor,

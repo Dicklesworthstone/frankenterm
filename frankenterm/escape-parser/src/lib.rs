@@ -39,6 +39,10 @@
     clippy::map_clone
 )]
 #![cfg_attr(not(feature = "std"), no_std)]
+// The ground-state ASCII scan (ft-yccm0.3.2.2) uses `core::simd`, which is
+// still unstable. The toolchain is pinned to nightly, and the `core::arch`
+// intrinsics that would avoid the feature need `unsafe`.
+#![feature(portable_simd)]
 //! This module provides the ability to parse escape sequences and attach
 //! semantic meaning to them.  It can also encode the semantic values as
 //! escape sequences.  It provides encoding and decoding functionality

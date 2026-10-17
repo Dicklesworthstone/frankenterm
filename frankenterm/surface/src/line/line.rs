@@ -51,6 +51,29 @@ fn normalize_cell_width(width: usize) -> usize {
     width.clamp(1, 2)
 }
 
+/// The text a cell built from `text` keeps: `TeenyString::from_str` turns
+/// empty text, CR LF and a lone control byte into a space.
+fn kept_cell_text(text: &str) -> &str {
+    match text.as_bytes() {
+        [] | b"\r\n" => " ",
+        [byte] if *byte < 0x20 || *byte == 0x7f => " ",
+        _ => text,
+    }
+}
+
+/// The builder [`Line::compress_for_scrollback`] uses. Every arm leaves the
+/// same line; the older ones stay as A/B arms and rollbacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompressArm {
+    /// `from_cell_vec`, then a separate `reproduces` pass (before
+    /// ft-yccm0.3.2.6).
+    Legacy,
+    /// The checked builder over the visible cells (ft-yccm0.3.2.6).
+    Checked,
+    /// The checked builder over the row's own cells (ft-951ev).
+    Slice,
+}
+
 fn checked_materialized_end(idx: usize, width: usize) -> Option<usize> {
     let end = idx.checked_add(width)?;
     (end <= MAX_MATERIALIZED_LINE_LEN).then_some(end)
@@ -287,6 +310,25 @@ impl Line {
         }
     }
 
+    /// How many owners share this line's clustered storage, or `None` for
+    /// vector storage (ft-70s4z). A row being printed should have one: with
+    /// a second owner, every write copies the whole row.
+    #[doc(hidden)]
+    pub fn clustered_storage_owners(&self) -> Option<usize> {
+        match &self.cells {
+            CellStorage::C(line) => Some(Arc::strong_count(line)),
+            CellStorage::V(_) => None,
+        }
+    }
+
+    /// Sets the presence bit for explicit hyperlinks, which writes of
+    /// hyperlinked cells set. A view rebuilt from cells with `from_cells`
+    /// sets it here (ft-yccm0.3.3.4).
+    #[doc(hidden)]
+    pub fn set_has_hyperlink(&mut self, on: bool) {
+        self.bits.set(LineBits::HAS_HYPERLINK, on);
+    }
+
     /// Retain only immutable semantic source data for a mutable callback fence.
     /// Cells stay shared even in eager-clone profiling mode; caches are omitted.
     pub fn semantic_snapshot(&self) -> Self {
@@ -496,7 +538,16 @@ impl Line {
         seqno: SequenceNo,
         blank_attr: CellAttributes,
     ) {
-        {
+        if matches!(self.cells, CellStorage::C(_)) && !Self::clear_materializes() {
+            // Every cell is replaced, so clustered storage (a scrollback row
+            // recycled at the bottom, on every newline once scrollback is
+            // full) is not decoded first only to be overwritten: that was
+            // about 7% of headless T0 (ft-yccm0.3.2.6).
+            let cells = (0..width)
+                .map(|_| Cell::blank_with_attrs(blank_attr.clone()))
+                .collect();
+            self.cells = CellStorage::V(VecStorage::new(cells));
+        } else {
             let cells = self.coerce_vec_storage();
             for c in cells.iter_mut() {
                 *c = Cell::blank_with_attrs(blank_attr.clone());
@@ -507,6 +558,22 @@ impl Line {
         self.update_last_change_seqno(seqno);
         self.invalidate_zones();
         self.bits = LineBits::NONE;
+    }
+
+    /// `FT_LINE_CLEAR_MATERIALIZE=1` makes [`Self::resize_and_clear`] decode
+    /// clustered storage before clearing it, as it did before
+    /// ft-yccm0.3.2.6: the A/B arm and a rollback. Both arms leave the same
+    /// line. Resolved once per process.
+    fn clear_materializes() -> bool {
+        #[cfg(feature = "std")]
+        {
+            static MATERIALIZE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *MATERIALIZE.get_or_init(|| {
+                std::env::var_os("FT_LINE_CLEAR_MATERIALIZE").is_some_and(|v| v == "1")
+            })
+        }
+        #[cfg(not(feature = "std"))]
+        false
     }
 
     pub fn resize(&mut self, width: usize, seqno: SequenceNo) {
@@ -1400,13 +1467,18 @@ impl Line {
                 // implicitly blank
                 return;
             }
-            while cl.len() < idx {
-                // Fill out any implied blanks until we can append
-                // their intended cell content
-                Arc::make_mut(cl).append_grapheme(" ", 1, CellAttributes::blank());
-            }
-            if idx == cl.len() {
-                Arc::make_mut(cl).append_grapheme(text, width, attr);
+            // A grapheme that would cluster with the previous cell cannot be
+            // appended to clustered storage; it takes the vector path below.
+            if cl.can_append_cell_at(idx, text) {
+                // Fill out any implied blanks, then append the intended
+                // cell content, all in one detach (ft-70s4z). The text is
+                // what the cell would keep: at the row's start any first
+                // character appends, and a lone control byte stored raw
+                // there read back as itself while clustered but as a blank
+                // once the row became a vector (ft-yccm0.3.3.4).
+                let cl = Arc::make_mut(cl);
+                cl.append_blank_cells(idx - cl.len());
+                cl.append_grapheme(kept_cell_text(text), width, attr);
                 self.invalidate_implicit_hyperlinks(seqno);
                 self.invalidate_zones();
                 self.update_last_change_seqno(seqno);
@@ -1420,6 +1492,12 @@ impl Line {
     /// Assign a contiguous printable width-1 ASCII run when it can be
     /// represented as a single append to clustered storage. Returns false for
     /// control bytes or whenever the caller must use normal per-cell assignment.
+    ///
+    /// A run that starts past the end of the line (ft-70s4z) gets the result
+    /// per-cell `set_cell` gives it. Leading cells equal to `Cell::blank()`
+    /// stay implicit, the gap up to the first other cell is filled with
+    /// blanks, and the rest is appended. All of it happens in one detach of
+    /// the clustered storage.
     pub fn append_ascii_cell_run(
         &mut self,
         idx: usize,
@@ -1442,14 +1520,25 @@ impl Line {
         let CellStorage::C(cl) = &mut self.cells else {
             return false;
         };
-        if idx != cl.len() {
+        if !cl.can_append_cell_at(idx, text) {
             return false;
         }
+        // Past the end, `set_cell` leaves a blank cell implicit.
+        let implicit = if idx > cl.len() && Cell::new(' ', attr.clone()) == Cell::blank() {
+            text.bytes().take_while(|&byte| byte == b' ').count()
+        } else {
+            0
+        };
+        let (idx, text) = (idx + implicit, &text[implicit..]);
 
         if attr.hyperlink().is_some() {
             self.bits |= LineBits::HAS_HYPERLINK;
         }
-        Arc::make_mut(cl).append_ascii_run(text, attr);
+        if !text.is_empty() {
+            let cl = Arc::make_mut(cl);
+            cl.append_blank_cells(idx - cl.len());
+            cl.append_ascii_run(text, attr);
+        }
         self.invalidate_implicit_hyperlinks(seqno);
         self.invalidate_zones();
         self.update_last_change_seqno(seqno);
@@ -1495,13 +1584,14 @@ impl Line {
                 // implicitly blank
                 return;
             }
-            while cl.len() < idx {
-                // Fill out any implied blanks until we can append
-                // their intended cell content
-                Arc::make_mut(cl).append_grapheme(" ", 1, CellAttributes::blank());
-            }
-            if idx == cl.len() {
-                Arc::make_mut(cl).append(cell);
+            // A grapheme that would cluster with the previous cell cannot be
+            // appended to clustered storage; it takes the vector path below.
+            if cl.can_append_cell_at(idx, cell.str()) {
+                // Fill out any implied blanks, then append the intended
+                // cell content, all in one detach (ft-70s4z).
+                let cl = Arc::make_mut(cl);
+                cl.append_blank_cells(idx - cl.len());
+                cl.append(cell);
                 return;
             }
             /*
@@ -1511,6 +1601,28 @@ impl Line {
                 cl.len
             );
             */
+        }
+
+        self.write_vector_cell(idx, cell, width, end_idx, clear, Self::write_split());
+    }
+
+    /// The vector-row part of `set_cell_impl`: pad, blank a wide grapheme
+    /// before `idx`, blank the columns the cell covers, store it. One storage
+    /// borrow does it all (ft-yccm0.3.2.6); `split` takes the steps one by
+    /// one as before. Both leave the same line.
+    fn write_vector_cell(
+        &mut self,
+        idx: usize,
+        cell: Cell,
+        width: usize,
+        end_idx: usize,
+        clear: bool,
+        split: bool,
+    ) {
+        if !split {
+            self.coerce_vec_storage()
+                .write_cell(idx, cell, width, end_idx, clear);
+            return;
         }
 
         // if the line isn't wide enough, pad it out with the default attributes.
@@ -1530,6 +1642,19 @@ impl Line {
         }
 
         self.raw_set_cell(idx, cell, clear);
+    }
+
+    /// `FT_LINE_WRITE_SPLIT=1` writes vector-row cells step by step, each
+    /// step borrowing the storage, as before ft-yccm0.3.2.6: the A/B arm and
+    /// a rollback. Both arms leave the same line. Resolved once per process.
+    fn write_split() -> bool {
+        #[cfg(feature = "std")]
+        {
+            static SPLIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *SPLIT.get_or_init(|| std::env::var_os("FT_LINE_WRITE_SPLIT").is_some_and(|v| v == "1"))
+        }
+        #[cfg(not(feature = "std"))]
+        false
     }
 
     /// Place text starting at the specified column index.
@@ -1832,11 +1957,77 @@ impl Line {
     /// re-materialize the storage in a form that is suitable
     /// for mutation.
     pub fn compress_for_scrollback(&mut self) {
-        let cv = match &self.cells {
-            CellStorage::V(v) => ClusteredLine::from_cell_vec(v.len(), self.visible_cells()),
+        self.compress_for_scrollback_arm(Self::compress_arm());
+    }
+
+    /// `compress_for_scrollback` through the builder `arm` names. Every arm
+    /// leaves the same line.
+    fn compress_for_scrollback_arm(&mut self, arm: CompressArm) {
+        let (cv, inert) = match &self.cells {
+            CellStorage::V(v) => match (arm, v.physical_cells()) {
+                (CompressArm::Legacy, _) => (
+                    ClusteredLine::from_cell_vec(v.len(), self.visible_cells()),
+                    false,
+                ),
+                (CompressArm::Slice, Some(cells)) => {
+                    ClusteredLine::from_cell_slice_checked(v.len(), cells)
+                }
+                // A deferred token row has no cells of its own to slice.
+                _ => ClusteredLine::from_cells_checked(v.len(), self.visible_cells()),
+            },
             CellStorage::C(_) => return,
         };
+        // Clustered storage re-segments its text, so it may only replace
+        // cells it reproduces exactly: neighbours that cluster with each
+        // other (a split regional-indicator pair) stay in vector storage.
+        // Inert boundaries everywhere already prove it does.
+        if !inert && !cv.reproduces(|| self.visible_cells()) {
+            return;
+        }
         self.cells = CellStorage::C(Arc::new(cv));
+    }
+
+    /// The builder `compress_for_scrollback` uses: [`CompressArm::Slice`],
+    /// unless `FT_LINE_COMPRESS_LEGACY=1` or `FT_LINE_COMPRESS_SLICE=0`.
+    fn compress_arm() -> CompressArm {
+        if Self::compress_legacy() {
+            CompressArm::Legacy
+        } else if Self::compress_slice() {
+            CompressArm::Slice
+        } else {
+            CompressArm::Checked
+        }
+    }
+
+    /// `FT_LINE_COMPRESS_SLICE=0` compresses rows for scrollback through
+    /// the checked builder over visible cells, as before ft-951ev: the A/B
+    /// arm and a rollback. Both arms leave the same line. Resolved once per
+    /// process.
+    fn compress_slice() -> bool {
+        #[cfg(feature = "std")]
+        {
+            static SLICE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *SLICE.get_or_init(|| {
+                !std::env::var_os("FT_LINE_COMPRESS_SLICE").is_some_and(|v| v == "0")
+            })
+        }
+        #[cfg(not(feature = "std"))]
+        true
+    }
+
+    /// `FT_LINE_COMPRESS_LEGACY=1` compresses rows for scrollback through
+    /// the builder and checks used before ft-yccm0.3.2.6: the A/B arm and a
+    /// rollback. Both arms leave the same line. Resolved once per process.
+    fn compress_legacy() -> bool {
+        #[cfg(feature = "std")]
+        {
+            static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *LEGACY.get_or_init(|| {
+                std::env::var_os("FT_LINE_COMPRESS_LEGACY").is_some_and(|v| v == "1")
+            })
+        }
+        #[cfg(not(feature = "std"))]
+        false
     }
 
     /// Rebuild canonical attribute runs without materializing a cell vector.
@@ -1844,7 +2035,18 @@ impl Line {
     /// storage whose mutations may have left adjacent identical-attribute runs.
     pub fn canonicalize_scrollback_storage(&mut self) {
         let clustered = ClusteredLine::from_cell_vec(self.len(), self.visible_cells());
+        // See compress_for_scrollback: keep cells clustering cannot reproduce.
+        if !clustered.reproduces(|| self.visible_cells()) {
+            return;
+        }
         self.cells = CellStorage::C(Arc::new(clustered));
+    }
+
+    /// Whether the cells are held as clustered attribute runs, the storage
+    /// `compress_for_scrollback` leaves a row in when clustering reproduces
+    /// it. Such a row serializes as its runs, without a cell vector.
+    pub fn has_clustered_storage(&self) -> bool {
+        matches!(self.cells, CellStorage::C(_))
     }
 
     pub fn cells_mut(&mut self) -> &mut [Cell] {
@@ -2306,6 +2508,10 @@ pub struct LineWrapGeometry {
     tail_basic: bool,
     head_after_basic: bool,
     tail_before_basic: bool,
+    /// The head starts with a pictograph basic starter, so a join certifies
+    /// it with `tail_before_pictograph` instead of `tail_before_basic`.
+    head_pictograph: bool,
+    tail_before_pictograph: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2322,6 +2528,15 @@ impl LineWrapGeometry {
     /// bounds retained metadata and temporary boundary-certificate text work.
     /// Standalone counts remain exact even when `supports_join()` is false.
     pub fn capture(line: &Line, max_bytes: usize) -> Option<Self> {
+        Self::capture_with(line, max_bytes, geometry_pictograph_starters())
+    }
+
+    /// [`Self::capture`], with single emoji pictographs counted among the
+    /// basic starters or not (see [`geometry_basic_starter`]). Both give the
+    /// same widths, counts and row joinability. With them, a join can also
+    /// be certified where a pictograph starts the next row, and a T0 row is
+    /// captured without segmenting its cells and seams.
+    fn capture_with(line: &Line, max_bytes: usize, pictographs: bool) -> Option<Self> {
         let available = max_bytes.checked_sub(core::mem::size_of::<Self>())?;
         // Visible tokens cannot outnumber columns in canonical physical rows.
         // Reserve once, before certificate scratch exists, so a growing width
@@ -2338,6 +2553,8 @@ impl LineWrapGeometry {
             tail_basic: false,
             head_after_basic: false,
             tail_before_basic: false,
+            head_pictograph: false,
+            tail_before_pictograph: false,
         };
         result.widths.try_reserve_exact(line.len()).ok()?;
         if result.widths.capacity() > available {
@@ -2384,7 +2601,10 @@ impl LineWrapGeometry {
             // for a later default-width decoded representation.
             let ascii = text.len() == 1 && matches!(text.as_bytes()[0], b' '..=b'~');
             let mut chars = text.chars();
-            let basic = chars.next().is_some_and(geometry_basic_starter) && chars.next().is_none();
+            let basic = chars
+                .next()
+                .is_some_and(|ch| geometry_basic_starter(ch, pictographs))
+                && chars.next().is_none();
             result.join_safe &= if ascii {
                 width == 1
             } else {
@@ -2404,7 +2624,13 @@ impl LineWrapGeometry {
                     )?;
                 }
             } else {
-                result.head_basic = text.chars().next().is_some_and(geometry_basic_starter);
+                let first = text.chars().next();
+                result.head_basic = first.is_some_and(|ch| geometry_basic_starter(ch, pictographs));
+                result.head_pictograph =
+                    result.head_basic && first.is_some_and(|ch| !geometry_basic_starter(ch, false));
+                // After any basic starter the same rules apply as after "a",
+                // a pictograph included: only a ZWJ before the boundary would
+                // differ (GB11), and a basic starter is a lone code point.
                 result.head_after_basic = basic
                     || geometry_boundary_is_separate("a", text, &mut boundary, boundary_budget)?;
             }
@@ -2416,6 +2642,18 @@ impl LineWrapGeometry {
             result.tail_basic = previous_basic;
             result.tail_before_basic = previous_basic
                 || geometry_boundary_is_separate(last, "a", &mut boundary, boundary_budget)?;
+            // Before a pictograph, a ZWJ ending this row joins it (GB11) where
+            // it would not join "a". A probe the budget cannot afford leaves
+            // this certificate off; the capture succeeds or fails as before.
+            result.tail_before_pictograph = pictographs
+                && (previous_basic
+                    || geometry_boundary_is_separate(
+                        last,
+                        GEOMETRY_PICTOGRAPH_PROBE,
+                        &mut boundary,
+                        boundary_budget,
+                    )
+                    .unwrap_or(false));
         }
         Some(result)
     }
@@ -2534,10 +2772,14 @@ impl LineWrapGeometry {
         if !self.join_safe || !other.join_safe {
             return Err(LineWrapGeometryJoinError::UncertifiedSource);
         }
+        let tail_before_head = if other.head_pictograph {
+            self.tail_before_pictograph
+        } else {
+            self.tail_before_basic
+        };
         if !self.widths.is_empty()
             && !other.widths.is_empty()
-            && !(self.tail_basic && other.head_after_basic
-                || other.head_basic && self.tail_before_basic)
+            && !(self.tail_basic && other.head_after_basic || other.head_basic && tail_before_head)
         {
             return Err(LineWrapGeometryJoinError::UncertifiedBoundary);
         }
@@ -2579,10 +2821,12 @@ impl LineWrapGeometry {
         if self.widths.is_empty() {
             self.head_basic = other.head_basic;
             self.head_after_basic = other.head_after_basic;
+            self.head_pictograph = other.head_pictograph;
         }
         if !other.widths.is_empty() {
             self.tail_basic = other.tail_basic;
             self.tail_before_basic = other.tail_before_basic;
+            self.tail_before_pictograph = other.tail_before_pictograph;
         }
         self.widths.extend_from_slice(&other.widths);
         self.physical_len = physical_len;
@@ -2644,8 +2888,44 @@ impl LineWrapGeometry {
 // continuation, RI, Hangul, Indic linker or emoji-ZWJ context. The conservative
 // set includes the CJK seam in the native profiling corpus. Other boundaries
 // require a basic starter on the opposite side or the text-bearing fallback.
-fn geometry_basic_starter(ch: char) -> bool {
+//
+// With `pictographs`, so are the emoji pictographs of the operator's T0 pool
+// (ft-yccm0.3.2.6), less the skin-tone modifiers U+1F3FB..=U+1F3FF, which
+// extend the grapheme before them. Alone, each is a grapheme of its own, as
+// "a" is, and no rule joins two of them; only a ZWJ before one does (GB11),
+// so a row's tail is also probed against GEOMETRY_PICTOGRAPH_PROBE.
+fn geometry_basic_starter(ch: char, pictographs: bool) -> bool {
     matches!(ch, ' '..='~' | '\u{4e00}'..='\u{9fff}')
+        || (pictographs
+            && matches!(
+                ch,
+                '\u{1F300}'..='\u{1F3FA}'
+                    | '\u{1F400}'..='\u{1F64F}'
+                    | '\u{1F680}'..='\u{1F6FF}'
+                    | '\u{1F900}'..='\u{1F9FF}'
+                    | '\u{1FA70}'..='\u{1FAFF}'
+            ))
+}
+
+/// The pictograph that stands for every pictograph basic starter where a join
+/// certificate probes a boundary.
+const GEOMETRY_PICTOGRAPH_PROBE: &str = "\u{1F600}";
+
+/// Whether [`LineWrapGeometry::capture`] counts single emoji pictographs as
+/// basic starters, which spares a T0 row's cells their per-cell and per-seam
+/// grapheme segmentation (ft-yccm0.3.2.6): on unless
+/// `FT_GEOMETRY_PICTOGRAPH_STARTERS=0`, the A/B arm and a rollback. Both arms
+/// give the same widths and counts. Resolved once per process.
+fn geometry_pictograph_starters() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static PICTOGRAPHS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *PICTOGRAPHS.get_or_init(|| {
+            !std::env::var_os("FT_GEOMETRY_PICTOGRAPH_STARTERS").is_some_and(|v| v == "0")
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    true
 }
 
 fn geometry_boundary_is_separate(
@@ -4444,6 +4724,430 @@ mod tests {
         assert!(!line.matches_semantic_snapshot(&before));
     }
 
+    /// ft-yccm0.3.2.6: clearing a clustered line without decoding it first
+    /// leaves exactly the line that clearing its never-compressed twin
+    /// leaves, at every width, with a styled blank.
+    #[test]
+    fn resize_and_clear_of_a_clustered_line_matches_its_vector_twin() {
+        let mut pen = CellAttributes::default();
+        pen.set_foreground(frankenterm_cell::color::ColorAttribute::PaletteIndex(196));
+        let mut blank = CellAttributes::default();
+        blank.set_background(frankenterm_cell::color::ColorAttribute::PaletteIndex(21));
+        for text in [
+            "plain text",
+            "h\u{e9} \u{1f600} w\u{f6}rld",
+            "",
+            "wide \u{1f468}\u{200d}\u{1f469} end",
+        ] {
+            for width in [0, 3, 12, 120] {
+                let mut clustered = Line::from_text(text, &pen, 3, None);
+                clustered.compress_for_scrollback();
+                assert!(
+                    text.is_empty() || matches!(clustered.cells, CellStorage::C(_)),
+                    "{:?} compresses",
+                    text
+                );
+                let mut vector = Line::from_text(text, &pen, 3, None);
+                assert!(matches!(vector.cells, CellStorage::V(_)));
+                clustered.resize_and_clear(width, 9, blank.clone());
+                vector.resize_and_clear(width, 9, blank.clone());
+                assert!(matches!(clustered.cells, CellStorage::V(_)));
+                assert_eq!(clustered.len(), width, "{text:?} at {width}");
+                assert!(clustered == vector, "{:?} at {}", text, width);
+                assert_eq!(clustered.current_seqno(), vector.current_seqno());
+            }
+        }
+    }
+
+    /// ft-yccm0.3.2.6: writing a vector row's cell with one storage borrow
+    /// leaves the line the step-by-step writes leave. Random narrow, wide,
+    /// combining and emoji cells with new colors land on random columns:
+    /// past the end, on wide heads and their placeholders, and over each
+    /// other.
+    #[test]
+    fn one_borrow_vector_writes_match_step_by_step_writes() {
+        use frankenterm_cell::color::ColorAttribute;
+        let glyphs = [
+            ("a", 1),
+            ("\u{4e2d}", 2),
+            ("\u{1f600}", 2),
+            (" ", 1),
+            ("e\u{301}", 1),
+        ];
+        let mut seed = 0x2026_1007_u64;
+        let mut next = move |bound: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % bound
+        };
+        for case in 0..2000 {
+            let mut pen = CellAttributes::default();
+            pen.set_background(ColorAttribute::PaletteIndex(4));
+            let mut joined = Line::with_width_and_cell(8, Cell::blank_with_attrs(pen), 1);
+            let mut split = joined.clone();
+            for step in 0..12 {
+                let (text, width) = glyphs[next(glyphs.len())];
+                let mut attrs = CellAttributes::default();
+                attrs.set_foreground(ColorAttribute::PaletteIndex(next(256) as u8));
+                let cell = Cell::new_grapheme_with_width(text, width, attrs);
+                let idx = next(14);
+                let width = normalize_cell_width(cell.width());
+                let clear = next(2) == 0;
+                joined.write_vector_cell(idx, cell.clone(), width, idx + width, clear, false);
+                split.write_vector_cell(idx, cell, width, idx + width, clear, true);
+                assert!(
+                    joined == split,
+                    "case {} step {}: {:?} at {}",
+                    case,
+                    step,
+                    text,
+                    idx
+                );
+            }
+        }
+    }
+
+    /// ft-yccm0.3.3.4: a lone control byte or CR LF appended at the start of
+    /// a clustered row reads back as the blank a cell built from it keeps,
+    /// before and after the row becomes a vector, like any other text.
+    #[test]
+    fn a_control_byte_appended_to_a_clustered_row_reads_as_its_cell_keeps_it() {
+        for text in ["\u{7}", "\r\n", "\u{7f}", "a"] {
+            let mut line = Line::new(1);
+            line.set_cell_grapheme(0, text, 1, CellAttributes::default(), 2);
+            assert!(line.has_clustered_storage(), "{:?}", text);
+            let read = |line: &Line| -> Vec<String> {
+                line.visible_cells()
+                    .map(|cell| cell.str().to_string())
+                    .collect()
+            };
+            let clustered = read(&line);
+            let _ = line.cells_mut();
+            assert!(!line.has_clustered_storage(), "{:?}", text);
+            assert_eq!(clustered, read(&line), "{:?}", text);
+            let kept = Cell::new_grapheme_with_width(text, 1, CellAttributes::default());
+            assert_eq!(clustered, vec![kept.str().to_string()], "{:?}", text);
+        }
+    }
+
+    /// ft-yccm0.3.2.6: compressing for scrollback through the checked,
+    /// presized builder leaves the line the legacy builder and its separate
+    /// `reproduces` pass leave, compressed or not: inert rows, a row whose
+    /// boundary is not inert but reproduces, a row whose neighbours cluster,
+    /// and a T0 row with new colours on every cell. Its clusters fit.
+    #[test]
+    fn compress_for_scrollback_arms_leave_the_same_line() {
+        use frankenterm_cell::color::ColorAttribute;
+        let plain = CellAttributes::default();
+        let mut rows = vec![
+            Line::from_text("plain text", &plain, 3, None),
+            Line::from_text("h\u{e9} \u{1f600} we\u{301}rld", &plain, 3, None),
+            Line::from_text("wide \u{1f468}\u{200d}\u{1f469} end", &plain, 3, None),
+            Line::new(3),
+        ];
+        // A terminal row: vector storage of styled blanks, then printed.
+        let mut t0 = Line::with_width_and_cell(140, Cell::blank_with_attrs(plain.clone()), 3);
+        let mut column = 0;
+        for n in 0..70u8 {
+            let mut attrs = CellAttributes::default();
+            attrs.set_foreground(ColorAttribute::PaletteIndex(n));
+            attrs.set_background(ColorAttribute::PaletteIndex(n.wrapping_mul(7)));
+            let text = if n.is_multiple_of(9) {
+                "h"
+            } else {
+                "\u{1f600}"
+            };
+            let cell = Cell::new_grapheme(text, attrs, None);
+            let width = cell.width();
+            t0.set_cell(column, cell, 3);
+            column += width;
+        }
+        rows.push(t0);
+        let mut split = Line::new(3);
+        let first = Cell::new_grapheme("\u{1F1FA}", plain.clone(), None);
+        let second_column = first.width();
+        split.set_cell(0, first, 3);
+        split.set_cell(
+            second_column,
+            Cell::new_grapheme("\u{1F1F8}", plain.clone(), None),
+            3,
+        );
+        rows.push(split);
+        let last = rows.len() - 1;
+        for (index, row) in rows.into_iter().enumerate() {
+            // Line::new (index 3) starts clustered; every other row is a
+            // vector row, so each arm really compresses it.
+            assert_eq!(row.has_clustered_storage(), index == 3, "row {}", index);
+            let mut legacy = row.clone();
+            let mut checked = row.clone();
+            let mut slice = row.clone();
+            legacy.compress_for_scrollback_arm(CompressArm::Legacy);
+            checked.compress_for_scrollback_arm(CompressArm::Checked);
+            slice.compress_for_scrollback_arm(CompressArm::Slice);
+            let text = row.as_str().into_owned();
+            assert_eq!(
+                checked.has_clustered_storage(),
+                legacy.has_clustered_storage(),
+                "{:?}",
+                text
+            );
+            assert_eq!(checked.has_clustered_storage(), index != last, "{:?}", text);
+            assert!(checked == legacy, "{:?}", text);
+            assert!(slice == checked, "{:?}", text);
+            for built in [&checked, &slice] {
+                match &built.cells {
+                    // Built here by a checked builder, not appended to before.
+                    CellStorage::C(cl) if !row.has_clustered_storage() => {
+                        assert!(cl.clusters_fit(), "{:?}", text);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// A terminal row as T0 leaves it (ft-951ev): `cols` styled blanks, then
+    /// cells written left to right, each a pool character with its own
+    /// palette foreground and background, one in twenty ASCII, the rest
+    /// emoji from the operator's pool. `next` draws the randomness.
+    fn t0_row(cols: usize, next: &mut dyn FnMut(usize) -> usize) -> Line {
+        use frankenterm_cell::color::ColorAttribute;
+        const EMOJI: [(u32, u32); 5] = [
+            (0x1F600, 0x1F64F),
+            (0x1F300, 0x1F5FF),
+            (0x1F680, 0x1F6FF),
+            (0x1F900, 0x1F9FF),
+            (0x1FA70, 0x1FAFF),
+        ];
+        let mut row = Line::with_width_and_cell(cols, Cell::blank(), 1);
+        let mut column = 0;
+        while column < cols {
+            let mut attrs = CellAttributes::default();
+            attrs.set_foreground(ColorAttribute::PaletteIndex(next(256) as u8));
+            attrs.set_background(ColorAttribute::PaletteIndex(next(256) as u8));
+            let ch = if next(20) == 0 {
+                char::from(b'A' + next(26) as u8)
+            } else {
+                let (start, end) = EMOJI[next(EMOJI.len())];
+                char::from_u32(start + next((end - start + 1) as usize) as u32).unwrap()
+            };
+            let cell = Cell::new(ch, attrs);
+            let width = cell.width();
+            if column + width > cols {
+                break;
+            }
+            row.set_cell(column, cell, 1);
+            column += width;
+        }
+        row
+    }
+
+    /// ft-951ev: a row compressed for scrollback reads back as the cells it
+    /// had, through every arm: the same cells at the same columns, with the
+    /// same text, widths and attributes (colours, styles, hyperlinks and,
+    /// with images, image attachments), the same length and wrap flag; and
+    /// the arms leave the same line. Rows: 3,000 written at random columns
+    /// (overwrites split wide cells) from text that clusters and text that
+    /// does not, with runs of shared attributes; and 1,000 T0 rows.
+    #[test]
+    fn compressed_rows_read_back_as_their_cells() {
+        use crate::hyperlink::Hyperlink;
+        use frankenterm_cell::color::{ColorAttribute, SrgbaTuple};
+        use frankenterm_cell::Underline;
+        let texts = [
+            "a",
+            "Z",
+            " ",
+            "\u{754c}",
+            "\u{1F600}",
+            "\u{1F680}",
+            "\u{1F3FB}",
+            "e\u{301}",
+            "\u{301}",
+            "\u{1F1FA}",
+            "\u{1F1F8}",
+            "\u{1F468}\u{200d}\u{1F469}",
+            "\u{200d}",
+            "\u{1F600}\u{FE0F}",
+        ];
+        let link = Arc::new(Hyperlink::new("https://example.invalid/951"));
+        let mut seed = 0x951e_0002_u64;
+        let mut next = move |bound: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % bound
+        };
+        let mut rows = Vec::new();
+        for _ in 0..3000 {
+            let cols = 1 + next(40);
+            let mut row = Line::with_width_and_cell(cols, Cell::blank(), 1);
+            let mut attrs = CellAttributes::default();
+            for _ in 0..next(2 * cols) {
+                if next(2) == 0 {
+                    attrs = CellAttributes::default();
+                    match next(7) {
+                        0 => {}
+                        1 => {
+                            attrs.set_foreground(ColorAttribute::PaletteIndex(next(256) as u8));
+                        }
+                        2 => {
+                            attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(
+                                SrgbaTuple(0.25, 0.5, next(4) as f32 / 4.0, 1.0),
+                            ));
+                        }
+                        3 => {
+                            attrs.set_intensity(frankenterm_cell::Intensity::Bold);
+                            attrs.set_italic(true);
+                        }
+                        4 => {
+                            attrs.set_underline(Underline::Double);
+                            attrs.set_reverse(true);
+                        }
+                        5 => {
+                            attrs.set_hyperlink(Some(Arc::clone(&link)));
+                        }
+                        _ => {
+                            #[cfg(feature = "use_image")]
+                            {
+                                use frankenterm_cell::image::{
+                                    ImageCell, ImageData, ImageDataType, TextureCoordinate,
+                                };
+                                let image = Arc::new(ImageData::with_data(
+                                    ImageDataType::new_single_frame(1, 1, vec![1, 2, 3, 4]),
+                                ));
+                                attrs.set_image(alloc::boxed::Box::new(ImageCell::new(
+                                    TextureCoordinate::new_f32(0.0, 0.0),
+                                    TextureCoordinate::new_f32(1.0, 1.0),
+                                    image,
+                                )));
+                            }
+                            attrs.set_background(ColorAttribute::PaletteIndex(next(16) as u8));
+                        }
+                    }
+                }
+                let cell = Cell::new_grapheme(texts[next(texts.len())], attrs.clone(), None);
+                row.set_cell(next(cols), cell, 1);
+            }
+            if next(3) == 0 {
+                row.set_last_cell_was_wrapped(true, 1);
+            }
+            rows.push(row);
+        }
+        for _ in 0..1000 {
+            let mut row = t0_row(120, &mut next);
+            if next(2) == 0 {
+                row.set_last_cell_was_wrapped(true, 1);
+            }
+            rows.push(row);
+        }
+        let (mut clustered, mut kept) = (0, 0);
+        for row in &rows {
+            assert!(!row.has_clustered_storage());
+            let text = row.as_str().into_owned();
+            let mut arms = Vec::new();
+            for &arm in &[
+                CompressArm::Legacy,
+                CompressArm::Checked,
+                CompressArm::Slice,
+            ] {
+                let mut compressed = row.clone();
+                compressed.compress_for_scrollback_arm(arm);
+                assert_eq!(compressed.len(), row.len(), "{:?} {:?}", arm, text);
+                assert_eq!(
+                    compressed.last_cell_was_wrapped(),
+                    row.last_cell_was_wrapped(),
+                    "{:?} {:?}",
+                    arm,
+                    text
+                );
+                let read: Vec<_> = compressed
+                    .visible_cells()
+                    .map(|cell| {
+                        (
+                            cell.cell_index(),
+                            cell.str().to_string(),
+                            cell.width(),
+                            cell.attrs().clone(),
+                        )
+                    })
+                    .collect();
+                let had: Vec<_> = row
+                    .visible_cells()
+                    .map(|cell| {
+                        (
+                            cell.cell_index(),
+                            cell.str().to_string(),
+                            cell.width(),
+                            cell.attrs().clone(),
+                        )
+                    })
+                    .collect();
+                assert!(read == had, "{:?} {:?}", arm, text);
+                arms.push(compressed);
+            }
+            assert!(arms[1] == arms[0] && arms[2] == arms[1], "{:?}", text);
+            if arms[2].has_clustered_storage() {
+                clustered += 1;
+            } else {
+                kept += 1;
+            }
+        }
+        // Both outcomes are well represented: rows that cluster, and rows
+        // whose neighbours cluster and so stay vectors (1854 and 2146 here).
+        assert!(clustered > 1000 && kept > 1000, "{} {}", clustered, kept);
+    }
+
+    /// ft-951ev: what compressing a T0 row for scrollback costs per row, as
+    /// the parse thread compresses every row that scrolls into the warm
+    /// tier, its old cells freed included: 2,000 fresh 120-column T0 rows per
+    /// arm and round, arms alternating, best of 5. A measurement, not a gate:
+    /// cargo test --profile release-perf -p frankenterm-surface --features std --lib -- --ignored compress_cost_on_t0_rows --nocapture
+    #[test]
+    #[ignore = "a throughput measurement; run it in release"]
+    fn compress_cost_on_t0_rows() {
+        let mut seed = 0x951e_u64;
+        let mut next = move |bound: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % bound
+        };
+        let arms = [
+            ("legacy", CompressArm::Legacy),
+            ("checked", CompressArm::Checked),
+            ("slice", CompressArm::Slice),
+        ];
+        let mut best = [f64::INFINITY; 3];
+        let mut clustered = [0usize; 3];
+        for _ in 0..5 {
+            for (arm, &(_, builder)) in arms.iter().enumerate() {
+                let mut rows: Vec<Line> = (0..2000).map(|_| t0_row(120, &mut next)).collect();
+                let start = std::time::Instant::now();
+                for row in &mut rows {
+                    row.compress_for_scrollback_arm(builder);
+                }
+                best[arm] = best[arm].min(start.elapsed().as_secs_f64());
+                // A skin-tone modifier after an emoji clusters with it, so
+                // its row stays a vector.
+                clustered[arm] = rows
+                    .iter()
+                    .filter(|row| row.has_clustered_storage())
+                    .count();
+            }
+        }
+        for (arm, &(name, _)) in arms.iter().enumerate() {
+            eprintln!(
+                "[BENCH] compress for scrollback, 2000 T0 rows of 120 columns: {} {:.2} us/row \
+                 ({} rows clustered)",
+                name,
+                best[arm] * 1e6 / 2000.0,
+                clustered[arm]
+            );
+        }
+    }
+
     fn geometry_screen_rows(source: Line, cols: usize, model: MonospaceKpCostModel) -> Vec<Line> {
         if source.len() <= cols {
             return vec![source];
@@ -4642,6 +5346,222 @@ mod tests {
             );
             assert_eq!(geometry, original);
         }
+    }
+
+    /// Whether `left` then `right` segment as those two graphemes.
+    fn graphemes_split(left: &str, right: &str) -> bool {
+        let joined = format!("{}{}", left, right);
+        let mut graphemes = Graphemes::new(&joined);
+        graphemes.next() == Some(left)
+            && graphemes.next() == Some(right)
+            && graphemes.next().is_none()
+    }
+
+    /// ft-yccm0.3.2.6: every pictograph geometry counts as a basic starter
+    /// is a grapheme of its own that binds to nothing beside it: not to "a",
+    /// a CJK ideograph, a space, the probe pictograph, itself, or another
+    /// pictograph, on either side. That is what lets capture skip its cell
+    /// and seam segmentation. They are the operator's T0 pool less the five
+    /// skin-tone modifiers, which do bind to the pictograph before them. And
+    /// only a ZWJ before a pictograph binds it, which the tail probe catches.
+    #[test]
+    fn pictograph_basic_starters_are_lone_ordinary_graphemes() {
+        let mut pictographs = 0;
+        for cp in 0x1F300..=0x1FAFF_u32 {
+            let Some(ch) = char::from_u32(cp) else {
+                continue;
+            };
+            if !geometry_basic_starter(ch, true) || geometry_basic_starter(ch, false) {
+                continue;
+            }
+            pictographs += 1;
+            let text = ch.to_string();
+            for other in ["a", "\u{754c}", " ", GEOMETRY_PICTOGRAPH_PROBE, "\u{1F9FF}"]
+                .iter()
+                .copied()
+                .chain(Some(text.as_str()))
+            {
+                assert!(
+                    graphemes_split(&text, other) && graphemes_split(other, &text),
+                    "U+{:X} binds to {:?}",
+                    cp,
+                    other
+                );
+            }
+        }
+        assert_eq!(pictographs, 1376 - 5);
+        for cp in 0x1F3FB..=0x1F3FF_u32 {
+            let modifier = char::from_u32(cp).unwrap();
+            assert!(!geometry_basic_starter(modifier, true));
+            assert!(!graphemes_split(
+                GEOMETRY_PICTOGRAPH_PROBE,
+                &modifier.to_string()
+            ));
+        }
+        assert!(!graphemes_split(
+            "\u{1F469}\u{200d}",
+            GEOMETRY_PICTOGRAPH_PROBE
+        ));
+        assert!(graphemes_split("\u{1F469}\u{200d}", "a"));
+    }
+
+    /// ft-yccm0.3.2.6: on random pairs of rows built from text that does and
+    /// does not join across a seam (pictographs, skin-tone modifiers, ZWJ
+    /// sequences and a dangling ZWJ, combining marks, VS16, regional
+    /// indicators, Hangul jamo, a Devanagari conjunct, ASCII, CJK, spaces),
+    /// geometry captured with pictograph starters and without has the same
+    /// widths, counts and joinability. It certifies every join the old
+    /// capture did, and every join it certifies holds: the tail of the first
+    /// row and the head of the second are separate graphemes when joined.
+    #[test]
+    fn pictograph_starter_geometry_certifies_only_joins_that_hold() {
+        let pool = [
+            "a",
+            " ",
+            "\u{754c}",
+            "\u{1F600}",
+            "\u{1F680}",
+            "\u{1F9FF}",
+            "\u{1F3FB}",
+            "\u{1F469}\u{200d}",
+            "\u{1F468}\u{200d}\u{1F469}",
+            "\u{200d}",
+            "e\u{301}",
+            "\u{301}",
+            "\u{FE0F}",
+            "\u{1F600}\u{FE0F}",
+            "\u{1F1FA}",
+            "\u{1F1F8}",
+            "\u{1100}",
+            "\u{1161}",
+            "\u{915}\u{94d}",
+        ];
+        let mut seed = 0x2026_1008_u64;
+        let mut next = move |bound: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % bound
+        };
+        let row = |next: &mut dyn FnMut(usize) -> usize| {
+            let mut cells = Vec::new();
+            let mut texts = Vec::new();
+            for _ in 0..1 + next(5) {
+                let text = pool[next(pool.len())];
+                let cell = Cell::new_grapheme(text, CellAttributes::blank(), None);
+                let width = cell.width();
+                cells.push(cell);
+                for _ in 1..width {
+                    cells.push(Cell::blank());
+                }
+                texts.push(text);
+            }
+            (Line::from_cells(cells, 1), texts)
+        };
+        let (mut certified, mut newly_certified) = (0, 0);
+        for _ in 0..20_000 {
+            let (left, left_texts) = row(&mut next);
+            let (right, right_texts) = row(&mut next);
+            let mut joins = [false; 2];
+            for (arm, &pictographs) in [false, true].iter().enumerate() {
+                let first = LineWrapGeometry::capture_with(&left, 1 << 16, pictographs).unwrap();
+                let second = LineWrapGeometry::capture_with(&right, 1 << 16, pictographs).unwrap();
+                for (captured, line, texts) in [
+                    (&first, &left, &left_texts),
+                    (&second, &right, &right_texts),
+                ] {
+                    let old = LineWrapGeometry::capture_with(line, 1 << 16, false).unwrap();
+                    assert_eq!(captured.widths, old.widths, "{:?}", texts);
+                    assert_eq!(captured.trimmed_tokens, old.trimmed_tokens, "{:?}", texts);
+                    assert_eq!(captured.physical_len, old.physical_len, "{:?}", texts);
+                    assert_eq!(captured.join_safe, old.join_safe, "{:?}", texts);
+                }
+                let mut joined = first.clone();
+                joins[arm] = joined.try_append(&second, 1 << 16).is_ok();
+                if joins[arm] {
+                    let (seam_left, seam_right) = (*left_texts.last().unwrap(), right_texts[0]);
+                    assert!(
+                        graphemes_split(seam_left, seam_right),
+                        "certified {:?} then {:?} (pictographs {})",
+                        left_texts,
+                        right_texts,
+                        pictographs
+                    );
+                }
+            }
+            assert!(
+                joins[1] || !joins[0],
+                "{:?} then {:?}",
+                left_texts,
+                right_texts
+            );
+            certified += usize::from(joins[1]);
+            newly_certified += usize::from(joins[1] && !joins[0]);
+        }
+        assert!(certified > 1000, "{}", certified);
+        assert!(newly_certified > 0, "{}", newly_certified);
+    }
+
+    /// ft-yccm0.3.2.6: what capturing a T0 row's geometry costs with
+    /// pictograph starters and without, as the parse thread captures every
+    /// row it spills to durable scrollback: rows of 60 wide cells from the
+    /// operator's pool (one in twenty an ASCII character), alternating arms.
+    /// A measurement, not a gate:
+    /// cargo test --profile release-perf -p frankenterm-surface --features std --lib -- --ignored geometry_capture_cost_on_t0_rows --nocapture
+    #[test]
+    #[ignore = "a throughput measurement; run it in release"]
+    fn geometry_capture_cost_on_t0_rows() {
+        let mut pool: Vec<char> = [
+            (0x1F600, 0x1F64F),
+            (0x1F300, 0x1F5FF),
+            (0x1F680, 0x1F6FF),
+            (0x1F900, 0x1F9FF),
+            (0x1FA70, 0x1FAFF),
+        ]
+        .iter()
+        .flat_map(|&(start, end)| (start..=end).filter_map(char::from_u32))
+        .collect();
+        pool.extend("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".chars());
+        let mut seed = 0x2026_1008_u64;
+        let mut rows = Vec::new();
+        for _ in 0..2000 {
+            let mut cells = Vec::new();
+            while cells.len() < 119 {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let ch = pool[(seed >> 33) as usize % pool.len()];
+                let cell = Cell::new(ch, CellAttributes::blank());
+                let width = cell.width();
+                cells.push(cell);
+                for _ in 1..width {
+                    cells.push(Cell::blank());
+                }
+            }
+            rows.push(Line::from_cells(cells, 1));
+        }
+        let mut best = [f64::INFINITY; 2];
+        for _ in 0..5 {
+            for (arm, &pictographs) in [false, true].iter().enumerate() {
+                let start = std::time::Instant::now();
+                for row in &rows {
+                    std::hint::black_box(LineWrapGeometry::capture_with(
+                        std::hint::black_box(row),
+                        1 << 16,
+                        pictographs,
+                    ));
+                }
+                best[arm] = best[arm].min(start.elapsed().as_secs_f64());
+            }
+        }
+        eprintln!(
+            "[BENCH] geometry capture, {} T0 rows: without pictograph starters {:.2} us/row, \
+             with {:.2} us/row, {:.1}x, best of 5",
+            rows.len(),
+            best[0] * 1e6 / rows.len() as f64,
+            best[1] * 1e6 / rows.len() as f64,
+            best[0] / best[1]
+        );
     }
 
     #[test]
@@ -6143,19 +7063,36 @@ mod tests {
             "aaaa bbbb cccc dddddddd eeeeeeee 界 e\u{301} 🚀 ".repeat(16)
         );
         let model = MonospaceKpCostModel::terminal_default();
-        let line: Line = text.as_str().into();
-        let report = line.wrap_with_report(14, SEQ_ZERO, model);
-        let reconstructed: String = report
-            .lines
-            .iter()
-            .map(|row| row.as_str().into_owned())
-            .collect();
-        assert_eq!(reconstructed, text);
-        assert_eq!(report.scorecard.mode, MonospaceWrapMode::Dp);
-        assert!(report.scorecard.estimated_states > model.max_dp_states);
-        assert!(report.scorecard.evaluated_states <= model.max_dp_states);
-        assert!(report.scorecard.selected_total_cost < report.scorecard.greedy_total_cost);
-        assert_eq!(report.scorecard.selected_forced_breaks, 0);
+        // ft-eyp5a: at 14 columns no wrap of this input beats greedy. A
+        // separator that fits must stay on its row, so the paragraph opens
+        // with an unavoidable slack-4 row, and every later 41-column period
+        // tiles as 14 + 14 + 13. An exhaustive search of this cost model
+        // gives 278 for both. At 15 columns the optimum (779) is strictly
+        // below greedy (1047). The bounded search must find a strict gain
+        // where one exists and tie greedy, never lose to it, where none does.
+        for (width, strictly_better) in [(15, true), (14, false)] {
+            let line: Line = text.as_str().into();
+            let report = line.wrap_with_report(width, SEQ_ZERO, model);
+            let reconstructed: String = report
+                .lines
+                .iter()
+                .map(|row| row.as_str().into_owned())
+                .collect();
+            assert_eq!(reconstructed, text);
+            assert_eq!(report.scorecard.mode, MonospaceWrapMode::Dp);
+            assert!(report.scorecard.estimated_states > model.max_dp_states);
+            assert!(report.scorecard.evaluated_states <= model.max_dp_states);
+            assert!(report.scorecard.selected_total_cost <= report.scorecard.greedy_total_cost);
+            assert_eq!(
+                report.scorecard.selected_total_cost < report.scorecard.greedy_total_cost,
+                strictly_better,
+                "width {}: selected {} greedy {}",
+                width,
+                report.scorecard.selected_total_cost,
+                report.scorecard.greedy_total_cost
+            );
+            assert_eq!(report.scorecard.selected_forced_breaks, 0);
+        }
     }
 
     #[test]

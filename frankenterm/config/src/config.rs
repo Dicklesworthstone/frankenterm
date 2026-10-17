@@ -248,6 +248,50 @@ pub struct Config {
     #[dynamic(default)]
     pub scrollback_warm_fleet_max_mb: usize,
 
+    /// Byte budget (MiB) for scrollback rows queued behind the durability
+    /// writer, shared by every pane in the process. Past it, a pane's oldest
+    /// queued rows are dropped from durability and recorded as an explicit
+    /// gap marker instead of throttling the pane (ft-yccm0.2.1.6).
+    #[dynamic(default = "default_scrollback_durability_queue_max_mb")]
+    pub scrollback_durability_queue_max_mb: usize,
+
+    /// Commit window (ms) of the durability writer (ft-yccm0.2.1.2): a pane's
+    /// queued rows wait up to this long after the first one, then go to the
+    /// store in one transaction. 0 commits every request at once.
+    /// `FT_DURABILITY_COMMIT_WINDOW_MS` overrides it for A/B runs.
+    #[dynamic(
+        default = "default_scrollback_durability_commit_window_ms",
+        validate = "validate_scrollback_durability_commit_window_ms"
+    )]
+    pub scrollback_durability_commit_window_ms: u64,
+
+    /// A commit window closes early once this many MiB are queued.
+    #[dynamic(
+        default = "default_scrollback_durability_commit_window_mb",
+        validate = "validate_scrollback_durability_commit_window_mb"
+    )]
+    pub scrollback_durability_commit_window_mb: usize,
+
+    /// A commit window closes early once its pane has queued no row for
+    /// this many milliseconds (the burst ended).
+    #[dynamic(
+        default = "default_scrollback_durability_commit_idle_ms",
+        validate = "validate_scrollback_durability_commit_window_ms"
+    )]
+    pub scrollback_durability_commit_idle_ms: u64,
+
+    /// Shortest interval (ms) between two manifest publications of one pane
+    /// (ft-yccm0.2.1.2). Between them, each commit window appends its rows
+    /// under one sync and recovery adopts that durable tail; a publication
+    /// (also on pane close or flush) names it in a cumulative WAL. 0
+    /// publishes every transaction. `FT_DURABILITY_MANIFEST_PUBLISH_MS`
+    /// overrides it for A/B runs.
+    #[dynamic(
+        default = "default_scrollback_durability_manifest_publish_ms",
+        validate = "validate_scrollback_durability_manifest_publish_ms"
+    )]
+    pub scrollback_durability_manifest_publish_ms: u64,
+
     // -- Agent pane state detection --
     /// Enable agent pane state detection and visual indicators.
     #[dynamic(default = "default_true")]
@@ -573,6 +617,58 @@ pub struct Config {
     /// Default: 1MB (1048576).
     #[dynamic(default = "default_mux_socket_buffer_size")]
     pub mux_socket_buffer_size: usize,
+
+    /// Slots in each pane's reader -> parser byte ring (ft-yccm0.3.1.1).
+    /// The pane reader publishes PTY output into free slots and the parser
+    /// releases each slot once parsed. When every slot is full the reader
+    /// parks and stops reading, so the kernel throttles the child.
+    #[dynamic(
+        default = "default_mux_output_ring_slots",
+        validate = "validate_mux_output_ring_slots"
+    )]
+    pub mux_output_ring_slots: usize,
+
+    /// Bytes per slot of the reader -> parser byte ring (ft-yccm0.3.1.1).
+    #[dynamic(
+        default = "default_mux_output_ring_slot_bytes",
+        validate = "validate_mux_output_ring_slot_bytes"
+    )]
+    pub mux_output_ring_slot_bytes: usize,
+
+    /// Pane reader gather policy (ft-yccm0.3.1.2). A first read below this
+    /// many bytes is published at once, so interactive echo never waits.
+    /// From it on the reader keeps reading what is already there. macOS
+    /// returns about 1 KiB per PTY read under load, hence the default.
+    #[dynamic(
+        default = "default_mux_output_gather_min_bytes",
+        validate = "validate_mux_output_gather_min_bytes"
+    )]
+    pub mux_output_gather_min_bytes: usize,
+
+    /// Zero-timeout readiness checks before the gathering reader starts to
+    /// poll with a timeout (ft-yccm0.3.1.2).
+    #[dynamic(
+        default = "default_mux_output_gather_spin_checks",
+        validate = "validate_mux_output_gather_spin_checks"
+    )]
+    pub mux_output_gather_spin_checks: u32,
+
+    /// Longest single poll of a gathering reader, in microseconds
+    /// (ft-yccm0.3.1.2).
+    #[dynamic(
+        default = "default_mux_output_gather_poll_us",
+        validate = "validate_mux_output_gather_poll_us"
+    )]
+    pub mux_output_gather_poll_us: u64,
+
+    /// Total time a reader may gather one batch, in microseconds; 0 turns
+    /// gathering off (ft-yccm0.3.1.2). A full ring slot, EOF or an idle
+    /// parser end the batch sooner.
+    #[dynamic(
+        default = "default_mux_output_gather_max_wait_us",
+        validate = "validate_mux_output_gather_max_wait_us"
+    )]
+    pub mux_output_gather_max_wait_us: u64,
 
     /// Maximum bytes of output to hold during synchronized rendering mode
     /// before force-flushing. Prevents unbounded memory growth from buggy
@@ -1150,6 +1246,12 @@ pub struct Config {
     pub line_to_ele_shape_cache_size: usize,
     #[dynamic(default = "default_glyph_cache_image_cache_size")]
     pub glyph_cache_image_cache_size: usize,
+    /// Side in pixels of a window's first glyph atlas (ft-yccm0.2.6). It
+    /// grows by doubling within the GPU budget when full; starting large
+    /// avoids the rebuild-and-repaint cascade a small atlas goes through at
+    /// startup with a real font. Rounded up to a power of two.
+    #[dynamic(default = "default_glyph_atlas_initial_size")]
+    pub glyph_atlas_initial_size: usize,
 
     #[dynamic(default)]
     pub visual_bell: VisualBell,
@@ -2163,6 +2265,115 @@ fn default_mux_socket_buffer_size() -> usize {
     1024 * 1024
 }
 
+pub const MUX_OUTPUT_RING_SLOTS_RANGE: std::ops::RangeInclusive<usize> = 2..=1024;
+pub const MUX_OUTPUT_RING_SLOT_BYTES_RANGE: std::ops::RangeInclusive<usize> =
+    4 * 1024..=16 * 1024 * 1024;
+
+fn default_mux_output_ring_slots() -> usize {
+    8
+}
+
+fn default_mux_output_ring_slot_bytes() -> usize {
+    64 * 1024
+}
+
+fn validate_mux_output_ring_slots(value: &usize) -> Result<(), String> {
+    if MUX_OUTPUT_RING_SLOTS_RANGE.contains(value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "mux_output_ring_slots must be in {}..={}, got {}",
+            MUX_OUTPUT_RING_SLOTS_RANGE.start(),
+            MUX_OUTPUT_RING_SLOTS_RANGE.end(),
+            value
+        ))
+    }
+}
+
+pub const MUX_OUTPUT_GATHER_MIN_BYTES_RANGE: std::ops::RangeInclusive<usize> = 0..=1024 * 1024;
+pub const MUX_OUTPUT_GATHER_SPIN_CHECKS_RANGE: std::ops::RangeInclusive<u32> = 0..=1024;
+pub const MUX_OUTPUT_GATHER_POLL_US_RANGE: std::ops::RangeInclusive<u64> = 1..=100_000;
+pub const MUX_OUTPUT_GATHER_MAX_WAIT_US_RANGE: std::ops::RangeInclusive<u64> = 0..=100_000;
+
+fn default_mux_output_gather_min_bytes() -> usize {
+    1024
+}
+
+fn default_mux_output_gather_spin_checks() -> u32 {
+    16
+}
+
+fn default_mux_output_gather_poll_us() -> u64 {
+    1000
+}
+
+fn default_mux_output_gather_max_wait_us() -> u64 {
+    3000
+}
+
+fn validate_in_range<T: PartialOrd + std::fmt::Display>(
+    key: &str,
+    value: &T,
+    range: &std::ops::RangeInclusive<T>,
+) -> Result<(), String> {
+    if range.contains(value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} must be in {}..={}, got {}",
+            key,
+            range.start(),
+            range.end(),
+            value
+        ))
+    }
+}
+
+fn validate_mux_output_gather_min_bytes(value: &usize) -> Result<(), String> {
+    validate_in_range(
+        "mux_output_gather_min_bytes",
+        value,
+        &MUX_OUTPUT_GATHER_MIN_BYTES_RANGE,
+    )
+}
+
+fn validate_mux_output_gather_spin_checks(value: &u32) -> Result<(), String> {
+    validate_in_range(
+        "mux_output_gather_spin_checks",
+        value,
+        &MUX_OUTPUT_GATHER_SPIN_CHECKS_RANGE,
+    )
+}
+
+fn validate_mux_output_gather_poll_us(value: &u64) -> Result<(), String> {
+    validate_in_range(
+        "mux_output_gather_poll_us",
+        value,
+        &MUX_OUTPUT_GATHER_POLL_US_RANGE,
+    )
+}
+
+fn validate_mux_output_gather_max_wait_us(value: &u64) -> Result<(), String> {
+    validate_in_range(
+        "mux_output_gather_max_wait_us",
+        value,
+        &MUX_OUTPUT_GATHER_MAX_WAIT_US_RANGE,
+    )
+}
+
+fn validate_mux_output_ring_slot_bytes(value: &usize) -> Result<(), String> {
+    if MUX_OUTPUT_RING_SLOT_BYTES_RANGE.contains(value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "mux_output_ring_slot_bytes must be in {}..={}, got {}",
+            MUX_OUTPUT_RING_SLOT_BYTES_RANGE.start(),
+            MUX_OUTPUT_RING_SLOT_BYTES_RANGE.end(),
+            value
+        ))
+    }
+}
+
 fn default_osc52_write_policy() -> frankenterm_term::config::Osc52WritePolicy {
     frankenterm_term::config::Osc52WritePolicy::Prompt
 }
@@ -2317,6 +2528,64 @@ fn default_scrollback_warm_max_mb() -> usize {
     50
 }
 
+fn default_scrollback_durability_queue_max_mb() -> usize {
+    64
+}
+
+/// Longest durability commit window or idle threshold, in milliseconds.
+pub const MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MS: u64 = 5_000;
+/// Largest durability commit window, in MiB.
+pub const MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MB: usize = 256;
+
+fn default_scrollback_durability_commit_window_ms() -> u64 {
+    250
+}
+
+fn default_scrollback_durability_commit_window_mb() -> usize {
+    8
+}
+
+fn default_scrollback_durability_commit_idle_ms() -> u64 {
+    25
+}
+
+fn validate_scrollback_durability_commit_window_ms(value: &u64) -> Result<(), String> {
+    if *value <= MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MS {
+        Ok(())
+    } else {
+        Err(format!(
+            "durability commit times must be in 0..={MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MS} ms, got {value}"
+        ))
+    }
+}
+
+/// Longest interval between manifest publications, in milliseconds.
+pub const MAX_SCROLLBACK_DURABILITY_MANIFEST_PUBLISH_MS: u64 = 60_000;
+
+fn default_scrollback_durability_manifest_publish_ms() -> u64 {
+    1_000
+}
+
+fn validate_scrollback_durability_manifest_publish_ms(value: &u64) -> Result<(), String> {
+    if *value <= MAX_SCROLLBACK_DURABILITY_MANIFEST_PUBLISH_MS {
+        Ok(())
+    } else {
+        Err(format!(
+            "scrollback_durability_manifest_publish_ms must be in 0..={MAX_SCROLLBACK_DURABILITY_MANIFEST_PUBLISH_MS}, got {value}"
+        ))
+    }
+}
+
+fn validate_scrollback_durability_commit_window_mb(value: &usize) -> Result<(), String> {
+    if (1..=MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MB).contains(value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "scrollback_durability_commit_window_mb must be in 1..={MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MB}, got {value}"
+        ))
+    }
+}
+
 fn default_agent_active_threshold_ms() -> u64 {
     5_000
 }
@@ -2427,9 +2696,10 @@ pub const MIN_MAX_FPS: u64 = 1;
 
 /// Highest supported repaint-rate limit.
 ///
-/// Timer-backed window implementations use millisecond resolution. Limiting
-/// the configured rate to 1,000 keeps their interval strictly positive rather
-/// than turning throttling into a zero-duration reschedule loop.
+/// The repaint throttles sleep on the runtime's timer wheel, whose finest
+/// level ticks once per millisecond. Limiting the configured rate to 1,000
+/// keeps their interval at one tick or more rather than turning throttling
+/// into a zero-duration reschedule loop.
 pub const MAX_MAX_FPS: u64 = 1_000;
 
 fn validate_max_fps(value: &u64) -> Result<(), String> {
@@ -2442,17 +2712,20 @@ fn validate_max_fps(value: &u64) -> Result<(), String> {
     }
 }
 
-/// Convert a configured repaint-rate limit into a nonzero timer interval.
+/// Convert a configured repaint-rate limit into a nonzero repaint interval.
 ///
 /// Dynamic configuration rejects values outside [`MIN_MAX_FPS`] through
 /// [`MAX_MAX_FPS`]. The clamp is intentional defense in depth for internal
-/// callers that construct or mutate [`Config`] directly. Ceiling division is
-/// required here: rounding the millisecond interval down would allow the timer
-/// to exceed the configured frame-rate limit for non-divisors of 1,000.
+/// callers that construct or mutate [`Config`] directly.
+///
+/// The interval is exact to the nanosecond, rounded up so that paints spaced
+/// by it never exceed the configured rate: `max_fps = 60` gives 16,666,667 ns.
+/// Rounding up to whole milliseconds instead (17 ms) capped FrankenTerm at
+/// 58.8 FPS on a 60 Hz display, below its own default limit (ft-1w85m).
 #[must_use]
 pub fn frame_interval_for_max_fps(max_fps: u64) -> Duration {
     let bounded = max_fps.clamp(MIN_MAX_FPS, MAX_MAX_FPS);
-    Duration::from_millis(1_000_u64.div_ceil(bounded))
+    Duration::from_nanos(1_000_000_000_u64.div_ceil(bounded))
 }
 
 fn default_initial_rows() -> u16 {
@@ -3039,6 +3312,10 @@ fn default_glyph_cache_image_cache_size() -> usize {
     256
 }
 
+fn default_glyph_atlas_initial_size() -> usize {
+    1024
+}
+
 fn default_shape_cache_size() -> usize {
     1024
 }
@@ -3411,6 +3688,49 @@ mod tests {
     }
 
     #[test]
+    fn mux_output_ring_keys_default_inside_their_validated_ranges() {
+        assert!(validate_mux_output_ring_slots(&default_mux_output_ring_slots()).is_ok());
+        assert!(validate_mux_output_ring_slot_bytes(&default_mux_output_ring_slot_bytes()).is_ok());
+        for slots in [0, 1, 1025] {
+            assert!(validate_mux_output_ring_slots(&slots).is_err(), "{}", slots);
+        }
+        for bytes in [0, 4095, 16 * 1024 * 1024 + 1] {
+            assert!(
+                validate_mux_output_ring_slot_bytes(&bytes).is_err(),
+                "{}",
+                bytes
+            );
+        }
+        assert!(validate_mux_output_ring_slots(&2).is_ok());
+        assert!(validate_mux_output_ring_slot_bytes(&(16 * 1024 * 1024)).is_ok());
+    }
+
+    #[test]
+    fn mux_output_gather_keys_default_inside_their_validated_ranges() {
+        assert!(
+            validate_mux_output_gather_min_bytes(&default_mux_output_gather_min_bytes()).is_ok()
+        );
+        assert!(
+            validate_mux_output_gather_spin_checks(&default_mux_output_gather_spin_checks())
+                .is_ok()
+        );
+        assert!(validate_mux_output_gather_poll_us(&default_mux_output_gather_poll_us()).is_ok());
+        assert!(
+            validate_mux_output_gather_max_wait_us(&default_mux_output_gather_max_wait_us())
+                .is_ok()
+        );
+        assert!(validate_mux_output_gather_min_bytes(&(1024 * 1024 + 1)).is_err());
+        assert!(validate_mux_output_gather_spin_checks(&1025).is_err());
+        assert!(validate_mux_output_gather_poll_us(&0).is_err());
+        assert!(validate_mux_output_gather_poll_us(&100_001).is_err());
+        assert!(
+            validate_mux_output_gather_max_wait_us(&0).is_ok(),
+            "0 turns gathering off"
+        );
+        assert!(validate_mux_output_gather_max_wait_us(&100_001).is_err());
+    }
+
+    #[test]
     fn gui_retained_pane_state_budget_rejects_zero_and_accepts_large_fleets() {
         use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, Value};
         for limit in [0_u64, 1, 4096, 65_536] {
@@ -3450,6 +3770,35 @@ mod tests {
     }
 
     #[test]
+    fn durability_commit_window_keys_validate_their_ranges() {
+        let config = Config::default_config();
+        assert_eq!(config.scrollback_durability_commit_window_ms, 250);
+        assert_eq!(config.scrollback_durability_commit_window_mb, 8);
+        assert_eq!(config.scrollback_durability_commit_idle_ms, 25);
+        for ms in [0, 250, MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MS] {
+            assert!(validate_scrollback_durability_commit_window_ms(&ms).is_ok());
+        }
+        assert!(validate_scrollback_durability_commit_window_ms(
+            &(MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MS + 1)
+        )
+        .is_err());
+        for mb in [1, 8, MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MB] {
+            assert!(validate_scrollback_durability_commit_window_mb(&mb).is_ok());
+        }
+        for mb in [0, MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MB + 1] {
+            assert!(validate_scrollback_durability_commit_window_mb(&mb).is_err());
+        }
+        assert_eq!(config.scrollback_durability_manifest_publish_ms, 1_000);
+        for ms in [0, 1_000, MAX_SCROLLBACK_DURABILITY_MANIFEST_PUBLISH_MS] {
+            assert!(validate_scrollback_durability_manifest_publish_ms(&ms).is_ok());
+        }
+        assert!(validate_scrollback_durability_manifest_publish_ms(
+            &(MAX_SCROLLBACK_DURABILITY_MANIFEST_PUBLISH_MS + 1)
+        )
+        .is_err());
+    }
+
+    #[test]
     fn validate_max_fps_rejects_zero_and_upper_bound_plus_one() {
         assert!(validate_max_fps(&0).is_err());
         assert!(validate_max_fps(&(MAX_MAX_FPS + 1)).is_err());
@@ -3457,17 +3806,19 @@ mod tests {
 
     #[test]
     fn frame_interval_is_nonzero_for_valid_and_defensive_inputs() {
-        assert_eq!(frame_interval_for_max_fps(0), Duration::from_millis(1_000));
+        assert_eq!(frame_interval_for_max_fps(0), Duration::from_secs(1));
         assert_eq!(
             frame_interval_for_max_fps(MIN_MAX_FPS),
-            Duration::from_millis(1_000)
+            Duration::from_secs(1)
         );
         assert_eq!(
-            frame_interval_for_max_fps(default_max_fps()),
-            Duration::from_millis(17)
+            frame_interval_for_max_fps(3),
+            Duration::from_nanos(333_333_334)
         );
-        assert_eq!(frame_interval_for_max_fps(3), Duration::from_millis(334));
-        assert_eq!(frame_interval_for_max_fps(999), Duration::from_millis(2));
+        assert_eq!(
+            frame_interval_for_max_fps(999),
+            Duration::from_nanos(1_001_002)
+        );
         assert_eq!(
             frame_interval_for_max_fps(MAX_MAX_FPS),
             Duration::from_millis(1)
@@ -3478,16 +3829,73 @@ mod tests {
         );
     }
 
+    /// ft-1w85m: the interval is exact to the nanosecond, not whole
+    /// milliseconds. 17 ms for the default of 60 capped repaint at 58.8 FPS.
+    #[test]
+    fn frame_interval_is_nanosecond_exact_for_display_rates() {
+        assert_eq!(default_max_fps(), 60);
+        assert_eq!(
+            frame_interval_for_max_fps(60),
+            Duration::from_nanos(16_666_667)
+        );
+        assert_eq!(
+            frame_interval_for_max_fps(120),
+            Duration::from_nanos(8_333_334)
+        );
+        assert_eq!(
+            frame_interval_for_max_fps(144),
+            Duration::from_nanos(6_944_445)
+        );
+        assert_eq!(
+            frame_interval_for_max_fps(30),
+            Duration::from_nanos(33_333_334)
+        );
+        assert_eq!(frame_interval_for_max_fps(50), Duration::from_millis(20));
+        assert_eq!(
+            frame_interval_for_max_fps(240),
+            Duration::from_nanos(4_166_667)
+        );
+    }
+
+    /// Paints spaced by the interval reach every common refresh rate to
+    /// within a nanosecond per frame, so max_fps equal to the refresh rate
+    /// no longer caps repaint below the display.
+    #[test]
+    fn frame_interval_sustains_the_matching_refresh_rate() {
+        for hz in [
+            24_u64, 30, 48, 50, 59, 60, 75, 90, 100, 120, 144, 165, 240, 360,
+        ] {
+            let interval = frame_interval_for_max_fps(hz).as_nanos();
+            let one_second = 1_000_000_000_u128;
+            let frames = u128::from(hz);
+            assert!(
+                interval * frames >= one_second && interval * frames < one_second + frames,
+                "max_fps={}: {} frames of {} ns",
+                hz,
+                frames,
+                interval
+            );
+        }
+    }
+
     #[test]
     fn frame_interval_never_exceeds_the_valid_configured_rate() {
         for max_fps in MIN_MAX_FPS..=MAX_MAX_FPS {
-            let interval_ms = frame_interval_for_max_fps(max_fps).as_millis();
-            assert!(interval_ms > 0, "max_fps={}", max_fps);
+            let interval_ns = frame_interval_for_max_fps(max_fps).as_nanos();
+            let fps = u128::from(max_fps);
+            assert!(interval_ns > 0, "max_fps={}", max_fps);
             assert!(
-                interval_ms * u128::from(max_fps) >= 1_000,
-                "max_fps={}, interval_ms={}",
+                interval_ns * fps >= 1_000_000_000,
+                "max_fps={}, interval_ns={}",
                 max_fps,
-                interval_ms
+                interval_ns
+            );
+            // The tightest such interval: one nanosecond less would exceed it.
+            assert!(
+                (interval_ns - 1) * fps < 1_000_000_000,
+                "max_fps={}, interval_ns={}",
+                max_fps,
+                interval_ns
             );
         }
     }

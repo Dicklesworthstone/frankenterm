@@ -22,6 +22,59 @@ struct Cluster {
     attrs: CellAttributes,
 }
 
+/// Whether `c` belongs to a code point range whose Grapheme_Cluster_Break is
+/// Other or Extended_Pictographic. Such a char neither extends the grapheme
+/// before it nor is extended by the one after it (GB6-GB9c, GB11-GB13 all
+/// need a Control, Extend, ZWJ, SpacingMark, Prepend, Regional_Indicator,
+/// Hangul jamo or InCB consonant on one side). Covered: printable ASCII,
+/// Latin-1 (minus U+00AD) through Latin Extended, IPA and spacing modifiers,
+/// Greek, Cyrillic, general punctuation (minus the format controls), arrows
+/// through dingbats, braille, CJK symbols (minus U+302A-U+302F), kana (minus
+/// U+3099-U+309A), CJK ideographs, Hangul syllables, fullwidth forms (minus
+/// U+FF9E-U+FF9F) and the emoji blocks minus the skin-tone modifiers
+/// U+1F3FB-U+1F3FF. Anything else is treated as able to cluster.
+pub(crate) fn is_cluster_inert(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0x20..=0x7E
+            | 0xA0..=0xAC
+            | 0xAE..=0x2FF
+            | 0x370..=0x482
+            | 0x48A..=0x52F
+            | 0x2010..=0x2027
+            | 0x2030..=0x205E
+            | 0x2190..=0x27BF
+            | 0x2800..=0x28FF
+            | 0x3000..=0x3029
+            | 0x3030..=0x303F
+            | 0x3041..=0x3096
+            | 0x309B..=0x30FF
+            | 0x4E00..=0x9FFF
+            | 0xAC00..=0xD7A3
+            | 0xFF01..=0xFF9D
+            | 0x1F300..=0x1F3FA
+            | 0x1F400..=0x1F64F
+            | 0x1F680..=0x1F6FF
+            | 0x1F900..=0x1F9FF
+            | 0x1FA70..=0x1FAFF
+    )
+}
+
+/// Whether a grapheme boundary is guaranteed between a cell whose text ends
+/// in `prev` (`None` for the start of the line) and one starting with `next`.
+fn breaks_between(prev: Option<char>, next: char) -> bool {
+    prev.is_none_or(|prev| is_cluster_inert(prev) && is_cluster_inert(next))
+}
+
+/// The rule clustered storage appends by: whether a cell starting with
+/// `next` may follow one ending in `prev` (`None` at the start of the line)
+/// without the two clustering into one grapheme. The PageGrid engine
+/// mirrors which rows stay clustered with it (ft-yccm0.3.3.4).
+#[doc(hidden)]
+pub fn clustered_append_breaks(prev: Option<char>, next: char) -> bool {
+    breaks_between(prev, next)
+}
+
 /// Stores line data as a contiguous string and a series of
 /// clusters of attribute data describing attributed ranges
 /// within the line
@@ -181,18 +234,25 @@ impl<'de> Deserialize<'de> for ClusteredLine {
 /// the thesis is that most of the cells on a given line are single width.
 /// That may not be strictly true for users that heavily use asian scripts,
 /// but we'll start with this and see if we need to improve it.
+///
+/// The indices go straight from the bitset into the sequence, the same bytes
+/// a `Vec<usize>` of them serializes to, without collecting that vector: the
+/// durable scrollback writer serializes every wide row (ft-yccm0.2.1.4).
 #[cfg(feature = "use_serde")]
 fn serialize_bitset<S>(value: &Option<Box<FixedBitSet>>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
-    let mut wide_indices: Vec<usize> = vec![];
+    use serde::ser::SerializeSeq as _;
+
+    let ones = value.as_ref().map_or(0, |bits| bits.count_ones(..));
+    let mut wide_indices = serializer.serialize_seq(Some(ones))?;
     if let Some(bits) = value {
         for idx in bits.ones() {
-            wide_indices.push(idx);
+            wide_indices.serialize_element(&idx)?;
         }
     }
-    wide_indices.serialize(serializer)
+    wide_indices.end()
 }
 
 impl ClusteredLine {
@@ -257,16 +317,48 @@ impl ClusteredLine {
     }
 
     pub fn from_cell_vec<'a>(hint: usize, iter: impl Iterator<Item = CellRef<'a>>) -> Self {
+        Self::build(hint, iter, false).0
+    }
+
+    /// [`Self::from_cell_vec`], built for `compress_for_scrollback`
+    /// (ft-yccm0.3.2.6), which returns the same line:
+    /// - also returns whether every boundary between neighbouring cells is
+    ///   inert, the cheap pass of [`Self::reproduces`], so that a caller
+    ///   re-segments only when it is not;
+    /// - sizes the clusters for one per cell and trims them to fit at the
+    ///   end, and starts the text with a byte per cell, where both grew by
+    ///   doubling (a T0 row's 60 to 120 clusters reallocated six times).
+    pub fn from_cells_checked<'a>(
+        hint: usize,
+        iter: impl Iterator<Item = CellRef<'a>>,
+    ) -> (Self, bool) {
+        Self::build(hint, iter, true)
+    }
+
+    fn build<'a>(
+        hint: usize,
+        iter: impl Iterator<Item = CellRef<'a>>,
+        presize: bool,
+    ) -> (Self, bool) {
         let mut last_cluster: Option<Cluster> = None;
         let mut is_double_wide = FixedBitSet::with_capacity(hint);
         // Attribute cloning and cluster growth happen after text append in the
         // loop below and may unwind.  Guard the builder from its first
         // allocation until the complete ClusteredLine can take ownership.
         let mut text = Zeroizing::new(String::new());
-        let mut clusters = vec![];
+        let mut clusters = if presize {
+            guarded_reserve_text(&mut text, hint);
+            Vec::with_capacity(hint)
+        } else {
+            vec![]
+        };
         let mut any_double = false;
         let mut len = 0usize;
         let mut last_cell_width = None;
+        // As the first pass of `reproduces`: the last char so far, and
+        // whether every boundary so far is inert.
+        let mut prev_char = None;
+        let mut inert = true;
 
         for cell in iter {
             let cell_width = Self::normalize_cell_width(cell.width());
@@ -276,6 +368,16 @@ impl ClusteredLine {
             if cell_width > 1 {
                 any_double = true;
                 is_double_wide.set(cell.cell_index(), true);
+            }
+
+            if inert {
+                let cell_text = cell.str();
+                match cell_text.chars().next() {
+                    Some(first) if breaks_between(prev_char, first) => {
+                        prev_char = cell_text.chars().next_back();
+                    }
+                    _ => inert = false,
+                }
             }
 
             guarded_push_str(&mut text, cell.str());
@@ -311,6 +413,9 @@ impl ClusteredLine {
         if let Some(cluster) = last_cluster.take() {
             clusters.push(cluster);
         }
+        if presize {
+            clusters.shrink_to_fit();
+        }
 
         // Box allocation is the final potentially panicking construction
         // step; complete it while the accumulated text is still guarded.
@@ -320,17 +425,210 @@ impl ClusteredLine {
             None
         };
 
-        Self {
+        let line = Self {
             text: core::mem::take(&mut *text),
             is_double_wide,
             clusters,
             len: len.min(u32::MAX as usize) as u32,
             last_cell_width,
+        };
+        (line, inert)
+    }
+
+    /// [`Self::from_cells_checked`] over a vector row's own cells, which it
+    /// returns the same line and inertness for (ft-951ev). It steps over the
+    /// slice as visible iteration does (a cell, then past the columns its
+    /// width covers) without building a `CellRef` per cell. A first pass
+    /// sums the visible cells' text, so the text is reserved once, exactly:
+    /// growing it copied the text and zeroized the old buffer each time (a
+    /// T0 row's ~300 bytes from a one-byte-per-cell start), and left up to
+    /// twice the bytes in every warm row. The clusters are reserved for the
+    /// visible cells. And each boundary looks up one character's inertness,
+    /// carrying the last one's to the next boundary, where it looked up two.
+    pub fn from_cell_slice_checked(hint: usize, cells: &[Cell]) -> (Self, bool) {
+        let (mut text_bytes, mut visible) = (0usize, 0usize);
+        let mut index = 0;
+        while let Some(cell) = cells.get(index) {
+            text_bytes = text_bytes.saturating_add(cell.str().len());
+            visible += 1;
+            index += cell.width().max(1);
         }
+
+        let mut is_double_wide = FixedBitSet::with_capacity(hint);
+        // As in `build`: guard the text from its first allocation.
+        let mut text = Zeroizing::new(String::new());
+        guarded_reserve_text(&mut text, text_bytes);
+        let mut clusters: Vec<Cluster> = Vec::with_capacity(visible);
+        let mut last_cluster: Option<Cluster> = None;
+        let mut any_double = false;
+        let mut len = 0usize;
+        let mut last_cell_width = None;
+        // Whether the last char so far is inert (None at the line's start),
+        // and whether every boundary so far is.
+        let mut prev_inert: Option<bool> = None;
+        let mut inert = true;
+
+        let mut index = 0;
+        while let Some(cell) = cells.get(index) {
+            let cell_index = index;
+            let width = cell.width();
+            index += width.max(1);
+            let cell_width = Self::normalize_cell_width(width);
+            len = len.saturating_add(usize::from(cell_width));
+            last_cell_width = NonZeroU8::new(cell_width as u8);
+
+            if cell_width > 1 {
+                any_double = true;
+                is_double_wide.set(cell_index, true);
+            }
+
+            let cell_text = cell.str();
+            if inert {
+                let mut chars = cell_text.chars();
+                match chars.next() {
+                    Some(first) => {
+                        let first_inert = is_cluster_inert(first);
+                        if prev_inert.is_some_and(|prev| !(prev && first_inert)) {
+                            inert = false;
+                        } else {
+                            prev_inert = Some(match chars.next_back() {
+                                Some(last) => is_cluster_inert(last),
+                                None => first_inert,
+                            });
+                        }
+                    }
+                    None => inert = false,
+                }
+            }
+
+            guarded_push_str(&mut text, cell_text);
+
+            last_cluster = match last_cluster.take() {
+                None => Some(Cluster {
+                    cell_width,
+                    attrs: cell.attrs().clone(),
+                }),
+                Some(cluster) if cluster.attrs != *cell.attrs() => {
+                    clusters.push(cluster);
+                    Some(Cluster {
+                        cell_width,
+                        attrs: cell.attrs().clone(),
+                    })
+                }
+                Some(mut cluster) => match cluster.cell_width.checked_add(cell_width) {
+                    Some(width) => {
+                        cluster.cell_width = width;
+                        Some(cluster)
+                    }
+                    None => {
+                        clusters.push(cluster);
+                        Some(Cluster {
+                            cell_width,
+                            attrs: cell.attrs().clone(),
+                        })
+                    }
+                },
+            };
+        }
+
+        if let Some(cluster) = last_cluster.take() {
+            clusters.push(cluster);
+        }
+        clusters.shrink_to_fit();
+
+        let is_double_wide = if any_double {
+            Some(Box::new(is_double_wide))
+        } else {
+            None
+        };
+
+        let line = Self {
+            text: core::mem::take(&mut *text),
+            is_double_wide,
+            clusters,
+            len: len.min(u32::MAX as usize) as u32,
+            last_cell_width,
+        };
+        (line, inert)
     }
 
     pub fn len(&self) -> usize {
         self.len as usize
+    }
+
+    /// Whether the clusters hold no spare capacity.
+    #[cfg(test)]
+    pub(crate) fn clusters_fit(&self) -> bool {
+        self.clusters.capacity() == self.clusters.len()
+    }
+
+    /// Whether a cell holding the grapheme `text` may be appended at cell
+    /// `idx` (at or past the end; blanks fill any gap first) so that the
+    /// concatenated text still segments into exactly this line's cells.
+    ///
+    /// Iteration re-runs `Graphemes` over the concatenated text, while `len`
+    /// counts the widths appended. Appending a regional indicator after its
+    /// partner, a skin-tone modifier after an emoji, or anything else that
+    /// clusters with the previous cell would merge the two on iteration, so
+    /// `len` would exceed the cells the line yields. Callers then index past
+    /// the materialized cells (DCH after a split flag emoji panicked in
+    /// `Line::erase_cell_with_margin`). Such writes must use vector storage.
+    pub fn can_append_cell_at(&self, idx: usize, text: &str) -> bool {
+        let len = self.len();
+        if idx < len {
+            return false;
+        }
+        let first = match text.chars().next() {
+            Some(first) => first,
+            None => return false,
+        };
+        let mut prev = self.text.chars().next_back();
+        if idx > len {
+            if !breaks_between(prev, ' ') {
+                return false;
+            }
+            prev = Some(' ');
+        }
+        breaks_between(prev, first)
+    }
+
+    /// Whether iterating this line yields exactly `cells`: the same
+    /// graphemes with the same widths, in order. A clustered line built from
+    /// cells whose neighbours cluster with each other would not.
+    ///
+    /// `cells` yields a fresh iterator per pass: a cheap pass checks that
+    /// every boundary is inert, and only a failure pays for re-segmenting.
+    pub fn reproduces<'a, I>(&self, cells: impl Fn() -> I) -> bool
+    where
+        I: Iterator<Item = CellRef<'a>>,
+    {
+        let mut prev = None;
+        let mut inert = true;
+        for cell in cells() {
+            let text = cell.str();
+            match text.chars().next() {
+                Some(first) if breaks_between(prev, first) => {}
+                _ => {
+                    inert = false;
+                    break;
+                }
+            }
+            prev = text.chars().next_back();
+        }
+        if inert {
+            return true;
+        }
+        let mut own = self.iter();
+        for cell in cells() {
+            match own.next() {
+                Some(mine)
+                    if mine.str() == cell.str()
+                        && mine.width()
+                            == usize::from(Self::normalize_cell_width(cell.width())) => {}
+                _ => return false,
+            }
+        }
+        own.next().is_none()
     }
 
     fn is_double_wide(&self, cell_index: usize) -> bool {
@@ -401,43 +699,61 @@ impl ClusteredLine {
             return;
         }
         guarded_reserve_text(&mut self.text, text.len());
-
-        const MAX_CLUSTER_CELL_WIDTH: usize = u16::MAX as usize;
-        let mut remaining = text;
-        while !remaining.is_empty() {
-            let appended_to_last = match self.clusters.last_mut() {
-                Some(cluster) if cluster.attrs == attrs => {
-                    let available =
-                        MAX_CLUSTER_CELL_WIDTH.saturating_sub(cluster.cell_width as usize);
-                    if available == 0 {
-                        0
-                    } else {
-                        let take = remaining.len().min(available);
-                        cluster.cell_width += take as u16;
-                        take
-                    }
-                }
-                _ => 0,
-            };
-
-            if appended_to_last > 0 {
-                remaining = &remaining[appended_to_last..];
-                continue;
-            }
-
-            let take = remaining.len().min(MAX_CLUSTER_CELL_WIDTH);
-            self.clusters.push(Cluster {
-                cell_width: take as u16,
-                attrs: attrs.clone(),
-            });
-            remaining = &remaining[take..];
-        }
-
+        self.extend_clusters(text.len(), &attrs);
         self.text.push_str(text);
         self.last_cell_width = NonZeroU8::new(1);
         self.len = self
             .len
             .saturating_add(text.len().min(u32::MAX as usize) as u32);
+    }
+
+    /// Appends `count` blank cells: what `append_grapheme(" ", 1,
+    /// CellAttributes::blank())` does `count` times, in one step
+    /// (ft-70s4z). Writing a cell past the end of a line fills the gap with
+    /// these, and a cell at a far column used to pay a detach, a capacity
+    /// check and an attribute comparison per blank.
+    pub fn append_blank_cells(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        guarded_reserve_text(&mut self.text, count);
+        self.extend_clusters(count, &CellAttributes::blank());
+        self.text.extend(core::iter::repeat_n(' ', count));
+        self.last_cell_width = NonZeroU8::new(1);
+        self.len = self.len.saturating_add(count.min(u32::MAX as usize) as u32);
+    }
+
+    /// Accounts `count` width-1 cells with `attrs` to the attribute runs:
+    /// the last run grows while its attributes match and it has room, then
+    /// new runs of at most `u16::MAX` cells follow. One cell at a time
+    /// through `append_grapheme` builds exactly the same runs.
+    fn extend_clusters(&mut self, count: usize, attrs: &CellAttributes) {
+        const MAX_CLUSTER_CELL_WIDTH: usize = u16::MAX as usize;
+        let mut remaining = count;
+        while remaining > 0 {
+            let appended_to_last = match self.clusters.last_mut() {
+                Some(cluster) if cluster.attrs == *attrs => {
+                    let available =
+                        MAX_CLUSTER_CELL_WIDTH.saturating_sub(cluster.cell_width as usize);
+                    let take = remaining.min(available);
+                    cluster.cell_width += take as u16;
+                    take
+                }
+                _ => 0,
+            };
+
+            if appended_to_last > 0 {
+                remaining -= appended_to_last;
+                continue;
+            }
+
+            let take = remaining.min(MAX_CLUSTER_CELL_WIDTH);
+            self.clusters.push(Cluster {
+                cell_width: take as u16,
+                attrs: attrs.clone(),
+            });
+            remaining -= take;
+        }
     }
 
     pub fn append(&mut self, cell: Cell) {
@@ -722,6 +1038,42 @@ mod test {
         );
     }
 
+    /// The wide-cell indices serialize straight from the bitset exactly as
+    /// the vector of them that serialize_bitset used to collect.
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn wide_mask_serializes_the_indices_a_collected_vector_would() {
+        #[derive(Serialize)]
+        struct Collected<'a> {
+            text: &'a str,
+            is_double_wide: Vec<usize>,
+            clusters: &'a [Cluster],
+            len: u32,
+            last_cell_width: Option<NonZeroU8>,
+        }
+
+        for text in ["a界 b界界", "界", "abc", ""] {
+            let source = crate::line::Line::from_text(text, &CellAttributes::blank(), 1, None);
+            let line = ClusteredLine::from_cell_vec(source.len(), source.visible_cells());
+            let collected = Collected {
+                text: &line.text,
+                is_double_wide: line
+                    .is_double_wide
+                    .as_ref()
+                    .map(|bits| bits.ones().collect())
+                    .unwrap_or_default(),
+                clusters: &line.clusters,
+                len: line.len,
+                last_cell_width: line.last_cell_width,
+            };
+            assert_eq!(
+                serde_json::to_string(&line).unwrap(),
+                serde_json::to_string(&collected).unwrap(),
+                "{text:?}"
+            );
+        }
+    }
+
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn memory_usage() {
@@ -872,5 +1224,49 @@ mod test {
             GUARDED_LINE_TEXT_WIPE_INVOCATIONS.load(core::sync::atomic::Ordering::Relaxed) > before,
             "a later-field serde error must drop and wipe the decoded text guard"
         );
+    }
+
+    /// ft-70s4z: `append_blank_cells(n)` builds exactly the line `n` single
+    /// blank `append_grapheme` calls build, after every kind of tail: none,
+    /// a blank run, another attribute, a wide cell, and a run one cell short
+    /// of `u16::MAX` (so the bulk fill crosses into new runs).
+    #[test]
+    fn append_blank_cells_matches_one_blank_at_a_time() {
+        let mut bold = CellAttributes::blank();
+        bold.set_intensity(frankenterm_cell::Intensity::Bold);
+        let mut starts = vec![ClusteredLine::new()];
+        let mut blank_tail = ClusteredLine::new();
+        blank_tail.append_ascii_run("ab ", CellAttributes::blank());
+        starts.push(blank_tail);
+        let mut bold_tail = ClusteredLine::new();
+        bold_tail.append_ascii_run("abc", bold.clone());
+        starts.push(bold_tail);
+        let mut wide_tail = ClusteredLine::new();
+        wide_tail.append_grapheme("\u{4e2d}", 2, bold);
+        starts.push(wide_tail);
+        let mut nearly_full = ClusteredLine::new();
+        for _ in 0..u16::MAX - 1 {
+            nearly_full.append_grapheme(" ", 1, CellAttributes::blank());
+        }
+        starts.push(nearly_full);
+
+        for (which, start) in starts.iter().enumerate() {
+            for count in [0usize, 1, 2, 7, 70_000] {
+                let mut bulk = start.clone();
+                bulk.append_blank_cells(count);
+                let mut single = start.clone();
+                for _ in 0..count {
+                    single.append_grapheme(" ", 1, CellAttributes::blank());
+                }
+                assert!(
+                    bulk == single,
+                    "start {} count {}: bulk {} runs, single {} runs",
+                    which,
+                    count,
+                    bulk.clusters.len(),
+                    single.clusters.len()
+                );
+            }
+        }
     }
 }

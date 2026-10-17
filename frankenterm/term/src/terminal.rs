@@ -1,8 +1,10 @@
 use super::*;
 use crate::terminalstate::performer::Performer;
-use frankenterm_escape_parser::parser::Parser;
+use frankenterm_escape_parser::csi::Sgr;
 #[cfg(feature = "use_serde")]
 use frankenterm_escape_parser::parser::RecoveryGroundBoundary;
+use frankenterm_escape_parser::parser::{Handler, Parser};
+use frankenterm_escape_parser::{Action, CSI};
 #[cfg(feature = "use_serde")]
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,6 +22,93 @@ pub const RECOVERY_TERMINAL_REPLAY_SEMANTICS_ID: &str =
 pub enum ClipboardSelection {
     Clipboard,
     PrimarySelection,
+}
+
+/// Decides which actions [`Terminal::feed`] must not apply itself
+/// (ft-yccm0.3.2.1): an embedder diverts the actions it has to handle around
+/// the terminal, such as those that need alert admission first.
+pub trait FeedGate {
+    /// Whether `action` leaves the fused path. Printing never does.
+    fn diverts(&mut self, action: &Action) -> bool;
+
+    /// [`FeedGate::diverts`] for `Action::CSI(CSI::Sgr(sgr))`, which the
+    /// parser's CSI fast path hands over without building the `Action`
+    /// (ft-yccm0.3.2.4). A gate that never diverts SGR can answer without
+    /// building one.
+    fn diverts_sgr(&mut self, sgr: &Sgr) -> bool {
+        self.diverts(&Action::CSI(CSI::Sgr(sgr.clone())))
+    }
+}
+
+/// Applies actions through the performer until the gate diverts one, then
+/// collects that action and the rest in order.
+struct FeedHandler<'s, 'f, G: FeedGate + ?Sized> {
+    performer: Performer<'s>,
+    gate: &'f mut G,
+    diverted: &'f mut Vec<Action>,
+    diverting: bool,
+    applied: bool,
+}
+
+impl<'s, 'f, G: FeedGate + ?Sized> Handler for FeedHandler<'s, 'f, G> {
+    fn action(&mut self, action: Action) {
+        if !self.diverting && !self.gate.diverts(&action) {
+            self.applied = true;
+            self.performer.perform(action);
+        } else {
+            self.diverting = true;
+            self.diverted.push(action);
+        }
+    }
+
+    #[inline]
+    fn print(&mut self, c: char) {
+        if self.diverting {
+            self.diverted.push(Action::Print(c));
+        } else {
+            self.applied = true;
+            Handler::print(&mut self.performer, c);
+        }
+    }
+
+    #[inline]
+    fn print_str(&mut self, text: &str) {
+        if self.diverting {
+            self.diverted.push(Action::PrintString(text.to_string()));
+        } else {
+            self.applied = true;
+            Handler::print_str(&mut self.performer, text);
+        }
+    }
+
+    #[inline]
+    fn print_ascii_run(&mut self, run: &str) {
+        if self.diverting {
+            self.diverted.push(Action::PrintString(run.to_string()));
+        } else {
+            self.applied = true;
+            Handler::print_ascii_run(&mut self.performer, run);
+        }
+    }
+
+    /// Offers each setting to the gate in order, as `action` offers each
+    /// action, and applies the run up to the first one it diverts.
+    fn sgr(&mut self, sgrs: &[Sgr]) {
+        let mut admitted = 0;
+        if !self.diverting {
+            while admitted < sgrs.len() && !self.gate.diverts_sgr(&sgrs[admitted]) {
+                admitted += 1;
+            }
+            if admitted > 0 {
+                self.applied = true;
+                Handler::sgr(&mut self.performer, &sgrs[..admitted]);
+            }
+            self.diverting = admitted < sgrs.len();
+        }
+        for sgr in &sgrs[admitted..] {
+            self.diverted.push(Action::CSI(CSI::Sgr(sgr.clone())));
+        }
+    }
 }
 
 pub trait Clipboard: Send + Sync {
@@ -1160,12 +1249,14 @@ impl Terminal {
     /// The output is parsed and applied to the terminal model.
     pub fn advance_bytes<B: AsRef<[u8]>>(&mut self, bytes: B) {
         self.state.increment_seqno();
+        self.state.refresh_batch_config();
         {
             let bytes = bytes.as_ref();
 
             let mut performer = Performer::new(&mut self.state);
 
-            self.parser.parse(bytes, |action| performer.perform(action));
+            // Fused: the parser drives the performer directly (ft-yccm0.3.2.1).
+            self.parser.parse_with(bytes, &mut performer);
         }
         if let Some(error) = self.parser.take_string_sequence_error() {
             log::warn!(
@@ -1175,18 +1266,266 @@ impl Terminal {
         self.trigger_unseen_output_notif();
     }
 
+    /// The fused path for an embedder that owns the parser, such as the mux
+    /// parse thread (ft-yccm0.3.2.1). Parses `bytes` with `parser` and
+    /// applies each action as it is decoded, storing none.
+    ///
+    /// At the first action `gate` diverts, application stops: that action and
+    /// every later one decoded from `bytes` go to `diverted`, in order, for the
+    /// embedder to apply itself (for example with [`Self::perform_actions`]
+    /// after admission). Buffered print is flushed before `feed` returns, so
+    /// diverted actions apply after everything `feed` applied. Returns
+    /// whether any action was applied. Like [`Self::perform_actions`], this
+    /// leaves the parser's string-sequence errors to the caller.
+    pub fn feed<G: FeedGate + ?Sized>(
+        &mut self,
+        parser: &mut Parser,
+        bytes: &[u8],
+        gate: &mut G,
+        diverted: &mut Vec<Action>,
+    ) -> bool {
+        self.begin_output_batch();
+        let outcome = self.feed_in_batch(parser, bytes, gate, diverted);
+        if outcome.applied {
+            self.finish_output_batch();
+        }
+        outcome.applied
+    }
+
+    /// Starts one output batch (ft-yccm0.2.3): a new sequence number for the
+    /// lines it changes, and the batch's configuration snapshot. A sliced
+    /// application starts one per terminal-lock hold, so a reader that took
+    /// the lock between slices sees every later change as new.
+    pub fn begin_output_batch(&mut self) {
+        self.state.increment_seqno();
+        self.state.refresh_batch_config();
+    }
+
+    /// Ends the output of one chunk (ft-yccm0.2.3): raises the unseen-output
+    /// alert at most once for it, however many slices applied it.
+    pub fn finish_output_batch(&mut self) {
+        self.trigger_unseen_output_notif();
+    }
+
+    /// [`Self::feed`] within the current output batch (ft-yccm0.2.3): neither
+    /// starts a batch nor raises the unseen-output alert.
+    pub fn feed_in_batch<G: FeedGate + ?Sized>(
+        &mut self,
+        parser: &mut Parser,
+        bytes: &[u8],
+        gate: &mut G,
+        diverted: &mut Vec<Action>,
+    ) -> FeedOutcome {
+        let mut handler = FeedHandler {
+            performer: Performer::new(&mut self.state),
+            gate,
+            diverted,
+            diverting: false,
+            applied: false,
+        };
+        parser.parse_with(bytes, &mut handler);
+        FeedOutcome {
+            applied: handler.applied,
+            diverting: handler.diverting,
+        }
+    }
+
     pub fn perform_actions(&mut self, actions: Vec<frankenterm_escape_parser::Action>) {
         if actions.is_empty() {
             return;
         }
-        self.state.increment_seqno();
-        {
-            let mut performer = Performer::new(&mut self.state);
-            for action in actions {
-                performer.perform(action);
+        self.begin_output_batch();
+        self.perform_actions_in_batch(&mut actions.into_iter(), &mut || false);
+        self.finish_output_batch();
+    }
+
+    /// Applies `actions` in order within the current output batch
+    /// (ft-yccm0.2.3), stopping early when `yield_now`, asked after every
+    /// [`ACTIONS_PER_YIELD_CHECK`]-th non-print action, says to. Every
+    /// non-print action flushes buffered print before it runs, so a stop
+    /// never splits a grapheme. Returns whether every action was applied;
+    /// otherwise the rest remain in `actions`.
+    pub fn perform_actions_in_batch(
+        &mut self,
+        actions: &mut std::vec::IntoIter<Action>,
+        yield_now: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        let mut performer = Performer::new(&mut self.state);
+        let mut unchecked = 0;
+        while let Some(action) = actions.next() {
+            let prints = matches!(action, Action::Print(_) | Action::PrintString(_));
+            performer.perform(action);
+            if prints || actions.as_slice().is_empty() {
+                continue;
+            }
+            unchecked += 1;
+            if unchecked == ACTIONS_PER_YIELD_CHECK {
+                unchecked = 0;
+                if yield_now() {
+                    return false;
+                }
             }
         }
-        self.trigger_unseen_output_notif();
+        true
+    }
+}
+
+/// What [`Terminal::feed_in_batch`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeedOutcome {
+    /// Whether any action was applied.
+    pub applied: bool,
+    /// Whether the gate diverted an action: it and everything after it went
+    /// to `diverted`.
+    pub diverting: bool,
+}
+
+/// Non-print actions [`Terminal::perform_actions_in_batch`] applies between
+/// checks for a waiting locker (ft-yccm0.2.3): the check reads the clock, too
+/// costly per action on SGR-heavy output (tens of thousands of actions a
+/// batch), while sixteen actions take microseconds.
+pub const ACTIONS_PER_YIELD_CHECK: usize = 16;
+
+/// Bytes a sliced feed parses between checks for a waiting locker
+/// (ft-yccm0.2.3). A locker that registers demand waits at most for the slice
+/// in progress, so this bounds that wait; the check is one clock read and
+/// one atomic load per slice.
+pub const FEED_SLICE_BYTES: usize = 1024;
+
+/// Where a slice of `bytes` that starts at `start` ends (ft-yccm0.2.3): just
+/// before the first control byte (ESC or another C0) at or after
+/// `start + slice_bytes`, or at the end of `bytes` when there is none.
+///
+/// A control byte flushes buffered print before it acts, so ending a slice
+/// there splits no grapheme and reorders nothing; and a slice that ends
+/// inside an escape sequence or string leaves the parser off ground, which
+/// [`SlicedFeed`] never yields at.
+pub fn feed_slice_end(bytes: &[u8], start: usize, slice_bytes: usize) -> usize {
+    let target = start.saturating_add(slice_bytes.max(1));
+    if target >= bytes.len() {
+        return bytes.len();
+    }
+    bytes[target..]
+        .iter()
+        .position(|&byte| byte < 0x20)
+        .map_or(bytes.len(), |at| target + at)
+}
+
+/// Whether a sliced application stopped to hand the terminal over, or
+/// finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SliceProgress {
+    /// Stopped at a clean boundary; call `run` again, under a new lock hold,
+    /// to continue.
+    Yielded,
+    /// Everything is applied (or diverted).
+    Done,
+}
+
+/// One chunk of output, fed into the terminal in slices so that the parser
+/// can hand the terminal lock to a waiting reader between them
+/// (ft-yccm0.2.3).
+///
+/// Each [`Self::run`] is one lock hold and one output batch. It yields only
+/// at a slice end ([`feed_slice_end`]) where the parser is at ground: no
+/// escape sequence, string or UTF-8 character is in flight, no grapheme is
+/// half printed, and the parser's position (its checkpoint watermark)
+/// counts every byte fed so far. Applying the chunk in slices therefore
+/// gives the same terminal state as applying it at once. This is what the
+/// completed-line boundaries of ft-8r43i.1.3 could not promise: they split
+/// graphemes and broke seqno and checkpoint ordering. Once the gate diverts
+/// an action, the rest of the chunk goes to `diverted` in order and the
+/// feed is done.
+pub struct SlicedFeed<'b> {
+    bytes: &'b [u8],
+    offset: usize,
+    slice_bytes: usize,
+    applied: bool,
+}
+
+impl<'b> SlicedFeed<'b> {
+    pub fn new(bytes: &'b [u8], slice_bytes: usize) -> Self {
+        Self {
+            bytes,
+            offset: 0,
+            slice_bytes,
+            applied: false,
+        }
+    }
+
+    /// Bytes fed (or diverted) so far.
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// Feeds slices into `terminal` as one output batch until the chunk is
+    /// done, or until `yield_now`, asked at each clean boundary, returns
+    /// true.
+    pub fn run<G: FeedGate + ?Sized>(
+        &mut self,
+        terminal: &mut Terminal,
+        parser: &mut Parser,
+        gate: &mut G,
+        diverted: &mut Vec<Action>,
+        yield_now: &mut dyn FnMut() -> bool,
+    ) -> SliceProgress {
+        terminal.begin_output_batch();
+        while self.offset < self.bytes.len() {
+            let end = feed_slice_end(self.bytes, self.offset, self.slice_bytes);
+            let outcome =
+                terminal.feed_in_batch(parser, &self.bytes[self.offset..end], gate, diverted);
+            self.applied |= outcome.applied;
+            self.offset = end;
+            if outcome.diverting {
+                // Everything after a diverted action is diverted as well, in
+                // order, without touching the terminal.
+                parser.parse(&self.bytes[self.offset..], |action| diverted.push(action));
+                self.offset = self.bytes.len();
+                break;
+            }
+            if self.offset < self.bytes.len() && parser.is_recovery_ground() && yield_now() {
+                return SliceProgress::Yielded;
+            }
+        }
+        if self.applied {
+            terminal.finish_output_batch();
+        }
+        SliceProgress::Done
+    }
+}
+
+/// [`SlicedFeed`] for a parsed batch of actions, the two-stage path
+/// (ft-yccm0.2.3): each [`Self::run`] is one lock hold and one output batch,
+/// and yields only after a non-print action, with the continuation owning
+/// the remaining actions, so order is kept and no grapheme is split.
+pub struct SlicedActions {
+    actions: std::vec::IntoIter<Action>,
+}
+
+impl SlicedActions {
+    pub fn new(actions: Vec<Action>) -> Self {
+        Self {
+            actions: actions.into_iter(),
+        }
+    }
+
+    /// Actions not applied yet.
+    pub fn remaining(&self) -> usize {
+        self.actions.len()
+    }
+
+    pub fn run(
+        &mut self,
+        terminal: &mut Terminal,
+        yield_now: &mut dyn FnMut() -> bool,
+    ) -> SliceProgress {
+        terminal.begin_output_batch();
+        if terminal.perform_actions_in_batch(&mut self.actions, yield_now) {
+            terminal.finish_output_batch();
+            SliceProgress::Done
+        } else {
+            SliceProgress::Yielded
+        }
     }
 }
 
@@ -2354,5 +2693,159 @@ mod tests {
                 term.screen().scrollback_rows(),
             );
         }
+    }
+
+    /// ft-70s4z: printing leaves no second owner on any row's clustered
+    /// storage; with one, every write would copy the whole row. The stream is
+    /// seq's output without carriage returns, as the M.1 seq corpus has it,
+    /// so each number lands further right on a fresh row and the gap before
+    /// it is filled in.
+    #[test]
+    fn printed_rows_keep_their_clustered_storage_unshared() {
+        let mut term = make_scrollback_prop_term(24, 120, 200);
+        let mut bytes = Vec::new();
+        for n in 1..3000 {
+            bytes.extend_from_slice(format!("{}\n", n).as_bytes());
+        }
+        for chunk in bytes.chunks(4096) {
+            term.advance_bytes(chunk);
+        }
+
+        let screen = term.screen_mut();
+        let rows = screen.scrollback_rows();
+        let mut clustered = 0;
+        for row in 0..rows {
+            if let Some(owners) = screen.line_mut(row).clustered_storage_owners() {
+                assert_eq!(owners, 1, "row {} of {} is shared", row, rows);
+                clustered += 1;
+            }
+        }
+        assert!(
+            clustered > rows / 2,
+            "{} of {} rows clustered",
+            clustered,
+            rows
+        );
+
+        // The probe does see sharing.
+        let last = rows - 1;
+        let snapshot = screen.line_mut(last).semantic_snapshot();
+        assert_eq!(screen.line_mut(last).clustered_storage_owners(), Some(2));
+        drop(snapshot);
+        assert_eq!(screen.line_mut(last).clustered_storage_owners(), Some(1));
+    }
+
+    /// Output that exercises every slicing hazard: combining marks, ZWJ and
+    /// variation-selector sequences, wide characters, SGR, an OSC string and
+    /// a screen erase.
+    const SLICING_PAYLOAD: &str = "e\u{301}x\x1b[1;32mgreen\u{1F468}\u{200D}\u{1F469}\x1b[0m\r\n\
+                                   \x1b]0;title\x07\u{1F600}\u{FE0F}w\x1b[2Jdone\u{4E2D}\u{6587}\r\n";
+
+    struct NoDivert;
+
+    impl FeedGate for NoDivert {
+        fn diverts(&mut self, _action: &Action) -> bool {
+            false
+        }
+    }
+
+    /// ft-yccm0.2.3: a slice ends only before a control byte, never inside a
+    /// printable run, so no grapheme straddles a cut.
+    #[test]
+    fn feed_slices_end_only_before_control_bytes() {
+        let bytes = SLICING_PAYLOAD.as_bytes();
+        for slice_bytes in 1..=bytes.len() {
+            let mut start = 0;
+            while start < bytes.len() {
+                let end = feed_slice_end(bytes, start, slice_bytes);
+                assert!(end > start);
+                assert!(
+                    end == bytes.len() || bytes[end] < 0x20,
+                    "slice of {} cut at {}",
+                    slice_bytes,
+                    end
+                );
+                start = end;
+            }
+        }
+        assert_eq!(feed_slice_end(b"plain text", 0, 3), 10, "no control byte");
+        assert_eq!(feed_slice_end(b"ab", 0, 5), 2);
+        assert_eq!(feed_slice_end(b"ab\ncd", 0, 1), 2);
+    }
+
+    /// ft-yccm0.2.3: feeding a chunk in slices, yielding at every clean
+    /// boundary as the mux does while a reader waits, gives the state of
+    /// feeding it at once. Every yield is at parser ground just before a
+    /// control byte, every hold is a new output batch, and the parser's
+    /// checkpoint watermark counts exactly the bytes fed.
+    #[test]
+    fn sliced_feed_yields_at_clean_boundaries_and_matches_one_feed() {
+        let payload = SLICING_PAYLOAD.as_bytes();
+        let mut whole = make_prop_term(8, 16);
+        whole.feed(&mut Parser::new(), payload, &mut NoDivert, &mut Vec::new());
+        let expected = snapshot_term(&whole);
+        for slice_bytes in 1..=8 {
+            let mut term = make_prop_term(8, 16);
+            let mut parser = Parser::new();
+            let mut sliced = SlicedFeed::new(payload, slice_bytes);
+            let mut yields = 0;
+            let mut seqno = term.current_seqno();
+            loop {
+                let progress = sliced.run(
+                    &mut term,
+                    &mut parser,
+                    &mut NoDivert,
+                    &mut Vec::new(),
+                    &mut || true,
+                );
+                assert!(term.current_seqno() > seqno, "each hold is a new batch");
+                seqno = term.current_seqno();
+                if progress == SliceProgress::Done {
+                    break;
+                }
+                yields += 1;
+                let at = sliced.offset();
+                assert!(payload[at] < 0x20, "yield just before a control byte");
+                assert!(parser.is_recovery_ground());
+                assert_eq!(
+                    parser
+                        .recovery_ground_boundary()
+                        .map(|boundary| boundary.stream_bytes()),
+                    Some(at as u64)
+                );
+            }
+            assert!(yields > 0, "slices of {} never yielded", slice_bytes);
+            assert_eq!(snapshot_term(&term), expected, "slices of {}", slice_bytes);
+        }
+    }
+
+    /// ft-yccm0.2.3: the two-stage continuation. Applying parsed actions in
+    /// slices that yield after every non-print action gives the state of
+    /// applying them at once, and the remaining actions stay with the
+    /// continuation for the next hold.
+    #[test]
+    fn sliced_actions_yield_after_non_print_actions_and_match_one_batch() {
+        // Enough non-print actions for several yield checks.
+        let payload = SLICING_PAYLOAD.repeat(2 * ACTIONS_PER_YIELD_CHECK);
+        let actions = Parser::new().parse_as_vec(payload.as_bytes());
+        let mut whole = make_prop_term(8, 16);
+        whole.perform_actions(actions.clone());
+        let mut term = make_prop_term(8, 16);
+        let mut sliced = SlicedActions::new(actions.clone());
+        let mut yields = 0;
+        while sliced.run(&mut term, &mut || true) == SliceProgress::Yielded {
+            yields += 1;
+            let applied = actions.len() - sliced.remaining();
+            assert!(
+                !matches!(
+                    actions[applied - 1],
+                    Action::Print(_) | Action::PrintString(_)
+                ),
+                "a yield follows a non-print action"
+            );
+        }
+        assert!(yields > 0);
+        assert_eq!(sliced.remaining(), 0);
+        assert_eq!(snapshot_term(&term), snapshot_term(&whole));
     }
 }

@@ -35,7 +35,19 @@ use frankenterm_dynamic::{FromDynamic, ToDynamic};
 
 mod linux;
 mod macos;
+mod signpost;
+mod thread_qos;
 mod windows;
+
+pub use signpost::{
+    set_signposts_enabled, signpost_interval, signpost_intervals_requested, signposts_enabled,
+    SignpostInterval, SignpostName,
+};
+pub use thread_qos::{
+    current_thread_base_priority, current_thread_qos, ensure_application_task_role,
+    keep_launched_task_role, set_current_thread_qos, start_thread_at, ApplicationTaskRole,
+    ThreadQos,
+};
 
 #[derive(Debug, Copy, Clone)]
 #[cfg_attr(feature = "lua", derive(FromDynamic, ToDynamic))]

@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use config::keyassignment::ScrollbackEraseMode;
 use config::{configuration, ExitBehavior, ExitBehaviorMessaging};
 use fancy_regex::Regex;
+use frankenterm_alloc::resource_ledger::{TerminalLockHolder, TerminalLockLedger};
 use frankenterm_dynamic::Value;
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::color::ColorPalette;
@@ -31,6 +32,8 @@ use frankenterm_term::{
     RecoveryTerminalCheckpointError, RecoveryTerminalCheckpointV3, SemanticZone, StableRowIndex,
     Terminal, TerminalConfiguration, TerminalSize,
 };
+#[cfg(not(feature = "disruptor-pane-io"))]
+use frankenterm_term::{SliceProgress, SlicedActions, SlicedFeed, FEED_SLICE_BYTES};
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
 use procinfo::LocalProcessInfo;
@@ -41,7 +44,7 @@ use std::convert::{TryFrom, TryInto};
 use std::io::{Result as IoResult, Write};
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1592,11 +1595,249 @@ where
     retry_with_backoff_controlled(policy, |attempt| op(attempt).map_err(RetryStepError::Retry))
 }
 
+/// A pane's terminal mutex, instrumented for ft-yccm0.1.5.
+///
+/// Every acquisition records how long it waited and how long it held the
+/// mutex, tagged with the holder kind, in the process's terminal-lock ledger
+/// (exported through `ft doctor --json`). A wait on the main (UI) thread also
+/// counts as main-thread blocking. An uncontended acquisition costs a
+/// try-lock plus two clock reads and a few relaxed atomic adds.
+///
+/// It is also fair to readers under a parser flood (ft-yccm0.2.3, Ghostty's
+/// `lockDemand`/`yieldToDemand`): a locker other than the parser that has
+/// to wait registers demand while it waits, and the parser, which applies
+/// output in slices, hands the lock over at its next clean slice boundary
+/// ([`Self::hand_over`]) instead of holding it for the whole chunk.
+struct TerminalMutex {
+    inner: Mutex<Terminal>,
+    /// Lockers other than the parser waiting for `inner` right now.
+    demand: AtomicU32,
+    /// Acquisitions by demanding lockers; the parser waits for this to move
+    /// after handing the lock over.
+    served: AtomicU64,
+}
+
+/// Longest the parser waits, after handing the terminal lock over, for a
+/// demanding locker to take it (ft-yccm0.2.3).
+#[cfg(not(feature = "disruptor-pane-io"))]
+const HANDOFF_WAIT: Duration = Duration::from_millis(1);
+
+/// Longest the parser holds a pane's terminal lock in one go while applying
+/// output (ft-yccm0.2.3). It then hands the lock over at its next clean
+/// boundary; while a locker is waiting, it does so at once.
+#[cfg(not(feature = "disruptor-pane-io"))]
+const PARSER_HOLD_BUDGET: Duration = Duration::from_millis(2);
+
+/// Longest a paint waits for a pane's terminal lock before drawing the pane
+/// from the frame it last painted (ft-yccm0.2.2.3). While it waits, a
+/// flooding parser hands the lock over at its next slice boundary (within
+/// `PARSER_HOLD_BUDGET`), so a fresh frame usually costs well under this.
+/// Without the wait, a paint during a flood almost always found the lock
+/// held and presented the old frame again: the default front end showed ~3
+/// new frames per second at ~26 presents (nv13 T0).
+const RENDER_CAPTURE_WAIT: Duration = Duration::from_millis(4);
+
+/// [`RENDER_CAPTURE_WAIT`], or `FRANKENTERM_RENDER_CAPTURE_WAIT_MS` when set
+/// (0: try the lock only, as before), read once.
+fn render_capture_wait() -> Duration {
+    static WAIT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *WAIT.get_or_init(|| {
+        std::env::var("FRANKENTERM_RENDER_CAPTURE_WAIT_MS")
+            .ok()
+            .and_then(|ms| ms.trim().parse::<u64>().ok())
+            .map_or(RENDER_CAPTURE_WAIT, Duration::from_millis)
+    })
+}
+
+impl TerminalMutex {
+    fn new(terminal: Terminal) -> Self {
+        Self {
+            inner: Mutex::new(terminal),
+            demand: AtomicU32::new(0),
+            served: AtomicU64::new(0),
+        }
+    }
+
+    fn lock(&self) -> TerminalGuard<'_> {
+        self.lock_as(TerminalLockHolder::Other)
+    }
+
+    fn lock_as(&self, holder: TerminalLockHolder) -> TerminalGuard<'_> {
+        if let Some(guard) = self.inner.try_lock() {
+            return TerminalGuard::acquired(guard, holder, 0);
+        }
+        let demanding = holder != TerminalLockHolder::Parser;
+        if demanding {
+            self.demand.fetch_add(1, Ordering::AcqRel);
+        }
+        let started = Instant::now();
+        let guard = self.inner.lock();
+        let waited = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if demanding {
+            self.demand.fetch_sub(1, Ordering::AcqRel);
+            self.served.fetch_add(1, Ordering::AcqRel);
+        }
+        TerminalGuard::acquired(guard, holder, waited.max(1))
+    }
+
+    /// Whether a locker other than the parser is waiting for the lock.
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    fn demanded(&self) -> bool {
+        self.demand.load(Ordering::Acquire) != 0
+    }
+
+    /// The parser's handoff (ft-yccm0.2.3): releases `guard` fairly, so a
+    /// queued locker gets the lock directly, and while lockers are waiting
+    /// gives them up to [`HANDOFF_WAIT`] to take it (a waiter may still be
+    /// spinning rather than queued) before the parser locks again.
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    fn hand_over(&self, guard: TerminalGuard<'_>) {
+        let served = self.served.load(Ordering::Acquire);
+        let demanded = self.demanded();
+        TerminalGuard::unlock_fair(guard);
+        if !demanded {
+            return;
+        }
+        let deadline = Instant::now() + HANDOFF_WAIT;
+        while self.demanded()
+            && self.served.load(Ordering::Acquire) == served
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+    }
+
+    fn try_lock(&self) -> Option<TerminalGuard<'_>> {
+        self.try_lock_as(TerminalLockHolder::Other)
+    }
+
+    fn try_lock_as(&self, holder: TerminalLockHolder) -> Option<TerminalGuard<'_>> {
+        self.inner
+            .try_lock()
+            .map(|guard| TerminalGuard::acquired(guard, holder, 0))
+    }
+
+    /// [`Self::lock_as`] that gives up after `wait`. A locker other than the
+    /// parser registers demand while it waits, so a flooding parser hands the
+    /// lock over at its next slice boundary (ft-yccm0.2.3); a bare try_lock
+    /// registers none and almost never finds the lock free during a flood.
+    fn try_lock_for_as(
+        &self,
+        holder: TerminalLockHolder,
+        wait: Duration,
+    ) -> Option<TerminalGuard<'_>> {
+        if let Some(guard) = self.inner.try_lock() {
+            return Some(TerminalGuard::acquired(guard, holder, 0));
+        }
+        if wait.is_zero() {
+            return None;
+        }
+        let demanding = holder != TerminalLockHolder::Parser;
+        if demanding {
+            self.demand.fetch_add(1, Ordering::AcqRel);
+        }
+        let started = Instant::now();
+        let guard = self.inner.try_lock_for(wait);
+        let waited = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if demanding {
+            self.demand.fetch_sub(1, Ordering::AcqRel);
+            if guard.is_some() {
+                self.served.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        guard.map(|guard| TerminalGuard::acquired(guard, holder, waited.max(1)))
+    }
+
+    /// A probe for availability; not an acquisition, so nothing is recorded.
+    fn is_locked(&self) -> bool {
+        self.inner.is_locked()
+    }
+}
+
+/// Whether the calling thread is the process's main thread, which std names
+/// "main"; in the GUI that is the AppKit/UI thread.
+fn on_main_thread() -> bool {
+    thread_local! {
+        static ON_MAIN: bool = std::thread::current().name() == Some("main");
+    }
+    ON_MAIN.with(|on_main| *on_main)
+}
+
+/// Guard of a [`TerminalMutex`]; records the hold time when released. With
+/// FT_SIGNPOST=1 the hold is also an os_signpost interval named by holder.
+struct TerminalGuard<'a> {
+    guard: Option<MutexGuard<'a, Terminal>>,
+    holder: TerminalLockHolder,
+    acquired: Instant,
+    // Declared after `guard`, so the interval ends once the mutex is free.
+    _hold_interval: procinfo::SignpostInterval,
+}
+
+fn hold_signpost(holder: TerminalLockHolder) -> procinfo::SignpostName {
+    use procinfo::SignpostName;
+    match holder {
+        TerminalLockHolder::Parser => SignpostName::TerminalLockParser,
+        TerminalLockHolder::Paint => SignpostName::TerminalLockPaint,
+        TerminalLockHolder::Mouse => SignpostName::TerminalLockMouse,
+        TerminalLockHolder::Resize => SignpostName::TerminalLockResize,
+        TerminalLockHolder::Selection => SignpostName::TerminalLockSelection,
+        TerminalLockHolder::Other => SignpostName::TerminalLockOther,
+    }
+}
+
+impl<'a> TerminalGuard<'a> {
+    fn acquired(guard: MutexGuard<'a, Terminal>, holder: TerminalLockHolder, wait_ns: u64) -> Self {
+        TerminalLockLedger::global().record_wait(holder, wait_ns, on_main_thread());
+        Self {
+            guard: Some(guard),
+            holder,
+            acquired: Instant::now(),
+            _hold_interval: procinfo::signpost_interval(hold_signpost(holder)),
+        }
+    }
+
+    /// Release with a fair handoff to a queued waiter, as
+    /// `parking_lot::MutexGuard::unlock_fair` does.
+    fn unlock_fair(mut this: Self) {
+        if let Some(guard) = this.guard.take() {
+            this.record_hold();
+            MutexGuard::unlock_fair(guard);
+        }
+    }
+
+    fn record_hold(&self) {
+        let held = u64::try_from(self.acquired.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        TerminalLockLedger::global().record_hold(self.holder, held);
+    }
+}
+
+impl Drop for TerminalGuard<'_> {
+    fn drop(&mut self) {
+        if self.guard.is_some() {
+            self.record_hold();
+        }
+    }
+}
+
+impl std::ops::Deref for TerminalGuard<'_> {
+    type Target = Terminal;
+
+    fn deref(&self) -> &Terminal {
+        self.guard.as_ref().expect("terminal guard is held until dropped")
+    }
+}
+
+impl std::ops::DerefMut for TerminalGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Terminal {
+        self.guard.as_mut().expect("terminal guard is held until dropped")
+    }
+}
+
 pub struct LocalPane {
     pane_id: PaneId,
     durable_pane_id: [u8; 16],
     ownership: LocalPaneOwnership,
-    terminal: Arc<Mutex<Terminal>>,
+    terminal: Arc<TerminalMutex>,
     // Pane-owned lifetime prevents cached metadata crossing pane-id reuse.
     // Only Arc swaps/clones run under this mutex, never terminal work.
     title_metadata: Mutex<Arc<PaneTitleMetadata>>,
@@ -1621,6 +1862,9 @@ pub struct LocalPane {
     writer: Mutex<Box<dyn Write + Send>>,
     domain_id: DomainId,
     tmux_domain: Arc<Mutex<Option<Arc<TmuxDomainState>>>>,
+    /// Republished under the terminal mutex after every change UI readers
+    /// care about; `render_facts()` never takes the terminal mutex.
+    render_facts: Arc<RenderFactsPublisher>,
     mux_registration: Arc<PaneRegistrationSlot>,
     child_exit_prune: Arc<ChildExitPruneState>,
     proc_list: Arc<Mutex<Option<CachedProcInfo>>>,
@@ -1782,7 +2026,8 @@ impl Pane for LocalPane {
     }
 
     fn get_cursor_position(&self) -> StableCursorPosition {
-        let mut cursor = terminal_get_cursor_position(&mut self.locked_terminal());
+        let mut cursor =
+            terminal_get_cursor_position(&mut self.locked_terminal_as(TerminalLockHolder::Paint));
         if self.tmux_domain.lock().is_some() {
             cursor.visibility = termwiz::surface::CursorVisibility::Hidden;
         }
@@ -1798,7 +2043,12 @@ impl Pane for LocalPane {
     }
 
     fn get_current_seqno(&self) -> SequenceNo {
-        self.locked_terminal().current_seqno()
+        self.locked_terminal_as(TerminalLockHolder::Paint)
+            .current_seqno()
+    }
+
+    fn render_facts(&self) -> Arc<crate::pane::PaneRenderFacts> {
+        self.render_facts.load()
     }
 
     fn get_changed_since(
@@ -1806,7 +2056,11 @@ impl Pane for LocalPane {
         lines: Range<StableRowIndex>,
         seqno: SequenceNo,
     ) -> RangeSet<StableRowIndex> {
-        terminal_get_dirty_lines(&mut self.locked_terminal(), lines, seqno)
+        terminal_get_dirty_lines(
+            &mut self.locked_terminal_as(TerminalLockHolder::Paint),
+            lines,
+            seqno,
+        )
     }
 
     fn get_changed_since_with_source_fence(
@@ -1814,7 +2068,7 @@ impl Pane for LocalPane {
         lines: Range<StableRowIndex>,
         last_observed_source_end: SequenceNo,
     ) -> (SequenceNo, RangeSet<StableRowIndex>) {
-        let mut terminal = self.locked_terminal();
+        let mut terminal = self.locked_terminal_as(TerminalLockHolder::Paint);
         let source_end = terminal.current_seqno();
         let baseline =
             crate::pane::changed_since_query_baseline(last_observed_source_end, source_end);
@@ -1827,7 +2081,7 @@ impl Pane for LocalPane {
         lines: Range<StableRowIndex>,
         for_line: &mut dyn ForEachPaneLogicalLine,
     ) {
-        let mut term = self.locked_terminal();
+        let mut term = self.locked_terminal_as(TerminalLockHolder::Selection);
         let cold = lines.start < term.screen().phys_to_stable_row_index(0);
         if cold {
             drop(term);
@@ -1838,7 +2092,7 @@ impl Pane for LocalPane {
     }
 
     fn with_lines_mut(&self, lines: Range<StableRowIndex>, with_lines: &mut dyn WithPaneLines) {
-        let mut term = self.locked_terminal();
+        let mut term = self.locked_terminal_as(TerminalLockHolder::Paint);
         let cold = lines.start < term.screen().phys_to_stable_row_index(0);
         if cold {
             drop(term);
@@ -1857,7 +2111,7 @@ impl Pane for LocalPane {
         // Never substitute resident row zero for a requested persisted row.
         // A missing cold snapshot is a loading frame, followed by a targeted
         // repaint after exact-registration publication of the worker result.
-        let Some(mut term) = self.terminal.try_lock() else {
+        let Some(mut term) = self.terminal.try_lock_as(TerminalLockHolder::Paint) else {
             if let Some(registration) = self.mux_registration.load() {
                 retry_cold_viewport(registration, Arc::clone(&self.cold_viewport_retry));
             }
@@ -1940,7 +2194,7 @@ impl Pane for LocalPane {
         };
         // This is optional cache maintenance, not a terminal read. Never wait
         // for the parser or drain staged actions after the frame is rendered.
-        let Some(mut term) = self.terminal.try_lock() else {
+        let Some(mut term) = self.terminal.try_lock_as(TerminalLockHolder::Paint) else {
             return;
         };
         let screen = term.screen_mut();
@@ -1965,7 +2219,7 @@ impl Pane for LocalPane {
         // treat an empty result as complete. Only paint uses the loading cache;
         // RPCs use owned worker plans. Preserve complete synchronous results
         // until these remaining consumers acquire an awaited read contract.
-        terminal_get_lines(&mut self.locked_terminal(), lines)
+        terminal_get_lines(&mut self.locked_terminal_as(TerminalLockHolder::Paint), lines)
     }
 
     fn capture_line_read(
@@ -2115,7 +2369,7 @@ impl Pane for LocalPane {
         baseline: SequenceNo,
     ) -> Option<Result<PaneSurfaceSnapshot, frankenterm_term::screen::ColdReadMetadataBusy>> {
         let _diagnostic = MetadataRefusalDiagnostic::new();
-        let mut term = match self.terminal.try_lock() {
+        let mut term = match self.terminal.try_lock_as(TerminalLockHolder::Paint) {
             Some(term) => term,
             None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceTerminal))),
         };
@@ -2236,7 +2490,7 @@ impl Pane for LocalPane {
     }
 
     fn get_dimensions(&self) -> RenderableDimensions {
-        terminal_get_dimensions(&mut self.locked_terminal())
+        terminal_get_dimensions(&mut self.locked_terminal_as(TerminalLockHolder::Paint))
     }
 
     fn get_tiered_scrollback_status(
@@ -2251,8 +2505,15 @@ impl Pane for LocalPane {
         )
     }
 
+    fn writer_backlog(&self) -> Option<frankenterm_term::WriterBacklog> {
+        Some(self.terminal.lock().writer_backlog())
+    }
+
     fn evict_warm_scrollback(&self) -> Option<usize> {
-        Some(self.terminal.lock().evict_warm_scrollback())
+        let mut terminal = self.terminal.lock();
+        let evicted = terminal.evict_warm_scrollback();
+        self.render_facts.publish(&mut terminal);
+        Some(evicted)
     }
 
     fn copy_user_vars(&self) -> HashMap<String, String> {
@@ -2290,6 +2551,8 @@ impl Pane for LocalPane {
                 | ProcessState::DeadPendingClose { killed } => *killed = true,
                 ProcessState::Dead => {}
             }
+            drop(proc);
+            self.request_scrollback_durability_on_close();
             return;
         }
 
@@ -2311,6 +2574,8 @@ impl Pane for LocalPane {
             }
             _ => {}
         }
+        drop(proc);
+        self.request_scrollback_durability_on_close();
     }
 
     fn is_dead(&self) -> bool {
@@ -2470,6 +2735,10 @@ impl Pane for LocalPane {
             .filter(|sink| sink.requires_scrollback_flush());
         terminal.set_config(config);
         *self.scrollback_flush_sink.lock() = sink;
+        // A new configuration object may carry a different palette even when
+        // its revision numbers coincide with the old one's.
+        self.render_facts.palette_may_have_changed();
+        self.render_facts.publish(&mut terminal);
     }
 
     fn get_config(&self) -> Option<Arc<dyn TerminalConfiguration>> {
@@ -2483,6 +2752,8 @@ impl Pane for LocalPane {
         if actions.is_empty() {
             return Ok(());
         }
+        // Covers admission, apply and the durability handoff (ft-yccm0.1.5).
+        let _parse_batch = procinfo::signpost_interval(procinfo::SignpostName::ParseBatch);
         // Authority is acquired outside terminal/tab locks and declared before
         // their guards, so refusal drops those guards before lifecycle custody.
         let mut output = match self.prepare_alert_output() {
@@ -2493,10 +2764,18 @@ impl Pane for LocalPane {
         if PaneAlertPreflight::needs_terminal_state(&actions) {
             // A terminator may publish a title begun in another batch. Drain
             // prior admitted work, then observe and admit against exact state.
-            let mut terminal = self.locked_terminal();
+            let mut terminal = self.locked_terminal_as(TerminalLockHolder::Parser);
             let pending_title = terminal.pending_tmux_title_bytes();
             match self.admit_alert_actions(&mut actions, pending_title, &mut output) {
-                Ok(batch) => batch.apply(&mut terminal),
+                Ok(batch) => {
+                    #[cfg(not(feature = "disruptor-pane-io"))]
+                    {
+                        terminal = batch.apply_sliced(self, terminal);
+                    }
+                    #[cfg(feature = "disruptor-pane-io")]
+                    batch.apply(&mut terminal);
+                    self.render_facts.publish(&mut terminal);
+                }
                 Err(reason) => return Err(PaneActionAdmissionError { actions, reason }),
             }
         } else {
@@ -2505,7 +2784,11 @@ impl Pane for LocalPane {
                 Err(reason) => return Err(PaneActionAdmissionError { actions, reason }),
             };
             #[cfg(not(feature = "disruptor-pane-io"))]
-            batch.apply(&mut self.terminal.lock());
+            {
+                let terminal = self.terminal.lock_as(TerminalLockHolder::Parser);
+                let mut terminal = batch.apply_sliced(self, terminal);
+                self.render_facts.publish(&mut terminal);
+            }
             #[cfg(feature = "disruptor-pane-io")]
             self.perform_actions_disruptor(batch);
         }
@@ -2538,11 +2821,12 @@ impl Pane for LocalPane {
         // materialization and serialization do not block the terminal mutex.
         let staged = {
             let _output_application = self.output_application.lock();
-            let mut terminal = self.locked_terminal();
+            let mut terminal = self.locked_terminal_as(TerminalLockHolder::Parser);
             let pending_title = terminal.pending_tmux_title_bytes();
             self.admit_alert_actions(pending_actions, pending_title, &mut output)
                 .map_err(LiveParserPaneCaptureError::ActionAdmission)?
                 .apply(&mut terminal);
+            self.render_facts.publish(&mut terminal);
             terminal
                 .capture_staged(limits)
                 .map_err(LiveParserPaneCaptureError::Terminal)?
@@ -2561,7 +2845,8 @@ impl Pane for LocalPane {
 
     fn mouse_event(&self, event: MouseEvent) -> Result<(), Error> {
         record_input_for_current_identity(&self.mux_registration);
-        self.locked_terminal().mouse_event(event)
+        self.locked_terminal_as(TerminalLockHolder::Mouse)
+            .mouse_event(event)
     }
 
     fn key_down(&self, key: KeyCode, mods: KeyModifiers) -> Result<(), Error> {
@@ -2598,6 +2883,16 @@ impl Pane for LocalPane {
         })
     }
 
+    /// Queues user input on the terminal's writer, FIFO with pastes and query
+    /// replies; never blocks on a child that has stopped reading
+    /// (ft-yccm0.2.2.5). The raw PTY `writer` would block the caller and
+    /// could interleave with a paste the terminal writer is still sending.
+    fn send_user_input(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        record_input_for_current_identity(&self.mux_registration);
+        self.locked_terminal().write_user_input(bytes)?;
+        Ok(())
+    }
+
     fn guardian_live_output_reader(
         &self,
     ) -> anyhow::Result<Option<Box<dyn GuardianLiveOutputReader>>> {
@@ -2629,6 +2924,11 @@ impl Pane for LocalPane {
 
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
         Ok(Some(self.pty.lock().try_clone_reader()?))
+    }
+
+    #[cfg(unix)]
+    fn gather_reader(&self) -> anyhow::Result<Option<Box<dyn portable_pty::PollablePtyReader>>> {
+        Ok(Some(self.pty.lock().try_clone_blocking_pollable_reader()?))
     }
 
     fn send_paste(&self, text: &str) -> Result<(), Error> {
@@ -2677,7 +2977,7 @@ impl Pane for LocalPane {
     }
 
     fn palette(&self) -> ColorPalette {
-        self.locked_terminal().palette()
+        self.locked_terminal_as(TerminalLockHolder::Paint).palette()
     }
 
     fn domain_id(&self) -> DomainId {
@@ -2685,18 +2985,20 @@ impl Pane for LocalPane {
     }
 
     fn erase_scrollback(&self, erase_mode: ScrollbackEraseMode) {
+        let mut terminal = self.locked_terminal();
         match erase_mode {
-            ScrollbackEraseMode::ScrollbackOnly => {
-                self.locked_terminal().erase_scrollback();
-            }
+            ScrollbackEraseMode::ScrollbackOnly => terminal.erase_scrollback(),
             ScrollbackEraseMode::ScrollbackAndViewport => {
-                self.locked_terminal().erase_scrollback_and_viewport();
+                terminal.erase_scrollback_and_viewport()
             }
         }
+        self.render_facts.publish(&mut terminal);
     }
 
     fn focus_changed(&self, focused: bool) {
-        self.locked_terminal().focus_changed(focused);
+        let mut terminal = self.locked_terminal();
+        terminal.focus_changed(focused);
+        self.render_facts.publish(&mut terminal);
     }
 
     fn has_unseen_output(&self) -> bool {
@@ -2707,7 +3009,8 @@ impl Pane for LocalPane {
         if self.tmux_domain.lock().is_some() {
             false
         } else {
-            self.locked_terminal().is_mouse_grabbed()
+            self.locked_terminal_as(TerminalLockHolder::Mouse)
+                .is_mouse_grabbed()
         }
     }
 
@@ -2715,7 +3018,8 @@ impl Pane for LocalPane {
         if self.tmux_domain.lock().is_some() {
             false
         } else {
-            self.locked_terminal().is_alt_screen_active()
+            self.locked_terminal_as(TerminalLockHolder::Mouse)
+                .is_alt_screen_active()
         }
     }
 
@@ -4127,6 +4431,18 @@ impl PaneAlertPreflight {
         })
     }
 
+    /// What [`Self::for_actions`] charges a batch with no alert source: the
+    /// one output alert a nonempty batch can raise. The fused path
+    /// (ft-yccm0.3.2.1) diverts every alert source, so this funds it.
+    #[cfg_attr(feature = "disruptor-pane-io", allow(dead_code))]
+    fn output_only() -> Self {
+        Self {
+            count: 1,
+            text_bytes: 0,
+            historical: Vec::new(),
+        }
+    }
+
     fn retained_bytes(&self) -> Option<usize> {
         self.count
             .checked_mul(std::mem::size_of::<Alert>())?
@@ -4140,8 +4456,209 @@ impl PaneAlertPreflight {
     }
 }
 
+/// Lock-free publication of [`crate::pane::PaneRenderFacts`] (ft-yccm0.2.2.1).
+///
+/// Publishers hold the terminal mutex, so publications are serialized and a
+/// later capture never replaces a newer one. Readers only load an `Arc`.
+///
+/// Publishing runs after every applied batch, so it must stay cheap: a
+/// publication that would change nothing is skipped, and a changed one reuses
+/// the allocation of the facts it replaced when no reader still holds them,
+/// replacing the palette and title `Arc`s only when they differ.
+struct RenderFactsPublisher {
+    facts: arc_swap::ArcSwap<crate::pane::PaneRenderFacts>,
+    /// Bumped by `Alert::PaletteChanged` (any dynamic color escape) and by
+    /// configuration assignment.
+    palette_epoch: AtomicU64,
+    /// What the latest publication was built from.
+    published: Mutex<PublishedFacts>,
+    tmux_domain: Arc<Mutex<Option<Arc<TmuxDomainState>>>>,
+    /// Bench-only: skip every publication, so
+    /// `mux/benches/render_facts_publication.rs` can measure what publishing
+    /// costs a batch (ft-yccm0.2.2.1). Not compiled into normal builds.
+    #[cfg(feature = "bench-hooks")]
+    skip_publication: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PaletteSource {
+    epoch: u64,
+    revision: frankenterm_term::config::TerminalConfigurationRevision,
+}
+
+/// The plain-value fields of [`crate::pane::PaneRenderFacts`].
+#[derive(Clone, Copy, PartialEq)]
+struct ScalarFacts {
+    seqno: SequenceNo,
+    cursor: StableCursorPosition,
+    dimensions: RenderableDimensions,
+    mouse_grabbed: bool,
+    alt_screen_active: bool,
+    bracketed_paste: bool,
+    focus_tracking: bool,
+}
+
+/// What the latest publication was built from, compared field by field
+/// against the next capture.
+struct PublishedFacts {
+    /// The palette is re-read only when this changes.
+    palette_source: PaletteSource,
+    palette: Arc<ColorPalette>,
+    palette_generation: u64,
+    title: Arc<str>,
+    scalars: ScalarFacts,
+    /// The facts the latest publication replaced; reused in place by the next
+    /// one when no reader still holds them.
+    spare: Option<Arc<crate::pane::PaneRenderFacts>>,
+}
+
+impl PublishedFacts {
+    /// Facts for this state, filled into the spare allocation when it is no
+    /// longer shared.
+    fn build(&mut self) -> Arc<crate::pane::PaneRenderFacts> {
+        if let Some(mut spare) = self.spare.take() {
+            if let Some(slot) = Arc::get_mut(&mut spare) {
+                self.fill(slot);
+                return spare;
+            }
+        }
+        Arc::new(self.facts())
+    }
+
+    /// Overwrites reused facts, touching the palette and title `Arc`s only
+    /// when they differ.
+    fn fill(&self, slot: &mut crate::pane::PaneRenderFacts) {
+        let scalars = self.scalars;
+        slot.seqno = scalars.seqno;
+        slot.cursor = scalars.cursor;
+        slot.dimensions = scalars.dimensions;
+        slot.mouse_grabbed = scalars.mouse_grabbed;
+        slot.alt_screen_active = scalars.alt_screen_active;
+        slot.bracketed_paste = scalars.bracketed_paste;
+        slot.focus_tracking = scalars.focus_tracking;
+        slot.palette_generation = self.palette_generation;
+        if !Arc::ptr_eq(&slot.palette, &self.palette) {
+            slot.palette = Arc::clone(&self.palette);
+        }
+        if !Arc::ptr_eq(&slot.title, &self.title) {
+            slot.title = Arc::clone(&self.title);
+        }
+    }
+
+    fn facts(&self) -> crate::pane::PaneRenderFacts {
+        let scalars = self.scalars;
+        crate::pane::PaneRenderFacts {
+            seqno: scalars.seqno,
+            cursor: scalars.cursor,
+            dimensions: scalars.dimensions,
+            mouse_grabbed: scalars.mouse_grabbed,
+            alt_screen_active: scalars.alt_screen_active,
+            bracketed_paste: scalars.bracketed_paste,
+            focus_tracking: scalars.focus_tracking,
+            palette: Arc::clone(&self.palette),
+            palette_generation: self.palette_generation,
+            title: Arc::clone(&self.title),
+        }
+    }
+}
+
+impl RenderFactsPublisher {
+    fn new(terminal: &mut Terminal, tmux_domain: Arc<Mutex<Option<Arc<TmuxDomainState>>>>) -> Self {
+        let published = PublishedFacts {
+            palette_source: PaletteSource {
+                epoch: 0,
+                revision: terminal.get_config().revision(),
+            },
+            palette: Arc::new(terminal.palette()),
+            palette_generation: 0,
+            title: Arc::from(terminal.get_title()),
+            scalars: Self::capture(terminal, &tmux_domain),
+            spare: None,
+        };
+        Self {
+            facts: arc_swap::ArcSwap::from_pointee(published.facts()),
+            palette_epoch: AtomicU64::new(0),
+            published: Mutex::new(published),
+            tmux_domain,
+            #[cfg(feature = "bench-hooks")]
+            skip_publication: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn load(&self) -> Arc<crate::pane::PaneRenderFacts> {
+        self.facts.load_full()
+    }
+
+    fn palette_may_have_changed(&self) {
+        self.palette_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Capture and publish. The caller holds the terminal mutex.
+    fn publish(&self, terminal: &mut Terminal) {
+        #[cfg(feature = "bench-hooks")]
+        if self.skip_publication.load(Ordering::Relaxed) {
+            return;
+        }
+        let source = PaletteSource {
+            epoch: self.palette_epoch.load(Ordering::Acquire),
+            revision: terminal.get_config().revision(),
+        };
+        let scalars = Self::capture(terminal, &self.tmux_domain);
+        let mut published = self.published.lock();
+        let mut changed = scalars != published.scalars;
+        if published.palette_source != source {
+            published.palette_source = source;
+            let palette = terminal.palette();
+            if palette != *published.palette {
+                published.palette = Arc::new(palette);
+                published.palette_generation = published.palette_generation.wrapping_add(1);
+                changed = true;
+            }
+        }
+        if *published.title != *terminal.get_title() {
+            published.title = Arc::from(terminal.get_title());
+            changed = true;
+        }
+        if !changed {
+            // Readers already hold exactly these facts.
+            return;
+        }
+        published.scalars = scalars;
+        let facts = published.build();
+        log::trace!(
+            "render facts seqno={} cursor={:?} palette_generation={}",
+            facts.seqno,
+            facts.cursor,
+            facts.palette_generation
+        );
+        published.spare = Some(self.facts.swap(facts));
+    }
+
+    fn capture(
+        terminal: &mut Terminal,
+        tmux_domain: &Mutex<Option<Arc<TmuxDomainState>>>,
+    ) -> ScalarFacts {
+        // Terminal before tmux binding: the DCS parser's lock order.
+        let tmux = tmux_domain.lock().is_some();
+        let mut cursor = terminal_get_cursor_position(terminal);
+        if tmux {
+            cursor.visibility = termwiz::surface::CursorVisibility::Hidden;
+        }
+        ScalarFacts {
+            seqno: terminal.current_seqno(),
+            cursor,
+            dimensions: terminal_get_dimensions(terminal),
+            mouse_grabbed: !tmux && terminal.is_mouse_grabbed(),
+            alt_screen_active: !tmux && terminal.is_alt_screen_active(),
+            bracketed_paste: terminal.bracketed_paste_enabled(),
+            focus_tracking: terminal.focus_tracking_enabled(),
+        }
+    }
+}
+
 struct LocalPaneNotifHandler {
     staging: Arc<Mutex<PaneAlertStaging>>,
+    render_facts: Arc<RenderFactsPublisher>,
 }
 
 #[derive(Default)]
@@ -4175,12 +4692,55 @@ impl Drop for PaneAlertCompletion {
     }
 }
 
+/// The actions the fused path hands back to the admitted path
+/// (ft-yccm0.3.2.1): every alert source [`PaneAlertPreflight`] charges for,
+/// and the synchronized-output controls the parse thread tracks itself.
+pub(crate) struct FusedFeedGate;
+
+impl frankenterm_term::FeedGate for FusedFeedGate {
+    fn diverts(&mut self, action: &Action) -> bool {
+        use termwiz::escape::{ControlCode, Esc, EscCode};
+        matches!(
+            action,
+            Action::Control(ControlCode::Bell)
+                | Action::OperatingSystemCommand(_)
+                | Action::KittyImage(_)
+                | Action::Esc(Esc::Code(EscCode::StringTerminator | EscCode::FullReset))
+        ) || crate::is_synchronized_output_action(action)
+    }
+
+    /// SGR is neither an alert source nor a synchronized-output control, so
+    /// `diverts` never diverts it; the CSI fast path's settings
+    /// (ft-yccm0.3.2.4) apply without an `Action` being built for the gate.
+    fn diverts_sgr(&mut self, _sgr: &Sgr) -> bool {
+        false
+    }
+}
+
+/// [`FusedFeedGate`] for a synchronized-output frame the parse thread held
+/// raw from its BSU through its ESU (ft-yccm0.3.2.1): the BSU and ESU are
+/// applied in place, so the terminal is in synchronized output while the
+/// frame lands, as when the frame's actions were applied with them. The
+/// parse thread has opened and drained the hold for them already.
+pub(crate) struct SynchronizedFrameFeedGate;
+
+impl frankenterm_term::FeedGate for SynchronizedFrameFeedGate {
+    fn diverts(&mut self, action: &Action) -> bool {
+        !crate::is_synchronized_output_mode_switch(action)
+            && frankenterm_term::FeedGate::diverts(&mut FusedFeedGate, action)
+    }
+
+    fn diverts_sgr(&mut self, _sgr: &Sgr) -> bool {
+        false
+    }
+}
+
 struct FundedPaneAlerts {
     dispatch: Option<crate::FundedPaneAlertDispatch>,
     output: Option<crate::PaneAlertOutput>,
     alerts: Vec<Alert>,
     text_bytes: usize,
-    terminal: std::sync::Weak<Mutex<Terminal>>,
+    terminal: std::sync::Weak<TerminalMutex>,
     historical: Option<crate::AdmittedHistoricalAlerts>,
 }
 
@@ -4213,7 +4773,7 @@ impl FundedPaneAlerts {
     fn reserve(
         preflight: PaneAlertPreflight,
         output: &mut Option<crate::PaneAlertOutput>,
-        terminal: &Arc<Mutex<Terminal>>,
+        terminal: &Arc<TerminalMutex>,
     ) -> Result<Option<Self>, PaneActionAdmissionRefusal> {
         if output.is_none() {
             return Ok(None);
@@ -4295,12 +4855,12 @@ impl FundedPaneAlerts {
     }
 }
 
-async fn wait_for_alert_terminal_unlock(terminal: &std::sync::Weak<Mutex<Terminal>>) {
+async fn wait_for_alert_terminal_unlock(terminal: &std::sync::Weak<TerminalMutex>) {
     loop {
         let Some(terminal) = terminal.upgrade() else {
             return;
         };
-        if terminal.try_lock().is_some() {
+        if !terminal.is_locked() {
             return;
         }
         drop(terminal);
@@ -4358,9 +4918,58 @@ impl AdmittedPaneActions {
     fn apply(self, terminal: &mut Terminal) {
         let Self {
             actions,
-            mut alerts,
+            alerts,
             staging,
         } = self;
+        let application = PaneAlertApplication::install(alerts, staging);
+        terminal.perform_actions(actions);
+        drop(application);
+    }
+
+    /// [`Self::apply`] in slices that hand the terminal lock to waiting
+    /// lockers between them (ft-yccm0.2.3). The continuation owns the
+    /// remaining actions, so they apply in order, and a slice ends only
+    /// after a non-print action. Returns the guard, still held.
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    fn apply_sliced<'a>(
+        self,
+        pane: &'a LocalPane,
+        terminal: TerminalGuard<'a>,
+    ) -> TerminalGuard<'a> {
+        let Self {
+            actions,
+            alerts,
+            staging,
+        } = self;
+        if actions.is_empty() {
+            return terminal;
+        }
+        let mut application = PaneAlertApplication::install(alerts, staging);
+        let mut sliced = SlicedActions::new(actions);
+        let terminal =
+            pane.run_parser_slices(terminal, &mut application, &mut |terminal, yield_now| {
+                sliced.run(terminal, yield_now)
+            });
+        drop(application);
+        terminal
+    }
+}
+
+struct PaneAlertApplication {
+    alerts: Option<FundedPaneAlerts>,
+    staging: Arc<Mutex<PaneAlertStaging>>,
+    /// The staged alerts while the terminal lock is handed over between
+    /// slices (ft-yccm0.2.3).
+    suspended: Option<ActivePaneAlerts>,
+}
+
+impl PaneAlertApplication {
+    /// Installs the batch's funded alerts for the alert handler; dropping
+    /// the application publishes what the batch raised.
+    fn install(
+        mut alerts: Option<FundedPaneAlerts>,
+        staging: Arc<Mutex<PaneAlertStaging>>,
+    ) -> Self {
         {
             let mut state = staging.lock();
             assert!(
@@ -4372,19 +4981,40 @@ impl AdmittedPaneActions {
                 remaining_text_bytes: batch.text_bytes,
             });
         }
-        let application = PaneAlertApplication { alerts, staging };
-        terminal.perform_actions(actions);
-        drop(application);
+        PaneAlertApplication {
+            alerts,
+            staging,
+            suspended: None,
+        }
     }
-}
 
-struct PaneAlertApplication {
-    alerts: Option<FundedPaneAlerts>,
-    staging: Arc<Mutex<PaneAlertStaging>>,
+    /// Takes the batch's staged alerts out before the parser hands the
+    /// terminal lock over between slices (ft-yccm0.2.3). Terminal work by
+    /// other lock holders meanwhile then raises nothing into this funded
+    /// batch: as between any two batches, it is not charged to output.
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    fn suspend(&mut self) {
+        if self.alerts.is_some() && self.suspended.is_none() {
+            self.suspended = self.staging.lock().active.take();
+        }
+    }
+
+    /// Reinstalls the staged alerts once the parser holds the lock again.
+    fn resume(&mut self) {
+        if let Some(active) = self.suspended.take() {
+            let mut state = self.staging.lock();
+            assert!(
+                state.active.is_none(),
+                "terminal action batches are serialized"
+            );
+            state.active = Some(active);
+        }
+    }
 }
 
 impl Drop for PaneAlertApplication {
     fn drop(&mut self) {
+        self.resume();
         let Some(mut batch) = self.alerts.take() else {
             return;
         };
@@ -4411,6 +5041,10 @@ impl Drop for PaneAlertApplication {
 
 impl AlertHandler for LocalPaneNotifHandler {
     fn alert(&mut self, mut alert: Alert) {
+        if matches!(alert, Alert::PaletteChanged) {
+            // Render facts track the palette for every pane, registered or not.
+            self.render_facts.palette_may_have_changed();
+        }
         let mut state = self.staging.lock();
         let Some(active) = state.active.as_mut() else {
             // Unregistered model-only batches never acquire authority midway
@@ -4474,6 +5108,53 @@ fn split_child(
 }
 
 impl LocalPane {
+    /// Runs one producer batch under the terminal lock as the parser, one
+    /// `step` per lock hold (ft-yccm0.2.3). A step stops at a clean boundary
+    /// once `yield_now` says a locker is waiting or the hold has lasted
+    /// [`PARSER_HOLD_BUDGET`]. The facts it applied are then published, the
+    /// batch's alerts are suspended, the lock is handed over and taken
+    /// again, and the next step continues. Returns the guard, still held.
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    fn run_parser_slices<'a>(
+        &'a self,
+        mut terminal: TerminalGuard<'a>,
+        application: &mut PaneAlertApplication,
+        step: &mut dyn FnMut(&mut Terminal, &mut dyn FnMut() -> bool) -> SliceProgress,
+    ) -> TerminalGuard<'a> {
+        let mut held_since = Instant::now();
+        let mut handoffs = 0_u64;
+        loop {
+            let progress = step(&mut terminal, &mut || {
+                self.terminal.demanded() || held_since.elapsed() >= PARSER_HOLD_BUDGET
+            });
+            if progress == SliceProgress::Done {
+                break;
+            }
+            self.render_facts.publish(&mut terminal);
+            application.suspend();
+            let held = held_since.elapsed();
+            let demanded = self.terminal.demanded();
+            self.terminal.hand_over(terminal);
+            handoffs += 1;
+            log::trace!(
+                "pane {} parser handed the terminal lock over after {held:?} (demanded: {demanded})",
+                self.pane_id
+            );
+            terminal = self.terminal.lock_as(TerminalLockHolder::Parser);
+            application.resume();
+            held_since = Instant::now();
+        }
+        if handoffs > 0 {
+            metrics::counter!("mux.parser.terminal_lock_handoffs").increment(handoffs);
+            log::debug!(
+                "pane {} applied one batch in {} lock holds",
+                self.pane_id,
+                handoffs + 1
+            );
+        }
+        terminal
+    }
+
     fn prepare_alert_output(
         &self,
     ) -> Result<Option<crate::PaneAlertOutput>, PaneActionAdmissionRefusal> {
@@ -4490,6 +5171,75 @@ impl LocalPane {
             .reserve_alert_output()
             .map(Some)
             .ok_or(PaneActionAdmissionRefusal::Retired)
+    }
+
+    /// The fused live path (ft-yccm0.3.2.1): parses `bytes` with the parse
+    /// thread's `parser` straight into the terminal, under the same locks
+    /// and alert admission as `perform_actions`, storing no actions. Every
+    /// alert source and synchronized-output control is diverted, with
+    /// everything after it, into `diverted`, which the parse thread applies
+    /// through the admitted path; so the batch needs only the funding of its
+    /// one output alert. On refusal nothing was parsed or applied.
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    pub(crate) fn feed_fused(
+        &self,
+        parser: &mut termwiz::escape::parser::Parser,
+        bytes: &[u8],
+        diverted: &mut Vec<Action>,
+    ) -> Result<(), PaneActionAdmissionRefusal> {
+        self.feed_fused_through(parser, bytes, &mut FusedFeedGate, diverted)
+    }
+
+    /// [`Self::feed_fused`] for a synchronized-output frame the parse thread
+    /// held raw: its BSU and ESU are applied in place
+    /// ([`SynchronizedFrameFeedGate`]).
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    pub(crate) fn feed_fused_frame(
+        &self,
+        parser: &mut termwiz::escape::parser::Parser,
+        bytes: &[u8],
+        diverted: &mut Vec<Action>,
+    ) -> Result<(), PaneActionAdmissionRefusal> {
+        self.feed_fused_through(parser, bytes, &mut SynchronizedFrameFeedGate, diverted)
+    }
+
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    fn feed_fused_through<G: frankenterm_term::FeedGate>(
+        &self,
+        parser: &mut termwiz::escape::parser::Parser,
+        bytes: &[u8],
+        gate: &mut G,
+        diverted: &mut Vec<Action>,
+    ) -> Result<(), PaneActionAdmissionRefusal> {
+        // Covers admission, apply and the durability handoff (ft-yccm0.1.5).
+        let _parse_batch = procinfo::signpost_interval(procinfo::SignpostName::ParseBatch);
+        let mut output = self.prepare_alert_output()?;
+        let _output_application = self.output_application.lock();
+        let alerts = FundedPaneAlerts::reserve(
+            PaneAlertPreflight::output_only(),
+            &mut output,
+            &self.terminal,
+        )?;
+        {
+            let terminal = self.terminal.lock_as(TerminalLockHolder::Parser);
+            let mut application =
+                PaneAlertApplication::install(alerts, Arc::clone(&self.alert_staging));
+            // Applied in slices that hand the lock to waiting lockers
+            // (ft-yccm0.2.3); see SlicedFeed for why that is exact.
+            let mut sliced = SlicedFeed::new(bytes, FEED_SLICE_BYTES);
+            let mut terminal =
+                self.run_parser_slices(terminal, &mut application, &mut |terminal, yield_now| {
+                    sliced.run(terminal, parser, gate, diverted, yield_now)
+                });
+            drop(application);
+            self.render_facts.publish(&mut terminal);
+        }
+        let sink = self.scrollback_flush_sink.lock().clone();
+        if let Some(sink) = sink {
+            drop(self.locked_terminal());
+            self.drain_scrollback_outside_terminal(sink);
+        }
+        Ok(())
     }
 
     fn admit_alert_actions(
@@ -4567,12 +5317,13 @@ impl LocalPane {
                 .map_err(LegacyTerminalCaptureError::ActionAdmission)?
         };
         let _output_application = self.output_application.lock();
-        let mut terminal = self.locked_terminal();
+        let mut terminal = self.locked_terminal_as(TerminalLockHolder::Parser);
         if !pending_actions.is_empty() {
             let pending_title = terminal.pending_tmux_title_bytes();
             self.admit_alert_actions(pending_actions, pending_title, &mut output)
                 .map_err(LegacyTerminalCaptureError::ActionAdmission)?
                 .apply(&mut terminal);
+            self.render_facts.publish(&mut terminal);
         }
         let staged = terminal.capture_staged(limits)?;
         Ok(staged.bind_external_parser_ground(ground))
@@ -4628,12 +5379,13 @@ impl LocalPane {
         // 1. Under terminal lock: drain/apply actions, capture hot state, pin cold generation
         let staged = {
             let _output_application = self.output_application.lock();
-            let mut terminal = self.locked_terminal();
+            let mut terminal = self.locked_terminal_as(TerminalLockHolder::Parser);
             if policy == PendingActionDrainPolicy::DrainAndApply {
                 let pending_title = terminal.pending_tmux_title_bytes();
                 self.admit_alert_actions(pending_actions, pending_title, &mut output)
                     .map_err(LegacyTerminalCaptureError::ActionAdmission)?
                     .apply(&mut terminal);
+                self.render_facts.publish(&mut terminal);
             }
             terminal.capture_staged(limits).map_err(|e| match e {
                 RecoveryTerminalCheckpointError::Checkpoint(
@@ -5578,6 +6330,31 @@ impl LocalPane {
         }
     }
 
+    /// The Metal renderer's capture (ft-yccm0.4.4). One hold of the fair
+    /// terminal lock copies into `mirror` only the viewport rows that changed
+    /// since its last capture; resolution and instance building happen after
+    /// the lock is released. The lock is taken as a paint locker, so its wait
+    /// and hold land in the paint histograms, and a flooding parser hands it
+    /// over within one apply slice (ft-yccm0.2.3). `None` for a viewport in
+    /// cold scrollback, which is never hydrated under the lock: capture that
+    /// with [`crate::render_mirror::capture_pane_rows`].
+    pub fn capture_render_rows(
+        &self,
+        mirror: &mut crate::render_mirror::RenderMirror,
+        request: &crate::render_mirror::CaptureRequest<'_>,
+    ) -> Option<crate::render_mirror::CaptureStats> {
+        let hide_cursor = self.tmux_domain.lock().is_some();
+        let mut term = self.terminal.lock_as(TerminalLockHolder::Paint);
+        #[cfg(feature = "disruptor-pane-io")]
+        self.drain_action_ring_locked(&mut term);
+        let stats = crate::render_mirror::capture_terminal_rows(&mut term, mirror, request)?;
+        drop(term);
+        if hide_cursor {
+            mirror.hide_cursor();
+        }
+        Some(stats)
+    }
+
     pub fn try_capture_render_frame(
         &self,
         mut viewport: Option<NativeViewport>,
@@ -5586,7 +6363,9 @@ impl LocalPane {
         rules: &[termwiz::hyperlink::Rule],
         detect_password_input: bool,
     ) -> Option<NativeRenderFrame> {
-        let mut term = self.terminal.try_lock()?;
+        let mut term = self
+            .terminal
+            .try_lock_for_as(TerminalLockHolder::Paint, render_capture_wait())?;
         #[cfg(feature = "disruptor-pane-io")]
         self.drain_action_ring_locked(&mut term);
         let hide_cursor = self.tmux_domain.try_lock()?.is_some();
@@ -5925,7 +6704,9 @@ impl LocalPane {
                                 if completion.cancelled.load(Ordering::Acquire) { return; }
                                 let _ = registration.try_with_current(|pane| {
                                     let Some(terminal) = terminal_for_failure.upgrade() else { return; };
-                                    let Some(term) = terminal.try_lock() else { return; };
+                                    let Some(term) =
+                                    terminal.try_lock_as(TerminalLockHolder::Resize)
+                                else { return; };
                                     let current = failure_witness.matches(term.screen());
                                     drop(term);
                                     if current {
@@ -6090,84 +6871,129 @@ impl LocalPane {
         empty()
     }
 
+    /// Move this batch's hot-tier overflow into the sink's bounded queue in
+    /// short terminal-lock slices, then hand the queue to the sink's
+    /// durability writer. No storage IO runs on the parser (ft-yccm0.2.1.1).
+    ///
+    /// The parser waits only when the bounded queue refuses a row, and then
+    /// on the writer's progress signal with no terminal lock held. Until the
+    /// overload policy (ft-yccm0.2.1.6) can drop rows into explicit gaps,
+    /// that wait is what keeps refused rows from growing Screen without bound.
     fn drain_scrollback_outside_terminal(
         &self,
         mut sink: Arc<dyn frankenterm_term::config::ScrollbackSpillSink>,
     ) {
-        let mut reported_failure = false;
-        let mut needs_flush = true;
+        use frankenterm_term::config::{ScrollbackCapacityWait, ScrollbackSpillError};
+        use frankenterm_term::DeferredScrollbackTrim;
+        // Bounds how long a parser waiting on durability goes without seeing
+        // an explicit close. Progress wakes the wait immediately.
+        const CAPACITY_WAIT: Duration = Duration::from_millis(100);
+
+        let mut reported_stall = false;
         loop {
-            if matches!(
-                *self.process.lock(),
-                ProcessState::Running { killed: true, .. }
-                    | ProcessState::DeadPendingClose { killed: true }
-                    | ProcessState::Dead
-            ) {
+            if self.process_close_requested() {
+                // Close marker: the writer finishes rows already admitted.
+                let _ = sink.request_scrollback_flush();
                 return;
             }
-            let flushed = if needs_flush {
-                sink.flush_scrollback()
-            } else {
-                Ok(())
+            let mut terminal = self.locked_terminal_as(TerminalLockHolder::Parser);
+            let result = terminal.trim_deferred_scrollback();
+            if !matches!(
+                result,
+                DeferredScrollbackTrim::Settled { moved: false }
+                    | DeferredScrollbackTrim::AdmissionBlocked { moved: false }
+            ) {
+                // Moved rows change the scrollback geometry.
+                self.render_facts.publish(&mut terminal);
+            }
+            let current = self.scrollback_flush_sink.lock().clone();
+            // Wake a queued reader before another geometry slice can
+            // reacquire the mutex.
+            TerminalGuard::unlock_fair(terminal);
+            let Some(current) = current else {
+                return;
             };
-            let stalled = match flushed {
-                Ok(()) => {
-                    let mut terminal = self.locked_terminal();
-                    let result = terminal.trim_deferred_scrollback();
-                    let current = self.scrollback_flush_sink.lock().clone();
-                    // Wake a queued reader before another geometry slice can
-                    // reacquire the mutex. Durability still runs outside it.
-                    MutexGuard::unlock_fair(terminal);
-                    let Some(current) = current else {
-                        return;
-                    };
-                    sink = current;
-                    match result {
-                        frankenterm_term::DeferredScrollbackTrim::Settled { moved: false } => {
-                            if needs_flush {
-                                return;
-                            }
-                            // Resize/configuration may settle the overflow
-                            // between yielded slices. Earlier slices still
-                            // own queued rows that must reach durability.
-                            needs_flush = true;
-                            false
+            sink = current;
+            let failure: Option<ScrollbackSpillError> = match result {
+                DeferredScrollbackTrim::Yielded => {
+                    metrics::counter!("mux.scrollback.geometry_yields").increment(1);
+                    // Opportunistic try-lock readers do not queue on the
+                    // mutex; give their executor a scheduling turn.
+                    std::thread::yield_now();
+                    None
+                }
+                DeferredScrollbackTrim::Settled { .. } => {
+                    // Rows admitted while the batch applied, or by earlier
+                    // yielded slices, reach durability through this handoff.
+                    if let Err(error) = sink.request_scrollback_flush() {
+                        self.report_scrollback_failure(&mut reported_stall, error);
+                    }
+                    return;
+                }
+                DeferredScrollbackTrim::AdmissionBlocked { moved: true } => {
+                    // A full queue after progress is normal capacity, not a
+                    // failure: retry admission before deciding to wait.
+                    sink.request_scrollback_flush().err()
+                }
+                DeferredScrollbackTrim::AdmissionBlocked { moved: false } => {
+                    let requested = sink.request_scrollback_flush();
+                    match sink.await_scrollback_capacity(CAPACITY_WAIT) {
+                        ScrollbackCapacityWait::Progressed => None,
+                        ScrollbackCapacityWait::TimedOut => {
+                            // The writer is behind, not failing; this pane
+                            // is being backpressured.
+                            metrics::counter!("mux.scrollback.persistence_backpressure")
+                                .increment(1);
+                            requested.err()
                         }
-                        frankenterm_term::DeferredScrollbackTrim::Yielded => {
-                            needs_flush = false;
-                            metrics::counter!("mux.scrollback.geometry_yields").increment(1);
-                            // Opportunistic try-lock readers do not queue on
-                            // the mutex; give their executor a scheduling turn.
-                            std::thread::yield_now();
-                            false
-                        }
-                        frankenterm_term::DeferredScrollbackTrim::Settled { moved }
-                        | frankenterm_term::DeferredScrollbackTrim::AdmissionBlocked { moved } => {
-                            // A yielded slice may have filled the pending
-                            // queue. Flush that batch immediately: refusal
-                            // before attempting durability is normal capacity
-                            // backpressure, not a failed persistence attempt.
-                            let stalled = needs_flush && !moved;
-                            needs_flush = true;
-                            stalled
+                        ScrollbackCapacityWait::Failed(error) => {
+                            metrics::counter!("mux.scrollback.persistence_backpressure")
+                                .increment(1);
+                            Some(error)
                         }
                     }
                 }
-                Err(_) => true,
             };
-            if stalled {
-                if !reported_failure {
-                    log::error!(
-                        "pane {} scrollback persistence is stalled; retaining rows and applying parser backpressure outside the terminal lock",
-                        self.pane_id
-                    );
-                    reported_failure = true;
-                }
-                metrics::counter!("mux.scrollback.persistence_backpressure").increment(1);
-                // This is the blocking parser thread, not an async executor or
-                // the GUI. Explicit pane close ends retries; failures never
-                // permit another input batch to grow retained memory forever.
-                std::thread::sleep(Duration::from_millis(100));
+            if let Some(error) = failure {
+                self.report_scrollback_failure(&mut reported_stall, error);
+            }
+        }
+    }
+
+    fn process_close_requested(&self) -> bool {
+        matches!(
+            *self.process.lock(),
+            ProcessState::Running { killed: true, .. }
+                | ProcessState::DeadPendingClose { killed: true }
+                | ProcessState::Dead
+        )
+    }
+
+    fn report_scrollback_failure(
+        &self,
+        reported: &mut bool,
+        error: frankenterm_term::config::ScrollbackSpillError,
+    ) {
+        if !*reported {
+            log::error!(
+                "pane {} scrollback durability is failing ({error}); retaining rows and applying parser backpressure outside the terminal lock",
+                self.pane_id
+            );
+            *reported = true;
+        }
+    }
+
+    /// Pane close enqueues a close marker. The writer commits rows the pane
+    /// already admitted, then drops the sink, which releases its store.
+    fn request_scrollback_durability_on_close(&self) {
+        let sink = self.scrollback_flush_sink.lock().clone();
+        if let Some(sink) = sink {
+            // Close ends the commit window: no further rows will join it.
+            if let Err(error) = sink.request_scrollback_commit() {
+                log::warn!(
+                    "pane {} closed with scrollback durability degraded: {error}",
+                    self.pane_id
+                );
             }
         }
     }
@@ -6231,8 +7057,8 @@ impl LocalPane {
     /// the terminal reflects all parsed output before the caller observes it.
     #[cfg(feature = "disruptor-pane-io")]
     #[inline]
-    fn locked_terminal(&self) -> MutexGuard<'_, Terminal> {
-        let mut term = self.terminal.lock();
+    fn locked_terminal_as(&self, holder: TerminalLockHolder) -> TerminalGuard<'_> {
+        let mut term = self.terminal.lock_as(holder);
         self.drain_action_ring_locked(&mut term);
         term
     }
@@ -6240,8 +7066,21 @@ impl LocalPane {
     /// Default build: a transparent wrapper around the terminal mutex.
     #[cfg(not(feature = "disruptor-pane-io"))]
     #[inline]
-    fn locked_terminal(&self) -> MutexGuard<'_, Terminal> {
-        self.terminal.lock()
+    fn locked_terminal_as(&self, holder: TerminalLockHolder) -> TerminalGuard<'_> {
+        self.terminal.lock_as(holder)
+    }
+
+    /// The terminal for a holder kind not tagged separately (ft-yccm0.1.5).
+    #[inline]
+    fn locked_terminal(&self) -> TerminalGuard<'_> {
+        self.locked_terminal_as(TerminalLockHolder::Other)
+    }
+
+    /// Queues a reply to one of the child's queries on the terminal's writer,
+    /// behind everything the terminal has already written. Never waits for
+    /// the child to read it (ft-yccm0.2.2.5).
+    pub(crate) fn enqueue_terminal_reply(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.locked_terminal().enqueue_reply(bytes)
     }
 
     /// Apply every staged action batch to `term`, in FIFO order, emptying the
@@ -6250,18 +7089,27 @@ impl LocalPane {
     #[cfg(feature = "disruptor-pane-io")]
     #[inline]
     fn drain_action_ring_locked(&self, term: &mut Terminal) {
-        Self::drain_action_ring_into(self.action_ring.as_ref(), term);
+        if Self::drain_action_ring_into(self.action_ring.as_ref(), term) {
+            self.render_facts.publish(term);
+        }
     }
 
     /// Drain `action_ring` into `term` while the caller holds the terminal
-    /// mutex. This is shared by normal `LocalPane` terminal access and the
-    /// resize worker, whose static helper cannot call `locked_terminal`.
+    /// mutex, returning whether any batch was applied. This is shared by
+    /// normal `LocalPane` terminal access and the resize worker, whose static
+    /// helper cannot call `locked_terminal`.
     #[cfg(feature = "disruptor-pane-io")]
     #[inline]
-    fn drain_action_ring_into(action_ring: &ArrayQueue<AdmittedPaneActions>, term: &mut Terminal) {
+    fn drain_action_ring_into(
+        action_ring: &ArrayQueue<AdmittedPaneActions>,
+        term: &mut Terminal,
+    ) -> bool {
+        let mut applied = false;
         while let Some(actions) = action_ring.pop() {
             actions.apply(term);
+            applied = true;
         }
+        applied
     }
 
     /// Producer side (parser thread). If the terminal lock is free, drain any
@@ -6276,15 +7124,18 @@ impl LocalPane {
         if actions.actions.is_empty() {
             return;
         }
-        if let Some(mut term) = self.terminal.try_lock() {
-            self.drain_action_ring_locked(&mut term);
+        if let Some(mut term) = self.terminal.try_lock_as(TerminalLockHolder::Parser) {
+            Self::drain_action_ring_into(self.action_ring.as_ref(), &mut term);
             actions.apply(&mut term);
+            self.render_facts.publish(&mut term);
             return;
         }
+        // A staged batch is published by whichever caller drains the ring.
         if let Err(actions) = self.action_ring.push(actions) {
-            let mut term = self.terminal.lock();
-            self.drain_action_ring_locked(&mut term);
+            let mut term = self.terminal.lock_as(TerminalLockHolder::Parser);
+            Self::drain_action_ring_into(self.action_ring.as_ref(), &mut term);
             actions.apply(&mut term);
+            self.render_facts.publish(&mut term);
         }
     }
 
@@ -6301,6 +7152,33 @@ impl LocalPane {
     {
         let _terminal = self.terminal.lock();
         f();
+    }
+
+    /// Bench-only hook (feature `bench-hooks`) for
+    /// `mux/benches/render_facts_publication.rs`: with `skip` set, batches are
+    /// applied without publishing `PaneRenderFacts`, so the bench can measure
+    /// the publication's cost (ft-yccm0.2.2.1).
+    #[cfg(feature = "bench-hooks")]
+    #[doc(hidden)]
+    pub fn bench_skip_render_facts_publication(&self, skip: bool) {
+        self.render_facts
+            .skip_publication
+            .store(skip, Ordering::Relaxed);
+    }
+
+    /// Bench-only entry (feature `bench-hooks`) to the fused live path the
+    /// parse thread takes for bulk output (`feed_fused`, ft-yccm0.3.2.1), so
+    /// the render-facts bench measures that path too.
+    #[cfg(all(feature = "bench-hooks", not(feature = "disruptor-pane-io")))]
+    #[doc(hidden)]
+    pub fn bench_feed_fused(
+        &self,
+        parser: &mut termwiz::escape::parser::Parser,
+        bytes: &[u8],
+        diverted: &mut Vec<Action>,
+    ) -> anyhow::Result<()> {
+        self.feed_fused(parser, bytes, diverted)
+            .map_err(|refusal| anyhow::anyhow!("fused feed refused: {:?}", refusal))
     }
 
     fn enqueue_resize(&self, size: TerminalSize, reconcile_tab: bool) -> Result<(), Error> {
@@ -6378,20 +7256,23 @@ impl LocalPane {
                 Arc::clone(&self.pty),
                 Arc::clone(&self.resize_queue),
                 Arc::clone(&self.mux_registration),
+                Arc::clone(&self.render_facts),
             );
         }
 
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_resize_worker(
         pane_id: PaneId,
-        terminal: Arc<Mutex<Terminal>>,
+        terminal: Arc<TerminalMutex>,
         line_layout_observation: Arc<LineLayoutObservation>,
         #[cfg(feature = "disruptor-pane-io")] action_ring: Arc<ArrayQueue<AdmittedPaneActions>>,
         pty: Arc<Mutex<Box<dyn MasterPty>>>,
         resize_queue: Arc<Mutex<ResizeQueueState>>,
         registration: Arc<PaneRegistrationSlot>,
+        render_facts: Arc<RenderFactsPublisher>,
     ) {
         let worker_terminal = Arc::clone(&terminal);
         let worker_line_layout_observation = Arc::clone(&line_layout_observation);
@@ -6400,6 +7281,7 @@ impl LocalPane {
         let worker_pty = Arc::clone(&pty);
         let worker_queue = Arc::clone(&resize_queue);
         let worker_registration = Arc::clone(&registration);
+        let worker_render_facts = Arc::clone(&render_facts);
         let spawn_result = std::thread::Builder::new()
             .name(format!("pane-resize-{}", pane_id))
             .spawn(move || {
@@ -6412,6 +7294,7 @@ impl LocalPane {
                     worker_pty,
                     worker_queue,
                     worker_registration,
+                    worker_render_facts,
                     true,
                 );
             });
@@ -6438,19 +7321,22 @@ impl LocalPane {
                 pty,
                 resize_queue,
                 registration,
+                render_facts,
                 false,
             );
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_resize_worker(
         pane_id: PaneId,
-        terminal: Arc<Mutex<Terminal>>,
+        terminal: Arc<TerminalMutex>,
         line_layout_observation: Arc<LineLayoutObservation>,
         #[cfg(feature = "disruptor-pane-io")] action_ring: Arc<ArrayQueue<AdmittedPaneActions>>,
         pty: Arc<Mutex<Box<dyn MasterPty>>>,
         resize_queue: Arc<Mutex<ResizeQueueState>>,
         registration: Arc<PaneRegistrationSlot>,
+        render_facts: Arc<RenderFactsPublisher>,
         allow_cold_preparation: bool,
     ) {
         while let Some(pending) = {
@@ -6478,6 +7364,9 @@ impl LocalPane {
             });
             let settled_apply_result = apply_result
                 .map(|result| recover_resize_apply_error(resize_queue.as_ref(), pending, result));
+            // Publish the committed geometry before any completion can wake
+            // a reader of the new size.
+            render_facts.publish(&mut terminal.lock_as(TerminalLockHolder::Resize));
             if matches!(&settled_apply_result, Ok(Ok(metrics)) if !metrics.cancelled) {
                 if let Some(registration) = pending_registration {
                     // Reconcile primary committed size before cold preparation waits,
@@ -6492,6 +7381,7 @@ impl LocalPane {
                             token,
                             registration,
                         );
+                        render_facts.publish(&mut terminal.lock_as(TerminalLockHolder::Resize));
                     }
                 }
             }
@@ -6633,7 +7523,7 @@ impl LocalPane {
     /// unable to cross its old-width cold/resident boundary.
     fn prepare_cold_layout_after_resize(
         pane_id: PaneId,
-        terminal: &Mutex<Terminal>,
+        terminal: &TerminalMutex,
         line_layout_observation: &LineLayoutObservation,
         resize_queue: &Arc<Mutex<ResizeQueueState>>,
         token: ResizeCancellationToken,
@@ -6659,7 +7549,9 @@ impl LocalPane {
                     let Some(seam) = retry_cold_resize_step("seam_capture", &cancelled, || {
                         registration
                             .try_with_current(|_| {
-                                let Some(term) = terminal.try_lock() else {
+                                let Some(term) =
+                                    terminal.try_lock_as(TerminalLockHolder::Resize)
+                                else {
                                     return Ok(None);
                                 };
                                 term.capture_cold_seam_reflow().map(Some)
@@ -6679,7 +7571,9 @@ impl LocalPane {
                     let installed = retry_cold_resize_step("seam_commit", &cancelled, || {
                         registration
                             .try_with_current(|_| {
-                                let Some(mut term) = terminal.try_lock() else {
+                                let Some(mut term) =
+                                    terminal.try_lock_as(TerminalLockHolder::Resize)
+                                else {
                                     return Ok(None);
                                 };
                                 let (decision, _) =
@@ -6725,7 +7619,9 @@ impl LocalPane {
                     let Some(plan) = retry_cold_resize_step("index_capture", &cancelled, || {
                         registration
                             .try_with_current(|_| -> anyhow::Result<_> {
-                                let Some(term) = terminal.try_lock() else {
+                                let Some(term) =
+                                    terminal.try_lock_as(TerminalLockHolder::Resize)
+                                else {
                                     return Ok(None);
                                 };
                                 let screen = term.screen();
@@ -6753,7 +7649,9 @@ impl LocalPane {
                     let installed = retry_cold_resize_step("index_commit", &cancelled, || {
                         registration
                             .try_with_current(|_| {
-                                let Some(mut term) = terminal.try_lock() else {
+                                let Some(mut term) =
+                                    terminal.try_lock_as(TerminalLockHolder::Resize)
+                                else {
                                     return Ok(None);
                                 };
                                 let (decision, _) =
@@ -6895,14 +7793,14 @@ impl LocalPane {
     }
 
     fn prepare_resize_reflow(
-        terminal: &Mutex<Terminal>,
+        terminal: &TerminalMutex,
         #[cfg(feature = "disruptor-pane-io")] action_ring: &ArrayQueue<AdmittedPaneActions>,
         size: TerminalSize,
         is_cancelled: impl Fn() -> bool,
     ) -> (Option<frankenterm_term::ScreenReflowPreparation>, Duration) {
         let capture_start = Instant::now();
         let mut prepared = {
-            let terminal = terminal.lock();
+            let terminal = terminal.lock_as(TerminalLockHolder::Resize);
             #[cfg(feature = "disruptor-pane-io")]
             let mut terminal = terminal;
             #[cfg(feature = "disruptor-pane-io")]
@@ -6920,7 +7818,7 @@ impl LocalPane {
 
     fn apply_resize_sync(
         pane_id: PaneId,
-        terminal: &Mutex<Terminal>,
+        terminal: &TerminalMutex,
         line_layout_observation: &LineLayoutObservation,
         #[cfg(feature = "disruptor-pane-io")] action_ring: &ArrayQueue<AdmittedPaneActions>,
         pty: &Mutex<Box<dyn MasterPty>>,
@@ -6933,12 +7831,12 @@ impl LocalPane {
         let terminal_probe_lock_start = Instant::now();
         #[cfg(feature = "disruptor-pane-io")]
         let current_size = {
-            let mut terminal = terminal.lock();
+            let mut terminal = terminal.lock_as(TerminalLockHolder::Resize);
             Self::drain_action_ring_into(action_ring, &mut terminal);
             terminal.get_size()
         };
         #[cfg(not(feature = "disruptor-pane-io"))]
-        let current_size = terminal.lock().get_size();
+        let current_size = terminal.lock_as(TerminalLockHolder::Resize).get_size();
         let terminal_probe_lock_wait = terminal_probe_lock_start.elapsed();
 
         let (superseded_by_seq, last_proven_pty_size) = {
@@ -7119,7 +8017,7 @@ impl LocalPane {
         );
 
         let terminal_apply_lock_start = Instant::now();
-        let mut terminal = terminal.lock();
+        let mut terminal = terminal.lock_as(TerminalLockHolder::Resize);
         #[cfg(feature = "disruptor-pane-io")]
         Self::drain_action_ring_into(action_ring, &mut terminal);
         let terminal_apply_lock_wait = terminal_apply_lock_start.elapsed();
@@ -7341,8 +8239,13 @@ impl LocalPane {
             tmux_domain: Arc::clone(&tmux_domain),
             mux_registration: Arc::clone(&mux_registration),
         }));
+        let render_facts = Arc::new(RenderFactsPublisher::new(
+            &mut terminal,
+            Arc::clone(&tmux_domain),
+        ));
         terminal.set_notification_handler(Box::new(LocalPaneNotifHandler {
             staging: Arc::clone(&alert_staging),
+            render_facts: Arc::clone(&render_facts),
         }));
 
         let process = Arc::new(Mutex::new(ProcessState::Running {
@@ -7363,7 +8266,7 @@ impl LocalPane {
             durable_pane_id,
             ownership,
             title_metadata: Mutex::new(Arc::new(Self::capture_title_metadata(&terminal))),
-            terminal: Arc::new(Mutex::new(terminal)),
+            terminal: Arc::new(TerminalMutex::new(terminal)),
             cold_viewport_pending: Arc::new(Mutex::new(None)),
             cold_viewport_retry: Arc::new(AtomicBool::new(false)),
             cold_viewport_failure: Arc::new(Mutex::new(None)),
@@ -7382,6 +8285,7 @@ impl LocalPane {
             writer: Mutex::new(writer),
             domain_id,
             tmux_domain,
+            render_facts,
             mux_registration,
             child_exit_prune,
             proc_list: Arc::clone(&proc_list),
@@ -7688,6 +8592,70 @@ mod tests {
     use super::*;
     use frankenterm_term::config::ScrollbackSpillSink;
     use std::sync::atomic::AtomicUsize;
+
+    /// ft-yccm0.3.2.1: the fused path funds only the output alert, so its
+    /// gate must divert every action `PaneAlertPreflight` charges more for,
+    /// and every synchronized-output control the parse thread tracks, and
+    /// nothing else.
+    #[test]
+    fn fused_feed_gate_diverts_exactly_the_charged_and_synchronized_actions() {
+        use frankenterm_term::FeedGate;
+        let bytes: &[u8] = b"text \xc3\xa9\x07\x1b]0;title\x07\x1b]2;win\x1b\\\
+            \x1b]1337;SetUserVar=a=Yg==\x07\x1b]7;file://h/p\x07\x1b]777;notify;t;b\x07\
+            \x1bc\x1b\\\x1b[1mbold\x1b[2J\x1b[5;5H\x1b[?2026h\x1b[?2026l\x1b[?2026$p\
+            \x1b[!p\x1bP$qm\x1b\\\x1b_Ga=q,i=1;AAAA\x1b\\\x1b(0q\x1b7\x1b8\r\n\x08\
+            \x1b[?25l\x1b[4h\x1bM\x1b[38;5;196;48;2;1;2;3;4:3m";
+        let actions = termwiz::escape::parser::Parser::new().parse_as_vec(bytes);
+        assert!(actions.len() > 20, "{:?}", actions);
+        let output_only = PaneAlertPreflight::output_only();
+        let mut gate = FusedFeedGate;
+        let mut frame_gate = SynchronizedFrameFeedGate;
+        let (mut charged_seen, mut sync_seen, mut plain_seen) = (0, 0, 0);
+        let (mut sgr_seen, mut switches_seen) = (0, 0);
+        for action in &actions {
+            let preflight = PaneAlertPreflight::for_actions(std::slice::from_ref(action), 0)
+                .expect("a bounded preflight");
+            let charged = preflight.count != output_only.count
+                || preflight.text_bytes != output_only.text_bytes
+                || !preflight.historical.is_empty();
+            let sync = crate::is_synchronized_output_action(action);
+            assert_eq!(gate.diverts(action), charged || sync, "{:?}", action);
+            // A frame held raw applies its BSU and ESU, and diverts the
+            // rest alike.
+            let switch = crate::is_synchronized_output_mode_switch(action);
+            assert_eq!(
+                frame_gate.diverts(action),
+                charged || (sync && !switch),
+                "{:?}",
+                action
+            );
+            switches_seen += usize::from(switch);
+            // The CSI fast path asks about SGR without an Action.
+            if let Action::CSI(CSI::Sgr(sgr)) = action {
+                assert_eq!(gate.diverts_sgr(sgr), gate.diverts(action), "{:?}", action);
+                assert_eq!(
+                    frame_gate.diverts_sgr(sgr),
+                    gate.diverts(action),
+                    "{:?}",
+                    action
+                );
+                sgr_seen += 1;
+            }
+            if charged {
+                charged_seen += 1;
+            } else if sync {
+                sync_seen += 1;
+            } else {
+                plain_seen += 1;
+            }
+        }
+        // The sample covers every class.
+        assert!(charged_seen >= 7, "{} charged", charged_seen);
+        assert_eq!(sync_seen, 4);
+        assert_eq!(switches_seen, 2);
+        assert!(plain_seen >= 10, "{} plain", plain_seen);
+        assert_eq!(sgr_seen, 4);
+    }
 
     #[test]
     fn alert_executor_initialization_failure_is_not_retryable_capacity() {
@@ -9627,6 +10595,7 @@ mod tests {
                         Arc::clone(&pane.pty),
                         Arc::clone(&pane.resize_queue),
                         Arc::clone(&pane.mux_registration),
+                        Arc::clone(&pane.render_facts),
                         false,
                     );
                 });
@@ -9874,6 +10843,7 @@ mod tests {
                 Arc::clone(&target.pty),
                 Arc::clone(&target.resize_queue),
                 Arc::clone(&target.mux_registration),
+                Arc::clone(&target.render_facts),
                 true,
             );
             worker_done_tx.send(()).unwrap();
@@ -12167,6 +13137,57 @@ mod tests {
                 Some(ColdSelectionValue::Captured(Ok(Some(_))))
             )
         }));
+        // A cold worker publishes its result before it retires: its
+        // completion then takes the slot again, to drop the result if it was
+        // cancelled meanwhile. A capture that meets that hold, or that of
+        // any worker still running, reports Busy, as it should: bv19 met it
+        // at the resident capture below, and a run on ts1 at the append
+        // capture. So each step below that expects an exact answer first
+        // waits until every worker has retired: only the pane and the
+        // `owners` capture owners it names still hold the slot.
+        let await_retired_workers = |owners: usize, step: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                while executor.try_tick().unwrap() {}
+                if Arc::strong_count(&pane.cold_selection) <= 1 + owners {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "cold workers did not retire before {}",
+                    step
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        // What a capture that does not settle left behind.
+        let describe_cold_work = |request: &ColdSelectionRequest| {
+            let slot = pane.cold_selection.lock();
+            let state = match slot.iter().find(|work| work.request == *request) {
+                None => "absent".to_string(),
+                Some(work) => format!(
+                    "cancelled {}, ready {}",
+                    work.cancelled.load(Ordering::Acquire),
+                    match work.ready.as_ref().map(|ready| &ready.value) {
+                        None => "none",
+                        Some(ColdSelectionValue::Busy) => "busy",
+                        Some(ColdSelectionValue::RetryAt(_)) => "retry later",
+                        Some(ColdSelectionValue::Captured(Ok(Some(_)))) => "captured",
+                        Some(ColdSelectionValue::Captured(Ok(None))) => "captured nothing",
+                        Some(ColdSelectionValue::Captured(Err(_))) => "capture failed",
+                        Some(ColdSelectionValue::Resolved(_)) => "resolved",
+                    }
+                ),
+            };
+            let permit = crate::pane::LineReadPermit::try_acquire().is_some();
+            format!(
+                "{} works in the slot; this one {}; a line-read permit {}",
+                slot.len(),
+                state,
+                if permit { "is free" } else { "is not free" }
+            )
+        };
+        await_retired_workers(0, "the append capture");
         // Content appended below this closed group advances physical bounds,
         // not its logical layout. An already-owned cold capture must survive
         // that unrelated output and keep its original endpoint authority.
@@ -12223,6 +13244,7 @@ mod tests {
             .downcast_ref::<frankenterm_term::screen::ScreenSelectionAnchor>()
             .is_some()));
         drop(append_state);
+        await_retired_workers(0, "the abandoned captures");
         // A GUI gesture can be superseded after its real cold worker has
         // completed but before the next paint delivers the token. Twenty
         // distinct abandoned captures must not exhaust Screen's sixteen
@@ -12273,10 +13295,16 @@ mod tests {
                     }
                     assert!(
                         Instant::now() < deadline,
-                        "owned cold capture did not settle"
+                        "owned cold capture {} did not settle: {}",
+                        abandoned,
+                        describe_cold_work(&request)
                     );
                     std::thread::sleep(Duration::from_millis(1));
                 }
+                // This capture's owner (`state`) still holds the slot. Its
+                // worker retires first, so it cannot drop the cancelled token
+                // below, which the next capture must reclaim.
+                await_retired_workers(1, "the owner is dropped");
                 // Force the owner's nonblocking retirement to lose the slot
                 // race. The next capture must reclaim this cancelled strong
                 // token before registering a new one.
@@ -12346,6 +13374,8 @@ mod tests {
         assert!(survivor.as_ref().is_some_and(|state| state
             .downcast_ref::<frankenterm_term::screen::ScreenSelectionAnchor>()
             .is_some()));
+        // The admissions below try the slot once each.
+        await_retired_workers(0, "the seeded admissions");
         // A superseded completion may only retire its own generation. This
         // exercises the production RAII guard used by canceled read workers.
         let old_cancelled = Arc::new(AtomicBool::new(true));
@@ -12618,6 +13648,7 @@ mod tests {
                 })
             );
             if cols != 20 {
+                await_retired_workers(0, "the stale gesture's capture");
                 assert!(
                     matches!(
                         pane.capture_selection_anchor(
@@ -15431,7 +16462,7 @@ mod tests {
 
     #[test]
     fn resize_preparation_releases_locks_and_observes_supersession() {
-        let terminal = Mutex::new(Terminal::new(
+        let terminal = TerminalMutex::new(Terminal::new(
             term_size(80, 3),
             Arc::new(GuardianLifetimeTestTermConfig),
             "FrankenTerm",
@@ -15486,6 +16517,68 @@ mod tests {
             });
         assert!(matches!(decision, ResizeCommitDecision::Superseded { .. }));
         assert_eq!(terminal.get_size(), term_size(80, 3));
+    }
+
+    /// ft-yccm0.2.2.3: a paint's bounded terminal lock registers demand while
+    /// it waits, so a flooding parser's slice handoff (ft-yccm0.2.3) gives it
+    /// the lock; a bare try_lock registered none and almost always found the
+    /// lock held. A hold that outlasts the wait makes the paint give up and
+    /// withdraw its demand, and a zero wait only tries.
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    #[test]
+    fn a_paint_lock_registers_demand_while_it_waits_and_withdraws_it_on_timeout() {
+        let terminal = Arc::new(TerminalMutex::new(Terminal::new(
+            term_size(80, 3),
+            Arc::new(GuardianLifetimeTestTermConfig),
+            "FrankenTerm",
+            "paint-lock-test",
+            Box::new(std::io::sink()),
+        )));
+        let held = terminal.lock_as(TerminalLockHolder::Parser);
+        assert!(terminal
+            .try_lock_for_as(TerminalLockHolder::Paint, Duration::ZERO)
+            .is_none());
+        assert!(!terminal.demanded(), "a zero wait only tries");
+
+        let served = terminal.served.load(Ordering::Acquire);
+        let paint = {
+            let terminal = Arc::clone(&terminal);
+            std::thread::spawn(move || {
+                terminal
+                    .try_lock_for_as(TerminalLockHolder::Paint, Duration::from_secs(30))
+                    .is_some()
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !terminal.demanded() {
+            assert!(
+                Instant::now() < deadline,
+                "the waiting paint never registered demand"
+            );
+            std::thread::yield_now();
+        }
+        // The parser answers demand at its next slice boundary.
+        terminal.hand_over(held);
+        assert!(
+            paint.join().unwrap(),
+            "the handed-over lock reached the paint"
+        );
+        assert_eq!(terminal.served.load(Ordering::Acquire), served + 1);
+        assert!(!terminal.demanded());
+
+        let held = terminal.lock_as(TerminalLockHolder::Parser);
+        let started = Instant::now();
+        assert!(terminal
+            .try_lock_for_as(TerminalLockHolder::Paint, Duration::from_millis(20))
+            .is_none());
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert!(!terminal.demanded(), "a given-up wait withdraws its demand");
+        assert_eq!(
+            terminal.served.load(Ordering::Acquire),
+            served + 1,
+            "a given-up wait was not served"
+        );
+        drop(held);
     }
 
     #[test]
@@ -15833,10 +16926,7 @@ mod tests {
                 .capture_pane_operation(pane.pane_id())
                 .expect("admit current pane operation");
             let control = &generation.live_parser_checkpoint;
-            let (mut writer, mut reader) = crate::allocate_socketpair().expect("parser socket");
-            writer
-                .set_non_blocking(true)
-                .expect("nonblocking parser writer");
+            let (writer, mut reader) = crate::pane_byte_ring::pane_byte_ring(2, 1024);
             let (mut wake_writer, _wake_reader) =
                 crate::allocate_socketpair().expect("wake socket");
             wake_writer
@@ -15852,9 +16942,13 @@ mod tests {
                 .write_delivered_bytes(b"ab")
                 .expect("deliver authenticated bytes");
             let mut delivered = [0; 2];
-            reader
-                .read_exact(&mut delivered)
-                .expect("read delivered parser bytes");
+            match reader.peek(2).expect("read delivered parser bytes") {
+                crate::pane_byte_ring::RingRead::Bytes(bytes) => {
+                    delivered.copy_from_slice(bytes);
+                }
+                _ => panic!("the authenticated bytes were published"),
+            }
+            reader.consume(2);
             assert_eq!(&delivered, b"ab");
             let mut parser = termwiz::escape::parser::Parser::new();
             let mut staged = Vec::new();
@@ -16400,6 +17494,715 @@ mod tests {
         }
     }
 
+    /// ft-yccm0.2.1.1: a sink with its own durability writer. The parser
+    /// may only hand rows over and, when the queue refuses one, wait for
+    /// writer progress; any blocking flush on the parser fails the test.
+    #[derive(Debug, Default)]
+    struct HandoffOnlySink {
+        rows: std::sync::Mutex<Vec<(StableRowIndex, String)>>,
+        written: AtomicUsize,
+        handoffs: AtomicUsize,
+        capacity_waits: AtomicUsize,
+    }
+
+    impl HandoffOnlySink {
+        const QUEUE_ROWS: usize = 16;
+    }
+
+    impl frankenterm_term::config::ScrollbackSpillSink for HandoffOnlySink {
+        fn requires_scrollback_flush(&self) -> bool {
+            true
+        }
+
+        fn flush_scrollback(&self) -> Result<(), frankenterm_term::config::ScrollbackSpillError> {
+            panic!("the parser must never run a blocking scrollback flush")
+        }
+
+        fn request_scrollback_flush(
+            &self,
+        ) -> Result<(), frankenterm_term::config::ScrollbackSpillError> {
+            self.handoffs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn await_scrollback_capacity(
+            &self,
+            _timeout: Duration,
+        ) -> frankenterm_term::config::ScrollbackCapacityWait {
+            // The writer drains everything queued, then signals progress.
+            self.capacity_waits.fetch_add(1, Ordering::SeqCst);
+            self.written
+                .store(self.rows.lock().unwrap().len(), Ordering::SeqCst);
+            frankenterm_term::config::ScrollbackCapacityWait::Progressed
+        }
+
+        fn store_scrollback_line(
+            &self,
+            stable_row: StableRowIndex,
+            line: &Line,
+            _max_retained_rows: usize,
+        ) -> bool {
+            let mut rows = self.rows.lock().unwrap();
+            if rows.len() - self.written.load(Ordering::SeqCst) >= Self::QUEUE_ROWS {
+                return false;
+            }
+            rows.push((stable_row, line.as_str().trim_end().to_string()));
+            true
+        }
+
+        fn load_scrollback_line(&self, stable_row: StableRowIndex) -> Option<Line> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(row, _)| *row == stable_row)
+                .map(|(_, text)| {
+                    Line::from_text(
+                        text,
+                        &frankenterm_term::CellAttributes::blank(),
+                        0,
+                        None,
+                    )
+                })
+        }
+
+        fn oldest_scrollback_row(&self) -> Option<StableRowIndex> {
+            self.rows.lock().unwrap().first().map(|(row, _)| *row)
+        }
+
+        fn retained_scrollback_rows(&self) -> usize {
+            self.rows.lock().unwrap().len()
+        }
+
+        fn retained_scrollback_bytes(&self) -> usize {
+            self.rows.lock().unwrap().len() * 80
+        }
+
+        fn snapshot_scrollback(
+            &self,
+            _expected_newest_exclusive: StableRowIndex,
+            _limits: frankenterm_term::config::ScrollbackSnapshotLimits,
+        ) -> Result<
+            frankenterm_term::config::ScrollbackSnapshot,
+            frankenterm_term::config::ScrollbackSpillError,
+        > {
+            Err(frankenterm_term::config::ScrollbackSpillError::StorageUnavailable)
+        }
+
+        fn replace_scrollback_prefix(
+            &self,
+            _expected_generation: Option<frankenterm_term::config::ScrollbackSnapshotGeneration>,
+            _prefix: frankenterm_term::config::ScrollbackPrefix<'_>,
+            _max_retained_rows: usize,
+        ) -> Result<
+            frankenterm_term::config::ScrollbackReplaceCommit,
+            frankenterm_term::config::ScrollbackSpillError,
+        > {
+            Err(frankenterm_term::config::ScrollbackSpillError::StorageUnavailable)
+        }
+
+        fn clear_scrollback(
+            &self,
+        ) -> Result<
+            frankenterm_term::config::ScrollbackClearCommit,
+            frankenterm_term::config::ScrollbackSpillError,
+        > {
+            Err(frankenterm_term::config::ScrollbackSpillError::StorageUnavailable)
+        }
+    }
+
+    #[test]
+    fn perform_actions_hands_scrollback_to_the_writer_without_store_io() {
+        #[derive(Debug)]
+        struct HandoffConfig(Arc<HandoffOnlySink>);
+        impl TerminalConfiguration for HandoffConfig {
+            fn color_palette(&self) -> ColorPalette {
+                ColorPalette::default()
+            }
+            fn scrollback_size(&self) -> usize {
+                2048
+            }
+            fn scrollback_tier_config(&self) -> frankenterm_term::config::ScrollbackTierConfig {
+                frankenterm_term::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 1,
+                    warm_max_bytes: 0,
+                }
+            }
+            fn scrollback_spill_sink(
+                &self,
+            ) -> Option<Arc<dyn frankenterm_term::config::ScrollbackSpillSink>> {
+                Some(self.0.clone())
+            }
+        }
+
+        let sink = Arc::new(HandoffOnlySink::default());
+        let mut terminal = Terminal::new(
+            term_size(80, 4),
+            Arc::new(HandoffConfig(sink.clone())),
+            "FrankenTerm",
+            "durability-handoff-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        // The queue admits 16 rows while this output scrolls; Screen keeps
+        // the refused overflow until the pane's parser maintenance runs.
+        for row in 0..70 {
+            terminal.advance_bytes(format!("row-{row:02}\r\n").as_bytes());
+        }
+        assert_eq!(sink.rows.lock().unwrap().len(), HandoffOnlySink::QUEUE_ROWS);
+        let pane = make_legacy_test_pane(788, terminal);
+        pane.perform_actions(vec![Action::Print('x')])
+            .expect("test action admission");
+
+        let rows = sink.rows.lock().unwrap().clone();
+        assert_eq!(rows.len(), 66, "every overflow row reached the queue");
+        for (index, (stable_row, text)) in rows.iter().enumerate() {
+            assert_eq!(*stable_row, index as StableRowIndex);
+            assert_eq!(text, &format!("row-{index:02}"));
+        }
+        // 50 refused rows in 16-row queues: at least three progress waits.
+        assert!(sink.capacity_waits.load(Ordering::SeqCst) >= 3);
+        let handoffs = sink.handoffs.load(Ordering::SeqCst);
+        assert!(handoffs >= 1, "the settled batch must reach the writer");
+
+        // Pane close is a durability handoff (close marker), never a flush.
+        pane.kill();
+        assert_eq!(sink.handoffs.load(Ordering::SeqCst), handoffs + 1);
+    }
+
+    #[derive(Debug)]
+    struct RenderFactsTestConfig;
+
+    impl TerminalConfiguration for RenderFactsTestConfig {
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+    }
+
+    fn render_facts_test_pane(pane_id: PaneId) -> LocalPane {
+        make_legacy_test_pane(
+            pane_id,
+            Terminal::new(
+                term_size(80, 24),
+                Arc::new(RenderFactsTestConfig),
+                "FrankenTerm",
+                "render-facts-test",
+                Box::new(Vec::<u8>::new()),
+            ),
+        )
+    }
+
+    fn apply_output(pane: &LocalPane, output: &[u8]) -> Arc<crate::pane::PaneRenderFacts> {
+        let mut actions = Vec::new();
+        termwiz::escape::parser::Parser::new().parse(output, |action| actions.push(action));
+        pane.perform_actions(actions).expect("test action admission");
+        let facts = pane.render_facts();
+        // The publication matches the blocking accessors exactly.
+        assert_eq!(facts.seqno, pane.get_current_seqno());
+        assert_eq!(facts.cursor, pane.get_cursor_position());
+        assert_eq!(facts.dimensions, pane.get_dimensions());
+        assert_eq!(facts.mouse_grabbed, pane.is_mouse_grabbed());
+        assert_eq!(facts.alt_screen_active, pane.is_alt_screen_active());
+        assert_eq!(*facts.palette, pane.palette());
+        assert_eq!(&*facts.title, pane.terminal.lock().get_title());
+        facts
+    }
+
+    #[test]
+    fn render_facts_follow_every_render_relevant_change() {
+        let pane = render_facts_test_pane(790);
+        let initial = pane.render_facts();
+        assert_eq!(initial.dimensions, pane.get_dimensions());
+        assert_eq!(initial.cursor, pane.get_cursor_position());
+        assert!(!initial.mouse_grabbed && !initial.alt_screen_active);
+        assert!(!initial.bracketed_paste && !initial.focus_tracking);
+
+        let moved = apply_output(&pane, b"\x1b[5;10H");
+        assert_eq!((moved.cursor.x, moved.cursor.y), (9, 4));
+        assert!(moved.seqno > initial.seqno);
+
+        let mouse = apply_output(&pane, b"\x1b[?1000h");
+        assert!(mouse.mouse_grabbed);
+        let paste = apply_output(&pane, b"\x1b[?2004h");
+        assert!(paste.bracketed_paste);
+        let focus = apply_output(&pane, b"\x1b[?1004h");
+        assert!(focus.focus_tracking);
+
+        // A title change shares the unchanged palette by pointer.
+        let titled = apply_output(&pane, b"\x1b]2;facts-title\x07");
+        assert_eq!(&*titled.title, "facts-title");
+        assert_eq!(titled.palette_generation, focus.palette_generation);
+        assert!(Arc::ptr_eq(&titled.palette, &focus.palette));
+
+        // A dynamic color escape changes the palette generation and value;
+        // the unchanged title is shared by pointer.
+        let recolored = apply_output(&pane, b"\x1b]4;1;rgb:12/34/56\x1b\\");
+        assert_ne!(recolored.palette_generation, titled.palette_generation);
+        assert_ne!(recolored.palette.colors.0[1], titled.palette.colors.0[1]);
+        assert!(Arc::ptr_eq(&recolored.title, &titled.title));
+
+        let alt = apply_output(&pane, b"\x1b[?1049h");
+        assert!(alt.alt_screen_active);
+        let primary = apply_output(&pane, b"\x1b[?1049l");
+        assert!(!primary.alt_screen_active);
+        let scrolled = apply_output(&pane, &b"line\r\n".repeat(40));
+        assert!(scrolled.dimensions.scrollback_rows > primary.dimensions.scrollback_rows);
+
+        // Changes that do not come from output are published as well.
+        pane.focus_changed(true);
+        assert_eq!(pane.render_facts().seqno, pane.get_current_seqno());
+        pane.erase_scrollback(ScrollbackEraseMode::ScrollbackOnly);
+        assert_eq!(pane.render_facts().dimensions, pane.get_dimensions());
+        pane.set_config(Arc::new(RenderFactsTestConfig));
+        let reconfigured = pane.render_facts();
+        assert_eq!(*reconfigured.palette, pane.palette());
+
+        pane.resize(term_size(100, 30)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pane.render_facts().dimensions.cols != 100 {
+            assert!(Instant::now() < deadline, "resize was never published");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let resized = pane.render_facts();
+        assert_eq!(resized.dimensions, pane.get_dimensions());
+        assert_eq!(resized.dimensions.viewport_rows, 30);
+    }
+
+    /// Publication runs after every batch, so it must stay cheap
+    /// (ft-yccm0.2.2.1, < 1%): nothing new publishes nothing, and a changed
+    /// publication refills the allocation it replaced once no reader holds
+    /// it, never facts a reader still holds.
+    #[test]
+    fn render_facts_skip_unchanged_publications_and_reuse_released_facts() {
+        let pane = render_facts_test_pane(793);
+        let first = apply_output(&pane, b"\x1b[2;2H");
+        pane.render_facts.publish(&mut pane.terminal.lock());
+        assert!(
+            Arc::ptr_eq(&first, &pane.render_facts()),
+            "a publication with nothing new keeps the same facts"
+        );
+        drop(first);
+
+        // Each apply_output drops its facts at the end of its statement, so
+        // the third publication refills the first one's allocation.
+        let a = Arc::as_ptr(&apply_output(&pane, b"\x1b[3;3H"));
+        let b = Arc::as_ptr(&apply_output(&pane, b"\x1b[4;4H"));
+        let c = Arc::as_ptr(&apply_output(&pane, b"\x1b[5;5H"));
+        assert_ne!(a, b);
+        assert_eq!(a, c, "released facts are reused in place");
+
+        // Facts a reader holds are never overwritten.
+        let held = pane.render_facts();
+        let held_cursor = held.cursor;
+        apply_output(&pane, b"\x1b[6;6H");
+        apply_output(&pane, b"\x1b[7;7H");
+        assert_eq!(held.cursor, held_cursor);
+        assert_eq!((held.cursor.x, held.cursor.y), (4, 4));
+        let latest = pane.render_facts();
+        assert_eq!((latest.cursor.x, latest.cursor.y), (6, 6));
+    }
+
+    #[test]
+    fn render_facts_reader_never_waits_for_the_terminal_mutex() {
+        let pane = render_facts_test_pane(791);
+        let published = apply_output(&pane, b"\x1b[3;7Hready");
+        let pane = &pane;
+        std::thread::scope(|scope| {
+            let held = pane.terminal.lock();
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            scope.spawn(move || tx.send(pane.render_facts()).unwrap());
+            let observed = rx.recv_timeout(Duration::from_secs(5));
+            drop(held);
+            let facts = observed.expect("render_facts waited on the terminal mutex");
+            assert!(Arc::ptr_eq(&facts, &published));
+        });
+    }
+
+    #[test]
+    fn render_facts_concurrent_readers_never_see_a_torn_publication() {
+        const BATCHES: usize = 2000;
+        let pane = render_facts_test_pane(792);
+        let pane = &pane;
+        let done = AtomicBool::new(false);
+        let done = &done;
+        std::thread::scope(|scope| {
+            let readers: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(move || {
+                        let mut reads = 0usize;
+                        let mut last_seqno = 0;
+                        while !done.load(Ordering::Acquire) || reads == 0 {
+                            let facts = pane.render_facts();
+                            assert!(facts.seqno >= last_seqno, "publications went backwards");
+                            last_seqno = facts.seqno;
+                            // Each batch sets the title and cursor column
+                            // together; a torn read would split them.
+                            if let Ok(batch) = facts.title.parse::<usize>() {
+                                assert_eq!(facts.cursor.x, batch % 80, "torn read");
+                            }
+                            reads += 1;
+                        }
+                        reads
+                    })
+                })
+                .collect();
+            for batch in 0..BATCHES {
+                let mut actions = Vec::new();
+                termwiz::escape::parser::Parser::new().parse(
+                    format!("\x1b]2;{batch}\x07\x1b[1;{}H", batch % 80 + 1).as_bytes(),
+                    |action| actions.push(action),
+                );
+                pane.perform_actions(actions).unwrap();
+            }
+            done.store(true, Ordering::Release);
+            for reader in readers {
+                assert!(reader.join().unwrap() > 0);
+            }
+        });
+        let last = pane.render_facts();
+        assert_eq!(&*last.title, format!("{}", BATCHES - 1));
+        assert_eq!(last.cursor.x, (BATCHES - 1) % 80);
+    }
+
+    fn lock_counts(holder: TerminalLockHolder) -> (u64, u64) {
+        let snapshot = TerminalLockLedger::global().snapshot();
+        snapshot
+            .holders
+            .get(holder.as_str())
+            .map_or((0, 0), |stats| (stats.wait.count, stats.hold.count))
+    }
+
+    /// ft-yccm0.1.5: each path records its acquisitions under its own holder
+    /// kind. The ledger is process-wide and other tests run concurrently, so
+    /// only increases caused here are asserted.
+    #[test]
+    fn terminal_lock_acquisitions_are_tagged_by_holder_kind() {
+        let pane = render_facts_test_pane(793);
+        let expect_recorded = |holder: TerminalLockHolder, action: &dyn Fn()| {
+            let (waits, holds) = lock_counts(holder);
+            action();
+            let (waits_after, holds_after) = lock_counts(holder);
+            assert!(waits_after > waits, "{:?} acquisition was not recorded", holder);
+            assert!(holds_after > holds, "{:?} hold was not recorded", holder);
+        };
+        expect_recorded(TerminalLockHolder::Parser, &|| {
+            pane.perform_actions(vec![Action::Print('x')]).unwrap();
+        });
+        expect_recorded(TerminalLockHolder::Paint, &|| {
+            pane.get_dimensions();
+        });
+        expect_recorded(TerminalLockHolder::Paint, &|| {
+            pane.get_lines(0..1);
+        });
+        expect_recorded(TerminalLockHolder::Mouse, &|| {
+            pane.is_mouse_grabbed();
+        });
+        expect_recorded(TerminalLockHolder::Selection, &|| {
+            pane.apply_hyperlinks(0..1, &[]);
+        });
+        expect_recorded(TerminalLockHolder::Other, &|| {
+            pane.get_title();
+        });
+        expect_recorded(TerminalLockHolder::Resize, &|| {
+            pane.resize(term_size(90, 24)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while pane.render_facts().dimensions.cols != 90 {
+                assert!(Instant::now() < deadline, "resize never applied");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+    }
+
+    /// T0's shape (ft-yccm0.2.3): 256-colour foreground and background SGR
+    /// before every character, mostly wide emoji; about 25 bytes a frame.
+    fn t0_flood(frames: u32) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut flood = Vec::new();
+        for frame in 0..frames {
+            write!(
+                flood,
+                "\x1b[38;5;{}m\x1b[48;5;{}m",
+                frame % 256,
+                frame * 7 % 256
+            )
+            .unwrap();
+            let character = if frame % 5 == 0 {
+                'x'
+            } else {
+                char::from_u32(0x1F600 + frame % 80).unwrap()
+            };
+            let mut utf8 = [0; 4];
+            flood.extend_from_slice(character.encode_utf8(&mut utf8).as_bytes());
+        }
+        flood
+    }
+
+    /// The comparable state of a pane's terminal: every cell's text and
+    /// attributes, and the cursor without its seqno.
+    fn terminal_cells_and_cursor(
+        pane: &LocalPane,
+    ) -> (
+        Vec<Vec<(String, frankenterm_term::CellAttributes)>>,
+        frankenterm_term::CursorPosition,
+    ) {
+        let terminal = pane.terminal.lock();
+        let screen = terminal.screen();
+        let lines = screen
+            .lines_in_phys_range(0..screen.scrollback_rows())
+            .iter()
+            .map(|line| {
+                line.visible_cells()
+                    .map(|cell| (cell.str().to_string(), cell.attrs().clone()))
+                    .collect()
+            })
+            .collect();
+        let mut cursor = terminal.cursor_pos();
+        cursor.seqno = 0;
+        (lines, cursor)
+    }
+
+    /// What a reader saw of the terminal lock while one flood was applied
+    /// (ft-yccm0.2.3).
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    struct FloodReads {
+        /// Each wait of a Paint locker that asks every 300 us.
+        waits: Vec<Duration>,
+        /// Reads that saw the flood partly applied: the reader was served
+        /// between two of the parser's holds, so the parser handed over.
+        mid_batch_reads: usize,
+        apply_time: Duration,
+    }
+
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    impl FloodReads {
+        /// Runs `apply` while a reader locks the pane's terminal every 300 us
+        /// (the reader has been served once before `apply` starts). Each hold
+        /// of the parser is its own output batch, one seqno, so a read
+        /// strictly between the seqnos before and after the flood happened
+        /// inside it.
+        fn record(pane: &LocalPane, apply: impl FnOnce()) -> Self {
+            let before = pane.terminal.lock().current_seqno();
+            let done = AtomicBool::new(false);
+            let (reads, apply_time) = std::thread::scope(|scope| {
+                let done = &done;
+                let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+                let reader = scope.spawn(move || {
+                    let mut reads = Vec::new();
+                    let mut ready = Some(ready_tx);
+                    while !done.load(Ordering::Acquire) {
+                        let asked = Instant::now();
+                        let terminal = pane.terminal.lock_as(TerminalLockHolder::Paint);
+                        reads.push((asked.elapsed(), terminal.current_seqno()));
+                        drop(terminal);
+                        if let Some(ready) = ready.take() {
+                            ready.send(()).unwrap();
+                        }
+                        std::thread::sleep(Duration::from_micros(300));
+                    }
+                    reads
+                });
+                ready_rx.recv().unwrap();
+                let started = Instant::now();
+                apply();
+                let apply_time = started.elapsed();
+                done.store(true, Ordering::Release);
+                (reader.join().unwrap(), apply_time)
+            });
+            let after = pane.terminal.lock().current_seqno();
+            Self {
+                waits: reads.iter().map(|(wait, _)| *wait).collect(),
+                mid_batch_reads: reads
+                    .iter()
+                    .filter(|(_, seqno)| before < *seqno && *seqno < after)
+                    .count(),
+                apply_time,
+            }
+        }
+
+        fn p99(&self) -> Duration {
+            let mut sorted = self.waits.clone();
+            sorted.sort();
+            sorted[sorted.len() * 99 / 100]
+        }
+
+        /// Which parts of the fairness property these reads break. It is
+        /// relative to `unsliced`, the time to apply the same flood in one
+        /// hold, not an absolute bound, which on a shared debug worker would
+        /// measure scheduler noise as much as fairness. The parser handed
+        /// over, and a waiting reader's p99 wait is a tenth of the unsliced
+        /// apply or less. Unsliced, a reader waits for the whole batch. The
+        /// strict 1 ms target is the M.4 histograms' on the M4.
+        fn fairness_failures(&self, unsliced: Duration) -> Vec<&'static str> {
+            let mut failures = Vec::new();
+            if self.mid_batch_reads == 0 {
+                failures.push("no handoff: the reader was never served mid-batch");
+            }
+            if self.waits.len() < 10 {
+                failures.push("fewer than 10 reader samples");
+            }
+            if self.p99() * 10 > unsliced {
+                failures.push("p99 wait is not far below the unsliced apply time");
+            }
+            failures
+        }
+    }
+
+    /// ft-yccm0.2.3 acceptance: while the parse thread applies two megabytes
+    /// of T0-shaped output in one fused batch, a reader that has to wait for
+    /// the terminal lock is served at the parser's slice boundaries. The
+    /// planted negative applies the same flood through the same slicing with
+    /// yielding suppressed, one hold as before ft-yccm0.2.3: its time is the
+    /// unsliced apply time, and the same fairness check must fail on it.
+    /// Both batches still land exactly as one unsliced feed.
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    #[test]
+    fn a_waiting_reader_is_served_at_slice_boundaries_under_a_parser_flood() {
+        let flood = t0_flood(80_000);
+        let unsliced_pane = render_facts_test_pane(845);
+        let unsliced = FloodReads::record(&unsliced_pane, || {
+            let mut terminal = unsliced_pane.terminal.lock_as(TerminalLockHolder::Parser);
+            let mut sliced = SlicedFeed::new(&flood, FEED_SLICE_BYTES);
+            let progress = sliced.run(
+                &mut terminal,
+                &mut termwiz::escape::parser::Parser::new(),
+                &mut FusedFeedGate,
+                &mut Vec::new(),
+                &mut || false,
+            );
+            assert!(progress == SliceProgress::Done);
+        });
+        let pane = render_facts_test_pane(841);
+        let sliced = FloodReads::record(&pane, || {
+            let mut diverted = Vec::new();
+            pane.feed_fused(
+                &mut termwiz::escape::parser::Parser::new(),
+                &flood,
+                &mut diverted,
+            )
+            .expect("an unregistered pane admits output");
+            assert!(diverted.is_empty(), "T0 output diverts nothing");
+        });
+        for (name, reads) in [("unsliced", &unsliced), ("sliced", &sliced)] {
+            eprintln!(
+                "[BENCH] parser flood {} bytes, {name}: applied in {:?}, {} reader samples, \
+                 {} mid-batch, p99 wait {:?}, max {:?}",
+                flood.len(),
+                reads.apply_time,
+                reads.waits.len(),
+                reads.mid_batch_reads,
+                reads.p99(),
+                reads.waits.iter().max().copied().unwrap_or_default()
+            );
+        }
+
+        let negative = unsliced.fairness_failures(unsliced.apply_time);
+        assert!(
+            negative.contains(&"no handoff: the reader was never served mid-batch")
+                && negative.contains(&"p99 wait is not far below the unsliced apply time"),
+            "with yielding suppressed the fairness check must fail, but it found only {:?}",
+            negative
+        );
+        let failures = sliced.fairness_failures(unsliced.apply_time);
+        assert!(failures.is_empty(), "{:?}", failures);
+
+        let reference = render_facts_test_pane(842);
+        reference.terminal.lock().advance_bytes(&flood);
+        let expected = terminal_cells_and_cursor(&reference);
+        assert!(
+            terminal_cells_and_cursor(&pane) == expected,
+            "the sliced batch must land as one unsliced feed"
+        );
+        assert!(terminal_cells_and_cursor(&unsliced_pane) == expected);
+    }
+
+    /// ft-yccm0.2.3: the two-stage path hands the lock over the same way,
+    /// between actions, and still applies the batch exactly.
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    #[test]
+    fn two_stage_batches_hand_the_lock_to_a_waiting_reader_and_apply_exactly() {
+        let flood = t0_flood(40_000);
+        let pane = render_facts_test_pane(843);
+        let mut actions = Vec::new();
+        termwiz::escape::parser::Parser::new().parse(&flood, |action| actions.push(action));
+        let served = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let pane = &pane;
+            let served = &served;
+            let applier = scope.spawn(move || pane.perform_actions(actions));
+            // Ask while the batch is applying; the parser yields to us.
+            while !pane.terminal.is_locked() && !applier.is_finished() {
+                std::thread::yield_now();
+            }
+            drop(pane.terminal.lock_as(TerminalLockHolder::Paint));
+            served.store(!applier.is_finished(), Ordering::Release);
+            applier.join().unwrap().expect("test action admission");
+        });
+        assert!(
+            served.load(Ordering::Acquire),
+            "the reader was served before the batch finished"
+        );
+        let reference = render_facts_test_pane(844);
+        reference.terminal.lock().advance_bytes(&flood);
+        assert!(terminal_cells_and_cursor(&pane) == terminal_cells_and_cursor(&reference));
+    }
+
+    /// A wait for a contended terminal mutex on the main thread is counted as
+    /// main-thread blocking, with its duration.
+    #[test]
+    fn main_thread_waits_on_a_held_terminal_lock_count_as_blocking() {
+        let pane = render_facts_test_pane(794);
+        let pane = &pane;
+        let before = TerminalLockLedger::global().snapshot();
+        let held_for = Duration::from_millis(30);
+        std::thread::scope(|scope| {
+            let held = pane.terminal.lock();
+            let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+            // std names the process's main thread "main"; so does this one.
+            let waiter = std::thread::Builder::new()
+                .name("main".to_string())
+                .spawn_scoped(scope, move || {
+                    started_tx.send(()).unwrap();
+                    pane.get_dimensions()
+                })
+                .unwrap();
+            started_rx.recv().unwrap();
+            std::thread::sleep(held_for);
+            drop(held);
+            waiter.join().unwrap();
+        });
+        let after = TerminalLockLedger::global().snapshot();
+        assert!(after.main_thread_blocked_waits > before.main_thread_blocked_waits);
+        let blocked = after.main_thread_blocked_ns - before.main_thread_blocked_ns;
+        // The waiter may reach the mutex a little after it signalled.
+        assert!(
+            blocked >= u64::try_from(held_for.as_nanos() / 2).unwrap(),
+            "blocked {} ns while the lock was held for {:?}",
+            blocked,
+            held_for
+        );
+        let half_hold = u64::try_from(held_for.as_nanos() / 2).unwrap();
+        assert!(after.main_thread_max_wait_ns >= half_hold);
+        assert!(after.holders["paint"].wait.max_ns >= half_hold);
+    }
+
+    /// With signposts on, a parse batch opens a "parse batch" interval and a
+    /// parser terminal-lock interval (macOS); elsewhere signposts are no-ops.
+    /// Whether the OS records them depends on Instruments recording.
+    #[test]
+    fn parse_batches_request_signpost_intervals_when_enabled() {
+        let pane = render_facts_test_pane(795);
+        procinfo::set_signposts_enabled(true);
+        let before = procinfo::signpost_intervals_requested();
+        pane.perform_actions(vec![Action::Print('x')]).unwrap();
+        let after = procinfo::signpost_intervals_requested();
+        procinfo::set_signposts_enabled(false);
+        if cfg!(target_os = "macos") {
+            assert!(after >= before + 2, "{} -> {}", before, after);
+        } else {
+            assert_eq!(after, before);
+        }
+    }
+
     fn seed_checkpoint_cold_rows(terminal: &mut Terminal, rows: &[&str]) {
         for row in rows {
             terminal.advance_bytes(row.as_bytes());
@@ -16760,7 +18563,7 @@ mod tests {
             }
         }
         struct Recorder {
-            terminal: Arc<Mutex<Terminal>>,
+            terminal: Arc<TerminalMutex>,
             emitted: AtomicUsize,
         }
         impl log::Log for Recorder {
