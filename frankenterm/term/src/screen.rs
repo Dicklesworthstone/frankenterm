@@ -9980,7 +9980,7 @@ impl Screen {
         {
             return false;
         }
-        self.page_scroll_up_line(seqno, &CellAttributes::blank(), bidi_mode)
+        self.page_scroll_up_line(seqno, None, bidi_mode)
     }
 
     pub fn scroll_up_within_margins(
@@ -10362,7 +10362,8 @@ impl Screen {
             && self.recovery_scrollback.is_none()
             && !self.scrollback_policy.tier.enabled
         {
-            return self.page_scroll_up_line(seqno, blank_attr, &bidi_mode);
+            let custom_blank = (*blank_attr != CellAttributes::blank()).then_some(blank_attr);
+            return self.page_scroll_up_line(seqno, custom_blank, &bidi_mode);
         }
         let phys_scroll = self.phys_range(scroll_region);
         let num_rows = num_rows.min(phys_scroll.end - phys_scroll.start);
@@ -10518,11 +10519,14 @@ impl Screen {
     /// entering scrollback compressed, at most one row leaving the hot cap
     /// with nothing read back for a spill, one row appended, and built as
     /// the general path builds it) without the general path's region
-    /// arithmetic, which was a quarter of a line feed's cost.
+    /// arithmetic, which was a quarter of a line feed's cost. `custom_blank`
+    /// is the new row's blank unless it is the default one, which the line
+    /// feed path knows without comparing attributes (a tenth of this
+    /// function's cost).
     fn page_scroll_up_line(
         &mut self,
         seqno: SequenceNo,
-        blank_attr: &CellAttributes,
+        custom_blank: Option<&CellAttributes>,
         bidi_mode: &BidiMode,
     ) -> bool {
         let max_allowed = self.physical_rows + self.hot_scrollback_size();
@@ -10541,7 +10545,7 @@ impl Screen {
         let admitted = lines_removed;
         // Under the default blank the list appends the row in legacy's
         // clustered form, all `native::new_row` would give it.
-        let default_blank = *blank_attr == CellAttributes::blank();
+        let default_blank = custom_blank.is_none();
         let rows = self.lines.page_mut().expect("page rows");
         rows.set_hot_cap(max_allowed);
         // Every row leaving the cap is admitted, so the list's own count
@@ -10561,13 +10565,29 @@ impl Screen {
         // with it. The region ends at the screen's bottom: no footer moves.
         let bidi = (lines_removed == 0).then_some(bidi_mode);
         if !default_blank || bidi.is_some() {
-            let cols = self.physical_cols;
-            let first_new = self.lines.len() - 1;
-            if let Some((page, row)) = self.page_row(first_new) {
-                native::new_row(page, row, cols, blank_attr, bidi, seqno);
-            }
+            self.build_scrolled_in_row(custom_blank, bidi, seqno);
         }
         true
+    }
+
+    /// [`Self::page_scroll_up_line`]'s new row under a custom blank, or below
+    /// the hot cap: built as the general path builds it. Out of line: once
+    /// scrollback is full under the default pen, neither happens.
+    #[cold]
+    #[inline(never)]
+    fn build_scrolled_in_row(
+        &mut self,
+        custom_blank: Option<&CellAttributes>,
+        bidi: Option<&BidiMode>,
+        seqno: SequenceNo,
+    ) {
+        let default_blank = CellAttributes::blank();
+        let blank_attr = custom_blank.unwrap_or(&default_blank);
+        let cols = self.physical_cols;
+        let first_new = self.lines.len() - 1;
+        if let Some((page, row)) = self.page_row(first_new) {
+            native::new_row(page, row, cols, blank_attr, bidi, seqno);
+        }
     }
 
     /// Legacy [`Self::scroll_down`] on page-engine rows (ft-yccm0.3.3.4): the
