@@ -393,6 +393,20 @@ impl PageList {
         n: usize,
         seqno: SequenceNo,
         hold: bool,
+        admit: impl FnMut(RowRef<'_>) -> bool,
+    ) -> Scrolled {
+        self.scroll_with_row_flags(n, seqno, hold, 0, admit)
+    }
+
+    /// [`Self::scroll`] whose new rows also carry the row flags `flags`, set
+    /// while the list holds the tail page, so a caller that would only set
+    /// them looks no new row up again.
+    pub fn scroll_with_row_flags(
+        &mut self,
+        n: usize,
+        seqno: SequenceNo,
+        hold: bool,
+        flags: u64,
         mut admit: impl FnMut(RowRef<'_>) -> bool,
     ) -> Scrolled {
         // Legacy's `lines.len() + num_rows >= max_allowed` count.
@@ -404,7 +418,7 @@ impl PageList {
         };
         let first_new = self.next_stable;
         for _ in 0..n {
-            self.append_row(seqno);
+            self.append_row(seqno, flags);
         }
         if !hold && !refused && trimmed < excess {
             // More rows scrolled in than were retained: legacy's eviction
@@ -702,9 +716,9 @@ impl PageList {
         }
     }
 
-    /// Appends one empty row at the tail, taking a pooled page when the tail
-    /// page is full.
-    fn append_row(&mut self, seqno: SequenceNo) {
+    /// Appends one empty row at the tail, carrying the row flags `flags`,
+    /// taking a pooled page when the tail page is full.
+    fn append_row(&mut self, seqno: SequenceNo, flags: u64) {
         if self.pages.back().is_none_or(PageSlot::is_full) {
             let page = match self.pool.pop() {
                 Some(page) => {
@@ -724,9 +738,11 @@ impl PageList {
             });
         }
         let tail = self.pages.len() - 1;
-        self.page_mut(tail)
-            .grow(seqno)
-            .expect("the tail page has room");
+        let page = self.page_mut(tail);
+        let row = page.grow(seqno).expect("the tail page has room");
+        if flags != 0 {
+            page.set_row_flags(row, flags, true);
+        }
         self.retained_rows += 1;
         self.next_stable += 1;
     }

@@ -190,8 +190,21 @@ impl PageRows {
     /// `admitted` were admitted and the next was refused (see
     /// [`PageList::scroll`]). With `hold`, nothing is trimmed.
     pub fn scroll(&mut self, n: usize, seqno: SequenceNo, hold: bool, admitted: usize) -> Scrolled {
+        self.scroll_with_row_flags(n, seqno, hold, admitted, 0)
+    }
+
+    /// [`Self::scroll`] whose new rows carry the row flags `flags` (see
+    /// [`PageList::scroll_with_row_flags`]).
+    pub fn scroll_with_row_flags(
+        &mut self,
+        n: usize,
+        seqno: SequenceNo,
+        hold: bool,
+        admitted: usize,
+        flags: u64,
+    ) -> Scrolled {
         let mut left = admitted;
-        let scrolled = self.list.scroll(n, seqno, hold, |_| {
+        let scrolled = self.list.scroll_with_row_flags(n, seqno, hold, flags, |_| {
             if left > 0 {
                 left -= 1;
                 true

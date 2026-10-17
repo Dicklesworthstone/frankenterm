@@ -10353,8 +10353,16 @@ impl Screen {
         let footer = self.physical_rows - scroll_region.end as usize;
         let rows = self.lines.page_mut().expect("page rows");
         rows.set_hot_cap(max_allowed);
+        // A new row under the default blank needs only legacy's clustered
+        // storage form from `native::new_row`; the list sets it as it appends
+        // the row, so the loop below looks that row up only for a bidi mode.
+        let appended_flags = if insert_at_end && *blank_attr == CellAttributes::blank() {
+            crate::pagegrid::RowHeader::LEGACY_FORM_C
+        } else {
+            0
+        };
         let scrolled = if insert_at_end {
-            rows.scroll(num_rows, seqno, hold, admitted)
+            rows.scroll_with_row_flags(num_rows, seqno, hold, admitted, appended_flags)
         } else {
             rows.scroll_above_footer(num_rows, footer, seqno, hold, admitted)
         };
@@ -10374,8 +10382,11 @@ impl Screen {
         let to_add = num_rows - lines_moved;
         let first_new = self.lines.len() - footer - num_rows;
         for added in 0..num_rows {
+            let bidi = (added >= lines_moved).then_some(&bidi_mode);
+            if appended_flags != 0 && bidi.is_none() {
+                continue;
+            }
             if let Some((page, row)) = self.page_row(first_new + added) {
-                let bidi = (added >= lines_moved).then_some(&bidi_mode);
                 native::new_row(page, row, cols, blank_attr, bidi, seqno);
             }
         }
