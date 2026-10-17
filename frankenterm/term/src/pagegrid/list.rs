@@ -893,27 +893,7 @@ impl PageList {
     /// taking a pooled page when the tail page is full.
     fn append_row(&mut self, seqno: SequenceNo, flags: u64) {
         if self.pages.back().is_none_or(PageSlot::is_full) {
-            let mut page = match self.pool.pop() {
-                Some(page) => {
-                    self.pages_reused += 1;
-                    page
-                }
-                None => {
-                    self.pages_allocated += 1;
-                    let serial = self.allocate_serial();
-                    Box::new(Page::new(self.cols, self.page_rows, serial))
-                }
-            };
-            // Text full of graphemes keeps filling pages with them: a fresh
-            // page takes room for as many as the page it follows, rather
-            // than regrowing its map from a reset page's capacity.
-            if let Some(previous) = self.pages.back() {
-                if previous.page().graphemes().len() > STD_ARENA_ENTRIES {
-                    page.reserve_graphemes_like(previous.page());
-                }
-            }
-            self.pages
-                .push_back(PageSlot::new_active(self.next_stable, page));
+            self.push_tail_page();
         }
         let tail = self.pages.len() - 1;
         let page = self.page_mut(tail);
@@ -923,6 +903,35 @@ impl PageList {
         }
         self.retained_rows += 1;
         self.next_stable += 1;
+    }
+
+    /// [`Self::append_row`]'s new tail page, from the pool or new. Out of
+    /// line: it runs once a page, and building a page inline made the frame
+    /// of every appended row.
+    #[cold]
+    #[inline(never)]
+    fn push_tail_page(&mut self) {
+        let mut page = match self.pool.pop() {
+            Some(page) => {
+                self.pages_reused += 1;
+                page
+            }
+            None => {
+                self.pages_allocated += 1;
+                let serial = self.allocate_serial();
+                Box::new(Page::new(self.cols, self.page_rows, serial))
+            }
+        };
+        // Text full of graphemes keeps filling pages with them: a fresh
+        // page takes room for as many as the page it follows, rather than
+        // regrowing its map from a reset page's capacity.
+        if let Some(previous) = self.pages.back() {
+            if previous.page().graphemes().len() > STD_ARENA_ENTRIES {
+                page.reserve_graphemes_like(previous.page());
+            }
+        }
+        self.pages
+            .push_back(PageSlot::new_active(self.next_stable, page));
     }
 
     /// Trims up to `count` rows from the front, offering each to `admit`
