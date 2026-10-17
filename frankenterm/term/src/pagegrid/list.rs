@@ -411,15 +411,25 @@ impl PageList {
             return None;
         }
         let tail = self.pages.len() - 1;
-        let index = if stable >= self.pages[tail].first_stable {
-            tail
-        } else {
-            self.pages
-                .partition_point(|slot| slot.end_stable() <= stable)
-        };
+        let slot = &self.pages[tail];
+        if stable >= slot.first_stable {
+            let row = slot.front_trim as usize + (stable - slot.first_stable) as usize;
+            return Some((tail, row as u32));
+        }
+        Some(self.locate_before_tail(stable))
+    }
+
+    /// [`Self::locate`] of a retained row before the tail page, by binary
+    /// search, out of line: inline, its frame was the tail lookup's, which
+    /// every printed run on the bottom row makes.
+    #[inline(never)]
+    fn locate_before_tail(&self, stable: StableRowIndex) -> (usize, u32) {
+        let index = self
+            .pages
+            .partition_point(|slot| slot.end_stable() <= stable);
         let slot = &self.pages[index];
         let row = slot.front_trim as usize + (stable - slot.first_stable) as usize;
-        Some((index, row as u32))
+        (index, row as u32)
     }
 
     /// The retained row at `stable`.
