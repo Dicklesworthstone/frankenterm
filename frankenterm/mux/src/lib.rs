@@ -2570,13 +2570,17 @@ const GUARDIAN_LIVE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 const GUARDIAN_LIVE_CHECKPOINT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const GUARDIAN_LIVE_CHECKPOINT_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Live checkpoints a pane adopts after the one its newest committed recovery
-/// root names, while a root publisher runs. The guardian keeps a pane's newest
-/// eight catalog members and reclaims the oldest first; a root whose member is
-/// gone can no longer be restored or published over. The root's member, these
-/// three, up to three failed root captures, and the adoption that reclaims
-/// stay within the eight. At one live checkpoint every five seconds and one
-/// root a minute, an ungated pane reclaimed its root's member in 40 seconds.
-const GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT: usize = 3;
+/// root names, while a root publisher runs: none. Every root capture adopts a
+/// fresh member for each pane, which re-anchors its replay and bounds its
+/// journal, so live checkpoints only repeat that work, and the guardian does
+/// all of it on one worker: at three per root interval, 12 panes' live
+/// checkpoints (1-2 s each for a 2 MB payload) saturated it and recovery
+/// captures overran their budget. The guardian also keeps only a pane's
+/// newest eight catalog members, reclaiming the oldest first; a root whose
+/// member is gone can no longer be restored, and at one live checkpoint every
+/// five seconds an ungated pane reclaimed its root's member in 40 seconds.
+/// Without a root publisher, live checkpoints are the only ones and stay.
+const GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT: usize = 0;
 /// Adoptions a ledger remembers while no committed root names one of them.
 const GUARDIAN_ADOPTION_LEDGER_CAPACITY: usize = 64;
 
@@ -2621,8 +2625,10 @@ impl GuardianAdoptionLedger {
         true
     }
 
-    fn live_adoption_allowed(&self) -> bool {
-        self.root_named && self.since_root.len() < GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT
+    /// Whether a live checkpoint may be adopted, `limit` after the member
+    /// the newest committed root names.
+    fn live_adoption_allowed(&self, limit: usize) -> bool {
+        self.root_named && self.since_root.len() < limit
     }
 }
 
@@ -13269,7 +13275,11 @@ fn guardian_live_adoption_allowed(generation: &PaneRegistrationGeneration) -> bo
         .owner
         .upgrade()
         .is_some_and(|mux| mux.guardian_root_retention.load(Ordering::Acquire));
-    !retains_roots || generation.guardian_adoptions.lock().live_adoption_allowed()
+    !retains_roots
+        || generation
+            .guardian_adoptions
+            .lock()
+            .live_adoption_allowed(GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT)
 }
 
 /// This function is run in a separate thread; its purpose is to perform
@@ -25232,12 +25242,14 @@ mod tests {
             crate::guardian_protocol::GuardianCheckpointIdentityDigest::from_bytes([byte; 32])
                 .expect("checkpoint identity")
         };
+        // The gate's mechanics, under an allowance of three.
+        let limit = 3;
         let mut ledger = GuardianAdoptionLedger::default();
         // Nothing a committed root names yet: no live adoption.
-        assert!(!ledger.live_adoption_allowed());
+        assert!(!ledger.live_adoption_allowed(limit));
         let root = uuid::Uuid::from_u128(1);
         ledger.record(root, digest(1), 3);
-        assert!(!ledger.live_adoption_allowed());
+        assert!(!ledger.live_adoption_allowed(limit));
         let (_, generation) = ledger.reanchor.take().expect("root capture re-anchors");
         assert_eq!(generation, 3);
 
@@ -25245,17 +25257,18 @@ mod tests {
         let in_flight = uuid::Uuid::from_u128(2);
         ledger.record(in_flight, digest(2), 3);
         assert!(!ledger.root_committed(uuid::Uuid::from_u128(99)));
-        assert!(!ledger.live_adoption_allowed());
+        assert!(!ledger.live_adoption_allowed(limit));
         assert!(ledger.root_committed(root));
         assert_eq!(ledger.since_root, [in_flight]);
-        let mut live = 3;
-        while ledger.since_root.len() < GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT {
-            assert!(ledger.live_adoption_allowed());
+        // Production allows none after a committed root: root captures are
+        // the only adoptions while a root publisher runs.
+        assert!(!ledger.live_adoption_allowed(GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT));
+        for live in 3..=4 {
+            assert!(ledger.live_adoption_allowed(limit));
             ledger.record(uuid::Uuid::from_u128(live), digest(3), 3);
-            live += 1;
         }
-        assert_eq!(live, 3 + GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT as u128 - 1);
-        assert!(!ledger.live_adoption_allowed());
+        assert_eq!(ledger.since_root.len(), limit);
+        assert!(!ledger.live_adoption_allowed(limit));
 
         // The next root's member lifts the gate for what follows it only.
         let next_root = uuid::Uuid::from_u128(10);
@@ -25264,7 +25277,7 @@ mod tests {
         ledger.record(failed_capture, digest(5), 3);
         assert!(ledger.root_committed(next_root));
         assert_eq!(ledger.since_root, [failed_capture]);
-        assert!(ledger.live_adoption_allowed());
+        assert!(ledger.live_adoption_allowed(limit));
 
         // A ledger that forgot a root's member keeps the gate where it was.
         let mut forgetful = GuardianAdoptionLedger::default();
@@ -25278,7 +25291,7 @@ mod tests {
             GUARDIAN_ADOPTION_LEDGER_CAPACITY
         );
         assert!(!forgetful.root_committed(forgotten));
-        assert!(!forgetful.live_adoption_allowed());
+        assert!(!forgetful.live_adoption_allowed(limit));
     }
 
     #[derive(Debug, Eq, PartialEq)]
