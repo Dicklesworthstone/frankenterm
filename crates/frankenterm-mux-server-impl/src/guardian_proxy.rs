@@ -142,6 +142,22 @@ impl GuardianRestoreBudget<'_> {
     }
 }
 
+/// Whether the guardian at `socket` validates version 4 (compact) terminal
+/// checkpoints, for `Mux::set_guardian_compact_checkpoints`. The probe owns
+/// nothing at the guardian, so it may run at any time.
+pub fn guardian_admits_compact_checkpoints(socket: &Path, token: &Path) -> bool {
+    let admitted = GuardianClient::admits_compact_checkpoints(socket, token);
+    log::info!(
+        "guardian checkpoints: {}",
+        if admitted {
+            "version 4 (compact lines)"
+        } else {
+            "version 3 (the guardian, or this build, predates compact lines)"
+        }
+    );
+    admitted
+}
+
 /// Guardian spawning for an exact mux owner, using current or recovered command
 /// policy. Successor lease attachment belongs to the separate atomic recovery
 /// transaction; an unadopted birth fences further spawning in this domain.

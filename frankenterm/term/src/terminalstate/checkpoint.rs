@@ -17,6 +17,50 @@ use zeroize::Zeroizing;
 /// Current semantic terminal checkpoint schema.
 pub const TERMINAL_CHECKPOINT_VERSION: u32 = 3;
 
+/// The schema whose lines are runs of cells sharing attributes from a
+/// per-screen table (`TerminalCheckpointLineEncoding::Runs`). Everything
+/// else is version 3's; every decoder of this release admits both.
+pub const COMPACT_TERMINAL_CHECKPOINT_VERSION: u32 = 4;
+
+/// How a capture writes screen lines.
+///
+/// Version 3 stores one object per cell, about 300 bytes each with its
+/// attributes spelled out; a pane with a few thousand rows of history made a
+/// payload of tens of megabytes that the guardian stages, hashes, validates
+/// and stores on every capture. Version 4 stores a line as runs: one string of
+/// text per run of cells sharing attributes, the attributes once per screen.
+/// A reader older than this release refuses version 4, so a writer chooses
+/// it only for a reader known to admit it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TerminalCheckpointLineEncoding {
+    /// Version 3: every release reads it.
+    #[default]
+    Cells,
+    /// Version 4: runs and a per-screen attribute table.
+    Runs,
+}
+
+impl TerminalCheckpointLineEncoding {
+    /// The schema version a capture in this encoding carries.
+    #[must_use]
+    pub const fn version(self) -> u32 {
+        match self {
+            Self::Cells => TERMINAL_CHECKPOINT_VERSION,
+            Self::Runs => COMPACT_TERMINAL_CHECKPOINT_VERSION,
+        }
+    }
+
+    /// The encoding of a schema version this release decodes.
+    #[must_use]
+    pub const fn of_version(version: u32) -> Option<Self> {
+        match version {
+            TERMINAL_CHECKPOINT_VERSION => Some(Self::Cells),
+            COMPACT_TERMINAL_CHECKPOINT_VERSION => Some(Self::Runs),
+            _ => None,
+        }
+    }
+}
+
 fn resource_limit(
     resource: &'static str,
     observed: usize,
@@ -366,7 +410,7 @@ impl std::fmt::Debug for ValidatedTerminalCheckpointV3 {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckpointSrgba {
     red_bits: u32,
@@ -448,7 +492,7 @@ impl CheckpointSrgba {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 enum CheckpointColorAttribute {
     Default,
@@ -1068,7 +1112,7 @@ impl CheckpointBidiHint {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckpointHyperlink {
     params: BTreeMap<String, String>,
@@ -1121,6 +1165,31 @@ struct CheckpointCellAttributes {
     background: CheckpointColorAttribute,
     underline_color: CheckpointColorAttribute,
     hyperlink: Option<CheckpointHyperlink>,
+}
+
+// Keys a capture's attribute table. The parser's enums have no Hash; their
+// discriminants hash what their Eq compares.
+impl std::hash::Hash for CheckpointCellAttributes {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(&self.intensity).hash(state);
+        self.underline.hash(state);
+        std::mem::discriminant(&self.blink).hash(state);
+        (
+            self.italic,
+            self.reverse,
+            self.strikethrough,
+            self.invisible,
+            self.wrapped,
+            self.overline,
+        )
+            .hash(state);
+        std::mem::discriminant(&self.semantic_type).hash(state);
+        std::mem::discriminant(&self.vertical_align).hash(state);
+        self.foreground.hash(state);
+        self.background.hash(state);
+        self.underline_color.hash(state);
+        self.hyperlink.hash(state);
+    }
 }
 
 impl CheckpointCellAttributes {
@@ -1270,40 +1339,227 @@ enum CheckpointLineScale {
     DoubleHeightBottom,
 }
 
+/// Version 4's cells: consecutive cells of one line sharing one entry of
+/// their screen's attribute table. Without `clusters`, each char of `text` is
+/// a cell one column wide. Otherwise `clusters` gives every cell as (chars,
+/// columns); it is present only when some cell is not one char one column
+/// wide, so each run has one encoding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointRun {
+    text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    clusters: Option<Vec<(u32, u8)>>,
+    attributes: u32,
+}
+
+/// A capture closes a run at this much text, well under the decoder's
+/// per-string limit however long the line or its clusters.
+const CHECKPOINT_RUN_TEXT_BYTES: usize = 32 * 1024;
+
+impl CheckpointRun {
+    fn push_cell(&mut self, text: &str, width: u8) -> Result<(), TerminalCheckpointError> {
+        let chars = if text.len() == 1 {
+            1
+        } else {
+            text.chars().count()
+        };
+        if self.clusters.is_none() && (chars != 1 || width != 1) {
+            // Every earlier cell was one char one column wide.
+            let mut clusters = Vec::new();
+            let earlier = self.text.chars().count();
+            clusters
+                .try_reserve(earlier + 1)
+                .map_err(|_| TerminalCheckpointError::ResourceAllocation("run.clusters"))?;
+            clusters.resize(earlier, (1, 1));
+            self.clusters = Some(clusters);
+        }
+        if let Some(clusters) = self.clusters.as_mut() {
+            let chars = u32::try_from(chars)
+                .map_err(|_| TerminalCheckpointError::ArithmeticOverflow("run.clusters"))?;
+            clusters.push((chars, width));
+        }
+        self.text.push_str(text);
+        Ok(())
+    }
+
+    /// Whether the run ends in a one-column blank (" ").
+    fn ends_in_single_blank(&self) -> bool {
+        self.text.ends_with(' ')
+            && self
+                .clusters
+                .as_ref()
+                .is_none_or(|clusters| clusters.last() == Some(&(1, 1)))
+    }
+
+    /// Drop the last cell, a one-column blank (see `ends_in_single_blank`).
+    fn pop_single_blank(&mut self) {
+        self.text.pop();
+        if let Some(clusters) = self.clusters.as_mut() {
+            clusters.pop();
+            if clusters.iter().all(|cluster| *cluster == (1, 1)) {
+                self.clusters = None;
+            }
+        }
+    }
+
+    /// The columns its cells cover.
+    fn columns(&self) -> usize {
+        match &self.clusters {
+            None => self.text.chars().count(),
+            Some(clusters) => clusters
+                .iter()
+                .map(|(_, width)| usize::from(*width))
+                .sum(),
+        }
+    }
+
+    /// The text of its `index`th cell, if it has that many.
+    fn cell_text(&self, index: usize) -> Option<&str> {
+        let (start, chars) = match &self.clusters {
+            None => (index, 1),
+            Some(clusters) => {
+                let chars = clusters.get(index)?.0 as usize;
+                let start = clusters[..index]
+                    .iter()
+                    .map(|(chars, _)| *chars as usize)
+                    .sum();
+                (start, chars)
+            }
+        };
+        char_span(&self.text, start, chars)
+    }
+
+    /// How many cells it holds.
+    fn cells(&self) -> usize {
+        match &self.clusters {
+            None => self.text.chars().count(),
+            Some(clusters) => clusters.len(),
+        }
+    }
+}
+
+/// The `chars` chars of `text` that start after its first `start` chars,
+/// if it has them all.
+fn char_span(text: &str, start: usize, chars: usize) -> Option<&str> {
+    let mut bounds = text
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(text.len()));
+    let begin = bounds.nth(start)?;
+    let end = bounds.nth(chars.checked_sub(1)?)?;
+    Some(&text[begin..end])
+}
+
+/// A capture's attribute table for one screen: each distinct attribute set
+/// once, in the order the screen's lines first use it.
+#[derive(Default)]
+struct CheckpointAttributeTable {
+    entries: Vec<CheckpointCellAttributes>,
+    index: HashMap<CheckpointCellAttributes, u32>,
+}
+
+impl CheckpointAttributeTable {
+    fn intern(
+        &mut self,
+        attributes: CheckpointCellAttributes,
+    ) -> Result<u32, TerminalCheckpointError> {
+        if let Some(index) = self.index.get(&attributes) {
+            return Ok(*index);
+        }
+        let index = u32::try_from(self.entries.len())
+            .map_err(|_| TerminalCheckpointError::ArithmeticOverflow("screen.attributes"))?;
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("screen.attributes"))?;
+        self.index
+            .try_reserve(1)
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("screen.attributes"))?;
+        self.entries.push(attributes.clone());
+        self.index.insert(attributes, index);
+        Ok(index)
+    }
+}
+
+/// Exactly one of `cells` (version 3) and `runs` (version 4) is present;
+/// version 3's bytes are what they were before version 4 existed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckpointLine {
-    cells: Vec<CheckpointCell>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cells: Option<Vec<CheckpointCell>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runs: Option<Vec<CheckpointRun>>,
     seqno: u64,
     scale: CheckpointLineScale,
     bidi_enabled: bool,
     bidi_hint: CheckpointBidiHint,
 }
 
+fn checkpoint_cell_width(width: usize) -> Result<u8, TerminalCheckpointError> {
+    let width = u8::try_from(width).map_err(|_| TerminalCheckpointError::InvalidField {
+        field: "cell.width",
+        reason: "cell width does not fit the checkpoint wire type",
+    })?;
+    if !(1..=2).contains(&width) {
+        return Err(TerminalCheckpointError::InvalidField {
+            field: "cell.width",
+            reason: "cell width must be one or two columns",
+        });
+    }
+    Ok(width)
+}
+
+fn line_encoding_mismatch() -> TerminalCheckpointError {
+    TerminalCheckpointError::InvalidField {
+        field: "line.cells",
+        reason: "a line's cells must be encoded as its checkpoint version encodes them",
+    }
+}
+
 impl CheckpointLine {
-    fn capture(line: &Line) -> Result<Self, TerminalCheckpointError> {
+    /// Capture `line` as cells (version 3) or, given its screen's attribute
+    /// table, as runs (version 4).
+    fn capture(
+        line: &Line,
+        table: Option<&mut CheckpointAttributeTable>,
+    ) -> Result<Self, TerminalCheckpointError> {
         if line.has_image_attachments() {
             return Err(TerminalCheckpointError::UnsupportedGraphicsState);
         }
+        let (cells, runs) = match table {
+            None => (Some(Self::capture_cells(line)?), None),
+            Some(table) => (None, Some(Self::capture_runs(line, table)?)),
+        };
+        let scale = if line.is_double_height_top() {
+            CheckpointLineScale::DoubleHeightTop
+        } else if line.is_double_height_bottom() {
+            CheckpointLineScale::DoubleHeightBottom
+        } else if line.is_double_width() {
+            CheckpointLineScale::DoubleWidth
+        } else {
+            CheckpointLineScale::Single
+        };
+        let (bidi_enabled, bidi_hint) = line.bidi_info();
+        Ok(Self {
+            cells,
+            runs,
+            seqno: u64_from_usize(line.current_seqno(), "line.seqno")?,
+            scale,
+            bidi_enabled,
+            bidi_hint: bidi_hint.into(),
+        })
+    }
+
+    fn capture_cells(line: &Line) -> Result<Vec<CheckpointCell>, TerminalCheckpointError> {
         let mut cells = Vec::new();
         cells
             .try_reserve_exact(line.len())
             .map_err(|_| TerminalCheckpointError::ResourceAllocation("line.cells"))?;
         for cell in line.visible_cells() {
-            let width =
-                u8::try_from(cell.width()).map_err(|_| TerminalCheckpointError::InvalidField {
-                    field: "cell.width",
-                    reason: "cell width does not fit the checkpoint wire type",
-                })?;
-            if !(1..=2).contains(&width) {
-                return Err(TerminalCheckpointError::InvalidField {
-                    field: "cell.width",
-                    reason: "cell width must be one or two columns",
-                });
-            }
             cells.push(CheckpointCell {
                 text: cell.str().to_string(),
-                width,
+                width: checkpoint_cell_width(cell.width())?,
                 attributes: CheckpointCellAttributes::capture(cell.attrs())?,
             });
         }
@@ -1325,48 +1581,95 @@ impl CheckpointLine {
                 cells.pop();
             }
         }
-        let scale = if line.is_double_height_top() {
-            CheckpointLineScale::DoubleHeightTop
-        } else if line.is_double_height_bottom() {
-            CheckpointLineScale::DoubleHeightBottom
-        } else if line.is_double_width() {
-            CheckpointLineScale::DoubleWidth
-        } else {
-            CheckpointLineScale::Single
-        };
-        let (bidi_enabled, bidi_hint) = line.bidi_info();
-        Ok(Self {
-            cells,
-            seqno: u64_from_usize(line.current_seqno(), "line.seqno")?,
-            scale,
-            bidi_enabled,
-            bidi_hint: bidi_hint.into(),
-        })
+        Ok(cells)
     }
 
-    fn into_live(self) -> Result<Line, TerminalCheckpointError> {
-        let seqno = usize_from_u64(self.seqno, "line.seqno")?;
-        let mut cells = Vec::new();
-        let stored_cells = self.cells.iter().try_fold(0usize, |total, cell| {
-            total
-                .checked_add(usize::from(cell.width))
-                .ok_or(TerminalCheckpointError::ArithmeticOverflow("line.cells"))
-        })?;
-        cells
-            .try_reserve_exact(stored_cells)
-            .map_err(|_| TerminalCheckpointError::ResourceAllocation("line.cells"))?;
-        for cell in self.cells {
-            let width = usize::from(cell.width);
-            let attributes = cell.attributes.into_live()?;
-            cells.push(Cell::new_grapheme_with_width(
-                &cell.text,
-                width,
-                attributes.clone(),
-            ));
-            for _ in 1..width {
-                cells.push(Cell::blank_with_attrs(attributes.clone()));
+    /// The cells `capture_cells` keeps, as runs. A run ends where the
+    /// attributes change; attributes that compare unequal live but capture
+    /// equal continue it, so neighbouring runs name different entries unless
+    /// the first closed at `CHECKPOINT_RUN_TEXT_BYTES`.
+    fn capture_runs(
+        line: &Line,
+        table: &mut CheckpointAttributeTable,
+    ) -> Result<Vec<CheckpointRun>, TerminalCheckpointError> {
+        let mut runs: Vec<CheckpointRun> = Vec::new();
+        let mut previous: Option<&CellAttributes> = None;
+        let mut entry = 0u32;
+        for cell in line.visible_cells() {
+            let width = checkpoint_cell_width(cell.width())?;
+            let (text, attributes) = match cell {
+                CellRef::CellRef { cell, .. } => (cell.str(), cell.attrs()),
+                CellRef::ClusterRef { text, attrs, .. } => (text, attrs),
+            };
+            if previous != Some(attributes) {
+                entry = table.intern(CheckpointCellAttributes::capture(attributes)?)?;
+                previous = Some(attributes);
+            }
+            let continues = runs.last().is_some_and(|run| {
+                run.attributes == entry && run.text.len() + text.len() <= CHECKPOINT_RUN_TEXT_BYTES
+            });
+            if !continues {
+                runs.try_reserve(1)
+                    .map_err(|_| TerminalCheckpointError::ResourceAllocation("line.runs"))?;
+                runs.push(CheckpointRun {
+                    text: String::new(),
+                    clusters: None,
+                    attributes: entry,
+                });
+            }
+            if let Some(run) = runs.last_mut() {
+                run.push_cell(text, width)?;
             }
         }
+        // Trailing default blanks, as in `capture_cells`.
+        if runs.last().is_some_and(CheckpointRun::ends_in_single_blank) {
+            let blank = CheckpointCellAttributes::capture(&CellAttributes::blank())?;
+            while let Some(run) = runs.last_mut() {
+                if !run.ends_in_single_blank()
+                    || table.entries.get(run.attributes as usize) != Some(&blank)
+                {
+                    break;
+                }
+                run.pop_single_blank();
+                if run.text.is_empty() {
+                    runs.pop();
+                }
+            }
+        }
+        Ok(runs)
+    }
+
+    /// The text and attributes of its `index`th stored cell; a wide cell is
+    /// one stored cell. `table` is its screen's version 4 attribute table.
+    fn cell<'a>(
+        &'a self,
+        index: usize,
+        table: Option<&'a [CheckpointCellAttributes]>,
+    ) -> Option<(&'a str, &'a CheckpointCellAttributes)> {
+        if let Some(cells) = &self.cells {
+            return cells
+                .get(index)
+                .map(|cell| (cell.text.as_str(), &cell.attributes));
+        }
+        let (runs, table) = (self.runs.as_ref()?, table?);
+        let mut index = index;
+        for run in runs {
+            let cells = run.cells();
+            if index < cells {
+                return Some((run.cell_text(index)?, table.get(run.attributes as usize)?));
+            }
+            index -= cells;
+        }
+        None
+    }
+
+    fn into_live(self, table: Option<&[CellAttributes]>) -> Result<Line, TerminalCheckpointError> {
+        let seqno = usize_from_u64(self.seqno, "line.seqno")?;
+        let cells = match (self.cells, self.runs, table) {
+            (Some(cells), None, None) => Self::cells_into_live(cells)?,
+            (None, Some(runs), Some(table)) => Self::runs_into_live(&runs, table)?,
+            _ => return Err(line_encoding_mismatch()),
+        };
         let mut line = Line::from_cells(cells, seqno);
         match self.scale {
             CheckpointLineScale::Single => {}
@@ -1379,11 +1682,86 @@ impl CheckpointLine {
         Ok(line)
     }
 
+    fn cells_into_live(cells: Vec<CheckpointCell>) -> Result<Vec<Cell>, TerminalCheckpointError> {
+        let mut live = Vec::new();
+        let stored_cells = cells.iter().try_fold(0usize, |total, cell| {
+            total
+                .checked_add(usize::from(cell.width))
+                .ok_or(TerminalCheckpointError::ArithmeticOverflow("line.cells"))
+        })?;
+        live.try_reserve_exact(stored_cells)
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("line.cells"))?;
+        for cell in cells {
+            let width = usize::from(cell.width);
+            let attributes = cell.attributes.into_live()?;
+            live.push(Cell::new_grapheme_with_width(
+                &cell.text,
+                width,
+                attributes.clone(),
+            ));
+            for _ in 1..width {
+                live.push(Cell::blank_with_attrs(attributes.clone()));
+            }
+        }
+        Ok(live)
+    }
+
+    fn runs_into_live(
+        runs: &[CheckpointRun],
+        table: &[CellAttributes],
+    ) -> Result<Vec<Cell>, TerminalCheckpointError> {
+        let mut live = Vec::new();
+        let columns = runs.iter().try_fold(0usize, |total, run| {
+            total
+                .checked_add(run.columns())
+                .ok_or(TerminalCheckpointError::ArithmeticOverflow("line.cells"))
+        })?;
+        live.try_reserve_exact(columns)
+            .map_err(|_| TerminalCheckpointError::ResourceAllocation("line.cells"))?;
+        for run in runs {
+            let attributes = table
+                .get(run.attributes as usize)
+                .ok_or_else(line_encoding_mismatch)?;
+            match &run.clusters {
+                None => {
+                    for (start, ch) in run.text.char_indices() {
+                        live.push(Cell::new_grapheme_with_width(
+                            &run.text[start..start + ch.len_utf8()],
+                            1,
+                            attributes.clone(),
+                        ));
+                    }
+                }
+                Some(clusters) => {
+                    let mut rest = run.text.as_str();
+                    for (chars, width) in clusters {
+                        let text = char_span(rest, 0, *chars as usize)
+                            .ok_or_else(line_encoding_mismatch)?;
+                        rest = &rest[text.len()..];
+                        let width = usize::from(*width);
+                        live.push(Cell::new_grapheme_with_width(
+                            text,
+                            width,
+                            attributes.clone(),
+                        ));
+                        for _ in 1..width {
+                            live.push(Cell::blank_with_attrs(attributes.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(live)
+    }
+
+    /// `table` is its screen's version 4 attribute table; a version 3 line
+    /// has none.
     fn validate(
         &self,
         limits: TerminalCheckpointLimits,
         usage: &mut crate::screen::ScreenCheckpointUsage,
         terminal_seqno: u64,
+        table: Option<&[CheckpointCellAttributes]>,
     ) -> Result<(), TerminalCheckpointError> {
         if self.seqno > terminal_seqno {
             return Err(TerminalCheckpointError::InvalidField {
@@ -1398,8 +1776,137 @@ impl CheckpointLine {
             limits.max_retained_capture_bytes,
             "retained_capture_bytes",
         )?;
+        let occupied_columns = match (&self.cells, &self.runs, table) {
+            (Some(cells), None, None) => Self::validate_cells(cells, limits, usage)?,
+            (None, Some(runs), Some(table)) => {
+                Self::validate_runs(runs, table.len(), limits, usage)?
+            }
+            _ => return Err(line_encoding_mismatch()),
+        };
+        checked_accumulate(
+            &mut usage.cells,
+            occupied_columns,
+            limits.max_total_cells,
+            "screen_cells",
+        )?;
+        if occupied_columns > limits.max_cols {
+            return Err(resource_limit(
+                "line_occupied_columns",
+                occupied_columns,
+                limits.max_cols,
+            ));
+        }
+        Ok(())
+    }
+
+    /// The columns a version 4 line's runs cover, each cell charged as
+    /// `validate_cells` charges one; the attributes are charged once, with
+    /// their table.
+    fn validate_runs(
+        runs: &[CheckpointRun],
+        table_entries: usize,
+        limits: TerminalCheckpointLimits,
+        usage: &mut crate::screen::ScreenCheckpointUsage,
+    ) -> Result<usize, TerminalCheckpointError> {
         let mut occupied_columns = 0usize;
-        for cell in &self.cells {
+        for run in runs {
+            if run.attributes as usize >= table_entries {
+                return Err(TerminalCheckpointError::InvalidField {
+                    field: "run.attributes",
+                    reason: "a run's attributes must be an entry of its screen's table",
+                });
+            }
+            if run.text.is_empty() || run.text.chars().any(char::is_control) {
+                return Err(TerminalCheckpointError::InvalidField {
+                    field: "run.text",
+                    reason: "run text must be nonempty and contain no control characters",
+                });
+            }
+            ensure_limit("run_text_bytes", run.text.len(), limits.max_string_bytes)?;
+            checked_accumulate(
+                &mut usage.cell_text_bytes,
+                run.text.len(),
+                limits.max_total_cell_text_bytes,
+                "cell_text_bytes",
+            )?;
+            let (cells, columns) = match &run.clusters {
+                None => {
+                    let chars = run.text.chars().count();
+                    (chars, chars)
+                }
+                Some(clusters) => {
+                    if clusters.iter().all(|cluster| *cluster == (1, 1)) {
+                        return Err(TerminalCheckpointError::InvalidField {
+                            field: "run.clusters",
+                            reason: "clusters are stored only when some cell is not one char one column wide",
+                        });
+                    }
+                    let mut rest = run.text.as_str();
+                    let mut columns = 0usize;
+                    for (chars, width) in clusters {
+                        if !(1..=2).contains(width) {
+                            return Err(TerminalCheckpointError::InvalidField {
+                                field: "cell.width",
+                                reason: "cell width must be one or two columns",
+                            });
+                        }
+                        let text = char_span(rest, 0, *chars as usize).ok_or(
+                            TerminalCheckpointError::InvalidField {
+                                field: "run.clusters",
+                                reason: "every cell holds at least one char of the run's text",
+                            },
+                        )?;
+                        ensure_limit(
+                            "cell_text_value_bytes",
+                            text.len(),
+                            limits.max_string_bytes,
+                        )?;
+                        rest = &rest[text.len()..];
+                        columns += usize::from(*width);
+                    }
+                    if !rest.is_empty() {
+                        return Err(TerminalCheckpointError::InvalidField {
+                            field: "run.clusters",
+                            reason: "a run's cells must hold all of its text",
+                        });
+                    }
+                    (clusters.len(), columns)
+                }
+            };
+            checked_accumulate(
+                &mut usage.cell_records,
+                cells,
+                limits.max_total_cell_records,
+                "screen_cell_records",
+            )?;
+            let retained = cells
+                .checked_mul(std::mem::size_of::<Cell>())
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<CheckpointRun>()))
+                .and_then(|bytes| bytes.checked_add(run.text.len()))
+                .ok_or(TerminalCheckpointError::ArithmeticOverflow(
+                    "retained_capture_bytes",
+                ))?;
+            checked_accumulate(
+                &mut usage.retained_capture_bytes,
+                retained,
+                limits.max_retained_capture_bytes,
+                "retained_capture_bytes",
+            )?;
+            occupied_columns = occupied_columns.checked_add(columns).ok_or(
+                TerminalCheckpointError::ArithmeticOverflow("line_occupied_columns"),
+            )?;
+        }
+        Ok(occupied_columns)
+    }
+
+    /// The columns a version 3 line's cells cover.
+    fn validate_cells(
+        cells: &[CheckpointCell],
+        limits: TerminalCheckpointLimits,
+        usage: &mut crate::screen::ScreenCheckpointUsage,
+    ) -> Result<usize, TerminalCheckpointError> {
+        let mut occupied_columns = 0usize;
+        for cell in cells {
             checked_accumulate(
                 &mut usage.cell_records,
                 1,
@@ -1444,20 +1951,7 @@ impl CheckpointLine {
             )?;
             cell.attributes.validate(limits, usage)?;
         }
-        checked_accumulate(
-            &mut usage.cells,
-            occupied_columns,
-            limits.max_total_cells,
-            "screen_cells",
-        )?;
-        if occupied_columns > limits.max_cols {
-            return Err(resource_limit(
-                "line_occupied_columns",
-                occupied_columns,
-                limits.max_cols,
-            ));
-        }
-        Ok(())
+        Ok(occupied_columns)
     }
 }
 
@@ -2274,6 +2768,9 @@ impl CheckpointScrollbackGeneration {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckpointScreen {
+    /// Version 4 only: the attribute sets its lines' runs name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attributes: Option<Vec<CheckpointCellAttributes>>,
     lines: Vec<CheckpointLine>,
     stable_row_index_offset: u64,
     cold_snapshot_generation: Option<CheckpointScrollbackGeneration>,
@@ -2289,13 +2786,18 @@ struct CheckpointScreen {
 impl CheckpointScreen {
     fn capture(
         value: crate::screen::ScreenCheckpointParts,
+        encoding: TerminalCheckpointLineEncoding,
     ) -> Result<Self, TerminalCheckpointError> {
         let mut lines = Vec::new();
         lines
             .try_reserve_exact(value.lines.len())
             .map_err(|_| TerminalCheckpointError::ResourceAllocation("screen.lines"))?;
+        let mut table = match encoding {
+            TerminalCheckpointLineEncoding::Cells => None,
+            TerminalCheckpointLineEncoding::Runs => Some(CheckpointAttributeTable::default()),
+        };
         for line in &value.lines {
-            lines.push(CheckpointLine::capture(line)?);
+            lines.push(CheckpointLine::capture(line, table.as_mut())?);
         }
         let mut keyboard_stack = Vec::new();
         keyboard_stack
@@ -2305,6 +2807,7 @@ impl CheckpointScreen {
             keyboard_stack.push(CheckpointKeyboardEncoding::from(encoding));
         }
         Ok(Self {
+            attributes: table.map(|table| table.entries),
             lines,
             stable_row_index_offset: u64_from_usize(
                 value.stable_row_index_offset,
@@ -2338,13 +2841,33 @@ impl CheckpointScreen {
         })
     }
 
+    /// The text and attributes of the `col`th stored cell of line `row`.
+    fn cell(&self, row: usize, col: usize) -> Option<(&str, &CheckpointCellAttributes)> {
+        self.lines
+            .get(row)?
+            .cell(col, self.attributes.as_deref())
+    }
+
     fn into_live(self) -> Result<crate::screen::ScreenCheckpointParts, TerminalCheckpointError> {
+        // Each entry becomes live attributes once; its cells share clones.
+        let table = match self.attributes {
+            None => None,
+            Some(entries) => {
+                let mut live = Vec::new();
+                live.try_reserve_exact(entries.len())
+                    .map_err(|_| TerminalCheckpointError::ResourceAllocation("screen.attributes"))?;
+                for entry in entries {
+                    live.push(entry.into_live()?);
+                }
+                Some(live)
+            }
+        };
         let mut lines = Vec::new();
         lines
             .try_reserve_exact(self.lines.len())
             .map_err(|_| TerminalCheckpointError::ResourceAllocation("screen.lines"))?;
         for line in self.lines {
-            lines.push(line.into_live()?);
+            lines.push(line.into_live(table.as_deref())?);
         }
         let mut keyboard_stack = Vec::new();
         keyboard_stack
@@ -2394,7 +2917,35 @@ impl CheckpointScreen {
         limits: TerminalCheckpointLimits,
         usage: &mut crate::screen::ScreenCheckpointUsage,
         terminal_seqno: u64,
+        encoding: TerminalCheckpointLineEncoding,
     ) -> Result<(), TerminalCheckpointError> {
+        let table = match (encoding, self.attributes.as_deref()) {
+            (TerminalCheckpointLineEncoding::Cells, None) => None,
+            (TerminalCheckpointLineEncoding::Runs, Some(table)) => Some(table),
+            _ => {
+                return Err(TerminalCheckpointError::InvalidField {
+                    field: "screen.attributes",
+                    reason: "a screen has an attribute table exactly when its lines are runs",
+                });
+            }
+        };
+        if let Some(table) = table {
+            ensure_limit(
+                "screen_attributes",
+                table.len(),
+                limits.max_total_cell_records,
+            )?;
+            for entry in table {
+                checked_accumulate(
+                    &mut usage.retained_capture_bytes,
+                    std::mem::size_of::<CheckpointCellAttributes>()
+                        + std::mem::size_of::<CellAttributes>(),
+                    limits.max_retained_capture_bytes,
+                    "retained_capture_bytes",
+                )?;
+                entry.validate(limits, usage)?;
+            }
+        }
         if self.allow_scrollback != expected_scrollback {
             return Err(TerminalCheckpointError::InvalidField {
                 field: "screen.allow_scrollback",
@@ -2505,7 +3056,7 @@ impl CheckpointScreen {
             });
         }
         for line in &self.lines {
-            line.validate(limits, usage, terminal_seqno)?;
+            line.validate(limits, usage, terminal_seqno, table)?;
         }
         if let Some(saved) = self.saved_cursor.as_ref() {
             saved.validate(terminal_seqno, limits, usage)?;
@@ -2555,6 +3106,10 @@ pub struct TerminalCheckpointLimits {
     pub max_terminal_string_bytes: usize,
     pub max_pixel_dimension: usize,
     pub max_dpi: u32,
+    /// How a capture under these limits writes its lines. Decoding admits
+    /// either encoding; a terminal restored from a checkpoint captures
+    /// again in the encoding it was restored from.
+    pub line_encoding: TerminalCheckpointLineEncoding,
 }
 
 impl Default for TerminalCheckpointLimits {
@@ -2589,6 +3144,7 @@ impl Default for TerminalCheckpointLimits {
             max_terminal_string_bytes: 8 * 1024 * 1024,
             max_pixel_dimension: 1_048_576,
             max_dpi: 1_000_000,
+            line_encoding: TerminalCheckpointLineEncoding::Cells,
         }
     }
 }
@@ -3012,6 +3568,8 @@ mod historical_saved_cursor_option {
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "CheckpointScreen", deny_unknown_fields)]
 struct HistoricalScreenV2 {
+    #[serde(skip)]
+    attributes: Option<Vec<CheckpointCellAttributes>>,
     lines: Vec<CheckpointLine>,
     stable_row_index_offset: u64,
     cold_snapshot_generation: Option<CheckpointScrollbackGeneration>,
@@ -3411,9 +3969,11 @@ impl StagedHotCheckpoint {
                 },
             })?;
 
-        let primary_screen = CheckpointScreen::capture(parts)?;
+        // The alternate screen was captured in this encoding when staged.
+        let encoding = self.limits.line_encoding;
+        let primary_screen = CheckpointScreen::capture(parts, encoding)?;
         let checkpoint = TerminalCheckpointV3 {
-            version: TERMINAL_CHECKPOINT_VERSION,
+            version: encoding.version(),
             custom_cell_width_maps: self.custom_cell_width_maps,
             replay_config: self.replay_config,
             primary_screen,
@@ -4007,7 +4567,7 @@ impl TerminalCheckpointV3 {
 
         Ok(StagedHotCheckpoint {
             staged_primary,
-            alternate_screen: CheckpointScreen::capture(alternate_screen)?,
+            alternate_screen: CheckpointScreen::capture(alternate_screen, limits.line_encoding)?,
             alternate_screen_active: terminal.screen.alt_screen_is_active,
             pen: CheckpointCellAttributes::capture(&terminal.pen)?,
             cursor: CheckpointCursorPosition::capture(terminal.cursor)?,
@@ -4158,12 +4718,12 @@ impl TerminalCheckpointV3 {
         }
 
         limits.validate_policy()?;
-        if self.version != TERMINAL_CHECKPOINT_VERSION {
-            return Err(TerminalCheckpointError::UnsupportedVersion {
+        let encoding = TerminalCheckpointLineEncoding::of_version(self.version).ok_or(
+            TerminalCheckpointError::UnsupportedVersion {
                 observed: self.version,
-                supported: TERMINAL_CHECKPOINT_VERSION,
-            });
-        }
+                supported: COMPACT_TERMINAL_CHECKPOINT_VERSION,
+            },
+        )?;
         let native_seqno = usize_from_u64(self.seqno, "seqno")?;
         if native_seqno == 0 || native_seqno == SequenceNo::MAX {
             return Err(TerminalCheckpointError::InvalidField {
@@ -4215,9 +4775,9 @@ impl TerminalCheckpointV3 {
             referenced_tables |= 1u8 << index;
         }
         self.primary_screen
-            .validate(true, limits, &mut usage, self.seqno)?;
+            .validate(true, limits, &mut usage, self.seqno, encoding)?;
         self.alternate_screen
-            .validate(false, limits, &mut usage, self.seqno)?;
+            .validate(false, limits, &mut usage, self.seqno, encoding)?;
 
         let rows = self.primary_screen.physical_rows;
         let cols = self.primary_screen.physical_cols;
@@ -4601,13 +5161,13 @@ impl TerminalCheckpointV3 {
         let observed = version_text
             .parse::<u32>()
             .map_err(|_| TerminalCheckpointError::Serialization)?;
-        if observed != TERMINAL_CHECKPOINT_VERSION {
-            return Err(TerminalCheckpointError::UnsupportedVersion {
+        let encoding = TerminalCheckpointLineEncoding::of_version(observed).ok_or(
+            TerminalCheckpointError::UnsupportedVersion {
                 observed,
-                supported: TERMINAL_CHECKPOINT_VERSION,
-            });
-        }
-        if version_text != TERMINAL_CHECKPOINT_VERSION.to_string() {
+                supported: COMPACT_TERMINAL_CHECKPOINT_VERSION,
+            },
+        )?;
+        if version_text != observed.to_string() {
             return Err(TerminalCheckpointError::NonCanonicalEncoding);
         }
 
@@ -4620,7 +5180,22 @@ impl TerminalCheckpointV3 {
         if canonical.as_slice() != bytes {
             return Err(TerminalCheckpointError::NonCanonicalEncoding);
         }
+        // What it restores captures again as it was captured.
+        let limits = TerminalCheckpointLimits {
+            line_encoding: encoding,
+            ..limits
+        };
         Ok(ValidatedTerminalCheckpointV3 { checkpoint, limits })
+    }
+
+    /// The schema version a canonical payload declares, read from its prefix
+    /// without decoding it; `None` for bytes no decoder would admit.
+    #[must_use]
+    pub fn canonical_payload_version(bytes: &[u8]) -> Option<u32> {
+        let tail = bytes.strip_prefix(b"{\"version\":")?;
+        let comma = tail.iter().take(11).position(|byte| *byte == b',')?;
+        let version = std::str::from_utf8(&tail[..comma]).ok()?.parse().ok()?;
+        TerminalCheckpointLineEncoding::of_version(version).map(|_| version)
     }
 
     #[must_use]
@@ -4739,41 +5314,29 @@ impl TerminalCheckpointV3 {
     /// Text of the cell at `(row, col)` in the primary screen.
     #[must_use]
     pub fn primary_cell_text(&self, row: usize, col: usize) -> Option<&str> {
-        self.primary_screen
-            .lines
-            .get(row)
-            .and_then(|line| line.cells.get(col))
-            .map(|cell| cell.text.as_str())
+        self.primary_screen.cell(row, col).map(|(text, _)| text)
     }
 
     /// Text of the cell at `(row, col)` in the alternate screen.
     #[must_use]
     pub fn alternate_cell_text(&self, row: usize, col: usize) -> Option<&str> {
-        self.alternate_screen
-            .lines
-            .get(row)
-            .and_then(|line| line.cells.get(col))
-            .map(|cell| cell.text.as_str())
+        self.alternate_screen.cell(row, col).map(|(text, _)| text)
     }
 
     /// Intensity attribute of the cell at `(row, col)` in the primary screen.
     #[must_use]
     pub fn primary_cell_intensity(&self, row: usize, col: usize) -> Option<Intensity> {
         self.primary_screen
-            .lines
-            .get(row)
-            .and_then(|line| line.cells.get(col))
-            .map(|cell| cell.attributes.intensity)
+            .cell(row, col)
+            .map(|(_, attributes)| attributes.intensity)
     }
 
     /// Underline attribute of the cell at `(row, col)` in the alternate screen.
     #[must_use]
     pub fn alternate_cell_underline(&self, row: usize, col: usize) -> Option<Underline> {
         self.alternate_screen
-            .lines
-            .get(row)
-            .and_then(|line| line.cells.get(col))
-            .map(|cell| cell.attributes.underline)
+            .cell(row, col)
+            .map(|(_, attributes)| attributes.underline)
     }
 }
 
@@ -5645,22 +6208,23 @@ mod tests {
         let checkpoint = TerminalCheckpointV3::capture(&terminal).expect("capture terminal");
         let blank =
             CheckpointCellAttributes::capture(&CellAttributes::blank()).expect("blank attributes");
-        let lines = &checkpoint.primary_screen.lines;
+        let lines = checkpoint
+            .primary_screen
+            .lines
+            .iter()
+            .map(|line| line.cells.as_deref().expect("version 3 cells"))
+            .collect::<Vec<_>>();
         assert!(lines
             .iter()
-            .all(|line| line.cells.last().is_none_or(|cell| {
+            .all(|cells| cells.last().is_none_or(|cell| {
                 !(cell.width == 1 && cell.text == " " && cell.attributes == blank)
             })));
         // The colored blank and the wrapped row's last cell stay.
-        assert!(lines.iter().any(|line| line
-            .cells
+        assert!(lines.iter().any(|cells| cells
             .last()
             .is_some_and(|cell| cell.text == " " && cell.attributes != blank)));
-        assert!(lines.iter().any(|line| line.cells.len() == 120
-            && line
-                .cells
-                .last()
-                .is_some_and(|cell| cell.attributes.wrapped)));
+        assert!(lines.iter().any(|cells| cells.len() == 120
+            && cells.last().is_some_and(|cell| cell.attributes.wrapped)));
 
         let limits = TerminalCheckpointLimits::default();
         let payload = checkpoint
@@ -5942,7 +6506,7 @@ mod tests {
             screen
                 .lines
                 .iter()
-                .map(|line| line.clone().into_live().unwrap().as_str().into_owned())
+                .map(|line| line.clone().into_live(None).unwrap().as_str().into_owned())
                 .collect::<String>()
         };
         assert_eq!(text(&before.primary_screen), text(&captured.primary_screen));
@@ -6320,8 +6884,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn canonical_restore_roundtrips_complete_semantic_projection() {
+    /// A terminal using every part of the schema: a resize, both screens,
+    /// a hyperlink, saved cursors, user vars, a palette, a custom width map.
+    fn rich_terminal() -> Terminal {
         let config: Arc<dyn TerminalConfiguration + Send + Sync> =
             Arc::new(RichCheckpointTestConfig);
         let mut terminal = Terminal::new(
@@ -6362,7 +6927,12 @@ mod tests {
                 label: Some("prior-unicode".into()),
             });
         terminal.accumulating_title = Some("pending-title-fragment".into());
+        terminal
+    }
 
+    #[test]
+    fn canonical_restore_roundtrips_complete_semantic_projection() {
+        let terminal = rich_terminal();
         let limits = TerminalCheckpointLimits::default();
         let before = TerminalCheckpointV3::capture_with_limits(&terminal, limits)
             .expect("capture rich terminal");
@@ -6382,6 +6952,274 @@ mod tests {
                 .expect("encode restored rich terminal"),
             canonical,
         );
+    }
+
+    fn runs_limits() -> TerminalCheckpointLimits {
+        TerminalCheckpointLimits {
+            line_encoding: TerminalCheckpointLineEncoding::Runs,
+            ..TerminalCheckpointLimits::default()
+        }
+    }
+
+    /// Captures `terminal` in both encodings, restores each payload, and
+    /// captures every restored terminal in both encodings again: each must
+    /// give back exactly what capturing `terminal` in that encoding gave, so
+    /// either payload restores the same terminal. Returns both payloads.
+    fn assert_both_encodings_restore_alike(
+        terminal: &Terminal,
+        config: fn() -> Arc<dyn TerminalConfiguration + Send + Sync>,
+    ) -> (Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>) {
+        let cells_limits = TerminalCheckpointLimits::default();
+        let runs_limits = runs_limits();
+        let encode = |limits: TerminalCheckpointLimits| {
+            TerminalCheckpointV3::capture_with_limits(terminal, limits)
+                .expect("capture")
+                .to_canonical_json(limits)
+                .expect("encode")
+        };
+        let cells = encode(cells_limits);
+        let runs = encode(runs_limits);
+        assert!(cells.starts_with(b"{\"version\":3,"));
+        assert!(runs.starts_with(b"{\"version\":4,"));
+        for payload in [&cells, &runs] {
+            let decoded = TerminalCheckpointV3::decode_canonical_json(payload, cells_limits)
+                .expect("decode")
+                .into_checkpoint();
+            for (limits, expected) in [(cells_limits, &cells), (runs_limits, &runs)] {
+                let restored = ValidatedTerminalCheckpointV3 {
+                    checkpoint: decoded.clone(),
+                    limits,
+                }
+                .restore_inert(config())
+                .expect("restore");
+                let again = restored
+                    .checkpoint()
+                    .expect("capture the restored terminal")
+                    .to_canonical_json(limits)
+                    .expect("encode the restored terminal");
+                assert!(
+                    again == *expected,
+                    "a version {} payload restored and captured as {:?} differs",
+                    decoded.version,
+                    limits.line_encoding,
+                );
+            }
+        }
+        (cells, runs)
+    }
+
+    fn plain_config() -> Arc<dyn TerminalConfiguration + Send + Sync> {
+        Arc::new(CheckpointTestConfig)
+    }
+
+    fn rich_config() -> Arc<dyn TerminalConfiguration + Send + Sync> {
+        Arc::new(RichCheckpointTestConfig)
+    }
+
+    /// Every cell shape and attribute a run holds: wide and custom-width
+    /// cells, emoji sequences, combining marks, colors of every kind,
+    /// hyperlinks, colored and trailing blanks, wrapped and double-width
+    /// rows, tabs, history, and an active alternate screen.
+    const MIXED_CELLS: &str = concat!(
+        "plain ascii\r\n",
+        "\x1b[1;31mbold red\x1b[0m normal \x1b[38;2;10;20;30mtruecolor\x1b[0m\r\n",
+        "wide \u{65e5}\u{672c} crab \u{1f980} thumb \u{1f44d}\u{1f3fd} family ",
+        "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} flag \u{1f1fa}\u{1f1f8} heart \u{2764}\u{fe0f}\r\n",
+        "combining e\u{301}a\u{308} x-wide xx\r\n",
+        "\x1b[4:3m\x1b[58;2;1;2;3mcurly\x1b[0m \x1b[7mreverse\x1b[0m \x1b[9mstrike\x1b[0m\r\n",
+        "\x1b[44m   \x1b[0m colored blanks, trailing spaces    \r\n",
+        "\x1b#6double width\r\n",
+        "tab\tseparated\tcells\r\n",
+        "\x1b]8;id=a;https://example.invalid/a\x07link\x1b]8;;\x07 after\r\n",
+    );
+
+    #[test]
+    fn both_line_encodings_restore_the_same_terminal() {
+        let mut mixed = terminal();
+        mixed.advance_bytes(MIXED_CELLS.as_bytes());
+        mixed.advance_bytes([b'w'; 200]);
+        mixed.advance_bytes(b"\r\n");
+        for tick in 0..40 {
+            mixed.advance_bytes(format!("tick {tick}\r\n").as_bytes());
+        }
+        assert_both_encodings_restore_alike(&mixed, plain_config);
+
+        mixed.advance_bytes(b"\x1b[?1049h\x1b[32malt \xe6\xbc\xa2 green\x1b[0m\r\nsecond row");
+        assert_both_encodings_restore_alike(&mixed, plain_config);
+
+        let mut rich = rich_terminal();
+        rich.advance_bytes(MIXED_CELLS.as_bytes());
+        assert_both_encodings_restore_alike(&rich, rich_config);
+        assert_both_encodings_restore_alike(&terminal(), plain_config);
+    }
+
+    /// The payload a pane of short log lines makes: runs carry each line's
+    /// text once and each attribute set once per screen.
+    #[test]
+    fn runs_make_a_small_fraction_of_the_cells_payload() {
+        let mut ticks = Terminal::new(
+            TerminalSize {
+                rows: 80,
+                cols: 120,
+                pixel_width: 960,
+                pixel_height: 1280,
+                dpi: 96,
+            },
+            Arc::new(CheckpointTestConfig),
+            "FrankenTerm",
+            "checkpoint-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        for tick in 0..500 {
+            ticks.advance_bytes(
+                format!("\x1b[32m{tick:>6}\x1b[0m tick at \x1b[1msome time\x1b[0m done\r\n")
+                    .as_bytes(),
+            );
+        }
+        let (cells, runs) = assert_both_encodings_restore_alike(&ticks, plain_config);
+        assert!(
+            runs.len() * 20 < cells.len(),
+            "runs {} bytes, cells {} bytes",
+            runs.len(),
+            cells.len()
+        );
+        let checkpoint = TerminalCheckpointV3::decode_canonical_json(&runs, runs_limits())
+            .expect("decode runs")
+            .into_checkpoint();
+        assert_eq!(
+            checkpoint
+                .primary_screen
+                .attributes
+                .as_ref()
+                .map(Vec::len),
+            Some(3),
+            "default, green and bold, each once"
+        );
+        assert_eq!(
+            TerminalCheckpointV3::canonical_payload_version(&runs),
+            Some(COMPACT_TERMINAL_CHECKPOINT_VERSION)
+        );
+        assert_eq!(
+            TerminalCheckpointV3::canonical_payload_version(&cells),
+            Some(TERMINAL_CHECKPOINT_VERSION)
+        );
+        assert_eq!(
+            TerminalCheckpointV3::canonical_payload_version(b"{\"version\":5,"),
+            None
+        );
+        assert_eq!(TerminalCheckpointV3::canonical_payload_version(b"{}"), None);
+    }
+
+    fn run_of(checkpoint: &mut TerminalCheckpointV3, line: usize) -> &mut CheckpointRun {
+        &mut checkpoint.primary_screen.lines[line]
+            .runs
+            .as_mut()
+            .expect("version 4 runs")[0]
+    }
+
+    #[test]
+    fn decoder_refuses_runs_that_misstate_their_cells() {
+        let mut terminal = terminal();
+        terminal.advance_bytes("plain\r\nwide \u{65e5}\u{672c} e\u{301}".as_bytes());
+        let checkpoint = TerminalCheckpointV3::capture_with_limits(&terminal, runs_limits())
+            .expect("capture runs");
+        assert!(run_of(&mut checkpoint.clone(), 0).clusters.is_none());
+        assert!(run_of(&mut checkpoint.clone(), 1).clusters.is_some());
+        let table_len = checkpoint
+            .primary_screen
+            .attributes
+            .as_ref()
+            .map_or(0, Vec::len);
+
+        let cases: Vec<(&str, Box<dyn Fn(&mut TerminalCheckpointV3)>)> = vec![
+            (
+                "run.attributes",
+                Box::new(move |c| run_of(c, 0).attributes = table_len as u32),
+            ),
+            ("run.text", Box::new(|c| run_of(c, 0).text.clear())),
+            ("run.text", Box::new(|c| run_of(c, 0).text.push('\u{7}'))),
+            (
+                "run.clusters",
+                Box::new(|c| run_of(c, 0).clusters = Some(vec![(1, 1); 5])),
+            ),
+            (
+                "run.clusters",
+                Box::new(|c| {
+                    run_of(c, 1).clusters.as_mut().unwrap().pop();
+                }),
+            ),
+            (
+                "run.clusters",
+                Box::new(|c| run_of(c, 1).clusters.as_mut().unwrap().push((1, 1))),
+            ),
+            (
+                "run.clusters",
+                Box::new(|c| run_of(c, 1).clusters.as_mut().unwrap()[0] = (0, 1)),
+            ),
+            (
+                "cell.width",
+                Box::new(|c| run_of(c, 1).clusters.as_mut().unwrap()[0] = (1, 3)),
+            ),
+            (
+                "screen.attributes",
+                Box::new(|c| c.primary_screen.attributes = None),
+            ),
+            ("screen.attributes", Box::new(|c| c.version = 3)),
+            (
+                "line.cells",
+                Box::new(|c| {
+                    let line = &mut c.primary_screen.lines[0];
+                    line.runs = None;
+                    line.cells = Some(Vec::new());
+                }),
+            ),
+        ];
+        let limits = TerminalCheckpointLimits::default();
+        for (field, damage) in cases {
+            let mut damaged = checkpoint.clone();
+            damage(&mut damaged);
+            let bytes = serde_json::to_vec(&damaged).expect("encode damaged checkpoint");
+            match TerminalCheckpointV3::decode_canonical_json(&bytes, limits) {
+                Err(TerminalCheckpointError::InvalidField { field: refused, .. })
+                    if refused == field => {}
+                other => panic!("expected {} refused, got {:?}", field, other),
+            }
+        }
+        let undamaged = serde_json::to_vec(&checkpoint).expect("encode checkpoint");
+        TerminalCheckpointV3::decode_canonical_json(&undamaged, limits).expect("decode runs");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+
+        /// Any output, in a small pane whose history scrolls, restores alike
+        /// from either encoding.
+        #[test]
+        fn any_output_restores_alike_from_either_encoding(
+            pieces in proptest::collection::vec(proptest::sample::select(vec![
+                "a", "word ", "  ", "\u{65e5}", "\u{1f980}", "e\u{301}", "\u{2764}\u{fe0f}",
+                "\r\n", "\r", "\t", "\x1b[31m", "\x1b[1;4m", "\x1b[38;2;1;2;3m", "\x1b[44m",
+                "\x1b[0m", "\x1b[7m", "\x1b[2K", "\x1b[H", "\x1b[3;5H", "\x1b#6",
+                "\x1b]8;;https://example.invalid\x07", "\x1b]8;;\x07", "\x1b[?1049h",
+                "\x1b[?1049l", "0123456789",
+            ]), 0..160)
+        ) {
+            let mut small = Terminal::new(
+                TerminalSize {
+                    rows: 5,
+                    cols: 12,
+                    pixel_width: 120,
+                    pixel_height: 100,
+                    dpi: 96,
+                },
+                Arc::new(CheckpointTestConfig),
+                "FrankenTerm",
+                "checkpoint-proptest",
+                Box::new(Vec::<u8>::new()),
+            );
+            small.advance_bytes(pieces.concat().as_bytes());
+            assert_both_encodings_restore_alike(&small, plain_config);
+        }
     }
 
     #[test]
@@ -6582,10 +7420,20 @@ mod tests {
         let mut unknown_version = canonical.clone();
         let version = b"{\"version\":3";
         assert!(unknown_version.starts_with(version));
-        unknown_version[version.len() - 1] = b'4';
+        unknown_version[version.len() - 1] = b'5';
         assert!(matches!(
             TerminalCheckpointV3::decode_canonical_json(&unknown_version, limits),
-            Err(TerminalCheckpointError::UnsupportedVersion { observed: 4, .. })
+            Err(TerminalCheckpointError::UnsupportedVersion { observed: 5, .. })
+        ));
+        // Version 4 names the encoding, which these cells are not.
+        let mut relabelled = canonical.clone();
+        relabelled[version.len() - 1] = b'4';
+        assert!(matches!(
+            TerminalCheckpointV3::decode_canonical_json(&relabelled, limits),
+            Err(TerminalCheckpointError::InvalidField {
+                field: "screen.attributes",
+                ..
+            })
         ));
 
         // Mutate the canonical bytes in place so this negative reaches typed

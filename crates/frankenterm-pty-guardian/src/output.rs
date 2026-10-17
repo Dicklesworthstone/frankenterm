@@ -15436,7 +15436,9 @@ fn checkpoint_catalog_publish_sealed_stage(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
+    use frankenterm_term::terminalstate::checkpoint::{
+        TerminalCheckpointLimits, TerminalCheckpointLineEncoding,
+    };
     use frankenterm_term::{
         RecoveryTerminalCheckpointV3, Terminal, TerminalConfiguration, TerminalSize,
     };
@@ -18190,6 +18192,52 @@ mod tests {
     /// the checkpoint again. A candidate built in memory (no checksum)
     /// validates every time, and so does a member whose checksum the memo
     /// has forgotten.
+    /// A version 4 (compact lines) terminal checkpoint is staged, validated,
+    /// published and scanned as version 3 is, at a fraction of its size.
+    #[test]
+    fn a_compact_terminal_checkpoint_is_adopted_as_version_three_is()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-catalog-compact-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0xaf200);
+        let mux = Uuid::from_u128(0xaf201);
+        let pane = Uuid::from_u128(0xaf202);
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
+        let mut output = Vec::new();
+        for line in 0..60 {
+            output.extend_from_slice(
+                format!("\x1b[32m{line:>4}\x1b[0m compact \x1b[1mlines\x1b[0m\r\n").as_bytes(),
+            );
+        }
+        let receipt = durable_commit(&pipeline, pane, &journal, &output)?;
+        let capture = |line_encoding| {
+            checkpoint_catalog_test_terminal_instance(&output).capture_recovery_checkpoint(
+                TerminalCheckpointLimits {
+                    line_encoding,
+                    ..TerminalCheckpointLimits::default()
+                },
+            )
+        };
+        let compact = capture(TerminalCheckpointLineEncoding::Runs)?;
+        let cells = capture(TerminalCheckpointLineEncoding::Cells)?;
+        assert!(compact.canonical_payload().starts_with(b"{\"version\":4,"));
+        assert!(compact.canonical_payload().len() * 10 < cells.canonical_payload().len());
+        checkpoint_catalog_stage_and_publish_checkpoint(
+            &store, &journal, &mut state, guardian, mux, pane, 1, 1, 0xaf_2000, receipt, &compact,
+        )?;
+        store.with_exclusive_directory(|inner| {
+            let scan =
+                checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })?;
+            assert_eq!(scan.published.len(), 1);
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     #[test]
     fn a_member_payload_is_validated_once_per_authenticated_checksum()
     -> Result<(), Box<dyn std::error::Error>> {

@@ -89,7 +89,9 @@ use config::{configuration, ExitBehavior, GuiPosition, TermConfig};
 use domain::{Domain, DomainId, DomainState, SplitSource};
 use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
-use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
+use frankenterm_term::terminalstate::checkpoint::{
+    TerminalCheckpointLimits, TerminalCheckpointLineEncoding,
+};
 use frankenterm_term::{Alert, Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
 #[cfg(unix)]
 use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
@@ -10681,6 +10683,9 @@ pub struct Mux {
     /// A recovery root publisher runs: live guardian checkpoints keep the
     /// members newest committed roots name (`guardian_live_adoption_allowed`).
     guardian_root_retention: AtomicBool,
+    /// This mux's guardian validates version 4 (compact) terminal
+    /// checkpoints (`set_guardian_compact_checkpoints`).
+    guardian_compact_checkpoints: AtomicBool,
     retiring_pane_ids: Mutex<HashSet<PaneId>>,
     pane_removal_cleanup_fences: Mutex<HashMap<PaneId, Arc<PaneRemovalCleanupToken>>>,
     pane_removal_cleanup_outstanding_leases: AtomicUsize,
@@ -13261,7 +13266,7 @@ fn publish_guardian_checkpoint_after_typed_delivery(
         .capture_and_publish_guardian_checkpoint(
             segment,
             output,
-            TerminalCheckpointLimits::default(),
+            mux.guardian_checkpoint_limits(),
             GUARDIAN_LIVE_CHECKPOINT_CAPTURE_TIMEOUT,
         )
         .map(drop)
@@ -13765,6 +13770,7 @@ impl Mux {
             pane_preparations: Mutex::new(HashMap::new()),
             pane_registration: Mutex::new(()),
             guardian_root_retention: AtomicBool::new(false),
+            guardian_compact_checkpoints: AtomicBool::new(false),
             retiring_pane_ids: Mutex::new(HashSet::new()),
             pane_removal_cleanup_fences: Mutex::new(HashMap::new()),
             pane_removal_cleanup_outstanding_leases: AtomicUsize::new(0),
@@ -21995,6 +22001,33 @@ impl Mux {
     pub fn set_guardian_root_retention(&self, enabled: bool) {
         self.guardian_root_retention
             .store(enabled, Ordering::Release);
+    }
+
+    /// Whether this mux's guardian validates version 4 (compact) terminal
+    /// checkpoints: the caller learned it from the guardian itself
+    /// (`GuardianClient::admits_compact_checkpoints`).
+    ///
+    /// Every reader of what this mux publishes then admits version 4: the
+    /// guardian, and any mux that restores it, which is the guardian's own
+    /// family or an upgrade of it, since the guardian stays on the family it
+    /// was installed with.
+    pub fn set_guardian_compact_checkpoints(&self, enabled: bool) {
+        self.guardian_compact_checkpoints
+            .store(enabled, Ordering::Release);
+    }
+
+    /// The limits for checkpoints this mux publishes: version 4 lines when
+    /// its guardian admits them, version 3 otherwise.
+    pub fn guardian_checkpoint_limits(&self) -> TerminalCheckpointLimits {
+        let line_encoding = if self.guardian_compact_checkpoints.load(Ordering::Acquire) {
+            TerminalCheckpointLineEncoding::Runs
+        } else {
+            TerminalCheckpointLineEncoding::Cells
+        };
+        TerminalCheckpointLimits {
+            line_encoding,
+            ..TerminalCheckpointLimits::default()
+        }
     }
 
     /// A committed recovery root names `published` for `pane_id`. Returns

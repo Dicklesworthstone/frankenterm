@@ -104,6 +104,12 @@ const REPLAY_ACK_REPLY_MAGIC: [u8; 4] = *b"GAR1";
 const REJECTION_PAYLOAD_MAGIC: [u8; 4] = *b"GRE1";
 const SPAWN_PAYLOAD_FIXED_BYTES: usize = 16;
 const HELLO_BUILD_IDENTITY_PAYLOAD_BYTES: usize = 40;
+// Bits of a build-bearing Hello's byte 5, each a capability the mux requires.
+// A guardian refuses a bit it does not know; the first decoder refused all.
+const HELLO_REQUIRES_SUCCESSOR_ROTATION: u8 = 1;
+const HELLO_REQUIRES_COMPACT_CHECKPOINTS: u8 = 2;
+const HELLO_KNOWN_REQUIREMENTS: u8 =
+    HELLO_REQUIRES_SUCCESSOR_ROTATION | HELLO_REQUIRES_COMPACT_CHECKPOINTS;
 const RESIZE_PAYLOAD_BYTES: usize = 12;
 const SIGNAL_PAYLOAD_BYTES: usize = 5;
 const INPUT_EFFECT_QUERY_PAYLOAD_BYTES: usize = 64;
@@ -1189,14 +1195,24 @@ impl GuardianHelloBuildIdentityV1 {
     #[must_use]
     pub fn encode_requiring_successor_rotation(self) -> [u8; HELLO_BUILD_IDENTITY_PAYLOAD_BYTES] {
         let mut payload = self.encode();
-        payload[5] = 1;
+        payload[5] |= HELLO_REQUIRES_SUCCESSOR_ROTATION;
+        payload
+    }
+
+    /// Require that the guardian validate version 4 (compact) terminal
+    /// checkpoints. A guardian predating them rejects this reserved bit, so
+    /// an accepted Hello is the mux's only evidence that it may publish them.
+    #[must_use]
+    pub fn encode_requiring_compact_checkpoints(self) -> [u8; HELLO_BUILD_IDENTITY_PAYLOAD_BYTES] {
+        let mut payload = self.encode();
+        payload[5] |= HELLO_REQUIRES_COMPACT_CHECKPOINTS;
         payload
     }
 
     fn decode(payload: &[u8]) -> Result<Self, GuardianProtocolError> {
         if payload.len() != HELLO_BUILD_IDENTITY_PAYLOAD_BYTES
             || payload.get(..4) != Some(HELLO_BUILD_IDENTITY_PAYLOAD_MAGIC.as_slice())
-            || payload[5] > 1
+            || payload[5] & !HELLO_KNOWN_REQUIREMENTS != 0
             || payload[6..8].iter().any(|byte| *byte != 0)
         {
             return Err(GuardianProtocolError::InvalidOperationPayload);
@@ -13867,6 +13883,26 @@ mod tests {
     }
 
     #[test]
+    fn compact_checkpoints_are_an_explicit_hello_requirement() {
+        let hello = GuardianHelloBuildIdentityV1::from_build_identity_for_test(
+            AtomicBuildIdentity::Sealed(sealed_build_identity(0x52)),
+        );
+        let ordinary = hello.encode();
+        let compact = hello.encode_requiring_compact_checkpoints();
+        assert_eq!(compact[5], 2);
+        assert_eq!(compact[..5], ordinary[..5]);
+        assert_eq!(compact[6..], ordinary[6..]);
+        assert!(GuardianHelloBuildIdentityV1::decode(&compact).is_ok());
+        // Guardians predating compact checkpoints refused a byte 5 above 1.
+        assert!(compact[5] > 1);
+        let mut both = hello.encode_requiring_successor_rotation();
+        both[5] |= compact[5];
+        assert!(GuardianHelloBuildIdentityV1::decode(&both).is_ok());
+        both[5] |= 4;
+        assert!(GuardianHelloBuildIdentityV1::decode(&both).is_err());
+    }
+
+    #[test]
     fn successor_rotation_requires_exact_payload_and_explicit_hello_extension() {
         let hello = GuardianHelloBuildIdentityV1::from_build_identity_for_test(
             AtomicBuildIdentity::Sealed(sealed_build_identity(0x51)),
@@ -13879,7 +13915,7 @@ mod tests {
         // Hello remains byte-for-byte unchanged; requiring the extension cannot
         // be mistaken for an ordinary connection by a historical guardian.
         assert!(extended[5..8].iter().any(|byte| *byte != 0));
-        extended[5] = 2;
+        extended[5] = 4;
         assert!(GuardianHelloBuildIdentityV1::decode(&extended).is_err());
         for generation in [1, 2, 3, u64::MAX] {
             for delta in [-1_isize, 0, 1] {

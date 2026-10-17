@@ -421,7 +421,8 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
     }
     let mut checkpoints = Vec::with_capacity(captured.pane_bindings.len());
     let mut total_bytes = 0usize;
-    let limits = frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits::default();
+    // Version 4 lines when the mux's guardian admits them.
+    let limits = mux.guardian_checkpoint_limits();
     let mut timing = CaptureTiming {
         started,
         panes: captured.pane_bindings.len(),
@@ -677,7 +678,7 @@ pub fn publish_whole_mux_recovery(
         representation_id_from_envelope_bytes,
     };
     use frankenterm_term::terminalstate::checkpoint::{
-        TERMINAL_CHECKPOINT_VERSION, TerminalCheckpointLimits, TerminalCheckpointV3,
+        TerminalCheckpointLimits, TerminalCheckpointV3,
     };
 
     snapshot_cx_checkpoint(cx)?;
@@ -859,13 +860,20 @@ pub fn publish_whole_mux_recovery(
                 && encrypted_bytes <= current_verifier.limits().max_total_checkpoint_bytes,
             "whole-mux encrypted byte limit exceeded",
         )?;
+        // Version 3 or 4, as the mux's guardian admits (decoded above).
+        let schema_version = TerminalCheckpointV3::canonical_payload_version(
+            input.checkpoint.terminal_checkpoint().canonical_payload(),
+        )
+        .ok_or(WholeMuxPublicationError::Validation(
+            "whole-mux checkpoint declares no schema version",
+        ))?;
         refs.insert(
             input.pane_id,
             RecoveryObjectRef {
                 object_id: input.object_id.to_owned(),
                 byte_length: envelope.len() as u64,
                 payload_digest,
-                schema_version: TERMINAL_CHECKPOINT_VERSION,
+                schema_version,
             },
         );
         prepared_objects.push(RecoveryObjectPayload {

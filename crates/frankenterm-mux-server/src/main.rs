@@ -394,12 +394,19 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
     let guardian_paths = opts.guardian_socket_path.zip(opts.guardian_token_path);
     #[cfg(not(unix))]
     let guardian_paths: Option<(std::path::PathBuf, std::path::PathBuf)> = None;
+    #[cfg(unix)]
+    let compact_checkpoints = guardian_paths.as_ref().is_some_and(|(socket, token)| {
+        frankenterm_mux_server_impl::guardian_proxy::guardian_admits_compact_checkpoints(
+            socket, token,
+        )
+    });
     let executor = promise::spawn::SimpleExecutor::with_io_runtime()
         .context("initialize headless mux I/O reactor")?;
     let (mux, restored) = if opts.recovery_restore {
         #[cfg(unix)]
         {
             let mux = Arc::new(Mux::new(None));
+            mux.set_guardian_compact_checkpoints(compact_checkpoints);
             frankenterm_mux_server_impl::install_scrollback_spill_sink_factory();
             let restored = frankenterm_mux_server_impl::guardian_proxy::restore_from_options(
                 Arc::clone(&mux),
@@ -416,6 +423,7 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
             #[cfg(unix)]
             Some((socket, token)) => {
                 let mux = Arc::new(Mux::new(None));
+                mux.set_guardian_compact_checkpoints(compact_checkpoints);
                 let domain: Arc<dyn Domain> = Arc::new(
                     frankenterm_mux_server_impl::guardian_proxy::GuardianDomain::new(
                         &mux, socket, token,

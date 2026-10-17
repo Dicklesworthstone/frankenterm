@@ -2552,6 +2552,28 @@ impl GuardianClient {
         Self::connect_with_hello(socket_path, token_path, mux_incarnation, Vec::new())
     }
 
+    /// Whether the guardian at `socket_path` validates version 4 (compact)
+    /// terminal checkpoints: it accepted an authenticated Hello requiring
+    /// them. A guardian predating them refuses that Hello, as any guardian
+    /// refuses a build-bearing Hello from an unsealed build; every failure
+    /// reads as no, and the mux keeps publishing version 3.
+    ///
+    /// The probe connects as a throwaway mux incarnation that owns nothing,
+    /// so the guardian's retirement of it on disconnect retires nothing of
+    /// the caller's.
+    pub fn admits_compact_checkpoints(socket_path: &Path, token_path: &Path) -> bool {
+        let Ok(hello) = GuardianHelloBuildIdentityV1::for_compiled_mux() else {
+            return false;
+        };
+        Self::connect_with_hello(
+            socket_path,
+            token_path,
+            Uuid::new_v4(),
+            hello.encode_requiring_compact_checkpoints().to_vec(),
+        )
+        .is_ok()
+    }
+
     /// Authenticate the build compiled into this mux for Genesis staging.
     /// This does not reserve or start a child.
     pub fn connect_for_genesis(

@@ -8017,9 +8017,7 @@ impl WholeMuxRecoveryVerifier {
                 let checkpoint = validated.checkpoint();
                 let (pixel_width, pixel_height, dpi) = checkpoint.pixel_dimensions_and_dpi();
                 let (row, column) = checkpoint.cursor_position();
-                let mismatch = if obj_ref.schema_version
-                    != frankenterm_term::terminalstate::checkpoint::TERMINAL_CHECKPOINT_VERSION
-                {
+                let mismatch = if obj_ref.schema_version != checkpoint.version() {
                     Some(TerminalProjectionField::SchemaVersion)
                 } else if pane.size.rows != checkpoint.primary_rows()
                     || pane.size.cols != checkpoint.primary_cols()
