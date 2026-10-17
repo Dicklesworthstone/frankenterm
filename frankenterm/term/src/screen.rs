@@ -10311,6 +10311,16 @@ impl Screen {
         if self.lines.page().is_none() {
             return false;
         }
+        if num_rows == 1
+            && self.physical_rows > 0
+            && scroll_region.start == 0
+            && scroll_region.end as usize == self.physical_rows
+            && self.allow_scrollback
+            && self.recovery_scrollback.is_none()
+            && !self.scrollback_policy.tier.enabled
+        {
+            return self.page_scroll_up_line(seqno, blank_attr, &bidi_mode);
+        }
         let phys_scroll = self.phys_range(scroll_region);
         let num_rows = num_rows.min(phys_scroll.end - phys_scroll.start);
         let scrollback_ok = scroll_region.start == 0 && self.allow_scrollback;
@@ -10453,6 +10463,66 @@ impl Screen {
                 self.phys_range(&(scroll_region.end..self.physical_rows as VisibleRowIndex))
             {
                 self.touch_phys_row(index, seqno);
+            }
+        }
+        true
+    }
+
+    /// [`Self::page_scroll_up`] of one row of the full screen with
+    /// scrollback, no recovery hold and no warm tier: the line feed at the
+    /// bottom of the screen, once per line of a `cat` flood (ft-yccm0.3.2.6).
+    /// It runs the general path's steps for exactly those arguments (the row
+    /// entering scrollback compressed, at most one row leaving the hot cap
+    /// with nothing read back for a spill, one row appended, and built as
+    /// the general path builds it) without the general path's region
+    /// arithmetic, which was a quarter of a line feed's cost.
+    fn page_scroll_up_line(
+        &mut self,
+        seqno: SequenceNo,
+        blank_attr: &CellAttributes,
+        bidi_mode: &BidiMode,
+    ) -> bool {
+        let max_allowed = self.physical_rows + self.hot_scrollback_size();
+        let lines_removed = (self.lines.len() + 1).saturating_sub(max_allowed);
+        if lines_removed > self.lines.len() {
+            return false;
+        }
+        self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
+        if scrollback_compression_enabled() {
+            for index in self.phys_range(&(0..1)) {
+                self.page_compress_for_scrollback(index);
+            }
+        }
+        // Without a warm tier no row is offered to a sink: each one leaving
+        // the hot cap is admitted.
+        let admitted = lines_removed;
+        // Under the default blank the list appends the row in legacy's
+        // clustered form, all `native::new_row` would give it.
+        let default_blank = *blank_attr == CellAttributes::blank();
+        let rows = self.lines.page_mut().expect("page rows");
+        rows.set_hot_cap(max_allowed);
+        let scrolled = rows.scroll_with_row_flags(
+            1,
+            seqno,
+            false,
+            admitted,
+            if default_blank {
+                crate::pagegrid::RowHeader::LEGACY_FORM_C
+            } else {
+                0
+            },
+        );
+        debug_assert_eq!(scrolled.trimmed, admitted);
+        self.advance_stable_row_index_offset(admitted);
+        // A row that replaced one leaving the cap is legacy's reused row,
+        // which keeps no bidi mode; a row added below the cap is built new,
+        // with it. The region ends at the screen's bottom: no footer moves.
+        let bidi = (lines_removed == 0).then_some(bidi_mode);
+        if !default_blank || bidi.is_some() {
+            let cols = self.physical_cols;
+            let first_new = self.lines.len() - 1;
+            if let Some((page, row)) = self.page_row(first_new) {
+                native::new_row(page, row, cols, blank_attr, bidi, seqno);
             }
         }
         true

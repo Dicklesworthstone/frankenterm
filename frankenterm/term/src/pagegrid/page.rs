@@ -1589,6 +1589,8 @@ impl Page {
         // (I2): zeroing just those measured 5-11% more cycles on a `seq`
         // flood, because a bulk zero allocates the page's lines in cache as
         // it clears them, and without it every row's first write missed.
+        // Zeroing each slot as `grow` hands it out instead measured 7.5%
+        // more cycles: the bulk zero runs at full streaming width.
         self.buf.fill(0);
         for slot in 0..self.rows {
             self.buf[slot as usize] = RowHeader::with_slot(slot).bits();
