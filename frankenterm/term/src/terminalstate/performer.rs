@@ -956,11 +956,19 @@ impl<'a> Performer<'a> {
         // After a grapheme that printed nothing, `g` may yet continue the
         // cell before it.
         let mut printed_cell = true;
+        let graphemes = PrintGraphemes::new(text);
         // Cells are written in runs (`PendingCells`), except in insert mode,
-        // where each one first shifts the row.
-        let batch = !self.insert && print_cell_runs_enabled();
-        let mut pending = PendingCells::new(std::mem::take(&mut self.pending_cells));
-        for g in PrintGraphemes::new(text) {
+        // where each one first shifts the row, and for a lone grapheme (T0
+        // flushes one per SGR pair), which a run would only slow down.
+        let batch = !self.insert
+            && matches!(graphemes, PrintGraphemes::Segmented(_))
+            && print_cell_runs_enabled();
+        let mut pending = PendingCells::new(if batch {
+            std::mem::take(&mut self.pending_cells)
+        } else {
+            Vec::new()
+        });
+        for g in graphemes {
             let follows_segmented_cell = std::mem::replace(&mut printed_cell, false);
             if let Some(cell) = junction.take() {
                 // Only the first grapheme meets the junction: nothing pends.
@@ -1131,7 +1139,9 @@ impl<'a> Performer<'a> {
             }
         }
         self.write_pending_cells(&mut pending, seqno);
-        self.pending_cells = pending.into_buffer();
+        if batch {
+            self.pending_cells = pending.into_buffer();
+        }
 
         std::mem::swap(&mut self.print, &mut p);
         self.print.clear();
