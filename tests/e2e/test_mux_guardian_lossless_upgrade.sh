@@ -20,8 +20,8 @@
 # 3,000-line burst and then a line a second while recovery captures run
 # every 2 s for N seconds. Recovery must publish by halfway and again
 # after it, never disable itself, and keep the checkpoint stage at most
-# 8 uploads, each pane catalog at most 8 members (the guardian keeps the
-# newest 8 so failed captures cannot reclaim a committed root's member),
+# 3 uploads per pane, each pane catalog at most 8 members (the guardian keeps
+# the newest 8 so failed captures cannot reclaim a committed root's member),
 # and each output journal at most a few segments. Keep N under ~180 so
 # tick 0 stays in the tail.
 #
@@ -191,9 +191,13 @@ if [ "$SOAK" -gt 0 ]; then
     || fail "recovery stalled ($HALFWAY generations by halfway, $PUBLISHED by the end)"
   [ "$DISABLED" = 0 ] && pass "recovery never disabled itself" \
     || fail "recovery disabled itself $DISABLED time(s)"
-  # The stage bound is the guardian's; catalogs and journals are per pane.
-  [ $((UPLOADS + GENESIS)) -le 8 ] && pass "stage bounded ($UPLOADS pane + $GENESIS genesis uploads)" \
-    || fail "stage holds $UPLOADS pane + $GENESIS genesis uploads"
+  # Each pane holds at most its newest acknowledged upload, one in flight and
+  # its Genesis upload (reclaimed only when the stage runs short of room); an
+  # acknowledgement reclaims the pane's older uploads. Catalogs and journals
+  # are per pane too.
+  [ $((UPLOADS + GENESIS)) -le $((3 * PANES)) ] \
+    && pass "stage bounded ($UPLOADS pane + $GENESIS genesis uploads, $PANES pane(s))" \
+    || fail "stage holds $UPLOADS pane + $GENESIS genesis uploads for $PANES pane(s)"
   [ "$MEMBERS" -le $((8 * PANES)) ] && pass "catalogs bounded ($MEMBERS members, $PANES pane(s))" \
     || fail "catalogs hold $MEMBERS members for $PANES pane(s)"
   [ "$RSEG" -le $((4 * PANES)) ] && [ "$BSEG" -le $((4 * PANES)) ] \
