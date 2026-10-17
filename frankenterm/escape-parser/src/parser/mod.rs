@@ -848,8 +848,8 @@ impl Parser {
     /// On:
     /// - the run's extent (up to the first control, DEL or C1 control) is
     ///   found with the [`AsciiScan`] in use;
-    /// - its UTF-8 is validated once, by the same `core::str::from_utf8`
-    ///   that hands the handler its `&str`;
+    /// - its UTF-8 is validated once, by the same check that hands the
+    ///   handler its `&str` (`valid_utf8_prefix`, once per parse call);
     /// - a lone character with no printable byte after it is decoded and
     ///   checked in place.
     ///
@@ -1397,14 +1397,7 @@ impl<'a> RunExtents<'a> {
     /// the whole input of this parse call, as for the other positions.
     #[inline]
     fn text(&mut self, bytes: &'a [u8], start: usize, end: usize) -> Option<&'a str> {
-        let valid = *self
-            .valid
-            .get_or_insert_with(|| match core::str::from_utf8(bytes) {
-                Ok(text) => text,
-                Err(error) => {
-                    core::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap_or_default()
-                }
-            });
+        let valid = *self.valid.get_or_insert_with(|| valid_utf8_prefix(bytes));
         valid.get(start..end)
     }
 
@@ -1486,18 +1479,14 @@ fn ground_run_scalar(bytes: &[u8], start: usize, scan: AsciiScan) -> GroundRun<'
 /// 3. Otherwise the run can reach as far as the first control, DEL or
 ///    `0xc2 0x00..=0x9f` pair (a C1 control in UTF-8, which the state
 ///    machine executes), found with the `std::simd` scans in
-///    [`RunExtents`]. That stretch is validated once by
-///    `core::str::from_utf8`, which also yields the `&str` handed over. The
-///    run ends where the valid UTF-8 ends, at an invalid or incomplete
-///    sequence, which the state machine then decodes, replacement
-///    characters and all.
+///    [`RunExtents`]. That stretch lies in the input's valid UTF-8 prefix,
+///    which [`valid_utf8_prefix`] validates once per parse call and which
+///    yields the `&str` handed over. The run ends where the valid UTF-8
+///    ends, at an invalid or incomplete sequence, which the state machine
+///    then decodes, replacement characters and all.
 ///
-/// Only a run cut short by such a sequence is validated a second time, to
-/// obtain its shorter `&str`.
-///
-/// A separate `std::simd` UTF-8 validator would not save that pass: safe
-/// Rust only makes a `&str` from bytes by `core::str::from_utf8`, so it
-/// would be a second validation, not a replacement.
+/// Only a run outside that prefix is validated on its own, by
+/// `core::str::from_utf8`.
 fn ground_run_bulk<'a>(
     bytes: &'a [u8],
     start: usize,
@@ -1543,6 +1532,20 @@ fn ground_run_bulk<'a>(
             ascii: text.len() <= ascii_end - start,
         },
     }
+}
+
+/// The longest valid UTF-8 prefix of `bytes`, as `core::str::from_utf8`
+/// and `Utf8Error::valid_up_to` give it, but checked with SIMD by
+/// `simdutf8` (NEON on aarch64; on x86 AVX2 or SSE4.2, detected at run time
+/// with `std`). On mixed-script text, where few blocks are all ASCII,
+/// `core::str::from_utf8` was 8% of the ingest (ft-yccm0.3.2.6).
+fn valid_utf8_prefix(bytes: &[u8]) -> &str {
+    if let Ok(text) = simdutf8::basic::from_utf8(bytes) {
+        return text;
+    }
+    let valid = simdutf8::compat::from_utf8(bytes)
+        .map_or_else(|error| error.valid_up_to(), str::len);
+    simdutf8::basic::from_utf8(&bytes[..valid]).unwrap_or_default()
 }
 
 /// The run of printable ASCII `bytes[start..end]`.

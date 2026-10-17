@@ -4232,6 +4232,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "simdutf8",
  "thiserror 2.0.21",
  "vtparse 0.7.0",
  "winapi",
