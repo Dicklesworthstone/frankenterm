@@ -143,6 +143,10 @@ pub enum MmapStoreError {
     VersionedPaneIdentityCollision,
     #[error("staged pane ledger failed exact reopen verification")]
     StagedPaneVerificationFailed,
+    #[error(
+        "cannot cut pane ledger back to sequence {next_seq}: it retains rows only from {oldest}"
+    )]
+    TruncateIntoPrunedPrefix { next_seq: u64, oldest: u64 },
 }
 
 const COLD_ERASURE_DATA_SHARDS: usize = 3;
@@ -157,7 +161,11 @@ const PANE_LOG_MAX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
 /// Maximum rows in one durable append; independent byte limits still apply.
 /// Spill queues use the same cap so accepted batches cannot exceed storage admission.
 pub const PANE_APPEND_MAX_ROWS: usize = 4096;
-const PANE_APPEND_MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// Chunks one synchronized append may carry (ft-yccm0.2.1.2): 64 batches of
+/// at most 4096 rows, so a commit window's single barrier covers up to
+/// 262,144 rows.
+pub const PANE_APPEND_MAX_CHUNKS: usize = 64;
+pub const PANE_APPEND_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Durability sync for the live scrollback store (ft-y0gy9).
 ///
@@ -171,6 +179,7 @@ const PANE_APPEND_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// macOS. A filesystem that rejects the barrier falls back to a full sync.
 /// Elsewhere this is `sync_all`.
 pub fn ordered_durability_sync(file: &File) -> std::io::Result<()> {
+    THREAD_DURABILITY_SYNCS.with(|count| count.set(count.get().wrapping_add(1)));
     #[cfg(target_os = "macos")]
     if nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_BARRIERFSYNC).is_ok() {
         return Ok(());
@@ -178,10 +187,24 @@ pub fn ordered_durability_sync(file: &File) -> std::io::Result<()> {
     file.sync_all()
 }
 
+std::thread_local! {
+    static THREAD_DURABILITY_SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many ordered-durability syncs the calling thread has issued, the
+/// unit a durability protocol's cost is measured in (syncs per MiB
+/// ingested, ft-yccm0.2.1.2). Per thread, so concurrent work elsewhere in
+/// the process does not leak into a measurement.
+#[must_use]
+pub fn thread_durability_sync_count() -> u64 {
+    THREAD_DURABILITY_SYNCS.with(std::cell::Cell::get)
+}
+
 /// [`ordered_durability_sync`] for a file's data only. Barrier syncs cover
 /// data and metadata alike, so on macOS this is the same call; elsewhere it
 /// is `sync_data`.
 pub fn ordered_durability_sync_data(file: &File) -> std::io::Result<()> {
+    THREAD_DURABILITY_SYNCS.with(|count| count.set(count.get().wrapping_add(1)));
     #[cfg(target_os = "macos")]
     if nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_BARRIERFSYNC).is_ok() {
         return Ok(());
@@ -319,6 +342,26 @@ fn validate_append_batch(lines: &[&str]) -> Result<(), MmapStoreError> {
     Ok(())
 }
 
+/// Validates every chunk as one append batch and bounds the chunk count;
+/// returns the total row count.
+fn validate_append_chunks(chunks: &[&[&str]]) -> Result<usize, MmapStoreError> {
+    if chunks.len() > PANE_APPEND_MAX_CHUNKS {
+        return Err(MmapStoreError::PaneAppendLimitExceeded {
+            limit_name: "chunks",
+            limit: PANE_APPEND_MAX_CHUNKS as u64,
+            observed: u64::try_from(chunks.len()).unwrap_or(u64::MAX),
+        });
+    }
+    let mut rows = 0usize;
+    for chunk in chunks {
+        validate_append_batch(chunk)?;
+        rows = rows
+            .checked_add(chunk.len())
+            .ok_or(MmapStoreError::NumericOverflow("append_rows"))?;
+    }
+    Ok(rows)
+}
+
 fn validate_read_range(
     range: &std::ops::Range<u64>,
     max_rows: usize,
@@ -371,6 +414,12 @@ pub struct MmapPaneReadSnapshot {
     pub oldest_seq: Option<u64>,
     pub next_seq: u64,
     pub records: Vec<String>,
+    /// The pruned tail (ft-yccm0.2.1.4): the last pruned rows the log still
+    /// holds, ending just before `oldest_seq`, oldest first. They are not
+    /// retained rows; a reader uses them only to authenticate a sealed
+    /// segment that starts among them. Only `read_pane_snapshot_through`
+    /// reads them.
+    pub pruned_tail: Vec<String>,
     pub retained_record_bytes: u64,
     pub committed_bytes: u64,
     pub sequence_bytes: u64,
@@ -859,7 +908,17 @@ struct PaneFile {
     data_start: u64,
     base_seq: u64,
     line_offsets: Vec<LineOffset>,
+    /// The pruned tail (ft-yccm0.2.1.4): offsets of the last pruned rows
+    /// whose bytes the log still holds, ending just before `base_seq`. They
+    /// are not reachable rows; a reader may read them only to authenticate
+    /// a sealed segment that starts among them. At most
+    /// `PANE_PRUNED_TAIL_MAX_ROWS`.
+    pruned_offsets: Vec<LineOffset>,
 }
+
+/// Pruned rows a pane keeps readable for segment authentication: one short
+/// of the most rows a sealed scrollback segment may hold.
+pub const PANE_PRUNED_TAIL_MAX_ROWS: usize = 4095;
 
 #[derive(Clone, Copy)]
 enum PaneOpenPolicy {
@@ -915,6 +974,7 @@ impl PaneFile {
             data_start: 0,
             base_seq: 0,
             line_offsets: Vec::new(),
+            pruned_offsets: Vec::new(),
         }))
     }
 
@@ -1302,6 +1362,11 @@ impl PaneFile {
                 line_offsets.len()
             )));
         }
+        // The last pruned rows still in the log stay readable as the pruned
+        // tail.
+        let pruned_offsets = line_offsets
+            [logically_pruned.saturating_sub(PANE_PRUNED_TAIL_MAX_ROWS)..logically_pruned]
+            .to_vec();
         line_offsets.drain(0..logically_pruned);
 
         Ok(Self {
@@ -1313,6 +1378,7 @@ impl PaneFile {
             data_start,
             base_seq,
             line_offsets,
+            pruned_offsets,
         })
     }
 
@@ -1342,19 +1408,26 @@ impl PaneFile {
     }
 
     fn append_lines(&mut self, lines: &[&str]) -> Result<u64, MmapStoreError> {
-        validate_append_batch(lines)?;
+        self.append_line_chunks(&[lines])
+    }
+
+    /// Append every chunk, in order, with one vectored write per chunk and
+    /// one data sync for all of them (ft-yccm0.2.1.2): a commit window costs
+    /// one barrier however many store batches it holds. Each chunk keeps the
+    /// per-batch row and byte bounds; the chunk count is bounded too.
+    fn append_line_chunks(&mut self, chunks: &[&[&str]]) -> Result<u64, MmapStoreError> {
+        let rows = validate_append_chunks(chunks)?;
         let seq = self.next_seq()?;
-        if lines.is_empty() {
+        let Some(first) = chunks.iter().find_map(|chunk| chunk.first()) else {
             return Ok(seq);
-        }
-        if self.file_len == 0 && lines[0].as_bytes().starts_with(b"\0FTMMAP") {
+        };
+        if self.file_len == 0 && first.as_bytes().starts_with(b"\0FTMMAP") {
             return Err(MmapStoreError::InvalidPaneLogHeader(
                 "first record collides with the reserved pane header".to_string(),
             ));
         }
         seq.checked_add(
-            u64::try_from(lines.len())
-                .map_err(|_| MmapStoreError::NumericOverflow("line_count"))?,
+            u64::try_from(rows).map_err(|_| MmapStoreError::NumericOverflow("line_count"))?,
         )
         .ok_or(MmapStoreError::NumericOverflow("seq"))?;
         let physical_end = self.file.seek(SeekFrom::End(0))?;
@@ -1365,20 +1438,10 @@ impl PaneFile {
         };
         let mut offsets = Vec::new();
         offsets
-            .try_reserve_exact(lines.len())
+            .try_reserve_exact(rows)
             .map_err(|_| std::io::Error::other("cannot reserve bounded append offsets"))?;
-        let mut slices = Vec::new();
-        let slice_count = lines
-            .len()
-            .checked_mul(2)
-            .ok_or(MmapStoreError::NumericOverflow("append_slice_count"))?;
-        slices
-            .try_reserve_exact(slice_count)
-            .map_err(|_| std::io::Error::other("cannot reserve bounded append slices"))?;
-        for line in lines {
+        for line in chunks.iter().flat_map(|chunk| chunk.iter()) {
             offsets.push(LineOffset(new_file_len));
-            slices.push(IoSlice::new(line.as_bytes()));
-            slices.push(IoSlice::new(b"\n"));
             new_file_len = new_file_len
                 .checked_add(
                     u64::try_from(line.len())
@@ -1387,8 +1450,19 @@ impl PaneFile {
                 .and_then(|len| len.checked_add(1))
                 .ok_or(MmapStoreError::NumericOverflow("file_len"))?;
         }
+        let mut slices = Vec::new();
+        let slice_count = chunks
+            .iter()
+            .map(|chunk| chunk.len())
+            .max()
+            .unwrap_or(0)
+            .checked_mul(2)
+            .ok_or(MmapStoreError::NumericOverflow("append_slice_count"))?;
+        slices
+            .try_reserve_exact(slice_count)
+            .map_err(|_| std::io::Error::other("cannot reserve bounded append slices"))?;
         self.line_offsets
-            .try_reserve(lines.len())
+            .try_reserve(rows)
             .map_err(|_| std::io::Error::other("cannot reserve bounded append row metadata"))?;
         if self.trailing_partial {
             // The suffix after `file_len` was never acknowledged. A failed
@@ -1407,18 +1481,29 @@ impl PaneFile {
         let mut writer = PaneAppendWriter {
             file: &mut self.file,
             #[cfg(test)]
-            fault_after_bytes: PANE_APPEND_FAULT.with(|fault| match fault.get() {
-                Some(0) => Some(lines[0].len() / 2),
-                Some(rows) if rows <= lines.len() => {
-                    Some(lines[..rows].iter().map(|line| line.len() + 1).sum())
+            fault_after_bytes: PANE_APPEND_FAULT.with(|fault| {
+                let lines = chunks.first().copied().unwrap_or_default();
+                match fault.get() {
+                    Some(0) => lines.first().map(|line| line.len() / 2),
+                    Some(rows) if rows <= lines.len() => {
+                        Some(lines[..rows].iter().map(|line| line.len() + 1).sum())
+                    }
+                    _ => None,
                 }
-                _ => None,
             }),
         };
-        // At most 8192 descriptors (128 KiB on 64-bit hosts) cover the
-        // 4096-row/32-MiB bound. File uses writev on Unix; platforms or writes
-        // accepting only a prefix are handled without replaying accepted bytes.
-        write_append_slices(&mut writer, &mut slices)?;
+        // At most 8192 descriptors (128 KiB on 64-bit hosts) cover one chunk's
+        // 4096-row/32-MiB bound; the vector is reused chunk by chunk. File
+        // uses writev on Unix; platforms or writes accepting only a prefix are
+        // handled without replaying accepted bytes.
+        for chunk in chunks {
+            slices.clear();
+            for line in *chunk {
+                slices.push(IoSlice::new(line.as_bytes()));
+                slices.push(IoSlice::new(b"\n"));
+            }
+            write_append_slices(&mut writer, &mut slices)?;
+        }
         #[cfg(test)]
         if writer.fault_after_bytes == Some(0) {
             return Err(
@@ -1537,6 +1622,50 @@ impl PaneFile {
         let Some(offsets) = self.line_offsets.get(first..) else {
             return Ok(Vec::new());
         };
+        self.read_records(offsets, count, max_stored_bytes)
+    }
+
+    /// `lines_range`, reaching back into the pruned tail (ft-yccm0.2.1.4):
+    /// a range may start at any row from `pruned_tail_start`. Rows before it
+    /// read as absent.
+    fn lines_range_reaching_pruned(
+        &self,
+        range: std::ops::Range<u64>,
+        max_rows: usize,
+        max_stored_bytes: u64,
+    ) -> Result<Vec<String>, MmapStoreError> {
+        if range.start >= self.base_seq {
+            return self.lines_range(range, max_rows, max_stored_bytes);
+        }
+        let count = validate_read_range(&range, max_rows)?;
+        let pruned_start = self.pruned_tail_start();
+        if count == 0 || range.start < pruned_start {
+            return Ok(Vec::new());
+        }
+        let first = usize::try_from(range.start - pruned_start)
+            .map_err(|_| MmapStoreError::NumericOverflow("line_index"))?;
+        let mut offsets = Vec::new();
+        offsets
+            .try_reserve_exact(count)
+            .map_err(std::io::Error::other)?;
+        offsets.extend(
+            self.pruned_offsets[first..]
+                .iter()
+                .chain(&self.line_offsets)
+                .take(count)
+                .copied(),
+        );
+        self.read_records(&offsets, count, max_stored_bytes)
+    }
+
+    /// Up to `count` newline-terminated records starting at `offsets`,
+    /// within `max_stored_bytes`.
+    fn read_records(
+        &self,
+        offsets: &[LineOffset],
+        count: usize,
+        max_stored_bytes: u64,
+    ) -> Result<Vec<String>, MmapStoreError> {
         // A cloned descriptor pins the same file, NOT an independent seek
         // offset. The owning store must serialize this read with other users.
         let mut reader = BufReader::new(self.file.try_clone()?);
@@ -1647,9 +1776,58 @@ impl PaneFile {
         // crash after this acknowledgement replays the same prefix drop when
         // the pane log is reopened, even when byte compaction has not run.
         self.persist_base_seq(next_base_seq)?;
+        self.pruned_offsets.extend(
+            self.line_offsets[drop_count.saturating_sub(PANE_PRUNED_TAIL_MAX_ROWS)..drop_count]
+                .iter()
+                .copied(),
+        );
+        self.pruned_offsets.drain(
+            ..self
+                .pruned_offsets
+                .len()
+                .saturating_sub(PANE_PRUNED_TAIL_MAX_ROWS),
+        );
         self.line_offsets.drain(0..drop_count);
         self.base_seq = next_base_seq;
         Ok(())
+    }
+
+    /// The first row of the pruned tail: the oldest pruned row still
+    /// readable for segment authentication.
+    fn pruned_tail_start(&self) -> u64 {
+        self.base_seq
+            .saturating_sub(u64::try_from(self.pruned_offsets.len()).unwrap_or(u64::MAX))
+    }
+
+    /// Drop every record at or after `next_seq`; returns whether any was cut.
+    /// The index forgets the records first, as an uncommitted suffix, so a
+    /// failed truncate or sync leaves them invisible and the next append cuts
+    /// them again. A crash before the sync may keep them on disk; the caller's
+    /// recovery decides about them again on reopen.
+    fn truncate_after(&mut self, next_seq: u64) -> Result<bool, MmapStoreError> {
+        if next_seq >= self.next_seq()? {
+            return Ok(false);
+        }
+        if next_seq < self.base_seq {
+            return Err(MmapStoreError::TruncateIntoPrunedPrefix {
+                next_seq,
+                oldest: self.base_seq,
+            });
+        }
+        let keep = usize::try_from(next_seq - self.base_seq)
+            .map_err(|_| MmapStoreError::NumericOverflow("truncate_keep"))?;
+        let new_len = self
+            .line_offsets
+            .get(keep)
+            .ok_or(MmapStoreError::NumericOverflow("truncate_offset"))?
+            .0;
+        self.line_offsets.truncate(keep);
+        self.file_len = new_len;
+        self.trailing_partial = true;
+        self.file.set_len(new_len)?;
+        ordered_durability_sync(&self.file)?;
+        self.trailing_partial = false;
+        Ok(true)
     }
 
     fn clear(&mut self) -> Result<(), MmapStoreError> {
@@ -1661,6 +1839,7 @@ impl PaneFile {
         self.data_start = 0;
         self.base_seq = 0;
         self.line_offsets.clear();
+        self.pruned_offsets.clear();
         self.base_seq_file.set_len(0)?;
         self.base_seq_file.flush()?;
         ordered_durability_sync_data(&self.base_seq_file)?;
@@ -1811,18 +1990,37 @@ impl PaneFile {
         )
     }
 
-    fn stale_prefix_bytes(&self) -> u64 {
-        self.line_offsets
-            .first()
+    /// Bytes compaction would drop: everything before the first reachable
+    /// row, or before the pruned-tail row `keep_from` when it is one.
+    fn stale_prefix_bytes(&self, keep_from: Option<u64>) -> u64 {
+        self.kept_pruned_row(keep_from)
+            .and_then(|(_, index)| self.pruned_offsets.get(index))
+            .or_else(|| self.line_offsets.first())
             .map(|offset| offset.0.saturating_sub(self.data_start))
             .unwrap_or_else(|| self.file_len.saturating_sub(self.data_start))
     }
 
-    fn compact_retained_prefix(&mut self) -> Result<bool, MmapStoreError> {
-        let stale_bytes = self.stale_prefix_bytes();
+    /// The pruned-tail row `keep_from`, when it is one: its sequence and the
+    /// index of its offset.
+    fn kept_pruned_row(&self, keep_from: Option<u64>) -> Option<(u64, usize)> {
+        let keep = keep_from?;
+        let start = self.pruned_tail_start();
+        if keep < start || keep >= self.base_seq {
+            return None;
+        }
+        Some((keep, usize::try_from(keep - start).ok()?))
+    }
+
+    fn compact_retained_prefix(&mut self, keep_from: Option<u64>) -> Result<bool, MmapStoreError> {
+        let stale_bytes = self.stale_prefix_bytes(keep_from);
         if stale_bytes == 0 {
             return Ok(false);
         }
+        // Keeping a pruned-tail row keeps it and every later pruned row; the
+        // new log's header names it as the log's first row, so reopening
+        // replays the same pruned tail from the base sequence journal.
+        let kept_pruned = self.kept_pruned_row(keep_from);
+        let first_kept_seq = kept_pruned.map_or(self.base_seq, |(keep, _)| keep);
         let retained_start = self
             .data_start
             .checked_add(stale_bytes)
@@ -1856,7 +2054,7 @@ impl PaneFile {
         // temp + fsync + rename, the live log is at every instant either the
         // old (full) file or the new (compacted) file — never truncated.
         let tmp_path = Self::unique_staging_path(&self.log_path, "compact-installing")?;
-        let header = format!("\0FTMMAP1:{}\n", self.base_seq);
+        let header = format!("\0FTMMAP1:{first_kept_seq}\n");
         let header_len = u64::try_from(header.len())
             .map_err(|_| MmapStoreError::NumericOverflow("header_len"))?;
         let new_file_len = header_len
@@ -1865,18 +2063,26 @@ impl PaneFile {
                     .map_err(|_| MmapStoreError::NumericOverflow("file_len"))?,
             )
             .ok_or(MmapStoreError::NumericOverflow("file_len"))?;
+        let relocate = |offset: &LineOffset| {
+            offset
+                .0
+                .checked_sub(retained_start)
+                .and_then(|relative| relative.checked_add(header_len))
+                .map(LineOffset)
+                .ok_or(MmapStoreError::NumericOverflow("line_offset"))
+        };
         let compacted_offsets = self
             .line_offsets
             .iter()
-            .map(|offset| {
-                offset
-                    .0
-                    .checked_sub(retained_start)
-                    .and_then(|relative| relative.checked_add(header_len))
-                    .map(LineOffset)
-                    .ok_or(MmapStoreError::NumericOverflow("line_offset"))
-            })
+            .map(relocate)
             .collect::<Result<Vec<_>, _>>()?;
+        let compacted_pruned_offsets = match kept_pruned {
+            Some((_, index)) => self.pruned_offsets[index..]
+                .iter()
+                .map(relocate)
+                .collect::<Result<Vec<_>, _>>()?,
+            None => Vec::new(),
+        };
         let compacted_file = {
             let mut options = OpenOptions::new();
             options.create_new(true).read(true).write(true).append(true);
@@ -1904,6 +2110,7 @@ impl PaneFile {
         self.trailing_partial = false;
         self.data_start = header_len;
         self.line_offsets = compacted_offsets;
+        self.pruned_offsets = compacted_pruned_offsets;
         // Make the rename itself durable: without a directory fsync a crash
         // after the rename but before the directory entry reaches disk could
         // resurrect the pre-compaction file. Successful compaction requires
@@ -1944,6 +2151,32 @@ impl PaneFile {
                     .map_err(|_| MmapStoreError::NumericOverflow("line_count"))?,
             )
             .ok_or(MmapStoreError::NumericOverflow("seq"))
+    }
+
+    /// Bytes, newlines included, of the reachable rows `from..to`, from the
+    /// in-memory offsets alone.
+    fn record_bytes_between(&self, from: u64, to: u64) -> Result<u64, MmapStoreError> {
+        let next = self.next_seq()?;
+        if from < self.base_seq || from > to || to > next {
+            return Err(MmapStoreError::OffsetOutOfBounds {
+                offset: if from < self.base_seq { from } else { to },
+                len: next,
+            });
+        }
+        let offset_of = |seq: u64| -> Result<u64, MmapStoreError> {
+            if seq == next {
+                return Ok(self.file_len);
+            }
+            let index = usize::try_from(seq - self.base_seq)
+                .map_err(|_| MmapStoreError::NumericOverflow("line_index"))?;
+            self.line_offsets
+                .get(index)
+                .map(|offset| offset.0)
+                .ok_or(MmapStoreError::NumericOverflow("line_index"))
+        };
+        offset_of(to)?
+            .checked_sub(offset_of(from)?)
+            .ok_or(MmapStoreError::NumericOverflow("record_bytes"))
     }
 
     fn file_bytes(&self) -> u64 {
@@ -2245,6 +2478,34 @@ impl SqliteFallbackStore {
         Ok(())
     }
 
+    fn truncate_after(&mut self, pane_id: PaneId, next_seq: u64) -> Result<bool, MmapStoreError> {
+        if next_seq >= self.next_seq(pane_id)? {
+            return Ok(false);
+        }
+        if let Some(oldest) = self.oldest_seq(pane_id)?
+            && next_seq < oldest
+        {
+            return Err(MmapStoreError::TruncateIntoPrunedPrefix { next_seq, oldest });
+        }
+        let pane_id_i64 =
+            i64::try_from(pane_id).map_err(|_| MmapStoreError::NumericOverflow("pane_id"))?;
+        let next_seq_i64 =
+            i64::try_from(next_seq).map_err(|_| MmapStoreError::NumericOverflow("seq"))?;
+        let transaction = self.conn.transaction()?;
+        transaction.execute(
+            "DELETE FROM mmap_scrollback_lines WHERE pane_id = ?1 AND seq >= ?2",
+            params![pane_id_i64, next_seq_i64],
+        )?;
+        transaction.execute(
+            "INSERT INTO mmap_scrollback_fallback_panes (pane_id, next_seq)
+             VALUES (?1, ?2)
+             ON CONFLICT(pane_id) DO UPDATE SET next_seq = excluded.next_seq",
+            params![pane_id_i64, next_seq_i64],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     fn line_count(&self, pane_id: PaneId) -> Result<usize, MmapStoreError> {
         let pane_id_i64 =
             i64::try_from(pane_id).map_err(|_| MmapStoreError::NumericOverflow("pane_id"))?;
@@ -2318,6 +2579,53 @@ pub fn read_pane_snapshot(
     max_record_bytes: u64,
     max_physical_bytes: u64,
 ) -> Result<MmapPaneReadSnapshot, MmapStoreError> {
+    read_pane_snapshot_bounded(
+        base_dir,
+        pane_id,
+        None,
+        max_records,
+        max_record_bytes,
+        max_physical_bytes,
+        0,
+    )
+}
+
+/// [`read_pane_snapshot`] of the records before `through_seq` only
+/// (ft-yccm0.2.1.2). A writer may have appended a durable tail past the
+/// prefix its manifest publishes; this reads that published prefix exactly,
+/// as if the tail were an uncommitted suffix: `committed_bytes` ends at the
+/// last returned record and `max_records` bounds the returned records only.
+/// It also reads the pruned tail (up to `PANE_PRUNED_TAIL_MAX_ROWS` rows,
+/// within `max_record_bytes` of their own), for sealed segments that start
+/// before the oldest retained row (ft-yccm0.2.1.4).
+pub fn read_pane_snapshot_through(
+    base_dir: &Path,
+    pane_id: PaneId,
+    through_seq: u64,
+    max_records: usize,
+    max_record_bytes: u64,
+    max_physical_bytes: u64,
+) -> Result<MmapPaneReadSnapshot, MmapStoreError> {
+    read_pane_snapshot_bounded(
+        base_dir,
+        pane_id,
+        Some(through_seq),
+        max_records,
+        max_record_bytes,
+        max_physical_bytes,
+        PANE_PRUNED_TAIL_MAX_ROWS,
+    )
+}
+
+fn read_pane_snapshot_bounded(
+    base_dir: &Path,
+    pane_id: PaneId,
+    through_seq: Option<u64>,
+    max_records: usize,
+    max_record_bytes: u64,
+    max_physical_bytes: u64,
+    pruned_tail_rows: usize,
+) -> Result<MmapPaneReadSnapshot, MmapStoreError> {
     let base_metadata = std::fs::symlink_metadata(base_dir)?;
     if !base_metadata.file_type().is_dir() {
         return Err(MmapStoreError::InvalidPaneLogHeader(
@@ -2371,10 +2679,12 @@ pub fn read_pane_snapshot(
             ));
         }
     }
-    let (mut line_offsets, committed_bytes, log_base_seq, _data_start) =
+    // A bounded read scans past its bound (the physical byte limit still
+    // applies) and enforces `max_records` on the records it returns.
+    let (mut line_offsets, mut committed_bytes, log_base_seq, _data_start) =
         PaneFile::scan_offsets_and_base_bounded(
             &file,
-            Some(max_records),
+            through_seq.is_none().then_some(max_records),
             Some(max_physical_bytes),
         )?;
 
@@ -2451,7 +2761,23 @@ pub fn read_pane_snapshot(
             line_offsets.len()
         )));
     }
+    let pruned_tail_offsets =
+        line_offsets[logically_pruned.saturating_sub(pruned_tail_rows)..logically_pruned].to_vec();
     line_offsets.drain(0..logically_pruned);
+    if let Some(through_seq) = through_seq {
+        let kept = usize::try_from(through_seq.saturating_sub(base_seq))
+            .map_err(|_| MmapStoreError::NumericOverflow("snapshot_through_rows"))?;
+        if kept > line_offsets.len() {
+            return Err(MmapStoreError::InvalidPaneLogHeader(format!(
+                "pane log ends at sequence {} before the requested bound {through_seq}",
+                base_seq.saturating_add(u64::try_from(line_offsets.len()).unwrap_or(u64::MAX))
+            )));
+        }
+        if let Some(first_excluded) = line_offsets.get(kept) {
+            committed_bytes = first_excluded.0;
+        }
+        line_offsets.truncate(kept);
+    }
     if line_offsets.len() > max_records {
         return Err(MmapStoreError::PaneSnapshotLimitExceeded {
             limit_name: "records",
@@ -2460,9 +2786,8 @@ pub fn read_pane_snapshot(
         });
     }
 
-    let mut records = Vec::with_capacity(line_offsets.len());
-    let mut record_bytes = 0u64;
-    for offset in line_offsets {
+    // One indexed record, read from its offset through its newline.
+    let read_record = |offset: LineOffset| -> Result<Vec<u8>, MmapStoreError> {
         if offset.0 > committed_bytes {
             return Err(MmapStoreError::OffsetOutOfBounds {
                 offset: offset.0,
@@ -2485,6 +2810,12 @@ pub fn read_pane_snapshot(
         while matches!(bytes.last(), Some(b'\n' | b'\r')) {
             bytes.pop();
         }
+        Ok(bytes)
+    };
+    let mut records = Vec::with_capacity(line_offsets.len());
+    let mut record_bytes = 0u64;
+    for offset in line_offsets {
+        let bytes = read_record(offset)?;
         record_bytes = record_bytes
             .checked_add(
                 u64::try_from(bytes.len())
@@ -2511,6 +2842,24 @@ pub fn read_pane_snapshot(
             });
         }
         records.push(String::from_utf8(bytes)?);
+    }
+    let mut pruned_tail = Vec::with_capacity(pruned_tail_offsets.len());
+    let mut pruned_tail_bytes = 0u64;
+    for offset in pruned_tail_offsets {
+        let bytes = read_record(offset)?;
+        pruned_tail_bytes = u64::try_from(bytes.len())
+            .ok()
+            .and_then(|len| len.checked_add(1))
+            .and_then(|len| pruned_tail_bytes.checked_add(len))
+            .ok_or(MmapStoreError::NumericOverflow("pruned_tail_bytes"))?;
+        if pruned_tail_bytes > max_record_bytes {
+            return Err(MmapStoreError::PaneSnapshotLimitExceeded {
+                limit_name: "pruned_tail_bytes",
+                limit: max_record_bytes,
+                observed: pruned_tail_bytes,
+            });
+        }
+        pruned_tail.push(String::from_utf8(bytes)?);
     }
 
     let retained_record_bytes = record_bytes
@@ -2559,6 +2908,7 @@ pub fn read_pane_snapshot(
         oldest_seq: (!records.is_empty()).then_some(base_seq),
         next_seq,
         records,
+        pruned_tail,
         retained_record_bytes,
         committed_bytes,
         sequence_bytes,
@@ -2964,10 +3314,54 @@ impl MmapScrollbackStore {
             .append_lines(lines)
     }
 
+    /// [`Self::append_lines`] for several batches with one durability sync
+    /// for all of them on a file-backed pane (ft-yccm0.2.1.2). Returns the
+    /// sequence of the first row. A SQLite-authority pane commits chunk by
+    /// chunk, so a failure there may leave a prefix of the chunks appended.
+    pub fn append_line_chunks(
+        &mut self,
+        pane_id: PaneId,
+        chunks: &[&[&str]],
+    ) -> Result<u64, MmapStoreError> {
+        validate_append_chunks(chunks)?;
+        self.ensure_pane(pane_id)?;
+        if self.fallback_panes.contains(&pane_id) {
+            let sqlite = self
+                .sqlite_fallback
+                .as_mut()
+                .ok_or(MmapStoreError::UnknownPane(pane_id))?;
+            let mut first = None;
+            for chunk in chunks.iter().filter(|chunk| !chunk.is_empty()) {
+                let seq = sqlite.append_lines_auto_seq(pane_id, chunk)?;
+                first.get_or_insert(seq);
+            }
+            return match first {
+                Some(seq) => Ok(seq),
+                None => sqlite.next_seq(pane_id),
+            };
+        }
+        self.panes
+            .get_mut(&pane_id)
+            .ok_or(MmapStoreError::UnknownPane(pane_id))?
+            .append_line_chunks(chunks)
+    }
+
     pub fn compact_pane_if_stale(
         &mut self,
         pane_id: PaneId,
         min_stale_bytes: u64,
+    ) -> Result<bool, MmapStoreError> {
+        self.compact_pane_if_stale_keeping(pane_id, min_stale_bytes, None)
+    }
+
+    /// `compact_pane_if_stale`, keeping the pruned rows from `keep_from` on
+    /// in the log and readable in the pruned tail (ft-yccm0.2.1.4). `None`
+    /// drops every pruned row, as `compact_pane_if_stale` does.
+    pub fn compact_pane_if_stale_keeping(
+        &mut self,
+        pane_id: PaneId,
+        min_stale_bytes: u64,
+        keep_from: Option<u64>,
     ) -> Result<bool, MmapStoreError> {
         if self.fallback_panes.contains(&pane_id) {
             return Ok(false);
@@ -2976,7 +3370,7 @@ impl MmapScrollbackStore {
         let Some(pane) = self.panes.get_mut(&pane_id) else {
             return Ok(false);
         };
-        let stale_bytes = pane.stale_prefix_bytes();
+        let stale_bytes = pane.stale_prefix_bytes(keep_from);
         let retained_bytes = pane.retained_bytes();
         if stale_bytes == 0 {
             return Ok(false);
@@ -2985,12 +3379,13 @@ impl MmapScrollbackStore {
             return Ok(false);
         }
 
-        pane.compact_retained_prefix().and_then(|compacted| {
-            if compacted && self.cold_erasure == ColdErasureMode::ReedSolomon {
-                pane.write_erasure_sidecars()?;
-            }
-            Ok(compacted)
-        })
+        pane.compact_retained_prefix(keep_from)
+            .and_then(|compacted| {
+                if compacted && self.cold_erasure == ColdErasureMode::ReedSolomon {
+                    pane.write_erasure_sidecars()?;
+                }
+                Ok(compacted)
+            })
     }
 
     pub fn tail_lines(&self, pane_id: PaneId, n: usize) -> Result<Vec<String>, MmapStoreError> {
@@ -3069,7 +3464,53 @@ impl MmapScrollbackStore {
             .lines_range(pane_id, range, max_rows, max_stored_bytes)
     }
 
+    /// `lines_range`, reaching back into the pane's pruned tail
+    /// (ft-yccm0.2.1.4): a range may start at any row from
+    /// `pruned_tail_start`. Those rows are not reachable rows; read them only
+    /// to authenticate a sealed segment. A SQLite fallback pane has no
+    /// pruned tail.
+    pub fn lines_range_reaching_pruned(
+        &self,
+        pane_id: PaneId,
+        range: std::ops::Range<u64>,
+        max_rows: usize,
+        max_stored_bytes: u64,
+    ) -> Result<Vec<String>, MmapStoreError> {
+        if validate_read_range(&range, max_rows)? == 0 {
+            return Ok(Vec::new());
+        }
+        if !self.fallback_panes.contains(&pane_id)
+            && let Some(pane) = self.panes.get(&pane_id)
+        {
+            return pane.lines_range_reaching_pruned(range, max_rows, max_stored_bytes);
+        }
+        self.lines_range(pane_id, range, max_rows, max_stored_bytes)
+    }
+
+    /// The oldest row `lines_range_reaching_pruned` can read: the pruned
+    /// tail's first row, or the oldest reachable row without a tail.
+    #[must_use]
+    pub fn pruned_tail_start(&self, pane_id: PaneId) -> Option<u64> {
+        if self.fallback_panes.contains(&pane_id) {
+            return self.oldest_seq(pane_id);
+        }
+        self.panes.get(&pane_id).map(PaneFile::pruned_tail_start)
+    }
+
     pub fn prune_before(&mut self, pane_id: PaneId, seq: u64) -> Result<(), MmapStoreError> {
+        self.prune_before_keeping(pane_id, seq, None)
+    }
+
+    /// `prune_before`, keeping the pruned rows from `keep_from` on readable
+    /// in the pruned tail even when the prune also compacts the log
+    /// (ft-yccm0.2.1.4: `keep_from` is the first row of the sealed segment
+    /// that holds `seq`). `None` keeps nothing, as `prune_before` does.
+    pub fn prune_before_keeping(
+        &mut self,
+        pane_id: PaneId,
+        seq: u64,
+        keep_from: Option<u64>,
+    ) -> Result<(), MmapStoreError> {
         if self.fallback_panes.contains(&pane_id) || self.sqlite_is_authority(pane_id)? {
             self.activate_sqlite_fallback(pane_id)?;
             return self
@@ -3083,7 +3524,7 @@ impl MmapScrollbackStore {
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             pane.prune_before(seq)?;
             if pane.base_seq_file.metadata()?.len() >= PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES
-                && pane.compact_retained_prefix()?
+                && pane.compact_retained_prefix(keep_from)?
                 && cold_erasure == ColdErasureMode::ReedSolomon
             {
                 pane.write_erasure_sidecars()?;
@@ -3110,6 +3551,40 @@ impl MmapScrollbackStore {
             }
         }
         Ok(())
+    }
+
+    /// Cut a pane's ledger back so `next_seq` is its next sequence, dropping
+    /// every newer record (ft-yccm0.2.1.3). A cut at or past the end does
+    /// nothing; a cut into the pruned prefix is refused. Returns whether rows
+    /// were dropped. The cut is synchronized before return, and Reed-Solomon
+    /// shards are rewritten so they cannot restore the dropped rows.
+    ///
+    /// An authenticated owner cuts only rows that no durable authority names:
+    /// it syncs a batch's rows before publishing the WAL that authorizes
+    /// them, so a crash or a failed publication between the two leaves such
+    /// a tail.
+    pub fn truncate_after(
+        &mut self,
+        pane_id: PaneId,
+        next_seq: u64,
+    ) -> Result<bool, MmapStoreError> {
+        if self.fallback_panes.contains(&pane_id) || self.sqlite_is_authority(pane_id)? {
+            self.activate_sqlite_fallback(pane_id)?;
+            return self
+                .sqlite_fallback
+                .as_mut()
+                .ok_or(MmapStoreError::UnknownPane(pane_id))?
+                .truncate_after(pane_id, next_seq);
+        }
+        let pane = self
+            .panes
+            .get_mut(&pane_id)
+            .ok_or(MmapStoreError::UnknownPane(pane_id))?;
+        let truncated = pane.truncate_after(next_seq)?;
+        if truncated && self.cold_erasure == ColdErasureMode::ReedSolomon {
+            pane.write_erasure_sidecars()?;
+        }
+        Ok(truncated)
     }
 
     pub fn refresh_pane_erasure_shards(&mut self, pane_id: PaneId) -> Result<bool, MmapStoreError> {
@@ -3183,6 +3658,26 @@ impl MmapScrollbackStore {
             .get(&pane_id)
             .map(PaneFile::retained_record_bytes)
             .unwrap_or(0)
+    }
+
+    /// Bytes, newlines included, of the reachable records `from..to`, read
+    /// from the in-memory offsets without touching the records. The range
+    /// must lie within the reachable rows.
+    pub fn record_bytes_between(
+        &self,
+        pane_id: PaneId,
+        from: u64,
+        to: u64,
+    ) -> Result<u64, MmapStoreError> {
+        if self.fallback_panes.contains(&pane_id) {
+            return Err(MmapStoreError::InvalidPaneLogHeader(
+                "SQLite fallback has no versioned sequence ledger".to_string(),
+            ));
+        }
+        self.panes
+            .get(&pane_id)
+            .ok_or(MmapStoreError::UnknownPane(pane_id))?
+            .record_bytes_between(from, to)
     }
 
     #[must_use]
@@ -5118,6 +5613,145 @@ mod tests {
     }
 
     #[test]
+    fn truncate_after_cuts_the_tail_durably_and_appends_continue_at_the_cut() {
+        let dir = temp_dir();
+        let log_path = dir.path().join("1.log");
+        {
+            let mut store = file_only_store(dir.path());
+            for idx in 0..6 {
+                assert_eq!(store.append_line(1, &format!("line-{idx}")).unwrap(), idx);
+            }
+            store.prune_before(1, 2).unwrap();
+
+            assert!(!store.truncate_after(1, 6).unwrap(), "a cut at the end");
+            assert!(!store.truncate_after(1, 9).unwrap(), "a cut past the end");
+            assert_eq!(store.next_seq(1).unwrap(), 6);
+            assert!(matches!(
+                store.truncate_after(1, 1),
+                Err(MmapStoreError::TruncateIntoPrunedPrefix {
+                    next_seq: 1,
+                    oldest: 2
+                })
+            ));
+            assert_eq!(store.line_count(1), 4, "a refused cut changes nothing");
+
+            assert!(store.truncate_after(1, 4).unwrap());
+            assert_eq!(store.next_seq(1).unwrap(), 4);
+            assert_eq!(store.oldest_seq(1), Some(2));
+            assert_eq!(store.line_count(1), 2);
+            assert_eq!(store.line_at(1, 3).unwrap().as_deref(), Some("line-3"));
+            assert_eq!(store.line_at(1, 4).unwrap(), None);
+            assert_eq!(
+                std::fs::metadata(&log_path).unwrap().len(),
+                store.file_bytes(1),
+                "the cut bytes are gone from disk, not just from the index"
+            );
+        }
+
+        let mut reopened = file_only_store(dir.path());
+        reopened.ensure_pane(1).unwrap();
+        assert_eq!(reopened.oldest_seq(1), Some(2));
+        assert_eq!(reopened.next_seq(1).unwrap(), 4);
+        assert_eq!(
+            reopened.tail_lines(1, 10).unwrap(),
+            vec!["line-2", "line-3"]
+        );
+        assert_eq!(reopened.append_line(1, "new-4").unwrap(), 4);
+        drop(reopened);
+
+        let mut reopened = file_only_store(dir.path());
+        reopened.ensure_pane(1).unwrap();
+        assert_eq!(
+            reopened.tail_lines(1, 10).unwrap(),
+            vec!["line-2", "line-3", "new-4"]
+        );
+        assert_eq!(reopened.line_at(1, 5).unwrap(), None);
+    }
+
+    #[test]
+    fn truncate_after_a_compacted_log_can_cut_every_retained_row() {
+        let dir = temp_dir();
+        {
+            let mut store = file_only_store(dir.path());
+            for idx in 0..8 {
+                store.append_line(1, &format!("line-{idx}")).unwrap();
+            }
+            store.prune_before(1, 6).unwrap();
+            assert!(store.compact_pane_if_stale(1, 1).unwrap());
+            assert_eq!(store.append_lines(1, &["line-8", "line-9"]).unwrap(), 8);
+
+            assert!(store.truncate_after(1, 7).unwrap());
+            assert_eq!(store.tail_lines(1, 10).unwrap(), vec!["line-6"]);
+        }
+
+        let mut reopened = file_only_store(dir.path());
+        reopened.ensure_pane(1).unwrap();
+        assert_eq!(reopened.oldest_seq(1), Some(6));
+        assert_eq!(reopened.next_seq(1).unwrap(), 7);
+        assert!(reopened.truncate_after(1, 6).unwrap());
+        assert_eq!(reopened.oldest_seq(1), None);
+        assert_eq!(reopened.line_count(1), 0);
+        assert_eq!(reopened.next_seq(1).unwrap(), 6);
+        drop(reopened);
+
+        let mut reopened = file_only_store(dir.path());
+        reopened.ensure_pane(1).unwrap();
+        assert_eq!(reopened.next_seq(1).unwrap(), 6, "the pruned base survives");
+        assert_eq!(reopened.line_count(1), 0);
+        assert_eq!(reopened.append_line(1, "again-6").unwrap(), 6);
+        assert_eq!(reopened.line_at(1, 6).unwrap().as_deref(), Some("again-6"));
+    }
+
+    #[test]
+    fn truncate_after_rewrites_erasure_shards_so_they_cannot_restore_cut_rows() {
+        let dir = temp_dir();
+        let mut store = rs_store(dir.path());
+        store
+            .append_lines(1, &["keep-0", "keep-1", "cut-2"])
+            .unwrap();
+        assert!(store.refresh_pane_erasure_shards(1).unwrap());
+
+        assert!(store.truncate_after(1, 2).unwrap());
+        let on_disk = std::fs::read(dir.path().join("1.log")).unwrap();
+        assert_eq!(on_disk, b"keep-0\nkeep-1\n");
+        assert_eq!(
+            store.recover_pane_bytes_from_erasure_shards(1).unwrap(),
+            Some(on_disk)
+        );
+    }
+
+    #[test]
+    fn sqlite_fallback_truncate_after_sets_the_next_sequence() {
+        let dir = temp_dir();
+        let db_path = dir.path().join("sqlite-truncate.db");
+        let mut sqlite = SqliteFallbackStore::open(&db_path).unwrap();
+        for idx in 0..5 {
+            assert_eq!(
+                sqlite
+                    .append_line_auto_seq(1, &format!("line-{idx}"))
+                    .unwrap(),
+                idx
+            );
+        }
+        sqlite.prune_before(1, 1).unwrap();
+
+        assert!(!sqlite.truncate_after(1, 5).unwrap());
+        assert!(matches!(
+            sqlite.truncate_after(1, 0),
+            Err(MmapStoreError::TruncateIntoPrunedPrefix {
+                next_seq: 0,
+                oldest: 1
+            })
+        ));
+        assert!(sqlite.truncate_after(1, 3).unwrap());
+        assert_eq!(sqlite.next_seq(1).unwrap(), 3);
+        assert_eq!(sqlite.line_count(1).unwrap(), 2);
+        assert_eq!(sqlite.line_at(1, 3).unwrap(), None);
+        assert_eq!(sqlite.append_line_auto_seq(1, "new-3").unwrap(), 3);
+        assert_eq!(sqlite.line_at(1, 3).unwrap().as_deref(), Some("new-3"));
+    }
+
+    #[test]
     fn file_store_empty_retention_compaction_preserves_next_sequence() {
         let dir = temp_dir();
 
@@ -5466,6 +6100,284 @@ mod tests {
                 observed: 3,
             }
         ));
+    }
+
+    /// ft-yccm0.2.1.2: a bounded snapshot reads the published prefix of a
+    /// log that also holds a durable tail, as if the tail were uncommitted:
+    /// records, next sequence and committed bytes end at the bound, and the
+    /// record limit applies to what is returned.
+    #[test]
+    fn read_pane_snapshot_through_reads_the_prefix_before_a_durable_tail() {
+        let dir = temp_dir();
+        let log_path = dir.path().join("9.log");
+        let sequence_path = dir.path().join("9.seq");
+        std::fs::write(&log_path, b"zero\none\ntwo\nthree\nfour\n").unwrap();
+        std::fs::write(&sequence_path, b"FTSEQ1:1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::set_permissions(&sequence_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+
+        let snapshot = read_pane_snapshot_through(dir.path(), 9, 3, 2, 1024, 1024).unwrap();
+        assert_eq!(snapshot.oldest_seq, Some(1));
+        assert_eq!(snapshot.next_seq, 3);
+        assert_eq!(snapshot.records, vec!["one", "two"]);
+        assert_eq!(snapshot.retained_record_bytes, 8);
+        assert_eq!(snapshot.committed_bytes, 13, "ends after \"two\\n\"");
+        assert_eq!(snapshot.trailing_uncommitted_bytes, 11);
+
+        let whole = read_pane_snapshot_through(dir.path(), 9, 5, 4, 1024, 1024).unwrap();
+        assert_eq!(whole.records, vec!["one", "two", "three", "four"]);
+        assert_eq!(whole.committed_bytes, 24);
+        assert_eq!(
+            whole.records,
+            read_pane_snapshot(dir.path(), 9, 5, 1024, 1024)
+                .unwrap()
+                .records
+        );
+
+        assert!(matches!(
+            read_pane_snapshot_through(dir.path(), 9, 3, 1, 1024, 1024),
+            Err(MmapStoreError::PaneSnapshotLimitExceeded {
+                limit_name: "records",
+                limit: 1,
+                observed: 2,
+            })
+        ));
+        assert!(
+            matches!(
+                read_pane_snapshot_through(dir.path(), 9, 6, 8, 1024, 1024),
+                Err(MmapStoreError::InvalidPaneLogHeader(_))
+            ),
+            "a bound past the log's end is refused"
+        );
+        let empty = read_pane_snapshot_through(dir.path(), 9, 1, 8, 1024, 1024).unwrap();
+        assert!(empty.records.is_empty());
+        assert_eq!(empty.next_seq, 1);
+    }
+
+    /// ft-yccm0.2.1.2: chunks append in order with one data sync for all of
+    /// them on a file pane; a SQLite-authority pane appends them too; empty
+    /// chunks are skipped; each chunk and the chunk count stay bounded.
+    /// ft-yccm0.2.1.4: the bytes of any reachable row range, from the
+    /// offsets alone, add up with the store's own accounting before and
+    /// after a prune; a range outside the reachable rows is refused.
+    #[test]
+    fn record_bytes_between_counts_reachable_rows_from_their_offsets() {
+        let dir = temp_dir();
+        let db = dir.path().join("bytes.sqlite");
+        let mut store = hybrid_store(dir.path(), &db);
+        let rows = ["a", "bc", "界e\u{301}", "", "👩‍💻", "last"];
+        assert_eq!(store.append_lines(3, &rows).unwrap(), 0);
+        let bytes = |range: std::ops::Range<usize>| {
+            rows[range]
+                .iter()
+                .map(|row| row.len() as u64 + 1)
+                .sum::<u64>()
+        };
+        for from in 0..=rows.len() {
+            for to in from..=rows.len() {
+                assert_eq!(
+                    store
+                        .record_bytes_between(3, from as u64, to as u64)
+                        .unwrap(),
+                    bytes(from..to),
+                    "{from}..{to}"
+                );
+            }
+        }
+        assert_eq!(
+            store.record_bytes_between(3, 0, 6).unwrap(),
+            store.retained_record_bytes(3)
+        );
+        store.prune_before(3, 2).unwrap();
+        assert_eq!(
+            store.record_bytes_between(3, 2, 6).unwrap(),
+            store.retained_record_bytes(3)
+        );
+        assert_eq!(store.record_bytes_between(3, 4, 5).unwrap(), bytes(4..5));
+        for (from, to) in [(1, 3), (3, 2), (2, 7)] {
+            assert!(
+                store.record_bytes_between(3, from, to).is_err(),
+                "{from}..{to}"
+            );
+        }
+        assert!(store.record_bytes_between(4, 0, 0).is_err(), "unknown pane");
+    }
+
+    /// ft-yccm0.2.1.4: pruned rows stay readable in the pruned tail, only
+    /// through lines_range_reaching_pruned, until a compaction drops them. A
+    /// compaction or a journal-compacting prune that keeps from a tail row
+    /// keeps that row and every later one, across reopen; reachable-row
+    /// accounting never includes the tail.
+    #[test]
+    fn pruned_tail_rows_stay_readable_until_a_compaction_drops_them() {
+        let dir = temp_dir();
+        let db = dir.path().join("tail.sqlite");
+        let rows: Vec<String> = (0..10).map(|row| format!("row-{row}")).collect();
+        let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+        {
+            let mut store = hybrid_store(dir.path(), &db);
+            store.append_lines(5, &refs).unwrap();
+            store.prune_before(5, 6).unwrap();
+            assert_eq!(store.oldest_seq(5), Some(6));
+            assert_eq!(store.line_count(5), 4);
+            assert_eq!(store.pruned_tail_start(5), Some(0));
+            assert_eq!(store.line_at(5, 3).unwrap(), None, "not a reachable row");
+            assert!(store.lines_range(5, 3..8, 8, 1 << 20).unwrap().is_empty());
+            assert_eq!(
+                store
+                    .lines_range_reaching_pruned(5, 3..8, 8, 1 << 20)
+                    .unwrap(),
+                rows[3..8].to_vec()
+            );
+            let reachable = store.retained_record_bytes(5);
+            // Compaction keeping from row 4 keeps rows 4 and 5 readable.
+            assert!(store.compact_pane_if_stale_keeping(5, 1, Some(4)).unwrap());
+            assert_eq!(store.retained_record_bytes(5), reachable);
+            assert_eq!(store.pruned_tail_start(5), Some(4));
+            assert!(
+                store
+                    .lines_range_reaching_pruned(5, 3..8, 8, 1 << 20)
+                    .unwrap()
+                    .is_empty(),
+                "row 3 was compacted away"
+            );
+            assert_eq!(
+                store
+                    .lines_range_reaching_pruned(5, 4..10, 8, 1 << 20)
+                    .unwrap(),
+                rows[4..10].to_vec()
+            );
+        }
+        {
+            // Reopening recovers the same pruned tail from the log header.
+            let mut store = hybrid_store(dir.path(), &db);
+            store.open_existing_pane(5).unwrap();
+            assert_eq!(store.oldest_seq(5), Some(6));
+            assert_eq!(store.pruned_tail_start(5), Some(4));
+            assert_eq!(
+                store
+                    .lines_range_reaching_pruned(5, 4..7, 8, 1 << 20)
+                    .unwrap(),
+                rows[4..7].to_vec()
+            );
+            // A plain compaction drops the whole tail.
+            store.prune_before(5, 8).unwrap();
+            assert_eq!(store.pruned_tail_start(5), Some(4));
+            assert!(store.compact_pane_if_stale(5, 1).unwrap());
+            assert_eq!(store.pruned_tail_start(5), Some(8));
+            assert!(
+                store
+                    .lines_range_reaching_pruned(5, 7..9, 8, 1 << 20)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                store
+                    .lines_range_reaching_pruned(5, 8..10, 8, 1 << 20)
+                    .unwrap(),
+                rows[8..10].to_vec()
+            );
+        }
+    }
+
+    /// The pruned tail holds at most PANE_PRUNED_TAIL_MAX_ROWS rows: older
+    /// pruned rows are no longer readable even before compaction.
+    #[test]
+    fn the_pruned_tail_is_bounded() {
+        let dir = temp_dir();
+        let db = dir.path().join("bound.sqlite");
+        let mut store = hybrid_store(dir.path(), &db);
+        let rows: Vec<String> = (0..PANE_PRUNED_TAIL_MAX_ROWS + 10)
+            .map(|row| row.to_string())
+            .collect();
+        for chunk in rows.chunks(PANE_APPEND_MAX_ROWS) {
+            let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+            store.append_lines(9, &refs).unwrap();
+        }
+        let end = rows.len() as u64;
+        store.prune_before(9, end - 1).unwrap();
+        let start = end - 1 - PANE_PRUNED_TAIL_MAX_ROWS as u64;
+        assert_eq!(store.pruned_tail_start(9), Some(start));
+        assert!(
+            store
+                .lines_range_reaching_pruned(9, start - 1..start + 1, 4, 1 << 20)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .lines_range_reaching_pruned(9, start..start + 2, 4, 1 << 20)
+                .unwrap(),
+            vec![start.to_string(), (start + 1).to_string()]
+        );
+    }
+
+    #[test]
+    fn append_line_chunks_write_every_chunk_in_order_under_one_data_sync() {
+        for fallback in [false, true] {
+            let dir = temp_dir();
+            let db = dir.path().join("chunks.sqlite");
+            let mut store = hybrid_store(dir.path(), &db);
+            if fallback {
+                store.activate_sqlite_fallback(7).unwrap();
+            }
+            assert_eq!(store.append_lines(7, &["before"]).unwrap(), 0);
+            PANE_APPEND_DATA_SYNCS.with(|count| count.set(0));
+            let first: Vec<String> = (0..PANE_APPEND_MAX_ROWS).map(|n| n.to_string()).collect();
+            let first: Vec<&str> = first.iter().map(String::as_str).collect();
+            let chunks: [&[&str]; 3] = [&first, &[], &["界e\u{301}", "👩‍💻"]];
+            assert_eq!(store.append_line_chunks(7, &chunks).unwrap(), 1);
+            let rows = 1 + PANE_APPEND_MAX_ROWS as u64 + 2;
+            assert_eq!(store.next_seq(7).unwrap(), rows);
+            assert_eq!(
+                PANE_APPEND_DATA_SYNCS.with(|count| count.get()),
+                usize::from(!fallback),
+                "one data sync for the whole append"
+            );
+            assert_eq!(store.line_at(7, 1).unwrap().as_deref(), Some("0"));
+            assert_eq!(
+                store.tail_lines(7, 3).unwrap(),
+                vec![
+                    (PANE_APPEND_MAX_ROWS - 1).to_string(),
+                    "界e\u{301}".to_string(),
+                    "👩‍💻".to_string()
+                ]
+            );
+            assert_eq!(store.append_line_chunks(7, &[]).unwrap(), rows);
+
+            let too_many = vec![["x"].as_slice(); PANE_APPEND_MAX_CHUNKS + 1];
+            assert!(matches!(
+                store.append_line_chunks(7, &too_many),
+                Err(MmapStoreError::PaneAppendLimitExceeded {
+                    limit_name: "chunks",
+                    ..
+                })
+            ));
+            let oversized: Vec<&str> = vec!["y"; PANE_APPEND_MAX_ROWS + 1];
+            assert!(matches!(
+                store.append_line_chunks(7, &[&["z"], &oversized]),
+                Err(MmapStoreError::PaneAppendLimitExceeded {
+                    limit_name: "rows",
+                    ..
+                })
+            ));
+            assert_eq!(
+                store.next_seq(7).unwrap(),
+                rows,
+                "a refused append writes nothing"
+            );
+            drop(store);
+            let mut reopened = hybrid_store(dir.path(), &db);
+            reopened.ensure_pane(7).unwrap();
+            assert_eq!(reopened.next_seq(7).unwrap(), rows);
+            assert_eq!(reopened.line_at(7, 1).unwrap().as_deref(), Some("0"));
+        }
     }
 
     #[cfg(unix)]

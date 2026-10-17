@@ -4,9 +4,10 @@ use ahash::{AHashMap, AHasher};
 use config::TextStyle;
 use frankenterm_font::shaper::GlyphInfo;
 use frankenterm_font::units::*;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const SHAPED_RUN_INTERNER_MAX_ENTRIES: usize = 8192;
 const SHAPED_RUN_INTERNER_MAX_COLLISIONS: usize = 4;
@@ -63,29 +64,76 @@ impl ShapedInfo {
 ///
 /// HarfBuzz shaping (`infos`) is **atlas-invariant**: it depends only on the
 /// font + text, not on which atlas generation the glyph sprites currently live
-/// in. The resolved [`ShapedInfo`] sprites (`glyphs`) ARE atlas-dependent. By
-/// caching the invariant `infos` alongside the sprites plus a `generation` tag,
-/// an atlas rebuild can re-resolve the (cheap) sprites from `infos` instead of
-/// throwing the entry away and re-running (expensive) HarfBuzz shaping. This is
-/// the shape-cache analogue of the [`ShapedRunInterner`] decoupling, and it
-/// removes the per-rebuild full-screen re-shape that drove the progressive GUI
-/// slowdown (the render loop's HarfBuzz time climbing over a session).
+/// in. The resolved [`ShapedInfo`] sprites are atlas-dependent: each holds an
+/// `Rc<CachedGlyph>` whose sprite owns an `Rc` of the whole atlas texture, so
+/// they are not stored here. The glyph cache binds them to this shape's `id`
+/// (`GlyphCache::bind_shape`), next to the atlas they point into. An atlas
+/// rebuild replaces the glyph cache and drops every binding with it, and a
+/// surviving shape re-resolves its (cheap) sprites from `infos` instead of
+/// re-running (expensive) HarfBuzz shaping. This removes the per-rebuild
+/// full-screen re-shape that drove the progressive GUI slowdown (the render
+/// loop's HarfBuzz time climbing over a session).
+///
+/// **Leak freedom (ft-yccm0.4.3.4):** this type reaches no GPU handle, so a
+/// shape-cache entry cannot pin an atlas however long it stays resident. The
+/// `cache_gpu_handle` lint proves it; before this, every rebuild had to release
+/// a per-entry binding (ft-yccm0.2.5).
 ///
 /// **Soundness of "re-resolve, don't re-shape":** the font-fallback and config
 /// invalidation paths always `clear()` the shape cache. Therefore any entry
 /// that *survives* a `shape_generation` bump only ever experienced an *atlas*
 /// rebuild — for which the cached `infos` remain valid and only the sprites
 /// need re-resolving. (A genuine shaping-input change clears the entry, forcing
-/// a real re-shape on the next miss.)
+/// a real re-shape on the next miss.) Each entry has a process-unique `id`, so a
+/// binding made for a cleared entry never answers for its replacement.
 #[derive(Debug)]
 pub struct CachedShape {
+    /// Process-unique key of this entry's sprite binding in the glyph cache.
+    id: u64,
     /// Atlas-invariant HarfBuzz output (glyph indices, clusters, advances).
-    pub infos: Vec<GlyphInfo>,
-    /// Atlas-dependent resolved sprites; re-resolved in place when `generation`
-    /// falls behind the window's `shape_generation`.
-    pub glyphs: RefCell<Rc<Vec<ShapedInfo>>>,
-    /// The `shape_generation` at which `glyphs` was last resolved.
-    pub generation: Cell<usize>,
+    infos: Vec<GlyphInfo>,
+}
+
+/// Heap bytes of the per-glyph cluster text that `GlyphInfo` retains only in
+/// builds with debug assertions (for diagnostics); release builds have none.
+#[cfg(debug_assertions)]
+fn glyph_text_bytes(infos: &[GlyphInfo]) -> usize {
+    infos.iter().map(|info| info.text.capacity()).sum()
+}
+
+#[cfg(not(debug_assertions))]
+fn glyph_text_bytes(_infos: &[GlyphInfo]) -> usize {
+    0
+}
+
+impl CachedShape {
+    /// A new entry for `infos`, with an id no other entry in this process has.
+    pub fn new(infos: Vec<GlyphInfo>) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            infos,
+        }
+    }
+
+    /// The key of this entry's sprite binding in the glyph cache.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The HarfBuzz output the sprites are resolved from.
+    pub fn infos(&self) -> &[GlyphInfo] {
+        &self.infos
+    }
+
+    /// Heap bytes this entry owns, for the cache-gauge ledger (ft-yccm0.1.7):
+    /// the struct and the shaping output, with each glyph's cluster text. The
+    /// sprite binding is the glyph cache's (`GlyphCache::shape_binding_bytes`).
+    pub fn accounted_bytes(&self) -> u64 {
+        let infos = self.infos.capacity() * std::mem::size_of::<GlyphInfo>()
+            + glyph_text_bytes(&self.infos);
+        (std::mem::size_of::<Self>() + infos) as u64
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -689,6 +737,67 @@ mod test {
             interner.entries <= SHAPED_RUN_INTERNER_MAX_ENTRIES,
             "interner entry count must stay bounded across churn"
         );
+    }
+
+    /// ft-yccm0.4.3.4: a cached shape keeps only HarfBuzz output under an id
+    /// no other entry has, so it owns no glyph and cannot pin an atlas.
+    #[test]
+    fn cached_shape_holds_only_shaping_output_under_a_unique_id() {
+        use super::CachedShape;
+        use std::mem::size_of;
+
+        let (infos, glyphs, run) = fake_shaped_run(5);
+        drop(run);
+        let infos_bytes =
+            infos.capacity() * size_of::<GlyphInfo>() + super::glyph_text_bytes(&infos);
+        let shape = CachedShape::new(infos.clone());
+        let twin = CachedShape::new(infos.clone());
+        assert_ne!(shape.id(), twin.id(), "equal shaping still gets its own id");
+        assert_eq!(shape.infos(), infos.as_slice());
+        assert_eq!(
+            shape.accounted_bytes(),
+            (size_of::<CachedShape>() + infos_bytes) as u64
+        );
+        for glyph in &glyphs {
+            assert_eq!(Rc::strong_count(glyph), 1, "a shape holds no glyph");
+        }
+    }
+
+    /// ft-yccm0.4.3.4: sprite bindings live in the glyph cache, answer only for
+    /// the shape they were bound to, and die with the glyph cache, which is what
+    /// frees the previous atlas texture after a rebuild.
+    #[test]
+    fn shape_bindings_answer_per_shape_and_die_with_their_glyph_cache() {
+        use super::CachedShape;
+
+        config::use_test_configuration();
+        let fonts = Rc::new(FontConfiguration::new(None, 96).unwrap());
+        let mut glyph_cache = GlyphCache::new_in_memory(&fonts, 128).unwrap();
+        let (infos, glyphs, run) = fake_shaped_run(3);
+        let shape = CachedShape::new(infos.clone());
+        let replacement = CachedShape::new(infos);
+
+        assert!(glyph_cache.shape_binding(shape.id()).is_none());
+        glyph_cache.bind_shape(shape.id(), Rc::new(run));
+        let bound = glyph_cache.shape_binding(shape.id()).expect("bound shape");
+        assert!(Rc::ptr_eq(&bound[0].glyph, &glyphs[0]));
+        assert!(
+            glyph_cache.shape_binding(replacement.id()).is_none(),
+            "a binding never answers for another entry with the same text"
+        );
+        drop(bound);
+        for glyph in &glyphs {
+            assert_eq!(Rc::strong_count(glyph), 2, "the binding holds one ref");
+        }
+
+        drop(glyph_cache);
+        for glyph in &glyphs {
+            assert_eq!(
+                Rc::strong_count(glyph),
+                1,
+                "dropping the glyph cache (an atlas rebuild) must drop every binding"
+            );
+        }
     }
 
     #[test]

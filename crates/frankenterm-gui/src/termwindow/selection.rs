@@ -259,7 +259,24 @@ impl LocalSelectionRead {
         deadline: std::time::Instant,
         wake: impl FnOnce() + Send + 'static,
     ) -> Result<Option<Self>, &'static str> {
-        let Some(permit) = mux::pane::LineReadPermit::try_acquire() else {
+        Self::start_with(
+            capture,
+            deadline,
+            mux::pane::LineReadPermit::try_acquire,
+            wake,
+        )
+    }
+
+    /// [`Self::start`] with the read permit from `acquire`: `None` is a busy
+    /// pool. Tests pass a permit they hold instead of racing other tests for
+    /// the process-wide pool (ft-6xf07).
+    fn start_with(
+        capture: impl FnOnce() -> Option<anyhow::Result<wezterm_term::screen::ScreenLineRead>>,
+        deadline: std::time::Instant,
+        acquire: impl FnOnce() -> Option<mux::pane::LineReadPermit>,
+        wake: impl FnOnce() + Send + 'static,
+    ) -> Result<Option<Self>, &'static str> {
+        let Some(permit) = acquire() else {
             return Ok(None);
         };
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -2915,11 +2932,28 @@ mod tests {
             )
         };
         let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Each read gets the pool's last permit once it is free: start's own
+        // try_acquire would fail whenever a test running alongside holds one
+        // (ft-6xf07). Holding the other three, getting it back again proves
+        // the read released its own.
+        let last_permit = || Some(available_permit());
+
+        // A busy pool starts no worker and captures nothing.
+        assert!(
+            LocalSelectionRead::start_with(
+                || panic!("captured without a read permit"),
+                deadline(),
+                || None,
+                || {},
+            )
+            .unwrap()
+            .is_none()
+        );
 
         // A real held terminal lock abandons the already-started worker.
         let held = terminal.lock();
         assert!(
-            LocalSelectionRead::start(capture, deadline(), || {})
+            LocalSelectionRead::start_with(capture, deadline(), last_permit, || {})
                 .unwrap()
                 .is_none()
         );
@@ -2929,7 +2963,7 @@ mod tests {
         // Completion remains charged while queued, and cancelling a queued
         // result returns its heavy payload to the worker before permit release.
         let (woke, wake) = sync_channel(1);
-        let read = LocalSelectionRead::start(capture, deadline(), move || {
+        let read = LocalSelectionRead::start_with(capture, deadline(), last_permit, move || {
             woke.send(()).unwrap();
         })
         .unwrap()
@@ -2955,7 +2989,7 @@ mod tests {
         assert!(cancelled.load(Ordering::Acquire));
         drop(available_permit());
 
-        let read = LocalSelectionRead::start(capture, deadline(), || {})
+        let read = LocalSelectionRead::start_with(capture, deadline(), last_permit, || {})
             .unwrap()
             .unwrap();
         let ready = read

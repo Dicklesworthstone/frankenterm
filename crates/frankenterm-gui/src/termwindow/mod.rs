@@ -120,12 +120,19 @@ pub mod clipboard;
 pub mod frame_budget;
 pub mod idle_detector;
 pub mod keyevent;
+mod metal_cells;
+mod metal_chrome;
+mod metal_glyphs;
+mod metal_images;
+mod metal_render_thread;
+mod metal_window;
 pub mod modal;
 mod mouseevent;
 pub mod palette;
 pub mod paneselect;
 mod prevcursor;
 pub mod render;
+pub(crate) mod render_snapshot;
 pub mod resize;
 mod selection;
 pub(crate) use selection::SelectionCopy;
@@ -134,8 +141,6 @@ pub mod spawn;
 pub mod webgpu;
 use crate::spawn::SpawnWhere;
 use prevcursor::PrevCursorPos;
-
-const ATLAS_SIZE: usize = 128;
 
 lazy_static::lazy_static! {
     static ref WINDOW_CLASS: Mutex<String> = Mutex::new(wezterm_gui_subcommands::DEFAULT_WINDOW_CLASS.to_owned());
@@ -507,6 +512,9 @@ struct RetainedMuxRefresh {
     title_pending: Arc<AtomicBool>,
     title: Arc<Mutex<Option<PendingMuxTitleRefresh>>>,
     wake: flume::Sender<()>,
+    /// The window's Metal render thread, woken directly for the output of
+    /// the pane it draws (ft-yccm0.4.1.2).
+    metal: Arc<metal_render_thread::MetalOutputWake>,
 }
 
 // Pending and admitted weak sets plus the native callback's validated Arc
@@ -684,6 +692,16 @@ impl RetainedMuxRefresh {
     }
 
     fn record(&self, notification: &MuxNotification, window_id: MuxWindowId) -> bool {
+        if let MuxNotification::PaneOutput(pane_id) = notification {
+            if self.metal.wake_for(*pane_id) {
+                // The render thread draws this pane and is awake now: no
+                // main-thread task for this batch (ft-yccm0.4.1.2, the
+                // ft-4p4uo class). The interest stays recorded, so the next
+                // main-thread wake still accounts for it.
+                self.output.record(*pane_id);
+                return true;
+            }
+        }
         if matches!(
             notification,
             MuxNotification::TabAddedToWindow { .. } | MuxNotification::WindowTopologyChanged(_)
@@ -992,6 +1010,45 @@ fn lock_termwindow_mutex<'a, T>(mutex: &'a Mutex<T>, name: &str) -> std::sync::M
     })
 }
 
+/// Image-parity hook for the Metal front end (ft-yccm0.1.10): the frame the
+/// live path draws (ft-yccm0.4.4), every visible pane with its backgrounds,
+/// selection, cursor and glyphs, splits and dimming (ft-yccm0.4.6), rendered
+/// offscreen by the real Metal passes and read back. Without a pane only the
+/// background clear is drawn.
+fn write_metal_render_snapshot(
+    metal: &frankenterm_renderer_metal::MetalRenderer,
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+    color: frankenterm_renderer_metal::ClearColor,
+    window: Option<&frankenterm_renderer_metal::WindowFrame<'_>>,
+) {
+    let readback = match window {
+        Some(window) => metal.snapshot_window(width, height, window),
+        None => metal.device().clear_offscreen(width, height, color),
+    };
+    let result = readback
+        .map_err(anyhow::Error::new)
+        .and_then(|bgra| render_snapshot::texels_to_rgba8(wgpu::TextureFormat::Bgra8Unorm, bgra))
+        .and_then(|rgba| render_snapshot::write_png_atomically(path, width, height, &rgba));
+    if let Err(err) = result {
+        log::error!("Metal render snapshot failed: {err:#}");
+    }
+}
+
+/// Sends a paste to `pane`. A refused paste (for example one over the
+/// terminal's paste size limit) is never truncated, so tell the user instead
+/// of failing silently (ft-yccm0.2.2.5).
+pub(crate) fn send_paste_or_notify(pane: &dyn Pane, text: &str) {
+    if let Err(err) = pane.send_paste(text) {
+        log::warn!("paste into pane {} refused: {err:#}", pane.pane_id());
+        frankenterm_toast_notification::persistent_toast_notification(
+            "Paste was not sent",
+            &format!("{err:#}"),
+        );
+    }
+}
+
 pub fn set_window_position(pos: GuiPosition) {
     lock_termwindow_mutex(&POSITION, "window position").replace(pos);
 }
@@ -1281,6 +1338,10 @@ pub struct PaneState {
     /// scrollback.
     viewport: Option<StableRowIndex>,
     native_viewport: Option<mux::localpane::NativeViewport>,
+    /// The native frame this pane was last painted from by a fresh capture.
+    /// When the terminal is busy, paint draws it again instead of failing the
+    /// window's frame (ft-yccm0.2.2.3).
+    last_native_frame: Option<render::pane::PaintedNativeFrame>,
     remote_viewport: Option<render::pane::ViewportAnchor>,
     last_viewport_source: Option<render::pane::ViewportSource>,
     /// Terminal sequence fence consumed by render damage discovery. This is
@@ -2400,6 +2461,33 @@ pub struct TermWindow {
 
     gl: Option<Rc<glium::backend::Context>>,
     webgpu: Option<Rc<WebGpuState>>,
+    /// The native Metal front end. While it is in development it only clears
+    /// the window to the background color; it never has a `RenderState`.
+    metal: Option<Rc<frankenterm_renderer_metal::MetalRenderer>>,
+    /// The Metal front end's frame state for each visible pane: its render
+    /// mirror, scene and glyphs (ft-yccm0.4.4, ft-yccm0.4.6).
+    metal_panes: metal_window::MetalPanes,
+    /// A Metal window's chrome target: the glyph cache and quad layers its
+    /// tab bar and overlays are laid out and painted with (ft-yccm0.4.7.1).
+    metal_chrome: Option<metal_chrome::MetalChrome>,
+    /// The Metal render thread that owns the renderer and draws every frame
+    /// off the main thread (ft-yccm0.4.1.2). While it runs, `metal` is
+    /// `None` and `metal_panes` is empty.
+    metal_render: Option<metal_render_thread::MetalRenderThread>,
+    /// Wakes the render thread for its pane's output from the mux
+    /// notification callback; shared with the pane-update subscription.
+    metal_output_wake: Arc<metal_render_thread::MetalOutputWake>,
+    /// Image-parity corpus snapshot request (ft-yccm0.1.10); `None` unless
+    /// `FRANKENTERM_RENDER_SNAPSHOT` was set at window creation.
+    render_snapshot: Option<render_snapshot::RenderSnapshotRequest>,
+    /// The latest decoder poll deadline of the images drawn as transparent
+    /// placeholders because their first frames were still decoding. It
+    /// outlives the paint that noted it: a line cached with a placeholder is
+    /// reused without re-rendering until that image's deadline, so it is
+    /// cleared only once it has passed, when every such line renders again
+    /// and notes its image anew if it is still loading. While it is set, the
+    /// window polls for the images and a render snapshot waits.
+    image_poll_due: Cell<Option<Instant>>,
     config_subscription: Option<config::ConfigSubscription>,
 
     /// Per-pane agent state classification, updated each render tick.
@@ -3224,6 +3312,11 @@ impl TermWindow {
         }
     }
 
+    /// The shortest time between two frames under the configured `max_fps`.
+    pub(crate) fn frame_interval(&self) -> Duration {
+        config::frame_interval_for_max_fps(self.config.max_fps)
+    }
+
     pub(crate) fn schedule_animation_wake(&mut self, due: Instant) {
         if !matches!(self.render_recovery_state.mode, RenderRecoveryMode::Healthy) {
             metrics::counter!("gui.render.animation_wake", "action" => "suppressed_recovery")
@@ -3247,6 +3340,9 @@ impl TermWindow {
         match directive {
             RenderRecoveryDirective::RetryAfter(delay) => {
                 self.schedule_render_retry(stage, delay);
+            }
+            RenderRecoveryDirective::RetryNextFrame => {
+                self.schedule_render_retry(stage, self.frame_interval());
             }
             RenderRecoveryDirective::Park => {
                 self.render_wake_state.cancel();
@@ -3818,7 +3914,12 @@ impl TermWindow {
         let render_info = ctx.renderer_info();
         self.opengl_info.replace(render_info.clone());
 
-        let render_state = RenderState::new(ctx, &self.fonts, &self.render_metrics, ATLAS_SIZE)
+        // ft-yccm0.2.6: start at glyph_atlas_initial_size (1024 by default),
+        // not 128, so a real font does not cascade through rebuilds and
+        // repainted frames at startup.
+        let atlas_side =
+            crate::renderstate::initial_texture_atlas_side(self.config.glyph_atlas_initial_size);
+        let render_state = RenderState::new(ctx, &self.fonts, &self.render_metrics, atlas_side)
             .with_context(|| format!("failed to create render state for {render_info}"))?;
         log::info!(
             "Renderer initialized: {} FrankenTerm version: {}",
@@ -3830,6 +3931,43 @@ impl TermWindow {
         self.record_quad_buffer_allocation_snapshot(0);
 
         Ok(())
+    }
+
+    /// Activates the native Metal front end. It has no `RenderState`: it
+    /// draws the panes (cells, glyphs, images, selection, cursor, dimming),
+    /// splits, borders and the scrollbar, and the window chrome (tab bars,
+    /// modal overlays, background layers) with the other front ends' code in
+    /// its own chrome target (ft-yccm0.4.7). It is still in development and
+    /// not the default, which the logged identity says.
+    fn metal_created(&mut self, metal: Rc<frankenterm_renderer_metal::MetalRenderer>) {
+        self.render_wake_state.cancel();
+        self.render_state = None;
+
+        let render_info = format!(
+            "Metal (in development, {} submission) on {}",
+            metal.submission_path(),
+            metal.device().capabilities()
+        );
+        self.opengl_info.replace(render_info.clone());
+        log::info!(
+            "Renderer initialized: {} FrankenTerm version: {}",
+            render_info,
+            config::wezterm_version(),
+        );
+        if let Some(note) = metal.submission_note() {
+            log::warn!("Metal renderer: {note}");
+        }
+        // ft-yccm0.4.1.2: frames are drawn on a render thread unless the
+        // image-parity snapshot (which reads frames back on this thread) or
+        // FRANKENTERM_METAL_RENDER_THREAD=0 asks for the main thread.
+        if self.render_snapshot.is_none() && metal_render_thread::render_thread_enabled() {
+            if let Err(metal) = self.start_metal_render_thread(metal) {
+                self.metal.replace(metal);
+            }
+        } else {
+            self.metal.replace(metal);
+        }
+        self.render_recovery_state.record_reinitialized();
     }
 }
 
@@ -4090,6 +4228,8 @@ enum PaintAdmission {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RenderRecoveryDirective {
     RetryAfter(Duration),
+    /// Retry at the next frame the configured `max_fps` allows.
+    RetryNextFrame,
     Park,
     OpenCircuit,
 }
@@ -4146,9 +4286,9 @@ fn render_recovery_directive(
     };
 
     match stage {
-        RenderFailureStage::NativeFramePending => {
-            RenderRecoveryDirective::RetryAfter(Duration::from_millis(16))
-        }
+        // Paced like any other frame, not by a fixed 16 ms loop that would
+        // ignore max_fps (ft-yccm0.2.2.3).
+        RenderFailureStage::NativeFramePending => RenderRecoveryDirective::RetryNextFrame,
         RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Occluded) => {
             RenderRecoveryDirective::Park
         }
@@ -4536,6 +4676,13 @@ impl TermWindow {
             os_parameters: None,
             gl: None,
             webgpu: None,
+            metal: None,
+            metal_panes: metal_window::MetalPanes::default(),
+            metal_chrome: None,
+            metal_render: None,
+            metal_output_wake: Arc::default(),
+            render_snapshot: render_snapshot::RenderSnapshotRequest::from_env(),
+            image_poll_due: Cell::new(None),
             window: None,
             window_background,
             background_load: BackgroundLoadCoordinator::default(),
@@ -4748,14 +4895,36 @@ impl TermWindow {
             }
         });
 
-        let gl = match config.front_end {
-            FrontEndSelection::WebGpu => None,
-            _ => Some(window.enable_opengl().await?),
+        // front_end = "Metal" keeps the native renderer only if it attaches.
+        // Every refusal (not macOS, no device, GPU older than Apple7, no
+        // CAMetalLayer) is logged with its reason code and falls back to WebGpu.
+        let metal = match config.front_end {
+            FrontEndSelection::Metal => {
+                match frankenterm_renderer_metal::MetalRenderer::attach(&window) {
+                    Ok(renderer) => Some(Rc::new(renderer)),
+                    Err(reason) => {
+                        log::warn!(
+                            "front_end=Metal unavailable (reason={}): {reason}; falling back to WebGpu",
+                            reason.code()
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        let effective_front_end = config.front_end.effective(metal.is_some());
+
+        let gl = match effective_front_end {
+            FrontEndSelection::WebGpu | FrontEndSelection::Metal => None,
+            FrontEndSelection::OpenGL | FrontEndSelection::Software => {
+                Some(window.enable_opengl().await?)
+            }
         };
 
         // Renderer initialization yields to native callbacks. Keep the
         // TermWindow RefCell unborrowed so resize/config events can run.
-        let webgpu = match config.front_end {
+        let webgpu = match effective_front_end {
             FrontEndSelection::WebGpu => Some(Rc::new(
                 WebGpuState::new(&window, dimensions, &config).await?,
             )),
@@ -4794,11 +4963,19 @@ impl TermWindow {
                 myself.webgpu.replace(Rc::clone(&webgpu));
                 myself.created(RenderContext::WebGpu(Rc::clone(&webgpu)))?;
             }
+            if let Some(metal) = metal {
+                myself.metal_created(metal);
+            }
             myself.load_os_parameters();
             myself.schedule_background_reload();
             myself
                 .subscribe_to_pane_updates()
                 .context("subscribing new GUI window to mux pane updates")?;
+            // A pane title set before the subscription (a shell's OSC 2 at
+            // startup) raised its alert while no window listened, so read the
+            // titles once now: otherwise the window keeps its creation title
+            // until the next title change, which may never come.
+            myself.update_title();
             window.show();
             myself.emit_window_event("window-config-reloaded", None);
             myself.emit_status_event();
@@ -4887,6 +5064,7 @@ impl TermWindow {
             }
             WindowEvent::FocusChanged(focused) => {
                 self.focus_changed(focused, window);
+                self.post_metal_surface();
                 Ok(true)
             }
             WindowEvent::MouseEvent(event) => {
@@ -4903,6 +5081,7 @@ impl TermWindow {
                 live_resizing,
             } => {
                 self.resize(dimensions, window_state, window, live_resizing);
+                self.post_metal_surface();
                 Ok(true)
             }
             WindowEvent::SetInnerSizeCompleted => {
@@ -4964,7 +5143,7 @@ impl TermWindow {
                     None => return Ok(true),
                 };
                 if self.pane_input_ready(&pane) {
-                    pane.send_paste(text.as_str())?;
+                    send_paste_or_notify(&*pane, text.as_str());
                 }
                 Ok(true)
             }
@@ -4980,7 +5159,7 @@ impl TermWindow {
                     .join(" ")
                     + " ";
                 if self.pane_input_ready(&pane) {
-                    pane.send_paste(urls.as_str())?;
+                    send_paste_or_notify(&*pane, urls.as_str());
                 }
                 Ok(true)
             }
@@ -5000,7 +5179,7 @@ impl TermWindow {
                     .join(" ")
                     + " ";
                 if self.pane_input_ready(&pane) {
-                    pane.send_paste(&paths)?;
+                    send_paste_or_notify(&*pane, &paths);
                 }
                 Ok(true)
             }
@@ -5011,7 +5190,11 @@ impl TermWindow {
     fn paint_if_admitted(&mut self, window: &Window) -> anyhow::Result<bool> {
         match self.render_recovery_state.admit() {
             PaintAdmission::Admit => {
-                if self.webgpu.is_some() {
+                if self.metal_render.is_some() {
+                    Ok(self.publish_metal_frame())
+                } else if self.metal.is_some() {
+                    Ok(self.do_paint_metal())
+                } else if self.webgpu.is_some() {
                     self.do_paint_webgpu()
                 } else {
                     Ok(self.do_paint(window))
@@ -5057,6 +5240,359 @@ impl TermWindow {
         drop(self.render_state.take());
         drop(self.webgpu.take());
         drop(self.gl.take());
+        // The Metal renderer retains the view's CAMetalLayer; release it
+        // before the native window goes away too. A render thread owns its
+        // renderer: dropping the handle stops and joins the thread, which
+        // drops the renderer there (ft-yccm0.4.1.2). The panes' glyph caches
+        // share the main thread's renderer, so they go first.
+        drop(self.metal_render.take());
+        drop(std::mem::take(&mut self.metal_panes));
+        drop(self.metal.take());
+    }
+
+    /// Paints with the in-development Metal front end on the main thread
+    /// (no render thread): every visible pane in one render pass, then
+    /// presents.
+    fn do_paint_metal(&mut self) -> bool {
+        let Some(metal) = self.metal.as_ref().map(Rc::clone) else {
+            return false;
+        };
+        self.begin_metal_font_read();
+        let captured_generation = self.damage_generation;
+        let snapshot_path = self.claim_render_snapshot();
+        let dimensions = self.dimensions;
+        let width = u32::try_from(dimensions.pixel_width).unwrap_or(u32::MAX);
+        let height = u32::try_from(dimensions.pixel_height).unwrap_or(u32::MAX);
+        // ft-yccm0.4.4: each visible pane's changed rows, captured under one
+        // short terminal lock, rebuilt into its scene outside the lock; all
+        // the panes drawn in one render pass (ft-yccm0.4.6), as the render
+        // thread draws them.
+        let request = self.metal_frame_request();
+        let mut panes = std::mem::take(&mut self.metal_panes);
+        let mut deferred = None;
+        let outcome = panes.draw(
+            &request.panes,
+            &request.splits,
+            request
+                .chrome
+                .as_ref()
+                .map(metal_chrome::ChromeFrame::layer),
+            request.clear,
+            &self.fonts,
+            &self.render_metrics,
+            &metal,
+            |window, images_loading| {
+                let outcome = match window {
+                    Some(window) => metal.render_window(width, height, window),
+                    // ft-yccm0.4.2.1: the frame slots are sized for the grid.
+                    None => metal.render_clear(width, height, request.grid, request.clear),
+                };
+                if let (Ok(frankenterm_renderer_metal::FrameOutcome::Presented), Some(path)) =
+                    (&outcome, snapshot_path)
+                {
+                    // The panes are shaped now: a frame not final yet
+                    // re-arms, as the WebGpu snapshot does. An image cell
+                    // still decoding is polled by the panes' redraw time
+                    // (ft-yccm0.4.7.2).
+                    let mut readiness = self.render_snapshot_readiness();
+                    readiness.images_loading |= images_loading;
+                    if readiness.is_final() {
+                        write_metal_render_snapshot(
+                            &metal,
+                            &path,
+                            width,
+                            height,
+                            request.clear,
+                            window,
+                        );
+                    } else {
+                        deferred = Some(readiness);
+                    }
+                }
+                outcome
+            },
+        );
+        let blink_due = panes.redraw_at();
+        self.metal_panes = panes;
+        if let Some(readiness) = deferred {
+            self.defer_render_snapshot(readiness);
+        }
+        match outcome {
+            Ok(frankenterm_renderer_metal::FrameOutcome::Presented) => {
+                // The GUI's own presented-frame count and cap, which the
+                // throughput harness checks its FPS meter against
+                // (ft-yccm0.1.4), as the WebGpu paint records them.
+                let frames = frankenterm_alloc::resource_ledger::FrameLedger::global();
+                frames.set_max_fps(self.config.max_fps);
+                frames.record_present();
+                let settlement = apply_presented_render_attempt(
+                    &mut self.dirty_lines,
+                    self.damage_generation,
+                    &mut self.render_recovery_state,
+                    captured_generation,
+                );
+                metrics::counter!("gui.render.damage_settlement", "outcome" => settlement.label())
+                    .increment(1);
+                self.render_wake_state.cancel();
+                if settlement.needs_follow_up_paint() {
+                    if let Some(window) = self.window.as_ref() {
+                        window.invalidate();
+                    }
+                }
+            }
+            // Nothing to draw; keep the damage for the first sized frame.
+            // (No display link hands this path a drawable to outgrow.)
+            Ok(
+                frankenterm_renderer_metal::FrameOutcome::ZeroSize
+                | frankenterm_renderer_metal::FrameOutcome::DrawableResized,
+            ) => {}
+            Err(err) => {
+                // nextDrawable returns nil when its one-second wait expires,
+                // and a frame slot can stay busy past its wait while the GPU
+                // is behind: the same acquisition-timeout class as a wgpu
+                // surface timeout, so both share that bounded
+                // retry-then-park policy.
+                let stage = match err {
+                    frankenterm_renderer_metal::FrameError::DrawableUnavailable
+                    | frankenterm_renderer_metal::FrameError::FrameSlotTimeout { .. } => {
+                        RenderFailureStage::SurfaceAcquire(
+                            webgpu::WebGpuSurfaceTextureError::Timeout,
+                        )
+                    }
+                    _ => RenderFailureStage::Draw(DrawFailureStage::BackendDraw),
+                };
+                frankenterm_alloc::resource_ledger::FrameLedger::global().record_present_failure();
+                let failure = RenderAttemptFailure::new(
+                    stage,
+                    anyhow::Error::new(err).context("Metal frame"),
+                );
+                self.handle_render_failure(&failure);
+                log::warn!("Metal paint failed; retaining damage: {failure:#}");
+            }
+        }
+        // Blinking text, a blinking cursor and the visual bell's fade paint
+        // again when they next move, as the WebGpu paint schedules them
+        // (ft-yccm0.4.7.3).
+        self.schedule_metal_animation(blink_due);
+        true
+    }
+
+    /// The image-parity snapshot path, once, when the active pane's title is
+    /// the snapshot sentinel (ft-yccm0.1.10). Cheap when no snapshot was
+    /// requested.
+    pub(crate) fn claim_render_snapshot(&mut self) -> Option<std::path::PathBuf> {
+        self.render_snapshot.as_ref()?;
+        let title = self
+            .get_active_pane_or_overlay()
+            .map(|pane| pane.get_title());
+        match self.render_snapshot.as_mut()?.step(title.as_deref()) {
+            render_snapshot::SnapshotStep::Idle => None,
+            render_snapshot::SnapshotStep::Split(split) => {
+                self.split_for_render_snapshot(&split);
+                None
+            }
+            render_snapshot::SnapshotStep::Prepare {
+                focus,
+                selection,
+                modal,
+            } => {
+                self.prepare_render_snapshot(focus, selection, modal);
+                None
+            }
+            render_snapshot::SnapshotStep::Take(path) => Some(path),
+        }
+    }
+
+    /// Whether this frame, its shaping and quads built, is final for a
+    /// claimed render snapshot (ft-yccm0.1.10): no fallback font pending, a
+    /// settled window background, no image placeholder for a decoding first
+    /// frame (drawn now or in a cached line), and the requested modal open.
+    pub(crate) fn render_snapshot_readiness(&self) -> render_snapshot::SnapshotFrameReadiness {
+        render_snapshot::SnapshotFrameReadiness {
+            fonts_pending: self.fonts.fallback_resolves_in_flight() > 0
+                || self
+                    .fallback_invalidation_pending
+                    .load(std::sync::atomic::Ordering::Acquire),
+            background_loading: !self.background_load.is_settled(),
+            images_loading: self.image_poll_due.get().is_some(),
+            modal_pending: self
+                .render_snapshot
+                .as_ref()
+                .is_some_and(render_snapshot::RenderSnapshotRequest::wants_modal)
+                && self.get_modal().is_none(),
+        }
+    }
+
+    /// Returns a claimed snapshot whose frame was not final to pending. Font,
+    /// background and modal completions invalidate the window; a decoding
+    /// image is polled at its decoder's next due time.
+    pub(crate) fn defer_render_snapshot(
+        &mut self,
+        readiness: render_snapshot::SnapshotFrameReadiness,
+    ) {
+        if let Some(request) = self.render_snapshot.as_mut() {
+            request.rearm();
+        }
+        if let Some(due) = self.image_poll_due.get().filter(|_| readiness.needs_poll()) {
+            self.schedule_animation_wake(due);
+        }
+        log::info!("render snapshot deferred: {readiness:?}");
+    }
+
+    /// Splits the active pane for a render snapshot (ft-yccm0.1.10): the new
+    /// pane runs the scene's second command and becomes active.
+    fn split_for_render_snapshot(&mut self, split: &render_snapshot::SnapshotSplit) {
+        let spawn = SpawnCommand {
+            args: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                split.command.clone(),
+            ]),
+            ..SpawnCommand::default()
+        };
+        let direction = match split.direction {
+            render_snapshot::SnapshotSplitDirection::Right => SplitDirection::Horizontal,
+            render_snapshot::SnapshotSplitDirection::Bottom => SplitDirection::Vertical,
+        };
+        self.spawn_command(
+            &spawn,
+            SpawnWhere::SplitPane(SplitRequest {
+                direction,
+                target_is_second: true,
+                size: MuxSplitSize::Percent(50),
+                top_level: false,
+            }),
+        );
+    }
+
+    /// Sets up window state a render snapshot asked for (ft-yccm0.1.10),
+    /// then schedules the paint that takes the snapshot.
+    fn prepare_render_snapshot(
+        &mut self,
+        focus: bool,
+        selection: Option<render_snapshot::SnapshotSelection>,
+        modal: Option<render_snapshot::SnapshotModal>,
+    ) {
+        if focus && self.focused.is_none() {
+            // Only the window's own focus state changes: nothing is
+            // activated, so the operator keeps keyboard focus.
+            self.focused = Some(Instant::now());
+            self.invalidate_render_caches(RenderInvalidationCause::Focus);
+            self.mark_all_panes_dirty_with_source(
+                frankenterm_core::dirty_line_telemetry::DirtyEventSource::FocusChange,
+            );
+        }
+        if let Some(selection) = selection
+            && let Some(pane) = self.get_active_pane_or_overlay()
+        {
+            let top = pane.get_dimensions().physical_top;
+            let row = |visible: usize| {
+                top.saturating_add(StableRowIndex::try_from(visible).unwrap_or(StableRowIndex::MAX))
+            };
+            let start = crate::selection::SelectionCoordinate::x_y(
+                selection.start_col,
+                row(selection.start_row),
+            );
+            let end = crate::selection::SelectionCoordinate::x_y(
+                selection.end_col,
+                row(selection.end_row),
+            );
+            let authority = crate::selection::SelectionAuthority::capture(&*pane);
+            if authority.is_none() {
+                log::error!("render snapshot: the active pane cannot hold a selection");
+            }
+            self.update_selection(&pane, authority, |current| {
+                current.origin = Some(start);
+                current.range = Some(crate::selection::SelectionRange { start, end });
+                current.rectangular = false;
+            });
+        }
+        if let Some(modal) = modal {
+            // The key assignment a keypress performs (ft-yccm0.4.7.1), with
+            // default arguments.
+            let assignment = match modal {
+                render_snapshot::SnapshotModal::CharSelect => {
+                    KeyAssignment::CharSelect(config::keyassignment::CharSelectArguments::default())
+                }
+                render_snapshot::SnapshotModal::PaneSelect => {
+                    KeyAssignment::PaneSelect(config::keyassignment::PaneSelectArguments::default())
+                }
+                render_snapshot::SnapshotModal::CommandPalette => {
+                    KeyAssignment::ActivateCommandPalette
+                }
+            };
+            match self.get_active_pane_or_overlay() {
+                Some(pane) => {
+                    if let Err(err) = self.perform_key_assignment(&pane, &assignment) {
+                        log::error!("render snapshot: opening {modal:?} failed: {err:#}");
+                    }
+                }
+                None => log::error!("render snapshot: no active pane to open {modal:?} over"),
+            }
+        }
+        // ft-yccm0.4.7.3: an IME composition, as the input method's marked
+        // text sets it (AdviseDeadKeyStatus).
+        let compose = self
+            .render_snapshot
+            .as_ref()
+            .and_then(render_snapshot::RenderSnapshotRequest::compose)
+            .map(str::to_string);
+        if let Some(text) = compose {
+            self.dead_key_status = DeadKeyStatus::Composing(text);
+            self.record_render_invalidation(RenderInvalidationCause::Ime);
+        }
+        // A pinned blink changes the colors of lines cached at the live
+        // blink level until their next blink.
+        if self
+            .render_snapshot
+            .as_ref()
+            .and_then(render_snapshot::RenderSnapshotRequest::blink_level)
+            .is_some()
+        {
+            self.invalidate_render_caches(RenderInvalidationCause::Palette);
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+    }
+
+    /// A blink state's level and when it next moves
+    /// (`intensity_continuous`), or the level a render snapshot pins, which
+    /// does not move (ft-yccm0.4.7.3).
+    pub(crate) fn blink_intensity(&self, ease: &mut ColorEase) -> (f32, Instant) {
+        match self
+            .render_snapshot
+            .as_ref()
+            .and_then(render_snapshot::RenderSnapshotRequest::blink_level)
+        {
+            Some(level) => (level, Instant::now() + Duration::from_secs(3600)),
+            None => ease.intensity_continuous(),
+        }
+    }
+
+    /// The level a render snapshot pins every blink at, if it pins one.
+    pub(crate) fn snapshot_blink_level(&self) -> Option<f32> {
+        self.render_snapshot
+            .as_ref()
+            .and_then(render_snapshot::RenderSnapshotRequest::blink_level)
+    }
+
+    /// The window background exactly as the other front ends fill it: the
+    /// sole pane's palette background (else the window palette's), scaled by
+    /// `window_background_opacity`.
+    fn metal_clear_color(&mut self) -> frankenterm_renderer_metal::ClearColor {
+        let panes = self.get_panes_to_render();
+        let background = if panes.len() == 1 {
+            panes[0].pane.render_facts().palette.background
+        } else {
+            self.palette().background
+        };
+        frankenterm_renderer_metal::ClearColor::from_srgba(
+            background.0,
+            background.1,
+            background.2,
+            background.3 * self.config.window_background_opacity,
+        )
     }
 
     fn do_paint(&mut self, window: &Window) -> bool {
@@ -5107,6 +5643,35 @@ impl TermWindow {
             log::warn!("cannot paint webgpu frame before webgpu state is initialized");
             return Ok(false);
         };
+        // ft-yccm0.1.10: a due image-parity snapshot draws offscreen before
+        // any surface acquisition, so a hidden or occluded window (whose
+        // surface yields no drawable) still captures. That paint presents
+        // nothing and settles no damage; the next paint draws the window.
+        if let Some(path) = self.claim_render_snapshot() {
+            let target = {
+                let config = webgpu.config.borrow();
+                render_snapshot::SnapshotTarget::new(
+                    &webgpu.device,
+                    config.format,
+                    config.width,
+                    config.height,
+                    path,
+                )
+            };
+            match target {
+                Ok(target) => {
+                    if let Err(failure) = self.paint_impl(move |tw| {
+                        tw.call_draw_webgpu(render_snapshot::WebGpuDrawTarget::Snapshot(target))
+                            .map_err(RenderAttemptFailure::draw)
+                    }) {
+                        log::error!("render snapshot paint failed: {failure:#}");
+                    }
+                }
+                Err(err) => log::error!("render snapshot: {err:#}"),
+            }
+            return Ok(true);
+        }
+
         let dimensions = self.dimensions;
         let acquired = match Self::acquire_webgpu_frame_with_repair(&webgpu, dimensions) {
             Ok(acquired) => acquired,
@@ -5118,7 +5683,7 @@ impl TermWindow {
         };
 
         let outcome = match self.paint_impl(move |tw| {
-            tw.call_draw_webgpu(acquired)
+            tw.call_draw_webgpu(render_snapshot::WebGpuDrawTarget::Surface(acquired))
                 .map_err(RenderAttemptFailure::draw)
         }) {
             Ok(outcome) => outcome,
@@ -6446,6 +7011,7 @@ impl TermWindow {
             title_pending: pending_title_refresh,
             title: Arc::clone(&retained_title_refresh),
             wake: output_tx.clone(),
+            metal: Arc::clone(&self.metal_output_wake),
         };
         self.pane_cleanup.bind(&mux, output_tx.clone());
         let cleanup_dead = Arc::new(AtomicBool::new(false));
@@ -7273,6 +7839,9 @@ impl TermWindow {
             .update_capacity(config.gui_retained_pane_state_limit);
         self.refresh_frame_budget_reduce_motion_state();
         self.palette.take();
+        if let Some(render) = &self.metal_render {
+            render.set_min_frame_interval(self.frame_interval());
+        }
 
         let Some(mux) = self.mux_or_log("reload GUI configuration") else {
             return;
@@ -7757,8 +8326,11 @@ impl TermWindow {
 
     fn update_text_cursor(&mut self, pos: &PositionedPane) {
         if let Some(win) = self.window.as_ref() {
-            let cursor = pos.pane.get_cursor_position();
-            let top = pos.pane.get_dimensions().physical_top;
+            // Paint calls this every frame for the active pane: read the
+            // published facts, never the terminal (ft-yccm0.2.2.3).
+            let facts = pos.pane.render_facts();
+            let cursor = facts.cursor;
+            let top = facts.dimensions.physical_top;
             let tab_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
                 self.tab_bar_pixel_height().unwrap_or(0.0)
             } else {
@@ -11342,7 +11914,7 @@ mod tests {
         for _ in 0..100 {
             assert_eq!(
                 recovery.record_failure(super::RenderFailureStage::NativeFramePending),
-                super::RenderRecoveryDirective::RetryAfter(std::time::Duration::from_millis(16))
+                super::RenderRecoveryDirective::RetryNextFrame
             );
             assert_eq!(recovery.failed_attempts_since_success, failures);
         }
@@ -12345,6 +12917,7 @@ mod tests {
             title_pending: Arc::new(AtomicBool::new(false)),
             title: Arc::new(Mutex::new(None)),
             wake,
+            metal: Arc::default(),
         };
         let seen = Arc::new(AtomicUsize::new(0));
         let callback_seen = Arc::clone(&seen);
@@ -13145,6 +13718,7 @@ mod tests {
             title_pending: Arc::new(AtomicBool::new(false)),
             title: Arc::clone(&retained_title),
             wake,
+            metal: Arc::default(),
         };
         let retained_window = mux.resolve_pane_id(first.pane_id()).unwrap().1;
         assert_eq!(

@@ -19,6 +19,7 @@ use frankenterm_gui::headless_render::{
     HeadlessCursor, HeadlessFixtureInput, HeadlessFrame, HeadlessMonitor, HeadlessRenderError,
     HeadlessSelection, HeadlessViewport, render_headless, smoketest_input,
 };
+use frankenterm_gui::render_corpus::{self, FontFileIdentity, SceneSpec};
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ColorType, ImageEncoder, ImageReader, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
@@ -30,7 +31,6 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-#[cfg(feature = "headless-render")]
 use std::time::Duration;
 use std::time::Instant;
 
@@ -99,6 +99,26 @@ struct InputSpec {
     cursor_blink_disabled: bool,
     #[serde(default = "default_true")]
     ime_disabled: bool,
+    /// `gui_snapshot` fixtures: the scene played into the real GUI.
+    #[serde(default)]
+    scene: Option<SceneSpec>,
+    /// `gui_snapshot` fixtures: compare against this other fixture's golden
+    /// (cross-backend parity, such as Metal against WebGpu on one scene).
+    /// Such a fixture never pins a golden of its own, so `--update-goldens`
+    /// cannot bless one backend's output as parity with itself. The named
+    /// fixture must sort before this one so an update pins it first.
+    #[serde(default)]
+    parity_golden: Option<String>,
+    /// `gui_snapshot` fixtures: also measure the render against this other
+    /// fixture's golden, the one a rasterizer change replaces (a CoreText
+    /// scene against its FreeType twin, ft-yccm0.4.3.1). The fixture still
+    /// pins and is gated on its own golden; this comparison is reported under
+    /// `reference` and fails the fixture only when the mean SSIM falls below
+    /// `reference_min_ssim`, the documented tolerance.
+    #[serde(default)]
+    reference_golden: Option<String>,
+    #[serde(default)]
+    reference_min_ssim: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,11 +137,15 @@ struct ResizeFrameSpec {
     dpi: f64,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum InputKind {
     StaticPngRoundtrip,
     HeadlessTerminal,
+    /// The real `frankenterm-gui` renderer, snapshotted through its
+    /// `FRANKENTERM_RENDER_SNAPSHOT` hook (ft-yccm0.1.10). Needs a display;
+    /// runs only when selected by name or `FT_GPU_HARNESS_REAL_RENDERER=1`.
+    GuiSnapshot,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,6 +197,13 @@ struct FixtureMeta {
     generated_at_runner: String,
     #[serde(default)]
     thresholds: Thresholds,
+    /// `gui_snapshot` goldens: every font file the scene could resolve, with
+    /// its SHA-256, so a font change is an explained delta.
+    #[serde(default)]
+    font_files: Vec<FontFileIdentity>,
+    /// `gui_snapshot` goldens: the rasterizer and renderer that drew them.
+    #[serde(default)]
+    rasterizer: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -578,7 +609,7 @@ fn run_fuzz(flags: &FuzzCliFlags) -> Result<(), Box<dyn std::error::Error>> {
         let elapsed = started.elapsed();
         let stop_after_event = elapsed >= duration && event_index > u64::from(start_at);
         if event_index == u64::from(start_at)
-            || event_index % FUZZ_FRAME_INTERVAL_EVENTS == 0
+            || event_index.is_multiple_of(FUZZ_FRAME_INTERVAL_EVENTS)
             || stop_after_event
         {
             let mut context = FuzzRunContext {
@@ -758,6 +789,16 @@ fn run_fixtures(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         fixtures.retain(|fixture| fixture.input.kind == InputKind::StaticPngRoundtrip);
     }
     let unavailable_without_renderer = before_feature_filter - fixtures.len();
+    // Real-renderer scenes launch the GUI and need a display, so an
+    // unfiltered run includes them only on request.
+    let before_real_renderer_filter = fixtures.len();
+    if args.fixture_filters.is_empty()
+        && !env_fixture_filter_present()
+        && !real_renderer_requested()
+    {
+        fixtures.retain(|fixture| fixture.input.kind != InputKind::GuiSnapshot);
+    }
+    let real_renderer_skipped = before_real_renderer_filter - fixtures.len();
     let filtered_out = discovered_count - fixtures.len();
 
     emit_json(json!({
@@ -766,6 +807,7 @@ fn run_fixtures(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         "count": fixtures.len(),
         "filtered_out": filtered_out,
         "unavailable_without_renderer": unavailable_without_renderer,
+        "real_renderer_skipped": real_renderer_skipped,
         "headless_render_enabled": cfg!(feature = "headless-render"),
     }));
     if fixtures.is_empty() {
@@ -779,6 +821,7 @@ fn run_fixtures(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut passed = 0usize;
     let mut failed = 0usize;
     let mut perf_entries: Vec<PerfEntry> = Vec::with_capacity(fixtures.len());
+    let mut receipt_rows = Vec::with_capacity(fixtures.len());
 
     for fixture in fixtures {
         emit_json(json!({
@@ -793,20 +836,50 @@ fn run_fixtures(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         let actual = render_outcome.image;
 
         if args.update_goldens {
-            write_png_deterministic(&fixture.dir.join("golden.png"), &actual)?;
+            if fixture.input.parity_golden.is_none() {
+                write_png_deterministic(&fixture.dir.join("golden.png"), &actual)?;
+            }
+            if fixture.input.kind == InputKind::GuiSnapshot {
+                write_gui_snapshot_meta(
+                    &fixture,
+                    &actual,
+                    render_outcome.renderer_info.as_deref(),
+                )?;
+            }
         }
 
-        let golden = load_png_rgba8(&fixture.dir.join("golden.png"))?;
+        let golden = load_png_rgba8(&golden_path(&root, &fixture)?)?;
         let compare_start = Instant::now();
         let comparison = compare_images(&actual, &golden, fixture.meta.thresholds)?;
+        let reference = reference_check(&root, &fixture, &actual)?;
         let compare_ms = compare_start.elapsed().as_millis();
-        let status = if comparison.passed { "pass" } else { "fail" };
+        let reference_passed = reference.as_ref().is_none_or(|check| check.result.passed);
+        let status = if comparison.passed && reference_passed {
+            "pass"
+        } else {
+            "fail"
+        };
+        let explained_delta = gui_snapshot_explained_delta(&fixture);
+        let reference_report = reference.as_ref().map(ReferenceCheck::report);
 
-        if comparison.passed && fixture.expected.status == ExpectedStatus::Pass {
+        let mut heatmap = None;
+        if status == "pass" && fixture.expected.status == ExpectedStatus::Pass {
             passed += 1;
         } else {
             failed += 1;
-            write_failure_artifacts(&artifact_root, &fixture, &actual, &comparison)?;
+            // The artifacts show the failing comparison: the fixture's own
+            // golden first, else its reference.
+            let shown = match &reference {
+                Some(check) if comparison.passed => &check.result,
+                _ => &comparison,
+            };
+            heatmap = Some(write_failure_artifacts(
+                &artifact_root,
+                &fixture,
+                &actual,
+                shown,
+                explained_delta.as_ref(),
+            )?);
         }
 
         let elapsed_ms = fixture_start.elapsed().as_millis();
@@ -817,10 +890,28 @@ fn run_fixtures(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             "compare_ms": compare_ms,
             "elapsed_ms": elapsed_ms,
             "ssim": comparison.metrics.ssim,
+            "min_window_ssim": comparison.metrics.min_window_ssim,
+            "worst_window": comparison.metrics.worst_window,
             "linf": comparison.metrics.l_inf,
+            "channel_max_delta": comparison.metrics.channel_max_delta,
             "changed_pixels": comparison.metrics.changed_pixels,
             "changed_pixel_fraction": comparison.metrics.changed_pixel_fraction,
+            "heatmap": heatmap,
+            "explained_delta": explained_delta,
+            "reference": reference_report,
             "status": status,
+        }));
+        receipt_rows.push(json!({
+            "fixture": fixture.name,
+            "kind": fixture.input.kind,
+            "status": status,
+            "metrics": comparison.metrics,
+            "heatmap": heatmap,
+            "renderer": render_outcome.renderer_info,
+            "font_set_sha": fixture.meta.font_set_sha,
+            "rasterizer": fixture.meta.rasterizer,
+            "explained_delta": explained_delta,
+            "reference": reference_report,
         }));
 
         perf_entries.push(PerfEntry {
@@ -834,12 +925,28 @@ fn run_fixtures(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    let receipt_path = artifact_root.join("parity-receipt.json");
+    fs::create_dir_all(&artifact_root)?;
+    fs::write(
+        &receipt_path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&json!({
+                "schema_version": "ft.render-parity-receipt.v1",
+                "root": root,
+                "passed": passed,
+                "failed": failed,
+                "fixtures": receipt_rows,
+            }))?
+        ),
+    )?;
     emit_json(json!({
         "phase": "summary",
         "total": passed + failed,
         "passed": passed,
         "failed": failed,
         "filtered_out": filtered_out,
+        "receipt": receipt_path,
     }));
 
     let perf_report = build_perf_report(perf_entries);
@@ -1147,6 +1254,8 @@ struct RenderOutcome {
     glyphs_cached: Option<u64>,
     fonts_loaded: Option<u64>,
     texture_format: Option<String>,
+    /// `gui_snapshot`: the GUI's own `Renderer initialized:` line.
+    renderer_info: Option<String>,
 }
 
 fn render_fixture(fixture: &Fixture) -> Result<RenderOutcome, Box<dyn std::error::Error>> {
@@ -1181,10 +1290,213 @@ fn render_fixture(fixture: &Fixture) -> Result<RenderOutcome, Box<dyn std::error
                 glyphs_cached: None,
                 fonts_loaded: None,
                 texture_format: None,
+                renderer_info: None,
             })
         }
         InputKind::HeadlessTerminal => render_headless_fixture(fixture),
+        InputKind::GuiSnapshot => render_gui_snapshot_fixture(fixture),
     }
+}
+
+/// Real-renderer scene timeout: GUI start-up, the scene and the readback.
+const GUI_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Renders a `gui_snapshot` fixture through the real `frankenterm-gui`
+/// binary (`FT_GPU_HARNESS_GUI_BIN` overrides the Cargo-built one).
+/// The rasterizer identity a `gui_snapshot` fixture's golden records: its
+/// scene's (`render_corpus::rasterizer_identity`).
+fn fixture_rasterizer_identity(fixture: &Fixture) -> String {
+    fixture.input.scene.as_ref().map_or_else(
+        || render_corpus::RASTERIZER_IDENTITY.to_string(),
+        render_corpus::rasterizer_identity,
+    )
+}
+
+/// A `reference_golden` fixture's measurement against that golden.
+struct ReferenceCheck {
+    fixture: String,
+    min_ssim: f64,
+    result: CompareResult,
+}
+
+impl ReferenceCheck {
+    fn report(&self) -> serde_json::Value {
+        json!({
+            "fixture": self.fixture,
+            "min_ssim": self.min_ssim,
+            "passed": self.result.passed,
+            "ssim": self.result.metrics.ssim,
+            "min_window_ssim": self.result.metrics.min_window_ssim,
+            "linf": self.result.metrics.l_inf,
+            "changed_pixel_fraction": self.result.metrics.changed_pixel_fraction,
+        })
+    }
+}
+
+/// Measures `actual` against the fixture's `reference_golden`, if it names
+/// one: only the mean SSIM floor `reference_min_ssim` decides.
+fn reference_check(
+    root: &Path,
+    fixture: &Fixture,
+    actual: &RgbaImage,
+) -> Result<Option<ReferenceCheck>, Box<dyn std::error::Error>> {
+    let input = &fixture.input;
+    let Some(name) = &input.reference_golden else {
+        if input.reference_min_ssim.is_some() {
+            return Err(format!(
+                "`{}`: reference_min_ssim needs reference_golden",
+                fixture.name
+            )
+            .into());
+        }
+        return Ok(None);
+    };
+    if name.split('/').any(|part| part.is_empty() || part == "..") || *name == fixture.name {
+        return Err(format!("`{}`: bad reference_golden {name:?}", fixture.name).into());
+    }
+    if input.parity_golden.is_some() {
+        return Err(format!(
+            "`{}`: parity_golden and reference_golden exclude each other",
+            fixture.name
+        )
+        .into());
+    }
+    let min_ssim = input
+        .reference_min_ssim
+        .filter(|floor| (0.0..=1.0).contains(floor))
+        .ok_or_else(|| {
+            format!(
+                "`{}`: reference_golden needs reference_min_ssim in [0, 1]",
+                fixture.name
+            )
+        })?;
+    let reference = load_png_rgba8(&root.join(name).join("golden.png"))?;
+    let thresholds = Thresholds {
+        min_ssim,
+        max_l_inf: u8::MAX,
+        max_changed_pixel_fraction: 1.0,
+        min_window_ssim: 0.0,
+    };
+    let result = compare_images(actual, &reference, thresholds)?;
+    Ok(Some(ReferenceCheck {
+        fixture: name.clone(),
+        min_ssim,
+        result,
+    }))
+}
+
+/// The golden a fixture is compared against: its own, or the
+/// `parity_golden` fixture's.
+fn golden_path(root: &Path, fixture: &Fixture) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    match &fixture.input.parity_golden {
+        None => Ok(fixture.dir.join("golden.png")),
+        Some(name) => {
+            if name.split('/').any(|part| part.is_empty() || part == "..") {
+                return Err(format!("`{}`: bad parity_golden {name:?}", fixture.name).into());
+            }
+            if name.as_str() >= fixture.name.as_str() {
+                return Err(format!(
+                    "`{}`: parity_golden {name:?} must sort before it",
+                    fixture.name
+                )
+                .into());
+            }
+            Ok(root.join(name).join("golden.png"))
+        }
+    }
+}
+
+fn render_gui_snapshot_fixture(
+    fixture: &Fixture,
+) -> Result<RenderOutcome, Box<dyn std::error::Error>> {
+    let scene = fixture
+        .input
+        .scene
+        .as_ref()
+        .ok_or("gui_snapshot requires input.scene")?;
+    let gui_bin = env::var_os("FT_GPU_HARNESS_GUI_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_frankenterm-gui")));
+    let work_dir = artifact_root().join("gui-snapshot").join(&fixture.name);
+    let snapshot = render_corpus::render_scene_snapshot(
+        &gui_bin,
+        &workspace_root(),
+        scene,
+        &work_dir,
+        GUI_SNAPSHOT_TIMEOUT,
+    )
+    .map_err(|err| format!("gui_snapshot `{}`: {err:#}", fixture.name))?;
+    emit_json(json!({
+        "phase": "render-frame",
+        "name": fixture.name,
+        "kind": "gui_snapshot",
+        "ms": snapshot.elapsed.as_millis(),
+        "width": snapshot.image.width(),
+        "height": snapshot.image.height(),
+        "renderer": snapshot.renderer_info,
+        "work_dir": work_dir,
+    }));
+    Ok(RenderOutcome {
+        image: snapshot.image,
+        glyphs_cached: None,
+        fonts_loaded: None,
+        texture_format: None,
+        renderer_info: snapshot.renderer_info,
+    })
+}
+
+/// Rewrites a `gui_snapshot` fixture's `meta.json` for a freshly pinned
+/// golden: its size, DPI, font identity and renderer, keeping thresholds.
+fn write_gui_snapshot_meta(
+    fixture: &Fixture,
+    golden: &RgbaImage,
+    renderer_info: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fonts = render_corpus::font_identity(&workspace_root())?;
+    let dpi = fixture
+        .input
+        .scene
+        .as_ref()
+        .and_then(|scene| scene.config.get("dpi"))
+        .and_then(serde_json::Value::as_f64)
+        .or_else(|| render_corpus::base_config()["dpi"].as_f64())
+        .unwrap_or(fixture.meta.viewport.dpi);
+    let meta = json!({
+        "fixture": fixture.name,
+        "viewport": {"width": golden.width(), "height": golden.height(), "dpi": dpi},
+        "texture_format": "presented surface (RGBA8 readback)",
+        "font_set_sha": render_corpus::font_set_sha(&fonts),
+        "harness_version": HARNESS_VERSION,
+        "generated_at_runner": renderer_info.unwrap_or("frankenterm-gui (renderer line not logged)"),
+        "rasterizer": fixture_rasterizer_identity(fixture),
+        "font_files": fonts,
+        "thresholds": fixture.meta.thresholds,
+    });
+    fs::write(
+        fixture.dir.join("meta.json"),
+        format!("{}\n", serde_json::to_string_pretty(&meta)?),
+    )?;
+    Ok(())
+}
+
+/// Why a `gui_snapshot` golden may legitimately differ now: font files whose
+/// content changed since it was pinned, or a different rasterizer.
+fn gui_snapshot_explained_delta(fixture: &Fixture) -> Option<serde_json::Value> {
+    if fixture.input.kind != InputKind::GuiSnapshot {
+        return None;
+    }
+    let current = render_corpus::font_identity(&workspace_root()).ok()?;
+    let font_changes = render_corpus::font_identity_changes(&fixture.meta.font_files, &current);
+    let current_rasterizer = fixture_rasterizer_identity(fixture);
+    let rasterizer_changed =
+        fixture.meta.rasterizer.as_deref() != Some(current_rasterizer.as_str());
+    Some(json!({
+        "font_changes": font_changes,
+        "golden_rasterizer": fixture.meta.rasterizer,
+        "current_rasterizer": current_rasterizer,
+        "rasterizer_changed": rasterizer_changed,
+        "explained": !font_changes.is_empty() || rasterizer_changed,
+    }))
 }
 
 #[cfg(feature = "headless-render")]
@@ -1295,6 +1607,7 @@ fn render_headless_fixture(fixture: &Fixture) -> Result<RenderOutcome, Box<dyn s
         glyphs_cached,
         fonts_loaded,
         texture_format,
+        renderer_info: None,
     })
 }
 
@@ -1850,12 +2163,15 @@ fn fuzz_host() -> String {
         .unwrap_or_else(|_| format!("local-{}", env::consts::OS))
 }
 
+/// Writes the actual frame, binary diff, delta heatmap and report for a
+/// failed fixture; returns the heatmap path.
 fn write_failure_artifacts(
     artifact_root: &Path,
     fixture: &Fixture,
     actual: &RgbaImage,
     comparison: &CompareResult,
-) -> Result<(), Box<dyn std::error::Error>> {
+    explained_delta: Option<&serde_json::Value>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     fs::create_dir_all(artifact_root)?;
     write_png_deterministic(
         &artifact_root.join(format!("{}.actual.png", fixture.name)),
@@ -1865,16 +2181,20 @@ fn write_failure_artifacts(
         &artifact_root.join(format!("{}.diff.png", fixture.name)),
         &comparison.diff,
     )?;
+    let heatmap = artifact_root.join(format!("{}.heatmap.png", fixture.name));
+    write_png_deterministic(&heatmap, &comparison.heatmap)?;
     let report = json!({
         "fixture": fixture.name,
         "status": "fail",
         "metrics": comparison.metrics,
+        "heatmap": heatmap,
+        "explained_delta": explained_delta,
     });
     fs::write(
         artifact_root.join(format!("{}.report.json", fixture.name)),
         format!("{}\n", serde_json::to_string_pretty(&report)?),
     )?;
-    Ok(())
+    Ok(heatmap)
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, Box<dyn std::error::Error>> {
@@ -2006,6 +2326,12 @@ fn fixture_filter(arg_filters: &[String]) -> Option<Vec<String>> {
     } else {
         Some(fixtures)
     }
+}
+
+/// `FT_GPU_HARNESS_REAL_RENDERER=1` adds the `gui_snapshot` scenes to an
+/// unfiltered run (they launch the GUI, so they need a display).
+fn real_renderer_requested() -> bool {
+    env::var("FT_GPU_HARNESS_REAL_RENDERER").is_ok_and(|value| value == "1")
 }
 
 fn env_fixture_filter_present() -> bool {

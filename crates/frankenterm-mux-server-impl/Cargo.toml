@@ -26,6 +26,7 @@ clap.workspace = true
 codec = { workspace = true, default-features = false, features = ["async-asupersync"] }
 config.workspace = true
 dns-lookup.workspace = true
+frankenterm-alloc.workspace = true
 frankenterm-core = { workspace = true, default-features = false, features = ["frankenterm-deps"] }
 frankenterm-core-audit-types = { path = "../frankenterm-core-audit-types" }
 frankenterm-flight-recorder = { path = "../frankenterm-flight-recorder" }
@@ -42,6 +43,7 @@ metrics.workspace = true
 mux.workspace = true
 portable-pty = { workspace=true, features = ["serde_support"]}
 parking_lot.workspace = true
+procinfo = { path = "../../frankenterm/procinfo", default-features = false }
 promise.workspace = true
 rangeset.workspace = true
 rcgen.workspace = true
@@ -72,8 +74,26 @@ winapi = { workspace=true, features = [ "winuser" ]}
 criterion = { workspace = true }
 proptest = "1.8.0"
 
+# ft-yccm0.2.1.4: tests/scrollback_row_arena_alloc.rs counts allocations with
+# jemalloc's per-thread counter. frankenterm-alloc installs jemalloc as the
+# global allocator, as the ft and mux-server binaries do; a test-local one
+# would collide with it in workspace builds, which unify that feature.
+# jemalloc's sys crate does not build on windows-msvc (ft-p9hok), so these
+# deps and that test skip Windows.
+[target.'cfg(not(windows))'.dev-dependencies]
+frankenterm-alloc = { workspace = true, features = ["jemalloc"] }
+tikv-jemalloc-ctl.workspace = true
+
 [[bench]]
 name = "dispatch_throughput"
+harness = false
+
+[[bench]]
+name = "scrollback_record_encode"
+harness = false
+
+[[bench]]
+name = "scrollback_cold_read"
 harness = false
 
 [lints]

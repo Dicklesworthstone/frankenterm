@@ -7215,9 +7215,12 @@ mod tests {
         config::set_scrollback_spill_sink_factory(Some(Arc::new(move |context| {
             let sink = crate::LiveScrollbackSpillSink::new(scrollback_directory.clone(), &context)
                 .expect("initialize real domain scrollback storage");
-            let sink = crate::deferred_scrollback::DeferredScrollbackSpillSink::new(Arc::new(sink))
-                .expect("initialize real domain deferred scrollback storage");
-            Some(Arc::new(sink))
+            let sink = crate::deferred_scrollback::DeferredScrollbackSpillSink::new(
+                Arc::new(sink),
+                context.durable_pane_id,
+            )
+            .expect("initialize real domain deferred scrollback storage");
+            Some(sink)
         })));
         let broker_dir = directory.join("broker");
         let spawn_catalog = broker_dir.join("spawn-catalog");

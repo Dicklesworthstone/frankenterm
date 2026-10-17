@@ -3,6 +3,7 @@ use crate::termwindow::{DamageGeneration, RenderAttemptFailure};
 use ::window::WindowOps;
 use ::window::bitmaps::atlas::{AtlasAllocationFailure, OutOfTextureSpace};
 use anyhow::Context;
+use frankenterm_alloc::resource_ledger::FrameLedger;
 use frankenterm_core::frame_budget_a11y_gate::ReduceMotionState;
 use frankenterm_font::ClearShapeCache;
 use std::time::{Duration, Instant};
@@ -31,11 +32,72 @@ struct PostPresentWork {
     animation_due: Option<Instant>,
     should_schedule_animation: bool,
     should_force_frame_budget_paint: bool,
+    /// When to poll for an image still drawn as a placeholder while its first
+    /// frame decodes (`TermWindow::image_poll_due`).
+    image_poll_due: Option<Instant>,
+}
+
+impl PostPresentWork {
+    /// When to wake for the next frame. Animations run only in a focused
+    /// window and within the frame budget. An image whose first frame is
+    /// still decoding is not motion: it is polled until it shows, focused or
+    /// not, because a finished decode wakes nothing and the image would
+    /// otherwise stay a transparent placeholder until an unrelated repaint.
+    fn animation_wake(self, focused: bool) -> Option<Instant> {
+        let animation = self
+            .animation_due
+            .filter(|_| focused && self.should_schedule_animation);
+        match (animation, self.image_poll_due) {
+            (Some(animation), Some(image)) => Some(animation.min(image)),
+            (animation, image) => animation.or(image),
+        }
+    }
 }
 
 const MAX_PAINT_PASSES: usize = 16;
 
+/// The image poll deadline after noting an image still loading, due to be
+/// polled at `due`: the latest pending one. A line cached with a placeholder
+/// expires no later than its image's deadline, so only once the latest has
+/// passed has every such line expired; keeping an earlier one would let a
+/// paint between the two settle on a line still cached with its placeholder.
+/// A known deadline that has already passed was for lines that expire and
+/// render again, noting their images afresh, so it is replaced.
+fn noted_image_poll_due(known: Option<Instant>, due: Instant, now: Instant) -> Instant {
+    match known {
+        Some(known) if known > now => known.max(due),
+        _ => due,
+    }
+}
+
+/// The image poll deadline that survives into a paint pass starting at
+/// `now`. A passed deadline is dropped: every line cached with a placeholder
+/// due by then has expired and renders again in this pass.
+fn surviving_image_poll_due(known: Option<Instant>, now: Instant) -> Option<Instant> {
+    known.filter(|due| *due > now)
+}
+
 impl crate::TermWindow {
+    /// Records an image drawn in this paint pass by its cache load state and
+    /// next due time: `Loading` means the frame holds a transparent
+    /// placeholder while the image's first frame decodes on a worker, to be
+    /// polled at `next_due` (or the next paint when the cache names none).
+    pub(crate) fn note_image_load_state(
+        &self,
+        load_state: crate::glyphcache::LoadState,
+        next_due: Option<Instant>,
+    ) {
+        if load_state == crate::glyphcache::LoadState::Loading {
+            let now = Instant::now();
+            let due = next_due.unwrap_or(now);
+            self.image_poll_due.set(Some(noted_image_poll_due(
+                self.image_poll_due.get(),
+                due,
+                now,
+            )));
+        }
+    }
+
     pub(crate) fn paint_impl<P>(&mut self, present: P) -> Result<PaintOutcome, RenderAttemptFailure>
     where
         P: FnOnce(&mut Self) -> Result<(), RenderAttemptFailure>,
@@ -84,8 +146,11 @@ impl crate::TermWindow {
             }
         }
 
+        // Paint passes this frame takes, retries included (ft-yccm0.2.6).
+        let mut passes = 0u64;
         let geometry_result = 'pass: {
             for pass in 0..MAX_PAINT_PASSES {
+                passes += 1;
                 let _dirty_quad_budget = self.frame_budget_should_run_render_op_with_reduce_motion(
                     OpKind::DirtyQuadRebuild,
                     OpPriority::Required,
@@ -139,8 +204,6 @@ impl crate::TermWindow {
                                 log::trace!("grow texture atlas to {}", size);
                                 self.recreate_texture_atlas(Some(size))
                             };
-                            self.invalidate_fancy_tab_bar();
-                            self.invalidate_modal();
 
                             if let Err(err) = result {
                                 self.allow_images = match self.allow_images {
@@ -182,28 +245,37 @@ impl crate::TermWindow {
                 "paint did not converge within {MAX_PAINT_PASSES} passes"
             ));
         };
+        FrameLedger::global().record_paint_passes(passes);
 
         let present_result = geometry_result
             .map_err(RenderAttemptFailure::paint)
             .and_then(|()| {
                 log::debug!("paint_impl before call_draw elapsed={:?}", start.elapsed());
                 let damage_generation = self.damage_generation();
-                present(self).map(|()| {
-                    // Sample immediately after successful backend acceptance,
-                    // before bookkeeping or log delivery can delay observation.
-                    // The optional diagnostic never substitutes for SCK pixels.
-                    let submission_mach_ns = if log::log_enabled!(
-                        target: "frankenterm_gui::native_present_profile",
-                        log::Level::Debug
-                    ) {
-                        self.webgpu
-                            .as_ref()
-                            .and_then(|state| state.native_submission_mach_ns())
-                    } else {
-                        None
-                    };
-                    (damage_generation, submission_mach_ns)
-                })
+                present(self)
+                    .inspect_err(|_| FrameLedger::global().record_present_failure())
+                    .map(|()| {
+                        // Sample immediately after successful backend acceptance,
+                        // before bookkeeping or log delivery can delay observation.
+                        // The optional diagnostic never substitutes for SCK pixels.
+                        let submission_mach_ns = if log::log_enabled!(
+                            target: "frankenterm_gui::native_present_profile",
+                            log::Level::Debug
+                        ) {
+                            self.webgpu
+                                .as_ref()
+                                .and_then(|state| state.native_submission_mach_ns())
+                        } else {
+                            None
+                        };
+                        // ft-yccm0.1.4: the GUI's own presented-frame count and
+                        // cap, which the throughput harness checks its
+                        // screen-capture FPS meter against.
+                        let frames = FrameLedger::global();
+                        frames.set_max_fps(self.config.max_fps);
+                        frames.record_present();
+                        (damage_generation, submission_mach_ns)
+                    })
             });
 
         // Scheduling the next animation frame is cosmetic: reduce-motion
@@ -233,6 +305,7 @@ impl crate::TermWindow {
         if let Some(state) = self.render_state.as_mut() {
             state.observe_quad_frame(Instant::now(), present_result.is_ok());
         }
+        self.report_cache_gauges(Instant::now());
         present_result.map(|(damage_generation, submission_mach_ns)| PaintOutcome {
             damage_generation,
             submission_mach_ns,
@@ -240,6 +313,7 @@ impl crate::TermWindow {
                 animation_due,
                 should_schedule_animation,
                 should_force_frame_budget_paint,
+                image_poll_due: self.image_poll_due.get(),
             },
         })
     }
@@ -325,10 +399,8 @@ impl crate::TermWindow {
             }
         }
 
-        if self.focused.is_some() && outcome.post_present.should_schedule_animation {
-            if let Some(next_due) = outcome.post_present.animation_due {
-                self.schedule_animation_wake(next_due);
-            }
+        if let Some(next_due) = outcome.post_present.animation_wake(self.focused.is_some()) {
+            self.schedule_animation_wake(next_due);
         }
     }
 
@@ -337,11 +409,7 @@ impl crate::TermWindow {
             for computed in modal.computed_element(self)?.iter() {
                 let mut ui_items = computed.ui_items();
 
-                let gl_state = self
-                    .render_state
-                    .as_ref()
-                    .context("render state is not initialized")?;
-                self.render_element(&computed, gl_state, None)?;
+                self.render_element(&computed, self.chrome()?, None)?;
 
                 self.ui_items.append(&mut ui_items);
             }
@@ -356,6 +424,10 @@ impl crate::TermWindow {
         for state in self.pane_state.borrow_mut().values_mut() {
             state.selection_frame.begin_attempt();
         }
+        self.image_poll_due.set(surviving_image_poll_due(
+            self.image_poll_due.get(),
+            Instant::now(),
+        ));
         {
             let gl_state = self
                 .render_state
@@ -407,7 +479,9 @@ impl crate::TermWindow {
                     .find(|p| p.is_active)
                     .map(|p| match self.get_viewport(p.pane.pane_id()) {
                         Some(top) => top,
-                        None => p.pane.get_dimensions().physical_top,
+                        // Published facts: paint never waits for the
+                        // terminal (ft-yccm0.2.2.3).
+                        None => p.pane.render_facts().dimensions.physical_top,
                     })
                     .unwrap_or(0);
 
@@ -437,7 +511,7 @@ impl crate::TermWindow {
             let background = if panes.len() == 1 {
                 // If we're the only pane, use the pane's palette
                 // to draw the padding background
-                panes[0].pane.palette().background
+                panes[0].pane.render_facts().palette.background
             } else {
                 self.palette().background
             }
@@ -507,5 +581,95 @@ impl crate::TermWindow {
         self.paint_modal().context("paint_modal")?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn work(
+        animation_due: Option<Instant>,
+        schedule: bool,
+        image_poll_due: Option<Instant>,
+    ) -> PostPresentWork {
+        PostPresentWork {
+            animation_due,
+            should_schedule_animation: schedule,
+            should_force_frame_budget_paint: false,
+            image_poll_due,
+        }
+    }
+
+    #[test]
+    fn the_image_poll_deadline_is_the_latest_pending_one() {
+        let now = Instant::now();
+        let ms = |n| now + Duration::from_millis(n);
+        assert_eq!(noted_image_poll_due(None, ms(16), now), ms(16));
+        // Two placeholders noted in one paint (a sixel row, then an iTerm2
+        // row a few ms later): a wake at the earlier deadline would find the
+        // later row still cached with its placeholder.
+        assert_eq!(noted_image_poll_due(Some(ms(16)), ms(19), now), ms(19));
+        assert_eq!(noted_image_poll_due(Some(ms(19)), ms(16), now), ms(19));
+        // A passed deadline belongs to lines that render again; a line that
+        // just noted its image afresh must not be hidden behind it.
+        assert_eq!(noted_image_poll_due(Some(now), ms(16), now), ms(16));
+        assert_eq!(noted_image_poll_due(Some(ms(5)), ms(16), ms(6)), ms(16));
+    }
+
+    #[test]
+    fn the_image_poll_deadline_survives_cached_paints_until_it_passes() {
+        let now = Instant::now();
+        let due = now + Duration::from_millis(16);
+        // A paint before the deadline may reuse the cached placeholder line
+        // without rendering it, so the deadline must survive that paint.
+        assert_eq!(surviving_image_poll_due(Some(due), now), Some(due));
+        // From the deadline on, that line has expired and renders again.
+        assert_eq!(surviving_image_poll_due(Some(due), due), None);
+        assert_eq!(surviving_image_poll_due(None, now), None);
+    }
+
+    #[test]
+    fn animations_wake_only_a_focused_window_within_budget() {
+        let due = Instant::now() + Duration::from_millis(16);
+        assert_eq!(work(Some(due), true, None).animation_wake(true), Some(due));
+        assert_eq!(work(Some(due), true, None).animation_wake(false), None);
+        assert_eq!(
+            work(Some(due), false, None).animation_wake(true),
+            None,
+            "reduce motion or frame pressure skips the animation"
+        );
+        assert_eq!(work(None, true, None).animation_wake(true), None);
+    }
+
+    #[test]
+    fn a_decoding_image_is_polled_focused_or_not() {
+        let now = Instant::now();
+        let image = now + Duration::from_millis(16);
+        for focused in [false, true] {
+            for schedule in [false, true] {
+                assert_eq!(
+                    work(None, schedule, Some(image)).animation_wake(focused),
+                    Some(image),
+                    "focused={focused} schedule={schedule}"
+                );
+            }
+        }
+        // A running animation and a decoding image: the earlier wins, and an
+        // animation the window may not run never delays the image poll.
+        let sooner = now + Duration::from_millis(5);
+        let later = now + Duration::from_millis(40);
+        assert_eq!(
+            work(Some(sooner), true, Some(image)).animation_wake(true),
+            Some(sooner)
+        );
+        assert_eq!(
+            work(Some(later), true, Some(image)).animation_wake(true),
+            Some(image)
+        );
+        assert_eq!(
+            work(Some(sooner), true, Some(image)).animation_wake(false),
+            Some(image)
+        );
     }
 }

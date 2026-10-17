@@ -1,6 +1,7 @@
 use super::utilsprites::RenderMetrics;
 use crate::customglyph::*;
 use crate::renderstate::RenderContext;
+use crate::shapecache::ShapedInfo;
 use crate::termwindow::render::paint::AllowImage;
 use ahash::AHashMap;
 use anyhow::Context;
@@ -192,6 +193,22 @@ fn monochrome_glyph_feature_atlas_key(font_id: LoadedFontId, glyph_id: u32) -> u
         GlyphFormat::Monochrome,
         &AxisVector::new(),
     )
+}
+
+/// A glyph laid out for its cells, before it is placed in an atlas
+/// ([`GlyphCache::lay_out_glyph`], ft-yccm0.4.7.3): the same fields as
+/// [`CachedGlyph`], with the scaled bitmap instead of a sprite. `image` is
+/// `None` for inkless glyphs, including ligature carriers.
+pub(crate) struct GlyphLayout {
+    pub has_color: bool,
+    pub brightness_adjust: f32,
+    pub x_offset: PixelLength,
+    pub y_offset: PixelLength,
+    pub x_advance: PixelLength,
+    pub bearing_x: PixelLength,
+    pub bearing_y: PixelLength,
+    pub image: Option<Image>,
+    pub scale: f64,
 }
 
 /// Caches a rendered glyph.
@@ -476,10 +493,13 @@ thread_local! {
     static FRAME_DECODER_TEST_JOBS: Cell<Option<&'static AtomicUsize>> = const { Cell::new(None) };
 }
 static FRAME_DECODER_QUEUED_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Decodes the frames of images shown in panes, which the user is waiting
+/// on: user-initiated, never the host's default (ft-yccm0.6).
 static FRAME_DECODER_POOL: LazyLock<Result<rayon::ThreadPool, String>> = LazyLock::new(|| {
     rayon::ThreadPoolBuilder::new()
         .num_threads(MAX_FRAME_DECODER_WORKERS)
         .thread_name(|index| format!("ft-frame-decoder-{index}"))
+        .start_handler(|_| procinfo::start_thread_at(procinfo::ThreadQos::UserInitiated))
         .build()
         .map_err(|error| error.to_string())
 });
@@ -1224,6 +1244,10 @@ pub struct GlyphCache {
     pub block_glyphs: AHashMap<SizedBlockKey, Sprite>,
     pub cursor_glyphs: AHashMap<(Option<CursorShape>, u8), Sprite>,
     pub color: AHashMap<(RgbColor, NotNan<f32>), Sprite>,
+    /// Sprites resolved for shape-cache entries, keyed by `CachedShape::id`
+    /// (ft-yccm0.4.3.4). They point into this cache's atlas, so they live here
+    /// and are dropped with it; the shape cache keeps only HarfBuzz output.
+    shape_bindings: LfuCache<u64, Rc<Vec<ShapedInfo>>>,
     min_frame_duration: Duration,
     /// Per-frame snapshot of `atlas.version()` at the start of the
     /// frame (ft-c9arc). Sprites whose stamped version is `<=
@@ -1237,44 +1261,23 @@ pub struct GlyphCache {
 
 impl GlyphCache {
     pub fn new_in_memory(fonts: &Rc<FontConfiguration>, size: usize) -> anyhow::Result<Self> {
-        let surface: Rc<dyn Texture2d> = Rc::new(ImageTexture::new(size, size));
-        let atlas = Atlas::new(&surface).expect("failed to create new texture atlas");
-
-        Ok(Self {
-            fonts: Rc::clone(fonts),
-            glyph_cache: AHashMap::new(),
-            image_cache: LfuCache::new(
-                "glyph_cache.image_cache.hit.rate",
-                "glyph_cache.image_cache.miss.rate",
-                |config| config.glyph_cache_image_cache_size,
-                &fonts.config(),
-            ),
-            image_cache_retained_bytes: 0,
-            image_cache_entry_bytes: AHashMap::new(),
-            image_revision_owners: AHashMap::new(),
-            image_validation_rejection_order: VecDeque::new(),
-            image_revision_owner_registrations_since_prune: 0,
-            frame_cache: AHashMap::new(),
-            blank_frame_cache: AHashMap::new(),
-            atlas,
-            line_glyphs: AHashMap::new(),
-            block_glyphs: AHashMap::new(),
-            cursor_glyphs: AHashMap::new(),
-            color: AHashMap::new(),
-            min_frame_duration: config::frame_interval_for_max_fps(fonts.config().max_fps),
-            last_synced_version: 0,
-        })
+        Self::with_atlas_surface(fonts, Rc::new(ImageTexture::new(size, size)))
     }
-}
 
-impl GlyphCache {
     pub fn new_gl(
         backend: &RenderContext,
         fonts: &Rc<FontConfiguration>,
         size: usize,
     ) -> anyhow::Result<Self> {
-        let surface = backend.allocate_texture_atlas(size)?;
-        let atlas = Atlas::new(&surface).expect("failed to create new texture atlas");
+        Self::with_atlas_surface(fonts, backend.allocate_texture_atlas(size)?)
+    }
+
+    /// A glyph cache whose atlas lives in `surface`.
+    pub fn with_atlas_surface(
+        fonts: &Rc<FontConfiguration>,
+        surface: Rc<dyn Texture2d>,
+    ) -> anyhow::Result<Self> {
+        let atlas = Atlas::new(&surface).context("create glyph texture atlas")?;
 
         Ok(Self {
             fonts: Rc::clone(fonts),
@@ -1297,13 +1300,107 @@ impl GlyphCache {
             block_glyphs: AHashMap::new(),
             cursor_glyphs: AHashMap::new(),
             color: AHashMap::new(),
+            shape_bindings: LfuCache::new(
+                "glyph_cache.shape_bindings.hit.rate",
+                "glyph_cache.shape_bindings.miss.rate",
+                |config| config.shape_cache_size,
+                &fonts.config(),
+            ),
             min_frame_duration: config::frame_interval_for_max_fps(fonts.config().max_fps),
             last_synced_version: 0,
         })
     }
+
+    /// A same-size atlas rebuild without a new texture (ft-yccm0.2.6): clears
+    /// the atlas in place (zeroed, packer reset, version bumped) and leaves
+    /// this cache as [`Self::with_atlas_surface`] would build it around that
+    /// atlas, keeping only the decoded-image state a replacement carries over
+    /// ([`Self::swap_decoded_image_cache_state`]). Every sprite of the old
+    /// generation (glyphs, shape bindings, image frames, utility sprites) is
+    /// dropped, so none can be drawn from the reused texture; the caller makes
+    /// new utility sprites.
+    pub fn clear_atlas_in_place(&mut self, fonts: &Rc<FontConfiguration>) {
+        // Exhaustive: a new field must say how a clear-in-place treats it.
+        let Self {
+            glyph_cache,
+            atlas,
+            fonts: cache_fonts,
+            image_cache: _,
+            image_cache_retained_bytes: _,
+            image_cache_entry_bytes: _,
+            image_revision_owners: _,
+            image_validation_rejection_order: _,
+            image_revision_owner_registrations_since_prune: _,
+            frame_cache,
+            blank_frame_cache,
+            line_glyphs,
+            block_glyphs,
+            cursor_glyphs,
+            color,
+            shape_bindings,
+            min_frame_duration,
+            last_synced_version,
+        } = self;
+        glyph_cache.clear();
+        frame_cache.clear();
+        blank_frame_cache.clear();
+        line_glyphs.clear();
+        block_glyphs.clear();
+        cursor_glyphs.clear();
+        color.clear();
+        *shape_bindings = LfuCache::new(
+            "glyph_cache.shape_bindings.hit.rate",
+            "glyph_cache.shape_bindings.miss.rate",
+            |config| config.shape_cache_size,
+            &fonts.config(),
+        );
+        *cache_fonts = Rc::clone(fonts);
+        *min_frame_duration = config::frame_interval_for_max_fps(fonts.config().max_fps);
+        *last_synced_version = 0;
+        atlas.clear();
+    }
 }
 
 impl GlyphCache {
+    /// Rasterized font glyphs currently cached (cache-gauge ledger).
+    pub fn glyph_entries(&self) -> usize {
+        self.glyph_cache.len()
+    }
+
+    /// The sprites bound to shape `id` in this atlas, if resolved here.
+    pub fn shape_binding(&mut self, id: u64) -> Option<Rc<Vec<ShapedInfo>>> {
+        self.shape_bindings.get(&id).cloned()
+    }
+
+    /// Bind `glyphs`, resolved against this atlas, to shape `id`.
+    pub fn bind_shape(&mut self, id: u64, glyphs: Rc<Vec<ShapedInfo>>) {
+        self.shape_bindings.put(id, glyphs);
+    }
+
+    /// Drop every shape binding. The shape cache was cleared, so no entry can
+    /// ask for them again; this keeps them from crowding out live ones.
+    pub fn clear_shape_bindings(&mut self) {
+        self.shape_bindings.clear();
+    }
+
+    /// Bytes of the shape bindings' keys and sprite vectors (cache-gauge
+    /// ledger). The glyphs are counted with the glyph cache.
+    pub fn shape_binding_bytes(&self) -> u64 {
+        use std::mem::size_of;
+        let mut bytes = 0u64;
+        self.shape_bindings.for_each_resident(|_, glyphs| {
+            bytes += (size_of::<u64>()
+                + size_of::<Vec<ShapedInfo>>()
+                + glyphs.capacity() * size_of::<ShapedInfo>()) as u64;
+        });
+        bytes
+    }
+
+    /// Decoded-image bytes retained by the image cache (cache-gauge ledger).
+    pub fn image_cache_retained_bytes(&self) -> usize {
+        self.image_cache_retained_bytes
+    }
+
     fn atlas_footprint_bytes(&self) -> u64 {
         let side = self.atlas.size() as u64;
         side.saturating_mul(side).saturating_mul(4)
@@ -1944,6 +2041,7 @@ impl GlyphCache {
         self.apply_image_cache_evictions(evicted);
         self.enforce_image_cache_byte_budget();
         self.cursor_glyphs.clear();
+        self.shape_bindings.update_config(config);
     }
 
     /// Read the current per-frame "last synced" cursor (ft-c9arc).
@@ -1977,7 +2075,6 @@ impl GlyphCache {
     }
 
     /// Perform the load and render of a glyph
-    #[allow(clippy::float_cmp)]
     fn load_glyph(
         &mut self,
         info: &GlyphInfo,
@@ -1985,6 +2082,48 @@ impl GlyphCache {
         followed_by_space: bool,
         num_cells: u8,
     ) -> anyhow::Result<Rc<CachedGlyph>> {
+        let layout = Self::lay_out_glyph(
+            &self.fonts.config(),
+            info,
+            font,
+            followed_by_space,
+            num_cells,
+        )?;
+        let texture = match &layout.image {
+            Some(image) => Some(self.atlas.allocate(image)?),
+            None => None,
+        };
+        let glyph = CachedGlyph {
+            brightness_adjust: layout.brightness_adjust,
+            has_color: layout.has_color,
+            texture,
+            x_offset: layout.x_offset,
+            y_offset: layout.y_offset,
+            x_advance: layout.x_advance,
+            bearing_x: layout.bearing_x,
+            bearing_y: layout.bearing_y,
+            scale: layout.scale,
+        };
+        if info.font_idx != 0 && glyph.texture.is_some() {
+            // It's generally interesting to examine eg: emoji or ligatures
+            // that we might have fallen back to
+            log::trace!("{:?} {:?}", info, glyph);
+        }
+        Ok(Rc::new(glyph))
+    }
+
+    /// What [`Self::load_glyph`] computes before the atlas: the rasterized
+    /// glyph scaled to fit its cells, with its offsets, advance and bearings.
+    /// The Metal renderer lays its glyphs out with this same function, so
+    /// both renderers place every glyph identically (ft-yccm0.4.7.3).
+    #[allow(clippy::float_cmp)]
+    pub(crate) fn lay_out_glyph(
+        config: &ConfigHandle,
+        info: &GlyphInfo,
+        font: &Rc<LoadedFont>,
+        followed_by_space: bool,
+        num_cells: u8,
+    ) -> anyhow::Result<GlyphLayout> {
         let base_metrics;
         let idx_metrics;
         let brightness_adjust;
@@ -2006,7 +2145,7 @@ impl GlyphCache {
         let is_square_or_wide = aspect >= 0.7;
 
         let allow_width_overflow = if is_square_or_wide {
-            match self.fonts.config().allow_square_glyphs_to_overflow_width {
+            match config.allow_square_glyphs_to_overflow_width {
                 AllowSquareGlyphOverflow::Never => false,
                 AllowSquareGlyphOverflow::Always => true,
                 AllowSquareGlyphOverflow::WhenFollowedBySpace => followed_by_space,
@@ -2101,10 +2240,10 @@ impl GlyphCache {
         let glyph = if glyph.width == 0 || glyph.height == 0 {
             // An inkless glyph, such as whitespace or a contextual-ligature
             // carrier. Preserve its advance without allocating an empty sprite.
-            CachedGlyph {
+            GlyphLayout {
                 brightness_adjust: 1.0,
                 has_color: glyph.has_color,
-                texture: None,
+                image: None,
                 x_offset: info.x_offset * scale,
                 y_offset: info.y_offset * scale,
                 x_advance: info.x_advance * scale,
@@ -2150,30 +2289,20 @@ impl GlyphCache {
                 (scale, raw_im)
             };
 
-            let tex = self.atlas.allocate(&raw_im)?;
-
-            let g = CachedGlyph {
+            GlyphLayout {
                 brightness_adjust,
                 has_color: glyph.has_color,
-                texture: Some(tex),
+                image: Some(raw_im),
                 x_offset,
                 y_offset,
                 x_advance,
                 bearing_x,
                 bearing_y,
                 scale,
-            };
-
-            if info.font_idx != 0 {
-                // It's generally interesting to examine eg: emoji or ligatures
-                // that we might have fallen back to
-                log::trace!("{:?} {:?}", info, g);
             }
-
-            g
         };
 
-        Ok(Rc::new(glyph))
+        Ok(glyph)
     }
 
     fn cached_image_impl(
@@ -2931,6 +3060,24 @@ impl GlyphCache {
     }
 
     fn line_sprite(&mut self, key: LineKey, metrics: &RenderMetrics) -> anyhow::Result<Sprite> {
+        let buffer =
+            Self::line_sprite_image(key.strike_through, key.underline, key.overline, metrics);
+        let sprite = self.atlas.allocate(&buffer)?;
+        self.line_glyphs.insert(key, sprite.clone());
+        Ok(sprite)
+    }
+
+    /// The bitmap of a line sprite: one cell of `metrics` with the
+    /// strikethrough, `underline` and overline drawn white (the alpha is the
+    /// coverage) over transparent black. The WebGpu renderer allocates it in
+    /// its atlas; the Metal renderer places the same pixels in its grayscale
+    /// atlas, so both draw decorations identically (ft-yccm0.4.7.3).
+    pub(crate) fn line_sprite_image(
+        strike_through: bool,
+        underline: Underline,
+        overline: bool,
+        metrics: &RenderMetrics,
+    ) -> Image {
         let mut buffer = Image::new(
             metrics.cell_size.width as usize,
             metrics.cell_size.height as usize,
@@ -3104,10 +3251,10 @@ impl GlyphCache {
         };
 
         buffer.clear_rect(cell_rect, black);
-        if key.overline {
+        if overline {
             draw_overline(&mut buffer);
         }
-        match key.underline {
+        match underline {
             Underline::None => {}
             Underline::Single => draw_single(&mut buffer),
             Underline::Curly => draw_curly(&mut buffer),
@@ -3115,12 +3262,10 @@ impl GlyphCache {
             Underline::Dotted => draw_dotted(&mut buffer),
             Underline::Double => draw_double(&mut buffer),
         }
-        if key.strike_through {
+        if strike_through {
             draw_strike(&mut buffer);
         }
-        let sprite = self.atlas.allocate(&buffer)?;
-        self.line_glyphs.insert(key, sprite.clone());
-        Ok(sprite)
+        buffer
     }
 
     /// Figure out what we're going to draw for the underline.
@@ -3134,11 +3279,11 @@ impl GlyphCache {
         overline: bool,
         metrics: &RenderMetrics,
     ) -> anyhow::Result<Sprite> {
-        let effective_underline = match (is_highlited_hyperlink, underline) {
-            (true, Underline::None) => Underline::Single,
-            (true, Underline::Single) => Underline::Double,
-            (true, _) => Underline::Single,
-            (false, u) => u,
+        // One rule for both renderers (ft-yccm0.4.7.3).
+        let effective_underline = if is_highlited_hyperlink {
+            frankenterm_gui::metal_scene::hovered_underline(underline)
+        } else {
+            underline
         };
 
         let key = LineKey {
@@ -3162,6 +3307,34 @@ mod tests {
     use crate::termwindow::render::paint::AllowImage;
     use frankenterm_core::font_features::{AxisValue, VariableAxis};
     use window::bitmaps::TextureRect;
+
+    /// ft-yccm0.6: frame decoder threads start at user-initiated, the
+    /// priority they actually run at on macOS, not the host's default.
+    #[test]
+    fn frame_decoder_threads_run_at_user_initiated_qos() {
+        let pool = FRAME_DECODER_POOL.as_ref().expect("frame decoder pool");
+        let (name, qos, priority) = pool.install(|| {
+            (
+                std::thread::current().name().map(str::to_owned),
+                procinfo::current_thread_qos(),
+                procinfo::current_thread_base_priority(),
+            )
+        });
+        assert!(
+            name.as_deref()
+                .is_some_and(|name| name.starts_with("ft-frame-decoder-")),
+            "{name:?}"
+        );
+        let expected = procinfo::ThreadQos::UserInitiated;
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                (qos, priority),
+                (Some(expected), Some(expected.base_priority()))
+            );
+        } else {
+            assert_eq!((qos, priority), (None, None));
+        }
+    }
 
     #[test]
     fn bounded_atomic_reservation_preserves_limit_overflow_and_release_boundaries() {

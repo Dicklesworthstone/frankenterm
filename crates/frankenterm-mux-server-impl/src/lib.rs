@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, MutexGuard};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize as _, Zeroizing};
 
 pub mod delivery_ledger;
 pub mod delivery_scheduler;
@@ -65,6 +65,10 @@ const EXACT_SCROLLBACK_ZSTD_MAGIC: &[u8; 8] = b"FTSLZ1\0\0";
 const EXACT_SCROLLBACK_ZSTD_HEADER_BYTES: usize = 12;
 const EXACT_SCROLLBACK_ZSTD_WINDOW_LOG: u32 = 17;
 const EXACT_SCROLLBACK_COMPACT_MIN_CELLS: usize = 3;
+/// ft-yccm0.2.1.4: an exact row's plaintext schema for a row in clustered
+/// storage, serialized as its attribute runs (1 is the cell vector, 2 the
+/// compact printable-ASCII form).
+const EXACT_SCROLLBACK_SCHEMA_CLUSTERED: u32 = 3;
 const LIVE_SCROLLBACK_MANIFEST_SCHEMA_V1: &str = "frankenterm.live-scrollback-manifest.v1";
 const LIVE_SCROLLBACK_MANIFEST_SCHEMA_V2: &str = "frankenterm.live-scrollback-manifest.v2";
 const LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3: &str = "frankenterm.live-scrollback-manifest.v3";
@@ -81,6 +85,29 @@ const LIVE_SCROLLBACK_INCREMENTAL_CHAIN_DOMAIN: &[u8] =
 const LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V1: &str = "frankenterm.live-scrollback-append-wal.v1";
 const LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2: &str = "frankenterm.live-scrollback-append-wal.v2";
 const LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3: &str = "frankenterm.live-scrollback-append-wal.v3";
+/// v4 names its batch by row count, byte count and digest. The rows are
+/// written once, to the ledger, before the WAL; recovery verifies them there
+/// (ft-yccm0.2.1.3). v1-v3 carry a second copy of every row.
+const LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4: &str = "frankenterm.live-scrollback-append-wal.v4";
+/// v5 is digest-only like v4 but cumulative (ft-yccm0.2.1.2): it names every
+/// row appended since its predecessor manifest, across any number of commit
+/// windows, and the retention those windows applied. Its target revision is
+/// the predecessor's plus the rows it names, the revision each window
+/// advanced, so a recovered tail lands on the generation it last had.
+const LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V5: &str = "frankenterm.live-scrollback-append-wal.v5";
+/// Bounds on the tail one cumulative WAL may name; a writer publishes before
+/// its tail would pass them.
+const LIVE_SCROLLBACK_CUMULATIVE_WAL_MAX_ROWS: u64 = 4 * 1024 * 1024;
+const LIVE_SCROLLBACK_CUMULATIVE_WAL_MAX_RECORD_BYTES: u64 = 1024 * 1024 * 1024;
+/// Rows one commit window may append under a single sync (ft-yccm0.2.1.2):
+/// sixteen store batches.
+const LIVE_SCROLLBACK_WINDOW_MAX_ROWS: usize = 16 * LIVE_SCROLLBACK_APPEND_MAX_ROWS;
+/// Record bytes one commit window may append.
+const LIVE_SCROLLBACK_WINDOW_MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
+const LIVE_SCROLLBACK_APPEND_WAL_BATCH_DIGEST_DOMAIN_V3: &[u8] =
+    b"frankenterm.live-scrollback-append-wal-batch.v3\0";
+const LIVE_SCROLLBACK_APPEND_WAL_BATCH_DIGEST_DOMAIN_V4: &[u8] =
+    b"frankenterm.live-scrollback-append-wal-batch.v4\0";
 // A 128 KiB parser batch of short output rows otherwise pays several durable
 // append transactions. The independent 16 MiB pending/record byte limits still
 // bound admission; geometry work continues to yield in its existing slices.
@@ -121,8 +148,32 @@ std::thread_local! {
     static LIVE_SCROLLBACK_WAL_RECORD_DIGESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_CHAIN_LINK_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_MANIFEST_PUBLICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Whether the process-wide keyring mutex was free at the last manifest
+    /// rename (ft-yccm0.2.1.5: publications must not convoy across panes).
+    static LIVE_SCROLLBACK_KEYRING_FREE_AT_RENAME: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static LIVE_SCROLLBACK_CONTENT_GROUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_BATCH_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    /// Seal clustered rows with the cell-vector schemas, as before schema 3
+    /// (ft-yccm0.2.1.4), for a same-run A/B.
+    static FORCE_CELL_SCHEMAS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Sealed segments this thread's readers opened (ft-yccm0.2.1.4).
+    static LIVE_SCROLLBACK_SEGMENT_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Manifests this thread read from disk, and keyring mutex acquisitions
+    /// (ft-yccm0.2.1.5).
+    static LIVE_SCROLLBACK_MANIFEST_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LIVE_SCROLLBACK_KEYRING_LOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Record bytes this thread appended to a ledger, bytes it hashed
+    /// (chain links and digests), and record bytes it read back from a
+    /// ledger (ft-y0gy9).
+    static LIVE_SCROLLBACK_RECORD_BYTES_APPENDED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static LIVE_SCROLLBACK_BYTES_HASHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static LIVE_SCROLLBACK_RECORD_BYTES_READ_BACK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Add `bytes` to one of this thread's byte counters (ft-y0gy9).
+#[cfg(test)]
+fn count_test_bytes(counter: &'static std::thread::LocalKey<std::cell::Cell<u64>>, bytes: usize) {
+    counter.with(|count| count.set(count.get().saturating_add(bytes as u64)));
 }
 
 fn configured_ssh_domains(config: &ConfigHandle) -> Vec<config::SshDomain> {
@@ -396,26 +447,374 @@ pub fn reconcile_client_domain_config(
     }
 }
 
-/// The parser owns draining this bounded warm queue. No worker thread, disk
-/// operation or acknowledgement is hidden in queue admission. In particular,
-/// queued reads can proceed during append synchronization. UI metadata callers
-/// must use try_capture_scrollback_interval: legacy getters can block while a
+/// Per-pane warm queue whose store IO runs on one process-wide
+/// `scrollback-durability` thread (ft-yccm0.2.1.1). Parser admission is a
+/// memory transfer under the terminal lock; the parser then hands the queue to
+/// the writer and never performs or waits on storage IO. Queued rows are
+/// bounded by the writer's byte budget (ft-yccm0.2.1.6): past it, a pane's
+/// oldest queued rows become a durability gap, which the writer records in
+/// order as one marker row, so overload never throttles the pane. Queued
+/// reads proceed during append synchronization. UI metadata callers must use
+/// try_capture_scrollback_interval: legacy getters can block while a
 /// destructive operation holds state across durable publication.
 mod deferred_scrollback {
+    use frankenterm_alloc::resource_ledger::DurabilityLedger;
     use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex, TryLockError};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, TryLockError, Weak};
+    use std::time::{Duration, Instant};
     use wezterm_term::config::{
-        ScrollbackClearCommit, ScrollbackIntervalCapture, ScrollbackIntervalIdentity,
-        ScrollbackPrefix, ScrollbackReplaceCommit, ScrollbackSnapshot,
-        ScrollbackSnapshotGeneration, ScrollbackSnapshotLimits, ScrollbackSpillError,
-        ScrollbackSpillSink, ScrollbackUsage, ScrollbackUsageCapture,
+        ScrollbackCapacityWait, ScrollbackClearCommit, ScrollbackIntervalCapture,
+        ScrollbackIntervalIdentity, ScrollbackLineAdmission, ScrollbackPrefix,
+        ScrollbackReplaceCommit, ScrollbackSnapshot, ScrollbackSnapshotGeneration,
+        ScrollbackSnapshotLimits, ScrollbackSpillError, ScrollbackSpillSink, ScrollbackUsage,
+        ScrollbackUsageCapture,
     };
     use wezterm_term::{Line, StableRowIndex};
 
-    const MAX_PENDING_ROWS: usize = super::LIVE_SCROLLBACK_APPEND_MAX_ROWS;
-    const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
+    /// Rows per commit window: one backing call appends them under a single
+    /// sync when it can continue a durable tail (ft-yccm0.2.1.2); a backing
+    /// that takes fewer acknowledges a prefix and the drain loops.
+    const MAX_BATCH_ROWS: usize = super::LIVE_SCROLLBACK_WINDOW_MAX_ROWS;
+    /// Default byte budget for rows queued behind the writer, across every
+    /// pane it serves (ft-yccm0.2.1.6). Over budget, the oldest queued rows
+    /// become a durability gap; admission never refuses for capacity.
+    pub const DEFAULT_QUEUE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
     const MAX_CACHED_ROWS: usize = 32;
     const MAX_CACHED_BYTES: usize = 256 * 1024;
+    /// Writer retry delay after a failed drain, doubling per consecutive
+    /// failure up to the maximum. Rows stay owned (and readable) meanwhile.
+    const RETRY_BACKOFF_MIN: Duration = Duration::from_millis(100);
+    const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(2);
+    pub const DURABILITY_THREAD_NAME: &str = "scrollback-durability";
+
+    /// The single thread that performs durable scrollback IO for every pane.
+    ///
+    /// The queue holds at most one entry per sink (`scheduled` deduplicates
+    /// wakeups), so its length is bounded by the live pane count; rows stay in
+    /// each sink's byte- and row-bounded pending queue, where cold reads can
+    /// see them, rather than being copied into the channel. One drainer per
+    /// sink at a time preserves per-pane FIFO order.
+    pub struct DurabilityWriter {
+        shared: Arc<WriterShared>,
+    }
+
+    struct WriterShared {
+        queue: Mutex<WriterQueue>,
+        wake: Condvar,
+        running: AtomicBool,
+        /// Byte budget for rows queued behind this writer.
+        budget: AtomicUsize,
+        /// Charged bytes of every row queued behind this writer.
+        queued_bytes: AtomicUsize,
+        /// Only the process-wide writer publishes to `DurabilityLedger`
+        /// (`ft doctor --json`); private test writers do not.
+        publishes: AtomicBool,
+        /// Commit window policy (ft-yccm0.2.1.2), see [`CommitPolicy`].
+        window_ms: AtomicU64,
+        window_bytes: AtomicUsize,
+        idle_ms: AtomicU64,
+    }
+
+    /// When the writer commits a pane's queued rows (ft-yccm0.2.1.2). A
+    /// commit window opens with the first queued row and closes, and the
+    /// rows go to the store, once it is `window` old, its pane has queued
+    /// nothing for `idle`, it holds `window_bytes` or a full batch, the
+    /// pane closes or flushes, or the queue is under pressure. Rows from
+    /// many parse batches thus share one transaction and its syncs.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct CommitPolicy {
+        pub window: Duration,
+        pub window_bytes: usize,
+        pub idle: Duration,
+    }
+
+    impl Default for CommitPolicy {
+        fn default() -> Self {
+            Self {
+                window: Duration::from_millis(250),
+                window_bytes: 8 * 1024 * 1024,
+                idle: Duration::from_millis(25),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct WriterQueue {
+        ready: VecDeque<Arc<DeferredScrollbackSpillSink>>,
+        backoff: Vec<(Instant, Arc<DeferredScrollbackSpillSink>)>,
+        /// Sinks whose commit window is still open, with its closing time.
+        windows: Vec<(Instant, Arc<DeferredScrollbackSpillSink>)>,
+        shutdown: bool,
+    }
+
+    impl DurabilityWriter {
+        /// The process-wide writer, started on first use.
+        pub(super) fn global() -> Arc<Self> {
+            static GLOBAL: OnceLock<Arc<DurabilityWriter>> = OnceLock::new();
+            Arc::clone(GLOBAL.get_or_init(|| {
+                let writer = Self::spawn();
+                writer.shared.publishes.store(true, Ordering::Release);
+                writer.publish_queue(0);
+                writer
+            }))
+        }
+
+        /// Whether this writer reports to `DurabilityLedger::global()`.
+        fn publishes(&self) -> bool {
+            self.shared.publishes.load(Ordering::Acquire)
+        }
+
+        fn publish_queue(&self, total: usize) {
+            metrics::gauge!("mux.scrollback.durability_queue_bytes").set(total as f64);
+            if self.publishes() {
+                DurabilityLedger::global().set_queue(total as u64, self.queue_budget() as u64);
+            }
+        }
+
+        /// Start a writer thread. Without one (spawn failure), sinks fall
+        /// back to draining inline on the requesting thread.
+        pub(super) fn spawn() -> Arc<Self> {
+            let shared = Arc::new(WriterShared {
+                queue: Mutex::new(WriterQueue::default()),
+                wake: Condvar::new(),
+                running: AtomicBool::new(false),
+                budget: AtomicUsize::new(DEFAULT_QUEUE_BUDGET_BYTES),
+                queued_bytes: AtomicUsize::new(0),
+                publishes: AtomicBool::new(false),
+                window_ms: AtomicU64::new(0),
+                window_bytes: AtomicUsize::new(0),
+                idle_ms: AtomicU64::new(0),
+            });
+            let policy = CommitPolicy::default();
+            shared
+                .window_ms
+                .store(duration_ms(policy.window), Ordering::Release);
+            shared
+                .window_bytes
+                .store(policy.window_bytes, Ordering::Release);
+            shared
+                .idle_ms
+                .store(duration_ms(policy.idle), Ordering::Release);
+            let worker = Arc::clone(&shared);
+            match std::thread::Builder::new()
+                .name(DURABILITY_THREAD_NAME.to_string())
+                .spawn(move || {
+                    // Durability need not finish promptly; keep it off the
+                    // performance cores that parse output (ft-yccm0.3.1.3).
+                    if let Err(error) =
+                        procinfo::set_current_thread_qos(procinfo::ThreadQos::Utility)
+                    {
+                        log::warn!(
+                            "{DURABILITY_THREAD_NAME} thread keeps its default QoS class: {error}"
+                        );
+                    }
+                    worker.run();
+                }) {
+                Ok(_) => shared.running.store(true, Ordering::Release),
+                Err(error) => log::error!(
+                    "failed to start the {DURABILITY_THREAD_NAME} thread; scrollback durability runs inline on parser threads: {error}"
+                ),
+            }
+            Arc::new(Self { shared })
+        }
+
+        /// O(1) handoff: never waits on storage. False when no thread runs.
+        fn enqueue(&self, sink: Arc<DeferredScrollbackSpillSink>) -> bool {
+            if !self.shared.running.load(Ordering::Acquire) {
+                return false;
+            }
+            let mut queue = self.shared.lock_queue();
+            queue.ready.push_back(sink);
+            drop(queue);
+            self.shared.wake.notify_one();
+            true
+        }
+
+        /// Sets the byte budget for queued rows (config
+        /// `scrollback_durability_queue_max_mb`).
+        pub(super) fn set_queue_budget(&self, bytes: usize) {
+            self.shared.budget.store(bytes.max(1), Ordering::Release);
+            self.publish_queue(self.queued_bytes());
+        }
+
+        pub(super) fn queue_budget(&self) -> usize {
+            self.shared.budget.load(Ordering::Acquire)
+        }
+
+        /// Charged bytes of every row queued behind this writer.
+        pub(super) fn queued_bytes(&self) -> usize {
+            self.shared.queued_bytes.load(Ordering::Acquire)
+        }
+
+        fn charge(&self, bytes: usize) {
+            let total = self.shared.queued_bytes.fetch_add(bytes, Ordering::AcqRel) + bytes;
+            self.publish_queue(total);
+        }
+
+        fn release(&self, bytes: usize) {
+            let total = self.shared.queued_bytes.fetch_sub(bytes, Ordering::AcqRel) - bytes;
+            self.publish_queue(total);
+        }
+
+        /// Sets the commit window policy (config
+        /// `scrollback_durability_commit_window_ms`, `_window_mb`,
+        /// `_idle_ms`). A zero window commits every request at once.
+        pub(super) fn set_commit_policy(&self, policy: CommitPolicy) {
+            let shared = &self.shared;
+            shared
+                .window_ms
+                .store(duration_ms(policy.window), Ordering::Release);
+            shared
+                .window_bytes
+                .store(policy.window_bytes.max(1), Ordering::Release);
+            shared
+                .idle_ms
+                .store(duration_ms(policy.idle), Ordering::Release);
+        }
+
+        pub(super) fn commit_policy(&self) -> CommitPolicy {
+            let shared = &self.shared;
+            CommitPolicy {
+                window: Duration::from_millis(shared.window_ms.load(Ordering::Acquire)),
+                window_bytes: shared.window_bytes.load(Ordering::Acquire),
+                idle: Duration::from_millis(shared.idle_ms.load(Ordering::Acquire)),
+            }
+        }
+
+        /// Moves `sink` out of an open commit window to the ready queue: a
+        /// threshold or a commit request closed the window early.
+        fn expedite(&self, sink: &DeferredScrollbackSpillSink) {
+            let mut queue = self.shared.lock_queue();
+            let Some(index) = queue
+                .windows
+                .iter()
+                .position(|(_, waiting)| std::ptr::eq(waiting.as_ref(), sink))
+            else {
+                return;
+            };
+            let (_, waiting) = queue.windows.swap_remove(index);
+            queue.ready.push_back(waiting);
+            drop(queue);
+            self.shared.wake.notify_one();
+        }
+    }
+
+    fn duration_ms(duration: Duration) -> u64 {
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    impl Drop for DurabilityWriter {
+        fn drop(&mut self) {
+            // Queued sinks hold this writer alive, so the queue is empty here.
+            self.shared.lock_queue().shutdown = true;
+            self.shared.wake.notify_all();
+        }
+    }
+
+    impl WriterShared {
+        fn lock_queue(&self) -> std::sync::MutexGuard<'_, WriterQueue> {
+            // Only VecDeque/Vec operations run under this lock.
+            self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        fn run(&self) {
+            while let Some(sink) = self.next_sink() {
+                self.service(sink);
+            }
+        }
+
+        fn next_sink(&self) -> Option<Arc<DeferredScrollbackSpillSink>> {
+            let mut queue = self.lock_queue();
+            loop {
+                let now = Instant::now();
+                let queue_ref = &mut *queue;
+                for timed in [&mut queue_ref.backoff, &mut queue_ref.windows] {
+                    let mut index = 0;
+                    while index < timed.len() {
+                        if timed[index].0 <= now {
+                            let (_, sink) = timed.swap_remove(index);
+                            queue_ref.ready.push_back(sink);
+                        } else {
+                            index += 1;
+                        }
+                    }
+                }
+                if let Some(sink) = queue.ready.pop_front() {
+                    return Some(sink);
+                }
+                if queue.shutdown {
+                    return None;
+                }
+                let next = queue
+                    .backoff
+                    .iter()
+                    .chain(queue.windows.iter())
+                    .map(|(at, _)| *at)
+                    .min();
+                queue = match next {
+                    Some(at) => {
+                        self.wake
+                            .wait_timeout(queue, at.saturating_duration_since(now))
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .0
+                    }
+                    None => self
+                        .wake
+                        .wait(queue)
+                        .unwrap_or_else(PoisonError::into_inner),
+                };
+            }
+        }
+
+        fn service(&self, sink: Arc<DeferredScrollbackSpillSink>) {
+            if let Some(retry_at) = sink.retry_not_before() {
+                if retry_at > Instant::now() {
+                    // Still backing off; `scheduled` stays set.
+                    self.lock_queue().backoff.push((retry_at, sink));
+                    return;
+                }
+            }
+            // An open commit window keeps gathering rows; `scheduled` stays
+            // set, so further requests do not queue the sink again.
+            let window = sink.commit_window(Instant::now());
+            match window {
+                CommitWindow::Open { closes_at } => {
+                    self.lock_queue().windows.push((closes_at, sink));
+                    return;
+                }
+                CommitWindow::Closed(reason) => log::debug!(
+                    target: "mux::scrollback_durability",
+                    "pane={} commit window closed: {reason}",
+                    sink.pane_label
+                ),
+            }
+            // Clear before draining: a row admitted during this drain
+            // schedules another pass instead of waiting for the next batch.
+            sink.scheduled.store(false, Ordering::Release);
+            if sink.drain_scheduled().is_ok() {
+                return;
+            }
+            let retry_at = sink.retry_not_before().unwrap_or_else(Instant::now);
+            if Arc::strong_count(&sink) == 1 {
+                // The pane closed and only this writer still owns its rows.
+                // Dropping the sink reports them (never silently) and
+                // releases its store.
+                return;
+            }
+            if !sink.scheduled.swap(true, Ordering::AcqRel) {
+                self.lock_queue().backoff.push((retry_at, sink));
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct WriterHealth {
+        failure: Option<ScrollbackSpillError>,
+        panicked: bool,
+        consecutive_failures: u32,
+        retry_not_before: Option<Instant>,
+    }
 
     struct PendingRow {
         stable_row: StableRowIndex,
@@ -424,11 +823,116 @@ mod deferred_scrollback {
         charged_bytes: usize,
     }
 
+    /// How every durability-gap marker row begins. Output can print it too,
+    /// so it identifies a row that may be a marker, never one that is.
+    pub const GAP_MARKER_PREFIX: &str = "[durability gap: ";
+
+    /// Queued rows dropped from durability under overload (ft-yccm0.2.1.6).
+    /// The writer records the gap as one marker row, in order.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct GapSpan {
+        start: StableRowIndex,
+        /// Exclusive.
+        end: StableRowIndex,
+        retention: usize,
+        /// Charged bytes of the dropped rows.
+        bytes: usize,
+        at_unix_ms: u64,
+    }
+
+    impl GapSpan {
+        fn rows(&self) -> StableRowIndex {
+            self.end - self.start
+        }
+
+        /// The marker the durable transcript carries in place of the rows.
+        fn marker_text(&self) -> String {
+            format!(
+                "{GAP_MARKER_PREFIX}{} rows ({}..{}), {} bytes, reason=overload, at_unix_ms={}]",
+                self.rows(),
+                self.start,
+                self.end,
+                self.bytes,
+                self.at_unix_ms
+            )
+        }
+
+        /// What a read of `stable_row` in the gap returns: the marker on the
+        /// first row, empty rows after it.
+        fn line_at(&self, stable_row: StableRowIndex) -> Line {
+            if stable_row == self.start {
+                Line::from_text(
+                    &self.marker_text(),
+                    &wezterm_term::CellAttributes::blank(),
+                    0,
+                    None,
+                )
+            } else {
+                Line::new(0)
+            }
+        }
+    }
+
+    enum Pending {
+        Row(PendingRow),
+        Gap(GapSpan),
+    }
+
+    /// Whether a sink's queued rows should go to the store now.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CommitWindow {
+        Open { closes_at: Instant },
+        Closed(&'static str),
+    }
+
+    impl Pending {
+        fn start(&self) -> StableRowIndex {
+            match self {
+                Self::Row(row) => row.stable_row,
+                Self::Gap(gap) => gap.start,
+            }
+        }
+
+        fn end(&self) -> StableRowIndex {
+            match self {
+                Self::Row(row) => row.stable_row + 1,
+                Self::Gap(gap) => gap.end,
+            }
+        }
+    }
+
+    fn unix_now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+            })
+    }
+
     struct State {
         interval_identity: ScrollbackIntervalIdentity,
         publication_uncertain: bool,
-        pending: VecDeque<PendingRow>,
+        /// Contiguous stable rows, oldest first: queued rows and gaps.
+        pending: VecDeque<Pending>,
+        /// Charged bytes of the queued rows.
         pending_bytes: usize,
+        /// Front entries a drain has captured and is writing; overload never
+        /// converts them.
+        in_flight: usize,
+        /// Gaps of this lineage already written as markers, oldest first.
+        /// Each makes the store rows after it `rows() - 1` lower than their
+        /// stable rows.
+        written_gaps: VecDeque<GapSpan>,
+        /// The store-row offset of written gaps pruned by retention.
+        pruned_gap_skip: StableRowIndex,
+        /// Overload shedding is active until the queue drains below half of
+        /// the budget (hysteresis).
+        shedding: bool,
+        /// When the first row still queued was admitted: the open commit
+        /// window's start (ft-yccm0.2.1.2).
+        window_opened: Option<Instant>,
+        /// When the newest row was admitted, for the idle close.
+        last_admitted: Option<Instant>,
         // An acknowledged suffix, transferred from pending without cloning or
         // serializing cells. First reflow can read its cold/hot boundary here.
         // Uses the same cell/text charge as pending, not a total heap estimate.
@@ -441,11 +945,179 @@ mod deferred_scrollback {
 
     pub struct DeferredScrollbackSpillSink {
         backing: Arc<dyn ScrollbackSpillSink>,
+        /// Destructive operations (clear, replace, snapshot). Admission only
+        /// try-locks it, so it never refuses rows because a drain is running.
         operation: Mutex<()>,
+        /// One drainer at a time: the writer, or an explicit flush. Lock
+        /// order is operation -> drain_gate -> state.
+        drain_gate: Mutex<()>,
         state: Mutex<State>,
+        self_ref: Weak<Self>,
+        writer: Arc<DurabilityWriter>,
+        pane_label: String,
+        /// Set while an entry for this sink sits in the writer queue.
+        scheduled: AtomicBool,
+        /// Mirrors `state.pending.len()` so a handoff needs no state lock.
+        pending_rows: AtomicUsize,
+        /// Bumped after every acknowledged batch, clear and replacement.
+        progress_epoch: AtomicU64,
+        /// The progress epoch observed before the most recent refusal.
+        refused_epoch: AtomicU64,
+        progress: Mutex<()>,
+        progress_signal: Condvar,
+        health: Mutex<WriterHealth>,
+        committed_batches: AtomicU64,
+        /// A close (or explicit commit request) ends the open commit window.
+        commit_now: AtomicBool,
     }
 
     impl State {
+        fn empty(
+            durable_bytes: usize,
+            oldest: Option<StableRowIndex>,
+            newest_exclusive: Option<StableRowIndex>,
+        ) -> Self {
+            Self {
+                interval_identity: ScrollbackIntervalIdentity::default(),
+                publication_uncertain: false,
+                pending: VecDeque::new(),
+                pending_bytes: 0,
+                in_flight: 0,
+                written_gaps: VecDeque::new(),
+                pruned_gap_skip: 0,
+                shedding: false,
+                window_opened: None,
+                last_admitted: None,
+                cached: VecDeque::new(),
+                cached_bytes: 0,
+                durable_bytes,
+                oldest,
+                newest_exclusive,
+            }
+        }
+
+        /// How far below `stable_row` its store row is: one less than each
+        /// written gap's length for every gap that ends at or before it.
+        fn store_skip_before(&self, stable_row: StableRowIndex) -> StableRowIndex {
+            self.pruned_gap_skip
+                + self
+                    .written_gaps
+                    .iter()
+                    .take_while(|gap| gap.end <= stable_row)
+                    .map(|gap| gap.rows() - 1)
+                    .sum::<StableRowIndex>()
+        }
+
+        /// The store-row offset after every written gap, which applies to
+        /// every queued row.
+        fn store_skip(&self) -> StableRowIndex {
+            self.pruned_gap_skip
+                + self
+                    .written_gaps
+                    .iter()
+                    .map(|gap| gap.rows() - 1)
+                    .sum::<StableRowIndex>()
+        }
+
+        /// Forgets written gaps whose marker the store no longer retains,
+        /// keeping their store-row offset. Pruning by the store, not by
+        /// `oldest`, keeps every marker a snapshot can return expandable.
+        fn prune_written_gaps(&mut self, store_oldest: Option<StableRowIndex>) {
+            let Some(store_oldest) = store_oldest else {
+                return;
+            };
+            while let Some(gap) = self.written_gaps.front() {
+                if gap.start - self.pruned_gap_skip >= store_oldest {
+                    break;
+                }
+                self.pruned_gap_skip += gap.rows() - 1;
+                self.written_gaps.pop_front();
+            }
+        }
+
+        /// The queued entry holding `stable_row`.
+        fn pending_entry(&self, stable_row: StableRowIndex) -> Option<&Pending> {
+            let index = self
+                .pending
+                .partition_point(|entry| entry.end() <= stable_row);
+            self.pending
+                .get(index)
+                .filter(|entry| entry.start() <= stable_row)
+        }
+
+        /// Turns queued rows after the in-flight prefix into gaps, oldest
+        /// first, until `need` bytes are freed or none are left. Adjacent
+        /// gaps coalesce into one. Returns the bytes freed, the dropped rows
+        /// (to be released outside the state lock) and the new gap spans.
+        fn shed(&mut self, need: usize, at_unix_ms: u64) -> (usize, Vec<Pending>, Vec<GapSpan>) {
+            let mut freed = 0;
+            let mut dropped = Vec::new();
+            let mut spans = Vec::new();
+            let mut index = self.in_flight;
+            while freed < need && index < self.pending.len() {
+                if matches!(self.pending[index], Pending::Gap(_)) {
+                    index += 1;
+                    continue;
+                }
+                // A run of rows from `index`, cut once `need` is met.
+                let mut end = index;
+                let mut run_bytes = 0;
+                while end < self.pending.len() && freed + run_bytes < need {
+                    match &self.pending[end] {
+                        Pending::Row(row) => run_bytes += row.charged_bytes,
+                        Pending::Gap(_) => break,
+                    }
+                    end += 1;
+                }
+                let first = self.pending[index].start();
+                let last = self.pending[end - 1].end();
+                let retention = match &self.pending[index] {
+                    Pending::Row(row) => row.retention,
+                    Pending::Gap(gap) => gap.retention,
+                };
+                dropped.extend(self.pending.drain(index..end));
+                let mut span = GapSpan {
+                    start: first,
+                    end: last,
+                    retention,
+                    bytes: run_bytes,
+                    at_unix_ms,
+                };
+                // Coalesce with a gap on either side that no drain holds.
+                if index > self.in_flight {
+                    if let Some(Pending::Gap(previous)) = self.pending.get(index - 1) {
+                        if previous.end == span.start {
+                            span.start = previous.start;
+                            span.bytes += previous.bytes;
+                            span.at_unix_ms = previous.at_unix_ms;
+                            span.retention = previous.retention;
+                            self.pending.remove(index - 1);
+                            index -= 1;
+                        }
+                    }
+                }
+                if let Some(Pending::Gap(next)) = self.pending.get(index) {
+                    if next.start == span.end {
+                        span.end = next.end;
+                        span.bytes += next.bytes;
+                        self.pending.remove(index);
+                    }
+                }
+                self.pending.insert(index, Pending::Gap(span));
+                spans.push(GapSpan {
+                    start: first,
+                    end: last,
+                    retention,
+                    bytes: run_bytes,
+                    at_unix_ms,
+                });
+                self.pending_bytes -= run_bytes;
+                freed += run_bytes;
+                index += 1;
+            }
+            (freed, dropped, spans)
+        }
+
         fn prune_cached(&mut self) {
             while self.cached.front().is_some_and(|row| {
                 self.oldest.is_none_or(|oldest| row.stable_row < oldest)
@@ -492,15 +1164,252 @@ mod deferred_scrollback {
     }
 
     impl DeferredScrollbackSpillSink {
+        /// A sink drained by the process-wide durability writer.
         pub(super) fn new(
             backing: Arc<dyn ScrollbackSpillSink>,
-        ) -> Result<Self, ScrollbackSpillError> {
+            durable_pane_id: [u8; 16],
+        ) -> Result<Arc<Self>, ScrollbackSpillError> {
+            Self::with_writer(backing, durable_pane_id, DurabilityWriter::global())
+        }
+
+        pub(super) fn with_writer(
+            backing: Arc<dyn ScrollbackSpillSink>,
+            durable_pane_id: [u8; 16],
+            writer: Arc<DurabilityWriter>,
+        ) -> Result<Arc<Self>, ScrollbackSpillError> {
             let state = Self::backing_state(backing.as_ref())?;
-            Ok(Self {
+            Ok(Arc::new_cyclic(|self_ref| Self {
                 backing,
                 operation: Mutex::new(()),
+                drain_gate: Mutex::new(()),
                 state: Mutex::new(state),
-            })
+                self_ref: self_ref.clone(),
+                writer,
+                pane_label: uuid::Uuid::from_bytes(durable_pane_id).to_string(),
+                scheduled: AtomicBool::new(false),
+                pending_rows: AtomicUsize::new(0),
+                progress_epoch: AtomicU64::new(0),
+                refused_epoch: AtomicU64::new(0),
+                progress: Mutex::new(()),
+                progress_signal: Condvar::new(),
+                health: Mutex::new(WriterHealth::default()),
+                committed_batches: AtomicU64::new(0),
+                commit_now: AtomicBool::new(false),
+            }))
+        }
+
+        /// The current writer failure, if this pane's durability is degraded.
+        /// Rows stay owned in memory (and readable) while it is degraded.
+        pub(super) fn durability_failure(&self) -> Option<ScrollbackSpillError> {
+            self.lock_health().failure
+        }
+
+        /// Whether a contained writer panic has degraded this pane.
+        #[cfg(test)]
+        pub(super) fn writer_panicked(&self) -> bool {
+            self.lock_health().panicked
+        }
+
+        /// Backing transactions this sink has acknowledged, one per batch.
+        #[cfg(test)]
+        pub(super) fn committed_batches(&self) -> u64 {
+            self.committed_batches.load(Ordering::Acquire)
+        }
+
+        /// Sets this sink's writer budget (tests use private writers).
+        #[cfg(test)]
+        pub(super) fn set_writer_budget(&self, bytes: usize) {
+            self.writer.set_queue_budget(bytes);
+        }
+
+        /// The stable-row spans of queued, not yet written, overload gaps.
+        #[cfg(test)]
+        pub(super) fn queued_gaps(&self) -> Vec<std::ops::Range<StableRowIndex>> {
+            self.state
+                .lock()
+                .unwrap()
+                .pending
+                .iter()
+                .filter_map(|entry| match entry {
+                    Pending::Gap(gap) => Some(gap.start..gap.end),
+                    Pending::Row(_) => None,
+                })
+                .collect()
+        }
+
+        fn lock_health(&self) -> std::sync::MutexGuard<'_, WriterHealth> {
+            // Only plain field updates run under this lock.
+            self.health.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        fn retry_not_before(&self) -> Option<Instant> {
+            self.lock_health().retry_not_before
+        }
+
+        fn record_writer_success(&self) {
+            let mut health = self.lock_health();
+            let recovered = health.failure.take();
+            health.consecutive_failures = 0;
+            health.retry_not_before = None;
+            drop(health);
+            if let Some(error) = recovered {
+                DurabilityLedger::global().record_recovered(&self.pane_label);
+                log::info!(
+                    "scrollback durability for pane {} recovered after: {error}",
+                    self.pane_label
+                );
+            }
+        }
+
+        fn record_writer_failure(&self, error: ScrollbackSpillError, panicked: bool) {
+            let mut health = self.lock_health();
+            let first = health.failure.is_none();
+            health.failure = Some(error);
+            health.panicked |= panicked;
+            health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+            let doublings = health.consecutive_failures.saturating_sub(1).min(5);
+            let delay = RETRY_BACKOFF_MIN
+                .saturating_mul(1 << doublings)
+                .min(RETRY_BACKOFF_MAX);
+            let retry_at = Instant::now() + delay;
+            health.retry_not_before = Some(retry_at);
+            drop(health);
+            // Surfaced by `ft doctor --json` through the resource snapshot.
+            DurabilityLedger::global().record_failure(
+                &self.pane_label,
+                &error.to_string(),
+                panicked,
+            );
+            if panicked {
+                metrics::counter!("mux.scrollback.durability_writer_panics").increment(1);
+            }
+            metrics::counter!("mux.scrollback.durability_writer_failures").increment(1);
+            if first {
+                log::error!(
+                    "scrollback durability for pane {} is degraded{}: {error}; rows stay in memory and the writer retries",
+                    self.pane_label,
+                    if panicked {
+                        " by a contained writer panic"
+                    } else {
+                        ""
+                    }
+                );
+            } else {
+                log::debug!(
+                    target: "mux::scrollback_durability",
+                    "pane={} writer retry failed: {error} retry_in_ms={}",
+                    self.pane_label,
+                    delay.as_millis()
+                );
+            }
+        }
+
+        /// O(1): queue this sink for the writer unless it is already queued.
+        /// Without a writer thread, the caller drains inline instead.
+        fn schedule(&self) {
+            if self.scheduled.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            let enqueued = self
+                .self_ref
+                .upgrade()
+                .is_some_and(|this| self.writer.enqueue(this));
+            if !enqueued {
+                self.scheduled.store(false, Ordering::Release);
+                // Records its own outcome; the caller reads the failure state.
+                let _ = self.flush_scrollback();
+            }
+        }
+
+        fn publish_progress(&self) {
+            let _progress = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
+            self.progress_epoch.fetch_add(1, Ordering::AcqRel);
+            self.progress_signal.notify_all();
+        }
+
+        /// Whether the writer should commit this sink's queued rows now
+        /// (ft-yccm0.2.1.2), or when its open commit window closes.
+        fn commit_window(&self, now: Instant) -> CommitWindow {
+            if self.commit_now.load(Ordering::Acquire) {
+                return CommitWindow::Closed("commit requested");
+            }
+            if self.self_ref.strong_count() <= 1 {
+                return CommitWindow::Closed("pane closed");
+            }
+            let policy = self.writer.commit_policy();
+            if policy.window.is_zero() {
+                return CommitWindow::Closed("windows disabled");
+            }
+            if self.writer.queued_bytes() >= self.writer.queue_budget() / 2 {
+                return CommitWindow::Closed("queue pressure");
+            }
+            let Ok(state) = self.state.lock() else {
+                return CommitWindow::Closed("state unavailable");
+            };
+            if state.pending.is_empty() {
+                return CommitWindow::Closed("nothing queued");
+            }
+            if state.shedding || matches!(state.pending.front(), Some(Pending::Gap(_))) {
+                return CommitWindow::Closed("overload gap");
+            }
+            if state.pending.len() >= MAX_BATCH_ROWS {
+                return CommitWindow::Closed("full batch");
+            }
+            if state.pending_bytes >= policy.window_bytes {
+                return CommitWindow::Closed("window bytes");
+            }
+            let opened = state.window_opened.unwrap_or(now);
+            let last = state.last_admitted.unwrap_or(now);
+            let age_close = opened + policy.window;
+            let idle_close = last + policy.idle;
+            if age_close <= now {
+                CommitWindow::Closed("window age")
+            } else if idle_close <= now {
+                CommitWindow::Closed("idle")
+            } else {
+                CommitWindow::Open {
+                    closes_at: age_close.min(idle_close),
+                }
+            }
+        }
+
+        /// One drain by the writer or an explicit flush. The outcome is
+        /// recorded under the gate, so a stale failure can never overwrite a
+        /// later drain's recovery. Panics are contained here.
+        fn drain_scheduled(&self) -> Result<(), ScrollbackSpillError> {
+            // The gate guards no data: pending-row invariants live in state,
+            // which is never held across backing IO by a drain. A drain that
+            // panicked left every unacknowledged row pending, and the backing
+            // store treats re-sent durable rows as exact retries.
+            let _drain = self
+                .drain_gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            // This drain empties the queue, which closes the window. A commit
+            // request or a closed pane also publishes the backing's manifest
+            // (ft-yccm0.2.1.2).
+            let publish =
+                self.commit_now.swap(false, Ordering::AcqRel) || self.self_ref.strong_count() <= 1;
+            let outcome = frankenterm_sigpipe::catch_recoverable(
+                frankenterm_sigpipe::RecoverablePanicSite::StorageWriter,
+                std::panic::AssertUnwindSafe(|| -> Result<(), ScrollbackSpillError> {
+                    self.drain()?;
+                    if publish {
+                        self.backing.flush_scrollback()?;
+                    }
+                    Ok(())
+                }),
+            );
+            let (error, panicked) = match outcome {
+                Ok(Ok(())) => {
+                    self.record_writer_success();
+                    return Ok(());
+                }
+                Ok(Err(error)) => (error, false),
+                Err(_) => (ScrollbackSpillError::StorageUnavailable, true),
+            };
+            self.record_writer_failure(error, panicked);
+            Err(error)
         }
 
         fn backing_state(backing: &dyn ScrollbackSpillSink) -> Result<State, ScrollbackSpillError> {
@@ -514,23 +1423,17 @@ mod deferred_scrollback {
                         .ok_or(ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))
                 })
                 .transpose()?;
-            Ok(State {
-                interval_identity: ScrollbackIntervalIdentity::default(),
-                publication_uncertain: false,
-                pending: VecDeque::new(),
-                pending_bytes: 0,
-                cached: VecDeque::new(),
-                cached_bytes: 0,
-                durable_bytes: backing.retained_scrollback_bytes(),
+            Ok(State::empty(
+                backing.retained_scrollback_bytes(),
                 oldest,
                 newest_exclusive,
-            })
+            ))
         }
 
         // Charges cell storage and grapheme bytes without allocating a second
         // text serialization under the terminal lock. Shared attribute/image
         // payloads are not a claim about total process memory usage.
-        fn row_charge(line: &Line) -> Option<usize> {
+        pub(super) fn row_charge(line: &Line) -> Option<usize> {
             let cells = line
                 .len()
                 .checked_mul(std::mem::size_of::<wezterm_term::Cell>())?;
@@ -541,70 +1444,488 @@ mod deferred_scrollback {
 
         /// The caller holds operation. Never hold state across backing IO.
         fn drain(&self) -> Result<(), ScrollbackSpillError> {
+            let result = self.drain_entries();
+            if let Ok(mut state) = self.state.lock() {
+                // Nothing is in flight between drains, whatever the outcome.
+                state.in_flight = 0;
+            }
+            result
+        }
+
+        fn drain_entries(&self) -> Result<(), ScrollbackSpillError> {
+            enum Next {
+                Rows {
+                    stable_row: StableRowIndex,
+                    store_row: StableRowIndex,
+                    lines: Vec<Arc<Line>>,
+                    cached: Vec<Arc<Line>>,
+                    retention: usize,
+                },
+                Gap {
+                    gap: GapSpan,
+                    store_row: StableRowIndex,
+                },
+            }
             loop {
                 let next = {
-                    let state = self
+                    let mut state = self
                         .state
                         .lock()
                         .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
                     if state.publication_uncertain {
                         return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
                     }
-                    state.pending.front().map(|first| {
-                        let lines: Vec<_> = state
-                            .pending
-                            .iter()
-                            .take(MAX_PENDING_ROWS)
-                            .take_while(|row| row.retention == first.retention)
-                            .map(|row| Arc::clone(&row.line))
-                            .collect();
-                        // Keep the previous cache alive through retirement as
-                        // well. Last-reference Line destruction must not block
-                        // metadata readers while state is locked.
-                        let cached: Vec<_> = state
-                            .cached
-                            .iter()
-                            .map(|row| Arc::clone(&row.line))
-                            .collect();
-                        (first.stable_row, lines, cached, first.retention)
-                    })
+                    // Every written gap precedes the queue.
+                    let skip = state.store_skip();
+                    let next = match state.pending.front() {
+                        None => None,
+                        Some(Pending::Gap(gap)) => Some(Next::Gap {
+                            gap: *gap,
+                            store_row: gap.start - skip,
+                        }),
+                        Some(Pending::Row(first)) => {
+                            let lines: Vec<_> = state
+                                .pending
+                                .iter()
+                                .take(MAX_BATCH_ROWS)
+                                .map_while(|entry| match entry {
+                                    Pending::Row(row) if row.retention == first.retention => {
+                                        Some(Arc::clone(&row.line))
+                                    }
+                                    _ => None,
+                                })
+                                .collect();
+                            // Keep the previous cache alive through retirement
+                            // as well. Last-reference Line destruction must not
+                            // block metadata readers while state is locked.
+                            let cached: Vec<_> = state
+                                .cached
+                                .iter()
+                                .map(|row| Arc::clone(&row.line))
+                                .collect();
+                            Some(Next::Rows {
+                                stable_row: first.stable_row,
+                                store_row: first.stable_row - skip,
+                                lines,
+                                cached,
+                                retention: first.retention,
+                            })
+                        }
+                    };
+                    state.in_flight = match &next {
+                        None => 0,
+                        Some(Next::Gap { .. }) => 1,
+                        Some(Next::Rows { lines, .. }) => lines.len(),
+                    };
+                    next
                 };
-                let Some((stable_row, pending_lines, cached_lines, retention)) = next else {
-                    return Ok(());
+                match next {
+                    None => return Ok(()),
+                    Some(Next::Gap { gap, store_row }) => self.write_gap(gap, store_row)?,
+                    Some(Next::Rows {
+                        stable_row,
+                        store_row,
+                        lines,
+                        cached,
+                        retention,
+                    }) => self.write_rows(stable_row, store_row, lines, cached, retention)?,
+                }
+            }
+        }
+
+        /// Records a gap as one marker row at its store row (ft-yccm0.2.1.6).
+        fn write_gap(
+            &self,
+            gap: GapSpan,
+            store_row: StableRowIndex,
+        ) -> Result<(), ScrollbackSpillError> {
+            let marker = gap.line_at(gap.start);
+            let (Ok(gap_rows), Ok(gap_bytes)) =
+                (u64::try_from(gap.rows()), u64::try_from(gap.bytes))
+            else {
+                return Err(ScrollbackSpillError::StorageUnavailable);
+            };
+            if !self.backing.store_scrollback_gap_marker(
+                store_row,
+                &marker,
+                gap.retention,
+                gap_rows,
+                gap_bytes,
+            ) {
+                return Err(ScrollbackSpillError::StorageUnavailable);
+            }
+            let durable_bytes = self.backing.retained_scrollback_bytes();
+            let store_oldest = self.backing.oldest_scrollback_row();
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            // in_flight kept admission's overload shedding off this entry.
+            match state.pending.pop_front() {
+                Some(Pending::Gap(front)) if front == gap => {}
+                _ => return Err(ScrollbackSpillError::SnapshotRowMissing),
+            }
+            state.in_flight = 0;
+            if state.pending.is_empty() {
+                state.window_opened = None;
+            }
+            state.written_gaps.push_back(gap);
+            state.prune_written_gaps(store_oldest);
+            // The cached suffix serves contiguous acknowledged rows only.
+            let cached = std::mem::take(&mut state.cached);
+            state.cached_bytes = 0;
+            state.durable_bytes = durable_bytes;
+            self.pending_rows
+                .store(state.pending.len(), Ordering::Release);
+            drop(state);
+            drop(cached);
+            self.committed_batches.fetch_add(1, Ordering::AcqRel);
+            self.publish_progress();
+            metrics::counter!("mux.scrollback.durability_gap_markers").increment(1);
+            if self.writer.publishes() {
+                DurabilityLedger::global().record_gaps(1, 0, 0);
+            }
+            log::debug!(
+                target: "mux::scrollback_durability",
+                "pane={} recorded durability gap rows={}..{} as store row {}",
+                self.pane_label,
+                gap.start,
+                gap.end,
+                store_row
+            );
+            Ok(())
+        }
+
+        fn write_rows(
+            &self,
+            stable_row: StableRowIndex,
+            store_row: StableRowIndex,
+            pending_lines: Vec<Arc<Line>>,
+            cached_lines: Vec<Arc<Line>>,
+            retention: usize,
+        ) -> Result<(), ScrollbackSpillError> {
+            let started = Instant::now();
+            // Only bounded Arc handles were captured under state. Materialize
+            // the backing-store batch outside the metadata critical section.
+            let lines: Vec<_> = pending_lines
+                .iter()
+                .map(|line| line.as_ref().clone())
+                .collect();
+            let acknowledged = self
+                .backing
+                .store_scrollback_lines(store_row, &lines, retention);
+            if acknowledged == 0 || acknowledged > lines.len() {
+                return Err(ScrollbackSpillError::StorageUnavailable);
+            }
+            let durable_bytes = self.backing.retained_scrollback_bytes();
+            let store_oldest = self.backing.oldest_scrollback_row();
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            state.prune_written_gaps(store_oldest);
+            // drain_gate excludes other drainers, operation excludes clear and
+            // replacement, and in_flight keeps overload shedding off the
+            // captured rows, so they are still the front. Keep the owned
+            // plaintext until the backing sink acknowledges durability.
+            let mut acknowledged_bytes = 0usize;
+            for _ in 0..acknowledged {
+                let Some(Pending::Row(row)) = state.pending.pop_front() else {
+                    return Err(ScrollbackSpillError::SnapshotRowMissing);
                 };
-                // Only bounded Arc handles were captured under state. Materialize
-                // the backing-store batch outside the metadata critical section.
-                let lines: Vec<_> = pending_lines
-                    .iter()
-                    .map(|line| line.as_ref().clone())
-                    .collect();
-                let acknowledged = self
-                    .backing
-                    .store_scrollback_lines(stable_row, &lines, retention);
-                if acknowledged == 0 || acknowledged > lines.len() {
-                    return Err(ScrollbackSpillError::StorageUnavailable);
+                state.pending_bytes -= row.charged_bytes;
+                acknowledged_bytes += row.charged_bytes;
+                state.cache_acknowledged(row);
+            }
+            state.in_flight = 0;
+            if state.pending.is_empty() {
+                state.window_opened = None;
+            }
+            state.durable_bytes = durable_bytes;
+            self.pending_rows
+                .store(state.pending.len(), Ordering::Release);
+            let caught_up = state.shedding
+                && self
+                    .writer
+                    .queued_bytes()
+                    .saturating_sub(acknowledged_bytes)
+                    < self.writer.queue_budget() / 2;
+            if caught_up {
+                state.shedding = false;
+            }
+            drop(state);
+            self.writer.release(acknowledged_bytes);
+            self.committed_batches.fetch_add(1, Ordering::AcqRel);
+            self.publish_progress();
+            drop(cached_lines);
+            drop(pending_lines);
+            metrics::counter!("mux.scrollback.deferred_rows_durable")
+                .increment(acknowledged as u64);
+            metrics::histogram!("mux.scrollback.durability_commit_latency_us")
+                .record(started.elapsed().as_micros() as f64);
+            if caught_up {
+                log::warn!(
+                    "scrollback durability for pane {} caught up below half its queue budget at row {}; overload gaps stop",
+                    self.pane_label,
+                    stable_row.saturating_add(acknowledged as StableRowIndex)
+                );
+            }
+            log::debug!(
+                target: "mux::scrollback_durability",
+                "pane={} committed rows={}..{} count={} bytes={} latency_us={}",
+                self.pane_label,
+                stable_row,
+                stable_row.saturating_add(acknowledged as StableRowIndex),
+                acknowledged,
+                acknowledged_bytes,
+                started.elapsed().as_micros()
+            );
+            Ok(())
+        }
+
+        /// Admission body; the trait wrapper records refusals for progress
+        /// waits.
+        fn admit(
+            &self,
+            stable_row: StableRowIndex,
+            line: &Line,
+            retention: usize,
+        ) -> ScrollbackLineAdmission {
+            // A destructive operation leaves the offered row in Screen; never
+            // wait for filesystem IO while the terminal is held. A running
+            // drain holds only drain_gate and does not refuse rows, and a
+            // full queue sheds into a durability gap instead (ft-yccm0.2.1.6).
+            let Ok(_operation) = self.operation.try_lock() else {
+                return ScrollbackLineAdmission::Refused;
+            };
+            let mut dropped = Vec::new();
+            let mut gaps = Vec::new();
+            let mut close_window = false;
+            let (admission, entered_overload) = {
+                let Ok(mut state) = self.state.lock() else {
+                    return ScrollbackLineAdmission::Refused;
+                };
+                let was_shedding = state.shedding;
+                let admission = self.admit_locked(
+                    &mut state,
+                    stable_row,
+                    line,
+                    retention,
+                    &mut dropped,
+                    &mut gaps,
+                    &mut close_window,
+                );
+                (admission, !was_shedding && state.shedding)
+            };
+            if close_window {
+                self.writer.expedite(self);
+            }
+            // Last-reference Line destruction happens outside the state lock.
+            drop(dropped);
+            if !gaps.is_empty() {
+                self.report_gaps(&gaps, entered_overload);
+            }
+            admission
+        }
+
+        /// Logs and counts rows dropped from durability. Entering overload is
+        /// a warning; further gaps while it lasts are debug detail.
+        fn report_gaps(&self, gaps: &[GapSpan], entered: bool) {
+            let rows: StableRowIndex = gaps.iter().map(GapSpan::rows).sum();
+            let bytes: usize = gaps.iter().map(|gap| gap.bytes).sum();
+            metrics::counter!("mux.scrollback.durability_gap_rows_total").increment(rows as u64);
+            metrics::counter!("mux.scrollback.durability_gap_bytes_total").increment(bytes as u64);
+            if self.writer.publishes() {
+                // Gap records are counted when their markers are written.
+                DurabilityLedger::global().record_gaps(0, rows as u64, bytes as u64);
+            }
+            let first = gaps[0].start;
+            let end = gaps[gaps.len() - 1].end;
+            if entered {
+                log::warn!(
+                    "scrollback durability for pane {} is overloaded ({} of {} queued bytes): rows {}..{} ({} rows, {} bytes) are recorded as a durability gap instead of throttling the pane",
+                    self.pane_label,
+                    self.writer.queued_bytes(),
+                    self.writer.queue_budget(),
+                    first,
+                    end,
+                    rows,
+                    bytes
+                );
+            } else {
+                log::debug!(
+                    target: "mux::scrollback_durability",
+                    "pane={} durability gap rows={}..{} count={} bytes={}",
+                    self.pane_label,
+                    first,
+                    end,
+                    rows,
+                    bytes
+                );
+            }
+        }
+
+        fn admit_locked(
+            &self,
+            state: &mut State,
+            stable_row: StableRowIndex,
+            line: &Line,
+            retention: usize,
+            dropped: &mut Vec<Pending>,
+            gaps: &mut Vec<GapSpan>,
+            close_window: &mut bool,
+        ) -> ScrollbackLineAdmission {
+            if state.publication_uncertain {
+                return ScrollbackLineAdmission::Refused;
+            }
+            // Admission appends contiguous rows; draining removes only a
+            // prefix. An exact retry of a queued row is admitted again, and a
+            // row already shed into a queued gap is part of that gap.
+            if let Some(existing) = state.pending_entry(stable_row) {
+                if let Pending::Row(existing) = existing {
+                    if existing.line.as_ref() != line || existing.retention != retention {
+                        return ScrollbackLineAdmission::Refused;
+                    }
                 }
-                let durable_bytes = self.backing.retained_scrollback_bytes();
-                let mut state = self
-                    .state
-                    .lock()
-                    .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-                // operation excludes enqueue, clear and replacement. Keep the
-                // owned plaintext until the backing sink acknowledges durability.
-                for _ in 0..acknowledged {
-                    let row = state
-                        .pending
-                        .pop_front()
-                        .ok_or(ScrollbackSpillError::SnapshotRowMissing)?;
-                    state.pending_bytes -= row.charged_bytes;
-                    state.cache_acknowledged(row);
+                let interval = match (state.oldest, state.newest_exclusive) {
+                    (Some(first), Some(end)) if (first..end).contains(&stable_row) => {
+                        match state.interval_identity.capture(Some(first..end)) {
+                            ScrollbackIntervalCapture::Ready(interval) => Some(interval),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                return ScrollbackLineAdmission::Admitted { interval };
+            }
+            let Ok(retention_rows) = StableRowIndex::try_from(retention) else {
+                return ScrollbackLineAdmission::Refused;
+            };
+            let Some(next) = stable_row.checked_add(1) else {
+                return ScrollbackLineAdmission::Refused;
+            };
+            let Some(charge) = Self::row_charge(line) else {
+                return ScrollbackLineAdmission::Refused;
+            };
+            if retention == 0
+                || state
+                    .newest_exclusive
+                    .is_some_and(|expected| expected != stable_row)
+            {
+                return ScrollbackLineAdmission::Refused;
+            }
+            let oldest = state
+                .oldest
+                .unwrap_or(stable_row)
+                .max(next.saturating_sub(retention_rows));
+
+            // Overload never throttles the pane (ft-yccm0.2.1.6). Past the
+            // budget this pane's oldest queued rows become a durability gap,
+            // down to half the budget so gaps are few and large.
+            let budget = self.writer.queue_budget();
+            let queued = self.writer.queued_bytes();
+            let as_gap = if queued.saturating_add(charge) > budget {
+                let need = queued.saturating_add(charge).saturating_sub(budget / 2);
+                let (freed, mut gone, mut spans) = state.shed(need, unix_now_ms());
+                self.writer.release(freed);
+                dropped.append(&mut gone);
+                gaps.append(&mut spans);
+                state.shedding = true;
+                // Other panes hold the budget, or this row alone exceeds it.
+                self.writer.queued_bytes().saturating_add(charge) > budget
+            } else {
+                false
+            };
+            let window_bytes = self.writer.commit_policy().window_bytes;
+            let window_full = |state: &State| {
+                state.shedding
+                    || state.pending.len() >= MAX_BATCH_ROWS
+                    || state.pending_bytes >= window_bytes
+            };
+            let was_empty = state.pending.is_empty();
+            let was_full = window_full(state);
+            if as_gap {
+                let at_unix_ms = unix_now_ms();
+                let span = GapSpan {
+                    start: stable_row,
+                    end: next,
+                    retention,
+                    bytes: charge,
+                    at_unix_ms,
+                };
+                let tail = state.pending.len().checked_sub(1);
+                match (tail, state.pending.back_mut()) {
+                    (Some(index), Some(Pending::Gap(last)))
+                        if index >= state.in_flight && last.end == stable_row =>
+                    {
+                        last.end = next;
+                        last.bytes += charge;
+                    }
+                    _ => state.pending.push_back(Pending::Gap(span)),
                 }
-                state.durable_bytes = durable_bytes;
-                drop(state);
-                drop(cached_lines);
-                drop(pending_lines);
-                metrics::counter!("mux.scrollback.deferred_rows_durable")
-                    .increment(acknowledged as u64);
+                gaps.push(span);
+            } else {
+                state.pending.push_back(Pending::Row(PendingRow {
+                    stable_row,
+                    line: Arc::new(line.clone()),
+                    retention,
+                    charged_bytes: charge,
+                }));
+                state.pending_bytes += charge;
+                self.writer.charge(charge);
+            }
+            // The commit window opens with the first queued row; reaching a
+            // size threshold closes it early (ft-yccm0.2.1.2).
+            let now = Instant::now();
+            if was_empty {
+                state.window_opened = Some(now);
+            }
+            state.last_admitted = Some(now);
+            *close_window = !was_full && window_full(state);
+            self.pending_rows
+                .store(state.pending.len(), Ordering::Release);
+            state.oldest = Some(oldest);
+            state.newest_exclusive = Some(next);
+            state.prune_cached();
+            metrics::counter!("mux.scrollback.deferred_rows_admitted").increment(1);
+            let interval = match state.interval_identity.capture(Some(oldest..next)) {
+                ScrollbackIntervalCapture::Ready(interval) => Some(interval),
+                _ => None,
+            };
+            ScrollbackLineAdmission::Admitted { interval }
+        }
+    }
+
+    impl Drop for DeferredScrollbackSpillSink {
+        fn drop(&mut self) {
+            // Never silent: rows dropped here were admitted but never became
+            // durable (pane closed while its store was failing, or without a
+            // durability handoff). No IO here; the dropping thread may be a UI
+            // thread.
+            // Rows of a queued gap were never recorded either, not even as a
+            // marker: they count as abandoned too.
+            let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+            let rows: StableRowIndex = state
+                .pending
+                .iter()
+                .map(|entry| entry.end() - entry.start())
+                .sum();
+            let pending = usize::try_from(rows).unwrap_or(usize::MAX);
+            // Return this pane's share of the writer's budget.
+            let queued_bytes = state.pending_bytes;
+            self.writer.release(queued_bytes);
+            let failure = self.lock_health().failure;
+            if pending > 0 {
+                log::error!(
+                    "scrollback durability for pane {} dropped {pending} admitted rows that never became durable (last writer failure: {failure:?})",
+                    self.pane_label
+                );
+                metrics::counter!("mux.scrollback.durability_rows_abandoned")
+                    .increment(pending as u64);
+                DurabilityLedger::global().record_abandoned(&self.pane_label, pending as u64);
+            } else if failure.is_some() {
+                // Nothing undurable was lost; a closed pane is no longer degraded.
+                DurabilityLedger::global().record_recovered(&self.pane_label);
             }
         }
     }
@@ -668,95 +1989,70 @@ mod deferred_scrollback {
             stable_row: StableRowIndex,
             line: &Line,
             retention: usize,
-        ) -> wezterm_term::config::ScrollbackLineAdmission {
-            use wezterm_term::config::ScrollbackLineAdmission;
-            // Queue saturation or another operation leaves the offered row in
-            // Screen; never wait for filesystem IO while the terminal is held.
-            let Ok(_operation) = self.operation.try_lock() else {
-                return ScrollbackLineAdmission::Refused;
-            };
-            let Ok(mut state) = self.state.lock() else {
-                return ScrollbackLineAdmission::Refused;
-            };
-            if state.publication_uncertain {
-                return ScrollbackLineAdmission::Refused;
+        ) -> ScrollbackLineAdmission {
+            // Read before deciding: progress that lands after this load makes
+            // a parser waiting on this refusal retry at once (no lost wakeup).
+            let epoch = self.progress_epoch.load(Ordering::Acquire);
+            let admission = self.admit(stable_row, line, retention);
+            if !admission.accepted() {
+                self.refused_epoch.store(epoch, Ordering::Release);
             }
-            // Admission appends contiguous sequence numbers; draining removes
-            // only a prefix. Retention's oldest can advance beyond pending
-            // rows, so index from the actual queue front instead.
-            let pending_index = state.pending.front().and_then(|first| {
-                stable_row
-                    .checked_sub(first.stable_row)
-                    .and_then(|offset| usize::try_from(offset).ok())
-            });
-            if let Some(existing) = pending_index.and_then(|index| state.pending.get(index)) {
-                if existing.stable_row != stable_row
-                    || existing.line.as_ref() != line
-                    || existing.retention != retention
-                {
-                    return ScrollbackLineAdmission::Refused;
-                }
-                let interval = match (state.oldest, state.newest_exclusive) {
-                    (Some(first), Some(end)) if (first..end).contains(&stable_row) => {
-                        match state.interval_identity.capture(Some(first..end)) {
-                            ScrollbackIntervalCapture::Ready(interval) => Some(interval),
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                };
-                return ScrollbackLineAdmission::Admitted { interval };
-            }
-            let Ok(retention_rows) = StableRowIndex::try_from(retention) else {
-                return ScrollbackLineAdmission::Refused;
-            };
-            let Some(next) = stable_row.checked_add(1) else {
-                return ScrollbackLineAdmission::Refused;
-            };
-            let Some(charge) = Self::row_charge(line) else {
-                return ScrollbackLineAdmission::Refused;
-            };
-            if retention == 0
-                || state
-                    .newest_exclusive
-                    .is_some_and(|expected| expected != stable_row)
-                || state.pending.len() >= MAX_PENDING_ROWS
-                || charge > MAX_PENDING_BYTES.saturating_sub(state.pending_bytes)
-            {
-                return ScrollbackLineAdmission::Refused;
-            }
-            let oldest = state
-                .oldest
-                .unwrap_or(stable_row)
-                .max(next.saturating_sub(retention_rows));
-            state.pending.push_back(PendingRow {
-                stable_row,
-                line: Arc::new(line.clone()),
-                retention,
-                charged_bytes: charge,
-            });
-            state.pending_bytes += charge;
-            state.oldest = Some(oldest);
-            state.newest_exclusive = Some(next);
-            state.prune_cached();
-            metrics::counter!("mux.scrollback.deferred_rows_admitted").increment(1);
-            let interval = match state.interval_identity.capture(Some(oldest..next)) {
-                ScrollbackIntervalCapture::Ready(interval) => Some(interval),
-                _ => None,
-            };
-            ScrollbackLineAdmission::Admitted { interval }
+            admission
         }
 
         fn requires_scrollback_flush(&self) -> bool {
             true
         }
 
+        /// Explicit sync point: drains on the calling thread, serialized with
+        /// the writer, and returns once every admitted row is durable and the
+        /// backing's manifest describes it.
         fn flush_scrollback(&self) -> Result<(), ScrollbackSpillError> {
-            let _operation = self
-                .operation
-                .lock()
-                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-            self.drain()
+            self.commit_now.store(true, Ordering::Release);
+            self.drain_scheduled()
+        }
+
+        fn request_scrollback_flush(&self) -> Result<(), ScrollbackSpillError> {
+            if self.pending_rows.load(Ordering::Acquire) != 0 {
+                self.schedule();
+            }
+            self.durability_failure().map_or(Ok(()), Err)
+        }
+
+        /// Pane close: commit now rather than at the window's end.
+        fn request_scrollback_commit(&self) -> Result<(), ScrollbackSpillError> {
+            self.commit_now.store(true, Ordering::Release);
+            let result = self.request_scrollback_flush();
+            self.writer.expedite(self);
+            result
+        }
+
+        fn await_scrollback_capacity(&self, timeout: Duration) -> ScrollbackCapacityWait {
+            let requested = self.request_scrollback_flush();
+            let refused = self.refused_epoch.load(Ordering::Acquire);
+            let deadline = Instant::now().checked_add(timeout);
+            let mut progress = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
+            loop {
+                if self.progress_epoch.load(Ordering::Acquire) != refused {
+                    return ScrollbackCapacityWait::Progressed;
+                }
+                let now = Instant::now();
+                let remaining =
+                    deadline.map_or(timeout, |deadline| deadline.saturating_duration_since(now));
+                if remaining.is_zero() {
+                    break;
+                }
+                progress = self
+                    .progress_signal
+                    .wait_timeout(progress, remaining)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+            drop(progress);
+            match self.durability_failure().or_else(|| requested.err()) {
+                Some(error) => ScrollbackCapacityWait::Failed(error),
+                None => ScrollbackCapacityWait::TimedOut,
+            }
         }
 
         fn load_scrollback_line(&self, stable_row: StableRowIndex) -> Option<Line> {
@@ -778,7 +2074,18 @@ mod deferred_scrollback {
             // even when the requested durable prefix is already available.
             // The backing read serializes its own IO; validate the lineage
             // afterwards so clear, replacement and retention cannot mix rows.
-            let (end, pending, interval, cached_range) = {
+            /// Where a durable span of stable rows is read from.
+            enum Durable {
+                /// Store rows from `store_start`, one per stable row.
+                Store { store_start: StableRowIndex },
+                /// A written gap's marker and empty rows (ft-yccm0.2.1.6).
+                Gap(GapSpan),
+            }
+            enum Memory {
+                Line(Arc<Line>),
+                Gap(GapSpan),
+            }
+            let (end, pending, interval, cached_range, plan) = {
                 let Ok(state) = self.state.lock() else {
                     return Vec::new();
                 };
@@ -794,32 +2101,85 @@ mod deferred_scrollback {
                     return Vec::new();
                 };
                 let end = rows.end.min(newest).min(rows.start.saturating_add(32));
-                let pending = state
+                let in_range = |row: StableRowIndex| row >= rows.start && row < end;
+                let mut pending: Vec<(StableRowIndex, Memory)> = state
                     .cached
                     .iter()
-                    .chain(state.pending.iter())
-                    .filter(|row| row.stable_row >= rows.start && row.stable_row < end)
-                    .map(|row| (row.stable_row, Arc::clone(&row.line)))
-                    .collect::<Vec<_>>();
+                    .filter(|row| in_range(row.stable_row))
+                    .map(|row| (row.stable_row, Memory::Line(Arc::clone(&row.line))))
+                    .collect();
+                for entry in &state.pending {
+                    match entry {
+                        Pending::Row(row) if in_range(row.stable_row) => {
+                            pending.push((row.stable_row, Memory::Line(Arc::clone(&row.line))));
+                        }
+                        Pending::Row(_) => {}
+                        Pending::Gap(gap) => {
+                            for row in gap.start.max(rows.start)..gap.end.min(end) {
+                                pending.push((row, Memory::Gap(*gap)));
+                            }
+                        }
+                    }
+                }
                 let cached_range = state
                     .cached
                     .front()
                     .zip(state.cached.back())
                     .map(|(first, last)| first.stable_row..last.stable_row.saturating_add(1));
-                (end, pending, interval, cached_range)
+                // The durable prefix: written gaps are synthesized, and the
+                // spans between them map to store rows, which sit lower than
+                // their stable rows by the gaps before them.
+                let durable_end = pending.first().map_or(end, |(row, _)| *row);
+                let mut plan = Vec::new();
+                let mut at = rows.start;
+                for gap in &state.written_gaps {
+                    if gap.end <= at {
+                        continue;
+                    }
+                    if gap.start >= durable_end {
+                        break;
+                    }
+                    if gap.start > at {
+                        let store_start = at - state.store_skip_before(at);
+                        plan.push((at..gap.start, Durable::Store { store_start }));
+                    }
+                    let gap_end = gap.end.min(durable_end);
+                    plan.push((gap.start.max(at)..gap_end, Durable::Gap(*gap)));
+                    at = gap_end;
+                }
+                if at < durable_end {
+                    let store_start = at - state.store_skip_before(at);
+                    plan.push((at..durable_end, Durable::Store { store_start }));
+                }
+                (end, pending, interval, cached_range, plan)
             };
             let durable_end = pending.first().map_or(end, |(row, _)| *row);
-            let mut result = if durable_end > rows.start {
-                self.backing.load_scrollback_lines(rows.start..durable_end)
-            } else {
-                Vec::new()
-            };
+            let mut result = Vec::new();
+            for (span, source) in plan {
+                match source {
+                    Durable::Store { store_start } => {
+                        let len = span.end - span.start;
+                        let lines = self
+                            .backing
+                            .load_scrollback_lines(store_start..store_start + len);
+                        let complete = lines.len() == len as usize;
+                        result.extend(lines);
+                        if !complete {
+                            break;
+                        }
+                    }
+                    Durable::Gap(gap) => result.extend(span.map(|row| gap.line_at(row))),
+                }
+            }
             if result.len() == (durable_end - rows.start) as usize {
-                for (row, line) in pending {
+                for (row, memory) in pending {
                     if row != rows.start + result.len() as StableRowIndex {
                         break;
                     }
-                    result.push(line.as_ref().clone());
+                    result.push(match memory {
+                        Memory::Line(line) => line.as_ref().clone(),
+                        Memory::Gap(gap) => gap.line_at(row),
+                    });
                 }
             }
             let Ok(state) = self.state.lock() else {
@@ -886,8 +2246,98 @@ mod deferred_scrollback {
                 .operation
                 .lock()
                 .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            let _drain = self
+                .drain_gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             self.drain()?;
-            self.backing.snapshot_scrollback(newest, limits)
+            let (gaps, mut skip) = {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+                (
+                    state.written_gaps.iter().copied().collect::<Vec<_>>(),
+                    state.pruned_gap_skip,
+                )
+            };
+            if gaps.is_empty() && skip == 0 {
+                return self.backing.snapshot_scrollback(newest, limits);
+            }
+            // The store holds each written gap as one marker row
+            // (ft-yccm0.2.1.6): read the store's rows, then expand every marker
+            // back into the gap's stable rows.
+            if gaps
+                .iter()
+                .any(|gap| gap.start < newest && newest < gap.end)
+            {
+                return Err(ScrollbackSpillError::SnapshotRangeMismatch);
+            }
+            let newest_skip = skip
+                + gaps
+                    .iter()
+                    .filter(|gap| gap.end <= newest)
+                    .map(|gap| gap.rows() - 1)
+                    .sum::<StableRowIndex>();
+            let snapshot = self
+                .backing
+                .snapshot_scrollback(newest - newest_skip, limits)?;
+            let Some(store_oldest) = snapshot.oldest_stable_row() else {
+                return ScrollbackSnapshot::from_contiguous_rows(
+                    snapshot.generation(),
+                    snapshot.fidelity(),
+                    None,
+                    newest,
+                    snapshot.stored_bytes(),
+                    snapshot.decoded_bytes(),
+                    Vec::new(),
+                );
+            };
+            let mut next_gap = 0;
+            while next_gap < gaps.len() && gaps[next_gap].start - skip < store_oldest {
+                skip += gaps[next_gap].rows() - 1;
+                next_gap += 1;
+            }
+            let oldest = store_oldest + skip;
+            let generation = snapshot.generation();
+            let fidelity = snapshot.fidelity();
+            let stored_bytes = snapshot.stored_bytes();
+            let decoded_bytes = snapshot.decoded_bytes();
+            let store_rows = snapshot.into_rows();
+            let mut rows = Vec::with_capacity(store_rows.len());
+            for (offset, line) in store_rows.into_iter().enumerate() {
+                rows.push(line);
+                let store_row = store_oldest + offset as StableRowIndex;
+                if let Some(gap) = gaps.get(next_gap) {
+                    if gap.start - skip == store_row {
+                        rows.extend((gap.start + 1..gap.end).map(|row| gap.line_at(row)));
+                        skip += gap.rows() - 1;
+                        next_gap += 1;
+                    }
+                }
+            }
+            if oldest + rows.len() as StableRowIndex != newest {
+                return Err(ScrollbackSpillError::SnapshotRangeMismatch);
+            }
+            // The store's contract is every retained row or a ResourceLimit,
+            // never a truncated snapshot. It checked its own (marker-compact)
+            // row count; the expanded stable rows must pass the same limit.
+            if rows.len() > limits.max_rows {
+                return Err(ScrollbackSpillError::ResourceLimit {
+                    resource: "rows",
+                    observed: u64::try_from(rows.len()).unwrap_or(u64::MAX),
+                    maximum: u64::try_from(limits.max_rows).unwrap_or(u64::MAX),
+                });
+            }
+            ScrollbackSnapshot::from_contiguous_rows(
+                generation,
+                fidelity,
+                (!rows.is_empty()).then_some(oldest),
+                newest,
+                stored_bytes,
+                decoded_bytes,
+                rows,
+            )
         }
 
         fn replace_scrollback_prefix(
@@ -900,6 +2350,12 @@ mod deferred_scrollback {
                 .operation
                 .lock()
                 .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+            // An in-flight writer batch must finish before the generation
+            // changes under it.
+            let _drain = self
+                .drain_gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             let mut state = self
                 .state
                 .lock()
@@ -941,17 +2397,19 @@ mod deferred_scrollback {
                 state.publication_uncertain = true;
                 return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
             }
+            // The replaced prefix is written row for row, so its store rows
+            // equal its stable rows again: no gap offset survives.
             *state = State {
                 interval_identity,
-                publication_uncertain: false,
-                pending: VecDeque::new(),
-                pending_bytes: 0,
-                cached: VecDeque::new(),
-                cached_bytes: 0,
-                durable_bytes: self.backing.retained_scrollback_bytes(),
-                oldest: receipt.oldest_stable_row(),
-                newest_exclusive: Some(receipt.newest_stable_row_exclusive()),
+                ..State::empty(
+                    self.backing.retained_scrollback_bytes(),
+                    receipt.oldest_stable_row(),
+                    Some(receipt.newest_stable_row_exclusive()),
+                )
             };
+            self.pending_rows.store(0, Ordering::Release);
+            drop(state);
+            self.publish_progress();
             Ok(receipt)
         }
 
@@ -960,9 +2418,15 @@ mod deferred_scrollback {
                 .operation
                 .lock()
                 .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-            // A successful explicit clear discards both the durable generation
-            // and its queued suffix. On failure every queued row stays owned,
-            // but indeterminate publication cannot authorize new UI results.
+            // Wait out an in-flight writer batch: an append landing after the
+            // clear would resurrect rows from before it. A successful explicit
+            // clear discards both the durable generation and its queued
+            // suffix. On failure every queued row stays owned, but
+            // indeterminate publication cannot authorize new UI results.
+            let _drain = self
+                .drain_gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             let mut state = self
                 .state
                 .lock()
@@ -979,17 +2443,19 @@ mod deferred_scrollback {
                     return Err(error);
                 }
             };
-            *state = State {
-                interval_identity,
-                publication_uncertain: false,
-                pending: VecDeque::new(),
-                pending_bytes: 0,
-                cached: VecDeque::new(),
-                cached_bytes: 0,
-                durable_bytes: 0,
-                oldest: None,
-                newest_exclusive: None,
-            };
+            let released = state.pending_bytes;
+            // Dropped after the state lock is released (end of scope).
+            let _discarded = std::mem::replace(
+                &mut *state,
+                State {
+                    interval_identity,
+                    ..State::empty(0, None, None)
+                },
+            );
+            self.pending_rows.store(0, Ordering::Release);
+            self.writer.release(released);
+            drop(state);
+            self.publish_progress();
             Ok(receipt)
         }
     }
@@ -1020,6 +2486,17 @@ mod deferred_scrollback {
                 .accepted()
         );
         drop(operation);
+        // A drain in flight is not a destructive operation: the parser keeps
+        // admitting rows while the writer is inside a transaction.
+        let drain = deferred.drain_gate.lock().unwrap();
+        let ScrollbackLineAdmission::Admitted {
+            interval: Some(during_drain),
+        } = deferred.store_scrollback_line_with_receipt(11, &line, 2)
+        else {
+            panic!("admission must not wait for or refuse on an in-flight drain");
+        };
+        assert!(during_drain.retains(&admitted, 10..11));
+        drop(drain);
         assert!(
             !deferred
                 .store_scrollback_line_with_receipt(10, &Line::new(1), 2)
@@ -1114,17 +2591,17 @@ mod deferred_scrollback {
         assert!(deferred.store_scrollback_line(1, &pending, 8));
         assert_eq!(backing.retained_scrollback_rows(), 1);
 
-        // Hold the exact transaction lock that a parser flush owns. The real
-        // backing prefix is readable; a read must not wait for the whole drain.
-        let operation = deferred.operation.lock().unwrap();
-        assert!(deferred.operation.try_lock().is_err());
+        // Hold the exact lock a durability drain owns. The real backing prefix
+        // is readable; a read must not wait for the whole drain.
+        let drain = deferred.drain_gate.lock().unwrap();
+        assert!(deferred.drain_gate.try_lock().is_err());
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let reading = Arc::clone(&deferred);
         let reader = std::thread::spawn(move || {
             tx.send(reading.load_scrollback_lines(0..2)).unwrap();
         });
         let result = rx.recv_timeout(std::time::Duration::from_secs(1));
-        drop(operation);
+        drop(drain);
         reader.join().unwrap();
         assert_eq!(result.unwrap(), vec![durable, pending]);
         assert_eq!(backing.retained_scrollback_rows(), 1);
@@ -1158,7 +2635,10 @@ mod deferred_scrollback {
         for row in 0..64 {
             assert!(deferred.store_scrollback_line(row, &line, 128));
         }
-        let original = Arc::clone(&deferred.state.lock().unwrap().pending.back().unwrap().line);
+        let original = match deferred.state.lock().unwrap().pending.back() {
+            Some(Pending::Row(row)) => Arc::clone(&row.line),
+            _ => panic!("the newest queued entry is a row"),
+        };
         deferred.flush_scrollback().unwrap();
         {
             let state = deferred.state.lock().unwrap();
@@ -1312,6 +2792,892 @@ mod deferred_scrollback {
             "an incomplete retained interval must not turn into zero usage"
         );
     }
+
+    /// A backing store whose writes can be stalled or made to panic, so the
+    /// durability writer can be driven deterministically (ft-yccm0.2.1.1).
+    /// It accepts only contiguous, in-order batches: a gap or a replay is
+    /// refused, which the tests would observe as a writer failure.
+    #[cfg(test)]
+    #[derive(Debug, Default)]
+    struct GatedStore {
+        rows: Mutex<Vec<(StableRowIndex, String)>>,
+        gate: Mutex<GateState>,
+        gate_signal: Condvar,
+    }
+
+    #[cfg(test)]
+    #[derive(Debug, Default)]
+    struct GateState {
+        closed: bool,
+        inside: usize,
+        panic_on_store: bool,
+        writer_thread: Option<String>,
+        writer_qos: Option<procinfo::ThreadQos>,
+    }
+
+    #[cfg(test)]
+    impl GatedStore {
+        fn text(row: StableRowIndex) -> String {
+            format!("row {row}")
+        }
+
+        fn line(row: StableRowIndex) -> Line {
+            Line::from_text(
+                &Self::text(row),
+                &wezterm_term::CellAttributes::blank(),
+                0,
+                None,
+            )
+        }
+
+        fn set_closed(&self, closed: bool) {
+            self.gate.lock().unwrap().closed = closed;
+            self.gate_signal.notify_all();
+        }
+
+        fn set_panic(&self, panic_on_store: bool) {
+            self.gate.lock().unwrap().panic_on_store = panic_on_store;
+        }
+
+        fn inside(&self) -> usize {
+            self.gate.lock().unwrap().inside
+        }
+
+        fn writer_thread(&self) -> Option<String> {
+            self.gate.lock().unwrap().writer_thread.clone()
+        }
+
+        fn writer_qos(&self) -> Option<procinfo::ThreadQos> {
+            self.gate.lock().unwrap().writer_qos
+        }
+
+        fn wait_until_inside(&self) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut gate = self.gate.lock().unwrap();
+            while gate.inside == 0 {
+                let now = Instant::now();
+                assert!(now < deadline, "the writer never entered the store");
+                gate = self
+                    .gate_signal
+                    .wait_timeout(gate, deadline - now)
+                    .unwrap()
+                    .0;
+            }
+        }
+
+        fn rows(&self) -> Vec<(StableRowIndex, String)> {
+            self.rows.lock().unwrap().clone()
+        }
+    }
+
+    #[cfg(test)]
+    impl ScrollbackSpillSink for GatedStore {
+        fn store_scrollback_line(
+            &self,
+            stable_row: StableRowIndex,
+            line: &Line,
+            retention: usize,
+        ) -> bool {
+            self.store_scrollback_lines(stable_row, std::slice::from_ref(line), retention) == 1
+        }
+
+        fn store_scrollback_lines(
+            &self,
+            first: StableRowIndex,
+            lines: &[Line],
+            _retention: usize,
+        ) -> usize {
+            {
+                let mut gate = self.gate.lock().unwrap();
+                gate.writer_thread = std::thread::current().name().map(str::to_owned);
+                gate.writer_qos = procinfo::current_thread_qos();
+                if gate.panic_on_store {
+                    drop(gate);
+                    panic!("injected scrollback store panic");
+                }
+                gate.inside += 1;
+                self.gate_signal.notify_all();
+                while gate.closed {
+                    gate = self.gate_signal.wait(gate).unwrap();
+                }
+                gate.inside -= 1;
+            }
+            let mut rows = self.rows.lock().unwrap();
+            if rows.last().is_some_and(|(last, _)| last + 1 != first) {
+                return 0;
+            }
+            for (offset, line) in lines.iter().enumerate() {
+                rows.push((
+                    first + offset as StableRowIndex,
+                    line.as_str().trim_end().to_string(),
+                ));
+            }
+            lines.len()
+        }
+
+        fn load_scrollback_line(&self, stable_row: StableRowIndex) -> Option<Line> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(row, _)| *row == stable_row)
+                .map(|(_, text)| {
+                    Line::from_text(text, &wezterm_term::CellAttributes::blank(), 0, None)
+                })
+        }
+
+        fn oldest_scrollback_row(&self) -> Option<StableRowIndex> {
+            self.rows.lock().unwrap().first().map(|(row, _)| *row)
+        }
+
+        fn retained_scrollback_rows(&self) -> usize {
+            self.rows.lock().unwrap().len()
+        }
+
+        fn retained_scrollback_bytes(&self) -> usize {
+            0
+        }
+
+        fn snapshot_scrollback(
+            &self,
+            _newest: StableRowIndex,
+            _limits: ScrollbackSnapshotLimits,
+        ) -> Result<ScrollbackSnapshot, ScrollbackSpillError> {
+            Err(ScrollbackSpillError::StorageUnavailable)
+        }
+
+        fn replace_scrollback_prefix(
+            &self,
+            _expected: Option<ScrollbackSnapshotGeneration>,
+            _prefix: ScrollbackPrefix<'_>,
+            _retention: usize,
+        ) -> Result<ScrollbackReplaceCommit, ScrollbackSpillError> {
+            Err(ScrollbackSpillError::StorageUnavailable)
+        }
+
+        fn clear_scrollback(&self) -> Result<ScrollbackClearCommit, ScrollbackSpillError> {
+            Err(ScrollbackSpillError::StorageUnavailable)
+        }
+    }
+
+    #[test]
+    fn durability_writer_handoff_never_blocks_on_a_stalled_store() {
+        let store = Arc::new(GatedStore::default());
+        store.set_closed(true);
+        let sink = DeferredScrollbackSpillSink::with_writer(
+            store.clone(),
+            [0x51; 16],
+            DurabilityWriter::spawn(),
+        )
+        .unwrap();
+        let retention = 1 << 20;
+        assert!(sink.store_scrollback_line(0, &GatedStore::line(0), retention));
+        sink.request_scrollback_flush().unwrap();
+        store.wait_until_inside();
+        assert_eq!(
+            store.writer_thread().as_deref(),
+            Some(DURABILITY_THREAD_NAME),
+            "store IO runs on the durability writer thread"
+        );
+        assert_eq!(
+            store.writer_qos(),
+            cfg!(target_os = "macos").then_some(procinfo::ThreadQos::Utility),
+            "the writer runs at QoS utility on macOS (no QoS classes elsewhere)"
+        );
+
+        // Every admission and handoff completes while the writer is provably
+        // stuck inside the store.
+        let mut latencies = Vec::with_capacity(512);
+        for row in 1..=512 {
+            let started = Instant::now();
+            assert!(sink.store_scrollback_line(row, &GatedStore::line(row), retention));
+            sink.request_scrollback_flush().unwrap();
+            latencies.push(started.elapsed());
+        }
+        assert_eq!(store.inside(), 1, "the writer is still inside the store");
+        latencies.sort();
+        let median = latencies[latencies.len() / 2];
+        assert!(
+            median < Duration::from_millis(1),
+            "median admission + handoff took {median:?}"
+        );
+        // Queued rows stay readable while their write is stalled.
+        assert_eq!(
+            sink.load_scrollback_line(300)
+                .map(|line| line.as_str().trim_end().to_string()),
+            Some(GatedStore::text(300))
+        );
+
+        // ft-yccm0.2.1.6 replaced "a full queue refuses rows": past the
+        // writer's byte budget the oldest queued rows become one durability
+        // gap, so admission never refuses and the parser never waits. A small
+        // budget makes the stalled queue overflow.
+        let charge = DeferredScrollbackSpillSink::row_charge(&GatedStore::line(1999)).unwrap();
+        sink.writer.set_queue_budget(charge * 600);
+        let budget = sink.writer.queue_budget();
+        let mut shedding_latencies = Vec::with_capacity(1_487);
+        for row in 513..2_000 {
+            let started = Instant::now();
+            assert!(sink.store_scrollback_line(row, &GatedStore::line(row), retention));
+            sink.request_scrollback_flush().unwrap();
+            shedding_latencies.push(started.elapsed());
+            assert!(
+                sink.writer.queued_bytes() <= budget,
+                "row {row} broke the budget"
+            );
+        }
+        // The parser never waits on the stalled writer, shedding included.
+        assert_eq!(store.inside(), 1, "the writer is still inside the store");
+        shedding_latencies.sort();
+        let median = shedding_latencies[shedding_latencies.len() / 2];
+        assert!(
+            median < Duration::from_millis(1),
+            "median admission + handoff while shedding took {median:?}"
+        );
+        let gap = {
+            let state = sink.state.lock().unwrap();
+            // The row the stalled writer holds is never shed; every later
+            // overflow coalesced into one gap from row 1.
+            assert!(matches!(&state.pending[0], Pending::Row(row) if row.stable_row == 0));
+            let Pending::Gap(gap) = state.pending[1] else {
+                panic!("the oldest queued rows after the in-flight one form a gap");
+            };
+            assert_eq!(gap.start, 1);
+            let dropped: usize = (gap.start..gap.end)
+                .map(|row| DeferredScrollbackSpillSink::row_charge(&GatedStore::line(row)).unwrap())
+                .sum();
+            assert_eq!(
+                gap.bytes, dropped,
+                "the gap accounts for every dropped byte"
+            );
+            assert_eq!(state.pending.len(), 2 + (2_000 - gap.end) as usize);
+            assert!(state.shedding);
+            gap
+        };
+        // Rows inside a queued gap read as the marker and empty rows.
+        assert_eq!(
+            sink.load_scrollback_line(1)
+                .map(|line| line.as_str().trim_end().to_string()),
+            Some(gap.marker_text())
+        );
+        assert_eq!(sink.load_scrollback_line(2).map(|line| line.len()), Some(0));
+
+        // A destructive operation still refuses a row (it stays in Screen),
+        // and writer progress wakes a parser waiting on that refusal.
+        let operation = sink.operation.lock().unwrap();
+        assert!(!sink.store_scrollback_line(2_000, &GatedStore::line(2_000), retention));
+        drop(operation);
+        store.set_closed(false);
+        assert_eq!(
+            sink.await_scrollback_capacity(Duration::from_secs(10)),
+            ScrollbackCapacityWait::Progressed
+        );
+        sink.flush_scrollback().unwrap();
+        // The store holds the gap as one marker row, in order.
+        let mut expected = vec![(0, GatedStore::text(0)), (1, gap.marker_text())];
+        expected.extend((gap.end..2_000).map(|row| (row - gap.rows() + 1, GatedStore::text(row))));
+        assert_eq!(store.rows(), expected);
+        // Reads translate stable rows to store rows around the gap.
+        for row in [0, gap.end, gap.end + 1, 1_900] {
+            assert_eq!(
+                sink.load_scrollback_line(row)
+                    .map(|line| line.as_str().trim_end().to_string()),
+                Some(GatedStore::text(row)),
+                "row {row}"
+            );
+        }
+        let span = sink.load_scrollback_lines(0..4);
+        assert_eq!(span.len(), 4);
+        assert_eq!(span[1].as_str().trim_end(), gap.marker_text());
+        assert!(span[2].is_whitespace() && span[3].is_whitespace());
+        assert!(sink.writer.queued_bytes() < budget / 2);
+        assert!(
+            !sink.state.lock().unwrap().shedding,
+            "caught up below half the budget"
+        );
+        assert_eq!(sink.durability_failure(), None);
+    }
+
+    #[test]
+    fn overload_gap_is_one_durable_marker_that_snapshots_and_recovery_see() {
+        use wezterm_term::CellAttributes;
+
+        let (dir, backing, deferred) = super::tests::deferred_test_sink();
+        let line = |row: StableRowIndex| {
+            Line::from_text(&format!("flood {row}"), &CellAttributes::blank(), 0, None)
+        };
+        let text = |line: &Line| line.as_str().trim_end().to_string();
+        for row in 0..10 {
+            assert!(deferred.store_scrollback_line(row, &line(row), 1_000));
+        }
+        deferred.flush_scrollback().unwrap();
+        // Nothing drains until the explicit flush, so admission alone sheds.
+        let charge = DeferredScrollbackSpillSink::row_charge(&line(99)).unwrap();
+        deferred.writer.set_queue_budget(charge * 40);
+        for row in 10..100 {
+            assert!(deferred.store_scrollback_line(row, &line(row), 1_000));
+        }
+        let gaps: Vec<GapSpan> = deferred
+            .state
+            .lock()
+            .unwrap()
+            .pending
+            .iter()
+            .filter_map(|entry| match entry {
+                Pending::Gap(gap) => Some(*gap),
+                Pending::Row(_) => None,
+            })
+            .collect();
+        assert_eq!(gaps.len(), 1, "repeated sheds coalesce into one gap");
+        let gap = gaps[0];
+        assert_eq!(gap.start, 10);
+        assert!(gap.end < 95, "half the budget stays queued as rows");
+        deferred.flush_scrollback().unwrap();
+        let kept = 10 + 1 + (100 - gap.end) as usize;
+        assert_eq!(
+            backing.retained_scrollback_rows(),
+            kept,
+            "one marker row per gap"
+        );
+        // export-durable shows the gap explicitly, in order.
+        let export = super::export_live_scrollback_transcript(
+            dir.path(),
+            &uuid::Uuid::from_bytes([0xd3; 16]).simple().to_string(),
+            256,
+            64 * 1024,
+            4 * 1024 * 1024,
+        )
+        .expect("export durable transcript");
+        let mut expected: Vec<String> = (0..10).map(|row| format!("flood {row}")).collect();
+        expected.push(gap.marker_text());
+        expected.extend((gap.end..100).map(|row| format!("flood {row}")));
+        let exported: Vec<String> = export
+            .transcript
+            .lines()
+            .map(|line| line.trim_end().to_string())
+            .collect();
+        assert_eq!(exported, expected);
+
+        // A checkpoint snapshot sees stable rows: the marker expands back into
+        // the gap's rows, and a row limit keeps the newest rows.
+        let limits = |max_rows| ScrollbackSnapshotLimits {
+            max_rows,
+            max_stored_bytes: 1 << 20,
+            max_decoded_bytes: 1 << 20,
+            max_physical_bytes: 1 << 20,
+        };
+        let snapshot = deferred.snapshot_scrollback(100, limits(1_000)).unwrap();
+        assert_eq!(snapshot.oldest_stable_row(), Some(0));
+        assert_eq!(snapshot.newest_stable_row_exclusive(), 100);
+        let rows: Vec<String> = snapshot.rows().iter().map(text).collect();
+        for (row, actual) in (0..).zip(&rows) {
+            let expected = if row < gap.start || row >= gap.end {
+                format!("flood {row}")
+            } else if row == gap.start {
+                gap.marker_text()
+            } else {
+                String::new()
+            };
+            assert_eq!(*actual, expected, "snapshot row {row}");
+        }
+        assert_eq!(rows.len(), 100);
+        // A row limit never truncates a snapshot (the store's contract is
+        // every retained row or ResourceLimit). Below the store's own,
+        // marker-compact row count the store refuses; between that and the
+        // expanded stable rows the expansion refuses the same way.
+        assert_eq!(
+            deferred.snapshot_scrollback(100, limits(5)).unwrap_err(),
+            ScrollbackSpillError::ResourceLimit {
+                resource: "rows",
+                observed: kept as u64,
+                maximum: 5,
+            }
+        );
+        assert_eq!(
+            deferred.snapshot_scrollback(100, limits(kept)).unwrap_err(),
+            ScrollbackSpillError::ResourceLimit {
+                resource: "rows",
+                observed: 100,
+                maximum: kept as u64,
+            }
+        );
+
+        // Recovery: the reopened store carries the marker in order, between
+        // the rows before and after the gap.
+        drop(deferred);
+        drop(backing);
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 913,
+            domain_id: 3,
+            durable_pane_id: [0xd3; 16],
+            command_description: "deferred-scrollback-test".to_string(),
+        };
+        let reopened =
+            super::LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context).unwrap();
+        assert_eq!(reopened.retained_scrollback_rows(), kept);
+        assert_eq!(text(&reopened.load_scrollback_line(9).unwrap()), "flood 9");
+        assert_eq!(
+            text(&reopened.load_scrollback_line(10).unwrap()),
+            gap.marker_text()
+        );
+        assert_eq!(
+            text(&reopened.load_scrollback_line(11).unwrap()),
+            format!("flood {}", gap.end)
+        );
+    }
+
+    /// ft-yccm0.2.1.6: `ft session list-durable` reports, from the manifest
+    /// alone, exactly the gaps `export-durable` shows as marker rows. A fresh
+    /// lineage lists a count of zero (not unknown), each overload adds its
+    /// marker's rows and bytes, and a reopened sink keeps the totals.
+    #[test]
+    fn list_durable_reports_the_gap_rows_export_durable_shows() {
+        use wezterm_term::CellAttributes;
+
+        let (dir, backing, deferred) = super::tests::deferred_test_sink();
+        let pane = uuid::Uuid::from_bytes([0xd3; 16]).simple().to_string();
+        let line = |row: StableRowIndex| {
+            Line::from_text(&format!("flood {row}"), &CellAttributes::blank(), 0, None)
+        };
+        let listed = || {
+            let panes =
+                super::list_live_scrollback_panes(dir.path(), 16).expect("list durable panes");
+            assert_eq!(panes.len(), 1);
+            assert_eq!(panes[0].durable_pane_id, pane);
+            panes[0].durability_gaps
+        };
+        for row in 0..10 {
+            assert!(deferred.store_scrollback_line(row, &line(row), 1_000));
+        }
+        deferred.flush_scrollback().unwrap();
+        assert_eq!(
+            listed(),
+            Some(super::LiveScrollbackDurabilityGaps::default()),
+            "a fresh lineage lists a count of zero, not unknown"
+        );
+
+        // Nothing drains until each explicit flush, so each flood sheds.
+        let charge = DeferredScrollbackSpillSink::row_charge(&line(999)).unwrap();
+        deferred.writer.set_queue_budget(charge * 40);
+        let mut shed = Vec::new();
+        for flood in [10..100, 100..190] {
+            for row in flood {
+                assert!(deferred.store_scrollback_line(row, &line(row), 1_000));
+            }
+            shed.extend(deferred.state.lock().unwrap().pending.iter().filter_map(
+                |entry| match entry {
+                    Pending::Gap(gap) => Some(*gap),
+                    Pending::Row(_) => None,
+                },
+            ));
+            deferred.flush_scrollback().unwrap();
+        }
+        assert_eq!(shed.len(), 2, "each flood sheds one gap");
+
+        let export =
+            super::export_live_scrollback_transcript(dir.path(), &pane, 1024, 1 << 20, 16 << 20)
+                .expect("export durable transcript");
+        let exported: Vec<(u64, u64)> = export
+            .transcript
+            .lines()
+            .filter_map(|line| line.trim_end().strip_prefix(GAP_MARKER_PREFIX))
+            .map(|marker| {
+                let (rows, rest) = marker.split_once(" rows (").unwrap();
+                let (_range, rest) = rest.split_once("), ").unwrap();
+                let (bytes, _) = rest.split_once(" bytes").unwrap();
+                (rows.parse().unwrap(), bytes.parse().unwrap())
+            })
+            .collect();
+        let expected: Vec<(u64, u64)> = shed
+            .iter()
+            .map(|gap| {
+                (
+                    u64::try_from(gap.rows()).unwrap(),
+                    u64::try_from(gap.bytes).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(exported, expected, "export shows each gap as one marker");
+        let totals = listed().expect("a lineage that recorded its gaps lists them");
+        assert_eq!(
+            totals,
+            super::LiveScrollbackDurabilityGaps {
+                markers: 2,
+                rows: exported.iter().map(|(rows, _)| rows).sum(),
+                bytes: exported.iter().map(|(_, bytes)| bytes).sum(),
+            }
+        );
+
+        drop(deferred);
+        drop(backing);
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 913,
+            domain_id: 3,
+            durable_pane_id: [0xd3; 16],
+            command_description: "deferred-scrollback-test".to_string(),
+        };
+        let reopened =
+            super::LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context).unwrap();
+        assert_eq!(
+            reopened
+                .lock_state("test reopened gap totals")
+                .unwrap()
+                .durability_gaps,
+            Some(totals)
+        );
+        drop(reopened);
+        assert_eq!(listed(), Some(totals));
+    }
+
+    /// A sink on a private writer with `policy`, over an open GatedStore.
+    #[cfg(test)]
+    fn windowed_sink(
+        policy: CommitPolicy,
+        pane: u8,
+    ) -> (Arc<GatedStore>, Arc<DeferredScrollbackSpillSink>) {
+        let store = Arc::new(GatedStore::default());
+        let writer = DurabilityWriter::spawn();
+        writer.set_commit_policy(policy);
+        let sink =
+            DeferredScrollbackSpillSink::with_writer(store.clone(), [pane; 16], writer).unwrap();
+        (store, sink)
+    }
+
+    #[cfg(test)]
+    fn wait_for_rows(store: &GatedStore, rows: usize) -> Duration {
+        let started = Instant::now();
+        while store.rows().len() < rows {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the writer stored {} of {rows} rows",
+                store.rows().len()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        started.elapsed()
+    }
+
+    #[test]
+    fn commit_windows_gather_parse_batches_into_one_transaction() {
+        let (store, sink) = windowed_sink(
+            CommitPolicy {
+                window: Duration::from_secs(5),
+                window_bytes: 1 << 30,
+                idle: Duration::from_millis(300),
+            },
+            0x61,
+        );
+        // Ten parse batches of eight rows, each followed by the parser's
+        // handoff request, all within one idle interval.
+        for batch in 0..10 {
+            for row in batch * 8..batch * 8 + 8 {
+                assert!(sink.store_scrollback_line(row, &GatedStore::line(row), 1 << 20));
+            }
+            sink.request_scrollback_flush().unwrap();
+        }
+        assert!(store.rows().is_empty(), "the window is still open");
+        // The burst ends: the idle close commits it as one transaction.
+        wait_for_rows(&store, 80);
+        assert_eq!(sink.committed_batches(), 1);
+        let expected: Vec<_> = (0..80).map(|row| (row, GatedStore::text(row))).collect();
+        assert_eq!(store.rows(), expected);
+    }
+
+    #[test]
+    fn window_bytes_and_a_close_commit_without_waiting_for_the_window() {
+        // Exactly the first sixteen rows' charge: row 15 closes the window.
+        let window_bytes = (0..16)
+            .map(|row| DeferredScrollbackSpillSink::row_charge(&GatedStore::line(row)).unwrap())
+            .sum();
+        let (store, sink) = windowed_sink(
+            CommitPolicy {
+                window: Duration::from_secs(5),
+                window_bytes,
+                idle: Duration::from_secs(5),
+            },
+            0x62,
+        );
+        for row in 0..15 {
+            assert!(sink.store_scrollback_line(row, &GatedStore::line(row), 1 << 20));
+        }
+        sink.request_scrollback_flush().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            store.rows().is_empty(),
+            "below the window bytes, it stays open"
+        );
+        // The 16th row reaches the window bytes and closes the window.
+        assert!(sink.store_scrollback_line(15, &GatedStore::line(15), 1 << 20));
+        assert!(wait_for_rows(&store, 16) < Duration::from_secs(4));
+        assert_eq!(sink.committed_batches(), 1);
+
+        // A pane close commits the open window at once.
+        for row in 16..19 {
+            assert!(sink.store_scrollback_line(row, &GatedStore::line(row), 1 << 20));
+        }
+        sink.request_scrollback_flush().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(store.rows().len(), 16, "the new window is open");
+        sink.request_scrollback_commit().unwrap();
+        assert!(wait_for_rows(&store, 19) < Duration::from_secs(4));
+        assert_eq!(sink.committed_batches(), 2);
+    }
+
+    #[test]
+    fn the_window_age_closes_a_busy_window_and_zero_disables_windows() {
+        let (store, sink) = windowed_sink(
+            CommitPolicy {
+                window: Duration::from_millis(400),
+                window_bytes: 1 << 30,
+                idle: Duration::from_secs(5),
+            },
+            0x63,
+        );
+        // A steady trickle never goes idle; the window age closes it.
+        let started = Instant::now();
+        let mut row = 0;
+        while store.rows().is_empty() {
+            assert!(started.elapsed() < Duration::from_secs(10), "no commit");
+            assert!(sink.store_scrollback_line(row, &GatedStore::line(row), 1 << 20));
+            sink.request_scrollback_flush().unwrap();
+            row += 1;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            started.elapsed() >= Duration::from_millis(400),
+            "committed after {:?}, before the window age",
+            started.elapsed()
+        );
+
+        // A zero window commits every handoff request by itself.
+        let (store, sink) = windowed_sink(
+            CommitPolicy {
+                window: Duration::ZERO,
+                ..CommitPolicy::default()
+            },
+            0x64,
+        );
+        for row in 0..3 {
+            assert!(sink.store_scrollback_line(row, &GatedStore::line(row), 1 << 20));
+            sink.request_scrollback_flush().unwrap();
+            wait_for_rows(&store, row as usize + 1);
+        }
+        assert_eq!(sink.committed_batches(), 3);
+    }
+
+    #[test]
+    fn durability_writer_preserves_per_pane_order_across_10k_enqueues() {
+        // More than two full windows per pane, so the batch limit must split
+        // every pane's rows into at least three backing batches.
+        const ROWS: StableRowIndex = 2 * MAX_BATCH_ROWS as StableRowIndex + 1;
+        let writer = DurabilityWriter::spawn();
+        let panes: Vec<_> = (0..2u8)
+            .map(|pane| {
+                let store = Arc::new(GatedStore::default());
+                let sink = DeferredScrollbackSpillSink::with_writer(
+                    store.clone(),
+                    [pane; 16],
+                    Arc::clone(&writer),
+                )
+                .unwrap();
+                (store, sink)
+            })
+            .collect();
+        let parsers: Vec<_> = panes
+            .iter()
+            .map(|(_, sink)| {
+                let sink = Arc::clone(sink);
+                std::thread::spawn(move || {
+                    for row in 0..ROWS {
+                        let line = GatedStore::line(row);
+                        // Like the parser: a refusal waits on writer progress.
+                        while !sink.store_scrollback_line(row, &line, 1 << 20) {
+                            assert_eq!(
+                                sink.await_scrollback_capacity(Duration::from_secs(10)),
+                                ScrollbackCapacityWait::Progressed
+                            );
+                        }
+                        if row % 64 == 63 {
+                            sink.request_scrollback_flush().unwrap();
+                        }
+                    }
+                    sink.request_scrollback_flush().unwrap();
+                })
+            })
+            .collect();
+        for parser in parsers {
+            parser.join().unwrap();
+        }
+        let expected: Vec<_> = (0..ROWS).map(|row| (row, GatedStore::text(row))).collect();
+        for (store, sink) in &panes {
+            sink.flush_scrollback().unwrap();
+            assert_eq!(
+                store.rows(),
+                expected,
+                "per-pane FIFO, each row exactly once"
+            );
+            assert_eq!(sink.durability_failure(), None);
+            assert!(
+                sink.committed_batches() >= 3,
+                "batches are bounded by the batch limit"
+            );
+        }
+    }
+
+    #[test]
+    fn durability_writer_finishes_a_closed_panes_rows_then_releases_its_store() {
+        use wezterm_term::CellAttributes;
+
+        let (dir, backing, deferred) = super::tests::deferred_test_sink();
+        let lines: Vec<_> = (0..64)
+            .map(|row| {
+                Line::from_text(
+                    &format!("closing {row} 界 e\u{301}"),
+                    &CellAttributes::blank(),
+                    0,
+                    None,
+                )
+            })
+            .collect();
+        let lease = super::acquire_live_scrollback_filesystem_mutation_lease(
+            backing.manifest_path.parent().unwrap(),
+            false,
+        )
+        .unwrap();
+        for (row, line) in lines.iter().enumerate() {
+            assert!(deferred.store_scrollback_line(row as StableRowIndex, line, 128));
+        }
+        // The close marker hands the rows to the writer, which then stalls
+        // inside the real store behind the held file lease.
+        deferred.request_scrollback_flush().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while backing.mutation_gate.try_lock().is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "the writer never entered the store"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The pane closes: only the writer still owns the sink and its store.
+        let closed_sink = Arc::downgrade(&deferred);
+        let closed_store = Arc::downgrade(&backing);
+        drop(deferred);
+        drop(backing);
+        drop(lease);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while closed_sink.upgrade().is_some() || closed_store.upgrade().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the writer kept a closed pane's store open"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 913,
+            domain_id: 3,
+            durable_pane_id: [0xd3; 16],
+            command_description: "deferred-scrollback-test".to_string(),
+        };
+        let reopened =
+            super::LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context).unwrap();
+        assert_eq!(reopened.retained_scrollback_rows(), lines.len());
+        for (row, expected) in lines.iter().enumerate() {
+            let mut actual = reopened
+                .load_scrollback_line(row as StableRowIndex)
+                .unwrap();
+            let mut expected = expected.clone();
+            actual.cells_mut();
+            expected.cells_mut();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn durability_writer_contains_a_store_panic_as_a_degraded_pane() {
+        let writer = DurabilityWriter::spawn();
+        let failing_store = Arc::new(GatedStore::default());
+        failing_store.set_panic(true);
+        let healthy_store = Arc::new(GatedStore::default());
+        let failing = DeferredScrollbackSpillSink::with_writer(
+            failing_store.clone(),
+            [0x61; 16],
+            Arc::clone(&writer),
+        )
+        .unwrap();
+        let healthy = DeferredScrollbackSpillSink::with_writer(
+            healthy_store.clone(),
+            [0x62; 16],
+            Arc::clone(&writer),
+        )
+        .unwrap();
+        for row in 0..8 {
+            assert!(failing.store_scrollback_line(row, &GatedStore::line(row), 64));
+        }
+        failing.request_scrollback_flush().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while failing.durability_failure().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the writer panic was not surfaced"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(failing.writer_panicked());
+        // The degraded pane is exported through the resource snapshot that
+        // `ft doctor --json` reads (this pane id is unique to this test).
+        let failing_label = uuid::Uuid::from_bytes([0x61; 16]).to_string();
+        let exported = DurabilityLedger::global().snapshot();
+        assert!(exported.degraded_panes.contains_key(&failing_label));
+        assert!(exported.writer_panics_total >= 1);
+        // The parser sees a degraded pane, never a panic, and keeps its rows.
+        assert_eq!(
+            failing.request_scrollback_flush(),
+            Err(ScrollbackSpillError::StorageUnavailable)
+        );
+        assert_eq!(
+            failing
+                .load_scrollback_line(3)
+                .map(|line| line.as_str().trim_end().to_string()),
+            Some(GatedStore::text(3))
+        );
+        assert_eq!(
+            failing.await_scrollback_capacity(Duration::from_millis(20)),
+            ScrollbackCapacityWait::Failed(ScrollbackSpillError::StorageUnavailable)
+        );
+
+        // The writer thread survived the panic: another pane still commits
+        // through it without any explicit flush.
+        for row in 0..8 {
+            assert!(healthy.store_scrollback_line(row, &GatedStore::line(row), 64));
+        }
+        healthy.request_scrollback_flush().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while healthy_store.rows().len() < 8 {
+            assert!(Instant::now() < deadline, "the writer thread died");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // Once the store stops panicking, the backoff retry commits every
+        // owned row and clears the degraded state.
+        failing_store.set_panic(false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while failing_store.rows().len() < 8 || failing.durability_failure().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the degraded pane never recovered"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let expected: Vec<_> = (0..8).map(|row| (row, GatedStore::text(row))).collect();
+        assert_eq!(failing_store.rows(), expected);
+        assert!(
+            !DurabilityLedger::global()
+                .snapshot()
+                .degraded_panes
+                .contains_key(&failing_label),
+            "a recovered pane leaves the exported degraded set"
+        );
+    }
 }
 
 struct LiveScrollbackSpillSink {
@@ -1324,6 +3690,22 @@ struct LiveScrollbackSpillSink {
     manifest_path: PathBuf,
     mutation_gate: std::sync::Mutex<()>,
     append_wal_identity_cache: std::sync::Mutex<[Option<ValidatedAppendWalIdentity>; 2]>,
+    /// The nonce stream compact rows are sealed under (ft-yccm0.2.1.4). It
+    /// only moves forward and is never restored from disk or rolled back
+    /// with the state: a process starts with none and draws a fresh segment.
+    row_nonce_stream:
+        std::sync::Mutex<Option<mux::guardian_output_journal::GuardianScrollbackRowNonceStream>>,
+    /// Commit windows publish the manifest at most this often
+    /// (ft-yccm0.2.1.2). Zero runs every transaction as a single batch with
+    /// its own WAL and manifest.
+    manifest_publish_interval: std::time::Duration,
+    last_publication: std::sync::Mutex<std::time::Instant>,
+    /// Ordered-durability syncs this sink's writes and publications issued
+    /// (ft-yccm0.2.1.2 syncs-per-MiB measurement).
+    durability_syncs: std::sync::atomic::AtomicU64,
+    /// The sealed segment the last cold read opened, for the next one
+    /// (ft-yccm0.2.1.4). Locked after the store and the keyring.
+    cold_segment: std::sync::Mutex<LiveScrollbackColdSegment>,
     store: std::sync::Mutex<frankenterm_core::storage::mmap_store::MmapScrollbackStore>,
     state: std::sync::Mutex<LiveScrollbackSpillState>,
     keyring: Arc<std::sync::Mutex<guardian_output_keys::GuardianOutputKeyring>>,
@@ -1339,6 +3721,200 @@ impl std::fmt::Debug for LiveScrollbackSpillSink {
             .field("durable_pane_id", &"[REDACTED]")
             .field("command_description", &"[REDACTED]")
             .finish_non_exhaustive()
+    }
+}
+
+/// ft-yccm0.2.1.4: the most compact-row nonce segments one retained ledger
+/// may name. Each writer process starts a segment, and so do a cut-back
+/// batch, a key rotation, a clear and a replacement ledger, so a retained
+/// window rarely holds more than a few. With the table full, new rows fall
+/// back to self-describing v3 records until retention frees a slot.
+const LIVE_SCROLLBACK_MAX_ROW_SEGMENTS: usize = 32;
+
+/// One compact-row nonce segment as the manifest's table and the append WAL
+/// that starts it persist it. The key ID and base are not secret: v3 rows
+/// carry both in the clear.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveScrollbackRowSegmentV1 {
+    key_id: String,
+    nonce_base: String,
+    first_sequence: u64,
+}
+
+impl LiveScrollbackRowSegmentV1 {
+    fn from_segment(segment: mux::guardian_output_journal::GuardianScrollbackRowSegment) -> Self {
+        Self {
+            key_id: hex::encode(segment.key_id()),
+            nonce_base: hex::encode(segment.nonce_base()),
+            first_sequence: segment.first_sequence(),
+        }
+    }
+
+    /// Canonical lowercase hex of the exact widths, and a nonzero base.
+    fn to_segment(
+        &self,
+    ) -> anyhow::Result<mux::guardian_output_journal::GuardianScrollbackRowSegment> {
+        let canonical = |encoded: &str, bytes: usize| {
+            encoded.len() == bytes * 2
+                && encoded
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        };
+        anyhow::ensure!(
+            canonical(&self.key_id, 8)
+                && canonical(
+                    &self.nonce_base,
+                    mux::guardian_output_journal::SCROLLBACK_ROW_NONCE_BASE_BYTES
+                ),
+            "scrollback row segment is not canonical lowercase hex"
+        );
+        let mut key_id = [0_u8; 8];
+        let mut nonce_base = [0_u8; mux::guardian_output_journal::SCROLLBACK_ROW_NONCE_BASE_BYTES];
+        hex::decode_to_slice(&self.key_id, &mut key_id).context("decode row segment key")?;
+        hex::decode_to_slice(&self.nonce_base, &mut nonce_base)
+            .context("decode row segment nonce base")?;
+        mux::guardian_output_journal::GuardianScrollbackRowSegment::new(
+            key_id,
+            nonce_base,
+            self.first_sequence,
+        )
+        .context("decode scrollback row segment")
+    }
+}
+
+/// The nonce segments of a ledger's retained compact rows, oldest first, in
+/// a fixed array so the pane state stays `Copy`. A compact row at sequence
+/// `s` belongs to the last segment starting at or before `s`.
+///
+/// Invariants, checked on every decode from disk: first sequences strictly
+/// increase, no two segments share a nonce base, and no base is zero.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LiveScrollbackRowSegments {
+    len: usize,
+    segments: [Option<mux::guardian_output_journal::GuardianScrollbackRowSegment>;
+        LIVE_SCROLLBACK_MAX_ROW_SEGMENTS],
+}
+
+impl std::fmt::Debug for LiveScrollbackRowSegments {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_list()
+            .entries(self.iter().map(|segment| segment.first_sequence()))
+            .finish()
+    }
+}
+
+impl LiveScrollbackRowSegments {
+    const EMPTY: Self = Self {
+        len: 0,
+        segments: [None; LIVE_SCROLLBACK_MAX_ROW_SEGMENTS],
+    };
+
+    fn iter(
+        &self,
+    ) -> impl Iterator<Item = &mux::guardian_output_journal::GuardianScrollbackRowSegment> {
+        self.segments[..self.len].iter().flatten()
+    }
+
+    fn is_full(&self) -> bool {
+        self.len == LIVE_SCROLLBACK_MAX_ROW_SEGMENTS
+    }
+
+    fn last(&self) -> Option<mux::guardian_output_journal::GuardianScrollbackRowSegment> {
+        self.len
+            .checked_sub(1)
+            .and_then(|index| self.segments[index])
+    }
+
+    /// The segment a compact row at `sequence` was sealed under.
+    fn covering(
+        &self,
+        sequence: u64,
+    ) -> Option<mux::guardian_output_journal::GuardianScrollbackRowSegment> {
+        self.iter()
+            .take_while(|segment| segment.first_sequence() <= sequence)
+            .last()
+            .copied()
+    }
+
+    /// Append a segment that starts after every retained one and shares no
+    /// retained segment's base.
+    fn push(
+        &mut self,
+        segment: mux::guardian_output_journal::GuardianScrollbackRowSegment,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.is_full(), "the scrollback row segment table is full");
+        anyhow::ensure!(
+            self.last()
+                .is_none_or(|last| last.first_sequence() < segment.first_sequence()),
+            "scrollback row segments must start in increasing sequence order"
+        );
+        anyhow::ensure!(
+            self.iter()
+                .all(|retained| retained.nonce_base() != segment.nonce_base()),
+            "a scrollback row segment reuses a retained nonce base"
+        );
+        self.segments[self.len] = Some(segment);
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Forget the leading segments no retained row belongs to: those whose
+    /// successor starts at or before `oldest`. An empty ledger keeps none.
+    fn retain_from(&mut self, oldest: Option<u64>) {
+        let Some(oldest) = oldest else {
+            *self = Self::EMPTY;
+            return;
+        };
+        let dropped = self
+            .iter()
+            .skip(1)
+            .take_while(|segment| segment.first_sequence() <= oldest)
+            .count();
+        if dropped == 0 {
+            return;
+        }
+        self.segments.copy_within(dropped..self.len, 0);
+        self.len -= dropped;
+        self.segments[self.len..].fill(None);
+    }
+
+    fn to_manifest(self) -> Vec<LiveScrollbackRowSegmentV1> {
+        self.iter()
+            .map(|segment| LiveScrollbackRowSegmentV1::from_segment(*segment))
+            .collect()
+    }
+
+    /// Decode a persisted table for a ledger retaining `[oldest, next)`.
+    /// Beyond the push invariants, every segment must start before `next`
+    /// (it names rows that exist) and the table must already be trimmed to
+    /// `oldest`, so each published table has exactly one form.
+    fn from_manifest(
+        entries: &[LiveScrollbackRowSegmentV1],
+        oldest: Option<u64>,
+        next: u64,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            entries.len() <= LIVE_SCROLLBACK_MAX_ROW_SEGMENTS,
+            "scrollback row segment table exceeds its bound"
+        );
+        let mut table = Self::EMPTY;
+        for entry in entries {
+            let segment = entry.to_segment()?;
+            anyhow::ensure!(
+                segment.first_sequence() < next,
+                "a scrollback row segment starts past the ledger's end"
+            );
+            table.push(segment)?;
+        }
+        let mut trimmed = table;
+        trimmed.retain_from(oldest);
+        anyhow::ensure!(
+            trimmed == table,
+            "scrollback row segment table names segments with no retained row"
+        );
+        Ok(table)
     }
 }
 
@@ -1358,6 +3934,52 @@ struct LiveScrollbackSpillState {
     /// type has no public constructor: ordinary mutations may only derive a
     /// successor from an already verified predecessor.
     verified_ledger: Option<VerifiedLedgerState>,
+    /// The nonce segments of the retained compact rows (ft-yccm0.2.1.4), as
+    /// the published manifest or active WAL names them.
+    row_segments: LiveScrollbackRowSegments,
+    /// The lineage's durability-gap totals (ft-yccm0.2.1.6); `None` is
+    /// unknown. Only a gap marker's single-batch transaction changes them,
+    /// so commit windows never run ahead of the published totals.
+    durability_gaps: Option<LiveScrollbackDurabilityGaps>,
+    /// What the published manifest says while this state runs ahead of it
+    /// by a durable, unpublished tail (ft-yccm0.2.1.2); `None` when the
+    /// manifest describes this state.
+    published: Option<LiveScrollbackPublishedPrefix>,
+}
+
+/// The published prefix of a live state that commit windows have advanced
+/// past its manifest (ft-yccm0.2.1.2).
+///
+/// A window appends rows under one barrier and advances the live state: the
+/// revision by its row count, the chain, and the retention, logically. The
+/// rows past the published `authority` are durable in the ledger, so
+/// recovery adopts them, and so is every row retention has logically
+/// evicted: physical pruning waits for the publication that names the new
+/// oldest row in its cumulative WAL. The ledger therefore holds exactly the
+/// published prefix's rows plus the tail.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LiveScrollbackPublishedPrefix {
+    revision: u64,
+    predecessor_generation: Option<wezterm_term::config::ScrollbackSnapshotGeneration>,
+    newest_stable_row_exclusive: Option<wezterm_term::StableRowIndex>,
+    authority: VerifiedLedgerState,
+    /// Record bytes, with their newlines, of the rows past `authority`.
+    tail_record_bytes: u64,
+    /// The retained append WAL, checked replaceable before the first tail
+    /// row reached the ledger (it no longer matches the ledger after that).
+    retained_append_wal: Option<[u8; 32]>,
+}
+
+impl std::fmt::Debug for LiveScrollbackPublishedPrefix {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LiveScrollbackPublishedPrefix")
+            .field("revision", &self.revision)
+            .field("predecessor_generation", &self.predecessor_generation)
+            .field("authority", &self.authority)
+            .field("tail_record_bytes", &self.tail_record_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl std::fmt::Debug for LiveScrollbackSpillState {
@@ -1381,11 +4003,15 @@ impl std::fmt::Debug for LiveScrollbackSpillState {
             )
             .field("transaction_quarantined", &self.transaction_quarantined)
             .field("verified_ledger", &self.verified_ledger)
+            .field("row_segments", &self.row_segments)
+            .field("durability_gaps", &self.durability_gaps)
+            .field("published", &self.published)
             .finish()
     }
 }
 
 impl LiveScrollbackSpillState {
+    /// A fresh lineage: it has recorded no durability gaps.
     fn empty(content_epoch: [u8; 16], authenticated_manifest: bool) -> Self {
         Self {
             initial_stable_row: None,
@@ -1399,11 +4025,51 @@ impl LiveScrollbackSpillState {
             clear_pending_physical_reclamation: false,
             transaction_quarantined: false,
             verified_ledger: None,
+            row_segments: LiveScrollbackRowSegments::EMPTY,
+            durability_gaps: Some(LiveScrollbackDurabilityGaps::default()),
+            published: None,
         }
     }
 
     fn snapshot_generation(&self) -> wezterm_term::config::ScrollbackSnapshotGeneration {
         wezterm_term::config::ScrollbackSnapshotGeneration::new(self.content_epoch, self.revision)
+    }
+
+    /// The state the published manifest describes: this state itself, or
+    /// its published prefix when commit windows have run ahead.
+    fn published_view(&self) -> Self {
+        let Some(published) = self.published else {
+            return *self;
+        };
+        Self {
+            revision: published.revision,
+            predecessor_generation: published.predecessor_generation,
+            newest_stable_row_exclusive: published.newest_stable_row_exclusive,
+            verified_ledger: Some(published.authority),
+            published: None,
+            ..*self
+        }
+    }
+
+    /// The facts the ledger itself must show: the live authority, or, with a
+    /// tail, the published prefix's oldest row and anchor (nothing has been
+    /// pruned since) through the live next row and chain tail.
+    fn ledger_authority(&self) -> Option<VerifiedLedgerState> {
+        let live = self.verified_ledger?;
+        let Some(published) = self.published else {
+            return Some(live);
+        };
+        let prefix = published.authority;
+        let tail_rows = live.next_sequence.checked_sub(prefix.next_sequence)?;
+        Some(VerifiedLedgerState {
+            oldest_sequence: prefix.oldest_sequence.or(live.oldest_sequence),
+            record_count: prefix.record_count.checked_add(tail_rows)?,
+            retained_record_bytes: prefix
+                .retained_record_bytes
+                .checked_add(published.tail_record_bytes)?,
+            chain_anchor: prefix.chain_anchor,
+            ..live
+        })
     }
 
     fn advance_revision(&mut self) -> Result<(), wezterm_term::config::ScrollbackSpillError> {
@@ -1462,9 +4128,43 @@ struct LiveScrollbackManifestV1 {
     chain_anchor_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     chain_tail_sha256: Option<String>,
+    /// ft-yccm0.2.1.4: the nonce segments of the retained compact rows,
+    /// oldest first, trimmed to `oldest_seq`. Absent when no retained row is
+    /// compact.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    row_segments: Vec<LiveScrollbackRowSegmentV1>,
+    /// ft-yccm0.2.1.6: the durability gaps this lineage has recorded.
+    /// Absent means unknown (a manifest from before the field, or a
+    /// recovered tail that may hold an unpublished gap marker), never zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    durability_gaps: Option<LiveScrollbackDurabilityGaps>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     guardian_manifest_authentication: Option<String>,
     manifest_sha256: String,
+}
+
+/// Rows overload dropped from durability in one durable pane's lineage
+/// since it began or was last cleared (ft-yccm0.2.1.6): one marker row
+/// stands for each gap. Retention may have pruned older markers; their rows
+/// still count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveScrollbackDurabilityGaps {
+    pub markers: u64,
+    pub rows: u64,
+    pub bytes: u64,
+}
+
+impl LiveScrollbackDurabilityGaps {
+    /// These totals plus one gap of `rows` rows and `bytes` bytes; `None`
+    /// (unknown) if a total overflows.
+    fn with_gap(self, rows: u64, bytes: u64) -> Option<Self> {
+        Some(Self {
+            markers: self.markers.checked_add(1)?,
+            rows: self.rows.checked_add(rows)?,
+            bytes: self.bytes.checked_add(bytes)?,
+        })
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1512,6 +4212,19 @@ struct LiveScrollbackAppendWalV1 {
     superseding_ledger_pane_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     superseding_manifest_sha256: Option<String>,
+    /// v4 only: the batch's row count. Its rows are already in the ledger,
+    /// so `encrypted_record` is empty and no additional records follow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    appended_record_count: Option<u64>,
+    /// v4 only (ft-yccm0.2.1.4): the nonce segment the batch's compact rows
+    /// were sealed under, either the predecessor table's last segment or a
+    /// new one starting at `appended_sequence`. Absent for a v3-row batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    row_segment: Option<LiveScrollbackRowSegmentV1>,
+    /// ft-yccm0.2.1.6: the target's durability-gap totals, which the
+    /// manifest it rolls forward to publishes. Absent means unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_durability_gaps: Option<LiveScrollbackDurabilityGaps>,
     encrypted_record: String,
     /// v3 binds one ordered batch. v1/v2 must have no additional records.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1535,12 +4248,48 @@ struct PreparedAppendWal<'sink> {
     wal: LiveScrollbackAppendWalV1,
 }
 
+/// How a publication proves the retained WAL may be replaced.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetainedAppendWalCheck {
+    /// Verify it against the ledger now.
+    Live,
+    /// A digest-only transaction appends its rows before its WAL, so it checked
+    /// the retained WAL against the ledger before that append. Publication
+    /// requires the retained WAL to be the one checked (same checksum, or
+    /// still none).
+    VerifiedBeforeAppend(Option<[u8; 32]>),
+}
+
+/// What opening a pane did about ledger rows past its published manifest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LedgerTailSettlement {
+    /// The ledger ends at its manifest, or the active WAL names the rows past it.
+    Unchanged,
+    /// Rows no WAL names were cut back to the manifest.
+    Cut(u64),
+    /// The interrupted transaction's complete WAL stage was published and now
+    /// names the rows; recovery rolls it forward.
+    PromotedStage,
+}
+
+/// The append WAL a transaction writes. This binary writes only the
+/// digest-only (v4) form. Pre-v4 binaries carried every row in the WAL
+/// (v2/v3); tests build those so recovery of them stays proven.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppendWalFormat {
+    DigestOnly,
+    #[cfg(test)]
+    CarriedRows,
+}
+
 /// Fresh construction alone mints this borrow. The chain was computed while
 /// projecting these exact records, and the digest was computed after their
 /// owned copies were installed in this WAL. Holding the borrow prevents record
 /// mutation through the metadata validation boundary; disk reads never mint it.
+/// `records` is the batch the WAL names: a v4 WAL holds no copy of it.
 struct AppendWalConstructionProof<'wal> {
     wal: &'wal LiveScrollbackAppendWalV1,
+    records: &'wal [String],
     record_digest: [u8; 32],
     chain_tail: [u8; 32],
 }
@@ -1612,6 +4361,15 @@ impl std::fmt::Debug for LiveScrollbackAppendWalV1 {
                 &self.superseding_ledger_pane_id,
             )
             .field("superseding_manifest_sha256", &"[REDACTED]")
+            .field("appended_record_count", &self.appended_record_count)
+            .field(
+                "row_segment_first_sequence",
+                &self
+                    .row_segment
+                    .as_ref()
+                    .map(|segment| segment.first_sequence),
+            )
+            .field("target_durability_gaps", &self.target_durability_gaps)
             .field("encrypted_record", &"[REDACTED]")
             .field("additional_encrypted_records", &"[REDACTED]")
             .field("guardian_authentication", &"[REDACTED]")
@@ -1621,31 +4379,62 @@ impl std::fmt::Debug for LiveScrollbackAppendWalV1 {
 }
 
 impl LiveScrollbackAppendWalV1 {
+    /// The rows this WAL carries. A digest-only (v4) WAL carries none.
     fn records(&self) -> impl Iterator<Item = &str> {
+        let carried = if self.is_digest_only() { 0 } else { usize::MAX };
         std::iter::once(self.encrypted_record.as_str())
             .chain(self.additional_encrypted_records.iter().map(String::as_str))
+            .take(carried)
+    }
+
+    fn is_digest_only(&self) -> bool {
+        matches!(
+            self.schema.as_str(),
+            LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4 | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V5
+        )
+    }
+
+    fn is_cumulative(&self) -> bool {
+        self.schema == LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V5
+    }
+
+    /// Rows in the batch: counted by a v4 WAL, carried by v1-v3.
+    fn batch_row_count(&self) -> anyhow::Result<u64> {
+        if self.is_digest_only() {
+            return self
+                .appended_record_count
+                .ok_or_else(|| anyhow::anyhow!("digest-only append WAL has no row count"));
+        }
+        u64::try_from(self.additional_encrypted_records.len())
+            .ok()
+            .and_then(|additional| additional.checked_add(1))
+            .ok_or_else(|| anyhow::anyhow!("append WAL batch row count overflows"))
     }
 
     fn is_incremental(&self) -> bool {
         matches!(
             self.schema.as_str(),
-            LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2 | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3
+            LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2
+                | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3
+                | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4
+                | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V5
         )
     }
 
     fn records_digest(&self) -> anyhow::Result<[u8; 32]> {
         #[cfg(test)]
         LIVE_SCROLLBACK_WAL_RECORD_DIGESTS.with(|count| count.set(count.get() + 1));
-        if self.schema != LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3 {
-            return live_scrollback_append_wal_record_digest(&self.encrypted_record);
+        match self.schema.as_str() {
+            LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3 => live_scrollback_append_wal_batch_digest(
+                LIVE_SCROLLBACK_APPEND_WAL_BATCH_DIGEST_DOMAIN_V3,
+                self.batch_row_count()?,
+                self.records(),
+            ),
+            LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4 | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V5 => {
+                anyhow::bail!("a digest-only append WAL does not carry the rows it names")
+            }
+            _ => live_scrollback_append_wal_record_digest(&self.encrypted_record),
         }
-        let mut hasher = Sha256::new();
-        hasher.update(b"frankenterm.live-scrollback-append-wal-batch.v3\0");
-        hasher.update(u64::try_from(self.additional_encrypted_records.len() + 1)?.to_le_bytes());
-        for record in self.records() {
-            update_scrollback_digest_bytes(&mut hasher, record.as_bytes())?;
-        }
-        Ok(hasher.finalize().into())
     }
 
     fn checksum_view(&self) -> LiveScrollbackAppendWalCanonicalView<'_> {
@@ -1679,6 +4468,9 @@ impl LiveScrollbackAppendWalV1 {
             superseding_revision: self.superseding_revision,
             superseding_ledger_pane_id: self.superseding_ledger_pane_id,
             superseding_manifest_sha256: self.superseding_manifest_sha256.as_deref(),
+            appended_record_count: self.appended_record_count,
+            row_segment: self.row_segment.as_ref(),
+            target_durability_gaps: self.target_durability_gaps,
             encrypted_record: &self.encrypted_record,
             additional_encrypted_records: &self.additional_encrypted_records,
             guardian_authentication: self.guardian_authentication.as_deref(),
@@ -1743,6 +4535,12 @@ struct LiveScrollbackAppendWalCanonicalView<'a> {
     superseding_ledger_pane_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     superseding_manifest_sha256: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    appended_record_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    row_segment: Option<&'a LiveScrollbackRowSegmentV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_durability_gaps: Option<LiveScrollbackDurabilityGaps>,
     encrypted_record: &'a str,
     #[serde(skip_serializing_if = "is_empty_string_slice")]
     additional_encrypted_records: &'a [String],
@@ -1818,6 +4616,8 @@ fn live_scrollback_incremental_chain_next(
 ) -> anyhow::Result<[u8; 32]> {
     #[cfg(test)]
     LIVE_SCROLLBACK_CHAIN_LINK_HASHES.with(|count| count.set(count.get() + 1));
+    #[cfg(test)]
+    count_test_bytes(&LIVE_SCROLLBACK_BYTES_HASHED, record.len());
     let mut hasher = Sha256::new();
     hasher.update(LIVE_SCROLLBACK_INCREMENTAL_CHAIN_DOMAIN);
     hasher.update(predecessor);
@@ -1839,9 +4639,12 @@ fn live_scrollback_authority_record_at(
 ) -> anyhow::Result<String> {
     #[cfg(test)]
     LIVE_SCROLLBACK_AUTHORITY_RECORD_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
-    store
+    let record = store
         .line_at(ledger_pane_id, sequence)?
-        .ok_or_else(|| anyhow::anyhow!("authenticated ledger is missing sequence {sequence}"))
+        .ok_or_else(|| anyhow::anyhow!("authenticated ledger is missing sequence {sequence}"))?;
+    #[cfg(test)]
+    count_test_bytes(&LIVE_SCROLLBACK_RECORD_BYTES_READ_BACK, record.len());
+    Ok(record)
 }
 
 /// Read-ahead belongs only to one append projection while its store guard is
@@ -1916,6 +4719,11 @@ impl<'a> LedgerEvictionReader<'a> {
                             |bytes, record| bytes.and_then(|bytes| bytes.checked_add(record.capacity())),
                         );
                         if retained_capacity.is_some_and(|bytes| bytes <= Self::BYTE_LIMIT) {
+                            #[cfg(test)]
+                            count_test_bytes(
+                                &LIVE_SCROLLBACK_RECORD_BYTES_READ_BACK,
+                                records.iter().map(String::len).sum(),
+                            );
                             self.records = records.into_iter();
                             break;
                         }
@@ -2321,6 +5129,8 @@ impl LiveScrollbackLogicalLedgerHasher {
 }
 
 fn update_scrollback_digest_bytes(hasher: &mut Sha256, bytes: &[u8]) -> anyhow::Result<()> {
+    #[cfg(test)]
+    count_test_bytes(&LIVE_SCROLLBACK_BYTES_HASHED, bytes.len());
     hasher.update(
         u64::try_from(bytes.len())
             .map_err(|_| anyhow::anyhow!("logical ledger field length exceeds u64"))?
@@ -2537,6 +5347,29 @@ fn live_scrollback_append_wal_record_digest(record: &str) -> anyhow::Result<[u8;
     let mut hasher = Sha256::new();
     hasher.update(LIVE_SCROLLBACK_APPEND_WAL_RECORD_DIGEST_DOMAIN);
     update_scrollback_digest_bytes(&mut hasher, record.as_bytes())?;
+    Ok(hasher.finalize().into())
+}
+
+/// One ordered batch: the row count, then each length-framed row.
+fn live_scrollback_append_wal_batch_digest<'a>(
+    domain: &[u8],
+    row_count: u64,
+    records: impl IntoIterator<Item = &'a str>,
+) -> anyhow::Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(row_count.to_le_bytes());
+    let mut rows_digested = 0_u64;
+    for record in records {
+        update_scrollback_digest_bytes(&mut hasher, record.as_bytes())?;
+        rows_digested = rows_digested
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("append WAL batch digest row count overflows"))?;
+    }
+    anyhow::ensure!(
+        rows_digested == row_count,
+        "append WAL batch digest covers the wrong number of rows"
+    );
     Ok(hasher.finalize().into())
 }
 
@@ -2786,6 +5619,10 @@ pub struct LiveScrollbackDurablePane {
     pub command_description: Option<String>,
     pub retained_rows: Option<u64>,
     pub next_seq: Option<u64>,
+    /// The manifest's durability-gap totals (ft-yccm0.2.1.6), read without
+    /// decoding rows. `None` is unknown (a manifest without the field, or a
+    /// corrupt pane), never zero.
+    pub durability_gaps: Option<LiveScrollbackDurabilityGaps>,
     pub path: PathBuf,
     pub error: Option<String>,
 }
@@ -2961,6 +5798,44 @@ pub const LIVE_SCROLLBACK_EXPORT_MAX_TRANSCRIPT_BYTES: usize = 256 * 1024 * 1024
 pub const LIVE_SCROLLBACK_EXPORT_MAX_PHYSICAL_BYTES: u64 = 1024 * 1024 * 1024;
 const LIVE_SCROLLBACK_DISCOVERY_EXTRA_ENTRIES: usize = 4096;
 
+/// Read a pane ledger as its manifest publishes it (ft-yccm0.2.1.2). A
+/// complete authenticated v4 manifest names a prefix that the ledger may
+/// extend with a durable, not yet published tail; that tail reads as an
+/// uncommitted suffix.
+fn read_published_pane_snapshot(
+    pane_path: &std::path::Path,
+    ledger_pane_id: u64,
+    manifest: &LiveScrollbackManifestV1,
+    max_records: usize,
+    max_record_bytes: u64,
+    max_physical_bytes: u64,
+) -> Result<
+    frankenterm_core::storage::mmap_store::MmapPaneReadSnapshot,
+    frankenterm_core::storage::mmap_store::MmapStoreError,
+> {
+    if manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4
+        && manifest.publication_state == "complete"
+        && live_scrollback_manifest_is_authenticated(manifest)
+    {
+        frankenterm_core::storage::mmap_store::read_pane_snapshot_through(
+            pane_path,
+            ledger_pane_id,
+            manifest.next_seq,
+            max_records,
+            max_record_bytes,
+            max_physical_bytes,
+        )
+    } else {
+        frankenterm_core::storage::mmap_store::read_pane_snapshot(
+            pane_path,
+            ledger_pane_id,
+            max_records,
+            max_record_bytes,
+            max_physical_bytes,
+        )
+    }
+}
+
 fn is_canonical_live_scrollback_id(value: &str) -> bool {
     value.len() == 32
         && value
@@ -3019,9 +5894,19 @@ impl LiveScrollbackSpillSink {
                 .checked_sub(initial)
                 .ok_or_else(|| anyhow::anyhow!("scrollback sequence overflow"))?,
         )?;
+        // A row retention evicted reads as pruned, as the store reads a
+        // pruned row, whether it waits for a publication (ft-yccm0.2.1.2) or
+        // stays as segment slack (ft-yccm0.2.1.4).
+        if state
+            .verified_ledger
+            .and_then(|live| live.oldest_sequence)
+            .is_some_and(|oldest| start < oldest)
+        {
+            return Ok(Vec::new());
+        }
         let mut count = usize::try_from(rows.end.saturating_sub(rows.start))?.min(32);
         let ledger_pane_id = self.active_ledger_pane_id();
-        self.verify_current_published_state_before_mutation(state, ledger_pane_id, false)?;
+        self.verify_current_published_state_before_mutation(&state, ledger_pane_id, false)?;
         let store = self.lock_store("load_scrollback_lines read")?;
         // Retry only an explicitly classified aggregate stored-byte limit.
         // All attempts share the same publication, lease and pinned store.
@@ -3042,7 +5927,12 @@ impl LiveScrollbackSpillSink {
             }
         };
         let keyring = self.lock_keyring("load_scrollback_lines decrypt")?;
-        let mut cipher_cache = GuardianScrollbackCipherCache::new(&keyring);
+        let mut cipher_cache = GuardianScrollbackCipherCache::new(&keyring, &state.row_segments);
+        let (physical_oldest, next) = store_segment_bounds(&store, ledger_pane_id)?;
+        let mut fetch =
+            |range: std::ops::Range<u64>| store_segment_records(&store, ledger_pane_id, range);
+        let origin = (ledger_pane_id, state.content_epoch, initial);
+        let mut segments = self.take_cold_segment(origin, &mut fetch);
         let mut remaining = max_decoded_bytes;
         let mut result = Vec::with_capacity(records.len());
         for (index, record) in records.iter().enumerate() {
@@ -3050,8 +5940,12 @@ impl LiveScrollbackSpillSink {
                 .start
                 .checked_add(wezterm_term::StableRowIndex::try_from(index)?)
                 .ok_or_else(|| anyhow::anyhow!("scrollback row overflow"))?;
-            let decoded = decode_persisted_scrollback_line_with_limit(
+            let decoded = decode_stored_scrollback_row(
                 record,
+                &mut segments,
+                &mut fetch,
+                physical_oldest,
+                next,
                 &mut cipher_cache,
                 self.durable_pane_id,
                 state.content_epoch,
@@ -3079,7 +5973,40 @@ impl LiveScrollbackSpillSink {
                 .ok_or_else(|| anyhow::anyhow!("scrollback decoded byte limit exceeded"))?;
             result.push(line);
         }
+        self.keep_cold_segment(origin, segments);
         Ok(result)
+    }
+
+    /// The segment reader for a cold read under `origin`: the segment the
+    /// last cold read kept open when it still applies (ft-yccm0.2.1.4).
+    fn take_cold_segment(
+        &self,
+        origin: LiveScrollbackColdSegmentOrigin,
+        fetch: &mut LiveScrollbackRecordFetch<'_>,
+    ) -> LiveScrollbackSegmentReader {
+        self.cold_segment.lock().map_or_else(
+            |_| LiveScrollbackSegmentReader::default(),
+            |mut kept| kept.take(origin, fetch),
+        )
+    }
+
+    /// Keep a cold read's open segment for the next cold read.
+    fn keep_cold_segment(
+        &self,
+        origin: LiveScrollbackColdSegmentOrigin,
+        reader: LiveScrollbackSegmentReader,
+    ) {
+        if let Ok(mut kept) = self.cold_segment.lock() {
+            kept.keep(origin, reader);
+        }
+    }
+
+    /// Wipe the segment the last cold read kept open, so rows a clear or a
+    /// replacement removes leave no plaintext behind.
+    fn forget_cold_segment(&self) {
+        if let Ok(mut kept) = self.cold_segment.lock() {
+            *kept = LiveScrollbackColdSegment::default();
+        }
     }
 
     fn active_ledger_pane_id(&self) -> u64 {
@@ -3113,7 +6040,7 @@ impl LiveScrollbackSpillSink {
 
     fn clear_successor_state(
         &self,
-        previous: LiveScrollbackSpillState,
+        previous: &LiveScrollbackSpillState,
         ledger_pane_id: u64,
     ) -> LiveScrollbackSpillState {
         let predecessor = previous.snapshot_generation();
@@ -3129,6 +6056,10 @@ impl LiveScrollbackSpillSink {
             clear_pending_physical_reclamation: true,
             transaction_quarantined: false,
             verified_ledger: Some(VerifiedLedgerState::empty(ledger_pane_id)),
+            row_segments: LiveScrollbackRowSegments::EMPTY,
+            // A clear starts the gap count over.
+            durability_gaps: Some(LiveScrollbackDurabilityGaps::default()),
+            published: None,
         }
     }
 
@@ -3321,35 +6252,83 @@ impl LiveScrollbackSpillSink {
                 LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V1
                     | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2
                     | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3
+                    | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4
+                    | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V5
             ),
             "unsupported live scrollback append WAL schema"
         );
-        let record_count = wal
-            .additional_encrypted_records
-            .len()
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("append WAL batch row count overflows"))?;
         anyhow::ensure!(
-            record_count <= LIVE_SCROLLBACK_APPEND_MAX_ROWS
-                && if wal.schema == LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3 {
-                    record_count > 1 && u64::try_from(record_count)? <= wal.max_retained_rows
-                } else {
-                    record_count == 1
-                },
+            wal.is_digest_only() == wal.appended_record_count.is_some()
+                && (!wal.is_digest_only()
+                    || (wal.encrypted_record.is_empty()
+                        && wal.additional_encrypted_records.is_empty())),
             "append WAL batch row bounds or schema are invalid"
         );
-        let record_bytes = wal.records().try_fold(0u64, |bytes, record| {
-            anyhow::ensure!(!record.is_empty(), "append WAL contains an empty record");
-            bytes
-                .checked_add(u64::try_from(record.len())?)
-                .ok_or_else(|| anyhow::anyhow!("append WAL batch bytes overflow"))
-        })?;
+        if let Some(segment) = wal.row_segment.as_ref() {
+            // A cumulative WAL starts no segment: a window that needs one
+            // takes the single-batch path, whose WAL names it.
+            anyhow::ensure!(
+                wal.schema == LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4,
+                "only a v4 append WAL names a row nonce segment"
+            );
+            anyhow::ensure!(
+                segment.to_segment()?.first_sequence() <= wal.appended_sequence,
+                "append WAL row nonce segment starts after its batch"
+            );
+        }
+        let record_count = wal.batch_row_count()?;
         anyhow::ensure!(
-            wal.encrypted_record_bytes == record_bytes
-                && record_bytes != 0
-                && record_bytes <= LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES
-                && (wal.schema != LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3
-                    || record_bytes <= LIVE_SCROLLBACK_APPEND_MAX_RECORD_BYTES as u64),
+            match wal.schema.as_str() {
+                LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V5 => {
+                    record_count != 0 && record_count <= LIVE_SCROLLBACK_CUMULATIVE_WAL_MAX_ROWS
+                }
+                LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3 => {
+                    record_count > 1
+                        && record_count <= u64::try_from(LIVE_SCROLLBACK_APPEND_MAX_ROWS)?
+                        && record_count <= wal.max_retained_rows
+                }
+                LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4 => {
+                    record_count != 0
+                        && record_count <= u64::try_from(LIVE_SCROLLBACK_APPEND_MAX_ROWS)?
+                        && record_count <= wal.max_retained_rows
+                }
+                _ => record_count == 1,
+            },
+            "append WAL batch row bounds or schema are invalid"
+        );
+        // A digest-only WAL holds no rows. Its constructor's rows are checked
+        // here; recovery checks the ledger's rows against its digest.
+        let batch_rows: Option<Vec<&str>> = if wal.is_digest_only() {
+            construction.map(|proof| proof.records.iter().map(String::as_str).collect())
+        } else {
+            Some(wal.records().collect())
+        };
+        if let Some(rows) = batch_rows.as_deref() {
+            let record_bytes = rows.iter().try_fold(0u64, |bytes, record| {
+                anyhow::ensure!(!record.is_empty(), "append WAL contains an empty record");
+                bytes
+                    .checked_add(u64::try_from(record.len())?)
+                    .ok_or_else(|| anyhow::anyhow!("append WAL batch bytes overflow"))
+            })?;
+            anyhow::ensure!(
+                u64::try_from(rows.len())? == record_count
+                    && wal.encrypted_record_bytes == record_bytes,
+                "append WAL encrypted-record length is invalid"
+            );
+        }
+        anyhow::ensure!(
+            wal.encrypted_record_bytes >= record_count
+                && if wal.is_cumulative() {
+                    wal.encrypted_record_bytes <= LIVE_SCROLLBACK_CUMULATIVE_WAL_MAX_RECORD_BYTES
+                } else {
+                    wal.encrypted_record_bytes <= LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES
+                        && (!matches!(
+                            wal.schema.as_str(),
+                            LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3
+                                | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4
+                        ) || wal.encrypted_record_bytes
+                            <= u64::try_from(LIVE_SCROLLBACK_APPEND_MAX_RECORD_BYTES)?)
+                },
             "append WAL encrypted-record length is invalid"
         );
         let expected_durable_pane_id = uuid::Uuid::from_bytes(durable_pane_id).simple().to_string();
@@ -3364,12 +6343,15 @@ impl LiveScrollbackSpillSink {
         let target_epoch =
             decode_live_scrollback_epoch(&wal.target_content_epoch, "append WAL target epoch")?;
         Self::append_wal_supersession(wal)?;
+        // A batch advances the revision by one; a cumulative tail by one per
+        // row it names, as its windows did.
+        let revision_step = if wal.is_cumulative() { record_count } else { 1 };
         anyhow::ensure!(
             target_epoch == predecessor_epoch
                 && wal.target_revision
                     == wal
                         .predecessor_revision
-                        .checked_add(1)
+                        .checked_add(revision_step)
                         .ok_or_else(|| anyhow::anyhow!("append WAL predecessor is exhausted"))?,
             "append WAL target is not the exact predecessor successor"
         );
@@ -3398,7 +6380,10 @@ impl LiveScrollbackSpillSink {
                     "v1 append WAL contains incremental authority"
                 );
             }
-            LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2 | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3 => {
+            LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2
+            | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3
+            | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4
+            | LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V5 => {
                 anyhow::ensure!(
                     wal.target_record_set_sha256.is_none(),
                     "incremental append WAL contains a quadratic target-set digest"
@@ -3432,7 +6417,9 @@ impl LiveScrollbackSpillSink {
                     "incremental WAL target chain tail",
                 )?;
                 let expected_tail = match construction {
-                    Some(proof) => proof.chain_tail,
+                    Some(proof) => Some(proof.chain_tail),
+                    // The ledger's rows are chained by recovery instead.
+                    None if wal.is_digest_only() => None,
                     None => {
                         let mut tail = predecessor_tail;
                         for (offset, record) in wal.records().enumerate() {
@@ -3449,11 +6436,11 @@ impl LiveScrollbackSpillSink {
                                 record,
                             )?;
                         }
-                        tail
+                        Some(tail)
                     }
                 };
                 anyhow::ensure!(
-                    expected_tail == target_tail
+                    expected_tail.is_none_or(|tail| tail == target_tail)
                         && (wal.evicted_record_count != Some(0)
                             || predecessor_anchor == target_anchor),
                     "incremental append WAL chain successor is inconsistent"
@@ -3462,11 +6449,12 @@ impl LiveScrollbackSpillSink {
             _ => unreachable!("schema checked above"),
         }
         let expected_digest = match construction {
-            Some(proof) => proof.record_digest,
-            None => wal.records_digest()?,
+            Some(proof) => Some(proof.record_digest),
+            None if wal.is_digest_only() => None,
+            None => Some(wal.records_digest()?),
         };
         anyhow::ensure!(
-            expected_digest == record_digest,
+            expected_digest.is_none_or(|digest| digest == record_digest),
             "append WAL encrypted-record digest mismatch"
         );
         anyhow::ensure!(
@@ -3481,7 +6469,7 @@ impl LiveScrollbackSpillSink {
         );
         let target_next_sequence = wal
             .appended_sequence
-            .checked_add(u64::try_from(record_count)?)
+            .checked_add(record_count)
             .ok_or_else(|| anyhow::anyhow!("append WAL sequence is exhausted"))?;
         anyhow::ensure!(
             wal.target_next_sequence == target_next_sequence
@@ -3495,12 +6483,19 @@ impl LiveScrollbackSpillSink {
             let evicted = wal.evicted_record_count.ok_or_else(|| {
                 anyhow::anyhow!("incremental append WAL eviction count is missing")
             })?;
+            // A batch evicts only older rows; a cumulative tail longer than
+            // the retention may also evict rows it appended itself.
+            let eviction_bound = if wal.is_cumulative() {
+                wal.target_oldest_sequence
+            } else {
+                wal.appended_sequence
+            };
             anyhow::ensure!(
-                evicted <= wal.appended_sequence
+                evicted <= eviction_bound
                     && wal.target_oldest_sequence
                         == wal
                             .appended_sequence
-                            .checked_add(u64::try_from(record_count)?)
+                            .checked_add(record_count)
                             .and_then(|next| next.checked_sub(wal.target_record_count))
                             .ok_or_else(|| anyhow::anyhow!(
                                 "incremental append WAL target underflows"
@@ -3525,7 +6520,38 @@ impl LiveScrollbackSpillSink {
                         .ok_or_else(|| anyhow::anyhow!("append WAL endpoint overflows"))?,
             "append WAL stable-row interval is inconsistent"
         );
-        for (offset, record) in wal.records().enumerate() {
+        if let Some(rows) = batch_rows {
+            Self::validate_append_wal_row_locations(wal, rows, durable_pane_id, target_epoch)?;
+        }
+        anyhow::ensure!(
+            wal.guardian_authentication.is_some(),
+            "append WAL guardian authentication is missing"
+        );
+        Ok(())
+    }
+
+    /// Every row of a batch is sealed for the exact place the WAL puts it.
+    fn validate_append_wal_row_locations<'a>(
+        wal: &LiveScrollbackAppendWalV1,
+        rows: impl IntoIterator<Item = &'a str>,
+        durable_pane_id: [u8; 16],
+        target_epoch: [u8; 16],
+    ) -> anyhow::Result<()> {
+        for (offset, record) in rows.into_iter().enumerate() {
+            if mux::guardian_output_journal::is_compact_scrollback_row(record)
+                || mux::guardian_output_journal::is_scrollback_segment_record(record)
+            {
+                // A compact or sealed-segment row has no header to compare:
+                // its location is bound by its AEAD, which opening it at
+                // recovery checks. A batch names its nonce segment; a
+                // cumulative tail's rows belong to segments its predecessor
+                // manifest already names.
+                anyhow::ensure!(
+                    wal.row_segment.is_some() || wal.is_cumulative(),
+                    "append WAL names compact rows without their nonce segment"
+                );
+                continue;
+            }
             let parsed =
                 mux::guardian_output_journal::GuardianEncryptedScrollbackRow::parse(record)
                     .context("parse append WAL exact row")?;
@@ -3538,20 +6564,94 @@ impl LiveScrollbackSpillSink {
                 .appended_stable_row
                 .checked_add(wezterm_term::StableRowIndex::try_from(offset)?)
                 .ok_or_else(|| anyhow::anyhow!("append WAL stable row overflows"))?;
+            // A cumulative tail spans many windows, each sealed at its own
+            // revision; its location is still exact.
             anyhow::ensure!(
                 identity.durable_pane_id() == durable_pane_id
                     && identity.content_epoch() == target_epoch
-                    && identity.revision() == wal.target_revision
+                    && (wal.is_cumulative() || identity.revision() == wal.target_revision)
                     && identity.stable_row() == i64::try_from(stable_row)?
                     && identity.sequence() == sequence,
                 "append WAL exact row has the wrong authenticated location"
             );
         }
-        anyhow::ensure!(
-            wal.guardian_authentication.is_some(),
-            "append WAL guardian authentication is missing"
-        );
         Ok(())
+    }
+
+    /// A digest-only WAL names its batch and the ledger holds the only copy.
+    /// Rows read back from the ledger must be exactly that batch: its row
+    /// and byte counts, its digest, the chain successor it seals, and every
+    /// row's sealed location.
+    fn verify_digest_only_append_wal_rows(
+        wal: &LiveScrollbackAppendWalV1,
+        rows: &[String],
+        durable_pane_id: [u8; 16],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            wal.is_digest_only(),
+            "ledger batch verification needs a digest-only append WAL"
+        );
+        let row_count = wal.batch_row_count()?;
+        anyhow::ensure!(
+            u64::try_from(rows.len())? == row_count,
+            "the ledger is missing rows its digest-only append WAL names"
+        );
+        let digest = live_scrollback_append_wal_batch_digest(
+            LIVE_SCROLLBACK_APPEND_WAL_BATCH_DIGEST_DOMAIN_V4,
+            row_count,
+            rows.iter().map(String::as_str),
+        )?;
+        anyhow::ensure!(
+            digest
+                == decode_live_scrollback_canonical_digest(
+                    &wal.encrypted_record_sha256,
+                    "append WAL batch digest",
+                )?,
+            "ledger rows differ from the batch their append WAL names"
+        );
+        let mut tail = decode_live_scrollback_canonical_digest(
+            wal.predecessor_chain_tail_sha256
+                .as_deref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("incremental WAL predecessor chain tail is missing")
+                })?,
+            "incremental WAL predecessor chain tail",
+        )?;
+        let mut bytes = 0_u64;
+        for (offset, record) in rows.iter().enumerate() {
+            let sequence = wal
+                .appended_sequence
+                .checked_add(u64::try_from(offset)?)
+                .ok_or_else(|| anyhow::anyhow!("append WAL batch sequence overflows"))?;
+            tail =
+                live_scrollback_incremental_chain_next(tail, wal.ledger_pane_id, sequence, record)?;
+            bytes = bytes
+                .checked_add(u64::try_from(record.len())?)
+                .ok_or_else(|| anyhow::anyhow!("append WAL batch bytes overflow"))?;
+        }
+        anyhow::ensure!(
+            bytes == wal.encrypted_record_bytes
+                && Some(tail)
+                    == wal
+                        .target_chain_tail_sha256
+                        .as_deref()
+                        .map(|encoded| {
+                            decode_live_scrollback_canonical_digest(
+                                encoded,
+                                "incremental WAL target chain tail",
+                            )
+                        })
+                        .transpose()?,
+            "ledger rows disagree with their append WAL's chain or byte count"
+        );
+        let target_epoch =
+            decode_live_scrollback_epoch(&wal.target_content_epoch, "append WAL target epoch")?;
+        Self::validate_append_wal_row_locations(
+            wal,
+            rows.iter().map(String::as_str),
+            durable_pane_id,
+            target_epoch,
+        )
     }
 
     fn validate_verified_append_wal_identity(
@@ -3692,6 +6792,7 @@ impl LiveScrollbackSpillSink {
             && manifest.retained_rows == wal.target_record_count
             && manifest.next_seq == wal.target_next_sequence
             && manifest.retained_record_bytes == Some(wal.target_retained_record_bytes)
+            && manifest.durability_gaps == wal.target_durability_gaps
             && chain_matches)
     }
 
@@ -3793,41 +6894,86 @@ impl LiveScrollbackSpillSink {
                     && retained_record_bytes == wal.target_retained_record_bytes,
                 "append WAL target ledger digest or byte count mismatch"
             );
+        } else if wal.is_cumulative() && wal.appended_sequence < wal.target_oldest_sequence {
+            // Retention evicted rows of the tail this cumulative WAL names
+            // (ft-yccm0.2.1.2), so its digest can no longer be recomputed. It
+            // was checked against the ledger before that prune; the range and
+            // byte checks here and the chain verification cover what remains.
         } else {
-            let count = wal.records().count();
-            anyhow::ensure!(
-                count <= LIVE_SCROLLBACK_APPEND_MAX_ROWS,
-                "append WAL exact target row count exceeds limit"
-            );
-            let end = wal
-                .appended_sequence
-                .checked_add(u64::try_from(count)?)
-                .ok_or_else(|| anyhow::anyhow!("append WAL exact target sequence overflows"))?;
-            // The caller holds the store lock: cloned ledger descriptors share
-            // their seek position. Read the batch through one bounded reader,
-            // retaining exact equality for every row, including the final row.
-            // Use the WAL's hard size cap rather than trusting its claimed size.
-            let max_stored_bytes = LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES
-                .checked_add(u64::try_from(count)?)
-                .ok_or_else(|| anyhow::anyhow!("append WAL read byte budget overflows"))?;
-            #[cfg(test)]
-            LIVE_SCROLLBACK_AUTHORITY_BATCH_READS.with(|reads| reads.set(reads.get() + 1));
-            let records = store.lines_range(
-                wal.ledger_pane_id,
-                wal.appended_sequence..end,
-                count,
-                max_stored_bytes,
-            )?;
-            anyhow::ensure!(
-                records.len() == count && records.iter().map(String::as_str).eq(wal.records()),
-                "append WAL exact target row mismatch"
-            );
+            let records = Self::read_append_wal_batch_from_store(wal, store)?;
+            let count = usize::try_from(wal.batch_row_count()?)?;
+            let exact = if wal.is_digest_only() {
+                // The WAL keeps only the batch digest; the ledger's rows must
+                // reproduce it, byte for byte.
+                records.len() == count
+                    && records.iter().try_fold(0_u64, |bytes, record| {
+                        bytes.checked_add(u64::try_from(record.len()).ok()?)
+                    }) == Some(wal.encrypted_record_bytes)
+                    && live_scrollback_append_wal_batch_digest(
+                        LIVE_SCROLLBACK_APPEND_WAL_BATCH_DIGEST_DOMAIN_V4,
+                        wal.batch_row_count()?,
+                        records.iter().map(String::as_str),
+                    )? == decode_live_scrollback_canonical_digest(
+                        &wal.encrypted_record_sha256,
+                        "append WAL batch digest",
+                    )?
+            } else {
+                records.len() == count && records.iter().map(String::as_str).eq(wal.records())
+            };
+            anyhow::ensure!(exact, "append WAL exact target row mismatch");
         }
         anyhow::ensure!(
             store.retained_record_bytes(wal.ledger_pane_id) == wal.target_retained_record_bytes,
             "append WAL target retained-byte count mismatch"
         );
         Ok(())
+    }
+
+    /// The batch a WAL names, read from the ledger in one bounded read. The
+    /// caller holds the store lock: cloned ledger descriptors share their
+    /// seek position. The byte budget is the WAL's hard size cap, never the
+    /// size the WAL claims.
+    fn read_append_wal_batch_from_store(
+        wal: &LiveScrollbackAppendWalV1,
+        store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+    ) -> anyhow::Result<Vec<String>> {
+        let count = usize::try_from(wal.batch_row_count()?)?;
+        let (max_rows, max_record_bytes) = if wal.is_cumulative() {
+            (
+                usize::try_from(LIVE_SCROLLBACK_CUMULATIVE_WAL_MAX_ROWS)?,
+                LIVE_SCROLLBACK_CUMULATIVE_WAL_MAX_RECORD_BYTES,
+            )
+        } else {
+            (
+                LIVE_SCROLLBACK_APPEND_MAX_ROWS,
+                LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES,
+            )
+        };
+        anyhow::ensure!(
+            count <= max_rows,
+            "append WAL exact target row count exceeds limit"
+        );
+        let end = wal
+            .appended_sequence
+            .checked_add(u64::try_from(count)?)
+            .ok_or_else(|| anyhow::anyhow!("append WAL exact target sequence overflows"))?;
+        let max_stored_bytes = max_record_bytes
+            .checked_add(u64::try_from(count)?)
+            .ok_or_else(|| anyhow::anyhow!("append WAL read byte budget overflows"))?;
+        #[cfg(test)]
+        LIVE_SCROLLBACK_AUTHORITY_BATCH_READS.with(|reads| reads.set(reads.get() + 1));
+        let records = store.lines_range(
+            wal.ledger_pane_id,
+            wal.appended_sequence..end,
+            count,
+            max_stored_bytes,
+        )?;
+        #[cfg(test)]
+        count_test_bytes(
+            &LIVE_SCROLLBACK_RECORD_BYTES_READ_BACK,
+            records.iter().map(String::len).sum(),
+        );
+        Ok(records)
     }
 
     fn incremental_append_wal_target_authority(
@@ -3872,6 +7018,366 @@ impl LiveScrollbackSpillSink {
         Ok(scanned)
     }
 
+    /// A digest-only transaction syncs its rows before it publishes the WAL
+    /// that names them, so a crash in between leaves the ledger running past
+    /// its authenticated v4 manifest. Unless the active WAL is authenticated
+    /// and provably consumed or superseded, it may name the rows, and they are
+    /// left to its recovery or refusal, and so are rows a retained manifest
+    /// stage may name. A complete adjacent digest-only WAL stage is the
+    /// interrupted publication: it is finished, replacing the consumed active
+    /// WAL as that transaction would have. Any other complete WAL stage
+    /// leaves the rows alone. Otherwise nothing names them: a durable commit
+    /// window tail (ft-yccm0.2.1.2) or a batch interrupted before its WAL.
+    /// Once the retained prefix is proven to be exactly the manifest's, the
+    /// rows that open at their exact locations are adopted in order, through
+    /// the cumulative WAL their publication would have written, and the rows
+    /// from the first that does not open are cut.
+    fn settle_ledger_tail_past_manifest(
+        manifest: Option<&LiveScrollbackManifestV1>,
+        manifest_path: &std::path::Path,
+        ledger_pane_id: u64,
+        store: &mut frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+        active_wal: Option<&LiveScrollbackAppendWalV1>,
+        keyring: &mut guardian_output_keys::GuardianOutputKeyring,
+        durable_pane_id: [u8; 16],
+    ) -> anyhow::Result<LedgerTailSettlement> {
+        let Some(manifest) = manifest.filter(|manifest| {
+            live_scrollback_manifest_is_authenticated(manifest)
+                && manifest.publication_state == "complete"
+                && manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4
+        }) else {
+            return Ok(LedgerTailSettlement::Unchanged);
+        };
+        let observed_next = store.next_seq(ledger_pane_id)?;
+        if observed_next <= manifest.next_seq {
+            return Ok(LedgerTailSettlement::Unchanged);
+        }
+        // A retained manifest stage may be the successor that names the
+        // rows; its own recovery decides about them.
+        if std::fs::symlink_metadata(Self::deterministic_manifest_stage_path(manifest_path)?)
+            .is_ok()
+        {
+            return Ok(LedgerTailSettlement::Unchanged);
+        }
+        let active_path = Self::append_wal_path(manifest_path)?;
+        let stage_path = Self::append_wal_stage_path(manifest_path)?;
+        let (active_path, stage_path) = (active_path.as_path(), stage_path.as_path());
+        // Declining to cut is always safe: whatever no WAL proves still fails
+        // the checks after this one. Cutting needs proof that no WAL names
+        // the rows, so an active WAL that fails authentication, or is not
+        // provably consumed, leaves them alone.
+        if let Some(active) = active_wal {
+            let consumed = Self::validate_append_wal_identity(active, durable_pane_id).is_ok()
+                && Self::authenticate_append_wal(active, &*keyring).is_ok()
+                && Self::append_wal_is_consumed_or_superseded(active, manifest).unwrap_or(false);
+            if !consumed {
+                return Ok(LedgerTailSettlement::Unchanged);
+            }
+        }
+        let mut incomplete_stage = false;
+        match Self::read_append_wal(stage_path) {
+            Ok(Some(staged)) => {
+                let interrupted_publication = staged.is_digest_only()
+                    && Self::append_wal_matches_predecessor_manifest(&staged, manifest)
+                        .unwrap_or(false);
+                if !interrupted_publication {
+                    return Ok(LedgerTailSettlement::Unchanged);
+                }
+                Self::validate_append_wal_identity(&staged, durable_pane_id)?;
+                Self::authenticate_append_wal(&staged, &*keyring)?;
+                Self::promote_append_wal_stage(stage_path, active_path, &staged)?;
+                return Ok(LedgerTailSettlement::PromotedStage);
+            }
+            Ok(None) => {}
+            Err(_) if Self::append_wal_stage_is_recoverably_incomplete(stage_path)? => {
+                incomplete_stage = true;
+            }
+            Err(_) => return Ok(LedgerTailSettlement::Unchanged),
+        }
+
+        let tail = observed_next - manifest.next_seq;
+        let oldest = manifest.oldest_seq.unwrap_or(manifest.next_seq);
+        anyhow::ensure!(
+            store.oldest_seq(ledger_pane_id) == Some(oldest)
+                && oldest.checked_add(manifest.retained_rows) == Some(manifest.next_seq),
+            "a ledger running past its manifest no longer starts where the manifest does"
+        );
+        let (mut chain, expected) = expected_live_scrollback_v4_chain(manifest)?;
+        let mut bytes = 0_u64;
+        for sequence in oldest..manifest.next_seq {
+            let record = live_scrollback_authority_record_at(store, ledger_pane_id, sequence)?;
+            bytes = bytes
+                .checked_add(u64::try_from(record.len())?)
+                .and_then(|bytes| bytes.checked_add(1))
+                .ok_or_else(|| anyhow::anyhow!("manifest prefix bytes overflow"))?;
+            chain =
+                live_scrollback_incremental_chain_next(chain, ledger_pane_id, sequence, &record)?;
+        }
+        anyhow::ensure!(
+            chain == expected && Some(bytes) == manifest.retained_record_bytes,
+            "a ledger running past its manifest changed the rows the manifest seals"
+        );
+        // ft-yccm0.2.1.2: the rows are a durable commit-window tail, or a
+        // batch interrupted before its WAL. Each row that opens at its exact
+        // location under the manifest's nonce segments is adopted, in order,
+        // up to the first that does not; rows from there on (a torn,
+        // reordered or foreign suffix) are cut. The adopted tail gets the WAL
+        // its publication would have written, and recovery rolls it forward.
+        let (adopted, may_hold_gap_marker) = if incomplete_stage {
+            (Vec::new(), false)
+        } else {
+            Self::adoptable_ledger_tail(
+                manifest,
+                ledger_pane_id,
+                store,
+                &*keyring,
+                durable_pane_id,
+                observed_next,
+            )?
+        };
+        let adopted_rows = u64::try_from(adopted.len())?;
+        let adopted_next = manifest
+            .next_seq
+            .checked_add(adopted_rows)
+            .ok_or_else(|| anyhow::anyhow!("an adopted tail's sequence overflows"))?;
+        if adopted_next < observed_next {
+            store
+                .truncate_after(ledger_pane_id, adopted_next)
+                .context("cut scrollback rows past the adoptable tail")?;
+            log::warn!(
+                "cut {} scrollback rows past the published manifest that do not open at their location (adopted {adopted_rows} before them)",
+                observed_next - adopted_next
+            );
+        }
+        if adopted.is_empty() {
+            return Ok(LedgerTailSettlement::Cut(tail));
+        }
+        let published_authority = VerifiedLedgerState {
+            ledger_pane_id,
+            oldest_sequence: manifest.oldest_seq,
+            next_sequence: manifest.next_seq,
+            record_count: manifest.retained_rows,
+            retained_record_bytes: bytes,
+            chain_anchor: expected_live_scrollback_v4_chain(manifest)?.0,
+            chain_tail: chain,
+        };
+        let wal = Self::adopted_tail_append_wal(
+            manifest,
+            published_authority,
+            &adopted,
+            may_hold_gap_marker,
+            store,
+            keyring,
+            durable_pane_id,
+        )?;
+        Self::write_new_append_wal_stage(stage_path, &wal)?;
+        Self::promote_append_wal_stage(stage_path, active_path, &wal)?;
+        log::warn!("adopted {adopted_rows} durable scrollback rows past the published manifest");
+        Ok(LedgerTailSettlement::PromotedStage)
+    }
+
+    /// The ledger rows past `manifest` that open at their exact location
+    /// under its nonce segments, up to the first that does not, and whether
+    /// any of them may be a durability-gap marker (ft-yccm0.2.1.6): a marker
+    /// whose transaction died before its WAL never published its totals.
+    fn adoptable_ledger_tail(
+        manifest: &LiveScrollbackManifestV1,
+        ledger_pane_id: u64,
+        store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+        keyring: &guardian_output_keys::GuardianOutputKeyring,
+        durable_pane_id: [u8; 16],
+        observed_next: u64,
+    ) -> anyhow::Result<(Vec<String>, bool)> {
+        let row_segments = Self::manifest_row_segments(manifest)?;
+        let (content_epoch, _revision) = live_scrollback_manifest_generation(manifest)?
+            .ok_or_else(|| anyhow::anyhow!("a v4 manifest has no generation"))?;
+        let initial = manifest
+            .initial_stable_row
+            .ok_or_else(|| anyhow::anyhow!("a manifest with a tail has no stable-row origin"))?;
+        let mut cipher_cache = GuardianScrollbackCipherCache::new(keyring, &row_segments);
+        let mut adopted = Vec::new();
+        let mut may_hold_gap_marker = false;
+        // A sealed segment opens only whole: one whose tail never reached
+        // the ledger (a torn window) is cut from its first row.
+        let (physical_oldest, _) = store_segment_bounds(store, ledger_pane_id)?;
+        let mut segments = LiveScrollbackSegmentReader::default();
+        for sequence in manifest.next_seq..observed_next {
+            let Some(record) = store.line_at(ledger_pane_id, sequence)? else {
+                break;
+            };
+            let Some(stable_row) = wezterm_term::StableRowIndex::try_from(sequence)
+                .ok()
+                .and_then(|offset| initial.checked_add(offset))
+            else {
+                break;
+            };
+            let opened = decode_stored_scrollback_row(
+                &record,
+                &mut segments,
+                &mut |range| store_segment_records(store, ledger_pane_id, range),
+                physical_oldest,
+                observed_next,
+                &mut cipher_cache,
+                durable_pane_id,
+                content_epoch,
+                stable_row,
+                sequence,
+                LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+            )
+            .ok()
+            .filter(|(_line, _bytes, fidelity)| {
+                *fidelity == DecodedScrollbackRecordFidelity::ExactSemantic
+            });
+            let Some((line, _bytes, _fidelity)) = opened else {
+                break;
+            };
+            may_hold_gap_marker |= line
+                .as_str()
+                .starts_with(deferred_scrollback::GAP_MARKER_PREFIX);
+            adopted.push(record);
+        }
+        Ok((adopted, may_hold_gap_marker))
+    }
+
+    /// The cumulative WAL for a tail recovery adopts: the live state the
+    /// windows had built from `manifest` and `published_authority` (the
+    /// verified prefix), with the manifest's retention applied row by row.
+    /// The manifest's gap totals carry over unless the tail may hold a gap
+    /// marker they do not count; then they are unknown.
+    fn adopted_tail_append_wal(
+        manifest: &LiveScrollbackManifestV1,
+        published_authority: VerifiedLedgerState,
+        adopted: &[String],
+        may_hold_gap_marker: bool,
+        store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+        keyring: &mut guardian_output_keys::GuardianOutputKeyring,
+        durable_pane_id: [u8; 16],
+    ) -> anyhow::Result<LiveScrollbackAppendWalV1> {
+        let (content_epoch, revision) = live_scrollback_manifest_generation(manifest)?
+            .ok_or_else(|| anyhow::anyhow!("a v4 manifest has no generation"))?;
+        let max_retained_rows = usize::try_from(manifest.max_retained_rows)?;
+        let mut target = published_authority;
+        let mut tail_record_bytes = 0_u64;
+        for record in adopted {
+            (target, _) =
+                target.project_append(target.next_sequence, record, max_retained_rows, store)?;
+            tail_record_bytes = tail_record_bytes
+                .checked_add(u64::try_from(record.len())?)
+                .and_then(|bytes| bytes.checked_add(1))
+                .ok_or_else(|| anyhow::anyhow!("an adopted tail's bytes overflow"))?;
+        }
+        let rows = u64::try_from(adopted.len())?;
+        let initial_stable_row = manifest
+            .initial_stable_row
+            .ok_or_else(|| anyhow::anyhow!("a manifest with a tail has no stable-row origin"))?;
+        let published = LiveScrollbackPublishedPrefix {
+            revision,
+            predecessor_generation: live_scrollback_manifest_predecessor(manifest)?,
+            newest_stable_row_exclusive: manifest.newest_stable_row_exclusive,
+            authority: published_authority,
+            tail_record_bytes,
+            retained_append_wal: None,
+        };
+        let live = LiveScrollbackSpillState {
+            initial_stable_row: Some(initial_stable_row),
+            newest_stable_row_exclusive: Some(
+                initial_stable_row
+                    .checked_add(wezterm_term::StableRowIndex::try_from(
+                        target.next_sequence,
+                    )?)
+                    .ok_or_else(|| anyhow::anyhow!("an adopted tail's newest row overflows"))?,
+            ),
+            max_retained_rows,
+            content_epoch,
+            revision: revision
+                .checked_add(rows)
+                .ok_or_else(|| anyhow::anyhow!("an adopted tail exhausts the revision"))?,
+            authenticated_manifest: true,
+            predecessor_generation: Some(wezterm_term::config::ScrollbackSnapshotGeneration::new(
+                content_epoch,
+                revision,
+            )),
+            clear_manifest_published: false,
+            clear_pending_physical_reclamation: false,
+            transaction_quarantined: false,
+            verified_ledger: Some(target),
+            row_segments: Self::manifest_row_segments(manifest)?,
+            durability_gaps: if may_hold_gap_marker {
+                None
+            } else {
+                manifest.durability_gaps
+            },
+            published: Some(published),
+        };
+        let cipher = keyring
+            .latest_active_cipher()
+            .context("load guardian append-WAL authentication key")?;
+        Self::build_cumulative_append_wal(
+            durable_pane_id,
+            manifest,
+            &published,
+            &live,
+            adopted,
+            &cipher,
+        )
+    }
+
+    /// Write a fresh, private, synchronized append WAL stage, refusing to
+    /// replace any existing stage file.
+    fn write_new_append_wal_stage(
+        stage_path: &std::path::Path,
+        wal: &LiveScrollbackAppendWalV1,
+    ) -> anyhow::Result<()> {
+        let mut bytes = serde_json::to_vec_pretty(wal)?;
+        bytes.push(b'\n');
+        anyhow::ensure!(
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES,
+            "append WAL serialization exceeds its byte ceiling"
+        );
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options
+            .open(stage_path)
+            .with_context(|| format!("create append WAL stage {}", stage_path.display()))?;
+        file.write_all(&bytes)?;
+        frankenterm_core::storage::mmap_store::ordered_durability_sync(&file)?;
+        Self::verify_append_wal_readback(stage_path, &bytes)
+    }
+
+    /// Publish a complete, authenticated WAL stage as the active WAL: sync
+    /// it, rename it over the active path, and sync the directory.
+    fn promote_append_wal_stage(
+        stage_path: &std::path::Path,
+        active_path: &std::path::Path,
+        staged: &LiveScrollbackAppendWalV1,
+    ) -> anyhow::Result<()> {
+        Self::sync_private_scrollback_stage(stage_path, LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES)?;
+        if let Err(rename_error) = std::fs::rename(stage_path, active_path) {
+            anyhow::ensure!(
+                Self::read_append_wal(active_path)?.as_ref() == Some(staged),
+                "publish the interrupted append WAL stage: {rename_error}"
+            );
+        }
+        #[cfg(not(windows))]
+        std::fs::File::open(
+            active_path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("scrollback append WAL has no parent"))?,
+        )?
+        .sync_all()?;
+        anyhow::ensure!(
+            Self::read_append_wal(active_path)?.as_ref() == Some(staged),
+            "the published append WAL stage changed during recovery"
+        );
+        Ok(())
+    }
+
     fn reconcile_authenticated_append_wal(
         wal: &LiveScrollbackAppendWalV1,
         manifest: &LiveScrollbackManifestV1,
@@ -3907,7 +7413,26 @@ impl LiveScrollbackSpillSink {
         );
 
         let observed_next = store.next_seq(wal.ledger_pane_id)?;
-        if wal.schema == LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3 {
+        if wal.is_digest_only() {
+            // The batch was synchronized before this WAL was published, so
+            // recovery only rolls forward: the ledger must hold exactly the
+            // batch the WAL names, and nothing after it.
+            anyhow::ensure!(
+                observed_next == wal.target_next_sequence,
+                "digest-only append WAL recovery found its batch incomplete or followed by rows"
+            );
+            // A publication that crashed after its prune already dropped the
+            // tail rows retention evicted (ft-yccm0.2.1.2); the authenticated
+            // target chain, verified cold below, pins every retained row.
+            let pruned_tail = wal.is_cumulative()
+                && wal.appended_sequence < wal.target_oldest_sequence
+                && store.oldest_seq(wal.ledger_pane_id) == Some(wal.target_oldest_sequence);
+            if !pruned_tail {
+                let rows = Self::read_append_wal_batch_from_store(wal, store)?;
+                Self::verify_digest_only_append_wal_rows(wal, &rows, durable_pane_id)
+                    .context("verify the ledger rows of a digest-only append WAL")?;
+            }
+        } else if wal.schema == LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3 {
             anyhow::ensure!(
                 observed_next >= wal.appended_sequence && observed_next <= wal.target_next_sequence,
                 "batch WAL recovery found a gap or conflicting successor"
@@ -4010,8 +7535,10 @@ impl LiveScrollbackSpillSink {
             "append WAL recovery ledger pruned beyond its authenticated target"
         );
         if observed_oldest < wal.target_oldest_sequence {
+            let keep_from =
+                store_segment_keep_from(store, wal.ledger_pane_id, wal.target_oldest_sequence)?;
             store
-                .prune_before(wal.ledger_pane_id, wal.target_oldest_sequence)
+                .prune_before_keeping(wal.ledger_pane_id, wal.target_oldest_sequence, keep_from)
                 .context("recover append WAL retention cut")?;
         }
         Self::verify_append_wal_target_store(wal, store)?;
@@ -4024,6 +7551,11 @@ impl LiveScrollbackSpillSink {
         };
         let target_epoch =
             decode_live_scrollback_epoch(&wal.target_content_epoch, "append WAL target epoch")?;
+        let row_segments = Self::append_wal_target_row_segments(
+            wal,
+            &Self::manifest_row_segments(manifest)
+                .context("append WAL predecessor row segments")?,
+        )?;
         Self::validate_persisted_records(
             store,
             wal.ledger_pane_id,
@@ -4031,6 +7563,7 @@ impl LiveScrollbackSpillSink {
             durable_pane_id,
             target_epoch,
             wal.initial_stable_row,
+            &row_segments,
             true,
         )?;
         let predecessor_epoch = decode_live_scrollback_epoch(
@@ -4052,20 +7585,228 @@ impl LiveScrollbackSpillSink {
             clear_pending_physical_reclamation: false,
             transaction_quarantined: false,
             verified_ledger,
+            row_segments,
+            durability_gaps: wal.target_durability_gaps,
+            published: None,
         }))
+    }
+
+    /// The nonce segments after `wal`'s batch: the predecessor's, plus the
+    /// segment the WAL starts, trimmed to the WAL's target oldest row. A
+    /// started segment must begin at the batch and must not reuse the base
+    /// of any segment the predecessor retains (ft-yccm0.2.1.4).
+    fn append_wal_target_row_segments(
+        wal: &LiveScrollbackAppendWalV1,
+        predecessor: &LiveScrollbackRowSegments,
+    ) -> anyhow::Result<LiveScrollbackRowSegments> {
+        let mut table = *predecessor;
+        if let Some(entry) = wal.row_segment.as_ref() {
+            let segment = entry.to_segment()?;
+            if table.last() == Some(segment) {
+                anyhow::ensure!(
+                    segment.first_sequence() < wal.appended_sequence,
+                    "append WAL continues a row nonce segment that has no earlier rows"
+                );
+            } else {
+                anyhow::ensure!(
+                    segment.first_sequence() == wal.appended_sequence,
+                    "append WAL starts a row nonce segment away from its batch"
+                );
+                table
+                    .push(segment)
+                    .context("append WAL row nonce segment")?;
+            }
+        }
+        table.retain_from(Some(wal.target_oldest_sequence));
+        Ok(table)
+    }
+
+    /// The cumulative (v5) WAL that publishes a durable tail (ft-yccm0.2.1.2):
+    /// it follows `predecessor_manifest`, which describes `published`, and
+    /// names `tail_rows`, the ledger's rows past it, the retention the
+    /// windows applied, and `live`'s exact target. Shared by publication and
+    /// by recovery adopting a tail, so both write the same WAL.
+    fn build_cumulative_append_wal(
+        durable_pane_id: [u8; 16],
+        predecessor_manifest: &LiveScrollbackManifestV1,
+        published: &LiveScrollbackPublishedPrefix,
+        live: &LiveScrollbackSpillState,
+        tail_rows: &[String],
+        cipher: &mux::guardian_output_journal::GuardianOutputCipher,
+    ) -> anyhow::Result<LiveScrollbackAppendWalV1> {
+        let predecessor_authority = published.authority;
+        let target_authority = live
+            .verified_ledger
+            .ok_or_else(|| anyhow::anyhow!("a tail has no live ledger authority"))?;
+        let row_count = u64::try_from(tail_rows.len())?;
+        anyhow::ensure!(
+            row_count != 0
+                && predecessor_authority.next_sequence.checked_add(row_count)
+                    == Some(target_authority.next_sequence)
+                && published.revision.checked_add(row_count) == Some(live.revision)
+                && predecessor_authority.ledger_pane_id == target_authority.ledger_pane_id,
+            "a durable tail disagrees with its published prefix"
+        );
+        let initial_stable_row = live
+            .initial_stable_row
+            .ok_or_else(|| anyhow::anyhow!("a tail has no stable-row origin"))?;
+        let appended_stable_row = initial_stable_row
+            .checked_add(wezterm_term::StableRowIndex::try_from(
+                predecessor_authority.next_sequence,
+            )?)
+            .ok_or_else(|| anyhow::anyhow!("a tail's first stable row overflows"))?;
+        let previous_oldest = predecessor_authority
+            .oldest_sequence
+            .unwrap_or(predecessor_authority.next_sequence);
+        let target_oldest = target_authority
+            .oldest_sequence
+            .ok_or_else(|| anyhow::anyhow!("a tail target is unexpectedly empty"))?;
+        let mut encrypted_record_bytes = 0_u64;
+        for record in tail_rows {
+            encrypted_record_bytes = encrypted_record_bytes
+                .checked_add(u64::try_from(record.len())?)
+                .ok_or_else(|| anyhow::anyhow!("a tail's record bytes overflow"))?;
+        }
+        let record_digest = live_scrollback_append_wal_batch_digest(
+            LIVE_SCROLLBACK_APPEND_WAL_BATCH_DIGEST_DOMAIN_V4,
+            row_count,
+            tail_rows.iter().map(String::as_str),
+        )?;
+        let epoch = hex::encode(live.content_epoch);
+        let mut wal = LiveScrollbackAppendWalV1 {
+            schema: LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V5.to_string(),
+            durable_pane_id: uuid::Uuid::from_bytes(durable_pane_id).simple().to_string(),
+            ledger_pane_id: target_authority.ledger_pane_id,
+            predecessor_content_epoch: epoch.clone(),
+            predecessor_revision: published.revision,
+            predecessor_manifest_sha256: predecessor_manifest.manifest_sha256.clone(),
+            target_content_epoch: epoch,
+            target_revision: live.revision,
+            initial_stable_row,
+            newest_stable_row_exclusive: live
+                .newest_stable_row_exclusive
+                .ok_or_else(|| anyhow::anyhow!("a tail has no stable-row endpoint"))?,
+            appended_stable_row,
+            appended_sequence: predecessor_authority.next_sequence,
+            max_retained_rows: u64::try_from(live.max_retained_rows)?,
+            target_oldest_sequence: target_oldest,
+            target_next_sequence: target_authority.next_sequence,
+            target_record_count: target_authority.record_count,
+            target_retained_record_bytes: target_authority.retained_record_bytes,
+            encrypted_record_bytes,
+            encrypted_record_sha256: hex::encode(record_digest),
+            target_record_set_sha256: None,
+            predecessor_chain_anchor_sha256: Some(hex::encode(predecessor_authority.chain_anchor)),
+            predecessor_chain_tail_sha256: Some(hex::encode(predecessor_authority.chain_tail)),
+            target_chain_anchor_sha256: Some(hex::encode(target_authority.chain_anchor)),
+            target_chain_tail_sha256: Some(hex::encode(target_authority.chain_tail)),
+            evicted_record_count: Some(
+                target_oldest
+                    .checked_sub(previous_oldest)
+                    .ok_or_else(|| anyhow::anyhow!("a tail's retention moves backwards"))?,
+            ),
+            superseding_content_epoch: None,
+            superseding_revision: None,
+            superseding_ledger_pane_id: None,
+            superseding_manifest_sha256: None,
+            appended_record_count: Some(row_count),
+            row_segment: None,
+            target_durability_gaps: live.durability_gaps,
+            encrypted_record: String::new(),
+            additional_encrypted_records: Vec::new(),
+            guardian_authentication: None,
+            wal_sha256: String::new(),
+        };
+        wal.guardian_authentication = Some("pending".to_string());
+        Self::validate_append_wal_metadata(
+            &wal,
+            durable_pane_id,
+            Some(&AppendWalConstructionProof {
+                wal: &wal,
+                records: tail_rows,
+                record_digest,
+                chain_tail: target_authority.chain_tail,
+            }),
+        )?;
+        wal.guardian_authentication = None;
+        let canonical = Self::append_wal_authentication_bytes(&wal)?;
+        wal.guardian_authentication = Some(
+            cipher
+                .authenticate_scrollback_append_wal(&canonical)
+                .context("authenticate cumulative append WAL")?
+                .encode(),
+        );
+        wal.wal_sha256 = Self::append_wal_checksum(&wal)?;
+        Ok(wal)
+    }
+
+    /// The nonce segment a batch at `desired_sequence` seals its compact
+    /// rows under (ft-yccm0.2.1.4): the live stream's when it continues the
+    /// table's last segment under the same key and has not sealed this
+    /// sequence; otherwise a fresh segment starting at the batch, which may
+    /// not reuse the base of a retained segment or of the stream it replaces.
+    /// `None` when a fresh segment is needed but the table is full: the
+    /// batch then writes v3 rows.
+    fn row_nonce_stream_for_batch(
+        stream: &mut Option<mux::guardian_output_journal::GuardianScrollbackRowNonceStream>,
+        cipher: &mux::guardian_output_journal::GuardianOutputCipher,
+        retained: &LiveScrollbackRowSegments,
+        desired_sequence: u64,
+    ) -> anyhow::Result<Option<mux::guardian_output_journal::GuardianScrollbackRowSegment>> {
+        let replaced = stream.as_ref().map(|live| live.segment());
+        if let Some(live) = stream.as_ref() {
+            if replaced.is_some_and(|segment| {
+                segment.key_id() == cipher.key_id() && retained.last() == Some(segment)
+            }) && live.next_sequence() <= desired_sequence
+            {
+                return Ok(replaced);
+            }
+        }
+        if retained.is_full() {
+            return Ok(None);
+        }
+        let fresh = mux::guardian_output_journal::GuardianScrollbackRowNonceStream::begin(
+            cipher,
+            desired_sequence,
+            retained.iter().chain(replaced.as_ref()),
+        )
+        .context("start a scrollback row nonce segment")?;
+        let segment = fresh.segment();
+        *stream = Some(fresh);
+        Ok(Some(segment))
+    }
+
+    /// The nonce segment table a manifest publishes, checked against the
+    /// interval it retains. Only a v4 manifest can name compact rows.
+    fn manifest_row_segments(
+        manifest: &LiveScrollbackManifestV1,
+    ) -> anyhow::Result<LiveScrollbackRowSegments> {
+        anyhow::ensure!(
+            manifest.row_segments.is_empty()
+                || (manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4
+                    && manifest.publication_state == "complete"),
+            "only a complete v4 scrollback manifest names row nonce segments"
+        );
+        LiveScrollbackRowSegments::from_manifest(
+            &manifest.row_segments,
+            manifest.oldest_seq,
+            manifest.next_seq,
+        )
     }
 
     fn prepare_authenticated_append_wal(
         &self,
         predecessor_manifest: &LiveScrollbackManifestV1,
-        previous_state: LiveScrollbackSpillState,
-        proposed_state: LiveScrollbackSpillState,
+        previous_state: &LiveScrollbackSpillState,
+        proposed_state: &LiveScrollbackSpillState,
         ledger_pane_id: u64,
         stable_row: wezterm_term::StableRowIndex,
         desired_sequence: u64,
         max_retained_rows: usize,
         encrypted_records: &[String],
+        row_segment: Option<mux::guardian_output_journal::GuardianScrollbackRowSegment>,
         store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+        format: AppendWalFormat,
     ) -> anyhow::Result<(PreparedAppendWal<'_>, VerifiedLedgerState)> {
         let encrypted_record = encrypted_records
             .first()
@@ -4164,8 +7905,12 @@ impl LiveScrollbackSpillSink {
         let newest_stable_row_exclusive = proposed_state
             .newest_stable_row_exclusive
             .ok_or_else(|| anyhow::anyhow!("append WAL target has no stable-row endpoint"))?;
+        let digest_only = format == AppendWalFormat::DigestOnly;
+        let row_count = u64::try_from(encrypted_records.len())?;
         let mut wal = LiveScrollbackAppendWalV1 {
-            schema: if encrypted_records.len() == 1 {
+            schema: if digest_only {
+                LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4
+            } else if encrypted_records.len() == 1 {
                 LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2
             } else {
                 LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3
@@ -4203,12 +7948,31 @@ impl LiveScrollbackSpillSink {
             superseding_revision: None,
             superseding_ledger_pane_id: None,
             superseding_manifest_sha256: None,
-            encrypted_record: encrypted_record.to_string(),
-            additional_encrypted_records: encrypted_records[1..].to_vec(),
+            appended_record_count: digest_only.then_some(row_count),
+            row_segment: row_segment.map(LiveScrollbackRowSegmentV1::from_segment),
+            target_durability_gaps: proposed_state.durability_gaps,
+            encrypted_record: if digest_only {
+                String::new()
+            } else {
+                encrypted_record.to_string()
+            },
+            additional_encrypted_records: if digest_only {
+                Vec::new()
+            } else {
+                encrypted_records[1..].to_vec()
+            },
             guardian_authentication: None,
             wal_sha256: String::new(),
         };
-        let record_digest = wal.records_digest()?;
+        let record_digest = if digest_only {
+            live_scrollback_append_wal_batch_digest(
+                LIVE_SCROLLBACK_APPEND_WAL_BATCH_DIGEST_DOMAIN_V4,
+                row_count,
+                encrypted_records.iter().map(String::as_str),
+            )?
+        } else {
+            wal.records_digest()?
+        };
         wal.encrypted_record_sha256 = hex::encode(record_digest);
         // Authentication is intentionally absent until every other canonical
         // field is frozen. Validate the non-auth fields with a private marker,
@@ -4219,6 +7983,7 @@ impl LiveScrollbackSpillSink {
             self.durable_pane_id,
             Some(&AppendWalConstructionProof {
                 wal: &wal,
+                records: encrypted_records,
                 record_digest,
                 chain_tail: target_authority.chain_tail,
             }),
@@ -4266,12 +8031,13 @@ impl LiveScrollbackSpillSink {
             outcome_indeterminate: false,
             source,
         })?;
-        self.publish_validated_append_wal(wal)
+        self.publish_validated_append_wal(wal, RetainedAppendWalCheck::Live)
     }
 
     fn persist_prepared_append_wal(
         &self,
         prepared: &PreparedAppendWal<'_>,
+        retained: RetainedAppendWalCheck,
     ) -> Result<(), LiveScrollbackAppendWalPublishError> {
         if !std::ptr::eq(self, prepared.owner) {
             return Err(LiveScrollbackAppendWalPublishError {
@@ -4279,7 +8045,101 @@ impl LiveScrollbackSpillSink {
                 source: anyhow::anyhow!("prepared append WAL belongs to another sink"),
             });
         }
-        self.publish_validated_append_wal(&prepared.wal)
+        self.publish_validated_append_wal(&prepared.wal, retained)
+    }
+
+    /// The retained WAL may be replaced only when the published manifest
+    /// consumed it, with the ledger still at that target, or authentically
+    /// superseded it. Returns its checksum, or None when none is retained.
+    fn verify_replaceable_active_append_wal(
+        &self,
+        keyring: &dyn guardian_output_keys::GuardianHistoricalKeyLookup,
+    ) -> anyhow::Result<Option<[u8; 32]>> {
+        self.verify_replaceable_active_append_wal_with(keyring, || {
+            Self::read_manifest(&self.manifest_path)
+        })
+    }
+
+    /// [`Self::verify_replaceable_active_append_wal`] against the published
+    /// manifest `published` returns, asked for only when a WAL is retained.
+    /// A commit window passes the copy its transaction already read, under
+    /// the mutation gate and filesystem lease (ft-yccm0.2.1.5 AC2).
+    fn verify_replaceable_active_append_wal_with(
+        &self,
+        keyring: &dyn guardian_output_keys::GuardianHistoricalKeyLookup,
+        published: impl FnOnce() -> anyhow::Result<Option<LiveScrollbackManifestV1>>,
+    ) -> anyhow::Result<Option<[u8; 32]>> {
+        let active_path = Self::append_wal_path(&self.manifest_path)?;
+        let Some(verified) = Self::read_checksum_verified_append_wal(&active_path)? else {
+            return Ok(None);
+        };
+        self.validate_verified_append_wal_identity(&verified)?;
+        let checksum = verified.checksum;
+        let active = verified.wal;
+        let manifest =
+            published()?.ok_or_else(|| anyhow::anyhow!("active append WAL has no manifest"))?;
+        let durable_pane_id = uuid::Uuid::from_bytes(self.durable_pane_id)
+            .simple()
+            .to_string();
+        validate_live_scrollback_manifest_identity(
+            &manifest,
+            &durable_pane_id,
+            &self.manifest_path,
+        )?;
+        Self::authenticate_append_wal(&active, keyring)?;
+        anyhow::ensure!(
+            Self::authenticate_manifest(&manifest, keyring)?,
+            "active append WAL supersession manifest is not authenticated"
+        );
+        if Self::append_wal_matches_target_manifest(&active, &manifest)? {
+            let store = self
+                .lock_store("replace consumed append WAL target")
+                .map_err(anyhow::Error::new)?;
+            if Self::append_wal_is_v1_to_v4_target_migration(&active, &manifest) {
+                Self::verify_v1_append_wal_v4_target_migration(&active, &manifest, &store)?;
+            } else {
+                Self::verify_append_wal_target_store(&active, &store)?;
+            }
+            if active.is_incremental() {
+                let authority = Self::incremental_append_wal_target_authority(&active)?;
+                anyhow::ensure!(
+                    authority.matches_store_facts(&store)?
+                        && expected_live_scrollback_v4_chain(&manifest)?
+                            == (authority.chain_anchor, authority.chain_tail),
+                    "consumed incremental append WAL disagrees with its published v4 authority"
+                );
+            } else if !Self::append_wal_is_v1_to_v4_target_migration(&active, &manifest) {
+                Self::verify_logical_ledger_digest_from_store(
+                    &manifest,
+                    active.ledger_pane_id,
+                    &store,
+                )
+                .context("bind consumed append WAL before bounded-slot replacement")?;
+            }
+        } else {
+            anyhow::ensure!(
+                Self::append_wal_supersession_matches_manifest(&active, &manifest)?
+                    || Self::append_wal_is_immediately_superseded_by_manifest(&active, &manifest,)?,
+                "refusing to replace an unconsumed or unlinked append WAL"
+            );
+        }
+        Ok(Some(checksum))
+    }
+
+    /// Whether the deterministic WAL stage may hold exactly this WAL, so a
+    /// failed publication could still be finished by recovery. A stage that
+    /// cannot be read, and is not a recoverably incomplete write, might.
+    fn append_wal_stage_may_name(&self, wal: &LiveScrollbackAppendWalV1) -> bool {
+        let Ok(stage_path) = Self::append_wal_stage_path(&self.manifest_path) else {
+            return true;
+        };
+        match Self::read_append_wal(&stage_path) {
+            Ok(Some(staged)) => staged == *wal,
+            Ok(None) => false,
+            Err(_) => {
+                !Self::append_wal_stage_is_recoverably_incomplete(&stage_path).unwrap_or(false)
+            }
+        }
     }
 
     /// Both entry points prove input identity and checksum before reaching
@@ -4287,6 +8147,7 @@ impl LiveScrollbackSpillSink {
     fn publish_validated_append_wal(
         &self,
         wal: &LiveScrollbackAppendWalV1,
+        retained: RetainedAppendWalCheck,
     ) -> Result<(), LiveScrollbackAppendWalPublishError> {
         let mut publication_attempted = false;
         let result = (|| -> anyhow::Result<()> {
@@ -4304,56 +8165,16 @@ impl LiveScrollbackSpillSink {
             #[cfg(unix)]
             let parent = _parent;
 
-            if let Some(verified) = Self::read_checksum_verified_append_wal(&active_path)? {
-                self.validate_verified_append_wal_identity(&verified)?;
-                let active = verified.wal;
-                let manifest = Self::read_manifest(&self.manifest_path)?
-                    .ok_or_else(|| anyhow::anyhow!("active append WAL has no manifest"))?;
-                let durable_pane_id = uuid::Uuid::from_bytes(self.durable_pane_id)
-                    .simple()
-                    .to_string();
-                validate_live_scrollback_manifest_identity(
-                    &manifest,
-                    &durable_pane_id,
-                    &self.manifest_path,
-                )?;
-                Self::authenticate_append_wal(&active, &keyring)?;
-                anyhow::ensure!(
-                    Self::authenticate_manifest(&manifest, &keyring)?,
-                    "active append WAL supersession manifest is not authenticated"
-                );
-                if Self::append_wal_matches_target_manifest(&active, &manifest)? {
-                    let store = self
-                        .lock_store("replace consumed append WAL target")
-                        .map_err(anyhow::Error::new)?;
-                    if Self::append_wal_is_v1_to_v4_target_migration(&active, &manifest) {
-                        Self::verify_v1_append_wal_v4_target_migration(&active, &manifest, &store)?;
-                    } else {
-                        Self::verify_append_wal_target_store(&active, &store)?;
-                    }
-                    if active.is_incremental() {
-                        let authority = Self::incremental_append_wal_target_authority(&active)?;
-                        anyhow::ensure!(
-                            authority.matches_store_facts(&store)?
-                                && expected_live_scrollback_v4_chain(&manifest)?
-                                    == (authority.chain_anchor, authority.chain_tail),
-                            "consumed incremental append WAL disagrees with its published v4 authority"
-                        );
-                    } else if !Self::append_wal_is_v1_to_v4_target_migration(&active, &manifest) {
-                        Self::verify_logical_ledger_digest_from_store(
-                            &manifest,
-                            active.ledger_pane_id,
-                            &store,
-                        )
-                        .context("bind consumed append WAL before bounded-slot replacement")?;
-                    }
-                } else {
+            match retained {
+                RetainedAppendWalCheck::Live => {
+                    self.verify_replaceable_active_append_wal(&keyring)?;
+                }
+                RetainedAppendWalCheck::VerifiedBeforeAppend(expected) => {
+                    let observed = Self::read_checksum_verified_append_wal(&active_path)?
+                        .map(|verified| verified.checksum);
                     anyhow::ensure!(
-                        Self::append_wal_supersession_matches_manifest(&active, &manifest)?
-                            || Self::append_wal_is_immediately_superseded_by_manifest(
-                                &active, &manifest,
-                            )?,
-                        "refusing to replace an unconsumed or unlinked append WAL"
+                        observed == expected,
+                        "the retained append WAL changed after its pre-append replacement check"
                     );
                 }
             }
@@ -4467,9 +8288,13 @@ impl LiveScrollbackSpillSink {
                 parent,
             )?)?;
 
+            #[cfg(test)]
+            scrollback_crash_points::reach("wal_staged");
             publication_attempted = true;
             std::fs::rename(&stage_path, &active_path)
                 .with_context(|| format!("publish append WAL {}", active_path.display()))?;
+            #[cfg(test)]
+            scrollback_crash_points::reach("wal_renamed");
             #[cfg(not(windows))]
             frankenterm_core::storage::mmap_store::ordered_durability_sync(&std::fs::File::open(
                 parent,
@@ -4525,13 +8350,26 @@ impl LiveScrollbackSpillSink {
     /// pointer, and digest. A crash before this acknowledgement leaves the
     /// immediately-adjacent predecessor relation recoverable.
     fn advance_authenticated_append_wal_supersession(&self) -> anyhow::Result<()> {
+        self.advance_authenticated_append_wal_supersession_with(|| {
+            Self::read_manifest(&self.manifest_path)
+        })
+    }
+
+    /// [`Self::advance_authenticated_append_wal_supersession`], taking the
+    /// published manifest from `published` when there is a retained WAL to
+    /// advance. A commit window passes the copy it read once under the
+    /// mutation gate and filesystem lease (ft-yccm0.2.1.5 AC2).
+    fn advance_authenticated_append_wal_supersession_with(
+        &self,
+        published: impl FnOnce() -> anyhow::Result<Option<LiveScrollbackManifestV1>>,
+    ) -> anyhow::Result<()> {
         let active_path = Self::append_wal_path(&self.manifest_path)?;
         let Some(verified) = Self::read_checksum_verified_append_wal(&active_path)? else {
             return Ok(());
         };
         self.validate_verified_append_wal_identity(&verified)?;
         let active = verified.wal;
-        let manifest = Self::read_manifest(&self.manifest_path)?
+        let manifest = published()?
             .ok_or_else(|| anyhow::anyhow!("retained append WAL has no published manifest"))?;
         let durable_pane_id = uuid::Uuid::from_bytes(self.durable_pane_id)
             .simple()
@@ -4791,7 +8629,7 @@ impl LiveScrollbackSpillSink {
     fn replacement_manifest_matches(
         &self,
         manifest: &LiveScrollbackManifestV1,
-        proposed_state: LiveScrollbackSpillState,
+        proposed_state: &LiveScrollbackSpillState,
         expected_generation: Option<wezterm_term::config::ScrollbackSnapshotGeneration>,
         oldest_stable_row: Option<wezterm_term::StableRowIndex>,
         newest_stable_row_exclusive: wezterm_term::StableRowIndex,
@@ -4844,12 +8682,13 @@ impl LiveScrollbackSpillSink {
             && manifest.next_seq == row_count_u64
             && manifest.retained_record_bytes == Some(staged.committed_bytes())
             && manifest.committed_log_bytes == Some(staged.committed_bytes())
-            && manifest.committed_sequence_bytes == Some(0))
+            && manifest.committed_sequence_bytes == Some(0)
+            && manifest.row_segments.is_empty())
     }
 
     fn reread_and_verify_replacement_manifest(
         &self,
-        proposed_state: LiveScrollbackSpillState,
+        proposed_state: &LiveScrollbackSpillState,
         expected_generation: Option<wezterm_term::config::ScrollbackSnapshotGeneration>,
         oldest_stable_row: Option<wezterm_term::StableRowIndex>,
         newest_stable_row_exclusive: wezterm_term::StableRowIndex,
@@ -4880,6 +8719,7 @@ impl LiveScrollbackSpillSink {
         durable_pane_id: [u8; 16],
         content_epoch: [u8; 16],
         initial_stable_row: wezterm_term::StableRowIndex,
+        row_segments: &LiveScrollbackRowSegments,
         require_exact_semantic: bool,
     ) -> anyhow::Result<()> {
         let retained_rows = store.line_count(pane_id);
@@ -4889,7 +8729,9 @@ impl LiveScrollbackSpillSink {
         let oldest_seq = store
             .oldest_seq(pane_id)
             .ok_or_else(|| anyhow::anyhow!("non-empty scrollback log has no oldest sequence"))?;
-        let mut cipher_cache = GuardianScrollbackCipherCache::new(keyring);
+        let mut cipher_cache = GuardianScrollbackCipherCache::new(keyring, row_segments);
+        let (physical_oldest, next) = store_segment_bounds(store, pane_id)?;
+        let mut segments = LiveScrollbackSegmentReader::default();
         for offset in 0..retained_rows {
             let seq = oldest_seq
                 .checked_add(
@@ -4905,8 +8747,12 @@ impl LiveScrollbackSpillSink {
             let stable_row = initial_stable_row
                 .checked_add(stable_offset)
                 .ok_or_else(|| anyhow::anyhow!("scrollback stable row range overflow"))?;
-            let (_line, _decoded_bytes, fidelity) = decode_persisted_scrollback_line_with_limit(
+            let (_line, _decoded_bytes, fidelity) = decode_stored_scrollback_row(
                 &record,
+                &mut segments,
+                &mut |range| store_segment_records(store, pane_id, range),
+                physical_oldest,
+                next,
                 &mut cipher_cache,
                 durable_pane_id,
                 content_epoch,
@@ -5014,9 +8860,22 @@ impl LiveScrollbackSpillSink {
         Ok(observed)
     }
 
+    /// A sink whose every transaction is a single batch with its own WAL and
+    /// manifest publication.
+    #[cfg(test)]
     fn new(
         base_dir: PathBuf,
         context: &config::ScrollbackSpillSinkContext,
+    ) -> anyhow::Result<Self> {
+        Self::open(base_dir, context, std::time::Duration::ZERO)
+    }
+
+    /// A sink whose commit windows publish the manifest at most once per
+    /// `manifest_publish_interval` (ft-yccm0.2.1.2).
+    fn open(
+        base_dir: PathBuf,
+        context: &config::ScrollbackSpillSinkContext,
+        manifest_publish_interval: std::time::Duration,
     ) -> anyhow::Result<Self> {
         let pane_id = 0;
         let content_epoch = *uuid::Uuid::new_v4().as_bytes();
@@ -5151,7 +9010,27 @@ impl LiveScrollbackSpillSink {
         }
         let append_wal_path = Self::append_wal_path(&manifest_path)?;
         let append_wal_stage_path = Self::append_wal_stage_path(&manifest_path)?;
-        let active_append_wal = Self::read_append_wal(&append_wal_path)?;
+        let mut active_append_wal = Self::read_append_wal(&append_wal_path)?;
+        let tail_settlement = {
+            let mut keyring_guard = keyring
+                .lock()
+                .map_err(|_| anyhow::anyhow!("guardian output keyring is poisoned"))?;
+            Self::settle_ledger_tail_past_manifest(
+                persisted_manifest
+                    .as_ref()
+                    .filter(|_| authenticated_manifest),
+                &manifest_path,
+                ledger_pane_id,
+                &mut store,
+                active_append_wal.as_ref(),
+                &mut keyring_guard,
+                context.durable_pane_id,
+            )
+            .context("settle scrollback rows past the published manifest")?
+        };
+        if tail_settlement == LedgerTailSettlement::PromotedStage {
+            active_append_wal = Self::read_append_wal(&append_wal_path)?;
+        }
         if let Some(wal) = active_append_wal.as_ref() {
             let published_manifest = persisted_manifest.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("scrollback append WAL has no published predecessor manifest")
@@ -5238,11 +9117,17 @@ impl LiveScrollbackSpillSink {
                             && staged_generation == published_generation
                             && staged_predecessor
                                 == live_scrollback_manifest_predecessor(published_manifest)?;
+                        // A single batch advances the revision by one; a
+                        // cumulative tail (ft-yccm0.2.1.2) by the rows it adds.
+                        let tail_revision = staged_manifest
+                            .next_seq
+                            .checked_sub(published_manifest.next_seq)
+                            .and_then(|rows| published_generation.revision().checked_add(rows));
                         let exact_complete_successor = published_manifest.publication_state
                             == "complete"
                             && staged_generation.content_epoch()
                                 == published_generation.content_epoch()
-                            && staged_generation.revision()
+                            && (staged_generation.revision()
                                 == published_generation.revision().checked_add(1).ok_or_else(
                                     || {
                                         anyhow::anyhow!(
@@ -5250,6 +9135,7 @@ impl LiveScrollbackSpillSink {
                                         )
                                     },
                                 )?
+                                || Some(staged_generation.revision()) == tail_revision)
                             && staged_predecessor == Some(published_generation);
                         anyhow::ensure!(
                             same_prepared_generation || exact_complete_successor,
@@ -5279,6 +9165,8 @@ impl LiveScrollbackSpillSink {
                                 context.durable_pane_id,
                                 staged_generation.content_epoch(),
                                 initial_stable_row,
+                                &Self::manifest_row_segments(&staged_manifest)
+                                    .context("retained complete stage row segments")?,
                                 true,
                             )
                             .context("authenticate retained complete scrollback rows")?;
@@ -5564,6 +9452,7 @@ impl LiveScrollbackSpillSink {
                         let mut state = LiveScrollbackSpillState::empty(state_content_epoch, true);
                         state.revision = state_revision;
                         state.authenticated_manifest = authenticated_manifest;
+                        state.durability_gaps = manifest.durability_gaps;
                         state.predecessor_generation =
                             live_scrollback_manifest_predecessor(&manifest)?;
                         state.clear_manifest_published = true;
@@ -5582,6 +9471,14 @@ impl LiveScrollbackSpillSink {
                         let actual_committed_sequence_bytes =
                             store.sequence_file_bytes(ledger_pane_id)?;
                         let initial_stable_row = manifest.initial_stable_row;
+                        let mut row_segments = Self::manifest_row_segments(&manifest)
+                            .with_context(|| {
+                                format!(
+                                    "decode scrollback row nonce segments for {}",
+                                    manifest_path.display()
+                                )
+                            })?;
+                        row_segments.retain_from(actual_oldest_seq);
                         if authenticated_manifest {
                             let digest_verified = Self::verify_logical_ledger_digest_from_store(
                                 &manifest,
@@ -5617,6 +9514,7 @@ impl LiveScrollbackSpillSink {
                                 context.durable_pane_id,
                                 state_content_epoch,
                                 initial_stable_row,
+                                &row_segments,
                                 authenticated_manifest,
                             )
                             .with_context(|| {
@@ -5767,6 +9665,9 @@ impl LiveScrollbackSpillSink {
                                 clear_pending_physical_reclamation: false,
                                 transaction_quarantined: false,
                                 verified_ledger: None,
+                                row_segments,
+                                durability_gaps: manifest.durability_gaps,
+                                published: None,
                             },
                             repair_complete_manifest.then_some("complete"),
                         )
@@ -5811,6 +9712,11 @@ impl LiveScrollbackSpillSink {
             manifest_path,
             mutation_gate: std::sync::Mutex::new(()),
             append_wal_identity_cache: std::sync::Mutex::new([None; 2]),
+            row_nonce_stream: std::sync::Mutex::new(None),
+            manifest_publish_interval,
+            last_publication: std::sync::Mutex::new(std::time::Instant::now()),
+            durability_syncs: std::sync::atomic::AtomicU64::new(0),
+            cold_segment: std::sync::Mutex::default(),
             store: std::sync::Mutex::new(store),
             state: std::sync::Mutex::new(state),
             keyring,
@@ -5908,6 +9814,8 @@ impl LiveScrollbackSpillSink {
             .take(LIVE_SCROLLBACK_MANIFEST_MAX_BYTES.saturating_add(1))
             .read_to_end(&mut bytes)
             .with_context(|| format!("read scrollback manifest {}", path.display()))?;
+        #[cfg(test)]
+        LIVE_SCROLLBACK_MANIFEST_READS.with(|reads| reads.set(reads.get() + 1));
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > LIVE_SCROLLBACK_MANIFEST_MAX_BYTES {
             anyhow::bail!("scrollback manifest exceeds 1 MiB: {}", path.display());
         }
@@ -6344,20 +10252,38 @@ impl LiveScrollbackSpillSink {
             let authenticated_manifest = state.authenticated_manifest;
             let predecessor_generation = state.predecessor_generation;
             let verified_ledger = state.verified_ledger;
+            let mut row_segments = state.row_segments;
+            let durability_gaps = state.durability_gaps;
             drop(state);
             let ledger_pane_id = self.active_ledger_pane_id();
-            let mut keyring_guard = if authenticated_manifest {
+            // ft-yccm0.2.1.5: the process-wide keyring mutex is held only to
+            // resolve the signing key. Authentication of the staged and
+            // published manifest runs under a shared authority lease, which
+            // blocks rotation but not other panes, so manifest syncs and the
+            // rename no longer convoy every pane behind one mutex. The
+            // exclusive lease `latest_active_cipher` takes is released before
+            // the shared one is taken: one process never nests them.
+            let signing_cipher = if authenticated_manifest {
+                let mut keyring = self
+                    .lock_keyring("persist_manifest signing key")
+                    .map_err(anyhow::Error::new)?;
                 Some(
-                    self.lock_keyring("persist_manifest authentication")
-                        .map_err(anyhow::Error::new)?,
+                    keyring
+                        .latest_active_cipher()
+                        .context("load guardian manifest-authentication key")?,
                 )
             } else {
                 None
             };
-            let mut keyring = keyring_guard
-                .as_mut()
-                .map(|keyring| keyring.scoped_authority())
-                .transpose()?;
+            let keyring = if authenticated_manifest {
+                Some(
+                    guardian_output_keys::GuardianOutputKeyring::historical_authority(
+                        &self.keyring,
+                    )?,
+                )
+            } else {
+                None
+            };
 
             let (
                 oldest_seq,
@@ -6412,6 +10338,12 @@ impl LiveScrollbackSpillSink {
                 predecessor_generation.map(|generation| hex::encode(generation.content_epoch()));
             let predecessor_revision =
                 predecessor_generation.map(|generation| generation.revision());
+            row_segments.retain_from(oldest_seq);
+            anyhow::ensure!(
+                row_segments == LiveScrollbackRowSegments::EMPTY
+                    || (authenticated_manifest && publication_state == "complete"),
+                "only a complete authenticated manifest publishes row nonce segments"
+            );
             let mut manifest = LiveScrollbackManifestV1 {
                 schema: if authenticated_manifest {
                     LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4
@@ -6462,16 +10394,19 @@ impl LiveScrollbackSpillSink {
                     .map(|authority| hex::encode(authority.chain_anchor)),
                 chain_tail_sha256: incremental_authority
                     .map(|authority| hex::encode(authority.chain_tail)),
+                row_segments: row_segments.to_manifest(),
+                durability_gaps: if authenticated_manifest {
+                    durability_gaps
+                } else {
+                    None
+                },
                 guardian_manifest_authentication: None,
                 manifest_sha256: String::new(),
             };
 
-            if let Some(keyring) = keyring.as_mut() {
+            if let Some(cipher) = signing_cipher.as_ref() {
                 expected_live_scrollback_v4_chain(&manifest)?;
                 let canonical = Self::manifest_authentication_bytes(&manifest)?;
-                let cipher = keyring
-                    .latest_active_cipher()
-                    .context("load guardian manifest-authentication key")?;
                 manifest.guardian_manifest_authentication = Some(
                     cipher
                         .authenticate_scrollback_manifest(&canonical)
@@ -6582,6 +10517,11 @@ impl LiveScrollbackSpillSink {
                     });
                 }
             }
+            #[cfg(test)]
+            LIVE_SCROLLBACK_KEYRING_FREE_AT_RENAME
+                .with(|free| free.set(Some(self.keyring.try_lock().is_ok())));
+            #[cfg(test)]
+            scrollback_crash_points::reach("manifest_staged");
             std::fs::rename(&temp_path, &self.manifest_path).with_context(|| {
                 format!(
                     "publish scrollback manifest {}",
@@ -6589,6 +10529,8 @@ impl LiveScrollbackSpillSink {
                 )
             })?;
             published = true;
+            #[cfg(test)]
+            scrollback_crash_points::reach("manifest_renamed");
             #[cfg(not(windows))]
             {
                 let directory = std::fs::File::open(parent).with_context(|| {
@@ -6682,7 +10624,7 @@ impl LiveScrollbackSpillSink {
 
     fn authenticated_manifest_for_snapshot(
         &self,
-        state: LiveScrollbackSpillState,
+        state: &LiveScrollbackSpillState,
         ledger_pane_id: u64,
     ) -> Result<Option<LiveScrollbackManifestV1>, wezterm_term::config::ScrollbackSpillError> {
         use wezterm_term::config::ScrollbackSpillError;
@@ -6736,6 +10678,10 @@ impl LiveScrollbackSpillSink {
                 != ledger_pane_id
             || (state.clear_manifest_published && manifest.publication_state != "cleared")
             || (!state.clear_manifest_published && manifest.publication_state != "complete")
+            || Self::manifest_row_segments(&manifest)
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
+                != state.row_segments
+            || manifest.durability_gaps != state.durability_gaps
         {
             return Err(ScrollbackSpillError::StorageUnavailable);
         }
@@ -6765,7 +10711,7 @@ impl LiveScrollbackSpillSink {
 
     fn verify_current_published_state_before_mutation(
         &self,
-        state: LiveScrollbackSpillState,
+        state: &LiveScrollbackSpillState,
         ledger_pane_id: u64,
         allow_prepared_content_ahead: bool,
     ) -> Result<(), wezterm_term::config::ScrollbackSpillError> {
@@ -6776,6 +10722,57 @@ impl LiveScrollbackSpillSink {
         }
         let manifest = Self::read_manifest(&self.manifest_path)
             .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+        if let Some(manifest) = manifest.as_ref() {
+            let keyring = self.lock_keyring("pre-mutation manifest authentication")?;
+            if !Self::authenticate_manifest(manifest, &keyring)
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
+            {
+                return Err(ScrollbackSpillError::StorageUnavailable);
+            }
+        }
+        self.verify_authenticated_published_state_before_mutation(
+            manifest.as_ref(),
+            state,
+            ledger_pane_id,
+            allow_prepared_content_ahead,
+        )?;
+        // Re-read and re-authenticate: the manifest did not change while it
+        // was being verified.
+        match manifest.as_ref() {
+            Some(manifest) => self.revalidate_snapshot_manifest(manifest),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Self::verify_current_published_state_before_mutation`] against the
+    /// published manifest the caller read (`None`: there is none) and has
+    /// already authenticated under the keyring, without reading it again
+    /// (ft-yccm0.2.1.5 AC2). The caller must hold the mutation gate and the
+    /// filesystem lease from that read through its mutation: the lease
+    /// excludes every other writer of the manifest, so the re-read the
+    /// wrapper does to catch a change mid-verification is covered, and a
+    /// later on-disk change fails the next transaction's verification.
+    fn verify_authenticated_published_state_before_mutation(
+        &self,
+        manifest: Option<&LiveScrollbackManifestV1>,
+        state: &LiveScrollbackSpillState,
+        ledger_pane_id: u64,
+        allow_prepared_content_ahead: bool,
+    ) -> Result<(), wezterm_term::config::ScrollbackSpillError> {
+        use wezterm_term::config::ScrollbackSpillError;
+
+        if !state.authenticated_manifest {
+            return Ok(());
+        }
+        // The manifest describes the published prefix; the ledger holds that
+        // prefix plus any durable tail commit windows appended since
+        // (ft-yccm0.2.1.2).
+        let live = state;
+        let published_view = state.published_view();
+        let state = &published_view;
+        let tail_record_bytes = live
+            .published
+            .map_or(0, |published| published.tail_record_bytes);
         let Some(manifest) = manifest else {
             let pristine = state.revision == 0
                 && state.predecessor_generation.is_none()
@@ -6792,32 +10789,24 @@ impl LiveScrollbackSpillSink {
         let durable_pane_id = uuid::Uuid::from_bytes(self.durable_pane_id)
             .simple()
             .to_string();
-        validate_live_scrollback_manifest_identity(
-            &manifest,
-            &durable_pane_id,
-            &self.manifest_path,
-        )
-        .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-        {
-            let keyring = self.lock_keyring("pre-mutation manifest authentication")?;
-            if !Self::authenticate_manifest(&manifest, &keyring)
-                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
-            {
-                return Err(ScrollbackSpillError::StorageUnavailable);
-            }
-        }
-        let generation = live_scrollback_manifest_generation(&manifest)
+        validate_live_scrollback_manifest_identity(manifest, &durable_pane_id, &self.manifest_path)
+            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+        let generation = live_scrollback_manifest_generation(manifest)
             .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
             .map(|(epoch, revision)| {
                 wezterm_term::config::ScrollbackSnapshotGeneration::new(epoch, revision)
             });
         if generation != Some(state.snapshot_generation())
-            || live_scrollback_manifest_predecessor(&manifest)
+            || live_scrollback_manifest_predecessor(manifest)
                 .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
                 != state.predecessor_generation
-            || Self::manifest_ledger_pane_id(&manifest)
+            || Self::manifest_ledger_pane_id(manifest)
                 .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
                 != ledger_pane_id
+            || Self::manifest_row_segments(manifest)
+                .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
+                != state.row_segments
+            || manifest.durability_gaps != state.durability_gaps
         {
             return Err(ScrollbackSpillError::SnapshotGenerationMismatch);
         }
@@ -6833,7 +10822,7 @@ impl LiveScrollbackSpillSink {
         let store = self.lock_store("pre-mutation logical ledger")?;
         let digest_verified = if manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4 {
             state.verified_ledger.is_some_and(|authority| {
-                let chain = expected_live_scrollback_v4_chain(&manifest).ok();
+                let chain = expected_live_scrollback_v4_chain(manifest).ok();
                 let manifest_facts_match = authority.ledger_pane_id == ledger_pane_id
                     && authority.oldest_sequence == manifest.oldest_seq
                     && authority.next_sequence == manifest.next_seq
@@ -6844,14 +10833,19 @@ impl LiveScrollbackSpillSink {
                     manifest_facts_match && authority == VerifiedLedgerState::empty(ledger_pane_id)
                 } else {
                     manifest_facts_match
-                        && authority.matches_store_facts(&store).unwrap_or(false)
-                        && manifest.committed_log_bytes == Some(store.file_bytes(ledger_pane_id))
+                        && live.ledger_authority().is_some_and(|ledger| {
+                            ledger.matches_store_facts(&store).unwrap_or(false)
+                        })
+                        && manifest
+                            .committed_log_bytes
+                            .and_then(|bytes| bytes.checked_add(tail_record_bytes))
+                            == Some(store.file_bytes(ledger_pane_id))
                         && manifest.committed_sequence_bytes
                             == store.sequence_file_bytes(ledger_pane_id).ok()
                 }
             })
         } else {
-            Self::verify_logical_ledger_digest_from_store(&manifest, ledger_pane_id, &store).is_ok()
+            Self::verify_logical_ledger_digest_from_store(manifest, ledger_pane_id, &store).is_ok()
         };
         if !digest_verified {
             if !(allow_prepared_content_ahead && manifest.publication_state == "prepared") {
@@ -6880,13 +10874,14 @@ impl LiveScrollbackSpillSink {
                     self.durable_pane_id,
                     state.content_epoch,
                     initial_stable_row,
+                    &state.row_segments,
                     true,
                 )
                 .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
             }
         }
         drop(store);
-        self.revalidate_snapshot_manifest(&manifest)
+        Ok(())
     }
 
     fn lock_state(
@@ -6926,6 +10921,8 @@ impl LiveScrollbackSpillSink {
         MutexGuard<'_, guardian_output_keys::GuardianOutputKeyring>,
         wezterm_term::config::ScrollbackSpillError,
     > {
+        #[cfg(test)]
+        LIVE_SCROLLBACK_KEYRING_LOCKS.with(|locks| locks.set(locks.get() + 1));
         match self.keyring.lock() {
             Ok(keyring) => Ok(keyring),
             Err(_) => {
@@ -7000,6 +10997,85 @@ fn encode_scrollback_line_record(
     ))
 }
 
+/// Named crash points of a durable scrollback transaction (ft-yccm0.2.1.7).
+/// A crash-test child process arms one; reaching it kills the process with
+/// SIGKILL. Nothing unwinds and nothing is flushed, so only what the kernel
+/// already holds survives, exactly as after `kill -9`.
+#[cfg(test)]
+mod scrollback_crash_points {
+    use std::path::{Path, PathBuf};
+
+    /// Every regular file under a store's base directory, by relative path.
+    pub type Image = std::collections::BTreeMap<PathBuf, Vec<u8>>;
+
+    static ARMED: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
+
+    /// The store being imaged and its images so far, by crash point.
+    type Recording = Option<(PathBuf, Vec<(&'static str, Image)>)>;
+
+    std::thread_local! {
+        static RECORDING: std::cell::RefCell<Recording> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub fn arm(step: &'static str) {
+        *ARMED.lock().unwrap() = Some(step);
+    }
+
+    /// Take an image of `base` now ("start") and at every crash point this
+    /// thread reaches until `take`.
+    pub fn record(base: &Path) {
+        let start = image(base);
+        RECORDING.with(|recording| {
+            *recording.borrow_mut() = Some((base.to_path_buf(), vec![("start", start)]));
+        });
+    }
+
+    pub fn take() -> Vec<(&'static str, Image)> {
+        RECORDING.with(|recording| {
+            recording
+                .borrow_mut()
+                .take()
+                .map(|(_, images)| images)
+                .unwrap_or_default()
+        })
+    }
+
+    pub fn image(base: &Path) -> Image {
+        fn walk(base: &Path, dir: &Path, image: &mut Image) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    walk(base, &path, image);
+                } else {
+                    let relative = path.strip_prefix(base).unwrap().to_path_buf();
+                    image.insert(relative, std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        let mut image = Image::new();
+        walk(base, base, &mut image);
+        image
+    }
+
+    pub fn reach(step: &'static str) {
+        RECORDING.with(|recording| {
+            if let Some((base, images)) = recording.borrow_mut().as_mut() {
+                let snapshot = image(base);
+                images.push((step, snapshot));
+            }
+        });
+        if ARMED.lock().is_ok_and(|armed| *armed == Some(step)) {
+            #[cfg(unix)]
+            let _ = rustix::process::kill_process(
+                rustix::process::getpid(),
+                rustix::process::Signal::KILL,
+            );
+            std::process::abort();
+        }
+    }
+}
+
 fn encode_exact_scrollback_line_record(
     line: &wezterm_term::Line,
     cipher: &mux::guardian_output_journal::GuardianOutputCipher,
@@ -7015,30 +11091,1275 @@ fn encode_exact_scrollback_line_record(
         .ok()
 }
 
+/// What an exact row seals for `line`: its serialized plaintext, compressed
+/// when that pays. v3 and compact rows seal the same payload.
+fn exact_scrollback_line_payload(line: &wezterm_term::Line) -> Option<Zeroizing<Vec<u8>>> {
+    let plaintext = serialize_exact_semantic_scrollback_line(line)?;
+    Some(compress_exact_scrollback_plaintext(&plaintext).unwrap_or(plaintext))
+}
+
+/// Wipe the bytes a reused plaintext buffer holds and empty it, keeping its
+/// capacity. Its spare capacity never holds plaintext: every use ends here.
+fn wipe_scrollback_plaintext(buffer: &mut Vec<u8>) {
+    buffer.as_mut_slice().zeroize();
+    buffer.clear();
+}
+
+/// Record capacity an encode arena keeps from batch to batch: about two
+/// typical commit windows, far below the 64 MiB a window may reach.
+const ROW_ENCODE_ARENA_MAX_SPARE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Reusable buffers for encoding a batch's compact rows (ft-yccm0.2.1.4
+/// AC1), one per thread: the durability writer's, in production. A row in
+/// clustered storage, as Screen hands rows over, is serialized, compressed
+/// and sealed through them without allocating once they have grown to fit.
+/// The plaintext buffers are wiped after every row.
+#[derive(Default)]
+struct ScrollbackRowEncodeArena {
+    plaintext: Zeroizing<Vec<u8>>,
+    compressed: Zeroizing<Vec<u8>>,
+    seal_scratch: Zeroizing<Vec<u8>>,
+    /// Whether the payload `prepare_payload` left is in `compressed`.
+    compressed_payload: bool,
+    /// The batch's sealed records, in order.
+    batch: Vec<String>,
+    /// Emptied records of earlier batches, for the next batch's rows.
+    spare: Vec<String>,
+    spare_bytes: usize,
+    /// ft-yccm0.2.1.4 option A: the open segment's payloads, back to back,
+    /// and each row's length; sealed together by `seal_segment`.
+    segment_payloads: Zeroizing<Vec<u8>>,
+    segment_rows: Vec<u32>,
+    segment_aad: Vec<u8>,
+}
+
+std::thread_local! {
+    static ROW_ENCODE_ARENA: std::cell::RefCell<Option<ScrollbackRowEncodeArena>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl ScrollbackRowEncodeArena {
+    /// Serialize and compress `line`'s payload, the bytes
+    /// `exact_scrollback_line_payload` returns, and return its length. It
+    /// stays held for `seal_compact_row`.
+    fn prepare_payload(&mut self, line: &wezterm_term::Line) -> Option<usize> {
+        if !serialize_exact_semantic_scrollback_line_into(line, &mut self.plaintext) {
+            return None;
+        }
+        self.compressed_payload =
+            compress_exact_scrollback_plaintext_into(&self.plaintext, &mut self.compressed);
+        if self.compressed_payload {
+            wipe_scrollback_plaintext(&mut self.plaintext);
+            Some(self.compressed.len())
+        } else {
+            Some(self.plaintext.len())
+        }
+    }
+
+    /// Wipe a prepared payload the batch will not seal.
+    fn discard_payload(&mut self) {
+        wipe_scrollback_plaintext(&mut self.plaintext);
+        wipe_scrollback_plaintext(&mut self.compressed);
+    }
+
+    /// Seal the prepared payload as the batch's next compact record, in a
+    /// record string an earlier batch emptied, then wipe the plaintext.
+    fn seal_compact_row(
+        &mut self,
+        cipher: &mux::guardian_output_journal::GuardianOutputCipher,
+        stream: &mut mux::guardian_output_journal::GuardianScrollbackRowNonceStream,
+        location: mux::guardian_output_journal::GuardianScrollbackRowLocation,
+    ) -> bool {
+        let mut record = self.spare.pop().unwrap_or_default();
+        self.spare_bytes = self.spare_bytes.saturating_sub(record.capacity());
+        let payload: &[u8] = if self.compressed_payload {
+            &self.compressed
+        } else {
+            &self.plaintext
+        };
+        let sealed = cipher
+            .seal_compact_scrollback_row_into(
+                stream,
+                location,
+                payload,
+                &mut self.seal_scratch,
+                &mut record,
+            )
+            .is_ok();
+        wipe_scrollback_plaintext(&mut self.plaintext);
+        wipe_scrollback_plaintext(&mut self.compressed);
+        wipe_scrollback_plaintext(&mut self.seal_scratch);
+        if sealed {
+            self.batch.push(record);
+        } else {
+            self.recycle(record);
+        }
+        sealed
+    }
+
+    /// Whether the prepared payload of `payload_bytes` must start a new
+    /// segment: the open one is full by rows, or would pass the multi-row
+    /// byte cap, both the writer's targets.
+    fn segment_is_full_for(&self, payload_bytes: usize) -> bool {
+        !self.segment_rows.is_empty()
+            && (self.segment_rows.len() >= LIVE_SCROLLBACK_SEGMENT_TARGET_ROWS
+                || self.segment_payloads.len().saturating_add(payload_bytes)
+                    > LIVE_SCROLLBACK_SEGMENT_TARGET_PLAINTEXT_BYTES)
+    }
+
+    /// Move the prepared payload into the open segment.
+    fn push_segment_payload(&mut self) -> bool {
+        let payload: &[u8] = if self.compressed_payload {
+            &self.compressed
+        } else {
+            &self.plaintext
+        };
+        let pushed = u32::try_from(payload.len()).is_ok_and(|bytes| {
+            self.segment_payloads.try_reserve(payload.len()).is_ok()
+                && self.segment_rows.try_reserve(1).is_ok()
+                && {
+                    self.segment_payloads.extend_from_slice(payload);
+                    self.segment_rows.push(bytes);
+                    true
+                }
+        });
+        self.discard_payload();
+        pushed
+    }
+
+    /// Seal the open segment, whose first row is at `first`, with one AEAD
+    /// operation and append its rows to the batch as records, in record
+    /// strings earlier batches emptied. The segment is empty afterwards,
+    /// sealed or not, and its plaintext wiped.
+    fn seal_segment(
+        &mut self,
+        cipher: &mux::guardian_output_journal::GuardianOutputCipher,
+        stream: &mut mux::guardian_output_journal::GuardianScrollbackRowNonceStream,
+        first: mux::guardian_output_journal::GuardianScrollbackRowLocation,
+    ) -> bool {
+        let Self {
+            seal_scratch,
+            batch,
+            spare,
+            spare_bytes,
+            segment_payloads,
+            segment_rows,
+            segment_aad,
+            ..
+        } = self;
+        if segment_rows.is_empty() {
+            return true;
+        }
+        let sealed = cipher
+            .seal_scrollback_segment_in_place(
+                stream,
+                first,
+                segment_rows,
+                segment_payloads,
+                segment_aad,
+            )
+            .is_ok_and(|tag| {
+                let mut offset = 0;
+                segment_rows.iter().enumerate().all(|(index, &bytes)| {
+                    let mut record = spare.pop().unwrap_or_default();
+                    *spare_bytes = spare_bytes.saturating_sub(record.capacity());
+                    let end = offset + bytes as usize;
+                    let tail = (index + 1 == segment_rows.len()).then_some(&tag);
+                    let pushed = mux::guardian_output_journal::push_scrollback_segment_record(
+                        &mut record,
+                        &segment_payloads[offset..end],
+                        tail,
+                        seal_scratch,
+                    )
+                    .is_ok();
+                    offset = end;
+                    batch.push(record);
+                    pushed
+                })
+            });
+        wipe_scrollback_plaintext(segment_payloads);
+        segment_rows.clear();
+        sealed
+    }
+
+    fn recycle(&mut self, mut record: String) {
+        record.clear();
+        if let Some(bytes) = self
+            .spare_bytes
+            .checked_add(record.capacity())
+            .filter(|bytes| *bytes <= ROW_ENCODE_ARENA_MAX_SPARE_BYTES)
+        {
+            self.spare_bytes = bytes;
+            self.spare.push(record);
+        }
+    }
+}
+
+/// This thread's encode arena for one transaction. Dropping it, on any
+/// path, empties the batch into the spare records and returns the arena.
+struct ScrollbackRowEncodeLease {
+    arena: ScrollbackRowEncodeArena,
+}
+
+impl ScrollbackRowEncodeLease {
+    /// The thread's arena, or a fresh one when this thread has none free.
+    fn take() -> Self {
+        let arena = ROW_ENCODE_ARENA
+            .try_with(|slot| slot.try_borrow_mut().ok().and_then(|mut slot| slot.take()))
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        Self { arena }
+    }
+}
+
+impl Drop for ScrollbackRowEncodeLease {
+    fn drop(&mut self) {
+        let mut arena = std::mem::take(&mut self.arena);
+        // Newest first, so the next batch's first row pops the string this
+        // batch's first row grew. The batch vector keeps its capacity too.
+        let mut batch = std::mem::take(&mut arena.batch);
+        while let Some(record) = batch.pop() {
+            arena.recycle(record);
+        }
+        arena.batch = batch;
+        let _ = ROW_ENCODE_ARENA.try_with(|slot| {
+            if let Ok(mut slot) = slot.try_borrow_mut() {
+                *slot = Some(arena);
+            }
+        });
+    }
+}
+
+/// `encode_exact_scrollback_line_record`, sealed in place and appended to
+/// `records`, a batch string whose capacity is reused with `scratch` from
+/// window to window (ft-yccm0.2.1.4). Same record bytes; returns false and
+/// leaves `records` unchanged when the row cannot be sealed.
+fn encode_exact_scrollback_line_record_into(
+    line: &wezterm_term::Line,
+    cipher: &mux::guardian_output_journal::GuardianOutputCipher,
+    identity: mux::guardian_output_journal::GuardianScrollbackRowIdentity,
+    scratch: &mut Vec<u8>,
+    records: &mut String,
+) -> bool {
+    let Some(plaintext) = serialize_exact_semantic_scrollback_line(line) else {
+        return false;
+    };
+    let compressed = compress_exact_scrollback_plaintext(&plaintext);
+    let payload = compressed.as_deref().unwrap_or(&plaintext);
+    cipher
+        .seal_scrollback_row_into(identity, payload, scratch, records)
+        .is_ok()
+}
+
+/// Benchmark hooks for the durable scrollback record path (ft-yccm0.2.1.4):
+/// the per-row stages the store's writer runs, on rows built here. Not an
+/// API; `benches/scrollback_record_encode.rs` is the only caller.
+#[doc(hidden)]
+pub mod scrollback_record_bench {
+    /// `count` printable rows of `text_bytes` cells, one attribute run each.
+    pub struct Rows(Vec<wezterm_term::Line>);
+
+    impl Rows {
+        #[must_use]
+        pub fn printable(count: usize, text_bytes: usize) -> Self {
+            Self(
+                (0..count)
+                    .map(|row| {
+                        let text: String = (0..text_bytes)
+                            .map(|column| char::from(b'!' + ((row + column) % 94) as u8))
+                            .collect();
+                        wezterm_term::Line::from_text(
+                            &text,
+                            &wezterm_term::CellAttributes::blank(),
+                            1,
+                            None,
+                        )
+                    })
+                    .collect(),
+            )
+        }
+
+        /// T0-like rows of `cells` columns: a wide emoji per cell pair, each
+        /// with a fresh palette foreground and background, as
+        /// `color-emoji-random` prints.
+        #[must_use]
+        pub fn emoji_colors(count: usize, cells: usize) -> Self {
+            const EMOJI: [&str; 4] = ["\u{1f600}", "\u{1f680}", "\u{1f916}", "\u{1f389}"];
+            Self(
+                (0..count)
+                    .map(|row| {
+                        let mut line = wezterm_term::Line::with_width(cells, 1);
+                        for column in (0..cells).step_by(2) {
+                            let mut attrs = wezterm_term::CellAttributes::blank();
+                            attrs.set_foreground(termwiz::color::ColorAttribute::PaletteIndex(
+                                ((row * 7 + column) % 256) as u8,
+                            ));
+                            attrs.set_background(termwiz::color::ColorAttribute::PaletteIndex(
+                                ((row * 13 + column * 3) % 256) as u8,
+                            ));
+                            line.set_cell(
+                                column,
+                                wezterm_term::Cell::new_grapheme(
+                                    EMOJI[(row + column) % EMOJI.len()],
+                                    attrs,
+                                    None,
+                                ),
+                                1,
+                            );
+                        }
+                        line
+                    })
+                    .collect(),
+            )
+        }
+
+        /// UTF-8 bytes of the rows' visible text.
+        #[must_use]
+        pub fn text_bytes(&self) -> u64 {
+            self.0
+                .iter()
+                .flat_map(wezterm_term::Line::visible_cells)
+                .map(|cell| cell.str().len() as u64)
+                .sum()
+        }
+    }
+
+    /// One row sealer with a fresh key, sealing rows as the store does.
+    pub struct Sealer {
+        cipher: mux::guardian_output_journal::GuardianOutputCipher,
+    }
+
+    impl Sealer {
+        #[must_use]
+        pub fn new() -> Self {
+            let key = mux::guardian_output_journal::GuardianOutputKey::generate()
+                .expect("bench key from OS entropy");
+            Self {
+                cipher: key.cipher().expect("bench cipher"),
+            }
+        }
+
+        /// The exact semantic plaintext only; returns its total bytes.
+        #[must_use]
+        pub fn serialize(&self, rows: &Rows) -> usize {
+            rows.0
+                .iter()
+                .map(|line| {
+                    super::serialize_exact_semantic_scrollback_line(line)
+                        .expect("bench row serializes")
+                        .len()
+                })
+                .sum()
+        }
+
+        /// The exact plaintext of every row through the writer's path, with
+        /// `exact_varbincode` (`direct`) or `varbincode` forced (ft-y0gy9).
+        /// Returns its total bytes.
+        #[must_use]
+        pub fn serialize_through(&self, rows: &Rows, direct: bool, out: &mut Vec<u8>) -> usize {
+            super::SCROLLBACK_SERIALIZER_OVERRIDE.with(|forced| forced.set(Some(direct)));
+            let bytes = rows
+                .0
+                .iter()
+                .map(|line| {
+                    assert!(
+                        super::serialize_exact_semantic_scrollback_line_into(line, out),
+                        "bench row serializes"
+                    );
+                    out.len()
+                })
+                .sum();
+            super::SCROLLBACK_SERIALIZER_OVERRIDE.with(|forced| forced.set(None));
+            bytes
+        }
+
+        /// Each row's exact plaintext, as the writer compresses it.
+        #[must_use]
+        pub fn plaintexts(&self, rows: &Rows) -> Vec<Vec<u8>> {
+            rows.0
+                .iter()
+                .map(|line| {
+                    super::serialize_exact_semantic_scrollback_line(line)
+                        .expect("bench row serializes")
+                        .to_vec()
+                })
+                .collect()
+        }
+
+        /// Compress each plaintext as its own frame at zstd `level`, with
+        /// the writer's window and its rule (a row under 256 bytes, or one
+        /// that would not shrink, stays plain). Returns the payload bytes
+        /// the rows would seal (ft-y0gy9).
+        #[must_use]
+        pub fn compress_rows_at(&self, plaintexts: &[Vec<u8>], level: i32) -> usize {
+            let mut compressor = zstd::bulk::Compressor::new(level).expect("bench zstd level");
+            compressor
+                .window_log(super::EXACT_SCROLLBACK_ZSTD_WINDOW_LOG)
+                .expect("bench zstd window");
+            let mut payload = Vec::new();
+            plaintexts
+                .iter()
+                .map(|plaintext| {
+                    if plaintext.len() < 256 {
+                        return plaintext.len();
+                    }
+                    payload.resize(plaintext.len(), 0);
+                    compressor
+                        .compress_to_buffer(plaintext, &mut payload[..])
+                        .ok()
+                        .map(|bytes| bytes + super::EXACT_SCROLLBACK_ZSTD_HEADER_BYTES)
+                        .filter(|bytes| *bytes < plaintext.len())
+                        .unwrap_or(plaintext.len())
+                })
+                .sum()
+        }
+
+        /// Compress the plaintexts as one frame per segment of at most
+        /// `segment_rows` rows and 128 KiB, at zstd `level`. Measurement for
+        /// the owner's format decision only: the store compresses rows
+        /// alone, and never across rows (ft-y0gy9). Returns the total bytes.
+        #[must_use]
+        pub fn compress_segments_at(
+            &self,
+            plaintexts: &[Vec<u8>],
+            segment_rows: usize,
+            level: i32,
+        ) -> usize {
+            let mut compressor = zstd::bulk::Compressor::new(level).expect("bench zstd level");
+            let mut segment = Vec::new();
+            let mut total = 0;
+            let mut rows = 0;
+            let mut flush = |segment: &mut Vec<u8>| {
+                if !segment.is_empty() {
+                    total += compressor
+                        .compress(segment)
+                        .expect("bench segment compresses")
+                        .len();
+                    segment.clear();
+                }
+            };
+            for plaintext in plaintexts {
+                if rows == segment_rows
+                    || segment.len() + plaintext.len()
+                        > super::LIVE_SCROLLBACK_SEGMENT_TARGET_PLAINTEXT_BYTES
+                {
+                    flush(&mut segment);
+                    rows = 0;
+                }
+                segment.extend_from_slice(plaintext);
+                rows += 1;
+            }
+            flush(&mut segment);
+            total
+        }
+
+        /// Plaintext then compression (the input sealing gets); returns the
+        /// total bytes sealing would take: (plaintext, compressed-or-plain).
+        #[must_use]
+        pub fn serialize_and_compress(&self, rows: &Rows) -> (usize, usize) {
+            rows.0.iter().fold((0, 0), |(plain, sealed), line| {
+                let plaintext = super::serialize_exact_semantic_scrollback_line(line)
+                    .expect("bench row serializes");
+                let compressed = super::compress_exact_scrollback_plaintext(&plaintext);
+                let payload = compressed
+                    .as_deref()
+                    .map_or(plaintext.len(), |payload| payload.len());
+                (plain + plaintext.len(), sealed + payload)
+            })
+        }
+
+        /// The full per-row record path: serialize, compress, seal, encode.
+        /// Returns the total record bytes the ledger would store.
+        #[must_use]
+        pub fn seal(&self, rows: &Rows) -> usize {
+            rows.0
+                .iter()
+                .enumerate()
+                .map(|(row, line)| {
+                    let identity =
+                        mux::guardian_output_journal::GuardianScrollbackRowIdentity::new(
+                            [0x5a; 16], [0xa5; 16], 1, row as i64, row as u64,
+                        )
+                        .expect("bench row identity");
+                    super::encode_exact_scrollback_line_record(line, &self.cipher, identity)
+                        .expect("bench row seals")
+                        .len()
+                })
+                .sum()
+        }
+    }
+
+    impl Sealer {
+        /// The same records, sealed in place into one reused batch string.
+        /// Returns the batch's record bytes (without row separators).
+        pub fn seal_into(&self, rows: &Rows, scratch: &mut Vec<u8>, records: &mut String) -> usize {
+            records.clear();
+            for (row, line) in rows.0.iter().enumerate() {
+                let identity = mux::guardian_output_journal::GuardianScrollbackRowIdentity::new(
+                    [0x5a; 16], [0xa5; 16], 1, row as i64, row as u64,
+                )
+                .expect("bench row identity");
+                assert!(super::encode_exact_scrollback_line_record_into(
+                    line,
+                    &self.cipher,
+                    identity,
+                    scratch,
+                    records,
+                ));
+            }
+            records.len()
+        }
+
+        /// The compact (v4) record path the store's batches take: the same
+        /// payload, sealed under one nonce stream with no per-row header or
+        /// nonce, one String per row. Returns the total record bytes.
+        pub fn seal_compact(&self, rows: &Rows, scratch: &mut Vec<u8>) -> usize {
+            let mut stream = mux::guardian_output_journal::GuardianScrollbackRowNonceStream::begin(
+                &self.cipher,
+                0,
+                [],
+            )
+            .expect("bench nonce stream");
+            rows.0
+                .iter()
+                .enumerate()
+                .map(|(row, line)| {
+                    let location =
+                        mux::guardian_output_journal::GuardianScrollbackRowLocation::new(
+                            [0x5a; 16], [0xa5; 16], row as i64, row as u64,
+                        )
+                        .expect("bench row location");
+                    let payload =
+                        super::exact_scrollback_line_payload(line).expect("bench row serializes");
+                    let mut record = String::new();
+                    self.cipher
+                        .seal_compact_scrollback_row_into(
+                            &mut stream,
+                            location,
+                            &payload,
+                            scratch,
+                            &mut record,
+                        )
+                        .expect("bench row seals");
+                    record.len()
+                })
+                .sum()
+        }
+    }
+
+    impl Default for Sealer {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Rows {
+        /// The rows as Screen hands them to the durable store: moved to
+        /// clustered storage where clustering reproduces them.
+        #[must_use]
+        pub fn compressed_for_scrollback(mut self) -> Self {
+            for line in &mut self.0 {
+                line.compress_for_scrollback();
+            }
+            self
+        }
+
+        #[must_use]
+        pub fn lines(&self) -> &[wezterm_term::Line] {
+            &self.0
+        }
+
+        /// Whether every row is in clustered storage.
+        #[must_use]
+        pub fn all_clustered(&self) -> bool {
+            self.0.iter().all(wezterm_term::Line::has_clustered_storage)
+        }
+
+        /// `count` T0 rows exactly as Screen hands them to the store: the
+        /// operator's color-emoji-random stream (per glyph a random 256-color
+        /// foreground and background, then one of 1,376 emoji or 71 ASCII
+        /// characters; the M.1 corpus generator) through an 80-column
+        /// terminal whose scrollback goes straight to a capturing sink.
+        #[must_use]
+        pub fn t0_corpus(count: usize, seed: u64) -> Self {
+            Self::t0_corpus_with_input(count, seed).0
+        }
+
+        /// `t0_corpus` and the bytes of T0 output fed to the terminal. They
+        /// include the last screenful, still on screen and not among the
+        /// rows (about 26 rows of input).
+        #[must_use]
+        pub fn t0_corpus_with_input(count: usize, seed: u64) -> (Self, usize) {
+            let sink = std::sync::Arc::new(CaptureSink::default());
+            let mut terminal = wezterm_term::Terminal::new(
+                wezterm_term::TerminalSize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 800,
+                    pixel_height: 480,
+                    dpi: 96,
+                },
+                std::sync::Arc::new(CaptureConfig(std::sync::Arc::clone(&sink))),
+                "FrankenTerm",
+                "scrollback-record-bench",
+                Box::new(Vec::<u8>::new()),
+            );
+            let pool: Vec<String> = T0_EMOJI_RANGES
+                .iter()
+                .flat_map(|&(start, end)| start..=end)
+                .filter_map(char::from_u32)
+                .map(String::from)
+                .chain(T0_ASCII_POOL.chars().map(String::from))
+                .collect();
+            let mut rng = T0Rng::new(seed);
+            let mut out = Vec::new();
+            let mut input_bytes = 0;
+            while sink.rows() < count {
+                out.clear();
+                for _ in 0..16 {
+                    // The generator's draw order: fg, bg, then the glyph.
+                    let fg = rng.below(256);
+                    let bg = rng.below(256);
+                    let glyph = &pool[rng.below(pool.len())];
+                    out.extend_from_slice(format!("\x1b[38;5;{fg}m\x1b[48;5;{bg}m").as_bytes());
+                    out.extend_from_slice(glyph.as_bytes());
+                }
+                input_bytes += out.len();
+                terminal.advance_bytes(&out);
+            }
+            (Self(sink.take(count)), input_bytes)
+        }
+    }
+
+    /// The M.1 corpus generator's emoji code point ranges and ASCII pool
+    /// (frankenterm-term benches/ingest/corpus.rs).
+    const T0_EMOJI_RANGES: [(u32, u32); 5] = [
+        (0x1F600, 0x1F64F),
+        (0x1F300, 0x1F5FF),
+        (0x1F680, 0x1F6FF),
+        (0x1F900, 0x1F9FF),
+        (0x1FA70, 0x1FAFF),
+    ];
+    const T0_ASCII_POOL: &str =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#%^&*()";
+
+    /// The M.1 corpus generator's xorshift, seeded through splitmix64.
+    struct T0Rng(u64);
+
+    impl T0Rng {
+        fn new(seed: u64) -> Self {
+            let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            Self(if z == 0 { 0x9E37_79B9_7F4A_7C15 } else { z })
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            let draw = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            ((u128::from(draw) * n as u128) >> 64) as usize
+        }
+    }
+
+    /// Keeps the rows a Screen moves to scrollback, as the store gets them.
+    #[derive(Debug, Default)]
+    struct CaptureSink(std::sync::Mutex<Vec<(wezterm_term::StableRowIndex, wezterm_term::Line)>>);
+
+    impl CaptureSink {
+        fn rows(&self) -> usize {
+            self.0.lock().map_or(0, |rows| rows.len())
+        }
+
+        fn take(&self, count: usize) -> Vec<wezterm_term::Line> {
+            self.0
+                .lock()
+                .map(|mut rows| rows.drain(..).take(count).map(|(_, line)| line).collect())
+                .unwrap_or_default()
+        }
+    }
+
+    impl wezterm_term::config::ScrollbackSpillSink for CaptureSink {
+        fn store_scrollback_line(
+            &self,
+            stable_row: wezterm_term::StableRowIndex,
+            line: &wezterm_term::Line,
+            _max_retained_rows: usize,
+        ) -> bool {
+            self.0
+                .lock()
+                .map(|mut rows| rows.push((stable_row, line.clone())))
+                .is_ok()
+        }
+
+        fn load_scrollback_line(
+            &self,
+            stable_row: wezterm_term::StableRowIndex,
+        ) -> Option<wezterm_term::Line> {
+            let rows = self.0.lock().ok()?;
+            rows.iter()
+                .find(|(row, _)| *row == stable_row)
+                .map(|(_, line)| line.clone())
+        }
+
+        fn oldest_scrollback_row(&self) -> Option<wezterm_term::StableRowIndex> {
+            self.0.lock().ok()?.first().map(|(row, _)| *row)
+        }
+
+        fn retained_scrollback_rows(&self) -> usize {
+            self.rows()
+        }
+
+        fn retained_scrollback_bytes(&self) -> usize {
+            0
+        }
+
+        fn snapshot_scrollback(
+            &self,
+            _expected_newest_exclusive: wezterm_term::StableRowIndex,
+            _limits: wezterm_term::config::ScrollbackSnapshotLimits,
+        ) -> Result<
+            wezterm_term::config::ScrollbackSnapshot,
+            wezterm_term::config::ScrollbackSpillError,
+        > {
+            Err(wezterm_term::config::ScrollbackSpillError::StorageUnavailable)
+        }
+
+        fn replace_scrollback_prefix(
+            &self,
+            _expected_generation: Option<wezterm_term::config::ScrollbackSnapshotGeneration>,
+            _prefix: wezterm_term::config::ScrollbackPrefix<'_>,
+            _max_retained_rows: usize,
+        ) -> Result<
+            wezterm_term::config::ScrollbackReplaceCommit,
+            wezterm_term::config::ScrollbackSpillError,
+        > {
+            Err(wezterm_term::config::ScrollbackSpillError::StorageUnavailable)
+        }
+
+        fn clear_scrollback(
+            &self,
+        ) -> Result<
+            wezterm_term::config::ScrollbackClearCommit,
+            wezterm_term::config::ScrollbackSpillError,
+        > {
+            Err(wezterm_term::config::ScrollbackSpillError::StorageUnavailable)
+        }
+    }
+
+    #[derive(Debug)]
+    struct CaptureConfig(std::sync::Arc<CaptureSink>);
+
+    impl wezterm_term::TerminalConfiguration for CaptureConfig {
+        fn color_palette(&self) -> wezterm_term::color::ColorPalette {
+            wezterm_term::color::ColorPalette::default()
+        }
+
+        fn scrollback_size(&self) -> usize {
+            1 << 20
+        }
+
+        fn scrollback_tier_config(&self) -> wezterm_term::config::ScrollbackTierConfig {
+            wezterm_term::config::ScrollbackTierConfig {
+                enabled: true,
+                hot_lines: 2,
+                warm_max_bytes: 0,
+            }
+        }
+
+        fn scrollback_spill_sink(
+            &self,
+        ) -> Option<std::sync::Arc<dyn wezterm_term::config::ScrollbackSpillSink>> {
+            Some(self.0.clone())
+        }
+    }
+
+    /// A compact-row nonce stream and its next sequence.
+    pub struct CompactStream {
+        stream: mux::guardian_output_journal::GuardianScrollbackRowNonceStream,
+        next_sequence: u64,
+    }
+
+    /// A bench row's durable location: its stable row is its sequence.
+    fn bench_location(
+        sequence: u64,
+    ) -> mux::guardian_output_journal::GuardianScrollbackRowLocation {
+        mux::guardian_output_journal::GuardianScrollbackRowLocation::new(
+            [0x5a; 16],
+            [0xa5; 16],
+            sequence as i64,
+            sequence,
+        )
+        .expect("bench row location")
+    }
+
+    /// The first row a `ColdReadStore` seals per segment. A fresh lineage's
+    /// first batch is sealed as self-describing v3 rows, so the store writes
+    /// row 0 alone, as a pane's store is after its first spill, and every
+    /// later row in commit windows.
+    pub const FIRST_SEGMENT_ROW: u64 = 1;
+
+    /// Rows sealed both ways and kept (`Sealer::seal_window`): compact (v4)
+    /// records, one per row, and per-segment (v5) records from
+    /// `FIRST_SEGMENT_ROW` on.
+    pub struct SealedWindow {
+        compact_segment: mux::guardian_output_journal::GuardianScrollbackRowSegment,
+        compact: Vec<String>,
+        segment_nonces: mux::guardian_output_journal::GuardianScrollbackRowSegment,
+        segmented: Vec<String>,
+        segments: Vec<std::ops::Range<u64>>,
+    }
+
+    impl SealedWindow {
+        /// The rows of each sealed segment, in order.
+        #[must_use]
+        pub fn segments(&self) -> &[std::ops::Range<u64>] {
+            &self.segments
+        }
+    }
+
+    /// A live durable scrollback store holding `rows` from stable row 0, as
+    /// a pane's scrollback reaches it: row 0 alone, then commit windows
+    /// from `FIRST_SEGMENT_ROW`, then published. For cold reads through the
+    /// sink exactly as Screen's scrollback loads make them (ft-yccm0.2.1.4
+    /// AC2). Nothing is pruned.
+    pub struct ColdReadStore {
+        sink: super::LiveScrollbackSpillSink,
+        /// Each sealed segment's rows and payload bytes, in order.
+        segments: Vec<(std::ops::Range<u64>, u64)>,
+    }
+
+    impl ColdReadStore {
+        /// The store, in `dir`, which must outlive it.
+        #[must_use]
+        pub fn open(dir: &std::path::Path, rows: &Rows) -> Self {
+            use mux::guardian_output_journal::{
+                is_scrollback_segment_tail, scrollback_segment_record_plaintext_bytes,
+            };
+            use wezterm_term::config::ScrollbackSpillSink as _;
+
+            let sink = super::LiveScrollbackSpillSink::open(
+                dir.to_path_buf(),
+                &config::ScrollbackSpillSinkContext {
+                    pane_id: 1,
+                    domain_id: 1,
+                    durable_pane_id: [0x5a; 16],
+                    command_description: "scrollback-cold-read-bench".to_string(),
+                },
+                std::time::Duration::from_secs(3600),
+            )
+            .expect("bench durable scrollback store");
+            let count = rows.0.len();
+            assert!(
+                sink.store_scrollback_line(0, &rows.0[0], count),
+                "bench first row"
+            );
+            let mut row = FIRST_SEGMENT_ROW as usize;
+            while row < count {
+                let window =
+                    &rows.0[row..(row + super::LIVE_SCROLLBACK_APPEND_MAX_ROWS).min(count)];
+                let stored = sink.store_scrollback_lines(row as isize, window, count);
+                assert!(stored > 0, "bench window at row {row}");
+                row += stored;
+            }
+            sink.flush_scrollback().expect("bench store publishes");
+            let records = sink
+                .lock_store("scrollback cold-read bench")
+                .expect("bench store")
+                .lines_range_reaching_pruned(
+                    sink.active_ledger_pane_id(),
+                    0..count as u64,
+                    count,
+                    u64::MAX,
+                )
+                .expect("bench store records");
+            let mut segments = Vec::new();
+            let (mut start, mut payload_bytes) = (FIRST_SEGMENT_ROW, 0);
+            for (row, record) in (FIRST_SEGMENT_ROW..).zip(&records[FIRST_SEGMENT_ROW as usize..]) {
+                let tail = is_scrollback_segment_tail(record);
+                payload_bytes += u64::from(
+                    scrollback_segment_record_plaintext_bytes(record, tail)
+                        .expect("the bench store seals segments"),
+                );
+                if tail {
+                    segments.push((start..row + 1, payload_bytes));
+                    (start, payload_bytes) = (row + 1, 0);
+                }
+            }
+            assert_eq!(start, count as u64, "the last segment has a tail");
+            Self { sink, segments }
+        }
+
+        /// Each sealed segment's rows and payload bytes, in order.
+        #[must_use]
+        pub fn segments(&self) -> &[(std::ops::Range<u64>, u64)] {
+            &self.segments
+        }
+
+        /// Drop the segment the sink keeps open after a read, so the next
+        /// read is cold.
+        pub fn forget_open_segment(&self) {
+            self.sink.forget_cold_segment();
+        }
+
+        /// One row read: `load_scrollback_line`, which opens the segment
+        /// holding the row unless the sink kept it open.
+        #[must_use]
+        pub fn load(&self, row: u64) -> wezterm_term::Line {
+            use wezterm_term::config::ScrollbackSpillSink as _;
+
+            self.sink
+                .load_scrollback_line(row as isize)
+                .expect("bench cold read")
+        }
+
+        /// A viewport read: `rows` rows from `row` in one ranged load, which
+        /// opens each segment they touch at most once.
+        #[must_use]
+        pub fn load_viewport(&self, row: u64, rows: u64) -> Vec<wezterm_term::Line> {
+            use wezterm_term::config::ScrollbackSpillSink as _;
+
+            let lines = self
+                .sink
+                .load_scrollback_lines(row as isize..(row + rows) as isize);
+            assert_eq!(lines.len() as u64, rows, "bench viewport read");
+            lines
+        }
+
+        /// Every stored row, read as Screen sweeps cold rows (the cold
+        /// index, search): ranged loads of at most 32 rows. Unless
+        /// `keep_open`, each load starts cold, as every load did before the
+        /// sink kept a segment open. Returns the rows read.
+        #[must_use]
+        pub fn sweep(&self, keep_open: bool) -> usize {
+            use wezterm_term::config::ScrollbackSpillSink as _;
+
+            let end = self.segments.last().map_or(0, |(rows, _)| rows.end);
+            let mut row = 0;
+            while row < end {
+                if !keep_open {
+                    self.forget_open_segment();
+                }
+                let batch = self
+                    .sink
+                    .load_scrollback_lines(row as isize..(row + 32).min(end) as isize);
+                assert!(!batch.is_empty(), "bench sweep at row {row}");
+                row += batch.len() as u64;
+            }
+            row as usize
+        }
+    }
+
+    impl Sealer {
+        #[must_use]
+        pub fn compact_stream(&self) -> CompactStream {
+            CompactStream {
+                stream: mux::guardian_output_journal::GuardianScrollbackRowNonceStream::begin(
+                    &self.cipher,
+                    0,
+                    [],
+                )
+                .expect("bench nonce stream"),
+                next_sequence: 0,
+            }
+        }
+
+        /// One commit window's compact records, through this thread's encode
+        /// arena exactly as the store's batches seal them (ft-yccm0.2.1.4
+        /// AC1). Returns the batch's record bytes; the records go back to
+        /// the arena.
+        pub fn seal_compact_arena(&self, rows: &Rows, stream: &mut CompactStream) -> usize {
+            self.seal_compact_window(rows, stream, |records| {
+                records.iter().map(String::len).sum()
+            })
+        }
+
+        /// `seal_compact_arena`, handing the window's records to `records`
+        /// before they go back to the arena.
+        fn seal_compact_window<R>(
+            &self,
+            rows: &Rows,
+            stream: &mut CompactStream,
+            records: impl FnOnce(&[String]) -> R,
+        ) -> R {
+            let mut lease = super::ScrollbackRowEncodeLease::take();
+            for line in &rows.0 {
+                let sequence = stream.next_sequence;
+                stream.next_sequence += 1;
+                lease
+                    .arena
+                    .prepare_payload(line)
+                    .expect("bench row serializes");
+                assert!(lease.arena.seal_compact_row(
+                    &self.cipher,
+                    &mut stream.stream,
+                    bench_location(sequence)
+                ));
+            }
+            records(&lease.arena.batch)
+        }
+
+        /// The same rows and payloads as `seal_compact_arena`, sealed per
+        /// segment (ft-yccm0.2.1.4 option A): one XChaCha20-Poly1305 for each
+        /// run of rows up to 256 KiB of payload, each row then storing only
+        /// its ciphertext and the segment's last row the tag. Returns the
+        /// batch's record bytes.
+        pub fn seal_segments_arena(&self, rows: &Rows, stream: &mut CompactStream) -> usize {
+            self.seal_segment_window(&rows.0, stream, |records| {
+                records.iter().map(String::len).sum()
+            })
+        }
+
+        /// `seal_segments_arena` for `lines`, handing the window's records to
+        /// `records` before they go back to the arena.
+        fn seal_segment_window<R>(
+            &self,
+            lines: &[wezterm_term::Line],
+            stream: &mut CompactStream,
+            records: impl FnOnce(&[String]) -> R,
+        ) -> R {
+            let mut lease = super::ScrollbackRowEncodeLease::take();
+            let arena = &mut lease.arena;
+            let mut first = stream.next_sequence;
+            for line in lines {
+                let payload_bytes = arena.prepare_payload(line).expect("bench row serializes");
+                if arena.segment_is_full_for(payload_bytes) {
+                    let sealed_rows = arena.segment_rows.len() as u64;
+                    assert!(arena.seal_segment(
+                        &self.cipher,
+                        &mut stream.stream,
+                        bench_location(first)
+                    ));
+                    first += sealed_rows;
+                }
+                assert!(arena.push_segment_payload());
+            }
+            let sealed_rows = arena.segment_rows.len() as u64;
+            assert!(arena.seal_segment(&self.cipher, &mut stream.stream, bench_location(first)));
+            stream.next_sequence = first + sealed_rows;
+            records(&arena.batch)
+        }
+
+        /// `rows` sealed both ways under fresh nonce streams, with the
+        /// records kept for cold reads (ft-yccm0.2.1.4 AC2): every row as a
+        /// compact (v4) row from sequence 0, and, as a `ColdReadStore`
+        /// holds them, the rows from `FIRST_SEGMENT_ROW` on as one commit
+        /// window sealed per segment.
+        #[must_use]
+        pub fn seal_window(&self, rows: &Rows) -> SealedWindow {
+            use mux::guardian_output_journal::is_scrollback_segment_tail;
+
+            let mut compact_stream = self.compact_stream();
+            let mut segment_stream = self.compact_stream();
+            segment_stream.next_sequence = FIRST_SEGMENT_ROW;
+            let compact_segment = compact_stream.stream.segment();
+            let segment_nonces = segment_stream.stream.segment();
+            let compact = self.seal_compact_window(rows, &mut compact_stream, <[String]>::to_vec);
+            let segmented = self.seal_segment_window(
+                &rows.0[FIRST_SEGMENT_ROW as usize..],
+                &mut segment_stream,
+                <[String]>::to_vec,
+            );
+            let mut segments = Vec::new();
+            let mut start = FIRST_SEGMENT_ROW;
+            for (row, record) in (FIRST_SEGMENT_ROW..).zip(&segmented) {
+                if is_scrollback_segment_tail(record) {
+                    segments.push(start..row + 1);
+                    start = row + 1;
+                }
+            }
+            assert_eq!(start, rows.0.len() as u64, "the last segment has a tail");
+            SealedWindow {
+                compact_segment,
+                compact,
+                segment_nonces,
+                segmented,
+                segments,
+            }
+        }
+
+        /// A cold read at the cipher of the compact (v4) row at `sequence`,
+        /// as rows were stored before option A: open the row alone, then
+        /// decode it.
+        #[must_use]
+        pub fn open_compact_row(&self, window: &SealedWindow, sequence: u64) -> wezterm_term::Line {
+            let plaintext = self
+                .cipher
+                .open_compact_scrollback_row(
+                    &window.compact_segment,
+                    &window.compact[sequence as usize],
+                    bench_location(sequence),
+                    super::LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE as u32,
+                )
+                .expect("bench compact row opens");
+            super::decode_exact_semantic_scrollback_plaintext(
+                plaintext,
+                super::LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+            )
+            .expect("bench row decodes")
+            .0
+        }
+
+        /// A cold read at the cipher of the per-segment (v5) row at
+        /// `sequence`, as a reader with no segment open makes it: open the
+        /// whole segment holding the row into fresh buffers, then decode the
+        /// row.
+        #[must_use]
+        pub fn open_segment_row(&self, window: &SealedWindow, sequence: u64) -> wezterm_term::Line {
+            let rows = window
+                .segments
+                .iter()
+                .find(|rows| rows.contains(&sequence))
+                .expect("a bench segment holds the row");
+            let records: Vec<&str> = window.segmented[(rows.start - FIRST_SEGMENT_ROW) as usize
+                ..(rows.end - FIRST_SEGMENT_ROW) as usize]
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let mut plaintext = zeroize::Zeroizing::new(Vec::new());
+            let (mut row_bytes, mut aad) = (Vec::new(), Vec::new());
+            self.cipher
+                .open_scrollback_segment(
+                    &window.segment_nonces,
+                    bench_location(rows.start),
+                    &records,
+                    super::LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+                    &mut plaintext,
+                    &mut row_bytes,
+                    &mut aad,
+                )
+                .expect("bench segment opens");
+            let index = (sequence - rows.start) as usize;
+            let start: usize = row_bytes[..index].iter().map(|&bytes| bytes as usize).sum();
+            let payload = plaintext[start..start + row_bytes[index] as usize].to_vec();
+            super::decode_exact_semantic_scrollback_plaintext(
+                zeroize::Zeroizing::new(payload),
+                super::LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+            )
+            .expect("bench row decodes")
+            .0
+        }
+
+        /// What the cell-vector schemas (2 or 1) take for these rows,
+        /// whatever their storage: (plaintext, sealed payload) bytes. Before
+        /// ft-yccm0.2.1.4 AC1 every row sealed one of them; kept for an A/B
+        /// in one run.
+        #[must_use]
+        pub fn serialize_and_compress_cell_schemas(&self, rows: &Rows) -> (usize, usize) {
+            rows.0.iter().fold((0, 0), |(plain, sealed), line| {
+                let plaintext = super::serialize_cell_semantic_scrollback_line(line)
+                    .expect("bench row serializes");
+                let payload = super::compress_exact_scrollback_plaintext(&plaintext)
+                    .map_or(plaintext.len(), |payload| payload.len());
+                (plain + plaintext.len(), sealed + payload)
+            })
+        }
+
+        /// The compact record path before AC1: the cell-vector schemas, with
+        /// a payload vector and a record string allocated per row. Returns
+        /// the total record bytes.
+        pub fn seal_compact_cell_schemas(&self, rows: &Rows, scratch: &mut Vec<u8>) -> usize {
+            let mut stream = mux::guardian_output_journal::GuardianScrollbackRowNonceStream::begin(
+                &self.cipher,
+                0,
+                [],
+            )
+            .expect("bench nonce stream");
+            rows.0
+                .iter()
+                .enumerate()
+                .map(|(row, line)| {
+                    let location =
+                        mux::guardian_output_journal::GuardianScrollbackRowLocation::new(
+                            [0x5a; 16], [0xa5; 16], row as i64, row as u64,
+                        )
+                        .expect("bench row location");
+                    let plaintext = super::serialize_cell_semantic_scrollback_line(line)
+                        .expect("bench row serializes");
+                    let payload =
+                        super::compress_exact_scrollback_plaintext(&plaintext).unwrap_or(plaintext);
+                    let mut record = String::new();
+                    self.cipher
+                        .seal_compact_scrollback_row_into(
+                            &mut stream,
+                            location,
+                            &payload,
+                            scratch,
+                            &mut record,
+                        )
+                        .expect("bench row seals");
+                    record.len()
+                })
+                .sum()
+        }
+    }
+}
+
+/// The zstd level each exact row's frame is written at when no override
+/// names one (ft-y0gy9).
+const EXACT_SCROLLBACK_ROW_ZSTD_LEVEL: i32 = 1;
+
+/// The zstd level of each exact row's own frame: FT_SCROLLBACK_ROW_ZSTD_LEVEL
+/// when it names one in -7..=3, otherwise `EXACT_SCROLLBACK_ROW_ZSTD_LEVEL`,
+/// read once per process (ft-y0gy9). Every level writes one frame per row
+/// that the same bounded decoder reads; levels below 1 store literals raw
+/// instead of Huffman-coding them, which is most of level 1's time on T0
+/// rows.
+fn exact_scrollback_row_zstd_level() -> i32 {
+    static LEVEL: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        parse_exact_scrollback_row_zstd_level(
+            std::env::var_os("FT_SCROLLBACK_ROW_ZSTD_LEVEL").as_deref(),
+        )
+    })
+}
+
+fn parse_exact_scrollback_row_zstd_level(value: Option<&std::ffi::OsStr>) -> i32 {
+    value
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .filter(|level| (-7..=3).contains(level))
+        .unwrap_or(EXACT_SCROLLBACK_ROW_ZSTD_LEVEL)
+}
+
 /// Compress only the exact semantic bytes, before the existing AEAD boundary.
 /// Each frame is independent; the thread-local context only reuses workspace,
 /// never a dictionary from another row. Failed or unhelpful compression leaves
 /// the original representation intact.
 fn compress_exact_scrollback_plaintext(plaintext: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    let mut payload = Zeroizing::new(Vec::new());
+    compress_exact_scrollback_plaintext_into(plaintext, &mut payload).then_some(payload)
+}
+
+/// `compress_exact_scrollback_plaintext` into `payload`, which keeps its
+/// capacity from row to row (ft-yccm0.2.1.4 AC1). On false (compression
+/// failed or does not pay) `payload` is wiped and empty.
+fn compress_exact_scrollback_plaintext_into(plaintext: &[u8], payload: &mut Vec<u8>) -> bool {
+    wipe_scrollback_plaintext(payload);
     if plaintext.len() < 256 || plaintext.len() > LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE {
-        return None;
+        return false;
     }
     std::thread_local! {
         static COMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> =
             const { std::cell::RefCell::new(None) };
     }
-    COMPRESSOR
+    let compressed = COMPRESSOR
         .try_with(|slot| {
             let mut slot = slot.try_borrow_mut().ok()?;
             if slot.is_none() {
-                let mut compressor = zstd::bulk::Compressor::new(1).ok()?;
+                let mut compressor =
+                    zstd::bulk::Compressor::new(exact_scrollback_row_zstd_level()).ok()?;
                 compressor
                     .window_log(EXACT_SCROLLBACK_ZSTD_WINDOW_LOG)
                     .ok()?;
                 *slot = Some(compressor);
             }
             let compressor = slot.as_mut()?;
-            let mut payload = Zeroizing::new(Vec::new());
             payload.try_reserve_exact(plaintext.len()).ok()?;
             payload.resize(plaintext.len(), 0);
             let compressed_bytes = compressor
@@ -7054,14 +12375,22 @@ fn compress_exact_scrollback_plaintext(plaintext: &[u8]) -> Option<Zeroizing<Vec
             payload[..8].copy_from_slice(EXACT_SCROLLBACK_ZSTD_MAGIC);
             payload[8..EXACT_SCROLLBACK_ZSTD_HEADER_BYTES]
                 .copy_from_slice(&u32::try_from(plaintext.len()).ok()?.to_le_bytes());
+            // Truncated bytes become spare capacity, which must hold no
+            // plaintext once the buffer is reused.
+            payload[encoded_bytes..].zeroize();
             payload.truncate(encoded_bytes);
             metrics::counter!("mux.scrollback.exact_compressed_rows").increment(1);
             metrics::counter!("mux.scrollback.exact_compression_bytes_saved")
                 .increment((plaintext.len() - encoded_bytes) as u64);
-            Some(payload)
+            Some(())
         })
         .ok()
         .flatten()
+        .is_some();
+    if !compressed {
+        wipe_scrollback_plaintext(payload);
+    }
+    compressed
 }
 
 /// Called only after authenticating the encrypted row at its expected location.
@@ -7092,17 +12421,71 @@ fn expand_exact_scrollback_plaintext(
     let mut decoder = zstd::Decoder::with_buffer(&plaintext[EXACT_SCROLLBACK_ZSTD_HEADER_BYTES..])?
         .single_frame();
     decoder.window_log_max(EXACT_SCROLLBACK_ZSTD_WINDOW_LOG)?;
-    let mut expanded = BoundedScrollbackPlaintext::new(expected);
-    std::io::copy(&mut decoder, &mut expanded)
-        .context("bounded expansion of authenticated semantic scrollback")?;
+    let mut expanded = Zeroizing::new(Vec::new());
+    std::io::copy(
+        &mut decoder,
+        &mut BoundedScrollbackPlaintext::new(&mut expanded, expected),
+    )
+    .context("bounded expansion of authenticated semantic scrollback")?;
     anyhow::ensure!(
-        expanded.bytes.len() == expected && decoder.finish().is_empty(),
+        expanded.len() == expected && decoder.finish().is_empty(),
         "compressed semantic scrollback frame length or trailing bytes mismatch"
     );
-    Ok(expanded.bytes)
+    Ok(expanded)
 }
 
 fn serialize_exact_semantic_scrollback_line(
+    line: &wezterm_term::Line,
+) -> Option<Zeroizing<Vec<u8>>> {
+    let mut plaintext = Zeroizing::new(Vec::new());
+    serialize_exact_semantic_scrollback_line_into(line, &mut plaintext).then_some(plaintext)
+}
+
+/// The plaintext an exact row seals for `line`, written into `out`, which
+/// keeps its capacity from row to row (ft-yccm0.2.1.4 AC1). A row in
+/// clustered storage, as Screen leaves every row it moves to scrollback,
+/// serializes borrowed as schema 3: its attribute runs, wide cells included,
+/// with no cell vector, clone or width sidecar, so it allocates nothing once
+/// `out` is large enough. Other rows use schema 2 or 1. On false, `out` is
+/// wiped and empty.
+fn serialize_exact_semantic_scrollback_line_into(
+    line: &wezterm_term::Line,
+    out: &mut Vec<u8>,
+) -> bool {
+    wipe_scrollback_plaintext(out);
+    #[cfg(test)]
+    let clustered = line.has_clustered_storage() && !FORCE_CELL_SCHEMAS.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let clustered = line.has_clustered_storage();
+    if clustered {
+        let semantic = ExactSemanticScrollbackLineRef {
+            schema: EXACT_SCROLLBACK_SCHEMA_CLUSTERED,
+            line,
+            cell_widths: &[],
+        };
+        // The decoder must accept what is sealed: a row it would refuse, or
+        // charge past the row limit, takes the cell-vector schemas instead.
+        if serialize_semantic_scrollback_payload_into(&semantic, out)
+            && clustered_scrollback_decoded_charge(line, out.len())
+                .is_some_and(|charge| charge <= LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE)
+        {
+            return true;
+        }
+        wipe_scrollback_plaintext(out);
+    }
+    let Some(plaintext) = serialize_cell_semantic_scrollback_line(line) else {
+        return false;
+    };
+    if out.try_reserve(plaintext.len()).is_err() {
+        return false;
+    }
+    out.extend_from_slice(&plaintext);
+    true
+}
+
+/// Schema 2 (compact printable ASCII) or schema 1 (the cell vector with a
+/// width sidecar) for a row clustered storage does not hold.
+fn serialize_cell_semantic_scrollback_line(
     line: &wezterm_term::Line,
 ) -> Option<Zeroizing<Vec<u8>>> {
     // Inspect borrowed cells before materializing compressed scrollback. For
@@ -7183,16 +12566,70 @@ fn serialize_exact_semantic_scrollback_line(
 fn serialize_semantic_scrollback_payload(
     semantic: &ExactSemanticScrollbackLineV1,
 ) -> Option<Zeroizing<Vec<u8>>> {
-    let mut plaintext =
-        BoundedScrollbackPlaintext::new(LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE);
-    let serialization = {
-        let mut serializer = varbincode::Serializer::new(&mut plaintext);
-        semantic.serialize(&mut serializer)
+    let mut plaintext = Zeroizing::new(Vec::new());
+    serialize_semantic_scrollback_payload_into(semantic, &mut plaintext).then_some(plaintext)
+}
+
+/// Appends `semantic`'s bounded varbincode to `out`; on false `out` is wiped.
+fn serialize_semantic_scrollback_payload_into<T: Serialize>(
+    semantic: &T,
+    out: &mut Vec<u8>,
+) -> bool {
+    let start = out.len();
+    let serialized = if direct_scrollback_serialization_enabled() {
+        exact_varbincode::serialize_into(
+            semantic,
+            out,
+            LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+        )
+        .is_ok()
+    } else {
+        let mut plaintext =
+            BoundedScrollbackPlaintext::new(out, LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE);
+        let serialization = {
+            let mut serializer = varbincode::Serializer::new(&mut plaintext);
+            semantic.serialize(&mut serializer)
+        };
+        !plaintext.exceeded && serialization.is_ok()
     };
-    if plaintext.exceeded || serialization.is_err() || plaintext.bytes.is_empty() {
+    if !serialized || out.len() == start {
+        wipe_scrollback_plaintext(out);
+        return false;
+    }
+    true
+}
+
+/// Validate a clustered (schema 3) row and charge it as if materialized
+/// (ft-yccm0.2.1.4). Every cell is one or two columns wide and starts where
+/// the previous one ended, the columns add up to the row's length, and the
+/// cells consume all of its text: the runs then reproduce exactly the cells
+/// they were stored with. A wide cell materializes with a spacer that clones
+/// its attributes, so it is charged twice. `None` refuses the row.
+fn clustered_scrollback_decoded_charge(
+    line: &wezterm_term::Line,
+    plaintext_bytes: usize,
+) -> Option<usize> {
+    if !line.has_clustered_storage() || line.len() > LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE {
         return None;
     }
-    Some(plaintext.bytes)
+    let mut charge = plaintext_bytes;
+    let mut columns = 0usize;
+    let mut text_bytes = 0usize;
+    for cell in line.visible_cells() {
+        let width = cell.width();
+        if !matches!(width, 1 | 2) || cell.cell_index() != columns {
+            return None;
+        }
+        columns = columns.checked_add(width)?;
+        if columns > line.len() {
+            return None;
+        }
+        text_bytes = text_bytes.checked_add(cell.str().len())?;
+        let materialized = std::mem::size_of::<termwiz::cell::Cell>()
+            .checked_add(cell.attrs().snapshot_clone_heap_bytes()?)?;
+        charge = charge.checked_add(materialized.checked_mul(width)?)?;
+    }
+    (columns == line.len() && line.visible_text_bytes() == Some(text_bytes)).then_some(charge)
 }
 
 /// Validate the complete compact representation and charge expansion before
@@ -7236,23 +12673,33 @@ struct ExactSemanticScrollbackLineV1 {
     cell_widths: Vec<u8>,
 }
 
-struct BoundedScrollbackPlaintext {
-    bytes: Zeroizing<Vec<u8>>,
+/// `ExactSemanticScrollbackLineV1` over a borrowed row and sidecar: the same
+/// bytes, without cloning the row (ft-yccm0.2.1.4).
+#[derive(Serialize)]
+struct ExactSemanticScrollbackLineRef<'a> {
+    schema: u32,
+    line: &'a wezterm_term::Line,
+    cell_widths: &'a [u8],
+}
+
+/// Appends to a caller's buffer, refusing to grow it past `max_bytes`.
+struct BoundedScrollbackPlaintext<'a> {
+    bytes: &'a mut Vec<u8>,
     max_bytes: usize,
     exceeded: bool,
 }
 
-impl BoundedScrollbackPlaintext {
-    fn new(max_bytes: usize) -> Self {
+impl<'a> BoundedScrollbackPlaintext<'a> {
+    fn new(bytes: &'a mut Vec<u8>, max_bytes: usize) -> Self {
         Self {
-            bytes: Zeroizing::new(Vec::new()),
+            bytes,
             max_bytes,
             exceeded: false,
         }
     }
 }
 
-impl Write for BoundedScrollbackPlaintext {
+impl Write for BoundedScrollbackPlaintext<'_> {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         let Some(next_len) = self.bytes.len().checked_add(buffer.len()) else {
             self.exceeded = true;
@@ -7275,6 +12722,431 @@ impl Write for BoundedScrollbackPlaintext {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// Whether a durability switch read from the environment is on: anything
+/// but exactly `0` (ft-y0gy9). The switches exist for native A/B arms.
+fn durability_switch_on(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|value| value != "0")
+}
+
+std::thread_local! {
+    /// Forces this thread's exact rows through `exact_varbincode` (true) or
+    /// `varbincode` (false), for a same-run A/B in tests and benches.
+    static SCROLLBACK_SERIALIZER_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether exact rows serialize through `exact_varbincode`: on unless
+/// FT_SCROLLBACK_DIRECT_SERIALIZE=0, read once per process. Both encoders
+/// write the same bytes; only the writer's CPU differs (ft-y0gy9).
+fn direct_scrollback_serialization_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    SCROLLBACK_SERIALIZER_OVERRIDE
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(|| {
+            *ENABLED.get_or_init(|| {
+                durability_switch_on(std::env::var_os("FT_SCROLLBACK_DIRECT_SERIALIZE").as_deref())
+            })
+        })
+}
+
+/// varbincode's encoding, which every exact row's plaintext is decoded with,
+/// written straight into a bounded buffer (ft-y0gy9). `varbincode::Serializer`
+/// writes through `&mut dyn Write`: a virtual call per field and per byte of
+/// every varint, which was most of the durability writer's serialization
+/// time. This writes the same bytes with static dispatch:
+/// - integers wider than a byte as LEB128, signed ones in its signed form;
+/// - `u8` and `i8` as one byte, floats little-endian, `bool` as 0 or 1;
+/// - strings and byte slices as a `u64` length, then the bytes;
+/// - sequences and maps as a `u64` length, which they must have;
+/// - `None` as a 0 byte, `Some` as a 1 byte and the value;
+/// - variants as their `u32` index; structs and tuples with no framing.
+///
+/// Tests compare it byte for byte with varbincode.
+mod exact_varbincode {
+    use serde::ser::{self, Serialize};
+
+    /// Why serialization stopped. The bytes written before it are the
+    /// caller's to wipe.
+    #[derive(Debug)]
+    pub enum Error {
+        /// The output would pass its bound.
+        Exceeded,
+        /// The output could not grow.
+        Allocation,
+        /// A sequence or map without a length, which varbincode refuses too.
+        SequenceMustHaveLength,
+        /// A value's own serialization failed.
+        Custom(String),
+    }
+
+    impl std::fmt::Display for Error {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Exceeded => formatter.write_str("serialization exceeds its byte bound"),
+                Self::Allocation => formatter.write_str("serialization output cannot grow"),
+                Self::SequenceMustHaveLength => {
+                    formatter.write_str("a sequence or map must have a length")
+                }
+                Self::Custom(message) => formatter.write_str(message),
+            }
+        }
+    }
+
+    impl std::error::Error for Error {}
+
+    impl ser::Error for Error {
+        fn custom<T: std::fmt::Display>(message: T) -> Self {
+            Self::Custom(message.to_string())
+        }
+    }
+
+    /// Appends to `out`, refusing to grow it past `max_bytes` in all.
+    pub struct Serializer<'a> {
+        out: &'a mut Vec<u8>,
+        max_bytes: usize,
+    }
+
+    /// Append `value`'s varbincode encoding to `out`, whose length must stay
+    /// at most `max_bytes`. On an error `out` may hold a partial encoding.
+    pub fn serialize_into<T: Serialize + ?Sized>(
+        value: &T,
+        out: &mut Vec<u8>,
+        max_bytes: usize,
+    ) -> Result<(), Error> {
+        value.serialize(&mut Serializer { out, max_bytes })
+    }
+
+    impl Serializer<'_> {
+        #[inline]
+        fn push(&mut self, bytes: &[u8]) -> Result<(), Error> {
+            let next_len = self
+                .out
+                .len()
+                .checked_add(bytes.len())
+                .ok_or(Error::Exceeded)?;
+            if next_len > self.max_bytes {
+                return Err(Error::Exceeded);
+            }
+            self.out
+                .try_reserve(bytes.len())
+                .map_err(|_| Error::Allocation)?;
+            self.out.extend_from_slice(bytes);
+            Ok(())
+        }
+
+        /// leb128's unsigned form: seven bits a byte, low first, the high
+        /// bit set on every byte but the last.
+        #[inline]
+        fn unsigned(&mut self, mut value: u64) -> Result<(), Error> {
+            let mut encoded = [0_u8; 10];
+            let mut len = 0;
+            loop {
+                let mut byte = (value & 0x7f) as u8;
+                value >>= 7;
+                if value != 0 {
+                    byte |= 0x80;
+                }
+                encoded[len] = byte;
+                len += 1;
+                if value == 0 {
+                    return self.push(&encoded[..len]);
+                }
+            }
+        }
+
+        /// leb128's signed form: it ends once the bits left are all copies
+        /// of the sign bit.
+        #[inline]
+        fn signed(&mut self, mut value: i64) -> Result<(), Error> {
+            let mut encoded = [0_u8; 10];
+            let mut len = 0;
+            loop {
+                let mut byte = value as u8;
+                value >>= 6;
+                let done = value == 0 || value == -1;
+                if done {
+                    byte &= 0x7f;
+                } else {
+                    value >>= 1;
+                    byte |= 0x80;
+                }
+                encoded[len] = byte;
+                len += 1;
+                if done {
+                    return self.push(&encoded[..len]);
+                }
+            }
+        }
+    }
+
+    impl ser::Serializer for &mut Serializer<'_> {
+        type Ok = ();
+        type Error = Error;
+        type SerializeSeq = Self;
+        type SerializeTuple = Self;
+        type SerializeTupleStruct = Self;
+        type SerializeTupleVariant = Self;
+        type SerializeMap = Self;
+        type SerializeStruct = Self;
+        type SerializeStructVariant = Self;
+
+        fn serialize_bool(self, value: bool) -> Result<(), Error> {
+            self.unsigned(u64::from(value))
+        }
+
+        fn serialize_i8(self, value: i8) -> Result<(), Error> {
+            self.push(&value.to_le_bytes())
+        }
+
+        fn serialize_i16(self, value: i16) -> Result<(), Error> {
+            self.signed(i64::from(value))
+        }
+
+        fn serialize_i32(self, value: i32) -> Result<(), Error> {
+            self.signed(i64::from(value))
+        }
+
+        fn serialize_i64(self, value: i64) -> Result<(), Error> {
+            self.signed(value)
+        }
+
+        fn serialize_u8(self, value: u8) -> Result<(), Error> {
+            self.push(&[value])
+        }
+
+        fn serialize_u16(self, value: u16) -> Result<(), Error> {
+            self.unsigned(u64::from(value))
+        }
+
+        fn serialize_u32(self, value: u32) -> Result<(), Error> {
+            self.unsigned(u64::from(value))
+        }
+
+        fn serialize_u64(self, value: u64) -> Result<(), Error> {
+            self.unsigned(value)
+        }
+
+        fn serialize_f32(self, value: f32) -> Result<(), Error> {
+            self.push(&value.to_le_bytes())
+        }
+
+        fn serialize_f64(self, value: f64) -> Result<(), Error> {
+            self.push(&value.to_le_bytes())
+        }
+
+        fn serialize_char(self, value: char) -> Result<(), Error> {
+            self.unsigned(u64::from(u32::from(value)))
+        }
+
+        fn serialize_str(self, value: &str) -> Result<(), Error> {
+            self.serialize_bytes(value.as_bytes())
+        }
+
+        fn serialize_bytes(self, value: &[u8]) -> Result<(), Error> {
+            self.unsigned(value.len() as u64)?;
+            self.push(value)
+        }
+
+        fn serialize_none(self) -> Result<(), Error> {
+            self.push(&[0])
+        }
+
+        fn serialize_some<T: Serialize + ?Sized>(self, value: &T) -> Result<(), Error> {
+            self.push(&[1])?;
+            value.serialize(self)
+        }
+
+        fn serialize_unit(self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn serialize_unit_struct(self, _name: &'static str) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn serialize_unit_variant(
+            self,
+            _name: &'static str,
+            variant_index: u32,
+            _variant: &'static str,
+        ) -> Result<(), Error> {
+            self.unsigned(u64::from(variant_index))
+        }
+
+        fn serialize_newtype_struct<T: Serialize + ?Sized>(
+            self,
+            _name: &'static str,
+            value: &T,
+        ) -> Result<(), Error> {
+            value.serialize(self)
+        }
+
+        fn serialize_newtype_variant<T: Serialize + ?Sized>(
+            self,
+            _name: &'static str,
+            variant_index: u32,
+            _variant: &'static str,
+            value: &T,
+        ) -> Result<(), Error> {
+            self.unsigned(u64::from(variant_index))?;
+            value.serialize(self)
+        }
+
+        fn serialize_seq(self, len: Option<usize>) -> Result<Self, Error> {
+            let len = len.ok_or(Error::SequenceMustHaveLength)?;
+            self.unsigned(len as u64)?;
+            Ok(self)
+        }
+
+        fn serialize_tuple(self, _len: usize) -> Result<Self, Error> {
+            Ok(self)
+        }
+
+        fn serialize_tuple_struct(self, _name: &'static str, _len: usize) -> Result<Self, Error> {
+            Ok(self)
+        }
+
+        fn serialize_tuple_variant(
+            self,
+            _name: &'static str,
+            variant_index: u32,
+            _variant: &'static str,
+            _len: usize,
+        ) -> Result<Self, Error> {
+            self.unsigned(u64::from(variant_index))?;
+            Ok(self)
+        }
+
+        fn serialize_map(self, len: Option<usize>) -> Result<Self, Error> {
+            let len = len.ok_or(Error::SequenceMustHaveLength)?;
+            self.unsigned(len as u64)?;
+            Ok(self)
+        }
+
+        fn serialize_struct(self, _name: &'static str, _len: usize) -> Result<Self, Error> {
+            Ok(self)
+        }
+
+        fn serialize_struct_variant(
+            self,
+            _name: &'static str,
+            variant_index: u32,
+            _variant: &'static str,
+            _len: usize,
+        ) -> Result<Self, Error> {
+            self.unsigned(u64::from(variant_index))?;
+            Ok(self)
+        }
+
+        fn is_human_readable(&self) -> bool {
+            false
+        }
+    }
+
+    impl ser::SerializeSeq for &mut Serializer<'_> {
+        type Ok = ();
+        type Error = Error;
+
+        fn serialize_element<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
+            value.serialize(&mut **self)
+        }
+
+        fn end(self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    impl ser::SerializeTuple for &mut Serializer<'_> {
+        type Ok = ();
+        type Error = Error;
+
+        fn serialize_element<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
+            value.serialize(&mut **self)
+        }
+
+        fn end(self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    impl ser::SerializeTupleStruct for &mut Serializer<'_> {
+        type Ok = ();
+        type Error = Error;
+
+        fn serialize_field<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
+            value.serialize(&mut **self)
+        }
+
+        fn end(self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    impl ser::SerializeTupleVariant for &mut Serializer<'_> {
+        type Ok = ();
+        type Error = Error;
+
+        fn serialize_field<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
+            value.serialize(&mut **self)
+        }
+
+        fn end(self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    impl ser::SerializeMap for &mut Serializer<'_> {
+        type Ok = ();
+        type Error = Error;
+
+        fn serialize_key<T: Serialize + ?Sized>(&mut self, key: &T) -> Result<(), Error> {
+            key.serialize(&mut **self)
+        }
+
+        fn serialize_value<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
+            value.serialize(&mut **self)
+        }
+
+        fn end(self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    impl ser::SerializeStruct for &mut Serializer<'_> {
+        type Ok = ();
+        type Error = Error;
+
+        fn serialize_field<T: Serialize + ?Sized>(
+            &mut self,
+            _key: &'static str,
+            value: &T,
+        ) -> Result<(), Error> {
+            value.serialize(&mut **self)
+        }
+
+        fn end(self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    impl ser::SerializeStructVariant for &mut Serializer<'_> {
+        type Ok = ();
+        type Error = Error;
+
+        fn serialize_field<T: Serialize + ?Sized>(
+            &mut self,
+            _key: &'static str,
+            value: &T,
+        ) -> Result<(), Error> {
+            value.serialize(&mut **self)
+        }
+
+        fn end(self) -> Result<(), Error> {
+            Ok(())
+        }
     }
 }
 
@@ -7393,16 +13265,22 @@ enum DecodedScrollbackRecordFidelity {
     LegacyRedacted,
 }
 
+/// The keys and nonce segments a reader needs to open a ledger's rows.
 struct GuardianScrollbackCipherCache<'a> {
     keyring: &'a guardian_output_keys::GuardianOutputKeyring,
     ciphers: std::collections::HashMap<[u8; 8], mux::guardian_output_journal::GuardianOutputCipher>,
+    row_segments: &'a LiveScrollbackRowSegments,
 }
 
 impl<'a> GuardianScrollbackCipherCache<'a> {
-    fn new(keyring: &'a guardian_output_keys::GuardianOutputKeyring) -> Self {
+    fn new(
+        keyring: &'a guardian_output_keys::GuardianOutputKeyring,
+        row_segments: &'a LiveScrollbackRowSegments,
+    ) -> Self {
         Self {
             keyring,
             ciphers: std::collections::HashMap::new(),
+            row_segments,
         }
     }
 
@@ -7438,6 +13316,493 @@ struct ScrollbackDecodedBudgetExceeded {
     minimum_required: usize,
 }
 
+/// An exact row's plaintext size against the per-record limit and the
+/// caller's remaining decode budget, before anything is decrypted.
+fn charge_exact_scrollback_plaintext(
+    plaintext_bytes: u32,
+    max_decoded_bytes: usize,
+) -> anyhow::Result<()> {
+    let plaintext_bytes = usize::try_from(plaintext_bytes)
+        .map_err(|_| anyhow::anyhow!("encrypted scrollback row size exceeds usize"))?;
+    anyhow::ensure!(
+        plaintext_bytes <= LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+        "encrypted scrollback row exceeds the per-record decoded-byte limit"
+    );
+    if plaintext_bytes > max_decoded_bytes {
+        return Err(ScrollbackDecodedBudgetExceeded {
+            minimum_required: plaintext_bytes,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// The line an exact row's authenticated plaintext holds, v3 or compact.
+fn decode_exact_semantic_scrollback_plaintext(
+    plaintext: Zeroizing<Vec<u8>>,
+    max_decoded_bytes: usize,
+) -> anyhow::Result<(wezterm_term::Line, usize, DecodedScrollbackRecordFidelity)> {
+    let plaintext = expand_exact_scrollback_plaintext(plaintext, max_decoded_bytes)?;
+    let mut decoded_bytes = plaintext.len();
+    let mut reader = plaintext.as_slice();
+    let mut semantic: ExactSemanticScrollbackLineV1 =
+        codec::bounded_varbincode_deserialize(&mut reader)
+            .context("bounded decode of semantic scrollback row")?;
+    anyhow::ensure!(
+        reader.is_empty(),
+        "semantic scrollback row contains trailing plaintext"
+    );
+    anyhow::ensure!(
+        matches!(semantic.schema, 1 | 2 | EXACT_SCROLLBACK_SCHEMA_CLUSTERED),
+        "unsupported semantic scrollback row schema"
+    );
+    if semantic.schema == EXACT_SCROLLBACK_SCHEMA_CLUSTERED {
+        // The stored runs are the row: validated and charged, it is returned
+        // in clustered storage, exactly as it was sealed.
+        anyhow::ensure!(
+            semantic.cell_widths.is_empty(),
+            "clustered semantic scrollback row carries a width sidecar"
+        );
+        decoded_bytes = clustered_scrollback_decoded_charge(&semantic.line, decoded_bytes)
+            .ok_or_else(|| anyhow::anyhow!("invalid clustered semantic scrollback row"))?;
+        if decoded_bytes > max_decoded_bytes.min(LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE) {
+            return Err(ScrollbackDecodedBudgetExceeded {
+                minimum_required: decoded_bytes,
+            }
+            .into());
+        }
+        return Ok((
+            semantic.line,
+            decoded_bytes,
+            DecodedScrollbackRecordFidelity::ExactSemantic,
+        ));
+    }
+    if semantic.schema == 2 {
+        decoded_bytes = compact_scrollback_decoded_charge(&semantic, decoded_bytes)
+            .ok_or_else(|| anyhow::anyhow!("invalid compact semantic scrollback row"))?;
+        if decoded_bytes > max_decoded_bytes.min(LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE) {
+            return Err(ScrollbackDecodedBudgetExceeded {
+                minimum_required: decoded_bytes,
+            }
+            .into());
+        }
+    }
+    let cells = semantic.line.cells_mut();
+    anyhow::ensure!(
+        cells.len() == semantic.cell_widths.len(),
+        "semantic scrollback cell-width sidecar length mismatch"
+    );
+    for (cell, width) in cells.iter_mut().zip(semantic.cell_widths) {
+        anyhow::ensure!(
+            matches!(width, 1 | 2),
+            "invalid semantic scrollback cell width"
+        );
+        let restored = termwiz::cell::Cell::new_grapheme_with_width(
+            cell.str(),
+            usize::from(width),
+            cell.attrs().clone(),
+        );
+        *cell = restored;
+    }
+    Ok((
+        semantic.line,
+        decoded_bytes,
+        DecodedScrollbackRecordFidelity::ExactSemantic,
+    ))
+}
+
+/// Records a segment reader may ask for: the reachable rows of `range`, all
+/// of them, oldest first.
+type LiveScrollbackRecordFetch<'f> =
+    dyn FnMut(std::ops::Range<u64>) -> anyhow::Result<Vec<String>> + 'f;
+
+/// Rows a segment reader fetches at a time while it looks for a segment's
+/// first row or tail.
+const LIVE_SCROLLBACK_SEGMENT_FETCH_ROWS: u64 = 64;
+
+/// Stored bytes one segment-reader fetch may read: room for a whole segment
+/// of the largest single row.
+const LIVE_SCROLLBACK_SEGMENT_FETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The most a segment's tail record grows by carrying the 16-byte tag in
+/// base64, which a batch's byte budget reserves for every segment it opens.
+const LIVE_SCROLLBACK_SEGMENT_TAG_RECORD_BYTES: usize = 22;
+
+/// The segments the store's writer cuts (ft-yccm0.2.1.4 AC2): at most 1024
+/// rows and 128 KiB of payload, a quarter and a half of the format's
+/// bounds, which readers keep accepting. A cold read opens the whole
+/// segment holding its row, and with segments at the format's bounds cold
+/// reads measured up to 1.5 ms (benches/scrollback_cold_read.rs); one
+/// sealing per 1024 rows still amortizes the AEAD.
+const LIVE_SCROLLBACK_SEGMENT_TARGET_ROWS: usize = 1024;
+const LIVE_SCROLLBACK_SEGMENT_TARGET_PLAINTEXT_BYTES: usize = 128 * 1024;
+const _: () = assert!(
+    LIVE_SCROLLBACK_SEGMENT_TARGET_ROWS
+        <= mux::guardian_output_journal::SCROLLBACK_SEGMENT_MAX_ROWS
+        && LIVE_SCROLLBACK_SEGMENT_TARGET_PLAINTEXT_BYTES
+            <= mux::guardian_output_journal::SCROLLBACK_SEGMENT_MAX_PLAINTEXT_BYTES
+);
+
+/// A segment reader's fetch from the live store: exactly the rows `range`,
+/// which may reach into the pruned tail, where a segment holding the oldest
+/// retained row may start (ft-yccm0.2.1.4).
+fn store_segment_records(
+    store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+    ledger_pane_id: u64,
+    range: std::ops::Range<u64>,
+) -> anyhow::Result<Vec<String>> {
+    let rows = usize::try_from(range.end.saturating_sub(range.start))?;
+    Ok(store.lines_range_reaching_pruned(
+        ledger_pane_id,
+        range,
+        rows,
+        LIVE_SCROLLBACK_SEGMENT_FETCH_MAX_BYTES,
+    )?)
+}
+
+/// The rows a segment reader may read in the live store: from the pruned
+/// tail's first row up to the next sequence.
+fn store_segment_bounds(
+    store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+    ledger_pane_id: u64,
+) -> anyhow::Result<(u64, u64)> {
+    let next = store.next_seq(ledger_pane_id)?;
+    Ok((
+        store.pruned_tail_start(ledger_pane_id).unwrap_or(next),
+        next,
+    ))
+}
+
+/// The first row of the sealed segment holding `oldest`, when that segment
+/// starts before it: the slack a physical prune to `oldest` must keep
+/// readable so the oldest retained row still authenticates
+/// (ft-yccm0.2.1.4). `None` when `oldest` starts its segment or is not a
+/// segment row.
+fn store_segment_keep_from(
+    store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+    ledger_pane_id: u64,
+    oldest: u64,
+) -> anyhow::Result<Option<u64>> {
+    use mux::guardian_output_journal::{is_scrollback_segment_record, is_scrollback_segment_tail};
+
+    let (floor, next) = store_segment_bounds(store, ledger_pane_id)?;
+    if oldest >= next || oldest <= floor {
+        return Ok(None);
+    }
+    let first = store_segment_records(store, ledger_pane_id, oldest..oldest + 1)?;
+    if !first
+        .first()
+        .is_some_and(|record| is_scrollback_segment_record(record))
+    {
+        return Ok(None);
+    }
+    let mut start = oldest;
+    while start > floor {
+        let from = start
+            .saturating_sub(LIVE_SCROLLBACK_SEGMENT_FETCH_ROWS)
+            .max(floor);
+        let block = store_segment_records(store, ledger_pane_id, from..start)?;
+        anyhow::ensure!(
+            u64::try_from(block.len())? == start - from,
+            "scrollback rows before the oldest row are missing"
+        );
+        match block.iter().rposition(|record| {
+            !is_scrollback_segment_record(record) || is_scrollback_segment_tail(record)
+        }) {
+            Some(at) => {
+                start = from + u64::try_from(at)? + 1;
+                break;
+            }
+            None => start = from,
+        }
+    }
+    Ok((start < oldest).then_some(start))
+}
+
+/// Opens v5 segments for a reader of stored rows (ft-yccm0.2.1.4 option
+/// A). A v5 row authenticates only with its whole segment, so reading one
+/// opens the segment, which stays open for the next row: a sequential
+/// reader decrypts each segment once. The plaintext is wiped when the next
+/// segment opens and on drop.
+#[derive(Default)]
+struct LiveScrollbackSegmentReader {
+    /// First sequence of the open segment; meaningless while `offsets` is
+    /// empty.
+    first: u64,
+    plaintext: Zeroizing<Vec<u8>>,
+    row_bytes: Vec<u32>,
+    /// Each open row's start in `plaintext`.
+    offsets: Vec<usize>,
+    aad: Vec<u8>,
+    /// The open segment's tail record, as read.
+    tail: String,
+}
+
+impl LiveScrollbackSegmentReader {
+    /// The open segment's payload for the row at `sequence`, if it holds it.
+    fn open_row(&self, sequence: u64) -> Option<&[u8]> {
+        let index = usize::try_from(sequence.checked_sub(self.first)?).ok()?;
+        let start = *self.offsets.get(index)?;
+        let bytes = *self.row_bytes.get(index)? as usize;
+        self.plaintext.get(start..start.checked_add(bytes)?)
+    }
+
+    /// The open segment's rows, if one is open.
+    fn open_rows(&self) -> Option<std::ops::Range<u64>> {
+        let rows = u64::try_from(self.offsets.len())
+            .ok()
+            .filter(|rows| *rows > 0)?;
+        Some(self.first..self.first.checked_add(rows)?)
+    }
+
+    /// Whether the open segment is still stored as it was read: its tail
+    /// record, whose tag covers the whole segment, is unchanged at its
+    /// sequence. Stored rows are rewritten only after a cut through the
+    /// ledger's end, sealed again under a fresh nonce, so a rewritten
+    /// segment never keeps its tail.
+    fn still_stored(&self, fetch: &mut LiveScrollbackRecordFetch<'_>) -> bool {
+        self.open_rows().is_some_and(|rows| {
+            fetch(rows.end - 1..rows.end)
+                .is_ok_and(|records| matches!(records.as_slice(), [tail] if *tail == self.tail))
+        })
+    }
+
+    /// The payload of the v5 row at `sequence` (its stable row is
+    /// `stable_row`), opening the segment that holds it unless it is open.
+    /// The segment starts after the nearest earlier tail or non-segment row,
+    /// or at `physical_oldest`, the first reachable row; it ends at its tail
+    /// before `next`.
+    #[allow(clippy::too_many_arguments)]
+    fn row_payload(
+        &mut self,
+        sequence: u64,
+        stable_row: wezterm_term::StableRowIndex,
+        physical_oldest: u64,
+        next: u64,
+        fetch: &mut LiveScrollbackRecordFetch<'_>,
+        cipher_cache: &mut GuardianScrollbackCipherCache<'_>,
+        durable_pane_id: [u8; 16],
+        content_epoch: [u8; 16],
+    ) -> anyhow::Result<&[u8]> {
+        use mux::guardian_output_journal::{
+            SCROLLBACK_SEGMENT_MAX_ROWS, is_scrollback_segment_record, is_scrollback_segment_tail,
+        };
+
+        if self.open_row(sequence).is_none() {
+            anyhow::ensure!(
+                physical_oldest <= sequence && sequence < next,
+                "scrollback segment row {sequence} is not reachable"
+            );
+            let max_rows = u64::try_from(SCROLLBACK_SEGMENT_MAX_ROWS)?;
+            // The rows the scan back reads after the previous segment are
+            // this segment's first rows: keep them, so each record is read
+            // once.
+            let mut earlier = Vec::new();
+            let mut start = sequence;
+            while start > physical_oldest {
+                let from = start
+                    .saturating_sub(LIVE_SCROLLBACK_SEGMENT_FETCH_ROWS)
+                    .max(physical_oldest);
+                let mut block = fetch(from..start)?;
+                anyhow::ensure!(
+                    u64::try_from(block.len())? == start - from,
+                    "scrollback rows before a segment row are missing"
+                );
+                match block.iter().rposition(|record| {
+                    !is_scrollback_segment_record(record) || is_scrollback_segment_tail(record)
+                }) {
+                    Some(at) => {
+                        start = from + u64::try_from(at)? + 1;
+                        block.drain(..=at);
+                        earlier.push(block);
+                        break;
+                    }
+                    None => {
+                        start = from;
+                        earlier.push(block);
+                    }
+                }
+                anyhow::ensure!(
+                    sequence - start < max_rows,
+                    "a scrollback segment runs past its row bound"
+                );
+            }
+            let mut records: Vec<String> = earlier.into_iter().rev().flatten().collect();
+            let mut at = sequence;
+            'segment: loop {
+                anyhow::ensure!(at < next, "a scrollback segment has no tail");
+                let to = at
+                    .saturating_add(LIVE_SCROLLBACK_SEGMENT_FETCH_ROWS)
+                    .min(next);
+                let block = fetch(at..to)?;
+                anyhow::ensure!(
+                    u64::try_from(block.len())? == to - at,
+                    "scrollback segment rows are missing"
+                );
+                for record in block {
+                    anyhow::ensure!(
+                        is_scrollback_segment_record(&record),
+                        "a scrollback segment is cut by a row of another format"
+                    );
+                    let tail = is_scrollback_segment_tail(&record);
+                    records.push(record);
+                    at += 1;
+                    anyhow::ensure!(
+                        u64::try_from(records.len())? <= max_rows,
+                        "a scrollback segment runs past its row bound"
+                    );
+                    if tail {
+                        break 'segment;
+                    }
+                }
+            }
+            anyhow::ensure!(sequence < at, "a scrollback segment does not hold its row");
+            let segment = cipher_cache.row_segments.covering(start).ok_or_else(|| {
+                anyhow::anyhow!("no nonce segment covers scrollback segment {start}")
+            })?;
+            let first_row = stable_row
+                .checked_sub(wezterm_term::StableRowIndex::try_from(sequence - start)?)
+                .ok_or_else(|| anyhow::anyhow!("scrollback segment stable row underflows"))?;
+            let location = mux::guardian_output_journal::GuardianScrollbackRowLocation::new(
+                durable_pane_id,
+                content_epoch,
+                i64::try_from(first_row)
+                    .map_err(|_| anyhow::anyhow!("stable row does not fit a segment location"))?,
+                start,
+            )
+            .context("scrollback segment location")?;
+            let refs: Vec<&str> = records.iter().map(String::as_str).collect();
+            self.offsets.clear();
+            let cipher = cipher_cache
+                .cipher_for_key_id(segment.key_id())
+                .context("load historical guardian key for a scrollback segment")?;
+            cipher
+                .open_scrollback_segment(
+                    &segment,
+                    location,
+                    &refs,
+                    LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+                    &mut self.plaintext,
+                    &mut self.row_bytes,
+                    &mut self.aad,
+                )
+                .context("authenticate scrollback segment at its durable location")?;
+            self.first = start;
+            let mut offset = 0_usize;
+            for bytes in &self.row_bytes {
+                self.offsets.push(offset);
+                offset += *bytes as usize;
+            }
+            self.tail = records.pop().unwrap_or_default();
+            #[cfg(test)]
+            LIVE_SCROLLBACK_SEGMENT_OPENS.with(|opens| opens.set(opens.get() + 1));
+        }
+        self.open_row(sequence)
+            .ok_or_else(|| anyhow::anyhow!("an open scrollback segment lost its row"))
+    }
+}
+
+/// Where a sink's kept segment was read: the ledger, the content epoch and
+/// the stable row of the ledger's first sequence.
+type LiveScrollbackColdSegmentOrigin = (u64, [u8; 16], wezterm_term::StableRowIndex);
+
+/// The most buffer a kept segment may hold: a full segment's plaintext,
+/// with room for the base64 decoder's growth.
+const LIVE_SCROLLBACK_COLD_SEGMENT_MAX_CAPACITY: usize =
+    4 * mux::guardian_output_journal::SCROLLBACK_SEGMENT_MAX_PLAINTEXT_BYTES;
+
+/// The sealed segment a sink's last cold read opened, kept open for the
+/// next (ft-yccm0.2.1.4). Screen reads cold rows in batches of at most 32,
+/// so without it a sweep (the cold index, search) decrypts each segment
+/// once per batch; with it, once. A kept segment is used only under the
+/// origin it was read under, and only while it is still stored as it was
+/// read. A segment larger than the bound (a single larger row) is not
+/// kept. The plaintext is wiped when it is replaced and on drop.
+#[derive(Default)]
+struct LiveScrollbackColdSegment {
+    origin: Option<LiveScrollbackColdSegmentOrigin>,
+    reader: LiveScrollbackSegmentReader,
+}
+
+impl LiveScrollbackColdSegment {
+    /// A reader for a cold read under `origin`: the kept segment if it
+    /// still applies, else one with nothing open.
+    fn take(
+        &mut self,
+        origin: LiveScrollbackColdSegmentOrigin,
+        fetch: &mut LiveScrollbackRecordFetch<'_>,
+    ) -> LiveScrollbackSegmentReader {
+        let reader = std::mem::take(&mut self.reader);
+        if self.origin.take() == Some(origin) && reader.still_stored(fetch) {
+            reader
+        } else {
+            LiveScrollbackSegmentReader::default()
+        }
+    }
+
+    /// Keep `reader`'s open segment for the next cold read under `origin`,
+    /// unless it is larger than a bounded segment.
+    fn keep(
+        &mut self,
+        origin: LiveScrollbackColdSegmentOrigin,
+        reader: LiveScrollbackSegmentReader,
+    ) {
+        if reader.open_rows().is_some()
+            && reader.plaintext.len()
+                <= mux::guardian_output_journal::SCROLLBACK_SEGMENT_MAX_PLAINTEXT_BYTES
+            && reader.plaintext.capacity() <= LIVE_SCROLLBACK_COLD_SEGMENT_MAX_CAPACITY
+        {
+            self.origin = Some(origin);
+            self.reader = reader;
+        }
+    }
+}
+
+/// Decode the stored row at `sequence` whatever its format: a v3 or v4 row
+/// alone, a v5 row through `segments`, which reads the rows around it with
+/// `fetch`. `physical_oldest` and `next` bound the reachable rows.
+#[allow(clippy::too_many_arguments)]
+fn decode_stored_scrollback_row(
+    record: &str,
+    segments: &mut LiveScrollbackSegmentReader,
+    fetch: &mut LiveScrollbackRecordFetch<'_>,
+    physical_oldest: u64,
+    next: u64,
+    cipher_cache: &mut GuardianScrollbackCipherCache<'_>,
+    durable_pane_id: [u8; 16],
+    content_epoch: [u8; 16],
+    stable_row: wezterm_term::StableRowIndex,
+    sequence: u64,
+    max_decoded_bytes: usize,
+) -> anyhow::Result<(wezterm_term::Line, usize, DecodedScrollbackRecordFidelity)> {
+    if !mux::guardian_output_journal::is_scrollback_segment_record(record) {
+        return decode_persisted_scrollback_line_with_limit(
+            record,
+            cipher_cache,
+            durable_pane_id,
+            content_epoch,
+            stable_row,
+            sequence,
+            max_decoded_bytes,
+        );
+    }
+    let payload = segments.row_payload(
+        sequence,
+        stable_row,
+        physical_oldest,
+        next,
+        fetch,
+        cipher_cache,
+        durable_pane_id,
+        content_epoch,
+    )?;
+    charge_exact_scrollback_plaintext(
+        u32::try_from(payload.len()).unwrap_or(u32::MAX),
+        max_decoded_bytes,
+    )?;
+    decode_exact_semantic_scrollback_plaintext(Zeroizing::new(payload.to_vec()), max_decoded_bytes)
+}
+
 fn decode_persisted_scrollback_line_with_limit(
     record: &str,
     cipher_cache: &mut GuardianScrollbackCipherCache<'_>,
@@ -7449,21 +13814,45 @@ fn decode_persisted_scrollback_line_with_limit(
 ) -> anyhow::Result<(wezterm_term::Line, usize, DecodedScrollbackRecordFidelity)> {
     use mux::guardian_output_journal::GuardianEncryptedScrollbackRow;
 
+    anyhow::ensure!(
+        !mux::guardian_output_journal::is_scrollback_segment_record(record),
+        "a scrollback segment row decodes only with its segment"
+    );
+    let max_plaintext_bytes =
+        u32::try_from(max_decoded_bytes.min(LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE))
+            .unwrap_or(u32::MAX);
+    if mux::guardian_output_journal::is_compact_scrollback_row(record) {
+        let plaintext_bytes =
+            mux::guardian_output_journal::compact_scrollback_row_plaintext_bytes(record)
+                .context("size compact semantic scrollback row")?;
+        charge_exact_scrollback_plaintext(plaintext_bytes, max_decoded_bytes)?;
+        let segment = cipher_cache
+            .row_segments
+            .covering(sequence)
+            .ok_or_else(|| {
+                anyhow::anyhow!("no nonce segment covers compact scrollback row {sequence}")
+            })?;
+        let location = mux::guardian_output_journal::GuardianScrollbackRowLocation::new(
+            durable_pane_id,
+            content_epoch,
+            i64::try_from(stable_row)
+                .map_err(|_| anyhow::anyhow!("stable row does not fit compact row location"))?,
+            sequence,
+        )
+        .context("compact scrollback row location")?;
+        let cipher = cipher_cache
+            .cipher_for_key_id(segment.key_id())
+            .context("load historical guardian key for compact scrollback row")?;
+        let plaintext = cipher
+            .open_compact_scrollback_row(&segment, record, location, max_plaintext_bytes)
+            .context("authenticate compact scrollback row at durable location")?;
+        return decode_exact_semantic_scrollback_plaintext(plaintext, max_decoded_bytes);
+    }
+
     if GuardianEncryptedScrollbackRow::has_encrypted_prefix(record) {
         let parsed = GuardianEncryptedScrollbackRow::parse(record)
             .context("parse encrypted semantic scrollback row")?;
-        let plaintext_bytes = usize::try_from(parsed.plaintext_bytes())
-            .map_err(|_| anyhow::anyhow!("encrypted scrollback row size exceeds usize"))?;
-        anyhow::ensure!(
-            plaintext_bytes <= LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
-            "encrypted scrollback row exceeds the per-record decoded-byte limit"
-        );
-        if plaintext_bytes > max_decoded_bytes {
-            return Err(ScrollbackDecodedBudgetExceeded {
-                minimum_required: plaintext_bytes,
-            }
-            .into());
-        }
+        charge_exact_scrollback_plaintext(parsed.plaintext_bytes(), max_decoded_bytes)?;
         let stable_row = i64::try_from(stable_row)
             .map_err(|_| anyhow::anyhow!("stable row does not fit encrypted row identity"))?;
         let cipher = cipher_cache
@@ -7476,56 +13865,10 @@ fn decode_persisted_scrollback_line_with_limit(
                 content_epoch,
                 stable_row,
                 sequence,
-                u32::try_from(max_decoded_bytes.min(LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE))
-                    .unwrap_or(u32::MAX),
+                max_plaintext_bytes,
             )
             .context("authenticate semantic scrollback row at durable location")?;
-        let plaintext = expand_exact_scrollback_plaintext(plaintext, max_decoded_bytes)?;
-        let mut decoded_bytes = plaintext.len();
-        let mut reader = plaintext.as_slice();
-        let mut semantic: ExactSemanticScrollbackLineV1 =
-            codec::bounded_varbincode_deserialize(&mut reader)
-                .context("bounded decode of semantic scrollback row")?;
-        anyhow::ensure!(
-            reader.is_empty(),
-            "semantic scrollback row contains trailing plaintext"
-        );
-        anyhow::ensure!(
-            matches!(semantic.schema, 1 | 2),
-            "unsupported semantic scrollback row schema"
-        );
-        if semantic.schema == 2 {
-            decoded_bytes = compact_scrollback_decoded_charge(&semantic, decoded_bytes)
-                .ok_or_else(|| anyhow::anyhow!("invalid compact semantic scrollback row"))?;
-            if decoded_bytes > max_decoded_bytes.min(LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE) {
-                return Err(ScrollbackDecodedBudgetExceeded {
-                    minimum_required: decoded_bytes,
-                }
-                .into());
-            }
-        }
-        let cells = semantic.line.cells_mut();
-        anyhow::ensure!(
-            cells.len() == semantic.cell_widths.len(),
-            "semantic scrollback cell-width sidecar length mismatch"
-        );
-        for (cell, width) in cells.iter_mut().zip(semantic.cell_widths) {
-            anyhow::ensure!(
-                matches!(width, 1 | 2),
-                "invalid semantic scrollback cell width"
-            );
-            let restored = termwiz::cell::Cell::new_grapheme_with_width(
-                cell.str(),
-                usize::from(width),
-                cell.attrs().clone(),
-            );
-            *cell = restored;
-        }
-        return Ok((
-            semantic.line,
-            decoded_bytes,
-            DecodedScrollbackRecordFidelity::ExactSemantic,
-        ));
+        return decode_exact_semantic_scrollback_plaintext(plaintext, max_decoded_bytes);
     }
 
     if record.starts_with("ftsl3") {
@@ -7576,6 +13919,10 @@ fn decode_persisted_scrollback_line_with_limit(
     ))
 }
 
+/// Whether `existing`, the stored row at `sequence`, is exactly `line`. A v5
+/// row opens through its segment in `ledger`, the store and ledger it lives
+/// in; without one it is never equivalent.
+#[allow(clippy::too_many_arguments)]
 fn exact_scrollback_line_record_is_equivalent(
     existing: &str,
     line: &wezterm_term::Line,
@@ -7584,24 +13931,53 @@ fn exact_scrollback_line_record_is_equivalent(
     content_epoch: [u8; 16],
     stable_row: wezterm_term::StableRowIndex,
     sequence: u64,
+    row_segments: &LiveScrollbackRowSegments,
+    ledger: Option<(
+        &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+        u64,
+    )>,
 ) -> bool {
-    let Ok((decoded, _decoded_bytes, fidelity)) = decode_persisted_scrollback_line_with_limit(
-        existing,
-        &mut GuardianScrollbackCipherCache::new(keyring),
-        durable_pane_id,
-        content_epoch,
-        stable_row,
-        sequence,
-        LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
-    ) else {
+    let mut cipher_cache = GuardianScrollbackCipherCache::new(keyring, row_segments);
+    let decoded = match ledger {
+        Some((store, ledger_pane_id)) => {
+            store_segment_bounds(store, ledger_pane_id).and_then(|(physical_oldest, next)| {
+                decode_stored_scrollback_row(
+                    existing,
+                    &mut LiveScrollbackSegmentReader::default(),
+                    &mut |range| store_segment_records(store, ledger_pane_id, range),
+                    physical_oldest,
+                    next,
+                    &mut cipher_cache,
+                    durable_pane_id,
+                    content_epoch,
+                    stable_row,
+                    sequence,
+                    LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+                )
+            })
+        }
+        None => decode_persisted_scrollback_line_with_limit(
+            existing,
+            &mut cipher_cache,
+            durable_pane_id,
+            content_epoch,
+            stable_row,
+            sequence,
+            LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+        ),
+    };
+    let Ok((decoded, _decoded_bytes, fidelity)) = decoded else {
         return false;
     };
     if fidelity != DecodedScrollbackRecordFidelity::ExactSemantic {
         return false;
     }
+    // Compare through the cell-vector schemas, which normalize storage: a
+    // clustered row seals as schema 3, but the same row stored earlier as
+    // schema 2 or 1 decodes into vector storage.
     match (
-        serialize_exact_semantic_scrollback_line(&decoded),
-        serialize_exact_semantic_scrollback_line(line),
+        serialize_cell_semantic_scrollback_line(&decoded),
+        serialize_cell_semantic_scrollback_line(line),
     ) {
         (Some(decoded), Some(expected)) => decoded == expected,
         _ => false,
@@ -7625,17 +14001,440 @@ impl LiveScrollbackSpillSink {
         }
     }
 
+    /// Whether a transaction at `stable_row` can be a commit window
+    /// (ft-yccm0.2.1.2): publication cadence is on, the manifest is a
+    /// complete authenticated one at this retention, the rows follow the
+    /// ledger, and the live nonce stream continues the table's last segment
+    /// under the active key without resealing a sequence. A window that
+    /// would start a segment is a single-batch transaction instead, so its
+    /// WAL and manifest name the segment before a tail depends on it.
+    fn window_continues_tail(
+        &self,
+        state: &LiveScrollbackSpillState,
+        stable_row: wezterm_term::StableRowIndex,
+        max_retained_rows: usize,
+        cipher: &mux::guardian_output_journal::GuardianOutputCipher,
+    ) -> bool {
+        if self.manifest_publish_interval.is_zero()
+            || !state.authenticated_manifest
+            || state.transaction_quarantined
+            || state.clear_manifest_published
+            || max_retained_rows != state.max_retained_rows
+        {
+            return false;
+        }
+        let Some(desired) = state
+            .initial_stable_row
+            .and_then(|initial| stable_row.checked_sub(initial))
+            .and_then(|offset| u64::try_from(offset).ok())
+        else {
+            return false;
+        };
+        if state
+            .verified_ledger
+            .is_none_or(|live| live.next_sequence != desired || live.oldest_sequence.is_none())
+        {
+            return false;
+        }
+        self.row_nonce_stream.lock().is_ok_and(|stream| {
+            stream.as_ref().is_some_and(|stream| {
+                let segment = stream.segment();
+                segment.key_id() == cipher.key_id()
+                    && state.row_segments.last() == Some(segment)
+                    && stream.next_sequence() <= desired
+            })
+        })
+    }
+
+    /// Whether the manifest is due: the publication interval has passed, or
+    /// the tail is near the bounds one cumulative WAL may name.
+    fn publication_due(&self, published: &LiveScrollbackPublishedPrefix, live_next: u64) -> bool {
+        let tail_rows = live_next.saturating_sub(published.authority.next_sequence);
+        tail_rows >= LIVE_SCROLLBACK_CUMULATIVE_WAL_MAX_ROWS / 2
+            || published.tail_record_bytes >= LIVE_SCROLLBACK_CUMULATIVE_WAL_MAX_RECORD_BYTES / 2
+            || self
+                .last_publication
+                .lock()
+                .map_or(true, |at| at.elapsed() >= self.manifest_publish_interval)
+    }
+
+    /// One commit window (ft-yccm0.2.1.2): append the window's rows, which
+    /// continue the published nonce segment, under ONE durability sync, and
+    /// advance the live state past the manifest. No WAL, prune or manifest:
+    /// the rows are durable, recovery adopts them, and the publication that
+    /// is due at most once per interval names them in a cumulative WAL.
+    /// Retention is applied logically; the publication prunes physically.
+    /// The caller holds the mutation gate and filesystem lease, and every
+    /// record continues `previous_state`'s last nonce segment.
+    /// `published_manifest` is the manifest on disk, which the caller read
+    /// and verified under that gate and lease.
+    fn commit_window_rows(
+        &self,
+        previous_state: &LiveScrollbackSpillState,
+        published_manifest: &LiveScrollbackManifestV1,
+        stable_row: wezterm_term::StableRowIndex,
+        desired_seq: u64,
+        records: &[String],
+        max_retained_rows: usize,
+    ) -> bool {
+        let ledger_pane_id = self.active_ledger_pane_id();
+        let Some(predecessor) = previous_state.verified_ledger else {
+            return false;
+        };
+        let (Ok(rows), Some(newest)) = (
+            u64::try_from(records.len()),
+            wezterm_term::StableRowIndex::try_from(records.len())
+                .ok()
+                .and_then(|count| stable_row.checked_add(count)),
+        ) else {
+            return false;
+        };
+        let Some(revision) = previous_state.revision.checked_add(rows) else {
+            return false;
+        };
+        // The first window past a publication checks the retained WAL while
+        // the ledger still ends where that WAL's target does.
+        let published = match previous_state.published {
+            Some(published) => published,
+            None => {
+                let retained = (|| -> anyhow::Result<Option<[u8; 32]>> {
+                    let keyring =
+                        guardian_output_keys::GuardianOutputKeyring::historical_authority(
+                            &self.keyring,
+                        )?;
+                    self.verify_replaceable_active_append_wal_with(&keyring, || {
+                        Ok(Some(published_manifest.clone()))
+                    })
+                })();
+                let Ok(retained_append_wal) = retained else {
+                    return false;
+                };
+                LiveScrollbackPublishedPrefix {
+                    revision: previous_state.revision,
+                    predecessor_generation: previous_state.predecessor_generation,
+                    newest_stable_row_exclusive: previous_state.newest_stable_row_exclusive,
+                    authority: predecessor,
+                    tail_record_bytes: 0,
+                    retained_append_wal,
+                }
+            }
+        };
+        let mut window_record_bytes = 0_u64;
+        for record in records {
+            let Some(bytes) = u64::try_from(record.len())
+                .ok()
+                .and_then(|len| len.checked_add(1))
+                .and_then(|len| window_record_bytes.checked_add(len))
+            else {
+                return false;
+            };
+            window_record_bytes = bytes;
+        }
+        let Some(tail_record_bytes) = published.tail_record_bytes.checked_add(window_record_bytes)
+        else {
+            return false;
+        };
+        let appended = (|| -> anyhow::Result<VerifiedLedgerState> {
+            let mut store = self
+                .lock_store("commit window append")
+                .map_err(anyhow::Error::new)?;
+            anyhow::ensure!(
+                store.next_seq(ledger_pane_id)? == desired_seq,
+                "commit window sequence changed after serialized preflight"
+            );
+            // Project first: rows this window evicts were either already in
+            // the ledger or are this window's own.
+            let mut target = predecessor;
+            {
+                let mut eviction_reader =
+                    LedgerEvictionReader::new(&store, predecessor, desired_seq);
+                for (offset, record) in records.iter().enumerate() {
+                    let sequence = desired_seq
+                        .checked_add(u64::try_from(offset)?)
+                        .ok_or_else(|| anyhow::anyhow!("commit window sequence overflows"))?;
+                    (target, _) = target.project_append_with_reader(
+                        sequence,
+                        record,
+                        max_retained_rows,
+                        |evicted| match evicted.checked_sub(desired_seq) {
+                            Some(index) => records
+                                .get(usize::try_from(index)?)
+                                .cloned()
+                                .ok_or_else(|| anyhow::anyhow!("window eviction is out of range")),
+                            None => eviction_reader.read(evicted),
+                        },
+                    )?;
+                }
+            }
+            // Store batches: at most 4096 rows and the store's byte bound each.
+            let mut chunk_refs: Vec<Vec<&str>> = Vec::new();
+            let mut chunk_bytes = 0_u64;
+            for record in records {
+                let record_bytes = u64::try_from(record.len())?.saturating_add(1);
+                let full = chunk_refs.last().is_none_or(|chunk| {
+                    chunk.len() == LIVE_SCROLLBACK_APPEND_MAX_ROWS
+                        || chunk_bytes.saturating_add(record_bytes)
+                            > frankenterm_core::storage::mmap_store::PANE_APPEND_MAX_BYTES
+                });
+                if full {
+                    chunk_refs.push(Vec::new());
+                    chunk_bytes = 0;
+                }
+                if let Some(chunk) = chunk_refs.last_mut() {
+                    chunk.push(record.as_str());
+                }
+                chunk_bytes = chunk_bytes.saturating_add(record_bytes);
+            }
+            let chunk_slices: Vec<&[&str]> = chunk_refs.iter().map(Vec::as_slice).collect();
+            let appended_seq = store.append_line_chunks(ledger_pane_id, &chunk_slices)?;
+            #[cfg(test)]
+            count_test_bytes(
+                &LIVE_SCROLLBACK_RECORD_BYTES_APPENDED,
+                records.iter().map(String::len).sum(),
+            );
+            #[cfg(test)]
+            LIVE_SCROLLBACK_CONTENT_GROUPS.with(|count| count.set(count.get() + 1));
+            anyhow::ensure!(
+                appended_seq == desired_seq,
+                "commit window appended at the wrong sequence"
+            );
+            Ok(target)
+        })();
+        let Ok(target) = appended else {
+            if let Ok(mut state) = self.lock_state("commit window quarantine") {
+                // The window's rows may be partly durable; reopen adopts or
+                // cuts them. Never roll the live state back over them.
+                state.transaction_quarantined = true;
+            }
+            return false;
+        };
+        #[cfg(test)]
+        scrollback_crash_points::reach("window_rows_synced");
+        let Ok(mut state) = self.lock_state("commit window state") else {
+            return false;
+        };
+        let mut live = *previous_state;
+        live.revision = revision;
+        live.clear_manifest_published = false;
+        live.newest_stable_row_exclusive = Some(
+            live.newest_stable_row_exclusive
+                .map_or(newest, |current| current.max(newest)),
+        );
+        live.max_retained_rows = max_retained_rows;
+        live.verified_ledger = Some(target);
+        // The next manifest's predecessor is the one published now.
+        live.predecessor_generation =
+            Some(wezterm_term::config::ScrollbackSnapshotGeneration::new(
+                live.content_epoch,
+                published.revision,
+            ));
+        live.published = Some(LiveScrollbackPublishedPrefix {
+            tail_record_bytes,
+            ..published
+        });
+        *state = live;
+        drop(state);
+        log::debug!(
+            target: "mux::scrollback_durability",
+            "pane={} commit window rows={} bytes={} tail_rows={} one sync",
+            self.pane_id,
+            rows,
+            window_record_bytes,
+            target.next_sequence - published.authority.next_sequence,
+        );
+        if self.publication_due(&published, target.next_sequence) {
+            // The window is durable whatever publication does; a failed
+            // publication leaves the tail pending (or quarantines the sink).
+            let _ = self.publish_pending_tail("interval");
+        }
+        true
+    }
+
+    /// Publish the durable tail that commit windows appended past the
+    /// manifest (ft-yccm0.2.1.2): a cumulative v5 WAL names every tail row and
+    /// the retention the windows applied, then the ledger is pruned to the
+    /// live oldest row, then the manifest describes the live state: the
+    /// order a single-batch transaction uses, so a crash at any step recovers
+    /// through the existing WAL path. The caller holds the mutation gate and
+    /// filesystem lease. Returns whether the manifest now describes the live
+    /// state (trivially, with no tail).
+    fn publish_pending_tail(&self, reason: &'static str) -> bool {
+        let Ok(live) = self.lock_state("publish tail state").map(|state| *state) else {
+            return false;
+        };
+        let Some(published) = live.published else {
+            return true;
+        };
+        if live.transaction_quarantined {
+            return false;
+        }
+        let started = std::time::Instant::now();
+        let ledger_pane_id = self.active_ledger_pane_id();
+        let Some(target) = live.verified_ledger else {
+            return false;
+        };
+        let prepared = (|| -> anyhow::Result<LiveScrollbackAppendWalV1> {
+            let predecessor_manifest = Self::read_manifest(&self.manifest_path)?
+                .ok_or_else(|| anyhow::anyhow!("a tail's predecessor manifest is missing"))?;
+            let tail_rows = {
+                let store = self
+                    .lock_store("publish tail rows")
+                    .map_err(anyhow::Error::new)?;
+                let count = target.next_sequence - published.authority.next_sequence;
+                let rows = store.lines_range(
+                    ledger_pane_id,
+                    published.authority.next_sequence..target.next_sequence,
+                    usize::try_from(count)?,
+                    LIVE_SCROLLBACK_CUMULATIVE_WAL_MAX_RECORD_BYTES.saturating_add(count),
+                )?;
+                anyhow::ensure!(
+                    u64::try_from(rows.len())? == count,
+                    "the ledger is missing rows of its durable tail"
+                );
+                #[cfg(test)]
+                count_test_bytes(
+                    &LIVE_SCROLLBACK_RECORD_BYTES_READ_BACK,
+                    rows.iter().map(String::len).sum(),
+                );
+                rows
+            };
+            let cipher = {
+                let mut keyring = self
+                    .lock_keyring("publish tail authentication key")
+                    .map_err(anyhow::Error::new)?;
+                keyring
+                    .latest_active_cipher()
+                    .context("load guardian append-WAL authentication key")?
+            };
+            Self::build_cumulative_append_wal(
+                self.durable_pane_id,
+                &predecessor_manifest,
+                &published,
+                &live,
+                &tail_rows,
+                &cipher,
+            )
+        })();
+        let wal = match prepared {
+            Ok(wal) => wal,
+            Err(error) => {
+                log::warn!("scrollback tail publication ({reason}) not prepared: {error:#}");
+                return false;
+            }
+        };
+        if let Err(error) = self.publish_validated_append_wal(
+            &wal,
+            RetainedAppendWalCheck::VerifiedBeforeAppend(published.retained_append_wal),
+        ) {
+            if error.outcome_indeterminate() {
+                if let Ok(mut state) = self.lock_state("publish tail WAL quarantine") {
+                    state.transaction_quarantined = true;
+                }
+            }
+            log::warn!("scrollback tail publication ({reason}) refused its WAL: {error}");
+            return false;
+        }
+        let pruned = (|| -> anyhow::Result<()> {
+            let mut store = self
+                .lock_store("publish tail retention")
+                .map_err(anyhow::Error::new)?;
+            if let Some(oldest) = target.oldest_sequence {
+                // The segment holding the oldest row stays readable whole.
+                let keep_from = store_segment_keep_from(&store, ledger_pane_id, oldest)?;
+                store.prune_before_keeping(ledger_pane_id, oldest, keep_from)?;
+                #[cfg(test)]
+                scrollback_crash_points::reach("retention_pruned");
+                store.compact_pane_if_stale_keeping(
+                    ledger_pane_id,
+                    LIVE_SCROLLBACK_COMPACT_MIN_STALE_BYTES,
+                    keep_from,
+                )?;
+                #[cfg(test)]
+                scrollback_crash_points::reach("compacted");
+            }
+            Self::verify_append_wal_target_store(&wal, &store)?;
+            anyhow::ensure!(
+                target.matches_store_facts(&store)?,
+                "a published tail disagrees with synchronized store facts"
+            );
+            Ok(())
+        })();
+        if pruned.is_err() {
+            if let Ok(mut state) = self.lock_state("publish tail content quarantine") {
+                // The active WAL authorizes recovery to roll forward.
+                state.transaction_quarantined = true;
+            }
+            return false;
+        }
+        match self.lock_state("publish tail published") {
+            Ok(mut state) => state.published = None,
+            Err(_) => return false,
+        }
+        if let Err(error) = self.persist_manifest("complete") {
+            if let Ok(mut state) = self.lock_state("publish tail manifest quarantine") {
+                state.transaction_quarantined = true;
+            }
+            log::warn!("scrollback tail publication ({reason}) manifest failed: {error}");
+            return false;
+        }
+        #[cfg(test)]
+        scrollback_crash_points::reach("committed");
+        if let Err(error) = self.advance_authenticated_append_wal_supersession() {
+            log::warn!(
+                "deferred append WAL supersession acknowledgement after a tail publication: {error:#}"
+            );
+        }
+        if let Ok(mut at) = self.last_publication.lock() {
+            *at = std::time::Instant::now();
+        }
+        log::debug!(
+            target: "mux::scrollback_durability",
+            "pane={} published tail ({reason}) rows={} bytes={} in {:?}",
+            self.pane_id,
+            wal.appended_record_count.unwrap_or(0),
+            wal.encrypted_record_bytes,
+            started.elapsed(),
+        );
+        true
+    }
+
+    /// Store `lines` and count the durability syncs that took. `gap` is the
+    /// (rows, bytes) a single gap-marker row stands for (ft-yccm0.2.1.6).
+    fn store_scrollback_rows(
+        &self,
+        stable_row: wezterm_term::StableRowIndex,
+        lines: &[wezterm_term::Line],
+        max_retained_rows: usize,
+        gap: Option<(u64, u64)>,
+    ) -> usize {
+        let mut committed_rows = 1;
+        let syncs = frankenterm_core::storage::mmap_store::thread_durability_sync_count();
+        let committed = self.store_scrollback_lines_transaction(
+            stable_row,
+            lines,
+            max_retained_rows,
+            gap,
+            &mut committed_rows,
+        );
+        self.durability_syncs.fetch_add(
+            frankenterm_core::storage::mmap_store::thread_durability_sync_count() - syncs,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if committed { committed_rows } else { 0 }
+    }
+
     fn store_scrollback_lines_transaction(
         &self,
         stable_row: wezterm_term::StableRowIndex,
         lines: &[wezterm_term::Line],
         max_retained_rows: usize,
+        gap: Option<(u64, u64)>,
         committed_rows: &mut usize,
     ) -> bool {
         let Some(line) = lines.first() else {
             return false;
         };
-        if lines.len() > LIVE_SCROLLBACK_APPEND_MAX_ROWS {
+        if lines.len() > LIVE_SCROLLBACK_WINDOW_MAX_ROWS || (gap.is_some() && lines.len() != 1) {
             return false;
         }
         if max_retained_rows == 0 {
@@ -7707,14 +14506,47 @@ impl LiveScrollbackSpillSink {
                 Ok(false) | Err(_) => return false,
             },
         }
+        // ft-yccm0.2.1.5 AC2: the transaction reads the published manifest
+        // once and verifies, advances and continues from that copy. From
+        // here it holds the mutation gate and the filesystem lease, so no
+        // other writer replaces the manifest; after this transaction itself
+        // publishes (`publish_pending_tail` below) it reads it again.
+        let Ok(published_manifest) = Self::read_manifest(&self.manifest_path) else {
+            return false;
+        };
+        // One acquisition of the process-wide keyring mutex per window: it
+        // authenticates that manifest and resolves the active cipher. The
+        // owned cipher remains valid across rotation; encoding this batch
+        // must not exclude other panes from the shared keyring.
+        let cipher = {
+            let Ok(mut keyring) =
+                self.lock_keyring("store_scrollback_line manifest authentication and active key")
+            else {
+                return false;
+            };
+            if let Some(manifest) = published_manifest.as_ref()
+                && !matches!(Self::authenticate_manifest(manifest, &keyring), Ok(true))
+            {
+                return false;
+            }
+            let Ok(cipher) = keyring.latest_active_cipher() else {
+                return false;
+            };
+            cipher
+        };
         if self
-            .verify_current_published_state_before_mutation(current_state, ledger_pane_id, true)
+            .verify_authenticated_published_state_before_mutation(
+                published_manifest.as_ref(),
+                &current_state,
+                ledger_pane_id,
+                true,
+            )
             .is_err()
         {
             return false;
         }
         if self
-            .advance_authenticated_append_wal_supersession()
+            .advance_authenticated_append_wal_supersession_with(|| Ok(published_manifest.clone()))
             .is_err()
         {
             return false;
@@ -7775,6 +14607,8 @@ impl LiveScrollbackSpillSink {
                             retry_state.content_epoch,
                             stable_row,
                             retry_sequence,
+                            &retry_state.row_segments,
+                            Some((&store, ledger_pane_id)),
                         );
                     }
                     Ok(None)
@@ -7790,6 +14624,29 @@ impl LiveScrollbackSpillSink {
             if retry_sequence > next_sequence {
                 return false;
             }
+        }
+
+        // ft-yccm0.2.1.2: a commit window continues a durable tail only when
+        // it can append without a WAL: publication cadence on, the same
+        // retention, and rows continuing the published nonce segment. Any
+        // other transaction is a single-batch one, which starts from a
+        // published manifest, so the tail is published first. A gap marker
+        // is always a single batch, so the WAL and manifest that publish it
+        // also publish its totals (ft-yccm0.2.1.6).
+        let window_state = match self.lock_state("store_scrollback_line window state") {
+            Ok(state) => *state,
+            Err(_) => return false,
+        };
+        let publishes_tail = window_state.published.is_some()
+            && (gap.is_some()
+                || !self.window_continues_tail(
+                    &window_state,
+                    stable_row,
+                    max_retained_rows,
+                    &cipher,
+                ));
+        if publishes_tail && !self.publish_pending_tail("single-batch transaction") {
+            return false;
         }
 
         let (previous_state, mut proposed_state, manifest_prepare_required, desired_seq) = {
@@ -7825,6 +14682,13 @@ impl LiveScrollbackSpillSink {
                     }),
             );
             proposed_state.max_retained_rows = max_retained_rows;
+            if let Some((rows, bytes)) = gap {
+                // Unknown totals stay unknown; an overflowing total becomes
+                // unknown rather than wrapping.
+                proposed_state.durability_gaps = proposed_state
+                    .durability_gaps
+                    .and_then(|totals| totals.with_gap(rows, bytes));
+            }
             (
                 previous_state,
                 proposed_state,
@@ -7834,26 +14698,74 @@ impl LiveScrollbackSpillSink {
         };
         // Establish pristine or historical authority through the existing
         // single-row path. Subsequent v4 batches use one generation and WAL.
-        let batch_rows = if !manifest_prepare_required
-            && lines.len() > 1
-            && matches!(Self::read_manifest(&self.manifest_path), Ok(Some(manifest)) if manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4)
-        {
-            lines.len().min(max_retained_rows)
+        let predecessor_manifest = if manifest_prepare_required {
+            None
+        } else if publishes_tail {
+            // This transaction just published the tail: read what it wrote.
+            match Self::read_manifest(&self.manifest_path) {
+                Ok(Some(manifest)) => Some(manifest),
+                _ => return false,
+            }
+        } else {
+            match published_manifest {
+                Some(manifest) => Some(manifest),
+                None => return false,
+            }
+        };
+        let v4_predecessor = predecessor_manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.schema == LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4);
+        // A commit window appends every row under one sync (ft-yccm0.2.1.2);
+        // a single-batch transaction takes at most one store batch.
+        let commit_window = gap.is_none()
+            && v4_predecessor
+            && self.window_continues_tail(&previous_state, stable_row, max_retained_rows, &cipher);
+        let batch_rows = if commit_window {
+            lines.len()
+        } else if v4_predecessor && lines.len() > 1 {
+            lines
+                .len()
+                .min(max_retained_rows)
+                .min(LIVE_SCROLLBACK_APPEND_MAX_ROWS)
         } else {
             1
         };
-        let records = {
-            let Ok(mut keyring) = self.lock_keyring("store_scrollback_line active key") else {
+        let max_batch_record_bytes = if commit_window {
+            LIVE_SCROLLBACK_WINDOW_MAX_RECORD_BYTES
+        } else {
+            LIVE_SCROLLBACK_APPEND_MAX_RECORD_BYTES
+        };
+        // The batch's records are encoded through this thread's arena and
+        // stay in it until the transaction ends (ft-yccm0.2.1.4 AC1).
+        let mut encode = ScrollbackRowEncodeLease::take();
+        let row_segment = {
+            // ft-yccm0.2.1.4: rows after a v4 manifest are compact, sealed
+            // under the live nonce stream. A full segment table leaves them
+            // self-describing v3 rows.
+            let Ok(mut row_nonce_stream) = self.row_nonce_stream.lock() else {
                 return false;
             };
-            let Ok(cipher) = keyring.latest_active_cipher() else {
-                return false;
+            let row_segment = if v4_predecessor {
+                match Self::row_nonce_stream_for_batch(
+                    &mut row_nonce_stream,
+                    &cipher,
+                    &previous_state.row_segments,
+                    desired_seq,
+                ) {
+                    Ok(segment) => segment,
+                    Err(error) => {
+                        log::warn!("scrollback batch refused a row nonce segment: {error:#}");
+                        return false;
+                    }
+                }
+            } else {
+                None
             };
-            // The owned cipher remains valid across rotation; encoding this
-            // batch must not exclude other panes from the shared keyring.
-            drop(keyring);
-            let mut records = Vec::with_capacity(batch_rows);
+            let arena = &mut encode.arena;
             let mut bytes = 0usize;
+            // ft-yccm0.2.1.4 option A: compact rows go into the open segment,
+            // sealed by one AEAD operation when full and at the batch's end.
+            let mut segment_first = None;
             for (offset, line) in lines.iter().take(batch_rows).enumerate() {
                 let Some(row) = wezterm_term::StableRowIndex::try_from(offset)
                     .ok()
@@ -7870,6 +14782,64 @@ impl LiveScrollbackSpillSink {
                 let Ok(row) = i64::try_from(row) else {
                     return false;
                 };
+                if let Some(stream) = row_nonce_stream.as_mut().filter(|_| row_segment.is_some()) {
+                    let Some(payload_bytes) = arena.prepare_payload(line) else {
+                        return false;
+                    };
+                    let starts_segment =
+                        segment_first.is_none() || arena.segment_is_full_for(payload_bytes);
+                    // Check the batch budget before the row joins a segment:
+                    // a row left for the next batch must not consume its
+                    // sequence. A row that starts a segment also reserves
+                    // room for the tag its segment's tail will carry.
+                    let Some(next_bytes) =
+                        mux::guardian_output_journal::scrollback_segment_record_bytes(
+                            payload_bytes,
+                            false,
+                        )
+                        .and_then(|record_bytes| bytes.checked_add(record_bytes))
+                        .and_then(|bytes| {
+                            if starts_segment {
+                                bytes.checked_add(LIVE_SCROLLBACK_SEGMENT_TAG_RECORD_BYTES)
+                            } else {
+                                Some(bytes)
+                            }
+                        })
+                    else {
+                        arena.discard_payload();
+                        return false;
+                    };
+                    if (!arena.batch.is_empty() || segment_first.is_some())
+                        && next_bytes > max_batch_record_bytes
+                    {
+                        arena.discard_payload();
+                        break;
+                    }
+                    if starts_segment {
+                        if let Some(first) = segment_first.take() {
+                            if !arena.seal_segment(&cipher, stream, first) {
+                                return false;
+                            }
+                        }
+                        let Ok(location) =
+                            mux::guardian_output_journal::GuardianScrollbackRowLocation::new(
+                                self.durable_pane_id,
+                                proposed_state.content_epoch,
+                                row,
+                                sequence,
+                            )
+                        else {
+                            arena.discard_payload();
+                            return false;
+                        };
+                        segment_first = Some(location);
+                    }
+                    if !arena.push_segment_payload() {
+                        return false;
+                    }
+                    bytes = next_bytes;
+                    continue;
+                }
                 let Ok(identity) = mux::guardian_output_journal::GuardianScrollbackRowIdentity::new(
                     self.durable_pane_id,
                     proposed_state.content_epoch,
@@ -7886,14 +14856,51 @@ impl LiveScrollbackSpillSink {
                 let Some(next_bytes) = bytes.checked_add(record.len()) else {
                     return false;
                 };
-                if !records.is_empty() && next_bytes > LIVE_SCROLLBACK_APPEND_MAX_RECORD_BYTES {
+                if !arena.batch.is_empty() && next_bytes > max_batch_record_bytes {
                     break;
                 }
                 bytes = next_bytes;
-                records.push(record);
+                arena.batch.push(record);
             }
-            records
+            if let Some(first) = segment_first {
+                let Some(stream) = row_nonce_stream.as_mut() else {
+                    return false;
+                };
+                if !arena.seal_segment(&cipher, stream, first) {
+                    return false;
+                }
+            }
+            row_segment
         };
+        let records = &encode.arena.batch;
+        if commit_window {
+            // The window continued the published segment (checked above,
+            // under the mutation gate that still excludes every other writer).
+            if row_segment.is_none() || previous_state.row_segments.last() != row_segment {
+                return false;
+            }
+            let Some(published_manifest) = predecessor_manifest.as_ref() else {
+                return false;
+            };
+            *committed_rows = records.len();
+            return self.commit_window_rows(
+                &previous_state,
+                published_manifest,
+                stable_row,
+                desired_seq,
+                records,
+                max_retained_rows,
+            );
+        }
+        if let Some(segment) = row_segment {
+            // A segment the batch starts joins the table; one it continues
+            // is already the table's last.
+            if proposed_state.row_segments.last() != Some(segment)
+                && proposed_state.row_segments.push(segment).is_err()
+            {
+                return false;
+            }
+        }
         *committed_rows = records.len();
         let Some(newest) = wezterm_term::StableRowIndex::try_from(*committed_rows)
             .ok()
@@ -7902,7 +14909,9 @@ impl LiveScrollbackSpillSink {
             return false;
         };
         proposed_state.newest_stable_row_exclusive = Some(newest);
-        let (append_wal, target_authority) = if manifest_prepare_required {
+        // Rows reach the ledger before the record that authorizes them: a
+        // first row's prepared manifest, or a later batch's digest-only WAL.
+        let (prepared_wal, target_authority) = if manifest_prepare_required {
             let target = {
                 let Ok(store) = self.lock_store("store_scrollback_line prepare first authority")
                 else {
@@ -7923,47 +14932,55 @@ impl LiveScrollbackSpillSink {
             };
             (None, target)
         } else {
-            let predecessor_manifest = match Self::read_manifest(&self.manifest_path) {
-                Ok(Some(manifest)) => manifest,
-                _ => return false,
-            };
-            let (wal, target) = {
-                let Ok(store) = self.lock_store("store_scrollback_line prepare append WAL") else {
-                    return false;
-                };
-                match self.prepare_authenticated_append_wal(
-                    &predecessor_manifest,
-                    previous_state,
-                    proposed_state,
-                    ledger_pane_id,
-                    stable_row,
-                    desired_seq,
-                    max_retained_rows,
-                    &records,
-                    &store,
-                ) {
-                    Ok(prepared) => prepared,
-                    Err(_) => return false,
-                }
-            };
-            if let Err(error) = self.persist_prepared_append_wal(&wal) {
-                if error.outcome_indeterminate() {
-                    if let Ok(mut state) =
-                        self.lock_state("store_scrollback_line append WAL quarantine")
-                    {
-                        state.transaction_quarantined = true;
-                    }
-                }
+            let Some(predecessor_manifest) = predecessor_manifest.as_ref() else {
                 return false;
+            };
+            let Ok(store) = self.lock_store("store_scrollback_line prepare append WAL") else {
+                return false;
+            };
+            match self.prepare_authenticated_append_wal(
+                predecessor_manifest,
+                &previous_state,
+                &proposed_state,
+                ledger_pane_id,
+                stable_row,
+                desired_seq,
+                max_retained_rows,
+                records,
+                row_segment,
+                &store,
+                AppendWalFormat::DigestOnly,
+            ) {
+                Ok((wal, target)) => (Some(wal), target),
+                Err(_) => return false,
             }
-            (Some(wal.wal), target)
         };
-        let Ok(mut state) = self.lock_state("store_scrollback_line publish proposed state") else {
-            return false;
+        // The retained WAL is checked against the ledger before this batch
+        // lands in it; publication then requires that same retained WAL.
+        let retained_wal_checksum = if prepared_wal.is_some() {
+            let checked = (|| -> anyhow::Result<Option<[u8; 32]>> {
+                let keyring = guardian_output_keys::GuardianOutputKeyring::historical_authority(
+                    &self.keyring,
+                )?;
+                // Nothing has published since the predecessor was read.
+                self.verify_replaceable_active_append_wal_with(&keyring, || {
+                    Ok(predecessor_manifest.clone())
+                })
+            })();
+            let Ok(checksum) = checked else {
+                return false;
+            };
+            checksum
+        } else {
+            None
         };
-        *state = proposed_state;
-        drop(state);
         if manifest_prepare_required {
+            let Ok(mut state) = self.lock_state("store_scrollback_line publish proposed state")
+            else {
+                return false;
+            };
+            *state = proposed_state;
+            drop(state);
             if let Err(error) = self.persist_manifest("prepared") {
                 let Ok(mut state) = self.lock_state("store_scrollback_line prepare failure") else {
                     return false;
@@ -7977,11 +14994,7 @@ impl LiveScrollbackSpillSink {
             }
         }
 
-        #[cfg(test)]
-        if records.len() > 1 && self.fail_batch_at(1) {
-            return false;
-        }
-        let content_result = (|| -> anyhow::Result<()> {
+        let append_result = (|| -> anyhow::Result<()> {
             let mut store = self
                 .lock_store("store_scrollback_line append")
                 .map_err(anyhow::Error::new)?;
@@ -7992,12 +15005,71 @@ impl LiveScrollbackSpillSink {
             let record_refs: Vec<_> = records.iter().map(String::as_str).collect();
             let appended_seq = store.append_lines(ledger_pane_id, &record_refs)?;
             #[cfg(test)]
+            count_test_bytes(
+                &LIVE_SCROLLBACK_RECORD_BYTES_APPENDED,
+                records.iter().map(String::len).sum(),
+            );
+            #[cfg(test)]
             LIVE_SCROLLBACK_CONTENT_GROUPS.with(|count| count.set(count.get() + 1));
             anyhow::ensure!(
                 appended_seq == desired_seq,
                 "scrollback append returned the wrong sequence"
             );
-
+            Ok(())
+        })();
+        if append_result.is_err() {
+            if let Ok(mut state) = self.lock_state("store_scrollback_line append quarantine") {
+                // A synchronized prepared manifest may already authorize
+                // recovery, and a failed sync leaves the ledger's tail
+                // uncertain until reopen settles it. Never roll back here.
+                state.transaction_quarantined = true;
+            }
+            return false;
+        }
+        #[cfg(test)]
+        scrollback_crash_points::reach("rows_appended");
+        #[cfg(test)]
+        if records.len() > 1 && self.fail_batch_at(1) {
+            return false;
+        }
+        let append_wal = if let Some(wal) = prepared_wal {
+            if let Err(error) = self.persist_prepared_append_wal(
+                &wal,
+                RetainedAppendWalCheck::VerifiedBeforeAppend(retained_wal_checksum),
+            ) {
+                // No WAL names the batch, so its rows were never
+                // acknowledged: cut them and the ledger is back at its
+                // manifest. A WAL that may be on disk keeps them for
+                // recovery to roll forward instead.
+                let cut = !error.outcome_indeterminate()
+                    && !self.append_wal_stage_may_name(&wal.wal)
+                    && self
+                        .lock_store("store_scrollback_line cut unauthorized batch")
+                        .is_ok_and(|mut store| {
+                            store.truncate_after(ledger_pane_id, desired_seq).is_ok()
+                        });
+                if !cut {
+                    if let Ok(mut state) =
+                        self.lock_state("store_scrollback_line append WAL quarantine")
+                    {
+                        state.transaction_quarantined = true;
+                    }
+                }
+                return false;
+            }
+            let Ok(mut state) = self.lock_state("store_scrollback_line publish proposed state")
+            else {
+                return false;
+            };
+            *state = proposed_state;
+            Some(wal.wal)
+        } else {
+            None
+        };
+        let content_result = (|| -> anyhow::Result<()> {
+            let mut store = self
+                .lock_store("store_scrollback_line retention")
+                .map_err(anyhow::Error::new)?;
             let retained = store.line_count(ledger_pane_id);
             if retained > max_retained_rows {
                 let oldest_seq = store.oldest_seq(ledger_pane_id).ok_or_else(|| {
@@ -8007,11 +15079,18 @@ impl LiveScrollbackSpillSink {
                 let prune_before_seq = oldest_seq
                     .checked_add(drop_count)
                     .ok_or_else(|| anyhow::anyhow!("scrollback retention cut overflows"))?;
-                store.prune_before(ledger_pane_id, prune_before_seq)?;
-                store.compact_pane_if_stale(
+                // The segment holding the oldest row stays readable whole.
+                let keep_from = store_segment_keep_from(&store, ledger_pane_id, prune_before_seq)?;
+                store.prune_before_keeping(ledger_pane_id, prune_before_seq, keep_from)?;
+                #[cfg(test)]
+                scrollback_crash_points::reach("retention_pruned");
+                store.compact_pane_if_stale_keeping(
                     ledger_pane_id,
                     LIVE_SCROLLBACK_COMPACT_MIN_STALE_BYTES,
+                    keep_from,
                 )?;
+                #[cfg(test)]
+                scrollback_crash_points::reach("compacted");
             }
             if let Some(wal) = append_wal.as_ref() {
                 Self::verify_append_wal_target_store(wal, &store)?;
@@ -8041,10 +15120,15 @@ impl LiveScrollbackSpillSink {
         };
         state.max_retained_rows = max_retained_rows;
         state.verified_ledger = Some(target_authority);
+        state
+            .row_segments
+            .retain_from(target_authority.oldest_sequence);
         drop(state);
 
         match self.persist_manifest("complete") {
             Ok(()) => {
+                #[cfg(test)]
+                scrollback_crash_points::reach("committed");
                 #[cfg(test)]
                 if records.len() > 1 && self.fail_batch_at(3) {
                     return false;
@@ -8086,16 +15170,43 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         lines: &[wezterm_term::Line],
         max_retained_rows: usize,
     ) -> usize {
-        let mut committed_rows = 1;
-        if self.store_scrollback_lines_transaction(
+        self.store_scrollback_rows(stable_row, lines, max_retained_rows, None)
+    }
+
+    /// The marker's single-batch transaction publishes the lineage's gap
+    /// totals with it (ft-yccm0.2.1.6).
+    fn store_scrollback_gap_marker(
+        &self,
+        stable_row: wezterm_term::StableRowIndex,
+        marker: &wezterm_term::Line,
+        max_retained_rows: usize,
+        gap_rows: u64,
+        gap_bytes: u64,
+    ) -> bool {
+        self.store_scrollback_rows(
             stable_row,
-            lines,
+            std::slice::from_ref(marker),
             max_retained_rows,
-            &mut committed_rows,
-        ) {
-            committed_rows
+            Some((gap_rows, gap_bytes)),
+        ) == 1
+    }
+
+    /// Publish a durable tail now (ft-yccm0.2.1.2). Its rows are already
+    /// durable; this makes the manifest describe them, as pane close and an
+    /// explicit flush require.
+    fn flush_scrollback(&self) -> Result<(), wezterm_term::config::ScrollbackSpillError> {
+        let _mutation_gate = self.lock_mutation_gate("flush_scrollback")?;
+        let _filesystem_mutation_lease = self.lock_filesystem_mutation("flush_scrollback")?;
+        let syncs = frankenterm_core::storage::mmap_store::thread_durability_sync_count();
+        let published = self.publish_pending_tail("flush");
+        self.durability_syncs.fetch_add(
+            frankenterm_core::storage::mmap_store::thread_durability_sync_count() - syncs,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if published {
+            Ok(())
         } else {
-            0
+            Err(wezterm_term::config::ScrollbackSpillError::StorageUnavailable)
         }
     }
 
@@ -8111,7 +15222,7 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             return None;
         }
         let ledger_pane_id = self.active_ledger_pane_id();
-        self.verify_current_published_state_before_mutation(state, ledger_pane_id, false)
+        self.verify_current_published_state_before_mutation(&state, ledger_pane_id, false)
             .ok()?;
         let initial = state.initial_stable_row;
         let content_epoch = state.content_epoch;
@@ -8120,16 +15231,31 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             return None;
         }
         let seq = u64::try_from(stable_row.checked_sub(initial)?).ok()?;
-        let record = self
-            .lock_store("load_scrollback_line read")
-            .ok()?
-            .line_at(ledger_pane_id, seq)
-            .ok()
-            .flatten()?;
+        // A row retention evicted reads as pruned, whether it waits for a
+        // publication (ft-yccm0.2.1.2) or stays as the slack of the segment
+        // holding the oldest row (ft-yccm0.2.1.4).
+        if state
+            .verified_ledger
+            .and_then(|live| live.oldest_sequence)
+            .is_some_and(|oldest| seq < oldest)
+        {
+            return None;
+        }
+        let store = self.lock_store("load_scrollback_line read").ok()?;
+        let record = store.line_at(ledger_pane_id, seq).ok().flatten()?;
+        let (physical_oldest, next) = store_segment_bounds(&store, ledger_pane_id).ok()?;
         let keyring = self.lock_keyring("load_scrollback_line decrypt").ok()?;
-        let mut cipher_cache = GuardianScrollbackCipherCache::new(&keyring);
-        decode_persisted_scrollback_line_with_limit(
+        let mut cipher_cache = GuardianScrollbackCipherCache::new(&keyring, &state.row_segments);
+        let mut fetch =
+            |range: std::ops::Range<u64>| store_segment_records(&store, ledger_pane_id, range);
+        let origin = (ledger_pane_id, content_epoch, initial);
+        let mut segments = self.take_cold_segment(origin, &mut fetch);
+        let (line, _decoded_bytes, _fidelity) = decode_stored_scrollback_row(
             &record,
+            &mut segments,
+            &mut fetch,
+            physical_oldest,
+            next,
             &mut cipher_cache,
             self.durable_pane_id,
             content_epoch,
@@ -8137,8 +15263,9 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             seq,
             LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
         )
-        .ok()
-        .map(|(line, _decoded_bytes, _fidelity)| line)
+        .ok()?;
+        self.keep_cold_segment(origin, segments);
+        Some(line)
     }
 
     fn load_scrollback_lines(
@@ -8156,21 +15283,26 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
 
     fn oldest_scrollback_row(&self) -> Option<wezterm_term::StableRowIndex> {
         let _mutation_gate = self.lock_mutation_gate("oldest_scrollback_row").ok()?;
-        let state = self.lock_state("oldest_scrollback_row initial row").ok()?;
+        let state = *self.lock_state("oldest_scrollback_row initial row").ok()?;
         if state.clear_manifest_published || state.transaction_quarantined {
             return None;
         }
         let initial = state.initial_stable_row?;
-        drop(state);
         let ledger_pane_id = self.active_ledger_pane_id();
-        self.lock_store("oldest_scrollback_row oldest seq")
-            .ok()?
-            .oldest_seq(ledger_pane_id)
-            .and_then(|seq| {
-                wezterm_term::StableRowIndex::try_from(seq)
-                    .ok()
-                    .and_then(|seq| initial.checked_add(seq))
-            })
+        // With an unpublished tail, retention has logically evicted rows the
+        // ledger still holds until publication prunes them (ft-yccm0.2.1.2).
+        let oldest = match state.published.and(state.verified_ledger) {
+            Some(live) => live.oldest_sequence,
+            None => self
+                .lock_store("oldest_scrollback_row oldest seq")
+                .ok()?
+                .oldest_seq(ledger_pane_id),
+        };
+        oldest.and_then(|seq| {
+            wezterm_term::StableRowIndex::try_from(seq)
+                .ok()
+                .and_then(|seq| initial.checked_add(seq))
+        })
     }
 
     fn retained_scrollback_rows(&self) -> usize {
@@ -8183,7 +15315,11 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         if state.clear_manifest_published || state.transaction_quarantined {
             return 0;
         }
+        let live = state.published.and(state.verified_ledger);
         drop(state);
+        if let Some(live) = live {
+            return usize::try_from(live.record_count).unwrap_or(usize::MAX);
+        }
         let ledger_pane_id = self.active_ledger_pane_id();
         self.lock_store("retained_scrollback_rows")
             .map(|store| store.line_count(ledger_pane_id))
@@ -8200,10 +15336,22 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         if state.clear_manifest_published || state.transaction_quarantined {
             return 0;
         }
+        let live = state.published.and(state.verified_ledger);
         drop(state);
         let ledger_pane_id = self.active_ledger_pane_id();
         self.lock_store("retained_scrollback_bytes")
-            .map(|store| store.retained_bytes(ledger_pane_id))
+            .map(|store| {
+                let physical = store.retained_bytes(ledger_pane_id);
+                // Rows retention evicted logically still occupy the ledger
+                // until publication prunes them; they are not retained.
+                live.map_or(physical, |live| {
+                    physical.saturating_sub(
+                        store
+                            .retained_record_bytes(ledger_pane_id)
+                            .saturating_sub(live.retained_record_bytes),
+                    )
+                })
+            })
             .unwrap_or(0)
             .try_into()
             .unwrap_or(usize::MAX)
@@ -8221,7 +15369,16 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
 
         let _mutation_gate = self.lock_mutation_gate("snapshot_scrollback")?;
         let _filesystem_mutation_lease = self.lock_filesystem_mutation("snapshot_scrollback")?;
-        let state = *self.lock_state("snapshot_scrollback state")?;
+        let mut state = *self.lock_state("snapshot_scrollback state")?;
+        if state.published.is_some() && !state.transaction_quarantined {
+            // A snapshot reads the ledger exactly as its manifest describes
+            // it, so a durable tail is published first, as a flush does
+            // (ft-yccm0.2.1.2).
+            if !self.publish_pending_tail("snapshot") {
+                return Err(ScrollbackSpillError::StorageUnavailable);
+            }
+            state = *self.lock_state("snapshot_scrollback published state")?;
+        }
 
         if state.transaction_quarantined {
             return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
@@ -8233,7 +15390,7 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             return Err(ScrollbackSpillError::SnapshotRangeMismatch);
         }
         let ledger_pane_id = self.active_ledger_pane_id();
-        let manifest_before = self.authenticated_manifest_for_snapshot(state, ledger_pane_id)?;
+        let manifest_before = self.authenticated_manifest_for_snapshot(&state, ledger_pane_id)?;
         if state.clear_manifest_published {
             if let Some(manifest) = manifest_before.as_ref() {
                 let store = self.lock_store("snapshot_scrollback cleared digest")?;
@@ -8351,7 +15508,10 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             ScrollbackSnapshotFidelity::LegacyRedacted
         };
         let keyring = self.lock_keyring("snapshot_scrollback decrypt")?;
-        let mut cipher_cache = GuardianScrollbackCipherCache::new(&keyring);
+        let mut cipher_cache = GuardianScrollbackCipherCache::new(&keyring, &state.row_segments);
+        let (physical_oldest, segment_next) = store_segment_bounds(&store, ledger_pane_id)
+            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+        let mut segments = LiveScrollbackSegmentReader::default();
         if let Some(oldest_seq) = oldest_seq {
             for offset in 0..retained_rows_u64 {
                 let seq = oldest_seq
@@ -8370,22 +15530,45 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
                             observed: u64::try_from(decoded_bytes).unwrap_or(u64::MAX),
                             maximum: u64::try_from(limits.max_decoded_bytes).unwrap_or(u64::MAX),
                         })?;
-                if mux::guardian_output_journal::GuardianEncryptedScrollbackRow::has_encrypted_prefix(
+                let plaintext_bytes = if mux::guardian_output_journal::is_compact_scrollback_row(
                     &record,
                 ) {
-                    let parsed = mux::guardian_output_journal::GuardianEncryptedScrollbackRow::parse(
-                        &record,
+                    Some(
+                        mux::guardian_output_journal::compact_scrollback_row_plaintext_bytes(
+                            &record,
+                        )
+                        .map_err(|_| ScrollbackSpillError::StorageUnavailable)?,
                     )
-                    .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
-                    let line_bytes = usize::try_from(parsed.plaintext_bytes())
+                } else if mux::guardian_output_journal::is_scrollback_segment_record(&record) {
+                    Some(
+                        mux::guardian_output_journal::scrollback_segment_record_plaintext_bytes(
+                            &record,
+                            mux::guardian_output_journal::is_scrollback_segment_tail(&record),
+                        )
+                        .map_err(|_| ScrollbackSpillError::StorageUnavailable)?,
+                    )
+                } else if mux::guardian_output_journal::GuardianEncryptedScrollbackRow::has_encrypted_prefix(
+                    &record,
+                ) {
+                    Some(
+                        mux::guardian_output_journal::GuardianEncryptedScrollbackRow::parse(
+                            &record,
+                        )
+                        .map_err(|_| ScrollbackSpillError::StorageUnavailable)?
+                        .plaintext_bytes(),
+                    )
+                } else {
+                    None
+                };
+                if let Some(plaintext_bytes) = plaintext_bytes {
+                    let line_bytes = usize::try_from(plaintext_bytes)
                         .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
                     if line_bytes > remaining_decoded_bytes {
                         return Err(ScrollbackSpillError::ResourceLimit {
                             resource: "decoded_bytes",
                             observed: u64::try_from(decoded_bytes.saturating_add(line_bytes))
                                 .unwrap_or(u64::MAX),
-                            maximum: u64::try_from(limits.max_decoded_bytes)
-                                .unwrap_or(u64::MAX),
+                            maximum: u64::try_from(limits.max_decoded_bytes).unwrap_or(u64::MAX),
                         });
                     }
                 }
@@ -8394,33 +15577,33 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
                 let stable_row = initial_stable_row
                     .checked_add(stable_offset)
                     .ok_or(ScrollbackSpillError::ArithmeticOverflow("stable_row_range"))?;
-                let (line, line_decoded_bytes, row_fidelity) =
-                    decode_persisted_scrollback_line_with_limit(
-                        &record,
-                        &mut cipher_cache,
-                        self.durable_pane_id,
-                        state.content_epoch,
-                        stable_row,
-                        seq,
-                        remaining_decoded_bytes,
-                    )
-                    .map_err(|error| {
-                        if let Some(budget) =
-                            error.downcast_ref::<ScrollbackDecodedBudgetExceeded>()
-                        {
-                            ScrollbackSpillError::ResourceLimit {
-                                resource: "decoded_bytes",
-                                observed: u64::try_from(
-                                    decoded_bytes.saturating_add(budget.minimum_required),
-                                )
-                                .unwrap_or(u64::MAX),
-                                maximum: u64::try_from(limits.max_decoded_bytes)
-                                    .unwrap_or(u64::MAX),
-                            }
-                        } else {
-                            ScrollbackSpillError::StorageUnavailable
+                let (line, line_decoded_bytes, row_fidelity) = decode_stored_scrollback_row(
+                    &record,
+                    &mut segments,
+                    &mut |range| store_segment_records(&store, ledger_pane_id, range),
+                    physical_oldest,
+                    segment_next,
+                    &mut cipher_cache,
+                    self.durable_pane_id,
+                    state.content_epoch,
+                    stable_row,
+                    seq,
+                    remaining_decoded_bytes,
+                )
+                .map_err(|error| {
+                    if let Some(budget) = error.downcast_ref::<ScrollbackDecodedBudgetExceeded>() {
+                        ScrollbackSpillError::ResourceLimit {
+                            resource: "decoded_bytes",
+                            observed: u64::try_from(
+                                decoded_bytes.saturating_add(budget.minimum_required),
+                            )
+                            .unwrap_or(u64::MAX),
+                            maximum: u64::try_from(limits.max_decoded_bytes).unwrap_or(u64::MAX),
                         }
-                    })?;
+                    } else {
+                        ScrollbackSpillError::StorageUnavailable
+                    }
+                })?;
                 if row_fidelity == DecodedScrollbackRecordFidelity::LegacyRedacted {
                     fidelity = ScrollbackSnapshotFidelity::LegacyRedacted;
                 }
@@ -8468,6 +15651,7 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         let _mutation_gate = self.lock_mutation_gate("replace_scrollback_prefix")?;
         let _filesystem_mutation_lease =
             self.lock_filesystem_mutation("replace_scrollback_prefix")?;
+        self.forget_cold_segment();
         let row_count = prefix.row_count();
         if row_count > max_retained_rows {
             return Err(ScrollbackSpillError::ResourceLimit {
@@ -8485,7 +15669,7 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         }
         let previous_ledger_pane_id = self.active_ledger_pane_id();
         self.verify_current_published_state_before_mutation(
-            previous_state,
+            &previous_state,
             previous_ledger_pane_id,
             false,
         )?;
@@ -8537,6 +15721,12 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             clear_pending_physical_reclamation: false,
             transaction_quarantined: false,
             verified_ledger: None,
+            // A replacement ledger is sealed as self-describing v3 rows.
+            row_segments: LiveScrollbackRowSegments::EMPTY,
+            // Replacement re-lays the same pane's rows: the rows its gaps
+            // dropped stay lost, so their totals carry over.
+            durability_gaps: previous_state.durability_gaps,
+            published: None,
         };
         let replacement_ledger_pane_id = self.replacement_ledger_pane_id(
             successor_generation,
@@ -8663,6 +15853,8 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
                         proposed_state.content_epoch,
                         stable_row,
                         sequence,
+                        &proposed_state.row_segments,
+                        None,
                     )
                 {
                     return Err(ScrollbackSpillError::StorageUnavailable);
@@ -8703,7 +15895,7 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
 
             let recovered_publication = self
                 .reread_and_verify_replacement_manifest(
-                    proposed_state,
+                    &proposed_state,
                     expected_generation,
                     prefix.oldest_stable_row(),
                     prefix.newest_stable_row_exclusive(),
@@ -8719,7 +15911,7 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
                         std::fs::File::open(parent)?.sync_all()?;
                     }
                     self.reread_and_verify_replacement_manifest(
-                        proposed_state,
+                        &proposed_state,
                         expected_generation,
                         prefix.oldest_stable_row(),
                         prefix.newest_stable_row_exclusive(),
@@ -8764,13 +15956,14 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
                     self.durable_pane_id,
                     proposed_state.content_epoch,
                     initial_stable_row,
+                    &proposed_state.row_segments,
                     true,
                 )
                 .context("authenticate every published replacement row")?;
             }
             drop(store);
             self.reread_and_verify_replacement_manifest(
-                proposed_state,
+                &proposed_state,
                 expected_generation,
                 prefix.oldest_stable_row(),
                 prefix.newest_stable_row_exclusive(),
@@ -8814,12 +16007,13 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
 
         let _mutation_gate = self.lock_mutation_gate("clear_scrollback")?;
         let _filesystem_mutation_lease = self.lock_filesystem_mutation("clear_scrollback")?;
+        self.forget_cold_segment();
         let ledger_pane_id = self.active_ledger_pane_id();
         let current_state = *self.lock_state("clear_scrollback current state")?;
         if current_state.transaction_quarantined {
             return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
         }
-        self.verify_current_published_state_before_mutation(current_state, ledger_pane_id, true)?;
+        self.verify_current_published_state_before_mutation(&current_state, ledger_pane_id, true)?;
         self.advance_authenticated_append_wal_supersession()
             .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
         // Prove the physical store is available before publishing a logical
@@ -8830,7 +16024,7 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         let (previous, clear_generation) = {
             let mut state = self.lock_state("clear_scrollback state reset")?;
             let previous = *state;
-            *state = self.clear_successor_state(previous, ledger_pane_id);
+            *state = self.clear_successor_state(&previous, ledger_pane_id);
             (previous, state.snapshot_generation())
         };
         // Publish the clear intent before truncating the content log. If the
@@ -9068,9 +16262,10 @@ pub fn read_live_scrollback_committed_ledger_identity(
         identity_max_rows <= LIVE_SCROLLBACK_EXPORT_MAX_ROWS,
         "v3 retained row count exceeds the hard identity-read limit"
     );
-    let snapshot = frankenterm_core::storage::mmap_store::read_pane_snapshot(
+    let snapshot = read_published_pane_snapshot(
         &pane_path,
         ledger_pane_id,
+        &manifest_before,
         identity_max_rows,
         LIVE_SCROLLBACK_EXPORT_MAX_PHYSICAL_BYTES,
         LIVE_SCROLLBACK_EXPORT_MAX_PHYSICAL_BYTES,
@@ -9238,9 +16433,10 @@ pub fn list_live_scrollback_panes(
                         "v3 retained rows exceed the hard discovery limit"
                     );
                     Some(
-                        frankenterm_core::storage::mmap_store::read_pane_snapshot(
+                        read_published_pane_snapshot(
                             &pane_path,
                             ledger_pane_id,
+                            &manifest_before,
                             retained_rows,
                             LIVE_SCROLLBACK_EXPORT_MAX_PHYSICAL_BYTES,
                             LIVE_SCROLLBACK_EXPORT_MAX_PHYSICAL_BYTES,
@@ -9313,6 +16509,7 @@ pub fn list_live_scrollback_panes(
                 command_description: Some(manifest.command_description),
                 retained_rows: Some(manifest.retained_rows),
                 next_seq: Some(manifest.next_seq),
+                durability_gaps: manifest.durability_gaps,
                 path: pane_path,
                 error: None,
             }),
@@ -9324,6 +16521,7 @@ pub fn list_live_scrollback_panes(
                 command_description: None,
                 retained_rows: None,
                 next_seq: None,
+                durability_gaps: None,
                 path: pane_path,
                 error: Some(format!("{error:#}")),
             }),
@@ -9392,9 +16590,10 @@ pub fn export_live_scrollback_transcript(
         !authenticated_manifest,
     )?;
 
-    let snapshot = frankenterm_core::storage::mmap_store::read_pane_snapshot(
+    let snapshot = read_published_pane_snapshot(
         &pane_path,
         ledger_pane_id,
+        &manifest_before,
         max_rows,
         max_physical_bytes,
         max_physical_bytes,
@@ -9472,13 +16671,16 @@ pub fn export_live_scrollback_transcript(
         );
     }
 
-    let exact_semantic_records = records
-        .iter()
-        .filter(|record| {
-            mux::guardian_output_journal::GuardianEncryptedScrollbackRow::has_encrypted_prefix(
+    let is_exact_record = |record: &str| {
+        mux::guardian_output_journal::is_compact_scrollback_row(record)
+            || mux::guardian_output_journal::is_scrollback_segment_record(record)
+            || mux::guardian_output_journal::GuardianEncryptedScrollbackRow::has_encrypted_prefix(
                 record,
             )
-        })
+    };
+    let exact_semantic_records = records
+        .iter()
+        .filter(|record| is_exact_record(record))
         .count();
     let legacy_non_recovery_grade_records = records
         .len()
@@ -9509,7 +16711,11 @@ pub fn export_live_scrollback_transcript(
     } else {
         None
     };
-    let mut cipher_cache = keyring.as_ref().map(GuardianScrollbackCipherCache::new);
+    let row_segments = LiveScrollbackSpillSink::manifest_row_segments(&manifest_before)
+        .context("decode scrollback row nonce segments for export")?;
+    let mut cipher_cache = keyring
+        .as_ref()
+        .map(|keyring| GuardianScrollbackCipherCache::new(keyring, &row_segments));
     let content_epoch =
         live_scrollback_manifest_generation(&manifest_before)?.map(|(epoch, _revision)| epoch);
     let mut durable_pane_bytes = [0; 16];
@@ -9519,63 +16725,85 @@ pub fn export_live_scrollback_transcript(
     }
     let initial_stable_row = manifest_before.initial_stable_row;
     let oldest_seq = snapshot.oldest_seq;
+    // Sealed segments (ft-yccm0.2.1.4) open from the snapshot: its pruned
+    // tail, then its records.
+    let tail_rows = u64::try_from(snapshot.pruned_tail.len())?;
+    let segment_floor = oldest_seq.map_or(0, |oldest| oldest.saturating_sub(tail_rows));
+    let segment_next = oldest_seq.map_or(0, |oldest| {
+        oldest.saturating_add(u64::try_from(records.len()).unwrap_or(u64::MAX))
+    });
+    let mut segments = LiveScrollbackSegmentReader::default();
+    let mut fetch = |range: std::ops::Range<u64>| -> anyhow::Result<Vec<String>> {
+        let mut rows = Vec::new();
+        for sequence in range {
+            let index = usize::try_from(sequence.checked_sub(segment_floor).ok_or_else(|| {
+                anyhow::anyhow!("scrollback segment row {sequence} is not in the snapshot")
+            })?)?;
+            let record = match index.checked_sub(snapshot.pruned_tail.len()) {
+                None => snapshot.pruned_tail.get(index),
+                Some(index) => records.get(index),
+            }
+            .ok_or_else(|| {
+                anyhow::anyhow!("scrollback segment row {sequence} is not in the snapshot")
+            })?;
+            rows.push(record.clone());
+        }
+        Ok(rows)
+    };
     let redactor = frankenterm_core::redactor::Redactor::new();
     let mut transcript = String::new();
     for (index, record) in records.iter().enumerate() {
-        let line =
-            if mux::guardian_output_journal::GuardianEncryptedScrollbackRow::has_encrypted_prefix(
+        let line = if is_exact_record(record) {
+            let sequence = oldest_seq
+                .and_then(|oldest| oldest.checked_add(u64::try_from(index).ok()?))
+                .ok_or_else(|| anyhow::anyhow!("live scrollback export sequence overflow"))?;
+            let stable_row = initial_stable_row
+                .and_then(|initial| {
+                    wezterm_term::StableRowIndex::try_from(sequence)
+                        .ok()
+                        .and_then(|offset| initial.checked_add(offset))
+                })
+                .ok_or_else(|| anyhow::anyhow!("live scrollback export row identity overflow"))?;
+            let cipher_cache = cipher_cache
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("encrypted scrollback keyring is unavailable"))?;
+            let content_epoch = content_epoch.ok_or_else(|| {
+                anyhow::anyhow!("encrypted scrollback record has no content epoch")
+            })?;
+            decode_stored_scrollback_row(
                 record,
-            ) {
-                let sequence = oldest_seq
-                    .and_then(|oldest| oldest.checked_add(u64::try_from(index).ok()?))
-                    .ok_or_else(|| anyhow::anyhow!("live scrollback export sequence overflow"))?;
-                let stable_row = initial_stable_row
-                    .and_then(|initial| {
-                        wezterm_term::StableRowIndex::try_from(sequence)
-                            .ok()
-                            .and_then(|offset| initial.checked_add(offset))
-                    })
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("live scrollback export row identity overflow")
-                    })?;
-                let cipher_cache = cipher_cache.as_mut().ok_or_else(|| {
-                    anyhow::anyhow!("encrypted scrollback keyring is unavailable")
-                })?;
-                let content_epoch = content_epoch.ok_or_else(|| {
-                    anyhow::anyhow!("encrypted scrollback record has no content epoch")
-                })?;
-                decode_persisted_scrollback_line_with_limit(
-                    record,
-                    cipher_cache,
-                    durable_pane_bytes,
-                    content_epoch,
-                    stable_row,
-                    sequence,
-                    LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
-                )
-                .with_context(|| format!("decrypt live scrollback record {index}"))?
-                .0
-            } else if record.starts_with(LIVE_SCROLLBACK_LINE_RECORD_V1_UNCOMPRESSED)
-                || record.starts_with(LIVE_SCROLLBACK_LINE_RECORD_V1_ZSTD)
-                || record.starts_with(LIVE_SCROLLBACK_LINE_RECORD_V2_UNCOMPRESSED)
-                || record.starts_with(LIVE_SCROLLBACK_LINE_RECORD_V2_ZSTD)
-            {
-                decode_scrollback_line_record(record).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "live scrollback record {index} failed bounded integrity decoding"
-                    )
-                })?
-            } else if record.starts_with("ftsl") {
-                anyhow::bail!(
-                    "live scrollback record {index} has an unrecognized reserved record prefix"
-                );
-            } else {
-                anyhow::ensure!(
-                    record.len() <= LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
-                    "legacy text scrollback record {index} exceeds the hard decoded-byte limit"
-                );
-                legacy_text_scrollback_line(record)
-            };
+                &mut segments,
+                &mut fetch,
+                segment_floor,
+                segment_next,
+                cipher_cache,
+                durable_pane_bytes,
+                content_epoch,
+                stable_row,
+                sequence,
+                LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+            )
+            .with_context(|| format!("decrypt live scrollback record {index}"))?
+            .0
+        } else if record.starts_with(LIVE_SCROLLBACK_LINE_RECORD_V1_UNCOMPRESSED)
+            || record.starts_with(LIVE_SCROLLBACK_LINE_RECORD_V1_ZSTD)
+            || record.starts_with(LIVE_SCROLLBACK_LINE_RECORD_V2_UNCOMPRESSED)
+            || record.starts_with(LIVE_SCROLLBACK_LINE_RECORD_V2_ZSTD)
+        {
+            decode_scrollback_line_record(record).ok_or_else(|| {
+                anyhow::anyhow!("live scrollback record {index} failed bounded integrity decoding")
+            })?
+        } else if record.starts_with("ftsl") {
+            anyhow::bail!(
+                "live scrollback record {index} has an unrecognized reserved record prefix"
+            );
+        } else {
+            anyhow::ensure!(
+                record.len() <= LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+                "legacy text scrollback record {index} exceeds the hard decoded-byte limit"
+            );
+            legacy_text_scrollback_line(record)
+        };
         let text = line.as_str();
         let redacted_text = redactor.redact(text.as_ref());
         let delimiter_bytes = usize::from(!line.last_cell_was_wrapped());
@@ -9649,10 +16877,43 @@ pub fn open_scrollback_spill_sink(
     base_dir: PathBuf,
     context: &config::ScrollbackSpillSinkContext,
 ) -> anyhow::Result<Arc<dyn wezterm_term::config::ScrollbackSpillSink>> {
-    let backing = Arc::new(LiveScrollbackSpillSink::new(base_dir, context)?);
-    let sink = deferred_scrollback::DeferredScrollbackSpillSink::new(backing)
-        .context("initialize deferred scrollback metadata")?;
-    Ok(Arc::new(sink))
+    // The budget and commit windows are process-wide; each new pane applies
+    // the current values. FT_DURABILITY_COMMIT_WINDOW_MS and
+    // FT_DURABILITY_MANIFEST_PUBLISH_MS override the window and the manifest
+    // cadence for A/B runs (ft-yccm0.2.1.2).
+    let config = config::configuration();
+    let publish_ms = std::env::var("FT_DURABILITY_MANIFEST_PUBLISH_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|ms| *ms <= config::MAX_SCROLLBACK_DURABILITY_MANIFEST_PUBLISH_MS)
+        .unwrap_or(config.scrollback_durability_manifest_publish_ms);
+    let backing = Arc::new(LiveScrollbackSpillSink::open(
+        base_dir,
+        context,
+        std::time::Duration::from_millis(publish_ms),
+    )?);
+    let writer = deferred_scrollback::DurabilityWriter::global();
+    writer.set_queue_budget(
+        config
+            .scrollback_durability_queue_max_mb
+            .saturating_mul(1024 * 1024),
+    );
+    let window_ms = std::env::var("FT_DURABILITY_COMMIT_WINDOW_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|ms| *ms <= config::MAX_SCROLLBACK_DURABILITY_COMMIT_WINDOW_MS)
+        .unwrap_or(config.scrollback_durability_commit_window_ms);
+    writer.set_commit_policy(deferred_scrollback::CommitPolicy {
+        window: std::time::Duration::from_millis(window_ms),
+        window_bytes: config
+            .scrollback_durability_commit_window_mb
+            .saturating_mul(1024 * 1024),
+        idle: std::time::Duration::from_millis(config.scrollback_durability_commit_idle_ms),
+    });
+    let sink =
+        deferred_scrollback::DeferredScrollbackSpillSink::new(backing, context.durable_pane_id)
+            .context("initialize deferred scrollback metadata")?;
+    Ok(sink)
 }
 
 pub fn install_scrollback_spill_sink_factory() {
@@ -9996,10 +17257,475 @@ mod tests {
         };
         let backing =
             Arc::new(LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context).unwrap());
-        let deferred = Arc::new(
-            deferred_scrollback::DeferredScrollbackSpillSink::new(backing.clone()).unwrap(),
-        );
+        // A private writer: a test that stalls its store must not delay the
+        // durability of sinks in concurrently running tests.
+        let deferred = deferred_scrollback::DeferredScrollbackSpillSink::with_writer(
+            backing.clone(),
+            context.durable_pane_id,
+            deferred_scrollback::DurabilityWriter::spawn(),
+        )
+        .unwrap();
         (dir, backing, deferred)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn steady_state_commits_rescan_no_keyring_and_publish_without_the_keyring_mutex() {
+        use std::time::{Duration, Instant};
+
+        let (_dir, backing, _deferred) = deferred_test_sink();
+        let line = |row: isize| {
+            Line::from_text(&format!("epoch {row}"), &CellAttributes::blank(), 0, None)
+        };
+        // The first append establishes the authenticated lineage.
+        assert_eq!(backing.store_scrollback_lines(0, &[line(0)], 1_000), 1);
+        // Fresh keyring stamps are racy: wait until a full validation arms
+        // the stat fast path.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let mut keyring = backing.lock_keyring("settle keyring").unwrap();
+            keyring.latest_active_cipher().unwrap();
+            if keyring.fast_path_validated() {
+                break;
+            }
+            drop(keyring);
+            assert!(Instant::now() < deadline, "keyring fast path never engaged");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let scans = || guardian_output_keys::INVENTORY_SCANS.with(std::cell::Cell::get);
+        let before = scans();
+        LIVE_SCROLLBACK_KEYRING_FREE_AT_RENAME.with(|free| free.set(None));
+        let lines: Vec<_> = (1..65).map(line).collect();
+        assert_eq!(backing.store_scrollback_lines(1, &lines, 1_000), 64);
+        // ft-yccm0.2.1.5: one pane's manifest syncs and rename no longer hold
+        // the keyring mutex every pane's commit needs, and a steady-state
+        // commit rescans no keyring directory.
+        assert_eq!(
+            LIVE_SCROLLBACK_KEYRING_FREE_AT_RENAME.with(std::cell::Cell::get),
+            Some(true),
+            "the manifest rename held the process-wide keyring mutex"
+        );
+        assert_eq!(
+            scans() - before,
+            0,
+            "a steady-state commit scanned the keyring directory"
+        );
+    }
+
+    /// ft-yccm0.2.1.5 AC2/AC3: a settled commit window reads the pane's
+    /// manifest from disk at most once, rescans no keyring directory, and
+    /// locks the process-wide keyring mutex at most once (authentication and
+    /// the active cipher). The retained WAL's supersession check takes one
+    /// historical lease, which holds that mutex only to snapshot the
+    /// authority; the first window past a publication takes a second one to
+    /// check that the WAL is replaceable. Measured per window over eight
+    /// windows after the first batch has published the lineage and the
+    /// keyring's stat fast path is armed.
+    #[test]
+    fn a_settled_commit_window_reads_the_manifest_once_and_locks_the_keyring_once() {
+        use std::time::{Duration, Instant};
+
+        const WINDOWS: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let sink = windowed_test_sink(dir.path());
+        let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+        assert!(sink.store_scrollback_line(0, &prior, 4096));
+        let mut next_row = 1;
+        let window = |sink: &LiveScrollbackSpillSink, next_row: &mut usize| {
+            let lines = digest_only_test_lines(&format!("w{next_row}"), 16);
+            assert_eq!(
+                sink.store_scrollback_lines(*next_row as isize, &lines, 4096),
+                16
+            );
+            *next_row += 16;
+        };
+        // The first batch starts the nonce segment and publishes.
+        window(&sink, &mut next_row);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let mut keyring = sink.lock_keyring("settle keyring").unwrap();
+            keyring.latest_active_cipher().unwrap();
+            if keyring.fast_path_validated() {
+                break;
+            }
+            drop(keyring);
+            assert!(Instant::now() < deadline, "keyring fast path never engaged");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        // Per window: manifest reads, keyring mutex locks, historical leases
+        // and keyring directory scans.
+        let counts = || {
+            (
+                LIVE_SCROLLBACK_MANIFEST_READS.with(std::cell::Cell::get),
+                LIVE_SCROLLBACK_KEYRING_LOCKS.with(std::cell::Cell::get),
+                guardian_output_keys::HISTORICAL_LEASES.with(std::cell::Cell::get),
+                guardian_output_keys::INVENTORY_SCANS.with(std::cell::Cell::get),
+            )
+        };
+        let mut per_window = Vec::with_capacity(WINDOWS);
+        for _ in 0..WINDOWS {
+            let before = counts();
+            window(&sink, &mut next_row);
+            let after = counts();
+            per_window.push((
+                after.0 - before.0,
+                after.1 - before.1,
+                after.2 - before.2,
+                after.3 - before.3,
+            ));
+        }
+        let settled =
+            per_window
+                .iter()
+                .enumerate()
+                .all(|(index, &(reads, locks, leases, scans))| {
+                    reads <= 1 && locks <= 1 && leases <= 1 + u64::from(index == 0) && scans == 0
+                });
+        assert!(
+            settled,
+            "per window (manifest reads, keyring mutex locks, historical leases, keyring \
+             directory scans): {per_window:?}; each window reads and locks at most once, takes \
+             at most one lease (two in the first) and scans nothing"
+        );
+    }
+
+    /// The exact-row plaintext of `line` through each encoder: (sealable,
+    /// bytes).
+    fn exact_plaintext_through(line: &Line, direct: bool) -> (bool, Vec<u8>) {
+        SCROLLBACK_SERIALIZER_OVERRIDE.with(|forced| forced.set(Some(direct)));
+        let mut plaintext = Vec::new();
+        let sealable = serialize_exact_semantic_scrollback_line_into(line, &mut plaintext);
+        SCROLLBACK_SERIALIZER_OVERRIDE.with(|forced| forced.set(None));
+        (sealable, plaintext)
+    }
+
+    /// ft-y0gy9: `exact_varbincode` writes the bytes varbincode writes: for
+    /// every kind of value serde hands a serializer, at the integer values
+    /// where LEB128 changes length, and for exact rows of every shape the
+    /// store seals, through the production path with each encoder forced.
+    #[test]
+    fn direct_serialization_writes_the_bytes_varbincode_writes() {
+        #[derive(Serialize)]
+        struct UnitStruct;
+        #[derive(Serialize)]
+        struct Newtype(u32);
+        #[derive(Serialize)]
+        struct TupleStruct(i16, char, bool);
+        #[derive(Serialize)]
+        enum Variant {
+            Unit,
+            Newtype(i64),
+            Tuple(u8, i8),
+            Struct { float: f32, double: f64 },
+        }
+        struct Bytes(&'static [u8]);
+        impl Serialize for Bytes {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_bytes(self.0)
+            }
+        }
+        #[derive(Serialize)]
+        struct Every {
+            unit: (),
+            unit_struct: UnitStruct,
+            newtype: Newtype,
+            tuple_struct: TupleStruct,
+            pair: (u16, String),
+            variants: Vec<Variant>,
+            missing: Option<u64>,
+            present: Option<&'static str>,
+            map: std::collections::BTreeMap<u32, Vec<u8>>,
+            bytes: Bytes,
+        }
+        fn direct<T: Serialize>(value: &T) -> Vec<u8> {
+            let mut out = Vec::new();
+            exact_varbincode::serialize_into(value, &mut out, usize::MAX).unwrap();
+            out
+        }
+        fn assert_same<T: Serialize>(value: &T, label: &str) {
+            assert_eq!(
+                direct(value),
+                varbincode::serialize(value).unwrap(),
+                "{label}"
+            );
+        }
+
+        assert_same(
+            &Every {
+                unit: (),
+                unit_struct: UnitStruct,
+                newtype: Newtype(300),
+                tuple_struct: TupleStruct(-300, '\u{1f600}', true),
+                pair: (65_535, "pair \u{1f680}".to_string()),
+                variants: vec![
+                    Variant::Unit,
+                    Variant::Newtype(-1),
+                    Variant::Tuple(255, -128),
+                    Variant::Struct {
+                        float: -0.5,
+                        double: f64::NAN,
+                    },
+                ],
+                missing: None,
+                present: Some("present"),
+                map: [(0, vec![]), (200, vec![1, 2, 3])].into_iter().collect(),
+                bytes: Bytes(b"\x00\xffbytes"),
+            },
+            "every serde kind",
+        );
+        for value in [
+            0,
+            1,
+            63,
+            64,
+            127,
+            128,
+            255,
+            256,
+            16_383,
+            16_384,
+            u64::from(u16::MAX),
+            u64::from(u32::MAX),
+            u64::MAX - 1,
+            u64::MAX,
+        ] {
+            assert_same(&value, "u64");
+            assert_same(&(value as u32), "u32");
+            assert_same(&(value as u16), "u16");
+            assert_same(&(value as u8), "u8");
+        }
+        for value in [
+            0,
+            1,
+            -1,
+            63,
+            -64,
+            64,
+            -65,
+            127,
+            -128,
+            8_191,
+            -8_192,
+            8_192,
+            -8_193,
+            i64::from(i32::MIN),
+            i64::from(i32::MAX),
+            i64::MIN,
+            i64::MAX,
+        ] {
+            assert_same(&value, "i64");
+            assert_same(&(value as i32), "i32");
+            assert_same(&(value as i16), "i16");
+            assert_same(&(value as i8), "i8");
+        }
+
+        let mut rows: Vec<Line> = scrollback_record_bench::Rows::t0_corpus(256, 11)
+            .lines()
+            .to_vec();
+        rows.extend_from_slice(scrollback_record_bench::Rows::printable(8, 9).lines());
+        rows.extend_from_slice(scrollback_record_bench::Rows::printable(8, 91).lines());
+        rows.extend_from_slice(scrollback_record_bench::Rows::emoji_colors(8, 80).lines());
+        rows.extend_from_slice(
+            scrollback_record_bench::Rows::emoji_colors(8, 80)
+                .compressed_for_scrollback()
+                .lines(),
+        );
+        let mut attrs = CellAttributes::blank();
+        attrs.set_italic(true);
+        attrs.set_reverse(true);
+        attrs.set_underline_color(termwiz::color::ColorAttribute::PaletteIndex(9));
+        attrs.set_hyperlink(Some(Arc::new(termwiz::cell::Hyperlink::new_with_id(
+            "https://scrollback.example/direct",
+            "direct-row",
+        ))));
+        let mut linked = Line::from_text("linked \u{1f600} row, then plain text", &attrs, 7, None);
+        linked.set_last_cell_was_wrapped(true, 7);
+        rows.push(linked.clone());
+        linked.compress_for_scrollback();
+        rows.push(linked);
+        assert!(rows.iter().any(Line::has_clustered_storage));
+        assert!(rows.iter().any(|line| !line.has_clustered_storage()));
+        for (index, line) in rows.iter().enumerate() {
+            let label = format!("row {index}");
+            assert_same(line, &label);
+            assert_same(
+                &ExactSemanticScrollbackLineRef {
+                    schema: EXACT_SCROLLBACK_SCHEMA_CLUSTERED,
+                    line,
+                    cell_widths: &[1, 2],
+                },
+                &label,
+            );
+            let direct_row = exact_plaintext_through(line, true);
+            assert!(direct_row.0, "{label} is sealable");
+            assert_eq!(
+                direct_row,
+                exact_plaintext_through(line, false),
+                "{label}: the exact plaintext"
+            );
+        }
+    }
+
+    /// ft-y0gy9: both encoders refuse a row at the same byte bound: an
+    /// encoding of exactly the bound succeeds, one byte more fails.
+    #[test]
+    fn direct_serialization_refuses_at_the_same_byte_bound() {
+        let rows = scrollback_record_bench::Rows::t0_corpus(4, 5);
+        let line = &rows.lines()[0];
+        let encoded = varbincode::serialize(line).unwrap().len();
+        for (bound, fits) in [(encoded, true), (encoded - 1, false), (0, false)] {
+            let mut direct = Vec::new();
+            let direct_fits = exact_varbincode::serialize_into(line, &mut direct, bound).is_ok();
+            let mut via_varbincode = Vec::new();
+            let mut bounded = BoundedScrollbackPlaintext::new(&mut via_varbincode, bound);
+            let serialized = {
+                let mut serializer = varbincode::Serializer::new(&mut bounded);
+                line.serialize(&mut serializer).is_ok()
+            };
+            let varbincode_fits = serialized && !bounded.exceeded;
+            assert_eq!(
+                (direct_fits, varbincode_fits),
+                (fits, fits),
+                "a {encoded}-byte row under a {bound}-byte bound"
+            );
+        }
+    }
+
+    /// ft-y0gy9: what the durability writer does per T0 record byte in
+    /// steady state, with retention evicting and the tail publishing: bytes
+    /// hashed (chain links, WAL and ledger digests) and record bytes read
+    /// back from the ledger, each per record byte appended, and durability
+    /// syncs per window. 8192 T0 rows in 1024-row windows under a 2048-row
+    /// retention, filled first so every measured window evicts, with the tail
+    /// published every second window.
+    #[test]
+    fn t0_steady_state_writer_hashes_and_reads_back_per_appended_byte() {
+        const ROWS: usize = 8192;
+        const WINDOW: usize = 1024;
+        const RETENTION: usize = 2048;
+        const PUBLISH_EVERY: usize = 2;
+        let rows = scrollback_record_bench::Rows::t0_corpus(ROWS, 9);
+        let lines = rows.lines();
+        let dir = tempfile::tempdir().unwrap();
+        let sink = windowed_test_sink(dir.path());
+        assert!(sink.store_scrollback_line(0, &lines[0], RETENTION));
+        let store_window = |start: usize| {
+            let mut row = start;
+            let end = (start + WINDOW).min(ROWS);
+            while row < end {
+                let stored = sink.store_scrollback_lines(row as isize, &lines[row..end], RETENTION);
+                assert!(stored > 0, "window at row {row}");
+                row += stored;
+            }
+            end
+        };
+        let mut row = 1;
+        while row <= RETENTION {
+            row = store_window(row);
+        }
+        sink.flush_scrollback().unwrap();
+        let counts = || {
+            (
+                LIVE_SCROLLBACK_RECORD_BYTES_APPENDED.with(std::cell::Cell::get),
+                LIVE_SCROLLBACK_BYTES_HASHED.with(std::cell::Cell::get),
+                LIVE_SCROLLBACK_RECORD_BYTES_READ_BACK.with(std::cell::Cell::get),
+                frankenterm_core::storage::mmap_store::thread_durability_sync_count(),
+            )
+        };
+        let before = counts();
+        let measured_rows = ROWS - row;
+        let mut windows = 0;
+        while row < ROWS {
+            row = store_window(row);
+            windows += 1;
+            if windows % PUBLISH_EVERY == 0 || row == ROWS {
+                sink.flush_scrollback().unwrap();
+            }
+        }
+        let after = counts();
+        let (appended, hashed, read_back, syncs) = (
+            after.0 - before.0,
+            after.1 - before.1,
+            after.2 - before.2,
+            after.3 - before.3,
+        );
+        let manifest = published_manifest(&sink);
+        assert_eq!(manifest.next_seq, ROWS as u64);
+        assert_eq!(manifest.retained_rows, RETENTION as u64);
+        let per_appended = |bytes: u64| bytes as f64 / appended as f64;
+        eprintln!(
+            "T0 steady state, {windows} windows of {WINDOW} rows, retention {RETENTION}, a \
+             publication every {PUBLISH_EVERY} windows: {appended} record bytes appended \
+             ({:.1} per row); per appended byte {:.2} bytes hashed and {:.2} read back; \
+             {:.1} syncs per window",
+            appended as f64 / measured_rows as f64,
+            per_appended(hashed),
+            per_appended(read_back),
+            syncs as f64 / windows as f64,
+        );
+        // Every appended record is hashed into the chain at least once, and
+        // every evicted one is read back to advance the chain's anchor.
+        assert!(
+            hashed >= appended,
+            "{hashed} bytes hashed for {appended} appended"
+        );
+        assert!(read_back > 0, "evictions read the evicted records back");
+    }
+
+    /// ft-y0gy9: FT_SCROLLBACK_ROW_ZSTD_LEVEL parses as documented, and a
+    /// T0 row's frame written at any level it accepts expands to the row's
+    /// exact plaintext through the store's existing bounded decoder.
+    #[test]
+    fn row_frames_at_every_accepted_zstd_level_expand_through_the_same_decoder() {
+        use std::ffi::OsStr;
+
+        let parse = |value: &str| parse_exact_scrollback_row_zstd_level(Some(OsStr::new(value)));
+        assert_eq!(
+            parse_exact_scrollback_row_zstd_level(None),
+            EXACT_SCROLLBACK_ROW_ZSTD_LEVEL
+        );
+        assert_eq!(parse("-3"), -3);
+        assert_eq!(parse(" 2 "), 2);
+        for refused in ["4", "-8", "fast", ""] {
+            assert_eq!(
+                parse(refused),
+                EXACT_SCROLLBACK_ROW_ZSTD_LEVEL,
+                "{refused:?}"
+            );
+        }
+        let rows = scrollback_record_bench::Rows::t0_corpus(64, 13);
+        for level in -7..=3 {
+            let mut compressor = zstd::bulk::Compressor::new(level).unwrap();
+            compressor
+                .window_log(EXACT_SCROLLBACK_ZSTD_WINDOW_LOG)
+                .unwrap();
+            let mut expanded_rows = 0;
+            for line in rows.lines() {
+                let plaintext = serialize_exact_semantic_scrollback_line(line).unwrap();
+                let mut payload = Zeroizing::new(EXACT_SCROLLBACK_ZSTD_MAGIC.to_vec());
+                payload.extend_from_slice(&u32::try_from(plaintext.len()).unwrap().to_le_bytes());
+                payload.extend_from_slice(&compressor.compress(&plaintext).unwrap());
+                if payload.len() >= plaintext.len() {
+                    // The store keeps such a row plain.
+                    continue;
+                }
+                let expanded = expand_exact_scrollback_plaintext(payload, plaintext.len()).unwrap();
+                assert_eq!(expanded.as_slice(), plaintext.as_slice(), "level {level}");
+                expanded_rows += 1;
+            }
+            eprintln!("zstd level {level}: {expanded_rows} of 64 T0 rows compress");
+        }
+    }
+
+    #[test]
+    fn durability_switches_are_on_unless_set_to_zero() {
+        use std::ffi::OsStr;
+
+        assert!(durability_switch_on(None));
+        assert!(durability_switch_on(Some(OsStr::new("1"))));
+        assert!(durability_switch_on(Some(OsStr::new(""))));
+        assert!(durability_switch_on(Some(OsStr::new("00"))));
+        assert!(!durability_switch_on(Some(OsStr::new("0"))));
     }
 
     #[cfg(unix)]
@@ -10224,15 +17950,19 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn deferred_scrollback_geometry_yields_preserve_durable_batch_sizes() {
-        for (row_count, expected_revision) in [
+        for (row_count, minimum_revision, exact) in [
             // A fixed corpus that formerly required four publications: one
-            // establishing authority, then 1023, 1024, and 33 rows. It now fits
-            // one bounded batch, without changing its Unicode/text oracle.
-            (2086, 2),
-            (2 * LIVE_SCROLLBACK_APPEND_MAX_ROWS + 38, 4),
+            // establishing authority, then 1023, 1024, and 33 rows. It fits
+            // the bounded queue during one applied batch, so the writer sees
+            // it whole: exactly one authority row plus one batch.
+            (2086, 2, true),
+            // Overflow past the queue cap is admitted while the writer drains
+            // concurrently, so the writer (not the parser) picks the batch
+            // boundaries: at least authority + three full queues.
+            (2 * LIVE_SCROLLBACK_APPEND_MAX_ROWS + 38, 4, false),
         ] {
             let (_dir, backing, deferred) = deferred_test_sink();
-            let pane = deferred_test_pane(deferred, row_count + 1);
+            let pane = deferred_test_pane(deferred.clone(), row_count + 1);
             let mut corpus = String::new();
             for row in 0..row_count {
                 use std::fmt::Write as _;
@@ -10243,9 +17973,19 @@ mod tests {
                 .parse(corpus.as_bytes(), |action| actions.push(action));
             pane.perform_actions(actions)
                 .expect("test action admission");
+            // The explicit sync point: durability is the writer's, not the
+            // parser's, so the batch has been handed over but may be in flight.
+            deferred.flush_scrollback().unwrap();
             assert_eq!(backing.retained_scrollback_rows(), row_count - 5);
-            // Cooperative geometry slices must not create extra generations.
-            assert_eq!(backing.state.lock().unwrap().revision, expected_revision);
+            // Cooperative geometry slices never mint generations: every one
+            // is exactly one acknowledged writer/flush batch.
+            let revision = backing.state.lock().unwrap().revision;
+            assert_eq!(revision, deferred.committed_batches());
+            if exact {
+                assert_eq!(revision, minimum_revision);
+            } else {
+                assert!(revision >= minimum_revision, "revision {revision}");
+            }
             let (first, lines) = pane.get_lines(0..isize::try_from(row_count + 1).unwrap());
             assert_eq!(first, 0);
             assert_eq!(lines.len(), row_count + 1);
@@ -10284,7 +18024,12 @@ mod tests {
             termwiz::escape::parser::Parser::new()
                 .parse(corpus.as_bytes(), |action| actions.push(action));
             let writing = Arc::clone(&pane);
-            let writer = std::thread::spawn(move || writing.perform_actions(actions));
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            let writer = std::thread::spawn(move || {
+                let result = writing.perform_actions(actions);
+                done_tx.send(()).unwrap();
+                result
+            });
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let entered = loop {
                 if backing.mutation_gate.try_lock().is_err() {
@@ -10310,16 +18055,29 @@ mod tests {
             });
             let observed = rx.recv_timeout(std::time::Duration::from_millis(500));
             let responsive = observed.is_ok();
+            // With the queue, the parser finishes its batch while the
+            // durability writer is still stuck inside real storage.
+            let parser_finished = done_rx
+                .recv_timeout(if use_queue {
+                    std::time::Duration::from_secs(5)
+                } else {
+                    std::time::Duration::from_millis(200)
+                })
+                .is_ok();
             drop(lease);
             writer.join().unwrap().expect("test action admission");
             reader.join().unwrap();
             assert!(
                 entered,
-                "parser did not enter the real persistence boundary"
+                "persistence did not enter the real storage boundary"
             );
             assert_eq!(
                 responsive, use_queue,
                 "queued={use_queue}: direct persistence is the negative control"
+            );
+            assert_eq!(
+                parser_finished, use_queue,
+                "queued={use_queue}: the parser must not wait on storage IO"
             );
             if use_queue {
                 assert_eq!(
@@ -10327,11 +18085,12 @@ mod tests {
                     0,
                     "admission must not report durable worker completion"
                 );
+                deferred.flush_scrollback().unwrap();
             }
             assert_eq!(
                 backing.retained_scrollback_rows(),
                 265,
-                "overflow beyond the queue cap must drain before returning"
+                "every admitted row is durable after the explicit sync point"
             );
             let (first, lines) = pane.get_lines(0..271);
             assert_eq!(first, 0);
@@ -10358,49 +18117,57 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn deferred_scrollback_parser_backpressure_is_readable_and_close_cancellable() {
+        fn parse(output: &[u8]) -> Vec<termwiz::escape::Action> {
+            let mut actions = Vec::new();
+            termwiz::escape::parser::Parser::new().parse(output, |action| actions.push(action));
+            actions
+        }
+        fn run_parser(
+            pane: &Arc<dyn mux::pane::Pane>,
+            actions: Vec<termwiz::escape::Action>,
+        ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<()>) {
+            let writing = Arc::clone(pane);
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            let parser = std::thread::spawn(move || {
+                writing
+                    .perform_actions(actions)
+                    .expect("test action admission");
+                done_tx.send(()).unwrap();
+            });
+            (parser, done_rx)
+        }
+        let restore_store = |backing: &LiveScrollbackSpillSink| {
+            std::fs::rename(
+                &backing.manifest_path,
+                backing.manifest_path.with_extension("retained-invalid"),
+            )
+            .unwrap();
+        };
+
+        // A failing store with queue room: the parser hands rows over and
+        // returns; the rows stay owned and readable while the writer reports
+        // the pane as durability-degraded and retries.
         let (_dir, backing, deferred) = deferred_test_sink();
         let pane = deferred_test_pane(deferred.clone(), 4096);
         std::fs::write(&backing.manifest_path, b"invalid retained authority").unwrap();
-        let mut actions = Vec::new();
-        termwiz::escape::parser::Parser::new().parse(
-            b"retained\r\n".repeat(20).as_slice(),
-            |action| {
-                actions.push(action);
-            },
-        );
-        let writing = Arc::clone(&pane);
-        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-        let writer = std::thread::spawn(move || {
-            writing
-                .perform_actions(actions)
-                .expect("test action admission");
-            done_tx.send(()).unwrap();
-        });
+        let (parser, done_rx) = run_parser(&pane, parse(&b"retained\r\n".repeat(20)));
+        let returned = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        parser.join().unwrap();
+        returned.expect("a failing store must not hold a parser whose queue has room");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while deferred.retained_scrollback_rows() == 0 && std::time::Instant::now() < deadline {
+        while deferred.durability_failure().is_none() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let retained = deferred.load_scrollback_line(0);
-        let parser_blocked = done_rx
-            .recv_timeout(std::time::Duration::from_millis(200))
-            .is_err();
-        let _dimensions = pane.get_dimensions();
-        pane.kill();
-        let stopped = done_rx.recv_timeout(std::time::Duration::from_secs(5));
-        writer.join().unwrap();
-        assert!(retained.is_some());
-        assert!(
-            parser_blocked,
-            "a failed flush must not admit another parser batch"
+        assert_eq!(
+            deferred.durability_failure(),
+            Some(wezterm_term::config::ScrollbackSpillError::StorageUnavailable),
+            "the writer must surface the failing store as a degraded pane"
         );
-        stopped.unwrap();
-        assert_eq!(deferred.load_scrollback_line(0), retained);
-        std::fs::rename(
-            &backing.manifest_path,
-            backing.manifest_path.with_extension("retained-invalid"),
-        )
-        .unwrap();
+        let retained = deferred.load_scrollback_line(0);
+        assert!(retained.is_some());
+        restore_store(&backing);
         deferred.flush_scrollback().unwrap();
+        assert_eq!(deferred.durability_failure(), None);
         let mut persisted = backing.load_scrollback_line(0).unwrap();
         let mut retained = retained.unwrap();
         // The durable codec materializes clustered cells. Compare the full
@@ -10408,6 +18175,306 @@ mod tests {
         persisted.cells_mut();
         retained.cells_mut();
         assert_eq!(persisted, retained);
+
+        // A failing store whose queue passes its bound. ft-yccm0.2.1.6
+        // changed this contract on purpose. Before, memory stayed bounded by
+        // holding the parser until close; that wait was 22% of mux-parse
+        // samples in the operator's T1 run. Now memory stays bounded by the
+        // writer's byte budget, set to exactly what the old 4096-row full
+        // queue held, and overflow sheds the oldest queued rows into an
+        // explicit gap. The parser never waits, and no row disappears.
+        let (_dir, backing, deferred) = deferred_test_sink();
+        let row_bytes = deferred_scrollback::DeferredScrollbackSpillSink::row_charge(
+            &Line::from_text("retained", &CellAttributes::blank(), 0, None),
+        )
+        .unwrap();
+        let budget = LIVE_SCROLLBACK_APPEND_MAX_ROWS * row_bytes;
+        deferred.set_writer_budget(budget);
+        let pane = deferred_test_pane(deferred.clone(), 8192);
+        std::fs::write(&backing.manifest_path, b"invalid retained authority").unwrap();
+        let rows = LIVE_SCROLLBACK_APPEND_MAX_ROWS + 200;
+        let (parser, done_rx) = run_parser(&pane, parse(&b"retained\r\n".repeat(rows)));
+        let returned = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        parser.join().unwrap();
+        returned.expect("a queue past its budget on a failing store must not hold the parser");
+        let (_dimensions, _title) = (pane.get_dimensions(), pane.get_title());
+        // Nothing is durable, so every retained row is a queued row or gap.
+        assert_eq!(backing.retained_scrollback_rows(), 0);
+        assert!(
+            deferred.retained_scrollback_bytes() <= budget,
+            "queued rows stay within the old full-queue bytes"
+        );
+        let evicted = deferred.retained_scrollback_rows();
+        assert!(
+            evicted > LIVE_SCROLLBACK_APPEND_MAX_ROWS,
+            "every evicted row is admitted ({evicted}), none refused"
+        );
+        let gaps = deferred.queued_gaps();
+        assert!(!gaps.is_empty(), "the overflow is an explicit gap");
+        let newest = wezterm_term::StableRowIndex::try_from(evicted - 1).unwrap();
+        for stable in [0, gaps[0].start, gaps[0].end - 1, newest] {
+            assert!(
+                deferred.load_scrollback_line(stable).is_some(),
+                "row {stable} stays readable (its text, or the gap's marker)"
+            );
+        }
+        assert_eq!(
+            deferred
+                .load_scrollback_line(newest)
+                .map(|line| line.as_str().trim_end().to_string()),
+            Some("retained".to_string())
+        );
+        pane.kill();
+        restore_store(&backing);
+        deferred.flush_scrollback().unwrap();
+        // The store holds every row, with each gap written as one marker.
+        let markers_save: usize = gaps.iter().map(|gap| gap.len() - 1).sum();
+        assert_eq!(backing.retained_scrollback_rows(), evicted - markers_save);
+    }
+
+    /// The real store, committing at most `chunk` rows per call. When armed,
+    /// it parks the durability writer after a committed chunk, between two
+    /// transactions of one drain (ft-yccm0.2.1.1).
+    #[derive(Debug)]
+    struct ChunkedPausingStore {
+        inner: Arc<LiveScrollbackSpillSink>,
+        chunk: usize,
+        pause: std::sync::Mutex<(bool, bool)>,
+        pause_signal: std::sync::Condvar,
+    }
+
+    impl ChunkedPausingStore {
+        fn arm(&self) {
+            self.pause.lock().unwrap().0 = true;
+        }
+
+        fn wait_until_parked(&self) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut pause = self.pause.lock().unwrap();
+            while !pause.1 {
+                let now = std::time::Instant::now();
+                assert!(now < deadline, "the writer never parked mid-batch");
+                pause = self
+                    .pause_signal
+                    .wait_timeout(pause, deadline - now)
+                    .unwrap()
+                    .0;
+            }
+        }
+
+        fn release(&self) {
+            self.pause.lock().unwrap().1 = false;
+            self.pause_signal.notify_all();
+        }
+    }
+
+    impl ScrollbackSpillSink for ChunkedPausingStore {
+        fn store_scrollback_line(
+            &self,
+            stable_row: wezterm_term::StableRowIndex,
+            line: &Line,
+            retention: usize,
+        ) -> bool {
+            self.inner
+                .store_scrollback_line(stable_row, line, retention)
+        }
+
+        fn store_scrollback_lines(
+            &self,
+            first: wezterm_term::StableRowIndex,
+            lines: &[Line],
+            retention: usize,
+        ) -> usize {
+            let take = lines.len().min(self.chunk);
+            let acknowledged = self
+                .inner
+                .store_scrollback_lines(first, &lines[..take], retention);
+            let mut pause = self.pause.lock().unwrap();
+            if pause.0 && acknowledged > 0 {
+                *pause = (false, true);
+                self.pause_signal.notify_all();
+                while pause.1 {
+                    pause = self.pause_signal.wait(pause).unwrap();
+                }
+            }
+            acknowledged
+        }
+
+        fn load_scrollback_line(&self, stable_row: wezterm_term::StableRowIndex) -> Option<Line> {
+            self.inner.load_scrollback_line(stable_row)
+        }
+
+        fn load_scrollback_lines(
+            &self,
+            rows: std::ops::Range<wezterm_term::StableRowIndex>,
+        ) -> Vec<Line> {
+            self.inner.load_scrollback_lines(rows)
+        }
+
+        fn oldest_scrollback_row(&self) -> Option<wezterm_term::StableRowIndex> {
+            self.inner.oldest_scrollback_row()
+        }
+
+        fn retained_scrollback_rows(&self) -> usize {
+            self.inner.retained_scrollback_rows()
+        }
+
+        fn retained_scrollback_bytes(&self) -> usize {
+            self.inner.retained_scrollback_bytes()
+        }
+
+        fn snapshot_scrollback(
+            &self,
+            newest: wezterm_term::StableRowIndex,
+            limits: wezterm_term::config::ScrollbackSnapshotLimits,
+        ) -> Result<
+            wezterm_term::config::ScrollbackSnapshot,
+            wezterm_term::config::ScrollbackSpillError,
+        > {
+            self.inner.snapshot_scrollback(newest, limits)
+        }
+
+        fn replace_scrollback_prefix(
+            &self,
+            expected: Option<wezterm_term::config::ScrollbackSnapshotGeneration>,
+            prefix: wezterm_term::config::ScrollbackPrefix<'_>,
+            retention: usize,
+        ) -> Result<
+            wezterm_term::config::ScrollbackReplaceCommit,
+            wezterm_term::config::ScrollbackSpillError,
+        > {
+            self.inner
+                .replace_scrollback_prefix(expected, prefix, retention)
+        }
+
+        fn clear_scrollback(
+            &self,
+        ) -> Result<
+            wezterm_term::config::ScrollbackClearCommit,
+            wezterm_term::config::ScrollbackSpillError,
+        > {
+            self.inner.clear_scrollback()
+        }
+    }
+
+    /// ft session list-durable / export-durable read the store through
+    /// list_live_scrollback_panes and export_live_scrollback_transcript. With
+    /// durability on its own thread they must still see an exact committed
+    /// prefix: while the writer is parked between two transactions of a
+    /// drain, while it is blocked inside a real transaction, and after the
+    /// pane closes.
+    #[test]
+    fn durable_list_and_export_see_a_committed_prefix_while_the_writer_runs_and_after_close() {
+        let dir = tempfile::tempdir().expect("private durable-prefix fixture");
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 914,
+            domain_id: 3,
+            durable_pane_id: [0xd4; 16],
+            command_description: "durable-prefix-test".to_string(),
+        };
+        let durable_pane_id = uuid::Uuid::from_bytes(context.durable_pane_id)
+            .simple()
+            .to_string();
+        let backing =
+            Arc::new(LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context).unwrap());
+        let store = Arc::new(ChunkedPausingStore {
+            inner: Arc::clone(&backing),
+            chunk: 16,
+            pause: std::sync::Mutex::new((false, false)),
+            pause_signal: std::sync::Condvar::new(),
+        });
+        let deferred = deferred_scrollback::DeferredScrollbackSpillSink::with_writer(
+            store.clone(),
+            context.durable_pane_id,
+            deferred_scrollback::DurabilityWriter::spawn(),
+        )
+        .unwrap();
+        let text = |row: usize| format!("durable row {row} 界");
+        let attrs = CellAttributes::blank();
+        let admit = |rows: std::ops::Range<usize>| {
+            for row in rows {
+                let line = Line::from_text(&text(row), &attrs, 1, None);
+                assert!(deferred.store_scrollback_line(row as isize, &line, 1024));
+            }
+        };
+        let committed_prefix = |rows: usize| {
+            let panes = list_live_scrollback_panes(dir.path(), 8).expect("list durable panes");
+            assert_eq!(panes.len(), 1);
+            assert_eq!(panes[0].durable_pane_id, durable_pane_id);
+            assert!(panes[0].error.is_none(), "{:?}", panes[0].error);
+            assert_eq!(panes[0].state, "complete");
+            assert_eq!(panes[0].retained_rows, Some(rows as u64));
+            let export = export_live_scrollback_transcript(
+                dir.path(),
+                &durable_pane_id,
+                256,
+                64 * 1024,
+                4 * 1024 * 1024,
+            )
+            .expect("export durable transcript");
+            assert_eq!(export.retained_rows, rows);
+            assert_eq!(export.next_seq, rows as u64);
+            let exported: Vec<_> = export.transcript.lines().map(str::trim_end).collect();
+            let expected: Vec<_> = (0..rows).map(text).collect();
+            assert_eq!(
+                exported, expected,
+                "export must be an exact committed prefix"
+            );
+        };
+
+        admit(0..32);
+        deferred.flush_scrollback().unwrap();
+        committed_prefix(32);
+
+        // The writer commits one 16-row transaction of a 64-row drain, then
+        // parks with the rest still owned by the queue.
+        store.arm();
+        admit(32..96);
+        deferred.request_scrollback_flush().unwrap();
+        store.wait_until_parked();
+        committed_prefix(48);
+        assert_eq!(
+            deferred.load_scrollback_lines(80..96).len(),
+            16,
+            "uncommitted rows stay readable through the pane's sink"
+        );
+
+        // Blocked inside a real transaction (behind the store's file lease),
+        // the writer has published nothing new.
+        let lease = acquire_live_scrollback_filesystem_mutation_lease(
+            backing.manifest_path.parent().unwrap(),
+            false,
+        )
+        .unwrap();
+        store.release();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while backing.mutation_gate.try_lock().is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer never entered its next transaction"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        committed_prefix(48);
+
+        // Pane close: the close marker hands the rest to the writer, which
+        // commits it and then drops the sink and the store.
+        deferred.request_scrollback_flush().unwrap();
+        let closed_sink = Arc::downgrade(&deferred);
+        let closed_store = Arc::downgrade(&backing);
+        drop(deferred);
+        drop(store);
+        drop(backing);
+        drop(lease);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while closed_sink.upgrade().is_some() || closed_store.upgrade().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer kept the closed pane's store"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        committed_prefix(96);
     }
 
     #[test]
@@ -10460,8 +18527,11 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3);
-        assert_eq!(wal.records().count(), lines.len());
+        // ft-yccm0.2.1.3: the batch WAL is digest-only (v4); it names the
+        // 64 rows by count and digest and the rows live once, in the ledger.
+        assert_eq!(wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4);
+        assert_eq!(wal.appended_record_count, Some(lines.len() as u64));
+        assert_eq!(wal.records().count(), 0);
         let manifest = LiveScrollbackSpillSink::read_manifest(&backing.manifest_path)
             .unwrap()
             .unwrap();
@@ -10479,7 +18549,13 @@ mod tests {
 
     #[test]
     fn deferred_scrollback_batch_failure_keeps_pending_rows_and_reopens_exactly() {
-        for (fault, persisted_prefix) in [(1, 0), (1, 1), (1, 2), (2, 3), (3, 3)] {
+        // ft-yccm0.2.1.3 moved the batch's rows ahead of its WAL. Fault 1
+        // now dies after the rows are synchronized and before the WAL exists;
+        // `persisted_prefix` is how many of the batch's rows that crash left
+        // on disk. No WAL names them, so reopen cuts them and the owner
+        // re-commits them. Faults 2 and 3 die after the digest-only WAL, so
+        // reopen rolls the batch forward from the ledger.
+        for (fault, persisted_prefix) in [(1, 0), (1, 1), (1, 2), (1, 3), (2, 3), (3, 3)] {
             let (dir, backing, deferred) = deferred_test_sink();
             let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
             assert!(deferred.store_scrollback_line(0, &prior, 16));
@@ -10509,18 +18585,20 @@ mod tests {
             let wal = LiveScrollbackSpillSink::read_append_wal(
                 &LiveScrollbackSpillSink::append_wal_path(&backing.manifest_path).unwrap(),
             )
-            .unwrap()
             .unwrap();
-            assert_eq!(wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3);
-            if fault == 1 && persisted_prefix != 0 {
-                // Retain a real synchronized prefix under the actual generated
-                // WAL, independently of the storage unit's partial-write hook.
-                let records: Vec<_> = wal.records().take(persisted_prefix).collect();
-                backing
+            if fault == 1 {
+                assert!(wal.is_none(), "the crash came before the batch's WAL");
+                // Keep the synchronized prefix that crash would have left.
+                let cut = backing
                     .lock_store("test partial batch cut")
                     .unwrap()
-                    .append_lines(backing.active_ledger_pane_id(), &records)
+                    .truncate_after(backing.active_ledger_pane_id(), 1 + persisted_prefix)
                     .unwrap();
+                assert_eq!(cut, persisted_prefix < 3);
+            } else {
+                let wal = wal.unwrap();
+                assert_eq!(wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4);
+                assert_eq!(wal.appended_record_count, Some(3));
             }
             let context = config::ScrollbackSpillSinkContext {
                 pane_id: 913,
@@ -10530,13 +18608,15 @@ mod tests {
             };
             let reopened =
                 LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context).unwrap();
-            assert_eq!(reopened.retained_scrollback_rows(), 4);
-            for (offset, expected) in std::iter::once(&prior).chain(lines.iter()).enumerate() {
-                let mut actual = reopened.load_scrollback_line(offset as isize).unwrap();
-                let mut expected = expected.clone();
-                actual.cells_mut();
-                expected.cells_mut();
-                assert_eq!(actual, expected);
+            if fault == 1 {
+                assert_eq!(
+                    reopened.retained_scrollback_rows(),
+                    1,
+                    "rows no WAL names are cut on reopen"
+                );
+                assert!(reopened.load_scrollback_line(1).is_none());
+            } else {
+                assert_eq!(reopened.retained_scrollback_rows(), 4);
             }
             // A lost receipt is retried only after authoritative reopen. Every
             // acknowledged prefix is exact and does not mint another revision.
@@ -10546,6 +18626,13 @@ mod tests {
                     reopened.store_scrollback_lines(1 + offset as isize, &lines[offset..], 16);
                 assert!(acknowledged > 0 && acknowledged <= lines.len() - offset);
                 offset += acknowledged;
+            }
+            for (offset, expected) in std::iter::once(&prior).chain(lines.iter()).enumerate() {
+                let mut actual = reopened.load_scrollback_line(offset as isize).unwrap();
+                let mut expected = expected.clone();
+                actual.cells_mut();
+                expected.cells_mut();
+                assert_eq!(actual, expected);
             }
             let manifest = LiveScrollbackSpillSink::read_manifest(&reopened.manifest_path)
                 .unwrap()
@@ -10696,7 +18783,7 @@ mod tests {
             .collect();
         let before = std::fs::read(&backing.manifest_path).unwrap();
         assert_eq!(
-            backing.store_scrollback_lines(1, &vec![prior; LIVE_SCROLLBACK_APPEND_MAX_ROWS + 1], 2),
+            backing.store_scrollback_lines(1, &vec![prior; LIVE_SCROLLBACK_WINDOW_MAX_ROWS + 1], 2),
             0
         );
         assert_eq!(std::fs::read(&backing.manifest_path).unwrap(), before);
@@ -10710,7 +18797,9 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(wal.records().count(), 2);
+        // The digest-only WAL (ft-yccm0.2.1.3) names its batch by count;
+        // the bounds below are the same ones a carried batch had to meet.
+        assert_eq!(wal.appended_record_count, Some(2));
         assert_eq!(wal.target_oldest_sequence, 1);
         assert_eq!(wal.target_next_sequence, 3);
         assert_eq!(backing.retained_scrollback_rows(), 2);
@@ -10721,13 +18810,22 @@ mod tests {
                 .is_err()
         );
         let mut too_large = wal.clone();
-        too_large.additional_encrypted_records[0] =
-            "x".repeat(LIVE_SCROLLBACK_APPEND_MAX_RECORD_BYTES);
-        too_large.encrypted_record_bytes =
-            too_large.records().map(|record| record.len() as u64).sum();
+        too_large.encrypted_record_bytes = LIVE_SCROLLBACK_APPEND_MAX_RECORD_BYTES as u64 + 1;
         let error = LiveScrollbackSpillSink::validate_append_wal_identity(&too_large, [0xd3; 16])
             .unwrap_err();
         assert!(error.to_string().contains("encrypted-record length"));
+        let mut over_retention = wal.clone();
+        over_retention.appended_record_count = Some(3);
+        let error =
+            LiveScrollbackSpillSink::validate_append_wal_identity(&over_retention, [0xd3; 16])
+                .unwrap_err();
+        assert!(error.to_string().contains("batch row bounds"));
+        let mut carried = wal.clone();
+        carried.encrypted_record = "x".to_string();
+        assert!(
+            LiveScrollbackSpillSink::validate_append_wal_identity(&carried, [0xd3; 16]).is_err(),
+            "a digest-only WAL never carries a row"
+        );
         let context = config::ScrollbackSpillSinkContext {
             pane_id: 913,
             domain_id: 3,
@@ -10790,7 +18888,11 @@ mod tests {
                 .iter()
                 .map(|text| Line::from_text(text, &CellAttributes::blank(), 2, None))
                 .collect();
-            LIVE_SCROLLBACK_BATCH_FAULT.with(|setting| setting.set(1));
+            // Since ft-yccm0.2.1.3 the batch's rows precede its WAL, so the
+            // fault that leaves a published, unconsumed WAL is 2 (after the
+            // WAL and retention, before the manifest). The WAL is digest-only:
+            // reordering or dropping rows is a digest or count change.
+            LIVE_SCROLLBACK_BATCH_FAULT.with(|setting| setting.set(2));
             let acknowledged = backing.store_scrollback_lines(1, &lines, 16);
             LIVE_SCROLLBACK_BATCH_FAULT.with(|setting| setting.set(0));
             assert_eq!(acknowledged, 0);
@@ -10799,12 +18901,13 @@ mod tests {
             let mut wal = LiveScrollbackSpillSink::read_append_wal(&wal_path)
                 .unwrap()
                 .unwrap();
+            assert_eq!(wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4);
             match mutation {
                 0 => {
-                    wal.additional_encrypted_records.swap(0, 1);
+                    wal.encrypted_record_sha256 = "22".repeat(32);
                 }
                 1 => {
-                    wal.additional_encrypted_records.pop();
+                    wal.appended_record_count = Some(2);
                 }
                 2 => {
                     wal.predecessor_manifest_sha256 = "11".repeat(32);
@@ -10820,11 +18923,7 @@ mod tests {
             std::fs::write(&wal_path, serde_json::to_vec_pretty(&wal).unwrap()).unwrap();
             let content_path = backing.manifest_path.parent().unwrap().join("0.log");
             if mutation == 4 {
-                backing
-                    .lock_store("test exact partial batch before old-prefix tamper")
-                    .unwrap()
-                    .append_line(backing.active_ledger_pane_id(), &wal.encrypted_record)
-                    .unwrap();
+                // The exact batch is on disk; alter a row the manifest seals.
                 let mut content = std::fs::read(&content_path).unwrap();
                 let middle = content.iter().position(|byte| *byte == b'\n').unwrap() / 2;
                 content[middle] = if content[middle] == b'A' { b'B' } else { b'A' };
@@ -10843,6 +18942,2045 @@ mod tests {
             assert_eq!(
                 std::fs::read(&backing.manifest_path).unwrap(),
                 before_manifest
+            );
+        }
+    }
+
+    fn deferred_test_context() -> config::ScrollbackSpillSinkContext {
+        config::ScrollbackSpillSinkContext {
+            pane_id: 913,
+            domain_id: 3,
+            durable_pane_id: [0xd3; 16],
+            command_description: "deferred-scrollback-test".to_string(),
+        }
+    }
+
+    fn digest_only_test_lines(prefix: &str, rows: usize) -> Vec<Line> {
+        (0..rows)
+            .map(|row| {
+                Line::from_text(
+                    &format!("{prefix}-{row:04} {}", "x".repeat(80)),
+                    &CellAttributes::blank(),
+                    2,
+                    None,
+                )
+            })
+            .collect()
+    }
+
+    /// ft-yccm0.2.1.3 AC1: the WAL names a batch by count and digest; every
+    /// row byte reaches disk once, in the ledger; the WAL's size does not grow
+    /// with the batch.
+    #[test]
+    fn digest_only_wal_names_a_batch_without_copying_it_and_rows_are_written_once() {
+        let (_dir, backing, _deferred) = deferred_test_sink();
+        let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+        assert!(backing.store_scrollback_line(0, &prior, 4096));
+        let log_path = backing.manifest_path.parent().unwrap().join("0.log");
+        let wal_path = LiveScrollbackSpillSink::append_wal_path(&backing.manifest_path).unwrap();
+        let ledger_pane_id = backing.active_ledger_pane_id();
+        let mut wal_sizes = Vec::new();
+        let mut next_row = 1_usize;
+        for batch_rows in [4_usize, 256] {
+            let lines = digest_only_test_lines("batch", batch_rows);
+            let log_before = std::fs::metadata(&log_path).unwrap().len();
+            assert_eq!(
+                backing.store_scrollback_lines(next_row as isize, &lines, 4096),
+                batch_rows
+            );
+            let records = backing
+                .lock_store("test digest-only batch rows")
+                .unwrap()
+                .lines_range(
+                    ledger_pane_id,
+                    next_row as u64..(next_row + batch_rows) as u64,
+                    batch_rows,
+                    64 * 1024 * 1024,
+                )
+                .unwrap();
+            assert_eq!(records.len(), batch_rows);
+            let record_bytes: u64 = records.iter().map(|record| record.len() as u64 + 1).sum();
+            assert_eq!(
+                std::fs::metadata(&log_path).unwrap().len() - log_before,
+                record_bytes,
+                "each row is written to the ledger exactly once"
+            );
+            let wal_text = std::fs::read_to_string(&wal_path).unwrap();
+            let wal = LiveScrollbackSpillSink::read_append_wal(&wal_path)
+                .unwrap()
+                .unwrap();
+            assert_eq!(wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4);
+            assert_eq!(wal.appended_record_count, Some(batch_rows as u64));
+            assert_eq!(wal.encrypted_record_bytes + batch_rows as u64, record_bytes);
+            assert!(
+                records
+                    .iter()
+                    .all(|record| !wal_text.contains(record.as_str())),
+                "the WAL holds no row"
+            );
+            wal_sizes.push(wal_text.len());
+            next_row += batch_rows;
+        }
+        // 64x the rows changes only the WAL's numbers, never its size class.
+        assert!(wal_sizes[1] <= wal_sizes[0] + 32, "{wal_sizes:?}");
+        assert!(wal_sizes[1] < 4096, "{wal_sizes:?}");
+    }
+
+    /// A crash after the batch's WAL stage is complete but before it is
+    /// renamed: the rows are kept, and reopen finishes the publication and
+    /// rolls the batch forward from the ledger.
+    #[test]
+    fn digest_only_wal_publication_cut_short_after_a_complete_stage_rolls_forward_on_reopen() {
+        let (dir, backing, _deferred) = deferred_test_sink();
+        let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+        assert!(backing.store_scrollback_line(0, &prior, 16));
+        let first = digest_only_test_lines("first", 2);
+        assert_eq!(backing.store_scrollback_lines(1, &first, 16), 2);
+        let consumed = LiveScrollbackSpillSink::read_append_wal(
+            &LiveScrollbackSpillSink::append_wal_path(&backing.manifest_path).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let lines = digest_only_test_lines("second", 2);
+        // The stage gains a trailing byte after its sync: still the same
+        // complete WAL, but publication's exact readback refuses it.
+        LIVE_SCROLLBACK_WAL_READBACK_FAULT.with(|fault| fault.set(1));
+        let acknowledged = backing.store_scrollback_lines(3, &lines, 16);
+        LIVE_SCROLLBACK_WAL_READBACK_FAULT.with(|fault| fault.set(0));
+        assert_eq!(acknowledged, 0);
+        assert!(
+            backing
+                .lock_state("test stage-kept quarantine")
+                .unwrap()
+                .transaction_quarantined,
+            "rows a complete stage names are kept for recovery"
+        );
+        let ledger_pane_id = backing.active_ledger_pane_id();
+        assert_eq!(
+            backing
+                .lock_store("test stage-kept rows")
+                .unwrap()
+                .next_seq(ledger_pane_id)
+                .unwrap(),
+            5
+        );
+        let stage_path =
+            LiveScrollbackSpillSink::append_wal_stage_path(&backing.manifest_path).unwrap();
+        let staged = LiveScrollbackSpillSink::read_append_wal(&stage_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(staged.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4);
+        assert_ne!(staged, consumed);
+
+        let reopened =
+            LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                .unwrap();
+        assert!(!stage_path.exists(), "the interrupted stage was published");
+        assert_eq!(
+            LiveScrollbackSpillSink::read_append_wal(
+                &LiveScrollbackSpillSink::append_wal_path(&reopened.manifest_path).unwrap()
+            )
+            .unwrap(),
+            Some(staged.clone())
+        );
+        assert_eq!(reopened.retained_scrollback_rows(), 5);
+        for (offset, expected) in std::iter::once(&prior)
+            .chain(first.iter())
+            .chain(lines.iter())
+            .enumerate()
+        {
+            let mut actual = reopened.load_scrollback_line(offset as isize).unwrap();
+            let mut expected = expected.clone();
+            actual.cells_mut();
+            expected.cells_mut();
+            assert_eq!(actual, expected);
+        }
+        let manifest = LiveScrollbackSpillSink::read_manifest(&reopened.manifest_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.next_seq, 5);
+        assert_eq!(manifest.revision, Some(staged.target_revision));
+    }
+
+    /// Publication refused before this batch's stage was written: no WAL can
+    /// name the batch, so its rows are cut at once and the sink stays usable.
+    #[test]
+    fn digest_only_wal_publication_refused_before_its_stage_cuts_the_unnamed_rows() {
+        let (_dir, backing, _deferred) = deferred_test_sink();
+        let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+        assert!(backing.store_scrollback_line(0, &prior, 16));
+        assert_eq!(
+            backing.store_scrollback_lines(1, &digest_only_test_lines("first", 2), 16),
+            2
+        );
+        let wal_path = LiveScrollbackSpillSink::append_wal_path(&backing.manifest_path).unwrap();
+        let stage_path =
+            LiveScrollbackSpillSink::append_wal_stage_path(&backing.manifest_path).unwrap();
+        // Another transaction's complete stage makes publication refuse.
+        std::fs::copy(&wal_path, stage_path).unwrap();
+        let log_path = backing.manifest_path.parent().unwrap().join("0.log");
+        let log_before = std::fs::read(&log_path).unwrap();
+        let manifest_before = std::fs::read(&backing.manifest_path).unwrap();
+        let wal_before = std::fs::read(&wal_path).unwrap();
+
+        assert_eq!(
+            backing.store_scrollback_lines(3, &digest_only_test_lines("second", 2), 16),
+            0
+        );
+        assert!(
+            !backing
+                .lock_state("test cut without quarantine")
+                .unwrap()
+                .transaction_quarantined
+        );
+        assert_eq!(
+            std::fs::read(&log_path).unwrap(),
+            log_before,
+            "the unnamed rows were cut"
+        );
+        assert_eq!(
+            std::fs::read(&backing.manifest_path).unwrap(),
+            manifest_before
+        );
+        assert_eq!(std::fs::read(&wal_path).unwrap(), wal_before);
+        assert_eq!(backing.retained_scrollback_rows(), 3);
+        assert!(backing.load_scrollback_line(3).is_none());
+    }
+
+    /// A published digest-only WAL whose batch is torn or missing in the
+    /// ledger cannot be rolled forward or back: reopen refuses and writes
+    /// nothing.
+    #[test]
+    fn digest_only_wal_recovery_refuses_a_torn_or_missing_batch_without_writing() {
+        for damage in ["torn", "missing"] {
+            let (dir, backing, _deferred) = deferred_test_sink();
+            let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+            assert!(backing.store_scrollback_line(0, &prior, 16));
+            LIVE_SCROLLBACK_BATCH_FAULT.with(|setting| setting.set(2));
+            let acknowledged =
+                backing.store_scrollback_lines(1, &digest_only_test_lines("batch", 3), 16);
+            LIVE_SCROLLBACK_BATCH_FAULT.with(|setting| setting.set(0));
+            assert_eq!(acknowledged, 0);
+            let log_path = backing.manifest_path.parent().unwrap().join("0.log");
+            let mut content = std::fs::read(&log_path).unwrap();
+            let last_start = content[..content.len() - 1]
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .unwrap()
+                + 1;
+            if damage == "torn" {
+                let middle = last_start + (content.len() - last_start) / 2;
+                content[middle] = if content[middle] == b'A' { b'B' } else { b'A' };
+            } else {
+                content.truncate(last_start);
+            }
+            std::fs::write(&log_path, &content).unwrap();
+            let manifest_before = std::fs::read(&backing.manifest_path).unwrap();
+            let error =
+                LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                    .err()
+                    .unwrap_or_else(|| panic!("{damage}: a damaged batch must refuse"));
+            assert!(
+                format!("{error:#}").contains("digest-only append WAL")
+                    || format!("{error:#}").contains("batch their append WAL names"),
+                "{damage}: {error:#}"
+            );
+            assert_eq!(std::fs::read(&log_path).unwrap(), content, "{damage}");
+            assert_eq!(
+                std::fs::read(&backing.manifest_path).unwrap(),
+                manifest_before,
+                "{damage}"
+            );
+        }
+    }
+
+    fn copy_scrollback_tree(from: &std::path::Path, to: &std::path::Path) {
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                std::fs::create_dir(&target).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+
+                    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
+                copy_scrollback_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
+    /// Recovery fuzz (ft-yccm0.2.1.3): a crash between a digest-only WAL and
+    /// its manifest, then one flipped bit at spread offsets of the manifest,
+    /// the WAL or the ledger, each in a fresh copy of the store. Reopen either
+    /// refuses or serves exactly the original rows. It never panics, and never
+    /// serves a changed, reordered or missing row.
+    #[test]
+    fn digest_only_recovery_refuses_or_exactly_restores_after_any_single_bit_flip() {
+        let (dir, backing, _deferred) = deferred_test_sink();
+        let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+        assert!(backing.store_scrollback_line(0, &prior, 16));
+        let lines = digest_only_test_lines("fuzz", 3);
+        LIVE_SCROLLBACK_BATCH_FAULT.with(|setting| setting.set(2));
+        assert_eq!(backing.store_scrollback_lines(1, &lines, 16), 0);
+        LIVE_SCROLLBACK_BATCH_FAULT.with(|setting| setting.set(0));
+        let expected: Vec<Line> = std::iter::once(prior).chain(lines).collect();
+        let pane = uuid::Uuid::from_bytes([0xd3; 16]).simple().to_string();
+
+        let reopen = |flip: Option<(&str, u64, u8)>| {
+            let copy = tempfile::tempdir().unwrap();
+            copy_scrollback_tree(dir.path(), copy.path());
+            if let Some((name, offset, bit)) = flip {
+                let path = copy.path().join(&pane).join(name);
+                let mut bytes = std::fs::read(&path).unwrap();
+                bytes[usize::try_from(offset).unwrap()] ^= 1 << bit;
+                std::fs::write(&path, bytes).unwrap();
+            }
+            let case = format!("{flip:?}");
+            let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                LiveScrollbackSpillSink::new(copy.path().to_path_buf(), &deferred_test_context())
+            }))
+            .unwrap_or_else(|_| panic!("{case}: reopen panicked"));
+            let Ok(reopened) = opened else {
+                return false;
+            };
+            for (row, expected) in expected.iter().enumerate() {
+                let mut actual = reopened
+                    .load_scrollback_line(row as isize)
+                    .unwrap_or_else(|| panic!("{case}: accepted reopen lost row {row}"));
+                let mut expected = expected.clone();
+                actual.cells_mut();
+                expected.cells_mut();
+                assert_eq!(
+                    actual, expected,
+                    "{case}: accepted reopen changed row {row}"
+                );
+            }
+            assert!(
+                reopened
+                    .load_scrollback_line(expected.len() as isize)
+                    .is_none()
+            );
+            true
+        };
+
+        assert!(reopen(None), "the uncorrupted crash state rolls forward");
+        let mut refused = 0;
+        for name in ["manifest.json", ".append-wal.v1.json", "0.log"] {
+            let len = std::fs::metadata(dir.path().join(&pane).join(name))
+                .unwrap()
+                .len();
+            for step in 0..24_u64 {
+                let offset = len * (2 * step + 1) / 48;
+                if !reopen(Some((name, offset, (step % 8) as u8))) {
+                    refused += 1;
+                }
+            }
+        }
+        assert!(refused > 0, "single-bit corruption is detected");
+    }
+
+    const CRASH_CHILD_STEP: &str = "FT_TEST_SCROLLBACK_CRASH_STEP";
+    const CRASH_CHILD_BASE: &str = "FT_TEST_SCROLLBACK_CRASH_BASE";
+    const CRASH_TEST: &str = "tests::scrollback_transaction_killed_at_every_named_step_recovers_an_exact_committed_prefix";
+    /// Every named crash point of a batch transaction, in order, and whether
+    /// the killed transaction's batch is rolled forward on reopen.
+    const CRASH_STEPS: [(&str, bool); 8] = [
+        ("rows_appended", false),
+        ("wal_staged", true),
+        ("wal_renamed", true),
+        ("retention_pruned", true),
+        ("compacted", true),
+        ("manifest_staged", true),
+        ("manifest_renamed", true),
+        ("committed", true),
+    ];
+
+    /// `count` rows of `seq` output starting at `first`: the decimal numbers,
+    /// one per row, as the M.1 seq corpus prints them.
+    fn seq_corpus_lines(first: usize, count: usize) -> Vec<Line> {
+        (first..first + count)
+            .map(|number| Line::from_text(&number.to_string(), &CellAttributes::blank(), 1, None))
+            .collect()
+    }
+
+    /// Syncs per MiB of seq output a sink pays, fed the way the durability
+    /// writer feeds it: windows of at most one store batch, at the default
+    /// 3500-row retention. Returns (syncs, windows, ingested bytes).
+    fn seq_corpus_durability_syncs(sink: &LiveScrollbackSpillSink, rows: usize) -> (u64, u64, u64) {
+        const RETENTION: usize = 3500;
+        let window_rows = LIVE_SCROLLBACK_APPEND_MAX_ROWS.min(RETENTION);
+        let first = seq_corpus_lines(0, 1);
+        assert!(sink.store_scrollback_line(0, &first[0], RETENTION));
+        let before = frankenterm_core::storage::mmap_store::thread_durability_sync_count();
+        let (mut windows, mut bytes, mut row) = (0_u64, 0_u64, 1_usize);
+        while row < rows {
+            let lines = seq_corpus_lines(row, window_rows.min(rows - row));
+            let stored = sink.store_scrollback_lines(row as isize, &lines, RETENTION);
+            assert_eq!(stored, lines.len(), "window at row {row}");
+            bytes += lines
+                .iter()
+                .map(|line| line.as_str().len() as u64 + 1)
+                .sum::<u64>();
+            windows += 1;
+            row += stored;
+        }
+        let syncs = frankenterm_core::storage::mmap_store::thread_durability_sync_count() - before;
+        (syncs, windows, bytes)
+    }
+
+    /// ft-yccm0.2.1.2 AC4 instrument: ordered-durability syncs per MiB of
+    /// the seq corpus through the per-window store protocol.
+    #[test]
+    fn durability_syncs_per_mib_on_the_seq_corpus() {
+        let (_dir, backing, _deferred) = deferred_test_sink();
+        let (syncs, windows, bytes) = seq_corpus_durability_syncs(&backing, 100_000);
+        let mib = bytes as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "seq corpus per-window protocol: {windows} windows, {bytes} bytes, {syncs} syncs = \
+             {:.2} syncs/window, {:.1} syncs/MiB",
+            syncs as f64 / windows as f64,
+            syncs as f64 / mib,
+        );
+        assert!(syncs >= windows, "every window makes its rows durable");
+    }
+
+    fn ledger_records(sink: &LiveScrollbackSpillSink, range: std::ops::Range<u64>) -> Vec<String> {
+        let rows = usize::try_from(range.end - range.start).unwrap();
+        sink.lock_store("test ledger records")
+            .unwrap()
+            .lines_range(sink.active_ledger_pane_id(), range, rows, 64 * 1024 * 1024)
+            .unwrap()
+    }
+
+    fn published_row_segments(
+        sink: &LiveScrollbackSpillSink,
+    ) -> Vec<mux::guardian_output_journal::GuardianScrollbackRowSegment> {
+        let manifest = LiveScrollbackSpillSink::read_manifest(&sink.manifest_path)
+            .unwrap()
+            .unwrap();
+        LiveScrollbackSpillSink::manifest_row_segments(&manifest)
+            .unwrap()
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    fn assert_rows_read_back(sink: &LiveScrollbackSpillSink, rows: &[&Line]) {
+        for (offset, expected) in rows.iter().enumerate() {
+            let mut actual = sink.load_scrollback_line(offset as isize).unwrap();
+            let mut expected = (*expected).clone();
+            actual.cells_mut();
+            expected.cells_mut();
+            assert_eq!(actual, expected, "row {offset}");
+        }
+    }
+
+    /// ft-yccm0.2.1.4: after the first row, batches store compact rows under
+    /// one nonce segment that the manifest and the starting WAL name once.
+    /// Since ft-yccm0.2.1.4 option A each batch seals its rows as one
+    /// segment (v5): the segment's tail, which carries the tag as a compact
+    /// row did, is exactly 128 bytes shorter than the v3 record of the same
+    /// payload, and every other row also drops the tag. A reopened sink
+    /// reads every row back exactly.
+    #[test]
+    fn batches_store_compact_rows_under_one_manifest_named_nonce_segment() {
+        use mux::guardian_output_journal::{
+            GuardianEncryptedScrollbackRow, GuardianScrollbackRowIdentity,
+            compact_scrollback_row_record_bytes, is_scrollback_segment_record,
+            is_scrollback_segment_tail, scrollback_segment_record_bytes,
+        };
+
+        let (dir, backing, _deferred) = deferred_test_sink();
+        let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+        assert!(backing.store_scrollback_line(0, &prior, 4096));
+        assert!(published_row_segments(&backing).is_empty());
+        let first = digest_only_test_lines("first", 3);
+        let second = digest_only_test_lines("second", 5);
+        assert_eq!(backing.store_scrollback_lines(1, &first, 4096), 3);
+        let segments = published_row_segments(&backing);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].first_sequence(), 1);
+        let wal_path = LiveScrollbackSpillSink::append_wal_path(&backing.manifest_path).unwrap();
+        let wal = LiveScrollbackSpillSink::read_append_wal(&wal_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            wal.row_segment,
+            Some(LiveScrollbackRowSegmentV1::from_segment(segments[0]))
+        );
+        assert_eq!(backing.store_scrollback_lines(4, &second, 4096), 5);
+        assert_eq!(
+            published_row_segments(&backing),
+            segments,
+            "a continuing batch starts no segment"
+        );
+
+        let records = ledger_records(&backing, 0..9);
+        assert!(
+            GuardianEncryptedScrollbackRow::has_encrypted_prefix(&records[0]),
+            "the first row keeps the self-describing v3 form"
+        );
+        let epoch = backing
+            .lock_state("test compact epoch")
+            .unwrap()
+            .content_epoch;
+        let cipher = backing
+            .lock_keyring("test v3 comparison")
+            .unwrap()
+            .latest_active_cipher()
+            .unwrap();
+        for (offset, (record, line)) in records[1..]
+            .iter()
+            .zip(first.iter().chain(second.iter()))
+            .enumerate()
+        {
+            let sequence = offset as u64 + 1;
+            assert!(is_scrollback_segment_record(record), "row {sequence}");
+            let tail = is_scrollback_segment_tail(record);
+            assert_eq!(
+                tail,
+                matches!(sequence, 3 | 8),
+                "row {sequence}: each batch ends its segment"
+            );
+            let identity =
+                GuardianScrollbackRowIdentity::new([0xd3; 16], epoch, 7, sequence as i64, sequence)
+                    .unwrap();
+            let v3 = encode_exact_scrollback_line_record(line, &cipher, identity).unwrap();
+            let payload_bytes = exact_scrollback_line_payload(line).unwrap().len();
+            let tag_bytes = compact_scrollback_row_record_bytes(payload_bytes).unwrap()
+                - scrollback_segment_record_bytes(payload_bytes, false).unwrap();
+            assert_eq!(
+                v3.len() - record.len(),
+                if tail { 128 } else { 128 + tag_bytes },
+                "row {sequence}"
+            );
+        }
+
+        let reopened =
+            LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                .unwrap();
+        let rows: Vec<&Line> = std::iter::once(&prior)
+            .chain(first.iter())
+            .chain(second.iter())
+            .collect();
+        assert_rows_read_back(&reopened, &rows);
+    }
+
+    /// ft-yccm0.2.1.4: a process seals a batch under the segment it starts
+    /// and dies before the WAL that would name that segment. Nothing names
+    /// the segment, so its rows cannot open and reopen cuts them (rows under
+    /// a published segment are adopted instead, ft-yccm0.2.1.2). The reopened
+    /// sink never seals those sequences under the lost base: its first batch
+    /// draws a fresh segment, so every reused sequence gets a new nonce.
+    #[test]
+    fn a_reopen_after_a_crash_reseals_lost_sequences_under_a_fresh_nonce_segment() {
+        use mux::guardian_output_journal::GuardianScrollbackRowLocation;
+
+        let (dir, backing, _deferred) = deferred_test_sink();
+        let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+        assert!(backing.store_scrollback_line(0, &prior, 4096));
+        let first = digest_only_test_lines("first", 2);
+        assert_eq!(backing.store_scrollback_lines(1, &first, 4096), 2);
+        let first_segment = published_row_segments(&backing)[0];
+
+        // A second process starts its own segment for its first batch; the
+        // rows reach the ledger and it stops before its WAL (fault point 1).
+        let crashed =
+            LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                .unwrap();
+        let lost = digest_only_test_lines("lost", 2);
+        LIVE_SCROLLBACK_BATCH_FAULT.with(|fault| fault.set(1));
+        let acknowledged = crashed.store_scrollback_lines(3, &lost, 4096);
+        LIVE_SCROLLBACK_BATCH_FAULT.with(|fault| fault.set(0));
+        assert_eq!(acknowledged, 0);
+        let lost_records = ledger_records(&crashed, 3..5);
+        let crashed_segment = {
+            let stream = crashed.row_nonce_stream.lock().unwrap();
+            let stream = stream.as_ref().unwrap();
+            assert_eq!(stream.next_sequence(), 5);
+            stream.segment()
+        };
+        assert_eq!(crashed_segment.first_sequence(), 3);
+        assert_ne!(crashed_segment.nonce_base(), first_segment.nonce_base());
+        drop(crashed);
+
+        let reopened =
+            LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                .unwrap();
+        assert_eq!(
+            reopened.retained_scrollback_rows(),
+            3,
+            "reopen cut the rows of the unnamed segment"
+        );
+        assert!(reopened.row_nonce_stream.lock().unwrap().is_none());
+        let replacement = digest_only_test_lines("replacement", 2);
+        assert_eq!(reopened.store_scrollback_lines(3, &replacement, 4096), 2);
+        let segments = published_row_segments(&reopened);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0], first_segment);
+        let fresh = segments[1];
+        assert_eq!(fresh.first_sequence(), 3);
+        assert_ne!(
+            fresh.nonce_base(),
+            crashed_segment.nonce_base(),
+            "the reopened sink drew a fresh base"
+        );
+
+        // Each reused sequence opens only under the segment that sealed it.
+        let epoch = reopened
+            .lock_state("test crash epoch")
+            .unwrap()
+            .content_epoch;
+        let cipher = reopened
+            .lock_keyring("test crash cipher")
+            .unwrap()
+            .latest_active_cipher()
+            .unwrap();
+        // Both batches sealed their two rows as one v5 segment, which opens
+        // whole (ft-yccm0.2.1.4 option A).
+        let records = ledger_records(&reopened, 3..5);
+        assert!(
+            records
+                .iter()
+                .zip(&lost_records)
+                .all(|(record, lost)| record != lost)
+        );
+        let location = GuardianScrollbackRowLocation::new([0xd3; 16], epoch, 3, 3).unwrap();
+        let open = |segment, records: &[String]| {
+            let refs: Vec<&str> = records.iter().map(String::as_str).collect();
+            cipher
+                .open_scrollback_segment(
+                    segment,
+                    location,
+                    &refs,
+                    1 << 20,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                )
+                .is_ok()
+        };
+        assert!(open(&fresh, &records));
+        assert!(!open(&crashed_segment, &records));
+        assert!(open(&crashed_segment, &lost_records));
+        assert!(!open(&fresh, &lost_records));
+        let rows: Vec<&Line> = std::iter::once(&prior)
+            .chain(first.iter())
+            .chain(replacement.iter())
+            .collect();
+        assert_rows_read_back(&reopened, &rows);
+    }
+
+    /// A batch cut back in the same process (its WAL was refused before it
+    /// was staged) is retried under a fresh segment: the live stream already
+    /// consumed those sequences and refuses them.
+    #[test]
+    fn a_batch_cut_back_in_process_is_retried_under_a_fresh_nonce_segment() {
+        let (_dir, backing, _deferred) = deferred_test_sink();
+        let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+        assert!(backing.store_scrollback_line(0, &prior, 16));
+        let first = digest_only_test_lines("first", 2);
+        assert_eq!(backing.store_scrollback_lines(1, &first, 16), 2);
+        let first_segment = published_row_segments(&backing)[0];
+        let wal_path = LiveScrollbackSpillSink::append_wal_path(&backing.manifest_path).unwrap();
+        let stage_path =
+            LiveScrollbackSpillSink::append_wal_stage_path(&backing.manifest_path).unwrap();
+        // Another transaction's complete stage makes publication refuse.
+        std::fs::copy(&wal_path, &stage_path).unwrap();
+        let second = digest_only_test_lines("second", 2);
+        assert_eq!(backing.store_scrollback_lines(3, &second, 16), 0);
+        assert_eq!(backing.retained_scrollback_rows(), 3, "the batch was cut");
+        assert_eq!(
+            backing
+                .row_nonce_stream
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .next_sequence(),
+            5
+        );
+        std::fs::remove_file(&stage_path).unwrap();
+
+        assert_eq!(backing.store_scrollback_lines(3, &second, 16), 2);
+        let segments = published_row_segments(&backing);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0], first_segment);
+        assert_eq!(segments[1].first_sequence(), 3);
+        assert_ne!(segments[1].nonce_base(), first_segment.nonce_base());
+        let rows: Vec<&Line> = std::iter::once(&prior)
+            .chain(first.iter())
+            .chain(second.iter())
+            .collect();
+        assert_rows_read_back(&backing, &rows);
+    }
+
+    /// Planted negatives for the stored segment tables: a table that repeats
+    /// a nonce base, starts out of order, keeps a segment with no retained
+    /// row, names a segment past the ledger's end, uses non-canonical hex or
+    /// exceeds its bound is refused; so is a WAL that starts a segment
+    /// reusing a retained base or away from its batch.
+    #[test]
+    fn row_segment_tables_refuse_reused_bases_and_noncanonical_forms() {
+        use mux::guardian_output_journal::{
+            GuardianOutputCipher, GuardianScrollbackRowNonceStream, GuardianScrollbackRowSegment,
+        };
+
+        let cipher = GuardianOutputCipher::try_from_key_slice(&[0x5a; 32]).unwrap();
+        let segment = |first: u64| {
+            GuardianScrollbackRowNonceStream::begin(&cipher, first, [])
+                .unwrap()
+                .segment()
+        };
+        let entries =
+            |segments: &[GuardianScrollbackRowSegment]| -> Vec<LiveScrollbackRowSegmentV1> {
+                segments
+                    .iter()
+                    .map(|segment| LiveScrollbackRowSegmentV1::from_segment(*segment))
+                    .collect()
+            };
+        let decode = |segments: &[LiveScrollbackRowSegmentV1], oldest: Option<u64>, next: u64| {
+            LiveScrollbackRowSegments::from_manifest(segments, oldest, next)
+        };
+        let (a, b, c) = (segment(0), segment(10), segment(20));
+        let table = decode(&entries(&[a, b, c]), Some(5), 30).unwrap();
+        assert_eq!(table.covering(4), Some(a));
+        assert_eq!(table.covering(10), Some(b));
+        assert_eq!(table.covering(29), Some(c));
+        let mut trimmed = table;
+        trimmed.retain_from(Some(10));
+        assert_eq!(trimmed.iter().copied().collect::<Vec<_>>(), vec![b, c]);
+        trimmed.retain_from(Some(25));
+        assert_eq!(trimmed.iter().copied().collect::<Vec<_>>(), vec![c]);
+        trimmed.retain_from(None);
+        assert_eq!(trimmed, LiveScrollbackRowSegments::EMPTY);
+
+        assert!(
+            decode(&entries(&[a, b, c]), Some(10), 30).is_err(),
+            "untrimmed"
+        );
+        assert!(
+            decode(&entries(&[a, b, c]), Some(5), 20).is_err(),
+            "past the end"
+        );
+        assert!(
+            decode(&entries(&[b, a]), Some(0), 30).is_err(),
+            "out of order"
+        );
+        let reused = GuardianScrollbackRowSegment::new(a.key_id(), a.nonce_base(), 20).unwrap();
+        assert!(
+            decode(&entries(&[a, b, reused]), Some(5), 30).is_err(),
+            "reused base"
+        );
+        let mut uppercase = entries(&[a]);
+        uppercase[0].nonce_base = "AB".repeat(16);
+        assert!(decode(&uppercase, Some(0), 1).is_err(), "uppercase hex");
+        let mut zero = entries(&[a]);
+        zero[0].nonce_base = "0".repeat(32);
+        assert!(decode(&zero, Some(0), 1).is_err(), "zero base");
+        let bound = LIVE_SCROLLBACK_MAX_ROW_SEGMENTS as u64;
+        let many: Vec<_> = (0..=bound).map(segment).collect();
+        assert!(
+            decode(&entries(&many), Some(0), bound + 1).is_err(),
+            "over the bound"
+        );
+        let full = decode(&entries(&many[1..]), Some(1), bound + 1).unwrap();
+        assert!(full.is_full());
+        let mut overfull = full;
+        assert!(overfull.push(segment(bound + 1)).is_err());
+        assert_eq!(
+            decode(&[], None, 0).unwrap(),
+            LiveScrollbackRowSegments::EMPTY
+        );
+
+        // A WAL from a real batch, then planted segments it might start.
+        let (_dir, backing, _deferred) = deferred_test_sink();
+        let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+        assert!(backing.store_scrollback_line(0, &prior, 4096));
+        assert_eq!(
+            backing.store_scrollback_lines(1, &digest_only_test_lines("first", 2), 4096),
+            2
+        );
+        let retained = backing.lock_state("test wal table").unwrap().row_segments;
+        let live = retained.last().unwrap();
+        assert_eq!(
+            backing.store_scrollback_lines(3, &digest_only_test_lines("second", 2), 4096),
+            2
+        );
+        let wal = LiveScrollbackSpillSink::read_append_wal(
+            &LiveScrollbackSpillSink::append_wal_path(&backing.manifest_path).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(wal.appended_sequence, 3);
+        assert_eq!(
+            LiveScrollbackSpillSink::append_wal_target_row_segments(&wal, &retained).unwrap(),
+            retained,
+            "a continuing batch keeps the table"
+        );
+        let mut planted = wal.clone();
+        planted.row_segment = Some(LiveScrollbackRowSegmentV1::from_segment(
+            GuardianScrollbackRowSegment::new(live.key_id(), live.nonce_base(), 3).unwrap(),
+        ));
+        assert!(
+            LiveScrollbackSpillSink::append_wal_target_row_segments(&planted, &retained).is_err(),
+            "a started segment reusing a retained base is refused"
+        );
+        let elsewhere = segment(2);
+        planted.row_segment = Some(LiveScrollbackRowSegmentV1::from_segment(elsewhere));
+        assert!(
+            LiveScrollbackSpillSink::append_wal_target_row_segments(&planted, &retained).is_err(),
+            "a segment must start at its batch"
+        );
+        let started = segment(3);
+        planted.row_segment = Some(LiveScrollbackRowSegmentV1::from_segment(started));
+        let target =
+            LiveScrollbackSpillSink::append_wal_target_row_segments(&planted, &retained).unwrap();
+        assert_eq!(
+            target.iter().copied().collect::<Vec<_>>(),
+            vec![live, started]
+        );
+    }
+
+    /// With the segment table full, a batch that needs a new segment writes
+    /// self-describing v3 rows. Once retention frees a slot, batches are
+    /// compact again (sealed segments since ft-yccm0.2.1.4 option A). Every
+    /// row reads back exactly throughout.
+    #[test]
+    fn a_full_row_segment_table_falls_back_to_v3_rows_until_retention_frees_a_slot() {
+        use mux::guardian_output_journal::{
+            GuardianEncryptedScrollbackRow, is_scrollback_segment_record,
+        };
+
+        let (dir, backing, _deferred) = deferred_test_sink();
+        let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+        assert!(backing.store_scrollback_line(0, &prior, 4096));
+        let mut rows = vec![prior];
+        let mut sink = backing;
+        // Each process starts its own segment.
+        for cycle in 0..LIVE_SCROLLBACK_MAX_ROW_SEGMENTS {
+            let lines = digest_only_test_lines(&format!("cycle{cycle}"), 1);
+            assert_eq!(
+                sink.store_scrollback_lines(rows.len() as isize, &lines, 4096),
+                1
+            );
+            rows.extend(lines);
+            sink = Arc::new(
+                LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            published_row_segments(&sink).len(),
+            LIVE_SCROLLBACK_MAX_ROW_SEGMENTS
+        );
+
+        let overflow = digest_only_test_lines("overflow", 2);
+        let at = rows.len();
+        assert_eq!(sink.store_scrollback_lines(at as isize, &overflow, 4096), 2);
+        rows.extend(overflow);
+        let records = ledger_records(&sink, at as u64..rows.len() as u64);
+        assert!(
+            records
+                .iter()
+                .all(|record| GuardianEncryptedScrollbackRow::has_encrypted_prefix(record)),
+            "a full table leaves the batch in v3 rows"
+        );
+        assert_eq!(
+            published_row_segments(&sink).len(),
+            LIVE_SCROLLBACK_MAX_ROW_SEGMENTS
+        );
+        let refs: Vec<&Line> = rows.iter().collect();
+        assert_rows_read_back(&sink, &refs);
+
+        // Retention down to four rows: the table keeps the segments those
+        // rows need, so the next batch can start one again.
+        let pruning = digest_only_test_lines("pruning", 2);
+        let at = rows.len();
+        assert_eq!(sink.store_scrollback_lines(at as isize, &pruning, 4), 2);
+        rows.extend(pruning);
+        assert!(published_row_segments(&sink).len() < LIVE_SCROLLBACK_MAX_ROW_SEGMENTS);
+        let compact = digest_only_test_lines("compact", 2);
+        let at = rows.len();
+        assert_eq!(sink.store_scrollback_lines(at as isize, &compact, 4), 2);
+        rows.extend(compact);
+        let records = ledger_records(&sink, at as u64..rows.len() as u64);
+        assert!(
+            records
+                .iter()
+                .all(|record| is_scrollback_segment_record(record))
+        );
+        let segments = published_row_segments(&sink);
+        assert_eq!(segments.last().unwrap().first_sequence(), at as u64);
+        for (offset, expected) in rows.iter().enumerate().skip(rows.len() - 4) {
+            let mut actual = sink.load_scrollback_line(offset as isize).unwrap();
+            let mut expected = expected.clone();
+            actual.cells_mut();
+            expected.cells_mut();
+            assert_eq!(actual, expected, "row {offset}");
+        }
+    }
+
+    fn windowed_test_sink(dir: &std::path::Path) -> LiveScrollbackSpillSink {
+        LiveScrollbackSpillSink::open(
+            dir.to_path_buf(),
+            &deferred_test_context(),
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap()
+    }
+
+    fn published_manifest(sink: &LiveScrollbackSpillSink) -> LiveScrollbackManifestV1 {
+        LiveScrollbackSpillSink::read_manifest(&sink.manifest_path)
+            .unwrap()
+            .unwrap()
+    }
+
+    /// ft-yccm0.2.1.2 AC1/AC2: with a publication cadence, a process's first
+    /// batch (which starts its nonce segment) is a single-batch transaction
+    /// that publishes; every later commit window appends its rows under
+    /// exactly one sync and leaves the manifest alone, while the sink reads
+    /// the live rows and retention evicts logically. A flush publishes the
+    /// tail as one cumulative WAL, prunes, and the manifest then describes
+    /// the live state, at the revision the windows reached.
+    #[test]
+    fn commit_windows_append_under_one_sync_and_a_flush_publishes_the_tail() {
+        const RETENTION: usize = 6;
+        let dir = tempfile::tempdir().unwrap();
+        let sink = windowed_test_sink(dir.path());
+        let mut rows = vec![Line::from_text("prior", &CellAttributes::blank(), 1, None)];
+        assert!(sink.store_scrollback_line(0, &rows[0], RETENTION));
+        let first = digest_only_test_lines("first", 2);
+        assert_eq!(sink.store_scrollback_lines(1, &first, RETENTION), 2);
+        rows.extend(first);
+        let published = published_manifest(&sink);
+        assert_eq!(published.next_seq, 3);
+        assert!(
+            sink.lock_state("test window state")
+                .unwrap()
+                .published
+                .is_none()
+        );
+
+        for window in 0..3 {
+            let lines = digest_only_test_lines(&format!("window{window}"), 3);
+            let before = frankenterm_core::storage::mmap_store::thread_durability_sync_count();
+            assert_eq!(
+                sink.store_scrollback_lines(rows.len() as isize, &lines, RETENTION),
+                3
+            );
+            assert_eq!(
+                frankenterm_core::storage::mmap_store::thread_durability_sync_count() - before,
+                1,
+                "window {window} costs exactly one sync"
+            );
+            rows.extend(lines);
+        }
+        assert_eq!(
+            published_manifest(&sink),
+            published,
+            "windows leave the manifest alone"
+        );
+        let ledger_pane_id = sink.active_ledger_pane_id();
+        {
+            let store = sink.lock_store("test tail ledger").unwrap();
+            assert_eq!(store.next_seq(ledger_pane_id).unwrap(), 12);
+            assert_eq!(
+                store.oldest_seq(ledger_pane_id),
+                Some(0),
+                "nothing is pruned before publication"
+            );
+        }
+        assert_eq!(sink.retained_scrollback_rows(), RETENTION);
+        assert_eq!(sink.oldest_scrollback_row(), Some(6));
+        assert!(sink.load_scrollback_line(5).is_none(), "evicted logically");
+        let live: Vec<&Line> = rows[6..].iter().collect();
+        for (offset, expected) in live.iter().enumerate() {
+            let mut actual = sink.load_scrollback_line(6 + offset as isize).unwrap();
+            let mut expected = (*expected).clone();
+            actual.cells_mut();
+            expected.cells_mut();
+            assert_eq!(actual, expected);
+        }
+
+        sink.flush_scrollback().unwrap();
+        let manifest = published_manifest(&sink);
+        assert_eq!((manifest.oldest_seq, manifest.next_seq), (Some(6), 12));
+        assert_eq!(
+            manifest.revision,
+            published.revision.map(|revision| revision + 9),
+            "the revision advanced by each window's rows"
+        );
+        let wal = LiveScrollbackSpillSink::read_append_wal(
+            &LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V5);
+        assert_eq!(wal.appended_sequence, 3);
+        assert_eq!(wal.appended_record_count, Some(9));
+        assert_eq!(wal.evicted_record_count, Some(6));
+        assert!(
+            sink.lock_state("test published")
+                .unwrap()
+                .published
+                .is_none()
+        );
+        assert_eq!(
+            sink.lock_store("test pruned")
+                .unwrap()
+                .oldest_seq(ledger_pane_id),
+            Some(6)
+        );
+        drop(sink);
+        let reopened =
+            LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                .unwrap();
+        assert_rows_read_back_from(&reopened, 6, &live);
+    }
+
+    fn assert_rows_read_back_from(sink: &LiveScrollbackSpillSink, first: isize, rows: &[&Line]) {
+        for (offset, expected) in rows.iter().enumerate() {
+            let row = first + offset as isize;
+            let mut actual = sink
+                .load_scrollback_line(row)
+                .unwrap_or_else(|| panic!("row {row} is missing"));
+            let mut expected = (*expected).clone();
+            actual.cells_mut();
+            expected.cells_mut();
+            assert_eq!(actual, expected, "row {row}");
+        }
+    }
+
+    /// ft-yccm0.2.1.4 option A: batches and commit windows seal their rows
+    /// as segments, one AEAD operation each, and retention stays exact. The
+    /// oldest retained row here sits inside a segment whose first rows
+    /// retention evicted: the store keeps those rows only as the slack that
+    /// authenticates the segment (tests compact on every prune, so the slack
+    /// survives compaction), and they never read back. Every retained row
+    /// reads back exactly through a cold read, a ranged read, a snapshot and
+    /// export, before and after reopen.
+    #[test]
+    fn segments_keep_exact_retention_and_the_oldest_rows_segment_readable() {
+        use mux::guardian_output_journal::{
+            is_scrollback_segment_record, is_scrollback_segment_tail,
+        };
+        const RETENTION: usize = 7;
+        let dir = tempfile::tempdir().unwrap();
+        let sink = windowed_test_sink(dir.path());
+        let mut rows = vec![Line::from_text("prior", &CellAttributes::blank(), 1, None)];
+        assert!(sink.store_scrollback_line(0, &rows[0], RETENTION));
+        // The first batch starts the process's nonce segment; the rest are
+        // commit windows. Rows 1..6, 6..11, 11..16 and 16..21.
+        for window in 0..4 {
+            let lines = digest_only_test_lines(&format!("w{window}"), 5);
+            assert_eq!(
+                sink.store_scrollback_lines(rows.len() as isize, &lines, RETENTION),
+                5
+            );
+            rows.extend(lines);
+        }
+        sink.flush_scrollback().unwrap();
+        let oldest = rows.len() - RETENTION;
+        assert_eq!(oldest, 14, "inside the segment of rows 11..16");
+        let check = |sink: &LiveScrollbackSpillSink, case: &str| {
+            assert_eq!(sink.retained_scrollback_rows(), RETENTION, "{case}");
+            assert_eq!(sink.oldest_scrollback_row(), Some(14), "{case}");
+            let manifest = published_manifest(sink);
+            assert_eq!(
+                (
+                    manifest.oldest_seq,
+                    manifest.retained_rows,
+                    manifest.next_seq
+                ),
+                (Some(14), RETENTION as u64, 21),
+                "{case}"
+            );
+            let ledger_pane_id = sink.active_ledger_pane_id();
+            let store = sink.lock_store("test segment slack").unwrap();
+            assert_eq!(store.oldest_seq(ledger_pane_id), Some(14), "{case}");
+            assert_eq!(
+                store.pruned_tail_start(ledger_pane_id),
+                Some(11),
+                "{case}: the slack is exactly the segment's evicted rows"
+            );
+            let slack = store
+                .lines_range_reaching_pruned(ledger_pane_id, 11..21, 16, 1 << 20)
+                .unwrap();
+            drop(store);
+            assert!(
+                slack
+                    .iter()
+                    .all(|record| is_scrollback_segment_record(record))
+            );
+            let tails: Vec<usize> = slack
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| is_scrollback_segment_tail(record))
+                .map(|(index, _)| 11 + index)
+                .collect();
+            assert_eq!(tails, vec![15, 20], "{case}: one tail per window");
+            for evicted in [0, 11, 13] {
+                assert!(
+                    sink.load_scrollback_line(evicted).is_none(),
+                    "{case} {evicted}"
+                );
+            }
+            let retained: Vec<&Line> = rows[14..].iter().collect();
+            assert_rows_read_back_from(sink, 14, &retained);
+            let ranged = sink.load_scrollback_lines(14..21);
+            assert_eq!(ranged.len(), RETENTION, "{case}");
+            let limits = wezterm_term::config::ScrollbackSnapshotLimits {
+                max_rows: 64,
+                max_stored_bytes: 1 << 20,
+                max_decoded_bytes: 1 << 20,
+                max_physical_bytes: 1 << 20,
+            };
+            let snapshot = sink.snapshot_scrollback(21, limits).unwrap();
+            let snapshot_text: Vec<String> = snapshot
+                .rows()
+                .iter()
+                .map(|line| line.as_str().into_owned())
+                .collect();
+            let expected: Vec<String> = rows[14..]
+                .iter()
+                .map(|line| line.as_str().into_owned())
+                .collect();
+            assert_eq!(snapshot_text, expected, "{case}: snapshot");
+        };
+        check(&sink, "live");
+        let export = export_live_scrollback_transcript(
+            dir.path(),
+            &uuid::Uuid::from_bytes([0xd3; 16]).simple().to_string(),
+            64,
+            1 << 20,
+            1 << 22,
+        )
+        .expect("export durable transcript");
+        let exported: Vec<String> = export
+            .transcript
+            .lines()
+            .map(|line| line.trim_end().to_string())
+            .collect();
+        let expected: Vec<String> = rows[14..]
+            .iter()
+            .map(|line| line.as_str().trim_end().to_string())
+            .collect();
+        assert_eq!(exported, expected, "export");
+        drop(sink);
+        let reopened =
+            LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                .unwrap();
+        check(&reopened, "reopened");
+    }
+
+    /// A commit window whose last segment lost its tail (a crash tore the
+    /// window's append) is cut from that segment's first row: a sealed
+    /// segment authenticates only whole. The complete segment before it is
+    /// adopted, and the sink keeps working.
+    #[test]
+    fn a_torn_segment_is_cut_from_its_first_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = windowed_test_sink(dir.path());
+        let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+        assert!(sink.store_scrollback_line(0, &prior, 4096));
+        let first = digest_only_test_lines("first", 2);
+        assert_eq!(sink.store_scrollback_lines(1, &first, 4096), 2);
+        let one = digest_only_test_lines("one", 3);
+        assert_eq!(sink.store_scrollback_lines(3, &one, 4096), 3);
+        let two = digest_only_test_lines("two", 3);
+        assert_eq!(sink.store_scrollback_lines(6, &two, 4096), 3);
+        assert_eq!(
+            published_manifest(&sink).next_seq,
+            3,
+            "windows are unpublished"
+        );
+        let records = ledger_records(&sink, 6..9);
+        let log_path = sink.manifest_path.parent().unwrap().join("0.log");
+        drop(sink);
+
+        // Cut the log half way through row 8, the tail of window two.
+        let mut log = std::fs::read(&log_path).unwrap();
+        let at = log
+            .windows(records[2].len())
+            .position(|window| window == records[2].as_bytes())
+            .unwrap();
+        log.truncate(at + records[2].len() / 2);
+        std::fs::write(&log_path, &log).unwrap();
+
+        let reopened =
+            LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                .unwrap();
+        assert_eq!(published_manifest(&reopened).next_seq, 6);
+        let kept: Vec<&Line> = std::iter::once(&prior).chain(&first).chain(&one).collect();
+        assert_rows_read_back_from(&reopened, 0, &kept);
+        assert!(
+            reopened.load_scrollback_line(6).is_none(),
+            "window two was cut"
+        );
+        let again = digest_only_test_lines("again", 2);
+        assert_eq!(reopened.store_scrollback_lines(6, &again, 4096), 2);
+        assert_rows_read_back_from(&reopened, 6, &again.iter().collect::<Vec<_>>());
+    }
+
+    const TAIL_CRASH_TEST: &str =
+        "tests::a_tail_killed_between_window_sync_and_publication_recovers_every_window_row";
+    /// The crash points between a window's sync and the publication that
+    /// names its rows, in order.
+    const TAIL_CRASH_STEPS: [&str; 8] = [
+        "window_rows_synced",
+        "wal_staged",
+        "wal_renamed",
+        "retention_pruned",
+        "compacted",
+        "manifest_staged",
+        "manifest_renamed",
+        "committed",
+    ];
+
+    /// ft-yccm0.2.1.2 AC5: a child process runs commit windows and is killed
+    /// with SIGKILL after a window's rows are synced but before any
+    /// publication, and at every step of the publication that follows. Every
+    /// window's rows were durable, so reopen recovers all of them: adopted
+    /// from the ledger before the cumulative WAL exists, rolled forward by it
+    /// after. The recovered manifest describes exactly that prefix, at the
+    /// revision the windows reached, and the sink keeps working.
+    #[cfg(unix)]
+    #[test]
+    fn a_tail_killed_between_window_sync_and_publication_recovers_every_window_row() {
+        const RETENTION: usize = 4;
+        let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+        let first = digest_only_test_lines("first", 2);
+        let window_one = digest_only_test_lines("one", 3);
+        let window_two = digest_only_test_lines("two", 3);
+        let rows: Vec<&Line> = std::iter::once(&prior)
+            .chain(&first)
+            .chain(&window_one)
+            .chain(&window_two)
+            .collect();
+
+        if let Ok(armed) = std::env::var(CRASH_CHILD_STEP) {
+            let step = TAIL_CRASH_STEPS
+                .iter()
+                .find(|step| **step == armed)
+                .copied()
+                .expect("a named tail crash step");
+            let base = PathBuf::from(std::env::var(CRASH_CHILD_BASE).unwrap());
+            let sink = windowed_test_sink(&base);
+            assert!(sink.store_scrollback_line(0, &prior, RETENTION));
+            assert_eq!(sink.store_scrollback_lines(1, &first, RETENTION), 2);
+            assert_eq!(sink.store_scrollback_lines(3, &window_one, RETENTION), 3);
+            scrollback_crash_points::arm(step);
+            assert_eq!(sink.store_scrollback_lines(6, &window_two, RETENTION), 3);
+            let _ = sink.flush_scrollback();
+            panic!("tail crash step {step} was never reached");
+        }
+
+        for step in TAIL_CRASH_STEPS {
+            use std::os::unix::process::ExitStatusExt as _;
+
+            let dir = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg(TAIL_CRASH_TEST)
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(CRASH_CHILD_STEP, step)
+                .env(CRASH_CHILD_BASE, dir.path())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGKILL),
+                "{step}: the child dies at its step ({status:?})"
+            );
+            let reopened =
+                LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                    .unwrap_or_else(|error| panic!("{step}: reopen after kill -9: {error:#}"));
+            assert_eq!(reopened.retained_scrollback_rows(), RETENTION, "{step}");
+            assert_eq!(reopened.oldest_scrollback_row(), Some(5), "{step}");
+            assert_rows_read_back_from(&reopened, 5, &rows[5..]);
+            assert!(reopened.load_scrollback_line(9).is_none(), "{step}");
+            let manifest = published_manifest(&reopened);
+            assert_eq!(
+                (manifest.oldest_seq, manifest.next_seq),
+                (Some(5), 9),
+                "{step}: the manifest describes the recovered prefix"
+            );
+            // Before the first window: the published single batch. Each tail
+            // row adds one revision.
+            let state = *reopened.lock_state("test tail crash state").unwrap();
+            assert!(state.published.is_none(), "{step}");
+            let after = digest_only_test_lines("after", 2);
+            assert_eq!(
+                reopened.store_scrollback_lines(9, &after, RETENTION),
+                2,
+                "{step}"
+            );
+            assert_rows_read_back_from(&reopened, 9, &after.iter().collect::<Vec<_>>());
+        }
+    }
+
+    /// ft-yccm0.2.1.2 AC5: a durable tail whose rows were reordered on disk,
+    /// or torn inside a record, is adopted only up to its first row that
+    /// does not open at its location; everything after it is cut. Recovery
+    /// never yields an out-of-order row, and the manifest it publishes
+    /// describes a prefix. Since ft-yccm0.2.1.4 option A a window's rows
+    /// authenticate only as a whole sealed segment, so the cut falls at the
+    /// first damaged segment: here the tail is two windows of two rows, the
+    /// damage is in the second, and the first is adopted exactly.
+    #[test]
+    fn a_reordered_or_torn_tail_is_adopted_only_up_to_its_first_bad_segment() {
+        for damage in ["reorder", "torn"] {
+            let dir = tempfile::tempdir().unwrap();
+            let sink = windowed_test_sink(dir.path());
+            let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+            assert!(sink.store_scrollback_line(0, &prior, 4096));
+            let first = digest_only_test_lines("first", 2);
+            assert_eq!(sink.store_scrollback_lines(1, &first, 4096), 2);
+            let tail = digest_only_test_lines("tail", 4);
+            assert_eq!(sink.store_scrollback_lines(3, &tail[..2], 4096), 2);
+            assert_eq!(sink.store_scrollback_lines(5, &tail[2..], 4096), 2);
+            let records = ledger_records(&sink, 3..7);
+            assert!(sink.lock_state("test tail").unwrap().published.is_some());
+            let log_path = sink.manifest_path.parent().unwrap().join("0.log");
+            drop(sink);
+
+            let mut log = std::fs::read(&log_path).unwrap();
+            let find = |log: &[u8], record: &str| {
+                log.windows(record.len())
+                    .position(|window| window == record.as_bytes())
+                    .unwrap()
+            };
+            let adopted = match damage {
+                "reorder" => {
+                    // Swap rows 5 and 6, the second window: its inner row
+                    // and its tail trade places. They differ in length (the
+                    // tail carries the tag), so the log is rebuilt around
+                    // them.
+                    let (a, b) = (&records[2], &records[3]);
+                    let (at_a, at_b) = (find(&log, a), find(&log, b));
+                    let (len_a, len_b) = (a.len(), b.len());
+                    let mut swapped = log[..at_a].to_vec();
+                    swapped.extend_from_slice(b.as_bytes());
+                    swapped.extend_from_slice(&log[at_a + len_a..at_b]);
+                    swapped.extend_from_slice(a.as_bytes());
+                    swapped.extend_from_slice(&log[at_b + len_b..]);
+                    log = swapped;
+                    2
+                }
+                _ => {
+                    // Cut the log half way through row 6, the second
+                    // window's tail.
+                    let at = find(&log, &records[3]);
+                    log.truncate(at + records[3].len() / 2);
+                    2
+                }
+            };
+            std::fs::write(&log_path, &log).unwrap();
+
+            let reopened =
+                LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                    .unwrap_or_else(|error| panic!("{damage}: reopen: {error:#}"));
+            let next = 3 + adopted;
+            let manifest = published_manifest(&reopened);
+            assert_eq!(manifest.next_seq, next as u64, "{damage}");
+            let expected: Vec<&Line> = std::iter::once(&prior)
+                .chain(&first)
+                .chain(&tail[..adopted])
+                .collect();
+            assert_rows_read_back_from(&reopened, 0, &expected);
+            assert!(
+                reopened.load_scrollback_line(next as isize).is_none(),
+                "{damage}: nothing past the first bad row"
+            );
+            assert_eq!(
+                ledger_records(&reopened, 3..next as u64),
+                records[..adopted].to_vec(),
+                "{damage}: the adopted rows are the originals, in order"
+            );
+        }
+    }
+
+    /// ft-yccm0.2.1.2 AC4: ordered-durability syncs per MiB of the seq corpus
+    /// through the durability writer with its production commit policy:
+    /// the single-batch protocol (HEAD: a WAL and a manifest per store batch)
+    /// against commit windows that sync once each and publish only on the
+    /// flush (the publication interval outlasts the run, so this counts the
+    /// windows' cost; each cadence publication adds its own syncs once per
+    /// interval, reported with the measurement).
+    #[test]
+    fn commit_windows_cut_durability_syncs_per_mib_on_the_seq_corpus_tenfold() {
+        const ROWS: usize = 100_000;
+        const RETENTION: usize = 3500;
+        const PARSE_BATCH: usize = 1400;
+        let measure = |interval: std::time::Duration| {
+            let dir = tempfile::tempdir().unwrap();
+            let backing = Arc::new(
+                LiveScrollbackSpillSink::open(
+                    dir.path().to_path_buf(),
+                    &deferred_test_context(),
+                    interval,
+                )
+                .unwrap(),
+            );
+            let writer = deferred_scrollback::DurabilityWriter::spawn();
+            writer.set_queue_budget(1 << 30);
+            let sink = deferred_scrollback::DeferredScrollbackSpillSink::with_writer(
+                backing.clone(),
+                [0xd3; 16],
+                writer,
+            )
+            .unwrap();
+            let mut bytes = 0_u64;
+            for start in (0..ROWS).step_by(PARSE_BATCH) {
+                let lines = seq_corpus_lines(start, PARSE_BATCH.min(ROWS - start));
+                bytes += lines
+                    .iter()
+                    .map(|line| line.as_str().len() as u64 + 1)
+                    .sum::<u64>();
+                for (offset, line) in lines.iter().enumerate() {
+                    assert!(sink.store_scrollback_line((start + offset) as isize, line, RETENTION));
+                }
+                sink.request_scrollback_flush().unwrap();
+            }
+            sink.flush_scrollback().unwrap();
+            assert_eq!(backing.retained_scrollback_rows(), RETENTION);
+            let manifest = published_manifest(&backing);
+            assert_eq!(
+                manifest.next_seq, ROWS as u64,
+                "the flush published everything"
+            );
+            assert_eq!(manifest.oldest_seq, Some((ROWS - RETENTION) as u64));
+            let syncs = backing
+                .durability_syncs
+                .load(std::sync::atomic::Ordering::Relaxed);
+            (syncs, bytes, sink.committed_batches())
+        };
+        let (head_syncs, bytes, head_batches) = measure(std::time::Duration::ZERO);
+        let (window_syncs, _, windows) = measure(std::time::Duration::from_secs(3600));
+        let mib = bytes as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "seq corpus {ROWS} rows, {bytes} bytes: single-batch {head_syncs} syncs in \
+             {head_batches} drains = {:.1} syncs/MiB; commit windows {window_syncs} syncs in \
+             {windows} drains = {:.1} syncs/MiB; ratio {:.1}x",
+            head_syncs as f64 / mib,
+            window_syncs as f64 / mib,
+            head_syncs as f64 / window_syncs as f64,
+        );
+        assert!(
+            head_syncs >= 10 * window_syncs,
+            "commit windows must cut syncs per MiB at least tenfold: {head_syncs} vs {window_syncs}"
+        );
+    }
+
+    /// ft-yccm0.2.1.7: a child process commits one row, then runs a 3-row
+    /// batch (retention 3, so it also prunes and compacts) and is killed with
+    /// SIGKILL at each named step. The parent reopens the store. Recovery
+    /// yields an exact committed prefix: before the batch's WAL is staged,
+    /// the first row alone; from a staged WAL on, the whole batch rolled
+    /// forward. Rows sit at their exact stable rows, nothing is duplicated
+    /// or reordered, and the durability-gap marker row survives as written.
+    /// The owner's retry then ends in the same exact rows from either state.
+    #[cfg(unix)]
+    #[test]
+    fn scrollback_transaction_killed_at_every_named_step_recovers_an_exact_committed_prefix() {
+        let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+        let mut batch = digest_only_test_lines("crash", 2);
+        batch.push(Line::from_text(
+            "[durability gap: 4 rows (10..14), 512 bytes, reason=overload, at_unix_ms=1]",
+            &CellAttributes::blank(),
+            2,
+            None,
+        ));
+        let assert_row =
+            |sink: &LiveScrollbackSpillSink, row: isize, expected: &Line, case: &str| {
+                let mut actual = sink
+                    .load_scrollback_line(row)
+                    .unwrap_or_else(|| panic!("{case}: row {row} is missing"));
+                let mut expected = expected.clone();
+                actual.cells_mut();
+                expected.cells_mut();
+                assert_eq!(actual, expected, "{case}: row {row}");
+            };
+
+        if let Ok(armed) = std::env::var(CRASH_CHILD_STEP) {
+            let step = CRASH_STEPS
+                .iter()
+                .map(|(step, _)| *step)
+                .find(|step| *step == armed)
+                .expect("a named crash step");
+            let base = PathBuf::from(std::env::var(CRASH_CHILD_BASE).unwrap());
+            let sink = LiveScrollbackSpillSink::new(base, &deferred_test_context()).unwrap();
+            assert!(sink.store_scrollback_line(0, &prior, 3));
+            scrollback_crash_points::arm(step);
+            let _ = sink.store_scrollback_lines(1, &batch, 3);
+            panic!("crash step {step} was never reached");
+        }
+
+        for (step, rolled_forward) in CRASH_STEPS {
+            use std::os::unix::process::ExitStatusExt as _;
+
+            let dir = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg(CRASH_TEST)
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(CRASH_CHILD_STEP, step)
+                .env(CRASH_CHILD_BASE, dir.path())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGKILL),
+                "{step}: the child dies at its step ({status:?})"
+            );
+            let reopened =
+                LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                    .unwrap_or_else(|error| panic!("{step}: reopen after kill -9: {error:#}"));
+            if rolled_forward {
+                assert_eq!(reopened.retained_scrollback_rows(), 3, "{step}");
+                assert_eq!(reopened.oldest_scrollback_row(), Some(1), "{step}");
+                for (offset, line) in batch.iter().enumerate() {
+                    assert_row(&reopened, 1 + offset as isize, line, step);
+                }
+            } else {
+                assert_eq!(reopened.retained_scrollback_rows(), 1, "{step}");
+                assert_eq!(reopened.oldest_scrollback_row(), Some(0), "{step}");
+                assert_row(&reopened, 0, &prior, step);
+            }
+            assert!(reopened.load_scrollback_line(4).is_none(), "{step}");
+
+            let mut offset = 0;
+            while offset < batch.len() {
+                let acknowledged =
+                    reopened.store_scrollback_lines(1 + offset as isize, &batch[offset..], 3);
+                assert!(
+                    acknowledged > 0,
+                    "{step}: retry refused at row {}",
+                    1 + offset
+                );
+                offset += acknowledged;
+            }
+            assert_eq!(reopened.retained_scrollback_rows(), 3, "{step}");
+            for (offset, line) in batch.iter().enumerate() {
+                assert_row(&reopened, 1 + offset as isize, line, step);
+            }
+            let manifest = LiveScrollbackSpillSink::read_manifest(&reopened.manifest_path)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (manifest.oldest_seq, manifest.next_seq),
+                (Some(1), 4),
+                "{step}"
+            );
+        }
+    }
+
+    /// The store's files in the units that persist independently at a crash:
+    /// a rename moves a stage and its target together, and an append-only
+    /// file can also tear part way through its growth.
+    const CRASH_UNITS: [(&[&str], bool); 4] = [
+        (&[".append-wal.v1.json", ".append-wal.v1.installing"], false),
+        (&["manifest.json", "manifest.json.installing-v3"], false),
+        (&["0.log"], true),
+        (&["0.seq"], true),
+    ];
+
+    fn crash_unit(path: &std::path::Path) -> Option<usize> {
+        let name = path.file_name()?.to_str()?;
+        CRASH_UNITS
+            .iter()
+            .position(|(names, _)| names.contains(&name))
+    }
+
+    /// The durable states a crash can leave between two consecutive images:
+    /// each unit that changed is at its earlier or its later image, and a
+    /// grown append-only file or a newly written stage may also stop half way
+    /// or one byte short. Files outside every unit (keys, locks) take their
+    /// later image.
+    fn crash_states_between(
+        earlier: &scrollback_crash_points::Image,
+        later: &scrollback_crash_points::Image,
+    ) -> Vec<scrollback_crash_points::Image> {
+        let paths: std::collections::BTreeSet<_> = earlier.keys().chain(later.keys()).collect();
+        let changed: Vec<usize> = (0..CRASH_UNITS.len())
+            .filter(|&unit| {
+                paths
+                    .iter()
+                    .filter(|path| crash_unit(path) == Some(unit))
+                    .any(|path| earlier.get(*path) != later.get(*path))
+            })
+            .collect();
+        let mut states = Vec::new();
+        for mask in 0..(1_u32 << changed.len()) {
+            let takes_later = |unit: Option<usize>| {
+                unit.is_none_or(|unit| {
+                    changed
+                        .iter()
+                        .position(|&changed| changed == unit)
+                        .is_some_and(|bit| mask & (1 << bit) != 0)
+                })
+            };
+            let state: scrollback_crash_points::Image = paths
+                .iter()
+                .filter_map(|path| {
+                    let source = if takes_later(crash_unit(path)) {
+                        later
+                    } else {
+                        earlier
+                    };
+                    source
+                        .get(*path)
+                        .map(|bytes| ((*path).clone(), bytes.clone()))
+                })
+                .collect();
+            for path in &paths {
+                let Some(unit) = crash_unit(path) else {
+                    continue;
+                };
+                let (Some(grown), before) = (later.get(*path), earlier.get(*path)) else {
+                    continue;
+                };
+                // A new stage is written then synced, so it can tear too.
+                let new_stage = before.is_none()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.contains("installing"));
+                let before = before.map_or(&[][..], Vec::as_slice);
+                if !takes_later(Some(unit))
+                    || !(CRASH_UNITS[unit].1 || new_stage)
+                    || grown.len() <= before.len() + 1
+                    || !grown.starts_with(before)
+                {
+                    continue;
+                }
+                for cut in [
+                    before.len() + (grown.len() - before.len()) / 2,
+                    grown.len() - 1,
+                ] {
+                    let mut torn = state.clone();
+                    torn.insert((*path).clone(), grown[..cut].to_vec());
+                    states.push(torn);
+                }
+            }
+            states.push(state);
+        }
+        states
+    }
+
+    /// A fresh store holding exactly `image`, with the live store's
+    /// (unchanging) directory layout and private permissions.
+    fn materialize_store_image(
+        live: &std::path::Path,
+        image: &scrollback_crash_points::Image,
+    ) -> tempfile::TempDir {
+        fn directories(live: &std::path::Path, dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    out.push(entry.path().strip_prefix(live).unwrap().to_path_buf());
+                    directories(live, &entry.path(), out);
+                }
+            }
+        }
+        let restored = tempfile::tempdir().unwrap();
+        let mut dirs = Vec::new();
+        directories(live, live, &mut dirs);
+        for dir in dirs {
+            let target = restored.path().join(dir);
+            std::fs::create_dir_all(&target).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        for (path, bytes) in image {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+
+                options.mode(0o600);
+            }
+            options
+                .open(restored.path().join(path))
+                .unwrap()
+                .write_all(bytes)
+                .unwrap();
+        }
+        restored
+    }
+
+    /// Commit `pre` row by row, image the store at every crash point of one
+    /// `batch` transaction, and reopen every crash state between consecutive
+    /// images. Each must reopen to exactly the rows before the transaction
+    /// followed by an in-order prefix of the batch: none of it, the part of
+    /// it already durable that opens at its location (adopted, ft-yccm0.2.1.2)
+    /// or all of it. Never a reordered, duplicated or missing row. Returns
+    /// the number of states checked.
+    fn every_crash_state_of_a_batch_recovers_exactly(
+        pre: &[Line],
+        batch: &[Line],
+        retention: usize,
+    ) -> usize {
+        let (dir, backing, _deferred) = deferred_test_sink();
+        for (row, line) in pre.iter().enumerate() {
+            assert!(backing.store_scrollback_line(row as isize, line, retention));
+        }
+        scrollback_crash_points::record(dir.path());
+        assert_eq!(
+            backing.store_scrollback_lines(pre.len() as isize, batch, retention),
+            batch.len()
+        );
+        let mut images = scrollback_crash_points::take();
+        images.push(("end", scrollback_crash_points::image(dir.path())));
+        let retained = |rows: &[Line]| -> Vec<(isize, Line)> {
+            let first = rows.len().saturating_sub(retention);
+            rows.iter()
+                .enumerate()
+                .skip(first)
+                .map(|(row, line)| (row as isize, line.clone()))
+                .collect()
+        };
+        let prefixes: Vec<Vec<(isize, Line)>> = (0..=batch.len())
+            .map(|adopted| {
+                retained(
+                    &pre.iter()
+                        .chain(&batch[..adopted])
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let mut states = 0;
+        for pair in images.windows(2) {
+            let case = format!("{} -> {}", pair[0].0, pair[1].0);
+            for state in crash_states_between(&pair[0].1, &pair[1].1) {
+                states += 1;
+                let restored = materialize_store_image(dir.path(), &state);
+                let reopened = LiveScrollbackSpillSink::new(
+                    restored.path().to_path_buf(),
+                    &deferred_test_context(),
+                )
+                .unwrap_or_else(|error| panic!("{case}: crash state refused: {error:#}"));
+                let holds = |expected: &[(isize, Line)]| {
+                    reopened.retained_scrollback_rows() == expected.len()
+                        && expected.iter().all(|(row, line)| {
+                            reopened
+                                .load_scrollback_line(*row)
+                                .is_some_and(|mut actual| {
+                                    let mut line = line.clone();
+                                    actual.cells_mut();
+                                    line.cells_mut();
+                                    actual == line
+                                })
+                        })
+                };
+                assert!(
+                    prefixes.iter().any(|expected| holds(expected)),
+                    "{case}: recovered no in-order prefix of the rows before and the batch"
+                );
+                assert!(
+                    reopened
+                        .load_scrollback_line((pre.len() + batch.len()) as isize)
+                        .is_none(),
+                    "{case}"
+                );
+            }
+        }
+        states
+    }
+
+    /// ft-yccm0.2.1.7 AC2 (crash-state model): every durable state a crash can
+    /// leave inside a transaction recovers an exact committed prefix. Covers a
+    /// pristine first row, batches with and without retention pruning and
+    /// compaction, a batch replacing a consumed WAL, and full eviction.
+    #[test]
+    fn every_crash_state_inside_a_transaction_recovers_an_exact_committed_prefix() {
+        let row = |text: &str| Line::from_text(text, &CellAttributes::blank(), 1, None);
+        let mut states = 0;
+        states += every_crash_state_of_a_batch_recovers_exactly(&[], &[row("first")], 16);
+        states += every_crash_state_of_a_batch_recovers_exactly(
+            &[row("prior")],
+            &digest_only_test_lines("batch", 3),
+            16,
+        );
+        states += every_crash_state_of_a_batch_recovers_exactly(
+            &[row("prior")],
+            &digest_only_test_lines("pruned", 3),
+            3,
+        );
+        states += every_crash_state_of_a_batch_recovers_exactly(
+            &[row("a"), row("b"), row("c")],
+            &digest_only_test_lines("replacing", 2),
+            16,
+        );
+        states += every_crash_state_of_a_batch_recovers_exactly(&[row("old")], &[row("new")], 1);
+        assert!(states >= 40, "only {states} crash states were exercised");
+    }
+
+    /// Rows past the manifest that no WAL names, here a batch interrupted
+    /// before its WAL under the published nonce segment, are durable and
+    /// open at their locations, so reopen adopts them (ft-yccm0.2.1.2; they
+    /// were cut before deferred publication) after the consumed active WAL is
+    /// authenticated, and only over a retained prefix that is exactly the
+    /// manifest's. A changed prefix refuses and writes nothing.
+    #[test]
+    fn rows_past_the_manifest_that_no_wal_names_are_adopted_only_over_an_intact_prefix() {
+        for tamper_prefix in [false, true] {
+            let (dir, backing, _deferred) = deferred_test_sink();
+            let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+            assert!(backing.store_scrollback_line(0, &prior, 16));
+            let first = digest_only_test_lines("first", 2);
+            assert_eq!(backing.store_scrollback_lines(1, &first, 16), 2);
+            let log_path = backing.manifest_path.parent().unwrap().join("0.log");
+            let committed_len = std::fs::metadata(&log_path).unwrap().len();
+            let second = digest_only_test_lines("second", 3);
+            LIVE_SCROLLBACK_BATCH_FAULT.with(|setting| setting.set(1));
+            let acknowledged = backing.store_scrollback_lines(3, &second, 16);
+            LIVE_SCROLLBACK_BATCH_FAULT.with(|setting| setting.set(0));
+            assert_eq!(acknowledged, 0);
+            let durable_len = std::fs::metadata(&log_path).unwrap().len();
+            assert!(durable_len > committed_len);
+            if tamper_prefix {
+                let mut content = std::fs::read(&log_path).unwrap();
+                let middle = content.iter().position(|byte| *byte == b'\n').unwrap() / 2;
+                content[middle] = if content[middle] == b'A' { b'B' } else { b'A' };
+                std::fs::write(&log_path, content).unwrap();
+            }
+            let content_before = std::fs::read(&log_path).unwrap();
+            let reopened =
+                LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context());
+            if tamper_prefix {
+                assert!(reopened.is_err());
+                assert_eq!(
+                    std::fs::read(&log_path).unwrap(),
+                    content_before,
+                    "a changed prefix is never cut over"
+                );
+                continue;
+            }
+            let reopened = reopened.unwrap();
+            assert_eq!(
+                std::fs::metadata(&log_path).unwrap().len(),
+                durable_len,
+                "every adopted row stays where it was written"
+            );
+            assert_eq!(reopened.retained_scrollback_rows(), 6);
+            assert!(reopened.load_scrollback_line(6).is_none());
+            let rows: Vec<&Line> = std::iter::once(&prior)
+                .chain(first.iter())
+                .chain(second.iter())
+                .collect();
+            assert_rows_read_back_from(&reopened, 0, &rows);
+            assert_eq!(published_manifest(&reopened).next_seq, 6);
+            assert_eq!(
+                published_manifest(&reopened).durability_gaps,
+                Some(LiveScrollbackDurabilityGaps::default()),
+                "a tail with no row that may be a gap marker keeps the gap count (ft-yccm0.2.1.6)"
+            );
+            let again = digest_only_test_lines("again", 2);
+            assert_eq!(reopened.store_scrollback_lines(6, &again, 16), 2);
+            assert_eq!(reopened.retained_scrollback_rows(), 8);
+        }
+    }
+
+    /// ft-yccm0.2.1.6 planted negative: a manifest without the gap totals
+    /// (as one written before the field existed) lists them as unknown,
+    /// never as zero. A reopened sink keeps them unknown through later gap
+    /// markers, since it cannot know the missing count; a clear starts the
+    /// count over from a known zero.
+    #[test]
+    fn a_manifest_without_gap_totals_lists_unknown_until_a_clear_counts_from_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = deferred_test_context();
+        let pane = uuid::Uuid::from_bytes(context.durable_pane_id)
+            .simple()
+            .to_string();
+        let listed = || {
+            let panes = list_live_scrollback_panes(dir.path(), 16).unwrap();
+            assert_eq!(panes.len(), 1);
+            assert_eq!(panes[0].durable_pane_id, pane);
+            assert_eq!(panes[0].error, None);
+            panes[0].durability_gaps
+        };
+        let row = |text: &str| Line::from_text(text, &CellAttributes::blank(), 1, None);
+        let marker =
+            row("[durability gap: 7 rows (1..8), 70 bytes, reason=overload, at_unix_ms=1]");
+
+        let sink = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context).unwrap();
+        // The first row publishes through its manifest alone; no WAL exists.
+        assert!(sink.store_scrollback_line(0, &row("prior"), 16));
+        assert!(
+            LiveScrollbackSpillSink::read_append_wal(
+                &LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path).unwrap()
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(listed(), Some(LiveScrollbackDurabilityGaps::default()));
+
+        // Plant the same manifest without the field, authenticated again.
+        let mut planted = published_manifest(&sink);
+        planted.durability_gaps = None;
+        let canonical = LiveScrollbackSpillSink::manifest_authentication_bytes(&planted).unwrap();
+        let cipher = sink
+            .lock_keyring("test plant manifest without gap totals")
+            .unwrap()
+            .latest_active_cipher()
+            .unwrap();
+        planted.guardian_manifest_authentication = Some(
+            cipher
+                .authenticate_scrollback_manifest(&canonical)
+                .unwrap()
+                .encode(),
+        );
+        planted.manifest_sha256 = LiveScrollbackSpillSink::manifest_checksum(&planted).unwrap();
+        overwrite_private_manifest_fixture(&sink.manifest_path, &planted);
+        drop(sink);
+        assert_eq!(listed(), None, "a missing count lists as unknown, not 0");
+
+        let reopened = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context).unwrap();
+        assert_eq!(
+            reopened
+                .lock_state("test planted gap totals")
+                .unwrap()
+                .durability_gaps,
+            None
+        );
+        assert!(reopened.store_scrollback_gap_marker(1, &marker, 16, 7, 70));
+        assert_eq!(
+            listed(),
+            None,
+            "an unknown count plus a gap stays unknown, never 7"
+        );
+
+        reopened.clear_scrollback().unwrap();
+        assert_eq!(
+            listed(),
+            Some(LiveScrollbackDurabilityGaps::default()),
+            "a clear counts from zero"
+        );
+        assert!(reopened.store_scrollback_gap_marker(8, &marker, 16, 7, 70));
+        assert_eq!(
+            listed(),
+            Some(LiveScrollbackDurabilityGaps {
+                markers: 1,
+                rows: 7,
+                bytes: 70,
+            })
+        );
+    }
+
+    const GAP_CRASH_TEST: &str =
+        "tests::a_gap_marker_killed_at_every_step_never_lists_a_wrong_gap_count";
+
+    /// ft-yccm0.2.1.6: a child process writes a gap marker and is killed
+    /// with SIGKILL at every named step of the marker's transaction. Its row
+    /// is synced first, so reopen recovers it at every step. The totals then
+    /// count it exactly (its WAL rolled forward) or are unknown (the row was
+    /// adopted before any WAL named it): never a count that leaves it out.
+    #[cfg(unix)]
+    #[test]
+    fn a_gap_marker_killed_at_every_step_never_lists_a_wrong_gap_count() {
+        const RETENTION: usize = 3;
+        let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
+        let first = digest_only_test_lines("first", 2);
+        let marker = Line::from_text(
+            "[durability gap: 9 rows (3..12), 900 bytes, reason=overload, at_unix_ms=1]",
+            &CellAttributes::blank(),
+            1,
+            None,
+        );
+        let counted = LiveScrollbackDurabilityGaps {
+            markers: 1,
+            rows: 9,
+            bytes: 900,
+        };
+
+        if let Ok(armed) = std::env::var(CRASH_CHILD_STEP) {
+            let step = CRASH_STEPS
+                .iter()
+                .map(|(step, _)| *step)
+                .find(|step| *step == armed)
+                .expect("a named crash step");
+            let base = PathBuf::from(std::env::var(CRASH_CHILD_BASE).unwrap());
+            let sink = LiveScrollbackSpillSink::new(base, &deferred_test_context()).unwrap();
+            assert!(sink.store_scrollback_line(0, &prior, RETENTION));
+            // This batch starts the process's nonce segment and publishes
+            // it, so the marker continues a published segment.
+            assert_eq!(sink.store_scrollback_lines(1, &first, RETENTION), 2);
+            scrollback_crash_points::arm(step);
+            let _ = sink.store_scrollback_gap_marker(3, &marker, RETENTION, 9, 900);
+            panic!("gap marker crash step {step} was never reached");
+        }
+
+        for (step, rolled_forward) in CRASH_STEPS {
+            use std::os::unix::process::ExitStatusExt as _;
+
+            let dir = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg(GAP_CRASH_TEST)
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(CRASH_CHILD_STEP, step)
+                .env(CRASH_CHILD_BASE, dir.path())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGKILL),
+                "{step}: the child dies at its step ({status:?})"
+            );
+            let reopened =
+                LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &deferred_test_context())
+                    .unwrap_or_else(|error| panic!("{step}: reopen after kill -9: {error:#}"));
+            assert_eq!(reopened.retained_scrollback_rows(), RETENTION, "{step}");
+            assert_rows_read_back_from(&reopened, 1, &[&first[0], &first[1], &marker]);
+            // Killed after its rows synced but before its WAL, the marker is
+            // adopted from the ledger; from the WAL on, it rolls forward.
+            let expected = if rolled_forward { Some(counted) } else { None };
+            assert_eq!(
+                published_manifest(&reopened).durability_gaps,
+                expected,
+                "{step}"
+            );
+            assert_eq!(
+                list_live_scrollback_panes(dir.path(), 16).unwrap()[0].durability_gaps,
+                expected,
+                "{step}"
+            );
+            // The next marker adds to a known count and leaves an unknown one
+            // unknown.
+            let next = Line::from_text(
+                "[durability gap: 2 rows (13..15), 20 bytes, reason=overload, at_unix_ms=2]",
+                &CellAttributes::blank(),
+                1,
+                None,
+            );
+            assert!(
+                reopened.store_scrollback_gap_marker(4, &next, RETENTION, 2, 20),
+                "{step}"
+            );
+            assert_eq!(
+                published_manifest(&reopened).durability_gaps,
+                expected.and_then(|totals| totals.with_gap(2, 20)),
+                "{step}"
             );
         }
     }
@@ -10886,33 +21024,75 @@ mod tests {
         );
     }
 
+    /// Formerly `deferred_scrollback_refuses_bounded_overflow_without_hiding_rows`.
+    /// ft-yccm0.2.1.6 changed this contract on purpose: a full queue no
+    /// longer refuses rows, because the refusal made the parser wait (22% of
+    /// mux-parse samples in the operator's T1 run). Both of the old bounds
+    /// still hold. Queue memory is bounded by the writer's byte budget, set
+    /// here to the old 16 MiB, and overflow sheds the oldest queued rows
+    /// into an explicit gap rather than hiding them. 4096 rows still bounds
+    /// every store transaction.
     #[test]
-    fn deferred_scrollback_refuses_bounded_overflow_without_hiding_rows() {
+    fn deferred_scrollback_bounds_overflow_by_bytes_without_hiding_rows() {
         let (_dir, backing, deferred) = deferred_test_sink();
         let line = Line::from_text("bounded", &CellAttributes::blank(), 0, None);
         let cap = isize::try_from(LIVE_SCROLLBACK_APPEND_MAX_ROWS).unwrap();
         let retention = LIVE_SCROLLBACK_APPEND_MAX_ROWS * 2;
-        for row in 0..cap {
+        // Rows past the old row cap are admitted: the queue is bounded by
+        // bytes, and these short rows stay far below the budget.
+        for row in 0..=cap {
             assert!(deferred.store_scrollback_line(row, &line, retention));
         }
-        assert!(!deferred.store_scrollback_line(cap, &line, retention));
         assert_eq!(
             deferred.retained_scrollback_rows(),
-            LIVE_SCROLLBACK_APPEND_MAX_ROWS
+            LIVE_SCROLLBACK_APPEND_MAX_ROWS + 1
         );
-        assert_eq!(deferred.load_scrollback_line(cap - 1), Some(line));
+        assert!(deferred.queued_gaps().is_empty());
+        assert_eq!(deferred.load_scrollback_line(cap), Some(line.clone()));
         assert_eq!(backing.retained_scrollback_rows(), 0);
+        deferred.flush_scrollback().unwrap();
+        assert_eq!(
+            backing.retained_scrollback_rows(),
+            LIVE_SCROLLBACK_APPEND_MAX_ROWS + 1
+        );
+        assert!(
+            deferred.committed_batches() >= 2,
+            "no store transaction exceeds {LIVE_SCROLLBACK_APPEND_MAX_ROWS} rows"
+        );
 
         let (_byte_dir, byte_backing, byte_deferred) = deferred_test_sink();
+        let budget = 16 * 1024 * 1024;
+        byte_deferred.set_writer_budget(budget);
         let long = Line::from_text(&"x".repeat(4096), &CellAttributes::blank(), 0, None);
-        let accepted = (0..cap)
-            .take_while(|row| byte_deferred.store_scrollback_line(*row, &long, retention))
-            .count();
-        assert!(
-            accepted > 0 && accepted < LIVE_SCROLLBACK_APPEND_MAX_ROWS,
-            "byte charge must bound long rows before the row cap"
+        for row in 0..cap {
+            assert!(byte_deferred.store_scrollback_line(row, &long, retention));
+            assert!(
+                byte_deferred.retained_scrollback_bytes() <= budget,
+                "the byte budget bounds the queue at row {row}"
+            );
+        }
+        // Long rows hit the byte bound long before the old row cap, and the
+        // oldest became one explicit gap; every row is still accounted for.
+        let gaps = byte_deferred.queued_gaps();
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        let gap = gaps[0].clone();
+        assert_eq!(gap.start, 0);
+        assert!(gap.end < cap, "{gap:?}");
+        assert_eq!(
+            byte_deferred.retained_scrollback_rows(),
+            LIVE_SCROLLBACK_APPEND_MAX_ROWS
         );
-        assert!(byte_deferred.retained_scrollback_bytes() <= 16 * 1024 * 1024);
+        let marker = byte_deferred.load_scrollback_line(0).unwrap();
+        assert!(
+            marker.as_str().starts_with("[durability gap: "),
+            "{}",
+            marker.as_str()
+        );
+        assert_eq!(
+            byte_deferred.load_scrollback_line(gap.end),
+            Some(long.clone())
+        );
+        assert_eq!(byte_deferred.load_scrollback_line(cap - 1), Some(long));
         assert_eq!(byte_backing.retained_scrollback_rows(), 0);
     }
 
@@ -11042,8 +21222,12 @@ mod tests {
         assert_eq!(backing.retained_scrollback_rows(), 64);
         // A fresh adapter has the same durable rows but no warm suffix. This
         // is the causal control for the pre-cache path, using real encrypted IO.
-        let uncached =
-            deferred_scrollback::DeferredScrollbackSpillSink::new(backing.clone()).unwrap();
+        let uncached = deferred_scrollback::DeferredScrollbackSpillSink::with_writer(
+            backing.clone(),
+            [0xd3; 16],
+            deferred_scrollback::DurabilityWriter::spawn(),
+        )
+        .unwrap();
         let pending = Line::from_text("pending tail", &CellAttributes::blank(), 64, None);
         assert!(deferred.store_scrollback_line(64, &pending, 128));
         expected.push(pending);
@@ -11309,12 +21493,539 @@ mod tests {
                     })
                     .unwrap();
                 assert_eq!(
-                    serialize_exact_semantic_scrollback_line(&line).unwrap(),
+                    serialize_cell_semantic_scrollback_line(&line).unwrap(),
                     expected,
                     "columns={columns} storage_case={storage_case}",
                 );
+                // ft-yccm0.2.1.4 changed what a clustered row seals: its own
+                // runs as schema 3. A vector row still seals as schema 2.
+                let sealed = serialize_exact_semantic_scrollback_line(&line).unwrap();
+                if storage_case == 0 {
+                    assert!(!line.has_clustered_storage());
+                    assert_eq!(*sealed, *expected, "columns={columns} vector row");
+                } else {
+                    assert!(line.has_clustered_storage());
+                    let clustered = varbincode::serialize(&ExactSemanticScrollbackLineRef {
+                        schema: EXACT_SCROLLBACK_SCHEMA_CLUSTERED,
+                        line: &line,
+                        cell_widths: &[],
+                    })
+                    .unwrap();
+                    assert_eq!(
+                        *sealed, clustered,
+                        "columns={columns} storage_case={storage_case}"
+                    );
+                }
                 assert_eq!(varbincode::serialize(&line).unwrap(), before);
             }
+        }
+    }
+
+    /// Rows as Screen hands them to the store, clustered: T0-like (a wide
+    /// emoji per cell pair with fresh colors), CJK with a bold run, a
+    /// wrapped ASCII row and an empty row.
+    fn clustered_test_rows() -> Vec<Line> {
+        const EMOJI: [&str; 4] = ["\u{1f600}", "\u{1f680}", "\u{1f916}", "\u{1f389}"];
+        let mut t0 = Line::with_width(80, 1);
+        for column in (0..80).step_by(2) {
+            let mut attrs = CellAttributes::blank();
+            attrs.set_foreground(termwiz::color::ColorAttribute::PaletteIndex(
+                (column * 7 % 256) as u8,
+            ));
+            attrs.set_background(termwiz::color::ColorAttribute::PaletteIndex(
+                (column * 13 % 256) as u8,
+            ));
+            t0.set_cell(
+                column,
+                termwiz::cell::Cell::new_grapheme(EMOJI[column % EMOJI.len()], attrs, None),
+                1,
+            );
+        }
+        let mut cjk = Line::from_text("ls 界面 漢字 ok", &CellAttributes::blank(), 3, None);
+        let mut bold = CellAttributes::blank();
+        bold.set_intensity(termwiz::cell::Intensity::Bold);
+        cjk.set_cell_grapheme(3, "界", 2, bold, 3);
+        let mut wrapped = Line::from_text(&"seq ".repeat(20), &CellAttributes::blank(), 5, None);
+        wrapped.set_last_cell_was_wrapped(true, 5);
+        let mut rows = vec![
+            t0,
+            cjk,
+            wrapped,
+            Line::from_text("", &CellAttributes::blank(), 1, None),
+        ];
+        for line in &mut rows {
+            line.compress_for_scrollback();
+            assert!(line.has_clustered_storage(), "{:?}", line.as_str());
+        }
+        rows
+    }
+
+    /// ft-yccm0.2.1.4: durable bytes written and syncs per MiB of T0 input,
+    /// the cell-vector schemas every row sealed before against schema 3, in
+    /// one run. Realistic T0 rows (the M.1 generator through an 80-column
+    /// terminal, as Screen hands them over) take the live sink's production
+    /// protocol: a first single batch, then commit windows of at most one
+    /// store batch, published on the final flush. Retention keeps every row,
+    /// so nothing is pruned or compacted: the ledger's log and sequence
+    /// bytes are exactly the bytes appended, and the WAL and manifest the
+    /// publications left come on top. Schema 3 must not amplify them.
+    #[test]
+    fn t0_durable_bytes_and_syncs_per_mib_before_and_after_schema_3() {
+        const ROWS: usize = 8192;
+        let (rows, input_bytes) =
+            super::scrollback_record_bench::Rows::t0_corpus_with_input(ROWS, 7);
+        let lines = rows.lines();
+        let clustered = lines
+            .iter()
+            .filter(|line| line.has_clustered_storage())
+            .count();
+        let measure = |force_cell_schemas: bool| {
+            FORCE_CELL_SCHEMAS.with(|force| force.set(force_cell_schemas));
+            let dir = tempfile::tempdir().unwrap();
+            let sink = LiveScrollbackSpillSink::open(
+                dir.path().to_path_buf(),
+                &deferred_test_context(),
+                std::time::Duration::from_secs(3600),
+            )
+            .unwrap();
+            let syncs_before =
+                frankenterm_core::storage::mmap_store::thread_durability_sync_count();
+            let publications_before =
+                LIVE_SCROLLBACK_MANIFEST_PUBLICATIONS.with(|count| count.get());
+            let mut row = 0;
+            while row < ROWS {
+                let window = &lines[row..(row + LIVE_SCROLLBACK_APPEND_MAX_ROWS).min(ROWS)];
+                let stored = sink.store_scrollback_lines(row as isize, window, ROWS);
+                assert!(stored > 0, "window at row {row}");
+                row += stored;
+            }
+            sink.flush_scrollback().unwrap();
+            let syncs = frankenterm_core::storage::mmap_store::thread_durability_sync_count()
+                - syncs_before;
+            let publications = LIVE_SCROLLBACK_MANIFEST_PUBLICATIONS.with(|count| count.get())
+                - publications_before;
+            FORCE_CELL_SCHEMAS.with(|force| force.set(false));
+            let manifest = published_manifest(&sink);
+            assert_eq!(manifest.next_seq, ROWS as u64);
+            assert_eq!(manifest.oldest_seq, Some(0), "nothing was pruned");
+            for probe in [0, ROWS / 2, ROWS - 1] {
+                let mut stored = sink.load_scrollback_line(probe as isize).unwrap();
+                let mut expected = lines[probe].clone();
+                assert_eq!(stored.cells_mut(), expected.cells_mut(), "row {probe}");
+            }
+            let ledger =
+                manifest.committed_log_bytes.unwrap() + manifest.committed_sequence_bytes.unwrap();
+            let file_bytes =
+                |path: &std::path::Path| std::fs::metadata(path).map_or(0, |m| m.len());
+            let metadata = file_bytes(&sink.manifest_path)
+                + file_bytes(
+                    &LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path).unwrap(),
+                );
+            (ledger, metadata, syncs, publications)
+        };
+        let (before_ledger, before_metadata, before_syncs, before_publications) = measure(true);
+        let (after_ledger, after_metadata, after_syncs, after_publications) = measure(false);
+        let mib = input_bytes as f64 / (1024.0 * 1024.0);
+        let per_mib = |bytes: u64| bytes as f64 / mib;
+        eprintln!(
+            "T0 corpus {ROWS} rows ({clustered} clustered), {input_bytes} input bytes: \
+             cell schemas {before_ledger} ledger + {before_metadata} WAL/manifest bytes = \
+             {:.0} bytes/MiB, {before_syncs} syncs = {:.1} syncs/MiB, {before_publications} \
+             publications; schema 3 {after_ledger} + {after_metadata} = {:.0} bytes/MiB, \
+             {after_syncs} syncs = {:.1} syncs/MiB, {after_publications} publications; \
+             bytes ratio {:.3}",
+            per_mib(before_ledger + before_metadata),
+            before_syncs as f64 / mib,
+            per_mib(after_ledger + after_metadata),
+            after_syncs as f64 / mib,
+            (after_ledger + after_metadata) as f64 / (before_ledger + before_metadata) as f64,
+        );
+        assert_eq!(after_syncs, before_syncs, "the same windows sync the same");
+        assert_eq!(after_publications, before_publications);
+        assert!(
+            after_ledger + after_metadata < before_ledger + before_metadata,
+            "schema 3 must not amplify T0's durable bytes"
+        );
+    }
+
+    /// ft-yccm0.2.1.4 AC2: the cold-read bench measures the store's own
+    /// segments. The live store, row 0 alone then one full window, seals
+    /// the window into exactly the segments the bench's sealer cuts (the
+    /// writer's 128 KiB target ends ascii91's first, its 1024-row target
+    /// ascii9's), and every hook
+    /// reads back exactly the stored rows: both cipher-level opens, the
+    /// store's cold row reads at each segment's first and tail rows, and a
+    /// viewport across a segment boundary.
+    #[test]
+    fn cold_read_bench_hooks_read_back_exact_rows_from_the_stores_segments() {
+        use super::scrollback_record_bench::{ColdReadStore, FIRST_SEGMENT_ROW, Rows, Sealer};
+        use mux::guardian_output_journal::{
+            SCROLLBACK_SEGMENT_MAX_PLAINTEXT_BYTES, SCROLLBACK_SEGMENT_MAX_ROWS,
+        };
+
+        let same = |mut stored: Line, expected: &Line, case: &str| {
+            let mut expected = expected.clone();
+            assert_eq!(stored.cells_mut(), expected.cells_mut(), "{case}");
+        };
+        let sealer = Sealer::new();
+        let rows_stored = FIRST_SEGMENT_ROW as usize + LIVE_SCROLLBACK_APPEND_MAX_ROWS;
+        for (shape, rows) in [
+            ("ascii91", Rows::printable(rows_stored, 91)),
+            ("ascii9", Rows::printable(rows_stored, 9)),
+        ] {
+            let lines = rows.lines();
+            let window = sealer.seal_window(&rows);
+            let dir = tempfile::tempdir().unwrap();
+            let store = ColdReadStore::open(dir.path(), &rows);
+            let store_segments: Vec<_> = store
+                .segments()
+                .iter()
+                .map(|(rows, _)| rows.clone())
+                .collect();
+            assert_eq!(store_segments, window.segments(), "{shape}");
+            assert_eq!(
+                store_segments.first().map(|rows| rows.start),
+                Some(FIRST_SEGMENT_ROW),
+                "{shape}"
+            );
+            for (rows, payload_bytes) in store.segments() {
+                assert!(
+                    (rows.end - rows.start) as usize <= LIVE_SCROLLBACK_SEGMENT_TARGET_ROWS
+                        && *payload_bytes as usize
+                            <= LIVE_SCROLLBACK_SEGMENT_TARGET_PLAINTEXT_BYTES
+                        && LIVE_SCROLLBACK_SEGMENT_TARGET_ROWS <= SCROLLBACK_SEGMENT_MAX_ROWS
+                        && LIVE_SCROLLBACK_SEGMENT_TARGET_PLAINTEXT_BYTES
+                            <= SCROLLBACK_SEGMENT_MAX_PLAINTEXT_BYTES,
+                    "{shape}: segment {rows:?} of {payload_bytes} bytes"
+                );
+            }
+            let (first, first_bytes) = store.segments()[0].clone();
+            match shape {
+                "ascii91" => assert!(
+                    store.segments().len() > 1
+                        && ((first.end - first.start) as usize)
+                            < LIVE_SCROLLBACK_SEGMENT_TARGET_ROWS
+                        && first_bytes as usize
+                            > LIVE_SCROLLBACK_SEGMENT_TARGET_PLAINTEXT_BYTES - 1024,
+                    "ascii91: the byte target ends the first segment {first:?} at {first_bytes}"
+                ),
+                _ => assert_eq!(
+                    first.end - first.start,
+                    LIVE_SCROLLBACK_SEGMENT_TARGET_ROWS as u64,
+                    "ascii9: the row target ends the first segment"
+                ),
+            }
+            for (rows, _) in store.segments() {
+                for row in [rows.start, rows.end - 1] {
+                    let expected = &lines[row as usize];
+                    let case = format!("{shape} row {row}");
+                    same(sealer.open_compact_row(&window, row), expected, &case);
+                    same(sealer.open_segment_row(&window, row), expected, &case);
+                    same(store.load(row), expected, &case);
+                }
+            }
+            let from = first.end.saturating_sub(12);
+            let viewport = store.load_viewport(from, 24.min(lines.len() as u64 - from));
+            for (row, line) in (from..).zip(viewport) {
+                same(
+                    line,
+                    &lines[row as usize],
+                    &format!("{shape} viewport row {row}"),
+                );
+            }
+            // A sweep in 32-row loads opens each segment once with the
+            // sink keeping one open, and once per load touching it without.
+            let opens = || LIVE_SCROLLBACK_SEGMENT_OPENS.with(std::cell::Cell::get);
+            let end = lines.len() as u64;
+            let cold_opens: usize = (0..end)
+                .step_by(32)
+                .map(|start| {
+                    let stop = (start + 32).min(end);
+                    store
+                        .segments()
+                        .iter()
+                        .filter(|(rows, _)| rows.start < stop && start < rows.end)
+                        .count()
+                })
+                .sum();
+            for (keep_open, expected) in [(true, store.segments().len()), (false, cold_opens)] {
+                store.forget_open_segment();
+                let before = opens();
+                assert_eq!(store.sweep(keep_open), lines.len(), "{shape}");
+                assert_eq!(
+                    opens() - before,
+                    expected,
+                    "{shape}: segment opens of a sweep keeping one open: {keep_open}"
+                );
+            }
+        }
+    }
+
+    /// ft-yccm0.2.1.4: the sink keeps the segment its last cold read
+    /// opened. A sweep in Screen's 32-row loads opens each segment once,
+    /// not once per load, and a row read after its neighbor opens nothing.
+    /// A kept segment is used only while its tail is stored as it was read,
+    /// and never across a clear, even where the new rows reuse its
+    /// sequences.
+    #[test]
+    fn cold_reads_keep_the_last_segment_open_until_it_changes() {
+        const RETENTION: usize = 4096;
+        let dir = tempfile::tempdir().unwrap();
+        let sink = windowed_test_sink(dir.path());
+        let mut rows = vec![Line::from_text("prior", &CellAttributes::blank(), 1, None)];
+        assert!(sink.store_scrollback_line(0, &rows[0], RETENTION));
+        for window in 0..3 {
+            let lines = digest_only_test_lines(&format!("w{window}"), 40);
+            assert_eq!(
+                sink.store_scrollback_lines(rows.len() as isize, &lines, RETENTION),
+                40
+            );
+            rows.extend(lines);
+        }
+        sink.flush_scrollback().unwrap();
+        let ledger_pane_id = sink.active_ledger_pane_id();
+        let tails: Vec<u64> = sink
+            .lock_store("test kept segment tails")
+            .unwrap()
+            .lines_range_reaching_pruned(ledger_pane_id, 0..121, 121, 1 << 20)
+            .unwrap()
+            .iter()
+            .zip(0..)
+            .filter(|(record, _)| mux::guardian_output_journal::is_scrollback_segment_tail(record))
+            .map(|(_, row)| row)
+            .collect();
+        assert_eq!(tails, vec![40, 80, 120], "one segment per window");
+        let opens = || LIVE_SCROLLBACK_SEGMENT_OPENS.with(std::cell::Cell::get);
+        let text = |line: &Line| line.as_str().into_owned();
+
+        let before = opens();
+        let mut row = 0;
+        while row < rows.len() {
+            let batch =
+                sink.load_scrollback_lines(row as isize..(row + 32).min(rows.len()) as isize);
+            assert!(!batch.is_empty(), "sweep at row {row}");
+            for (offset, line) in batch.iter().enumerate() {
+                assert_eq!(
+                    text(line),
+                    text(&rows[row + offset]),
+                    "row {}",
+                    row + offset
+                );
+            }
+            row += batch.len();
+        }
+        assert_eq!(opens() - before, 3, "the sweep opens each segment once");
+
+        let before = opens();
+        assert_eq!(
+            text(&sink.load_scrollback_line(50).unwrap()),
+            text(&rows[50])
+        );
+        assert_eq!(
+            text(&sink.load_scrollback_line(51).unwrap()),
+            text(&rows[51])
+        );
+        assert_eq!(
+            opens() - before,
+            1,
+            "row 51 reads from row 50's open segment"
+        );
+
+        {
+            let store = sink.lock_store("test kept segment").unwrap();
+            let kept = sink.cold_segment.lock().unwrap();
+            assert_eq!(kept.reader.open_rows(), Some(41..81));
+            let mut stored =
+                |range: std::ops::Range<u64>| store_segment_records(&store, ledger_pane_id, range);
+            assert!(kept.reader.still_stored(&mut stored));
+            // The same rows sealed again carry another tag.
+            let mut resealed = |range: std::ops::Range<u64>| -> anyhow::Result<Vec<String>> {
+                let mut records = store_segment_records(&store, ledger_pane_id, range)?;
+                let last = records[0].pop().unwrap();
+                records[0].push(if last == 'A' { 'B' } else { 'A' });
+                Ok(records)
+            };
+            assert!(!kept.reader.still_stored(&mut resealed));
+            let mut cut =
+                |_: std::ops::Range<u64>| -> anyhow::Result<Vec<String>> { anyhow::bail!("cut") };
+            assert!(!kept.reader.still_stored(&mut cut));
+        }
+
+        // A clear wipes the kept segment. New rows then reuse its
+        // sequences: row 250 is sequence 50.
+        sink.clear_scrollback().unwrap();
+        assert_eq!(sink.cold_segment.lock().unwrap().reader.open_rows(), None);
+        let prior = Line::from_text("prior after clear", &CellAttributes::blank(), 1, None);
+        assert!(sink.store_scrollback_line(200, &prior, RETENTION));
+        let after = digest_only_test_lines("after", 100);
+        assert_eq!(sink.store_scrollback_lines(201, &after, RETENTION), 100);
+        let before = opens();
+        assert_eq!(
+            text(&sink.load_scrollback_line(250).unwrap()),
+            text(&after[49])
+        );
+        assert_eq!(
+            opens() - before,
+            1,
+            "the kept segment is not reused across a clear"
+        );
+    }
+
+    /// ft-yccm0.2.1.4 AC1: a clustered row seals as schema 3, its own runs
+    /// with no width sidecar, and decodes to exactly that row, still
+    /// clustered. Wide and colored rows take it too, and seal smaller than
+    /// their cell vector. The arena and the allocating path seal the same
+    /// payload.
+    #[test]
+    fn clustered_rows_seal_as_their_runs_and_decode_exactly() {
+        let mut arena = ScrollbackRowEncodeArena::default();
+        for line in clustered_test_rows() {
+            let text = line.as_str().into_owned();
+            let raw = serialize_exact_semantic_scrollback_line(&line).unwrap();
+            let semantic: ExactSemanticScrollbackLineV1 =
+                codec::bounded_varbincode_deserialize(&mut raw.as_slice()).unwrap();
+            assert_eq!(
+                semantic.schema, EXACT_SCROLLBACK_SCHEMA_CLUSTERED,
+                "{text:?}"
+            );
+            assert!(semantic.cell_widths.is_empty(), "{text:?}");
+            let vector = serialize_cell_semantic_scrollback_line(&line).unwrap();
+            if !line.is_whitespace() {
+                assert!(
+                    raw.len() < vector.len(),
+                    "{text:?}: runs {} bytes, cell vector {} bytes",
+                    raw.len(),
+                    vector.len()
+                );
+            }
+
+            let payload = exact_scrollback_line_payload(&line).unwrap();
+            let payload_bytes = arena.prepare_payload(&line).unwrap();
+            let prepared: &[u8] = if arena.compressed_payload {
+                &arena.compressed
+            } else {
+                &arena.plaintext
+            };
+            assert_eq!(prepared, payload.as_slice(), "{text:?}: arena payload");
+            assert_eq!(payload_bytes, payload.len());
+            arena.discard_payload();
+
+            let (decoded, charge, fidelity) = decode_exact_semantic_scrollback_plaintext(
+                payload,
+                LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+            )
+            .unwrap();
+            assert_eq!(fidelity, DecodedScrollbackRecordFidelity::ExactSemantic);
+            assert!(decoded.has_clustered_storage(), "{text:?}");
+            // Derived equality also compares the wide-cell bitset's
+            // capacity, which the wire form drops (the surface crate's
+            // wide_mask_wire_omits_unused_trailing_extent); the row's bytes
+            // and its cells are what must match.
+            assert_eq!(
+                varbincode::serialize(&decoded).unwrap(),
+                varbincode::serialize(&line).unwrap(),
+                "{text:?}: the decoded row is the sealed row"
+            );
+            assert_eq!(decoded.len(), line.len(), "{text:?}");
+            assert_eq!(
+                decoded.last_cell_was_wrapped(),
+                line.last_cell_was_wrapped(),
+                "{text:?}"
+            );
+            assert!(charge >= raw.len(), "{text:?}");
+            let (mut decoded, mut line) = (decoded, line);
+            assert_eq!(decoded.cells_mut(), line.cells_mut(), "{text:?}: cells");
+        }
+    }
+
+    /// The schema 3 decoder refuses a width sidecar and vector storage, and
+    /// any mutation of a sealed plaintext either decodes to a row whose
+    /// runs reproduce exactly its cells or is refused: never a panic.
+    #[test]
+    fn clustered_row_decoder_refuses_malformed_rows_without_panicking() {
+        let rows = clustered_test_rows();
+        let t0 = &rows[0];
+        let decode = |plaintext: Vec<u8>| {
+            decode_exact_semantic_scrollback_plaintext(
+                Zeroizing::new(plaintext),
+                LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE,
+            )
+        };
+        let sidecar = varbincode::serialize(&ExactSemanticScrollbackLineRef {
+            schema: EXACT_SCROLLBACK_SCHEMA_CLUSTERED,
+            line: t0,
+            cell_widths: &[2],
+        })
+        .unwrap();
+        assert!(decode(sidecar).is_err(), "a width sidecar is refused");
+        let mut vector = t0.clone();
+        vector.cells_mut();
+        let vector = varbincode::serialize(&ExactSemanticScrollbackLineRef {
+            schema: EXACT_SCROLLBACK_SCHEMA_CLUSTERED,
+            line: &vector,
+            cell_widths: &[],
+        })
+        .unwrap();
+        assert!(decode(vector).is_err(), "vector storage is refused");
+
+        let sealed = serialize_exact_semantic_scrollback_line(t0)
+            .unwrap()
+            .to_vec();
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut accepted = 0;
+        for _ in 0..4096 {
+            let mut mutated = sealed.clone();
+            for _ in 0..=next() % 3 {
+                let at = (next() % mutated.len() as u64) as usize;
+                mutated[at] = next() as u8;
+            }
+            if let Ok((mut line, _, _)) = decode(mutated) {
+                accepted += 1;
+                let columns = line.len();
+                assert_eq!(
+                    line.cells_mut().len(),
+                    columns,
+                    "an accepted row materializes exactly its columns"
+                );
+            }
+        }
+        // Most single-byte changes land in text or attribute values, which
+        // stay well-formed rows; the sweep must exercise both outcomes.
+        assert!(
+            accepted > 0 && accepted < 4096,
+            "accepted {accepted} of 4096"
+        );
+    }
+
+    /// An exact retry is recognized whatever the row's storage: a row stored
+    /// from vector storage (schema 2 or 1) and retried clustered (schema 3),
+    /// and the reverse. A different row at the same place is not a retry.
+    #[test]
+    fn exact_retries_match_across_vector_and_clustered_storage() {
+        let (_dir, backing, _deferred) = deferred_test_sink();
+        for (row, clustered) in clustered_test_rows().into_iter().enumerate() {
+            let row = row as isize * 2;
+            let mut vector = clustered.clone();
+            vector.cells_mut();
+            assert!(backing.store_scrollback_line(row, &vector, 64));
+            assert!(
+                backing.store_scrollback_line(row, &clustered, 64),
+                "row {row}"
+            );
+            assert!(backing.store_scrollback_line(row + 1, &clustered, 64));
+            assert!(
+                backing.store_scrollback_line(row + 1, &vector, 64),
+                "row {}",
+                row + 1
+            );
+            let other = Line::from_text("other", &CellAttributes::blank(), 1, None);
+            assert!(!backing.store_scrollback_line(row, &other, 64), "row {row}");
         }
     }
 
@@ -11447,7 +22158,7 @@ mod tests {
             .unwrap()
             .encode()
             .unwrap();
-        let mut cache = GuardianScrollbackCipherCache::new(&keyring);
+        let mut cache = GuardianScrollbackCipherCache::new(&keyring, &state.row_segments);
         let error = decode_persisted_scrollback_line_with_limit(
             &encrypted,
             &mut cache,
@@ -11504,7 +22215,7 @@ mod tests {
         assert!(usize::try_from(parsed.plaintext_bytes()).unwrap() < raw.len());
         let state = *backing.lock_state("compressed row identity").unwrap();
         let keyring = backing.lock_keyring("compressed row decode").unwrap();
-        let mut cache = GuardianScrollbackCipherCache::new(&keyring);
+        let mut cache = GuardianScrollbackCipherCache::new(&keyring, &state.row_segments);
         let (decoded, charged, fidelity) = decode_persisted_scrollback_line_with_limit(
             &records[0],
             &mut cache,
@@ -11964,6 +22675,11 @@ mod tests {
         Mux::shutdown();
     }
 
+    // These fixtures build the pre-v4 append WAL that carries its rows (v2
+    // for one row, v3 for a batch): crash fixtures that publish a WAL without
+    // its rows prove this binary still recovers WALs older binaries left.
+    // The digest-only v4 WAL this binary writes is covered by the
+    // digest_only_* tests.
     fn prepare_later_row_append_wal_for_test(
         sink: &LiveScrollbackSpillSink,
         stable_row: wezterm_term::StableRowIndex,
@@ -12052,14 +22768,16 @@ mod tests {
         let (wal, target_authority) = sink
             .prepare_authenticated_append_wal(
                 &predecessor_manifest,
-                previous_state,
-                proposed_state,
+                &previous_state,
+                &proposed_state,
                 sink.active_ledger_pane_id(),
                 stable_row,
                 desired_sequence,
                 max_retained_rows,
                 &records,
+                None,
                 &store,
+                AppendWalFormat::CarriedRows,
             )
             .expect("prepare authenticated test append WAL");
         proposed_state.verified_ledger = Some(target_authority);
@@ -12267,9 +22985,11 @@ mod tests {
             &LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path)
                 .expect("derive measured append WAL path"),
         )
-        .expect("read measured v2 append WAL")
-        .expect("measured v2 append WAL exists");
-        assert_eq!(wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2);
+        .expect("read measured append WAL")
+        .expect("measured append WAL exists");
+        // A single later row is a one-row digest-only batch (ft-yccm0.2.1.3).
+        assert_eq!(wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4);
+        assert_eq!(wal.appended_record_count, Some(1));
         (
             reads,
             LIVE_SCROLLBACK_EVICTION_RANGE_READS.with(std::cell::Cell::get),
@@ -12736,8 +23456,10 @@ mod tests {
     #[test]
     fn append_wal_construction_proof_cannot_authorize_copied_or_tampered_wal() {
         let (_dir, _context, sink, wal, _line) = append_wal_fixture(196, 8);
+        let records: Vec<String> = wal.records().map(str::to_string).collect();
         let proof = AppendWalConstructionProof {
             wal: &wal,
+            records: &records,
             record_digest: wal.records_digest().unwrap(),
             chain_tail: decode_live_scrollback_canonical_digest(
                 wal.target_chain_tail_sha256.as_deref().unwrap(),
@@ -12804,7 +23526,8 @@ mod tests {
         let identities = LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get);
         let checksums = LIVE_SCROLLBACK_WAL_CHECKSUMS.with(std::cell::Cell::get);
         let decodes = LIVE_SCROLLBACK_WAL_DECODES.with(std::cell::Cell::get);
-        sink.persist_prepared_append_wal(&prepared).unwrap();
+        sink.persist_prepared_append_wal(&prepared, RetainedAppendWalCheck::Live)
+            .unwrap();
         assert_eq!(
             LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get),
             identities
@@ -12858,7 +23581,7 @@ mod tests {
             let (_dir, _context, sink, _wal, line) = append_wal_fixture(189 + point, 8);
             let (prepared, _) = prepare_later_row_owned_append_wal_for_test(&sink, 11, &line, 8);
             LIVE_SCROLLBACK_WAL_READBACK_FAULT.with(|fault| fault.set(point));
-            let result = sink.persist_prepared_append_wal(&prepared);
+            let result = sink.persist_prepared_append_wal(&prepared, RetainedAppendWalCheck::Live);
             LIVE_SCROLLBACK_WAL_READBACK_FAULT.with(|fault| fault.set(0));
             let error = result.unwrap_err();
             assert_eq!(error.outcome_indeterminate(), point == 2);
@@ -12894,7 +23617,8 @@ mod tests {
         write_private_stage_fixture(&stage, &compact);
         let checksums = LIVE_SCROLLBACK_WAL_CHECKSUMS.with(std::cell::Cell::get);
         let decodes = LIVE_SCROLLBACK_WAL_DECODES.with(std::cell::Cell::get);
-        sink.persist_prepared_append_wal(&prepared).unwrap();
+        sink.persist_prepared_append_wal(&prepared, RetainedAppendWalCheck::Live)
+            .unwrap();
         assert_eq!(
             LIVE_SCROLLBACK_WAL_CHECKSUMS.with(std::cell::Cell::get),
             checksums + 3
@@ -12959,7 +23683,9 @@ mod tests {
         let (prepared, _) = prepare_later_row_owned_append_wal_for_test(&sink, 11, &line, 8);
         let other_dir = tempfile::tempdir().unwrap();
         let other = LiveScrollbackSpillSink::new(other_dir.path().to_path_buf(), &context).unwrap();
-        let error = other.persist_prepared_append_wal(&prepared).unwrap_err();
+        let error = other
+            .persist_prepared_append_wal(&prepared, RetainedAppendWalCheck::Live)
+            .unwrap_err();
         assert!(!error.outcome_indeterminate());
         assert!(format!("{:#}", error.source).contains("another sink"));
         assert!(
@@ -12973,7 +23699,9 @@ mod tests {
         seal_append_wal_fixture(&sink, &mut occupied);
         let stage = LiveScrollbackSpillSink::append_wal_stage_path(&sink.manifest_path).unwrap();
         write_complete_append_wal_fixture(&stage, &occupied);
-        let error = sink.persist_prepared_append_wal(&prepared).unwrap_err();
+        let error = sink
+            .persist_prepared_append_wal(&prepared, RetainedAppendWalCheck::Live)
+            .unwrap_err();
         assert!(!error.outcome_indeterminate());
         assert_eq!(
             LiveScrollbackSpillSink::read_append_wal(&stage).unwrap(),
@@ -12991,7 +23719,9 @@ mod tests {
             let mut other_keys = other.keyring.lock().unwrap();
             std::mem::swap(&mut *keys, &mut *other_keys);
         }
-        let error = sink.persist_prepared_append_wal(&prepared).unwrap_err();
+        let error = sink
+            .persist_prepared_append_wal(&prepared, RetainedAppendWalCheck::Live)
+            .unwrap_err();
         assert!(!error.outcome_indeterminate());
         assert!(format!("{:#}", error.source).contains("append WAL guardian key"));
         let active = LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path).unwrap();
@@ -13010,7 +23740,9 @@ mod tests {
             panic!("test prepared publication cache poison");
         }));
         assert!(poison.is_err());
-        let error = sink.persist_prepared_append_wal(&prepared).unwrap_err();
+        let error = sink
+            .persist_prepared_append_wal(&prepared, RetainedAppendWalCheck::Live)
+            .unwrap_err();
         assert!(error.outcome_indeterminate());
         assert_eq!(
             LiveScrollbackSpillSink::read_append_wal(&active).unwrap(),
@@ -13129,10 +23861,22 @@ mod tests {
             let before = AUTHORITY_LEASE_ACQUISITIONS.with(std::cell::Cell::get);
             sink.persist_manifest("complete")
                 .expect("publish and acknowledge the authenticated manifest");
+            // ft-yccm0.2.1.5 split manifest publication the way append-WAL
+            // publication already was: the signing key is resolved under the
+            // keyring mutex with its own brief exclusive lease, released
+            // before one shared lease authenticates the staged and published
+            // manifest. The publication's I/O no longer holds the process-wide
+            // mutex, so it no longer convoys other panes. Acknowledgement
+            // still runs under a single lease.
             assert_eq!(
                 AUTHORITY_LEASE_ACQUISITIONS.with(std::cell::Cell::get),
-                before + 1,
-                "manifest sealing and acknowledgement must share one durable authority lease"
+                before + 2,
+                "one lease resolves the signing key, one authenticates and acknowledges"
+            );
+            assert_eq!(
+                LIVE_SCROLLBACK_KEYRING_FREE_AT_RENAME.with(std::cell::Cell::get),
+                Some(true),
+                "the manifest rename runs without the keyring mutex"
             );
         }
         // Rotation must be able to acquire the released scope, and reopening
@@ -13281,7 +24025,11 @@ mod tests {
         let sink = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
             .expect("create logical-ledger digest sink");
         let attrs = CellAttributes::blank();
+        // The lineage's first row is a self-describing v3 record and later
+        // rows are compact (ft-yccm0.2.1.4); retention 3 ages the anchor row
+        // out, so the three ordered rows share one length.
         for (stable_row, text) in [
+            (29_isize, "order-anchor"),
             (30_isize, "order-row-a"),
             (31_isize, "order-row-b"),
             (32_isize, "order-row-c"),
@@ -13294,7 +24042,7 @@ mod tests {
                     usize::try_from(stable_row).expect("fixture stable row fits usize"),
                     None,
                 ),
-                8,
+                3,
             ));
         }
         let manifest = LiveScrollbackSpillSink::read_manifest(&sink.manifest_path)
@@ -13302,10 +24050,12 @@ mod tests {
             .expect("logical-ledger manifest exists");
         let ledger_pane_id = LiveScrollbackSpillSink::manifest_ledger_pane_id(&manifest)
             .expect("decode logical-ledger pointer");
+        assert_eq!(manifest.oldest_seq, Some(1));
+        assert_eq!(manifest.retained_rows, 3);
         let store = sink
             .lock_store("test logical-ledger canonical order")
             .expect("test logical-ledger store lock");
-        let records = (0..3)
+        let records = (1..4)
             .map(|sequence| {
                 store
                     .line_at(ledger_pane_id, sequence)
@@ -14565,18 +25315,19 @@ mod tests {
                 second_reopen.store_scrollback_line(12, &successor, 1),
                 "a recovered v1 WAL must not strand later append authority"
             );
+            // This binary's successor WAL is digest-only (ft-yccm0.2.1.3).
             let successor_wal = LiveScrollbackSpillSink::read_append_wal(&wal_path)
-                .expect("read successor v2 WAL")
-                .expect("successor v2 WAL exists");
-            assert_eq!(successor_wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2);
+                .expect("read successor v4 WAL")
+                .expect("successor v4 WAL exists");
+            assert_eq!(successor_wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4);
             drop(second_reopen);
 
             let third_reopen = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
-                .expect("reopen after replacing legacy v1 WAL with v2");
+                .expect("reopen after replacing legacy v1 WAL with v4");
             assert_eq!(
                 third_reopen
                     .load_scrollback_line(12)
-                    .expect("v2 successor survives cold reopen")
+                    .expect("v4 successor survives cold reopen")
                     .as_str()
                     .as_ref(),
                 successor.as_str().as_ref()
@@ -15451,6 +26202,19 @@ mod tests {
         ];
         assert_append_wal_borrowed_and_legacy_equivalence(&v3_wal, "Variant 3 (V3 batch)");
 
+        // Variant 3b: digest-only V4 batch: a row count and no rows
+        let mut v4_wal = v2_wal.clone();
+        v4_wal.schema = LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V4.to_string();
+        v4_wal.appended_record_count = Some(3);
+        v4_wal.encrypted_record.clear();
+        assert_append_wal_borrowed_and_legacy_equivalence(&v4_wal, "Variant 3b (V4 digest-only)");
+        assert!(
+            serde_json::to_string(&v4_wal.authentication_view())
+                .unwrap()
+                .contains("\"appended_record_count\":3"),
+            "the guardian MAC binds the row count"
+        );
+
         // Variant 4: Metadata variants (None vs Some for optional fields, supersession, eviction)
         let mut modified = v2_wal.clone();
         modified.guardian_authentication = None;
@@ -16262,7 +27026,7 @@ mod tests {
         *sink
             .lock_state("test staged-clear successor")
             .expect("lock staged-clear successor state") =
-            sink.clear_successor_state(previous_state, sink.active_ledger_pane_id());
+            sink.clear_successor_state(&previous_state, sink.active_ledger_pane_id());
         let parent = sink
             .manifest_path
             .parent()

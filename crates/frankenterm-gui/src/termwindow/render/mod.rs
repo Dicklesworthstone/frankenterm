@@ -6,8 +6,9 @@ use crate::quad::{
     TripleLayerQuadAllocatorTrait,
 };
 use crate::shapecache::*;
+use crate::termwindow::box_model::ChromeTarget;
 use crate::termwindow::render::paint::AllowImage;
-use crate::termwindow::{BorrowedShapeCacheKey, RenderState, ShapedInfo};
+use crate::termwindow::{BorrowedShapeCacheKey, ShapedInfo};
 use crate::utilsprites::RenderMetrics;
 use ::window::bitmaps::{TextureCoord, TextureRect, TextureSize};
 use ::window::{DeadKeyStatus, PointF, RectF, SizeF};
@@ -17,6 +18,7 @@ use config::{
     VerticalWindowContentAlignment, VisualBellTarget,
 };
 use euclid::num::Zero;
+use frankenterm_alloc::resource_ledger::CacheGauge;
 use frankenterm_font::shaper::PresentationWidth;
 use frankenterm_font::units::{IntPixelLength, PixelLength};
 use frankenterm_font::{GlyphInfo, LoadedFont};
@@ -231,7 +233,7 @@ pub struct RenderScreenLineParams<'a> {
 }
 
 #[inline]
-fn image_padding_fits_cell(
+pub(crate) fn image_padding_fits_cell(
     (left, top, right, bottom): (u16, u16, u16, u16),
     cell_width: isize,
     cell_height: isize,
@@ -247,7 +249,7 @@ fn image_padding_fits_cell(
 }
 
 #[inline]
-fn image_cache_padding_for_cell(cell_width: isize, cell_height: isize) -> Option<usize> {
+pub(crate) fn image_cache_padding_for_cell(cell_width: isize, cell_height: isize) -> Option<usize> {
     if cell_width <= 0 || cell_height <= 0 {
         return None;
     }
@@ -256,7 +258,7 @@ fn image_cache_padding_for_cell(cell_width: isize, cell_height: isize) -> Option
 }
 
 #[inline]
-fn canonical_image_texture_region(
+pub(crate) fn canonical_image_texture_region(
     top_left: termwiz::image::TextureCoordinate,
     bottom_right: termwiz::image::TextureCoordinate,
 ) -> Option<(f32, f32, f32, f32)> {
@@ -341,6 +343,65 @@ pub struct ClusterStyleCache<'a> {
     underline_color: LinearRgba,
 }
 
+/// How often a window refreshes its cache gauges (ft-yccm0.1.7).
+const CACHE_GAUGE_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Entries and accounted heap bytes of a window's shape, line-shape and
+/// line-quad caches for the cache-gauge ledger (ft-yccm0.1.7). Bytes count
+/// each entry's key and value structs plus the vectors and strings they own
+/// (cluster and composing text, quad vectors, hyperlink spans). Glyphs are not
+/// counted, and the sprite vectors that line entries share are counted once,
+/// as the glyph cache's shape bindings, which the caller adds to the shape
+/// bytes.
+fn render_cache_gauge_values(
+    shapes: &LfuCache<ShapeCacheKey, Rc<CachedShape>>,
+    lines: &LfuCache<LineToEleShapeCacheKey, LineToElementShapeItem>,
+    quads: &LfuCache<LineQuadCacheKey, LineQuadCacheValue>,
+) -> [(CacheGauge, u64); 6] {
+    use std::mem::size_of;
+
+    let mut shape_bytes = 0u64;
+    shapes.for_each_resident(|key, shape| {
+        shape_bytes +=
+            (size_of::<ShapeCacheKey>() + key.text.capacity()) as u64 + shape.accounted_bytes();
+    });
+    let mut line_bytes = 0u64;
+    lines.for_each_resident(|key, item| {
+        let composing = key
+            .composing
+            .as_ref()
+            .map_or(0, |(_, text)| text.capacity());
+        let elements: usize = item
+            .shaped
+            .iter()
+            .map(|element| element.cluster.text.capacity())
+            .sum();
+        line_bytes += (size_of::<LineToEleShapeCacheKey>()
+            + composing
+            + size_of::<LineToElementShapeItem>()
+            + item.shaped.capacity() * size_of::<LineToElementShape>()
+            + elements) as u64;
+    });
+    let mut quad_bytes = 0u64;
+    quads.for_each_resident(|key, value| {
+        let composing = key.composing.as_ref().map_or(0, String::capacity);
+        quad_bytes += (size_of::<LineQuadCacheKey>()
+            + composing
+            + size_of::<LineQuadCacheValue>()
+            + value.hyperlinks.capacity() * size_of::<crate::selection::HyperlinkSpan>())
+            as u64
+            + value.layers.accounted_bytes();
+    });
+    [
+        (CacheGauge::ShapeCacheEntries, shapes.len() as u64),
+        (CacheGauge::ShapeCacheBytes, shape_bytes),
+        (CacheGauge::LineShapeCacheEntries, lines.len() as u64),
+        (CacheGauge::LineShapeCacheBytes, line_bytes),
+        (CacheGauge::LineQuadCacheEntries, quads.len() as u64),
+        (CacheGauge::LineQuadCacheBytes, quad_bytes),
+    ]
+}
+
 /// Keep only complete successful resolutions. A failure must reach the bounded
 /// frame retry without becoming an LFU hit that prevents the shaper running again.
 fn resolve_cached_shape(
@@ -362,13 +423,62 @@ fn resolve_cached_shape(
 }
 
 impl crate::TermWindow {
+    /// Publish this window's cache sizes into the process cache gauges, at
+    /// most once per [`CACHE_GAUGE_REPORT_INTERVAL`] (ft-yccm0.1.7).
+    pub(crate) fn report_cache_gauges(&mut self, now: Instant) {
+        let Some(render_state) = self.render_state.as_mut() else {
+            return;
+        };
+        if render_state
+            .last_cache_gauge_report
+            .is_some_and(|last| now.saturating_duration_since(last) < CACHE_GAUGE_REPORT_INTERVAL)
+        {
+            return;
+        }
+        render_state.last_cache_gauge_report = Some(now);
+        let values = render_cache_gauge_values(
+            &self.shape_cache.borrow(),
+            &self.line_to_ele_shape_cache.borrow(),
+            &self.line_quad_cache.borrow(),
+        );
+        let (glyph_entries, image_bytes, binding_bytes) = {
+            let glyph_cache = render_state.glyph_cache.borrow();
+            (
+                glyph_cache.glyph_entries() as u64,
+                glyph_cache.image_cache_retained_bytes() as u64,
+                glyph_cache.shape_binding_bytes(),
+            )
+        };
+        for (gauge, mut value) in values {
+            if gauge == CacheGauge::ShapeCacheBytes {
+                value += binding_bytes;
+            }
+            render_state.cache_gauges.set(gauge, value);
+        }
+        render_state
+            .cache_gauges
+            .set(CacheGauge::GlyphCacheEntries, glyph_entries);
+        render_state
+            .cache_gauges
+            .set(CacheGauge::ImageCacheBytes, image_bytes);
+        let shaping = render_state.shaping.get();
+        for (gauge, value) in [
+            (CacheGauge::ShapedLinesTotal, shaping.lines),
+            (CacheGauge::ShapedClustersTotal, shaping.clusters),
+            (CacheGauge::ShapingRunsTotal, shaping.runs),
+            (CacheGauge::UnsplitShapingRunsTotal, shaping.unsplit_runs),
+        ] {
+            render_state.cache_gauges.set(gauge, value);
+        }
+    }
+
     pub fn update_next_frame_time(&self, next_due: Option<Instant>) {
         if next_due.is_some() {
             update_next_frame_time(&mut *self.has_animation.borrow_mut(), next_due);
         }
     }
 
-    fn get_intensity_if_bell_target_ringing(
+    pub(crate) fn get_intensity_if_bell_target_ringing(
         &self,
         pane: &Arc<dyn Pane>,
         config: &ConfigHandle,
@@ -401,6 +511,16 @@ impl crate::TermWindow {
         None
     }
 
+    /// Where window chrome is laid out and drawn: the WebGpu front end's
+    /// render state, or a Metal window's own chrome target (ft-yccm0.4.7.1).
+    pub(crate) fn chrome(&self) -> anyhow::Result<&dyn ChromeTarget> {
+        match (&self.render_state, &self.metal_chrome) {
+            (Some(state), _) => Ok(state),
+            (None, Some(chrome)) => Ok(chrome),
+            (None, None) => Err(anyhow!("render state is not initialized")),
+        }
+    }
+
     pub fn filled_rectangle<'a>(
         &self,
         layers: &'a mut TripleLayerQuadAllocator,
@@ -411,17 +531,14 @@ impl crate::TermWindow {
         let mut quad = layers.allocate(layer_num)?;
         let left_offset = self.dimensions.pixel_width as f32 / 2.;
         let top_offset = self.dimensions.pixel_height as f32 / 2.;
-        let gl_state = self
-            .render_state
-            .as_ref()
-            .context("render state is not initialized")?;
+        let chrome = self.chrome()?;
         quad.set_position(
             rect.min_x() as f32 - left_offset,
             rect.min_y() as f32 - top_offset,
             rect.max_x() as f32 - left_offset,
             rect.max_y() as f32 - top_offset,
         );
-        quad.set_texture(gl_state.util_sprites.filled_box.texture_coords());
+        quad.set_texture(chrome.util_sprites().filled_box.texture_coords());
         quad.set_is_background();
         quad.set_fg_color(color);
         quad.set_hsv(None);
@@ -440,12 +557,9 @@ impl crate::TermWindow {
     ) -> anyhow::Result<QuadImpl<'a>> {
         let left_offset = self.dimensions.pixel_width as f32 / 2.;
         let top_offset = self.dimensions.pixel_height as f32 / 2.;
-        let gl_state = self
-            .render_state
-            .as_ref()
-            .context("render state is not initialized")?;
-        let sprite = gl_state
-            .glyph_cache
+        let sprite = self
+            .chrome()?
+            .glyph_cache()
             .borrow_mut()
             .cached_block(
                 BlockKey::PolyWithCustomMetrics {
@@ -544,7 +658,7 @@ impl crate::TermWindow {
         style: &TextStyle,
         attrs: &CellAttributes,
         font: Option<&Rc<LoadedFont>>,
-        gl_state: &RenderState,
+        gl_state: &dyn ChromeTarget,
         metrics: &RenderMetrics,
     ) -> anyhow::Result<Rc<CachedGlyph>> {
         let fa_lock = "\u{f023}";
@@ -564,7 +678,7 @@ impl crate::TermWindow {
     pub fn populate_block_quad(
         &self,
         block: BlockKey,
-        gl_state: &RenderState,
+        gl_state: &dyn ChromeTarget,
         quads: &mut dyn QuadAllocator,
         pos_x: f32,
         params: &RenderScreenLineParams,
@@ -572,7 +686,7 @@ impl crate::TermWindow {
         glyph_color: LinearRgba,
     ) -> anyhow::Result<()> {
         let sprite = gl_state
-            .glyph_cache
+            .glyph_cache()
             .borrow_mut()
             .cached_block(block, &params.render_metrics)?
             .texture_coords();
@@ -593,7 +707,7 @@ impl crate::TermWindow {
     pub fn populate_image_quad(
         &self,
         image: &termwiz::image::ImageCell,
-        gl_state: &RenderState,
+        gl_state: &dyn ChromeTarget,
         layers: &mut TripleLayerQuadAllocator,
         layer_num: usize,
         cell_idx: usize,
@@ -650,11 +764,12 @@ impl crate::TermWindow {
         };
 
         let (sprite, next_due, load_state) = gl_state
-            .glyph_cache
+            .glyph_cache()
             .borrow_mut()
             .cached_image(image.image_data(), Some(padding), self.allow_images)
             .context("cached_image")?;
         self.update_next_frame_time(next_due);
+        self.note_image_load_state(load_state, next_due);
         if load_state != crate::glyphcache::LoadState::Loaded {
             return Ok(());
         }
@@ -865,7 +980,7 @@ impl crate::TermWindow {
         if blinking {
             let mut color_ease = self.cursor_blink_state.borrow_mut();
             color_ease.update_start(self.prev_cursor.last_cursor_movement());
-            let (intensity, next) = color_ease.intensity_continuous();
+            let (intensity, next) = self.blink_intensity(&mut color_ease);
 
             cursor_border_mix = intensity;
             cursor_border_color_alt = params.bg_color;
@@ -970,7 +1085,7 @@ impl crate::TermWindow {
         &self,
         style: &TextStyle,
         cluster: &CellCluster,
-        gl_state: &RenderState,
+        gl_state: &dyn ChromeTarget,
         font: Option<&Rc<LoadedFont>>,
         metrics: &RenderMetrics,
         paragraph_context: Option<(&str, Range<usize>)>,
@@ -984,7 +1099,7 @@ impl crate::TermWindow {
             style,
             text: &cluster.text,
         };
-        let resolve = || -> anyhow::Result<CachedShape> {
+        let shape = || -> anyhow::Result<(Vec<GlyphInfo>, Rc<Vec<ShapedInfo>>)> {
             let font = match font {
                 Some(f) => Rc::clone(f),
                 None => self.fonts.resolve_font(style)?,
@@ -1013,44 +1128,44 @@ impl crate::TermWindow {
             }
             let glyphs = self.glyph_infos_to_glyphs(
                 style,
-                &mut gl_state.glyph_cache.borrow_mut(),
+                &mut gl_state.glyph_cache().borrow_mut(),
                 &info,
                 &font,
                 metrics,
             )?;
             let shaped = Rc::new(ShapedInfo::process(&info, &glyphs));
-            Ok(CachedShape {
-                infos: info,
-                glyphs: RefCell::new(shaped),
-                generation: std::cell::Cell::new(self.shape_generation),
-            })
+            Ok((info, shaped))
         };
         let glyph_info = if paragraph_range.is_some() {
             // Context-sensitive shapes never share this context-free cache;
             // avoid allocating an Rc<CachedShape> for their uncached result.
-            resolve()?.glyphs.into_inner()
+            shape()?.1
         } else {
-            let cached = resolve_cached_shape(&self.shape_cache, key, resolve)?;
-            if cached.generation.get() == self.shape_generation {
-                Rc::clone(&cached.glyphs.borrow())
+            let mut fresh = None;
+            let cached = resolve_cached_shape(&self.shape_cache, key, || {
+                let (infos, glyphs) = shape()?;
+                fresh = Some(glyphs);
+                Ok(CachedShape::new(infos))
+            })?;
+            let mut glyph_cache = gl_state.glyph_cache().borrow_mut();
+            if let Some(glyphs) = fresh {
+                glyph_cache.bind_shape(cached.id(), Rc::clone(&glyphs));
+                glyphs
+            } else if let Some(glyphs) = glyph_cache.shape_binding(cached.id()) {
+                glyphs
             } else {
-                // Atlas rebuilds preserve HarfBuzz output; refresh only sprites.
-                // Publish the new generation only after every glyph resolves.
+                // The bindings died with a rebuilt atlas (or were evicted);
+                // resolve only the sprites from the kept HarfBuzz output.
                 let font = match font {
                     Some(f) => Rc::clone(f),
                     None => self.fonts.resolve_font(style)?,
                 };
-                let glyphs = self.glyph_infos_to_glyphs(
-                    style,
-                    &mut gl_state.glyph_cache.borrow_mut(),
-                    &cached.infos,
-                    &font,
-                    metrics,
-                )?;
-                let shaped = Rc::new(ShapedInfo::process(&cached.infos, &glyphs));
-                *cached.glyphs.borrow_mut() = Rc::clone(&shaped);
-                cached.generation.set(self.shape_generation);
-                shaped
+                let infos = cached.infos();
+                let glyphs =
+                    self.glyph_infos_to_glyphs(style, &mut glyph_cache, infos, &font, metrics)?;
+                let glyphs = Rc::new(ShapedInfo::process(infos, &glyphs));
+                glyph_cache.bind_shape(cached.id(), Rc::clone(&glyphs));
+                glyphs
             }
         };
         metrics::histogram!("cached_cluster_shape").record(shape_resolve_start.elapsed());
@@ -1063,14 +1178,23 @@ impl crate::TermWindow {
     }
 
     pub fn recreate_texture_atlas(&mut self, size: Option<usize>) -> anyhow::Result<()> {
-        self.invalidate_render_caches(super::resize::RenderInvalidationCause::AtlasResource);
         // Do NOT clear `shape_cache` here: the cached HarfBuzz output is
-        // atlas-invariant. The `shape_generation` bump makes each surviving
-        // entry re-resolve its glyph sprites (cheap) on next access instead of
-        // re-shaping (the slow HarfBuzz path), and it invalidates the
-        // generation-keyed line_to_ele / line_quad caches. This removes the
-        // full-screen re-shape that every atlas overflow used to trigger — the
-        // root cause of the progressive GUI slowdown.
+        // atlas-invariant, and the entries' sprite bindings live in the glyph
+        // cache, which the replacement below drops with the old atlas. Each
+        // surviving entry re-resolves its sprites (cheap) on next access
+        // instead of re-shaping (the slow HarfBuzz path). The invalidation
+        // bumps `shape_generation` and clears the generation-keyed line_to_ele
+        // / line_quad caches. This removes the full-screen re-shape that every
+        // atlas overflow used to trigger — the root cause of the progressive
+        // GUI slowdown.
+        //
+        // ft-yccm0.2.5: every other per-window holder of an `Rc<CachedGlyph>`
+        // (the line caches here, the fancy tab bar and modal elements below)
+        // lets go BEFORE the old glyph cache is replaced, so dropping that
+        // cache frees the old atlas texture instead of leaving it pinned.
+        self.invalidate_render_caches(super::resize::RenderInvalidationCause::AtlasResource);
+        self.invalidate_fancy_tab_bar();
+        self.invalidate_modal();
         if let Some(render_state) = self.render_state.as_mut() {
             render_state.recreate_texture_atlas(&self.fonts, &self.render_metrics, size)?;
         }
@@ -1250,6 +1374,114 @@ mod tests {
     use wezterm_term::{CellAttributes, Intensity};
     use window::color::LinearRgba;
 
+    /// ft-yccm0.1.7: the cache gauges count real LFU entries and grow with the
+    /// strings and shaping output an entry owns.
+    #[test]
+    fn render_cache_gauges_count_entries_and_track_owned_bytes() {
+        use super::{
+            LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey, LineToElementShapeItem,
+            render_cache_gauge_values,
+        };
+        use crate::quad::HeapQuadAllocator;
+        use crate::shapecache::{CachedShape, ShapeCacheKey};
+        use config::{ConfigHandle, TextStyle};
+        use frankenterm_alloc::resource_ledger::CacheGauge;
+        use lfucache::LfuCache;
+        use ordered_float::NotNan;
+        use std::rc::Rc;
+
+        let config = ConfigHandle::default_config();
+        let mut shapes: LfuCache<ShapeCacheKey, Rc<CachedShape>> =
+            LfuCache::new("t.s.hit", "t.s.miss", |c| c.shape_cache_size, &config);
+        let mut lines: LfuCache<LineToEleShapeCacheKey, LineToElementShapeItem> = LfuCache::new(
+            "t.l.hit",
+            "t.l.miss",
+            |c| c.line_to_ele_shape_cache_size,
+            &config,
+        );
+        let mut quads: LfuCache<LineQuadCacheKey, LineQuadCacheValue> =
+            LfuCache::new("t.q.hit", "t.q.miss", |c| c.line_quad_cache_size, &config);
+        let gauge = |values: &[(CacheGauge, u64); 6], wanted: CacheGauge| {
+            values
+                .iter()
+                .find(|(gauge, _)| *gauge == wanted)
+                .map(|(_, value)| *value)
+                .unwrap()
+        };
+
+        let empty = render_cache_gauge_values(&shapes, &lines, &quads);
+        assert!(empty.iter().all(|(_, value)| *value == 0), "{empty:?}");
+
+        let key = |text: &str| ShapeCacheKey {
+            style: TextStyle::default(),
+            text: text.to_string(),
+        };
+        let shaped = Rc::new(CachedShape::new(Vec::with_capacity(8)));
+        shapes.put(key("a"), Rc::clone(&shaped));
+        shapes.put(key("bb"), Rc::new(CachedShape::new(Vec::new())));
+        lines.put(
+            LineToEleShapeCacheKey {
+                shape_hash: [0; 16],
+                composing: Some((0, "compose".to_string())),
+                shape_generation: 3,
+            },
+            LineToElementShapeItem {
+                expires: None,
+                shaped: Rc::new(Vec::new()),
+                current_highlight: None,
+                invalidate_on_hover_change: false,
+            },
+        );
+        quads.put(
+            LineQuadCacheKey {
+                config_generation: 0,
+                shape_generation: 3,
+                quad_generation: 0,
+                composing: None,
+                selection: 0..0,
+                shape_hash: [0; 16],
+                top_pixel_y: NotNan::new(0.0).unwrap(),
+                left_pixel_x: NotNan::new(0.0).unwrap(),
+                pixel_width: NotNan::new(10.0).unwrap(),
+                phys_line_idx: 0,
+                pane_id: 1,
+                pane_is_active: true,
+                cursor: None,
+                reverse_video: false,
+                password_input: false,
+            },
+            LineQuadCacheValue {
+                expires: None,
+                layers: HeapQuadAllocator::default(),
+                current_highlight: None,
+                invalidate_on_hover_change: false,
+                hyperlinks: Vec::new(),
+            },
+        );
+
+        let populated = render_cache_gauge_values(&shapes, &lines, &quads);
+        assert_eq!(gauge(&populated, CacheGauge::ShapeCacheEntries), 2);
+        assert_eq!(gauge(&populated, CacheGauge::LineShapeCacheEntries), 1);
+        assert_eq!(gauge(&populated, CacheGauge::LineQuadCacheEntries), 1);
+        let shape_bytes = gauge(&populated, CacheGauge::ShapeCacheBytes);
+        assert_eq!(
+            shape_bytes,
+            2 * std::mem::size_of::<ShapeCacheKey>() as u64
+                + 3
+                + shaped.accounted_bytes()
+                + std::mem::size_of::<CachedShape>() as u64,
+            "keys, their text and each entry's shaping output"
+        );
+        assert!(
+            shaped.accounted_bytes()
+                >= (std::mem::size_of::<CachedShape>()
+                    + 8 * std::mem::size_of::<frankenterm_font::shaper::GlyphInfo>())
+                    as u64
+        );
+        assert!(gauge(&populated, CacheGauge::LineShapeCacheBytes) >= "compose".len() as u64);
+        assert!(gauge(&populated, CacheGauge::LineQuadCacheBytes) > 0);
+    }
+
     #[test]
     fn shape_cache_retries_failed_resolution_and_keeps_successful_runs() {
         use crate::glyphcache::GlyphCache;
@@ -1307,11 +1539,9 @@ mod tests {
                 "successful retry must produce real ink"
             );
             let shaped = ShapedInfo::process(&infos, &[glyph]);
-            Ok(CachedShape {
-                infos,
-                glyphs: RefCell::new(Rc::new(shaped)),
-                generation: Cell::new(7),
-            })
+            let shape = CachedShape::new(infos);
+            glyph_cache.bind_shape(shape.id(), Rc::new(shaped));
+            Ok(shape)
         };
         let failed = resolve_cached_shape(&cache, key, &mut resolve).unwrap_err();
         assert!(
@@ -1327,7 +1557,8 @@ mod tests {
         let hit =
             resolve_cached_shape(&cache, key, || panic!("cache hit must not resolve")).unwrap();
         assert!(Rc::ptr_eq(&success, &hit));
-        assert_eq!(hit.generation.get(), 7);
+        assert_eq!(hit.infos().len(), 1);
+        assert!(glyph_cache.shape_binding(hit.id()).is_some());
 
         let other = BorrowedShapeCacheKey {
             style: &style,
