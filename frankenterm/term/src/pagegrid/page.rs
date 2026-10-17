@@ -220,6 +220,13 @@ impl Page {
         &self.graphemes
     }
 
+    /// Room for the graphemes a page like `previous` held (see
+    /// [`GraphemeArena::reserve`]).
+    pub fn reserve_graphemes_like(&mut self, previous: &Page) {
+        self.graphemes
+            .reserve(previous.graphemes.len(), previous.graphemes.arena_bytes());
+    }
+
     pub fn links(&self) -> &LinkTable {
         &self.links
     }

@@ -69,6 +69,14 @@ impl GraphemeArena {
         self.map.is_empty()
     }
 
+    /// Room for `entries` graphemes in `bytes` of arena, so that filling a
+    /// page as full as the one before it does not regrow (and rehash) the
+    /// map step by step from a reset page's capacity.
+    pub fn reserve(&mut self, entries: usize, bytes: usize) {
+        self.map.reserve(entries.saturating_sub(self.map.len()));
+        self.bytes.reserve(bytes.saturating_sub(self.bytes.len()));
+    }
+
     /// Arena size in bytes, free blocks included.
     pub fn arena_bytes(&self) -> usize {
         self.bytes.len()

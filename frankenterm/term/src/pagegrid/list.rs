@@ -35,6 +35,7 @@
 //! seqno is the numeric maximum of its own seqno and every floor covering
 //! it; only then does 0 mean "always changed".
 
+use super::grapheme::STD_ARENA_ENTRIES;
 use super::page::{rows_per_page, Page};
 use crate::StableRowIndex;
 use frankenterm_surface::SequenceNo;
@@ -791,7 +792,7 @@ impl PageList {
     /// taking a pooled page when the tail page is full.
     fn append_row(&mut self, seqno: SequenceNo, flags: u64) {
         if self.pages.back().is_none_or(PageSlot::is_full) {
-            let page = Box::new(match self.pool.pop() {
+            let mut page = Box::new(match self.pool.pop() {
                 Some(page) => {
                     self.pages_reused += 1;
                     page
@@ -802,6 +803,14 @@ impl PageList {
                     Page::new(self.cols, self.page_rows, serial)
                 }
             });
+            // Text full of graphemes keeps filling pages with them: a fresh
+            // page takes room for as many as the page it follows, rather
+            // than regrowing its map from a reset page's capacity.
+            if let Some(previous) = self.pages.back() {
+                if previous.page().graphemes().len() > STD_ARENA_ENTRIES {
+                    page.reserve_graphemes_like(previous.page());
+                }
+            }
             self.pages
                 .push_back(PageSlot::new_active(self.next_stable, page));
         }
