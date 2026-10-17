@@ -30,6 +30,7 @@ members = [
     "crates/frankenterm-mux-server-impl",
     "crates/frankenterm-alloc",
     "crates/frankenterm-sigpipe",
+    "crates/frankenterm-renderer-metal",
     "crates/frankenterm-topo",
     "crates/ft-perf-gate",
     "crates/ft-test-log",
@@ -557,6 +558,7 @@ mux-lua = { path = "frankenterm/lua-api-crates/mux-lua" }
 url-funcs = { path = "frankenterm/lua-api-crates/url-funcs" }
 frankenterm-mux-server-impl = { path = "crates/frankenterm-mux-server-impl" }
 frankenterm-sigpipe = { path = "crates/frankenterm-sigpipe" }
+frankenterm-renderer-metal = { path = "crates/frankenterm-renderer-metal" }
 frankenterm-pty-guardian = { path = "crates/frankenterm-pty-guardian" }
 
 # Notify: upstream used 5.0; FrankenTerm now targets the latest stable API.
@@ -685,6 +687,16 @@ panic = "unwind"
 # The inherited release profile strips symbols. That would discard the line
 # tables this measurement profile explicitly requests and make sampled stacks
 # needlessly opaque, so preserve them for attribution-quality A/B evidence.
+strip = "none"
+
+[profile.bench]
+# Without this, `cargo bench` inherits the size-optimized `release` profile
+# (opt-level = "z") and measures code nobody ships or tunes. Mirror
+# `release-perf`; a built-in profile cannot name `inherits`, so its settings
+# are repeated here (ft-yccm0.1.2).
+opt-level = 3
+lto = "thin"
+debug = "line-tables-only"
 strip = "none"
 
 [profile.release.package.frankenterm-fuzz]

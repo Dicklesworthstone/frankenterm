@@ -1497,6 +1497,7 @@ dependencies = [
  "portable-pty",
  "promise",
  "proptest",
+ "semver",
  "serde",
  "serde_json",
  "shlex",
@@ -3672,6 +3673,10 @@ name = "frankenterm-alloc"
 version = "0.15.21"
 dependencies = [
  "criterion",
+ "log",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
@@ -3731,7 +3736,7 @@ version = "0.1.3"
 dependencies = [
  "criterion",
  "k9",
- "phf 0.14.0",
+ "phf 0.13.1",
  "serde",
  "termwiz 0.24.0",
  "ucd-trie",
@@ -4209,7 +4214,9 @@ dependencies = [
  "cocoa",
  "config",
  "core-foundation 0.10.1",
+ "core-graphics",
  "core-text",
+ "criterion",
  "dwrote",
  "encoding_rs",
  "enum-display-derive",
@@ -4234,10 +4241,12 @@ dependencies = [
  "objc",
  "ordered-float 5.5.0",
  "rangeset",
+ "tar",
  "termwiz 0.24.0",
  "thiserror 2.0.21",
  "walkdir",
  "winapi",
+ "zstd 0.14.0",
 ]
 
 [[package]]
@@ -4307,6 +4316,7 @@ dependencies = [
  "frankenterm-gui-subcommands",
  "frankenterm-mux-server-impl",
  "frankenterm-open-url",
+ "frankenterm-renderer-metal",
  "frankenterm-sigpipe",
  "frankenterm-ssh",
  "frankenterm-term",
@@ -4331,6 +4341,7 @@ dependencies = [
  "ordered-float 5.5.0",
  "parking_lot",
  "portable-pty",
+ "procinfo",
  "promise",
  "proptest",
  "rangeset",
@@ -4432,6 +4443,7 @@ dependencies = [
  "config",
  "criterion",
  "dns-lookup",
+ "frankenterm-alloc",
  "frankenterm-client",
  "frankenterm-core",
  "frankenterm-core-audit-types",
@@ -4453,6 +4465,7 @@ dependencies = [
  "mux",
  "parking_lot",
  "portable-pty",
+ "procinfo",
  "promise",
  "proptest",
  "rangeset",
@@ -4464,6 +4477,7 @@ dependencies = [
  "tempfile",
  "termwiz 0.24.0",
  "thiserror 2.0.21",
+ "tikv-jemalloc-ctl",
  "url",
  "uuid",
  "varbincode",
@@ -4518,6 +4532,20 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+]
+
+[[package]]
+name = "frankenterm-renderer-metal"
+version = "0.15.21"
+dependencies = [
+ "block2",
+ "frankenterm-alloc",
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-foundation",
+ "objc2-metal",
+ "objc2-quartz-core",
+ "raw-window-handle",
 ]
 
 [[package]]
@@ -4626,6 +4654,7 @@ dependencies = [
  "frankenterm-dynamic",
  "frankenterm-escape-parser",
  "frankenterm-surface",
+ "frankenterm-term",
  "hex",
  "humansize",
  "image",
@@ -4640,8 +4669,11 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "terminfo",
  "termwiz 0.24.0",
+ "tikv-jemalloc-ctl",
+ "tikv-jemallocator",
  "unicode-normalization",
  "url",
  "zeroize",
@@ -7591,6 +7623,7 @@ name = "mux"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "base64 0.23.1",
  "bintree",
@@ -7604,6 +7637,7 @@ dependencies = [
  "fancy-regex 0.19.2",
  "filedescriptor 0.8.3",
  "finl_unicode 1.3.0",
+ "frankenterm-alloc",
  "frankenterm-build-identity",
  "frankenterm-dynamic",
  "frankenterm-sigpipe",
@@ -8052,6 +8086,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
 dependencies = [
  "bitflags 2.13.2",
+ "block2",
  "dispatch2",
  "objc2",
 ]
@@ -8596,6 +8631,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1562dc717473dbaa4c1f85a36410e03c047b2e7df7f45ee938fbef64ae7fadf"
 dependencies = [
  "phf_shared 0.13.1",
+ "serde",
 ]
 
 [[package]]
@@ -9030,6 +9066,7 @@ dependencies = [
  "flume",
  "frankenterm-sigpipe",
  "lazy_static",
+ "procinfo",
  "proptest",
  "thiserror 2.0.21",
 ]
@@ -12102,7 +12139,6 @@ version = "0.7.0"
 dependencies = [
  "heapless 0.9.3",
  "k9",
- "utf8parse",
 ]
 
 [[package]]
