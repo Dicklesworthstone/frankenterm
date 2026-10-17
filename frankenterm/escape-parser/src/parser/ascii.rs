@@ -23,10 +23,14 @@
 //! `std::simd` needs the nightly `portable_simd` feature (the toolchain is
 //! pinned to nightly). The `core::arch` NEON intrinsics would need `unsafe`,
 //! which these crates forbid. On Apple Silicon the 16-byte scan is one NEON
-//! register; the wider scans are for measuring.
+//! register; the wider scans are for measuring. The 16-byte scans read the
+//! comparison as one nibble per byte (`nibble_mask`, NEON's `shrn`), since a
+//! bitmask takes several instructions on NEON, which has no `movemask`:
+//! long_lines -1.3% instructions and -3% cycles, seq -0.7% and -2%.
 
-use core::simd::Simd;
 use core::simd::cmp::{SimdPartialEq, SimdPartialOrd};
+use core::simd::num::{SimdInt, SimdUint};
+use core::simd::{Simd, ToBytes};
 
 /// How the ground-state scan finds the end of a printable-ASCII stretch.
 /// Every variant gives the same answer; they differ only in speed.
@@ -79,7 +83,7 @@ impl AsciiScan {
     pub fn printable_len(self, bytes: &[u8]) -> usize {
         match self {
             AsciiScan::Scalar => printable_len_scalar(bytes),
-            AsciiScan::Simd16 => printable_len_simd::<16>(bytes),
+            AsciiScan::Simd16 => printable_len_simd16(bytes),
             AsciiScan::Simd32 => printable_len_simd::<32>(bytes),
             AsciiScan::Simd64 => printable_len_simd::<64>(bytes),
         }
@@ -92,7 +96,7 @@ impl AsciiScan {
     pub(super) fn control_free_len(self, bytes: &[u8]) -> usize {
         match self {
             AsciiScan::Scalar => control_free_len_scalar(bytes),
-            AsciiScan::Simd16 => control_free_len_simd::<16>(bytes),
+            AsciiScan::Simd16 => control_free_len_simd16(bytes),
             AsciiScan::Simd32 => control_free_len_simd::<32>(bytes),
             AsciiScan::Simd64 => control_free_len_simd::<64>(bytes),
         }
@@ -106,7 +110,7 @@ impl AsciiScan {
     pub(super) fn c1_position(self, text: &[u8]) -> Option<usize> {
         match self {
             AsciiScan::Scalar => c1_position_scalar(text),
-            AsciiScan::Simd16 => c1_position_simd::<16>(text),
+            AsciiScan::Simd16 => c1_position_simd16(text),
             AsciiScan::Simd32 => c1_position_simd::<32>(text),
             AsciiScan::Simd64 => c1_position_simd::<64>(text),
         }
@@ -125,6 +129,35 @@ fn printable_len_scalar(bytes: &[u8]) -> usize {
         .iter()
         .position(|&byte| !is_printable_ascii(byte))
         .unwrap_or(bytes.len())
+}
+
+/// [`printable_len_simd`] 16 bytes at a time, finding the first stop in a
+/// mask of one nibble per byte ([`nibble_mask`]) rather than one bit.
+#[inline]
+fn printable_len_simd16(bytes: &[u8]) -> usize {
+    let first_unprintable = Simd::<u8, 16>::splat(0x5f);
+    let space = Simd::<u8, 16>::splat(0x20);
+    let mut offset = 0;
+    while let Some(chunk) = bytes.get(offset..offset + 16) {
+        let lanes = Simd::<u8, 16>::from_slice(chunk);
+        let stops = nibble_mask((lanes - space).simd_ge(first_unprintable).to_simd().cast());
+        if stops != 0 {
+            return offset + (stops.trailing_zeros() / 4) as usize;
+        }
+        offset += 16;
+    }
+    offset + printable_len_scalar(&bytes[offset..])
+}
+
+/// Lanes of all ones or all zeros as a `u64` of one nibble per lane, lane 0
+/// lowest. NEON has no `movemask`, so a bitmask (`to_bitmask`) takes several
+/// instructions; shifting each pair of lanes right by four and narrowing
+/// them to a byte is one (`shrn`).
+#[inline]
+fn nibble_mask(lanes: Simd<u8, 16>) -> u64 {
+    let pairs = Simd::<u16, 8>::from_le_bytes(lanes);
+    let narrowed: Simd<u8, 8> = (pairs >> 4).cast();
+    u64::from_le_bytes(narrowed.to_array())
 }
 
 /// `LANES` bytes at a time while that many remain, then the oracle for the
@@ -159,6 +192,23 @@ fn control_free_len_scalar(bytes: &[u8]) -> usize {
         .unwrap_or(bytes.len())
 }
 
+/// [`control_free_len_simd`] 16 bytes at a time with a [`nibble_mask`].
+#[inline]
+fn control_free_len_simd16(bytes: &[u8]) -> usize {
+    let space = Simd::<u8, 16>::splat(0x20);
+    let del = Simd::<u8, 16>::splat(0x7f);
+    let mut offset = 0;
+    while let Some(chunk) = bytes.get(offset..offset + 16) {
+        let lanes = Simd::<u8, 16>::from_slice(chunk);
+        let stops = nibble_mask((lanes.simd_lt(space) | lanes.simd_eq(del)).to_simd().cast());
+        if stops != 0 {
+            return offset + (stops.trailing_zeros() / 4) as usize;
+        }
+        offset += 16;
+    }
+    offset + control_free_len_scalar(&bytes[offset..])
+}
+
 #[inline]
 fn control_free_len_simd<const LANES: usize>(bytes: &[u8]) -> usize {
     let space = Simd::<u8, LANES>::splat(0x20);
@@ -180,6 +230,31 @@ fn control_free_len_simd<const LANES: usize>(bytes: &[u8]) -> usize {
 fn c1_position_scalar(text: &[u8]) -> Option<usize> {
     text.windows(2)
         .position(|pair| pair[0] == 0xc2 && pair[1] < 0xa0)
+}
+
+/// [`c1_position_simd`] 16 bytes at a time with a [`nibble_mask`].
+#[inline]
+fn c1_position_simd16(text: &[u8]) -> Option<usize> {
+    let lead = Simd::<u8, 16>::splat(0xc2);
+    let first_printable = Simd::<u8, 16>::splat(0xa0);
+    let mut offset = 0;
+    while let (Some(here), Some(next)) = (
+        text.get(offset..offset + 16),
+        text.get(offset + 1..offset + 1 + 16),
+    ) {
+        let here = Simd::<u8, 16>::from_slice(here);
+        let next = Simd::<u8, 16>::from_slice(next);
+        let hits = nibble_mask(
+            (here.simd_eq(lead) & next.simd_lt(first_printable))
+                .to_simd()
+                .cast(),
+        );
+        if hits != 0 {
+            return Some(offset + (hits.trailing_zeros() / 4) as usize);
+        }
+        offset += 16;
+    }
+    c1_position_scalar(&text[offset..]).map(|at| offset + at)
 }
 
 /// Each block compares its bytes and the bytes one further on, so a pair
@@ -211,8 +286,10 @@ mod test {
 
     #[test]
     fn every_byte_value_stops_exactly_when_it_is_not_printable_ascii() {
+        // Every lane of the first three 16-byte blocks (the nibble mask's
+        // lane order), then the wider scans' block edges.
         for byte in 0..=u8::MAX {
-            for position in [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100] {
+            for position in (0..48).chain([63, 64, 65, 100]) {
                 let mut bytes = vec![b'a'; 130];
                 bytes[position] = byte;
                 let expected = if is_printable_ascii(byte) {
