@@ -27,11 +27,17 @@
 #
 # E2E_PANES=N (default 1) runs N panes; every one must keep its process,
 # id and history across the upgrade and the rollback.
+#
+# POST_UPGRADE_SOAK_SECONDS=N (default 0) keeps the upgraded mux running N
+# seconds before the rollback; it must publish a recovery generation in
+# that time, as a successor whose restore pinned the guardian's catalog
+# once never did.
 set -uo pipefail
 # The guardian refuses group- or world-writable directories on its paths
 # (a umask of 002 on some hosts); keep any stricter umask.
 umask "$(printf '%04o' $(( 8#$(umask) | 8#022 )))"
 SOAK=${SOAK_SECONDS:-0}
+POST_SOAK=${POST_UPGRADE_SOAK_SECONDS:-0}
 OLD=${1:?old family dir}
 NEW=${2:?new family dir}
 TOOL=${3:-$(cd "$(dirname "$0")/../.." && pwd)/scripts/mux-guardian-host.sh}
@@ -220,6 +226,21 @@ PID2=$(child_pid)
   || fail "pane process changed across upgrade: $PID1 -> ${PID2:-none}"
 check_history upgrade "$NEW"
 check_other_panes upgrade "$NEW"
+
+if [ "$POST_SOAK" -gt 0 ]; then
+  # The successor must go on publishing recovery generations: a catalog
+  # member its replays pin once kept it from adopting any checkpoint.
+  step "successor soak ${POST_SOAK}s"
+  LOG=$STATE/logs/mux-server.log
+  BEFORE=$(grep -c "published local generation" "$LOG")
+  sleep "$POST_SOAK"
+  AFTER=$(grep -c "published local generation" "$LOG")
+  REFUSED=$(grep -c "rejected with CapacityExhausted" "$LOG")
+  echo "successor published=$((AFTER - BEFORE)) capacity_refusals=$REFUSED"
+  [ "$AFTER" -gt "$BEFORE" ] \
+    && pass "the successor kept publishing ($((AFTER - BEFORE)) generations in ${POST_SOAK}s)" \
+    || fail "the successor published no recovery generation in ${POST_SOAK}s"
+fi
 
 step "rollback"
 if "$TOOL" rollback; then pass "rollback reported success"; else fail "rollback"; fi
