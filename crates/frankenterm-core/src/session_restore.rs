@@ -8231,6 +8231,41 @@ pub fn validate_whole_mux_image_layout_only<S: std::hash::BuildHasher>(
     Ok(())
 }
 
+/// Whether the root diagnostics leave recovery root authority unresolved,
+/// after marking superseded guardian evidence. A root older than the newest
+/// verified generation, rejected only for guardian evidence (the indices
+/// `guardian_rejections` into `diagnostics`, whose generations authenticated),
+/// is superseded: the guardian keeps the newest adopted checkpoint of each
+/// pane, so an older root's evidence goes once a newer root's capture is
+/// adopted. A rejected root at or above the newest verified generation, or
+/// with none verified, still blocks, as does every other diagnostic but an
+/// authenticated reconstruction.
+fn settle_root_authority(
+    diagnostics: &mut [crate::snapshot_publication::TornRootDiagnostic],
+    guardian_rejections: &[usize],
+    newest_verified: Option<u64>,
+) -> bool {
+    use crate::snapshot_publication::RootDiagnosticAuthority;
+    if let Some(newest) = newest_verified {
+        for &index in guardian_rejections {
+            let diagnostic = &mut diagnostics[index];
+            if diagnostic
+                .generation
+                .is_some_and(|generation| generation < newest)
+            {
+                diagnostic.authority = RootDiagnosticAuthority::SupersededGuardianEvidence;
+            }
+        }
+    }
+    diagnostics.iter().any(|diagnostic| {
+        !matches!(
+            diagnostic.authority,
+            RootDiagnosticAuthority::AuthenticatedReconstruction
+                | RootDiagnosticAuthority::SupersededGuardianEvidence
+        )
+    })
+}
+
 /// Select the latest verified recovery root from the publication store using
 /// `WholeMuxRecoveryVerifier`.
 pub fn select_verified_recovery_roots(
@@ -8276,6 +8311,8 @@ pub fn select_verified_recovery_roots_with_cx(
         .as_deref()
         .unwrap_or_else(|| shared_admission_controller());
     let mut accepted_roots = Vec::with_capacity(2);
+    // Indices into `diagnostics` of roots rejected for guardian evidence.
+    let mut guardian_rejections = Vec::new();
     for slot in [RootSlot::SlotA, RootSlot::SlotB] {
         let ordinary = candidates.iter().find(|candidate| candidate.slot == slot);
         let discovery = discoveries.iter().find(|discovery| discovery.slot == slot);
@@ -8417,6 +8454,14 @@ pub fn select_verified_recovery_roots_with_cx(
                     } else {
                         "root graph rejected"
                     };
+                    // Only raised after the root's envelope and image
+                    // authenticated, `generation` included.
+                    if matches!(
+                        error,
+                        WholeMuxRecoveryError::UnprovedGuardianAuthority { .. }
+                    ) {
+                        guardian_rejections.push(diagnostics.len());
+                    }
                     diagnostics.push(TornRootDiagnostic {
                         slot,
                         generation: Some(generation),
@@ -8434,9 +8479,11 @@ pub fn select_verified_recovery_roots_with_cx(
         }
         .into());
     }
-    let unresolved_authority = diagnostics.iter().any(|diagnostic| {
-        diagnostic.authority != RootDiagnosticAuthority::AuthenticatedReconstruction
-    });
+    let unresolved_authority = settle_root_authority(
+        &mut diagnostics,
+        &guardian_rejections,
+        accepted_roots.first().map(|root| root.0),
+    );
     diagnostics.truncate(store.limits().max_error_records);
     let mut accepted_roots = accepted_roots.into_iter();
     Ok(VerifiedRootSelection {
@@ -8467,6 +8514,57 @@ mod tests {
         assert_ne!(short, semantic_object_id_from_str("pane\0"));
         assert_ne!(short, semantic_object_id_from_str(&hex::encode(short)));
         assert_eq!(short, semantic_object_id_from_str("pane"));
+    }
+
+    #[test]
+    fn only_a_newer_verified_root_supersedes_guardian_evidence() {
+        use crate::snapshot_publication::{RootDiagnosticAuthority, RootSlot, TornRootDiagnostic};
+        let rejected = |generation| TornRootDiagnostic {
+            slot: RootSlot::SlotA,
+            generation,
+            reason: "root graph rejected: unproved guardian authority".to_owned(),
+            authority: RootDiagnosticAuthority::Unresolved,
+        };
+        // An older root rejected for guardian evidence blocks nothing.
+        let mut older = vec![rejected(Some(5))];
+        assert!(!settle_root_authority(&mut older, &[0], Some(6)));
+        assert_eq!(
+            older[0].authority,
+            RootDiagnosticAuthority::SupersededGuardianEvidence
+        );
+        // At or above the newest verified generation, with none verified, or
+        // without a generation, it blocks.
+        for (generation, newest) in [
+            (Some(6), Some(6)),
+            (Some(7), Some(6)),
+            (Some(5), None),
+            (None, Some(6)),
+        ] {
+            let mut diagnostics = vec![rejected(generation)];
+            assert!(
+                settle_root_authority(&mut diagnostics, &[0], newest),
+                "{generation:?} under {newest:?}"
+            );
+            assert_eq!(
+                diagnostics[0].authority,
+                RootDiagnosticAuthority::Unresolved
+            );
+        }
+        // Any other rejection of an older root still blocks.
+        let mut other = vec![rejected(Some(5))];
+        assert!(settle_root_authority(&mut other, &[], Some(6)));
+        // Beside an authenticated reconstruction nothing blocks; beside a
+        // rejected newer root, the superseded one does not hide it.
+        let mut mixed = vec![
+            rejected(Some(5)),
+            TornRootDiagnostic {
+                authority: RootDiagnosticAuthority::AuthenticatedReconstruction,
+                ..rejected(Some(6))
+            },
+        ];
+        assert!(!settle_root_authority(&mut mixed, &[0], Some(6)));
+        let mut mixed = vec![rejected(Some(5)), rejected(Some(7))];
+        assert!(settle_root_authority(&mut mixed, &[0, 1], Some(6)));
     }
 
     fn test_runtime_error(operation: &'static str, detail: impl Into<String>) -> crate::Error {

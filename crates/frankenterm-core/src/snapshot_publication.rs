@@ -439,13 +439,20 @@ pub struct ObjectPublicationReceipt {
     pub was_already_present: bool,
 }
 
-/// Only a decoded, authenticated reconstruction can resolve envelope corruption.
-/// All other authority diagnostics remain blocking.
+/// Only a decoded, authenticated reconstruction can resolve envelope corruption,
+/// and only a newer verified root can supersede guardian evidence. All other
+/// authority diagnostics remain blocking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RootDiagnosticAuthority {
     Unresolved,
     EnvelopeCorruption,
     AuthenticatedReconstruction,
+    /// An authenticated root older than the newest verified root, rejected
+    /// only because the guardian no longer vouches for a checkpoint it
+    /// names. The guardian reclaims a pane's checkpoints once a newer one is
+    /// adopted, so only the newest root's evidence survives; an older root
+    /// conceals no newer authority and blocks nothing.
+    SupersededGuardianEvidence,
 }
 
 /// Diagnostic for a root slot candidate that was torn, corrupted, or rejected by verification.
