@@ -1143,12 +1143,20 @@ impl Page {
             return false;
         }
         let kept = end.min(old_len);
-        if (x..kept).any(|col| {
-            let old = self.cell_at(slot, col);
+        // The cells the run overwrites, read as one slice so that both
+        // checks vectorize.
+        let first = self.cell_index(slot, x);
+        let overwritten = &self.buf[first..first + (kept - x)];
+        if overwritten.iter().any(|&bits| {
+            let old = PackedCell::from_bits(bits);
             old.is_wide() || old.is_hidden() || old.has_image()
         }) {
             return false;
         }
+        // Releasing a cell with no side entries does nothing.
+        let releases = overwritten
+            .iter()
+            .any(|&bits| PackedCell::from_bits(bits).has_side_entries());
         cell.glyph = Glyph::Blank;
         cell.wide = false;
         // Acquire before release (D3).
@@ -1163,12 +1171,13 @@ impl Page {
             .with_semantic(cell.semantic)
             .with_wrapped(cell.wrapped)
             .with_hyperlink(cell.hyperlink.is_some());
-        // Releasing a cell with no side entries does nothing.
-        for col in x..kept {
-            let old = self.cell_at(slot, col);
-            if old.has_side_entries() {
-                let off = self.offset(slot, col);
-                self.release(off, old, false);
+        if releases {
+            for col in x..kept {
+                let old = self.cell_at(slot, col);
+                if old.has_side_entries() {
+                    let off = self.offset(slot, col);
+                    self.release(off, old, false);
+                }
             }
         }
         self.store_ascii_cells(slot, x, bytes, template);
