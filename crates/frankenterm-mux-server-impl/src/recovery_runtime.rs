@@ -518,8 +518,13 @@ impl PeriodicRecovery {
                             // refreshing it at the end of encode/verification.
                             self.last_success = self.attempt_started;
                             metrics::counter!("mux.recovery.publication", "outcome" => "published_local").increment(1);
+                            // How long capture through commit took: an
+                            // upgrade waits for one started after its request.
+                            let took_ms = self.attempt_started.map_or(0, |started| {
+                                now.saturating_duration_since(started).as_millis()
+                            });
                             log::info!(
-                                "mux periodic recovery published local generation={generation}; replica durability unproven"
+                                "mux periodic recovery published local generation={generation} in {took_ms} ms; replica durability unproven"
                             );
                         }
                         if let Some(error) = result.error {
