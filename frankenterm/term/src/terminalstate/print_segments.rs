@@ -395,10 +395,21 @@ mod tests {
                             text.push(k);
                         }
                         text.push(follower);
-                        let fast: Vec<&str> =
-                            table.segments(&text, &latest()).map(|(g, _)| g).collect();
+                        let segments: Vec<(&str, Option<usize>)> =
+                            table.segments(&text, &latest()).collect();
+                        let fast: Vec<&str> = segments.iter().map(|&(g, _)| g).collect();
                         let expected: Vec<&str> = Graphemes::new(&text).collect();
                         assert_eq!(fast, expected, "{:?}", text.escape_unicode());
+                        for (g, width) in segments {
+                            if let Some(width) = width {
+                                assert_eq!(
+                                    width,
+                                    grapheme_column_width(g, Some(&latest())),
+                                    "{:?}",
+                                    g.escape_unicode()
+                                );
+                            }
+                        }
                     }
                 }
             }

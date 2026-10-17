@@ -4059,6 +4059,59 @@ mod tests {
         assert_eq!(print(false), print(true));
     }
 
+    /// A letter and its combining marks, which the segmentation's fast path
+    /// settles without `Graphemes` (4ece39911): every row, the cursor and
+    /// the pending wrap end as with the segmenter alone, mid-row, at the
+    /// right margin with autowrap on and off, with VS15 and VS16, around
+    /// ZWJ, in insert mode, between colors, and split into reads of a few
+    /// bytes.
+    #[test]
+    fn combining_mark_clusters_print_as_the_segmenter_prints_them() {
+        let mut stream = String::new();
+        for _ in 0..3 {
+            stream.push_str("a\u{301}b\u{308}\u{301}c \u{4e2d}\u{301}x");
+            stream.push_str("\u{5d0}\u{5b8}\u{645}\u{64b}");
+            stream.push_str("e\u{301}\u{fe0f}\u{2764}\u{fe0e}\u{301}q\u{200d}\u{301}r\u{200d} ");
+        }
+        stream.push_str(concat!(
+            // A wide base with a mark at the right margin, autowrap on, then off.
+            "\x1b[2;16H\u{4e2d}\u{301}z\u{4e2d}\u{301}",
+            "\x1b[?7l\x1b[3;16Hab\u{4e2d}\u{301}c\u{301}\x1b[?7h",
+            // After a ZWJ tail.
+            "\x1b[4;1Ha\u{200d}e\u{301}\u{4e2d}",
+            // Insert mode.
+            "\x1b[4h\x1b[5;2Hy\u{301}\u{4e2d}\u{301}\x1b[4l",
+            // Colors between clusters.
+            "\x1b[31me\u{301}\x1b[32mi\u{308}\x1b[m",
+        ));
+        let bytes = stream.as_bytes();
+        let print = |force_segmenter: bool, read: usize| {
+            FORCE_GRAPHEME_SEGMENTER.with(|force| force.set(force_segmenter));
+            let config: Arc<dyn TerminalConfiguration + Send + Sync> = Arc::new(GateTermConfig);
+            let size = TerminalSize {
+                rows: 6,
+                cols: 17,
+                pixel_width: 136,
+                pixel_height: 96,
+                dpi: 96,
+            };
+            let mut terminal = Terminal::new(size, config, "WezTerm", "test", Box::new(Vec::new()));
+            for chunk in bytes.chunks(read) {
+                terminal.advance_bytes(chunk);
+            }
+            terminal.advance_bytes(b"Z");
+            FORCE_GRAPHEME_SEGMENTER.with(|force| force.set(false));
+            snapshot_terminal(&terminal)
+        };
+        for read in [bytes.len(), 1, 2, 3, 5, 7] {
+            assert_eq!(
+                print(false, read),
+                print(true, read),
+                "reads of {read} bytes"
+            );
+        }
+    }
+
     /// ft-yccm0.3.2.6: printed cells written in runs leave every row, the
     /// cursor and each row's storage form as writing them one by one does,
     /// on both grid engines, whole and split into reads of a few bytes.
