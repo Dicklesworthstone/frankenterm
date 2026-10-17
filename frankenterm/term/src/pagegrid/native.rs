@@ -402,7 +402,22 @@ pub fn set_ascii_run(
             return true;
         }
     }
+    set_ascii_run_per_byte(page, row, x, text, attr, &class, seqno)
+}
 
+/// [`set_ascii_run`]'s fallback, each byte as `set_cell` writes it, out of
+/// line: inline, it made the frame of every bulk run.
+#[inline(never)]
+fn set_ascii_run_per_byte(
+    page: &mut Page,
+    row: u32,
+    x: usize,
+    text: &str,
+    attr: &CellAttributes,
+    class: &StyleClass,
+    seqno: SequenceNo,
+) -> bool {
+    let mut cache = None;
     let images: Vec<Box<ImageCell>> = attr
         .images()
         .map(|images| images.into_iter().map(Box::new).collect())
@@ -419,7 +434,7 @@ pub fn set_ascii_run(
                 set_vector(page, row);
             }
         }
-        let style = match &class {
+        let style = match class {
             StyleClass::Inline(inline) => StyleSpec::Inline(*inline),
             StyleClass::Rich(rich) => StyleSpec::Rich {
                 style: rich,

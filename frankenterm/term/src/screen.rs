@@ -9747,6 +9747,20 @@ impl Screen {
                 return;
             }
         }
+        self.set_ascii_cell_run_in_line(line_idx, x, text, attr, seqno);
+    }
+
+    /// [`Self::set_ascii_cell_run`] on a legacy `Line`, out of line: inline,
+    /// it made the frame of every page-engine run.
+    #[inline(never)]
+    fn set_ascii_cell_run_in_line(
+        &mut self,
+        line_idx: PhysRowIndex,
+        x: usize,
+        text: &str,
+        attr: &CellAttributes,
+        seqno: SequenceNo,
+    ) {
         let line = self.line_mut(line_idx);
         if ascii_cluster_run_append_enabled()
             && line.append_ascii_cell_run(x, text, attr.clone(), seqno)
