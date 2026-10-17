@@ -881,19 +881,32 @@ fn execute_checkpoint_job(
         }
         GuardianOperation::CheckpointStage => execute_checkpoint_stage_job(store, job),
         GuardianOperation::Checkpoint => {
-            let receipt = match job
-                .protocol
-                .apply_checkpoint_transactionally(&job.request, |permit| {
-                    store
-                        .publish_checkpoint_catalog_adoption(permit)
-                        .inspect_err(|error| {
-                            // The mux sees only an indeterminate outcome, and
-                            // quarantines the lease: this names the cause.
-                            log::warn!(
-                                "guardian checkpoint catalog adoption failed; outcome indeterminate: {error:?}"
-                            );
-                        })
-                }) {
+            let receipt = match job.protocol.apply_checkpoint_transactionally_or_refuse(
+                &job.request,
+                |permit| {
+                    let published = store.publish_checkpoint_catalog_adoption(permit);
+                    published.map_err(|error| {
+                        use crate::output::GuardianCheckpointStageStoreError as StoreError;
+                        use mux::guardian_protocol::GuardianCheckpointPublicationFailure as Failure;
+                        match error {
+                            // No room in the pane's catalog yet (a restore's
+                            // replay pins its oldest members): nothing was
+                            // written, so the request is refused, not left
+                            // indeterminate, which would quarantine the lease.
+                            StoreError::CatalogFull => Failure::Refused(error),
+                            error => {
+                                // The mux sees only an indeterminate outcome,
+                                // and quarantines the lease: this names it.
+                                log::warn!(
+                                    "guardian checkpoint catalog adoption failed; \
+                                     outcome indeterminate: {error:?}"
+                                );
+                                Failure::Indeterminate(error)
+                            }
+                        }
+                    })
+                },
+            ) {
                 Ok(receipt) => receipt,
                 Err(error) => {
                     return Some(GuardianResponseEnvelope::rejection(
@@ -1317,6 +1330,7 @@ fn replay_store_error_response(
             GuardianRejectionCode::ReplaySnapshotExpired
         }
         GuardianCheckpointStageStoreError::Capacity
+        | GuardianCheckpointStageStoreError::CatalogFull
         | GuardianCheckpointStageStoreError::Allocation
         | GuardianCheckpointStageStoreError::NameLimit => GuardianRejectionCode::CapacityExhausted,
         GuardianCheckpointStageStoreError::SpawnCustody(_)

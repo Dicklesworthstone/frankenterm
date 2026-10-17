@@ -322,6 +322,12 @@ pub enum GuardianCheckpointStageStoreError {
     Poisoned,
     #[error("guardian checkpoint staging resource policy is exhausted")]
     Capacity,
+    /// A pane's catalog has no room for another member and none could be
+    /// reclaimed (a restore still replaying pins its oldest members, or the
+    /// replay state was busy). The adoption wrote nothing; a later attempt
+    /// may find room.
+    #[error("guardian checkpoint catalog has no room for another pane member")]
+    CatalogFull,
     #[error("guardian checkpoint staging allocation failed")]
     Allocation,
     #[error("guardian checkpoint staging filesystem does not expose a safe name bound")]
@@ -14731,7 +14737,12 @@ fn checkpoint_catalog_publish_sealed_stage(
             .checked_add(2)
             .is_none_or(|files| files > CHECKPOINT_CATALOG_MAX_RELEVANT_FILES)
     {
-        return Err(GuardianCheckpointStageStoreError::Capacity);
+        // Nothing of this member is written yet.
+        return Err(if matches!(scope, CheckpointCatalogScope::Pane { .. }) {
+            GuardianCheckpointStageStoreError::CatalogFull
+        } else {
+            GuardianCheckpointStageStoreError::Capacity
+        });
     }
     let candidate_path =
         checkpoint_catalog_path(inner, identity, CheckpointCatalogPathRole::Candidate)?;

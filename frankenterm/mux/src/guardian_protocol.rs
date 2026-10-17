@@ -1789,6 +1789,18 @@ impl GuardianCheckpointEffectIdentity {
     }
 }
 
+/// How a catalog adoption under
+/// [`GuardianProtocolState::apply_checkpoint_transactionally_or_refuse`]
+/// failed.
+#[derive(Debug)]
+pub enum GuardianCheckpointPublicationFailure<E> {
+    /// Refused before anything durable was written: the request fails with
+    /// no effect recorded, and its exact retry is a fresh attempt.
+    Refused(E),
+    /// The durable outcome is unknown: the effect is recorded indeterminate.
+    Indeterminate(E),
+}
+
 /// Nonconstructible catalog-publication authority issued only after the
 /// authenticated Checkpoint operation passes every lease, mutation-sequence,
 /// effect-identity, capacity, and idempotency fence.
@@ -9852,6 +9864,28 @@ impl GuardianProtocolState {
         request: &AuthenticatedGuardianRequest,
         publish: impl FnOnce(GuardianCheckpointCatalogAdoptionPermitV1) -> Result<(), E>,
     ) -> Result<GuardianCheckpointReceipt, GuardianProtocolError> {
+        self.apply_checkpoint_transactionally_or_refuse(request, |permit| {
+            publish(permit).map_err(GuardianCheckpointPublicationFailure::Indeterminate)
+        })
+    }
+
+    /// [`Self::apply_checkpoint_transactionally`] whose callback may also
+    /// refuse: [`GuardianCheckpointPublicationFailure::Refused`] says the
+    /// publication made nothing durable (the guardian's catalog had no room),
+    /// so no effect, receipt or sequence is installed and the request fails
+    /// with [`GuardianProtocolError::CapacityExhausted`]. Its exact retry is
+    /// then a fresh attempt. An indeterminate outcome quarantines the mux's
+    /// lease; a full catalog after a restore is neither indeterminate nor
+    /// lasting, since reclamation resumes once the restore's replay settles.
+    /// An exact replay of an indeterminate publication treats a refusal as
+    /// one more failed reconciliation.
+    pub fn apply_checkpoint_transactionally_or_refuse<E>(
+        &mut self,
+        request: &AuthenticatedGuardianRequest,
+        publish: impl FnOnce(
+            GuardianCheckpointCatalogAdoptionPermitV1,
+        ) -> Result<(), GuardianCheckpointPublicationFailure<E>>,
+    ) -> Result<GuardianCheckpointReceipt, GuardianProtocolError> {
         validate_request_envelope(request)?;
         if request.header.guardian_incarnation != self.incarnation {
             return Err(GuardianProtocolError::GuardianIncarnationMismatch);
@@ -10011,7 +10045,15 @@ impl GuardianProtocolState {
         );
         let disposition = match publication {
             Ok(Ok(())) => GuardianCheckpointDisposition::Committed,
-            Ok(Err(error)) => {
+            Ok(Err(GuardianCheckpointPublicationFailure::Refused(error))) => {
+                let _ = catch_recoverable(
+                    RecoverablePanicSite::MuxPaneCallback,
+                    AssertUnwindSafe(|| drop(error)),
+                );
+                // Nothing below has run: the state is as before the request.
+                return Err(GuardianProtocolError::CapacityExhausted);
+            }
+            Ok(Err(GuardianCheckpointPublicationFailure::Indeterminate(error))) => {
                 let _ = catch_recoverable(
                     RecoverablePanicSite::MuxPaneCallback,
                     AssertUnwindSafe(|| drop(error)),
@@ -10234,7 +10276,9 @@ impl GuardianProtocolState {
     fn reconcile_checkpoint_publication<E>(
         &mut self,
         identity: GuardianCheckpointEffectIdentity,
-        publish: impl FnOnce(GuardianCheckpointCatalogAdoptionPermitV1) -> Result<(), E>,
+        publish: impl FnOnce(
+            GuardianCheckpointCatalogAdoptionPermitV1,
+        ) -> Result<(), GuardianCheckpointPublicationFailure<E>>,
     ) -> Result<GuardianCheckpointReceipt, GuardianProtocolError> {
         let stored = self
             .effects
@@ -14693,6 +14737,57 @@ mod tests {
             Err(GuardianProtocolError::EffectIdentityConflict)
         );
         assert_eq!(invocations.get(), 1);
+    }
+
+    #[test]
+    fn refused_checkpoint_records_nothing_and_its_exact_retry_commits() {
+        let guardian = id(1);
+        let mux = id(2);
+        let pane = id(3);
+        let checkpoint = checkpoint_request(guardian, mux, pane, 1, 1, 8, 9, 0x61, 0x62);
+        let authenticated_checkpoint = authenticate(&checkpoint);
+        let mut state = GuardianProtocolState::new(guardian).unwrap();
+        apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
+        apply_request(&mut state, &claim_request(guardian, mux, pane, 0, 6, 7)).unwrap();
+        let claimed = |state: &GuardianProtocolState, next: u64| {
+            matches!(
+                state.pane_state(pane),
+                Some(GuardianPaneState::LiveClaimed {
+                    generation: 1,
+                    mux_incarnation,
+                    next_sequence,
+                    pending_input_effect: None,
+                }) if *mux_incarnation == mux && *next_sequence == next
+            )
+        };
+
+        let invocations = std::cell::Cell::new(0_usize);
+        let refuse = |_| {
+            invocations.set(invocations.get() + 1);
+            Err(GuardianCheckpointPublicationFailure::Refused(
+                "catalog-full",
+            ))
+        };
+        let refused =
+            state.apply_checkpoint_transactionally_or_refuse(&authenticated_checkpoint, refuse);
+        assert_eq!(refused, Err(GuardianProtocolError::CapacityExhausted));
+        assert_eq!(invocations.get(), 1);
+        // No effect, receipt or sequence was installed.
+        assert!(claimed(&state, 1));
+
+        let receipt = state
+            .apply_checkpoint_transactionally_or_refuse(&authenticated_checkpoint, |_| {
+                invocations.set(invocations.get() + 1);
+                Ok::<(), GuardianCheckpointPublicationFailure<&str>>(())
+            })
+            .unwrap();
+        assert_eq!(invocations.get(), 2);
+        assert_eq!(
+            receipt.disposition(),
+            GuardianCheckpointDisposition::Committed
+        );
+        assert_eq!(receipt.sequence(), 1);
+        assert!(claimed(&state, 2));
     }
 
     #[test]
