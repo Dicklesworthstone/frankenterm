@@ -439,9 +439,7 @@ impl Page {
     pub fn store_legacy_row(&mut self, row: u32, cells: &[Cell], seqno: SequenceNo) -> bool {
         let header = self.header(row);
         let slot = header.slot();
-        for x in 0..header.len() {
-            self.release_at(slot, x);
-        }
+        self.release_range(slot, 0..header.len());
         self.set_header(
             row,
             RowHeader::with_slot(slot).with_flags(RowHeader::DIRTY, true),
@@ -727,6 +725,30 @@ impl Page {
         } else {
             Vec::new()
         }
+    }
+
+    /// [`Self::release_at`] for every cell of `cols`, read and zeroed as one
+    /// slice: the cells are folded into one word, and only when some cell
+    /// has side entries are they released one by one (a release touches
+    /// only the side tables, never the cells). A row's truncation or
+    /// replacement released its cells one call at a time.
+    fn release_range(&mut self, slot: u32, cols: Range<usize>) {
+        if cols.is_empty() {
+            return;
+        }
+        let start = self.cell_index(slot, cols.start);
+        let end = start + cols.len();
+        let any = self.buf[start..end].iter().fold(0, |any, &bits| any | bits);
+        if PackedCell::from_bits(any).has_side_entries() {
+            for x in cols {
+                let old = self.cell_at(slot, x);
+                if old.has_side_entries() {
+                    let off = self.offset(slot, x);
+                    self.release(off, old, false);
+                }
+            }
+        }
+        self.buf[start..end].fill(PackedCell::BLANK.bits());
     }
 
     /// Releases and zeroes one cell.
@@ -1432,9 +1454,7 @@ impl Page {
         self.shift_cells(row, x..len, true);
         len += 1;
         if len > limit {
-            for col in limit..len {
-                self.release_at(slot, col);
-            }
+            self.release_range(slot, limit..len);
             len = limit;
         }
         let header = self.header(row);
@@ -1512,9 +1532,7 @@ impl Page {
         let header = self.header(row);
         let slot = header.slot();
         let len = header.len();
-        for col in width..len {
-            self.release_at(slot, col);
-        }
+        self.release_range(slot, width..len);
         self.set_header(
             row,
             header.with_len(width).with_flags(RowHeader::DIRTY, true),
@@ -1593,9 +1611,7 @@ impl Page {
     pub fn clear_row(&mut self, row: u32, seqno: SequenceNo) {
         let header = self.header(row);
         let slot = header.slot();
-        for x in 0..header.len() {
-            self.release_at(slot, x);
-        }
+        self.release_range(slot, 0..header.len());
         self.set_header(
             row,
             RowHeader::with_slot(slot).with_flags(RowHeader::DIRTY, true),
