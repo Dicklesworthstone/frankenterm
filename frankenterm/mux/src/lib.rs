@@ -71,7 +71,6 @@ use crate::guardian_output_journal::{
     GuardianOutputJournal, GuardianOutputJournalError, GuardianOutputJournalTail,
     GuardianOutputPredecessor, GuardianOutputRecoveryBatch, GuardianOutputRecoveryLimits,
 };
-use crate::guardian_protocol::GuardianCheckpointReceipt;
 use crate::pane::{CachePolicy, CloseReason, GuardianLiveOutputReader, Pane, PaneId};
 use crate::ssh_agent::AgentProxy;
 use crate::tab::{FloatingPaneRect, PaneEntry, PaneNode, SplitRequest, Tab, TabId};
@@ -2570,6 +2569,62 @@ const LIVE_PARSER_CHECKPOINT_MAX_TIMEOUT: Duration = Duration::from_secs(30);
 const GUARDIAN_LIVE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 const GUARDIAN_LIVE_CHECKPOINT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const GUARDIAN_LIVE_CHECKPOINT_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Live checkpoints a pane adopts after the one its newest committed recovery
+/// root names, while a root publisher runs. The guardian keeps a pane's newest
+/// eight catalog members and reclaims the oldest first; a root whose member is
+/// gone can no longer be restored or published over. The root's member, these
+/// three, up to three failed root captures, and the adoption that reclaims
+/// stay within the eight. At one live checkpoint every five seconds and one
+/// root a minute, an ungated pane reclaimed its root's member in 40 seconds.
+const GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT: usize = 3;
+/// Adoptions a ledger remembers while no committed root names one of them.
+const GUARDIAN_ADOPTION_LEDGER_CAPACITY: usize = 64;
+
+/// The guardian checkpoints one pane registration adopted, as far as keeping
+/// its newest committed recovery root's member needs them.
+#[derive(Debug, Default)]
+struct GuardianAdoptionLedger {
+    /// Effect ids adopted after the member the newest committed root names,
+    /// oldest first; every adoption while no committed root names one.
+    since_root: VecDeque<uuid::Uuid>,
+    root_named: bool,
+    /// The newest adoption the live replay has not yet anchored at.
+    reanchor: Option<(
+        crate::guardian_protocol::GuardianCheckpointIdentityDigest,
+        u64,
+    )>,
+}
+
+impl GuardianAdoptionLedger {
+    fn record(
+        &mut self,
+        effect_id: uuid::Uuid,
+        checkpoint_id: crate::guardian_protocol::GuardianCheckpointIdentityDigest,
+        capture_generation: u64,
+    ) {
+        if self.since_root.len() == GUARDIAN_ADOPTION_LEDGER_CAPACITY {
+            self.since_root.pop_front();
+        }
+        self.since_root.push_back(effect_id);
+        self.reanchor = Some((checkpoint_id, capture_generation));
+    }
+
+    /// A committed root names the member adopted as `effect_id`: from now on
+    /// only what this registration adopted after it counts. A member this
+    /// ledger no longer remembers changes nothing.
+    fn root_committed(&mut self, effect_id: uuid::Uuid) -> bool {
+        let Some(at) = self.since_root.iter().position(|id| *id == effect_id) else {
+            return false;
+        };
+        self.since_root.drain(..=at);
+        self.root_named = true;
+        true
+    }
+
+    fn live_adoption_allowed(&self) -> bool {
+        self.root_named && self.since_root.len() < GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct GuardianLiveCheckpointSchedule {
@@ -4298,6 +4353,7 @@ struct PaneRegistrationGeneration {
     operation_state: AtomicUsize,
     reader_dead: Arc<AtomicBool>,
     live_parser_checkpoint: Arc<LiveParserCheckpointControl>,
+    guardian_adoptions: Mutex<GuardianAdoptionLedger>,
     retirement_tracker: Weak<PaneRetirementTracker>,
     owner: Weak<Mux>,
     cleanup: Mutex<PaneRetirementCleanupState>,
@@ -4329,6 +4385,7 @@ impl PaneRegistrationGeneration {
             operation_state: AtomicUsize::new(0),
             reader_dead: Arc::new(AtomicBool::new(false)),
             live_parser_checkpoint: Arc::new(LiveParserCheckpointControl::new(wire_identity)),
+            guardian_adoptions: Mutex::new(GuardianAdoptionLedger::default()),
             retirement_tracker: Arc::downgrade(retirement_tracker),
             owner,
             cleanup: Mutex::new(PaneRetirementCleanupState::Unattached),
@@ -5876,7 +5933,24 @@ mod pane_registration_handle {
             let capture = self
                 .capture_live_parser_checkpoint(segment, output, limits, timeout)
                 .map_err(anyhow::Error::new)?;
-            self.pane.publish_guardian_checkpoint(capture)
+            self.publish_and_record_guardian_checkpoint(capture)
+        }
+
+        /// Every adoption, live or for a recovery root, enters this
+        /// registration's ledger: the live replay re-anchors at the newest,
+        /// and live adoptions count against the newest committed root.
+        fn publish_and_record_guardian_checkpoint(
+            &self,
+            capture: LiveParserCheckpointAck,
+        ) -> anyhow::Result<crate::guardian_checkpoint::PublishedGuardianCheckpoint> {
+            let published = self.pane.publish_guardian_checkpoint(capture)?;
+            let receipt = published.receipt();
+            self.generation.guardian_adoptions.lock().record(
+                receipt.effect_id(),
+                receipt.intent().checkpoint_identity(),
+                receipt.generation(),
+            );
+            Ok(published)
         }
 
         /// Capture the current fully parsed authenticated guardian prefix.
@@ -5918,7 +5992,7 @@ mod pane_registration_handle {
                     source, limits, timeout, cancelled,
                 )
                 .map_err(anyhow::Error::new)?;
-            self.pane.publish_guardian_checkpoint(capture)
+            self.publish_and_record_guardian_checkpoint(capture)
         }
 
         pub fn same_registration(&self, other: &Self) -> bool {
@@ -10581,6 +10655,9 @@ pub struct Mux {
     pane_retirements: Arc<PaneRetirementTracker>,
     pane_preparations: Mutex<HashMap<PaneId, PanePreparation>>,
     pane_registration: Mutex<()>,
+    /// A recovery root publisher runs: live guardian checkpoints keep the
+    /// members newest committed roots name (`guardian_live_adoption_allowed`).
+    guardian_root_retention: AtomicBool,
     retiring_pane_ids: Mutex<HashSet<PaneId>>,
     pane_removal_cleanup_fences: Mutex<HashMap<PaneId, Arc<PaneRemovalCleanupToken>>>,
     pane_removal_cleanup_outstanding_leases: AtomicUsize,
@@ -13142,7 +13219,7 @@ fn publish_guardian_checkpoint_after_typed_delivery(
     pane_id: PaneId,
     segment: GuardianOutputSegmentIdentity,
     output: GuardianOutputAppendReceipt,
-) -> anyhow::Result<GuardianCheckpointReceipt> {
+) -> anyhow::Result<()> {
     let _generation_lease = generation
         .try_acquire()
         .ok_or(LiveParserCheckpointError::StaleRegistration)?;
@@ -13164,7 +13241,18 @@ fn publish_guardian_checkpoint_after_typed_delivery(
             TerminalCheckpointLimits::default(),
             GUARDIAN_LIVE_CHECKPOINT_CAPTURE_TIMEOUT,
         )
-        .map(|published| published.receipt())
+        .map(drop)
+}
+
+/// Whether a live checkpoint may be adopted now: always without a recovery
+/// root publisher, otherwise only within `GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT`
+/// of the member this pane's newest committed root names.
+fn guardian_live_adoption_allowed(generation: &PaneRegistrationGeneration) -> bool {
+    let retains_roots = generation
+        .owner
+        .upgrade()
+        .is_some_and(|mux| mux.guardian_root_retention.load(Ordering::Acquire));
+    !retains_roots || generation.guardian_adoptions.lock().live_adoption_allowed()
 }
 
 /// This function is run in a separate thread; its purpose is to perform
@@ -13253,7 +13341,19 @@ fn read_from_guardian_live_output(
             }
         };
         let now = Instant::now();
-        if checkpoint_schedule.is_due(now) && delivery.has_durable_replay_page_ack() {
+        if checkpoint_schedule.is_due(now)
+            && delivery.has_durable_replay_page_ack()
+            && !guardian_live_adoption_allowed(&generation)
+        {
+            // The guardian would reclaim the member the newest committed
+            // root names; the next root capture adopts and lifts this.
+            metrics::counter!(
+                "mux.guardian_checkpoint.publication_total",
+                "outcome" => "deferred_for_root"
+            )
+            .increment(1);
+            checkpoint_schedule.record_outcome(now, true);
+        } else if checkpoint_schedule.is_due(now) && delivery.has_durable_replay_page_ack() {
             let Some((segment, output)) = delivered_boundary else {
                 log::error!(
                     "guardian record reader returned success without one typed delivery: pane {}",
@@ -13269,11 +13369,7 @@ fn read_from_guardian_live_output(
                 segment,
                 output,
             ) {
-                Ok(receipt) => {
-                    // Later snapshots resume from this checkpoint, whose
-                    // boundary this reader delivered, and stop pinning the
-                    // one the pane was restored from.
-                    reader.reanchor(receipt.intent().checkpoint_identity(), receipt.generation());
+                Ok(()) => {
                     metrics::counter!(
                         "mux.guardian_checkpoint.publication_total",
                         "outcome" => "committed"
@@ -13297,6 +13393,13 @@ fn read_from_guardian_live_output(
                     checkpoint_schedule.record_outcome(Instant::now(), false);
                 }
             }
+        }
+        // Later snapshots resume from the newest checkpoint adopted, live or
+        // for a recovery root, whose boundary this reader already delivered,
+        // and stop pinning the one the pane was restored from.
+        let reanchor = generation.guardian_adoptions.lock().reanchor.take();
+        if let Some((checkpoint_id, capture_generation)) = reanchor {
+            reader.reanchor(checkpoint_id, capture_generation);
         }
     }
 
@@ -13634,6 +13737,7 @@ impl Mux {
             pane_retirements: Arc::new(PaneRetirementTracker::default()),
             pane_preparations: Mutex::new(HashMap::new()),
             pane_registration: Mutex::new(()),
+            guardian_root_retention: AtomicBool::new(false),
             retiring_pane_ids: Mutex::new(HashSet::new()),
             pane_removal_cleanup_fences: Mutex::new(HashMap::new()),
             pane_removal_cleanup_outstanding_leases: AtomicUsize::new(0),
@@ -21863,6 +21967,37 @@ impl Mux {
     /// byte after its boundary and a restore replays them, so a guardian pane
     /// needs no common cut with the rest of the mux. A pane that never stops
     /// printing could otherwise never be part of a published image.
+    /// While a recovery root publisher runs, each guardian pane adopts live
+    /// checkpoints only from the member its newest committed root names up to
+    /// `GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT` after it, so the guardian, which
+    /// keeps a pane's newest members, still holds that member for a restore.
+    /// Without a publisher no root names a member and live adoption is free.
+    pub fn set_guardian_root_retention(&self, enabled: bool) {
+        self.guardian_root_retention
+            .store(enabled, Ordering::Release);
+    }
+
+    /// A committed recovery root names `published` for `pane_id`. Returns
+    /// whether the pane's current registration adopted it.
+    pub fn note_guardian_root_committed(
+        &self,
+        pane_id: PaneId,
+        published: &crate::guardian_checkpoint::PublishedGuardianCheckpoint,
+    ) -> bool {
+        let generation = {
+            let panes = self.panes.read();
+            let Some(registered) = panes.get(&pane_id) else {
+                return false;
+            };
+            Arc::clone(&registered.generation)
+        };
+        generation.wire_identity == published.capture().registration_wire_identity()
+            && generation
+                .guardian_adoptions
+                .lock()
+                .root_committed(published.receipt().effect_id())
+    }
+
     pub fn guardian_checkpoint_is_restorable(
         &self,
         pane_id: PaneId,
@@ -25072,6 +25207,61 @@ mod tests {
         schedule.record_outcome(retry, true);
         assert!(!schedule.is_due(retry));
         assert!(schedule.is_due(retry + GUARDIAN_LIVE_CHECKPOINT_INTERVAL));
+    }
+
+    #[test]
+    fn guardian_live_adoptions_stay_within_reach_of_the_newest_committed_root() {
+        let digest = |byte| {
+            crate::guardian_protocol::GuardianCheckpointIdentityDigest::from_bytes([byte; 32])
+                .expect("checkpoint identity")
+        };
+        let mut ledger = GuardianAdoptionLedger::default();
+        // Nothing a committed root names yet: no live adoption.
+        assert!(!ledger.live_adoption_allowed());
+        let root = uuid::Uuid::from_u128(1);
+        ledger.record(root, digest(1), 3);
+        assert!(!ledger.live_adoption_allowed());
+        let (_, generation) = ledger.reanchor.take().expect("root capture re-anchors");
+        assert_eq!(generation, 3);
+
+        // A capture still in flight when the root commits counts after it.
+        let in_flight = uuid::Uuid::from_u128(2);
+        ledger.record(in_flight, digest(2), 3);
+        assert!(!ledger.root_committed(uuid::Uuid::from_u128(99)));
+        assert!(!ledger.live_adoption_allowed());
+        assert!(ledger.root_committed(root));
+        assert_eq!(ledger.since_root, [in_flight]);
+        let mut live = 3;
+        while ledger.since_root.len() < GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT {
+            assert!(ledger.live_adoption_allowed());
+            ledger.record(uuid::Uuid::from_u128(live), digest(3), 3);
+            live += 1;
+        }
+        assert_eq!(live, 3 + GUARDIAN_LIVE_ADOPTIONS_AFTER_ROOT as u128 - 1);
+        assert!(!ledger.live_adoption_allowed());
+
+        // The next root's member lifts the gate for what follows it only.
+        let next_root = uuid::Uuid::from_u128(10);
+        ledger.record(next_root, digest(4), 3);
+        let failed_capture = uuid::Uuid::from_u128(11);
+        ledger.record(failed_capture, digest(5), 3);
+        assert!(ledger.root_committed(next_root));
+        assert_eq!(ledger.since_root, [failed_capture]);
+        assert!(ledger.live_adoption_allowed());
+
+        // A ledger that forgot a root's member keeps the gate where it was.
+        let mut forgetful = GuardianAdoptionLedger::default();
+        let forgotten = uuid::Uuid::from_u128(20);
+        forgetful.record(forgotten, digest(6), 3);
+        for capture in 0..GUARDIAN_ADOPTION_LEDGER_CAPACITY {
+            forgetful.record(uuid::Uuid::from_u128(100 + capture as u128), digest(7), 3);
+        }
+        assert_eq!(
+            forgetful.since_root.len(),
+            GUARDIAN_ADOPTION_LEDGER_CAPACITY
+        );
+        assert!(!forgetful.root_committed(forgotten));
+        assert!(!forgetful.live_adoption_allowed());
     }
 
     #[derive(Debug, Eq, PartialEq)]

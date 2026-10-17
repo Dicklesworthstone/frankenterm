@@ -620,6 +620,12 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
     match result {
         Ok(receipt) => {
             attempt.settle();
+            // Live checkpoints now count from the members this root names.
+            for (pane, checkpoint) in captured.pane_bindings.iter().zip(&checkpoints) {
+                if let CapturedPaneCheckpoint::Guardian(published) = checkpoint {
+                    mux.note_guardian_root_committed(pane.pane_id, published);
+                }
+            }
             Ok(receipt)
         }
         Err(error) => {
@@ -910,48 +916,11 @@ pub fn publish_whole_mux_recovery(
         )?;
     }
     snapshot_cx_checkpoint(cx)?;
-    // RootVerifier's closure adapter retains the caller's actual Cx throughout
-    // graph validation; no fresh root context or permissive verifier is involved.
-    #[derive(Debug, thiserror::Error)]
-    enum VerifyPublicationError {
-        #[error("publication context stopped")]
-        Context(#[from] SnapshotError),
-        #[error("whole-mux graph verification failed")]
-        Graph(#[from] crate::session_restore::WholeMuxRecoveryError),
-        #[error("predecessor identity or semantic image digest mismatch")]
-        Predecessor,
-        #[error("unexpected candidate generation {0}")]
-        UnexpectedRole(u64),
-    }
-    let verify = |candidate: &crate::snapshot_publication::RootSlotCandidate,
-                  store: &crate::snapshot_publication::SnapshotPublicationStore|
-     -> Result<_, VerifyPublicationError> {
-        snapshot_cx_checkpoint(cx)?;
-        let checked_root = if candidate.generation == expected.generation {
-            current_verifier.verify_root_with_cx(cx, candidate, store)?
-        } else if let Some(predecessor) = expected.predecessor.as_ref() {
-            if candidate.generation <= predecessor.expected_generation {
-                let checked = predecessor_verifier.verify_root_with_cx(cx, candidate, store)?;
-                // Both alternating slots retain authenticated discovery roots.
-                // Verify the older slot too: rejecting it makes generation 3
-                // fail reconciliation before it can replace generation 1.
-                // The publication store still requires the selected active
-                // root to match the exact predecessor generation and hash.
-                if candidate.generation == predecessor.expected_generation
-                    && (hex::encode(checked.root_envelope_sha256()) != predecessor.expected_hash
-                        || Some(checked.image().image_digest) != expected.predecessor_image_digest)
-                {
-                    return Err(VerifyPublicationError::Predecessor);
-                }
-                checked
-            } else {
-                return Err(VerifyPublicationError::UnexpectedRole(candidate.generation));
-            }
-        } else {
-            return Err(VerifyPublicationError::UnexpectedRole(candidate.generation));
-        };
-        snapshot_cx_checkpoint(cx)?;
-        Ok(checked_root)
+    let verify = WholeMuxPublicationVerifier {
+        cx,
+        expected,
+        current: &current_verifier,
+        predecessor: &predecessor_verifier,
     };
     Ok(store.publish_repair_protected_generation_root(
         cx,
@@ -967,6 +936,81 @@ pub fn publish_whole_mux_recovery(
         repair_key.as_ref(),
         &verify,
     )?)
+}
+
+#[cfg(feature = "frankenterm-deps")]
+#[derive(Debug, thiserror::Error)]
+enum WholeMuxPublicationVerifyError {
+    #[error("publication context stopped")]
+    Context(#[from] SnapshotError),
+    #[error("whole-mux graph verification failed: {0}")]
+    Graph(#[from] crate::session_restore::WholeMuxRecoveryError),
+    #[error("predecessor identity or semantic image digest mismatch")]
+    Predecessor,
+    #[error("unexpected candidate generation {0}")]
+    UnexpectedRole(u64),
+}
+
+/// Verifies the candidate and the committed roots a whole-mux publication
+/// meets. Retains the caller's actual Cx throughout graph validation; no fresh
+/// root context or permissive verifier is involved. Unlike a closure
+/// (`RootVerifier` for `Fn`), it tells the store which rejections only say
+/// newer captures superseded a root's guardian evidence.
+#[cfg(feature = "frankenterm-deps")]
+struct WholeMuxPublicationVerifier<'a> {
+    cx: &'a crate::cx::Cx,
+    expected: &'a WholeMuxPublicationIdentity,
+    current: &'a crate::session_restore::WholeMuxRecoveryVerifier,
+    predecessor: &'a crate::session_restore::WholeMuxRecoveryVerifier,
+}
+
+#[cfg(feature = "frankenterm-deps")]
+impl crate::snapshot_publication::RootVerifier for WholeMuxPublicationVerifier<'_> {
+    type Error = WholeMuxPublicationVerifyError;
+    type Verified = crate::session_restore::ValidatedWholeMuxRecovery;
+
+    fn verify_root(
+        &self,
+        candidate: &crate::snapshot_publication::RootSlotCandidate,
+        store: &crate::snapshot_publication::SnapshotPublicationStore,
+    ) -> Result<Self::Verified, Self::Error> {
+        let (cx, expected) = (self.cx, self.expected);
+        snapshot_cx_checkpoint(cx)?;
+        let checked_root = if candidate.generation == expected.generation {
+            self.current.verify_root_with_cx(cx, candidate, store)?
+        } else if let Some(predecessor) = expected.predecessor.as_ref() {
+            if candidate.generation <= predecessor.expected_generation {
+                let checked = self.predecessor.verify_root_with_cx(cx, candidate, store)?;
+                // Both alternating slots retain authenticated discovery roots.
+                // Verify the older slot too: rejecting it makes generation 3
+                // fail reconciliation before it can replace generation 1.
+                // The publication store still requires the selected active
+                // root to match the exact predecessor generation and hash.
+                if candidate.generation == predecessor.expected_generation
+                    && (hex::encode(checked.root_envelope_sha256()) != predecessor.expected_hash
+                        || Some(checked.image().image_digest) != expected.predecessor_image_digest)
+                {
+                    return Err(WholeMuxPublicationVerifyError::Predecessor);
+                }
+                checked
+            } else {
+                return Err(WholeMuxPublicationVerifyError::UnexpectedRole(
+                    candidate.generation,
+                ));
+            }
+        } else {
+            return Err(WholeMuxPublicationVerifyError::UnexpectedRole(
+                candidate.generation,
+            ));
+        };
+        snapshot_cx_checkpoint(cx)?;
+        Ok(checked_root)
+    }
+
+    fn superseded_by_newer(&self, error: &Self::Error) -> bool {
+        matches!(error, WholeMuxPublicationVerifyError::Graph(graph)
+            if self.predecessor.superseded_by_newer(graph))
+    }
 }
 
 // =============================================================================
@@ -13610,6 +13654,67 @@ mod tests {
     use super::*;
     use crate::runtime_async::{CompatRuntime, RuntimeBuilder, sleep, timeout};
     use crate::wezterm::PaneSize;
+
+    #[test]
+    #[cfg(feature = "frankenterm-deps")]
+    fn publication_verifier_tells_the_store_which_rejections_are_superseded() {
+        use crate::session_restore::{
+            WholeMuxRecoveryError, WholeMuxRecoveryVerifier, WholeMuxTrustedIdentityConfig,
+        };
+        use crate::snapshot_publication::RootVerifier;
+        let key =
+            Arc::new(crate::snapshot_representation::RecoveryKey::from_bytes([24; 32]).unwrap());
+        let graph_verifier = || {
+            WholeMuxRecoveryVerifier::new_production(
+                Arc::clone(&key),
+                WholeMuxTrustedIdentityConfig::new([25; 32]),
+            )
+        };
+        let (current, predecessor) = (graph_verifier(), graph_verifier());
+        let expected = WholeMuxPublicationIdentity {
+            generation: 2,
+            session_id: "superseded-test".into(),
+            mux_incarnation_id: "00".repeat(16),
+            root_object_id: [25; 32],
+            publisher_id: "test".into(),
+            ft_version: "test".into(),
+            predecessor: None,
+            predecessor_image_digest: None,
+            existing_guardian_custody: None,
+        };
+        let cx = crate::cx::Cx::for_testing();
+        let verifier = WholeMuxPublicationVerifier {
+            cx: &cx,
+            expected: &expected,
+            current: &current,
+            predecessor: &predecessor,
+        };
+        // A committed root whose guardian member newer captures superseded
+        // must reach the store as such; the closure this replaced never did.
+        assert!(
+            verifier.superseded_by_newer(&WholeMuxPublicationVerifyError::Graph(
+                WholeMuxRecoveryError::SupersededGuardianCheckpoint { pane_id: 1 }
+            ))
+        );
+        for error in [
+            WholeMuxPublicationVerifyError::Graph(
+                WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                    pane_id: 1,
+                    reason: "no authenticated guardian witness is installed".into(),
+                },
+            ),
+            WholeMuxPublicationVerifyError::Predecessor,
+            WholeMuxPublicationVerifyError::UnexpectedRole(3),
+        ] {
+            assert!(!verifier.superseded_by_newer(&error), "{error}");
+        }
+        // The store's rejection reason carries the graph error.
+        let shown = WholeMuxPublicationVerifyError::Graph(
+            WholeMuxRecoveryError::SupersededGuardianCheckpoint { pane_id: 1 },
+        )
+        .to_string();
+        assert!(shown.contains("superseded for pane 1"), "{shown}");
+    }
 
     #[test]
     #[cfg(feature = "frankenterm-deps")]

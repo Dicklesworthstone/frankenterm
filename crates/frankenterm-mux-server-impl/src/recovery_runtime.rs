@@ -433,6 +433,8 @@ impl PeriodicRecovery {
                 && (1..=30).contains(&timeout),
             "invalid periodic recovery timing bounds"
         );
+        // Roots name guardian members; live checkpoints must leave them be.
+        mux.set_guardian_root_retention(true);
         Ok(Some(Self {
             options,
             mux,
@@ -506,6 +508,10 @@ impl PeriodicRecovery {
                     Ok(result) => {
                         self.state = result.state;
                         self.failed = result.terminal;
+                        if result.terminal {
+                            // No root will lift the live checkpoint gate.
+                            self.mux.set_guardian_root_retention(false);
+                        }
                         if let Some(generation) = result.published_generation {
                             // The optimistic cut happened no earlier than the
                             // attempt start. Do not understate RPO age by
@@ -527,6 +533,7 @@ impl PeriodicRecovery {
                     }
                     Err(_) => {
                         self.failed = true;
+                        self.mux.set_guardian_root_retention(false);
                         log::error!(
                             "mux periodic recovery blocking task failed; publication lane disabled"
                         );

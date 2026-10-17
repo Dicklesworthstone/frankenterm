@@ -6540,6 +6540,15 @@ pub enum WholeMuxRecoveryError {
     #[error("unproved guardian authority rejected for pane {pane_id}: {reason}")]
     UnprovedGuardianAuthority { pane_id: u64, reason: String },
 
+    /// The guardian, its custody of the pane authenticated, no longer holds
+    /// the catalog member (or its acknowledgement) this authenticated root
+    /// names: it keeps a pane's newest adopted checkpoints, and newer ones
+    /// superseded this one.
+    #[error(
+        "guardian checkpoint superseded for pane {pane_id}: the guardian no longer holds the member this root names"
+    )]
+    SupersededGuardianCheckpoint { pane_id: u64 },
+
     #[error("publication store error: {0}")]
     Publication(#[from] PublicationError),
 
@@ -7320,16 +7329,24 @@ impl WholeMuxRecoveryVerifier {
                 return Err(fail());
             }
         }
-        // The store's error tells a reclaimed checkpoint (absent) from a
-        // catalog caught mid-adoption (out of order) or a damaged one.
+        // Custody authenticated above. The store's error tells a reclaimed
+        // checkpoint (absent) from a catalog caught mid-adoption (out of
+        // order) or a damaged one.
         custody
             .reopen_checkpoint(selector)
             .map(Some)
-            .map_err(|error| WholeMuxRecoveryError::UnprovedGuardianAuthority {
-                pane_id: pane.pane_id as u64,
-                reason: format!(
-                    "existing guardian custody/catalog/ACK does not authenticate the manifest entry: {error:?}"
-                ),
+            .map_err(|error| match error {
+                frankenterm_pty_guardian::GuardianCheckpointStageStoreError::CandidateAbsent => {
+                    WholeMuxRecoveryError::SupersededGuardianCheckpoint {
+                        pane_id: pane.pane_id as u64,
+                    }
+                }
+                error => WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                    pane_id: pane.pane_id as u64,
+                    reason: format!(
+                        "existing guardian custody/catalog/ACK does not authenticate the manifest entry: {error:?}"
+                    ),
+                },
             })
     }
 
@@ -8067,13 +8084,15 @@ impl RootVerifier for WholeMuxRecoveryVerifier {
         self.verify_root_with_cx(&cx, candidate, store)
     }
 
-    /// Guardian evidence an older root names goes once a newer capture of
-    /// the pane is adopted; the rejection is raised only after the root's
-    /// envelope and image authenticated (see `settle_root_authority`).
+    /// Guardian evidence a root names goes once newer captures of the pane
+    /// are adopted; the rejection is raised only after the root's envelope
+    /// and image authenticated and the pane's guardian custody opened. Any
+    /// other guardian authority failure (no or wrong custody, a mismatched
+    /// witness) still blocks publication.
     fn superseded_by_newer(&self, error: &Self::Error) -> bool {
         matches!(
             error,
-            WholeMuxRecoveryError::UnprovedGuardianAuthority { .. }
+            WholeMuxRecoveryError::SupersededGuardianCheckpoint { .. }
         )
     }
 }
@@ -8476,6 +8495,7 @@ pub fn select_verified_recovery_roots_with_cx(
                     if matches!(
                         error,
                         WholeMuxRecoveryError::UnprovedGuardianAuthority { .. }
+                            | WholeMuxRecoveryError::SupersededGuardianCheckpoint { .. }
                     ) {
                         guardian_rejections.push(diagnostics.len());
                     }
@@ -8582,6 +8602,33 @@ mod tests {
         assert!(!settle_root_authority(&mut mixed, &[0], Some(6)));
         let mut mixed = vec![rejected(Some(5)), rejected(Some(7))];
         assert!(settle_root_authority(&mut mixed, &[0, 1], Some(6)));
+    }
+
+    #[test]
+    fn only_a_reclaimed_guardian_member_is_superseded_for_publication() {
+        use crate::snapshot_publication::RootVerifier;
+        let verifier = whole_mux_test_verifier();
+        assert!(verifier.superseded_by_newer(
+            &WholeMuxRecoveryError::SupersededGuardianCheckpoint { pane_id: 3 }
+        ));
+        // Missing or wrong custody, or a witness that does not match, says
+        // nothing about newer captures: it still blocks publication.
+        for reason in [
+            "no authenticated guardian witness is installed",
+            "existing guardian custody/catalog/ACK does not authenticate the manifest entry",
+            "reopened guardian witness does not match image",
+        ] {
+            assert!(!verifier.superseded_by_newer(
+                &WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                    pane_id: 3,
+                    reason: reason.to_owned(),
+                }
+            ));
+        }
+        assert!(
+            !verifier
+                .superseded_by_newer(&WholeMuxRecoveryError::FakeGuardianAuthority { pane_id: 3 })
+        );
     }
 
     fn test_runtime_error(operation: &'static str, detail: impl Into<String>) -> crate::Error {
