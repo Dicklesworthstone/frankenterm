@@ -386,6 +386,16 @@ impl<'a, 't> PrintGraphemeWidths<'a, 't> {
     }
 }
 
+impl<'a> PrintGraphemeWidths<'a, '_> {
+    /// [`PrintSegments::plain_run`]; without the fast segmentation, none.
+    fn plain_run(&mut self, room: usize, multibyte: bool, cells: &mut Vec<(&'a str, u8)>) -> usize {
+        match self {
+            Self::Fast(segments) => segments.plain_run(room, multibyte, cells),
+            Self::Plain(_) => 0,
+        }
+    }
+}
+
 impl<'a> Iterator for PrintGraphemeWidths<'a, '_> {
     type Item = (&'a str, Option<usize>);
 
@@ -1055,7 +1065,7 @@ impl<'a> Performer<'a> {
         // cell before it.
         let mut printed_cell = true;
         let mut table = std::mem::take(&mut self.print_char_table);
-        let graphemes = PrintGraphemeWidths::new(text, &mut table, &self.unicode_version);
+        let mut graphemes = PrintGraphemeWidths::new(text, &mut table, &self.unicode_version);
         // Cells are written in runs (`PendingCells`), except in insert mode,
         // where each one first shifts the row, and for a lone character (T0
         // flushes one per SGR pair), which a run would only slow down.
@@ -1072,7 +1082,7 @@ impl<'a> Performer<'a> {
         // No DEC or UK charset remaps a grapheme (nor insert mode, which
         // turns batching off): the fast path below may run.
         let plain_print = batch && self.active_charset() == CharSet::Ascii;
-        for (g, known_width) in graphemes {
+        while let Some((g, known_width)) = graphemes.next() {
             let follows_segmented_cell = std::mem::replace(&mut printed_cell, false);
             // The common case, decided in a few compares: a lone character
             // whose width the segmentation knows, after a printed cell, with
@@ -1110,11 +1120,29 @@ impl<'a> Performer<'a> {
                         pending.end = next_x;
                         self.note_printed(y, x, width, false);
                         printed_cell = true;
-                        if next_x >= self.left_and_right_margins.end {
+                        let margin = self.left_and_right_margins.end;
+                        if next_x >= margin {
                             self.wrap_next = self.dec_auto_wrap;
                         } else {
                             self.cursor.x = next_x;
                             self.wrap_next = false;
+                            // Each grapheme that follows here as the one
+                            // just printed did, ending before the margin, is
+                            // printed as this one was, with this cell's
+                            // checks settled for all of them: take the run.
+                            let multibyte =
+                                !self.zwj_tail_cell_possible || self.zwj_continuation_ruled_out();
+                            let run_from = pending.cells.len();
+                            let taken =
+                                graphemes.plain_run(margin - next_x, multibyte, &mut pending.cells);
+                            if taken > 0 {
+                                let last = usize::from(pending.cells[pending.cells.len() - 1].1);
+                                debug_assert!(pending.cells.len() > run_from);
+                                let end = next_x + taken;
+                                pending.end = end;
+                                self.note_printed(y, end - last, last, false);
+                                self.cursor.x = end;
+                            }
                         }
                         continue;
                     }
@@ -4210,6 +4238,76 @@ mod tests {
                     "{engine:?}, reads of {read} bytes"
                 );
             }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(160))]
+
+        /// The plain runs the fast path takes whole
+        /// (`PrintSegments::plain_run`) print what the segmenter alone
+        /// prints, one grapheme at a time: any mix of one- and multi-byte
+        /// lone characters, wide ones at the margin, clusters, ZWJ tails,
+        /// colors, line ends, cursor moves, margins, autowrap off and insert
+        /// mode, in narrow screens on both engines, split into any reads.
+        #[test]
+        fn plain_runs_print_as_the_segmenter_prints_them(
+            pieces in proptest::collection::vec(proptest::sample::select(vec![
+                "abc", "x", " ", "\u{4e2d}", "\u{6587}\u{5b57}", "\u{5d0}\u{5d1}",
+                "\u{645}\u{631}", "\u{e9}", "e\u{301}", "\u{301}", "\u{1f600}",
+                "\u{1f468}\u{200d}\u{1f469}", "a\u{200d}", "\u{200d}", "\u{2764}\u{fe0f}",
+                "\u{1f1fa}\u{1f1f8}", "\u{1f3fb}", "\u{200b}", "\u{903}", "\x1b[31m",
+                "\x1b[m", "\r\n", "\n", "\r", "\x1b[2;3H", "\x1b[1;9H", "\x1b[?7l",
+                "\x1b[?7h", "\x1b[4h", "\x1b[4l", "\x1b[?69h\x1b[2;7s", "\x1b[?69l",
+                "\x08", "\t",
+            ]), 1..48),
+            cols in 3usize..14,
+            read in 1usize..24,
+            page in proptest::bool::ANY,
+        ) {
+            #[derive(Debug)]
+            struct EngineConfig(crate::config::GridEngine);
+            impl TerminalConfiguration for EngineConfig {
+                fn scrollback_size(&self) -> usize {
+                    16
+                }
+                fn scrollback_tier_config(&self) -> ScrollbackTierConfig {
+                    ScrollbackTierConfig::default()
+                }
+                fn color_palette(&self) -> ColorPalette {
+                    ColorPalette::default()
+                }
+                fn grid_engine(&self) -> crate::config::GridEngine {
+                    self.0
+                }
+            }
+            let engine = if page {
+                crate::config::GridEngine::Page
+            } else {
+                crate::config::GridEngine::Legacy
+            };
+            let stream = pieces.concat();
+            let print = |force_segmenter: bool| {
+                FORCE_GRAPHEME_SEGMENTER.with(|force| force.set(force_segmenter));
+                let config: Arc<dyn TerminalConfiguration + Send + Sync> =
+                    Arc::new(EngineConfig(engine));
+                let size = TerminalSize {
+                    rows: 4,
+                    cols,
+                    pixel_width: cols * 8,
+                    pixel_height: 64,
+                    dpi: 96,
+                };
+                let mut terminal =
+                    Terminal::new(size, config, "WezTerm", "test", Box::new(Vec::new()));
+                for chunk in stream.as_bytes().chunks(read) {
+                    terminal.advance_bytes(chunk);
+                }
+                terminal.advance_bytes(b"Z");
+                FORCE_GRAPHEME_SEGMENTER.with(|force| force.set(false));
+                snapshot_terminal(&terminal)
+            };
+            proptest::prop_assert_eq!(print(false), print(true));
         }
     }
 

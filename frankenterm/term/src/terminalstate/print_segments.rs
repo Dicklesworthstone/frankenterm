@@ -252,7 +252,67 @@ impl<'a> Iterator for PrintSegments<'a, '_> {
     }
 }
 
-impl PrintSegments<'_, '_> {
+impl<'a> PrintSegments<'a, '_> {
+    /// Takes the run of graphemes at the front of what is left that
+    /// [`Iterator::next`] would yield as lone characters of a known width,
+    /// one or two columns, while all of them fit in fewer than `room`
+    /// columns, and only one-byte ones without `multibyte`: each goes to
+    /// `cells` with its width, exactly as `next` yields it. Stops before
+    /// the first that is not, which `next` yields next. Returns the columns
+    /// taken.
+    ///
+    /// The print loop's fast path asked of each such grapheme what is
+    /// settled for the whole run once it has printed one (ft-yccm0.3.2.6),
+    /// and `next` decoded every character twice (as the lookahead, then as
+    /// itself); here each is decoded and looked up once.
+    pub(crate) fn plain_run(
+        &mut self,
+        room: usize,
+        multibyte: bool,
+        cells: &mut Vec<(&'a str, u8)>,
+    ) -> usize {
+        let text = self.text;
+        let Some(rest) = text.get(self.pos..) else {
+            return 0;
+        };
+        let mut chars = rest.chars();
+        let Some(mut c) = chars.next() else {
+            return 0;
+        };
+        let mut entry = self.table.entry(c);
+        let mut pos = self.pos;
+        let mut used = 0;
+        loop {
+            let next = chars.next();
+            let next_entry = next.map(|next| self.table.entry(next));
+            // `next`'s test of a lone character.
+            let alone = next_entry
+                .is_none_or(|next| u16::from(PLAIN) & entry != 0 && u16::from(CONTINUES) & next == 0);
+            let width = usize::from(entry >> 8);
+            let len = c.len_utf8();
+            if !alone
+                || entry & WIDTH_KNOWN == 0
+                || !(1..=2).contains(&width)
+                || used + width >= room
+                || (len > 1 && !multibyte)
+            {
+                break;
+            }
+            cells.push((&text[pos..pos + len], width as u8));
+            pos += len;
+            used += width;
+            match (next, next_entry) {
+                (Some(next), Some(next_entry)) => {
+                    c = next;
+                    entry = next_entry;
+                }
+                _ => break,
+            }
+        }
+        self.pos = pos;
+        used
+    }
+
     /// The length of the cluster that the plain character `first` bytes
     /// long at the front of `rest` starts, when each character continuing
     /// it resumes the plain state: it then ends before the first character
