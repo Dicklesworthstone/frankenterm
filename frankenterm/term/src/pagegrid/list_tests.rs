@@ -689,8 +689,9 @@ fn run_ops(page_rows: u32, viewport: usize, cap: usize, ops: &[Op]) {
                 assert_eq!((scrolled.trimmed, scrolled.refused), (trimmed, refused));
                 assert_eq!(scrolled.first_new, model.end() - 1);
                 let new_row = list.row(model.end() - 1).expect("the new row");
+                let header = new_row.page.header(new_row.row);
                 assert_eq!(
-                    new_row.page.header(new_row.row).has(RowHeader::LEGACY_FORM_C),
+                    header.has(RowHeader::LEGACY_FORM_C),
                     flags != 0,
                     "the new row carries the flags"
                 );

@@ -526,8 +526,7 @@ impl PageList {
     /// takes the general path.
     pub fn scroll_line(&mut self, seqno: SequenceNo, flags: u64) -> Scrolled {
         let excess = (self.retained_rows + 1).saturating_sub(self.hot_cap);
-        let front_trims =
-            excess == 1 && self.pages.front().is_some_and(|slot| slot.retained() > 0);
+        let front_trims = excess == 1 && self.pages.front().is_some_and(|slot| slot.retained() > 0);
         if excess > 1 || (excess == 1 && !front_trims) {
             return self.scroll_with_row_flags(1, seqno, false, flags, |_| true);
         }
