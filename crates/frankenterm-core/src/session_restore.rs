@@ -8408,17 +8408,20 @@ pub fn select_verified_recovery_roots_with_cx(
                         RepairError::AdmissionExceeded(_),
                     ))),
                 ) => return Err(error),
-                Err(_) => {
+                Err(error) => {
+                    // The verifier's own error, after the fixed prefix, is
+                    // what tells one rejected graph from another: a refused
+                    // restore logs these reasons.
+                    let prefix = if repair {
+                        "authenticated root repair or graph rejected"
+                    } else {
+                        "root graph rejected"
+                    };
                     diagnostics.push(TornRootDiagnostic {
                         slot,
                         generation: Some(generation),
                         authority: RootDiagnosticAuthority::Unresolved,
-                        reason: if repair {
-                            "authenticated root repair or graph rejected"
-                        } else {
-                            "root graph rejected"
-                        }
-                        .to_owned(),
+                        reason: format!("{prefix}: {error}"),
                     });
                 }
             }

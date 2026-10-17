@@ -1003,7 +1003,7 @@ mod tests {
                         .torn_or_rejected
                         .iter()
                         .any(|diagnostic| diagnostic.generation == Some(2)
-                            && diagnostic.reason == "root graph rejected")
+                            && diagnostic.reason.starts_with("root graph rejected: "))
                 );
                 assert!(load_recovery_for_startup(&options, None, &cx::for_request()).is_err());
                 std::fs::write(&path, damaged_root).unwrap();
