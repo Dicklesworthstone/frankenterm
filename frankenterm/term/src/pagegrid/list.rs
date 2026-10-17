@@ -173,6 +173,7 @@ impl PageSlot {
     /// box, now holding the shell's reset page, goes back to the pool, so
     /// sealing allocates nothing; without a shell the page moves into a new
     /// `Arc`.
+    #[allow(clippy::vec_box)] // A pooled box moves into an active slot as is.
     fn seal(&mut self, shells: &mut Vec<Arc<Page>>, pool: &mut Vec<Box<Page>>) {
         let Some(mut page) = self.active.take() else {
             return;
@@ -222,7 +223,9 @@ impl PageSlot {
 pub struct PageList {
     pages: VecDeque<PageSlot>,
     /// Reset pages of this list's geometry, each held only here, boxed as an
-    /// active slot holds them.
+    /// active slot holds them: taking one for a new slot moves the box, with
+    /// no allocation (D8).
+    #[allow(clippy::vec_box)]
     pool: Vec<Box<Page>>,
     /// Reset pages of this list's geometry in `Arc`s, each held only here:
     /// sealing moves a page's contents into one ([`PageSlot::seal`]).
