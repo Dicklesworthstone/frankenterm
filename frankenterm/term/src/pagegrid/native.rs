@@ -509,7 +509,16 @@ pub fn fill_blank(
     }
     page.touch_row(row, seqno);
     set_vector(page, row);
-    if !fill_blank_run(page, row, cols.start..end, attr, seqno) {
+    if is_default && end == len && !page.cell(row, cols.start - 1).is_wide() {
+        // A default fill to the row's end leaves default blanks there,
+        // which the pruning below removes: truncating at the fill's start
+        // releases the same cells once instead of writing blanks only to
+        // release them again (an erase to the end of line under the default
+        // pen, every TUI repaint). Only a wide cell just before the fill,
+        // which writing there would blank, needs the cells written.
+        // (`cols.start` is past 0: a whole-row default fill cleared above.)
+        page.resize_row(row, cols.start, seqno);
+    } else if !fill_blank_run(page, row, cols.start..end, attr, seqno) {
         for x in cols.start..end {
             // A fill replaces cells outright: no placement carries over.
             page.write_legacy(row, x, &cell, true, seqno);

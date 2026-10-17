@@ -731,9 +731,12 @@ impl Page {
 
     /// Releases and zeroes one cell.
     fn release_at(&mut self, slot: u32, x: usize) {
-        let off = self.offset(slot, x);
         let old = self.cell_at(slot, x);
-        self.release(off, old, false);
+        // Releasing a cell with no side entries does nothing.
+        if old.has_side_entries() {
+            let off = self.offset(slot, x);
+            self.release(off, old, false);
+        }
         self.set_cell_at(slot, x, PackedCell::BLANK);
     }
 
