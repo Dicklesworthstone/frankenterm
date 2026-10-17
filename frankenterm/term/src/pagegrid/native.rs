@@ -405,6 +405,70 @@ pub fn set_ascii_run(
     set_ascii_run_per_byte(page, row, x, text, attr, &class, seqno)
 }
 
+/// A pen classified once for a line-feed flood's runs (ft-wd6cy), whose
+/// lines all print under it: [`set_ascii_run`] classified it for every run.
+/// Only a pen whose style is inline and that carries no images and no
+/// protection has one; the others take [`set_ascii_run`].
+pub struct FloodPen {
+    inline: super::cell::InlineStyle,
+    semantic: SemanticType,
+    wrapped: bool,
+    hyperlink: Option<std::sync::Arc<frankenterm_cell::Hyperlink>>,
+    default_blank: bool,
+}
+
+impl FloodPen {
+    pub fn new(attr: &CellAttributes) -> Option<Self> {
+        if attr.has_image_attachments() || attr.protected() {
+            return None;
+        }
+        let StyleClass::Inline(inline) = classify(attr) else {
+            return None;
+        };
+        Some(Self {
+            inline,
+            semantic: attr.semantic_type(),
+            wrapped: attr.wrapped(),
+            hyperlink: attr.hyperlink().cloned(),
+            default_blank: *attr == CellAttributes::blank(),
+        })
+    }
+}
+
+/// [`set_ascii_run`]'s common case under a [`FloodPen`]: the run appends at
+/// or past the end of `row`, a vector row, or a clustered one whose last
+/// character lets it, exactly as [`set_ascii_run`] appends it. Returns
+/// false, writing nothing, wherever [`set_ascii_run`] would decide
+/// otherwise; the caller then takes it.
+pub fn append_ascii_run(
+    page: &mut Page,
+    row: u32,
+    x: usize,
+    text: &[u8],
+    pen: &FloodPen,
+    seqno: SequenceNo,
+) -> bool {
+    let Some(&first) = text.first() else {
+        return false;
+    };
+    if !fits(page, x, text.len()) {
+        return false;
+    }
+    let len = page.row_len(row);
+    let appends = x >= len
+        && (!is_clustered(page, row)
+            || (clustered_can_append(page, row, x, char::from(first))
+                && !(x > len && pen.default_blank && text.iter().all(|&byte| byte == b' '))));
+    if !appends {
+        return false;
+    }
+    let mut write = CellWrite::new(Glyph::Blank, StyleSpec::Inline(pen.inline));
+    write.semantic = pen.semantic;
+    write.wrapped = pen.wrapped;
+    write.hyperlink = pen.hyperlink.as_ref();
+    page.append_ascii(row, x, text, write, seqno)
+}
+
 /// [`set_ascii_run`]'s fallback, each byte as `set_cell` writes it, out of
 /// line: inline, it made the frame of every bulk run.
 #[inline(never)]

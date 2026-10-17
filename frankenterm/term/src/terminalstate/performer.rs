@@ -1517,10 +1517,19 @@ impl<'a> Performer<'a> {
             return 0;
         }
         let bidi_mode = self.get_bidi_mode();
+        let plan = {
+            let state = &*self.state;
+            state
+                .screen
+                .flood_scroll_plan(&state.top_and_bottom_margins, &state.left_and_right_margins)
+        };
+        // Nothing in a flood changes the pen: classify it once, when the
+        // first line that fits its row needs it, not per line.
+        let mut flood_pen = None;
         // `bytes[at]` is the next line feed.
         let mut at = 0;
         loop {
-            self.flood_line_feed(&bidi_mode);
+            self.flood_line_feed(&bidi_mode, plan.as_ref());
             at += 1;
             // One scan finds the line's end and checks it is plain: its
             // first byte that is not printable ASCII must be a line feed.
@@ -1533,7 +1542,9 @@ impl<'a> Performer<'a> {
             if rest.get(line) != Some(&b'\n') {
                 break;
             }
-            if line > 0 {
+            if line > 0 && !self.flood_write(&rest[..line], &mut flood_pen, bottom) {
+                // Only the general path needs the line as `str` (checking it
+                // for every line was 7% of a `seq` flood).
                 let Ok(text) = std::str::from_utf8(&rest[..line]) else {
                     break;
                 };
@@ -1548,11 +1559,60 @@ impl<'a> Performer<'a> {
         at
     }
 
+    /// `write_ascii_run` for a flood line that fits the rest of the bottom
+    /// row (ft-wd6cy): the run appended under the flood's pen, with the
+    /// cursor and pending wrap `write_ascii_run` leaves. What that also
+    /// records (the printed cell, the junction) the line feed after every
+    /// flood line clears. Returns false, having written nothing, otherwise.
+    /// `pen` is the flood's, classified at its first use (`None` until
+    /// then, `Some(None)` for a pen that must take the per-run path).
+    #[inline]
+    fn flood_write(
+        &mut self,
+        text: &[u8],
+        pen: &mut Option<Option<crate::pagegrid::native::FloodPen>>,
+        bottom: VisibleRowIndex,
+    ) -> bool {
+        let x = self.cursor.x;
+        let right_margin = self.left_and_right_margins.end;
+        if self.wrap_next || text.len() > right_margin.saturating_sub(x) {
+            return false;
+        }
+        let Some(pen) =
+            pen.get_or_insert_with(|| crate::pagegrid::native::FloodPen::new(&self.pen))
+        else {
+            return false;
+        };
+        let seqno = self.seqno;
+        if !self
+            .state
+            .screen
+            .flood_ascii_cell_run(x, bottom, text, pen, seqno)
+        {
+            return false;
+        }
+        let next_x = x + text.len();
+        if next_x < right_margin {
+            self.cursor.x = next_x;
+            self.wrap_next = false;
+        } else {
+            // It ends on the right margin: a wrap pends, or without autowrap
+            // the cursor stays on that column.
+            self.cursor.x = next_x - 1;
+            self.wrap_next = self.dec_auto_wrap;
+        }
+        true
+    }
+
     /// `control(LineFeed)` within a line-feed flood: on the bottom row of a
     /// full-screen region, without newline or origin mode, the line feed
     /// scrolls and the cursor keeps its row and column.
     #[inline]
-    fn flood_line_feed(&mut self, bidi_mode: &crate::config::BidiMode) {
+    fn flood_line_feed(
+        &mut self,
+        bidi_mode: &crate::config::BidiMode,
+        plan: Option<&crate::screen::FloodScroll>,
+    ) {
         self.flush_print();
         if !self.left_and_right_margins.contains(&self.cursor.x) {
             Performer::control(self, ControlCode::LineFeed);
@@ -1560,15 +1620,9 @@ impl<'a> Performer<'a> {
             return;
         }
         let seqno = self.seqno;
-        let scrolled = {
-            let state = &mut *self.state;
-            state.screen.scroll_up_line(
-                &state.top_and_bottom_margins,
-                &state.left_and_right_margins,
-                seqno,
-                bidi_mode,
-            )
-        };
+        // `scroll_up`'s page-engine path, its checks made once for the flood.
+        let scrolled =
+            plan.is_some_and(|plan| self.state.screen.flood_scroll_line(plan, seqno, bidi_mode));
         if !scrolled {
             self.scroll_up(1);
         }

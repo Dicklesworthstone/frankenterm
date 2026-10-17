@@ -4117,6 +4117,13 @@ fn cold_geometry_capture_enabled() -> bool {
     })
 }
 
+/// What a line-feed flood's scrolls share, from
+/// [`Screen::flood_scroll_plan`] (ft-wd6cy).
+pub(crate) struct FloodScroll {
+    max_allowed: usize,
+    compress: bool,
+}
+
 pub(crate) fn scrollback_compression_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -9750,6 +9757,30 @@ impl Screen {
         self.set_ascii_cell_run_in_line(line_idx, x, text, attr, seqno);
     }
 
+    /// [`Self::set_ascii_cell_run`] for a line-feed flood's run (ft-wd6cy),
+    /// its pen classified once for the flood: what that writes, where the
+    /// run appends to a page-engine row. Returns false, having written
+    /// nothing, wherever [`Self::set_ascii_cell_run`] must decide.
+    pub(crate) fn flood_ascii_cell_run(
+        &mut self,
+        x: usize,
+        y: VisibleRowIndex,
+        text: &[u8],
+        pen: &native::FloodPen,
+        seqno: SequenceNo,
+    ) -> bool {
+        debug_assert!(text.iter().all(|byte| matches!(byte, 0x20..=0x7e)));
+        let line_idx = self.phys_row(y);
+        let Some((page, row)) = self.page_row(line_idx) else {
+            return false;
+        };
+        if !native::append_ascii_run(page, row, x, text, pen, seqno) {
+            return false;
+        }
+        self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
+        true
+    }
+
     /// [`Self::set_ascii_cell_run`] on a legacy `Line`, out of line: inline,
     /// it made the frame of every page-engine run.
     #[inline(never)]
@@ -9968,6 +9999,21 @@ impl Screen {
         seqno: SequenceNo,
         bidi_mode: &BidiMode,
     ) -> bool {
+        match self.flood_scroll_plan(scroll_region, left_and_right_margins) {
+            Some(plan) => self.flood_scroll_line(&plan, seqno, bidi_mode),
+            None => false,
+        }
+    }
+
+    /// What [`Self::scroll_up_line`] checks and derives before it scrolls,
+    /// for a line-feed flood to do once (ft-wd6cy): nothing in a flood
+    /// changes the margins, the screen or the scrollback policy. `None`
+    /// where [`Self::scroll_up_line`] declines.
+    pub(crate) fn flood_scroll_plan(
+        &self,
+        scroll_region: &Range<VisibleRowIndex>,
+        left_and_right_margins: &Range<usize>,
+    ) -> Option<FloodScroll> {
         if self.lines.page().is_none()
             || self.physical_rows == 0
             || scroll_region.start != 0
@@ -9978,9 +10024,23 @@ impl Screen {
             || self.recovery_scrollback.is_some()
             || self.scrollback_policy.tier.enabled
         {
-            return false;
+            return None;
         }
-        self.page_scroll_up_line(seqno, None, bidi_mode)
+        Some(FloodScroll {
+            max_allowed: self.physical_rows + self.hot_scrollback_size(),
+            compress: scrollback_compression_enabled(),
+        })
+    }
+
+    /// [`Self::scroll_up_line`] under a plan [`Self::flood_scroll_plan`]
+    /// made for this screen as it still is.
+    pub(crate) fn flood_scroll_line(
+        &mut self,
+        plan: &FloodScroll,
+        seqno: SequenceNo,
+        bidi_mode: &BidiMode,
+    ) -> bool {
+        self.page_scroll_up_line_within(seqno, None, bidi_mode, plan.max_allowed, plan.compress)
     }
 
     pub fn scroll_up_within_margins(
@@ -10530,12 +10590,32 @@ impl Screen {
         bidi_mode: &BidiMode,
     ) -> bool {
         let max_allowed = self.physical_rows + self.hot_scrollback_size();
+        self.page_scroll_up_line_within(
+            seqno,
+            custom_blank,
+            bidi_mode,
+            max_allowed,
+            scrollback_compression_enabled(),
+        )
+    }
+
+    /// [`Self::page_scroll_up_line`] with the rows the screen keeps
+    /// (`max_allowed`) and whether rows entering scrollback are compressed
+    /// given, as a line-feed flood derives them once (ft-wd6cy).
+    fn page_scroll_up_line_within(
+        &mut self,
+        seqno: SequenceNo,
+        custom_blank: Option<&CellAttributes>,
+        bidi_mode: &BidiMode,
+        max_allowed: usize,
+        compress: bool,
+    ) -> bool {
         let lines_removed = (self.lines.len() + 1).saturating_sub(max_allowed);
         if lines_removed > self.lines.len() {
             return false;
         }
         self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
-        if scrollback_compression_enabled() {
+        if compress {
             for index in self.phys_range(&(0..1)) {
                 self.page_compress_for_scrollback(index);
             }
