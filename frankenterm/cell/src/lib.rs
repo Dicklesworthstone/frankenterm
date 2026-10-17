@@ -65,7 +65,7 @@ impl Into<ColorAttribute> for SmallColor {
 /// The setter methods return a mutable self reference so that they can
 /// be chained together.
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq)]
 pub struct CellAttributes {
     attributes: u32,
     /// The foreground color
@@ -76,6 +76,29 @@ pub struct CellAttributes {
     /// allocated struct in order to keep CellAttributes
     /// smaller in the common case.
     fat: Option<Box<FatAttributes>>,
+}
+
+/// Field for field what `derive(PartialEq)` compares, with the rare deep
+/// comparison of two fat attribute sets kept out of line. The derived body
+/// carried that comparison inline, which kept this comparison (on every
+/// scroll and every appended cell run) a call.
+impl PartialEq for CellAttributes {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.attributes == other.attributes
+            && self.foreground == other.foreground
+            && self.background == other.background
+            && match (&self.fat, &other.fat) {
+                (None, None) => true,
+                (Some(left), Some(right)) => fat_attributes_eq(left, right),
+                _ => false,
+            }
+    }
+}
+
+#[inline(never)]
+fn fat_attributes_eq(left: &FatAttributes, right: &FatAttributes) -> bool {
+    left == right
 }
 
 impl core::fmt::Debug for CellAttributes {
