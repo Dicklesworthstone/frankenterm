@@ -1143,20 +1143,21 @@ impl Page {
             return false;
         }
         let kept = end.min(old_len);
-        // The cells the run overwrites, read as one slice so that both
-        // checks vectorize.
+        // The cells the run overwrites, folded into one word: every check
+        // below tests one flag bit, which their OR has exactly when some
+        // cell does. Unlike `any`, the fold has no early exit, so it
+        // vectorizes; two `any` passes were a third of a repaint's overwrite.
         let first = self.cell_index(slot, x);
-        let overwritten = &self.buf[first..first + (kept - x)];
-        if overwritten.iter().any(|&bits| {
-            let old = PackedCell::from_bits(bits);
-            old.is_wide() || old.is_hidden() || old.has_image()
-        }) {
+        let overwritten = PackedCell::from_bits(
+            self.buf[first..first + (kept - x)]
+                .iter()
+                .fold(0, |any, &bits| any | bits),
+        );
+        if overwritten.is_wide() || overwritten.is_hidden() || overwritten.has_image() {
             return false;
         }
         // Releasing a cell with no side entries does nothing.
-        let releases = overwritten
-            .iter()
-            .any(|&bits| PackedCell::from_bits(bits).has_side_entries());
+        let releases = overwritten.has_side_entries();
         cell.glyph = Glyph::Blank;
         cell.wide = false;
         // Acquire before release (D3).
