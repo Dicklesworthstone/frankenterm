@@ -120,9 +120,11 @@ publish_family() {  # <src dir> -> echoes installed dir; immutable once publishe
   if [ -d "$dest" ]; then
     log "family $tag already published"
   else
-    mkdir -p "$BASE/families" || die "cannot create $BASE/families"
-    cp -R "$src" "$dest.partial.$$" || die "copying $src failed"
+    # Only the three binaries: a family dir may be a whole cargo target dir
+    # (gigabytes of build output) or an app bundle's MacOS dir.
+    mkdir -p "$dest.partial.$$" || die "cannot create $dest.partial.$$"
     for b in frankenterm-mux-server frankenterm-pty-guardian ft; do
+      cp -p "$src/$b" "$dest.partial.$$/$b" || die "copying $src/$b failed"
       chmod 0755 "$dest.partial.$$/$b" || die "cannot mark $b executable"
     done
     same_family "$src" "$dest.partial.$$" || die "the copy of $src does not match it"
