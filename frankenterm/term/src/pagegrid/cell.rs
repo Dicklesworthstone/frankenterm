@@ -126,6 +126,11 @@ pub enum StyleClass {
 /// and side maps.
 pub fn classify(attrs: &CellAttributes) -> StyleClass {
     let bits = encode_attrs(attrs);
+    // Without fat attributes the colors are default or palette ones and the
+    // underline color is the default: the codes come straight off them.
+    if let Some((fg, bg)) = attrs.inline_color_codes() {
+        return StyleClass::Inline(InlineStyle::new(bits, fg, bg));
+    }
     let underline_color = attrs.underline_color();
     match (
         encode_color(attrs.foreground()),

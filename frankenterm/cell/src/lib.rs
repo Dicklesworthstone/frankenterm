@@ -740,6 +740,23 @@ impl CellAttributes {
         }
     }
 
+    /// The foreground and background as a packed page cell's palette codes
+    /// (0 for the default color, else the palette index plus one), when no
+    /// fat attributes are set: both colors are then default or palette
+    /// colors and the underline color is the default, so the style fits
+    /// inline. `None` otherwise.
+    #[inline]
+    pub fn inline_color_codes(&self) -> Option<(u16, u16)> {
+        if self.fat.is_some() {
+            return None;
+        }
+        let code = |color: SmallColor| match color {
+            SmallColor::Default => 0,
+            SmallColor::PaletteIndex(index) => u16::from(index) + 1,
+        };
+        Some((code(self.foreground), code(self.background)))
+    }
+
     /// The style attributes a packed page cell keeps inline, in its order:
     /// intensity 2 bits, underline 3, blink 2, italic, reverse,
     /// strikethrough, invisible, overline, vertical align 2. That is every
@@ -2547,6 +2564,46 @@ mod test {
         assert!(!cloned.protected());
         assert!(cloned.reverse());
         assert_eq!(cloned.background(), ColorAttribute::PaletteIndex(4));
+    }
+
+    #[test]
+    fn inline_color_codes_are_the_palette_codes_of_small_colors() {
+        let code = |color: ColorAttribute| match color {
+            ColorAttribute::Default => Some(0),
+            ColorAttribute::PaletteIndex(index) => Some(u16::from(index) + 1),
+            _ => None,
+        };
+        let colors = [
+            ColorAttribute::Default,
+            ColorAttribute::PaletteIndex(0),
+            ColorAttribute::PaletteIndex(255),
+            ColorAttribute::TrueColorWithDefaultFallback(SrgbaTuple(0.5, 0.25, 0.0, 1.0)),
+        ];
+        for fg in colors {
+            for bg in colors {
+                for underline in [ColorAttribute::Default, ColorAttribute::PaletteIndex(3)] {
+                    let mut a = CellAttributes::blank();
+                    a.set_foreground(fg)
+                        .set_background(bg)
+                        .set_underline_color(underline);
+                    let colors = (code(a.foreground()), code(a.background()));
+                    let expected = match (colors, a.underline_color()) {
+                        ((Some(fg), Some(bg)), ColorAttribute::Default) => Some((fg, bg)),
+                        _ => None,
+                    };
+                    assert_eq!(
+                        a.inline_color_codes(),
+                        expected,
+                        "{fg:?} {bg:?} {underline:?}"
+                    );
+                }
+            }
+        }
+        // A hyperlink takes fat attributes: the general classification
+        // handles that pen.
+        let mut linked = CellAttributes::blank();
+        linked.set_hyperlink(Some(Arc::new(Hyperlink::new("https://example.com"))));
+        assert_eq!(linked.inline_color_codes(), None);
     }
 
     #[test]
