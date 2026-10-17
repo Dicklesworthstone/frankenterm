@@ -1383,26 +1383,6 @@ impl CheckpointRun {
         Ok(())
     }
 
-    /// Whether the run ends in a one-column blank (" ").
-    fn ends_in_single_blank(&self) -> bool {
-        self.text.ends_with(' ')
-            && self
-                .clusters
-                .as_ref()
-                .is_none_or(|clusters| clusters.last() == Some(&(1, 1)))
-    }
-
-    /// Drop the last cell, a one-column blank (see `ends_in_single_blank`).
-    fn pop_single_blank(&mut self) {
-        self.text.pop();
-        if let Some(clusters) = self.clusters.as_mut() {
-            clusters.pop();
-            if clusters.iter().all(|cluster| *cluster == (1, 1)) {
-                self.clusters = None;
-            }
-        }
-    }
-
     /// The columns its cells cover.
     fn columns(&self) -> usize {
         match &self.clusters {
@@ -1584,18 +1564,46 @@ impl CheckpointLine {
         Ok(cells)
     }
 
+    /// How many of the line's leading cells `capture_cells` keeps: all but
+    /// its trailing default blanks (one-column " " whose attributes capture
+    /// as the blank's).
+    fn kept_cells(line: &Line) -> Result<usize, TerminalCheckpointError> {
+        let live_blank = CellAttributes::blank();
+        let mut blank = None;
+        let mut kept = 0;
+        for (index, cell) in line.visible_cells().enumerate() {
+            let default_blank = cell.width() == 1 && cell.str() == " " && {
+                let attributes = cell.attrs();
+                *attributes == live_blank || {
+                    if blank.is_none() {
+                        blank = Some(CheckpointCellAttributes::capture(&live_blank)?);
+                    }
+                    Some(CheckpointCellAttributes::capture(attributes)?) == blank
+                }
+            };
+            if !default_blank {
+                kept = index + 1;
+            }
+        }
+        Ok(kept)
+    }
+
     /// The cells `capture_cells` keeps, as runs. A run ends where the
     /// attributes change; attributes that compare unequal live but capture
     /// equal continue it, so neighbouring runs name different entries unless
-    /// the first closed at `CHECKPOINT_RUN_TEXT_BYTES`.
+    /// the first closed at `CHECKPOINT_RUN_TEXT_BYTES`. Only kept cells are
+    /// interned, so a screen's table holds exactly the attributes its runs
+    /// name, in the order they first name them: a restored screen's table is
+    /// the same.
     fn capture_runs(
         line: &Line,
         table: &mut CheckpointAttributeTable,
     ) -> Result<Vec<CheckpointRun>, TerminalCheckpointError> {
+        let kept = Self::kept_cells(line)?;
         let mut runs: Vec<CheckpointRun> = Vec::new();
         let mut previous: Option<&CellAttributes> = None;
         let mut entry = 0u32;
-        for cell in line.visible_cells() {
+        for cell in line.visible_cells().take(kept) {
             let width = checkpoint_cell_width(cell.width())?;
             let (text, attributes) = match cell {
                 CellRef::CellRef { cell, .. } => (cell.str(), cell.attrs()),
@@ -1619,21 +1627,6 @@ impl CheckpointLine {
             }
             if let Some(run) = runs.last_mut() {
                 run.push_cell(text, width)?;
-            }
-        }
-        // Trailing default blanks, as in `capture_cells`.
-        if runs.last().is_some_and(CheckpointRun::ends_in_single_blank) {
-            let blank = CheckpointCellAttributes::capture(&CellAttributes::blank())?;
-            while let Some(run) = runs.last_mut() {
-                if !run.ends_in_single_blank()
-                    || table.entries.get(run.attributes as usize) != Some(&blank)
-                {
-                    break;
-                }
-                run.pop_single_blank();
-                if run.text.is_empty() {
-                    runs.pop();
-                }
             }
         }
         Ok(runs)
@@ -2839,6 +2832,45 @@ impl CheckpointScreen {
                 .map(CheckpointSavedCursor::capture)
                 .transpose()?,
         })
+    }
+
+    /// Keep only the attribute table entries its runs still name, renumbered
+    /// in the order they first name them, as a capture of these lines builds
+    /// it (after dropped lines took the only runs naming some entries).
+    fn compact_attribute_table(&mut self) -> Result<(), TerminalCheckpointError> {
+        let Some(entries) = self.attributes.take() else {
+            return Ok(());
+        };
+        let mut entries: Vec<Option<CheckpointCellAttributes>> =
+            entries.into_iter().map(Some).collect();
+        let mut renumbered = vec![None; entries.len()];
+        let mut compacted = Vec::new();
+        for run in self
+            .lines
+            .iter_mut()
+            .filter_map(|line| line.runs.as_mut())
+            .flatten()
+        {
+            let old = run.attributes as usize;
+            let new = match renumbered.get(old).copied().flatten() {
+                Some(new) => new,
+                None => {
+                    let entry = entries
+                        .get_mut(old)
+                        .and_then(Option::take)
+                        .ok_or_else(line_encoding_mismatch)?;
+                    let new = u32::try_from(compacted.len()).map_err(|_| {
+                        TerminalCheckpointError::ArithmeticOverflow("screen.attributes")
+                    })?;
+                    compacted.push(entry);
+                    renumbered[old] = Some(new);
+                    new
+                }
+            };
+            run.attributes = new;
+        }
+        self.attributes = Some(compacted);
+        Ok(())
     }
 
     /// The text and attributes of the `col`th stored cell of line `row`.
@@ -5090,6 +5122,7 @@ impl TerminalCheckpointV3 {
             return Ok(());
         }
         self.primary_screen.lines.drain(..dropped);
+        self.primary_screen.compact_attribute_table()?;
         let dropped = u64::try_from(dropped)
             .map_err(|_| TerminalCheckpointError::ArithmeticOverflow("screen.dropped_history"))?;
         self.primary_screen.stable_row_index_offset = self
@@ -7051,6 +7084,13 @@ mod tests {
         rich.advance_bytes(MIXED_CELLS.as_bytes());
         assert_both_encodings_restore_alike(&rich, rich_config);
         assert_both_encodings_restore_alike(&terminal(), plain_config);
+
+        // The trailing blanks of a full-width row are not stored; interning
+        // their attributes anyway put the default ahead of red in the table
+        // of a capture but not of its restored terminal's.
+        let mut blanks = terminal();
+        blanks.advance_bytes(b"\r\n\x1b[31ma\x1b[0m\r\n  \r\n");
+        assert_both_encodings_restore_alike(&blanks, plain_config);
     }
 
     /// The payload a pane of short log lines makes: runs carry each line's
@@ -7110,6 +7150,39 @@ mod tests {
         assert_eq!(TerminalCheckpointV3::canonical_payload_version(b"{}"), None);
     }
 
+    /// History dropped to fit a budget takes the attributes only it used out
+    /// of the table, which stays what a capture of the remaining lines builds.
+    #[test]
+    fn dropped_history_takes_its_attributes_out_of_the_table() {
+        let mut live = terminal();
+        for line in 0..40 {
+            let color = if line < 10 { "\x1b[31m" } else { "" };
+            live.advance_bytes(format!("{}line {}\x1b[0m\r\n", color, line).as_bytes());
+        }
+        let limits = runs_limits();
+        let mut checkpoint = TerminalCheckpointV3::capture_with_limits(&live, limits).unwrap();
+        let table = |checkpoint: &TerminalCheckpointV3| {
+            checkpoint.primary_screen.attributes.clone().unwrap()
+        };
+        let default = CheckpointCellAttributes::capture(&CellAttributes::blank()).unwrap();
+        assert_eq!(table(&checkpoint).len(), 2);
+        assert_eq!(table(&checkpoint)[1], default);
+
+        checkpoint.primary_screen.lines.drain(..12);
+        checkpoint.primary_screen.compact_attribute_table().unwrap();
+        assert_eq!(table(&checkpoint), vec![default]);
+        let payload = checkpoint.to_canonical_json(limits).unwrap();
+        let again = TerminalCheckpointV3::decode_canonical_json(&payload, limits)
+            .unwrap()
+            .restore_inert(plain_config())
+            .unwrap()
+            .checkpoint()
+            .unwrap()
+            .to_canonical_json(limits)
+            .unwrap();
+        assert_eq!(again, payload);
+    }
+
     fn run_of(checkpoint: &mut TerminalCheckpointV3, line: usize) -> &mut CheckpointRun {
         &mut checkpoint.primary_screen.lines[line]
             .runs
@@ -7131,7 +7204,8 @@ mod tests {
             .as_ref()
             .map_or(0, Vec::len);
 
-        let cases: Vec<(&str, Box<dyn Fn(&mut TerminalCheckpointV3)>)> = vec![
+        type Damage = Box<dyn Fn(&mut TerminalCheckpointV3)>;
+        let cases: Vec<(&str, Damage)> = vec![
             (
                 "run.attributes",
                 Box::new(move |c| run_of(c, 0).attributes = table_len as u32),

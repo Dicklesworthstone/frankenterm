@@ -6353,6 +6353,61 @@ mod tests {
         client.join().unwrap();
     }
 
+    /// A guardian of this release admits a Hello requiring compact
+    /// checkpoints exactly when it admits this build's sealed Hello (an
+    /// unsealed development build gets neither), and the probe leaves it
+    /// serving ordinary connections.
+    #[test]
+    fn compact_checkpoint_probe_follows_the_sealed_hello() {
+        struct StopOnDrop<'a>(&'a AtomicBool);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let directory = tempfile::Builder::new()
+            .prefix("ft-compact-probe-")
+            .tempdir_in(crate::canonical_test_temp_root())
+            .unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let token = directory.path().join("token");
+        let socket = directory.path().join("guardian.sock");
+        provision_guardian_token(&token).unwrap();
+        let config = GuardianServiceConfig::new(
+            socket.clone(),
+            token.clone(),
+            8,
+            1,
+            65_536,
+            65_536,
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let stop_guard = StopOnDrop(&stop);
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+            let worker_stop = &stop;
+            let worker = scope.spawn(move || {
+                let mut service = GuardianService::bind(config).unwrap();
+                ready_tx.send(()).unwrap();
+                service.run_until(worker_stop).unwrap();
+                assert_eq!(service.runtime.pane_count(), 0);
+            });
+            ready_rx.recv_timeout(CLIENT_IO_TIMEOUT).unwrap();
+            let compact = GuardianClient::admits_compact_checkpoints(&socket, &token);
+            let sealed = GuardianClient::connect_for_genesis(&socket, &token, Uuid::new_v4());
+            assert_eq!(compact, sealed.is_ok());
+            drop(sealed);
+            GuardianClient::connect(&socket, &token, Uuid::new_v4())
+                .expect("the guardian still serves an ordinary connection");
+            drop(stop_guard);
+            worker.join().unwrap();
+        });
+    }
+
     #[test]
     fn genesis_staging_real_service_preserves_owner_and_reconnect_progress() {
         use mux::guardian_protocol::GuardianCheckpointDescriptorV1;
