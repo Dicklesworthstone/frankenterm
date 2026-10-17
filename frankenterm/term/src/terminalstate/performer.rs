@@ -34,6 +34,7 @@ use url::Url;
 
 const MOONSHOT_RECOMMENDED_ENV: &str = "FT_MOONSHOT_RECOMMENDED";
 const BULK_ASCII_ROW_WRITE_ENV: &str = "FT_MOONSHOT_TERM_BULK_ASCII_ROW_WRITE";
+const LINE_FEED_FLOOD_ENV: &str = "FT_LINE_FEED_FLOOD";
 
 impl TerminalState {
     /// Bytes retained by an unfinished legacy tmux title sequence.
@@ -461,6 +462,14 @@ fn moonshot_recommended_enabled() -> bool {
     !moonshot_env_falsey(MOONSHOT_RECOMMENDED_ENV)
 }
 
+/// Whether a new terminal takes line-feed floods on the batched path
+/// (ft-wd6cy) unless `FT_LINE_FEED_FLOOD` turns it off.
+pub(super) fn line_flood_default() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| !moonshot_env_falsey(LINE_FEED_FLOOD_ENV));
+    *ENABLED
+}
+
 impl<'a> Deref for Performer<'a> {
     type Target = TerminalState;
 
@@ -517,6 +526,17 @@ impl<'a> Handler for Performer<'a> {
         {
             self.print_string(run);
         }
+    }
+
+    /// What `control` and `print_ascii_run` do for a line-feed flood
+    /// (ft-wd6cy): see [`Performer::line_flood`].
+    #[inline]
+    fn line_feed_flood(
+        &mut self,
+        bytes: &[u8],
+        scan: frankenterm_escape_parser::parser::AsciiScan,
+    ) -> usize {
+        self.line_flood(bytes, scan)
     }
 
     /// What `perform` does for `Action::Control`, with no `Action` built
@@ -1457,6 +1477,107 @@ impl<'a> Performer<'a> {
         }
         self.ascii_junction = self.last_printed;
         true
+    }
+
+    /// [`Handler::line_feed_flood`] (ft-wd6cy): the line feed at `bytes[0]`
+    /// and the complete printable-ASCII lines after it, applied as `control`
+    /// and `write_ascii_run` apply them one at a time, without the per-line
+    /// dispatch. What those re-check for every line holds for the whole
+    /// flood once checked here: nothing in it changes a mode, the margins,
+    /// the charset or the pen. Returns the bytes taken, or 0 to decline,
+    /// having done no more than the flush `control` starts with.
+    #[inline(never)]
+    fn line_flood(
+        &mut self,
+        bytes: &[u8],
+        scan: frankenterm_escape_parser::parser::AsciiScan,
+    ) -> usize {
+        let rows = self.screen().physical_rows;
+        let cols = self.screen().physical_cols;
+        let bottom: VisibleRowIndex = super::usize_to_i64_saturating(rows) - 1;
+        if !self.line_flood
+            || rows == 0
+            || self.insert
+            || self.newline_mode
+            || self.dec_origin_mode
+            || self.state.enable_conpty_quirks
+            || self.accumulating_title.is_some()
+            || self.active_charset() != CharSet::Ascii
+            || !Self::bulk_ascii_row_write_enabled()
+            || self.left_and_right_margins != (0..cols)
+            || self.top_and_bottom_margins != (0..bottom + 1)
+            || !self.pen.sgr_only_is_blank()
+        {
+            return 0;
+        }
+        debug_assert_eq!(bytes.first(), Some(&b'\n'));
+        // What `control` does first.
+        self.flush_print();
+        if self.cursor.y != bottom {
+            return 0;
+        }
+        let bidi_mode = self.get_bidi_mode();
+        // `bytes[at]` is the next line feed.
+        let mut at = 0;
+        loop {
+            self.flood_line_feed(&bidi_mode);
+            at += 1;
+            // One scan finds the line's end and checks it is plain: its
+            // first byte that is not printable ASCII must be a line feed.
+            // The line after the flood is left for the parser, which may
+            // yet find it continues past `bytes`. (Validating the whole
+            // flood as UTF-8 once instead cost a second scan: 1% fewer
+            // instructions on `seq`, 1% more on long lines.)
+            let rest = &bytes[at..];
+            let line = scan.printable_len(rest);
+            if rest.get(line) != Some(&b'\n') {
+                break;
+            }
+            if line > 0 {
+                let Ok(text) = std::str::from_utf8(&rest[..line]) else {
+                    break;
+                };
+                if !self.write_ascii_run(text) {
+                    // Unreachable under the checks above; the next line
+                    // feed flushes it as it would have.
+                    self.print_string(text);
+                }
+            }
+            at += line;
+        }
+        at
+    }
+
+    /// `control(LineFeed)` within a line-feed flood: on the bottom row of a
+    /// full-screen region, without newline or origin mode, the line feed
+    /// scrolls and the cursor keeps its row and column.
+    #[inline]
+    fn flood_line_feed(&mut self, bidi_mode: &crate::config::BidiMode) {
+        self.flush_print();
+        if !self.left_and_right_margins.contains(&self.cursor.x) {
+            Performer::control(self, ControlCode::LineFeed);
+            self.last_printed = None;
+            return;
+        }
+        let seqno = self.seqno;
+        let scrolled = {
+            let state = &mut *self.state;
+            state.screen.scroll_up_line(
+                &state.top_and_bottom_margins,
+                &state.left_and_right_margins,
+                seqno,
+                bidi_mode,
+            )
+        };
+        if !scrolled {
+            self.scroll_up(1);
+        }
+        // `new_line`'s cursor move, within the bottom row.
+        let cols = self.screen().physical_cols;
+        self.cursor.x = self.cursor.x.min(cols.saturating_sub(1));
+        self.cursor.seqno = seqno;
+        self.wrap_next = false;
+        self.last_printed = None;
     }
 
     /// The first grapheme flushed after `write_ascii_run` wrote a run
@@ -2715,6 +2836,17 @@ mod tests {
         }
     }
 
+    /// Serializes the tests that switch the process-wide print paths below:
+    /// run at once, one read the other's switches (the cluster-run test
+    /// then saw no cluster-run append at all). Taken once per render, since
+    /// a render sets two switches and the lock is not reentrant.
+    fn test_switches() -> std::sync::MutexGuard<'static, ()> {
+        static SWITCHES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SWITCHES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     struct BulkAsciiRowWriteOverride;
 
     impl BulkAsciiRowWriteOverride {
@@ -2834,6 +2966,7 @@ mod tests {
     }
 
     fn run_gate_stream(bytes: &[u8], force_scalar: bool) -> GateRun {
+        let _switches = test_switches();
         let _scan_override = ScalarScanOverride::set(force_scalar);
         let mut parser = Parser::new();
         let actions = parser.parse_as_vec(bytes);
@@ -3406,6 +3539,7 @@ mod tests {
         actions: Vec<Action>,
         force_bulk: bool,
     ) -> TerminalSnapshot {
+        let _switches = test_switches();
         let _bulk_override = BulkAsciiRowWriteOverride::set(force_bulk);
         let _cluster_override = AsciiClusterRunAppendOverride::set(false);
         render_actions(actions)
@@ -3415,6 +3549,7 @@ mod tests {
         actions: Vec<Action>,
         force_bulk_append: bool,
     ) -> TerminalSnapshot {
+        let _switches = test_switches();
         let _bulk_override = BulkAsciiRowWriteOverride::set(true);
         let _cluster_override = AsciiClusterRunAppendOverride::set(force_bulk_append);
         render_actions(actions)
@@ -3514,10 +3649,16 @@ mod tests {
                 "ASCII cluster-run append diverged from per-cell materialization for {name}"
             );
         }
-        assert!(
-            total_cluster_hits > 0,
-            "ASCII cluster-run append was not exercised by the oracle corpus"
-        );
+        // Cluster-run append is the legacy `Line`'s: PageGrid rows store an
+        // ASCII run natively, so under FT_GRID_ENGINE=page the oracle corpus
+        // never reaches it. That lane only passed when another test's legacy
+        // append bumped the shared counter mid-render; alone it failed.
+        if make_terminal().screen().grid_engine() == crate::config::GridEngine::Legacy {
+            assert!(
+                total_cluster_hits > 0,
+                "ASCII cluster-run append was not exercised by the oracle corpus"
+            );
+        }
     }
 
     #[test]
@@ -3808,6 +3949,7 @@ mod tests {
 
     #[test]
     fn a_direct_ascii_run_joins_the_next_grapheme_across_an_ignored_sequence() {
+        let _switches = test_switches();
         let _bulk = BulkAsciiRowWriteOverride::set(true);
         let cases: &[(&[u8], &str)] = &[
             (b"\x1b[?7lcY691164;\x1b[,1_\xe2\x80\x8d", ";\u{200d}"),
@@ -3856,5 +3998,138 @@ mod tests {
                 cells
             );
         }
+    }
+
+    /// Pieces of a line-feed flood and of what interrupts or disables one
+    /// (ft-wd6cy): plain lines and line feeds most often, then what changes
+    /// a condition the flood checks once (margins, modes, charset, a pen
+    /// whose blank is colored), moves the cursor off the bottom row, or
+    /// ends a plain line early (UTF-8, a combining mark, a control).
+    fn line_flood_piece() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+        use proptest::prelude::*;
+        prop_oneof![
+            8 => proptest::collection::vec(0x20u8..=0x7e, 0..30),
+            8 => Just(b"\n".to_vec()),
+            2 => Just(b"\r\n".to_vec()),
+            1 => Just(b"\r".to_vec()),
+            1 => Just(b"\t".to_vec()),
+            1 => Just(b"\x08".to_vec()),
+            1 => Just(b"\x1b[31m".to_vec()),
+            1 => Just(b"\x1b[41m".to_vec()),
+            1 => Just(b"\x1b[0m".to_vec()),
+            1 => Just(b"\x1b[3;2H".to_vec()),
+            1 => Just(b"\x1b[99;1H".to_vec()),
+            1 => Just(b"\x1b[2;3r".to_vec()),
+            1 => Just(b"\x1b[r".to_vec()),
+            1 => Just(b"\x1b[?6h".to_vec()),
+            1 => Just(b"\x1b[?6l".to_vec()),
+            1 => Just(b"\x1b[4h".to_vec()),
+            1 => Just(b"\x1b[4l".to_vec()),
+            1 => Just(b"\x1b[20h".to_vec()),
+            1 => Just(b"\x1b[20l".to_vec()),
+            1 => Just(b"\x1b[?7l".to_vec()),
+            1 => Just(b"\x1b[?7h".to_vec()),
+            1 => Just(b"\x1b(0".to_vec()),
+            1 => Just(b"\x1b(B".to_vec()),
+            1 => Just(b"\x1b[?69h\x1b[2;4s".to_vec()),
+            1 => Just(b"\x1b[?69l".to_vec()),
+            1 => Just("\u{e9}".as_bytes().to_vec()),
+            1 => Just("\u{301}".as_bytes().to_vec()),
+            1 => Just("\u{1f680}".as_bytes().to_vec()),
+            1 => Just(b"\x1b]0;title\x07".to_vec()),
+        ]
+    }
+
+    struct NoLineFeedDivert;
+
+    impl crate::terminal::FeedGate for NoLineFeedDivert {
+        fn diverts(&mut self, _action: &Action) -> bool {
+            false
+        }
+    }
+
+    fn line_flood_terminal(rows: usize, cols: usize, flood: bool) -> Terminal {
+        let mut term = Terminal::new(
+            TerminalSize {
+                rows,
+                cols,
+                pixel_width: cols * 8,
+                pixel_height: rows * 16,
+                dpi: 96,
+            },
+            Arc::new(GateTermConfig),
+            "WezTerm",
+            "test",
+            Box::new(Vec::new()),
+        );
+        term.line_flood = flood;
+        term
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(512))]
+
+        /// ft-wd6cy: with line-feed floods on, every chunking of any mix of
+        /// plain lines, line feeds and what interrupts them leaves the
+        /// terminal exactly as the per-line path does: every row's cells,
+        /// attributes, wrap flag and sequence number (scrollback included),
+        /// and the cursor. One more character then shows the pending wrap
+        /// agrees too. The fused mux path (`feed`) agrees as well.
+        #[test]
+        fn line_floods_leave_what_the_per_line_path_leaves(
+            pieces in proptest::collection::vec(line_flood_piece(), 1..60),
+            rows in 1usize..6,
+            cols in 1usize..14,
+            cuts in proptest::collection::vec(1usize..40, 1..8),
+        ) {
+            let bytes: Vec<u8> = pieces.concat();
+            let mut per_line = line_flood_terminal(rows, cols, false);
+            let mut flood = line_flood_terminal(rows, cols, true);
+            let mut fed = line_flood_terminal(rows, cols, true);
+            let mut fed_parser = Parser::new();
+            let mut diverted = Vec::new();
+            let mut start = 0;
+            let mut cut = 0;
+            while start < bytes.len() {
+                let end = (start + cuts[cut % cuts.len()]).min(bytes.len());
+                cut += 1;
+                per_line.advance_bytes(&bytes[start..end]);
+                flood.advance_bytes(&bytes[start..end]);
+                fed.feed(&mut fed_parser, &bytes[start..end], &mut NoLineFeedDivert, &mut diverted);
+                start = end;
+            }
+            proptest::prop_assert!(diverted.is_empty());
+            let what = String::from_utf8_lossy(&bytes).to_string();
+            let expected = snapshot_terminal(&per_line);
+            proptest::prop_assert_eq!(&snapshot_terminal(&flood), &expected, "{:?}", what);
+            proptest::prop_assert_eq!(&snapshot_terminal(&fed), &expected, "{:?} fed", what);
+            for term in [&mut per_line, &mut flood, &mut fed] {
+                term.advance_bytes(b"Z");
+            }
+            let expected = snapshot_terminal(&per_line);
+            proptest::prop_assert_eq!(&snapshot_terminal(&flood), &expected, "{:?} + Z", what);
+            proptest::prop_assert_eq!(&snapshot_terminal(&fed), &expected, "{:?} fed + Z", what);
+        }
+    }
+
+    /// ft-wd6cy: a flood takes a run of plain lines in one call, stops
+    /// before a line it cannot take whole, and declines off the bottom row.
+    #[test]
+    fn a_line_feed_flood_takes_whole_plain_lines_on_the_bottom_row() {
+        use frankenterm_escape_parser::parser::AsciiScan;
+        let mut term = line_flood_terminal(3, 10, true);
+        let mut performer = Performer::new(&mut term);
+        // The cursor starts on the top row: declined.
+        assert_eq!(performer.line_flood(b"\nab\n", AsciiScan::DEFAULT), 0);
+        performer.cursor.y = 2;
+        // Two whole lines, then one that ends in UTF-8: up to its start.
+        let bytes = "\nab\n\ncd\u{e9}\n".as_bytes();
+        assert_eq!(performer.line_flood(bytes, AsciiScan::DEFAULT), 5);
+        // A line without its line feed stays for the parser.
+        assert_eq!(performer.line_flood(b"\nxyz", AsciiScan::DEFAULT), 1);
+        drop(performer);
+        term.line_flood = false;
+        let mut performer = Performer::new(&mut term);
+        assert_eq!(performer.line_flood(b"\nab\n", AsciiScan::DEFAULT), 0);
     }
 }

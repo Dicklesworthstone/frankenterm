@@ -556,6 +556,9 @@ pub struct TerminalState {
     print_char_table: print_segments::PrintCharTable,
 
     enable_conpty_quirks: bool,
+    /// Whether the parser's line-feed floods take the batched path
+    /// (ft-wd6cy); `FT_LINE_FEED_FLOOD=0` keeps every line on the per-line one.
+    line_flood: bool,
     /// On Windows, the ConPTY layer emits an OSC sequence to
     /// set the title shortly after it starts up.
     /// We don't want that, so we use this flag to remember
@@ -1139,6 +1142,7 @@ impl TerminalState {
             print_char_table: Default::default(),
             suppress_initial_title_change: false,
             enable_conpty_quirks: false,
+            line_flood: performer::line_flood_default(),
             accumulating_title: None,
             lost_focus_seqno: seqno,
             lost_focus_alerted_seqno: seqno,

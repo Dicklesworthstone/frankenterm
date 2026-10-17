@@ -91,6 +91,27 @@ impl<'s, 'f, G: FeedGate + ?Sized> Handler for FeedHandler<'s, 'f, G> {
         }
     }
 
+    /// A line-feed flood holds only printing, which never diverts, and line
+    /// feeds, which the gate is asked about once: a gate that diverts them
+    /// sees each one as an action instead.
+    #[inline]
+    fn line_feed_flood(
+        &mut self,
+        bytes: &[u8],
+        scan: frankenterm_escape_parser::parser::AsciiScan,
+    ) -> usize {
+        if self.diverting
+            || self.gate.diverts(&Action::Control(
+                frankenterm_escape_parser::ControlCode::LineFeed,
+            ))
+        {
+            return 0;
+        }
+        let taken = Handler::line_feed_flood(&mut self.performer, bytes, scan);
+        self.applied |= taken > 0;
+        taken
+    }
+
     /// Offers each setting to the gate in order, as `action` offers each
     /// action, and applies the run up to the first one it diverts.
     fn sgr(&mut self, sgrs: &[Sgr]) {

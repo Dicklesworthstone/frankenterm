@@ -5160,6 +5160,7 @@ impl TerminalState {
             zwj_tail_cell_possible: true,
             print_char_table: Default::default(),
             enable_conpty_quirks,
+            line_flood: super::performer::line_flood_default(),
             suppress_initial_title_change,
             accumulating_title,
             lost_focus_seqno: restored_lost_focus_seqno,

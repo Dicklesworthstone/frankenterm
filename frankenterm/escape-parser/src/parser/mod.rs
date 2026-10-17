@@ -406,6 +406,21 @@ pub trait Handler {
         self.action(Action::Control(code));
     }
 
+    /// A line-feed flood (ft-wd6cy): `bytes` starts with a ground-state line
+    /// feed. A handler may take it together with the complete lines after it,
+    /// each a run of printable ASCII (`0x20..=0x7e`, possibly empty) ending in
+    /// a line feed, exactly as [`Handler::control`]`(LineFeed)` for each line
+    /// feed and [`Handler::print_ascii_run`] (or [`Handler::print`] for one
+    /// byte) for each run would apply them. Returns how many bytes it took:
+    /// 0, the default, declines, and the parser goes on byte by byte;
+    /// otherwise a prefix of `bytes` ending in a line feed. A trailing line
+    /// without its line feed is never taken. `scan` is the parser's own
+    /// printable-ASCII scan, for finding where each line ends.
+    #[inline]
+    fn line_feed_flood(&mut self, _bytes: &[u8], _scan: AsciiScan) -> usize {
+        0
+    }
+
     /// [`Action::CSI`].
     #[inline]
     fn csi(&mut self, csi: CSI) {
@@ -1009,7 +1024,18 @@ impl Parser {
                     }
                 } else if csi_fast_path && byte < 0x20 {
                     // A C0 control other than ESC (taken above), such as
-                    // the line feed ending every line.
+                    // the line feed ending every line, which a handler may
+                    // take with the plain lines after it.
+                    if byte == b'\n' {
+                        let taken = handler.line_feed_flood(&bytes[i..], ascii_scan);
+                        debug_assert!(
+                            taken == 0 || (taken <= n - i && bytes[i + taken - 1] == b'\n')
+                        );
+                        if taken > 0 {
+                            i += taken;
+                            continue;
+                        }
+                    }
                     handler.control(crate::C0_CONTROL_CODES[usize::from(byte)]);
                     i += 1;
                     continue;
