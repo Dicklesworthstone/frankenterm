@@ -519,6 +519,16 @@ impl<'a> Handler for Performer<'a> {
         }
     }
 
+    /// What `perform` does for `Action::Control`, with no `Action` built
+    /// (ft-yccm0.3.2.6): the control runs, and since it may move the cursor
+    /// or scroll, `last_printed` is forgotten. `perform`'s other check only
+    /// concerns OSC. A `cat` flood hands over one LF per line.
+    #[inline]
+    fn control(&mut self, code: ControlCode) {
+        Performer::control(self, code);
+        self.last_printed = None;
+    }
+
     /// What `perform` does for each `Action::CSI(CSI::Sgr(_))`, with no
     /// `Action` built (ft-yccm0.3.2.4). Pending print is committed with the
     /// old pen, then every setting updates the pen. Flushing once covers the
@@ -1481,7 +1491,12 @@ impl<'a> Performer<'a> {
     /// To combat this, we pop_tmux_title_state when we're obviously moving
     /// to different escape sequence parsing states.
     /// <https://github.com/wezterm/wezterm/issues/2442>
+    #[inline]
     fn pop_tmux_title_state(&mut self) {
+        // Every control and SGR lands here; the slot is almost always empty.
+        if self.accumulating_title.is_none() {
+            return;
+        }
         if let Some(title) = self.accumulating_title.take() {
             log::debug!("ST never received for pending tmux title escape sequence: {title:?}");
         }
