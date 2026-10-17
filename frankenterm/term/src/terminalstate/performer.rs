@@ -980,12 +980,23 @@ impl<'a> Performer<'a> {
         }
     }
 
+    /// Every control and SGR flushes, mostly with nothing pending (a line
+    /// feed after a direct ASCII run): that check stays inline, out of the
+    /// flush's large frame.
+    #[inline]
     fn flush_print(&mut self) {
-        // Whatever flushes also ends a direct ASCII run's junction.
-        let mut junction = self.ascii_junction.take();
         if self.print.is_empty() {
+            // Whatever flushes also ends a direct ASCII run's junction.
+            self.ascii_junction = None;
             return;
         }
+        self.flush_pending_print();
+    }
+
+    #[inline(never)]
+    fn flush_pending_print(&mut self) {
+        // Whatever flushes also ends a direct ASCII run's junction.
+        let mut junction = self.ascii_junction.take();
 
         let seqno = self.seqno;
         let mut p = std::mem::take(&mut self.print);
