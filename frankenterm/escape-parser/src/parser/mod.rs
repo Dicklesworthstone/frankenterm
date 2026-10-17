@@ -964,11 +964,12 @@ impl Parser {
     /// across chunk boundaries (an incomplete trailing multibyte sequence is
     /// deferred to the scalar path, which correctly parks in `Utf8Sequence`).
     ///
-    /// With the CSI fast path on (ft-yccm0.3.2.4), two more ground-state
+    /// With the CSI fast path on (ft-yccm0.3.2.4), three more ground-state
     /// shapes skip the state machine, by the same invariant. A run of one
     /// codepoint prints as the `Action::Print` the machine would emit. A
     /// complete CSI sequence that [`Parser::ground_csi`] takes dispatches as
-    /// the machine would dispatch it, ending in Ground.
+    /// the machine would dispatch it, ending in Ground. A C0 control other
+    /// than ESC executes as the machine executes it, staying in Ground.
     fn parse_ground_batched<H: Handler + ?Sized>(&mut self, bytes: &[u8], handler: &mut H) {
         let csi_fast_path = self.csi_fast_path;
         let ascii_scan = self.ascii_scan;
@@ -1006,6 +1007,12 @@ impl Parser {
                         i += consumed;
                         continue;
                     }
+                } else if csi_fast_path && byte < 0x20 {
+                    // A C0 control other than ESC (taken above), such as
+                    // the line feed ending every line.
+                    handler.control(crate::C0_CONTROL_CODES[usize::from(byte)]);
+                    i += 1;
+                    continue;
                 }
             }
 
@@ -1026,7 +1033,8 @@ impl Parser {
                 if self.state_machine.is_ground() {
                     let byte = bytes[i];
                     let boundary = if csi_fast_path {
-                        byte == 0x1b || can_start_printable_run(byte)
+                        // ESC and the other C0 controls included.
+                        byte < 0x20 || can_start_printable_run(byte)
                     } else {
                         can_start_printable_run(byte)
                             && matches!(
@@ -1816,6 +1824,9 @@ impl<'a, H: Handler + ?Sized> VTActor for Performer<'a, H> {
     }
 
     fn execute_c0_or_c1(&mut self, byte: u8) {
+        if let Some(&code) = crate::C0_CONTROL_CODES.get(usize::from(byte)) {
+            return self.handler.control(code);
+        }
         match FromPrimitive::from_u8(byte) {
             Some(code) => self.handler.control(code),
             None => error!(
@@ -3203,6 +3214,47 @@ mod test {
             actions
         };
         for cut in (0..=stream.len()).step_by(7) {
+            assert_eq!(parse(true, cut), parse(false, cut), "cut at {}", cut);
+        }
+    }
+
+    /// ft-yccm0.3.2.6: the ground-state C0 shortcut leaves the action stream
+    /// the state machine gives, for every C0 byte between characters, after
+    /// a CSI, inside OSC, ESC and CSI sequences (which CAN and SUB abort),
+    /// after a cut-off UTF-8 lead, and twice in a row, at every cut of the
+    /// stream in two. The table it reads names each byte's own code.
+    #[test]
+    fn ground_c0_shortcut_leaves_the_action_stream_unchanged() {
+        for (byte, code) in crate::C0_CONTROL_CODES.iter().enumerate() {
+            assert_eq!(*code as usize, byte);
+            assert_eq!(ControlCode::from_u8(byte as u8), Some(*code));
+        }
+        // 0 in a shape stands for the C0 byte under test.
+        let shapes: [&[u8]; 7] = [
+            b"a\x00b",
+            b"\x1b[1m\x00",
+            b"\x1b]0;t\x00\x07",
+            b"\x1b\x00[m",
+            b"\x1b[3\x00m",
+            b"\xc3\x00",
+            b"\x00\x00",
+        ];
+        let mut stream = Vec::new();
+        for byte in 0..0x20u8 {
+            for shape in shapes {
+                stream.extend(shape.iter().map(|&b| if b == 0 { byte } else { b }));
+                stream.push(b'Z');
+            }
+        }
+        let parse = |shortcut: bool, cut: usize| {
+            let mut parser = Parser::new();
+            parser.set_print_batching(true);
+            parser.set_csi_fast_path(shortcut);
+            let mut actions = parser.parse_as_vec(&stream[..cut]);
+            actions.extend(parser.parse_as_vec(&stream[cut..]));
+            actions
+        };
+        for cut in (0..=stream.len()).step_by(5) {
             assert_eq!(parse(true, cut), parse(false, cut), "cut at {}", cut);
         }
     }

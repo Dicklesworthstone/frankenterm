@@ -585,6 +585,44 @@ pub enum ControlCode {
     APC = 0x9f,
 }
 
+/// The C0 control codes in byte order: entry `b` is the code of the byte
+/// `b`, by an index rather than the derived `FromPrimitive` conversion,
+/// which compares its way through the variants on every line feed.
+pub(crate) const C0_CONTROL_CODES: [ControlCode; 0x20] = [
+    ControlCode::Null,
+    ControlCode::StartOfHeading,
+    ControlCode::StartOfText,
+    ControlCode::EndOfText,
+    ControlCode::EndOfTransmission,
+    ControlCode::Enquiry,
+    ControlCode::Acknowledge,
+    ControlCode::Bell,
+    ControlCode::Backspace,
+    ControlCode::HorizontalTab,
+    ControlCode::LineFeed,
+    ControlCode::VerticalTab,
+    ControlCode::FormFeed,
+    ControlCode::CarriageReturn,
+    ControlCode::ShiftOut,
+    ControlCode::ShiftIn,
+    ControlCode::DataLinkEscape,
+    ControlCode::DeviceControlOne,
+    ControlCode::DeviceControlTwo,
+    ControlCode::DeviceControlThree,
+    ControlCode::DeviceControlFour,
+    ControlCode::NegativeAcknowledge,
+    ControlCode::SynchronousIdle,
+    ControlCode::EndOfTransmissionBlock,
+    ControlCode::Cancel,
+    ControlCode::EndOfMedium,
+    ControlCode::Substitute,
+    ControlCode::Escape,
+    ControlCode::FileSeparator,
+    ControlCode::GroupSeparator,
+    ControlCode::RecordSeparator,
+    ControlCode::UnitSeparator,
+];
+
 /// A helper type to avoid accidentally tripping over problems with
 /// 1-based values in escape sequences.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
