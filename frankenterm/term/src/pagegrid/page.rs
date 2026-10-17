@@ -1081,17 +1081,12 @@ impl Page {
             .with_semantic(cell.semantic)
             .with_wrapped(cell.wrapped)
             .with_hyperlink(cell.hyperlink.is_some());
-        for (offset, &byte) in bytes.iter().enumerate() {
-            let glyph = if byte == b' ' {
-                Glyph::Blank
-            } else {
-                Glyph::Char(char::from(byte))
-            };
-            if let Some(link) = cell.hyperlink {
+        self.store_ascii_cells(slot, x, bytes, template);
+        if let Some(link) = cell.hyperlink {
+            for offset in 0..bytes.len() {
                 let off = self.offset(slot, x + offset);
                 self.links.attach(off, link);
             }
-            self.set_cell_at(slot, x + offset, template.with_codepoint(glyph.codepoint()));
         }
         // Cells past the end were zero (I2), so the padding is already
         // default blanks and nothing stored is hidden. Only the first new
@@ -1165,22 +1160,20 @@ impl Page {
             .with_semantic(cell.semantic)
             .with_wrapped(cell.wrapped)
             .with_hyperlink(cell.hyperlink.is_some());
-        for (offset, &byte) in bytes.iter().enumerate() {
-            let col = x + offset;
-            let off = self.offset(slot, col);
-            if col < kept {
-                let old = self.cell_at(slot, col);
+        // Releasing a cell with no side entries does nothing.
+        for col in x..kept {
+            let old = self.cell_at(slot, col);
+            if old.has_side_entries() {
+                let off = self.offset(slot, col);
                 self.release(off, old, false);
             }
-            if let Some(link) = cell.hyperlink {
+        }
+        self.store_ascii_cells(slot, x, bytes, template);
+        if let Some(link) = cell.hyperlink {
+            for offset in 0..bytes.len() {
+                let off = self.offset(slot, x + offset);
                 self.links.attach(off, link);
             }
-            let glyph = if byte == b' ' {
-                Glyph::Blank
-            } else {
-                Glyph::Char(char::from(byte))
-            };
-            self.set_cell_at(slot, col, template.with_codepoint(glyph.codepoint()));
         }
         // Every cell in the run was narrow and visible and stays so, and no
         // cell after it was hidden by one of them: no hidden bit changes.
@@ -1192,6 +1185,22 @@ impl Page {
         self.touch(slot, seqno);
         self.debug_check_cells(row, x.saturating_sub(1)..(end + 1).min(self.stride()));
         true
+    }
+
+    /// Stores the printable-ASCII `bytes` from column `x` of slot `slot` as
+    /// [`Self::write`] stores their glyphs over `template` (whose codepoint
+    /// is 0): a space is the blank glyph, codepoint 0, and any other byte
+    /// its own codepoint. A straight store into the row's cells, which the
+    /// compiler vectorizes; per-cell index arithmetic and glyph matching
+    /// were 40% of a long-line ingest (ft-yccm0.3.2.6).
+    #[inline]
+    fn store_ascii_cells(&mut self, slot: u32, x: usize, bytes: &[u8], template: PackedCell) {
+        debug_assert_eq!(template.codepoint(), 0);
+        let base = template.bits();
+        let start = self.cell_index(slot, x);
+        for (cell, &byte) in self.buf[start..start + bytes.len()].iter_mut().zip(bytes) {
+            *cell = base | if byte == b' ' { 0 } else { u64::from(byte) };
+        }
     }
 
     /// A run of graphemes from column `x`, at or past the row's end, each

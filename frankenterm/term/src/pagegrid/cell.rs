@@ -308,6 +308,13 @@ impl PackedCell {
         self.0 & Self::RICH != 0
     }
 
+    /// Whether the cell owns entries in its page's side tables (a rich
+    /// style, a grapheme, a hyperlink or images), which overwriting it must
+    /// release.
+    pub fn has_side_entries(self) -> bool {
+        self.0 & (Self::RICH | Self::GRAPHEME | Self::HYPERLINK | Self::IMAGE) != 0
+    }
+
     pub fn is_wrapped(self) -> bool {
         self.0 & Self::WRAPPED != 0
     }
