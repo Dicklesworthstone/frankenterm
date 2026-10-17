@@ -1,10 +1,10 @@
 use crate::quad::TripleLayerQuadAllocator;
+use crate::termwindow::UIItem;
 use crate::termwindow::render::RenderScreenLineParams;
 use crate::utilsprites::RenderMetrics;
-use anyhow::Context;
 use config::ConfigHandle;
 use mux::renderable::RenderableDimensions;
-use wezterm_term::color::ColorAttribute;
+use wezterm_term::color::{ColorAttribute, ColorPalette};
 use window::color::LinearRgba;
 
 impl crate::TermWindow {
@@ -20,9 +20,22 @@ impl crate::TermWindow {
             return Ok(());
         }
 
+        let palette = self.palette().clone();
+        let mut items = self.paint_retro_tab_bar(layers, &palette)?;
+        self.ui_items.append(&mut items);
+        Ok(())
+    }
+
+    /// The retro tab bar, a line of cells drawn as a screen line into
+    /// `layers`, and its hit-test items. The Metal front end draws it with
+    /// the same code into its own chrome target (ft-yccm0.4.7.1).
+    pub(crate) fn paint_retro_tab_bar(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        palette: &ColorPalette,
+    ) -> anyhow::Result<Vec<UIItem>> {
         let border = self.get_os_border();
 
-        let palette = self.palette().clone();
         let tab_bar_height = self.tab_bar_pixel_height()?;
         let tab_bar_y = if self.config.tab_bar_at_bottom {
             ((self.dimensions.pixel_height as f32) - (tab_bar_height + border.bottom.get() as f32))
@@ -32,20 +45,17 @@ impl crate::TermWindow {
         };
 
         // Register the tab bar location
-        self.ui_items.append(&mut self.tab_bar.compute_ui_items(
+        let items = self.tab_bar.compute_ui_items(
             tab_bar_y as usize,
             self.render_metrics.cell_size.height as usize,
             self.render_metrics.cell_size.width as usize,
-        ));
+        );
 
         let window_is_transparent =
             !self.window_background.is_empty() || self.config.window_background_opacity != 1.0;
-        let gl_state = self
-            .render_state
-            .as_ref()
-            .context("render state is not initialized")?;
-        let white_space = gl_state.util_sprites.white_space.texture_coords();
-        let filled_box = gl_state.util_sprites.filled_box.texture_coords();
+        let chrome = self.chrome()?;
+        let white_space = chrome.util_sprites().white_space.texture_coords();
+        let filled_box = chrome.util_sprites().filled_box.texture_coords();
         let default_bg = palette
             .resolve_bg(ColorAttribute::Default)
             .to_linear()
@@ -64,7 +74,7 @@ impl crate::TermWindow {
                 line: self.tab_bar.line(),
                 selection: 0..0,
                 cursor: &Default::default(),
-                palette: &palette,
+                palette,
                 dims: &RenderableDimensions {
                     cols: self.dimensions.pixel_width
                         / (self.render_metrics.cell_size.width as usize).max(1),
@@ -101,7 +111,7 @@ impl crate::TermWindow {
             layers,
         )?;
 
-        Ok(())
+        Ok(items)
     }
 
     pub fn tab_bar_pixel_height_impl(

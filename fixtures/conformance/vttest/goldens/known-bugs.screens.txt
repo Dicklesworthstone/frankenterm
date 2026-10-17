@@ -1,0 +1,1110 @@
+# vttest/known-bugs screen dumps (ft-yccm0.1.9): cursor, DECSCNM, then rows.
+# Golden expectations: change only with a recorded reason (README).
+# Screens corrected by hand where legacy is wrong (see xfail.txt): 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40.
+=== 00 key ''
+cursor 21,41 visible
+screen normal
+01 ||
+02 ||
+03 |         VT100 test program, version 2.7 (20251205)|
+04 |         Screen size 24x80 (80 max)|
+05 |         Choose test type:|
+06 ||
+07 |          0. Exit|
+08 |          1. Test of cursor movements|
+09 |          2. Test of screen features|
+10 |          3. Test of character sets|
+11 |          4. Test of double-sized characters|
+12 |          5. Test of keyboard|
+13 |          6. Test of terminal reports|
+14 |          7. Test of VT52 mode|
+15 |          8. Test of VT102 features (Insert/Delete Char/Line)|
+16 |          9. Test of known bugs|
+17 |          10. Test of reset and self-test|
+18 |          11. Test non-VT100 (e.g., VT220, XTERM) terminals|
+19 |          12. Modify test-parameters|
+20 ||
+21 |          Enter choice number (0 - 12):|
+22 ||
+23 ||
+24 ||
+=== 01 key '9\r'
+cursor 21,40 visible
+screen normal
+01 |Test of known bugs in the DEC VT100 series. The numbering of some of|
+02 |the bugs (A-F) refers to the article 'VT100 MAGIC' by Sami Tabih in|
+03 |the 'Proceedings of the DEC Users Society' at St. Louis, Missouri, May|
+04 |1983. To understand some of the tests, you have to look at the source|
+05 |code or the article. Of course, a good VT100-compatible terminal|
+06 |should not have these bugs (or have some means of disabling them)! If|
+07 |a bug appears, you might want to RESET the terminal before continuing|
+08 |the test. There is a test of the RESET function in the main menu.|
+09 ||
+10 |          0. Exit to main menu|
+11 |          1. Bug A: Smooth scroll to jump scroll|
+12 |          2. Bug B: Scrolling region|
+13 |          3. Bug C: Wide to narrow screen|
+14 |          4. Bug D: Narrow to wide screen|
+15 |          5. Bug E: Cursor move from double- to single-wide line|
+16 |          6. Bug F: Column mode escape sequence|
+17 |          7. Wrap around with cursor addressing|
+18 |          8. Erase right half of double width lines|
+19 |          9. Funny scroll regions|
+20 ||
+21 |          Enter choice number (0 - 9):|
+22 ||
+23 ||
+24 ||
+=== 02 key '1\r'
+cursor 13,14 visible
+screen normal
+01 ||
+02 ||
+03 ||
+04 ||
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 |This is a test of the VT100 'Scroll while toggle softscroll'|
+11 |bug.  The cursor may disappear, or move UP the screen, or|
+12 |multiple copies of some lines may appear.|
+13 |Push <RETURN>|
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 03 key '\r'
+cursor 24,44 visible
+screen normal
+01 ||
+02 ||
+03 ||
+04 ||
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 |Softscroll bug test, line 1.  Push <RETURN>|
+=== 04 key '\r'
+cursor 24,44 visible
+screen normal
+01 ||
+02 ||
+03 ||
+04 ||
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 |Softscroll bug test, line 1.  Push <RETURN>|
+24 |Softscroll bug test, line 2.  Push <RETURN>|
+=== 05 key '\r'
+cursor 24,44 visible
+screen normal
+01 ||
+02 ||
+03 ||
+04 ||
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 |Softscroll bug test, line 1.  Push <RETURN>|
+23 |Softscroll bug test, line 2.  Push <RETURN>|
+24 |Softscroll bug test, line 3.  Push <RETURN>|
+=== 06 key '\r'
+cursor 24,44 visible
+screen normal
+01 ||
+02 ||
+03 ||
+04 ||
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 |Softscroll bug test, line 1.  Push <RETURN>|
+22 |Softscroll bug test, line 2.  Push <RETURN>|
+23 |Softscroll bug test, line 3.  Push <RETURN>|
+24 |Softscroll bug test, line 4.  Push <RETURN>|
+=== 07 key '\r'
+cursor 24,44 visible
+screen normal
+01 ||
+02 ||
+03 ||
+04 ||
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 |Softscroll bug test, line 1.  Push <RETURN>|
+21 |Softscroll bug test, line 2.  Push <RETURN>|
+22 |Softscroll bug test, line 3.  Push <RETURN>|
+23 |Softscroll bug test, line 4.  Push <RETURN>|
+24 |Softscroll bug test, line 5.  Push <RETURN>|
+=== 08 key '\r'
+cursor 24,44 visible
+screen normal
+01 ||
+02 ||
+03 ||
+04 ||
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 |Softscroll bug test, line 1.  Push <RETURN>|
+20 |Softscroll bug test, line 2.  Push <RETURN>|
+21 |Softscroll bug test, line 3.  Push <RETURN>|
+22 |Softscroll bug test, line 4.  Push <RETURN>|
+23 |Softscroll bug test, line 5.  Push <RETURN>|
+24 |Softscroll bug test, line 6.  Push <RETURN>|
+=== 09 key '\r'
+cursor 24,44 visible
+screen normal
+01 ||
+02 ||
+03 ||
+04 ||
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 |Softscroll bug test, line 1.  Push <RETURN>|
+19 |Softscroll bug test, line 2.  Push <RETURN>|
+20 |Softscroll bug test, line 3.  Push <RETURN>|
+21 |Softscroll bug test, line 4.  Push <RETURN>|
+22 |Softscroll bug test, line 5.  Push <RETURN>|
+23 |Softscroll bug test, line 6.  Push <RETURN>|
+24 |Softscroll bug test, line 7.  Push <RETURN>|
+=== 10 key '\r'
+cursor 24,44 visible
+screen normal
+01 ||
+02 ||
+03 ||
+04 ||
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 |Softscroll bug test, line 1.  Push <RETURN>|
+18 |Softscroll bug test, line 2.  Push <RETURN>|
+19 |Softscroll bug test, line 3.  Push <RETURN>|
+20 |Softscroll bug test, line 4.  Push <RETURN>|
+21 |Softscroll bug test, line 5.  Push <RETURN>|
+22 |Softscroll bug test, line 6.  Push <RETURN>|
+23 |Softscroll bug test, line 7.  Push <RETURN>|
+24 |Softscroll bug test, line 8.  Push <RETURN>|
+=== 11 key '\r'
+cursor 24,44 visible
+screen normal
+01 ||
+02 ||
+03 ||
+04 ||
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 |Softscroll bug test, line 1.  Push <RETURN>|
+17 |Softscroll bug test, line 2.  Push <RETURN>|
+18 |Softscroll bug test, line 3.  Push <RETURN>|
+19 |Softscroll bug test, line 4.  Push <RETURN>|
+20 |Softscroll bug test, line 5.  Push <RETURN>|
+21 |Softscroll bug test, line 6.  Push <RETURN>|
+22 |Softscroll bug test, line 7.  Push <RETURN>|
+23 |Softscroll bug test, line 8.  Push <RETURN>|
+24 |Softscroll bug test, line 9.  Push <RETURN>|
+=== 12 key '\r'
+cursor 24,45 visible
+screen normal
+01 ||
+02 ||
+03 ||
+04 ||
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 |Softscroll bug test, line 1.  Push <RETURN>|
+16 |Softscroll bug test, line 2.  Push <RETURN>|
+17 |Softscroll bug test, line 3.  Push <RETURN>|
+18 |Softscroll bug test, line 4.  Push <RETURN>|
+19 |Softscroll bug test, line 5.  Push <RETURN>|
+20 |Softscroll bug test, line 6.  Push <RETURN>|
+21 |Softscroll bug test, line 7.  Push <RETURN>|
+22 |Softscroll bug test, line 8.  Push <RETURN>|
+23 |Softscroll bug test, line 9.  Push <RETURN>|
+24 |Softscroll bug test, line 10.  Push <RETURN>|
+=== 13 key '\r'
+cursor 24,14 visible
+screen normal
+01 ||
+02 ||
+03 ||
+04 ||
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 |Softscroll bug test, line 1.  Push <RETURN>|
+14 |Softscroll bug test, line 2.  Push <RETURN>|
+15 |Softscroll bug test, line 3.  Push <RETURN>|
+16 |Softscroll bug test, line 4.  Push <RETURN>|
+17 |Softscroll bug test, line 5.  Push <RETURN>|
+18 |Softscroll bug test, line 6.  Push <RETURN>|
+19 |Softscroll bug test, line 7.  Push <RETURN>|
+20 |Softscroll bug test, line 8.  Push <RETURN>|
+21 |Softscroll bug test, line 9.  Push <RETURN>|
+22 |Softscroll bug test, line 10.  Push <RETURN>|
+23 |That should have been enough to show the bug, if present.|
+24 |Push <RETURN>|
+=== 14 key '\r'
+cursor 21,40 visible
+screen normal
+01 |Test of known bugs in the DEC VT100 series. The numbering of some of|
+02 |the bugs (A-F) refers to the article 'VT100 MAGIC' by Sami Tabih in|
+03 |the 'Proceedings of the DEC Users Society' at St. Louis, Missouri, May|
+04 |1983. To understand some of the tests, you have to look at the source|
+05 |code or the article. Of course, a good VT100-compatible terminal|
+06 |should not have these bugs (or have some means of disabling them)! If|
+07 |a bug appears, you might want to RESET the terminal before continuing|
+08 |the test. There is a test of the RESET function in the main menu.|
+09 ||
+10 |          0. Exit to main menu|
+11 |          1. Bug A: Smooth scroll to jump scroll|
+12 |          2. Bug B: Scrolling region|
+13 |          3. Bug C: Wide to narrow screen|
+14 |          4. Bug D: Narrow to wide screen|
+15 |          5. Bug E: Cursor move from double- to single-wide line|
+16 |          6. Bug F: Column mode escape sequence|
+17 |          7. Wrap around with cursor addressing|
+18 |          8. Erase right half of double width lines|
+19 |          9. Funny scroll regions|
+20 ||
+21 |          Enter choice number (0 - 9):|
+22 ||
+23 ||
+24 ||
+=== 15 key '2\r'
+cursor 12,28 visible
+screen normal
+01 |Line 11 should be double-wide, line 12 should be cleared.|
+02 |Then, the letters A-P should be written at the beginning|
+03 |of lines 12-24, and the empty line and A-E are scrolled away.|
+04 |If the bug is present, some lines are confused, look at K-P.|
+05 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+06 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+07 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+08 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+09 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+10 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+11W|EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+12 |Here we go... Push <RETURN>|
+13 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+14 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+15 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+16 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+17 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+18 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+19 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+20 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+21 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+22 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+23 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+24 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+=== 16 key '\r'
+cursor 24,14 visible
+screen normal
+01 |Line 11 should be double-wide, line 12 should be cleared.|
+02 |Then, the letters A-P should be written at the beginning|
+03 |of lines 12-24, and the empty line and A-E are scrolled away.|
+04 |If the bug is present, some lines are confused, look at K-P.|
+05 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+06 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+07 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+08 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+09 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+10 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+11W|EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+12 |EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+13 |FEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+14 |GEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+15 |HEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+16 |IEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+17 |JEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+18 |KEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+19 |LEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+20 |MEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE|
+21 |N|
+22 |O|
+23 |P|
+24 |Push <RETURN>|
+=== 17 key '\r'
+cursor 21,40 visible
+screen normal
+01 |Test of known bugs in the DEC VT100 series. The numbering of some of|
+02 |the bugs (A-F) refers to the article 'VT100 MAGIC' by Sami Tabih in|
+03 |the 'Proceedings of the DEC Users Society' at St. Louis, Missouri, May|
+04 |1983. To understand some of the tests, you have to look at the source|
+05 |code or the article. Of course, a good VT100-compatible terminal|
+06 |should not have these bugs (or have some means of disabling them)! If|
+07 |a bug appears, you might want to RESET the terminal before continuing|
+08 |the test. There is a test of the RESET function in the main menu.|
+09 ||
+10 |          0. Exit to main menu|
+11 |          1. Bug A: Smooth scroll to jump scroll|
+12 |          2. Bug B: Scrolling region|
+13 |          3. Bug C: Wide to narrow screen|
+14 |          4. Bug D: Narrow to wide screen|
+15 |          5. Bug E: Cursor move from double- to single-wide line|
+16 |          6. Bug F: Column mode escape sequence|
+17 |          7. Wrap around with cursor addressing|
+18 |          8. Erase right half of double width lines|
+19 |          9. Funny scroll regions|
+20 ||
+21 |          Enter choice number (0 - 9):|
+22 ||
+23 ||
+24 ||
+=== 18 key '3\r'
+cursor 12,68 visible
+screen normal
+01 ||
+02 ||
+03 ||
+04 ||
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 |    Except for this line, the screen should be blank. Push <RETURN>|
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 19 key '\r'
+cursor 21,40 visible
+screen normal
+01 |Test of known bugs in the DEC VT100 series. The numbering of some of|
+02 |the bugs (A-F) refers to the article 'VT100 MAGIC' by Sami Tabih in|
+03 |the 'Proceedings of the DEC Users Society' at St. Louis, Missouri, May|
+04 |1983. To understand some of the tests, you have to look at the source|
+05 |code or the article. Of course, a good VT100-compatible terminal|
+06 |should not have these bugs (or have some means of disabling them)! If|
+07 |a bug appears, you might want to RESET the terminal before continuing|
+08 |the test. There is a test of the RESET function in the main menu.|
+09 ||
+10 |          0. Exit to main menu|
+11 |          1. Bug A: Smooth scroll to jump scroll|
+12 |          2. Bug B: Scrolling region|
+13 |          3. Bug C: Wide to narrow screen|
+14 |          4. Bug D: Narrow to wide screen|
+15 |          5. Bug E: Cursor move from double- to single-wide line|
+16 |          6. Bug F: Column mode escape sequence|
+17 |          7. Wrap around with cursor addressing|
+18 |          8. Erase right half of double width lines|
+19 |          9. Funny scroll regions|
+20 ||
+21 |          Enter choice number (0 - 9):|
+22 ||
+23 ||
+24 ||
+=== 20 key '4\r'
+cursor 4,9 visible
+screen normal
+01W|        You should see blinking text at the bottom line.|
+02 ||
+03W|        Enter 0 to exit, 1 to try to invoke the bug again.|
+04W||
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24W|        If you can see this then the bug did not appear.|
+=== 21 key '\r'
+cursor 5,1 visible
+screen normal
+01W|        You should see blinking text at the bottom line.|
+02 ||
+03W|        Enter 0 to exit, 1 to try to invoke the bug again.|
+04W||
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24W|        If you can see this then the bug did not appear.|
+=== 22 key '\r'
+cursor 24,14 visible
+screen normal
+01 ||
+02 ||
+03 ||
+04 ||
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 |If the bug is present, this should make things much worse!|
+20 |If the bug is present, this should make things much worse!|
+21 |If the bug is present, this should make things much worse!|
+22 |If the bug is present, this should make things much worse!|
+23 |If the bug is present, this should make things much worse!|
+24 |Push <RETURN>|
+=== 23 key '\r'
+cursor 21,40 visible
+screen normal
+01 |Test of known bugs in the DEC VT100 series. The numbering of some of|
+02 |the bugs (A-F) refers to the article 'VT100 MAGIC' by Sami Tabih in|
+03 |the 'Proceedings of the DEC Users Society' at St. Louis, Missouri, May|
+04 |1983. To understand some of the tests, you have to look at the source|
+05 |code or the article. Of course, a good VT100-compatible terminal|
+06 |should not have these bugs (or have some means of disabling them)! If|
+07 |a bug appears, you might want to RESET the terminal before continuing|
+08 |the test. There is a test of the RESET function in the main menu.|
+09 ||
+10 |          0. Exit to main menu|
+11 |          1. Bug A: Smooth scroll to jump scroll|
+12 |          2. Bug B: Scrolling region|
+13 |          3. Bug C: Wide to narrow screen|
+14 |          4. Bug D: Narrow to wide screen|
+15 |          5. Bug E: Cursor move from double- to single-wide line|
+16 |          6. Bug F: Column mode escape sequence|
+17 |          7. Wrap around with cursor addressing|
+18 |          8. Erase right half of double width lines|
+19 |          9. Funny scroll regions|
+20 ||
+21 |          Enter choice number (0 - 9):|
+22 ||
+23 ||
+24 ||
+=== 24 key '5\r'
+cursor 10,14 visible
+screen normal
+01W|This test should put an 'X' at line 3 column 100.|
+02 |12345678901234567890123456789012345678901234567890123456789012345678901234567890|
+03 |1234567890123456789012345678901234567890                                       X|
+04 |                                       !                                 !|
+05 |--------------------------- The 'X' should NOT be above here ----+------------ b|
+06 |ut above here -----+|
+07 ||
+08 ||
+09 ||
+10W|Push <RETURN>|
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 25 key '\r'
+cursor 21,40 visible
+screen normal
+01 |Test of known bugs in the DEC VT100 series. The numbering of some of|
+02 |the bugs (A-F) refers to the article 'VT100 MAGIC' by Sami Tabih in|
+03 |the 'Proceedings of the DEC Users Society' at St. Louis, Missouri, May|
+04 |1983. To understand some of the tests, you have to look at the source|
+05 |code or the article. Of course, a good VT100-compatible terminal|
+06 |should not have these bugs (or have some means of disabling them)! If|
+07 |a bug appears, you might want to RESET the terminal before continuing|
+08 |the test. There is a test of the RESET function in the main menu.|
+09 ||
+10 |          0. Exit to main menu|
+11 |          1. Bug A: Smooth scroll to jump scroll|
+12 |          2. Bug B: Scrolling region|
+13 |          3. Bug C: Wide to narrow screen|
+14 |          4. Bug D: Narrow to wide screen|
+15 |          5. Bug E: Cursor move from double- to single-wide line|
+16 |          6. Bug F: Column mode escape sequence|
+17 |          7. Wrap around with cursor addressing|
+18 |          8. Erase right half of double width lines|
+19 |          9. Funny scroll regions|
+20 ||
+21 |          Enter choice number (0 - 9):|
+22 ||
+23 ||
+24 ||
+=== 26 key '6\r'
+cursor 3,14 visible
+screen reverse
+01 |Test VT100 'Toggle origin mode, forget rest' bug, part 1.|
+02 |The screen should be in reverse, 80 column mode.|
+03 |Push <RETURN>|
+04 ||
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 27 key '\r'
+cursor 4,14 visible
+screen normal
+01 |Test VT100 'Toggle origin mode, forget rest' bug, part 2.|
+02 ||
+03 |The screen should be in non-reverse, 80 column mode.|
+04 |Push <RETURN>|
+05 ||
+06 ||
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 ||
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 28 key '\r'
+cursor 21,40 visible
+screen normal
+01 |Test of known bugs in the DEC VT100 series. The numbering of some of|
+02 |the bugs (A-F) refers to the article 'VT100 MAGIC' by Sami Tabih in|
+03 |the 'Proceedings of the DEC Users Society' at St. Louis, Missouri, May|
+04 |1983. To understand some of the tests, you have to look at the source|
+05 |code or the article. Of course, a good VT100-compatible terminal|
+06 |should not have these bugs (or have some means of disabling them)! If|
+07 |a bug appears, you might want to RESET the terminal before continuing|
+08 |the test. There is a test of the RESET function in the main menu.|
+09 ||
+10 |          0. Exit to main menu|
+11 |          1. Bug A: Smooth scroll to jump scroll|
+12 |          2. Bug B: Scrolling region|
+13 |          3. Bug C: Wide to narrow screen|
+14 |          4. Bug D: Narrow to wide screen|
+15 |          5. Bug E: Cursor move from double- to single-wide line|
+16 |          6. Bug F: Column mode escape sequence|
+17 |          7. Wrap around with cursor addressing|
+18 |          8. Erase right half of double width lines|
+19 |          9. Funny scroll regions|
+20 ||
+21 |          Enter choice number (0 - 9):|
+22 ||
+23 ||
+24 ||
+=== 29 key '7\r'
+cursor 24,14 visible
+screen normal
+01 |+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*|
+02 |                                                                               *|
+03 |                                                                               *|
+04 |                                                                               *|
+05 |                                                                               *|
+06 |                                                                               *|
+07 |                                                                               *|
+08 |                                                                               *|
+09 |                                                                               *|
+10 |                                                                               *|
+11 |                                                                               *|
+12 |                                                                               *|
+13 |                                                                               *|
+14 |                                                                               *|
+15 |                                                                               *|
+16 |   This illustrates the "wrap around bug" which exists on a                    *|
+17 |   standard VT100. At the top of the screen there should be                    *|
+18 |   a row of +'s, and the rightmost column should be filled                     *|
+19 |   with *'s. But if the bug is present, some of the *'s may                    *|
+20 |   be placed in other places, e.g. in the leftmost column,                     *|
+21 |   and the top line of +'s may be scrolled away.                               *|
+22 |                                                                               *|
+23 |                                                                               *|
+24 |Push <RETURN>                                                                  *|
+=== 30 key '\r'
+cursor 21,40 visible
+screen normal
+01 |Test of known bugs in the DEC VT100 series. The numbering of some of|
+02 |the bugs (A-F) refers to the article 'VT100 MAGIC' by Sami Tabih in|
+03 |the 'Proceedings of the DEC Users Society' at St. Louis, Missouri, May|
+04 |1983. To understand some of the tests, you have to look at the source|
+05 |code or the article. Of course, a good VT100-compatible terminal|
+06 |should not have these bugs (or have some means of disabling them)! If|
+07 |a bug appears, you might want to RESET the terminal before continuing|
+08 |the test. There is a test of the RESET function in the main menu.|
+09 ||
+10 |          0. Exit to main menu|
+11 |          1. Bug A: Smooth scroll to jump scroll|
+12 |          2. Bug B: Scrolling region|
+13 |          3. Bug C: Wide to narrow screen|
+14 |          4. Bug D: Narrow to wide screen|
+15 |          5. Bug E: Cursor move from double- to single-wide line|
+16 |          6. Bug F: Column mode escape sequence|
+17 |          7. Wrap around with cursor addressing|
+18 |          8. Erase right half of double width lines|
+19 |          9. Funny scroll regions|
+20 ||
+21 |          Enter choice number (0 - 9):|
+22 ||
+23 ||
+24 ||
+=== 31 key '8\r'
+cursor 6,14 visible
+screen normal
+01 |This is a test of what happens to the right half of double-width lines.|
+02 |A common misfeature is that the right half does not come back when a long|
+03 |single-width line is set to double-width and then reset to single-width.|
+04 ||
+05 |Now the line below should contain 80 characters in single width.|
+06 |Push <RETURN>|
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 |This-is-a-long-line-This-is-a-long-line-This-is-a-long-line-This-is-a-long-line-|
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 32 key '\r'
+cursor 9,14 visible
+screen normal
+01 |This is a test of what happens to the right half of double-width lines.|
+02 |A common misfeature is that the right half does not come back when a long|
+03 |single-width line is set to double-width and then reset to single-width.|
+04 ||
+05 |Now the line below should contain 80 characters in single width.|
+06 |Push <RETURN>|
+07 ||
+08 |Now the line below should contain 40 characters in double width.|
+09 |Push <RETURN>|
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15W|This-is-a-long-line-This-is-a-long-line-This-is-a-long-line-This-is-a-long-line-|
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 33 key '\r'
+cursor 12,14 visible
+screen normal
+01 |This is a test of what happens to the right half of double-width lines.|
+02 |A common misfeature is that the right half does not come back when a long|
+03 |single-width line is set to double-width and then reset to single-width.|
+04 ||
+05 |Now the line below should contain 80 characters in single width.|
+06 |Push <RETURN>|
+07 ||
+08 |Now the line below should contain 40 characters in double width.|
+09 |Push <RETURN>|
+10 ||
+11 |Now the line below should contain 80 characters in single width.|
+12 |Push <RETURN>|
+13 ||
+14 ||
+15 |This-is-a-long-line-This-is-a-long-line-This-is-a-long-line-This-is-a-long-line-|
+16 ||
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 34 key '\r'
+cursor 6,14 visible
+screen normal
+01 |This is the same test in 80 column mode.|
+02 ||
+03 ||
+04 ||
+05 |Now the line below should contain 80 characters in single width.|
+06 |Push <RETURN>|
+07 ||
+08 ||
+09 ||
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15 |This-is-a-long-line-This-is-a-long-line-This-is-a-long-line-This-is-a-long-line-|
+16 |This-is-a-long-line-This-is-a-long-line-ending-here-|
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 35 key '\r'
+cursor 9,14 visible
+screen normal
+01 |This is the same test in 80 column mode.|
+02 ||
+03 ||
+04 ||
+05 |Now the line below should contain 80 characters in single width.|
+06 |Push <RETURN>|
+07 ||
+08 |Now the line below should contain 40 characters in double width.|
+09 |Push <RETURN>|
+10 ||
+11 ||
+12 ||
+13 ||
+14 ||
+15W|This-is-a-long-line-This-is-a-long-line-This-is-a-long-line-This-is-a-long-line-|
+16 |This-is-a-long-line-This-is-a-long-line-ending-here-|
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 36 key '\r'
+cursor 12,14 visible
+screen normal
+01 |This is the same test in 80 column mode.|
+02 ||
+03 ||
+04 ||
+05 |Now the line below should contain 80 characters in single width.|
+06 |Push <RETURN>|
+07 ||
+08 |Now the line below should contain 40 characters in double width.|
+09 |Push <RETURN>|
+10 ||
+11 |Now the line below should contain 80 characters in single width.|
+12 |Push <RETURN>|
+13 ||
+14 ||
+15 |This-is-a-long-line-This-is-a-long-line-This-is-a-long-line-This-is-a-long-line-|
+16 |This-is-a-long-line-This-is-a-long-line-ending-here-|
+17 ||
+18 ||
+19 ||
+20 ||
+21 ||
+22 ||
+23 ||
+24 ||
+=== 37 key '\r'
+cursor 21,40 visible
+screen normal
+01 |Test of known bugs in the DEC VT100 series. The numbering of some of|
+02 |the bugs (A-F) refers to the article 'VT100 MAGIC' by Sami Tabih in|
+03 |the 'Proceedings of the DEC Users Society' at St. Louis, Missouri, May|
+04 |1983. To understand some of the tests, you have to look at the source|
+05 |code or the article. Of course, a good VT100-compatible terminal|
+06 |should not have these bugs (or have some means of disabling them)! If|
+07 |a bug appears, you might want to RESET the terminal before continuing|
+08 |the test. There is a test of the RESET function in the main menu.|
+09 ||
+10 |          0. Exit to main menu|
+11 |          1. Bug A: Smooth scroll to jump scroll|
+12 |          2. Bug B: Scrolling region|
+13 |          3. Bug C: Wide to narrow screen|
+14 |          4. Bug D: Narrow to wide screen|
+15 |          5. Bug E: Cursor move from double- to single-wide line|
+16 |          6. Bug F: Column mode escape sequence|
+17 |          7. Wrap around with cursor addressing|
+18 |          8. Erase right half of double width lines|
+19 |          9. Funny scroll regions|
+20 ||
+21 |          Enter choice number (0 - 9):|
+22 ||
+23 ||
+24 ||
+=== 38 key '9\r'
+cursor 21,14 visible
+screen normal
+01 |This is 20 lines of text (line 1), no scroll region.|
+02 |This is 20 lines of text (line 2), no scroll region.|
+03 |This is 20 lines of text (line 3), no scroll region.|
+04 |This is 20 lines of text (line 4), no scroll region.|
+05 |This is 20 lines of text (line 5), no scroll region.|
+06 |This is 20 lines of text (line 6), no scroll region.|
+07 |This is 20 lines of text (line 7), no scroll region.|
+08 |This is 20 lines of text (line 8), no scroll region.|
+09 |This is 20 lines of text (line 9), no scroll region.|
+10 |This is 20 lines of text (line 10), no scroll region.|
+11 |This is 20 lines of text (line 11), no scroll region.|
+12 |This is 20 lines of text (line 12), no scroll region.|
+13 |This is 20 lines of text (line 13), no scroll region.|
+14 |This is 20 lines of text (line 14), no scroll region.|
+15 |This is 20 lines of text (line 15), no scroll region.|
+16 |This is 20 lines of text (line 16), no scroll region.|
+17 |This is 20 lines of text (line 17), no scroll region.|
+18 |This is 20 lines of text (line 18), no scroll region.|
+19 |This is 20 lines of text (line 19), no scroll region.|
+20 |This is 20 lines of text (line 20), no scroll region.|
+21 |Push <RETURN>|
+22 ||
+23 ||
+24 ||
+=== 39 key '\r'
+cursor 21,14 visible
+screen normal
+01 |This is 20 lines of text (line 1), no scroll region.|
+02 |This is 20 lines of text (line 2), no scroll region.|
+03 |This is 20 lines of text (line 3), no scroll region.|
+04 |This is 20 lines of text (line 4), no scroll region.|
+05 |This is 20 lines of text (line 5), no scroll region.|
+06 |This is 20 lines of text (line 6), no scroll region.|
+07 |This is 20 lines of text (line 7), no scroll region.|
+08 |This is 20 lines of text (line 8), no scroll region.|
+09 |This is 20 lines of text (line 9), no scroll region.|
+10 |This is 20 lines of text (line 10), no scroll region.|
+11 |This is 20 lines of text (line 11), no scroll region.|
+12 |This is 20 lines of text (line 12), no scroll region.|
+13 |This is 20 lines of text (line 13), no scroll region.|
+14 |This is 20 lines of text (line 14), no scroll region.|
+15 |This is 20 lines of text (line 15), no scroll region.|
+16 |This is 20 lines of text (line 16), no scroll region.|
+17 |This is 20 lines of text (line 17), no scroll region.|
+18 |This is 20 lines of text (line 18), no scroll region.|
+19 |This is 20 lines of text (line 19), no scroll region.|
+20 |This is 20 lines of text (line 20), no scroll region.|
+21 |Push <RETURN>|
+22 ||
+23 ||
+24 ||
+=== 40 key '\r'
+cursor 21,40 visible
+screen normal
+01 |Test of known bugs in the DEC VT100 series. The numbering of some of|
+02 |the bugs (A-F) refers to the article 'VT100 MAGIC' by Sami Tabih in|
+03 |the 'Proceedings of the DEC Users Society' at St. Louis, Missouri, May|
+04 |1983. To understand some of the tests, you have to look at the source|
+05 |code or the article. Of course, a good VT100-compatible terminal|
+06 |should not have these bugs (or have some means of disabling them)! If|
+07 |a bug appears, you might want to RESET the terminal before continuing|
+08 |the test. There is a test of the RESET function in the main menu.|
+09 ||
+10 |          0. Exit to main menu|
+11 |          1. Bug A: Smooth scroll to jump scroll|
+12 |          2. Bug B: Scrolling region|
+13 |          3. Bug C: Wide to narrow screen|
+14 |          4. Bug D: Narrow to wide screen|
+15 |          5. Bug E: Cursor move from double- to single-wide line|
+16 |          6. Bug F: Column mode escape sequence|
+17 |          7. Wrap around with cursor addressing|
+18 |          8. Erase right half of double width lines|
+19 |          9. Funny scroll regions|
+20 ||
+21 |          Enter choice number (0 - 9):|
+22 ||
+23 ||
+24 ||

@@ -65,10 +65,18 @@ fn main() -> ExitCode {
         emit_human_report(&report);
     }
 
-    if report.findings.is_empty() {
+    if report.findings.is_empty() && report.stale_cache_field_allow_entries.is_empty() {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
+    }
+}
+
+fn emit_stale_allow_entries(report: &cache_gpu_handle_lint::AuditReport) {
+    for entry in &report.stale_cache_field_allow_entries {
+        eprintln!(
+            "  stale ALLOWED_CACHE_FIELDS entry `{entry}`: no GPU-reaching cache field matches it any more; remove it"
+        );
     }
 }
 
@@ -86,24 +94,29 @@ fn print_help() {
 }
 
 fn emit_human_report(report: &cache_gpu_handle_lint::AuditReport) {
-    if report.findings.is_empty() {
+    if report.findings.is_empty() && report.stale_cache_field_allow_entries.is_empty() {
         println!(
-            "cache-gpu-handle-lint: clean. {} process-global container(s) scanned ({} clean, {} allow-listed), {} type-graph node(s).",
+            "cache-gpu-handle-lint: clean. {} process-global container(s) scanned ({} clean, {} allow-listed); {} cache field(s) scanned ({} clean, {} atlas-owner, {} fenced by an atlas-rebuild release), {} type-graph node(s).",
             report.total_globals,
             report.clean_globals,
             report.allow_listed_globals,
+            report.total_cache_fields,
+            report.clean_cache_fields,
+            report.atlas_owner_cache_fields,
+            report.allow_listed_cache_fields,
             report.type_graph_nodes,
         );
         return;
     }
 
     eprintln!(
-        "cache-gpu-handle-lint: {} finding(s) — process-global cache(s) can pin a GPU resource:",
+        "cache-gpu-handle-lint: {} finding(s) — cache(s) can pin a GPU resource:",
         report.findings.len()
     );
     for f in &report.findings {
         eprintln!("  {}", f.render());
     }
+    emit_stale_allow_entries(report);
     eprintln!();
     eprintln!(
         "Summary: {} process-global container(s) scanned, {} reach a GPU-handle leaf, {} clean, {} allow-listed, {} type-graph node(s).",
@@ -124,6 +137,20 @@ fn emit_json_report(report: &cache_gpu_handle_lint::AuditReport) {
     print!(",\"clean_globals\":{}", report.clean_globals);
     print!(",\"allow_listed_globals\":{}", report.allow_listed_globals);
     print!(",\"type_graph_nodes\":{}", report.type_graph_nodes);
+    print!(",\"total_cache_fields\":{}", report.total_cache_fields);
+    print!(",\"clean_cache_fields\":{}", report.clean_cache_fields);
+    print!(
+        ",\"atlas_owner_cache_fields\":{}",
+        report.atlas_owner_cache_fields
+    );
+    print!(
+        ",\"allow_listed_cache_fields\":{}",
+        report.allow_listed_cache_fields
+    );
+    print!(
+        ",\"stale_cache_field_allow_entries\":{:?}",
+        report.stale_cache_field_allow_entries
+    );
     print!(",\"finding_count\":{}", report.finding_count());
     print!(",\"findings\":[");
     let mut first = true;

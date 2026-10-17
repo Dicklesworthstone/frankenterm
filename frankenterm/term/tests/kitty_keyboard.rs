@@ -75,6 +75,14 @@ impl CapturedWriter {
     }
 }
 
+/// Waits until the writer thread has written everything the terminal queued
+/// for its child; the writer never blocks the terminal itself.
+fn drain(term: &mut Terminal) {
+    term.writer_barrier()
+        .wait(std::time::Duration::from_secs(10))
+        .expect("terminal writer drained");
+}
+
 fn make_term() -> Terminal {
     Terminal::new(
         TerminalSize {
@@ -358,6 +366,7 @@ fn query_kitty_support_responds_with_current_flags() {
     let (mut term, captured) = make_term_with_capture();
     term.advance_bytes(b"\x1b[>5;1u"); // push DISAMBIGUATE | REPORT_ALTERNATE_KEYS
     term.advance_bytes(b"\x1b[?u"); // query
+    drain(&mut term);
 
     let buf = captured.snapshot();
     let buf_str = String::from_utf8_lossy(&buf);
@@ -373,6 +382,7 @@ fn query_kitty_support_responds_with_current_flags() {
 fn query_kitty_support_on_empty_stack_responds_with_zero() {
     let (mut term, captured) = make_term_with_capture();
     term.advance_bytes(b"\x1b[?u");
+    drain(&mut term);
 
     let buf = captured.snapshot();
     let buf_str = String::from_utf8_lossy(&buf);
@@ -449,6 +459,7 @@ fn key_down_writes_to_pty_capture() {
     let (mut term, captured) = make_term_with_capture();
     term.key_down(KeyCode::Char('p'), KeyModifiers::NONE)
         .unwrap();
+    drain(&mut term);
 
     assert_eq!(String::from_utf8(captured.snapshot()).unwrap(), "p");
 }

@@ -42,7 +42,13 @@ frankenterm-sigpipe = { workspace = true }
 # depend on the sub-crate as a regular dep here. `frankenterm-core` itself
 # only dev-depends on this crate, so there's no production cycle.
 frankenterm-core-replay = { workspace = true, default-features = false }
-frankenterm-alloc = { workspace = true, optional = true }
+# Always linked: `ft doctor --json` reads the GUI's published GPU resource
+# ledger (ft-yccm0.2.5). Without the `jemalloc` feature it installs no global
+# allocator.
+frankenterm-alloc.workspace = true
+# `config::RUNTIME_DIR`, where the GUI publishes that ledger. Already in the
+# graph through frankenterm-client.
+config.workspace = true
 frankenterm-client.workspace = true
 frankenterm-mux-server-impl.workspace = true
 mux.workspace = true
@@ -134,7 +140,7 @@ asupersync-runtime = ["frankenterm-core/asupersync-runtime"]
 semantic-search = ["frankenterm-core/semantic-search"]
 session-resume = ["frankenterm-core/session-resume"]
 redis-session = ["frankenterm-core/redis-session"]
-jemalloc = ["dep:frankenterm-alloc", "frankenterm-alloc/jemalloc"]
+jemalloc = ["frankenterm-alloc/jemalloc"]
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

@@ -322,6 +322,58 @@ impl CellCluster {
         }
         self.text.push_str(text);
     }
+
+    /// Joins clusters that sit side by side in one line into a single run,
+    /// so the GUI can shape text whose cells differ only in paint attributes
+    /// (colors, underline, hyperlinks) once (ft-yccm0.4.3.4). The result
+    /// carries the first part's attributes, and byte-to-cell maps that are
+    /// exact over the joined text. `None` when the parts are empty, do not
+    /// each start where the previous one ends, or differ in presentation or
+    /// direction.
+    pub fn concat(parts: &[&CellCluster]) -> Option<CellCluster> {
+        let (first, rest) = parts.split_first()?;
+        let mut next_cell = first.first_cell_idx.checked_add(first.width)?;
+        for part in rest {
+            if part.first_cell_idx != next_cell
+                || part.presentation != first.presentation
+                || part.direction != first.direction
+            {
+                return None;
+            }
+            next_cell = part.first_cell_idx.checked_add(part.width)?;
+        }
+        let text_len = parts.iter().map(|part| part.text.len()).sum();
+        // Empty maps mean "one byte per single-width cell"; the joined maps
+        // stay empty only when every part's are.
+        let explicit_idx = parts.iter().any(|part| !part.byte_to_cell_idx.is_empty());
+        let explicit_width = parts.iter().any(|part| !part.byte_to_cell_width.is_empty());
+        let mut joined = CellCluster {
+            attrs: first.attrs.clone(),
+            text: String::with_capacity(text_len),
+            width: next_cell - first.first_cell_idx,
+            presentation: first.presentation,
+            direction: first.direction,
+            byte_to_cell_idx: Vec::with_capacity(if explicit_idx { text_len } else { 0 }),
+            byte_to_cell_width: Vec::with_capacity(if explicit_width { text_len } else { 0 }),
+            first_cell_idx: first.first_cell_idx,
+        };
+        for part in parts {
+            for byte_idx in 0..part.text.len() {
+                if explicit_idx {
+                    joined
+                        .byte_to_cell_idx
+                        .push(part.byte_to_cell_idx(byte_idx));
+                }
+                if explicit_width {
+                    joined
+                        .byte_to_cell_width
+                        .push(part.byte_to_cell_width(byte_idx));
+                }
+            }
+            joined.text.push_str(&part.text);
+        }
+        Some(joined)
+    }
 }
 
 #[cfg(test)]
@@ -341,6 +393,47 @@ mod tests {
             cell_idx,
             width,
         )
+    }
+
+    // ── CellCluster::concat (ft-yccm0.4.3.4) ──────────
+
+    #[test]
+    fn concat_joins_adjacent_clusters_with_exact_cell_maps() {
+        let mut ab = make_cluster("a", 0, 1);
+        ab.add("b", 1, 1);
+        ab.attrs
+            .set_foreground(frankenterm_cell::color::ColorAttribute::PaletteIndex(1));
+        let mut cd = make_cluster("c", 2, 1);
+        cd.add("d", 3, 1);
+
+        // Single-byte cells keep the compact empty maps.
+        let joined = CellCluster::concat(&[&ab, &cd]).unwrap();
+        assert_eq!(joined.text, "abcd");
+        assert_eq!((joined.first_cell_idx, joined.width), (0, 4));
+        assert!(joined.byte_to_cell_idx.is_empty() && joined.byte_to_cell_width.is_empty());
+        let cells: Vec<usize> = (0..4).map(|byte| joined.byte_to_cell_idx(byte)).collect();
+        assert_eq!(cells, vec![0, 1, 2, 3]);
+        // The first part's attributes carry over.
+        assert_eq!(joined.attrs, ab.attrs);
+
+        // A wide multi-byte emoji after them: explicit maps over the join.
+        let emoji = make_cluster("\u{1F600}", 4, 2);
+        let mixed = CellCluster::concat(&[&ab, &cd, &emoji]).unwrap();
+        assert_eq!(mixed.width, 6);
+        let cells: Vec<usize> = (0..8).map(|byte| mixed.byte_to_cell_idx(byte)).collect();
+        assert_eq!(cells, vec![0, 1, 2, 3, 4, 4, 4, 4]);
+        let widths: Vec<u8> = (0..8).map(|byte| mixed.byte_to_cell_width(byte)).collect();
+        assert_eq!(widths, vec![1, 1, 1, 1, 2, 2, 2, 2]);
+
+        // Gaps, presentation and direction changes, and nothing, are refused.
+        assert!(CellCluster::concat(&[&ab, &make_cluster("e", 9, 1)]).is_none());
+        let mut emoji_presentation = make_cluster("e", 2, 1);
+        emoji_presentation.presentation = Presentation::Emoji;
+        assert!(CellCluster::concat(&[&ab, &emoji_presentation]).is_none());
+        let mut rtl = make_cluster("e", 2, 1);
+        rtl.direction = Direction::RightToLeft;
+        assert!(CellCluster::concat(&[&ab, &rtl]).is_none());
+        assert!(CellCluster::concat(&[]).is_none());
     }
 
     // ── CellCluster::new ──────────────────────────────

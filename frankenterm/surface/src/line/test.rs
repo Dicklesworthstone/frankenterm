@@ -6,6 +6,7 @@ use crate::line::clusterline::ClusteredLine;
 use crate::line::storage::CellStorage;
 use crate::SEQ_ZERO;
 use alloc::format;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -511,4 +512,154 @@ fn fill_range_blank_erases_wide_grapheme_truncated_to_head() {
     // Column 2 is the implicit placeholder owned by the wide grapheme at
     // column 1.  Erasing that placeholder must not leave an orphaned head.
     assert_eq!(line.as_str(), "a");
+}
+
+fn visible_width_sum(line: &Line) -> usize {
+    line.visible_cells().map(|cell| cell.width()).sum()
+}
+
+/// ft-yccm0.2.14 batch verify 4: clustered storage re-segments its text with
+/// `Graphemes`, so appending a cell that clusters with the previous one (a
+/// regional-indicator partner, a skin-tone modifier, a combining mark written
+/// as its own cell) made `len()` exceed the cells the line yields, and DCH
+/// then removed past the end of the materialized cells and panicked.
+#[test]
+fn clustering_neighbours_keep_len_and_dch_consistent() {
+    let attrs = CellAttributes::default();
+    let pairs = [
+        ("\u{1F1FA}", "\u{1F1F8}"),
+        ("\u{1F600}", "\u{1F3FD}"),
+        ("a", "\u{301}"),
+    ];
+    for &(first, second) in pairs.iter() {
+        let mut line = Line::new(1);
+        line.set_cell_grapheme(0, first, 1, attrs.clone(), 1);
+        line.set_cell_grapheme(1, second, 1, attrs.clone(), 1);
+        let texts: Vec<String> = line
+            .visible_cells()
+            .map(|cell| cell.str().to_string())
+            .collect();
+        assert_eq!(texts, vec![first.to_string(), second.to_string()]);
+        assert_eq!(line.len(), visible_width_sum(&line));
+
+        line.erase_cell_with_margin(1, 2, 1, attrs.clone());
+        assert_eq!(line.len(), visible_width_sum(&line));
+        assert_eq!(
+            line.visible_cells()
+                .next()
+                .map(|cell| cell.str().to_string()),
+            Some(first.to_string())
+        );
+    }
+}
+
+#[test]
+fn compression_keeps_clustering_neighbours_in_vector_storage() {
+    let attrs = CellAttributes::default();
+    let mut line = Line::new(1);
+    // Regional indicators are two columns wide under the latest Unicode
+    // version, so the second one starts after the first one's spacer.
+    let first = Cell::new_grapheme("\u{1F1FA}", attrs.clone(), None);
+    let second_column = first.width();
+    line.set_cell(0, first, 1);
+    line.set_cell(
+        second_column,
+        Cell::new_grapheme("\u{1F1F8}", attrs.clone(), None),
+        1,
+    );
+    line.compress_for_scrollback();
+    line.canonicalize_scrollback_storage();
+    let texts: Vec<String> = line
+        .visible_cells()
+        .map(|cell| cell.str().to_string())
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["\u{1F1FA}".to_string(), "\u{1F1F8}".to_string()]
+    );
+    assert_eq!(line.len(), visible_width_sum(&line));
+
+    // Inert neighbours still compress and read back unchanged.
+    let mut plain = Line::new(1);
+    plain.set_cell(1, Cell::new_grapheme("\u{4E2D}", attrs.clone(), None), 1);
+    plain.set_cell(0, Cell::new_grapheme("x", attrs, None), 1);
+    let before: Vec<String> = plain
+        .visible_cells()
+        .map(|cell| cell.str().to_string())
+        .collect();
+    plain.compress_for_scrollback();
+    let after: Vec<String> = plain
+        .visible_cells()
+        .map(|cell| cell.str().to_string())
+        .collect();
+    assert_eq!(before, after);
+    assert_eq!(plain.len(), visible_width_sum(&plain));
+}
+
+/// ft-70s4z: a printable-ASCII run written past the end of a clustered line
+/// lands exactly where per-cell `set_cell` puts it, which is what the screen
+/// fell back to before. Leading blank cells stay implicit, the gap fills
+/// with blanks, and the storage stays clustered.
+#[test]
+fn append_ascii_cell_run_past_the_end_matches_per_cell_set_cell() {
+    use frankenterm_cell::Intensity;
+    let blank = CellAttributes::blank();
+    let mut bold = CellAttributes::blank();
+    bold.set_intensity(Intensity::Bold);
+    let mut linked = CellAttributes::blank();
+    linked.set_hyperlink(Some(Arc::new(Hyperlink::new("https://seq.example/"))));
+    let cases = [
+        ("", 0, "abc", &blank),
+        ("", 7, "abc", &blank),
+        ("ab", 2, "  cd", &blank),
+        ("ab", 9, "  cd", &blank),
+        ("ab", 9, "   ", &blank),
+        ("ab", 9, "  cd", &bold),
+        ("ab", 9, " ", &bold),
+        ("", 60, "123", &linked),
+        ("", 119, "4", &blank),
+    ];
+    for (prefix, idx, text, attr) in cases {
+        let start = || {
+            let mut line = Line::new(1);
+            assert!(line.append_ascii_cell_run(0, prefix, CellAttributes::blank(), 1));
+            line
+        };
+        let mut bulk = start();
+        assert!(bulk.append_ascii_cell_run(idx, text, attr.clone(), 2));
+        let mut per_cell = start();
+        for (offset, byte) in text.bytes().enumerate() {
+            per_cell.set_cell(idx + offset, Cell::new(char::from(byte), attr.clone()), 2);
+        }
+        assert!(
+            bulk == per_cell,
+            "prefix {:?} at {} text {:?}: {:?} != {:?}",
+            prefix,
+            idx,
+            text,
+            bulk,
+            per_cell
+        );
+        assert!(matches!(&bulk.cells, CellStorage::C(_)));
+    }
+}
+
+/// ft-70s4z: a cell written far past the end of a clustered line fills the
+/// gap in one step and stays clustered, through both `set_cell` and
+/// `set_cell_grapheme`.
+#[test]
+fn far_cell_writes_fill_the_gap_and_stay_clustered() {
+    let mut line = Line::new(1);
+    line.set_cell(60, Cell::new('x', CellAttributes::blank()), 2);
+    line.set_cell_grapheme(100, "\u{4e2d}", 2, CellAttributes::blank(), 3);
+    assert!(matches!(&line.cells, CellStorage::C(_)));
+    assert_eq!(line.len(), 102);
+    let text: String = line
+        .visible_cells()
+        .map(|cell| cell.str().to_string())
+        .collect();
+    assert_eq!(
+        text,
+        format!("{}x{}\u{4e2d}", " ".repeat(60), " ".repeat(39))
+    );
 }

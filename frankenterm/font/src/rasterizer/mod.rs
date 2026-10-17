@@ -11,6 +11,8 @@ pub(crate) const FAKE_ITALIC_SKEW: f64 = 0.2;
 
 #[cfg(not(windows))]
 pub mod colr;
+#[cfg(target_os = "macos")]
+pub mod coretext;
 #[cfg(not(windows))]
 pub mod freetype;
 #[cfg(not(windows))]
@@ -55,7 +57,42 @@ pub fn new_rasterizer(
         FontRasterizerSelection::Harfbuzz => Ok(Box::new(
             harfbuzz::HarfbuzzRasterizer::from_locator(handle)?,
         )),
+        FontRasterizerSelection::CoreText => coretext_or_freetype(handle, pixel_geometry),
     }
+}
+
+/// CoreText for faces it can load; FreeType, the kill-switch fallback, for
+/// the rest (ft-yccm0.4.3.1).
+#[cfg(target_os = "macos")]
+fn coretext_or_freetype(
+    handle: &ParsedFont,
+    pixel_geometry: config::DisplayPixelGeometry,
+) -> anyhow::Result<Box<dyn FontRasterizer>> {
+    match coretext::CoreTextRasterizer::from_locator(handle) {
+        Ok(rasterizer) => Ok(Box::new(rasterizer)),
+        Err(reason) => {
+            log::info!(
+                "CoreText rasterizer: {} falls back to FreeType: {reason:#}",
+                handle.handle.diagnostic_string()
+            );
+            Ok(Box::new(freetype::FreeTypeRasterizer::from_locator(
+                handle,
+                pixel_geometry,
+            )?))
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn coretext_or_freetype(
+    handle: &ParsedFont,
+    pixel_geometry: config::DisplayPixelGeometry,
+) -> anyhow::Result<Box<dyn FontRasterizer>> {
+    log::warn!("font_rasterizer = \"CoreText\" is macOS-only; using FreeType");
+    Ok(Box::new(freetype::FreeTypeRasterizer::from_locator(
+        handle,
+        pixel_geometry,
+    )?))
 }
 
 #[cfg(windows)]

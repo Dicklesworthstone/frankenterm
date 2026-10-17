@@ -137,7 +137,16 @@ fn serialize_screen_cells(term: &Terminal) -> Vec<String> {
     cells
 }
 
-fn chunk_snapshot(term: &Terminal, capture: &CapturedWriter) -> ChunkSnapshot {
+/// Waits until the writer thread has written everything the terminal queued
+/// for its child; the writer never blocks the terminal itself.
+fn drain(term: &mut Terminal) {
+    term.writer_barrier()
+        .wait(std::time::Duration::from_secs(10))
+        .expect("terminal writer drained");
+}
+
+fn chunk_snapshot(term: &mut Terminal, capture: &CapturedWriter) -> ChunkSnapshot {
+    drain(term);
     let cursor = term.cursor_pos();
     ChunkSnapshot {
         cursor_x: cursor.x,
@@ -740,6 +749,8 @@ proptest! {
             offset += chunk_len;
         }
 
+        drain(&mut chunked);
+        drain(&mut whole);
         prop_assert_eq!(
             chunked_capture.snapshot(),
             whole_capture.snapshot(),
@@ -796,6 +807,8 @@ proptest! {
                 mode_idx,
                 payload.len()
             );
+            drain(&mut chunked);
+            drain(&mut whole);
             prop_assert_eq!(
                 chunked_capture.snapshot(),
                 whole_capture.snapshot(),
@@ -820,7 +833,7 @@ proptest! {
         let (mut whole, whole_capture) = make_term_with_capture(rows, cols);
         whole.advance_bytes(&payload);
         assert_terminal_invariants(&whole, rows, cols, &payload);
-        let expected = chunk_snapshot(&whole, &whole_capture);
+        let expected = chunk_snapshot(&mut whole, &whole_capture);
 
         let (mut chunked, chunked_capture) = make_term_with_capture(rows, cols);
         for byte in &payload {
@@ -829,7 +842,7 @@ proptest! {
         assert_terminal_invariants(&chunked, rows, cols, &payload);
 
         prop_assert_eq!(
-            chunk_snapshot(&chunked, &chunked_capture),
+            chunk_snapshot(&mut chunked, &chunked_capture),
             expected,
             "byte-by-byte pty escape chunking changed terminal state for payload_len={}",
             payload.len()
@@ -861,7 +874,7 @@ proptest! {
     ) {
         let (mut whole, whole_capture) = make_term_with_capture(rows, cols);
         whole.advance_bytes(&payload);
-        let expected = chunk_snapshot(&whole, &whole_capture);
+        let expected = chunk_snapshot(&mut whole, &whole_capture);
 
         let (mut chunked, chunked_capture) = make_term_with_capture(rows, cols);
         let mut offset = 0;
@@ -876,7 +889,7 @@ proptest! {
         if offset < payload.len() {
             chunked.advance_bytes(&payload[offset..]);
         }
-        let actual = chunk_snapshot(&chunked, &chunked_capture);
+        let actual = chunk_snapshot(&mut chunked, &chunked_capture);
 
         // Cursor + title + scrollback + pty-responses must be chunk-invariant over
         // arbitrary chunk sizes for complete escape streams. (Cell content is NOT

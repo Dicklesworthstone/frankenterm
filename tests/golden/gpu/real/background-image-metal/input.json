@@ -1,0 +1,11 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "image behind default cells\n\u001b[48;5;52m explicit background \u001b[0m\nmore default cells\u001b[?25l",
+    "config": {
+      "window_background_image": "${FIXTURES}/background-checker.png",
+      "front_end": "Metal"
+    }
+  },
+  "parity_golden": "real/background-image"
+}

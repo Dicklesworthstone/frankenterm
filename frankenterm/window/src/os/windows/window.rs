@@ -124,6 +124,8 @@ static NEXT_WINDOW_ID: AtomicUsize = AtomicUsize::new(1);
 struct RepaintState {
     throttled: Cell<bool>,
     invalidated: Cell<bool>,
+    /// The latest paint's throttle slot (`crate::repaint_slot`, ft-1w85m).
+    slot: Cell<Option<Instant>>,
 }
 
 /// The admitted Render task owns this latch even before its first poll.
@@ -1950,6 +1952,9 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
         return Some(0);
     }
     state.invalidated.set(false);
+    let interval = config::frame_interval_for_max_fps(max_fps);
+    let slot = crate::repaint_slot(state.slot.get(), paint_started, interval);
+    state.slot.set(Some(slot));
     let throttle = RepaintThrottle {
         window,
         owner: Rc::downgrade(&owner),
@@ -1964,12 +1969,8 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
     ) {
         reservation
             .spawn_local(async move {
-                crate::complete_repaint_after_interval(
-                    paint_started,
-                    config::frame_interval_for_max_fps(max_fps),
-                    move || drop(throttle),
-                )
-                .await;
+                crate::complete_repaint_after_interval(slot, interval, move || drop(throttle))
+                    .await;
             })
             .detach();
     } else {

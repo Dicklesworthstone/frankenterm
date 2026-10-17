@@ -722,39 +722,58 @@ mod alphabet_test {
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
 
-        // Saturate the 4-worker permit pool
-        let p1 = LineReadPermit::try_acquire().expect("permit 1");
-        let p2 = LineReadPermit::try_acquire().expect("permit 2");
-        let p3 = LineReadPermit::try_acquire().expect("permit 3");
-        let p4 = LineReadPermit::try_acquire().expect("permit 4");
-        assert!(LineReadPermit::try_acquire().is_none());
-
-        // QuickSelectLineRead::start must return Ok(None) representing Busy retention
-        let busy_result = QuickSelectLineRead::start(&fixture.pane, accepted, deadline, || {});
+        // A saturated pool, injected: the process-wide pool is shared with
+        // the tests running alongside, so exhausting it raced them
+        // (ft-6xf07). Busy must yield Ok(None) to retain the pending action.
+        let busy_result =
+            QuickSelectLineRead::start_with(&fixture.pane, accepted, deadline, || None, || {});
         assert!(
             matches!(busy_result, Ok(None)),
             "Permit saturation must yield Ok(None) to retain pending action"
         );
 
-        // Release one permit
-        drop(p1);
+        // An expired deadline is refused before a permit is taken.
+        let expired = std::time::Instant::now() - Duration::from_millis(10);
+        let refused = QuickSelectLineRead::start_with(
+            &fixture.pane,
+            accepted,
+            expired,
+            || panic!("an expired read must not take a permit"),
+            || {},
+        );
+        assert_eq!(refused.err(), Some("The selection deadline expired."));
 
-        // Now start must succeed and acquire the released permit
+        // With a permit, start succeeds and runs the read. One real permit:
+        // wait for a free one rather than assume the shared pool is idle.
+        let permit_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let permit = loop {
+            if let Some(permit) = LineReadPermit::try_acquire() {
+                break permit;
+            }
+            assert!(
+                std::time::Instant::now() < permit_deadline,
+                "no read permit came free in 5 s"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
         let (woke, wake) = sync_channel(1);
-        let read = QuickSelectLineRead::start(&fixture.pane, accepted, deadline, move || {
-            let _ = woke.send(());
-        });
+        let read = QuickSelectLineRead::start_with(
+            &fixture.pane,
+            accepted,
+            deadline,
+            move || Some(permit),
+            move || {
+                let _ = woke.send(());
+            },
+        );
         assert!(
             matches!(read, Ok(Some(_))),
-            "After permit release, start must succeed"
+            "With a permit, start must succeed"
         );
 
         wake.recv_timeout(Duration::from_secs(5))
             .expect("worker wake");
         drop(read);
-        drop(p2);
-        drop(p3);
-        drop(p4);
     }
 
     #[test]
@@ -1916,10 +1935,30 @@ impl QuickSelectLineRead {
         deadline: std::time::Instant,
         wake: impl FnOnce() + Send + 'static,
     ) -> Result<Option<Self>, &'static str> {
+        Self::start_with(
+            pane,
+            accepted_selection,
+            deadline,
+            LineReadPermit::try_acquire,
+            wake,
+        )
+    }
+
+    /// [`Self::start`] with the read permit from `acquire`, called once the
+    /// deadline holds; `None` is a saturated pool (busy). Tests inject it
+    /// rather than exhaust the process-wide pool, which tests running
+    /// alongside share (ft-6xf07).
+    fn start_with(
+        pane: &Arc<dyn Pane>,
+        accepted_selection: SelectionRange,
+        deadline: std::time::Instant,
+        acquire: impl FnOnce() -> Option<LineReadPermit>,
+        wake: impl FnOnce() + Send + 'static,
+    ) -> Result<Option<Self>, &'static str> {
         if std::time::Instant::now() >= deadline {
             return Err("The selection deadline expired.");
         }
-        let Some(permit) = LineReadPermit::try_acquire() else {
+        let Some(permit) = acquire() else {
             return Ok(None);
         };
 

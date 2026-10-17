@@ -34,6 +34,14 @@ impl Write for CapturedWriter {
     }
 }
 
+/// Waits until the writer thread has written everything the terminal queued
+/// for its child; terminal writes never block on the writer (ft-yccm0.2.2.5).
+fn drain(term: &mut Terminal) {
+    term.writer_barrier()
+        .wait(std::time::Duration::from_secs(10))
+        .expect("terminal writer drained");
+}
+
 fn make_term_with_writer(writer: CapturedWriter) -> Terminal {
     Terminal::new(
         TerminalSize {
@@ -212,6 +220,7 @@ fn decrqm_2026_when_set_responds_with_ps_1() {
     term.advance_bytes(BSU);
     assert!(term.synchronized_output());
     term.advance_bytes(DECRQM_2026);
+    drain(&mut term);
 
     let buf = captured.lock().unwrap().clone();
     assert_eq!(
@@ -231,6 +240,7 @@ fn decrqm_2026_when_unset_responds_with_ps_2() {
     // No BSU — flag is at default (false).
     assert!(!term.synchronized_output());
     term.advance_bytes(DECRQM_2026);
+    drain(&mut term);
 
     let buf = captured.lock().unwrap().clone();
     assert_eq!(
@@ -250,6 +260,7 @@ fn decrqm_2026_after_bsu_then_esu_responds_with_ps_2() {
     term.advance_bytes(BSU);
     term.advance_bytes(ESU);
     term.advance_bytes(DECRQM_2026);
+    drain(&mut term);
 
     let buf = captured.lock().unwrap().clone();
     assert_eq!(

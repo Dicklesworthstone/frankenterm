@@ -280,7 +280,8 @@ impl TerminalState {
         event.x = x;
         event.y = y;
 
-        match event {
+        // Mouse reports are user input: queued in order, never dropped.
+        self.with_user_input(|term| match event {
             MouseEvent {
                 kind: MouseEventKind::Press,
                 button:
@@ -289,7 +290,7 @@ impl TerminalState {
                     | MouseButton::WheelLeft(_)
                     | MouseButton::WheelRight(_),
                 ..
-            } => self.mouse_wheel(event),
+            } => term.mouse_wheel(event),
             MouseEvent {
                 kind: MouseEventKind::Press | MouseEventKind::Release,
                 button: MouseButton::None,
@@ -301,16 +302,16 @@ impl TerminalState {
             MouseEvent {
                 kind: MouseEventKind::Press,
                 ..
-            } => self.mouse_button_press(event),
+            } => term.mouse_button_press(event),
             MouseEvent {
                 kind: MouseEventKind::Release,
                 ..
-            } => self.mouse_button_release(event),
+            } => term.mouse_button_release(event),
             MouseEvent {
                 kind: MouseEventKind::Move,
                 ..
-            } => self.mouse_move(event),
-        }
+            } => term.mouse_move(event),
+        })
     }
 }
 

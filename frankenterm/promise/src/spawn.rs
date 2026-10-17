@@ -1158,6 +1158,23 @@ lazy_static::lazy_static! {
         start_background_executor();
 }
 
+/// The QoS class of every thread that runs promise's async work: the
+/// background executor's thread (the GUI's pane-output and render-wake
+/// workers run there) and both runtimes' workers (socket and timer
+/// readiness for main-thread futures, `block_on` bridges). The user waits on
+/// all of it, so none of it may queue behind the host's default-class load
+/// (ft-yccm0.6).
+const ASYNC_THREAD_QOS: procinfo::ThreadQos = procinfo::ThreadQos::UserInitiated;
+
+/// A current-thread runtime whose threads (its worker and any blocking-pool
+/// threads) are named `prefix-N` and start at [`ASYNC_THREAD_QOS`].
+#[cfg(feature = "async-asupersync")]
+fn promise_runtime_builder(prefix: &str) -> asupersync::runtime::RuntimeBuilder {
+    asupersync::runtime::RuntimeBuilder::current_thread()
+        .thread_name_prefix(prefix)
+        .on_thread_start(|| procinfo::start_thread_at(ASYNC_THREAD_QOS))
+}
+
 fn start_background_executor() -> std::result::Result<Arc<Executor<'static>>, String> {
     let executor = Arc::new(Executor::new());
     let worker_executor = Arc::clone(&executor);
@@ -1166,17 +1183,23 @@ fn start_background_executor() -> std::result::Result<Arc<Executor<'static>>, St
         // This worker owns a dedicated reactor. Reusing ASUPERSYNC_RUNTIME here
         // would hold its current-thread `block_on` forever and starve unrelated
         // synchronous I/O bridges.
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        let runtime = promise_runtime_builder("promise-background")
             .build()
             .map_err(|err| err.to_string())?;
         std::thread::Builder::new()
             .name("promise-background-io".to_string())
-            .spawn(move || runtime.block_on(worker_executor.run(std::future::pending::<()>())))
+            .spawn(move || {
+                procinfo::start_thread_at(ASYNC_THREAD_QOS);
+                runtime.block_on(worker_executor.run(std::future::pending::<()>()))
+            })
     };
     #[cfg(not(feature = "async-asupersync"))]
     let worker = std::thread::Builder::new()
         .name("promise-background-io".to_string())
-        .spawn(move || async_io::block_on(worker_executor.run(std::future::pending::<()>())));
+        .spawn(move || {
+            procinfo::start_thread_at(ASYNC_THREAD_QOS);
+            async_io::block_on(worker_executor.run(std::future::pending::<()>()))
+        });
 
     worker
         .map(|_worker| executor)
@@ -1228,7 +1251,7 @@ pub fn try_reserve_background_task(
 #[cfg(feature = "async-asupersync")]
 static ASUPERSYNC_RUNTIME: std::sync::LazyLock<asupersync::runtime::Runtime> =
     std::sync::LazyLock::new(|| {
-        asupersync::runtime::RuntimeBuilder::current_thread()
+        promise_runtime_builder("promise-block-on")
             .build()
             .expect("failed to build asupersync runtime")
     });
@@ -2959,6 +2982,67 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("background worker should poll the reserved future");
         assert_eq!(worker_name.as_deref(), Some("promise-background-io"));
+    }
+
+    /// What a thread at [`ASYNC_THREAD_QOS`] reads: the class it asked for
+    /// and the base priority it actually runs at (macOS only).
+    fn expected_async_thread_qos() -> (Option<procinfo::ThreadQos>, Option<i32>) {
+        if cfg!(target_os = "macos") {
+            (
+                Some(ASYNC_THREAD_QOS),
+                Some(ASYNC_THREAD_QOS.base_priority()),
+            )
+        } else {
+            (None, None)
+        }
+    }
+
+    /// ft-yccm0.6: the background executor's thread, where the GUI's
+    /// pane-output and render-wake workers run, runs at user-initiated: the
+    /// priority it actually gets, not only the class it asked for.
+    #[test]
+    fn background_futures_run_at_user_initiated_qos() {
+        let _lock = lock_or_recover(&TEST_LOCK);
+        let reservation = try_reserve_background_task(4 * 1024)
+            .expect("background I/O capacity should be available");
+        let (tx, rx) = flume::bounded(1);
+        reservation.spawn(async move {
+            tx.send((
+                procinfo::current_thread_qos(),
+                procinfo::current_thread_base_priority(),
+            ))
+            .expect("test receiver should remain live");
+        });
+        let observed = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("background worker should poll the reserved future");
+        assert_eq!(observed, expected_async_thread_qos());
+    }
+
+    /// ft-yccm0.6: a promise runtime's worker is named after its runtime and
+    /// runs at user-initiated. Checked on a private runtime built like the
+    /// shared ones: a concurrent `block_on` borrows a shared runtime's
+    /// worker, so a task spawned there may run on the borrower's thread.
+    #[cfg(feature = "async-asupersync")]
+    #[test]
+    fn promise_runtime_workers_run_at_user_initiated_qos() {
+        let runtime = promise_runtime_builder("promise-qos-test")
+            .build()
+            .expect("promise runtime");
+        let (tx, rx) = flume::bounded(1);
+        drop(runtime.handle().spawn(async move {
+            tx.send((
+                std::thread::current().name().map(str::to_owned),
+                procinfo::current_thread_qos(),
+                procinfo::current_thread_base_priority(),
+            ))
+            .expect("test receiver should remain live");
+        }));
+        let (name, qos, priority) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the runtime's worker should run the task");
+        assert_eq!(name.as_deref(), Some("promise-qos-test-0"));
+        assert_eq!((qos, priority), expected_async_thread_qos());
     }
 
     #[test]

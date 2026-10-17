@@ -1068,14 +1068,22 @@ impl SelectionFrameState {
         self.pending = None;
         self.pending_hyperlinks = None;
     }
+    /// Stages the stamp of a pane this attempt drew and returns it.
     pub fn stage(
         &mut self,
         before: Option<SelectionFrameStamp>,
         after: Option<SelectionFrameStamp>,
         complete: bool,
-    ) {
+    ) -> Option<SelectionFrameStamp> {
         self.pending = before
             .filter(|before| complete && after.is_some_and(|after| before.same_coordinates(after)));
+        self.pending
+    }
+    /// Stages again the stamp `stage` returned for a frame this attempt drew
+    /// once more, unchanged, because its terminal was busy (ft-yccm0.2.2.3).
+    /// The pane shows exactly that frame, so its stamp stays the authority.
+    pub(crate) fn restage(&mut self, stamp: Option<SelectionFrameStamp>) {
+        self.pending = stamp;
     }
     /// Return only the complete stamp promoted by this successful submission.
     /// An omitted/incomplete pane must not report its previously displayed stamp.

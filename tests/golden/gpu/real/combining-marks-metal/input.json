@@ -1,0 +1,10 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "acute: e\u0301 a\u0300 o\u0302 n\u0303 u\u0308\nstack: a\u0301\u0302\u0323 o\u031b\u0309 x\u0336\nviet:  Ti\u1ebfng Vi\u1ec7t c\u00f3 d\u1ea5u\ndeva:  \u0928\u092e\u0938\u094d\u0924\u0947 \u0926\u0941\u0928\u093f\u092f\u093e\nthai:  \u0e2a\u0e27\u0e31\u0e2a\u0e14\u0e35\u0e0a\u0e32\u0e27\u0e42\u0e25\u0e01\nruler: 0123456789012345678901234\u001b[?25l",
+    "config": {
+      "front_end": "Metal"
+    }
+  },
+  "parity_golden": "real/combining-marks"
+}

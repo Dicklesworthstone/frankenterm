@@ -15961,11 +15961,19 @@ mod test {
         let fired_for_hook = Arc::clone(&fired);
         let revision_for_hook = Arc::clone(&revision_after_hook);
         let tab_for_hook = Arc::clone(&hook_tab);
+        // The commit runs on this thread. Anything else that reads the pane
+        // id meanwhile must leave the probe armed for it: in a parallel suite
+        // this idle mux's prune can run on another test's scheduler at any
+        // moment, and it reads every pane's id (the probe then fired before
+        // preparation, and the commit found nothing stale).
+        let commit_thread = std::thread::current().id();
         let target = FakePane::new_with_pane_id_probe(
             32_120,
             size,
             Arc::new(move || {
-                if !armed_for_hook.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                if std::thread::current().id() != commit_thread
+                    || !armed_for_hook.swap(false, std::sync::atomic::Ordering::AcqRel)
+                {
                     return;
                 }
                 let tab = tab_for_hook
@@ -15999,6 +16007,12 @@ mod test {
         mux.pane_count_recomputes
             .store(0, std::sync::atomic::Ordering::Relaxed);
         armed.store(true, std::sync::atomic::Ordering::Release);
+        // A pane-id read on another thread, as such a prune makes, leaves the
+        // probe armed for the commit.
+        std::thread::scope(|scope| {
+            scope.spawn(|| target.pane_id()).join().unwrap();
+        });
+        assert!(!fired.load(std::sync::atomic::Ordering::Acquire));
 
         let error = mux
             .commit_guarded_moved_split(&target_guard, &source_guard, SplitRequest::default())
@@ -17561,10 +17575,15 @@ mod test {
             .expect("register public-floating test domain");
         let window = mux.new_empty_window(Some("public-floating".to_string()), None);
         let window_id = *window;
-        drop(window);
         let tiled = FakePane::new(31_001, size);
         let floating = FakePane::new(31_002, size);
         let tab = attach_floating_reconcile_test_tab(&mux, &tiled, size, window_id);
+        // The builder's activity keeps the empty window from being pruned
+        // until its tab is attached, as a spawn's does. Dropped before that,
+        // the window could go: the idle mux is pruned on the process's
+        // main-thread scheduler, which in a parallel suite is another test's,
+        // and runs at any moment ("no such window_id").
+        drop(window);
         mux.add_pane(&floating)
             .expect("register detached public floating pane");
         mux.pane_count_recomputes
@@ -17713,11 +17732,12 @@ mod test {
             .expect("register successor test domain");
         let window = mux.new_empty_window(Some("public-successor".to_string()), None);
         let window_id = *window;
-        drop(window);
         let tiled = FakePane::new(31_003, size);
         let incumbent = FakePane::new(31_004, size);
         let successor = FakePane::new(31_004, size);
         let tab = attach_floating_reconcile_test_tab(&mux, &tiled, size, window_id);
+        // Only now: an empty window can be pruned once its builder drops.
+        drop(window);
         mux.add_pane(&incumbent)
             .expect("register incumbent floating pane");
         tab.add_floating_pane(
@@ -17811,10 +17831,11 @@ mod test {
             .expect("register exhaustion test domain");
         let window = mux.new_empty_window(Some("public-exhaustion".to_string()), None);
         let window_id = *window;
-        drop(window);
         let tiled = FakePane::new(31_005, size);
         let floating = FakePane::new(31_006, size);
         let tab = attach_floating_reconcile_test_tab(&mux, &tiled, size, window_id);
+        // Only now: an empty window can be pruned once its builder drops.
+        drop(window);
         mux.add_pane(&floating)
             .expect("register exhaustion floating pane");
         tab.add_floating_pane(
@@ -17894,10 +17915,11 @@ mod test {
             .expect("register output-corruption test domain");
         let window = mux.new_empty_window(Some("public-output-corruption".to_string()), None);
         let window_id = *window;
-        drop(window);
         let tiled = FakePane::new(31_009, size);
         let floating = FakePane::new(31_010, size);
         let tab = attach_floating_reconcile_test_tab(&mux, &tiled, size, window_id);
+        // Only now: an empty window can be pruned once its builder drops.
+        drop(window);
         mux.add_pane(&floating)
             .expect("register output-corruption floating pane");
         tab.add_floating_pane(
@@ -18009,10 +18031,11 @@ mod test {
             .expect("register overflow test domain");
         let window = mux.new_empty_window(Some("public-overflow".to_string()), None);
         let window_id = *window;
-        drop(window);
         let tiled = FakePane::new(31_007, size);
         let floating = FakePane::new(31_008, size);
         let tab = attach_floating_reconcile_test_tab(&mux, &tiled, size, window_id);
+        // Only now: an empty window can be pruned once its builder drops.
+        drop(window);
         mux.add_pane(&floating)
             .expect("register detached overflow pane");
         mux.num_panes_by_workspace

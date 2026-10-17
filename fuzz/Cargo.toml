@@ -470,6 +470,15 @@ bench = false
 path = "fuzz_targets/term_advance_bytes.rs"
 doc = false
 
+# ft-yccm0.1.8: legacy vs candidate terminal engines on identical chunked
+# streams. Shares frankenterm/term/tests/differential with the CI runner.
+[[bin]]
+name = "term_engine_differential"
+test = false
+bench = false
+path = "fuzz_targets/term_engine_differential.rs"
+doc = false
+
 [[bin]]
 name = "mcp_request_params"
 test = false

@@ -351,3 +351,167 @@ If you are tuning a live deployment and do not know where to start, use this ord
 6. `wezterm`, `wire_protocol`, and `ipc`: only when backend or transport diagnostics point there.
 
 The default configuration is intentionally conservative. For most fleets, the right first move is to leave most keys alone and adjust only the small set of knobs tied to the subsystem that is already showing stress.
+
+## Durable Scrollback Writer (GUI and mux config)
+
+These keys live in the GUI and mux config (`frankenterm.lua`, `wezterm.lua` or
+`frankenterm.toml`), not in `ft.toml`. One `scrollback-durability` thread per
+process stores every pane's evicted scrollback rows. The keys are
+process-wide, and each new pane applies their current values.
+
+| Key | Default | Range | What it controls |
+| --- | --- | --- | --- |
+| `scrollback_durability_queue_max_mb` | `64` | any | Byte budget for rows queued behind the writer, shared by all panes. Past it, a pane's oldest queued rows are dropped from durability and recorded as an explicit gap marker instead of throttling the pane (ft-yccm0.2.1.6; see `docs/resource-pressure-cockpit-contract.md`). |
+| `scrollback_durability_commit_window_ms` | `250` | `0..=5000` | Commit window. A pane's queued rows wait up to this long after the first one, then go to the store in one transaction with one set of syncs (ft-yccm0.2.1.2). `0` commits every handoff at once. |
+| `scrollback_durability_commit_window_mb` | `8` | `1..=256` | Closes a window early once this many MiB are queued. |
+| `scrollback_durability_commit_idle_ms` | `25` | `0..=5000` | Closes a window early once its pane has queued no row for this long, so a burst commits as soon as it ends. |
+| `scrollback_durability_manifest_publish_ms` | `1000` | `0..=60000` | Shortest interval between two manifest publications of one pane (ft-yccm0.2.1.2). Between them each window appends its rows under one sync. `0` publishes after every store batch. |
+
+Other events close a window at once:
+
+- a full window (65,536 rows, sixteen store batches);
+- an overload gap, or a queue past half its budget;
+- an explicit flush, such as a checkpoint;
+- the pane closing.
+
+For A/B runs, `FT_DURABILITY_COMMIT_WINDOW_MS` overrides the window, up to
+5000 ms, and `FT_DURABILITY_MANIFEST_PUBLISH_MS` the publication interval, up
+to 60000 ms.
+
+**Publication.** A window's rows are durable once its single sync returns.
+The manifest that describes them is published at most once per interval,
+and also on pane close, on an explicit flush and before a snapshot. A
+publication writes one cumulative WAL naming every row since the last
+manifest, prunes what retention evicted, and replaces the manifest: about
+eight syncs, once per interval rather than once per batch. After a crash,
+reopen adopts every unpublished row that opens at its exact location and
+cuts a torn or reordered remainder. A process's first window, a key
+rotation, or a retention change runs as one store batch with its own WAL
+and manifest, so the nonce segment its rows need is published before a
+tail depends on it.
+
+**Tradeoff.**
+
+- **Longer windows.** Rows from many parse batches share one transaction,
+  which cuts syncs, renames and manifest publications per row.
+- **Exposure.** Rows sit in memory, not on disk, until their window closes. A
+  crash loses the queued rows: about one window of output when the writer
+  keeps up, up to the queue budget when it is behind.
+- **Overload.** Under a flood, the batch limit closes windows long before the
+  window age does, so the window mainly saves IO for interactive output and
+  moderate streams.
+
+## Pane Output Ring (GUI and mux config)
+
+Each pane's reader thread hands PTY output to its parser thread through a
+ring of preallocated slots (ft-yccm0.3.1.1). It replaced an AF_UNIX
+socketpair, so moving bytes between the two threads costs no syscall and no
+kernel copy. The parser parses each slot in place. Each new pane applies the
+current values.
+
+| Key | Default | Range | What it controls |
+| --- | --- | --- | --- |
+| `mux_output_ring_slots` | `8` | `2..=1024` | Slots per pane. When every slot holds unparsed output, the reader parks and stops reading the PTY, so the kernel throttles the child. |
+| `mux_output_ring_slot_bytes` | `65536` | `4096..=16777216` | Bytes per slot. One delivery fills as many slots as it needs; a slot is published as soon as its delivery ends, so small output is not held back. |
+
+On Unix the reader gathers PTY output into batches before it hands them over
+(ft-yccm0.3.1.2). A macOS PTY master returns about 1 KiB per `read` under
+load (Ghostty observes the same in `Exec.zig`), and every batch costs a ring
+publication, a parser wake and terminal-model work. So:
+
+- A first read below `mux_output_gather_min_bytes` is published at once, so
+  keypress echo never waits.
+- From that size on, the reader keeps reading what is already buffered:
+  `mux_output_gather_spin_checks` immediate checks, then polls of at most
+  `mux_output_gather_poll_us` each.
+- It publishes at a full slot, EOF, an idle parser (the parser interrupts the
+  poll before it sleeps), or after `mux_output_gather_max_wait_us` in total.
+
+The PTY descriptor stays blocking, because it shares its open file description
+with the input writer; the reader polls before every read after the first.
+
+| Key | Default | Range | What it controls |
+| --- | --- | --- | --- |
+| `mux_output_gather_min_bytes` | `1024` | `0..=1048576` | Smallest first read that starts a gather. Below it, output is published at once. |
+| `mux_output_gather_spin_checks` | `16` | `0..=1024` | Immediate readiness checks before the reader polls with a timeout. |
+| `mux_output_gather_poll_us` | `1000` | `1..=100000` | Longest single poll while gathering, in microseconds. |
+| `mux_output_gather_max_wait_us` | `3000` | `0..=100000` | Longest time one batch may gather, in microseconds. `0` turns gathering off. |
+
+**Tradeoff.** Slots times slot bytes bounds the output buffered between
+reader and parser, about 512 KiB per pane by default. The slots are
+preallocated per pane; pages the OS has not touched cost no memory until
+output fills them. A larger ring absorbs longer bursts while the parser is
+busy, at the price of that memory per pane.
+
+## GUI Performance Advisories (`FT-TUNE` codes)
+
+These advisories cover the GUI config (`frankenterm.lua`, `wezterm.lua` or `frankenterm.toml`), not `ft.toml`. Each one names a setting that costs throughput or responsiveness without any other sign. The codes are stable and are never reused.
+
+Where they appear:
+
+- **GUI startup log.** The GUI logs one `warn` line per advisory, in the form `FT-TUNE-000N <setting>: <what it costs> Fix: <change> (<this page>)`. It judges `max_fps` against the fastest screen it sees.
+- **`ft doctor`.** Each advisory is a `performance config (<setting>)` warning row. In `--json`, the row carries a `code` field. The `config_tuning` block lists the inputs, where they came from, and every advisory with its `code`, `subject`, `detail`, `remediation` and `docs`.
+
+Where `ft doctor` gets the settings:
+
+- **From a running GUI.** A GUI publishes the settings it actually evaluated, and its fastest display, to `gui-tuning-<pid>.json` in the runtime directory. It republishes on config reload. Doctor trusts that file only while the same GUI's resource snapshot is fresh.
+- **From the config file.** With no running GUI, doctor reads the first config file the GUI would load, as text, and never executes it. It reads `name = value` assignments. Integer values may be products such as `512 * 1024`. An assignment that shares a line with an `if` is not read. A computed value, for example from a function call, is not guessed.
+- **Installed GUI version.** On macOS, the GUI version also comes from an installed `FrankenTerm.app` bundle.
+
+The rules are implemented in `frankenterm/config/src/tuning.rs`.
+
+### FT-TUNE-0001
+
+**`mux_output_parser_buffer_size` above 128 KiB**
+
+- **Trigger:** `mux_output_parser_buffer_size` is larger than its 128 KiB (`131072`) default.
+- **Cost:**
+  - Each pty read takes up to this many bytes, and the parsed batch is applied while the pane's terminal lock is held. A larger buffer means longer lock holds, and paint, mouse and resize all wait behind them.
+  - Output that backed up during any stall arrives in bursts of this size.
+  - A 512 KiB buffer makes every such burst four times the default.
+- **Fix:** remove the setting, or set it to `131072` or less.
+- **Tradeoff:** a larger buffer trims per-read overhead on a flood, but the extra lock time lands on the GUI thread.
+
+### FT-TUNE-0002
+
+**`max_fps` below the display's refresh rate**
+
+- **Trigger:** `max_fps` is below the refresh rate of the fastest screen the GUI reported.
+  - Without a running GUI, doctor cannot see the display and compares against 60 Hz, the `max_fps` default.
+  - The default `60` on a 120 Hz ProMotion display also trips this rule.
+- **Cost:** repaints are capped at `max_fps`, so output and typing echo reach the screen at most that many times a second. A 30 fps cap on a 60 Hz display halves the visible frame rate.
+- **Fix:** set `max_fps` to the refresh rate named in the advisory, for example `max_fps = 120`.
+- **Tradeoff:** a lower cap can save GPU work on battery. Make that choice deliberately, not as a leftover setting.
+
+### FT-TUNE-0003
+
+**Very large scrollback with tiering disabled**
+
+- **Trigger:** `scrollback_tiered_enabled = false` and `scrollback_lines` above 10,000.
+- **Cost:**
+  - Without tiering, every scrollback line of every pane stays in memory as a full line.
+  - A resize rewraps every one of those lines, so memory and resize time grow with `scrollback_lines` times the pane count.
+- **Fix:** set `scrollback_tiered_enabled = true` (the default), or lower `scrollback_lines` to 10,000 or less.
+  - With tiering, the newest `scrollback_hot_lines` lines (default 1,000) stay hot and older lines move to the warm and cold tiers.
+- **Tradeoff:** an untiered buffer avoids tier transitions entirely. The 10,000-line threshold is a heuristic, about three times the 3,500-line default.
+
+### FT-TUNE-0004
+
+**A front end that renders on the CPU**
+
+- **Trigger:** either of these, on every platform:
+  - `front_end = "Software"`, a software (CPU) OpenGL renderer;
+  - `front_end = "WebGpu"` with `webgpu_force_fallback_adapter = true`, which makes wgpu use its fallback adapter, generally a software implementation.
+- **Cost:** every frame is drawn on the CPU, which competes with the parser and the shell for the same cores.
+- **Fix:** remove `front_end` to use the default GPU renderer (OpenGL), or set `front_end = "WebGpu"`. Set `webgpu_force_fallback_adapter = false` (the default).
+- **Tradeoff:** a software renderer is a workaround for broken GPU drivers. Keep it only while that problem exists.
+- **Platform rows:** none yet. When a measurement shows a GPU front end slower on a given platform, add a platform row in `tuning.rs` and here. The Metal default switch is ft-yccm0.4.8.
+
+### FT-TUNE-0005
+
+**The GUI is older than `ft`**
+
+- **Trigger:** the GUI's release is older than the `ft` that runs doctor, compared as semantic versions (`0.15.6-rc.53` is older than `0.15.21`). The GUI version comes from the running GUI if one published it, otherwise from an installed `FrankenTerm.app` bundle.
+- **Cost:** the GUI runs without every change released after its version, including ingest, rendering and durability fixes.
+- **Fix:** install `FrankenTerm.app` from the same release as `ft` (`install.sh --version <ft's version>`), then restart FrankenTerm.
+- **Tradeoff:** none. Two builds of the same version that differ only by commit are not ordered, and are not reported.

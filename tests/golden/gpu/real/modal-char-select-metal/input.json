@@ -1,0 +1,13 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "char select modal scene\n\u001b[48;5;24m blue row under the modal \u001b[0m\u001b[?25l",
+    "config": {
+      "front_end": "Metal"
+    },
+    "snapshot": {
+      "modal": "char_select"
+    }
+  },
+  "parity_golden": "real/modal-char-select"
+}

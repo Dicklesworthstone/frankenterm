@@ -348,7 +348,7 @@ impl TermWindow {
                         if myself.mux_window_id == expected_window
                             && myself.pane_input_ready(&expected_pane)
                         {
-                            expected_pane.send_paste(&clip).ok();
+                            super::send_paste_or_notify(&*expected_pane, &clip);
                         }
                     })));
                 }

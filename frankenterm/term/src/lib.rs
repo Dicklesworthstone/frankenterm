@@ -151,6 +151,7 @@ pub struct SemanticZone {
 }
 
 pub mod color;
+pub mod pagegrid;
 
 #[cfg(test)]
 mod test;

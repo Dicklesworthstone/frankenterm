@@ -1,0 +1,14 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "scrollback line 00\nscrollback line 01\nscrollback line 02\nscrollback line 03\nscrollback line 04\nscrollback line 05\nscrollback line 06\nscrollback line 07\nscrollback line 08\nscrollback line 09\nscrollback line 10\nscrollback line 11\nscrollback line 12\nscrollback line 13\nscrollback line 14\nscrollback line 15\nscrollback line 16\nscrollback line 17\nscrollback line 18\nscrollback line 19\nscrollback line 20\nscrollback line 21\nscrollback line 22\nscrollback line 23\nscrollback line 24\nscrollback line 25\nscrollback line 26\nscrollback line 27\nscrollback line 28\nscrollback line 29\u001b[?25l",
+    "config": {
+      "enable_tab_bar": true,
+      "hide_tab_bar_if_only_one_tab": false,
+      "use_fancy_tab_bar": false,
+      "enable_scroll_bar": true,
+      "front_end": "Metal"
+    }
+  },
+  "parity_golden": "real/tab-bar-scrollbar"
+}

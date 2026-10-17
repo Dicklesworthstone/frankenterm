@@ -1,6 +1,7 @@
 use crate::glyphcache::{GlyphCache, SizedBlockKey};
 use crate::utilsprites::RenderMetrics;
 use config::DimensionContext;
+use frankenterm_font::FontConfiguration;
 use frankenterm_font::units::{IntPixelLength, PixelLength};
 use std::ops::Range;
 use termwiz::surface::CursorShape;
@@ -4899,8 +4900,10 @@ impl BlockKey {
 }
 
 impl GlyphCache {
-    fn draw_polys(
-        &mut self,
+    /// Paints `polys` into `buffer`. It needs only the metrics, not the
+    /// cache, so the Metal renderer's glyph source paints the same cursor
+    /// and block sprites (ft-yccm0.4.7.3).
+    fn paint_polys(
         metrics: &RenderMetrics,
         polys: &[Poly],
         buffer: &mut Image,
@@ -4948,10 +4951,26 @@ impl GlyphCache {
             return Ok(sprite.clone());
         }
 
+        let buffer = Self::cursor_sprite_image(&self.fonts, shape, metrics, width);
+        let sprite = self.atlas.allocate(&buffer)?;
+        self.cursor_glyphs.insert((shape, width), sprite.clone());
+        Ok(sprite)
+    }
+
+    /// The bitmap of a cursor sprite `width` cells wide: white (the alpha is
+    /// the coverage) over transparent black, anti-aliased. The WebGpu
+    /// renderer allocates it in its atlas; the Metal renderer places the same
+    /// pixels in its grayscale atlas (ft-yccm0.4.7.3).
+    pub(crate) fn cursor_sprite_image(
+        fonts: &FontConfiguration,
+        shape: Option<CursorShape>,
+        metrics: &RenderMetrics,
+        width: u8,
+    ) -> Image {
         let mut metrics = metrics.scale_cell_width(width as f64);
-        if let Some(d) = &self.fonts.config().cursor_thickness {
+        if let Some(d) = &fonts.config().cursor_thickness {
             metrics.underline_height = d.evaluate_as_pixels(DimensionContext {
-                dpi: self.fonts.get_dpi() as f32,
+                dpi: fonts.get_dpi() as f32,
                 pixel_max: metrics.underline_height as f32,
                 pixel_cell: metrics.cell_size.height as f32,
             }) as isize;
@@ -4971,7 +4990,7 @@ impl GlyphCache {
                 buffer.clear_rect(cell_rect, SrgbaPixel::rgba(0xff, 0xff, 0xff, 0xff));
             }
             Some(CursorShape::BlinkingBlock | CursorShape::SteadyBlock) => {
-                self.draw_polys(
+                Self::paint_polys(
                     &metrics,
                     &[Poly {
                         path: &[
@@ -4990,7 +5009,7 @@ impl GlyphCache {
                 );
             }
             Some(CursorShape::BlinkingBar | CursorShape::SteadyBar) => {
-                self.draw_polys(
+                Self::paint_polys(
                     &metrics,
                     &[Poly {
                         path: &[
@@ -5006,7 +5025,7 @@ impl GlyphCache {
                 );
             }
             Some(CursorShape::BlinkingUnderline | CursorShape::SteadyUnderline) => {
-                self.draw_polys(
+                Self::paint_polys(
                     &metrics,
                     &[Poly {
                         path: &[
@@ -5022,10 +5041,7 @@ impl GlyphCache {
                 );
             }
         }
-
-        let sprite = self.atlas.allocate(&buffer)?;
-        self.cursor_glyphs.insert((shape, width), sprite.clone());
-        Ok(sprite)
+        buffer
     }
 
     pub fn block_sprite(
@@ -5033,6 +5049,23 @@ impl GlyphCache {
         render_metrics: &RenderMetrics,
         key: SizedBlockKey,
     ) -> anyhow::Result<Sprite> {
+        let buffer = Self::block_sprite_image(render_metrics, key.block);
+        let sprite = self.atlas.allocate(&buffer)?;
+        self.block_glyphs.insert(key, sprite.clone());
+        Ok(sprite)
+    }
+
+    /// The bitmap of the custom glyph `block` (box drawing, block elements,
+    /// powerline and the like) for a cell of `render_metrics`: white (the
+    /// alpha is the coverage) over transparent black. The WebGpu renderer
+    /// allocates it in its atlas; the Metal renderer places the same pixels in
+    /// its grayscale atlas, so lines connect across cells identically on both
+    /// (ft-yccm0.4.7.3).
+    pub(crate) fn block_sprite_image(render_metrics: &RenderMetrics, block: BlockKey) -> Image {
+        let key = SizedBlockKey {
+            block,
+            size: render_metrics.into(),
+        };
         let metrics = match &key.block {
             BlockKey::PolyWithCustomMetrics {
                 underline_height,
@@ -5118,7 +5151,7 @@ impl GlyphCache {
             }
             BlockKey::Triangles(triangles, alpha) => {
                 let mut draw = |cmd: &'static [PolyCommand], style: PolyStyle| {
-                    self.draw_polys(
+                    Self::paint_polys(
                         &metrics,
                         &[Poly {
                             path: cmd,
@@ -5201,7 +5234,7 @@ impl GlyphCache {
             }
             BlockKey::CellDiagonals(diagonals) => {
                 let mut draw = |cmd: &'static [PolyCommand]| {
-                    self.draw_polys(
+                    Self::paint_polys(
                         &metrics,
                         &[Poly {
                             path: cmd,
@@ -5350,7 +5383,7 @@ impl GlyphCache {
             }
             BlockKey::Progress(chunks) => {
                 let mut draw = |cmd: &'static [PolyCommand], style: PolyStyle| {
-                    self.draw_polys(
+                    Self::paint_polys(
                         &metrics,
                         &[Poly {
                             path: cmd,
@@ -5482,7 +5515,7 @@ impl GlyphCache {
             BlockKey::Branches(pattern) => {
                 let mut draw =
                     |cmd: &'static [PolyCommand], style: PolyStyle, blend_mode: BlendMode| {
-                        self.draw_polys(
+                        Self::paint_polys(
                             &metrics,
                             &[Poly {
                                 path: cmd,
@@ -5651,7 +5684,7 @@ impl GlyphCache {
             BlockKey::Spinner(segment) => {
                 let mut draw =
                     |cmd: &'static [PolyCommand], style: PolyStyle, blend_mode: BlendMode| {
-                        self.draw_polys(
+                        Self::paint_polys(
                             &metrics,
                             &[Poly {
                                 path: cmd,
@@ -5871,7 +5904,7 @@ impl GlyphCache {
                 }
             }
             BlockKey::Poly(polys) | BlockKey::PolyWithCustomMetrics { polys, .. } => {
-                self.draw_polys(
+                Self::paint_polys(
                     &metrics,
                     polys,
                     &mut buffer,
@@ -5890,9 +5923,7 @@ impl GlyphCache {
         buffer.log_bits();
         */
 
-        let sprite = self.atlas.allocate(&buffer)?;
-        self.block_glyphs.insert(key, sprite.clone());
-        Ok(sprite)
+        buffer
     }
 }
 

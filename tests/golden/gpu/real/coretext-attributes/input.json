@@ -1,0 +1,11 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "\u001b[1mbold\u001b[0m \u001b[3mitalic\u001b[0m \u001b[1;3mbold-italic\u001b[0m normal\n\u001b[4munder\u001b[0m \u001b[4:2mdouble\u001b[0m \u001b[4:3mcurly\u001b[0m \u001b[4:4mdotted\u001b[0m \u001b[4:5mdashed\u001b[0m\n\u001b[4:3;58;5;196mred curl\u001b[0m \u001b[4;58;2;0;200;255mcyan under\u001b[0m\n\u001b[9mstrike\u001b[0m \u001b[53moverline\u001b[0m \u001b[7mreverse\u001b[0m \u001b[2mdim\u001b[0m\n\u001b[5mblink\u001b[0m \u001b[8mhidden\u001b[0m<-hidden \u001b[1;4;9;53mall\u001b[0m\u001b[?25l",
+    "config": {
+      "font_rasterizer": "CoreText"
+    }
+  },
+  "reference_golden": "real/attributes",
+  "reference_min_ssim": 0.998
+}

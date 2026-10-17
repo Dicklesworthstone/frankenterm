@@ -1,0 +1,21 @@
+{"session":"double-sized-characters","screens":[
+{"screen":0,"rows":[
+]},
+{"screen":1,"rows":[
+]},
+{"screen":2,"rows":[
+]},
+{"screen":3,"rows":[
+]},
+{"screen":4,"rows":[
+]},
+{"screen":5,"rows":[
+{"row":12,"runs":[[3,37,"bold blink=slow"]]},
+{"row":13,"runs":[[3,36,"bold blink=slow"]]}
+]},
+{"screen":6,"rows":[
+{"row":24,"runs":[[3,37,"bold blink=slow"]]}
+]},
+{"screen":7,"rows":[
+]}
+]}

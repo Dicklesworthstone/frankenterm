@@ -19,7 +19,8 @@ Details are in `fingerprint.json`.
 | `gui-47759-sample-0.15.2.txt` | `/usr/bin/sample` (8 s, 1 ms) of the frozen FrankenTerm.app 0.15.2 (319a56d, front_end=WebGpu) while `cat color-random.bin` was stalled. Binary is stripped, so frames are addresses. |
 | `ftbench-seq-sample.txt` | Symbolized sample of the out-of-tree ftbench `term` lane on 64 MiB of `seq` output |
 | `ftbench-emoji-term-sample.txt` | Symbolized sample of the ftbench `term` lane on 64 MiB of the operator's color-emoji-random corpus |
-| `ftbench/` | Source of the out-of-tree headless driver over `frankenterm-term` at HEAD fc3fd2121. Lanes: parse, term, mux; `CONFIG=prodlike` mimics the GUI's mutex + Arc config reads. |
+| `ftbench/` | Source of the out-of-tree headless driver over `frankenterm-term` at HEAD fc3fd2121. Lanes: parse, term, mux; `CONFIG=prodlike` mimics the GUI's mutex + Arc config reads. Build it from the repository root with `CARGO_TARGET_DIR=/tmp/ftbench-target RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --manifest-path evidence/mac-render-perf/2026-10-05/ftbench/Cargo.toml`, then run it as `ftbench <parse\|term\|mux> <corpus>`. It is not a workspace member, and its path dependencies are repository-relative. |
+| `ftbench-emoji-term-after-fix-sample.txt` | Symbolized sample of the ftbench `term` lane on the emoji corpus after 2f7920f79 |
 
 ## Key observations
 
@@ -46,7 +47,20 @@ ftbench at 80x120 with 3,500-line scrollback, compared with `ghostty-bench +term
 
 ### 3. Hotspots
 
-**Emoji corpus (term lane):** `Performer::recluster_at_cursor` accounts for 52% of samples, and malloc/free for about 20%. The cause is an O(cursor_x) allocating scan that runs for every multi-byte grapheme (`frankenterm/term/src/terminalstate/performer.rs:110`, called at `:449`). Bead A4.8 fixes it.
+**Emoji corpus (term lane):** `Performer::recluster_at_cursor` accounts for 52% of samples, and malloc/free for about 20%. The cause is an O(cursor_x) allocating scan that runs for every multi-byte grapheme (`frankenterm/term/src/terminalstate/performer.rs:110`, called at `:449`).
+
+This was fixed in 2f7920f79 (bead ft-yccm0.2.11). The after-fix sample is `ftbench-emoji-term-after-fix-sample.txt`; it shows `recluster_at_cursor` at 0.0% of samples. The residual fallback is tracked in ft-yccm0.2.14.
+
+Quieter-window re-measurement on the same 64 MiB emoji slice (load avg 11-20):
+
+| Engine | Time |
+|---|---|
+| ghostty-bench | 0.42-0.50 s (~140 MiB/s) |
+| FrankenTerm term, before the fix (4 runs) | 2.61-2.87 s |
+| FrankenTerm term, allocation-free scan only (10 runs) | mean 1.218 s |
+| FrankenTerm term, fixed with the ZWJ gate (10 runs) | mean 0.862 s, CV ~2% |
+
+Ghostty's headless rate swings from ~32 to ~140 MiB/s with host load. Ghostty's GUI time on this test (41.8 s, about 17.9 MB/s) was measured on a busy machine. Compare only numbers taken in the same window.
 
 **seq corpus:** time goes to `Line::set_cell_impl` → `ClusteredLine::append_grapheme` / `guarded_reserve_text`, plus `Arc::make_mut` on every character, `CellAttributes::eq` on every character, and `Arc<ClusteredLine>::drop_slow` on every scroll (about 14%). Bead A4.6 addresses this.
 

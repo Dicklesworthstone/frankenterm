@@ -1,6 +1,9 @@
 {
   "captured_at": "2026-10-05",
   "host": {
+    "model": "Mac16,11 (Mac mini, M4 Pro)",
+    "display_refresh_hz": 60,
+    "display_ui_looks_like": "3072x1728 @ 60.00Hz (2x)",
     "cpu": "Apple M4 Pro",
     "cores_total": 14,
     "performance_cores": 10,

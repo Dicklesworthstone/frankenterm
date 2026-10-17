@@ -6,15 +6,18 @@ use mux::tab::{PositionedSplit, SplitDirection};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct SplitRenderGeometry {
-    rect: RectF,
-    ui_x: usize,
-    ui_y: usize,
-    ui_width: usize,
-    ui_height: usize,
+pub(crate) struct SplitRenderGeometry {
+    /// The split line's pixels; the Metal frame fills the same rectangle
+    /// (ft-yccm0.4.6).
+    pub(crate) rect: RectF,
+    /// Where the split is hit-tested (dragged).
+    pub(crate) ui_x: usize,
+    pub(crate) ui_y: usize,
+    pub(crate) ui_width: usize,
+    pub(crate) ui_height: usize,
 }
 
-fn split_render_geometry(
+pub(crate) fn split_render_geometry(
     split: &PositionedSplit,
     cell_width: f32,
     cell_height: f32,
@@ -66,8 +69,8 @@ impl crate::TermWindow {
         split: &PositionedSplit,
         pane: &Arc<dyn Pane>,
     ) -> anyhow::Result<()> {
-        let palette = pane.palette();
-        let foreground = palette.split.to_linear();
+        // Published facts: paint never waits for the terminal (ft-yccm0.2.2.3).
+        let foreground = pane.render_facts().palette.split.to_linear();
         let cell_width = self.render_metrics.cell_size.width as f32;
         let cell_height = self.render_metrics.cell_size.height as f32;
 

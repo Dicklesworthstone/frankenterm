@@ -542,10 +542,7 @@ impl CharSelector {
                     size.rows as f32 * term_window.render_metrics.cell_size.height as f32,
                 ),
                 metrics: &metrics,
-                gl_state: term_window
-                    .render_state
-                    .as_ref()
-                    .context("render state is not initialized")?,
+                chrome: term_window.chrome()?,
                 zindex: 100,
             },
             &element,
@@ -689,7 +686,7 @@ impl Modal for CharSelector {
                     term_window.copy_to_clipboard(self.copy_to, glyph.clone());
                 }
                 if let Some(pane) = term_window.get_active_pane_or_overlay() {
-                    pane.writer().write_all(glyph.as_bytes()).ok();
+                    pane.send_user_input(glyph.as_bytes()).ok();
                 }
                 term_window.cancel_modal();
                 return Ok(true);

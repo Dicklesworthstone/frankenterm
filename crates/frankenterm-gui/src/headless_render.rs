@@ -328,6 +328,9 @@ async fn render_headless_async(
             },
             compatible_surface: None,
             force_fallback_adapter: force_software,
+            // wgpu 30: limit bucketing is a web fingerprinting mitigation;
+            // a native harness wants the adapter's real limits.
+            apply_limit_buckets: false,
         })
         .await
         .map_err(|err| HeadlessRenderError::GpuInitFailed {
@@ -550,7 +553,9 @@ fn readback_rgba8(
         }
     }
 
-    let mapped = slice.get_mapped_range();
+    let mapped = slice.get_mapped_range().map_err(|err| {
+        HeadlessRenderError::RenderFailed(format!("reading the mapped readback buffer: {err:?}"))
+    })?;
     let mut rgba = vec![0; width as usize * height as usize * 4];
     let unpadded = width as usize * 4;
     let padded = bytes_per_row as usize;

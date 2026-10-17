@@ -6,7 +6,6 @@ use crate::termwindow::render::corners::*;
 use crate::termwindow::render::window_buttons::window_button_element;
 use crate::termwindow::{UIItem, UIItemType};
 use crate::utilsprites::RenderMetrics;
-use anyhow::Context;
 use config::{Dimension, DimensionContext, TabBarColors};
 use frankenterm_font::LoadedFont;
 use std::rc::Rc;
@@ -443,10 +442,7 @@ impl crate::TermWindow {
                     tab_bar_height,
                 ),
                 metrics: &metrics,
-                gl_state: self
-                    .render_state
-                    .as_ref()
-                    .context("render state is not initialized")?,
+                chrome: self.chrome()?,
                 zindex: 10,
             },
             &tabs,
@@ -470,13 +466,7 @@ impl crate::TermWindow {
             anyhow::anyhow!("paint_fancy_tab_bar called but fancy_tab_bar is None")
         })?;
         let ui_items = computed.ui_items();
-
-        let gl_state = self
-            .render_state
-            .as_ref()
-            .context("render state is not initialized")?;
-        self.render_element(&computed, gl_state, None)?;
-
+        self.render_element(&computed, self.chrome()?, None)?;
         Ok(ui_items)
     }
 }

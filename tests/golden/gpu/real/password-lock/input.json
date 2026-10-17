@@ -1,0 +1,10 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "password lock scene\n[sudo] password for ft: ",
+    "snapshot": {
+      "focus": true,
+      "password_input": true
+    }
+  }
+}

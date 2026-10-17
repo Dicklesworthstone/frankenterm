@@ -1,0 +1,10 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "ime preedit scene\nprompt> \u001b[1mtyped\u001b[0m ",
+    "snapshot": {
+      "focus": true,
+      "compose": "日本語"
+    }
+  }
+}

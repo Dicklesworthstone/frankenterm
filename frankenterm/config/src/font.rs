@@ -713,11 +713,26 @@ impl Default for FontLocatorSelection {
     }
 }
 
-#[derive(Debug, Clone, Copy, FromDynamic, ToDynamic, Default)]
+/// Which glyph rasterizer draws font glyphs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub enum FontRasterizerSelection {
-    #[default]
     FreeType,
     Harfbuzz,
+    /// macOS CoreText (ft-yccm0.4.3.1): native outlines, Apple Color Emoji
+    /// (sbix) and COLR version 0 color glyphs. The default on macOS. A face
+    /// CoreText cannot draw (COLR version 1, CBDT bitmaps) or load falls back
+    /// to FreeType; elsewhere this selects FreeType.
+    CoreText,
+}
+
+impl Default for FontRasterizerSelection {
+    fn default() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::CoreText
+        } else {
+            Self::FreeType
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, FromDynamic, ToDynamic, Default)]
@@ -979,10 +994,29 @@ mod test {
 
     #[test]
     fn font_rasterizer_default() {
-        assert!(matches!(
-            FontRasterizerSelection::default(),
+        // CoreText on macOS (ft-yccm0.4.3.1); FreeType everywhere else.
+        let expected = if cfg!(target_os = "macos") {
+            FontRasterizerSelection::CoreText
+        } else {
             FontRasterizerSelection::FreeType
-        ));
+        };
+        assert_eq!(FontRasterizerSelection::default(), expected);
+    }
+
+    #[test]
+    fn font_rasterizer_names_parse_including_coretext() {
+        for (name, expected) in [
+            ("FreeType", FontRasterizerSelection::FreeType),
+            ("Harfbuzz", FontRasterizerSelection::Harfbuzz),
+            ("CoreText", FontRasterizerSelection::CoreText),
+        ] {
+            let parsed = FontRasterizerSelection::from_dynamic(
+                &Value::String(name.to_string()),
+                Default::default(),
+            )
+            .unwrap_or_else(|err| panic!("{}: {}", name, err));
+            assert_eq!(parsed, expected);
+        }
     }
 
     #[test]

@@ -38,6 +38,10 @@
 //! - Metal shader compilation (.metal source files); golden-test
 //!   parity against the wgpu WGSL shaders.
 //! - `FT_MACOS_BACKEND` env-var routing in `frankenterm-gui` startup.
+//!   Superseded: the GUI selects the native renderer with
+//!   `front_end = "Metal"` (crate `frankenterm-renderer-metal`,
+//!   ft-yccm0.4.1.1) and no longer runs this selector or reads
+//!   `FT_MACOS_BACKEND`.
 //! - Address-sanitizer + thread-sanitizer CI runs (Loom can't model
 //!   FFI per the bead).
 //! - Per-release attestation cross-link

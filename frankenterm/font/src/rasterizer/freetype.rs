@@ -78,7 +78,10 @@ impl FontRasterizer for FreeTypeRasterizer {
                                 load_flags | FT_LOAD_NO_HINTING as i32,
                             );
                         }
-                        FontRasterizerSelection::Harfbuzz => {
+                        // A COLR face that reached FreeType under CoreText
+                        // (COLR version 1, which CoreText draws blank) gets
+                        // the HarfBuzz painter.
+                        FontRasterizerSelection::Harfbuzz | FontRasterizerSelection::CoreText => {
                             return self.hb_raster.rasterize_glyph(glyph_pos, size, dpi);
                         }
                     }

@@ -146,6 +146,8 @@ pub(crate) struct XWindowInner {
     last_cursor_position: Rect,
     invalidated: bool,
     paint_throttled: bool,
+    /// The latest paint's throttle slot (`crate::repaint_slot`, ft-1w85m).
+    repaint_slot: Option<std::time::Instant>,
     pending: Vec<WindowEvent>,
     sure_about_geometry: bool,
     current_mouse_event: Option<MouseEvent>,
@@ -446,6 +448,8 @@ impl XWindowInner {
                 self.paint_throttled = true;
                 let window_id = self.window_id;
                 let interval = config::frame_interval_for_max_fps(self.config.max_fps);
+                let slot = crate::repaint_slot(self.repaint_slot, paint_started, interval);
+                self.repaint_slot = Some(slot);
                 let connection = self.conn.clone();
                 let original_window = connection
                     .upgrade()
@@ -458,7 +462,7 @@ impl XWindowInner {
                 ) {
                     reservation
                         .spawn_local(crate::complete_repaint_after_interval(
-                            paint_started,
+                            slot,
                             interval,
                             move || {
                                 let Some(connection) = connection.upgrade() else {
@@ -1579,6 +1583,7 @@ impl XWindow {
                 verify_focus: true,
                 last_cursor_position: Rect::default(),
                 paint_throttled: false,
+                repaint_slot: None,
                 last_wm_state: WindowState::default(),
                 invalidated: false,
                 pending: vec![],

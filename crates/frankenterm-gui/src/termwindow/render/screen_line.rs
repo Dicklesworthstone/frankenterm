@@ -1,4 +1,6 @@
 use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
+use crate::renderstate::ShapingCounters;
+use crate::shapecache::ShapedInfo;
 use crate::termwindow::LineToElementShapeItem;
 use crate::termwindow::render::{
     ClusterStyleCache, ComputeCellFgBgParams, ComputeCellFgBgResult, LineToElementParams,
@@ -11,49 +13,16 @@ use crate::termwindow::webgpu::{
 use ::window::DeadKeyStatus;
 use anyhow::Context;
 use config::{HsbTransform, TextStyle};
+use frankenterm_gui::line_shaping::{cluster_shaping_context, line_paragraph_context, shape_runs};
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::Instant;
 use termwiz::cell::{Blink, unicode_column_width};
-use termwiz::cellcluster::CellCluster;
 use termwiz::color::LinearRgba;
 use termwiz::surface::CursorShape;
 use wezterm_bidi::Direction;
 use wezterm_term::CellAttributes;
 use wezterm_term::color::ColorAttribute;
-
-#[derive(Debug, PartialEq, Eq)]
-struct ClusterParagraphContext {
-    text: String,
-    ranges: Vec<Range<usize>>,
-}
-
-fn cluster_paragraph_context(cell_clusters: &[CellCluster]) -> ClusterParagraphContext {
-    let mut text = String::new();
-    let mut ranges = Vec::with_capacity(cell_clusters.len());
-
-    for cluster in cell_clusters {
-        let start = text.len();
-        text.push_str(&cluster.text);
-        ranges.push(start..text.len());
-    }
-
-    ClusterParagraphContext { text, ranges }
-}
-
-fn should_shape_cluster_with_paragraph_context(cluster: &CellCluster) -> bool {
-    // Harfbuzz paragraph ranges are the established default for terminal
-    // text. OSC 8 hyperlink runs are the narrow ASCII case that diverges from
-    // upstream when shaped with adjacent non-hyperlink context.
-    !cluster.text.is_ascii() || cluster.attrs.hyperlink().is_none()
-}
-
-fn any_cluster_needs_paragraph_context(cell_clusters: &[CellCluster]) -> bool {
-    cell_clusters.len() > 1
-        && cell_clusters
-            .iter()
-            .any(should_shape_cluster_with_paragraph_context)
-}
 
 impl crate::TermWindow {
     /// "Render" a line of the terminal screen into the vertex buffer.
@@ -75,10 +44,9 @@ impl crate::TermWindow {
             });
         }
 
-        let gl_state = self
-            .render_state
-            .as_ref()
-            .context("render state is not initialized")?;
+        // The window's chrome target: the WebGpu render state, or a Metal
+        // window's own (ft-yccm0.4.7.1: the retro tab bar).
+        let gl_state = self.chrome()?;
 
         let num_cols = params.dims.cols;
 
@@ -445,7 +413,7 @@ impl crate::TermWindow {
                     );
                     quad.set_texture(
                         gl_state
-                            .glyph_cache
+                            .glyph_cache()
                             .borrow_mut()
                             .cursor_sprite(
                                 Some(shape),
@@ -540,7 +508,7 @@ impl crate::TermWindow {
                         if let Some(block) = &info.block_key {
                             texture.replace(
                                 gl_state
-                                    .glyph_cache
+                                    .glyph_cache()
                                     .borrow_mut()
                                     .cached_block(*block, &params.render_metrics)
                                     .context("cached_block")?,
@@ -815,13 +783,43 @@ impl crate::TermWindow {
         } else {
             params.line.cluster(bidi_hint)
         };
-        let paragraph_context = any_cluster_needs_paragraph_context(&cell_clusters)
-            .then(|| cluster_paragraph_context(&cell_clusters));
+        let paragraph_context = line_paragraph_context(&cell_clusters);
 
-        let gl_state = self
-            .render_state
-            .as_ref()
-            .context("render state is not initialized")?;
+        let gl_state = self.chrome()?;
+
+        // ft-yccm0.4.3.4: clusters that differ only in paint attributes are
+        // shaped once as a run; each cluster then gets its own glyphs back,
+        // so colors still apply per glyph. The Metal renderer shapes its rows
+        // with the same code (ft-yccm0.4.7.3).
+        let mut counters = ShapingCounters {
+            lines: 1,
+            clusters: cell_clusters.len() as u64,
+            ..ShapingCounters::default()
+        };
+        let styles: Vec<&TextStyle> = cell_clusters
+            .iter()
+            .map(|cluster| self.fonts.match_style(params.config, &cluster.attrs))
+            .collect();
+        let run_shapes = shape_runs(
+            &cell_clusters,
+            &styles,
+            paragraph_context.as_ref(),
+            |info: &ShapedInfo| info.pos.num_cells,
+            |style, cluster, context| {
+                self.cached_cluster_shape(
+                    style,
+                    cluster,
+                    gl_state,
+                    None,
+                    &self.render_metrics,
+                    context,
+                )
+            },
+        )?;
+        counters.runs += run_shapes.runs;
+        counters.unsplit_runs += run_shapes.unsplit_runs;
+        let mut run_glyphs = run_shapes.glyphs;
+
         let mut shaped = vec![];
         let mut last_style = None;
         let mut x_pos = 0.;
@@ -841,7 +839,7 @@ impl crate::TermWindow {
                 }
                 // underline and strikethrough
                 let underline_tex_rect = gl_state
-                    .glyph_cache
+                    .glyph_cache()
                     .borrow_mut()
                     .cached_line_sprite(
                         is_highlited_hyperlink,
@@ -888,7 +886,7 @@ impl crate::TermWindow {
                     };
                     if let Some((blink_rate, mut colorease)) = blink_rate {
                         if blink_rate != 0 {
-                            let (intensity, next) = colorease.intensity_continuous();
+                            let (intensity, next) = self.blink_intensity(&mut colorease);
 
                             let (r1, g1, b1, a) = bg.tuple();
                             let (r, g, b, _a) = fg.tuple();
@@ -937,22 +935,23 @@ impl crate::TermWindow {
 
             let style_params = last_style.as_ref().expect("we just set it up").clone();
 
-            let cluster_paragraph_context = paragraph_context.as_ref().and_then(|context| {
-                if should_shape_cluster_with_paragraph_context(cluster) {
-                    Some((context.text.as_str(), context.ranges[idx].clone()))
-                } else {
-                    None
-                }
-            });
+            let cluster_paragraph_context =
+                cluster_shaping_context(paragraph_context.as_ref(), cluster, idx);
 
-            let glyph_info = self.cached_cluster_shape(
-                style_params.style,
-                &cluster,
-                &gl_state,
-                None,
-                &self.render_metrics,
-                cluster_paragraph_context,
-            )?;
+            let glyph_info = match run_glyphs[idx].take() {
+                Some(glyphs) => glyphs,
+                None => {
+                    counters.runs += 1;
+                    self.cached_cluster_shape(
+                        style_params.style,
+                        &cluster,
+                        gl_state,
+                        None,
+                        &self.render_metrics,
+                        cluster_paragraph_context,
+                    )?
+                }
+            };
             let pixel_width = glyph_info
                 .iter()
                 .map(|info| info.glyph.x_advance.get() as f32)
@@ -971,6 +970,7 @@ impl crate::TermWindow {
 
             x_pos += pixel_width;
         }
+        gl_state.record_shaping(counters);
 
         let shaped = Rc::new(shaped);
 
@@ -991,94 +991,5 @@ impl crate::TermWindow {
         }
 
         Ok((shaped, invalidate_on_hover_change))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use termwiz::cell::Cell;
-    use termwiz::hyperlink::Hyperlink;
-    use termwiz::surface::{Line, SEQ_ZERO};
-
-    #[test]
-    fn cluster_paragraph_context_tracks_rtl_and_indic_ranges() {
-        let attrs = CellAttributes::default();
-        let line = Line::from_text("abc שלום नमस्ते", &attrs, SEQ_ZERO, None);
-        let clusters = line.cluster(None);
-        let context = cluster_paragraph_context(&clusters);
-
-        assert_eq!(context.ranges.len(), clusters.len());
-        assert!(context.text.contains("שלום"));
-        assert!(context.text.contains("नमस्ते"));
-
-        let mut expected_start = 0;
-        for (cluster, range) in clusters.iter().zip(&context.ranges) {
-            assert_eq!(range.start, expected_start);
-            assert_eq!(&context.text[range.clone()], cluster.text);
-            expected_start = range.end;
-        }
-        assert_eq!(expected_start, context.text.len());
-    }
-
-    #[test]
-    fn paragraph_context_skips_only_ascii_hyperlink_clusters() {
-        let attrs = CellAttributes::default();
-
-        let ascii = Line::from_text("linktext", &attrs, SEQ_ZERO, None);
-        let ascii_clusters = ascii.cluster(None);
-        assert_eq!(ascii_clusters.len(), 1);
-        assert!(!any_cluster_needs_paragraph_context(&ascii_clusters));
-        assert!(
-            ascii_clusters
-                .iter()
-                .all(should_shape_cluster_with_paragraph_context)
-        );
-
-        // With bidi disabled, whitespace boundaries deliberately split runs.
-        // They need paragraph context just like attribute-split ASCII runs.
-        let spaced_ascii = Line::from_text("link text", &attrs, SEQ_ZERO, None);
-        let spaced_clusters = spaced_ascii.cluster(None);
-        assert!(spaced_clusters.len() > 1);
-        assert!(any_cluster_needs_paragraph_context(&spaced_clusters));
-
-        let mut bold_attrs = CellAttributes::default();
-        bold_attrs.set_intensity(wezterm_term::Intensity::Bold);
-        let ascii_split = Line::from_cells(
-            vec![
-                Cell::new('l', attrs.clone()),
-                Cell::new('i', attrs.clone()),
-                Cell::new('n', bold_attrs.clone()),
-                Cell::new('k', bold_attrs),
-            ],
-            SEQ_ZERO,
-        );
-        let ascii_split_clusters = ascii_split.cluster(None);
-        assert!(ascii_split_clusters.len() > 1);
-        assert!(any_cluster_needs_paragraph_context(&ascii_split_clusters));
-
-        let mut hyperlink_attrs = CellAttributes::default();
-        hyperlink_attrs.set_hyperlink(Some(Arc::new(Hyperlink::new("https://example.com"))));
-        let hyperlink = Line::from_text("link text", &hyperlink_attrs, SEQ_ZERO, None);
-        let hyperlink_clusters = hyperlink.cluster(None);
-        assert!(!any_cluster_needs_paragraph_context(&hyperlink_clusters));
-        assert!(
-            hyperlink_clusters
-                .iter()
-                .all(|cluster| !should_shape_cluster_with_paragraph_context(cluster))
-        );
-
-        let complex = Line::from_text("abc שלום नमस्ते", &attrs, SEQ_ZERO, None);
-        let complex_clusters = complex.cluster(None);
-        assert!(any_cluster_needs_paragraph_context(&complex_clusters));
-        assert!(complex_clusters.iter().any(|cluster| {
-            !cluster.text.is_ascii() && should_shape_cluster_with_paragraph_context(cluster)
-        }));
-        assert!(
-            complex_clusters
-                .iter()
-                .all(should_shape_cluster_with_paragraph_context)
-        );
     }
 }

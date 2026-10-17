@@ -1,0 +1,7 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "\u001b[1mbold default\u001b[0m plain \u001b[1;31mbold red\u001b[0m\n\u001b[1;4mbold underlined\u001b[0m \u001b[1;7mbold reversed\u001b[0m\n\u001b[?25l",
+    "extra_toml": "[[font_rules]]\nintensity = \"Bold\"\n\n[font_rules.font]\nforeground = \"#ff8a3d\"\n\n[[font_rules.font.font]]\nfamily = \"JetBrains Mono\"\nweight = \"Bold\"\nharfbuzz_features = [\"calt=0\", \"clig=0\", \"liga=0\"]"
+  }
+}

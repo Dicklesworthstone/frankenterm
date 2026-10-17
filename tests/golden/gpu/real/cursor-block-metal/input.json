@@ -1,0 +1,10 @@
+{
+  "kind": "gui_snapshot",
+  "scene": {
+    "text": "cursor scene\nline two with text\nabc\u001b[2 q\u001b[2;6H",
+    "config": {
+      "front_end": "Metal"
+    }
+  },
+  "parity_golden": "real/cursor-block"
+}

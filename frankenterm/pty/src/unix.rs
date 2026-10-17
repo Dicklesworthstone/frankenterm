@@ -496,6 +496,10 @@ impl MasterPty for UnixMasterPty {
         Ok(Box::new(fd))
     }
 
+    fn try_clone_blocking_pollable_reader(&self) -> Result<Box<dyn PollablePtyReader>, Error> {
+        Ok(Box::new(PtyFd(self.fd.try_clone()?)))
+    }
+
     fn take_writer(&self) -> Result<Box<dyn Write + Send>, Error> {
         if *self.took_writer.borrow() {
             anyhow::bail!("cannot take writer more than once");

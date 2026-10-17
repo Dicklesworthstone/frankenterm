@@ -387,6 +387,13 @@ impl Face {
         unsafe { ((*self.face).style_flags & FT_STYLE_FLAG_ITALIC as FT_Long) != 0 }
     }
 
+    /// Whether FreeType has kerning for this face (a TrueType `kern` table
+    /// or an attached AFM). HarfBuzz's fallback kerning reads it through
+    /// FreeType between neighbouring glyphs.
+    pub fn has_kerning(&self) -> bool {
+        unsafe { ((*self.face).face_flags & FT_FACE_FLAG_KERNING as FT_Long) != 0 }
+    }
+
     pub fn compute_coverage(&self) -> RangeSet<u32> {
         if let Some(coverage) = self.source.coverage.as_ref() {
             return coverage.clone();

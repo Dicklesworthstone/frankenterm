@@ -515,10 +515,7 @@ impl CommandPalette {
                     size.rows as f32 * term_window.render_metrics.cell_size.height as f32,
                 ),
                 metrics: &metrics,
-                gl_state: term_window
-                    .render_state
-                    .as_ref()
-                    .context("render state is not initialized")?,
+                chrome: term_window.chrome()?,
                 zindex: 100,
             },
             &element,

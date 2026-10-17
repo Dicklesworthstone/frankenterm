@@ -124,6 +124,18 @@ pub trait MasterPty: Downcast + Send {
             "this PTY backend does not provide a pollable non-blocking reader"
         ))
     }
+    /// Obtain a blocking readable handle whose descriptor can be polled.
+    ///
+    /// Unlike [`Self::try_clone_pollable_reader`] this leaves `O_NONBLOCK`
+    /// alone: the clone shares its open file description with the writer,
+    /// whose blocking writes must stay blocking. A reader that polls before
+    /// reading never blocks in `read` (ft-yccm0.3.1.2).
+    #[cfg(unix)]
+    fn try_clone_blocking_pollable_reader(&self) -> Result<Box<dyn PollablePtyReader>, Error> {
+        Err(anyhow::anyhow!(
+            "this PTY backend does not provide a pollable reader"
+        ))
+    }
     /// Obtain a writable handle; writing to it will send data to the
     /// slave end.
     /// Dropping the writer will send EOF to the slave end.

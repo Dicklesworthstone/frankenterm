@@ -17,9 +17,15 @@ use serde::{Deserialize, Serialize};
 /// `tests/golden/gpu/README.md`.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 pub struct Thresholds {
+    /// Floor for the mean windowed SSIM.
     pub min_ssim: f64,
     pub max_l_inf: u8,
     pub max_changed_pixel_fraction: f64,
+    /// Floor for the worst single SSIM window. It catches a regression
+    /// confined to a few glyphs, which the mean over thousands of windows
+    /// barely registers. 0.0 (the default) disables it.
+    #[serde(default)]
+    pub min_window_ssim: f64,
 }
 
 impl Default for Thresholds {
@@ -28,6 +34,7 @@ impl Default for Thresholds {
             min_ssim: 0.99,
             max_l_inf: 8,
             max_changed_pixel_fraction: 0.001,
+            min_window_ssim: 0.0,
         }
     }
 }
@@ -35,15 +42,22 @@ impl Default for Thresholds {
 /// Quantitative output of a single comparator run.
 #[derive(Debug, Clone, Serialize)]
 pub struct CompareMetrics {
+    /// Mean SSIM over [`SSIM_WINDOW`]-pixel luma windows (Wang et al. MSSIM),
+    /// so a regression confined to a few glyphs still moves the score.
     pub ssim: f64,
+    /// SSIM of the worst window, and where it is (top-left pixel).
+    pub min_window_ssim: f64,
+    pub worst_window: [u32; 2],
     pub l_inf: u8,
+    /// Largest absolute delta per channel, `[R, G, B, A]`.
+    pub channel_max_delta: [u8; 4],
     pub changed_pixels: u64,
     pub total_pixels: u64,
     pub changed_pixel_fraction: f64,
     pub thresholds: Thresholds,
 }
 
-/// Pass/fail verdict plus a diff visualization PNG.
+/// Pass/fail verdict plus diff visualizations.
 #[derive(Debug)]
 pub struct CompareResult {
     pub passed: bool,
@@ -51,6 +65,25 @@ pub struct CompareResult {
     /// RGBA image highlighting differing pixels in red and showing matching
     /// pixels at their original luminance with reduced alpha.
     pub diff: RgbaImage,
+    /// Per-pixel max-channel delta as a heat ramp (black, blue, red, yellow,
+    /// white as the delta grows); identical pixels show the expected image's
+    /// luminance dimmed, so the scene stays recognizable.
+    pub heatmap: RgbaImage,
+}
+
+/// Side of the square SSIM window, in pixels.
+pub const SSIM_WINDOW: u32 = 8;
+/// Step between SSIM windows. Half the window, so every pixel lies in at
+/// least one window and interior pixels in four.
+pub const SSIM_STRIDE: u32 = 4;
+
+/// Windowed luma SSIM summary; see [`ssim_windowed_luma`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SsimSummary {
+    pub mean: f64,
+    pub min: f64,
+    pub worst_window: [u32; 2],
+    pub windows: u64,
 }
 
 /// Errors produced by the comparator. Distinct from a *failed* comparison —
@@ -95,18 +128,20 @@ pub fn compare_images(
     let total_pixels = u64::from(actual_width) * u64::from(actual_height);
     let mut changed_pixels = 0u64;
     let mut l_inf = 0u8;
+    let mut channel_max_delta = [0u8; 4];
     let mut diff = RgbaImage::new(actual_width, actual_height);
+    let mut heatmap = RgbaImage::new(actual_width, actual_height);
 
     for y in 0..actual_height {
         for x in 0..actual_width {
             let a = actual.get_pixel(x, y).0;
             let e = expected.get_pixel(x, y).0;
-            let pixel_delta = a
-                .iter()
-                .zip(e.iter())
-                .map(|(left, right)| left.abs_diff(*right))
-                .max()
-                .unwrap_or(0);
+            let mut pixel_delta = 0u8;
+            for (channel, max) in channel_max_delta.iter_mut().enumerate() {
+                let delta = a[channel].abs_diff(e[channel]);
+                *max = cmp::max(*max, delta);
+                pixel_delta = cmp::max(pixel_delta, delta);
+            }
             l_inf = cmp::max(l_inf, pixel_delta);
             if pixel_delta > thresholds.max_l_inf {
                 changed_pixels += 1;
@@ -115,6 +150,7 @@ pub fn compare_images(
                 let shade = ((u16::from(a[0]) + u16::from(a[1]) + u16::from(a[2])) / 3) as u8;
                 diff.put_pixel(x, y, Rgba([shade, shade, shade, 96]));
             }
+            heatmap.put_pixel(x, y, heat_pixel(pixel_delta, e));
         }
     }
 
@@ -123,23 +159,166 @@ pub fn compare_images(
     } else {
         changed_pixels as f64 / total_pixels as f64
     };
-    let ssim = ssim_luma(actual, expected);
-    let passed = ssim >= thresholds.min_ssim
+    let ssim = ssim_windowed_luma(actual, expected);
+    let passed = ssim.mean >= thresholds.min_ssim
+        && ssim.min >= thresholds.min_window_ssim
         && l_inf <= thresholds.max_l_inf
         && changed_pixel_fraction <= thresholds.max_changed_pixel_fraction;
 
     Ok(CompareResult {
         passed,
         metrics: CompareMetrics {
-            ssim,
+            ssim: ssim.mean,
+            min_window_ssim: ssim.min,
+            worst_window: ssim.worst_window,
             l_inf,
+            channel_max_delta,
             changed_pixels,
             total_pixels,
             changed_pixel_fraction,
             thresholds,
         },
         diff,
+        heatmap,
     })
+}
+
+/// One heatmap pixel: a perceptual ramp over the max-channel delta, or the
+/// expected pixel's dimmed luminance where nothing changed.
+fn heat_pixel(delta: u8, expected: [u8; 4]) -> Rgba<u8> {
+    if delta == 0 {
+        let luma = luma(&Rgba(expected));
+        let dim = (luma * 0.3).round().clamp(0.0, 255.0) as u8;
+        return Rgba([dim, dim, dim, 255]);
+    }
+    // sqrt stretches small deltas (antialiasing drift) into visible colors.
+    let t = (f64::from(delta) / 255.0).sqrt();
+    const STOPS: [[f64; 3]; 5] = [
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 255.0],
+        [255.0, 0.0, 0.0],
+        [255.0, 255.0, 0.0],
+        [255.0, 255.0, 255.0],
+    ];
+    let scaled = t * (STOPS.len() - 1) as f64;
+    let index = (scaled.floor() as usize).min(STOPS.len() - 2);
+    let frac = scaled - index as f64;
+    let channel = |c: usize| {
+        let value = STOPS[index][c] + (STOPS[index + 1][c] - STOPS[index][c]) * frac;
+        value.round().clamp(0.0, 255.0) as u8
+    };
+    Rgba([channel(0), channel(1), channel(2), 255])
+}
+
+/// Mean and worst SSIM over [`SSIM_WINDOW`]-square luma windows placed every
+/// [`SSIM_STRIDE`] pixels (the last row and column of windows are clamped to
+/// the image edge). An image smaller than one window is a single window.
+/// Window sums come from summed-area tables, so the cost is linear in pixels.
+pub fn ssim_windowed_luma(actual: &RgbaImage, expected: &RgbaImage) -> SsimSummary {
+    let (width, height) = actual.dimensions();
+    if width == 0 || height == 0 {
+        return SsimSummary {
+            mean: 1.0,
+            min: 1.0,
+            worst_window: [0, 0],
+            windows: 0,
+        };
+    }
+    let window_w = width.min(SSIM_WINDOW);
+    let window_h = height.min(SSIM_WINDOW);
+    let tables = SummedAreaTables::new(actual, expected);
+    let starts = |extent: u32, window: u32| {
+        let last = extent - window;
+        let mut starts: Vec<u32> = (0..=last).step_by(SSIM_STRIDE as usize).collect();
+        if starts.last() != Some(&last) {
+            starts.push(last);
+        }
+        starts
+    };
+    let xs = starts(width, window_w);
+    let ys = starts(height, window_h);
+
+    let mut sum = 0.0;
+    let mut min = f64::INFINITY;
+    let mut worst_window = [0, 0];
+    for &y in &ys {
+        for &x in &xs {
+            let s = tables.window_ssim(x, y, window_w, window_h);
+            sum += s;
+            if s < min {
+                min = s;
+                worst_window = [x, y];
+            }
+        }
+    }
+    let windows = (xs.len() * ys.len()) as u64;
+    SsimSummary {
+        mean: sum / windows as f64,
+        min,
+        worst_window,
+        windows,
+    }
+}
+
+/// Summed-area tables of luma `x`, `y`, `x²`, `y²` and `xy` over two images,
+/// with a zero row and column in front so window sums need no edge cases.
+struct SummedAreaTables {
+    stride: usize,
+    tables: [Vec<f64>; 5],
+}
+
+impl SummedAreaTables {
+    fn new(actual: &RgbaImage, expected: &RgbaImage) -> Self {
+        let (width, height) = actual.dimensions();
+        let stride = width as usize + 1;
+        let len = stride * (height as usize + 1);
+        let mut tables: [Vec<f64>; 5] = std::array::from_fn(|_| vec![0.0; len]);
+        for y in 0..height as usize {
+            let mut row = [0.0; 5];
+            for x in 0..width as usize {
+                let a = luma(actual.get_pixel(x as u32, y as u32));
+                let e = luma(expected.get_pixel(x as u32, y as u32));
+                let values = [a, e, a * a, e * e, a * e];
+                let below = (y + 1) * stride + x + 1;
+                let above = y * stride + x + 1;
+                for (index, table) in tables.iter_mut().enumerate() {
+                    row[index] += values[index];
+                    table[below] = table[above] + row[index];
+                }
+            }
+        }
+        Self { stride, tables }
+    }
+
+    fn window_sum(&self, table: usize, x: u32, y: u32, w: u32, h: u32) -> f64 {
+        let (x0, y0) = (x as usize, y as usize);
+        let (x1, y1) = (x0 + w as usize, y0 + h as usize);
+        let t = &self.tables[table];
+        t[y1 * self.stride + x1] - t[y0 * self.stride + x1] - t[y1 * self.stride + x0]
+            + t[y0 * self.stride + x0]
+    }
+
+    fn window_ssim(&self, x: u32, y: u32, w: u32, h: u32) -> f64 {
+        let n = f64::from(w) * f64::from(h);
+        let sum = |table| self.window_sum(table, x, y, w, h);
+        let (sum_x, sum_y) = (sum(0), sum(1));
+        let mean_x = sum_x / n;
+        let mean_y = sum_y / n;
+        let denom = (n - 1.0).max(1.0);
+        // Not clamped: a cancellation residue is far below c2, and computing
+        // var and cov identically keeps identical windows at exactly 1.0.
+        let var_x = (sum(2) - sum_x * mean_x) / denom;
+        let var_y = (sum(3) - sum_y * mean_y) / denom;
+        let cov_xy = (sum(4) - sum_x * mean_y) / denom;
+        ssim_from_moments(mean_x, mean_y, var_x, var_y, cov_xy)
+    }
+}
+
+fn ssim_from_moments(mean_x: f64, mean_y: f64, var_x: f64, var_y: f64, cov_xy: f64) -> f64 {
+    let c1 = (0.01_f64 * 255.0).powi(2);
+    let c2 = (0.03_f64 * 255.0).powi(2);
+    ((2.0 * mean_x * mean_y + c1) * (2.0 * cov_xy + c2))
+        / ((mean_x.powi(2) + mean_y.powi(2) + c1) * (var_x + var_y + c2))
 }
 
 /// Detect the macOS 15 screen-capture permission dialog in a captured frame.
@@ -223,11 +402,7 @@ pub fn ssim_luma(actual: &RgbaImage, expected: &RgbaImage) -> f64 {
     var_x /= denom;
     var_y /= denom;
     cov_xy /= denom;
-
-    let c1 = (0.01_f64 * 255.0).powi(2);
-    let c2 = (0.03_f64 * 255.0).powi(2);
-    ((2.0 * mean_x * mean_y + c1) * (2.0 * cov_xy + c2))
-        / ((mean_x.powi(2) + mean_y.powi(2) + c1) * (var_x + var_y + c2))
+    ssim_from_moments(mean_x, mean_y, var_x, var_y, cov_xy)
 }
 
 fn luma(pixel: &Rgba<u8>) -> f64 {
@@ -479,6 +654,7 @@ mod tests {
                 min_ssim: 0.0,
                 max_l_inf: 49,
                 max_changed_pixel_fraction: 0.0,
+                min_window_ssim: 0.0,
             },
         )
         .unwrap();
@@ -496,6 +672,7 @@ mod tests {
                 min_ssim: 0.0,
                 max_l_inf: 100,
                 max_changed_pixel_fraction: 0.0,
+                min_window_ssim: 0.0,
             },
         )
         .unwrap();
@@ -679,10 +856,21 @@ mod tests {
             min_ssim: 0.97,
             max_l_inf: 12,
             max_changed_pixel_fraction: 0.005,
+            min_window_ssim: 0.9,
         };
         let s = serde_json::to_string(&t).unwrap();
         let back: Thresholds = serde_json::from_str(&s).unwrap();
         assert_eq!(t, back);
+    }
+
+    #[test]
+    fn legacy_thresholds_without_a_window_floor_disable_it() {
+        let back: Thresholds = serde_json::from_str(
+            r#"{"min_ssim":0.99,"max_l_inf":8,"max_changed_pixel_fraction":0.001}"#,
+        )
+        .unwrap();
+        assert_eq!(back, Thresholds::default());
+        assert_eq!(back.min_window_ssim, 0.0);
     }
 
     // ── 16. macOS screen-capture prompt contamination guard ─────────────────
@@ -801,7 +989,10 @@ mod tests {
         let v = serde_json::to_value(&r.metrics).unwrap();
         for key in [
             "ssim",
+            "min_window_ssim",
+            "worst_window",
             "l_inf",
+            "channel_max_delta",
             "changed_pixels",
             "total_pixels",
             "changed_pixel_fraction",
@@ -809,5 +1000,147 @@ mod tests {
         ] {
             assert!(v.get(key).is_some(), "metrics missing key `{key}`: {v}");
         }
+    }
+
+    // ── 17. Windowed SSIM, channel deltas and heatmap (ft-yccm0.1.10) ───────
+
+    /// A text-like frame: dark background with a 7x12 "glyph" in each 8x14
+    /// cell, its strokes varying per cell so windows are not all identical.
+    fn text_like(cols: u32, rows: u32) -> RgbaImage {
+        let mut img = solid(cols * 8, rows * 14, [12, 12, 16, 255]);
+        for row in 0..rows {
+            for col in 0..cols {
+                let seed = row * 31 + col * 17;
+                for y in 1..13 {
+                    for x in 1..7 {
+                        if (x * 3 + y * 5 + seed) % 4 == 0 {
+                            img.put_pixel(col * 8 + x, row * 14 + y, Rgba([220, 220, 210, 255]));
+                        }
+                    }
+                }
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn windowed_ssim_of_identical_images_is_one_and_covers_the_edges() {
+        let a = text_like(10, 3);
+        let s = ssim_windowed_luma(&a, &a);
+        assert!((s.mean - 1.0).abs() < 1e-9, "{s:?}");
+        assert!((s.min - 1.0).abs() < 1e-9, "{s:?}");
+        // 80x42: x starts 0,4,..,72 (19); y starts 0,4,..,32 plus the clamped 34 (10).
+        assert_eq!(s.windows, 19 * 10);
+    }
+
+    #[test]
+    fn images_smaller_than_a_window_use_one_global_window() {
+        let a = solid(5, 3, [40, 40, 40, 255]);
+        let mut b = a.clone();
+        b.put_pixel(2, 1, Rgba([200, 200, 200, 255]));
+        let s = ssim_windowed_luma(&a, &b);
+        assert_eq!(s.windows, 1);
+        assert!((s.mean - ssim_luma(&a, &b)).abs() < 1e-9, "{s:?}");
+    }
+
+    #[test]
+    fn windowed_ssim_catches_a_one_glyph_regression_that_global_ssim_misses() {
+        let expected = text_like(64, 8);
+        let mut actual = expected.clone();
+        // Blank one glyph cell, as a missing-glyph regression would.
+        let (cell_x, cell_y) = (37 * 8, 5 * 14);
+        for y in cell_y..cell_y + 14 {
+            for x in cell_x..cell_x + 8 {
+                actual.put_pixel(x, y, Rgba([12, 12, 16, 255]));
+            }
+        }
+        let global = ssim_luma(&actual, &expected);
+        let windowed = ssim_windowed_luma(&actual, &expected);
+        assert!(
+            global > 0.99,
+            "global SSIM {global} should barely notice one glyph"
+        );
+        assert!(
+            windowed.min < 0.5,
+            "worst window should expose the glyph: {windowed:?}"
+        );
+        let [wx, wy] = windowed.worst_window;
+        assert!(
+            wx + SSIM_WINDOW > cell_x
+                && wx < cell_x + 8
+                && wy + SSIM_WINDOW > cell_y
+                && wy < cell_y + 14,
+            "worst window {:?} should overlap the blanked cell at ({cell_x}, {cell_y})",
+            windowed.worst_window
+        );
+        let gated = compare_images(
+            &actual,
+            &expected,
+            Thresholds {
+                min_ssim: 0.0,
+                max_l_inf: 255,
+                max_changed_pixel_fraction: 1.0,
+                min_window_ssim: 0.9,
+            },
+        )
+        .unwrap();
+        assert!(!gated.passed, "the window floor must fail the comparison");
+    }
+
+    /// The corpus self-test: an intentionally perturbed frame (every glyph
+    /// shifted one pixel right, as a cell-origin bug would) drops below the
+    /// 0.995 parity threshold.
+    #[test]
+    fn perturbed_frame_drops_below_the_parity_threshold() {
+        let expected = text_like(40, 6);
+        let mut actual = solid(expected.width(), expected.height(), [12, 12, 16, 255]);
+        for y in 0..expected.height() {
+            for x in 1..expected.width() {
+                actual.put_pixel(x, y, *expected.get_pixel(x - 1, y));
+            }
+        }
+        let result = compare_images(
+            &actual,
+            &expected,
+            Thresholds {
+                min_ssim: 0.995,
+                max_l_inf: 255,
+                max_changed_pixel_fraction: 1.0,
+                min_window_ssim: 0.0,
+            },
+        )
+        .unwrap();
+        assert!(result.metrics.ssim < 0.995, "{:?}", result.metrics);
+        assert!(!result.passed);
+    }
+
+    #[test]
+    fn channel_max_delta_is_reported_per_channel() {
+        let expected = solid(16, 16, [100, 100, 100, 200]);
+        let mut actual = expected.clone();
+        actual.put_pixel(3, 3, Rgba([103, 100, 93, 200]));
+        actual.put_pixel(9, 12, Rgba([100, 100, 100, 201]));
+        let r = compare_images(&actual, &expected, Thresholds::default()).unwrap();
+        assert_eq!(r.metrics.channel_max_delta, [3, 0, 7, 1]);
+        assert_eq!(r.metrics.l_inf, 7);
+    }
+
+    #[test]
+    fn heatmap_ramps_with_the_delta_and_dims_unchanged_pixels() {
+        let expected = solid(8, 8, [200, 200, 200, 255]);
+        let mut actual = expected.clone();
+        actual.put_pixel(1, 1, Rgba([0, 0, 0, 255]));
+        actual.put_pixel(2, 2, Rgba([196, 200, 200, 255]));
+        let r = compare_images(&actual, &expected, Thresholds::default()).unwrap();
+        assert_eq!(r.heatmap.dimensions(), (8, 8));
+        // Unchanged: the expected luminance dimmed to 30%.
+        assert_eq!(r.heatmap.get_pixel(0, 0).0, [60, 60, 60, 255]);
+        // Delta 200: between the yellow and white stops.
+        let big = r.heatmap.get_pixel(1, 1).0;
+        assert!(big[0] == 255 && big[1] > 0 && big[2] < 255, "{big:?}");
+        // Delta 4: dark blue.
+        let small = r.heatmap.get_pixel(2, 2).0;
+        assert!(small[2] > small[0] && small[2] > small[1], "{small:?}");
+        assert_eq!(heat_pixel(255, [0, 0, 0, 255]).0, [255, 255, 255, 255]);
     }
 }
