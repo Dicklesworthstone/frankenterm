@@ -35,6 +35,11 @@ struct Cluster {
 /// U+1F3FB-U+1F3FF. Anything else is treated as able to cluster.
 #[inline]
 pub(crate) fn is_cluster_inert(c: char) -> bool {
+    // ASCII first: the range table below compiles to a vector compare of
+    // every range, which the page engine ran for each ASCII run it appended.
+    if c.is_ascii() {
+        return matches!(u32::from(c), 0x20..=0x7E);
+    }
     matches!(
         u32::from(c),
         0x20..=0x7E

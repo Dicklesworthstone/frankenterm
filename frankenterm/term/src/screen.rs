@@ -9732,7 +9732,7 @@ impl Screen {
         x: usize,
         y: VisibleRowIndex,
         text: &str,
-        attr: CellAttributes,
+        attr: &CellAttributes,
         seqno: SequenceNo,
     ) {
         debug_assert!(text.is_ascii());
@@ -9743,7 +9743,7 @@ impl Screen {
         self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
         let line_idx = self.phys_row(y);
         if let Some((page, row)) = self.page_row(line_idx) {
-            if native::set_ascii_run(page, row, x, text, &attr, seqno) {
+            if native::set_ascii_run(page, row, x, text, attr, seqno) {
                 return;
             }
         }

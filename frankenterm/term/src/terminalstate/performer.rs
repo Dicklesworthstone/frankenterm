@@ -886,13 +886,15 @@ impl<'a> Performer<'a> {
         }
 
         let y = self.cursor.y;
-        let pen = self.pen.clone();
         if Self::bulk_ascii_row_write_enabled() {
             #[cfg(test)]
             BULK_ASCII_ROW_WRITE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.screen_mut()
-                .set_ascii_cell_run(start_x, y, text, pen, seqno);
+            let state = &mut *self.state;
+            state
+                .screen
+                .set_ascii_cell_run(start_x, y, text, &state.pen, seqno);
         } else {
+            let pen = self.pen.clone();
             let screen = self.screen_mut();
             for (offset, _) in text.bytes().enumerate() {
                 let x = start_x + offset;
@@ -1363,8 +1365,10 @@ impl<'a> Performer<'a> {
             let room = right_margin.saturating_sub(x).max(1);
             let (row, tail) = rest.split_at(room.min(rest.len()));
             let last_x = x + row.len() - 1;
-            let pen = self.pen.clone();
-            self.screen_mut().set_ascii_cell_run(x, y, row, pen, seqno);
+            let state = &mut *self.state;
+            state
+                .screen
+                .set_ascii_cell_run(x, y, row, &state.pen, seqno);
             self.note_printed(y, last_x, 1, false);
             rest = tail;
             if row.len() < room {
@@ -1380,9 +1384,10 @@ impl<'a> Performer<'a> {
                 self.wrap_next = false;
                 if !rest.is_empty() {
                     let last = &rest[rest.len() - 1..];
-                    let pen = self.pen.clone();
-                    self.screen_mut()
-                        .set_ascii_cell_run(last_x, y, last, pen, seqno);
+                    let state = &mut *self.state;
+                    state
+                        .screen
+                        .set_ascii_cell_run(last_x, y, last, &state.pen, seqno);
                     self.note_printed(y, last_x, 1, false);
                 }
                 rest = "";
