@@ -12,39 +12,13 @@ use frankenterm_cell::{Blink, CellAttributes, Intensity, SemanticType, Underline
 /// The 14 inline attribute bits, in legacy order minus wrap and semantic
 /// type: intensity 2, underline 3, blink 2, italic, reverse, strikethrough,
 /// invisible, overline, vertical align 2.
+///
+/// Read straight off the legacy bitfield (`CellAttributes::inline_style_bits`),
+/// whose order these bits follow, rather than through each getter: every
+/// printed run encodes its pen (ft-yccm0.3.2.6).
+#[inline]
 pub fn encode_attrs(attrs: &CellAttributes) -> u16 {
-    let intensity: u16 = match attrs.intensity() {
-        Intensity::Normal => 0,
-        Intensity::Bold => 1,
-        Intensity::Half => 2,
-    };
-    let underline: u16 = match attrs.underline() {
-        Underline::None => 0,
-        Underline::Single => 1,
-        Underline::Double => 2,
-        Underline::Curly => 3,
-        Underline::Dotted => 4,
-        Underline::Dashed => 5,
-    };
-    let blink: u16 = match attrs.blink() {
-        Blink::None => 0,
-        Blink::Slow => 1,
-        Blink::Rapid => 2,
-    };
-    let vertical_align: u16 = match attrs.vertical_align() {
-        VerticalAlign::BaseLine => 0,
-        VerticalAlign::SuperScript => 1,
-        VerticalAlign::SubScript => 2,
-    };
-    intensity
-        | (underline << 2)
-        | (blink << 5)
-        | (u16::from(attrs.italic()) << 7)
-        | (u16::from(attrs.reverse()) << 8)
-        | (u16::from(attrs.strikethrough()) << 9)
-        | (u16::from(attrs.invisible()) << 10)
-        | (u16::from(attrs.overline()) << 11)
-        | (vertical_align << 12)
+    attrs.inline_style_bits()
 }
 
 /// Applies [`encode_attrs`] bits to `attrs`.

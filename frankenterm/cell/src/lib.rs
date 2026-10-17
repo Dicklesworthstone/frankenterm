@@ -740,6 +740,32 @@ impl CellAttributes {
         }
     }
 
+    /// The style attributes a packed page cell keeps inline, in its order:
+    /// intensity 2 bits, underline 3, blink 2, italic, reverse,
+    /// strikethrough, invisible, overline, vertical align 2. That is every
+    /// attribute but wrap, semantic type and protection, each decoded as its
+    /// getter decodes it (a value no setter stores reads as the default),
+    /// read straight off the bitfield rather than through each getter.
+    #[inline]
+    pub fn inline_style_bits(&self) -> u16 {
+        let a = self.attributes;
+        // Intensity through invisible keep their positions (bits 0-10).
+        let mut bits = (a & 0x7ff) | (((a >> 12) & 1) << 11) | (((a >> 15) & 0b11) << 12);
+        if a & 0b11 == 0b11 {
+            bits &= !0b11;
+        }
+        if (a >> 2) & 0b111 > 5 {
+            bits &= !(0b111 << 2);
+        }
+        if (a >> 5) & 0b11 == 0b11 {
+            bits &= !(0b11 << 5);
+        }
+        if (a >> 15) & 0b11 == 0b11 {
+            bits &= !(0b11 << 12);
+        }
+        bits as u16
+    }
+
     /// Returns true if the attribute bits in both objects are equal.
     /// This can be used to cheaply test whether the styles of the two
     /// cells are the same, and is used by some `Renderer` implementations.
@@ -2521,6 +2547,51 @@ mod test {
         assert!(!cloned.protected());
         assert!(cloned.reverse());
         assert_eq!(cloned.background(), ColorAttribute::PaletteIndex(4));
+    }
+
+    #[test]
+    fn inline_style_bits_decode_as_the_getters_do() {
+        // Every pattern of the 18 attribute bits, values no setter stores
+        // included, plus garbage above them.
+        let reference = |a: &CellAttributes| -> u16 {
+            let intensity = match a.intensity() {
+                Intensity::Normal => 0,
+                Intensity::Bold => 1,
+                Intensity::Half => 2,
+            };
+            let underline = match a.underline() {
+                Underline::None => 0,
+                Underline::Single => 1,
+                Underline::Double => 2,
+                Underline::Curly => 3,
+                Underline::Dotted => 4,
+                Underline::Dashed => 5,
+            };
+            let blink = match a.blink() {
+                Blink::None => 0,
+                Blink::Slow => 1,
+                Blink::Rapid => 2,
+            };
+            let vertical_align = match a.vertical_align() {
+                VerticalAlign::BaseLine => 0,
+                VerticalAlign::SuperScript => 1,
+                VerticalAlign::SubScript => 2,
+            };
+            intensity
+                | (underline << 2)
+                | (blink << 5)
+                | (u16::from(a.italic()) << 7)
+                | (u16::from(a.reverse()) << 8)
+                | (u16::from(a.strikethrough()) << 9)
+                | (u16::from(a.invisible()) << 10)
+                | (u16::from(a.overline()) << 11)
+                | (vertical_align << 12)
+        };
+        let mut a = CellAttributes::blank();
+        for bits in (0..1_u32 << 18).chain([0xfffc_0000, u32::MAX]) {
+            a.attributes = bits;
+            assert_eq!(a.inline_style_bits(), reference(&a), "{bits:#x}");
+        }
     }
 
     #[test]
